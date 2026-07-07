@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // Type-resolve breakwater from source (matches the vitest alias). tsc
+    // enforces rootDir even under noEmit, so widen it to the repo root to
+    // admit ../breakwater/src into this (emit-free) program.
+    "rootDir": "../..",
+    "paths": {
+      "@proofoftech/breakwater": ["../breakwater/src/index.ts"]
+    }
+  },
+  "include": ["src"],
+  "exclude": ["src/approval-ui/**/*.tsx", "src/approval-ui/index.ts"]
+}

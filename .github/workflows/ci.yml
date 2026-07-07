@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reads the pnpm version from package.json "packageManager".
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      # The repo's verification gate, in order.
+      - name: Lint
+        run: pnpm -r lint
+
+      - name: Typecheck
+        run: pnpm -r typecheck
+
+      - name: Test
+        run: pnpm -r test
+
+      - name: Build
+        run: pnpm -r build
+
+      # End-to-end durability proof on real workerd (local mode, no
+      # Cloudflare credentials): suspend -> process kill -> restart on
+      # persisted D1 state -> approval-decided resume -> forged-resume
+      # fails closed. Exits non-zero on any broken link in that chain.
+      - name: Spike verify (workerd suspend/resume)
+        run: pnpm --filter @proofoftech/flowsafe spike:verify

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "flowsafe-do-runner-demo",
+  "main": "./worker.ts",
+  "compatibility_date": "2025-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [{ "name": "RUNNER", "class_name": "DemoRunner" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DemoRunner"] }],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "flowsafe-demo",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ]
+}

@@ -1,0 +1,83 @@
+{
+  "name": "@proofoftech/flowsafe",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Approval UX + Cloudflare-native durable execution for AI agent workflows",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ProofOfTechOrg/anchorage.git",
+    "directory": "packages/flowsafe"
+  },
+  "homepage": "https://github.com/ProofOfTechOrg/anchorage/tree/main/packages/flowsafe#readme",
+  "bugs": "https://github.com/ProofOfTechOrg/anchorage/issues",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./approval-api": "./dist/approval-api/index.js",
+    "./approval-ui": "./dist/approval-ui/index.js",
+    "./artifacts": "./dist/artifacts/index.js",
+    "./audit-export": "./dist/audit-export/index.js",
+    "./do-runner": "./dist/do-runner/index.js"
+  },
+  "scripts": {
+    "build": "tsc && tsc -p src/approval-ui/tsconfig.json && vite build app",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "lint": "biome check src/ app/ scripts/ deploy/",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json && tsc -p src/approval-ui/tsconfig.json --noEmit && tsc -p app/tsconfig.json --noEmit && tsc -p app/tsconfig.node.json --noEmit && tsc -p demo/tsconfig.json && tsc -p deploy/tsconfig.json",
+    "spike": "wrangler dev --config demo/wrangler.jsonc",
+    "spike:verify": "node scripts/spike-verify.mjs",
+    "deploy:cf": "wrangler deploy --config deploy/wrangler.jsonc",
+    "deploy:dev": "wrangler dev --config deploy/wrangler.jsonc",
+    "app:dev": "vite app",
+    "app:build": "vite build app",
+    "app:preview": "vite preview app"
+  },
+  "peerDependencies": {
+    "@mastra/core": "^1.49.0",
+    "react": ">=18 <20",
+    "react-dom": ">=18 <20"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "react-dom": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@astryxdesign/cli": "0.1.3",
+    "@astryxdesign/core": "0.1.3",
+    "@astryxdesign/theme-neutral": "0.1.3",
+    "@biomejs/biome": "^1.9",
+    "@cloudflare/workers-types": "^4.2025",
+    "@mastra/core": "^1.50.0",
+    "@proofoftech/breakwater": "workspace:*",
+    "@stylexjs/stylex": "0.18.3",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "typescript": "^5.6",
+    "vite": "^6",
+    "vitest": "^2.1",
+    "wrangler": "^4.107.0",
+    "zod": "^4.4.3"
+  },
+  "keywords": [
+    "mastra",
+    "ai-agents",
+    "approval-workflow",
+    "human-in-the-loop",
+    "cloudflare-workers",
+    "durable-objects"
+  ],
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@mastra/cloudflare-d1": "^1.1.1"
+  }
+}

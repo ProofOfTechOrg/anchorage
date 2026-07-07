@@ -1,0 +1,9 @@
+/* Astryx styling, bundled by Vite (order matters: reset → base → theme). */
+@import "@astryxdesign/core/reset.css";
+@import "@astryxdesign/core/astryx.css";
+@import "@astryxdesign/theme-neutral/theme.css";
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}

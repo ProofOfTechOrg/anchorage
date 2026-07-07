@@ -1,0 +1,22 @@
+packages:
+  - "packages/*"
+
+# Supply-chain guard: only install package versions >= 7 days old (minutes)
+minimumReleaseAge: 10080
+# Mastra ships in lockstep with @mastra/core (audited, version-locked here);
+# quarantining it just forces stale mismatched subtrees.
+minimumReleaseAgeExclude:
+  - "@mastra/*"
+  # Astryx (Meta design system) is Beta and ships faster than the 7-day gate;
+  # versions are pinned exact in packages/flowsafe to bound the exposure.
+  - "@astryxdesign/*"
+  # Forced by wrangler's pinned workerd range; Cloudflare publishes workerd and
+  # workers-types ~weekly, faster than the 7-day gate. The resolved versions are
+  # already lockfile-pinned and installed, so this reuses them rather than
+  # fetching anything new.
+  - "@cloudflare/*"
+  - "workerd"
+  # Forced by @mastra/core's own pinned dep ranges (its tree ships in lockstep):
+  - "chat"
+  - "p-map"
+  - "picomatch"

@@ -1,0 +1,136 @@
+# flowsafe reference deployment
+
+Production-shaped Worker wiring the flowsafe DO runner and approval queue on
+Cloudflare: one Durable Object per run, D1 for snapshots and approvals, a
+bearer-token auth seam, and a cron trigger that owns SLA enforcement and
+snapshot retention. Copy this directory into your project as the starting
+point for a real deployment; it typechecks in-repo against flowsafe source
+through the same `@proofoftech/flowsafe/*` specifiers you keep when copying.
+
+The demo sibling (`../demo/`) is the minimal spike this template grew from;
+deploy differences: real auth, cron maintenance, multi-gate approval
+bridging, `/healthz`, and env-tunable SLA/retention.
+
+## Deploy checklist
+
+```bash
+# 1. Create the database; paste the printed id into wrangler.jsonc.
+wrangler d1 create anchorage-flowsafe
+
+# 2. Mint actor tokens (any random strings) and store the map as a secret:
+#    roles: admin | builder | operator | reviewer | viewer
+wrangler secret put APPROVAL_ACTOR_TOKENS --config deploy/wrangler.jsonc
+# paste, e.g.: {"tok-ray":{"id":"ray","role":"reviewer"},"tok-op":{"id":"op","role":"operator"}}
+
+# 3. Deploy (from packages/flowsafe/)
+pnpm deploy:cf
+
+# 4. Verify
+curl https://<worker>/healthz
+curl -X POST https://<worker>/runs \
+  -H 'authorization: Bearer tok-op' -H 'content-type: application/json' \
+  -d '{"workflowId":"example-approval","inputData":{"topic":"launch"}}'
+curl https://<worker>/api/approvals -H 'authorization: Bearer tok-ray'
+curl -X POST https://<worker>/api/approvals/<id>/decide \
+  -H 'authorization: Bearer tok-ray' -H 'content-type: application/json' \
+  -d '{"decision":"approve"}'
+curl https://<worker>/runs/example-approval/<runId> \
+  -H 'authorization: Bearer tok-ray'
+```
+
+Local iteration: `pnpm deploy:dev` (wrangler dev against local D1/DO state —
+no Cloudflare account needed).
+
+## What the cron does
+
+`triggers.crons` fires `scheduled()`, which runs both enforcement surfaces
+(each isolated, so one failing never masks the other):
+
+- **SLA sweep** — `ApprovalService.sweepSLA()` escalates every open approval
+  past its `slaDeadlineAt`; each escalation hits the `onEscalation`
+  notification seam and the audit trail.
+- **Retention purge** — `purgeExpiredWorkflowRuns()` deletes terminal-status
+  run snapshots older than `RUN_RETENTION_DAYS`. Suspended and running runs
+  are never purged.
+
+Keep the cron interval at or below your SLA granularity; the default
+`*/15 * * * *` gives 4-hour SLAs minute-scale slack.
+
+## Configuration
+
+| Name | Kind | Default | Meaning |
+| ---- | ---- | ------- | ------- |
+| `APPROVAL_ACTOR_TOKENS` | secret | none (all authed routes 401) | JSON map of bearer token → `{ id, role }` |
+| `APPROVAL_SLA_SECONDS` | var | `14400` (4h) | Default SLA applied to new approvals |
+| `RUN_RETENTION_DAYS` | var | `30` | Terminal snapshot age before cron purge |
+| `AUDIT_QUEUE` | queue binding | unbound (logs only) | Enables audit export: events flow to the queue consumer |
+| `SIEM_ENDPOINT` | var | none (consumer retries) | HTTP event-collector URL the consumer POSTs NDJSON batches to |
+| `SIEM_AUTH_HEADER` | secret | none | Sent as the `authorization` header on export POSTs |
+
+## The conventions the template encodes
+
+- **Auth is one function.** `authenticateActor()` maps a request to an
+  approval actor; swap its body for your SSO/JWT verification. Everything
+  else (role checks, separation of duties, self-approval denial) lives in
+  `ApprovalService` and stays.
+- **A suspension is an approval request.** Both bridges (start and resume)
+  call `queueApprovalForSuspension()`, which captures the suspension's
+  `suspendedAt` so grant minting binds the decision to that exact suspension
+  (clock-free), and reads the suspend payload's `connectors` array so a
+  decision mints exactly the grants the step asked for. Multi-gate
+  workflows re-enter the queue automatically on each re-suspension.
+- **Grants never travel in HTTP bodies.** The DO-side
+  `approvalGrantProvider` derives `breakwater.approvedConnectors` from
+  APPROVED records on every start/resume; the public raw-resume route stays
+  grant-free and gated steps fail closed on forged resumes. A forged
+  `resumeData.approved` can cosmetically flip a workflow boolean but grants
+  no connector capability — the side-effecting step re-checks the
+  server-derived grant, so treat `resumeData` as untrusted, never as the
+  security boundary.
+- **Separation of duties survives the bridge.** `queueApprovalForSuspension`
+  attributes each auto-queued approval to the human who advanced the run
+  (`requestedBy` = the starting actor, or the reviewer whose decision caused
+  a re-suspension), not the `SYSTEM_ACTOR` bridge — so the library's
+  self-decision check can fire and a start actor cannot approve their own
+  run. Dropping `requestedBy` here silently disables that control.
+- **Structured logs always, Queues export when bound.** Audit events, SLA
+  escalations, config errors, and maintenance counts all go to Workers Logs
+  as single-line JSON (`{"type":"audit"|"sla-escalation"|...}`). Uncomment
+  the `queues` block in wrangler.jsonc and audit events additionally flow
+  producer → queue → the `queue` consumer → an authenticated NDJSON POST to
+  `SIEM_ENDPOINT` (`@proofoftech/flowsafe/audit-export`); a failed export
+  retries the whole batch into Queues backoff and the dead-letter queue, so
+  no event is acked before the collector confirmed it.
+
+## Testing & verification
+
+This template has **no standalone unit tests by design** — it is composition
+glue over already-tested library code, and unit-testing it would mean mocking
+the Durable Object + D1 bindings for little gain. Its correctness rests on
+four independently-maintained layers:
+
+1. **Typecheck.** `pnpm --filter @proofoftech/flowsafe typecheck` includes
+   `deploy/tsconfig.json`, so the wiring is type-checked against flowsafe
+   source through the real `@proofoftech/flowsafe/*` specifiers.
+2. **The library test suite.** Every enforcement rule the template relies on
+   — role authorization, CAS transitions, SLA/escalation, self-decision
+   separation of duties, grant derivation — is covered by the `approval-api`
+   and `do-runner` unit tests. The template only *feeds* those guarantees; it
+   does not reimplement them.
+3. **The `spike:verify` end-to-end proof.** The sibling `../demo/` worker
+   shares the same library and is driven by
+   `pnpm --filter @proofoftech/flowsafe spike:verify` (also run in CI), which
+   proves suspend → process-kill → restart-on-persisted-state → grant-minted
+   resume, a forged raw resume failing closed, and a run's requester being
+   denied self-decision. The template's start/decide/resume/SoD shape is
+   structurally identical, so that proof exercises the same code paths.
+4. **A local smoke run.** `pnpm deploy:dev` against local workerd (no
+   Cloudflare account) lets you drive the full loop with the `curl` commands
+   in the deploy checklist above.
+
+**Consequence:** because layer 3 covers the demo rather than this file
+directly, any change to the template's own logic — auth, the approval
+bridges, `requestedBy` attribution, the cron handler — is not caught by
+`pnpm -r test`. Re-run a `deploy:dev` smoke (start a run, decide it, confirm
+resume; and confirm a start actor cannot decide their own run) after editing
+this worker.

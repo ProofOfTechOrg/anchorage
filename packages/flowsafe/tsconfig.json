@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "types": ["@cloudflare/workers-types"]
+  },
+  "include": ["src"],
+  // approval-ui's JSX shell compiles in its own pass (src/approval-ui/
+  // tsconfig.json — DOM lib vs workers-types); the DOM-free client.ts and
+  // view-model.ts stay in this pass so their tests typecheck here.
+  "exclude": [
+    "src/**/*.test.ts",
+    "src/approval-ui/**/*.tsx",
+    "src/approval-ui/index.ts",
+    "src/approval-ui/use-*.ts"
+  ]
+}

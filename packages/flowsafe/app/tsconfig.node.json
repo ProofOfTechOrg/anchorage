@@ -1,0 +1,16 @@
+{
+  // Node-side pass: the Vite config + dev-server plugin run in Node, not the
+  // browser. This exists so the plugin's approval-api usage (store / service /
+  // router construction + the typed seed) is type-checked by the repo gate —
+  // otherwise a signature change in approval-api would rot here silently and
+  // only surface at `app:dev` runtime. `types: []` + skipLibCheck (inherited):
+  // the connect/http request/response types resolve loosely, but the
+  // approval-api calls — the part that actually drifts — are fully checked.
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM"],
+    "types": [],
+    "noEmit": true
+  },
+  "include": ["vite.config.ts", "approval-api-dev-plugin.ts"]
+}

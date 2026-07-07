@@ -1,0 +1,49 @@
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "anchorage-flowsafe",
+  "main": "./worker.ts",
+  "compatibility_date": "2025-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  // The worker emits structured JSON (audit + maintenance) to Workers Logs.
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [{ "name": "RUNNER", "class_name": "FlowsafeRunner" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["FlowsafeRunner"] }],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "anchorage-flowsafe",
+      // `wrangler d1 create anchorage-flowsafe` prints the id — paste it here.
+      // Tables are created lazily by the stores; no migration files needed.
+      "database_id": "REPLACE-WITH-YOUR-D1-DATABASE-ID"
+    }
+  ],
+  // Every firing runs the SLA sweep + retention purge (worker.ts scheduled()).
+  // Keep the interval >= your SLA granularity.
+  "triggers": { "crons": ["*/15 * * * *"] },
+  // Optional audit export to a SIEM: `wrangler queues create anchorage-audit`
+  // (and anchorage-audit-dlq), uncomment, then set SIEM_ENDPOINT (var below)
+  // and SIEM_AUTH_HEADER (secret). Without this block, audit events stay on
+  // structured Workers Logs only.
+  // "queues": {
+  //   "producers": [{ "binding": "AUDIT_QUEUE", "queue": "anchorage-audit" }],
+  //   "consumers": [
+  //     {
+  //       "queue": "anchorage-audit",
+  //       "max_retries": 10,
+  //       "dead_letter_queue": "anchorage-audit-dlq"
+  //     }
+  //   ]
+  // },
+  "vars": {
+    "APPROVAL_SLA_SECONDS": "14400",
+    "RUN_RETENTION_DAYS": "30"
+    // "SIEM_ENDPOINT": "https://siem.example/services/collector"
+  }
+  // Secrets (set with `wrangler secret put <name>`):
+  //   APPROVAL_ACTOR_TOKENS — JSON map of bearer token -> { id, role };
+  //     roles: admin | builder | operator | reviewer | viewer.
+  //   SIEM_AUTH_HEADER — sent as the `authorization` header on audit export,
+  //     e.g. "Splunk <hec-token>".
+}

@@ -1,0 +1,19 @@
+{
+  // UI compilation pass: JSX + DOM lib. Kept separate from the package
+  // tsconfig because DOM globals (Request/Response/fetch) collide with the
+  // @cloudflare/workers-types ambient set the rest of the package compiles
+  // against. rootDir/outDir are inherited (resolved relative to the root
+  // config), so emit lands in dist/approval-ui/ alongside the main pass.
+  // The DOM-free approval-api modules this pulls in double-emit identical
+  // output — harmless by construction.
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": []
+  },
+  "include": ["."],
+  // Override the inherited exclude — the package tsconfig excludes this
+  // directory's .tsx/barrel (they only compile here); tests stay out.
+  "exclude": ["./**/*.test.ts"]
+}

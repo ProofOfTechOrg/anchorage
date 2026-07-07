@@ -1,0 +1,50 @@
+{
+  "name": "@proofoftech/breakwater",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Safety middleware for AI agent workflows — policy engine, RBAC + audit, connector SDK",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ProofOfTechOrg/anchorage.git",
+    "directory": "packages/breakwater"
+  },
+  "homepage": "https://github.com/ProofOfTechOrg/anchorage/tree/main/packages/breakwater#readme",
+  "bugs": "https://github.com/ProofOfTechOrg/anchorage/issues",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./policy-engine": "./dist/policy-engine/index.js",
+    "./rbac": "./dist/rbac/index.js",
+    "./audit": "./dist/audit/index.js",
+    "./connector-sdk": "./dist/connector-sdk/index.js",
+    "./agent-cli": "./dist/agent-cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "lint": "biome check src/",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json"
+  },
+  "peerDependencies": {
+    "@mastra/core": "^1.49.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9",
+    "@mastra/core": "^1.50.0",
+    "typescript": "^5.6",
+    "vitest": "^2.1",
+    "zod": "^4.4.3"
+  },
+  "keywords": [
+    "mastra",
+    "ai-agents",
+    "security",
+    "rbac",
+    "policy-engine",
+    "audit-log"
+  ],
+  "license": "Apache-2.0"
+}

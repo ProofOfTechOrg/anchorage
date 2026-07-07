@@ -1,0 +1,15 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["@cloudflare/workers-types"]
+  },
+  "include": ["./worker.ts", "../src/**/*.ts"],
+  // approval-ui's barrel/JSX compile only in src/approval-ui/tsconfig.json
+  // (DOM lib); this workers-types program must not pull them in.
+  "exclude": [
+    "../src/**/*.test.ts",
+    "../src/approval-ui/**/*.tsx",
+    "../src/approval-ui/index.ts"
+  ]
+}

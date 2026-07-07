@@ -1,0 +1,39 @@
+# Negative (whitelist) model: ignore everything at the repo root by default;
+# only the paths explicitly un-ignored below are trackable, so internal or
+# scratch files dropped at the root can never be committed by accident.
+/*
+
+# --- Tracked top-level directories (their contents track normally) ---
+!/.github/
+!/packages/
+!/docs/
+
+# --- Tracked top-level files ---
+!/.gitignore
+!/biome.json
+!/CLAUDE.md
+!/CONTRIBUTING.md
+!/LICENSE
+!/package.json
+!/pnpm-lock.yaml
+!/pnpm-workspace.yaml
+!/README.md
+!/SECURITY.md
+!/tsconfig.base.json
+
+# --- Re-ignore build / dependency / runtime artifacts nested inside the
+#     tracked directories above (root-level "/*" does not reach these) ---
+node_modules/
+dist/
+.wrangler/
+__pycache__/
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.swp
+*.swo
+.DS_Store
+.dev.vars
+.env
+.env.*
