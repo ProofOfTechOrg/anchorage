@@ -111,6 +111,17 @@ export interface RunSummary {
    * bind the decision to this exact suspension (clock-free).
    */
   suspendedAt?: Record<string, number>;
+  /**
+   * Epoch-ms resume time per dot-joined suspended step key (core clock),
+   * paired with `suspendedAt`. ABSENT for a step's first suspension (never
+   * resumed) and PRESENT once the step has been resumed at least once (a
+   * re-suspension). Approval bridges copy it into
+   * CreateApprovalInput.resumedAt so grant minting binds a decision to the
+   * exact suspension by the (suspendedAt, resumedAt) fingerprint — the
+   * categorical first-vs-re-suspension difference no same-ms suspendedAt
+   * collision can erase.
+   */
+  resumedAt?: Record<string, number>;
   /** ISO 8601. Present on status() projections (read from the stored snapshot). */
   createdAt?: string;
   /** ISO 8601. Present on status() projections (read from the stored snapshot). */
@@ -173,11 +184,11 @@ function summarize(runId: string, result: CoreRunResult): RunSummary {
         suspended: result.suspended,
         suspendPayload: result.suspendPayload,
       };
-      const suspendedAt = suspendedAtByStep(
-        result.steps,
-        result.suspended.map((path) => path.join('.')),
-      );
+      const suspendedKeys = result.suspended.map((path) => path.join('.'));
+      const suspendedAt = suspendedAtByStep(result.steps, suspendedKeys);
       if (suspendedAt !== undefined) summary.suspendedAt = suspendedAt;
+      const resumedAt = resumedAtByStep(result.steps, suspendedKeys);
+      if (resumedAt !== undefined) summary.resumedAt = resumedAt;
       return summary;
     }
     case 'tripwire':
@@ -210,14 +221,20 @@ function resolveResumeStep(
   return suspended.length === 1 ? suspended[0]?.split('.') : undefined;
 }
 
+// The live attempt for a step. Repeated steps (foreach) store an array of
+// attempts, so the current suspension/resume is the latest; a single-run step
+// stores one entry. Shared by the suspendedAt/resumedAt/suspendPayload readers.
+function latestAttempt(steps: WorkflowState['steps'], stepKey: string) {
+  const entry = steps?.[stepKey];
+  return Array.isArray(entry) ? entry[entry.length - 1] : entry;
+}
+
 /** Epoch-ms suspension time of the step's latest attempt, if recorded. */
 function suspendedAtOf(
   steps: WorkflowState['steps'],
   stepKey: string,
 ): number | undefined {
-  const entry = steps?.[stepKey];
-  const latest = Array.isArray(entry) ? entry[entry.length - 1] : entry;
-  return latest?.suspendedAt;
+  return latestAttempt(steps, stepKey)?.suspendedAt;
 }
 
 /** RunSummary.suspendedAt: dot-joined step key -> epoch-ms suspension time. */
@@ -234,6 +251,32 @@ function suspendedAtByStep(
   return Object.keys(map).length > 0 ? map : undefined;
 }
 
+/**
+ * Epoch-ms resume time of the step's latest attempt, if recorded. Undefined
+ * for a first suspension (never resumed) and defined for a re-suspension —
+ * the categorical signal grant minting pairs with suspendedAt.
+ */
+function resumedAtOf(
+  steps: WorkflowState['steps'],
+  stepKey: string,
+): number | undefined {
+  return latestAttempt(steps, stepKey)?.resumedAt;
+}
+
+/** RunSummary.resumedAt: dot-joined step key -> epoch-ms resume time. */
+function resumedAtByStep(
+  steps: WorkflowState['steps'] | undefined,
+  suspendedKeys: readonly string[],
+): Record<string, number> | undefined {
+  if (!steps) return undefined;
+  const map: Record<string, number> = {};
+  for (const key of suspendedKeys) {
+    const at = resumedAtOf(steps, key);
+    if (at !== undefined) map[key] = at;
+  }
+  return Object.keys(map).length > 0 ? map : undefined;
+}
+
 function suspendPayloadByStep(
   steps: WorkflowState['steps'],
   suspendedKeys: string[],
@@ -241,10 +284,7 @@ function suspendPayloadByStep(
   if (!steps) return undefined;
   const payloads: Record<string, unknown> = {};
   for (const key of suspendedKeys) {
-    const entry = steps[key];
-    // Repeated steps (foreach) store an array; the live suspension is the
-    // latest attempt.
-    const latest = Array.isArray(entry) ? entry[entry.length - 1] : entry;
+    const latest = latestAttempt(steps, key);
     if (latest && latest.suspendPayload !== undefined) {
       payloads[key] = latest.suspendPayload;
     }
@@ -281,6 +321,8 @@ function summarizeState(runId: string, state: WorkflowState): RunSummary {
     }
     const suspendedAt = suspendedAtByStep(state.steps, suspendedKeys);
     if (suspendedAt !== undefined) summary.suspendedAt = suspendedAt;
+    const resumedAt = resumedAtByStep(state.steps, suspendedKeys);
+    if (resumedAt !== undefined) summary.resumedAt = resumedAt;
   }
   return summary;
 }
@@ -295,11 +337,19 @@ function summarizeState(runId: string, state: WorkflowState): RunSummary {
  * providers bind capabilities to the specific suspension they were granted
  * for — an approval decided before this suspension began belongs to an
  * earlier incarnation of the gate and must not mint again (see flowsafe's
- * approvalGrantProvider).
+ * approvalGrantProvider). `resumedAt` pairs with `suspendedAt` — undefined on
+ * a step's first suspension, defined on a re-suspension — so a provider can
+ * tell two same-step suspensions apart even when their `suspendedAt` stamps
+ * collide within a millisecond.
  */
 export type RunLeg =
   | { kind: 'start' }
-  | { kind: 'resume'; step?: string[]; suspendedAt?: number };
+  | {
+      kind: 'resume';
+      step?: string[];
+      suspendedAt?: number;
+      resumedAt?: number;
+    };
 
 /**
  * Server-side requestContext source, consulted on EVERY start and resume.
@@ -459,12 +509,16 @@ export class RunnerRuntime {
       // createRun only reattaches (no snapshot write), but failing before it
       // still does the least work and keeps the ordering invariant uniform.
       const step = resolveResumeStep(options.step, state);
+      const stepKey = step?.join('.');
       const requestContext = await this.#requestContextFor(workflowId, runId, {
         kind: 'resume',
         step,
-        suspendedAt: step
-          ? suspendedAtOf(state.steps, step.join('.'))
-          : undefined,
+        suspendedAt:
+          stepKey !== undefined
+            ? suspendedAtOf(state.steps, stepKey)
+            : undefined,
+        resumedAt:
+          stepKey !== undefined ? resumedAtOf(state.steps, stepKey) : undefined,
       });
       const run = await workflow.createRun({ runId });
       let result: CoreRunResult;

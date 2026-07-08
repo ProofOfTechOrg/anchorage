@@ -8,15 +8,23 @@
 // Grants are SUSPENSION-SCOPED: a step-keyed approval unlocks its connectors
 // only for the leg that resumes THAT step, and only when the decision binds
 // to the step's CURRENT suspension. The preferred binding is clock-free and
-// exact: the creating bridge captures the snapshot's suspendedAt into the
-// record (CreateApprovalInput.suspendedAt), and minting requires
-// record.suspendedAt === leg.suspendedAt — both sides come from the core
-// clock, so a decision bound to any other suspension of the step (an
-// earlier round, a forged timestamp) never mints. That closes both leak
-// shapes: approving connector X at one approval point never unlocks X at
-// another point of the run, and when the SAME step suspends again later,
-// the earlier approval is spent — the new suspension needs its own
-// decision, and a rejected re-quest never falls back to the old approval.
+// exact on the (suspendedAt, resumedAt) fingerprint the snapshot carries: the
+// creating bridge captures both into the record (CreateApprovalInput), and
+// minting requires record.suspendedAt === leg.suspendedAt AND
+// record.resumedAt === leg.resumedAt — all four come from the core clock, so
+// a decision bound to any other suspension of the step never mints. resumedAt
+// is the categorical tie-breaker: a step's FIRST suspension has it undefined,
+// a RE-suspension defined, so even two same-step suspensions whose suspendedAt
+// collide within a millisecond (possible only on the synchronous in-process
+// path — production round-trips make them seconds apart) stay distinguishable.
+// That closes both leak shapes: approving connector X at one approval point
+// never unlocks X at another point of the run, and when the SAME step suspends
+// again later, the earlier approval is spent — the new suspension needs its
+// own decision, and a rejected re-quest never falls back to the old approval.
+// (Residual, deferred: a chain of three+ suspensions compares two defined
+// resumedAt values, which collide only if BOTH resumes AND both re-suspends
+// each land in the same ms — astronomically rare, in-process only; the
+// bulletproof fix is a synthesized monotonic per-(run,step) counter.)
 // Records created WITHOUT observing the suspension (pre-capture bridges)
 // fall back to chronology — service-clock decidedAt strictly after the
 // core-clock suspendedAt — correct only where the two clocks are one
@@ -44,21 +52,31 @@ import { type ApprovalStore, stepKeyOf } from './store.js';
 import type { ApprovalDecision, ApprovalRecord } from './types.js';
 
 // Whether a step-keyed approval is bound to the resumed step's CURRENT
-// suspension (exact suspendedAt match, or the legacy decidedAt-after
-// fallback) — the predicate that decides whether a decision mints.
+// suspension (exact (suspendedAt, resumedAt) pair match, or the legacy
+// decidedAt-after fallback) — the predicate that decides whether a decision
+// mints.
 function boundToCurrentSuspension(
   record: ApprovalRecord,
   suspendedAt: number | undefined,
+  resumedAt: number | undefined,
 ): boolean {
   // Unknown suspension time (snapshot without step timestamps, or an
   // unresolvable resume target) — fail closed for step-keyed grants.
   if (suspendedAt === undefined) return false;
-  // Preferred, clock-free binding: the bridge captured the snapshot's
-  // suspendedAt into the record at create time; both sides then come from
-  // the core clock and must match EXACTLY — a decision bound to any other
-  // suspension of this step (earlier round, forged timestamp) never mints.
+  // Preferred, clock-free binding on the (suspendedAt, resumedAt) fingerprint.
+  // The bridge captured both from the snapshot at create time; both come from
+  // the core clock and must match EXACTLY. Mastra stamps both with Date.now(),
+  // so two same-step suspensions CAN share suspendedAt within one millisecond
+  // (only on the synchronous in-process path — production has HTTP+D1 round-
+  // trips between suspensions) — but a step's FIRST suspension has resumedAt
+  // undefined and a RE-suspension has it defined, a categorical difference no
+  // ms collision erases. undefined === undefined holds (first-vs-first), so the
+  // pair reduces to the suspendedAt-exact case whenever resumedAt is absent on
+  // both sides, and only tightens the deny direction when resumedAt differs.
+  // See the module header for the depth-3+ residual (deferred monotonic
+  // counter).
   if (record.suspendedAt !== undefined) {
-    return record.suspendedAt === suspendedAt;
+    return record.suspendedAt === suspendedAt && record.resumedAt === resumedAt;
   }
   // Legacy fallback for records created without observing the suspension
   // (pre-capture bridges): service-clock decidedAt strictly after the core-
@@ -72,9 +90,9 @@ function boundToCurrentSuspension(
 /**
  * Union of connector ids across APPROVED records that apply to this leg:
  * step-keyed records matching the resumed step AND bound to the step's
- * CURRENT suspension (exact `suspendedAt` match, or the legacy
- * decidedAt-after fallback for records created without the capture), plus
- * step-less (run-scoped) records. Start legs and unresolvable resume
+ * CURRENT suspension (exact `(suspendedAt, resumedAt)` pair match, or the
+ * legacy decidedAt-after fallback for records created without the capture),
+ * plus step-less (run-scoped) records. Start legs and unresolvable resume
  * targets mint run-scoped records only.
  */
 export async function approvedConnectorsForLeg(
@@ -89,6 +107,7 @@ export async function approvedConnectorsForLeg(
       ? stepKeyOf(leg.step)
       : undefined;
   const suspendedAt = leg.kind === 'resume' ? leg.suspendedAt : undefined;
+  const resumedAt = leg.kind === 'resume' ? leg.resumedAt : undefined;
   const connectors = new Set<string>();
   for (const record of approved) {
     const recordKey = stepKeyOf(record.stepPath);
@@ -97,7 +116,7 @@ export async function approvedConnectorsForLeg(
         ? true
         : targetKey !== undefined &&
           recordKey === targetKey &&
-          boundToCurrentSuspension(record, suspendedAt);
+          boundToCurrentSuspension(record, suspendedAt, resumedAt);
     if (!applies) continue;
     for (const connector of record.connectors) {
       connectors.add(connector);

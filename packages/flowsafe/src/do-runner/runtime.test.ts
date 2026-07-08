@@ -797,3 +797,110 @@ describe('RunnerRuntime requestContextForRun', () => {
     expect(retried.status).toBe('suspended');
   });
 });
+
+describe('RunnerRuntime resumedAt projection (re-suspension)', () => {
+  // The do-runner OWNS the RunSummary/RunLeg projection of Mastra's snapshot,
+  // so the layer that publishes the resumedAt contract must pin it against the
+  // real engine — otherwise a Mastra bump could silently change
+  // "resumedAt absent on first suspension, present on re-suspension" (the
+  // categorical signal flowsafe's grant binding depends on) with no tripwire
+  // here. gate2x suspends, resumes, then suspends AGAIN before completing.
+  function buildReSuspender(onLeg?: (leg: RunLeg) => void): RunnerRuntime {
+    let rounds = 0;
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      onLeg
+        ? {
+            requestContextForRun: (_workflowId, _runId, leg) => {
+              onLeg(leg);
+              return undefined;
+            },
+          }
+        : undefined,
+    );
+    const gate2x = createStep({
+      id: 'gate2x',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      suspendSchema: z.object({ reason: z.string() }),
+      resumeSchema: z.object({ go: z.boolean() }),
+      execute: async ({ resumeData, suspend }) => {
+        if (!resumeData) return suspend({ reason: 'round 1' });
+        rounds += 1;
+        if (rounds < 2) return suspend({ reason: 'round 2' });
+        return {};
+      },
+    });
+    createWorkflow({
+      id: 'resuspend',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(gate2x)
+      .commit();
+    return runtime;
+  }
+
+  it('omits resumedAt on the first suspension and carries it on a re-suspension', async () => {
+    // #given
+    const runtime = buildReSuspender();
+
+    // #when — first suspension
+    const started = await runtime.start('resuspend', { inputData: {} });
+
+    // #then — a first suspension carries suspendedAt but NO resumedAt; this
+    // undefined is the categorical tie-breaker the grant binding relies on
+    expect(started.status).toBe('suspended');
+    expect(started.suspendedAt?.gate2x).toBeTypeOf('number');
+    expect(started.resumedAt?.gate2x).toBeUndefined();
+
+    // #when — resume; gate2x runs and re-suspends (round 2)
+    const reSuspended = await runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+    });
+
+    // #then — the re-suspension summary now carries a defined resumedAt paired
+    // with a fresh suspendedAt
+    expect(reSuspended.suspended).toEqual([['gate2x']]);
+    expect(reSuspended.resumedAt?.gate2x).toBeTypeOf('number');
+    expect(reSuspended.suspendedAt?.gate2x).toBeTypeOf('number');
+  });
+
+  it('passes resumedAt on the resume leg only once the step has re-suspended', async () => {
+    // #given — a provider recording every leg
+    const legs: RunLeg[] = [];
+    const runtime = buildReSuspender((leg) => legs.push(leg));
+
+    // #when — start (round-1 suspension) then resume, which re-suspends
+    const started = await runtime.start('resuspend', { inputData: {} });
+    await runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+    });
+
+    // #then — the leg that reattached to the FIRST suspension read a snapshot
+    // with no resumedAt yet, so its resumedAt is undefined
+    expect(legs[1]).toMatchObject({
+      kind: 'resume',
+      step: ['gate2x'],
+      suspendedAt: expect.any(Number),
+    });
+    expect((legs[1] as { resumedAt?: number }).resumedAt).toBeUndefined();
+
+    // #when — resume again, reattaching to the RE-suspension
+    const done = await runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+    });
+
+    // #then — that leg's snapshot carries resumedAt, so the leg does too
+    expect(done.status).toBe('success');
+    expect(legs[2]).toMatchObject({
+      kind: 'resume',
+      step: ['gate2x'],
+      suspendedAt: expect.any(Number),
+      resumedAt: expect.any(Number),
+    });
+  });
+});

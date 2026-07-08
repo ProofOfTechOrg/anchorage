@@ -72,9 +72,17 @@ export interface ApprovalRecord {
   /**
    * Epoch-ms suspendedAt of the suspension this approval binds to (core
    * clock) — see CreateApprovalInput.suspendedAt. Grant minting requires an
-   * EXACT match with the resumed leg's suspension timestamp when present.
+   * EXACT match with the resumed leg's suspension timestamp when present,
+   * paired with `resumedAt`.
    */
   suspendedAt?: number;
+  /**
+   * Epoch-ms resumedAt of that suspension (core clock) — undefined for a
+   * step's first suspension, defined for a re-suspension. Pairs with
+   * `suspendedAt` in the exact grant binding so two same-step suspensions
+   * whose `suspendedAt` collide within a millisecond stay distinguishable.
+   */
+  resumedAt?: number;
 }
 
 export interface CreateApprovalInput {
@@ -97,6 +105,12 @@ export interface CreateApprovalInput {
    * fall back to the same-clock decidedAt-after-suspension comparison.
    */
   suspendedAt?: number;
+  /**
+   * Epoch-ms resumedAt of that suspension, observed from RunSummary.resumedAt
+   * by the same bridge — undefined for a first suspension, defined for a
+   * re-suspension. Pairs with `suspendedAt` in the exact binding.
+   */
+  resumedAt?: number;
 }
 
 export interface ApprovalListFilter {

@@ -73,9 +73,14 @@ verification gate + `spike:verify` on push/PR to `main`. Phases 1-3:
   flowsafe validates `workflowId` at `register()` (same path-safe pattern as
   runId), ships `purgeExpiredWorkflowRuns` (terminal-status-only TTL purge of
   `mastra_workflow_snapshot`; scheduling stays with the caller), and binds
-  approvals to suspensions clock-free (`RunSummary.suspendedAt` map →
-  `ApprovalRecord.suspendedAt`, exact-match minting with a legacy
-  decidedAt-after fallback for records created without the capture).
+  approvals to suspensions clock-free (`RunSummary.{suspendedAt,resumedAt}`
+  maps → `ApprovalRecord.{suspendedAt,resumedAt}`, exact-match minting on the
+  `(suspendedAt, resumedAt)` pair — `resumedAt` is undefined on a first
+  suspension and defined on a re-suspension, the categorical tie-breaker that
+  keeps same-step suspensions distinct when their `suspendedAt` stamps collide
+  in one ms on the in-process path — with a legacy decidedAt-after fallback for
+  records created without the capture; deep chains of 3+ re-suspensions are a
+  documented residual, deferred to a synthesized monotonic counter).
 
 Phase 4 (Ecosystem, 2026-07-07):
 - breakwater `src/agent-cli/`: Claude Code + Codex as approval-gated
@@ -100,7 +105,7 @@ Phase 4 (Ecosystem, 2026-07-07):
   trigger (isolated failures), bearer-token auth seam, start+resume approval
   bridges (multi-gate), optional Queues audit export. `deploy:cf`/`deploy:dev`.
 
-Verification gate: `pnpm -r lint && pnpm -r typecheck && pnpm -r test && pnpm -r build` (381 tests).
+Verification gate: `pnpm -r lint && pnpm -r typecheck && pnpm -r test && pnpm -r build` (395 tests).
 
 ## Files
 
@@ -164,16 +169,24 @@ runtime — Mastra provides workflows, agents, memory, RAG, and observability.
   APPROVED approval records on every start/resume, so grants never cross an
   HTTP body and the DO's public resume route stays grant-free. Grants are
   SUSPENSION-SCOPED: the runtime passes the resumed step and its current
-  suspension timestamp to the provider, and a step-keyed approval mints
-  preferentially by EXACT MATCH — the creating bridge captures the
-  snapshot's suspendedAt into the record (`ApprovalRecord.suspendedAt`, from
-  `RunSummary.suspendedAt`), and it must equal the resumed leg's suspension
-  timestamp; both sides come from the core clock, so the binding is
-  clock-free. Records created without the capture fall back to
-  decided-strictly-after-suspension, correct on same-clock topologies only.
-  Step-less approvals are explicitly run-scoped — approving a connector at
-  one gate never unlocks it at another gate, and a re-suspension of the same
-  step spends the earlier approval. Because Mastra merges resume-provided context
+  suspension's `(suspendedAt, resumedAt)` fingerprint to the provider, and a
+  step-keyed approval mints preferentially by EXACT MATCH — the creating
+  bridge captures both from the snapshot into the record
+  (`ApprovalRecord.{suspendedAt,resumedAt}`, from
+  `RunSummary.{suspendedAt,resumedAt}`), and both must equal the resumed leg's
+  values; all four come from the core clock, so the binding is clock-free.
+  `resumedAt` is the categorical tie-breaker — undefined on a step's first
+  suspension, defined on a re-suspension — so a spent first-suspension approval
+  never mints into a re-suspension even when the two `suspendedAt` stamps
+  collide within a millisecond (possible only on the synchronous in-process
+  path; production's HTTP+D1 round-trips keep them seconds apart). Records
+  created without the capture fall back to decided-strictly-after-suspension,
+  correct on same-clock topologies only. A deep chain of 3+ re-suspensions
+  compares two defined `resumedAt` values and is a documented residual
+  (deferred to a synthesized monotonic per-(run,step) counter). Step-less
+  approvals are explicitly run-scoped — approving a connector at one gate never
+  unlocks it at another gate, and a re-suspension of the same step spends the
+  earlier approval. Because Mastra merges resume-provided context
   OVER persisted
   context (pinned in runtime.test.ts; omission does not revoke), the
   provider returns the grant key on EVERY leg — empty when nothing applies —

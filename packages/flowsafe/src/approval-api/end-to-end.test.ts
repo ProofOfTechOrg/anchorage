@@ -61,6 +61,19 @@ function suspendedAtFor(summary: unknown, stepPath: readonly string[]): number {
   return at;
 }
 
+// The bridge's resumedAt capture, paired with suspendedAtFor. No throw: a
+// step's FIRST suspension legitimately carries no resumedAt (undefined), which
+// is exactly the signal that distinguishes it from a re-suspension.
+function resumedAtFor(
+  summary: unknown,
+  stepPath: readonly string[],
+): number | undefined {
+  const at = (summary as RunSummary | undefined)?.resumedAt?.[
+    stepPath.join('.')
+  ];
+  return typeof at === 'number' ? at : undefined;
+}
+
 describe('breakwater contract tripwires', () => {
   it('mirrors the approved-connectors key literally', () => {
     expect(BREAKWATER_APPROVED_CONNECTORS_KEY).toBe(
@@ -398,6 +411,7 @@ describe('approval queue end to end', () => {
         runId: started.runId,
         stepPath: ['gateA'],
         suspendedAt: suspendedAtFor(started, ['gateA']),
+        resumedAt: resumedAtFor(started, ['gateA']),
         title: 'Gate A',
         connectors: ['blog-publisher'],
       },
@@ -440,6 +454,7 @@ describe('approval queue end to end', () => {
         runId: started.runId,
         stepPath: ['gateA'],
         suspendedAt: suspendedAtFor(started, ['gateA']),
+        resumedAt: resumedAtFor(started, ['gateA']),
         title: 'Gate A',
         connectors: ['blog-publisher'],
       },
@@ -463,6 +478,7 @@ describe('approval queue end to end', () => {
         runId: started.runId,
         stepPath: ['gateB'],
         suspendedAt: suspendedAtFor(afterA.resume.summary, ['gateB']),
+        resumedAt: resumedAtFor(afterA.resume.summary, ['gateB']),
         title: 'Gate B',
         connectors: ['blog-publisher'],
       },
@@ -488,12 +504,18 @@ describe('approval queue end to end', () => {
       inputData: { topic: 'respun' },
     });
     expect(started.suspended).toEqual([['gate2x']]);
+    // Tripwire for the pair-binding: a FIRST suspension carries no resumedAt.
+    // The forged re-suspension below WILL carry one, and that categorical
+    // undefined-vs-defined gap is what denies deterministically — even if the
+    // two suspensions' suspendedAt stamps collide within a millisecond.
+    expect(resumedAtFor(started, ['gate2x'])).toBeUndefined();
     const { record: first } = await harness.service.create(
       {
         workflowId: 'relaunch',
         runId: started.runId,
         stepPath: ['gate2x'],
         suspendedAt: suspendedAtFor(started, ['gate2x']),
+        resumedAt: resumedAtFor(started, ['gate2x']),
         title: 'Gate 2x — round 1',
         connectors: ['blog-publisher'],
       },
@@ -516,10 +538,12 @@ describe('approval queue end to end', () => {
       resumeData: { approved: true },
     });
 
-    // #then — the round-1 approval is BOUND to suspension #1 by exact
-    // timestamp match, so it never mints into suspension #2 — clock-free:
-    // no reliance on decidedAt ordering relative to the re-suspension
-    // (previously this fail-closed path needed settleClock choreography)
+    // #then — round-1's approval captured resumedAt=undefined (a first
+    // suspension); suspension #2's leg carries a defined resumedAt, so the
+    // (suspendedAt, resumedAt) pair cannot match and the approval never mints
+    // into #2 — deterministically, with no reliance on the suspendedAt stamps
+    // differing (they can collide in-process) or on decidedAt ordering (without
+    // the pair binding, this fail-closed path relied on settleClock ordering).
     expect(forged.status).toBe('failed');
     expect(forged.error).toContain('approval required and not granted');
     expect(harness.publishes()).toBe(0);
@@ -537,6 +561,7 @@ describe('approval queue end to end', () => {
         runId: started.runId,
         stepPath: ['gate2x'],
         suspendedAt: suspendedAtFor(started, ['gate2x']),
+        resumedAt: resumedAtFor(started, ['gate2x']),
         title: 'Gate 2x — round 1',
         connectors: ['blog-publisher'],
       },
@@ -548,15 +573,23 @@ describe('approval queue end to end', () => {
       REVIEWER,
     );
 
+    // The re-suspension carries a DEFINED resumedAt (unlike round 1) — proof
+    // the summary plumbs it end to end; round 2's approval binds to this new
+    // (suspendedAt, resumedAt) pair.
+    expect(resumedAtFor(afterFirst.resume.summary, ['gate2x'])).toBeTypeOf(
+      'number',
+    );
+
     // #when — suspension #2 gets its own request (fresh, not collapsed into
-    // the decided round-1 record), bound to the NEW suspension's timestamp,
-    // and its own approval
+    // the decided round-1 record), bound to the NEW suspension's
+    // (suspendedAt, resumedAt) pair, and its own approval
     const second = await harness.service.create(
       {
         workflowId: 'relaunch',
         runId: started.runId,
         stepPath: ['gate2x'],
         suspendedAt: suspendedAtFor(afterFirst.resume.summary, ['gate2x']),
+        resumedAt: resumedAtFor(afterFirst.resume.summary, ['gate2x']),
         title: 'Gate 2x — round 2',
         connectors: ['blog-publisher'],
       },

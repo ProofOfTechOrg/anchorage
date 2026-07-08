@@ -149,6 +149,9 @@ export class ApprovalService {
     if (input.suspendedAt !== undefined) {
       record.suspendedAt = input.suspendedAt;
     }
+    if (input.resumedAt !== undefined) {
+      record.resumedAt = input.resumedAt;
+    }
     if (input.summary !== undefined) record.summary = input.summary;
     if (input.payload !== undefined) record.payload = input.payload;
     // Attribution powers the self-approval check: default to the creating
@@ -548,6 +551,16 @@ export class ApprovalService {
     ) {
       throw new InvalidApprovalInputError(
         'suspendedAt must be a positive epoch-ms number',
+      );
+    }
+    if (
+      input.resumedAt !== undefined &&
+      (typeof input.resumedAt !== 'number' ||
+        !Number.isFinite(input.resumedAt) ||
+        input.resumedAt <= 0)
+    ) {
+      throw new InvalidApprovalInputError(
+        'resumedAt must be a positive epoch-ms number',
       );
     }
     // The record contract is JSON-safe end to end (types.ts); reject what

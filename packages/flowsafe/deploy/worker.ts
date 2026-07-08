@@ -283,9 +283,9 @@ function requestedConnectors(stepPayload: unknown): string[] {
 /**
  * A suspension IS an approval request: queue it (idempotently — the store's
  * partial unique index collapses duplicates). Capturing the step's
- * suspendedAt binds the approval to THIS suspension exactly (clock-free
- * grant minting), and the suspend payload's `connectors` declares what a
- * decision should mint.
+ * (suspendedAt, resumedAt) pair binds the approval to THIS suspension exactly
+ * (clock-free grant minting), and the suspend payload's `connectors` declares
+ * what a decision should mint.
  *
  * `requestedBy` is the HUMAN who advanced the run to this suspension — the
  * actor who started it, or the reviewer whose decision caused a re-suspension
@@ -318,6 +318,8 @@ async function queueApprovalForSuspension(
       stepPath,
       suspendedAt:
         stepKey !== undefined ? summary.suspendedAt?.[stepKey] : undefined,
+      resumedAt:
+        stepKey !== undefined ? summary.resumedAt?.[stepKey] : undefined,
       title: `Approve '${workflowId}' run`,
       payload: summary.suspendPayload,
       connectors: connectors.length > 0 ? connectors : undefined,

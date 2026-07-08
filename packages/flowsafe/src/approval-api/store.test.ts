@@ -96,6 +96,7 @@ function describeStoreContract(
       const record = makeRecord({
         stepPath: ['approval'],
         suspendedAt: 1751882400000,
+        resumedAt: 1751882460000,
         summary: 'publish the launch post',
         payload: { reason: 'human approval required', nested: { n: 1 } },
         connectors: ['blog-publisher', 'mailer'],
@@ -407,8 +408,8 @@ describeStoreContract(
 );
 
 describe('D1ApprovalStore schema upgrade', () => {
-  // The pre-1.0 spike-era column set — no suspended_at. Mirrors the shipped
-  // SCHEMA_STATEMENTS as of the Phase 3 release.
+  // The pre-1.0 spike-era column set — no suspended_at, no resumed_at. Mirrors
+  // the shipped SCHEMA_STATEMENTS as of the Phase 3 release.
   const LEGACY_TABLE_DDL = `CREATE TABLE flowsafe_approvals (
     id TEXT PRIMARY KEY,
     workflow_id TEXT NOT NULL,
@@ -435,9 +436,9 @@ describe('D1ApprovalStore schema upgrade', () => {
     sla_deadline_at TEXT
   )`;
 
-  it('backfills suspended_at onto a pre-1.0 table and keeps legacy rows fallback-scoped', async () => {
-    // #given — a spike database created BEFORE the suspended_at column
-    // existed, already holding a decided legacy row
+  it('backfills suspended_at and resumed_at onto a pre-1.0 table and keeps legacy rows fallback-scoped', async () => {
+    // #given — a spike database created BEFORE the suspended_at/resumed_at
+    // columns existed, already holding a decided legacy row
     const sqlite = openSqlite();
     sqlite.prepare(LEGACY_TABLE_DDL).run();
     sqlite
@@ -455,17 +456,21 @@ describe('D1ApprovalStore schema upgrade', () => {
     const store = new D1ApprovalStore(d1Like(sqlite));
     const legacy = await store.get('legacy-1');
 
-    // #then — the legacy row reads back with NO suspendedAt, so grant
-    // minting falls to the legacy decidedAt-after comparison for it...
+    // #then — the legacy row reads back with NO suspendedAt/resumedAt, so
+    // grant minting falls to the legacy decidedAt-after comparison for it...
     expect(legacy).toMatchObject({ id: 'legacy-1', status: 'approved' });
     expect(legacy?.suspendedAt).toBeUndefined();
+    expect(legacy?.resumedAt).toBeUndefined();
 
-    // ...and a fresh record round-trips the backfilled column
+    // ...and a fresh record round-trips both backfilled columns
     const fresh = makeRecord({
       stepPath: ['gate'],
       suspendedAt: 1751882400000,
+      resumedAt: 1751882460000,
     });
     await store.create(fresh);
-    expect((await store.get(fresh.id))?.suspendedAt).toBe(1751882400000);
+    const readBack = await store.get(fresh.id);
+    expect(readBack?.suspendedAt).toBe(1751882400000);
+    expect(readBack?.resumedAt).toBe(1751882460000);
   });
 });

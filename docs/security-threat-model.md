@@ -37,17 +37,24 @@ Agentic workflows can read sensitive data, produce persuasive content, and write
    HTTP boundary. Grants are SUSPENSION-SCOPED: a step-keyed approval
    unlocks its connectors only for the leg that resumes that step, and only
    when the decision binds to the step's CURRENT suspension. The primary
-   binding is EXACT and clock-free: the creating bridge captures the
-   snapshot's `suspendedAt` into the record
-   (`CreateApprovalInput.suspendedAt`, observed from
-   `RunSummary.suspendedAt`), and minting requires it to equal the
-   `suspendedAt` the runner passes to the provider -- both values come from
-   the core clock, so no cross-clock comparison exists and clock skew
-   between a split approval service and runner cannot mis-mint. So approving
-   a connector at one approval point never unlocks it at another point of
-   the run, and when the same step suspends again the earlier approval is
-   spent -- the new suspension needs its own decision, and a rejected
-   re-request never falls back to an old approval. Records created WITHOUT
+   binding is EXACT and clock-free on the `(suspendedAt, resumedAt)`
+   fingerprint: the creating bridge captures both from the snapshot into the
+   record (`CreateApprovalInput.{suspendedAt,resumedAt}`, observed from
+   `RunSummary.{suspendedAt,resumedAt}`), and minting requires both to equal
+   the values the runner passes to the provider -- all come from the core
+   clock, so no cross-clock comparison exists and clock skew between a split
+   approval service and runner cannot mis-mint. `resumedAt` is the
+   categorical tie-breaker -- undefined on a step's first suspension, defined
+   on a re-suspension -- so a spent first-suspension approval never mints
+   into a re-suspension even if the two `suspendedAt` stamps collide within a
+   millisecond (possible only on the synchronous in-process path; production's
+   HTTP+D1 round-trips keep them seconds apart). So approving a connector at
+   one approval point never unlocks it at another point of the run, and when
+   the same step suspends again the earlier approval is spent -- the new
+   suspension needs its own decision, and a rejected re-request never falls
+   back to an old approval. A deep chain of three-plus re-suspensions compares
+   two defined `resumedAt` values and is a documented residual (deferred to a
+   synthesized monotonic per-(run,step) counter). Records created WITHOUT
    capturing the suspension (legacy/pre-capture bridges) fall back to
    chronology (`decidedAt` strictly after `suspendedAt` -- deny-deterministic
    under a shared clock); only that fallback carries the same-clock

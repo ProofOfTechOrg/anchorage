@@ -42,6 +42,18 @@ const RESUME_GATE: RunLeg = {
   suspendedAt: SUSPENDED_AT,
 };
 
+// A RE-suspension of the same 'gate' step: the leg carries a DEFINED resumedAt
+// (the step was resumed once, then suspended again). A first suspension's leg
+// has resumedAt undefined (RESUME_GATE above) — the categorical difference the
+// pair binding leans on.
+const RESUMED_AT = Date.parse('2026-07-06T12:03:00.000Z');
+const RESUME_GATE_RESUSPENDED: RunLeg = {
+  kind: 'resume',
+  step: ['gate'],
+  suspendedAt: SUSPENDED_AT,
+  resumedAt: RESUMED_AT,
+};
+
 describe('approvedConnectorsForLeg', () => {
   it('unions run-scoped records with step records decided during the current suspension', async () => {
     // #given — approved for 'gate' during this suspension, approved
@@ -258,6 +270,89 @@ describe('approvedConnectorsForLeg — exact suspension binding', () => {
     expect(
       await approvedConnectorsForLeg(store, 'wf', 'run-1', RESUME_GATE),
     ).toEqual(['run-wide']);
+  });
+});
+
+describe('approvedConnectorsForLeg — same-step re-suspension pair binding', () => {
+  it('denies a first-suspension approval on a re-suspension leg even when suspendedAt collides', async () => {
+    // #given — an approval bound to the step's FIRST suspension (resumedAt
+    // undefined); the leg is a RE-suspension of the SAME step at the SAME
+    // suspendedAt (the in-process same-millisecond collision). Only resumedAt
+    // separates them — undefined on the record, defined on the leg. On the
+    // pre-fix suspendedAt-only rule this WOULD have minted (the flake).
+    const store = new InMemoryApprovalStore();
+    await store.create(
+      record({
+        status: 'approved',
+        stepPath: ['gate'],
+        suspendedAt: SUSPENDED_AT,
+        connectors: ['mailer'],
+        decidedAt: DECIDED_DURING,
+      }),
+    );
+
+    // #when / #then — the spent round-1 approval must not mint into round 2
+    expect(
+      await approvedConnectorsForLeg(
+        store,
+        'wf',
+        'run-1',
+        RESUME_GATE_RESUSPENDED,
+      ),
+    ).toEqual([]);
+  });
+
+  it('mints a re-suspension approval whose (suspendedAt, resumedAt) pair matches', async () => {
+    // #given — the approval is bound to THIS re-suspension: both timestamps
+    // captured from the same snapshot
+    const store = new InMemoryApprovalStore();
+    await store.create(
+      record({
+        status: 'approved',
+        stepPath: ['gate'],
+        suspendedAt: SUSPENDED_AT,
+        resumedAt: RESUMED_AT,
+        connectors: ['mailer'],
+        decidedAt: DECIDED_DURING,
+      }),
+    );
+
+    // #when / #then
+    expect(
+      await approvedConnectorsForLeg(
+        store,
+        'wf',
+        'run-1',
+        RESUME_GATE_RESUSPENDED,
+      ),
+    ).toEqual(['mailer']);
+  });
+
+  it('denies when resumedAt differs even though suspendedAt matches', async () => {
+    // #given — bound to a DIFFERENT re-suspension of this step (same
+    // suspendedAt, later resumedAt) — the deep-chain deny direction the pair
+    // still catches when both sides carry a defined resumedAt
+    const store = new InMemoryApprovalStore();
+    await store.create(
+      record({
+        status: 'approved',
+        stepPath: ['gate'],
+        suspendedAt: SUSPENDED_AT,
+        resumedAt: RESUMED_AT + 60_000,
+        connectors: ['mailer'],
+        decidedAt: DECIDED_DURING,
+      }),
+    );
+
+    // #when / #then
+    expect(
+      await approvedConnectorsForLeg(
+        store,
+        'wf',
+        'run-1',
+        RESUME_GATE_RESUSPENDED,
+      ),
+    ).toEqual([]);
   });
 });
 

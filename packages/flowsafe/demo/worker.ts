@@ -262,8 +262,8 @@ const handler: ExportedHandler<Env> = {
       if (summary.status !== 'suspended') return json(summary);
       // A suspension IS an approval request: queue it (idempotently — the
       // partial unique index collapses duplicates) so reviewers see it.
-      // Capturing the step's suspendedAt binds the approval to THIS
-      // suspension exactly (clock-free grant minting).
+      // Capturing the step's (suspendedAt, resumedAt) pair binds the approval
+      // to THIS suspension exactly (clock-free grant minting).
       const service = buildApprovalService(env);
       const stepPath = summary.suspended?.[0];
       const stepKey = stepPath?.join('.');
@@ -279,6 +279,8 @@ const handler: ExportedHandler<Env> = {
           stepPath,
           suspendedAt:
             stepKey !== undefined ? summary.suspendedAt?.[stepKey] : undefined,
+          resumedAt:
+            stepKey !== undefined ? summary.resumedAt?.[stepKey] : undefined,
           title: `Approve '${body.workflowId}' run`,
           payload: summary.suspendPayload,
           connectors: [PUBLISH_CONNECTOR],

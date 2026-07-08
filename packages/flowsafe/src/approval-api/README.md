@@ -99,6 +99,8 @@ grant in its requestContext.
 - `decidedAt` (service clock) is compared against `suspendedAt` (engine
   clock): deployments must keep them on a shared clock (true same-Worker and
   on Cloudflare). The clock-free hardening — capturing the snapshot's
-  `suspendedAt` into the record at create time and matching exactly — is
-  implemented as the exact-match suspension binding.
+  `(suspendedAt, resumedAt)` pair into the record at create time and matching
+  both exactly — is implemented as the exact-match suspension binding;
+  `resumedAt` (undefined on a first suspension, defined on a re-suspension)
+  keeps same-step suspensions distinct when their `suspendedAt` collide.
 - `escalated` stays decidable; `approved`/`rejected` are terminal.
