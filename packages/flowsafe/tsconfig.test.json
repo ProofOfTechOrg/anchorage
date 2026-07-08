@@ -10,6 +10,6 @@
       "@proofoftech/breakwater": ["../breakwater/src/index.ts"]
     }
   },
-  "include": ["src"],
+  "include": ["src", "examples"],
   "exclude": ["src/approval-ui/**/*.tsx", "src/approval-ui/index.ts"]
 }
