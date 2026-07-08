@@ -152,6 +152,9 @@ export class ApprovalService {
     if (input.resumedAt !== undefined) {
       record.resumedAt = input.resumedAt;
     }
+    if (input.resumeCount !== undefined) {
+      record.resumeCount = input.resumeCount;
+    }
     if (input.summary !== undefined) record.summary = input.summary;
     if (input.payload !== undefined) record.payload = input.payload;
     // Attribution powers the self-approval check: default to the creating
@@ -561,6 +564,19 @@ export class ApprovalService {
     ) {
       throw new InvalidApprovalInputError(
         'resumedAt must be a positive epoch-ms number',
+      );
+    }
+    // resumeCount is the runtime resume ordinal — a positive integer (1,2,…);
+    // undefined means a first suspension. Unlike the timestamps it is a count,
+    // so it must be an integer.
+    if (
+      input.resumeCount !== undefined &&
+      (typeof input.resumeCount !== 'number' ||
+        !Number.isInteger(input.resumeCount) ||
+        input.resumeCount <= 0)
+    ) {
+      throw new InvalidApprovalInputError(
+        'resumeCount must be a positive integer',
       );
     }
     // The record contract is JSON-safe end to end (types.ts); reject what

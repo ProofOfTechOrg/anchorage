@@ -798,13 +798,15 @@ describe('RunnerRuntime requestContextForRun', () => {
   });
 });
 
-describe('RunnerRuntime resumedAt projection (re-suspension)', () => {
-  // The do-runner OWNS the RunSummary/RunLeg projection of Mastra's snapshot,
-  // so the layer that publishes the resumedAt contract must pin it against the
-  // real engine — otherwise a Mastra bump could silently change
-  // "resumedAt absent on first suspension, present on re-suspension" (the
-  // categorical signal flowsafe's grant binding depends on) with no tripwire
-  // here. gate2x suspends, resumes, then suspends AGAIN before completing.
+describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
+  // The do-runner OWNS the RunSummary/RunLeg projection, so the layer that
+  // publishes the resumeCount contract must pin it against the real engine.
+  // resumeCount is the categorical signal flowsafe's grant binding depends on
+  // ("undefined on first suspension, defined on re-suspension"); unlike the
+  // informational resumedAt (which Mastra stamps only on a payload-bearing
+  // resume) the runtime increments resumeCount on EVERY resume, so it holds
+  // even for a no-payload re-suspension. gate2x suspends, and re-suspends on a
+  // no-payload resume (round 1) or after a payload resume (round 2).
   function buildReSuspender(onLeg?: (leg: RunLeg) => void): RunnerRuntime {
     let rounds = 0;
     const { createWorkflow, createStep, runtime } = init(
@@ -823,7 +825,10 @@ describe('RunnerRuntime resumedAt projection (re-suspension)', () => {
       inputSchema: z.object({}),
       outputSchema: z.object({}),
       suspendSchema: z.object({ reason: z.string() }),
-      resumeSchema: z.object({ go: z.boolean() }),
+      // No resumeSchema on purpose: with a required schema, core rejects a
+      // no-payload resume before execute, so the falsy-resume re-suspension
+      // (the bug's trigger) is unreachable. Without one, a falsy resume passes
+      // validation and re-suspends via the guard below.
       execute: async ({ resumeData, suspend }) => {
         if (!resumeData) return suspend({ reason: 'round 1' });
         rounds += 1;
@@ -841,33 +846,93 @@ describe('RunnerRuntime resumedAt projection (re-suspension)', () => {
     return runtime;
   }
 
-  it('omits resumedAt on the first suspension and carries it on a re-suspension', async () => {
+  it('omits resumeCount on the first suspension and carries it on a re-suspension', async () => {
     // #given
     const runtime = buildReSuspender();
 
     // #when — first suspension
     const started = await runtime.start('resuspend', { inputData: {} });
 
-    // #then — a first suspension carries suspendedAt but NO resumedAt; this
+    // #then — a first suspension carries suspendedAt but NO resumeCount; this
     // undefined is the categorical tie-breaker the grant binding relies on
     expect(started.status).toBe('suspended');
     expect(started.suspendedAt?.gate2x).toBeTypeOf('number');
-    expect(started.resumedAt?.gate2x).toBeUndefined();
+    expect(started.resumeCount?.gate2x).toBeUndefined();
 
-    // #when — resume; gate2x runs and re-suspends (round 2)
+    // #when — resume (payload); gate2x runs and re-suspends (round 2)
     const reSuspended = await runtime.resume('resuspend', started.runId, {
       step: 'gate2x',
       resumeData: { go: true },
     });
 
-    // #then — the re-suspension summary now carries a defined resumedAt paired
-    // with a fresh suspendedAt
+    // #then — the re-suspension summary carries resumeCount 1 (one resume so
+    // far); resumedAt is also present here because the resume carried a payload
     expect(reSuspended.suspended).toEqual([['gate2x']]);
-    expect(reSuspended.resumedAt?.gate2x).toBeTypeOf('number');
+    expect(reSuspended.resumeCount?.gate2x).toBe(1);
     expect(reSuspended.suspendedAt?.gate2x).toBeTypeOf('number');
+    expect(reSuspended.resumedAt?.gate2x).toBeTypeOf('number');
   });
 
-  it('passes resumedAt on the resume leg only once the step has re-suspended', async () => {
+  it('carries resumeCount on a NO-PAYLOAD re-suspension even though Mastra omits resumedAt', async () => {
+    // #given — the regression: a falsy resume re-suspends via
+    // `if (!resumeData) return suspend(...)`, so Mastra never stamps resumedAt.
+    const runtime = buildReSuspender();
+    const started = await runtime.start('resuspend', { inputData: {} });
+
+    // #when — resume with NO resumeData; gate2x re-suspends (round 1 again)
+    const reSuspended = await runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+    });
+
+    // #then — resumedAt stays undefined (Mastra's payload-conditional stamp),
+    // but the runtime-owned resumeCount is present, so the grant binding can
+    // still tell this re-suspension apart from the first suspension. Pre-fix
+    // (resumeCount did not exist) this re-suspension was indistinguishable.
+    expect(reSuspended.suspended).toEqual([['gate2x']]);
+    expect(reSuspended.resumedAt?.gate2x).toBeUndefined();
+    expect(reSuspended.resumeCount?.gate2x).toBe(1);
+  });
+
+  it('a required resumeSchema rejects a no-payload resume (why the falsy path needs a schema-less step)', async () => {
+    // Tripwire pinning the Mastra-version-dependent boundary the falsy-resume
+    // fixtures rely on: with a REQUIRED resumeSchema, core validates resume
+    // data and rejects a no-payload resume BEFORE execute, so the falsy-resume
+    // re-suspension (the bug's trigger) is only reachable for schema-less /
+    // optional-schema / validateInputs-off steps. If a Mastra bump changes
+    // this, the "schema-less fixture required" assumption (buildReSuspender,
+    // the relaunch-falsy e2e fixture) goes silently stale.
+    const { createWorkflow, createStep, runtime } = init({
+      storage: new InMemoryStore(),
+    });
+    const schemaGate = createStep({
+      id: 'schemaGate',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      suspendSchema: z.object({ reason: z.string() }),
+      resumeSchema: z.object({ go: z.boolean() }),
+      execute: async ({ resumeData, suspend }) => {
+        if (!resumeData) return suspend({ reason: 'awaiting' });
+        return {};
+      },
+    });
+    createWorkflow({
+      id: 'schema-gate',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(schemaGate)
+      .commit();
+    const started = await runtime.start('schema-gate', { inputData: {} });
+    expect(started.status).toBe('suspended');
+
+    // #when / #then — a no-payload resume is rejected as invalid resume data,
+    // never reaching execute (so it cannot re-suspend without a resumedAt)
+    await expect(
+      runtime.resume('schema-gate', started.runId, { step: 'schemaGate' }),
+    ).rejects.toThrow(/resume data/i);
+  });
+
+  it('passes resumeCount on the resume leg, incrementing per resume', async () => {
     // #given — a provider recording every leg
     const legs: RunLeg[] = [];
     const runtime = buildReSuspender((leg) => legs.push(leg));
@@ -879,14 +944,14 @@ describe('RunnerRuntime resumedAt projection (re-suspension)', () => {
       resumeData: { go: true },
     });
 
-    // #then — the leg that reattached to the FIRST suspension read a snapshot
-    // with no resumedAt yet, so its resumedAt is undefined
+    // #then — the leg that reattached to the FIRST suspension read the ledger
+    // before any resume, so its resumeCount is undefined
     expect(legs[1]).toMatchObject({
       kind: 'resume',
       step: ['gate2x'],
       suspendedAt: expect.any(Number),
     });
-    expect((legs[1] as { resumedAt?: number }).resumedAt).toBeUndefined();
+    expect((legs[1] as { resumeCount?: number }).resumeCount).toBeUndefined();
 
     // #when — resume again, reattaching to the RE-suspension
     const done = await runtime.resume('resuspend', started.runId, {
@@ -894,13 +959,71 @@ describe('RunnerRuntime resumedAt projection (re-suspension)', () => {
       resumeData: { go: true },
     });
 
-    // #then — that leg's snapshot carries resumedAt, so the leg does too
+    // #then — one prior resume happened, so this leg carries resumeCount 1
     expect(done.status).toBe('success');
     expect(legs[2]).toMatchObject({
       kind: 'resume',
       step: ['gate2x'],
       suspendedAt: expect.any(Number),
-      resumedAt: expect.any(Number),
+      resumeCount: 1,
     });
+  });
+
+  it('marks only the resumed branch, leaving a co-suspended branch a first suspension', async () => {
+    // #given — two parallel gates both suspend; gateA re-suspends on a payload
+    // resume (round 2), gateB stays at its first suspension.
+    const { createWorkflow, createStep, runtime } = init({
+      storage: new InMemoryStore(),
+    });
+    let aRounds = 0;
+    const gateA = createStep({
+      id: 'gateA',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ ok: z.boolean() }),
+      suspendSchema: z.object({ reason: z.string() }),
+      resumeSchema: z.object({ go: z.boolean() }),
+      execute: async ({ resumeData, suspend }) => {
+        if (!resumeData) return suspend({ reason: 'A round 1' });
+        aRounds += 1;
+        if (aRounds < 2) return suspend({ reason: 'A round 2' });
+        return { ok: true };
+      },
+    });
+    const gateB = createStep({
+      id: 'gateB',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ ok: z.boolean() }),
+      suspendSchema: z.object({ reason: z.string() }),
+      resumeSchema: z.object({ go: z.boolean() }),
+      execute: async ({ resumeData, suspend }) =>
+        resumeData ? { ok: true } : suspend({ reason: 'B waits' }),
+    });
+    createWorkflow({
+      id: 'parallel-resuspend',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .parallel([gateA, gateB])
+      .commit();
+    const started = await runtime.start('parallel-resuspend', {
+      inputData: {},
+    });
+    expect(started.suspended).toHaveLength(2);
+    expect(started.resumeCount?.gateA).toBeUndefined();
+    expect(started.resumeCount?.gateB).toBeUndefined();
+
+    // #when — resume ONLY gateA; it re-suspends (round 2), gateB is untouched
+    const reSuspended = await runtime.resume(
+      'parallel-resuspend',
+      started.runId,
+      { step: 'gateA', resumeData: { go: true } },
+    );
+
+    // #then — gateA carries resumeCount 1 (it was resumed); gateB, never
+    // resumed, stays undefined — its own first suspension, not collapsed into
+    // gateA's ordinal by the shared ledger.
+    expect(reSuspended.status).toBe('suspended');
+    expect(reSuspended.resumeCount?.gateA).toBe(1);
+    expect(reSuspended.resumeCount?.gateB).toBeUndefined();
   });
 });

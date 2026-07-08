@@ -46,6 +46,7 @@ const SCHEMA_STATEMENTS: readonly string[] = [
     step_path TEXT,
     suspended_at INTEGER,
     resumed_at INTEGER,
+    resume_count INTEGER,
     title TEXT NOT NULL,
     summary TEXT,
     payload TEXT,
@@ -80,6 +81,7 @@ interface ApprovalRow {
   step_path: string | null;
   suspended_at: number | null;
   resumed_at: number | null;
+  resume_count: number | null;
   title: string;
   summary: string | null;
   payload: string | null;
@@ -131,6 +133,7 @@ function rowToRecord(row: ApprovalRow): ApprovalRecord {
   // column (undefined) as well as the stored NULL.
   if (row.suspended_at != null) record.suspendedAt = row.suspended_at;
   if (row.resumed_at != null) record.resumedAt = row.resumed_at;
+  if (row.resume_count != null) record.resumeCount = row.resume_count;
   if (row.summary !== null) record.summary = row.summary;
   if (row.payload !== null) record.payload = JSON.parse(row.payload);
   if (row.requested_by !== null) record.requestedBy = row.requested_by;
@@ -172,11 +175,11 @@ export class D1ApprovalStore implements ApprovalStore {
         .prepare(
           `INSERT INTO ${TABLE} (
             id, workflow_id, run_id, step_key, step_path, suspended_at,
-            resumed_at, title, summary, payload, connectors, priority, status,
-            requested_by, claimed_by, decided_by, decision, comment,
-            delegated_to, created_at, updated_at, claimed_at, decided_at,
-            escalated_at, sla_deadline_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            resumed_at, resume_count, title, summary, payload, connectors,
+            priority, status, requested_by, claimed_by, decided_by, decision,
+            comment, delegated_to, created_at, updated_at, claimed_at,
+            decided_at, escalated_at, sla_deadline_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .bind(
           record.id,
@@ -186,6 +189,7 @@ export class D1ApprovalStore implements ApprovalStore {
           record.stepPath ? JSON.stringify(record.stepPath) : null,
           record.suspendedAt ?? null,
           record.resumedAt ?? null,
+          record.resumeCount ?? null,
           record.title,
           record.summary ?? null,
           record.payload === undefined ? null : JSON.stringify(record.payload),
@@ -325,19 +329,20 @@ export class D1ApprovalStore implements ApprovalStore {
       await this.#db.prepare(statement).run();
     }
     // Pre-existing databases (.wrangler/ spike state, or an earlier release)
-    // predate suspended_at and/or resumed_at, and there is no migration
-    // machinery: CREATE IF NOT EXISTS skips the table, so backfill each
-    // missing column in place. A DB from the suspended_at-only release has
-    // that column but not resumed_at — the per-column loop upgrades it. Only
-    // the duplicate-column error (the table already has the column) is
+    // predate suspended_at, resumed_at, and/or resume_count, and there is no
+    // migration machinery: CREATE IF NOT EXISTS skips the table, so backfill
+    // each missing column in place. A DB from an earlier release has the
+    // older columns but not resume_count — the per-column loop upgrades it.
+    // Only the duplicate-column error (the table already has the column) is
     // swallowed; anything else propagates. The column names are fixed
     // literals, so the interpolation carries no injection surface. Upgrade
-    // window: an approval decided under the suspended_at-only schema and bound
-    // to a re-suspension reads back with resumed_at NULL, so the tightened
-    // (suspendedAt, resumedAt) pair binding re-denies it fail-closed — the run
-    // stays suspended and a fresh approval for the current suspension mints
-    // correctly (grants.ts).
-    for (const column of ['suspended_at', 'resumed_at']) {
+    // window: an approval decided under a pre-resume_count schema and bound to
+    // a re-suspension reads back with resume_count NULL, so the tightened
+    // (suspendedAt, resumeCount) pair binding re-denies it fail-closed — the
+    // run stays suspended and a fresh approval for the current suspension mints
+    // correctly (grants.ts). A pre-resume_count first-suspension approval still
+    // mints (resume_count NULL matches a first-suspension leg's undefined).
+    for (const column of ['suspended_at', 'resumed_at', 'resume_count']) {
       try {
         await this.#db
           .prepare(`ALTER TABLE ${TABLE} ADD COLUMN ${column} INTEGER`)

@@ -37,24 +37,36 @@ Agentic workflows can read sensitive data, produce persuasive content, and write
    HTTP boundary. Grants are SUSPENSION-SCOPED: a step-keyed approval
    unlocks its connectors only for the leg that resumes that step, and only
    when the decision binds to the step's CURRENT suspension. The primary
-   binding is EXACT and clock-free on the `(suspendedAt, resumedAt)`
-   fingerprint: the creating bridge captures both from the snapshot into the
-   record (`CreateApprovalInput.{suspendedAt,resumedAt}`, observed from
-   `RunSummary.{suspendedAt,resumedAt}`), and minting requires both to equal
-   the values the runner passes to the provider -- all come from the core
-   clock, so no cross-clock comparison exists and clock skew between a split
-   approval service and runner cannot mis-mint. `resumedAt` is the
-   categorical tie-breaker -- undefined on a step's first suspension, defined
-   on a re-suspension -- so a spent first-suspension approval never mints
-   into a re-suspension even if the two `suspendedAt` stamps collide within a
+   binding is EXACT and clock-free on the `(suspendedAt, resumeCount)`
+   fingerprint: the creating bridge captures both into the record
+   (`CreateApprovalInput.{suspendedAt,resumeCount}`, observed from
+   `RunSummary.{suspendedAt,resumeCount}`), and minting requires both to equal
+   the values the runner passes to the provider. `suspendedAt` comes from the
+   core clock; `resumeCount` is the runtime-owned monotonic per-(run,step)
+   resume ordinal, so no cross-clock comparison exists and clock skew between a
+   split approval service and runner cannot mis-mint. `resumeCount` is the
+   categorical tie-breaker -- undefined on a step's first suspension, `1,2,...`
+   on re-suspensions, and incremented by the runtime on EVERY resume regardless
+   of payload -- so a spent first-suspension approval never mints into a
+   re-suspension even if the two `suspendedAt` stamps collide within a
    millisecond (possible only on the synchronous in-process path; production's
-   HTTP+D1 round-trips keep them seconds apart). So approving a connector at
-   one approval point never unlocks it at another point of the run, and when
-   the same step suspends again the earlier approval is spent -- the new
-   suspension needs its own decision, and a rejected re-request never falls
-   back to an old approval. A deep chain of three-plus re-suspensions compares
-   two defined `resumedAt` values and is a documented residual (deferred to a
-   synthesized monotonic per-(run,step) counter). Records created WITHOUT
+   HTTP+D1 round-trips keep them seconds apart), and a no-payload re-suspension
+   (which Mastra leaves without a `resumedAt`, the reason the earlier
+   `resumedAt`-based binding leaked) stays distinguishable. So approving a
+   connector at one approval point never unlocks it at another point of the run,
+   and when the same step suspends again the earlier approval is spent -- the
+   new suspension needs its own decision, and a rejected re-request never falls
+   back to an old approval. Because the ordinal strictly increments it never
+   collides, so this binding also closes the deep-chain (three-plus
+   re-suspension) residual the prior `(suspendedAt, resumedAt)` binding left
+   open; `resumedAt` is retained as informational audit metadata only. The
+   ledger is in-memory, so across a DO restart it resets -- but this can never
+   leak: a same-ms `suspendedAt` collision (the only case the ordinal guards)
+   requires a synchronous in-memory store with no I/O between the two suspends,
+   so same-ms-collision and surviving-a-restart are mutually exclusive. A
+   durable (D1) deployment gives the two suspensions distinct `suspendedAt`, so
+   the exact-match still denies fail-closed (a re-deny, never a leak). Records
+   created WITHOUT
    capturing the suspension (legacy/pre-capture bridges) fall back to
    chronology (`decidedAt` strictly after `suspendedAt` -- deny-deterministic
    under a shared clock); only that fallback carries the same-clock

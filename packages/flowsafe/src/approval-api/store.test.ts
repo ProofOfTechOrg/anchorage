@@ -97,6 +97,7 @@ function describeStoreContract(
         stepPath: ['approval'],
         suspendedAt: 1751882400000,
         resumedAt: 1751882460000,
+        resumeCount: 2,
         summary: 'publish the launch post',
         payload: { reason: 'human approval required', nested: { n: 1 } },
         connectors: ['blog-publisher', 'mailer'],
@@ -436,9 +437,9 @@ describe('D1ApprovalStore schema upgrade', () => {
     sla_deadline_at TEXT
   )`;
 
-  it('backfills suspended_at and resumed_at onto a pre-1.0 table and keeps legacy rows fallback-scoped', async () => {
-    // #given — a spike database created BEFORE the suspended_at/resumed_at
-    // columns existed, already holding a decided legacy row
+  it('backfills suspended_at, resumed_at and resume_count onto a pre-1.0 table and keeps legacy rows fallback-scoped', async () => {
+    // #given — a spike database created BEFORE the suspended_at/resumed_at/
+    // resume_count columns existed, already holding a decided legacy row
     const sqlite = openSqlite();
     sqlite.prepare(LEGACY_TABLE_DDL).run();
     sqlite
@@ -456,21 +457,95 @@ describe('D1ApprovalStore schema upgrade', () => {
     const store = new D1ApprovalStore(d1Like(sqlite));
     const legacy = await store.get('legacy-1');
 
-    // #then — the legacy row reads back with NO suspendedAt/resumedAt, so
-    // grant minting falls to the legacy decidedAt-after comparison for it...
+    // #then — the legacy row reads back with NO suspendedAt/resumedAt/
+    // resumeCount, so grant minting falls to the legacy decidedAt-after
+    // comparison for it...
     expect(legacy).toMatchObject({ id: 'legacy-1', status: 'approved' });
     expect(legacy?.suspendedAt).toBeUndefined();
     expect(legacy?.resumedAt).toBeUndefined();
+    expect(legacy?.resumeCount).toBeUndefined();
 
-    // ...and a fresh record round-trips both backfilled columns
+    // ...and a fresh record round-trips all three backfilled columns
     const fresh = makeRecord({
       stepPath: ['gate'],
       suspendedAt: 1751882400000,
       resumedAt: 1751882460000,
+      resumeCount: 1,
     });
     await store.create(fresh);
     const readBack = await store.get(fresh.id);
     expect(readBack?.suspendedAt).toBe(1751882400000);
     expect(readBack?.resumedAt).toBe(1751882460000);
+    expect(readBack?.resumeCount).toBe(1);
+  });
+
+  // The realistic upgrade path: a DB from the (suspendedAt, resumedAt)-binding
+  // release already has suspended_at AND resumed_at populated but lacks
+  // resume_count. The intermediate table only needs the resume_count ALTER.
+  const V1_TABLE_DDL = `CREATE TABLE flowsafe_approvals (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    step_key TEXT NOT NULL DEFAULT '',
+    step_path TEXT,
+    suspended_at INTEGER,
+    resumed_at INTEGER,
+    title TEXT NOT NULL,
+    summary TEXT,
+    payload TEXT,
+    connectors TEXT NOT NULL DEFAULT '[]',
+    priority TEXT NOT NULL,
+    status TEXT NOT NULL,
+    requested_by TEXT,
+    claimed_by TEXT,
+    decided_by TEXT,
+    decision TEXT,
+    comment TEXT,
+    delegated_to TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    claimed_at TEXT,
+    decided_at TEXT,
+    escalated_at TEXT,
+    sla_deadline_at TEXT
+  )`;
+
+  it('backfills resume_count onto a (suspendedAt, resumedAt)-vintage table without disturbing populated timestamps', async () => {
+    // #given — a DB from the prior binding release: a re-suspension approval
+    // already carries suspended_at AND resumed_at, but no resume_count column
+    const sqlite = openSqlite();
+    sqlite.prepare(V1_TABLE_DDL).run();
+    sqlite
+      .prepare(
+        `INSERT INTO flowsafe_approvals
+         (id, workflow_id, run_id, step_key, step_path, suspended_at,
+          resumed_at, title, priority, status, decided_at, created_at,
+          updated_at)
+         VALUES ('v1-1', 'wf', 'run-v1', 'gate', '["gate"]', 1751882400000,
+                 1751882460000, 'v1 approval', 'normal', 'approved', ?, ?, ?)`,
+      )
+      .run(T, T, T);
+
+    // #when — instantiating the store triggers only the resume_count ALTER
+    const store = new D1ApprovalStore(d1Like(sqlite));
+    const v1 = await store.get('v1-1');
+
+    // #then — the populated suspended_at/resumed_at survive the ALTER intact,
+    // and resume_count reads back undefined (a legacy re-suspension record:
+    // grant minting matches a first-suspension leg and fails closed on a
+    // re-suspension leg — the documented upgrade-window re-deny)
+    expect(v1).toMatchObject({ id: 'v1-1', status: 'approved' });
+    expect(v1?.suspendedAt).toBe(1751882400000);
+    expect(v1?.resumedAt).toBe(1751882460000);
+    expect(v1?.resumeCount).toBeUndefined();
+
+    // ...and a fresh record still round-trips resume_count on the upgraded table
+    const fresh = makeRecord({
+      stepPath: ['gate'],
+      suspendedAt: 1751882400000,
+      resumeCount: 3,
+    });
+    await store.create(fresh);
+    expect((await store.get(fresh.id))?.resumeCount).toBe(3);
   });
 });

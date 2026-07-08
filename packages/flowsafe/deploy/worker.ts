@@ -320,6 +320,8 @@ async function queueApprovalForSuspension(
         stepKey !== undefined ? summary.suspendedAt?.[stepKey] : undefined,
       resumedAt:
         stepKey !== undefined ? summary.resumedAt?.[stepKey] : undefined,
+      resumeCount:
+        stepKey !== undefined ? summary.resumeCount?.[stepKey] : undefined,
       title: `Approve '${workflowId}' run`,
       payload: summary.suspendPayload,
       connectors: connectors.length > 0 ? connectors : undefined,

@@ -73,14 +73,19 @@ verification gate + `spike:verify` on push/PR to `main`. Phases 1-3:
   flowsafe validates `workflowId` at `register()` (same path-safe pattern as
   runId), ships `purgeExpiredWorkflowRuns` (terminal-status-only TTL purge of
   `mastra_workflow_snapshot`; scheduling stays with the caller), and binds
-  approvals to suspensions clock-free (`RunSummary.{suspendedAt,resumedAt}`
-  maps → `ApprovalRecord.{suspendedAt,resumedAt}`, exact-match minting on the
-  `(suspendedAt, resumedAt)` pair — `resumedAt` is undefined on a first
-  suspension and defined on a re-suspension, the categorical tie-breaker that
-  keeps same-step suspensions distinct when their `suspendedAt` stamps collide
-  in one ms on the in-process path — with a legacy decidedAt-after fallback for
-  records created without the capture; deep chains of 3+ re-suspensions are a
-  documented residual, deferred to a synthesized monotonic counter).
+  approvals to suspensions clock-free (`RunSummary.{suspendedAt,resumeCount}`
+  maps → `ApprovalRecord.{suspendedAt,resumeCount}`, exact-match minting on the
+  `(suspendedAt, resumeCount)` pair — `resumeCount` is the runtime-owned
+  monotonic per-(run,step) resume ordinal, undefined on a first suspension and
+  `1,2,…` on re-suspensions; the runtime increments it on every resume
+  regardless of payload, so it stays present even on a no-payload re-suspension
+  and never collides, keeping same-step suspensions distinct even when their
+  `suspendedAt` stamps collide in one ms on the in-process path — with a legacy
+  decidedAt-after fallback for records created without the capture. `resumedAt`
+  is retained as informational audit metadata only (Mastra stamps it solely on
+  a payload-bearing resume). This supersedes the earlier `(suspendedAt,
+  resumedAt)` binding and closes its deep-3+-re-suspension residual (the counter
+  strictly increments, so it never collides).
 
 Phase 4 (Ecosystem, 2026-07-07):
 - breakwater `src/agent-cli/`: Claude Code + Codex as approval-gated
@@ -169,21 +174,27 @@ runtime — Mastra provides workflows, agents, memory, RAG, and observability.
   APPROVED approval records on every start/resume, so grants never cross an
   HTTP body and the DO's public resume route stays grant-free. Grants are
   SUSPENSION-SCOPED: the runtime passes the resumed step and its current
-  suspension's `(suspendedAt, resumedAt)` fingerprint to the provider, and a
+  suspension's `(suspendedAt, resumeCount)` fingerprint to the provider, and a
   step-keyed approval mints preferentially by EXACT MATCH — the creating
-  bridge captures both from the snapshot into the record
-  (`ApprovalRecord.{suspendedAt,resumedAt}`, from
-  `RunSummary.{suspendedAt,resumedAt}`), and both must equal the resumed leg's
-  values; all four come from the core clock, so the binding is clock-free.
-  `resumedAt` is the categorical tie-breaker — undefined on a step's first
-  suspension, defined on a re-suspension — so a spent first-suspension approval
-  never mints into a re-suspension even when the two `suspendedAt` stamps
-  collide within a millisecond (possible only on the synchronous in-process
-  path; production's HTTP+D1 round-trips keep them seconds apart). Records
-  created without the capture fall back to decided-strictly-after-suspension,
-  correct on same-clock topologies only. A deep chain of 3+ re-suspensions
-  compares two defined `resumedAt` values and is a documented residual
-  (deferred to a synthesized monotonic per-(run,step) counter). Step-less
+  bridge captures both from the snapshot/ledger into the record
+  (`ApprovalRecord.{suspendedAt,resumeCount}`, from
+  `RunSummary.{suspendedAt,resumeCount}`), and both must equal the resumed leg's
+  values. `suspendedAt` comes from the core clock; `resumeCount` is the
+  runtime-owned monotonic per-(run,step) resume ordinal (no clock), so the
+  binding is clock-free. `resumeCount` is the categorical tie-breaker —
+  undefined on a step's first suspension, `1,2,…` on re-suspensions, incremented
+  by the runtime on EVERY resume regardless of payload — so a spent
+  first-suspension approval never mints into a re-suspension even when the two
+  `suspendedAt` stamps collide within a millisecond (possible only on the
+  synchronous in-process path; production's HTTP+D1 round-trips keep them seconds
+  apart), and a no-payload re-suspension (which Mastra leaves without a
+  `resumedAt`) stays distinguishable. Because the ordinal strictly increments it
+  never collides, so this supersedes the earlier `(suspendedAt, resumedAt)`
+  binding and closes its deep-chain (3+ re-suspension) residual; `resumedAt` is
+  kept as informational audit metadata only. Records created without the capture
+  fall back to decided-strictly-after-suspension, correct on same-clock
+  topologies only (an in-memory ledger reset across a DO restart also degrades
+  to this fail-closed re-deny, never a leak). Step-less
   approvals are explicitly run-scoped — approving a connector at one gate never
   unlocks it at another gate, and a re-suspension of the same step spends the
   earlier approval. Because Mastra merges resume-provided context

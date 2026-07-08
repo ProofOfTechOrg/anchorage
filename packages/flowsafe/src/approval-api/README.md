@@ -98,9 +98,13 @@ grant in its requestContext.
   implementations cannot diverge on exotic payloads.
 - `decidedAt` (service clock) is compared against `suspendedAt` (engine
   clock): deployments must keep them on a shared clock (true same-Worker and
-  on Cloudflare). The clock-free hardening — capturing the snapshot's
-  `(suspendedAt, resumedAt)` pair into the record at create time and matching
-  both exactly — is implemented as the exact-match suspension binding;
-  `resumedAt` (undefined on a first suspension, defined on a re-suspension)
-  keeps same-step suspensions distinct when their `suspendedAt` collide.
+  on Cloudflare). The clock-free hardening — capturing the
+  `(suspendedAt, resumeCount)` pair into the record at create time and matching
+  both exactly — is implemented as the exact-match suspension binding.
+  `resumeCount` is the runtime-owned monotonic per-(run,step) resume ordinal
+  (undefined on a first suspension, `1,2,…` on re-suspensions), incremented on
+  every resume regardless of payload, so it keeps same-step suspensions distinct
+  when their `suspendedAt` collide — even a no-payload re-suspension (which
+  Mastra leaves without a `resumedAt`) — and, being strictly increasing, never
+  collides across deep chains. `resumedAt` is retained as informational only.
 - `escalated` stays decidable; `approved`/`rejected` are terminal.

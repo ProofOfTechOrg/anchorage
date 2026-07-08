@@ -42,16 +42,19 @@ const RESUME_GATE: RunLeg = {
   suspendedAt: SUSPENDED_AT,
 };
 
-// A RE-suspension of the same 'gate' step: the leg carries a DEFINED resumedAt
-// (the step was resumed once, then suspended again). A first suspension's leg
-// has resumedAt undefined (RESUME_GATE above) — the categorical difference the
-// pair binding leans on.
-const RESUMED_AT = Date.parse('2026-07-06T12:03:00.000Z');
+// A RE-suspension of the same 'gate' step: the leg carries a DEFINED
+// resumeCount (the runtime resumed the step once, so its ordinal is 1). A
+// first suspension's leg has resumeCount undefined (RESUME_GATE above) — the
+// categorical difference the pair binding leans on. resumeCount is
+// runtime-owned and increments on every resume regardless of payload, so it is
+// present even for a no-payload re-suspension (unlike the informational
+// resumedAt, which Mastra stamps only on a payload-bearing resume).
+const RESUME_COUNT = 1;
 const RESUME_GATE_RESUSPENDED: RunLeg = {
   kind: 'resume',
   step: ['gate'],
   suspendedAt: SUSPENDED_AT,
-  resumedAt: RESUMED_AT,
+  resumeCount: RESUME_COUNT,
 };
 
 describe('approvedConnectorsForLeg', () => {
@@ -275,11 +278,13 @@ describe('approvedConnectorsForLeg — exact suspension binding', () => {
 
 describe('approvedConnectorsForLeg — same-step re-suspension pair binding', () => {
   it('denies a first-suspension approval on a re-suspension leg even when suspendedAt collides', async () => {
-    // #given — an approval bound to the step's FIRST suspension (resumedAt
+    // #given — an approval bound to the step's FIRST suspension (resumeCount
     // undefined); the leg is a RE-suspension of the SAME step at the SAME
-    // suspendedAt (the in-process same-millisecond collision). Only resumedAt
+    // suspendedAt (the in-process same-millisecond collision). Only resumeCount
     // separates them — undefined on the record, defined on the leg. On the
-    // pre-fix suspendedAt-only rule this WOULD have minted (the flake).
+    // pre-fix suspendedAt-only rule this WOULD have minted (the flake); on the
+    // superseded resumedAt binding a NO-PAYLOAD re-suspension would also leak
+    // (resumedAt undefined on both), which resumeCount closes.
     const store = new InMemoryApprovalStore();
     await store.create(
       record({
@@ -302,16 +307,16 @@ describe('approvedConnectorsForLeg — same-step re-suspension pair binding', ()
     ).toEqual([]);
   });
 
-  it('mints a re-suspension approval whose (suspendedAt, resumedAt) pair matches', async () => {
-    // #given — the approval is bound to THIS re-suspension: both timestamps
-    // captured from the same snapshot
+  it('mints a re-suspension approval whose (suspendedAt, resumeCount) pair matches', async () => {
+    // #given — the approval is bound to THIS re-suspension: suspendedAt and the
+    // resume ordinal captured from the same suspension
     const store = new InMemoryApprovalStore();
     await store.create(
       record({
         status: 'approved',
         stepPath: ['gate'],
         suspendedAt: SUSPENDED_AT,
-        resumedAt: RESUMED_AT,
+        resumeCount: RESUME_COUNT,
         connectors: ['mailer'],
         decidedAt: DECIDED_DURING,
       }),
@@ -328,17 +333,19 @@ describe('approvedConnectorsForLeg — same-step re-suspension pair binding', ()
     ).toEqual(['mailer']);
   });
 
-  it('denies when resumedAt differs even though suspendedAt matches', async () => {
-    // #given — bound to a DIFFERENT re-suspension of this step (same
-    // suspendedAt, later resumedAt) — the deep-chain deny direction the pair
-    // still catches when both sides carry a defined resumedAt
+  it('denies when resumeCount differs even though suspendedAt matches (deep-chain)', async () => {
+    // #given — bound to a LATER re-suspension of this step (same suspendedAt,
+    // resumeCount 2) — the depth-3+ deny direction. Because the ordinal
+    // strictly increments, count 2 never collides with the count-1 leg, so the
+    // deterministic truthy→falsy depth-3 leak the old timestamp binding left
+    // open is closed.
     const store = new InMemoryApprovalStore();
     await store.create(
       record({
         status: 'approved',
         stepPath: ['gate'],
         suspendedAt: SUSPENDED_AT,
-        resumedAt: RESUMED_AT + 60_000,
+        resumeCount: RESUME_COUNT + 1,
         connectors: ['mailer'],
         decidedAt: DECIDED_DURING,
       }),
@@ -353,6 +360,67 @@ describe('approvedConnectorsForLeg — same-step re-suspension pair binding', ()
         RESUME_GATE_RESUSPENDED,
       ),
     ).toEqual([]);
+  });
+
+  it('denies a re-suspension approval on a leg whose resumeCount is undefined (reset ledger / first-suspension leg fails closed)', async () => {
+    // #given — a re-suspension approval (resumeCount 1) at this suspendedAt.
+    // The leg presents resumeCount undefined: either a first-suspension leg, or
+    // a re-suspension leg after a DO restart reset the in-memory ledger. Either
+    // way the record must NOT mint — the "fail-closed, never a leak" guarantee
+    // for the restart-reset residual, at the predicate level.
+    const store = new InMemoryApprovalStore();
+    await store.create(
+      record({
+        status: 'approved',
+        stepPath: ['gate'],
+        suspendedAt: SUSPENDED_AT,
+        resumeCount: 1,
+        connectors: ['mailer'],
+        decidedAt: DECIDED_DURING,
+      }),
+    );
+
+    // #when / #then — RESUME_GATE is a leg with resumeCount undefined
+    expect(
+      await approvedConnectorsForLeg(store, 'wf', 'run-1', RESUME_GATE),
+    ).toEqual([]);
+  });
+
+  it('mints the depth-3 approval on its own leg while the spent depth-2 approval stays denied', async () => {
+    // #given — two same-step approvals from consecutive re-suspensions: the
+    // spent count-1 approval and the live count-2 approval; the leg is the
+    // third suspension (resumeCount 2), all sharing one suspendedAt.
+    const store = new InMemoryApprovalStore();
+    await store.create(
+      record({
+        status: 'approved',
+        stepPath: ['gate'],
+        suspendedAt: SUSPENDED_AT,
+        resumeCount: 1,
+        connectors: ['stale'],
+        decidedAt: DECIDED_DURING,
+      }),
+    );
+    await store.create(
+      record({
+        status: 'approved',
+        stepPath: ['gate'],
+        suspendedAt: SUSPENDED_AT,
+        resumeCount: 2,
+        connectors: ['fresh'],
+        decidedAt: DECIDED_DURING,
+      }),
+    );
+
+    // #when / #then — only the count-2 approval mints; the spent count-1 does not
+    expect(
+      await approvedConnectorsForLeg(store, 'wf', 'run-1', {
+        kind: 'resume',
+        step: ['gate'],
+        suspendedAt: SUSPENDED_AT,
+        resumeCount: 2,
+      }),
+    ).toEqual(['fresh']);
   });
 });
 

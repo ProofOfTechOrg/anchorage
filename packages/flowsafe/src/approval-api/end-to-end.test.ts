@@ -21,7 +21,7 @@ import {
   ROLES,
   WORKFLOW_SCOPE_CONTEXT_KEY,
 } from '@proofoftech/breakwater';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 import { init } from '../do-runner/init.js';
@@ -61,9 +61,10 @@ function suspendedAtFor(summary: unknown, stepPath: readonly string[]): number {
   return at;
 }
 
-// The bridge's resumedAt capture, paired with suspendedAtFor. No throw: a
-// step's FIRST suspension legitimately carries no resumedAt (undefined), which
-// is exactly the signal that distinguishes it from a re-suspension.
+// The bridge's resumedAt capture (INFORMATIONAL). No throw: a step's FIRST
+// suspension legitimately carries no resumedAt (undefined), and Mastra also
+// omits it on a no-payload re-suspension — which is exactly why resumedAt is
+// NOT the binding signal.
 function resumedAtFor(
   summary: unknown,
   stepPath: readonly string[],
@@ -72,6 +73,20 @@ function resumedAtFor(
     stepPath.join('.')
   ];
   return typeof at === 'number' ? at : undefined;
+}
+
+// The bridge's resumeCount capture — the grant-binding tie-breaker. Undefined
+// for a step's FIRST suspension, 1,2,… on re-suspensions; unlike resumedAt the
+// runtime sets it on every resume, so it is present even for a no-payload
+// re-suspension.
+function resumeCountFor(
+  summary: unknown,
+  stepPath: readonly string[],
+): number | undefined {
+  const count = (summary as RunSummary | undefined)?.resumeCount?.[
+    stepPath.join('.')
+  ];
+  return typeof count === 'number' ? count : undefined;
 }
 
 describe('breakwater contract tripwires', () => {
@@ -276,6 +291,60 @@ function buildHarness(): Harness {
   })
     .then(gate2x)
     .then(makeUse('relaunch-use'))
+    .commit();
+
+  // relaunch-falsy: a gate with NO resumeSchema, so a no-payload resume is not
+  // schema-rejected and reaches execute, where it re-suspends. This is the
+  // configuration that exposes the bug the resumeCount binding closes — the
+  // re-suspension carries no resumedAt (Mastra stamps it only on a payload
+  // resume), so the old (suspendedAt, resumedAt) pair could not tell it from
+  // the first suspension.
+  const gateFalsy = createStep({
+    id: 'gateFalsy',
+    inputSchema: z.object({ topic: z.string() }),
+    outputSchema: z.object({ topic: z.string() }),
+    suspendSchema: z.object({ reason: z.string() }),
+    execute: async ({ inputData, resumeData, suspend }) => {
+      if (!resumeData) return suspend({ reason: 'gateFalsy awaits approval' });
+      return { topic: inputData.topic };
+    },
+  });
+  createWorkflow({
+    id: 'relaunch-falsy',
+    inputSchema: z.object({ topic: z.string() }),
+    outputSchema: z.object({ topic: z.string() }),
+  })
+    .then(gateFalsy)
+    .then(makeUse('falsy-use'))
+    .commit();
+
+  // relaunch-hole2: a schema-less gate that re-suspends on BOTH a truthy resume
+  // (round 2) and a falsy resume (round 1). This reproduces the deterministic
+  // depth-3 "truthy -> falsy" residual: Mastra stamps resumedAt on the truthy
+  // resume (susp #2) and PRESERVES that same value across the falsy resume
+  // (susp #3), so #2 and #3 share resumedAt — the old binding could not tell
+  // them apart. resumeCount (1 vs 2) still can. gate completes on the 2nd
+  // truthy resume.
+  let hole2Rounds = 0;
+  const gate2xNoSchema = createStep({
+    id: 'gate2xNoSchema',
+    inputSchema: z.object({ topic: z.string() }),
+    outputSchema: z.object({ topic: z.string() }),
+    suspendSchema: z.object({ reason: z.string() }),
+    execute: async ({ inputData, resumeData, suspend }) => {
+      if (!resumeData) return suspend({ reason: 'hole2 round 1' });
+      hole2Rounds += 1;
+      if (hole2Rounds < 2) return suspend({ reason: 'hole2 round 2' });
+      return { topic: inputData.topic };
+    },
+  });
+  createWorkflow({
+    id: 'relaunch-hole2',
+    inputSchema: z.object({ topic: z.string() }),
+    outputSchema: z.object({ topic: z.string() }),
+  })
+    .then(gate2xNoSchema)
+    .then(makeUse('hole2-use'))
     .commit();
 
   const service = new ApprovalService({
@@ -504,18 +573,19 @@ describe('approval queue end to end', () => {
       inputData: { topic: 'respun' },
     });
     expect(started.suspended).toEqual([['gate2x']]);
-    // Tripwire for the pair-binding: a FIRST suspension carries no resumedAt.
-    // The forged re-suspension below WILL carry one, and that categorical
-    // undefined-vs-defined gap is what denies deterministically — even if the
-    // two suspensions' suspendedAt stamps collide within a millisecond.
-    expect(resumedAtFor(started, ['gate2x'])).toBeUndefined();
+    // Tripwire for the pair-binding: a FIRST suspension carries no resumeCount.
+    // The forged re-suspension below WILL carry one (the runtime increments it
+    // on the intervening resume), and that categorical undefined-vs-defined gap
+    // is what denies deterministically — even if the two suspensions'
+    // suspendedAt stamps collide within a millisecond.
+    expect(resumeCountFor(started, ['gate2x'])).toBeUndefined();
     const { record: first } = await harness.service.create(
       {
         workflowId: 'relaunch',
         runId: started.runId,
         stepPath: ['gate2x'],
         suspendedAt: suspendedAtFor(started, ['gate2x']),
-        resumedAt: resumedAtFor(started, ['gate2x']),
+        resumeCount: resumeCountFor(started, ['gate2x']),
         title: 'Gate 2x — round 1',
         connectors: ['blog-publisher'],
       },
@@ -538,15 +608,154 @@ describe('approval queue end to end', () => {
       resumeData: { approved: true },
     });
 
-    // #then — round-1's approval captured resumedAt=undefined (a first
-    // suspension); suspension #2's leg carries a defined resumedAt, so the
-    // (suspendedAt, resumedAt) pair cannot match and the approval never mints
+    // #then — round-1's approval captured resumeCount=undefined (a first
+    // suspension); suspension #2's leg carries resumeCount=1, so the
+    // (suspendedAt, resumeCount) pair cannot match and the approval never mints
     // into #2 — deterministically, with no reliance on the suspendedAt stamps
     // differing (they can collide in-process) or on decidedAt ordering (without
     // the pair binding, this fail-closed path relied on settleClock ordering).
     expect(forged.status).toBe('failed');
     expect(forged.error).toContain('approval required and not granted');
     expect(harness.publishes()).toBe(0);
+  });
+
+  it('a spent approval does not mint into a NO-PAYLOAD re-suspension (falsy-resume regression)', async () => {
+    // The reported leak: Mastra stamps resumedAt only on a payload-bearing
+    // resume, so a re-suspension reached via a falsy resume left the old
+    // (suspendedAt, resumedAt) binding unable to tell it from a first
+    // suspension. Pin Date.now so both suspensions share suspendedAt — the
+    // in-process same-ms collision the leak needs (Mastra stamps suspendedAt
+    // from Date.now; the service clock uses new Date(), unaffected).
+    const fixed = Date.parse('2026-07-08T00:00:00.000Z');
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(fixed);
+    try {
+      const harness = buildHarness();
+      const started = await harness.runtime.start('relaunch-falsy', {
+        inputData: { topic: 'respun-falsy' },
+      });
+      // #given — suspended at the schema-less gate (first suspension:
+      // resumeCount undefined), with an approval bound to THAT suspension.
+      expect(started.suspended).toEqual([['gateFalsy']]);
+      expect(resumeCountFor(started, ['gateFalsy'])).toBeUndefined();
+      const decidedAt = new Date().toISOString();
+      await harness.store.create({
+        id: crypto.randomUUID(),
+        workflowId: 'relaunch-falsy',
+        runId: started.runId,
+        stepPath: ['gateFalsy'],
+        title: 'Gate — round 1',
+        connectors: ['blog-publisher'],
+        priority: 'normal',
+        status: 'approved',
+        createdAt: decidedAt,
+        updatedAt: decidedAt,
+        decidedAt,
+        suspendedAt: suspendedAtFor(started, ['gateFalsy']),
+        // resumeCount omitted → undefined: bound to the FIRST suspension.
+      });
+
+      // #when — a NO-PAYLOAD resume re-suspends the SAME step. Mastra leaves
+      // resumedAt undefined; the runtime still increments resumeCount to 1.
+      const reSuspended = await harness.runtime.resume(
+        'relaunch-falsy',
+        started.runId,
+        { step: 'gateFalsy' },
+      );
+      expect(reSuspended.suspended).toEqual([['gateFalsy']]);
+      expect(resumedAtFor(reSuspended, ['gateFalsy'])).toBeUndefined();
+      expect(resumeCountFor(reSuspended, ['gateFalsy'])).toBe(1);
+
+      // A truthy resume of the re-suspension drives the gate through to the
+      // write-gated connector.
+      const forged = await harness.runtime.resume(
+        'relaunch-falsy',
+        started.runId,
+        { step: 'gateFalsy', resumeData: { approved: true } },
+      );
+
+      // #then — suspension #1's approval (resumeCount undefined) cannot mint
+      // into suspension #2's leg (resumeCount 1) even though their suspendedAt
+      // collide, so the connector denies. On the superseded resumedAt binding
+      // (undefined on both sides) this leaked and published.
+      expect(forged.status).toBe('failed');
+      expect(forged.error).toContain('approval required and not granted');
+      expect(harness.publishes()).toBe(0);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('depth-3 truthy->falsy: a spent depth-2 approval does not mint into depth-3 despite a shared resumedAt (Hole-2)', async () => {
+    // Pin Date.now so all three suspensions share suspendedAt (the in-process
+    // same-ms collision), isolating resumeCount as the sole distinguisher.
+    const fixed = Date.parse('2026-07-08T01:00:00.000Z');
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(fixed);
+    try {
+      const harness = buildHarness();
+      const started = await harness.runtime.start('relaunch-hole2', {
+        inputData: { topic: 'hole2' },
+      });
+      expect(started.suspended).toEqual([['gate2xNoSchema']]);
+
+      // #when — a TRUTHY resume re-suspends (round 2 -> susp #2); Mastra stamps
+      // resumedAt here.
+      const susp2 = await harness.runtime.resume(
+        'relaunch-hole2',
+        started.runId,
+        { step: 'gate2xNoSchema', resumeData: { go: true } },
+      );
+      expect(susp2.suspended).toEqual([['gate2xNoSchema']]);
+      expect(resumeCountFor(susp2, ['gate2xNoSchema'])).toBe(1);
+      const sharedResumedAt = resumedAtFor(susp2, ['gate2xNoSchema']);
+      expect(sharedResumedAt).toBeTypeOf('number');
+
+      // A depth-2 approval bound to susp #2 (resumeCount 1) is approved.
+      const decidedAt = new Date().toISOString();
+      await harness.store.create({
+        id: crypto.randomUUID(),
+        workflowId: 'relaunch-hole2',
+        runId: started.runId,
+        stepPath: ['gate2xNoSchema'],
+        title: 'Depth-2 approval',
+        connectors: ['blog-publisher'],
+        priority: 'normal',
+        status: 'approved',
+        createdAt: decidedAt,
+        updatedAt: decidedAt,
+        decidedAt,
+        suspendedAt: suspendedAtFor(susp2, ['gate2xNoSchema']),
+        resumeCount: resumeCountFor(susp2, ['gate2xNoSchema']),
+      });
+
+      // #when — a FALSY resume re-suspends again (round 1 -> susp #3). Mastra
+      // PRESERVES the prior resumedAt, so #2 and #3 share it — the Hole-2 trap.
+      const susp3 = await harness.runtime.resume(
+        'relaunch-hole2',
+        started.runId,
+        { step: 'gate2xNoSchema' },
+      );
+      expect(susp3.suspended).toEqual([['gate2xNoSchema']]);
+      expect(resumeCountFor(susp3, ['gate2xNoSchema'])).toBe(2);
+      // The trap, proven: #3 carries the SAME resumedAt as #2.
+      expect(resumedAtFor(susp3, ['gate2xNoSchema'])).toBe(sharedResumedAt);
+
+      // A TRUTHY resume of susp #3 completes the gate and reaches the connector.
+      const forged = await harness.runtime.resume(
+        'relaunch-hole2',
+        started.runId,
+        { step: 'gate2xNoSchema', resumeData: { go: true } },
+      );
+
+      // #then — the depth-2 approval (resumeCount 1) cannot mint into susp #3's
+      // leg (resumeCount 2) even though suspendedAt AND resumedAt both collide,
+      // so the connector denies. On the old (suspendedAt, resumedAt) binding
+      // both pairs were equal, so this leaked and published.
+      expect(forged.status).toBe('failed');
+      expect(forged.error).toContain('approval required and not granted');
+      expect(harness.publishes()).toBe(0);
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 
   it('a re-suspension completes with its own fresh decision', async () => {
@@ -561,7 +770,7 @@ describe('approval queue end to end', () => {
         runId: started.runId,
         stepPath: ['gate2x'],
         suspendedAt: suspendedAtFor(started, ['gate2x']),
-        resumedAt: resumedAtFor(started, ['gate2x']),
+        resumeCount: resumeCountFor(started, ['gate2x']),
         title: 'Gate 2x — round 1',
         connectors: ['blog-publisher'],
       },
@@ -573,23 +782,21 @@ describe('approval queue end to end', () => {
       REVIEWER,
     );
 
-    // The re-suspension carries a DEFINED resumedAt (unlike round 1) — proof
-    // the summary plumbs it end to end; round 2's approval binds to this new
-    // (suspendedAt, resumedAt) pair.
-    expect(resumedAtFor(afterFirst.resume.summary, ['gate2x'])).toBeTypeOf(
-      'number',
-    );
+    // The re-suspension carries resumeCount=1 (round 1 had it undefined) —
+    // proof the summary plumbs the binding ordinal end to end; round 2's
+    // approval binds to this new (suspendedAt, resumeCount) pair.
+    expect(resumeCountFor(afterFirst.resume.summary, ['gate2x'])).toBe(1);
 
     // #when — suspension #2 gets its own request (fresh, not collapsed into
     // the decided round-1 record), bound to the NEW suspension's
-    // (suspendedAt, resumedAt) pair, and its own approval
+    // (suspendedAt, resumeCount) pair, and its own approval
     const second = await harness.service.create(
       {
         workflowId: 'relaunch',
         runId: started.runId,
         stepPath: ['gate2x'],
         suspendedAt: suspendedAtFor(afterFirst.resume.summary, ['gate2x']),
-        resumedAt: resumedAtFor(afterFirst.resume.summary, ['gate2x']),
+        resumeCount: resumeCountFor(afterFirst.resume.summary, ['gate2x']),
         title: 'Gate 2x — round 2',
         connectors: ['blog-publisher'],
       },

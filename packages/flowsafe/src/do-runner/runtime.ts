@@ -112,16 +112,25 @@ export interface RunSummary {
    */
   suspendedAt?: Record<string, number>;
   /**
-   * Epoch-ms resume time per dot-joined suspended step key (core clock),
-   * paired with `suspendedAt`. ABSENT for a step's first suspension (never
-   * resumed) and PRESENT once the step has been resumed at least once (a
-   * re-suspension). Approval bridges copy it into
-   * CreateApprovalInput.resumedAt so grant minting binds a decision to the
-   * exact suspension by the (suspendedAt, resumedAt) fingerprint — the
-   * categorical first-vs-re-suspension difference no same-ms suspendedAt
-   * collision can erase.
+   * Epoch-ms resume time per dot-joined suspended step key (core clock).
+   * INFORMATIONAL audit metadata only — NOT the grant-binding tie-breaker
+   * (that is `resumeCount`). Mastra stamps it only on a payload-bearing
+   * resume, so it is absent for a first suspension AND for any re-suspension
+   * reached via a falsy resume; do not use its presence to tell a first
+   * suspension from a re-suspension.
    */
   resumedAt?: Record<string, number>;
+  /**
+   * Runtime-owned monotonic per-step resume ordinal (dot-joined step key ->
+   * count). ABSENT for a step's first suspension (never resumed), `1` after
+   * the first resume, `2` after the second, and so on. This is the grant
+   * binding tie-breaker paired with `suspendedAt`: unlike `resumedAt` the
+   * runtime increments it on EVERY resume regardless of payload, so it is
+   * collision-free and cannot be erased by a same-ms suspendedAt collision or
+   * a no-payload resume. Approval bridges copy it into
+   * CreateApprovalInput.resumeCount.
+   */
+  resumeCount?: Record<string, number>;
   /** ISO 8601. Present on status() projections (read from the stored snapshot). */
   createdAt?: string;
   /** ISO 8601. Present on status() projections (read from the stored snapshot). */
@@ -167,7 +176,11 @@ function errorText(error: unknown): string {
   return String(error);
 }
 
-function summarize(runId: string, result: CoreRunResult): RunSummary {
+function summarize(
+  runId: string,
+  result: CoreRunResult,
+  counts?: ReadonlyMap<string, number>,
+): RunSummary {
   switch (result.status) {
     case 'success':
       return { runId, status: result.status, result: result.result };
@@ -189,6 +202,9 @@ function summarize(runId: string, result: CoreRunResult): RunSummary {
       if (suspendedAt !== undefined) summary.suspendedAt = suspendedAt;
       const resumedAt = resumedAtByStep(result.steps, suspendedKeys);
       if (resumedAt !== undefined) summary.resumedAt = resumedAt;
+      // resumeCount is runtime-owned (the ledger), NOT read from the snapshot.
+      const resumeCount = resumeCountByStep(counts, suspendedKeys);
+      if (resumeCount !== undefined) summary.resumeCount = resumeCount;
       return summary;
     }
     case 'tripwire':
@@ -252,9 +268,10 @@ function suspendedAtByStep(
 }
 
 /**
- * Epoch-ms resume time of the step's latest attempt, if recorded. Undefined
- * for a first suspension (never resumed) and defined for a re-suspension —
- * the categorical signal grant minting pairs with suspendedAt.
+ * Epoch-ms resume time of the step's latest attempt, if recorded. Feeds the
+ * INFORMATIONAL RunSummary.resumedAt only — Mastra stamps it solely on a
+ * payload-bearing resume, so it is unreliable as a first-vs-re-suspension
+ * signal. The grant binding uses `resumeCount` (the runtime ledger) instead.
  */
 function resumedAtOf(
   steps: WorkflowState['steps'],
@@ -273,6 +290,26 @@ function resumedAtByStep(
   for (const key of suspendedKeys) {
     const at = resumedAtOf(steps, key);
     if (at !== undefined) map[key] = at;
+  }
+  return Object.keys(map).length > 0 ? map : undefined;
+}
+
+/**
+ * RunSummary.resumeCount: dot-joined step key -> runtime resume ordinal.
+ * Sourced from the runtime's per-run resume ledger (NOT the Mastra snapshot),
+ * so it is present for every re-suspension regardless of resume payload —
+ * the collision-free grant-binding tie-breaker. Absent for a step with no
+ * ledger entry (a first suspension).
+ */
+function resumeCountByStep(
+  counts: ReadonlyMap<string, number> | undefined,
+  suspendedKeys: readonly string[],
+): Record<string, number> | undefined {
+  if (!counts) return undefined;
+  const map: Record<string, number> = {};
+  for (const key of suspendedKeys) {
+    const count = counts.get(key);
+    if (count !== undefined) map[key] = count;
   }
   return Object.keys(map).length > 0 ? map : undefined;
 }
@@ -301,7 +338,11 @@ function suspendPayloadByStep(
 // (isFromInMemory), steps are empty and timestamps are current-time; the
 // projection truthfully degrades to status-only rather than fabricating
 // detail.
-function summarizeState(runId: string, state: WorkflowState): RunSummary {
+function summarizeState(
+  runId: string,
+  state: WorkflowState,
+  counts?: ReadonlyMap<string, number>,
+): RunSummary {
   const summary: RunSummary = {
     runId,
     status: state.status,
@@ -323,6 +364,8 @@ function summarizeState(runId: string, state: WorkflowState): RunSummary {
     if (suspendedAt !== undefined) summary.suspendedAt = suspendedAt;
     const resumedAt = resumedAtByStep(state.steps, suspendedKeys);
     if (resumedAt !== undefined) summary.resumedAt = resumedAt;
+    const resumeCount = resumeCountByStep(counts, suspendedKeys);
+    if (resumeCount !== undefined) summary.resumeCount = resumeCount;
   }
   return summary;
 }
@@ -337,10 +380,13 @@ function summarizeState(runId: string, state: WorkflowState): RunSummary {
  * providers bind capabilities to the specific suspension they were granted
  * for — an approval decided before this suspension began belongs to an
  * earlier incarnation of the gate and must not mint again (see flowsafe's
- * approvalGrantProvider). `resumedAt` pairs with `suspendedAt` — undefined on
- * a step's first suspension, defined on a re-suspension — so a provider can
- * tell two same-step suspensions apart even when their `suspendedAt` stamps
- * collide within a millisecond.
+ * approvalGrantProvider). `resumeCount` pairs with `suspendedAt` — the
+ * runtime-owned monotonic resume ordinal (undefined on a step's first
+ * suspension, `1,2,…` on successive re-suspensions) — so a provider can tell
+ * two same-step suspensions apart even when their `suspendedAt` stamps collide
+ * within a millisecond. It replaces the payload-conditional `resumedAt` as the
+ * tie-breaker: the runtime increments it on every resume, so no-payload
+ * resumes cannot erase the first-vs-re-suspension distinction.
  */
 export type RunLeg =
   | { kind: 'start' }
@@ -348,7 +394,7 @@ export type RunLeg =
       kind: 'resume';
       step?: string[];
       suspendedAt?: number;
-      resumedAt?: number;
+      resumeCount?: number;
     };
 
 /**
@@ -401,6 +447,25 @@ export class RunnerRuntime {
   readonly #requestContextForRun?: RequestContextProvider;
   readonly #workflows = new Map<string, AnyWorkflow>();
   readonly #runLocks = new Map<string, Promise<unknown>>();
+  // Per-run resume ledger: runId -> (stepKey -> times that step has been
+  // resumed). The runtime increments it on every resume (regardless of
+  // payload) and projects it as RunSummary.resumeCount / RunLeg.resumeCount —
+  // the collision-free grant-binding tie-breaker that Mastra's
+  // payload-conditional resumedAt cannot provide. In-memory is sufficient by a
+  // mutual-exclusion argument (not merely restart wall-time): the tie-breaker
+  // only matters when two same-step suspensions share a suspendedAt (same ms),
+  // and that requires the suspend -> resume -> re-suspend cycle to run
+  // synchronously with NO persistence I/O between the stamps — i.e. the
+  // in-memory store. Any durable deployment (D1) has I/O between the two
+  // suspensions, so their suspendedAt differ and the suspendedAt half alone
+  // distinguishes them. Same-ms-collision and surviving-a-restart are therefore
+  // mutually exclusive: a reset ledger can only yield leg.resumeCount=undefined
+  // against a re-suspension record's defined count -> mismatch -> deny
+  // (fail-closed re-deny, see grants.ts), never a spurious mint. Revisit a
+  // durable counter only if a synchronous-yet-durable store is ever wired in.
+  // Cleared on terminal status below; a resumed-then-abandoned suspended run
+  // keeps one small map until DO eviction.
+  readonly #resumeCounts = new Map<string, Map<string, number>>();
   #mastra?: Mastra;
 
   constructor(options: RunnerRuntimeOptions) {
@@ -510,6 +575,10 @@ export class RunnerRuntime {
       // still does the least work and keeps the ordering invariant uniform.
       const step = resolveResumeStep(options.step, state);
       const stepKey = step?.join('.');
+      // resumeCount is read BEFORE this resume increments it: it is the count
+      // of prior resumes = the ordinal of the CURRENT suspension being resumed
+      // (undefined for a first suspension), which the minting approval captured
+      // at that suspension. suspendedAt still comes from the snapshot.
       const requestContext = await this.#requestContextFor(workflowId, runId, {
         kind: 'resume',
         step,
@@ -517,8 +586,10 @@ export class RunnerRuntime {
           stepKey !== undefined
             ? suspendedAtOf(state.steps, stepKey)
             : undefined,
-        resumedAt:
-          stepKey !== undefined ? resumedAtOf(state.steps, stepKey) : undefined,
+        resumeCount:
+          stepKey !== undefined
+            ? this.#resumeCounts.get(runId)?.get(stepKey)
+            : undefined,
       });
       const run = await workflow.createRun({ runId });
       let result: CoreRunResult;
@@ -529,16 +600,38 @@ export class RunnerRuntime {
           requestContext,
         });
       } catch (error) {
+        // The run stayed suspended (resume threw) — do NOT increment; the
+        // prior count must persist for a later retry of this same suspension.
         throw asClientError(error) ?? error;
       }
-      return summarize(run.runId, result);
+      // Record THIS resume AFTER the leg fingerprint read above and BEFORE
+      // summarize: a re-suspension produced by this resume must capture the
+      // incremented ordinal so its approval binds to the new suspension.
+      if (stepKey !== undefined) {
+        const counts =
+          this.#resumeCounts.get(runId) ?? new Map<string, number>();
+        counts.set(stepKey, (counts.get(stepKey) ?? 0) + 1);
+        this.#resumeCounts.set(runId, counts);
+      }
+      const summary = summarize(
+        run.runId,
+        result,
+        this.#resumeCounts.get(runId),
+      );
+      // Terminal run: drop the ledger (no further suspension can occur).
+      if (summary.status !== 'suspended') this.#resumeCounts.delete(runId);
+      return summary;
     });
   }
 
   async status(workflowId: string, runId: string): Promise<RunSummary | null> {
     const workflow = this.#getWorkflow(workflowId);
     const state = await workflow.getWorkflowRunById(runId);
-    return state ? summarizeState(runId, state) : null;
+    // Project resumeCount from the ledger too (defense in depth: a bridge that
+    // ever mints off status() must not see a stale/absent ordinal).
+    return state
+      ? summarizeState(runId, state, this.#resumeCounts.get(runId))
+      : null;
   }
 
   // A provider crash propagates (fail loud): silently starting the leg with
