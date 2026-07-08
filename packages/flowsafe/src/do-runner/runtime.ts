@@ -447,8 +447,10 @@ export class RunnerRuntime {
   readonly #requestContextForRun?: RequestContextProvider;
   readonly #workflows = new Map<string, AnyWorkflow>();
   readonly #runLocks = new Map<string, Promise<unknown>>();
-  // Per-run resume ledger: runId -> (stepKey -> times that step has been
-  // resumed). The runtime increments it on every resume (regardless of
+  // Per-run resume ledger: #runKey(workflowId, runId) -> (stepKey -> times that
+  // step has been resumed). Keyed by the run's FULL identity, never runId alone
+  // (see #runKey): a shared caller runId under two workflows are distinct runs.
+  // The runtime increments it on every resume (regardless of
   // payload) and projects it as RunSummary.resumeCount / RunLeg.resumeCount —
   // the collision-free grant-binding tie-breaker that Mastra's
   // payload-conditional resumedAt cannot provide. In-memory is sufficient by a
@@ -565,6 +567,7 @@ export class RunnerRuntime {
   ): Promise<RunSummary> {
     const workflow = this.#getWorkflow(workflowId);
     return this.#withRunLock(workflowId, runId, async () => {
+      const runKey = this.#runKey(workflowId, runId);
       const state = await workflow.getWorkflowRunById(runId);
       if (!state) throw new UnknownRunError(workflowId, runId);
       if (state.status !== 'suspended') {
@@ -588,7 +591,7 @@ export class RunnerRuntime {
             : undefined,
         resumeCount:
           stepKey !== undefined
-            ? this.#resumeCounts.get(runId)?.get(stepKey)
+            ? this.#resumeCounts.get(runKey)?.get(stepKey)
             : undefined,
       });
       const run = await workflow.createRun({ runId });
@@ -609,17 +612,17 @@ export class RunnerRuntime {
       // incremented ordinal so its approval binds to the new suspension.
       if (stepKey !== undefined) {
         const counts =
-          this.#resumeCounts.get(runId) ?? new Map<string, number>();
+          this.#resumeCounts.get(runKey) ?? new Map<string, number>();
         counts.set(stepKey, (counts.get(stepKey) ?? 0) + 1);
-        this.#resumeCounts.set(runId, counts);
+        this.#resumeCounts.set(runKey, counts);
       }
       const summary = summarize(
         run.runId,
         result,
-        this.#resumeCounts.get(runId),
+        this.#resumeCounts.get(runKey),
       );
       // Terminal run: drop the ledger (no further suspension can occur).
-      if (summary.status !== 'suspended') this.#resumeCounts.delete(runId);
+      if (summary.status !== 'suspended') this.#resumeCounts.delete(runKey);
       return summary;
     });
   }
@@ -630,7 +633,11 @@ export class RunnerRuntime {
     // Project resumeCount from the ledger too (defense in depth: a bridge that
     // ever mints off status() must not see a stale/absent ordinal).
     return state
-      ? summarizeState(runId, state, this.#resumeCounts.get(runId))
+      ? summarizeState(
+          runId,
+          state,
+          this.#resumeCounts.get(this.#runKey(workflowId, runId)),
+        )
       : null;
   }
 
@@ -673,23 +680,30 @@ export class RunnerRuntime {
     });
   }
 
+  // The run's full identity as a single map key: workflowId + runId, never runId
+  // alone. The same caller-supplied runId under two workflows are DISTINCT
+  // persisted runs (Mastra snapshots key on workflowName+runId) and must never
+  // share a per-run entry — the FIFO lock OR the resume ledger. Composing the key
+  // in ONE place keeps every per-run map keyed identically, so a future per-run
+  // map cannot reintroduce a runId-only key (the grant leak the ledger guards).
+  // This is the exact string the DO name join produces
+  // (idFromName(`${workflowId}:${runId}`)); PATH_SAFE_ID_PATTERN excludes ':'
+  // from both ids, so the join is unambiguous.
+  #runKey(workflowId: string, runId: string): string {
+    return `${workflowId}:${runId}`;
+  }
+
   // FIFO per-run lock: callers for the same run execute strictly in arrival
   // order; distinct runs do not contend. The map entry is removed when the last
-  // waiter settles, so idle runs hold no memory.
-  //
-  // Keyed by the run's full identity (workflowId + runId), not runId alone: the
-  // same caller-supplied runId under two workflows are distinct persisted runs
-  // and must not share a lock. This uses the exact string the DO name join
-  // produces (idFromName(`${workflowId}:${runId}`)), so the in-process lock
-  // granularity matches the cross-instance routing granularity — and adds no
-  // ambiguity PATH_SAFE_ID_PATTERN (which excludes ':' from both ids) does
-  // not already exclude.
+  // waiter settles, so idle runs hold no memory. Keyed by the run's full identity
+  // via #runKey (workflowId + runId), not runId alone — the in-process lock
+  // granularity thus matches the cross-instance DO routing granularity.
   async #withRunLock<T>(
     workflowId: string,
     runId: string,
     fn: () => Promise<T>,
   ): Promise<T> {
-    const key = `${workflowId}:${runId}`;
+    const key = this.#runKey(workflowId, runId);
     const prev = this.#runLocks.get(key) ?? Promise.resolve();
     const task = prev.then(fn);
     const tail = task.then(

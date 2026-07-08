@@ -1027,3 +1027,189 @@ describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
     expect(reSuspended.resumeCount?.gateB).toBeUndefined();
   });
 });
+
+describe('RunnerRuntime resumeCount ledger keying (shared runId across workflows)', () => {
+  // Two suspending workflows under DIFFERENT ids on ONE runtime, both driven with
+  // the SAME caller runId. Mastra persists them as distinct runs (snapshots key on
+  // `${workflowName}-${runId}`), so the ONLY thing that can conflate them is the
+  // runtime's own resume ledger. wfA completes on its first payload resume
+  // (terminal — triggers the ledger delete); wfB re-suspends once (round 1 ->
+  // round 2), so it holds a live ledger entry across wfA's delete. Both gates share
+  // step id 'gate' on purpose: an identical inner stepKey is what lets one run's
+  // ordinal contaminate the other's leg read if the OUTER key is runId alone.
+  function buildSharedRunIdPair(
+    onLeg?: (workflowId: string, leg: RunLeg) => void,
+  ): RunnerRuntime {
+    let bRounds = 0;
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      onLeg
+        ? {
+            requestContextForRun: (workflowId, _runId, leg) => {
+              onLeg(workflowId, leg);
+              return undefined;
+            },
+          }
+        : undefined,
+    );
+    const gateA = createStep({
+      id: 'gate',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      suspendSchema: z.object({ reason: z.string() }),
+      execute: async ({ resumeData, suspend }) =>
+        resumeData ? {} : suspend({ reason: 'A waits' }),
+    });
+    createWorkflow({
+      id: 'wfA',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(gateA)
+      .commit();
+    const gateB = createStep({
+      id: 'gate',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      suspendSchema: z.object({ reason: z.string() }),
+      execute: async ({ resumeData, suspend }) => {
+        if (!resumeData) return suspend({ reason: 'B round 1' });
+        bRounds += 1;
+        if (bRounds < 2) return suspend({ reason: 'B round 2' });
+        return {};
+      },
+    });
+    createWorkflow({
+      id: 'wfB',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(gateB)
+      .commit();
+    return runtime;
+  }
+
+  it("does not wipe a sibling run's resume ledger when a run sharing its runId reaches terminal status", async () => {
+    // #given — wfA and wfB both suspended under the SAME runId 'shared'
+    const runtime = buildSharedRunIdPair();
+    await runtime.start('wfA', { runId: 'shared', inputData: {} });
+    await runtime.start('wfB', { runId: 'shared', inputData: {} });
+
+    // #given — wfB resumed once, so its ledger bucket holds gate -> 1
+    const reSuspendedB = await runtime.resume('wfB', 'shared', {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+    expect(reSuspendedB.suspended).toEqual([['gate']]);
+    expect(reSuspendedB.resumeCount?.gate).toBe(1);
+
+    // #when — wfA (same runId) resumed to SUCCESS; a terminal run drops its ledger.
+    // Keyed by runId alone (the bug) this delete('shared') wipes wfB's bucket too.
+    const doneA = await runtime.resume('wfA', 'shared', {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+    expect(doneA.status).toBe('success');
+
+    // #then — wfB's still-suspended round-2 leg keeps resumeCount 1. Pre-fix this
+    // projected undefined (wfA's delete erased it), letting a spent first-suspension
+    // approval (resumeCount undefined) re-mint at the grant gate — the leak.
+    const statusB = await runtime.status('wfB', 'shared');
+    expect(statusB).toMatchObject({
+      status: 'suspended',
+      suspended: [['gate']],
+    });
+    expect(statusB?.resumeCount?.gate).toBe(1);
+  });
+
+  it("reads a run's own ledger bucket on the resume leg, not a sibling run's sharing the runId", async () => {
+    // #given — a provider recording (workflowId, leg) for every consult
+    const legs: Array<{ workflowId: string; leg: RunLeg }> = [];
+    const runtime = buildSharedRunIdPair((workflowId, leg) =>
+      legs.push({ workflowId, leg }),
+    );
+    await runtime.start('wfA', { runId: 'shared', inputData: {} });
+    await runtime.start('wfB', { runId: 'shared', inputData: {} });
+
+    // #given — wfB resumed once, bumping the 'gate' ordinal in wfB's bucket
+    await runtime.resume('wfB', 'shared', {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+
+    // #when — wfA's FIRST resume of its FIRST suspension; the leg fingerprint reads
+    // the ledger BEFORE this resume increments it
+    await runtime.resume('wfA', 'shared', {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+
+    // #then — wfA never resumed before, so its own bucket has no 'gate' entry: the
+    // leg's resumeCount is undefined. Keyed by runId alone (the bug) it read wfB's
+    // bucket and saw 1 — a first suspension masquerading as a re-suspension, which
+    // lets a re-suspension approval mint into a first leg.
+    const wfAResumeLeg = legs.find(
+      (e) => e.workflowId === 'wfA' && e.leg.kind === 'resume',
+    )?.leg as { resumeCount?: number } | undefined;
+    expect(wfAResumeLeg).toBeDefined();
+    expect(wfAResumeLeg?.resumeCount).toBeUndefined();
+  });
+
+  // A step that re-suspends on EVERY resume (never completes), so a run stays
+  // suspended at any depth and status() keeps projecting its accumulating
+  // ordinal — the deep-chain (3+ suspension) case the pair-binding relies on.
+  function buildSharedDeepChain(): RunnerRuntime {
+    const { createWorkflow, createStep, runtime } = init({
+      storage: new InMemoryStore(),
+    });
+    for (const id of ['wfA', 'wfB']) {
+      const gate = createStep({
+        id: 'gate',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        suspendSchema: z.object({ reason: z.string() }),
+        execute: async ({ resumeData, suspend }) =>
+          suspend({ reason: resumeData ? 'again' : 'first' }),
+      });
+      createWorkflow({
+        id,
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      })
+        .then(gate)
+        .commit();
+    }
+    return runtime;
+  }
+
+  it('accumulates per-workflow resume ordinals independently past depth 1 under a shared runId', async () => {
+    // #given — wfA and wfB both suspended under the SAME runId 'shared'
+    const runtime = buildSharedDeepChain();
+    await runtime.start('wfA', { runId: 'shared', inputData: {} });
+    await runtime.start('wfB', { runId: 'shared', inputData: {} });
+
+    // #when — wfA resumed once (ordinal 1), wfB resumed twice (ordinal 2); both
+    // re-suspend each time, so the ledger must ACCUMULATE, not reset to 1
+    await runtime.resume('wfA', 'shared', {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+    await runtime.resume('wfB', 'shared', {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+    await runtime.resume('wfB', 'shared', {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+
+    // #then — each workflow's ordinal is its OWN accumulated count: wfA=1, wfB=2.
+    // A fully shared bucket takes all 3 increments, so both reads see 3; a
+    // get-or-create keyed wrong freezes both at 1 (the deep-chain leak: a round-2
+    // approval minting into round 3).
+    const statusA = await runtime.status('wfA', 'shared');
+    const statusB = await runtime.status('wfB', 'shared');
+    expect(statusA?.resumeCount?.gate).toBe(1);
+    expect(statusB?.resumeCount?.gate).toBe(2);
+  });
+});
