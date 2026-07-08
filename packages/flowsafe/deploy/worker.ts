@@ -283,7 +283,7 @@ function requestedConnectors(stepPayload: unknown): string[] {
 /**
  * A suspension IS an approval request: queue it (idempotently — the store's
  * partial unique index collapses duplicates). Capturing the step's
- * (suspendedAt, resumedAt) pair binds the approval to THIS suspension exactly
+ * (suspendedAt, resumeCount) pair binds the approval to THIS suspension exactly
  * (clock-free grant minting), and the suspend payload's `connectors` declares
  * what a decision should mint.
  *

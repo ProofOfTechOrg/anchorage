@@ -10,6 +10,12 @@
       "@proofoftech/breakwater": ["../breakwater/src/index.ts"]
     }
   },
-  "include": ["src", "examples"],
+  "include": [
+    "src",
+    "examples",
+    "showcase/**/*.test.ts",
+    "showcase/runtime.ts",
+    "showcase/workflows/**/*.ts"
+  ],
   "exclude": ["src/approval-ui/**/*.tsx", "src/approval-ui/index.ts"]
 }

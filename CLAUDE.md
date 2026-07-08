@@ -110,7 +110,17 @@ Phase 4 (Ecosystem, 2026-07-07):
   trigger (isolated failures), bearer-token auth seam, start+resume approval
   bridges (multi-gate), optional Queues audit export. `deploy:cf`/`deploy:dev`.
 
-Verification gate: `pnpm -r lint && pnpm -r typecheck && pnpm -r test && pnpm -r build` (395 tests).
+Verification gate: `pnpm -r lint && pnpm -r typecheck && pnpm -r test && pnpm -r build` (427 tests).
+
+Showcase (2026-07-09): all five `docs/examples/*` workflows made runnable behind
+one React frontend and shipped as a single Cloudflare deploy —
+`packages/flowsafe/showcase/` (`buildShowcaseRuntime` registers all 5 on one
+Worker + DO + D1; `GET /workflows` + per-workflow `allowedRoles`; `assets` block
+serves `app/dist` at `/` with the API on the same origin) + host-agnostic glue in
+`src/host-kit/` (`WorkflowModule`, the approval bridge). The `app/` frontend gains
+a launcher + run-status panel + actor switcher; `run-api-dev-plugin.ts` runs the
+showcase host in-process for `app:dev`. Connectors stay binding-gated (simulate
+offline; grant gate always exercised).
 
 ## Files
 

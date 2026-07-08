@@ -1,0 +1,147 @@
+// A tiny client for the showcase run surface (GET /workflows, POST /runs,
+// GET /runs/:wf/:run), mirroring ApprovalApiClient's shape: injectable
+// baseUrl/fetch/headers, a private #request that prefixes the base and merges
+// #headers on every call, and a #post wrapper. The actor switcher rebuilds this
+// with a new Authorization header to act as a different identity.
+
+// Structural types matching the JSON the run API returns. Kept local (not
+// imported from the server-only do-runner/host-kit modules) so the browser
+// bundle stays decoupled from Workers-typed server code — the client only needs
+// this subset of fields.
+
+/** A workflow module's public metadata (GET /workflows). */
+export interface WorkflowMeta {
+  id: string;
+  title: string;
+  description: string;
+  sampleInput: unknown;
+  allowedRoles?: readonly string[];
+}
+
+/**
+ * The run projection (POST /runs, GET /runs/:wf/:run) — a subset of the server's
+ * RunSummary carrying the fields the UI may render.
+ */
+export interface RunSummary {
+  runId: string;
+  status: string;
+  result?: unknown;
+  error?: string;
+  suspended?: string[][];
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface ResponseLike {
+  ok: boolean;
+  status: number;
+  json(): Promise<unknown>;
+}
+
+export type FetchLike = (
+  url: string,
+  init?: {
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string;
+  },
+) => Promise<ResponseLike>;
+
+export class RunApiError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'RunApiError';
+    this.status = status;
+  }
+}
+
+export interface RunClientOptions {
+  /** Default: '' — the run routes (/workflows, /runs) live at the origin root. */
+  baseUrl?: string;
+  /** Default: globalThis.fetch. Injected in tests and non-browser hosts. */
+  fetch?: FetchLike;
+  /** Sent on every request — the deployment's auth (bearer token, etc.). */
+  headers?: Record<string, string>;
+}
+
+/** A run start response: the RunSummary plus, on a suspension, the queued approval. */
+export interface StartRunResponse extends RunSummary {
+  approval?: { id: string } & Record<string, unknown>;
+}
+
+export class RunClient {
+  readonly #baseUrl: string;
+  readonly #fetch: FetchLike;
+  readonly #headers: Record<string, string>;
+
+  constructor(options: RunClientOptions = {}) {
+    this.#baseUrl = options.baseUrl ?? '';
+    const fetchFn =
+      options.fetch ??
+      ((globalThis as { fetch?: unknown }).fetch as FetchLike | undefined);
+    if (!fetchFn) {
+      throw new Error('RunClient: no fetch available — pass one');
+    }
+    this.#fetch = (url, init) => fetchFn(url, init);
+    this.#headers = { ...options.headers };
+  }
+
+  async workflows(): Promise<WorkflowMeta[]> {
+    const payload = (await this.#request('/workflows')) as {
+      workflows: WorkflowMeta[];
+    };
+    return payload.workflows;
+  }
+
+  async start(
+    workflowId: string,
+    inputData: unknown,
+  ): Promise<StartRunResponse> {
+    return (await this.#post('/runs', {
+      workflowId,
+      inputData,
+    })) as StartRunResponse;
+  }
+
+  async status(workflowId: string, runId: string): Promise<RunSummary> {
+    return (await this.#request(
+      `/runs/${encodeURIComponent(workflowId)}/${encodeURIComponent(runId)}`,
+    )) as RunSummary;
+  }
+
+  async #post(path: string, body: Record<string, unknown>): Promise<unknown> {
+    return this.#request(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  }
+
+  async #request(
+    path: string,
+    init: {
+      method?: string;
+      headers?: Record<string, string>;
+      body?: string;
+    } = {},
+  ): Promise<unknown> {
+    const response = await this.#fetch(`${this.#baseUrl}${path}`, {
+      ...init,
+      headers: { ...this.#headers, ...init.headers },
+    });
+    const payload = await response.json().catch(() => undefined);
+    if (!response.ok) {
+      const message =
+        payload !== null &&
+        typeof payload === 'object' &&
+        'error' in payload &&
+        typeof (payload as { error: unknown }).error === 'string'
+          ? (payload as { error: string }).error
+          : `request failed with status ${response.status}`;
+      throw new RunApiError(response.status, message);
+    }
+    return payload;
+  }
+}

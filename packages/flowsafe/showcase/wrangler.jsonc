@@ -1,0 +1,74 @@
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "anchorage-showcase",
+  "main": "./worker.ts",
+  "compatibility_date": "2025-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  // The worker emits structured JSON (audit + maintenance + connector previews)
+  // to Workers Logs.
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [{ "name": "RUNNER", "class_name": "ShowcaseRunner" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ShowcaseRunner"] }],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "anchorage-showcase",
+      // Local `wrangler dev` creates a local SQLite automatically. For a real
+      // deploy: `wrangler d1 create anchorage-showcase` and paste the id here.
+      // Tables are created lazily by the stores; no migration files needed.
+      "database_id": "REPLACE-WITH-YOUR-D1-DATABASE-ID"
+    }
+  ],
+  // Single-deploy: serve the built SPA (app/dist) at / via Workers Static
+  // Assets, and the API on the SAME origin. run_worker_first is load-bearing —
+  // without it the SPA fallback would swallow the API routes (they are not files
+  // on disk). Everything else (/, deep SPA routes) serves index.html. Build the
+  // SPA first (`pnpm --filter @proofoftech/flowsafe app:build`) so ../app/dist
+  // exists.
+  "assets": {
+    "directory": "../app/dist",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/runs", "/runs/*", "/healthz", "/workflows"]
+  },
+  // The showcase runs OFFLINE by default: no `send_email` binding => the
+  // gtm-outbound connector simulates the send (logs the envelope, zero secrets),
+  // and the CRM/deploy egress connectors simulate too (they are wired from
+  // defineWorkflows() in worker.ts, unset here). content-pipeline's R2 write is
+  // offline-real via the in-memory artifact bucket. To send real email: onboard
+  // a domain (`wrangler email sending enable <yourdomain>`), then uncomment.
+  // Cloudflare Email Service is TRANSACTIONAL — for bulk campaigns swap the
+  // connector's execute for a marketing ESP.
+  // "send_email": [{ "name": "EMAIL" }],
+  // Every firing runs the SLA sweep + retention purge (worker.ts scheduled()).
+  "triggers": { "crons": ["*/15 * * * *"] },
+  // Optional audit export to a SIEM: `wrangler queues create showcase-audit`
+  // (and -dlq), uncomment, then set SIEM_ENDPOINT (var) + SIEM_AUTH_HEADER
+  // (secret). Without this block, audit stays on structured Workers Logs only.
+  // "queues": {
+  //   "producers": [{ "binding": "AUDIT_QUEUE", "queue": "showcase-audit" }],
+  //   "consumers": [
+  //     {
+  //       "queue": "showcase-audit",
+  //       "max_retries": 10,
+  //       "dead_letter_queue": "showcase-audit-dlq"
+  //     }
+  //   ]
+  // },
+  "vars": {
+    "APPROVAL_SLA_SECONDS": "14400",
+    "RUN_RETENTION_DAYS": "30",
+    "OUTREACH_FROM_ADDRESS": "gtm@example.com",
+    "OUTREACH_FROM_NAME": "Anchorage Showcase",
+    // DEMO tokens: a fixed bearer -> actor map so RBAC and separation-of-duties
+    // are clickable in the UI (the ActorSwitcher offers these exact tokens).
+    // These are NOT secrets — for a real deployment set
+    // `wrangler secret put APPROVAL_ACTOR_TOKENS` (read the same way) and remove
+    // this. Roles: admin | builder | operator | reviewer | viewer.
+    "APPROVAL_ACTOR_TOKENS": "{\"demo-admin\":{\"id\":\"admin\",\"role\":\"admin\"},\"demo-builder\":{\"id\":\"builder\",\"role\":\"builder\"},\"demo-operator\":{\"id\":\"operator\",\"role\":\"operator\"},\"demo-reviewer\":{\"id\":\"reviewer\",\"role\":\"reviewer\"},\"demo-viewer\":{\"id\":\"viewer\",\"role\":\"viewer\"}}"
+    // "SIEM_ENDPOINT": "https://siem.example/services/collector"
+  }
+  // Secrets (set with `wrangler secret put <name>`):
+  //   SIEM_AUTH_HEADER — sent as the `authorization` header on audit export.
+}

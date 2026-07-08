@@ -1,40 +1,45 @@
 # app/
 
-Full Vite React app for the approval dashboard — the runnable, deployable
-consumer of the `approval-ui` library. The library is styling-agnostic; this
-app injects an **Astryx adapter** (`src/astryx-components.tsx`) into
-`ApprovalUIProvider`, and Vite bundles Astryx's CSS (`src/index.css`) + the
-React components. In `serve` mode a dev-only plugin mounts a live, **seeded**
-approval-api at `/api/approvals`, so the real `ApprovalApiClient` drives real
-CAS transitions (claim / decide / delegate) and live metrics against
-`InMemoryApprovalStore` — a working backend, not a mock.
+Full Vite React app for the Anchorage **showcase** — a launcher + run-status
+panel + actor switcher layered beside the approval dashboard. The `approval-ui`
+library is styling-agnostic; this app injects an **Astryx adapter**
+(`src/astryx-components.tsx`) into `ApprovalUIProvider`, and Vite bundles Astryx's
+CSS (`src/index.css`). The new panels render through the same injected slot
+components, so they inherit the Astryx look with zero adapter changes.
 
-CSS handling differs by layer: `tsc` (the library build) can't bundle CSS, so a
-library consumer wires styling themselves (their own adapter, or the unstyled
-HTML default); Vite (this app) bundles the Astryx adapter's CSS, so running the
-app needs no extra wiring. Astryx is a `devDependency` — only this app uses it.
+In `serve` mode a dev-only plugin mounts the **in-process showcase host** —
+`/api/approvals` (the dashboard) + `/runs` + `/workflows` (the launcher/status
+panel) — so `app:dev` is a real working backend: launch a workflow, approve it
+in the dashboard, watch it run to success. A production `build` is a pure client
+bundle served by the single-deploy Worker on the same origin.
+
+Astryx is a `devDependency` — only this app uses it; published `approval-ui`
+consumers pull zero Astryx.
 
 ## Files
 
 | File | What | When to read |
 | ---- | ---- | ------------ |
 | `index.html` | Vite entry; mounts `src/main.tsx` into `#root` | Changing the HTML shell or title |
-| `vite.config.ts` | `@vitejs/plugin-react` + (serve-only) `approvalApiDevPlugin`; requests port 4321 (auto-increments if taken) | Changing build/dev config |
-| `approval-api-dev-plugin.ts` | Dev-server middleware: seeded `InMemoryApprovalStore` + `ApprovalService` + `createApprovalRouter`, with a Node↔web `Request` adapter. Runs in Node (Vite esbuild), outside the browser tsconfig's `src` root | Changing the dev backend or seed data |
-| `src/main.tsx` | Builds `ApprovalApiClient`, then renders `<App>` wrapped in `ApprovalUIProvider` with the Astryx adapter | Changing app bootstrap or API target |
-| `src/astryx-components.tsx` | The Astryx adapter — maps the library's `ApprovalUIComponents` slots onto `@astryxdesign/core`. The only Astryx-coupled module; swap it to restyle | Changing the Astryx mapping, or writing an adapter for another design system |
-| `src/index.css` | Astryx CSS `@import`s (order: reset → base → theme), bundled by Vite | Changing theme or global styles |
-| `tsconfig.json` | Browser pass (DOM + `react-jsx` + `vite/client`); typechecks `src` only | Debugging app typecheck |
-| `tsconfig.node.json` | Node pass: type-checks `vite.config.ts` + `approval-api-dev-plugin.ts` (so their approval-api usage can't rot silently). Part of the `typecheck` script | Debugging the dev backend's types |
+| `vite.config.ts` | `@vitejs/plugin-react` + (serve-only) `runApiDevPlugin`; port 4321 | Changing build/dev config |
+| `run-api-dev-plugin.ts` | Dev-server middleware: the showcase host in-process — one `buildShowcaseRuntime` + one `ApprovalService` (host-kit re-queue bridge) over a shared store, bearer→actor auth, mounts `/api/approvals` + `/runs` + `/workflows`, a Node↔web `Request` adapter. Runs in Node (Vite esbuild), outside the browser tsconfig's `src` root | Changing the dev backend or its routing |
+| `src/main.tsx` | The `Root` shell: holds the acting identity + launched runs, derives both API clients from the identity, renders `ActorSwitcher` + `LauncherPanel` + `RunStatusPanel` + `<App>` under the shared Astryx provider | Changing app bootstrap, the client wiring, or panel layout |
+| `src/showcase-panels.tsx` | `ActorSwitcher` (live RBAC/SoD), `LauncherPanel` (start any of the 5), `RunStatusPanel` (poll started runs) + `DEMO_ACTORS`. All render through `useApprovalUIComponents()` slots; the status panel deliberately does NOT use the `Table` slot (that slot is `ApprovalRecord`-typed) | Changing the launcher/status/switcher UI |
+| `src/run-client.ts` | `RunClient` mirroring `ApprovalApiClient` (injectable baseUrl/fetch/headers, `#request`/`#post`). Local structural `WorkflowMeta`/`RunSummary` types keep the browser bundle decoupled from the Workers-typed server modules | Changing the run API client |
+| `src/astryx-components.tsx` | The Astryx adapter — maps the library's `ApprovalUIComponents` slots onto `@astryxdesign/core`. The only Astryx-coupled module; swap it to restyle | Changing the Astryx mapping, or adapting another design system |
+| `src/index.css` | Astryx CSS `@import`s (reset → base → theme), bundled by Vite | Changing theme or global styles |
+| `tsconfig.json` | Browser pass (DOM + `react-jsx` + `vite/client`); type-checks `src` only | Debugging app typecheck |
+| `tsconfig.node.json` | Node pass: type-checks `vite.config.ts` + `run-api-dev-plugin.ts`. Uses `@cloudflare/workers-types` (NOT DOM — they collide) because the plugin now pulls the workers-native showcase runtime through it | Debugging the dev backend's types |
 
 ## Run
 
 ```bash
-pnpm --filter @proofoftech/flowsafe app:dev      # dev server + live seeded API
+pnpm --filter @proofoftech/flowsafe app:dev      # dev server + in-process showcase host
 pnpm --filter @proofoftech/flowsafe app:build    # production client bundle (dist/, gitignored)
 ```
 
-A production `build` is a pure client bundle (the dev API plugin is not
-included); point it at a deployed approval router via `VITE_APPROVAL_API_URL`.
-`pnpm --filter @proofoftech/flowsafe build` also runs `app:build`, so the app
-is covered by the repo verification gate.
+Demo actors (bearer tokens, matched in `run-api-dev-plugin.ts` +
+`showcase/wrangler.jsonc`): `demo-admin`, `demo-builder`, `demo-operator`,
+`demo-reviewer`, `demo-viewer`. Switch identity in the UI to see RBAC + SoD.
+`pnpm --filter @proofoftech/flowsafe build` also runs `app:build`, so the app is
+covered by the repo verification gate.
