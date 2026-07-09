@@ -1,4 +1,5 @@
-// The breakwater <-> flowsafe wire contract, mirrored by value.
+// The breakwater <-> flowsafe wire contract (mirrored by value), plus the
+// flowsafe host role policy derived from it (RUN_START_ROLES).
 //
 // flowsafe deliberately does NOT import @proofoftech/breakwater at runtime:
 // the packages compose over documented requestContext keys
@@ -34,6 +35,19 @@ export const APPROVAL_ROLES: readonly ApprovalRole[] = [
   'operator',
   'reviewer',
   'viewer',
+];
+
+/**
+ * Roles permitted to START a run at the HTTP route — the coarse start-role gate
+ * every host applies to POST /runs, before any per-workflow allowedRoles check.
+ * A strict subset of APPROVAL_ROLES; reviewer/viewer are review-only. A
+ * host-level concept (breakwater has no equivalent), so there is no cross-package
+ * mirror to keep.
+ */
+export const RUN_START_ROLES: readonly ApprovalRole[] = [
+  'admin',
+  'operator',
+  'builder',
 ];
 
 /** The acting principal, same shape as breakwater's Actor. */

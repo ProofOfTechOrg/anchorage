@@ -52,6 +52,7 @@ import {
   createApprovalRouter,
   D1ApprovalStore,
   defaultResumeData,
+  RUN_START_ROLES,
 } from '../src/approval-api/index.js';
 import {
   createAuditQueueConsumer,
@@ -437,12 +438,7 @@ const handler: ExportedHandler<Env> = {
     // may inspect runs; starting or raw-resuming one is operator work.
     const actor = authenticateActor(request as unknown as Request, env);
     if (!actor) return json({ error: 'authentication required' }, 401);
-    if (
-      request.method === 'POST' &&
-      actor.role !== 'admin' &&
-      actor.role !== 'operator' &&
-      actor.role !== 'builder'
-    ) {
+    if (request.method === 'POST' && !RUN_START_ROLES.includes(actor.role)) {
       return json({ error: 'forbidden' }, 403);
     }
 

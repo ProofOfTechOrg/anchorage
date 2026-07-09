@@ -34,6 +34,18 @@ export const DEMO_ACTORS: readonly DemoActor[] = [
   { token: 'demo-viewer', label: 'viewer', role: 'viewer' },
 ];
 
+/**
+ * Roles allowed to START any workflow — the host's coarse start-role gate,
+ * applied to POST /runs before any per-workflow allowedRoles check. Mirrors
+ * RUN_START_ROLES in ../../src/approval-api/contract.ts BY VALUE, the same way
+ * the Role type above mirrors ApprovalRole: the app consumes the approval-ui
+ * (browser) subpackage and does not reach into the approval-api (server)
+ * subpackage's internal modules. reviewer/viewer are review-only. Drift is
+ * fail-safe — the backend re-checks authoritatively, so a stale mirror only
+ * re-enables a button the server still 403s.
+ */
+const RUN_START_ROLES: readonly Role[] = ['admin', 'operator', 'builder'];
+
 /** The identity the app starts as (admin — can start any workflow). */
 export const DEFAULT_ACTOR: DemoActor = DEMO_ACTORS[0] ?? {
   token: 'demo-admin',
@@ -156,8 +168,13 @@ export function LauncherPanel({
   const inputJson =
     editedJson ??
     (selected ? JSON.stringify(selected.sampleInput, null, 2) : '');
+  // Coarse start-role gate (mirrors every backend's POST /runs check) runs
+  // FIRST, then the per-workflow allowedRoles gate. Without the coarse check,
+  // reviewer/viewer saw an enabled Launch button the backend then 403s.
+  const canStartAny = RUN_START_ROLES.includes(actorRole);
   const roleAllowed =
-    !selected?.allowedRoles || selected.allowedRoles.includes(actorRole);
+    canStartAny &&
+    (!selected?.allowedRoles || selected.allowedRoles.includes(actorRole));
 
   function selectWorkflow(id: string): void {
     setSelectedId(id);
@@ -231,7 +248,11 @@ export function LauncherPanel({
             {!roleAllowed ? (
               <C.Banner
                 tone="warning"
-                title={`Your role '${actorRole}' cannot start this workflow — switch to ${selected.allowedRoles?.join(' or ')}.`}
+                title={
+                  selected.allowedRoles
+                    ? `Your role '${actorRole}' cannot start this workflow — switch to ${selected.allowedRoles.join(' or ')}.`
+                    : `Your role '${actorRole}' cannot start any workflow — switch to ${RUN_START_ROLES.join(', ')}.`
+                }
               />
             ) : null}
             {launchError ? (

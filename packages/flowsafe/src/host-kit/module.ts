@@ -22,6 +22,10 @@ export interface WorkflowMeta {
    * Roles permitted to START this workflow at the HTTP route. Omitted => the
    * host's coarse start-role check applies. This is a route-level gate only;
    * in-step RBAC (if any) is enforced separately inside the workflow.
+   *
+   * Must be a SUBSET of the host's coarse start-role set (RUN_START_ROLES in
+   * approval-api/contract.ts): the coarse gate runs first, so any role listed
+   * here that cannot start a run at all is silently dead.
    */
   allowedRoles?: readonly ApprovalRole[];
 }

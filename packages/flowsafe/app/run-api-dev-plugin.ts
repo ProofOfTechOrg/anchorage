@@ -20,6 +20,7 @@ import {
   createApprovalRouter,
   InMemoryApprovalStore,
   resumeViaRuntime,
+  RUN_START_ROLES,
 } from '../src/approval-api/index.js';
 import type { RunnerRuntime } from '../src/do-runner/index.js';
 import {
@@ -77,12 +78,7 @@ async function handleRunRoutes(
   if (segments[0] !== 'runs') return null;
 
   if (!actor) return json({ error: 'authentication required' }, 401);
-  if (
-    request.method === 'POST' &&
-    actor.role !== 'admin' &&
-    actor.role !== 'operator' &&
-    actor.role !== 'builder'
-  ) {
+  if (request.method === 'POST' && !RUN_START_ROLES.includes(actor.role)) {
     return json({ error: 'forbidden' }, 403);
   }
 

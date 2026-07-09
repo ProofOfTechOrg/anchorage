@@ -32,6 +32,7 @@ import {
   BREAKWATER_ACTOR_KEY,
   BREAKWATER_APPROVED_CONNECTORS_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
+  RUN_START_ROLES,
 } from './contract.js';
 import { approvalGrantProvider, resumeViaRuntime } from './grants.js';
 import { ApprovalService } from './service.js';
@@ -106,6 +107,13 @@ describe('breakwater contract tripwires', () => {
 
   it('mirrors the role set', () => {
     expect([...APPROVAL_ROLES]).toEqual([...ROLES]);
+  });
+
+  it('pins RUN_START_ROLES to the start-capable subset', () => {
+    // The coarse start-role gate: the three start-capable roles, excluding the
+    // review-only roles (reviewer/viewer). A host-level concept that mirrors no
+    // breakwater constant, so the exact membership is pinned here.
+    expect([...RUN_START_ROLES]).toEqual(['admin', 'operator', 'builder']);
   });
 
   it('adapts approval audit events onto AuditLogger.record', () => {

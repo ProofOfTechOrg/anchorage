@@ -11,6 +11,7 @@ export {
   BREAKWATER_ACTOR_KEY,
   BREAKWATER_APPROVED_CONNECTORS_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
+  RUN_START_ROLES,
 } from './contract.js';
 export type {
   ApprovalActor,

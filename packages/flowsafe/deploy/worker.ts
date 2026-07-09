@@ -46,6 +46,7 @@ import {
   createApprovalRouter,
   D1ApprovalStore,
   defaultResumeData,
+  RUN_START_ROLES,
 } from '@proofoftech/flowsafe/approval-api';
 import {
   createAuditQueueConsumer,
@@ -546,12 +547,7 @@ const handler: ExportedHandler<Env> = {
     // deployment (breakwater RBAC at the agent boundary).
     const actor = authenticateActor(request as unknown as Request, env);
     if (!actor) return json({ error: 'authentication required' }, 401);
-    if (
-      request.method === 'POST' &&
-      actor.role !== 'admin' &&
-      actor.role !== 'operator' &&
-      actor.role !== 'builder'
-    ) {
+    if (request.method === 'POST' && !RUN_START_ROLES.includes(actor.role)) {
       return json({ error: 'forbidden' }, 403);
     }
 
