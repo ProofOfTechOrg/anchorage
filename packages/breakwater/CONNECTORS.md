@@ -61,10 +61,10 @@ export function createSlackPoster(webhookHost = 'hooks.slack.com') {
 | ----- | ------- | ----------- |
 | `sideEffect` | `'read'` — no state change. `'write'` — creates/updates state. `'destructive'` — deletes or irreversibly changes state. `'idempotent'` — write-class but safely repeatable. | Write-class calls (`write`/`destructive`/`idempotent`) are what the approval gate and `writePermissions` globs match; `destructive` requires approval by default under any `writePermissions` policy. Also surfaces as Mastra tool hints (`readOnlyHint`, `destructiveHint`). |
 | `egress` | Every hostname your connector contacts. | The network-egress gate runs pre-execute; calls to undeclared hosts are denied (`ConnectorPolicyError`, `policy: 'network-egress'`) and audited. Deny beats allow. |
-| `idempotencyKey` | Caller must set `IDEMPOTENCY_KEY_CONTEXT_KEY` per call. | Replays of a stored key return the stored result without re-executing; concurrent same-key calls join one in-flight execution (atomic reserve when the store supports it). |
+| `idempotencyKey` | Caller must set `IDEMPOTENCY_KEY_CONTEXT_KEY` per call. | Replays of a stored key return the stored result without re-executing; concurrent same-key calls join one in-flight execution (atomic reserve when the store supports it). Keys are segmented by the host-minted isolation scope (`ISOLATION_SCOPE_CONTEXT_KEY`) when present — never hand-prefix a tenant into the key. |
 | `requiresApproval` | Always require a human approval, regardless of org policy. | The call is denied unless the requestContext grant (`breakwater.approvedConnectors`) names this connector id. The grant is the **only** approval token — an agent-shaped execution context never bypasses it. flowsafe's approval queue mints grants from APPROVED records at resume time. |
 | `dryRun` | Connector supports side-effect-free simulation. | Requires `dryRunExecute` (and is forbidden without it). A caller sets `DRY_RUN_CONTEXT_KEY` and gets the simulation — allowed without a grant, because a simulation never reaches a side effect; the real call still needs one. |
-| `rateLimit` | `'<count>/<unit>'` — e.g. `'100/min'`, `'10/hour'`. | Fixed windows against `policies.rateLimitStore` (required when declared). Denied calls, replays, and dry-runs don't consume budget. |
+| `rateLimit` | `'<count>/<unit>'` — e.g. `'100/min'`, `'10/hour'`. | Fixed windows against `policies.rateLimitStore` (required when declared). Denied calls, replays, and dry-runs don't consume budget. Budgets are segmented per isolation scope when a host mints one, so one tenant cannot exhaust another's window. |
 
 `policies` (all optional) wires the enforcement environment: `networkEgress`
 options, `writePermissions` (org-level approval globs), custom `evaluators`
@@ -90,7 +90,9 @@ options, `writePermissions` (org-level approval globs), custom `evaluators`
   `breakwater.isolationScope` when a host mints one, so a cross-run business
   key (`send-email:bob@acme.com`) is safe. Do not defeat that by embedding your
   own tenant discriminator, and do not assume a scope exists — a single-tenant
-  host mints none.
+  host mints none. Absent scope deliberately falls back to shared single-tenant
+  keys, so a multi-tenant host must also register the `tenantIsolation`
+  evaluator, which denies any scope-less call (dry-run included).
 - **No secrets in the connector.** Take credentials via constructor
   parameters or the execution environment; never bake defaults, never log
   them, never put them in audit `detail`.

@@ -3,7 +3,7 @@
 // hmacVerifier is exercised against real crypto.subtle round-trips via
 // mintHmacToken — no mocked signatures.
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { ApprovalActor } from '../approval-api/index.js';
 import { parseActorTokens } from './bearer-auth.js';
@@ -54,6 +54,10 @@ describe('toApprovalActor', () => {
     ['uppercase tenantId', { id: 'a', role: 'admin', tenantId: 'Acme' }],
     ['short tenantId', { id: 'a', role: 'admin', tenantId: 'ab' }],
     ['underscore tenantId', { id: 'a', role: 'admin', tenantId: 'a_b' }],
+    [
+      "reserved identity tenantId ('system')",
+      { id: 'a', role: 'admin', tenantId: 'system' },
+    ],
     ['unknown role', { id: 'a', role: 'root', tenantId: 'acme' }],
     ['empty id', { id: '', role: 'admin', tenantId: 'acme' }],
     ['non-object', 'admin'],
@@ -62,6 +66,21 @@ describe('toApprovalActor', () => {
     // #when / #then — fail closed, no default actor
     expect(toApprovalActor(candidate)).toBeUndefined();
   });
+
+  it.each(['docs', 'api', 'default'])(
+    "accepts tenantId '%s' — allocation/routing reservations never bite at authentication",
+    (tenantId) => {
+      // #given a single-tenant host named after an allocation-reserved slug
+      // (no subdomains, so the routing collision cannot occur)
+      // #when / #then — only RESERVED_TENANT_IDS ('system') 401s at the
+      // token layer; re-conflating the two lists would 401 this host
+      expect(toApprovalActor({ id: 'a', role: 'admin', tenantId })).toEqual({
+        id: 'a',
+        role: 'admin',
+        tenantId,
+      });
+    },
+  );
 });
 
 describe('parseActorTokens (tenant required)', () => {
@@ -84,6 +103,28 @@ describe('parseActorTokens (tenant required)', () => {
     });
     expect(parsed.get('legacy')).toBeUndefined();
     expect(parsed.get('bad')).toBeUndefined();
+  });
+
+  it("drops a 'system' entry (the TCB's own audit identity) and logs config-error", () => {
+    // #given
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      // #when
+      const parsed = parseActorTokens(
+        JSON.stringify({
+          tok: { id: 'x', role: 'admin', tenantId: 'system' },
+        }),
+      );
+
+      // #then — empty map (the token 401s), and the drop is loud: a silent
+      // drop is how a broken token map hides until every route 401s
+      expect(parsed.size).toBe(0);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('config-error'),
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 });
 
@@ -245,6 +286,18 @@ describe('hmacVerifier', () => {
     const token = await mintHmacToken({
       ...MINT,
       actor: { ...ACTOR, tenantId: 'Bad_Tenant' },
+    });
+
+    // #when / #then
+    expect(await verifier().verify(token)).toBeUndefined();
+  });
+
+  it("rejects a signed token claiming the reserved identity 'system'", async () => {
+    // #given — correctly signed; the verifier chokepoint must still refuse
+    // the TCB's own audit identity (cron maintenance attribution)
+    const token = await mintHmacToken({
+      ...MINT,
+      actor: { ...ACTOR, tenantId: 'system' },
     });
 
     // #when / #then

@@ -128,7 +128,7 @@ anchorage/
 
 ```bash
 pnpm install
-pnpm -r build && pnpm -r test          # 640 tests across both packages
+pnpm -r build && pnpm -r test          # 669 tests across both packages
 pnpm --filter @proofoftech/flowsafe spike:verify   # workerd: suspend -> kill -> restart -> resume proof
 ```
 

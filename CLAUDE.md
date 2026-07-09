@@ -32,8 +32,10 @@ verification gate + `spike:verify` on push/PR to `main`. Phases 1-3:
 - flowsafe approval queue (Phase 3): `approval-api` — CAS-guarded store
   (D1 + in-memory), `ApprovalService` (role-checked claim/decide/delegate,
   SLA sweep → escalation, audit sink), fetch router for the REST surface,
-  and the grant-minting seam: `approvalGrantProvider(store)` wired into
-  `RunnerRuntime.requestContextForRun` derives
+  and the grant-minting seam: `approvalGrantProvider(tenantBoundStore)` wired
+  into `RunnerRuntime.requestContextForRun` (hosts wire
+  `approvalGrantProviderFromFactory(storeFactory)`, which recovers each leg's
+  tenant from the runId prefix and binds the store to it) derives
   `breakwater.approvedConnectors` from APPROVED records on every
   start/resume, leg-scoped to the resumed step (grants never travel in HTTP
   bodies; forged resumes fail closed at the connector gate even for
@@ -112,7 +114,7 @@ Phase 4 (Ecosystem, 2026-07-07):
   trigger (isolated failures), bearer-token auth seam, start+resume approval
   bridges (multi-gate), optional Queues audit export. `deploy:cf`/`deploy:dev`.
 
-Verification gate: `pnpm -r lint && pnpm -r typecheck && pnpm -r test && pnpm -r build` (623 tests).
+Verification gate: `pnpm -r lint && pnpm -r typecheck && pnpm -r test && pnpm -r build` (669 tests).
 
 Showcase (2026-07-09): all five `docs/examples/*` workflows made runnable behind
 one React frontend and shipped as a single Cloudflare deploy —
@@ -121,9 +123,11 @@ Worker + DO + D1; `GET /workflows` + per-workflow `allowedRoles`; `assets` block
 serves `app/dist` at `/` with the API on the same origin) + host-agnostic glue in
 `src/host-kit/` (subpath export `./host-kit`): `WorkflowModule`/`WorkflowMeta`,
 the approval bridge, the bearer auth seam (`parseActorTokens`,
-`bearerActorAuthenticator`), and `createRunRouter` — the `/workflows` + `/runs`
-surface with its 401 → coarse `RUN_START_ROLES` → per-workflow `allowedRoles`
-gate order. All four hosts (showcase, deploy template, `app:dev` plugin, demo
+`bearerActorAuthenticator`), and `createRunRouter({ resolve })` — the
+`/workflows` + `/runs` surface with its 401 → INV-3 → coarse `RUN_START_ROLES`
+→ per-workflow `allowedRoles` gate order; `resolve: TenantResolver`
+(authenticate → validate → bind) replaces the bare `authenticate`, and
+status/resume answer 404 for another tenant's run — no existence oracle. All four hosts (showcase, deploy template, `app:dev` plugin, demo
 spike) consume it; each injects only its resume topology (DO stub vs in-process).
 The `app/` frontend gains a launcher + run-status panel + actor switcher;
 `run-api-dev-plugin.ts` runs the showcase host in-process for `app:dev`. The demo
@@ -158,7 +162,10 @@ sandboxes — still offboard, and artifacts of retention-purged runs are covered
 by that purge's own `artifactStore` pairing, not re-enumerable here); Mastra
 six-table-inventory + `run_id` schema guards; the R2 no-workflow-level-listing pin; identity
 via `TokenVerifier` (`staticTokenVerifier` + HS256 `hmacVerifier`; `ApprovalActor.tenantId`
-required; the `tenants` registry is the allocation authority, reserved infra slugs denied);
+required; the `tenants` registry is the allocation authority — `RESERVED_FOR_ALLOCATION`
+denied at provisioning (infra slugs + `system` + `default`), `RESERVED_TENANT_IDS`
+(`system`) denied at token verification AND re-refused by `createTenantResolver`
+before any store binds — custom verifiers bypass `toApprovalActor`);
 the public demo (`showcase/demo-auth.ts`: GitHub OAuth → ephemeral `dm*` tenant + four-role
 JWT set, atomic per-tenant + global-daily run caps, kill switch in the AUTH middleware, two
 cron expressions so sweep/purge never share an invocation); subdomain↔tenant cross-check for
@@ -226,7 +233,12 @@ runtime — Mastra provides workflows, agents, memory, RAG, and observability.
   DERIVATION, not transport — `approvalGrantProvider(store)` plugs into
   `RunnerRuntime.requestContextForRun` and recomputes the grant list from
   APPROVED approval records on every start/resume, so grants never cross an
-  HTTP body and the DO's public resume route stays grant-free. Grants are
+  HTTP body and the DO's public resume route stays grant-free. Tenant-isolated
+  (INV-2): `approvalGrantProvider` takes a `TenantBoundApprovalStore`
+  (`factory.forTenant(tenantId)`); a `SystemApprovalStore` is not
+  type-assignable, so derivation can only ever read one tenant's APPROVED
+  records. The tenant is carried by the server-minted runId
+  (`${tenantId}_${uuid}`, INV-1), never chosen by a client. Grants are
   SUSPENSION-SCOPED: the runtime passes the resumed step and its current
   suspension's `(suspendedAt, resumeCount)` fingerprint to the provider, and a
   step-keyed approval mints preferentially by EXACT MATCH — the creating
@@ -287,3 +299,21 @@ runtime — Mastra provides workflows, agents, memory, RAG, and observability.
 - Any new code goes under `packages/breakwater/` or `packages/flowsafe/`
 - breakwater code must work as Mastra middleware (no custom runtime)
 - flowsafe code must target Cloudflare Workers/DO for the DO runner
+- **INV-1** — runIds are server-minted `${tenantId}_${uuid}`.
+  `RunnerRuntime.start` *requires* `options.runId`; never re-add the
+  `?? crypto.randomUUID()` fallback. `createRunRouter` 400s a client-supplied
+  `body.runId`.
+- **INV-2** — approval stores are tenant-bound. Obtain via
+  `D1ApprovalStoreFactory` / `InMemoryApprovalStoreFactory` `.forTenant()`.
+  `D1ApprovalStore` is deliberately not exported. `sweepSLA` is a cron-only
+  free function over `SystemApprovalStore`.
+- **INV-3** — `tenantId` matches `^[a-z0-9]{3,32}$`; every verifier validates
+  it and drops entries that fail. `'system'` is additionally rejected at token
+  verification AND re-refused by `createTenantResolver` before a store binds
+  or a runId mints (`RESERVED_TENANT_IDS`, defined in
+  `do-runner/path-safe-id.ts` — the TCB's own audit identity; the resolver
+  belt exists because a custom `TokenVerifier` or hand-built actor map never
+  crosses `toApprovalActor`); the routing/allocation slugs
+  (`RESERVED_FOR_ALLOCATION`, incl. `default`) are deliberately NOT enforced
+  at either of those points — re-conflating the two lists would 401 a
+  single-tenant host named `api` or `default`.

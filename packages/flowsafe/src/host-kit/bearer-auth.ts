@@ -15,9 +15,9 @@ import { toApprovalActor, type TokenVerifier } from './verifier.js';
 /**
  * Parse the `APPROVAL_ACTOR_TOKENS` secret:
  * `{"<token>": {"id","role","tenantId"}}`. Every entry passes the real
- * validator (toApprovalActor) — unknown roles, empty ids, and missing or
- * non-INV-3 tenantIds are dropped rather than trusted; there is no `as`-cast
- * at this JSON boundary.
+ * validator (toApprovalActor) — unknown roles, empty ids, and missing,
+ * non-INV-3, or reserved-identity ('system') tenantIds are dropped rather
+ * than trusted; there is no `as`-cast at this JSON boundary.
  */
 export function parseActorTokens(
   raw: string | undefined,
@@ -48,7 +48,7 @@ export function parseActorTokens(
           type: 'config-error',
           var: 'APPROVAL_ACTOR_TOKENS',
           reason:
-            'entry dropped: needs non-empty id, a known role, and an INV-3 tenantId (^[a-z0-9]{3,32}$) — its token will 401',
+            "entry dropped: needs non-empty id, a known role, and an INV-3 tenantId (^[a-z0-9]{3,32}$, not the reserved identity 'system') — its token will 401",
         }),
       );
     }

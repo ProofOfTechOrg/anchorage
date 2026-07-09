@@ -36,6 +36,19 @@ export const PATH_SAFE_ID_PATTERN = /^(?!\.\.?$)[A-Za-z0-9._~-]{1,200}$/;
 // path-safe-id.test.ts pins it character-by-character.
 export const TENANT_ID_PATTERN = /^[a-z0-9]{3,32}$/;
 
+// Ids that collide with the TCB's own audit identity: the cron maintenance
+// actor attributes sweeps and purges as tenantId 'system'. Never a valid
+// tenantId ANYWHERE, enforced twice: toApprovalActor drops it at token
+// verification, and createTenantResolver re-refuses it before any store binds
+// or runId mints — a custom TokenVerifier (a supported seam) or a hand-built
+// actor map handed to staticTokenVerifier never crosses toApprovalActor.
+// (Audit-attribution collision, not privilege escalation: a
+// SystemApprovalStore comes only from `.system()`, never from naming a
+// tenant.) Lives in this leaf, not host-kit/tenant-registry, so approval-api
+// can enforce it without importing host-kit against the layering; host-kit
+// re-exports it for the public surface.
+export const RESERVED_TENANT_IDS: readonly string[] = ['system'];
+
 /**
  * The ONE place INV-1's `${tenantId}_${uuid}` carrier is decoded. Returns the
  * INV-3-validated tenant prefix, or undefined when the runId carries none.

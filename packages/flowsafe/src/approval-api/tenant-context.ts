@@ -7,7 +7,10 @@
 // the request FIRST (authenticate -> validate INV-3 -> bind), and everything
 // downstream reads tenant.service() / tenant.newRunId() / tenant.ownsRun().
 
-import { TENANT_ID_PATTERN } from '../do-runner/path-safe-id.js';
+import {
+  RESERVED_TENANT_IDS,
+  TENANT_ID_PATTERN,
+} from '../do-runner/path-safe-id.js';
 import type { ApprovalActor } from './contract.js';
 import type { ApprovalService } from './service.js';
 import type { TenantBoundApprovalStore } from './tenant-brand.js';
@@ -26,11 +29,11 @@ export interface TenantContext {
 
 /**
  * undefined => no identity => 401. Throws TenantResolutionError when an
- * AUTHENTICATED actor carries a tenant that fails INV-3 — that is a verifier
- * or claim-mapping bug, surfaced as 403 by the routers, never concatenated
- * into a runId ("undefined" is itself an INV-3-valid string, so an
- * unvalidated `String(undefined)` would silently authorize a tenant literally
- * named 'undefined').
+ * AUTHENTICATED actor carries a tenant that fails INV-3 or names a reserved
+ * identity ('system') — either is a verifier or claim-mapping bug, surfaced
+ * as 403 by the routers, never concatenated into a runId ("undefined" is
+ * itself an INV-3-valid string, so an unvalidated `String(undefined)` would
+ * silently authorize a tenant literally named 'undefined').
  */
 export type TenantResolver = (
   request: Request,
@@ -73,6 +76,18 @@ export function createTenantResolver(
     if (!TENANT_ID_PATTERN.test(actor.tenantId)) {
       throw new TenantResolutionError(
         `authenticated actor '${actor.id}' carries a non-INV-3 tenantId — fix the verifier; refusing to scope the request`,
+      );
+    }
+    // Belt over the verifier seam: the built-in toApprovalActor already drops
+    // reserved identities, but a custom TokenVerifier or a hand-built actor
+    // map handed to staticTokenVerifier never crosses it. This resolver is
+    // the one chokepoint every routed request passes before a store binds or
+    // a runId mints, so the TCB's own audit identity is re-refused here
+    // whatever the verifier admitted. ('system' is INV-3-valid — the pattern
+    // check above cannot catch it.)
+    if (RESERVED_TENANT_IDS.includes(actor.tenantId)) {
+      throw new TenantResolutionError(
+        `authenticated actor '${actor.id}' carries the reserved tenantId '${actor.tenantId}' (the TCB's own audit identity) — fix the verifier; refusing to scope the request`,
       );
     }
     const tenantId = actor.tenantId;

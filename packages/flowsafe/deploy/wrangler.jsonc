@@ -43,17 +43,20 @@
     // <tenant>.<apex> is denied unless the token's VERIFIED tenant is that
     // tenant. Defense in depth over the tenant-bound stores (INV-2) — it
     // closes the confused-deputy UX where a user pastes tenant A's token into
-    // tenant B's branded host. Hosts outside the apex and the reserved infra
-    // subdomains (app/www/api/docs/admin/status) skip the check.
+    // tenant B's branded host. Hosts outside the apex and the reserved
+    // never-allocatable subdomains (app/www/api/docs/admin/status, plus
+    // system/default) skip the check.
     // "TENANT_APEX_DOMAIN": "example.com"
     // "SIEM_ENDPOINT": "https://siem.example/services/collector"
   }
   // Secrets (set with `wrangler secret put <name>`):
   //   APPROVAL_ACTOR_TOKENS — JSON map of bearer token ->
   //     { id, role, tenantId }; roles: admin | builder | operator | reviewer |
-  //     viewer; tenantId must match ^[a-z0-9]{3,32}$ (INV-3) or the entry is
+  //     viewer; tenantId must match ^[a-z0-9]{3,32}$ (INV-3) and must not be
+  //     'system' (the maintenance actor's audit identity) or the entry is
   //     dropped and its token 401s. Provision each tenantId through the
-  //     `tenants` registry (provisionTenant) BEFORE issuing its tokens.
+  //     `tenants` registry (provisionTenant) BEFORE issuing its tokens
+  //     (single-tenant hosts: see README "Hosting a single tenant").
   //   SIEM_AUTH_HEADER — sent as the `authorization` header on audit export,
   //     e.g. "Splunk <hec-token>".
 }

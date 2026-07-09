@@ -16,7 +16,10 @@
 // default actor.
 
 import { APPROVAL_ROLES, type ApprovalActor } from '../approval-api/index.js';
-import { TENANT_ID_PATTERN } from '../do-runner/path-safe-id.js';
+import {
+  RESERVED_TENANT_IDS,
+  TENANT_ID_PATTERN,
+} from '../do-runner/path-safe-id.js';
 
 export interface TokenVerifier {
   verify(token: string): Promise<ApprovalActor | undefined>;
@@ -25,7 +28,8 @@ export interface TokenVerifier {
 /**
  * Validate an untyped candidate into an ApprovalActor — the ONE place a
  * decoded token/map entry becomes an identity. No `as`-casting at the JSON
- * boundary: id non-empty, role recognized, tenantId INV-3-valid.
+ * boundary: id non-empty, role recognized, tenantId INV-3-valid and not a
+ * reserved identity.
  */
 export function toApprovalActor(candidate: unknown): ApprovalActor | undefined {
   if (candidate === null || typeof candidate !== 'object') return undefined;
@@ -44,6 +48,13 @@ export function toApprovalActor(candidate: unknown): ApprovalActor | undefined {
   if (typeof tenantId !== 'string' || !TENANT_ID_PATTERN.test(tenantId)) {
     return undefined;
   }
+  // 'system' is the TCB's own audit identity (cron maintenance attribution);
+  // a client token claiming it would launder into the operator's maintenance
+  // log stream. Only RESERVED_TENANT_IDS bites here: rejecting the routing
+  // slugs (api/docs/...) too would 401 a single-tenant host named 'api' over
+  // a subdomain collision that cannot occur on a host with no subdomains —
+  // those stay allocation/routing concerns (RESERVED_FOR_ALLOCATION).
+  if (RESERVED_TENANT_IDS.includes(tenantId)) return undefined;
   return { id, role: role as ApprovalActor['role'], tenantId };
 }
 

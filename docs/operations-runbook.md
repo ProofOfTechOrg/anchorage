@@ -56,8 +56,12 @@ their uniqueness**. Two clients slugged `acme` would merge their runs,
 approvals, rate limits, and artifacts.
 
 1. `provisionTenant(db, { tenantId, kind: 'commercial' })` — insert-or-fail.
-   `tenantId` must match `^[a-z0-9]{3,32}$` and must not be a reserved
-   infrastructure slug (`app`, `www`, `api`, `docs`, `admin`, `status`).
+   `tenantId` must match `^[a-z0-9]{3,32}$` and must not be reserved from
+   allocation: the infrastructure subdomains (`app`, `www`, `api`, `docs`,
+   `admin`, `status`), `system` (the cron maintenance actor's audit identity —
+   also rejected at token verification), and `default` (the conventional
+   single-tenant id, kept unallocatable so a single-tenant host can adopt the
+   registry later without a collision).
 2. Only then issue tokens naming that tenant. A bearer-map entry or JWT claim
    without an INV-3-valid `tenantId` is dropped, and its token 401s.
 3. Tenant ids are never reused. The registry is append-only: a purged tenant's

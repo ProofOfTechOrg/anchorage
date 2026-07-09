@@ -7,7 +7,10 @@
 // naming that tenantId is issued. The demo worker's ephemeral tenants go
 // through the same gate (its demo_tenants registry references this table).
 
-import { TENANT_ID_PATTERN } from '../do-runner/path-safe-id.js';
+import {
+  RESERVED_TENANT_IDS,
+  TENANT_ID_PATTERN,
+} from '../do-runner/path-safe-id.js';
 
 /** Structural D1 subset (tests back it with node:sqlite, Workers pass env.DB). */
 export interface TenantRegistryDatabase {
@@ -26,19 +29,37 @@ const CREATE_TENANTS_TABLE = `CREATE TABLE IF NOT EXISTS tenants (
 )`;
 
 /**
- * Slugs that can never be tenants: they are (or may become) shared
- * infrastructure subdomains, and the commercial host's subdomain cross-check
- * treats them as non-tenant hosts. Rejecting them AT PROVISIONING is the
- * robust half of that check — a tenant literally named 'www' could otherwise
- * satisfy `host-tenant === token-tenant` on a shared host.
+ * The TCB's own audit identity ('system'). Defined in the path-safe-id leaf —
+ * approval-api's createTenantResolver enforces it too, and importing host-kit
+ * from there would invert the layering — and re-exported here so the public
+ * surface stays `./host-kit`. Full rationale at the definition.
  */
-export const RESERVED_TENANT_SLUGS: readonly string[] = [
+export { RESERVED_TENANT_IDS } from '../do-runner/path-safe-id.js';
+
+/**
+ * Slugs that can never be ALLOCATED to a client, for three distinct reasons:
+ * the TCB identity above; shared-infrastructure subdomains the commercial
+ * host's subdomain cross-check treats as non-tenant hosts (rejecting them AT
+ * PROVISIONING is the robust half of that check — a tenant literally named
+ * 'www' could otherwise satisfy `host-tenant === token-tenant` on a shared
+ * host); and 'default', the conventional single-tenant id (deploy/README.md),
+ * reserved so a community host running it can adopt this registry later
+ * without finding 'default' sold to a client. Of these only
+ * RESERVED_TENANT_IDS bites at authentication — a single-tenant host whose
+ * tenant is named 'api' or 'default' still authenticates. 'default' is
+ * deliberately a list entry, not an exported constant: a blessed
+ * DEFAULT_TENANT value would invite the `tenantId ?? DEFAULT_TENANT`
+ * fail-open this design exists to prevent.
+ */
+export const RESERVED_FOR_ALLOCATION: readonly string[] = [
+  ...RESERVED_TENANT_IDS,
   'app',
   'www',
   'api',
   'docs',
   'admin',
   'status',
+  'default',
 ];
 
 /** A provisioning attempt for a tenantId that already exists. */
@@ -83,9 +104,9 @@ export async function provisionTenant(
       `tenantId '${tenantId}' violates INV-3 (^[a-z0-9]{3,32}$) — not provisioned`,
     );
   }
-  if (RESERVED_TENANT_SLUGS.includes(tenantId)) {
+  if (RESERVED_FOR_ALLOCATION.includes(tenantId)) {
     throw new Error(
-      `tenantId '${tenantId}' is a reserved infrastructure slug — not provisioned`,
+      `tenantId '${tenantId}' is a reserved slug — not provisioned`,
     );
   }
   await db.prepare(CREATE_TENANTS_TABLE).run();

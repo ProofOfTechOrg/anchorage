@@ -11,6 +11,68 @@ The demo sibling (`../demo/`) is the minimal spike this template grew from;
 deploy differences: real auth, cron maintenance, multi-gate approval
 bridging, `/healthz`, and env-tunable SLA/retention.
 
+## Hosting a single tenant
+
+flowsafe is multi-tenant by construction — you do not turn tenancy off, you
+use exactly one tenant. On this template that costs one field per token-map
+entry. `@proofoftech/breakwater` is unaffected: a breakwater-only consumer
+changes nothing.
+
+**Pick a tenant id.** It must match `^[a-z0-9]{3,32}$` — lowercase letters and
+digits only; no underscore, hyphen, or dot. `default` is the conventional
+choice and is permanently reserved against allocation, so it can never collide
+with a client if you later run more than one tenant; your own company name
+(`acme`) is equally fine. The only id you may **not** use is `system` — it is
+the audit identity of the cron maintenance actor, and a token carrying it is
+rejected at parse time (and re-refused by the tenant resolver, whichever
+verifier you plug in).
+
+**Put it in the token map.** Every entry in the `APPROVAL_ACTOR_TOKENS` secret
+needs it; an entry without a valid `tenantId` is dropped at parse time (a
+`config-error` line in the logs) and its token 401s:
+
+```json
+{"tok-ray":{"id":"ray","role":"reviewer","tenantId":"acme"}}
+```
+
+That is the whole configuration. Everything downstream binds itself: the
+tenant resolver binds each request's approval store to the authenticated
+token's tenant, and each run's Durable Object binds its grant store to the
+tenant prefix of its own run id. You never write the tenant id into
+`worker.ts` — the maintenance actor stays `system` on purpose.
+
+**What changes that you will notice.** Run ids become `acme_<uuid>`. They are
+minted server-side; `POST /runs` with a `runId` in the body returns `400`. Do
+not parse, pin, or derive anything from a run id — treat it as an opaque
+identifier that happens to carry its tenant.
+
+**If you route runs yourself.** `createRunRouter` mints the run id for you. If
+you bypass it and call `RunnerRuntime.start` directly, you must still pass
+`` `${tenantId}_${uuid}` `` — `start` requires a `runId` and no longer
+generates one. This matters because a Durable Object recovers its tenant by
+reading the prefix off its own run id: a hand-minted `batch_42` would bind
+that DO's grant store to a phantom tenant `batch`, and your approvals (created
+under `acme`) would never mint a grant. You will not have to debug that:
+`ApprovalService` rejects an approval whose run id does not carry its own
+tenant's prefix, loudly, at creation time —
+
+> `runId 'batch_42' does not carry this tenant's prefix 'acme_' — approvals bind to tenant-salted runs (INV-1)`
+
+**What you can ignore.** The `tenants` registry (checklist step 2) exists to
+keep multiple tenants unique; with one tenant you may skip it. Skipping is
+mandatory for `default` — it is deliberately not provisionable, which is
+exactly what keeps it yours; a named tenant like `acme` can be provisioned now
+to keep the upgrade path clean. The subdomain↔tenant cross-check
+(`TENANT_APEX_DOMAIN`) is for `<client>.example.com` hosts. `hmacVerifier`,
+OAuth sign-in, and the demo sandbox are the public demo's problem, not yours —
+`staticTokenVerifier` over your token map is the whole identity layer.
+`purgeTenant` is for offboarding a client.
+
+**What you must not do.** Do not make `tenantId` optional or give it a
+default. An omissible tenant is the one failure this design exists to prevent:
+on the day you add a second tenant, every tenant-less token silently becomes
+the first one. Typing `"tenantId":"acme"` a few times is the cheaper trade.
+
 ## Deploy checklist
 
 ```bash

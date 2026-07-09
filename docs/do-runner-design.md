@@ -28,9 +28,12 @@ const myWorkflow = createWorkflow({
   .then(approve)
   .commit();
 
-// Execution and suspend/resume state live in a Durable Object;
-// starting a run is unchanged Mastra API.
-const run = await myWorkflow.createRun();
+// Execution and suspend/resume state live in a Durable Object. Definition
+// code is unchanged; STARTING is not: the runtime requires a server-minted
+// runId (`${tenantId}_${uuid}`, INV-1) — in the flowsafe hosts createRunRouter
+// mints it and passes it in; there is no generation fallback. See "Run
+// Identity and Tenant Scoping" below.
+const run = await myWorkflow.createRun({ runId });
 await run.start({ inputData: {} });
 ```
 

@@ -434,6 +434,46 @@ describe('createRunRouter — POST /runs', () => {
     expect(started).toEqual([]);
   });
 
+  it("403s an actor claiming the reserved identity 'system' — a custom verifier must not bind the maintenance identity", async () => {
+    // #given — 'system' is INV-3-valid, so only the resolver's
+    // reserved-identity check can catch a custom TokenVerifier (or hand-built
+    // actor map) that never crossed toApprovalActor
+    const { handle, started } = makeHarness();
+
+    // #when
+    const response = await handle(
+      req('/runs', {
+        body: { workflowId: 'open-flow' },
+        actor: { id: 'eve', role: 'admin', tenantId: 'system' },
+      }),
+    );
+
+    // #then — no store bound, no system_* runId minted
+    expect(response?.status).toBe(403);
+    expect(started).toEqual([]);
+  });
+
+  it("still binds allocation-reserved tenants ('default') post-auth — only identities are refused at the resolver", async () => {
+    // #given — the two-list split must hold at this second enforcement layer
+    // too: refusing 'default' or 'api' here would break the single-tenant
+    // host the allocation reservation exists to protect
+    const { handle, started } = makeHarness();
+
+    // #when
+    const response = await handle(
+      req('/runs', {
+        body: { workflowId: 'open-flow' },
+        actor: { id: 'ray', role: 'admin', tenantId: 'default' },
+      }),
+    );
+
+    // #then — run minted under the 'default' tenant
+    expect(response?.ok).toBe(true);
+    expect(started.map((entry) => entry.runId)).toEqual([
+      'default_generated-run-id',
+    ]);
+  });
+
   it('returns the bare summary when the run does not suspend', async () => {
     // #given
     const { handle, store } = makeHarness();

@@ -12,7 +12,7 @@
 
 import type { TenantContext, TenantResolver } from '../approval-api/index.js';
 import { TenantResolutionError } from '../approval-api/index.js';
-import { RESERVED_TENANT_SLUGS } from './tenant-registry.js';
+import { RESERVED_FOR_ALLOCATION } from './tenant-registry.js';
 
 export interface SubdomainCrossCheckOptions {
   /**
@@ -46,7 +46,7 @@ export function subdomainTenantOf(
   if (host === apex || !host.endsWith(`.${apex}`)) return undefined;
   const label = host.slice(0, -(apex.length + 1));
   if (label.includes('.')) return undefined; // deeper levels are not tenants
-  if ((options.reserved ?? RESERVED_TENANT_SLUGS).includes(label)) {
+  if ((options.reserved ?? RESERVED_FOR_ALLOCATION).includes(label)) {
     return undefined;
   }
   return label;

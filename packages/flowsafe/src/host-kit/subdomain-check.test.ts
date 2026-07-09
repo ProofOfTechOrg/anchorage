@@ -48,6 +48,14 @@ describe('subdomainTenantOf', () => {
     ['reserved: api', 'api.example.com'],
     ['reserved: app', 'app.example.com'],
     ['reserved: admin', 'admin.example.com'],
+    [
+      "reserved identity: system (the TCB's audit identity)",
+      'system.example.com',
+    ],
+    [
+      'reserved: default (the conventional single-tenant id)',
+      'default.example.com',
+    ],
   ])('%s is NOT tenant-addressed', (_label, host) => {
     expect(subdomainTenantOf(host, APEX)).toBeUndefined();
   });
@@ -132,27 +140,35 @@ describe('withSubdomainCrossCheck', () => {
 });
 
 describe('reserved tenant slugs (the provisioning half of the check)', () => {
-  it.each(['www', 'api', 'app', 'docs', 'admin', 'status'])(
-    "provisionTenant refuses the reserved slug '%s'",
-    async (slug) => {
-      // #given — a registry db stub that must never be reached for the insert
-      const statements: string[] = [];
-      const db = {
-        prepare: (query: string) => {
-          statements.push(query);
-          return {
-            bind: () => db.prepare(query),
-            run: async () => ({}),
-          };
-        },
-      };
+  it.each([
+    'www',
+    'api',
+    'app',
+    'docs',
+    'admin',
+    'status',
+    // Beyond the infra subdomains: the TCB's own audit identity, and the
+    // conventional single-tenant id a community host may already be running.
+    'system',
+    'default',
+  ])("provisionTenant refuses the reserved slug '%s'", async (slug) => {
+    // #given — a registry db stub that must never be reached for the insert
+    const statements: string[] = [];
+    const db = {
+      prepare: (query: string) => {
+        statements.push(query);
+        return {
+          bind: () => db.prepare(query),
+          run: async () => ({}),
+        };
+      },
+    };
 
-      // #when / #then — a tenant named like shared infrastructure could
-      // satisfy host-tenant === token-tenant on a shared host
-      await expect(
-        provisionTenant(db, { tenantId: slug, kind: 'commercial' }),
-      ).rejects.toThrow(/reserved/);
-      expect(statements.filter((s) => s.startsWith('INSERT'))).toEqual([]);
-    },
-  );
+    // #when / #then — a tenant named like shared infrastructure could
+    // satisfy host-tenant === token-tenant on a shared host
+    await expect(
+      provisionTenant(db, { tenantId: slug, kind: 'commercial' }),
+    ).rejects.toThrow(/reserved/);
+    expect(statements.filter((s) => s.startsWith('INSERT'))).toEqual([]);
+  });
 });

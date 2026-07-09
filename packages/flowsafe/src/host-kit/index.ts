@@ -32,7 +32,8 @@ export {
 export type { SubdomainCrossCheckOptions } from './subdomain-check.js';
 export {
   provisionTenant,
-  RESERVED_TENANT_SLUGS,
+  RESERVED_FOR_ALLOCATION,
+  RESERVED_TENANT_IDS,
   TenantCollisionError,
 } from './tenant-registry.js';
 export type {
