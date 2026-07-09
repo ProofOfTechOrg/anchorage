@@ -274,6 +274,44 @@ describe('product-launch: two approval gates re-queued through host-kit', () => 
     expect(final.status).toBe('success');
     expect(final.result).toMatchObject({ healthy: true, outcome: 'simulated' });
   });
+
+  it('a rejected deploy declines without a second gate, approval, or promote', async () => {
+    // #given — the run suspends at gate 1 (deploy approval)
+    const harness = buildHarness();
+    const started = await harness.runtime.start('product-launch', {
+      inputData: { productName: 'anchorage', version: '1.0.0' },
+    });
+    expect(started.suspended).toEqual([['approveLaunch']]);
+
+    // #when — the reviewer REJECTS gate 1
+    const decided = await decideCurrent(
+      harness,
+      'product-launch',
+      started,
+      REVIEWER,
+      'reject',
+    );
+    const summary = decided.resume.summary as RunSummary;
+
+    // #then — the run completes as declined immediately: confirmRollout did not
+    // suspend (status is success, not suspended — this alone fails pre-fix), no
+    // second approval was queued, and the promote (phase:'promote') never ran.
+    expect(summary.status).toBe('success');
+    expect(summary.result).toMatchObject({
+      healthy: false,
+      outcome: 'declined',
+    });
+    expect(await harness.store.list({ status: 'pending' })).toHaveLength(0);
+    // the only deploy-connector activity is the dry-run pre-flight — no real
+    // (grant-gated) deploy and no promote executed
+    expect(
+      harness.audit
+        .events()
+        .some(
+          (e) => e.resource === DEPLOY_CONNECTOR && e.detail?.dryRun !== true,
+        ),
+    ).toBe(false);
+  });
 });
 
 describe('access-request: gated grant with cross-workflow isolation', () => {

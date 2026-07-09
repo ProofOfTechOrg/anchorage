@@ -265,6 +265,22 @@ export const productLaunchModule: WorkflowModule<ShowcaseModuleDeps> = {
       }),
       resumeSchema: showcaseResumeSchema,
       execute: async ({ inputData, resumeData, suspend }) => {
+        // The deploy gate was rejected: executeLaunch returned deployed:false
+        // with no side effect, so there is nothing to promote. Skip this gate
+        // AND its approval — suspending here would let the host bridge queue a
+        // second approval whose approval would promote a run whose deploy never
+        // happened. Decline straight through: completeLaunch returns
+        // outcome:'declined' and never promotes. (Guarding on `deployed` rather
+        // than the gate-1 decision also fail-safes any future path where a
+        // deploy reports failure without throwing.)
+        if (!inputData.deployed) {
+          return {
+            productName: inputData.productName,
+            version: inputData.version,
+            url: inputData.url,
+            confirmed: false,
+          };
+        }
         if (!resumeData) {
           return suspend({
             reason: 'confirm rollout before promoting to GA',
