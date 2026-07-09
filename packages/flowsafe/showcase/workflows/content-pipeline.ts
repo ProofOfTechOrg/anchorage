@@ -10,7 +10,7 @@ import {
 } from '@proofoftech/breakwater';
 import { z } from 'zod';
 
-import type { WorkflowModule } from '../../src/host-kit/index.js';
+import type { WorkflowModule } from '../../src/host-kit/module.js';
 import {
   callConnector,
   type ShowcaseModuleDeps,

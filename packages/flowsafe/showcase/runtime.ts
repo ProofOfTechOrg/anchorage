@@ -16,7 +16,8 @@ import {
   R2ArtifactStore,
 } from '../src/artifacts/index.js';
 import { init, type RunnerRuntime } from '../src/do-runner/index.js';
-import type { WorkflowModule } from '../src/host-kit/index.js';
+import { assertWorkflowsRegistered } from '../src/host-kit/index.js';
+import type { WorkflowModule } from '../src/host-kit/module.js';
 import { accessRequestModule } from './workflows/access-request.js';
 import { contentPipelineModule } from './workflows/content-pipeline.js';
 import { gtmOutboundModule } from './workflows/gtm-outbound.js';
@@ -86,16 +87,11 @@ export function buildShowcaseRuntime(deps: ShowcaseDeps): RunnerRuntime {
 
   // Fail fast if a module committed its workflow under an id different from its
   // meta.id: the launcher + per-workflow RBAC look runs up by meta.id, but the
-  // runtime routes start/resume by the committed createWorkflow id. Assert they
-  // agree here so a mismatch is a registration error, not a deep UnknownWorkflowError.
-  const registered = new Set(runtime.workflowIds());
-  for (const workflowModule of SHOWCASE_MODULES) {
-    if (!registered.has(workflowModule.meta.id)) {
-      throw new Error(
-        `showcase module '${workflowModule.meta.id}' did not register a workflow with that id`,
-      );
-    }
-  }
+  // runtime routes start/resume by the committed createWorkflow id.
+  assertWorkflowsRegistered(
+    runtime,
+    SHOWCASE_MODULES.map((entry) => entry.meta),
+  );
 
   return runtime;
 }

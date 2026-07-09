@@ -60,15 +60,16 @@
     "APPROVAL_SLA_SECONDS": "14400",
     "RUN_RETENTION_DAYS": "30",
     "OUTREACH_FROM_ADDRESS": "gtm@example.com",
-    "OUTREACH_FROM_NAME": "Anchorage Showcase",
-    // DEMO tokens: a fixed bearer -> actor map so RBAC and separation-of-duties
-    // are clickable in the UI (the ActorSwitcher offers these exact tokens).
-    // These are NOT secrets — for a real deployment set
-    // `wrangler secret put APPROVAL_ACTOR_TOKENS` (read the same way) and remove
-    // this. Roles: admin | builder | operator | reviewer | viewer.
-    "APPROVAL_ACTOR_TOKENS": "{\"demo-admin\":{\"id\":\"admin\",\"role\":\"admin\"},\"demo-builder\":{\"id\":\"builder\",\"role\":\"builder\"},\"demo-operator\":{\"id\":\"operator\",\"role\":\"operator\"},\"demo-reviewer\":{\"id\":\"reviewer\",\"role\":\"reviewer\"},\"demo-viewer\":{\"id\":\"viewer\",\"role\":\"viewer\"}}"
+    "OUTREACH_FROM_NAME": "Anchorage Showcase"
     // "SIEM_ENDPOINT": "https://siem.example/services/collector"
   }
   // Secrets (set with `wrangler secret put <name>`):
+  //   APPROVAL_ACTOR_TOKENS — REQUIRED. The bearer -> actor map every
+  //     authenticated route resolves identity against. It is deliberately NOT a
+  //     var here: no credentials are baked into a deployable config, so a deploy
+  //     without this secret 401s everywhere (fail closed). Local dev reads it
+  //     from `showcase/.dev.vars` (`cp showcase/.dev.vars.example` first).
+  //     Never seed the repo's demo tokens as the real secret — they are
+  //     world-known, and one of them is `admin`.
   //   SIEM_AUTH_HEADER — sent as the `authorization` header on audit export.
 }

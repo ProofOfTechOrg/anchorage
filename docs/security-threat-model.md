@@ -72,9 +72,13 @@ Agentic workflows can read sensitive data, produce persuasive content, and write
    under a shared clock); only that fallback carries the same-clock
    constraint, so deployments splitting the approval service and the runner
    across machines must either capture `suspendedAt` at create time (the
-   demo bridge does) or keep the clocks in sync. Step-less approvals are
-   explicitly run-scoped standing grants -- the deliberate opt-out; bridges
-   should always set `stepPath`. Mastra merges resume-provided context OVER
+   demo bridge does) or keep the clocks in sync. Run-scope is EXPLICIT: a
+   step-less approval is a standing grant on every leg only when it carries
+   `runScoped: true`, and mints nothing otherwise -- bridges always set
+   `stepPath` and never `runScoped`. (Treating an absent `stepPath` as
+   run-wide privilege was an inverted default: any record whose step was
+   merely omitted became a standing capability.) Mastra merges resume-provided
+   context OVER
    the persisted snapshot (pinned by test), so the provider returns the
    grant key on EVERY leg -- an empty list when nothing applies -- and the
    overwrite retires the previous leg's grants. Net invariant (proven in
@@ -84,8 +88,27 @@ Agentic workflows can read sensitive data, produce persuasive content, and write
    at the connector gate. The `connectors`
    list on an approval request is asserted by the CAN_CREATE caller
    (operator/builder/admin) -- creation is part of the trusted computing
-   base; prefer creating requests from a trusted suspend-observation bridge
+   base; requests must be created from a trusted suspend-observation bridge
    (as the demo Worker does) rather than hand-built payloads.
+
+   **The create route can never author capability.** An approval record's
+   `connectors` list IS the grant a decision mints, and its `requestedBy` is
+   the field the separation-of-duties check compares against -- so both are
+   TCB-only. `createApprovalRouter`'s `POST <basePath>` is therefore
+   **off by default** (`allowCreate`), and when a host deliberately mounts it as
+   a "file a request" affordance it 400s on any body naming a
+   `TCB_ONLY_CREATE_FIELDS` member -- `connectors`, `runScoped`, `stepPath`,
+   `suspendedAt`, `resumedAt`, `resumeCount`, `requestedBy` -- and forces
+   `requestedBy` to the authenticated actor. `stepPath` and the binding pair are
+   on that list because they select WHICH leg a grant mints on: a step-keyed
+   body with no `suspendedAt` would otherwise ride the legacy
+   `decidedAt`-after fallback and mint. Without these controls one principal
+   holding both `CAN_CREATE` and `CAN_REVIEW` (i.e. `admin`) could file a
+   request naming an arbitrary connector, spoof `requestedBy` so the
+   self-decision check compared the wrong identity, approve it alone, and --
+   because the step-less record was implicitly run-scoped -- mint that
+   capability on every leg of an arbitrary run. Regression-pinned in
+   `approval-api/end-to-end.test.ts`.
 
 ## Threats and Controls
 

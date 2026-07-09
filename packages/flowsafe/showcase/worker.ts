@@ -4,9 +4,11 @@
 // five (gtm-outbound, content-pipeline, lead-generation, product-launch,
 // access-request) running on a real Cloudflare Worker + Durable Object + D1,
 // behind the approval queue, bearer auth, and cron maintenance. This file is
-// host wiring only — it mirrors `deploy/worker.ts` (bearer auth seam, multi-gate
-// approval bridging, cron SLA sweep + retention purge, optional Queues audit
-// export) and delegates every workflow to buildShowcaseRuntime().
+// host wiring only: it delegates every workflow to buildShowcaseRuntime(), and
+// auth + the run routes + the approval bridge to src/host-kit (shared with
+// `deploy/worker.ts`). What stays here is this host's topology — the DO-stub
+// start/status/resume thunks — plus cron maintenance and the Queues audit
+// export.
 //
 // Side effects are binding-gated in each connector (see showcase/workflows/):
 // with no binding a connector simulates its side effect (envelope/preview
@@ -14,7 +16,8 @@
 // CRM/deploy egress, wired in defineWorkflows) to go live; a forged resume fails
 // closed regardless.
 //
-// Routes:
+// Routes (the /workflows + /runs surface is host-kit's createRunRouter; the
+// /api/approvals surface is approval-api's createApprovalRouter):
 //   GET  /workflows                       -> module catalog (id/title/sampleInput/
 //                                            allowedRoles) for the launcher
 //   POST /runs { workflowId, inputData }  -> start; a suspension auto-queues
@@ -25,12 +28,18 @@
 //   POST /runs/:workflowId/:runId/resume  -> raw resume (no grants; the gated
 //                                            step fails closed — approve via
 //                                            the queue instead)
-//   *    /api/approvals[...]              -> approval queue REST surface
+//   *    /api/approvals[...]              -> approval queue REST surface. The
+//                                            create route stays OFF (allowCreate
+//                                            defaults false): approval records
+//                                            are minted in-process from an
+//                                            observed suspension, never from a
+//                                            request body.
 //   GET  /healthz                         -> liveness (unauthenticated)
 //
 // All routes except /healthz require `Authorization: Bearer <token>` mapped to
-// an actor via APPROVAL_ACTOR_TOKENS (baked as a wrangler var for the demo; use
-// a secret for real deployments).
+// an actor via the APPROVAL_ACTOR_TOKENS secret. There is no baked-in token
+// map: a deploy without `wrangler secret put APPROVAL_ACTOR_TOKENS` 401s
+// everywhere (fail closed by construction). Local dev reads showcase/.dev.vars.
 
 import type {
   D1Database,
@@ -45,14 +54,11 @@ import type {
 import { AuditLogger } from '@proofoftech/breakwater';
 
 import {
-  APPROVAL_ROLES,
   type ApprovalActor,
-  type ApprovalRecord,
   ApprovalService,
   createApprovalRouter,
   D1ApprovalStore,
   defaultResumeData,
-  RUN_START_ROLES,
 } from '../src/approval-api/index.js';
 import {
   createAuditQueueConsumer,
@@ -65,7 +71,10 @@ import {
   type RunSummary,
 } from '../src/do-runner/index.js';
 import {
-  queueApprovalForSuspension,
+  bearerActorAuthenticator,
+  createRunRouter,
+  doSummary,
+  parseActorTokens,
   resumeRunWithRequeue,
 } from '../src/host-kit/index.js';
 import {
@@ -89,9 +98,9 @@ interface Env {
   /**
    * Secret (`wrangler secret put APPROVAL_ACTOR_TOKENS`): JSON map of bearer
    * token -> actor, e.g. {"<random-token>": {"id": "ray", "role":
-   * "reviewer"}}. Swap authenticateActor() for your SSO/JWT verification to
-   * replace it — actor mapping stays inside the trusted computing base either
-   * way.
+   * "reviewer"}}. Absent => an empty map => every authenticated route 401s.
+   * Swap bearerActorAuthenticator for your SSO/JWT verification to replace it —
+   * actor mapping stays inside the trusted computing base either way.
    */
   APPROVAL_ACTOR_TOKENS?: string;
   /** Default SLA seconds for new approvals (var; default 14400 = 4h). */
@@ -169,54 +178,54 @@ function numberVar(
   return value;
 }
 
-function parseActorTokens(raw: string | undefined): Map<string, ApprovalActor> {
-  const actors = new Map<string, ApprovalActor>();
-  if (!raw) return actors;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    console.error(
-      JSON.stringify({
-        type: 'config-error',
-        var: 'APPROVAL_ACTOR_TOKENS',
-        reason: 'not valid JSON — all authenticated routes will 401',
-      }),
-    );
-    return actors;
-  }
-  if (parsed === null || typeof parsed !== 'object') return actors;
-  for (const [token, actor] of Object.entries(parsed)) {
-    const candidate = actor as { id?: unknown; role?: unknown };
-    if (
-      typeof candidate?.id === 'string' &&
-      candidate.id.length > 0 &&
-      typeof candidate.role === 'string' &&
-      (APPROVAL_ROLES as readonly string[]).includes(candidate.role)
-    ) {
-      actors.set(token, candidate as ApprovalActor);
-    }
-  }
-  return actors;
-}
+// The auth seam (parseActorTokens + bearerActorAuthenticator), the run routes
+// with their RBAC gate order, and the DO-response reader (doSummary) live in
+// src/host-kit, shared with the reference deploy template and the dev backend
+// so the security-sensitive pieces — the (suspendedAt, resumeCount) capture,
+// the self-decision guard, and the coarse start-role check — have a single
+// tested home. This host supplies only its topology: every run leg travels
+// through the run's DO stub.
 
-// The auth seam. Bearer tokens from a Worker secret are the minimal real
-// deployment; production SSO/JWT verification replaces only this function.
-function authenticateActor(
-  request: Request,
+function runRouterFor(
   env: Env,
-): ApprovalActor | undefined {
-  const token = request.headers
-    .get('authorization')
-    ?.match(/^Bearer\s+(.+)$/i)?.[1];
-  if (!token) return undefined;
-  return parseActorTokens(env.APPROVAL_ACTOR_TOKENS).get(token);
+  approvalService: ApprovalService,
+  authenticate: (request: Request) => ApprovalActor | undefined,
+) {
+  return createRunRouter({
+    workflows: SHOWCASE_MODULES.map((entry) => entry.meta),
+    service: approvalService,
+    systemActor: SYSTEM_ACTOR,
+    authenticate,
+    start: async (workflowId, runId, inputData) =>
+      doSummary(
+        await runStub(env, workflowId, runId).fetch('http://do/runs', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ workflowId, runId, inputData }),
+        }),
+      ),
+    // The DO answers 404 for a run it has never seen; the router turns the
+    // undefined into its own 404 rather than leaking the DO's body.
+    status: async (workflowId, runId) => {
+      const response = await runStub(env, workflowId, runId).fetch(
+        `http://do/runs/${workflowId}/${runId}`,
+      );
+      if (response.status === 404) return undefined;
+      return doSummary(response);
+    },
+    resume: async (workflowId, runId, body) =>
+      doSummary(
+        await runStub(env, workflowId, runId).fetch(
+          `http://do/runs/${workflowId}/${runId}/resume`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+          },
+        ),
+      ),
+  });
 }
-
-// requestedConnectors + queueApprovalForSuspension + the SoD re-queue live in
-// src/host-kit (imported above), shared verbatim with the dev backend so the
-// security-sensitive (suspendedAt, resumeCount) capture and self-decision guard
-// have a single home. This host supplies only its topology: the DO-stub resume.
 
 // Worker-level approval service sharing the DO's D1 database. Decisions resume
 // the run through its DO stub (grants come from the store via the DO-side
@@ -267,27 +276,20 @@ function buildApprovalService(
     // re-queue so a run that re-suspends at a later gate keeps flowing through
     // the queue — the same wrapper the dev backend uses over its in-process base.
     resumeRun: resumeRunWithRequeue(
-      async (record, decision) => {
-        const response = await runStub(
-          env,
-          record.workflowId,
-          record.runId,
-        ).fetch(`http://do/runs/${record.workflowId}/${record.runId}/resume`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            step: record.stepPath,
-            resumeData: defaultResumeData(record, decision),
-          }),
-        });
-        const summary = (await response.json()) as RunSummary;
-        if (!response.ok) {
-          throw new Error(
-            `resume failed (${response.status}): ${JSON.stringify(summary)}`,
-          );
-        }
-        return summary;
-      },
+      async (record, decision) =>
+        doSummary(
+          await runStub(env, record.workflowId, record.runId).fetch(
+            `http://do/runs/${record.workflowId}/${record.runId}/resume`,
+            {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                step: record.stepPath,
+                resumeData: defaultResumeData(record, decision),
+              }),
+            },
+          ),
+        ),
       () => service,
       SYSTEM_ACTOR,
     ),
@@ -342,60 +344,6 @@ async function runMaintenance(env: Env, cron: string): Promise<void> {
   console.log(JSON.stringify({ type: 'maintenance', cron, escalated, purged }));
 }
 
-// POST /runs — start a run through its DO; a suspension auto-queues its
-// approval, attributed to the starting actor so they cannot later decide their
-// own run.
-async function startRun(
-  env: Env,
-  request: CfRequest,
-  approvalService: ApprovalService,
-  actor: ApprovalActor,
-): Promise<Response> {
-  const body = await request
-    .json<{ workflowId?: string; runId?: string; inputData?: unknown }>()
-    .catch(() => null);
-  if (!body || typeof body.workflowId !== 'string') {
-    return json({ error: 'workflowId is required' }, 400);
-  }
-  // Per-workflow RBAC: a module may restrict who can START it
-  // (meta.allowedRoles) — a finer gate than the coarse "can start any run"
-  // check the fetch handler already applied.
-  const workflowModule = SHOWCASE_MODULES.find(
-    (candidate) => candidate.meta.id === body.workflowId,
-  );
-  if (!workflowModule) {
-    return json({ error: `unknown workflow '${body.workflowId}'` }, 404);
-  }
-  const { allowedRoles } = workflowModule.meta;
-  if (allowedRoles && !allowedRoles.includes(actor.role)) {
-    return json(
-      { error: `role '${actor.role}' may not start '${body.workflowId}'` },
-      403,
-    );
-  }
-  // Worker owns runId generation so the DO instance key exists up front.
-  const runId = body.runId ?? crypto.randomUUID();
-  const response = await runStub(env, body.workflowId, runId).fetch(
-    'http://do/runs',
-    {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ ...body, runId }),
-    },
-  );
-  if (!response.ok) return response as unknown as Response;
-  const summary = (await response.json()) as RunSummary;
-  if (summary.status !== 'suspended') return json(summary);
-  const record = await queueApprovalForSuspension(
-    approvalService,
-    body.workflowId,
-    summary,
-    actor.id,
-    SYSTEM_ACTOR,
-  );
-  return json({ ...summary, approval: record });
-}
-
 const handler: ExportedHandler<Env> = {
   async fetch(
     request: CfRequest,
@@ -403,7 +351,6 @@ const handler: ExportedHandler<Env> = {
     ctx: ExecutionContext,
   ): Promise<Response> {
     const url = new URL(request.url);
-    const segments = url.pathname.split('/').filter(Boolean);
 
     if (request.method === 'GET' && url.pathname === '/healthz') {
       return json({ ok: true });
@@ -411,55 +358,26 @@ const handler: ExportedHandler<Env> = {
 
     const waitUntil = (promise: Promise<unknown>) => ctx.waitUntil(promise);
     const approvalService = buildApprovalService(env, waitUntil);
-    const approvalRouter = createApprovalRouter({
-      service: approvalService,
-      authenticate: (routed) => authenticateActor(routed, env),
-    });
-    const approvalResponse = await approvalRouter(
-      request as unknown as Request,
+    // Parsed once per request rather than once per authenticate() call — this
+    // handler authenticates in both routers.
+    const authenticate = bearerActorAuthenticator(
+      parseActorTokens(env.APPROVAL_ACTOR_TOKENS),
     );
+
+    const routed = request as unknown as Request;
+    const approvalResponse = await createApprovalRouter({
+      service: approvalService,
+      authenticate,
+    })(routed);
     if (approvalResponse) return approvalResponse;
 
-    // GET /workflows — the launcher catalog: each module's public meta (id,
-    // title, description, sampleInput, allowedRoles). Any authenticated actor
-    // may read it.
-    if (request.method === 'GET' && url.pathname === '/workflows') {
-      if (!authenticateActor(request as unknown as Request, env)) {
-        return json({ error: 'authentication required' }, 401);
-      }
-      return json({
-        workflows: SHOWCASE_MODULES.map((candidate) => candidate.meta),
-      });
-    }
+    const runResponse = await runRouterFor(
+      env,
+      approvalService,
+      authenticate,
+    )(routed);
+    if (runResponse) return runResponse;
 
-    if (segments[0] !== 'runs') return json({ error: 'not found' }, 404);
-
-    // The run surface shares the approval bearer map: any authenticated actor
-    // may inspect runs; starting or raw-resuming one is operator work.
-    const actor = authenticateActor(request as unknown as Request, env);
-    if (!actor) return json({ error: 'authentication required' }, 401);
-    if (request.method === 'POST' && !RUN_START_ROLES.includes(actor.role)) {
-      return json({ error: 'forbidden' }, 403);
-    }
-
-    if (request.method === 'POST' && segments.length === 1) {
-      return startRun(env, request, approvalService, actor);
-    }
-
-    // GET status and POST /resume forward straight to the run's DO. The raw
-    // resume route carries NO grants: a forged `resumeData.approved` can flip a
-    // workflow boolean but grants no connector capability — the send step
-    // re-checks the server-derived grant and fails closed. Approve through the
-    // queue (which mints grants), not this route.
-    const [, workflowId, runId] = segments;
-    if (workflowId && runId) {
-      return runStub(env, workflowId, runId).fetch(
-        new Request(
-          `http://do${url.pathname}`,
-          request as unknown as Request,
-        ) as unknown as CfRequest,
-      ) as unknown as Response;
-    }
     return json({ error: 'not found' }, 404);
   },
 

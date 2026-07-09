@@ -4,31 +4,22 @@
 // satisfied by a single builder that calls every module's register() before the
 // first start. Generic over Deps so this kit stays workflow-agnostic: a host
 // (the showcase) supplies its own shared-infrastructure bag.
+//
+// Ships under its OWN subpath — `@proofoftech/flowsafe/host-kit/module` — not
+// through host-kit's barrel. `WorkflowModuleContext.audit` is breakwater's
+// AuditLogger, a class with private fields (so it cannot be mirrored
+// structurally), and breakwater is a devDependency of this package. Re-exporting
+// this from `./host-kit` would force every consumer of `createRunRouter` to
+// resolve a breakwater type they do not need. Module authors already depend on
+// breakwater — their connectors do — so the split costs them one import and
+// keeps the route-mounting surface dependency-free.
 
 import type { AuditLogger } from '@proofoftech/breakwater';
 
-import type { ApprovalRole } from '../approval-api/index.js';
 import type { InitResult } from '../do-runner/index.js';
+import type { WorkflowMeta } from './workflow-meta.js';
 
-/** Static metadata every workflow module advertises to a launcher/host. */
-export interface WorkflowMeta {
-  /** Workflow id — MUST equal the registered createWorkflow id (PATH_SAFE_ID_PATTERN). */
-  id: string;
-  title: string;
-  description: string;
-  /** A ready-to-run inputData example a launcher can prefill. */
-  sampleInput: unknown;
-  /**
-   * Roles permitted to START this workflow at the HTTP route. Omitted => the
-   * host's coarse start-role check applies. This is a route-level gate only;
-   * in-step RBAC (if any) is enforced separately inside the workflow.
-   *
-   * Must be a SUBSET of the host's coarse start-role set (RUN_START_ROLES in
-   * approval-api/contract.ts): the coarse gate runs first, so any role listed
-   * here that cannot start a run at all is silently dead.
-   */
-  allowedRoles?: readonly ApprovalRole[];
-}
+export type { WorkflowMeta };
 
 /**
  * What a module's register() receives: the init()-derived builder factories
@@ -47,6 +38,16 @@ export interface WorkflowModuleContext<Deps = unknown> {
 /** A workflow packaged for host-agnostic registration. */
 export interface WorkflowModule<Deps = unknown> {
   meta: WorkflowMeta;
-  /** Build the steps + connectors and .commit() the workflow onto the runtime. */
+  /**
+   * Build the steps + connectors and .commit() the workflow onto the runtime.
+   *
+   * INVARIANT the type system cannot enforce: a gate step's suspend payload
+   * `connectors` MUST be a server-authored static literal (a module-level
+   * `const`, not a value derived from the run's inputData). The approval bridge
+   * copies it verbatim into the approval record, and an APPROVED record's
+   * connectors ARE the minted grant — so deriving the list from run input would
+   * let client input choose its own capability, re-opening the hole that
+   * TCB_ONLY_CREATE_FIELDS closes at the HTTP boundary.
+   */
   register(ctx: WorkflowModuleContext<Deps>): void;
 }

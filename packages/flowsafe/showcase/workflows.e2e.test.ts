@@ -19,10 +19,11 @@ import {
 import { InMemoryArtifactBucket } from '../src/artifacts/index.js';
 import type { RunSummary } from '../src/do-runner/index.js';
 import {
+  createRunRouter,
   queueApprovalForSuspension,
   resumeRunWithRequeue,
 } from '../src/host-kit/index.js';
-import { buildShowcaseRuntime } from './runtime.js';
+import { buildShowcaseRuntime, SHOWCASE_MODULES } from './runtime.js';
 import { ACCESS_CONNECTOR } from './workflows/access-request.js';
 import { PUBLISH_CONNECTOR } from './workflows/content-pipeline.js';
 import { CRM_ASSIGN_CONNECTOR } from './workflows/lead-generation.js';
@@ -371,5 +372,112 @@ describe('access-request: gated grant with cross-workflow isolation', () => {
         decision: 'denied',
       }),
     );
+  });
+});
+
+// createRunRouter's gates are unit-tested against fixture metas in
+// src/host-kit/run-router.test.ts. These drive it over the REAL showcase metas
+// and the real runtime, so a module whose allowedRoles regresses (or whose id
+// drifts from its committed workflow) fails here.
+describe('showcase run routes', () => {
+  function routerFor(
+    harness: ReturnType<typeof buildHarness>,
+    actor: ApprovalActor,
+  ) {
+    return createRunRouter({
+      workflows: SHOWCASE_MODULES.map((entry) => entry.meta),
+      service: harness.service,
+      systemActor: SYSTEM,
+      authenticate: () => actor,
+      start: (workflowId, runId, inputData) =>
+        harness.runtime.start(workflowId, { runId, inputData }),
+      status: async (workflowId, runId) =>
+        (await harness.runtime.status(workflowId, runId)) ?? undefined,
+      resume: (workflowId, runId, body) => {
+        const { step, resumeData } = (body ?? {}) as {
+          step?: string | string[];
+          resumeData?: unknown;
+        };
+        return harness.runtime.resume(workflowId, runId, { step, resumeData });
+      },
+    });
+  }
+
+  function startRequest(workflowId: string, inputData: unknown): Request {
+    return new Request('http://showcase.test/runs', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workflowId, inputData }),
+    });
+  }
+
+  const ACCESS_INPUT = {
+    resource: 'prod-database',
+    role: 'reader',
+    justification: 'oncall',
+    targetScope: 'access-request',
+  };
+
+  it('serves all five workflow metas at GET /workflows', async () => {
+    // #given
+    const harness = buildHarness();
+    const handle = routerFor(harness, { id: 'vic', role: 'viewer' });
+
+    // #when
+    const response = await handle(
+      new Request('http://showcase.test/workflows'),
+    );
+
+    // #then
+    expect(response?.status).toBe(200);
+    const { workflows } = (await response?.json()) as {
+      workflows: Array<{ id: string }>;
+    };
+    expect(workflows.map((meta) => meta.id)).toEqual([
+      'gtm-outbound',
+      'content-pipeline',
+      'lead-generation',
+      'product-launch',
+      'access-request',
+    ]);
+  });
+
+  it('403s an operator starting access-request, whose meta allows admin/builder only', async () => {
+    // #given — the operator clears the coarse start gate; the module's own
+    // allowedRoles is the finer one
+    const harness = buildHarness();
+    const handle = routerFor(harness, { id: 'opal', role: 'operator' });
+
+    // #when
+    const response = await handle(startRequest('access-request', ACCESS_INPUT));
+
+    // #then
+    expect(response?.status).toBe(403);
+    expect(await harness.store.list()).toEqual([]);
+  });
+
+  it('lets a builder start access-request, queuing an approval attributed to them', async () => {
+    // #given
+    const harness = buildHarness();
+    const handle = routerFor(harness, { id: 'bo', role: 'builder' });
+
+    // #when
+    const response = await handle(startRequest('access-request', ACCESS_INPUT));
+
+    // #then — the suspension became an approval the STARTER cannot decide
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({
+      status: 'suspended',
+      approval: { requestedBy: 'bo', connectors: [ACCESS_CONNECTOR] },
+    });
+  });
+
+  it('403s a reviewer starting any workflow (coarse gate)', async () => {
+    // #given
+    const harness = buildHarness();
+    const handle = routerFor(harness, REVIEWER);
+
+    // #when / #then
+    expect((await handle(startRequest('gtm-outbound', {})))?.status).toBe(403);
   });
 });

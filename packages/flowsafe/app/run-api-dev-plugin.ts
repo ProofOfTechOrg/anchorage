@@ -2,11 +2,13 @@
 // buildShowcaseRuntime (all five workflows) + ONE ApprovalService over the same
 // InMemoryApprovalStore, wired with the host-kit re-queue bridge so decisions
 // actually resume the run (and multi-gate runs re-queue the next gate). It mounts
-// three surfaces on the dev server — /api/approvals (the dashboard), /runs +
-// /workflows (the launcher + status panel) — all bearer→actor authenticated with
-// the same demo tokens the deployed worker and the UI use. So `app:dev` is a real
-// working backend: launch a workflow, approve it in the dashboard, watch it run
-// to success. No seeds — the queue fills as you launch.
+// the same two routers the deployed worker does — createApprovalRouter at
+// /api/approvals and host-kit's createRunRouter at /workflows + /runs — over the
+// same bearer→actor auth seam and the same demo tokens the UI offers. Only the
+// topology differs: runs resume in-process instead of through a DO stub. So
+// `app:dev` is a real working backend with the real RBAC gates: launch a
+// workflow, approve it in the dashboard, watch it run to success. No seeds — the
+// queue fills as you launch.
 //
 // Runs in the Node dev-server context (Vite transpiles with esbuild), outside the
 // browser tsconfig's `src` root.
@@ -20,13 +22,14 @@ import {
   createApprovalRouter,
   InMemoryApprovalStore,
   resumeViaRuntime,
-  RUN_START_ROLES,
 } from '../src/approval-api/index.js';
-import type { RunnerRuntime } from '../src/do-runner/index.js';
 import {
-  queueApprovalForSuspension,
+  bearerActorAuthenticator,
+  createRunRouter,
+  parseActorTokens,
   resumeRunWithRequeue,
 } from '../src/host-kit/index.js';
+import { demoActorTokensJson } from '../showcase/demo-actors.js';
 import { buildShowcaseRuntime, SHOWCASE_MODULES } from '../showcase/runtime.js';
 
 const APPROVAL_BASE = '/api/approvals';
@@ -34,100 +37,12 @@ const APPROVAL_BASE = '/api/approvals';
 /** Identity for system-created approval records (needs a create-capable role). */
 const SYSTEM_ACTOR: ApprovalActor = { id: 'showcase-dev', role: 'operator' };
 
-// The demo bearer tokens — must match showcase/wrangler.jsonc APPROVAL_ACTOR_TOKENS
-// and the UI's DEMO_ACTORS.
-const ACTOR_TOKENS: Record<string, ApprovalActor> = {
-  'demo-admin': { id: 'admin', role: 'admin' },
-  'demo-builder': { id: 'builder', role: 'builder' },
-  'demo-operator': { id: 'operator', role: 'operator' },
-  'demo-reviewer': { id: 'reviewer', role: 'reviewer' },
-  'demo-viewer': { id: 'viewer', role: 'viewer' },
-};
-
-function authenticate(request: Request): ApprovalActor | undefined {
-  const token = request.headers
-    .get('authorization')
-    ?.match(/^Bearer\s+(.+)$/i)?.[1];
-  return token ? ACTOR_TOKENS[token] : undefined;
-}
-
-function json(payload: unknown, status = 200): Response {
-  return new Response(JSON.stringify(payload), {
-    status,
-    headers: { 'content-type': 'application/json' },
-  });
-}
-
-// The run surface (/workflows + /runs), mirroring the deployed worker's routing
-// but resuming in-process instead of via a DO stub. Returns null for paths it
-// does not own so the caller can fall through.
-async function handleRunRoutes(
-  request: Request,
-  runtime: RunnerRuntime,
-  service: ApprovalService,
-): Promise<Response | null> {
-  const url = new URL(request.url);
-  const actor = authenticate(request);
-
-  if (request.method === 'GET' && url.pathname === '/workflows') {
-    if (!actor) return json({ error: 'authentication required' }, 401);
-    return json({ workflows: SHOWCASE_MODULES.map((module) => module.meta) });
-  }
-
-  const segments = url.pathname.split('/').filter(Boolean);
-  if (segments[0] !== 'runs') return null;
-
-  if (!actor) return json({ error: 'authentication required' }, 401);
-  if (request.method === 'POST' && !RUN_START_ROLES.includes(actor.role)) {
-    return json({ error: 'forbidden' }, 403);
-  }
-
-  if (request.method === 'POST' && segments.length === 1) {
-    const body = (await request.json().catch(() => null)) as {
-      workflowId?: string;
-      inputData?: unknown;
-    } | null;
-    if (!body || typeof body.workflowId !== 'string') {
-      return json({ error: 'workflowId is required' }, 400);
-    }
-    const workflowModule = SHOWCASE_MODULES.find(
-      (candidate) => candidate.meta.id === body.workflowId,
-    );
-    if (!workflowModule) {
-      return json({ error: `unknown workflow '${body.workflowId}'` }, 404);
-    }
-    const { allowedRoles } = workflowModule.meta;
-    if (allowedRoles && !allowedRoles.includes(actor.role)) {
-      return json(
-        { error: `role '${actor.role}' may not start '${body.workflowId}'` },
-        403,
-      );
-    }
-    const summary = await runtime.start(body.workflowId, {
-      inputData: body.inputData,
-    });
-    if (summary.status !== 'suspended') return json(summary);
-    const record = await queueApprovalForSuspension(
-      service,
-      body.workflowId,
-      summary,
-      actor.id,
-      SYSTEM_ACTOR,
-    );
-    return json({ ...summary, approval: record });
-  }
-
-  if (request.method === 'GET' && segments.length === 3) {
-    const workflowId = segments[1];
-    const runId = segments[2];
-    if (!workflowId || !runId) return json({ error: 'not found' }, 404);
-    const summary = await runtime.status(workflowId, runId);
-    if (!summary) return json({ error: 'not found' }, 404);
-    return json(summary);
-  }
-
-  return json({ error: 'not found' }, 404);
-}
+// Same auth seam as the deployed worker, over the same demo tokens the UI's
+// ActorSwitcher offers — routed through parseActorTokens so dev exercises the
+// production parse path rather than a hand-rolled map.
+const authenticate = bearerActorAuthenticator(
+  parseActorTokens(demoActorTokensJson()),
+);
 
 async function nodeToWebRequest(
   req: Connect.IncomingMessage,
@@ -178,6 +93,26 @@ export function runApiDevPlugin(): Plugin {
     authenticate,
     basePath: APPROVAL_BASE,
   });
+  // The same run surface the deployed worker mounts; only the topology differs
+  // (in-process runtime instead of a DO stub), so the RBAC gates and the
+  // suspension bridge are the shared, tested ones.
+  const runRouter = createRunRouter({
+    workflows: SHOWCASE_MODULES.map((entry) => entry.meta),
+    service,
+    systemActor: SYSTEM_ACTOR,
+    authenticate,
+    start: (workflowId, runId, inputData) =>
+      runtime.start(workflowId, { runId, inputData }),
+    status: async (workflowId, runId) =>
+      (await runtime.status(workflowId, runId)) ?? undefined,
+    resume: (workflowId, runId, body) => {
+      const { step, resumeData } = (body ?? {}) as {
+        step?: string | string[];
+        resumeData?: unknown;
+      };
+      return runtime.resume(workflowId, runId, { step, resumeData });
+    },
+  });
 
   return {
     name: 'flowsafe-showcase-dev',
@@ -203,8 +138,7 @@ export function runApiDevPlugin(): Plugin {
             // Approvals first (it returns null for non-approval paths without
             // touching the body); the run surface handles the rest.
             const response =
-              (await approvalRouter(request)) ??
-              (await handleRunRoutes(request, runtime, service));
+              (await approvalRouter(request)) ?? (await runRouter(request));
             if (!response) {
               next();
               return;

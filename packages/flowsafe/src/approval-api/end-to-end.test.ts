@@ -25,7 +25,11 @@ import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 import { init } from '../do-runner/init.js';
-import type { RunnerRuntime, RunSummary } from '../do-runner/runtime.js';
+import type {
+  RunLeg,
+  RunnerRuntime,
+  RunSummary,
+} from '../do-runner/runtime.js';
 import type { ApprovalActor, ApprovalAuditSink } from './contract.js';
 import {
   APPROVAL_ROLES,
@@ -34,12 +38,20 @@ import {
   BREAKWATER_WORKFLOW_SCOPE_KEY,
   RUN_START_ROLES,
 } from './contract.js';
-import { approvalGrantProvider, resumeViaRuntime } from './grants.js';
+import {
+  approvalGrantProvider,
+  approvedConnectorsForLeg,
+  resumeViaRuntime,
+} from './grants.js';
+import { createApprovalRouter } from './router.js';
 import { ApprovalService } from './service.js';
 import { InMemoryApprovalStore } from './store.js';
 
 const OPERATOR: ApprovalActor = { id: 'opal', role: 'operator' };
 const REVIEWER: ApprovalActor = { id: 'ray', role: 'reviewer' };
+// admin holds BOTH CAN_CREATE and CAN_REVIEW — the single principal the
+// create-route capability chain needed.
+const ADMIN: ApprovalActor = { id: 'ada', role: 'admin' };
 
 // LEGACY-fallback timing nudge: a step-keyed record created WITHOUT
 // suspendedAt mints only when decidedAt lands STRICTLY after the
@@ -368,6 +380,224 @@ function buildHarness(): Harness {
     publishes: () => publishes,
   };
 }
+
+// Regression suite for the create-route capability chain. Before the fix, one
+// admin (holding both CAN_CREATE and CAN_REVIEW) could POST a body carrying
+// `connectors` + a spoofed `requestedBy`, approve it themselves (the
+// separation-of-duties check compared the spoofed field), and — because a
+// step-less record was implicitly a run-scoped standing grant — mint an
+// arbitrary connector capability on EVERY leg of an arbitrary run, with no
+// second party. Three independent barriers now stand in that chain's way, and
+// each is asserted below.
+describe('fail closed: the HTTP create route cannot mint a run-scoped standing grant', () => {
+  const CAPABILITY_BODY = {
+    workflowId: 'launch',
+    runId: 'run-poc',
+    title: 'innocuous-looking request',
+    connectors: ['release-deploy'],
+    requestedBy: 'nobody',
+  };
+
+  function post(body: unknown): Request {
+    return new Request('http://queue.test/api/approvals', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  }
+
+  function routerOver(
+    store: InMemoryApprovalStore,
+    options: { allowCreate?: boolean; actor?: ApprovalActor } = {},
+  ) {
+    const service = new ApprovalService({ store });
+    const handle = createApprovalRouter({
+      service,
+      allowCreate: options.allowCreate,
+      authenticate: () => options.actor ?? ADMIN,
+    });
+    return { service, handle };
+  }
+
+  it('barrier 1: the route is off by default, so nothing is written', async () => {
+    // #given
+    const store = new InMemoryApprovalStore();
+    const { handle } = routerOver(store);
+
+    // #when — PoC step 1
+    const response = await handle(post(CAPABILITY_BODY));
+
+    // #then
+    expect(response?.status).toBe(404);
+    expect(await store.list()).toEqual([]);
+  });
+
+  it('barrier 1: a deliberately mounted route still rejects every capability-bearing field', async () => {
+    // #given — the host opted in to the "file a request" affordance
+    const store = new InMemoryApprovalStore();
+    const { handle } = routerOver(store, { allowCreate: true });
+
+    // #when / #then — connectors IS the grant; stepPath + the binding pair
+    // select the leg it mints on (a step-keyed record with no suspendedAt
+    // would ride the legacy decidedAt-after fallback); requestedBy is what SoD
+    // compares. Rejecting connectors alone would be insufficient.
+    for (const field of [
+      'connectors',
+      'stepPath',
+      'suspendedAt',
+      'resumedAt',
+      'resumeCount',
+      'runScoped',
+      'requestedBy',
+    ]) {
+      const response = await handle(
+        post({
+          workflowId: 'launch',
+          runId: 'run-poc',
+          title: 'x',
+          [field]: 'anything',
+        }),
+      );
+      expect(response?.status).toBe(400);
+    }
+    expect(await store.list()).toEqual([]);
+  });
+
+  it('barrier 2: forced self-attribution makes the filer unable to decide their own request', async () => {
+    // #given — the route force-sets requestedBy = the authenticated actor, so
+    // the spoof that disarmed separation of duties is gone
+    const store = new InMemoryApprovalStore();
+    const { service, handle } = routerOver(store, { allowCreate: true });
+    const created = await handle(
+      post({ workflowId: 'launch', runId: 'run-poc', title: 'inert' }),
+    );
+    expect(created?.status).toBe(201);
+    const record = (await created?.json()) as { id: string };
+
+    // #when / #then — PoC step 2: the same admin decides. SoD now fires.
+    await expect(
+      service.decide(record.id, { decision: 'approve' }, ADMIN),
+    ).rejects.toThrow(/cannot decide their own approval/);
+  });
+
+  it('barrier 3: an APPROVED step-less record with connectors mints NOTHING without runScoped', async () => {
+    // #given — the last barrier, isolated. Inject the record straight into the
+    // store (the HTTP route cannot author `connectors` at all, so driving this
+    // through the router would assert an empty union against an empty list and
+    // pass even with the runScoped gate reverted). This is the exact record
+    // shape the PoC produced: approved, step-less, capability-bearing.
+    const store = new InMemoryApprovalStore();
+    const decidedAt = new Date().toISOString();
+    await store.create({
+      id: crypto.randomUUID(),
+      workflowId: 'launch',
+      runId: 'run-poc',
+      title: 'standing grant by omission',
+      connectors: ['release-deploy'],
+      priority: 'normal',
+      status: 'approved',
+      createdAt: decidedAt,
+      updatedAt: decidedAt,
+      decidedAt,
+      // stepPath omitted, runScoped omitted — the inverted default.
+    });
+
+    // #when / #then — PoC step 3: inert on every leg shape
+    const legs: RunLeg[] = [
+      { kind: 'start' },
+      { kind: 'resume', step: ['approval'], suspendedAt: 1 },
+      { kind: 'resume' },
+    ];
+    for (const leg of legs) {
+      expect(
+        await approvedConnectorsForLeg(store, 'launch', 'run-poc', leg),
+      ).toEqual([]);
+    }
+  });
+
+  it('barrier 3, other direction: the same record WITH runScoped does mint (the gate is load-bearing)', async () => {
+    // #given — identical to the record above but with the explicit opt-in. If
+    // this did not mint, the test above would pass for the wrong reason.
+    const store = new InMemoryApprovalStore();
+    const decidedAt = new Date().toISOString();
+    await store.create({
+      id: crypto.randomUUID(),
+      workflowId: 'launch',
+      runId: 'run-ok',
+      title: 'deliberate standing grant',
+      connectors: ['release-deploy'],
+      priority: 'normal',
+      status: 'approved',
+      createdAt: decidedAt,
+      updatedAt: decidedAt,
+      decidedAt,
+      runScoped: true,
+    });
+
+    // #when / #then
+    expect(
+      await approvedConnectorsForLeg(store, 'launch', 'run-ok', {
+        kind: 'start',
+      }),
+    ).toEqual(['release-deploy']);
+  });
+
+  it('barrier 3: an APPROVED http-authored record carries no capability to mint', async () => {
+    // #given — a second party (the reviewer) approves the inert HTTP record
+    const store = new InMemoryApprovalStore();
+    const { service, handle } = routerOver(store, { allowCreate: true });
+    const created = await handle(
+      post({ workflowId: 'launch', runId: 'run-poc', title: 'inert' }),
+    );
+    const record = (await created?.json()) as { id: string };
+    const decided = await service.decide(
+      record.id,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then — approved, yet there is nothing in it for a grant to derive from
+    expect(decided.record.status).toBe('approved');
+    expect(decided.record.connectors).toEqual([]);
+    expect(decided.record.runScoped).toBeUndefined();
+    expect(decided.record.stepPath).toBeUndefined();
+  });
+
+  it('contrast: the intended in-process bridge path still mints on its own leg', async () => {
+    // #given — a step-keyed record created by TRUSTED in-process code, bound to
+    // the leg's exact suspension. The fix tightens the HTTP boundary only.
+    const store = new InMemoryApprovalStore();
+    const service = new ApprovalService({ store });
+    const suspendedAt = Date.parse('2026-07-09T00:00:00.000Z');
+    const { record } = await service.create(
+      {
+        workflowId: 'launch',
+        runId: 'run-ok',
+        stepPath: ['approval'],
+        suspendedAt,
+        title: 'Approve launch',
+        connectors: ['release-deploy'],
+        requestedBy: 'starter',
+      },
+      OPERATOR,
+    );
+    await service.decide(record.id, { decision: 'approve' }, REVIEWER);
+
+    // #when / #then — mints on its bound leg, and nowhere else
+    expect(
+      await approvedConnectorsForLeg(store, 'launch', 'run-ok', {
+        kind: 'resume',
+        step: ['approval'],
+        suspendedAt,
+      }),
+    ).toEqual(['release-deploy']);
+    expect(
+      await approvedConnectorsForLeg(store, 'launch', 'run-ok', {
+        kind: 'start',
+      }),
+    ).toEqual([]);
+  });
+});
 
 describe('approval queue end to end', () => {
   it('fails closed: a resume that bypasses decide() finds no grant and the connector denies', async () => {

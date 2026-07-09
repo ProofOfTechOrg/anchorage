@@ -11,45 +11,37 @@ import {
   type Tone,
   useApprovalUIComponents,
 } from '../../src/approval-ui/components.js';
-import type { RunClient, RunSummary, WorkflowMeta } from './run-client.js';
+import {
+  type DemoActor,
+  DEMO_ACTORS,
+  type DemoRole,
+} from '../../showcase/demo-actors.js';
+import {
+  RunApiError,
+  type RunClient,
+  type RunSummary,
+  type WorkflowMeta,
+} from './run-client.js';
 
-export type Role = 'admin' | 'builder' | 'operator' | 'reviewer' | 'viewer';
-
-export interface DemoActor {
-  token: string;
-  label: string;
-  role: Role;
-}
-
-/**
- * The demo identities the switcher offers. These bearer tokens must match the
- * dev backend's map (run-api-dev-plugin.ts) and the deployed worker's
- * APPROVAL_ACTOR_TOKENS var (showcase/wrangler.jsonc).
- */
-export const DEMO_ACTORS: readonly DemoActor[] = [
-  { token: 'demo-admin', label: 'admin', role: 'admin' },
-  { token: 'demo-builder', label: 'builder', role: 'builder' },
-  { token: 'demo-operator', label: 'operator', role: 'operator' },
-  { token: 'demo-reviewer', label: 'reviewer', role: 'reviewer' },
-  { token: 'demo-viewer', label: 'viewer', role: 'viewer' },
-];
+export type { DemoActor, DemoRole };
+export { DEMO_ACTORS };
 
 /**
  * Roles allowed to START any workflow — the host's coarse start-role gate,
  * applied to POST /runs before any per-workflow allowedRoles check. Mirrors
  * RUN_START_ROLES in ../../src/approval-api/contract.ts BY VALUE, the same way
- * the Role type above mirrors ApprovalRole: the app consumes the approval-ui
- * (browser) subpackage and does not reach into the approval-api (server)
- * subpackage's internal modules. reviewer/viewer are review-only. Drift is
- * fail-safe — the backend re-checks authoritatively, so a stale mirror only
- * re-enables a button the server still 403s.
+ * DemoRole mirrors ApprovalRole: the app consumes the approval-ui (browser)
+ * subpackage and does not reach into the approval-api (server) subpackage's
+ * internal modules. reviewer/viewer are review-only. Drift is fail-safe — the
+ * backend re-checks authoritatively, so a stale mirror only re-enables a button
+ * the server still 403s.
  */
-const RUN_START_ROLES: readonly Role[] = ['admin', 'operator', 'builder'];
+const RUN_START_ROLES: readonly DemoRole[] = ['admin', 'operator', 'builder'];
 
 /** The identity the app starts as (admin — can start any workflow). */
 export const DEFAULT_ACTOR: DemoActor = DEMO_ACTORS[0] ?? {
   token: 'demo-admin',
-  label: 'admin',
+  id: 'admin',
   role: 'admin',
 };
 
@@ -64,12 +56,16 @@ export interface RunEntry {
   title: string;
 }
 
+/** Rendered when the status endpoint, not the run, is what failed. */
+const UNAVAILABLE = 'unavailable';
+
 function statusTone(status: string): Tone {
   switch (status) {
     case 'success':
       return 'success';
     case 'failed':
     case 'tripwire':
+    case UNAVAILABLE:
       return 'danger';
     case 'suspended':
       return 'warning';
@@ -88,6 +84,31 @@ const TERMINAL_STATUSES = new Set([
   'bailed',
   'skipped',
 ]);
+
+const POLL_INTERVAL_MS = 3000;
+
+/**
+ * Consecutive transient failures tolerated before a run stops being polled.
+ * At POLL_INTERVAL_MS that is ~15s of grace — ample for a just-started run's
+ * snapshot to materialize.
+ */
+const MAX_TRANSIENT_FAILURES = 5;
+
+/** What the last poll of a run produced. `summary` survives a later error. */
+interface RunResult {
+  summary?: RunSummary;
+  error?: string;
+}
+
+/**
+ * A 404 is transient: the run was accepted but its snapshot may not be readable
+ * yet. So is a network blip (no RunApiError at all). Everything else — 401 after
+ * an actor switch, 403, 500 — is a hard failure that will not fix itself, so
+ * polling it forever is pure noise.
+ */
+function isTransient(error: unknown): boolean {
+  return !(error instanceof RunApiError) || error.status === 404;
+}
 
 export function ActorSwitcher({
   actorToken,
@@ -109,7 +130,7 @@ export function ActorSwitcher({
           {DEMO_ACTORS.map((actor) => (
             <C.Button
               key={actor.token}
-              label={actor.label}
+              label={actor.id}
               variant={actor.token === actorToken ? 'primary' : 'secondary'}
               pressed={actor.token === actorToken}
               onClick={() => onSelect(actor.token)}
@@ -127,7 +148,7 @@ export function LauncherPanel({
   onStarted,
 }: {
   runClient: RunClient;
-  actorRole: Role;
+  actorRole: DemoRole;
   onStarted: (entry: RunEntry) => void;
 }): ReactElement {
   const C = useApprovalUIComponents();
@@ -279,45 +300,77 @@ export function RunStatusPanel({
   runs: readonly RunEntry[];
 }): ReactElement {
   const C = useApprovalUIComponents();
-  const [summaries, setSummaries] = useState<
-    Record<string, RunSummary | undefined>
-  >({});
+  const [results, setResults] = useState<Record<string, RunResult>>({});
 
   // Poll each tracked run's status. External sync — a legitimate effect; re-runs
   // when the run set or the acting client changes.
   useEffect(() => {
     if (runs.length === 0) return;
     let alive = true;
-    // Returns true once every tracked run has reached a terminal status.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Per-effect-run bookkeeping, deliberately NOT a ref: re-arming (a new run,
+    // an actor switch) should forgive earlier failures, and StrictMode's double
+    // invoke gets its own counters instead of sharing one set.
+    const failures = new Map<string, number>();
+    const abandoned = new Set<string>();
+    const lastError = new Map<string, string>();
+
+    async function probe(run: RunEntry): Promise<[string, RunResult]> {
+      if (abandoned.has(run.runId)) {
+        return [run.runId, { error: lastError.get(run.runId) ?? UNAVAILABLE }];
+      }
+      try {
+        const summary = await runClient.status(run.workflowId, run.runId);
+        failures.delete(run.runId);
+        return [run.runId, { summary }];
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const count = (failures.get(run.runId) ?? 0) + 1;
+        failures.set(run.runId, count);
+        lastError.set(run.runId, message);
+        if (!isTransient(error) || count >= MAX_TRANSIENT_FAILURES) {
+          abandoned.add(run.runId);
+        }
+        return [run.runId, { error: message }];
+      }
+    }
+
+    // Returns true once every tracked run is finished or abandoned — the only
+    // two ways polling can stop. A swallowed error used to render as a plausible
+    // 'pending' that never became terminal, so a broken run polled forever.
     async function poll(): Promise<boolean> {
-      const entries = await Promise.all(
-        runs.map(async (run) => {
-          try {
-            const summary = await runClient.status(run.workflowId, run.runId);
-            return [run.runId, summary] as const;
-          } catch {
-            return [run.runId, undefined] as const;
-          }
-        }),
-      );
+      const entries = await Promise.all(runs.map(probe));
       if (!alive) return true;
-      const next = Object.fromEntries(entries);
-      setSummaries(next);
-      return runs.every((run) =>
-        TERMINAL_STATUSES.has(next[run.runId]?.status ?? ''),
+      setResults((previous) => {
+        const next: Record<string, RunResult> = {};
+        for (const [runId, result] of entries) {
+          // Keep the last good summary visible beneath the error banner; an
+          // untracked run drops out of the map entirely.
+          next[runId] = result.error
+            ? { summary: previous[runId]?.summary, error: result.error }
+            : result;
+        }
+        return next;
+      });
+      return entries.every(([runId, result]) =>
+        result.summary && !result.error
+          ? TERMINAL_STATUSES.has(result.summary.status)
+          : abandoned.has(runId),
       );
     }
-    void poll();
-    // Stop polling once all runs finish — no point hitting finished runs forever
-    // (a newly launched run re-arms the effect via the `runs` dependency).
-    const timer = setInterval(() => {
-      void poll().then((done) => {
-        if (done) clearInterval(timer);
-      });
-    }, 3000);
+
+    // Self-scheduling rather than setInterval: a poll slower than the interval
+    // cannot stack behind itself, and the chain simply stops when done.
+    async function tick(): Promise<void> {
+      const done = await poll();
+      if (!alive || done) return;
+      timer = setTimeout(() => void tick(), POLL_INTERVAL_MS);
+    }
+    void tick();
+
     return () => {
       alive = false;
-      clearInterval(timer);
+      if (timer !== undefined) clearTimeout(timer);
     };
   }, [runClient, runs]);
 
@@ -329,8 +382,12 @@ export function RunStatusPanel({
           <C.EmptyState title="No runs yet — launch one above." />
         ) : (
           runs.map((run) => {
-            const summary = summaries[run.runId];
-            const status = summary?.status ?? 'pending';
+            const { summary, error: pollError } = results[run.runId] ?? {};
+            // A failed STATUS READ is not a run status: say so, rather than
+            // rendering it as a plausible-looking 'pending'.
+            const status = pollError
+              ? UNAVAILABLE
+              : (summary?.status ?? 'pending');
             return (
               <C.Section key={run.runId} aria-label={`Run ${run.runId}`}>
                 <C.Stack gap="sm">
@@ -338,6 +395,12 @@ export function RunStatusPanel({
                     <C.Heading level={2}>{run.title}</C.Heading>
                     <C.Badge tone={statusTone(status)} label={status} />
                   </C.Stack>
+                  {pollError ? (
+                    <C.Banner
+                      tone="danger"
+                      title={`Could not read run status: ${pollError}`}
+                    />
+                  ) : null}
                   <C.MetadataList>
                     <C.MetadataItem label="workflow">
                       {run.workflowId}

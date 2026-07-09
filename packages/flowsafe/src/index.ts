@@ -10,6 +10,9 @@
 // 4. Audit export — Queues producer sink + batch consumer shipping audit
 //    events to a SIEM over HTTP
 // 5. Artifacts — R2-backed workflow artifact storage keyed by run identity
+// 6. Host kit — the shared run routes, bearer auth seam, and suspension→approval
+//    bridge every host mounts (subpath export '@proofoftech/flowsafe/host-kit'
+//    only — it is host glue, not part of the library's core surface)
 
 export {
   APPROVAL_PRIORITIES,
@@ -31,6 +34,7 @@ export {
   OPEN_STATUSES,
   resumeViaRuntime,
   stepKeyOf,
+  TCB_ONLY_CREATE_FIELDS,
   UnknownApprovalError,
 } from './approval-api/index.js';
 export type {

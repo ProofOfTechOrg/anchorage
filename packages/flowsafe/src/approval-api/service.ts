@@ -155,6 +155,7 @@ export class ApprovalService {
     if (input.resumeCount !== undefined) {
       record.resumeCount = input.resumeCount;
     }
+    if (input.runScoped !== undefined) record.runScoped = input.runScoped;
     if (input.summary !== undefined) record.summary = input.summary;
     if (input.payload !== undefined) record.payload = input.payload;
     // Attribution powers the self-approval check: default to the creating
@@ -527,6 +528,22 @@ export class ApprovalService {
       throw new InvalidApprovalInputError(
         'connectors must be an array of non-empty strings',
       );
+    }
+    // Attribution is what the separation-of-duties check compares, so an
+    // explicit one must be a usable identity — an empty string would silently
+    // match no actor and, worse, read as "attributed" to any later reader.
+    if (
+      input.requestedBy !== undefined &&
+      !isNonEmptyString(input.requestedBy)
+    ) {
+      throw new InvalidApprovalInputError(
+        'requestedBy must be a non-empty string',
+      );
+    }
+    // runScoped is a capability switch (mints on every leg); only a real
+    // boolean opts in, never a truthy string from a lax caller.
+    if (input.runScoped !== undefined && typeof input.runScoped !== 'boolean') {
+      throw new InvalidApprovalInputError('runScoped must be a boolean');
     }
     if (
       input.priority !== undefined &&

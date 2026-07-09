@@ -72,7 +72,7 @@ describe('approvedConnectorsForLeg', () => {
       }),
     );
     await store.create(
-      record({ status: 'approved', connectors: ['run-wide'] }),
+      record({ status: 'approved', runScoped: true, connectors: ['run-wide'] }),
     );
     await store.create(
       record({
@@ -154,7 +154,7 @@ describe('approvedConnectorsForLeg', () => {
       }),
     );
     await store.create(
-      record({ status: 'approved', connectors: ['run-wide'] }),
+      record({ status: 'approved', runScoped: true, connectors: ['run-wide'] }),
     );
 
     // #when — a resume leg whose snapshot carried no suspendedAt
@@ -179,7 +179,7 @@ describe('approvedConnectorsForLeg', () => {
       }),
     );
     await store.create(
-      record({ status: 'approved', connectors: ['run-wide'] }),
+      record({ status: 'approved', runScoped: true, connectors: ['run-wide'] }),
     );
 
     // #when
@@ -189,6 +189,42 @@ describe('approvedConnectorsForLeg', () => {
 
     // #then
     expect(connectors).toEqual(['run-wide']);
+  });
+
+  it('fails closed: a step-less record without runScoped mints nothing', async () => {
+    // #given — run-scope is EXPLICIT. An approved record that names neither a
+    // step nor runScoped is inert on every leg: "absent field => maximal
+    // privilege" was the inverted default that let an HTTP-authored record
+    // become a standing grant.
+    const store = new InMemoryApprovalStore();
+    await store.create(
+      record({ status: 'approved', connectors: ['smuggled'] }),
+    );
+
+    // #when / #then — start, resume-with-step, and unresolvable resume alike
+    expect(
+      await approvedConnectorsForLeg(store, 'wf', 'run-1', { kind: 'start' }),
+    ).toEqual([]);
+    expect(
+      await approvedConnectorsForLeg(store, 'wf', 'run-1', RESUME_GATE),
+    ).toEqual([]);
+    expect(
+      await approvedConnectorsForLeg(store, 'wf', 'run-1', { kind: 'resume' }),
+    ).toEqual([]);
+  });
+
+  it('denies a runScoped:false record exactly as it denies an absent flag', async () => {
+    // #given — the flag is a tri-state on the wire (D1 stores 0/1/NULL); only
+    // an explicit true opts in
+    const store = new InMemoryApprovalStore();
+    await store.create(
+      record({ status: 'approved', runScoped: false, connectors: ['nope'] }),
+    );
+
+    // #when / #then
+    expect(
+      await approvedConnectorsForLeg(store, 'wf', 'run-1', { kind: 'start' }),
+    ).toEqual([]);
   });
 });
 
@@ -257,13 +293,14 @@ describe('approvedConnectorsForLeg — exact suspension binding', () => {
     ).toEqual([]);
   });
 
-  it('run-scopes a step-less record even when it carries suspendedAt', async () => {
-    // #given — step-less = the deliberate run-scoped opt-out; suspendedAt on
-    // it is inert (the applies-rule keys binding off stepPath)
+  it('run-scopes a step-less runScoped record even when it carries suspendedAt', async () => {
+    // #given — step-less + runScoped = the deliberate run-scoped opt-out;
+    // suspendedAt on it is inert (the applies-rule keys binding off stepPath)
     const store = new InMemoryApprovalStore();
     await store.create(
       record({
         status: 'approved',
+        runScoped: true,
         suspendedAt: SUSPENDED_AT - 60_000,
         connectors: ['run-wide'],
       }),

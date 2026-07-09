@@ -6,6 +6,12 @@
 // authenticate option maps a Request to the acting principal and is part of
 // the trusted computing base (it asserts identity; the service enforces
 // roles). No actor -> 401 before any service call.
+//
+// The create route is OFF by default (allowCreate) and, when mounted, cannot
+// author capability: it rejects every TCB_ONLY_CREATE_FIELDS member and
+// force-attributes the request to the authenticated actor. Approval records
+// that carry grants are minted in-process from an observed suspension, never
+// from a request body.
 
 import type { ApprovalActor } from './contract.js';
 import {
@@ -23,6 +29,31 @@ import {
   type CreateApprovalInput,
 } from './types.js';
 
+/**
+ * Fields on CreateApprovalInput that select CAPABILITY or ATTRIBUTION, and so
+ * belong to the trusted computing base alone (security-threat-model.md, trust
+ * boundary 6). A request body that names any of them is rejected outright:
+ *
+ * - `connectors` IS the minted grant — an approved record's connectors become
+ *   the requestContext grant the write gate checks.
+ * - `runScoped` turns a step-less record into a standing grant on every leg.
+ * - `stepPath`, `suspendedAt`, `resumedAt`, `resumeCount` select WHICH leg a
+ *   grant mints on. A step-keyed body with no `suspendedAt` would fall into
+ *   grants.ts's legacy decidedAt-after fallback and mint, so rejecting
+ *   `connectors` alone is insufficient — reject the whole set.
+ * - `requestedBy` is the field decide()'s separation-of-duties check compares
+ *   against; spoofing it lets one principal approve their own request.
+ */
+export const TCB_ONLY_CREATE_FIELDS = [
+  'connectors',
+  'stepPath',
+  'suspendedAt',
+  'resumedAt',
+  'resumeCount',
+  'runScoped',
+  'requestedBy',
+] as const;
+
 export interface ApprovalRouterOptions {
   service: ApprovalService;
   /**
@@ -34,6 +65,15 @@ export interface ApprovalRouterOptions {
   ) => ApprovalActor | undefined | Promise<ApprovalActor | undefined>;
   /** Route prefix. Default: '/api/approvals'. */
   basePath?: string;
+  /**
+   * Mount `POST <basePath>` (create). Default false — every first-party host
+   * creates records in-process from an observed suspension (host-kit's
+   * approval bridge), so the HTTP route is an inert "file a request"
+   * affordance at best. When enabled it force-sets `requestedBy` to the
+   * authenticated actor and 400s on any TCB_ONLY_CREATE_FIELDS member, so it
+   * can never author capability.
+   */
+  allowCreate?: boolean;
 }
 
 export type ApprovalRouter = (request: Request) => Promise<Response | null>;
@@ -108,6 +148,7 @@ export function createApprovalRouter(
 ): ApprovalRouter {
   const { service, authenticate } = options;
   const basePath = options.basePath ?? '/api/approvals';
+  const allowCreate = options.allowCreate ?? false;
 
   return async (request: Request): Promise<Response | null> => {
     const url = new URL(request.url);
@@ -137,9 +178,25 @@ export function createApprovalRouter(
 
       if (request.method === 'POST') {
         if (segments.length === 0) {
+          if (!allowCreate) return json({ error: 'not found' }, 404);
           const body = await readJsonObject(request);
+          for (const field of TCB_ONLY_CREATE_FIELDS) {
+            if (field in body) {
+              throw new InvalidApprovalInputError(
+                `${field} may not be set over HTTP`,
+              );
+            }
+          }
           const { record, created } = await service.create(
-            body as unknown as CreateApprovalInput,
+            // Attribution is the authenticated identity, never the body:
+            // service.create still honours input.requestedBy for the
+            // in-process bridge (which legitimately attributes the human who
+            // advanced the run), so the tightening lives here at the HTTP
+            // boundary alone.
+            {
+              ...body,
+              requestedBy: actor.id,
+            } as unknown as CreateApprovalInput,
             actor,
           );
           return json(record, created ? 201 : 200);

@@ -69,16 +69,37 @@ Keep the cron interval at or below your SLA granularity; the default
 
 ## The conventions the template encodes
 
-- **Auth is one function.** `authenticateActor()` maps a request to an
-  approval actor; swap its body for your SSO/JWT verification. Everything
-  else (role checks, separation of duties, self-approval denial) lives in
-  `ApprovalService` and stays.
-- **A suspension is an approval request.** Both bridges (start and resume)
-  call `queueApprovalForSuspension()`, which captures the suspension's
-  `suspendedAt` so grant minting binds the decision to that exact suspension
-  (clock-free), and reads the suspend payload's `connectors` array so a
-  decision mints exactly the grants the step asked for. Multi-gate
-  workflows re-enter the queue automatically on each re-suspension.
+- **The shared pieces come from `@proofoftech/flowsafe/host-kit`, not from
+  here.** The auth seam (`parseActorTokens` + `bearerActorAuthenticator`), the
+  run routes with their RBAC gate order (`createRunRouter`), and the approval
+  bridge (`queueApprovalForSuspension`, `resumeRunWithRequeue`) are
+  security-critical and tested in the library. This file supplies only what is
+  deployment-specific: the workflows, and the DO-stub `start`/`status`/`resume`
+  thunks. Do not re-derive them.
+- **Auth is one function.** `authenticate` maps a request to an approval actor;
+  swap `bearerActorAuthenticator` for your SSO/JWT verification. Everything else
+  (role checks, separation of duties, self-approval denial) lives in
+  `ApprovalService` and stays. With no `APPROVAL_ACTOR_TOKENS` secret the map is
+  empty and every authenticated route 401s — fail closed.
+- **The approval queue's create route is off.** `createApprovalRouter` mounts
+  `POST /api/approvals` only when passed `allowCreate: true`, and even then a
+  body may not set `connectors` (which *is* the minted grant), `requestedBy`
+  (which separation-of-duties compares), or the fields selecting which leg a
+  grant mints on. Approval records are authored in-process from an observed
+  suspension. Never widen this.
+- **A suspension is an approval request.** Both bridges (start and resume) run
+  through `queueApprovalForSuspension()`, which captures the suspension's
+  `(suspendedAt, resumeCount)` pair so grant minting binds the decision to that
+  exact suspension (clock-free), and reads the suspend payload's `connectors`
+  array so a decision mints exactly the grants the step asked for. That array
+  must be a **server-authored static literal** — deriving it from run input
+  would let client input choose its own capability. Multi-gate workflows
+  re-enter the queue automatically on each re-suspension
+  (`resumeRunWithRequeue`).
+- **A workflow's metadata is its route contract.** Each entry in `WORKFLOWS`
+  is served at `GET /workflows` and gates `POST /runs` via its optional
+  `allowedRoles` (a subset of the coarse `RUN_START_ROLES` check that runs
+  first). `defineWorkflows` asserts every listed id was actually committed.
 - **Grants never travel in HTTP bodies.** The DO-side
   `approvalGrantProvider` derives `breakwater.approvedConnectors` from
   APPROVED records on every start/resume; the public raw-resume route stays

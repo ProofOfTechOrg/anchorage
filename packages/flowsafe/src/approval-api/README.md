@@ -92,8 +92,19 @@ grant in its requestContext.
   applies): Mastra merges resume-provided context over the persisted
   snapshot, so omission would inherit a previous leg's grants instead of
   retiring them.
-- Bridges must set `stepPath` when creating from a suspension; a step-less
-  record is an explicitly run-scoped standing grant, not a default.
+- Bridges must set `stepPath` when creating from a suspension. Run-scope is
+  EXPLICIT: a step-less record mints on every leg only when it also carries
+  `runScoped: true`, and mints nothing otherwise. "Absent `stepPath` implies
+  run-wide privilege" was an inverted default.
+- The HTTP create route is OFF by default (`createApprovalRouter`'s
+  `allowCreate`), and when a host deliberately mounts it, it cannot author
+  capability: it 400s on any body naming a `TCB_ONLY_CREATE_FIELDS` member
+  (`connectors`, `stepPath`, `suspendedAt`, `resumedAt`, `resumeCount`,
+  `runScoped`, `requestedBy`) and forces `requestedBy` to the authenticated
+  actor. `service.create` still honours an explicit `requestedBy` — the
+  in-process bridge attributes the human who advanced the run, which is exactly
+  what makes the separation-of-duties check fireable. The tightening is at the
+  HTTP boundary only.
 - Records are JSON-safe end to end (validated at create) so the two store
   implementations cannot diverge on exotic payloads.
 - `decidedAt` (service clock) is compared against `suspendedAt` (engine

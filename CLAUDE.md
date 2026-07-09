@@ -117,10 +117,18 @@ one React frontend and shipped as a single Cloudflare deploy —
 `packages/flowsafe/showcase/` (`buildShowcaseRuntime` registers all 5 on one
 Worker + DO + D1; `GET /workflows` + per-workflow `allowedRoles`; `assets` block
 serves `app/dist` at `/` with the API on the same origin) + host-agnostic glue in
-`src/host-kit/` (`WorkflowModule`, the approval bridge). The `app/` frontend gains
-a launcher + run-status panel + actor switcher; `run-api-dev-plugin.ts` runs the
-showcase host in-process for `app:dev`. Connectors stay binding-gated (simulate
-offline; grant gate always exercised).
+`src/host-kit/` (subpath export `./host-kit`): `WorkflowModule`/`WorkflowMeta`,
+the approval bridge, the bearer auth seam (`parseActorTokens`,
+`bearerActorAuthenticator`), and `createRunRouter` — the `/workflows` + `/runs`
+surface with its 401 → coarse `RUN_START_ROLES` → per-workflow `allowedRoles`
+gate order. All four hosts (showcase, deploy template, `app:dev` plugin, demo
+spike) consume it; each injects only its resume topology (DO stub vs in-process).
+The `app/` frontend gains a launcher + run-status panel + actor switcher;
+`run-api-dev-plugin.ts` runs the showcase host in-process for `app:dev`. The demo
+bearer identities live once in `showcase/demo-actors.ts` (drift-tested against
+`.dev.vars.example`); `showcase/wrangler.jsonc` bakes in NO credentials, so a
+deploy 401s until `wrangler secret put APPROVAL_ACTOR_TOKENS`. Connectors stay
+binding-gated (simulate offline; grant gate always exercised).
 
 ## Files
 
@@ -204,10 +212,18 @@ runtime — Mastra provides workflows, agents, memory, RAG, and observability.
   kept as informational audit metadata only. Records created without the capture
   fall back to decided-strictly-after-suspension, correct on same-clock
   topologies only (an in-memory ledger reset across a DO restart also degrades
-  to this fail-closed re-deny, never a leak). Step-less
-  approvals are explicitly run-scoped — approving a connector at one gate never
+  to this fail-closed re-deny, never a leak). Run-scope is EXPLICIT: a step-less
+  record is a run-wide standing grant only when it carries `runScoped: true`, and
+  mints nothing otherwise (absent-field-implies-privilege was an inverted
+  default) — so approving a connector at one gate never
   unlocks it at another gate, and a re-suspension of the same step spends the
-  earlier approval. Because Mastra merges resume-provided context
+  earlier approval. The queue's HTTP create route is off by default
+  (`createApprovalRouter`'s `allowCreate`) and can never author capability: it
+  400s on any body naming a `TCB_ONLY_CREATE_FIELDS` member (`connectors`,
+  `stepPath`, `suspendedAt`, `resumedAt`, `resumeCount`, `runScoped`,
+  `requestedBy`) and forces `requestedBy` to the authenticated actor, so no
+  client can name the connectors a decision mints, pick the leg it mints on, or
+  disarm the SoD check by spoofing the requester. Because Mastra merges resume-provided context
   OVER persisted
   context (pinned in runtime.test.ts; omission does not revoke), the
   provider returns the grant key on EVERY leg — empty when nothing applies —

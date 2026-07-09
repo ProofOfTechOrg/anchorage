@@ -46,12 +46,17 @@ is where you claim/decide. Try:
 ## Run it — the deployed shape (workerd)
 
 ```bash
+cp showcase/.dev.vars.example showcase/.dev.vars   # REQUIRED — the demo bearer tokens
 pnpm --filter @proofoftech/flowsafe build         # bundle breakwater from dist
 pnpm --filter @proofoftech/flowsafe app:build     # SPA → ../app/dist (served as assets)
 pnpm --filter @proofoftech/flowsafe showcase:dev  # wrangler dev on :8787 — SPA at / + API same origin
 ```
 
-Drive the loop with curl (demo bearer tokens are baked as a wrangler var):
+The `.dev.vars` copy is not optional: `APPROVAL_ACTOR_TOKENS` is a **secret**,
+not a wrangler var, so without it every authenticated route 401s. (`app:dev`
+needs no copy — the in-process host reads the tokens from `demo-actors.ts`.)
+
+Drive the loop with curl:
 
 ```bash
 # start a run → suspends at its gate, auto-queues an approval
@@ -78,7 +83,14 @@ curl -sX POST localhost:8787/runs/content-pipeline/<runId>/resume \
 ```
 
 Demo tokens (roles): `demo-admin`, `demo-builder`, `demo-operator`,
-`demo-reviewer`, `demo-viewer`.
+`demo-reviewer`, `demo-viewer`. They live in `showcase/demo-actors.ts` — the one
+source the UI's switcher, the `app:dev` host, and `.dev.vars.example` all derive
+from (`demo-actors.test.ts` fails if they drift).
+
+Note the queue's create route is **off**: `POST /api/approvals` returns 404.
+Approval records are minted in-process from an observed suspension, never from a
+request body — a body can carry neither `connectors` (which *is* the grant) nor
+`requestedBy` (which is what separation-of-duties compares).
 
 ## Single deploy
 
@@ -91,10 +103,21 @@ Worker — one origin, no build-time API URL.
 pnpm --filter @proofoftech/flowsafe showcase:deploy   # builds, then wrangler deploy
 ```
 
-For a real deployment: `wrangler d1 create anchorage-showcase` (paste the id),
-replace the demo `APPROVAL_ACTOR_TOKENS` var with a secret
-(`wrangler secret put APPROVAL_ACTOR_TOKENS`), and flip each connector's binding
-to go live.
+A fresh deploy **401s on every authenticated route until you set the auth
+secret** — no credentials are baked into `wrangler.jsonc`, so there is no state
+in which the service is reachable with a token an attacker can read off GitHub:
+
+```bash
+wrangler d1 create anchorage-showcase              # paste the id into wrangler.jsonc
+wrangler secret put APPROVAL_ACTOR_TOKENS \
+  --config showcase/wrangler.jsonc                 # then flip connector bindings to go live
+```
+
+> **Do not paste the demo tokens in as that secret.** They are checked into this
+> repository, so seeding them publishes world-known credentials — one of which is
+> `admin`, who can both file and decide approvals. Generate real random tokens
+> (or replace the bearer seam with your SSO/JWT verification in
+> `bearerActorAuthenticator`).
 
 ## Going live per connector
 

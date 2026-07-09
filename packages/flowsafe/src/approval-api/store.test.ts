@@ -12,6 +12,7 @@ import {
   type ApprovalPreparedStatement,
   D1ApprovalStore,
 } from './d1-store.js';
+import { approvedConnectorsForLeg } from './grants.js';
 import { type ApprovalStore, InMemoryApprovalStore } from './store.js';
 import type { ApprovalRecord } from './types.js';
 
@@ -98,6 +99,7 @@ function describeStoreContract(
         suspendedAt: 1751882400000,
         resumedAt: 1751882460000,
         resumeCount: 2,
+        runScoped: true,
         summary: 'publish the launch post',
         payload: { reason: 'human approval required', nested: { n: 1 } },
         connectors: ['blog-publisher', 'mailer'],
@@ -547,5 +549,49 @@ describe('D1ApprovalStore schema upgrade', () => {
     });
     await store.create(fresh);
     expect((await store.get(fresh.id))?.resumeCount).toBe(3);
+  });
+
+  it('upgrades a pre-run_scoped table so a legacy step-less approval mints NOTHING', async () => {
+    // #given — a DB predating the run_scoped column, holding exactly the record
+    // the OLD grant rule treated as a run-wide standing grant: approved,
+    // step-less (step_key ''), capability-bearing.
+    const sqlite = openSqlite();
+    sqlite.prepare(V1_TABLE_DDL).run();
+    sqlite
+      .prepare(
+        `INSERT INTO flowsafe_approvals
+         (id, workflow_id, run_id, step_key, step_path, title, connectors,
+          priority, status, decided_at, created_at, updated_at)
+         VALUES ('legacy-1', 'wf', 'run-legacy', '', NULL, 'legacy standing grant',
+                 '["release-deploy"]', 'normal', 'approved', ?, ?, ?)`,
+      )
+      .run(T, T, T);
+
+    // #when — instantiating the store ALTERs run_scoped in; the legacy row
+    // backfills to NULL
+    const store = new D1ApprovalStore(d1Like(sqlite));
+    const legacy = await store.get('legacy-1');
+
+    // #then — the row survives intact, but runScoped reads back undefined, so
+    // the tightened rule denies it on every leg. Fail CLOSED across the upgrade:
+    // a record that never named run-scope never had it. The operator's remedy is
+    // a fresh, explicit approval — not a silently surviving standing grant.
+    expect(legacy).toMatchObject({
+      id: 'legacy-1',
+      status: 'approved',
+      connectors: ['release-deploy'],
+    });
+    expect(legacy?.stepPath).toBeUndefined();
+    expect(legacy?.runScoped).toBeUndefined();
+    expect(
+      await approvedConnectorsForLeg(store, 'wf', 'run-legacy', {
+        kind: 'start',
+      }),
+    ).toEqual([]);
+
+    // ...and a fresh record still round-trips run_scoped on the upgraded table
+    const fresh = makeRecord({ runId: 'run-legacy', runScoped: true });
+    await store.create(fresh);
+    expect((await store.get(fresh.id))?.runScoped).toBe(true);
   });
 });

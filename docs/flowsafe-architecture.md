@@ -54,8 +54,9 @@ the DO's public resume route stays grant-free.
 Grants are suspension-scoped: the runner passes the resumed step AND that
 step's current suspension timestamp to the provider, and a step-keyed
 approval unlocks its connectors only when its decision landed strictly
-after that suspension began (step-less approvals are explicitly run-scoped
-standing grants). The provider returns the grant key on every leg — empty
+after that suspension began. Run-scope is explicit: a step-less approval is a
+standing grant on every leg only when it carries `runScoped: true`, and mints
+nothing otherwise. The provider returns the grant key on every leg — empty
 when nothing applies — so the resume-context merge overwrites, rather than
 inherits, the previous leg's grants. A resume that bypasses `decide()` for
 its suspension therefore finds no grant and the breakwater write gate fails

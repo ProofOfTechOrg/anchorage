@@ -9,9 +9,9 @@ copy it.
 
 | File | What | When to read |
 | ---- | ---- | ------------ |
-| `worker.ts` | Production-shaped Worker — bearer-token auth seam (`authenticateActor`), example gated workflow, `FlowsafeRunner` DO, start/resume approval bridges (`queueApprovalForSuspension`, suspend-payload `connectors` convention), `scheduled()` running `sweepSLA` + `purgeExpiredWorkflowRuns`, optional audit export (`AUDIT_QUEUE` producer sink + `queue()` SIEM consumer) | Changing the template's wiring, auth, maintenance, or audit-export behavior |
+| `worker.ts` | Production-shaped Worker — example gated workflow + its `WorkflowMeta`, `FlowsafeRunner` DO, the DO-stub `start`/`status`/`resume` thunks handed to host-kit's `createRunRouter`, `scheduled()` running `sweepSLA` + `purgeExpiredWorkflowRuns`, optional audit export (`AUDIT_QUEUE` producer sink + `queue()` SIEM consumer). Auth (`bearerActorAuthenticator`), the RBAC gate order, and the approval bridges come from `@proofoftech/flowsafe/host-kit` — not copied here | Changing the template's wiring, auth, maintenance, or audit-export behavior |
 | `wrangler.jsonc` | Deploy config — `RUNNER` DO + `DB` D1 bindings, cron trigger, SLA/retention vars, commented `queues` block for audit export, secret docs | Changing bindings, cron cadence, or defaults |
-| `tsconfig.json` | Template TS config; resolves `@proofoftech/flowsafe/*` specifiers to `../src` so the copy-ready imports typecheck in-repo | Debugging deploy typecheck failures |
+| `tsconfig.json` | Template TS config; resolves `@proofoftech/flowsafe/*` specifiers (incl. `/host-kit`) to `../src` so the copy-ready imports typecheck in-repo | Debugging deploy typecheck failures |
 | `README.md` | Deploy checklist, cron semantics, config table, encoded conventions | Deploying, operating, or copying the template |
 
 ## Verify

@@ -8,7 +8,8 @@
     "paths": {
       "@proofoftech/flowsafe/approval-api": ["../src/approval-api/index.ts"],
       "@proofoftech/flowsafe/audit-export": ["../src/audit-export/index.ts"],
-      "@proofoftech/flowsafe/do-runner": ["../src/do-runner/index.ts"]
+      "@proofoftech/flowsafe/do-runner": ["../src/do-runner/index.ts"],
+      "@proofoftech/flowsafe/host-kit": ["../src/host-kit/index.ts"]
     }
   },
   "include": ["./worker.ts", "../src/**/*.ts"],

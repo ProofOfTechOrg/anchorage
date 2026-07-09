@@ -91,6 +91,15 @@ export interface ApprovalRecord {
    * even when their `suspendedAt` collide within a millisecond.
    */
   resumeCount?: number;
+  /**
+   * Explicit run-scoped standing grant: a step-less record mints its
+   * connectors on EVERY leg of the run. Opt-in only — a step-less record
+   * WITHOUT this flag mints nothing, because "absent field => maximal
+   * privilege" is an inverted default. Suspend-observation bridges must never
+   * set this (they always carry a stepPath); only trusted code that
+   * deliberately wants a run-wide capability does.
+   */
+  runScoped?: boolean;
 }
 
 export interface CreateApprovalInput {
@@ -125,6 +134,11 @@ export interface CreateApprovalInput {
    * collision-free grant-binding tie-breaker.
    */
   resumeCount?: number;
+  /**
+   * Opt in to a run-scoped standing grant (mints on every leg). Create-time
+   * only — see ApprovalRecord.runScoped. Never settable over HTTP.
+   */
+  runScoped?: boolean;
 }
 
 export interface ApprovalListFilter {

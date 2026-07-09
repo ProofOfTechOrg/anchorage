@@ -38,6 +38,7 @@ import type {
 import { z } from 'zod';
 
 import {
+  type ApprovalActor,
   approvalGrantProvider,
   type ApprovalRole,
   ApprovalService,
@@ -53,6 +54,10 @@ import {
   type RunnerRuntime,
   type RunSummary,
 } from '../src/do-runner/index.js';
+import {
+  doSummary,
+  queueApprovalForSuspension,
+} from '../src/host-kit/index.js';
 
 interface Env {
   DB: D1Database;
@@ -61,6 +66,9 @@ interface Env {
 
 /** The connector id an approval grants; the publish step demands it. */
 const PUBLISH_CONNECTOR = 'demo-publisher';
+
+/** Creator identity for bridge-queued records (needs a create-capable role). */
+const SYSTEM_ACTOR: ApprovalActor = { id: 'demo-worker', role: 'operator' };
 
 function defineWorkflows(env: Env): RunnerRuntime {
   const approvals = new D1ApprovalStore(env.DB);
@@ -90,7 +98,13 @@ function defineWorkflows(env: Env): RunnerRuntime {
       approved: z.boolean(),
       decidedBy: z.string().optional(),
     }),
-    suspendSchema: z.object({ reason: z.string() }),
+    // `connectors` is the convention every host-kit bridge reads: a
+    // server-authored static literal naming the grants a decision should mint.
+    // It must never be derived from run input.
+    suspendSchema: z.object({
+      reason: z.string(),
+      connectors: z.array(z.string()),
+    }),
     // Matches approval-api's defaultResumeData contract.
     resumeSchema: z.object({
       approved: z.boolean(),
@@ -99,7 +113,10 @@ function defineWorkflows(env: Env): RunnerRuntime {
     }),
     execute: async ({ inputData, resumeData, suspend }) => {
       if (!resumeData) {
-        return suspend({ reason: 'human approval required before publish' });
+        return suspend({
+          reason: 'human approval required before publish',
+          connectors: [PUBLISH_CONNECTOR],
+        });
       }
       return {
         ...inputData,
@@ -189,27 +206,23 @@ function buildApprovalService(env: Env): ApprovalService {
   return new ApprovalService({
     store,
     defaultSlaSeconds: 15 * 60,
-    resumeRun: async (record, decision) => {
-      const response = await runStub(
-        env,
-        record.workflowId,
-        record.runId,
-      ).fetch(`http://do/runs/${record.workflowId}/${record.runId}/resume`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          step: record.stepPath,
-          resumeData: defaultResumeData(record, decision),
-        }),
-      });
-      const summary = await response.json();
-      if (!response.ok) {
-        throw new Error(
-          `resume failed (${response.status}): ${JSON.stringify(summary)}`,
-        );
-      }
-      return summary;
-    },
+    // doSummary (host-kit) reads the DO's answer and rethrows a non-ok one as a
+    // RunRouteError carrying the DO's own status — the same reader the showcase
+    // and deploy hosts use. The spike keeps its own routing, not its own parsing.
+    resumeRun: async (record, decision) =>
+      doSummary(
+        await runStub(env, record.workflowId, record.runId).fetch(
+          `http://do/runs/${record.workflowId}/${record.runId}/resume`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              step: record.stepPath,
+              resumeData: defaultResumeData(record, decision),
+            }),
+          },
+        ),
+      ),
   });
 }
 
@@ -260,35 +273,24 @@ const handler: ExportedHandler<Env> = {
       if (!response.ok) return response as unknown as Response;
       const summary = (await response.json()) as RunSummary;
       if (summary.status !== 'suspended') return json(summary);
-      // A suspension IS an approval request: queue it (idempotently — the
-      // partial unique index collapses duplicates) so reviewers see it.
-      // Capturing the step's (suspendedAt, resumeCount) pair binds the approval
-      // to THIS suspension exactly (clock-free grant minting).
-      const service = buildApprovalService(env);
-      const stepPath = summary.suspended?.[0];
-      const stepKey = stepPath?.join('.');
-      // Attribute the request to the human who started the run (the
-      // x-actor-id header), not the system bridge — otherwise the
-      // self-decision separation-of-duties check can never fire. Falls back
-      // to 'demo-worker' when the start carries no identity.
-      const requestedBy = request.headers.get('x-actor-id') ?? 'demo-worker';
-      const { record } = await service.create(
-        {
-          workflowId: body.workflowId,
-          runId: summary.runId,
-          stepPath,
-          suspendedAt:
-            stepKey !== undefined ? summary.suspendedAt?.[stepKey] : undefined,
-          resumedAt:
-            stepKey !== undefined ? summary.resumedAt?.[stepKey] : undefined,
-          resumeCount:
-            stepKey !== undefined ? summary.resumeCount?.[stepKey] : undefined,
-          title: `Approve '${body.workflowId}' run`,
-          payload: summary.suspendPayload,
-          connectors: [PUBLISH_CONNECTOR],
-          requestedBy,
-        },
-        { id: 'demo-worker', role: 'operator' },
+      // A suspension IS an approval request. The shared host-kit bridge queues
+      // it: idempotent (the partial unique index collapses duplicates), and it
+      // captures the step's (suspendedAt, resumeCount) pair so the decision
+      // binds to THIS suspension exactly (clock-free grant minting) and reads
+      // the grants to mint from the suspend payload's `connectors`.
+      //
+      // Attribution is the human who started the run (the x-actor-id header),
+      // not the system bridge — otherwise the self-decision separation-of-duties
+      // check can never fire. Falls back to 'demo-starter' when the start
+      // carries no identity; that must differ from SYSTEM_ACTOR.id, or an
+      // anonymous start would attribute the request to the record's creator.
+      const requestedBy = request.headers.get('x-actor-id') ?? 'demo-starter';
+      const record = await queueApprovalForSuspension(
+        buildApprovalService(env),
+        body.workflowId,
+        summary,
+        requestedBy,
+        SYSTEM_ACTOR,
       );
       return json({ ...summary, approval: record });
     }

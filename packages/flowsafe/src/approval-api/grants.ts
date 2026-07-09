@@ -40,9 +40,14 @@
 // core-clock suspendedAt — correct only where the two clocks are one
 // (single-Worker/Cloudflare deployments; see the threat model, boundary 6).
 //
-// Step-less approvals (stepPath omitted at create) are explicitly RUN-SCOPED
-// standing grants and mint on every leg — the deliberate opt-out, not the
-// default; suspend-observation bridges should always set stepPath.
+// Run-scoped standing grants are EXPLICIT: a step-less record mints on every
+// leg only when it also carries runScoped === true. A step-less record without
+// the flag mints nothing. The opt-out must be named, never inferred from a
+// missing field — "absent stepPath implies run-wide privilege" was an inverted
+// default that let any record whose stepPath was merely omitted (including one
+// authored over the create route) become a standing capability. Neither field
+// is settable over HTTP (router.ts, TCB_ONLY_CREATE_FIELDS);
+// suspend-observation bridges always set stepPath and never runScoped.
 //
 // The provider always returns the grant key — an empty list when nothing
 // applies — because Mastra merges provided context over the persisted
@@ -106,8 +111,9 @@ function boundToCurrentSuspension(
  * step-keyed records matching the resumed step AND bound to the step's
  * CURRENT suspension (exact `(suspendedAt, resumeCount)` pair match, or the
  * legacy decidedAt-after fallback for records created without the capture),
- * plus step-less (run-scoped) records. Start legs and unresolvable resume
- * targets mint run-scoped records only.
+ * plus step-less records that explicitly opted in with `runScoped: true`.
+ * Start legs and unresolvable resume targets mint run-scoped records only. A
+ * step-less record without `runScoped` is inert on every leg — fail closed.
  */
 export async function approvedConnectorsForLeg(
   store: ApprovalStore,
@@ -127,7 +133,7 @@ export async function approvedConnectorsForLeg(
     const recordKey = stepKeyOf(record.stepPath);
     const applies =
       recordKey === ''
-        ? true
+        ? record.runScoped === true
         : targetKey !== undefined &&
           recordKey === targetKey &&
           boundToCurrentSuspension(record, suspendedAt, resumeCount);

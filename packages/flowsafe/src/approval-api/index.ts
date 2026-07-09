@@ -30,7 +30,7 @@ export {
   defaultResumeData,
   resumeViaRuntime,
 } from './grants.js';
-export { createApprovalRouter } from './router.js';
+export { createApprovalRouter, TCB_ONLY_CREATE_FIELDS } from './router.js';
 export type { ApprovalRouter, ApprovalRouterOptions } from './router.js';
 export {
   ApprovalAuthzError,

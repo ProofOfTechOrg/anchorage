@@ -166,6 +166,15 @@ describe('ApprovalService.create', () => {
       { slaSeconds: Number.NaN },
       { connectors: ['ok', ''] },
       { stepPath: [''] },
+      // Attribution is what the separation-of-duties check compares. An empty
+      // string is not an identity: it matches no actor, yet reads as
+      // "attributed" to anything downstream inspecting the record.
+      { requestedBy: '' },
+      { requestedBy: 42 as unknown as string },
+      // runScoped is a capability switch (mints on every leg of the run), so
+      // only a real boolean opts in — never a truthy string from a lax caller.
+      { runScoped: 'true' as unknown as boolean },
+      { runScoped: 1 as unknown as boolean },
     ];
 
     // #when / #then
@@ -174,6 +183,43 @@ describe('ApprovalService.create', () => {
         harness.service.create(input(overrides), OPERATOR),
       ).rejects.toBeInstanceOf(InvalidApprovalInputError);
     }
+  });
+
+  it('accepts an explicit requestedBy and copies runScoped through', async () => {
+    // #given — the in-process bridge legitimately attributes the human who
+    // advanced the run; only the HTTP boundary forbids it (router.ts)
+    const harness = makeHarness();
+
+    // #when
+    const { record } = await harness.service.create(
+      input({ requestedBy: 'starter', runScoped: true }),
+      OPERATOR,
+    );
+
+    // #then
+    expect(record.requestedBy).toBe('starter');
+    expect(record.runScoped).toBe(true);
+  });
+
+  it('defaults runScoped to absent — a record is never run-scoped by omission', async () => {
+    // #given / #when
+    const harness = makeHarness();
+    const { record } = await harness.service.create(input(), OPERATOR);
+
+    // #then — grants.ts mints a step-less record only on runScoped === true
+    expect(record.runScoped).toBeUndefined();
+  });
+
+  it('preserves an explicit runScoped:false rather than dropping it', async () => {
+    // #given / #when
+    const harness = makeHarness();
+    const { record } = await harness.service.create(
+      input({ runScoped: false }),
+      OPERATOR,
+    );
+
+    // #then
+    expect(record.runScoped).toBe(false);
   });
 });
 
