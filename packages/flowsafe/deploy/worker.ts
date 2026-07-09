@@ -498,6 +498,12 @@ async function runMaintenance(env: Env, cron: string): Promise<void> {
     );
   }
   try {
+    // Storing run artifacts in R2? Pass your R2ArtifactStore here as
+    // `artifactStore` — and the same store to purgeTenant, if you add
+    // tenant offboarding (this template does not call it): the snapshot row
+    // is the only record of a run's artifact keys, so a retention purge
+    // without the pairing strands the purged runs' artifacts. `limit`
+    // batches the paired path per firing (subrequest budget).
     purged = await purgeExpiredWorkflowRuns(env.DB, {
       ttlMs:
         numberVar(env.RUN_RETENTION_DAYS, 30, 'RUN_RETENTION_DAYS') *

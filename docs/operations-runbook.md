@@ -76,6 +76,12 @@ offboarding. `purgeExpiredWorkflowRuns` — the ordinary retention purge — nev
 touches a suspended row at any age, which is precisely why abandoned runs
 require `purgeTenant`.
 
+**If you store artifacts in R2, pass the same `artifactStore` to
+`purgeExpiredWorkflowRuns` too.** Offboarding enumerates a tenant's artifacts
+from its surviving snapshot rows; an unpaired retention purge deletes rows —
+the only record of those runs' artifact keys — and strands their artifacts
+where no later `purgeTenant` can find them.
+
 ### breakwater Middleware
 
 Shipped as npm package `@proofoftech/breakwater` -- consumers add as a dependency.

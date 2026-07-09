@@ -33,8 +33,16 @@ export function subdomainTenantOf(
   hostname: string,
   options: SubdomainCrossCheckOptions,
 ): string | undefined {
-  const apex = options.apexDomain.toLowerCase();
-  const host = hostname.toLowerCase();
+  // DNS-equivalent normalization: 'bravo.example.com.' (the FQDN root-dot
+  // form browsers pass through Host and URL untouched) names the same host
+  // as 'bravo.example.com' — without stripping it, the dotted form would
+  // silently SKIP the cross-check this module exists to apply. The WHOLE
+  // trailing run goes, not one dot: multi-dot forms are not valid DNS, but
+  // stripping them errs toward APPLYING the check (fail closed), and a
+  // fat-fingered apex config ('example.com..') keeps matching instead of
+  // silently disabling the check for every host.
+  const apex = stripTrailingDots(options.apexDomain.toLowerCase());
+  const host = stripTrailingDots(hostname.toLowerCase());
   if (host === apex || !host.endsWith(`.${apex}`)) return undefined;
   const label = host.slice(0, -(apex.length + 1));
   if (label.includes('.')) return undefined; // deeper levels are not tenants
@@ -42,6 +50,10 @@ export function subdomainTenantOf(
     return undefined;
   }
   return label;
+}
+
+function stripTrailingDots(name: string): string {
+  return name.replace(/\.+$/, '');
 }
 
 /**

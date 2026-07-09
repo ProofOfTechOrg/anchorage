@@ -72,7 +72,9 @@ verification gate + `spike:verify` on push/PR to `main`. Phases 1-3:
   ('breakwater.workflowScope'), which `RunnerRuntime` mints on every leg.
   flowsafe validates `workflowId` at `register()` (same path-safe pattern as
   runId), ships `purgeExpiredWorkflowRuns` (terminal-status-only TTL purge of
-  `mastra_workflow_snapshot`; scheduling stays with the caller), and binds
+  `mastra_workflow_snapshot`; optional `artifactStore` pairs each purged run's
+  R2 artifacts with its row — the row is the only record of their keys;
+  missing table = zero rows; scheduling stays with the caller), and binds
   approvals to suspensions clock-free (`RunSummary.{suspendedAt,resumeCount}`
   maps → `ApprovalRecord.{suspendedAt,resumeCount}`, exact-match minting on the
   `(suspendedAt, resumeCount)` pair — `resumeCount` is the runtime-owned
@@ -150,7 +152,10 @@ runId prefix ownership check and the `[tid_, tid\x60)` range purge EXACT
 longer no-ops approved re-suspension resumes); `ISOLATION_SCOPE_CONTEXT_KEY` segments
 breakwater idempotency/rate-limit keys per tenant (no flag — absent scope keeps single-tenant
 keys; `tenantIsolation` evaluator denies scope-less calls incl. dry-run); `purgeTenant`
-offboards all three stores (any-status snapshots + approvals + artifacts); Mastra
+offboards all three stores (any-status snapshots + approvals + artifacts;
+a missing snapshot table reads as empty so run-less tenants — expired demo
+sandboxes — still offboard, and artifacts of retention-purged runs are covered
+by that purge's own `artifactStore` pairing, not re-enumerable here); Mastra
 six-table-inventory + `run_id` schema guards; the R2 no-workflow-level-listing pin; identity
 via `TokenVerifier` (`staticTokenVerifier` + HS256 `hmacVerifier`; `ApprovalActor.tenantId`
 required; the `tenants` registry is the allocation authority, reserved infra slugs denied);

@@ -109,16 +109,33 @@ live in the DO's own `ctx.storage`:
 
 Two purges, deliberately different:
 
-- `purgeExpiredWorkflowRuns(db, { ttlMs })` — the retention purge. Deletes only
-  TERMINAL snapshot rows older than the TTL. A suspended run is never eligible
-  at any age, because expiring one would kill a pending approval.
+- `purgeExpiredWorkflowRuns(db, { ttlMs, artifactStore })` — the retention
+  purge. Deletes only TERMINAL snapshot rows older than the TTL. A suspended
+  run is never eligible at any age, because expiring one would kill a pending
+  approval. Hosts that store artifacts in R2 must pass the same
+  `artifactStore` here as to `purgeTenant`: the snapshot row is the only
+  enumerable record of a run's artifact keys (R2 keys lead with `workflowId`,
+  so there is no run-level listing), and each run's artifacts are deleted
+  BEFORE its row so a crash between the two retries instead of stranding them.
+  The paired path is `limit`-batched per firing (default 100 runs — each run
+  costs ~2+N subrequests, so an unbounded backlog would blow the Workers
+  per-invocation cap); the shrinking eligible set is the cursor, and per-run
+  failures are isolated (a wedged run keeps its row as its own retry cursor
+  while the pass continues, then the failures re-throw aggregated so the
+  cron's error surface fires).
 - `purgeTenant(db, { tenantId, artifactStore })` — complete offboarding.
   Deletes snapshot rows of *any* status via an INV-3 range predicate over
-  `run_id`, the tenant's approval records, and its R2 artifacts. This is the
-  only way an abandoned-at-a-gate run is ever reclaimed. It races a live
-  resume, so purge only tenants whose tokens have already expired; the resume
-  then fails against the vanished row without re-executing the workflow (pinned
-  by regression test).
+  `run_id`, the tenant's approval records, and its R2 artifacts (enumerated
+  from the *surviving* snapshot rows — hence the retention pairing above).
+  This is the only way an abandoned-at-a-gate run is ever reclaimed. It races
+  a live resume, so purge only tenants whose tokens have already expired; the
+  resume then fails against the vanished row without re-executing the
+  workflow (pinned by regression test).
+
+Both purges treat a missing snapshot table as empty: Mastra creates it lazily
+with the first persisted run, and a tenant (or a whole fresh deployment) that
+never started one must still offboard cleanly — approvals are reaped even
+when there are no snapshots.
 
 ## Error Handling
 

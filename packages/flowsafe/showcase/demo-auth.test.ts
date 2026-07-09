@@ -298,6 +298,40 @@ describe('purgeExpiredDemoTenants', () => {
       .all()) as { results: Array<{ tenant_id: string }> };
     expect(rows.results).toEqual([{ tenant_id: live.tenant_id }]);
   });
+
+  it("one tenant's failing purge does not head-of-line block the rest — its row survives as its own retry cursor", async () => {
+    // #given — three expired tenants; the OLDEST one's purge is wedged.
+    // Oldest-first ordering retries it first EVERY pass, so aborting on it
+    // would starve the other two (and every later expiry) forever.
+    const db = demoDb(openSqlite());
+    const expired: string[] = [];
+    for (const [index, subject] of ['s1', 's2', 's3'].entries()) {
+      const tenant = await findOrCreateDemoTenant(db, {
+        ...makeTenantOptions(),
+        subject,
+        now: () => T0 - (10 - index) * HOUR - 25 * HOUR,
+      });
+      expired.push(tenant.tenant_id);
+    }
+    const wedged = expired[0] ?? '';
+    const purgeTenantData = async (tenantId: string) => {
+      if (tenantId === wedged) throw new Error('snapshot store unavailable');
+    };
+
+    // #when / #then — the pass reaps the other two, then reports the
+    // failure (naming the tenant) so the cron's error surface still fires
+    await expect(
+      purgeExpiredDemoTenants(db, {
+        purgeTenantData,
+        graceMs: 0,
+        now: () => T0,
+      }),
+    ).rejects.toThrow(wedged);
+    const rows = (await db
+      .prepare('SELECT tenant_id FROM demo_tenants')
+      .all()) as { results: Array<{ tenant_id: string }> };
+    expect(rows.results).toEqual([{ tenant_id: wedged }]);
+  });
 });
 
 describe('signed OAuth state', () => {

@@ -64,7 +64,10 @@ no Cloudflare account needed).
 - **Retention purge** — `purgeExpiredWorkflowRuns()` deletes terminal-status
   run snapshots older than `RUN_RETENTION_DAYS`. Suspended and running runs
   are never purged, so a run abandoned at an approval gate is reclaimed only
-  by `purgeTenant()` at offboarding.
+  by `purgeTenant()` at offboarding. Storing run artifacts in R2? Pass your
+  `R2ArtifactStore` as `artifactStore` (here and to `purgeTenant`): the
+  snapshot row is the only record of a run's artifact keys, so an unpaired
+  retention purge strands the purged runs' artifacts.
 
 Keep the sweep interval at or below your SLA granularity; the default
 `*/15 * * * *` gives 4-hour SLAs minute-scale slack. If you add a second cron

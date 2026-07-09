@@ -54,11 +54,36 @@ export interface SnapshotStatement {
   all<T = unknown>(): Promise<{ results: T[] }>;
 }
 
+/** Structural: R2ArtifactStore.deleteRun, without importing the artifacts module. */
+export interface TenantArtifactPurger {
+  deleteRun(workflowId: string, runId: string): Promise<number>;
+}
+
 export interface PurgeExpiredRunsOptions {
   /** workflowOutputTTL: runs untouched for longer than this are eligible. */
   ttlMs: number;
   /** Must match createD1Storage's tablePrefix. */
   tablePrefix?: string;
+  /**
+   * When set, each purged run's R2 artifacts are deleted WITH its snapshot
+   * row. Hosts that store artifacts must pass the same store purgeTenant
+   * gets: the snapshot row is the only enumerable record of a run's
+   * artifact keys (R2 keys lead with workflowId — there is no run-level
+   * listing without it), so a retention purge without this pairing strands
+   * the run's artifacts beyond even purgeTenant's reach.
+   */
+  artifactStore?: TenantArtifactPurger;
+  /**
+   * Runs processed per call on the artifact-paired path (default 100) —
+   * the cron's subrequest-budget guard, same batching as the demo-tenant
+   * reaper. Each run costs ~2+N subrequests (R2 list, per-artifact deletes,
+   * its row's DELETE), so an UNBOUNDED first backlog would blow the Workers
+   * per-invocation cap mid-pass and log an error every firing until it
+   * drained; size this to your plan's budget instead. The shrinking
+   * eligible set is the cursor — the next firing resumes at the survivors.
+   * Without artifactStore the purge is one bulk DELETE and ignores this.
+   */
+  limit?: number;
   /** Clock override for tests. */
   now?: () => number;
 }
@@ -66,11 +91,13 @@ export interface PurgeExpiredRunsOptions {
 /**
  * Data-retention purge: deletes TERMINAL runs (success/failed/tripwire/
  * canceled/bailed/skipped) whose updatedAt is older than the TTL from
- * mastra_workflow_snapshot. Live runs (running/suspended/waiting/pending/
- * paused) are never touched — expiring a suspended run would kill a pending
- * approval. TTL enforcement is a storage-layer property, so it lives here;
- * scheduling (Worker cron / DO alarm) stays with the caller. Returns the
- * number of deleted rows.
+ * mastra_workflow_snapshot — and, when `artifactStore` is wired, each purged
+ * run's R2 artifacts with its row. Live runs (running/suspended/waiting/
+ * pending/paused) are never touched — expiring a suspended run would kill a
+ * pending approval. A missing snapshot table reads as zero purgeable runs
+ * (Mastra creates it lazily with the first persisted run). TTL enforcement
+ * is a storage-layer property, so it lives here; scheduling (Worker cron /
+ * DO alarm) stays with the caller. Returns the number of deleted rows.
  */
 export async function purgeExpiredWorkflowRuns(
   db: SnapshotDatabase,
@@ -90,20 +117,90 @@ export async function purgeExpiredWorkflowRuns(
   // conjunct could still evaluate the extract on the bad row. Unclassifiable
   // rows yield NULL and survive (fail safe: never delete what can't be
   // proven terminal).
-  const result = await db
-    .prepare(
-      `DELETE FROM ${prefix}mastra_workflow_snapshot
-       WHERE updatedAt < ?
+  const eligible = `updatedAt < ?
          AND CASE
                WHEN json_valid(snapshot)
                  THEN json_extract(snapshot, '$.status')
-             END IN (${placeholders})`,
-    )
-    .bind(cutoff, ...TERMINAL_STATUSES)
-    .run();
-  const changes = (result as { meta?: { changes?: number } } | undefined)?.meta
-    ?.changes;
-  return typeof changes === 'number' ? changes : 0;
+             END IN (${placeholders})`;
+
+  if (options.artifactStore) {
+    // Artifact-paired path, run by run: artifacts BEFORE the row, because
+    // the row is the only record of the run's artifact keys — dying between
+    // the two leaves the row for the next sweep (deleteRun is idempotent),
+    // while row-first would strand the artifacts forever. Each deleted row
+    // is durable progress: a mid-pass crash or the LIMIT batch cap resumes
+    // at the survivors on the next firing, and per-run failures are
+    // isolated below so one wedged run cannot stall the rows behind it.
+    let rows: Array<{ workflow_name: string; run_id: string }>;
+    try {
+      ({ results: rows } = await db
+        .prepare(
+          `SELECT workflow_name, run_id
+           FROM ${prefix}mastra_workflow_snapshot
+           WHERE ${eligible}
+           LIMIT ?`,
+        )
+        .bind(cutoff, ...TERMINAL_STATUSES, options.limit ?? 100)
+        .all<{ workflow_name: string; run_id: string }>());
+    } catch (error) {
+      if (!isMissingTable(error)) throw error;
+      return 0;
+    }
+    let deleted = 0;
+    const failures: Array<{ run: string; message: string }> = [];
+    for (const row of rows) {
+      try {
+        await options.artifactStore.deleteRun(row.workflow_name, row.run_id);
+      } catch (error) {
+        // Isolate per run, same as the demo-tenant reaper: aborting the
+        // loop would re-hit this run at the same scan position every firing
+        // and stall every eligible row behind it forever. Its row survives
+        // as its own retry cursor; the aggregate throw below keeps the
+        // cron's error surface firing. A wedged run does occupy a batch
+        // slot until fixed, so isolation holds while wedged runs number
+        // fewer than `limit`.
+        failures.push({
+          run: `${row.workflow_name}/${row.run_id}`,
+          message: errorMessageOf(error),
+        });
+        continue;
+      }
+      // Re-checking eligibility keys the delete to the row the SELECT saw;
+      // terminal is absorbing, so this is belt-and-braces, not a race fix.
+      deleted += d1Changes(
+        await db
+          .prepare(
+            `DELETE FROM ${prefix}mastra_workflow_snapshot
+             WHERE workflow_name = ? AND run_id = ? AND ${eligible}`,
+          )
+          .bind(row.workflow_name, row.run_id, cutoff, ...TERMINAL_STATUSES)
+          .run(),
+      );
+    }
+    if (failures.length > 0) {
+      throw new Error(
+        `purgeExpiredWorkflowRuns: artifact deletion failed for ${failures.length} of ${rows.length} eligible run(s), the rest were purged (${failures
+          .map((failure) => `${failure.run}: ${failure.message}`)
+          .join('; ')})`,
+      );
+    }
+    return deleted;
+  }
+
+  try {
+    return d1Changes(
+      await db
+        .prepare(
+          `DELETE FROM ${prefix}mastra_workflow_snapshot
+           WHERE ${eligible}`,
+        )
+        .bind(cutoff, ...TERMINAL_STATUSES)
+        .run(),
+    );
+  } catch (error) {
+    if (!isMissingTable(error)) throw error;
+    return 0;
+  }
 }
 
 /**
@@ -124,11 +221,6 @@ export async function ensureSnapshotRunIdIndex(
     .run();
 }
 
-/** Structural: R2ArtifactStore.deleteRun, without importing the artifacts module. */
-export interface TenantArtifactPurger {
-  deleteRun(workflowId: string, runId: string): Promise<number>;
-}
-
 export interface PurgeTenantOptions {
   /** MUST satisfy INV-3 (^[a-z0-9]{3,32}$) — see the range note below. */
   tenantId: string;
@@ -136,9 +228,11 @@ export interface PurgeTenantOptions {
   tablePrefix?: string;
   /**
    * The tenant's R2 artifacts are deleted per surviving run BEFORE the
-   * snapshot rows go (deleteRun needs the run list). Artifacts of runs whose
-   * snapshots were already retention-purged are reaped by that purge's own
-   * deleteRun pairing, not here.
+   * snapshot rows go (deleteRun needs the run list — snapshot rows are the
+   * only enumerable record of a run's artifact keys). That is also why the
+   * SAME store must ride purgeExpiredWorkflowRuns' `artifactStore`:
+   * retention deletes rows this offboarding can then no longer see, so an
+   * unpaired retention purge strands those runs' artifacts.
    */
   artifactStore?: TenantArtifactPurger;
 }
@@ -182,50 +276,68 @@ export async function purgeTenant(
   const prefix = options.tablePrefix ?? '';
   const lower = `${tenantId}_`;
   const upper = `${tenantId}\x60`;
-  await ensureSnapshotRunIdIndex(db, prefix);
-
-  // 1. Artifacts first — deleteRun needs the run list the snapshot DELETE
-  // would destroy.
-  let artifacts = 0;
-  if (options.artifactStore) {
-    const { results } = await db
-      .prepare(
-        `SELECT workflow_name, run_id FROM ${prefix}mastra_workflow_snapshot
-         WHERE run_id >= ? AND run_id < ?`,
-      )
-      .bind(lower, upper)
-      .all<{ workflow_name: string; run_id: string }>();
-    for (const row of results) {
-      artifacts += await options.artifactStore.deleteRun(
-        row.workflow_name,
-        row.run_id,
-      );
-    }
+  // The snapshot table exists only once Mastra lazily creates it for the
+  // first persisted run. A tenant that never started one — routine for an
+  // expired demo sandbox — has zero snapshots and artifacts, and its
+  // approvals below MUST still be reaped: throwing here would wedge every
+  // offboarding (the purge cron AND the demo re-auth's inline purge) until
+  // some unrelated run initializes the schema.
+  let hasSnapshotTable = true;
+  try {
+    await ensureSnapshotRunIdIndex(db, prefix);
+  } catch (error) {
+    if (!isMissingTable(error)) throw error;
+    hasSnapshotTable = false;
   }
 
-  // 2. Snapshots — ANY status.
-  const snapshotResult = await db
-    .prepare(
-      `DELETE FROM ${prefix}mastra_workflow_snapshot
-       WHERE run_id >= ? AND run_id < ?`,
-    )
-    .bind(lower, upper)
-    .run();
+  let artifacts = 0;
+  let snapshots = 0;
+  if (hasSnapshotTable) {
+    // 1. Artifacts first — deleteRun needs the run list the snapshot DELETE
+    // would destroy.
+    if (options.artifactStore) {
+      const { results } = await db
+        .prepare(
+          `SELECT workflow_name, run_id FROM ${prefix}mastra_workflow_snapshot
+           WHERE run_id >= ? AND run_id < ?`,
+        )
+        .bind(lower, upper)
+        .all<{ workflow_name: string; run_id: string }>();
+      for (const row of results) {
+        artifacts += await options.artifactStore.deleteRun(
+          row.workflow_name,
+          row.run_id,
+        );
+      }
+    }
+
+    // 2. Snapshots — ANY status.
+    snapshots = d1Changes(
+      await db
+        .prepare(
+          `DELETE FROM ${prefix}mastra_workflow_snapshot
+           WHERE run_id >= ? AND run_id < ?`,
+        )
+        .bind(lower, upper)
+        .run(),
+    );
+  }
 
   // 3. Approvals — by the tenant_id column. Hosts without the approval queue
-  // have no such table; that is the only tolerated failure.
+  // have no such table; a missing table is the only tolerated failure.
   let approvals = 0;
   try {
-    const approvalResult = await db
-      .prepare('DELETE FROM flowsafe_approvals WHERE tenant_id = ?')
-      .bind(tenantId)
-      .run();
-    approvals = d1Changes(approvalResult);
+    approvals = d1Changes(
+      await db
+        .prepare('DELETE FROM flowsafe_approvals WHERE tenant_id = ?')
+        .bind(tenantId)
+        .run(),
+    );
   } catch (error) {
-    if (!/no such table/i.test(errorMessageOf(error))) throw error;
+    if (!isMissingTable(error)) throw error;
   }
 
-  return { snapshots: d1Changes(snapshotResult), approvals, artifacts };
+  return { snapshots, approvals, artifacts };
 }
 
 /** Rows affected by a D1 write, read from its `{ meta: { changes } }` envelope. */
@@ -237,4 +349,16 @@ export function d1Changes(result: unknown): number {
 
 function errorMessageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * SQLite/D1's "no such table". For the purges, a table that was never
+ * created is an EMPTY table, not an error: Mastra creates the snapshot
+ * table lazily with the first persisted run, and hosts without the approval
+ * queue never create flowsafe_approvals. Matched on the message because the
+ * structural SnapshotDatabase seam carries no error codes (D1 wraps the
+ * SQLite text but preserves it).
+ */
+function isMissingTable(error: unknown): boolean {
+  return /no such table/i.test(errorMessageOf(error));
 }

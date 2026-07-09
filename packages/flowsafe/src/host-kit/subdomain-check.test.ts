@@ -24,6 +24,12 @@ describe('subdomainTenantOf', () => {
   it.each([
     ['acme.example.com', 'acme'],
     ['ACME.EXAMPLE.COM', 'acme'],
+    // The FQDN root-dot form is DNS-equivalent — it must not skip the check.
+    ['acme.example.com.', 'acme'],
+    ['ACME.EXAMPLE.COM.', 'acme'],
+    // Multi-dot runs are not valid DNS, but normalizing them errs toward
+    // APPLYING the check rather than silently skipping it.
+    ['acme.example.com..', 'acme'],
     ['dm0011223344556677aa.example.com', 'dm0011223344556677aa'],
   ])('%s addresses tenant %s', (host, tenant) => {
     expect(subdomainTenantOf(host, APEX)).toBe(tenant);
@@ -31,15 +37,31 @@ describe('subdomainTenantOf', () => {
 
   it.each([
     ['the apex itself', 'example.com'],
+    ['the apex in FQDN root-dot form', 'example.com.'],
     ['outside the apex', 'evil.test'],
     ['a lookalike suffix', 'evilexample.com'],
+    ['a lookalike suffix with a root dot', 'evilexample.com.'],
+    ['a lookalike suffix with a dot run', 'evilexample.com..'],
     ['a deeper level', 'a.b.example.com'],
     ['reserved: www', 'www.example.com'],
+    ['reserved www in FQDN root-dot form', 'www.example.com.'],
     ['reserved: api', 'api.example.com'],
     ['reserved: app', 'app.example.com'],
     ['reserved: admin', 'admin.example.com'],
   ])('%s is NOT tenant-addressed', (_label, host) => {
     expect(subdomainTenantOf(host, APEX)).toBeUndefined();
+  });
+
+  it('normalizes trailing dots on the CONFIGURED apex too (a typo must not silently disable the check)', () => {
+    expect(
+      subdomainTenantOf('acme.example.com', { apexDomain: 'example.com.' }),
+    ).toBe('acme');
+    expect(
+      subdomainTenantOf('acme.example.com.', { apexDomain: 'example.com.' }),
+    ).toBe('acme');
+    expect(
+      subdomainTenantOf('acme.example.com', { apexDomain: 'example.com..' }),
+    ).toBe('acme');
   });
 });
 
@@ -60,6 +82,18 @@ describe('withSubdomainCrossCheck', () => {
     // #when / #then
     await expect(
       resolve(new Request('https://bravo.example.com/workflows')),
+    ).rejects.toBeInstanceOf(TenantResolutionError);
+  });
+
+  it("denies the same mismatch on the FQDN root-dot host 'bravo.example.com.'", async () => {
+    // #given — the trailing-dot form is DNS-equivalent, so skipping the
+    // check there would let an acme token quietly operate on acme data
+    // while the browser shows Bravo's branded host
+    const resolve = withSubdomainCrossCheck(makeResolve('acme'), APEX);
+
+    // #when / #then
+    await expect(
+      resolve(new Request('https://bravo.example.com./workflows')),
     ).rejects.toBeInstanceOf(TenantResolutionError);
   });
 

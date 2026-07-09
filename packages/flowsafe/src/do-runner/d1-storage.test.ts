@@ -267,6 +267,179 @@ describe('purgeExpiredWorkflowRuns', () => {
       }),
     ).toBe(0);
   });
+
+  it('treats a MISSING snapshot table as zero purgeable runs (Mastra creates it lazily)', async () => {
+    // #given — a database where no run ever persisted, so Mastra's lazy
+    // CREATE TABLE never happened
+    const sqlite = openSqlite();
+
+    // #when / #then — the purge cron must not fail until some unrelated run
+    // initializes the schema
+    expect(
+      await purgeExpiredWorkflowRuns(d1Like(sqlite), {
+        ttlMs: 7 * DAY_MS,
+        now: () => NOW,
+      }),
+    ).toBe(0);
+    expect(
+      await purgeExpiredWorkflowRuns(d1Like(sqlite), {
+        ttlMs: 7 * DAY_MS,
+        now: () => NOW,
+        artifactStore: {
+          deleteRun: async () => {
+            throw new Error('must not be called without a snapshot table');
+          },
+        },
+      }),
+    ).toBe(0);
+  });
+
+  it("pairs each purged run's artifact deletion with its snapshot row when artifactStore is wired", async () => {
+    // #given — a stale terminal run beside a fresh terminal and a stale live
+    // one; only the first is eligible
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    seedRun(sqlite, {
+      runId: 'stale-done',
+      status: 'success',
+      updatedAt: NOW - 8 * DAY_MS,
+    });
+    seedRun(sqlite, {
+      runId: 'fresh-done',
+      status: 'success',
+      updatedAt: NOW - 1 * DAY_MS,
+    });
+    seedRun(sqlite, {
+      runId: 'stale-open',
+      status: 'suspended',
+      updatedAt: NOW - 30 * DAY_MS,
+    });
+    const deletedArtifacts: string[] = [];
+    const artifactStore = {
+      deleteRun: async (workflowId: string, runId: string) => {
+        deletedArtifacts.push(`${workflowId}/${runId}`);
+        return 2;
+      },
+    };
+
+    // #when
+    const deleted = await purgeExpiredWorkflowRuns(d1Like(sqlite), {
+      ttlMs: 7 * DAY_MS,
+      now: () => NOW,
+      artifactStore,
+    });
+
+    // #then — exactly the purged run's artifacts went with its row; the
+    // survivors keep theirs (purgeTenant can still enumerate them later)
+    expect(deleted).toBe(1);
+    expect(deletedArtifacts).toEqual(['wf/stale-done']);
+    expect(remainingRunIds(sqlite)).toEqual(['fresh-done', 'stale-open']);
+  });
+
+  it('LIMIT-batches the artifact-paired path; the shrinking eligible set is the cursor', async () => {
+    // #given — three stale terminal runs, batch size 2 (the subrequest-
+    // budget guard: an unbounded first backlog would blow the Workers
+    // per-invocation cap)
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    for (const runId of ['stale-a', 'stale-b', 'stale-c']) {
+      seedRun(sqlite, {
+        runId,
+        status: 'success',
+        updatedAt: NOW - 8 * DAY_MS,
+      });
+    }
+    const deletedArtifacts: string[] = [];
+    const artifactStore = {
+      deleteRun: async (_workflowId: string, runId: string) => {
+        deletedArtifacts.push(runId);
+        return 1;
+      },
+    };
+    const options = {
+      ttlMs: 7 * DAY_MS,
+      now: () => NOW,
+      artifactStore,
+      limit: 2,
+    };
+
+    // #when — two passes
+    const first = await purgeExpiredWorkflowRuns(d1Like(sqlite), options);
+    const second = await purgeExpiredWorkflowRuns(d1Like(sqlite), options);
+
+    // #then — the batches advance without a cursor row and stay paired
+    expect(first).toBe(2);
+    expect(second).toBe(1);
+    expect(deletedArtifacts.sort()).toEqual(['stale-a', 'stale-b', 'stale-c']);
+    expect(remainingRunIds(sqlite)).toEqual([]);
+  });
+
+  it("a failing artifact delete leaves that run's snapshot row for the next sweep (artifacts-first ordering)", async () => {
+    // #given — artifacts go BEFORE the row: if this order ever flips, a
+    // crash between the two strands the artifacts forever (the row is their
+    // only enumerable record)
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    seedRun(sqlite, {
+      runId: 'stale-done',
+      status: 'success',
+      updatedAt: NOW - 8 * DAY_MS,
+    });
+    const artifactStore = {
+      deleteRun: async () => {
+        throw new Error('R2 unavailable');
+      },
+    };
+
+    // #when / #then — the failure propagates (the cron logs it)...
+    await expect(
+      purgeExpiredWorkflowRuns(d1Like(sqlite), {
+        ttlMs: 7 * DAY_MS,
+        now: () => NOW,
+        artifactStore,
+      }),
+    ).rejects.toThrow('R2 unavailable');
+    // ...and the row survives as the retry cursor
+    expect(remainingRunIds(sqlite)).toEqual(['stale-done']);
+  });
+
+  it("one run's wedged artifact delete does not stall the eligible rows behind it", async () => {
+    // #given — five stale terminal runs; only the middle one's deleteRun is
+    // permanently broken. Without per-run isolation the loop aborts at the
+    // same scan position EVERY firing and the runs behind it never purge.
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    for (const runId of ['r1-ok', 'r2-ok', 'r3-bad', 'r4-ok', 'r5-ok']) {
+      seedRun(sqlite, {
+        runId,
+        status: 'success',
+        updatedAt: NOW - 8 * DAY_MS,
+      });
+    }
+    const artifactStore = {
+      deleteRun: async (_workflowId: string, runId: string) => {
+        if (runId === 'r3-bad') throw new Error('permanently broken');
+        return 1;
+      },
+    };
+    const options = { ttlMs: 7 * DAY_MS, now: () => NOW, artifactStore };
+
+    // #when / #then — the pass purges the other four, then reports the
+    // failure (naming the run) so the cron's error surface still fires
+    await expect(
+      purgeExpiredWorkflowRuns(d1Like(sqlite), options),
+    ).rejects.toThrow('wf/r3-bad: permanently broken');
+    expect(remainingRunIds(sqlite)).toEqual(['r3-bad']);
+
+    // #then — a later pass with the store healed reaps the survivor
+    expect(
+      await purgeExpiredWorkflowRuns(d1Like(sqlite), {
+        ...options,
+        artifactStore: { deleteRun: async () => 1 },
+      }),
+    ).toBe(1);
+    expect(remainingRunIds(sqlite)).toEqual([]);
+  });
 });
 
 describe('purgeTenant (complete offboarding)', () => {
@@ -345,6 +518,47 @@ describe('purgeTenant (complete offboarding)', () => {
     // #when / #then
     const result = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
     expect(result).toEqual({ snapshots: 1, approvals: 0, artifacts: 0 });
+  });
+
+  it('offboards a tenant that never started a run: a MISSING snapshot table reads as empty and approvals are still reaped', async () => {
+    // #given — Mastra creates the snapshot table lazily with the first
+    // persisted run, and an expired demo sandbox routinely dies without one;
+    // the approvals table exists (the store factory creates it eagerly)
+    const sqlite = openSqlite();
+    seedApprovalsTable(sqlite);
+    const artifactStore = {
+      deleteRun: async () => {
+        throw new Error('must not be called without a snapshot table');
+      },
+    };
+
+    // #when — must not throw before the approval delete (a throw here wedged
+    // BOTH the purge cron and re-auth for the sandbox's identity)
+    const result = await purgeTenant(d1Like(sqlite), {
+      tenantId: 'abc',
+      artifactStore,
+    });
+
+    // #then — the tenant's approval rows are gone; the neighbor survives
+    expect(result).toEqual({ snapshots: 0, approvals: 1, artifacts: 0 });
+    const approvals = (
+      sqlite.prepare('SELECT tenant_id FROM flowsafe_approvals') as unknown as {
+        all(): Array<{ tenant_id: string }>;
+      }
+    ).all();
+    expect(approvals).toEqual([{ tenant_id: 'abcdefg' }]);
+  });
+
+  it('offboards cleanly when NEITHER table exists yet (fresh deployment)', async () => {
+    // #given — no snapshot table, no approvals table
+    const sqlite = openSqlite();
+
+    // #when / #then
+    expect(await purgeTenant(d1Like(sqlite), { tenantId: 'abc' })).toEqual({
+      snapshots: 0,
+      approvals: 0,
+      artifacts: 0,
+    });
   });
 
   it.each(['Abc', 'a_b', 'ab', "abc'; DROP TABLE x; --", ''])(

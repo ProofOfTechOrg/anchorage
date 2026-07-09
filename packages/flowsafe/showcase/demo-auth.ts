@@ -332,6 +332,14 @@ export interface PurgeDemoTenantsOptions {
  * at most `limit` per call. The "cursor" is the table itself: each reaped
  * tenant's row is deleted, so the next invocation resumes where this one
  * stopped — durable by construction, no separate cursor row to corrupt.
+ * Failures are isolated PER TENANT: a failing purge keeps its row (its own
+ * retry cursor) while the pass continues — oldest-first ordering would
+ * otherwise retry the same wedged tenant first every pass and head-of-line
+ * block every later expiry. Failures re-throw AFTER the pass, aggregated,
+ * so the cron's error surface still fires. The isolation is bounded by
+ * `limit`: a wedged tenant keeps occupying an oldest-first batch slot, so
+ * once `limit` many are simultaneously wedged, younger expiries starve
+ * until an operator clears them (every pass logs all of them).
  */
 export async function purgeExpiredDemoTenants(
   db: DemoDatabase,
@@ -347,13 +355,29 @@ export async function purgeExpiredDemoTenants(
     .bind(new Date(now - options.graceMs).toISOString(), options.limit ?? 25)
     .all<{ tenant_id: string }>();
   const purged: string[] = [];
+  const failures: Array<{ tenantId: string; message: string }> = [];
   for (const row of results) {
-    await options.purgeTenantData(row.tenant_id);
+    try {
+      await options.purgeTenantData(row.tenant_id);
+    } catch (error) {
+      failures.push({
+        tenantId: row.tenant_id,
+        message: errorMessageOf(error),
+      });
+      continue;
+    }
     await db
       .prepare('DELETE FROM demo_tenants WHERE tenant_id = ?')
       .bind(row.tenant_id)
       .run();
     purged.push(row.tenant_id);
+  }
+  if (failures.length > 0) {
+    throw new Error(
+      `purgeExpiredDemoTenants: ${failures.length} of ${results.length} expired tenant purge(s) failed, the rest were reaped (${failures
+        .map((failure) => `${failure.tenantId}: ${failure.message}`)
+        .join('; ')})`,
+    );
   }
   return purged;
 }
