@@ -61,9 +61,64 @@ await run.start({ inputData: {} });
 }
 ```
 
-## Alarm Handling
+## Run Identity and Tenant Scoping
 
-The DO uses storage alarms (`ctx.storage.setAlarm()` plus the class's `alarm()` handler) to wake itself after a timeout. The alarm interval is configurable and determines the polling cadence for approval resolution. Default: 60 seconds.
+The `runId` is the tenant carrier, not an opaque token: it is minted
+server-side as `` `${tenantId}_${uuid}` `` from the authenticated tenant, and
+the runner enforces that at three points.
+
+- `RunnerRuntime.start()` **requires** a `runId`. There is deliberately no
+  `?? crypto.randomUUID()` fallback: a caller that omitted one would mint a
+  bare, tenant-less run whose snapshot row no tenant purge can reach and no
+  actor can own.
+- The DO's HTTP surface refuses a start without a `runId`, and every route
+  asserts the request's `(workflowId, runId)` equals the identity the instance
+  was addressed with. `ctx.id.name` is populated only for `idFromName`-created
+  ids and is unforgeable at the DO boundary, so a request that disagrees with
+  it routed around the name join.
+- `DurableObjectRunner.tenantId` recovers the tenant from that same identity
+  and **throws** when it cannot. Defaulting would hand the instance an
+  unscoped grant store — a cross-tenant capability mint. The parse is safe
+  because `PATH_SAFE_ID_PATTERN` excludes `:` from `workflowId` (so the first
+  `:` is the join) and the tenant charset excludes `_` (so the first `_` in
+  the runId is the tenant boundary). It has exactly one implementation,
+  `tenantOfRunId`.
+
+Every leg also mints two opaque requestContext scopes the trusted runtime
+owns: `breakwater.workflowScope` (always) and `breakwater.isolationScope` (for
+tenant-salted run ids). breakwater never parses either.
+
+## Storage Beyond the Snapshot
+
+Run state lives in D1, which is what lets a run survive a restart. Two things
+live in the DO's own `ctx.storage`:
+
+- **The resume ledger** — the monotonic per-`(run, step)` resume ordinal that
+  the approval grant binding uses as its collision-free tie-breaker. It must be
+  durable: in-memory state dies with the isolate on idle eviction (~70–140 s),
+  hibernation, and code deploys, and a lost ordinal turns an already-approved
+  action into a silent no-op. Losing it fails closed for *grants* — never a
+  leak — but it is an availability defect, so the DO shell adopts a
+  `ctx.storage`-backed ledger automatically rather than making each host
+  remember to thread one.
+- **Alarms** — reserved. The DO captures `state` for a future alarm-chained
+  engine (`setAlarm()` + an `alarm()` handler); no alarm is scheduled today,
+  and resume is driven by the approval decision rather than by polling.
+
+## Retention and Offboarding
+
+Two purges, deliberately different:
+
+- `purgeExpiredWorkflowRuns(db, { ttlMs })` — the retention purge. Deletes only
+  TERMINAL snapshot rows older than the TTL. A suspended run is never eligible
+  at any age, because expiring one would kill a pending approval.
+- `purgeTenant(db, { tenantId, artifactStore })` — complete offboarding.
+  Deletes snapshot rows of *any* status via an INV-3 range predicate over
+  `run_id`, the tenant's approval records, and its R2 artifacts. This is the
+  only way an abandoned-at-a-gate run is ever reclaimed. It races a live
+  resume, so purge only tenants whose tokens have already expired; the resume
+  then fails against the vanished row without re-executing the workflow (pinned
+  by regression test).
 
 ## Error Handling
 

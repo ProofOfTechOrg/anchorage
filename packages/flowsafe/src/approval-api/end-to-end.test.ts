@@ -15,15 +15,18 @@ import { InMemoryStore } from '@mastra/core/storage';
 import type { ToolExecutionContext } from '@mastra/core/tools';
 import {
   ACTOR_CONTEXT_KEY,
+  type Actor,
   APPROVED_CONNECTORS_CONTEXT_KEY,
   AuditLogger,
   createConnector,
+  ISOLATION_SCOPE_CONTEXT_KEY,
   ROLES,
   WORKFLOW_SCOPE_CONTEXT_KEY,
 } from '@proofoftech/breakwater';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
+import { BREAKWATER_ISOLATION_SCOPE_KEY } from '../do-runner/breakwater-keys.js';
 import { init } from '../do-runner/init.js';
 import type {
   RunLeg,
@@ -44,14 +47,23 @@ import {
   resumeViaRuntime,
 } from './grants.js';
 import { createApprovalRouter } from './router.js';
+import { createTenantResolver } from './tenant-context.js';
 import { ApprovalService } from './service.js';
 import { InMemoryApprovalStore } from './store.js';
 
-const OPERATOR: ApprovalActor = { id: 'opal', role: 'operator' };
-const REVIEWER: ApprovalActor = { id: 'ray', role: 'reviewer' };
+const OPERATOR: ApprovalActor = {
+  id: 'opal',
+  role: 'operator',
+  tenantId: 'acme',
+};
+const REVIEWER: ApprovalActor = {
+  id: 'ray',
+  role: 'reviewer',
+  tenantId: 'acme',
+};
 // admin holds BOTH CAN_CREATE and CAN_REVIEW — the single principal the
 // create-route capability chain needed.
-const ADMIN: ApprovalActor = { id: 'ada', role: 'admin' };
+const ADMIN: ApprovalActor = { id: 'ada', role: 'admin', tenantId: 'acme' };
 
 // LEGACY-fallback timing nudge: a step-keyed record created WITHOUT
 // suspendedAt mints only when decidedAt lands STRICTLY after the
@@ -117,8 +129,30 @@ describe('breakwater contract tripwires', () => {
     expect(BREAKWATER_WORKFLOW_SCOPE_KEY).toBe(WORKFLOW_SCOPE_CONTEXT_KEY);
   });
 
+  it('mirrors the isolation-scope key literally', () => {
+    expect(BREAKWATER_ISOLATION_SCOPE_KEY).toBe(ISOLATION_SCOPE_CONTEXT_KEY);
+  });
+
   it('mirrors the role set', () => {
     expect([...APPROVAL_ROLES]).toEqual([...ROLES]);
+  });
+
+  it('mirrors breakwater Actor PLUS the platform tenant dimension', () => {
+    // breakwater stays tenant-agnostic; flowsafe is the multi-tenant host.
+    // The relationship is "breakwater's fields + a REQUIRED tenantId":
+    // ApprovalActor must stay assignable to Actor (audit adapters and the
+    // actor context key depend on the structural widening) while a
+    // tenant-less literal must not compile on flowsafe's side.
+    const flowsafeActor: ApprovalActor = {
+      id: 'x',
+      role: 'admin',
+      tenantId: 'acme',
+    };
+    const widened: Actor = flowsafeActor;
+    expect(widened).toMatchObject({ id: 'x', role: 'admin' });
+    // @ts-expect-error tenantId is required on ApprovalActor — dropping it must not compile
+    const tenantless: ApprovalActor = { id: 'x', role: 'admin' };
+    void tenantless;
   });
 
   it('pins RUN_START_ROLES to the start-capable subset', () => {
@@ -167,7 +201,7 @@ interface Harness {
 }
 
 function buildHarness(): Harness {
-  const store = new InMemoryApprovalStore();
+  const store = new InMemoryApprovalStore('acme');
   const connectorAudit = new AuditLogger();
   let publishes = 0;
 
@@ -392,7 +426,7 @@ function buildHarness(): Harness {
 describe('fail closed: the HTTP create route cannot mint a run-scoped standing grant', () => {
   const CAPABILITY_BODY = {
     workflowId: 'launch',
-    runId: 'run-poc',
+    runId: 'acme_run-poc',
     title: 'innocuous-looking request',
     connectors: ['release-deploy'],
     requestedBy: 'nobody',
@@ -412,16 +446,19 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
   ) {
     const service = new ApprovalService({ store });
     const handle = createApprovalRouter({
-      service,
+      resolve: createTenantResolver({
+        authenticate: () => options.actor ?? ADMIN,
+        storeFactory: { forTenant: () => store },
+        buildService: () => service,
+      }),
       allowCreate: options.allowCreate,
-      authenticate: () => options.actor ?? ADMIN,
     });
     return { service, handle };
   }
 
   it('barrier 1: the route is off by default, so nothing is written', async () => {
     // #given
-    const store = new InMemoryApprovalStore();
+    const store = new InMemoryApprovalStore('acme');
     const { handle } = routerOver(store);
 
     // #when — PoC step 1
@@ -434,7 +471,7 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
 
   it('barrier 1: a deliberately mounted route still rejects every capability-bearing field', async () => {
     // #given — the host opted in to the "file a request" affordance
-    const store = new InMemoryApprovalStore();
+    const store = new InMemoryApprovalStore('acme');
     const { handle } = routerOver(store, { allowCreate: true });
 
     // #when / #then — connectors IS the grant; stepPath + the binding pair
@@ -453,7 +490,7 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
       const response = await handle(
         post({
           workflowId: 'launch',
-          runId: 'run-poc',
+          runId: 'acme_run-poc',
           title: 'x',
           [field]: 'anything',
         }),
@@ -466,10 +503,10 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
   it('barrier 2: forced self-attribution makes the filer unable to decide their own request', async () => {
     // #given — the route force-sets requestedBy = the authenticated actor, so
     // the spoof that disarmed separation of duties is gone
-    const store = new InMemoryApprovalStore();
+    const store = new InMemoryApprovalStore('acme');
     const { service, handle } = routerOver(store, { allowCreate: true });
     const created = await handle(
-      post({ workflowId: 'launch', runId: 'run-poc', title: 'inert' }),
+      post({ workflowId: 'launch', runId: 'acme_run-poc', title: 'inert' }),
     );
     expect(created?.status).toBe(201);
     const record = (await created?.json()) as { id: string };
@@ -486,12 +523,13 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
     // through the router would assert an empty union against an empty list and
     // pass even with the runScoped gate reverted). This is the exact record
     // shape the PoC produced: approved, step-less, capability-bearing.
-    const store = new InMemoryApprovalStore();
+    const store = new InMemoryApprovalStore('acme');
     const decidedAt = new Date().toISOString();
     await store.create({
       id: crypto.randomUUID(),
+      tenantId: 'acme',
       workflowId: 'launch',
-      runId: 'run-poc',
+      runId: 'acme_run-poc',
       title: 'standing grant by omission',
       connectors: ['release-deploy'],
       priority: 'normal',
@@ -510,7 +548,7 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
     ];
     for (const leg of legs) {
       expect(
-        await approvedConnectorsForLeg(store, 'launch', 'run-poc', leg),
+        await approvedConnectorsForLeg(store, 'launch', 'acme_run-poc', leg),
       ).toEqual([]);
     }
   });
@@ -518,12 +556,13 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
   it('barrier 3, other direction: the same record WITH runScoped does mint (the gate is load-bearing)', async () => {
     // #given — identical to the record above but with the explicit opt-in. If
     // this did not mint, the test above would pass for the wrong reason.
-    const store = new InMemoryApprovalStore();
+    const store = new InMemoryApprovalStore('acme');
     const decidedAt = new Date().toISOString();
     await store.create({
       id: crypto.randomUUID(),
+      tenantId: 'acme',
       workflowId: 'launch',
-      runId: 'run-ok',
+      runId: 'acme_run-ok',
       title: 'deliberate standing grant',
       connectors: ['release-deploy'],
       priority: 'normal',
@@ -536,7 +575,7 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
 
     // #when / #then
     expect(
-      await approvedConnectorsForLeg(store, 'launch', 'run-ok', {
+      await approvedConnectorsForLeg(store, 'launch', 'acme_run-ok', {
         kind: 'start',
       }),
     ).toEqual(['release-deploy']);
@@ -544,10 +583,10 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
 
   it('barrier 3: an APPROVED http-authored record carries no capability to mint', async () => {
     // #given — a second party (the reviewer) approves the inert HTTP record
-    const store = new InMemoryApprovalStore();
+    const store = new InMemoryApprovalStore('acme');
     const { service, handle } = routerOver(store, { allowCreate: true });
     const created = await handle(
-      post({ workflowId: 'launch', runId: 'run-poc', title: 'inert' }),
+      post({ workflowId: 'launch', runId: 'acme_run-poc', title: 'inert' }),
     );
     const record = (await created?.json()) as { id: string };
     const decided = await service.decide(
@@ -566,13 +605,13 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
   it('contrast: the intended in-process bridge path still mints on its own leg', async () => {
     // #given — a step-keyed record created by TRUSTED in-process code, bound to
     // the leg's exact suspension. The fix tightens the HTTP boundary only.
-    const store = new InMemoryApprovalStore();
+    const store = new InMemoryApprovalStore('acme');
     const service = new ApprovalService({ store });
     const suspendedAt = Date.parse('2026-07-09T00:00:00.000Z');
     const { record } = await service.create(
       {
         workflowId: 'launch',
-        runId: 'run-ok',
+        runId: 'acme_run-ok',
         stepPath: ['approval'],
         suspendedAt,
         title: 'Approve launch',
@@ -585,14 +624,14 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
 
     // #when / #then — mints on its bound leg, and nowhere else
     expect(
-      await approvedConnectorsForLeg(store, 'launch', 'run-ok', {
+      await approvedConnectorsForLeg(store, 'launch', 'acme_run-ok', {
         kind: 'resume',
         step: ['approval'],
         suspendedAt,
       }),
     ).toEqual(['release-deploy']);
     expect(
-      await approvedConnectorsForLeg(store, 'launch', 'run-ok', {
+      await approvedConnectorsForLeg(store, 'launch', 'acme_run-ok', {
         kind: 'start',
       }),
     ).toEqual([]);
@@ -604,6 +643,7 @@ describe('approval queue end to end', () => {
     // #given — a suspended run, nothing approved in the store
     const harness = buildHarness();
     const started = await harness.runtime.start('launch', {
+      runId: `acme_${crypto.randomUUID()}`,
       inputData: { topic: 'ship-it' },
     });
     expect(started.status).toBe('suspended');
@@ -632,6 +672,7 @@ describe('approval queue end to end', () => {
     // decidedAt-after-suspension fallback (hence the settleClock below).
     const harness = buildHarness();
     const started = await harness.runtime.start('launch', {
+      runId: `acme_${crypto.randomUUID()}`,
       inputData: { topic: 'ship-it' },
     });
     expect(started.status).toBe('suspended');
@@ -675,6 +716,7 @@ describe('approval queue end to end', () => {
     // #given
     const harness = buildHarness();
     const started = await harness.runtime.start('launch', {
+      runId: `acme_${crypto.randomUUID()}`,
       inputData: { topic: 'hold-it' },
     });
     const { record } = await harness.service.create(
@@ -709,6 +751,7 @@ describe('approval queue end to end', () => {
     // suspended at gateB, whose own approval is still pending
     const harness = buildHarness();
     const started = await harness.runtime.start('double-launch', {
+      runId: `acme_${crypto.randomUUID()}`,
       inputData: { topic: 'twice-gated' },
     });
     expect(started.suspended).toEqual([['gateA']]);
@@ -753,6 +796,7 @@ describe('approval queue end to end', () => {
     // #given
     const harness = buildHarness();
     const started = await harness.runtime.start('double-launch', {
+      runId: `acme_${crypto.randomUUID()}`,
       inputData: { topic: 'twice-approved' },
     });
     const { record: recordA } = await harness.service.create(
@@ -808,6 +852,7 @@ describe('approval queue end to end', () => {
     // (or even created — the window before a bridge reacts)
     const harness = buildHarness();
     const started = await harness.runtime.start('relaunch', {
+      runId: `acme_${crypto.randomUUID()}`,
       inputData: { topic: 'respun' },
     });
     expect(started.suspended).toEqual([['gate2x']]);
@@ -869,6 +914,7 @@ describe('approval queue end to end', () => {
     try {
       const harness = buildHarness();
       const started = await harness.runtime.start('relaunch-falsy', {
+        runId: `acme_${crypto.randomUUID()}`,
         inputData: { topic: 'respun-falsy' },
       });
       // #given — suspended at the schema-less gate (first suspension:
@@ -878,6 +924,7 @@ describe('approval queue end to end', () => {
       const decidedAt = new Date().toISOString();
       await harness.store.create({
         id: crypto.randomUUID(),
+        tenantId: 'acme',
         workflowId: 'relaunch-falsy',
         runId: started.runId,
         stepPath: ['gateFalsy'],
@@ -931,6 +978,7 @@ describe('approval queue end to end', () => {
     try {
       const harness = buildHarness();
       const started = await harness.runtime.start('relaunch-hole2', {
+        runId: `acme_${crypto.randomUUID()}`,
         inputData: { topic: 'hole2' },
       });
       expect(started.suspended).toEqual([['gate2xNoSchema']]);
@@ -951,6 +999,7 @@ describe('approval queue end to end', () => {
       const decidedAt = new Date().toISOString();
       await harness.store.create({
         id: crypto.randomUUID(),
+        tenantId: 'acme',
         workflowId: 'relaunch-hole2',
         runId: started.runId,
         stepPath: ['gate2xNoSchema'],
@@ -1000,6 +1049,7 @@ describe('approval queue end to end', () => {
     // #given — round 1 approved and resumed; the step suspended again
     const harness = buildHarness();
     const started = await harness.runtime.start('relaunch', {
+      runId: `acme_${crypto.randomUUID()}`,
       inputData: { topic: 'respun-legit' },
     });
     const { record: first } = await harness.service.create(

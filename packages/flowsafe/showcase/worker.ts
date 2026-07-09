@@ -36,10 +36,15 @@
 //                                            request body.
 //   GET  /healthz                         -> liveness (unauthenticated)
 //
-// All routes except /healthz require `Authorization: Bearer <token>` mapped to
-// an actor via the APPROVAL_ACTOR_TOKENS secret. There is no baked-in token
-// map: a deploy without `wrangler secret put APPROVAL_ACTOR_TOKENS` 401s
-// everywhere (fail closed by construction). Local dev reads showcase/.dev.vars.
+// All routes except /healthz and /auth/* require `Authorization: Bearer
+// <token>`. Two verifiers feed one seam: the APPROVAL_ACTOR_TOKENS static map
+// (local dev / operators) and, when DEMO_JWT_SECRET is set, the public demo's
+// OAuth-minted HS256 JWTs (see demo-auth.ts: GET /auth/github ->
+// per-visitor ephemeral tenant + a four-role token set). Neither is baked in:
+// a deploy without secrets 401s everywhere (fail closed by construction).
+// DEMO_DISABLED=true is the kill switch — checked in the AUTH middleware, so
+// already-issued demo JWTs die with it, and at the mint/refresh routes.
+// Local dev reads showcase/.dev.vars.
 
 import type {
   D1Database,
@@ -55,10 +60,15 @@ import { AuditLogger } from '@proofoftech/breakwater';
 
 import {
   type ApprovalActor,
+  approvalGrantProvider,
   ApprovalService,
   createApprovalRouter,
-  D1ApprovalStore,
+  createTenantResolver,
+  D1ApprovalStoreFactory,
   defaultResumeData,
+  sweepSLA,
+  type TenantBoundApprovalStore,
+  type TenantResolver,
 } from '../src/approval-api/index.js';
 import {
   createAuditQueueConsumer,
@@ -67,16 +77,33 @@ import {
 import {
   DurableObjectRunner,
   purgeExpiredWorkflowRuns,
+  purgeTenant,
   type RunnerRuntime,
   type RunSummary,
+  tenantOfRunId,
 } from '../src/do-runner/index.js';
 import {
   bearerActorAuthenticator,
   createRunRouter,
   doSummary,
+  hmacVerifier,
   parseActorTokens,
   resumeRunWithRequeue,
+  RunRouteError,
+  staticTokenVerifier,
+  type TokenVerifier,
 } from '../src/host-kit/index.js';
+import {
+  consumeRunBudget,
+  createDemoAuthRouter,
+  DEMO_JWT_AUDIENCE,
+  DEMO_JWT_ISSUER,
+  DEMO_JWT_KID,
+  DemoRunLimitError,
+  githubProvider,
+  isDemoTenant,
+  purgeExpiredDemoTenants,
+} from './demo-auth.js';
 import {
   buildShowcaseRuntime,
   SHOWCASE_MODULES,
@@ -105,6 +132,24 @@ interface Env {
   APPROVAL_ACTOR_TOKENS?: string;
   /** Default SLA seconds for new approvals (var; default 14400 = 4h). */
   APPROVAL_SLA_SECONDS?: string;
+  /**
+   * Public-demo switches. DEMO_JWT_SECRET (secret) turns the OAuth demo on;
+   * GITHUB_CLIENT_ID (var) + GITHUB_CLIENT_SECRET (secret) name the OAuth
+   * app. DEMO_DISABLED=true is the kill switch (auth middleware + mint).
+   * Caps are vars so ops can tune without a deploy.
+   */
+  DEMO_JWT_SECRET?: string;
+  GITHUB_CLIENT_ID?: string;
+  GITHUB_CLIENT_SECRET?: string;
+  DEMO_DISABLED?: string;
+  /** Max runs per demo tenant lifetime (var; default 20). */
+  DEMO_TENANT_RUN_CAP?: string;
+  /** Global demo runs per UTC day — the spend backstop (var; default 500). */
+  DEMO_DAILY_RUN_CAP?: string;
+  /** Demo tenant lifetime hours (var; default 24). */
+  DEMO_TENANT_TTL_HOURS?: string;
+  /** Demo JWT lifetime seconds (var; default 3600 = 1h, silent refresh). */
+  DEMO_JWT_TTL_SECONDS?: string;
   /** Cron purges terminal run snapshots older than this (var; default 30). */
   RUN_RETENTION_DAYS?: string;
   /**
@@ -118,13 +163,27 @@ interface Env {
   SIEM_AUTH_HEADER?: string;
 }
 
-/** Identity for system-created records and the cron SLA sweep. */
-const SYSTEM_ACTOR: ApprovalActor = { id: 'flowsafe-worker', role: 'operator' };
+/** Id for system-created records; the tenant is bound per request/instance. */
+const SYSTEM_ACTOR_ID = 'flowsafe-worker';
 
-function defineWorkflows(env: Env): RunnerRuntime {
+/**
+ * Attribution identity for the cron SLA sweep (audit only — the sweep is TCB
+ * code over the system store; per-record tenants ride in the audit detail).
+ */
+const MAINTENANCE_ACTOR: ApprovalActor = {
+  id: SYSTEM_ACTOR_ID,
+  role: 'operator',
+  tenantId: 'system',
+};
+
+function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
   return buildShowcaseRuntime({
     initInput: env,
-    approvalStore: new D1ApprovalStore(env.DB),
+    // The DO topology binds the grant store to THIS instance's tenant,
+    // recovered from the DO's own idFromName identity (INV-1 -> INV-2).
+    grantProvider: approvalGrantProvider(
+      approvalStoreFactory(env.DB).forTenant(tenantId),
+    ),
     email: env.EMAIL,
     fromAddress: env.OUTREACH_FROM_ADDRESS,
     fromName: env.OUTREACH_FROM_NAME,
@@ -141,7 +200,7 @@ function defineWorkflows(env: Env): RunnerRuntime {
 
 export class ShowcaseRunner extends DurableObjectRunner<Env> {
   protected build(env: Env): RunnerRuntime {
-    return defineWorkflows(env);
+    return defineWorkflows(env, this.tenantId);
   }
 }
 
@@ -178,6 +237,76 @@ function numberVar(
   return value;
 }
 
+/**
+ * The composed verifier: the static operator map, plus (when configured) the
+ * demo's HS256 JWTs. DEMO_DISABLED kills the JWT path entirely — issued
+ * tokens stop verifying, not just new mints.
+ */
+export function buildVerifier(env: Env): TokenVerifier {
+  const staticVerifier = staticTokenVerifier(
+    parseActorTokens(env.APPROVAL_ACTOR_TOKENS),
+  );
+  const secret = env.DEMO_JWT_SECRET;
+  if (!secret || env.DEMO_DISABLED === 'true') return staticVerifier;
+  const demoVerifier = hmacVerifier({
+    keys: new Map([[DEMO_JWT_KID, secret]]),
+    issuer: DEMO_JWT_ISSUER,
+    audience: DEMO_JWT_AUDIENCE,
+  });
+  return {
+    async verify(token) {
+      return (
+        (await staticVerifier.verify(token)) ??
+        (await demoVerifier.verify(token))
+      );
+    },
+  };
+}
+
+// One factory per isolate, not per request: it owns the memoized schema-init
+// promise, so rebuilding it inside fetch() would re-run the whole DDL pass
+// (CREATE TABLE + DROP/CREATE indexes + PRAGMA + ALTERs) on every request.
+// Keyed by the D1 binding, which is stable for an isolate's lifetime.
+const approvalFactories = new WeakMap<D1Database, D1ApprovalStoreFactory>();
+
+function approvalStoreFactory(db: D1Database): D1ApprovalStoreFactory {
+  let factory = approvalFactories.get(db);
+  if (!factory) {
+    factory = new D1ApprovalStoreFactory(db);
+    approvalFactories.set(db, factory);
+  }
+  return factory;
+}
+
+/** Demo sandboxes pay for runs from two atomic budgets; others start freely. */
+async function chargeDemoBudget(env: Env, runId: string): Promise<void> {
+  const tenantId = tenantOfRunId(runId);
+  // Demo-ness is read from `tenants.kind` (the allocation authority), never
+  // guessed from the slug: a commercial tenant slugged 'dmart' would be
+  // charged against a demo_tenants row that does not exist and 429 forever,
+  // and a change to the demo slug scheme would silently stop budgeting the
+  // traffic the ceiling exists to bound.
+  if (tenantId === undefined || !(await isDemoTenant(env.DB, tenantId))) {
+    return;
+  }
+  try {
+    await consumeRunBudget(env.DB, {
+      tenantId,
+      tenantRunCap: numberVar(
+        env.DEMO_TENANT_RUN_CAP,
+        20,
+        'DEMO_TENANT_RUN_CAP',
+      ),
+      dailyRunCap: numberVar(env.DEMO_DAILY_RUN_CAP, 500, 'DEMO_DAILY_RUN_CAP'),
+    });
+  } catch (error) {
+    if (error instanceof DemoRunLimitError) {
+      throw new RunRouteError(429, error.message);
+    }
+    throw error;
+  }
+}
+
 // The auth seam (parseActorTokens + bearerActorAuthenticator), the run routes
 // with their RBAC gate order, and the DO-response reader (doSummary) live in
 // src/host-kit, shared with the reference deploy template and the dev backend
@@ -186,24 +315,23 @@ function numberVar(
 // tested home. This host supplies only its topology: every run leg travels
 // through the run's DO stub.
 
-function runRouterFor(
-  env: Env,
-  approvalService: ApprovalService,
-  authenticate: (request: Request) => ApprovalActor | undefined,
-) {
+function runRouterFor(env: Env, resolve: TenantResolver) {
   return createRunRouter({
     workflows: SHOWCASE_MODULES.map((entry) => entry.meta),
-    service: approvalService,
-    systemActor: SYSTEM_ACTOR,
-    authenticate,
-    start: async (workflowId, runId, inputData) =>
-      doSummary(
+    resolve,
+    systemActorId: SYSTEM_ACTOR_ID,
+    start: async (workflowId, runId, inputData) => {
+      // Budget BEFORE the DO round-trip: a capped tenant must not consume DO
+      // CPU. Charged only on starts (a suspend/resume cycle is one run).
+      await chargeDemoBudget(env, runId);
+      return doSummary(
         await runStub(env, workflowId, runId).fetch('http://do/runs', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ workflowId, runId, inputData }),
         }),
-      ),
+      );
+    },
     // The DO answers 404 for a run it has never seen; the router turns the
     // undefined into its own 404 rather than leaking the DO's body.
     status: async (workflowId, runId) => {
@@ -233,13 +361,18 @@ function runRouterFor(
 // later gate, the next approval is queued right here, so multi-gate workflows
 // keep flowing through the queue.
 function buildApprovalService(
+  store: TenantBoundApprovalStore,
   env: Env,
   waitUntil?: (promise: Promise<unknown>) => void,
 ): ApprovalService {
-  const store = new D1ApprovalStore(env.DB);
   const queueSink = env.AUDIT_QUEUE
     ? queueAuditSink(env.AUDIT_QUEUE)
     : undefined;
+  const systemActor: ApprovalActor = {
+    id: SYSTEM_ACTOR_ID,
+    role: 'operator',
+    tenantId: store.tenantId,
+  };
   const service: ApprovalService = new ApprovalService({
     store,
     defaultSlaSeconds: numberVar(
@@ -291,26 +424,63 @@ function buildApprovalService(
           ),
         ),
       () => service,
-      SYSTEM_ACTOR,
+      systemActor,
     ),
   });
   return service;
 }
 
 /**
- * Cron owns both enforcement surfaces: sweepSLA() (SLA breaches escalate) and
- * purgeExpiredWorkflowRuns() (terminal snapshots are reclaimed). Each is
- * isolated so one failing never masks the other; counts go to structured logs.
+ * Maintenance runs on TWO cron expressions, dispatched on controller.cron so
+ * the SLA sweep and the purge NEVER share an invocation: a Workers CPU-limit
+ * termination kills the isolate and is NOT a catchable JS error, so a slow
+ * sweep sharing an invocation would permanently starve the purge (and vice
+ * versa) no matter how many try/catches wrap them. Keep these literals equal
+ * to wrangler.jsonc's `triggers.crons`.
  */
-async function runMaintenance(env: Env, cron: string): Promise<void> {
+export const SWEEP_CRON = '*/15 * * * *';
+export const PURGE_CRON = '7 * * * *';
+
+async function runSweepMaintenance(env: Env, cron: string): Promise<void> {
   let escalated: number | undefined;
-  let purged: number | undefined;
   const pendingSends: Promise<unknown>[] = [];
   try {
-    const service = buildApprovalService(env, (send) =>
-      pendingSends.push(send),
-    );
-    escalated = (await service.sweepSLA(SYSTEM_ACTOR)).length;
+    // Cron-owned TCB sweep over the SYSTEM store: the ONLY legitimate
+    // cross-tenant read+write, and it is not reachable over HTTP.
+    const queueSink = env.AUDIT_QUEUE
+      ? queueAuditSink(env.AUDIT_QUEUE)
+      : undefined;
+    escalated = (
+      await sweepSLA(approvalStoreFactory(env.DB).system(), {
+        systemActor: MAINTENANCE_ACTOR,
+        audit: (event) => {
+          console.log(JSON.stringify({ type: 'audit', ...event }));
+          if (queueSink) {
+            pendingSends.push(
+              queueSink(event).catch((error: unknown) =>
+                console.error(
+                  JSON.stringify({
+                    type: 'audit-queue-error',
+                    reason: String(error),
+                  }),
+                ),
+              ),
+            );
+          }
+        },
+        onEscalation: (record) =>
+          console.log(
+            JSON.stringify({
+              type: 'sla-escalation',
+              id: record.id,
+              tenantId: record.tenantId,
+              workflowId: record.workflowId,
+              runId: record.runId,
+              slaDeadlineAt: record.slaDeadlineAt,
+            }),
+          ),
+      })
+    ).length;
   } catch (error) {
     console.error(
       JSON.stringify({
@@ -321,6 +491,13 @@ async function runMaintenance(env: Env, cron: string): Promise<void> {
       }),
     );
   }
+  await Promise.all(pendingSends);
+  console.log(JSON.stringify({ type: 'maintenance', cron, escalated }));
+}
+
+async function runPurgeMaintenance(env: Env, cron: string): Promise<void> {
+  let purged: number | undefined;
+  let demoTenantsPurged: string[] | undefined;
   try {
     purged = await purgeExpiredWorkflowRuns(env.DB, {
       ttlMs:
@@ -340,8 +517,36 @@ async function runMaintenance(env: Env, cron: string): Promise<void> {
       }),
     );
   }
-  await Promise.all(pendingSends);
-  console.log(JSON.stringify({ type: 'maintenance', cron, escalated, purged }));
+  try {
+    // Expired demo sandboxes: complete offboarding per tenant (snapshots of
+    // ANY status — a visitor who closed the tab mid-approval left a
+    // suspended row the terminal-only retention purge can never reap — plus
+    // approvals). No R2 artifactStore here: the showcase's artifact bucket
+    // is in-memory. LIMIT-batched; the shrinking table is the durable cursor.
+    demoTenantsPurged = await purgeExpiredDemoTenants(env.DB, {
+      purgeTenantData: (tenantId) => purgeTenant(env.DB, { tenantId }),
+      // Wait out the JWT lifetime past expires_at: a refresh at the last live
+      // instant mints a token good until ~expires_at + jwtTtl, and purgeTenant
+      // deletes suspended rows. Without the grace, a visitor's still-valid
+      // token would find its own runs gone.
+      graceMs:
+        numberVar(env.DEMO_JWT_TTL_SECONDS, 3600, 'DEMO_JWT_TTL_SECONDS') *
+        1000,
+      limit: 25,
+    });
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        type: 'maintenance-error',
+        surface: 'demo-tenant-purge',
+        cron,
+        error: String(error),
+      }),
+    );
+  }
+  console.log(
+    JSON.stringify({ type: 'maintenance', cron, purged, demoTenantsPurged }),
+  );
 }
 
 const handler: ExportedHandler<Env> = {
@@ -357,25 +562,47 @@ const handler: ExportedHandler<Env> = {
     }
 
     const waitUntil = (promise: Promise<unknown>) => ctx.waitUntil(promise);
-    const approvalService = buildApprovalService(env, waitUntil);
-    // Parsed once per request rather than once per authenticate() call — this
-    // handler authenticates in both routers.
-    const authenticate = bearerActorAuthenticator(
-      parseActorTokens(env.APPROVAL_ACTOR_TOKENS),
-    );
-
     const routed = request as unknown as Request;
-    const approvalResponse = await createApprovalRouter({
-      service: approvalService,
-      authenticate,
-    })(routed);
+
+    // Public demo sign-in (no auth — it MINTS identity). Mounted only when
+    // configured; the kill switch 503s it.
+    if (env.DEMO_JWT_SECRET && env.GITHUB_CLIENT_ID) {
+      const authResponse = await createDemoAuthRouter({
+        db: env.DB,
+        provider: githubProvider({
+          clientId: env.GITHUB_CLIENT_ID,
+          clientSecret: env.GITHUB_CLIENT_SECRET ?? '',
+        }),
+        secret: env.DEMO_JWT_SECRET,
+        jwtTtlSeconds: numberVar(
+          env.DEMO_JWT_TTL_SECONDS,
+          3600,
+          'DEMO_JWT_TTL_SECONDS',
+        ),
+        tenantTtlMs:
+          numberVar(env.DEMO_TENANT_TTL_HOURS, 24, 'DEMO_TENANT_TTL_HOURS') *
+          60 *
+          60 *
+          1000,
+        purgeTenantData: (tenantId) => purgeTenant(env.DB, { tenantId }),
+        disabled: env.DEMO_DISABLED === 'true',
+      })(routed);
+      if (authResponse) return authResponse;
+    }
+
+    // AUTHENTICATE FIRST, then construct (INV-2): the resolver binds the
+    // approval store to the verified actor's tenant before any service
+    // exists — there is no pre-auth store for a rushed fix to reach.
+    const resolve = createTenantResolver({
+      authenticate: bearerActorAuthenticator(buildVerifier(env)),
+      storeFactory: approvalStoreFactory(env.DB),
+      buildService: (store) => buildApprovalService(store, env, waitUntil),
+    });
+
+    const approvalResponse = await createApprovalRouter({ resolve })(routed);
     if (approvalResponse) return approvalResponse;
 
-    const runResponse = await runRouterFor(
-      env,
-      approvalService,
-      authenticate,
-    )(routed);
+    const runResponse = await runRouterFor(env, resolve)(routed);
     if (runResponse) return runResponse;
 
     return json({ error: 'not found' }, 404);
@@ -386,7 +613,28 @@ const handler: ExportedHandler<Env> = {
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
-    ctx.waitUntil(runMaintenance(env, controller.cron));
+    // Dispatch on WHICH cron fired; an unrecognized expression (ops edited
+    // wrangler without updating the constants) runs both sequentially and
+    // logs — availability of both duties beats purity on a misconfig.
+    if (controller.cron === SWEEP_CRON) {
+      ctx.waitUntil(runSweepMaintenance(env, controller.cron));
+    } else if (controller.cron === PURGE_CRON) {
+      ctx.waitUntil(runPurgeMaintenance(env, controller.cron));
+    } else {
+      console.error(
+        JSON.stringify({
+          type: 'config-error',
+          var: 'triggers.crons',
+          raw: controller.cron,
+          reason: 'unknown cron expression — running both maintenance surfaces',
+        }),
+      );
+      ctx.waitUntil(
+        runSweepMaintenance(env, controller.cron).then(() =>
+          runPurgeMaintenance(env, controller.cron),
+        ),
+      );
+    }
   },
 
   // Audit-export consumer (active only when the wrangler.jsonc `queues` block is

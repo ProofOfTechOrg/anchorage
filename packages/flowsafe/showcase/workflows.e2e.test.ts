@@ -12,8 +12,11 @@ import { describe, expect, it } from 'vitest';
 
 import {
   type ApprovalActor,
+  approvalGrantProviderFromFactory,
   ApprovalService,
-  InMemoryApprovalStore,
+  createTenantResolver,
+  type InMemoryApprovalStore,
+  InMemoryApprovalStoreFactory,
   resumeViaRuntime,
 } from '../src/approval-api/index.js';
 import { InMemoryArtifactBucket } from '../src/artifacts/index.js';
@@ -29,17 +32,28 @@ import { PUBLISH_CONNECTOR } from './workflows/content-pipeline.js';
 import { CRM_ASSIGN_CONNECTOR } from './workflows/lead-generation.js';
 import { DEPLOY_CONNECTOR } from './workflows/product-launch.js';
 
-const SYSTEM: ApprovalActor = { id: 'sys', role: 'operator' };
-const REVIEWER: ApprovalActor = { id: 'ray', role: 'reviewer' };
-const REVIEWER2: ApprovalActor = { id: 'rhea', role: 'reviewer' };
+const SYSTEM: ApprovalActor = { id: 'sys', role: 'operator', tenantId: 'demo' };
+const REVIEWER: ApprovalActor = {
+  id: 'ray',
+  role: 'reviewer',
+  tenantId: 'demo',
+};
+const REVIEWER2: ApprovalActor = {
+  id: 'rhea',
+  role: 'reviewer',
+  tenantId: 'demo',
+};
 
 function buildHarness() {
   const bucket = new InMemoryArtifactBucket();
-  const store = new InMemoryApprovalStore();
+  // ONE shared backend: the run router binds per request tenant, while the
+  // in-process grant provider recovers each leg's tenant from its runId.
+  const storeFactory = new InMemoryApprovalStoreFactory();
+  const store = storeFactory.forTenant('demo') as InMemoryApprovalStore;
   const audit = new AuditLogger();
   const runtime = buildShowcaseRuntime({
     initInput: { storage: new InMemoryStore() },
-    approvalStore: store,
+    grantProvider: approvalGrantProviderFromFactory(storeFactory),
     audit,
     artifactBucket: bucket,
     // crm/deploy egress left unset => those connectors simulate
@@ -54,7 +68,7 @@ function buildHarness() {
       SYSTEM,
     ),
   });
-  return { runtime, service, store, audit, bucket };
+  return { runtime, service, store, storeFactory, audit, bucket };
 }
 
 /** Queue the approval bound to a run's current suspension, then decide it. */
@@ -79,6 +93,7 @@ describe('content-pipeline: parallel fan-in, gate, idempotent R2 publish', () =>
   it('approve mints the grant, the parallel article is assembled and written to R2', async () => {
     const harness = buildHarness();
     const started = await harness.runtime.start('content-pipeline', {
+      runId: `demo_${crypto.randomUUID()}`,
       inputData: { topic: 'durable workflows' },
     });
     // #then — the gate suspends AFTER the parallel fan-in, as a bare id
@@ -112,6 +127,7 @@ describe('content-pipeline: parallel fan-in, gate, idempotent R2 publish', () =>
     // replayed as run 1's write (the debugger's HIGH-impact finding).
     const harness = buildHarness();
     const run1 = await harness.runtime.start('content-pipeline', {
+      runId: `demo_${crypto.randomUUID()}`,
       inputData: { topic: 'durable workflows' },
     });
     const d1 = await decideCurrent(harness, 'content-pipeline', run1, REVIEWER);
@@ -119,6 +135,7 @@ describe('content-pipeline: parallel fan-in, gate, idempotent R2 publish', () =>
       .key;
 
     const run2 = await harness.runtime.start('content-pipeline', {
+      runId: `demo_${crypto.randomUUID()}`,
       inputData: { topic: 'durable workflows' },
     });
     const d2 = await decideCurrent(harness, 'content-pipeline', run2, REVIEWER);
@@ -137,6 +154,7 @@ describe('content-pipeline: parallel fan-in, gate, idempotent R2 publish', () =>
   it('fails closed: a forged resume finds no grant and never publishes', async () => {
     const harness = buildHarness();
     const started = await harness.runtime.start('content-pipeline', {
+      runId: `demo_${crypto.randomUUID()}`,
       inputData: { topic: 'durable workflows' },
     });
     const forged = await harness.runtime.resume(
@@ -165,6 +183,7 @@ describe('lead-generation: branch routing then gated CRM assign', () => {
   it('routes hot and cold, gates on the hot count, assigns on approve', async () => {
     const harness = buildHarness();
     const started = await harness.runtime.start('lead-generation', {
+      runId: `demo_${crypto.randomUUID()}`,
       inputData: {
         leads: [
           {
@@ -206,6 +225,7 @@ describe('lead-generation: branch routing then gated CRM assign', () => {
     // #given — no hot leads: nothing to assign
     const harness = buildHarness();
     const started = await harness.runtime.start('lead-generation', {
+      runId: `demo_${crypto.randomUUID()}`,
       inputData: {
         leads: [
           {
@@ -233,6 +253,7 @@ describe('product-launch: two approval gates re-queued through host-kit', () => 
   it('clears both gates (SoD across gates) and completes, with a dry-run pre-flight', async () => {
     const harness = buildHarness();
     const started = await harness.runtime.start('product-launch', {
+      runId: `demo_${crypto.randomUUID()}`,
       inputData: { productName: 'anchorage', version: '1.0.0' },
     });
     expect(started.suspended).toEqual([['approveLaunch']]);
@@ -280,6 +301,7 @@ describe('product-launch: two approval gates re-queued through host-kit', () => 
     // #given — the run suspends at gate 1 (deploy approval)
     const harness = buildHarness();
     const started = await harness.runtime.start('product-launch', {
+      runId: `demo_${crypto.randomUUID()}`,
       inputData: { productName: 'anchorage', version: '1.0.0' },
     });
     expect(started.suspended).toEqual([['approveLaunch']]);
@@ -319,6 +341,7 @@ describe('access-request: gated grant with cross-workflow isolation', () => {
   it('grants access on approve', async () => {
     const harness = buildHarness();
     const started = await harness.runtime.start('access-request', {
+      runId: `demo_${crypto.randomUUID()}`,
       inputData: {
         resource: 'prod-database',
         role: 'reader',
@@ -349,6 +372,7 @@ describe('access-request: gated grant with cross-workflow isolation', () => {
   it('cross-workflow isolation denies a request scoped to another workflow', async () => {
     const harness = buildHarness();
     const started = await harness.runtime.start('access-request', {
+      runId: `demo_${crypto.randomUUID()}`,
       inputData: {
         resource: 'prod-database',
         role: 'reader',
@@ -386,9 +410,20 @@ describe('showcase run routes', () => {
   ) {
     return createRunRouter({
       workflows: SHOWCASE_MODULES.map((entry) => entry.meta),
-      service: harness.service,
-      systemActor: SYSTEM,
-      authenticate: () => actor,
+      resolve: createTenantResolver({
+        authenticate: () => actor,
+        storeFactory: harness.storeFactory,
+        buildService: (store) =>
+          new ApprovalService({
+            store,
+            resumeRun: resumeRunWithRequeue(
+              resumeViaRuntime(harness.runtime),
+              () => harness.service,
+              SYSTEM,
+            ),
+          }),
+      }),
+      systemActorId: SYSTEM.id,
       start: (workflowId, runId, inputData) =>
         harness.runtime.start(workflowId, { runId, inputData }),
       status: async (workflowId, runId) =>
@@ -421,7 +456,11 @@ describe('showcase run routes', () => {
   it('serves all five workflow metas at GET /workflows', async () => {
     // #given
     const harness = buildHarness();
-    const handle = routerFor(harness, { id: 'vic', role: 'viewer' });
+    const handle = routerFor(harness, {
+      id: 'vic',
+      role: 'viewer',
+      tenantId: 'demo',
+    });
 
     // #when
     const response = await handle(
@@ -446,7 +485,11 @@ describe('showcase run routes', () => {
     // #given — the operator clears the coarse start gate; the module's own
     // allowedRoles is the finer one
     const harness = buildHarness();
-    const handle = routerFor(harness, { id: 'opal', role: 'operator' });
+    const handle = routerFor(harness, {
+      id: 'opal',
+      role: 'operator',
+      tenantId: 'demo',
+    });
 
     // #when
     const response = await handle(startRequest('access-request', ACCESS_INPUT));
@@ -459,7 +502,11 @@ describe('showcase run routes', () => {
   it('lets a builder start access-request, queuing an approval attributed to them', async () => {
     // #given
     const harness = buildHarness();
-    const handle = routerFor(harness, { id: 'bo', role: 'builder' });
+    const handle = routerFor(harness, {
+      id: 'bo',
+      role: 'builder',
+      tenantId: 'demo',
+    });
 
     // #when
     const response = await handle(startRequest('access-request', ACCESS_INPUT));
@@ -479,5 +526,59 @@ describe('showcase run routes', () => {
 
     // #when / #then
     expect((await handle(startRequest('gtm-outbound', {})))?.status).toBe(403);
+  });
+
+  it('two tenants starting the same workflow get disjoint tenant-salted runs; neither can read the other (INV-1)', async () => {
+    // #given — one shared runtime + store (worst case: everything colocated),
+    // two tenants
+    const harness = buildHarness();
+    const alfa = routerFor(harness, {
+      id: 'a1',
+      role: 'operator',
+      tenantId: 'alfa',
+    });
+    const bravo = routerFor(harness, {
+      id: 'b1',
+      role: 'operator',
+      tenantId: 'bravo',
+    });
+    const input = { industry: 'fintech', targetCount: 2 };
+
+    // #when — both start gtm-outbound
+    const startedA = (await (
+      await alfa(startRequest('gtm-outbound', input))
+    )?.json()) as { runId: string };
+    const startedB = (await (
+      await bravo(startRequest('gtm-outbound', input))
+    )?.json()) as { runId: string };
+
+    // #then — each runId carries its tenant, so the DO name join
+    // (`${workflowId}:${runId}`) and the snapshot key (workflow_name, run_id)
+    // are tenant-disjoint BY CONSTRUCTION, with no schema change
+    expect(startedA.runId.startsWith('alfa_')).toBe(true);
+    expect(startedB.runId.startsWith('bravo_')).toBe(true);
+    expect(startedA.runId).not.toBe(startedB.runId);
+
+    // #then — each tenant reads its own run; the other tenant's probe 404s
+    // on status AND resume (no existence oracle)
+    expect(
+      (await alfa(new Request(`http://x/runs/gtm-outbound/${startedA.runId}`)))
+        ?.status,
+    ).toBe(200);
+    expect(
+      (await bravo(new Request(`http://x/runs/gtm-outbound/${startedA.runId}`)))
+        ?.status,
+    ).toBe(404);
+    expect(
+      (
+        await bravo(
+          new Request(`http://x/runs/gtm-outbound/${startedA.runId}/resume`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({}),
+          }),
+        )
+      )?.status,
+    ).toBe(404);
   });
 });

@@ -22,8 +22,9 @@
 
 import {
   type ApprovalActor,
-  type ApprovalService,
   RUN_START_ROLES,
+  TenantResolutionError,
+  type TenantResolver,
 } from '../approval-api/index.js';
 import {
   InvalidRunRequestError,
@@ -49,17 +50,20 @@ export interface RunRouterOptions {
    * committed is asserted at registration (see buildShowcaseRuntime).
    */
   workflows: ReadonlyArray<WorkflowMeta>;
-  service: ApprovalService;
-  /** Creator identity for bridge-queued approval records (needs a create-capable role). */
-  systemActor: ApprovalActor;
   /**
-   * Maps the request to the acting principal. Part of the trusted computing
-   * base (it asserts identity; RUN_START_ROLES and meta.allowedRoles enforce
-   * authorization). Returning undefined yields 401.
+   * Authenticates the request and binds the tenant scope (INV-2): the
+   * approval service, the runId mint, and the ownership predicate all come
+   * from the resolved TenantContext. undefined yields 401.
    */
-  authenticate: (
-    request: Request,
-  ) => ApprovalActor | undefined | Promise<ApprovalActor | undefined>;
+  resolve: TenantResolver;
+  /**
+   * Creator identity for bridge-queued approval records. Only the id is
+   * configurable — the role is 'operator' (create-capable) and the tenant is
+   * ALWAYS the request's resolved tenant, so the record lands in the same
+   * tenant as the run it gates. Must differ from human actor ids or the
+   * separation-of-duties check can never fire. Default: 'flowsafe-system'.
+   */
+  systemActorId?: string;
   /** Host topology: in-process runtime, or a DO stub fetch. */
   start: (
     workflowId: string,
@@ -75,8 +79,6 @@ export interface RunRouterOptions {
     runId: string,
     body: unknown,
   ) => Promise<RunSummary>;
-  /** Default: crypto.randomUUID. Injected in tests for deterministic run ids. */
-  newRunId?: () => string;
 }
 
 export type RunRouter = (request: Request) => Promise<Response | null>;
@@ -103,6 +105,11 @@ function json(payload: unknown, status = 200): Response {
 function errorResponse(error: unknown): Response {
   if (error instanceof RunRouteError) {
     return json({ error: error.message }, error.status);
+  }
+  if (error instanceof TenantResolutionError) {
+    // Authenticated but with a malformed tenant claim — a verifier bug,
+    // surfaced as forbidden rather than a retryable 500.
+    return json({ error: 'forbidden' }, 403);
   }
   if (
     error instanceof UnknownWorkflowError ||
@@ -134,8 +141,8 @@ async function readJson(request: Request): Promise<unknown> {
 }
 
 export function createRunRouter(options: RunRouterOptions): RunRouter {
-  const { workflows, service, systemActor, authenticate } = options;
-  const newRunId = options.newRunId ?? (() => crypto.randomUUID());
+  const { workflows, resolve } = options;
+  const systemActorId = options.systemActorId ?? 'flowsafe-system';
 
   function metaFor(workflowId: string): WorkflowMeta | undefined {
     return workflows.find((candidate) => candidate.id === workflowId);
@@ -147,8 +154,12 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
     if (url.pathname !== '/workflows' && segments[0] !== 'runs') return null;
 
     try {
-      const actor = await authenticate(request);
-      if (!actor) return json({ error: 'authentication required' }, 401);
+      // Resolution is authentication + INV-3 validation + tenant binding in
+      // one step (tenant-context.ts): a malformed tenant claim throws (403
+      // below), never concatenates into a runId or an ownership prefix.
+      const tenant = await resolve(request);
+      if (!tenant) return json({ error: 'authentication required' }, 401);
+      const actor = tenant.actor;
 
       // Coarse gate: reviewers and viewers may inspect runs, never advance
       // them. Applied before any route so a new POST route cannot forget it.
@@ -157,7 +168,14 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
       }
 
       if (request.method === 'GET' && url.pathname === '/workflows') {
-        return json({ workflows });
+        // The catalog echoes the AUTHENTICATED identity so the SPA renders
+        // role gates from the server's view of the actor — a client that
+        // guesses its own role from a local token table is fail-open (an
+        // unknown token must not default to admin).
+        return json({
+          workflows,
+          actor: { id: actor.id, role: actor.role, tenantId: actor.tenantId },
+        });
       }
       if (segments[0] !== 'runs') return json({ error: 'not found' }, 404);
 
@@ -167,6 +185,11 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
         const body = (await readJson(request)) as StartBody | null;
         if (!body || typeof body.workflowId !== 'string') {
           return json({ error: 'workflowId is required' }, 400);
+        }
+        // INV-1: the runId IS the tenant carrier; a client may never choose
+        // it. 400 (not silent override) so a caller pinning ids finds out.
+        if (body.runId !== undefined) {
+          return json({ error: 'runId is server-assigned' }, 400);
         }
         const meta = metaFor(body.workflowId);
         if (!meta) {
@@ -183,16 +206,21 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
             403,
           );
         }
-        // The router mints the runId (unless the caller pinned one) and hands
-        // it to the host, so a DO-routing host has its instance key up front.
+        // The router mints the tenant-salted runId and hands it to the host,
+        // so a DO-routing host has its instance key up front.
         const summary = await options.start(
           body.workflowId,
-          body.runId ?? newRunId(),
+          tenant.newRunId(),
           body.inputData,
         );
         if (summary.status !== 'suspended') return json(summary);
+        const systemActor: ApprovalActor = {
+          id: systemActorId,
+          role: 'operator',
+          tenantId: tenant.tenantId,
+        };
         const record = await queueApprovalForSuspension(
-          service,
+          tenant.service(),
           body.workflowId,
           summary,
           actor.id,
@@ -206,6 +234,18 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
       // for workflow ids this host never registered.
       if (workflowId && runId && !metaFor(workflowId)) {
         return json({ error: `unknown workflow '${workflowId}'` }, 404);
+      }
+
+      // Ownership: attribution is not authorization. A run belongs to the
+      // tenant its runId carries; any other tenant gets 404 — not 403, so the
+      // route is not an existence oracle for other tenants' runIds.
+      if (
+        workflowId &&
+        runId &&
+        segments.length >= 3 &&
+        !tenant.ownsRun(runId)
+      ) {
+        return json({ error: 'run not found' }, 404);
       }
 
       if (

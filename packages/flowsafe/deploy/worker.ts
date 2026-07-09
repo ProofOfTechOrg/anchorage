@@ -55,10 +55,14 @@ import {
   type ApprovalActor,
   ApprovalService,
   approvalGrantProvider,
+  createTenantResolver,
   BREAKWATER_APPROVED_CONNECTORS_KEY,
   createApprovalRouter,
-  D1ApprovalStore,
+  D1ApprovalStoreFactory,
   defaultResumeData,
+  sweepSLA,
+  type TenantBoundApprovalStore,
+  type TenantResolver,
 } from '@proofoftech/flowsafe/approval-api';
 import {
   createAuditQueueConsumer,
@@ -78,6 +82,8 @@ import {
   doSummary,
   parseActorTokens,
   resumeRunWithRequeue,
+  staticTokenVerifier,
+  withSubdomainCrossCheck,
   type WorkflowMeta,
 } from '@proofoftech/flowsafe/host-kit';
 
@@ -106,10 +112,28 @@ interface Env {
   AUDIT_QUEUE?: Queue;
   SIEM_ENDPOINT?: string;
   SIEM_AUTH_HEADER?: string;
+  /**
+   * Client-per-subdomain apex, e.g. 'example.com' (var). When set, a request
+   * to <tenant>.<apex> is denied unless the token's verified tenant IS that
+   * tenant — defense in depth over INV-2, closing the pasted-token
+   * confused-deputy UX (reserved infra subdomains and hosts outside the apex
+   * skip the check). Unset => no cross-check (single-host deployments).
+   */
+  TENANT_APEX_DOMAIN?: string;
 }
 
-/** Identity for system-created records and the cron SLA sweep. */
-const SYSTEM_ACTOR: ApprovalActor = { id: 'flowsafe-worker', role: 'operator' };
+/** Id for system-created records; the tenant is bound per request/instance. */
+const SYSTEM_ACTOR_ID = 'flowsafe-worker';
+
+/**
+ * Attribution identity for the cron SLA sweep (audit only — the sweep is TCB
+ * code over the system store; per-record tenants ride in the audit detail).
+ */
+const MAINTENANCE_ACTOR: ApprovalActor = {
+  id: SYSTEM_ACTOR_ID,
+  role: 'operator',
+  tenantId: 'system',
+};
 
 /** The connector the example publish step demands a grant for. */
 const EXAMPLE_CONNECTOR = 'example-publisher';
@@ -130,8 +154,25 @@ const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
   },
 ];
 
-function defineWorkflows(env: Env): RunnerRuntime {
-  const approvals = new D1ApprovalStore(env.DB);
+// One factory per isolate, not per request: it owns the memoized schema-init
+// promise, so rebuilding it inside fetch() would re-run the whole DDL pass on
+// every request. Keyed by the D1 binding, stable for an isolate's lifetime.
+const approvalFactories = new WeakMap<D1Database, D1ApprovalStoreFactory>();
+
+function approvalStoreFactory(db: D1Database): D1ApprovalStoreFactory {
+  let factory = approvalFactories.get(db);
+  if (!factory) {
+    factory = new D1ApprovalStoreFactory(db);
+    approvalFactories.set(db, factory);
+  }
+  return factory;
+}
+
+function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
+  // Bound to THIS DO instance's tenant, recovered from its idFromName
+  // identity (INV-1 -> INV-2): the grant mint can only ever read the runs'
+  // own tenant, even though the runId predicate already scopes it.
+  const approvals = approvalStoreFactory(env.DB).forTenant(tenantId);
   const { createWorkflow, createStep, runtime } = init(env, {
     // The grant-minting seam: on every start/resume the runtime derives the
     // breakwater grant key from APPROVED records in D1 — decisions become
@@ -234,7 +275,7 @@ function defineWorkflows(env: Env): RunnerRuntime {
 
 export class FlowsafeRunner extends DurableObjectRunner<Env> {
   protected build(env: Env): RunnerRuntime {
-    return defineWorkflows(env);
+    return defineWorkflows(env, this.tenantId);
   }
 }
 
@@ -280,16 +321,11 @@ function numberVar(
 // only the `authenticate` seam.
 
 /** The run surface: shared routes + this deployment's DO-stub topology. */
-function runRouterFor(
-  env: Env,
-  approvalService: ApprovalService,
-  authenticate: (request: Request) => ApprovalActor | undefined,
-) {
+function runRouterFor(env: Env, resolve: TenantResolver) {
   return createRunRouter({
     workflows: WORKFLOWS,
-    service: approvalService,
-    systemActor: SYSTEM_ACTOR,
-    authenticate,
+    resolve,
+    systemActorId: SYSTEM_ACTOR_ID,
     start: async (workflowId, runId, inputData) =>
       doSummary(
         await runStub(env, workflowId, runId).fetch('http://do/runs', {
@@ -328,13 +364,18 @@ function runRouterFor(
 // waitUntil keeps queue sends alive past the invocation (ctx.waitUntil in
 // fetch; the maintenance runner collects and awaits them itself).
 function buildApprovalService(
+  store: TenantBoundApprovalStore,
   env: Env,
   waitUntil?: (promise: Promise<unknown>) => void,
 ): ApprovalService {
-  const store = new D1ApprovalStore(env.DB);
   const queueSink = env.AUDIT_QUEUE
     ? queueAuditSink(env.AUDIT_QUEUE)
     : undefined;
+  const systemActor: ApprovalActor = {
+    id: SYSTEM_ACTOR_ID,
+    role: 'operator',
+    tenantId: store.tenantId,
+  };
   const service: ApprovalService = new ApprovalService({
     store,
     defaultSlaSeconds: numberVar(
@@ -391,7 +432,7 @@ function buildApprovalService(
           ),
         ),
       () => service,
-      SYSTEM_ACTOR,
+      systemActor,
     ),
   });
   return service;
@@ -410,10 +451,42 @@ async function runMaintenance(env: Env, cron: string): Promise<void> {
   // fired by sweep audit events are collected and awaited here instead.
   const pendingSends: Promise<unknown>[] = [];
   try {
-    const service = buildApprovalService(env, (send) =>
-      pendingSends.push(send),
-    );
-    escalated = (await service.sweepSLA(SYSTEM_ACTOR)).length;
+    // Cron-owned TCB sweep over the SYSTEM store: the ONLY legitimate
+    // cross-tenant read+write, and it is not reachable over HTTP.
+    const queueSink = env.AUDIT_QUEUE
+      ? queueAuditSink(env.AUDIT_QUEUE)
+      : undefined;
+    escalated = (
+      await sweepSLA(approvalStoreFactory(env.DB).system(), {
+        systemActor: MAINTENANCE_ACTOR,
+        audit: (event) => {
+          console.log(JSON.stringify({ type: 'audit', ...event }));
+          if (queueSink) {
+            pendingSends.push(
+              queueSink(event).catch((error: unknown) =>
+                console.error(
+                  JSON.stringify({
+                    type: 'audit-queue-error',
+                    reason: String(error),
+                  }),
+                ),
+              ),
+            );
+          }
+        },
+        onEscalation: (record) =>
+          console.log(
+            JSON.stringify({
+              type: 'sla-escalation',
+              id: record.id,
+              tenantId: record.tenantId,
+              workflowId: record.workflowId,
+              runId: record.runId,
+              slaDeadlineAt: record.slaDeadlineAt,
+            }),
+          ),
+      })
+    ).length;
   } catch (error) {
     console.error(
       JSON.stringify({
@@ -460,25 +533,27 @@ const handler: ExportedHandler<Env> = {
     }
 
     const waitUntil = (promise: Promise<unknown>) => ctx.waitUntil(promise);
-    const approvalService = buildApprovalService(env, waitUntil);
-    // Parsed once per request rather than once per authenticate() call — this
-    // handler authenticates in both routers.
-    const authenticate = bearerActorAuthenticator(
-      parseActorTokens(env.APPROVAL_ACTOR_TOKENS),
-    );
+    // AUTHENTICATE FIRST, then construct (INV-2): the resolver binds the
+    // approval store to the verified actor's tenant before any service
+    // exists — there is no pre-auth store for a rushed fix to reach.
+    const baseResolve = createTenantResolver({
+      authenticate: bearerActorAuthenticator(
+        staticTokenVerifier(parseActorTokens(env.APPROVAL_ACTOR_TOKENS)),
+      ),
+      storeFactory: approvalStoreFactory(env.DB),
+      buildService: (store) => buildApprovalService(store, env, waitUntil),
+    });
+    const resolve = env.TENANT_APEX_DOMAIN
+      ? withSubdomainCrossCheck(baseResolve, {
+          apexDomain: env.TENANT_APEX_DOMAIN,
+        })
+      : baseResolve;
 
     const routed = request as unknown as Request;
-    const approvalResponse = await createApprovalRouter({
-      service: approvalService,
-      authenticate,
-    })(routed);
+    const approvalResponse = await createApprovalRouter({ resolve })(routed);
     if (approvalResponse) return approvalResponse;
 
-    const runResponse = await runRouterFor(
-      env,
-      approvalService,
-      authenticate,
-    )(routed);
+    const runResponse = await runRouterFor(env, resolve)(routed);
     if (runResponse) return runResponse;
 
     return json({ error: 'not found' }, 404);

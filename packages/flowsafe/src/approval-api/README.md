@@ -12,14 +12,24 @@ cross-file contract and the rules that are not enforced by the compiler.
 
 - `store.ts` / `d1-store.ts`: persistence. The store is the authoritative
   record of decisions — the grant provider reads it, so it sits inside the
-  trust boundary. Every mutation is a status-guarded compare-and-swap.
+  trust boundary. Every mutation is a status-guarded compare-and-swap, and
+  every read and write carries a `tenant_id` predicate sourced from the
+  store's constructor.
+- `tenant-brand.ts` / `tenant-store.ts` / `tenant-context.ts`: the tenancy
+  seam. Stores come only from a factory's `forTenant()`; the bound type carries
+  a `unique symbol` brand, so an unbound store or the cron-only
+  `SystemApprovalStore` is a compile error in request scope. `TenantResolver`
+  authenticates, validates the tenant against INV-3, and binds — which is what
+  makes "bind at construction from the authenticated actor" have a valid call
+  site at all.
 - `service.ts`: business rules (roles, SLA, audit, self-approval). Writes the
   store under RBAC; triggers the post-decision resume via an injected
   `resumeRun` callback so it stays deployment-agnostic (same-process =
   `resumeViaRuntime`, cross-Worker = DO stub fetch).
 - `router.ts`: REST surface. Returns null off-prefix so a host Worker
-  composes it ahead of its own routes. `authenticate` is injected and is
-  part of the trusted computing base.
+  composes it ahead of its own routes. It takes a `TenantResolver` (injected,
+  part of the trusted computing base) and resolves it as its first act, so no
+  route body ever sees an unbound service. There is no `/sla/sweep` route.
 - `grants.ts`: the seam between the queue and the runner. Plugs into the
   DO runner's `requestContextForRun`; on every start/resume it derives the
   breakwater grant key from APPROVED records.
@@ -78,12 +88,47 @@ grant in its requestContext.
   Rejected: vitest-pool-workers (heavy config), better-sqlite3 (native dep
   through the supply-chain age gate).
 
+## Tenancy invariants
+
+- **No caller can obtain a store that is not bound to exactly one tenant.**
+  `D1ApprovalStore` is not exported; `forTenant()` throws on a non-INV-3
+  tenant. `create()` STAMPS the tenant from the binding — `CreateApprovalInput`
+  has no `tenantId`, and a field that cannot be supplied cannot be spoofed.
+- **`tenantId` is not an `ApprovalListFilter` member.** An omissible tenant
+  filter is the canonical fail-open: an empty filter would scan every tenant.
+  The bound store seeds `tenant_id = ?` before every optional clause.
+- **A wrong-tenant id behaves exactly like an unknown id.** `get`/`transition`
+  return null and reuse the existing 404/409 paths, so the API is not an
+  oracle for another tenant's record ids.
+- **Open-uniqueness is per tenant.** The partial unique index leads with
+  `tenant_id`. It had to be `DROP`ped and recreated under a NEW name:
+  `CREATE UNIQUE INDEX IF NOT EXISTS` matches on name alone, so redefining it
+  in place is a silent no-op on any database that already has it — and tenant
+  B's create would collapse into tenant A's open record.
+- **A pre-tenant table refuses to serve.** `ALTER TABLE … ADD COLUMN tenant_id
+  TEXT NOT NULL` has no valid backfill (SQLite rejects it even on an empty
+  table, and a NULL or `''` tenant is an isolation hole), so the store throws a
+  loud error naming the fix rather than half-upgrading.
+- **The cross-tenant sweep is a type, not a comment.** `sweepSLA` is a
+  standalone function over `SystemApprovalStore`, which declares
+  `[TENANT_BOUND]?: never` and is therefore unassignable wherever a bound store
+  is required.
+- **The grant query's `runId` predicate is load-bearing.** Under INV-1 a salted
+  runId belongs to exactly one tenant, so the mint is tenant-safe even from a
+  mis-bound store. The store binding is defense in depth, not the fix. A spy
+  test pins the exact filter, because "optimizing away" that predicate would
+  reopen the leak with a green build.
+
 ## Invariants
 
 - The requestContext capability keys (`breakwater.approvedConnectors`,
   `breakwater.actor`) must never be populated from client input, model
   output, or tool results. Grant-minting code — the provider, the service,
   and any bridge — is inside the trust boundary.
+- `service.create` asserts the input `runId` carries the store's tenant prefix.
+  Not a leak (every read filters on the `tenant_id` column, never by parsing
+  `run_id`), but it turns an orphan row into a loud error at the only write
+  path.
 - Every state change goes through `transition(id, from[], patch)`.
 - At most one OPEN request per (workflowId, runId, stepKey) — enforced by a
   partial unique index; decided records never block a re-suspension's fresh

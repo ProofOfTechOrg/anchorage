@@ -1,9 +1,11 @@
+import type { DurableObjectState } from '@cloudflare/workers-types';
 import { InMemoryStore } from '@mastra/core/storage';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 
 import { DurableObjectRunner } from './durable-object.js';
 import { init } from './init.js';
+import type { ResumeLedgerStorage } from './resume-ledger.js';
 import type { RunnerRuntime, RunSummary } from './runtime.js';
 
 interface TestEnv {
@@ -51,7 +53,11 @@ function post(path: string, body: unknown): Request {
 
 async function startGated(runner: TestRunner): Promise<RunSummary> {
   const response = await runner.fetch(
-    post('/runs', { workflowId: 'gated', inputData: { topic: 't' } }),
+    post('/runs', {
+      workflowId: 'gated',
+      runId: crypto.randomUUID(),
+      inputData: { topic: 't' },
+    }),
   );
   return (await response.json()) as RunSummary;
 }
@@ -61,9 +67,13 @@ describe('DurableObjectRunner.fetch', () => {
     // #given
     const runner = makeRunner();
 
-    // #when — start
+    // #when — start (the Worker mints the runId; the DO never generates)
     const startResponse = await runner.fetch(
-      post('/runs', { workflowId: 'gated', inputData: { topic: 't' } }),
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'run-http-1',
+        inputData: { topic: 't' },
+      }),
     );
 
     // #then
@@ -107,7 +117,7 @@ describe('DurableObjectRunner.fetch', () => {
   it('returns 404 for an unknown workflow', async () => {
     // #when
     const response = await makeRunner().fetch(
-      post('/runs', { workflowId: 'nope' }),
+      post('/runs', { workflowId: 'nope', runId: 'r-nope' }),
     );
 
     // #then
@@ -259,26 +269,152 @@ describe('DurableObjectRunner.fetch', () => {
     }
   });
 
-  it('treats a null runId like an omitted one and generates a fresh id', async () => {
-    // #given — JSON has no undefined, so a client with no id sends `null`; it
-    // must behave like omitting runId (generate one), not 400. The non-string
-    // guard must not reject this otherwise-valid request.
+  it('400s a start without a runId — the DO never generates one (INV-1)', async () => {
+    // #given — the runId is the tenant carrier, minted by the run router
+    // from the AUTHENTICATED tenant. A DO-side generation fallback would let
+    // any caller that skips the router mint a bare, tenant-less run.
     const runner = makeRunner();
 
-    // #when
-    const response = await runner.fetch(
+    // #when / #then — omitted and JSON-null both refuse
+    for (const body of [
+      { workflowId: 'gated', inputData: { topic: 't' } },
+      { workflowId: 'gated', runId: null, inputData: { topic: 't' } },
+    ]) {
+      const response = await runner.fetch(post('/runs', body));
+      expect(response.status).toBe(400);
+    }
+  });
+
+  it('refuses to act outside its own identity when id.name is present (INV-1)', async () => {
+    // #given — a runner whose DO identity names a DIFFERENT run than the
+    // request. id.name is set by the trusted Worker via idFromName and is
+    // unforgeable at this boundary, so a mismatch means someone routed
+    // around the name join.
+    const state = {
+      id: { name: 'gated:run-A' },
+    } as unknown as DurableObjectState;
+    const runner = new TestRunner(state, { storage: new InMemoryStore() });
+
+    // #when — the request names run-B on the instance whose identity is run-A
+    const mismatched = await runner.fetch(
       post('/runs', {
         workflowId: 'gated',
-        runId: null,
+        runId: 'run-B',
         inputData: { topic: 't' },
       }),
     );
 
-    // #then — a run was minted under a generated string id
-    expect(response.status).toBe(200);
-    const summary = (await response.json()) as RunSummary;
-    expect(typeof summary.runId).toBe('string');
-    expect(summary.runId.length).toBeGreaterThan(0);
+    // #then — refused loudly; and the matching id works normally
+    expect(mismatched.status).toBe(500);
+    expect(
+      (((await mismatched.json()) as { error?: string }).error ?? '').includes(
+        'identity mismatch',
+      ),
+    ).toBe(true);
+    const matching = await runner.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'run-A',
+        inputData: { topic: 't' },
+      }),
+    );
+    expect(matching.status).toBe(200);
+
+    // #then — status and resume enforce the same identity
+    expect(
+      (await runner.fetch(new Request('http://do/runs/gated/run-B'))).status,
+    ).toBe(500);
+    expect(
+      (await runner.fetch(post('/runs/gated/run-B/resume', {}))).status,
+    ).toBe(500);
+  });
+
+  it('adopts a ctx.storage-backed resume ledger: the ordinal survives a DO instance swap', async () => {
+    // #given — a runner whose state carries (fake) ctx.storage. The gate here
+    // re-suspends on a falsy resume (schema-less), so the run can accrue a
+    // resume ordinal.
+    class ResuspendRunner extends DurableObjectRunner<TestEnv> {
+      protected build(env: TestEnv): RunnerRuntime {
+        const { createWorkflow, createStep, runtime } = init({
+          storage: env.storage,
+        });
+        const gate = createStep({
+          id: 'gate',
+          inputSchema: z.object({}),
+          outputSchema: z.object({}),
+          suspendSchema: z.object({ reason: z.string() }),
+          execute: async ({ resumeData, suspend }) =>
+            resumeData ? {} : suspend({ reason: 'wait' }),
+        });
+        createWorkflow({
+          id: 'resuspend',
+          inputSchema: z.object({}),
+          outputSchema: z.object({}),
+        })
+          .then(gate)
+          .commit();
+        return runtime;
+      }
+    }
+    const persisted = new Map<string, unknown>();
+    const ledgerStorage: ResumeLedgerStorage = {
+      async get<T>(key: string): Promise<T | undefined> {
+        return persisted.get(key) as T | undefined;
+      },
+      async put<T>(key: string, value: T): Promise<void> {
+        persisted.set(key, value);
+      },
+      async delete(key: string): Promise<boolean> {
+        return persisted.delete(key);
+      },
+    };
+    // Minimal stub: the shell only touches state.storage (and, for tenant
+    // recovery, state.id.name — not exercised here).
+    const state = {
+      storage: ledgerStorage,
+    } as unknown as DurableObjectState;
+    const env: TestEnv = { storage: new InMemoryStore() };
+
+    // #given — instance A re-suspends the run once (falsy resume)
+    const before = new ResuspendRunner(state, env);
+    const startResponse = await before.fetch(
+      post('/runs', {
+        workflowId: 'resuspend',
+        runId: 'run-ledger-1',
+        inputData: {},
+      }),
+    );
+    const started = (await startResponse.json()) as RunSummary;
+    expect(started.status).toBe('suspended');
+    const reSuspendResponse = await before.fetch(
+      post(`/runs/resuspend/${started.runId}/resume`, { step: 'gate' }),
+    );
+    const reSuspended = (await reSuspendResponse.json()) as RunSummary;
+    expect(reSuspended.status).toBe('suspended');
+    expect(reSuspended.resumeCount?.gate).toBe(1);
+
+    // #when — "eviction": a NEW runner instance over the same env storage and
+    // the same (surviving) ctx.storage projects the run's status
+    const after = new ResuspendRunner(state, env);
+    const statusResponse = await after.fetch(
+      new Request(`http://do/runs/resuspend/${started.runId}`),
+    );
+    const status = (await statusResponse.json()) as RunSummary;
+
+    // #then — the ordinal came back from ctx.storage; with the in-memory
+    // default it would be undefined and an approval bound to this
+    // re-suspension could never mint again
+    expect(status.status).toBe('suspended');
+    expect(status.resumeCount?.gate).toBe(1);
+
+    // #then — the swapped instance completes the run normally
+    const doneResponse = await after.fetch(
+      post(`/runs/resuspend/${started.runId}/resume`, {
+        step: 'gate',
+        resumeData: { go: true },
+      }),
+    );
+    expect(((await doneResponse.json()) as RunSummary).status).toBe('success');
   });
 
   it('round-trips a path-safe custom runId over status and resume', async () => {

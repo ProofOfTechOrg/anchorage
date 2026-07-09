@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   purgeExpiredWorkflowRuns,
+  purgeTenant,
   type SnapshotDatabase,
   type SnapshotStatement,
 } from './d1-storage.js';
@@ -14,6 +15,7 @@ import {
 interface SqliteStatement {
   get(...params: unknown[]): unknown;
   run(...params: unknown[]): unknown;
+  all(...params: unknown[]): unknown[];
 }
 
 interface SqliteDatabase {
@@ -44,6 +46,9 @@ function d1Like(db: SqliteDatabase): SnapshotDatabase {
   function statement(sql: string, params: unknown[]): SnapshotStatement {
     return {
       bind: (...values: unknown[]) => statement(sql, values),
+      all: async <T>() => ({
+        results: db.prepare(sql).all(...params) as T[],
+      }),
       run: async () => {
         const outcome = db.prepare(sql).run(...params) as {
           changes?: number | bigint;
@@ -261,5 +266,120 @@ describe('purgeExpiredWorkflowRuns', () => {
         now: () => NOW,
       }),
     ).toBe(0);
+  });
+});
+
+describe('purgeTenant (complete offboarding)', () => {
+  function seedApprovalsTable(db: SqliteDatabase): void {
+    db.prepare(
+      `CREATE TABLE flowsafe_approvals (
+        id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        title TEXT NOT NULL
+      )`,
+    ).run();
+    db.prepare(
+      `INSERT INTO flowsafe_approvals (id, tenant_id, title)
+       VALUES ('a1', 'abc', 'abc approval'),
+              ('b1', 'abcdefg', 'neighbor approval')`,
+    ).run();
+  }
+
+  it("reaps all three stores for the tenant and leaves the prefix-NEIGHBOR untouched ('abc' vs 'abcdefg')", async () => {
+    // #given — snapshots of EVERY status for two tenants whose slugs share a
+    // prefix (the range-exactness worst case), plus approvals and artifacts
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    seedApprovalsTable(sqlite);
+    seedRun(sqlite, {
+      runId: 'abc_r-terminal',
+      status: 'success',
+      updatedAt: NOW,
+    });
+    seedRun(sqlite, {
+      runId: 'abc_r-suspended',
+      status: 'suspended',
+      updatedAt: NOW,
+    });
+    seedRun(sqlite, {
+      runId: 'abcdefg_r1',
+      status: 'suspended',
+      updatedAt: NOW,
+    });
+    const deletedArtifacts: string[] = [];
+    const artifactStore = {
+      deleteRun: async (workflowId: string, runId: string) => {
+        deletedArtifacts.push(`${workflowId}/${runId}`);
+        return 1;
+      },
+    };
+
+    // #when
+    const result = await purgeTenant(d1Like(sqlite), {
+      tenantId: 'abc',
+      artifactStore,
+    });
+
+    // #then — abc's rows (INCLUDING the suspended one the retention purge can
+    // never reap) are gone from all three stores; abcdefg survives intact
+    expect(result).toEqual({ snapshots: 2, approvals: 1, artifacts: 2 });
+    expect(remainingRunIds(sqlite)).toEqual(['abcdefg_r1']);
+    expect(deletedArtifacts.sort()).toEqual([
+      'wf/abc_r-suspended',
+      'wf/abc_r-terminal',
+    ]);
+    const approvals = (
+      sqlite.prepare('SELECT tenant_id FROM flowsafe_approvals') as unknown as {
+        all(): Array<{ tenant_id: string }>;
+      }
+    ).all();
+    expect(approvals).toEqual([{ tenant_id: 'abcdefg' }]);
+  });
+
+  it('tolerates a host without the approvals table (snapshot-only deployments)', async () => {
+    // #given — no flowsafe_approvals table at all
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    seedRun(sqlite, { runId: 'abc_r1', status: 'running', updatedAt: NOW });
+
+    // #when / #then
+    const result = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
+    expect(result).toEqual({ snapshots: 1, approvals: 0, artifacts: 0 });
+  });
+
+  it.each(['Abc', 'a_b', 'ab', "abc'; DROP TABLE x; --", ''])(
+    "rejects the non-INV-3 tenantId '%s' BEFORE any interpolation (range-exactness, not injection)",
+    async (tenantId) => {
+      // #given
+      const sqlite = openSqlite();
+      createSnapshotTable(sqlite);
+
+      // #when / #then
+      await expect(purgeTenant(d1Like(sqlite), { tenantId })).rejects.toThrow(
+        /INV-3/,
+      );
+    },
+  );
+
+  it('respects the table prefix', async () => {
+    // #given
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite, 'p_');
+    seedRun(sqlite, {
+      runId: 'abc_r1',
+      status: 'suspended',
+      updatedAt: NOW,
+      prefix: 'p_',
+    });
+
+    // #when
+    const result = await purgeTenant(d1Like(sqlite), {
+      tenantId: 'abc',
+      tablePrefix: 'p_',
+    });
+
+    // #then
+    expect(result.snapshots).toBe(1);
+    expect(remainingRunIds(sqlite, 'p_')).toEqual([]);
   });
 });

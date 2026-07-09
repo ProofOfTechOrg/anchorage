@@ -27,8 +27,12 @@ import type {
   WorkflowState,
 } from '@mastra/core/workflows';
 
-import { BREAKWATER_WORKFLOW_SCOPE_KEY } from './breakwater-keys.js';
-import { PATH_SAFE_ID_PATTERN } from './path-safe-id.js';
+import {
+  BREAKWATER_ISOLATION_SCOPE_KEY,
+  BREAKWATER_WORKFLOW_SCOPE_KEY,
+} from './breakwater-keys.js';
+import { PATH_SAFE_ID_PATTERN, tenantOfRunId } from './path-safe-id.js';
+import { InMemoryResumeLedger, type ResumeLedger } from './resume-ledger.js';
 
 export class UnknownWorkflowError extends Error {
   constructor(workflowId: string) {
@@ -428,10 +432,25 @@ export interface RunnerRuntimeOptions {
   logger?: IMastraLogger | false;
   /** Consulted on every start/resume — see RequestContextProvider. */
   requestContextForRun?: RequestContextProvider;
+  /**
+   * Per-run resume ledger backing RunSummary.resumeCount / RunLeg.resumeCount.
+   * Default: in-memory. The DO shell adopts a ctx.storage-backed ledger via
+   * adoptDefaultResumeLedger() so the ordinal survives eviction — an explicit
+   * ledger here wins over that adoption.
+   */
+  resumeLedger?: ResumeLedger;
 }
 
 export interface StartRunOptions {
-  runId?: string;
+  /**
+   * REQUIRED — the runtime never generates a runId (INV-1). Multi-tenant
+   * hosts mint `${tenantId}_${uuid}` server-side (createRunRouter) so the
+   * runId carries its tenant everywhere it becomes a key (D1 snapshot row,
+   * DO name, R2 segment, grant-list predicate). A generation fallback here
+   * would let any caller that forgets to mint create a bare, tenant-less
+   * run — unreachable by tenant purge and un-ownable by every actor.
+   */
+  runId: string;
   inputData?: unknown;
 }
 
@@ -453,27 +472,45 @@ export class RunnerRuntime {
   // The runtime increments it on every resume (regardless of
   // payload) and projects it as RunSummary.resumeCount / RunLeg.resumeCount —
   // the collision-free grant-binding tie-breaker that Mastra's
-  // payload-conditional resumedAt cannot provide. In-memory is sufficient by a
-  // mutual-exclusion argument (not merely restart wall-time): the tie-breaker
-  // only matters when two same-step suspensions share a suspendedAt (same ms),
-  // and that requires the suspend -> resume -> re-suspend cycle to run
-  // synchronously with NO persistence I/O between the stamps — i.e. the
-  // in-memory store. Any durable deployment (D1) has I/O between the two
-  // suspensions, so their suspendedAt differ and the suspendedAt half alone
-  // distinguishes them. Same-ms-collision and surviving-a-restart are therefore
-  // mutually exclusive: a reset ledger can only yield leg.resumeCount=undefined
-  // against a re-suspension record's defined count -> mismatch -> deny
-  // (fail-closed re-deny, see grants.ts), never a spurious mint. Revisit a
-  // durable counter only if a synchronous-yet-durable store is ever wired in.
-  // Cleared on terminal status below; a resumed-then-abandoned suspended run
-  // keeps one small map until DO eviction.
-  readonly #resumeCounts = new Map<string, Map<string, number>>();
+  // payload-conditional resumedAt cannot provide.
+  //
+  // Durability: a lost ledger is fail-closed for grants (leg.resumeCount
+  // undefined vs an approval's captured ordinal -> mismatch -> deny, see
+  // grants.ts) — never a leak, but an AVAILABILITY bug: the approved action
+  // silently no-ops. DO eviction (~70-140s idle), hibernation, and code
+  // deploys all wipe in-memory state while ctx.storage survives, so the DO
+  // shell adopts a DurableStorageResumeLedger (durable-object.ts); the
+  // in-memory default covers node tests and non-DO hosts. Entries are
+  // deleted on terminal status below; a resumed-then-abandoned suspended run
+  // keeps one small entry until the run is purged.
+  #resumeLedger: ResumeLedger;
+  readonly #resumeLedgerExplicit: boolean;
   #mastra?: Mastra;
 
   constructor(options: RunnerRuntimeOptions) {
     this.#storage = options.storage;
     this.#logger = options.logger ?? false;
     this.#requestContextForRun = options.requestContextForRun;
+    this.#resumeLedgerExplicit = options.resumeLedger !== undefined;
+    this.#resumeLedger = options.resumeLedger ?? new InMemoryResumeLedger();
+  }
+
+  /**
+   * Host-shell seam: replace the DEFAULT in-memory ledger with a durable one.
+   * The DO shell calls this with a ctx.storage-backed ledger right after
+   * build(), so every DO host gets eviction-proof ordinals without threading
+   * a parameter (a forgettable thread is how the durability guarantee rots).
+   * A ledger explicitly injected via options wins; adoption is rejected once
+   * runs may have consulted the ledger.
+   */
+  adoptDefaultResumeLedger(ledger: ResumeLedger): void {
+    if (this.#mastra) {
+      throw new Error(
+        'RunnerRuntime: adopt the resume ledger before the first run — ordinals already read from the default ledger would be lost',
+      );
+    }
+    if (this.#resumeLedgerExplicit) return;
+    this.#resumeLedger = ledger;
   }
 
   register(workflow: AnyWorkflow): void {
@@ -499,7 +536,7 @@ export class RunnerRuntime {
 
   async start(
     workflowId: string,
-    options: StartRunOptions = {},
+    options: StartRunOptions,
   ): Promise<RunSummary> {
     const workflow = this.#getWorkflow(workflowId);
     // Reject non-path-safe ids at the mint boundary so the runId is unambiguous
@@ -510,29 +547,23 @@ export class RunnerRuntime {
     // (durable-object.ts readJson), and RegExp.test() coerces its argument to a
     // String — so a numeric runId like 123 would pass the pattern as "123" yet
     // mint a run keyed by the number 123, unreachable by the string "123" the
-    // URL path later carries. Only a *supplied* non-string is a client error:
-    // `!= null` lets an explicit JSON null fall through to generation exactly
-    // like an omitted runId (JSON has no undefined, so null means "none
-    // supplied"), matching the `?? crypto.randomUUID()` below.
+    // URL path later carries. There is NO generation fallback (INV-1): a
+    // missing/null runId is a client error, not a request for one.
     if (
-      options.runId != null &&
-      (typeof options.runId !== 'string' ||
-        !PATH_SAFE_ID_PATTERN.test(options.runId))
+      typeof options.runId !== 'string' ||
+      !PATH_SAFE_ID_PATTERN.test(options.runId)
     ) {
       throw new InvalidRunRequestError(
-        "runId must be URL-path-safe (letters, digits, '.', '_', '~', '-'; 1–200 chars)",
+        "runId is required and must be URL-path-safe (letters, digits, '.', '_', '~', '-'; 1–200 chars)",
       );
     }
-    // Generating the runId here (not in core) lets the lock cover createRun.
-    const runId = options.runId ?? crypto.randomUUID();
+    const runId = options.runId;
     return this.#withRunLock(workflowId, runId, async () => {
-      if (options.runId) {
-        // Caller-supplied ids can collide with an existing run; starting it
-        // again would re-execute already-executed steps.
-        const existing = await workflow.getWorkflowRunById(runId);
-        if (existing) {
-          throw new RunAlreadyExistsError(workflowId, runId, existing.status);
-        }
+      // Supplied ids can collide with an existing run; starting it
+      // again would re-execute already-executed steps.
+      const existing = await workflow.getWorkflowRunById(runId);
+      if (existing) {
+        throw new RunAlreadyExistsError(workflowId, runId, existing.status);
       }
       // Resolve the leg's context BEFORE createRun: createRun persists the
       // initial snapshot, so a provider failure after it would strand a
@@ -582,6 +613,7 @@ export class RunnerRuntime {
       // of prior resumes = the ordinal of the CURRENT suspension being resumed
       // (undefined for a first suspension), which the minting approval captured
       // at that suspension. suspendedAt still comes from the snapshot.
+      const priorCounts = await this.#resumeLedger.counts(runKey);
       const requestContext = await this.#requestContextFor(workflowId, runId, {
         kind: 'resume',
         step,
@@ -590,9 +622,7 @@ export class RunnerRuntime {
             ? suspendedAtOf(state.steps, stepKey)
             : undefined,
         resumeCount:
-          stepKey !== undefined
-            ? this.#resumeCounts.get(runKey)?.get(stepKey)
-            : undefined,
+          stepKey !== undefined ? priorCounts?.get(stepKey) : undefined,
       });
       const run = await workflow.createRun({ runId });
       let result: CoreRunResult;
@@ -610,19 +640,15 @@ export class RunnerRuntime {
       // Record THIS resume AFTER the leg fingerprint read above and BEFORE
       // summarize: a re-suspension produced by this resume must capture the
       // incremented ordinal so its approval binds to the new suspension.
+      let counts = priorCounts;
       if (stepKey !== undefined) {
-        const counts =
-          this.#resumeCounts.get(runKey) ?? new Map<string, number>();
-        counts.set(stepKey, (counts.get(stepKey) ?? 0) + 1);
-        this.#resumeCounts.set(runKey, counts);
+        counts = await this.#resumeLedger.increment(runKey, stepKey);
       }
-      const summary = summarize(
-        run.runId,
-        result,
-        this.#resumeCounts.get(runKey),
-      );
+      const summary = summarize(run.runId, result, counts);
       // Terminal run: drop the ledger (no further suspension can occur).
-      if (summary.status !== 'suspended') this.#resumeCounts.delete(runKey);
+      if (summary.status !== 'suspended') {
+        await this.#resumeLedger.delete(runKey);
+      }
       return summary;
     });
   }
@@ -630,15 +656,13 @@ export class RunnerRuntime {
   async status(workflowId: string, runId: string): Promise<RunSummary | null> {
     const workflow = this.#getWorkflow(workflowId);
     const state = await workflow.getWorkflowRunById(runId);
+    if (!state) return null;
     // Project resumeCount from the ledger too (defense in depth: a bridge that
     // ever mints off status() must not see a stale/absent ordinal).
-    return state
-      ? summarizeState(
-          runId,
-          state,
-          this.#resumeCounts.get(this.#runKey(workflowId, runId)),
-        )
-      : null;
+    const counts = await this.#resumeLedger.counts(
+      this.#runKey(workflowId, runId),
+    );
+    return summarizeState(runId, state, counts);
   }
 
   // A provider crash propagates (fail loud): silently starting the leg with
@@ -658,6 +682,25 @@ export class RunnerRuntime {
     const base: Record<string, unknown> = {
       [BREAKWATER_WORKFLOW_SCOPE_KEY]: workflowId,
     };
+    // Tenant-salted runs (INV-1: `${tenantId}_${uuid}`) also mint the OPAQUE
+    // isolation scope, segmenting breakwater's connector idempotency and
+    // rate-limit keys per tenant. Server-authoritative like the workflow
+    // scope above — the runId was minted from the AUTHENTICATED tenant, so
+    // its prefix is trustworthy here.
+    //
+    // Structural, not flagged: a runId shaped `<inv3-slug>_<rest>` mints a
+    // scope. For this repo's hosts that is exactly the tenant (they all mint
+    // via TenantContext.newRunId); a standalone OSS consumer whose custom
+    // runIds happen to look like `batch_042` gets incidental — and harmless —
+    // key segmentation, never a leak (there is no tenant boundary there).
+    // Non-matching runIds mint nothing: the single-tenant keys stay
+    // byte-identical, and deployments that must never run scope-less enforce
+    // that with breakwater's tenantIsolation evaluator (which binds dry-run
+    // too, unlike the idempotency path).
+    const tenantId = tenantOfRunId(runId);
+    if (tenantId !== undefined) {
+      base[BREAKWATER_ISOLATION_SCOPE_KEY] = tenantId;
+    }
     const values = this.#requestContextForRun
       ? await this.#requestContextForRun(workflowId, runId, leg)
       : undefined;

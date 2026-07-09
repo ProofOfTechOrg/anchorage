@@ -110,7 +110,7 @@ Phase 4 (Ecosystem, 2026-07-07):
   trigger (isolated failures), bearer-token auth seam, start+resume approval
   bridges (multi-gate), optional Queues audit export. `deploy:cf`/`deploy:dev`.
 
-Verification gate: `pnpm -r lint && pnpm -r typecheck && pnpm -r test && pnpm -r build` (427 tests).
+Verification gate: `pnpm -r lint && pnpm -r typecheck && pnpm -r test && pnpm -r build` (623 tests).
 
 Showcase (2026-07-09): all five `docs/examples/*` workflows made runnable behind
 one React frontend and shipped as a single Cloudflare deploy —
@@ -129,6 +129,37 @@ bearer identities live once in `showcase/demo-actors.ts` (drift-tested against
 `.dev.vars.example`); `showcase/wrangler.jsonc` bakes in NO credentials, so a
 deploy 401s until `wrangler secret put APPROVAL_ACTOR_TOKENS`. Connectors stay
 binding-gated (simulate offline; grant gate always exercised).
+
+Multi-tenant platform (2026-07-09, `.notes/multi-tenant-and-demo-plan.md` implemented):
+one tenant dimension, one chokepoint per resource class, fail-closed by construction.
+Three invariants: **INV-1** — every runId is server-minted `${tenantId}_${uuid}` from the
+AUTHENTICATED tenant (`createRunRouter` 400s client runIds; `RunnerRuntime.start` requires
+one — no generation fallback; the DO asserts path ≡ `ctx.id.name`), making Mastra snapshot
+rows, DO instances, `#runKey`, the grant-mint `runId` predicate, and R2 keys tenant-disjoint
+with no schema or signature change. **INV-2** — approval stores are tenant-BOUND at
+construction (`D1ApprovalStoreFactory`/`InMemoryApprovalStoreFactory.forTenant()`; the
+`TENANT_BOUND` unique-symbol brand makes an unbound/system store a compile error in request
+scope; `tenant_id` column + unconditional predicates; the open-step index was DROPped and
+recreated tenant-first under a NEW name — name-keyed `IF NOT EXISTS` redefinition is a silent
+no-op; a pre-tenant table REFUSES to serve). Requests flow through `TenantResolver`
+(authenticate → INV-3-validate → bind) so no pre-auth store exists; `sweepSLA` left the
+service for a cron-only function over `SystemApprovalStore` (the HTTP sweep route is gone).
+**INV-3** — `tenantId` matches `^[a-z0-9]{3,32}$` (no chars in `[0x5F,0x60]`), making the
+runId prefix ownership check and the `[tid_, tid\x60)` range purge EXACT
+(character-exhaustive test pins it). Plus: durable `ctx.storage` resume ledger (eviction no
+longer no-ops approved re-suspension resumes); `ISOLATION_SCOPE_CONTEXT_KEY` segments
+breakwater idempotency/rate-limit keys per tenant (no flag — absent scope keeps single-tenant
+keys; `tenantIsolation` evaluator denies scope-less calls incl. dry-run); `purgeTenant`
+offboards all three stores (any-status snapshots + approvals + artifacts); Mastra
+six-table-inventory + `run_id` schema guards; the R2 no-workflow-level-listing pin; identity
+via `TokenVerifier` (`staticTokenVerifier` + HS256 `hmacVerifier`; `ApprovalActor.tenantId`
+required; the `tenants` registry is the allocation authority, reserved infra slugs denied);
+the public demo (`showcase/demo-auth.ts`: GitHub OAuth → ephemeral `dm*` tenant + four-role
+JWT set, atomic per-tenant + global-daily run caps, kill switch in the AUTH middleware, two
+cron expressions so sweep/purge never share an invocation); subdomain↔tenant cross-check for
+client-per-subdomain hosts. The deployed SPA derives identity from the server's `/workflows`
+actor echo (the fail-open client actor table is gone) and its production bundle is proven
+demo-token-free at build time.
 
 ## Files
 

@@ -6,6 +6,8 @@ import { z } from 'zod';
 import { AuditLogger } from '../audit/index.js';
 import {
   crossWorkflowIsolation,
+  ISOLATION_SCOPE_CONTEXT_KEY,
+  tenantIsolation,
   WORKFLOW_SCOPE_CONTEXT_KEY,
 } from '../policy-engine/index.js';
 import { ACTOR_CONTEXT_KEY, type Actor } from '../rbac/index.js';
@@ -1797,5 +1799,125 @@ describe('audit attribution', () => {
         detail: { stage: 'execute' },
       },
     ]);
+  });
+});
+
+describe('isolation scope (multi-tenant key segmentation)', () => {
+  function scopedContext(options: {
+    scope?: string;
+    idempotencyKey?: string;
+    dryRun?: boolean;
+  }): ToolExecutionContext {
+    const requestContext = new RequestContext();
+    if (options.scope !== undefined) {
+      requestContext.set(ISOLATION_SCOPE_CONTEXT_KEY, options.scope);
+    }
+    if (options.idempotencyKey !== undefined) {
+      requestContext.set(IDEMPOTENCY_KEY_CONTEXT_KEY, options.idempotencyKey);
+    }
+    if (options.dryRun) requestContext.set(DRY_RUN_CONTEXT_KEY, true);
+    return { requestContext } as unknown as ToolExecutionContext;
+  }
+
+  it('the SAME business key under two scopes does not replay across tenants', async () => {
+    // #given — metamind's canonical cross-run key ("never email this lead
+    // twice") is business identity two tenants can legitimately share; the
+    // scope segment is what keeps B's send from replaying A's cached result
+    const { tool, execute } = makeConnector({
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { idempotencyStore: new InMemoryIdempotencyStore() },
+    });
+
+    // #when — tenant A executes, tenant B presents the SAME key
+    const a = await run(
+      tool,
+      input,
+      scopedContext({ scope: 'acme', idempotencyKey: 'send:ada@example.com' }),
+    );
+    const b = await run(
+      tool,
+      input,
+      scopedContext({ scope: 'bravo', idempotencyKey: 'send:ada@example.com' }),
+    );
+
+    // #then — both executed for real; same-scope replay still works
+    expect(a).toEqual({ ok: true });
+    expect(b).toEqual({ ok: true });
+    expect(execute).toHaveBeenCalledTimes(2);
+    await run(
+      tool,
+      input,
+      scopedContext({ scope: 'acme', idempotencyKey: 'send:ada@example.com' }),
+    );
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+
+  it("scope segments the rate-limit budget: A exhausting connector 'c' does not throttle B", async () => {
+    // #given — a budget of 1/min shared-in-name across two tenants
+    const { tool } = makeConnector({
+      permissions: { sideEffect: 'write', rateLimit: '1/min' },
+      policies: { rateLimitStore: new InMemoryRateLimitStore() },
+    });
+
+    // #when — A consumes its whole budget
+    await run(tool, input, scopedContext({ scope: 'acme' }));
+    const aSecond = run(tool, input, scopedContext({ scope: 'acme' }));
+
+    // #then — A is throttled; B still executes
+    await expect(aSecond).rejects.toMatchObject({
+      name: 'ConnectorPolicyError',
+      policy: 'rate-limit',
+    });
+    await expect(
+      run(tool, input, scopedContext({ scope: 'bravo' })),
+    ).resolves.toEqual({ ok: true });
+  });
+
+  it('absent scope preserves the single-tenant keys exactly (no flag to forget)', async () => {
+    // #given — no scope anywhere: the OSS default
+    const { tool, execute } = makeConnector({
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { idempotencyStore: new InMemoryIdempotencyStore() },
+    });
+
+    // #when — same key twice, no scope
+    await run(tool, input, scopedContext({ idempotencyKey: 'k1' }));
+    await run(tool, input, scopedContext({ idempotencyKey: 'k1' }));
+
+    // #then — replayed, exactly as before the scope feature existed
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('a tenantIsolation-policied connector denies a scope-less call INCLUDING dry-run', async () => {
+    // #given — the platform's policy set includes the evaluator; the dry-run
+    // branch returns before idempotency/rate-limit, so only a gates-loop
+    // evaluator can bind simulations
+    const dryRunExecute = vi.fn(async () => ({ ok: true }));
+    const { tool, execute } = makeConnector({
+      permissions: { sideEffect: 'write', dryRun: true },
+      dryRunExecute,
+      policies: { evaluators: [tenantIsolation()] },
+    });
+
+    // #when / #then — scope-less real call denies
+    await expect(run(tool, input, scopedContext({}))).rejects.toMatchObject({
+      name: 'ConnectorPolicyError',
+      policy: 'tenant-isolation',
+    });
+    // scope-less DRY-RUN denies too — the simulation never runs
+    await expect(
+      run(tool, input, scopedContext({ dryRun: true })),
+    ).rejects.toMatchObject({
+      name: 'ConnectorPolicyError',
+      policy: 'tenant-isolation',
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(dryRunExecute).not.toHaveBeenCalled();
+
+    // and a scoped dry-run simulates normally
+    await expect(
+      run(tool, input, scopedContext({ scope: 'acme', dryRun: true })),
+    ).resolves.toEqual({ ok: true });
+    expect(dryRunExecute).toHaveBeenCalledTimes(1);
   });
 });

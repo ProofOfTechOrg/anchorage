@@ -18,6 +18,24 @@ export interface WorkflowMeta {
   allowedRoles?: readonly string[];
 }
 
+/** The server's view of the authenticated caller (GET /workflows). */
+export interface CatalogActor {
+  id: string;
+  role: string;
+  tenantId?: string;
+}
+
+/**
+ * GET /workflows: the workflow catalog plus the SERVER-derived identity of
+ * the presented token. The UI renders role gates from `actor` — it never
+ * infers a role client-side (an unknown token must render as nothing, not
+ * default to some local actor table's first entry).
+ */
+export interface WorkflowCatalog {
+  workflows: WorkflowMeta[];
+  actor: CatalogActor;
+}
+
 /**
  * The run projection (POST /runs, GET /runs/:wf/:run) — a subset of the server's
  * RunSummary carrying the fields the UI may render.
@@ -88,11 +106,8 @@ export class RunClient {
     this.#headers = { ...options.headers };
   }
 
-  async workflows(): Promise<WorkflowMeta[]> {
-    const payload = (await this.#request('/workflows')) as {
-      workflows: WorkflowMeta[];
-    };
-    return payload.workflows;
+  async catalog(): Promise<WorkflowCatalog> {
+    return (await this.#request('/workflows')) as WorkflowCatalog;
   }
 
   async start(

@@ -715,7 +715,9 @@ export function maxTextLength(
 export {
   approvalRequired,
   crossWorkflowIsolation,
+  ISOLATION_SCOPE_CONTEXT_KEY,
   networkEgress,
+  tenantIsolation,
   WORKFLOW_SCOPE_CONTEXT_KEY,
 } from './tool-policy.js';
 export type {

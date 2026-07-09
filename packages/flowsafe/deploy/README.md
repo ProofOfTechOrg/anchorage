@@ -17,15 +17,23 @@ bridging, `/healthz`, and env-tunable SLA/retention.
 # 1. Create the database; paste the printed id into wrangler.jsonc.
 wrangler d1 create anchorage-flowsafe
 
-# 2. Mint actor tokens (any random strings) and store the map as a secret:
+# 2. Provision each tenant BEFORE issuing any token that names it.
+#    provisionTenant() is insert-or-fail against the `tenants` registry;
+#    nothing else enforces tenant-id uniqueness, and two clients slugged
+#    `acme` would merge their runs, approvals, budgets, and artifacts.
+#    tenantId must match ^[a-z0-9]{3,32}$ and must not be a reserved slug.
+
+# 3. Mint actor tokens (any random strings) and store the map as a secret:
 #    roles: admin | builder | operator | reviewer | viewer
 wrangler secret put APPROVAL_ACTOR_TOKENS --config deploy/wrangler.jsonc
-# paste, e.g.: {"tok-ray":{"id":"ray","role":"reviewer"},"tok-op":{"id":"op","role":"operator"}}
+# paste, e.g.: {"tok-ray":{"id":"ray","role":"reviewer","tenantId":"acme"},
+#               "tok-op":{"id":"op","role":"operator","tenantId":"acme"}}
+# An entry without an INV-3-valid tenantId is DROPPED and its token 401s.
 
-# 3. Deploy (from packages/flowsafe/)
+# 4. Deploy (from packages/flowsafe/)
 pnpm deploy:cf
 
-# 4. Verify
+# 5. Verify
 curl https://<worker>/healthz
 curl -X POST https://<worker>/runs \
   -H 'authorization: Bearer tok-op' -H 'content-type: application/json' \
@@ -43,24 +51,33 @@ no Cloudflare account needed).
 
 ## What the cron does
 
-`triggers.crons` fires `scheduled()`, which runs both enforcement surfaces
+`triggers.crons` fires `scheduled()`, which runs the two enforcement surfaces
 (each isolated, so one failing never masks the other):
 
-- **SLA sweep** — `ApprovalService.sweepSLA()` escalates every open approval
-  past its `slaDeadlineAt`; each escalation hits the `onEscalation`
-  notification seam and the audit trail.
+- **SLA sweep** — the standalone `sweepSLA(factory.system(), …)` escalates
+  every open approval past its `slaDeadlineAt`, across all tenants; each
+  escalation hits the `onEscalation` notification seam and the audit trail.
+  It is deliberately **not** a service method and **not** an HTTP route: an
+  unfiltered cross-tenant read *and write* behind a role check would let any
+  sweep-capable actor escalate every tenant's queue. Its parameter type,
+  `SystemApprovalStore`, is unobtainable from a request handler.
 - **Retention purge** — `purgeExpiredWorkflowRuns()` deletes terminal-status
   run snapshots older than `RUN_RETENTION_DAYS`. Suspended and running runs
-  are never purged.
+  are never purged, so a run abandoned at an approval gate is reclaimed only
+  by `purgeTenant()` at offboarding.
 
-Keep the cron interval at or below your SLA granularity; the default
-`*/15 * * * *` gives 4-hour SLAs minute-scale slack.
+Keep the sweep interval at or below your SLA granularity; the default
+`*/15 * * * *` gives 4-hour SLAs minute-scale slack. If you add a second cron
+expression (the showcase splits sweep and purge), dispatch on
+`controller.cron` — a Workers CPU-limit termination kills the isolate and is
+not catchable, so a slow sweep sharing an invocation would starve the purge.
 
 ## Configuration
 
 | Name | Kind | Default | Meaning |
 | ---- | ---- | ------- | ------- |
-| `APPROVAL_ACTOR_TOKENS` | secret | none (all authed routes 401) | JSON map of bearer token → `{ id, role }` |
+| `APPROVAL_ACTOR_TOKENS` | secret | none (all authed routes 401) | JSON map of bearer token → `{ id, role, tenantId }`; entries without an INV-3-valid `tenantId` are dropped |
+| `TENANT_APEX_DOMAIN` | var | unset (no cross-check) | Client-per-subdomain apex, e.g. `example.com`. A request to `<tenant>.<apex>` is denied unless the token's verified tenant is that tenant. Defense in depth over the tenant-bound stores |
 | `APPROVAL_SLA_SECONDS` | var | `14400` (4h) | Default SLA applied to new approvals |
 | `RUN_RETENTION_DAYS` | var | `30` | Terminal snapshot age before cron purge |
 | `AUDIT_QUEUE` | queue binding | unbound (logs only) | Enables audit export: events flow to the queue consumer |
@@ -76,11 +93,21 @@ Keep the cron interval at or below your SLA granularity; the default
   security-critical and tested in the library. This file supplies only what is
   deployment-specific: the workflows, and the DO-stub `start`/`status`/`resume`
   thunks. Do not re-derive them.
-- **Auth is one function.** `authenticate` maps a request to an approval actor;
-  swap `bearerActorAuthenticator` for your SSO/JWT verification. Everything else
-  (role checks, separation of duties, self-approval denial) lives in
-  `ApprovalService` and stays. With no `APPROVAL_ACTOR_TOKENS` secret the map is
-  empty and every authenticated route 401s — fail closed.
+- **Authenticate first, then construct.** The routers take a `TenantResolver`,
+  not a bare `authenticate`: it verifies the token, validates the tenant claim,
+  and binds the approval store to that tenant — so there is no pre-auth service
+  for a later refactor to reach for. Swap `staticTokenVerifier` for
+  `hmacVerifier` or your own `TokenVerifier` (JWKS, OIDC); everything else
+  (role checks, separation of duties, self-approval denial, the tenant
+  predicates) stays. With no `APPROVAL_ACTOR_TOKENS` secret the map is empty
+  and every authenticated route 401s — fail closed.
+- **The store factory is isolate-scoped, not request-scoped.**
+  `D1ApprovalStoreFactory` owns one memoized schema-init pass; rebuilding it
+  inside `fetch()` re-runs the whole DDL on every request. The template holds
+  it in a module-scoped `WeakMap` keyed by the D1 binding.
+- **A tenant is not a slug you can guess.** Provision through the `tenants`
+  registry before issuing tokens, and read a tenant's *kind* from that registry
+  rather than inferring it from its id.
 - **The approval queue's create route is off.** `createApprovalRouter` mounts
   `POST /api/approvals` only when passed `allowCreate: true`, and even then a
   body may not set `connectors` (which *is* the minted grant), `requestedBy`

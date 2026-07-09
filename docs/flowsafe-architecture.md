@@ -29,19 +29,27 @@ Endpoints (implemented in `packages/flowsafe/src/approval-api/router.ts`):
 |---|---|---|
 | GET | `/api/approvals` | List approvals (`?status=&workflowId=&runId=&claimedBy=`) |
 | GET | `/api/approvals/:id` | Approval detail with full context |
-| POST | `/api/approvals` | Create a request (idempotent: one open request per workflowId/runId/step) |
+| POST | `/api/approvals` | Create a request — **off by default** (`allowCreate`), and it can never author capability |
 | POST | `/api/approvals/:id/claim` | Claim an approval for review |
 | POST | `/api/approvals/:id/decide` | Approve or reject with comment; resumes the run |
 | POST | `/api/approvals/:id/delegate` | Delegate to another reviewer |
-| GET | `/api/approvals/metrics` | SLA and resolution metrics |
-| POST | `/api/approvals/sla/sweep` | Escalate breached open requests (cron-triggered) |
+| GET | `/api/approvals/metrics` | SLA and resolution metrics (scoped to the caller's tenant) |
+
+There is deliberately **no HTTP SLA-sweep route**. The sweep is an unfiltered
+cross-tenant read *and* write, so it ships as a standalone `sweepSLA(store, …)`
+over a `SystemApprovalStore` — a type request-scoped code cannot obtain — and a
+Workers cron calls it.
 
 Every state change is a status-guarded compare-and-swap in the store (D1
 partial-unique-index + `UPDATE ... RETURNING`), so racing reviewers resolve to
-one winner and the loser gets 409. Authentication is injected
-(`authenticate(request) -> actor`); the service enforces the RBAC role policy
-(reviewers/admins decide, operators/builders/admins create and sweep, every
-role reads) and emits audit events shaped for breakwater's `AuditLogger`.
+one winner and the loser gets 409. Every read and write additionally carries a
+`tenant_id` predicate sourced from the store's constructor (see
+[Multi-tenancy](#multi-tenancy)). The router takes a `TenantResolver`, not a
+bare `authenticate`: it authenticates the request, validates the tenant claim,
+and binds the service to that tenant before any route body runs. The service
+enforces the RBAC role policy (reviewers/admins decide, operators/builders/
+admins create, every role reads) and emits audit events shaped for
+breakwater's `AuditLogger`, each carrying `tenantId` in `detail`.
 
 ### Grant minting (trust boundary 6)
 
@@ -66,11 +74,47 @@ re-suspension needs its own decision).
 
 The runner resolves the provider context BEFORE `createRun`, so a provider
 failure (e.g. the approval store briefly unreachable) rejects the call
-without persisting anything — a caller-supplied runId stays retryable.
+without persisting anything — the minted runId stays retryable.
+
+The resume ordinal that anchors this binding lives in a `ResumeLedger` backed
+by the Durable Object's `ctx.storage`, so it survives eviction, hibernation,
+and code deploys. An in-memory ledger fails closed rather than leaking, but a
+lost ordinal turns an already-approved action into a silent no-op — an
+availability defect, not a confidentiality one.
 
 Separation of duties: `decide()` denies the requester deciding their own
 request (`requestedBy` is attributed server-side to the creating actor);
 deployments opt out only via the explicit `allowSelfDecision` service option.
+
+## Multi-tenancy
+
+One Worker, one D1, one Durable Object namespace, many tenants — with no
+per-tenant database. Three invariants carry it; the threat model
+([`security-threat-model.md`](security-threat-model.md), trust boundary 7)
+states them in full, with the residuals each one does not cover.
+
+- **INV-1** — every `runId` is minted server-side as `` `${tenantId}_${uuid}` ``
+  from the authenticated tenant, and no code path accepts or generates one
+  without a tenant. The Mastra snapshot row, the DO instance name, the per-run
+  lock, the grant-derivation predicate, and the R2 artifact key all key off
+  `runId`, so they become tenant-disjoint for free — no schema change, and no
+  callback signature grows a `tenantId` parameter that a host could forget to
+  thread (TypeScript assigns a fewer-parameter function to a more-parameter
+  slot, so such an omission would compile clean and run cross-tenant).
+- **INV-2** — approval stores are bound to one tenant at construction, via a
+  factory, behind a `unique symbol` brand. Request handlers receive the bound
+  type; the cron sweep receives a distinctly-typed `SystemApprovalStore`.
+  "Cross-tenant reads happen only inside the trusted computing base" is a
+  compile-time property.
+- **INV-3** — `tenantId` matches `^[a-z0-9]{3,32}$`, a charset containing
+  neither `_` nor `` ` ``, which is what makes the run-ownership prefix check
+  and the tenant range-purge exact.
+
+Tenant ids are allocated by the `tenants` registry (insert-or-fail) before any
+token naming them is issued. Offboarding is `purgeTenant(db, { tenantId })`,
+which reaps snapshot rows of *any* status — a visitor who abandons a run at an
+approval gate leaves a `suspended` row the terminal-only retention purge can
+never reap at any age — plus the tenant's approvals and R2 artifacts.
 
 ## React Dashboard
 

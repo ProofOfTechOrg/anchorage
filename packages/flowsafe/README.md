@@ -18,6 +18,7 @@ standalone service with a React approval UI and a DO-based workflow runner.
 | `do-runner` | Durable Object workflow runner (import-swap pattern) |
 | `audit-export` | Cloudflare Queues → SIEM audit export (producer sink + batch consumer) |
 | `artifacts` | R2-backed workflow artifact storage keyed by run identity |
+| `host-kit` | Host-agnostic glue: the identity seam (`TokenVerifier`), the tenant resolver, the shared `/workflows` + `/runs` routes, the tenants registry, the suspension→approval bridge |
 
 A copy-ready production deployment lives in [`deploy/`](deploy/) — a Worker
 wiring all of the above with cron-owned SLA enforcement and retention purge.
@@ -47,6 +48,12 @@ start/resume, leg-scoped to the resumed step. Grants never travel in HTTP
 bodies: a resume that bypasses `decide()` for its step finds no grant and
 fails closed at the connector gate — even when the same connector was
 approved at an earlier gate of the run.
+
+flowsafe is **multi-tenant by construction** (see
+[Multi-tenancy](#multi-tenancy) below): run ids carry their tenant, approval
+stores are bound to one tenant at construction, and the cross-tenant SLA sweep
+is cron-only code that a request handler cannot reach — enforced by the type
+system, not by convention.
 
 ## Usage
 
@@ -97,36 +104,53 @@ import {
   approvalGrantProvider,
   ApprovalService,
   createApprovalRouter,
-  D1ApprovalStore,
+  createTenantResolver,
+  D1ApprovalStoreFactory,
   resumeViaRuntime,
+  sweepSLA,
 } from '@proofoftech/flowsafe/approval-api';
+import { bearerActorAuthenticator, staticTokenVerifier, parseActorTokens }
+  from '@proofoftech/flowsafe/host-kit';
 
-const store = new D1ApprovalStore(env.DB); // shares the runner's D1 database
+// Hoist the factory to module scope: it owns one memoized schema-init pass,
+// so rebuilding it per request re-runs the DDL every time.
+const factory = new D1ApprovalStoreFactory(env.DB); // shares the runner's D1
 
-// 1. Grant-minting seam: wire the provider into the runner so every
-//    start/resume derives `breakwater.approvedConnectors` from APPROVED
-//    records — grants never travel in request bodies.
+// 1. Grant-minting seam. Inside a Durable Object, bind the store to THIS
+//    instance's tenant (recovered from its own idFromName identity), so the
+//    mint can only ever read its own tenant's records.
 const { createWorkflow, createStep, runtime } = init(env, {
-  requestContextForRun: approvalGrantProvider(store),
+  requestContextForRun: approvalGrantProvider(factory.forTenant(this.tenantId)),
 });
 
-// 2. The queue: create on suspend, decide to resume.
-const service = new ApprovalService({
-  store,
-  defaultSlaSeconds: 15 * 60,
-  resumeRun: resumeViaRuntime(runtime), // or a DO-stub fetch across Workers
-  audit: (event) => auditLogger.record(event), // breakwater AuditLogger fits
+// 2. Authenticate FIRST, then construct. The resolver validates the actor's
+//    tenant and binds the store to it, so there is no pre-auth service for a
+//    later refactor to reach for.
+const resolve = createTenantResolver({
+  authenticate: bearerActorAuthenticator(
+    staticTokenVerifier(parseActorTokens(env.APPROVAL_ACTOR_TOKENS)),
+  ),
+  storeFactory: factory,
+  buildService: (store) =>
+    new ApprovalService({
+      store,                                  // tenant-bound; required
+      defaultSlaSeconds: 15 * 60,
+      resumeRun: resumeViaRuntime(runtime),   // or a DO-stub fetch
+      audit: (event) => auditLogger.record(event),
+    }),
 });
 
-// 3. REST surface (list/get/create/claim/decide/delegate/metrics/sla-sweep)
-//    mounted ahead of your other routes; authenticate() is your session/JWT
-//    mapping and is part of the trusted computing base.
-const router = createApprovalRouter({ service, authenticate });
+// 3. REST surface (list/get/claim/decide/delegate/metrics). The create route
+//    is off unless you pass allowCreate.
+const router = createApprovalRouter({ resolve });
 ```
 
-Escalation: run `POST /api/approvals/sla/sweep` from a Workers cron trigger;
-breached open requests transition to `escalated` (still decidable) and fire
-`onEscalation`.
+Escalation is **cron-only**. There is deliberately no HTTP sweep route: the
+sweep is an unfiltered cross-tenant read *and write*, so it lives in a
+standalone `sweepSLA(factory.system(), { systemActor, audit, onEscalation })`
+that takes a `SystemApprovalStore` — a type a request handler cannot obtain.
+Call it from `scheduled()`. Breached open requests transition to `escalated`
+(still decidable) and fire `onEscalation`.
 
 Grant scope: a step-keyed approval unlocks its connectors only for the leg
 that resumes that step, and only for the suspension it was decided during —
@@ -167,10 +191,65 @@ render any UI you like. A ready-to-run reference app lives in `app/` (`pnpm
 in dev — mounts a live seeded approval-api at `/api/approvals` so
 claim/decide/delegate drive real state.
 
+## Multi-tenancy
+
+Three invariants, each enforced at a single chokepoint. Everything else is a
+corollary.
+
+**INV-1 — the run id carries the tenant.** Every `runId` is minted
+server-side as `` `${tenantId}_${uuid}` `` from the *authenticated* tenant.
+`createRunRouter` rejects a client-supplied `body.runId` with 400,
+`RunnerRuntime.start` requires a `runId` (there is no generation fallback),
+and the Durable Object refuses any request whose `(workflowId, runId)`
+disagrees with its own `ctx.id.name`. Because `runId` is the key everything
+else derives from, this makes the Mastra snapshot row, the DO instance, the
+per-run lock, the grant-mint predicate, and the R2 key tenant-disjoint with
+no schema change and no signature change. Status and resume additionally
+check ownership and answer **404** — not 403 — for another tenant's run, so
+the route is not an existence oracle.
+
+**INV-2 — the store is bound to one tenant at construction.** Approval
+stores come only from a factory (`D1ApprovalStoreFactory.forTenant()`), and
+the bound type carries a `unique symbol` brand: an unbound store, or the
+cron-only `SystemApprovalStore`, is a *compile error* wherever a request
+handler expects a bound one. `tenantId` is deliberately not a member of
+`ApprovalListFilter` — an omissible tenant filter is the canonical fail-open.
+Requests flow through a `TenantResolver` (authenticate → validate → bind), so
+no pre-auth store exists.
+
+**INV-3 — the charset makes the prefix exact.** `tenantId` matches
+`^[a-z0-9]{3,32}$`. That set contains no character in `[0x5F, 0x60]` —
+neither `_` nor `` ` `` — so `runId.startsWith(tenantId + '_')` cannot match
+another tenant (`acme` never matches `acmecorp`), and the offboarding range
+delete `` run_id >= '<tid>_' AND run_id < '<tid>`' `` selects exactly one
+tenant's rows. Loosening the charset silently breaks both; a
+character-exhaustive test pins it.
+
+Consequences worth knowing:
+
+- **Provision before you issue tokens.** `provisionTenant(db, { tenantId, kind })`
+  inserts into the `tenants` registry or fails. Nothing else enforces tenant-id
+  uniqueness, and two clients slugged `acme` would merge entirely.
+- **Every actor carries a tenant.** `ApprovalActor` is `{ id, role, tenantId }`;
+  a bearer-map entry or JWT claim without an INV-3-valid `tenantId` is dropped
+  and its token 401s. breakwater's own `Actor` stays tenant-agnostic.
+- **Connector budgets are per-tenant.** The runtime mints an opaque
+  `breakwater.isolationScope` on every leg of a tenant-salted run, and
+  breakwater segments its idempotency and rate-limit keys by it — so one
+  tenant exhausting a connector's budget cannot throttle another, and two
+  tenants sharing a business-level idempotency key do not replay each other's
+  results. Absent scope preserves the single-tenant keys exactly; there is no
+  flag to forget.
+- **Offboarding is one call.** `purgeTenant(db, { tenantId, artifactStore })`
+  reaps snapshots of *any* status (a run abandoned at a gate is never eligible
+  for the terminal-only retention purge), the tenant's approval records, and
+  its R2 artifacts. Only purge tenants whose tokens have already expired.
+
 ### Deployment & ops
 
 Copy [`deploy/`](deploy/) as a production starting point: a Worker wiring one
-DO per run, the D1 approval queue, bearer-token auth, and a cron trigger that
+DO per run, the D1 approval queue, the tenant resolver over a bearer-token
+verifier, an optional subdomain↔tenant cross-check, and a cron trigger that
 owns the SLA sweep and snapshot retention purge. `pnpm deploy:dev` runs it on
 local workerd (no Cloudflare account); `pnpm deploy:cf` deploys it. Checklist
 and configuration table: [`deploy/README.md`](deploy/README.md).

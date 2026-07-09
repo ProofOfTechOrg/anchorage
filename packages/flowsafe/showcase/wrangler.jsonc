@@ -30,8 +30,20 @@
   "assets": {
     "directory": "../app/dist",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*", "/runs", "/runs/*", "/healthz", "/workflows"]
+    "run_worker_first": [
+      "/api/*",
+      "/runs",
+      "/runs/*",
+      "/healthz",
+      "/workflows",
+      "/auth/*"
+    ]
   },
+  // The public demo runs REAL isolate CPU per visitor run. Cap it (Workers
+  // PAID feature — the demo needs the paid plan anyway for sane limits) and
+  // set a billing alert in the dashboard: the caps below REACT to load; the
+  // alert is what tells you they are reacting.
+  "limits": { "cpu_ms": 30000 },
   // The showcase runs OFFLINE by default: no `send_email` binding => the
   // gtm-outbound connector simulates the send (logs the envelope, zero secrets),
   // and the CRM/deploy egress connectors simulate too (they are wired from
@@ -41,8 +53,12 @@
   // Cloudflare Email Service is TRANSACTIONAL — for bulk campaigns swap the
   // connector's execute for a marketing ESP.
   // "send_email": [{ "name": "EMAIL" }],
-  // Every firing runs the SLA sweep + retention purge (worker.ts scheduled()).
-  "triggers": { "crons": ["*/15 * * * *"] },
+  // TWO cron expressions, dispatched on controller.cron (worker.ts
+  // SWEEP_CRON / PURGE_CRON — keep these literals in sync): the SLA sweep and
+  // the purge never share an invocation, because a CPU-limit termination
+  // kills the isolate un-catchably and a slow sweep would otherwise starve
+  // the purge forever.
+  "triggers": { "crons": ["*/15 * * * *", "7 * * * *"] },
   // Optional audit export to a SIEM: `wrangler queues create showcase-audit`
   // (and -dlq), uncomment, then set SIEM_ENDPOINT (var) + SIEM_AUTH_HEADER
   // (secret). Without this block, audit stays on structured Workers Logs only.
@@ -60,16 +76,28 @@
     "APPROVAL_SLA_SECONDS": "14400",
     "RUN_RETENTION_DAYS": "30",
     "OUTREACH_FROM_ADDRESS": "gtm@example.com",
-    "OUTREACH_FROM_NAME": "Anchorage Showcase"
+    "OUTREACH_FROM_NAME": "Anchorage Showcase",
+    // Public-demo tuning (ops-tunable without a code change). The DAILY cap
+    // is the spend backstop — per-identity limits are a speed bump against N
+    // free accounts, so size this for tolerable spend, not expected traffic.
+    "DEMO_TENANT_RUN_CAP": "20",
+    "DEMO_DAILY_RUN_CAP": "500",
+    "DEMO_TENANT_TTL_HOURS": "24",
+    "DEMO_JWT_TTL_SECONDS": "3600"
+    // "GITHUB_CLIENT_ID": "<your OAuth app client id>",
+    // "DEMO_DISABLED": "true",   // kill switch: 503s /auth/* AND stops
+    //                            // verifying already-issued demo JWTs
     // "SIEM_ENDPOINT": "https://siem.example/services/collector"
   }
   // Secrets (set with `wrangler secret put <name>`):
-  //   APPROVAL_ACTOR_TOKENS — REQUIRED. The bearer -> actor map every
-  //     authenticated route resolves identity against. It is deliberately NOT a
-  //     var here: no credentials are baked into a deployable config, so a deploy
-  //     without this secret 401s everywhere (fail closed). Local dev reads it
-  //     from `showcase/.dev.vars` (`cp showcase/.dev.vars.example` first).
-  //     Never seed the repo's demo tokens as the real secret — they are
+  //   APPROVAL_ACTOR_TOKENS — operator/admin bearer map. Deliberately NOT a
+  //     var here: no credentials are baked into a deployable config, so a
+  //     deploy without secrets 401s everywhere (fail closed). Local dev reads
+  //     `showcase/.dev.vars` (`cp showcase/.dev.vars.example` first). Never
+  //     seed the repo's demo tokens as the real secret — they are
   //     world-known, and one of them is `admin`.
+  //   DEMO_JWT_SECRET — turns the public OAuth demo ON: signs the per-visitor
+  //     HS256 token sets and the OAuth state. Generate long + random.
+  //   GITHUB_CLIENT_SECRET — pairs with the GITHUB_CLIENT_ID var.
   //   SIEM_AUTH_HEADER — sent as the `authorization` header on audit export.
 }

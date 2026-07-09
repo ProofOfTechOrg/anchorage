@@ -12,6 +12,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   type ApprovalActor,
+  approvalGrantProvider,
   ApprovalService,
   InMemoryApprovalStore,
   resumeViaRuntime,
@@ -19,15 +20,23 @@ import {
 import { buildShowcaseRuntime } from './runtime.js';
 import { OUTREACH_CONNECTOR } from './workflows/gtm-outbound.js';
 
-const OPERATOR: ApprovalActor = { id: 'opal', role: 'operator' };
-const REVIEWER: ApprovalActor = { id: 'ray', role: 'reviewer' };
+const OPERATOR: ApprovalActor = {
+  id: 'opal',
+  role: 'operator',
+  tenantId: 'demo',
+};
+const REVIEWER: ApprovalActor = {
+  id: 'ray',
+  role: 'reviewer',
+  tenantId: 'demo',
+};
 
 function buildHarness() {
-  const store = new InMemoryApprovalStore();
+  const store = new InMemoryApprovalStore('demo');
   const audit = new AuditLogger();
   const runtime = buildShowcaseRuntime({
     initInput: { storage: new InMemoryStore() },
-    approvalStore: store,
+    grantProvider: approvalGrantProvider(store),
     audit,
     // no `email` binding => the connector simulates the send
   });
@@ -76,6 +85,7 @@ describe('gtm-app: outreach pipeline on real Anchorage seams (simulated send)', 
     // #given — a run suspended at the approval gate, queued as an approval
     const { runtime, service, audit } = buildHarness();
     const started = await runtime.start('gtm-outbound', {
+      runId: `demo_${crypto.randomUUID()}`,
       inputData: { industry: 'fintech', targetCount: 50 },
     });
     expect(started.status).toBe('suspended');
@@ -114,6 +124,7 @@ describe('gtm-app: outreach pipeline on real Anchorage seams (simulated send)', 
     // #given — a suspended run, nothing approved
     const { runtime, audit } = buildHarness();
     const started = await runtime.start('gtm-outbound', {
+      runId: `demo_${crypto.randomUUID()}`,
       inputData: { industry: 'fintech', targetCount: 50 },
     });
     expect(started.status).toBe('suspended');
@@ -139,6 +150,7 @@ describe('gtm-app: outreach pipeline on real Anchorage seams (simulated send)', 
     // #given — a suspended run queued as an approval
     const { runtime, service, audit } = buildHarness();
     const started = await runtime.start('gtm-outbound', {
+      runId: `demo_${crypto.randomUUID()}`,
       inputData: { industry: 'fintech', targetCount: 50 },
     });
     const record = await queueApproval(

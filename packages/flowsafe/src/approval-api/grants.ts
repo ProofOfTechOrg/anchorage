@@ -62,8 +62,10 @@ import type {
   RunnerRuntime,
   RunSummary,
 } from '../do-runner/index.js';
+import { tenantOfRunId } from '../do-runner/path-safe-id.js';
 import { BREAKWATER_APPROVED_CONNECTORS_KEY } from './contract.js';
 import { type ApprovalStore, stepKeyOf } from './store.js';
+import type { TenantBoundApprovalStore } from './tenant-brand.js';
 import type { ApprovalDecision, ApprovalRecord } from './types.js';
 
 // Whether a step-keyed approval is bound to the resumed step's CURRENT
@@ -121,6 +123,12 @@ export async function approvedConnectorsForLeg(
   runId: string,
   leg: RunLeg,
 ): Promise<string[]> {
+  // The `runId` predicate is LOAD-BEARING and must never be "optimized away"
+  // in favor of the store's tenant binding: under INV-1 a salted runId
+  // belongs to exactly one tenant, so this predicate is what keeps the mint
+  // tenant-safe even from an unbound or mis-bound store (the binding is
+  // defense in depth, not the fix). grants.test.ts pins the exact filter
+  // with a spy store.
   const approved = await store.list({ workflowId, runId, status: 'approved' });
   const targetKey =
     leg.kind === 'resume' && leg.step !== undefined
@@ -149,9 +157,14 @@ export async function approvedConnectorsForLeg(
  * RequestContextProvider wiring the approval store into the DO runner:
  * pass as init()'s / RunnerRuntimeOptions' requestContextForRun. Part of the
  * trusted computing base — it writes the breakwater grant key.
+ *
+ * Takes a TENANT-BOUND store (the brand): a DO builds it as
+ * `factory.forTenant(this.tenantId)` from its own identity. A
+ * SystemApprovalStore is not assignable here — the type-level assertion in
+ * grants.test.ts pins that.
  */
 export function approvalGrantProvider(
-  store: ApprovalStore,
+  store: TenantBoundApprovalStore,
 ): RequestContextProvider {
   return async (workflowId, runId, leg) => {
     const connectors = await approvedConnectorsForLeg(
@@ -162,6 +175,32 @@ export function approvalGrantProvider(
     );
     // Always return the key (even empty) — see the header: overwrite, don't
     // inherit, so stale grants from earlier legs cannot survive the merge.
+    return { [BREAKWATER_APPROVED_CONNECTORS_KEY]: connectors };
+  };
+}
+
+/**
+ * Factory-backed provider for hosts whose ONE runtime serves every tenant
+ * in-process (the dev plugin; DO hosts bind per-instance instead). The
+ * tenant is recovered from the leg's runId prefix — the same INV-1 carrier
+ * the DO name join uses — and the store is bound per leg. A runId without a
+ * valid tenant prefix mints an EMPTY grant list (fail closed), never a
+ * cross-tenant read.
+ */
+export function approvalGrantProviderFromFactory(factory: {
+  forTenant(tenantId: string): TenantBoundApprovalStore;
+}): RequestContextProvider {
+  return async (workflowId, runId, leg) => {
+    const tenantId = tenantOfRunId(runId);
+    if (tenantId === undefined) {
+      return { [BREAKWATER_APPROVED_CONNECTORS_KEY]: [] };
+    }
+    const connectors = await approvedConnectorsForLeg(
+      factory.forTenant(tenantId),
+      workflowId,
+      runId,
+      leg,
+    );
     return { [BREAKWATER_APPROVED_CONNECTORS_KEY]: connectors };
   };
 }

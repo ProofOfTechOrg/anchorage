@@ -15,9 +15,11 @@ export {
   crossWorkflowIsolation,
   denyPatterns,
   extractMessageText,
+  ISOLATION_SCOPE_CONTEXT_KEY,
   maxTextLength,
   networkEgress,
   PolicyEngine,
+  tenantIsolation,
   WORKFLOW_SCOPE_CONTEXT_KEY,
 } from './policy-engine/index.js';
 export type {

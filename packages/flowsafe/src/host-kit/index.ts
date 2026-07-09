@@ -25,4 +25,32 @@ export { assertWorkflowsRegistered } from './registration.js';
 export { RunRouteError } from './run-route-error.js';
 export { createRunRouter } from './run-router.js';
 export type { RunRouter, RunRouterOptions } from './run-router.js';
+export {
+  subdomainTenantOf,
+  withSubdomainCrossCheck,
+} from './subdomain-check.js';
+export type { SubdomainCrossCheckOptions } from './subdomain-check.js';
+export {
+  provisionTenant,
+  RESERVED_TENANT_SLUGS,
+  TenantCollisionError,
+} from './tenant-registry.js';
+export type {
+  ProvisionTenantOptions,
+  TenantRegistryDatabase,
+  TenantRegistryStatement,
+} from './tenant-registry.js';
+export {
+  base64UrlEncode,
+  hmacSign,
+  hmacVerifier,
+  mintHmacToken,
+  staticTokenVerifier,
+  toApprovalActor,
+} from './verifier.js';
+export type {
+  HmacVerifierOptions,
+  MintHmacTokenOptions,
+  TokenVerifier,
+} from './verifier.js';
 export type { WorkflowMeta } from './workflow-meta.js';

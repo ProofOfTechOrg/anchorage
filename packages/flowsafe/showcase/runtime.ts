@@ -10,7 +10,6 @@ import {
   InMemoryRateLimitStore,
 } from '@proofoftech/breakwater';
 
-import { approvalGrantProvider } from '../src/approval-api/index.js';
 import {
   InMemoryArtifactBucket,
   R2ArtifactStore,
@@ -72,8 +71,10 @@ export function buildShowcaseRuntime(deps: ShowcaseDeps): RunnerRuntime {
   const { createWorkflow, createStep, runtime } = init(deps.initInput, {
     // The grant-minting seam: on every start/resume the runtime derives the
     // breakwater grant key from APPROVED records — decisions become
-    // capabilities without any grant crossing a request body.
-    requestContextForRun: approvalGrantProvider(deps.approvalStore),
+    // capabilities without any grant crossing a request body. The provider is
+    // host-built (see ShowcaseDeps.grantProvider) so the store binding matches
+    // the host's topology.
+    requestContextForRun: deps.grantProvider,
   });
 
   for (const workflowModule of SHOWCASE_MODULES) {

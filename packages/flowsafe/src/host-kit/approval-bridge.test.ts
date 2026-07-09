@@ -20,8 +20,12 @@ import {
   resumeRunWithRequeue,
 } from './index.js';
 
-const SYSTEM: ApprovalActor = { id: 'sys', role: 'operator' };
-const REVIEWER: ApprovalActor = { id: 'ray', role: 'reviewer' };
+const SYSTEM: ApprovalActor = { id: 'sys', role: 'operator', tenantId: 'acme' };
+const REVIEWER: ApprovalActor = {
+  id: 'ray',
+  role: 'reviewer',
+  tenantId: 'acme',
+};
 
 describe('requestedConnectors', () => {
   it.each([
@@ -60,10 +64,10 @@ function suspendedSummary(
 describe('queueApprovalForSuspension', () => {
   it('captures the suspended step, its (suspendedAt, resumeCount) pair, and connectors', async () => {
     // #given — a run suspended at gate2 on its second suspension
-    const store = new InMemoryApprovalStore();
+    const store = new InMemoryApprovalStore('acme');
     const service = new ApprovalService({ store });
     const summary = suspendedSummary(
-      'run-1',
+      'acme_run-1',
       'gate2',
       ['deploy-conn'],
       1717,
@@ -82,7 +86,7 @@ describe('queueApprovalForSuspension', () => {
     // #then — the binding fingerprint is copied verbatim from the summary
     expect(record).toMatchObject({
       workflowId: 'product-launch',
-      runId: 'run-1',
+      runId: 'acme_run-1',
       stepPath: ['gate2'],
       suspendedAt: 1717,
       resumeCount: 2,
@@ -96,9 +100,15 @@ describe('queueApprovalForSuspension', () => {
 describe('resumeRunWithRequeue', () => {
   it('re-queues the next gate attributed to the decider (SoD across gates)', async () => {
     // #given — a service whose base resume re-suspends the run at a 2nd gate
-    const store = new InMemoryApprovalStore();
+    const store = new InMemoryApprovalStore('acme');
     const base: ResumeRunFn = async () =>
-      suspendedSummary('run-1', 'confirmRollout', ['deploy-conn'], 2020, 1);
+      suspendedSummary(
+        'acme_run-1',
+        'confirmRollout',
+        ['deploy-conn'],
+        2020,
+        1,
+      );
     // service forward-references itself in the resumeRun closure (invoked only
     // on a later decision); the same const-with-deferred-ref shape worker.ts uses.
     const service: ApprovalService = new ApprovalService({
@@ -110,7 +120,7 @@ describe('resumeRunWithRequeue', () => {
     const { record: gate1 } = await service.create(
       {
         workflowId: 'product-launch',
-        runId: 'run-1',
+        runId: 'acme_run-1',
         stepPath: ['approveLaunch'],
         suspendedAt: 1000,
         title: 'Approve launch',
@@ -137,9 +147,9 @@ describe('resumeRunWithRequeue', () => {
 
   it('does not re-queue when the resumed run reaches a terminal status', async () => {
     // #given — a base resume that completes the run
-    const store = new InMemoryApprovalStore();
+    const store = new InMemoryApprovalStore('acme');
     const base: ResumeRunFn = async () => ({
-      runId: 'run-2',
+      runId: 'acme_run-2',
       status: 'success',
       result: { done: true },
     });
@@ -150,7 +160,7 @@ describe('resumeRunWithRequeue', () => {
     const { record } = await service.create(
       {
         workflowId: 'gtm-outbound',
-        runId: 'run-2',
+        runId: 'acme_run-2',
         stepPath: ['reviewAndApprove'],
         suspendedAt: 5,
         title: 'Approve',
@@ -169,12 +179,12 @@ describe('resumeRunWithRequeue', () => {
 
   it('fails closed: refuses to re-queue a suspension with no decider', async () => {
     // #given — the wrapper invoked directly with a record lacking decidedBy
-    const store = new InMemoryApprovalStore();
+    const store = new InMemoryApprovalStore('acme');
     const service = new ApprovalService({ store });
     const base: ResumeRunFn = async () =>
-      suspendedSummary('run-3', 'gate2', ['c'], 9);
+      suspendedSummary('acme_run-3', 'gate2', ['c'], 9);
     const wrapped = resumeRunWithRequeue(base, () => service, SYSTEM);
-    const record = { workflowId: 'wf', runId: 'run-3' } as ApprovalRecord;
+    const record = { workflowId: 'wf', runId: 'acme_run-3' } as ApprovalRecord;
 
     // #when / #then — re-queue without a requester is a hard error, not a
     // silent fall back to the system id

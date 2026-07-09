@@ -4,13 +4,23 @@
 // rows and it gets null). Open-request uniqueness is a partial unique index,
 // so duplicate creates collapse to the existing open record even across
 // concurrent Workers.
+//
+// TENANT BINDING (INV-2): the store is bound to ONE tenant at construction
+// and every SELECT/UPDATE carries `tenant_id = ?` sourced from that field —
+// never from a request parameter. `tenantId` is deliberately NOT a member of
+// ApprovalListFilter: an omissible tenant filter is the canonical fail-open
+// (an empty filter would scan every tenant). Construct through
+// D1ApprovalStoreFactory (tenant-store.ts) — this class is not exported from
+// the package barrel.
 
+import { TENANT_ID_PATTERN } from '../do-runner/path-safe-id.js';
 import {
   type ApprovalPatch,
   type ApprovalStore,
   type CreateResult,
   stepKeyOf,
 } from './store.js';
+import { TENANT_BOUND, type SystemApprovalStore } from './tenant-brand.js';
 import {
   type ApprovalListFilter,
   type ApprovalRecord,
@@ -35,11 +45,21 @@ export interface ApprovalPreparedStatement {
 
 const TABLE = 'flowsafe_approvals';
 
-// Partial unique index = the open-uniqueness invariant. Decided rows fall out
-// of the index, so a re-suspension of the same step can open a fresh request.
+// Partial unique index = the open-uniqueness invariant, now tenant-first.
+// Decided rows fall out of the index, so a re-suspension of the same step can
+// open a fresh request.
+//
+// THE FATAL TRAP, spelled out: `CREATE UNIQUE INDEX IF NOT EXISTS` matches on
+// NAME ONLY — redefining the old `flowsafe_approvals_open_step` with a
+// leading tenant_id would be a SILENT NO-OP on any database that already has
+// it, leaving open-uniqueness enforced WITHOUT the tenant dimension (tenant
+// B's create would collapse into tenant A's open record). The migration must
+// DROP the old index and create the new one under a NEW NAME, and the
+// schema-upgrade test creates the OLD index first to prove the drop happens.
 const SCHEMA_STATEMENTS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS ${TABLE} (
     id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
     workflow_id TEXT NOT NULL,
     run_id TEXT NOT NULL,
     step_key TEXT NOT NULL DEFAULT '',
@@ -67,15 +87,19 @@ const SCHEMA_STATEMENTS: readonly string[] = [
     escalated_at TEXT,
     sla_deadline_at TEXT
   )`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS ${TABLE}_open_step
-    ON ${TABLE} (workflow_id, run_id, step_key)
+  `DROP INDEX IF EXISTS ${TABLE}_open_step`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS ${TABLE}_open_step_v2
+    ON ${TABLE} (tenant_id, workflow_id, run_id, step_key)
     WHERE status IN ('pending', 'claimed', 'escalated')`,
   `CREATE INDEX IF NOT EXISTS ${TABLE}_status ON ${TABLE} (status)`,
-  `CREATE INDEX IF NOT EXISTS ${TABLE}_run ON ${TABLE} (workflow_id, run_id)`,
+  `DROP INDEX IF EXISTS ${TABLE}_run`,
+  `CREATE INDEX IF NOT EXISTS ${TABLE}_run_v2
+    ON ${TABLE} (tenant_id, workflow_id, run_id)`,
 ];
 
 interface ApprovalRow {
   id: string;
+  tenant_id: string;
   workflow_id: string;
   run_id: string;
   step_key: string;
@@ -118,9 +142,62 @@ const PATCH_COLUMNS: Record<keyof ApprovalPatch, string> = {
   escalatedAt: 'escalated_at',
 };
 
+/**
+ * The optional WHERE clauses of list(), shared verbatim by the tenant-bound
+ * store and the cron-only system view. The bound store SEEDS the arrays with
+ * its unconditional `tenant_id = ?`; the system view seeds them empty. Two
+ * hand-written copies would drift, and only one of them is on the request
+ * path (the other is the sweep) — so a fix would silently miss it.
+ */
+function appendListFilters(
+  filter: ApprovalListFilter,
+  where: string[],
+  values: unknown[],
+): void {
+  if (filter.status !== undefined) {
+    const statuses = Array.isArray(filter.status)
+      ? filter.status
+      : [filter.status];
+    where.push(`status IN (${statuses.map(() => '?').join(', ')})`);
+    values.push(...statuses);
+  }
+  if (filter.workflowId !== undefined) {
+    where.push('workflow_id = ?');
+    values.push(filter.workflowId);
+  }
+  if (filter.runId !== undefined) {
+    where.push('run_id = ?');
+    values.push(filter.runId);
+  }
+  if (filter.claimedBy !== undefined) {
+    where.push('claimed_by = ?');
+    values.push(filter.claimedBy);
+  }
+}
+
+/** The `SET col = ?` fragments + bound values of a CAS patch — both views. */
+function buildPatchSets(patch: ApprovalPatch): {
+  sets: string[];
+  values: unknown[];
+} {
+  const sets: string[] = [];
+  const values: unknown[] = [];
+  for (const [field, column] of Object.entries(PATCH_COLUMNS) as Array<
+    [keyof ApprovalPatch, string]
+  >) {
+    const value = patch[field];
+    if (value !== undefined) {
+      sets.push(`${column} = ?`);
+      values.push(value);
+    }
+  }
+  return { sets, values };
+}
+
 function rowToRecord(row: ApprovalRow): ApprovalRecord {
   const record: ApprovalRecord = {
     id: row.id,
+    tenantId: row.tenant_id,
     workflowId: row.workflow_id,
     runId: row.run_id,
     title: row.title,
@@ -160,59 +237,129 @@ function isUniqueViolation(error: unknown): boolean {
   );
 }
 
+export interface D1ApprovalStoreOptions {
+  tenantId: string;
+  /**
+   * Shared schema gate: the factory memoizes ONE schema-init promise across
+   * every per-request forTenant() store, so DDL runs once per isolate rather
+   * than once per request. Default: this instance memoizes its own.
+   */
+  ready?: () => Promise<void>;
+}
+
+/**
+ * One-shot schema creation + fail-closed shape check. Exported for the
+ * factory (which owns the cross-instance memo) and the schema tests.
+ *
+ * REFUSES a pre-tenant table: `ALTER TABLE ... ADD COLUMN tenant_id TEXT NOT
+ * NULL` without a default is rejected by SQLite even on an empty table, and a
+ * NULL/'' tenant is an isolation hole — so there is deliberately NO backfill.
+ * A database created before the tenant column must be recreated (nothing is
+ * deployed; local `.wrangler/` state is deleted, not migrated).
+ */
+export async function createApprovalSchema(
+  db: ApprovalDatabase,
+): Promise<void> {
+  const existing = await db
+    .prepare(`PRAGMA table_info(${TABLE})`)
+    .all<{ name: string }>();
+  const columns = new Set(existing.results.map((column) => column.name));
+  if (columns.size > 0 && !columns.has('tenant_id')) {
+    throw new Error(
+      `${TABLE} exists WITHOUT the tenant_id column — a tenant-less approvals table cannot be isolated and cannot be backfilled (SQLite rejects ADD COLUMN ... NOT NULL, and a NULL tenant is an isolation hole). Recreate the database: for local dev, delete the .wrangler state directory; nothing production is deployed.`,
+    );
+  }
+  for (const statement of SCHEMA_STATEMENTS) {
+    await db.prepare(statement).run();
+  }
+  // Post-tenant, pre-{suspended_at,resumed_at,resume_count,run_scoped}
+  // databases backfill those nullable INTEGER columns in place (see the
+  // upgrade-window notes in the git history); tenant_id can never join this
+  // loop — it is TEXT NOT NULL and semantically non-backfillable.
+  for (const column of [
+    'suspended_at',
+    'resumed_at',
+    'resume_count',
+    'run_scoped',
+  ]) {
+    try {
+      await db
+        .prepare(`ALTER TABLE ${TABLE} ADD COLUMN ${column} INTEGER`)
+        .run();
+    } catch (error) {
+      if (!isDuplicateColumn(error)) throw error;
+    }
+  }
+}
+
 export class D1ApprovalStore implements ApprovalStore {
+  readonly tenantId: string;
+  readonly [TENANT_BOUND] = true as const;
   readonly #db: ApprovalDatabase;
+  readonly #sharedReady?: () => Promise<void>;
   #schemaReady?: Promise<void>;
 
-  constructor(db: ApprovalDatabase) {
+  constructor(db: ApprovalDatabase, options: D1ApprovalStoreOptions) {
+    if (!TENANT_ID_PATTERN.test(options.tenantId)) {
+      throw new Error(
+        `D1ApprovalStore: tenantId '${options.tenantId}' violates INV-3 (^[a-z0-9]{3,32}$)`,
+      );
+    }
     this.#db = db;
+    this.tenantId = options.tenantId;
+    this.#sharedReady = options.ready;
   }
 
   async create(record: ApprovalRecord): Promise<CreateResult> {
     await this.#ready();
-    // Clone BEFORE the INSERT: a non-cloneable payload must fail the call
-    // without persisting anything (the in-memory store fails at the same
-    // point), never orphan a row behind a thrown create.
-    const snapshot = structuredClone(record);
+    // Stamp the tenant from the binding, never from the record: a field the
+    // caller cannot control cannot be spoofed. Clone BEFORE the INSERT: a
+    // non-cloneable payload must fail the call without persisting anything
+    // (the in-memory store fails at the same point), never orphan a row
+    // behind a thrown create.
+    const snapshot = structuredClone({ ...record, tenantId: this.tenantId });
     try {
       await this.#db
         .prepare(
           `INSERT INTO ${TABLE} (
-            id, workflow_id, run_id, step_key, step_path, suspended_at,
-            resumed_at, resume_count, run_scoped, title, summary, payload,
-            connectors, priority, status, requested_by, claimed_by, decided_by,
-            decision, comment, delegated_to, created_at, updated_at, claimed_at,
-            decided_at, escalated_at, sla_deadline_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            id, tenant_id, workflow_id, run_id, step_key, step_path,
+            suspended_at, resumed_at, resume_count, run_scoped, title, summary,
+            payload, connectors, priority, status, requested_by, claimed_by,
+            decided_by, decision, comment, delegated_to, created_at, updated_at,
+            claimed_at, decided_at, escalated_at, sla_deadline_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .bind(
-          record.id,
-          record.workflowId,
-          record.runId,
-          stepKeyOf(record.stepPath),
-          record.stepPath ? JSON.stringify(record.stepPath) : null,
-          record.suspendedAt ?? null,
-          record.resumedAt ?? null,
-          record.resumeCount ?? null,
-          record.runScoped === undefined ? null : record.runScoped ? 1 : 0,
-          record.title,
-          record.summary ?? null,
-          record.payload === undefined ? null : JSON.stringify(record.payload),
-          JSON.stringify(record.connectors),
-          record.priority,
-          record.status,
-          record.requestedBy ?? null,
-          record.claimedBy ?? null,
-          record.decidedBy ?? null,
-          record.decision ?? null,
-          record.comment ?? null,
-          record.delegatedTo ?? null,
-          record.createdAt,
-          record.updatedAt,
-          record.claimedAt ?? null,
-          record.decidedAt ?? null,
-          record.escalatedAt ?? null,
-          record.slaDeadlineAt ?? null,
+          snapshot.id,
+          this.tenantId,
+          snapshot.workflowId,
+          snapshot.runId,
+          stepKeyOf(snapshot.stepPath),
+          snapshot.stepPath ? JSON.stringify(snapshot.stepPath) : null,
+          snapshot.suspendedAt ?? null,
+          snapshot.resumedAt ?? null,
+          snapshot.resumeCount ?? null,
+          snapshot.runScoped === undefined ? null : snapshot.runScoped ? 1 : 0,
+          snapshot.title,
+          snapshot.summary ?? null,
+          snapshot.payload === undefined
+            ? null
+            : JSON.stringify(snapshot.payload),
+          JSON.stringify(snapshot.connectors),
+          snapshot.priority,
+          snapshot.status,
+          snapshot.requestedBy ?? null,
+          snapshot.claimedBy ?? null,
+          snapshot.decidedBy ?? null,
+          snapshot.decision ?? null,
+          snapshot.comment ?? null,
+          snapshot.delegatedTo ?? null,
+          snapshot.createdAt,
+          snapshot.updatedAt,
+          snapshot.claimedAt ?? null,
+          snapshot.decidedAt ?? null,
+          snapshot.escalatedAt ?? null,
+          snapshot.slaDeadlineAt ?? null,
         )
         .run();
     } catch (error) {
@@ -220,9 +367,9 @@ export class D1ApprovalStore implements ApprovalStore {
         // Could be the open-uniqueness index (expected: return the existing
         // open record) or the id primary key (caller bug: rethrow).
         const open = await this.#openFor(
-          record.workflowId,
-          record.runId,
-          stepKeyOf(record.stepPath),
+          snapshot.workflowId,
+          snapshot.runId,
+          stepKeyOf(snapshot.stepPath),
         );
         if (open) return { record: open, created: false };
       }
@@ -233,40 +380,24 @@ export class D1ApprovalStore implements ApprovalStore {
 
   async get(id: string): Promise<ApprovalRecord | null> {
     await this.#ready();
+    // Wrong tenant == unknown id: no oracle for other tenants' record ids.
     const row = await this.#db
-      .prepare(`SELECT * FROM ${TABLE} WHERE id = ?`)
-      .bind(id)
+      .prepare(`SELECT * FROM ${TABLE} WHERE id = ? AND tenant_id = ?`)
+      .bind(id, this.tenantId)
       .first<ApprovalRow>();
     return row ? rowToRecord(row) : null;
   }
 
   async list(filter: ApprovalListFilter = {}): Promise<ApprovalRecord[]> {
     await this.#ready();
-    const where: string[] = [];
-    const values: unknown[] = [];
-    if (filter.status !== undefined) {
-      const statuses = Array.isArray(filter.status)
-        ? filter.status
-        : [filter.status];
-      where.push(`status IN (${statuses.map(() => '?').join(', ')})`);
-      values.push(...statuses);
-    }
-    if (filter.workflowId !== undefined) {
-      where.push('workflow_id = ?');
-      values.push(filter.workflowId);
-    }
-    if (filter.runId !== undefined) {
-      where.push('run_id = ?');
-      values.push(filter.runId);
-    }
-    if (filter.claimedBy !== undefined) {
-      where.push('claimed_by = ?');
-      values.push(filter.claimedBy);
-    }
-    const clause = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : '';
+    // Tenant FIRST, unconditionally, before every optional clause — the WHERE
+    // is never empty, so an empty filter scans one tenant, not the table.
+    const where: string[] = ['tenant_id = ?'];
+    const values: unknown[] = [this.tenantId];
+    appendListFilters(filter, where, values);
     const { results } = await this.#db
       .prepare(
-        `SELECT * FROM ${TABLE}${clause} ORDER BY created_at ASC, id ASC`,
+        `SELECT * FROM ${TABLE} WHERE ${where.join(' AND ')} ORDER BY created_at ASC, id ASC`,
       )
       .bind(...values)
       .all<ApprovalRow>();
@@ -280,24 +411,16 @@ export class D1ApprovalStore implements ApprovalStore {
   ): Promise<ApprovalRecord | null> {
     if (from.length === 0) return null;
     await this.#ready();
-    const sets: string[] = [];
-    const values: unknown[] = [];
-    for (const [field, column] of Object.entries(PATCH_COLUMNS) as Array<
-      [keyof ApprovalPatch, string]
-    >) {
-      const value = patch[field];
-      if (value !== undefined) {
-        sets.push(`${column} = ?`);
-        values.push(value);
-      }
-    }
+    const { sets, values } = buildPatchSets(patch);
+    // A wrong tenant matches zero rows and reuses the existing loser-of-CAS
+    // null path (404/409 upstream) — no new error branch, no oracle.
     const row = await this.#db
       .prepare(
         `UPDATE ${TABLE} SET ${sets.join(', ')}
-         WHERE id = ? AND status IN (${from.map(() => '?').join(', ')})
+         WHERE id = ? AND tenant_id = ? AND status IN (${from.map(() => '?').join(', ')})
          RETURNING *`,
       )
-      .bind(...values, id, ...from)
+      .bind(...values, id, this.tenantId, ...from)
       .first<ApprovalRow>();
     return row ? rowToRecord(row) : null;
   }
@@ -310,63 +433,74 @@ export class D1ApprovalStore implements ApprovalStore {
     const row = await this.#db
       .prepare(
         `SELECT * FROM ${TABLE}
-         WHERE workflow_id = ? AND run_id = ? AND step_key = ?
+         WHERE tenant_id = ? AND workflow_id = ? AND run_id = ? AND step_key = ?
            AND status IN (${OPEN_STATUSES.map(() => '?').join(', ')})
          LIMIT 1`,
       )
-      .bind(workflowId, runId, stepKey, ...OPEN_STATUSES)
+      .bind(this.tenantId, workflowId, runId, stepKey, ...OPEN_STATUSES)
       .first<ApprovalRow>();
     return row ? rowToRecord(row) : null;
   }
 
   // Lazy, memoized schema creation; a failed attempt clears the memo so the
-  // next call retries instead of pinning the store to a dead promise.
+  // next call retries instead of pinning the store to a dead promise. When
+  // the factory injected a shared gate, defer to it (one DDL pass per
+  // isolate, not per request-scoped store).
   #ready(): Promise<void> {
-    this.#schemaReady ??= this.#createSchema().catch((error: unknown) => {
-      this.#schemaReady = undefined;
-      throw error;
-    });
+    if (this.#sharedReady) return this.#sharedReady();
+    this.#schemaReady ??= createApprovalSchema(this.#db).catch(
+      (error: unknown) => {
+        this.#schemaReady = undefined;
+        throw error;
+      },
+    );
     return this.#schemaReady;
-  }
-
-  async #createSchema(): Promise<void> {
-    for (const statement of SCHEMA_STATEMENTS) {
-      await this.#db.prepare(statement).run();
-    }
-    // Pre-existing databases (.wrangler/ spike state, or an earlier release)
-    // predate suspended_at, resumed_at, resume_count, and/or run_scoped, and
-    // there is no migration machinery: CREATE IF NOT EXISTS skips the table, so
-    // backfill each missing column in place. A DB from an earlier release has
-    // the older columns but not the newer ones — the per-column loop upgrades
-    // it. Only the duplicate-column error (the table already has the column) is
-    // swallowed; anything else propagates. The column names are fixed
-    // literals, so the interpolation carries no injection surface. Upgrade
-    // window: an approval decided under a pre-resume_count schema and bound to
-    // a re-suspension reads back with resume_count NULL, so the tightened
-    // (suspendedAt, resumeCount) pair binding re-denies it fail-closed — the
-    // run stays suspended and a fresh approval for the current suspension mints
-    // correctly (grants.ts). A pre-resume_count first-suspension approval still
-    // mints (resume_count NULL matches a first-suspension leg's undefined). A
-    // pre-run_scoped step-less record backfills to NULL and therefore mints
-    // NOTHING — the same fail-closed direction: run-scope is now explicit, so a
-    // record that never named it never had it.
-    for (const column of [
-      'suspended_at',
-      'resumed_at',
-      'resume_count',
-      'run_scoped',
-    ]) {
-      try {
-        await this.#db
-          .prepare(`ALTER TABLE ${TABLE} ADD COLUMN ${column} INTEGER`)
-          .run();
-      } catch (error) {
-        if (!isDuplicateColumn(error)) throw error;
-      }
-    }
   }
 }
 
 function isDuplicateColumn(error: unknown): boolean {
   return error instanceof Error && /duplicate column/i.test(error.message);
+}
+
+/** The cron-only cross-tenant view over the same table — see tenant-brand.ts. */
+export function d1SystemApprovalStore(
+  db: ApprovalDatabase,
+  ready: () => Promise<void>,
+): SystemApprovalStore {
+  return {
+    // The bound store's queries minus the tenant predicate — same builders,
+    // so a filter/CAS fix cannot reach the request path and miss the sweep.
+    async list(filter: ApprovalListFilter = {}): Promise<ApprovalRecord[]> {
+      await ready();
+      const where: string[] = [];
+      const values: unknown[] = [];
+      appendListFilters(filter, where, values);
+      const clause = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : '';
+      const { results } = await db
+        .prepare(
+          `SELECT * FROM ${TABLE}${clause} ORDER BY created_at ASC, id ASC`,
+        )
+        .bind(...values)
+        .all<ApprovalRow>();
+      return results.map(rowToRecord);
+    },
+    async transition(
+      id: string,
+      from: readonly ApprovalStatus[],
+      patch: ApprovalPatch,
+    ): Promise<ApprovalRecord | null> {
+      if (from.length === 0) return null;
+      await ready();
+      const { sets, values } = buildPatchSets(patch);
+      const row = await db
+        .prepare(
+          `UPDATE ${TABLE} SET ${sets.join(', ')}
+           WHERE id = ? AND status IN (${from.map(() => '?').join(', ')})
+           RETURNING *`,
+        )
+        .bind(...values, id, ...from)
+        .first<ApprovalRow>();
+      return row ? rowToRecord(row) : null;
+    },
+  };
 }

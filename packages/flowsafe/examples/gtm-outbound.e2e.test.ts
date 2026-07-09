@@ -39,8 +39,16 @@ import {
 const OUTREACH_CONNECTOR = 'outreach-sender';
 // Separation of duties: the operator who requests is NOT the reviewer who
 // decides (ApprovalService denies self-decision by default).
-const OPERATOR: ApprovalActor = { id: 'opal', role: 'operator' };
-const REVIEWER: ApprovalActor = { id: 'ray', role: 'reviewer' };
+const OPERATOR: ApprovalActor = {
+  id: 'opal',
+  role: 'operator',
+  tenantId: 'acme',
+};
+const REVIEWER: ApprovalActor = {
+  id: 'ray',
+  role: 'reviewer',
+  tenantId: 'acme',
+};
 
 interface Harness {
   runtime: RunnerRuntime;
@@ -50,7 +58,7 @@ interface Harness {
 }
 
 function buildHarness(): Harness {
-  const store = new InMemoryApprovalStore();
+  const store = new InMemoryApprovalStore('acme');
   const audit = new AuditLogger();
   let sends = 0;
 
@@ -188,6 +196,7 @@ describe('example: gtm-outbound runs end to end on real Anchorage seams', () => 
     // #given — a started run that suspends at the approval gate
     const harness = buildHarness();
     const started = await harness.runtime.start('gtm-outbound', {
+      runId: `acme_${crypto.randomUUID()}`,
       inputData: { industry: 'fintech', targetCount: 50 },
     });
     console.log(`[1] started run ${started.runId} -> status=${started.status}`);
@@ -257,6 +266,7 @@ describe('example: gtm-outbound runs end to end on real Anchorage seams', () => 
     // #given — a suspended run, nothing approved
     const harness = buildHarness();
     const started = await harness.runtime.start('gtm-outbound', {
+      runId: `acme_${crypto.randomUUID()}`,
       inputData: { industry: 'fintech', targetCount: 50 },
     });
     expect(started.status).toBe('suspended');

@@ -6,6 +6,11 @@
 // resumed and published. Scenario B proves a forged raw resume (no grant
 // minted) fails closed at the connector gate.
 //
+// Auth rides the worker's host-kit seam: every request presents one of the
+// LOCAL-ONLY spike bearer tokens (demo/worker.ts SPIKE_ACTORS). The C probe
+// uses spike-admin because admin is the only role that can both START a run
+// and DECIDE approvals — exactly the identity separation-of-duties must deny.
+//
 // Kill protocol: killing wrangler alone orphans its workerd child, which
 // keeps serving the port and fakes persistence. So: capture descendant
 // PIDs BEFORE the kill (orphans reparent to init after it), SIGKILL the
@@ -36,6 +41,12 @@ const FAULT = process.env.SPIKE_VERIFY_FAULT || undefined;
 const RUN_BODY = {
   workflowId: 'demo-approval',
   inputData: { topic: 'launch' },
+};
+const AUTH = {
+  admin: { authorization: 'Bearer spike-admin' },
+  operator: { authorization: 'Bearer spike-operator' },
+  reviewer: { authorization: 'Bearer spike-reviewer' },
+  viewer: { authorization: 'Bearer spike-viewer' },
 };
 
 let currentStep = 'startup';
@@ -297,10 +308,18 @@ async function main() {
   const run = await step(
     'A1 start: run suspends at approval gate',
     async () => {
-      const { status, body } = await http('POST', '/runs', { body: RUN_BODY });
+      const { status, body } = await http('POST', '/runs', {
+        body: RUN_BODY,
+        headers: AUTH.operator,
+      });
       assert(status === 200, `POST /runs -> ${status}`, body);
       assert(body.status === 'suspended', 'run suspended', body.status);
       assert(typeof body.runId === 'string', 'runId is a string', body.runId);
+      assert(
+        body.runId.startsWith('spike_'),
+        'runId carries the tenant prefix (INV-1: server-minted `spike_<uuid>`)',
+        body.runId,
+      );
       assert(
         JSON.stringify(body.suspended?.[0]) === JSON.stringify(['approval']),
         "suspended[0] is ['approval']",
@@ -342,7 +361,7 @@ async function main() {
 
   await step('A3 list: approval survived the restart', async () => {
     const { status, body } = await http('GET', '/api/approvals', {
-      headers: { 'x-actor-id': 'vic', 'x-actor-role': 'viewer' },
+      headers: AUTH.viewer,
     });
     assert(status === 200, `GET /api/approvals -> ${status}`, body);
     assert(Array.isArray(body), 'list is a bare array', body);
@@ -360,7 +379,7 @@ async function main() {
         'POST',
         `/api/approvals/${run.approvalId}/decide`,
         {
-          headers: { 'x-actor-id': 'ray', 'x-actor-role': 'reviewer' },
+          headers: AUTH.reviewer,
           body: { decision: 'approve' },
         },
       );
@@ -388,6 +407,7 @@ async function main() {
     const { status, body } = await http(
       'GET',
       `/runs/demo-approval/${run.runId}`,
+      { headers: AUTH.viewer },
     );
     assert(status === 200, `final status -> ${status}`, body);
     assert(body.status === 'success', 'final run status', body.status);
@@ -396,7 +416,10 @@ async function main() {
   });
 
   await step('B forged-resume: no grant -> fails closed', async () => {
-    const started = await http('POST', '/runs', { body: RUN_BODY });
+    const started = await http('POST', '/runs', {
+      body: RUN_BODY,
+      headers: AUTH.operator,
+    });
     assert(
       started.status === 200 && started.body.status === 'suspended',
       'second run suspended',
@@ -406,6 +429,7 @@ async function main() {
       'POST',
       `/runs/demo-approval/${started.body.runId}/resume`,
       {
+        headers: AUTH.operator,
         body: {
           step: started.body.suspended[0],
           resumeData: { approved: true, decidedBy: 'mallory' },
@@ -434,12 +458,15 @@ async function main() {
   await step(
     'C self-decision: requester cannot decide their own run -> denied',
     async () => {
-      // Start a run AS ray, so ray is recorded as the approval's requester
-      // (the worker attributes requestedBy from x-actor-id). ray then trying
-      // to decide their own run must hit the separation-of-duties denial —
-      // the bridge must NOT attribute the request to the system actor.
+      // Start a run AS the admin, so ada is recorded as the approval's
+      // requester (the run router attributes requestedBy from the
+      // authenticated actor). ada then trying to decide their own run must
+      // hit the separation-of-duties denial — the bridge must NOT attribute
+      // the request to the system actor. admin is the only role that can
+      // both start (RUN_START_ROLES) and decide, so it is the only identity
+      // this probe CAN use under the shared router's coarse gate.
       const started = await http('POST', '/runs', {
-        headers: { 'x-actor-id': 'ray', 'x-actor-role': 'reviewer' },
+        headers: AUTH.admin,
         body: RUN_BODY,
       });
       assert(
@@ -448,15 +475,15 @@ async function main() {
         { status: started.status, body: started.body },
       );
       assert(
-        started.body.approval?.requestedBy === 'ray',
-        'approval attributed to the starting actor (requestedBy=ray)',
+        started.body.approval?.requestedBy === 'ada',
+        'approval attributed to the starting actor (requestedBy=ada)',
         started.body.approval,
       );
       const selfDecide = await http(
         'POST',
         `/api/approvals/${started.body.approval.id}/decide`,
         {
-          headers: { 'x-actor-id': 'ray', 'x-actor-role': 'reviewer' },
+          headers: AUTH.admin,
           body: { decision: 'approve' },
         },
       );

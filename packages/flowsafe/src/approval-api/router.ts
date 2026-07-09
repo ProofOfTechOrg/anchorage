@@ -13,14 +13,16 @@
 // that carry grants are minted in-process from an observed suspension, never
 // from a request body.
 
-import type { ApprovalActor } from './contract.js';
 import {
   ApprovalAuthzError,
   ApprovalConflictError,
-  type ApprovalService,
   InvalidApprovalInputError,
   UnknownApprovalError,
 } from './service.js';
+import {
+  TenantResolutionError,
+  type TenantResolver,
+} from './tenant-context.js';
 import {
   APPROVAL_STATUSES,
   type ApprovalDecision,
@@ -55,14 +57,13 @@ export const TCB_ONLY_CREATE_FIELDS = [
 ] as const;
 
 export interface ApprovalRouterOptions {
-  service: ApprovalService;
   /**
-   * Maps the request to the acting principal (session, JWT, API key —
-   * deployment-specific). Returning undefined yields 401.
+   * Authenticates the request and binds the tenant-scoped service (INV-2).
+   * The router's first line is `resolve(request)`; the store the service
+   * wraps is constructed AFTER authentication, bound to the actor's tenant —
+   * there is no pre-auth service to leak through. undefined yields 401.
    */
-  authenticate: (
-    request: Request,
-  ) => ApprovalActor | undefined | Promise<ApprovalActor | undefined>;
+  resolve: TenantResolver;
   /** Route prefix. Default: '/api/approvals'. */
   basePath?: string;
   /**
@@ -88,6 +89,12 @@ function json(payload: unknown, status = 200): Response {
 function errorResponse(error: unknown): Response {
   if (error instanceof InvalidApprovalInputError) {
     return json({ error: error.message }, 400);
+  }
+  if (error instanceof TenantResolutionError) {
+    // An authenticated actor with a malformed tenant claim is a verifier
+    // bug, not a client 4xx it can fix — but it must not become a 500 that
+    // reads as "try again". Forbidden, with the reason in the body.
+    return json({ error: 'forbidden' }, 403);
   }
   if (error instanceof ApprovalAuthzError) {
     return json({ error: error.message }, 403);
@@ -146,7 +153,7 @@ function parseListFilter(url: URL): ApprovalListFilter {
 export function createApprovalRouter(
   options: ApprovalRouterOptions,
 ): ApprovalRouter {
-  const { service, authenticate } = options;
+  const { resolve } = options;
   const basePath = options.basePath ?? '/api/approvals';
   const allowCreate = options.allowCreate ?? false;
 
@@ -161,8 +168,10 @@ export function createApprovalRouter(
       .filter(Boolean);
 
     try {
-      const actor = await authenticate(request);
-      if (!actor) return json({ error: 'authentication required' }, 401);
+      const tenant = await resolve(request);
+      if (!tenant) return json({ error: 'authentication required' }, 401);
+      const actor = tenant.actor;
+      const service = tenant.service();
 
       if (request.method === 'GET') {
         if (segments.length === 0) {
@@ -201,13 +210,10 @@ export function createApprovalRouter(
           );
           return json(record, created ? 201 : 200);
         }
-        if (
-          segments.length === 2 &&
-          segments[0] === 'sla' &&
-          segments[1] === 'sweep'
-        ) {
-          return json({ escalated: await service.sweepSLA(actor) });
-        }
+        // NOTE: there is deliberately NO /sla/sweep route. The sweep is an
+        // unfiltered cross-tenant read+write; it lives in the cron-owned
+        // sweepSLA() function over a SystemApprovalStore, unreachable from
+        // request scope by type.
         const [id, action] = segments;
         if (segments.length === 2 && id && action === 'claim') {
           return json(await service.claim(id, actor));

@@ -14,12 +14,14 @@ import type {
 } from '@proofoftech/breakwater';
 import { z } from 'zod';
 
-import type { ApprovalStore } from '../../src/approval-api/index.js';
 import type {
   ArtifactBucket,
   R2ArtifactStore,
 } from '../../src/artifacts/index.js';
-import type { InitSource } from '../../src/do-runner/index.js';
+import type {
+  InitSource,
+  RequestContextProvider,
+} from '../../src/do-runner/index.js';
 
 /**
  * The resume payload every showcase gate accepts — matches approval-api's
@@ -81,8 +83,14 @@ export interface EgressBinding {
 export interface ShowcaseDeps {
   /** `init` input: a Cloudflare env (D1 from `DB`) or `{ storage }`. */
   initInput: InitSource;
-  /** Approval store the grant provider derives grants from (D1 or in-memory). */
-  approvalStore: ApprovalStore;
+  /**
+   * The grant-minting seam, built by the HOST from its topology (INV-2):
+   * a DO binds per-instance — approvalGrantProvider(factory.forTenant(
+   * this.tenantId)) — while an in-process host serving every tenant on one
+   * runtime uses approvalGrantProviderFromFactory(factory), which recovers
+   * the tenant from each leg's runId prefix.
+   */
+  grantProvider: RequestContextProvider;
   /** Connector audit sink; defaults to a buffering AuditLogger when omitted. */
   audit?: AuditLogger;
   // gtm-outbound

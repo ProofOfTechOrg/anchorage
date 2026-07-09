@@ -85,6 +85,12 @@ options, `writePermissions` (org-level approval globs), custom `evaluators`
 - **Never read approval state from anywhere but the wrapper.** Do not
   inspect the requestContext for grants inside `execute` — enforcement
   already happened; re-implementing it invites drift.
+- **Never derive an idempotency key from something two tenants can share
+  without saying so.** The wrapper prefixes the key with the caller's
+  `breakwater.isolationScope` when a host mints one, so a cross-run business
+  key (`send-email:bob@acme.com`) is safe. Do not defeat that by embedding your
+  own tenant discriminator, and do not assume a scope exists — a single-tenant
+  host mints none.
 - **No secrets in the connector.** Take credentials via constructor
   parameters or the execution environment; never bake defaults, never log
   them, never put them in audit `detail`.

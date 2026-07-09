@@ -15,7 +15,7 @@
 # and therefore WORLD-KNOWN: never seed them as a deployed worker's secret, or
 # anyone can act as `admin`. They are kept in sync with showcase/demo-actors.ts by
 # showcase/demo-actors.test.ts.
-APPROVAL_ACTOR_TOKENS={"demo-admin":{"id":"admin","role":"admin"},"demo-builder":{"id":"builder","role":"builder"},"demo-operator":{"id":"operator","role":"operator"},"demo-reviewer":{"id":"reviewer","role":"reviewer"},"demo-viewer":{"id":"viewer","role":"viewer"}}
+APPROVAL_ACTOR_TOKENS={"demo-admin":{"id":"admin","role":"admin","tenantId":"demo"},"demo-builder":{"id":"builder","role":"builder","tenantId":"demo"},"demo-operator":{"id":"operator","role":"operator","tenantId":"demo"},"demo-reviewer":{"id":"reviewer","role":"reviewer","tenantId":"demo"},"demo-viewer":{"id":"viewer","role":"viewer","tenantId":"demo"}}
 
 # Optional: the audit-export auth header, when the `queues` block is enabled.
 # SIEM_AUTH_HEADER=Bearer your-siem-token

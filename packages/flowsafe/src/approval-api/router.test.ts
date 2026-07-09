@@ -3,26 +3,35 @@ import { describe, expect, it } from 'vitest';
 import type { ApprovalRole } from './contract.js';
 import { createApprovalRouter, TCB_ONLY_CREATE_FIELDS } from './router.js';
 import { ApprovalService } from './service.js';
-import { InMemoryApprovalStore } from './store.js';
+import { createTenantResolver } from './tenant-context.js';
+import { InMemoryApprovalStoreFactory } from './tenant-store.js';
 import type { ApprovalRecord } from './types.js';
 
-// Header-based test authenticator; production wires sessions/JWTs here.
-// allowCreate is opt-in (the route is off by default), so every fixture that
-// exercises create passes it explicitly — mirroring the posture a host must
-// choose deliberately.
+// Header-based test authenticator behind the real TenantResolver (production
+// wires sessions/JWTs into the same seam). The x-actor-tenant header defaults
+// to 'acme' so single-tenant fixtures stay terse. allowCreate is opt-in (the
+// route is off by default), so every fixture that exercises create passes it
+// explicitly — mirroring the posture a host must choose deliberately.
 function makeHandler(options: { allowCreate?: boolean } = {}) {
-  const store = new InMemoryApprovalStore();
-  const service = new ApprovalService({ store });
+  const backend = new InMemoryApprovalStoreFactory();
+  const store = backend.forTenant('acme');
+  const resolve = createTenantResolver({
+    authenticate: (request) => {
+      const id = request.headers.get('x-actor-id');
+      const role = request.headers.get('x-actor-role');
+      const tenantId = request.headers.get('x-actor-tenant') ?? 'acme';
+      return id && role
+        ? { id, role: role as ApprovalRole, tenantId }
+        : undefined;
+    },
+    storeFactory: backend,
+    buildService: (boundStore) => new ApprovalService({ store: boundStore }),
+  });
   return {
     store,
     handle: createApprovalRouter({
-      service,
+      resolve,
       allowCreate: options.allowCreate,
-      authenticate: (request) => {
-        const id = request.headers.get('x-actor-id');
-        const role = request.headers.get('x-actor-role');
-        return id && role ? { id, role: role as ApprovalRole } : undefined;
-      },
     }),
   };
 }
@@ -63,7 +72,7 @@ function req(path: string, options: ReqOptions = {}): Request {
 // construction: it can never mint a grant.
 const CREATE_BODY = {
   workflowId: 'wf',
-  runId: 'run-1',
+  runId: 'acme_run-1',
   title: 'publish launch post',
   slaSeconds: 3600,
 };
@@ -316,8 +325,9 @@ describe('createApprovalRouter', () => {
     expect(await response?.json()).toMatchObject({ claimedBy: 'quinn' });
   });
 
-  it('sweeps SLAs via POST /sla/sweep', async () => {
-    // #given
+  it('404s POST /sla/sweep — the sweep is cron-owned TCB code, not an endpoint', async () => {
+    // #given — the route USED to exist and was an unfiltered cross-tenant
+    // read+write behind a role check; it must never come back
     const { handle } = makeHandler();
 
     // #when
@@ -326,8 +336,7 @@ describe('createApprovalRouter', () => {
     );
 
     // #then
-    expect(response?.status).toBe(200);
-    expect(await response?.json()).toEqual({ escalated: [] });
+    expect(response?.status).toBe(404);
   });
 
   it('404s unknown subroutes', async () => {
@@ -348,17 +357,13 @@ describe('createApprovalRouter', () => {
     const { handle } = makeHandler({ allowCreate: true });
     const record = await createOne(handle);
 
-    // #when — DELETE on a real record; GET on the POST-only sweep endpoint
+    // #when — DELETE on a real record
     const deleted = await handle(
       req(`/api/approvals/${record.id}`, { method: 'DELETE' }),
     );
-    const sweepViaGet = await handle(
-      req('/api/approvals/sla/sweep', { method: 'GET' }),
-    );
 
-    // #then — no method falls through to a mutation; both are 404
+    // #then — no method falls through to a mutation
     expect(deleted?.status).toBe(404);
-    expect(sweepViaGet?.status).toBe(404);
   });
 
   it('treats a trailing slash on the base as a list, and on an id as a get', async () => {

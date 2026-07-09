@@ -50,10 +50,21 @@ export const RUN_START_ROLES: readonly ApprovalRole[] = [
   'builder',
 ];
 
-/** The acting principal, same shape as breakwater's Actor. */
+/**
+ * The acting principal — breakwater's Actor shape plus the platform's tenant
+ * dimension. breakwater stays tenant-agnostic (it is a standalone library);
+ * flowsafe is the multi-tenant host, so ITS actor carries the tenant. The
+ * e2e mirror tripwire pins "breakwater's Actor fields + tenantId".
+ *
+ * `tenantId` crosses an authentication boundary (bearer map or JWT claims):
+ * every verifier must validate it against TENANT_ID_PATTERN (INV-3,
+ * do-runner/path-safe-id.ts) before constructing an ApprovalActor — the type
+ * says `string`, but the type system has no authority over a decoded token.
+ */
 export interface ApprovalActor {
   id: string;
   role: ApprovalRole;
+  tenantId: string;
 }
 
 /**

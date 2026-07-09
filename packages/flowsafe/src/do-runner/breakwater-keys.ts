@@ -31,3 +31,12 @@ export const BREAKWATER_ACTOR_KEY = 'breakwater.actor';
  * every start/resume leg — trusted-runtime-only, like the grant key above.
  */
 export const BREAKWATER_WORKFLOW_SCOPE_KEY = 'breakwater.workflowScope';
+
+/**
+ * requestContext key breakwater's tenantIsolation evaluator and connector
+ * key-scoping read: the caller's OPAQUE isolation scope. RunnerRuntime mints
+ * the runId's tenant prefix here on every leg of a tenant-salted run (INV-1),
+ * so connector idempotency + rate-limit keys segment per tenant. Absent on
+ * non-tenant runs — breakwater then preserves its single-tenant keys.
+ */
+export const BREAKWATER_ISOLATION_SCOPE_KEY = 'breakwater.isolationScope';

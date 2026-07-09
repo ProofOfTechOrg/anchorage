@@ -1,23 +1,23 @@
-// The bearer-token auth seam every host shares: a JSON `token -> actor` map in
-// a Worker secret, parsed once per request (the secret arrives on `env`, so a
-// Worker cannot do better; an in-process host hoists it and parses once per
-// process) and then consulted by both routers.
+// The bearer auth seam every host shares: extract the bearer token, hand it
+// to a TokenVerifier (static map or HS256 JWT — verifier.ts), get back an
+// ApprovalActor or undefined.
 //
 // This is trusted-computing-base code: it ASSERTS identity (the service
-// enforces roles from it), so a malformed map must fail closed — an unparseable
-// or absent secret yields an empty map and every authenticated route 401s.
-//
-// Production SSO/JWT verification replaces `bearerActorAuthenticator` wholesale;
-// the `(request) => ApprovalActor | undefined` shape is the seam both
-// createApprovalRouter and createRunRouter accept.
+// enforces roles from it; the tenant predicates key on actor.tenantId), so a
+// malformed map must fail closed — an unparseable or absent secret yields an
+// empty map and every authenticated route 401s, and an entry without an
+// INV-3-valid tenantId is dropped (its token 401s) rather than admitted
+// tenant-less.
 
-import { APPROVAL_ROLES, type ApprovalActor } from '../approval-api/index.js';
+import type { ApprovalActor } from '../approval-api/index.js';
+import { toApprovalActor, type TokenVerifier } from './verifier.js';
 
 /**
- * Parse the `APPROVAL_ACTOR_TOKENS` secret: `{"<token>": {"id","role"}}`.
- * Unknown roles and malformed entries are dropped rather than trusted — a
- * half-valid map must not smuggle an actor with an unrecognized role past the
- * service's role check.
+ * Parse the `APPROVAL_ACTOR_TOKENS` secret:
+ * `{"<token>": {"id","role","tenantId"}}`. Every entry passes the real
+ * validator (toApprovalActor) — unknown roles, empty ids, and missing or
+ * non-INV-3 tenantIds are dropped rather than trusted; there is no `as`-cast
+ * at this JSON boundary.
  */
 export function parseActorTokens(
   raw: string | undefined,
@@ -38,35 +38,38 @@ export function parseActorTokens(
     return actors;
   }
   if (parsed === null || typeof parsed !== 'object') return actors;
-  for (const [token, actor] of Object.entries(parsed)) {
-    const candidate = actor as { id?: unknown; role?: unknown };
-    if (
-      typeof candidate?.id === 'string' &&
-      candidate.id.length > 0 &&
-      typeof candidate.role === 'string' &&
-      (APPROVAL_ROLES as readonly string[]).includes(candidate.role)
-    ) {
-      actors.set(token, candidate as ApprovalActor);
+  for (const [token, candidate] of Object.entries(parsed)) {
+    const actor = toApprovalActor(candidate);
+    if (actor) {
+      actors.set(token, actor);
+    } else {
+      console.error(
+        JSON.stringify({
+          type: 'config-error',
+          var: 'APPROVAL_ACTOR_TOKENS',
+          reason:
+            'entry dropped: needs non-empty id, a known role, and an INV-3 tenantId (^[a-z0-9]{3,32}$) — its token will 401',
+        }),
+      );
     }
   }
   return actors;
 }
 
 /**
- * Build the `authenticate` seam over an already-parsed token map. Take the map
- * as an argument rather than the raw secret so the JSON is parsed once and
- * shared across both routers, rather than once per `authenticate` call — a
- * Worker `fetch` authenticates twice (approval router, then run router). In a
- * Worker that is once per request (the secret arrives on `env`); an in-process
- * host can hoist it to module scope and parse once per process.
+ * Build the `authenticate` seam over a TokenVerifier. Callers with a parsed
+ * token map wrap it: `bearerActorAuthenticator(staticTokenVerifier(map))`.
+ * Parsing the map stays outside so the JSON is parsed once and shared across
+ * both routers (a Worker `fetch` authenticates twice — approval router, then
+ * run router; the secret arrives on `env`, so once per request is the floor).
  */
 export function bearerActorAuthenticator(
-  actors: Map<string, ApprovalActor>,
-): (request: Request) => ApprovalActor | undefined {
-  return (request) => {
+  verifier: TokenVerifier,
+): (request: Request) => Promise<ApprovalActor | undefined> {
+  return async (request) => {
     const token = request.headers
       .get('authorization')
       ?.match(/^Bearer\s+(.+)$/i)?.[1];
-    return token ? actors.get(token) : undefined;
+    return token ? verifier.verify(token) : undefined;
   };
 }

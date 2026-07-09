@@ -82,22 +82,62 @@ curl -sX POST localhost:8787/runs/content-pipeline/<runId>/resume \
 # → status "failed" (the connector's write gate denies: approval required, not granted)
 ```
 
-Demo tokens (roles): `demo-admin`, `demo-builder`, `demo-operator`,
-`demo-reviewer`, `demo-viewer`. They live in `showcase/demo-actors.ts` — the one
-source the UI's switcher, the `app:dev` host, and `.dev.vars.example` all derive
-from (`demo-actors.test.ts` fails if they drift).
+Local dev tokens (roles): `demo-admin`, `demo-builder`, `demo-operator`,
+`demo-reviewer`, `demo-viewer` — all in the shared tenant `demo`. They live in
+`showcase/demo-actors.ts`, the one source the dev switcher, the `app:dev` host,
+and `.dev.vars.example` all derive from (`demo-actors.test.ts` fails if they
+drift). They exist **only in dev**: the production SPA bundle contains no token
+literal, and `scripts/assert-clean-app-bundle.mjs` fails the build if one
+appears.
 
 Note the queue's create route is **off**: `POST /api/approvals` returns 404.
 Approval records are minted in-process from an observed suspension, never from a
 request body — a body can carry neither `connectors` (which *is* the grant) nor
 `requestedBy` (which is what separation-of-duties compares).
 
+## The public demo (OAuth sandboxes)
+
+Set `DEMO_JWT_SECRET` (secret) plus `GITHUB_CLIENT_ID` (var) and
+`GITHUB_CLIENT_SECRET` (secret) and the showcase grows a public sign-in:
+
+`GET /auth/github` → OAuth → an **ephemeral tenant** provisioned through the
+`tenants` registry, plus a set of short-TTL HS256 JWTs, one per demo role, all
+bound to that tenant and each carrying a distinct `actor.id` (a shared id would
+trip the self-approval check and no approval could ever complete). The token set
+comes back in the URL **fragment**, so it never reaches a server log, and the
+SPA scrubs it from history on read.
+
+Everything a visitor runs and approves is invisible to every other visitor —
+the same three invariants the commercial platform uses, not a demo-specific
+shortcut.
+
+Abuse controls, honestly:
+
+- `UNIQUE(provider, subject)` gives one live sandbox per identity. That stops
+  one account holding two; it does not stop N free accounts.
+- Per-sandbox run cap **and** a global daily run ceiling, each enforced as a
+  single conditional `UPDATE` (a `SELECT`-then-`UPDATE` is a TOCTOU race a
+  burst of parallel starts walks straight through).
+- `DEMO_DISABLED=true` is the kill switch, checked in the **auth middleware**,
+  so already-issued JWTs stop verifying — not just new mints.
+- Sandboxes expire after `DEMO_TENANT_TTL_HOURS`; a cron reaps them with
+  `purgeTenant`, waiting out the JWT lifetime first so it never deletes runs
+  out from under a still-valid token.
+- Connectors stay binding-gated: a published demo cannot send an email, write
+  a CRM, or deploy anything.
+
+The real backstops react *after* spend. Size `DEMO_DAILY_RUN_CAP` for what you
+can tolerate and set a billing alert.
+
 ## Single deploy
 
 `showcase/wrangler.jsonc` has an `assets` block serving `../app/dist` at `/`
 (`not_found_handling: single-page-application`), with `run_worker_first` keeping
-the API routes (`/api/*`, `/runs`, `/runs/*`, `/healthz`, `/workflows`) on the
-Worker — one origin, no build-time API URL.
+the API routes (`/api/*`, `/runs`, `/runs/*`, `/healthz`, `/workflows`,
+`/auth/*`) on the Worker — one origin, no build-time API URL. Two cron
+expressions are declared and dispatched on `controller.cron`, so the SLA sweep
+and the purge never share an invocation (a CPU-limit termination kills the
+isolate and cannot be caught, so a slow sweep would starve the purge forever).
 
 ```bash
 pnpm --filter @proofoftech/flowsafe showcase:deploy   # builds, then wrangler deploy

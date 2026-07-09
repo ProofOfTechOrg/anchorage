@@ -31,7 +31,8 @@ Implemented and tested. `PolicyEngine` and `RBACMiddleware` are real Mastra
 `Processor` implementations with `AuditLogger` as the shared sink both gates
 write to; the policy engine gates output per channel (answer / reasoning /
 object) with opt-in zero-leak hold-back buffering, and ships network-egress,
-retention, and cross-workflow-isolation tool-boundary policies.
+retention, cross-workflow-isolation, and cross-tenant-isolation tool-boundary
+policies.
 
 `createConnector()` wraps Mastra `createTool()` with an enforced permission
 manifest — network-egress allowlisting, write-approval gating (a
@@ -79,5 +80,14 @@ request's connector ids are derived into
 `requestContext['breakwater.approvedConnectors']` at resume time
 (store-derived, never body-carried) — see
 `@proofoftech/flowsafe/approval-api`.
+
+Breakwater is **tenant-agnostic**: its `Actor` has no tenant, and no gate needs
+one. A multi-tenant host passes an opaque scope string through
+`requestContext['breakwater.isolationScope']`, which breakwater never parses.
+The scope segments the connector SDK's idempotency and rate-limit keys — so one
+tenant cannot replay another's cached result or exhaust its budget — and the
+optional `tenantIsolation()` evaluator denies a call that arrives without one,
+including on dry-run. Absent scope reproduces the single-tenant keys exactly;
+there is no flag to forget.
 
 See `docs/breakwater-architecture.md` for design details.

@@ -1,9 +1,16 @@
-// The showcase controls layered beside the approval dashboard: an actor switcher
-// (live RBAC / SoD), a launcher (start any of the five workflows), and a run
+// The showcase controls layered beside the approval dashboard: a token gate
+// (production sign-in), a launcher (start any of the five workflows), and a run
 // status panel (poll started runs to success). All render through the injected
 // ApprovalUIComponents slots, so they inherit the Astryx look with zero adapter
 // changes — and the run-status panel deliberately does NOT use the Table slot
 // (that slot is hard-typed to ApprovalRecord).
+//
+// Identity is SERVER-DERIVED: GET /workflows echoes the authenticated actor,
+// and every role gate here renders from that echo. This module holds no token
+// table and must not import showcase/demo-actors.js — the dev-only actor
+// switcher (dev-actor-switcher.tsx) is the single module that may, and main.tsx
+// loads it only behind import.meta.env.DEV, keeping demo tokens out of the
+// production bundle.
 
 import { type ReactElement, useEffect, useState } from 'react';
 
@@ -12,42 +19,23 @@ import {
   useApprovalUIComponents,
 } from '../../src/approval-ui/components.js';
 import {
-  type DemoActor,
-  DEMO_ACTORS,
-  type DemoRole,
-} from '../../showcase/demo-actors.js';
-import {
+  type CatalogActor,
   RunApiError,
   type RunClient,
   type RunSummary,
   type WorkflowMeta,
 } from './run-client.js';
 
-export type { DemoActor, DemoRole };
-export { DEMO_ACTORS };
-
 /**
  * Roles allowed to START any workflow — the host's coarse start-role gate,
  * applied to POST /runs before any per-workflow allowedRoles check. Mirrors
- * RUN_START_ROLES in ../../src/approval-api/contract.ts BY VALUE, the same way
- * DemoRole mirrors ApprovalRole: the app consumes the approval-ui (browser)
- * subpackage and does not reach into the approval-api (server) subpackage's
- * internal modules. reviewer/viewer are review-only. Drift is fail-safe — the
- * backend re-checks authoritatively, so a stale mirror only re-enables a button
- * the server still 403s.
+ * RUN_START_ROLES in ../../src/approval-api/contract.ts BY VALUE: the app
+ * consumes the approval-ui (browser) subpackage and does not reach into the
+ * approval-api (server) subpackage's internal modules. reviewer/viewer are
+ * review-only. Drift is fail-safe — the backend re-checks authoritatively, so
+ * a stale mirror only re-enables a button the server still 403s.
  */
-const RUN_START_ROLES: readonly DemoRole[] = ['admin', 'operator', 'builder'];
-
-/** The identity the app starts as (admin — can start any workflow). */
-export const DEFAULT_ACTOR: DemoActor = DEMO_ACTORS[0] ?? {
-  token: 'demo-admin',
-  id: 'admin',
-  role: 'admin',
-};
-
-export function actorForToken(token: string): DemoActor {
-  return DEMO_ACTORS.find((actor) => actor.token === token) ?? DEFAULT_ACTOR;
-}
+const RUN_START_ROLES: readonly string[] = ['admin', 'operator', 'builder'];
 
 /** A run the launcher started, tracked so the status panel can poll it. */
 export interface RunEntry {
@@ -110,33 +98,81 @@ function isTransient(error: unknown): boolean {
   return !(error instanceof RunApiError) || error.status === 404;
 }
 
-export function ActorSwitcher({
-  actorToken,
-  onSelect,
+/**
+ * Production sign-in: paste the deployment's bearer token. The token is held in
+ * memory only; identity and role come back from the server's catalog echo. In
+ * dev, main.tsx renders the demo actor switcher instead.
+ */
+export function TokenGate({
+  signedIn,
+  onSubmit,
+  onSignOut,
+  demoSignInHref,
 }: {
-  actorToken: string;
-  onSelect: (token: string) => void;
+  signedIn: boolean;
+  onSubmit: (token: string) => void;
+  onSignOut: () => void;
+  /** When the worker has the public demo configured: the OAuth entry point. */
+  demoSignInHref?: string;
 }): ReactElement {
   const C = useApprovalUIComponents();
+  const [draft, setDraft] = useState('');
+
+  function submit(): void {
+    const token = draft.trim();
+    if (token.length === 0) return;
+    setDraft('');
+    onSubmit(token);
+  }
+
   return (
-    <C.Section aria-label="Acting identity">
+    <C.Section aria-label="Sign in">
       <C.Stack gap="sm">
-        <C.Heading level={2}>Acting as</C.Heading>
-        <C.Text>
-          Switch identity to see RBAC and separation-of-duties live.
-          Grant-minting always stays server-side, whichever actor you pick.
-        </C.Text>
-        <C.Stack direction="horizontal" gap="sm">
-          {DEMO_ACTORS.map((actor) => (
+        <C.Heading level={2}>Sign in</C.Heading>
+        {signedIn ? (
+          <C.Stack direction="horizontal" gap="sm">
+            <C.Text>Token set — identity is verified by the server.</C.Text>
             <C.Button
-              key={actor.token}
-              label={actor.id}
-              variant={actor.token === actorToken ? 'primary' : 'secondary'}
-              pressed={actor.token === actorToken}
-              onClick={() => onSelect(actor.token)}
+              label="Sign out"
+              variant="secondary"
+              onClick={onSignOut}
             />
-          ))}
-        </C.Stack>
+          </C.Stack>
+        ) : (
+          <C.Stack gap="sm">
+            {demoSignInHref ? (
+              <C.Stack gap="sm">
+                <C.Text>
+                  Try the demo: sign in to get your own isolated sandbox — four
+                  switchable roles, your data invisible to every other visitor.
+                </C.Text>
+                <C.Button
+                  label="Sign in with GitHub"
+                  variant="primary"
+                  onClick={() => {
+                    window.location.href = demoSignInHref;
+                  }}
+                />
+              </C.Stack>
+            ) : null}
+            <C.Text>
+              {demoSignInHref
+                ? 'Or paste an operator API token.'
+                : "Paste this deployment's API token. Your identity and role are resolved server-side; the app ships with no credentials."}
+            </C.Text>
+            <C.TextField
+              label="API token"
+              value={draft}
+              onChange={setDraft}
+              onSubmit={submit}
+            />
+            <C.Button
+              label="Sign in"
+              variant={demoSignInHref ? 'secondary' : 'primary'}
+              onClick={submit}
+            />
+          </C.Stack>
+        )}
       </C.Stack>
     </C.Section>
   );
@@ -144,15 +180,14 @@ export function ActorSwitcher({
 
 export function LauncherPanel({
   runClient,
-  actorRole,
   onStarted,
 }: {
   runClient: RunClient;
-  actorRole: DemoRole;
   onStarted: (entry: RunEntry) => void;
 }): ReactElement {
   const C = useApprovalUIComponents();
   const [workflows, setWorkflows] = useState<WorkflowMeta[]>([]);
+  const [actor, setActor] = useState<CatalogActor | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   // null selection => the first workflow; null input => derive from the sample.
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -160,21 +195,24 @@ export function LauncherPanel({
   const [launchError, setLaunchError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  // Fetch the workflow catalog when the client identity changes (any actor may
-  // read it). External-data sync — a legitimate effect.
+  // Fetch the catalog (workflows + the server-derived identity) when the
+  // client identity changes. External-data sync — a legitimate effect.
   useEffect(() => {
     let alive = true;
     runClient
-      .workflows()
-      .then((list) => {
+      .catalog()
+      .then((catalog) => {
         if (!alive) return;
-        setWorkflows(list);
+        setWorkflows(catalog.workflows);
+        setActor(catalog.actor);
         setLoadError(null);
       })
       .catch((error: unknown) => {
-        if (alive) {
-          setLoadError(error instanceof Error ? error.message : String(error));
-        }
+        if (!alive) return;
+        // Fail closed: with no server echo there is no identity, so every
+        // role gate below renders as "cannot start".
+        setActor(null);
+        setLoadError(error instanceof Error ? error.message : String(error));
       });
     return () => {
       alive = false;
@@ -190,12 +228,15 @@ export function LauncherPanel({
     editedJson ??
     (selected ? JSON.stringify(selected.sampleInput, null, 2) : '');
   // Coarse start-role gate (mirrors every backend's POST /runs check) runs
-  // FIRST, then the per-workflow allowedRoles gate. Without the coarse check,
-  // reviewer/viewer saw an enabled Launch button the backend then 403s.
-  const canStartAny = RUN_START_ROLES.includes(actorRole);
+  // FIRST, then the per-workflow allowedRoles gate. Both read the SERVER'S
+  // actor echo — no identity yet (or a failed catalog read) means no launch.
+  const actorRole = actor?.role;
+  const canStartAny =
+    actorRole !== undefined && RUN_START_ROLES.includes(actorRole);
   const roleAllowed =
     canStartAny &&
-    (!selected?.allowedRoles || selected.allowedRoles.includes(actorRole));
+    (!selected?.allowedRoles ||
+      (actorRole !== undefined && selected.allowedRoles.includes(actorRole)));
 
   function selectWorkflow(id: string): void {
     setSelectedId(id);
@@ -234,6 +275,11 @@ export function LauncherPanel({
     <C.Section aria-label="Launch a workflow">
       <C.Stack gap="md">
         <C.Heading level={2}>Launch a workflow</C.Heading>
+        {actor ? (
+          <C.Text>
+            {`Acting as ${actor.id} (${actor.role}) — identity verified by the server.`}
+          </C.Text>
+        ) : null}
         {loadError ? (
           <C.Banner
             tone="danger"
@@ -270,9 +316,11 @@ export function LauncherPanel({
               <C.Banner
                 tone="warning"
                 title={
-                  selected.allowedRoles
-                    ? `Your role '${actorRole}' cannot start this workflow — switch to ${selected.allowedRoles.join(' or ')}.`
-                    : `Your role '${actorRole}' cannot start any workflow — switch to ${RUN_START_ROLES.join(', ')}.`
+                  actorRole === undefined
+                    ? 'No verified identity — sign in with a valid token to launch workflows.'
+                    : selected.allowedRoles
+                      ? `Your role '${actorRole}' cannot start this workflow — switch to ${selected.allowedRoles.join(' or ')}.`
+                      : `Your role '${actorRole}' cannot start any workflow — switch to ${RUN_START_ROLES.join(', ')}.`
                 }
               />
             ) : null}

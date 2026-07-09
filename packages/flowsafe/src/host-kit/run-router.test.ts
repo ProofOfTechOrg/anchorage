@@ -13,7 +13,8 @@ import { describe, expect, it } from 'vitest';
 import {
   type ApprovalActor,
   ApprovalService,
-  InMemoryApprovalStore,
+  createTenantResolver,
+  InMemoryApprovalStoreFactory,
 } from '../approval-api/index.js';
 import {
   InvalidRunRequestError,
@@ -25,12 +26,20 @@ import { RunRouteError } from './run-route-error.js';
 import { createRunRouter } from './run-router.js';
 import type { WorkflowMeta } from './workflow-meta.js';
 
-const SYSTEM: ApprovalActor = { id: 'sys', role: 'operator' };
-const ADMIN = { id: 'ada', role: 'admin' };
-const BUILDER = { id: 'bo', role: 'builder' };
-const OPERATOR = { id: 'opal', role: 'operator' };
-const REVIEWER = { id: 'ray', role: 'reviewer' };
-const VIEWER = { id: 'vic', role: 'viewer' };
+const SYSTEM: ApprovalActor = { id: 'sys', role: 'operator', tenantId: 'acme' };
+
+/** Header-transported test identities; tenant defaults to 'acme' in req(). */
+interface ReqActor {
+  id: string;
+  role: string;
+  tenantId?: string;
+}
+
+const ADMIN: ReqActor = { id: 'ada', role: 'admin' };
+const BUILDER: ReqActor = { id: 'bo', role: 'builder' };
+const OPERATOR: ReqActor = { id: 'opal', role: 'operator' };
+const REVIEWER: ReqActor = { id: 'ray', role: 'reviewer' };
+const VIEWER: ReqActor = { id: 'vic', role: 'viewer' };
 
 // The two shapes that matter: open-to-any-starter, and role-restricted.
 const OPEN_FLOW: WorkflowMeta = {
@@ -80,7 +89,10 @@ interface HarnessOptions {
 }
 
 function makeHarness(options: HarnessOptions = {}) {
-  const store = new InMemoryApprovalStore();
+  const backend = new InMemoryApprovalStoreFactory();
+  const store = backend.forTenant('acme');
+  // The bridge queues records through the request's TENANT-BOUND service;
+  // exposing acme's service keeps the SoD assertions terse.
   const service = new ApprovalService({ store });
   const started: Array<{
     workflowId: string;
@@ -89,18 +101,23 @@ function makeHarness(options: HarnessOptions = {}) {
   }> = [];
   const resumed: Array<{ workflowId: string; runId: string; body: unknown }> =
     [];
-  const handle = createRunRouter({
-    workflows: WORKFLOWS,
-    service,
-    systemActor: SYSTEM,
+  const resolve = createTenantResolver({
     authenticate: (request) => {
       const id = request.headers.get('x-actor-id');
       const role = request.headers.get('x-actor-role');
+      const tenantId = request.headers.get('x-actor-tenant') ?? 'acme';
       return id && role
-        ? { id, role: role as ApprovalActor['role'] }
+        ? { id, role: role as ApprovalActor['role'], tenantId }
         : undefined;
     },
+    storeFactory: backend,
+    buildService: (boundStore) => new ApprovalService({ store: boundStore }),
     newRunId: () => 'generated-run-id',
+  });
+  const handle = createRunRouter({
+    workflows: WORKFLOWS,
+    resolve,
+    systemActorId: SYSTEM.id,
     start:
       options.start ??
       (async (workflowId, runId, inputData) => {
@@ -123,7 +140,7 @@ function makeHarness(options: HarnessOptions = {}) {
 interface ReqOptions {
   method?: string;
   body?: unknown;
-  actor?: { id: string; role: string } | null;
+  actor?: ReqActor | null;
 }
 
 function req(path: string, options: ReqOptions = {}): Request {
@@ -132,6 +149,9 @@ function req(path: string, options: ReqOptions = {}): Request {
   if (actor) {
     headers.set('x-actor-id', actor.id);
     headers.set('x-actor-role', actor.role);
+    if (actor.tenantId !== undefined) {
+      headers.set('x-actor-tenant', actor.tenantId);
+    }
   }
   let body: string | undefined;
   if (options.body !== undefined) {
@@ -199,10 +219,29 @@ describe('createRunRouter — GET /workflows', () => {
     // #when
     const response = await handle(req('/workflows', { actor: VIEWER }));
 
-    // #then
+    // #then — the response carries the SERVER-derived identity; the SPA must
+    // never guess its own role from a local token table (fail-open)
     expect(response?.status).toBe(200);
     expect(await response?.json()).toEqual({
       workflows: [OPEN_FLOW, RESTRICTED_FLOW],
+      actor: { id: 'vic', role: 'viewer', tenantId: 'acme' },
+    });
+  });
+
+  it('echoes exactly the authenticated actor, per identity', async () => {
+    // #given
+    const { handle } = makeHarness();
+
+    // #when
+    const asAdmin = await handle(req('/workflows', { actor: ADMIN }));
+    const asReviewer = await handle(req('/workflows', { actor: REVIEWER }));
+
+    // #then
+    expect(await asAdmin?.json()).toMatchObject({
+      actor: { id: 'ada', role: 'admin' },
+    });
+    expect(await asReviewer?.json()).toMatchObject({
+      actor: { id: 'ray', role: 'reviewer' },
     });
   });
 });
@@ -248,7 +287,7 @@ describe('createRunRouter — the coarse start-role gate', () => {
 
     // #when / #then
     expect(
-      (await handle(req('/runs/open-flow/r1', { actor: VIEWER })))?.status,
+      (await handle(req('/runs/open-flow/acme_r1', { actor: VIEWER })))?.status,
     ).toBe(200);
   });
 });
@@ -291,7 +330,7 @@ describe('createRunRouter — per-workflow allowedRoles', () => {
     expect(started).toEqual([
       {
         workflowId: 'restricted-flow',
-        runId: 'generated-run-id',
+        runId: 'acme_generated-run-id',
         inputData: undefined,
       },
     ]);
@@ -323,21 +362,76 @@ describe('createRunRouter — POST /runs', () => {
     ).toBe(404);
   });
 
-  it('honors a caller-supplied runId and otherwise mints one', async () => {
-    // #given
+  it('400s a client-pinned runId and mints the tenant-salted id itself (INV-1)', async () => {
+    // #given — the runId IS the tenant carrier; a client may never choose it
     const { handle, started } = makeHarness();
 
-    // #when
-    await handle(
+    // #when — a pinned runId is rejected, not silently overridden
+    const pinned = await handle(
       req('/runs', { body: { workflowId: 'open-flow', runId: 'mine' } }),
     );
+
+    // #then
+    expect(pinned?.status).toBe(400);
+    expect(await pinned?.json()).toEqual({ error: 'runId is server-assigned' });
+    expect(started).toEqual([]);
+
+    // #when — a normal start mints `${tenantId}_${uuid}`
     await handle(req('/runs', { body: { workflowId: 'open-flow' } }));
 
     // #then
     expect(started.map((entry) => entry.runId)).toEqual([
-      'mine',
-      'generated-run-id',
+      'acme_generated-run-id',
     ]);
+  });
+
+  it("404s another tenant's run on status AND resume — 404, not 403, so the route is no existence oracle", async () => {
+    // #given — tenant beta probing an acme-owned runId; the host thunks must
+    // never even be consulted
+    let statusCalls = 0;
+    let resumeCalls = 0;
+    const { handle } = makeHarness({
+      status: async (_workflowId, runId) => {
+        statusCalls += 1;
+        return { runId, status: 'running' };
+      },
+      resume: async (_workflowId, runId) => {
+        resumeCalls += 1;
+        return { runId, status: 'success' };
+      },
+    });
+    const beta = { id: 'eve', role: 'admin', tenantId: 'beta' };
+
+    // #when / #then
+    const status = await handle(
+      req('/runs/open-flow/acme_r1', { actor: beta }),
+    );
+    expect(status?.status).toBe(404);
+    expect(await status?.json()).toEqual({ error: 'run not found' });
+    const resume = await handle(
+      req('/runs/open-flow/acme_r1/resume', { body: {}, actor: beta }),
+    );
+    expect(resume?.status).toBe(404);
+    expect(statusCalls).toBe(0);
+    expect(resumeCalls).toBe(0);
+  });
+
+  it("403s an actor whose tenant claim violates INV-3 — 'undefined' must never concatenate", async () => {
+    // #given — the tenant crosses an authentication boundary; the router
+    // re-validates before minting or prefix-matching with it
+    const { handle, started } = makeHarness();
+
+    // #when / #then
+    for (const tenantId of ['ACME', 'a_b', 'ab', '']) {
+      const response = await handle(
+        req('/runs', {
+          body: { workflowId: 'open-flow' },
+          actor: { id: 'eve', role: 'admin', tenantId },
+        }),
+      );
+      expect(response?.status).toBe(403);
+    }
+    expect(started).toEqual([]);
   });
 
   it('returns the bare summary when the run does not suspend', async () => {
@@ -351,7 +445,7 @@ describe('createRunRouter — POST /runs', () => {
 
     // #then — nothing queued
     expect(await response?.json()).toEqual({
-      runId: 'generated-run-id',
+      runId: 'acme_generated-run-id',
       status: 'success',
       result: { ok: true },
     });
@@ -401,7 +495,7 @@ describe('createRunRouter — POST /runs', () => {
       service.decide(
         queued?.id ?? '',
         { decision: 'approve' },
-        ADMIN as ApprovalActor,
+        { id: ADMIN.id, role: 'admin', tenantId: 'acme' },
       ),
     ).rejects.toThrow(/cannot decide their own approval/);
   });
@@ -428,7 +522,7 @@ describe('createRunRouter — GET status and POST resume', () => {
     const { handle } = makeHarness({ status: async () => undefined });
 
     // #when / #then
-    expect((await handle(req('/runs/open-flow/r1')))?.status).toBe(404);
+    expect((await handle(req('/runs/open-flow/acme_r1')))?.status).toBe(404);
   });
 
   it('passes the resume body straight through, carrying no grants', async () => {
@@ -437,7 +531,7 @@ describe('createRunRouter — GET status and POST resume', () => {
 
     // #when
     const response = await handle(
-      req('/runs/open-flow/r1/resume', {
+      req('/runs/open-flow/acme_r1/resume', {
         body: { step: ['gate'], resumeData: { approved: true } },
       }),
     );
@@ -448,7 +542,7 @@ describe('createRunRouter — GET status and POST resume', () => {
     expect(resumed).toEqual([
       {
         workflowId: 'open-flow',
-        runId: 'r1',
+        runId: 'acme_r1',
         body: { step: ['gate'], resumeData: { approved: true } },
       },
     ]);
@@ -460,7 +554,10 @@ describe('createRunRouter — GET status and POST resume', () => {
 
     // #when
     await handle(
-      req('/runs/open-flow/r1/resume', { method: 'POST', body: '{not json' }),
+      req('/runs/open-flow/acme_r1/resume', {
+        method: 'POST',
+        body: '{not json',
+      }),
     );
 
     // #then
@@ -473,10 +570,12 @@ describe('createRunRouter — GET status and POST resume', () => {
 
     // #when / #then
     expect(
-      (await handle(req('/runs/open-flow/r1/bogus', { method: 'POST' })))
+      (await handle(req('/runs/open-flow/acme_r1/bogus', { method: 'POST' })))
         ?.status,
     ).toBe(404);
-    expect((await handle(req('/runs/open-flow/r1/resume')))?.status).toBe(404);
+    expect((await handle(req('/runs/open-flow/acme_r1/resume')))?.status).toBe(
+      404,
+    );
   });
 });
 
@@ -521,7 +620,8 @@ describe('createRunRouter — error mapping', () => {
 
     // #when / #then
     expect(
-      (await handle(req('/runs/open-flow/r1/resume', { body: {} })))?.status,
+      (await handle(req('/runs/open-flow/acme_r1/resume', { body: {} })))
+        ?.status,
     ).toBe(status);
   });
 
@@ -534,7 +634,7 @@ describe('createRunRouter — error mapping', () => {
     });
 
     // #when
-    const response = await handle(req('/runs/open-flow/r1'));
+    const response = await handle(req('/runs/open-flow/acme_r1'));
 
     // #then
     expect(response?.status).toBe(500);

@@ -7,27 +7,40 @@ import {
   ApprovalService,
   type ApprovalServiceOptions,
   InvalidApprovalInputError,
+  sweepSLA,
   UnknownApprovalError,
 } from './service.js';
-import { InMemoryApprovalStore } from './store.js';
+import type { InMemoryApprovalStore } from './store.js';
+import { InMemoryApprovalStoreFactory } from './tenant-store.js';
 import type { ApprovalRecord, CreateApprovalInput } from './types.js';
 
-const ADMIN: ApprovalActor = { id: 'ada', role: 'admin' };
-const OPERATOR: ApprovalActor = { id: 'opal', role: 'operator' };
-const REVIEWER: ApprovalActor = { id: 'ray', role: 'reviewer' };
-const VIEWER: ApprovalActor = { id: 'vic', role: 'viewer' };
+const ADMIN: ApprovalActor = { id: 'ada', role: 'admin', tenantId: 'acme' };
+const OPERATOR: ApprovalActor = {
+  id: 'opal',
+  role: 'operator',
+  tenantId: 'acme',
+};
+const REVIEWER: ApprovalActor = {
+  id: 'ray',
+  role: 'reviewer',
+  tenantId: 'acme',
+};
+const VIEWER: ApprovalActor = { id: 'vic', role: 'viewer', tenantId: 'acme' };
 
 const T0 = Date.parse('2026-07-06T12:00:00.000Z');
 
 interface Harness {
   service: ApprovalService;
   store: InMemoryApprovalStore;
+  backend: InMemoryApprovalStoreFactory;
   events: ApprovalAuditEvent[];
+  now: () => Date;
   advance: (ms: number) => void;
 }
 
 function makeHarness(options: Partial<ApprovalServiceOptions> = {}): Harness {
-  const store = new InMemoryApprovalStore();
+  const backend = new InMemoryApprovalStoreFactory();
+  const store = backend.forTenant('acme') as InMemoryApprovalStore;
   const events: ApprovalAuditEvent[] = [];
   let nowMs = T0;
   const service = new ApprovalService({
@@ -39,7 +52,9 @@ function makeHarness(options: Partial<ApprovalServiceOptions> = {}): Harness {
   return {
     service,
     store,
+    backend,
     events,
+    now: () => new Date(nowMs),
     advance: (ms) => {
       nowMs += ms;
     },
@@ -51,7 +66,7 @@ function input(
 ): CreateApprovalInput {
   return {
     workflowId: 'wf',
-    runId: 'run-1',
+    runId: 'acme_run-1',
     title: 'publish launch post',
     ...overrides,
   };
@@ -65,7 +80,62 @@ async function seedPending(
   return record;
 }
 
+/**
+ * The cron-owned standalone sweep over the harness's SYSTEM store, sharing
+ * the harness clock and audit sink — the shape every host's scheduled()
+ * runs. There is deliberately no service.sweepSLA anymore.
+ */
+function runSweep(
+  harness: Harness,
+  options: { onEscalation?: (record: ApprovalRecord) => void } = {},
+): Promise<ApprovalRecord[]> {
+  return sweepSLA(harness.backend.system(), {
+    systemActor: OPERATOR,
+    audit: (event) => harness.events.push(event),
+    onEscalation: options.onEscalation,
+    now: harness.now,
+  });
+}
+
 describe('ApprovalService.create', () => {
+  it("rejects a runId that does not carry the store's tenant prefix (INV-1 belt)", async () => {
+    // #given — every read path filters on the tenant_id column, so a foreign
+    // prefix would only orphan a row; the belt makes it a loud error instead
+    const harness = makeHarness();
+
+    // #when / #then
+    await expect(
+      harness.service.create(input({ runId: 'bravo_run-1' }), OPERATOR),
+    ).rejects.toBeInstanceOf(InvalidApprovalInputError);
+    await expect(
+      harness.service.create(input({ runId: 'bare-run' }), OPERATOR),
+    ).rejects.toBeInstanceOf(InvalidApprovalInputError);
+  });
+
+  it('denies EVERY action to an actor whose tenant differs from the store binding', async () => {
+    // #given — a valid role, wrong tenant: the service-layer INV-2 belt
+    const harness = makeHarness();
+    const intruder: ApprovalActor = {
+      id: 'eve',
+      role: 'admin',
+      tenantId: 'bravo',
+    };
+
+    // #when / #then
+    await expect(
+      harness.service.create(input(), intruder),
+    ).rejects.toBeInstanceOf(ApprovalAuthzError);
+    await expect(harness.service.list({}, intruder)).rejects.toBeInstanceOf(
+      ApprovalAuthzError,
+    );
+    expect(harness.events).toContainEqual(
+      expect.objectContaining({
+        decision: 'denied',
+        reason: expect.stringContaining('tenant'),
+      }),
+    );
+  });
+
   it('creates a pending record with an SLA deadline from slaSeconds', async () => {
     // #given
     const harness = makeHarness();
@@ -86,7 +156,7 @@ describe('ApprovalService.create', () => {
     expect(created).toBe(true);
     expect(record).toMatchObject({
       workflowId: 'wf',
-      runId: 'run-1',
+      runId: 'acme_run-1',
       status: 'pending',
       priority: 'high',
       connectors: ['blog-publisher'],
@@ -471,16 +541,16 @@ describe('ApprovalService.sweepSLA', () => {
   it('escalates only breached open requests and fires onEscalation', async () => {
     // #given — one breached, one within SLA
     const onEscalation = vi.fn();
-    const harness = makeHarness({ onEscalation });
+    const harness = makeHarness();
     const breached = await seedPending(harness, {
-      runId: 'run-breach',
+      runId: 'acme_run-breach',
       slaSeconds: 60,
     });
-    await seedPending(harness, { runId: 'run-fresh', slaSeconds: 3600 });
+    await seedPending(harness, { runId: 'acme_run-fresh', slaSeconds: 3600 });
     harness.advance(120_000);
 
     // #when
-    const escalated = await harness.service.sweepSLA(OPERATOR);
+    const escalated = await runSweep(harness, { onEscalation });
 
     // #then
     expect(escalated.map((record) => record.id)).toEqual([breached.id]);
@@ -500,13 +570,13 @@ describe('ApprovalService.sweepSLA', () => {
   it('is idempotent — a second sweep escalates nothing new', async () => {
     // #given
     const onEscalation = vi.fn();
-    const harness = makeHarness({ onEscalation });
+    const harness = makeHarness();
     await seedPending(harness, { slaSeconds: 60 });
     harness.advance(120_000);
-    await harness.service.sweepSLA(OPERATOR);
+    await runSweep(harness, { onEscalation });
 
     // #when
-    const second = await harness.service.sweepSLA(OPERATOR);
+    const second = await runSweep(harness, { onEscalation });
 
     // #then
     expect(second).toEqual([]);
@@ -518,7 +588,7 @@ describe('ApprovalService.sweepSLA', () => {
     const harness = makeHarness();
     const record = await seedPending(harness, { slaSeconds: 60 });
     harness.advance(120_000);
-    await harness.service.sweepSLA(OPERATOR);
+    await runSweep(harness);
 
     // #when
     const result = await harness.service.decide(
@@ -539,13 +609,13 @@ describe('ApprovalService.sweepSLA', () => {
         throw new Error('pager down');
       })
       .mockImplementation(() => undefined);
-    const harness = makeHarness({ onEscalation });
-    await seedPending(harness, { runId: 'r1', slaSeconds: 60 });
-    await seedPending(harness, { runId: 'r2', slaSeconds: 60 });
+    const harness = makeHarness();
+    await seedPending(harness, { runId: 'acme_r1', slaSeconds: 60 });
+    await seedPending(harness, { runId: 'acme_r2', slaSeconds: 60 });
     harness.advance(120_000);
 
     // #when
-    const escalated = await harness.service.sweepSLA(OPERATOR);
+    const escalated = await runSweep(harness, { onEscalation });
 
     // #then — both escalated despite the crash; error audited
     expect(escalated).toHaveLength(2);
@@ -563,13 +633,13 @@ describe('ApprovalService.sweepSLA', () => {
     // #given — deadline is createdAt + 60s
     const harness = makeHarness();
     const record = await seedPending(harness, {
-      runId: 'run-boundary',
+      runId: 'acme_run-boundary',
       slaSeconds: 60,
     });
     harness.advance(60_000); // now === deadline, to the millisecond
 
     // #when
-    const escalated = await harness.service.sweepSLA(OPERATOR);
+    const escalated = await runSweep(harness);
 
     // #then — the sweep uses <= (skip only when deadline > now), so AT the
     // deadline the request escalates; one ms earlier it would not
@@ -579,31 +649,60 @@ describe('ApprovalService.sweepSLA', () => {
   it('does not escalate one millisecond before the deadline', async () => {
     // #given
     const harness = makeHarness();
-    await seedPending(harness, { runId: 'run-early', slaSeconds: 60 });
+    await seedPending(harness, { runId: 'acme_run-early', slaSeconds: 60 });
     harness.advance(59_999);
 
     // #when / #then
-    expect(await harness.service.sweepSLA(OPERATOR)).toEqual([]);
+    expect(await runSweep(harness)).toEqual([]);
   });
 
   it('never escalates a request that has no SLA deadline', async () => {
     // #given — no slaSeconds and no service default: the request has no deadline
     const harness = makeHarness();
-    await seedPending(harness, { runId: 'run-no-sla' });
+    await seedPending(harness, { runId: 'acme_run-no-sla' });
     harness.advance(10_000_000);
 
     // #when / #then — an undefined deadline is skipped, not treated as breached
-    expect(await harness.service.sweepSLA(OPERATOR)).toEqual([]);
+    expect(await runSweep(harness)).toEqual([]);
   });
 
-  it('denies the sweep to reviewer/viewer roles', async () => {
-    // #given
+  it('sweeps ACROSS tenants — the one legitimate cross-tenant write, cron-only', async () => {
+    // #given — breached records under two tenants sharing the backend
     const harness = makeHarness();
-
-    // #when / #then
-    await expect(harness.service.sweepSLA(REVIEWER)).rejects.toBeInstanceOf(
-      ApprovalAuthzError,
+    await seedPending(harness, { slaSeconds: 60 });
+    const bravoService = new ApprovalService({
+      store: harness.backend.forTenant('bravo'),
+      now: harness.now,
+    });
+    await bravoService.create(
+      {
+        workflowId: 'wf',
+        runId: 'bravo_run-1',
+        title: 'bravo approval',
+        slaSeconds: 60,
+      },
+      { id: 'opal', role: 'operator', tenantId: 'bravo' },
     );
+    harness.advance(120_000);
+
+    // #when
+    const escalated = await runSweep(harness);
+
+    // #then — both tenants' breaches escalate, each audit event attributed
+    // to its record's tenant
+    expect(escalated.map((record) => record.tenantId).sort()).toEqual([
+      'acme',
+      'bravo',
+    ]);
+    for (const record of escalated) {
+      expect(harness.events).toContainEqual(
+        expect.objectContaining({
+          action: 'approval.escalate',
+          decision: 'allowed',
+          detail: expect.objectContaining({ tenantId: record.tenantId }),
+        }),
+      );
+    }
   });
 });
 
@@ -611,15 +710,15 @@ describe('ApprovalService.metrics', () => {
   it('computes queue metrics with a fixed clock', async () => {
     // #given — 4 requests: decided-fast, decided-slow, breached-open, fresh-open
     const harness = makeHarness();
-    const fast = await seedPending(harness, { runId: 'fast' });
-    const slow = await seedPending(harness, { runId: 'slow' });
-    await seedPending(harness, { runId: 'breached', slaSeconds: 60 });
-    await seedPending(harness, { runId: 'fresh', slaSeconds: 7200 });
+    const fast = await seedPending(harness, { runId: 'acme_fast' });
+    const slow = await seedPending(harness, { runId: 'acme_slow' });
+    await seedPending(harness, { runId: 'acme_breached', slaSeconds: 60 });
+    await seedPending(harness, { runId: 'acme_fresh', slaSeconds: 7200 });
     harness.advance(60_000);
     await harness.service.decide(fast.id, { decision: 'approve' }, REVIEWER);
     harness.advance(120_000);
     await harness.service.decide(slow.id, { decision: 'reject' }, REVIEWER);
-    await harness.service.sweepSLA(OPERATOR);
+    await runSweep(harness);
 
     // #when
     const metrics = await harness.service.metrics(VIEWER);
@@ -653,11 +752,11 @@ describe('ApprovalService.metrics', () => {
     // #given — a breached request escalated by the sweep, then decided
     const harness = makeHarness();
     const record = await seedPending(harness, {
-      runId: 'run-esc-dec',
+      runId: 'acme_run-esc-dec',
       slaSeconds: 60,
     });
     harness.advance(120_000);
-    await harness.service.sweepSLA(OPERATOR);
+    await runSweep(harness);
     await harness.service.decide(record.id, { decision: 'approve' }, REVIEWER);
 
     // #when
@@ -691,7 +790,7 @@ describe('ApprovalService self-approval control', () => {
       await harness.service.decide(
         record.id,
         { decision: 'approve' },
-        { id: 'opal', role: 'admin' },
+        { id: 'opal', role: 'admin', tenantId: 'acme' },
       );
     } catch (error) {
       caught = error;
@@ -720,7 +819,7 @@ describe('ApprovalService self-approval control', () => {
     const result = await harness.service.decide(
       record.id,
       { decision: 'approve' },
-      { id: 'opal', role: 'admin' },
+      { id: 'opal', role: 'admin', tenantId: 'acme' },
     );
 
     // #then

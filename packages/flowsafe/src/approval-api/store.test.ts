@@ -4,16 +4,25 @@
 // and the partial unique index are exercised for real, not mocked.
 // (workerd-level verification happens in the demo spike, matching the
 // Phase-1 precedent for d1-storage.ts.)
+//
+// The contract runs over FACTORIES, not stores: tenant isolation (INV-2) is
+// only real when tenant A's and tenant B's views share ONE backend — two
+// independent in-memory stores hold separate Maps and would pass a
+// cross-tenant test without exercising any predicate.
 
 import { describe, expect, it } from 'vitest';
 
-import {
-  type ApprovalDatabase,
-  type ApprovalPreparedStatement,
-  D1ApprovalStore,
+import type {
+  ApprovalDatabase,
+  ApprovalPreparedStatement,
 } from './d1-store.js';
 import { approvedConnectorsForLeg } from './grants.js';
-import { type ApprovalStore, InMemoryApprovalStore } from './store.js';
+import type { ApprovalStore } from './store.js';
+import {
+  type ApprovalStoreFactory,
+  D1ApprovalStoreFactory,
+  InMemoryApprovalStoreFactory,
+} from './tenant-store.js';
 import type { ApprovalRecord } from './types.js';
 
 let seq = 0;
@@ -23,6 +32,9 @@ function makeRecord(overrides: Partial<ApprovalRecord> = {}): ApprovalRecord {
   const at = new Date(1700000000000 + seq * 1000).toISOString();
   return {
     id: `apr-${seq}`,
+    // The store STAMPS the tenant from its own binding; this field only keeps
+    // the literal type-complete (and documents what a read must return).
+    tenantId: 'acme',
     workflowId: 'wf',
     runId: `run-${seq}`,
     title: `approval ${seq}`,
@@ -88,8 +100,10 @@ function d1Like(db: SqliteDatabase): ApprovalDatabase {
 
 function describeStoreContract(
   name: string,
-  makeStore: () => Promise<ApprovalStore> | ApprovalStore,
+  makeBackend: () => ApprovalStoreFactory,
 ): void {
+  // Single-tenant cases run over the default 'acme' view of a fresh backend.
+  const makeStore = (): ApprovalStore => makeBackend().forTenant('acme');
   describe(name, () => {
     it('round-trips a record with every optional field through create/get', async () => {
       // #given
@@ -397,94 +411,110 @@ function describeStoreContract(
       expect(byInjectClaimed).toEqual([]);
       expect(await store.get(record.id)).toMatchObject({ runId: 'safe-run' });
     });
+
+    // ---- tenant isolation (INV-2), over ONE shared backend ----------------
+
+    it("cross-tenant get/transition return null — B cannot read or move A's record", async () => {
+      // #given — tenant A and tenant B views over the SAME backend
+      const backend = makeBackend();
+      const storeA = backend.forTenant('acme');
+      const storeB = backend.forTenant('bravo');
+      const record = makeRecord({ runId: 'acme_r1' });
+      await storeA.create(record);
+
+      // #when / #then — a wrong-tenant id behaves exactly like an unknown id
+      expect(await storeB.get(record.id)).toBeNull();
+      expect(
+        await storeB.transition(record.id, ['pending'], {
+          status: 'approved',
+          updatedAt: T,
+        }),
+      ).toBeNull();
+      // and A's record is untouched
+      expect(await storeA.get(record.id)).toMatchObject({ status: 'pending' });
+    });
+
+    it("an EMPTY filter lists only the bound tenant's rows — the canonical fail-open, closed", async () => {
+      // #given
+      const backend = makeBackend();
+      const storeA = backend.forTenant('acme');
+      const storeB = backend.forTenant('bravo');
+      const a = makeRecord({ runId: 'acme_r1' });
+      const b = makeRecord({ runId: 'bravo_r1' });
+      await storeA.create(a);
+      await storeB.create(b);
+
+      // #when / #then — list() with NO filter is a one-tenant scan
+      expect((await storeA.list()).map((r) => r.id)).toEqual([a.id]);
+      expect((await storeB.list()).map((r) => r.id)).toEqual([b.id]);
+    });
+
+    it("open-uniqueness is PER TENANT: B's create for A's open (wf, run, step) is a fresh record", async () => {
+      // #given — A holds an open record for (wf, run-shared, gate). The old
+      // 3-column unique index would collapse B's create into A's record —
+      // handing B a reference to A's approval.
+      const backend = makeBackend();
+      const storeA = backend.forTenant('acme');
+      const storeB = backend.forTenant('bravo');
+      const a = makeRecord({ runId: 'run-shared', stepPath: ['gate'] });
+      await storeA.create(a);
+
+      // #when
+      const b = await storeB.create(
+        makeRecord({ runId: 'run-shared', stepPath: ['gate'] }),
+      );
+
+      // #then — created under B, not collapsed into A's
+      expect(b.created).toBe(true);
+      expect(b.record.id).not.toBe(a.id);
+      expect(b.record.tenantId).toBe('bravo');
+    });
+
+    it('create() STAMPS the binding tenant — a spoofed record.tenantId cannot cross tenants', async () => {
+      // #given — a record claiming tenant 'evil' handed to the acme-bound store
+      const backend = makeBackend();
+      const storeA = backend.forTenant('acme');
+      const spoofed = makeRecord({ tenantId: 'evil' });
+
+      // #when
+      const created = await storeA.create(spoofed);
+
+      // #then — stored under the BINDING, readable by acme, invisible to evil
+      expect(created.record.tenantId).toBe('acme');
+      expect((await storeA.get(spoofed.id))?.tenantId).toBe('acme');
+      expect(await backend.forTenant('evil').get(spoofed.id)).toBeNull();
+    });
+
+    it('the system view sees every tenant (the one legitimate cross-tenant read, cron-only by type)', async () => {
+      // #given
+      const backend = makeBackend();
+      await backend.forTenant('acme').create(makeRecord({ runId: 'acme_r' }));
+      await backend.forTenant('bravo').create(makeRecord({ runId: 'bravo_r' }));
+
+      // #when / #then
+      const all = await backend.system().list();
+      expect(all.map((r) => r.tenantId).sort()).toEqual(['acme', 'bravo']);
+    });
   });
 }
 
 describeStoreContract(
-  'InMemoryApprovalStore',
-  () => new InMemoryApprovalStore(),
+  'InMemoryApprovalStore (via InMemoryApprovalStoreFactory)',
+  () => new InMemoryApprovalStoreFactory(),
 );
 
 describeStoreContract(
-  'D1ApprovalStore (real SQLite via node:sqlite)',
-  () => new D1ApprovalStore(d1Like(openSqlite())),
+  'D1ApprovalStore (real SQLite via node:sqlite, via D1ApprovalStoreFactory)',
+  () => new D1ApprovalStoreFactory(d1Like(openSqlite())),
 );
 
 describe('D1ApprovalStore schema upgrade', () => {
-  // The pre-1.0 spike-era column set — no suspended_at, no resumed_at. Mirrors
-  // the shipped SCHEMA_STATEMENTS as of the Phase 3 release.
-  const LEGACY_TABLE_DDL = `CREATE TABLE flowsafe_approvals (
-    id TEXT PRIMARY KEY,
-    workflow_id TEXT NOT NULL,
-    run_id TEXT NOT NULL,
-    step_key TEXT NOT NULL DEFAULT '',
-    step_path TEXT,
-    title TEXT NOT NULL,
-    summary TEXT,
-    payload TEXT,
-    connectors TEXT NOT NULL DEFAULT '[]',
-    priority TEXT NOT NULL,
-    status TEXT NOT NULL,
-    requested_by TEXT,
-    claimed_by TEXT,
-    decided_by TEXT,
-    decision TEXT,
-    comment TEXT,
-    delegated_to TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    claimed_at TEXT,
-    decided_at TEXT,
-    escalated_at TEXT,
-    sla_deadline_at TEXT
-  )`;
-
-  it('backfills suspended_at, resumed_at and resume_count onto a pre-1.0 table and keeps legacy rows fallback-scoped', async () => {
-    // #given — a spike database created BEFORE the suspended_at/resumed_at/
-    // resume_count columns existed, already holding a decided legacy row
-    const sqlite = openSqlite();
-    sqlite.prepare(LEGACY_TABLE_DDL).run();
-    sqlite
-      .prepare(
-        `INSERT INTO flowsafe_approvals
-         (id, workflow_id, run_id, step_key, step_path, title, priority,
-          status, decided_at, created_at, updated_at)
-         VALUES ('legacy-1', 'wf', 'run-legacy', 'gate', '["gate"]',
-                 'legacy approval', 'normal', 'approved', ?, ?, ?)`,
-      )
-      .run(T, T, T);
-
-    // #when — instantiating the store against it triggers the defensive
-    // ALTER (CREATE IF NOT EXISTS skips the existing table)
-    const store = new D1ApprovalStore(d1Like(sqlite));
-    const legacy = await store.get('legacy-1');
-
-    // #then — the legacy row reads back with NO suspendedAt/resumedAt/
-    // resumeCount, so grant minting falls to the legacy decidedAt-after
-    // comparison for it...
-    expect(legacy).toMatchObject({ id: 'legacy-1', status: 'approved' });
-    expect(legacy?.suspendedAt).toBeUndefined();
-    expect(legacy?.resumedAt).toBeUndefined();
-    expect(legacy?.resumeCount).toBeUndefined();
-
-    // ...and a fresh record round-trips all three backfilled columns
-    const fresh = makeRecord({
-      stepPath: ['gate'],
-      suspendedAt: 1751882400000,
-      resumedAt: 1751882460000,
-      resumeCount: 1,
-    });
-    await store.create(fresh);
-    const readBack = await store.get(fresh.id);
-    expect(readBack?.suspendedAt).toBe(1751882400000);
-    expect(readBack?.resumedAt).toBe(1751882460000);
-    expect(readBack?.resumeCount).toBe(1);
-  });
-
-  // The realistic upgrade path: a DB from the (suspendedAt, resumedAt)-binding
-  // release already has suspended_at AND resumed_at populated but lacks
-  // resume_count. The intermediate table only needs the resume_count ALTER.
-  const V1_TABLE_DDL = `CREATE TABLE flowsafe_approvals (
+  // The pre-tenant column set — what the 31 local .wrangler databases and any
+  // pre-multi-tenant release carry. There is deliberately NO upgrade path:
+  // tenant_id is TEXT NOT NULL with no legitimate backfill value (SQLite
+  // rejects ADD COLUMN ... NOT NULL without a default, and a NULL/'' tenant
+  // is an isolation hole), so the store must REFUSE to serve the table.
+  const PRE_TENANT_TABLE_DDL = `CREATE TABLE flowsafe_approvals (
     id TEXT PRIMARY KEY,
     workflow_id TEXT NOT NULL,
     run_id TEXT NOT NULL,
@@ -492,6 +522,8 @@ describe('D1ApprovalStore schema upgrade', () => {
     step_path TEXT,
     suspended_at INTEGER,
     resumed_at INTEGER,
+    resume_count INTEGER,
+    run_scoped INTEGER,
     title TEXT NOT NULL,
     summary TEXT,
     payload TEXT,
@@ -512,86 +544,137 @@ describe('D1ApprovalStore schema upgrade', () => {
     sla_deadline_at TEXT
   )`;
 
-  it('backfills resume_count onto a (suspendedAt, resumedAt)-vintage table without disturbing populated timestamps', async () => {
-    // #given — a DB from the prior binding release: a re-suspension approval
-    // already carries suspended_at AND resumed_at, but no resume_count column
+  // A tenant-ful table missing the nullable INTEGER columns — the only shape
+  // the defensive ALTER loop still upgrades in place.
+  const TENANTED_MINUS_INTEGERS_DDL = `CREATE TABLE flowsafe_approvals (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    step_key TEXT NOT NULL DEFAULT '',
+    step_path TEXT,
+    title TEXT NOT NULL,
+    summary TEXT,
+    payload TEXT,
+    connectors TEXT NOT NULL DEFAULT '[]',
+    priority TEXT NOT NULL,
+    status TEXT NOT NULL,
+    requested_by TEXT,
+    claimed_by TEXT,
+    decided_by TEXT,
+    decision TEXT,
+    comment TEXT,
+    delegated_to TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    claimed_at TEXT,
+    decided_at TEXT,
+    escalated_at TEXT,
+    sla_deadline_at TEXT
+  )`;
+
+  it('REFUSES a pre-tenant table with a loud error naming the fix (fail closed, no backfill)', async () => {
+    // #given — a database created before the tenant column existed
     const sqlite = openSqlite();
-    sqlite.prepare(V1_TABLE_DDL).run();
+    sqlite.prepare(PRE_TENANT_TABLE_DDL).run();
+
+    // #when / #then — every operation refuses; nothing silently serves a
+    // tenant-less approvals table
+    const store = new D1ApprovalStoreFactory(d1Like(sqlite)).forTenant('acme');
+    await expect(store.get('anything')).rejects.toThrow(/tenant_id/);
+    await expect(store.list()).rejects.toThrow(/tenant_id/);
+    await expect(store.create(makeRecord())).rejects.toThrow(/tenant_id/);
+  });
+
+  it('DROPS the old-name open-step index — the silent-no-op redefinition trap (B1)', async () => {
+    // #given — a fresh tenant-ful table on which someone (an intermediate
+    // build, a hand migration) created the OLD 3-column unique index under
+    // the OLD name. `CREATE UNIQUE INDEX IF NOT EXISTS` matches on NAME
+    // alone, so WITHOUT the explicit DROP the tenant-less shape would
+    // silently survive and collapse tenant B\'s create into tenant A\'s open
+    // record.
+    const sqlite = openSqlite();
+    sqlite.prepare(TENANTED_MINUS_INTEGERS_DDL).run();
     sqlite
       .prepare(
-        `INSERT INTO flowsafe_approvals
-         (id, workflow_id, run_id, step_key, step_path, suspended_at,
-          resumed_at, title, priority, status, decided_at, created_at,
-          updated_at)
-         VALUES ('v1-1', 'wf', 'run-v1', 'gate', '["gate"]', 1751882400000,
-                 1751882460000, 'v1 approval', 'normal', 'approved', ?, ?, ?)`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS flowsafe_approvals_open_step
+         ON flowsafe_approvals (workflow_id, run_id, step_key)
+         WHERE status IN ('pending', 'claimed', 'escalated')`,
       )
-      .run(T, T, T);
+      .run();
+    const backend = new D1ApprovalStoreFactory(d1Like(sqlite));
 
-    // #when — instantiating the store triggers only the resume_count ALTER
-    const store = new D1ApprovalStore(d1Like(sqlite));
-    const v1 = await store.get('v1-1');
+    // #when — two tenants create the SAME (workflowId, runId, stepKey)
+    const a = await backend
+      .forTenant('acme')
+      .create(makeRecord({ runId: 'run-shared', stepPath: ['gate'] }));
+    const b = await backend
+      .forTenant('bravo')
+      .create(makeRecord({ runId: 'run-shared', stepPath: ['gate'] }));
 
-    // #then — the populated suspended_at/resumed_at survive the ALTER intact,
-    // and resume_count reads back undefined (a legacy re-suspension record:
-    // grant minting matches a first-suspension leg and fails closed on a
-    // re-suspension leg — the documented upgrade-window re-deny)
-    expect(v1).toMatchObject({ id: 'v1-1', status: 'approved' });
-    expect(v1?.suspendedAt).toBe(1751882400000);
-    expect(v1?.resumedAt).toBe(1751882460000);
-    expect(v1?.resumeCount).toBeUndefined();
+    // #then — both create (the old index is gone; the v2 index is
+    // tenant-first), and the old-name index no longer exists
+    expect(a.created).toBe(true);
+    expect(b.created).toBe(true);
+    const indexes = sqlite
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='flowsafe_approvals' AND sql IS NOT NULL`,
+      )
+      .all() as Array<{ name: string }>;
+    const names = indexes.map((row) => row.name);
+    expect(names).not.toContain('flowsafe_approvals_open_step');
+    expect(names).toContain('flowsafe_approvals_open_step_v2');
+  });
 
-    // ...and a fresh record still round-trips resume_count on the upgraded table
+  it('still backfills the nullable INTEGER columns onto a tenant-ful table missing them', async () => {
+    // #given — tenant_id present, suspended_at/resumed_at/resume_count/
+    // run_scoped absent (the one in-place upgrade that remains legal)
+    const sqlite = openSqlite();
+    sqlite.prepare(TENANTED_MINUS_INTEGERS_DDL).run();
+    const store = new D1ApprovalStoreFactory(d1Like(sqlite)).forTenant('acme');
+
+    // #when — a fresh record round-trips all four backfilled columns
     const fresh = makeRecord({
       stepPath: ['gate'],
       suspendedAt: 1751882400000,
-      resumeCount: 3,
+      resumedAt: 1751882460000,
+      resumeCount: 2,
+      runScoped: true,
     });
     await store.create(fresh);
-    expect((await store.get(fresh.id))?.resumeCount).toBe(3);
+    const readBack = await store.get(fresh.id);
+
+    // #then
+    expect(readBack?.suspendedAt).toBe(1751882400000);
+    expect(readBack?.resumedAt).toBe(1751882460000);
+    expect(readBack?.resumeCount).toBe(2);
+    expect(readBack?.runScoped).toBe(true);
   });
 
-  it('upgrades a pre-run_scoped table so a legacy step-less approval mints NOTHING', async () => {
-    // #given — a DB predating the run_scoped column, holding exactly the record
-    // the OLD grant rule treated as a run-wide standing grant: approved,
-    // step-less (step_key ''), capability-bearing.
+  it('a legacy step-less approval (no run_scoped) mints NOTHING on the upgraded table', async () => {
+    // #given — a tenant-ful pre-run_scoped table holding exactly the record
+    // the OLD grant rule treated as a run-wide standing grant
     const sqlite = openSqlite();
-    sqlite.prepare(V1_TABLE_DDL).run();
+    sqlite.prepare(TENANTED_MINUS_INTEGERS_DDL).run();
     sqlite
       .prepare(
         `INSERT INTO flowsafe_approvals
-         (id, workflow_id, run_id, step_key, step_path, title, connectors,
-          priority, status, decided_at, created_at, updated_at)
-         VALUES ('legacy-1', 'wf', 'run-legacy', '', NULL, 'legacy standing grant',
-                 '["release-deploy"]', 'normal', 'approved', ?, ?, ?)`,
+         (id, tenant_id, workflow_id, run_id, step_key, step_path, title,
+          connectors, priority, status, decided_at, created_at, updated_at)
+         VALUES ('legacy-1', 'acme', 'wf', 'run-legacy', '', NULL,
+                 'legacy standing grant', '["release-deploy"]', 'normal',
+                 'approved', ?, ?, ?)`,
       )
       .run(T, T, T);
+    const store = new D1ApprovalStoreFactory(d1Like(sqlite)).forTenant('acme');
 
-    // #when — instantiating the store ALTERs run_scoped in; the legacy row
-    // backfills to NULL
-    const store = new D1ApprovalStore(d1Like(sqlite));
+    // #when / #then — runScoped backfills to NULL => denies on every leg
     const legacy = await store.get('legacy-1');
-
-    // #then — the row survives intact, but runScoped reads back undefined, so
-    // the tightened rule denies it on every leg. Fail CLOSED across the upgrade:
-    // a record that never named run-scope never had it. The operator's remedy is
-    // a fresh, explicit approval — not a silently surviving standing grant.
-    expect(legacy).toMatchObject({
-      id: 'legacy-1',
-      status: 'approved',
-      connectors: ['release-deploy'],
-    });
-    expect(legacy?.stepPath).toBeUndefined();
     expect(legacy?.runScoped).toBeUndefined();
     expect(
       await approvedConnectorsForLeg(store, 'wf', 'run-legacy', {
         kind: 'start',
       }),
     ).toEqual([]);
-
-    // ...and a fresh record still round-trips run_scoped on the upgraded table
-    const fresh = makeRecord({ runId: 'run-legacy', runScoped: true });
-    await store.create(fresh);
-    expect((await store.get(fresh.id))?.runScoped).toBe(true);
   });
 });

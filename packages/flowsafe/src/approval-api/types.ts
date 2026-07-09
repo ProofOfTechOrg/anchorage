@@ -40,6 +40,13 @@ export const APPROVAL_STATUSES: readonly ApprovalStatus[] = [
 
 export interface ApprovalRecord {
   id: string;
+  /**
+   * The owning tenant. STAMPED by the bound store from its own constructor
+   * field — never accepted from input (CreateApprovalInput deliberately has
+   * no tenantId: a field that cannot be supplied cannot be spoofed). Every
+   * read/write predicate carries it (INV-2).
+   */
+  tenantId: string;
   workflowId: string;
   runId: string;
   /** Suspended step path this approval unblocks, e.g. ['approval']. */

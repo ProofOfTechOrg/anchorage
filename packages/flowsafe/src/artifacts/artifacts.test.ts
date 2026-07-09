@@ -246,3 +246,48 @@ describe('R2ArtifactStore list/delete', () => {
     expect(await (await store.get(REF))?.text()).toBe('x');
   });
 });
+
+describe('tenant isolation invariant: NO workflow-level enumeration', () => {
+  // The R2 key is `[prefix/]workflowId/runId/name` — workflowId (a
+  // tenant-SHARED literal like 'product-launch') is the OUTERMOST segment;
+  // the tenant lives inside the runId in the SECOND segment. Isolation
+  // therefore holds only because every read/delete demands the FULL
+  // (workflowId, runId) pair: a "list all artifacts for workflow W" API
+  // would enumerate EVERY tenant's artifacts under W. This suite pins the
+  // absence of that API — if you are adding one, you are opening a
+  // cross-tenant enumeration and must re-key the store tenant-first instead.
+
+  it('every public read/delete surface requires the full (workflowId, runId) pair', () => {
+    // #given
+    const store = new R2ArtifactStore(new InMemoryArtifactBucket());
+
+    // #then — compile-time pins inside a NEVER-CALLED closure (the calls
+    // would throw at runtime; only their types are under test). An unused
+    // ts-expect-error directive is itself an error, so tsc exit 0 proves
+    // each pin fails to compile.
+    const typePins = (s: R2ArtifactStore): void => {
+      // @ts-expect-error list() must not accept a workflow-only scope
+      void s.list({ workflowId: 'wf' });
+
+      // @ts-expect-error deleteRun() must not accept a workflow alone
+      void s.deleteRun('wf');
+
+      // @ts-expect-error get() addresses one artifact, never a workflow
+      void s.get({ workflowId: 'wf' });
+    };
+    void typePins;
+
+    expect(typeof store.list).toBe('function');
+  });
+
+  it('runtime belt: list() rejects an empty runId rather than widening the prefix', async () => {
+    // #given — if a caller defeats the types with a cast, an empty runId
+    // would make the R2 prefix `wf/` — the exact workflow-level enumeration
+    const store = new R2ArtifactStore(new InMemoryArtifactBucket());
+
+    // #when / #then
+    await expect(
+      store.list({ workflowId: 'wf', runId: '' } as never),
+    ).rejects.toThrow();
+  });
+});

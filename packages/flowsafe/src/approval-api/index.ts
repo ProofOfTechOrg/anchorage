@@ -19,13 +19,16 @@ export type {
   ApprovalAuditSink,
   ApprovalRole,
 } from './contract.js';
-export { D1ApprovalStore } from './d1-store.js';
+// D1ApprovalStore itself is deliberately NOT exported: hosts obtain bound
+// stores through D1ApprovalStoreFactory.forTenant() (INV-2) — a directly
+// constructable store is a bindable-to-nothing footgun.
 export type {
   ApprovalDatabase,
   ApprovalPreparedStatement,
 } from './d1-store.js';
 export {
   approvalGrantProvider,
+  approvalGrantProviderFromFactory,
   approvedConnectorsForLeg,
   defaultResumeData,
   resumeViaRuntime,
@@ -37,11 +40,31 @@ export {
   ApprovalConflictError,
   ApprovalService,
   InvalidApprovalInputError,
+  sweepSLA,
   UnknownApprovalError,
 } from './service.js';
-export type { ApprovalServiceOptions } from './service.js';
+export type { ApprovalServiceOptions, SweepSLAOptions } from './service.js';
 export { InMemoryApprovalStore, stepKeyOf } from './store.js';
 export type { ApprovalPatch, ApprovalStore, CreateResult } from './store.js';
+export { TENANT_BOUND } from './tenant-brand.js';
+export type {
+  SystemApprovalStore,
+  TenantBoundApprovalStore,
+} from './tenant-brand.js';
+export {
+  createTenantResolver,
+  TenantResolutionError,
+} from './tenant-context.js';
+export type {
+  CreateTenantResolverOptions,
+  TenantContext,
+  TenantResolver,
+} from './tenant-context.js';
+export {
+  D1ApprovalStoreFactory,
+  InMemoryApprovalStoreFactory,
+} from './tenant-store.js';
+export type { ApprovalStoreFactory } from './tenant-store.js';
 export {
   APPROVAL_PRIORITIES,
   APPROVAL_STATUSES,

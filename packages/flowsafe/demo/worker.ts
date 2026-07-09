@@ -7,27 +7,35 @@
 //    APPROVED store records — the gated publish step sees the grant in its
 //    requestContext without any grant ever crossing an HTTP body.
 //
-//   POST /runs { workflowId, inputData }   -> starts; on suspend, also queues
-//                                             an approval (response.approval)
+//   GET  /workflows                        -> catalog + server-derived actor
+//   POST /runs { workflowId, inputData }   -> starts (runId server-minted as
+//                                             `spike_<uuid>` per INV-1); on
+//                                             suspend, also queues an approval
 //   GET  /runs/:workflowId/:runId          -> widened status projection
 //   POST /runs/:workflowId/:runId/resume   -> raw resume (no grants — the
 //                                             gated step fails closed)
-//   /api/approvals[...]                    -> approval queue REST surface;
-//                                             demo auth: x-actor-id/x-actor-role
-//                                             headers (production wires real
-//                                             authentication here)
+//   /api/approvals[...]                    -> approval queue REST surface
+//
+// Auth: bearer tokens over the SAME host-kit seam every deployed host uses
+// (staticTokenVerifier + bearerActorAuthenticator + createRunRouter) — a
+// second unguarded routing path is how INV-1 rots, so even this local spike
+// mounts the shared run router instead of hand-rolled /runs routing. The
+// SPIKE_ACTORS tokens are LOCAL-ONLY fixtures for wrangler dev; this worker
+// is never deployed.
+//
+// Spike script (restart between steps 1 and 2 to prove persistence):
+//   1. curl -sX POST localhost:8787/runs -H 'authorization: Bearer spike-operator' \
+//        -H 'content-type: application/json' \
+//        -d '{"workflowId":"demo-approval","inputData":{"topic":"launch"}}'
+//   2. curl -s localhost:8787/api/approvals -H 'authorization: Bearer spike-viewer'
+//   3. curl -sX POST localhost:8787/api/approvals/<id>/decide \
+//        -H 'authorization: Bearer spike-reviewer' \
+//        -H 'content-type: application/json' -d '{"decision":"approve"}'
+//   4. curl -s localhost:8787/runs/demo-approval/<runId> \
+//        -H 'authorization: Bearer spike-viewer'
 //
 // One DO instance per run (idFromName(workflowId:runId)) serializes
 // start/resume for that run; all instances share the same D1 database.
-//
-// Spike script (restart between steps 1 and 2 to prove persistence):
-//   1. curl -sX POST localhost:8787/runs -H 'content-type: application/json' \
-//        -d '{"workflowId":"demo-approval","inputData":{"topic":"launch"}}'
-//   2. curl -s localhost:8787/api/approvals -H 'x-actor-id: vic' -H 'x-actor-role: viewer'
-//   3. curl -sX POST localhost:8787/api/approvals/<id>/decide \
-//        -H 'x-actor-id: ray' -H 'x-actor-role: reviewer' \
-//        -H 'content-type: application/json' -d '{"decision":"approve"}'
-//   4. curl -s localhost:8787/runs/demo-approval/<runId>
 
 import type {
   D1Database,
@@ -40,23 +48,25 @@ import { z } from 'zod';
 import {
   type ApprovalActor,
   approvalGrantProvider,
-  type ApprovalRole,
   ApprovalService,
-  APPROVAL_ROLES,
   BREAKWATER_APPROVED_CONNECTORS_KEY,
   createApprovalRouter,
-  D1ApprovalStore,
+  createTenantResolver,
+  D1ApprovalStoreFactory,
   defaultResumeData,
+  type TenantBoundApprovalStore,
 } from '../src/approval-api/index.js';
 import {
   DurableObjectRunner,
   init,
   type RunnerRuntime,
-  type RunSummary,
 } from '../src/do-runner/index.js';
 import {
+  bearerActorAuthenticator,
+  createRunRouter,
   doSummary,
-  queueApprovalForSuspension,
+  staticTokenVerifier,
+  type WorkflowMeta,
 } from '../src/host-kit/index.js';
 
 interface Env {
@@ -67,11 +77,55 @@ interface Env {
 /** The connector id an approval grants; the publish step demands it. */
 const PUBLISH_CONNECTOR = 'demo-publisher';
 
-/** Creator identity for bridge-queued records (needs a create-capable role). */
-const SYSTEM_ACTOR: ApprovalActor = { id: 'demo-worker', role: 'operator' };
+/**
+ * Id for bridge-queued approval records. The run router builds the full actor
+ * (operator role, the request's resolved tenant) — matching showcase/deploy.
+ */
+const SYSTEM_ACTOR_ID = 'demo-worker';
 
-function defineWorkflows(env: Env): RunnerRuntime {
-  const approvals = new D1ApprovalStore(env.DB);
+// LOCAL-ONLY spike identities (wrangler dev; never deployed). One tenant so
+// every probe sees the same queue; ids/roles chosen so spike-verify.mjs can
+// exercise RBAC, the grant loop, and separation of duties:
+//   spike-admin    — the ONLY role in RUN_START_ROLES ∩ decide-capable, so it
+//                    can request AND be denied deciding its own request (SoD)
+//   spike-operator — starts runs, fires the forged-resume probe
+//   spike-reviewer — decides the happy-path approval
+//   spike-viewer   — read-only listing
+const SPIKE_ACTORS = new Map<string, ApprovalActor>([
+  ['spike-admin', { id: 'ada', role: 'admin', tenantId: 'spike' }],
+  ['spike-operator', { id: 'opal', role: 'operator', tenantId: 'spike' }],
+  ['spike-reviewer', { id: 'ray', role: 'reviewer', tenantId: 'spike' }],
+  ['spike-viewer', { id: 'vic', role: 'viewer', tenantId: 'spike' }],
+]);
+
+const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
+  {
+    id: 'demo-approval',
+    title: 'Demo approval',
+    description:
+      'research -> human approval gate -> grant-gated publish (the spike workflow)',
+    sampleInput: { topic: 'launch' },
+  },
+];
+
+// One factory per isolate, not per request: it owns the memoized schema-init
+// promise, so rebuilding it inside fetch() would re-run the whole DDL pass on
+// every request. Keyed by the D1 binding, stable for an isolate's lifetime.
+const approvalFactories = new WeakMap<D1Database, D1ApprovalStoreFactory>();
+
+function approvalStoreFactory(db: D1Database): D1ApprovalStoreFactory {
+  let factory = approvalFactories.get(db);
+  if (!factory) {
+    factory = new D1ApprovalStoreFactory(db);
+    approvalFactories.set(db, factory);
+  }
+  return factory;
+}
+
+function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
+  // Bound to THIS DO instance's tenant, recovered from its idFromName
+  // identity (INV-1 -> INV-2).
+  const approvals = approvalStoreFactory(env.DB).forTenant(tenantId);
   const { createWorkflow, createStep, runtime } = init(env, {
     // The grant-minting seam: on every start/resume the runtime derives the
     // breakwater grant key from APPROVED records in D1 — decisions become
@@ -179,7 +233,7 @@ function defineWorkflows(env: Env): RunnerRuntime {
 
 export class DemoRunner extends DurableObjectRunner<Env> {
   protected build(env: Env): RunnerRuntime {
-    return defineWorkflows(env);
+    return defineWorkflows(env, this.tenantId);
   }
 }
 
@@ -201,14 +255,16 @@ function runStub(
 // Worker-level approval service: shares the DO's D1 database; decisions
 // resume the run through its DO stub (grants come from the store via the
 // DO-side provider, never from this request).
-function buildApprovalService(env: Env): ApprovalService {
-  const store = new D1ApprovalStore(env.DB);
+function buildApprovalService(
+  store: TenantBoundApprovalStore,
+  env: Env,
+): ApprovalService {
   return new ApprovalService({
     store,
     defaultSlaSeconds: 15 * 60,
     // doSummary (host-kit) reads the DO's answer and rethrows a non-ok one as a
     // RunRouteError carrying the DO's own status — the same reader the showcase
-    // and deploy hosts use. The spike keeps its own routing, not its own parsing.
+    // and deploy hosts use. The spike keeps its own topology, not its own parsing.
     resumeRun: async (record, decision) =>
       doSummary(
         await runStub(env, record.workflowId, record.runId).fetch(
@@ -228,82 +284,56 @@ function buildApprovalService(env: Env): ApprovalService {
 
 const handler: ExportedHandler<Env> = {
   async fetch(request: CfRequest, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-    const segments = url.pathname.split('/').filter(Boolean);
-
-    // Demo-only authentication: trust two headers. A real deployment maps
-    // its session/JWT to the actor here — this stays inside the trusted
-    // computing base either way.
-    const approvalRouter = createApprovalRouter({
-      service: buildApprovalService(env),
-      authenticate: (routed) => {
-        const id = routed.headers.get('x-actor-id');
-        const role = routed.headers.get('x-actor-role');
-        return id &&
-          role &&
-          (APPROVAL_ROLES as readonly string[]).includes(role)
-          ? { id, role: role as ApprovalRole }
-          : undefined;
-      },
+    // AUTHENTICATE FIRST, then construct (INV-2): the resolver binds the
+    // approval store to the verified actor's tenant.
+    const resolve = createTenantResolver({
+      authenticate: bearerActorAuthenticator(staticTokenVerifier(SPIKE_ACTORS)),
+      storeFactory: approvalStoreFactory(env.DB),
+      buildService: (store) => buildApprovalService(store, env),
     });
-    const approvalResponse = await approvalRouter(
-      request as unknown as Request,
-    );
+    const routed = request as unknown as Request;
+
+    const approvalResponse = await createApprovalRouter({ resolve })(routed);
     if (approvalResponse) return approvalResponse;
 
-    if (segments[0] !== 'runs') return json({ error: 'not found' }, 404);
+    // The shared run surface: server-minted `${tenantId}_${uuid}` runIds,
+    // the 401 -> coarse-role -> per-workflow gate order, ownership checks,
+    // and the suspension->approval bridge — all host-kit, zero spike-local
+    // routing. Topology (the only host-specific part): every leg goes
+    // through the run's DO stub.
+    const runResponse = await createRunRouter({
+      workflows: WORKFLOWS,
+      resolve,
+      systemActorId: SYSTEM_ACTOR_ID,
+      start: async (workflowId, runId, inputData) =>
+        doSummary(
+          await runStub(env, workflowId, runId).fetch('http://do/runs', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ workflowId, runId, inputData }),
+          }),
+        ),
+      status: async (workflowId, runId) => {
+        const response = await runStub(env, workflowId, runId).fetch(
+          `http://do/runs/${workflowId}/${runId}`,
+        );
+        if (response.status === 404) return undefined;
+        return doSummary(response);
+      },
+      resume: async (workflowId, runId, body) =>
+        doSummary(
+          await runStub(env, workflowId, runId).fetch(
+            `http://do/runs/${workflowId}/${runId}/resume`,
+            {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(body ?? {}),
+            },
+          ),
+        ),
+    })(routed);
+    if (runResponse) return runResponse;
 
-    if (request.method === 'POST' && segments.length === 1) {
-      const body = await request
-        .json<{ workflowId?: string; runId?: string; inputData?: unknown }>()
-        .catch(() => null);
-      if (!body || typeof body.workflowId !== 'string') {
-        return json({ error: 'workflowId is required' }, 400);
-      }
-      // Worker owns runId generation so the DO instance key exists up front.
-      const runId = body.runId ?? crypto.randomUUID();
-      const response = await runStub(env, body.workflowId, runId).fetch(
-        'http://do/runs',
-        {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ ...body, runId }),
-        },
-      );
-      if (!response.ok) return response as unknown as Response;
-      const summary = (await response.json()) as RunSummary;
-      if (summary.status !== 'suspended') return json(summary);
-      // A suspension IS an approval request. The shared host-kit bridge queues
-      // it: idempotent (the partial unique index collapses duplicates), and it
-      // captures the step's (suspendedAt, resumeCount) pair so the decision
-      // binds to THIS suspension exactly (clock-free grant minting) and reads
-      // the grants to mint from the suspend payload's `connectors`.
-      //
-      // Attribution is the human who started the run (the x-actor-id header),
-      // not the system bridge — otherwise the self-decision separation-of-duties
-      // check can never fire. Falls back to 'demo-starter' when the start
-      // carries no identity; that must differ from SYSTEM_ACTOR.id, or an
-      // anonymous start would attribute the request to the record's creator.
-      const requestedBy = request.headers.get('x-actor-id') ?? 'demo-starter';
-      const record = await queueApprovalForSuspension(
-        buildApprovalService(env),
-        body.workflowId,
-        summary,
-        requestedBy,
-        SYSTEM_ACTOR,
-      );
-      return json({ ...summary, approval: record });
-    }
-
-    const [, workflowId, runId] = segments;
-    if (workflowId && runId) {
-      return runStub(env, workflowId, runId).fetch(
-        new Request(
-          `http://do${url.pathname}`,
-          request as unknown as Request,
-        ) as unknown as CfRequest,
-      ) as unknown as Response;
-    }
     return json({ error: 'not found' }, 404);
   },
 };
