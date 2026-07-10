@@ -36,6 +36,7 @@ export type {
   CodeProps,
   EmptyStateProps,
   HeadingProps,
+  InfoTipProps,
   MetadataItemProps,
   MetadataListProps,
   SectionProps,
@@ -56,6 +57,8 @@ export { createApprovalDashboard } from './mount.js';
 export type { CreateApprovalDashboardOptions } from './mount.js';
 export { QueueView } from './QueueView.js';
 export type { QueueViewProps } from './QueueView.js';
+export { APPROVAL_TIPS } from './tips.js';
+export type { MetricLabel } from './tips.js';
 export { useApprovalDashboard } from './use-approval-dashboard.js';
 export type {
   ApprovalDashboardState,

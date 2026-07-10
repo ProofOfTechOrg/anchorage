@@ -82,9 +82,19 @@ export interface EmptyStateProps {
 export interface SpinnerProps {
   label?: string;
 }
+export interface InfoTipProps {
+  /** The visible content the tip explains (a term, a value, a header). */
+  label: ReactNode;
+  /** Plain-text explanation, shown on hover/focus. */
+  tip: string;
+}
 export interface ApprovalColumn {
   key: string;
-  header: string;
+  /**
+   * ReactNode (not string) so headers can carry an InfoTip. A custom Table
+   * slot doing string operations on `header` must render it as a node instead.
+   */
+  header: ReactNode;
   renderCell: (record: ApprovalRecord) => ReactNode;
 }
 export interface TableProps {
@@ -117,6 +127,7 @@ export interface ApprovalUIComponents {
   Code: (props: CodeProps) => ReactNode;
   EmptyState: (props: EmptyStateProps) => ReactNode;
   Spinner: (props: SpinnerProps) => ReactNode;
+  InfoTip: (props: InfoTipProps) => ReactNode;
   Table: (props: TableProps) => ReactNode;
 }
 
@@ -261,6 +272,11 @@ export const htmlComponents: ApprovalUIComponents = {
   EmptyState: ({ title }) => <p className="flowsafe-empty">{title}</p>,
   Spinner: ({ label }) => (
     <output className="flowsafe-spinner">{label ?? 'Loading…'}</output>
+  ),
+  InfoTip: ({ label, tip }) => (
+    <span className="flowsafe-infotip" title={tip}>
+      {label}
+    </span>
   ),
   Table: HtmlTable,
 };

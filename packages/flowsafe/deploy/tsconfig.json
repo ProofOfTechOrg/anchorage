@@ -4,8 +4,10 @@
     "noEmit": true,
     "types": ["@cloudflare/workers-types"],
     // Copy-ready package specifiers resolve to source here; consumers keep
-    // the same imports against the published package.
+    // the same imports against the published package. breakwater too (matches
+    // the vitest alias) so this pass never depends on a built breakwater dist.
     "paths": {
+      "@proofoftech/breakwater": ["../../breakwater/src/index.ts"],
       "@proofoftech/flowsafe/approval-api": ["../src/approval-api/index.ts"],
       "@proofoftech/flowsafe/audit-export": ["../src/audit-export/index.ts"],
       "@proofoftech/flowsafe/do-runner": ["../src/do-runner/index.ts"],

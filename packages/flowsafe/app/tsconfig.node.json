@@ -13,7 +13,13 @@
   "compilerOptions": {
     "lib": ["ES2022"],
     "types": ["@cloudflare/workers-types"],
-    "noEmit": true
+    "noEmit": true,
+    // The plugin reaches breakwater through the showcase workflows; resolve it
+    // to source (matches the vitest alias) so this pass never depends on a
+    // built breakwater dist.
+    "paths": {
+      "@proofoftech/breakwater": ["../../breakwater/src/index.ts"]
+    }
   },
   "include": ["vite.config.ts", "run-api-dev-plugin.ts"]
 }

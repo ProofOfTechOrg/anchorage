@@ -33,6 +33,7 @@ import {
 import { Text as AstryxText } from '@astryxdesign/core/Text';
 import { TextArea } from '@astryxdesign/core/TextArea';
 import { TextInput } from '@astryxdesign/core/TextInput';
+import { Tooltip as AstryxTooltip } from '@astryxdesign/core/Tooltip';
 
 import type { ApprovalRecord } from '../../src/approval-api/types.js';
 import type {
@@ -150,6 +151,22 @@ export const astryxComponents: ApprovalUIComponents = {
   ),
   EmptyState: ({ title }) => <AstryxEmptyState title={title} />,
   Spinner: ({ label }) => <AstryxSpinner label={label} />,
+  // Real hover/focus tooltip (vs the HTML default's title attribute). A dotted
+  // underline marks the term as explorable without inventing a new component.
+  InfoTip: ({ label, tip }) => (
+    <AstryxTooltip content={tip}>
+      <span
+        style={{
+          textDecorationLine: 'underline',
+          textDecorationStyle: 'dotted',
+          textUnderlineOffset: '3px',
+          cursor: 'help',
+        }}
+      >
+        {label}
+      </span>
+    </AstryxTooltip>
+  ),
   Table: ({ data, columns, idKey, emptyState, 'aria-label': ariaLabel }) => {
     const astryxColumns: AstryxTableColumn<AstryxRow>[] = columns.map(
       (column) => ({

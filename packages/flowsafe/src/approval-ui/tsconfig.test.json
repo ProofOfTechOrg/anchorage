@@ -1,0 +1,12 @@
+{
+  // UI test pass: same jsx+DOM settings as the UI build pass, but with the
+  // test exclusion lifted so JSX-importing tests (components.test.ts)
+  // typecheck. The package-level tsconfig.test.json cannot compile them (its
+  // workers-typed program has no jsx), so it excludes them and this pass
+  // owns them instead. noEmit: tests never ship.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "exclude": []
+}

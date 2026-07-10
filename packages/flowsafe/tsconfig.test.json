@@ -26,5 +26,11 @@
     "showcase/runtime.ts",
     "showcase/workflows/**/*.ts"
   ],
-  "exclude": ["src/approval-ui/**/*.tsx", "src/approval-ui/index.ts"]
+  "exclude": [
+    "src/approval-ui/**/*.tsx",
+    "src/approval-ui/index.ts",
+    // Imports the .tsx contract, which this workers-typed (jsx-free) program
+    // cannot compile; the approval-ui UI test pass typechecks it instead.
+    "src/approval-ui/components.test.ts"
+  ]
 }
