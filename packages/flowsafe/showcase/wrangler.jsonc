@@ -49,7 +49,8 @@
       "/runs/*",
       "/healthz",
       "/workflows",
-      "/auth/*"
+      "/auth/*",
+      "/demo/*"
     ]
   },
   // The public demo runs REAL isolate CPU per visitor run. Cap it (Workers

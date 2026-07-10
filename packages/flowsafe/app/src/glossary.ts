@@ -64,6 +64,8 @@ export const GLOSSARY = {
     "Your identity renders from the server's authenticated echo on API responses. The browser holds tokens but never decides who you are.",
   runCaps:
     'Demo budget: 20 runs per sandbox lifetime and 500 across all visitors per UTC day. Exceeding either returns 429.',
+  reset:
+    "Deletes ALL of your sandbox's runs and approval records server-side (admin role required). You stay signed in; the run budget is NOT refilled.",
   simulated:
     "The connector's real code path runs — grant check, audit, idempotency, limits — but no binding is configured, so the external call is skipped and its envelope logged.",
   dryRun:

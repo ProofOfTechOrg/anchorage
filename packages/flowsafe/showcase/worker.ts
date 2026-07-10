@@ -34,6 +34,11 @@
 //                                            are minted in-process from an
 //                                            observed suspension, never from a
 //                                            request body.
+//   POST /demo/reset                      -> self-service sandbox wipe (admin
+//                                            role + demo tenant only): purges
+//                                            the caller's runs + approvals via
+//                                            purgeTenant; the run budget is
+//                                            deliberately NOT refilled
 //   GET  /healthz                         -> liveness (unauthenticated)
 //
 // All routes except /healthz and /auth/* require `Authorization: Bearer
@@ -103,6 +108,7 @@ import {
   type OAuthProvider,
   purgeExpiredDemoTenants,
 } from './demo-auth.js';
+import { createDemoResetRouter } from './demo-reset.js';
 import {
   buildShowcaseRuntime,
   SHOWCASE_MODULES,
@@ -563,6 +569,17 @@ const handler: ExportedHandler<Env> = {
           waitUntil,
         }),
     });
+
+    // Self-service sandbox reset (admin role + demo tenant only): the same
+    // purge primitive as the reaper. Deliberately leaves run_count/demo_daily
+    // alone — a reset must never refill the spend budget. (A future
+    // budget-refill would extend this purgeTenantData arrow, nothing else.)
+    const resetResponse = await createDemoResetRouter({
+      resolve,
+      isDemoTenant: (tenantId) => isDemoTenant(env.DB, tenantId),
+      purgeTenantData: (tenantId) => purgeTenant(env.DB, { tenantId }),
+    })(routed);
+    if (resetResponse) return resetResponse;
 
     const approvalResponse = await createApprovalRouter({ resolve })(routed);
     if (approvalResponse) return approvalResponse;

@@ -6,6 +6,9 @@
 // run leg), and the Parameters<typeof fetchHandler> cast for workers types.
 import { describe, expect, it, vi } from 'vitest';
 
+import { D1ApprovalStoreFactory } from '../src/approval-api/index.js';
+import type { ApprovalRecord } from '../src/approval-api/index.js';
+import { provisionTenant } from '../src/host-kit/index.js';
 import { STATE_COOKIE } from './demo-auth.js';
 import handler from './worker.js';
 
@@ -267,5 +270,161 @@ describe('showcase worker fetch(): the demo-auth mount', () => {
       ),
     ).toBe(true);
     errorSpy.mockRestore();
+  });
+});
+
+describe('showcase worker fetch(): the demo-reset mount', () => {
+  const DEMO_TENANT = 'dmvisitor01';
+  const RESET_TOKENS = {
+    'tok-demo-admin': {
+      id: 'demo-admin',
+      role: 'admin',
+      tenantId: DEMO_TENANT,
+    },
+    'tok-demo-viewer': {
+      id: 'demo-viewer',
+      role: 'viewer',
+      tenantId: DEMO_TENANT,
+    },
+    // Static operator identity: admin of a tenant NEVER provisioned as demo.
+    'tok-ops-admin': { id: 'ops-olive', role: 'admin', tenantId: 'acme' },
+    ...TOKENS,
+  };
+
+  let approvalSeq = 0;
+
+  function approvalRecord(tenantId: string): ApprovalRecord {
+    approvalSeq += 1;
+    const at = new Date(1751000000000 + approvalSeq * 1000).toISOString();
+    return {
+      id: `apr-reset-${approvalSeq}`,
+      tenantId,
+      workflowId: 'gtm-outbound',
+      runId: `${tenantId}_run${approvalSeq}`,
+      title: `approval ${approvalSeq}`,
+      connectors: [],
+      priority: 'normal',
+      status: 'pending',
+      createdAt: at,
+      updatedAt: at,
+    };
+  }
+
+  // One seeded world: a provisioned demo tenant holding a snapshot row and an
+  // approval, plus a foreign tenant's row in each store that must SURVIVE.
+  async function seededEnv(): Promise<{
+    env: Env;
+    sqlite: SqliteDatabase;
+    approvals: D1ApprovalStoreFactory;
+  }> {
+    const sqlite = openSqlite();
+    const db = d1DatabaseLike(sqlite);
+    const env = makeEnv({
+      DB: db,
+      APPROVAL_ACTOR_TOKENS: JSON.stringify(RESET_TOKENS),
+    } as Partial<Env>);
+    await provisionTenant(db as Parameters<typeof provisionTenant>[0], {
+      tenantId: DEMO_TENANT,
+      kind: 'demo',
+    });
+    sqlite.exec(
+      `CREATE TABLE mastra_workflow_snapshot (
+         workflow_name TEXT NOT NULL,
+         run_id TEXT NOT NULL,
+         snapshot TEXT NOT NULL,
+         createdAt TEXT,
+         updatedAt TEXT
+       )`,
+    );
+    const insert = sqlite.prepare(
+      `INSERT INTO mastra_workflow_snapshot
+         (workflow_name, run_id, snapshot) VALUES (?, ?, ?)`,
+    );
+    insert.run('gtm-outbound', `${DEMO_TENANT}_run1`, '{}');
+    insert.run('gtm-outbound', 'acme_run1', '{}');
+    const approvals = new D1ApprovalStoreFactory(
+      db as ConstructorParameters<typeof D1ApprovalStoreFactory>[0],
+    );
+    await approvals.forTenant(DEMO_TENANT).create(approvalRecord(DEMO_TENANT));
+    await approvals.forTenant('acme').create(approvalRecord('acme'));
+    return { env, sqlite, approvals };
+  }
+
+  it("an admin of a demo tenant wipes exactly their own rows — the foreign tenant's survive", async () => {
+    // #given
+    const { env, sqlite, approvals } = await seededEnv();
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    // #when
+    const response = await call(env, '/demo/reset', {
+      method: 'POST',
+      token: 'tok-demo-admin',
+    });
+
+    // #then — real counts in the envelope
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      tenantId: DEMO_TENANT,
+      purged: { snapshots: 1, approvals: 1, artifacts: 0 },
+    });
+    // #then — the demo tenant's stores are empty, the foreign tenant's intact
+    const remaining = sqlite
+      .prepare('SELECT run_id FROM mastra_workflow_snapshot')
+      .all() as Array<{ run_id: string }>;
+    expect(remaining.map((row) => row.run_id)).toEqual(['acme_run1']);
+    expect(await approvals.forTenant(DEMO_TENANT).list()).toEqual([]);
+    expect(await approvals.forTenant('acme').list()).toHaveLength(1);
+    // #then — the structured audit line names the tenant
+    expect(
+      logSpy.mock.calls.some(([line]) =>
+        String(line).includes('"type":"demo-reset"'),
+      ),
+    ).toBe(true);
+    logSpy.mockRestore();
+  });
+
+  it('refuses everyone else: 401 without a token, 403 for a non-admin role, 403 for a non-demo tenant', async () => {
+    // #given
+    const { env, sqlite } = await seededEnv();
+
+    // #when / #then — unauthenticated
+    expect((await call(env, '/demo/reset', { method: 'POST' })).status).toBe(
+      401,
+    );
+    // #then — viewer of the demo tenant (RBAC lesson, not a wipe)
+    expect(
+      (
+        await call(env, '/demo/reset', {
+          method: 'POST',
+          token: 'tok-demo-viewer',
+        })
+      ).status,
+    ).toBe(403);
+    // #then — admin of a tenant that was never provisioned as demo
+    expect(
+      (
+        await call(env, '/demo/reset', {
+          method: 'POST',
+          token: 'tok-ops-admin',
+        })
+      ).status,
+    ).toBe(403);
+    // #then — nothing was purged by any refusal
+    const rows = sqlite
+      .prepare('SELECT run_id FROM mastra_workflow_snapshot')
+      .all() as Array<{ run_id: string }>;
+    expect(rows).toHaveLength(2);
+  });
+
+  it('405s a GET on /demo/reset while the rest of the composition stays intact', async () => {
+    // #given
+    const { env } = await seededEnv();
+
+    // #when / #then
+    expect(
+      (await call(env, '/demo/reset', { token: 'tok-demo-admin' })).status,
+    ).toBe(405);
+    expect((await call(env, '/healthz')).status).toBe(200);
   });
 });

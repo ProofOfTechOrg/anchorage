@@ -13,12 +13,13 @@ import { Grid } from '@astryxdesign/core/Grid';
 import { Heading } from '@astryxdesign/core/Heading';
 import { HStack } from '@astryxdesign/core/HStack';
 import { SelectableCard } from '@astryxdesign/core/SelectableCard';
+import { Spinner } from '@astryxdesign/core/Spinner';
 import { Text } from '@astryxdesign/core/Text';
 import { TextArea } from '@astryxdesign/core/TextArea';
 import { Token } from '@astryxdesign/core/Token';
 import { Tooltip } from '@astryxdesign/core/Tooltip';
 import { VStack } from '@astryxdesign/core/VStack';
-import { type ReactElement, useState } from 'react';
+import { type CSSProperties, type ReactElement, useState } from 'react';
 
 import { claimableSteps, GLOSSARY, WORKFLOW_GUIDES } from './glossary.js';
 import {
@@ -47,9 +48,43 @@ const CARD_VARIANTS: Record<string, CardVariant> = {
   'access-request': 'pink',
 };
 
+/** The Card variants that tint their background and ship a matched text var. */
+const UNTONED_VARIANTS: readonly CardVariant[] = [
+  'default',
+  'transparent',
+  'muted',
+];
+
+/**
+ * Toned ink for a tinted variant. The y2k card tints keep the SAME light hex
+ * in dark mode, but --color-text-primary flips to near-white there — so an
+ * unstyled card title renders near-white on pastel. Re-point the text vars at
+ * the variant's matched --color-text-<variant> (dark in BOTH modes — the
+ * theme's own Banner/Token pairing), and set `color` so the hover overlay's
+ * currentColor tint stays dark-on-pastel too. Custom properties, not a bare
+ * color: the theme styles Text via `color: var(--color-text-primary)`.
+ * Mode-aware variants keep the theme's own ink.
+ */
+function cardInk(variant: CardVariant): CSSProperties | undefined {
+  if (UNTONED_VARIANTS.includes(variant)) return undefined;
+  const ink = `var(--color-text-${variant})`;
+  return {
+    color: ink,
+    '--color-text-primary': ink,
+    '--color-text-secondary': ink,
+  } as CSSProperties;
+}
+
+// DERIVED from CARD_VARIANTS, never hand-repeated: a parallel id→tone map
+// would silently drift on a recolor and reinstate the wash-out this fixes.
+const CARD_INK: Record<string, CSSProperties | undefined> = Object.fromEntries(
+  Object.entries(CARD_VARIANTS).map(([id, variant]) => [id, cardInk(variant)]),
+);
+
 export function WorkflowLauncher({
   workflows,
   actor,
+  isLoading = false,
   loadError,
   runClient,
   onStarted,
@@ -57,6 +92,8 @@ export function WorkflowLauncher({
 }: {
   workflows: readonly WorkflowMeta[];
   actor: CatalogActor | null;
+  /** True until the FIRST catalog fetch settles — renders a spinner. */
+  isLoading?: boolean;
   loadError: string | null;
   runClient: RunClient;
   onStarted: (entry: RunEntry) => void;
@@ -149,12 +186,14 @@ export function WorkflowLauncher({
           title={`Could not load workflows: ${loadError}`}
         />
       ) : null}
+      {isLoading ? <Spinner label="Loading workflows…" /> : null}
       <Grid columns={{ minWidth: 150 }} gap={2}>
         {workflows.map((w) => (
           <SelectableCard
             key={w.id}
             label={w.title}
             variant={CARD_VARIANTS[w.id] ?? 'default'}
+            style={CARD_INK[w.id]}
             padding={3}
             isSelected={w.id === effectiveId}
             onChange={(isSelected) => {

@@ -124,11 +124,13 @@ function RunCard({
   result,
   records,
   onReview,
+  onRetryPolling,
 }: {
   run: RunEntry;
   result: RunResult | undefined;
   records: readonly ApprovalRecord[];
   onReview: (approvalId: string) => void;
+  onRetryPolling: () => void;
 }): ReactElement {
   const summary = result?.summary;
   const pollError = result?.error;
@@ -226,10 +228,27 @@ function RunCard({
         </HStack>
         <StepChips workflowId={run.workflowId} suspendedStep={susp?.step} />
         {pollError ? (
-          <Banner
-            status="error"
-            title={`Could not read run status: ${pollError}`}
-          />
+          <VStack gap={2}>
+            <Banner
+              status="error"
+              title={`Could not read run status: ${pollError}`}
+            />
+            {result?.stopped ? (
+              // Polling gave up (hard error or repeated transient failures);
+              // without this the card is dead until a full reload.
+              <HStack gap={2} align="center">
+                <Button
+                  label="Retry live updates"
+                  variant="ghost"
+                  size="sm"
+                  onClick={onRetryPolling}
+                />
+                <Text size="sm" color="secondary">
+                  Polling stopped after repeated failures.
+                </Text>
+              </HStack>
+            ) : null}
+          </VStack>
         ) : null}
         {susp ? (
           <VStack gap={2}>
@@ -341,12 +360,15 @@ export function RunCards({
   results,
   records,
   onReview,
+  onRetryPolling,
 }: {
   runs: readonly RunEntry[];
   results: Record<string, RunResult>;
   /** The approval queue — used to jump from a suspended run to its request. */
   records: readonly ApprovalRecord[];
   onReview: (approvalId: string) => void;
+  /** Re-arms the status poll after it abandoned a run (see useRunPolling). */
+  onRetryPolling: () => void;
 }): ReactElement {
   return (
     <VStack gap={3} aria-label="Runs">
@@ -364,6 +386,7 @@ export function RunCards({
             result={results[run.runId]}
             records={records}
             onReview={onReview}
+            onRetryPolling={onRetryPolling}
           />
         ))
       )}

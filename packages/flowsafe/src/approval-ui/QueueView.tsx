@@ -108,7 +108,12 @@ export function QueueView({
       data={records}
       columns={columns}
       idKey="id"
-      emptyState={<C.EmptyState title="No approval requests." />}
+      emptyState={
+        <C.EmptyState
+          title="No approval requests."
+          description="Launch a workflow — a suspension queues its approval request here."
+        />
+      }
     />
   );
 }

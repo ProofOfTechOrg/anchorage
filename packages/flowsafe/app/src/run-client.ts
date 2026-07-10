@@ -115,6 +115,17 @@ export interface StartRunResponse extends RunSummary {
   approval?: { id: string } & Record<string, unknown>;
 }
 
+/**
+ * POST /demo/reset: the server-side sandbox wipe. `purged` carries the exact
+ * delete counts, so the UI narrates verified numbers only. Admin role + demo
+ * tenant enforced server-side (401/403 surface as RunApiError).
+ */
+export interface DemoResetResponse {
+  ok: boolean;
+  tenantId: string;
+  purged: { snapshots: number; approvals: number; artifacts: number };
+}
+
 export class RunClient {
   readonly #baseUrl: string;
   readonly #fetch: FetchLike;
@@ -150,6 +161,10 @@ export class RunClient {
     return (await this.#request(
       `/runs/${encodeURIComponent(workflowId)}/${encodeURIComponent(runId)}`,
     )) as RunSummary;
+  }
+
+  async reset(): Promise<DemoResetResponse> {
+    return (await this.#post('/demo/reset', {})) as DemoResetResponse;
   }
 
   async #post(path: string, body: Record<string, unknown>): Promise<unknown> {

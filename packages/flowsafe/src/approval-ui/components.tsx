@@ -78,6 +78,8 @@ export interface CodeProps {
 }
 export interface EmptyStateProps {
   title: string;
+  /** Optional supporting line (what fills this view, or what to do next). */
+  description?: string;
 }
 export interface SpinnerProps {
   label?: string;
@@ -269,7 +271,14 @@ export const htmlComponents: ApprovalUIComponents = {
     </div>
   ),
   Code: ({ code }) => <pre className="flowsafe-code">{code}</pre>,
-  EmptyState: ({ title }) => <p className="flowsafe-empty">{title}</p>,
+  EmptyState: ({ title, description }) => (
+    <div className="flowsafe-empty">
+      <p className="flowsafe-empty-title">{title}</p>
+      {description !== undefined ? (
+        <p className="flowsafe-empty-description">{description}</p>
+      ) : null}
+    </div>
+  ),
   Spinner: ({ label }) => (
     <output className="flowsafe-spinner">{label ?? 'Loading…'}</output>
   ),

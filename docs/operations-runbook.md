@@ -137,3 +137,8 @@ Keep the sweep interval at or below your SLA granularity.
   tokens die with it. Per-identity limits are a speed bump — someone with N
   free accounts mints N sandboxes — so size the daily ceiling for the spend you
   can tolerate and pair it with a billing alert.
+- Demo self-reset (`showcase/`): visitors can wipe their own sandbox with
+  `POST /demo/reset` (admin token + demo tenant only; logs
+  `{"type":"demo-reset","tenantId":…}` with the purge counts). It reuses the
+  reaper's `purgeTenant` but never touches `run_count`/`demo_daily`, so a
+  reset cannot refill the spend budget.

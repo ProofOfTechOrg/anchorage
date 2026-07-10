@@ -57,12 +57,21 @@ function isTransient(error: unknown): boolean {
 export function useRunPolling(
   runClient: RunClient,
   runs: readonly RunEntry[],
+  // Bumping the nonce re-arms the effect, which forgives every abandonment by
+  // construction (the failure/abandoned maps are per-effect-run) — the "Retry
+  // live updates" affordance on a degraded run card. Required (not defaulted):
+  // biome's exhaustive-deps misreads a defaulted parameter as an outer-scope
+  // value.
+  retryNonce: number,
 ): Record<string, RunResult> {
   const [results, setResults] = useState<Record<string, RunResult>>({});
 
   // Poll each tracked run's status. External sync — a legitimate effect; re-runs
-  // when the run set or the acting client changes.
+  // when the run set, the acting client, or the retry nonce changes.
   useEffect(() => {
+    // The nonce's value is meaningless — its CHANGE is the re-arm signal, and
+    // re-arming forgives abandonments because the maps below are per-effect-run.
+    void retryNonce;
     if (runs.length === 0) return;
     let alive = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -156,7 +165,7 @@ export function useRunPolling(
       alive = false;
       if (timer !== undefined) clearTimeout(timer);
     };
-  }, [runClient, runs]);
+  }, [runClient, runs, retryNonce]);
 
   return results;
 }

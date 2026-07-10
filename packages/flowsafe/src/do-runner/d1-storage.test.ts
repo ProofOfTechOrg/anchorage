@@ -482,6 +482,114 @@ describe('purgeTenant (complete offboarding)', () => {
     expect(approvals).toEqual([{ tenant_id: 'abcdefg' }]);
   });
 
+  it('a run landing INSIDE the artifact-SELECT → snapshot-DELETE window is still deleted, and its artifacts are NOT enumerated', async () => {
+    // The three statements are not one transaction, and the artifact deletes
+    // are R2 calls no SQL transaction could span. Pin the resulting behavior
+    // rather than pretend it away: the DELETE re-evaluates the range at
+    // execution time, so a run started mid-purge IS reaped — but the SELECT
+    // feeding artifact cleanup already ran, so that run's artifacts are never
+    // enumerated. Only self-service reset (showcase /demo/reset) can reach
+    // this, by racing its OWN tenant's start; the reaper purges expired
+    // tenants, which have no live caller by construction.
+    // #given — one pre-existing run; a second lands between the two statements
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    seedApprovalsTable(sqlite);
+    seedRun(sqlite, { runId: 'abc_r1', status: 'suspended', updatedAt: NOW });
+    const real = d1Like(sqlite);
+    let selected = false;
+    const racing: SnapshotDatabase = {
+      prepare: (sql: string) => {
+        const statement = real.prepare(sql);
+        if (!sql.includes('SELECT workflow_name')) return statement;
+        return {
+          ...statement,
+          bind: (...values: unknown[]) => {
+            const bound = statement.bind(...values);
+            return {
+              ...bound,
+              all: async <T>() => {
+                const out = await bound.all<T>();
+                if (!selected) {
+                  selected = true;
+                  // a POST /runs for the same tenant commits right here
+                  seedRun(sqlite, {
+                    runId: 'abc_r2',
+                    status: 'running',
+                    updatedAt: NOW,
+                  });
+                }
+                return out;
+              },
+            };
+          },
+        };
+      },
+    };
+    const deletedArtifacts: string[] = [];
+    const artifactStore = {
+      deleteRun: async (workflowId: string, runId: string) => {
+        deletedArtifacts.push(`${workflowId}/${runId}`);
+        return 1;
+      },
+    };
+
+    // #when
+    const result = await purgeTenant(racing, {
+      tenantId: 'abc',
+      artifactStore,
+    });
+
+    // #then — both rows are gone (the DELETE re-reads the range), but only the
+    // run visible to the SELECT had its artifacts cleaned
+    expect(result.snapshots).toBe(2);
+    expect(remainingRunIds(sqlite)).toEqual([]);
+    expect(deletedArtifacts).toEqual(['wf/abc_r1']);
+  });
+
+  it('a failing approvals DELETE leaves the purge PARTIALLY applied — the snapshots are already gone', async () => {
+    // The three statements are not one transaction, so a throw at the last one
+    // cannot roll the first ones back. A caller that surfaces the rejection
+    // (the /demo/reset route 500s) must therefore treat its local view as
+    // stale, not as "nothing happened". Pinned so nobody reads the sequence as
+    // atomic.
+    // #given — a tenant with a snapshot and an approvals table that throws
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    seedApprovalsTable(sqlite);
+    seedRun(sqlite, { runId: 'abc_r1', status: 'suspended', updatedAt: NOW });
+    const real = d1Like(sqlite);
+    const failing: SnapshotDatabase = {
+      prepare: (sql: string) => {
+        const statement = real.prepare(sql);
+        if (!sql.includes('DELETE FROM flowsafe_approvals')) return statement;
+        return {
+          ...statement,
+          bind: () => ({
+            ...statement,
+            run: async () => {
+              throw new Error('D1_ERROR: network');
+            },
+          }),
+        };
+      },
+    };
+
+    // #when / #then — the failure propagates (never silently swallowed)
+    await expect(purgeTenant(failing, { tenantId: 'abc' })).rejects.toThrow(
+      /D1_ERROR/,
+    );
+
+    // #then — the snapshot DELETE already committed: the purge is half-applied
+    expect(remainingRunIds(sqlite)).toEqual([]);
+    const approvals = (
+      sqlite.prepare('SELECT tenant_id FROM flowsafe_approvals') as unknown as {
+        all(): Array<{ tenant_id: string }>;
+      }
+    ).all();
+    expect(approvals).toEqual([{ tenant_id: 'abc' }, { tenant_id: 'abcdefg' }]);
+  });
+
   it('tolerates a host without the approvals table (snapshot-only deployments)', async () => {
     // #given — no flowsafe_approvals table at all
     const sqlite = openSqlite();

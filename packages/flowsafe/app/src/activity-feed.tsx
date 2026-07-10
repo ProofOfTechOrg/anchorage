@@ -15,7 +15,7 @@ import { Timestamp } from '@astryxdesign/core/Timestamp';
 import { Token } from '@astryxdesign/core/Token';
 import { Tooltip } from '@astryxdesign/core/Tooltip';
 import { VStack } from '@astryxdesign/core/VStack';
-import type { ReactElement } from 'react';
+import { type ReactElement, useEffect, useRef } from 'react';
 
 import { GLOSSARY } from './glossary.js';
 import type { NarrationEvent, NarrationTone } from './narration.js';
@@ -96,6 +96,21 @@ export function ActivityFeedPanel({
   onReview: (approvalId: string) => void;
   onViewRun: (runId: string) => void;
 }): ReactElement {
+  // The list scrolls inside its own bounded container; new activity lands at
+  // the top (the feed is newest-first), so snap the container back to the top
+  // whenever the head event changes. DOM-scroll sync — a legitimate effect.
+  // clear() empties the feed (headKey undefined) and must not scroll.
+  const listRef = useRef<HTMLElement | null>(null);
+  const headKey = feed.events[0]?.key;
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el || headKey === undefined) return;
+    const reduce = window.matchMedia(
+      '(prefers-reduced-motion: reduce)',
+    ).matches;
+    el.scrollTo({ top: 0, behavior: reduce ? 'auto' : 'smooth' });
+  }, [headKey]);
+
   return (
     <VStack gap={3} aria-label="Activity">
       <HStack gap={2} align="center" justify="between">
@@ -116,7 +131,20 @@ export function ActivityFeedPanel({
           description="As you act, every observed API response — and the by-design server steps between them — gets narrated here. ● observed, ○ by design."
         />
       ) : (
-        <VStack gap={3}>
+        <VStack
+          gap={3}
+          ref={listRef}
+          style={{
+            // 60vh keeps the column within one viewport on laptops; the px
+            // ceiling stops it ballooning on tall monitors (200 capped rows
+            // would otherwise run thousands of px). Only the rows scroll —
+            // the header/honesty note above stay put.
+            maxHeight: 'min(60vh, 720px)',
+            overflowY: 'auto',
+            overscrollBehavior: 'contain',
+            paddingRight: 4,
+          }}
+        >
           {feed.events.map((event) => (
             <FeedRow
               key={event.key}

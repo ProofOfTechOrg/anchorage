@@ -305,7 +305,14 @@ export interface PurgeTenantResult {
  * approving at that moment would resume against a vanishing row (absorbed:
  * the runtime's pre-check throws before any step re-executes — pinned by the
  * purge-race regression test). Only purge tenants whose tokens have already
- * expired, so no live caller can be mid-resume by construction.
+ * expired, so no live caller can be mid-resume by construction — or purge at
+ * the tenant's own explicit request (the showcase's self-service /demo/reset).
+ * That caller, uniquely, can race ITSELF: a run started between the artifact
+ * SELECT and the snapshot DELETE is reaped by the DELETE (which re-reads the
+ * range) with its artifacts unenumerated, and the three statements are not one
+ * transaction — an R2 delete can never join a SQL one — so a mid-purge failure
+ * leaves it partially applied. Both are pinned in d1-storage.test.ts. Neither
+ * can escape the requester's own tenant: the range predicate is exact.
  */
 export async function purgeTenant(
   db: SnapshotDatabase,

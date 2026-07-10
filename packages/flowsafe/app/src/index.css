@@ -23,3 +23,16 @@ body {
   background-color: var(--color-background-body);
   font-family: var(--font-family-body, sans-serif);
 }
+
+/* Desktop: pin the activity column while the runs column grows — the feed's
+   own max-height keeps the column shorter than the viewport. Lives here
+   because the Astryx layout components take inline style only, which cannot
+   express a media query; below the grid's ~940px single-column breakpoint the
+   rule must be inert (a stacked sticky column would cover the content). */
+@media (min-width: 980px) {
+  .anchorage-activity-column {
+    position: sticky;
+    top: 16px;
+    align-self: start;
+  }
+}

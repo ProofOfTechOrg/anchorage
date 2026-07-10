@@ -87,6 +87,24 @@ export class InMemoryApprovalStoreFactory implements ApprovalStoreFactory {
     return new InMemoryApprovalStore(tenantId, this.#records);
   }
 
+  /**
+   * Delete every record stamped with this tenant, returning the count — the
+   * in-memory mirror of the D1 `purgeTenant` approvals delete (in-memory hosts
+   * have no D1 for that function to run against). Factory-level like
+   * `system()`: offboarding is not a request-scoped capability.
+   */
+  purgeTenant(tenantId: string): number {
+    assertTenantId(tenantId);
+    let purged = 0;
+    for (const [id, record] of this.#records) {
+      if (record.tenantId === tenantId) {
+        this.#records.delete(id);
+        purged += 1;
+      }
+    }
+    return purged;
+  }
+
   system(): SystemApprovalStore {
     const records = this.#records;
     return {

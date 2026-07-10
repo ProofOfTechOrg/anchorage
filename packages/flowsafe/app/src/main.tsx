@@ -15,6 +15,7 @@ import { createRoot } from 'react-dom/client';
 
 import { ApprovalUIProvider } from '../../src/approval-ui/components.js';
 import { astryxComponents } from './astryx-components.js';
+import { AppErrorBoundary } from './error-boundary.js';
 import { NarratingApprovalClient } from './narrating-approval-client.js';
 import {
   DemoActorSwitcher,
@@ -92,6 +93,18 @@ function Root(): ReactElement {
     setRuns((current) => [entry, ...current]);
   }, []);
 
+  // Clearing runs leaves useRunPolling's internal results map with stale
+  // entries; harmless — RunCards renders from `runs`, and post-reset runs get
+  // fresh runIds (never reused) and poll fresh.
+  const clearRuns = useCallback(() => {
+    setRuns([]);
+  }, []);
+
+  // The reset affordance only renders where the server can honor it: the
+  // OAuth demo sandbox and local dev (tenant 'demo' is the dev plugin's demo
+  // tenant). A static-operator-token session would always 403.
+  const canReset = DevActorSwitcher !== null || demoSession !== null;
+
   const endDemoSession = useCallback(() => {
     setDemoSession(null);
     setActorToken(null);
@@ -151,6 +164,8 @@ function Root(): ReactElement {
           runClient={runClient}
           runs={runs}
           onStarted={addRun}
+          onRunsCleared={clearRuns}
+          canReset={canReset}
           feed={feed}
           identityControls={identityControls}
         />
@@ -164,10 +179,14 @@ function Root(): ReactElement {
 // icon registry, so mounting the provider also registers the icon set.
 createRoot(container).render(
   <StrictMode>
-    <Theme theme={y2kTheme}>
-      <ToastViewport position="bottomEnd" maxVisible={3}>
-        <Root />
-      </ToastViewport>
-    </Theme>
+    {/* Outside Theme/ToastViewport: the plain-HTML fallback must render even
+        when the theme provider itself is what threw. */}
+    <AppErrorBoundary>
+      <Theme theme={y2kTheme}>
+        <ToastViewport position="bottomEnd" maxVisible={3}>
+          <Root />
+        </ToastViewport>
+      </Theme>
+    </AppErrorBoundary>
   </StrictMode>,
 );

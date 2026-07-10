@@ -131,6 +131,10 @@ Abuse controls, honestly:
 - Sandboxes expire after `DEMO_TENANT_TTL_HOURS`; a cron reaps them with
   `purgeTenant`, waiting out the JWT lifetime first so it never deletes runs
   out from under a still-valid token.
+- Visitors can self-reset their sandbox (`POST /demo/reset`, admin token +
+  demo tenant only) — the same `purgeTenant` wipe of runs + approvals, but the
+  run budget is deliberately NOT refilled, so reset can never farm runs past
+  the per-tenant cap.
 - Connectors stay binding-gated: a published demo cannot send an email, write
   a CRM, or deploy anything.
 
@@ -142,7 +146,7 @@ can tolerate and set a billing alert.
 `showcase/wrangler.jsonc` has an `assets` block serving `../app/dist` at `/`
 (`not_found_handling: single-page-application`), with `run_worker_first` keeping
 the API routes (`/api/*`, `/runs`, `/runs/*`, `/healthz`, `/workflows`,
-`/auth/*`) on the Worker — one origin, no build-time API URL. Two cron
+`/auth/*`, `/demo/*`) on the Worker — one origin, no build-time API URL. Two cron
 expressions are declared and dispatched on `controller.cron`, so the SLA sweep
 and the purge never share an invocation (a CPU-limit termination kills the
 isolate and cannot be caught, so a slow sweep would starve the purge forever).

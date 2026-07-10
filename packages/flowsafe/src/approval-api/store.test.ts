@@ -480,6 +480,47 @@ describeStoreContract(
   () => new D1ApprovalStoreFactory(d1Like(openSqlite())),
 );
 
+describe('InMemoryApprovalStoreFactory.purgeTenant (in-memory offboarding)', () => {
+  // The in-memory mirror of D1 purgeTenant's approvals delete — the shared-Map
+  // factory makes the isolation assertion non-vacuous.
+  it("deletes only the named tenant's records and returns the count", async () => {
+    // #given — two acme records and one bravo record over ONE backend
+    const backend = new InMemoryApprovalStoreFactory();
+    const storeA = backend.forTenant('acme');
+    const storeB = backend.forTenant('bravo');
+    const a1 = makeRecord({ runId: 'acme_r1' });
+    const a2 = makeRecord({ runId: 'acme_r2', stepPath: ['gate'] });
+    const b1 = makeRecord({ runId: 'bravo_r1' });
+    await storeA.create(a1);
+    await storeA.create(a2);
+    await storeB.create(b1);
+
+    // #when
+    const purged = backend.purgeTenant('acme');
+
+    // #then — acme emptied, bravo untouched
+    expect(purged).toBe(2);
+    expect(await storeA.list()).toEqual([]);
+    expect((await storeB.list()).map((r) => r.id)).toEqual([b1.id]);
+  });
+
+  it('returns 0 for a tenant with no records', () => {
+    // #given
+    const backend = new InMemoryApprovalStoreFactory();
+
+    // #when / #then
+    expect(backend.purgeTenant('ghost')).toBe(0);
+  });
+
+  it('rejects a non-INV-3 tenantId before touching any record', () => {
+    // #given
+    const backend = new InMemoryApprovalStoreFactory();
+
+    // #when / #then — same guard as forTenant (and D1's purgeTenant)
+    expect(() => backend.purgeTenant("a'; DROP--")).toThrow(/INV-3/);
+  });
+});
+
 describe('D1ApprovalStore schema upgrade', () => {
   // The pre-tenant column set — what the 31 local .wrangler databases and any
   // pre-multi-tenant release carry. There is deliberately NO upgrade path:

@@ -30,6 +30,7 @@ import {
   InMemoryApprovalStoreFactory,
   resumeViaRuntime,
 } from '../src/approval-api/index.js';
+import { tenantOfRunId } from '../src/do-runner/index.js';
 import {
   bearerActorAuthenticator,
   createRunRouter,
@@ -37,7 +38,11 @@ import {
   resumeRunWithRequeue,
   staticTokenVerifier,
 } from '../src/host-kit/index.js';
-import { demoActorTokensJson } from '../showcase/demo-actors.js';
+import {
+  DEMO_TENANT_ID,
+  demoActorTokensJson,
+} from '../showcase/demo-actors.js';
+import { createDemoResetRouter } from '../showcase/demo-reset.js';
 import { buildShowcaseRuntime, SHOWCASE_MODULES } from '../showcase/runtime.js';
 
 const APPROVAL_BASE = '/api/approvals';
@@ -79,8 +84,10 @@ async function nodeToWebRequest(
 
 export function runApiDevPlugin(): Plugin {
   const storeFactory = new InMemoryApprovalStoreFactory();
+  // Held by name so the /demo/reset seam below can purge its workflow rows.
+  const storage = new InMemoryStore();
   const runtime = buildShowcaseRuntime({
-    initInput: { storage: new InMemoryStore() },
+    initInput: { storage },
     // In-process host: one runtime serves every tenant, so the provider binds
     // per LEG from the runId's tenant prefix (the DO topology binds
     // per-instance instead).
@@ -136,6 +143,41 @@ export function runApiDevPlugin(): Plugin {
       return runtime.resume(workflowId, runId, { step, resumeData });
     },
   });
+  // The same reset router the deployed worker mounts, over in-memory seams:
+  // every dev identity shares the 'demo' tenant (no D1 registry exists here,
+  // so the discriminator is the constant), snapshots purge through Mastra's
+  // workflows domain, approvals through the shared-Map factory. The runtime's
+  // in-memory idempotency + artifact state is not cleared — mirrors the
+  // deployed worker's orphaned-DO-state posture (runIds are never reused).
+  const resetRouter = createDemoResetRouter({
+    resolve,
+    isDemoTenant: async (tenantId) => tenantId === DEMO_TENANT_ID,
+    purgeTenantData: async (tenantId) => {
+      let snapshots = 0;
+      const workflows = await storage.getStore('workflows');
+      if (workflows) {
+        // listWorkflowRuns() paginates only when BOTH perPage and page are
+        // given, so this enumerates every run. Ownership goes through the ONE
+        // INV-1 decode (tenantOfRunId) rather than a hand-rolled prefix test —
+        // the same reason D1's purge uses an exact range predicate.
+        const { runs } = await workflows.listWorkflowRuns();
+        for (const run of runs) {
+          if (tenantOfRunId(run.runId) === tenantId) {
+            await workflows.deleteWorkflowRunById({
+              runId: run.runId,
+              workflowName: run.workflowName,
+            });
+            snapshots += 1;
+          }
+        }
+      }
+      return {
+        snapshots,
+        approvals: storeFactory.purgeTenant(tenantId),
+        artifacts: 0,
+      };
+    },
+  });
 
   return {
     name: 'flowsafe-showcase-dev',
@@ -150,7 +192,8 @@ export function runApiDevPlugin(): Plugin {
           url.startsWith('/workflows?') ||
           url === '/runs' ||
           url.startsWith('/runs/') ||
-          url.startsWith('/runs?');
+          url.startsWith('/runs?') ||
+          url === '/demo/reset';
         if (!isShowcaseApi) {
           next();
           return;
@@ -158,10 +201,13 @@ export function runApiDevPlugin(): Plugin {
         void (async () => {
           try {
             const request = await nodeToWebRequest(req);
-            // Approvals first (it returns null for non-approval paths without
-            // touching the body); the run surface handles the rest.
+            // Reset first (exact-path, cheapest check), then approvals (null
+            // for non-approval paths without touching the body); the run
+            // surface handles the rest.
             const response =
-              (await approvalRouter(request)) ?? (await runRouter(request));
+              (await resetRouter(request)) ??
+              (await approvalRouter(request)) ??
+              (await runRouter(request));
             if (!response) {
               next();
               return;

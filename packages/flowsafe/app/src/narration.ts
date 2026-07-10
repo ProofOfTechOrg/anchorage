@@ -769,6 +769,73 @@ export function startErrorEvent(
 }
 
 /**
+ * Narrate a successful sandbox reset. Timestamp-keyed: the feed was cleared
+ * the instant before this records, so there is nothing to dedup against, and
+ * a SECOND reset minutes later is a genuinely new fact that must not collapse
+ * into the first. Counts come verbatim from the server response — the
+ * truthfulness rule (verified numbers only) applies to deletes too.
+ */
+export function resetEvent(purged: {
+  snapshots: number;
+  approvals: number;
+  artifacts: number;
+}): NarrationEvent {
+  const at = Date.now();
+  const plural = (count: number) => (count === 1 ? '' : 's');
+  return {
+    key: `demo.reset:${at}`,
+    at,
+    zone: 'd1',
+    kind: 'demo.reset',
+    title: `Sandbox reset — ${purged.snapshots} run snapshot${plural(purged.snapshots)} and ${purged.approvals} approval${plural(purged.approvals)} purged`,
+    detail:
+      'A tenant-scoped D1 delete, server-side — the same primitive the expiry reaper uses. You stay signed in, and the run budget is NOT refilled.',
+    tone: 'success',
+    observed: true,
+    toast: true,
+    toastLong: true,
+  };
+}
+
+/** Narrate a refused/failed reset; the 403 is the RBAC lesson working. */
+export function resetErrorEvent(
+  error: unknown,
+  actorRole?: string,
+): NarrationEvent {
+  const at = Date.now();
+  const message = error instanceof Error ? error.message : String(error);
+  if (
+    error instanceof RunApiError &&
+    (error.status === 401 || error.status === 403)
+  ) {
+    return {
+      key: `reset-denied:${actorRole ?? 'unknown'}`,
+      at,
+      zone: 'worker',
+      kind: 'demo.reset-denied',
+      title: 'Reset refused by the server',
+      detail: `${message}. Only the admin identity of a demo sandbox may wipe it — the same server-side RBAC that gates every other mutation.`,
+      tone: 'danger',
+      observed: true,
+      toast: true,
+      toastLong: true,
+    };
+  }
+  return {
+    key: `reset-failed:${at}`,
+    at,
+    zone: 'worker',
+    kind: 'demo.reset-failed',
+    title: 'Sandbox reset failed',
+    detail: message,
+    tone: 'danger',
+    observed: true,
+    toast: true,
+    toastSticky: true,
+  };
+}
+
+/**
  * Narrate the decider's own decide result. Pre-records the resumed/grant keys
  * the poll will re-derive, so the decider never gets a second toast for the
  * resume their decision caused.

@@ -41,6 +41,52 @@ describe('htmlComponents.InfoTip', () => {
   });
 });
 
+describe('htmlComponents.EmptyState', () => {
+  interface EmptyStateElementProps {
+    className: string;
+    children: unknown;
+  }
+
+  function renderDefaultEmptyState(props: {
+    title: string;
+    description?: string;
+  }): ReactElement<EmptyStateElementProps>[] {
+    // #given / #when — the default slot as an element object (no jsdom)
+    const element = htmlComponents.EmptyState(
+      props,
+    ) as ReactElement<EmptyStateElementProps>;
+    expect(element.type).toBe('div');
+    expect(element.props.className).toBe('flowsafe-empty');
+    const children = element.props
+      .children as Array<ReactElement<EmptyStateElementProps> | null>;
+    return children.filter(
+      (child): child is ReactElement<EmptyStateElementProps> => child !== null,
+    );
+  }
+
+  it('renders the description as a second paragraph when provided', () => {
+    // #when
+    const children = renderDefaultEmptyState({
+      title: 'Nothing here',
+      description: 'Launch something.',
+    });
+
+    // #then
+    expect(children).toHaveLength(2);
+    expect(children[1]?.props.className).toBe('flowsafe-empty-description');
+    expect(children[1]?.props.children).toBe('Launch something.');
+  });
+
+  it('omits the description paragraph when absent (backward compatible)', () => {
+    // #when
+    const children = renderDefaultEmptyState({ title: 'Nothing here' });
+
+    // #then
+    expect(children).toHaveLength(1);
+    expect(children[0]?.props.className).toBe('flowsafe-empty-title');
+  });
+});
+
 describe('provider merge semantics', () => {
   // Mirrors ApprovalUIProvider's merge ({...htmlComponents, ...components})
   // without mounting the provider — hooks need a renderer, the merge does not.

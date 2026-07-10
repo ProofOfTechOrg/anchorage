@@ -149,7 +149,9 @@ export const astryxComponents: ApprovalUIComponents = {
   Code: ({ code, language }) => (
     <CodeBlock code={code} language={language} isWrapped hasCopyButton />
   ),
-  EmptyState: ({ title }) => <AstryxEmptyState title={title} />,
+  EmptyState: ({ title, description }) => (
+    <AstryxEmptyState title={title} description={description} />
+  ),
   Spinner: ({ label }) => <AstryxSpinner label={label} />,
   // Real hover/focus tooltip (vs the HTML default's title attribute). A dotted
   // underline marks the term as explorable without inventing a new component.

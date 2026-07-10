@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type {
   ApprovalRecord,
@@ -11,6 +11,8 @@ import {
   deriveRunEvents,
   interpretRunResult,
   type NarrationRunRef,
+  resetErrorEvent,
+  resetEvent,
   shortId,
   startErrorEvent,
   startEvent,
@@ -429,6 +431,68 @@ describe('startErrorEvent', () => {
     const generic = startErrorEvent('x', new Error('network down'));
     expect(generic.kind).toBe('run.start-failed');
     expect(generic.detail).toBe('network down');
+  });
+});
+
+describe('resetEvent', () => {
+  it('narrates the verified purge counts with singular/plural wording and honest budget copy', () => {
+    // #given / #when
+    const event = resetEvent({ snapshots: 1, approvals: 2, artifacts: 0 });
+
+    // #then — counts verbatim, toasted, and the budget claim stays truthful
+    expect(event.title).toBe(
+      'Sandbox reset — 1 run snapshot and 2 approvals purged',
+    );
+    expect(event.zone).toBe('d1');
+    expect(event.tone).toBe('success');
+    expect(event.observed).toBe(true);
+    expect(event.toast).toBe(true);
+    expect(event.detail).toContain('NOT refilled');
+  });
+
+  it('mints a fresh key per reset so a second wipe never dedups into the first', () => {
+    // #given
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_752_000_000_000);
+      const first = resetEvent({ snapshots: 0, approvals: 0, artifacts: 0 });
+      vi.setSystemTime(1_752_000_060_000);
+
+      // #when
+      const second = resetEvent({ snapshots: 0, approvals: 0, artifacts: 0 });
+
+      // #then
+      expect(second.key).not.toBe(first.key);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('resetErrorEvent', () => {
+  it('maps 403 to the RBAC lesson naming the admin requirement', () => {
+    // #given / #when
+    const event = resetErrorEvent(
+      new RunApiError(403, "forbidden — requires admin (you are 'viewer')"),
+      'viewer',
+    );
+
+    // #then
+    expect(event.key).toBe('reset-denied:viewer');
+    expect(event.kind).toBe('demo.reset-denied');
+    expect(event.tone).toBe('danger');
+    expect(event.detail).toContain('admin');
+    expect(event.detail).toContain("you are 'viewer'");
+  });
+
+  it('maps anything else to a sticky generic failure carrying the message', () => {
+    // #given / #when
+    const event = resetErrorEvent(new Error('D1 unavailable'));
+
+    // #then
+    expect(event.kind).toBe('demo.reset-failed');
+    expect(event.toastSticky).toBe(true);
+    expect(event.detail).toBe('D1 unavailable');
   });
 });
 
