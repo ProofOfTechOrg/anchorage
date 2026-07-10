@@ -10,6 +10,7 @@
 
 # --- Tracked top-level files ---
 !/.gitignore
+!/.node-version
 !/biome.json
 !/CLAUDE.md
 !/CONTRIBUTING.md
