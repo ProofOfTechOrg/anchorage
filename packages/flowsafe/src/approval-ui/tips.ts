@@ -36,6 +36,8 @@ export type MetricLabel = keyof typeof METRIC_TIPS;
 
 export const APPROVAL_TIPS = {
   sla: 'Each request carries a decide-by deadline (4 hours here). A cron sweep every 15 minutes marks overdue requests as escalated.',
+  statusColumn:
+    'pending → claimed → approved/rejected; escalated when the SLA sweep flags an overdue request.',
   priority:
     'low, normal, high, or critical — set when a request is created. Approvals auto-queued by this demo are always normal.',
   claim:

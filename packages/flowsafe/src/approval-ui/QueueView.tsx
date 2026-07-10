@@ -83,12 +83,7 @@ export function QueueView({
     },
     {
       key: 'status',
-      header: (
-        <C.InfoTip
-          label="Status"
-          tip="pending → claimed → approved/rejected; escalated when the SLA sweep flags an overdue request."
-        />
-      ),
+      header: <C.InfoTip label="Status" tip={APPROVAL_TIPS.statusColumn} />,
       renderCell: (record) => (
         <C.Badge tone={STATUS_TONE[record.status]} label={record.status} />
       ),

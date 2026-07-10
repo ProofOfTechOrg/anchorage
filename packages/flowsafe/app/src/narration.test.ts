@@ -248,6 +248,65 @@ describe('deriveRunEvents', () => {
     const second = deriveRunEvents(prev, next, RUN).map((e) => e.key);
     expect(second).toEqual(first);
   });
+
+  it('produces deterministic keys for EVERY transition shape (the dedup contract)', () => {
+    // The feed/toast layers dedup by key; a wall-clock or random component in
+    // any snapshot-derived key would break StrictMode/poll-race safety. This
+    // matrix guards the contract for every deriver path at once.
+    const transitions: Array<[RunSummary | undefined, RunSummary]> = [
+      [undefined, suspendedAt('approveLaunch')],
+      [summary(), suspendedAt('approveLaunch')],
+      [suspendedAt('approveLaunch'), summary({ status: 'running' })],
+      [
+        suspendedAt('approveLaunch'),
+        suspendedAt('confirmRollout', { resumeCount: { approveLaunch: 1 } }),
+      ],
+      [
+        suspendedAt('approveLaunch'),
+        suspendedAt('approveLaunch', { resumeCount: { approveLaunch: 1 } }),
+      ],
+      [
+        suspendedAt('approveLaunch'),
+        summary({ status: 'success', result: { outcome: 'simulated' } }),
+      ],
+      [
+        suspendedAt('approveLaunch'),
+        summary({ status: 'success', result: { outcome: 'declined' } }),
+      ],
+      [summary(), summary({ status: 'success', result: { assigned: 0 } })],
+      [summary(), summary({ status: 'failed', error: 'boom' })],
+    ];
+    for (const [prev, next] of transitions) {
+      for (const options of [
+        {},
+        { everSuspendedHint: true, laterGateHint: true },
+      ]) {
+        const first = deriveRunEvents(prev, next, RUN, options).map(
+          (e) => e.key,
+        );
+        const second = deriveRunEvents(prev, next, RUN, options).map(
+          (e) => e.key,
+        );
+        expect(second).toEqual(first);
+      }
+    }
+    const before = record();
+    const flips = [
+      record({ status: 'claimed' as const, claimedBy: 'demo-reviewer' }),
+      record({
+        status: 'approved' as const,
+        decision: 'approve' as const,
+        decidedBy: 'demo-reviewer',
+      }),
+      record({ status: 'escalated' as const }),
+    ];
+    for (const after of flips) {
+      const prevMap = new Map([[before.id, before]]);
+      const first = deriveApprovalEvents(prevMap, [after]).map((e) => e.key);
+      const second = deriveApprovalEvents(prevMap, [after]).map((e) => e.key);
+      expect(second).toEqual(first);
+    }
+  });
 });
 
 describe('deriveApprovalEvents', () => {
@@ -436,6 +495,22 @@ describe('decideEvents', () => {
     );
     expect(events).toHaveLength(1);
   });
+
+  it('pins the stepless-record behavior: decide narrates, resume elaboration is skipped', () => {
+    // Only reachable via a runScoped standing approval (no stepPath) — none
+    // of the showcase workflows produce one. The decide toast still lands;
+    // the per-leg resumed/grant lines need a step to key on and are dropped.
+    const result = decideEvents({
+      record: record({
+        status: 'approved',
+        decision: 'approve',
+        decidedBy: 'demo-reviewer',
+        stepPath: undefined,
+      }),
+      resume: { attempted: true, ok: true, summary: summary() },
+    });
+    expect(result.map((e) => e.kind)).toEqual(['approval.decided']);
+  });
 });
 
 describe('interpretRunResult', () => {
@@ -451,6 +526,13 @@ describe('interpretRunResult', () => {
         .line,
     ).toContain('key content-pipeline/r/a.md');
     expect(interpretRunResult({ outcome: 'sent' }).flavor).toBe('delivered');
+    // Only reachable with a live binding configured, so the line may say so.
+    expect(interpretRunResult({ outcome: 'assigned' }).flavor).toBe(
+      'delivered',
+    );
+    expect(interpretRunResult({ outcome: 'sent' }).line).toContain(
+      'live connector binding',
+    );
     expect(interpretRunResult('nope').flavor).toBe('plain');
   });
 

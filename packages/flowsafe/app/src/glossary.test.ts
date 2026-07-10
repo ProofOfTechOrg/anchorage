@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
-import { GLOSSARY, ROLE_NOTES, WORKFLOW_GUIDES, ZONES } from './glossary.js';
+import {
+  claimableSteps,
+  GLOSSARY,
+  ROLE_NOTES,
+  WORKFLOW_GUIDES,
+  ZONES,
+} from './glossary.js';
 
 const WORKFLOW_IDS = [
   'gtm-outbound',
@@ -59,5 +65,54 @@ describe('workflow guides', () => {
       'confirmRollout',
     ]);
     expect(WORKFLOW_GUIDES['lead-generation']?.shortCircuitNote).toBeDefined();
+    // lead-generation is the one .branch() workflow: its branch targets must
+    // be marked conditional or narration over-claims skipped branches.
+    expect(WORKFLOW_GUIDES['lead-generation']?.conditionalSteps).toEqual([
+      'fastTrack',
+      'nurture',
+    ]);
+    for (const [id, guide] of Object.entries(WORKFLOW_GUIDES)) {
+      for (const step of guide.conditionalSteps ?? []) {
+        expect(guide.steps, `${id} conditional ${step}`).toContain(step);
+      }
+    }
+  });
+});
+
+describe('claimableSteps', () => {
+  const leadGen = WORKFLOW_GUIDES['lead-generation'];
+  const gtm = WORKFLOW_GUIDES['gtm-outbound'];
+
+  it('never claims branch-conditional steps, suspended or not', () => {
+    // suspended at the gate: only the unconditional pre-gate step remains
+    expect(claimableSteps(leadGen, 'reviewHotLeads')).toEqual(['scoreLeads']);
+    // terminal (all-cold short-circuit): branch steps still excluded
+    expect(claimableSteps(leadGen, undefined)).toEqual([
+      'scoreLeads',
+      'reviewHotLeads',
+      'assignLeads',
+    ]);
+  });
+
+  it('claims the full pre-gate slice for pure .then() chains', () => {
+    expect(claimableSteps(gtm, 'reviewAndApprove')).toEqual([
+      'researchAccounts',
+      'enrichContacts',
+      'generateOutreach',
+    ]);
+    expect(claimableSteps(gtm, undefined)).toEqual([...(gtm?.steps ?? [])]);
+  });
+
+  it('returns undefined without a guide or when nothing is claimable', () => {
+    expect(claimableSteps(undefined, 'x')).toBeUndefined();
+    // suspended at the FIRST step ⇒ nothing ran before it to claim
+    expect(
+      claimableSteps(
+        { steps: ['gate'], gateSteps: ['gate'], capabilities: [], note: 'n' },
+        'gate',
+      ),
+    ).toBeUndefined();
+    // unknown suspended step (guide drift) ⇒ claim nothing rather than guess
+    expect(claimableSteps(gtm, 'notARealStep')).toBeUndefined();
   });
 });

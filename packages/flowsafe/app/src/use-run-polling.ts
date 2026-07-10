@@ -6,7 +6,12 @@
 
 import { useEffect, useState } from 'react';
 
-import { RunApiError, type RunClient, type RunSummary } from './run-client.js';
+import {
+  RunApiError,
+  type RunClient,
+  type RunSummary,
+  TERMINAL_RUN_STATUSES,
+} from './run-client.js';
 
 /** A run the launcher started, tracked so the status panel can poll it. */
 export interface RunEntry {
@@ -29,15 +34,6 @@ export interface RunResult {
 
 /** Rendered when the status endpoint, not the run, is what failed. */
 export const UNAVAILABLE = 'unavailable';
-
-export const TERMINAL_STATUSES = new Set([
-  'success',
-  'failed',
-  'tripwire',
-  'canceled',
-  'bailed',
-  'skipped',
-]);
 
 const POLL_INTERVAL_MS = 3000;
 
@@ -132,7 +128,7 @@ export function useRunPolling(
       });
       return entries.every(([runId, result]) =>
         result.summary && !result.error
-          ? TERMINAL_STATUSES.has(result.summary.status)
+          ? TERMINAL_RUN_STATUSES.has(result.summary.status)
           : abandoned.has(runId),
       );
     }

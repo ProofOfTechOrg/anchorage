@@ -18,6 +18,7 @@ import {
   RunApiError,
   type RunSummary,
   type StartRunResponse,
+  TERMINAL_RUN_STATUSES,
 } from './run-client.js';
 
 export type NarrationZone = 'browser' | 'worker' | 'do' | 'd1' | 'cron';
@@ -58,22 +59,13 @@ export interface NarrationRunRef {
   title: string;
 }
 
-const TERMINAL_STATUSES = new Set([
-  'success',
-  'failed',
-  'tripwire',
-  'canceled',
-  'bailed',
-  'skipped',
-]);
-
 /** `${tenant}_${uuid}` → first 8 uuid chars; anything else → first 8. */
 export function shortId(id: string): string {
   const tail = id.includes('_') ? id.slice(id.lastIndexOf('_') + 1) : id;
   return tail.slice(0, 8);
 }
 
-interface Suspension {
+export interface Suspension {
   step: string;
   ordinal: number;
   suspendedAt?: number;
@@ -81,7 +73,8 @@ interface Suspension {
   connectors?: readonly string[];
 }
 
-function suspensionOf(summary: RunSummary): Suspension | undefined {
+/** Parse the current suspension out of a summary (shared with the run cards). */
+export function suspensionOf(summary: RunSummary): Suspension | undefined {
   const path = summary.suspended?.[0];
   if (!path || path.length === 0) return undefined;
   const step = path.join('.');
@@ -165,11 +158,13 @@ export function interpretRunResult(result: unknown): ResultInterpretation {
       line: 'Outcome: simulated — the connector ran its full code path; the external call was skipped (connectors are offline here).',
     };
   }
-  if (outcome === 'sent' || outcome === 'deployed') {
+  if (outcome === 'sent' || outcome === 'deployed' || outcome === 'assigned') {
+    // Only reachable when a deployment configures a live connector binding —
+    // the public demo never does, so this claim is true precisely when made.
     return {
       flavor: 'delivered',
       replayed,
-      line: `Outcome: ${outcome}.`,
+      line: `Outcome: ${outcome} — a live connector binding is configured on this deployment.`,
     };
   }
   if (r.granted === true) {
@@ -417,7 +412,7 @@ export function deriveRunEvents(
   ) {
     const ordinal = next.resumeCount?.[prevSusp.step] ?? prevSusp.ordinal + 1;
     const declined =
-      TERMINAL_STATUSES.has(next.status) &&
+      TERMINAL_RUN_STATUSES.has(next.status) &&
       interpretRunResult(next.result).flavor === 'declined';
     events.push(
       ...resumedEvents(run, prevSusp.step, ordinal, at, {
@@ -445,8 +440,8 @@ export function deriveRunEvents(
   }
 
   if (
-    !TERMINAL_STATUSES.has(prev.status) &&
-    TERMINAL_STATUSES.has(next.status)
+    !TERMINAL_RUN_STATUSES.has(prev.status) &&
+    TERMINAL_RUN_STATUSES.has(next.status)
   ) {
     const everSuspended =
       options.everSuspendedHint === true ||
@@ -519,7 +514,9 @@ export function deriveApprovalEvents(
         events.push({
           // Same key family as the decider's own decideEvents — first wins,
           // so the decider never sees a duplicate "decided" via the poll.
-          key: `decide:${record.id}:${record.decision ?? record.status}`,
+          // The ?? fallback must agree with decideEvents' or a decision-less
+          // record would double-narrate ('approve' vs 'approved').
+          key: `decide:${record.id}:${record.decision ?? (record.status === 'approved' ? 'approve' : 'reject')}`,
           at,
           zone: 'worker',
           kind: 'approval.decided',
@@ -609,7 +606,8 @@ export function startEvent(
 ): NarrationEvent[] {
   const at = Date.now();
   const settledElsewhere =
-    response.status === 'suspended' || TERMINAL_STATUSES.has(response.status);
+    response.status === 'suspended' ||
+    TERMINAL_RUN_STATUSES.has(response.status);
   const events: NarrationEvent[] = [
     {
       key: `start:${run.runId}:requested`,
@@ -697,7 +695,7 @@ export function startEvent(
       cronMentionEvent(at),
     );
   }
-  if (TERMINAL_STATUSES.has(response.status)) {
+  if (TERMINAL_RUN_STATUSES.has(response.status)) {
     events.push(...terminalEvents(response, run, at, undefined, false));
   }
   return events;

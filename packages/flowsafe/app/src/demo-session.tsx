@@ -13,7 +13,7 @@ import {
 import { Timestamp } from '@astryxdesign/core/Timestamp';
 import { Token } from '@astryxdesign/core/Token';
 import { Tooltip } from '@astryxdesign/core/Tooltip';
-import { type ReactElement, useEffect, useState } from 'react';
+import { type ReactElement, useEffect, useRef, useState } from 'react';
 
 import { GLOSSARY } from './glossary.js';
 import {
@@ -129,9 +129,16 @@ export function DemoActorSwitcher({
 
   // Silent refresh while the tenant is live: the mid-demo "step away, come
   // back, switch to reviewer and approve" flow must survive a JWT expiry.
+  // session/actorToken are read through refs so a role switch (or the refresh
+  // itself replacing the session) does NOT re-arm the interval — resetting
+  // the 30-minute countdown on every switch could outlast the 1h JWT TTL.
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+  const actorTokenRef = useRef(actorToken);
+  actorTokenRef.current = actorToken;
   useEffect(() => {
     const timer = setInterval(() => {
-      const current = session.tokens[0];
+      const current = sessionRef.current.tokens[0];
       if (!current) return;
       void fetch('/auth/refresh', {
         method: 'POST',
@@ -148,8 +155,8 @@ export function DemoActorSwitcher({
         onSession(next);
         narrate([tokenRefreshedEvent()]);
         // Keep the selected ROLE across the rotation.
-        const selected = session.tokens.find(
-          (entry) => entry.token === actorToken,
+        const selected = sessionRef.current.tokens.find(
+          (entry) => entry.token === actorTokenRef.current,
         );
         const replacement = next.tokens.find(
           (entry) => entry.id === selected?.id,
@@ -158,7 +165,7 @@ export function DemoActorSwitcher({
       });
     }, REFRESH_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [session, actorToken, onSelect, onSession, onExpired, narrate]);
+  }, [onSelect, onSession, onExpired, narrate]);
 
   // One heads-up before the tenant reaches end of life (key-deduped, so the
   // effect re-arming on session refreshes cannot double-warn).

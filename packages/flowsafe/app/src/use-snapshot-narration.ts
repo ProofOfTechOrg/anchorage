@@ -48,11 +48,21 @@ export function useSnapshotNarration(
       if (!next) continue;
       const before = previous.runResults[run.runId];
       if (next.summary) {
+        // ACCEPTED DEVIATION from "never derive one poll stream from the
+        // other": these hints read the APPROVAL records to refine RUN
+        // narration. The root cause is a server wire gap — the resume ledger
+        // (resumeCount) drops at terminal status and fingerprints cover only
+        // CURRENT suspensions — so the summary alone cannot prove a past
+        // gate. The hints only refine labels/suppress false lines; event
+        // KEYS stay run-scoped, so dedup is unaffected. Known residual: if
+        // gate 1 suspends AND is decided entirely between two run polls
+        // while the 5s approval poll also hasn't caught up, gate 2 titles as
+        // a first gate (imprecise, never dishonest) and dedup keeps that
+        // title. Do not "simplify" the hints away without fixing the wire.
+        //
         // An approval anywhere in this run's history proves a gate suspended
-        // it — the terminal snapshot alone can't (the resume ledger is
-        // dropped at terminal status). A DECIDED approval further proves any
-        // new suspension is a later gate (the wire's fingerprints cover only
-        // current suspensions).
+        // it; a DECIDED approval further proves any new suspension is a
+        // later gate.
         const everSuspendedHint =
           run.approvalId !== undefined ||
           records.some((record) => record.runId === run.runId);

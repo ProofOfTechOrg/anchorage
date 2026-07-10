@@ -28,9 +28,11 @@ import { DetailView } from '../../src/approval-ui/DetailView.js';
 import { MetricsView } from '../../src/approval-ui/MetricsView.js';
 import { QueueView } from '../../src/approval-ui/QueueView.js';
 import { useApprovalDashboard } from '../../src/approval-ui/use-approval-dashboard.js';
+import { Tooltip } from '@astryxdesign/core/Tooltip';
+
 import { ActivityFeedPanel } from './activity-feed.js';
 import { WhatsRealHere, WhereThingsRunDialog } from './architecture-legend.js';
-import { GLOSSARY, TAGLINE } from './glossary.js';
+import { GLOSSARY, ROLE_NOTES, TAGLINE } from './glossary.js';
 import { IntroTourDialog, useIntroTour } from './intro-tour.js';
 import type { CatalogActor, RunClient, WorkflowMeta } from './run-client.js';
 import { RunCards } from './run-cards.js';
@@ -165,9 +167,11 @@ export function ShowcaseApp({
             {identityControls}
           </HStack>
           {actor ? (
-            <Text size="sm" color="secondary">
-              server-verified: {actor.id} ({actor.role})
-            </Text>
+            <Tooltip content={GLOSSARY.actorEcho}>
+              <Text size="sm" color="secondary">
+                server-verified: {actor.id} ({actor.role})
+              </Text>
+            </Tooltip>
           ) : null}
         </VStack>
       </HStack>
@@ -178,7 +182,11 @@ export function ShowcaseApp({
       <Banner
         status="info"
         title="Suggested path: start a run as operator → switch to reviewer → approve → watch the run resume."
-        description={actor ? `Currently acting as ${actor.role}.` : undefined}
+        description={
+          actor
+            ? `Currently acting as ${actor.role}.${ROLE_NOTES[actor.role] ? ` ${ROLE_NOTES[actor.role]}` : ''}`
+            : undefined
+        }
       />
 
       <Grid columns={{ minWidth: 460 }} gap={5}>

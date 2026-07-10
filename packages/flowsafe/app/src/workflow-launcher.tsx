@@ -20,7 +20,7 @@ import { Tooltip } from '@astryxdesign/core/Tooltip';
 import { VStack } from '@astryxdesign/core/VStack';
 import { type ReactElement, useState } from 'react';
 
-import { GLOSSARY, WORKFLOW_GUIDES } from './glossary.js';
+import { claimableSteps, GLOSSARY, WORKFLOW_GUIDES } from './glossary.js';
 import {
   type NarrationEvent,
   startErrorEvent,
@@ -66,7 +66,9 @@ export function WorkflowLauncher({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [editedJson, setEditedJson] = useState<string | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  // Busy is scoped to the workflow whose launch is in flight — switching to
+  // another workflow must not leave ITS form spuriously disabled.
+  const [busyId, setBusyId] = useState<string | null>(null);
 
   // Selection + editor value are DERIVED (no reset effect): the edited JSON
   // overrides the selected workflow's sample until the user picks a different
@@ -106,7 +108,8 @@ export function WorkflowLauncher({
       );
       return;
     }
-    setBusy(true);
+    const launchedId = selected.id;
+    setBusyId(launchedId);
     setLaunchError(null);
     try {
       const response = await runClient.start(selected.id, input);
@@ -118,23 +121,22 @@ export function WorkflowLauncher({
         startedAt: Date.now(),
       };
       onStarted(entry);
-      // The ○ "steps execute in the DO" line lists what ran before the gate.
-      const suspendedStep = response.suspended?.[0]?.join('.');
-      const gateIndex = suspendedStep
-        ? (guide?.steps.indexOf(suspendedStep) ?? -1)
-        : -1;
+      // The ○ "steps execute in the DO" line may only claim steps that ran
+      // unconditionally — branch-conditional steps are excluded (the input
+      // decides which branch ran; claiming both would be false).
       narrate(
         startEvent(entry, response, {
           actor: actor ?? undefined,
-          steps:
-            gateIndex > 0 ? guide?.steps.slice(0, gateIndex) : guide?.steps,
+          steps: claimableSteps(guide, response.suspended?.[0]?.join('.')),
         }),
       );
     } catch (error) {
       setLaunchError(error instanceof Error ? error.message : String(error));
       narrate([startErrorEvent(selected.id, error, actorRole)]);
     } finally {
-      setBusy(false);
+      // Another workflow's launch may have started meanwhile — clear only
+      // our own claim.
+      setBusyId((current) => (current === launchedId ? null : current));
     }
   }
 
@@ -193,7 +195,7 @@ export function WorkflowLauncher({
                 value={inputJson}
                 onChange={(next) => setEditedJson(next)}
                 rows={6}
-                isDisabled={busy}
+                isDisabled={busyId === selected.id}
               />
               {editedJson !== null ? (
                 <Button
@@ -222,8 +224,8 @@ export function WorkflowLauncher({
               label="Start run"
               variant="primary"
               onClick={() => void launch()}
-              isLoading={busy}
-              isDisabled={busy || !roleAllowed}
+              isLoading={busyId === selected.id}
+              isDisabled={busyId === selected.id || !roleAllowed}
             />
             <Tooltip content={GLOSSARY.runCaps}>
               <Text size="sm" color="secondary">

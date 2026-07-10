@@ -22,7 +22,7 @@ const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   github: 'GitHub',
 };
 
-export function providerDisplayName(provider: string): string {
+function providerDisplayName(provider: string): string {
   return (
     PROVIDER_DISPLAY_NAMES[provider] ??
     provider.charAt(0).toUpperCase() + provider.slice(1)

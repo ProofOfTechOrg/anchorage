@@ -32,8 +32,8 @@ import {
   interpretRunResult,
   type ResultInterpretation,
   shortId,
+  suspensionOf,
 } from './narration.js';
-import type { RunSummary } from './run-client.js';
 import {
   type RunEntry,
   type RunResult,
@@ -79,30 +79,6 @@ function flavorBadge(interp: ResultInterpretation): FlavorBadge | undefined {
     default:
       return undefined;
   }
-}
-
-function suspensionOf(summary: RunSummary | undefined):
-  | {
-      step: string;
-      reason?: string;
-      connectors?: readonly string[];
-      suspendedAtMs?: number;
-      ordinal: number;
-    }
-  | undefined {
-  const path = summary?.suspended?.[0];
-  if (!summary || !path || path.length === 0) return undefined;
-  const step = path.join('.');
-  const payload = summary.suspendPayload?.[step];
-  return {
-    step,
-    reason: typeof payload?.reason === 'string' ? payload.reason : undefined,
-    connectors: Array.isArray(payload?.connectors)
-      ? payload.connectors
-      : undefined,
-    suspendedAtMs: summary.suspendedAt?.[step],
-    ordinal: summary.resumeCount?.[step] ?? 0,
-  };
 }
 
 function StepChips({
@@ -159,7 +135,8 @@ function RunCard({
   // A failed STATUS READ is not a run status: say so, rather than rendering it
   // as a plausible-looking 'pending'.
   const status = pollError ? UNAVAILABLE : (summary?.status ?? 'pending');
-  const susp = status === 'suspended' ? suspensionOf(summary) : undefined;
+  const susp =
+    summary && status === 'suspended' ? suspensionOf(summary) : undefined;
   const guide = WORKFLOW_GUIDES[run.workflowId];
   const rawInterp =
     summary?.result !== undefined
@@ -186,12 +163,17 @@ function RunCard({
       : rawInterp;
   const badge = interp ? flavorBadge(interp) : undefined;
   // Prefer the OPEN record for this run (gate 2's approval is a different
-  // record than the one the start response carried).
+  // record than the one the start response carried). The start-captured
+  // approvalId is only a fallback while NO record for the run has been
+  // polled yet — once records exist but none is open (gate 1 decided, gate
+  // 2's record not yet fetched), linking to the stale gate-1 record would
+  // open a closed request; render the "in the queue below" line instead.
+  const runHasRecords = records.some((record) => record.runId === run.runId);
   const openApprovalId =
     records.find(
       (record) =>
         record.runId === run.runId && OPEN_STATUSES.includes(record.status),
-    )?.id ?? run.approvalId;
+    )?.id ?? (runHasRecords ? undefined : run.approvalId);
 
   return (
     <Card
@@ -265,13 +247,13 @@ function RunCard({
                   <Token label={connector} size="sm" color="orange" />
                 </Tooltip>
               ))}
-              {susp.suspendedAtMs !== undefined ? (
+              {susp.suspendedAt !== undefined ? (
                 <HStack gap={1} align="center">
                   <Text size="sm" color="secondary">
                     suspended
                   </Text>
                   <Timestamp
-                    value={new Date(susp.suspendedAtMs).toISOString()}
+                    value={new Date(susp.suspendedAt).toISOString()}
                     format="relative"
                     isLive
                     size="sm"
@@ -282,7 +264,7 @@ function RunCard({
             </HStack>
             <Tooltip content={GLOSSARY.fingerprint}>
               <Text size="sm" color="secondary">
-                fingerprint: suspension {susp.suspendedAtMs ?? '?'} · resume #
+                fingerprint: suspension {susp.suspendedAt ?? '?'} · resume #
                 {susp.ordinal}
               </Text>
             </Tooltip>

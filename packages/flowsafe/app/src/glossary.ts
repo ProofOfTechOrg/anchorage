@@ -45,8 +45,6 @@ export const GLOSSARY = {
     'A workflow step that suspends the run and auto-queues an approval request. Its gated side effect cannot run until a decision mints a grant.',
   suspended:
     'The run is parked durably in its Durable Object — no compute is waiting. It survives isolate restarts and moves only when a decision resumes it server-side.',
-  grant:
-    'Server-side permission to run specific connectors on one resumed leg. Derived from approved records at resume time — it never travels in an HTTP body.',
   grantDerivation:
     'On approve, the Worker recomputes approved connectors from stored records bound to exactly this suspension. A forged resume finds no grant and fails closed.',
   fingerprint:
@@ -54,8 +52,6 @@ export const GLOSSARY = {
   resumeCount:
     'Runtime-owned resume counter per step: absent on a first suspension, 1 after the first resume. The collision-free tie-breaker for grants.',
   sod: 'Whoever advanced a run into a gate cannot decide that request — the server answers 403, admins included. Each demo role is a distinct actor id, so switching works.',
-  resume:
-    'Happens server-side inside the decide call — no browser triggers it. The public resume route is grant-free and fails closed at the connector gate.',
   runId:
     'Minted server-side as {tenantId}_{uuid}; a client-sent runId is rejected (400). The prefix makes snapshots, DOs, and grants tenant-disjoint by construction.',
   tenantIsolation:
@@ -65,13 +61,9 @@ export const GLOSSARY = {
   expiry:
     "The tenant's end of life (~24 h from first sign-in). A cron reaper purges its runs, approvals, and budget rows after a grace window.",
   actorEcho:
-    "Your identity chip renders from the server's authenticated echo on API responses. The browser holds tokens but never decides who you are.",
-  tokens:
-    'Tokens arrive in the URL #fragment (never in server logs), live in tab memory only, and silently refresh every 30 minutes while the sandbox lives.',
+    "Your identity renders from the server's authenticated echo on API responses. The browser holds tokens but never decides who you are.",
   runCaps:
     'Demo budget: 20 runs per sandbox lifetime and 500 across all visitors per UTC day. Exceeding either returns 429.',
-  killSwitch:
-    'Operations can disable the whole demo. The switch is checked at sign-in and on every request — already-issued tokens are refused too.',
   simulated:
     "The connector's real code path runs — grant check, audit, idempotency, limits — but no binding is configured, so the external call is skipped and its envelope logged.",
   dryRun:
@@ -88,8 +80,6 @@ export const GLOSSARY = {
     "The grant-access connector refuses a request naming another workflow's scope — it fails closed even with a valid approval.",
   destructiveClass:
     'Marked as a connector whose effect cannot be undone. Each action (deploy vs promote) carries its own idempotency key.',
-  d1Snapshot:
-    "After each step, Mastra's run state is written to D1 (Cloudflare SQLite). A run survives isolate eviction and resumes from this snapshot.",
   polling:
     'This UI polls run status every 3s and the queue/metrics every 5s. There is no event API — the activity feed is reconstructed from these responses.',
   artifactStore:
@@ -122,12 +112,45 @@ export interface WorkflowGuide {
    * the run card highlights the step named by RunSummary.suspended. */
   steps: readonly string[];
   gateSteps: readonly string[];
+  /**
+   * Steps behind a `.branch()` predicate — the input decides which of them
+   * actually run, so narration must never claim them unconditionally.
+   */
+  conditionalSteps?: readonly string[];
   connector?: string;
   capabilities: readonly CapabilityBadge[];
   /** Simulated-visibility card note (what is real vs logged here). */
   note: string;
   /** Variant note when the gate short-circuits (run never suspends). */
   shortCircuitNote?: string;
+}
+
+/**
+ * The steps a start narration may TRUTHFULLY claim executed: definition-order
+ * steps up to the suspended gate (or all of them when the run finished),
+ * minus any branch-conditional steps — the summary can't tell which branch an
+ * input matched, and over-claiming a skipped branch would be a false line.
+ * Under-claiming is honest; over-claiming never is.
+ */
+export function claimableSteps(
+  guide: WorkflowGuide | undefined,
+  suspendedStep: string | undefined,
+): readonly string[] | undefined {
+  if (!guide) return undefined;
+  let upToGate: readonly string[];
+  if (suspendedStep === undefined) {
+    // Terminal without a suspension: every listed (unconditional) step ran.
+    upToGate = guide.steps;
+  } else {
+    const gateIndex = guide.steps.indexOf(suspendedStep);
+    // Unknown step (guide drift): claim nothing rather than guess.
+    if (gateIndex < 0) return undefined;
+    upToGate = guide.steps.slice(0, gateIndex);
+  }
+  const unconditional = upToGate.filter(
+    (step) => !guide.conditionalSteps?.includes(step),
+  );
+  return unconditional.length > 0 ? unconditional : undefined;
 }
 
 export const WORKFLOW_GUIDES: Record<string, WorkflowGuide> = {
@@ -175,6 +198,8 @@ export const WORKFLOW_GUIDES: Record<string, WorkflowGuide> = {
       'assignLeads',
     ],
     gateSteps: ['reviewHotLeads'],
+    // .branch([hot, cold]) — the input decides which of these actually run.
+    conditionalSteps: ['fastTrack', 'nurture'],
     connector: 'crm-assign',
     capabilities: [
       { label: '1 gate (only if hot leads)', tip: GLOSSARY.approvalGate },

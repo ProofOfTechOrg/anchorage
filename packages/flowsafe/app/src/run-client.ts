@@ -77,6 +77,20 @@ export type FetchLike = (
   },
 ) => Promise<ResponseLike>;
 
+/**
+ * Statuses a run can never leave. ONE definition — the poller decides when to
+ * stop polling and the narration layer decides when a flip is terminal from
+ * the same set, so they can never disagree on "done".
+ */
+export const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
+  'success',
+  'failed',
+  'tripwire',
+  'canceled',
+  'bailed',
+  'skipped',
+]);
+
 export class RunApiError extends Error {
   readonly status: number;
 

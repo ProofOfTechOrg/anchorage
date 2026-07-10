@@ -25,6 +25,7 @@ const METRIC_LABELS = [
 
 const CONCEPT_KEYS = [
   'sla',
+  'statusColumn',
   'priority',
   'claim',
   'delegate',

@@ -1,4 +1,4 @@
-// The architecture explainers: the "Where things run" dialog (the four zones +
+// The architecture explainers: the "Where things run" dialog (the five zones +
 // the enforcement story) and the "What's real here?" collapsible (exactly
 // which effects are real, simulated, or in between). One module so the copy
 // that teaches the architecture lives in one place.
@@ -53,6 +53,9 @@ export function WhereThingsRunDialog({
           </Text>
           <Text size="sm">
             <strong>Grants:</strong> {GLOSSARY.grantDerivation}
+          </Text>
+          <Text size="sm">
+            <strong>Tenant isolation:</strong> {GLOSSARY.tenantIsolation}
           </Text>
           <Text size="sm" color="secondary">
             {GLOSSARY.polling}
