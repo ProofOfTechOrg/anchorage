@@ -776,7 +776,12 @@ export function startErrorEvent(
 export function decideEvents(result: DecideResult): NarrationEvent[] {
   const at = Date.now();
   const { record, resume } = result;
-  const decision = record.decision ?? 'approve';
+  // The ?? fallback must be the EXACT expression deriveApprovalEvents uses,
+  // or a decision-less record would key (and read) differently between the
+  // decider's own event and the poll-observed one — a rejected record must
+  // never fall back to 'approve' and claim a grant was derived.
+  const decision =
+    record.decision ?? (record.status === 'approved' ? 'approve' : 'reject');
   const events: NarrationEvent[] = [
     {
       key: `decide:${record.id}:${decision}`,

@@ -496,6 +496,26 @@ describe('decideEvents', () => {
     expect(events).toHaveLength(1);
   });
 
+  it('keys a decision-less record identically to the poll-observed event', () => {
+    // Both fallbacks must agree, and a rejected record must never read as an
+    // approval (grant language) just because `decision` was absent.
+    const rejected = record({
+      status: 'rejected',
+      decision: undefined,
+      decidedBy: 'demo-reviewer',
+    });
+    const own = decideEvents({
+      record: rejected,
+      resume: { attempted: false },
+    });
+    expect(own[0]?.key).toBe('decide:appr-1:reject');
+    expect(own[0]?.title).toContain('no grant');
+    const observed = deriveApprovalEvents(new Map([[rejected.id, record()]]), [
+      rejected,
+    ]);
+    expect(observed[0]?.key).toBe('decide:appr-1:reject');
+  });
+
   it('pins the stepless-record behavior: decide narrates, resume elaboration is skipped', () => {
     // Only reachable via a runScoped standing approval (no stepPath) — none
     // of the showcase workflows produce one. The decide toast still lands;
