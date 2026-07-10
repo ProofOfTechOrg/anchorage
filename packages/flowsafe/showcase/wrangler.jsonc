@@ -4,6 +4,10 @@
   "main": "./worker.ts",
   "compatibility_date": "2025-06-01",
   "compatibility_flags": ["nodejs_compat"],
+  // The account hosting the proofoftech.org zone (the custom domain below
+  // must live on the same account). Pinned because the deploying identity
+  // has access to more than one account.
+  "account_id": "056cbaa6f5c3d8ff5584f1aa84bbe050",
   // The ONLY public origin. The OAuth callback is registered for exactly this
   // origin (the worker derives redirect_uri from url.origin), so a second
   // reachable host would half-work: API yes, sign-in no. workers_dev off
@@ -23,10 +27,11 @@
     {
       "binding": "DB",
       "database_name": "anchorage-showcase",
-      // Local `wrangler dev` creates a local SQLite automatically. For a real
-      // deploy: `wrangler d1 create anchorage-showcase` and paste the id here.
-      // Tables are created lazily by the stores; no migration files needed.
-      "database_id": "REPLACE-WITH-YOUR-D1-DATABASE-ID"
+      // Local `wrangler dev` creates a local SQLite automatically. Tables are
+      // created lazily by the stores; no migration files needed. This id is
+      // the live anchorage.proofoftech.org database (`wrangler d1 create
+      // anchorage-showcase` on the account above).
+      "database_id": "342fd280-2b62-4ae3-90ea-afb5133a8823"
     }
   ],
   // Single-deploy: serve the built SPA (app/dist) at / via Workers Static
