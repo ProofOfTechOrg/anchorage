@@ -765,41 +765,110 @@ describe('the kill switch in the AUTH middleware (worker.buildVerifier)', () => 
 });
 
 describe('provider selection (worker.selectOAuthProvider)', () => {
+  const GOOGLE_PAIR = {
+    GOOGLE_CLIENT_ID: 'g-id',
+    GOOGLE_CLIENT_SECRET: 'g-secret',
+  };
+  const GITHUB_PAIR = {
+    GITHUB_CLIENT_ID: 'h-id',
+    GITHUB_CLIENT_SECRET: 'h-secret',
+  };
+
   it.each([
-    ['Google only', { GOOGLE_CLIENT_ID: 'g-id' }, 'google'],
-    ['GitHub only', { GITHUB_CLIENT_ID: 'h-id' }, 'github'],
+    ['Google pair only', GOOGLE_PAIR, 'google'],
+    ['GitHub pair only', GITHUB_PAIR, 'github'],
     [
-      'both configured — Google wins',
-      { GOOGLE_CLIENT_ID: 'g-id', GITHUB_CLIENT_ID: 'h-id' },
+      'both pairs configured — Google wins',
+      { ...GOOGLE_PAIR, ...GITHUB_PAIR },
       'google',
     ],
     ['neither — the demo stays unmounted', {}, undefined],
+    [
+      'Google id without its secret — a sign-in that dies at the token exchange must not mount',
+      { GOOGLE_CLIENT_ID: 'g-id' },
+      undefined,
+    ],
+    [
+      'Google secret without its id — same class, same refusal',
+      { GOOGLE_CLIENT_SECRET: 'g-secret' },
+      undefined,
+    ],
+    ['GitHub id without its secret', { GITHUB_CLIENT_ID: 'h-id' }, undefined],
+    [
+      'GitHub secret without its id',
+      { GITHUB_CLIENT_SECRET: 'h-secret' },
+      undefined,
+    ],
+    [
+      'a half-set Google pair must not mask a fully-configured GitHub fallback',
+      { GOOGLE_CLIENT_ID: 'g-id', ...GITHUB_PAIR },
+      'github',
+    ],
   ])('%s', (_name, envPart, expected) => {
-    // #given / #when — the warn on both-set is asserted separately below
+    // #given / #when — the tripwire logs are asserted separately below
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const provider = selectOAuthProvider(envPart as never);
 
     // #then
     expect(provider?.name).toBe(expected);
     warnSpy.mockRestore();
+    errorSpy.mockRestore();
   });
 
-  it('logs a config-warning when both provider ids are set (stale-credential tripwire)', async () => {
+  it('logs a config-warning only when both FULL pairs are set (stale-credential tripwire)', async () => {
     // #given
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    // #when
-    selectOAuthProvider({ GOOGLE_CLIENT_ID: 'g-id' } as never);
+    // #when — a full Google pair alone, then alongside a full GitHub pair
+    selectOAuthProvider(GOOGLE_PAIR as never);
     expect(warnSpy).not.toHaveBeenCalled();
-    selectOAuthProvider({
-      GOOGLE_CLIENT_ID: 'g-id',
-      GITHUB_CLIENT_ID: 'h-id',
-    } as never);
+    selectOAuthProvider({ ...GOOGLE_PAIR, ...GITHUB_PAIR } as never);
 
     // #then
     expect(warnSpy).toHaveBeenCalledTimes(1);
     expect(String(warnSpy.mock.calls[0]?.[0])).toContain('config-warning');
     warnSpy.mockRestore();
+  });
+
+  it('logs a config-error NAMING THE MISSING VAR when a pair is half-set', async () => {
+    // #given
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when — id without secret, then secret without id
+    selectOAuthProvider({ GOOGLE_CLIENT_ID: 'g-id' } as never);
+    selectOAuthProvider({ GITHUB_CLIENT_SECRET: 'h-secret' } as never);
+
+    // #then — each line names the var the operator must add
+    const lines = errorSpy.mock.calls.map(([line]) => String(line));
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain('config-error');
+    expect(lines[0]).toContain('"var":"GOOGLE_CLIENT_SECRET"');
+    expect(lines[1]).toContain('"var":"GITHUB_CLIENT_ID"');
+    errorSpy.mockRestore();
+  });
+
+  it('a half-set GitHub pair beside a full Google pair gets the config-error, NOT the both-pairs warning', async () => {
+    // #given — the stale-credential warning keys on the FULL fallback pair;
+    // gating it on "any GitHub var present" would double-log this combination
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when
+    const provider = selectOAuthProvider({
+      ...GOOGLE_PAIR,
+      GITHUB_CLIENT_ID: 'h-id',
+    } as never);
+
+    // #then — Google mounts; one config-error names the missing secret
+    expect(provider?.name).toBe('google');
+    expect(warnSpy).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(String(errorSpy.mock.calls[0]?.[0])).toContain(
+      '"var":"GITHUB_CLIENT_SECRET"',
+    );
+    warnSpy.mockRestore();
+    errorSpy.mockRestore();
   });
 });
 

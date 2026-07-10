@@ -1,0 +1,271 @@
+// Drives the showcase worker's EXPORTED fetch() in-process — the route
+// composition itself (healthz, the demo-auth mount, the auth fall-through to
+// the run/approval surface), which the other showcase tests bypass by calling
+// the routers directly. Mirrors deploy/worker.e2e.test.ts's scaffolding:
+// D1-shaped node:sqlite, a throwing DO namespace (these routes never reach a
+// run leg), and the Parameters<typeof fetchHandler> cast for workers types.
+import { describe, expect, it, vi } from 'vitest';
+
+import { STATE_COOKIE } from './demo-auth.js';
+import handler from './worker.js';
+
+interface SqliteStatement {
+  get(...params: unknown[]): unknown;
+  run(...params: unknown[]): unknown;
+  all(...params: unknown[]): unknown[];
+}
+
+interface SqliteDatabase {
+  prepare(sql: string): SqliteStatement;
+  exec(sql: string): void;
+}
+
+function openSqlite(): SqliteDatabase {
+  const getBuiltin = (
+    globalThis as {
+      process?: { getBuiltinModule?: (id: string) => unknown };
+    }
+  ).process?.getBuiltinModule;
+  if (!getBuiltin) {
+    throw new Error('node:sqlite unavailable — tests require node >= 22.13');
+  }
+  const mod = getBuiltin('node:sqlite') as {
+    DatabaseSync: new (path: string) => SqliteDatabase;
+  };
+  return new mod.DatabaseSync(':memory:');
+}
+
+// Minimal D1 face over node:sqlite — the same envelope deploy's e2e uses
+// ({ results }, { meta }); enough for any schema-init the routers run.
+function d1DatabaseLike(db: SqliteDatabase): unknown {
+  function statement(sql: string, params: unknown[]): Record<string, unknown> {
+    return {
+      bind: (...values: unknown[]) => statement(sql, values),
+      first: async (column?: string) => {
+        const row = db.prepare(sql).get(...params) as
+          | Record<string, unknown>
+          | undefined;
+        if (row === undefined) return null;
+        return column !== undefined ? (row[column] ?? null) : row;
+      },
+      run: async () => {
+        const outcome = db.prepare(sql).run(...params) as {
+          changes?: number | bigint;
+        };
+        return {
+          success: true,
+          meta: { changes: Number(outcome?.changes ?? 0) },
+        };
+      },
+      all: async () => ({
+        success: true,
+        results: db.prepare(sql).all(...params),
+        meta: {},
+      }),
+      raw: async () => {
+        const rows = db.prepare(sql).all(...params) as Array<
+          Record<string, unknown>
+        >;
+        return rows.map((row) => Object.values(row));
+      },
+    };
+  }
+  return {
+    prepare: (sql: string) => statement(sql, []),
+    exec: async (sql: string) => {
+      db.exec(sql);
+      return { count: 1, duration: 0 };
+    },
+    batch: async (statements: Array<{ run: () => Promise<unknown> }>) => {
+      const results = [];
+      for (const stmt of statements) results.push(await stmt.run());
+      return results;
+    },
+    dump: async () => new ArrayBuffer(0),
+  };
+}
+
+function required<T>(value: T | undefined): T {
+  if (value === undefined) throw new Error('handler method missing');
+  return value;
+}
+
+const fetchHandler = required(handler.fetch);
+
+type Env = Parameters<typeof fetchHandler>[1];
+
+const TOKENS = {
+  'tok-reviewer': { id: 'rev-ray', role: 'reviewer', tenantId: 'demo' },
+};
+
+const GOOGLE_PAIR = {
+  GOOGLE_CLIENT_ID: 'g-id',
+  GOOGLE_CLIENT_SECRET: 'g-secret',
+};
+const GITHUB_PAIR = {
+  GITHUB_CLIENT_ID: 'h-id',
+  GITHUB_CLIENT_SECRET: 'h-secret',
+};
+
+function makeEnv(overrides: Partial<Env> = {}): Env {
+  return {
+    DB: d1DatabaseLike(openSqlite()),
+    // None of these routes reaches a run leg; a request that does is a bug.
+    RUNNER: {
+      idFromName: (name: string) => ({ name }),
+      get: () => {
+        throw new Error('DO namespace must not be reached by these routes');
+      },
+    },
+    APPROVAL_ACTOR_TOKENS: JSON.stringify(TOKENS),
+    ...overrides,
+  } as Env;
+}
+
+async function call(
+  env: Env,
+  path: string,
+  init: RequestInit & { token?: string } = {},
+): Promise<Response> {
+  const { token, ...requestInit } = init;
+  const headers = new Headers(requestInit.headers);
+  if (token) headers.set('authorization', `Bearer ${token}`);
+  const pending: Promise<unknown>[] = [];
+  const ctx = {
+    waitUntil: (promise: Promise<unknown>) => {
+      pending.push(promise);
+    },
+    passThroughOnException: () => {},
+  } as unknown as Parameters<typeof fetchHandler>[2];
+  const response = await fetchHandler(
+    new Request(`https://showcase.example${path}`, {
+      ...requestInit,
+      headers,
+    }) as unknown as Parameters<typeof fetchHandler>[0],
+    env,
+    ctx,
+  );
+  await Promise.all(pending);
+  return response as unknown as Response;
+}
+
+describe('showcase worker fetch(): auth composition', () => {
+  it('serves /healthz unauthenticated and 401s the authenticated surfaces without a token', async () => {
+    // #given
+    const env = makeEnv();
+
+    // #when / #then — liveness is open
+    const health = await call(env, '/healthz');
+    expect(health.status).toBe(200);
+    expect(await health.json()).toEqual({ ok: true });
+
+    // #then — catalog and approvals fail closed
+    expect((await call(env, '/workflows')).status).toBe(401);
+    expect((await call(env, '/api/approvals')).status).toBe(401);
+  });
+
+  it('echoes the authenticated identity and all five module metas on the catalog', async () => {
+    // #given
+    const env = makeEnv();
+
+    // #when
+    const response = await call(env, '/workflows', { token: 'tok-reviewer' });
+
+    // #then — the server's view of the actor, over the REAL showcase metas
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      actor: unknown;
+      workflows: Array<{ id: string }>;
+    };
+    expect(body.actor).toEqual({
+      id: 'rev-ray',
+      role: 'reviewer',
+      tenantId: 'demo',
+    });
+    expect(body.workflows.map((entry) => entry.id)).toEqual([
+      'gtm-outbound',
+      'content-pipeline',
+      'lead-generation',
+      'product-launch',
+      'access-request',
+    ]);
+  });
+});
+
+describe('showcase worker fetch(): the demo-auth mount', () => {
+  it('demo OFF: a half-set OAuth pair is inert — no /auth/* mount, no config-error per request', async () => {
+    // #given — the committed GOOGLE_CLIENT_ID with no secrets provisioned yet
+    // (the partial-provisioning window every fresh deploy passes through)
+    const env = makeEnv({ GOOGLE_CLIENT_ID: 'g-id' });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when
+    const response = await call(env, '/auth/config');
+
+    // #then — unmounted AND silent: selection never runs with the demo off
+    expect(response.status).toBe(404);
+    expect(errorSpy).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  it('demo ON: a half-set pair stays unmounted and the config-error tripwire fires', async () => {
+    // #given
+    const env = makeEnv({
+      DEMO_JWT_SECRET: 'demo-secret',
+      GOOGLE_CLIENT_ID: 'g-id',
+    });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when
+    const response = await call(env, '/auth/config');
+
+    // #then — fail closed, with the missing var named for the operator
+    expect(response.status).toBe(404);
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(String(errorSpy.mock.calls[0]?.[0])).toContain(
+      '"var":"GOOGLE_CLIENT_SECRET"',
+    );
+    errorSpy.mockRestore();
+  });
+
+  it('demo ON + full Google pair: /auth/config advertises google and /auth/google redirects to the real authorize URL', async () => {
+    // #given
+    const env = makeEnv({ DEMO_JWT_SECRET: 'demo-secret', ...GOOGLE_PAIR });
+
+    // #when / #then — the SPA's provider discovery
+    const config = await call(env, '/auth/config');
+    expect(config.status).toBe(200);
+    expect(await config.json()).toEqual({ enabled: true, provider: 'google' });
+
+    // #then — the entry route 302s to Google with the CSRF-binding cookie
+    const entry = await call(env, '/auth/google');
+    expect(entry.status).toBe(302);
+    expect(entry.headers.get('location')).toContain(
+      'https://accounts.google.com/o/oauth2/v2/auth',
+    );
+    expect(entry.headers.get('set-cookie')).toContain(STATE_COOKIE);
+  });
+
+  it('demo ON, half-set Google + full GitHub pair: the fallback mounts — the misconfig cannot mask it', async () => {
+    // #given — the exact reviewed failure mode, proven over HTTP
+    const env = makeEnv({
+      DEMO_JWT_SECRET: 'demo-secret',
+      GOOGLE_CLIENT_ID: 'g-id',
+      ...GITHUB_PAIR,
+    });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when
+    const config = await call(env, '/auth/config');
+
+    // #then — GitHub serves sign-in; the broken Google pair is still surfaced
+    expect(config.status).toBe(200);
+    expect(await config.json()).toEqual({ enabled: true, provider: 'github' });
+    expect(
+      errorSpy.mock.calls.some(([line]) =>
+        String(line).includes('"var":"GOOGLE_CLIENT_SECRET"'),
+      ),
+    ).toBe(true);
+    errorSpy.mockRestore();
+  });
+});

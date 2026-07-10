@@ -99,7 +99,10 @@ request body — a body can carry neither `connectors` (which *is* the grant) no
 
 Set `DEMO_JWT_SECRET` (secret) plus an OAuth client — `GOOGLE_CLIENT_ID` (var)
 and `GOOGLE_CLIENT_SECRET` (secret), or the GitHub pair — and the showcase
-grows a public sign-in. One provider mounts per deployment; when both are
+grows a public sign-in. A provider counts only with its **full id+secret
+pair**: a half-set pair logs a `config-error` and stays unmounted (an id
+alone would advertise a sign-in that dies at the token exchange — and mask a
+working fallback). One provider mounts per deployment; when both pairs are
 configured, **Google wins** (the launch provider). The SPA reads the provider
 name from `/auth/config`, so no client change is needed to switch. Subjects
 are provider-scoped (`google:<sub>` / `github:<id>`), so switching providers

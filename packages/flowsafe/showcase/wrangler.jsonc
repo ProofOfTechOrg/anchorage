@@ -103,7 +103,7 @@
     // https://anchorage.proofoftech.org/auth/google/callback, and its consent
     // screen must be "In production" (Testing status only admits listed test
     // users — no verification review needed for the bare `openid` scope).
-    "GOOGLE_CLIENT_ID": "540939373490-5jfq332en4l4q5cc70fjth76l9v65oqm.apps.googleusercontent.com",
+    "GOOGLE_CLIENT_ID": "540939373490-5jfq332en4l4q5cc70fjth76l9v65oqm.apps.googleusercontent.com"
     // "GITHUB_CLIENT_ID": "<your GitHub OAuth app client id>",
     // "DEMO_DISABLED": "true",   // kill switch: 503s /auth/* AND stops
     //                            // verifying already-issued demo JWTs

@@ -137,10 +137,11 @@ interface Env {
   /**
    * Public-demo switches. DEMO_JWT_SECRET (secret) turns the OAuth demo on;
    * the OAuth app is named by GOOGLE_CLIENT_ID (var) + GOOGLE_CLIENT_SECRET
-   * (secret), or GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET — when both are
-   * configured, Google wins (the launch provider; the router mounts ONE).
-   * DEMO_DISABLED=true is the kill switch (auth middleware + mint).
-   * Caps are vars so ops can tune without a deploy.
+   * (secret), or GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET — a provider counts
+   * only with its FULL pair (a half-set pair is a config-error and stays
+   * unmounted); when both pairs are configured, Google wins (the launch
+   * provider; the router mounts ONE). DEMO_DISABLED=true is the kill switch
+   * (auth middleware + mint). Caps are vars so ops can tune without a deploy.
    */
   DEMO_JWT_SECRET?: string;
   GOOGLE_CLIENT_ID?: string;
@@ -270,36 +271,73 @@ export function buildVerifier(env: Env): TokenVerifier {
 }
 
 /**
+ * A credential pair counts only when BOTH halves are present: an id without
+ * its secret mounts a sign-in that always dies at the token exchange — and
+ * masks a fully-configured fallback provider. A half-set pair fails closed
+ * (skipped) with the missing var named in the log.
+ */
+function oauthPair(
+  idVar: string,
+  id: string | undefined,
+  secretVar: string,
+  secret: string | undefined,
+): { clientId: string; clientSecret: string } | undefined {
+  if (id && secret) return { clientId: id, clientSecret: secret };
+  if (id || secret) {
+    const present = id ? idVar : secretVar;
+    const missing = id ? secretVar : idVar;
+    console.error(
+      JSON.stringify({
+        type: 'config-error',
+        var: missing,
+        reason: `${present} is set without ${missing} — sign-in cannot complete, so the provider stays unmounted`,
+      }),
+    );
+  }
+  return undefined;
+}
+
+/**
  * One OAuth provider mounts per deployment: Google when configured (the
  * launch provider), else GitHub, else none (the /auth/* routes stay
- * unmounted). Identities are provider-scoped (`google:<sub>` vs
- * `github:<id>`), so switching providers mints fresh sandboxes rather than
- * colliding subjects. Both ids set is tolerated — Google wins — but logged
- * per request (same tripwire convention as numberVar's config-error), so
- * stale fallback credentials never linger silently.
+ * unmounted). Configured means the FULL id+secret pair — a half-set pair is
+ * a config-error and never mounts (see oauthPair). Identities are
+ * provider-scoped (`google:<sub>` vs `github:<id>`), so switching providers
+ * mints fresh sandboxes rather than colliding subjects. Both pairs set is
+ * tolerated — Google wins — but logged (same tripwire convention as
+ * numberVar's config-error), so stale fallback credentials never linger
+ * silently. The fetch handler selects per request, but only while the demo
+ * is on (DEMO_JWT_SECRET set): a half-set pair on a demo-off deployment is
+ * inert, and error-logging it every request would be noise.
  */
 export function selectOAuthProvider(env: Env): OAuthProvider | undefined {
-  if (env.GOOGLE_CLIENT_ID) {
-    if (env.GITHUB_CLIENT_ID) {
+  const google = oauthPair(
+    'GOOGLE_CLIENT_ID',
+    env.GOOGLE_CLIENT_ID,
+    'GOOGLE_CLIENT_SECRET',
+    env.GOOGLE_CLIENT_SECRET,
+  );
+  const github = oauthPair(
+    'GITHUB_CLIENT_ID',
+    env.GITHUB_CLIENT_ID,
+    'GITHUB_CLIENT_SECRET',
+    env.GITHUB_CLIENT_SECRET,
+  );
+  if (google) {
+    if (github) {
       console.warn(
         JSON.stringify({
           type: 'config-warning',
           var: 'GITHUB_CLIENT_ID',
           reason:
-            'GOOGLE_CLIENT_ID and GITHUB_CLIENT_ID are both set — Google mounts; remove the stale GitHub credentials',
+            'the Google and GitHub OAuth pairs are both set — Google mounts; remove the stale GitHub credentials',
         }),
       );
     }
-    return googleProvider({
-      clientId: env.GOOGLE_CLIENT_ID,
-      clientSecret: env.GOOGLE_CLIENT_SECRET ?? '',
-    });
+    return googleProvider(google);
   }
-  if (env.GITHUB_CLIENT_ID) {
-    return githubProvider({
-      clientId: env.GITHUB_CLIENT_ID,
-      clientSecret: env.GITHUB_CLIENT_SECRET ?? '',
-    });
+  if (github) {
+    return githubProvider(github);
   }
   return undefined;
 }
@@ -606,27 +644,31 @@ const handler: ExportedHandler<Env> = {
     const routed = request as unknown as Request;
 
     // Public demo sign-in (no auth — it MINTS identity). Mounted only when
-    // configured; the kill switch 503s it.
-    const oauthProvider = selectOAuthProvider(env);
-    if (env.DEMO_JWT_SECRET && oauthProvider) {
-      const authResponse = await createDemoAuthRouter({
-        db: env.DB,
-        provider: oauthProvider,
-        secret: env.DEMO_JWT_SECRET,
-        jwtTtlSeconds: numberVar(
-          env.DEMO_JWT_TTL_SECONDS,
-          3600,
-          'DEMO_JWT_TTL_SECONDS',
-        ),
-        tenantTtlMs:
-          numberVar(env.DEMO_TENANT_TTL_HOURS, 24, 'DEMO_TENANT_TTL_HOURS') *
-          60 *
-          60 *
-          1000,
-        purgeTenantData: (tenantId) => purgeTenant(env.DB, { tenantId }),
-        disabled: env.DEMO_DISABLED === 'true',
-      })(routed);
-      if (authResponse) return authResponse;
+    // configured; the kill switch 503s it. Provider selection runs only with
+    // the demo switched on: a half-set OAuth pair on a demo-off deployment is
+    // inert, so its config-error tripwire would be per-request noise.
+    if (env.DEMO_JWT_SECRET) {
+      const oauthProvider = selectOAuthProvider(env);
+      if (oauthProvider) {
+        const authResponse = await createDemoAuthRouter({
+          db: env.DB,
+          provider: oauthProvider,
+          secret: env.DEMO_JWT_SECRET,
+          jwtTtlSeconds: numberVar(
+            env.DEMO_JWT_TTL_SECONDS,
+            3600,
+            'DEMO_JWT_TTL_SECONDS',
+          ),
+          tenantTtlMs:
+            numberVar(env.DEMO_TENANT_TTL_HOURS, 24, 'DEMO_TENANT_TTL_HOURS') *
+            60 *
+            60 *
+            1000,
+          purgeTenantData: (tenantId) => purgeTenant(env.DB, { tenantId }),
+          disabled: env.DEMO_DISABLED === 'true',
+        })(routed);
+        if (authResponse) return authResponse;
+      }
     }
 
     // AUTHENTICATE FIRST, then construct (INV-2): the resolver binds the
