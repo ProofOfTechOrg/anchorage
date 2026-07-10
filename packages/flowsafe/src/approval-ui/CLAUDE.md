@@ -24,7 +24,8 @@ only in the UI pass.
 | `client.ts` | `ApprovalApiClient` (injected-fetch REST client, structural `FetchLike`), `ApprovalApiError` | Changing API calls or error mapping |
 | `view-model.ts` | Pure presentation logic: SLA state/countdowns, queue ordering, duration formatting | Changing queue order or SLA display rules |
 | `use-approval-dashboard.ts` | Headless `useApprovalDashboard` hook: fetch/poll, derived selection, busy/error state, claim/decide/delegate actions. UI-pass-only (React), excluded from the main pass | Changing dashboard data or interaction logic |
-| `components.tsx` | The `ApprovalUIComponents` slot contract, `ApprovalUIProvider`/`useApprovalUIComponents`, and the `htmlComponents` default adapter | Changing the styling contract or the HTML default |
+| `components.tsx` | The `ApprovalUIComponents` slot contract (incl. `InfoTip` — hover-tip slot with a `<span title>` default; `ApprovalColumn.header` is `ReactNode` so headers can carry tips), `ApprovalUIProvider`/`useApprovalUIComponents`, and the `htmlComponents` default adapter | Changing the styling contract or the HTML default |
+| `tips.ts` | `APPROVAL_TIPS` — the hover-tip copy for domain terms (SLA, statuses, grants, metrics), DOM-free, compiled in both passes | Changing tip copy or adding a tipped term |
 | `App.tsx` | Dashboard shell: runs the hook, renders the child views through the injected slots | Changing dashboard composition |
 | `QueueView.tsx` | Queue table (via the `Table`/`Badge`/`Button` slots) with SLA column and row selection | Changing the queue view |
 | `DetailView.tsx` | Record detail + decision form (approve/reject/comment), claim, delegate — all via slots | Changing the decision UX |
@@ -32,5 +33,8 @@ only in the UI pass.
 | `mount.tsx` | `createApprovalDashboard(container, { client, components })` — wraps `App` in `ApprovalUIProvider` | Embedding the dashboard |
 | `index.ts` | UI barrel (compiles only in the UI tsc pass) | Finding the UI export surface |
 | `tsconfig.json` | The UI compilation pass: `jsx: react-jsx`, DOM lib, `types: []` | Debugging UI typecheck/build |
+| `tsconfig.test.json` | The UI **test** pass: same settings, `exclude: []` + `noEmit` — owns JSX-importing tests the workers-typed package test pass must exclude | Adding a test that imports a `.tsx` module |
 | `client.test.ts` | Wire-format and error-mapping tests (plain node) | Adding client tests |
 | `view-model.test.ts` | SLA states, sorting, formatting tests (plain node) | Adding view-model tests |
+| `tips.test.ts` | `APPROVAL_TIPS` completeness (every status/metric/concept key non-empty) | Changing tips |
+| `components.test.ts` | Default `InfoTip` shape + provider merge semantics (element inspection, no jsdom) | Changing the default adapter or merge behavior |

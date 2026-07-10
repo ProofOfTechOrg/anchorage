@@ -230,9 +230,12 @@ export class R2ArtifactStore {
   }
 
   /**
-   * Delete every artifact of a run; returns the count. Pairs with the
-   * snapshot retention purge: reclaim a run's artifacts when its snapshot
-   * ages out (the caller owns scheduling, same as purgeExpiredWorkflowRuns).
+   * Delete every artifact of a run; returns the count. Idempotent (a
+   * deleted run lists nothing). The purges call it: pass this store as
+   * `artifactStore` to BOTH purgeExpiredWorkflowRuns (per aged-out run,
+   * with its snapshot row) and purgeTenant (per surviving run at
+   * offboarding) — the snapshot rows are the only enumerable record of a
+   * run's artifact keys, so an unpaired retention purge strands them.
    */
   async deleteRun(workflowId: string, runId: string): Promise<number> {
     const records = await this.list({ workflowId, runId });

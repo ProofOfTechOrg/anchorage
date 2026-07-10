@@ -40,6 +40,13 @@ export const APPROVAL_STATUSES: readonly ApprovalStatus[] = [
 
 export interface ApprovalRecord {
   id: string;
+  /**
+   * The owning tenant. STAMPED by the bound store from its own constructor
+   * field — never accepted from input (CreateApprovalInput deliberately has
+   * no tenantId: a field that cannot be supplied cannot be spoofed). Every
+   * read/write predicate carries it (INV-2).
+   */
+  tenantId: string;
   workflowId: string;
   runId: string;
   /** Suspended step path this approval unblocks, e.g. ['approval']. */
@@ -72,9 +79,34 @@ export interface ApprovalRecord {
   /**
    * Epoch-ms suspendedAt of the suspension this approval binds to (core
    * clock) — see CreateApprovalInput.suspendedAt. Grant minting requires an
-   * EXACT match with the resumed leg's suspension timestamp when present.
+   * EXACT match with the resumed leg's suspension timestamp when present,
+   * paired with `resumeCount`.
    */
   suspendedAt?: number;
+  /**
+   * Epoch-ms resumedAt of that suspension (core clock). INFORMATIONAL audit
+   * metadata only — Mastra stamps it solely on a payload-bearing resume, so it
+   * is NOT the grant tie-breaker (that is `resumeCount`).
+   */
+  resumedAt?: number;
+  /**
+   * Runtime-owned monotonic resume ordinal of that suspension — undefined for
+   * a step's FIRST suspension, 1,2,… on successive re-suspensions. Pairs with
+   * `suspendedAt` in the exact grant binding as the collision-free
+   * tie-breaker: unlike `resumedAt` the runtime increments it on every resume
+   * regardless of payload, so two same-step suspensions stay distinguishable
+   * even when their `suspendedAt` collide within a millisecond.
+   */
+  resumeCount?: number;
+  /**
+   * Explicit run-scoped standing grant: a step-less record mints its
+   * connectors on EVERY leg of the run. Opt-in only — a step-less record
+   * WITHOUT this flag mints nothing, because "absent field => maximal
+   * privilege" is an inverted default. Suspend-observation bridges must never
+   * set this (they always carry a stepPath); only trusted code that
+   * deliberately wants a run-wide capability does.
+   */
+  runScoped?: boolean;
 }
 
 export interface CreateApprovalInput {
@@ -97,6 +129,23 @@ export interface CreateApprovalInput {
    * fall back to the same-clock decidedAt-after-suspension comparison.
    */
   suspendedAt?: number;
+  /**
+   * Epoch-ms resumedAt of that suspension, observed from RunSummary.resumedAt
+   * by the same bridge. INFORMATIONAL only — not the grant tie-breaker.
+   */
+  resumedAt?: number;
+  /**
+   * Runtime resume ordinal of that suspension, observed from
+   * RunSummary.resumeCount by the same bridge — undefined for a first
+   * suspension, 1,2,… on re-suspensions. Pairs with `suspendedAt` as the
+   * collision-free grant-binding tie-breaker.
+   */
+  resumeCount?: number;
+  /**
+   * Opt in to a run-scoped standing grant (mints on every leg). Create-time
+   * only — see ApprovalRecord.runScoped. Never settable over HTTP.
+   */
+  runScoped?: boolean;
 }
 
 export interface ApprovalListFilter {

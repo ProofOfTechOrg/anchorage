@@ -41,7 +41,7 @@ What Mastra provides vs. what breakwater adds: Mastra `createTool()` takes `id`,
 | `egress` | string[] | Hostnames the connector calls (`api.example.com`); checked against the org `networkEgress` allowlist |
 | `idempotencyKey` | boolean | Requires caller to provide an idempotency key |
 | `dryRun` | boolean | Supports simulation without side effects |
-| `rateLimit` | string | Connector-level rate limit expression |
+| `rateLimit` | string | Connector-level rate limit expression (budget is per isolation scope when the host mints one) |
 | `requiresApproval` | boolean | Gates execution on human approval (compiled to a Mastra-native `requireApproval` per-call predicate that exempts dry-run requests) |
 
 Every manifest field is implemented and enforced: `sideEffect`, `egress`, `idempotencyKey`, `requiresApproval`, `dryRun`, and `rateLimit`.
@@ -104,12 +104,42 @@ three more, in order:
    trust boundary 6). Grants are checked on every attempt: a retried or
    resumed call must carry the grant again, or it fails closed.
 3. **Idempotency** -- the per-call key comes from requestContext
-   `breakwater.idempotencyKey`; results are stored per `${connectorId}:${key}`.
-   A stored key replays the stored result without re-executing; concurrent
-   duplicates share one attempt; failures are never cached, so retries
-   re-execute. Nothing injects keys on the agent path, so
-   idempotency-keyed connectors fail closed under an agent until the flowsafe
-   runtime supplies keys.
+   `breakwater.idempotencyKey`; results are stored per
+   `[<isolationScope>:]${connectorId}:${key}`. A stored key replays the stored
+   result without re-executing; concurrent duplicates share one attempt;
+   failures are never cached, so retries re-execute. Nothing injects keys on
+   the agent path, so idempotency-keyed connectors fail closed under an agent
+   until the flowsafe runtime supplies keys.
+
+## Isolation Scope (Multi-Tenant Hosts)
+
+breakwater is tenant-agnostic: it is a standalone library, and no gate needs
+tenant *identity* -- `RBACMiddleware` decides on `actor.role`, `PolicyEngine`
+on message content. What a multi-tenant host supplies instead is one **opaque
+string** through requestContext `breakwater.isolationScope`
+(`ISOLATION_SCOPE_CONTEXT_KEY`), which breakwater never parses -- the same
+pattern `crossWorkflowIsolation` already uses for `breakwater.workflowScope`.
+flowsafe's runtime mints it on every leg of a tenant-salted run.
+
+It does two things:
+
+- **Segments the connector's keys.** Both the idempotency key and the
+  rate-limit budget key are prefixed with the scope when one is present. This
+  matters because an idempotency key is *caller-supplied* and its canonical use
+  is cross-run business identity (`send-email:bob@acme.com`), which two tenants
+  can legitimately share: without the segment, tenant B's send would be
+  suppressed as a replay of tenant A's, or would return A's cached result
+  object. Likewise, one tenant exhausting a connector's `rateLimit` would
+  throttle every other tenant. There is **no flag**: absent scope reproduces
+  the single-tenant keys byte for byte, so there is no default-false switch to
+  forget.
+- **Feeds the `tenantIsolation` evaluator.** "Absence of a scope is an error"
+  is a property of the *deployment*, not of the library, so it ships as an
+  evaluator a platform adds to its policy set:
+  `tenantIsolation()` denies any call whose requestContext carries no scope.
+  It runs in the pre-execute gates loop, which is load-bearing: the dry-run
+  branch returns *before* both the idempotency and rate-limit machinery, so a
+  constraint that must also bind simulations cannot live on those paths.
 
 Custom `ToolPolicyEvaluator`s registered via `policies.evaluators` run
 pre-execute after the built-in egress gate, in order -- the slot later policy

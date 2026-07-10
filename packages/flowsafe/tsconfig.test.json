@@ -7,9 +7,30 @@
     // admit ../breakwater/src into this (emit-free) program.
     "rootDir": "../..",
     "paths": {
-      "@proofoftech/breakwater": ["../breakwater/src/index.ts"]
+      "@proofoftech/breakwater": ["../breakwater/src/index.ts"],
+      // deploy/worker.ts (pulled in by its e2e test) imports the package
+      // specifiers a copy-ready consumer would; resolve them to source here
+      // (matches the vitest aliases).
+      "@proofoftech/flowsafe/approval-api": ["./src/approval-api/index.ts"],
+      "@proofoftech/flowsafe/audit-export": ["./src/audit-export/index.ts"],
+      "@proofoftech/flowsafe/do-runner": ["./src/do-runner/index.ts"],
+      "@proofoftech/flowsafe/host-kit": ["./src/host-kit/index.ts"]
     }
   },
-  "include": ["src"],
-  "exclude": ["src/approval-ui/**/*.tsx", "src/approval-ui/index.ts"]
+  "include": [
+    "src",
+    "examples",
+    "deploy/worker.ts",
+    "deploy/worker.e2e.test.ts",
+    "showcase/**/*.test.ts",
+    "showcase/runtime.ts",
+    "showcase/workflows/**/*.ts"
+  ],
+  "exclude": [
+    "src/approval-ui/**/*.tsx",
+    "src/approval-ui/index.ts",
+    // Imports the .tsx contract, which this workers-typed (jsx-free) program
+    // cannot compile; the approval-ui UI test pass typechecks it instead.
+    "src/approval-ui/components.test.ts"
+  ]
 }

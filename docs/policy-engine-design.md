@@ -9,7 +9,7 @@ The policy engine covers four gap domains that Mastra's processor pipeline does 
 | Network egress | Nothing | Restrict which domains tools and connectors can call |
 | Write permission gates | Per-tool `requireApproval` flag (boolean or predicate) -- no classification, no org policy | Classify write vs read vs destructive; gate writes behind org-level approval policy |
 | Data retention | Nothing | Enforce workflow output TTLs; auto-expire after retention period |
-| Cross-workflow isolation | Nothing | Prevent workflow A from reading workflow B's state |
+| Cross-workflow isolation | Nothing | Prevent workflow A from reading workflow B's state; on a multi-tenant host, also require a tenant scope on every connector call |
 
 ## Architecture
 
@@ -42,7 +42,7 @@ interface PolicyResult {
 }
 ```
 
-Policy evaluation order is configurable. By default: network egress, write permissions, data retention, cross-workflow isolation.
+Policy evaluation order is configurable. By default: network egress, write permissions, data retention, cross-workflow isolation (plus cross-tenant isolation on a multi-tenant host).
 
 ## Policy Configuration
 
@@ -92,6 +92,14 @@ The remaining two domains are each enforced where enforcement naturally lives:
   addresses; calls without a target pass, calls targeting another workflow's
   state — or targeting workflow state without a minted caller scope — fail
   closed.
+- **Cross-tenant isolation** is its sibling, `tenantIsolation()`, reading the
+  opaque `breakwater.isolationScope` key. It deliberately does not re-qualify
+  the workflow-scope key's value (a consumer may parse that as a bare
+  `workflowId`). A multi-tenant platform adds it to its policy set, and any
+  connector call arriving without a scope is denied — including a dry-run,
+  because the evaluator runs in the pre-execute gates loop while the dry-run
+  branch returns before the idempotency and rate-limit paths. The scope also
+  segments those two keys per tenant. See `connector-interface.md`.
 - **Data retention** is deliberately NOT a policy evaluator: TTL enforcement
   is a storage-layer property (the data outlives any single call, so a
   call-time gate cannot expire it). It ships as flowsafe's
@@ -99,4 +107,7 @@ The remaining two domains are each enforced where enforcement naturally lives:
   that deletes TERMINAL runs (success/failed/tripwire/canceled/bailed/
   skipped) older than the `workflowOutputTTL` from `mastra_workflow_snapshot`
   and never touches live runs (expiring a suspended run would kill a pending
-  approval). Scheduling (Worker cron / DO alarm) stays with the caller.
+  approval). Its counterpart `purgeTenant(db, { tenantId, artifactStore })`
+  reaps a departing tenant's snapshots of ANY status, its approval records,
+  and its R2 artifacts — the only path that reclaims a run abandoned at an
+  approval gate. Scheduling stays with the caller (a Worker cron).

@@ -20,18 +20,31 @@ anywhere and versioned against the wire contract alone.
   one design system (couples every consumer to it and forces its React version —
   the concrete failure that pulling Astryx as a hard dep caused); CSS-only
   theming (can't swap in a consumer's own components).
+- **`InfoTip` slot + `APPROVAL_TIPS`.** The views attach hover explanations to
+  domain terms (SLA, status values, grants, metrics) through one additional
+  slot, `InfoTip {label: ReactNode, tip: string}`, with a plain
+  `<span title>` default — so a design-system adapter can supply a real
+  Tooltip without the library depending on one. The copy lives in `tips.ts`
+  (`APPROVAL_TIPS`), exported for consumers to reuse. Because tips must ride
+  table headers, `ApprovalColumn.header` widened `string → ReactNode` — a
+  custom Table slot doing string operations on `header` must treat it as a
+  node now (the built-in HTML and app Astryx tables already do).
 - **Subpath export only.** The dashboard ships as
   `@proofoftech/flowsafe/approval-ui` and is deliberately absent from the
   package root barrel, so DO-runner/API consumers never resolve React.
   `react`/`react-dom` are optional peers for the same reason.
-- **Three-tsconfig scheme instead of a separate package.** JSX needs the DOM
+- **Four-tsconfig scheme instead of a separate package.** JSX needs the DOM
   lib, but the rest of the package compiles against the
   `@cloudflare/workers-types` ambient set, and the two declare conflicting
   globals (`Request`/`Response`/`fetch`). So the `.tsx` shells, `mount.tsx`,
   the UI barrel, and the React hook `use-approval-dashboard.ts` compile only in
   this directory's own tsconfig (`jsx: react-jsx`, `lib: DOM`, `types: []`),
   while the package/test/demo tsconfigs exclude them (`.tsx` via its glob; the
-  React `.ts` hooks via a `use-*.ts` glob, since they aren't caught by `*.tsx`). A separate `@proofoftech/flowsafe-ui` package
+  React `.ts` hooks via a `use-*.ts` glob, since they aren't caught by `*.tsx`).
+  The fourth pass is `tsconfig.test.json` here: identical settings with the
+  test exclusion lifted (`exclude: []`, `noEmit`), owning JSX-importing tests
+  (`components.test.ts`) that the workers-typed package test pass must exclude.
+  A separate `@proofoftech/flowsafe-ui` package
   would remove the double compilation entirely and is the documented
   fallback if the UI grows.
 - **No jsdom render tests.** The components are thin declarative shells;

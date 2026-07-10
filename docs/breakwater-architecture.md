@@ -76,6 +76,21 @@ Structured audit log for every action: who, what, when, result, reason. Writes t
 
 Pre-gate and post-gate policy evaluation (network egress, budget, data retention). Policies are expressed as a set of evaluator functions. Each function returns `{ allowed: boolean, reason?: string }`.
 
+## Tenancy
+
+Breakwater is **tenant-agnostic by design**: it is a standalone Apache-2.0
+library, and no gate needs tenant identity — `RBACMiddleware` decides on
+`actor.role`, `PolicyEngine` on message content. Its `Actor` therefore has no
+`tenantId`, and its audit events carry none.
+
+A multi-tenant host passes one **opaque scope string** through requestContext
+(`breakwater.isolationScope`), which breakwater never interprets — the same
+arrangement `crossWorkflowIsolation` already uses for
+`breakwater.workflowScope`. The scope segments the connector SDK's idempotency
+and rate-limit keys, and the optional `tenantIsolation()` evaluator denies a
+call that arrives without one. Absent scope reproduces the single-tenant
+behaviour exactly. See [`connector-interface.md`](connector-interface.md).
+
 ## Dependencies
 
 - Requires `@mastra/core@^1.49.0` (Processor API)

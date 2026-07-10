@@ -10,6 +10,7 @@ import {
   type Tone,
   useApprovalUIComponents,
 } from './components.js';
+import { APPROVAL_TIPS } from './tips.js';
 import { formatSlaCountdown, type SlaState, slaStateOf } from './view-model.js';
 
 const STATUS_TONE: Record<ApprovalStatus, Tone> = {
@@ -72,7 +73,7 @@ export function QueueView({
     },
     {
       key: 'priority',
-      header: 'Priority',
+      header: <C.InfoTip label="Priority" tip={APPROVAL_TIPS.priority} />,
       renderCell: (record) => (
         <C.Badge
           tone={PRIORITY_TONE[record.priority]}
@@ -82,14 +83,14 @@ export function QueueView({
     },
     {
       key: 'status',
-      header: 'Status',
+      header: <C.InfoTip label="Status" tip={APPROVAL_TIPS.statusColumn} />,
       renderCell: (record) => (
         <C.Badge tone={STATUS_TONE[record.status]} label={record.status} />
       ),
     },
     {
       key: 'sla',
-      header: 'SLA',
+      header: <C.InfoTip label="SLA" tip={APPROVAL_TIPS.sla} />,
       renderCell: (record) => (
         <C.Badge
           tone={SLA_TONE[slaStateOf(record, nowMs)]}

@@ -4,6 +4,10 @@ import { z } from 'zod';
 
 import { init } from './init.js';
 import {
+  DurableStorageResumeLedger,
+  type ResumeLedgerStorage,
+} from './resume-ledger.js';
+import {
   InvalidRunRequestError,
   type RequestContextProvider,
   RunAlreadyExistsError,
@@ -94,6 +98,7 @@ describe('RunnerRuntime', () => {
 
     // #when
     const started = await runtime.start('demo-approval', {
+      runId: crypto.randomUUID(),
       inputData: { topic: 'launch' },
     });
 
@@ -125,6 +130,7 @@ describe('RunnerRuntime', () => {
     const storage = new InMemoryStore();
     const before = buildRuntime(storage).runtime;
     const started = await before.start('demo-approval', {
+      runId: crypto.randomUUID(),
       inputData: { topic: 'launch' },
     });
     expect(started.status).toBe('suspended');
@@ -151,6 +157,7 @@ describe('RunnerRuntime', () => {
     // #given — a suspended approval run
     const { runtime, counters } = buildRuntime(new InMemoryStore());
     const started = await runtime.start('demo-approval', {
+      runId: crypto.randomUUID(),
       inputData: { topic: 'race' },
     });
     expect(started.status).toBe('suspended');
@@ -214,7 +221,10 @@ describe('RunnerRuntime', () => {
     const { runtime } = buildRuntime(new InMemoryStore());
 
     // #when
-    const done = await runtime.start('echo', { inputData: { value: 'hi' } });
+    const done = await runtime.start('echo', {
+      runId: crypto.randomUUID(),
+      inputData: { value: 'hi' },
+    });
 
     // #then
     expect(done.status).toBe('success');
@@ -228,6 +238,7 @@ describe('RunnerRuntime', () => {
     // #given
     const { runtime } = buildRuntime(new InMemoryStore());
     const started = await runtime.start('demo-approval', {
+      runId: crypto.randomUUID(),
       inputData: { topic: 'validate' },
     });
 
@@ -254,6 +265,7 @@ describe('RunnerRuntime', () => {
     // #given
     const { runtime } = buildRuntime(new InMemoryStore());
     const started = await runtime.start('demo-approval', {
+      runId: crypto.randomUUID(),
       inputData: { topic: 'wrong-step' },
     });
 
@@ -285,9 +297,9 @@ describe('RunnerRuntime', () => {
     const { runtime } = buildRuntime(new InMemoryStore());
 
     // #when / #then
-    await expect(runtime.start('nope', {})).rejects.toBeInstanceOf(
-      UnknownWorkflowError,
-    );
+    await expect(
+      runtime.start('nope', { runId: 'r-unknown' }),
+    ).rejects.toBeInstanceOf(UnknownWorkflowError);
   });
 
   it('returns null status for unknown runs', async () => {
@@ -378,7 +390,7 @@ describe('RunnerRuntime', () => {
     })
       .then(step)
       .commit();
-    await runtime.start('wf', { inputData: {} });
+    await runtime.start('wf', { runId: crypto.randomUUID(), inputData: {} });
 
     // #when / #then
     expect(() =>
@@ -398,6 +410,7 @@ describe('RunnerRuntime.status projection', () => {
     // #given
     const { runtime } = buildRuntime(new InMemoryStore());
     const started = await runtime.start('demo-approval', {
+      runId: crypto.randomUUID(),
       inputData: { topic: 'launch' },
     });
     expect(started.status).toBe('suspended');
@@ -418,7 +431,10 @@ describe('RunnerRuntime.status projection', () => {
   it('projects the result for a completed run', async () => {
     // #given
     const { runtime } = buildRuntime(new InMemoryStore());
-    const done = await runtime.start('echo', { inputData: { value: 'hi' } });
+    const done = await runtime.start('echo', {
+      runId: crypto.randomUUID(),
+      inputData: { value: 'hi' },
+    });
 
     // #when
     const status = await runtime.status('echo', done.runId);
@@ -450,7 +466,10 @@ describe('RunnerRuntime.status projection', () => {
     })
       .then(boom)
       .commit();
-    const started = await runtime.start('failing', { inputData: {} });
+    const started = await runtime.start('failing', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
     expect(started.status).toBe('failed');
 
     // #when
@@ -490,7 +509,10 @@ describe('RunnerRuntime.status projection', () => {
       .commit();
 
     // #when
-    const started = await runtime.start('obj-failing', { inputData: {} });
+    const started = await runtime.start('obj-failing', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
 
     // #then — both the run summary and the status projection surface the
     // message field, never '[object Object]'
@@ -523,7 +545,10 @@ describe('RunnerRuntime.status projection', () => {
     })
       .parallel([makeGate('gateA', 'A waits'), makeGate('gateB', 'B waits')])
       .commit();
-    const started = await runtime.start('parallel-suspend', { inputData: {} });
+    const started = await runtime.start('parallel-suspend', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
     expect(started.status).toBe('suspended');
 
     // #when
@@ -607,7 +632,10 @@ describe('RunnerRuntime requestContextForRun', () => {
     });
 
     // #when
-    const started = await runtime.start('probe', { inputData: {} });
+    const started = await runtime.start('probe', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
     expect(started.status).toBe('suspended');
     const resumed = await runtime.resume('probe', started.runId, {
       step: 'gate',
@@ -636,7 +664,10 @@ describe('RunnerRuntime requestContextForRun', () => {
     });
 
     // #when
-    const started = await runtime.start('probe', { inputData: {} });
+    const started = await runtime.start('probe', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
     await runtime.resume('probe', started.runId, {
       step: 'gate',
       resumeData: { go: true },
@@ -657,9 +688,9 @@ describe('RunnerRuntime requestContextForRun', () => {
     });
 
     // #when / #then
-    await expect(runtime.start('probe', { inputData: {} })).rejects.toThrow(
-      'grant store down',
-    );
+    await expect(
+      runtime.start('probe', { runId: crypto.randomUUID(), inputData: {} }),
+    ).rejects.toThrow('grant store down');
   });
 
   it('passes the execution leg: start, then resume with the explicit step', async () => {
@@ -671,7 +702,10 @@ describe('RunnerRuntime requestContextForRun', () => {
     });
 
     // #when
-    const started = await runtime.start('probe', { inputData: {} });
+    const started = await runtime.start('probe', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
     await runtime.resume('probe', started.runId, {
       step: 'gate',
       resumeData: { go: true },
@@ -692,7 +726,10 @@ describe('RunnerRuntime requestContextForRun', () => {
       legs.push(leg);
       return undefined;
     });
-    const started = await runtime.start('probe', { inputData: {} });
+    const started = await runtime.start('probe', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
 
     // #when — no explicit step; 'gate' is the only suspended step
     await runtime.resume('probe', started.runId, { resumeData: { go: true } });
@@ -730,10 +767,55 @@ describe('RunnerRuntime requestContextForRun', () => {
       .commit();
 
     // #when
-    await runtime.start('scoped-wf', { inputData: {} });
+    await runtime.start('scoped-wf', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
 
     // #then — the executing workflow's own id, minted by the runtime
     expect(seen).toEqual(['scoped-wf']);
+  });
+
+  it('mints the isolation scope from a tenant-salted runId, and omits it otherwise', async () => {
+    // #given — a probe recording both server-minted keys
+    const seen: Array<{ scope: unknown; isolation: unknown }> = [];
+    const { createWorkflow, createStep, runtime } = init({
+      storage: new InMemoryStore(),
+    });
+    const probe = createStep({
+      id: 'probe',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      execute: async ({ requestContext }) => {
+        seen.push({
+          scope: requestContext.get('breakwater.workflowScope'),
+          isolation: requestContext.get('breakwater.isolationScope'),
+        });
+        return {};
+      },
+    });
+    createWorkflow({
+      id: 'scoped-wf2',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(probe)
+      .commit();
+
+    // #when — one INV-1 tenant-salted run, one plain single-tenant run
+    await runtime.start('scoped-wf2', { runId: 'acme_r1', inputData: {} });
+    await runtime.start('scoped-wf2', { runId: 'plain-run', inputData: {} });
+    // a prefix that fails INV-3 must NOT mint (e.g. underscore-led)
+    await runtime.start('scoped-wf2', { runId: 'AB_r1', inputData: {} });
+
+    // #then — the tenant prefix is server-authoritative (the runId was minted
+    // from the authenticated tenant); non-tenant runs stay scope-less so the
+    // single-tenant OSS keys are untouched
+    expect(seen).toEqual([
+      { scope: 'scoped-wf2', isolation: 'acme' },
+      { scope: 'scoped-wf2', isolation: undefined },
+      { scope: 'scoped-wf2', isolation: undefined },
+    ]);
   });
 
   it('lets a provider override the minted workflow scope (merge-over)', async () => {
@@ -765,7 +847,10 @@ describe('RunnerRuntime requestContextForRun', () => {
       .commit();
 
     // #when
-    await runtime.start('scoped-wf', { inputData: {} });
+    await runtime.start('scoped-wf', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
 
     // #then — provider values merge OVER the runtime base
     expect(seen).toEqual(['overridden']);
@@ -795,5 +880,650 @@ describe('RunnerRuntime requestContextForRun', () => {
       inputData: {},
     });
     expect(retried.status).toBe('suspended');
+  });
+});
+
+describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
+  // The do-runner OWNS the RunSummary/RunLeg projection, so the layer that
+  // publishes the resumeCount contract must pin it against the real engine.
+  // resumeCount is the categorical signal flowsafe's grant binding depends on
+  // ("undefined on first suspension, defined on re-suspension"); unlike the
+  // informational resumedAt (which Mastra stamps only on a payload-bearing
+  // resume) the runtime increments resumeCount on EVERY resume, so it holds
+  // even for a no-payload re-suspension. gate2x suspends, and re-suspends on a
+  // no-payload resume (round 1) or after a payload resume (round 2).
+  function buildReSuspender(onLeg?: (leg: RunLeg) => void): RunnerRuntime {
+    let rounds = 0;
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      onLeg
+        ? {
+            requestContextForRun: (_workflowId, _runId, leg) => {
+              onLeg(leg);
+              return undefined;
+            },
+          }
+        : undefined,
+    );
+    const gate2x = createStep({
+      id: 'gate2x',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      suspendSchema: z.object({ reason: z.string() }),
+      // No resumeSchema on purpose: with a required schema, core rejects a
+      // no-payload resume before execute, so the falsy-resume re-suspension
+      // (the bug's trigger) is unreachable. Without one, a falsy resume passes
+      // validation and re-suspends via the guard below.
+      execute: async ({ resumeData, suspend }) => {
+        if (!resumeData) return suspend({ reason: 'round 1' });
+        rounds += 1;
+        if (rounds < 2) return suspend({ reason: 'round 2' });
+        return {};
+      },
+    });
+    createWorkflow({
+      id: 'resuspend',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(gate2x)
+      .commit();
+    return runtime;
+  }
+
+  it('omits resumeCount on the first suspension and carries it on a re-suspension', async () => {
+    // #given
+    const runtime = buildReSuspender();
+
+    // #when — first suspension
+    const started = await runtime.start('resuspend', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+
+    // #then — a first suspension carries suspendedAt but NO resumeCount; this
+    // undefined is the categorical tie-breaker the grant binding relies on
+    expect(started.status).toBe('suspended');
+    expect(started.suspendedAt?.gate2x).toBeTypeOf('number');
+    expect(started.resumeCount?.gate2x).toBeUndefined();
+
+    // #when — resume (payload); gate2x runs and re-suspends (round 2)
+    const reSuspended = await runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+    });
+
+    // #then — the re-suspension summary carries resumeCount 1 (one resume so
+    // far); resumedAt is also present here because the resume carried a payload
+    expect(reSuspended.suspended).toEqual([['gate2x']]);
+    expect(reSuspended.resumeCount?.gate2x).toBe(1);
+    expect(reSuspended.suspendedAt?.gate2x).toBeTypeOf('number');
+    expect(reSuspended.resumedAt?.gate2x).toBeTypeOf('number');
+  });
+
+  it('carries resumeCount on a NO-PAYLOAD re-suspension even though Mastra omits resumedAt', async () => {
+    // #given — the regression: a falsy resume re-suspends via
+    // `if (!resumeData) return suspend(...)`, so Mastra never stamps resumedAt.
+    const runtime = buildReSuspender();
+    const started = await runtime.start('resuspend', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+
+    // #when — resume with NO resumeData; gate2x re-suspends (round 1 again)
+    const reSuspended = await runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+    });
+
+    // #then — resumedAt stays undefined (Mastra's payload-conditional stamp),
+    // but the runtime-owned resumeCount is present, so the grant binding can
+    // still tell this re-suspension apart from the first suspension. Pre-fix
+    // (resumeCount did not exist) this re-suspension was indistinguishable.
+    expect(reSuspended.suspended).toEqual([['gate2x']]);
+    expect(reSuspended.resumedAt?.gate2x).toBeUndefined();
+    expect(reSuspended.resumeCount?.gate2x).toBe(1);
+  });
+
+  it('a required resumeSchema rejects a no-payload resume (why the falsy path needs a schema-less step)', async () => {
+    // Tripwire pinning the Mastra-version-dependent boundary the falsy-resume
+    // fixtures rely on: with a REQUIRED resumeSchema, core validates resume
+    // data and rejects a no-payload resume BEFORE execute, so the falsy-resume
+    // re-suspension (the bug's trigger) is only reachable for schema-less /
+    // optional-schema / validateInputs-off steps. If a Mastra bump changes
+    // this, the "schema-less fixture required" assumption (buildReSuspender,
+    // the relaunch-falsy e2e fixture) goes silently stale.
+    const { createWorkflow, createStep, runtime } = init({
+      storage: new InMemoryStore(),
+    });
+    const schemaGate = createStep({
+      id: 'schemaGate',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      suspendSchema: z.object({ reason: z.string() }),
+      resumeSchema: z.object({ go: z.boolean() }),
+      execute: async ({ resumeData, suspend }) => {
+        if (!resumeData) return suspend({ reason: 'awaiting' });
+        return {};
+      },
+    });
+    createWorkflow({
+      id: 'schema-gate',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(schemaGate)
+      .commit();
+    const started = await runtime.start('schema-gate', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+    expect(started.status).toBe('suspended');
+
+    // #when / #then — a no-payload resume is rejected as invalid resume data,
+    // never reaching execute (so it cannot re-suspend without a resumedAt)
+    await expect(
+      runtime.resume('schema-gate', started.runId, { step: 'schemaGate' }),
+    ).rejects.toThrow(/resume data/i);
+  });
+
+  it('passes resumeCount on the resume leg, incrementing per resume', async () => {
+    // #given — a provider recording every leg
+    const legs: RunLeg[] = [];
+    const runtime = buildReSuspender((leg) => legs.push(leg));
+
+    // #when — start (round-1 suspension) then resume, which re-suspends
+    const started = await runtime.start('resuspend', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+    await runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+    });
+
+    // #then — the leg that reattached to the FIRST suspension read the ledger
+    // before any resume, so its resumeCount is undefined
+    expect(legs[1]).toMatchObject({
+      kind: 'resume',
+      step: ['gate2x'],
+      suspendedAt: expect.any(Number),
+    });
+    expect((legs[1] as { resumeCount?: number }).resumeCount).toBeUndefined();
+
+    // #when — resume again, reattaching to the RE-suspension
+    const done = await runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+    });
+
+    // #then — one prior resume happened, so this leg carries resumeCount 1
+    expect(done.status).toBe('success');
+    expect(legs[2]).toMatchObject({
+      kind: 'resume',
+      step: ['gate2x'],
+      suspendedAt: expect.any(Number),
+      resumeCount: 1,
+    });
+  });
+
+  it('marks only the resumed branch, leaving a co-suspended branch a first suspension', async () => {
+    // #given — two parallel gates both suspend; gateA re-suspends on a payload
+    // resume (round 2), gateB stays at its first suspension.
+    const { createWorkflow, createStep, runtime } = init({
+      storage: new InMemoryStore(),
+    });
+    let aRounds = 0;
+    const gateA = createStep({
+      id: 'gateA',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ ok: z.boolean() }),
+      suspendSchema: z.object({ reason: z.string() }),
+      resumeSchema: z.object({ go: z.boolean() }),
+      execute: async ({ resumeData, suspend }) => {
+        if (!resumeData) return suspend({ reason: 'A round 1' });
+        aRounds += 1;
+        if (aRounds < 2) return suspend({ reason: 'A round 2' });
+        return { ok: true };
+      },
+    });
+    const gateB = createStep({
+      id: 'gateB',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ ok: z.boolean() }),
+      suspendSchema: z.object({ reason: z.string() }),
+      resumeSchema: z.object({ go: z.boolean() }),
+      execute: async ({ resumeData, suspend }) =>
+        resumeData ? { ok: true } : suspend({ reason: 'B waits' }),
+    });
+    createWorkflow({
+      id: 'parallel-resuspend',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .parallel([gateA, gateB])
+      .commit();
+    const started = await runtime.start('parallel-resuspend', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+    expect(started.suspended).toHaveLength(2);
+    expect(started.resumeCount?.gateA).toBeUndefined();
+    expect(started.resumeCount?.gateB).toBeUndefined();
+
+    // #when — resume ONLY gateA; it re-suspends (round 2), gateB is untouched
+    const reSuspended = await runtime.resume(
+      'parallel-resuspend',
+      started.runId,
+      { step: 'gateA', resumeData: { go: true } },
+    );
+
+    // #then — gateA carries resumeCount 1 (it was resumed); gateB, never
+    // resumed, stays undefined — its own first suspension, not collapsed into
+    // gateA's ordinal by the shared ledger.
+    expect(reSuspended.status).toBe('suspended');
+    expect(reSuspended.resumeCount?.gateA).toBe(1);
+    expect(reSuspended.resumeCount?.gateB).toBeUndefined();
+  });
+});
+
+describe('RunnerRuntime resumeCount ledger keying (shared runId across workflows)', () => {
+  // Two suspending workflows under DIFFERENT ids on ONE runtime, both driven with
+  // the SAME caller runId. Mastra persists them as distinct runs (snapshots key on
+  // `${workflowName}-${runId}`), so the ONLY thing that can conflate them is the
+  // runtime's own resume ledger. wfA completes on its first payload resume
+  // (terminal — triggers the ledger delete); wfB re-suspends once (round 1 ->
+  // round 2), so it holds a live ledger entry across wfA's delete. Both gates share
+  // step id 'gate' on purpose: an identical inner stepKey is what lets one run's
+  // ordinal contaminate the other's leg read if the OUTER key is runId alone.
+  function buildSharedRunIdPair(
+    onLeg?: (workflowId: string, leg: RunLeg) => void,
+  ): RunnerRuntime {
+    let bRounds = 0;
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      onLeg
+        ? {
+            requestContextForRun: (workflowId, _runId, leg) => {
+              onLeg(workflowId, leg);
+              return undefined;
+            },
+          }
+        : undefined,
+    );
+    const gateA = createStep({
+      id: 'gate',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      suspendSchema: z.object({ reason: z.string() }),
+      execute: async ({ resumeData, suspend }) =>
+        resumeData ? {} : suspend({ reason: 'A waits' }),
+    });
+    createWorkflow({
+      id: 'wfA',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(gateA)
+      .commit();
+    const gateB = createStep({
+      id: 'gate',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      suspendSchema: z.object({ reason: z.string() }),
+      execute: async ({ resumeData, suspend }) => {
+        if (!resumeData) return suspend({ reason: 'B round 1' });
+        bRounds += 1;
+        if (bRounds < 2) return suspend({ reason: 'B round 2' });
+        return {};
+      },
+    });
+    createWorkflow({
+      id: 'wfB',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(gateB)
+      .commit();
+    return runtime;
+  }
+
+  it("does not wipe a sibling run's resume ledger when a run sharing its runId reaches terminal status", async () => {
+    // #given — wfA and wfB both suspended under the SAME runId 'shared'
+    const runtime = buildSharedRunIdPair();
+    await runtime.start('wfA', { runId: 'shared', inputData: {} });
+    await runtime.start('wfB', { runId: 'shared', inputData: {} });
+
+    // #given — wfB resumed once, so its ledger bucket holds gate -> 1
+    const reSuspendedB = await runtime.resume('wfB', 'shared', {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+    expect(reSuspendedB.suspended).toEqual([['gate']]);
+    expect(reSuspendedB.resumeCount?.gate).toBe(1);
+
+    // #when — wfA (same runId) resumed to SUCCESS; a terminal run drops its ledger.
+    // Keyed by runId alone (the bug) this delete('shared') wipes wfB's bucket too.
+    const doneA = await runtime.resume('wfA', 'shared', {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+    expect(doneA.status).toBe('success');
+
+    // #then — wfB's still-suspended round-2 leg keeps resumeCount 1. Pre-fix this
+    // projected undefined (wfA's delete erased it), letting a spent first-suspension
+    // approval (resumeCount undefined) re-mint at the grant gate — the leak.
+    const statusB = await runtime.status('wfB', 'shared');
+    expect(statusB).toMatchObject({
+      status: 'suspended',
+      suspended: [['gate']],
+    });
+    expect(statusB?.resumeCount?.gate).toBe(1);
+  });
+
+  it("reads a run's own ledger bucket on the resume leg, not a sibling run's sharing the runId", async () => {
+    // #given — a provider recording (workflowId, leg) for every consult
+    const legs: Array<{ workflowId: string; leg: RunLeg }> = [];
+    const runtime = buildSharedRunIdPair((workflowId, leg) =>
+      legs.push({ workflowId, leg }),
+    );
+    await runtime.start('wfA', { runId: 'shared', inputData: {} });
+    await runtime.start('wfB', { runId: 'shared', inputData: {} });
+
+    // #given — wfB resumed once, bumping the 'gate' ordinal in wfB's bucket
+    await runtime.resume('wfB', 'shared', {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+
+    // #when — wfA's FIRST resume of its FIRST suspension; the leg fingerprint reads
+    // the ledger BEFORE this resume increments it
+    await runtime.resume('wfA', 'shared', {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+
+    // #then — wfA never resumed before, so its own bucket has no 'gate' entry: the
+    // leg's resumeCount is undefined. Keyed by runId alone (the bug) it read wfB's
+    // bucket and saw 1 — a first suspension masquerading as a re-suspension, which
+    // lets a re-suspension approval mint into a first leg.
+    const wfAResumeLeg = legs.find(
+      (e) => e.workflowId === 'wfA' && e.leg.kind === 'resume',
+    )?.leg as { resumeCount?: number } | undefined;
+    expect(wfAResumeLeg).toBeDefined();
+    expect(wfAResumeLeg?.resumeCount).toBeUndefined();
+  });
+
+  // A step that re-suspends on EVERY resume (never completes), so a run stays
+  // suspended at any depth and status() keeps projecting its accumulating
+  // ordinal — the deep-chain (3+ suspension) case the pair-binding relies on.
+  function buildSharedDeepChain(): RunnerRuntime {
+    const { createWorkflow, createStep, runtime } = init({
+      storage: new InMemoryStore(),
+    });
+    for (const id of ['wfA', 'wfB']) {
+      const gate = createStep({
+        id: 'gate',
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+        suspendSchema: z.object({ reason: z.string() }),
+        execute: async ({ resumeData, suspend }) =>
+          suspend({ reason: resumeData ? 'again' : 'first' }),
+      });
+      createWorkflow({
+        id,
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      })
+        .then(gate)
+        .commit();
+    }
+    return runtime;
+  }
+
+  it('accumulates per-workflow resume ordinals independently past depth 1 under a shared runId', async () => {
+    // #given — wfA and wfB both suspended under the SAME runId 'shared'
+    const runtime = buildSharedDeepChain();
+    await runtime.start('wfA', { runId: 'shared', inputData: {} });
+    await runtime.start('wfB', { runId: 'shared', inputData: {} });
+
+    // #when — wfA resumed once (ordinal 1), wfB resumed twice (ordinal 2); both
+    // re-suspend each time, so the ledger must ACCUMULATE, not reset to 1
+    await runtime.resume('wfA', 'shared', {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+    await runtime.resume('wfB', 'shared', {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+    await runtime.resume('wfB', 'shared', {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+
+    // #then — each workflow's ordinal is its OWN accumulated count: wfA=1, wfB=2.
+    // A fully shared bucket takes all 3 increments, so both reads see 3; a
+    // get-or-create keyed wrong freezes both at 1 (the deep-chain leak: a round-2
+    // approval minting into round 3).
+    const statusA = await runtime.status('wfA', 'shared');
+    const statusB = await runtime.status('wfB', 'shared');
+    expect(statusA?.resumeCount?.gate).toBe(1);
+    expect(statusB?.resumeCount?.gate).toBe(2);
+  });
+});
+
+describe('RunnerRuntime resume ledger durability (DO eviction)', () => {
+  // In-memory ledger state dies with the isolate on DO eviction/hibernation/
+  // redeploy, while ctx.storage (and D1 snapshots) survive. Pre-seam, a
+  // re-suspension resumed after an eviction read leg.resumeCount undefined
+  // against the approval's captured ordinal — mismatch — and the APPROVED
+  // action silently no-oped. These tests back the ledger with a fake
+  // ctx.storage and rebuild the runtime around it, exactly the eviction
+  // topology.
+  function fakeLedgerStorage(): ResumeLedgerStorage & {
+    keyCount(): number;
+  } {
+    const map = new Map<string, unknown>();
+    return {
+      async get<T>(key: string): Promise<T | undefined> {
+        return map.get(key) as T | undefined;
+      },
+      async put<T>(key: string, value: T): Promise<void> {
+        map.set(key, value);
+      },
+      async delete(key: string): Promise<boolean> {
+        return map.delete(key);
+      },
+      keyCount: () => map.size,
+    };
+  }
+
+  // gate completes on a payload resume and re-suspends on a falsy one; no
+  // resumeSchema so the falsy resume reaches execute (see the tripwire test
+  // above). Behavior is stateless, so a rebuilt runtime acts identically.
+  function buildDurable(
+    storage: InMemoryStore,
+    ledgerStorage: ResumeLedgerStorage,
+    onLeg?: (leg: RunLeg) => void,
+  ): RunnerRuntime {
+    const { createWorkflow, createStep, runtime } = init(
+      { storage },
+      {
+        resumeLedger: new DurableStorageResumeLedger(ledgerStorage),
+        ...(onLeg
+          ? {
+              requestContextForRun: (
+                _workflowId: string,
+                _runId: string,
+                leg: RunLeg,
+              ) => {
+                onLeg(leg);
+                return undefined;
+              },
+            }
+          : {}),
+      },
+    );
+    const gate = createStep({
+      id: 'gate',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      suspendSchema: z.object({ reason: z.string() }),
+      execute: async ({ resumeData, suspend }) =>
+        resumeData ? {} : suspend({ reason: 'wait' }),
+    });
+    createWorkflow({
+      id: 'durable-gate',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(gate)
+      .commit();
+    return runtime;
+  }
+
+  it('a re-suspension ordinal survives an eviction: the fresh runtime still sees resumeCount 1 on the resuming leg', async () => {
+    // #given — a run re-suspended once (ledger: gate -> 1) under runtime A
+    const storage = new InMemoryStore();
+    const ledgerStorage = fakeLedgerStorage();
+    const before = buildDurable(storage, ledgerStorage);
+    const started = await before.start('durable-gate', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+    expect(started.status).toBe('suspended');
+    const reSuspended = await before.resume('durable-gate', started.runId, {
+      step: 'gate',
+    });
+    expect(reSuspended.status).toBe('suspended');
+    expect(reSuspended.resumeCount?.gate).toBe(1);
+
+    // #when — "eviction": a fresh runtime shares only the Mastra storage and
+    // the ctx.storage-backed ledger (fresh in-memory maps), then resumes
+    const legs: RunLeg[] = [];
+    const after = buildDurable(storage, ledgerStorage, (leg) => legs.push(leg));
+    const done = await after.resume('durable-gate', started.runId, {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+
+    // #then — the resuming leg carries the persisted ordinal (pre-seam this
+    // was undefined, so an approval bound to resumeCount 1 was denied and the
+    // approved resume no-oped)
+    expect(done.status).toBe('success');
+    const resumeLeg = legs.find((leg) => leg.kind === 'resume') as
+      | { resumeCount?: number }
+      | undefined;
+    expect(resumeLeg).toBeDefined();
+    expect(resumeLeg?.resumeCount).toBe(1);
+  });
+
+  it('drops the persisted ledger entry once the run is terminal', async () => {
+    // #given — a run with one re-suspension recorded durably
+    const storage = new InMemoryStore();
+    const ledgerStorage = fakeLedgerStorage();
+    const runtime = buildDurable(storage, ledgerStorage);
+    const started = await runtime.start('durable-gate', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+    await runtime.resume('durable-gate', started.runId, { step: 'gate' });
+    expect(ledgerStorage.keyCount()).toBe(1);
+
+    // #when — the run completes
+    const done = await runtime.resume('durable-gate', started.runId, {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+
+    // #then — terminal status reaps the durable entry (no unbounded growth)
+    expect(done.status).toBe('success');
+    expect(ledgerStorage.keyCount()).toBe(0);
+  });
+
+  it('status() reads the ledger only for SUSPENDED runs, and a resume reads it exactly once', async () => {
+    // #given — a ctx.storage that counts billed get()s
+    const storage = new InMemoryStore();
+    const base = fakeLedgerStorage();
+    let gets = 0;
+    const counting: ResumeLedgerStorage = {
+      async get<T>(key: string): Promise<T | undefined> {
+        gets += 1;
+        return base.get<T>(key);
+      },
+      put: (key, value) => base.put(key, value),
+      delete: (key) => base.delete(key),
+    };
+    const runtime = buildDurable(storage, counting);
+    const started = await runtime.start('durable-gate', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+
+    // #when — one resume: the fingerprint read is the ONLY ledger get (the
+    // increment rides the prior counts the per-run lock guarantees unchanged)
+    const beforeResume = gets;
+    const done = await runtime.resume('durable-gate', started.runId, {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+    expect(done.status).toBe('success');
+    expect(gets).toBe(beforeResume + 1);
+
+    // #when — the SPA-style poll of the now-terminal run
+    const beforeStatus = gets;
+    const status = await runtime.status('durable-gate', started.runId);
+
+    // #then — no billed get for a projection that would discard it...
+    expect(status?.status).toBe('success');
+    expect(gets).toBe(beforeStatus);
+
+    // ...while a suspended run still projects the ordinal (one read)
+    const suspended = await runtime.start('durable-gate', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+    const beforeSuspendedStatus = gets;
+    const suspendedStatus = await runtime.status(
+      'durable-gate',
+      suspended.runId,
+    );
+    expect(suspendedStatus?.status).toBe('suspended');
+    expect(gets).toBe(beforeSuspendedStatus + 1);
+  });
+
+  it('projects status() resumeCount from the durable ledger across the rebuild', async () => {
+    // #given — a re-suspended run, then an eviction
+    const storage = new InMemoryStore();
+    const ledgerStorage = fakeLedgerStorage();
+    const before = buildDurable(storage, ledgerStorage);
+    const started = await before.start('durable-gate', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+    await before.resume('durable-gate', started.runId, { step: 'gate' });
+
+    // #when — a fresh runtime projects status
+    const after = buildDurable(storage, ledgerStorage);
+    const status = await after.status('durable-gate', started.runId);
+
+    // #then — the ordinal is read back from storage, not from isolate memory
+    expect(status?.status).toBe('suspended');
+    expect(status?.resumeCount?.gate).toBe(1);
+  });
+
+  it("stores counts as entry pairs, so a step keyed '__proto__' is counted, not swallowed", async () => {
+    // #given — Record-shaped storage would route a '__proto__' assignment to
+    // the prototype setter and silently lose the count; pairs have no
+    // reserved names
+    const ledger = new DurableStorageResumeLedger(fakeLedgerStorage());
+
+    // #when
+    await ledger.increment('wf:run', '__proto__');
+    const counts = await ledger.increment('wf:run', '__proto__');
+
+    // #then
+    expect(counts.get('__proto__')).toBe(2);
+    expect((await ledger.counts('wf:run'))?.get('__proto__')).toBe(2);
   });
 });

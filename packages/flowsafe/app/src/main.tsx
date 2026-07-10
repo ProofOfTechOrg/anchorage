@@ -1,27 +1,173 @@
-import { StrictMode } from 'react';
+import { ToastViewport } from '@astryxdesign/core/Toast';
+import { Theme } from '@astryxdesign/core/theme';
+import { y2kTheme } from '@astryxdesign/theme-y2k/built';
+import {
+  lazy,
+  type ReactElement,
+  StrictMode,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from 'react';
 import { createRoot } from 'react-dom/client';
 
-import { App } from '../../src/approval-ui/App.js';
-import { ApprovalApiClient } from '../../src/approval-ui/client.js';
 import { ApprovalUIProvider } from '../../src/approval-ui/components.js';
 import { astryxComponents } from './astryx-components.js';
+import { NarratingApprovalClient } from './narrating-approval-client.js';
+import {
+  DemoActorSwitcher,
+  type DemoTokenSet,
+  readDemoTokensFromHash,
+  useDemoSignIn,
+} from './demo-session.js';
+import { sessionReadyEvent } from './narration.js';
+import { RunClient } from './run-client.js';
+import { ShowcaseApp } from './showcase-app.js';
+import { OperatorIdentityChip, TokenGate } from './token-gate.js';
+import { useActivityFeed } from './use-activity-feed.js';
+import type { RunEntry } from './use-run-polling.js';
 import './index.css';
 
 const container = document.getElementById('root');
 if (!container) throw new Error('missing #root element');
 
-// fetch is omitted: ApprovalApiClient defaults to globalThis.fetch, which the
-// browser entry always has.
-const client = new ApprovalApiClient({
-  baseUrl: import.meta.env.VITE_APPROVAL_API_URL ?? '/api/approvals',
-});
+// Same-origin by default: the single-deploy worker serves the approval API and
+// the run surface on one origin. Overridable for a split deployment.
+const APPROVAL_BASE = import.meta.env.VITE_APPROVAL_API_URL ?? '/api/approvals';
+const RUN_BASE = import.meta.env.VITE_RUN_API_URL ?? '';
 
-// The library is style-agnostic; this app injects the Astryx adapter. Swap
-// astryxComponents for another adapter (or omit the provider for unstyled HTML).
+// Demo tokens exist ONLY in dev: the switcher module (the sole importer of
+// showcase/demo-actors.js) is reachable exclusively through this dead-branch
+// dynamic import, which the production build eliminates —
+// scripts/assert-clean-app-bundle.mjs proves the bundle is token-free. (The
+// PUBLIC demo's tokens are runtime values from the OAuth callback fragment,
+// never literals.)
+const DevActorSwitcher = import.meta.env.DEV
+  ? lazy(async () => ({
+      default: (await import('./dev-actor-switcher.js')).DevActorSwitcher,
+    }))
+  : null;
+
+// The showcase shell: hold the acting token + the launched runs at the root,
+// derive both API clients from the token (a new client instance re-triggers
+// the dashboard fetch and re-scopes the run polling), and hand the activity
+// feed's stable `record` down as the narration sink. Identity (id/role/tenant)
+// is never derived client-side — the server echoes it per request.
+function Root(): ReactElement {
+  const [actorToken, setActorToken] = useState<string | null>(null);
+  // The OAuth callback delivers a per-visitor sandbox token set in the URL
+  // fragment; read exactly once (the initializer also scrubs the hash).
+  const [demoSession, setDemoSession] = useState<DemoTokenSet | null>(
+    readDemoTokensFromHash,
+  );
+  const [runs, setRuns] = useState<readonly RunEntry[]>([]);
+  const demoSignInProvider = useDemoSignIn();
+  const feed = useActivityFeed();
+  const narrate = feed.record;
+
+  const authHeaders = useMemo(() => {
+    const headers: Record<string, string> = {};
+    if (actorToken !== null) headers.authorization = `Bearer ${actorToken}`;
+    return headers;
+  }, [actorToken]);
+  // narrate is the feed hook's stable useCallback — pinned here so identity
+  // churn can never rebuild the client and re-trigger the dashboard fetches.
+  const approvalClient = useMemo(
+    () =>
+      new NarratingApprovalClient({
+        baseUrl: APPROVAL_BASE,
+        headers: authHeaders,
+        narrate,
+      }),
+    [authHeaders, narrate],
+  );
+  const runClient = useMemo(
+    () => new RunClient({ baseUrl: RUN_BASE, headers: authHeaders }),
+    [authHeaders],
+  );
+
+  const addRun = useCallback((entry: RunEntry) => {
+    setRuns((current) => [entry, ...current]);
+  }, []);
+
+  const endDemoSession = useCallback(() => {
+    setDemoSession(null);
+    setActorToken(null);
+  }, []);
+
+  // Announce the sandbox once per tenant — the key dedups re-renders and the
+  // refreshed token sets that keep the same tenantId.
+  useEffect(() => {
+    if (!demoSession) return;
+    narrate([
+      sessionReadyEvent({
+        provider: demoSignInProvider ?? 'OAuth',
+        tenantId: demoSession.tenantId,
+        expiresAtMs: Date.parse(demoSession.tenantExpiresAt),
+      }),
+    ]);
+  }, [demoSession, demoSignInProvider, narrate]);
+
+  const identityControls = DevActorSwitcher ? (
+    <Suspense fallback={null}>
+      <DevActorSwitcher
+        actorToken={actorToken}
+        onSelect={setActorToken}
+        narrate={narrate}
+      />
+    </Suspense>
+  ) : demoSession ? (
+    <DemoActorSwitcher
+      session={demoSession}
+      actorToken={actorToken}
+      onSelect={setActorToken}
+      onSession={setDemoSession}
+      onExpired={endDemoSession}
+      narrate={narrate}
+    />
+  ) : actorToken !== null ? (
+    <OperatorIdentityChip onSignOut={() => setActorToken(null)} />
+  ) : null;
+
+  return (
+    <ApprovalUIProvider components={astryxComponents}>
+      {actorToken === null ? (
+        <>
+          {/* The switchers bootstrap the first token, so they must mount
+              even before sign-in; the token gate covers the rest. */}
+          {identityControls}
+          {!DevActorSwitcher && !demoSession ? (
+            <TokenGate
+              onSubmit={setActorToken}
+              demoSignInProvider={demoSignInProvider}
+            />
+          ) : null}
+        </>
+      ) : (
+        <ShowcaseApp
+          approvalClient={approvalClient}
+          runClient={runClient}
+          runs={runs}
+          onStarted={addRun}
+          feed={feed}
+          identityControls={identityControls}
+        />
+      )}
+    </ApprovalUIProvider>
+  );
+}
+
+// <Theme> stamps data-astryx-theme="y2k" on <html> — the theme.css rules are
+// @scope'd to that attribute and are inert without it. y2kTheme embeds its
+// icon registry, so mounting the provider also registers the icon set.
 createRoot(container).render(
   <StrictMode>
-    <ApprovalUIProvider components={astryxComponents}>
-      <App client={client} pollIntervalMs={5000} />
-    </ApprovalUIProvider>
+    <Theme theme={y2kTheme}>
+      <ToastViewport position="bottomEnd" maxVisible={3}>
+        <Root />
+      </ToastViewport>
+    </Theme>
   </StrictMode>,
 );

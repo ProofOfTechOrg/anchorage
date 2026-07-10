@@ -27,8 +27,12 @@ import type {
   WorkflowState,
 } from '@mastra/core/workflows';
 
-import { BREAKWATER_WORKFLOW_SCOPE_KEY } from './breakwater-keys.js';
-import { PATH_SAFE_ID_PATTERN } from './path-safe-id.js';
+import {
+  BREAKWATER_ISOLATION_SCOPE_KEY,
+  BREAKWATER_WORKFLOW_SCOPE_KEY,
+} from './breakwater-keys.js';
+import { PATH_SAFE_ID_PATTERN, tenantOfRunId } from './path-safe-id.js';
+import { InMemoryResumeLedger, type ResumeLedger } from './resume-ledger.js';
 
 export class UnknownWorkflowError extends Error {
   constructor(workflowId: string) {
@@ -111,6 +115,26 @@ export interface RunSummary {
    * bind the decision to this exact suspension (clock-free).
    */
   suspendedAt?: Record<string, number>;
+  /**
+   * Epoch-ms resume time per dot-joined suspended step key (core clock).
+   * INFORMATIONAL audit metadata only — NOT the grant-binding tie-breaker
+   * (that is `resumeCount`). Mastra stamps it only on a payload-bearing
+   * resume, so it is absent for a first suspension AND for any re-suspension
+   * reached via a falsy resume; do not use its presence to tell a first
+   * suspension from a re-suspension.
+   */
+  resumedAt?: Record<string, number>;
+  /**
+   * Runtime-owned monotonic per-step resume ordinal (dot-joined step key ->
+   * count). ABSENT for a step's first suspension (never resumed), `1` after
+   * the first resume, `2` after the second, and so on. This is the grant
+   * binding tie-breaker paired with `suspendedAt`: unlike `resumedAt` the
+   * runtime increments it on EVERY resume regardless of payload, so it is
+   * collision-free and cannot be erased by a same-ms suspendedAt collision or
+   * a no-payload resume. Approval bridges copy it into
+   * CreateApprovalInput.resumeCount.
+   */
+  resumeCount?: Record<string, number>;
   /** ISO 8601. Present on status() projections (read from the stored snapshot). */
   createdAt?: string;
   /** ISO 8601. Present on status() projections (read from the stored snapshot). */
@@ -156,7 +180,11 @@ function errorText(error: unknown): string {
   return String(error);
 }
 
-function summarize(runId: string, result: CoreRunResult): RunSummary {
+function summarize(
+  runId: string,
+  result: CoreRunResult,
+  counts?: ReadonlyMap<string, number>,
+): RunSummary {
   switch (result.status) {
     case 'success':
       return { runId, status: result.status, result: result.result };
@@ -173,11 +201,18 @@ function summarize(runId: string, result: CoreRunResult): RunSummary {
         suspended: result.suspended,
         suspendPayload: result.suspendPayload,
       };
-      const suspendedAt = suspendedAtByStep(
-        result.steps,
-        result.suspended.map((path) => path.join('.')),
+      const suspendedKeys = result.suspended.map((path) => path.join('.'));
+      const suspendedAt = byStep(suspendedKeys, (key) =>
+        suspendedAtOf(result.steps, key),
       );
       if (suspendedAt !== undefined) summary.suspendedAt = suspendedAt;
+      const resumedAt = byStep(suspendedKeys, (key) =>
+        resumedAtOf(result.steps, key),
+      );
+      if (resumedAt !== undefined) summary.resumedAt = resumedAt;
+      // resumeCount is runtime-owned (the ledger), NOT read from the snapshot.
+      const resumeCount = byStep(suspendedKeys, (key) => counts?.get(key));
+      if (resumeCount !== undefined) summary.resumeCount = resumeCount;
       return summary;
     }
     case 'tripwire':
@@ -210,46 +245,63 @@ function resolveResumeStep(
   return suspended.length === 1 ? suspended[0]?.split('.') : undefined;
 }
 
+// The live attempt for a step. Repeated steps (foreach) store an array of
+// attempts, so the current suspension/resume is the latest; a single-run step
+// stores one entry. Shared by the suspendedAt/resumedAt/suspendPayload readers.
+function latestAttempt(
+  steps: WorkflowState['steps'] | undefined,
+  stepKey: string,
+) {
+  const entry = steps?.[stepKey];
+  return Array.isArray(entry) ? entry[entry.length - 1] : entry;
+}
+
 /** Epoch-ms suspension time of the step's latest attempt, if recorded. */
 function suspendedAtOf(
-  steps: WorkflowState['steps'],
+  steps: WorkflowState['steps'] | undefined,
   stepKey: string,
 ): number | undefined {
-  const entry = steps?.[stepKey];
-  const latest = Array.isArray(entry) ? entry[entry.length - 1] : entry;
-  return latest?.suspendedAt;
+  return latestAttempt(steps, stepKey)?.suspendedAt;
 }
 
-/** RunSummary.suspendedAt: dot-joined step key -> epoch-ms suspension time. */
-function suspendedAtByStep(
+/**
+ * Epoch-ms resume time of the step's latest attempt, if recorded. Feeds the
+ * INFORMATIONAL RunSummary.resumedAt only — Mastra stamps it solely on a
+ * payload-bearing resume, so it is unreliable as a first-vs-re-suspension
+ * signal. The grant binding uses `resumeCount` (the runtime ledger) instead.
+ */
+function resumedAtOf(
   steps: WorkflowState['steps'] | undefined,
-  suspendedKeys: readonly string[],
-): Record<string, number> | undefined {
-  if (!steps) return undefined;
-  const map: Record<string, number> = {};
-  for (const key of suspendedKeys) {
-    const at = suspendedAtOf(steps, key);
-    if (at !== undefined) map[key] = at;
-  }
-  return Object.keys(map).length > 0 ? map : undefined;
+  stepKey: string,
+): number | undefined {
+  return latestAttempt(steps, stepKey)?.resumedAt;
 }
 
-function suspendPayloadByStep(
-  steps: WorkflowState['steps'],
-  suspendedKeys: string[],
-): Record<string, unknown> | undefined {
-  if (!steps) return undefined;
-  const payloads: Record<string, unknown> = {};
+/**
+ * One home for the per-step projection convention behind every RunSummary map
+ * (suspendedAt / resumedAt / resumeCount / suspendPayload): collect
+ * `stepKey -> value` over the suspended step keys, projecting an empty result
+ * as undefined so JSON summaries omit the field. The accumulator is
+ * null-prototype because step keys are author-chosen strings: on a plain
+ * object literal a step named '__proto__' would route into the
+ * Object.prototype setter and silently vanish (or, for an object-valued
+ * payload, rewire the accumulator's prototype) — the same hazard
+ * resume-ledger.ts stores [stepKey, count] pairs to avoid.
+ */
+function byStep<T>(
+  suspendedKeys: readonly string[],
+  lookup: (stepKey: string) => T | undefined,
+): Record<string, T> | undefined {
+  const map: Record<string, T> = Object.create(null);
+  let size = 0;
   for (const key of suspendedKeys) {
-    const entry = steps[key];
-    // Repeated steps (foreach) store an array; the live suspension is the
-    // latest attempt.
-    const latest = Array.isArray(entry) ? entry[entry.length - 1] : entry;
-    if (latest && latest.suspendPayload !== undefined) {
-      payloads[key] = latest.suspendPayload;
+    const value = lookup(key);
+    if (value !== undefined) {
+      map[key] = value;
+      size += 1;
     }
   }
-  return Object.keys(payloads).length > 0 ? payloads : undefined;
+  return size > 0 ? map : undefined;
 }
 
 // Projection of the persisted WorkflowState for status(). Unlike summarize()
@@ -261,7 +313,11 @@ function suspendPayloadByStep(
 // (isFromInMemory), steps are empty and timestamps are current-time; the
 // projection truthfully degrades to status-only rather than fabricating
 // detail.
-function summarizeState(runId: string, state: WorkflowState): RunSummary {
+function summarizeState(
+  runId: string,
+  state: WorkflowState,
+  counts?: ReadonlyMap<string, number>,
+): RunSummary {
   const summary: RunSummary = {
     runId,
     status: state.status,
@@ -275,12 +331,23 @@ function summarizeState(runId: string, state: WorkflowState): RunSummary {
   } else if (state.status === 'suspended') {
     const suspendedKeys = Object.keys(state.suspendedPaths ?? {});
     summary.suspended = suspendedKeys.map((key) => key.split('.'));
-    const suspendPayload = suspendPayloadByStep(state.steps, suspendedKeys);
+    const suspendPayload = byStep(
+      suspendedKeys,
+      (key) => latestAttempt(state.steps, key)?.suspendPayload,
+    );
     if (suspendPayload !== undefined) {
       summary.suspendPayload = suspendPayload;
     }
-    const suspendedAt = suspendedAtByStep(state.steps, suspendedKeys);
+    const suspendedAt = byStep(suspendedKeys, (key) =>
+      suspendedAtOf(state.steps, key),
+    );
     if (suspendedAt !== undefined) summary.suspendedAt = suspendedAt;
+    const resumedAt = byStep(suspendedKeys, (key) =>
+      resumedAtOf(state.steps, key),
+    );
+    if (resumedAt !== undefined) summary.resumedAt = resumedAt;
+    const resumeCount = byStep(suspendedKeys, (key) => counts?.get(key));
+    if (resumeCount !== undefined) summary.resumeCount = resumeCount;
   }
   return summary;
 }
@@ -295,11 +362,22 @@ function summarizeState(runId: string, state: WorkflowState): RunSummary {
  * providers bind capabilities to the specific suspension they were granted
  * for — an approval decided before this suspension began belongs to an
  * earlier incarnation of the gate and must not mint again (see flowsafe's
- * approvalGrantProvider).
+ * approvalGrantProvider). `resumeCount` pairs with `suspendedAt` — the
+ * runtime-owned monotonic resume ordinal (undefined on a step's first
+ * suspension, `1,2,…` on successive re-suspensions) — so a provider can tell
+ * two same-step suspensions apart even when their `suspendedAt` stamps collide
+ * within a millisecond. It replaces the payload-conditional `resumedAt` as the
+ * tie-breaker: the runtime increments it on every resume, so no-payload
+ * resumes cannot erase the first-vs-re-suspension distinction.
  */
 export type RunLeg =
   | { kind: 'start' }
-  | { kind: 'resume'; step?: string[]; suspendedAt?: number };
+  | {
+      kind: 'resume';
+      step?: string[];
+      suspendedAt?: number;
+      resumeCount?: number;
+    };
 
 /**
  * Server-side requestContext source, consulted on EVERY start and resume.
@@ -332,10 +410,25 @@ export interface RunnerRuntimeOptions {
   logger?: IMastraLogger | false;
   /** Consulted on every start/resume — see RequestContextProvider. */
   requestContextForRun?: RequestContextProvider;
+  /**
+   * Per-run resume ledger backing RunSummary.resumeCount / RunLeg.resumeCount.
+   * Default: in-memory. The DO shell adopts a ctx.storage-backed ledger via
+   * adoptDefaultResumeLedger() so the ordinal survives eviction — an explicit
+   * ledger here wins over that adoption.
+   */
+  resumeLedger?: ResumeLedger;
 }
 
 export interface StartRunOptions {
-  runId?: string;
+  /**
+   * REQUIRED — the runtime never generates a runId (INV-1). Multi-tenant
+   * hosts mint `${tenantId}_${uuid}` server-side (createRunRouter) so the
+   * runId carries its tenant everywhere it becomes a key (D1 snapshot row,
+   * DO name, R2 segment, grant-list predicate). A generation fallback here
+   * would let any caller that forgets to mint create a bare, tenant-less
+   * run — unreachable by tenant purge and un-ownable by every actor.
+   */
+  runId: string;
   inputData?: unknown;
 }
 
@@ -351,12 +444,51 @@ export class RunnerRuntime {
   readonly #requestContextForRun?: RequestContextProvider;
   readonly #workflows = new Map<string, AnyWorkflow>();
   readonly #runLocks = new Map<string, Promise<unknown>>();
+  // Per-run resume ledger: #runKey(workflowId, runId) -> (stepKey -> times that
+  // step has been resumed). Keyed by the run's FULL identity, never runId alone
+  // (see #runKey): a shared caller runId under two workflows are distinct runs.
+  // The runtime increments it on every resume (regardless of
+  // payload) and projects it as RunSummary.resumeCount / RunLeg.resumeCount —
+  // the collision-free grant-binding tie-breaker that Mastra's
+  // payload-conditional resumedAt cannot provide.
+  //
+  // Durability: a lost ledger is fail-closed for grants (leg.resumeCount
+  // undefined vs an approval's captured ordinal -> mismatch -> deny, see
+  // grants.ts) — never a leak, but an AVAILABILITY bug: the approved action
+  // silently no-ops. DO eviction (~70-140s idle), hibernation, and code
+  // deploys all wipe in-memory state while ctx.storage survives, so the DO
+  // shell adopts a DurableStorageResumeLedger (durable-object.ts); the
+  // in-memory default covers node tests and non-DO hosts. Entries are
+  // deleted on terminal status below; a resumed-then-abandoned suspended run
+  // keeps one small entry until the run is purged.
+  #resumeLedger: ResumeLedger;
+  readonly #resumeLedgerExplicit: boolean;
   #mastra?: Mastra;
 
   constructor(options: RunnerRuntimeOptions) {
     this.#storage = options.storage;
     this.#logger = options.logger ?? false;
     this.#requestContextForRun = options.requestContextForRun;
+    this.#resumeLedgerExplicit = options.resumeLedger !== undefined;
+    this.#resumeLedger = options.resumeLedger ?? new InMemoryResumeLedger();
+  }
+
+  /**
+   * Host-shell seam: replace the DEFAULT in-memory ledger with a durable one.
+   * The DO shell calls this with a ctx.storage-backed ledger right after
+   * build(), so every DO host gets eviction-proof ordinals without threading
+   * a parameter (a forgettable thread is how the durability guarantee rots).
+   * A ledger explicitly injected via options wins; adoption is rejected once
+   * runs may have consulted the ledger.
+   */
+  adoptDefaultResumeLedger(ledger: ResumeLedger): void {
+    if (this.#mastra) {
+      throw new Error(
+        'RunnerRuntime: adopt the resume ledger before the first run — ordinals already read from the default ledger would be lost',
+      );
+    }
+    if (this.#resumeLedgerExplicit) return;
+    this.#resumeLedger = ledger;
   }
 
   register(workflow: AnyWorkflow): void {
@@ -382,7 +514,7 @@ export class RunnerRuntime {
 
   async start(
     workflowId: string,
-    options: StartRunOptions = {},
+    options: StartRunOptions,
   ): Promise<RunSummary> {
     const workflow = this.#getWorkflow(workflowId);
     // Reject non-path-safe ids at the mint boundary so the runId is unambiguous
@@ -393,29 +525,23 @@ export class RunnerRuntime {
     // (durable-object.ts readJson), and RegExp.test() coerces its argument to a
     // String — so a numeric runId like 123 would pass the pattern as "123" yet
     // mint a run keyed by the number 123, unreachable by the string "123" the
-    // URL path later carries. Only a *supplied* non-string is a client error:
-    // `!= null` lets an explicit JSON null fall through to generation exactly
-    // like an omitted runId (JSON has no undefined, so null means "none
-    // supplied"), matching the `?? crypto.randomUUID()` below.
+    // URL path later carries. There is NO generation fallback (INV-1): a
+    // missing/null runId is a client error, not a request for one.
     if (
-      options.runId != null &&
-      (typeof options.runId !== 'string' ||
-        !PATH_SAFE_ID_PATTERN.test(options.runId))
+      typeof options.runId !== 'string' ||
+      !PATH_SAFE_ID_PATTERN.test(options.runId)
     ) {
       throw new InvalidRunRequestError(
-        "runId must be URL-path-safe (letters, digits, '.', '_', '~', '-'; 1–200 chars)",
+        "runId is required and must be URL-path-safe (letters, digits, '.', '_', '~', '-'; 1–200 chars)",
       );
     }
-    // Generating the runId here (not in core) lets the lock cover createRun.
-    const runId = options.runId ?? crypto.randomUUID();
+    const runId = options.runId;
     return this.#withRunLock(workflowId, runId, async () => {
-      if (options.runId) {
-        // Caller-supplied ids can collide with an existing run; starting it
-        // again would re-execute already-executed steps.
-        const existing = await workflow.getWorkflowRunById(runId);
-        if (existing) {
-          throw new RunAlreadyExistsError(workflowId, runId, existing.status);
-        }
+      // Supplied ids can collide with an existing run; starting it
+      // again would re-execute already-executed steps.
+      const existing = await workflow.getWorkflowRunById(runId);
+      if (existing) {
+        throw new RunAlreadyExistsError(workflowId, runId, existing.status);
       }
       // Resolve the leg's context BEFORE createRun: createRun persists the
       // initial snapshot, so a provider failure after it would strand a
@@ -450,6 +576,7 @@ export class RunnerRuntime {
   ): Promise<RunSummary> {
     const workflow = this.#getWorkflow(workflowId);
     return this.#withRunLock(workflowId, runId, async () => {
+      const runKey = this.#runKey(workflowId, runId);
       const state = await workflow.getWorkflowRunById(runId);
       if (!state) throw new UnknownRunError(workflowId, runId);
       if (state.status !== 'suspended') {
@@ -459,12 +586,21 @@ export class RunnerRuntime {
       // createRun only reattaches (no snapshot write), but failing before it
       // still does the least work and keeps the ordering invariant uniform.
       const step = resolveResumeStep(options.step, state);
+      const stepKey = step?.join('.');
+      // resumeCount is read BEFORE this resume increments it: it is the count
+      // of prior resumes = the ordinal of the CURRENT suspension being resumed
+      // (undefined for a first suspension), which the minting approval captured
+      // at that suspension. suspendedAt still comes from the snapshot.
+      const priorCounts = await this.#resumeLedger.counts(runKey);
       const requestContext = await this.#requestContextFor(workflowId, runId, {
         kind: 'resume',
         step,
-        suspendedAt: step
-          ? suspendedAtOf(state.steps, step.join('.'))
-          : undefined,
+        suspendedAt:
+          stepKey !== undefined
+            ? suspendedAtOf(state.steps, stepKey)
+            : undefined,
+        resumeCount:
+          stepKey !== undefined ? priorCounts?.get(stepKey) : undefined,
       });
       const run = await workflow.createRun({ runId });
       let result: CoreRunResult;
@@ -475,16 +611,46 @@ export class RunnerRuntime {
           requestContext,
         });
       } catch (error) {
+        // The run stayed suspended (resume threw) — do NOT increment; the
+        // prior count must persist for a later retry of this same suspension.
         throw asClientError(error) ?? error;
       }
-      return summarize(run.runId, result);
+      // Record THIS resume AFTER the leg fingerprint read above and BEFORE
+      // summarize: a re-suspension produced by this resume must capture the
+      // incremented ordinal so its approval binds to the new suspension.
+      // priorCounts rides along so a durable ledger need not re-read what the
+      // per-run FIFO lock guarantees unchanged since the read above.
+      let counts = priorCounts;
+      if (stepKey !== undefined) {
+        counts = await this.#resumeLedger.increment(
+          runKey,
+          stepKey,
+          priorCounts ?? new Map(),
+        );
+      }
+      const summary = summarize(run.runId, result, counts);
+      // Terminal run: drop the ledger (no further suspension can occur).
+      if (summary.status !== 'suspended') {
+        await this.#resumeLedger.delete(runKey);
+      }
+      return summary;
     });
   }
 
   async status(workflowId: string, runId: string): Promise<RunSummary | null> {
     const workflow = this.#getWorkflow(workflowId);
     const state = await workflow.getWorkflowRunById(runId);
-    return state ? summarizeState(runId, state) : null;
+    if (!state) return null;
+    // Ledger read only for SUSPENDED runs — the one branch that projects
+    // resumeCount (defense in depth: a bridge that ever mints off status()
+    // must not see a stale/absent ordinal). Every other status would discard
+    // the result, and under the DO shell each read is a billed
+    // ctx.storage.get the SPA's polling would pay on every terminal run.
+    const counts =
+      state.status === 'suspended'
+        ? await this.#resumeLedger.counts(this.#runKey(workflowId, runId))
+        : undefined;
+    return summarizeState(runId, state, counts);
   }
 
   // A provider crash propagates (fail loud): silently starting the leg with
@@ -504,6 +670,30 @@ export class RunnerRuntime {
     const base: Record<string, unknown> = {
       [BREAKWATER_WORKFLOW_SCOPE_KEY]: workflowId,
     };
+    // Tenant-salted runs (INV-1: `${tenantId}_${uuid}`) also mint the OPAQUE
+    // isolation scope, segmenting breakwater's connector idempotency and
+    // rate-limit keys per tenant. Server-authoritative like the workflow
+    // scope above — the runId was minted from the AUTHENTICATED tenant, so
+    // its prefix is trustworthy here.
+    //
+    // Structural, not flagged: a runId shaped `<inv3-slug>_<rest>` mints a
+    // scope. For this repo's hosts that is exactly the tenant (they all mint
+    // via TenantContext.newRunId). CONSTRAINT for standalone OSS consumers
+    // minting their own runIds: the scope segments breakwater's CROSS-RUN
+    // idempotency and rate-limit keys, so one logical account must keep ONE
+    // stable pre-`_` prefix (or avoid `_`-prefixed runIds entirely) — ids
+    // like `daily_<uuid>` vs `weekly_<uuid>` would split that account's key
+    // namespace per prefix, and a cross-run business key ("invoice-2026-07")
+    // would fire once per prefix instead of once. Never a cross-tenant leak
+    // (splitting only narrows sharing), but a real duplication hazard.
+    // Non-matching runIds mint nothing: the single-tenant keys stay
+    // byte-identical, and deployments that must never run scope-less enforce
+    // that with breakwater's tenantIsolation evaluator (which binds dry-run
+    // too, unlike the idempotency path).
+    const tenantId = tenantOfRunId(runId);
+    if (tenantId !== undefined) {
+      base[BREAKWATER_ISOLATION_SCOPE_KEY] = tenantId;
+    }
     const values = this.#requestContextForRun
       ? await this.#requestContextForRun(workflowId, runId, leg)
       : undefined;
@@ -526,23 +716,30 @@ export class RunnerRuntime {
     });
   }
 
+  // The run's full identity as a single map key: workflowId + runId, never runId
+  // alone. The same caller-supplied runId under two workflows are DISTINCT
+  // persisted runs (Mastra snapshots key on workflowName+runId) and must never
+  // share a per-run entry — the FIFO lock OR the resume ledger. Composing the key
+  // in ONE place keeps every per-run map keyed identically, so a future per-run
+  // map cannot reintroduce a runId-only key (the grant leak the ledger guards).
+  // This is the exact string the DO name join produces
+  // (idFromName(`${workflowId}:${runId}`)); PATH_SAFE_ID_PATTERN excludes ':'
+  // from both ids, so the join is unambiguous.
+  #runKey(workflowId: string, runId: string): string {
+    return `${workflowId}:${runId}`;
+  }
+
   // FIFO per-run lock: callers for the same run execute strictly in arrival
   // order; distinct runs do not contend. The map entry is removed when the last
-  // waiter settles, so idle runs hold no memory.
-  //
-  // Keyed by the run's full identity (workflowId + runId), not runId alone: the
-  // same caller-supplied runId under two workflows are distinct persisted runs
-  // and must not share a lock. This uses the exact string the DO name join
-  // produces (idFromName(`${workflowId}:${runId}`)), so the in-process lock
-  // granularity matches the cross-instance routing granularity — and adds no
-  // ambiguity PATH_SAFE_ID_PATTERN (which excludes ':' from both ids) does
-  // not already exclude.
+  // waiter settles, so idle runs hold no memory. Keyed by the run's full identity
+  // via #runKey (workflowId + runId), not runId alone — the in-process lock
+  // granularity thus matches the cross-instance DO routing granularity.
   async #withRunLock<T>(
     workflowId: string,
     runId: string,
     fn: () => Promise<T>,
   ): Promise<T> {
-    const key = `${workflowId}:${runId}`;
+    const key = this.#runKey(workflowId, runId);
     const prev = this.#runLocks.get(key) ?? Promise.resolve();
     const task = prev.then(fn);
     const tail = task.then(

@@ -1,4 +1,5 @@
-// The breakwater <-> flowsafe wire contract, mirrored by value.
+// The breakwater <-> flowsafe wire contract (mirrored by value), plus the
+// flowsafe host role policy derived from it (RUN_START_ROLES).
 //
 // flowsafe deliberately does NOT import @proofoftech/breakwater at runtime:
 // the packages compose over documented requestContext keys
@@ -36,10 +37,34 @@ export const APPROVAL_ROLES: readonly ApprovalRole[] = [
   'viewer',
 ];
 
-/** The acting principal, same shape as breakwater's Actor. */
+/**
+ * Roles permitted to START a run at the HTTP route — the coarse start-role gate
+ * every host applies to POST /runs, before any per-workflow allowedRoles check.
+ * A strict subset of APPROVAL_ROLES; reviewer/viewer are review-only. A
+ * host-level concept (breakwater has no equivalent), so there is no cross-package
+ * mirror to keep.
+ */
+export const RUN_START_ROLES: readonly ApprovalRole[] = [
+  'admin',
+  'operator',
+  'builder',
+];
+
+/**
+ * The acting principal — breakwater's Actor shape plus the platform's tenant
+ * dimension. breakwater stays tenant-agnostic (it is a standalone library);
+ * flowsafe is the multi-tenant host, so ITS actor carries the tenant. The
+ * e2e mirror tripwire pins "breakwater's Actor fields + tenantId".
+ *
+ * `tenantId` crosses an authentication boundary (bearer map or JWT claims):
+ * every verifier must validate it against TENANT_ID_PATTERN (INV-3,
+ * do-runner/path-safe-id.ts) before constructing an ApprovalActor — the type
+ * says `string`, but the type system has no authority over a decoded token.
+ */
 export interface ApprovalActor {
   id: string;
   role: ApprovalRole;
+  tenantId: string;
 }
 
 /**

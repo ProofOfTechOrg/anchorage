@@ -19,6 +19,7 @@ function record(overrides: Partial<ApprovalRecord> = {}): ApprovalRecord {
   const at = new Date(1700000000000 + seq * 1000).toISOString();
   return {
     id: `apr-${seq}`,
+    tenantId: 'acme',
     workflowId: 'wf',
     runId: `run-${seq}`,
     title: `approval ${seq}`,

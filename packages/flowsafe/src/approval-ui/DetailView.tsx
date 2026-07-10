@@ -6,6 +6,7 @@ import type {
   ApprovalRecord,
 } from '../approval-api/types.js';
 import { useApprovalUIComponents } from './components.js';
+import { APPROVAL_TIPS } from './tips.js';
 import { formatSlaCountdown } from './view-model.js';
 
 export interface DetailViewProps {
@@ -45,19 +46,35 @@ export function DetailView({
             {record.stepPath ? ` @ ${record.stepPath.join('.')}` : null}
           </C.MetadataItem>
           <C.MetadataItem label="Status">
-            {record.status}
+            <C.InfoTip
+              label={record.status}
+              tip={APPROVAL_TIPS.status[record.status]}
+            />
             {record.claimedBy ? ` (claimed by ${record.claimedBy})` : null}
           </C.MetadataItem>
-          <C.MetadataItem label="Priority">{record.priority}</C.MetadataItem>
+          <C.MetadataItem label="Priority">
+            <C.InfoTip label={record.priority} tip={APPROVAL_TIPS.priority} />
+          </C.MetadataItem>
           <C.MetadataItem label="SLA">
-            {formatSlaCountdown(record, nowMs)}
+            <C.InfoTip
+              label={formatSlaCountdown(record, nowMs)}
+              tip={APPROVAL_TIPS.sla}
+            />
           </C.MetadataItem>
           <C.MetadataItem label="Grants on approve">
-            {record.connectors.length > 0 ? record.connectors.join(', ') : '—'}
+            <C.InfoTip
+              label={
+                record.connectors.length > 0
+                  ? record.connectors.join(', ')
+                  : '—'
+              }
+              tip={APPROVAL_TIPS.grantsOnApprove}
+            />
           </C.MetadataItem>
           {record.decision ? (
             <C.MetadataItem label="Decision">
-              {record.decision} by {record.decidedBy}
+              <C.InfoTip label={record.decision} tip={APPROVAL_TIPS.decision} />{' '}
+              by {record.decidedBy}
               {record.comment ? ` — ${record.comment}` : null}
             </C.MetadataItem>
           ) : null}
@@ -116,6 +133,17 @@ export function DetailView({
                 onClick={submitDelegate}
               />
             </C.Stack>
+            <C.Text>
+              <C.InfoTip
+                label="What does claiming do?"
+                tip={APPROVAL_TIPS.claim}
+              />
+              {' · '}
+              <C.InfoTip
+                label="What does delegating do?"
+                tip={APPROVAL_TIPS.delegate}
+              />
+            </C.Text>
           </C.Stack>
         ) : null}
       </C.Stack>

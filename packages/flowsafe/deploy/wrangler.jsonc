@@ -19,9 +19,13 @@
       "database_id": "REPLACE-WITH-YOUR-D1-DATABASE-ID"
     }
   ],
-  // Every firing runs the SLA sweep + retention purge (worker.ts scheduled()).
-  // Keep the interval >= your SLA granularity.
-  "triggers": { "crons": ["*/15 * * * *"] },
+  // TWO cron expressions, dispatched on controller.cron (worker.ts
+  // scheduled()): the SLA sweep and the retention purge never share an
+  // invocation — a CPU-limit termination is not catchable, so a slow sweep
+  // sharing one would permanently starve the purge. Keep these equal to
+  // worker.ts's SWEEP_CRON / PURGE_CRON; keep the sweep interval >= your SLA
+  // granularity.
+  "triggers": { "crons": ["*/15 * * * *", "7 * * * *"] },
   // Optional audit export to a SIEM: `wrangler queues create anchorage-audit`
   // (and anchorage-audit-dlq), uncomment, then set SIEM_ENDPOINT (var below)
   // and SIEM_AUTH_HEADER (secret). Without this block, audit events stay on
@@ -39,11 +43,24 @@
   "vars": {
     "APPROVAL_SLA_SECONDS": "14400",
     "RUN_RETENTION_DAYS": "30"
+    // Client-per-subdomain deployments: set the apex and every request to
+    // <tenant>.<apex> is denied unless the token's VERIFIED tenant is that
+    // tenant. Defense in depth over the tenant-bound stores (INV-2) — it
+    // closes the confused-deputy UX where a user pastes tenant A's token into
+    // tenant B's branded host. Hosts outside the apex and the reserved
+    // never-allocatable subdomains (app/www/api/docs/admin/status, plus
+    // system/default) skip the check.
+    // "TENANT_APEX_DOMAIN": "example.com"
     // "SIEM_ENDPOINT": "https://siem.example/services/collector"
   }
   // Secrets (set with `wrangler secret put <name>`):
-  //   APPROVAL_ACTOR_TOKENS — JSON map of bearer token -> { id, role };
-  //     roles: admin | builder | operator | reviewer | viewer.
+  //   APPROVAL_ACTOR_TOKENS — JSON map of bearer token ->
+  //     { id, role, tenantId }; roles: admin | builder | operator | reviewer |
+  //     viewer; tenantId must match ^[a-z0-9]{3,32}$ (INV-3) and must not be
+  //     'system' (the maintenance actor's audit identity) or the entry is
+  //     dropped and its token 401s. Provision each tenantId through the
+  //     `tenants` registry (provisionTenant) BEFORE issuing its tokens
+  //     (single-tenant hosts: see README "Hosting a single tenant").
   //   SIEM_AUTH_HEADER — sent as the `authorization` header on audit export,
   //     e.g. "Splunk <hec-token>".
 }

@@ -162,6 +162,45 @@ export function crossWorkflowIsolation(
   };
 }
 
+/**
+ * requestContext key: the caller's OPAQUE isolation scope (a multi-tenant
+ * host mints its tenant id here). breakwater never parses the value — it
+ * segments the connector SDK's idempotency and rate-limit keys and feeds the
+ * tenantIsolation evaluator. Minted by the trusted runtime on every leg,
+ * mirroring WORKFLOW_SCOPE_CONTEXT_KEY — trust boundary 6 applies: never
+ * populate it from client input, model output, or tool results.
+ */
+export const ISOLATION_SCOPE_CONTEXT_KEY = 'breakwater.isolationScope';
+
+/**
+ * Deny any call whose requestContext carries NO isolation scope. Deployments
+ * that segment budgets/replay caches by tenant include this in their policy
+ * set, turning "the scope is absent" from silently-shared-keys into a denial.
+ * It runs in the PRE-EXECUTE gates loop — which matters because the dry-run
+ * branch returns before the idempotency and rate-limit machinery, and a
+ * constraint that must bind simulations cannot live on those paths. The
+ * single-tenant OSS default simply omits this evaluator: absent scope then
+ * preserves unsegmented keys exactly.
+ */
+export function tenantIsolation(
+  options: { name?: string } = {},
+): ToolPolicyEvaluator {
+  return {
+    name: options.name ?? 'tenant-isolation',
+    evaluate(call): PolicyDecision {
+      const scope = call.requestContext?.get(ISOLATION_SCOPE_CONTEXT_KEY);
+      if (typeof scope !== 'string' || scope.length === 0) {
+        return {
+          allowed: false,
+          reason:
+            'caller carries no isolation scope; this deployment requires tenant-scoped connector calls',
+        };
+      }
+      return { allowed: true };
+    },
+  };
+}
+
 /** Org-level approval policy for write-class connector calls. */
 export interface WritePermissionsPolicy {
   /**

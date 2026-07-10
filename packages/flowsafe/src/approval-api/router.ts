@@ -6,15 +6,23 @@
 // authenticate option maps a Request to the acting principal and is part of
 // the trusted computing base (it asserts identity; the service enforces
 // roles). No actor -> 401 before any service call.
+//
+// The create route is OFF by default (allowCreate) and, when mounted, cannot
+// author capability: it rejects every TCB_ONLY_CREATE_FIELDS member and
+// force-attributes the request to the authenticated actor. Approval records
+// that carry grants are minted in-process from an observed suspension, never
+// from a request body.
 
-import type { ApprovalActor } from './contract.js';
 import {
   ApprovalAuthzError,
   ApprovalConflictError,
-  type ApprovalService,
   InvalidApprovalInputError,
   UnknownApprovalError,
 } from './service.js';
+import {
+  TenantResolutionError,
+  type TenantResolver,
+} from './tenant-context.js';
 import {
   APPROVAL_STATUSES,
   type ApprovalDecision,
@@ -23,17 +31,73 @@ import {
   type CreateApprovalInput,
 } from './types.js';
 
+/**
+ * Fields on CreateApprovalInput that select CAPABILITY or ATTRIBUTION, and so
+ * belong to the trusted computing base alone (security-threat-model.md, trust
+ * boundary 6). A request body that names any of them is rejected outright:
+ *
+ * - `connectors` IS the minted grant — an approved record's connectors become
+ *   the requestContext grant the write gate checks.
+ * - `runScoped` turns a step-less record into a standing grant on every leg.
+ * - `stepPath`, `suspendedAt`, `resumedAt`, `resumeCount` select WHICH leg a
+ *   grant mints on. A step-keyed body with no `suspendedAt` would fall into
+ *   grants.ts's legacy decidedAt-after fallback and mint, so rejecting
+ *   `connectors` alone is insufficient — reject the whole set.
+ * - `requestedBy` is the field decide()'s separation-of-duties check compares
+ *   against; spoofing it lets one principal approve their own request.
+ */
+export const TCB_ONLY_CREATE_FIELDS = [
+  'connectors',
+  'stepPath',
+  'suspendedAt',
+  'resumedAt',
+  'resumeCount',
+  'runScoped',
+  'requestedBy',
+] as const;
+
+/**
+ * The complement: what a request body MAY set. The create route copies ONLY
+ * these fields off the body — an allowlist, so a field added to
+ * CreateApprovalInput later is INERT over HTTP until it is deliberately
+ * classified here (fail closed by construction; a body spread would instead
+ * hand every future field to service.create unless someone remembered to
+ * extend the denylist above). TCB_ONLY_CREATE_FIELDS stays as the
+ * 400-with-a-reason layer; router.test.ts pins at the type level that the two
+ * lists exactly cover CreateApprovalInput.
+ */
+export const CLIENT_CREATE_FIELDS = [
+  'workflowId',
+  'runId',
+  'title',
+  'summary',
+  'payload',
+  'priority',
+  'slaSeconds',
+] as const satisfies readonly Exclude<
+  keyof CreateApprovalInput,
+  (typeof TCB_ONLY_CREATE_FIELDS)[number]
+>[];
+
 export interface ApprovalRouterOptions {
-  service: ApprovalService;
   /**
-   * Maps the request to the acting principal (session, JWT, API key —
-   * deployment-specific). Returning undefined yields 401.
+   * Authenticates the request and binds the tenant-scoped service (INV-2).
+   * The router's first line is `resolve(request)`; the store the service
+   * wraps is constructed AFTER authentication, bound to the actor's tenant —
+   * there is no pre-auth service to leak through. undefined yields 401.
    */
-  authenticate: (
-    request: Request,
-  ) => ApprovalActor | undefined | Promise<ApprovalActor | undefined>;
+  resolve: TenantResolver;
   /** Route prefix. Default: '/api/approvals'. */
   basePath?: string;
+  /**
+   * Mount `POST <basePath>` (create). Default false — every first-party host
+   * creates records in-process from an observed suspension (host-kit's
+   * approval bridge), so the HTTP route is an inert "file a request"
+   * affordance at best. When enabled it force-sets `requestedBy` to the
+   * authenticated actor and 400s on any TCB_ONLY_CREATE_FIELDS member, so it
+   * can never author capability.
+   */
+  allowCreate?: boolean;
 }
 
 export type ApprovalRouter = (request: Request) => Promise<Response | null>;
@@ -48,6 +112,12 @@ function json(payload: unknown, status = 200): Response {
 function errorResponse(error: unknown): Response {
   if (error instanceof InvalidApprovalInputError) {
     return json({ error: error.message }, 400);
+  }
+  if (error instanceof TenantResolutionError) {
+    // An authenticated actor with a malformed tenant claim is a verifier
+    // bug, not a client 4xx it can fix — but it must not become a 500 that
+    // reads as "try again". Forbidden, with the reason in the body.
+    return json({ error: 'forbidden' }, 403);
   }
   if (error instanceof ApprovalAuthzError) {
     return json({ error: error.message }, 403);
@@ -106,8 +176,9 @@ function parseListFilter(url: URL): ApprovalListFilter {
 export function createApprovalRouter(
   options: ApprovalRouterOptions,
 ): ApprovalRouter {
-  const { service, authenticate } = options;
+  const { resolve } = options;
   const basePath = options.basePath ?? '/api/approvals';
+  const allowCreate = options.allowCreate ?? false;
 
   return async (request: Request): Promise<Response | null> => {
     const url = new URL(request.url);
@@ -120,8 +191,10 @@ export function createApprovalRouter(
       .filter(Boolean);
 
     try {
-      const actor = await authenticate(request);
-      if (!actor) return json({ error: 'authentication required' }, 401);
+      const tenant = await resolve(request);
+      if (!tenant) return json({ error: 'authentication required' }, 401);
+      const actor = tenant.actor;
+      const service = tenant.service();
 
       if (request.method === 'GET') {
         if (segments.length === 0) {
@@ -137,20 +210,34 @@ export function createApprovalRouter(
 
       if (request.method === 'POST') {
         if (segments.length === 0) {
+          if (!allowCreate) return json({ error: 'not found' }, 404);
           const body = await readJsonObject(request);
+          for (const field of TCB_ONLY_CREATE_FIELDS) {
+            if (field in body) {
+              throw new InvalidApprovalInputError(
+                `${field} may not be set over HTTP`,
+              );
+            }
+          }
+          // Attribution is the authenticated identity, never the body:
+          // service.create still honours input.requestedBy for the
+          // in-process bridge (which legitimately attributes the human who
+          // advanced the run), so the tightening lives here at the HTTP
+          // boundary alone.
+          const input: Record<string, unknown> = { requestedBy: actor.id };
+          for (const field of CLIENT_CREATE_FIELDS) {
+            if (field in body) input[field] = body[field];
+          }
           const { record, created } = await service.create(
-            body as unknown as CreateApprovalInput,
+            input as unknown as CreateApprovalInput,
             actor,
           );
           return json(record, created ? 201 : 200);
         }
-        if (
-          segments.length === 2 &&
-          segments[0] === 'sla' &&
-          segments[1] === 'sweep'
-        ) {
-          return json({ escalated: await service.sweepSLA(actor) });
-        }
+        // NOTE: there is deliberately NO /sla/sweep route. The sweep is an
+        // unfiltered cross-tenant read+write; it lives in the cron-owned
+        // sweepSLA() function over a SystemApprovalStore, unreachable from
+        // request scope by type.
         const [id, action] = segments;
         if (segments.length === 2 && id && action === 'claim') {
           return json(await service.claim(id, actor));

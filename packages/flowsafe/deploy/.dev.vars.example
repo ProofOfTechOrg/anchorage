@@ -2,4 +2,4 @@
 #   cp .dev.vars.example .dev.vars
 # These sample tokens are for local workerd only — mint real random tokens
 # for production via `wrangler secret put APPROVAL_ACTOR_TOKENS`.
-APPROVAL_ACTOR_TOKENS={"dev-operator":{"id":"op","role":"operator"},"dev-reviewer":{"id":"ray","role":"reviewer"},"dev-viewer":{"id":"vic","role":"viewer"}}
+APPROVAL_ACTOR_TOKENS={"dev-operator":{"id":"op","role":"operator","tenantId":"devtenant"},"dev-reviewer":{"id":"ray","role":"reviewer","tenantId":"devtenant"},"dev-viewer":{"id":"vic","role":"viewer","tenantId":"devtenant"}}

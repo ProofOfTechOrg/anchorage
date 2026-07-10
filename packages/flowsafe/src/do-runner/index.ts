@@ -3,15 +3,34 @@
 // createWorkflow/createStep (import-swap); DurableObjectRunner hosts
 // execution; D1 holds run snapshots so suspend/resume survives restarts.
 
-export { createD1Storage, purgeExpiredWorkflowRuns } from './d1-storage.js';
+export {
+  createD1Storage,
+  d1Changes,
+  ensureSnapshotRunIdIndex,
+  purgeExpiredWorkflowRuns,
+  purgeTenant,
+} from './d1-storage.js';
 export type {
   D1StorageOptions,
   PurgeExpiredRunsOptions,
+  PurgeTenantOptions,
+  PurgeTenantResult,
   SnapshotDatabase,
   SnapshotStatement,
+  TenantArtifactPurger,
 } from './d1-storage.js';
 export { DurableObjectRunner } from './durable-object.js';
+export {
+  PATH_SAFE_ID_PATTERN,
+  TENANT_ID_PATTERN,
+  tenantOfRunId,
+} from './path-safe-id.js';
 export { init } from './init.js';
+export {
+  DurableStorageResumeLedger,
+  InMemoryResumeLedger,
+} from './resume-ledger.js';
+export type { ResumeLedger, ResumeLedgerStorage } from './resume-ledger.js';
 export type {
   DORunnerEnv,
   InitOptions,

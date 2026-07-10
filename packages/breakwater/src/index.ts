@@ -15,9 +15,11 @@ export {
   crossWorkflowIsolation,
   denyPatterns,
   extractMessageText,
+  ISOLATION_SCOPE_CONTEXT_KEY,
   maxTextLength,
   networkEgress,
   PolicyEngine,
+  tenantIsolation,
   WORKFLOW_SCOPE_CONTEXT_KEY,
 } from './policy-engine/index.js';
 export type {
@@ -57,6 +59,7 @@ export {
   ConnectorPolicyError,
   createConnector,
   D1IdempotencyStore,
+  D1RateLimitStore,
   DRY_RUN_CONTEXT_KEY,
   IDEMPOTENCY_KEY_CONTEXT_KEY,
   InMemoryIdempotencyStore,
@@ -67,12 +70,15 @@ export type {
   ConnectorConfig,
   ConnectorPolicies,
   D1IdempotencyStoreOptions,
+  D1RateLimitStoreOptions,
   IdempotencyDatabase,
   IdempotencyRecord,
   IdempotencyReservation,
   IdempotencyStatement,
   IdempotencyStore,
   PermissionManifest,
+  RateLimitDatabase,
+  RateLimitStatement,
   RateLimitStore,
 } from './connector-sdk/index.js';
 export {

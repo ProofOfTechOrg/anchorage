@@ -21,9 +21,17 @@ credit unless you prefer otherwise.
 Especially interesting: anything that bypasses an enforcement path —
 connector approval grants, network-egress gating, RBAC, policy-engine
 output gating, idempotency/rate-limit accounting, approval-queue
-authorization, or the fail-closed behavior of forged resumes. The threat
-model, trust boundaries, and audit schema live in
-[`docs/security-threat-model.md`](docs/security-threat-model.md).
+authorization, or the fail-closed behavior of forged resumes.
+
+**Tenant isolation is the highest-value target.** Any path that lets one
+tenant read, write, enumerate, resume, or purge another tenant's runs,
+approvals, grants, artifacts, connector replay cache, or rate-limit budget is
+critical — including a run-id that reaches a store without its tenant prefix,
+an approval query that loses its `tenant_id` predicate, or a cross-tenant
+store escaping the cron path into a request handler. The three invariants and
+their residuals are stated in
+[`docs/security-threat-model.md`](docs/security-threat-model.md) (trust
+boundary 7), along with the trust boundaries and audit schema.
 
 Out of scope: vulnerabilities in Mastra itself (report upstream at
 [mastra-ai/mastra](https://github.com/mastra-ai/mastra)), and issues

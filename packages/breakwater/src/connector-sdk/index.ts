@@ -32,6 +32,7 @@ import type { Tool, ToolExecutionContext } from '@mastra/core/tools';
 import {
   approvalRequired,
   EGRESS_HOSTNAME_PATTERN,
+  ISOLATION_SCOPE_CONTEXT_KEY,
   networkEgress,
 } from '../policy-engine/tool-policy.js';
 import type {
@@ -204,7 +205,10 @@ export class InMemoryIdempotencyStore implements AtomicIdempotencyStore {
 
 /**
  * Fixed-window rate-limit counters keyed by connector id. Implementations
- * back the manifest's `rateLimit` budget.
+ * back the manifest's `rateLimit` budget. The store's reach IS the budget's
+ * reach: InMemoryRateLimitStore caps per isolate (per RUN under DO-per-run
+ * routing); a declared cap that must hold across isolates needs
+ * D1RateLimitStore (or an equivalent shared store).
  */
 export interface RateLimitStore {
   /**
@@ -336,6 +340,18 @@ function approvalGranted(
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+// The caller's opaque isolation scope (multi-tenant hosts mint their tenant
+// id; see ISOLATION_SCOPE_CONTEXT_KEY). Used as a KEY SEGMENT only — never
+// parsed. Absent (or non-string) scope preserves the single-tenant keys
+// exactly; deployments that must not run scope-less include the
+// tenantIsolation evaluator in their policy set.
+function isolationScopeOf(
+  requestContext: RequestContext | undefined,
+): string | undefined {
+  const scope = requestContext?.get(ISOLATION_SCOPE_CONTEXT_KEY);
+  return typeof scope === 'string' && scope.length > 0 ? scope : undefined;
 }
 
 const RATE_LIMIT_PATTERN = /^(\d+)\/(s|sec|second|m|min|minute|h|hour|d|day)$/;
@@ -528,10 +544,18 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     requestContext: RequestContext | undefined,
   ): Promise<void> {
     if (!rateLimit) return;
+    // Budget key segments by isolation scope: tenant A exhausting connector
+    // `c` must not throttle tenant B. No scope => the connector id alone,
+    // today's single-tenant key. The key only NAMES the budget — how far it
+    // is shared is the store's reach: an in-memory store bounds the window
+    // to this isolate (under DO-per-run routing, to this RUN), so a cap that
+    // must hold across isolates needs a durable store (D1RateLimitStore).
+    const scope = isolationScopeOf(requestContext);
+    const budgetKey = scope === undefined ? id : `${scope}:${id}`;
     let count: number;
     try {
       count = await rateLimit.store.increment(
-        id,
+        budgetKey,
         rateLimit.windowMs,
         Date.now(),
       );
@@ -719,7 +743,16 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
           `manifest requires an idempotency key; set requestContext '${IDEMPOTENCY_KEY_CONTEXT_KEY}'`,
         );
       }
-      const scoped = `${id}:${key}`;
+      // Replay-cache key segments by isolation scope: metamind's canonical
+      // key is CROSS-RUN business identity ("never email this lead twice"),
+      // which two tenants can legitimately share — without the scope segment
+      // tenant B's send would replay tenant A's cached result object
+      // (confidentiality AND availability). No scope => today's key.
+      const isolationScope = isolationScopeOf(requestContext);
+      const scoped =
+        isolationScope === undefined
+          ? `${id}:${key}`
+          : `${isolationScope}:${id}:${key}`;
       if (isAtomicStore(store)) {
         return keyedFlow(requestContext, scoped, key, async () => {
           // Atomic claim — exactly one isolate wins a key.
@@ -879,11 +912,17 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   return tool;
 }
 
-// Durable D1-backed idempotency store (kept in its own module; only type
-// imports flow back into this one, so there is no runtime cycle).
+// Durable D1-backed stores (kept in their own modules; only type imports
+// flow back into this one, so there is no runtime cycle).
 export { D1IdempotencyStore } from './d1-idempotency-store.js';
 export type {
   D1IdempotencyStoreOptions,
   IdempotencyDatabase,
   IdempotencyStatement,
 } from './d1-idempotency-store.js';
+export { D1RateLimitStore } from './d1-rate-limit-store.js';
+export type {
+  D1RateLimitStoreOptions,
+  RateLimitDatabase,
+  RateLimitStatement,
+} from './d1-rate-limit-store.js';

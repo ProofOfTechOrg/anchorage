@@ -15,30 +15,55 @@ import { InMemoryStore } from '@mastra/core/storage';
 import type { ToolExecutionContext } from '@mastra/core/tools';
 import {
   ACTOR_CONTEXT_KEY,
+  type Actor,
   APPROVED_CONNECTORS_CONTEXT_KEY,
   AuditLogger,
   createConnector,
+  ISOLATION_SCOPE_CONTEXT_KEY,
   ROLES,
   WORKFLOW_SCOPE_CONTEXT_KEY,
 } from '@proofoftech/breakwater';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
+import { BREAKWATER_ISOLATION_SCOPE_KEY } from '../do-runner/breakwater-keys.js';
 import { init } from '../do-runner/init.js';
-import type { RunnerRuntime, RunSummary } from '../do-runner/runtime.js';
+import type {
+  RunLeg,
+  RunnerRuntime,
+  RunSummary,
+} from '../do-runner/runtime.js';
 import type { ApprovalActor, ApprovalAuditSink } from './contract.js';
 import {
   APPROVAL_ROLES,
   BREAKWATER_ACTOR_KEY,
   BREAKWATER_APPROVED_CONNECTORS_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
+  RUN_START_ROLES,
 } from './contract.js';
-import { approvalGrantProvider, resumeViaRuntime } from './grants.js';
+import {
+  approvalGrantProvider,
+  approvedConnectorsForLeg,
+  resumeViaRuntime,
+} from './grants.js';
+import { createApprovalRouter } from './router.js';
+import { createTenantResolver } from './tenant-context.js';
 import { ApprovalService } from './service.js';
 import { InMemoryApprovalStore } from './store.js';
 
-const OPERATOR: ApprovalActor = { id: 'opal', role: 'operator' };
-const REVIEWER: ApprovalActor = { id: 'ray', role: 'reviewer' };
+const OPERATOR: ApprovalActor = {
+  id: 'opal',
+  role: 'operator',
+  tenantId: 'acme',
+};
+const REVIEWER: ApprovalActor = {
+  id: 'ray',
+  role: 'reviewer',
+  tenantId: 'acme',
+};
+// admin holds BOTH CAN_CREATE and CAN_REVIEW — the single principal the
+// create-route capability chain needed.
+const ADMIN: ApprovalActor = { id: 'ada', role: 'admin', tenantId: 'acme' };
 
 // LEGACY-fallback timing nudge: a step-keyed record created WITHOUT
 // suspendedAt mints only when decidedAt lands STRICTLY after the
@@ -61,6 +86,34 @@ function suspendedAtFor(summary: unknown, stepPath: readonly string[]): number {
   return at;
 }
 
+// The bridge's resumedAt capture (INFORMATIONAL). No throw: a step's FIRST
+// suspension legitimately carries no resumedAt (undefined), and Mastra also
+// omits it on a no-payload re-suspension — which is exactly why resumedAt is
+// NOT the binding signal.
+function resumedAtFor(
+  summary: unknown,
+  stepPath: readonly string[],
+): number | undefined {
+  const at = (summary as RunSummary | undefined)?.resumedAt?.[
+    stepPath.join('.')
+  ];
+  return typeof at === 'number' ? at : undefined;
+}
+
+// The bridge's resumeCount capture — the grant-binding tie-breaker. Undefined
+// for a step's FIRST suspension, 1,2,… on re-suspensions; unlike resumedAt the
+// runtime sets it on every resume, so it is present even for a no-payload
+// re-suspension.
+function resumeCountFor(
+  summary: unknown,
+  stepPath: readonly string[],
+): number | undefined {
+  const count = (summary as RunSummary | undefined)?.resumeCount?.[
+    stepPath.join('.')
+  ];
+  return typeof count === 'number' ? count : undefined;
+}
+
 describe('breakwater contract tripwires', () => {
   it('mirrors the approved-connectors key literally', () => {
     expect(BREAKWATER_APPROVED_CONNECTORS_KEY).toBe(
@@ -76,8 +129,37 @@ describe('breakwater contract tripwires', () => {
     expect(BREAKWATER_WORKFLOW_SCOPE_KEY).toBe(WORKFLOW_SCOPE_CONTEXT_KEY);
   });
 
+  it('mirrors the isolation-scope key literally', () => {
+    expect(BREAKWATER_ISOLATION_SCOPE_KEY).toBe(ISOLATION_SCOPE_CONTEXT_KEY);
+  });
+
   it('mirrors the role set', () => {
     expect([...APPROVAL_ROLES]).toEqual([...ROLES]);
+  });
+
+  it('mirrors breakwater Actor PLUS the platform tenant dimension', () => {
+    // breakwater stays tenant-agnostic; flowsafe is the multi-tenant host.
+    // The relationship is "breakwater's fields + a REQUIRED tenantId":
+    // ApprovalActor must stay assignable to Actor (audit adapters and the
+    // actor context key depend on the structural widening) while a
+    // tenant-less literal must not compile on flowsafe's side.
+    const flowsafeActor: ApprovalActor = {
+      id: 'x',
+      role: 'admin',
+      tenantId: 'acme',
+    };
+    const widened: Actor = flowsafeActor;
+    expect(widened).toMatchObject({ id: 'x', role: 'admin' });
+    // @ts-expect-error tenantId is required on ApprovalActor — dropping it must not compile
+    const tenantless: ApprovalActor = { id: 'x', role: 'admin' };
+    void tenantless;
+  });
+
+  it('pins RUN_START_ROLES to the start-capable subset', () => {
+    // The coarse start-role gate: the three start-capable roles, excluding the
+    // review-only roles (reviewer/viewer). A host-level concept that mirrors no
+    // breakwater constant, so the exact membership is pinned here.
+    expect([...RUN_START_ROLES]).toEqual(['admin', 'operator', 'builder']);
   });
 
   it('adapts approval audit events onto AuditLogger.record', () => {
@@ -119,7 +201,7 @@ interface Harness {
 }
 
 function buildHarness(): Harness {
-  const store = new InMemoryApprovalStore();
+  const store = new InMemoryApprovalStore('acme');
   const connectorAudit = new AuditLogger();
   let publishes = 0;
 
@@ -265,6 +347,60 @@ function buildHarness(): Harness {
     .then(makeUse('relaunch-use'))
     .commit();
 
+  // relaunch-falsy: a gate with NO resumeSchema, so a no-payload resume is not
+  // schema-rejected and reaches execute, where it re-suspends. This is the
+  // configuration that exposes the bug the resumeCount binding closes — the
+  // re-suspension carries no resumedAt (Mastra stamps it only on a payload
+  // resume), so the old (suspendedAt, resumedAt) pair could not tell it from
+  // the first suspension.
+  const gateFalsy = createStep({
+    id: 'gateFalsy',
+    inputSchema: z.object({ topic: z.string() }),
+    outputSchema: z.object({ topic: z.string() }),
+    suspendSchema: z.object({ reason: z.string() }),
+    execute: async ({ inputData, resumeData, suspend }) => {
+      if (!resumeData) return suspend({ reason: 'gateFalsy awaits approval' });
+      return { topic: inputData.topic };
+    },
+  });
+  createWorkflow({
+    id: 'relaunch-falsy',
+    inputSchema: z.object({ topic: z.string() }),
+    outputSchema: z.object({ topic: z.string() }),
+  })
+    .then(gateFalsy)
+    .then(makeUse('falsy-use'))
+    .commit();
+
+  // relaunch-hole2: a schema-less gate that re-suspends on BOTH a truthy resume
+  // (round 2) and a falsy resume (round 1). This reproduces the deterministic
+  // depth-3 "truthy -> falsy" residual: Mastra stamps resumedAt on the truthy
+  // resume (susp #2) and PRESERVES that same value across the falsy resume
+  // (susp #3), so #2 and #3 share resumedAt — the old binding could not tell
+  // them apart. resumeCount (1 vs 2) still can. gate completes on the 2nd
+  // truthy resume.
+  let hole2Rounds = 0;
+  const gate2xNoSchema = createStep({
+    id: 'gate2xNoSchema',
+    inputSchema: z.object({ topic: z.string() }),
+    outputSchema: z.object({ topic: z.string() }),
+    suspendSchema: z.object({ reason: z.string() }),
+    execute: async ({ inputData, resumeData, suspend }) => {
+      if (!resumeData) return suspend({ reason: 'hole2 round 1' });
+      hole2Rounds += 1;
+      if (hole2Rounds < 2) return suspend({ reason: 'hole2 round 2' });
+      return { topic: inputData.topic };
+    },
+  });
+  createWorkflow({
+    id: 'relaunch-hole2',
+    inputSchema: z.object({ topic: z.string() }),
+    outputSchema: z.object({ topic: z.string() }),
+  })
+    .then(gate2xNoSchema)
+    .then(makeUse('hole2-use'))
+    .commit();
+
   const service = new ApprovalService({
     store,
     resumeRun: resumeViaRuntime(runtime),
@@ -279,11 +415,235 @@ function buildHarness(): Harness {
   };
 }
 
+// Regression suite for the create-route capability chain. Before the fix, one
+// admin (holding both CAN_CREATE and CAN_REVIEW) could POST a body carrying
+// `connectors` + a spoofed `requestedBy`, approve it themselves (the
+// separation-of-duties check compared the spoofed field), and — because a
+// step-less record was implicitly a run-scoped standing grant — mint an
+// arbitrary connector capability on EVERY leg of an arbitrary run, with no
+// second party. Three independent barriers now stand in that chain's way, and
+// each is asserted below.
+describe('fail closed: the HTTP create route cannot mint a run-scoped standing grant', () => {
+  const CAPABILITY_BODY = {
+    workflowId: 'launch',
+    runId: 'acme_run-poc',
+    title: 'innocuous-looking request',
+    connectors: ['release-deploy'],
+    requestedBy: 'nobody',
+  };
+
+  function post(body: unknown): Request {
+    return new Request('http://queue.test/api/approvals', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  }
+
+  function routerOver(
+    store: InMemoryApprovalStore,
+    options: { allowCreate?: boolean; actor?: ApprovalActor } = {},
+  ) {
+    const service = new ApprovalService({ store });
+    const handle = createApprovalRouter({
+      resolve: createTenantResolver({
+        authenticate: () => options.actor ?? ADMIN,
+        storeFactory: { forTenant: () => store },
+        buildService: () => service,
+      }),
+      allowCreate: options.allowCreate,
+    });
+    return { service, handle };
+  }
+
+  it('barrier 1: the route is off by default, so nothing is written', async () => {
+    // #given
+    const store = new InMemoryApprovalStore('acme');
+    const { handle } = routerOver(store);
+
+    // #when — PoC step 1
+    const response = await handle(post(CAPABILITY_BODY));
+
+    // #then
+    expect(response?.status).toBe(404);
+    expect(await store.list()).toEqual([]);
+  });
+
+  it('barrier 1: a deliberately mounted route still rejects every capability-bearing field', async () => {
+    // #given — the host opted in to the "file a request" affordance
+    const store = new InMemoryApprovalStore('acme');
+    const { handle } = routerOver(store, { allowCreate: true });
+
+    // #when / #then — connectors IS the grant; stepPath + the binding pair
+    // select the leg it mints on (a step-keyed record with no suspendedAt
+    // would ride the legacy decidedAt-after fallback); requestedBy is what SoD
+    // compares. Rejecting connectors alone would be insufficient.
+    for (const field of [
+      'connectors',
+      'stepPath',
+      'suspendedAt',
+      'resumedAt',
+      'resumeCount',
+      'runScoped',
+      'requestedBy',
+    ]) {
+      const response = await handle(
+        post({
+          workflowId: 'launch',
+          runId: 'acme_run-poc',
+          title: 'x',
+          [field]: 'anything',
+        }),
+      );
+      expect(response?.status).toBe(400);
+    }
+    expect(await store.list()).toEqual([]);
+  });
+
+  it('barrier 2: forced self-attribution makes the filer unable to decide their own request', async () => {
+    // #given — the route force-sets requestedBy = the authenticated actor, so
+    // the spoof that disarmed separation of duties is gone
+    const store = new InMemoryApprovalStore('acme');
+    const { service, handle } = routerOver(store, { allowCreate: true });
+    const created = await handle(
+      post({ workflowId: 'launch', runId: 'acme_run-poc', title: 'inert' }),
+    );
+    expect(created?.status).toBe(201);
+    const record = (await created?.json()) as { id: string };
+
+    // #when / #then — PoC step 2: the same admin decides. SoD now fires.
+    await expect(
+      service.decide(record.id, { decision: 'approve' }, ADMIN),
+    ).rejects.toThrow(/cannot decide their own approval/);
+  });
+
+  it('barrier 3: an APPROVED step-less record with connectors mints NOTHING without runScoped', async () => {
+    // #given — the last barrier, isolated. Inject the record straight into the
+    // store (the HTTP route cannot author `connectors` at all, so driving this
+    // through the router would assert an empty union against an empty list and
+    // pass even with the runScoped gate reverted). This is the exact record
+    // shape the PoC produced: approved, step-less, capability-bearing.
+    const store = new InMemoryApprovalStore('acme');
+    const decidedAt = new Date().toISOString();
+    await store.create({
+      id: crypto.randomUUID(),
+      tenantId: 'acme',
+      workflowId: 'launch',
+      runId: 'acme_run-poc',
+      title: 'standing grant by omission',
+      connectors: ['release-deploy'],
+      priority: 'normal',
+      status: 'approved',
+      createdAt: decidedAt,
+      updatedAt: decidedAt,
+      decidedAt,
+      // stepPath omitted, runScoped omitted — the inverted default.
+    });
+
+    // #when / #then — PoC step 3: inert on every leg shape
+    const legs: RunLeg[] = [
+      { kind: 'start' },
+      { kind: 'resume', step: ['approval'], suspendedAt: 1 },
+      { kind: 'resume' },
+    ];
+    for (const leg of legs) {
+      expect(
+        await approvedConnectorsForLeg(store, 'launch', 'acme_run-poc', leg),
+      ).toEqual([]);
+    }
+  });
+
+  it('barrier 3, other direction: the same record WITH runScoped does mint (the gate is load-bearing)', async () => {
+    // #given — identical to the record above but with the explicit opt-in. If
+    // this did not mint, the test above would pass for the wrong reason.
+    const store = new InMemoryApprovalStore('acme');
+    const decidedAt = new Date().toISOString();
+    await store.create({
+      id: crypto.randomUUID(),
+      tenantId: 'acme',
+      workflowId: 'launch',
+      runId: 'acme_run-ok',
+      title: 'deliberate standing grant',
+      connectors: ['release-deploy'],
+      priority: 'normal',
+      status: 'approved',
+      createdAt: decidedAt,
+      updatedAt: decidedAt,
+      decidedAt,
+      runScoped: true,
+    });
+
+    // #when / #then
+    expect(
+      await approvedConnectorsForLeg(store, 'launch', 'acme_run-ok', {
+        kind: 'start',
+      }),
+    ).toEqual(['release-deploy']);
+  });
+
+  it('barrier 3: an APPROVED http-authored record carries no capability to mint', async () => {
+    // #given — a second party (the reviewer) approves the inert HTTP record
+    const store = new InMemoryApprovalStore('acme');
+    const { service, handle } = routerOver(store, { allowCreate: true });
+    const created = await handle(
+      post({ workflowId: 'launch', runId: 'acme_run-poc', title: 'inert' }),
+    );
+    const record = (await created?.json()) as { id: string };
+    const decided = await service.decide(
+      record.id,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then — approved, yet there is nothing in it for a grant to derive from
+    expect(decided.record.status).toBe('approved');
+    expect(decided.record.connectors).toEqual([]);
+    expect(decided.record.runScoped).toBeUndefined();
+    expect(decided.record.stepPath).toBeUndefined();
+  });
+
+  it('contrast: the intended in-process bridge path still mints on its own leg', async () => {
+    // #given — a step-keyed record created by TRUSTED in-process code, bound to
+    // the leg's exact suspension. The fix tightens the HTTP boundary only.
+    const store = new InMemoryApprovalStore('acme');
+    const service = new ApprovalService({ store });
+    const suspendedAt = Date.parse('2026-07-09T00:00:00.000Z');
+    const { record } = await service.create(
+      {
+        workflowId: 'launch',
+        runId: 'acme_run-ok',
+        stepPath: ['approval'],
+        suspendedAt,
+        title: 'Approve launch',
+        connectors: ['release-deploy'],
+        requestedBy: 'starter',
+      },
+      OPERATOR,
+    );
+    await service.decide(record.id, { decision: 'approve' }, REVIEWER);
+
+    // #when / #then — mints on its bound leg, and nowhere else
+    expect(
+      await approvedConnectorsForLeg(store, 'launch', 'acme_run-ok', {
+        kind: 'resume',
+        step: ['approval'],
+        suspendedAt,
+      }),
+    ).toEqual(['release-deploy']);
+    expect(
+      await approvedConnectorsForLeg(store, 'launch', 'acme_run-ok', {
+        kind: 'start',
+      }),
+    ).toEqual([]);
+  });
+});
+
 describe('approval queue end to end', () => {
   it('fails closed: a resume that bypasses decide() finds no grant and the connector denies', async () => {
     // #given — a suspended run, nothing approved in the store
     const harness = buildHarness();
     const started = await harness.runtime.start('launch', {
+      runId: `acme_${crypto.randomUUID()}`,
       inputData: { topic: 'ship-it' },
     });
     expect(started.status).toBe('suspended');
@@ -312,6 +672,7 @@ describe('approval queue end to end', () => {
     // decidedAt-after-suspension fallback (hence the settleClock below).
     const harness = buildHarness();
     const started = await harness.runtime.start('launch', {
+      runId: `acme_${crypto.randomUUID()}`,
       inputData: { topic: 'ship-it' },
     });
     expect(started.status).toBe('suspended');
@@ -355,6 +716,7 @@ describe('approval queue end to end', () => {
     // #given
     const harness = buildHarness();
     const started = await harness.runtime.start('launch', {
+      runId: `acme_${crypto.randomUUID()}`,
       inputData: { topic: 'hold-it' },
     });
     const { record } = await harness.service.create(
@@ -389,6 +751,7 @@ describe('approval queue end to end', () => {
     // suspended at gateB, whose own approval is still pending
     const harness = buildHarness();
     const started = await harness.runtime.start('double-launch', {
+      runId: `acme_${crypto.randomUUID()}`,
       inputData: { topic: 'twice-gated' },
     });
     expect(started.suspended).toEqual([['gateA']]);
@@ -398,6 +761,7 @@ describe('approval queue end to end', () => {
         runId: started.runId,
         stepPath: ['gateA'],
         suspendedAt: suspendedAtFor(started, ['gateA']),
+        resumedAt: resumedAtFor(started, ['gateA']),
         title: 'Gate A',
         connectors: ['blog-publisher'],
       },
@@ -432,6 +796,7 @@ describe('approval queue end to end', () => {
     // #given
     const harness = buildHarness();
     const started = await harness.runtime.start('double-launch', {
+      runId: `acme_${crypto.randomUUID()}`,
       inputData: { topic: 'twice-approved' },
     });
     const { record: recordA } = await harness.service.create(
@@ -440,6 +805,7 @@ describe('approval queue end to end', () => {
         runId: started.runId,
         stepPath: ['gateA'],
         suspendedAt: suspendedAtFor(started, ['gateA']),
+        resumedAt: resumedAtFor(started, ['gateA']),
         title: 'Gate A',
         connectors: ['blog-publisher'],
       },
@@ -463,6 +829,7 @@ describe('approval queue end to end', () => {
         runId: started.runId,
         stepPath: ['gateB'],
         suspendedAt: suspendedAtFor(afterA.resume.summary, ['gateB']),
+        resumedAt: resumedAtFor(afterA.resume.summary, ['gateB']),
         title: 'Gate B',
         connectors: ['blog-publisher'],
       },
@@ -485,15 +852,23 @@ describe('approval queue end to end', () => {
     // (or even created — the window before a bridge reacts)
     const harness = buildHarness();
     const started = await harness.runtime.start('relaunch', {
+      runId: `acme_${crypto.randomUUID()}`,
       inputData: { topic: 'respun' },
     });
     expect(started.suspended).toEqual([['gate2x']]);
+    // Tripwire for the pair-binding: a FIRST suspension carries no resumeCount.
+    // The forged re-suspension below WILL carry one (the runtime increments it
+    // on the intervening resume), and that categorical undefined-vs-defined gap
+    // is what denies deterministically — even if the two suspensions'
+    // suspendedAt stamps collide within a millisecond.
+    expect(resumeCountFor(started, ['gate2x'])).toBeUndefined();
     const { record: first } = await harness.service.create(
       {
         workflowId: 'relaunch',
         runId: started.runId,
         stepPath: ['gate2x'],
         suspendedAt: suspendedAtFor(started, ['gate2x']),
+        resumeCount: resumeCountFor(started, ['gate2x']),
         title: 'Gate 2x — round 1',
         connectors: ['blog-publisher'],
       },
@@ -516,19 +891,165 @@ describe('approval queue end to end', () => {
       resumeData: { approved: true },
     });
 
-    // #then — the round-1 approval is BOUND to suspension #1 by exact
-    // timestamp match, so it never mints into suspension #2 — clock-free:
-    // no reliance on decidedAt ordering relative to the re-suspension
-    // (previously this fail-closed path needed settleClock choreography)
+    // #then — round-1's approval captured resumeCount=undefined (a first
+    // suspension); suspension #2's leg carries resumeCount=1, so the
+    // (suspendedAt, resumeCount) pair cannot match and the approval never mints
+    // into #2 — deterministically, with no reliance on the suspendedAt stamps
+    // differing (they can collide in-process) or on decidedAt ordering (without
+    // the pair binding, this fail-closed path relied on settleClock ordering).
     expect(forged.status).toBe('failed');
     expect(forged.error).toContain('approval required and not granted');
     expect(harness.publishes()).toBe(0);
+  });
+
+  it('a spent approval does not mint into a NO-PAYLOAD re-suspension (falsy-resume regression)', async () => {
+    // The reported leak: Mastra stamps resumedAt only on a payload-bearing
+    // resume, so a re-suspension reached via a falsy resume left the old
+    // (suspendedAt, resumedAt) binding unable to tell it from a first
+    // suspension. Pin Date.now so both suspensions share suspendedAt — the
+    // in-process same-ms collision the leak needs (Mastra stamps suspendedAt
+    // from Date.now; the service clock uses new Date(), unaffected).
+    const fixed = Date.parse('2026-07-08T00:00:00.000Z');
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(fixed);
+    try {
+      const harness = buildHarness();
+      const started = await harness.runtime.start('relaunch-falsy', {
+        runId: `acme_${crypto.randomUUID()}`,
+        inputData: { topic: 'respun-falsy' },
+      });
+      // #given — suspended at the schema-less gate (first suspension:
+      // resumeCount undefined), with an approval bound to THAT suspension.
+      expect(started.suspended).toEqual([['gateFalsy']]);
+      expect(resumeCountFor(started, ['gateFalsy'])).toBeUndefined();
+      const decidedAt = new Date().toISOString();
+      await harness.store.create({
+        id: crypto.randomUUID(),
+        tenantId: 'acme',
+        workflowId: 'relaunch-falsy',
+        runId: started.runId,
+        stepPath: ['gateFalsy'],
+        title: 'Gate — round 1',
+        connectors: ['blog-publisher'],
+        priority: 'normal',
+        status: 'approved',
+        createdAt: decidedAt,
+        updatedAt: decidedAt,
+        decidedAt,
+        suspendedAt: suspendedAtFor(started, ['gateFalsy']),
+        // resumeCount omitted → undefined: bound to the FIRST suspension.
+      });
+
+      // #when — a NO-PAYLOAD resume re-suspends the SAME step. Mastra leaves
+      // resumedAt undefined; the runtime still increments resumeCount to 1.
+      const reSuspended = await harness.runtime.resume(
+        'relaunch-falsy',
+        started.runId,
+        { step: 'gateFalsy' },
+      );
+      expect(reSuspended.suspended).toEqual([['gateFalsy']]);
+      expect(resumedAtFor(reSuspended, ['gateFalsy'])).toBeUndefined();
+      expect(resumeCountFor(reSuspended, ['gateFalsy'])).toBe(1);
+
+      // A truthy resume of the re-suspension drives the gate through to the
+      // write-gated connector.
+      const forged = await harness.runtime.resume(
+        'relaunch-falsy',
+        started.runId,
+        { step: 'gateFalsy', resumeData: { approved: true } },
+      );
+
+      // #then — suspension #1's approval (resumeCount undefined) cannot mint
+      // into suspension #2's leg (resumeCount 1) even though their suspendedAt
+      // collide, so the connector denies. On the superseded resumedAt binding
+      // (undefined on both sides) this leaked and published.
+      expect(forged.status).toBe('failed');
+      expect(forged.error).toContain('approval required and not granted');
+      expect(harness.publishes()).toBe(0);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('depth-3 truthy->falsy: a spent depth-2 approval does not mint into depth-3 despite a shared resumedAt (Hole-2)', async () => {
+    // Pin Date.now so all three suspensions share suspendedAt (the in-process
+    // same-ms collision), isolating resumeCount as the sole distinguisher.
+    const fixed = Date.parse('2026-07-08T01:00:00.000Z');
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(fixed);
+    try {
+      const harness = buildHarness();
+      const started = await harness.runtime.start('relaunch-hole2', {
+        runId: `acme_${crypto.randomUUID()}`,
+        inputData: { topic: 'hole2' },
+      });
+      expect(started.suspended).toEqual([['gate2xNoSchema']]);
+
+      // #when — a TRUTHY resume re-suspends (round 2 -> susp #2); Mastra stamps
+      // resumedAt here.
+      const susp2 = await harness.runtime.resume(
+        'relaunch-hole2',
+        started.runId,
+        { step: 'gate2xNoSchema', resumeData: { go: true } },
+      );
+      expect(susp2.suspended).toEqual([['gate2xNoSchema']]);
+      expect(resumeCountFor(susp2, ['gate2xNoSchema'])).toBe(1);
+      const sharedResumedAt = resumedAtFor(susp2, ['gate2xNoSchema']);
+      expect(sharedResumedAt).toBeTypeOf('number');
+
+      // A depth-2 approval bound to susp #2 (resumeCount 1) is approved.
+      const decidedAt = new Date().toISOString();
+      await harness.store.create({
+        id: crypto.randomUUID(),
+        tenantId: 'acme',
+        workflowId: 'relaunch-hole2',
+        runId: started.runId,
+        stepPath: ['gate2xNoSchema'],
+        title: 'Depth-2 approval',
+        connectors: ['blog-publisher'],
+        priority: 'normal',
+        status: 'approved',
+        createdAt: decidedAt,
+        updatedAt: decidedAt,
+        decidedAt,
+        suspendedAt: suspendedAtFor(susp2, ['gate2xNoSchema']),
+        resumeCount: resumeCountFor(susp2, ['gate2xNoSchema']),
+      });
+
+      // #when — a FALSY resume re-suspends again (round 1 -> susp #3). Mastra
+      // PRESERVES the prior resumedAt, so #2 and #3 share it — the Hole-2 trap.
+      const susp3 = await harness.runtime.resume(
+        'relaunch-hole2',
+        started.runId,
+        { step: 'gate2xNoSchema' },
+      );
+      expect(susp3.suspended).toEqual([['gate2xNoSchema']]);
+      expect(resumeCountFor(susp3, ['gate2xNoSchema'])).toBe(2);
+      // The trap, proven: #3 carries the SAME resumedAt as #2.
+      expect(resumedAtFor(susp3, ['gate2xNoSchema'])).toBe(sharedResumedAt);
+
+      // A TRUTHY resume of susp #3 completes the gate and reaches the connector.
+      const forged = await harness.runtime.resume(
+        'relaunch-hole2',
+        started.runId,
+        { step: 'gate2xNoSchema', resumeData: { go: true } },
+      );
+
+      // #then — the depth-2 approval (resumeCount 1) cannot mint into susp #3's
+      // leg (resumeCount 2) even though suspendedAt AND resumedAt both collide,
+      // so the connector denies. On the old (suspendedAt, resumedAt) binding
+      // both pairs were equal, so this leaked and published.
+      expect(forged.status).toBe('failed');
+      expect(forged.error).toContain('approval required and not granted');
+      expect(harness.publishes()).toBe(0);
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 
   it('a re-suspension completes with its own fresh decision', async () => {
     // #given — round 1 approved and resumed; the step suspended again
     const harness = buildHarness();
     const started = await harness.runtime.start('relaunch', {
+      runId: `acme_${crypto.randomUUID()}`,
       inputData: { topic: 'respun-legit' },
     });
     const { record: first } = await harness.service.create(
@@ -537,6 +1058,7 @@ describe('approval queue end to end', () => {
         runId: started.runId,
         stepPath: ['gate2x'],
         suspendedAt: suspendedAtFor(started, ['gate2x']),
+        resumeCount: resumeCountFor(started, ['gate2x']),
         title: 'Gate 2x — round 1',
         connectors: ['blog-publisher'],
       },
@@ -548,15 +1070,21 @@ describe('approval queue end to end', () => {
       REVIEWER,
     );
 
+    // The re-suspension carries resumeCount=1 (round 1 had it undefined) —
+    // proof the summary plumbs the binding ordinal end to end; round 2's
+    // approval binds to this new (suspendedAt, resumeCount) pair.
+    expect(resumeCountFor(afterFirst.resume.summary, ['gate2x'])).toBe(1);
+
     // #when — suspension #2 gets its own request (fresh, not collapsed into
-    // the decided round-1 record), bound to the NEW suspension's timestamp,
-    // and its own approval
+    // the decided round-1 record), bound to the NEW suspension's
+    // (suspendedAt, resumeCount) pair, and its own approval
     const second = await harness.service.create(
       {
         workflowId: 'relaunch',
         runId: started.runId,
         stepPath: ['gate2x'],
         suspendedAt: suspendedAtFor(afterFirst.resume.summary, ['gate2x']),
+        resumeCount: resumeCountFor(afterFirst.resume.summary, ['gate2x']),
         title: 'Gate 2x — round 2',
         connectors: ['blog-publisher'],
       },

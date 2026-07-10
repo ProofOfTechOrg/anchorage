@@ -5,6 +5,8 @@
 // sweep racing a claim) resolve to exactly one winner; losers get null and
 // surface as HTTP 409. There is deliberately no unconditional update.
 
+import { TENANT_ID_PATTERN } from '../do-runner/path-safe-id.js';
+import { TENANT_BOUND } from './tenant-brand.js';
 import {
   type ApprovalListFilter,
   type ApprovalRecord,
@@ -66,7 +68,12 @@ export interface ApprovalStore {
   ): Promise<ApprovalRecord | null>;
 }
 
-function matchesFilter(
+/**
+ * The filter predicate, shared by the tenant-bound store and the cron-only
+ * system view (tenant-store.ts). Internal to approval-api — deliberately not
+ * on the package barrel; the two views must never drift.
+ */
+export function matchesFilter(
   record: ApprovalRecord,
   filter: ApprovalListFilter,
 ): boolean {
@@ -87,7 +94,8 @@ function matchesFilter(
   return true;
 }
 
-function byQueueOrder(a: ApprovalRecord, b: ApprovalRecord): number {
+/** FIFO queue order (createdAt, then id) — shared by both store views. */
+export function byQueueOrder(a: ApprovalRecord, b: ApprovalRecord): number {
   return a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
 }
 
@@ -98,40 +106,69 @@ function clone(record: ApprovalRecord): ApprovalRecord {
 }
 
 /**
- * In-memory reference implementation. Mirrors D1ApprovalStore semantics —
- * both run the same contract test suite. CAS atomicity holds because the
- * check-and-mutate section is synchronous (no awaits inside).
+ * In-memory reference implementation, BOUND to one tenant at construction
+ * (INV-2). Mirrors D1ApprovalStore semantics — both run the same contract
+ * test suite, including the cross-tenant cases over ONE shared backend (pass
+ * the same `records` Map to two instances; the InMemoryApprovalStoreFactory
+ * does exactly that). CAS atomicity holds because the check-and-mutate
+ * section is synchronous (no awaits inside).
+ *
+ * Every read/write carries the tenant predicate sourced from the constructor
+ * field — never from a parameter — and create() STAMPS the tenant, so no
+ * caller (and no spoofed input) can write another tenant's row.
  */
 export class InMemoryApprovalStore implements ApprovalStore {
-  readonly #records = new Map<string, ApprovalRecord>();
+  readonly tenantId: string;
+  readonly [TENANT_BOUND] = true as const;
+  readonly #records: Map<string, ApprovalRecord>;
+
+  constructor(tenantId: string, records?: Map<string, ApprovalRecord>) {
+    if (!TENANT_ID_PATTERN.test(tenantId)) {
+      throw new Error(
+        `InMemoryApprovalStore: tenantId '${tenantId}' violates INV-3 (^[a-z0-9]{3,32}$)`,
+      );
+    }
+    this.tenantId = tenantId;
+    this.#records = records ?? new Map();
+  }
+
+  #owns(record: ApprovalRecord | undefined): record is ApprovalRecord {
+    return record !== undefined && record.tenantId === this.tenantId;
+  }
 
   async create(record: ApprovalRecord): Promise<CreateResult> {
-    const key = stepKeyOf(record.stepPath);
+    // Stamp, never trust: the bound store is the tenant authority.
+    const stamped: ApprovalRecord = { ...record, tenantId: this.tenantId };
+    const key = stepKeyOf(stamped.stepPath);
     for (const existing of this.#records.values()) {
       if (
-        existing.workflowId === record.workflowId &&
-        existing.runId === record.runId &&
+        existing.tenantId === this.tenantId &&
+        existing.workflowId === stamped.workflowId &&
+        existing.runId === stamped.runId &&
         stepKeyOf(existing.stepPath) === key &&
         OPEN_STATUSES.includes(existing.status)
       ) {
         return { record: clone(existing), created: false };
       }
     }
-    if (this.#records.has(record.id)) {
-      throw new Error(`approval id '${record.id}' already exists`);
+    if (this.#records.has(stamped.id)) {
+      throw new Error(`approval id '${stamped.id}' already exists`);
     }
-    this.#records.set(record.id, clone(record));
-    return { record: clone(record), created: true };
+    this.#records.set(stamped.id, clone(stamped));
+    return { record: clone(stamped), created: true };
   }
 
   async get(id: string): Promise<ApprovalRecord | null> {
     const record = this.#records.get(id);
-    return record ? clone(record) : null;
+    return this.#owns(record) ? clone(record) : null;
   }
 
   async list(filter: ApprovalListFilter = {}): Promise<ApprovalRecord[]> {
     return [...this.#records.values()]
-      .filter((record) => matchesFilter(record, filter))
+      .filter(
+        (record) =>
+          record.tenantId === this.tenantId && matchesFilter(record, filter),
+      )
       .sort(byQueueOrder)
       .map(clone);
   }
@@ -142,7 +179,9 @@ export class InMemoryApprovalStore implements ApprovalStore {
     patch: ApprovalPatch,
   ): Promise<ApprovalRecord | null> {
     const current = this.#records.get(id);
-    if (!current || !from.includes(current.status)) return null;
+    // A wrong-tenant id behaves exactly like an unknown id (null -> 404/409
+    // disambiguation upstream) — no oracle for other tenants' record ids.
+    if (!this.#owns(current) || !from.includes(current.status)) return null;
     const updated: ApprovalRecord = { ...current };
     for (const [field, value] of Object.entries(patch)) {
       if (value !== undefined) {

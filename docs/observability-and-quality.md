@@ -18,9 +18,18 @@ Mastra provides OTel tracing, Studio visual debugger, 20+ evaluation scorers, an
 | `approval.avg_resolution_time` | flowsafe API | Mean time to approve or reject |
 | `approval.escalation.count` | flowsafe API | Escalations triggered |
 
+Metrics are read through the caller's tenant-bound store, so
+`GET /api/approvals/metrics` reports that tenant's queue, never the fleet's.
+
 ## Audit Export
 
-Audit log is exported as JSON Lines via Cloudflare Queues for SIEM ingestion. Each line is a single audit event in the schema defined in `security-threat-model.md`.
+Audit log is exported as JSON Lines via Cloudflare Queues for SIEM ingestion.
+Each line is a single audit event in the schema defined in
+`security-threat-model.md`. Approval-service events carry `tenantId` in
+`detail`; the SLA sweep — the one cross-tenant writer — would otherwise emit
+unattributable escalations. Export deliberately co-batches all tenants into one
+NDJSON POST: payload-level tagging is sufficient for a shared SIEM, and
+per-tenant fan-out is a non-goal.
 
 ## Quality Gates
 

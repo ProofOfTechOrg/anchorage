@@ -10,6 +10,9 @@
 // 4. Audit export — Queues producer sink + batch consumer shipping audit
 //    events to a SIEM over HTTP
 // 5. Artifacts — R2-backed workflow artifact storage keyed by run identity
+// 6. Host kit — the shared run routes, bearer auth seam, and suspension→approval
+//    bridge every host mounts (subpath export '@proofoftech/flowsafe/host-kit'
+//    only — it is host glue, not part of the library's core surface)
 
 export {
   APPROVAL_PRIORITIES,
@@ -18,19 +21,26 @@ export {
   ApprovalAuthzError,
   ApprovalConflictError,
   approvalGrantProvider,
+  approvalGrantProviderFromFactory,
   ApprovalService,
   approvedConnectorsForLeg,
   BREAKWATER_ACTOR_KEY,
   BREAKWATER_APPROVED_CONNECTORS_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
   createApprovalRouter,
-  D1ApprovalStore,
+  createTenantResolver,
+  D1ApprovalStoreFactory,
   defaultResumeData,
   InMemoryApprovalStore,
+  InMemoryApprovalStoreFactory,
   InvalidApprovalInputError,
   OPEN_STATUSES,
   resumeViaRuntime,
   stepKeyOf,
+  sweepSLA,
+  TCB_ONLY_CREATE_FIELDS,
+  TENANT_BOUND,
+  TenantResolutionError,
   UnknownApprovalError,
 } from './approval-api/index.js';
 export type {
@@ -51,10 +61,17 @@ export type {
   ApprovalServiceOptions,
   ApprovalStatus,
   ApprovalStore,
+  ApprovalStoreFactory,
   CreateApprovalInput,
   CreateResult,
+  CreateTenantResolverOptions,
   DecideResult,
   ResumeOutcome,
+  SweepSLAOptions,
+  SystemApprovalStore,
+  TenantBoundApprovalStore,
+  TenantContext,
+  TenantResolver,
 } from './approval-api/index.js';
 export {
   InMemoryArtifactBucket,

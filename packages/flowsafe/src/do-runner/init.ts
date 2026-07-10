@@ -18,6 +18,7 @@ import {
 import type { AnyWorkflow } from '@mastra/core/workflows';
 
 import { createD1Storage } from './d1-storage.js';
+import type { ResumeLedger } from './resume-ledger.js';
 import { RunnerRuntime } from './runtime.js';
 import type { RequestContextProvider } from './runtime.js';
 
@@ -39,6 +40,12 @@ export interface InitOptions {
    * grant-minting seam. See RequestContextProvider in runtime.ts.
    */
   requestContextForRun?: RequestContextProvider;
+  /**
+   * Explicit resume ledger (see RunnerRuntimeOptions.resumeLedger). When
+   * omitted, the runtime defaults to in-memory and the DO shell adopts a
+   * ctx.storage-backed ledger.
+   */
+  resumeLedger?: ResumeLedger;
 }
 
 export interface InitResult {
@@ -71,6 +78,7 @@ export function init(
   const runtime = new RunnerRuntime({
     storage,
     requestContextForRun: options.requestContextForRun,
+    resumeLedger: options.resumeLedger,
   });
 
   // Cast preserves core's generic call-site inference (6 type params); the

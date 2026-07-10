@@ -13,7 +13,11 @@ import type {
   ApprovalRole,
 } from './contract.js';
 import { APPROVAL_ROLES } from './contract.js';
-import type { ApprovalPatch, ApprovalStore } from './store.js';
+import type { ApprovalPatch } from './store.js';
+import type {
+  SystemApprovalStore,
+  TenantBoundApprovalStore,
+} from './tenant-brand.js';
 import {
   APPROVAL_PRIORITIES,
   type ApprovalDecision,
@@ -63,7 +67,12 @@ export class InvalidApprovalInputError extends Error {
 }
 
 export interface ApprovalServiceOptions {
-  store: ApprovalStore;
+  /**
+   * MUST be tenant-bound (INV-2): the service asserts every acting
+   * principal's tenant against this binding, and the store's predicates are
+   * what scope reads/writes. Obtain via a store factory's forTenant().
+   */
+  store: TenantBoundApprovalStore;
   /**
    * Structural match for breakwater AuditLogger.record — wire
    * `(event) => auditLogger.record(event)`. Must not throw; failures are
@@ -71,8 +80,6 @@ export interface ApprovalServiceOptions {
    * AuditLogger's own sink policy).
    */
   audit?: ApprovalAuditSink;
-  /** Fired for each record sweepSLA() escalates. */
-  onEscalation?: (record: ApprovalRecord) => void;
   /** Applied when CreateApprovalInput.slaSeconds is absent. */
   defaultSlaSeconds?: number;
   /**
@@ -95,19 +102,18 @@ export interface ApprovalServiceOptions {
 }
 
 // Role policy from security-threat-model.md: reviewers decide, operators run
-// the system, admins do both; every authenticated role may read.
+// the system, admins do both; every authenticated role may read. (The SLA
+// sweep has no role: it is cron-owned TCB code — see sweepSLA below.)
 const CAN_REVIEW: readonly ApprovalRole[] = ['reviewer', 'admin'];
 const CAN_CREATE: readonly ApprovalRole[] = ['operator', 'builder', 'admin'];
-const CAN_SWEEP: readonly ApprovalRole[] = ['operator', 'admin'];
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
 }
 
 export class ApprovalService {
-  readonly #store: ApprovalStore;
+  readonly #store: TenantBoundApprovalStore;
   readonly #audit?: ApprovalAuditSink;
-  readonly #onEscalation?: (record: ApprovalRecord) => void;
   readonly #defaultSlaSeconds?: number;
   readonly #resumeRun?: (
     record: ApprovalRecord,
@@ -119,7 +125,6 @@ export class ApprovalService {
   constructor(options: ApprovalServiceOptions) {
     this.#store = options.store;
     this.#audit = options.audit;
-    this.#onEscalation = options.onEscalation;
     this.#defaultSlaSeconds = options.defaultSlaSeconds;
     this.#resumeRun = options.resumeRun;
     this.#allowSelfDecision = options.allowSelfDecision ?? false;
@@ -136,6 +141,9 @@ export class ApprovalService {
     const slaSeconds = input.slaSeconds ?? this.#defaultSlaSeconds;
     const record: ApprovalRecord = {
       id: crypto.randomUUID(),
+      // The bound store re-stamps this from its own field either way; setting
+      // it here keeps the literal honest for the type and the audit trail.
+      tenantId: this.#store.tenantId,
       workflowId: input.workflowId,
       runId: input.runId,
       title: input.title,
@@ -149,6 +157,13 @@ export class ApprovalService {
     if (input.suspendedAt !== undefined) {
       record.suspendedAt = input.suspendedAt;
     }
+    if (input.resumedAt !== undefined) {
+      record.resumedAt = input.resumedAt;
+    }
+    if (input.resumeCount !== undefined) {
+      record.resumeCount = input.resumeCount;
+    }
+    if (input.runScoped !== undefined) record.runScoped = input.runScoped;
     if (input.summary !== undefined) record.summary = input.summary;
     if (input.payload !== undefined) record.payload = input.payload;
     // Attribution powers the self-approval check: default to the creating
@@ -168,6 +183,7 @@ export class ApprovalService {
       'allowed',
       {
         detail: {
+          tenantId: result.record.tenantId,
           workflowId: result.record.workflowId,
           runId: result.record.runId,
           created: result.created,
@@ -257,6 +273,7 @@ export class ApprovalService {
     this.#record(actor, 'approval.decide', `approval:${id}`, 'allowed', {
       detail: {
         decision: input.decision,
+        tenantId: updated.tenantId,
         workflowId: updated.workflowId,
         runId: updated.runId,
       },
@@ -295,63 +312,6 @@ export class ApprovalService {
       detail: { to: input.to },
     });
     return updated;
-  }
-
-  /**
-   * Escalate every open request past its SLA deadline. Idempotent: already
-   * escalated records are not re-escalated (their status left the guard set).
-   * Production trigger: a Workers cron hitting POST .../sla/sweep.
-   */
-  async sweepSLA(actor: ApprovalActor): Promise<ApprovalRecord[]> {
-    this.#authorize(actor, CAN_SWEEP, 'approval.escalate', 'approval');
-    const now = this.#now();
-    const nowIso = now.toISOString();
-    const open = await this.#store.list({ status: ['pending', 'claimed'] });
-    const escalated: ApprovalRecord[] = [];
-    for (const record of open) {
-      if (
-        record.slaDeadlineAt === undefined ||
-        Date.parse(record.slaDeadlineAt) > now.getTime()
-      ) {
-        continue;
-      }
-      const updated = await this.#store.transition(
-        record.id,
-        ['pending', 'claimed'],
-        { status: 'escalated', escalatedAt: nowIso, updatedAt: nowIso },
-      );
-      // null = lost a race (decided or escalated concurrently) — skip quietly.
-      if (!updated) continue;
-      escalated.push(updated);
-      this.#record(
-        actor,
-        'approval.escalate',
-        `approval:${updated.id}`,
-        'allowed',
-        {
-          reason: `SLA deadline ${updated.slaDeadlineAt} breached`,
-          detail: { workflowId: updated.workflowId, runId: updated.runId },
-        },
-      );
-      if (this.#onEscalation) {
-        try {
-          this.#onEscalation(updated);
-        } catch (error) {
-          // The hook is notification-only; a crashing notifier must not
-          // abort the sweep. The audit trail keeps the evidence.
-          this.#record(
-            actor,
-            'approval.escalate',
-            `approval:${updated.id}`,
-            'error',
-            {
-              reason: `onEscalation threw: ${errorMessage(error)}`,
-            },
-          );
-        }
-      }
-    }
-    return escalated;
   }
 
   async metrics(actor: ApprovalActor): Promise<ApprovalMetrics> {
@@ -430,7 +390,11 @@ export class ApprovalService {
         `approval:${record.id}`,
         'allowed',
         {
-          detail: { workflowId: record.workflowId, runId: record.runId },
+          detail: {
+            tenantId: record.tenantId,
+            workflowId: record.workflowId,
+            runId: record.runId,
+          },
         },
       );
       return { attempted: true, ok: true, summary };
@@ -440,7 +404,11 @@ export class ApprovalService {
       const message = errorMessage(error);
       this.#record(actor, 'approval.resume', `approval:${record.id}`, 'error', {
         reason: message,
-        detail: { workflowId: record.workflowId, runId: record.runId },
+        detail: {
+          tenantId: record.tenantId,
+          workflowId: record.workflowId,
+          runId: record.runId,
+        },
       });
       return { attempted: true, ok: false, error: message };
     }
@@ -455,17 +423,32 @@ export class ApprovalService {
     if (
       isNonEmptyString(actor?.id) &&
       (APPROVAL_ROLES as readonly string[]).includes(actor.role) &&
-      roles.includes(actor.role)
+      roles.includes(actor.role) &&
+      // INV-2 belt at the service layer: the acting principal's tenant must
+      // BE the store's binding. The resolver constructs the service from the
+      // actor's own tenant so this can only fire on a wiring bug — which is
+      // exactly when it must fail closed rather than act cross-tenant.
+      isNonEmptyString(actor.tenantId) &&
+      actor.tenantId === this.#store.tenantId
     ) {
       return;
     }
+    const roleOk =
+      actor !== null &&
+      actor !== undefined &&
+      (APPROVAL_ROLES as readonly string[]).includes(actor.role) &&
+      roles.includes(actor.role);
     this.#record(actor ?? null, action, resource, 'denied', {
-      reason: actor
-        ? `role '${actor.role}' is not in [${roles.join(', ')}]`
-        : 'no actor',
+      reason: !actor
+        ? 'no actor'
+        : !roleOk
+          ? `role '${actor.role}' is not in [${roles.join(', ')}]`
+          : `actor tenant '${actor.tenantId}' does not match the store binding '${this.#store.tenantId}'`,
     });
     throw new ApprovalAuthzError(
-      `${action} requires one of roles [${roles.join(', ')}]`,
+      roleOk && actor
+        ? `${action}: actor tenant does not match this service's tenant binding`
+        : `${action} requires one of roles [${roles.join(', ')}]`,
     );
   }
 
@@ -501,6 +484,15 @@ export class ApprovalService {
     if (!isNonEmptyString(input.runId)) {
       throw new InvalidApprovalInputError('runId is required');
     }
+    // Cheap INV-1 belt: every read path filters on the tenant_id COLUMN (not
+    // by parsing run_id), so a foreign-prefixed record would not leak — but it
+    // would be an orphan row no tenant's queue ever shows. Turn it into a
+    // loud error at the only write path.
+    if (!input.runId.startsWith(`${this.#store.tenantId}_`)) {
+      throw new InvalidApprovalInputError(
+        `runId '${input.runId}' does not carry this tenant's prefix '${this.#store.tenantId}_' — approvals bind to tenant-salted runs (INV-1)`,
+      );
+    }
     if (!isNonEmptyString(input.title)) {
       throw new InvalidApprovalInputError('title is required');
     }
@@ -521,6 +513,22 @@ export class ApprovalService {
       throw new InvalidApprovalInputError(
         'connectors must be an array of non-empty strings',
       );
+    }
+    // Attribution is what the separation-of-duties check compares, so an
+    // explicit one must be a usable identity — an empty string would silently
+    // match no actor and, worse, read as "attributed" to any later reader.
+    if (
+      input.requestedBy !== undefined &&
+      !isNonEmptyString(input.requestedBy)
+    ) {
+      throw new InvalidApprovalInputError(
+        'requestedBy must be a non-empty string',
+      );
+    }
+    // runScoped is a capability switch (mints on every leg); only a real
+    // boolean opts in, never a truthy string from a lax caller.
+    if (input.runScoped !== undefined && typeof input.runScoped !== 'boolean') {
+      throw new InvalidApprovalInputError('runScoped must be a boolean');
     }
     if (
       input.priority !== undefined &&
@@ -550,6 +558,29 @@ export class ApprovalService {
         'suspendedAt must be a positive epoch-ms number',
       );
     }
+    if (
+      input.resumedAt !== undefined &&
+      (typeof input.resumedAt !== 'number' ||
+        !Number.isFinite(input.resumedAt) ||
+        input.resumedAt <= 0)
+    ) {
+      throw new InvalidApprovalInputError(
+        'resumedAt must be a positive epoch-ms number',
+      );
+    }
+    // resumeCount is the runtime resume ordinal — a positive integer (1,2,…);
+    // undefined means a first suspension. Unlike the timestamps it is a count,
+    // so it must be an integer.
+    if (
+      input.resumeCount !== undefined &&
+      (typeof input.resumeCount !== 'number' ||
+        !Number.isInteger(input.resumeCount) ||
+        input.resumeCount <= 0)
+    ) {
+      throw new InvalidApprovalInputError(
+        'resumeCount must be a positive integer',
+      );
+    }
     // The record contract is JSON-safe end to end (types.ts); reject what
     // JSON.stringify cannot represent (BigInt, circular refs) here so the
     // two stores never diverge on exotic payloads.
@@ -567,4 +598,101 @@ export class ApprovalService {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Options for the cron-owned SLA sweep. */
+export interface SweepSLAOptions {
+  /**
+   * Attribution identity for audit events (e.g. the worker's system actor).
+   * Attribution only — the sweep runs inside the trusted computing base
+   * (cron), so there is no role check: the TYPE of the store argument is the
+   * authorization (a SystemApprovalStore is unobtainable from request scope).
+   */
+  systemActor: ApprovalActor;
+  audit?: ApprovalAuditSink;
+  /** Fired for each record escalated. */
+  onEscalation?: (record: ApprovalRecord) => void;
+  /** Injectable clock (tests, deterministic SLA math). */
+  now?: () => Date;
+}
+
+/**
+ * Escalate every open request past its SLA deadline, ACROSS TENANTS.
+ * Idempotent: already escalated records are not re-escalated (their status
+ * left the guard set). Cron-owned TCB code — deliberately NOT a service
+ * method and NOT reachable over HTTP: an unfiltered cross-tenant read+write
+ * behind a role check was an IDOR-shaped hole (any CAN_SWEEP actor could
+ * escalate every tenant's queue). The distinct SystemApprovalStore parameter
+ * type makes "cross-tenant reads happen only inside the TCB" a compile-time
+ * property, not a convention.
+ */
+export async function sweepSLA(
+  store: SystemApprovalStore,
+  options: SweepSLAOptions,
+): Promise<ApprovalRecord[]> {
+  const now = options.now ?? (() => new Date());
+  const record = (
+    action: string,
+    resource: string,
+    decision: 'allowed' | 'denied' | 'error',
+    extra: { reason?: string; detail?: Record<string, unknown> } = {},
+  ): void => {
+    if (!options.audit) return;
+    try {
+      options.audit({
+        actor: options.systemActor,
+        action,
+        resource,
+        decision,
+        reason: extra.reason,
+        detail: extra.detail,
+      });
+    } catch {
+      // Availability over export reliability — a crashing sink must not
+      // abort the sweep.
+    }
+  };
+  const at = now();
+  const nowIso = at.toISOString();
+  const open = await store.list({ status: ['pending', 'claimed'] });
+  const escalated: ApprovalRecord[] = [];
+  for (const candidate of open) {
+    if (
+      candidate.slaDeadlineAt === undefined ||
+      Date.parse(candidate.slaDeadlineAt) > at.getTime()
+    ) {
+      continue;
+    }
+    const updated = await store.transition(
+      candidate.id,
+      ['pending', 'claimed'],
+      { status: 'escalated', escalatedAt: nowIso, updatedAt: nowIso },
+    );
+    // null = lost a race (decided or escalated concurrently) — skip quietly.
+    if (!updated) continue;
+    escalated.push(updated);
+    record('approval.escalate', `approval:${updated.id}`, 'allowed', {
+      reason: `SLA deadline ${updated.slaDeadlineAt} breached`,
+      // tenantId attributes the escalation: a cross-tenant sweep without it
+      // emits unattributable audit events.
+      detail: {
+        tenantId: updated.tenantId,
+        workflowId: updated.workflowId,
+        runId: updated.runId,
+      },
+    });
+    if (options.onEscalation) {
+      try {
+        options.onEscalation(updated);
+      } catch (error) {
+        // The hook is notification-only; a crashing notifier must not
+        // abort the sweep. The audit trail keeps the evidence.
+        record('approval.escalate', `approval:${updated.id}`, 'error', {
+          reason: `onEscalation threw: ${errorMessage(error)}`,
+          detail: { tenantId: updated.tenantId },
+        });
+      }
+    }
+  }
+  return escalated;
 }

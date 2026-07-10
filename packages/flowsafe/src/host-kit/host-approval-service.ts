@@ -1,0 +1,210 @@
+// The host-side ApprovalService assembly and cron SLA sweep that the
+// showcase Worker and the deploy template previously carried as byte-copies:
+// the structured-log + optional-Queues audit sink, the system actor derived
+// from the store's own tenant binding, and the SoD-guarded multi-gate
+// re-queue over the host's injected resume topology. The only genuine host
+// difference — HOW a run resumes — stays injected as `resumeRun`
+// (createDoRunTopology(...).resumeRecord for DO hosts, resumeViaRuntime for
+// in-process ones). Also home to the isolate-scoped D1ApprovalStoreFactory
+// memo, which every host needs for the same reason (the DDL promise must
+// span the isolate, not one request).
+
+import type {
+  ApprovalActor,
+  ApprovalAuditEvent,
+  ApprovalAuditSink,
+  ApprovalDatabase,
+  SystemApprovalStore,
+  TenantBoundApprovalStore,
+} from '../approval-api/index.js';
+import {
+  ApprovalService,
+  D1ApprovalStoreFactory,
+  sweepSLA,
+} from '../approval-api/index.js';
+import { type AuditQueue, queueAuditSink } from '../audit-export/index.js';
+import { type ResumeRunFn, resumeRunWithRequeue } from './approval-bridge.js';
+
+/**
+ * Attribution identity for cron maintenance — audit only. The sweep is TCB
+ * code over the system store, so 'system' here is the reserved audit
+ * identity (RESERVED_TENANT_IDS), which no verifier admits and no store
+ * binds to; per-record tenants ride in the audit detail.
+ */
+export function maintenanceActor(systemActorId: string): ApprovalActor {
+  return { id: systemActorId, role: 'operator', tenantId: 'system' };
+}
+
+// One factory per isolate, not per request: it owns the memoized schema-init
+// promise, so rebuilding it inside fetch() would re-run the whole DDL pass
+// (CREATE TABLE + DROP/CREATE indexes + PRAGMA + ALTERs) on every request.
+// Keyed by the D1 binding, which is stable for an isolate's lifetime.
+const approvalFactories = new WeakMap<
+  ApprovalDatabase,
+  D1ApprovalStoreFactory
+>();
+
+export function approvalStoreFactoryFor(
+  db: ApprovalDatabase,
+): D1ApprovalStoreFactory {
+  let factory = approvalFactories.get(db);
+  if (!factory) {
+    factory = new D1ApprovalStoreFactory(db);
+    approvalFactories.set(db, factory);
+  }
+  return factory;
+}
+
+export interface HostAuditSinkOptions {
+  /** Optional Cloudflare queue producer for SIEM export. */
+  queue?: AuditQueue<ApprovalAuditEvent>;
+  /**
+   * Keeps each queue send alive past the handler — ctx.waitUntil in fetch
+   * scope; a cron runner collects and awaits instead (it already executes
+   * under the handler's waitUntil).
+   */
+  keepAlive?: (send: Promise<unknown>) => void;
+}
+
+/**
+ * The audit sink every host wires: structured Workers Logs always, plus the
+ * SIEM queue when bound. Never throws and never blocks the approval path —
+ * a failed send is logged, not propagated.
+ */
+export function hostAuditSink(
+  options: HostAuditSinkOptions = {},
+): ApprovalAuditSink {
+  const queueSink = options.queue ? queueAuditSink(options.queue) : undefined;
+  return (event) => {
+    console.log(JSON.stringify({ type: 'audit', ...event }));
+    if (queueSink) {
+      const send = queueSink(event).catch((error: unknown) =>
+        console.error(
+          JSON.stringify({
+            type: 'audit-queue-error',
+            reason: String(error),
+          }),
+        ),
+      );
+      options.keepAlive?.(send);
+    }
+  };
+}
+
+export interface HostApprovalServiceOptions {
+  /**
+   * Id for system-created records (the bridge's record creator). Must differ
+   * from human actor ids or the separation-of-duties check can never fire.
+   */
+  systemActorId: string;
+  /** Applied when CreateApprovalInput.slaSeconds is absent. */
+  defaultSlaSeconds?: number;
+  /**
+   * The host's resume topology — createDoRunTopology(...).resumeRecord for a
+   * DO host, resumeViaRuntime(runtime) for an in-process one. Wrapped in
+   * resumeRunWithRequeue here, so a run that re-suspends at a later gate
+   * auto-queues its next approval(s) with SoD intact (the deciding reviewer
+   * becomes the next gate's requester).
+   */
+  resumeRun: ResumeRunFn;
+  /** Optional audit export queue (wrangler `queues` producer binding). */
+  queue?: AuditQueue<ApprovalAuditEvent>;
+  /** ctx.waitUntil — keeps audit queue sends alive past the response. */
+  waitUntil?: (send: Promise<unknown>) => void;
+}
+
+/**
+ * Worker-level approval service sharing the DO's D1 database. Decisions
+ * resume the run through the injected topology (grants come from the store
+ * via the DO-side provider, never from this request); if the resumed run
+ * suspends again at a later gate, the next approval is queued right here, so
+ * multi-gate workflows keep flowing through the queue.
+ */
+export function buildHostApprovalService(
+  store: TenantBoundApprovalStore,
+  options: HostApprovalServiceOptions,
+): ApprovalService {
+  const systemActor: ApprovalActor = {
+    id: options.systemActorId,
+    role: 'operator',
+    tenantId: store.tenantId,
+  };
+  const service: ApprovalService = new ApprovalService({
+    store,
+    defaultSlaSeconds: options.defaultSlaSeconds,
+    audit: hostAuditSink({
+      queue: options.queue,
+      keepAlive: options.waitUntil,
+    }),
+    resumeRun: resumeRunWithRequeue(
+      options.resumeRun,
+      () => service,
+      systemActor,
+    ),
+  });
+  return service;
+}
+
+export interface SlaSweepMaintenanceOptions {
+  /** factory.system() — the cron-only cross-tenant view. */
+  store: SystemApprovalStore;
+  /** maintenanceActor(systemActorId). */
+  systemActor: ApprovalActor;
+  /** Optional audit export queue. */
+  queue?: AuditQueue<ApprovalAuditEvent>;
+  /** The firing cron expression — log correlation only. */
+  cron: string;
+}
+
+/**
+ * The cron-owned SLA sweep, verbatim-shared by the hosts: sweepSLA over the
+ * SYSTEM store (the only legitimate cross-tenant read+write, unreachable
+ * over HTTP), audit to logs + optional queue, a structured line per
+ * escalation, and containment — a sweep failure logs a maintenance-error and
+ * resolves rather than throwing, so a caller running other duties is never
+ * starved by this one (the two-cron split covers the uncatchable CPU-limit
+ * case). Queue sends are collected and awaited HERE: the whole runner
+ * already executes under the handler's ctx.waitUntil, where a nested
+ * waitUntil is unavailable.
+ */
+export async function runSlaSweepMaintenance(
+  options: SlaSweepMaintenanceOptions,
+): Promise<void> {
+  let escalated: number | undefined;
+  const pendingSends: Promise<unknown>[] = [];
+  try {
+    escalated = (
+      await sweepSLA(options.store, {
+        systemActor: options.systemActor,
+        audit: hostAuditSink({
+          queue: options.queue,
+          keepAlive: (send) => pendingSends.push(send),
+        }),
+        onEscalation: (record) =>
+          console.log(
+            JSON.stringify({
+              type: 'sla-escalation',
+              id: record.id,
+              tenantId: record.tenantId,
+              workflowId: record.workflowId,
+              runId: record.runId,
+              slaDeadlineAt: record.slaDeadlineAt,
+            }),
+          ),
+      })
+    ).length;
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        type: 'maintenance-error',
+        surface: 'sla-sweep',
+        cron: options.cron,
+        error: String(error),
+      }),
+    );
+  }
+  await Promise.all(pendingSends);
+  console.log(
+    JSON.stringify({ type: 'maintenance', cron: options.cron, escalated }),
+  );
+}

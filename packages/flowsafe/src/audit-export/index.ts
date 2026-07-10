@@ -76,6 +76,41 @@ export interface AuditExportOptions<TEvent = unknown> {
 }
 
 /**
+ * The whole Worker `queue()` handler for the audit-export consumer,
+ * previously copied verbatim into each host: guard the endpoint config —
+ * a consumer bound without an endpoint logs a config-error and RETRIES the
+ * batch (fail closed: nothing is acked unconfirmed, and the DLQ eventually
+ * surfaces the misconfig) — then delegate to createAuditQueueConsumer.
+ */
+export function createAuditQueueHandler<TEvent = unknown>(options: {
+  /** SIEM collector URL (the host's SIEM_ENDPOINT var). */
+  endpoint?: string;
+  /** Sent as the `authorization` header (the SIEM_AUTH_HEADER secret). */
+  authHeader?: string;
+}): (batch: AuditMessageBatch<TEvent>) => Promise<void> {
+  return async (batch) => {
+    if (!options.endpoint) {
+      console.error(
+        JSON.stringify({
+          type: 'config-error',
+          var: 'SIEM_ENDPOINT',
+          reason:
+            'audit consumer bound without an export endpoint — retrying batch',
+        }),
+      );
+      batch.retryAll();
+      return;
+    }
+    await createAuditQueueConsumer<TEvent>({
+      endpoint: options.endpoint,
+      headers: options.authHeader
+        ? { authorization: options.authHeader }
+        : undefined,
+    })(batch);
+  };
+}
+
+/**
  * Build a Workers queue consumer exporting audit batches to a SIEM. The
  * export is all-or-nothing per batch: a failed POST retries the whole batch
  * (Queues backoff, then the configured dead-letter queue), so no event is

@@ -1,0 +1,21 @@
+# Local-dev secrets for `pnpm showcase:dev` (wrangler reads `showcase/.dev.vars`).
+#
+#   cp showcase/.dev.vars.example showcase/.dev.vars
+#
+# APPROVAL_ACTOR_TOKENS is the bearer -> actor map EVERY authenticated route
+# resolves identity against. It is a secret, not a wrangler var: nothing is baked
+# into wrangler.jsonc, so a deploy without
+#
+#   wrangler secret put APPROVAL_ACTOR_TOKENS
+#
+# 401s everywhere — fail closed by construction.
+#
+# The tokens below are the DEMO identities the UI's ActorSwitcher offers, so RBAC
+# and separation-of-duties are clickable locally. They are checked into this repo
+# and therefore WORLD-KNOWN: never seed them as a deployed worker's secret, or
+# anyone can act as `admin`. They are kept in sync with showcase/demo-actors.ts by
+# showcase/demo-actors.test.ts.
+APPROVAL_ACTOR_TOKENS={"demo-admin":{"id":"admin","role":"admin","tenantId":"demo"},"demo-builder":{"id":"builder","role":"builder","tenantId":"demo"},"demo-operator":{"id":"operator","role":"operator","tenantId":"demo"},"demo-reviewer":{"id":"reviewer","role":"reviewer","tenantId":"demo"},"demo-viewer":{"id":"viewer","role":"viewer","tenantId":"demo"}}
+
+# Optional: the audit-export auth header, when the `queues` block is enabled.
+# SIEM_AUTH_HEADER=Bearer your-siem-token

@@ -32,8 +32,10 @@ verification gate + `spike:verify` on push/PR to `main`. Phases 1-3:
 - flowsafe approval queue (Phase 3): `approval-api` — CAS-guarded store
   (D1 + in-memory), `ApprovalService` (role-checked claim/decide/delegate,
   SLA sweep → escalation, audit sink), fetch router for the REST surface,
-  and the grant-minting seam: `approvalGrantProvider(store)` wired into
-  `RunnerRuntime.requestContextForRun` derives
+  and the grant-minting seam: `approvalGrantProvider(tenantBoundStore)` wired
+  into `RunnerRuntime.requestContextForRun` (hosts wire
+  `approvalGrantProviderFromFactory(storeFactory)`, which recovers each leg's
+  tenant from the runId prefix and binds the store to it) derives
   `breakwater.approvedConnectors` from APPROVED records on every
   start/resume, leg-scoped to the resumed step (grants never travel in HTTP
   bodies; forged resumes fail closed at the connector gate even for
@@ -65,17 +67,31 @@ verification gate + `spike:verify` on push/PR to `main`. Phases 1-3:
   manifests enforce `dryRun` (per-call simulation via `DRY_RUN_CONTEXT_KEY`
   + `dryRunExecute`; unsupported manifests fail closed) and `rateLimit`
   ('<count>/<unit>' fixed windows against a `RateLimitStore`; only actual
-  executions consume budget). Idempotency grew `AtomicIdempotencyStore`
+  executions consume budget; the store's reach IS the budget's reach —
+  `D1RateLimitStore` shares the window across isolates, which DO-per-run
+  hosts need or the cap degrades to per-run). Idempotency grew `AtomicIdempotencyStore`
   (reserve/release — the wrapper prefers it) and `D1IdempotencyStore`
   (INSERT-claim CAS + stale-pending TTL takeover). `crossWorkflowIsolation`
   ships as a tool policy reading `WORKFLOW_SCOPE_CONTEXT_KEY`
   ('breakwater.workflowScope'), which `RunnerRuntime` mints on every leg.
   flowsafe validates `workflowId` at `register()` (same path-safe pattern as
   runId), ships `purgeExpiredWorkflowRuns` (terminal-status-only TTL purge of
-  `mastra_workflow_snapshot`; scheduling stays with the caller), and binds
-  approvals to suspensions clock-free (`RunSummary.suspendedAt` map →
-  `ApprovalRecord.suspendedAt`, exact-match minting with a legacy
-  decidedAt-after fallback for records created without the capture).
+  `mastra_workflow_snapshot`; optional `artifactStore` pairs each purged run's
+  R2 artifacts with its row — the row is the only record of their keys;
+  missing table = zero rows; scheduling stays with the caller), and binds
+  approvals to suspensions clock-free (`RunSummary.{suspendedAt,resumeCount}`
+  maps → `ApprovalRecord.{suspendedAt,resumeCount}`, exact-match minting on the
+  `(suspendedAt, resumeCount)` pair — `resumeCount` is the runtime-owned
+  monotonic per-(run,step) resume ordinal, undefined on a first suspension and
+  `1,2,…` on re-suspensions; the runtime increments it on every resume
+  regardless of payload, so it stays present even on a no-payload re-suspension
+  and never collides, keeping same-step suspensions distinct even when their
+  `suspendedAt` stamps collide in one ms on the in-process path — with a legacy
+  decidedAt-after fallback for records created without the capture. `resumedAt`
+  is retained as informational audit metadata only (Mastra stamps it solely on
+  a payload-bearing resume). This supersedes the earlier `(suspendedAt,
+  resumedAt)` binding and closes its deep-3+-re-suspension residual (the counter
+  strictly increments, so it never collides).
 
 Phase 4 (Ecosystem, 2026-07-07):
 - breakwater `src/agent-cli/`: Claude Code + Codex as approval-gated
@@ -100,7 +116,81 @@ Phase 4 (Ecosystem, 2026-07-07):
   trigger (isolated failures), bearer-token auth seam, start+resume approval
   bridges (multi-gate), optional Queues audit export. `deploy:cf`/`deploy:dev`.
 
-Verification gate: `pnpm -r lint && pnpm -r typecheck && pnpm -r test && pnpm -r build` (381 tests).
+Verification gate: `pnpm -r lint && pnpm -r typecheck && pnpm -r test && pnpm -r build` (698 tests).
+
+Showcase (2026-07-09): all five `docs/examples/*` workflows made runnable behind
+one React frontend and shipped as a single Cloudflare deploy —
+`packages/flowsafe/showcase/` (`buildShowcaseRuntime` registers all 5 on one
+Worker + DO + D1; `GET /workflows` + per-workflow `allowedRoles`; `assets` block
+serves `app/dist` at `/` with the API on the same origin) + host-agnostic glue in
+`src/host-kit/` (subpath export `./host-kit`): `WorkflowModule`/`WorkflowMeta`,
+the approval bridge, the bearer auth seam (`parseActorTokens`,
+`bearerActorAuthenticator`), and `createRunRouter({ resolve })` — the
+`/workflows` + `/runs` surface with its 401 → INV-3 → coarse `RUN_START_ROLES`
+→ per-workflow `allowedRoles` gate order; `resolve: TenantResolver`
+(authenticate → validate → bind) replaces the bare `authenticate`, and
+status/resume answer 404 for another tenant's run — no existence oracle. All four hosts (showcase, deploy template, `app:dev` plugin, demo
+spike) consume it; each injects only its resume topology (DO stub vs in-process).
+The `app/` frontend gains a launcher + run-status panel + actor switcher;
+`run-api-dev-plugin.ts` runs the showcase host in-process for `app:dev`. The demo
+bearer identities live once in `showcase/demo-actors.ts` (drift-tested against
+`.dev.vars.example`); `showcase/wrangler.jsonc` bakes in NO credentials, so a
+deploy 401s until `wrangler secret put APPROVAL_ACTOR_TOKENS`. Connectors stay
+binding-gated (simulate offline; grant gate always exercised).
+
+Multi-tenant platform (2026-07-09, `.notes/multi-tenant-and-demo-plan.md` implemented):
+one tenant dimension, one chokepoint per resource class, fail-closed by construction.
+Three invariants: **INV-1** — every runId is server-minted `${tenantId}_${uuid}` from the
+AUTHENTICATED tenant (`createRunRouter` 400s client runIds; `RunnerRuntime.start` requires
+one — no generation fallback; the DO asserts path ≡ `ctx.id.name`), making Mastra snapshot
+rows, DO instances, `#runKey`, the grant-mint `runId` predicate, and R2 keys tenant-disjoint
+with no schema or signature change. **INV-2** — approval stores are tenant-BOUND at
+construction (`D1ApprovalStoreFactory`/`InMemoryApprovalStoreFactory.forTenant()`; the
+`TENANT_BOUND` unique-symbol brand makes an unbound/system store a compile error in request
+scope; `tenant_id` column + unconditional predicates; the open-step index was DROPped and
+recreated tenant-first under a NEW name — name-keyed `IF NOT EXISTS` redefinition is a silent
+no-op; a pre-tenant table REFUSES to serve). Requests flow through `TenantResolver`
+(authenticate → INV-3-validate → bind) so no pre-auth store exists; `sweepSLA` left the
+service for a cron-only function over `SystemApprovalStore` (the HTTP sweep route is gone).
+**INV-3** — `tenantId` matches `^[a-z0-9]{3,32}$` (no chars in `[0x5F,0x60]`), making the
+runId prefix ownership check and the `[tid_, tid\x60)` range purge EXACT
+(character-exhaustive test pins it). Plus: durable `ctx.storage` resume ledger (eviction no
+longer no-ops approved re-suspension resumes); `ISOLATION_SCOPE_CONTEXT_KEY` segments
+breakwater idempotency/rate-limit keys per tenant (no flag — absent scope keeps single-tenant
+keys; `tenantIsolation` evaluator denies scope-less calls incl. dry-run); `purgeTenant`
+offboards all three stores (any-status snapshots + approvals + artifacts;
+a missing snapshot table reads as empty so run-less tenants — expired demo
+sandboxes — still offboard, and artifacts of retention-purged runs are covered
+by that purge's own `artifactStore` pairing, not re-enumerable here); Mastra
+six-table-inventory + `run_id` schema guards; the R2 no-workflow-level-listing pin; identity
+via `TokenVerifier` (`staticTokenVerifier` + HS256 `hmacVerifier`; `ApprovalActor.tenantId`
+required; the `tenants` registry is the allocation authority — `RESERVED_FOR_ALLOCATION`
+denied at provisioning (infra slugs + `system` + `default`), `RESERVED_TENANT_IDS`
+(`system`) denied at token verification AND re-refused by `createTenantResolver`
+before any store binds — custom verifiers bypass `toApprovalActor`);
+the public demo (`showcase/demo-auth.ts`: OAuth → ephemeral `dm*` tenant + four-role
+JWT set, atomic per-tenant + global-daily run caps, kill switch in the AUTH middleware, two
+cron expressions so sweep/purge never share an invocation; providers behind the `OAuthProvider`
+seam — `googleProvider` is the LAUNCH provider, `githubProvider` the env-selected fallback;
+one mounts per deployment, Google wins when both are configured, and the SPA reads the
+provider name from `/auth/config`); subdomain↔tenant cross-check for
+client-per-subdomain hosts. The deployed SPA derives identity from the server's `/workflows`
+actor echo (the fail-open client actor table is gone) and its production bundle is proven
+demo-token-free at build time.
+
+## Live demo deployment (anchorage.proofoftech.org)
+
+The showcase deploys to **`anchorage.proofoftech.org`** — a Workers custom
+domain on the proofoftech.org zone, with `workers_dev: false` so it is the
+ONLY public origin (the Google OAuth callback is registered for exactly
+`https://anchorage.proofoftech.org/auth/google/callback`; a second origin
+would break sign-in and undermine noindex). **TEMPORARY: `app/index.html`
+carries a `<meta name="robots" content="noindex" />` so the live demo stays
+out of search indexes pre-announce — REMOVE that meta (and this reminder)
+when the demo should be indexable.** Google OAuth is the launch provider
+(`GOOGLE_CLIENT_ID` var + `GOOGLE_CLIENT_SECRET` secret; the Google consent
+screen must be "In production" — Testing status only admits listed test
+users); GitHub stays a config-only fallback.
 
 ## Files
 
@@ -162,18 +252,45 @@ runtime — Mastra provides workflows, agents, memory, RAG, and observability.
   DERIVATION, not transport — `approvalGrantProvider(store)` plugs into
   `RunnerRuntime.requestContextForRun` and recomputes the grant list from
   APPROVED approval records on every start/resume, so grants never cross an
-  HTTP body and the DO's public resume route stays grant-free. Grants are
+  HTTP body and the DO's public resume route stays grant-free. Tenant-isolated
+  (INV-2): `approvalGrantProvider` takes a `TenantBoundApprovalStore`
+  (`factory.forTenant(tenantId)`); a `SystemApprovalStore` is not
+  type-assignable, so derivation can only ever read one tenant's APPROVED
+  records. The tenant is carried by the server-minted runId
+  (`${tenantId}_${uuid}`, INV-1), never chosen by a client. Grants are
   SUSPENSION-SCOPED: the runtime passes the resumed step and its current
-  suspension timestamp to the provider, and a step-keyed approval mints
-  preferentially by EXACT MATCH — the creating bridge captures the
-  snapshot's suspendedAt into the record (`ApprovalRecord.suspendedAt`, from
-  `RunSummary.suspendedAt`), and it must equal the resumed leg's suspension
-  timestamp; both sides come from the core clock, so the binding is
-  clock-free. Records created without the capture fall back to
-  decided-strictly-after-suspension, correct on same-clock topologies only.
-  Step-less approvals are explicitly run-scoped — approving a connector at
-  one gate never unlocks it at another gate, and a re-suspension of the same
-  step spends the earlier approval. Because Mastra merges resume-provided context
+  suspension's `(suspendedAt, resumeCount)` fingerprint to the provider, and a
+  step-keyed approval mints preferentially by EXACT MATCH — the creating
+  bridge captures both from the snapshot/ledger into the record
+  (`ApprovalRecord.{suspendedAt,resumeCount}`, from
+  `RunSummary.{suspendedAt,resumeCount}`), and both must equal the resumed leg's
+  values. `suspendedAt` comes from the core clock; `resumeCount` is the
+  runtime-owned monotonic per-(run,step) resume ordinal (no clock), so the
+  binding is clock-free. `resumeCount` is the categorical tie-breaker —
+  undefined on a step's first suspension, `1,2,…` on re-suspensions, incremented
+  by the runtime on EVERY resume regardless of payload — so a spent
+  first-suspension approval never mints into a re-suspension even when the two
+  `suspendedAt` stamps collide within a millisecond (possible only on the
+  synchronous in-process path; production's HTTP+D1 round-trips keep them seconds
+  apart), and a no-payload re-suspension (which Mastra leaves without a
+  `resumedAt`) stays distinguishable. Because the ordinal strictly increments it
+  never collides, so this supersedes the earlier `(suspendedAt, resumedAt)`
+  binding and closes its deep-chain (3+ re-suspension) residual; `resumedAt` is
+  kept as informational audit metadata only. Records created without the capture
+  fall back to decided-strictly-after-suspension, correct on same-clock
+  topologies only (an in-memory ledger reset across a DO restart also degrades
+  to this fail-closed re-deny, never a leak). Run-scope is EXPLICIT: a step-less
+  record is a run-wide standing grant only when it carries `runScoped: true`, and
+  mints nothing otherwise (absent-field-implies-privilege was an inverted
+  default) — so approving a connector at one gate never
+  unlocks it at another gate, and a re-suspension of the same step spends the
+  earlier approval. The queue's HTTP create route is off by default
+  (`createApprovalRouter`'s `allowCreate`) and can never author capability: it
+  400s on any body naming a `TCB_ONLY_CREATE_FIELDS` member (`connectors`,
+  `stepPath`, `suspendedAt`, `resumedAt`, `resumeCount`, `runScoped`,
+  `requestedBy`) and forces `requestedBy` to the authenticated actor, so no
+  client can name the connectors a decision mints, pick the leg it mints on, or
+  disarm the SoD check by spoofing the requester. Because Mastra merges resume-provided context
   OVER persisted
   context (pinned in runtime.test.ts; omission does not revoke), the
   provider returns the grant key on EVERY leg — empty when nothing applies —
@@ -201,3 +318,21 @@ runtime — Mastra provides workflows, agents, memory, RAG, and observability.
 - Any new code goes under `packages/breakwater/` or `packages/flowsafe/`
 - breakwater code must work as Mastra middleware (no custom runtime)
 - flowsafe code must target Cloudflare Workers/DO for the DO runner
+- **INV-1** — runIds are server-minted `${tenantId}_${uuid}`.
+  `RunnerRuntime.start` *requires* `options.runId`; never re-add the
+  `?? crypto.randomUUID()` fallback. `createRunRouter` 400s a client-supplied
+  `body.runId`.
+- **INV-2** — approval stores are tenant-bound. Obtain via
+  `D1ApprovalStoreFactory` / `InMemoryApprovalStoreFactory` `.forTenant()`.
+  `D1ApprovalStore` is deliberately not exported. `sweepSLA` is a cron-only
+  free function over `SystemApprovalStore`.
+- **INV-3** — `tenantId` matches `^[a-z0-9]{3,32}$`; every verifier validates
+  it and drops entries that fail. `'system'` is additionally rejected at token
+  verification AND re-refused by `createTenantResolver` before a store binds
+  or a runId mints (`RESERVED_TENANT_IDS`, defined in
+  `do-runner/path-safe-id.ts` — the TCB's own audit identity; the resolver
+  belt exists because a custom `TokenVerifier` or hand-built actor map never
+  crosses `toApprovalActor`); the routing/allocation slugs
+  (`RESERVED_FOR_ALLOCATION`, incl. `default`) are deliberately NOT enforced
+  at either of those points — re-conflating the two lists would 401 a
+  single-tenant host named `api` or `default`.
