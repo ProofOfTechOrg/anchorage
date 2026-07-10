@@ -96,14 +96,14 @@
     "DEMO_TENANT_RUN_CAP": "20",
     "DEMO_DAILY_RUN_CAP": "500",
     "DEMO_TENANT_TTL_HOURS": "24",
-    "DEMO_JWT_TTL_SECONDS": "3600"
+    "DEMO_JWT_TTL_SECONDS": "3600",
     // The launch OAuth provider is GOOGLE (worker.ts prefers it when both
     // are configured; GitHub remains a config-only fallback). The Google
     // OAuth client's authorized redirect URI must be EXACTLY
     // https://anchorage.proofoftech.org/auth/google/callback, and its consent
     // screen must be "In production" (Testing status only admits listed test
     // users — no verification review needed for the bare `openid` scope).
-    // "GOOGLE_CLIENT_ID": "<your Google OAuth client id>",
+    "GOOGLE_CLIENT_ID": "540939373490-5jfq332en4l4q5cc70fjth76l9v65oqm.apps.googleusercontent.com",
     // "GITHUB_CLIENT_ID": "<your GitHub OAuth app client id>",
     // "DEMO_DISABLED": "true",   // kill switch: 503s /auth/* AND stops
     //                            // verifying already-issued demo JWTs
