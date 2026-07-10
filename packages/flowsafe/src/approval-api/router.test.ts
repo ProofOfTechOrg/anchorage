@@ -1,11 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
 import type { ApprovalRole } from './contract.js';
-import { createApprovalRouter, TCB_ONLY_CREATE_FIELDS } from './router.js';
+import {
+  CLIENT_CREATE_FIELDS,
+  createApprovalRouter,
+  TCB_ONLY_CREATE_FIELDS,
+} from './router.js';
 import { ApprovalService } from './service.js';
 import { createTenantResolver } from './tenant-context.js';
 import { InMemoryApprovalStoreFactory } from './tenant-store.js';
-import type { ApprovalRecord } from './types.js';
+import type { ApprovalRecord, CreateApprovalInput } from './types.js';
 
 // Header-based test authenticator behind the real TenantResolver (production
 // wires sessions/JWTs into the same seam). The x-actor-tenant header defaults
@@ -142,6 +146,63 @@ describe('createApprovalRouter', () => {
       });
     },
   );
+
+  it('classifies every CreateApprovalInput field exactly once — new fields cannot slip past the allowlist', () => {
+    // #given — the type-level pin: an unclassified field makes `true` not
+    // assignable to the union below, so this file stops COMPILING until the
+    // new field is deliberately sorted into CLIENT_CREATE_FIELDS or
+    // TCB_ONLY_CREATE_FIELDS. That is the fail-closed inversion of the old
+    // body spread, where a forgotten denylist entry silently granted.
+    type Classified =
+      | (typeof CLIENT_CREATE_FIELDS)[number]
+      | (typeof TCB_ONLY_CREATE_FIELDS)[number];
+    type Unclassified = Exclude<keyof CreateApprovalInput, Classified>;
+    const allClassified: [Unclassified] extends [never] ? true : Unclassified =
+      true;
+
+    // #then — and the two lists never overlap (a field in both would 400)
+    expect(allClassified).toBe(true);
+    const overlap = CLIENT_CREATE_FIELDS.filter((field) =>
+      (TCB_ONLY_CREATE_FIELDS as readonly string[]).includes(field),
+    );
+    expect(overlap).toEqual([]);
+  });
+
+  it('drops a body field that is in NEITHER list instead of forwarding it to service.create', async () => {
+    // #given — the allowlist pick: a future CreateApprovalInput field that
+    // nobody classified must be inert over HTTP, not flow through a spread
+    const { handle } = makeHandler({ allowCreate: true });
+
+    // #when
+    const record = await createOne(handle, {
+      ...CREATE_BODY,
+      futureCapabilityField: 'attacker-controlled',
+    });
+
+    // #then — created (no 400: only TCB names reject), but the field never
+    // reached the record
+    expect(record).not.toHaveProperty('futureCapabilityField');
+  });
+
+  it('copies every allowlisted optional field through', async () => {
+    // #given
+    const { handle } = makeHandler({ allowCreate: true });
+
+    // #when
+    const record = await createOne(handle, {
+      ...CREATE_BODY,
+      summary: 'a human summary',
+      priority: 'high',
+      payload: { context: 42 },
+    });
+
+    // #then
+    expect(record).toMatchObject({
+      summary: 'a human summary',
+      priority: 'high',
+      payload: { context: 42 },
+    });
+  });
 
   it('forces requestedBy to the authenticated actor', async () => {
     // #given

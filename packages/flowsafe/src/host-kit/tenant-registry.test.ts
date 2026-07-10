@@ -4,37 +4,13 @@
 
 import { describe, expect, it } from 'vitest';
 
+import { openSqlite, type SqliteDatabase } from '../../test-support/sqlite.js';
 import {
   provisionTenant,
   TenantCollisionError,
   type TenantRegistryDatabase,
   type TenantRegistryStatement,
 } from './tenant-registry.js';
-
-interface SqliteStatement {
-  get(...params: unknown[]): unknown;
-  run(...params: unknown[]): unknown;
-  all(...params: unknown[]): unknown[];
-}
-
-interface SqliteDatabase {
-  prepare(sql: string): SqliteStatement;
-}
-
-function openSqlite(): SqliteDatabase {
-  const getBuiltin = (
-    globalThis as {
-      process?: { getBuiltinModule?: (id: string) => unknown };
-    }
-  ).process?.getBuiltinModule;
-  if (!getBuiltin) {
-    throw new Error('node:sqlite unavailable — tests require node >= 22.13');
-  }
-  const mod = getBuiltin('node:sqlite') as {
-    DatabaseSync: new (path: string) => SqliteDatabase;
-  };
-  return new mod.DatabaseSync(':memory:');
-}
 
 function d1Like(db: SqliteDatabase): TenantRegistryDatabase {
   function statement(sql: string, params: unknown[]): TenantRegistryStatement {

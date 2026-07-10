@@ -1,0 +1,107 @@
+// D1-backed RateLimitStore — a durable fixed-window budget shared across
+// isolates. The in-memory store is per-isolate, and under flowsafe's
+// DO-per-run routing "per isolate" degrades to "per RUN": ten concurrent runs
+// each get a fresh window, so a manifest `rateLimit: '5/min'` admits fifty
+// executions a minute. Sharing the counter in D1 makes the declared budget
+// mean what it says across every isolate that shares the database. The
+// count-then-check contract matches InMemoryRateLimitStore exactly: the
+// UPSERT always increments and returns the post-increment count; the
+// connector wrapper compares it to the manifest limit. Structural typing on
+// purpose (no @cloudflare/workers-types import), same posture as
+// D1IdempotencyStore: tests back the interface with node:sqlite, Workers
+// pass env.DB.
+
+import type { RateLimitStore } from './index.js';
+
+/** The subset of D1Database this store uses. */
+export interface RateLimitDatabase {
+  prepare(query: string): RateLimitStatement;
+}
+
+export interface RateLimitStatement {
+  bind(...values: unknown[]): RateLimitStatement;
+  first<T = unknown>(): Promise<T | null>;
+  run(): Promise<unknown>;
+}
+
+export interface D1RateLimitStoreOptions {
+  /** Table name (default 'breakwater_rate_limit'). */
+  table?: string;
+}
+
+const DEFAULT_TABLE = 'breakwater_rate_limit';
+
+export class D1RateLimitStore implements RateLimitStore {
+  readonly #db: RateLimitDatabase;
+  readonly #table: string;
+  #schemaReady?: Promise<void>;
+
+  constructor(db: RateLimitDatabase, options: D1RateLimitStoreOptions = {}) {
+    this.#db = db;
+    this.#table = options.table ?? DEFAULT_TABLE;
+  }
+
+  async increment(key: string, windowMs: number, now: number): Promise<number> {
+    await this.#ready();
+    // Epoch-aligned bucketing, identical to InMemoryRateLimitStore: every
+    // isolate computes the same window boundaries from the caller's clock.
+    const windowStart = now - (now % windowMs);
+    // The UPSERT is the atomicity: concurrent increments against one
+    // (key, window) row serialize in the database, and RETURNING hands each
+    // caller its own post-increment count — no read-modify-write race.
+    const row = await this.#db
+      .prepare(
+        `INSERT INTO ${this.#table} (budget_key, window_start, count)
+         VALUES (?, ?, 1)
+         ON CONFLICT(budget_key, window_start) DO UPDATE
+           SET count = count + 1
+         RETURNING count`,
+      )
+      .bind(key, windowStart)
+      .first<{ count: number }>();
+    if (!row) {
+      // INSERT-or-UPDATE always yields a row; no row means the database
+      // misbehaved. Throw (the wrapper records it and fails the call closed)
+      // rather than return a count that under-reports spend.
+      throw new Error(
+        `D1RateLimitStore: increment returned no row for '${key}'`,
+      );
+    }
+    if (row.count === 1) {
+      // This call OPENED the window, so reap the key's expired windows now —
+      // one DELETE per rollover per key instead of per call, keeping the
+      // table at ~one live row per budget key.
+      await this.#db
+        .prepare(
+          `DELETE FROM ${this.#table}
+           WHERE budget_key = ? AND window_start < ?`,
+        )
+        .bind(key, windowStart)
+        .run();
+    }
+    return row.count;
+  }
+
+  // Lazy, memoized schema creation; a failed attempt clears the memo so the
+  // next call retries instead of pinning the store to a dead promise.
+  #ready(): Promise<void> {
+    this.#schemaReady ??= this.#createSchema().catch((error: unknown) => {
+      this.#schemaReady = undefined;
+      throw error;
+    });
+    return this.#schemaReady;
+  }
+
+  async #createSchema(): Promise<void> {
+    await this.#db
+      .prepare(
+        `CREATE TABLE IF NOT EXISTS ${this.#table} (
+          budget_key TEXT NOT NULL,
+          window_start INTEGER NOT NULL,
+          count INTEGER NOT NULL,
+          PRIMARY KEY (budget_key, window_start)
+        )`,
+      )
+      .run();
+  }
+}

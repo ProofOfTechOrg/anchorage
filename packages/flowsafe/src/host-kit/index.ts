@@ -15,20 +15,38 @@
 
 export {
   queueApprovalForSuspension,
-  requestedConnectors,
   type ResumeRunFn,
   resumeRunWithRequeue,
 } from './approval-bridge.js';
 export { bearerActorAuthenticator, parseActorTokens } from './bearer-auth.js';
 export { doSummary, type DoResponseLike } from './do-response.js';
+export {
+  createDoRunTopology,
+  type DoRunTopology,
+  type RunnerNamespaceLike,
+  type RunnerStubLike,
+} from './do-run-topology.js';
+export { boolVar, numberVar, type NumberVarOptions } from './env-vars.js';
+// hostAuditSink stays module-internal for the same reason as
+// requestedConnectors below: it is the primitive beneath
+// buildHostApprovalService / runSlaSweepMaintenance, and no host consumes it
+// directly.
+export {
+  approvalStoreFactoryFor,
+  buildHostApprovalService,
+  type HostApprovalServiceOptions,
+  maintenanceActor,
+  runSlaSweepMaintenance,
+  type SlaSweepMaintenanceOptions,
+} from './host-approval-service.js';
 export { assertWorkflowsRegistered } from './registration.js';
 export { RunRouteError } from './run-route-error.js';
 export { createRunRouter } from './run-router.js';
 export type { RunRouter, RunRouterOptions } from './run-router.js';
-export {
-  subdomainTenantOf,
-  withSubdomainCrossCheck,
-} from './subdomain-check.js';
+// requestedConnectors and subdomainTenantOf stay module-internal on purpose:
+// they are the primitives beneath queueApprovalForSuspension /
+// withSubdomainCrossCheck, and no host consumes them directly.
+export { withSubdomainCrossCheck } from './subdomain-check.js';
 export type { SubdomainCrossCheckOptions } from './subdomain-check.js';
 export {
   provisionTenant,

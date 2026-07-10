@@ -7,6 +7,7 @@
 import {
   createConnector,
   IDEMPOTENCY_KEY_CONTEXT_KEY,
+  tenantIsolation,
 } from '@proofoftech/breakwater';
 import { z } from 'zod';
 
@@ -70,7 +71,13 @@ export const contentPipelineModule: WorkflowModule<ShowcaseModuleDeps> = {
         requiresApproval: true,
         idempotencyKey: true,
       },
-      policies: { audit, idempotencyStore: deps.idempotency },
+      // tenantIsolation: scope-less calls deny instead of collapsing to
+      // unsegmented keys — mandatory on a multi-tenant host (see gtm-outbound).
+      policies: {
+        audit,
+        idempotencyStore: deps.idempotency,
+        evaluators: [tenantIsolation()],
+      },
       execute: async ({ workflowId, runId, name, article }) => {
         const record = await deps.artifactStore.put(
           { workflowId, runId, name },

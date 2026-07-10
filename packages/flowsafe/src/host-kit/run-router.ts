@@ -9,7 +9,11 @@
 //
 //   1. authenticate                        -> 401
 //   2. any POST, coarse RUN_START_ROLES    -> 403   (reviewer/viewer are read-only)
-//   3. per-workflow meta.allowedRoles      -> 403   (a module may narrow further)
+//   3. per-workflow meta.allowedRoles      -> 403   (a module may narrow further;
+//                                                    applied to EVERY mutating
+//                                                    route — start via the body's
+//                                                    workflowId, resume and any
+//                                                    future POST via the path's)
 //
 // and the suspension bridge: a start that suspends queues its approval
 // attributed to the STARTING actor, so that actor cannot later decide their own
@@ -143,9 +147,10 @@ async function readJson(request: Request): Promise<unknown> {
 export function createRunRouter(options: RunRouterOptions): RunRouter {
   const { workflows, resolve } = options;
   const systemActorId = options.systemActorId ?? 'flowsafe-system';
+  const metaById = new Map(workflows.map((meta) => [meta.id, meta]));
 
   function metaFor(workflowId: string): WorkflowMeta | undefined {
-    return workflows.find((candidate) => candidate.id === workflowId);
+    return metaById.get(workflowId);
   }
 
   return async (request: Request): Promise<Response | null> => {
@@ -219,14 +224,17 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
           role: 'operator',
           tenantId: tenant.tenantId,
         };
-        const record = await queueApprovalForSuspension(
+        const approvals = await queueApprovalForSuspension(
           tenant.service(),
           body.workflowId,
           summary,
           actor.id,
           systemActor,
         );
-        return json({ ...summary, approval: record });
+        // `approval` remains the single-gate response contract (what the SPA
+        // links); `approvals` carries every record a parallel multi-step
+        // suspension filed, so no gate is invisible to the caller.
+        return json({ ...summary, approval: approvals[0], approvals });
       }
 
       // Status and resume both validate the workflow against the catalog: the
@@ -246,6 +254,23 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
         !tenant.ownsRun(runId)
       ) {
         return json({ error: 'run not found' }, 404);
+      }
+
+      // Per-workflow RBAC, mirrored from the start route: a module that
+      // narrows who may START a workflow also narrows who may ADVANCE it —
+      // resume drives the same state machine. Hoisted above dispatch so a
+      // future mutating route cannot forget it; GETs stay coarse
+      // (reviewer/viewer inspect runs they may not drive). Placed after the
+      // 404s above so another tenant's probe learns nothing it could not read
+      // from its own /workflows catalog.
+      if (request.method !== 'GET' && workflowId) {
+        const allowedRoles = metaFor(workflowId)?.allowedRoles;
+        if (allowedRoles && !allowedRoles.includes(actor.role)) {
+          return json(
+            { error: `role '${actor.role}' may not advance '${workflowId}'` },
+            403,
+          );
+        }
       }
 
       if (

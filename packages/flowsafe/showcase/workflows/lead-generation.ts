@@ -3,7 +3,7 @@
 // with a post-fan-in gate, a network-egress-allowlisted + rate-limited CRM write
 // connector (binding-gated; simulated offline).
 
-import { createConnector } from '@proofoftech/breakwater';
+import { createConnector, tenantIsolation } from '@proofoftech/breakwater';
 import { z } from 'zod';
 
 import type { WorkflowModule } from '../../src/host-kit/module.js';
@@ -91,10 +91,13 @@ export const leadGenerationModule: WorkflowModule<ShowcaseModuleDeps> = {
         egress: [CRM_HOST],
         rateLimit: '5/min',
       },
+      // tenantIsolation: scope-less calls deny instead of collapsing to
+      // unsegmented keys — mandatory on a multi-tenant host (see gtm-outbound).
       policies: {
         audit,
         networkEgress: { allowedDomains: [CRM_HOST] },
         rateLimitStore: deps.rateLimit,
+        evaluators: [tenantIsolation()],
       },
       execute: async ({ assignments }) => {
         if (!crm) {

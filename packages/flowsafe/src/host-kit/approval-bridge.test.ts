@@ -13,9 +13,11 @@ import {
   InMemoryApprovalStore,
 } from '../approval-api/index.js';
 import type { RunSummary } from '../do-runner/index.js';
+// requestedConnectors is module-internal (not on the barrel): it is the
+// primitive beneath queueApprovalForSuspension, tested here directly.
+import { requestedConnectors } from './approval-bridge.js';
 import {
   queueApprovalForSuspension,
-  requestedConnectors,
   type ResumeRunFn,
   resumeRunWithRequeue,
 } from './index.js';
@@ -75,7 +77,7 @@ describe('queueApprovalForSuspension', () => {
     );
 
     // #when — the bridge queues the approval
-    const record = await queueApprovalForSuspension(
+    const records = await queueApprovalForSuspension(
       service,
       'product-launch',
       summary,
@@ -84,7 +86,8 @@ describe('queueApprovalForSuspension', () => {
     );
 
     // #then — the binding fingerprint is copied verbatim from the summary
-    expect(record).toMatchObject({
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
       workflowId: 'product-launch',
       runId: 'acme_run-1',
       stepPath: ['gate2'],
@@ -94,6 +97,90 @@ describe('queueApprovalForSuspension', () => {
       requestedBy: 'reviewer-of-gate1',
       status: 'pending',
     });
+  });
+
+  it('files one record PER suspended path when parallel branches suspend together', async () => {
+    // #given — a .parallel() run suspended at TWO gates in one summary
+    const store = new InMemoryApprovalStore('acme');
+    const service = new ApprovalService({ store });
+    const summary: RunSummary = {
+      runId: 'acme_run-parallel',
+      status: 'suspended',
+      suspended: [['gateA'], ['gateB']],
+      suspendPayload: {
+        gateA: { reason: 'gate A', connectors: ['conn-a'] },
+        gateB: { reason: 'gate B', connectors: ['conn-b'] },
+      },
+      suspendedAt: { gateA: 111, gateB: 222 },
+    };
+
+    // #when — the bridge queues the suspension
+    const records = await queueApprovalForSuspension(
+      service,
+      'parallel-gates',
+      summary,
+      'starter',
+      SYSTEM,
+    );
+
+    // #then — BOTH gates reach the queue, each bound to its own suspension
+    // and carrying its own connectors. A gate that never files can never be
+    // decided: its connector would deny on every resume with nothing telling
+    // a reviewer why the run is stuck.
+    expect(records).toHaveLength(2);
+    expect(records.map((record) => record.stepPath)).toEqual([
+      ['gateA'],
+      ['gateB'],
+    ]);
+    expect(records[0]).toMatchObject({
+      suspendedAt: 111,
+      connectors: ['conn-a'],
+    });
+    expect(records[1]).toMatchObject({
+      suspendedAt: 222,
+      connectors: ['conn-b'],
+    });
+    expect(await store.list({ status: 'pending' })).toHaveLength(2);
+  });
+
+  it('isolates a failing gate filing: siblings still file and the error aggregates', async () => {
+    // #given — a store that rejects gateA's record but accepts gateB's (a
+    // transient D1 hiccup mid-loop). The run is already suspended by now and
+    // a POST /runs retry mints a FRESH runId, so abandoning the loop on the
+    // first failure would strand gateB with no record and no retry path.
+    const store = new InMemoryApprovalStore('acme');
+    const originalCreate = store.create.bind(store);
+    (store as { create: typeof store.create }).create = async (record) => {
+      if (record.stepPath?.[0] === 'gateA') throw new Error('d1 hiccup');
+      return originalCreate(record);
+    };
+    const service = new ApprovalService({ store });
+    const summary: RunSummary = {
+      runId: 'acme_run-partial',
+      status: 'suspended',
+      suspended: [['gateA'], ['gateB']],
+      suspendPayload: {
+        gateA: { reason: 'gate A', connectors: ['conn-a'] },
+        gateB: { reason: 'gate B', connectors: ['conn-b'] },
+      },
+      suspendedAt: { gateA: 111, gateB: 222 },
+    };
+
+    // #when / #then — the failure still surfaces, aggregated...
+    await expect(
+      queueApprovalForSuspension(
+        service,
+        'parallel-gates',
+        summary,
+        'starter',
+        SYSTEM,
+      ),
+    ).rejects.toThrow(/1 of 2 gate filing\(s\) failed/);
+
+    // ...but gateB's filing landed rather than being abandoned
+    const open = await store.list({ status: 'pending' });
+    expect(open).toHaveLength(1);
+    expect(open[0]?.stepPath).toEqual(['gateB']);
   });
 });
 

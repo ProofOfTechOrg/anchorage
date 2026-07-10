@@ -10,6 +10,7 @@
 import {
   createConnector,
   crossWorkflowIsolation,
+  tenantIsolation,
 } from '@proofoftech/breakwater';
 import { z } from 'zod';
 
@@ -65,6 +66,10 @@ export const accessRequestModule: WorkflowModule<ShowcaseModuleDeps> = {
             targetScopeOf: (call) =>
               (call.input as { targetScope?: string }).targetScope,
           }),
+          // tenantIsolation: scope-less calls deny instead of collapsing to
+          // unsegmented keys — mandatory on a multi-tenant host (see
+          // gtm-outbound).
+          tenantIsolation(),
         ],
       },
       execute: async ({ resource, role }) => {

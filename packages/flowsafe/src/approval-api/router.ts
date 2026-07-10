@@ -56,6 +56,29 @@ export const TCB_ONLY_CREATE_FIELDS = [
   'requestedBy',
 ] as const;
 
+/**
+ * The complement: what a request body MAY set. The create route copies ONLY
+ * these fields off the body — an allowlist, so a field added to
+ * CreateApprovalInput later is INERT over HTTP until it is deliberately
+ * classified here (fail closed by construction; a body spread would instead
+ * hand every future field to service.create unless someone remembered to
+ * extend the denylist above). TCB_ONLY_CREATE_FIELDS stays as the
+ * 400-with-a-reason layer; router.test.ts pins at the type level that the two
+ * lists exactly cover CreateApprovalInput.
+ */
+export const CLIENT_CREATE_FIELDS = [
+  'workflowId',
+  'runId',
+  'title',
+  'summary',
+  'payload',
+  'priority',
+  'slaSeconds',
+] as const satisfies readonly Exclude<
+  keyof CreateApprovalInput,
+  (typeof TCB_ONLY_CREATE_FIELDS)[number]
+>[];
+
 export interface ApprovalRouterOptions {
   /**
    * Authenticates the request and binds the tenant-scoped service (INV-2).
@@ -196,16 +219,17 @@ export function createApprovalRouter(
               );
             }
           }
+          // Attribution is the authenticated identity, never the body:
+          // service.create still honours input.requestedBy for the
+          // in-process bridge (which legitimately attributes the human who
+          // advanced the run), so the tightening lives here at the HTTP
+          // boundary alone.
+          const input: Record<string, unknown> = { requestedBy: actor.id };
+          for (const field of CLIENT_CREATE_FIELDS) {
+            if (field in body) input[field] = body[field];
+          }
           const { record, created } = await service.create(
-            // Attribution is the authenticated identity, never the body:
-            // service.create still honours input.requestedBy for the
-            // in-process bridge (which legitimately attributes the human who
-            // advanced the run), so the tightening lives here at the HTTP
-            // boundary alone.
-            {
-              ...body,
-              requestedBy: actor.id,
-            } as unknown as CreateApprovalInput,
+            input as unknown as CreateApprovalInput,
             actor,
           );
           return json(record, created ? 201 : 200);

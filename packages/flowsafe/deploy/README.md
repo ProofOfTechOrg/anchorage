@@ -113,18 +113,26 @@ no Cloudflare account needed).
 
 ## What the cron does
 
-`triggers.crons` fires `scheduled()`, which runs the two enforcement surfaces
-(each isolated, so one failing never masks the other):
+`triggers.crons` declares TWO expressions, and `scheduled()` dispatches on
+`controller.cron` (`SWEEP_CRON` vs `PURGE_CRON` in worker.ts) so the two
+enforcement surfaces never share an invocation — a Workers CPU-limit
+termination kills the isolate and is **not** a catchable JS error, so a slow
+sweep sharing an invocation would permanently starve the purge no matter how
+many try/catches wrap them. (An expression the dispatch does not recognize —
+wrangler edited without the constants — runs both sequentially and logs a
+config-error: availability of both duties beats purity on a misconfig.)
 
 - **SLA sweep** — the standalone `sweepSLA(factory.system(), …)` escalates
   every open approval past its `slaDeadlineAt`, across all tenants; each
-  escalation hits the `onEscalation` notification seam and the audit trail.
+  escalation lands a structured `sla-escalation` log line and the audit
+  trail (extend `runSlaSweepMaintenance`'s seam to page/Slack from it).
   It is deliberately **not** a service method and **not** an HTTP route: an
   unfiltered cross-tenant read *and write* behind a role check would let any
   sweep-capable actor escalate every tenant's queue. Its parameter type,
   `SystemApprovalStore`, is unobtainable from a request handler.
 - **Retention purge** — `purgeExpiredWorkflowRuns()` deletes terminal-status
-  run snapshots older than `RUN_RETENTION_DAYS`. Suspended and running runs
+  run snapshots older than `RUN_RETENTION_DAYS`, LIMIT-batched per firing
+  (the shrinking eligible set is the cursor). Suspended and running runs
   are never purged, so a run abandoned at an approval gate is reclaimed only
   by `purgeTenant()` at offboarding. Storing run artifacts in R2? Pass your
   `R2ArtifactStore` as `artifactStore` (here and to `purgeTenant`): the
@@ -132,10 +140,8 @@ no Cloudflare account needed).
   retention purge strands the purged runs' artifacts.
 
 Keep the sweep interval at or below your SLA granularity; the default
-`*/15 * * * *` gives 4-hour SLAs minute-scale slack. If you add a second cron
-expression (the showcase splits sweep and purge), dispatch on
-`controller.cron` — a Workers CPU-limit termination kills the isolate and is
-not catchable, so a slow sweep sharing an invocation would starve the purge.
+`*/15 * * * *` gives 4-hour SLAs minute-scale slack. Keep the wrangler
+expressions byte-equal to worker.ts's `SWEEP_CRON`/`PURGE_CRON` constants.
 
 ## Configuration
 
@@ -144,7 +150,7 @@ not catchable, so a slow sweep sharing an invocation would starve the purge.
 | `APPROVAL_ACTOR_TOKENS` | secret | none (all authed routes 401) | JSON map of bearer token → `{ id, role, tenantId }`; entries without an INV-3-valid `tenantId` are dropped |
 | `TENANT_APEX_DOMAIN` | var | unset (no cross-check) | Client-per-subdomain apex, e.g. `example.com`. A request to `<tenant>.<apex>` is denied unless the token's verified tenant is that tenant. Defense in depth over the tenant-bound stores |
 | `APPROVAL_SLA_SECONDS` | var | `14400` (4h) | Default SLA applied to new approvals |
-| `RUN_RETENTION_DAYS` | var | `30` | Terminal snapshot age before cron purge |
+| `RUN_RETENTION_DAYS` | var | `30` | Terminal snapshot age before cron purge; `0` purges terminal runs immediately |
 | `AUDIT_QUEUE` | queue binding | unbound (logs only) | Enables audit export: events flow to the queue consumer |
 | `SIEM_ENDPOINT` | var | none (consumer retries) | HTTP event-collector URL the consumer POSTs NDJSON batches to |
 | `SIEM_AUTH_HEADER` | secret | none | Sent as the `authorization` header on export POSTs |

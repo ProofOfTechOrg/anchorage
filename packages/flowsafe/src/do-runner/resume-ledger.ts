@@ -21,10 +21,18 @@ export interface ResumeLedger {
    * the suspension currently being resumed (undefined = first suspension).
    */
   counts(runKey: string): Promise<ReadonlyMap<string, number> | undefined>;
-  /** Record one more resume of stepKey; resolves to the run's updated counts. */
+  /**
+   * Record one more resume of stepKey; resolves to the run's updated counts.
+   * `prior` is a read-elision hint: the run's current counts as read by
+   * counts() under the SAME per-run lock, with nothing writing in between
+   * (an empty map when the run has none). An I/O-backed ledger uses it to
+   * skip re-reading what the lock guarantees unchanged; implementations with
+   * free reads may ignore it. Omit when no such fresh read exists.
+   */
   increment(
     runKey: string,
     stepKey: string,
+    prior?: ReadonlyMap<string, number>,
   ): Promise<ReadonlyMap<string, number>>;
   /** Drop the run's ledger — call only once the run is terminal. */
   delete(runKey: string): Promise<void>;
@@ -95,9 +103,14 @@ export class DurableStorageResumeLedger implements ResumeLedger {
   async increment(
     runKey: string,
     stepKey: string,
+    prior?: ReadonlyMap<string, number>,
   ): Promise<ReadonlyMap<string, number>> {
     const key = KEY_PREFIX + runKey;
-    const counts = new Map((await this.#storage.get<StoredCounts>(key)) ?? []);
+    // `prior` (read under the run lock) elides a second billed storage.get
+    // for the value the lock guarantees unchanged.
+    const counts = new Map(
+      prior ?? (await this.#storage.get<StoredCounts>(key)) ?? [],
+    );
     counts.set(stepKey, (counts.get(stepKey) ?? 0) + 1);
     await this.#storage.put(key, [...counts.entries()]);
     return counts;

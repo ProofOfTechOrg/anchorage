@@ -205,7 +205,10 @@ export class InMemoryIdempotencyStore implements AtomicIdempotencyStore {
 
 /**
  * Fixed-window rate-limit counters keyed by connector id. Implementations
- * back the manifest's `rateLimit` budget.
+ * back the manifest's `rateLimit` budget. The store's reach IS the budget's
+ * reach: InMemoryRateLimitStore caps per isolate (per RUN under DO-per-run
+ * routing); a declared cap that must hold across isolates needs
+ * D1RateLimitStore (or an equivalent shared store).
  */
 export interface RateLimitStore {
   /**
@@ -543,7 +546,10 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     if (!rateLimit) return;
     // Budget key segments by isolation scope: tenant A exhausting connector
     // `c` must not throttle tenant B. No scope => the connector id alone,
-    // today's single-tenant key.
+    // today's single-tenant key. The key only NAMES the budget — how far it
+    // is shared is the store's reach: an in-memory store bounds the window
+    // to this isolate (under DO-per-run routing, to this RUN), so a cap that
+    // must hold across isolates needs a durable store (D1RateLimitStore).
     const scope = isolationScopeOf(requestContext);
     const budgetKey = scope === undefined ? id : `${scope}:${id}`;
     let count: number;
@@ -906,11 +912,17 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   return tool;
 }
 
-// Durable D1-backed idempotency store (kept in its own module; only type
-// imports flow back into this one, so there is no runtime cycle).
+// Durable D1-backed stores (kept in their own modules; only type imports
+// flow back into this one, so there is no runtime cycle).
 export { D1IdempotencyStore } from './d1-idempotency-store.js';
 export type {
   D1IdempotencyStoreOptions,
   IdempotencyDatabase,
   IdempotencyStatement,
 } from './d1-idempotency-store.js';
+export { D1RateLimitStore } from './d1-rate-limit-store.js';
+export type {
+  D1RateLimitStoreOptions,
+  RateLimitDatabase,
+  RateLimitStatement,
+} from './d1-rate-limit-store.js';

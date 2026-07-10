@@ -144,25 +144,30 @@ export function DemoActorSwitcher({
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ token: current.token }),
-      }).then(async (response) => {
-        if (response.status === 401) {
-          narrate([sessionExpiredEvent()]);
-          onExpired();
-          return;
-        }
-        if (!response.ok) return; // transient — retry next tick
-        const next = (await response.json()) as DemoTokenSet;
-        onSession(next);
-        narrate([tokenRefreshedEvent()]);
-        // Keep the selected ROLE across the rotation.
-        const selected = sessionRef.current.tokens.find(
-          (entry) => entry.token === actorTokenRef.current,
-        );
-        const replacement = next.tokens.find(
-          (entry) => entry.id === selected?.id,
-        );
-        if (replacement) onSelect(replacement.token);
-      });
+      })
+        .then(async (response) => {
+          if (response.status === 401) {
+            narrate([sessionExpiredEvent()]);
+            onExpired();
+            return;
+          }
+          if (!response.ok) return; // transient — retry next tick
+          const next = (await response.json()) as DemoTokenSet;
+          onSession(next);
+          narrate([tokenRefreshedEvent()]);
+          // Keep the selected ROLE across the rotation.
+          const selected = sessionRef.current.tokens.find(
+            (entry) => entry.token === actorTokenRef.current,
+          );
+          const replacement = next.tokens.find(
+            (entry) => entry.id === selected?.id,
+          );
+          if (replacement) onSelect(replacement.token);
+        })
+        // A network blip (or a malformed body) is transient like a non-ok
+        // response: swallow and retry next tick — same posture as
+        // useDemoSignIn — instead of surfacing an unhandled rejection.
+        .catch(() => undefined);
     }, REFRESH_INTERVAL_MS);
     return () => clearInterval(timer);
   }, [onSelect, onSession, onExpired, narrate]);

@@ -335,6 +335,72 @@ describe('createRunRouter — per-workflow allowedRoles', () => {
       },
     ]);
   });
+
+  it('403s an operator RESUMING a restricted workflow — allowedRoles binds every mutating route, not just start', async () => {
+    // #given — an operator who was 403'd from starting restricted-flow must
+    // not be able to drive an admin-started run to completion via resume
+    const { handle, resumed } = makeHarness();
+
+    // #when
+    const response = await handle(
+      req('/runs/restricted-flow/acme_r1/resume', {
+        body: { resumeData: { approved: false } },
+        actor: OPERATOR,
+      }),
+    );
+
+    // #then — denied before the host thunk is consulted
+    expect(response?.status).toBe(403);
+    expect(await response?.json()).toMatchObject({
+      error: "role 'operator' may not advance 'restricted-flow'",
+    });
+    expect(resumed).toEqual([]);
+  });
+
+  it('lets an allowed role resume the restricted workflow', async () => {
+    // #given
+    const { handle, resumed } = makeHarness();
+
+    // #when
+    const response = await handle(
+      req('/runs/restricted-flow/acme_r1/resume', {
+        body: { resumeData: { approved: true } },
+        actor: BUILDER,
+      }),
+    );
+
+    // #then
+    expect(response?.status).toBe(200);
+    expect(resumed).toHaveLength(1);
+  });
+
+  it('keeps restricted-workflow STATUS reads open to read-only roles — reads stay coarse', async () => {
+    // #given — reviewer/viewer inspect runs they may not drive
+    const { handle } = makeHarness();
+
+    // #when / #then
+    expect(
+      (await handle(req('/runs/restricted-flow/acme_r1', { actor: VIEWER })))
+        ?.status,
+    ).toBe(200);
+  });
+
+  it("still 404s another tenant's run BEFORE the role check — no oracle for narrowed workflows", async () => {
+    // #given — a beta operator (not in restricted-flow's allowedRoles)
+    // probing an acme runId must see the same 404 an allowed role would
+    const { handle } = makeHarness();
+
+    // #when
+    const response = await handle(
+      req('/runs/restricted-flow/acme_r1/resume', {
+        body: {},
+        actor: { id: 'eve', role: 'operator', tenantId: 'beta' },
+      }),
+    );
+
+    // #then — 404, not the 403 the role check would emit
+    expect(response?.status).toBe(404);
+  });
 });
 
 describe('createRunRouter — POST /runs', () => {

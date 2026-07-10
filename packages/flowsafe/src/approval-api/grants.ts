@@ -103,6 +103,13 @@ function boundToCurrentSuspension(
   // (pre-capture bridges): service-clock decidedAt strictly after the core-
   // clock suspendedAt — correct on same-clock (single-Worker/Cloudflare)
   // topologies only; see security-threat-model.md boundary 6.
+  //
+  // TRANSITIONAL and self-draining — it fires only while pre-capture rows
+  // remain undecided, and no client can force it (`suspendedAt` is in
+  // TCB_ONLY_CREATE_FIELDS). INVARIANT for writers: every NEW step-keyed
+  // record MUST capture `suspendedAt` (host-kit's bridge does); creating one
+  // without it would re-open the clock-dependence this exact-match binding
+  // exists to close.
   return (
     record.decidedAt !== undefined && Date.parse(record.decidedAt) > suspendedAt
   );

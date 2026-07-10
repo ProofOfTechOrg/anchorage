@@ -79,13 +79,14 @@ async function decideCurrent(
   actor: ApprovalActor,
   decision: 'approve' | 'reject' = 'approve',
 ) {
-  const record = await queueApprovalForSuspension(
+  const [record] = await queueApprovalForSuspension(
     harness.service,
     workflowId,
     summary,
     'starter',
     SYSTEM,
   );
+  if (!record) throw new Error('expected the suspension to queue an approval');
   return harness.service.decide(record.id, { decision }, actor);
 }
 
@@ -396,6 +397,60 @@ describe('access-request: gated grant with cross-workflow isolation', () => {
         decision: 'denied',
       }),
     );
+  });
+});
+
+describe('tenant isolation: scope-less connector calls are denied, not silently shared', () => {
+  // The runtime mints breakwater's isolation scope from the INV-1 runId
+  // prefix; a runId without one (path-safe, but no `${tenant}_` shape) mints
+  // NO scope. Without the tenantIsolation evaluator that call would fall back
+  // to UNSEGMENTED idempotency/rate-limit keys — tenant B replaying tenant
+  // A's cached result. Every showcase connector registers the evaluator, so
+  // the fallback is a denial instead.
+
+  it('denies the dry-run pre-flight of a scope-less run (the evaluator binds simulations too)', async () => {
+    // #given — a run whose runId carries no tenant prefix
+    const harness = buildHarness();
+
+    // #when — product-launch's FIRST step dry-runs the deploy connector
+    const started = await harness.runtime.start('product-launch', {
+      runId: 'noscope-run',
+      inputData: { productName: 'anchorage', version: '1.0.0' },
+    });
+
+    // #then — denied at the pre-execute gate, before any simulation
+    expect(started.status).toBe('failed');
+    expect(started.error).toContain('tenant-isolation');
+    expect(harness.audit.events()).toContainEqual(
+      expect.objectContaining({
+        resource: DEPLOY_CONNECTOR,
+        decision: 'denied',
+      }),
+    );
+  });
+
+  it('denies a scope-less gated write even when the resume forges approval', async () => {
+    // #given — a suspended scope-less run (the gate itself calls no connector)
+    const harness = buildHarness();
+    const started = await harness.runtime.start('gtm-outbound', {
+      runId: 'noscope-run2',
+      inputData: { industry: 'fintech', targetCount: 5 },
+    });
+    expect(started.status).toBe('suspended');
+
+    // #when — a forged approved:true resume reaches the send step
+    const forged = await harness.runtime.resume(
+      'gtm-outbound',
+      'noscope-run2',
+      {
+        step: 'reviewAndApprove',
+        resumeData: { approved: true },
+      },
+    );
+
+    // #then — tenant-isolation denies ahead of the grant gate; nothing sent
+    expect(forged.status).toBe('failed');
+    expect(forged.error).toContain('tenant-isolation');
   });
 });
 

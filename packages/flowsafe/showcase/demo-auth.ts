@@ -14,6 +14,17 @@
 // already-issued JWTs die with it, not just new mints), and billing alerts.
 // Size DEMO_DAILY_RUN_CAP for the spend you can tolerate, not the traffic
 // you expect.
+//
+// What the run budgets DO bound: run STARTS and raw RESUME attempts — the
+// worker charges both before the DO round-trip, so a garbage-resume loop
+// against a suspended run burns budget instead of free DO CPU (a resume
+// that fails resumeSchema still cost a DO fetch + D1 snapshot read). Queue
+// DECISIONS are unmetered by design: each approval record is decidable
+// once, and records only exist because a charged start/resume suspended.
+// What they DON'T bound: status GETs, /auth/refresh, and approval-queue
+// reads — cheap per request but unlimited per token; the backstop for
+// raw request-rate abuse is platform-level (Cloudflare WAF rate rules),
+// not this module.
 
 import type { ApprovalActor, ApprovalRole } from '../src/approval-api/index.js';
 import { d1Changes } from '../src/do-runner/index.js';

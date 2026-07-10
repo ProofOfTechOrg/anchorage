@@ -80,8 +80,6 @@ export interface ApprovalServiceOptions {
    * AuditLogger's own sink policy).
    */
   audit?: ApprovalAuditSink;
-  /** Fired for each record sweepSLA() escalates. */
-  onEscalation?: (record: ApprovalRecord) => void;
   /** Applied when CreateApprovalInput.slaSeconds is absent. */
   defaultSlaSeconds?: number;
   /**
@@ -116,7 +114,6 @@ function isNonEmptyString(value: unknown): value is string {
 export class ApprovalService {
   readonly #store: TenantBoundApprovalStore;
   readonly #audit?: ApprovalAuditSink;
-  readonly #onEscalation?: (record: ApprovalRecord) => void;
   readonly #defaultSlaSeconds?: number;
   readonly #resumeRun?: (
     record: ApprovalRecord,
@@ -128,7 +125,6 @@ export class ApprovalService {
   constructor(options: ApprovalServiceOptions) {
     this.#store = options.store;
     this.#audit = options.audit;
-    this.#onEscalation = options.onEscalation;
     this.#defaultSlaSeconds = options.defaultSlaSeconds;
     this.#resumeRun = options.resumeRun;
     this.#allowSelfDecision = options.allowSelfDecision ?? false;

@@ -538,6 +538,23 @@ describe('ApprovalService.delegate', () => {
 });
 
 describe('ApprovalService.sweepSLA', () => {
+  it('ApprovalServiceOptions carries NO onEscalation — escalation hooks belong to sweepSLA alone', () => {
+    // #given — the option existed, was never read (its only reader was the
+    // retired service.sweepSLA), and both hosts passed a hook that could
+    // never fire. The pin: re-adding it makes this @ts-expect-error unused,
+    // which is itself a compile error — so it cannot come back silently.
+    const harness = makeHarness();
+    const options: ApprovalServiceOptions = {
+      store: harness.store,
+      // @ts-expect-error — onEscalation is not an ApprovalService option;
+      // wire SweepSLAOptions.onEscalation (the cron sweep) instead.
+      onEscalation: () => {},
+    };
+
+    // #then — the literal above is the assertion; keep the value used
+    expect(options.store).toBe(harness.store);
+  });
+
   it('escalates only breached open requests and fires onEscalation', async () => {
     // #given — one breached, one within SLA
     const onEscalation = vi.fn();

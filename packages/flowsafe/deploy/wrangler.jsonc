@@ -19,9 +19,13 @@
       "database_id": "REPLACE-WITH-YOUR-D1-DATABASE-ID"
     }
   ],
-  // Every firing runs the SLA sweep + retention purge (worker.ts scheduled()).
-  // Keep the interval >= your SLA granularity.
-  "triggers": { "crons": ["*/15 * * * *"] },
+  // TWO cron expressions, dispatched on controller.cron (worker.ts
+  // scheduled()): the SLA sweep and the retention purge never share an
+  // invocation — a CPU-limit termination is not catchable, so a slow sweep
+  // sharing one would permanently starve the purge. Keep these equal to
+  // worker.ts's SWEEP_CRON / PURGE_CRON; keep the sweep interval >= your SLA
+  // granularity.
+  "triggers": { "crons": ["*/15 * * * *", "7 * * * *"] },
   // Optional audit export to a SIEM: `wrangler queues create anchorage-audit`
   // (and anchorage-audit-dlq), uncomment, then set SIEM_ENDPOINT (var below)
   // and SIEM_AUTH_HEADER (secret). Without this block, audit events stay on

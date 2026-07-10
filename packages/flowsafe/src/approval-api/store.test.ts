@@ -12,6 +12,7 @@
 
 import { describe, expect, it } from 'vitest';
 
+import { openSqlite, type SqliteDatabase } from '../../test-support/sqlite.js';
 import type {
   ApprovalDatabase,
   ApprovalPreparedStatement,
@@ -50,35 +51,6 @@ function makeRecord(overrides: Partial<ApprovalRecord> = {}): ApprovalRecord {
 const T = '2026-07-06T12:00:00.000Z';
 
 // --- node:sqlite -> ApprovalDatabase adapter ------------------------------
-
-interface SqliteStatement {
-  get(...params: unknown[]): unknown;
-  run(...params: unknown[]): unknown;
-  all(...params: unknown[]): unknown[];
-}
-
-interface SqliteDatabase {
-  prepare(sql: string): SqliteStatement;
-}
-
-// process.getBuiltinModule loads the builtin without import machinery, so
-// neither vite's resolver (which cannot resolve node:sqlite) nor the
-// workers-types tsconfig (no @types/node) ever sees the specifier. Available
-// since node 22.3; node:sqlite itself is unflagged since 22.13.
-function openSqlite(): SqliteDatabase {
-  const getBuiltin = (
-    globalThis as {
-      process?: { getBuiltinModule?: (id: string) => unknown };
-    }
-  ).process?.getBuiltinModule;
-  if (!getBuiltin) {
-    throw new Error('node:sqlite unavailable — tests require node >= 22.13');
-  }
-  const mod = getBuiltin('node:sqlite') as {
-    DatabaseSync: new (path: string) => SqliteDatabase;
-  };
-  return new mod.DatabaseSync(':memory:');
-}
 
 function d1Like(db: SqliteDatabase): ApprovalDatabase {
   function statement(

@@ -33,11 +33,16 @@ export function requestedConnectors(stepPayload: unknown): string[] {
 }
 
 /**
- * A suspension IS an approval request: queue it (idempotently — the store's
- * partial unique index collapses duplicates). Capturing the step's
- * (suspendedAt, resumeCount) pair binds the approval to THIS suspension exactly
- * (clock-free grant minting), and the suspend payload's `connectors` declares
- * what a decision should mint.
+ * A suspension IS an approval request: queue one record per suspended step
+ * path (idempotently — the store's partial unique open-step index collapses
+ * duplicates, so re-queuing an already-queued gate is a no-op). EVERY path
+ * files: `.parallel()` branches can suspend together
+ * (`summary.suspended = [['a'], ['b']]`), and a gate that never reaches the
+ * queue can never be decided — its connector then denies on every resume
+ * (fail closed) with nothing telling a reviewer why the run is stuck.
+ * Capturing each step's (suspendedAt, resumeCount) pair binds its approval to
+ * THAT suspension exactly (clock-free grant minting), and each suspend
+ * payload's `connectors` declares what a decision should mint.
  *
  * `requestedBy` is the HUMAN who advanced the run to this suspension — the actor
  * who started it, or the reviewer whose decision caused a re-suspension at the
@@ -52,40 +57,64 @@ export async function queueApprovalForSuspension(
   summary: RunSummary,
   requestedBy: string,
   systemActor: ApprovalActor,
-): Promise<ApprovalRecord> {
-  const stepPath = summary.suspended?.[0];
-  const stepKey = stepPath?.join('.');
-  const stepPayload =
-    stepKey !== undefined &&
-    summary.suspendPayload !== null &&
-    typeof summary.suspendPayload === 'object'
-      ? (summary.suspendPayload as Record<string, unknown>)[stepKey]
-      : undefined;
-  const connectors = requestedConnectors(stepPayload);
-  const { record } = await service.create(
-    {
-      workflowId,
-      runId: summary.runId,
-      stepPath,
-      suspendedAt:
-        stepKey !== undefined ? summary.suspendedAt?.[stepKey] : undefined,
-      resumedAt:
-        stepKey !== undefined ? summary.resumedAt?.[stepKey] : undefined,
-      resumeCount:
-        stepKey !== undefined ? summary.resumeCount?.[stepKey] : undefined,
-      title: `Approve '${workflowId}' run`,
-      payload: summary.suspendPayload,
-      connectors: connectors.length > 0 ? connectors : undefined,
-      requestedBy,
-    },
-    systemActor,
-  );
-  return record;
+): Promise<ApprovalRecord[]> {
+  const suspended = summary.suspended ?? [];
+  const records: ApprovalRecord[] = [];
+  const failures: Array<{ stepKey: string; message: string }> = [];
+  for (const stepPath of suspended) {
+    const stepKey = stepPath.join('.');
+    const stepPayload =
+      summary.suspendPayload !== null &&
+      typeof summary.suspendPayload === 'object'
+        ? (summary.suspendPayload as Record<string, unknown>)[stepKey]
+        : undefined;
+    const connectors = requestedConnectors(stepPayload);
+    try {
+      const { record } = await service.create(
+        {
+          workflowId,
+          runId: summary.runId,
+          stepPath,
+          suspendedAt: summary.suspendedAt?.[stepKey],
+          resumedAt: summary.resumedAt?.[stepKey],
+          resumeCount: summary.resumeCount?.[stepKey],
+          title: `Approve '${workflowId}' run`,
+          payload: summary.suspendPayload,
+          connectors: connectors.length > 0 ? connectors : undefined,
+          requestedBy,
+        },
+        systemActor,
+      );
+      records.push(record);
+    } catch (error) {
+      // Isolate per path (the purge loops' convention): the run is ALREADY
+      // suspended by the time this files, and a client retry of POST /runs
+      // mints a fresh runId rather than re-filing this one — so a transient
+      // store failure on one gate must not abandon its siblings' filings.
+      // File every path that can file, then re-throw aggregated so the
+      // caller still surfaces the failure. Filed records persist (create is
+      // idempotent under the open-step unique index), and the next
+      // decision's re-queue re-files any gate still missing.
+      failures.push({
+        stepKey,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  if (failures.length > 0) {
+    throw new Error(
+      `queueApprovalForSuspension: ${failures.length} of ${suspended.length} gate filing(s) failed, the rest were queued (${failures
+        .map((failure) => `${failure.stepKey}: ${failure.message}`)
+        .join('; ')})`,
+    );
+  }
+  return records;
 }
 
 /**
  * Wrap a base resume fn so a run that re-suspends at a LATER gate auto-queues
- * its next approval — the multi-gate flow (product-launch's two gates). The base
+ * its next approval(s) — the multi-gate flow (product-launch's two gates); every
+ * suspended path re-queues, not just the first. The base
  * resume (resumeViaRuntime or a DO-stub fetch) deliberately omits re-queue; this
  * adds it without coupling to the host's resume topology.
  *

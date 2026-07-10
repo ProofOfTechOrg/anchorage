@@ -67,7 +67,9 @@ verification gate + `spike:verify` on push/PR to `main`. Phases 1-3:
   manifests enforce `dryRun` (per-call simulation via `DRY_RUN_CONTEXT_KEY`
   + `dryRunExecute`; unsupported manifests fail closed) and `rateLimit`
   ('<count>/<unit>' fixed windows against a `RateLimitStore`; only actual
-  executions consume budget). Idempotency grew `AtomicIdempotencyStore`
+  executions consume budget; the store's reach IS the budget's reach —
+  `D1RateLimitStore` shares the window across isolates, which DO-per-run
+  hosts need or the cap degrades to per-run). Idempotency grew `AtomicIdempotencyStore`
   (reserve/release — the wrapper prefers it) and `D1IdempotencyStore`
   (INSERT-claim CAS + stale-pending TTL takeover). `crossWorkflowIsolation`
   ships as a tool policy reading `WORKFLOW_SCOPE_CONTEXT_KEY`

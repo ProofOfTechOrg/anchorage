@@ -202,12 +202,16 @@ function summarize(
         suspendPayload: result.suspendPayload,
       };
       const suspendedKeys = result.suspended.map((path) => path.join('.'));
-      const suspendedAt = suspendedAtByStep(result.steps, suspendedKeys);
+      const suspendedAt = byStep(suspendedKeys, (key) =>
+        suspendedAtOf(result.steps, key),
+      );
       if (suspendedAt !== undefined) summary.suspendedAt = suspendedAt;
-      const resumedAt = resumedAtByStep(result.steps, suspendedKeys);
+      const resumedAt = byStep(suspendedKeys, (key) =>
+        resumedAtOf(result.steps, key),
+      );
       if (resumedAt !== undefined) summary.resumedAt = resumedAt;
       // resumeCount is runtime-owned (the ledger), NOT read from the snapshot.
-      const resumeCount = resumeCountByStep(counts, suspendedKeys);
+      const resumeCount = byStep(suspendedKeys, (key) => counts?.get(key));
       if (resumeCount !== undefined) summary.resumeCount = resumeCount;
       return summary;
     }
@@ -244,31 +248,20 @@ function resolveResumeStep(
 // The live attempt for a step. Repeated steps (foreach) store an array of
 // attempts, so the current suspension/resume is the latest; a single-run step
 // stores one entry. Shared by the suspendedAt/resumedAt/suspendPayload readers.
-function latestAttempt(steps: WorkflowState['steps'], stepKey: string) {
+function latestAttempt(
+  steps: WorkflowState['steps'] | undefined,
+  stepKey: string,
+) {
   const entry = steps?.[stepKey];
   return Array.isArray(entry) ? entry[entry.length - 1] : entry;
 }
 
 /** Epoch-ms suspension time of the step's latest attempt, if recorded. */
 function suspendedAtOf(
-  steps: WorkflowState['steps'],
+  steps: WorkflowState['steps'] | undefined,
   stepKey: string,
 ): number | undefined {
   return latestAttempt(steps, stepKey)?.suspendedAt;
-}
-
-/** RunSummary.suspendedAt: dot-joined step key -> epoch-ms suspension time. */
-function suspendedAtByStep(
-  steps: WorkflowState['steps'] | undefined,
-  suspendedKeys: readonly string[],
-): Record<string, number> | undefined {
-  if (!steps) return undefined;
-  const map: Record<string, number> = {};
-  for (const key of suspendedKeys) {
-    const at = suspendedAtOf(steps, key);
-    if (at !== undefined) map[key] = at;
-  }
-  return Object.keys(map).length > 0 ? map : undefined;
 }
 
 /**
@@ -278,59 +271,37 @@ function suspendedAtByStep(
  * signal. The grant binding uses `resumeCount` (the runtime ledger) instead.
  */
 function resumedAtOf(
-  steps: WorkflowState['steps'],
+  steps: WorkflowState['steps'] | undefined,
   stepKey: string,
 ): number | undefined {
   return latestAttempt(steps, stepKey)?.resumedAt;
 }
 
-/** RunSummary.resumedAt: dot-joined step key -> epoch-ms resume time. */
-function resumedAtByStep(
-  steps: WorkflowState['steps'] | undefined,
-  suspendedKeys: readonly string[],
-): Record<string, number> | undefined {
-  if (!steps) return undefined;
-  const map: Record<string, number> = {};
-  for (const key of suspendedKeys) {
-    const at = resumedAtOf(steps, key);
-    if (at !== undefined) map[key] = at;
-  }
-  return Object.keys(map).length > 0 ? map : undefined;
-}
-
 /**
- * RunSummary.resumeCount: dot-joined step key -> runtime resume ordinal.
- * Sourced from the runtime's per-run resume ledger (NOT the Mastra snapshot),
- * so it is present for every re-suspension regardless of resume payload —
- * the collision-free grant-binding tie-breaker. Absent for a step with no
- * ledger entry (a first suspension).
+ * One home for the per-step projection convention behind every RunSummary map
+ * (suspendedAt / resumedAt / resumeCount / suspendPayload): collect
+ * `stepKey -> value` over the suspended step keys, projecting an empty result
+ * as undefined so JSON summaries omit the field. The accumulator is
+ * null-prototype because step keys are author-chosen strings: on a plain
+ * object literal a step named '__proto__' would route into the
+ * Object.prototype setter and silently vanish (or, for an object-valued
+ * payload, rewire the accumulator's prototype) — the same hazard
+ * resume-ledger.ts stores [stepKey, count] pairs to avoid.
  */
-function resumeCountByStep(
-  counts: ReadonlyMap<string, number> | undefined,
+function byStep<T>(
   suspendedKeys: readonly string[],
-): Record<string, number> | undefined {
-  if (!counts) return undefined;
-  const map: Record<string, number> = {};
+  lookup: (stepKey: string) => T | undefined,
+): Record<string, T> | undefined {
+  const map: Record<string, T> = Object.create(null);
+  let size = 0;
   for (const key of suspendedKeys) {
-    const count = counts.get(key);
-    if (count !== undefined) map[key] = count;
-  }
-  return Object.keys(map).length > 0 ? map : undefined;
-}
-
-function suspendPayloadByStep(
-  steps: WorkflowState['steps'],
-  suspendedKeys: string[],
-): Record<string, unknown> | undefined {
-  if (!steps) return undefined;
-  const payloads: Record<string, unknown> = {};
-  for (const key of suspendedKeys) {
-    const latest = latestAttempt(steps, key);
-    if (latest && latest.suspendPayload !== undefined) {
-      payloads[key] = latest.suspendPayload;
+    const value = lookup(key);
+    if (value !== undefined) {
+      map[key] = value;
+      size += 1;
     }
   }
-  return Object.keys(payloads).length > 0 ? payloads : undefined;
+  return size > 0 ? map : undefined;
 }
 
 // Projection of the persisted WorkflowState for status(). Unlike summarize()
@@ -360,15 +331,22 @@ function summarizeState(
   } else if (state.status === 'suspended') {
     const suspendedKeys = Object.keys(state.suspendedPaths ?? {});
     summary.suspended = suspendedKeys.map((key) => key.split('.'));
-    const suspendPayload = suspendPayloadByStep(state.steps, suspendedKeys);
+    const suspendPayload = byStep(
+      suspendedKeys,
+      (key) => latestAttempt(state.steps, key)?.suspendPayload,
+    );
     if (suspendPayload !== undefined) {
       summary.suspendPayload = suspendPayload;
     }
-    const suspendedAt = suspendedAtByStep(state.steps, suspendedKeys);
+    const suspendedAt = byStep(suspendedKeys, (key) =>
+      suspendedAtOf(state.steps, key),
+    );
     if (suspendedAt !== undefined) summary.suspendedAt = suspendedAt;
-    const resumedAt = resumedAtByStep(state.steps, suspendedKeys);
+    const resumedAt = byStep(suspendedKeys, (key) =>
+      resumedAtOf(state.steps, key),
+    );
     if (resumedAt !== undefined) summary.resumedAt = resumedAt;
-    const resumeCount = resumeCountByStep(counts, suspendedKeys);
+    const resumeCount = byStep(suspendedKeys, (key) => counts?.get(key));
     if (resumeCount !== undefined) summary.resumeCount = resumeCount;
   }
   return summary;
@@ -640,9 +618,15 @@ export class RunnerRuntime {
       // Record THIS resume AFTER the leg fingerprint read above and BEFORE
       // summarize: a re-suspension produced by this resume must capture the
       // incremented ordinal so its approval binds to the new suspension.
+      // priorCounts rides along so a durable ledger need not re-read what the
+      // per-run FIFO lock guarantees unchanged since the read above.
       let counts = priorCounts;
       if (stepKey !== undefined) {
-        counts = await this.#resumeLedger.increment(runKey, stepKey);
+        counts = await this.#resumeLedger.increment(
+          runKey,
+          stepKey,
+          priorCounts ?? new Map(),
+        );
       }
       const summary = summarize(run.runId, result, counts);
       // Terminal run: drop the ledger (no further suspension can occur).
@@ -657,11 +641,15 @@ export class RunnerRuntime {
     const workflow = this.#getWorkflow(workflowId);
     const state = await workflow.getWorkflowRunById(runId);
     if (!state) return null;
-    // Project resumeCount from the ledger too (defense in depth: a bridge that
-    // ever mints off status() must not see a stale/absent ordinal).
-    const counts = await this.#resumeLedger.counts(
-      this.#runKey(workflowId, runId),
-    );
+    // Ledger read only for SUSPENDED runs — the one branch that projects
+    // resumeCount (defense in depth: a bridge that ever mints off status()
+    // must not see a stale/absent ordinal). Every other status would discard
+    // the result, and under the DO shell each read is a billed
+    // ctx.storage.get the SPA's polling would pay on every terminal run.
+    const counts =
+      state.status === 'suspended'
+        ? await this.#resumeLedger.counts(this.#runKey(workflowId, runId))
+        : undefined;
     return summarizeState(runId, state, counts);
   }
 
@@ -690,9 +678,14 @@ export class RunnerRuntime {
     //
     // Structural, not flagged: a runId shaped `<inv3-slug>_<rest>` mints a
     // scope. For this repo's hosts that is exactly the tenant (they all mint
-    // via TenantContext.newRunId); a standalone OSS consumer whose custom
-    // runIds happen to look like `batch_042` gets incidental — and harmless —
-    // key segmentation, never a leak (there is no tenant boundary there).
+    // via TenantContext.newRunId). CONSTRAINT for standalone OSS consumers
+    // minting their own runIds: the scope segments breakwater's CROSS-RUN
+    // idempotency and rate-limit keys, so one logical account must keep ONE
+    // stable pre-`_` prefix (or avoid `_`-prefixed runIds entirely) — ids
+    // like `daily_<uuid>` vs `weekly_<uuid>` would split that account's key
+    // namespace per prefix, and a cross-run business key ("invoice-2026-07")
+    // would fire once per prefix instead of once. Never a cross-tenant leak
+    // (splitting only narrows sharing), but a real duplication hazard.
     // Non-matching runIds mint nothing: the single-tenant keys stay
     // byte-identical, and deployments that must never run scope-less enforce
     // that with breakwater's tenantIsolation evaluator (which binds dry-run

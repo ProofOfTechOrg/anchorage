@@ -4,7 +4,7 @@
 // the other four. Capabilities shown: write-approval grant (the send's fail-
 // closed spine), binding-gated real side effect, connector audit.
 
-import { createConnector } from '@proofoftech/breakwater';
+import { createConnector, tenantIsolation } from '@proofoftech/breakwater';
 import { z } from 'zod';
 
 import type { WorkflowModule } from '../../src/host-kit/module.js';
@@ -72,7 +72,13 @@ export const gtmOutboundModule: WorkflowModule<ShowcaseModuleDeps> = {
         delivered: z.number(),
       }),
       permissions: { sideEffect: 'write', requiresApproval: true },
-      policies: { audit },
+      // tenantIsolation: the showcase is multi-tenant, so a connector call
+      // whose requestContext somehow lacks the runtime-minted isolation
+      // scope must DENY rather than fall back to unsegmented single-tenant
+      // idempotency/rate-limit keys (CONNECTORS.md makes the evaluator
+      // mandatory for multi-tenant hosts). Every showcase connector
+      // registers it.
+      policies: { audit, evaluators: [tenantIsolation()] },
       execute: async ({ drafts }) => {
         if (!email) {
           for (const draft of drafts) {

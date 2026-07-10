@@ -10,6 +10,7 @@ import {
   createConnector,
   DRY_RUN_CONTEXT_KEY,
   IDEMPOTENCY_KEY_CONTEXT_KEY,
+  tenantIsolation,
 } from '@proofoftech/breakwater';
 import { z } from 'zod';
 
@@ -71,10 +72,15 @@ export const productLaunchModule: WorkflowModule<ShowcaseModuleDeps> = {
         idempotencyKey: true,
         dryRun: true,
       },
+      // tenantIsolation: scope-less calls deny instead of collapsing to
+      // unsegmented keys — mandatory on a multi-tenant host (see
+      // gtm-outbound). It runs in the pre-execute gates, so it binds the
+      // dry-run pre-flight too.
       policies: {
         audit,
         networkEgress: { allowedDomains: [DEPLOY_HOST] },
         idempotencyStore: deps.idempotency,
+        evaluators: [tenantIsolation()],
       },
       dryRunExecute: async ({ productName }) => ({
         ok: true,

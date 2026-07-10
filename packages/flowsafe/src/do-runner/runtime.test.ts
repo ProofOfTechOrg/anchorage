@@ -1441,6 +1441,57 @@ describe('RunnerRuntime resume ledger durability (DO eviction)', () => {
     expect(ledgerStorage.keyCount()).toBe(0);
   });
 
+  it('status() reads the ledger only for SUSPENDED runs, and a resume reads it exactly once', async () => {
+    // #given — a ctx.storage that counts billed get()s
+    const storage = new InMemoryStore();
+    const base = fakeLedgerStorage();
+    let gets = 0;
+    const counting: ResumeLedgerStorage = {
+      async get<T>(key: string): Promise<T | undefined> {
+        gets += 1;
+        return base.get<T>(key);
+      },
+      put: (key, value) => base.put(key, value),
+      delete: (key) => base.delete(key),
+    };
+    const runtime = buildDurable(storage, counting);
+    const started = await runtime.start('durable-gate', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+
+    // #when — one resume: the fingerprint read is the ONLY ledger get (the
+    // increment rides the prior counts the per-run lock guarantees unchanged)
+    const beforeResume = gets;
+    const done = await runtime.resume('durable-gate', started.runId, {
+      step: 'gate',
+      resumeData: { go: true },
+    });
+    expect(done.status).toBe('success');
+    expect(gets).toBe(beforeResume + 1);
+
+    // #when — the SPA-style poll of the now-terminal run
+    const beforeStatus = gets;
+    const status = await runtime.status('durable-gate', started.runId);
+
+    // #then — no billed get for a projection that would discard it...
+    expect(status?.status).toBe('success');
+    expect(gets).toBe(beforeStatus);
+
+    // ...while a suspended run still projects the ordinal (one read)
+    const suspended = await runtime.start('durable-gate', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+    const beforeSuspendedStatus = gets;
+    const suspendedStatus = await runtime.status(
+      'durable-gate',
+      suspended.runId,
+    );
+    expect(suspendedStatus?.status).toBe('suspended');
+    expect(gets).toBe(beforeSuspendedStatus + 1);
+  });
+
   it('projects status() resumeCount from the durable ledger across the rebuild', async () => {
     // #given — a re-suspended run, then an eviction
     const storage = new InMemoryStore();

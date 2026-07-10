@@ -72,8 +72,14 @@ export function useRunPolling(
     const failures = new Map<string, number>();
     const abandoned = new Map<string, 'hard' | 'degraded'>();
     const lastError = new Map<string, string>();
+    // A run observed terminal keeps its final result without further fetches:
+    // while a LIVE sibling keeps the chain ticking, re-probing a finished run
+    // every 3s is a DO wake + snapshot read for an answer that cannot change.
+    const settled = new Map<string, RunResult>();
 
     async function probe(run: RunEntry): Promise<[string, RunResult]> {
+      const finished = settled.get(run.runId);
+      if (finished) return [run.runId, finished];
       const alreadyStopped = abandoned.get(run.runId);
       if (alreadyStopped) {
         return [
@@ -87,7 +93,11 @@ export function useRunPolling(
       try {
         const summary = await runClient.status(run.workflowId, run.runId);
         failures.delete(run.runId);
-        return [run.runId, { summary }];
+        const result: RunResult = { summary };
+        if (TERMINAL_RUN_STATUSES.has(summary.status)) {
+          settled.set(run.runId, result);
+        }
+        return [run.runId, result];
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const count = (failures.get(run.runId) ?? 0) + 1;

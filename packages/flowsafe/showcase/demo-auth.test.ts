@@ -31,32 +31,8 @@ import {
   STATE_COOKIE,
   verifyState,
 } from './demo-auth.js';
+import { openSqlite, type SqliteDatabase } from '../test-support/sqlite.js';
 import { buildVerifier, selectOAuthProvider } from './worker.js';
-
-interface SqliteStatement {
-  get(...params: unknown[]): unknown;
-  run(...params: unknown[]): unknown;
-  all(...params: unknown[]): unknown[];
-}
-
-interface SqliteDatabase {
-  prepare(sql: string): SqliteStatement;
-}
-
-function openSqlite(): SqliteDatabase {
-  const getBuiltin = (
-    globalThis as {
-      process?: { getBuiltinModule?: (id: string) => unknown };
-    }
-  ).process?.getBuiltinModule;
-  if (!getBuiltin) {
-    throw new Error('node:sqlite unavailable — tests require node >= 22.13');
-  }
-  const mod = getBuiltin('node:sqlite') as {
-    DatabaseSync: new (path: string) => SqliteDatabase;
-  };
-  return new mod.DatabaseSync(':memory:');
-}
 
 function demoDb(db: SqliteDatabase): DemoDatabase {
   function statement(sql: string, params: unknown[]): DemoStatement {
@@ -189,6 +165,39 @@ describe('consumeRunBudget (atomic caps)', () => {
       .bind(tenantId)
       .first()) as { run_count: number };
     expect(row.run_count).toBe(2);
+  });
+
+  it('cap 0 refuses the FIRST run — the incident freeze the worker passes via allowZero', async () => {
+    // #given — a live, provisioned tenant and DEMO_TENANT_RUN_CAP=0 (the
+    // operator's freeze; numberVar's allowZero keeps it from reverting to the
+    // fallback). run_count < 0 is never satisfiable, so the very first
+    // conditional UPDATE refuses.
+    const { db, tenantId } = await seededDb();
+
+    // #when / #then
+    await expect(
+      consumeRunBudget(db, {
+        tenantId,
+        tenantRunCap: 0,
+        dailyRunCap: 100,
+        now: () => T0 + 1000,
+      }),
+    ).rejects.toMatchObject({ scope: 'tenant', reason: 'cap-reached' });
+  });
+
+  it('daily cap 0 freezes the whole demo even when tenant budgets remain', async () => {
+    // #given
+    const { db, tenantId } = await seededDb();
+
+    // #when / #then
+    await expect(
+      consumeRunBudget(db, {
+        tenantId,
+        tenantRunCap: 10,
+        dailyRunCap: 0,
+        now: () => T0 + 1000,
+      }),
+    ).rejects.toMatchObject({ scope: 'global', reason: 'cap-reached' });
   });
 
   it('refuses runs for an EXPIRED tenant even under its cap', async () => {
@@ -762,6 +771,31 @@ describe('the kill switch in the AUTH middleware (worker.buildVerifier)', () => 
     expect(await killed.verify(demoJwt)).toBeUndefined();
     expect(await killed.verify('op-token')).toMatchObject({ id: 'op' });
   });
+
+  it.each(['1', 'yes', 'on', 'TRUE', 'disable-now-please'])(
+    "DEMO_DISABLED='%s' also kills issued JWTs — the emergency switch parses fail-closed, never as a silent no-op",
+    async (raw) => {
+      // #given — a valid demo JWT
+      const db = demoDb(openSqlite());
+      const tenant = await findOrCreateDemoTenant(db, makeTenantOptions());
+      const set = await mintDemoTokenSet({
+        secret: SECRET,
+        tenant,
+        ttlSeconds: 3600,
+      });
+      const demoJwt = set.tokens[0]?.token ?? '';
+
+      // #when — an operator mid-incident flips the switch with a
+      // non-canonical spelling (or a typo)
+      const killed = buildVerifier({
+        DEMO_JWT_SECRET: SECRET,
+        DEMO_DISABLED: raw,
+      } as never);
+
+      // #then — the demo verifier is unmounted regardless of spelling
+      expect(await killed.verify(demoJwt)).toBeUndefined();
+    },
+  );
 });
 
 describe('provider selection (worker.selectOAuthProvider)', () => {

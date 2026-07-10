@@ -44,7 +44,12 @@ import {
   D1ApprovalStoreFactory,
 } from '../src/approval-api/index.js';
 import type { RunSummary } from '../src/do-runner/index.js';
-import handler, { FlowsafeRunner } from './worker.js';
+import {
+  d1DatabaseLike,
+  openSqlite,
+  type SqliteDatabase,
+} from '../test-support/sqlite.js';
+import handler, { FlowsafeRunner, PURGE_CRON, SWEEP_CRON } from './worker.js';
 
 type Env = Parameters<NonNullable<typeof handler.fetch>>[1];
 
@@ -55,87 +60,6 @@ function required<T>(handlerFn: T | undefined, name: string): T {
 const fetchHandler = required(handler.fetch, 'fetch');
 const scheduledHandler = required(handler.scheduled, 'scheduled');
 const queueHandler = required(handler.queue, 'queue');
-
-interface SqliteStatement {
-  get(...params: unknown[]): unknown;
-  run(...params: unknown[]): unknown;
-  all(...params: unknown[]): unknown[];
-}
-
-interface SqliteDatabase {
-  prepare(sql: string): SqliteStatement;
-  exec(sql: string): void;
-}
-
-// process.getBuiltinModule loads the builtin without import machinery, so
-// neither vite's resolver (which cannot resolve node:sqlite) nor the
-// workers-types tsconfig (no @types/node) ever sees the specifier.
-function openSqlite(): SqliteDatabase {
-  const getBuiltin = (
-    globalThis as {
-      process?: { getBuiltinModule?: (id: string) => unknown };
-    }
-  ).process?.getBuiltinModule;
-  if (!getBuiltin) {
-    throw new Error('node:sqlite unavailable — tests require node >= 22.13');
-  }
-  const mod = getBuiltin('node:sqlite') as {
-    DatabaseSync: new (path: string) => SqliteDatabase;
-  };
-  return new mod.DatabaseSync(':memory:');
-}
-
-// A D1Database-shaped adapter rich enough for BOTH stores the worker builds
-// over env.DB (Mastra's D1Store and D1ApprovalStore): prepare/bind with
-// first()/run()/all()/raw(), plus exec and batch. Statement results follow
-// D1's envelope ({ results }, { meta }). Matches mastra-schema-guard.test.ts.
-function d1DatabaseLike(db: SqliteDatabase): unknown {
-  function statement(sql: string, params: unknown[]): Record<string, unknown> {
-    return {
-      bind: (...values: unknown[]) => statement(sql, values),
-      first: async (column?: string) => {
-        const row = db.prepare(sql).get(...params) as
-          | Record<string, unknown>
-          | undefined;
-        if (row === undefined) return null;
-        return column !== undefined ? (row[column] ?? null) : row;
-      },
-      run: async () => {
-        const outcome = db.prepare(sql).run(...params) as {
-          changes?: number | bigint;
-        };
-        return {
-          success: true,
-          meta: { changes: Number(outcome?.changes ?? 0) },
-        };
-      },
-      all: async () => ({
-        success: true,
-        results: db.prepare(sql).all(...params),
-        meta: {},
-      }),
-      raw: async () => {
-        const rows = db.prepare(sql).all(...params) as Array<
-          Record<string, unknown>
-        >;
-        return rows.map((row) => Object.values(row));
-      },
-    };
-  }
-  return {
-    prepare: (sql: string) => statement(sql, []),
-    exec: async (sql: string) => {
-      db.exec(sql);
-      return { count: 1, duration: 0 };
-    },
-    batch: async (statements: Array<{ run: () => Promise<unknown> }>) => {
-      const results = [];
-      for (const stmt of statements) results.push(await stmt.run());
-      return results;
-    },
-    dump: async () => new ArrayBuffer(0),
-  };
-}
 
 // In-process DO namespace: idFromName carries the name, get() memoizes a REAL
 // FlowsafeRunner per name with a stub state exposing that identity — the same
@@ -597,20 +521,38 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
       updatedAt: Date.now() - 90 * DAY_MS,
     });
 
-    // #when — one cron firing
+    // #when — the SWEEP cron fires alone
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const { ctx, drain } = makeCtx();
+    const sweepCtx = makeCtx();
     await scheduledHandler(
-      { cron: '*/5 * * * *' } as unknown as ScheduledController,
+      { cron: SWEEP_CRON } as unknown as ScheduledController,
       env,
-      ctx,
+      sweepCtx.ctx,
     );
-    await drain();
+    await sweepCtx.drain();
 
-    // #then — the sweep escalated the overdue approval...
+    // #then — the sweep escalated the overdue approval, and the DISPATCH
+    // kept the purge out of this invocation (a CPU-limit kill is not
+    // catchable, so the two duties must never share one): every snapshot
+    // row survives the sweep firing
     const swept = await store.get('apr-overdue');
     expect(swept?.status).toBe('escalated');
-    // ...the purge reclaimed exactly the stale terminal row under the
+    expect(remainingRunIds(sqlite)).toEqual([
+      'acme_fresh-done',
+      'acme_stale-done',
+      'acme_stale-open',
+    ]);
+
+    // #when — the PURGE cron fires
+    const purgeCtx = makeCtx();
+    await scheduledHandler(
+      { cron: PURGE_CRON } as unknown as ScheduledController,
+      env,
+      purgeCtx.ctx,
+    );
+    await purgeCtx.drain();
+
+    // #then — the purge reclaimed exactly the stale terminal row under the
     // FALLBACK 30-day TTL (a stale SUSPENDED run is a pending approval, not
     // garbage)...
     expect(remainingRunIds(sqlite)).toEqual([
@@ -655,14 +597,21 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
     });
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    // #when
-    const { ctx, drain } = makeCtx();
+    // #when — the sweep firing fails; the purge firing still does its duty
+    const sweepCtx = makeCtx();
     await scheduledHandler(
-      { cron: '*/5 * * * *' } as unknown as ScheduledController,
+      { cron: SWEEP_CRON } as unknown as ScheduledController,
       env,
-      ctx,
+      sweepCtx.ctx,
     );
-    await drain();
+    await sweepCtx.drain();
+    const purgeCtx = makeCtx();
+    await scheduledHandler(
+      { cron: PURGE_CRON } as unknown as ScheduledController,
+      env,
+      purgeCtx.ctx,
+    );
+    await purgeCtx.drain();
 
     // #then — the sweep failure was logged, not propagated, and the purge ran
     expect(remainingRunIds(sqlite)).toEqual([]);
@@ -708,14 +657,21 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
     });
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    // #when
-    const { ctx, drain } = makeCtx();
+    // #when — the purge firing fails; the sweep firing still does its duty
+    const purgeCtx = makeCtx();
     await scheduledHandler(
-      { cron: '*/5 * * * *' } as unknown as ScheduledController,
+      { cron: PURGE_CRON } as unknown as ScheduledController,
       env,
-      ctx,
+      purgeCtx.ctx,
     );
-    await drain();
+    await purgeCtx.drain();
+    const sweepCtx = makeCtx();
+    await scheduledHandler(
+      { cron: SWEEP_CRON } as unknown as ScheduledController,
+      env,
+      sweepCtx.ctx,
+    );
+    await sweepCtx.drain();
 
     // #then — the purge failure was logged, not propagated, and the sweep ran
     const swept = await store.get('apr-overdue');
@@ -726,6 +682,54 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
     expect(surfaces.some((line) => line.includes('retention-purge'))).toBe(
       true,
     );
+    errorSpy.mockRestore();
+  });
+
+  it('an unrecognized cron expression runs BOTH surfaces and logs the misconfig', async () => {
+    // #given — ops edited wrangler.jsonc without updating the constants;
+    // availability of both duties beats purity on a misconfig
+    const { env, sqlite, d1 } = makeEnv();
+    const store = new D1ApprovalStoreFactory(d1 as never).forTenant('acme');
+    const past = new Date(Date.now() - 60_000).toISOString();
+    await store.create({
+      id: 'apr-overdue',
+      tenantId: 'acme',
+      workflowId: 'example-approval',
+      runId: 'acme_r1',
+      title: 'overdue approval',
+      connectors: [],
+      priority: 'normal',
+      status: 'pending',
+      createdAt: past,
+      updatedAt: past,
+      slaDeadlineAt: past,
+    });
+    createSnapshotTable(sqlite);
+    seedRun(sqlite, {
+      runId: 'acme_stale-done',
+      status: 'success',
+      updatedAt: Date.now() - 40 * DAY_MS,
+    });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when
+    const { ctx, drain } = makeCtx();
+    await scheduledHandler(
+      { cron: '*/5 * * * *' } as unknown as ScheduledController,
+      env,
+      ctx,
+    );
+    await drain();
+
+    // #then — swept AND purged, with the config-error tripwire on record
+    expect((await store.get('apr-overdue'))?.status).toBe('escalated');
+    expect(remainingRunIds(sqlite)).toEqual([]);
+    expect(
+      errorSpy.mock.calls.some(([line]) => {
+        const text = String(line);
+        return text.includes('config-error') && text.includes('triggers.crons');
+      }),
+    ).toBe(true);
     errorSpy.mockRestore();
   });
 });

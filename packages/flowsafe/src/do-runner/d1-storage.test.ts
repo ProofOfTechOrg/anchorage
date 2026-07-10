@@ -5,40 +5,13 @@
 
 import { describe, expect, it } from 'vitest';
 
+import { openSqlite, type SqliteDatabase } from '../../test-support/sqlite.js';
 import {
   purgeExpiredWorkflowRuns,
   purgeTenant,
   type SnapshotDatabase,
   type SnapshotStatement,
 } from './d1-storage.js';
-
-interface SqliteStatement {
-  get(...params: unknown[]): unknown;
-  run(...params: unknown[]): unknown;
-  all(...params: unknown[]): unknown[];
-}
-
-interface SqliteDatabase {
-  prepare(sql: string): SqliteStatement;
-}
-
-// process.getBuiltinModule loads the builtin without import machinery, so
-// neither vite's resolver (which cannot resolve node:sqlite) nor the
-// workers-types tsconfig (no @types/node) ever sees the specifier.
-function openSqlite(): SqliteDatabase {
-  const getBuiltin = (
-    globalThis as {
-      process?: { getBuiltinModule?: (id: string) => unknown };
-    }
-  ).process?.getBuiltinModule;
-  if (!getBuiltin) {
-    throw new Error('node:sqlite unavailable — tests require node >= 22.13');
-  }
-  const mod = getBuiltin('node:sqlite') as {
-    DatabaseSync: new (path: string) => SqliteDatabase;
-  };
-  return new mod.DatabaseSync(':memory:');
-}
 
 // Faithful to D1: run() resolves to a result whose meta.changes carries the
 // affected-row count (node:sqlite reports it as `changes`).
@@ -595,5 +568,99 @@ describe('purgeTenant (complete offboarding)', () => {
     // #then
     expect(result.snapshots).toBe(1);
     expect(remainingRunIds(sqlite, 'p_')).toEqual([]);
+  });
+});
+
+describe('purgeExpiredWorkflowRuns row-only batching', () => {
+  it('LIMIT-batches the bulk path: one firing reclaims at most `limit` rows; the next resumes at the survivors', async () => {
+    // #given — more expired terminal rows than one batch
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    for (let index = 0; index < 5; index += 1) {
+      seedRun(sqlite, {
+        runId: `stale-${index}`,
+        status: 'success',
+        updatedAt: NOW - 40 * DAY_MS,
+      });
+    }
+    const db = d1Like(sqlite);
+
+    // #when — two firings at limit 3
+    const first = await purgeExpiredWorkflowRuns(db, {
+      ttlMs: 30 * DAY_MS,
+      limit: 3,
+      now: () => NOW,
+    });
+    const survivors = remainingRunIds(sqlite).length;
+    const second = await purgeExpiredWorkflowRuns(db, {
+      ttlMs: 30 * DAY_MS,
+      limit: 3,
+      now: () => NOW,
+    });
+
+    // #then — the shrinking eligible set is the cursor across firings
+    expect(first).toBe(3);
+    expect(survivors).toBe(2);
+    expect(second).toBe(2);
+    expect(remainingRunIds(sqlite)).toEqual([]);
+  });
+});
+
+describe('ensureSnapshotRunIdIndex memoization (via purgeTenant)', () => {
+  function countingDb(inner: SnapshotDatabase): {
+    db: SnapshotDatabase;
+    indexStatements: () => number;
+  } {
+    let count = 0;
+    return {
+      db: {
+        prepare(sql: string) {
+          if (sql.includes('CREATE INDEX')) count += 1;
+          return inner.prepare(sql);
+        },
+      },
+      indexStatements: () => count,
+    };
+  }
+
+  it('runs CREATE INDEX once per database binding — the reaper loop pays no per-tenant DDL', async () => {
+    // #given — a snapshot table and a DDL-counting wrapper over ONE binding
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    seedRun(sqlite, { runId: 'aaa111_r1', status: 'success', updatedAt: NOW });
+    const { db, indexStatements } = countingDb(d1Like(sqlite));
+
+    // #when — three offboardings, the cron reaper's loop shape
+    await purgeTenant(db, { tenantId: 'aaa111' });
+    await purgeTenant(db, { tenantId: 'bbb222' });
+    await purgeTenant(db, { tenantId: 'ccc333' });
+
+    // #then — one DDL round-trip, not one per tenant
+    expect(indexStatements()).toBe(1);
+  });
+
+  it('memoizes success only: a missing snapshot table re-probes per call and recovers once the table exists', async () => {
+    // #given — no snapshot table yet (a run-less deployment)
+    const sqlite = openSqlite();
+    const { db, indexStatements } = countingDb(d1Like(sqlite));
+
+    // #when — offboarding tolerates the missing table as empty
+    const first = await purgeTenant(db, { tenantId: 'aaa111' });
+    expect(first.snapshots).toBe(0);
+    expect(indexStatements()).toBe(1);
+
+    // the table appears (a first run persisted); the next offboarding must
+    // probe again rather than trust a memoized failure
+    createSnapshotTable(sqlite);
+    seedRun(sqlite, {
+      runId: 'aaa111_r1',
+      status: 'suspended',
+      updatedAt: NOW,
+    });
+    const second = await purgeTenant(db, { tenantId: 'aaa111' });
+
+    // #then — retried (2 DDL statements total) and the rows were reaped
+    expect(indexStatements()).toBe(2);
+    expect(second.snapshots).toBe(1);
   });
 });

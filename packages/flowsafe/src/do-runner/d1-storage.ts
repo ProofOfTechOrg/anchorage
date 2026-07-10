@@ -74,14 +74,15 @@ export interface PurgeExpiredRunsOptions {
    */
   artifactStore?: TenantArtifactPurger;
   /**
-   * Runs processed per call on the artifact-paired path (default 100) —
-   * the cron's subrequest-budget guard, same batching as the demo-tenant
-   * reaper. Each run costs ~2+N subrequests (R2 list, per-artifact deletes,
-   * its row's DELETE), so an UNBOUNDED first backlog would blow the Workers
+   * Runs processed per call. Artifact-paired path: default 100 — the cron's
+   * subrequest-budget guard, same batching as the demo-tenant reaper. Each
+   * run costs ~2+N subrequests (R2 list, per-artifact deletes, its row's
+   * DELETE), so an UNBOUNDED first backlog would blow the Workers
    * per-invocation cap mid-pass and log an error every firing until it
-   * drained; size this to your plan's budget instead. The shrinking
-   * eligible set is the cursor — the next firing resumes at the survivors.
-   * Without artifactStore the purge is one bulk DELETE and ignores this.
+   * drained; size this to your plan's budget instead. Row-only path:
+   * default 1000 — one LIMIT-batched DELETE statement per firing, bounding
+   * D1 per-query cost instead of subrequests. Both paths use the shrinking
+   * eligible set as the cursor — the next firing resumes at the survivors.
    */
   limit?: number;
   /** Clock override for tests. */
@@ -187,14 +188,25 @@ export async function purgeExpiredWorkflowRuns(
     return deleted;
   }
 
+  // Row-only path: LIMIT-batched like the artifact path, but against D1's
+  // per-QUERY budget rather than the subrequest cap (it stays one statement
+  // per firing whatever the batch size, hence the larger default). An
+  // unbounded DELETE over a huge first backlog can exceed the per-query
+  // limits and then fail the same way on EVERY firing — retention silently
+  // unenforced, the exact wedge the cron split exists to avoid. The
+  // shrinking eligible set is the cursor: a backlog drains across firings.
   try {
     return d1Changes(
       await db
         .prepare(
           `DELETE FROM ${prefix}mastra_workflow_snapshot
-           WHERE ${eligible}`,
+           WHERE rowid IN (
+             SELECT rowid FROM ${prefix}mastra_workflow_snapshot
+             WHERE ${eligible}
+             LIMIT ?
+           )`,
         )
-        .bind(cutoff, ...TERMINAL_STATUSES)
+        .bind(cutoff, ...TERMINAL_STATUSES, options.limit ?? 1000)
         .run(),
     );
   } catch (error) {
@@ -202,6 +214,19 @@ export async function purgeExpiredWorkflowRuns(
     return 0;
   }
 }
+
+// One CREATE INDEX per (database, prefix) per isolate: purgeTenant runs this,
+// and the demo reaper invokes purgeTenant in a LIMIT-batched loop — without
+// the memo that is one DDL round-trip to the D1 primary per tenant per cron
+// firing (24 no-ops out of 25), plus one on every expired-sandbox re-auth.
+// Same clear-on-failure promise memo as D1ApprovalStoreFactory's
+// #schemaReady: only SUCCESS memoizes, so a missing snapshot table (this call
+// doubles as purgeTenant's table probe) or a transient error retries on the
+// next call instead of pinning the database to a dead promise.
+const snapshotIndexReady = new WeakMap<
+  SnapshotDatabase,
+  Map<string, Promise<void>>
+>();
 
 /**
  * Additive, app-owned index for the tenant range predicate. It couples us to
@@ -213,12 +238,31 @@ export async function ensureSnapshotRunIdIndex(
   db: SnapshotDatabase,
   tablePrefix = '',
 ): Promise<void> {
-  await db
-    .prepare(
-      `CREATE INDEX IF NOT EXISTS idx_${tablePrefix}snapshot_run_id
-       ON ${tablePrefix}mastra_workflow_snapshot (run_id)`,
-    )
-    .run();
+  let prefixes = snapshotIndexReady.get(db);
+  if (!prefixes) {
+    prefixes = new Map();
+    snapshotIndexReady.set(db, prefixes);
+  }
+  const memo = prefixes;
+  let ready = memo.get(tablePrefix);
+  if (!ready) {
+    ready = Promise.resolve(
+      db
+        .prepare(
+          `CREATE INDEX IF NOT EXISTS idx_${tablePrefix}snapshot_run_id
+           ON ${tablePrefix}mastra_workflow_snapshot (run_id)`,
+        )
+        .run(),
+    ).then(
+      () => undefined,
+      (error: unknown) => {
+        memo.delete(tablePrefix);
+        throw error;
+      },
+    );
+    memo.set(tablePrefix, ready);
+  }
+  await ready;
 }
 
 export interface PurgeTenantOptions {

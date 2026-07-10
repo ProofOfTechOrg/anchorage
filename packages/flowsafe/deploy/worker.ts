@@ -6,9 +6,10 @@
 // for your identity provider.
 //
 // The security-critical pieces are NOT copied here — auth, the run routes with
-// their RBAC gate order, and the suspension→approval bridge all come from
+// their RBAC gate order, the suspension→approval bridge, the DO-stub topology,
+// and the approval-service assembly all come from
 // `@proofoftech/flowsafe/host-kit`, where they are tested. This file supplies
-// the workflows and this deployment's DO-stub topology.
+// the workflows and this deployment's bindings.
 //
 // Routes (the /workflows + /runs surface is host-kit's createRunRouter; the
 // /api/approvals surface is approval-api's createApprovalRouter):
@@ -33,9 +34,12 @@
 // to an actor via the APPROVAL_ACTOR_TOKENS secret. No secret => every
 // authenticated route 401s (fail closed).
 //
-// Scheduled (wrangler.jsonc `triggers.crons`): every firing sweeps SLA
-// breaches (escalates open approvals past their deadline) and purges
-// terminal run snapshots older than RUN_RETENTION_DAYS.
+// Scheduled (wrangler.jsonc `triggers.crons`): TWO cron expressions,
+// dispatched on controller.cron, so the SLA sweep and the retention purge
+// never share an invocation — a Workers CPU-limit termination kills the
+// isolate and is NOT a catchable JS error, so a slow sweep sharing an
+// invocation would permanently starve the purge (and vice versa) no matter
+// how many try/catches wrap them.
 //
 // Deploy checklist: README.md next to this file.
 
@@ -52,37 +56,33 @@ import type {
 import { z } from 'zod';
 
 import {
-  type ApprovalActor,
-  ApprovalService,
   approvalGrantProvider,
-  createTenantResolver,
   BREAKWATER_APPROVED_CONNECTORS_KEY,
   createApprovalRouter,
-  D1ApprovalStoreFactory,
-  defaultResumeData,
-  sweepSLA,
-  type TenantBoundApprovalStore,
+  createTenantResolver,
   type TenantResolver,
 } from '@proofoftech/flowsafe/approval-api';
-import {
-  createAuditQueueConsumer,
-  queueAuditSink,
-} from '@proofoftech/flowsafe/audit-export';
+import { createAuditQueueHandler } from '@proofoftech/flowsafe/audit-export';
 import {
   DurableObjectRunner,
   init,
   purgeExpiredWorkflowRuns,
   type RunnerRuntime,
-  type RunSummary,
 } from '@proofoftech/flowsafe/do-runner';
 import {
+  approvalStoreFactoryFor,
   assertWorkflowsRegistered,
   bearerActorAuthenticator,
+  buildHostApprovalService,
+  createDoRunTopology,
   createRunRouter,
-  doSummary,
+  type DoRunTopology,
+  maintenanceActor,
+  numberVar,
   parseActorTokens,
-  resumeRunWithRequeue,
+  runSlaSweepMaintenance,
   staticTokenVerifier,
+  type TokenVerifier,
   withSubdomainCrossCheck,
   type WorkflowMeta,
 } from '@proofoftech/flowsafe/host-kit';
@@ -100,7 +100,7 @@ interface Env {
   APPROVAL_ACTOR_TOKENS?: string;
   /** Default SLA seconds for new approvals (var; default 14400 = 4h). */
   APPROVAL_SLA_SECONDS?: string;
-  /** Cron purges terminal run snapshots older than this (var; default 30). */
+  /** Cron purges terminal run snapshots older than this (var; default 30; 0 = immediately). */
   RUN_RETENTION_DAYS?: string;
   /**
    * Optional audit export to a SIEM: bind a queue producer (wrangler.jsonc
@@ -125,24 +125,15 @@ interface Env {
 /** Id for system-created records; the tenant is bound per request/instance. */
 const SYSTEM_ACTOR_ID = 'flowsafe-worker';
 
-/**
- * Attribution identity for the cron SLA sweep (audit only — the sweep is TCB
- * code over the system store; per-record tenants ride in the audit detail).
- */
-const MAINTENANCE_ACTOR: ApprovalActor = {
-  id: SYSTEM_ACTOR_ID,
-  role: 'operator',
-  tenantId: 'system',
-};
-
 /** The connector the example publish step demands a grant for. */
 const EXAMPLE_CONNECTOR = 'example-publisher';
 
 /**
  * Every workflow this deployment hosts, as the run router sees it: the catalog
- * for GET /workflows, and the per-workflow start gate (`allowedRoles`, omitted
- * here so the coarse RUN_START_ROLES check is the only one). Each `id` MUST
- * equal the createWorkflow id committed below — defineWorkflows asserts it.
+ * for GET /workflows, and the per-workflow gate (`allowedRoles`, enforced on
+ * start AND resume; omitted here so the coarse RUN_START_ROLES check is the
+ * only one). Each `id` MUST equal the createWorkflow id committed below —
+ * defineWorkflows asserts it.
  */
 const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
   {
@@ -154,25 +145,11 @@ const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
   },
 ];
 
-// One factory per isolate, not per request: it owns the memoized schema-init
-// promise, so rebuilding it inside fetch() would re-run the whole DDL pass on
-// every request. Keyed by the D1 binding, stable for an isolate's lifetime.
-const approvalFactories = new WeakMap<D1Database, D1ApprovalStoreFactory>();
-
-function approvalStoreFactory(db: D1Database): D1ApprovalStoreFactory {
-  let factory = approvalFactories.get(db);
-  if (!factory) {
-    factory = new D1ApprovalStoreFactory(db);
-    approvalFactories.set(db, factory);
-  }
-  return factory;
-}
-
 function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
   // Bound to THIS DO instance's tenant, recovered from its idFromName
   // identity (INV-1 -> INV-2): the grant mint can only ever read the runs'
   // own tenant, even though the runId predicate already scopes it.
-  const approvals = approvalStoreFactory(env.DB).forTenant(tenantId);
+  const approvals = approvalStoreFactoryFor(env.DB).forTenant(tenantId);
   const { createWorkflow, createStep, runtime } = init(env, {
     // The grant-minting seam: on every start/resume the runtime derives the
     // breakwater grant key from APPROVED records in D1 — decisions become
@@ -186,7 +163,14 @@ function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
   //    approval, so a decision mints exactly the grants that suspension asked
   //    for. Deriving it from run input would let client input choose its own
   //    capability;
-  //  - resumeSchema matches approval-api's defaultResumeData contract.
+  //  - resumeSchema matches approval-api's defaultResumeData contract;
+  //  - real breakwater connectors (createConnector) in a MULTI-TENANT
+  //    deployment must register breakwater's `tenantIsolation()` evaluator in
+  //    their `policies.evaluators`: the runtime mints the isolation scope
+  //    from every INV-1 runId, and the evaluator turns "scope somehow absent"
+  //    from silently-shared idempotency/rate-limit keys into a denial. Wire
+  //    durable stores too (D1IdempotencyStore / D1RateLimitStore) — an
+  //    in-memory budget under DO-per-run routing is a per-RUN budget.
   const gate = createStep({
     id: 'gate',
     inputSchema: z.object({ topic: z.string() }),
@@ -286,227 +270,69 @@ function json(payload: unknown, status = 200): Response {
   });
 }
 
-function runStub(
-  env: Env,
-  workflowId: string,
-  runId: string,
-): ReturnType<DurableObjectNamespace['get']> {
-  return env.RUNNER.get(env.RUNNER.idFromName(`${workflowId}:${runId}`));
-}
-
-function numberVar(
-  raw: string | undefined,
-  fallback: number,
-  name: string,
-): number {
-  if (raw === undefined || raw === '') return fallback;
-  const value = Number(raw);
-  if (!Number.isFinite(value) || value <= 0) {
-    // Fall back rather than fail: maintenance must keep running on a typo'd
-    // var, and the log line is the operator's tripwire.
-    console.error(
-      JSON.stringify({ type: 'config-error', var: name, raw, fallback }),
-    );
-    return fallback;
-  }
-  return value;
-}
-
 // The auth seam (parseActorTokens + bearerActorAuthenticator), the run routes
-// with their RBAC gate order, and the approval bridge all live in
-// @proofoftech/flowsafe/host-kit. They are security-critical and tested there —
-// the (suspendedAt, resumeCount) capture that binds a decision to one exact
-// suspension, the separation-of-duties re-queue, and the coarse start-role
-// check. Do not re-derive them here; production SSO/JWT verification replaces
+// with their RBAC gate order, the approval bridge, and the service assembly
+// all live in @proofoftech/flowsafe/host-kit. They are security-critical and
+// tested there — the (suspendedAt, resumeCount) capture that binds a decision
+// to one exact suspension, the separation-of-duties re-queue, and the role
+// gates. Do not re-derive them here; production SSO/JWT verification replaces
 // only the `authenticate` seam.
 
+/**
+ * The bearer verifier, memoized per isolate: parseActorTokens re-parses and
+ * re-validates the whole secret map, and the env is stable for the isolate's
+ * lifetime — rebuilding it on every request is pure waste. Swap the body for
+ * your SSO/JWT verification; keep the memo if construction stays non-trivial.
+ */
+let verifierMemo: { key: string; verifier: TokenVerifier } | undefined;
+
+function buildVerifier(env: Env): TokenVerifier {
+  const key = env.APPROVAL_ACTOR_TOKENS ?? '';
+  if (verifierMemo?.key === key) return verifierMemo.verifier;
+  const verifier = staticTokenVerifier(
+    parseActorTokens(env.APPROVAL_ACTOR_TOKENS),
+  );
+  verifierMemo = { key, verifier };
+  return verifier;
+}
+
 /** The run surface: shared routes + this deployment's DO-stub topology. */
-function runRouterFor(env: Env, resolve: TenantResolver) {
+function runRouterFor(resolve: TenantResolver, topology: DoRunTopology) {
   return createRunRouter({
     workflows: WORKFLOWS,
     resolve,
     systemActorId: SYSTEM_ACTOR_ID,
-    start: async (workflowId, runId, inputData) =>
-      doSummary(
-        await runStub(env, workflowId, runId).fetch('http://do/runs', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ workflowId, runId, inputData }),
-        }),
-      ),
-    status: async (workflowId, runId) => {
-      const response = await runStub(env, workflowId, runId).fetch(
-        `http://do/runs/${workflowId}/${runId}`,
-      );
-      if (response.status === 404) return undefined;
-      return doSummary(response);
-    },
-    resume: async (workflowId, runId, body) =>
-      doSummary(
-        await runStub(env, workflowId, runId).fetch(
-          `http://do/runs/${workflowId}/${runId}/resume`,
-          {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(body),
-          },
-        ),
-      ),
+    start: topology.start,
+    status: topology.status,
+    resume: topology.resume,
   });
-}
-
-// Worker-level approval service sharing the DO's D1 database. Decisions
-// resume the run through its DO stub (grants come from the store via the
-// DO-side provider, never from this request); if the resumed run suspends
-// again at a later gate, the next approval is queued right here, so
-// multi-gate workflows keep flowing through the queue.
-//
-// waitUntil keeps queue sends alive past the invocation (ctx.waitUntil in
-// fetch; the maintenance runner collects and awaits them itself).
-function buildApprovalService(
-  store: TenantBoundApprovalStore,
-  env: Env,
-  waitUntil?: (promise: Promise<unknown>) => void,
-): ApprovalService {
-  const queueSink = env.AUDIT_QUEUE
-    ? queueAuditSink(env.AUDIT_QUEUE)
-    : undefined;
-  const systemActor: ApprovalActor = {
-    id: SYSTEM_ACTOR_ID,
-    role: 'operator',
-    tenantId: store.tenantId,
-  };
-  const service: ApprovalService = new ApprovalService({
-    store,
-    defaultSlaSeconds: numberVar(
-      env.APPROVAL_SLA_SECONDS,
-      4 * 60 * 60,
-      'APPROVAL_SLA_SECONDS',
-    ),
-    // Structured audit trail into Workers Logs, plus the SIEM queue when
-    // bound. The sink must not throw and must not block the approval path:
-    // a failed send is logged, never propagated.
-    audit: (event) => {
-      console.log(JSON.stringify({ type: 'audit', ...event }));
-      if (queueSink) {
-        const send = queueSink(event).catch((error: unknown) =>
-          console.error(
-            JSON.stringify({
-              type: 'audit-queue-error',
-              reason: String(error),
-            }),
-          ),
-        );
-        waitUntil?.(send);
-      }
-    },
-    // Notification seam: page/Slack/queue SLA breaches from here.
-    onEscalation: (record) =>
-      console.log(
-        JSON.stringify({
-          type: 'sla-escalation',
-          id: record.id,
-          workflowId: record.workflowId,
-          runId: record.runId,
-          slaDeadlineAt: record.slaDeadlineAt,
-        }),
-      ),
-    // This host's only topology-specific piece: resume the run through its DO
-    // stub. resumeRunWithRequeue (host-kit) wraps it with the SoD-guarded
-    // re-queue so a run that re-suspends at a later gate keeps flowing through
-    // the queue — the reviewer whose decision advanced the run becomes the next
-    // gate's requester, and therefore cannot decide it.
-    resumeRun: resumeRunWithRequeue(
-      async (record, decision) =>
-        doSummary(
-          await runStub(env, record.workflowId, record.runId).fetch(
-            `http://do/runs/${record.workflowId}/${record.runId}/resume`,
-            {
-              method: 'POST',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({
-                step: record.stepPath,
-                resumeData: defaultResumeData(record, decision),
-              }),
-            },
-          ),
-        ),
-      () => service,
-      systemActor,
-    ),
-  });
-  return service;
 }
 
 /**
- * Cron owns both enforcement surfaces: sweepSLA() (SLA breaches escalate)
- * and purgeExpiredWorkflowRuns() (terminal snapshots are reclaimed). Each is
- * isolated so one failing never masks the other; counts go to structured
- * logs.
+ * Maintenance runs on TWO cron expressions, dispatched on controller.cron so
+ * the SLA sweep and the retention purge NEVER share an invocation — a
+ * CPU-limit kill is uncatchable, so sharing one would let a slow sweep
+ * permanently starve the purge. Keep these literals equal to wrangler.jsonc's
+ * `triggers.crons`.
  */
-async function runMaintenance(env: Env, cron: string): Promise<void> {
-  let escalated: number | undefined;
+export const SWEEP_CRON = '*/15 * * * *';
+export const PURGE_CRON = '7 * * * *';
+
+async function runPurgeMaintenance(env: Env, cron: string): Promise<void> {
   let purged: number | undefined;
-  // The maintenance promise itself runs under ctx.waitUntil, so queue sends
-  // fired by sweep audit events are collected and awaited here instead.
-  const pendingSends: Promise<unknown>[] = [];
-  try {
-    // Cron-owned TCB sweep over the SYSTEM store: the ONLY legitimate
-    // cross-tenant read+write, and it is not reachable over HTTP.
-    const queueSink = env.AUDIT_QUEUE
-      ? queueAuditSink(env.AUDIT_QUEUE)
-      : undefined;
-    escalated = (
-      await sweepSLA(approvalStoreFactory(env.DB).system(), {
-        systemActor: MAINTENANCE_ACTOR,
-        audit: (event) => {
-          console.log(JSON.stringify({ type: 'audit', ...event }));
-          if (queueSink) {
-            pendingSends.push(
-              queueSink(event).catch((error: unknown) =>
-                console.error(
-                  JSON.stringify({
-                    type: 'audit-queue-error',
-                    reason: String(error),
-                  }),
-                ),
-              ),
-            );
-          }
-        },
-        onEscalation: (record) =>
-          console.log(
-            JSON.stringify({
-              type: 'sla-escalation',
-              id: record.id,
-              tenantId: record.tenantId,
-              workflowId: record.workflowId,
-              runId: record.runId,
-              slaDeadlineAt: record.slaDeadlineAt,
-            }),
-          ),
-      })
-    ).length;
-  } catch (error) {
-    console.error(
-      JSON.stringify({
-        type: 'maintenance-error',
-        surface: 'sla-sweep',
-        cron,
-        error: String(error),
-      }),
-    );
-  }
   try {
     // Storing run artifacts in R2? Pass your R2ArtifactStore here as
     // `artifactStore` — and the same store to purgeTenant, if you add
     // tenant offboarding (this template does not call it): the snapshot row
     // is the only record of a run's artifact keys, so a retention purge
     // without the pairing strands the purged runs' artifacts. `limit`
-    // batches the paired path per firing (subrequest budget).
+    // batches both purge paths per firing.
     purged = await purgeExpiredWorkflowRuns(env.DB, {
+      // allowZero: RUN_RETENTION_DAYS=0 means "purge terminal runs now".
       ttlMs:
-        numberVar(env.RUN_RETENTION_DAYS, 30, 'RUN_RETENTION_DAYS') *
+        numberVar(env.RUN_RETENTION_DAYS, 30, 'RUN_RETENTION_DAYS', {
+          allowZero: true,
+        }) *
         24 *
         60 *
         60 *
@@ -522,8 +348,7 @@ async function runMaintenance(env: Env, cron: string): Promise<void> {
       }),
     );
   }
-  await Promise.all(pendingSends);
-  console.log(JSON.stringify({ type: 'maintenance', cron, escalated, purged }));
+  console.log(JSON.stringify({ type: 'maintenance', cron, purged }));
 }
 
 const handler: ExportedHandler<Env> = {
@@ -539,15 +364,27 @@ const handler: ExportedHandler<Env> = {
     }
 
     const waitUntil = (promise: Promise<unknown>) => ctx.waitUntil(promise);
+    const topology = createDoRunTopology(env.RUNNER);
     // AUTHENTICATE FIRST, then construct (INV-2): the resolver binds the
     // approval store to the verified actor's tenant before any service
     // exists — there is no pre-auth store for a rushed fix to reach.
     const baseResolve = createTenantResolver({
-      authenticate: bearerActorAuthenticator(
-        staticTokenVerifier(parseActorTokens(env.APPROVAL_ACTOR_TOKENS)),
-      ),
-      storeFactory: approvalStoreFactory(env.DB),
-      buildService: (store) => buildApprovalService(store, env, waitUntil),
+      authenticate: bearerActorAuthenticator(buildVerifier(env)),
+      storeFactory: approvalStoreFactoryFor(env.DB),
+      buildService: (store) =>
+        buildHostApprovalService(store, {
+          systemActorId: SYSTEM_ACTOR_ID,
+          defaultSlaSeconds: numberVar(
+            env.APPROVAL_SLA_SECONDS,
+            4 * 60 * 60,
+            'APPROVAL_SLA_SECONDS',
+          ),
+          // This deployment's only topology-specific piece: decisions resume
+          // the run through its DO stub.
+          resumeRun: topology.resumeRecord,
+          queue: env.AUDIT_QUEUE,
+          waitUntil,
+        }),
     });
     const resolve = env.TENANT_APEX_DOMAIN
       ? withSubdomainCrossCheck(baseResolve, {
@@ -559,7 +396,7 @@ const handler: ExportedHandler<Env> = {
     const approvalResponse = await createApprovalRouter({ resolve })(routed);
     if (approvalResponse) return approvalResponse;
 
-    const runResponse = await runRouterFor(env, resolve)(routed);
+    const runResponse = await runRouterFor(resolve, topology)(routed);
     if (runResponse) return runResponse;
 
     return json({ error: 'not found' }, 404);
@@ -570,30 +407,42 @@ const handler: ExportedHandler<Env> = {
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
-    ctx.waitUntil(runMaintenance(env, controller.cron));
+    // Dispatch on WHICH cron fired; an unrecognized expression (ops edited
+    // wrangler without updating the constants) runs both sequentially and
+    // logs — availability of both duties beats purity on a misconfig.
+    const sweep = () =>
+      runSlaSweepMaintenance({
+        store: approvalStoreFactoryFor(env.DB).system(),
+        systemActor: maintenanceActor(SYSTEM_ACTOR_ID),
+        queue: env.AUDIT_QUEUE,
+        cron: controller.cron,
+      });
+    if (controller.cron === SWEEP_CRON) {
+      ctx.waitUntil(sweep());
+    } else if (controller.cron === PURGE_CRON) {
+      ctx.waitUntil(runPurgeMaintenance(env, controller.cron));
+    } else {
+      console.error(
+        JSON.stringify({
+          type: 'config-error',
+          var: 'triggers.crons',
+          raw: controller.cron,
+          reason: 'unknown cron expression — running both maintenance surfaces',
+        }),
+      );
+      ctx.waitUntil(
+        sweep().then(() => runPurgeMaintenance(env, controller.cron)),
+      );
+    }
   },
 
   // Audit-export consumer (active only when the wrangler.jsonc `queues`
   // block is uncommented): ships each batch to the SIEM collector; a failed
   // export retries the batch, so nothing is acked unconfirmed.
   async queue(batch: MessageBatch, env: Env): Promise<void> {
-    if (!env.SIEM_ENDPOINT) {
-      console.error(
-        JSON.stringify({
-          type: 'config-error',
-          var: 'SIEM_ENDPOINT',
-          reason:
-            'audit consumer bound without an export endpoint — retrying batch',
-        }),
-      );
-      batch.retryAll();
-      return;
-    }
-    await createAuditQueueConsumer({
+    await createAuditQueueHandler({
       endpoint: env.SIEM_ENDPOINT,
-      headers: env.SIEM_AUTH_HEADER
-        ? { authorization: env.SIEM_AUTH_HEADER }
-        : undefined,
+      authHeader: env.SIEM_AUTH_HEADER,
     })(batch);
   },
 };
