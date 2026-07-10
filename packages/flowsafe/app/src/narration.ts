@@ -808,6 +808,30 @@ export function decideEvents(result: DecideResult): NarrationEvent[] {
   return events;
 }
 
+/**
+ * A refused decide (403): separation of duties for reviewer/admin (the
+ * requester deciding their own request), the role gate for viewer/operator.
+ * The server message names which; the hint applies to both.
+ */
+export function decideDeniedEvent(
+  approvalId: string,
+  message: string,
+): NarrationEvent {
+  return {
+    key: `sod:${approvalId}`,
+    at: Date.now(),
+    zone: 'worker',
+    kind: 'authz.denied',
+    title: 'Decision refused (403)',
+    detail: `${message}. Switch role — each demo role is a distinct actor id, so another role can decide this.`,
+    tone: 'danger',
+    approvalId,
+    observed: true,
+    toast: true,
+    toastLong: true,
+  };
+}
+
 /** Narrate the actor's own successful claim (feed only — the button shows it). */
 export function claimEvent(record: ApprovalRecord): NarrationEvent {
   return {

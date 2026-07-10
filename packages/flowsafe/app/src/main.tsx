@@ -13,9 +13,9 @@ import {
 } from 'react';
 import { createRoot } from 'react-dom/client';
 
-import { ApprovalApiClient } from '../../src/approval-ui/client.js';
 import { ApprovalUIProvider } from '../../src/approval-ui/components.js';
 import { astryxComponents } from './astryx-components.js';
+import { NarratingApprovalClient } from './narrating-approval-client.js';
 import {
   DemoActorSwitcher,
   type DemoTokenSet,
@@ -72,10 +72,16 @@ function Root(): ReactElement {
     if (actorToken !== null) headers.authorization = `Bearer ${actorToken}`;
     return headers;
   }, [actorToken]);
+  // narrate is the feed hook's stable useCallback — pinned here so identity
+  // churn can never rebuild the client and re-trigger the dashboard fetches.
   const approvalClient = useMemo(
     () =>
-      new ApprovalApiClient({ baseUrl: APPROVAL_BASE, headers: authHeaders }),
-    [authHeaders],
+      new NarratingApprovalClient({
+        baseUrl: APPROVAL_BASE,
+        headers: authHeaders,
+        narrate,
+      }),
+    [authHeaders, narrate],
   );
   const runClient = useMemo(
     () => new RunClient({ baseUrl: RUN_BASE, headers: authHeaders }),
@@ -145,7 +151,7 @@ function Root(): ReactElement {
           runClient={runClient}
           runs={runs}
           onStarted={addRun}
-          narrate={narrate}
+          feed={feed}
           identityControls={identityControls}
         />
       )}

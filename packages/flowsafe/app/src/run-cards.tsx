@@ -183,7 +183,12 @@ function RunCard({
     )?.id ?? run.approvalId;
 
   return (
-    <Card variant="default" padding={4} aria-label={`Run ${run.runId}`}>
+    <Card
+      variant="default"
+      padding={4}
+      aria-label={`Run ${run.runId}`}
+      id={`run-${run.runId}`}
+    >
       <VStack gap={3}>
         <HStack gap={3} align="center" justify="between">
           <Heading level={3}>{run.title}</Heading>
