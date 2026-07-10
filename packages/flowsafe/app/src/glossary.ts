@@ -8,6 +8,10 @@
 
 import type { NarrationZone } from './narration.js';
 
+/** The one-line product statement (header + signed-out landing). */
+export const TAGLINE =
+  'Approval gates and capability grants for AI agent workflows — suspending, deciding, and resuming durably on Cloudflare.';
+
 export const ZONES: Record<NarrationZone, { label: string; blurb: string }> = {
   browser: {
     label: 'browser',

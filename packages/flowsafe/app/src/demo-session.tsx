@@ -5,9 +5,24 @@
 // JWTs while the sandbox (tenant) is live. No token literal exists here: the
 // production bundle stays credential-free (scripts/assert-clean-app-bundle).
 
+import { HStack } from '@astryxdesign/core/HStack';
+import {
+  SegmentedControl,
+  SegmentedControlItem,
+} from '@astryxdesign/core/SegmentedControl';
+import { Timestamp } from '@astryxdesign/core/Timestamp';
+import { Token } from '@astryxdesign/core/Token';
+import { Tooltip } from '@astryxdesign/core/Tooltip';
 import { type ReactElement, useEffect, useState } from 'react';
 
-import { useApprovalUIComponents } from '../../src/approval-ui/components.js';
+import { GLOSSARY } from './glossary.js';
+import {
+  actorSwitchedEvent,
+  type NarrationEvent,
+  sessionExpiredEvent,
+  sessionExpiringEvent,
+  tokenRefreshedEvent,
+} from './narration.js';
 
 export interface DemoToken {
   id: string;
@@ -81,12 +96,16 @@ export function useDemoSignIn(): string | undefined {
   return provider;
 }
 
+/** Warn this long before the sandbox tenant expires. */
+const EXPIRY_WARNING_MS = 15 * 60 * 1000;
+
 export function DemoActorSwitcher({
   session,
   actorToken,
   onSelect,
   onSession,
   onExpired,
+  narrate,
 }: {
   session: DemoTokenSet;
   actorToken: string | null;
@@ -95,9 +114,8 @@ export function DemoActorSwitcher({
   onSession: (session: DemoTokenSet) => void;
   /** The sandbox (tenant) expired — the caller drops back to sign-in. */
   onExpired: () => void;
+  narrate: (events: readonly NarrationEvent[]) => void;
 }): ReactElement {
-  const C = useApprovalUIComponents();
-
   // Bootstrap: start as the operator (the natural workflow starter);
   // reviewer/admin are one click away for the approve-your-run flow.
   const bootstrap =
@@ -121,12 +139,14 @@ export function DemoActorSwitcher({
         body: JSON.stringify({ token: current.token }),
       }).then(async (response) => {
         if (response.status === 401) {
+          narrate([sessionExpiredEvent()]);
           onExpired();
           return;
         }
         if (!response.ok) return; // transient — retry next tick
         const next = (await response.json()) as DemoTokenSet;
         onSession(next);
+        narrate([tokenRefreshedEvent()]);
         // Keep the selected ROLE across the rotation.
         const selected = session.tokens.find(
           (entry) => entry.token === actorToken,
@@ -138,31 +158,66 @@ export function DemoActorSwitcher({
       });
     }, REFRESH_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [session, actorToken, onSelect, onSession, onExpired]);
+  }, [session, actorToken, onSelect, onSession, onExpired, narrate]);
+
+  // One heads-up before the tenant reaches end of life (key-deduped, so the
+  // effect re-arming on session refreshes cannot double-warn).
+  useEffect(() => {
+    const expiresAtMs = Date.parse(session.tenantExpiresAt);
+    if (Number.isNaN(expiresAtMs)) return;
+    const delay = expiresAtMs - EXPIRY_WARNING_MS - Date.now();
+    if (expiresAtMs <= Date.now()) return;
+    const minutesLeft = Math.max(
+      1,
+      Math.round((expiresAtMs - Date.now()) / 60_000),
+    );
+    const timer = setTimeout(
+      () => narrate([sessionExpiringEvent(Math.min(15, minutesLeft))]),
+      Math.max(0, delay),
+    );
+    return () => clearTimeout(timer);
+  }, [session.tenantExpiresAt, narrate]);
+
+  const selectedRole =
+    session.tokens.find((entry) => entry.token === actorToken)?.role ?? '';
+
+  function switchRole(role: string): void {
+    const entry = session.tokens.find((token) => token.role === role);
+    if (!entry || entry.token === actorToken) return;
+    onSelect(entry.token);
+    narrate([actorSwitchedEvent(entry.id, entry.role)]);
+  }
 
   return (
-    <C.Section aria-label="Acting identity">
-      <C.Stack gap="sm">
-        <C.Heading level={2}>Your demo sandbox</C.Heading>
-        <C.Text>
-          {`Isolated tenant ${session.tenantId} — everything you run and approve here is invisible to every other visitor. Sandbox expires ${new Date(session.tenantExpiresAt).toLocaleString()}.`}
-        </C.Text>
-        <C.Text>
-          Switch identity to see RBAC and separation-of-duties live: start a run
-          as the operator, then approve it as the reviewer.
-        </C.Text>
-        <C.Stack direction="horizontal" gap="sm">
-          {session.tokens.map((entry) => (
-            <C.Button
-              key={entry.id}
-              label={entry.role}
-              variant={entry.token === actorToken ? 'primary' : 'secondary'}
-              pressed={entry.token === actorToken}
-              onClick={() => onSelect(entry.token)}
-            />
-          ))}
-        </C.Stack>
-      </C.Stack>
-    </C.Section>
+    <HStack gap={2} align="center" wrap="wrap" aria-label="Acting identity">
+      <Tooltip content={GLOSSARY.sandboxTenant}>
+        <Token label={`sandbox ${session.tenantId}`} size="sm" color="cyan" />
+      </Tooltip>
+      <Tooltip content={GLOSSARY.expiry}>
+        <HStack gap={1} align="center">
+          <Timestamp
+            value={session.tenantExpiresAt}
+            format="relative"
+            isLive
+            size="sm"
+            color="secondary"
+          />
+        </HStack>
+      </Tooltip>
+      <SegmentedControl
+        label="Acting role"
+        value={selectedRole}
+        onChange={switchRole}
+        size="sm"
+      >
+        {session.tokens.map((entry) => (
+          <SegmentedControlItem
+            key={entry.id}
+            value={entry.role}
+            label={entry.role}
+          />
+        ))}
+      </SegmentedControl>
+    </HStack>
   );
 }

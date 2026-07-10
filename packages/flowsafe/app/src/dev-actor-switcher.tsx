@@ -4,20 +4,27 @@
 // that). Identity itself still comes from the server's catalog echo — these
 // buttons only choose which PUBLIC dev token to present.
 
+import { HStack } from '@astryxdesign/core/HStack';
+import {
+  SegmentedControl,
+  SegmentedControlItem,
+} from '@astryxdesign/core/SegmentedControl';
+import { Token } from '@astryxdesign/core/Token';
+import { Tooltip } from '@astryxdesign/core/Tooltip';
 import { type ReactElement, useEffect } from 'react';
 
-import { useApprovalUIComponents } from '../../src/approval-ui/components.js';
 import { DEMO_ACTORS } from '../../showcase/demo-actors.js';
+import { actorSwitchedEvent, type NarrationEvent } from './narration.js';
 
 export function DevActorSwitcher({
   actorToken,
   onSelect,
+  narrate,
 }: {
   actorToken: string | null;
   onSelect: (token: string) => void;
+  narrate: (events: readonly NarrationEvent[]) => void;
 }): ReactElement {
-  const C = useApprovalUIComponents();
-
   // Dev bootstrap: start signed in as the first demo actor, preserving the
   // zero-click app:dev experience. Runs once; the selection lives in Root.
   const bootstrapToken = actorToken === null ? DEMO_ACTORS[0]?.token : null;
@@ -25,26 +32,35 @@ export function DevActorSwitcher({
     if (bootstrapToken) onSelect(bootstrapToken);
   }, [bootstrapToken, onSelect]);
 
+  const selectedId =
+    DEMO_ACTORS.find((actor) => actor.token === actorToken)?.id ?? '';
+
+  function switchActor(id: string): void {
+    const actor = DEMO_ACTORS.find((entry) => entry.id === id);
+    if (!actor || actor.token === actorToken) return;
+    onSelect(actor.token);
+    narrate([actorSwitchedEvent(actor.id, actor.role)]);
+  }
+
   return (
-    <C.Section aria-label="Acting identity">
-      <C.Stack gap="sm">
-        <C.Heading level={2}>Acting as</C.Heading>
-        <C.Text>
-          Switch identity to see RBAC and separation-of-duties live.
-          Grant-minting always stays server-side, whichever actor you pick.
-        </C.Text>
-        <C.Stack direction="horizontal" gap="sm">
-          {DEMO_ACTORS.map((actor) => (
-            <C.Button
-              key={actor.token}
-              label={actor.id}
-              variant={actor.token === actorToken ? 'primary' : 'secondary'}
-              pressed={actor.token === actorToken}
-              onClick={() => onSelect(actor.token)}
-            />
-          ))}
-        </C.Stack>
-      </C.Stack>
-    </C.Section>
+    <HStack gap={2} align="center" aria-label="Acting identity">
+      <Tooltip content="app:dev only — these are the public local-dev bearer tokens; the production bundle ships none.">
+        <Token label="dev tokens" size="sm" color="gray" />
+      </Tooltip>
+      <SegmentedControl
+        label="Acting identity"
+        value={selectedId}
+        onChange={switchActor}
+        size="sm"
+      >
+        {DEMO_ACTORS.map((actor) => (
+          <SegmentedControlItem
+            key={actor.id}
+            value={actor.id}
+            label={actor.id}
+          />
+        ))}
+      </SegmentedControl>
+    </HStack>
   );
 }

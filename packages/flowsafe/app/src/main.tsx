@@ -6,12 +6,13 @@ import {
   type ReactElement,
   StrictMode,
   Suspense,
+  useCallback,
+  useEffect,
   useMemo,
   useState,
 } from 'react';
 import { createRoot } from 'react-dom/client';
 
-import { App } from '../../src/approval-ui/App.js';
 import { ApprovalApiClient } from '../../src/approval-ui/client.js';
 import { ApprovalUIProvider } from '../../src/approval-ui/components.js';
 import { astryxComponents } from './astryx-components.js';
@@ -21,13 +22,12 @@ import {
   readDemoTokensFromHash,
   useDemoSignIn,
 } from './demo-session.js';
+import { sessionReadyEvent } from './narration.js';
 import { RunClient } from './run-client.js';
-import {
-  LauncherPanel,
-  type RunEntry,
-  RunStatusPanel,
-  TokenGate,
-} from './showcase-panels.js';
+import { ShowcaseApp } from './showcase-app.js';
+import { OperatorIdentityChip, TokenGate } from './token-gate.js';
+import { useActivityFeed } from './use-activity-feed.js';
+import type { RunEntry } from './use-run-polling.js';
 import './index.css';
 
 const container = document.getElementById('root');
@@ -52,10 +52,9 @@ const DevActorSwitcher = import.meta.env.DEV
 
 // The showcase shell: hold the acting token + the launched runs at the root,
 // derive both API clients from the token (a new client instance re-triggers
-// the dashboard fetch and re-scopes the run polling), and render the controls
-// beside the approval dashboard under the shared Astryx provider. Identity
-// (id/role/tenant) is never derived client-side — the server echoes it per
-// request.
+// the dashboard fetch and re-scopes the run polling), and hand the activity
+// feed's stable `record` down as the narration sink. Identity (id/role/tenant)
+// is never derived client-side — the server echoes it per request.
 function Root(): ReactElement {
   const [actorToken, setActorToken] = useState<string | null>(null);
   // The OAuth callback delivers a per-visitor sandbox token set in the URL
@@ -65,6 +64,8 @@ function Root(): ReactElement {
   );
   const [runs, setRuns] = useState<readonly RunEntry[]>([]);
   const demoSignInProvider = useDemoSignIn();
+  const feed = useActivityFeed();
+  const narrate = feed.record;
 
   const authHeaders = useMemo(() => {
     const headers: Record<string, string> = {};
@@ -81,44 +82,73 @@ function Root(): ReactElement {
     [authHeaders],
   );
 
-  function addRun(entry: RunEntry): void {
+  const addRun = useCallback((entry: RunEntry) => {
     setRuns((current) => [entry, ...current]);
-  }
+  }, []);
 
-  function endDemoSession(): void {
+  const endDemoSession = useCallback(() => {
     setDemoSession(null);
     setActorToken(null);
-  }
+  }, []);
+
+  // Announce the sandbox once per tenant — the key dedups re-renders and the
+  // refreshed token sets that keep the same tenantId.
+  useEffect(() => {
+    if (!demoSession) return;
+    narrate([
+      sessionReadyEvent({
+        provider: demoSignInProvider ?? 'OAuth',
+        tenantId: demoSession.tenantId,
+        expiresAtMs: Date.parse(demoSession.tenantExpiresAt),
+      }),
+    ]);
+  }, [demoSession, demoSignInProvider, narrate]);
+
+  const identityControls = DevActorSwitcher ? (
+    <Suspense fallback={null}>
+      <DevActorSwitcher
+        actorToken={actorToken}
+        onSelect={setActorToken}
+        narrate={narrate}
+      />
+    </Suspense>
+  ) : demoSession ? (
+    <DemoActorSwitcher
+      session={demoSession}
+      actorToken={actorToken}
+      onSelect={setActorToken}
+      onSession={setDemoSession}
+      onExpired={endDemoSession}
+      narrate={narrate}
+    />
+  ) : actorToken !== null ? (
+    <OperatorIdentityChip onSignOut={() => setActorToken(null)} />
+  ) : null;
 
   return (
     <ApprovalUIProvider components={astryxComponents}>
-      {DevActorSwitcher ? (
-        <Suspense fallback={null}>
-          <DevActorSwitcher actorToken={actorToken} onSelect={setActorToken} />
-        </Suspense>
-      ) : demoSession ? (
-        <DemoActorSwitcher
-          session={demoSession}
-          actorToken={actorToken}
-          onSelect={setActorToken}
-          onSession={setDemoSession}
-          onExpired={endDemoSession}
-        />
+      {actorToken === null ? (
+        <>
+          {/* The switchers bootstrap the first token, so they must mount
+              even before sign-in; the token gate covers the rest. */}
+          {identityControls}
+          {!DevActorSwitcher && !demoSession ? (
+            <TokenGate
+              onSubmit={setActorToken}
+              demoSignInProvider={demoSignInProvider}
+            />
+          ) : null}
+        </>
       ) : (
-        <TokenGate
-          signedIn={actorToken !== null}
-          onSubmit={setActorToken}
-          onSignOut={() => setActorToken(null)}
-          demoSignInProvider={demoSignInProvider}
+        <ShowcaseApp
+          approvalClient={approvalClient}
+          runClient={runClient}
+          runs={runs}
+          onStarted={addRun}
+          narrate={narrate}
+          identityControls={identityControls}
         />
       )}
-      {actorToken !== null ? (
-        <>
-          <LauncherPanel runClient={runClient} onStarted={addRun} />
-          <RunStatusPanel runClient={runClient} runs={runs} />
-          <App client={approvalClient} pollIntervalMs={5000} />
-        </>
-      ) : null}
     </ApprovalUIProvider>
   );
 }

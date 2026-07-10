@@ -1,6 +1,6 @@
 // The showcase's demo identities — ONE source of truth for three consumers:
 //
-//   1. app/src/showcase-panels.tsx  — the ActorSwitcher's buttons
+//   1. app/src/dev-actor-switcher.tsx — the dev actor switcher's buttons
 //   2. app/run-api-dev-plugin.ts    — the dev backend's bearer -> actor map
 //   3. showcase/.dev.vars.example   — the APPROVAL_ACTOR_TOKENS local-dev secret
 //
