@@ -42,6 +42,10 @@ export interface RunEntry {
   workflowId: string;
   runId: string;
   title: string;
+  /** The approval auto-queued by a start that suspended (run → queue link). */
+  approvalId?: string;
+  /** Client clock at launch — display/ordering only, never sent anywhere. */
+  startedAt: number;
 }
 
 /** Rendered when the status endpoint, not the run, is what failed. */
@@ -282,6 +286,8 @@ export function LauncherPanel({
         workflowId: selected.id,
         runId: summary.runId,
         title: selected.title,
+        approvalId: summary.approval?.id,
+        startedAt: Date.now(),
       });
     } catch (error) {
       setLaunchError(error instanceof Error ? error.message : String(error));

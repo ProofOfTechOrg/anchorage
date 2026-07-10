@@ -38,7 +38,11 @@ export interface WorkflowCatalog {
 
 /**
  * The run projection (POST /runs, GET /runs/:wf/:run) — a subset of the server's
- * RunSummary carrying the fields the UI may render.
+ * RunSummary carrying the fields the UI may render. The suspension fields are
+ * keyed by the dot-joined step path (e.g. 'reviewAndApprove'): `suspendPayload`
+ * is what the gate suspended with, and `(suspendedAt, resumeCount)` is the
+ * fingerprint approvals bind to (resumeCount is the runtime's per-step resume
+ * ordinal — absent on a first suspension, 1,2,… on re-suspensions).
  */
 export interface RunSummary {
   runId: string;
@@ -46,6 +50,14 @@ export interface RunSummary {
   result?: unknown;
   error?: string;
   suspended?: string[][];
+  suspendPayload?: Record<
+    string,
+    { reason?: string; connectors?: string[] } & Record<string, unknown>
+  >;
+  /** Epoch ms per step key. */
+  suspendedAt?: Record<string, number>;
+  /** Resume ordinal per step key. */
+  resumeCount?: Record<string, number>;
   createdAt?: string;
   updatedAt?: string;
 }
