@@ -93,7 +93,8 @@ Shipped as npm package `@proofoftech/breakwater` -- consumers add as a dependenc
 ## Run (Local Development)
 
 ```
-pnpm dev
+pnpm dev            # the showcase app: Vite dev server + in-process API host (:4321)
+pnpm -r dev         # instead: tsc --watch on both libraries (no app)
 ```
 
 ## Cron
