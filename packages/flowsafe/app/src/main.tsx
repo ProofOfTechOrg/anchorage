@@ -61,7 +61,7 @@ function Root(): ReactElement {
     readDemoTokensFromHash,
   );
   const [runs, setRuns] = useState<readonly RunEntry[]>([]);
-  const demoSignInEnabled = useDemoSignIn();
+  const demoSignInProvider = useDemoSignIn();
 
   const authHeaders = useMemo(() => {
     const headers: Record<string, string> = {};
@@ -106,7 +106,7 @@ function Root(): ReactElement {
           signedIn={actorToken !== null}
           onSubmit={setActorToken}
           onSignOut={() => setActorToken(null)}
-          demoSignInHref={demoSignInEnabled ? '/auth/github' : undefined}
+          demoSignInProvider={demoSignInProvider}
         />
       )}
       {actorToken !== null ? (

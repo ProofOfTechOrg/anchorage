@@ -49,26 +49,36 @@ export function readDemoTokensFromHash(): DemoTokenSet | null {
   }
 }
 
-/** Whether the worker has the public demo configured (drives the sign-in button). */
-export function useDemoSignIn(): boolean {
-  const [enabled, setEnabled] = useState(false);
+/**
+ * The configured public-demo OAuth provider name ('google', 'github', …), or
+ * undefined when the worker has no demo configured. The server's /auth/config
+ * echo is the single source — the SPA never hardcodes a provider, so swapping
+ * the worker's provider needs no client change.
+ */
+export function useDemoSignIn(): string | undefined {
+  const [provider, setProvider] = useState<string | undefined>(undefined);
   useEffect(() => {
     let alive = true;
     fetch('/auth/config')
-      .then(async (response) =>
-        response.ok
-          ? ((await response.json()) as { enabled?: boolean }).enabled === true
-          : false,
-      )
-      .catch(() => false)
+      .then(async (response) => {
+        if (!response.ok) return undefined;
+        const config = (await response.json()) as {
+          enabled?: boolean;
+          provider?: string;
+        };
+        return config.enabled === true && typeof config.provider === 'string'
+          ? config.provider
+          : undefined;
+      })
+      .catch(() => undefined)
       .then((value) => {
-        if (alive) setEnabled(value);
+        if (alive) setProvider(value);
       });
     return () => {
       alive = false;
     };
   }, []);
-  return enabled;
+  return provider;
 }
 
 export function DemoActorSwitcher({

@@ -217,33 +217,31 @@ not catchable, so a slow sweep sharing an invocation would starve the purge.
 
 ## Testing & verification
 
-This template has **no standalone unit tests by design** — it is composition
-glue over already-tested library code, and unit-testing it would mean mocking
-the Durable Object + D1 bindings for little gain. Its correctness rests on
-four independently-maintained layers:
+The template's correctness rests on four independently-maintained layers:
 
-1. **Typecheck.** `pnpm --filter @proofoftech/flowsafe typecheck` includes
+1. **Its own executable test.** `worker.e2e.test.ts` (part of `pnpm -r test`)
+   drives the REAL exported handler in-process — real Mastra D1Store and
+   `D1ApprovalStore` over `node:sqlite` behind a D1-shaped adapter, real
+   `FlowsafeRunner` instances behind a stub DO namespace — and pins the auth
+   seam (incl. the reserved-`system` token drop), the full
+   start → auto-queued approval → SoD denials → reviewer decision →
+   grant-minted publish loop, the fail-closed forged resume, the tenant
+   boundary (client runId 400, cross-tenant 404s), `scheduled()` (SLA
+   escalation + terminal-only retention purge, with the two surfaces isolated
+   from each other's failures), and the `queue()` audit-export consumer.
+2. **Typecheck.** `pnpm --filter @proofoftech/flowsafe typecheck` includes
    `deploy/tsconfig.json`, so the wiring is type-checked against flowsafe
    source through the real `@proofoftech/flowsafe/*` specifiers.
-2. **The library test suite.** Every enforcement rule the template relies on
+3. **The library test suite.** Every enforcement rule the template relies on
    — role authorization, CAS transitions, SLA/escalation, self-decision
    separation of duties, grant derivation — is covered by the `approval-api`
    and `do-runner` unit tests. The template only *feeds* those guarantees; it
    does not reimplement them.
-3. **The `spike:verify` end-to-end proof.** The sibling `../demo/` worker
-   shares the same library and is driven by
+4. **The `spike:verify` end-to-end proof on workerd.** The sibling `../demo/`
+   worker shares the same library and is driven by
    `pnpm --filter @proofoftech/flowsafe spike:verify` (also run in CI), which
    proves suspend → process-kill → restart-on-persisted-state → grant-minted
-   resume, a forged raw resume failing closed, and a run's requester being
-   denied self-decision. The template's start/decide/resume/SoD shape is
-   structurally identical, so that proof exercises the same code paths.
-4. **A local smoke run.** `pnpm deploy:dev` against local workerd (no
-   Cloudflare account) lets you drive the full loop with the `curl` commands
-   in the deploy checklist above.
-
-**Consequence:** because layer 3 covers the demo rather than this file
-directly, any change to the template's own logic — auth, the approval
-bridges, `requestedBy` attribution, the cron handler — is not caught by
-`pnpm -r test`. Re-run a `deploy:dev` smoke (start a run, decide it, confirm
-resume; and confirm a start actor cannot decide their own run) after editing
-this worker.
+   resume on the real Workers runtime — the process-death durability layer 1
+   cannot exercise in-process. A local `pnpm deploy:dev` smoke against
+   workerd (no Cloudflare account) covers the same ground for this template
+   via the `curl` commands in the deploy checklist above.

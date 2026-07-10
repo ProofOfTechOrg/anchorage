@@ -224,13 +224,27 @@ export async function findOrCreateDemoTenant(
   return row;
 }
 
+/**
+ * Machine-readable cause of a budget refusal. `scope` says WHICH budget bit
+ * ('tenant' caps one sandbox; 'global' is the platform-wide daily ceiling);
+ * `reason` says WHY, so consumers branch on it instead of string-matching
+ * `message` (whose copy is UX and may change).
+ */
+export type DemoRunLimitReason = 'not-provisioned' | 'expired' | 'cap-reached';
+
 export class DemoRunLimitError extends Error {
   readonly scope: 'tenant' | 'global';
+  readonly reason: DemoRunLimitReason;
 
-  constructor(scope: 'tenant' | 'global', message: string) {
+  constructor(
+    scope: 'tenant' | 'global',
+    reason: DemoRunLimitReason,
+    message: string,
+  ) {
     super(message);
     this.name = 'DemoRunLimitError';
     this.scope = scope;
+    this.reason = reason;
   }
 }
 
@@ -277,17 +291,20 @@ export async function consumeRunBudget(
     if (!row) {
       throw new DemoRunLimitError(
         'tenant',
+        'not-provisioned',
         'demo tenant not found or not provisioned',
       );
     }
     if (Date.parse(row.expires_at) <= now) {
       throw new DemoRunLimitError(
         'tenant',
+        'expired',
         'demo tenant expired — sign in again for a fresh sandbox',
       );
     }
     throw new DemoRunLimitError(
       'tenant',
+      'cap-reached',
       `demo run limit reached (${options.tenantRunCap} runs per sandbox)`,
     );
   }
@@ -303,6 +320,7 @@ export async function consumeRunBudget(
   if (d1Changes(dailyUpdate) === 0) {
     throw new DemoRunLimitError(
       'global',
+      'cap-reached',
       'the demo has reached its global daily run ceiling — try again tomorrow',
     );
   }
@@ -382,7 +400,7 @@ export async function purgeExpiredDemoTenants(
   return purged;
 }
 
-// ---- OAuth (provider behind a seam; GitHub ships first) --------------------
+// ---- OAuth (providers behind a seam; Google launches, GitHub falls back) ---
 
 export interface OAuthProvider {
   readonly name: string;
@@ -447,6 +465,68 @@ export function githubProvider(options: GithubProviderOptions): OAuthProvider {
       if (typeof user.id !== 'number') return undefined;
       // The NUMERIC id is the stable subject — logins are renameable.
       return { subject: `github:${user.id}` };
+    },
+  };
+}
+
+interface GoogleProviderOptions {
+  clientId: string;
+  clientSecret: string;
+  /** Injectable for tests. Default: globalThis.fetch. */
+  fetch?: typeof fetch;
+}
+
+export function googleProvider(options: GoogleProviderOptions): OAuthProvider {
+  const fetchFn = options.fetch ?? fetch;
+  return {
+    name: 'google',
+    authorizeUrl({ state, redirectUri }) {
+      const url = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+      url.searchParams.set('client_id', options.clientId);
+      url.searchParams.set('redirect_uri', redirectUri);
+      url.searchParams.set('response_type', 'code');
+      // 'openid' alone: the demo needs only a stable subject (`sub`), never
+      // email or profile — the narrowest consent screen Google offers.
+      url.searchParams.set('scope', 'openid');
+      url.searchParams.set('state', state);
+      return url.toString();
+    },
+    async exchange({ code, redirectUri }) {
+      // Google's token endpoint accepts ONLY form encoding — a JSON body is
+      // rejected (unlike GitHub's, which negotiates).
+      const tokenResponse = await fetchFn(
+        'https://oauth2.googleapis.com/token',
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            grant_type: 'authorization_code',
+            code,
+            client_id: options.clientId,
+            client_secret: options.clientSecret,
+            redirect_uri: redirectUri,
+          }).toString(),
+        },
+      );
+      if (!tokenResponse.ok) return undefined;
+      const tokenBody = (await tokenResponse.json()) as {
+        access_token?: string;
+      };
+      if (!tokenBody.access_token) return undefined;
+      const userResponse = await fetchFn(
+        'https://openidconnect.googleapis.com/v1/userinfo',
+        {
+          headers: { authorization: `Bearer ${tokenBody.access_token}` },
+        },
+      );
+      if (!userResponse.ok) return undefined;
+      const user = (await userResponse.json()) as { sub?: string };
+      if (typeof user.sub !== 'string' || user.sub.length === 0) {
+        return undefined;
+      }
+      // `sub` is Google's stable per-account identifier ("unique among all
+      // Google accounts and never reused") — emails are renameable.
+      return { subject: `google:${user.sub}` };
     },
   };
 }
@@ -602,9 +682,10 @@ function json(payload: unknown, status = 200): Response {
 }
 
 /**
- * Routes (null for paths outside /auth/*, so hosts compose it first):
- *   GET  /auth/github            -> 302 to the provider (signed state)
- *   GET  /auth/github/callback   -> verify state, exchange code, mint the
+ * Routes (null for paths outside /auth/*, so hosts compose it first; the
+ * <provider> segment is the mounted provider's name — google or github):
+ *   GET  /auth/<provider>          -> 302 to the provider (signed state)
+ *   GET  /auth/<provider>/callback -> verify state, exchange code, mint the
  *                                   tenant + token set, 302 to /#demo-tokens=
  *                                   <base64url(JSON DemoTokenSet)> — a
  *                                   FRAGMENT, so tokens never hit server logs

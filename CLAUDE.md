@@ -114,7 +114,7 @@ Phase 4 (Ecosystem, 2026-07-07):
   trigger (isolated failures), bearer-token auth seam, start+resume approval
   bridges (multi-gate), optional Queues audit export. `deploy:cf`/`deploy:dev`.
 
-Verification gate: `pnpm -r lint && pnpm -r typecheck && pnpm -r test && pnpm -r build` (669 tests).
+Verification gate: `pnpm -r lint && pnpm -r typecheck && pnpm -r test && pnpm -r build` (698 tests).
 
 Showcase (2026-07-09): all five `docs/examples/*` workflows made runnable behind
 one React frontend and shipped as a single Cloudflare deploy —
@@ -166,12 +166,29 @@ required; the `tenants` registry is the allocation authority — `RESERVED_FOR_A
 denied at provisioning (infra slugs + `system` + `default`), `RESERVED_TENANT_IDS`
 (`system`) denied at token verification AND re-refused by `createTenantResolver`
 before any store binds — custom verifiers bypass `toApprovalActor`);
-the public demo (`showcase/demo-auth.ts`: GitHub OAuth → ephemeral `dm*` tenant + four-role
+the public demo (`showcase/demo-auth.ts`: OAuth → ephemeral `dm*` tenant + four-role
 JWT set, atomic per-tenant + global-daily run caps, kill switch in the AUTH middleware, two
-cron expressions so sweep/purge never share an invocation); subdomain↔tenant cross-check for
+cron expressions so sweep/purge never share an invocation; providers behind the `OAuthProvider`
+seam — `googleProvider` is the LAUNCH provider, `githubProvider` the env-selected fallback;
+one mounts per deployment, Google wins when both are configured, and the SPA reads the
+provider name from `/auth/config`); subdomain↔tenant cross-check for
 client-per-subdomain hosts. The deployed SPA derives identity from the server's `/workflows`
 actor echo (the fail-open client actor table is gone) and its production bundle is proven
 demo-token-free at build time.
+
+## Live demo deployment (anchorage.proofoftech.org)
+
+The showcase deploys to **`anchorage.proofoftech.org`** — a Workers custom
+domain on the proofoftech.org zone, with `workers_dev: false` so it is the
+ONLY public origin (the Google OAuth callback is registered for exactly
+`https://anchorage.proofoftech.org/auth/google/callback`; a second origin
+would break sign-in and undermine noindex). **TEMPORARY: `app/index.html`
+carries a `<meta name="robots" content="noindex" />` so the live demo stays
+out of search indexes pre-announce — REMOVE that meta (and this reminder)
+when the demo should be indexable.** Google OAuth is the launch provider
+(`GOOGLE_CLIENT_ID` var + `GOOGLE_CLIENT_SECRET` secret; the Google consent
+screen must be "In production" — Testing status only admits listed test
+users); GitHub stays a config-only fallback.
 
 ## Files
 

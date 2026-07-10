@@ -5,7 +5,7 @@
 // provider, and the kill switch — including its auth-middleware half (an
 // ALREADY-ISSUED JWT must die with the switch, not just new mints).
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { hmacVerifier, provisionTenant } from '../src/host-kit/index.js';
 import {
@@ -20,6 +20,7 @@ import {
   type DemoStatement,
   type DemoTokenSet,
   findOrCreateDemoTenant,
+  googleProvider,
   mintDemoTenantId,
   mintDemoTokenSet,
   nonceOfState,
@@ -30,7 +31,7 @@ import {
   STATE_COOKIE,
   verifyState,
 } from './demo-auth.js';
-import { buildVerifier } from './worker.js';
+import { buildVerifier, selectOAuthProvider } from './worker.js';
 
 interface SqliteStatement {
   get(...params: unknown[]): unknown;
@@ -177,9 +178,12 @@ describe('consumeRunBudget (atomic caps)', () => {
     // overshoots because increment-and-check is one statement
     await consumeRunBudget(db, options);
     await consumeRunBudget(db, options);
-    await expect(consumeRunBudget(db, options)).rejects.toBeInstanceOf(
-      DemoRunLimitError,
-    );
+    const refusal = consumeRunBudget(db, options);
+    await expect(refusal).rejects.toBeInstanceOf(DemoRunLimitError);
+    await expect(refusal).rejects.toMatchObject({
+      scope: 'tenant',
+      reason: 'cap-reached',
+    });
     const row = (await db
       .prepare('SELECT run_count FROM demo_tenants WHERE tenant_id = ?')
       .bind(tenantId)
@@ -199,7 +203,7 @@ describe('consumeRunBudget (atomic caps)', () => {
         dailyRunCap: 100,
         now: () => T0 + 25 * HOUR,
       }),
-    ).rejects.toMatchObject({ scope: 'tenant' });
+    ).rejects.toMatchObject({ scope: 'tenant', reason: 'expired' });
   });
 
   it('refuses runs for an unknown tenant (a dm-prefixed forgery)', async () => {
@@ -214,7 +218,7 @@ describe('consumeRunBudget (atomic caps)', () => {
         dailyRunCap: 100,
         now: () => T0 + 1000,
       }),
-    ).rejects.toMatchObject({ scope: 'tenant' });
+    ).rejects.toMatchObject({ scope: 'tenant', reason: 'not-provisioned' });
   });
 
   it('the GLOBAL daily ceiling stops runs across tenants — the spend backstop', async () => {
@@ -241,7 +245,7 @@ describe('consumeRunBudget (atomic caps)', () => {
     // #then — the fourth refuses GLOBALLY, whoever asks
     await expect(
       consumeRunBudget(db, budget(b.tenant_id)),
-    ).rejects.toMatchObject({ scope: 'global' });
+    ).rejects.toMatchObject({ scope: 'global', reason: 'cap-reached' });
 
     // ...and the ceiling resets on the next UTC day (T0 is 12:00Z, so +13h
     // crosses midnight while the tenant is still live)
@@ -387,10 +391,116 @@ describe('mintDemoTokenSet', () => {
   });
 });
 
+describe('googleProvider', () => {
+  const OPTIONS = { clientId: 'client-1', clientSecret: 'secret-1' };
+  const REDIRECT_URI = 'https://demo.test/auth/google/callback';
+
+  function jsonResponse(payload: unknown, status = 200): Response {
+    return new Response(JSON.stringify(payload), { status });
+  }
+
+  it('builds a code-flow authorize URL with the minimal openid scope', () => {
+    // #given / #when
+    const url = new URL(
+      googleProvider(OPTIONS).authorizeUrl({
+        state: 'the-state',
+        redirectUri: REDIRECT_URI,
+      }),
+    );
+
+    // #then
+    expect(url.origin + url.pathname).toBe(
+      'https://accounts.google.com/o/oauth2/v2/auth',
+    );
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      client_id: 'client-1',
+      redirect_uri: REDIRECT_URI,
+      response_type: 'code',
+      scope: 'openid',
+      state: 'the-state',
+    });
+  });
+
+  it('exchanges the code FORM-ENCODED, reads the subject from userinfo, and scopes it google:', async () => {
+    // #given — Google's token endpoint rejects JSON bodies; pin the encoding
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const fetchFn = (async (input: unknown, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      if (String(input).includes('oauth2.googleapis.com/token')) {
+        return jsonResponse({ access_token: 'at-123' });
+      }
+      return jsonResponse({ sub: '1093874' });
+    }) as typeof fetch;
+
+    // #when
+    const identity = await googleProvider({
+      ...OPTIONS,
+      fetch: fetchFn,
+    }).exchange({ code: 'good-code', redirectUri: REDIRECT_URI });
+
+    // #then — provider-scoped stable subject
+    expect(identity).toEqual({ subject: 'google:1093874' });
+    const [token, userinfo] = calls;
+    expect(token?.url).toBe('https://oauth2.googleapis.com/token');
+    expect(new Headers(token?.init?.headers).get('content-type')).toBe(
+      'application/x-www-form-urlencoded',
+    );
+    expect(
+      Object.fromEntries(new URLSearchParams(String(token?.init?.body))),
+    ).toEqual({
+      grant_type: 'authorization_code',
+      code: 'good-code',
+      client_id: 'client-1',
+      client_secret: 'secret-1',
+      redirect_uri: REDIRECT_URI,
+    });
+    expect(userinfo?.url).toBe(
+      'https://openidconnect.googleapis.com/v1/userinfo',
+    );
+    expect(new Headers(userinfo?.init?.headers).get('authorization')).toBe(
+      'Bearer at-123',
+    );
+  });
+
+  it.each([
+    ['token endpoint error', [jsonResponse({}, 400)]],
+    ['missing access_token', [jsonResponse({})]],
+    [
+      'userinfo error',
+      [jsonResponse({ access_token: 'at' }), jsonResponse({}, 401)],
+    ],
+    [
+      'missing sub',
+      [jsonResponse({ access_token: 'at' }), jsonResponse({ name: 'x' })],
+    ],
+    [
+      'empty sub',
+      [jsonResponse({ access_token: 'at' }), jsonResponse({ sub: '' })],
+    ],
+  ])('fails closed (undefined identity) on %s', async (_name, responses) => {
+    // #given — each step that goes wrong must yield "sign-in failed", never
+    // a half-identity
+    const queue = [...responses];
+    const fetchFn = (async () => {
+      const next = queue.shift();
+      if (!next) throw new Error('unexpected extra fetch');
+      return next;
+    }) as unknown as typeof fetch;
+
+    // #when / #then
+    expect(
+      await googleProvider({ ...OPTIONS, fetch: fetchFn }).exchange({
+        code: 'good-code',
+        redirectUri: REDIRECT_URI,
+      }),
+    ).toBeUndefined();
+  });
+});
+
 describe('createDemoAuthRouter (fake provider round-trip)', () => {
-  function fakeProvider(subject = 'github:42'): OAuthProvider {
+  function fakeProvider(subject = 'github:42', name = 'github'): OAuthProvider {
     return {
-      name: 'github',
+      name,
       authorizeUrl: ({ state, redirectUri }) =>
         `https://fake.test/authorize?state=${encodeURIComponent(state)}&redirect_uri=${encodeURIComponent(redirectUri)}`,
       exchange: async ({ code }) =>
@@ -399,13 +509,17 @@ describe('createDemoAuthRouter (fake provider round-trip)', () => {
   }
 
   function makeRouter(
-    options: { disabled?: boolean; now?: () => number } = {},
+    options: {
+      disabled?: boolean;
+      now?: () => number;
+      providerName?: string;
+    } = {},
   ) {
     const db = demoDb(openSqlite());
     const purged: string[] = [];
     const router = createDemoAuthRouter({
       db,
-      provider: fakeProvider(),
+      provider: fakeProvider(undefined, options.providerName),
       secret: SECRET,
       jwtTtlSeconds: 3600,
       tenantTtlMs: 24 * HOUR,
@@ -576,6 +690,43 @@ describe('createDemoAuthRouter (fake provider round-trip)', () => {
       (await router(new Request('https://demo.test/auth/github')))?.status,
     ).toBe(503);
   });
+
+  it('echoes the mounted provider NAME on /auth/config — the SPA derives the sign-in button and href from it', async () => {
+    // #given — a live (not disabled) router over the fake 'github' provider
+    const { router } = makeRouter();
+
+    // #when
+    const response = await router(new Request('https://demo.test/auth/config'));
+
+    // #then — exact echo: dropping/renaming `provider` would silently break
+    // the deployed sign-in button while every other test stays green
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toEqual({
+      enabled: true,
+      provider: 'github',
+    });
+  });
+
+  it("routes derive from provider.name, empirically: a 'google'-named mount serves /auth/google and not /auth/github", async () => {
+    // #given — the same router machinery under the LAUNCH provider's name
+    const { router } = makeRouter({ providerName: 'google' });
+
+    // #when / #then — the config echo, the entry redirect (with its nonce
+    // cookie), and the sibling path all follow the mounted name
+    expect(
+      await (
+        await router(new Request('https://demo.test/auth/config'))
+      )?.json(),
+    ).toEqual({ enabled: true, provider: 'google' });
+    const redirect = await router(new Request('https://demo.test/auth/google'));
+    expect(redirect?.status).toBe(302);
+    expect(redirect?.headers.get('set-cookie')).toContain(STATE_COOKIE);
+
+    // #then — the OTHER provider's path is not mounted (404, not 302)
+    expect(
+      (await router(new Request('https://demo.test/auth/github')))?.status,
+    ).toBe(404);
+  });
 });
 
 describe('the kill switch in the AUTH middleware (worker.buildVerifier)', () => {
@@ -610,6 +761,45 @@ describe('the kill switch in the AUTH middleware (worker.buildVerifier)', () => 
     });
     expect(await killed.verify(demoJwt)).toBeUndefined();
     expect(await killed.verify('op-token')).toMatchObject({ id: 'op' });
+  });
+});
+
+describe('provider selection (worker.selectOAuthProvider)', () => {
+  it.each([
+    ['Google only', { GOOGLE_CLIENT_ID: 'g-id' }, 'google'],
+    ['GitHub only', { GITHUB_CLIENT_ID: 'h-id' }, 'github'],
+    [
+      'both configured — Google wins',
+      { GOOGLE_CLIENT_ID: 'g-id', GITHUB_CLIENT_ID: 'h-id' },
+      'google',
+    ],
+    ['neither — the demo stays unmounted', {}, undefined],
+  ])('%s', (_name, envPart, expected) => {
+    // #given / #when — the warn on both-set is asserted separately below
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const provider = selectOAuthProvider(envPart as never);
+
+    // #then
+    expect(provider?.name).toBe(expected);
+    warnSpy.mockRestore();
+  });
+
+  it('logs a config-warning when both provider ids are set (stale-credential tripwire)', async () => {
+    // #given
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    // #when
+    selectOAuthProvider({ GOOGLE_CLIENT_ID: 'g-id' } as never);
+    expect(warnSpy).not.toHaveBeenCalled();
+    selectOAuthProvider({
+      GOOGLE_CLIENT_ID: 'g-id',
+      GITHUB_CLIENT_ID: 'h-id',
+    } as never);
+
+    // #then
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0]?.[0])).toContain('config-warning');
+    warnSpy.mockRestore();
   });
 });
 

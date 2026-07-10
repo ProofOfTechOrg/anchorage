@@ -97,10 +97,15 @@ request body — a body can carry neither `connectors` (which *is* the grant) no
 
 ## The public demo (OAuth sandboxes)
 
-Set `DEMO_JWT_SECRET` (secret) plus `GITHUB_CLIENT_ID` (var) and
-`GITHUB_CLIENT_SECRET` (secret) and the showcase grows a public sign-in:
+Set `DEMO_JWT_SECRET` (secret) plus an OAuth client — `GOOGLE_CLIENT_ID` (var)
+and `GOOGLE_CLIENT_SECRET` (secret), or the GitHub pair — and the showcase
+grows a public sign-in. One provider mounts per deployment; when both are
+configured, **Google wins** (the launch provider). The SPA reads the provider
+name from `/auth/config`, so no client change is needed to switch. Subjects
+are provider-scoped (`google:<sub>` / `github:<id>`), so switching providers
+mints fresh sandboxes rather than colliding identities.
 
-`GET /auth/github` → OAuth → an **ephemeral tenant** provisioned through the
+`GET /auth/<provider>` → OAuth → an **ephemeral tenant** provisioned through the
 `tenants` registry, plus a set of short-TTL HS256 JWTs, one per demo role, all
 bound to that tenant and each carrying a distinct `actor.id` (a shared id would
 trip the self-approval check and no approval could ever complete). The token set
@@ -142,6 +147,12 @@ isolate and cannot be caught, so a slow sweep would starve the purge forever).
 ```bash
 pnpm --filter @proofoftech/flowsafe showcase:deploy   # builds, then wrangler deploy
 ```
+
+The deploy binds ONE public origin — `anchorage.proofoftech.org` (a Workers
+custom domain; the zone must live on the deploying Cloudflare account) with
+`workers_dev: false`, because the OAuth callback is registered for exactly
+that origin. The SPA ships a TEMPORARY `noindex` robots meta
+(`app/index.html`) until the demo is ready to be indexed.
 
 A fresh deploy **401s on every authenticated route until you set the auth
 secret** — no credentials are baked into `wrangler.jsonc`, so there is no state

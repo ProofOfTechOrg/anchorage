@@ -98,6 +98,19 @@ function isTransient(error: unknown): boolean {
   return !(error instanceof RunApiError) || error.status === 404;
 }
 
+/** Wordmark-correct display names; anything unlisted gets a plain capitalize. */
+const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
+  google: 'Google',
+  github: 'GitHub',
+};
+
+function providerDisplayName(provider: string): string {
+  return (
+    PROVIDER_DISPLAY_NAMES[provider] ??
+    provider.charAt(0).toUpperCase() + provider.slice(1)
+  );
+}
+
 /**
  * Production sign-in: paste the deployment's bearer token. The token is held in
  * memory only; identity and role come back from the server's catalog echo. In
@@ -107,16 +120,22 @@ export function TokenGate({
   signedIn,
   onSubmit,
   onSignOut,
-  demoSignInHref,
+  demoSignInProvider,
 }: {
   signedIn: boolean;
   onSubmit: (token: string) => void;
   onSignOut: () => void;
-  /** When the worker has the public demo configured: the OAuth entry point. */
-  demoSignInHref?: string;
+  /**
+   * When the worker has the public demo configured: the OAuth provider name
+   * from the server's /auth/config echo. Drives the entry href and label.
+   */
+  demoSignInProvider?: string;
 }): ReactElement {
   const C = useApprovalUIComponents();
   const [draft, setDraft] = useState('');
+  const demoSignInHref = demoSignInProvider
+    ? `/auth/${demoSignInProvider}`
+    : undefined;
 
   function submit(): void {
     const token = draft.trim();
@@ -140,14 +159,14 @@ export function TokenGate({
           </C.Stack>
         ) : (
           <C.Stack gap="sm">
-            {demoSignInHref ? (
+            {demoSignInHref && demoSignInProvider ? (
               <C.Stack gap="sm">
                 <C.Text>
                   Try the demo: sign in to get your own isolated sandbox — four
                   switchable roles, your data invisible to every other visitor.
                 </C.Text>
                 <C.Button
-                  label="Sign in with GitHub"
+                  label={`Sign in with ${providerDisplayName(demoSignInProvider)}`}
                   variant="primary"
                   onClick={() => {
                     window.location.href = demoSignInHref;

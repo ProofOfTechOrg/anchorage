@@ -45,6 +45,22 @@ pnpm --filter @proofoftech/flowsafe spike:verify
 This project follows industry-standard open-source conduct guidelines. Be
 respectful, constructive, and inclusive in all interactions.
 
+## Governance
+
+- Maintainer: [ProofOfTechOrg](https://github.com/ProofOfTechOrg) — final
+  review and merge authority.
+- Contributions flow through the standard GitHub PR process.
+- **Significant contributions** (new subsystems, connectors, or public API
+  surface) require a Contributor License Agreement, requested and approved by
+  the maintainer on the PR. Small fixes and docs changes need none.
+
 ## License
 
 Contributions will be licensed under Apache-2.0. See [`LICENSE`](LICENSE).
+Everything in this repository — including enterprise-oriented features such as
+SSO seams and audit export — is Apache-2.0; nothing is held back for a paid
+tier.
+
+Anchorage is an independent implementation built ON Mastra. Contributions must
+not fork or modify Mastra source code, wrap Mastra Enterprise features to
+bypass their licensing, or copy any third-party proprietary implementation.

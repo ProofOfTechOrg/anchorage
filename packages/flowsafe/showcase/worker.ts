@@ -39,7 +39,7 @@
 // All routes except /healthz and /auth/* require `Authorization: Bearer
 // <token>`. Two verifiers feed one seam: the APPROVAL_ACTOR_TOKENS static map
 // (local dev / operators) and, when DEMO_JWT_SECRET is set, the public demo's
-// OAuth-minted HS256 JWTs (see demo-auth.ts: GET /auth/github ->
+// OAuth-minted HS256 JWTs (see demo-auth.ts: GET /auth/<provider> ->
 // per-visitor ephemeral tenant + a four-role token set). Neither is baked in:
 // a deploy without secrets 401s everywhere (fail closed by construction).
 // DEMO_DISABLED=true is the kill switch — checked in the AUTH middleware, so
@@ -101,7 +101,9 @@ import {
   DEMO_JWT_KID,
   DemoRunLimitError,
   githubProvider,
+  googleProvider,
   isDemoTenant,
+  type OAuthProvider,
   purgeExpiredDemoTenants,
 } from './demo-auth.js';
 import {
@@ -134,11 +136,15 @@ interface Env {
   APPROVAL_SLA_SECONDS?: string;
   /**
    * Public-demo switches. DEMO_JWT_SECRET (secret) turns the OAuth demo on;
-   * GITHUB_CLIENT_ID (var) + GITHUB_CLIENT_SECRET (secret) name the OAuth
-   * app. DEMO_DISABLED=true is the kill switch (auth middleware + mint).
+   * the OAuth app is named by GOOGLE_CLIENT_ID (var) + GOOGLE_CLIENT_SECRET
+   * (secret), or GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET — when both are
+   * configured, Google wins (the launch provider; the router mounts ONE).
+   * DEMO_DISABLED=true is the kill switch (auth middleware + mint).
    * Caps are vars so ops can tune without a deploy.
    */
   DEMO_JWT_SECRET?: string;
+  GOOGLE_CLIENT_ID?: string;
+  GOOGLE_CLIENT_SECRET?: string;
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
   DEMO_DISABLED?: string;
@@ -261,6 +267,41 @@ export function buildVerifier(env: Env): TokenVerifier {
       );
     },
   };
+}
+
+/**
+ * One OAuth provider mounts per deployment: Google when configured (the
+ * launch provider), else GitHub, else none (the /auth/* routes stay
+ * unmounted). Identities are provider-scoped (`google:<sub>` vs
+ * `github:<id>`), so switching providers mints fresh sandboxes rather than
+ * colliding subjects. Both ids set is tolerated — Google wins — but logged
+ * per request (same tripwire convention as numberVar's config-error), so
+ * stale fallback credentials never linger silently.
+ */
+export function selectOAuthProvider(env: Env): OAuthProvider | undefined {
+  if (env.GOOGLE_CLIENT_ID) {
+    if (env.GITHUB_CLIENT_ID) {
+      console.warn(
+        JSON.stringify({
+          type: 'config-warning',
+          var: 'GITHUB_CLIENT_ID',
+          reason:
+            'GOOGLE_CLIENT_ID and GITHUB_CLIENT_ID are both set — Google mounts; remove the stale GitHub credentials',
+        }),
+      );
+    }
+    return googleProvider({
+      clientId: env.GOOGLE_CLIENT_ID,
+      clientSecret: env.GOOGLE_CLIENT_SECRET ?? '',
+    });
+  }
+  if (env.GITHUB_CLIENT_ID) {
+    return githubProvider({
+      clientId: env.GITHUB_CLIENT_ID,
+      clientSecret: env.GITHUB_CLIENT_SECRET ?? '',
+    });
+  }
+  return undefined;
 }
 
 // One factory per isolate, not per request: it owns the memoized schema-init
@@ -566,13 +607,11 @@ const handler: ExportedHandler<Env> = {
 
     // Public demo sign-in (no auth — it MINTS identity). Mounted only when
     // configured; the kill switch 503s it.
-    if (env.DEMO_JWT_SECRET && env.GITHUB_CLIENT_ID) {
+    const oauthProvider = selectOAuthProvider(env);
+    if (env.DEMO_JWT_SECRET && oauthProvider) {
       const authResponse = await createDemoAuthRouter({
         db: env.DB,
-        provider: githubProvider({
-          clientId: env.GITHUB_CLIENT_ID,
-          clientSecret: env.GITHUB_CLIENT_SECRET ?? '',
-        }),
+        provider: oauthProvider,
         secret: env.DEMO_JWT_SECRET,
         jwtTtlSeconds: numberVar(
           env.DEMO_JWT_TTL_SECONDS,

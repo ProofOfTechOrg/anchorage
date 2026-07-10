@@ -4,6 +4,14 @@
   "main": "./worker.ts",
   "compatibility_date": "2025-06-01",
   "compatibility_flags": ["nodejs_compat"],
+  // The ONLY public origin. The OAuth callback is registered for exactly this
+  // origin (the worker derives redirect_uri from url.origin), so a second
+  // reachable host would half-work: API yes, sign-in no. workers_dev off
+  // keeps the origin single — and the SPA carries a TEMPORARY noindex robots
+  // meta (app/index.html) until the demo should be indexable. Prerequisite:
+  // proofoftech.org must be a zone on this Cloudflare account.
+  "workers_dev": false,
+  "routes": [{ "pattern": "anchorage.proofoftech.org", "custom_domain": true }],
   // The worker emits structured JSON (audit + maintenance + connector previews)
   // to Workers Logs.
   "observability": { "enabled": true },
@@ -84,7 +92,14 @@
     "DEMO_DAILY_RUN_CAP": "500",
     "DEMO_TENANT_TTL_HOURS": "24",
     "DEMO_JWT_TTL_SECONDS": "3600"
-    // "GITHUB_CLIENT_ID": "<your OAuth app client id>",
+    // The launch OAuth provider is GOOGLE (worker.ts prefers it when both
+    // are configured; GitHub remains a config-only fallback). The Google
+    // OAuth client's authorized redirect URI must be EXACTLY
+    // https://anchorage.proofoftech.org/auth/google/callback, and its consent
+    // screen must be "In production" (Testing status only admits listed test
+    // users — no verification review needed for the bare `openid` scope).
+    // "GOOGLE_CLIENT_ID": "<your Google OAuth client id>",
+    // "GITHUB_CLIENT_ID": "<your GitHub OAuth app client id>",
     // "DEMO_DISABLED": "true",   // kill switch: 503s /auth/* AND stops
     //                            // verifying already-issued demo JWTs
     // "SIEM_ENDPOINT": "https://siem.example/services/collector"
@@ -98,6 +113,7 @@
   //     world-known, and one of them is `admin`.
   //   DEMO_JWT_SECRET — turns the public OAuth demo ON: signs the per-visitor
   //     HS256 token sets and the OAuth state. Generate long + random.
-  //   GITHUB_CLIENT_SECRET — pairs with the GITHUB_CLIENT_ID var.
+  //   GOOGLE_CLIENT_SECRET — pairs with the GOOGLE_CLIENT_ID var.
+  //   GITHUB_CLIENT_SECRET — pairs with the GITHUB_CLIENT_ID var (fallback).
   //   SIEM_AUTH_HEADER — sent as the `authorization` header on audit export.
 }
