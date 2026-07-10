@@ -57,9 +57,11 @@
   "devDependencies": {
     "@astryxdesign/cli": "0.1.3",
     "@astryxdesign/core": "0.1.3",
-    "@astryxdesign/theme-neutral": "0.1.3",
+    "@astryxdesign/theme-y2k": "0.1.3",
     "@biomejs/biome": "^1.9",
     "@cloudflare/workers-types": "^4.2025",
+    "@fontsource/jetbrains-mono": "5.2.8",
+    "@fontsource/poppins": "5.2.7",
     "@mastra/core": "^1.50.0",
     "@proofoftech/breakwater": "workspace:*",
     "@stylexjs/stylex": "0.18.3",

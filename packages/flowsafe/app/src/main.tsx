@@ -1,3 +1,6 @@
+import { ToastViewport } from '@astryxdesign/core/Toast';
+import { Theme } from '@astryxdesign/core/theme';
+import { y2kTheme } from '@astryxdesign/theme-y2k/built';
 import {
   lazy,
   type ReactElement,
@@ -120,8 +123,15 @@ function Root(): ReactElement {
   );
 }
 
+// <Theme> stamps data-astryx-theme="y2k" on <html> — the theme.css rules are
+// @scope'd to that attribute and are inert without it. y2kTheme embeds its
+// icon registry, so mounting the provider also registers the icon set.
 createRoot(container).render(
   <StrictMode>
-    <Root />
+    <Theme theme={y2kTheme}>
+      <ToastViewport position="bottomEnd" maxVisible={3}>
+        <Root />
+      </ToastViewport>
+    </Theme>
   </StrictMode>,
 );

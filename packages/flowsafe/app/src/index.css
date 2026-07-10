@@ -1,7 +1,18 @@
-/* Astryx styling, bundled by Vite (order matters: reset → base → theme). */
+/* Fonts first (all @imports must precede rules). y2k names Poppins/JetBrains
+   Mono but ships no @font-face — vendored via @fontsource, bundled by Vite
+   (single-origin, no CDN). Crimson Text deliberately not vendored (only
+   Blockquote/Citation use it; Georgia fallback). */
+@import "@fontsource/poppins/400.css";
+@import "@fontsource/poppins/500.css";
+@import "@fontsource/poppins/600.css";
+@import "@fontsource/poppins/700.css";
+@import "@fontsource/jetbrains-mono/400.css";
+/* Astryx styling (order matters: reset → base → theme). theme.css is @scope'd
+   to [data-astryx-theme="y2k"]; the root <Theme> in main.tsx sets that
+   attribute — without it these rules are inert. */
 @import "@astryxdesign/core/reset.css";
 @import "@astryxdesign/core/astryx.css";
-@import "@astryxdesign/theme-neutral/theme.css";
+@import "@astryxdesign/theme-y2k/theme.css";
 
 body {
   margin: 0;

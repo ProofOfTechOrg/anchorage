@@ -16,6 +16,9 @@ minimumReleaseAgeExclude:
   # fetching anything new.
   - "@cloudflare/*"
   - "workerd"
+  # Forced by wrangler → miniflare → sharp; already lockfile-pinned — the gate
+  # only re-fires because any lockfile update re-resolves the whole graph.
+  - "@emnapi/runtime"
   # Forced by @mastra/core's own pinned dep ranges (its tree ships in lockstep):
   - "chat"
   - "p-map"
