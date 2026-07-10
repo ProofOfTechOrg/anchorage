@@ -8,12 +8,12 @@ import { Collapsible } from '@astryxdesign/core/Collapsible';
 import { Dialog } from '@astryxdesign/core/Dialog';
 import { Grid } from '@astryxdesign/core/Grid';
 import { Heading } from '@astryxdesign/core/Heading';
-import { HStack } from '@astryxdesign/core/HStack';
 import { Text } from '@astryxdesign/core/Text';
 import { VStack } from '@astryxdesign/core/VStack';
 import type { ReactElement } from 'react';
 
 import { GLOSSARY, ZONES } from './glossary.js';
+import { MarkerRow } from './marker-row.js';
 import type { NarrationZone } from './narration.js';
 import { ZoneBadge } from './zone-badge.js';
 
@@ -76,14 +76,9 @@ function RealityRow({
   items: string;
 }): ReactElement {
   return (
-    <HStack gap={2} align="start">
-      <Text size="sm" weight="semibold">
-        {marker} {title}
-      </Text>
-      <Text size="sm" color="secondary">
-        {items}
-      </Text>
-    </HStack>
+    <MarkerRow marker={`${marker} ${title}`} color="secondary">
+      {items}
+    </MarkerRow>
   );
 }
 

@@ -8,9 +8,10 @@ import { Button } from '@astryxdesign/core/Button';
 import { Dialog } from '@astryxdesign/core/Dialog';
 import { Heading } from '@astryxdesign/core/Heading';
 import { HStack } from '@astryxdesign/core/HStack';
-import { Text } from '@astryxdesign/core/Text';
 import { VStack } from '@astryxdesign/core/VStack';
 import { type ReactElement, useCallback, useState } from 'react';
+
+import { MarkerRow } from './marker-row.js';
 
 const DISMISS_KEY = 'anchorage-tour-dismissed';
 
@@ -75,12 +76,9 @@ export function IntroTourDialog({
         <Heading level={2}>A 60-second tour</Heading>
         <VStack gap={2}>
           {TOUR_BULLETS.map((bullet, index) => (
-            <HStack key={bullet} gap={2} align="start">
-              <Text size="sm" weight="semibold">
-                {index + 1}.
-              </Text>
-              <Text size="sm">{bullet}</Text>
-            </HStack>
+            <MarkerRow key={bullet} marker={`${index + 1}.`}>
+              {bullet}
+            </MarkerRow>
           ))}
         </VStack>
         <HStack gap={2}>
