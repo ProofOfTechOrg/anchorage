@@ -53,7 +53,7 @@ pnpm --filter showcase dev:worker               # wrangler dev (:8787) — bundl
 ## Single deploy (SPA + API, one Worker)
 
 ```bash
-pnpm --filter showcase deploy                   # build (SPA + clean-bundle assert) + wrangler deploy
+pnpm showcase:deploy                            # build (SPA + clean-bundle assert) + wrangler deploy
 ```
 
 ## Verify

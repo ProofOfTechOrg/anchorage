@@ -63,7 +63,7 @@ is a pure client bundle served by the single-deploy Worker on the same origin.
 
 | File | What | When to read |
 | ---- | ---- | ------------ |
-| `package.json` | The package manifest: scripts (`predev` builds the two libraries — the dev plugin resolves them via dist; `dev`, `build`, `dev:worker`, `deploy`, `test`, `typecheck`, `lint`, `react-doctor`, `react-doctor:diff`), the `#worker/*` imports field (maps to `./worker/*.ts` — LITERAL substitution, so it resolves `.ts` files ONLY; a non-.ts asset under worker/ would need its own mapping), runtime deps (Astryx, react 19, workspace flowsafe + breakwater, @mastra/core, zod) and tooling devDeps (vite, vitest, wrangler, jsdom + testing-library) | Adding a dep or script, changing the `#worker` mapping |
+| `package.json` | The package manifest: scripts (`predev` builds the two libraries — the dev plugin resolves them via dist; `dev`, `build`, `dev:worker`, `deploy:cf` — NOT `deploy`, which pnpm's builtin of the same name shadows — `test`, `typecheck`, `lint`, `react-doctor`, `react-doctor:diff`), the `#worker/*` imports field (maps to `./worker/*.ts` — LITERAL substitution, so it resolves `.ts` files ONLY; a non-.ts asset under worker/ would need its own mapping), runtime deps (Astryx, react 19, workspace flowsafe + breakwater, @mastra/core, zod) and tooling devDeps (vite, vitest, wrangler, jsdom + testing-library) | Adding a dep or script, changing the `#worker` mapping |
 | `wrangler.jsonc` | Deploy config — custom domain `anchorage.proofoftech.org` + `workers_dev: false` (single public origin: the Google OAuth callback is registered for exactly that origin), `RUNNER` DO + `DB` D1, two crons, `main: worker/worker.ts`, `tsconfig: tsconfig.worker.json` (esbuild bundles flowsafe + breakwater from SOURCE — no dist build order for wrangler), the `assets` block (serves `./dist` at `/`, `run_worker_first` keeps the API on the same origin). Carries NO credentials: `APPROVAL_ACTOR_TOKENS` is a secret, so a deploy without it 401s everywhere | Changing bindings, the public origin, or the assets/single-deploy config |
 | `.dev.vars.example` | Local-dev secrets (`cp .dev.vars.example .dev.vars` — REQUIRED for `dev:worker`): the demo `APPROVAL_ACTOR_TOKENS` map, plus the optional SIEM header. Lives beside wrangler.jsonc, where wrangler reads it | Running `dev:worker`, or wiring real secrets |
 | `doctor.config.jsonc` | react-doctor config: scopes the scan to the React app (worker/ + node glue ignored — deslop can't resolve `#worker/*`), plus per-file rule ignores with the WHY inline (composition root, polling-architecture session module, dev-only switcher) | Changing what the react-doctor gate ignores |
@@ -118,7 +118,7 @@ is a pure client bundle served by the single-deploy Worker on the same origin.
 pnpm dev                             # root shortcut → vite dev server + in-process host (:4321)
 pnpm --filter showcase build         # production client bundle (dist/) + clean-bundle assert
 pnpm --filter showcase dev:worker    # wrangler dev (:8787) — real Worker + DO + D1; needs .dev.vars + a built dist/
-pnpm --filter showcase deploy        # build + wrangler deploy (anchorage.proofoftech.org)
+pnpm showcase:deploy                 # build + wrangler deploy (anchorage.proofoftech.org)
 pnpm --filter showcase test          # or root `pnpm test` for the whole workspace
 pnpm react-doctor                    # full 100/100 gate (also in CI); react-doctor:diff = changed files (pre-push)
 ```

@@ -153,7 +153,7 @@ and the purge never share an invocation (a CPU-limit termination kills the
 isolate and cannot be caught, so a slow sweep would starve the purge forever).
 
 ```bash
-pnpm --filter showcase deploy   # builds, then wrangler deploy
+pnpm showcase:deploy            # builds, then wrangler deploy
 ```
 
 The deploy binds ONE public origin — `anchorage.proofoftech.org` (a Workers

@@ -19,6 +19,7 @@
     "typecheck": "pnpm -r typecheck",
     "react-doctor": "pnpm --filter showcase react-doctor",
     "react-doctor:diff": "pnpm --filter showcase react-doctor:diff",
+    "showcase:deploy": "pnpm --filter showcase deploy:cf",
     "spike:verify": "pnpm --filter @proofoftech/flowsafe spike:verify",
     "prepare": "husky"
   },
