@@ -5,9 +5,8 @@
  * Not runnable as-is.
  */
 
-import { createWorkflow, createStep } from '@mastra/core/workflows';
+import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { z } from 'zod';
-import { RBACMiddleware } from '@proofoftech/breakwater/rbac';
 
 const sensitiveOperation = createStep({
   id: 'sensitiveOperation',

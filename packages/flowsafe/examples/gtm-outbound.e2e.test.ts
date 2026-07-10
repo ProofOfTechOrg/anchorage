@@ -22,11 +22,11 @@ import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 
 // Barrels (not deep paths): these map 1:1 to the published subpaths a real
-// consumer imports, and mirror demo/worker.ts's wiring.
+// consumer imports, and mirror spike/worker.ts's wiring.
 import {
   type ApprovalActor,
-  approvalGrantProvider,
   ApprovalService,
+  approvalGrantProvider,
   InMemoryApprovalStore,
   resumeViaRuntime,
 } from '../src/approval-api/index.js';

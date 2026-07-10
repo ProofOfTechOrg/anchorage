@@ -10,7 +10,7 @@
 // tenant-less.
 
 import type { ApprovalActor } from '../approval-api/index.js';
-import { toApprovalActor, type TokenVerifier } from './verifier.js';
+import { type TokenVerifier, toApprovalActor } from './verifier.js';
 
 /**
  * Parse the `APPROVAL_ACTOR_TOKENS` secret:

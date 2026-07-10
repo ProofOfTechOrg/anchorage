@@ -1,5 +1,10 @@
 {
-  "$schema": "https://biomejs.dev/schemas/1.9.4/schema.json",
+  "$schema": "https://biomejs.dev/schemas/2.5.2/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
   "formatter": {
     "indentStyle": "space",
     "indentWidth": 2
@@ -9,19 +14,93 @@
       "quoteStyle": "single"
     }
   },
-  "linter": {
-    "enabled": true
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
   },
-  "organizeImports": {
-    "enabled": false
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended",
+      "correctness": {
+        "useExhaustiveDependencies": "warn",
+        "noUnusedImports": "error",
+        "noUnusedVariables": "error"
+      },
+      "style": {
+        "noNonNullAssertion": "warn",
+        "useConst": "error"
+      },
+      "suspicious": {
+        "noExplicitAny": "warn"
+      }
+    }
   },
   "files": {
-    "ignore": ["dist", "node_modules", ".wrangler"]
+    "includes": ["**", "!**/node_modules", "!**/dist", "!**/.wrangler"]
   },
   "overrides": [
     {
-      "include": ["**/tsconfig*.json"],
+      "includes": ["**/tsconfig*.json"],
       "json": { "parser": { "allowComments": true } }
+    },
+    {
+      "includes": ["docs/examples/**"],
+      "linter": {
+        "rules": {
+          "correctness": {
+            "noUnusedFunctionParameters": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["packages/showcase/public/**"],
+      "linter": {
+        "rules": {
+          "a11y": {
+            "noSvgWithoutTitle": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["packages/showcase/src/**", "packages/showcase/worker/**"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "patterns": [
+                  {
+                    "group": ["./**", "../**"],
+                    "message": "Use an absolute import: @/* for src, #worker/* for worker modules, @flowsafe/* for deep flowsafe source, or the real package specifier."
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "packages/showcase/src/**/*.test.ts",
+        "packages/showcase/src/**/*.test.tsx",
+        "packages/showcase/worker/**/*.test.ts",
+        "packages/showcase/worker/**/*.test.tsx"
+      ],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": "off"
+          }
+        }
+      }
     }
   ]
 }

@@ -14,8 +14,8 @@ import { ACTOR_CONTEXT_KEY, type Actor } from '../rbac/index.js';
 import {
   APPROVED_CONNECTORS_CONTEXT_KEY,
   type AtomicIdempotencyStore,
-  connectorManifest,
   ConnectorPolicyError,
+  connectorManifest,
   createConnector,
   DRY_RUN_CONTEXT_KEY,
   IDEMPOTENCY_KEY_CONTEXT_KEY,
@@ -1539,18 +1539,23 @@ describe('rate limit', () => {
     ).toThrow(TypeError);
   });
 
-  it.each(['nope', '0/min', '2/mins', '2 / min', '2/minutes', '/min', '2/'])(
-    "rejects malformed rate limit '%s' at definition time",
-    (rateLimit) => {
-      // #when / #then
-      expect(() =>
-        makeConnector({
-          permissions: { sideEffect: 'write', rateLimit },
-          policies: { rateLimitStore: new InMemoryRateLimitStore() },
-        }),
-      ).toThrow(TypeError);
-    },
-  );
+  it.each([
+    'nope',
+    '0/min',
+    '2/mins',
+    '2 / min',
+    '2/minutes',
+    '/min',
+    '2/',
+  ])("rejects malformed rate limit '%s' at definition time", (rateLimit) => {
+    // #when / #then
+    expect(() =>
+      makeConnector({
+        permissions: { sideEffect: 'write', rateLimit },
+        policies: { rateLimitStore: new InMemoryRateLimitStore() },
+      }),
+    ).toThrow(TypeError);
+  });
 
   it('allows the budget then denies the call over it', async () => {
     // #given

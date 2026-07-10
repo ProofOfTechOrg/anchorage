@@ -47,9 +47,9 @@ import {
   resumeViaRuntime,
 } from './grants.js';
 import { createApprovalRouter } from './router.js';
-import { createTenantResolver } from './tenant-context.js';
 import { ApprovalService } from './service.js';
 import { InMemoryApprovalStore } from './store.js';
+import { createTenantResolver } from './tenant-context.js';
 
 const OPERATOR: ApprovalActor = {
   id: 'opal',

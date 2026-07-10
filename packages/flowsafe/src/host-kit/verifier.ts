@@ -188,7 +188,7 @@ export function hmacVerifier(options: HmacVerifierOptions): TokenVerifier {
       ];
 
       const header = base64UrlDecodeJson(headerPart) as JwtHeader | undefined;
-      if (!header || header.alg !== 'HS256') return undefined;
+      if (header?.alg !== 'HS256') return undefined;
 
       let secret: string | undefined;
       if (typeof header.kid === 'string') {

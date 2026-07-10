@@ -1,0 +1,28 @@
+{
+  // Browser app pass: DOM lib + JSX + Vite client types. tsc only type-checks
+  // (Vite bundles). The Node-side vite.config.ts + run-api-dev-plugin.ts are
+  // type-checked by tsconfig.node.json; the worker by tsconfig.worker.json.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["vite/client"],
+    "noEmit": true,
+    // tsc enforces rootDir even under noEmit; widen it to the repo root so the
+    // flowsafe source reached via @flowsafe/* is admitted into this program.
+    "rootDir": "../..",
+    // Worker modules resolve via the package.json "imports" field (#worker/*)
+    // — platform-native, so tsc, Vite, vitest, wrangler's esbuild, and Node
+    // all resolve it with no per-tool alias. Only the dependency-free worker
+    // modules (demo-actors) may be imported from the SPA — anything
+    // workers-typed would collide with the DOM lib.
+    "paths": {
+      "@/*": ["./src/*"],
+      // Deep DOM-free flowsafe source imports (approval-api/types, individual
+      // approval-ui modules). Deliberately NOT the package barrels: the
+      // approval-api barrel pulls workers-typed stores into this DOM program.
+      "@flowsafe/*": ["../flowsafe/src/*"]
+    }
+  },
+  "include": ["src"]
+}

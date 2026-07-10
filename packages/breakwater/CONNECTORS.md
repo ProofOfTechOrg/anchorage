@@ -123,7 +123,7 @@ connector through the wrapper):
    their own module directory with an `index.ts`, tests, and a `CLAUDE.md`
    file table (match `src/agent-cli/`).
 2. Run the full gate locally:
-   `pnpm -r lint && pnpm -r typecheck && pnpm -r test && pnpm -r build`.
+   `pnpm lint && pnpm typecheck && pnpm test && pnpm build`.
 3. Open a PR describing the vendor surface, the chosen `sideEffect`
    classification (and why), and the egress list. The review focuses on
    manifest honesty first, code second.

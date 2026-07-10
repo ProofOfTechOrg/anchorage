@@ -49,7 +49,8 @@ import {
   openSqlite,
   type SqliteDatabase,
 } from '../test-support/sqlite.js';
-import handler, { FlowsafeRunner, PURGE_CRON, SWEEP_CRON } from './worker.js';
+import { PURGE_CRON, SWEEP_CRON } from './crons.js';
+import handler, { FlowsafeRunner } from './worker.js';
 
 type Env = Parameters<NonNullable<typeof handler.fetch>>[1];
 

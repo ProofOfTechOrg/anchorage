@@ -1,5 +1,5 @@
-import { MessageList } from '@mastra/core/agent/message-list';
 import type { MastraDBMessage } from '@mastra/core/agent/message-list';
+import { MessageList } from '@mastra/core/agent/message-list';
 import {
   type OutputResult,
   type ProcessInputArgs,

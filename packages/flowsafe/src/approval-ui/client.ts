@@ -57,7 +57,7 @@ export class ApprovalApiClient {
       options.fetch ??
       ((globalThis as { fetch?: unknown }).fetch as FetchLike | undefined);
     if (!fetchFn) {
-      throw new Error('ApprovalApiClient: no fetch available — pass one');
+      throw new Error('ApprovalApiClient: no fetch available; pass one');
     }
     // Global fetch must be invoked without a bound `this` complaint.
     this.#fetch = (url, init) => fetchFn(url, init);

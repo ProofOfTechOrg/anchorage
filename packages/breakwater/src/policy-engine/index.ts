@@ -29,7 +29,7 @@ import type { RequestContext } from '@mastra/core/request-context';
 import type { ChunkType } from '@mastra/core/stream';
 
 import type { AuditLogger } from '../audit/index.js';
-import { actorFromRequestContext, type Actor } from '../rbac/index.js';
+import { type Actor, actorFromRequestContext } from '../rbac/index.js';
 import type { PolicyDecision } from './tool-policy.js';
 
 export type PolicyPhase = 'input' | 'output';
@@ -709,6 +709,15 @@ export function maxTextLength(
   };
 }
 
+export type {
+  CrossWorkflowIsolationOptions,
+  NetworkEgressOptions,
+  PolicyDecision,
+  SideEffect,
+  ToolCallContext,
+  ToolPolicyEvaluator,
+  WritePermissionsPolicy,
+} from './tool-policy.js';
 // Tool-boundary policies — evaluated by the connector SDK's execute
 // wrapper, not this processor. See tool-policy.ts. PolicyDecision lives
 // there (the leaf module) and is shared by both seams.
@@ -719,13 +728,4 @@ export {
   networkEgress,
   tenantIsolation,
   WORKFLOW_SCOPE_CONTEXT_KEY,
-} from './tool-policy.js';
-export type {
-  CrossWorkflowIsolationOptions,
-  NetworkEgressOptions,
-  PolicyDecision,
-  SideEffect,
-  ToolCallContext,
-  ToolPolicyEvaluator,
-  WritePermissionsPolicy,
 } from './tool-policy.js';

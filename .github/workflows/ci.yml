@@ -26,16 +26,24 @@ jobs:
 
       # The repo's verification gate, in order.
       - name: Lint
-        run: pnpm -r lint
+        run: pnpm lint
 
       - name: Typecheck
-        run: pnpm -r typecheck
+        run: pnpm typecheck
 
+      # Root vitest workspace: every package's suite in one process.
       - name: Test
-        run: pnpm -r test
+        run: pnpm test
 
       - name: Build
-        run: pnpm -r build
+        run: pnpm build
+
+      # React quality gate: the FULL react-doctor scan over the showcase app
+      # (pre-push runs the fast changed-files subset; this is the
+      # authoritative pass, incl. dead-code rules that only run at full scope).
+      - name: React Doctor (full gate)
+        timeout-minutes: 10
+        run: pnpm --filter showcase run react-doctor
 
       # End-to-end durability proof on real workerd (local mode, no
       # Cloudflare credentials): suspend -> process kill -> restart on

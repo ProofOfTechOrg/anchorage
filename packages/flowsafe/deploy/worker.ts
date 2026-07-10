@@ -44,17 +44,15 @@
 // Deploy checklist: README.md next to this file.
 
 import type {
+  Request as CfRequest,
   D1Database,
   DurableObjectNamespace,
   ExecutionContext,
   ExportedHandler,
   MessageBatch,
   Queue,
-  Request as CfRequest,
   ScheduledController,
 } from '@cloudflare/workers-types';
-import { z } from 'zod';
-
 import {
   approvalGrantProvider,
   BREAKWATER_APPROVED_CONNECTORS_KEY,
@@ -83,9 +81,12 @@ import {
   runSlaSweepMaintenance,
   staticTokenVerifier,
   type TokenVerifier,
-  withSubdomainCrossCheck,
   type WorkflowMeta,
+  withSubdomainCrossCheck,
 } from '@proofoftech/flowsafe/host-kit';
+import { z } from 'zod';
+
+import { PURGE_CRON, SWEEP_CRON } from './crons.js';
 
 interface Env {
   DB: D1Database;
@@ -308,15 +309,8 @@ function runRouterFor(resolve: TenantResolver, topology: DoRunTopology) {
   });
 }
 
-/**
- * Maintenance runs on TWO cron expressions, dispatched on controller.cron so
- * the SLA sweep and the retention purge NEVER share an invocation — a
- * CPU-limit kill is uncatchable, so sharing one would let a slow sweep
- * permanently starve the purge. Keep these literals equal to wrangler.jsonc's
- * `triggers.crons`.
- */
-export const SWEEP_CRON = '*/15 * * * *';
-export const PURGE_CRON = '7 * * * *';
+// The two-cron dispatch rationale and the wrangler.jsonc byte-equality
+// contract live with the constants in crons.ts.
 
 async function runPurgeMaintenance(env: Env, cron: string): Promise<void> {
   let purged: number | undefined;

@@ -21,10 +21,7 @@
     "src",
     "examples",
     "deploy/worker.ts",
-    "deploy/worker.e2e.test.ts",
-    "showcase/**/*.test.ts",
-    "showcase/runtime.ts",
-    "showcase/workflows/**/*.ts"
+    "deploy/worker.e2e.test.ts"
   ],
   "exclude": [
     "src/approval-ui/**/*.tsx",

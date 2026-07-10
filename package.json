@@ -11,10 +11,23 @@
   "bugs": "https://github.com/ProofOfTechOrg/anchorage/issues",
   "scripts": {
     "build": "pnpm -r build",
-    "dev": "pnpm -r dev",
-    "test": "pnpm -r test",
-    "lint": "pnpm -r lint",
-    "typecheck": "pnpm -r typecheck"
+    "dev": "pnpm --filter showcase dev",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "typecheck": "pnpm -r typecheck",
+    "react-doctor": "pnpm --filter showcase react-doctor",
+    "react-doctor:diff": "pnpm --filter showcase react-doctor:diff",
+    "showcase:deploy": "pnpm --filter showcase deploy:cf",
+    "spike:verify": "pnpm --filter @proofoftech/flowsafe spike:verify",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.11",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.4.0",
+    "vitest": "^4.1.8"
   },
   "engines": {
     "node": ">=22.22.0",

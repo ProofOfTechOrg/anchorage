@@ -1,6 +1,6 @@
 import { RequestContext } from '@mastra/core/request-context';
 import type { ToolExecutionContext } from '@mastra/core/tools';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, type Mock, vi } from 'vitest';
 
 import {
   APPROVED_CONNECTORS_CONTEXT_KEY,
@@ -49,8 +49,10 @@ async function run(
 
 function mockExec(
   result: Partial<Awaited<ReturnType<AgentCliExec>>> = {},
-): ReturnType<typeof vi.fn> {
-  return vi.fn().mockResolvedValue({
+  // vitest 4 types a bare vi.fn() as Mock<Procedure | Constructable>, which no
+  // longer structurally satisfies AgentCliExec — type the mock at creation.
+): Mock<AgentCliExec> {
+  return vi.fn<AgentCliExec>().mockResolvedValue({
     stdout: '',
     stderr: '',
     exitCode: 0,

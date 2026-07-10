@@ -33,7 +33,7 @@ cross-file contract and the rules that are not enforced by the compiler.
 - `grants.ts`: the seam between the queue and the runner. Plugs into the
   DO runner's `requestContextForRun`; on every start/resume it derives the
   breakwater grant key from APPROVED records.
-- The create "bridge" is deployment glue (see `demo/worker.ts`): whatever
+- The create "bridge" is deployment glue (see `spike/worker.ts`): whatever
   observes a suspension creates the queue record, carrying the suspended
   step's path and the connectors that approval should unlock.
 

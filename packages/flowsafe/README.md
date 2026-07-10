@@ -94,8 +94,8 @@ export class MyRunner extends DurableObjectRunner<Env> {
 The DO exposes `POST /runs`, `GET /runs/:workflowId/:runId`, and
 `POST /runs/:workflowId/:runId/resume`; route one DO instance per run
 (`idFromName(workflowId + ':' + runId)`) from your Worker. See
-`demo/worker.ts` for a complete Worker, and run the end-to-end spike with
-`pnpm spike` (wrangler dev on `demo/wrangler.jsonc`).
+`spike/worker.ts` for a complete Worker, and run the end-to-end spike with
+`pnpm spike` (wrangler dev on `spike/wrangler.jsonc`).
 
 ### Approval queue (`@proofoftech/flowsafe/approval-api`)
 
@@ -185,8 +185,9 @@ const dashboard = createApprovalDashboard(document.getElementById('root')!, { cl
 ```
 
 For a headless integration, drive `useApprovalDashboard(client)` yourself and
-render any UI you like. A ready-to-run reference app lives in `app/` (`pnpm
---filter @proofoftech/flowsafe app:dev`): a full Vite build that injects an
+render any UI you like. A ready-to-run reference app lives in the repo's
+`showcase` package (`packages/showcase/` — `pnpm --filter showcase dev`, or
+`pnpm dev` at the root): a full Vite build that injects an
 [Astryx](https://astryx.atmeta.com) adapter, bundles that library's CSS, and —
 in dev — mounts a live seeded approval-api at `/api/approvals` so
 claim/decide/delegate drive real state.

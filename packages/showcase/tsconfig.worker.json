@@ -1,0 +1,17 @@
+{
+  // Worker pass: the Cloudflare host (worker/, incl. its tests). Also the
+  // tsconfig wrangler's esbuild uses to bundle the worker (wrangler.jsonc
+  // "tsconfig"), so the shared paths (tsconfig.paths.json) make deploy/dev
+  // bundle flowsafe and breakwater from SOURCE — no dist build order for
+  // wrangler. Worker-internal imports use the package.json "imports" field
+  // (#worker/*), resolved natively by tsc and wrangler's esbuild.
+  "extends": ["../../tsconfig.base.json", "./tsconfig.paths.json"],
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["@cloudflare/workers-types"],
+    // tsc enforces rootDir even under noEmit; widen it to the repo root so the
+    // flowsafe/breakwater source resolved via the shared paths is admitted.
+    "rootDir": "../.."
+  },
+  "include": ["worker/**/*.ts"]
+}

@@ -20,7 +20,7 @@ import {
   type CreateResult,
   stepKeyOf,
 } from './store.js';
-import { TENANT_BOUND, type SystemApprovalStore } from './tenant-brand.js';
+import { type SystemApprovalStore, TENANT_BOUND } from './tenant-brand.js';
 import {
   type ApprovalListFilter,
   type ApprovalRecord,

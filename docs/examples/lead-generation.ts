@@ -5,7 +5,7 @@
  * approval gates. Not runnable as-is.
  */
 
-import { createWorkflow, createStep } from '@mastra/core/workflows';
+import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { z } from 'zod';
 
 const scoredOutput = z.object({

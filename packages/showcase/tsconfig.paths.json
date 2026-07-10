@@ -1,0 +1,28 @@
+{
+  // The ONE home for the cross-package source mappings shared by
+  // tsconfig.worker.json and tsconfig.node.json (extends-array member).
+  // vitest.config.ts mirrors these programmatically; adding a flowsafe
+  // subpath export means updating THIS file + the vitest subpath array.
+  // Package-specifier imports resolve to source here; published consumers
+  // resolve the same specifiers to dist via the exports map. approval-ui is
+  // deliberately absent — its JSX barrel must never enter a workers-typed
+  // program (the SPA reaches it via @flowsafe/* instead).
+  "compilerOptions": {
+    "paths": {
+      "@proofoftech/breakwater": ["../breakwater/src/index.ts"],
+      "@proofoftech/flowsafe/approval-api": [
+        "../flowsafe/src/approval-api/index.ts"
+      ],
+      "@proofoftech/flowsafe/artifacts": ["../flowsafe/src/artifacts/index.ts"],
+      "@proofoftech/flowsafe/audit-export": [
+        "../flowsafe/src/audit-export/index.ts"
+      ],
+      "@proofoftech/flowsafe/do-runner": ["../flowsafe/src/do-runner/index.ts"],
+      "@proofoftech/flowsafe/host-kit": ["../flowsafe/src/host-kit/index.ts"],
+      "@proofoftech/flowsafe/host-kit/module": [
+        "../flowsafe/src/host-kit/module.ts"
+      ],
+      "@flowsafe-test/*": ["../flowsafe/test-support/*"]
+    }
+  }
+}
