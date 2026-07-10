@@ -114,7 +114,7 @@ no Cloudflare account needed).
 ## What the cron does
 
 `triggers.crons` declares TWO expressions, and `scheduled()` dispatches on
-`controller.cron` (`SWEEP_CRON` vs `PURGE_CRON` in worker.ts) so the two
+`controller.cron` (`SWEEP_CRON` vs `PURGE_CRON` in crons.ts) so the two
 enforcement surfaces never share an invocation — a Workers CPU-limit
 termination kills the isolate and is **not** a catchable JS error, so a slow
 sweep sharing an invocation would permanently starve the purge no matter how
@@ -141,7 +141,7 @@ config-error: availability of both duties beats purity on a misconfig.)
 
 Keep the sweep interval at or below your SLA granularity; the default
 `*/15 * * * *` gives 4-hour SLAs minute-scale slack. Keep the wrangler
-expressions byte-equal to worker.ts's `SWEEP_CRON`/`PURGE_CRON` constants.
+expressions byte-equal to crons.ts's `SWEEP_CRON`/`PURGE_CRON` constants.
 
 ## Configuration
 

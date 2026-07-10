@@ -64,7 +64,9 @@ function Root(): ReactElement {
     readDemoTokensFromHash,
   );
   const [runs, setRuns] = useState<readonly RunEntry[]>([]);
-  const demoSignInProvider = useDemoSignIn();
+  const demoSignIn = useDemoSignIn();
+  const demoSignInProvider =
+    demoSignIn.status === 'oauth' ? demoSignIn.provider : undefined;
   const feed = useActivityFeed();
   const narrate = feed.record;
 
@@ -152,10 +154,7 @@ function Root(): ReactElement {
               even before sign-in; the token gate covers the rest. */}
           {identityControls}
           {!DevActorSwitcher && !demoSession ? (
-            <TokenGate
-              onSubmit={setActorToken}
-              demoSignInProvider={demoSignInProvider}
-            />
+            <TokenGate onSubmit={setActorToken} demoSignIn={demoSignIn} />
           ) : null}
         </>
       ) : (

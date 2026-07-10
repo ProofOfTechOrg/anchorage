@@ -87,6 +87,8 @@ import {
   type WorkflowMeta,
 } from '@proofoftech/flowsafe/host-kit';
 
+import { PURGE_CRON, SWEEP_CRON } from './crons.js';
+
 interface Env {
   DB: D1Database;
   RUNNER: DurableObjectNamespace;
@@ -308,15 +310,8 @@ function runRouterFor(resolve: TenantResolver, topology: DoRunTopology) {
   });
 }
 
-/**
- * Maintenance runs on TWO cron expressions, dispatched on controller.cron so
- * the SLA sweep and the retention purge NEVER share an invocation — a
- * CPU-limit kill is uncatchable, so sharing one would let a slow sweep
- * permanently starve the purge. Keep these literals equal to wrangler.jsonc's
- * `triggers.crons`.
- */
-export const SWEEP_CRON = '*/15 * * * *';
-export const PURGE_CRON = '7 * * * *';
+// The two-cron dispatch rationale and the wrangler.jsonc byte-equality
+// contract live with the constants in crons.ts.
 
 async function runPurgeMaintenance(env: Env, cron: string): Promise<void> {
   let purged: number | undefined;

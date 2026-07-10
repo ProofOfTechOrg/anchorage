@@ -257,7 +257,10 @@ let verifierMemo: { key: string; verifier: TokenVerifier } | undefined;
 
 export function buildVerifier(env: Env): TokenVerifier {
   const disabled = demoDisabledOf(env);
-  const memoKey = `${env.APPROVAL_ACTOR_TOKENS ?? ''} ${env.DEMO_JWT_SECRET ?? ''} ${disabled}`;
+  // NUL-separated so the concatenation cannot collide (env values never
+  // contain NUL). Kept as \u0000 ESCAPES: raw NUL bytes turn this file
+  // binary for grep/diff tooling.
+  const memoKey = `${env.APPROVAL_ACTOR_TOKENS ?? ''}\u0000${env.DEMO_JWT_SECRET ?? ''}\u0000${disabled}`;
   if (verifierMemo?.key === memoKey) return verifierMemo.verifier;
   const staticVerifier = staticTokenVerifier(
     parseActorTokens(env.APPROVAL_ACTOR_TOKENS),
@@ -441,10 +444,12 @@ function runRouterFor(
  * termination kills the isolate and is NOT a catchable JS error, so a slow
  * sweep sharing an invocation would permanently starve the purge (and vice
  * versa) no matter how many try/catches wrap them. Keep these literals equal
- * to wrangler.jsonc's `triggers.crons`.
+ * to wrangler.jsonc's `triggers.crons`. NOT exported: workerd rejects any
+ * entry-module export that is not a handler/class/function, so a bare const
+ * here fails the whole Worker at startup.
  */
-export const SWEEP_CRON = '*/15 * * * *';
-export const PURGE_CRON = '7 * * * *';
+const SWEEP_CRON = '*/15 * * * *';
+const PURGE_CRON = '7 * * * *';
 
 async function runPurgeMaintenance(env: Env, cron: string): Promise<void> {
   let purged: number | undefined;

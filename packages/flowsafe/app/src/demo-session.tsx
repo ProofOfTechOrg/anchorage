@@ -65,13 +65,20 @@ export function readDemoTokensFromHash(): DemoTokenSet | null {
 }
 
 /**
- * The configured public-demo OAuth provider name ('google', 'github', …), or
- * undefined when the worker has no demo configured. The server's /auth/config
- * echo is the single source — the SPA never hardcodes a provider, so swapping
- * the worker's provider needs no client change.
+ * The public-demo OAuth entry, resolved from the server's /auth/config echo —
+ * the single source; the SPA never hardcodes a provider, so swapping the
+ * worker's provider needs no client change. Deliberately TRI-state: a plain
+ * `string | undefined` conflated "probe in flight" with "no demo configured",
+ * forcing the signed-out landing to paint the token-paste layout first and
+ * then replace it once the echo landed on every OAuth deployment.
  */
-export function useDemoSignIn(): string | undefined {
-  const [provider, setProvider] = useState<string | undefined>(undefined);
+export type DemoSignIn =
+  | { status: 'loading' }
+  | { status: 'oauth'; provider: string }
+  | { status: 'none' };
+
+export function useDemoSignIn(): DemoSignIn {
+  const [signIn, setSignIn] = useState<DemoSignIn>({ status: 'loading' });
   useEffect(() => {
     let alive = true;
     fetch('/auth/config')
@@ -86,14 +93,19 @@ export function useDemoSignIn(): string | undefined {
           : undefined;
       })
       .catch(() => undefined)
-      .then((value) => {
-        if (alive) setProvider(value);
+      .then((provider) => {
+        if (!alive) return;
+        setSignIn(
+          provider === undefined
+            ? { status: 'none' }
+            : { status: 'oauth', provider },
+        );
       });
     return () => {
       alive = false;
     };
   }, []);
-  return provider;
+  return signIn;
 }
 
 /** Warn this long before the sandbox tenant expires. */
