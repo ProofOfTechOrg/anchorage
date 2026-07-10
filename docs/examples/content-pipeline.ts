@@ -5,18 +5,24 @@
  * Not runnable as-is.
  */
 
-import { createWorkflow, createStep } from '@mastra/core/workflows';
+import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { z } from 'zod';
 
 const researchTopic = createStep({
   id: 'researchTopic',
   inputSchema: z.object({ topic: z.string() }),
-  outputSchema: z.object({ outline: z.array(z.string()), sources: z.array(z.string()) }),
+  outputSchema: z.object({
+    outline: z.array(z.string()),
+    sources: z.array(z.string()),
+  }),
   execute: async ({ inputData }) => ({ outline: [], sources: [] }),
 });
 
 // Parallel section writers -- each receives researchTopic's output.
-const sectionInput = z.object({ outline: z.array(z.string()), sources: z.array(z.string()) });
+const sectionInput = z.object({
+  outline: z.array(z.string()),
+  sources: z.array(z.string()),
+});
 const sectionOutput = z.object({ content: z.string() });
 
 const writeIntro = createStep({

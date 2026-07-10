@@ -1,0 +1,57 @@
+{
+  "$schema": "https://raw.githubusercontent.com/gcharang/react-doctor/4ad50e2e8c37104c98223e6e2ab1f8bea6bd27de/packages/website/public/schema/config.json",
+  "ignore": {
+    "files": [
+      // react-doctor audits the React app. The Cloudflare worker + node-side
+      // glue are covered by tsc/vitest/biome, and deslop cannot resolve the
+      // #worker/* package-imports, so scanning them only produces noise.
+      "worker/**",
+      "run-api-dev-plugin.ts",
+      "vite.config.ts",
+      "vitest.config.ts",
+      "scripts/**"
+    ],
+    "overrides": [
+      {
+        // The composition root — it IS the page. Splitting it or folding its
+        // page-level state into a reducer is a rewrite of working, tested
+        // wiring, not a cleanup. The flagged effect is the documented
+        // external-data catalog sync whose setStates React batches into one
+        // render.
+        "files": ["src/showcase-app.tsx"],
+        "rules": [
+          "react-doctor/no-giant-component",
+          "react-doctor/prefer-useReducer",
+          "react-doctor/no-cascading-set-state"
+        ]
+      },
+      {
+        // The public-demo session module: polling/bootstrap effects are the
+        // architecture (there is no event API — the narration honesty
+        // contract derives everything from polled snapshots), and the
+        // session→parent token handoff is the deliberate OAuth-callback
+        // wiring. It also exports the useDemoSignIn hook beside its
+        // components by design.
+        "files": ["src/demo-session.tsx"],
+        "rules": [
+          "react-doctor/no-fetch-in-effect",
+          "react-doctor/no-event-handler",
+          "react-doctor/no-pass-data-to-parent",
+          "react-doctor/no-prop-callback-in-effect",
+          "react-doctor/only-export-components"
+        ]
+      },
+      {
+        // DEV-only identity bootstrap: hands the initial dev token to the
+        // parent once on mount. The extra render is confined to `pnpm dev`;
+        // the module never ships (assert-clean-app-bundle pins that).
+        "files": ["src/dev-actor-switcher.tsx"],
+        "rules": [
+          "react-doctor/no-event-handler",
+          "react-doctor/no-pass-data-to-parent",
+          "react-doctor/no-prop-callback-in-effect"
+        ]
+      }
+    ]
+  }
+}

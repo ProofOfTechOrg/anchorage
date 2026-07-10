@@ -8,10 +8,8 @@ export default defineConfig({
       // breakwater dist. tsconfig.test.json mirrors this with `paths`.
       {
         find: /^@proofoftech\/breakwater$/,
-        replacement: new URL(
-          '../breakwater/src/index.ts',
-          import.meta.url,
-        ).pathname,
+        replacement: new URL('../breakwater/src/index.ts', import.meta.url)
+          .pathname,
       },
       // deploy/worker.e2e.test.ts imports the copy-ready template, whose
       // package-specifier imports must resolve to THIS package's source (the

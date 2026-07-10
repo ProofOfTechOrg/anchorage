@@ -91,12 +91,9 @@ describe('tenantOfRunId — the ONE INV-1 decode', () => {
     ['uppercase tenant', 'ACME_uuid'],
     ['hyphenated tenant', 'ac-me_uuid'],
     ['empty', ''],
-  ])(
-    'returns undefined for %s (callers fail closed on their own terms)',
-    (_label, runId) => {
-      expect(tenantOfRunId(runId)).toBeUndefined();
-    },
-  );
+  ])('returns undefined for %s (callers fail closed on their own terms)', (_label, runId) => {
+    expect(tenantOfRunId(runId)).toBeUndefined();
+  });
 
   it('rejects a non-INV-3 prefix that a bare indexOf would have accepted — the drift this centralization closes', () => {
     // A hand-rolled `runId.slice(0, indexOf('_'))` returns 'AB' here; the

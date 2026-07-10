@@ -1,10 +1,9 @@
 import { type JSX, useState } from 'react';
-
-import { OPEN_STATUSES } from '../approval-api/types.js';
 import type {
   ApprovalDecision,
   ApprovalRecord,
 } from '../approval-api/types.js';
+import { OPEN_STATUSES } from '../approval-api/types.js';
 import { useApprovalUIComponents } from './components.js';
 import { APPROVAL_TIPS } from './tips.js';
 import { formatSlaCountdown } from './view-model.js';

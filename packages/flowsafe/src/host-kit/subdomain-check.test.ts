@@ -4,19 +4,18 @@
 // through carve-outs (apex, reserved infra subs, hosts outside the apex).
 
 import { describe, expect, it } from 'vitest';
-
 import {
   type ApprovalService,
   createTenantResolver,
   InMemoryApprovalStoreFactory,
+  ApprovalService as Service,
   TenantResolutionError,
 } from '../approval-api/index.js';
-import { ApprovalService as Service } from '../approval-api/index.js';
-import { provisionTenant } from './tenant-registry.js';
 import {
   subdomainTenantOf,
   withSubdomainCrossCheck,
 } from './subdomain-check.js';
+import { provisionTenant } from './tenant-registry.js';
 
 const APEX = { apexDomain: 'example.com' };
 

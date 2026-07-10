@@ -5,10 +5,10 @@ import {
   approvalRequired,
   crossWorkflowIsolation,
   ISOLATION_SCOPE_CONTEXT_KEY,
-  tenantIsolation,
   networkEgress,
   type SideEffect,
   type ToolCallContext,
+  tenantIsolation,
   WORKFLOW_SCOPE_CONTEXT_KEY,
 } from './index.js';
 
@@ -335,18 +335,15 @@ describe('tenantIsolation', () => {
     ['absent scope', undefined],
     ['empty scope', ''],
     ['non-string scope', 42],
-  ])(
-    'denies on %s — a scoped deployment must never run scope-less',
-    async (_label, scope) => {
-      // #when / #then — the evaluator runs in the PRE-EXECUTE gates loop, so
-      // this denial binds dry-run requests too (the dry-run branch returns
-      // before the idempotency/rate-limit machinery, where a key-side check
-      // could never reach it)
-      expect(await policy.evaluate(scopedCall(scope))).toMatchObject({
-        allowed: false,
-      });
-    },
-  );
+  ])('denies on %s — a scoped deployment must never run scope-less', async (_label, scope) => {
+    // #when / #then — the evaluator runs in the PRE-EXECUTE gates loop, so
+    // this denial binds dry-run requests too (the dry-run branch returns
+    // before the idempotency/rate-limit machinery, where a key-side check
+    // could never reach it)
+    expect(await policy.evaluate(scopedCall(scope))).toMatchObject({
+      allowed: false,
+    });
+  });
 
   it('never parses the scope — any non-empty string is opaque and valid', async () => {
     // #when / #then — breakwater stays tenant-agnostic; the host owns the format

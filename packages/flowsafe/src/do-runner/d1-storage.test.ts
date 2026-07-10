@@ -642,19 +642,22 @@ describe('purgeTenant (complete offboarding)', () => {
     });
   });
 
-  it.each(['Abc', 'a_b', 'ab', "abc'; DROP TABLE x; --", ''])(
-    "rejects the non-INV-3 tenantId '%s' BEFORE any interpolation (range-exactness, not injection)",
-    async (tenantId) => {
-      // #given
-      const sqlite = openSqlite();
-      createSnapshotTable(sqlite);
+  it.each([
+    'Abc',
+    'a_b',
+    'ab',
+    "abc'; DROP TABLE x; --",
+    '',
+  ])("rejects the non-INV-3 tenantId '%s' BEFORE any interpolation (range-exactness, not injection)", async (tenantId) => {
+    // #given
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
 
-      // #when / #then
-      await expect(purgeTenant(d1Like(sqlite), { tenantId })).rejects.toThrow(
-        /INV-3/,
-      );
-    },
-  );
+    // #when / #then
+    await expect(purgeTenant(d1Like(sqlite), { tenantId })).rejects.toThrow(
+      /INV-3/,
+    );
+  });
 
   it('respects the table prefix', async () => {
     // #given

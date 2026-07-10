@@ -1,5 +1,5 @@
-import { MessageList } from '@mastra/core/agent/message-list';
 import type { MastraDBMessage } from '@mastra/core/agent/message-list';
+import { MessageList } from '@mastra/core/agent/message-list';
 import type { ProcessInputArgs } from '@mastra/core/processors';
 import { RequestContext } from '@mastra/core/request-context';
 import { describe, expect, it } from 'vitest';

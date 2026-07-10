@@ -1,0 +1,16 @@
+#!/usr/bin/env sh
+# Fast pre-push pre-check: react-doctor on this branch's CHANGED files only
+# (`--scope changed --base <ref>`, ref = this branch's PR base via `gh`,
+# preferring `origin/<base>`, else react-doctor's `parent` fork-point
+# heuristic — resolved by packages/showcase/scripts/
+# resolve-react-doctor-diff-base.sh). The authoritative FULL scan runs in CI
+# (.github/workflows/ci.yml). `--scope changed` keeps this quick +
+# non-interactive; `--blocking warning` aborts on any score-affecting finding
+# in the changed files. (Dead-code rules like unused-file/unused-export run
+# only in the CI full scan, not here.) Bypass with `git push --no-verify`.
+echo "[husky/pre-push] react-doctor (changed files) — fast pre-check; CI runs the full gate…"
+if ! pnpm --filter showcase run react-doctor:diff; then
+	printf '\033[1;31m[husky/pre-push] react-doctor found issues in changed files — push aborted. Re-run: pnpm react-doctor:diff (or pnpm react-doctor for a full scan). Bypass: git push --no-verify\033[0m\n' >&2
+	exit 1
+fi
+echo "[husky/pre-push] react-doctor (changed files) clean"

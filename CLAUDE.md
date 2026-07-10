@@ -28,7 +28,7 @@ verification gate + `spike:verify` on push/PR to `main`. Phases 1-3:
   `pnpm --filter @proofoftech/flowsafe spike:verify` (scoped kill protocol,
   restart persistence, fail-closed forged-resume probe, self-decision-denial
   probe; exits 0/1); `spike` stays the interactive server (demo in
-  `packages/flowsafe/demo/`).
+  `packages/flowsafe/spike/`).
 - flowsafe approval queue (Phase 3): `approval-api` — CAS-guarded store
   (D1 + in-memory), `ApprovalService` (role-checked claim/decide/delegate,
   SLA sweep → escalation, audit sink), fetch router for the REST surface,
@@ -49,12 +49,12 @@ verification gate + `spike:verify` on push/PR to `main`. Phases 1-3:
   `useApprovalDashboard` hook holds the logic. The library has no Astryx/CSS
   dependency and runs on React 18+. `status()` widened
   (result/error/suspendPayload/timestamps).
-- flowsafe app (`packages/flowsafe/app/`): full Vite React app that consumes the
-  library and injects an **Astryx adapter** (`app/src/astryx-components.tsx`) —
-  the only place Astryx (Meta's design system) is used; it's a `devDependency`,
-  so published consumers pull zero Astryx. `vite build` bundles the theme CSS,
-  and `app:dev` mounts a live seeded approval-api in the dev server (real
-  claim/decide/delegate). Run: `pnpm --filter @proofoftech/flowsafe app:dev`.
+- showcase app (`packages/showcase/`, its own workspace package since
+  2026-07-10): full Vite React app that consumes the library and injects an
+  **Astryx adapter** (`src/astryx-components.tsx`) — the only place Astryx
+  (Meta's design system) is used, so published consumers pull zero Astryx.
+  `vite build` bundles the theme CSS, and the dev server mounts a live
+  approval-api in-process (real claim/decide/delegate). Run: `pnpm dev`.
 - Deferred backlog closed (2026-07-07, all 8 items): the policy engine gates
   output per channel — `answer`/`reasoning`/`object` (`OutputChannel`;
   policies declare `channels`, default answer-only; `denyPatterns` defaults
@@ -116,25 +116,29 @@ Phase 4 (Ecosystem, 2026-07-07):
   trigger (isolated failures), bearer-token auth seam, start+resume approval
   bridges (multi-gate), optional Queues audit export. `deploy:cf`/`deploy:dev`.
 
-Verification gate: `pnpm -r lint && pnpm -r typecheck && pnpm -r test && pnpm -r build` (698 tests).
+Verification gate: `pnpm lint && pnpm typecheck && pnpm test && pnpm build`
+(837 tests; lint is ONE root Biome 2 pass, test is ONE root vitest run over
+every package via `test.projects`). CI adds the full react-doctor gate
+(100/100 over `packages/showcase`, `--blocking warning`) and `spike:verify`.
 
-Showcase (2026-07-09): all five `docs/examples/*` workflows made runnable behind
+Showcase (2026-07-09; extracted to its own `showcase` workspace package
+2026-07-10): all five `docs/examples/*` workflows made runnable behind
 one React frontend and shipped as a single Cloudflare deploy —
-`packages/flowsafe/showcase/` (`buildShowcaseRuntime` registers all 5 on one
+`packages/showcase/worker/` (`buildShowcaseRuntime` registers all 5 on one
 Worker + DO + D1; `GET /workflows` + per-workflow `allowedRoles`; `assets` block
-serves `app/dist` at `/` with the API on the same origin) + host-agnostic glue in
+serves the package's `dist/` at `/` with the API on the same origin) + host-agnostic glue in
 `src/host-kit/` (subpath export `./host-kit`): `WorkflowModule`/`WorkflowMeta`,
 the approval bridge, the bearer auth seam (`parseActorTokens`,
 `bearerActorAuthenticator`), and `createRunRouter({ resolve })` — the
 `/workflows` + `/runs` surface with its 401 → INV-3 → coarse `RUN_START_ROLES`
 → per-workflow `allowedRoles` gate order; `resolve: TenantResolver`
 (authenticate → validate → bind) replaces the bare `authenticate`, and
-status/resume answer 404 for another tenant's run — no existence oracle. All four hosts (showcase, deploy template, `app:dev` plugin, demo
-spike) consume it; each injects only its resume topology (DO stub vs in-process).
-The `app/` frontend gains a launcher + run-status panel + actor switcher;
-`run-api-dev-plugin.ts` runs the showcase host in-process for `app:dev`. The demo
-bearer identities live once in `showcase/demo-actors.ts` (drift-tested against
-`.dev.vars.example`); `showcase/wrangler.jsonc` bakes in NO credentials, so a
+status/resume answer 404 for another tenant's run — no existence oracle. All four hosts (showcase worker, deploy template, dev
+plugin, spike) consume it; each injects only its resume topology (DO stub vs in-process).
+The SPA (`packages/showcase/src/`) has a launcher + run-status panel + actor switcher;
+`run-api-dev-plugin.ts` runs the showcase host in-process for `pnpm dev`. The demo
+bearer identities live once in `worker/demo-actors.ts` (drift-tested against
+`.dev.vars.example`); `packages/showcase/wrangler.jsonc` bakes in NO credentials, so a
 deploy 401s until `wrangler secret put APPROVAL_ACTOR_TOKENS`. Connectors stay
 binding-gated (simulate offline; grant gate always exercised).
 
@@ -168,7 +172,7 @@ required; the `tenants` registry is the allocation authority — `RESERVED_FOR_A
 denied at provisioning (infra slugs + `system` + `default`), `RESERVED_TENANT_IDS`
 (`system`) denied at token verification AND re-refused by `createTenantResolver`
 before any store binds — custom verifiers bypass `toApprovalActor`);
-the public demo (`showcase/demo-auth.ts`: OAuth → ephemeral `dm*` tenant + four-role
+the public demo (`packages/showcase/worker/demo-auth.ts`: OAuth → ephemeral `dm*` tenant + four-role
 JWT set, atomic per-tenant + global-daily run caps, kill switch in the AUTH middleware, two
 cron expressions so sweep/purge never share an invocation; providers behind the `OAuthProvider`
 seam — `googleProvider` is the LAUNCH provider, `githubProvider` the env-selected fallback;
@@ -184,10 +188,13 @@ The showcase deploys to **`anchorage.proofoftech.org`** — a Workers custom
 domain on the proofoftech.org zone, with `workers_dev: false` so it is the
 ONLY public origin (the Google OAuth callback is registered for exactly
 `https://anchorage.proofoftech.org/auth/google/callback`; a second origin
-would break sign-in and undermine noindex). **TEMPORARY: `app/index.html`
-carries a `<meta name="robots" content="noindex" />` so the live demo stays
-out of search indexes pre-announce — REMOVE that meta (and this reminder)
-when the demo should be indexable.** Google OAuth is the launch provider
+would break sign-in and undermine noindex). **TEMPORARY:
+`packages/showcase/index.html` carries a `<meta name="robots"
+content="noindex" />` so the live demo stays out of search indexes
+pre-announce — REMOVE that meta (and this reminder) when the demo should be
+indexable.** Cloudflare Workers Builds deploys it (root dir
+`/packages/showcase`, build `pnpm -r build`; main branch → `wrangler deploy`,
+other branches → `wrangler versions upload`). Google OAuth is the launch provider
 (`GOOGLE_CLIENT_ID` var + `GOOGLE_CLIENT_SECRET` secret; the Google consent
 screen must be "In production" — Testing status only admits listed test
 users); GitHub stays a config-only fallback.
@@ -200,12 +207,15 @@ users); GitHub stays a config-only fallback.
 | `CONTRIBUTING.md` | Setup, workflow, and PR guidelines | Preparing a PR, first-time setup |
 | `LICENSE` | Apache-2.0 license text | Licensing questions |
 | `SECURITY.md` | Vulnerability reporting (GitHub private advisories) + scope | Reporting or triaging a security issue |
-| `.github/workflows/ci.yml` | CI — verification gate + `spike:verify` on push/PR to `main` | Changing CI, debugging a failed check |
-| `package.json` | Root workspace manifest and `-r` scripts (build/dev/test/lint/typecheck) | Adding dependencies, modifying workspace scripts |
-| `pnpm-workspace.yaml` | pnpm workspace package globs | Adding or removing workspace packages |
+| `.github/workflows/ci.yml` | CI — verification gate + react-doctor full gate + `spike:verify` on push/PR to `main` | Changing CI, debugging a failed check |
+| `package.json` | Root workspace manifest and scripts: `build`/`typecheck` fan out with `-r`; `lint`/`lint:fix` run ONE root Biome pass; `test`/`test:watch` run ONE root vitest; `dev` = showcase dev server; `react-doctor`/`react-doctor:diff` mirrors; `prepare` installs husky | Adding dependencies, modifying workspace scripts |
+| `pnpm-workspace.yaml` | pnpm workspace package globs + supply-chain `minimumReleaseAge` (7-day buffer; exclusions documented inline, incl. `deslop-js` for react-doctor's dlx install) | Adding or removing workspace packages, dependency-age failures |
 | `pnpm-lock.yaml` | Resolved dependency lockfile (generated) | Never edit by hand — regenerated by `pnpm install` |
 | `tsconfig.base.json` | Shared TypeScript compiler config | Modifying compiler options across all packages |
-| `biome.json` | Biome lint/format configuration | Changing lint or format rules |
+| `biome.json` | Biome 2 lint/format config (plain JSON — comments break config loading and silently revert Biome to defaults; use `biome.jsonc` if comments are ever needed). Holds the showcase absolute-import ban (`noRestrictedImports` on `./**`+`../**`, tests exempt) | Changing lint or format rules |
+| `vitest.config.ts` | Root vitest workspace (`test.projects` over `packages/*/vitest.config.ts`) — `pnpm test` runs every suite in one process | Changing which packages the root test run covers |
+| `.lintstagedrc.cjs` | Staged-files Biome autofix for the pre-commit hook (deliberately NOT repo-wide — parallel sessions share this worktree) | Changing pre-commit behavior |
+| `.husky/` | Git hooks: `pre-commit` = lint-staged; `pre-push` = react-doctor on changed files (`--scope changed --blocking warning`; bypass `git push --no-verify`) | Changing hook behavior |
 | `.gitignore` | Ignored paths (build output, `.wrangler/`, `.codebase-memory/`, DB/log files) | Adding generated artifacts that must not be committed |
 
 ## Subdirectories
@@ -214,7 +224,7 @@ Each subdirectory has its own `CLAUDE.md` with a file-level index.
 
 | Directory | What | When to read |
 | --------- | ---- | ------------ |
-| `packages/` | The two implementation packages — `breakwater` (safety middleware) and `flowsafe` (approval UX + DO runner) | Implementing or modifying any shipped code |
+| `packages/` | The three workspace packages — `breakwater` (safety middleware), `flowsafe` (approval UX + DO runner), and `showcase` (the demo product: SPA + Cloudflare host) | Implementing or modifying any shipped code |
 | `docs/` | Architecture, design, security, and operations docs, plus illustrative TS workflow examples | Understanding design rationale, the threat model, or the connector/policy interfaces |
 
 ## Architecture
@@ -229,6 +239,27 @@ runtime — Mastra provides workflows, agents, memory, RAG, and observability.
 |---------|---------|-------------------|
 | **breakwater** | Safety middleware | Plugs into Mastra as processors (`@mastra/core/processors`) + wrappers |
 | **flowsafe** | Approval UX + durable execution | Plugs into Mastra suspend/resume events; wraps workflows for DO |
+| **showcase** | The demo product (private, never published): Vite SPA + Cloudflare host running all five example workflows | Consumes both libraries; deploys to anchorage.proofoftech.org |
+
+### DX conventions (2026-07-10)
+
+- **Absolute imports are mandatory in `packages/showcase/src` + `worker`**
+  (Biome-enforced, tests exempt): `@/*` → src (vite/tsc alias), `#worker/*` →
+  worker (package.json `imports` field — platform-native so Node, esbuild,
+  Vite, vitest, and tsc all resolve it), `@flowsafe/*` → deep DOM-free
+  flowsafe source, real `@proofoftech/*` specifiers for everything else.
+  Library packages keep relative imports — tsc does not rewrite `paths` in
+  emitted dist.
+- **Git hooks (husky)**: pre-commit = Biome autofix on staged files only;
+  pre-push = react-doctor over the branch's changed files. Typecheck/tests/
+  full doctor scan are CI's job — the local loop stays fast.
+- **react-doctor** runs via `pnpm dlx github:gcharang/react-doctor#<pinned
+  sha>` (never a dependency); config + per-file ignores with reasons live in
+  `packages/showcase/doctor.config.jsonc`. CI holds the full scan at 100/100
+  with `--blocking warning`.
+- **One-process quality tools**: `pnpm lint` = one Biome pass for the repo;
+  `pnpm test` = one vitest run over every package (root `vitest.config.ts`
+  `test.projects`).
 
 ## Key Design Decisions
 
@@ -315,9 +346,13 @@ runtime — Mastra provides workflows, agents, memory, RAG, and observability.
 
 ## When Making Changes
 
-- Any new code goes under `packages/breakwater/` or `packages/flowsafe/`
+- Library code goes under `packages/breakwater/` or `packages/flowsafe/`;
+  demo-app code (SPA or its worker) goes under `packages/showcase/`
 - breakwater code must work as Mastra middleware (no custom runtime)
 - flowsafe code must target Cloudflare Workers/DO for the DO runner
+- showcase `src/`+`worker/` code uses absolute imports only (see DX
+  conventions); the react-doctor CI gate must stay at 100/100 — fix findings
+  or add a REASONED ignore in `doctor.config.jsonc`, never blanket-disable
 - **INV-1** — runIds are server-minted `${tenantId}_${uuid}`.
   `RunnerRuntime.start` *requires* `options.runId`; never re-add the
   `?? crypto.randomUUID()` fallback. `createRunRouter` 400s a client-supplied

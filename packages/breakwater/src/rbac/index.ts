@@ -30,13 +30,13 @@ export interface Actor {
   role: Role;
 }
 
-// Audit moved to its own module; keep the historical rbac export surface.
-export { AuditLogger } from '../audit/index.js';
 export type {
   AuditEvent,
   AuditLoggerOptions,
   AuditSink,
 } from '../audit/index.js';
+// Audit moved to its own module; keep the historical rbac export surface.
+export { AuditLogger } from '../audit/index.js';
 
 /** requestContext key the default actor lookup reads. */
 export const ACTOR_CONTEXT_KEY = 'breakwater.actor';

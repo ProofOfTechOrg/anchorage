@@ -55,17 +55,21 @@ describe('provisionTenant', () => {
     ).rejects.toBeInstanceOf(TenantCollisionError);
   });
 
-  it.each(['Acme', 'a_b', 'ab', 'a'.repeat(33), 'a-b', ''])(
-    "rejects the non-INV-3 tenantId '%s' before touching the table",
-    async (tenantId) => {
-      // #when / #then — a tenant that cannot be range-purged or
-      // prefix-matched must never exist
-      await expect(
-        provisionTenant(d1Like(openSqlite()), {
-          tenantId,
-          kind: 'commercial',
-        }),
-      ).rejects.toThrow(/INV-3/);
-    },
-  );
+  it.each([
+    'Acme',
+    'a_b',
+    'ab',
+    'a'.repeat(33),
+    'a-b',
+    '',
+  ])("rejects the non-INV-3 tenantId '%s' before touching the table", async (tenantId) => {
+    // #when / #then — a tenant that cannot be range-purged or
+    // prefix-matched must never exist
+    await expect(
+      provisionTenant(d1Like(openSqlite()), {
+        tenantId,
+        kind: 'commercial',
+      }),
+    ).rejects.toThrow(/INV-3/);
+  });
 });

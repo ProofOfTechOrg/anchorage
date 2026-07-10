@@ -26,15 +26,9 @@
 
 import type { RequestContext } from '@mastra/core/request-context';
 import type { PublicSchema } from '@mastra/core/schema';
-import { createTool } from '@mastra/core/tools';
 import type { Tool, ToolExecutionContext } from '@mastra/core/tools';
-
-import {
-  approvalRequired,
-  EGRESS_HOSTNAME_PATTERN,
-  ISOLATION_SCOPE_CONTEXT_KEY,
-  networkEgress,
-} from '../policy-engine/tool-policy.js';
+import { createTool } from '@mastra/core/tools';
+import type { AuditLogger } from '../audit/index.js';
 import type {
   NetworkEgressOptions,
   PolicyDecision,
@@ -43,7 +37,12 @@ import type {
   ToolPolicyEvaluator,
   WritePermissionsPolicy,
 } from '../policy-engine/tool-policy.js';
-import type { AuditLogger } from '../audit/index.js';
+import {
+  approvalRequired,
+  EGRESS_HOSTNAME_PATTERN,
+  ISOLATION_SCOPE_CONTEXT_KEY,
+  networkEgress,
+} from '../policy-engine/tool-policy.js';
 import { actorFromRequestContext } from '../rbac/index.js';
 
 /** Permission manifest — what the connector declares about itself. */
@@ -912,17 +911,17 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   return tool;
 }
 
-// Durable D1-backed stores (kept in their own modules; only type imports
-// flow back into this one, so there is no runtime cycle).
-export { D1IdempotencyStore } from './d1-idempotency-store.js';
 export type {
   D1IdempotencyStoreOptions,
   IdempotencyDatabase,
   IdempotencyStatement,
 } from './d1-idempotency-store.js';
-export { D1RateLimitStore } from './d1-rate-limit-store.js';
+// Durable D1-backed stores (kept in their own modules; only type imports
+// flow back into this one, so there is no runtime cycle).
+export { D1IdempotencyStore } from './d1-idempotency-store.js';
 export type {
   D1RateLimitStoreOptions,
   RateLimitDatabase,
   RateLimitStatement,
 } from './d1-rate-limit-store.js';
+export { D1RateLimitStore } from './d1-rate-limit-store.js';

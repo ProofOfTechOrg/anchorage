@@ -12,6 +12,7 @@ import {
   D1ApprovalStore,
   d1SystemApprovalStore,
 } from './d1-store.js';
+import type { ApprovalPatch } from './store.js';
 import { byQueueOrder, InMemoryApprovalStore, matchesFilter } from './store.js';
 import type {
   SystemApprovalStore,
@@ -22,7 +23,6 @@ import type {
   ApprovalRecord,
   ApprovalStatus,
 } from './types.js';
-import type { ApprovalPatch } from './store.js';
 
 export interface ApprovalStoreFactory {
   /** Bind a store to one tenant. Throws unless tenantId satisfies INV-3. */

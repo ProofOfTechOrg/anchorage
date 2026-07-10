@@ -123,29 +123,28 @@ describe('createApprovalRouter', () => {
     expect(response?.status).toBe(404);
   });
 
-  it.each(TCB_ONLY_CREATE_FIELDS)(
-    '400s when the body supplies %s',
-    async (field) => {
-      // #given — every one of these selects capability or attribution:
-      // `connectors` IS the minted grant, `requestedBy` is what the
-      // separation-of-duties check compares, and stepPath + the binding pair
-      // choose which leg a grant mints on
-      const { handle } = makeHandler({ allowCreate: true });
+  it.each(
+    TCB_ONLY_CREATE_FIELDS,
+  )('400s when the body supplies %s', async (field) => {
+    // #given — every one of these selects capability or attribution:
+    // `connectors` IS the minted grant, `requestedBy` is what the
+    // separation-of-duties check compares, and stepPath + the binding pair
+    // choose which leg a grant mints on
+    const { handle } = makeHandler({ allowCreate: true });
 
-      // #when
-      const response = await handle(
-        req('/api/approvals', {
-          body: { ...CREATE_BODY, [field]: 'anything' },
-        }),
-      );
+    // #when
+    const response = await handle(
+      req('/api/approvals', {
+        body: { ...CREATE_BODY, [field]: 'anything' },
+      }),
+    );
 
-      // #then
-      expect(response?.status).toBe(400);
-      expect(await response?.json()).toMatchObject({
-        error: `${field} may not be set over HTTP`,
-      });
-    },
-  );
+    // #then
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toMatchObject({
+      error: `${field} may not be set over HTTP`,
+    });
+  });
 
   it('classifies every CreateApprovalInput field exactly once — new fields cannot slip past the allowlist', () => {
     // #given — the type-level pin: an unclassified field makes `true` not

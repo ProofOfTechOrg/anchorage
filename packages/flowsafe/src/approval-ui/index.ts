@@ -9,22 +9,17 @@
 // the UI tsc pass (jsx + DOM lib); client.ts and view-model.ts are DOM-free and
 // typecheck in the main pass too, where their tests run.
 
-export { App } from './App.js';
 export type { ApprovalDashboardProps } from './App.js';
-export {
-  ApprovalApiClient,
-  ApprovalApiError,
-} from './client.js';
+export { App } from './App.js';
 export type {
   ApprovalApiClientOptions,
   FetchLike,
   ResponseLike,
 } from './client.js';
 export {
-  ApprovalUIProvider,
-  htmlComponents,
-  useApprovalUIComponents,
-} from './components.js';
+  ApprovalApiClient,
+  ApprovalApiError,
+} from './client.js';
 export type {
   ApprovalColumn,
   ApprovalUIComponents,
@@ -49,21 +44,27 @@ export type {
   TextProps,
   Tone,
 } from './components.js';
-export { DetailView } from './DetailView.js';
+export {
+  ApprovalUIProvider,
+  htmlComponents,
+  useApprovalUIComponents,
+} from './components.js';
 export type { DetailViewProps } from './DetailView.js';
-export { MetricsView } from './MetricsView.js';
+export { DetailView } from './DetailView.js';
 export type { MetricsViewProps } from './MetricsView.js';
-export { createApprovalDashboard } from './mount.js';
+export { MetricsView } from './MetricsView.js';
 export type { CreateApprovalDashboardOptions } from './mount.js';
-export { QueueView } from './QueueView.js';
+export { createApprovalDashboard } from './mount.js';
 export type { QueueViewProps } from './QueueView.js';
-export { APPROVAL_TIPS } from './tips.js';
+export { QueueView } from './QueueView.js';
 export type { MetricLabel } from './tips.js';
-export { useApprovalDashboard } from './use-approval-dashboard.js';
+export { APPROVAL_TIPS } from './tips.js';
 export type {
   ApprovalDashboardState,
   UseApprovalDashboardOptions,
 } from './use-approval-dashboard.js';
+export { useApprovalDashboard } from './use-approval-dashboard.js';
+export type { SlaState } from './view-model.js';
 export {
   DEFAULT_SLA_WARNING_MS,
   formatDuration,
@@ -73,4 +74,3 @@ export {
   slaStateOf,
   sortQueue,
 } from './view-model.js';
-export type { SlaState } from './view-model.js';

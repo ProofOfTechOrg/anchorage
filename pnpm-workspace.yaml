@@ -23,3 +23,16 @@ minimumReleaseAgeExclude:
   - "chat"
   - "p-map"
   - "picomatch"
+  # react-doctor (run via `pnpm dlx github:gcharang/react-doctor#<sha>`, never a
+  # dependency) depends on deslop-js with a floating range; every fresh
+  # deslop-js publish would otherwise trip the 7-day buffer inside the dlx
+  # install and fail the react-doctor gate.
+  # RUNBOOK — this is a CLASS, deslop-js was just the first instance: the age
+  # gate applies to a dlx target's transitive registry deps too, picking the
+  # newest version ≥7 days old and failing ONLY when a range's entire recent
+  # history is younger than the buffer. react-doctor has ~18 other floating
+  # deps (@sentry/node, oxc-parser, jiti, ...); if the doctor gate ever fails
+  # on one of them, the fix is one line — add that package name here. They are
+  # deliberately NOT pre-excluded: excludes are global, and would weaken the
+  # buffer for the whole workspace.
+  - "deslop-js"

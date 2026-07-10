@@ -1,7 +1,11 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "noEmit": true
+    "noEmit": true,
+    // Tests run under Node via vitest; vitest 4 no longer leaks timer globals
+    // through its own types, so the test program needs Node's. The build
+    // tsconfig deliberately stays types-free — the library is runtime-agnostic.
+    "types": ["node"]
   },
   "include": ["src"],
   "exclude": []

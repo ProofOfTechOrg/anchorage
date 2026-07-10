@@ -67,20 +67,21 @@ describe('toApprovalActor', () => {
     expect(toApprovalActor(candidate)).toBeUndefined();
   });
 
-  it.each(['docs', 'api', 'default'])(
-    "accepts tenantId '%s' — allocation/routing reservations never bite at authentication",
-    (tenantId) => {
-      // #given a single-tenant host named after an allocation-reserved slug
-      // (no subdomains, so the routing collision cannot occur)
-      // #when / #then — only RESERVED_TENANT_IDS ('system') 401s at the
-      // token layer; re-conflating the two lists would 401 this host
-      expect(toApprovalActor({ id: 'a', role: 'admin', tenantId })).toEqual({
-        id: 'a',
-        role: 'admin',
-        tenantId,
-      });
-    },
-  );
+  it.each([
+    'docs',
+    'api',
+    'default',
+  ])("accepts tenantId '%s' — allocation/routing reservations never bite at authentication", (tenantId) => {
+    // #given a single-tenant host named after an allocation-reserved slug
+    // (no subdomains, so the routing collision cannot occur)
+    // #when / #then — only RESERVED_TENANT_IDS ('system') 401s at the
+    // token layer; re-conflating the two lists would 401 this host
+    expect(toApprovalActor({ id: 'a', role: 'admin', tenantId })).toEqual({
+      id: 'a',
+      role: 'admin',
+      tenantId,
+    });
+  });
 });
 
 describe('parseActorTokens (tenant required)', () => {

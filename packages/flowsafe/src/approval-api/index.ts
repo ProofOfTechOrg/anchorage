@@ -6,18 +6,18 @@
 // requestContextForRun + resumeViaRuntime; persistence is D1 (or the
 // in-memory store for tests/dev).
 
+export type {
+  ApprovalActor,
+  ApprovalAuditEvent,
+  ApprovalAuditSink,
+  ApprovalRole,
+} from './contract.js';
 export {
   APPROVAL_ROLES,
   BREAKWATER_ACTOR_KEY,
   BREAKWATER_APPROVED_CONNECTORS_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
   RUN_START_ROLES,
-} from './contract.js';
-export type {
-  ApprovalActor,
-  ApprovalAuditEvent,
-  ApprovalAuditSink,
-  ApprovalRole,
 } from './contract.js';
 // D1ApprovalStore itself is deliberately NOT exported: hosts obtain bound
 // stores through D1ApprovalStoreFactory.forTenant() (INV-2) — a directly
@@ -33,12 +33,13 @@ export {
   defaultResumeData,
   resumeViaRuntime,
 } from './grants.js';
+export type { ApprovalRouter, ApprovalRouterOptions } from './router.js';
 export {
   CLIENT_CREATE_FIELDS,
   createApprovalRouter,
   TCB_ONLY_CREATE_FIELDS,
 } from './router.js';
-export type { ApprovalRouter, ApprovalRouterOptions } from './router.js';
+export type { ApprovalServiceOptions, SweepSLAOptions } from './service.js';
 export {
   ApprovalAuthzError,
   ApprovalConflictError,
@@ -47,33 +48,27 @@ export {
   sweepSLA,
   UnknownApprovalError,
 } from './service.js';
-export type { ApprovalServiceOptions, SweepSLAOptions } from './service.js';
-export { InMemoryApprovalStore, stepKeyOf } from './store.js';
 export type { ApprovalPatch, ApprovalStore, CreateResult } from './store.js';
-export { TENANT_BOUND } from './tenant-brand.js';
+export { InMemoryApprovalStore, stepKeyOf } from './store.js';
 export type {
   SystemApprovalStore,
   TenantBoundApprovalStore,
 } from './tenant-brand.js';
-export {
-  createTenantResolver,
-  TenantResolutionError,
-} from './tenant-context.js';
+export { TENANT_BOUND } from './tenant-brand.js';
 export type {
   CreateTenantResolverOptions,
   TenantContext,
   TenantResolver,
 } from './tenant-context.js';
 export {
+  createTenantResolver,
+  TenantResolutionError,
+} from './tenant-context.js';
+export type { ApprovalStoreFactory } from './tenant-store.js';
+export {
   D1ApprovalStoreFactory,
   InMemoryApprovalStoreFactory,
 } from './tenant-store.js';
-export type { ApprovalStoreFactory } from './tenant-store.js';
-export {
-  APPROVAL_PRIORITIES,
-  APPROVAL_STATUSES,
-  OPEN_STATUSES,
-} from './types.js';
 export type {
   ApprovalDecision,
   ApprovalListFilter,
@@ -84,4 +79,9 @@ export type {
   CreateApprovalInput,
   DecideResult,
   ResumeOutcome,
+} from './types.js';
+export {
+  APPROVAL_PRIORITIES,
+  APPROVAL_STATUSES,
+  OPEN_STATUSES,
 } from './types.js';

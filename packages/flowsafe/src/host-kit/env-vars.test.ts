@@ -78,19 +78,26 @@ describe('boolVar', () => {
     expect(errors).not.toHaveBeenCalled();
   });
 
-  it.each(['true', '1', 'yes', 'on', 'TRUE', ' On '])(
-    "parses '%s' as true",
-    (raw) => {
-      expect(boolVar(raw, 'X', { onInvalid: false })).toBe(true);
-    },
-  );
+  it.each([
+    'true',
+    '1',
+    'yes',
+    'on',
+    'TRUE',
+    ' On ',
+  ])("parses '%s' as true", (raw) => {
+    expect(boolVar(raw, 'X', { onInvalid: false })).toBe(true);
+  });
 
-  it.each(['false', '0', 'no', 'off', 'FALSE'])(
-    "parses '%s' as false",
-    (raw) => {
-      expect(boolVar(raw, 'X', { onInvalid: true })).toBe(false);
-    },
-  );
+  it.each([
+    'false',
+    '0',
+    'no',
+    'off',
+    'FALSE',
+  ])("parses '%s' as false", (raw) => {
+    expect(boolVar(raw, 'X', { onInvalid: true })).toBe(false);
+  });
 
   it('returns the caller-named fail-closed value on garbage, and logs', () => {
     // #given — a kill switch fed a typo must kill, not carry on

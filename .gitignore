@@ -7,9 +7,12 @@
 !/.github/
 !/packages/
 !/docs/
+# Git hooks (husky's runtime shim dir keeps itself out via .husky/_/.gitignore)
+!/.husky/
 
 # --- Tracked top-level files ---
 !/.gitignore
+!/.lintstagedrc.cjs
 !/.node-version
 !/biome.json
 !/CLAUDE.md
@@ -21,6 +24,7 @@
 !/README.md
 !/SECURITY.md
 !/tsconfig.base.json
+!/vitest.config.ts
 
 # --- Re-ignore build / dependency / runtime artifacts nested inside the
 #     tracked directories above (root-level "/*" does not reach these) ---

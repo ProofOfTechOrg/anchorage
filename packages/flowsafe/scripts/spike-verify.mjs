@@ -1,13 +1,13 @@
 // Automates the flowsafe workerd spike end-to-end so "durable execution
 // across real process death" is a pass/fail command instead of a manual
-// curl ritual (protocol: demo/worker.ts header). Scenario A starts a run
+// curl ritual (protocol: spike/worker.ts header). Scenario A starts a run
 // that suspends at the approval gate, kills the dev server, restarts it
 // on the SAME persisted state, decides the approval, and asserts the run
 // resumed and published. Scenario B proves a forged raw resume (no grant
 // minted) fails closed at the connector gate.
 //
 // Auth rides the worker's host-kit seam: every request presents one of the
-// LOCAL-ONLY spike bearer tokens (demo/worker.ts SPIKE_ACTORS). The C probe
+// LOCAL-ONLY spike bearer tokens (spike/worker.ts SPIKE_ACTORS). The C probe
 // uses spike-admin because admin is the only role that can both START a run
 // and DECIDE approvals — exactly the identity separation-of-duties must deny.
 //
@@ -34,7 +34,7 @@ import { fileURLToPath } from 'node:url';
 
 const FLOWSAFE = dirname(dirname(fileURLToPath(import.meta.url)));
 const WRANGLER = join(FLOWSAFE, 'node_modules/.bin/wrangler');
-const CONFIG = join(FLOWSAFE, 'demo/wrangler.jsonc');
+const CONFIG = join(FLOWSAFE, 'spike/wrangler.jsonc');
 const PORT = Number(process.env.SPIKE_VERIFY_PORT ?? 8799);
 const BASE = `http://127.0.0.1:${PORT}`;
 const FAULT = process.env.SPIKE_VERIFY_FAULT || undefined;

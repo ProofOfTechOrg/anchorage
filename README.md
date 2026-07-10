@@ -17,7 +17,7 @@ multi-tenant by construction — run ids carry their tenant, approval stores are
 tenant-bound at construction, and cross-tenant reads are a compile error
 outside the cron path. A React dashboard ships as
 `@proofoftech/flowsafe/approval-ui`. Anchorage also includes a runnable
-five-workflow showcase (`packages/flowsafe/showcase/`), a copy-ready
+five-workflow showcase (`packages/showcase/`), a copy-ready
 production deploy template (`packages/flowsafe/deploy/`, with cron-owned SLA
 sweep + retention purge), Cloudflare Queues → SIEM audit export, R2 artifact
 storage, and Claude Code / Codex CLIs as approval-gated connectors. See
@@ -36,6 +36,7 @@ execution — as Mastra middleware.
 |---------|---------|--------------|
 | **breakwater** | Safety middleware — policy engine, RBAC + audit, connector SDK | `@proofoftech/breakwater` |
 | **flowsafe** | Approval UX + durable execution — approval API/dashboard, Cloudflare DO workflow runner | `@proofoftech/flowsafe` |
+| **showcase** | Runnable demo — five workflows, one React frontend, one Cloudflare deploy | `showcase` (private) |
 
 Source-only today — clone and build (see [Quick Start](#quick-start)); not yet published to npm.
 
@@ -119,8 +120,10 @@ anchorage/
         host-kit/       # Identity seam, tenant resolver + registry, shared run routes
         audit-export/   # Cloudflare Queues -> SIEM audit export
         artifacts/      # R2-backed workflow artifact storage
-      showcase/         # Five runnable workflows behind one frontend, one deploy
       deploy/           # Copy-ready production Worker (cron SLA sweep + retention purge)
+    showcase/           # Runnable demo (private): five workflows, one frontend, one deploy
+      src/              # Vite React SPA: launcher, run cards, approval dashboard
+      worker/           # The Cloudflare host: runtime, the five workflows, demo auth
   docs/                 # Product & engineering design specification
 ```
 
@@ -128,7 +131,7 @@ anchorage/
 
 ```bash
 pnpm install
-pnpm -r build && pnpm -r test          # 698 tests across both packages
+pnpm build && pnpm test                # 837 tests across the workspace
 pnpm --filter @proofoftech/flowsafe spike:verify   # workerd: suspend -> kill -> restart -> resume proof
 ```
 

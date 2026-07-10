@@ -44,17 +44,15 @@
 // Deploy checklist: README.md next to this file.
 
 import type {
+  Request as CfRequest,
   D1Database,
   DurableObjectNamespace,
   ExecutionContext,
   ExportedHandler,
   MessageBatch,
   Queue,
-  Request as CfRequest,
   ScheduledController,
 } from '@cloudflare/workers-types';
-import { z } from 'zod';
-
 import {
   approvalGrantProvider,
   BREAKWATER_APPROVED_CONNECTORS_KEY,
@@ -83,9 +81,10 @@ import {
   runSlaSweepMaintenance,
   staticTokenVerifier,
   type TokenVerifier,
-  withSubdomainCrossCheck,
   type WorkflowMeta,
+  withSubdomainCrossCheck,
 } from '@proofoftech/flowsafe/host-kit';
+import { z } from 'zod';
 
 import { PURGE_CRON, SWEEP_CRON } from './crons.js';
 

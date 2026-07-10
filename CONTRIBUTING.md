@@ -35,10 +35,21 @@ git clone https://github.com/ProofOfTechOrg/anchorage.git
 cd anchorage
 pnpm install
 # The full verification gate (what CI runs):
-pnpm -r lint && pnpm -r typecheck && pnpm -r test && pnpm -r build
+pnpm lint && pnpm typecheck && pnpm test && pnpm build
 # Plus the end-to-end workerd durability proof:
 pnpm --filter @proofoftech/flowsafe spike:verify
 ```
+
+Lint is one Biome pass at the root, and `pnpm test` is one root vitest run
+covering every package (837 tests). Git hooks (husky) back the gate up:
+pre-commit runs Biome on staged files (lint-staged); pre-push runs
+react-doctor on the branch's changed files (`pnpm react-doctor:diff`; bypass
+with `git push --no-verify`). CI additionally runs the full react-doctor gate
+(100/100, `--blocking warning`) over `packages/showcase`, plus `spike:verify`.
+
+The showcase app uses mandatory absolute imports — `@/*` for `src`,
+`#worker/*` for worker modules, `@flowsafe/*` for deep flowsafe source
+imports — enforced by Biome.
 
 ## Code Of Conduct
 

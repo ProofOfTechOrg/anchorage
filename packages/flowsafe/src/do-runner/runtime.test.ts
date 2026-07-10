@@ -12,8 +12,8 @@ import {
   type RequestContextProvider,
   RunAlreadyExistsError,
   type RunLeg,
-  type RunnerRuntime,
   RunNotSuspendedError,
+  type RunnerRuntime,
   UnknownWorkflowError,
 } from './runtime.js';
 
@@ -337,24 +337,27 @@ describe('RunnerRuntime', () => {
     ).toThrowError(/duplicate workflow id/);
   });
 
-  it.each(['team:wf', 'a/b', '.', '..', ''])(
-    "rejects non-path-safe workflow id '%s' at registration",
-    (id) => {
-      // #given
-      const { createWorkflow } = init({ storage: new InMemoryStore() });
+  it.each([
+    'team:wf',
+    'a/b',
+    '.',
+    '..',
+    '',
+  ])("rejects non-path-safe workflow id '%s' at registration", (id) => {
+    // #given
+    const { createWorkflow } = init({ storage: new InMemoryStore() });
 
-      // #when / #then — a ':' or '/' in the id would make the DO name join
-      // (`${workflowId}:${runId}`) and the /runs/:workflowId/:runId path
-      // ambiguous; fail at register(), before any run can be minted under it
-      expect(() =>
-        createWorkflow({
-          id,
-          inputSchema: z.object({}),
-          outputSchema: z.object({}),
-        }),
-      ).toThrowError(/must be URL-path-safe/);
-    },
-  );
+    // #when / #then — a ':' or '/' in the id would make the DO name join
+    // (`${workflowId}:${runId}`) and the /runs/:workflowId/:runId path
+    // ambiguous; fail at register(), before any run can be minted under it
+    expect(() =>
+      createWorkflow({
+        id,
+        inputSchema: z.object({}),
+        outputSchema: z.object({}),
+      }),
+    ).toThrowError(/must be URL-path-safe/);
+  });
 
   it('accepts path-safe workflow ids at registration', () => {
     // #given

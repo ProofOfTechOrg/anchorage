@@ -11,7 +11,7 @@ import type {
 } from '../approval-api/index.js';
 import { defaultResumeData } from '../approval-api/index.js';
 import type { RunSummary } from '../do-runner/index.js';
-import { doSummary, type DoResponseLike } from './do-response.js';
+import { type DoResponseLike, doSummary } from './do-response.js';
 
 /** The subset of a DurableObjectStub the topology uses. */
 export interface RunnerStubLike {

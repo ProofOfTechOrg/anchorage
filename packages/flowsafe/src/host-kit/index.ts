@@ -19,14 +19,14 @@ export {
   resumeRunWithRequeue,
 } from './approval-bridge.js';
 export { bearerActorAuthenticator, parseActorTokens } from './bearer-auth.js';
-export { doSummary, type DoResponseLike } from './do-response.js';
+export { type DoResponseLike, doSummary } from './do-response.js';
 export {
   createDoRunTopology,
   type DoRunTopology,
   type RunnerNamespaceLike,
   type RunnerStubLike,
 } from './do-run-topology.js';
-export { boolVar, numberVar, type NumberVarOptions } from './env-vars.js';
+export { boolVar, type NumberVarOptions, numberVar } from './env-vars.js';
 // hostAuditSink stays module-internal for the same reason as
 // requestedConnectors below: it is the primitive beneath
 // buildHostApprovalService / runSlaSweepMaintenance, and no host consumes it
@@ -41,13 +41,18 @@ export {
 } from './host-approval-service.js';
 export { assertWorkflowsRegistered } from './registration.js';
 export { RunRouteError } from './run-route-error.js';
-export { createRunRouter } from './run-router.js';
 export type { RunRouter, RunRouterOptions } from './run-router.js';
+export { createRunRouter } from './run-router.js';
+export type { SubdomainCrossCheckOptions } from './subdomain-check.js';
 // requestedConnectors and subdomainTenantOf stay module-internal on purpose:
 // they are the primitives beneath queueApprovalForSuspension /
 // withSubdomainCrossCheck, and no host consumes them directly.
 export { withSubdomainCrossCheck } from './subdomain-check.js';
-export type { SubdomainCrossCheckOptions } from './subdomain-check.js';
+export type {
+  ProvisionTenantOptions,
+  TenantRegistryDatabase,
+  TenantRegistryStatement,
+} from './tenant-registry.js';
 export {
   provisionTenant,
   RESERVED_FOR_ALLOCATION,
@@ -55,10 +60,10 @@ export {
   TenantCollisionError,
 } from './tenant-registry.js';
 export type {
-  ProvisionTenantOptions,
-  TenantRegistryDatabase,
-  TenantRegistryStatement,
-} from './tenant-registry.js';
+  HmacVerifierOptions,
+  MintHmacTokenOptions,
+  TokenVerifier,
+} from './verifier.js';
 export {
   base64UrlEncode,
   hmacSign,
@@ -66,10 +71,5 @@ export {
   mintHmacToken,
   staticTokenVerifier,
   toApprovalActor,
-} from './verifier.js';
-export type {
-  HmacVerifierOptions,
-  MintHmacTokenOptions,
-  TokenVerifier,
 } from './verifier.js';
 export type { WorkflowMeta } from './workflow-meta.js';

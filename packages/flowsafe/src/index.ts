@@ -14,35 +14,6 @@
 //    bridge every host mounts (subpath export '@proofoftech/flowsafe/host-kit'
 //    only — it is host glue, not part of the library's core surface)
 
-export {
-  APPROVAL_PRIORITIES,
-  APPROVAL_ROLES,
-  APPROVAL_STATUSES,
-  ApprovalAuthzError,
-  ApprovalConflictError,
-  approvalGrantProvider,
-  approvalGrantProviderFromFactory,
-  ApprovalService,
-  approvedConnectorsForLeg,
-  BREAKWATER_ACTOR_KEY,
-  BREAKWATER_APPROVED_CONNECTORS_KEY,
-  BREAKWATER_WORKFLOW_SCOPE_KEY,
-  createApprovalRouter,
-  createTenantResolver,
-  D1ApprovalStoreFactory,
-  defaultResumeData,
-  InMemoryApprovalStore,
-  InMemoryApprovalStoreFactory,
-  InvalidApprovalInputError,
-  OPEN_STATUSES,
-  resumeViaRuntime,
-  stepKeyOf,
-  sweepSLA,
-  TCB_ONLY_CREATE_FIELDS,
-  TENANT_BOUND,
-  TenantResolutionError,
-  UnknownApprovalError,
-} from './approval-api/index.js';
 export type {
   ApprovalActor,
   ApprovalAuditEvent,
@@ -74,10 +45,34 @@ export type {
   TenantResolver,
 } from './approval-api/index.js';
 export {
-  InMemoryArtifactBucket,
-  InvalidArtifactRefError,
-  R2ArtifactStore,
-} from './artifacts/index.js';
+  APPROVAL_PRIORITIES,
+  APPROVAL_ROLES,
+  APPROVAL_STATUSES,
+  ApprovalAuthzError,
+  ApprovalConflictError,
+  ApprovalService,
+  approvalGrantProvider,
+  approvalGrantProviderFromFactory,
+  approvedConnectorsForLeg,
+  BREAKWATER_ACTOR_KEY,
+  BREAKWATER_APPROVED_CONNECTORS_KEY,
+  BREAKWATER_WORKFLOW_SCOPE_KEY,
+  createApprovalRouter,
+  createTenantResolver,
+  D1ApprovalStoreFactory,
+  defaultResumeData,
+  InMemoryApprovalStore,
+  InMemoryApprovalStoreFactory,
+  InvalidApprovalInputError,
+  OPEN_STATUSES,
+  resumeViaRuntime,
+  stepKeyOf,
+  sweepSLA,
+  TCB_ONLY_CREATE_FIELDS,
+  TENANT_BOUND,
+  TenantResolutionError,
+  UnknownApprovalError,
+} from './approval-api/index.js';
 export type {
   ArtifactBody,
   ArtifactBucket,
@@ -92,9 +87,10 @@ export type {
   R2ArtifactStoreOptions,
 } from './artifacts/index.js';
 export {
-  createAuditQueueConsumer,
-  queueAuditSink,
-} from './audit-export/index.js';
+  InMemoryArtifactBucket,
+  InvalidArtifactRefError,
+  R2ArtifactStore,
+} from './artifacts/index.js';
 export type {
   AuditExportFetch,
   AuditExportOptions,
@@ -103,17 +99,9 @@ export type {
   AuditQueueMessage,
 } from './audit-export/index.js';
 export {
-  createD1Storage,
-  DurableObjectRunner,
-  init,
-  InvalidRunRequestError,
-  purgeExpiredWorkflowRuns,
-  RunAlreadyExistsError,
-  RunnerRuntime,
-  RunNotSuspendedError,
-  UnknownRunError,
-  UnknownWorkflowError,
-} from './do-runner/index.js';
+  createAuditQueueConsumer,
+  queueAuditSink,
+} from './audit-export/index.js';
 export type {
   D1StorageOptions,
   DORunnerEnv,
@@ -129,4 +117,16 @@ export type {
   SnapshotDatabase,
   SnapshotStatement,
   StartRunOptions,
+} from './do-runner/index.js';
+export {
+  createD1Storage,
+  DurableObjectRunner,
+  InvalidRunRequestError,
+  init,
+  purgeExpiredWorkflowRuns,
+  RunAlreadyExistsError,
+  RunNotSuspendedError,
+  RunnerRuntime,
+  UnknownRunError,
+  UnknownWorkflowError,
 } from './do-runner/index.js';
