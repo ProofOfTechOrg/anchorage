@@ -48,7 +48,7 @@ function FeedRow({
           tooltip={
             event.observed
               ? 'Observed: restates an API response this tab received.'
-              : 'By design: what the deployed architecture does here — not client-observable.'
+              : 'By design: what the deployed architecture does here; the browser cannot observe it directly.'
           }
         />
         {!event.observed ? <Token label="by design" size="sm" /> : null}
@@ -121,14 +121,14 @@ export function ActivityFeedPanel({
       </HStack>
       <Tooltip content={GLOSSARY.polling}>
         <Text size="sm" color="secondary">
-          Derived in your browser from polling — the authoritative audit trail
-          is in Workers Logs. ● observed, ○ by design.
+          Derived in your browser from polling; the authoritative audit trail is
+          in Workers Logs. ● observed, ○ by design.
         </Text>
       </Tooltip>
       {feed.events.length === 0 ? (
         <EmptyState
           title="Quiet in here"
-          description="As you act, every observed API response — and the by-design server steps between them — gets narrated here. ● observed, ○ by design."
+          description="As you act, every observed API response and the by-design server steps between them get narrated here. ● observed, ○ by design."
         />
       ) : (
         <VStack

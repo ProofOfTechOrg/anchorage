@@ -308,7 +308,7 @@ function oauthPair(
       JSON.stringify({
         type: 'config-error',
         var: missing,
-        reason: `${present} is set without ${missing} — sign-in cannot complete, so the provider stays unmounted`,
+        reason: `${present} is set without ${missing}; sign-in cannot complete, so the provider stays unmounted`,
       }),
     );
   }
@@ -348,7 +348,7 @@ export function selectOAuthProvider(env: Env): OAuthProvider | undefined {
           type: 'config-warning',
           var: 'GITHUB_CLIENT_ID',
           reason:
-            'the Google and GitHub OAuth pairs are both set — Google mounts; remove the stale GitHub credentials',
+            'the Google and GitHub OAuth pairs are both set. Google mounts; remove the stale GitHub credentials',
         }),
       );
     }
@@ -620,7 +620,7 @@ const handler: ExportedHandler<Env> = {
           type: 'config-error',
           var: 'triggers.crons',
           raw: controller.cron,
-          reason: 'unknown cron expression — running both maintenance surfaces',
+          reason: 'unknown cron expression; running both maintenance surfaces',
         }),
       );
       ctx.waitUntil(

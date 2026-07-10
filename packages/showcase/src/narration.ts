@@ -133,18 +133,18 @@ export function interpretRunResult(result: unknown): ResultInterpretation {
     return {
       flavor: 'declined',
       replayed,
-      line: 'Outcome: declined — the rejection resumed the run to a clean stop; no side effect ran.',
+      line: 'Outcome: declined. The rejection resumed the run to a clean stop; no side effect ran.',
     };
   }
   if (outcome === 'preview') {
     return {
       flavor: 'preview',
       replayed,
-      line: 'Outcome: preview — a dry-run pass through the real connector path; nothing changed.',
+      line: 'Outcome: preview. A dry-run pass through the real connector path changed nothing.',
     };
   }
   if (r.published === true) {
-    const key = typeof r.key === 'string' ? ` — key ${r.key}` : '';
+    const key = typeof r.key === 'string' ? ` (key ${r.key})` : '';
     return {
       flavor: 'real-write',
       replayed,
@@ -155,7 +155,7 @@ export function interpretRunResult(result: unknown): ResultInterpretation {
     return {
       flavor: 'simulated',
       replayed,
-      line: 'Outcome: simulated — the connector ran its full code path; the external call was skipped (connectors are offline here).',
+      line: 'Outcome: simulated. The connector ran its full code path; the external call was skipped (connectors are offline here).',
     };
   }
   if (outcome === 'sent' || outcome === 'deployed' || outcome === 'assigned') {
@@ -164,14 +164,14 @@ export function interpretRunResult(result: unknown): ResultInterpretation {
     return {
       flavor: 'delivered',
       replayed,
-      line: `Outcome: ${outcome} — a live connector binding is configured on this deployment.`,
+      line: `Outcome: ${outcome}. A live connector binding is configured on this deployment.`,
     };
   }
   if (r.granted === true) {
     return {
       flavor: 'plain',
       replayed,
-      line: "Access granted — the grant exists only in this run's result; no real system was touched.",
+      line: "Access granted. The grant exists only in this run's result; no real system was touched.",
     };
   }
   return { flavor: 'plain', replayed };
@@ -205,18 +205,18 @@ function suspendedEvents(
       zone: 'do',
       kind: 'run.suspended',
       title: again
-        ? `Second gate — ${run.title} suspended again at ${susp.step}`
-        : `Approval needed — ${run.title} suspended at ${susp.step}`,
+        ? `Second gate: ${run.title} suspended again at ${susp.step}`
+        : `Approval needed: ${run.title} suspended at ${susp.step}`,
       detail: [
         susp.reason ? `'${susp.reason}'` : undefined,
         connectors ? `connectors to grant: ${connectors}` : undefined,
         again
-          ? 'The earlier approval is spent — this new suspension needs its own decision and mints its own grant.'
-          : 'The request is in the queue.',
+          ? 'the earlier approval is spent: this new suspension needs its own decision and mints its own grant'
+          : 'the request is in the queue',
         `(${fingerprint})`,
       ]
         .filter(Boolean)
-        .join(' — '),
+        .join(' · '),
       tone: 'warning',
       runId: run.runId,
       observed: true,
@@ -245,12 +245,12 @@ function resumedEvents(
       at,
       zone: 'do',
       kind: 'run.resumed',
-      title: `Run resumed — ${run.title}`,
+      title: `Run resumed: ${run.title}`,
       detail: options.declined
-        ? 'The rejection resumed the run server-side toward a declined outcome — no grant was minted.'
+        ? 'The rejection resumed the run server-side toward a declined outcome. No grant was minted.'
         : options.connectors?.length
           ? `The approval unlocked ${options.connectors.join(', ')} for this resumed leg only.`
-          : `Resume attempted inside the decide call — ok: ${options.ok ?? true}.`,
+          : `Resume attempted inside the decide call (ok: ${options.ok ?? true}).`,
       tone: 'info',
       runId: run.runId,
       observed: true,
@@ -264,7 +264,7 @@ function resumedEvents(
       zone: 'worker',
       kind: 'grant.derived',
       title: 'Grant derived server-side',
-      detail: `Recomputed from APPROVED records bound to (${step}, suspendedAt, resume #${ordinal}) — grants never travel in HTTP bodies.`,
+      detail: `Recomputed from APPROVED records bound to (${step}, suspendedAt, resume #${ordinal}). Grants never travel in HTTP bodies.`,
       tone: 'neutral',
       runId: run.runId,
       observed: false,
@@ -307,7 +307,7 @@ function terminalEvents(
         kind: 'connector.replayed',
         title: 'Idempotent replay',
         detail:
-          'The result reports replayed: true — a retry with the same idempotency key returned the recorded result instead of executing again.',
+          'The result reports replayed: true. A retry with the same idempotency key returned the recorded result instead of executing again.',
         tone: 'info',
         runId: run.runId,
         observed: true,
@@ -320,7 +320,7 @@ function terminalEvents(
         at,
         zone: 'do',
         kind: 'run.no-gate',
-        title: `Gate short-circuited — ${run.title}`,
+        title: `Gate short-circuited: ${run.title}`,
         detail:
           'The run completed without ever suspending: its approval gate was never reached, so no approval was queued and no connector ran.',
         tone: 'info',
@@ -334,14 +334,14 @@ function terminalEvents(
     // happened instead of the rejection copy.
     const line =
       !everSuspended && interp.flavor === 'declined'
-        ? 'Completed without reaching its gate — nothing needed approval and no connector ran.'
+        ? 'Completed without reaching its gate: nothing needed approval and no connector ran.'
         : interp.line;
     events.push({
       key: `done:${run.runId}`,
       at,
       zone: 'do',
       kind: 'run.succeeded',
-      title: `Run finished — ${run.title}`,
+      title: `Run finished: ${run.title}`,
       detail: line,
       tone: 'success',
       runId: run.runId,
@@ -354,7 +354,7 @@ function terminalEvents(
       at,
       zone: 'do',
       kind: 'run.failed',
-      title: `Run ${next.status} — ${run.title}`,
+      title: `Run ${next.status}: ${run.title}`,
       detail: `${next.error ?? 'no error detail'}. The D1 snapshot is retained; last known state stays on the run card.`,
       tone: 'danger',
       runId: run.runId,
@@ -484,7 +484,7 @@ export function deriveApprovalEvents(
             `requested by ${record.requestedBy}`,
           ]
             .filter(Boolean)
-            .join(' — '),
+            .join(' · '),
           tone: 'info',
           runId: record.runId,
           approvalId: record.id,
@@ -503,7 +503,7 @@ export function deriveApprovalEvents(
           zone: 'worker',
           kind: 'approval.claimed',
           title: `Claimed by ${record.claimedBy ?? 'a reviewer'}`,
-          detail: `'${record.title}' is being reviewed. Claiming is optional bookkeeping — deciding does not require it.`,
+          detail: `'${record.title}' is being reviewed. Claiming is optional bookkeeping; deciding does not require it.`,
           tone: 'info',
           runId: record.runId,
           approvalId: record.id,
@@ -520,7 +520,7 @@ export function deriveApprovalEvents(
           at,
           zone: 'worker',
           kind: 'approval.decided',
-          title: `Approval ${record.status} — '${record.title}'`,
+          title: `Approval ${record.status}: '${record.title}'`,
           detail: [
             `${record.decision ?? record.status} by ${record.decidedBy ?? 'unknown'}`,
             record.comment ? `'${record.comment}'` : undefined,
@@ -529,7 +529,7 @@ export function deriveApprovalEvents(
               : undefined,
           ]
             .filter(Boolean)
-            .join(' — '),
+            .join(' · '),
           tone: record.status === 'approved' ? 'success' : 'warning',
           runId: record.runId,
           approvalId: record.id,
@@ -542,9 +542,9 @@ export function deriveApprovalEvents(
           at,
           zone: 'cron',
           kind: 'approval.escalated',
-          title: `Approval ${shortId(record.id)} escalated — SLA breached`,
+          title: `Approval ${shortId(record.id)} escalated: SLA breached`,
           detail:
-            'Flagged by the 15-minute sweep. Escalation raises visibility only — the request is still fully decidable.',
+            'Flagged by the 15-minute sweep. Escalation raises visibility only; the request is still fully decidable.',
           tone: 'warning',
           runId: record.runId,
           approvalId: record.id,
@@ -562,7 +562,7 @@ export function deriveApprovalEvents(
         zone: 'worker',
         kind: 'approval.delegated',
         title: `Delegated to ${record.claimedBy}`,
-        detail: `'${record.title}' — last write wins by design: delegation moves a pointer and guards no side effect.`,
+        detail: `'${record.title}'. Last write wins by design: delegation moves a pointer and guards no side effect.`,
         tone: 'neutral',
         runId: record.runId,
         approvalId: record.id,
@@ -628,8 +628,8 @@ export function startEvent(
       at,
       zone: 'worker',
       kind: 'run.started',
-      title: `Run started — ${run.title}`,
-      detail: `Worker verified the caller and minted runId ${shortId(run.runId)} server-side (tenant-prefixed). Executing in its own Durable Object.`,
+      title: `Run started: ${run.title}`,
+      detail: `The Worker verified the caller and minted runId ${shortId(run.runId)} server-side (tenant-prefixed). The run executes in its own Durable Object.`,
       tone: 'info',
       runId: run.runId,
       observed: true,
@@ -685,7 +685,7 @@ export function startEvent(
         zone: 'worker',
         kind: 'approval.queued',
         title: 'Worker observed the suspension and queued an approval',
-        detail: `approval ${shortId(response.approval.id)} — decide it in the queue below.`,
+        detail: `approval ${shortId(response.approval.id)}: decide it in the queue below.`,
         tone: 'info',
         runId: run.runId,
         approvalId: response.approval.id,
@@ -730,7 +730,7 @@ export function startErrorEvent(
         at,
         zone: 'worker',
         kind: 'authz.denied',
-        title: `Role can't start this — ${workflowId}`,
+        title: `This role can't start ${workflowId}`,
         detail: `${message}. The server enforces this even if the button renders.`,
         tone: 'danger',
         observed: true,
@@ -746,7 +746,7 @@ export function startErrorEvent(
         kind: 'demo.disabled',
         title: 'Demo temporarily disabled',
         detail:
-          'The operator kill switch is on — even issued tokens are refused. Nothing is wrong with your sandbox; check back later.',
+          'The operator kill switch is on, so even issued tokens are refused. Nothing is wrong with your sandbox; check back later.',
         tone: 'danger',
         observed: true,
         toast: true,
@@ -787,9 +787,9 @@ export function resetEvent(purged: {
     at,
     zone: 'd1',
     kind: 'demo.reset',
-    title: `Sandbox reset — ${purged.snapshots} run snapshot${plural(purged.snapshots)} and ${purged.approvals} approval${plural(purged.approvals)} purged`,
+    title: `Sandbox reset: ${purged.snapshots} run snapshot${plural(purged.snapshots)} and ${purged.approvals} approval${plural(purged.approvals)} purged`,
     detail:
-      'A tenant-scoped D1 delete, server-side — the same primitive the expiry reaper uses. You stay signed in, and the run budget is NOT refilled.',
+      'A tenant-scoped D1 delete, server-side: the same primitive the expiry reaper uses. You stay signed in, and the run budget is NOT refilled.',
     tone: 'success',
     observed: true,
     toast: true,
@@ -814,7 +814,7 @@ export function resetErrorEvent(
       zone: 'worker',
       kind: 'demo.reset-denied',
       title: 'Reset refused by the server',
-      detail: `${message}. Only the admin identity of a demo sandbox may wipe it — the same server-side RBAC that gates every other mutation.`,
+      detail: `${message}. Only the admin identity of a demo sandbox may wipe it: the same server-side RBAC that gates every other mutation.`,
       tone: 'danger',
       observed: true,
       toast: true,
@@ -857,8 +857,8 @@ export function decideEvents(result: DecideResult): NarrationEvent[] {
       kind: 'approval.decided',
       title:
         decision === 'approve'
-          ? 'Approved — grant derived'
-          : 'Rejected — no grant minted',
+          ? 'Approved: grant derived'
+          : 'Rejected: no grant minted',
       detail:
         decision === 'approve'
           ? `Decision recorded. The Worker derived the connector grant and resumed the run inline (resume ok: ${resume.ok ?? 'not attempted'}).`
@@ -878,7 +878,7 @@ export function decideEvents(result: DecideResult): NarrationEvent[] {
       kind: 'run.resume-failed',
       title: "Decision saved; resume didn't complete",
       detail:
-        'The decision is durable and the grant re-derives from the store — re-driving this run is safe.',
+        'The decision is durable and the grant re-derives from the store, so re-driving this run is safe.',
       tone: 'danger',
       runId: record.runId,
       approvalId: record.id,
@@ -932,7 +932,7 @@ export function decideDeniedEvent(
     zone: 'worker',
     kind: 'authz.denied',
     title: 'Decision refused (403)',
-    detail: `${message}. Switch role — each demo role is a distinct actor id, so another role can decide this.`,
+    detail: `${message}. Switch role: each demo role is a distinct actor id, so another role can decide this.`,
     tone: 'danger',
     approvalId,
     observed: true,
@@ -949,7 +949,7 @@ export function claimEvent(record: ApprovalRecord): NarrationEvent {
     zone: 'worker',
     kind: 'approval.claimed',
     title: `Claimed '${record.title}'`,
-    detail: 'Marked as yours to review — deciding does not require a claim.',
+    detail: 'Marked as yours to review. Deciding does not require a claim.',
     tone: 'info',
     runId: record.runId,
     approvalId: record.id,
@@ -1005,7 +1005,7 @@ export function sessionReadyEvent(options: {
   const at = Date.now();
   const expires =
     options.expiresAtMs !== undefined
-      ? ` — expires ${new Date(options.expiresAtMs).toLocaleTimeString()}`
+      ? ` (expires ${new Date(options.expiresAtMs).toLocaleTimeString()})`
       : '';
   return {
     key: `session:${options.tenantId}`,
@@ -1081,7 +1081,7 @@ export function pollTroubleEvent(
     kind: options.stopped ? 'poll.stopped' : 'poll.degraded',
     title: options.stopped ? 'Run polling stopped' : 'Live updates degraded',
     detail: options.stopped
-      ? `${options.message}. This affects only this tab's view — the run itself is unaffected server-side.`
+      ? `${options.message}. This affects only this tab's view; the run itself is unaffected server-side.`
       : 'Run status reads are failing; showing last known state.',
     tone: options.stopped ? 'danger' : 'warning',
     runId,

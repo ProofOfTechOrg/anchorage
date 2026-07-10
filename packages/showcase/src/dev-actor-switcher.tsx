@@ -44,7 +44,7 @@ export function DevActorSwitcher({
 
   return (
     <HStack gap={2} align="center" aria-label="Acting identity">
-      <Tooltip content="Local dev only — these are the public local-dev bearer tokens; the production bundle ships none.">
+      <Tooltip content="Local dev only: these are the public local-dev bearer tokens; the production bundle ships none.">
         <Token label="dev tokens" size="sm" color="gray" />
       </Tooltip>
       <SegmentedControl

@@ -163,7 +163,7 @@ export const gtmOutboundModule: WorkflowModule<ShowcaseModuleDeps> = {
         drafts: inputData.contacts.map((contact) => ({
           to: contact,
           subject: 'Quick question about your growth stack',
-          body: `Hi ${contact}, noticed your team is scaling — worth a chat?`,
+          body: `Hi ${contact}, noticed your team is scaling. Worth a chat?`,
         })),
       }),
     });

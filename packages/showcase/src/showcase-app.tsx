@@ -212,7 +212,7 @@ export function ShowcaseApp({
 
   const resetDescription = `Deletes ALL of this sandbox's runs and approval records server-side and clears the local activity feed. You stay signed in, and the run budget is NOT refilled.${
     actor && actor.role !== 'admin'
-      ? ` Requires the admin role — you are '${actor.role}', so the server will refuse (403).`
+      ? ` Requires the admin role; you are '${actor.role}', so the server will refuse (403).`
       : ''
   }`;
 
@@ -368,7 +368,7 @@ export function ShowcaseApp({
       </div>
 
       <Text size="sm" color="secondary">
-        Anchorage demo — flowsafe + breakwater running on Cloudflare Workers,
+        Anchorage demo: flowsafe + breakwater running on Cloudflare Workers,
         Durable Objects, and D1. Connectors are offline; your sandbox and
         everything in it self-destructs at expiry. · Theme: Astryx y2k.
       </Text>

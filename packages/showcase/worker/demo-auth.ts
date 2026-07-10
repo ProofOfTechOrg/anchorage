@@ -230,7 +230,7 @@ export async function findOrCreateDemoTenant(
       .first<DemoTenantRow>();
     if (!winner) {
       throw new Error(
-        'demo tenant insert lost its race but the winner is unreadable — retry sign-in',
+        'demo tenant insert lost its race but the winner is unreadable; retry sign-in',
       );
     }
     return winner;
@@ -313,7 +313,7 @@ export async function consumeRunBudget(
       throw new DemoRunLimitError(
         'tenant',
         'expired',
-        'demo tenant expired — sign in again for a fresh sandbox',
+        'demo tenant expired; sign in again for a fresh sandbox',
       );
     }
     throw new DemoRunLimitError(
@@ -335,7 +335,7 @@ export async function consumeRunBudget(
     throw new DemoRunLimitError(
       'global',
       'cap-reached',
-      'the demo has reached its global daily run ceiling — try again tomorrow',
+      'the demo has reached its global daily run ceiling; try again tomorrow',
     );
   }
 }
@@ -821,7 +821,7 @@ export function createDemoAuthRouter(
         .first<DemoTenantRow>();
       if (!tenant || Date.parse(tenant.expires_at) <= now()) {
         return json(
-          { error: 'sandbox expired — sign in again for a fresh one' },
+          { error: 'sandbox expired; sign in again for a fresh one' },
           401,
         );
       }

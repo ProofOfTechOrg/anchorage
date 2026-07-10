@@ -45,7 +45,7 @@ export class AppErrorBoundary extends Component<
           The demo hit a rendering error
         </h1>
         <p style={{ margin: '0 0 1rem' }}>
-          Nothing server-side is affected — your runs and approvals are intact.
+          Nothing server-side is affected; your runs and approvals are intact.
           Reload to continue.
         </p>
         <pre

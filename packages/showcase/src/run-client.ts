@@ -137,7 +137,7 @@ export class RunClient {
       options.fetch ??
       ((globalThis as { fetch?: unknown }).fetch as FetchLike | undefined);
     if (!fetchFn) {
-      throw new Error('RunClient: no fetch available — pass one');
+      throw new Error('RunClient: no fetch available; pass one');
     }
     this.#fetch = (url, init) => fetchFn(url, init);
     this.#headers = { ...options.headers };

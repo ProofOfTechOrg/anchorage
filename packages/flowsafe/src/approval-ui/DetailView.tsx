@@ -74,7 +74,7 @@ export function DetailView({
             <C.MetadataItem label="Decision">
               <C.InfoTip label={record.decision} tip={APPROVAL_TIPS.decision} />{' '}
               by {record.decidedBy}
-              {record.comment ? ` — ${record.comment}` : null}
+              {record.comment ? ` · ${record.comment}` : null}
             </C.MetadataItem>
           ) : null}
         </C.MetadataList>

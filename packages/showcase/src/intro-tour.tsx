@@ -49,10 +49,10 @@ export function useIntroTour(): IntroTour {
 }
 
 const TOUR_BULLETS: readonly string[] = [
-  'Launch a workflow — it runs its real steps and suspends at an approval gate within a couple of seconds.',
+  'Launch a workflow. It runs its real steps and suspends at an approval gate within a couple of seconds.',
   "Switch to reviewer and approve it. Separation of duties is server-enforced: whoever advanced the run into its gate can't decide it.",
   'The approval derives a capability grant bound to that exact suspension, and the run resumes server-side behind four connector gates.',
-  'Dangerous things are simulated (no live bindings); the machinery — grants, RBAC, tenant isolation, durable suspend/resume — is real.',
+  'Dangerous things are simulated (no live bindings); the machinery is real: grants, RBAC, tenant isolation, durable suspend/resume.',
 ];
 
 export function IntroTourDialog({

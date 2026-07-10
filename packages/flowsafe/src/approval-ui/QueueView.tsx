@@ -111,7 +111,7 @@ export function QueueView({
       emptyState={
         <C.EmptyState
           title="No approval requests."
-          description="Launch a workflow — a suspension queues its approval request here."
+          description="Launch a workflow; a suspension queues its approval request here."
         />
       }
     />

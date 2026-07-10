@@ -211,7 +211,7 @@ export function WorkflowLauncher({
               </Tooltip>
             ))}
             {selected.allowedRoles ? (
-              <Tooltip content="Only these roles can start this workflow — enforced server-side on POST /runs.">
+              <Tooltip content="Only these roles can start this workflow. The server enforces this on POST /runs.">
                 <Token
                   label={`start roles: ${selected.allowedRoles.join(', ')}`}
                   size="sm"
@@ -246,10 +246,10 @@ export function WorkflowLauncher({
               status="warning"
               title={
                 actorRole === undefined
-                  ? 'No verified identity — sign in with a valid token to launch workflows.'
+                  ? 'No verified identity. Sign in with a valid token to launch workflows.'
                   : selected.allowedRoles
-                    ? `Your role '${actorRole}' cannot start this workflow — switch to ${selected.allowedRoles.join(' or ')}.`
-                    : `Your role '${actorRole}' cannot start any workflow — switch to ${RUN_START_ROLES.join(', ')}.`
+                    ? `Your role '${actorRole}' cannot start this workflow. Switch to ${selected.allowedRoles.join(' or ')}.`
+                    : `Your role '${actorRole}' cannot start any workflow. Switch to ${RUN_START_ROLES.join(', ')}.`
               }
             />
           ) : null}

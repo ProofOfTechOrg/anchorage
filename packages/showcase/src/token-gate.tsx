@@ -42,10 +42,10 @@ function providerDisplayName(provider: string): string {
  * derived server-side, refusals are real server responses.
  */
 const DEMO_POINTS = [
-  'Five real agent workflows execute server-side and suspend durably at human approval gates — multi-gate, branching, re-suspension.',
-  'Four roles (operator, reviewer, admin, viewer): RBAC and separation of duties are enforced server-side — watch your own requests get refused.',
+  'Five real agent workflows execute server-side and suspend durably at human approval gates, including multi-gate, branching, and re-suspension shapes.',
+  'Four roles (operator, reviewer, admin, viewer): RBAC and separation of duties are enforced server-side. Watch your own requests get refused.',
   'Every approval derives a capability grant bound to that exact suspension; a forged resume finds no grant and fails closed.',
-  'Dangerous side effects are simulated — emails and deploys are logged, never delivered. The grants, tenant isolation, and durable suspend/resume are real.',
+  'Dangerous side effects are simulated: emails and deploys are logged, never delivered. The grants, tenant isolation, and durable suspend/resume are real.',
 ];
 
 /**
@@ -117,8 +117,8 @@ export function TokenGate({
             <VStack gap={3}>
               <Text>
                 This demo is the full open-source platform running against a
-                sandbox — not a video, not a mock — so you can judge the safety
-                story by poking at it:
+                sandbox, not a video or a mock. Poke at it and judge the safety
+                story yourself:
               </Text>
               <VStack gap={2}>
                 {DEMO_POINTS.map((point) => (
@@ -207,7 +207,7 @@ export function OperatorIdentityChip({
   return (
     <HStack gap={2} align="center">
       <Text size="sm" color="secondary">
-        Token set — identity is verified by the server.
+        Token set. Identity is verified by the server.
       </Text>
       <Button label="Sign out" variant="ghost" onClick={onSignOut} />
     </HStack>

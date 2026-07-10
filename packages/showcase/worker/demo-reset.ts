@@ -80,14 +80,14 @@ export function createDemoResetRouter(
       if (tenant.actor.role !== 'admin') {
         return json(
           {
-            error: `forbidden — resetting the sandbox requires the admin role (you are '${tenant.actor.role}')`,
+            error: `forbidden: resetting the sandbox requires the admin role (you are '${tenant.actor.role}')`,
           },
           403,
         );
       }
       if (!(await options.isDemoTenant(tenant.tenantId))) {
         return json(
-          { error: 'forbidden — reset is a demo-sandbox affordance' },
+          { error: 'forbidden: reset only exists for demo sandboxes' },
           403,
         );
       }

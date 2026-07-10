@@ -97,7 +97,7 @@ export function WhatsRealHere(): ReactElement {
         <RealityRow
           marker="◌"
           title="SIMULATED"
-          items="the blast radius: email delivery, the CRM POST, deploy/promote calls. No live bindings — the full code path runs and the envelope is logged."
+          items="the blast radius: email delivery, the CRM POST, deploy/promote calls. There are no live bindings; the full code path runs and the envelope is logged."
         />
         <RealityRow
           marker="◐"

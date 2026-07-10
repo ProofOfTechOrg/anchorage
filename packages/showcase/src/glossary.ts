@@ -10,7 +10,7 @@ import type { NarrationZone } from '@/narration';
 
 /** The one-line product statement (header + signed-out landing). */
 export const TAGLINE =
-  'Approval gates and capability grants for AI agent workflows — suspending, deciding, and resuming durably on Cloudflare.';
+  'Approval gates and capability grants for AI agent workflows. Runs suspend durably on Cloudflare, wait for a decision, and resume.';
 
 export const ZONES: Record<NarrationZone, { label: string; blurb: string }> = {
   browser: {
@@ -26,7 +26,7 @@ export const ZONES: Record<NarrationZone, { label: string; blurb: string }> = {
   do: {
     label: 'Durable Object',
     blurb:
-      'A single-threaded Cloudflare compute instance — one per run. It executes steps under a per-run lock and owns the suspend/resume lifecycle.',
+      'A single-threaded Cloudflare compute instance, one per run. It executes steps under a per-run lock and owns the suspend/resume lifecycle.',
   },
   d1: {
     label: 'D1',
@@ -44,20 +44,20 @@ export const GLOSSARY = {
   approvalGate:
     'A workflow step that suspends the run and auto-queues an approval request. Its gated side effect cannot run until a decision mints a grant.',
   suspended:
-    'The run is parked durably in its Durable Object — no compute is waiting. It survives isolate restarts and moves only when a decision resumes it server-side.',
+    'The run is parked durably in its Durable Object with no compute waiting. It survives isolate restarts and moves only when a decision resumes it server-side.',
   grantDerivation:
     'On approve, the Worker recomputes approved connectors from stored records bound to exactly this suspension. A forged resume finds no grant and fails closed.',
   fingerprint:
-    'suspendedAt (epoch ms) plus resumeCount (per-step resume ordinal) name this exact suspension. Approvals bind to it — a re-suspension needs a fresh decision.',
+    'suspendedAt (epoch ms) plus resumeCount (per-step resume ordinal) name this exact suspension. Approvals bind to it, so a re-suspension needs a fresh decision.',
   resumeCount:
     'Runtime-owned resume counter per step: absent on a first suspension, 1 after the first resume. The collision-free tie-breaker for grants.',
-  sod: 'Whoever advanced a run into a gate cannot decide that request — the server answers 403, admins included. Each demo role is a distinct actor id, so switching works.',
+  sod: 'Whoever advanced a run into a gate cannot decide that request: the server answers 403, admins included. Each demo role is a distinct actor id, so switching works.',
   runId:
     'Minted server-side as {tenantId}_{uuid}; a client-sent runId is rejected (400). The prefix makes snapshots, DOs, and grants tenant-disjoint by construction.',
   tenantIsolation:
-    "Every id, store, and budget is scoped to your tenant. Another tenant's run answers 404 — not 403 — so the API is not an existence oracle.",
+    "Every id, store, and budget is scoped to your tenant. Another tenant's run answers 404 rather than 403, so the API is not an existence oracle.",
   sandboxTenant:
-    "Your ephemeral tenant: 'dm' + 18 hex chars, invisible to other visitors. Everything in it is purged after expiry — nothing you do here persists.",
+    "Your ephemeral tenant: 'dm' + 18 hex chars, invisible to other visitors. Everything in it is purged after expiry; nothing you do here persists.",
   expiry:
     "The tenant's end of life (~24 h from first sign-in). A cron reaper purges its runs, approvals, and budget rows after a grace window.",
   actorEcho:
@@ -67,23 +67,23 @@ export const GLOSSARY = {
   reset:
     "Deletes ALL of your sandbox's runs and approval records server-side (admin role required). You stay signed in; the run budget is NOT refilled.",
   simulated:
-    "The connector's real code path runs — grant check, audit, idempotency, limits — but no binding is configured, so the external call is skipped and its envelope logged.",
+    "The connector's real code path runs (grant check, audit, idempotency, limits), but no binding is configured, so the external call is skipped and its envelope logged.",
   dryRun:
     'A real pass through the deploy connector with side effects off. Needs no grant, changes nothing, and returns the preview shown at the first gate.',
   idempotency:
     'Every write carries an idempotency key. A retry with the same key returns the recorded result (replayed: true) instead of executing again.',
   rateLimit:
-    'Per-tenant call budget on a connector — crm-assign allows 5/min. Your sandbox exhausting it cannot throttle any other visitor.',
+    'Per-tenant call budget on a connector: crm-assign allows 5/min. Your sandbox exhausting it cannot throttle any other visitor.',
   egressAllowlist:
     'The only host a connector may call (crm.example.com, deploy.example.com). Any other destination is refused before a request leaves.',
   fourGates:
     'Order on every connector call: egress allowlist → write-approval grant → idempotent replay → rate limit. All four are scoped to your tenant.',
   crossWorkflowIsolation:
-    "The grant-access connector refuses a request naming another workflow's scope — it fails closed even with a valid approval.",
+    "The grant-access connector refuses a request naming another workflow's scope. It fails closed even with a valid approval.",
   destructiveClass:
     'Marked as a connector whose effect cannot be undone. Each action (deploy vs promote) carries its own idempotency key.',
   polling:
-    'This UI polls run status every 3s and the queue/metrics every 5s. There is no event API — the activity feed is reconstructed from these responses.',
+    'This UI polls run status every 3s and the queue/metrics every 5s. There is no event API; the activity feed is reconstructed from these responses.',
   artifactStore:
     'Real writes to an in-memory bucket standing in for R2. Keys look like production (workflowId/runId/name); contents vanish with the sandbox.',
 } as const;
@@ -94,9 +94,9 @@ export const ROLE_NOTES: Record<string, string> = {
   admin:
     'Starts any workflow, including access-request, and decides approvals. Still blocked by separation of duties on requests it advanced itself.',
   operator:
-    'Starts 4 of the 5 workflows and edits run inputs. Cannot claim or decide approvals — reviewing is reviewer/admin work.',
+    'Starts 4 of the 5 workflows and edits run inputs. Cannot claim or decide approvals; reviewing is reviewer/admin work.',
   reviewer:
-    'Cannot start runs. Claims, delegates, and decides approvals — the second pair of eyes this whole system exists for.',
+    'Cannot start runs. Claims, delegates, and decides approvals: the second pair of eyes this whole system exists for.',
   viewer:
     'Read-only. Sees runs, the queue, and metrics; every write it attempts returns 403.',
   builder:
@@ -171,7 +171,7 @@ export const WORKFLOW_GUIDES: Record<string, WorkflowGuide> = {
       { label: 'outreach-email', tip: GLOSSARY.simulated },
       { label: 'idempotent', tip: GLOSSARY.idempotency },
     ],
-    note: 'The send is a Cloudflare Email Service call with no binding here — envelope logged, nothing delivered.',
+    note: 'The send is a Cloudflare Email Service call with no binding here, so the envelope is logged and nothing is delivered.',
   },
   'content-pipeline': {
     steps: [
@@ -189,7 +189,7 @@ export const WORKFLOW_GUIDES: Record<string, WorkflowGuide> = {
       { label: 'publish-article', tip: GLOSSARY.artifactStore },
       { label: 'idempotent: runId:contentHash', tip: GLOSSARY.idempotency },
     ],
-    note: 'Publish writes to a real artifact store keyed {workflowId}/{runId}/… — in-memory here, R2 in production. Idempotency key: runId:contentHash.',
+    note: 'Publish writes to a real artifact store keyed {workflowId}/{runId}/… (in-memory here, R2 in production). Idempotency key: runId:contentHash.',
   },
   'lead-generation': {
     steps: [
@@ -209,9 +209,9 @@ export const WORKFLOW_GUIDES: Record<string, WorkflowGuide> = {
       { label: 'egress: crm.example.com', tip: GLOSSARY.egressAllowlist },
       { label: 'rate 5/min', tip: GLOSSARY.rateLimit },
     ],
-    note: "crm-assign may only reach crm.example.com (allowlist) at 5/min — and it's offline, so assignments are logged, not sent.",
+    note: "crm-assign may only reach crm.example.com (allowlist) at 5/min, and it's offline here, so assignments are logged, not sent.",
     shortCircuitNote:
-      'No hot leads — the gate never suspended: no approval, no CRM call.',
+      'No hot leads, so the gate never suspended: the run queued no approval and never called the CRM.',
   },
   'product-launch': {
     steps: [
@@ -244,7 +244,7 @@ export const WORKFLOW_GUIDES: Record<string, WorkflowGuide> = {
         tip: GLOSSARY.crossWorkflowIsolation,
       },
     ],
-    note: "The access grant exists only in this run's result — no real system is touched. Cross-workflow isolation on the connector is enforced for real.",
+    note: "The access grant exists only in this run's result; no real system is touched. Cross-workflow isolation on the connector is enforced for real.",
   },
 };
 
@@ -253,4 +253,4 @@ export const WORKFLOW_GUIDES: Record<string, WorkflowGuide> = {
  * clearest teaching moment about what "permission" means here.
  */
 export const DRY_RUN_TRIO_FOOTER =
-  'Dry-run = real path, no permission needed, nothing changes. Simulated = permission granted for real, external call skipped. Declined = permission refused, nothing ran.';
+  'Dry-run runs the real path with no permission and changes nothing. Simulated means the permission was granted for real and the external call was skipped. Declined means the permission was refused and nothing ran.';

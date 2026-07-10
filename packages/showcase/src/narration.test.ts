@@ -440,7 +440,7 @@ describe('resetEvent', () => {
 
     // #then — counts verbatim, toasted, and the budget claim stays truthful
     expect(event.title).toBe(
-      'Sandbox reset — 1 run snapshot and 2 approvals purged',
+      'Sandbox reset: 1 run snapshot and 2 approvals purged',
     );
     expect(event.zone).toBe('d1');
     expect(event.tone).toBe('success');
@@ -472,7 +472,7 @@ describe('resetErrorEvent', () => {
   it('maps 403 to the RBAC lesson naming the admin requirement', () => {
     // #given / #when
     const event = resetErrorEvent(
-      new RunApiError(403, "forbidden — requires admin (you are 'viewer')"),
+      new RunApiError(403, "forbidden: requires admin (you are 'viewer')"),
       'viewer',
     );
 
