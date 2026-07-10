@@ -48,7 +48,25 @@ export function useSnapshotNarration(
       if (!next) continue;
       const before = previous.runResults[run.runId];
       if (next.summary) {
-        events.push(...deriveRunEvents(before?.summary, next.summary, run));
+        // An approval anywhere in this run's history proves a gate suspended
+        // it — the terminal snapshot alone can't (the resume ledger is
+        // dropped at terminal status). A DECIDED approval further proves any
+        // new suspension is a later gate (the wire's fingerprints cover only
+        // current suspensions).
+        const everSuspendedHint =
+          run.approvalId !== undefined ||
+          records.some((record) => record.runId === run.runId);
+        const laterGateHint = records.some(
+          (record) =>
+            record.runId === run.runId &&
+            (record.status === 'approved' || record.status === 'rejected'),
+        );
+        events.push(
+          ...deriveRunEvents(before?.summary, next.summary, run, {
+            everSuspendedHint,
+            laterGateHint,
+          }),
+        );
       }
       if (next.stopped && before?.stopped !== next.stopped) {
         events.push(

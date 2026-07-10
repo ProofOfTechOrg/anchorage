@@ -17,4 +17,9 @@
 body {
   margin: 0;
   min-height: 100vh;
+  /* Astryx applies tokens per component, not to the page — paint the y2k
+     body color (periwinkle/navy) and body font on the canvas ourselves.
+     The tokens resolve because <html> carries data-astryx-theme. */
+  background-color: var(--color-background-body);
+  font-family: var(--font-family-body, sans-serif);
 }

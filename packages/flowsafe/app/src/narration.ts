@@ -188,13 +188,19 @@ function suspendedEvents(
   next: RunSummary,
   run: NarrationRunRef,
   at: number,
+  laterGateHint = false,
 ): NarrationEvent[] {
   const susp = next.status === 'suspended' ? suspensionOf(next) : undefined;
   if (!susp) return [];
-  // A later gate (some earlier leg already resumed) or a re-suspension of the
-  // same step: either way the earlier approval is spent.
+  // A later gate or a re-suspension of the same step: either way the earlier
+  // approval is spent. The wire's resumeCount covers only CURRENTLY-suspended
+  // steps, so a different-step later gate is invisible in the summary alone —
+  // the caller passes laterGateHint when it observed the earlier suspension
+  // (poll diff) or a decided approval for this run (records).
   const again =
-    susp.ordinal > 0 || Object.keys(next.resumeCount ?? {}).length > 0;
+    laterGateHint ||
+    susp.ordinal > 0 ||
+    Object.keys(next.resumeCount ?? {}).length > 0;
   const fingerprint = `suspension ${susp.suspendedAt ?? '?'} · resume #${susp.ordinal}`;
   const connectors = susp.connectors?.join(', ');
   return [
@@ -328,13 +334,20 @@ function terminalEvents(
         toast: false,
       });
     }
+    // A gate-less run labelled 'declined' by its workflow (lead-generation's
+    // all-cold path) was never rejected by anyone — say what actually
+    // happened instead of the rejection copy.
+    const line =
+      !everSuspended && interp.flavor === 'declined'
+        ? 'Completed without reaching its gate — nothing needed approval and no connector ran.'
+        : interp.line;
     events.push({
       key: `done:${run.runId}`,
       at,
       zone: 'do',
       kind: 'run.succeeded',
       title: `Run finished — ${run.title}`,
-      detail: interp.line,
+      detail: line,
       tone: 'success',
       runId: run.runId,
       observed: true,
@@ -360,6 +373,23 @@ function terminalEvents(
 
 // ---- snapshot derivers -------------------------------------------------------
 
+export interface DeriveRunOptions {
+  /**
+   * The caller knows a gate DID suspend this run (an approval exists for it).
+   * Needed because the runtime's resume ledger — the resumeCount source — is
+   * dropped at terminal status, so a running→success flip can look
+   * gate-less even when a gate was approved between polls.
+   */
+  everSuspendedHint?: boolean;
+  /**
+   * The caller knows an earlier gate of this run was already DECIDED, so any
+   * new suspension is a later gate whose approval must be fresh. Needed for
+   * the running→suspended two-poll path, where neither summary shows the
+   * spent gate (the wire's fingerprints cover only current suspensions).
+   */
+  laterGateHint?: boolean;
+}
+
 /**
  * Diff two polled summaries of one run into events. `prev === undefined`
  * yields [] — a run's first appearance is narrated by startEvent (the start
@@ -369,6 +399,7 @@ export function deriveRunEvents(
   prev: RunSummary | undefined,
   next: RunSummary,
   run: NarrationRunRef,
+  options: DeriveRunOptions = {},
 ): NarrationEvent[] {
   if (!prev) return [];
   const at = Date.now();
@@ -403,7 +434,14 @@ export function deriveRunEvents(
       prevSusp.step !== nextSusp.step ||
       prevSusp.ordinal !== nextSusp.ordinal)
   ) {
-    events.push(...suspendedEvents(next, run, at));
+    // A previously-observed different suspension is direct proof of a later
+    // gate; otherwise trust the caller's decided-approval hint.
+    const laterGate =
+      (prevSusp !== undefined &&
+        (prevSusp.step !== nextSusp.step ||
+          nextSusp.ordinal > prevSusp.ordinal)) ||
+      options.laterGateHint === true;
+    events.push(...suspendedEvents(next, run, at, laterGate));
   }
 
   if (
@@ -411,6 +449,7 @@ export function deriveRunEvents(
     TERMINAL_STATUSES.has(next.status)
   ) {
     const everSuspended =
+      options.everSuspendedHint === true ||
       prevSusp !== undefined ||
       Object.keys(next.resumeCount ?? {}).length > 0 ||
       Object.keys(next.suspendedAt ?? {}).length > 0;

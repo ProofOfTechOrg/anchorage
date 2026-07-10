@@ -161,19 +161,30 @@ function RunCard({
   const status = pollError ? UNAVAILABLE : (summary?.status ?? 'pending');
   const susp = status === 'suspended' ? suspensionOf(summary) : undefined;
   const guide = WORKFLOW_GUIDES[run.workflowId];
-  const interp =
+  const rawInterp =
     summary?.result !== undefined
       ? interpretRunResult(summary.result)
       : undefined;
-  const badge = interp ? flavorBadge(interp) : undefined;
   const totalResumes = Object.values(summary?.resumeCount ?? {}).reduce(
     (sum, count) => sum + count,
     0,
   );
+  // An approval anywhere in this run's history proves a gate suspended it —
+  // the terminal snapshot alone can't (the resume ledger drops at terminal).
   const neverSuspended =
     status === 'success' &&
     totalResumes === 0 &&
-    Object.keys(summary?.suspendedAt ?? {}).length === 0;
+    Object.keys(summary?.suspendedAt ?? {}).length === 0 &&
+    run.approvalId === undefined &&
+    !records.some((record) => record.runId === run.runId);
+  // A gate-less run labelled 'declined' by its workflow (lead-generation's
+  // all-cold path) was never rejected by anyone — drop the DECLINED badge and
+  // let the short-circuit note tell the real story.
+  const interp =
+    rawInterp && neverSuspended && rawInterp.flavor === 'declined'
+      ? { ...rawInterp, flavor: 'plain' as const, line: undefined }
+      : rawInterp;
+  const badge = interp ? flavorBadge(interp) : undefined;
   // Prefer the OPEN record for this run (gate 2's approval is a different
   // record than the one the start response carried).
   const openApprovalId =

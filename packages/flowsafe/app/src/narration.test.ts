@@ -129,6 +129,21 @@ describe('deriveRunEvents', () => {
     expect(gate2?.title).toContain('Second gate');
   });
 
+  it('titles a later gate reached across two polls via the decided-approval hint', () => {
+    // running→suspended(confirmRollout): neither summary shows the spent
+    // gate (the wire's fingerprints cover only current suspensions), so the
+    // caller's records-derived hint is the only later-gate signal.
+    const events = deriveRunEvents(
+      summary(),
+      suspendedAt('confirmRollout'),
+      RUN,
+      { laterGateHint: true },
+    );
+    const gate2 = events.find((e) => e.kind === 'run.suspended');
+    expect(gate2?.title).toContain('Second gate');
+    expect(gate2?.detail).toContain('its own decision');
+  });
+
   it('keys a re-suspension of the SAME step by its bumped ordinal', () => {
     const prev = suspendedAt('approveLaunch');
     const next = suspendedAt('approveLaunch', {
@@ -180,6 +195,35 @@ describe('deriveRunEvents', () => {
       RUN,
     );
     expect(events.some((e) => e.kind === 'run.no-gate')).toBe(true);
+  });
+
+  it("never claims a rejection for a short-circuited run the workflow labels 'declined'", () => {
+    // lead-generation's all-cold result is {assigned: 0, outcome: 'declined'}
+    // — nobody rejected anything; the gate never ran.
+    const events = deriveRunEvents(
+      summary(),
+      summary({
+        status: 'success',
+        result: { assigned: 0, outcome: 'declined' },
+      }),
+      RUN,
+    );
+    const done = events.find((e) => e.kind === 'run.succeeded');
+    expect(done?.detail).not.toContain('rejection');
+    expect(done?.detail).toContain('without reaching its gate');
+    expect(events.some((e) => e.kind === 'run.no-gate')).toBe(true);
+  });
+
+  it('suppresses the short-circuit line when an approval proves a gate ran', () => {
+    // running→success with the resume ledger already dropped at terminal —
+    // only the hint (an approval exists for this run) knows a gate suspended.
+    const events = deriveRunEvents(
+      summary(),
+      summary({ status: 'success', result: { outcome: 'simulated' } }),
+      RUN,
+      { everSuspendedHint: true },
+    );
+    expect(events.some((e) => e.kind === 'run.no-gate')).toBe(false);
   });
 
   it('narrates a failed run with a sticky toast', () => {
