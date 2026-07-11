@@ -1,8 +1,8 @@
 # packages/
 
 Implementation packages — everything shippable lives here. Two libraries and
-one product: `breakwater` + `flowsafe` are the publishable safety layer
-(un-private, changesets-versioned; the release workflow publishes them to npm
+one product: `breakwater` + `flowsafe` are the published safety layer
+(on npm at 0.1.0, changesets-versioned; the release workflow publishes them to npm
 from `main` — breakwater first, flowsafe's `./host-kit/module` types reference
 it as an optional peer); `showcase` is the private demo app built on them and
 never publishes.

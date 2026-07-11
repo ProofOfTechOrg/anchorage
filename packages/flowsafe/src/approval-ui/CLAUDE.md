@@ -35,6 +35,8 @@ only in the UI pass.
 | `tsconfig.json` | The UI compilation pass: `jsx: react-jsx`, DOM lib, `types: []` | Debugging UI typecheck/build |
 | `tsconfig.test.json` | The UI **test** pass: same settings, `exclude: []` + `noEmit` — owns JSX-importing tests the workers-typed package test pass must exclude | Adding a test that imports a `.tsx` module |
 | `client.test.ts` | Wire-format and error-mapping tests (plain node) | Adding client tests |
+| `client-router.pipeline.test.ts` | Full-pipeline D3 proof (plain node): `ApprovalApiClient` → router → service → store — a bare reviewer-ordered `list()` past the cap stays bounded yet still surfaces the freshest critical at the top | Adding cross-layer approval-flow tests |
+| `use-approval-dashboard.test.ts` | DOM-free hook tests: `DEFAULT_QUEUE_FILTER` contract, poll wiring (`fetchDashboardSnapshot`), and `orderRecordsForDisplay` (reviewer-only re-sort) — no renderer | Adding hook data/filter tests |
 | `use-approval-dashboard.render.test.ts` | The ONE renderer-backed suite (raw `createRoot` + `act` on happy-dom via a per-file `@vitest-environment` docblock): mounts the hook and pins the P1 filter-identity fix — inline value-equal options refetch once, value/client changes refetch immediately; fails against the pre-fix hook. Excluded from the workers-typed package test pass (react-dom/client needs DOM types); the UI test tsconfig owns it | Changing the hook's dependency wiring, or weighing another render test against the no-jsdom stance |
 | `view-model.test.ts` | SLA states, sorting, formatting tests (plain node) | Adding view-model tests |
 | `tips.test.ts` | `APPROVAL_TIPS` completeness (every status/metric/concept key non-empty) | Changing tips |

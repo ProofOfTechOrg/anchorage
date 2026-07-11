@@ -44,6 +44,7 @@ import {
   networkEgress,
 } from '../policy-engine/tool-policy.js';
 import { actorFromRequestContext } from '../rbac/index.js';
+import { newToken } from './new-token.js';
 
 /** Permission manifest — what the connector declares about itself. */
 export interface PermissionManifest {
@@ -91,22 +92,36 @@ export interface IdempotencyStore {
   get(
     key: string,
   ): IdempotencyRecord | undefined | Promise<IdempotencyRecord | undefined>;
-  put(key: string, record: IdempotencyRecord): void | Promise<void>;
+  /**
+   * Finalize a key's record. `token` is the lease returned by an atomic
+   * reserve(): when supplied, the store finalizes ONLY if the key still
+   * belongs to that lease (audit D2 CAS) — a stale, taken-over holder's put
+   * is a no-op. Omitted on the legacy get/put path, which upserts
+   * unconditionally (same-isolate protection only).
+   */
+  put(
+    key: string,
+    record: IdempotencyRecord,
+    token?: string,
+  ): void | Promise<void>;
 }
 
 /**
  * Outcome of an atomic reserve():
- * - 'reserved' — this caller claimed the key: execute, then put();
- *   release() after a failed execute so the key stays retryable. `tookOver`
- *   is set when the claim came from a stale-pending takeover rather than a
- *   fresh key (D1IdempotencyStore's pendingTtlMs) — worth a dedicated audit
- *   signal, since a takeover fired too early means the previous holder may
- *   still be executing (audit D2).
+ * - 'reserved' — this caller claimed the key: execute, then put(token);
+ *   release(token) after a failed execute so the key stays retryable. The
+ *   opaque `token` is the reservation lease — put()/release() compare-and-set
+ *   on it, so a holder whose reservation was taken over as stale (audit D2)
+ *   can no longer finalize or delete the new holder's claim. `tookOver` is
+ *   set when the claim came from a stale-pending takeover rather than a fresh
+ *   key (D1IdempotencyStore's pendingTtlMs) — worth a dedicated audit signal,
+ *   since a takeover fired too early means the previous holder may still be
+ *   executing (audit D2).
  * - 'replay'   — a completed execution's record: return it, do not execute.
  * - 'pending'  — another isolate is executing this key right now.
  */
 export type IdempotencyReservation =
-  | { state: 'reserved'; tookOver?: boolean }
+  | { state: 'reserved'; token: string; tookOver?: boolean }
   | { state: 'replay'; record: IdempotencyRecord }
   | { state: 'pending' };
 
@@ -120,8 +135,13 @@ export interface AtomicIdempotencyStore extends IdempotencyStore {
   reserve(
     key: string,
   ): IdempotencyReservation | Promise<IdempotencyReservation>;
-  /** Drop a pending reservation after a failed execute — failures stay retryable. */
-  release(key: string): void | Promise<void>;
+  /**
+   * Drop a pending reservation after a failed execute — failures stay
+   * retryable. `token` is the lease from reserve(): when supplied, only the
+   * matching lease's pending row is dropped (audit D2 CAS), so a stale,
+   * taken-over holder cannot delete the new holder's claim.
+   */
+  release(key: string, token?: string): void | Promise<void>;
 }
 
 function isAtomicStore(
@@ -165,8 +185,9 @@ type KeyedOutcome<T> =
 export class InMemoryIdempotencyStore implements AtomicIdempotencyStore {
   readonly #maxEntries: number;
   #entries = new Map<string, IdempotencyRecord>();
-  // Reservations live outside the LRU: a pending key is never evictable.
-  #pending = new Set<string>();
+  // Reservations live outside the LRU: a pending key is never evictable. Value
+  // is the reservation lease token so release()/put() can CAS on ownership.
+  #pending = new Map<string, string>();
 
   constructor(options: { maxEntries?: number } = {}) {
     this.#maxEntries = options.maxEntries ?? 1000;
@@ -180,15 +201,25 @@ export class InMemoryIdempotencyStore implements AtomicIdempotencyStore {
     const record = this.#entries.get(key);
     if (record) return { state: 'replay', record };
     if (this.#pending.has(key)) return { state: 'pending' };
-    this.#pending.add(key);
-    return { state: 'reserved' };
+    const token = newToken();
+    this.#pending.set(key, token);
+    return { state: 'reserved', token };
   }
 
-  release(key: string): void {
-    this.#pending.delete(key);
+  release(key: string, token?: string): void {
+    // CAS on the lease: a token-less caller (legacy) drops any pending row; a
+    // token-bearing caller drops only its own, so a taken-over stale holder
+    // never deletes the current holder's claim (audit D2).
+    if (token === undefined || this.#pending.get(key) === token) {
+      this.#pending.delete(key);
+    }
   }
 
-  put(key: string, record: IdempotencyRecord): void {
+  put(key: string, record: IdempotencyRecord, token?: string): void {
+    // Lost the lease (taken over as stale) — do NOT overwrite the new holder's
+    // in-flight claim or its record (audit D2). Token-less puts (legacy path)
+    // finalize unconditionally.
+    if (token !== undefined && this.#pending.get(key) !== token) return;
     this.#pending.delete(key);
     // Delete-before-set refreshes insertion order, so eviction drops the
     // least recently written key (Map iterates in insertion order).
@@ -836,6 +867,11 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
               detail: { idempotencyKey: key, tookOver: true },
             });
           }
+          // The reservation lease — put()/release() CAS on it so this holder
+          // can only finalize or drop the row it still owns (audit D2).
+          // Captured as a const OUTSIDE the attempt closure: narrowing on the
+          // `let reservation` does not persist into the closure body.
+          const { token } = reservation;
           // Reserved: consume the rate budget, execute, then put()
           // finalizes the record. Any throw before put releases the
           // reservation — failures are never cached, the key stays
@@ -854,7 +890,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
               await consumeRateLimit(requestContext);
               const result = await config.execute(typedInput, context);
               try {
-                await store.put(scoped, { result });
+                await store.put(scoped, { result }, token);
               } catch (error) {
                 // The side effect already succeeded; failing the call now
                 // would invite a retry that re-executes it — the exact
@@ -868,7 +904,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
               return result;
             } catch (error) {
               try {
-                await store.release(scoped);
+                await store.release(scoped, token);
               } catch (releaseError) {
                 // Best effort: an unreleased reservation is recovered by the
                 // store's stale-pending takeover.

@@ -16,6 +16,7 @@ import {
   approvalFilterKey,
   DEFAULT_QUEUE_FILTER,
   fetchDashboardSnapshot,
+  orderRecordsForDisplay,
 } from './use-approval-dashboard.js';
 
 const METRICS: ApprovalMetrics = {
@@ -65,6 +66,81 @@ function fakeClient(records: ApprovalRecord[] = []): {
     },
   };
 }
+
+describe('orderRecordsForDisplay', () => {
+  it('re-sorts into reviewer order when the filter asks for reviewer order', () => {
+    // #given — the server returned a normal ahead of a critical (out of order)
+    const normal = makeRecord({ id: 'apr-normal', priority: 'normal' });
+    const critical = makeRecord({ id: 'apr-critical', priority: 'critical' });
+
+    // #then — byReviewerOrder surfaces the critical first
+    expect(
+      orderRecordsForDisplay([normal, critical], { orderBy: 'reviewer' }).map(
+        (record) => record.id,
+      ),
+    ).toEqual(['apr-critical', 'apr-normal']);
+  });
+
+  it('preserves server order for a created/FIFO filter (no client re-sort)', () => {
+    // #given — a FIFO page where a higher-priority record legitimately sits later
+    const older = makeRecord({
+      id: 'apr-older',
+      priority: 'normal',
+      createdAt: '2026-07-06T12:00:00.000Z',
+    });
+    const newerCritical = makeRecord({
+      id: 'apr-newer',
+      priority: 'critical',
+      createdAt: '2026-07-06T13:00:00.000Z',
+    });
+
+    // #then — server FIFO order preserved verbatim (the critical stays second)
+    expect(
+      orderRecordsForDisplay([older, newerCritical], {
+        orderBy: 'created',
+      }).map((record) => record.id),
+    ).toEqual(['apr-older', 'apr-newer']);
+  });
+
+  it('preserves server order when orderBy is omitted (defaults to FIFO)', () => {
+    // #given
+    const older = makeRecord({
+      id: 'apr-older',
+      priority: 'normal',
+      createdAt: '2026-07-06T12:00:00.000Z',
+    });
+    const newerCritical = makeRecord({
+      id: 'apr-newer',
+      priority: 'critical',
+      createdAt: '2026-07-06T13:00:00.000Z',
+    });
+
+    // #then — no orderBy => server FIFO, not reshuffled into reviewer order
+    expect(
+      orderRecordsForDisplay([older, newerCritical], {}).map(
+        (record) => record.id,
+      ),
+    ).toEqual(['apr-older', 'apr-newer']);
+  });
+
+  it('does not throw on the reviewer+after combination (unlike approvalListOrder) and still re-sorts', () => {
+    // #given — reviewer order WITH an after cursor: approvalListOrder rejects
+    // this combination (the server 400s it), but orderRecordsForDisplay runs
+    // in the render path where a throw would crash the dashboard, so it must
+    // resolve the order WITHOUT that guard. Pins that a future refactor cannot
+    // reintroduce the throw by delegating to approvalListOrder.
+    const normal = makeRecord({ id: 'apr-normal', priority: 'normal' });
+    const critical = makeRecord({ id: 'apr-critical', priority: 'critical' });
+
+    // #then — no throw, and reviewer order still applied
+    expect(
+      orderRecordsForDisplay([normal, critical], {
+        orderBy: 'reviewer',
+        after: 'some-cursor',
+      }).map((record) => record.id),
+    ).toEqual(['apr-critical', 'apr-normal']);
+  });
+});
 
 describe('DEFAULT_QUEUE_FILTER', () => {
   it('scopes the queue to open statuses, bounded at 100 in REVIEWER order', () => {

@@ -4,8 +4,9 @@ name: Release
 # - pending changesets -> opens/updates the "Version Packages" PR (bumps +
 #   CHANGELOG entries); merging that PR re-runs this workflow;
 # - no pending changesets -> `changeset publish` publishes any public package
-#   whose version is not yet on npm (this is also how the FIRST 0.1.0 publish
-#   of breakwater + flowsafe happens), creates git tags, and pushes them.
+#   whose version is not yet on npm (this is how the first 0.1.0 publish of
+#   breakwater + flowsafe landed on 2026-07-11, and how future unpublished
+#   versions publish), creates git tags, and pushes them.
 #
 # Requires the NPM_TOKEN repo secret (an npm automation token with publish
 # rights on the @proofoftech scope). Without it the publish step fails loudly

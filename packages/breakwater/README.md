@@ -32,7 +32,13 @@ Implemented and tested. `PolicyEngine` and `RBACMiddleware` are real Mastra
 write to; the policy engine gates output per channel (answer / reasoning /
 object) with opt-in zero-leak hold-back buffering, and ships network-egress,
 retention, cross-workflow-isolation, and cross-tenant-isolation tool-boundary
-policies.
+policies. The `object` channel is enforced on the streaming path
+(`agent.stream()`) only under @mastra/core 1.50.0 — a non-streaming
+`generate()` exposes no parsed object to gate (structured output carried as
+answer text is still caught by any policy whose channels include `answer`) — so
+a policy scoped to `object` without `answer` requires an audit sink at
+construction; `PolicyEngine` rejects that configuration without one rather than
+silently no-op.
 
 `createConnector()` wraps Mastra `createTool()` with an enforced permission
 manifest — network-egress allowlisting, write-approval gating (a

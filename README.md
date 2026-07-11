@@ -38,7 +38,8 @@ execution — as Mastra middleware.
 | **flowsafe** | Approval UX + durable execution — approval API/dashboard, Cloudflare DO workflow runner | `@proofoftech/flowsafe` |
 | **showcase** | Runnable demo — five workflows, one React frontend, one Cloudflare deploy | `showcase` (private) |
 
-Source-only today — clone and build (see [Quick Start](#quick-start)); not yet published to npm.
+Published on npm: `npm i @proofoftech/breakwater @proofoftech/flowsafe`. `showcase`
+is private — clone and build to run the demo (see [Quick Start](#quick-start)).
 Targets Node >= 22, ESM only (TypeScript `moduleResolution` `node16`/`nodenext`/`bundler`), `@mastra/core` ^1.50.0.
 
 ### breakwater — safety layer

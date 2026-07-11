@@ -1016,6 +1016,13 @@ describe('atomic idempotency (reserve path)', () => {
     expect(store.put).toHaveBeenCalledTimes(1);
     expect(store.get).not.toHaveBeenCalled();
     expect(execute).toHaveBeenCalledTimes(1);
+    // the lease minted by reserve() is exactly the token handed to put() (D2)
+    const reservation = store.reserve.mock.results[0]?.value as
+      | IdempotencyReservation
+      | undefined;
+    expect(store.put.mock.calls[0]?.[2]).toBe(
+      reservation?.state === 'reserved' ? reservation.token : undefined,
+    );
   });
 
   it('denies honestly when another isolate holds the key', async () => {
@@ -1092,7 +1099,10 @@ describe('atomic idempotency (reserve path)', () => {
     await expect(
       run(tool, input, makeContext({ idempotencyKey: 'k1' })),
     ).rejects.toThrow('salesforce 500');
-    expect(store.release).toHaveBeenCalledWith('salesforce.createContact:k1');
+    expect(store.release).toHaveBeenCalledWith(
+      'salesforce.createContact:k1',
+      expect.any(String),
+    );
     expect(
       await run(tool, input, makeContext({ idempotencyKey: 'k1' })),
     ).toEqual({ ok: true });
@@ -1124,7 +1134,10 @@ describe('atomic idempotency (reserve path)', () => {
     ).catch((error: unknown) => error);
     // #then — the denial released k2: no budget consumed, key retryable
     expect((failure as ConnectorPolicyError).policy).toBe('rate-limit');
-    expect(store.release).toHaveBeenCalledWith('salesforce.createContact:k2');
+    expect(store.release).toHaveBeenCalledWith(
+      'salesforce.createContact:k2',
+      expect.any(String),
+    );
     expect(execute).toHaveBeenCalledTimes(1);
     // #then — exactly two records: k1 allowed, k2 denied once — never a
     // second, false 'execute threw' record for the denial that propagated
@@ -1210,7 +1223,10 @@ describe('atomic idempotency (reserve path)', () => {
       run(tool, input, makeContext({ idempotencyKey: 'k1' })),
     ).rejects.toThrow('counter backend down');
     expect(execute).not.toHaveBeenCalled();
-    expect(store.release).toHaveBeenCalledWith('salesforce.createContact:k1');
+    expect(store.release).toHaveBeenCalledWith(
+      'salesforce.createContact:k1',
+      expect.any(String),
+    );
     // #then — exactly ONE audit record, attributed to the rate-limit store;
     // never a second, false 'execute threw' record
     expect(audit.events()).toEqual([
@@ -1267,7 +1283,7 @@ describe('atomic idempotency (reserve path)', () => {
     const store: AtomicIdempotencyStore = {
       get: () => undefined,
       put: () => {},
-      reserve: () => ({ state: 'reserved', tookOver: true }),
+      reserve: () => ({ state: 'reserved', token: 'tok', tookOver: true }),
       release: () => {},
     };
     const { tool, execute } = makeConnector({
@@ -1331,7 +1347,7 @@ describe('atomic idempotency (reserve path)', () => {
     // #then — the twin joined the leader's placeholder instead of probing
     // the store (where it would have read 'pending' and been denied)
     expect(store.reserve).toHaveBeenCalledTimes(1);
-    settleReserve().resolve({ state: 'reserved' });
+    settleReserve().resolve({ state: 'reserved', token: 'tok' });
     expect(await calls).toEqual([{ ok: true }, { ok: true }]);
     expect(execute).toHaveBeenCalledTimes(1);
   });
@@ -1763,7 +1779,10 @@ describe('InMemoryIdempotencyStore', () => {
     // #given
     const store = new InMemoryIdempotencyStore();
     // #when / #then
-    expect(store.reserve('k1')).toEqual({ state: 'reserved' });
+    expect(store.reserve('k1')).toEqual({
+      state: 'reserved',
+      token: expect.any(String),
+    });
     expect(store.reserve('k1')).toEqual({ state: 'pending' });
     store.put('k1', { result: 1 });
     expect(store.reserve('k1')).toEqual({
@@ -1778,11 +1797,39 @@ describe('InMemoryIdempotencyStore', () => {
   it('release() makes a failed key reservable again', () => {
     // #given
     const store = new InMemoryIdempotencyStore();
-    expect(store.reserve('k1')).toEqual({ state: 'reserved' });
+    expect(store.reserve('k1')).toEqual({
+      state: 'reserved',
+      token: expect.any(String),
+    });
     // #when
     store.release('k1');
     // #then
-    expect(store.reserve('k1')).toEqual({ state: 'reserved' });
+    expect(store.reserve('k1')).toEqual({
+      state: 'reserved',
+      token: expect.any(String),
+    });
+  });
+
+  it('binds release/put to the reservation token — a stale token cannot delete or finalize a live reservation (audit D2)', () => {
+    // #given — a live reservation holding its lease token
+    const store = new InMemoryIdempotencyStore();
+    const reservation = store.reserve('k1');
+    if (reservation.state !== 'reserved') {
+      throw new Error('expected a reservation');
+    }
+
+    // #when / #then — a stale/foreign token neither releases nor finalizes...
+    store.release('k1', 'stale-token');
+    expect(store.reserve('k1')).toEqual({ state: 'pending' });
+    store.put('k1', { result: 'stale' }, 'stale-token');
+    expect(store.reserve('k1')).toEqual({ state: 'pending' });
+
+    // ...but the owner's own lease finalizes, and the key then replays
+    store.put('k1', { result: 'owner' }, reservation.token);
+    expect(store.reserve('k1')).toEqual({
+      state: 'replay',
+      record: { result: 'owner' },
+    });
   });
 });
 

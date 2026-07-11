@@ -7,7 +7,7 @@
 | File | What | When to read |
 | ---- | ---- | ------------ |
 | `README.md` | Package purpose, subpackage roles, status, DO-runner usage example | Understanding flowsafe's design and wiring a workflow into a Durable Object |
-| `CHANGELOG.md` | Release notes (0.1.0 unreleased; breakwater is an optional peer consumed only by `./host-kit/module`) | Cutting a release |
+| `CHANGELOG.md` | Release notes (0.1.0 released 2026-07-11; breakwater is an optional peer consumed only by `./host-kit/module`) | Cutting a release |
 | `LICENSE` | Apache-2.0 copy shipped in the npm tarball (packing ignores the repo-root LICENSE) | Never edit separately — keep identical to the root LICENSE |
 | `package.json` | Manifest, subpath exports (`./approval-api`, `./approval-ui`, `./artifacts`, `./audit-export`, `./do-runner`, `./host-kit`), scripts (`spike`/`spike:verify`, `deploy:cf`/`deploy:dev`; build/typecheck run the extra approval-ui passes incl. the UI TEST pass `src/approval-ui/tsconfig.test.json`, plus `spike/` + `deploy/` tsc passes). Sole runtime dep is `@mastra/cloudflare-d1`. Optional react peers (React 18+); breakwater devDep (tests only); happy-dom devDep (the one renderer-backed hook regression test only). The Astryx-styled demo app lives in the separate `showcase` package — published consumers pull zero Astryx | Adding a subpath export, changing scripts, bumping deps |
 | `tsconfig.json` | Build TS config (emits `dist/`; excludes the approval-ui JSX set, which compiles in its own pass) | Changing build output or compiler options |

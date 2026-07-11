@@ -29,6 +29,7 @@ import {
   type ApprovalStatus,
   approvalListOrder,
   clampApprovalLimit,
+  MAX_APPROVAL_LIST_LIMIT,
   OPEN_STATUSES,
   parseApprovalCursor,
   TERMINAL_APPROVAL_STATUSES,
@@ -487,14 +488,15 @@ export class D1ApprovalStore implements ApprovalStore {
     const where: string[] = ['tenant_id = ?'];
     const values: unknown[] = [this.tenantId];
     appendListFilters(filter, where, values);
-    const limit = clampApprovalLimit(filter.limit);
+    // D3: default a tenant-bound bare list() to the max, so a repeated poll can
+    // never fall back to an unbounded SELECT — always bounded now, unlike the
+    // cron-only d1SystemApprovalStore.list below, which stays complete.
+    const limit = clampApprovalLimit(filter.limit) ?? MAX_APPROVAL_LIST_LIMIT;
     const { results } = await this.#db
       .prepare(
-        `SELECT * FROM ${TABLE} WHERE ${where.join(' AND ')} ${listOrderBy(filter)}${
-          limit !== undefined ? ' LIMIT ?' : ''
-        }`,
+        `SELECT * FROM ${TABLE} WHERE ${where.join(' AND ')} ${listOrderBy(filter)} LIMIT ?`,
       )
-      .bind(...values, ...(limit !== undefined ? [limit] : []))
+      .bind(...values, limit)
       .all<ApprovalRow>();
     return results.map(rowToRecord);
   }

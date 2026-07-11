@@ -68,6 +68,25 @@ export async function fetchDashboardSnapshot(
   return { records, metrics };
 }
 
+/**
+ * Queue display order: re-sort into reviewer order ONLY when the filter asked
+ * for it; otherwise return the server's order untouched, so a 'created'/FIFO
+ * or `after`-paged filter is never client-resorted against the server's paging
+ * (a page-2 FIFO slice re-sorted into reviewer order would interleave with
+ * page 1). Resolves orderBy like approvalListOrder but WITHOUT its
+ * reviewer+after throw — this runs in the hook's render path, where a throw
+ * would crash the dashboard (the fetch already surfaces that incoherent combo
+ * as an error). Pulled out (like fetchDashboardSnapshot) for DOM-free testing.
+ */
+export function orderRecordsForDisplay(
+  records: readonly ApprovalRecord[],
+  filter: ApprovalListFilter,
+): ApprovalRecord[] {
+  return (filter.orderBy ?? 'created') === 'reviewer'
+    ? sortQueue(records)
+    : [...records];
+}
+
 export interface UseApprovalDashboardOptions {
   /** Queue/metrics refresh cadence; <= 0 disables polling. Default 10s. */
   pollIntervalMs?: number;
@@ -82,7 +101,11 @@ export interface UseApprovalDashboardOptions {
 }
 
 export interface ApprovalDashboardState {
-  /** Queue in reviewer order (priority → deadline → FIFO). */
+  /**
+   * Queue records. In reviewer order (priority → deadline → FIFO) when the
+   * filter requests it (the default) — otherwise the server's order, so a
+   * FIFO/`after`-paged filter is not client-resorted. See orderRecordsForDisplay.
+   */
   records: ApprovalRecord[];
   metrics: ApprovalMetrics | null;
   /** Derived from the fetched list — never stale after a refresh. */
@@ -205,9 +228,11 @@ export function useApprovalDashboard(
   );
 
   return {
-    // Idempotent under DEFAULT_QUEUE_FILTER (the server already returns
-    // reviewer order); load-bearing for caller filters without orderBy.
-    records: sortQueue(records),
+    // Reviewer order only when the filter requested it (DEFAULT_QUEUE_FILTER
+    // does, so this is idempotent there — the server already returns reviewer
+    // order); a FIFO / `after`-paged filter is returned in the server's order,
+    // never client-resorted against its own paging. See orderRecordsForDisplay.
+    records: orderRecordsForDisplay(records, stableFilter),
     metrics,
     selected,
     selectedId,

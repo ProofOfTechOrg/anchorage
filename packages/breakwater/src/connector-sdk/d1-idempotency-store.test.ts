@@ -69,7 +69,7 @@ describe('D1IdempotencyStore', () => {
     const second = await store.reserve('conn:k1');
 
     // #then
-    expect(first).toEqual({ state: 'reserved' });
+    expect(first).toEqual({ state: 'reserved', token: expect.any(String) });
     expect(second).toEqual({
       state: 'replay',
       record: { result: { ok: true, n: 42 } },
@@ -105,13 +105,19 @@ describe('D1IdempotencyStore', () => {
     const store = new D1IdempotencyStore(d1Like(openSqlite()), {
       now: () => T0,
     });
-    expect(await store.reserve('conn:k1')).toEqual({ state: 'reserved' });
+    expect(await store.reserve('conn:k1')).toEqual({
+      state: 'reserved',
+      token: expect.any(String),
+    });
 
     // #when
     await store.release('conn:k1');
 
     // #then — the retry claims it fresh (failures are never cached)
-    expect(await store.reserve('conn:k1')).toEqual({ state: 'reserved' });
+    expect(await store.reserve('conn:k1')).toEqual({
+      state: 'reserved',
+      token: expect.any(String),
+    });
   });
 
   it('release() never deletes a done record', async () => {
@@ -136,7 +142,10 @@ describe('D1IdempotencyStore', () => {
     const clock = () => now;
     const a = new D1IdempotencyStore(db, { now: clock, pendingTtlMs: 60_000 });
     const b = new D1IdempotencyStore(db, { now: clock, pendingTtlMs: 60_000 });
-    expect(await a.reserve('conn:k1')).toEqual({ state: 'reserved' });
+    expect(await a.reserve('conn:k1')).toEqual({
+      state: 'reserved',
+      token: expect.any(String),
+    });
 
     // #when — before the TTL the key is honestly pending...
     now = T0 + 59_000;
@@ -148,7 +157,11 @@ describe('D1IdempotencyStore', () => {
     // #then — the takeover is flagged distinctly from a fresh claim (audit
     // D2 — the wrapper uses this to emit a dedicated audit event), and the
     // takeover refreshed the row: a third claim is pending
-    expect(takeover).toEqual({ state: 'reserved', tookOver: true });
+    expect(takeover).toEqual({
+      state: 'reserved',
+      token: expect.any(String),
+      tookOver: true,
+    });
     expect(await a.reserve('conn:k1')).toEqual({ state: 'pending' });
   });
 
@@ -162,7 +175,10 @@ describe('D1IdempotencyStore', () => {
     const a = new D1IdempotencyStore(db, { now: clock });
     const b = new D1IdempotencyStore(db, { now: clock });
     expect(a.pendingTtlMs).toBe(900_000);
-    expect(await a.reserve('conn:k1')).toEqual({ state: 'reserved' });
+    expect(await a.reserve('conn:k1')).toEqual({
+      state: 'reserved',
+      token: expect.any(String),
+    });
 
     // #when — a's execute is still running 600s later, and a retrying
     // caller b probes the same key
@@ -204,7 +220,10 @@ describe('D1IdempotencyStore', () => {
     await expect(store.put('conn:k1', { result: circular })).rejects.toThrow();
     expect(await store.reserve('conn:k1')).toEqual({ state: 'pending' });
     await store.release('conn:k1');
-    expect(await store.reserve('conn:k1')).toEqual({ state: 'reserved' });
+    expect(await store.reserve('conn:k1')).toEqual({
+      state: 'reserved',
+      token: expect.any(String),
+    });
   });
 
   it('respects a custom table name', async () => {
@@ -220,9 +239,80 @@ describe('D1IdempotencyStore', () => {
     });
 
     // #when — the same key reserves independently per table
-    expect(await a.reserve('conn:k1')).toEqual({ state: 'reserved' });
+    expect(await a.reserve('conn:k1')).toEqual({
+      state: 'reserved',
+      token: expect.any(String),
+    });
 
     // #then
-    expect(await b.reserve('conn:k1')).toEqual({ state: 'reserved' });
+    expect(await b.reserve('conn:k1')).toEqual({
+      state: 'reserved',
+      token: expect.any(String),
+    });
+  });
+
+  it('binds finalize/release to the reservation lease — a taken-over holder cannot delete or finalize the winner (audit D2)', async () => {
+    // #given — A reserves; the clock advances past the TTL; B takes over with a
+    // rotated lease
+    const db = d1Like(openSqlite());
+    let now = T0;
+    const clock = () => now;
+    const a = new D1IdempotencyStore(db, { now: clock, pendingTtlMs: 60_000 });
+    const b = new D1IdempotencyStore(db, { now: clock, pendingTtlMs: 60_000 });
+    const ra = await a.reserve('conn:k1');
+    now = T0 + 61_000;
+    const rb = await b.reserve('conn:k1');
+    if (ra.state !== 'reserved' || rb.state !== 'reserved') {
+      throw new Error('expected both reservations to be reserved');
+    }
+    expect(rb).toEqual({
+      state: 'reserved',
+      token: expect.any(String),
+      tookOver: true,
+    });
+    expect(rb.token).not.toBe(ra.token); // leases are distinct
+
+    // #when — the stale holder A tries to release then finalize under its OLD lease
+    await a.release('conn:k1', ra.token);
+    await a.put('conn:k1', { result: 'A-stale' }, ra.token);
+
+    // #then — A neither finalized its own result nor (proven below) deleted B's
+    // pending row: the key is still open
+    expect(await a.get('conn:k1')).toBeUndefined();
+
+    // ...and B, the real owner, still finalizes — which only works if its
+    // pending row survived A's release AND A's put never clobbered it
+    await b.put('conn:k1', { result: 'B-wins' }, rb.token);
+    expect(await a.get('conn:k1')).toEqual({ result: 'B-wins' });
+  });
+
+  it('backfills the token column on a pre-token table (schema migration, audit D2)', async () => {
+    // #given — a table created by a pre-D2 release: the 5-column schema with NO
+    // `token`. CREATE TABLE IF NOT EXISTS is a no-op against it, so only the
+    // guarded ALTER can add the column.
+    const raw = openSqlite();
+    raw
+      .prepare(
+        `CREATE TABLE breakwater_idempotency (
+          key TEXT PRIMARY KEY,
+          state TEXT NOT NULL,
+          result TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )`,
+      )
+      .run();
+    const store = new D1IdempotencyStore(d1Like(raw), { now: () => T0 });
+
+    // #when / #then — the guarded ALTER adds `token`, so the owner-scoped CAS
+    // path works on the upgraded table: reserve → put(token) → replay
+    const reservation = await store.reserve('conn:k1');
+    expect(reservation).toEqual({
+      state: 'reserved',
+      token: expect.any(String),
+    });
+    if (reservation.state !== 'reserved') throw new Error('unreachable');
+    await store.put('conn:k1', { result: 'migrated' }, reservation.token);
+    expect(await store.get('conn:k1')).toEqual({ result: 'migrated' });
   });
 });

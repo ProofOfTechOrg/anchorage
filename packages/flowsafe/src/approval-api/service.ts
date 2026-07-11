@@ -25,8 +25,10 @@ import {
   type ApprovalMetrics,
   type ApprovalRecord,
   type ApprovalStatus,
+  approvalCursor,
   type CreateApprovalInput,
   type DecideResult,
+  MAX_APPROVAL_LIST_LIMIT,
   OPEN_STATUSES,
   type ResumeOutcome,
 } from './types.js';
@@ -686,45 +688,64 @@ export async function sweepSLA(
   };
   const at = now();
   const nowIso = at.toISOString();
-  const open = await store.list({ status: ['pending', 'claimed'] });
   const escalated: ApprovalRecord[] = [];
-  for (const candidate of open) {
-    if (
-      candidate.slaDeadlineAt === undefined ||
-      Date.parse(candidate.slaDeadlineAt) > at.getTime()
-    ) {
-      continue;
-    }
-    const updated = await store.transition(
-      candidate.id,
-      ['pending', 'claimed'],
-      { status: 'escalated', escalatedAt: nowIso, updatedAt: nowIso },
-    );
-    // null = lost a race (decided or escalated concurrently) — skip quietly.
-    if (!updated) continue;
-    escalated.push(updated);
-    record('approval.escalate', `approval:${updated.id}`, 'allowed', {
-      reason: `SLA deadline ${updated.slaDeadlineAt} breached`,
-      // tenantId attributes the escalation: a cross-tenant sweep without it
-      // emits unattributable audit events.
-      detail: {
-        tenantId: updated.tenantId,
-        workflowId: updated.workflowId,
-        runId: updated.runId,
-      },
+  // D3: page the cross-tenant open set with an explicit cursor instead of one
+  // unbounded SELECT (the system view is deliberately un-defaulted, so a bare
+  // list() here would be the whole table). Keyset paging is on (createdAt, id);
+  // escalating a record only drops it from the pending/claimed filter and never
+  // changes its cursor position, so every currently-open record is visited
+  // exactly once — no skips, no repeats — and every breach as of `at` still
+  // escalates regardless of where it sits in FIFO order.
+  let after: string | undefined;
+  for (;;) {
+    const page = await store.list({
+      status: ['pending', 'claimed'],
+      limit: MAX_APPROVAL_LIST_LIMIT,
+      after,
     });
-    if (options.onEscalation) {
-      try {
-        options.onEscalation(updated);
-      } catch (error) {
-        // The hook is notification-only; a crashing notifier must not
-        // abort the sweep. The audit trail keeps the evidence.
-        record('approval.escalate', `approval:${updated.id}`, 'error', {
-          reason: `onEscalation threw: ${errorMessage(error)}`,
-          detail: { tenantId: updated.tenantId },
-        });
+    for (const candidate of page) {
+      if (
+        candidate.slaDeadlineAt === undefined ||
+        Date.parse(candidate.slaDeadlineAt) > at.getTime()
+      ) {
+        continue;
+      }
+      const updated = await store.transition(
+        candidate.id,
+        ['pending', 'claimed'],
+        { status: 'escalated', escalatedAt: nowIso, updatedAt: nowIso },
+      );
+      // null = lost a race (decided or escalated concurrently) — skip quietly.
+      if (!updated) continue;
+      escalated.push(updated);
+      record('approval.escalate', `approval:${updated.id}`, 'allowed', {
+        reason: `SLA deadline ${updated.slaDeadlineAt} breached`,
+        // tenantId attributes the escalation: a cross-tenant sweep without it
+        // emits unattributable audit events.
+        detail: {
+          tenantId: updated.tenantId,
+          workflowId: updated.workflowId,
+          runId: updated.runId,
+        },
+      });
+      if (options.onEscalation) {
+        try {
+          options.onEscalation(updated);
+        } catch (error) {
+          // The hook is notification-only; a crashing notifier must not
+          // abort the sweep. The audit trail keeps the evidence.
+          record('approval.escalate', `approval:${updated.id}`, 'error', {
+            reason: `onEscalation threw: ${errorMessage(error)}`,
+            detail: { tenantId: updated.tenantId },
+          });
+        }
       }
     }
+    // Full page ⇒ there may be more; cursor past the last row (FIFO order, so
+    // `after` is valid) and continue. Short page ⇒ done.
+    const last = page.at(-1);
+    if (page.length < MAX_APPROVAL_LIST_LIMIT || !last) break;
+    after = approvalCursor(last);
   }
   return escalated;
 }

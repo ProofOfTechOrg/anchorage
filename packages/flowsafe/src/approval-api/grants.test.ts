@@ -11,7 +11,7 @@ import {
 } from './grants.js';
 import { type ApprovalStore, InMemoryApprovalStore } from './store.js';
 import { InMemoryApprovalStoreFactory } from './tenant-store.js';
-import type { ApprovalRecord } from './types.js';
+import { type ApprovalRecord, MAX_APPROVAL_LIST_LIMIT } from './types.js';
 
 let seq = 0;
 
@@ -603,10 +603,46 @@ describe('grant derivation — tenant hardening (INV-1 + INV-2)', () => {
     // #when
     await approvedConnectorsForLeg(spy, 'wf', 'acme_run-1', { kind: 'start' });
 
-    // #then — exactly this filter, all three predicates present
-    expect(listCalls).toEqual([
-      { workflowId: 'wf', runId: 'acme_run-1', status: 'approved' },
-    ]);
+    // #then — one page (the fixture is far under the cap) whose filter carries
+    // all three load-bearing predicates; explicit paging adds limit/after but
+    // must never drop workflowId/runId/status (the runId predicate is the
+    // tenant-safety guard under INV-1)
+    expect(listCalls).toHaveLength(1);
+    expect(listCalls[0]).toMatchObject({
+      workflowId: 'wf',
+      runId: 'acme_run-1',
+      status: 'approved',
+    });
+  });
+
+  it('mints from ALL approved records past the list cap — a run with >MAX approvals still unlocks the newest connector (D3 grant-path paging)', async () => {
+    // #given — more approved records for one run than the D3 bare-list cap:
+    // MAX run-scoped 'noise' records, then a NEWEST run-scoped record carrying
+    // 'newest-connector'. A single bounded FIFO page (the D3 tenant-store
+    // default) returns the oldest MAX and DROPS the newest, failing the grant
+    // CLOSED. approvedConnectorsForLeg must page the complete set instead.
+    const store = new InMemoryApprovalStore('acme');
+    for (let index = 0; index < MAX_APPROVAL_LIST_LIMIT; index += 1) {
+      await store.create(
+        record({ status: 'approved', runScoped: true, connectors: ['noise'] }),
+      );
+    }
+    await store.create(
+      record({
+        status: 'approved',
+        runScoped: true,
+        connectors: ['newest-connector'],
+      }),
+    );
+
+    // #when — a start leg mints run-scoped grants
+    const connectors = await approvedConnectorsForLeg(store, 'wf', 'run-1', {
+      kind: 'start',
+    });
+
+    // #then — the newest record's connector is present (complete paging, not a
+    // truncated first page)
+    expect(connectors).toContain('newest-connector');
   });
 
   it('approvalGrantProviderFromFactory binds per leg from the runId prefix and fails closed on a bare runId', async () => {

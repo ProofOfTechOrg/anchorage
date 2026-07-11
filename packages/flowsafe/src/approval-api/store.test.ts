@@ -26,7 +26,7 @@ import {
   InMemoryApprovalStoreFactory,
 } from './tenant-store.js';
 import type { ApprovalRecord } from './types.js';
-import { approvalCursor } from './types.js';
+import { approvalCursor, MAX_APPROVAL_LIST_LIMIT } from './types.js';
 
 let seq = 0;
 
@@ -470,6 +470,40 @@ function describeStoreContract(
       await expect(
         store.list({ after: 'not valid base64!!' }),
       ).rejects.toThrow();
+    });
+
+    it('bounds a bare tenant list() at MAX_APPROVAL_LIST_LIMIT while the system view stays complete (D3)', async () => {
+      // #given — one tenant holding MORE than the cap in a single queue
+      const backend = makeBackend();
+      const store = backend.forTenant('acme');
+      const total = MAX_APPROVAL_LIST_LIMIT + 1;
+      for (let index = 0; index < total; index += 1) {
+        await store.create(makeRecord({ runId: `run-bound-${index}` }));
+      }
+
+      // #when — a bare tenant list() (no limit)...
+      const bounded = await store.list();
+      // ...and an explicit cursor walk of MAX-sized pages
+      const walked: string[] = [];
+      let after: string | undefined;
+      for (;;) {
+        const page = await store.list({
+          limit: MAX_APPROVAL_LIST_LIMIT,
+          after,
+        });
+        walked.push(...page.map((r) => r.id));
+        const last = page.at(-1);
+        if (page.length < MAX_APPROVAL_LIST_LIMIT || !last) break;
+        after = approvalCursor(last);
+      }
+
+      // #then — the bare list defaults to the cap (never an unbounded scan);
+      // explicit cursor paging still retrieves everything with no gaps/dupes;
+      // the cron-only system view stays complete (un-defaulted)
+      expect(bounded).toHaveLength(MAX_APPROVAL_LIST_LIMIT);
+      expect(walked).toHaveLength(total);
+      expect(new Set(walked).size).toBe(total);
+      expect(await backend.system().list()).toHaveLength(total);
     });
 
     // ---- reviewer ordering (orderBy: 'reviewer', 2026-07-11 review) -------

@@ -171,8 +171,10 @@ export interface ApprovalListFilter {
   claimedBy?: string;
   /**
    * Max records to return (clamped to [1, MAX_APPROVAL_LIST_LIMIT] — see
-   * clampApprovalLimit). undefined means no limit (the pre-D3 behavior);
-   * callers that poll a queue repeatedly should always set one.
+   * clampApprovalLimit). undefined requests no explicit limit: a tenant-bound
+   * store then DEFAULTS to MAX_APPROVAL_LIST_LIMIT (D3 — a bare list() is
+   * never an unbounded scan), while the cron-only SystemApprovalStore view
+   * stays complete. Page complete history with an explicit `after` cursor.
    */
   limit?: number;
   /**

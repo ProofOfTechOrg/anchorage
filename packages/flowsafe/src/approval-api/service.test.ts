@@ -12,7 +12,11 @@ import {
 } from './service.js';
 import type { InMemoryApprovalStore } from './store.js';
 import { InMemoryApprovalStoreFactory } from './tenant-store.js';
-import type { ApprovalRecord, CreateApprovalInput } from './types.js';
+import {
+  type ApprovalRecord,
+  type CreateApprovalInput,
+  MAX_APPROVAL_LIST_LIMIT,
+} from './types.js';
 
 const ADMIN: ApprovalActor = { id: 'ada', role: 'admin', tenantId: 'acme' };
 const OPERATOR: ApprovalActor = {
@@ -582,6 +586,31 @@ describe('ApprovalService.sweepSLA', () => {
         decision: 'allowed',
       }),
     );
+  });
+
+  it('escalates ALL breached requests across more than one page (>MAX), paging the system view (D3)', async () => {
+    // #given — more breached requests than a single page holds, so the sweep
+    // must cursor-page the (un-defaulted) system view instead of one SELECT;
+    // pre-D3 this bare list() was unbounded, post-D3 a naive single list would
+    // silently cap at MAX and leave the tail un-escalated
+    const harness = makeHarness();
+    const total = MAX_APPROVAL_LIST_LIMIT + 1;
+    for (let index = 0; index < total; index += 1) {
+      await seedPending(harness, {
+        runId: `acme_run-sweep-${index}`,
+        slaSeconds: 60,
+      });
+    }
+    harness.advance(120_000);
+
+    // #when
+    const escalated = await runSweep(harness);
+
+    // #then — every breached request escalated, none dropped past the first page
+    expect(escalated).toHaveLength(total);
+    expect(
+      await harness.backend.system().list({ status: ['escalated'] }),
+    ).toHaveLength(total);
   });
 
   it('is idempotent — a second sweep escalates nothing new', async () => {

@@ -324,6 +324,49 @@ describe('createApprovalRouter', () => {
     expect(page[0]?.id).toBe(critical.id);
   });
 
+  it('composes status + orderBy=reviewer + limit — reviewer-ranked, status-filtered, then bounded', async () => {
+    // #given — two normals, a critical created LAST, and a fourth we approve so
+    // it leaves the open set
+    const { handle } = makeHandler({ allowCreate: true });
+    await createOne(handle, { ...CREATE_BODY, runId: 'acme_run-c1' });
+    await createOne(handle, { ...CREATE_BODY, runId: 'acme_run-c2' });
+    const critical = await createOne(handle, {
+      ...CREATE_BODY,
+      runId: 'acme_run-chot',
+      priority: 'critical',
+    });
+    const decided = await createOne(handle, {
+      ...CREATE_BODY,
+      runId: 'acme_run-cdone',
+    });
+    const decideResponse = await handle(
+      req(`/api/approvals/${decided.id}/decide`, {
+        body: { decision: 'approve' },
+        actor: { id: 'ray', role: 'reviewer' },
+      }),
+    );
+    expect(decideResponse?.status).toBe(200);
+
+    // #when — all three query params at once
+    const response = await handle(
+      req(
+        '/api/approvals?status=pending,claimed,escalated&orderBy=reviewer&limit=2',
+      ),
+    );
+    const page = (await response?.json()) as ApprovalRecord[];
+
+    // #then — reviewer order ranks the critical to the top BEFORE limit cuts to
+    // two, and the status filter keeps the approved record out of the page
+    expect(response?.status).toBe(200);
+    expect(page).toHaveLength(2);
+    expect(page[0]?.id).toBe(critical.id);
+    expect(
+      page.every((record) =>
+        ['pending', 'claimed', 'escalated'].includes(record.status),
+      ),
+    ).toBe(true);
+  });
+
   it('400s an unknown orderBy and the incoherent orderBy=reviewer + after combination', async () => {
     // #given
     const { handle } = makeHandler({ allowCreate: true });

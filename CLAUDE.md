@@ -199,6 +199,25 @@ other branches → `wrangler versions upload`). Google OAuth is the launch provi
 screen must be "In production" — Testing status only admits listed test
 users); GitHub stays a config-only fallback.
 
+## Branching and releases
+
+- **`dev` is the integration branch — all feature/fix PRs target `dev`.**
+  Branch off `dev`, open PRs into `dev`, and add a changeset describing the
+  change. Do NOT open feature PRs against `main`.
+- **`main` is the release/production branch.** Only a **release PR**
+  (`dev` → `main`) lands there, bringing the accumulated changesets. Merging it
+  runs `release.yml`: the changesets action opens a "Version Packages" PR
+  (changelog + version bump), and merging THAT PR publishes to npm with
+  provenance and pushes tags. The live demo deploys from `main`.
+- `main` remains the changesets `baseBranch` and the sole `release.yml` trigger
+  (publishing never runs on `dev`); CI (`ci.yml`) runs on both `main` and `dev`,
+  so the verification gate fires on every PR into the integration branch, not
+  only at release time.
+- **After a release publishes, sync `main` → `dev`** (fast-forward or merge) so
+  `dev` carries the version bump + CHANGELOG and drops the consumed changesets
+  (the Version Packages PR commits those to `main` only) — the next release then
+  starts from a clean `dev`.
+
 ## Files
 
 | File | What | When to read |
