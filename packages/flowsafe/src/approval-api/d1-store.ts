@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // D1-backed ApprovalStore. The CAS in transition() is a status-guarded
 // conditional UPDATE ... RETURNING — SQLite executes it atomically, so two
 // racing transitions resolve to one winner (the loser's guard matches zero
@@ -32,6 +33,7 @@ import {
   MAX_APPROVAL_LIST_LIMIT,
   OPEN_STATUSES,
   parseApprovalCursor,
+  parseApprovalTimeBound,
   TERMINAL_APPROVAL_STATUSES,
 } from './types.js';
 
@@ -179,6 +181,31 @@ function appendListFilters(
   if (filter.claimedBy !== undefined) {
     where.push('claimed_by = ?');
     values.push(filter.claimedBy);
+  }
+  if (filter.requestedBy !== undefined) {
+    where.push('requested_by = ?');
+    values.push(filter.requestedBy);
+  }
+  // Time bounds bind CANONICALIZED to the exact 24-char toISOString() format
+  // the column stores: SQLite TEXT comparison is bytewise, so a caller-
+  // formatted variant ('…T10:00:00Z' vs '…T10:00:00.000Z') would misorder at
+  // the boundary. parseApprovalTimeBound is the same throw-on-garbage gate
+  // the in-memory matchesFilter applies — backend parity.
+  if (filter.createdBefore !== undefined) {
+    where.push('created_at < ?');
+    values.push(
+      new Date(
+        parseApprovalTimeBound(filter.createdBefore, 'createdBefore'),
+      ).toISOString(),
+    );
+  }
+  if (filter.createdAfter !== undefined) {
+    where.push('created_at > ?');
+    values.push(
+      new Date(
+        parseApprovalTimeBound(filter.createdAfter, 'createdAfter'),
+      ).toISOString(),
+    );
   }
   if (filter.after !== undefined) {
     const cursor = parseApprovalCursor(filter.after);

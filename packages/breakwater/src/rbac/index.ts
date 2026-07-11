@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // RBAC — actor identity + role authorization. RBAC is EE-licensed in Mastra;
 // this is the open implementation.
 //

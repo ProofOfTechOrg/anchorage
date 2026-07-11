@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Unit coverage for the host-kit approval bridge: the payload-shape edge cases
 // of requestedConnectors, the (suspendedAt, resumeCount) capture in
 // queueApprovalForSuspension, the multi-gate re-queue + fail-closed guard in

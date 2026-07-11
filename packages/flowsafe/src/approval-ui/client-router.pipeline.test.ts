@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Full-pipeline D3 proof: the real ApprovalApiClient → createApprovalRouter →
 // ApprovalService → InMemoryApprovalStore, driven with NO limit at >MAX scale.
 // Lives in approval-ui (not approval-api) because the "client" under test is

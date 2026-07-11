@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // D1RateLimitStore against REAL SQLite via node:sqlite (D1 is SQLite), so the
 // atomic UPSERT ... RETURNING count is exercised for real, not mocked. The
 // openSqlite()/d1Like() fixture is copied from d1-idempotency-store.test.ts

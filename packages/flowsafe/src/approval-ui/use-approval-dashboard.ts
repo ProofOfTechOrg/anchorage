@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Headless core of the approval dashboard: all data + interaction logic, no
 // markup. A consumer can drive a fully custom UI from this hook alone, or use
 // the slot-based views (App/QueueView/…) that render it through injected
@@ -11,6 +12,7 @@ import type {
   ApprovalListFilter,
   ApprovalMetrics,
   ApprovalRecord,
+  BatchDecideResult,
 } from '../approval-api/types.js';
 import { OPEN_STATUSES } from '../approval-api/types.js';
 import type { ApprovalApiClient } from './client.js';
@@ -87,6 +89,48 @@ export function orderRecordsForDisplay(
     : [...records];
 }
 
+/**
+ * The batch-selection prune: only ids still present in the fetched page AND
+ * still open (decidable) survive. Derived on every render, never an effect —
+ * a refresh that decides, escalates-out, or pages a record away cannot leave
+ * a stale id behind for decideSelected to re-submit. Pulled out (like
+ * fetchDashboardSnapshot) for DOM-free testing.
+ */
+export function pruneSelection(
+  selectedIds: readonly string[],
+  records: readonly ApprovalRecord[],
+): string[] {
+  return selectedIds.filter((id) =>
+    records.some(
+      (record) => record.id === id && OPEN_STATUSES.includes(record.status),
+    ),
+  );
+}
+
+/** A setFilter override, valid only against the options.filter it was set under. */
+export interface ApprovalFilterOverride {
+  /** approvalFilterKey(options.filter) at the moment setFilter was called. */
+  baseKey: string;
+  filter: ApprovalListFilter;
+}
+
+/**
+ * The controlled-filter derivation (deliberately NOT a reset effect): a
+ * setFilter override is honoured only while the OPTIONS filter still has the
+ * VALUE it was created against, so a caller-side filter change (tab switch,
+ * new options literal) naturally retires the override on the same render —
+ * no effect, no transient fetch against a stale filter. Pulled out for
+ * DOM-free testing; the hook applies it every render.
+ */
+export function effectiveApprovalFilter(
+  override: ApprovalFilterOverride | null,
+  optionsFilter: ApprovalListFilter,
+): ApprovalListFilter {
+  return override && override.baseKey === approvalFilterKey(optionsFilter)
+    ? override.filter
+    : optionsFilter;
+}
+
 export interface UseApprovalDashboardOptions {
   /** Queue/metrics refresh cadence; <= 0 disables polling. Default 10s. */
   pollIntervalMs?: number;
@@ -112,9 +156,29 @@ export interface ApprovalDashboardState {
   selected: ApprovalRecord | null;
   selectedId: string | null;
   error: string | null;
-  /** True while a claim/decide/delegate mutation is in flight. */
+  /** True while a claim/decide/delegate/decideSelected mutation is in flight. */
   busy: boolean;
   nowMs: number;
+  /** The EFFECTIVE queue filter: options.filter unless setFilter overrode it. */
+  filter: ApprovalListFilter;
+  /**
+   * Override the queue filter from the UI (FilterBar). The override holds
+   * until the OPTIONS filter value changes, which retires it on the same
+   * render — controlled without a reset effect (effectiveApprovalFilter).
+   */
+  setFilter: (next: ApprovalListFilter) => void;
+  /**
+   * Batch selection, derived-pruned to ids still in the fetched page AND
+   * still open (pruneSelection) — a decided or paged-out record can never
+   * ride a stale checkbox into decideSelected.
+   */
+  selectedIds: readonly string[];
+  toggleSelect: (id: string) => void;
+  clearSelection: () => void;
+  /** One decision fanned out over the current selection via decideBatch. No-op when empty. */
+  decideSelected: (decision: ApprovalDecision, comment: string) => void;
+  /** The most recent batch envelope; cleared when the next mutation starts. */
+  lastBatch: BatchDecideResult | null;
   select: (id: string) => void;
   decide: (decision: ApprovalDecision, comment: string) => void;
   claim: () => void;
@@ -136,6 +200,9 @@ export function useApprovalDashboard(
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [nowMs, setNowMs] = useState(now);
+  const [override, setOverride] = useState<ApprovalFilterOverride | null>(null);
+  const [rawSelectedIds, setRawSelectedIds] = useState<readonly string[]>([]);
+  const [lastBatch, setLastBatch] = useState<BatchDecideResult | null>(null);
 
   // Latest-ref for the injected clock: an inline `now` (a fixed test/story
   // clock) is a new function identity every render — the same request-loop
@@ -146,12 +213,25 @@ export function useApprovalDashboard(
     nowRef.current = now;
   });
 
+  // A setFilter override wins only while options.filter still carries the
+  // value it was set against (effectiveApprovalFilter) — an options change
+  // retires it with no reset effect. optionKey is that guard's identity.
+  const optionKey = approvalFilterKey(filter);
+  const effective = effectiveApprovalFilter(override, filter);
+
+  const setFilter = useCallback(
+    (next: ApprovalListFilter) => {
+      setOverride({ baseKey: optionKey, filter: next });
+    },
+    [optionKey],
+  );
+
   // Value identity for the filter (see approvalFilterKey): rebuilt from the
   // key alone so the memo depends on nothing identity-unstable. Without
   // this, an inline filter recreated refresh() every render, whose effect
   // refetched immediately, whose state updates rendered again — an unbounded
   // request loop that never reached the poll interval (2026-07-11 review).
-  const filterKey = approvalFilterKey(filter);
+  const filterKey = approvalFilterKey(effective);
   const stableFilter = useMemo(
     () => JSON.parse(filterKey) as ApprovalListFilter,
     [filterKey],
@@ -185,9 +265,29 @@ export function useApprovalDashboard(
   // Selection is derived — the queue refresh may change or remove the record.
   const selected = records.find((record) => record.id === selectedId) ?? null;
 
+  // Batch selection is derived-pruned the same way (see pruneSelection).
+  const selectedIds = useMemo(
+    () => pruneSelection(rawSelectedIds, records),
+    [rawSelectedIds, records],
+  );
+
+  const toggleSelect = useCallback((id: string): void => {
+    setRawSelectedIds((current) =>
+      current.includes(id)
+        ? current.filter((existing) => existing !== id)
+        : [...current, id],
+    );
+  }, []);
+
+  const clearSelection = useCallback((): void => {
+    setRawSelectedIds([]);
+  }, []);
+
   const act = useCallback(
     async (action: () => Promise<unknown>): Promise<void> => {
       setBusy(true);
+      // Any new mutation supersedes the previous batch summary.
+      setLastBatch(null);
       try {
         await action();
         await refresh();
@@ -198,6 +298,23 @@ export function useApprovalDashboard(
       }
     },
     [refresh],
+  );
+
+  const decideSelected = useCallback(
+    (decision: ApprovalDecision, comment: string): void => {
+      const ids = selectedIds;
+      if (ids.length === 0) return;
+      void act(async () => {
+        const outcome = await client.decideBatch(
+          ids,
+          decision,
+          comment === '' ? undefined : comment,
+        );
+        setLastBatch(outcome);
+        setRawSelectedIds([]);
+      });
+    },
+    [act, client, selectedIds],
   );
 
   const decide = useCallback(
@@ -239,6 +356,13 @@ export function useApprovalDashboard(
     error,
     busy,
     nowMs,
+    filter: stableFilter,
+    setFilter,
+    selectedIds,
+    toggleSelect,
+    clearSelection,
+    decideSelected,
+    lastBatch,
     select: setSelectedId,
     decide,
     claim,

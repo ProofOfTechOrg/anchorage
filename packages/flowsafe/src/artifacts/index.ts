@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Artifacts — R2-backed workflow artifact storage (Phase 4 "Workflow
 // artifacts stored in R2"). Steps write files a run produces (reports,
 // exports, generated media) keyed `${workflowId}/${runId}/${name}`, so

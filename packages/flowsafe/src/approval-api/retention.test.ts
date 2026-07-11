@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // purgeExpiredApprovals — the approvals analog of do-runner's
 // purgeExpiredWorkflowRuns test coverage: terminal-only, the exclusive TTL
 // boundary, LIMIT-batching, and cross-tenant reach (the system view, NOT a

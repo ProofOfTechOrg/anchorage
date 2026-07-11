@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // DOM-free: exercises the default-filter contract and the poll wiring
 // (fetchDashboardSnapshot) without mounting the hook — approval-ui has no
 // renderer (see components.test.ts's "hooks need a renderer, the merge does
@@ -15,8 +16,10 @@ import { OPEN_STATUSES } from '../approval-api/types.js';
 import {
   approvalFilterKey,
   DEFAULT_QUEUE_FILTER,
+  effectiveApprovalFilter,
   fetchDashboardSnapshot,
   orderRecordsForDisplay,
+  pruneSelection,
 } from './use-approval-dashboard.js';
 
 const METRICS: ApprovalMetrics = {
@@ -236,5 +239,70 @@ describe('fetchDashboardSnapshot', () => {
 
     // #then — the override reached list() verbatim, not the open-statuses default
     expect(client.listCalls).toEqual([historyFilter]);
+  });
+});
+
+describe('pruneSelection', () => {
+  it('keeps only ids that are present in the page AND still open', () => {
+    // #given
+    const open = makeRecord({ id: 'apr-open', status: 'pending' });
+    const claimed = makeRecord({ id: 'apr-claimed', status: 'claimed' });
+    const escalated = makeRecord({ id: 'apr-escalated', status: 'escalated' });
+    const decided = makeRecord({ id: 'apr-decided', status: 'approved' });
+    const records = [open, claimed, escalated, decided];
+
+    // #when — selection carries a decided record and a paged-out one
+    const pruned = pruneSelection(
+      ['apr-open', 'apr-decided', 'apr-gone', 'apr-claimed', 'apr-escalated'],
+      records,
+    );
+
+    // #then — every OPEN status survives; decided and absent ids drop
+    expect(pruned).toEqual(['apr-open', 'apr-claimed', 'apr-escalated']);
+  });
+
+  it('returns empty for an empty selection or an empty page', () => {
+    // #when / #then
+    expect(pruneSelection([], [makeRecord()])).toEqual([]);
+    expect(pruneSelection(['apr-1'], [])).toEqual([]);
+  });
+});
+
+describe('effectiveApprovalFilter', () => {
+  const optionsFilter: ApprovalListFilter = { status: ['pending'], limit: 5 };
+
+  it('returns the options filter when no override is set', () => {
+    // #when / #then
+    expect(effectiveApprovalFilter(null, optionsFilter)).toBe(optionsFilter);
+  });
+
+  it('honours an override created against the current options value', () => {
+    // #given — override captured while optionsFilter had this exact value
+    const override = {
+      baseKey: approvalFilterKey(optionsFilter),
+      filter: { requestedBy: 'ada' } satisfies ApprovalListFilter,
+    };
+
+    // #when / #then
+    expect(effectiveApprovalFilter(override, optionsFilter)).toBe(
+      override.filter,
+    );
+    // Value identity, not reference: an equal-value options literal still
+    // honours the override (the inline-options caller shape).
+    expect(
+      effectiveApprovalFilter(override, { status: ['pending'], limit: 5 }),
+    ).toBe(override.filter);
+  });
+
+  it('retires the override when the options filter VALUE changes', () => {
+    // #given
+    const override = {
+      baseKey: approvalFilterKey(optionsFilter),
+      filter: { requestedBy: 'ada' } satisfies ApprovalListFilter,
+    };
+    const changed: ApprovalListFilter = { status: ['claimed'], limit: 5 };
+
+    // #when / #then — no reset effect needed; the derivation itself retires it
+    expect(effectiveApprovalFilter(override, changed)).toBe(changed);
   });
 });

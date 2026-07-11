@@ -17,6 +17,7 @@
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "typecheck": "pnpm -r typecheck",
+    "docs:api": "typedoc",
     "react-doctor": "pnpm --filter showcase react-doctor",
     "react-doctor:diff": "pnpm --filter showcase react-doctor:diff",
     "showcase:deploy": "pnpm --filter showcase deploy:cf",
@@ -28,6 +29,7 @@
     "@changesets/cli": "^2.31.0",
     "husky": "^9.1.7",
     "lint-staged": "^16.4.0",
+    "typedoc": "^0.28.19",
     "vitest": "^4.1.8"
   },
   "engines": {

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Opaque reservation lease tokens for the idempotency stores (audit D2). A
 // token is minted per successful reserve() (and rotated on a stale-pending
 // takeover) so put()/release() can compare-and-set on ownership — a

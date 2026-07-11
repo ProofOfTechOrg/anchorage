@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Subdomain <-> tenant cross-check for client-per-subdomain commercial hosts
 // (<tenant>.example.com). DEFENSE IN DEPTH ONLY: the subdomain identifies the
 // tenant for ROUTING; authorization is the token's verified tenant claim and

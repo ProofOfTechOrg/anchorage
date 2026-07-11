@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Path-safe id pattern — a leaf module (zero imports) the do-runner owns.
 //
 // The pattern lives HERE, not in runtime.ts, so consumers that only need the

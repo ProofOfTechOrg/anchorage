@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // HTTP surface for the approval queue (flowsafe-architecture.md endpoint
 // table). Plain fetch routing like the DO runner — no HTTP framework.
 //
@@ -34,6 +35,7 @@ import {
   type CreateApprovalInput,
   MAX_APPROVAL_LIST_LIMIT,
   parseApprovalCursor,
+  parseApprovalTimeBound,
 } from './types.js';
 
 /**
@@ -175,6 +177,22 @@ function parseListFilter(url: URL): ApprovalListFilter {
   if (runId !== null) filter.runId = runId;
   const claimedBy = url.searchParams.get('claimedBy');
   if (claimedBy !== null) filter.claimedBy = claimedBy;
+  const requestedBy = url.searchParams.get('requestedBy');
+  if (requestedBy !== null) filter.requestedBy = requestedBy;
+  // Eager 400 on unparseable time bounds (the cursor convention):
+  // parseApprovalTimeBound is the exact gate both stores re-apply.
+  for (const field of ['createdBefore', 'createdAfter'] as const) {
+    const value = url.searchParams.get(field);
+    if (value === null) continue;
+    try {
+      parseApprovalTimeBound(value, field);
+    } catch (error) {
+      throw new InvalidApprovalInputError(
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    filter[field] = value;
+  }
   const limit = url.searchParams.get('limit');
   if (limit !== null) {
     const parsed = Number(limit);
@@ -291,6 +309,28 @@ export function createApprovalRouter(
         // unfiltered cross-tenant read+write; it lives in the cron-owned
         // sweepSLA() function over a SystemApprovalStore, unreachable from
         // request scope by type.
+        //
+        // Batch decide matches BEFORE the generic [id, action] arms — those
+        // would otherwise resolve this path as decide('batch') and 404.
+        // Record ids are server-minted UUIDs, so 'batch' can never collide
+        // with a real id. Always mounted: it is decide fan-out, not create.
+        if (
+          segments.length === 2 &&
+          segments[0] === 'batch' &&
+          segments[1] === 'decide'
+        ) {
+          const body = await readJsonObject(request);
+          return json(
+            await service.decideBatch(
+              body.ids as string[],
+              {
+                decision: body.decision as ApprovalDecision,
+                comment: body.comment as string | undefined,
+              },
+              actor,
+            ),
+          );
+        }
         const [id, action] = segments;
         if (segments.length === 2 && id && action === 'claim') {
           return json(await service.claim(id, actor));

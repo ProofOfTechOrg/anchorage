@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // D1IdempotencyStore against REAL SQLite via node:sqlite (D1 is SQLite), so
 // the atomic claim — INSERT ... ON CONFLICT DO NOTHING RETURNING — and the
 // stale-pending takeover CAS are exercised for real, not mocked. The

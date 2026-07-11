@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Policy Engine — pre-gate (input) and post-gate (output) policy evaluation
 // as a single Mastra processor registered in both inputProcessors and
 // outputProcessors. Policies are evaluator functions returning
@@ -809,6 +810,17 @@ export function maxTextLength(
   };
 }
 
+export type {
+  ClassifierPolicyOptions,
+  PiiSecretsDetectorId,
+  PiiSecretsOptions,
+} from './content-inspection.js';
+// Agent-boundary content-inspection evaluators — see content-inspection.ts.
+export {
+  classifierPolicy,
+  PII_SECRETS_DETECTOR_IDS,
+  piiSecrets,
+} from './content-inspection.js';
 export type {
   CrossWorkflowIsolationOptions,
   NetworkEgressOptions,

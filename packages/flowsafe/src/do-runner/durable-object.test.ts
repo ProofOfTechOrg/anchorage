@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 import type { DurableObjectState } from '@cloudflare/workers-types';
 import { InMemoryStore } from '@mastra/core/storage';
 import { describe, expect, it } from 'vitest';

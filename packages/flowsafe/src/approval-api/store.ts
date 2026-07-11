@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ApprovalStore — the persistence contract for the approval queue.
 //
 // Every state change goes through transition(), a compare-and-swap guarded by
@@ -19,6 +20,7 @@ import {
   MAX_APPROVAL_LIST_LIMIT,
   OPEN_STATUSES,
   parseApprovalCursor,
+  parseApprovalTimeBound,
 } from './types.js';
 
 /** Uniqueness scope for open requests: one per (workflowId, runId, stepKey). */
@@ -115,6 +117,30 @@ export function matchesFilter(
     return false;
   if (filter.runId !== undefined && record.runId !== filter.runId) return false;
   if (filter.claimedBy !== undefined && record.claimedBy !== filter.claimedBy)
+    return false;
+  if (
+    filter.requestedBy !== undefined &&
+    record.requestedBy !== filter.requestedBy
+  )
+    return false;
+  // Chronological (parsed), not bytewise: the filter value is caller-formatted
+  // ISO and may not match the column's canonical toISOString() form. Strict
+  // bounds; parseApprovalTimeBound throws on garbage (router 400s it first).
+  if (
+    filter.createdBefore !== undefined &&
+    !(
+      Date.parse(record.createdAt) <
+      parseApprovalTimeBound(filter.createdBefore, 'createdBefore')
+    )
+  )
+    return false;
+  if (
+    filter.createdAfter !== undefined &&
+    !(
+      Date.parse(record.createdAt) >
+      parseApprovalTimeBound(filter.createdAfter, 'createdAfter')
+    )
+  )
     return false;
   return true;
 }

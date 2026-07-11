@@ -11,7 +11,9 @@
 // to an observed event.
 
 import type {
+  ApprovalDecision,
   ApprovalRecord,
+  BatchDecideResult,
   DecideResult,
 } from '@flowsafe/approval-api/types';
 import {
@@ -840,6 +842,43 @@ export function resetErrorEvent(
  * the poll will re-derive, so the decider never gets a second toast for the
  * resume their decision caused.
  */
+/**
+ * One-shot summary of a batch decision. ONE event per batch (keyed by the
+ * action instant, the resetEvent precedent for one-shot actions): the
+ * per-record status changes arrive through the poll diffs under their own
+ * deterministic keys, so narrating each record here would only duplicate
+ * them. Failures are named inline because they never surface as a poll diff.
+ */
+export function batchDecideEvent(
+  decision: ApprovalDecision,
+  result: BatchDecideResult,
+): NarrationEvent {
+  const at = Date.now();
+  const failures = result.results.filter((item) => !item.ok);
+  const verb = decision === 'approve' ? 'approved' : 'rejected';
+  return {
+    key: `decide.batch:${decision}:${at}`,
+    at,
+    zone: 'worker',
+    kind: 'approval.decided-batch',
+    title:
+      result.failed === 0
+        ? `Batch ${verb}: ${result.decided} request${result.decided === 1 ? '' : 's'}`
+        : `Batch ${verb}: ${result.decided} decided · ${result.failed} failed`,
+    detail:
+      result.failed === 0
+        ? 'Each record went through its own CAS transition; the queue refresh shows the outcomes.'
+        : `Failed: ${failures
+            .map((item) => `${shortId(item.id)} (${item.code ?? 'error'})`)
+            .join(
+              ', ',
+            )}. Failures are independent; the decided records stayed decided.`,
+    tone: result.failed > 0 ? 'warning' : 'success',
+    observed: true,
+    toast: true,
+  };
+}
+
 export function decideEvents(result: DecideResult): NarrationEvent[] {
   const at = Date.now();
   const { record, resume } = result;

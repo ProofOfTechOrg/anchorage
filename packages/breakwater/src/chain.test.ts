@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Roadmap Phase 1 acceptance: "Processor chain evaluates without error".
 // Mastra runs inputProcessors sequentially in array order, threading messages;
 // this harness replicates that contract for [RBACMiddleware, PolicyEngine].

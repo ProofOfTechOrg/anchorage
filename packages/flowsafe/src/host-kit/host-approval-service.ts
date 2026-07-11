@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The host-side ApprovalService assembly and cron SLA sweep that the
 // showcase Worker and the deploy template previously carried as byte-copies:
 // the structured-log + optional-Queues audit sink, the system actor derived
@@ -14,6 +15,7 @@ import type {
   ApprovalAuditEvent,
   ApprovalAuditSink,
   ApprovalDatabase,
+  ApprovalNotificationSink,
   SystemApprovalStore,
   TenantBoundApprovalStore,
 } from '../approval-api/index.js';
@@ -117,6 +119,12 @@ export interface HostApprovalServiceOptions {
   queue?: AuditQueue<ApprovalAuditEvent>;
   /** ctx.waitUntil — keeps audit queue sends alive past the response. */
   waitUntil?: (send: Promise<unknown>) => void;
+  /**
+   * Notification transport (email/Slack/pager adapter) for newly-created
+   * approval requests — threaded to ApprovalServiceOptions.notify. Transports
+   * needing to outlive the response wrap themselves in the host's waitUntil.
+   */
+  notify?: ApprovalNotificationSink;
 }
 
 /**
@@ -147,6 +155,7 @@ export function buildHostApprovalService(
     store,
     defaultSlaSeconds: options.defaultSlaSeconds,
     audit,
+    notify: options.notify,
     resumeRun: resumeRunWithRequeue(
       options.resumeRun,
       () => service,
@@ -166,6 +175,12 @@ export interface SlaSweepMaintenanceOptions {
   queue?: AuditQueue<ApprovalAuditEvent>;
   /** The firing cron expression — log correlation only. */
   cron: string;
+  /**
+   * Notification transport for SLA escalations — threaded to
+   * SweepSLAOptions.notify (the cron runner already executes under the
+   * handler's waitUntil, so transports need no extra keep-alive here).
+   */
+  notify?: ApprovalNotificationSink;
 }
 
 /**
@@ -192,6 +207,7 @@ export async function runSlaSweepMaintenance(
           queue: options.queue,
           keepAlive: (send) => pendingSends.push(send),
         }),
+        notify: options.notify,
         onEscalation: (record) =>
           console.log(
             JSON.stringify({

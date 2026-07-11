@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Guards over the parts of Mastra's persistence WE do not own but DO depend
 // on, exercised against the REAL @mastra/cloudflare-d1 D1Store over real
 // SQLite (node:sqlite):

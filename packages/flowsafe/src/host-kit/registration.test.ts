@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The catalog/runtime consistency check every host runs at startup. It is the
 // only guard tying an advertised WorkflowMeta.id to a committed workflow id, so
 // it gets direct coverage rather than relying on each host's happy path.

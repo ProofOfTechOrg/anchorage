@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The bearer auth seam every host shares: extract the bearer token, hand it
 // to a TokenVerifier (static map or HS256 JWT — verifier.ts), get back an
 // ApprovalActor or undefined.
