@@ -220,19 +220,31 @@ users); GitHub stays a config-only fallback.
 - **`dev` is the integration branch — all feature/fix PRs target `dev`.**
   Branch off `dev`, open PRs into `dev`, and add a changeset describing the
   change. Do NOT open feature PRs against `main`.
-- **`main` is the release/production branch.** Only a **release PR**
-  (`dev` → `main`) lands there, bringing the accumulated changesets. Merging it
-  runs `release.yml`: the changesets action opens a "Version Packages" PR
-  (changelog + version bump), and merging THAT PR publishes to npm with
-  provenance and pushes tags. The live demo deploys from `main`.
-- `main` remains the changesets `baseBranch` and the sole `release.yml` trigger
-  (publishing never runs on `dev`); CI (`ci.yml`) runs on both `main` and `dev`,
-  so the verification gate fires on every PR into the integration branch, not
-  only at release time.
-- **After a release publishes, sync `main` → `dev`** (fast-forward or merge) so
-  `dev` carries the version bump + CHANGELOG and drops the consumed changesets
-  (the Version Packages PR commits those to `main` only) — the next release then
-  starts from a clean `dev`.
+- **Version bumps happen ON dev (bump-on-dev, 2026-07-12).** `version.yml`
+  runs on every push to `dev` and maintains a standing "Version Packages" PR
+  against dev (`changeset-release/dev`): bumps + CHANGELOGs + changeset
+  deletion all land on the integration branch. Changesets `baseBranch` is
+  `dev`.
+- **`main` is the release/production branch.** The release ritual: confirm
+  the Version Packages PR is current, merge it into `dev`, then IMMEDIATELY
+  cut and merge the release PR (`dev` → `main`) — it carries the bump, so CI
+  validates the exact tree that publishes. Merging runs `release.yml`, which
+  ONLY publishes (any package.json version not yet on npm) + tags + GitHub
+  releases; it never opens PRs or commits to main. The live demo deploys
+  from `main`.
+- **No `main` → `dev` back-sync exists anymore** — main only ever receives
+  merge commits from dev, so there is nothing to flow back. The freeze
+  window (a feature merging into dev between the Version-PR merge and the
+  release-PR merge) is guarded by release.yml's tripwire: pending changeset
+  files on main FAIL the publish loudly; merge the regenerated Version
+  Packages PR and re-cut the release PR.
+- **Changesets peer-escalation trap:** a breakwater MINOR leaves flowsafe's
+  `^0.x` peer range, and changesets escalates an out-of-range peer dependent
+  to MAJOR (0.2.0 proposed flowsafe 1.0.0 under a "Minor Changes" heading).
+  Until the peer range is widened, override the version by editing the
+  Version Packages PR before merging it.
+- CI (`ci.yml`) runs on both `main` and `dev`, so the verification gate
+  fires on every PR into the integration branch, not only at release time.
 
 ## Files
 
@@ -243,8 +255,9 @@ users); GitHub stays a config-only fallback.
 | `LICENSE` | Apache-2.0 license text | Licensing questions |
 | `SECURITY.md` | Vulnerability reporting (GitHub private advisories) + scope | Reporting or triaging a security issue |
 | `.github/workflows/ci.yml` | CI — verification gate + react-18 peer-floor probe (`typecheck:react18`, after Build) + react-doctor full gate + `spike:verify` on push/PR to `main`/`dev` | Changing CI, debugging a failed check |
-| `.github/workflows/release.yml` | Changesets release: on push to `main`, opens/updates the "Version Packages" PR or publishes unpublished versions to npm with provenance (needs the `NPM_TOKEN` secret) | Changing the publish pipeline, debugging a failed release |
-| `.changeset/` | Changesets config (`config.json`: public access, main base) + contributor how-to (`README.md`); pending changesets live here between releases | Adding a changeset, changing versioning behavior |
+| `.github/workflows/version.yml` | Bump-on-dev half of the release flow: on push to `dev`, maintains the standing "Version Packages" PR against dev (version bumps + changelogs on the integration branch; no-op without pending changesets) | Changing how versions are proposed |
+| `.github/workflows/release.yml` | Publish half: on push to `main`, refuses pending changesets (freeze-window tripwire), then publishes unpublished versions to npm with provenance + tags + GitHub releases (needs the `NPM_TOKEN` secret). Never opens PRs or commits to main | Changing the publish pipeline, debugging a failed release |
+| `.changeset/` | Changesets config (`config.json`: public access, `dev` base) + contributor how-to (`README.md`); pending changesets live here between releases | Adding a changeset, changing versioning behavior |
 | `package.json` | Root workspace manifest and scripts: `build`/`typecheck` fan out with `-r`; `lint`/`lint:fix` run ONE root Biome pass; `test`/`test:watch` run ONE root vitest; `dev` = showcase dev server; `docs:api` = typedoc (on-demand, output gitignored); `react-doctor`/`react-doctor:diff` mirrors; `prepare` installs husky | Adding dependencies, modifying workspace scripts |
 | `typedoc.json` | Root typedoc config (`entryPointStrategy: packages` over breakwater + flowsafe; out `docs/api/`, gitignored). approval-ui is deliberately NOT typedoc'd — its DOM/JSX program conflicts with the workers-typed one; its README documents that surface | Changing API-reference generation |
 | `pnpm-workspace.yaml` | pnpm workspace package globs + supply-chain `minimumReleaseAge` (7-day buffer; exclusions documented inline, incl. `deslop-js` for react-doctor's dlx install) | Adding or removing workspace packages, dependency-age failures |
