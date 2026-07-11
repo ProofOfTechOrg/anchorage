@@ -27,6 +27,7 @@
 import {
   type ApprovalActor,
   RUN_START_ROLES,
+  type TenantContext,
   TenantResolutionError,
   type TenantResolver,
 } from '../approval-api/index.js';
@@ -83,6 +84,33 @@ export interface RunRouterOptions {
     runId: string,
     body: unknown,
   ) => Promise<RunSummary>;
+  /**
+   * D4 self-healing hook (2026-07-11 audit): invoked after a status() read
+   * reports the run suspended, so every status poll of a stuck run doubles
+   * as a check for a gate whose approval never made it into the queue (a
+   * re-queue failure previously left it there with no recovery path — see
+   * reconcileApprovalsForSummary in approval-bridge.ts). Awaited rather than
+   * fire-and-forget by DEFAULT: this host-agnostic layer has no ctx.waitUntil
+   * of its own to keep a detached promise alive past the response, so a
+   * plain awaited call is what it can offer on its own. The work is no
+   * longer cheap (2026-07-11 audit follow-up): reconcile now pages the run's
+   * full approval history and may supersede stale open records before
+   * filing a fresh one, so the two ctx-capable hosts (deploy/worker.ts, the
+   * showcase worker) hand this hook a wrapper that detaches the real work
+   * via ctx.waitUntil and resolves immediately — this option's contract (an
+   * awaited function of this exact shape) is unchanged either way, only
+   * what a given host's function actually blocks on. A throw is caught and
+   * logged here, never surfaced to the caller: a broken reconcile must not
+   * turn a working status read into a 500; the next poll simply retries.
+   * Absent => today's behavior (no reconciliation). Hosts wire
+   * reconcileApprovalsOnStatus(systemActorId) here, optionally wrapped for
+   * waitUntil-detachment.
+   */
+  reconcileApprovals?: (
+    tenant: TenantContext,
+    workflowId: string,
+    summary: RunSummary,
+  ) => Promise<void>;
 }
 
 export type RunRouter = (request: Request) => Promise<Response | null>;
@@ -280,7 +308,22 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
         runId
       ) {
         const summary = await options.status(workflowId, runId);
-        return summary ? json(summary) : json({ error: 'run not found' }, 404);
+        if (!summary) return json({ error: 'run not found' }, 404);
+        if (summary.status === 'suspended' && options.reconcileApprovals) {
+          try {
+            await options.reconcileApprovals(tenant, workflowId, summary);
+          } catch (error) {
+            console.error(
+              JSON.stringify({
+                type: 'reconcile-error',
+                workflowId,
+                runId,
+                error: error instanceof Error ? error.message : String(error),
+              }),
+            );
+          }
+        }
+        return json(summary);
       }
 
       if (

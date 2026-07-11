@@ -91,6 +91,8 @@ import {
   numberVar,
   parseActorTokens,
   RunRouteError,
+  reconcileApprovalsOnStatusDetached,
+  runApprovalRetentionPurge,
   runSlaSweepMaintenance,
   staticTokenVerifier,
   type TokenVerifier,
@@ -165,6 +167,8 @@ interface Env {
   DEMO_JWT_TTL_SECONDS?: string;
   /** Cron purges terminal run snapshots older than this (var; default 30; 0 = immediately). */
   RUN_RETENTION_DAYS?: string;
+  /** Cron purges DECIDED (approved/rejected) approval records older than this (var; default 30; 0 = immediately). */
+  APPROVAL_RETENTION_DAYS?: string;
   /**
    * Optional audit export to a SIEM: bind a queue producer (wrangler.jsonc
    * `queues` block) and audit events flow producer -> queue -> the `queue`
@@ -409,6 +413,7 @@ function runRouterFor(
   env: Env,
   resolve: TenantResolver,
   topology: DoRunTopology,
+  waitUntil: (promise: Promise<unknown>) => void,
 ) {
   return createRunRouter({
     workflows: SHOWCASE_MODULES.map((entry) => entry.meta),
@@ -435,6 +440,12 @@ function runRouterFor(
       await chargeDemoBudget(env, runId);
       return topology.resume(workflowId, runId, body);
     },
+    // D4 self-healing, waitUntil-detached — the shared host-kit wrapper owns
+    // the detach + reconcile-error logging.
+    reconcileApprovals: reconcileApprovalsOnStatusDetached(
+      SYSTEM_ACTOR_ID,
+      waitUntil,
+    ),
   });
 }
 
@@ -476,6 +487,15 @@ async function runPurgeMaintenance(env: Env, cron: string): Promise<void> {
       }),
     );
   }
+  // Own try/catch, same isolation as the snapshot purge above: a failure in
+  // any one purge duty must never stop the others (D3, 2026-07-11 audit). The
+  // purge itself now lives in host-kit (2026-07-11 audit follow-up, FIX 5) —
+  // verbatim-shared with the deploy template instead of hand-copied.
+  const approvalsPurged = await runApprovalRetentionPurge({
+    store: approvalStoreFactoryFor(env.DB).system(),
+    retentionDays: env.APPROVAL_RETENTION_DAYS,
+    cron,
+  });
   try {
     // Expired demo sandboxes: complete offboarding per tenant (snapshots of
     // ANY status — a visitor who closed the tab mid-approval left a
@@ -504,7 +524,13 @@ async function runPurgeMaintenance(env: Env, cron: string): Promise<void> {
     );
   }
   console.log(
-    JSON.stringify({ type: 'maintenance', cron, purged, demoTenantsPurged }),
+    JSON.stringify({
+      type: 'maintenance',
+      cron,
+      purged,
+      approvalsPurged,
+      demoTenantsPurged,
+    }),
   );
 }
 
@@ -589,7 +615,12 @@ const handler: ExportedHandler<Env> = {
     const approvalResponse = await createApprovalRouter({ resolve })(routed);
     if (approvalResponse) return approvalResponse;
 
-    const runResponse = await runRouterFor(env, resolve, topology)(routed);
+    const runResponse = await runRouterFor(
+      env,
+      resolve,
+      topology,
+      waitUntil,
+    )(routed);
     if (runResponse) return runResponse;
 
     return json({ error: 'not found' }, 404);

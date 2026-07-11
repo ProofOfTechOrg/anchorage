@@ -55,6 +55,21 @@ describe('ApprovalApiClient', () => {
     });
   });
 
+  it('forwards limit and after in the query string', async () => {
+    // #given
+    const { fetch, calls } = makeFetch(() => ({ payload: [] }));
+    const client = new ApprovalApiClient({ fetch });
+
+    // #when
+    await client.list({ limit: 25, after: 'CURSOR_TOKEN' });
+
+    // #then
+    expect(calls[0]).toMatchObject({
+      method: 'GET',
+      url: '/api/approvals?limit=25&after=CURSOR_TOKEN',
+    });
+  });
+
   it('decides with a JSON body and drops empty comments', async () => {
     // #given
     const { fetch, calls } = makeFetch(() => ({ payload: { record: {} } }));

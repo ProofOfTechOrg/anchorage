@@ -13,6 +13,7 @@
 // D1ApprovalStoreFactory (tenant-store.ts) — this class is not exported from
 // the package barrel.
 
+import { d1Changes } from '../do-runner/d1-storage.js';
 import { TENANT_ID_PATTERN } from '../do-runner/path-safe-id.js';
 import {
   type ApprovalPatch,
@@ -23,9 +24,13 @@ import {
 import { type SystemApprovalStore, TENANT_BOUND } from './tenant-brand.js';
 import {
   type ApprovalListFilter,
+  type ApprovalMetrics,
   type ApprovalRecord,
   type ApprovalStatus,
+  clampApprovalLimit,
   OPEN_STATUSES,
+  parseApprovalCursor,
+  TERMINAL_APPROVAL_STATUSES,
 } from './types.js';
 
 /**
@@ -173,6 +178,71 @@ function appendListFilters(
     where.push('claimed_by = ?');
     values.push(filter.claimedBy);
   }
+  if (filter.after !== undefined) {
+    const cursor = parseApprovalCursor(filter.after);
+    // Row-value comparison — SQLite supports `(a, b) > (c, d)` as a single
+    // expression equivalent to `a > c OR (a = c AND b > d)`, matching
+    // byQueueOrder's (createdAt, id) tie-break exactly.
+    where.push('(created_at, id) > (?, ?)');
+    values.push(cursor.createdAt, cursor.id);
+  }
+}
+
+/**
+ * One aggregate query, computed once per call — the D3 replacement for
+ * loading every record into JS just to count. Must match
+ * store.ts's computeApprovalMetrics field-for-field (store.test.ts pins the
+ * cross-backend parity, including the AVG-over-julianday vs JS Date-ms/1000
+ * arithmetic landing on the same value for round-second fixtures). SUM over
+ * zero matching rows is SQL NULL, not 0 — COALESCE every count; AVG's NULL
+ * (no decided-with-decidedAt rows) maps straight to avgResolutionSeconds:
+ * null, so it is deliberately NOT coalesced.
+ */
+const METRICS_QUERY = `SELECT
+    COALESCE(SUM(CASE WHEN status IN ('pending','claimed','escalated') THEN 1 ELSE 0 END), 0) AS open_count,
+    COALESCE(SUM(CASE WHEN status IN ('pending','claimed','escalated') AND sla_deadline_at IS NOT NULL AND sla_deadline_at <= ? THEN 1 ELSE 0 END), 0) AS sla_breached_count,
+    COALESCE(SUM(CASE WHEN escalated_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS escalation_count,
+    COALESCE(SUM(CASE WHEN status IN ('approved','rejected') THEN 1 ELSE 0 END), 0) AS decided_count,
+    COALESCE(SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END), 0) AS approved_count,
+    COALESCE(SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END), 0) AS rejected_count,
+    AVG(CASE
+          WHEN status IN ('approved','rejected') AND decided_at IS NOT NULL
+          THEN (julianday(decided_at) - julianday(created_at)) * 86400.0
+        END) AS avg_resolution_seconds
+  FROM ${TABLE}
+  WHERE tenant_id = ?`;
+
+interface ApprovalMetricsRow {
+  open_count: number;
+  sla_breached_count: number;
+  escalation_count: number;
+  decided_count: number;
+  approved_count: number;
+  rejected_count: number;
+  avg_resolution_seconds: number | null;
+}
+
+function rowToApprovalMetrics(row: ApprovalMetricsRow | null): ApprovalMetrics {
+  if (!row) {
+    return {
+      openCount: 0,
+      slaBreachedCount: 0,
+      escalationCount: 0,
+      decidedCount: 0,
+      approvedCount: 0,
+      rejectedCount: 0,
+      avgResolutionSeconds: null,
+    };
+  }
+  return {
+    openCount: row.open_count,
+    slaBreachedCount: row.sla_breached_count,
+    escalationCount: row.escalation_count,
+    decidedCount: row.decided_count,
+    approvedCount: row.approved_count,
+    rejectedCount: row.rejected_count,
+    avgResolutionSeconds: row.avg_resolution_seconds,
+  };
 }
 
 /** The `SET col = ?` fragments + bound values of a CAS patch — both views. */
@@ -395,13 +465,25 @@ export class D1ApprovalStore implements ApprovalStore {
     const where: string[] = ['tenant_id = ?'];
     const values: unknown[] = [this.tenantId];
     appendListFilters(filter, where, values);
+    const limit = clampApprovalLimit(filter.limit);
     const { results } = await this.#db
       .prepare(
-        `SELECT * FROM ${TABLE} WHERE ${where.join(' AND ')} ORDER BY created_at ASC, id ASC`,
+        `SELECT * FROM ${TABLE} WHERE ${where.join(' AND ')} ORDER BY created_at ASC, id ASC${
+          limit !== undefined ? ' LIMIT ?' : ''
+        }`,
       )
-      .bind(...values)
+      .bind(...values, ...(limit !== undefined ? [limit] : []))
       .all<ApprovalRow>();
     return results.map(rowToRecord);
+  }
+
+  async metrics(nowMs: number): Promise<ApprovalMetrics> {
+    await this.#ready();
+    const row = await this.#db
+      .prepare(METRICS_QUERY)
+      .bind(new Date(nowMs).toISOString(), this.tenantId)
+      .first<ApprovalMetricsRow>();
+    return rowToApprovalMetrics(row);
   }
 
   async transition(
@@ -476,11 +558,14 @@ export function d1SystemApprovalStore(
       const values: unknown[] = [];
       appendListFilters(filter, where, values);
       const clause = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : '';
+      const limit = clampApprovalLimit(filter.limit);
       const { results } = await db
         .prepare(
-          `SELECT * FROM ${TABLE}${clause} ORDER BY created_at ASC, id ASC`,
+          `SELECT * FROM ${TABLE}${clause} ORDER BY created_at ASC, id ASC${
+            limit !== undefined ? ' LIMIT ?' : ''
+          }`,
         )
-        .bind(...values)
+        .bind(...values, ...(limit !== undefined ? [limit] : []))
         .all<ApprovalRow>();
       return results.map(rowToRecord);
     },
@@ -501,6 +586,28 @@ export function d1SystemApprovalStore(
         .bind(...values, id, ...from)
         .first<ApprovalRow>();
       return row ? rowToRecord(row) : null;
+    },
+    // Retention purge (D3/PART 4) — mirrors do-runner's
+    // purgeExpiredWorkflowRuns row-only batching: one LIMIT-batched DELETE
+    // per firing, no ORDER BY (the shrinking eligible set across firings is
+    // the cursor, not which N rows one firing picks). COALESCE(decided_at,
+    // updated_at) is the terminal-timestamp choice — see retention.ts.
+    async purgeExpired(cutoffIso: string, limit: number): Promise<number> {
+      await ready();
+      const placeholders = TERMINAL_APPROVAL_STATUSES.map(() => '?').join(', ');
+      const result = await db
+        .prepare(
+          `DELETE FROM ${TABLE}
+           WHERE id IN (
+             SELECT id FROM ${TABLE}
+             WHERE status IN (${placeholders})
+               AND COALESCE(decided_at, updated_at) < ?
+             LIMIT ?
+           )`,
+        )
+        .bind(...TERMINAL_APPROVAL_STATUSES, cutoffIso, limit)
+        .run();
+      return d1Changes(result);
     },
   };
 }

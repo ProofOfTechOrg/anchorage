@@ -281,6 +281,69 @@ export class ApprovalService {
     return { record: updated, resume: await this.#resume(updated, actor) };
   }
 
+  /**
+   * D4 follow-up (2026-07-11 audit): CAS-transitions a STALE OPEN record
+   * (pending/claimed/escalated, bound to a suspension its step has since
+   * moved past) straight to 'rejected'. host-kit's reconcileApprovalsForSummary
+   * calls this before filing a fresh record for a step whose only open
+   * record no longer matches the run's CURRENT (suspendedAt, resumeCount)
+   * fingerprint — the loop where a stale-but-open record otherwise never
+   * heals (every poll re-lists, finds the same open record via the
+   * open-step uniqueness index, and re-files nothing).
+   *
+   * Deliberately bypasses decide(): a rejection decision resumes the run
+   * with declined semantics via #resume(), and a stale record must die
+   * WITHOUT touching a run that is already suspended at a DIFFERENT
+   * (current) fingerprint — this method never calls #resume(). 'rejected'
+   * (not 'approved') is the deliberate terminal choice: approvedConnectorsForLeg
+   * (grants.ts) reads ONLY status: 'approved' records when deriving a leg's
+   * grants, so a superseded record is excluded by its STATUS alone, not
+   * merely by its stale fingerprint — it can never mint even if a future
+   * change loosened the fingerprint check.
+   *
+   * Never routed by router.ts (an ApprovalService method the HTTP surface
+   * never wires up) — reachable only from host-kit's
+   * reconcileApprovalsForSummary, itself only invoked from createRunRouter's
+   * optional reconcileApprovals hook on a status() read, never from a
+   * request body. Authorized like create() (CAN_CREATE, not CAN_REVIEW):
+   * the only actor that ever calls this is the same system actor create()
+   * already accepts for reconcile-filed records — superseding is the
+   * symmetric "un-file" half of that same self-healing operation, not a
+   * reviewer decision.
+   *
+   * Returns null — mirroring the store's own CAS contract, rather than
+   * throwing — when the record is unknown or already left the OPEN set (a
+   * real decision won the race): the caller backs off instead of treating a
+   * lost race as an error, the same "null = lost a race, skip quietly"
+   * contract sweepSLA uses for its own store-level CAS.
+   */
+  async supersedeStale(
+    id: string,
+    actor: ApprovalActor,
+    reason: string,
+  ): Promise<ApprovalRecord | null> {
+    this.#authorize(actor, CAN_CREATE, 'approval.supersede', `approval:${id}`);
+    const now = this.#now().toISOString();
+    const updated = await this.#store.transition(id, OPEN_STATUSES, {
+      status: 'rejected',
+      decidedBy: actor.id,
+      decision: 'reject',
+      comment: reason,
+      decidedAt: now,
+      updatedAt: now,
+    });
+    if (!updated) return null;
+    this.#record(actor, 'approval.supersede', `approval:${id}`, 'allowed', {
+      reason,
+      detail: {
+        tenantId: updated.tenantId,
+        workflowId: updated.workflowId,
+        runId: updated.runId,
+      },
+    });
+    return updated;
+  }
+
   async delegate(
     id: string,
     input: { to: string },
@@ -316,40 +379,9 @@ export class ApprovalService {
 
   async metrics(actor: ApprovalActor): Promise<ApprovalMetrics> {
     this.#authorize(actor, APPROVAL_ROLES, 'approval.read', 'approval');
-    const all = await this.#store.list();
-    const now = this.#now().getTime();
-    const open = all.filter((record) => OPEN_STATUSES.includes(record.status));
-    const decided = all.filter(
-      (record) => record.status === 'approved' || record.status === 'rejected',
-    );
-    const resolutionsSeconds = decided
-      .filter((record) => record.decidedAt !== undefined)
-      .map(
-        (record) =>
-          (Date.parse(record.decidedAt as string) -
-            Date.parse(record.createdAt)) /
-          1000,
-      );
-    return {
-      openCount: open.length,
-      slaBreachedCount: open.filter(
-        (record) =>
-          record.slaDeadlineAt !== undefined &&
-          Date.parse(record.slaDeadlineAt) <= now,
-      ).length,
-      escalationCount: all.filter((record) => record.escalatedAt !== undefined)
-        .length,
-      decidedCount: decided.length,
-      approvedCount: decided.filter((record) => record.status === 'approved')
-        .length,
-      rejectedCount: decided.filter((record) => record.status === 'rejected')
-        .length,
-      avgResolutionSeconds:
-        resolutionsSeconds.length > 0
-          ? resolutionsSeconds.reduce((sum, value) => sum + value, 0) /
-            resolutionsSeconds.length
-          : null,
-    };
+    // D3: computation moved into the store contract (SQL aggregate on D1,
+    // JS reduction on in-memory) instead of loading every record here.
+    return this.#store.metrics(this.#now().getTime());
   }
 
   // CAS wrapper: on guard failure, disambiguate unknown id (404) from a

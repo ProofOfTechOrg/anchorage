@@ -4,11 +4,17 @@
 // shares one implementation instead of re-deriving the (suspendedAt, resumeCount)
 // capture and the SoD-across-gates re-queue.
 
-import type {
-  ApprovalActor,
-  ApprovalDecision,
-  ApprovalRecord,
-  ApprovalService,
+import {
+  type ApprovalActor,
+  type ApprovalAuditSink,
+  type ApprovalDecision,
+  type ApprovalRecord,
+  type ApprovalService,
+  approvalCursor,
+  MAX_APPROVAL_LIST_LIMIT,
+  OPEN_STATUSES,
+  stepKeyOf,
+  type TenantContext,
 } from '../approval-api/index.js';
 import type { RunSummary } from '../do-runner/index.js';
 
@@ -126,11 +132,19 @@ export async function queueApprovalForSuspension(
  * `getService` is a thunk because the service references this closure at its own
  * construction (`service = new ApprovalService({ resumeRun: resumeRunWithRequeue(base, () => service, sys) })`);
  * the closure only runs on a later decision, so the reference is resolved by then.
+ *
+ * `audit` is optional and should be the SAME sink the service itself uses
+ * (buildHostApprovalService wires it that way): the base resume above has
+ * already durably advanced the run by the time the re-queue below can fail,
+ * so a throw here (D4, 2026-07-11 audit) leaves a gate suspended with no
+ * approval record and no other signal that happened. reconcileApprovalsForSummary
+ * is the recovery; this event is what tells an operator it was needed.
  */
 export function resumeRunWithRequeue(
   base: ResumeRunFn,
   getService: () => ApprovalService,
   systemActor: ApprovalActor,
+  audit?: ApprovalAuditSink,
 ): ResumeRunFn {
   return async (record, decision) => {
     const summary = await base(record, decision);
@@ -140,14 +154,189 @@ export function resumeRunWithRequeue(
           'resumeRunWithRequeue: decidedBy unset — refusing to re-queue an approval without a requester',
         );
       }
-      await queueApprovalForSuspension(
-        getService(),
-        record.workflowId,
-        summary,
-        record.decidedBy,
-        systemActor,
-      );
+      try {
+        await queueApprovalForSuspension(
+          getService(),
+          record.workflowId,
+          summary,
+          record.decidedBy,
+          systemActor,
+        );
+      } catch (error) {
+        // Best-effort: a crashing sink must not mask the resume failure it is
+        // reporting (same "availability over export reliability" posture as
+        // ApprovalService's own #record).
+        try {
+          audit?.({
+            actor: systemActor,
+            action: 'approval.requeue',
+            resource: `approval:${record.id}`,
+            decision: 'error',
+            reason: error instanceof Error ? error.message : String(error),
+            detail: {
+              tenantId: record.tenantId,
+              workflowId: record.workflowId,
+              runId: record.runId,
+              suspended: summary.suspended,
+            },
+          });
+        } catch {
+          // ignore — see comment above
+        }
+        throw error;
+      }
     }
     return summary;
+  };
+}
+
+/**
+ * Pages service.list() to completion via the D3 cursor instead of one
+ * unbounded call (`filter.limit` unset otherwise means "no limit" —
+ * types.ts's clampApprovalLimit). reconcileApprovalsForSummary needs a
+ * suspended run's FULL approval history — every status, every past
+ * suspension — to tell a stale fingerprint from a current one; a truncated
+ * read could hide a stale open record (so it never gets superseded) or a
+ * decided-current one (so a fresh record double-files over it).
+ */
+async function listAllApprovals(
+  service: ApprovalService,
+  filter: { workflowId: string; runId: string },
+  actor: ApprovalActor,
+): Promise<ApprovalRecord[]> {
+  const all: ApprovalRecord[] = [];
+  let after: string | undefined;
+  for (;;) {
+    const page = await service.list(
+      { ...filter, limit: MAX_APPROVAL_LIST_LIMIT, after },
+      actor,
+    );
+    all.push(...page);
+    const last = page.at(-1);
+    if (page.length < MAX_APPROVAL_LIST_LIMIT || !last) break;
+    after = approvalCursor(last);
+  }
+  return all;
+}
+
+/**
+ * D4 recovery primitive: given a run's suspended RunSummary, heals every
+ * CURRENTLY suspended step whose exact (suspendedAt, resumeCount)
+ * fingerprint has no approval record of ANY status, then files it fresh.
+ * Safe to call on every status() read of a suspended run, rather than only
+ * after a confirmed bridge failure, because per step:
+ *
+ *  - any record (any status) already bound to the CURRENT fingerprint means
+ *    nothing to do — a matching pending/claimed/escalated record makes
+ *    queueApprovalForSuspension's own idempotent create() a no-op anyway
+ *    (this skips the round-trip), and a matching DECIDED record means the
+ *    decision landed but its resume has not (yet, or ever, on the wedge path
+ *    this exists for) re-queued the next gate — re-filing would double-file
+ *    a gate correctly waiting on its own resume, the decide -> resume
+ *    in-flight window;
+ *  - otherwise, every STALE OPEN record for that step (pending/claimed/
+ *    escalated, bound to a suspension the step has since moved past —
+ *    produced e.g. by the raw grant-free resume route re-suspending the step
+ *    while an earlier request still sits open) is SUPERSEDED first
+ *    (ApprovalService.supersedeStale: a CAS transition straight to
+ *    'rejected', system-attributed, audited as approval.supersede, never
+ *    through decide() — so it never touches the run) before the fresh file,
+ *    closing the loop where a stale-but-open record otherwise never heals
+ *    (every poll re-lists, finds the same open record via the open-step
+ *    uniqueness index, and re-files nothing). A stale DECIDED record needs
+ *    no supersede — it is already terminal and excluded from grant
+ *    derivation by its own (non-'approved', or fingerprint-mismatched)
+ *    status.
+ *  - if a supersede loses its CAS (a real decision won the race between the
+ *    list() above and the supersede), this step is left alone for this
+ *    round entirely — no fresh file — rather than clobbering or
+ *    double-filing over a decision that just landed; the next status() read
+ *    re-evaluates against a fresh summary and a fresh list().
+ *
+ * Delegates the actual filing to queueApprovalForSuspension against a copy of
+ * `summary` narrowed to only the healed paths, so a step with a live or
+ * in-flight record is never touched. `requestedBy` on a reconciled record is
+ * the SYSTEM actor, not a human: on the re-queue-failure trigger a reviewer
+ * DID cause the suspension, but reconcile has only the RunSummary to work
+ * from and no reliable way to recover who — so it attributes to the system
+ * actor rather than guess (see the SoD note in retention.ts and the
+ * operations runbook). That is a deliberate, narrow SoD relaxation on this
+ * recovery path only: the gate-A decider MAY legally decide the reconciled
+ * gate B, same as the retention-purge recovery path.
+ */
+export async function reconcileApprovalsForSummary(
+  service: ApprovalService,
+  workflowId: string,
+  summary: RunSummary,
+  systemActor: ApprovalActor,
+): Promise<ApprovalRecord[]> {
+  const suspended = summary.suspended ?? [];
+  if (suspended.length === 0) return [];
+  const existing = await listAllApprovals(
+    service,
+    { workflowId, runId: summary.runId },
+    systemActor,
+  );
+  const toFile: string[][] = [];
+  for (const stepPath of suspended) {
+    const stepKey = stepKeyOf(stepPath);
+    const suspendedAt = summary.suspendedAt?.[stepKey];
+    const resumeCount = summary.resumeCount?.[stepKey];
+    const stepRecords = existing.filter(
+      (record) => stepKeyOf(record.stepPath) === stepKey,
+    );
+    const boundToCurrent = stepRecords.some(
+      (record) =>
+        record.suspendedAt === suspendedAt &&
+        record.resumeCount === resumeCount,
+    );
+    if (boundToCurrent) continue;
+
+    let lostRace = false;
+    for (const record of stepRecords) {
+      if (!OPEN_STATUSES.includes(record.status)) continue;
+      const superseded = await service.supersedeStale(
+        record.id,
+        systemActor,
+        'superseded: stale suspension fingerprint',
+      );
+      // null = a real decision won the CAS between the list() above and this
+      // supersede — back off THIS step for THIS round rather than clobber or
+      // double-file; the next status() read re-evaluates fresh.
+      if (!superseded) lostRace = true;
+    }
+    if (lostRace) continue;
+    toFile.push(stepPath);
+  }
+  if (toFile.length === 0) return [];
+  return queueApprovalForSuspension(
+    service,
+    workflowId,
+    { ...summary, suspended: toFile },
+    systemActor.id,
+    systemActor,
+  );
+}
+
+/**
+ * Adapts reconcileApprovalsForSummary to RunRouterOptions.reconcileApprovals's
+ * per-request shape: `tenant.service()`/`tenant.tenantId` only exist once a
+ * request resolves, so only the systemActorId (a per-deployment constant) can
+ * be bound ahead of time — everything else is read from the tenant the router
+ * hands in on each call.
+ */
+export function reconcileApprovalsOnStatus(
+  systemActorId: string,
+): (
+  tenant: TenantContext,
+  workflowId: string,
+  summary: RunSummary,
+) => Promise<void> {
+  return async (tenant, workflowId, summary) => {
+    await reconcileApprovalsForSummary(tenant.service(), workflowId, summary, {
+      id: systemActorId,
+      role: 'operator',
+      tenantId: tenant.tenantId,
+    });
   };
 }

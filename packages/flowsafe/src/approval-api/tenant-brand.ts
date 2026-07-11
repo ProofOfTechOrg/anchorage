@@ -46,4 +46,13 @@ export interface SystemApprovalStore {
     from: readonly ApprovalRecord['status'][],
     patch: ApprovalPatch,
   ): Promise<ApprovalRecord | null>;
+  /**
+   * Deletes TERMINAL (approved/rejected) records whose terminal timestamp —
+   * decidedAt, or updatedAt when a decided record was persisted without one
+   * — is strictly before cutoffIso, bounded to at most `limit` deletions.
+   * The retention-purge primitive behind purgeExpiredApprovals
+   * (retention.ts) — cron-only by type, exactly like list/transition: a
+   * tenant-bound store never gains this method.
+   */
+  purgeExpired(cutoffIso: string, limit: number): Promise<number>;
 }

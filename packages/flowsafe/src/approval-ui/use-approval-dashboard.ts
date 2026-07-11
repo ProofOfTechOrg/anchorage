@@ -8,17 +8,57 @@ import { useCallback, useEffect, useState } from 'react';
 
 import type {
   ApprovalDecision,
+  ApprovalListFilter,
   ApprovalMetrics,
   ApprovalRecord,
 } from '../approval-api/types.js';
+import { OPEN_STATUSES } from '../approval-api/types.js';
 import type { ApprovalApiClient } from './client.js';
 import { sortQueue } from './view-model.js';
+
+/**
+ * The dashboard's default queue slice: open (non-terminal) requests only,
+ * page-bounded at 100. An unfiltered client.list() repeated every poll is a
+ * full-table scan on every open dashboard (2026-07-11 audit, D3) — this is
+ * the fallback whenever a caller does not override
+ * UseApprovalDashboardOptions.filter.
+ */
+export const DEFAULT_QUEUE_FILTER: ApprovalListFilter = {
+  status: [...OPEN_STATUSES],
+  limit: 100,
+};
+
+/**
+ * One poll's worth of dashboard data. DOM-free and hook-free — pulled out of
+ * refresh() so the filter wiring (which ApprovalListFilter reaches
+ * client.list) is testable without mounting the hook: approval-ui has no
+ * renderer (see components.test.ts's "hooks need a renderer, the merge does
+ * not" — the package's documented no-jsdom stance). metrics() is
+ * deliberately called with no filter: it always summarizes the whole tenant
+ * queue, independent of the queue view's slice.
+ */
+export async function fetchDashboardSnapshot(
+  client: Pick<ApprovalApiClient, 'list' | 'metrics'>,
+  filter: ApprovalListFilter,
+): Promise<{ records: ApprovalRecord[]; metrics: ApprovalMetrics }> {
+  const [records, metrics] = await Promise.all([
+    client.list(filter),
+    client.metrics(),
+  ]);
+  return { records, metrics };
+}
 
 export interface UseApprovalDashboardOptions {
   /** Queue/metrics refresh cadence; <= 0 disables polling. Default 10s. */
   pollIntervalMs?: number;
   /** Injectable clock (deterministic SLA countdowns in tests/stories). */
   now?: () => number;
+  /**
+   * The queue list filter, re-applied on every poll. Default:
+   * DEFAULT_QUEUE_FILTER (open statuses, limit 100) — bounded so the
+   * dashboard never issues an unfiltered full-table scan.
+   */
+  filter?: ApprovalListFilter;
 }
 
 export interface ApprovalDashboardState {
@@ -41,7 +81,11 @@ export interface ApprovalDashboardState {
 
 export function useApprovalDashboard(
   client: ApprovalApiClient,
-  { pollIntervalMs = 10_000, now = Date.now }: UseApprovalDashboardOptions = {},
+  {
+    pollIntervalMs = 10_000,
+    now = Date.now,
+    filter = DEFAULT_QUEUE_FILTER,
+  }: UseApprovalDashboardOptions = {},
 ): ApprovalDashboardState {
   const [records, setRecords] = useState<ApprovalRecord[]>([]);
   const [metrics, setMetrics] = useState<ApprovalMetrics | null>(null);
@@ -52,10 +96,8 @@ export function useApprovalDashboard(
 
   const refresh = useCallback(async () => {
     try {
-      const [nextRecords, nextMetrics] = await Promise.all([
-        client.list(),
-        client.metrics(),
-      ]);
+      const { records: nextRecords, metrics: nextMetrics } =
+        await fetchDashboardSnapshot(client, filter);
       setRecords(nextRecords);
       setMetrics(nextMetrics);
       setNowMs(now());
@@ -63,7 +105,7 @@ export function useApprovalDashboard(
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
-  }, [client, now]);
+  }, [client, now, filter]);
 
   useEffect(() => {
     void refresh();

@@ -7,6 +7,8 @@
 | File | What | When to read |
 | ---- | ---- | ------------ |
 | `README.md` | Package purpose, subpackage roles, status, DO-runner usage example | Understanding flowsafe's design and wiring a workflow into a Durable Object |
+| `CHANGELOG.md` | Release notes (0.1.0 unreleased; breakwater is an optional peer consumed only by `./host-kit/module`) | Cutting a release |
+| `LICENSE` | Apache-2.0 copy shipped in the npm tarball (packing ignores the repo-root LICENSE) | Never edit separately — keep identical to the root LICENSE |
 | `package.json` | Manifest, subpath exports (`./approval-api`, `./approval-ui`, `./artifacts`, `./audit-export`, `./do-runner`, `./host-kit`), scripts (`spike`/`spike:verify`, `deploy:cf`/`deploy:dev`; build/typecheck run the extra approval-ui passes incl. the UI TEST pass `src/approval-ui/tsconfig.test.json`, plus `spike/` + `deploy/` tsc passes). Sole runtime dep is `@mastra/cloudflare-d1`. Optional react peers (React 18+); breakwater devDep (tests only). The Astryx-styled demo app lives in the separate `showcase` package — published consumers pull zero Astryx | Adding a subpath export, changing scripts, bumping deps |
 | `tsconfig.json` | Build TS config (emits `dist/`; excludes the approval-ui JSX set, which compiles in its own pass) | Changing build output or compiler options |
 | `tsconfig.test.json` | Test-only TS config (`paths`/`rootDir` resolve `@proofoftech/breakwater` AND the `@proofoftech/flowsafe/*` subpaths from source — the latter so `deploy/worker.ts`, pulled in by its e2e test, typechecks without `dist/`) | Debugging test typecheck failures, changing cross-package test resolution |

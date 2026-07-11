@@ -16,6 +16,8 @@
 export {
   queueApprovalForSuspension,
   type ResumeRunFn,
+  reconcileApprovalsForSummary,
+  reconcileApprovalsOnStatus,
   resumeRunWithRequeue,
 } from './approval-bridge.js';
 export { bearerActorAuthenticator, parseActorTokens } from './bearer-auth.js';
@@ -32,10 +34,13 @@ export { boolVar, type NumberVarOptions, numberVar } from './env-vars.js';
 // buildHostApprovalService / runSlaSweepMaintenance, and no host consumes it
 // directly.
 export {
+  type ApprovalRetentionPurgeOptions,
   approvalStoreFactoryFor,
   buildHostApprovalService,
   type HostApprovalServiceOptions,
   maintenanceActor,
+  reconcileApprovalsOnStatusDetached,
+  runApprovalRetentionPurge,
   runSlaSweepMaintenance,
   type SlaSweepMaintenanceOptions,
 } from './host-approval-service.js';

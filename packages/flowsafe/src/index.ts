@@ -13,11 +13,17 @@
 // 6. Host kit — the shared run routes, bearer auth seam, and suspension→approval
 //    bridge every host mounts (subpath export '@proofoftech/flowsafe/host-kit'
 //    only — it is host glue, not part of the library's core surface)
+//
+// Export rule: this root barrel mirrors the approval-api, do-runner,
+// artifacts, and audit-export subpath barrels COMPLETELY — anything those
+// subpaths export is also importable from the package root. approval-ui and
+// host-kit are subpath-only by design (React peer / host glue).
 
 export type {
   ApprovalActor,
   ApprovalAuditEvent,
   ApprovalAuditSink,
+  ApprovalCursor,
   ApprovalDatabase,
   ApprovalDecision,
   ApprovalListFilter,
@@ -37,6 +43,7 @@ export type {
   CreateResult,
   CreateTenantResolverOptions,
   DecideResult,
+  PurgeExpiredApprovalsOptions,
   ResumeOutcome,
   SweepSLAOptions,
   SystemApprovalStore,
@@ -51,12 +58,14 @@ export {
   ApprovalAuthzError,
   ApprovalConflictError,
   ApprovalService,
+  approvalCursor,
   approvalGrantProvider,
   approvalGrantProviderFromFactory,
   approvedConnectorsForLeg,
   BREAKWATER_ACTOR_KEY,
   BREAKWATER_APPROVED_CONNECTORS_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
+  CLIENT_CREATE_FIELDS,
   createApprovalRouter,
   createTenantResolver,
   D1ApprovalStoreFactory,
@@ -64,12 +73,17 @@ export {
   InMemoryApprovalStore,
   InMemoryApprovalStoreFactory,
   InvalidApprovalInputError,
+  MAX_APPROVAL_LIST_LIMIT,
   OPEN_STATUSES,
+  parseApprovalCursor,
+  purgeExpiredApprovals,
+  RUN_START_ROLES,
   resumeViaRuntime,
   stepKeyOf,
   sweepSLA,
   TCB_ONLY_CREATE_FIELDS,
   TENANT_BOUND,
+  TERMINAL_APPROVAL_STATUSES,
   TenantResolutionError,
   UnknownApprovalError,
 } from './approval-api/index.js';
@@ -100,16 +114,23 @@ export type {
 } from './audit-export/index.js';
 export {
   createAuditQueueConsumer,
+  createAuditQueueHandler,
   queueAuditSink,
 } from './audit-export/index.js';
 export type {
+  D1DatabaseBinding,
   D1StorageOptions,
   DORunnerEnv,
+  DurableObjectRunnerState,
   InitOptions,
   InitResult,
   InitSource,
   PurgeExpiredRunsOptions,
+  PurgeTenantOptions,
+  PurgeTenantResult,
   RequestContextProvider,
+  ResumeLedger,
+  ResumeLedgerStorage,
   ResumeRunOptions,
   RunLeg,
   RunnerRuntimeOptions,
@@ -117,16 +138,25 @@ export type {
   SnapshotDatabase,
   SnapshotStatement,
   StartRunOptions,
+  TenantArtifactPurger,
 } from './do-runner/index.js';
 export {
   createD1Storage,
   DurableObjectRunner,
+  DurableStorageResumeLedger,
+  d1Changes,
+  ensureSnapshotRunIdIndex,
+  InMemoryResumeLedger,
   InvalidRunRequestError,
   init,
+  PATH_SAFE_ID_PATTERN,
   purgeExpiredWorkflowRuns,
+  purgeTenant,
   RunAlreadyExistsError,
   RunNotSuspendedError,
   RunnerRuntime,
+  TENANT_ID_PATTERN,
+  tenantOfRunId,
   UnknownRunError,
   UnknownWorkflowError,
 } from './do-runner/index.js';

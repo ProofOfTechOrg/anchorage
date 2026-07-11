@@ -10,6 +10,7 @@ import { ApprovalService } from './service.js';
 import { createTenantResolver } from './tenant-context.js';
 import { InMemoryApprovalStoreFactory } from './tenant-store.js';
 import type { ApprovalRecord, CreateApprovalInput } from './types.js';
+import { approvalCursor } from './types.js';
 
 // Header-based test authenticator behind the real TenantResolver (production
 // wires sessions/JWTs into the same seam). The x-actor-tenant header defaults
@@ -264,6 +265,54 @@ describe('createApprovalRouter', () => {
     expect(listed?.status).toBe(200);
     expect((await listed?.json()) as ApprovalRecord[]).toHaveLength(1);
     expect(invalid?.status).toBe(400);
+  });
+
+  it('paginates with limit and after, and 400s an out-of-range limit', async () => {
+    // #given — 3 records
+    const { handle } = makeHandler({ allowCreate: true });
+    await createOne(handle, { ...CREATE_BODY, runId: 'acme_run-p1' });
+    await createOne(handle, { ...CREATE_BODY, runId: 'acme_run-p2' });
+    await createOne(handle, { ...CREATE_BODY, runId: 'acme_run-p3' });
+
+    // #when — page 1 (limit 2)
+    const page1Response = await handle(req('/api/approvals?limit=2'));
+    const page1 = (await page1Response?.json()) as ApprovalRecord[];
+
+    // #then
+    expect(page1Response?.status).toBe(200);
+    expect(page1).toHaveLength(2);
+
+    // #when — page 2 via the cursor derived from page 1's last record
+    const cursor = approvalCursor(page1[1] as ApprovalRecord);
+    const page2Response = await handle(
+      req(`/api/approvals?limit=2&after=${encodeURIComponent(cursor)}`),
+    );
+
+    // #then
+    expect(page2Response?.status).toBe(200);
+    expect(((await page2Response?.json()) as ApprovalRecord[]).length).toBe(1);
+
+    // #then — garbage limit values 400
+    expect((await handle(req('/api/approvals?limit=0')))?.status).toBe(400);
+    expect((await handle(req('/api/approvals?limit=abc')))?.status).toBe(400);
+    expect((await handle(req('/api/approvals?limit=1.5')))?.status).toBe(400);
+    expect((await handle(req('/api/approvals?limit=501')))?.status).toBe(400);
+  });
+
+  it('400s a malformed after cursor', async () => {
+    // #given
+    const { handle } = makeHandler();
+
+    // #when / #then — invalid base64
+    expect(
+      (await handle(req('/api/approvals?after=not%20valid%20base64!!')))
+        ?.status,
+    ).toBe(400);
+    // #when / #then — valid base64, wrong shape (no delimiter)
+    expect(
+      (await handle(req(`/api/approvals?after=${btoa('no-delimiter-here')}`)))
+        ?.status,
+    ).toBe(400);
   });
 
   it('serves metrics at the literal segment, not as an id', async () => {

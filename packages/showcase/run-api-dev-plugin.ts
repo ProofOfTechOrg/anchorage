@@ -33,6 +33,7 @@ import {
   bearerActorAuthenticator,
   createRunRouter,
   parseActorTokens,
+  reconcileApprovalsOnStatus,
   resumeRunWithRequeue,
   staticTokenVerifier,
 } from '@proofoftech/flowsafe/host-kit';
@@ -138,6 +139,9 @@ export function runApiDevPlugin(): Plugin {
       };
       return runtime.resume(workflowId, runId, { step, resumeData });
     },
+    // D4: heal a suspended run whose approval never made it into the queue
+    // on the next status() poll (see reconcileApprovalsOnStatus).
+    reconcileApprovals: reconcileApprovalsOnStatus(SYSTEM_ACTOR_ID),
   });
   // The same reset router the deployed worker mounts, over in-memory seams:
   // every dev identity shares the 'demo' tenant (no D1 registry exists here,

@@ -77,6 +77,8 @@ export class ApprovalApiClient {
     if (filter.runId !== undefined) params.set('runId', filter.runId);
     if (filter.claimedBy !== undefined)
       params.set('claimedBy', filter.claimedBy);
+    if (filter.limit !== undefined) params.set('limit', String(filter.limit));
+    if (filter.after !== undefined) params.set('after', filter.after);
     const query = params.size > 0 ? `?${params.toString()}` : '';
     return (await this.#request(query)) as ApprovalRecord[];
   }

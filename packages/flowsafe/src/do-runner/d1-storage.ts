@@ -7,11 +7,12 @@
 import type { D1Database } from '@cloudflare/workers-types';
 import { D1Store } from '@mastra/cloudflare-d1';
 
+import type { D1DatabaseBinding } from './cf-types.js';
 import { TENANT_ID_PATTERN } from './path-safe-id.js';
 
 export interface D1StorageOptions {
   /** D1 binding from the Worker/DO environment. */
-  binding: D1Database;
+  binding: D1DatabaseBinding;
   /** Storage instance id. Default: 'flowsafe'. */
   id?: string;
   /** Table name prefix (letters, numbers, underscores). */
@@ -21,7 +22,11 @@ export interface D1StorageOptions {
 export function createD1Storage(options: D1StorageOptions): D1Store {
   return new D1Store({
     id: options.id ?? 'flowsafe',
-    binding: options.binding,
+    // @mastra/cloudflare-d1's own D1Store signature wants the real
+    // D1Database; D1DatabaseBinding is the structural subset this package
+    // exposes instead, so consumers of its shipped types don't need
+    // @cloudflare/workers-types installed.
+    binding: options.binding as unknown as D1Database,
     ...(options.tablePrefix !== undefined
       ? { tablePrefix: options.tablePrefix }
       : {}),

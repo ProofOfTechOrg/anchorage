@@ -23,6 +23,17 @@ export const OPEN_STATUSES: readonly ApprovalStatus[] = [
   'escalated',
 ];
 
+/**
+ * The approval lifecycle's closed states — the complement of OPEN_STATUSES.
+ * Once decided, a record never reopens (a later re-suspension of the same
+ * step files a FRESH record — see store.ts's open-uniqueness index). Drives
+ * the retention purge (retention.ts): only these statuses are ever eligible.
+ */
+export const TERMINAL_APPROVAL_STATUSES: readonly ApprovalStatus[] = [
+  'approved',
+  'rejected',
+];
+
 export const APPROVAL_PRIORITIES: readonly ApprovalPriority[] = [
   'low',
   'normal',
@@ -153,6 +164,87 @@ export interface ApprovalListFilter {
   workflowId?: string;
   runId?: string;
   claimedBy?: string;
+  /**
+   * Max records to return (clamped to [1, MAX_APPROVAL_LIST_LIMIT] — see
+   * clampApprovalLimit). undefined means no limit (the pre-D3 behavior);
+   * callers that poll a queue repeatedly should always set one.
+   */
+  limit?: number;
+  /**
+   * Opaque pagination cursor from approvalCursor() — resume list() strictly
+   * after that record in queue order (createdAt, then id). undefined starts
+   * from the beginning.
+   */
+  after?: string;
+}
+
+/** Hard cap on ApprovalListFilter.limit — see clampApprovalLimit. */
+export const MAX_APPROVAL_LIST_LIMIT = 500;
+
+/**
+ * Clamps a caller-supplied ApprovalListFilter.limit into
+ * [1, MAX_APPROVAL_LIST_LIMIT]. undefined passes through unchanged (no
+ * limit was requested at all). This is store-level defense in depth: the
+ * HTTP boundary (router.ts) rejects a non-integer or out-of-range limit
+ * outright (400) rather than silently clamping it, so a client typo is a
+ * loud error, not a surprising page size — this clamp exists for
+ * programmatic callers (in-process filters) so a pathological value can
+ * NEVER produce an unbounded query. That guarantee has to hold for
+ * non-finite input too: NaN and +/-Infinity clamp to MAX_APPROVAL_LIST_LIMIT
+ * (not to "no limit") — a caller that derives a limit from arithmetic that
+ * can divide by zero (e.g. a per-page budget) must still get a bounded
+ * query, not silently reopen the unbounded scan this function exists to
+ * prevent.
+ */
+export function clampApprovalLimit(
+  limit: number | undefined,
+): number | undefined {
+  if (limit === undefined) return undefined;
+  if (!Number.isFinite(limit)) return MAX_APPROVAL_LIST_LIMIT;
+  return Math.min(MAX_APPROVAL_LIST_LIMIT, Math.max(1, Math.trunc(limit)));
+}
+
+export interface ApprovalCursor {
+  createdAt: string;
+  id: string;
+}
+
+/**
+ * Opaque list() pagination cursor: base64 of `${createdAt}|${id}` — the
+ * exact (createdAt, id) tuple both stores order list() by (FIFO queue
+ * order — byQueueOrder in store.ts). A caller derives the next page's
+ * cursor from the last record of the current page and passes it as
+ * ApprovalListFilter.after; round-trips through parseApprovalCursor(). Both
+ * fields are ISO-8601/UUID-shaped and never contain '|', so the encoding is
+ * lossless. btoa/atob (not a bundled base64 lib) because they are ambient
+ * on Node >=16, Workers, and browsers alike — the same DOM-free-but-
+ * web-standard posture client.ts already relies on for fetch.
+ */
+export function approvalCursor(
+  record: Pick<ApprovalRecord, 'createdAt' | 'id'>,
+): string {
+  return btoa(`${record.createdAt}|${record.id}`);
+}
+
+/**
+ * Throws a plain Error (router.ts maps it to 400) when `cursor` is not a
+ * validly-shaped approvalCursor().
+ */
+export function parseApprovalCursor(cursor: string): ApprovalCursor {
+  let decoded: string;
+  try {
+    decoded = atob(cursor);
+  } catch {
+    throw new Error(`invalid approval cursor: '${cursor}'`);
+  }
+  const separator = decoded.indexOf('|');
+  if (separator <= 0 || separator === decoded.length - 1) {
+    throw new Error(`invalid approval cursor: '${cursor}'`);
+  }
+  return {
+    createdAt: decoded.slice(0, separator),
+    id: decoded.slice(separator + 1),
+  };
 }
 
 export interface ApprovalMetrics {

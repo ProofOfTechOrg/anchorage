@@ -19,12 +19,14 @@ import type {
 } from './d1-store.js';
 import { approvedConnectorsForLeg } from './grants.js';
 import type { ApprovalStore } from './store.js';
+import { computeApprovalMetrics } from './store.js';
 import {
   type ApprovalStoreFactory,
   D1ApprovalStoreFactory,
   InMemoryApprovalStoreFactory,
 } from './tenant-store.js';
 import type { ApprovalRecord } from './types.js';
+import { approvalCursor } from './types.js';
 
 let seq = 0;
 
@@ -61,7 +63,17 @@ function d1Like(db: SqliteDatabase): ApprovalDatabase {
       bind: (...values: unknown[]) => statement(sql, values),
       first: async <T>() =>
         (db.prepare(sql).get(...params) as T | undefined) ?? null,
-      run: async () => db.prepare(sql).run(...params),
+      // D1-shaped envelope: real D1's run() resolves { meta: { changes } },
+      // not node:sqlite's raw { changes } — a caller reading changes via
+      // d1Changes()'s meta.changes optional chain would silently see 0
+      // without this wrap (latent here since no test used to read it; see
+      // retention.test.ts's purgeExpired coverage).
+      run: async () => {
+        const outcome = db.prepare(sql).run(...params) as {
+          changes?: number | bigint;
+        };
+        return { meta: { changes: Number(outcome?.changes ?? 0) } };
+      },
       all: async <T>() => ({ results: db.prepare(sql).all(...params) as T[] }),
     };
   }
@@ -382,6 +394,170 @@ function describeStoreContract(
       expect(byInjectRun).toEqual([]);
       expect(byInjectClaimed).toEqual([]);
       expect(await store.get(record.id)).toMatchObject({ runId: 'safe-run' });
+    });
+
+    // ---- pagination (D3: limit + cursor) -----------------------------------
+
+    it('paginates with limit and a cursor, reconstructing the unpaged list with no gaps or dupes', async () => {
+      // #given — 5 records under one tenant
+      const store = await makeStore();
+      const created: ApprovalRecord[] = [];
+      for (let index = 0; index < 5; index += 1) {
+        const record = makeRecord({ runId: `run-page-${index}` });
+        await store.create(record);
+        created.push(record);
+      }
+      const all = await store.list();
+      expect(all.map((r) => r.id)).toEqual(created.map((r) => r.id));
+
+      // #when — page through with limit 2, deriving each cursor from the
+      // previous page's last record (the documented client contract)
+      const page1 = await store.list({ limit: 2 });
+      const page2 = await store.list({
+        limit: 2,
+        after: approvalCursor(page1[page1.length - 1] as ApprovalRecord),
+      });
+      const page3 = await store.list({
+        limit: 2,
+        after: approvalCursor(page2[page2.length - 1] as ApprovalRecord),
+      });
+      const pastTheEnd = await store.list({
+        limit: 2,
+        after: approvalCursor(page3[page3.length - 1] as ApprovalRecord),
+      });
+
+      // #then — three pages reconstruct the full ordered list, then nothing
+      expect(page1.map((r) => r.id)).toEqual(all.slice(0, 2).map((r) => r.id));
+      expect(page2.map((r) => r.id)).toEqual(all.slice(2, 4).map((r) => r.id));
+      expect(page3.map((r) => r.id)).toEqual(all.slice(4, 5).map((r) => r.id));
+      expect(pastTheEnd).toEqual([]);
+    });
+
+    it('clamps an out-of-range limit rather than ignoring it (defense in depth)', async () => {
+      // #given
+      const store = await makeStore();
+      for (let index = 0; index < 3; index += 1) {
+        await store.create(makeRecord({ runId: `run-clamp-${index}` }));
+      }
+
+      // #when / #then — 0 clamps up to 1
+      expect((await store.list({ limit: 0 })).length).toBe(1);
+    });
+
+    it('rejects a malformed cursor', async () => {
+      // #given
+      const store = await makeStore();
+
+      // #when / #then
+      await expect(
+        store.list({ after: 'not valid base64!!' }),
+      ).rejects.toThrow();
+    });
+
+    // ---- metrics() (D3: SQL aggregate on D1, JS reduction in-memory) ------
+
+    it('metrics() matches the reference JS computation — mixed statuses, undecided, and a missing-decidedAt edge case', async () => {
+      // #given — breached open, fresh open, ever-escalated open, two clean
+      // decisions (60s and 240s resolutions), a FRACTIONAL-second decision
+      // (12.345s — pins the julianday-vs-Date-ms float divergence on a
+      // non-round delta instead of leaving it untested), and a decided
+      // record with NO decidedAt (the fallback edge case retention.ts also
+      // has to handle)
+      const store = await makeStore();
+      const nowMs = Date.parse('2026-07-06T12:00:00.000Z');
+      const fixture: ApprovalRecord[] = [
+        makeRecord({
+          id: 'm-1',
+          status: 'pending',
+          createdAt: T,
+          updatedAt: T,
+          slaDeadlineAt: '2020-01-01T00:00:00.000Z',
+        }),
+        makeRecord({
+          id: 'm-2',
+          status: 'claimed',
+          createdAt: T,
+          updatedAt: T,
+          claimedBy: 'ray',
+          slaDeadlineAt: '2099-01-01T00:00:00.000Z',
+        }),
+        makeRecord({
+          id: 'm-3',
+          status: 'escalated',
+          createdAt: T,
+          updatedAt: T,
+          escalatedAt: T,
+        }),
+        makeRecord({
+          id: 'm-4',
+          status: 'approved',
+          createdAt: '2026-07-06T12:00:00.000Z',
+          decidedAt: '2026-07-06T12:01:00.000Z',
+          updatedAt: '2026-07-06T12:01:00.000Z',
+        }),
+        makeRecord({
+          id: 'm-5',
+          status: 'rejected',
+          createdAt: '2026-07-06T12:00:00.000Z',
+          decidedAt: '2026-07-06T12:04:00.000Z',
+          updatedAt: '2026-07-06T12:04:00.000Z',
+        }),
+        makeRecord({
+          id: 'm-6',
+          status: 'approved',
+          createdAt: T,
+          updatedAt: T,
+        }),
+        makeRecord({
+          id: 'm-7',
+          status: 'approved',
+          createdAt: '2026-07-06T12:00:00.000Z',
+          decidedAt: '2026-07-06T12:00:12.345Z',
+          updatedAt: '2026-07-06T12:00:12.345Z',
+        }),
+      ];
+      for (const record of fixture) await store.create(record);
+
+      // #when
+      const actual = await store.metrics(nowMs);
+
+      // #then — the reference reduction over the SAME fixture (store.ts's
+      // computeApprovalMetrics is the "old JS computation" both backends
+      // must match). Counts compare exactly; avgResolutionSeconds allows a
+      // small tolerance because D1's AVG(julianday()) and JS's
+      // Date-ms-divided-by-1000 are different floating-point paths to the
+      // same value — julianday's double-precision fractional-day
+      // representation carries single-digit-microsecond rounding noise at
+      // these magnitudes (empirically ~9e-6s on this fixture), comfortably
+      // under the tolerance below.
+      const expected = computeApprovalMetrics(fixture, nowMs);
+      const { avgResolutionSeconds: expectedAvg, ...expectedRest } = expected;
+      const { avgResolutionSeconds: actualAvg, ...actualRest } = actual;
+      expect(actualRest).toEqual(expectedRest);
+      if (expectedAvg === null) {
+        expect(actualAvg).toBeNull();
+      } else {
+        expect(actualAvg).toBeCloseTo(expectedAvg, 3);
+      }
+    });
+
+    it('metrics() reports zero counts and a null average on an empty store', async () => {
+      // #given
+      const store = await makeStore();
+
+      // #when
+      const metrics = await store.metrics(Date.now());
+
+      // #then
+      expect(metrics).toEqual({
+        openCount: 0,
+        slaBreachedCount: 0,
+        escalationCount: 0,
+        decidedCount: 0,
+        approvedCount: 0,
+        rejectedCount: 0,
+        avgResolutionSeconds: null,
+      });
     });
 
     // ---- tenant isolation (INV-2), over ONE shared backend ----------------

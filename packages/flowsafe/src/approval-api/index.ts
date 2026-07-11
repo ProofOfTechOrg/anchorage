@@ -33,6 +33,8 @@ export {
   defaultResumeData,
   resumeViaRuntime,
 } from './grants.js';
+export type { PurgeExpiredApprovalsOptions } from './retention.js';
+export { purgeExpiredApprovals } from './retention.js';
 export type { ApprovalRouter, ApprovalRouterOptions } from './router.js';
 export {
   CLIENT_CREATE_FIELDS,
@@ -70,6 +72,7 @@ export {
   InMemoryApprovalStoreFactory,
 } from './tenant-store.js';
 export type {
+  ApprovalCursor,
   ApprovalDecision,
   ApprovalListFilter,
   ApprovalMetrics,
@@ -83,5 +86,9 @@ export type {
 export {
   APPROVAL_PRIORITIES,
   APPROVAL_STATUSES,
+  approvalCursor,
+  MAX_APPROVAL_LIST_LIMIT,
   OPEN_STATUSES,
+  parseApprovalCursor,
+  TERMINAL_APPROVAL_STATUSES,
 } from './types.js';

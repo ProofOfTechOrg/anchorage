@@ -1,14 +1,15 @@
 // Unit coverage for the run surface every host mounts: the authorization ORDER
 // (401 -> coarse RUN_START_ROLES -> per-workflow allowedRoles), the catalog, the
-// start/status/resume routes and their error mapping, and the suspension bridge's
+// start/status/resume routes and their error mapping, the suspension bridge's
 // attribution (the starting actor becomes requestedBy, so they cannot decide
-// their own run).
+// their own run), and the D4 reconcileApprovals self-healing hook on status
+// reads.
 //
 // Driven with real InMemoryApprovalStore + ApprovalService (no mocks) and
 // fixture WorkflowMetas — depending on the showcase's modules here would invert
 // the layering (showcase imports host-kit, not the reverse).
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   type ApprovalActor,
@@ -23,7 +24,7 @@ import {
   UnknownRunError,
 } from '../do-runner/index.js';
 import { RunRouteError } from './run-route-error.js';
-import { createRunRouter } from './run-router.js';
+import { createRunRouter, type RunRouterOptions } from './run-router.js';
 import type { WorkflowMeta } from './workflow-meta.js';
 
 const SYSTEM: ApprovalActor = { id: 'sys', role: 'operator', tenantId: 'acme' };
@@ -86,6 +87,7 @@ interface HarnessOptions {
     runId: string,
     body: unknown,
   ) => Promise<RunSummary>;
+  reconcileApprovals?: RunRouterOptions['reconcileApprovals'];
 }
 
 function makeHarness(options: HarnessOptions = {}) {
@@ -133,6 +135,7 @@ function makeHarness(options: HarnessOptions = {}) {
         resumed.push({ workflowId, runId, body });
         return { runId, status: 'success' };
       }),
+    reconcileApprovals: options.reconcileApprovals,
   });
   return { store, service, handle, started, resumed };
 }
@@ -682,6 +685,87 @@ describe('createRunRouter — GET status and POST resume', () => {
     expect((await handle(req('/runs/open-flow/acme_r1/resume')))?.status).toBe(
       404,
     );
+  });
+});
+
+describe('createRunRouter — reconcileApprovals hook (D4 self-healing)', () => {
+  it('invokes reconcileApprovals when a status read reports the run suspended', async () => {
+    // #given
+    const calls: Array<{ workflowId: string; runId: string }> = [];
+    const { handle } = makeHarness({
+      status: async (_workflowId, runId) => suspendedSummary(runId),
+      reconcileApprovals: async (_tenant, workflowId, summary) => {
+        calls.push({ workflowId, runId: summary.runId });
+      },
+    });
+
+    // #when
+    const response = await handle(req('/runs/open-flow/acme_r1'));
+
+    // #then — the status projection itself is unaffected...
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({ status: 'suspended' });
+    // ...and the hook ran, told which run to check
+    expect(calls).toEqual([{ workflowId: 'open-flow', runId: 'acme_r1' }]);
+  });
+
+  it('does not invoke reconcileApprovals for a non-suspended status', async () => {
+    // #given — the default status thunk reports 'running'
+    const calls: unknown[] = [];
+    const { handle } = makeHarness({
+      reconcileApprovals: async () => {
+        calls.push(1);
+      },
+    });
+
+    // #when
+    await handle(req('/runs/open-flow/acme_r1'));
+
+    // #then
+    expect(calls).toEqual([]);
+  });
+
+  it('leaves status() behavior unchanged when reconcileApprovals is absent (the default)', async () => {
+    // #given — no reconcileApprovals option at all, matching every other
+    // status test in this file
+    const { handle } = makeHarness({
+      status: async (_workflowId, runId) => suspendedSummary(runId),
+    });
+
+    // #when
+    const response = await handle(req('/runs/open-flow/acme_r1'));
+
+    // #then
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({ status: 'suspended' });
+  });
+
+  it('a throwing reconcileApprovals is logged, not surfaced — a broken reconcile must not break status reads', async () => {
+    // #given
+    const { handle } = makeHarness({
+      status: async (_workflowId, runId) => suspendedSummary(runId),
+      reconcileApprovals: async () => {
+        throw new Error('reconcile boom');
+      },
+    });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when
+    const response = await handle(req('/runs/open-flow/acme_r1'));
+
+    // #then — the read still succeeds...
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({ status: 'suspended' });
+    // ...and the failure was logged for an operator, not swallowed silently
+    expect(
+      errorSpy.mock.calls.some(([line]) => {
+        const text = String(line);
+        return (
+          text.includes('reconcile-error') && text.includes('reconcile boom')
+        );
+      }),
+    ).toBe(true);
+    errorSpy.mockRestore();
   });
 });
 

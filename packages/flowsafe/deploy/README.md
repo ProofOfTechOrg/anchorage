@@ -7,7 +7,7 @@ snapshot retention. Copy this directory into your project as the starting
 point for a real deployment; it typechecks in-repo against flowsafe source
 through the same `@proofoftech/flowsafe/*` specifiers you keep when copying.
 
-The demo sibling (`../demo/`) is the minimal spike this template grew from;
+The spike sibling (`../spike/`) is the minimal worker this template grew from;
 deploy differences: real auth, cron maintenance, multi-gate approval
 bridging, `/healthz`, and env-tunable SLA/retention.
 
@@ -138,6 +138,16 @@ config-error: availability of both duties beats purity on a misconfig.)
   `R2ArtifactStore` as `artifactStore` (here and to `purgeTenant`): the
   snapshot row is the only record of a run's artifact keys, so an unpaired
   retention purge strands the purged runs' artifacts.
+- **Approval retention purge** — `purgeExpiredApprovals()` deletes DECIDED
+  (`approved`/`rejected`) approval records whose terminal timestamp
+  (`decidedAt`, or `updatedAt` for a decided record persisted without one)
+  is older than `APPROVAL_RETENTION_DAYS`, LIMIT-batched per firing, same
+  shrinking-eligible-set cursor convention. Open requests
+  (`pending`/`claimed`/`escalated`) are never purged at any age — an
+  approval still awaiting a decision is not garbage, mirroring
+  `purgeExpiredWorkflowRuns`'s "live runs are never purged". Runs in the
+  same `PURGE_CRON` firing as the snapshot purge, in its own isolated
+  try/catch, so a failure in either never stops the other.
 
 Keep the sweep interval at or below your SLA granularity; the default
 `*/15 * * * *` gives 4-hour SLAs minute-scale slack. Keep the wrangler
@@ -151,6 +161,7 @@ expressions byte-equal to crons.ts's `SWEEP_CRON`/`PURGE_CRON` constants.
 | `TENANT_APEX_DOMAIN` | var | unset (no cross-check) | Client-per-subdomain apex, e.g. `example.com`. A request to `<tenant>.<apex>` is denied unless the token's verified tenant is that tenant. Defense in depth over the tenant-bound stores |
 | `APPROVAL_SLA_SECONDS` | var | `14400` (4h) | Default SLA applied to new approvals |
 | `RUN_RETENTION_DAYS` | var | `30` | Terminal snapshot age before cron purge; `0` purges terminal runs immediately |
+| `APPROVAL_RETENTION_DAYS` | var | `30` | Decided (approved/rejected) approval record age before cron purge; `0` purges decided approvals immediately |
 | `AUDIT_QUEUE` | queue binding | unbound (logs only) | Enables audit export: events flow to the queue consumer |
 | `SIEM_ENDPOINT` | var | none (consumer retries) | HTTP event-collector URL the consumer POSTs NDJSON batches to |
 | `SIEM_AUTH_HEADER` | secret | none | Sent as the `authorization` header on export POSTs |
@@ -243,7 +254,7 @@ The template's correctness rests on four independently-maintained layers:
    separation of duties, grant derivation — is covered by the `approval-api`
    and `do-runner` unit tests. The template only *feeds* those guarantees; it
    does not reimplement them.
-4. **The `spike:verify` end-to-end proof on workerd.** The sibling `../demo/`
+4. **The `spike:verify` end-to-end proof on workerd.** The sibling `../spike/`
    worker shares the same library and is driven by
    `pnpm --filter @proofoftech/flowsafe spike:verify` (also run in CI), which
    proves suspend → process-kill → restart-on-persisted-state → grant-minted

@@ -29,6 +29,8 @@ import {
   type ApprovalListFilter,
   type ApprovalStatus,
   type CreateApprovalInput,
+  MAX_APPROVAL_LIST_LIMIT,
+  parseApprovalCursor,
 } from './types.js';
 
 /**
@@ -170,6 +172,35 @@ function parseListFilter(url: URL): ApprovalListFilter {
   if (runId !== null) filter.runId = runId;
   const claimedBy = url.searchParams.get('claimedBy');
   if (claimedBy !== null) filter.claimedBy = claimedBy;
+  const limit = url.searchParams.get('limit');
+  if (limit !== null) {
+    const parsed = Number(limit);
+    if (
+      !Number.isInteger(parsed) ||
+      parsed < 1 ||
+      parsed > MAX_APPROVAL_LIST_LIMIT
+    ) {
+      throw new InvalidApprovalInputError(
+        `limit must be an integer between 1 and ${MAX_APPROVAL_LIST_LIMIT} (got '${limit}')`,
+      );
+    }
+    filter.limit = parsed;
+  }
+  const after = url.searchParams.get('after');
+  if (after !== null) {
+    // Validate eagerly so a malformed cursor is a 400 here, not a 500 (or a
+    // silently-empty page) once it reaches the store — parseApprovalCursor
+    // is the one shared decoder (types.ts), so this is the exact check
+    // store.ts/d1-store.ts will apply again when they actually page with it.
+    try {
+      parseApprovalCursor(after);
+    } catch {
+      throw new InvalidApprovalInputError(
+        `after is not a valid approval cursor (got '${after}')`,
+      );
+    }
+    filter.after = after;
+  }
   return filter;
 }
 
