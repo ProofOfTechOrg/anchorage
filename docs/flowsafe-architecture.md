@@ -27,11 +27,12 @@ Endpoints (implemented in `packages/flowsafe/src/approval-api/router.ts`):
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/approvals` | List approvals (`?status=&workflowId=&runId=&claimedBy=`) |
+| GET | `/api/approvals` | List approvals (`?status=&workflowId=&runId=&claimedBy=&requestedBy=&createdBefore=&createdAfter=&limit=&after=&orderBy=` — time bounds are strict ISO-8601 instants, `after` is an opaque FIFO cursor, `orderBy=reviewer` ranks priority → SLA → FIFO before the page cut) |
 | GET | `/api/approvals/:id` | Approval detail with full context |
 | POST | `/api/approvals` | Create a request — **off by default** (`allowCreate`), and it can never author capability |
 | POST | `/api/approvals/:id/claim` | Claim an approval for review |
 | POST | `/api/approvals/:id/decide` | Approve or reject with comment; resumes the run |
+| POST | `/api/approvals/batch/decide` | One decision over ≤100 unique ids, fanned through the same per-record CAS/SoD/audit/resume path; partial failure reported per record in the envelope (HTTP 200) |
 | POST | `/api/approvals/:id/delegate` | Delegate to another reviewer |
 | GET | `/api/approvals/metrics` | SLA and resolution metrics (scoped to the caller's tenant) |
 
@@ -39,6 +40,12 @@ There is deliberately **no HTTP SLA-sweep route**. The sweep is an unfiltered
 cross-tenant read *and* write, so it ships as a standalone `sweepSLA(store, …)`
 over a `SystemApprovalStore` — a type request-scoped code cannot obtain — and a
 Workers cron calls it.
+
+Reviewer-facing pushes ride the `ApprovalNotificationSink` seam: fired once
+per record actually entering the queue and once per SLA escalation, contained
+fire-and-forget (a failing transport audits as `approval.notify` and never
+blocks the approval action). flowsafe ships no transport — hosts wire email,
+chat, or pagers, and must project/redact the record for lower-trust channels.
 
 Every state change is a status-guarded compare-and-swap in the store (D1
 partial-unique-index + `UPDATE ... RETURNING`), so racing reviewers resolve to

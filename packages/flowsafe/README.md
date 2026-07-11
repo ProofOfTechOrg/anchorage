@@ -13,15 +13,16 @@ standalone service with a React approval UI and a DO-based workflow runner.
 
 | Subpackage | Role |
 |---|---|
-| `approval-api` | REST API for submitting and reviewing approval requests |
-| `approval-ui` | Styling-agnostic React UI surfacing pending approvals and history |
+| `approval-api` | REST API for submitting and reviewing approval requests: claim/decide/delegate, batch decide, triage filters (requester + age bounds), SLA tracking + escalation, and the `ApprovalNotificationSink` transport seam |
+| `approval-ui` | Styling-agnostic React UI surfacing pending approvals and history, with queue triage (filter bar + batch selection/decide) |
 | `do-runner` | Durable Object workflow runner (import-swap pattern) |
 | `audit-export` | Cloudflare Queues → SIEM audit export (producer sink + batch consumer) |
 | `artifacts` | R2-backed workflow artifact storage keyed by run identity |
-| `host-kit` | Host-agnostic glue: the identity seam (`TokenVerifier`), the tenant resolver, the shared `/workflows` + `/runs` routes, the tenants registry, the suspension→approval bridge |
+| `host-kit` | Host-agnostic glue: the identity seam (`TokenVerifier`), the tenant resolver, the shared `/workflows` + `/runs` routes, the tenants registry, the suspension→approval bridge, and `createFlowsafeWorker()` — the composed production Worker hosts consume as thin shells |
 
-A copy-ready production deployment lives in [`deploy/`](deploy/) — a Worker
-wiring all of the above with cron-owned SLA enforcement and retention purge.
+A copy-ready production deployment lives in [`deploy/`](deploy/) — a thin
+shell over `createFlowsafeWorker()` with cron-owned SLA enforcement and
+retention purge.
 
 ## Installation
 

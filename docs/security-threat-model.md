@@ -213,6 +213,8 @@ Agentic workflows can read sensitive data, produce persuasive content, and write
 | Tenant-id collision merging two clients | Critical | `provisionTenant` insert-or-fail against the `tenants` registry, before any token naming that tenant is issued |
 | Confused deputy: tenant A's token used on tenant B's subdomain | Medium | Optional `withSubdomainCrossCheck` (routing-level; INV-2 remains the enforcing layer) |
 | Data surviving offboarding | High | `purgeTenant` reaps snapshots of any status, approvals, and R2 artifacts; run only after the tenant's tokens expire |
+| PII/secret leakage through model output | High | `piiSecrets` policy (regex + entropy + Luhn detectors over answer/reasoning/object channels, denial reasons never echo the match) + `classifierPolicy` async-classifier seam, both fail-closed; best-effort against adversarial encodings, like `denyPatterns` |
+| Sensitive suspend payloads exiting via a notification transport | Medium | `ApprovalNotificationEvent` deliberately carries the full record (reviewer context) — MORE than audit `detail`s, which stay id-scoped; the documented contract requires host transports on lower-trust channels (email, chat) to project/redact, sink failures are contained + audited as `approval.notify`, and flowsafe ships no transport |
 
 ## RBAC Model
 
