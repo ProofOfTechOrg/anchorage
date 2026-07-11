@@ -4,6 +4,10 @@
 // execution; D1 holds run snapshots so suspend/resume survives restarts.
 
 export type {
+  D1DatabaseBinding,
+  DurableObjectRunnerState,
+} from './cf-types.js';
+export type {
   D1StorageOptions,
   PurgeExpiredRunsOptions,
   PurgeTenantOptions,

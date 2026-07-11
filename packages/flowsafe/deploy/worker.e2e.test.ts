@@ -24,6 +24,9 @@
 //     retention purge (the two surfaces are isolated)
 //   - queue(): no SIEM endpoint -> the batch retries (nothing acked);
 //     configured -> one NDJSON POST with the auth header, then ack
+//   - D4 wedge recovery: a status() poll re-files an approval a suspended
+//     run lost, and deciding the re-filed record resumes the run to
+//     completion
 //
 // Scope note: the template's @proofoftech/flowsafe/* imports are aliased to
 // SOURCE here (vitest.config.ts / tsconfig.test.json) — this proves the
@@ -437,6 +440,72 @@ describe('deploy worker fetch(): tenant boundary (INV-1/INV-2 at the template)',
   });
 });
 
+describe('deploy worker fetch(): D4 wedge recovery (status() self-heals)', () => {
+  it('re-files a lost approval on the next status() poll, and deciding the re-filed record resumes the run to completion', async () => {
+    // #given — a normal suspension with its approval auto-queued...
+    const { env, sqlite } = makeEnv();
+    const started = await startRun(env);
+    const approvalId = started.approval?.id;
+    if (!approvalId) throw new Error('expected an auto-queued approval');
+
+    // ...then the WEDGE itself: the record is gone (a transient store
+    // failure mid re-queue leaves the same state — a suspended gate with no
+    // approval record at all). The queue is now empty for this run.
+    sqlite
+      .prepare('DELETE FROM flowsafe_approvals WHERE id = ?')
+      .run(approvalId);
+    const emptyQueue = await call(env, '/api/approvals', {
+      token: 'tok-reviewer',
+    });
+    expect(JSON.stringify(await emptyQueue.json())).not.toContain(approvalId);
+
+    // #when — an operator/dashboard polls the run's status
+    const status = await call(env, `/runs/example-approval/${started.runId}`, {
+      token: 'tok-viewer',
+    });
+
+    // #then — the read itself is unaffected by the wedge...
+    expect(status.status).toBe(200);
+    expect(await status.json()).toMatchObject({ status: 'suspended' });
+
+    // ...and the poll healed it: a FRESH approval now exists for the same
+    // gate, attributed to the system rather than a human requester
+    const requeued = await call(env, '/api/approvals', {
+      token: 'tok-reviewer',
+    });
+    const records = (await requeued.json()) as ApprovalRecord[];
+    const refiled = records.find(
+      (record) => record.runId === started.runId && record.status === 'pending',
+    );
+    expect(refiled).toBeDefined();
+    expect(refiled?.id).not.toBe(approvalId);
+    expect(refiled).toMatchObject({
+      stepPath: ['gate'],
+      connectors: ['example-publisher'],
+      requestedBy: 'flowsafe-worker',
+    });
+
+    // #when — the reviewer decides the RE-FILED record
+    const decide = await call(env, `/api/approvals/${refiled?.id}/decide`, {
+      method: 'POST',
+      body: JSON.stringify({ decision: 'approve' }),
+      token: 'tok-reviewer',
+    });
+
+    // #then — the grant the re-filed record derives admits the gated
+    // publish, and the run reaches completion despite the wedge
+    expect(decide.status).toBe(200);
+    const decided = (await decide.json()) as {
+      resume: { attempted: boolean; ok: boolean; summary?: RunSummary };
+    };
+    expect(decided.resume).toMatchObject({ attempted: true, ok: true });
+    expect(decided.resume.summary).toMatchObject({
+      status: 'success',
+      result: { topic: 'launch', published: true, approvedBy: 'rev-ray' },
+    });
+  });
+});
+
 // Column set per @mastra/core storage constants for mastra_workflow_snapshot
 // (camelCase timestamps, snapshot serialized as JSON TEXT) — the cron's purge
 // targets this exact table shape. Drift from the real adapter's DDL is pinned
@@ -730,6 +799,132 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
         const text = String(line);
         return text.includes('config-error') && text.includes('triggers.crons');
       }),
+    ).toBe(true);
+    errorSpy.mockRestore();
+  });
+
+  it('purges DECIDED approvals past APPROVAL_RETENTION_DAYS on the SAME PURGE_CRON firing as the snapshot purge', async () => {
+    // #given — an old decided (approved) approval, a fresh decided
+    // (rejected) approval, and an old but still-OPEN approval (never
+    // purged at any age). RUN_RETENTION_DAYS is unset (fallback default);
+    // APPROVAL_RETENTION_DAYS is deliberately invalid: numberVar must log
+    // the config error and fall back to 30 days rather than skip the purge.
+    const { env, d1 } = makeEnv({ APPROVAL_RETENTION_DAYS: '-5' });
+    const store = new D1ApprovalStoreFactory(d1 as never).forTenant('acme');
+    const old = new Date(Date.now() - 40 * DAY_MS).toISOString();
+    const fresh = new Date(Date.now() - 1 * DAY_MS).toISOString();
+    await store.create({
+      id: 'apr-old-decided',
+      tenantId: 'acme',
+      workflowId: 'example-approval',
+      runId: 'acme_r-old',
+      title: 'old decided',
+      connectors: [],
+      priority: 'normal',
+      status: 'approved',
+      createdAt: old,
+      updatedAt: old,
+      decidedAt: old,
+    });
+    await store.create({
+      id: 'apr-fresh-decided',
+      tenantId: 'acme',
+      workflowId: 'example-approval',
+      runId: 'acme_r-fresh',
+      title: 'fresh decided',
+      connectors: [],
+      priority: 'normal',
+      status: 'rejected',
+      createdAt: fresh,
+      updatedAt: fresh,
+      decidedAt: fresh,
+    });
+    await store.create({
+      id: 'apr-old-open',
+      tenantId: 'acme',
+      workflowId: 'example-approval',
+      runId: 'acme_r-open',
+      title: 'old but still open',
+      connectors: [],
+      priority: 'normal',
+      status: 'pending',
+      createdAt: old,
+      updatedAt: old,
+    });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when — the PURGE cron fires once
+    const purgeCtx = makeCtx();
+    await scheduledHandler(
+      { cron: PURGE_CRON } as unknown as ScheduledController,
+      env,
+      purgeCtx.ctx,
+    );
+    await purgeCtx.drain();
+
+    // #then — the stale decided record is gone; the fresh decided record
+    // and the still-open record (however old) both survive
+    expect(await store.get('apr-old-decided')).toBeNull();
+    expect(await store.get('apr-fresh-decided')).not.toBeNull();
+    expect(await store.get('apr-old-open')).not.toBeNull();
+    // ...and the invalid var was surfaced as the operator's tripwire (same
+    // convention as RUN_RETENTION_DAYS's config-error test above)
+    expect(
+      errorSpy.mock.calls.some(([line]) => {
+        const text = String(line);
+        return (
+          text.includes('config-error') &&
+          text.includes('APPROVAL_RETENTION_DAYS')
+        );
+      }),
+    ).toBe(true);
+    errorSpy.mockRestore();
+  });
+
+  it('an approval-purge failure does not stop the snapshot retention purge (isolated surfaces)', async () => {
+    // #given — every approvals-table statement throws; a stale terminal
+    // snapshot is still eligible
+    const { sqlite, d1 } = makeEnv();
+    const inner = d1 as { prepare(sql: string): unknown };
+    const broken = {
+      ...(d1 as Record<string, unknown>),
+      prepare(sql: string) {
+        if (sql.includes('flowsafe_approvals')) {
+          throw new Error('approval store down');
+        }
+        return inner.prepare(sql);
+      },
+    } as unknown as D1Database;
+    const env = {
+      DB: broken,
+      APPROVAL_ACTOR_TOKENS: JSON.stringify(TOKENS),
+    } as Env;
+    createSnapshotTable(sqlite);
+    seedRun(sqlite, {
+      runId: 'acme_stale-done',
+      status: 'success',
+      updatedAt: Date.now() - 40 * DAY_MS,
+    });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when — the PURGE cron fires
+    const purgeCtx = makeCtx();
+    await scheduledHandler(
+      { cron: PURGE_CRON } as unknown as ScheduledController,
+      env,
+      purgeCtx.ctx,
+    );
+    await purgeCtx.drain();
+
+    // #then — the snapshot purge still ran despite the broken approval
+    // store, and the approval-purge failure was logged under its own
+    // surface rather than silently dropped or aborting the snapshot purge
+    expect(remainingRunIds(sqlite)).toEqual([]);
+    const surfaces = errorSpy.mock.calls
+      .map(([line]) => String(line))
+      .filter((line) => line.includes('maintenance-error'));
+    expect(
+      surfaces.some((line) => line.includes('approval-retention-purge')),
     ).toBe(true);
     errorSpy.mockRestore();
   });

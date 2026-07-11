@@ -72,6 +72,20 @@ options, `writePermissions` (org-level approval globs), custom `evaluators`
 `rateLimitStore` (in-memory and D1 implementations ship), and `audit`
 (an `AuditLogger`; every allow/deny/error is recorded).
 
+## Known limits (accepted, not bugs)
+
+- **`egress` is declaration-based, not enforced at the socket.** The gate
+  checks what the manifest *says* it calls, not what `fetch`/the vendor SDK
+  actually reaches — there is no runtime interception yet. It catches
+  misconfiguration and org-policy drift, not a connector (or a compromised
+  dependency) that lies about its egress. Treat it as an allowlist on paper,
+  not a network sandbox, until fetch-level enforcement ships.
+- **`rateLimit` is a fixed window, not a hard cap.** A burst straddling the
+  boundary between two adjacent windows can admit up to ~2x the declared
+  budget (worse across isolates under clock skew). This is inherent to fixed
+  windows and is accepted; a hard per-second cap needs a token-bucket/GCRA
+  store instead of `RateLimitStore`'s fixed-window contract.
+
 ## Rules that keep the manifest honest
 
 - **Classify by the worst thing the connector can do.** A "create or

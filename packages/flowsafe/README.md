@@ -29,6 +29,12 @@ wiring all of the above with cron-owned SLA enforcement and retention purge.
 npm install @proofoftech/flowsafe
 ```
 
+Support matrix: Node >= 22, ESM only (TypeScript `moduleResolution`
+`node16`/`nodenext`/`bundler`; no CJS build), `@mastra/core` ^1.50.0 as a
+peer. React 18 or 19 is an optional peer used only by `./approval-ui`;
+`@proofoftech/breakwater` is an optional peer whose types only the
+`./host-kit/module` subpath references.
+
 ## Status
 
 Implemented, tested, and spike-verified. The do-runner + D1 adapter run a
@@ -229,6 +235,7 @@ character-exhaustive test pins it.
 Consequences worth knowing:
 
 - **Provision before you issue tokens.** `provisionTenant(db, { tenantId, kind })`
+  (import from `@proofoftech/flowsafe/host-kit`)
   inserts into the `tenants` registry or fails. Nothing else enforces tenant-id
   uniqueness, and two clients slugged `acme` would merge entirely.
 - **Every actor carries a tenant.** `ApprovalActor` is `{ id, role, tenantId }`;
@@ -242,6 +249,7 @@ Consequences worth knowing:
   results. Absent scope preserves the single-tenant keys exactly; there is no
   flag to forget.
 - **Offboarding is one call.** `purgeTenant(db, { tenantId, artifactStore })`
+  (import from `@proofoftech/flowsafe/do-runner` or the package root)
   reaps snapshots of *any* status (a run abandoned at a gate is never eligible
   for the terminal-only retention purge), the tenant's approval records, and
   its R2 artifacts. Only purge tenants whose tokens have already expired.

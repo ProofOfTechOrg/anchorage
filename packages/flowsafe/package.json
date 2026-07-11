@@ -1,7 +1,20 @@
 {
   "name": "@proofoftech/flowsafe",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22"
+  },
   "description": "Approval UX + Cloudflare-native durable execution for AI agent workflows",
   "type": "module",
   "repository": {
@@ -21,7 +34,8 @@
     "./audit-export": "./dist/audit-export/index.js",
     "./do-runner": "./dist/do-runner/index.js",
     "./host-kit": "./dist/host-kit/index.js",
-    "./host-kit/module": "./dist/host-kit/module.js"
+    "./host-kit/module": "./dist/host-kit/module.js",
+    "./package.json": "./package.json"
   },
   "scripts": {
     "build": "tsc && tsc -p src/approval-ui/tsconfig.json",
@@ -34,14 +48,19 @@
     "spike": "wrangler dev --config spike/wrangler.jsonc",
     "spike:verify": "node scripts/spike-verify.mjs",
     "deploy:cf": "wrangler deploy --config deploy/wrangler.jsonc",
-    "deploy:dev": "wrangler dev --config deploy/wrangler.jsonc"
+    "deploy:dev": "wrangler dev --config deploy/wrangler.jsonc",
+    "prepublishOnly": "pnpm run build"
   },
   "peerDependencies": {
-    "@mastra/core": "^1.49.0",
+    "@mastra/core": "^1.50.0",
+    "@proofoftech/breakwater": "workspace:^",
     "react": ">=18 <20",
     "react-dom": ">=18 <20"
   },
   "peerDependenciesMeta": {
+    "@proofoftech/breakwater": {
+      "optional": true
+    },
     "react": {
       "optional": true
     },
@@ -55,6 +74,7 @@
     "@proofoftech/breakwater": "workspace:*",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "happy-dom": "^20.10.6",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "typescript": "^5.6",

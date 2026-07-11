@@ -20,10 +20,16 @@ import type {
 import {
   ApprovalService,
   D1ApprovalStoreFactory,
+  purgeExpiredApprovals,
   sweepSLA,
 } from '../approval-api/index.js';
 import { type AuditQueue, queueAuditSink } from '../audit-export/index.js';
-import { type ResumeRunFn, resumeRunWithRequeue } from './approval-bridge.js';
+import {
+  type ResumeRunFn,
+  reconcileApprovalsOnStatus,
+  resumeRunWithRequeue,
+} from './approval-bridge.js';
+import { numberVar } from './env-vars.js';
 
 /**
  * Attribution identity for cron maintenance — audit only. The sweep is TCB
@@ -119,6 +125,10 @@ export interface HostApprovalServiceOptions {
  * via the DO-side provider, never from this request); if the resumed run
  * suspends again at a later gate, the next approval is queued right here, so
  * multi-gate workflows keep flowing through the queue.
+ *
+ * One audit sink instance backs both the service's own trail AND the
+ * bridge's re-queue-failure signal (D4): a re-queue that fails after a
+ * durable resume is reported through it rather than silently absorbed.
  */
 export function buildHostApprovalService(
   store: TenantBoundApprovalStore,
@@ -129,17 +139,19 @@ export function buildHostApprovalService(
     role: 'operator',
     tenantId: store.tenantId,
   };
+  const audit = hostAuditSink({
+    queue: options.queue,
+    keepAlive: options.waitUntil,
+  });
   const service: ApprovalService = new ApprovalService({
     store,
     defaultSlaSeconds: options.defaultSlaSeconds,
-    audit: hostAuditSink({
-      queue: options.queue,
-      keepAlive: options.waitUntil,
-    }),
+    audit,
     resumeRun: resumeRunWithRequeue(
       options.resumeRun,
       () => service,
       systemActor,
+      audit,
     ),
   });
   return service;
@@ -207,4 +219,95 @@ export async function runSlaSweepMaintenance(
   console.log(
     JSON.stringify({ type: 'maintenance', cron: options.cron, escalated }),
   );
+}
+
+/**
+ * waitUntil-detached wrapper over reconcileApprovalsOnStatus for
+ * ExecutionContext-capable hosts (D4, 2026-07-11 audit follow-up): the heal
+ * only matters to a LATER poll, never the response being built, so its D1
+ * reads AND writes (the supersede CAS + the fresh create) leave the
+ * status-response path. A rejection is logged as `reconcile-error`, never
+ * left unhandled inside waitUntil. Hosts without an ExecutionContext keep
+ * passing reconcileApprovalsOnStatus(...) directly (awaited in-path) — the
+ * host-agnostic default createRunRouter documents.
+ */
+export function reconcileApprovalsOnStatusDetached(
+  systemActorId: string,
+  waitUntil: (promise: Promise<unknown>) => void,
+): ReturnType<typeof reconcileApprovalsOnStatus> {
+  const reconcile = reconcileApprovalsOnStatus(systemActorId);
+  return (tenant, workflowId, summary) => {
+    waitUntil(
+      reconcile(tenant, workflowId, summary).catch((error: unknown) =>
+        console.error(
+          JSON.stringify({
+            type: 'reconcile-error',
+            workflowId,
+            runId: summary.runId,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        ),
+      ),
+    );
+    return Promise.resolve();
+  };
+}
+
+/** Options for the cron-owned approval-retention purge. */
+export interface ApprovalRetentionPurgeOptions {
+  /** factory.system() — the cron-only cross-tenant view. */
+  store: SystemApprovalStore;
+  /**
+   * Raw APPROVAL_RETENTION_DAYS env value; parsed via numberVar(…, 30,
+   * 'APPROVAL_RETENTION_DAYS', { allowZero: true }) and converted to ms —
+   * 0 purges decided approvals immediately, the same convention
+   * RUN_RETENTION_DAYS uses.
+   */
+  retentionDays: string | undefined;
+  /** The firing cron expression — carried into the maintenance-error log line for correlation. */
+  cron: string;
+}
+
+/**
+ * The cron-owned approval-retention purge, previously hand-copied verbatim
+ * by the hosts (deploy/worker.ts and the showcase worker): purgeExpiredApprovals
+ * over the SYSTEM store (cross-tenant, cron-only — never a service method or
+ * HTTP route, see retention.ts), the APPROVAL_RETENTION_DAYS var parsing
+ * (allowZero: a 0-day retention purges decided approvals immediately, the
+ * same convention RUN_RETENTION_DAYS uses), and containment — a purge
+ * failure logs a maintenance-error and resolves `undefined` instead of
+ * throwing, so it never aborts a caller's other maintenance duties. Unlike
+ * runSlaSweepMaintenance, this does NOT log its own "maintenance" summary
+ * line: both hosts fold the returned count into ONE combined purge log
+ * alongside their other maintenance duties (the snapshot purge, and — for
+ * the showcase — the demo-tenant reaper), so logging it here too would
+ * double-log.
+ */
+export async function runApprovalRetentionPurge(
+  options: ApprovalRetentionPurgeOptions,
+): Promise<number | undefined> {
+  try {
+    return await purgeExpiredApprovals(options.store, {
+      // allowZero: APPROVAL_RETENTION_DAYS=0 means "purge decided approvals
+      // now" — same convention as RUN_RETENTION_DAYS.
+      ttlMs:
+        numberVar(options.retentionDays, 30, 'APPROVAL_RETENTION_DAYS', {
+          allowZero: true,
+        }) *
+        24 *
+        60 *
+        60 *
+        1000,
+    });
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        type: 'maintenance-error',
+        surface: 'approval-retention-purge',
+        cron: options.cron,
+        error: String(error),
+      }),
+    );
+    return undefined;
+  }
 }

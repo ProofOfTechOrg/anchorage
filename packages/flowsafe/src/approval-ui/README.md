@@ -47,12 +47,22 @@ anywhere and versioned against the wire contract alone.
   A separate `@proofoftech/flowsafe-ui` package
   would remove the double compilation entirely and is the documented
   fallback if the UI grows.
-- **No jsdom render tests.** The components are thin declarative shells;
-  everything decision-worthy (SLA math, queue ordering, wire formats, error
-  mapping) is extracted into `view-model.ts` and `client.ts` and tested in
-  plain node. Rejected: @testing-library/react + jsdom — three more
-  age-gated dev dependencies plus a third test environment for marginal
-  coverage of markup.
+- **No jsdom render tests — one renderer-backed exception for hook wiring.**
+  The components are thin declarative shells; everything decision-worthy
+  (SLA math, queue ordering, wire formats, error mapping) is extracted into
+  `view-model.ts` and `client.ts` and tested in plain node. Rejected:
+  @testing-library/react + jsdom — three more age-gated dev dependencies
+  plus a third test environment for marginal coverage of markup. Amended
+  2026-07-11: that rationale covers MARKUP, but the P1 filter-identity
+  request loop lived in `useApprovalDashboard`'s dependency wiring (the
+  useMemo/useCallback/effect interplay), which no pure extraction can
+  execute — `approvalFilterKey`'s stability test cannot prove the mounted
+  hook stops refetching. `use-approval-dashboard.render.test.ts` is the one
+  renderer-backed suite: raw `createRoot` + `act` on `happy-dom` (a single
+  dev dependency, scoped per-file via `@vitest-environment` — no
+  @testing-library, no jsdom, no global environment change), proven to fail
+  against the pre-fix hook. Markup stays untested by design; the exception
+  covers hook dependency wiring only.
 
 ## Invariants
 

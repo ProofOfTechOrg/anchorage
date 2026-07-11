@@ -24,11 +24,16 @@ import {
   type TenantResolver,
 } from './tenant-context.js';
 import {
+  APPROVAL_LIST_ORDERS,
   APPROVAL_STATUSES,
   type ApprovalDecision,
   type ApprovalListFilter,
+  type ApprovalListOrder,
   type ApprovalStatus,
+  approvalListOrder,
   type CreateApprovalInput,
+  MAX_APPROVAL_LIST_LIMIT,
+  parseApprovalCursor,
 } from './types.js';
 
 /**
@@ -170,6 +175,54 @@ function parseListFilter(url: URL): ApprovalListFilter {
   if (runId !== null) filter.runId = runId;
   const claimedBy = url.searchParams.get('claimedBy');
   if (claimedBy !== null) filter.claimedBy = claimedBy;
+  const limit = url.searchParams.get('limit');
+  if (limit !== null) {
+    const parsed = Number(limit);
+    if (
+      !Number.isInteger(parsed) ||
+      parsed < 1 ||
+      parsed > MAX_APPROVAL_LIST_LIMIT
+    ) {
+      throw new InvalidApprovalInputError(
+        `limit must be an integer between 1 and ${MAX_APPROVAL_LIST_LIMIT} (got '${limit}')`,
+      );
+    }
+    filter.limit = parsed;
+  }
+  const after = url.searchParams.get('after');
+  if (after !== null) {
+    // Validate eagerly so a malformed cursor is a 400 here, not a 500 (or a
+    // silently-empty page) once it reaches the store — parseApprovalCursor
+    // is the one shared decoder (types.ts), so this is the exact check
+    // store.ts/d1-store.ts will apply again when they actually page with it.
+    try {
+      parseApprovalCursor(after);
+    } catch {
+      throw new InvalidApprovalInputError(
+        `after is not a valid approval cursor (got '${after}')`,
+      );
+    }
+    filter.after = after;
+  }
+  const orderBy = url.searchParams.get('orderBy');
+  if (orderBy !== null) {
+    if (!(APPROVAL_LIST_ORDERS as readonly string[]).includes(orderBy)) {
+      throw new InvalidApprovalInputError(
+        `unknown orderBy '${orderBy}' (expected one of [${APPROVAL_LIST_ORDERS.join(', ')}])`,
+      );
+    }
+    filter.orderBy = orderBy as ApprovalListOrder;
+  }
+  // Same eager-validation rationale as the cursor above: the reviewer/after
+  // incoherence must 400 here, not surface as a store throw mapped to 500 —
+  // approvalListOrder is the one shared rule the stores re-apply.
+  try {
+    approvalListOrder(filter);
+  } catch (error) {
+    throw new InvalidApprovalInputError(
+      error instanceof Error ? error.message : String(error),
+    );
+  }
   return filter;
 }
 

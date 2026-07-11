@@ -13,7 +13,12 @@ import {
   d1SystemApprovalStore,
 } from './d1-store.js';
 import type { ApprovalPatch } from './store.js';
-import { byQueueOrder, InMemoryApprovalStore, matchesFilter } from './store.js';
+import {
+  approvalListComparator,
+  InMemoryApprovalStore,
+  matchesFilter,
+  paginateApprovalList,
+} from './store.js';
 import type {
   SystemApprovalStore,
   TenantBoundApprovalStore,
@@ -23,6 +28,7 @@ import type {
   ApprovalRecord,
   ApprovalStatus,
 } from './types.js';
+import { TERMINAL_APPROVAL_STATUSES } from './types.js';
 
 export interface ApprovalStoreFactory {
   /** Bind a store to one tenant. Throws unless tenantId satisfies INV-3. */
@@ -109,12 +115,15 @@ export class InMemoryApprovalStoreFactory implements ApprovalStoreFactory {
     const records = this.#records;
     return {
       // Identical to the bound store's list() minus the tenant predicate —
-      // hence the shared matchesFilter/byQueueOrder rather than a copy.
+      // hence the shared matchesFilter/approvalListComparator/
+      // paginateApprovalList rather than a copy.
       async list(filter: ApprovalListFilter = {}): Promise<ApprovalRecord[]> {
-        return [...records.values()]
+        const matched = [...records.values()]
           .filter((record) => matchesFilter(record, filter))
-          .sort(byQueueOrder)
-          .map((record) => structuredClone(record));
+          .sort(approvalListComparator(filter));
+        return paginateApprovalList(matched, filter).map((record) =>
+          structuredClone(record),
+        );
       },
       async transition(
         id: string,
@@ -131,6 +140,26 @@ export class InMemoryApprovalStoreFactory implements ApprovalStoreFactory {
         }
         records.set(id, updated);
         return structuredClone(updated);
+      },
+      // Retention purge (D3/PART 4): mirrors the D1 system view's
+      // purgeExpired — terminal-only, cutoff is exclusive (strictly before),
+      // bounded by `limit`. Map iteration order is insertion order; no
+      // ordering guarantee is required (purgeExpiredWorkflowRuns' row-only
+      // batching path makes the same no-ORDER-BY choice — the shrinking
+      // eligible set across firings is what matters, not which N rows a
+      // single firing picks).
+      async purgeExpired(cutoffIso: string, limit: number): Promise<number> {
+        let purged = 0;
+        for (const [id, record] of records) {
+          if (purged >= limit) break;
+          if (!TERMINAL_APPROVAL_STATUSES.includes(record.status)) continue;
+          const terminalAt = record.decidedAt ?? record.updatedAt;
+          if (terminalAt < cutoffIso) {
+            records.delete(id);
+            purged += 1;
+          }
+        }
+        return purged;
       },
     };
   }

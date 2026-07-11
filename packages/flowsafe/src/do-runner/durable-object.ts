@@ -9,8 +9,7 @@
 // since all traffic for a run lands on one instance. `state` is captured
 // for the Phase 2 alarm-chained engine (setAlarm/alarm) but unused today.
 
-import type { DurableObjectState } from '@cloudflare/workers-types';
-
+import type { DurableObjectRunnerState } from './cf-types.js';
 import { tenantOfRunId } from './path-safe-id.js';
 import { DurableStorageResumeLedger } from './resume-ledger.js';
 import {
@@ -36,10 +35,10 @@ interface ResumeBody {
 export abstract class DurableObjectRunner<TEnv = unknown> {
   protected readonly env: TEnv;
   /** Absent in node tests; present under workerd. Reserved for Phase 2 alarms. */
-  protected readonly state?: DurableObjectState;
+  protected readonly state?: DurableObjectRunnerState;
   #runtime?: RunnerRuntime;
 
-  constructor(state: DurableObjectState | undefined, env: TEnv) {
+  constructor(state: DurableObjectRunnerState | undefined, env: TEnv) {
     this.state = state;
     this.env = env;
   }

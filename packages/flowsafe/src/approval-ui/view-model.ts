@@ -2,10 +2,7 @@
 // formatting. Kept out of the components so it runs under plain vitest with
 // no DOM, and the .tsx files stay declarative shells.
 
-import type {
-  ApprovalPriority,
-  ApprovalRecord,
-} from '../approval-api/types.js';
+import { type ApprovalRecord, byReviewerOrder } from '../approval-api/types.js';
 
 export type SlaState = 'none' | 'ok' | 'warning' | 'breached';
 
@@ -55,32 +52,19 @@ export function formatSlaCountdown(
   return `${formatDuration(remaining)} left`;
 }
 
-const PRIORITY_RANK: Record<ApprovalPriority, number> = {
-  critical: 0,
-  high: 1,
-  normal: 2,
-  low: 3,
-};
-
 /**
  * Reviewer-facing queue order: priority first, then nearest SLA deadline
- * (records without one last), then FIFO. Non-mutating.
+ * (records without one last), then FIFO. Delegates to the shared
+ * byReviewerOrder (approval-api/types.ts) — the SAME rule the stores apply
+ * server-side under ApprovalListFilter.orderBy: 'reviewer', so a bounded
+ * page and this client-side sort can never rank differently (2026-07-11
+ * review: a page cut in a different order hid high-priority records).
+ * Non-mutating.
  */
 export function sortQueue(
   records: readonly ApprovalRecord[],
 ): ApprovalRecord[] {
-  return [...records].sort((a, b) => {
-    const byPriority = PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority];
-    if (byPriority !== 0) return byPriority;
-    const aDeadline = a.slaDeadlineAt ?? '';
-    const bDeadline = b.slaDeadlineAt ?? '';
-    if (aDeadline !== bDeadline) {
-      if (aDeadline === '') return 1;
-      if (bDeadline === '') return -1;
-      return aDeadline.localeCompare(bDeadline);
-    }
-    return a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
-  });
+  return [...records].sort(byReviewerOrder);
 }
 
 /** Metrics cell for avgResolutionSeconds. */

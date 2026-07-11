@@ -9,9 +9,15 @@ import { TENANT_ID_PATTERN } from '../do-runner/path-safe-id.js';
 import { TENANT_BOUND } from './tenant-brand.js';
 import {
   type ApprovalListFilter,
+  type ApprovalMetrics,
   type ApprovalRecord,
   type ApprovalStatus,
+  approvalListOrder,
+  byReviewerOrder,
+  clampApprovalLimit,
+  compareStrings,
   OPEN_STATUSES,
+  parseApprovalCursor,
 } from './types.js';
 
 /** Uniqueness scope for open requests: one per (workflowId, runId, stepKey). */
@@ -53,7 +59,14 @@ export interface ApprovalStore {
    */
   create(record: ApprovalRecord): Promise<CreateResult>;
   get(id: string): Promise<ApprovalRecord | null>;
-  /** Ordered oldest-first (createdAt, then id) — FIFO queue order. */
+  /**
+   * Ordered per filter.orderBy: oldest-first (createdAt, then id — FIFO
+   * queue order) by default, or the reviewer queue order (priority → SLA →
+   * FIFO, byReviewerOrder) under 'reviewer' — applied BEFORE filter.limit,
+   * so a bounded page is the top of the reviewer queue. Bounded by
+   * filter.limit/filter.after (D3: an unfiltered list() repeated on every
+   * dashboard poll is a full-table scan).
+   */
   list(filter?: ApprovalListFilter): Promise<ApprovalRecord[]>;
   /**
    * Compare-and-swap: apply patch iff the current status is in `from`.
@@ -66,6 +79,14 @@ export interface ApprovalStore {
     from: readonly ApprovalStatus[],
     patch: ApprovalPatch,
   ): Promise<ApprovalRecord | null>;
+  /**
+   * Aggregate queue metrics for this store's tenant — field semantics on
+   * ApprovalMetrics (types.ts), computed here instead of by the caller
+   * loading every record into JS (D3: metrics() used to do exactly that).
+   * `nowMs` is the SLA-breach reference instant (the service's injected
+   * clock), keeping the computation deterministic under tests.
+   */
+  metrics(nowMs: number): Promise<ApprovalMetrics>;
 }
 
 /**
@@ -94,9 +115,105 @@ export function matchesFilter(
   return true;
 }
 
-/** FIFO queue order (createdAt, then id) — shared by both store views. */
+/**
+ * FIFO queue order (createdAt, then id) — shared by both store views.
+ * Bytewise via the shared compareStrings (NOT localeCompare): D1 orders with
+ * BINARY collation and the cursor row-value comparison in appendListFilters
+ * compares bytewise too, so a locale-collated in-memory sort would disagree
+ * with D1 on an id tie-break (mixed-case ids) and with its own cursor
+ * filter.
+ */
 export function byQueueOrder(a: ApprovalRecord, b: ApprovalRecord): number {
-  return a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
+  return compareStrings(a.createdAt, b.createdAt) || compareStrings(a.id, b.id);
+}
+
+/**
+ * The comparator for a filter's effective orderBy — shared by both in-memory
+ * list() implementations, same no-drift rationale as matchesFilter. Also the
+ * chokepoint where the reviewer/after incoherence throws (approvalListOrder);
+ * D1's list() resolves through the same function when building its ORDER BY.
+ */
+export function approvalListComparator(
+  filter: ApprovalListFilter,
+): (a: ApprovalRecord, b: ApprovalRecord) => number {
+  return approvalListOrder(filter) === 'reviewer'
+    ? byReviewerOrder
+    : byQueueOrder;
+}
+
+/**
+ * Cursor + limit paging over an already status/workflow/run/claimedBy-
+ * filtered, orderBy-sorted record array — shared by both in-memory
+ * list() implementations (the tenant-bound store below and the system view
+ * in tenant-store.ts) so they can never drift, same rationale as
+ * matchesFilter/byQueueOrder. `after` only ever reaches this under the
+ * default FIFO order (approvalListOrder rejects it under 'reviewer' before
+ * any sort happens). D1's list() applies the equivalent conditions in SQL
+ * (appendListFilters' cursor clause + a LIMIT, d1-store.ts) instead of
+ * calling this.
+ */
+export function paginateApprovalList(
+  records: readonly ApprovalRecord[],
+  filter: Pick<ApprovalListFilter, 'after' | 'limit'>,
+): ApprovalRecord[] {
+  let page: readonly ApprovalRecord[] = records;
+  if (filter.after !== undefined) {
+    const cursor = parseApprovalCursor(filter.after);
+    page = page.filter(
+      (record) =>
+        record.createdAt > cursor.createdAt ||
+        (record.createdAt === cursor.createdAt && record.id > cursor.id),
+    );
+  }
+  const limit = clampApprovalLimit(filter.limit);
+  return limit !== undefined ? page.slice(0, limit) : [...page];
+}
+
+/**
+ * The in-memory metrics reduction — ALSO the reference "old JS computation"
+ * the D1 aggregate SQL (d1-store.ts's METRICS_QUERY) must match; see
+ * store.test.ts's cross-backend parity case. Field semantics: ApprovalMetrics
+ * (types.ts).
+ */
+export function computeApprovalMetrics(
+  records: readonly ApprovalRecord[],
+  nowMs: number,
+): ApprovalMetrics {
+  const open = records.filter((record) =>
+    OPEN_STATUSES.includes(record.status),
+  );
+  const decided = records.filter(
+    (record) => record.status === 'approved' || record.status === 'rejected',
+  );
+  const resolutionsSeconds = decided
+    .filter((record) => record.decidedAt !== undefined)
+    .map(
+      (record) =>
+        (Date.parse(record.decidedAt as string) -
+          Date.parse(record.createdAt)) /
+        1000,
+    );
+  return {
+    openCount: open.length,
+    slaBreachedCount: open.filter(
+      (record) =>
+        record.slaDeadlineAt !== undefined &&
+        Date.parse(record.slaDeadlineAt) <= nowMs,
+    ).length,
+    escalationCount: records.filter(
+      (record) => record.escalatedAt !== undefined,
+    ).length,
+    decidedCount: decided.length,
+    approvedCount: decided.filter((record) => record.status === 'approved')
+      .length,
+    rejectedCount: decided.filter((record) => record.status === 'rejected')
+      .length,
+    avgResolutionSeconds:
+      resolutionsSeconds.length > 0
+        ? resolutionsSeconds.reduce((sum, value) => sum + value, 0) /
+          resolutionsSeconds.length
+        : null,
+  };
 }
 
 // Records carry caller-provided payloads; clone on every boundary so callers
@@ -164,13 +281,20 @@ export class InMemoryApprovalStore implements ApprovalStore {
   }
 
   async list(filter: ApprovalListFilter = {}): Promise<ApprovalRecord[]> {
-    return [...this.#records.values()]
+    const matched = [...this.#records.values()]
       .filter(
         (record) =>
           record.tenantId === this.tenantId && matchesFilter(record, filter),
       )
-      .sort(byQueueOrder)
-      .map(clone);
+      .sort(approvalListComparator(filter));
+    return paginateApprovalList(matched, filter).map(clone);
+  }
+
+  async metrics(nowMs: number): Promise<ApprovalMetrics> {
+    const owned = [...this.#records.values()].filter(
+      (record) => record.tenantId === this.tenantId,
+    );
+    return computeApprovalMetrics(owned, nowMs);
   }
 
   async transition(

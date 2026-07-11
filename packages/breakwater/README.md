@@ -46,6 +46,15 @@ evaluators register via `policies.evaluators`. Enforcement contract:
 Agent CLI adapters (`@proofoftech/breakwater/agent-cli`) ship Claude Code and
 Codex as approval-gated connectors — Node-only at execution time.
 
+**Egress and rate-limit caveats.** `networkEgress` gates what a connector's
+manifest *declares* it calls, not the actual socket — there is no fetch-level
+interception (yet). It catches misconfiguration and org-policy drift, not a
+connector (or a compromised dependency) that lies about its egress; treat it
+as a declaration/allowlist control, not a network sandbox. Fixed-window
+`rateLimit` can admit up to ~2x the declared budget across two adjacent
+windows (amplified by cross-isolate clock skew) — an accepted characteristic
+of fixed windows, not a bug. See `CONNECTORS.md`'s "Known limits" for detail.
+
 ## Usage
 
 ```typescript

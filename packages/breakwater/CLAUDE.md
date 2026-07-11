@@ -7,6 +7,8 @@
 | File | What | When to read |
 | ---- | ---- | ------------ |
 | `README.md` | Package purpose, subpackage roles, status, usage example | Understanding breakwater's design and wiring it into a Mastra Agent |
+| `CHANGELOG.md` | Release notes (0.1.0 unreleased; breakwater publishes before flowsafe) | Cutting a release, checking the publish order |
+| `LICENSE` | Apache-2.0 copy shipped in the npm tarball (packing ignores the repo-root LICENSE) | Never edit separately — keep identical to the root LICENSE |
 | `CONNECTORS.md` | Connector authoring guide — manifest field-by-field with enforcement semantics, honesty rules, testing expectations, contribution flow | Building or reviewing a connector, onboarding community contributors |
 | `package.json` | Manifest, subpath exports (`./policy-engine`, `./rbac`, `./audit`, `./connector-sdk`), scripts, `@mastra/core` peer | Adding a subpath export, changing scripts, bumping the Mastra peer |
 | `tsconfig.json` | Build TS config (emits `dist/`) | Changing build output or compiler options |

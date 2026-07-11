@@ -42,7 +42,8 @@
   // },
   "vars": {
     "APPROVAL_SLA_SECONDS": "14400",
-    "RUN_RETENTION_DAYS": "30"
+    "RUN_RETENTION_DAYS": "30",
+    "APPROVAL_RETENTION_DAYS": "30"
     // Client-per-subdomain deployments: set the apex and every request to
     // <tenant>.<apex> is denied unless the token's VERIFIED tenant is that
     // tenant. Defense in depth over the tenant-bound stores (INV-2) — it

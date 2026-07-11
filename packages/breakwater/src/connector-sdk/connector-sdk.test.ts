@@ -948,6 +948,47 @@ describe('idempotency', () => {
     expect(a.execute).toHaveBeenCalledTimes(1);
     expect(b.execute).toHaveBeenCalledTimes(1);
   });
+
+  it('denies an explicitly empty idempotency key the same as a missing one', async () => {
+    // #given — key === '' must hit the same deny as an absent key
+    const { tool, execute } = makeConnector({
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { idempotencyStore: new InMemoryIdempotencyStore() },
+    });
+    const requestContext = new RequestContext();
+    requestContext.set(IDEMPOTENCY_KEY_CONTEXT_KEY, '');
+    const context = { requestContext } as unknown as ToolExecutionContext;
+
+    // #when
+    const failure = await run(tool, input, context).catch(
+      (error: unknown) => error,
+    );
+
+    // #then
+    expect(failure).toBeInstanceOf(ConnectorPolicyError);
+    expect((failure as ConnectorPolicyError).policy).toBe('idempotency');
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('treats an empty-string isolation scope as absent (unscoped key)', async () => {
+    // #given — isolationScopeOf's length > 0 guard must fold '' to undefined
+    const get = vi.fn(() => undefined);
+    const put = vi.fn();
+    const { tool } = makeConnector({
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { idempotencyStore: { get, put } },
+    });
+    const requestContext = new RequestContext();
+    requestContext.set(IDEMPOTENCY_KEY_CONTEXT_KEY, 'k1');
+    requestContext.set(ISOLATION_SCOPE_CONTEXT_KEY, '');
+    const context = { requestContext } as unknown as ToolExecutionContext;
+
+    // #when
+    await run(tool, input, context);
+
+    // #then — the same key as an unscoped call, no scope prefix
+    expect(get).toHaveBeenCalledWith('salesforce.createContact:k1');
+  });
 });
 
 describe('atomic idempotency (reserve path)', () => {
@@ -1217,6 +1258,36 @@ describe('atomic idempotency (reserve path)', () => {
     expect(execute).not.toHaveBeenCalled();
     expect(audit.events()).toMatchObject([
       { decision: 'error', detail: { stage: 'idempotency-store' } },
+    ]);
+  });
+
+  it('audits a dedicated event when the reservation came from a stale-pending takeover', async () => {
+    // #given — a store reporting a takeover (audit D2)
+    const audit = new AuditLogger();
+    const store: AtomicIdempotencyStore = {
+      get: () => undefined,
+      put: () => {},
+      reserve: () => ({ state: 'reserved', tookOver: true }),
+      release: () => {},
+    };
+    const { tool, execute } = makeConnector({
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { audit, idempotencyStore: store },
+    });
+
+    // #when
+    await run(tool, input, makeContext({ idempotencyKey: 'k1' }));
+
+    // #then — a dedicated takeover record naming the connector and key,
+    // alongside (not instead of) the call's own outcome record
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(audit.events()).toMatchObject([
+      {
+        resource: 'salesforce.createContact',
+        decision: 'allowed',
+        detail: { idempotencyKey: 'k1', tookOver: true },
+      },
+      { decision: 'allowed', detail: { idempotencyKey: 'k1' } },
     ]);
   });
 
@@ -1924,5 +1995,90 @@ describe('isolation scope (multi-tenant key segmentation)', () => {
       run(tool, input, scopedContext({ scope: 'acme', dryRun: true })),
     ).resolves.toEqual({ ok: true });
     expect(dryRunExecute).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('in-memory store under a minted isolation scope (D5)', () => {
+  it('warns once per idempotency store instance when a scope is present', async () => {
+    // #given
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const store = new InMemoryIdempotencyStore();
+    const { tool } = makeConnector({
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { idempotencyStore: store },
+    });
+    const requestContext = new RequestContext();
+    requestContext.set(ISOLATION_SCOPE_CONTEXT_KEY, 'tenant-a');
+    requestContext.set(IDEMPOTENCY_KEY_CONTEXT_KEY, 'k1');
+    const context = { requestContext } as unknown as ToolExecutionContext;
+
+    // #when — two scoped calls through the SAME store instance
+    await run(tool, input, context);
+    requestContext.set(IDEMPOTENCY_KEY_CONTEXT_KEY, 'k2');
+    await run(tool, input, context);
+
+    // #then — exactly one warning for this store instance, not one per call
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toContain('InMemoryIdempotencyStore');
+    warn.mockRestore();
+  });
+
+  it('does not warn for an idempotency store when no isolation scope is present', async () => {
+    // #given
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { tool } = makeConnector({
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { idempotencyStore: new InMemoryIdempotencyStore() },
+    });
+
+    // #when
+    await run(tool, input, makeContext({ idempotencyKey: 'k1' }));
+
+    // #then
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('warns once per rate-limit store instance when a scope is present', async () => {
+    // #given
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const rateLimitStore = new InMemoryRateLimitStore();
+    const { tool } = makeConnector({
+      permissions: { sideEffect: 'read', rateLimit: '5/min' },
+      policies: { rateLimitStore },
+    });
+    const requestContext = new RequestContext();
+    requestContext.set(ISOLATION_SCOPE_CONTEXT_KEY, 'tenant-a');
+    const context = { requestContext } as unknown as ToolExecutionContext;
+
+    // #when — two scoped calls through the SAME store instance
+    await run(tool, input, context);
+    await run(tool, input, context);
+
+    // #then
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toContain('InMemoryRateLimitStore');
+    warn.mockRestore();
+  });
+
+  it('does not warn for a non-InMemory store under scope', async () => {
+    // #given — any store that is not an InMemory* instance (e.g. D1-shaped)
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const store: IdempotencyStore = { get: () => undefined, put: () => {} };
+    const { tool } = makeConnector({
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { idempotencyStore: store },
+    });
+    const requestContext = new RequestContext();
+    requestContext.set(ISOLATION_SCOPE_CONTEXT_KEY, 'tenant-a');
+    requestContext.set(IDEMPOTENCY_KEY_CONTEXT_KEY, 'k1');
+    const context = { requestContext } as unknown as ToolExecutionContext;
+
+    // #when
+    await run(tool, input, context);
+
+    // #then
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
   });
 });

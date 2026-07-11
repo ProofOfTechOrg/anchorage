@@ -9,7 +9,6 @@
 // binding names are deploy-specific and Workers env objects only exist inside
 // handlers/DO constructors, never at module scope.
 
-import type { D1Database } from '@cloudflare/workers-types';
 import type { MastraCompositeStore } from '@mastra/core/storage';
 import type { AnyWorkflow } from '@mastra/core/workflows';
 import {
@@ -17,6 +16,7 @@ import {
   createStep,
 } from '@mastra/core/workflows';
 
+import type { D1DatabaseBinding } from './cf-types.js';
 import { createD1Storage } from './d1-storage.js';
 import type { ResumeLedger } from './resume-ledger.js';
 import type { RequestContextProvider } from './runtime.js';
@@ -24,7 +24,7 @@ import { RunnerRuntime } from './runtime.js';
 
 /** Workers env shape init() understands directly. */
 export interface DORunnerEnv {
-  DB: D1Database;
+  DB: D1DatabaseBinding;
 }
 
 /** Explicit storage takes precedence over a DB binding when both are present. */

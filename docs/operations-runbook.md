@@ -55,7 +55,8 @@ Tenant ids are allocated by the `tenants` registry, and **nothing else enforces
 their uniqueness**. Two clients slugged `acme` would merge their runs,
 approvals, rate limits, and artifacts.
 
-1. `provisionTenant(db, { tenantId, kind: 'commercial' })` — insert-or-fail.
+1. `provisionTenant(db, { tenantId, kind: 'commercial' })` (import from
+   `@proofoftech/flowsafe/host-kit`) — insert-or-fail.
    `tenantId` must match `^[a-z0-9]{3,32}$` and must not be reserved from
    allocation: the infrastructure subdomains (`app`, `www`, `api`, `docs`,
    `admin`, `status`), `system` (the cron maintenance actor's audit identity —
@@ -69,8 +70,9 @@ approvals, rate limits, and artifacts.
 
 ### Offboarding a tenant
 
-`purgeTenant(db, { tenantId, artifactStore })` deletes the tenant's snapshot
-rows of any status, its approval records, and its R2 artifacts.
+`purgeTenant(db, { tenantId, artifactStore })` (import from
+`@proofoftech/flowsafe/do-runner` or the package root) deletes the tenant's
+snapshot rows of any status, its approval records, and its R2 artifacts.
 
 **Revoke the tenant's tokens first and wait for the last one to expire.** The
 purge deletes `suspended` rows, so a reviewer approving at that moment would
@@ -112,6 +114,69 @@ They are split because a Workers **CPU-limit termination kills the isolate and
 is not a catchable JS exception**. Wrapping both in `try/catch` inside one
 invocation does not help: a slow sweep would starve the purge permanently.
 Keep the sweep interval at or below your SLA granularity.
+
+### Approval queue retention
+
+`purgeExpiredApprovals(factory.system(), …)` runs in the same `PURGE_CRON`
+firing as `purgeExpiredWorkflowRuns`, in its own isolated try/catch — a
+failure in either purge never stops the other. It deletes DECIDED approval
+records (status `approved` or `rejected`) whose terminal timestamp
+(`decidedAt`, falling back to `updatedAt` for a decided record persisted
+without one) is older than `APPROVAL_RETENTION_DAYS` (var; default `30`;
+`0` purges decided approvals immediately, same convention as
+`RUN_RETENTION_DAYS`), LIMIT-batched per firing. Open requests
+(`pending`/`claimed`/`escalated`) are never purged at any age — an approval
+still awaiting a decision is not garbage, exactly like
+`purgeExpiredWorkflowRuns` never touches a live run. An abandoned tenant's
+still-open approvals are reclaimed only by `purgeTenant()` at offboarding.
+
+**Self-healing recovery (D4, 2026-07-11 audit):** unlike
+`purgeExpiredWorkflowRuns`, this purge never checks whether the run a decided
+record's grant belongs to is still live — only the approval record's own
+age; that omission is accepted by design (see `retention.ts`'s header
+comment). A decided record whose resume attempt failed and has not yet been
+retried can still be purged before the retry, which then fails CLOSED (no
+leak — see `retention.ts`) and leaves the run suspended with no approval
+record. Recovery is now automatic: the next `status()` read of that run (a
+dashboard poll, or an operator's own `GET`) re-files a FRESH approval bound
+to the run's current suspension, requiring a NEW decision — deliberately,
+since an approval that aged past retention should not silently re-arm the
+grant it already spent. One separation-of-duties relaxation applies only in
+this recovery path: the re-filed record's requester is the system actor, not
+a human, so the reviewer who decided the purged record may decide its
+replacement. Set `APPROVAL_RETENTION_DAYS` well beyond any expected
+resume-retry window regardless — reconciliation heals the wedge, but a
+re-decision is real reviewer work, not a free retry.
+
+**Stale OPEN records are healed too, not just purged-decided ones
+(2026-07-11 audit, follow-up):** a re-suspension of the same step — e.g. via
+the raw grant-free resume route — while an earlier request for that step is
+still open (pending/claimed/escalated) leaves that record bound to a
+fingerprint the step has already moved past. Left alone, this record wedges
+forever: the store's open-step uniqueness index makes every later filing
+attempt collapse back into it unchanged, so the fingerprint never heals and
+every status poll repeats the same no-op list-then-create. The same
+reconcile pass now SUPERSEDES every such stale open record first — a CAS
+transition straight to `rejected`, attributed to the system actor, audited
+as `approval.supersede`, never routed through `decide()` so it never touches
+the run — before filing the fresh one. A concurrent real decision that wins
+the CAS race is left alone; reconcile backs off filing for that step and
+re-evaluates on the next `status()` read rather than double-filing or
+clobbering the decision. A superseded record is excluded from grant
+derivation by its terminal `rejected` status alone (grant derivation reads
+only `status: 'approved'` records), not merely by the fingerprint mismatch
+that triggered the supersede.
+
+`GET /api/approvals` and the flowsafe dashboard are now paginated:
+`ApprovalListFilter` accepts `limit` (1–500), an opaque `after` cursor
+(derive the next page's cursor from the last record of the current page
+with `approvalCursor()`), and `orderBy` (`created` — FIFO, the default —
+or `reviewer`: priority → nearest SLA deadline → FIFO, applied before
+`limit`; incompatible with `after`, since cursors only page the monotonic
+FIFO order). The dashboard defaults to open statuses with `limit: 100` and
+`orderBy: 'reviewer'`, so an open dashboard neither issues an unfiltered
+full-table scan on every poll nor loses a fresh critical request past the
+oldest 100 records to a FIFO page cut.
 
 ## Incident Response
 

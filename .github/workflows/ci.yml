@@ -51,3 +51,56 @@ jobs:
       # fails closed. Exits non-zero on any broken link in that chain.
       - name: Spike verify (workerd suspend/resume)
         run: pnpm --filter @proofoftech/flowsafe spike:verify
+
+  # Mastra compat matrix: the libraries pin behavioral contracts to
+  # @mastra/core internals (resume-context merge-over semantics, snapshot
+  # shape, the reprocess-part key, the six-table inventory). The peer range
+  # (^1.50.0) admits any 1.x, so run the library suites against the newest
+  # 1.x the supply-chain age gate allows -- drift becomes a CI signal here
+  # instead of a consumer's runtime surprise. The tripwire tests
+  # (runtime.test.ts merge pin, ProcessorRunner reprocess-key probe,
+  # mastra-schema-guard) are the teeth.
+  mastra-compat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Signal, not merge gate: an upstream @mastra/core release that trips a
+    # tripwire must not wedge unrelated PRs. Red here = investigate before the
+    # next release, not before the next merge.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      # Not committed: bump only @mastra/core (and its D1 adapter, which
+      # must ride the same core) to the newest allowed 1.x in this job's
+      # workspace, then run both library suites against it.
+      - name: Bump @mastra/core to newest allowed 1.x
+        run: |
+          pnpm -r update "@mastra/core@^1" "@mastra/cloudflare-d1@^1"
+          pnpm --filter @proofoftech/breakwater list @mastra/core
+          pnpm --filter @proofoftech/flowsafe list @mastra/core @mastra/cloudflare-d1
+
+      # The bump must PROVABLY land on the registry's newest 1.x (@mastra/* is
+      # exempt from the minimumReleaseAge gate), otherwise this job silently
+      # re-tests the pinned version and a green run means nothing.
+      - name: Assert the installed core IS the newest 1.x
+        run: |
+          EXPECTED=$(npm view '@mastra/core@^1' version --json | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(Array.isArray(d)?d.at(-1):d)')
+          INSTALLED=$(pnpm --filter @proofoftech/breakwater exec node -p 'require("@mastra/core/package.json").version')
+          echo "expected=$EXPECTED installed=$INSTALLED"
+          test "$EXPECTED" = "$INSTALLED"
+
+      - name: Typecheck libraries against newest core
+        run: pnpm --filter @proofoftech/breakwater typecheck && pnpm --filter @proofoftech/flowsafe typecheck
+
+      - name: Test libraries against newest core
+        run: pnpm --filter @proofoftech/breakwater test && pnpm --filter @proofoftech/flowsafe test
