@@ -299,6 +299,54 @@ describe('createApprovalRouter', () => {
     expect((await handle(req('/api/approvals?limit=501')))?.status).toBe(400);
   });
 
+  it('lists in reviewer order when orderBy=reviewer — the bounded page is the top of the queue', async () => {
+    // #given — three normals then a critical, the shape of the 2026-07-11
+    // review finding: a FIFO-then-limit page hid the critical arrival
+    const { handle } = makeHandler({ allowCreate: true });
+    await createOne(handle, { ...CREATE_BODY, runId: 'acme_run-o1' });
+    await createOne(handle, { ...CREATE_BODY, runId: 'acme_run-o2' });
+    await createOne(handle, { ...CREATE_BODY, runId: 'acme_run-o3' });
+    const critical = await createOne(handle, {
+      ...CREATE_BODY,
+      runId: 'acme_run-hot',
+      priority: 'critical',
+    });
+
+    // #when
+    const response = await handle(
+      req('/api/approvals?orderBy=reviewer&limit=2'),
+    );
+    const page = (await response?.json()) as ApprovalRecord[];
+
+    // #then
+    expect(response?.status).toBe(200);
+    expect(page).toHaveLength(2);
+    expect(page[0]?.id).toBe(critical.id);
+  });
+
+  it('400s an unknown orderBy and the incoherent orderBy=reviewer + after combination', async () => {
+    // #given
+    const { handle } = makeHandler({ allowCreate: true });
+    const record = await createOne(handle);
+    const cursor = approvalCursor(record);
+
+    // #when / #then — unknown value
+    expect((await handle(req('/api/approvals?orderBy=bogus')))?.status).toBe(
+      400,
+    );
+    // #when / #then — cursors page FIFO order only; the combination must be
+    // a 400 at the boundary, not a store throw mapped to 500
+    expect(
+      (
+        await handle(
+          req(
+            `/api/approvals?orderBy=reviewer&after=${encodeURIComponent(cursor)}`,
+          ),
+        )
+      )?.status,
+    ).toBe(400);
+  });
+
   it('400s a malformed after cursor', async () => {
     // #given
     const { handle } = makeHandler();

@@ -239,6 +239,24 @@ function describeStoreContract(
       ).toEqual([a.id, b.id, c.id]);
     });
 
+    it('breaks a createdAt tie by id BYTEWISE on both backends (FIFO collation parity)', async () => {
+      // #given — one shared createdAt; ids differing only in case pin the
+      // collation: 'B' (0x42) < 'a' (0x61) bytewise (SQLite BINARY, the
+      // cursor row-value compare, compareStrings), but 'a' < 'B' under a
+      // locale collation — the old in-memory localeCompare sort disagreed
+      // with D1 here
+      const store = await makeStore();
+      const bytewiseFirst = makeRecord({ id: 'tie-B', runId: 'r-tie-1' });
+      const bytewiseSecond = makeRecord({ id: 'tie-a', runId: 'r-tie-2' });
+      bytewiseSecond.createdAt = bytewiseFirst.createdAt;
+      bytewiseSecond.updatedAt = bytewiseFirst.updatedAt;
+      await store.create(bytewiseSecond);
+      await store.create(bytewiseFirst);
+
+      // #when / #then
+      expect((await store.list()).map((r) => r.id)).toEqual(['tie-B', 'tie-a']);
+    });
+
     it('applies the patch when the status guard matches', async () => {
       // #given
       const store = await makeStore();
@@ -454,6 +472,134 @@ function describeStoreContract(
       ).rejects.toThrow();
     });
 
+    // ---- reviewer ordering (orderBy: 'reviewer', 2026-07-11 review) -------
+
+    it("orders priority → nearest SLA deadline (missing last) → FIFO under orderBy: 'reviewer'", async () => {
+      // #given — creation order is deliberately the reverse of reviewer
+      // relevance where possible (makeRecord stamps increasing createdAt)
+      const store = await makeStore();
+      const normalNoSla = makeRecord({ runId: 'r-rev-1' });
+      const normalLate = makeRecord({
+        runId: 'r-rev-2',
+        slaDeadlineAt: '2099-01-01T00:00:00.000Z',
+      });
+      const normalSoon = makeRecord({
+        runId: 'r-rev-3',
+        slaDeadlineAt: '2027-01-01T00:00:00.000Z',
+      });
+      const criticalNewest = makeRecord({
+        runId: 'r-rev-4',
+        priority: 'critical',
+      });
+      const normalNoSlaLater = makeRecord({ runId: 'r-rev-5' });
+      const lowSoon = makeRecord({
+        runId: 'r-rev-6',
+        priority: 'low',
+        slaDeadlineAt: '2027-01-01T00:00:00.000Z',
+      });
+      for (const record of [
+        normalNoSla,
+        normalLate,
+        normalSoon,
+        criticalNewest,
+        normalNoSlaLater,
+        lowSoon,
+      ]) {
+        await store.create(record);
+      }
+
+      // #when
+      const listed = await store.list({ orderBy: 'reviewer' });
+
+      // #then — the D1 ORDER BY and the in-memory byReviewerOrder agree:
+      // priority rank, deadline ascending with missing-deadline last, FIFO tie
+      expect(listed.map((r) => r.id)).toEqual([
+        criticalNewest.id,
+        normalSoon.id,
+        normalLate.id,
+        normalNoSla.id,
+        normalNoSlaLater.id,
+        lowSoon.id,
+      ]);
+    });
+
+    it('applies limit AFTER reviewer ordering — a fresh critical past the oldest page stays visible', async () => {
+      // #given — three older 'normal' requests, then a critical arrival; the
+      // FIFO-then-limit cut (the 2026-07-11 review finding) dropped the
+      // newest record entirely
+      const store = await makeStore();
+      for (let index = 0; index < 3; index += 1) {
+        await store.create(makeRecord({ runId: `r-lim-${index}` }));
+      }
+      const critical = makeRecord({
+        runId: 'r-lim-critical',
+        priority: 'critical',
+      });
+      await store.create(critical);
+
+      // #when — the dashboard shape: open statuses, bounded, reviewer order
+      const page = await store.list({
+        status: ['pending'],
+        limit: 2,
+        orderBy: 'reviewer',
+      });
+
+      // #then — the bounded page leads with the critical record
+      expect(page).toHaveLength(2);
+      expect(page[0]?.id).toBe(critical.id);
+    });
+
+    it("rejects orderBy: 'reviewer' combined with an after cursor (cursors page FIFO order only)", async () => {
+      // #given
+      const store = await makeStore();
+      const record = makeRecord({ runId: 'r-rev-after' });
+      await store.create(record);
+
+      // #when / #then
+      await expect(
+        store.list({ orderBy: 'reviewer', after: approvalCursor(record) }),
+      ).rejects.toThrow(/orderBy 'reviewer'/);
+    });
+
+    it("the system view rejects orderBy: 'reviewer' + after too (shared guard, no drift)", async () => {
+      // #given — the guard lives in approvalListOrder, which BOTH views of
+      // both backends resolve through; this pins the system-view path
+      const backend = makeBackend();
+      const record = makeRecord({ runId: 'acme_r-sys-after' });
+      await backend.forTenant('acme').create(record);
+
+      // #when / #then
+      await expect(
+        backend
+          .system()
+          .list({ orderBy: 'reviewer', after: approvalCursor(record) }),
+      ).rejects.toThrow(/orderBy 'reviewer'/);
+    });
+
+    it("ranks an out-of-enum priority LAST on both backends (JS '?? 4' fallback == SQL ELSE arm)", async () => {
+      // #given — nothing validates priority at the store layer, so a rogue
+      // writer or a future enum member read by old code can land any TEXT.
+      // The rogue record is created FIRST: if its rank collapsed to
+      // normal/low's, the FIFO tie-break would ALSO put it first, so the
+      // expectation below only passes when the rank itself differs.
+      const store = await makeStore();
+      const rogue = makeRecord({
+        runId: 'r-enum-rogue',
+        priority: 'urgent' as ApprovalRecord['priority'],
+      });
+      const low = makeRecord({ runId: 'r-enum-low', priority: 'low' });
+      await store.create(rogue);
+      await store.create(low);
+
+      // #when
+      const listed = await store.list({ orderBy: 'reviewer' });
+
+      // #then — unknown priority sorts after 'low' identically on both
+      // backends (types.ts reviewerPriorityRank fallback; d1-store.ts CASE
+      // ELSE arm)
+      expect(listed.map((r) => r.id)).toEqual([low.id, rogue.id]);
+    });
+
     // ---- metrics() (D3: SQL aggregate on D1, JS reduction in-memory) ------
 
     it('metrics() matches the reference JS computation — mixed statuses, undecided, and a missing-decidedAt edge case', async () => {
@@ -642,6 +788,26 @@ function describeStoreContract(
       // #when / #then
       const all = await backend.system().list();
       expect(all.map((r) => r.tenantId).sort()).toEqual(['acme', 'bravo']);
+    });
+
+    it('the system view honors reviewer ordering too (shared order helpers — the views must not drift)', async () => {
+      // #given — the newest record is the most urgent, across tenants
+      const backend = makeBackend();
+      await backend
+        .forTenant('acme')
+        .create(makeRecord({ runId: 'acme_r-old' }));
+      await backend
+        .forTenant('bravo')
+        .create(makeRecord({ runId: 'bravo_r-hot', priority: 'critical' }));
+
+      // #when
+      const listed = await backend
+        .system()
+        .list({ orderBy: 'reviewer', limit: 1 });
+
+      // #then — reviewer order applied before the bound, same as the bound
+      // store's list()
+      expect(listed.map((r) => r.runId)).toEqual(['bravo_r-hot']);
     });
   });
 }

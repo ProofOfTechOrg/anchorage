@@ -75,6 +75,7 @@ export type {
   ApprovalCursor,
   ApprovalDecision,
   ApprovalListFilter,
+  ApprovalListOrder,
   ApprovalMetrics,
   ApprovalPriority,
   ApprovalRecord,
@@ -84,9 +85,12 @@ export type {
   ResumeOutcome,
 } from './types.js';
 export {
+  APPROVAL_LIST_ORDERS,
   APPROVAL_PRIORITIES,
   APPROVAL_STATUSES,
   approvalCursor,
+  approvalListOrder,
+  byReviewerOrder,
   MAX_APPROVAL_LIST_LIMIT,
   OPEN_STATUSES,
   parseApprovalCursor,

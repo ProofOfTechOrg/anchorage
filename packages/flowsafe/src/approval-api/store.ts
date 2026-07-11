@@ -12,7 +12,10 @@ import {
   type ApprovalMetrics,
   type ApprovalRecord,
   type ApprovalStatus,
+  approvalListOrder,
+  byReviewerOrder,
   clampApprovalLimit,
+  compareStrings,
   OPEN_STATUSES,
   parseApprovalCursor,
 } from './types.js';
@@ -57,7 +60,10 @@ export interface ApprovalStore {
   create(record: ApprovalRecord): Promise<CreateResult>;
   get(id: string): Promise<ApprovalRecord | null>;
   /**
-   * Ordered oldest-first (createdAt, then id) — FIFO queue order. Bounded by
+   * Ordered per filter.orderBy: oldest-first (createdAt, then id — FIFO
+   * queue order) by default, or the reviewer queue order (priority → SLA →
+   * FIFO, byReviewerOrder) under 'reviewer' — applied BEFORE filter.limit,
+   * so a bounded page is the top of the reviewer queue. Bounded by
    * filter.limit/filter.after (D3: an unfiltered list() repeated on every
    * dashboard poll is a full-table scan).
    */
@@ -109,19 +115,42 @@ export function matchesFilter(
   return true;
 }
 
-/** FIFO queue order (createdAt, then id) — shared by both store views. */
+/**
+ * FIFO queue order (createdAt, then id) — shared by both store views.
+ * Bytewise via the shared compareStrings (NOT localeCompare): D1 orders with
+ * BINARY collation and the cursor row-value comparison in appendListFilters
+ * compares bytewise too, so a locale-collated in-memory sort would disagree
+ * with D1 on an id tie-break (mixed-case ids) and with its own cursor
+ * filter.
+ */
 export function byQueueOrder(a: ApprovalRecord, b: ApprovalRecord): number {
-  return a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
+  return compareStrings(a.createdAt, b.createdAt) || compareStrings(a.id, b.id);
+}
+
+/**
+ * The comparator for a filter's effective orderBy — shared by both in-memory
+ * list() implementations, same no-drift rationale as matchesFilter. Also the
+ * chokepoint where the reviewer/after incoherence throws (approvalListOrder);
+ * D1's list() resolves through the same function when building its ORDER BY.
+ */
+export function approvalListComparator(
+  filter: ApprovalListFilter,
+): (a: ApprovalRecord, b: ApprovalRecord) => number {
+  return approvalListOrder(filter) === 'reviewer'
+    ? byReviewerOrder
+    : byQueueOrder;
 }
 
 /**
  * Cursor + limit paging over an already status/workflow/run/claimedBy-
- * filtered, byQueueOrder-sorted record array — shared by both in-memory
+ * filtered, orderBy-sorted record array — shared by both in-memory
  * list() implementations (the tenant-bound store below and the system view
  * in tenant-store.ts) so they can never drift, same rationale as
- * matchesFilter/byQueueOrder. D1's list() applies the equivalent conditions
- * in SQL (appendListFilters' cursor clause + a LIMIT, d1-store.ts) instead
- * of calling this.
+ * matchesFilter/byQueueOrder. `after` only ever reaches this under the
+ * default FIFO order (approvalListOrder rejects it under 'reviewer' before
+ * any sort happens). D1's list() applies the equivalent conditions in SQL
+ * (appendListFilters' cursor clause + a LIMIT, d1-store.ts) instead of
+ * calling this.
  */
 export function paginateApprovalList(
   records: readonly ApprovalRecord[],
@@ -257,7 +286,7 @@ export class InMemoryApprovalStore implements ApprovalStore {
         (record) =>
           record.tenantId === this.tenantId && matchesFilter(record, filter),
       )
-      .sort(byQueueOrder);
+      .sort(approvalListComparator(filter));
     return paginateApprovalList(matched, filter).map(clone);
   }
 

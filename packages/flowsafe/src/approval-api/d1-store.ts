@@ -27,6 +27,7 @@ import {
   type ApprovalMetrics,
   type ApprovalRecord,
   type ApprovalStatus,
+  approvalListOrder,
   clampApprovalLimit,
   OPEN_STATUSES,
   parseApprovalCursor,
@@ -186,6 +187,27 @@ function appendListFilters(
     where.push('(created_at, id) > (?, ?)');
     values.push(cursor.createdAt, cursor.id);
   }
+}
+
+/**
+ * The ORDER BY of list(), shared by both views like appendListFilters. The
+ * reviewer branch must rank exactly like types.ts's byReviewerOrder — the
+ * in-memory stores sort with that comparator and store.test.ts pins the
+ * cross-backend parity: the priority CASE (an out-of-enum TEXT value lands
+ * in the ELSE arm, after 'low'), NULL SLA deadlines last, then FIFO. TEXT
+ * comparison on the fixed-format ISO-8601 columns is bytewise ==
+ * chronological, matching the comparator's string compares. Resolving
+ * through approvalListOrder also rejects the reviewer/after combination
+ * before any SQL runs.
+ */
+function listOrderBy(filter: ApprovalListFilter): string {
+  if (approvalListOrder(filter) === 'reviewer') {
+    return `ORDER BY
+      CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 4 END ASC,
+      CASE WHEN sla_deadline_at IS NULL THEN 1 ELSE 0 END ASC,
+      sla_deadline_at ASC, created_at ASC, id ASC`;
+  }
+  return 'ORDER BY created_at ASC, id ASC';
 }
 
 /**
@@ -468,7 +490,7 @@ export class D1ApprovalStore implements ApprovalStore {
     const limit = clampApprovalLimit(filter.limit);
     const { results } = await this.#db
       .prepare(
-        `SELECT * FROM ${TABLE} WHERE ${where.join(' AND ')} ORDER BY created_at ASC, id ASC${
+        `SELECT * FROM ${TABLE} WHERE ${where.join(' AND ')} ${listOrderBy(filter)}${
           limit !== undefined ? ' LIMIT ?' : ''
         }`,
       )
@@ -561,7 +583,7 @@ export function d1SystemApprovalStore(
       const limit = clampApprovalLimit(filter.limit);
       const { results } = await db
         .prepare(
-          `SELECT * FROM ${TABLE}${clause} ORDER BY created_at ASC, id ASC${
+          `SELECT * FROM ${TABLE}${clause} ${listOrderBy(filter)}${
             limit !== undefined ? ' LIMIT ?' : ''
           }`,
         )

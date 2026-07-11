@@ -14,7 +14,7 @@ import {
 } from './d1-store.js';
 import type { ApprovalPatch } from './store.js';
 import {
-  byQueueOrder,
+  approvalListComparator,
   InMemoryApprovalStore,
   matchesFilter,
   paginateApprovalList,
@@ -115,12 +115,12 @@ export class InMemoryApprovalStoreFactory implements ApprovalStoreFactory {
     const records = this.#records;
     return {
       // Identical to the bound store's list() minus the tenant predicate —
-      // hence the shared matchesFilter/byQueueOrder/paginateApprovalList
-      // rather than a copy.
+      // hence the shared matchesFilter/approvalListComparator/
+      // paginateApprovalList rather than a copy.
       async list(filter: ApprovalListFilter = {}): Promise<ApprovalRecord[]> {
         const matched = [...records.values()]
           .filter((record) => matchesFilter(record, filter))
-          .sort(byQueueOrder);
+          .sort(approvalListComparator(filter));
         return paginateApprovalList(matched, filter).map((record) =>
           structuredClone(record),
         );

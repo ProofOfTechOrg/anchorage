@@ -4,7 +4,7 @@
 // components. React-only (no DOM globals), but UI-pass-only — excluded from the
 // main workers-typed tsc pass alongside the .tsx views.
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import type {
   ApprovalDecision,
@@ -18,22 +18,42 @@ import { sortQueue } from './view-model.js';
 
 /**
  * The dashboard's default queue slice: open (non-terminal) requests only,
- * page-bounded at 100. An unfiltered client.list() repeated every poll is a
- * full-table scan on every open dashboard (2026-07-11 audit, D3) — this is
- * the fallback whenever a caller does not override
+ * page-bounded at 100 in REVIEWER order. The bound is D3 — an unfiltered
+ * client.list() repeated every poll is a full-table scan on every open
+ * dashboard (2026-07-11 audit). orderBy: 'reviewer' makes the server rank
+ * priority → SLA → FIFO BEFORE cutting the page, so the 100 rows are the
+ * top of the queue — under the default FIFO cut, a fresh critical request
+ * beyond the oldest 100 never reached the dashboard at all (2026-07-11
+ * review). This is the fallback whenever a caller does not override
  * UseApprovalDashboardOptions.filter.
  */
 export const DEFAULT_QUEUE_FILTER: ApprovalListFilter = {
   status: [...OPEN_STATUSES],
   limit: 100,
+  orderBy: 'reviewer',
 };
+
+/**
+ * Render-stable identity for a filter: its JSON serialization. The hook keys
+ * refresh() on this VALUE instead of the object reference, so the natural
+ * `useApprovalDashboard(client, { filter: { status: 'pending' } })` — a new
+ * object identity every render — polls on the configured interval instead of
+ * looping list/metrics requests back-to-back (2026-07-11 review), while a
+ * filter that CHANGES value still refetches immediately. Key order follows
+ * the caller's literal, which is constant across that caller's renders — the
+ * only stability this needs.
+ */
+export function approvalFilterKey(filter: ApprovalListFilter): string {
+  return JSON.stringify(filter);
+}
 
 /**
  * One poll's worth of dashboard data. DOM-free and hook-free — pulled out of
  * refresh() so the filter wiring (which ApprovalListFilter reaches
- * client.list) is testable without mounting the hook: approval-ui has no
- * renderer (see components.test.ts's "hooks need a renderer, the merge does
- * not" — the package's documented no-jsdom stance). metrics() is
+ * client.list) is testable without mounting the hook (the package's default
+ * no-renderer stance; the one exception is
+ * use-approval-dashboard.render.test.ts, which mounts the hook on happy-dom
+ * to pin the dependency-identity wiring — see README). metrics() is
  * deliberately called with no filter: it always summarizes the whole tenant
  * queue, independent of the queue view's slice.
  */
@@ -94,18 +114,41 @@ export function useApprovalDashboard(
   const [busy, setBusy] = useState(false);
   const [nowMs, setNowMs] = useState(now);
 
+  // Latest-ref for the injected clock: an inline `now` (a fixed test/story
+  // clock) is a new function identity every render — the same request-loop
+  // class as an inline filter, but a function cannot be value-keyed, so it
+  // rides a ref and refresh() reads it at call time.
+  const nowRef = useRef(now);
+  useEffect(() => {
+    nowRef.current = now;
+  });
+
+  // Value identity for the filter (see approvalFilterKey): rebuilt from the
+  // key alone so the memo depends on nothing identity-unstable. Without
+  // this, an inline filter recreated refresh() every render, whose effect
+  // refetched immediately, whose state updates rendered again — an unbounded
+  // request loop that never reached the poll interval (2026-07-11 review).
+  const filterKey = approvalFilterKey(filter);
+  const stableFilter = useMemo(
+    () => JSON.parse(filterKey) as ApprovalListFilter,
+    [filterKey],
+  );
+
+  // `client` stays an identity dependency on purpose: a NEW client means a
+  // new endpoint/authorization (the showcase actor switcher), which must
+  // refetch immediately — unlike filter/now, its identity carries meaning.
   const refresh = useCallback(async () => {
     try {
       const { records: nextRecords, metrics: nextMetrics } =
-        await fetchDashboardSnapshot(client, filter);
+        await fetchDashboardSnapshot(client, stableFilter);
       setRecords(nextRecords);
       setMetrics(nextMetrics);
-      setNowMs(now());
+      setNowMs(nowRef.current());
       setError(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     }
-  }, [client, now, filter]);
+  }, [client, stableFilter]);
 
   useEffect(() => {
     void refresh();
@@ -162,6 +205,8 @@ export function useApprovalDashboard(
   );
 
   return {
+    // Idempotent under DEFAULT_QUEUE_FILTER (the server already returns
+    // reviewer order); load-bearing for caller filters without orderBy.
     records: sortQueue(records),
     metrics,
     selected,

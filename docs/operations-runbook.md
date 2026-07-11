@@ -168,11 +168,15 @@ only `status: 'approved'` records), not merely by the fingerprint mismatch
 that triggered the supersede.
 
 `GET /api/approvals` and the flowsafe dashboard are now paginated:
-`ApprovalListFilter` accepts `limit` (1–500) and an opaque `after` cursor
+`ApprovalListFilter` accepts `limit` (1–500), an opaque `after` cursor
 (derive the next page's cursor from the last record of the current page
-with `approvalCursor()`). The dashboard defaults to open statuses with
-`limit: 100`, so an open dashboard no longer issues an unfiltered
-full-table scan on every poll.
+with `approvalCursor()`), and `orderBy` (`created` — FIFO, the default —
+or `reviewer`: priority → nearest SLA deadline → FIFO, applied before
+`limit`; incompatible with `after`, since cursors only page the monotonic
+FIFO order). The dashboard defaults to open statuses with `limit: 100` and
+`orderBy: 'reviewer'`, so an open dashboard neither issues an unfiltered
+full-table scan on every poll nor loses a fresh critical request past the
+oldest 100 records to a FIFO page cut.
 
 ## Incident Response
 

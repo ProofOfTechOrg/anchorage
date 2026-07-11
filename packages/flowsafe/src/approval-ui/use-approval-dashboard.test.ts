@@ -13,6 +13,7 @@ import type {
 } from '../approval-api/types.js';
 import { OPEN_STATUSES } from '../approval-api/types.js';
 import {
+  approvalFilterKey,
   DEFAULT_QUEUE_FILTER,
   fetchDashboardSnapshot,
 } from './use-approval-dashboard.js';
@@ -66,12 +67,45 @@ function fakeClient(records: ApprovalRecord[] = []): {
 }
 
 describe('DEFAULT_QUEUE_FILTER', () => {
-  it('scopes the queue to open (non-terminal) statuses, bounded at 100', () => {
-    // #then
+  it('scopes the queue to open statuses, bounded at 100 in REVIEWER order', () => {
+    // #then — orderBy makes the server rank priority → SLA → FIFO before
+    // cutting the page; a FIFO cut hid a fresh critical request beyond the
+    // oldest 100 (2026-07-11 review)
     expect(DEFAULT_QUEUE_FILTER).toEqual({
       status: [...OPEN_STATUSES],
       limit: 100,
+      orderBy: 'reviewer',
     });
+  });
+});
+
+describe('approvalFilterKey', () => {
+  it('gives two structurally equal filters (fresh inline literals) ONE identity', () => {
+    // #given — what an inline `filter: {...}` option produces on every
+    // render: the same shape under a new object identity
+    const key = approvalFilterKey({ status: ['pending'], limit: 25 });
+    const rerenderKey = approvalFilterKey({ status: ['pending'], limit: 25 });
+
+    // #then — identical keys keep the hook's refresh() stable, so the poll
+    // interval governs request cadence instead of an every-render refetch
+    // loop (2026-07-11 review)
+    expect(rerenderKey).toBe(key);
+  });
+
+  it('changes when the filter value changes, and round-trips losslessly', () => {
+    // #given
+    const filter: ApprovalListFilter = {
+      status: ['pending'],
+      limit: 25,
+      orderBy: 'reviewer',
+    };
+
+    // #when / #then — a semantic change still refetches immediately, and the
+    // JSON round-trip the hook memoizes reconstructs an equivalent filter
+    expect(approvalFilterKey({ ...filter, limit: 50 })).not.toBe(
+      approvalFilterKey(filter),
+    );
+    expect(JSON.parse(approvalFilterKey(filter))).toEqual(filter);
   });
 });
 

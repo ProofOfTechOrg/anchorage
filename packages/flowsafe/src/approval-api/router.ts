@@ -24,10 +24,13 @@ import {
   type TenantResolver,
 } from './tenant-context.js';
 import {
+  APPROVAL_LIST_ORDERS,
   APPROVAL_STATUSES,
   type ApprovalDecision,
   type ApprovalListFilter,
+  type ApprovalListOrder,
   type ApprovalStatus,
+  approvalListOrder,
   type CreateApprovalInput,
   MAX_APPROVAL_LIST_LIMIT,
   parseApprovalCursor,
@@ -200,6 +203,25 @@ function parseListFilter(url: URL): ApprovalListFilter {
       );
     }
     filter.after = after;
+  }
+  const orderBy = url.searchParams.get('orderBy');
+  if (orderBy !== null) {
+    if (!(APPROVAL_LIST_ORDERS as readonly string[]).includes(orderBy)) {
+      throw new InvalidApprovalInputError(
+        `unknown orderBy '${orderBy}' (expected one of [${APPROVAL_LIST_ORDERS.join(', ')}])`,
+      );
+    }
+    filter.orderBy = orderBy as ApprovalListOrder;
+  }
+  // Same eager-validation rationale as the cursor above: the reviewer/after
+  // incoherence must 400 here, not surface as a store throw mapped to 500 —
+  // approvalListOrder is the one shared rule the stores re-apply.
+  try {
+    approvalListOrder(filter);
+  } catch (error) {
+    throw new InvalidApprovalInputError(
+      error instanceof Error ? error.message : String(error),
+    );
   }
   return filter;
 }

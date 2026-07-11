@@ -74,6 +74,7 @@
     "@proofoftech/breakwater": "workspace:*",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "happy-dom": "^20.10.6",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "typescript": "^5.6",

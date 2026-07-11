@@ -159,6 +159,11 @@ export interface CreateApprovalInput {
   runScoped?: boolean;
 }
 
+/** List orderings accepted by ApprovalListFilter.orderBy. */
+export const APPROVAL_LIST_ORDERS = ['created', 'reviewer'] as const;
+
+export type ApprovalListOrder = (typeof APPROVAL_LIST_ORDERS)[number];
+
 export interface ApprovalListFilter {
   status?: ApprovalStatus | ApprovalStatus[];
   workflowId?: string;
@@ -176,6 +181,85 @@ export interface ApprovalListFilter {
    * from the beginning.
    */
   after?: string;
+  /**
+   * Result ordering. 'created' (default) is FIFO — (createdAt, id), the
+   * order `after` cursors page over. 'reviewer' is the dashboard queue
+   * order (byReviewerOrder: priority, then nearest SLA deadline, then
+   * FIFO), applied BEFORE `limit` so a bounded page is the TOP of the
+   * reviewer queue — under FIFO-then-limit, a fresh critical request
+   * beyond the oldest `limit` records was invisible to a bounded dashboard
+   * poll (2026-07-11 review). Incompatible with `after`; see
+   * approvalListOrder.
+   */
+  orderBy?: ApprovalListOrder;
+}
+
+/**
+ * Resolves ApprovalListFilter.orderBy to its effective value — 'created'
+ * unless set — and rejects the one incoherent combination: an `after` cursor
+ * encodes a position in (createdAt, id) order, where new records only ever
+ * land PAST the cursor; under 'reviewer' order they insert anywhere, so
+ * cursor pages would silently skip or repeat records. Every list()
+ * implementation (both backends, both tenant views) resolves through here;
+ * router.ts maps the throw to a 400 before a store sees the filter.
+ */
+export function approvalListOrder(
+  filter: Pick<ApprovalListFilter, 'after' | 'orderBy'>,
+): ApprovalListOrder {
+  const orderBy = filter.orderBy ?? 'created';
+  if (orderBy === 'reviewer' && filter.after !== undefined) {
+    throw new Error(
+      "orderBy 'reviewer' cannot be combined with an 'after' cursor — cursors page FIFO (createdAt, id) order only",
+    );
+  }
+  return orderBy;
+}
+
+const REVIEWER_PRIORITY_RANK: Record<ApprovalPriority, number> = {
+  critical: 0,
+  high: 1,
+  normal: 2,
+  low: 3,
+};
+
+// D1 casts the priority TEXT column straight into the union, so the lookup
+// must tolerate an out-of-enum value at runtime: it ranks after 'low',
+// exactly like the SQL CASE's ELSE arm in d1-store.ts.
+function reviewerPriorityRank(priority: ApprovalPriority): number {
+  return (
+    (REVIEWER_PRIORITY_RANK as Partial<Record<string, number>>)[priority] ?? 4
+  );
+}
+
+// Bytewise, locale-independent — equals SQLite TEXT comparison, and equals
+// chronological order for the fixed-format ISO-8601 stamps. Exported (not
+// barreled) so store.ts's byQueueOrder shares the SAME collation: one
+// divergent localeCompare would let the in-memory and D1 backends disagree
+// on an id tie-break (concrete on mixed-case ids — 'B' < 'a' bytewise but
+// 'a' < 'B' in a locale collation).
+export function compareStrings(a: string, b: string): number {
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
+}
+
+/**
+ * Reviewer-facing queue order: priority first, then nearest SLA deadline
+ * (records without one last), then FIFO (createdAt, id). THE definition of
+ * orderBy: 'reviewer' — the dashboard's sortQueue (approval-ui/view-model.ts)
+ * delegates here and d1-store.ts mirrors it in SQL (store.test.ts pins the
+ * cross-backend parity), so a bounded server page and the client-side sort
+ * can never rank differently.
+ */
+export function byReviewerOrder(a: ApprovalRecord, b: ApprovalRecord): number {
+  const byPriority =
+    reviewerPriorityRank(a.priority) - reviewerPriorityRank(b.priority);
+  if (byPriority !== 0) return byPriority;
+  if (a.slaDeadlineAt !== b.slaDeadlineAt) {
+    if (a.slaDeadlineAt === undefined) return 1;
+    if (b.slaDeadlineAt === undefined) return -1;
+    return compareStrings(a.slaDeadlineAt, b.slaDeadlineAt);
+  }
+  return compareStrings(a.createdAt, b.createdAt) || compareStrings(a.id, b.id);
 }
 
 /** Hard cap on ApprovalListFilter.limit — see clampApprovalLimit. */

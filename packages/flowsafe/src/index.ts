@@ -27,6 +27,7 @@ export type {
   ApprovalDatabase,
   ApprovalDecision,
   ApprovalListFilter,
+  ApprovalListOrder,
   ApprovalMetrics,
   ApprovalPatch,
   ApprovalPreparedStatement,
@@ -52,6 +53,7 @@ export type {
   TenantResolver,
 } from './approval-api/index.js';
 export {
+  APPROVAL_LIST_ORDERS,
   APPROVAL_PRIORITIES,
   APPROVAL_ROLES,
   APPROVAL_STATUSES,
@@ -61,10 +63,12 @@ export {
   approvalCursor,
   approvalGrantProvider,
   approvalGrantProviderFromFactory,
+  approvalListOrder,
   approvedConnectorsForLeg,
   BREAKWATER_ACTOR_KEY,
   BREAKWATER_APPROVED_CONNECTORS_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
+  byReviewerOrder,
   CLIENT_CREATE_FIELDS,
   createApprovalRouter,
   createTenantResolver,

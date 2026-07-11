@@ -310,20 +310,21 @@ describe('agent CLI connector enforcement', () => {
   });
 });
 
-describe('idempotency TTL guard (audit D2)', () => {
-  // Structurally shaped like D1IdempotencyStore's public surface — agent-cli
-  // duck-types the pendingTtlMs field rather than importing the D1 class.
-  function fakeD1LikeStore(pendingTtlMs: number) {
-    return {
-      pendingTtlMs,
-      get: () => undefined,
-      put: () => {},
-      reserve: () => ({ state: 'reserved' as const }),
-      release: () => {},
-    };
-  }
+// Structurally shaped like D1IdempotencyStore's public surface — agent-cli
+// duck-types the pendingTtlMs field rather than importing the D1 class.
+// Shared by the TTL-guard suite and the numeric-option suite below.
+function fakeD1LikeStore(pendingTtlMs: number) {
+  return {
+    pendingTtlMs,
+    get: () => undefined,
+    put: () => {},
+    reserve: () => ({ state: 'reserved' as const }),
+    release: () => {},
+  };
+}
 
-  // Same shape, but pendingTtlMs is deliberately NOT typed as a number — a
+describe('idempotency TTL guard (audit D2)', () => {
+  // Same shape as fakeD1LikeStore, but pendingTtlMs is deliberately NOT typed as a number — a
   // hand-built or misconfigured store duck-typing the field wrong (a string,
   // NaN, ...). Returned from a function (not an inline literal at the call
   // site) so TS's excess-property check on `policies.idempotencyStore`
@@ -415,6 +416,85 @@ describe('idempotency TTL guard (audit D2)', () => {
         },
       }),
     ).toThrow(/pendingTtlMs is present but not a finite number/);
+  });
+});
+
+describe('numeric option validation (2026-07-11 review)', () => {
+  it.each([
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    0,
+    -1,
+    1.5,
+    2 ** 31,
+  ])('rejects timeoutMs %s at construction', (timeoutMs) => {
+    // #given — setTimeout reinterprets NaN/negative delays as 0 and clamps
+    // beyond-2^31-1 delays to 1ms: every one of these means instant SIGKILL
+    // #when / #then
+    expect(() =>
+      createClaudeCodeConnector({ exec: mockExec(), timeoutMs }),
+    ).toThrow(/timeoutMs must be an integer/);
+  });
+
+  it.each([
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    -1,
+    10.5,
+  ])('rejects maxOutputBytes %s at construction', (maxOutputBytes) => {
+    // #given — Infinity never evicts (totalBytes <= Infinity holds
+    // forever), NaN satisfies no comparison, negatives/fractions corrupt
+    // the byte math: the runaway-output bound must fail loudly, not disarm
+    // #when / #then
+    expect(() => createClaudeCodeConnector({ maxOutputBytes })).toThrow(
+      /maxOutputBytes must be an integer/,
+    );
+  });
+
+  it('rejects a malformed maxOutputBytes even when an injected exec would ignore it', () => {
+    // #given — present-but-malformed is a misconfiguration, not an exemption
+    // (the pendingTtlMs posture); dropping the exec injection later must not
+    // silently inherit a disarmed cap
+    // #when / #then
+    expect(() =>
+      createClaudeCodeConnector({
+        exec: mockExec(),
+        maxOutputBytes: Number.NaN,
+      }),
+    ).toThrow(/maxOutputBytes/);
+  });
+
+  it('rejects a NaN timeoutMs BEFORE the D2 pendingTtlMs guard it would defeat', () => {
+    // #given — `pendingTtlMs <= NaN` is false, so an accepted NaN timeout
+    // would let ANY store (here an unusably short 1ms TTL) pass the takeover
+    // guard vacuously
+    // #when / #then — the thrown error is the timeoutMs one, not a pass
+    expect(() =>
+      createClaudeCodeConnector({
+        idempotencyKey: true,
+        timeoutMs: Number.NaN,
+        policies: { idempotencyStore: fakeD1LikeStore(1) },
+      }),
+    ).toThrow(/timeoutMs must be an integer/);
+  });
+
+  it('accepts the boundary values (1 and 2^31-1 ms; 0 and MAX_SAFE_INTEGER bytes)', () => {
+    // #when / #then — the guard rejects malformed values, not extreme ones
+    expect(() =>
+      createClaudeCodeConnector({ exec: mockExec(), timeoutMs: 1 }),
+    ).not.toThrow();
+    expect(() =>
+      createClaudeCodeConnector({ exec: mockExec(), timeoutMs: 2 ** 31 - 1 }),
+    ).not.toThrow();
+    expect(() =>
+      createClaudeCodeConnector({ exec: mockExec(), maxOutputBytes: 0 }),
+    ).not.toThrow();
+    expect(() =>
+      createClaudeCodeConnector({
+        exec: mockExec(),
+        maxOutputBytes: Number.MAX_SAFE_INTEGER,
+      }),
+    ).not.toThrow();
   });
 });
 
@@ -586,6 +666,25 @@ describe('defaultExec (real node:child_process spawn)', () => {
     expect(output.text.endsWith('TAIL')).toBe(true);
     expect(output.text).not.toContain('HEAD');
     expect(output.text).toContain('truncated');
+  });
+
+  it('maxOutputBytes: 0 retains nothing but still reports the exit and marks truncation', async () => {
+    // #given — the legal floor of the validated range: exit-code-only usage
+    const tool = nodeScriptConnector(
+      "process.stdout.write('anything at all')",
+      undefined,
+      0,
+    );
+
+    // #when
+    const output = (await run(tool, { prompt: 'p' }, makeContext())) as {
+      text: string;
+      exitCode: number;
+    };
+
+    // #then
+    expect(output.exitCode).toBe(0);
+    expect(output.text).toBe('…[truncated to the last 0 bytes]…');
   });
 
   it('leaves pure-ASCII truncation exactly as before (byte length == char length)', async () => {

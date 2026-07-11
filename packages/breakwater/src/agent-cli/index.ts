@@ -84,7 +84,13 @@ export interface AgentCliConnectorOptions {
   exec?: AgentCliExec;
   /** Override the binary (absolute path or PATH name). */
   binaryPath?: string;
-  /** Kill the CLI after this long. Default 600000 (10 min — agent tasks run long). */
+  /**
+   * Kill the CLI after this long. Default 600000 (10 min — agent tasks run
+   * long). Must be an integer in [1, 2^31-1]: setTimeout treats NaN and
+   * negatives as 0 and clamps beyond-2^31-1 delays to 1ms — either way an
+   * instant SIGKILL — and a NaN additionally passes the pendingTtlMs guard
+   * below vacuously. Construction throws on a malformed value.
+   */
   timeoutMs?: number;
   /**
    * Agent CLIs are approval-gated by default (they execute arbitrary
@@ -113,7 +119,10 @@ export interface AgentCliConnectorOptions {
    * code units — a naive char-length cap over-counts non-Latin1 output and
    * can cut mid-codepoint). The TAIL is kept, cut on a codepoint boundary,
    * and truncation is marked (the agent's final answer text arrives last).
-   * Ignored when `exec` is injected. Default 1 MiB (1 048 576).
+   * Ignored when `exec` is injected. Default 1 MiB (1 048 576). Must be a
+   * non-negative safe integer (0 retains nothing): NaN/Infinity satisfy no
+   * eviction comparison, so a malformed cap silently DISARMS the bound —
+   * construction throws instead, even alongside an injected `exec`.
    */
   maxOutputBytes?: number;
 }
@@ -127,6 +136,41 @@ export class AgentCliError extends Error {
 
 const DEFAULT_TIMEOUT_MS = 600_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
+// setTimeout's delay ceiling (signed 32-bit ms, ~24.8 days): Node clamps
+// anything above it DOWN TO 1ms, so a "generous" timeout would SIGKILL every
+// CLI instantly.
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
+
+/**
+ * Construction-time guard for the numeric safety knobs. Each bounds a
+ * runaway CLI (timeoutMs → SIGKILL budget, maxOutputBytes → retained-tail
+ * cap), and each silently DISARMS on a malformed value instead of failing:
+ * NaN satisfies no comparison (the accumulator evicts nothing; the D2
+ * pendingTtlMs guard passes vacuously), `totalBytes <= Infinity` is always
+ * true, setTimeout reinterprets NaN/negative delays as 0 and beyond-2^31-1
+ * delays as 1ms, and fractional/negative byte caps corrupt the truncation
+ * arithmetic. Same posture as the pendingTtlMs check below: a PRESENT-but-
+ * malformed value is a misconfiguration to reject loudly, never to
+ * reinterpret.
+ */
+function assertIntegerOption(
+  connectorId: string,
+  name: 'timeoutMs' | 'maxOutputBytes',
+  value: number,
+  min: number,
+  max: number,
+): void {
+  if (
+    typeof value !== 'number' ||
+    !Number.isSafeInteger(value) ||
+    value < min ||
+    value > max
+  ) {
+    throw new TypeError(
+      `agent CLI connector ${connectorId}: ${name} must be an integer in [${min}, ${max}] (got ${typeof value}: ${String(value)}) — a malformed value silently disarms the bound it configures instead of failing it`,
+    );
+  }
+}
 
 const inputSchema = z.object({
   prompt: z.string().min(1),
@@ -286,6 +330,28 @@ export function createAgentCliConnector(
   definition: AgentCliDefinition,
   options: AgentCliConnectorOptions = {},
 ): Tool<AgentCliInput, AgentCliOutput> {
+  const connectorId = options.id ?? definition.id;
+  if (options.timeoutMs !== undefined) {
+    assertIntegerOption(
+      connectorId,
+      'timeoutMs',
+      options.timeoutMs,
+      1,
+      MAX_TIMEOUT_MS,
+    );
+  }
+  if (options.maxOutputBytes !== undefined) {
+    // 0 is legal (retain nothing — exit-code-only usage); the accumulator
+    // handles it. Validated even when `exec` is injected and the value goes
+    // unused: present-but-malformed is a misconfiguration, not an exemption.
+    assertIntegerOption(
+      connectorId,
+      'maxOutputBytes',
+      options.maxOutputBytes,
+      0,
+      Number.MAX_SAFE_INTEGER,
+    );
+  }
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   if (options.idempotencyKey) {
     // D2: the store's stale-pending takeover TTL must outlive the longest
@@ -305,12 +371,12 @@ export function createAgentCliConnector(
     if (pendingTtlMs !== undefined) {
       if (typeof pendingTtlMs !== 'number' || !Number.isFinite(pendingTtlMs)) {
         throw new TypeError(
-          `agent CLI connector ${options.id ?? definition.id}: permissions.idempotencyKey is enabled with an idempotency store whose pendingTtlMs is present but not a finite number (got ${typeof pendingTtlMs}: ${String(pendingTtlMs)}) — a present pendingTtlMs must be a finite number of milliseconds, or the property must be absent entirely to stay exempt`,
+          `agent CLI connector ${connectorId}: permissions.idempotencyKey is enabled with an idempotency store whose pendingTtlMs is present but not a finite number (got ${typeof pendingTtlMs}: ${String(pendingTtlMs)}) — a present pendingTtlMs must be a finite number of milliseconds, or the property must be absent entirely to stay exempt`,
         );
       }
       if (pendingTtlMs <= timeoutMs) {
         throw new TypeError(
-          `agent CLI connector ${options.id ?? definition.id}: permissions.idempotencyKey is enabled with an idempotency store whose pendingTtlMs (${pendingTtlMs}ms) is <= this connector's timeoutMs (${timeoutMs}ms) — a still-running execution could be taken over as stale and spawned a second time; raise the store's pendingTtlMs above timeoutMs`,
+          `agent CLI connector ${connectorId}: permissions.idempotencyKey is enabled with an idempotency store whose pendingTtlMs (${pendingTtlMs}ms) is <= this connector's timeoutMs (${timeoutMs}ms) — a still-running execution could be taken over as stale and spawned a second time; raise the store's pendingTtlMs above timeoutMs`,
         );
       }
     }
@@ -331,7 +397,7 @@ export function createAgentCliConnector(
   };
 
   return createConnector<AgentCliInput, AgentCliOutput>({
-    id: options.id ?? definition.id,
+    id: connectorId,
     description: definition.description,
     inputSchema,
     outputSchema,
