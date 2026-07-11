@@ -97,12 +97,16 @@ export interface IdempotencyStore {
 /**
  * Outcome of an atomic reserve():
  * - 'reserved' — this caller claimed the key: execute, then put();
- *   release() after a failed execute so the key stays retryable.
+ *   release() after a failed execute so the key stays retryable. `tookOver`
+ *   is set when the claim came from a stale-pending takeover rather than a
+ *   fresh key (D1IdempotencyStore's pendingTtlMs) — worth a dedicated audit
+ *   signal, since a takeover fired too early means the previous holder may
+ *   still be executing (audit D2).
  * - 'replay'   — a completed execution's record: return it, do not execute.
  * - 'pending'  — another isolate is executing this key right now.
  */
 export type IdempotencyReservation =
-  | { state: 'reserved' }
+  | { state: 'reserved'; tookOver?: boolean }
   | { state: 'replay'; record: IdempotencyRecord }
   | { state: 'pending' };
 
@@ -353,6 +357,19 @@ function isolationScopeOf(
   return typeof scope === 'string' && scope.length > 0 ? scope : undefined;
 }
 
+// D5: an in-memory store loses its cross-isolate reach the moment a host
+// mints an isolation scope — the budget/replay cache narrows to per-isolate
+// (per RUN under DO-per-run routing), not per-tenant, with no error. Warn
+// once per STORE INSTANCE (not per call, not per connector — the same store
+// can back several connectors) the first time this combination is seen.
+const warnedInMemoryStores = new WeakSet<object>();
+
+function warnOnceForInMemoryStore(store: object, message: string): void {
+  if (warnedInMemoryStores.has(store)) return;
+  warnedInMemoryStores.add(store);
+  console.warn(message);
+}
+
 const RATE_LIMIT_PATTERN = /^(\d+)\/(s|sec|second|m|min|minute|h|hour|d|day)$/;
 
 const RATE_LIMIT_WINDOW_MS: Record<string, number> = {
@@ -481,9 +498,14 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     throw new ConnectorPolicyError(id, policy, reason);
   }
 
-  // Single success seam: every result a call returns passes through here,
-  // so the post-execute policy stage (retention/isolation, later phases)
-  // slots in at one point instead of four.
+  // Single audit seam: every path that produces a successful result — a
+  // fresh execute, a replayed/joined idempotent result, or a dry-run
+  // simulation — routes through here to record the one 'allowed' audit
+  // event, instead of duplicating that call at each site. There is no
+  // post-execute policy stage today: retention and isolation
+  // (crossWorkflowIsolation, tenantIsolation) are PRE-execute evaluators run
+  // from the `gates` loop above, before execute — nothing currently gates
+  // the result of a call.
   function finishAllowed(
     requestContext: RequestContext | undefined,
     result: TOutput,
@@ -550,6 +572,15 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     // to this isolate (under DO-per-run routing, to this RUN), so a cap that
     // must hold across isolates needs a durable store (D1RateLimitStore).
     const scope = isolationScopeOf(requestContext);
+    if (
+      scope !== undefined &&
+      rateLimit.store instanceof InMemoryRateLimitStore
+    ) {
+      warnOnceForInMemoryStore(
+        rateLimit.store,
+        `breakwater: connector '${id}' uses InMemoryRateLimitStore under isolation scope '${scope}' — the rate-limit budget becomes per-isolate, not per-tenant; use D1RateLimitStore on DO-per-run hosts.`,
+      );
+    }
     const budgetKey = scope === undefined ? id : `${scope}:${id}`;
     let count: number;
     try {
@@ -748,6 +779,15 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       // tenant B's send would replay tenant A's cached result object
       // (confidentiality AND availability). No scope => today's key.
       const isolationScope = isolationScopeOf(requestContext);
+      if (
+        isolationScope !== undefined &&
+        store instanceof InMemoryIdempotencyStore
+      ) {
+        warnOnceForInMemoryStore(
+          store,
+          `breakwater: connector '${id}' uses InMemoryIdempotencyStore under isolation scope '${isolationScope}' — replay protection becomes per-isolate, not per-tenant; use D1IdempotencyStore on DO-per-run hosts.`,
+        );
+      }
       const scoped =
         isolationScope === undefined
           ? `${id}:${key}`
@@ -784,12 +824,31 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
               'another execution for this key is in progress; retry to replay its result',
             );
           }
+          if (reservation.tookOver) {
+            // D2: a dedicated signal, separate from this call's own outcome
+            // record below — the previous holder may only have been slow,
+            // not dead, if pendingTtlMs was set too low relative to the real
+            // execute duration (agent-cli's definition-time guard checks
+            // this; other connectors must size the store's TTL themselves).
+            record(requestContext, 'allowed', {
+              reason:
+                'stale-pending idempotency reservation taken over; the previous holder may still be executing',
+              detail: { idempotencyKey: key, tookOver: true },
+            });
+          }
           // Reserved: consume the rate budget, execute, then put()
           // finalizes the record. Any throw before put releases the
           // reservation — failures are never cached, the key stays
           // retryable. The consume stays INSIDE the attempt so denied
           // calls, replays, and joins never spend budget; single-audit of
           // rate failures is handled by deny()/auditedErrors.
+          // Accepted ordering quirk (audit D5, deliberate): reserve() runs
+          // BEFORE the rate-limit check, so a concurrent cross-isolate call
+          // for this same key that arrives while THIS attempt is later
+          // denied by the rate limit (and its reservation released) sees
+          // 'pending' and is denied 'idempotency' rather than 'rate-limit' —
+          // a transient misattribution in the audit reason, self-correcting
+          // on retry, with no duplicated side effect. Not fixed.
           const attempt = (async () => {
             try {
               await consumeRateLimit(requestContext);

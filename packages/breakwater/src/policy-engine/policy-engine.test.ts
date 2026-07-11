@@ -299,6 +299,137 @@ describe('PolicyEngine', () => {
   });
 });
 
+describe('PolicyEngine constructor validation (K2)', () => {
+  it('rejects a policy whose explicit phases include input but explicit channels exclude answer', () => {
+    // #given — processInput hardcodes channel: 'answer', so this policy
+    // would silently never run on input
+    const misconfigured: PolicyEvaluator = {
+      name: 'reasoning-only-input',
+      phases: ['input'],
+      channels: ['reasoning'],
+      evaluate: () => ({ allowed: true }),
+    };
+
+    // #when / #then
+    expect(() => new PolicyEngine({ policies: [misconfigured] })).toThrow(
+      /reasoning-only-input.*phases.*input.*channels.*answer/is,
+    );
+  });
+
+  it('does not throw when phases is left to its own default (both)', () => {
+    // #given — channels excludes answer, but phases was never narrowed
+    const policy: PolicyEvaluator = {
+      name: 'object-only',
+      channels: ['object'],
+      evaluate: () => ({ allowed: true }),
+    };
+
+    // #when / #then
+    expect(() => new PolicyEngine({ policies: [policy] })).not.toThrow();
+  });
+
+  it('does not throw when channels is left to its own default (answer)', () => {
+    // #given — phases explicitly includes input, but channels was never set
+    const policy: PolicyEvaluator = {
+      name: 'input-only',
+      phases: ['input'],
+      evaluate: () => ({ allowed: true }),
+    };
+
+    // #when / #then
+    expect(() => new PolicyEngine({ policies: [policy] })).not.toThrow();
+  });
+
+  it('does not throw when explicit channels include answer alongside object', () => {
+    // #given — denyPatterns' own default channels: ['answer','reasoning','object']
+    // #when / #then
+    expect(
+      () =>
+        new PolicyEngine({
+          policies: [denyPatterns(['x'], { phases: ['input'] })],
+        }),
+    ).not.toThrow();
+  });
+});
+
+describe('PolicyEngine object-channel result-phase fence (D1)', () => {
+  it('warns once per engine instance when a policy is scoped to object without answer', async () => {
+    // #given — zero result-phase coverage: OutputResult has no object field,
+    // and this policy never sees the answer channel either
+    const audit = new AuditLogger();
+    const engine = new PolicyEngine({
+      policies: [denyPatterns(['x'], { channels: ['object'] })],
+      audit,
+    });
+
+    // #when — two result-phase calls
+    await engine.processOutputResult(makeOutputArgs('clean'));
+    await engine.processOutputResult(makeOutputArgs('clean'));
+
+    // #then — exactly one warning, not one per call. #recordAllowed also
+    // writes 'agent.output.policy' events (decision: 'allowed') on every
+    // call, so the fence warning is distinguished by decision: 'error'.
+    const warnings = audit
+      .events()
+      .filter(
+        (event) =>
+          event.action === 'agent.output.policy' && event.decision === 'error',
+      );
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({
+      decision: 'error',
+      detail: { policies: ['deny-patterns'] },
+    });
+  });
+
+  it('does not warn for a policy scoped to object alongside answer (the designed cover)', async () => {
+    // #given — denyPatterns' default channels include 'answer'
+    const audit = new AuditLogger();
+    const engine = new PolicyEngine({
+      policies: [denyPatterns(['x'])],
+      audit,
+    });
+
+    // #when
+    await engine.processOutputResult(makeOutputArgs('clean'));
+
+    // #then — no fence warning fired (the normal 'allowed' record for this
+    // call is expected and is not the fence warning)
+    expect(
+      audit
+        .events()
+        .some(
+          (event) =>
+            event.action === 'agent.output.policy' &&
+            event.decision === 'error',
+        ),
+    ).toBe(false);
+  });
+
+  it('does not warn when no policy is object-scoped at all', async () => {
+    // #given
+    const audit = new AuditLogger();
+    const engine = new PolicyEngine({
+      policies: [maxTextLength(100)],
+      audit,
+    });
+
+    // #when
+    await engine.processOutputResult(makeOutputArgs('clean'));
+
+    // #then
+    expect(
+      audit
+        .events()
+        .some(
+          (event) =>
+            event.action === 'agent.output.policy' &&
+            event.decision === 'error',
+        ),
+    ).toBe(false);
+  });
+});
+
 describe('PolicyEngine.processOutputStream', () => {
   it('aborts a denied pattern that completes across chunks, before the chunk is emitted', async () => {
     // #given — an output deny policy; "secret" straddles two text-delta
@@ -1206,6 +1337,31 @@ describe('PolicyEngine hold-back buffering', () => {
     await expect(
       runner.drainReprocessParts(states, undefined, requestContext),
     ).resolves.toHaveLength(0);
+  });
+
+  it('leaves the held tail unemitted when the stream ends without a flush trigger', async () => {
+    // #given — an Infinity-window policy (any RegExp) holds everything until
+    // text-end/reasoning-end/finish; this driver simply stops after two
+    // clean deltas without ever sending one (the documented truncation case)
+    const engine = new PolicyEngine({
+      policies: [denyPatterns([/x-\d/], { phases: ['output'] })],
+      holdBack: true,
+    });
+    const state: Record<string, unknown> = {};
+
+    // #when
+    const first = await engine.processOutputStream(
+      makeStreamArgs([textDelta('all clear ')], state),
+    );
+    const second = await engine.processOutputStream(
+      makeStreamArgs([textDelta('all clear '), textDelta('here')], state),
+    );
+
+    // #then — both deltas were held; nothing ever reached the caller. The
+    // clean trailing text is silently dropped, not leaked (no leak; this
+    // pins the documented loss, it does not fix it).
+    expect(first).toBeNull();
+    expect(second).toBeNull();
   });
 });
 

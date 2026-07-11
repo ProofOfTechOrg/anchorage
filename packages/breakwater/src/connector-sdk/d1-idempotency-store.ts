@@ -39,7 +39,11 @@ export interface D1IdempotencyStoreOptions {
    * Age (ms) after which a 'pending' reservation counts as abandoned — a
    * crashed isolate — and may be taken over. Must exceed the longest
    * expected execute duration, or a slow-but-alive execution races its own
-   * takeover. Default 300 000.
+   * takeover (audit D2: a takeover while the original holder is still
+   * running double-executes a write connector). Default 900 000 — above
+   * agent-cli's default 600 000ms execute timeout; agent-cli's
+   * `idempotencyKey` option additionally throws at definition time when a
+   * configured store's `pendingTtlMs` does not clear its `timeoutMs`.
    */
   pendingTtlMs?: number;
   /** Clock override for tests. */
@@ -47,7 +51,7 @@ export interface D1IdempotencyStoreOptions {
 }
 
 const DEFAULT_TABLE = 'breakwater_idempotency';
-const DEFAULT_PENDING_TTL_MS = 300_000;
+const DEFAULT_PENDING_TTL_MS = 900_000;
 
 function parseRecord(json: string | null): IdempotencyRecord {
   // put() serializes the whole record, so a stored `undefined` result
@@ -59,7 +63,8 @@ function parseRecord(json: string | null): IdempotencyRecord {
 export class D1IdempotencyStore implements AtomicIdempotencyStore {
   readonly #db: IdempotencyDatabase;
   readonly #table: string;
-  readonly #pendingTtlMs: number;
+  /** Stale-pending takeover threshold (ms) — see D1IdempotencyStoreOptions.pendingTtlMs. */
+  readonly pendingTtlMs: number;
   readonly #now: () => number;
   #schemaReady?: Promise<void>;
 
@@ -69,7 +74,7 @@ export class D1IdempotencyStore implements AtomicIdempotencyStore {
   ) {
     this.#db = db;
     this.#table = options.table ?? DEFAULT_TABLE;
-    this.#pendingTtlMs = options.pendingTtlMs ?? DEFAULT_PENDING_TTL_MS;
+    this.pendingTtlMs = options.pendingTtlMs ?? DEFAULT_PENDING_TTL_MS;
     this.#now = options.now ?? Date.now;
   }
 
@@ -101,13 +106,14 @@ export class D1IdempotencyStore implements AtomicIdempotencyStore {
     }
     // ISO-8601 strings compare lexicographically in timestamp order (both
     // sides come from toISOString above).
-    const staleBefore = new Date(
-      this.#now() - this.#pendingTtlMs,
-    ).toISOString();
+    const staleBefore = new Date(this.#now() - this.pendingTtlMs).toISOString();
     if (row.updated_at >= staleBefore) return { state: 'pending' };
     // Stale-pending takeover (crash safety — a dead isolate must not poison
     // the key forever): refresh updated_at under the same CAS shape; losing
-    // the takeover race means another isolate now holds the key.
+    // the takeover race means another isolate now holds the key. tookOver is
+    // reported (not just 'reserved') so the wrapper can raise a dedicated
+    // audit signal — the "stale" holder was merely slow, not dead, whenever
+    // pendingTtlMs was set too low relative to the real execute duration.
     const takenOver = await this.#db
       .prepare(
         `UPDATE ${this.#table} SET updated_at = ?
@@ -116,7 +122,9 @@ export class D1IdempotencyStore implements AtomicIdempotencyStore {
       )
       .bind(nowIso, key, staleBefore)
       .first<{ key: string }>();
-    return takenOver ? { state: 'reserved' } : { state: 'pending' };
+    return takenOver
+      ? { state: 'reserved', tookOver: true }
+      : { state: 'pending' };
   }
 
   async put(key: string, record: IdempotencyRecord): Promise<void> {

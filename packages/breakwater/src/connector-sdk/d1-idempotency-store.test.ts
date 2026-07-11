@@ -145,9 +145,33 @@ describe('D1IdempotencyStore', () => {
     now = T0 + 61_000;
     const takeover = await b.reserve('conn:k1');
 
-    // #then — and the takeover refreshed the row: a third claim is pending
-    expect(takeover).toEqual({ state: 'reserved' });
+    // #then — the takeover is flagged distinctly from a fresh claim (audit
+    // D2 — the wrapper uses this to emit a dedicated audit event), and the
+    // takeover refreshed the row: a third claim is pending
+    expect(takeover).toEqual({ state: 'reserved', tookOver: true });
     expect(await a.reserve('conn:k1')).toEqual({ state: 'pending' });
+  });
+
+  it('does not take over a reservation still within the new 900s default TTL after a 600s execute (regression, audit D2)', async () => {
+    // #given — default pendingTtlMs (900 000ms); agent-cli's default execute
+    // timeout is 600 000ms. Under the OLD 300 000ms default this reserve
+    // would have been wrongly taken over here, double-executing the call.
+    const db = d1Like(openSqlite());
+    let now = T0;
+    const clock = () => now;
+    const a = new D1IdempotencyStore(db, { now: clock });
+    const b = new D1IdempotencyStore(db, { now: clock });
+    expect(a.pendingTtlMs).toBe(900_000);
+    expect(await a.reserve('conn:k1')).toEqual({ state: 'reserved' });
+
+    // #when — a's execute is still running 600s later, and a retrying
+    // caller b probes the same key
+    now = T0 + 600_000;
+    const probe = await b.reserve('conn:k1');
+
+    // #then — still honestly pending: a's in-flight execution is never
+    // taken over under the new default
+    expect(probe).toEqual({ state: 'pending' });
   });
 
   it('round-trips a stored undefined result distinctly from a miss', async () => {

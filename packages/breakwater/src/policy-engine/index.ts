@@ -41,11 +41,23 @@ export type PolicyPhase = 'input' | 'output';
  * output, gated as the JSON-stringified latest snapshot.
  *
  * Coverage caveat: the 'object' channel is enforced on the STREAMING path
- * only ('object'/'object-result' chunks). Core's OutputResult carries no
- * structured-object field, so non-streaming generate() with an output
- * schema is gated through the answer channel exactly when the object is
- * also transported as result.text — pure object-mode results are not
- * re-gated at the result phase.
+ * only ('object'/'object-result' chunks). Verified against the installed
+ * @mastra/core 1.50.0 dist: OutputResult is exactly `{ text, usage,
+ * finishReason, steps }` (dist/processors/index.d.ts) and steps carry no
+ * object field either (LLMStepResult, dist/stream/types.d.ts) — there is no
+ * structured-object value reachable at the result phase under ANY
+ * structured-output mode. In core's DEFAULT mode ("direct" — used whenever
+ * `output`/`experimental_output` is set without a separate structuring
+ * model, dist/chunk-JGDMZZAO.js), the model's JSON is piped through as
+ * ordinary text-delta chunks alongside the derived object/object-result
+ * chunks (dist/chunk-XJNAKXUS.js's createObjectStreamTransformer forwards
+ * the delta unchanged after deriving the object snapshot), so it lands in
+ * result.text and IS caught by any policy whose channels include 'answer' —
+ * this is a confirmed, designed cover for the common case, not a hedge. A
+ * policy explicitly narrowed to channels that EXCLUDE 'answer' (e.g.
+ * `channels: ['object']`) has zero result-phase coverage; PolicyEngine
+ * detects that at construction and emits a one-time audit warning the first
+ * time processOutputResult runs (see the class doc).
  */
 export type OutputChannel = 'answer' | 'reasoning' | 'object';
 
@@ -256,14 +268,50 @@ export interface PolicyEngineOptions {
   holdBack?: boolean;
 }
 
+/**
+ * Mastra Processor implementing input/output policy gating — see the module
+ * comment for the phase/channel model.
+ *
+ * Object-channel result-phase gap (audit D1): @mastra/core 1.50.0's
+ * OutputResult has no structured-object field, so processOutputResult (the
+ * only gate for non-streaming generate()) cannot evaluate an 'object'
+ * channel as such — see OutputChannel's coverage caveat for the full
+ * investigation. The constructor precomputes which registered policies are
+ * scoped to 'object' WITHOUT 'answer' — the only configuration with zero
+ * result-phase coverage, since an answer-inclusive policy is still caught
+ * via the text-mirroring described there. If any exist, the first
+ * processOutputResult call emits one audit warning (`action:
+ * 'agent.output.policy'`, `decision: 'error'`) and never repeats it for this
+ * engine instance. Policies left on default channels are never warned about.
+ *
+ * K2 config guard: the constructor also rejects a policy whose EXPLICIT
+ * `phases` includes 'input' while its EXPLICIT `channels` excludes 'answer'
+ * — processInput (below) hardcodes `channel: 'answer'`, so that combination
+ * would otherwise silently never run on input. A policy that left either
+ * field to its own default is not narrowing itself into the trap on
+ * purpose, so it is not rejected.
+ */
 export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
   readonly id = 'breakwater-policy-engine' as const;
   readonly #policies: readonly PolicyEvaluator[];
   readonly #audit?: AuditLogger;
   readonly #holdBack: boolean;
   readonly #holdBackWindow: Record<HoldableChannel, number>;
+  readonly #objectOnlyPolicyNames: readonly string[];
+  #objectChannelFenceWarned = false;
 
   constructor(options: PolicyEngineOptions) {
+    for (const policy of options.policies) {
+      if (
+        policy.phases?.includes('input') &&
+        policy.channels !== undefined &&
+        !policy.channels.includes('answer')
+      ) {
+        throw new TypeError(
+          `PolicyEngine: policy '${policy.name}' declares phases including 'input' but channels excluding 'answer' — processInput only ever evaluates the answer channel, so this policy would never run on input. Include 'answer' in channels or drop 'input' from phases.`,
+        );
+      }
+    }
     this.#policies = options.policies;
     this.#audit = options.audit;
     this.#holdBack = options.holdBack ?? false;
@@ -271,6 +319,13 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
       answer: holdBackWindowFor(options.policies, 'answer'),
       reasoning: holdBackWindowFor(options.policies, 'reasoning'),
     };
+    this.#objectOnlyPolicyNames = options.policies
+      .filter(
+        (policy) =>
+          policy.channels?.includes('object') &&
+          !policy.channels.includes('answer'),
+      )
+      .map((policy) => policy.name);
   }
 
   async processInput(args: ProcessInputArgs): Promise<ProcessInputResult> {
@@ -293,6 +348,7 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
   async processOutputResult(
     args: ProcessOutputResultArgs,
   ): Promise<MastraDBMessage[]> {
+    this.#warnObjectChannelGapOnce();
     // result.text is the authoritative generation output (non-optional in
     // core); messages also carry earlier conversation turns the output
     // policies should not re-gate. This is the final gate for both
@@ -563,6 +619,33 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
       }
     }
     return evaluated;
+  }
+
+  // D1 fence (see the class doc + OutputChannel's coverage caveat): a policy
+  // scoped to 'object' without 'answer' has zero coverage at the result
+  // phase under @mastra/core 1.50.0 — warn once per engine instance instead
+  // of silently doing nothing on every processOutputResult call.
+  // The signal rides the audit sink, so an engine constructed WITHOUT one
+  // emits nothing — the OutputChannel doc is the load-bearing warning there
+  // (running breakwater sink-less is itself an observability anti-pattern).
+  #warnObjectChannelGapOnce(): void {
+    if (
+      this.#objectChannelFenceWarned ||
+      this.#objectOnlyPolicyNames.length === 0
+    ) {
+      return;
+    }
+    this.#objectChannelFenceWarned = true;
+    const names = this.#objectOnlyPolicyNames.join(', ');
+    const plural = this.#objectOnlyPolicyNames.length === 1 ? 'y' : 'ies';
+    this.#audit?.record({
+      actor: null,
+      action: 'agent.output.policy',
+      resource: this.id,
+      decision: 'error',
+      reason: `polic${plural} [${names}] scoped to the 'object' channel without 'answer' cannot be enforced on non-streaming generate() results under @mastra/core 1.50.0 (OutputResult carries no structured-object field) — gate via agent.stream() or include 'answer' in channels`,
+      detail: { policies: [...this.#objectOnlyPolicyNames] },
+    });
   }
 
   #recordAllowed(

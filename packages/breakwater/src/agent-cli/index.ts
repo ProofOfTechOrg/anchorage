@@ -17,6 +17,12 @@ import { z } from 'zod';
 
 import type { ConnectorPolicies } from '../connector-sdk/index.js';
 import { createConnector } from '../connector-sdk/index.js';
+import type {
+  TextCodecLookups,
+  TextDecoderLike,
+  TextEncoderLike,
+} from './tail-accumulator.js';
+import { tailAccumulator } from './tail-accumulator.js';
 
 export interface AgentCliInput {
   /** The task prompt handed to the agent CLI. */
@@ -87,10 +93,29 @@ export interface AgentCliConnectorOptions {
   requiresApproval?: boolean;
   /** Manifest rate limit, e.g. '10/hour'. Requires policies.rateLimitStore. */
   rateLimit?: string;
+  /**
+   * Require callers to supply a per-call idempotency key; replays return the
+   * stored result instead of re-spawning the CLI. Requires
+   * policies.idempotencyStore. When the store exposes a numeric
+   * `pendingTtlMs` (D1IdempotencyStore), construction throws unless it
+   * exceeds `timeoutMs` — a shorter TTL lets a still-running invocation be
+   * taken over as stale and spawned a second time (audit D2).
+   */
+  idempotencyKey?: boolean;
   /** Connector id override (running two differently-configured instances). */
   id?: string;
   /** Passed through to createConnector (audit, stores, evaluators). */
   policies?: ConnectorPolicies;
+  /**
+   * Cap on retained stdout/stderr per stream in the default exec (node's
+   * child_process) — a runaway CLI must not balloon memory unbounded.
+   * Counted in actual UTF-8 encoded BYTES (not JS string length / UTF-16
+   * code units — a naive char-length cap over-counts non-Latin1 output and
+   * can cut mid-codepoint). The TAIL is kept, cut on a codepoint boundary,
+   * and truncation is marked (the agent's final answer text arrives last).
+   * Ignored when `exec` is injected. Default 1 MiB (1 048 576).
+   */
+  maxOutputBytes?: number;
 }
 
 export class AgentCliError extends Error {
@@ -101,6 +126,7 @@ export class AgentCliError extends Error {
 }
 
 const DEFAULT_TIMEOUT_MS = 600_000;
+const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 
 const inputSchema = z.object({
   prompt: z.string().min(1),
@@ -160,49 +186,92 @@ function nodeChildProcess(): ChildProcessModule {
   return childProcess;
 }
 
-const defaultExec: AgentCliExec = (command, args, options) => {
-  const { spawn } = nodeChildProcess();
-  const timers = globalThis as unknown as TimerGlobals;
-  return new Promise<AgentCliExecResult>((resolve, reject) => {
-    // No shell: args go straight to execve, so prompt content can't inject.
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stdout = '';
-    let stderr = '';
-    let settled = false;
-    const timer = timers.setTimeout(() => {
-      settled = true;
-      child.kill('SIGKILL');
-      reject(
-        new AgentCliError(
-          `'${command}' timed out after ${options.timeoutMs}ms`,
-        ),
-      );
-    }, options.timeoutMs);
-    child.stdout?.on('data', (chunk) => {
-      stdout += String(chunk);
-    });
-    child.stderr?.on('data', (chunk) => {
-      stderr += String(chunk);
-    });
-    child.on('error', (error) => {
-      if (settled) return;
-      settled = true;
-      timers.clearTimeout(timer);
-      reject(
-        new AgentCliError(`failed to spawn '${command}': ${String(error)}`),
-      );
-    });
-    child.on('close', (code) => {
-      if (settled) return;
-      settled = true;
-      timers.clearTimeout(timer);
-      resolve({ stdout, stderr, exitCode: code ?? -1 });
-    });
-  });
+// TextDecoder/TextEncoder looked up off globalThis — like nodeChildProcess()
+// above, structurally typed rather than assumed ambient: both are
+// unconditional Node/Workers/browser globals (no import, no @types/node, no
+// DOM lib needed to typecheck), which is what the default exec's real chunks
+// (always Uint8Array — node:child_process's 'pipe' stdio, no encoding ever
+// set) actually run under.
+function globalTextDecoder(): TextDecoderLike {
+  const Ctor = (globalThis as { TextDecoder?: new () => TextDecoderLike })
+    .TextDecoder;
+  if (!Ctor) {
+    throw new AgentCliError(
+      'agent CLI connectors decode captured process output via the global TextDecoder, which this runtime does not provide',
+    );
+  }
+  return new Ctor();
+}
+
+function globalTextEncoder(): TextEncoderLike {
+  const Ctor = (globalThis as { TextEncoder?: new () => TextEncoderLike })
+    .TextEncoder;
+  if (!Ctor) {
+    throw new AgentCliError(
+      'agent CLI connectors encode captured process output via the global TextEncoder, which this runtime does not provide',
+    );
+  }
+  return new Ctor();
+}
+
+// The bounded tail buffer lives in tail-accumulator.ts (package-internal —
+// the './agent-cli' subpath maps to this module only) so tests can drive
+// chunk-boundary geometry deterministically; the AgentCliError-throwing
+// global lookups above are injected into it here.
+const TEXT_CODEC_LOOKUPS: TextCodecLookups = {
+  encoder: globalTextEncoder,
+  decoder: globalTextDecoder,
 };
+
+function createDefaultExec(maxOutputBytes: number): AgentCliExec {
+  return (command, args, options) => {
+    const { spawn } = nodeChildProcess();
+    const timers = globalThis as unknown as TimerGlobals;
+    return new Promise<AgentCliExecResult>((resolve, reject) => {
+      // No shell: args go straight to execve, so prompt content can't inject.
+      const child = spawn(command, args, {
+        cwd: options.cwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const stdout = tailAccumulator(maxOutputBytes, TEXT_CODEC_LOOKUPS);
+      const stderr = tailAccumulator(maxOutputBytes, TEXT_CODEC_LOOKUPS);
+      let settled = false;
+      const timer = timers.setTimeout(() => {
+        settled = true;
+        child.kill('SIGKILL');
+        reject(
+          new AgentCliError(
+            `'${command}' timed out after ${options.timeoutMs}ms`,
+          ),
+        );
+      }, options.timeoutMs);
+      child.stdout?.on('data', (chunk) => {
+        stdout.push(chunk);
+      });
+      child.stderr?.on('data', (chunk) => {
+        stderr.push(chunk);
+      });
+      child.on('error', (error) => {
+        if (settled) return;
+        settled = true;
+        timers.clearTimeout(timer);
+        reject(
+          new AgentCliError(`failed to spawn '${command}': ${String(error)}`),
+        );
+      });
+      child.on('close', (code) => {
+        if (settled) return;
+        settled = true;
+        timers.clearTimeout(timer);
+        resolve({
+          stdout: stdout.value(),
+          stderr: stderr.value(),
+          exitCode: code ?? -1,
+        });
+      });
+    });
+  };
+}
 
 function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
@@ -217,9 +286,39 @@ export function createAgentCliConnector(
   definition: AgentCliDefinition,
   options: AgentCliConnectorOptions = {},
 ): Tool<AgentCliInput, AgentCliOutput> {
-  const exec = options.exec ?? defaultExec;
-  const binary = options.binaryPath ?? definition.binary;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  if (options.idempotencyKey) {
+    // D2: the store's stale-pending takeover TTL must outlive the longest
+    // expected execute, or a still-running invocation can be taken over as
+    // abandoned and spawned a second time. Only checked when the configured
+    // store exposes a pendingTtlMs (D1IdempotencyStore) — other stores (e.g.
+    // InMemoryIdempotencyStore) have no such window to violate, and a truly
+    // ABSENT property stays exempt. A PRESENT-but-malformed value (e.g. a
+    // string like '600000' from a hand-built or misconfigured store) is a
+    // misconfiguration, not an exemption — silently skipping the guard here
+    // would defeat the whole check by duck-typing coincidence.
+    const pendingTtlMs = (
+      options.policies?.idempotencyStore as
+        | { pendingTtlMs?: unknown }
+        | undefined
+    )?.pendingTtlMs;
+    if (pendingTtlMs !== undefined) {
+      if (typeof pendingTtlMs !== 'number' || !Number.isFinite(pendingTtlMs)) {
+        throw new TypeError(
+          `agent CLI connector ${options.id ?? definition.id}: permissions.idempotencyKey is enabled with an idempotency store whose pendingTtlMs is present but not a finite number (got ${typeof pendingTtlMs}: ${String(pendingTtlMs)}) — a present pendingTtlMs must be a finite number of milliseconds, or the property must be absent entirely to stay exempt`,
+        );
+      }
+      if (pendingTtlMs <= timeoutMs) {
+        throw new TypeError(
+          `agent CLI connector ${options.id ?? definition.id}: permissions.idempotencyKey is enabled with an idempotency store whose pendingTtlMs (${pendingTtlMs}ms) is <= this connector's timeoutMs (${timeoutMs}ms) — a still-running execution could be taken over as stale and spawned a second time; raise the store's pendingTtlMs above timeoutMs`,
+        );
+      }
+    }
+  }
+  const exec =
+    options.exec ??
+    createDefaultExec(options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES);
+  const binary = options.binaryPath ?? definition.binary;
 
   const commandLine = (
     input: AgentCliInput,
@@ -243,6 +342,7 @@ export function createAgentCliConnector(
       requiresApproval: options.requiresApproval ?? true,
       dryRun: true,
       rateLimit: options.rateLimit,
+      idempotencyKey: options.idempotencyKey,
     },
     policies: options.policies,
     execute: async (input) => {
