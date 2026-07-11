@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Audit — structured audit logging shared by every breakwater gate (RBAC,
 // policy engine, connector SDK) and external consumers (flowsafe approval-api
 // adapts its events onto this sink). Mastra ships no audit logging at any
@@ -78,4 +79,105 @@ export class AuditLogger {
   clear(): void {
     this.#buffer = [];
   }
+}
+
+/** Counters/histograms sink — any metrics client (StatsD, Prometheus push, OTel) can implement this. */
+export interface MetricsRecorder {
+  increment(name: string, tags?: Record<string, string>): void;
+  observe(name: string, value: number, tags?: Record<string, string>): void;
+}
+
+/**
+ * Adapts every AuditEvent onto a MetricsRecorder: `breakwater.audit.decision`
+ * increments with `{action, decision}` tags — denials, tripwires
+ * (`decision: 'error'`), rate-limit rejections, escalations, and SLA
+ * breaches all become queryable via those two dimensions without enumerating
+ * actions. When `event.detail?.durationSeconds` is a finite number, it also
+ * observes `breakwater.audit.duration_seconds` with a `{action}` tag — a
+ * generic convention any emitter can adopt (this module does not emit one
+ * itself). No Mastra-tracing duplication: counters/histograms over audit
+ * events only, never spans.
+ *
+ * Never throws on a missing, absent, or malformed `detail` — a non-number,
+ * NaN, Infinity, or NEGATIVE `durationSeconds` simply skips the observe call
+ * (a duration histogram must stay non-negative; cross-isolate clock skew can
+ * stamp a decide before its create, and that skew is not a duration).
+ */
+export function metricsAuditSink(metrics: MetricsRecorder): AuditSink {
+  return (event: AuditEvent): void => {
+    metrics.increment('breakwater.audit.decision', {
+      action: event.action,
+      decision: event.decision,
+    });
+    const duration = event.detail?.durationSeconds;
+    if (
+      typeof duration === 'number' &&
+      Number.isFinite(duration) &&
+      duration >= 0
+    ) {
+      metrics.observe('breakwater.audit.duration_seconds', duration, {
+        action: event.action,
+      });
+    }
+  };
+}
+
+/**
+ * Fans one event out to every sink. Each sink runs even if an earlier one
+ * throws: a sink's SYNCHRONOUS throw is caught and isolated so the rest still
+ * run, and every collected sync error is rethrown together — after all sinks
+ * have run — as one AggregateError, so AuditLogger.record's existing
+ * try/catch -> onSinkError still surfaces them (matching the containment a
+ * single sink already gets).
+ *
+ * A sink MAY return a promise. Every such promise is collected and awaited
+ * via Promise.allSettled rather than Promise.all: allSettled always waits
+ * for every pending sink to SETTLE (fulfilled or rejected) before this
+ * function's own returned promise resolves, so one async sink rejecting
+ * early never short-circuits — and therefore never hides — a later sink's
+ * failure the way Promise.all's reject-on-first-rejection would. Every
+ * pending promise still gets a handler attached (via allSettled itself, not
+ * a hand-rolled per-promise .catch), so nothing is ever left as an unhandled
+ * rejection — including the sync-throw-plus-pending-promises case: sync
+ * errors collected during the loop are merged with any async rejections
+ * once every pending promise has settled, and the combined AggregateError
+ * (if any) is thrown from the returned promise. When no sink returned a
+ * promise, the sync errors (if any) are thrown immediately and the function
+ * returns void synchronously, keeping AuditLogger.record's plain sync
+ * try/catch path for an all-sync sink set.
+ */
+export function combineAuditSinks(...sinks: readonly AuditSink[]): AuditSink {
+  return (event: AuditEvent): void | Promise<void> => {
+    const syncErrors: unknown[] = [];
+    const pending: Promise<void>[] = [];
+    for (const sink of sinks) {
+      try {
+        const result = sink(event);
+        if (result instanceof Promise) pending.push(result);
+      } catch (error) {
+        syncErrors.push(error);
+      }
+    }
+    if (pending.length === 0) {
+      if (syncErrors.length > 0) {
+        throw new AggregateError(
+          syncErrors,
+          'combineAuditSinks: one or more sinks failed',
+        );
+      }
+      return;
+    }
+    return Promise.allSettled(pending).then((results) => {
+      const errors = [...syncErrors];
+      for (const result of results) {
+        if (result.status === 'rejected') errors.push(result.reason);
+      }
+      if (errors.length > 0) {
+        throw new AggregateError(
+          errors,
+          'combineAuditSinks: one or more sinks failed',
+        );
+      }
+    });
+  };
 }

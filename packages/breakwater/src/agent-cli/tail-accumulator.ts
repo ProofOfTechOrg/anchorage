@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Bounded tail buffer for captured process output. Package-internal: the
 // './agent-cli' subpath export maps to index.js only, so nothing here is
 // consumer-reachable; it lives in its own module so tests can drive the

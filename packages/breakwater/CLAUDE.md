@@ -7,11 +7,12 @@
 | File | What | When to read |
 | ---- | ---- | ------------ |
 | `README.md` | Package purpose, subpackage roles, status, usage example | Understanding breakwater's design and wiring it into a Mastra Agent |
-| `CHANGELOG.md` | Release notes (0.1.0 unreleased; breakwater publishes before flowsafe) | Cutting a release, checking the publish order |
+| `CHANGELOG.md` | Release notes (0.1.0 released 2026-07-11; breakwater publishes before flowsafe) | Cutting a release, checking the publish order |
 | `LICENSE` | Apache-2.0 copy shipped in the npm tarball (packing ignores the repo-root LICENSE) | Never edit separately — keep identical to the root LICENSE |
 | `CONNECTORS.md` | Connector authoring guide — manifest field-by-field with enforcement semantics, honesty rules, testing expectations, contribution flow | Building or reviewing a connector, onboarding community contributors |
 | `package.json` | Manifest, subpath exports (`./policy-engine`, `./rbac`, `./audit`, `./connector-sdk`), scripts, `@mastra/core` peer | Adding a subpath export, changing scripts, bumping the Mastra peer |
 | `tsconfig.json` | Build TS config (emits `dist/`) | Changing build output or compiler options |
+| `typedoc.json` | Package typedoc entry (`src/index.ts` over the build tsconfig) — consumed by the root `pnpm docs:api` packages-strategy run | Changing what the API reference covers |
 | `tsconfig.test.json` | Test-only TS config (type-checks `*.test.ts`) | Debugging test typecheck failures |
 | `vitest.config.ts` | Vitest runner config | Changing test globs or runner options |
 

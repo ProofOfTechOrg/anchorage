@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Policy Engine — pre-gate (input) and post-gate (output) policy evaluation
 // as a single Mastra processor registered in both inputProcessors and
 // outputProcessors. Policies are evaluator functions returning
@@ -56,8 +57,10 @@ export type PolicyPhase = 'input' | 'output';
  * this is a confirmed, designed cover for the common case, not a hedge. A
  * policy explicitly narrowed to channels that EXCLUDE 'answer' (e.g.
  * `channels: ['object']`) has zero result-phase coverage; PolicyEngine
- * detects that at construction and emits a one-time audit warning the first
- * time processOutputResult runs (see the class doc).
+ * detects that at construction — it REJECTS the engine when no audit sink is
+ * present (the one-time warning would otherwise have nowhere to go), and with
+ * a sink emits that warning the first time processOutputResult runs (see the
+ * class doc).
  */
 export type OutputChannel = 'answer' | 'reasoning' | 'object';
 
@@ -279,10 +282,12 @@ export interface PolicyEngineOptions {
  * investigation. The constructor precomputes which registered policies are
  * scoped to 'object' WITHOUT 'answer' — the only configuration with zero
  * result-phase coverage, since an answer-inclusive policy is still caught
- * via the text-mirroring described there. If any exist, the first
- * processOutputResult call emits one audit warning (`action:
- * 'agent.output.policy'`, `decision: 'error'`) and never repeats it for this
- * engine instance. Policies left on default channels are never warned about.
+ * via the text-mirroring described there. If any exist, construction REJECTS
+ * the engine when no audit sink is present (audit D1 — the one-time warning
+ * would otherwise silently vanish); with a sink, the first processOutputResult
+ * call emits one audit warning (`action: 'agent.output.policy'`, `decision:
+ * 'error'`) and never repeats it for this engine instance. Policies left on
+ * default channels are never warned about.
  *
  * K2 config guard: the constructor also rejects a policy whose EXPLICIT
  * `phases` includes 'input' while its EXPLICIT `channels` excludes 'answer'
@@ -326,6 +331,19 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
           !policy.channels.includes('answer'),
       )
       .map((policy) => policy.name);
+    // D1 fence (construction time): an object-only policy has zero
+    // result-phase coverage under @mastra/core 1.50.0, and the runtime
+    // warning it would otherwise get rides the OPTIONAL audit sink — with no
+    // sink the gap is entirely silent. Reject the combination rather than
+    // ship an unenforceable policy that can never surface. Reuses the
+    // object-only set computed above.
+    if (this.#objectOnlyPolicyNames.length > 0 && options.audit === undefined) {
+      const names = this.#objectOnlyPolicyNames.join(', ');
+      const plural = this.#objectOnlyPolicyNames.length === 1 ? 'y' : 'ies';
+      throw new TypeError(
+        `PolicyEngine: polic${plural} [${names}] scoped to the 'object' channel without 'answer' cannot be enforced on non-streaming generate() results under @mastra/core 1.50.0 (OutputResult carries no structured-object field) and would silently no-op without an audit sink to carry the one-time warning — provide options.audit, or include 'answer' in channels.`,
+      );
+    }
   }
 
   async processInput(args: ProcessInputArgs): Promise<ProcessInputResult> {
@@ -624,10 +642,10 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
   // D1 fence (see the class doc + OutputChannel's coverage caveat): a policy
   // scoped to 'object' without 'answer' has zero coverage at the result
   // phase under @mastra/core 1.50.0 — warn once per engine instance instead
-  // of silently doing nothing on every processOutputResult call.
-  // The signal rides the audit sink, so an engine constructed WITHOUT one
-  // emits nothing — the OutputChannel doc is the load-bearing warning there
-  // (running breakwater sink-less is itself an observability anti-pattern).
+  // of silently doing nothing on every processOutputResult call. The
+  // constructor now REJECTS this configuration when no audit sink is present
+  // (D1), so #audit is guaranteed to exist whenever there is an object-only
+  // policy to warn about; the optional-chain remains only as defense in depth.
   #warnObjectChannelGapOnce(): void {
     if (
       this.#objectChannelFenceWarned ||
@@ -792,6 +810,17 @@ export function maxTextLength(
   };
 }
 
+export type {
+  ClassifierPolicyOptions,
+  PiiSecretsDetectorId,
+  PiiSecretsOptions,
+} from './content-inspection.js';
+// Agent-boundary content-inspection evaluators — see content-inspection.ts.
+export {
+  classifierPolicy,
+  PII_SECRETS_DETECTOR_IDS,
+  piiSecrets,
+} from './content-inspection.js';
 export type {
   CrossWorkflowIsolationOptions,
   NetworkEgressOptions,

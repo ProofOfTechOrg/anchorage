@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The catalog/runtime consistency check.
 //
 // createRunRouter looks a workflow up by WorkflowMeta.id, but start/resume route
@@ -11,7 +12,7 @@ import type { RunnerRuntime } from '../do-runner/index.js';
 import type { WorkflowMeta } from './workflow-meta.js';
 
 /** Structural view of the runtime: only the registered-ids listing is needed. */
-type WorkflowIdSource = Pick<RunnerRuntime, 'workflowIds'>;
+export type WorkflowIdSource = Pick<RunnerRuntime, 'workflowIds'>;
 
 /**
  * Throw unless every advertised meta id was actually committed onto `runtime`.

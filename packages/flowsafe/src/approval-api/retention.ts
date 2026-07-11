@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Cron-owned approval-queue retention purge (2026-07-11 audit, D3) — the
 // approvals analog of do-runner's purgeExpiredWorkflowRuns
 // (do-runner/d1-storage.ts), structured like sweepSLA (service.ts): a free

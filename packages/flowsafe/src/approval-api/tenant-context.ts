@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The request-scoped tenant context — the seam that makes INV-2
 // CONSTRUCTIBLE. The stores must be bound to the authenticated tenant, but a
 // host's fetch() historically built its ApprovalService from `env` before

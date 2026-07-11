@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // init()-based import-swap, the pattern @mastra/inngest and @mastra/temporal
 // ship: init(...) returns backend-bound createWorkflow/createStep imported in
 // place of the @mastra/core/workflows versions, leaving workflow definition

@@ -29,6 +29,22 @@ anywhere and versioned against the wire contract alone.
   table headers, `ApprovalColumn.header` widened `string → ReactNode` — a
   custom Table slot doing string operations on `header` must treat it as a
   node now (the built-in HTML and app Astryx tables already do).
+- **Triage is additive.** The batch/filter layer (2026-07-11) added two slots
+  — `Checkbox` and `Select` — as OPTIONAL members of `ApprovalUIComponents`,
+  so an adapter typed against the FULL interface before 0.2.0 keeps
+  compiling, not just `Partial`-typed ones; the provider merge fills omitted
+  slots from the HTML defaults, and the views consume
+  `ResolvedApprovalUIComponents` (every slot present). Post-1.0 slot
+  additions follow the same optional-member pattern. `FilterBar` maps its drafts to an `ApprovalListFilter`
+  through the pure `buildTriageFilter` (age presets become `createdBefore` at
+  APPLY time from an injected clock), and the hook's `setFilter` override is
+  DERIVED against the options filter's value (`effectiveApprovalFilter`) —
+  a caller-side filter change retires it on the same render, no reset
+  effect. Batch selection is derived-pruned (`pruneSelection`) to open
+  records still in the fetched page, so a decided or paged-out record can
+  never ride a stale checkbox into `decideSelected`. Domain types
+  (`BatchDecideResult`, `ApprovalRecord`, …) stay on the package ROOT
+  barrel; this subpath exports only UI surface.
 - **Subpath export only.** The dashboard ships as
   `@proofoftech/flowsafe/approval-ui` and is deliberately absent from the
   package root barrel, so DO-runner/API consumers never resolve React.

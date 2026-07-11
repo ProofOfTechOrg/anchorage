@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 import type { JSX } from 'react';
 
 import type {
@@ -5,6 +6,7 @@ import type {
   ApprovalRecord,
   ApprovalStatus,
 } from '../approval-api/types.js';
+import { OPEN_STATUSES } from '../approval-api/types.js';
 import {
   type ApprovalColumn,
   type Tone,
@@ -41,6 +43,13 @@ export interface QueueViewProps {
   nowMs: number;
   selectedId: string | null;
   onSelect: (id: string) => void;
+  /**
+   * Batch-triage mode: when BOTH batch props are provided, a selection
+   * column leads the table — a Checkbox per OPEN (decidable) row, an empty
+   * cell for decided ones. Omit both to keep the plain queue.
+   */
+  selectedIds?: readonly string[];
+  onToggleSelect?: (id: string) => void;
 }
 
 export function QueueView({
@@ -48,12 +57,35 @@ export function QueueView({
   nowMs,
   selectedId,
   onSelect,
+  selectedIds,
+  onToggleSelect,
 }: QueueViewProps): JSX.Element {
   const C = useApprovalUIComponents();
+
+  const batchColumns: ApprovalColumn[] =
+    selectedIds !== undefined && onToggleSelect !== undefined
+      ? [
+          {
+            key: 'select',
+            header: 'Select',
+            renderCell: (record) =>
+              OPEN_STATUSES.includes(record.status) ? (
+                <C.Checkbox
+                  // The label names the record for assistive tech; the
+                  // visible affordance is the checkbox itself.
+                  label={`Select ${record.title}`}
+                  checked={selectedIds.includes(record.id)}
+                  onChange={() => onToggleSelect(record.id)}
+                />
+              ) : null,
+          },
+        ]
+      : [];
 
   // Selection lives in the Title cell: a focusable button per row keeps the
   // queue keyboard-navigable regardless of the injected Table implementation.
   const columns: ApprovalColumn[] = [
+    ...batchColumns,
     {
       key: 'title',
       header: 'Title',

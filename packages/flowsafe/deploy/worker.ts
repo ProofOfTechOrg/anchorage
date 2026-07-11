@@ -56,31 +56,17 @@ import type {
 import {
   approvalGrantProvider,
   BREAKWATER_APPROVED_CONNECTORS_KEY,
-  createApprovalRouter,
-  createTenantResolver,
-  type TenantResolver,
 } from '@proofoftech/flowsafe/approval-api';
-import { createAuditQueueHandler } from '@proofoftech/flowsafe/audit-export';
 import {
   DurableObjectRunner,
   init,
-  purgeExpiredWorkflowRuns,
   type RunnerRuntime,
 } from '@proofoftech/flowsafe/do-runner';
 import {
   approvalStoreFactoryFor,
   assertWorkflowsRegistered,
-  bearerActorAuthenticator,
-  buildHostApprovalService,
-  createDoRunTopology,
-  createRunRouter,
-  type DoRunTopology,
-  maintenanceActor,
-  numberVar,
+  createFlowsafeWorker,
   parseActorTokens,
-  reconcileApprovalsOnStatusDetached,
-  runApprovalRetentionPurge,
-  runSlaSweepMaintenance,
   staticTokenVerifier,
   type TokenVerifier,
   type WorkflowMeta,
@@ -268,20 +254,14 @@ export class FlowsafeRunner extends DurableObjectRunner<Env> {
   }
 }
 
-function json(payload: unknown, status = 200): Response {
-  return new Response(JSON.stringify(payload), {
-    status,
-    headers: { 'content-type': 'application/json' },
-  });
-}
-
 // The auth seam (parseActorTokens + bearerActorAuthenticator), the run routes
-// with their RBAC gate order, the approval bridge, and the service assembly
-// all live in @proofoftech/flowsafe/host-kit. They are security-critical and
-// tested there — the (suspendedAt, resumeCount) capture that binds a decision
-// to one exact suspension, the separation-of-duties re-queue, and the role
-// gates. Do not re-derive them here; production SSO/JWT verification replaces
-// only the `authenticate` seam.
+// with their RBAC gate order, the approval bridge, the service assembly, and
+// the whole Worker pipeline (createFlowsafeWorker) all live in
+// @proofoftech/flowsafe/host-kit. They are security-critical and tested
+// there — the (suspendedAt, resumeCount) capture that binds a decision to one
+// exact suspension, the separation-of-duties re-queue, and the role gates. Do
+// not re-derive them here; production SSO/JWT verification replaces only the
+// `buildVerifier` seam.
 
 /**
  * The bearer verifier, memoized per isolate: parseActorTokens re-parses and
@@ -301,176 +281,36 @@ function buildVerifier(env: Env): TokenVerifier {
   return verifier;
 }
 
-/**
- * The run surface: shared routes + this deployment's DO-stub topology.
- * `waitUntil` detaches the D4 reconcile hook (below) from the response path.
- */
-function runRouterFor(
-  resolve: TenantResolver,
-  topology: DoRunTopology,
-  waitUntil: (promise: Promise<unknown>) => void,
-) {
-  return createRunRouter({
-    workflows: WORKFLOWS,
-    resolve,
-    systemActorId: SYSTEM_ACTOR_ID,
-    start: topology.start,
-    status: topology.status,
-    resume: topology.resume,
-    // D4 self-healing, waitUntil-detached — the shared host-kit wrapper owns
-    // the detach + reconcile-error logging.
-    reconcileApprovals: reconcileApprovalsOnStatusDetached(
-      SYSTEM_ACTOR_ID,
-      waitUntil,
-    ),
-  });
-}
-
-// The two-cron dispatch rationale and the wrangler.jsonc byte-equality
-// contract live with the constants in crons.ts.
-
-async function runPurgeMaintenance(env: Env, cron: string): Promise<void> {
-  let purged: number | undefined;
-  try {
-    // Storing run artifacts in R2? Pass your R2ArtifactStore here as
-    // `artifactStore` — and the same store to purgeTenant, if you add
-    // tenant offboarding (this template does not call it): the snapshot row
-    // is the only record of a run's artifact keys, so a retention purge
-    // without the pairing strands the purged runs' artifacts. `limit`
-    // batches both purge paths per firing.
-    purged = await purgeExpiredWorkflowRuns(env.DB, {
-      // allowZero: RUN_RETENTION_DAYS=0 means "purge terminal runs now".
-      ttlMs:
-        numberVar(env.RUN_RETENTION_DAYS, 30, 'RUN_RETENTION_DAYS', {
-          allowZero: true,
-        }) *
-        24 *
-        60 *
-        60 *
-        1000,
-    });
-  } catch (error) {
-    console.error(
-      JSON.stringify({
-        type: 'maintenance-error',
-        surface: 'retention-purge',
-        cron,
-        error: String(error),
-      }),
-    );
-  }
-  // Own try/catch, same isolation as the snapshot purge above: a failure in
-  // either must never stop the other (D3, 2026-07-11 audit). The purge
-  // itself now lives in host-kit (2026-07-11 audit follow-up, FIX 5) —
-  // verbatim-shared with the showcase worker instead of hand-copied.
-  const approvalsPurged = await runApprovalRetentionPurge({
-    store: approvalStoreFactoryFor(env.DB).system(),
-    retentionDays: env.APPROVAL_RETENTION_DAYS,
-    cron,
-  });
-  console.log(
-    JSON.stringify({ type: 'maintenance', cron, purged, approvalsPurged }),
-  );
-}
-
-const handler: ExportedHandler<Env> = {
-  async fetch(
-    request: CfRequest,
-    env: Env,
-    ctx: ExecutionContext,
-  ): Promise<Response> {
-    const url = new URL(request.url);
-
-    if (request.method === 'GET' && url.pathname === '/healthz') {
-      return json({ ok: true });
-    }
-
-    const waitUntil = (promise: Promise<unknown>) => ctx.waitUntil(promise);
-    const topology = createDoRunTopology(env.RUNNER);
-    // AUTHENTICATE FIRST, then construct (INV-2): the resolver binds the
-    // approval store to the verified actor's tenant before any service
-    // exists — there is no pre-auth store for a rushed fix to reach.
-    const baseResolve = createTenantResolver({
-      authenticate: bearerActorAuthenticator(buildVerifier(env)),
-      storeFactory: approvalStoreFactoryFor(env.DB),
-      buildService: (store) =>
-        buildHostApprovalService(store, {
-          systemActorId: SYSTEM_ACTOR_ID,
-          defaultSlaSeconds: numberVar(
-            env.APPROVAL_SLA_SECONDS,
-            4 * 60 * 60,
-            'APPROVAL_SLA_SECONDS',
-          ),
-          // This deployment's only topology-specific piece: decisions resume
-          // the run through its DO stub.
-          resumeRun: topology.resumeRecord,
-          queue: env.AUDIT_QUEUE,
-          waitUntil,
-        }),
-    });
-    const resolve = env.TENANT_APEX_DOMAIN
-      ? withSubdomainCrossCheck(baseResolve, {
+// The composed Worker: /healthz → /api/approvals → /workflows + /runs → 404,
+// two-cron maintenance (sweep vs purge never share an invocation; the
+// byte-equality contract with wrangler.jsonc lives in crons.ts), and the
+// audit-export queue consumer. This deployment supplies its workflows, its
+// verifier, and the optional client-per-subdomain cross-check; add run
+// artifacts (R2ArtifactStore) by copying the purge pairing notes in
+// host-kit's runPurgeMaintenance into an `extraPurgeDuties` hook.
+const worker = createFlowsafeWorker<Env>({
+  workflows: WORKFLOWS,
+  systemActorId: SYSTEM_ACTOR_ID,
+  buildVerifier,
+  crons: { sweep: SWEEP_CRON, purge: PURGE_CRON },
+  // Defense in depth over INV-2 (see Env.TENANT_APEX_DOMAIN), only when set.
+  wrapResolve: (resolve, env) =>
+    env.TENANT_APEX_DOMAIN
+      ? withSubdomainCrossCheck(resolve, {
           apexDomain: env.TENANT_APEX_DOMAIN,
         })
-      : baseResolve;
+      : resolve,
+});
 
-    const routed = request as unknown as Request;
-    const approvalResponse = await createApprovalRouter({ resolve })(routed);
-    if (approvalResponse) return approvalResponse;
-
-    const runResponse = await runRouterFor(
-      resolve,
-      topology,
-      waitUntil,
-    )(routed);
-    if (runResponse) return runResponse;
-
-    return json({ error: 'not found' }, 404);
-  },
-
-  async scheduled(
+const handler: ExportedHandler<Env> = {
+  fetch: (request: CfRequest, env: Env, ctx: ExecutionContext) =>
+    worker.fetch(request as unknown as Request, env, ctx),
+  scheduled: (
     controller: ScheduledController,
     env: Env,
     ctx: ExecutionContext,
-  ): Promise<void> {
-    // Dispatch on WHICH cron fired; an unrecognized expression (ops edited
-    // wrangler without updating the constants) runs both sequentially and
-    // logs — availability of both duties beats purity on a misconfig.
-    const sweep = () =>
-      runSlaSweepMaintenance({
-        store: approvalStoreFactoryFor(env.DB).system(),
-        systemActor: maintenanceActor(SYSTEM_ACTOR_ID),
-        queue: env.AUDIT_QUEUE,
-        cron: controller.cron,
-      });
-    if (controller.cron === SWEEP_CRON) {
-      ctx.waitUntil(sweep());
-    } else if (controller.cron === PURGE_CRON) {
-      ctx.waitUntil(runPurgeMaintenance(env, controller.cron));
-    } else {
-      console.error(
-        JSON.stringify({
-          type: 'config-error',
-          var: 'triggers.crons',
-          raw: controller.cron,
-          reason: 'unknown cron expression — running both maintenance surfaces',
-        }),
-      );
-      ctx.waitUntil(
-        sweep().then(() => runPurgeMaintenance(env, controller.cron)),
-      );
-    }
-  },
-
-  // Audit-export consumer (active only when the wrangler.jsonc `queues`
-  // block is uncommented): ships each batch to the SIEM collector; a failed
-  // export retries the batch, so nothing is acked unconfirmed.
-  async queue(batch: MessageBatch, env: Env): Promise<void> {
-    await createAuditQueueHandler({
-      endpoint: env.SIEM_ENDPOINT,
-      authHeader: env.SIEM_AUTH_HEADER,
-    })(batch);
-  },
+  ) => worker.scheduled(controller, env, ctx),
+  queue: (batch: MessageBatch, env: Env) => worker.queue(batch, env),
 };
 
 export default handler;

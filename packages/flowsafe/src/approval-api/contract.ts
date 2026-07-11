@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The breakwater <-> flowsafe wire contract (mirrored by value), plus the
 // flowsafe host role policy derived from it (RUN_START_ROLES).
 //
@@ -15,6 +16,8 @@
 // in a do-runner leaf keeps approval-api -> do-runner as the only
 // cross-directory dependency direction. Re-exported here because this
 // module is the approval-api's contract surface.
+import type { ApprovalRecord } from './types.js';
+
 export {
   BREAKWATER_ACTOR_KEY,
   BREAKWATER_APPROVED_CONNECTORS_KEY,
@@ -83,4 +86,47 @@ export interface ApprovalAuditEvent {
   detail?: Record<string, unknown>;
 }
 
-export type ApprovalAuditSink = (event: ApprovalAuditEvent) => void;
+/**
+ * The return value is IGNORED — unless it is a promise, whose rejection every
+ * flowsafe caller contains (the same availability-over-export-reliability
+ * policy as breakwater's AuditLogger.record, and what makes a composed
+ * `combineAuditSinks(...)` with an async member safe to wire here directly).
+ * Typed `unknown`, not `void | Promise<void>`: the union would forfeit TS's
+ * void-return leniency and break every `(event) => events.push(event)`-shaped
+ * sink, while `unknown` admits sync sinks, async sinks, and expression-bodied
+ * shorthand alike.
+ */
+export type ApprovalAuditSink = (event: ApprovalAuditEvent) => unknown;
+
+/**
+ * A queue moment worth pushing at reviewers: a NEW request entered the queue
+ * ('created' — fired only when a record is actually inserted, never on the
+ * idempotent re-observation of an already-open step), or an open request
+ * breached its SLA ('escalated', fired per record by the cron sweep).
+ * Decisions are deliberately not notification events — the decider is looking
+ * at the dashboard when they happen.
+ */
+export interface ApprovalNotificationEvent {
+  type: 'created' | 'escalated';
+  record: ApprovalRecord;
+}
+
+/**
+ * The notification transport seam (email, Slack, pager — flowsafe ships NO
+ * transport). Fire-and-forget with the same availability-over-delivery policy
+ * as ApprovalAuditSink: a sink that throws or rejects never fails the
+ * approval action that fired it — the failure is recorded to the AUDIT sink
+ * as `approval.notify`/'error' and the action proceeds. Workers hosts whose
+ * transport must outlive the response wrap it in ctx.waitUntil themselves
+ * (the hostAuditSink keepAlive pattern): the service does not await the sink.
+ *
+ * EXPOSURE: the event carries the FULL ApprovalRecord — including the
+ * workflow-authored `payload` (typically the suspend payload) and `summary`.
+ * That is deliberately MORE than the audit trail ever emits (audit `detail`s
+ * are scoped to ids), because a useful notification needs reviewer context.
+ * A transport addressing a lower-trust channel (email, chat) must project
+ * or redact the record itself — title/ids/priority/SLA usually suffice.
+ */
+export type ApprovalNotificationSink = (
+  event: ApprovalNotificationEvent,
+) => void | Promise<void>;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Store factories — the ONLY way hosts obtain approval stores (INV-2: "no
 // caller can obtain an approval store that is not bound to exactly one tenant
 // at construction"). Each factory owns its backend handle and its schema-init

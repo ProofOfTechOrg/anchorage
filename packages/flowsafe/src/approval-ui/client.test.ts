@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -83,6 +84,51 @@ describe('ApprovalApiClient', () => {
       method: 'GET',
       url: '/api/approvals?limit=100&orderBy=reviewer',
     });
+  });
+
+  it('forwards the triage filters (requestedBy, createdBefore, createdAfter)', async () => {
+    // #given
+    const { fetch, calls } = makeFetch(() => ({ payload: [] }));
+    const client = new ApprovalApiClient({ fetch });
+
+    // #when
+    await client.list({
+      requestedBy: 'ada',
+      createdBefore: '2026-07-11T10:00:00.000Z',
+      createdAfter: '2026-07-10T10:00:00.000Z',
+    });
+
+    // #then
+    expect(calls[0]).toMatchObject({
+      method: 'GET',
+      url: '/api/approvals?requestedBy=ada&createdBefore=2026-07-11T10%3A00%3A00.000Z&createdAfter=2026-07-10T10%3A00%3A00.000Z',
+    });
+  });
+
+  it('decideBatch posts ids + decision to /batch/decide and drops empty comments', async () => {
+    // #given
+    const { fetch, calls } = makeFetch(() => ({
+      payload: { results: [], decided: 0, failed: 0 },
+    }));
+    const client = new ApprovalApiClient({ fetch });
+
+    // #when
+    await client.decideBatch(['a', 'b'], 'approve', 'triage');
+    await client.decideBatch(['c'], 'reject', '');
+
+    // #then
+    expect(calls[0]).toMatchObject({
+      method: 'POST',
+      url: '/api/approvals/batch/decide',
+      body: JSON.stringify({
+        ids: ['a', 'b'],
+        decision: 'approve',
+        comment: 'triage',
+      }),
+    });
+    expect(calls[1]?.body).toBe(
+      JSON.stringify({ ids: ['c'], decision: 'reject' }),
+    );
   });
 
   it('decides with a JSON body and drops empty comments', async () => {

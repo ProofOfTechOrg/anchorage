@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Unit coverage for the run surface every host mounts: the authorization ORDER
 // (401 -> coarse RUN_START_ROLES -> per-workflow allowedRoles), the catalog, the
 // start/status/resume routes and their error mapping, the suspension bridge's

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The WorkflowModule contract: a self-contained workflow (its metadata + a
 // register() that builds its steps/connectors and commits it onto a shared
 // runtime). One RunnerRuntime hosts many modules — register-before-first-run is

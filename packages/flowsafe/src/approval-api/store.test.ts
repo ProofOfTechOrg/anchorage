@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // One behavioral contract, two backends: InMemoryApprovalStore and
 // D1ApprovalStore. The D1 store runs against REAL SQLite via node:sqlite
 // (D1 is SQLite), so the CAS SQL — status-guarded UPDATE ... RETURNING —
@@ -26,7 +27,7 @@ import {
   InMemoryApprovalStoreFactory,
 } from './tenant-store.js';
 import type { ApprovalRecord } from './types.js';
-import { approvalCursor } from './types.js';
+import { approvalCursor, MAX_APPROVAL_LIST_LIMIT } from './types.js';
 
 let seq = 0;
 
@@ -237,6 +238,78 @@ function describeStoreContract(
       expect(
         (await store.list({ status: ['pending', 'claimed'] })).map((r) => r.id),
       ).toEqual([a.id, b.id, c.id]);
+    });
+
+    it('filters by requestedBy and strict createdBefore/createdAfter bounds', async () => {
+      // #given — three records 1s apart (makeRecord increments createdAt)
+      const store = await makeStore();
+      const early = makeRecord({ runId: 'r-t1', requestedBy: 'ada' });
+      const middle = makeRecord({ runId: 'r-t2', requestedBy: 'opal' });
+      const late = makeRecord({ runId: 'r-t3', requestedBy: 'ada' });
+      await store.create(early);
+      await store.create(middle);
+      await store.create(late);
+
+      // #when / #then — exact requestedBy match
+      expect(
+        (await store.list({ requestedBy: 'ada' })).map((r) => r.id),
+      ).toEqual([early.id, late.id]);
+
+      // Strict bounds: the boundary record itself is excluded either side.
+      expect(
+        (await store.list({ createdBefore: middle.createdAt })).map(
+          (r) => r.id,
+        ),
+      ).toEqual([early.id]);
+      expect(
+        (await store.list({ createdAfter: middle.createdAt })).map((r) => r.id),
+      ).toEqual([late.id]);
+
+      // Combined filters intersect.
+      expect(
+        (
+          await store.list({
+            requestedBy: 'ada',
+            createdAfter: early.createdAt,
+          })
+        ).map((r) => r.id),
+      ).toEqual([late.id]);
+    });
+
+    it('treats a no-milliseconds ISO bound as the same instant (D1 canonicalization boundary case)', async () => {
+      // #given — SQLite TEXT compare is bytewise: '…T…Z' vs '…T….000Z' would
+      // misorder at the boundary unless the bound is canonicalized first
+      const store = await makeStore();
+      const early = makeRecord({ runId: 'r-c1' });
+      const boundary = makeRecord({ runId: 'r-c2' });
+      const late = makeRecord({ runId: 'r-c3' });
+      await store.create(early);
+      await store.create(boundary);
+      await store.create(late);
+      const noMillis = boundary.createdAt.replace('.000Z', 'Z');
+      expect(noMillis).not.toBe(boundary.createdAt);
+
+      // #when / #then — the variant spelling is the SAME strict bound
+      expect(
+        (await store.list({ createdBefore: noMillis })).map((r) => r.id),
+      ).toEqual([early.id]);
+      expect(
+        (await store.list({ createdAfter: noMillis })).map((r) => r.id),
+      ).toEqual([late.id]);
+    });
+
+    it('throws on an unparseable time bound identically on both backends', async () => {
+      // #given
+      const store = await makeStore();
+      await store.create(makeRecord({ runId: 'r-bad' }));
+
+      // #when / #then — loud error, not a silently-empty page
+      await expect(
+        store.list({ createdBefore: 'yesterday-ish' }),
+      ).rejects.toThrow(/createdBefore/);
+      await expect(store.list({ createdAfter: '' })).rejects.toThrow(
+        /createdAfter/,
+      );
     });
 
     it('breaks a createdAt tie by id BYTEWISE on both backends (FIFO collation parity)', async () => {
@@ -470,6 +543,40 @@ function describeStoreContract(
       await expect(
         store.list({ after: 'not valid base64!!' }),
       ).rejects.toThrow();
+    });
+
+    it('bounds a bare tenant list() at MAX_APPROVAL_LIST_LIMIT while the system view stays complete (D3)', async () => {
+      // #given — one tenant holding MORE than the cap in a single queue
+      const backend = makeBackend();
+      const store = backend.forTenant('acme');
+      const total = MAX_APPROVAL_LIST_LIMIT + 1;
+      for (let index = 0; index < total; index += 1) {
+        await store.create(makeRecord({ runId: `run-bound-${index}` }));
+      }
+
+      // #when — a bare tenant list() (no limit)...
+      const bounded = await store.list();
+      // ...and an explicit cursor walk of MAX-sized pages
+      const walked: string[] = [];
+      let after: string | undefined;
+      for (;;) {
+        const page = await store.list({
+          limit: MAX_APPROVAL_LIST_LIMIT,
+          after,
+        });
+        walked.push(...page.map((r) => r.id));
+        const last = page.at(-1);
+        if (page.length < MAX_APPROVAL_LIST_LIMIT || !last) break;
+        after = approvalCursor(last);
+      }
+
+      // #then — the bare list defaults to the cap (never an unbounded scan);
+      // explicit cursor paging still retrieves everything with no gaps/dupes;
+      // the cron-only system view stays complete (un-defaulted)
+      expect(bounded).toHaveLength(MAX_APPROVAL_LIST_LIMIT);
+      expect(walked).toHaveLength(total);
+      expect(new Set(walked).size).toBe(total);
+      expect(await backend.system().list()).toHaveLength(total);
     });
 
     // ---- reviewer ordering (orderBy: 'reviewer', 2026-07-11 review) -------

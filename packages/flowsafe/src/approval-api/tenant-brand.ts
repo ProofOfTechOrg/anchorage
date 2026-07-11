@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The tenant-binding brand (INV-2). TypeScript is structural: a plain
 // `readonly tenantId: string` discriminator is satisfied by any object
 // literal, and a #private field is nominal PER CLASS — which breaks here

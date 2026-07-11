@@ -16,12 +16,14 @@ import { HStack } from '@astryxdesign/core/HStack';
 import { Spinner } from '@astryxdesign/core/Spinner';
 import { Tab, TabList } from '@astryxdesign/core/TabList';
 import { Text } from '@astryxdesign/core/Text';
+import { TextInput } from '@astryxdesign/core/TextInput';
 import { Token } from '@astryxdesign/core/Token';
 import { Tooltip } from '@astryxdesign/core/Tooltip';
 import { VStack } from '@astryxdesign/core/VStack';
 
 import type { ApprovalApiClient } from '@flowsafe/approval-ui/client';
 import { DetailView } from '@flowsafe/approval-ui/DetailView';
+import { FilterBar } from '@flowsafe/approval-ui/FilterBar';
 import { MetricsView } from '@flowsafe/approval-ui/MetricsView';
 import { QueueView } from '@flowsafe/approval-ui/QueueView';
 import { useApprovalDashboard } from '@flowsafe/approval-ui/use-approval-dashboard';
@@ -37,7 +39,7 @@ import { ActivityFeedPanel } from '@/activity-feed';
 import { WhatsRealHere, WhereThingsRunDialog } from '@/architecture-legend';
 import { GLOSSARY, ROLE_NOTES, TAGLINE } from '@/glossary';
 import { IntroTourDialog, useIntroTour } from '@/intro-tour';
-import { resetErrorEvent, resetEvent } from '@/narration';
+import { resetErrorEvent, resetEvent, shortId } from '@/narration';
 import { RunCards } from '@/run-cards';
 import {
   type CatalogActor,
@@ -89,6 +91,7 @@ export function ShowcaseApp({
   const [retryNonce, setRetryNonce] = useState(0);
   const runResults = useRunPolling(runClient, runs, retryNonce);
   const [tab, setTab] = useState('queue');
+  const [batchComment, setBatchComment] = useState('');
   const [legendOpen, setLegendOpen] = useState(false);
   const [resetOpen, setResetOpen] = useState(false);
   const [resetBusy, setResetBusy] = useState(false);
@@ -328,6 +331,63 @@ export function ShowcaseApp({
                 {dashboard.error ? (
                   <Banner status="error" title={dashboard.error} />
                 ) : null}
+                <FilterBar
+                  filter={dashboard.filter}
+                  onApply={dashboard.setFilter}
+                  disabled={dashboard.busy}
+                />
+                {dashboard.lastBatch && dashboard.lastBatch.failed > 0 ? (
+                  <Banner
+                    status="warning"
+                    title={`Batch decide: ${dashboard.lastBatch.decided} decided · ${dashboard.lastBatch.failed} failed`}
+                    description={dashboard.lastBatch.results
+                      .flatMap((item) =>
+                        item.ok
+                          ? []
+                          : [
+                              `${shortId(item.id)}: ${item.error ?? item.code ?? 'failed'}`,
+                            ],
+                      )
+                      .join(' · ')}
+                  />
+                ) : null}
+                {dashboard.selectedIds.length > 0 ? (
+                  <HStack gap={2} align="end" wrap="wrap">
+                    <Text size="sm">
+                      {dashboard.selectedIds.length} selected
+                    </Text>
+                    <TextInput
+                      label="Batch comment"
+                      value={batchComment}
+                      onChange={setBatchComment}
+                      isDisabled={dashboard.busy}
+                    />
+                    <Button
+                      label="Approve selected"
+                      variant="primary"
+                      isDisabled={dashboard.busy}
+                      onClick={() => {
+                        dashboard.decideSelected('approve', batchComment);
+                        setBatchComment('');
+                      }}
+                    />
+                    <Button
+                      label="Reject selected"
+                      variant="destructive"
+                      isDisabled={dashboard.busy}
+                      onClick={() => {
+                        dashboard.decideSelected('reject', batchComment);
+                        setBatchComment('');
+                      }}
+                    />
+                    <Button
+                      label="Clear selection"
+                      variant="ghost"
+                      isDisabled={dashboard.busy}
+                      onClick={dashboard.clearSelection}
+                    />
+                  </HStack>
+                ) : null}
                 {!dashboardSettled ? (
                   // Before the first poll settles the queue is UNKNOWN, not
                   // empty — mirror MetricsView's loading spinner instead of
@@ -339,6 +399,8 @@ export function ShowcaseApp({
                     nowMs={dashboard.nowMs}
                     selectedId={dashboard.selectedId}
                     onSelect={dashboard.select}
+                    selectedIds={dashboard.selectedIds}
+                    onToggleSelect={dashboard.toggleSelect}
                   />
                 )}
                 {selfRequested ? (

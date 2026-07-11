@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // RunnerRuntime hosts Mastra workflow execution against injected storage.
 // It is deliberately environment-free: the Durable Object shell feeds it
 // D1-backed storage; tests feed it InMemoryStore. Durability comes from

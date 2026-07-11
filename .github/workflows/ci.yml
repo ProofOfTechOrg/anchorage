@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 jobs:
   verify:
@@ -37,6 +37,13 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+      # Peer-floor probe: the approval-ui d.ts is EMITTED under
+      # @types/react@19; this compiles the built dist against aliased
+      # @types/react@18 (skipLibCheck OFF), proving the React >=18 peer range
+      # the package declares. Needs the Build step's dist.
+      - name: Typecheck approval-ui at the react-18 peer floor
+        run: pnpm --filter @proofoftech/flowsafe typecheck:react18
 
       # React quality gate: the FULL react-doctor scan over the showcase app
       # (pre-push runs the fast changed-files subset; this is the

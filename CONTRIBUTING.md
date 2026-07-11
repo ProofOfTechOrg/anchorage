@@ -54,14 +54,18 @@ imports — enforced by Biome.
 ## Releasing
 
 Versioning and publishing run through [changesets](.changeset/README.md).
-A PR that changes published behavior of `@proofoftech/breakwater` or
-`@proofoftech/flowsafe` includes a changeset (`pnpm exec changeset` — pick the
-packages, a semver bump, and write the CHANGELOG entry). On merge to `main`,
-the release workflow (`.github/workflows/release.yml`) opens or updates a
-"Version Packages" PR; merging that PR publishes to npm with provenance and
-pushes the release tags. Publishing needs the `NPM_TOKEN` repository secret
-(an npm automation token with publish rights on the `@proofoftech` scope).
-`showcase` is private and never publishes.
+Feature and fix PRs target the `dev` integration branch and include a changeset
+(`pnpm exec changeset` — pick the packages, a semver bump, and write the
+CHANGELOG entry) when they change published behavior of `@proofoftech/breakwater`
+or `@proofoftech/flowsafe`. Changesets accumulate on `dev`; a **release PR**
+(`dev` → `main`) brings them to `main`. On merge, the release workflow
+(`.github/workflows/release.yml`) opens a "Version Packages" PR (version bump +
+CHANGELOG entries); merging that PR publishes to npm with provenance and pushes
+the release tags. After that publish, sync `main` → `dev` so `dev` carries the
+version bump + CHANGELOG and drops the consumed changesets; the next release
+then starts from a clean `dev`. Publishing needs the `NPM_TOKEN` repository
+secret (an npm automation token with publish rights on the `@proofoftech`
+scope). `showcase` is private and never publishes.
 
 ## Code Of Conduct
 

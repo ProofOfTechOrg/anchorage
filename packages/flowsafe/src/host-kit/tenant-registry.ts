@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The tenantId allocation authority. Every isolation invariant treats
 // tenantId as axiomatically unique — the salted runId prefix, the bound
 // store's tenant_id predicate, the R2 key segment — and NOTHING else enforces

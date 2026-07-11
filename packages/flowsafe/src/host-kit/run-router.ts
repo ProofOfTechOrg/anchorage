@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // HTTP surface for the run catalog + run lifecycle, shared by every host.
 //
 // Mirrors createApprovalRouter's contract — plain fetch routing, an injected

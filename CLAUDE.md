@@ -116,10 +116,26 @@ Phase 4 (Ecosystem, 2026-07-07):
   trigger (isolated failures), bearer-token auth seam, start+resume approval
   bridges (multi-gate), optional Queues audit export. `deploy:cf`/`deploy:dev`.
 
+0.2.0 batch (2026-07-11, branch `feat/high-batch-0.2.0`): breakwater grew
+content inspection (`piiSecrets` regex+entropy+Luhn detectors with allowlist
+exemptions and streaming windows; `classifierPolicy` async-classifier seam,
+fail-closed timeout) and the audit→metrics adapter (`MetricsRecorder`,
+`metricsAuditSink`, `combineAuditSinks`). flowsafe grew the notification seam
+(`ApprovalNotificationSink`: created + escalated, contained, failures audit as
+`approval.notify`), triage filters (`requestedBy`, strict
+`createdBefore`/`createdAfter`), `decideBatch` (≤100 ids through the existing
+per-record CAS/SoD path; `POST /api/approvals/batch/decide`), the dashboard
+triage UI (FilterBar, batch selection + decide, additive Checkbox/Select
+slots), and `createFlowsafeWorker()` — the composed Worker both hosts now
+consume as thin shells. Plus `pnpm docs:api` (typedoc), SPDX headers on every
+library src file (guarded by per-package `spdx.test.ts`), and a CI-run
+react-18 peer-floor probe (`typecheck:react18`).
+
 Verification gate: `pnpm lint && pnpm typecheck && pnpm test && pnpm build`
-(978 tests; lint is ONE root Biome 2 pass, test is ONE root vitest run over
+(1119 tests; lint is ONE root Biome 2 pass, test is ONE root vitest run over
 every package via `test.projects`). CI adds the full react-doctor gate
-(100/100 over `packages/showcase`, `--blocking warning`) and `spike:verify`.
+(100/100 over `packages/showcase`, `--blocking warning`), the react-18
+peer-floor probe, and `spike:verify`.
 
 Showcase (2026-07-09; extracted to its own `showcase` workspace package
 2026-07-10): all five `docs/examples/*` workflows made runnable behind
@@ -199,6 +215,25 @@ other branches → `wrangler versions upload`). Google OAuth is the launch provi
 screen must be "In production" — Testing status only admits listed test
 users); GitHub stays a config-only fallback.
 
+## Branching and releases
+
+- **`dev` is the integration branch — all feature/fix PRs target `dev`.**
+  Branch off `dev`, open PRs into `dev`, and add a changeset describing the
+  change. Do NOT open feature PRs against `main`.
+- **`main` is the release/production branch.** Only a **release PR**
+  (`dev` → `main`) lands there, bringing the accumulated changesets. Merging it
+  runs `release.yml`: the changesets action opens a "Version Packages" PR
+  (changelog + version bump), and merging THAT PR publishes to npm with
+  provenance and pushes tags. The live demo deploys from `main`.
+- `main` remains the changesets `baseBranch` and the sole `release.yml` trigger
+  (publishing never runs on `dev`); CI (`ci.yml`) runs on both `main` and `dev`,
+  so the verification gate fires on every PR into the integration branch, not
+  only at release time.
+- **After a release publishes, sync `main` → `dev`** (fast-forward or merge) so
+  `dev` carries the version bump + CHANGELOG and drops the consumed changesets
+  (the Version Packages PR commits those to `main` only) — the next release then
+  starts from a clean `dev`.
+
 ## Files
 
 | File | What | When to read |
@@ -207,10 +242,11 @@ users); GitHub stays a config-only fallback.
 | `CONTRIBUTING.md` | Setup, workflow, and PR guidelines | Preparing a PR, first-time setup |
 | `LICENSE` | Apache-2.0 license text | Licensing questions |
 | `SECURITY.md` | Vulnerability reporting (GitHub private advisories) + scope | Reporting or triaging a security issue |
-| `.github/workflows/ci.yml` | CI — verification gate + react-doctor full gate + `spike:verify` on push/PR to `main` | Changing CI, debugging a failed check |
+| `.github/workflows/ci.yml` | CI — verification gate + react-18 peer-floor probe (`typecheck:react18`, after Build) + react-doctor full gate + `spike:verify` on push/PR to `main`/`dev` | Changing CI, debugging a failed check |
 | `.github/workflows/release.yml` | Changesets release: on push to `main`, opens/updates the "Version Packages" PR or publishes unpublished versions to npm with provenance (needs the `NPM_TOKEN` secret) | Changing the publish pipeline, debugging a failed release |
 | `.changeset/` | Changesets config (`config.json`: public access, main base) + contributor how-to (`README.md`); pending changesets live here between releases | Adding a changeset, changing versioning behavior |
-| `package.json` | Root workspace manifest and scripts: `build`/`typecheck` fan out with `-r`; `lint`/`lint:fix` run ONE root Biome pass; `test`/`test:watch` run ONE root vitest; `dev` = showcase dev server; `react-doctor`/`react-doctor:diff` mirrors; `prepare` installs husky | Adding dependencies, modifying workspace scripts |
+| `package.json` | Root workspace manifest and scripts: `build`/`typecheck` fan out with `-r`; `lint`/`lint:fix` run ONE root Biome pass; `test`/`test:watch` run ONE root vitest; `dev` = showcase dev server; `docs:api` = typedoc (on-demand, output gitignored); `react-doctor`/`react-doctor:diff` mirrors; `prepare` installs husky | Adding dependencies, modifying workspace scripts |
+| `typedoc.json` | Root typedoc config (`entryPointStrategy: packages` over breakwater + flowsafe; out `docs/api/`, gitignored). approval-ui is deliberately NOT typedoc'd — its DOM/JSX program conflicts with the workers-typed one; its README documents that surface | Changing API-reference generation |
 | `pnpm-workspace.yaml` | pnpm workspace package globs + supply-chain `minimumReleaseAge` (7-day buffer; exclusions documented inline, incl. `deslop-js` for react-doctor's dlx install) | Adding or removing workspace packages, dependency-age failures |
 | `pnpm-lock.yaml` | Resolved dependency lockfile (generated) | Never edit by hand — regenerated by `pnpm install` |
 | `tsconfig.base.json` | Shared TypeScript compiler config | Modifying compiler options across all packages |

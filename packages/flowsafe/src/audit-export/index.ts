@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Audit export — Cloudflare Queues integration shipping audit events to a
 // SIEM (Phase 4 "Audit export to SIEM via Queues"). Producer side:
 // queueAuditSink() adapts a Queue producer binding onto the audit-sink

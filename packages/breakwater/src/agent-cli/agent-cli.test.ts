@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 import { RequestContext } from '@mastra/core/request-context';
 import type { ToolExecutionContext } from '@mastra/core/tools';
 import { describe, expect, it, type Mock, vi } from 'vitest';

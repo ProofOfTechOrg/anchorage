@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // purgeExpiredWorkflowRuns against REAL SQLite via node:sqlite (D1 is
 // SQLite), so the json_extract status filter and the ISO-cutoff comparison
 // run for real. The openSqlite() fixture matches the approval-api store

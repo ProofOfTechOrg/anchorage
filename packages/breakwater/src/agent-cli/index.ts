@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Agent CLI adapters — Claude Code and Codex as Mastra tools (Phase 4
 // "Agent CLI adapters"). Each adapter is a breakwater connector, so the full
 // permission manifest governs it: an agent CLI edits files and runs commands

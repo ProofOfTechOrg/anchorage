@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ApprovalStore — the persistence contract for the approval queue.
 //
 // Every state change goes through transition(), a compare-and-swap guarded by
@@ -16,8 +17,10 @@ import {
   byReviewerOrder,
   clampApprovalLimit,
   compareStrings,
+  MAX_APPROVAL_LIST_LIMIT,
   OPEN_STATUSES,
   parseApprovalCursor,
+  parseApprovalTimeBound,
 } from './types.js';
 
 /** Uniqueness scope for open requests: one per (workflowId, runId, stepKey). */
@@ -64,8 +67,11 @@ export interface ApprovalStore {
    * queue order) by default, or the reviewer queue order (priority → SLA →
    * FIFO, byReviewerOrder) under 'reviewer' — applied BEFORE filter.limit,
    * so a bounded page is the top of the reviewer queue. Bounded by
-   * filter.limit/filter.after (D3: an unfiltered list() repeated on every
-   * dashboard poll is a full-table scan).
+   * filter.limit/filter.after; a tenant-bound bare list() with no limit
+   * defaults to MAX_APPROVAL_LIST_LIMIT (D3: an unbounded list() repeated on
+   * every dashboard poll is a full-table scan), so page complete history with
+   * an explicit `after` cursor. The cron-only SystemApprovalStore view stays
+   * complete (no default) for reconciliation and the SLA sweep.
    */
   list(filter?: ApprovalListFilter): Promise<ApprovalRecord[]>;
   /**
@@ -111,6 +117,30 @@ export function matchesFilter(
     return false;
   if (filter.runId !== undefined && record.runId !== filter.runId) return false;
   if (filter.claimedBy !== undefined && record.claimedBy !== filter.claimedBy)
+    return false;
+  if (
+    filter.requestedBy !== undefined &&
+    record.requestedBy !== filter.requestedBy
+  )
+    return false;
+  // Chronological (parsed), not bytewise: the filter value is caller-formatted
+  // ISO and may not match the column's canonical toISOString() form. Strict
+  // bounds; parseApprovalTimeBound throws on garbage (router 400s it first).
+  if (
+    filter.createdBefore !== undefined &&
+    !(
+      Date.parse(record.createdAt) <
+      parseApprovalTimeBound(filter.createdBefore, 'createdBefore')
+    )
+  )
+    return false;
+  if (
+    filter.createdAfter !== undefined &&
+    !(
+      Date.parse(record.createdAt) >
+      parseApprovalTimeBound(filter.createdAfter, 'createdAfter')
+    )
+  )
     return false;
   return true;
 }
@@ -287,7 +317,14 @@ export class InMemoryApprovalStore implements ApprovalStore {
           record.tenantId === this.tenantId && matchesFilter(record, filter),
       )
       .sort(approvalListComparator(filter));
-    return paginateApprovalList(matched, filter).map(clone);
+    // D3: a tenant-bound bare list() defaults to MAX_APPROVAL_LIST_LIMIT so a
+    // repeated dashboard poll can never fall back to an unbounded scan. The
+    // default lives HERE, not in paginateApprovalList — the cron-only system
+    // view (tenant-store.ts) shares that helper and must stay complete.
+    return paginateApprovalList(matched, {
+      after: filter.after,
+      limit: filter.limit ?? MAX_APPROVAL_LIST_LIMIT,
+    }).map(clone);
   }
 
   async metrics(nowMs: number): Promise<ApprovalMetrics> {

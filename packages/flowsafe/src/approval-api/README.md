@@ -44,6 +44,27 @@ grant in its requestContext.
 
 ## Design Decisions
 
+- **Notifications are a seam, not a transport.** `ApprovalNotificationSink`
+  (contract.ts) fires on the two moments a reviewer is NOT already looking at
+  the dashboard: a record actually entering the queue (`created: true` only —
+  the idempotent re-observation of an open step never re-notifies) and an SLA
+  escalation (per record, from the cron sweep). Same
+  availability-over-delivery containment as the audit sink: a throwing or
+  rejecting transport is recorded as `approval.notify`/'error' and the
+  approval action proceeds. flowsafe ships NO transport (email/Slack adapters
+  stay with hosts); Workers hosts whose send must outlive the response wrap
+  it in `ctx.waitUntil` themselves. Rejected: notifying on decisions (the
+  decider is looking at the dashboard) and awaiting the sink (a slow
+  transport must never hold an approval hostage).
+- **Batch decide is fan-out, not a new decision model.** `decideBatch` runs
+  the EXISTING `decide()` per unique id (≤`MAX_APPROVAL_BATCH_DECIDE`),
+  sequentially — per-record CAS, separation-of-duties, audit, and resume
+  semantics untouched, so the one-decision-per-suspension model is not
+  widened. Partial failure is data (`BatchDecideItem.code`), never an HTTP
+  error; only record-independent problems (role, cap, malformed input)
+  reject the whole batch. Rejected: a store-level bulk transition (would
+  fork the CAS semantics) and `Promise.all` (audit-order scrambling + D1/DO
+  write contention for a path that is a reviewer clicking once).
 - **Grants by derivation, never transport.** The DO's public resume route
   carries only `{step, resumeData}`. Anything a proxying Worker forwards can
   be forged; a grant that never crosses HTTP cannot be. Rejected: signed

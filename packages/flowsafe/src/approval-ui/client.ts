@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // REST client for the approval API. Deliberately DOM-free: fetch is injected
 // behind a minimal structural type, so this file typechecks in the main
 // (workers-types) pass, tests run it in plain node, and the browser gets the
@@ -9,6 +10,7 @@ import type {
   ApprovalListFilter,
   ApprovalMetrics,
   ApprovalRecord,
+  BatchDecideResult,
   DecideResult,
 } from '../approval-api/types.js';
 
@@ -77,6 +79,12 @@ export class ApprovalApiClient {
     if (filter.runId !== undefined) params.set('runId', filter.runId);
     if (filter.claimedBy !== undefined)
       params.set('claimedBy', filter.claimedBy);
+    if (filter.requestedBy !== undefined)
+      params.set('requestedBy', filter.requestedBy);
+    if (filter.createdBefore !== undefined)
+      params.set('createdBefore', filter.createdBefore);
+    if (filter.createdAfter !== undefined)
+      params.set('createdAfter', filter.createdAfter);
     if (filter.limit !== undefined) params.set('limit', String(filter.limit));
     if (filter.after !== undefined) params.set('after', filter.after);
     if (filter.orderBy !== undefined) params.set('orderBy', filter.orderBy);
@@ -117,6 +125,22 @@ export class ApprovalApiClient {
     return (await this.#post(`/${encodeURIComponent(id)}/delegate`, {
       to,
     })) as ApprovalRecord;
+  }
+
+  /**
+   * One decision fanned out over up to MAX_APPROVAL_BATCH_DECIDE records.
+   * Partial failure is IN the envelope (per-record `ok`/`code`), never an
+   * HTTP error — only batch-level problems (role, cap, malformed input)
+   * reject.
+   */
+  async decideBatch(
+    ids: readonly string[],
+    decision: ApprovalDecision,
+    comment?: string,
+  ): Promise<BatchDecideResult> {
+    const body: Record<string, unknown> = { ids: [...ids], decision };
+    if (comment !== undefined && comment !== '') body.comment = comment;
+    return (await this.#post('/batch/decide', body)) as BatchDecideResult;
   }
 
   // There is deliberately no sweep() — POST /sla/sweep no longer exists. The
