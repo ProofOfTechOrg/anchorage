@@ -1,6 +1,6 @@
 # @proofoftech/breakwater
 
-## 0.1.0 (unreleased)
+## 0.1.0 — 2026-07-11
 
 First publishable cut. Mastra safety middleware: policy engine (output channels,
 deny patterns, opt-in hold-back buffering), RBAC processor, audit sink, connector

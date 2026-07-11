@@ -4,6 +4,7 @@
 /*
 
 # --- Tracked top-level directories (their contents track normally) ---
+!/.changeset/
 !/.github/
 !/packages/
 !/docs/

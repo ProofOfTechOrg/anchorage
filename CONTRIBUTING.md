@@ -41,7 +41,7 @@ pnpm --filter @proofoftech/flowsafe spike:verify
 ```
 
 Lint is one Biome pass at the root, and `pnpm test` is one root vitest run
-covering every package (837 tests). Git hooks (husky) back the gate up:
+covering every package (978 tests). Git hooks (husky) back the gate up:
 pre-commit runs Biome on staged files (lint-staged); pre-push runs
 react-doctor on the branch's changed files (`pnpm react-doctor:diff`; bypass
 with `git push --no-verify`). CI additionally runs the full react-doctor gate
@@ -50,6 +50,18 @@ with `git push --no-verify`). CI additionally runs the full react-doctor gate
 The showcase app uses mandatory absolute imports — `@/*` for `src`,
 `#worker/*` for worker modules, `@flowsafe/*` for deep flowsafe source
 imports — enforced by Biome.
+
+## Releasing
+
+Versioning and publishing run through [changesets](.changeset/README.md).
+A PR that changes published behavior of `@proofoftech/breakwater` or
+`@proofoftech/flowsafe` includes a changeset (`pnpm exec changeset` — pick the
+packages, a semver bump, and write the CHANGELOG entry). On merge to `main`,
+the release workflow (`.github/workflows/release.yml`) opens or updates a
+"Version Packages" PR; merging that PR publishes to npm with provenance and
+pushes the release tags. Publishing needs the `NPM_TOKEN` repository secret
+(an npm automation token with publish rights on the `@proofoftech` scope).
+`showcase` is private and never publishes.
 
 ## Code Of Conduct
 
