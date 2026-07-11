@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The subdomain <-> tenant cross-check: defense in depth over INV-2. The
 // interesting property is the DENY — tenant A's token presented on tenant
 // B's branded host must not quietly operate on A's data — plus the pass-

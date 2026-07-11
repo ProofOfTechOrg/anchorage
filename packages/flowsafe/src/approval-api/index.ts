@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Approval API — the Phase 3 enterprise-controls surface: a CAS-backed
 // approval queue (claim / decide / delegate), SLA tracking with escalation,
 // role-authorized REST routing, audit emission, and the grant-minting seam
@@ -10,6 +11,8 @@ export type {
   ApprovalActor,
   ApprovalAuditEvent,
   ApprovalAuditSink,
+  ApprovalNotificationEvent,
+  ApprovalNotificationSink,
   ApprovalRole,
 } from './contract.js';
 export {
@@ -80,6 +83,8 @@ export type {
   ApprovalPriority,
   ApprovalRecord,
   ApprovalStatus,
+  BatchDecideItem,
+  BatchDecideResult,
   CreateApprovalInput,
   DecideResult,
   ResumeOutcome,
@@ -91,6 +96,7 @@ export {
   approvalCursor,
   approvalListOrder,
   byReviewerOrder,
+  MAX_APPROVAL_BATCH_DECIDE,
   MAX_APPROVAL_LIST_LIMIT,
   OPEN_STATUSES,
   parseApprovalCursor,

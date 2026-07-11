@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // @proofoftech/flowsafe — Approval UX + Cloudflare-native durable execution
 //
 // flowsafe plugs into Mastra's suspend/resume workflow events and adds:
@@ -29,6 +30,8 @@ export type {
   ApprovalListFilter,
   ApprovalListOrder,
   ApprovalMetrics,
+  ApprovalNotificationEvent,
+  ApprovalNotificationSink,
   ApprovalPatch,
   ApprovalPreparedStatement,
   ApprovalPriority,
@@ -40,6 +43,8 @@ export type {
   ApprovalStatus,
   ApprovalStore,
   ApprovalStoreFactory,
+  BatchDecideItem,
+  BatchDecideResult,
   CreateApprovalInput,
   CreateResult,
   CreateTenantResolverOptions,
@@ -77,6 +82,7 @@ export {
   InMemoryApprovalStore,
   InMemoryApprovalStoreFactory,
   InvalidApprovalInputError,
+  MAX_APPROVAL_BATCH_DECIDE,
   MAX_APPROVAL_LIST_LIMIT,
   OPEN_STATUSES,
   parseApprovalCursor,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Reading a Durable Object's answer back as a RunSummary.
 //
 // Hosts that reach their runs through a DO stub (the showcase, the deploy

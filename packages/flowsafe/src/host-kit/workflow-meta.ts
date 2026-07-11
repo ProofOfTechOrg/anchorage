@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // WorkflowMeta — the metadata a host advertises for a workflow, and the only
 // part of the module contract the run router needs.
 //

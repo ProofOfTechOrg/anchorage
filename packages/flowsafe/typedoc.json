@@ -1,0 +1,9 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": [
+    "src/index.ts",
+    "src/host-kit/index.ts",
+    "src/host-kit/module.ts"
+  ],
+  "tsconfig": "tsconfig.json"
+}

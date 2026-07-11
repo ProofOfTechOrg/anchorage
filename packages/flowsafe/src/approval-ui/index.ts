@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Approval dashboard — a React UI over the approval REST API (queue, detail +
 // decision form, metrics). Subpath export only
 // ('@proofoftech/flowsafe/approval-ui'); deliberately absent from the package
@@ -10,7 +11,7 @@
 // typecheck in the main pass too, where their tests run.
 
 export type { ApprovalDashboardProps } from './App.js';
-export { App } from './App.js';
+export { App, batchFailureSummary } from './App.js';
 export type {
   ApprovalApiClientOptions,
   FetchLike,
@@ -28,13 +29,17 @@ export type {
   BannerProps,
   ButtonProps,
   ButtonVariant,
+  CheckboxProps,
   CodeProps,
   EmptyStateProps,
   HeadingProps,
   InfoTipProps,
   MetadataItemProps,
   MetadataListProps,
+  ResolvedApprovalUIComponents,
   SectionProps,
+  SelectOption,
+  SelectProps,
   SpinnerProps,
   StackDirection,
   StackGap,
@@ -51,6 +56,19 @@ export {
 } from './components.js';
 export type { DetailViewProps } from './DetailView.js';
 export { DetailView } from './DetailView.js';
+export type {
+  AgeDraft,
+  FilterBarProps,
+  StatusDraft,
+  TriageFilterDrafts,
+} from './FilterBar.js';
+export {
+  AGE_PRESETS,
+  buildTriageFilter,
+  DEFAULT_TRIAGE_DRAFTS,
+  FilterBar,
+  statusDraftOf,
+} from './FilterBar.js';
 export type { MetricsViewProps } from './MetricsView.js';
 export { MetricsView } from './MetricsView.js';
 export type { CreateApprovalDashboardOptions } from './mount.js';
@@ -63,7 +81,14 @@ export type {
   ApprovalDashboardState,
   UseApprovalDashboardOptions,
 } from './use-approval-dashboard.js';
-export { useApprovalDashboard } from './use-approval-dashboard.js';
+// effectiveApprovalFilter / pruneSelection stay module-level (DOM-free tests
+// import them directly): they are the hook's internal derivations, not
+// consumer API — keeping them off the barrel keeps them out of the frozen
+// 0.2.0 surface.
+export {
+  DEFAULT_QUEUE_FILTER,
+  useApprovalDashboard,
+} from './use-approval-dashboard.js';
 export type { SlaState } from './view-model.js';
 export {
   DEFAULT_SLA_WARNING_MS,

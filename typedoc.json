@@ -1,0 +1,8 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPointStrategy": "packages",
+  "entryPoints": ["packages/breakwater", "packages/flowsafe"],
+  "out": "docs/api",
+  "name": "Anchorage API",
+  "includeVersion": true
+}

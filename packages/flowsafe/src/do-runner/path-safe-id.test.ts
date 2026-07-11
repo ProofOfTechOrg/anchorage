@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Character-level pins for the two id charsets. TENANT_ID_PATTERN (INV-3) is
 // load-bearing beyond validation: the tenant is recovered from runIds by
 // prefix (`${tenantId}_`) and purged by the range [`${tid}_`, `${tid}\x60`),

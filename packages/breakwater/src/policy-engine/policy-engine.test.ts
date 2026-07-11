@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 import type { MastraDBMessage } from '@mastra/core/agent/message-list';
 import { MessageList } from '@mastra/core/agent/message-list';
 import {

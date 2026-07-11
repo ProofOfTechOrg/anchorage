@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Typechecked by the UI test pass (src/approval-ui/tsconfig.test.json), not
 // the package test pass — this file imports the .tsx contract, which the
 // workers-typed program cannot compile. No jsdom: the default slots are
@@ -96,6 +97,26 @@ describe('provider merge semantics', () => {
     };
     const merged = { ...htmlComponents, ...partial };
     expect(merged.InfoTip).toBe(htmlComponents.InfoTip);
+  });
+
+  it('falls back to default Checkbox/Select when a pre-triage adapter omits them (additive contract)', () => {
+    // #given — an adapter written before the triage slots existed supplies a
+    // partial map with neither; the merge must keep it working unmodified.
+    // (The defaults use useId, like TextField, so they are pinned here by
+    // identity + presence, not by direct invocation — hooks need a renderer.)
+    const preTriageAdapter: Partial<ApprovalUIComponents> = {
+      Text: htmlComponents.Text,
+      Button: htmlComponents.Button,
+    };
+
+    // #when
+    const merged = { ...htmlComponents, ...preTriageAdapter };
+
+    // #then
+    expect(merged.Checkbox).toBe(htmlComponents.Checkbox);
+    expect(merged.Select).toBe(htmlComponents.Select);
+    expect(typeof merged.Checkbox).toBe('function');
+    expect(typeof merged.Select).toBe('function');
   });
 
   it('prefers an adapter-supplied InfoTip over the default', () => {

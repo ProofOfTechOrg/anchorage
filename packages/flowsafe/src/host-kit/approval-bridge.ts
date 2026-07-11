@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Host-agnostic approval bridge: the glue that turns a workflow suspension into
 // an approval request and re-queues the next gate on a multi-gate run. Promoted
 // out of gtm-app/worker.ts so every host (the showcase Worker, the dev backend)
@@ -167,7 +168,7 @@ export function resumeRunWithRequeue(
         // reporting (same "availability over export reliability" posture as
         // ApprovalService's own #record).
         try {
-          audit?.({
+          const outcome = audit?.({
             actor: systemActor,
             action: 'approval.requeue',
             resource: `approval:${record.id}`,
@@ -180,6 +181,11 @@ export function resumeRunWithRequeue(
               suspended: summary.suspended,
             },
           });
+          if (outcome instanceof Promise) {
+            outcome.catch(() => {
+              // ignore — see comment above
+            });
+          }
         } catch {
           // ignore — see comment above
         }

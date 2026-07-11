@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Cloudflare Durable Objects workflow runner — the Cloudflare-native
 // counterpart of @mastra/inngest / @mastra/temporal. init() returns DO-bound
 // createWorkflow/createStep (import-swap); DurableObjectRunner hosts

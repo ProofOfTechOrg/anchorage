@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Roadmap Phase 1: "D1 storage adapter (wrap Mastra's)". The wrap pins
 // flowsafe defaults and is the seam where audit export / Queues hooks
 // attach in later phases. Table auto-creation (CREATE TABLE IF NOT EXISTS)

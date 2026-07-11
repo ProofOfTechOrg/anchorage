@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Tool-boundary policies — evaluated inside the connector SDK's execute
 // wrapper, not the agent processor chain. Mastra's processor seam only wraps
 // the agent loop; tools invoked from workflow steps (createStep(tool)) or

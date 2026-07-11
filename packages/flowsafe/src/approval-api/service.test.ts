@@ -1,6 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it, vi } from 'vitest';
 
-import type { ApprovalActor, ApprovalAuditEvent } from './contract.js';
+import type {
+  ApprovalActor,
+  ApprovalAuditEvent,
+  ApprovalNotificationEvent,
+  ApprovalNotificationSink,
+} from './contract.js';
 import {
   ApprovalAuthzError,
   ApprovalConflictError,
@@ -15,6 +21,7 @@ import { InMemoryApprovalStoreFactory } from './tenant-store.js';
 import {
   type ApprovalRecord,
   type CreateApprovalInput,
+  MAX_APPROVAL_BATCH_DECIDE,
   MAX_APPROVAL_LIST_LIMIT,
 } from './types.js';
 
@@ -91,12 +98,16 @@ async function seedPending(
  */
 function runSweep(
   harness: Harness,
-  options: { onEscalation?: (record: ApprovalRecord) => void } = {},
+  options: {
+    onEscalation?: (record: ApprovalRecord) => void;
+    notify?: ApprovalNotificationSink;
+  } = {},
 ): Promise<ApprovalRecord[]> {
   return sweepSLA(harness.backend.system(), {
     systemActor: OPERATOR,
     audit: (event) => harness.events.push(event),
     onEscalation: options.onEscalation,
+    notify: options.notify,
     now: harness.now,
   });
 }
@@ -924,6 +935,402 @@ describe('ApprovalService.delegate concurrency', () => {
     expect(second.status).toBe('claimed');
     const stored = await harness.store.get(record.id);
     expect(['quinn', 'pat']).toContain(stored?.claimedBy);
+  });
+});
+
+describe('ApprovalService notification seam', () => {
+  it('notifies once per actually-created record, with the record', async () => {
+    // #given
+    const notified: ApprovalNotificationEvent[] = [];
+    const harness = makeHarness({
+      notify: (event) => void notified.push(event),
+    });
+
+    // #when
+    const record = await seedPending(harness);
+
+    // #then
+    expect(notified).toEqual([
+      { type: 'created', record: expect.objectContaining({ id: record.id }) },
+    ]);
+  });
+
+  it('does not re-notify the idempotent re-observation of an open step', async () => {
+    // #given
+    const notify = vi.fn();
+    const harness = makeHarness({ notify });
+    await seedPending(harness, { stepPath: ['gate'] });
+
+    // #when — same (workflowId, runId, stepKey) while still open
+    const second = await harness.service.create(
+      input({ stepPath: ['gate'] }),
+      OPERATOR,
+    );
+
+    // #then
+    expect(second.created).toBe(false);
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
+  it('contains a throwing sink and audits approval.notify/error', async () => {
+    // #given
+    const harness = makeHarness({
+      notify: () => {
+        throw new Error('smtp down');
+      },
+    });
+
+    // #when — the create must succeed regardless
+    const record = await seedPending(harness);
+
+    // #then
+    expect(record.status).toBe('pending');
+    expect(harness.events).toContainEqual(
+      expect.objectContaining({
+        action: 'approval.notify',
+        decision: 'error',
+        reason: expect.stringContaining('smtp down'),
+      }),
+    );
+  });
+
+  it('contains an async-rejecting sink likewise', async () => {
+    // #given
+    const harness = makeHarness({
+      notify: () => Promise.reject(new Error('webhook 500')),
+    });
+
+    // #when
+    await seedPending(harness);
+    // The rejection handler runs off the microtask queue, after create returned.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // #then
+    expect(harness.events).toContainEqual(
+      expect.objectContaining({
+        action: 'approval.notify',
+        decision: 'error',
+        reason: expect.stringContaining('webhook 500'),
+      }),
+    );
+  });
+
+  it('notifies per escalated record from the sweep', async () => {
+    // #given
+    const harness = makeHarness();
+    await seedPending(harness, { slaSeconds: 60 });
+    await seedPending(harness, { slaSeconds: 60, runId: 'acme_run-2' });
+    harness.advance(61_000);
+
+    // #when
+    const notified: ApprovalNotificationEvent[] = [];
+    const escalated = await runSweep(harness, {
+      notify: (event) => void notified.push(event),
+    });
+
+    // #then
+    expect(escalated).toHaveLength(2);
+    expect(notified.map((event) => event.type)).toEqual([
+      'escalated',
+      'escalated',
+    ]);
+    expect(new Set(notified.map((event) => event.record.id))).toEqual(
+      new Set(escalated.map((record) => record.id)),
+    );
+  });
+
+  it('a throwing sweep sink does not abort the sweep and audits each failure', async () => {
+    // #given
+    const harness = makeHarness();
+    await seedPending(harness, { slaSeconds: 60 });
+    await seedPending(harness, { slaSeconds: 60, runId: 'acme_run-2' });
+    harness.advance(61_000);
+
+    // #when
+    const escalated = await runSweep(harness, {
+      notify: () => {
+        throw new Error('pager down');
+      },
+    });
+
+    // #then — both records still escalated, evidence preserved
+    expect(escalated).toHaveLength(2);
+    expect(
+      harness.events.filter(
+        (event) =>
+          event.action === 'approval.notify' && event.decision === 'error',
+      ),
+    ).toHaveLength(2);
+  });
+});
+
+describe('ApprovalService audit sink promise containment', () => {
+  it('contains a promise-returning audit sink rejection on every recorder (create/decide/sweep)', async () => {
+    // #given — ApprovalAuditSink may return a promise (a composed breakwater
+    // sink with an async member); a rejection must never surface as an
+    // unhandled rejection after the action already returned
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    const proc = (
+      globalThis as unknown as {
+        process: {
+          on(event: 'unhandledRejection', fn: (r: unknown) => void): void;
+          off(event: 'unhandledRejection', fn: (r: unknown) => void): void;
+        };
+      }
+    ).process;
+    proc.on('unhandledRejection', onUnhandled);
+    try {
+      const harness = makeHarness({
+        audit: () => Promise.reject(new Error('siem down')),
+      });
+
+      // #when — the three recorders: create, decide, and the sweep's own
+      const record = await seedPending(harness, { slaSeconds: 60 });
+      await harness.service.decide(
+        record.id,
+        { decision: 'approve' },
+        REVIEWER,
+      );
+      await seedPending(harness, { slaSeconds: 60, runId: 'acme_run-2' });
+      harness.advance(61_000);
+      await sweepSLA(harness.backend.system(), {
+        systemActor: OPERATOR,
+        audit: () => Promise.reject(new Error('siem down')),
+        now: harness.now,
+      });
+      // Rejection handlers run off the microtask queue; give them a tick.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      // #then
+      expect(unhandled).toEqual([]);
+    } finally {
+      proc.off('unhandledRejection', onUnhandled);
+    }
+  });
+});
+
+describe('ApprovalService decide audit detail', () => {
+  it('carries queue dwell time as durationSeconds (created -> decided)', async () => {
+    // #given
+    const harness = makeHarness();
+    const record = await seedPending(harness);
+    harness.advance(90_000);
+
+    // #when
+    await harness.service.decide(record.id, { decision: 'approve' }, REVIEWER);
+
+    // #then — feeds breakwater metricsAuditSink's histogram convention
+    expect(harness.events).toContainEqual(
+      expect.objectContaining({
+        action: 'approval.decide',
+        decision: 'allowed',
+        detail: expect.objectContaining({ durationSeconds: 90 }),
+      }),
+    );
+  });
+});
+
+describe('ApprovalService.decideBatch', () => {
+  it('reports per-record outcomes: ok, SoD-forbidden, not-found, conflict', async () => {
+    // #given
+    const harness = makeHarness();
+    const ok = await seedPending(harness);
+    const sod = await seedPending(harness, {
+      runId: 'acme_run-2',
+      requestedBy: REVIEWER.id,
+    });
+    const decided = await seedPending(harness, { runId: 'acme_run-3' });
+    await harness.service.decide(decided.id, { decision: 'reject' }, ADMIN);
+
+    // #when
+    const result = await harness.service.decideBatch(
+      [ok.id, sod.id, 'missing', decided.id],
+      { decision: 'approve', comment: 'triage sweep' },
+      REVIEWER,
+    );
+
+    // #then — per-record fan-out, input order preserved
+    expect(result.decided).toBe(1);
+    expect(result.failed).toBe(3);
+    expect(result.results.map((item) => [item.id, item.ok, item.code])).toEqual(
+      [
+        [ok.id, true, undefined],
+        [sod.id, false, 'forbidden'],
+        ['missing', false, 'not-found'],
+        [decided.id, false, 'conflict'],
+      ],
+    );
+    expect(result.results[0]?.record).toMatchObject({
+      status: 'approved',
+      comment: 'triage sweep',
+    });
+    expect(result.results[0]?.resume).toEqual({ attempted: false });
+  });
+
+  it('dedupes ids order-preservingly — a duplicate is not a spurious conflict', async () => {
+    // #given
+    const harness = makeHarness();
+    const record = await seedPending(harness);
+
+    // #when
+    const result = await harness.service.decideBatch(
+      [record.id, record.id, record.id],
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then
+    expect(result.results).toHaveLength(1);
+    expect(result.decided).toBe(1);
+    expect(result.failed).toBe(0);
+  });
+
+  it('rejects a batch over MAX_APPROVAL_BATCH_DECIDE unique ids', async () => {
+    // #given
+    const harness = makeHarness();
+    const ids = Array.from(
+      { length: MAX_APPROVAL_BATCH_DECIDE + 1 },
+      (_, index) => `id-${index}`,
+    );
+
+    // #when / #then
+    await expect(
+      harness.service.decideBatch(ids, { decision: 'approve' }, REVIEWER),
+    ).rejects.toBeInstanceOf(InvalidApprovalInputError);
+  });
+
+  it('rejects an empty batch and non-string or empty ids', async () => {
+    // #given
+    const harness = makeHarness();
+
+    // #when / #then
+    await expect(
+      harness.service.decideBatch([], { decision: 'approve' }, REVIEWER),
+    ).rejects.toBeInstanceOf(InvalidApprovalInputError);
+    await expect(
+      harness.service.decideBatch(
+        ['ok', ''],
+        { decision: 'approve' },
+        REVIEWER,
+      ),
+    ).rejects.toBeInstanceOf(InvalidApprovalInputError);
+  });
+
+  it('rejects the whole batch for a non-reviewer role, touching nothing', async () => {
+    // #given
+    const harness = makeHarness();
+    const record = await seedPending(harness);
+
+    // #when / #then
+    await expect(
+      harness.service.decideBatch([record.id], { decision: 'approve' }, VIEWER),
+    ).rejects.toBeInstanceOf(ApprovalAuthzError);
+    expect(await harness.store.get(record.id)).toMatchObject({
+      status: 'pending',
+    });
+  });
+
+  it('validates the decision once at batch level', async () => {
+    // #given
+    const harness = makeHarness();
+    const record = await seedPending(harness);
+
+    // #when / #then
+    await expect(
+      harness.service.decideBatch(
+        [record.id],
+        { decision: 'maybe' as 'approve' },
+        REVIEWER,
+      ),
+    ).rejects.toBeInstanceOf(InvalidApprovalInputError);
+    expect(await harness.store.get(record.id)).toMatchObject({
+      status: 'pending',
+    });
+  });
+
+  it('decides exactly MAX_APPROVAL_BATCH_DECIDE records (the positive boundary)', async () => {
+    // #given — the cap test above proves 101 rejects; this pins 100 working
+    const harness = makeHarness();
+    const ids: string[] = [];
+    for (let index = 0; index < MAX_APPROVAL_BATCH_DECIDE; index++) {
+      const record = await seedPending(harness, {
+        runId: `acme_run-b${index}`,
+      });
+      ids.push(record.id);
+    }
+
+    // #when
+    const result = await harness.service.decideBatch(
+      ids,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then
+    expect(result.decided).toBe(MAX_APPROVAL_BATCH_DECIDE);
+    expect(result.failed).toBe(0);
+  });
+
+  it("reads another tenant's id as not-found with no content leak", async () => {
+    // #given — a foreign-tenant record in the SAME shared backend (INV-2)
+    const harness = makeHarness();
+    const rivalStore = harness.backend.forTenant(
+      'bravo',
+    ) as InMemoryApprovalStore;
+    const { record: rival } = await rivalStore.create({
+      id: 'rival-1',
+      tenantId: 'bravo',
+      workflowId: 'wf',
+      runId: 'bravo_run-1',
+      title: 'RIVAL SECRET TITLE',
+      connectors: [],
+      priority: 'normal',
+      status: 'pending',
+      createdAt: new Date(T0).toISOString(),
+      updatedAt: new Date(T0).toISOString(),
+    });
+    const own = await seedPending(harness);
+
+    // #when
+    const result = await harness.service.decideBatch(
+      [own.id, rival.id],
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then — foreign id behaves exactly like an unknown id, leaks nothing,
+    // and the foreign record is untouched
+    expect(result.decided).toBe(1);
+    expect(result.results[1]).toMatchObject({ ok: false, code: 'not-found' });
+    expect(JSON.stringify(result.results[1])).not.toContain(
+      'RIVAL SECRET TITLE',
+    );
+    expect((await rivalStore.get(rival.id))?.status).toBe('pending');
+  });
+
+  it('emits one approval.decide.batch summary audit event with tallies', async () => {
+    // #given
+    const harness = makeHarness();
+    const record = await seedPending(harness);
+
+    // #when
+    await harness.service.decideBatch(
+      [record.id, 'missing'],
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then
+    expect(harness.events).toContainEqual(
+      expect.objectContaining({
+        action: 'approval.decide.batch',
+        decision: 'allowed',
+        detail: { requested: 2, decided: 1, failed: 1 },
+      }),
+    );
   });
 });
 

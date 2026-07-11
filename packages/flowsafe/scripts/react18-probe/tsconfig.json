@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": [],
+    "skipLibCheck": false,
+    "noUncheckedIndexedAccess": true,
+    "baseUrl": ".",
+    "paths": {
+      "react": ["../../node_modules/types-react-18"],
+      "react/jsx-runtime": ["../../node_modules/types-react-18/jsx-runtime"],
+      "react-dom": ["../../node_modules/types-react-dom-18"],
+      "react-dom/client": ["../../node_modules/types-react-dom-18/client"]
+    }
+  },
+  "include": ["consumer.tsx"]
+}

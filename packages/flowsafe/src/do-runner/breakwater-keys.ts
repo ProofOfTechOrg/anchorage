@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // breakwater requestContext keys, mirrored by value.
 //
 // flowsafe deliberately does NOT import @proofoftech/breakwater at runtime:

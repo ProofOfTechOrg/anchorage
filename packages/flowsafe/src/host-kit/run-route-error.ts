@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Shared vocabulary between the DO-response reader and the run router: an error
 // that already knows the HTTP status it should surface as.
 //

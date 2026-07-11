@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Connector SDK — createConnector() wraps Mastra's createTool() with an
 // enforced permission manifest. Mastra createTool() has no manifest field
 // (its MCP annotations are descriptive only), so the manifest is stripped

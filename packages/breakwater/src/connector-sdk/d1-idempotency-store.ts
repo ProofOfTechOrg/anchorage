@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // D1-backed AtomicIdempotencyStore — durable replay protection for
 // production connectors. Cross-isolate atomicity comes from the database:
 // reserve()'s INSERT ... ON CONFLICT DO NOTHING RETURNING admits exactly one

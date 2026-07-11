@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // One behavioral contract, two backends: InMemoryApprovalStore and
 // D1ApprovalStore. The D1 store runs against REAL SQLite via node:sqlite
 // (D1 is SQLite), so the CAS SQL — status-guarded UPDATE ... RETURNING —
@@ -237,6 +238,78 @@ function describeStoreContract(
       expect(
         (await store.list({ status: ['pending', 'claimed'] })).map((r) => r.id),
       ).toEqual([a.id, b.id, c.id]);
+    });
+
+    it('filters by requestedBy and strict createdBefore/createdAfter bounds', async () => {
+      // #given — three records 1s apart (makeRecord increments createdAt)
+      const store = await makeStore();
+      const early = makeRecord({ runId: 'r-t1', requestedBy: 'ada' });
+      const middle = makeRecord({ runId: 'r-t2', requestedBy: 'opal' });
+      const late = makeRecord({ runId: 'r-t3', requestedBy: 'ada' });
+      await store.create(early);
+      await store.create(middle);
+      await store.create(late);
+
+      // #when / #then — exact requestedBy match
+      expect(
+        (await store.list({ requestedBy: 'ada' })).map((r) => r.id),
+      ).toEqual([early.id, late.id]);
+
+      // Strict bounds: the boundary record itself is excluded either side.
+      expect(
+        (await store.list({ createdBefore: middle.createdAt })).map(
+          (r) => r.id,
+        ),
+      ).toEqual([early.id]);
+      expect(
+        (await store.list({ createdAfter: middle.createdAt })).map((r) => r.id),
+      ).toEqual([late.id]);
+
+      // Combined filters intersect.
+      expect(
+        (
+          await store.list({
+            requestedBy: 'ada',
+            createdAfter: early.createdAt,
+          })
+        ).map((r) => r.id),
+      ).toEqual([late.id]);
+    });
+
+    it('treats a no-milliseconds ISO bound as the same instant (D1 canonicalization boundary case)', async () => {
+      // #given — SQLite TEXT compare is bytewise: '…T…Z' vs '…T….000Z' would
+      // misorder at the boundary unless the bound is canonicalized first
+      const store = await makeStore();
+      const early = makeRecord({ runId: 'r-c1' });
+      const boundary = makeRecord({ runId: 'r-c2' });
+      const late = makeRecord({ runId: 'r-c3' });
+      await store.create(early);
+      await store.create(boundary);
+      await store.create(late);
+      const noMillis = boundary.createdAt.replace('.000Z', 'Z');
+      expect(noMillis).not.toBe(boundary.createdAt);
+
+      // #when / #then — the variant spelling is the SAME strict bound
+      expect(
+        (await store.list({ createdBefore: noMillis })).map((r) => r.id),
+      ).toEqual([early.id]);
+      expect(
+        (await store.list({ createdAfter: noMillis })).map((r) => r.id),
+      ).toEqual([late.id]);
+    });
+
+    it('throws on an unparseable time bound identically on both backends', async () => {
+      // #given
+      const store = await makeStore();
+      await store.create(makeRecord({ runId: 'r-bad' }));
+
+      // #when / #then — loud error, not a silently-empty page
+      await expect(
+        store.list({ createdBefore: 'yesterday-ish' }),
+      ).rejects.toThrow(/createdBefore/);
+      await expect(store.list({ createdAfter: '' })).rejects.toThrow(
+        /createdAfter/,
+      );
     });
 
     it('breaks a createdAt tie by id BYTEWISE on both backends (FIFO collation parity)', async () => {

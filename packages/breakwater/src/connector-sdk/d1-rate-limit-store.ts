@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // D1-backed RateLimitStore — a durable fixed-window budget shared across
 // isolates. The in-memory store is per-isolate, and under flowsafe's
 // DO-per-run routing "per isolate" degrades to "per RUN": ten concurrent runs

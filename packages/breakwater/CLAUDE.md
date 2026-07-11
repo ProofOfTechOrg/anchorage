@@ -12,6 +12,7 @@
 | `CONNECTORS.md` | Connector authoring guide — manifest field-by-field with enforcement semantics, honesty rules, testing expectations, contribution flow | Building or reviewing a connector, onboarding community contributors |
 | `package.json` | Manifest, subpath exports (`./policy-engine`, `./rbac`, `./audit`, `./connector-sdk`), scripts, `@mastra/core` peer | Adding a subpath export, changing scripts, bumping the Mastra peer |
 | `tsconfig.json` | Build TS config (emits `dist/`) | Changing build output or compiler options |
+| `typedoc.json` | Package typedoc entry (`src/index.ts` over the build tsconfig) — consumed by the root `pnpm docs:api` packages-strategy run | Changing what the API reference covers |
 | `tsconfig.test.json` | Test-only TS config (type-checks `*.test.ts`) | Debugging test typecheck failures |
 | `vitest.config.ts` | Vitest runner config | Changing test globs or runner options |
 

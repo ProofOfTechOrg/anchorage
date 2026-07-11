@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Grant derivation — how a decision becomes an in-run capability.
 //
 // Grants NEVER travel in HTTP bodies. The runner's public resume route stays

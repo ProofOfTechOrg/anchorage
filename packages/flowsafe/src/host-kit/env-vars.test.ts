@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Env-var parsing pins. The stakes are operational: numberVar guards the
 // demo's spend caps (where a rejected `0` silently reverted an incident
 // freeze to the 500-run fallback) and boolVar guards the kill switch (where
