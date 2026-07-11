@@ -1,6 +1,6 @@
 # @proofoftech/flowsafe
 
-## 0.1.0 (unreleased)
+## 0.1.0 — 2026-07-11
 
 First publishable cut. Approval UX + Cloudflare-native durable execution for
 Mastra workflows: Durable Object runner (`init()` import-swap, server-minted
