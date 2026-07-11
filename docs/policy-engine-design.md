@@ -63,9 +63,16 @@ policies:
 
 ## Evaluation Flow
 
-1. Pre-gate: evaluate network egress + write permissions before tool execution. Deny blocks execution.
-2. Execution: Mastra tool runs normally.
-3. Post-gate: evaluate data retention + cross-workflow isolation on output storage. Policy violation logs a warning and redacts the output.
+1. Pre-execute gates: every tool-boundary evaluator — network egress, write
+   permission (the requestContext grant check), cross-workflow isolation, and
+   tenant isolation — runs before the connector executes. A deny throws
+   `ConnectorPolicyError` and the tool never runs; there is no post-execute
+   redaction stage.
+2. Execution: the Mastra tool runs normally (or the dry-run simulation runs
+   instead — the pre-execute gates above fire either way).
+3. Data retention is not part of this flow at all: TTL enforcement is a
+   storage-layer property, shipped as flowsafe's cron-driven purge helpers
+   (see below).
 
 ## Implementation
 

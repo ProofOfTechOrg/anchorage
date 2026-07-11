@@ -1,7 +1,8 @@
 # packages/
 
 Implementation packages — everything shippable lives here. Two libraries and
-one product: `breakwater` + `flowsafe` are the published safety layer;
+one product: `breakwater` + `flowsafe` are the publishable safety layer
+(publish-ready metadata, still source-only/private until the first npm release);
 `showcase` is the private demo app built on them.
 
 ## Subdirectories

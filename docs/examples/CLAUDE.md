@@ -11,4 +11,4 @@ TypeScript `createWorkflow()` design sketches for Anchorage — illustrative, no
 | `content-pipeline.ts` | Parallel step execution | Implementing parallel workflow branches |
 | `lead-generation.ts` | Conditional branching (`.branch()` hot/cold routing) | Implementing conditional routing |
 | `product-launch.ts` | Multi-step serial approval checkpoints | Implementing multi-checkpoint approval |
-| `custom-workflow-scoping.ts` | Deployment-time RBAC scoping with breakwater | Implementing role-scoped workflow access |
+| `custom-workflow-scoping.ts` | Role-gated workflow access (design sketch; the shipped mechanism is flowsafe host-kit's `WorkflowMeta.allowedRoles` run-router gate, not a breakwater wrapper) | Implementing role-scoped workflow access |

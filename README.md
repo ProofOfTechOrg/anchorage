@@ -39,6 +39,7 @@ execution — as Mastra middleware.
 | **showcase** | Runnable demo — five workflows, one React frontend, one Cloudflare deploy | `showcase` (private) |
 
 Source-only today — clone and build (see [Quick Start](#quick-start)); not yet published to npm.
+Targets Node >= 22, ESM only (TypeScript `moduleResolution` `node16`/`nodenext`/`bundler`), `@mastra/core` ^1.50.0.
 
 ### breakwater — safety layer
 
