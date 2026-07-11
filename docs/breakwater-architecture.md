@@ -74,7 +74,7 @@ Structured audit log for every action: who, what, when, result, reason. Buffers 
 
 ### PolicyEngine (@proofoftech/breakwater/policy-engine)
 
-Pre-gate and post-gate content evaluation over the answer/reasoning/object output channels (deny patterns, length limits, opt-in hold-back buffering), with custom policies as evaluator functions returning `{ allowed: boolean, reason?: string }`. Tool-boundary policies (network-egress declaration gate, write approval, tenant and cross-workflow isolation) live in `tool-policy.ts` and are enforced by the connector SDK before a connector executes — pre-execute deny, not post-execute redaction.
+Pre-gate and post-gate content evaluation over the answer/reasoning/object output channels (deny patterns, length limits, PII/secret content inspection via `piiSecrets` — regex + entropy + Luhn detectors with allowlist exemptions — a pluggable async classifier via `classifierPolicy`, and opt-in hold-back buffering), with custom policies as evaluator functions returning `{ allowed: boolean, reason?: string }`. Tool-boundary policies (network-egress declaration gate, write approval, tenant and cross-workflow isolation) live in `tool-policy.ts` and are enforced by the connector SDK before a connector executes — pre-execute deny, not post-execute redaction.
 
 ## Tenancy
 

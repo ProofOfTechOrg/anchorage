@@ -13,7 +13,7 @@ the agent execution lifecycle.
 
 | Subpackage | Enforcement point | Role |
 |---|---|---|
-| `policy-engine` | Agent-boundary processors + connector execute wrapper | Egress, output-channel, retention, isolation gates around model and tool calls |
+| `policy-engine` | Agent-boundary processors + connector execute wrapper | Egress, output-channel, retention, isolation gates around model and tool calls; content inspection (`piiSecrets` PII/secret detectors, `classifierPolicy` async classifier seam) |
 | `rbac` | Workflow and tool invocation | Resolve caller identity -> role -> permissions |
 | `audit` | Shared sink used by every gate | `AuditLogger` — buffered, sink-isolated structured audit events (re-exported from `rbac` for compat); `metricsAuditSink` + `combineAuditSinks` adapt events onto counters/histograms and fan out to multiple sinks |
 | `connector-sdk` | `createConnector()` wrapping `createTool()` | Permission manifests: egress allowlist, write-approval gate, idempotent replay, dry-run simulation, fixed-window rate limits |
@@ -89,6 +89,16 @@ keys). Audit events buffer in memory with an injectable `sink`
 structurally-compatible events, so one `AuditLogger` can carry both. For
 durable export, flowsafe ships a Cloudflare Queues → SIEM sink
 (`@proofoftech/flowsafe/audit-export`).
+
+Output (and input) content is inspectable in the same policy chain:
+`piiSecrets()` denies text carrying PII or credential-shaped secrets — email,
+SSN, phone, Luhn-validated card numbers, AWS access keys, PEM private-key
+headers, JWTs, `key = value` secret assignments, and high-Shannon-entropy
+tokens — with allowlist exemptions and streaming-window scanning whose denial
+reasons never echo the matched text. `classifierPolicy()` plugs an async
+classifier (a moderation model, an external safety API) into the same gates
+on a streaming cadence, failing closed on error or timeout. Both are
+best-effort against adversarial encoding tricks, like `denyPatterns`.
 
 Audit events also drive metrics: `metricsAuditSink(recorder)` adapts any
 `{increment, observe}`-shaped client (StatsD, Prometheus push, OTel) onto a

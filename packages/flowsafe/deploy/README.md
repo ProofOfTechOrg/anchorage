@@ -169,12 +169,16 @@ expressions byte-equal to crons.ts's `SWEEP_CRON`/`PURGE_CRON` constants.
 ## The conventions the template encodes
 
 - **The shared pieces come from `@proofoftech/flowsafe/host-kit`, not from
-  here.** The auth seam (`parseActorTokens` + `bearerActorAuthenticator`), the
-  run routes with their RBAC gate order (`createRunRouter`), and the approval
-  bridge (`queueApprovalForSuspension`, `resumeRunWithRequeue`) are
-  security-critical and tested in the library. This file supplies only what is
-  deployment-specific: the workflows, and the DO-stub `start`/`status`/`resume`
-  thunks. Do not re-derive them.
+  here.** The whole Worker pipeline is `createFlowsafeWorker()` — the
+  `/healthz` → approvals → runs → 404 fetch order, the auth seam
+  (`parseActorTokens` + `bearerActorAuthenticator`), the run routes with
+  their RBAC gate order (`createRunRouter`), the approval bridge
+  (`queueApprovalForSuspension`, `resumeRunWithRequeue`), the two-cron
+  `scheduled()` dispatch, and the audit-export `queue()` consumer — all
+  security-critical and tested in the library. `worker.ts` supplies only what
+  is deployment-specific: the workflows, the memoized `buildVerifier`, the
+  cron expressions, and the optional subdomain cross-check (`wrapResolve`).
+  Do not re-derive them.
 - **Authenticate first, then construct.** The routers take a `TenantResolver`,
   not a bare `authenticate`: it verifies the token, validates the tenant claim,
   and binds the approval store to that tenant — so there is no pre-auth service

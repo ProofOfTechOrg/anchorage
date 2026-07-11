@@ -48,9 +48,12 @@ Plugs into Mastra as processors (`@mastra/core/processors`) and tool/workflow
 wrappers:
 
 - **Policy engine** — network egress policies, write permission gates, data
-  retention, cross-workflow and cross-tenant isolation
+  retention, cross-workflow and cross-tenant isolation, and content
+  inspection: PII/secret detection (regex + entropy + Luhn) plus a pluggable
+  async-classifier seam, both stream-aware and fail-closed
 - **RBAC + audit** — 5 roles (admin, builder, operator, reviewer, viewer),
-  per-workflow scoping, audit log for every action
+  per-workflow scoping, audit log for every action, and a metrics adapter
+  turning audit events into counters/histograms for any metrics client
 - **Connector SDK** — wraps Mastra `createTool()` with permission manifests,
   side-effect classification, idempotency keys, dry-run, and rate limits
   (idempotency and rate-limit budgets segment per tenant when the host mints
@@ -61,16 +64,20 @@ wrappers:
 
 Approval management UI + Cloudflare-native durable workflow runner:
 
-- **Approval API** — queue, claim, decide, delegate, SLA tracking, escalation
-- **Approval dashboard** — styling-agnostic React UI for the approval queue
+- **Approval API** — queue, claim, decide (single + batch), delegate, SLA
+  tracking, escalation, triage filters (requester + age bounds), and a
+  notification transport seam (created + escalated events)
+- **Approval dashboard** — styling-agnostic React UI for the approval queue,
+  with triage built in (filter bar, batch select + decide)
 - **DO runner** — init()-based import-swap for Mastra workflows on Cloudflare
   Durable Objects (the same mechanism `@mastra/inngest` and the experimental
   `@mastra/temporal` use)
 - **Multi-tenancy** — server-minted tenant-carrying run ids, tenant-bound
   approval stores enforced by the type system, per-tenant connector budgets,
   and one-call tenant offboarding
-- **Deploy template + ops** — copy-ready production Worker with cron-owned SLA
-  sweep and retention purge; Queues → SIEM audit export; R2 artifact storage
+- **Deploy template + ops** — copy-ready production Worker (a thin shell over
+  host-kit's `createFlowsafeWorker()`) with cron-owned SLA sweep and retention
+  purge; Queues → SIEM audit export; R2 artifact storage
 
 ## Architecture
 
@@ -110,7 +117,7 @@ anchorage/
   packages/
     breakwater/         # @proofoftech/breakwater
       src/
-        policy-engine/  # Policy gates: egress, output-channel, retention, cross-workflow isolation
+        policy-engine/  # Policy gates: egress, output-channel, retention, isolation, content inspection
         rbac/           # Roles, scopes, audit log
         connector-sdk/  # Permission manifests: egress, write-approval, idempotency, dry-run, rate limit
         agent-cli/      # Claude Code / Codex CLIs as approval-gated connectors

@@ -53,19 +53,23 @@ imports — enforced by Biome.
 
 ## Releasing
 
-Versioning and publishing run through [changesets](.changeset/README.md).
-Feature and fix PRs target the `dev` integration branch and include a changeset
-(`pnpm exec changeset` — pick the packages, a semver bump, and write the
-CHANGELOG entry) when they change published behavior of `@proofoftech/breakwater`
-or `@proofoftech/flowsafe`. Changesets accumulate on `dev`; a **release PR**
-(`dev` → `main`) brings them to `main`. On merge, the release workflow
-(`.github/workflows/release.yml`) opens a "Version Packages" PR (version bump +
-CHANGELOG entries); merging that PR publishes to npm with provenance and pushes
-the release tags. After that publish, sync `main` → `dev` so `dev` carries the
-version bump + CHANGELOG and drops the consumed changesets; the next release
-then starts from a clean `dev`. Publishing needs the `NPM_TOKEN` repository
-secret (an npm automation token with publish rights on the `@proofoftech`
-scope). `showcase` is private and never publishes.
+Versioning and publishing run through [changesets](.changeset/README.md), with
+version bumps happening ON `dev` (bump-on-dev). Feature and fix PRs target the
+`dev` integration branch and include a changeset (`pnpm exec changeset` — pick
+the packages, a semver bump, and write the CHANGELOG entry) when they change
+published behavior of `@proofoftech/breakwater` or `@proofoftech/flowsafe`. As
+changesets accumulate, the version workflow (`.github/workflows/version.yml`)
+maintains a standing **"Version Packages" PR against `dev`** with the pending
+bumps + CHANGELOG entries. Releasing is two merges: merge that PR into `dev`,
+then immediately cut and merge the **release PR** (`dev` → `main`). On the
+push to `main`, `.github/workflows/release.yml` publishes any not-yet-published
+versions to npm with provenance and pushes the release tags — it refuses,
+loudly, if an unversioned changeset reached `main` (a feature merged into
+`dev` between the two merges; merge the regenerated Version Packages PR and
+re-cut the release PR). There is no post-release sync step: `main` never gets
+commits of its own. Publishing needs the `NPM_TOKEN` repository secret (an npm
+automation token with publish rights on the `@proofoftech` scope). `showcase`
+is private and never publishes.
 
 ## Code Of Conduct
 

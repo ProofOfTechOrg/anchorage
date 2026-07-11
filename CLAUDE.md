@@ -5,8 +5,10 @@ Instructions for Claude Code when working in this repository.
 ## Project Status
 
 Roadmap Phases 1-4 implemented (see `mvp-roadmap.md`, gitignored/local-only).
-Pinned to `@mastra/core` 1.50.0. CI (`.github/workflows/ci.yml`) runs the
-verification gate + `spike:verify` on push/PR to `main`. Phases 1-3:
+Pinned to `@mastra/core` 1.50.0. Both libraries are published to npm at
+**0.2.0**. CI (`.github/workflows/ci.yml`) runs the verification gate + the
+react-18 peer-floor probe + the full react-doctor gate + `spike:verify` on
+push/PR to `main` and `dev`. Phases 1-3:
 
 - breakwater: `PolicyEngine` + `RBACMiddleware` as real Mastra processors,
   `AuditLogger` shared sink (own module `src/audit/`, re-exported from
