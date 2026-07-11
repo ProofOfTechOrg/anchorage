@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The tenants table is the tenantId allocation authority — insert-or-fail is
 // what stops two clients silently merging under one slug. Exercised against
 // real SQLite (node:sqlite), same posture as the approval store's tests.

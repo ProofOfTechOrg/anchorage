@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 import { type JSX, useState } from 'react';
 import type {
   ApprovalDecision,

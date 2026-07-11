@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Approval-queue domain types. All timestamps are ISO 8601 strings — records
 // travel over HTTP and in/out of D1, so the canonical representation is
 // JSON-safe end to end.
@@ -169,10 +170,24 @@ export interface ApprovalListFilter {
   workflowId?: string;
   runId?: string;
   claimedBy?: string;
+  /** Exact match on ApprovalRecord.requestedBy (triage: "everything Ada's runs asked for"). */
+  requestedBy?: string;
+  /**
+   * ISO-8601 bound: matches records whose createdAt is strictly BEFORE this
+   * instant (triage: "older than 4 hours"). Compared chronologically — any
+   * parseable ISO variant works; an unparseable value throws (router.ts maps
+   * it to 400 before a store sees it). Distinct from the `after` CURSOR,
+   * which pages queue position, not creation time.
+   */
+  createdBefore?: string;
+  /** ISO-8601 bound: matches records whose createdAt is strictly AFTER this instant. */
+  createdAfter?: string;
   /**
    * Max records to return (clamped to [1, MAX_APPROVAL_LIST_LIMIT] — see
-   * clampApprovalLimit). undefined means no limit (the pre-D3 behavior);
-   * callers that poll a queue repeatedly should always set one.
+   * clampApprovalLimit). undefined requests no explicit limit: a tenant-bound
+   * store then DEFAULTS to MAX_APPROVAL_LIST_LIMIT (D3 — a bare list() is
+   * never an unbounded scan), while the cron-only SystemApprovalStore view
+   * stays complete. Page complete history with an explicit `after` cursor.
    */
   limit?: number;
   /**
@@ -343,6 +358,58 @@ export interface ApprovalMetrics {
   rejectedCount: number;
   /** Mean createdAt→decidedAt seconds across decided requests; null when none decided. */
   avgResolutionSeconds: number | null;
+}
+
+/**
+ * Parses an ISO-8601 time-bound filter value (createdBefore/createdAfter) to
+ * epoch ms. Throws a plain Error on an unparseable stamp — router.ts maps it
+ * to 400 eagerly (the cursor convention), and BOTH store backends resolve
+ * bounds through here so they fail identically instead of one silently
+ * matching nothing while the other errors.
+ */
+export function parseApprovalTimeBound(value: string, field: string): number {
+  const ms = Date.parse(value);
+  if (Number.isNaN(ms)) {
+    throw new Error(
+      `${field} is not a parseable ISO-8601 timestamp: '${value}'`,
+    );
+  }
+  return ms;
+}
+
+/**
+ * Hard cap on ids per decideBatch call — see ApprovalService.decideBatch.
+ * Sized against the Workers request ceilings, not taste: each decided record
+ * costs a store CAS plus (when resumeRun is wired, as in every DO host) a
+ * cross-Worker resume fetch, sequentially — so the cap bounds subrequests
+ * and request duration. Bump deliberately, with those ceilings in mind.
+ */
+export const MAX_APPROVAL_BATCH_DECIDE = 100;
+
+/**
+ * Per-record outcome of a batch decide. `ok: false` carries the reason —
+ * `code` mirrors the HTTP status the same failure would produce on the
+ * single-record decide route ('not-found' 404, 'conflict' 409, 'forbidden'
+ * 403 — separation of duties, 'invalid' 400, 'error' 500).
+ */
+export interface BatchDecideItem {
+  id: string;
+  ok: boolean;
+  record?: ApprovalRecord;
+  resume?: ResumeOutcome;
+  error?: string;
+  code?: 'not-found' | 'conflict' | 'forbidden' | 'invalid' | 'error';
+}
+
+/**
+ * Envelope of ApprovalService.decideBatch: per-record fan-out results plus
+ * the tallies. Partial failure lives IN the envelope (HTTP 200), never as a
+ * response status — each record's CAS decided independently.
+ */
+export interface BatchDecideResult {
+  results: BatchDecideItem[];
+  decided: number;
+  failed: number;
 }
 
 /** Outcome of the resume attempt a decision triggers. */

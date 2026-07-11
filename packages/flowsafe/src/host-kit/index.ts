@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // host-kit — workflow-agnostic host glue shared by the showcase Worker, the
 // reference deploy template, and the dev backend. It is intentionally NOT a
 // generic host: the two resume topologies (DO-stub fetch vs in-process) stay in
@@ -29,6 +30,13 @@ export {
   type RunnerStubLike,
 } from './do-run-topology.js';
 export { boolVar, type NumberVarOptions, numberVar } from './env-vars.js';
+export type {
+  FlowsafeWorker,
+  FlowsafeWorkerConfig,
+  FlowsafeWorkerContext,
+  FlowsafeWorkerEnv,
+} from './flowsafe-worker.js';
+export { createFlowsafeWorker } from './flowsafe-worker.js';
 // hostAuditSink stays module-internal for the same reason as
 // requestedConnectors below: it is the primitive beneath
 // buildHostApprovalService / runSlaSweepMaintenance, and no host consumes it
@@ -44,6 +52,7 @@ export {
   runSlaSweepMaintenance,
   type SlaSweepMaintenanceOptions,
 } from './host-approval-service.js';
+export type { WorkflowIdSource } from './registration.js';
 export { assertWorkflowsRegistered } from './registration.js';
 export { RunRouteError } from './run-route-error.js';
 export type { RunRouter, RunRouterOptions } from './run-router.js';

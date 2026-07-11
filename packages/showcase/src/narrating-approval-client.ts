@@ -8,6 +8,7 @@
 import type {
   ApprovalDecision,
   ApprovalRecord,
+  BatchDecideResult,
   DecideResult,
 } from '@flowsafe/approval-api/types';
 import {
@@ -16,6 +17,7 @@ import {
   ApprovalApiError,
 } from '@flowsafe/approval-ui/client';
 import {
+  batchDecideEvent,
   claimEvent,
   decideDeniedEvent,
   decideEvents,
@@ -53,6 +55,19 @@ export class NarratingApprovalClient extends ApprovalApiClient {
       // The dashboard hook renders the error inline either way.
       throw error;
     }
+  }
+
+  override async decideBatch(
+    ids: readonly string[],
+    decision: ApprovalDecision,
+    comment?: string,
+  ): Promise<BatchDecideResult> {
+    // Batch-level throws (role 403, cap, malformed input) stay un-narrated:
+    // the dashboard hook renders them inline, and per-record SoD/conflict
+    // failures arrive IN the envelope, summarized by batchDecideEvent.
+    const result = await super.decideBatch(ids, decision, comment);
+    this.#narrate([batchDecideEvent(decision, result)]);
+    return result;
   }
 
   override async claim(id: string): Promise<ApprovalRecord> {

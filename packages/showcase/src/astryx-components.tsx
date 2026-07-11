@@ -15,6 +15,7 @@ import {
   Button as AstryxButton,
   type ButtonVariant as AstryxButtonVariant,
 } from '@astryxdesign/core/Button';
+import { CheckboxInput } from '@astryxdesign/core/CheckboxInput';
 import { CodeBlock } from '@astryxdesign/core/CodeBlock';
 import { EmptyState as AstryxEmptyState } from '@astryxdesign/core/EmptyState';
 import { Heading as AstryxHeading } from '@astryxdesign/core/Heading';
@@ -23,6 +24,7 @@ import {
   MetadataListItem,
 } from '@astryxdesign/core/MetadataList';
 import { Section as AstryxSection } from '@astryxdesign/core/Section';
+import { Selector } from '@astryxdesign/core/Selector';
 import { Spinner as AstryxSpinner } from '@astryxdesign/core/Spinner';
 import { Stack as AstryxStack } from '@astryxdesign/core/Stack';
 import {
@@ -140,6 +142,29 @@ export const astryxComponents: ApprovalUIComponents = {
         onEnter={onSubmit}
       />
     ),
+  // Label hidden visually (a11y-only, the SelectableCard/StatusDot pattern):
+  // in a queue row the record title next to the box would be duplicate noise.
+  Checkbox: ({ label, checked, onChange, disabled }) => (
+    <CheckboxInput
+      label={label}
+      isLabelHidden
+      value={checked}
+      onChange={(next) => onChange(next)}
+      isDisabled={disabled}
+    />
+  ),
+  Select: ({ label, value, options, onChange, disabled }) => (
+    <Selector
+      label={label}
+      value={value}
+      options={options.map((option) => ({
+        value: option.value,
+        label: option.label,
+      }))}
+      onChange={(next) => onChange(next)}
+      isDisabled={disabled}
+    />
+  ),
   MetadataList: ({ children }) => (
     <AstryxMetadataList columns="multi">{children}</AstryxMetadataList>
   ),

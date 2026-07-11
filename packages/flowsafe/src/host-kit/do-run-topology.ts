@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The DO-stub run topology every DO-routing host repeated verbatim: one
 // Durable Object instance per (workflowId, runId), addressed by idFromName,
 // with start/status/resume travelling as HTTP through the stub and read back

@@ -15,7 +15,7 @@ the agent execution lifecycle.
 |---|---|---|
 | `policy-engine` | Agent-boundary processors + connector execute wrapper | Egress, output-channel, retention, isolation gates around model and tool calls |
 | `rbac` | Workflow and tool invocation | Resolve caller identity -> role -> permissions |
-| `audit` | Shared sink used by every gate | `AuditLogger` — buffered, sink-isolated structured audit events (re-exported from `rbac` for compat) |
+| `audit` | Shared sink used by every gate | `AuditLogger` — buffered, sink-isolated structured audit events (re-exported from `rbac` for compat); `metricsAuditSink` + `combineAuditSinks` adapt events onto counters/histograms and fan out to multiple sinks |
 | `connector-sdk` | `createConnector()` wrapping `createTool()` | Permission manifests: egress allowlist, write-approval gate, idempotent replay, dry-run simulation, fixed-window rate limits |
 | `agent-cli` | `createClaudeCodeConnector` / `createCodexConnector` | Claude Code / Codex CLIs as approval-gated connectors (Node-only execution) |
 
@@ -32,7 +32,13 @@ Implemented and tested. `PolicyEngine` and `RBACMiddleware` are real Mastra
 write to; the policy engine gates output per channel (answer / reasoning /
 object) with opt-in zero-leak hold-back buffering, and ships network-egress,
 retention, cross-workflow-isolation, and cross-tenant-isolation tool-boundary
-policies.
+policies. The `object` channel is enforced on the streaming path
+(`agent.stream()`) only under @mastra/core 1.50.0 — a non-streaming
+`generate()` exposes no parsed object to gate (structured output carried as
+answer text is still caught by any policy whose channels include `answer`) — so
+a policy scoped to `object` without `answer` requires an audit sink at
+construction; `PolicyEngine` rejects that configuration without one rather than
+silently no-op.
 
 `createConnector()` wraps Mastra `createTool()` with an enforced permission
 manifest — network-egress allowlisting, write-approval gating (a
@@ -83,6 +89,15 @@ keys). Audit events buffer in memory with an injectable `sink`
 structurally-compatible events, so one `AuditLogger` can carry both. For
 durable export, flowsafe ships a Cloudflare Queues → SIEM sink
 (`@proofoftech/flowsafe/audit-export`).
+
+Audit events also drive metrics: `metricsAuditSink(recorder)` adapts any
+`{increment, observe}`-shaped client (StatsD, Prometheus push, OTel) onto a
+`breakwater.audit.decision` counter tagged `{action, decision}` and a
+`breakwater.audit.duration_seconds` histogram tagged `{action}` whenever an
+event carries a finite `detail.durationSeconds`. `combineAuditSinks(...)`
+fans one `AuditLogger` out to several sinks at once — e.g. metrics alongside
+flowsafe's Queues → SIEM export — running every sink per event and
+aggregating failures instead of letting one sink's error skip the rest.
 
 Write-approval grants are minted by flowsafe's approval queue: an approved
 request's connector ids are derived into

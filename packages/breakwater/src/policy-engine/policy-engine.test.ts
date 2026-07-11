@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 import type { MastraDBMessage } from '@mastra/core/agent/message-list';
 import { MessageList } from '@mastra/core/agent/message-list';
 import {
@@ -317,10 +318,14 @@ describe('PolicyEngine constructor validation (K2)', () => {
   });
 
   it('does not throw when phases is left to its own default (both)', () => {
-    // #given — channels excludes answer, but phases was never narrowed
+    // #given — channels excludes answer, but phases was never narrowed. A
+    // reasoning-only policy pins the K2 guard ALONE: an object-only policy
+    // would additionally trip the D1 audit-sink guard (see the D1 cases
+    // below), so use reasoning to isolate K2 — it must NOT reject a
+    // defaulted-phases policy merely because channels exclude answer.
     const policy: PolicyEvaluator = {
-      name: 'object-only',
-      channels: ['object'],
+      name: 'reasoning-only',
+      channels: ['reasoning'],
       evaluate: () => ({ allowed: true }),
     };
 
@@ -349,6 +354,34 @@ describe('PolicyEngine constructor validation (K2)', () => {
           policies: [denyPatterns(['x'], { phases: ['input'] })],
         }),
     ).not.toThrow();
+  });
+
+  it('rejects an object-only policy constructed without an audit sink (D1)', () => {
+    // #given — channels include 'object' but not 'answer': zero result-phase
+    // coverage AND no sink to carry the one-time warning, so the gap is silent
+    const policy: PolicyEvaluator = {
+      name: 'object-only',
+      channels: ['object'],
+      evaluate: () => ({ allowed: true }),
+    };
+
+    // #when / #then — fail closed at construction with a TypeError naming it
+    expect(() => new PolicyEngine({ policies: [policy] })).toThrow(
+      /object-only.*'object'.*without 'answer'.*audit sink/is,
+    );
+  });
+
+  it('allows an object-only policy when an audit sink is provided (D1)', () => {
+    // #given — the same policy, now with a sink to carry the one-time warning
+    const audit = new AuditLogger();
+    const policy: PolicyEvaluator = {
+      name: 'object-only',
+      channels: ['object'],
+      evaluate: () => ({ allowed: true }),
+    };
+
+    // #when / #then
+    expect(() => new PolicyEngine({ policies: [policy], audit })).not.toThrow();
   });
 });
 
@@ -660,8 +693,10 @@ describe('PolicyEngine output channels — streaming', () => {
     // #given — a cap that the CONCATENATION of the two snapshots would
     // exceed but the latest snapshot alone does not (partials are growing
     // snapshots of the same object, not deltas)
+    const audit = new AuditLogger();
     const engine = new PolicyEngine({
       policies: [maxTextLength(30, { channels: ['object'] })],
+      audit,
     });
     const state: Record<string, unknown> = {};
     const partial = objectChunk({ a: 'aaaaaaaaaa' });

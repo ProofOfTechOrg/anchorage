@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The per-run resume ledger: runKey (`${workflowId}:${runId}`, composed by
 // RunnerRuntime.#runKey) -> (stepKey -> times that step has been resumed).
 // The count is the grant-binding tie-breaker (RunLeg.resumeCount /

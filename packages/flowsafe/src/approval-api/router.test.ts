@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it } from 'vitest';
 
 import type { ApprovalRole } from './contract.js';
@@ -324,6 +325,49 @@ describe('createApprovalRouter', () => {
     expect(page[0]?.id).toBe(critical.id);
   });
 
+  it('composes status + orderBy=reviewer + limit — reviewer-ranked, status-filtered, then bounded', async () => {
+    // #given — two normals, a critical created LAST, and a fourth we approve so
+    // it leaves the open set
+    const { handle } = makeHandler({ allowCreate: true });
+    await createOne(handle, { ...CREATE_BODY, runId: 'acme_run-c1' });
+    await createOne(handle, { ...CREATE_BODY, runId: 'acme_run-c2' });
+    const critical = await createOne(handle, {
+      ...CREATE_BODY,
+      runId: 'acme_run-chot',
+      priority: 'critical',
+    });
+    const decided = await createOne(handle, {
+      ...CREATE_BODY,
+      runId: 'acme_run-cdone',
+    });
+    const decideResponse = await handle(
+      req(`/api/approvals/${decided.id}/decide`, {
+        body: { decision: 'approve' },
+        actor: { id: 'ray', role: 'reviewer' },
+      }),
+    );
+    expect(decideResponse?.status).toBe(200);
+
+    // #when — all three query params at once
+    const response = await handle(
+      req(
+        '/api/approvals?status=pending,claimed,escalated&orderBy=reviewer&limit=2',
+      ),
+    );
+    const page = (await response?.json()) as ApprovalRecord[];
+
+    // #then — reviewer order ranks the critical to the top BEFORE limit cuts to
+    // two, and the status filter keeps the approved record out of the page
+    expect(response?.status).toBe(200);
+    expect(page).toHaveLength(2);
+    expect(page[0]?.id).toBe(critical.id);
+    expect(
+      page.every((record) =>
+        ['pending', 'claimed', 'escalated'].includes(record.status),
+      ),
+    ).toBe(true);
+  });
+
   it('400s an unknown orderBy and the incoherent orderBy=reviewer + after combination', async () => {
     // #given
     const { handle } = makeHandler({ allowCreate: true });
@@ -537,5 +581,152 @@ describe('createApprovalRouter', () => {
     expect((await listed?.json()) as ApprovalRecord[]).toHaveLength(1);
     expect(got?.status).toBe(200);
     expect(((await got?.json()) as ApprovalRecord).id).toBe(record.id);
+  });
+});
+
+describe('createApprovalRouter triage filters', () => {
+  it('passes requestedBy through to the list filter', async () => {
+    // #given — HTTP create force-attributes requestedBy to the actor ('opal')
+    const { handle } = makeHandler({ allowCreate: true });
+    await createOne(handle);
+
+    // #when
+    const match = await handle(req('/api/approvals?requestedBy=opal'));
+    const miss = await handle(req('/api/approvals?requestedBy=ada'));
+
+    // #then
+    expect((await match?.json()) as ApprovalRecord[]).toHaveLength(1);
+    expect((await miss?.json()) as ApprovalRecord[]).toHaveLength(0);
+  });
+
+  it('passes createdBefore/createdAfter through as strict time bounds', async () => {
+    // #given — bounds far either side of the record's real clock stamp
+    const { handle } = makeHandler({ allowCreate: true });
+    await createOne(handle);
+
+    // #when / #then
+    const noneBefore = await handle(
+      req('/api/approvals?createdBefore=1990-01-01T00:00:00Z'),
+    );
+    expect((await noneBefore?.json()) as ApprovalRecord[]).toHaveLength(0);
+    const allAfter = await handle(
+      req('/api/approvals?createdAfter=1990-01-01T00:00:00Z'),
+    );
+    expect((await allAfter?.json()) as ApprovalRecord[]).toHaveLength(1);
+  });
+
+  it.each([
+    'createdBefore',
+    'createdAfter',
+  ])('400s an unparseable %s eagerly', async (field) => {
+    // #given
+    const { handle } = makeHandler();
+
+    // #when
+    const response = await handle(req(`/api/approvals?${field}=yesterday-ish`));
+
+    // #then
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toMatchObject({
+      error: expect.stringContaining(field),
+    });
+  });
+});
+
+describe('createApprovalRouter batch decide', () => {
+  const reviewer = { id: 'ray', role: 'reviewer' };
+
+  it('mounts POST /batch/decide always (it is decide fan-out, not create) and reports the envelope', async () => {
+    // #given — seed over HTTP with create enabled, then batch on a handler
+    // built the same way (allowCreate does not gate the batch route; both
+    // handlers here share nothing, so seed and decide use the same one)
+    const { handle } = makeHandler({ allowCreate: true });
+    const record = await createOne(handle);
+
+    // #when — one real id, one unknown
+    const response = await handle(
+      req('/api/approvals/batch/decide', {
+        body: { ids: [record.id, 'missing'], decision: 'approve' },
+        actor: reviewer,
+      }),
+    );
+
+    // #then — 200 with partial failure IN the envelope
+    expect(response?.status).toBe(200);
+    const envelope = (await response?.json()) as {
+      results: Array<{ id: string; ok: boolean; code?: string }>;
+      decided: number;
+      failed: number;
+    };
+    expect(envelope.decided).toBe(1);
+    expect(envelope.failed).toBe(1);
+    expect(envelope.results).toEqual([
+      expect.objectContaining({ id: record.id, ok: true }),
+      expect.objectContaining({ id: 'missing', ok: false, code: 'not-found' }),
+    ]);
+  });
+
+  it('is reachable when the create route is OFF (default posture)', async () => {
+    // #given
+    const { handle } = makeHandler();
+
+    // #when — empty queue, unknown id: proves routing, not creation
+    const response = await handle(
+      req('/api/approvals/batch/decide', {
+        body: { ids: ['missing'], decision: 'reject' },
+        actor: reviewer,
+      }),
+    );
+
+    // #then
+    expect(response?.status).toBe(200);
+    const envelope = (await response?.json()) as { failed: number };
+    expect(envelope.failed).toBe(1);
+  });
+
+  it('403s the whole batch for a non-reviewer role', async () => {
+    // #given
+    const { handle } = makeHandler();
+
+    // #when
+    const response = await handle(
+      req('/api/approvals/batch/decide', {
+        body: { ids: ['any'], decision: 'approve' },
+        actor: { id: 'vic', role: 'viewer' },
+      }),
+    );
+
+    // #then
+    expect(response?.status).toBe(403);
+  });
+
+  it('400s a malformed batch body', async () => {
+    // #given
+    const { handle } = makeHandler();
+
+    // #when — ids not an array
+    const notArray = await handle(
+      req('/api/approvals/batch/decide', {
+        body: { ids: 'oops', decision: 'approve' },
+        actor: reviewer,
+      }),
+    );
+    const emptyIds = await handle(
+      req('/api/approvals/batch/decide', {
+        body: { ids: [], decision: 'approve' },
+        actor: reviewer,
+      }),
+    );
+    const badDecision = await handle(
+      req('/api/approvals/batch/decide', {
+        body: { ids: ['x'], decision: 'maybe' },
+        actor: reviewer,
+      }),
+    );
+
+    // #then
+    expect(notArray?.status).toBe(400);
+    expect(emptyIds?.status).toBe(400);
+    expect(badDecision?.status).toBe(400);
   });
 });

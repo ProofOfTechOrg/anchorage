@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The token-verification seam is trusted-computing-base code: everything
 // here must fail CLOSED (verify to undefined), never to a default actor.
 // hmacVerifier is exercised against real crypto.subtle round-trips via

@@ -64,36 +64,21 @@ import type {
 } from '@cloudflare/workers-types';
 import { AuditLogger, D1RateLimitStore } from '@proofoftech/breakwater';
 
-import {
-  approvalGrantProvider,
-  createApprovalRouter,
-  createTenantResolver,
-  type TenantResolver,
-} from '@proofoftech/flowsafe/approval-api';
-import { createAuditQueueHandler } from '@proofoftech/flowsafe/audit-export';
+import { approvalGrantProvider } from '@proofoftech/flowsafe/approval-api';
 import {
   DurableObjectRunner,
-  purgeExpiredWorkflowRuns,
   purgeTenant,
   type RunnerRuntime,
   tenantOfRunId,
 } from '@proofoftech/flowsafe/do-runner';
 import {
   approvalStoreFactoryFor,
-  bearerActorAuthenticator,
   boolVar,
-  buildHostApprovalService,
-  createDoRunTopology,
-  createRunRouter,
-  type DoRunTopology,
+  createFlowsafeWorker,
   hmacVerifier,
-  maintenanceActor,
   numberVar,
   parseActorTokens,
   RunRouteError,
-  reconcileApprovalsOnStatusDetached,
-  runApprovalRetentionPurge,
-  runSlaSweepMaintenance,
   staticTokenVerifier,
   type TokenVerifier,
 } from '@proofoftech/flowsafe/host-kit';
@@ -228,13 +213,6 @@ export class ShowcaseRunner extends DurableObjectRunner<Env> {
   protected build(env: Env): RunnerRuntime {
     return defineWorkflows(env, this.tenantId);
   }
-}
-
-function json(payload: unknown, status = 200): Response {
-  return new Response(JSON.stringify(payload), {
-    status,
-    headers: { 'content-type': 'application/json' },
-  });
 }
 
 /**
@@ -401,53 +379,13 @@ async function chargeDemoBudget(env: Env, runId: string): Promise<void> {
   }
 }
 
-// The auth seam (parseActorTokens + bearerActorAuthenticator), the run routes
-// with their RBAC gate order, the DO-stub topology, and the approval-service
-// assembly live in src/host-kit, shared with the reference deploy template and
-// the dev backend so the security-sensitive pieces — the (suspendedAt,
-// resumeCount) capture, the self-decision guard, and the role gates — have a
-// single tested home. This host supplies only its bindings and the demo
-// budget charge.
-
-function runRouterFor(
-  env: Env,
-  resolve: TenantResolver,
-  topology: DoRunTopology,
-  waitUntil: (promise: Promise<unknown>) => void,
-) {
-  return createRunRouter({
-    workflows: SHOWCASE_MODULES.map((entry) => entry.meta),
-    resolve,
-    systemActorId: SYSTEM_ACTOR_ID,
-    start: async (workflowId, runId, inputData) => {
-      // Budget BEFORE the DO round-trip: a capped tenant must not consume DO
-      // CPU.
-      await chargeDemoBudget(env, runId);
-      return topology.start(workflowId, runId, inputData);
-    },
-    status: topology.status,
-    resume: async (workflowId, runId, body) => {
-      // Resumes are metered like starts: every attempt — including one that
-      // fails resumeSchema validation and leaves the run suspended — costs a
-      // DO round-trip plus a D1 snapshot read, so an uncharged resume would
-      // be an unbounded spend loop for an already-capped tenant. Queue
-      // DECISIONS stay uncharged, bounded by a different pair of facts:
-      // decide()'s one-shot CAS makes each approval record decidable exactly
-      // once, and a workflow's gate count is a small server-authored
-      // constant — a later gate's record is filed by the (uncharged)
-      // decision resume itself, so the uncharged multiplier is gates-per-run
-      // (2 at most today), never client-controlled.
-      await chargeDemoBudget(env, runId);
-      return topology.resume(workflowId, runId, body);
-    },
-    // D4 self-healing, waitUntil-detached — the shared host-kit wrapper owns
-    // the detach + reconcile-error logging.
-    reconcileApprovals: reconcileApprovalsOnStatusDetached(
-      SYSTEM_ACTOR_ID,
-      waitUntil,
-    ),
-  });
-}
+// The auth seam, the run routes with their RBAC gate order, the DO-stub
+// topology, the approval-service assembly, and the whole Worker pipeline
+// (createFlowsafeWorker) live in src/host-kit, shared with the reference
+// deploy template and the dev backend so the security-sensitive pieces — the
+// (suspendedAt, resumeCount) capture, the self-decision guard, and the role
+// gates — have a single tested home. This host supplies only its bindings,
+// its demo mounts, and the demo budget charge.
 
 /**
  * Maintenance runs on TWO cron expressions, dispatched on controller.cron so
@@ -462,97 +400,19 @@ function runRouterFor(
 const SWEEP_CRON = '*/15 * * * *';
 const PURGE_CRON = '7 * * * *';
 
-async function runPurgeMaintenance(env: Env, cron: string): Promise<void> {
-  let purged: number | undefined;
-  let demoTenantsPurged: string[] | undefined;
-  try {
-    purged = await purgeExpiredWorkflowRuns(env.DB, {
-      // allowZero: RUN_RETENTION_DAYS=0 means "purge terminal runs now".
-      ttlMs:
-        numberVar(env.RUN_RETENTION_DAYS, 30, 'RUN_RETENTION_DAYS', {
-          allowZero: true,
-        }) *
-        24 *
-        60 *
-        60 *
-        1000,
-    });
-  } catch (error) {
-    console.error(
-      JSON.stringify({
-        type: 'maintenance-error',
-        surface: 'retention-purge',
-        cron,
-        error: String(error),
-      }),
-    );
-  }
-  // Own try/catch, same isolation as the snapshot purge above: a failure in
-  // any one purge duty must never stop the others (D3, 2026-07-11 audit). The
-  // purge itself now lives in host-kit (2026-07-11 audit follow-up, FIX 5) —
-  // verbatim-shared with the deploy template instead of hand-copied.
-  const approvalsPurged = await runApprovalRetentionPurge({
-    store: approvalStoreFactoryFor(env.DB).system(),
-    retentionDays: env.APPROVAL_RETENTION_DAYS,
-    cron,
-  });
-  try {
-    // Expired demo sandboxes: complete offboarding per tenant (snapshots of
-    // ANY status — a visitor who closed the tab mid-approval left a
-    // suspended row the terminal-only retention purge can never reap — plus
-    // approvals). No R2 artifactStore here: the showcase's artifact bucket
-    // is in-memory. LIMIT-batched; the shrinking table is the durable cursor.
-    demoTenantsPurged = await purgeExpiredDemoTenants(env.DB, {
-      purgeTenantData: (tenantId) => purgeTenant(env.DB, { tenantId }),
-      // Wait out the JWT lifetime past expires_at: a refresh at the last live
-      // instant mints a token good until ~expires_at + jwtTtl, and purgeTenant
-      // deletes suspended rows. Without the grace, a visitor's still-valid
-      // token would find its own runs gone.
-      graceMs:
-        numberVar(env.DEMO_JWT_TTL_SECONDS, 3600, 'DEMO_JWT_TTL_SECONDS') *
-        1000,
-      limit: 25,
-    });
-  } catch (error) {
-    console.error(
-      JSON.stringify({
-        type: 'maintenance-error',
-        surface: 'demo-tenant-purge',
-        cron,
-        error: String(error),
-      }),
-    );
-  }
-  console.log(
-    JSON.stringify({
-      type: 'maintenance',
-      cron,
-      purged,
-      approvalsPurged,
-      demoTenantsPurged,
-    }),
-  );
-}
-
-const handler: ExportedHandler<Env> = {
-  async fetch(
-    request: CfRequest,
-    env: Env,
-    ctx: ExecutionContext,
-  ): Promise<Response> {
-    const url = new URL(request.url);
-
-    if (request.method === 'GET' && url.pathname === '/healthz') {
-      return json({ ok: true });
-    }
-
-    const waitUntil = (promise: Promise<unknown>) => ctx.waitUntil(promise);
-    const routed = request as unknown as Request;
-
-    // Public demo sign-in (no auth — it MINTS identity). Mounted only when
-    // configured; the kill switch 503s it. Provider selection runs only with
-    // the demo switched on: a half-set OAuth pair on a demo-off deployment is
-    // inert, so its config-error tripwire would be per-request noise.
+const worker = createFlowsafeWorker<Env>({
+  workflows: SHOWCASE_MODULES.map((entry) => entry.meta),
+  systemActorId: SYSTEM_ACTOR_ID,
+  buildVerifier,
+  crons: { sweep: SWEEP_CRON, purge: PURGE_CRON },
+  // The showcase's own mounts, in the order they always ran: the public demo
+  // sign-in first (no auth — it MINTS identity; the kill switch 503s it),
+  // then the self-service sandbox reset, which authenticates through the
+  // SAME resolve the API routers use.
+  preRoutes: async (request, env, _ctx, kit) => {
+    // Provider selection runs only with the demo switched on: a half-set
+    // OAuth pair on a demo-off deployment is inert, so its config-error
+    // tripwire would be per-request noise.
     if (env.DEMO_JWT_SECRET) {
       const oauthProvider = selectOAuthProvider(env);
       if (oauthProvider) {
@@ -572,103 +432,84 @@ const handler: ExportedHandler<Env> = {
             1000,
           purgeTenantData: (tenantId) => purgeTenant(env.DB, { tenantId }),
           disabled: demoDisabledOf(env),
-        })(routed);
+        })(request);
         if (authResponse) return authResponse;
       }
     }
-
-    const topology = createDoRunTopology(env.RUNNER);
-
-    // AUTHENTICATE FIRST, then construct (INV-2): the resolver binds the
-    // approval store to the verified actor's tenant before any service
-    // exists — there is no pre-auth store for a rushed fix to reach.
-    const resolve = createTenantResolver({
-      authenticate: bearerActorAuthenticator(buildVerifier(env)),
-      storeFactory: approvalStoreFactoryFor(env.DB),
-      buildService: (store) =>
-        buildHostApprovalService(store, {
-          systemActorId: SYSTEM_ACTOR_ID,
-          defaultSlaSeconds: numberVar(
-            env.APPROVAL_SLA_SECONDS,
-            4 * 60 * 60,
-            'APPROVAL_SLA_SECONDS',
-          ),
-          // This host's only topology-specific piece: decisions resume the
-          // run through its DO stub.
-          resumeRun: topology.resumeRecord,
-          queue: env.AUDIT_QUEUE,
-          waitUntil,
-        }),
-    });
-
     // Self-service sandbox reset (admin role + demo tenant only): the same
     // purge primitive as the reaper. Deliberately leaves run_count/demo_daily
     // alone — a reset must never refill the spend budget. (A future
     // budget-refill would extend this purgeTenantData arrow, nothing else.)
-    const resetResponse = await createDemoResetRouter({
-      resolve,
+    return createDemoResetRouter({
+      resolve: kit.resolve,
       isDemoTenant: (tenantId) => isDemoTenant(env.DB, tenantId),
       purgeTenantData: (tenantId) => purgeTenant(env.DB, { tenantId }),
-    })(routed);
-    if (resetResponse) return resetResponse;
-
-    const approvalResponse = await createApprovalRouter({ resolve })(routed);
-    if (approvalResponse) return approvalResponse;
-
-    const runResponse = await runRouterFor(
-      env,
-      resolve,
-      topology,
-      waitUntil,
-    )(routed);
-    if (runResponse) return runResponse;
-
-    return json({ error: 'not found' }, 404);
+    })(request);
   },
+  // Budget BEFORE the DO round-trip: a capped tenant must not consume DO CPU.
+  wrapStart: (start, env) => async (workflowId, runId, inputData) => {
+    await chargeDemoBudget(env, runId);
+    return start(workflowId, runId, inputData);
+  },
+  // Resumes are metered like starts: every attempt — including one that
+  // fails resumeSchema validation and leaves the run suspended — costs a
+  // DO round-trip plus a D1 snapshot read, so an uncharged resume would
+  // be an unbounded spend loop for an already-capped tenant. Queue
+  // DECISIONS stay uncharged, bounded by a different pair of facts:
+  // decide()'s one-shot CAS makes each approval record decidable exactly
+  // once, and a workflow's gate count is a small server-authored
+  // constant — a later gate's record is filed by the (uncharged)
+  // decision resume itself, so the uncharged multiplier is gates-per-run
+  // (2 at most today), never client-controlled.
+  wrapResume: (resume, env) => async (workflowId, runId, body) => {
+    await chargeDemoBudget(env, runId);
+    return resume(workflowId, runId, body);
+  },
+  // Expired demo sandboxes: complete offboarding per tenant (snapshots of
+  // ANY status — a visitor who closed the tab mid-approval left a
+  // suspended row the terminal-only retention purge can never reap — plus
+  // approvals). No R2 artifactStore here: the showcase's artifact bucket
+  // is in-memory. LIMIT-batched; the shrinking table is the durable cursor.
+  // Own try/catch (D3: a failure in any one purge duty must never stop the
+  // others) so the error surface stays 'demo-tenant-purge', not the
+  // composer's generic one.
+  extraPurgeDuties: async (env, cron) => {
+    try {
+      const demoTenantsPurged = await purgeExpiredDemoTenants(env.DB, {
+        purgeTenantData: (tenantId) => purgeTenant(env.DB, { tenantId }),
+        // Wait out the JWT lifetime past expires_at: a refresh at the last
+        // live instant mints a token good until ~expires_at + jwtTtl, and
+        // purgeTenant deletes suspended rows. Without the grace, a visitor's
+        // still-valid token would find its own runs gone.
+        graceMs:
+          numberVar(env.DEMO_JWT_TTL_SECONDS, 3600, 'DEMO_JWT_TTL_SECONDS') *
+          1000,
+        limit: 25,
+      });
+      return { demoTenantsPurged };
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          type: 'maintenance-error',
+          surface: 'demo-tenant-purge',
+          cron,
+          error: String(error),
+        }),
+      );
+      return {};
+    }
+  },
+});
 
-  async scheduled(
+const handler: ExportedHandler<Env> = {
+  fetch: (request: CfRequest, env: Env, ctx: ExecutionContext) =>
+    worker.fetch(request as unknown as Request, env, ctx),
+  scheduled: (
     controller: ScheduledController,
     env: Env,
     ctx: ExecutionContext,
-  ): Promise<void> {
-    // Dispatch on WHICH cron fired; an unrecognized expression (ops edited
-    // wrangler without updating the constants) runs both sequentially and
-    // logs — availability of both duties beats purity on a misconfig.
-    const sweep = () =>
-      runSlaSweepMaintenance({
-        store: approvalStoreFactoryFor(env.DB).system(),
-        systemActor: maintenanceActor(SYSTEM_ACTOR_ID),
-        queue: env.AUDIT_QUEUE,
-        cron: controller.cron,
-      });
-    if (controller.cron === SWEEP_CRON) {
-      ctx.waitUntil(sweep());
-    } else if (controller.cron === PURGE_CRON) {
-      ctx.waitUntil(runPurgeMaintenance(env, controller.cron));
-    } else {
-      console.error(
-        JSON.stringify({
-          type: 'config-error',
-          var: 'triggers.crons',
-          raw: controller.cron,
-          reason: 'unknown cron expression; running both maintenance surfaces',
-        }),
-      );
-      ctx.waitUntil(
-        sweep().then(() => runPurgeMaintenance(env, controller.cron)),
-      );
-    }
-  },
-
-  // Audit-export consumer (active only when the wrangler.jsonc `queues` block is
-  // uncommented): ships each batch to the SIEM collector; a failed export
-  // retries the batch, so nothing is acked unconfirmed.
-  async queue(batch: MessageBatch, env: Env): Promise<void> {
-    await createAuditQueueHandler({
-      endpoint: env.SIEM_ENDPOINT,
-      authHeader: env.SIEM_AUTH_HEADER,
-    })(batch);
-  },
+  ) => worker.scheduled(controller, env, ctx),
+  queue: (batch: MessageBatch, env: Env) => worker.queue(batch, env),
 };
 
 export default handler;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // @proofoftech/breakwater — Safety middleware for Mastra
 //
 // breakwater plugs into Mastra as processors and tool/workflow wrappers:
@@ -30,8 +31,13 @@ export type {
   AuditEvent,
   AuditLoggerOptions,
   AuditSink,
+  MetricsRecorder,
 } from './audit/index.js';
-export { AuditLogger } from './audit/index.js';
+export {
+  AuditLogger,
+  combineAuditSinks,
+  metricsAuditSink,
+} from './audit/index.js';
 export type {
   AtomicIdempotencyStore,
   ConnectorConfig,
@@ -61,9 +67,12 @@ export {
   InMemoryRateLimitStore,
 } from './connector-sdk/index.js';
 export type {
+  ClassifierPolicyOptions,
   CrossWorkflowIsolationOptions,
   NetworkEgressOptions,
   OutputChannel,
+  PiiSecretsDetectorId,
+  PiiSecretsOptions,
   PolicyContext,
   PolicyDecision,
   PolicyEngineOptions,
@@ -76,13 +85,16 @@ export type {
 } from './policy-engine/index.js';
 export {
   approvalRequired,
+  classifierPolicy,
   crossWorkflowIsolation,
   denyPatterns,
   extractMessageText,
   ISOLATION_SCOPE_CONTEXT_KEY,
   maxTextLength,
   networkEgress,
+  PII_SECRETS_DETECTOR_IDS,
   PolicyEngine,
+  piiSecrets,
   tenantIsolation,
   WORKFLOW_SCOPE_CONTEXT_KEY,
 } from './policy-engine/index.js';

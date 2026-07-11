@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Pure presentation logic for the dashboard — SLA math, queue ordering,
 // formatting. Kept out of the components so it runs under plain vitest with
 // no DOM, and the .tsx files stay declarative shells.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 import type { JSX } from 'react';
 
 import type { ApprovalMetrics } from '../approval-api/types.js';

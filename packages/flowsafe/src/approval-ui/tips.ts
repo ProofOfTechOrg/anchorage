@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Hover-tip copy for the dashboard's domain terms, rendered through the
 // InfoTip slot. One source so QueueView/DetailView/MetricsView never drift
 // and consumers can reuse the same explanations in their own surfaces.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Classic fetch-contract Durable Object (constructor(state, env) + fetch).
 // Deliberately NOT `extends DurableObject` from 'cloudflare:workers': the
 // classic contract needs no workers-only runtime import, so this module and

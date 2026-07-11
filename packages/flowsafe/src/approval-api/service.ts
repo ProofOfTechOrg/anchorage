@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // ApprovalService — the queue's business rules: role authorization, CAS
 // transitions, SLA escalation, audit emission, and the post-decision resume.
 //
@@ -10,6 +11,8 @@
 import type {
   ApprovalActor,
   ApprovalAuditSink,
+  ApprovalNotificationEvent,
+  ApprovalNotificationSink,
   ApprovalRole,
 } from './contract.js';
 import { APPROVAL_ROLES } from './contract.js';
@@ -25,8 +28,13 @@ import {
   type ApprovalMetrics,
   type ApprovalRecord,
   type ApprovalStatus,
+  approvalCursor,
+  type BatchDecideItem,
+  type BatchDecideResult,
   type CreateApprovalInput,
   type DecideResult,
+  MAX_APPROVAL_BATCH_DECIDE,
+  MAX_APPROVAL_LIST_LIMIT,
   OPEN_STATUSES,
   type ResumeOutcome,
 } from './types.js';
@@ -80,6 +88,15 @@ export interface ApprovalServiceOptions {
    * AuditLogger's own sink policy).
    */
   audit?: ApprovalAuditSink;
+  /**
+   * Notification transport seam — fired once per record actually CREATED
+   * (`created: true`; the idempotent re-observation of an already-open step
+   * never re-notifies). Fire-and-forget: a throwing or rejecting sink is
+   * contained and recorded to the audit sink as `approval.notify`/'error',
+   * never failing the create. See ApprovalNotificationSink (contract.ts) for
+   * the ctx.waitUntil convention on Workers hosts.
+   */
+  notify?: ApprovalNotificationSink;
   /** Applied when CreateApprovalInput.slaSeconds is absent. */
   defaultSlaSeconds?: number;
   /**
@@ -114,6 +131,7 @@ function isNonEmptyString(value: unknown): value is string {
 export class ApprovalService {
   readonly #store: TenantBoundApprovalStore;
   readonly #audit?: ApprovalAuditSink;
+  readonly #notify?: ApprovalNotificationSink;
   readonly #defaultSlaSeconds?: number;
   readonly #resumeRun?: (
     record: ApprovalRecord,
@@ -125,6 +143,7 @@ export class ApprovalService {
   constructor(options: ApprovalServiceOptions) {
     this.#store = options.store;
     this.#audit = options.audit;
+    this.#notify = options.notify;
     this.#defaultSlaSeconds = options.defaultSlaSeconds;
     this.#resumeRun = options.resumeRun;
     this.#allowSelfDecision = options.allowSelfDecision ?? false;
@@ -190,6 +209,23 @@ export class ApprovalService {
         },
       },
     );
+    // Only an actual insert notifies — the idempotent re-observation path
+    // (created: false) returns the EXISTING open record, which already
+    // notified when it entered the queue.
+    if (result.created) {
+      fireNotification(
+        this.#notify,
+        { type: 'created', record: result.record },
+        (reason) =>
+          this.#record(
+            actor,
+            'approval.notify',
+            `approval:${result.record.id}`,
+            'error',
+            { reason, detail: { tenantId: result.record.tenantId } },
+          ),
+      );
+    }
     return result;
   }
 
@@ -232,14 +268,7 @@ export class ApprovalService {
     actor: ApprovalActor,
   ): Promise<DecideResult> {
     this.#authorize(actor, CAN_REVIEW, 'approval.decide', `approval:${id}`);
-    if (input.decision !== 'approve' && input.decision !== 'reject') {
-      throw new InvalidApprovalInputError(
-        "decision must be 'approve' or 'reject'",
-      );
-    }
-    if (input.comment !== undefined && typeof input.comment !== 'string') {
-      throw new InvalidApprovalInputError('comment must be a string');
-    }
+    this.#assertDecisionInput(input);
     if (!this.#allowSelfDecision) {
       const existing = await this.#store.get(id);
       if (!existing) throw new UnknownApprovalError(id);
@@ -273,12 +302,81 @@ export class ApprovalService {
     this.#record(actor, 'approval.decide', `approval:${id}`, 'allowed', {
       detail: {
         decision: input.decision,
+        // Queue dwell time (created -> decided), in seconds. Feeds the
+        // generic durationSeconds histogram convention breakwater's
+        // metricsAuditSink observes — any emitter may adopt the field.
+        durationSeconds:
+          (Date.parse(now) - Date.parse(updated.createdAt)) / 1000,
         tenantId: updated.tenantId,
         workflowId: updated.workflowId,
         runId: updated.runId,
       },
     });
     return { record: updated, resume: await this.#resume(updated, actor) };
+  }
+
+  /**
+   * Triage fan-out: apply ONE decision to up to MAX_APPROVAL_BATCH_DECIDE
+   * records, each through the EXISTING decide() — per-record CAS, SoD,
+   * audit, and resume semantics untouched; the one-decision-per-suspension
+   * model is not widened. Partial success is the contract: each record's
+   * outcome (or typed failure) is reported in the envelope, never as a
+   * thrown error. Only record-INDEPENDENT failures reject the whole batch:
+   * the caller's role, malformed ids, the cap, and a malformed decision.
+   *
+   * Sequential, not Promise.all — preserves audit ordering and avoids
+   * hammering the store's CAS with concurrent writes (D1/DO contention);
+   * a batch is a reviewer clicking once, not a throughput path.
+   */
+  async decideBatch(
+    ids: readonly string[],
+    input: { decision: ApprovalDecision; comment?: string },
+    actor: ApprovalActor,
+  ): Promise<BatchDecideResult> {
+    this.#authorize(actor, CAN_REVIEW, 'approval.decide', 'approval');
+    if (!Array.isArray(ids) || ids.length === 0) {
+      throw new InvalidApprovalInputError(
+        'ids must be a non-empty array of approval ids',
+      );
+    }
+    if (!ids.every((id) => isNonEmptyString(id))) {
+      throw new InvalidApprovalInputError(
+        'every id must be a non-empty string',
+      );
+    }
+    // Order-preserving dedupe: deciding an id twice in one batch would
+    // guarantee a spurious per-record conflict for the duplicate.
+    const unique = [...new Set(ids)];
+    if (unique.length > MAX_APPROVAL_BATCH_DECIDE) {
+      throw new InvalidApprovalInputError(
+        `a batch may decide at most ${MAX_APPROVAL_BATCH_DECIDE} approvals (got ${unique.length} unique ids)`,
+      );
+    }
+    // Same validation decide() applies — hoisted so a malformed decision is
+    // one 400, not N identical per-record failures.
+    this.#assertDecisionInput(input);
+    const results: BatchDecideItem[] = [];
+    for (const id of unique) {
+      try {
+        const { record, resume } = await this.decide(id, input, actor);
+        results.push({ id, ok: true, record, resume });
+      } catch (error) {
+        results.push({
+          id,
+          ok: false,
+          error: errorMessage(error),
+          code: batchDecideErrorCode(error),
+        });
+      }
+    }
+    const decided = results.filter((item) => item.ok).length;
+    const failed = results.length - decided;
+    // Summary only — each decide() above already left its own per-record
+    // trail (allowed/denied), so this is the batch's one-line correlation.
+    this.#record(actor, 'approval.decide.batch', 'approval', 'allowed', {
+      detail: { requested: unique.length, decided, failed },
+    });
+    return { results, decided, failed };
   }
 
   /**
@@ -495,7 +593,7 @@ export class ApprovalService {
   ): void {
     if (!this.#audit) return;
     try {
-      this.#audit({
+      const outcome = this.#audit({
         actor,
         action,
         resource,
@@ -503,9 +601,33 @@ export class ApprovalService {
         reason: extra.reason,
         detail: extra.detail,
       });
+      // The sink may return a promise (a composed breakwater sink with an
+      // async member); a rejection must be contained here too or it becomes
+      // an unhandled rejection after the action already returned.
+      if (outcome instanceof Promise) {
+        outcome.catch(() => {
+          // Availability over export reliability — same policy as below.
+        });
+      }
     } catch {
       // Availability over export reliability (AuditLogger's own policy): a
       // crashing sink must not fail the approval action it records.
+    }
+  }
+
+  // Shared by decide() and decideBatch() — one home for the decision-shape
+  // rules, so the two surfaces can never drift on wording or strictness.
+  #assertDecisionInput(input: {
+    decision: ApprovalDecision;
+    comment?: string;
+  }): void {
+    if (input.decision !== 'approve' && input.decision !== 'reject') {
+      throw new InvalidApprovalInputError(
+        "decision must be 'approve' or 'reject'",
+      );
+    }
+    if (input.comment !== undefined && typeof input.comment !== 'string') {
+      throw new InvalidApprovalInputError('comment must be a string');
     }
   }
 
@@ -632,6 +754,42 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+// Maps a per-record decide() failure to BatchDecideItem.code — the same
+// classification errorResponse (router.ts) applies to thrown errors, kept as
+// data because a batch envelope has one HTTP status for N outcomes.
+function batchDecideErrorCode(error: unknown): BatchDecideItem['code'] {
+  if (error instanceof UnknownApprovalError) return 'not-found';
+  if (error instanceof ApprovalConflictError) return 'conflict';
+  if (error instanceof ApprovalAuthzError) return 'forbidden';
+  if (error instanceof InvalidApprovalInputError) return 'invalid';
+  return 'error';
+}
+
+// Containment for the notification seam (shared by create() and sweepSLA):
+// the sink is fire-and-forget — a sync throw is caught here, an async
+// rejection is caught on the returned promise — and either failure is
+// reported through the AUDIT sink (as `approval.notify`/'error') so the
+// evidence survives without the approval action ever failing. Deliberately
+// not awaited: hosts that must keep a transport alive past the response wrap
+// it in ctx.waitUntil themselves (see ApprovalNotificationSink).
+function fireNotification(
+  notify: ApprovalNotificationSink | undefined,
+  event: ApprovalNotificationEvent,
+  reportError: (reason: string) => void,
+): void {
+  if (!notify) return;
+  try {
+    const outcome = notify(event);
+    if (outcome) {
+      outcome.catch((error: unknown) =>
+        reportError(`notification sink rejected: ${errorMessage(error)}`),
+      );
+    }
+  } catch (error) {
+    reportError(`notification sink threw: ${errorMessage(error)}`);
+  }
+}
+
 /** Options for the cron-owned SLA sweep. */
 export interface SweepSLAOptions {
   /**
@@ -644,6 +802,14 @@ export interface SweepSLAOptions {
   audit?: ApprovalAuditSink;
   /** Fired for each record escalated. */
   onEscalation?: (record: ApprovalRecord) => void;
+  /**
+   * Notification transport seam — fired once per escalated record, alongside
+   * (not instead of) onEscalation: onEscalation is the hosts' structured-log
+   * hook, notify is the reviewer-facing transport. Same containment as
+   * ApprovalServiceOptions.notify: failures audit as `approval.notify`/'error'
+   * and never abort the sweep.
+   */
+  notify?: ApprovalNotificationSink;
   /** Injectable clock (tests, deterministic SLA math). */
   now?: () => Date;
 }
@@ -671,7 +837,7 @@ export async function sweepSLA(
   ): void => {
     if (!options.audit) return;
     try {
-      options.audit({
+      const outcome = options.audit({
         actor: options.systemActor,
         action,
         resource,
@@ -679,6 +845,13 @@ export async function sweepSLA(
         reason: extra.reason,
         detail: extra.detail,
       });
+      // Same promise containment as ApprovalService's #record: a composed
+      // sink's rejection must never surface as an unhandled rejection.
+      if (outcome instanceof Promise) {
+        outcome.catch(() => {
+          // Availability over export reliability — see below.
+        });
+      }
     } catch {
       // Availability over export reliability — a crashing sink must not
       // abort the sweep.
@@ -686,45 +859,73 @@ export async function sweepSLA(
   };
   const at = now();
   const nowIso = at.toISOString();
-  const open = await store.list({ status: ['pending', 'claimed'] });
   const escalated: ApprovalRecord[] = [];
-  for (const candidate of open) {
-    if (
-      candidate.slaDeadlineAt === undefined ||
-      Date.parse(candidate.slaDeadlineAt) > at.getTime()
-    ) {
-      continue;
-    }
-    const updated = await store.transition(
-      candidate.id,
-      ['pending', 'claimed'],
-      { status: 'escalated', escalatedAt: nowIso, updatedAt: nowIso },
-    );
-    // null = lost a race (decided or escalated concurrently) — skip quietly.
-    if (!updated) continue;
-    escalated.push(updated);
-    record('approval.escalate', `approval:${updated.id}`, 'allowed', {
-      reason: `SLA deadline ${updated.slaDeadlineAt} breached`,
-      // tenantId attributes the escalation: a cross-tenant sweep without it
-      // emits unattributable audit events.
-      detail: {
-        tenantId: updated.tenantId,
-        workflowId: updated.workflowId,
-        runId: updated.runId,
-      },
+  // D3: page the cross-tenant open set with an explicit cursor instead of one
+  // unbounded SELECT (the system view is deliberately un-defaulted, so a bare
+  // list() here would be the whole table). Keyset paging is on (createdAt, id);
+  // escalating a record only drops it from the pending/claimed filter and never
+  // changes its cursor position, so every currently-open record is visited
+  // exactly once — no skips, no repeats — and every breach as of `at` still
+  // escalates regardless of where it sits in FIFO order.
+  let after: string | undefined;
+  for (;;) {
+    const page = await store.list({
+      status: ['pending', 'claimed'],
+      limit: MAX_APPROVAL_LIST_LIMIT,
+      after,
     });
-    if (options.onEscalation) {
-      try {
-        options.onEscalation(updated);
-      } catch (error) {
-        // The hook is notification-only; a crashing notifier must not
-        // abort the sweep. The audit trail keeps the evidence.
-        record('approval.escalate', `approval:${updated.id}`, 'error', {
-          reason: `onEscalation threw: ${errorMessage(error)}`,
-          detail: { tenantId: updated.tenantId },
-        });
+    for (const candidate of page) {
+      if (
+        candidate.slaDeadlineAt === undefined ||
+        Date.parse(candidate.slaDeadlineAt) > at.getTime()
+      ) {
+        continue;
       }
+      const updated = await store.transition(
+        candidate.id,
+        ['pending', 'claimed'],
+        { status: 'escalated', escalatedAt: nowIso, updatedAt: nowIso },
+      );
+      // null = lost a race (decided or escalated concurrently) — skip quietly.
+      if (!updated) continue;
+      escalated.push(updated);
+      record('approval.escalate', `approval:${updated.id}`, 'allowed', {
+        reason: `SLA deadline ${updated.slaDeadlineAt} breached`,
+        // tenantId attributes the escalation: a cross-tenant sweep without it
+        // emits unattributable audit events.
+        detail: {
+          tenantId: updated.tenantId,
+          workflowId: updated.workflowId,
+          runId: updated.runId,
+        },
+      });
+      if (options.onEscalation) {
+        try {
+          options.onEscalation(updated);
+        } catch (error) {
+          // The hook is notification-only; a crashing notifier must not
+          // abort the sweep. The audit trail keeps the evidence.
+          record('approval.escalate', `approval:${updated.id}`, 'error', {
+            reason: `onEscalation threw: ${errorMessage(error)}`,
+            detail: { tenantId: updated.tenantId },
+          });
+        }
+      }
+      fireNotification(
+        options.notify,
+        { type: 'escalated', record: updated },
+        (reason) =>
+          record('approval.notify', `approval:${updated.id}`, 'error', {
+            reason,
+            detail: { tenantId: updated.tenantId },
+          }),
+      );
     }
+    // Full page ⇒ there may be more; cursor past the last row (FIFO order, so
+    // `after` is valid) and continue. Short page ⇒ done.
+    const last = page.at(-1);
+    if (page.length < MAX_APPROVAL_LIST_LIMIT || !last) break;
+    after = approvalCursor(last);
   }
   return escalated;
 }

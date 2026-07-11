@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The styling contract. approval-ui renders every visual primitive through
 // these slots, so an importer supplies their own design-system components
 // (Astryx, MUI, Chakra, …) via <ApprovalUIProvider>. A plain-HTML default
@@ -65,6 +66,24 @@ export interface TextFieldProps {
   /** Fires on Enter for single-line inputs. */
   onSubmit?: () => void;
 }
+export interface CheckboxProps {
+  /** Accessible label — reference the record (e.g. its title), not just "select". */
+  label: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  disabled?: boolean;
+}
+export interface SelectOption {
+  value: string;
+  label: string;
+}
+export interface SelectProps {
+  label: string;
+  value: string;
+  options: readonly SelectOption[];
+  onChange: (value: string) => void;
+  disabled?: boolean;
+}
 export interface MetadataListProps {
   children: ReactNode;
 }
@@ -124,6 +143,15 @@ export interface ApprovalUIComponents {
   Badge: (props: BadgeProps) => ReactNode;
   Banner: (props: BannerProps) => ReactNode;
   TextField: (props: TextFieldProps) => ReactNode;
+  /**
+   * OPTIONAL members (0.2.0 triage slots): a pre-triage adapter typed
+   * against the FULL interface keeps compiling without them, and the
+   * provider merge fills the gap from `htmlComponents` — so adding a slot
+   * stays a semver-minor, source-compatible change. The views consume the
+   * merged ResolvedApprovalUIComponents, where every slot is present.
+   */
+  Checkbox?: (props: CheckboxProps) => ReactNode;
+  Select?: (props: SelectProps) => ReactNode;
   MetadataList: (props: MetadataListProps) => ReactNode;
   MetadataItem: (props: MetadataItemProps) => ReactNode;
   Code: (props: CodeProps) => ReactNode;
@@ -132,6 +160,14 @@ export interface ApprovalUIComponents {
   InfoTip: (props: InfoTipProps) => ReactNode;
   Table: (props: TableProps) => ReactNode;
 }
+
+/**
+ * What the provider context always resolves to: every slot present —
+ * optional (post-1.0-additive) slots included, filled from `htmlComponents`
+ * by the merge. Views type against THIS; adapters type against
+ * ApprovalUIComponents (or a Partial of it).
+ */
+export type ResolvedApprovalUIComponents = Required<ApprovalUIComponents>;
 
 // ---- Plain-HTML default adapter -------------------------------------------
 // Semantic markup + `flowsafe-*` class hooks, no CSS. Functional out of the
@@ -171,7 +207,7 @@ function HtmlTable({
   );
 }
 
-export const htmlComponents: ApprovalUIComponents = {
+export const htmlComponents: ResolvedApprovalUIComponents = {
   Stack: ({ direction = 'vertical', gap = 'md', children }) => (
     <div
       className={`flowsafe-stack flowsafe-stack-${direction} flowsafe-gap-${gap}`}
@@ -261,6 +297,43 @@ export const htmlComponents: ApprovalUIComponents = {
       </div>
     );
   },
+  Checkbox: ({ label, checked, onChange, disabled }) => {
+    // useId associates the label with the control, like TextField.
+    const id = useId();
+    return (
+      <div className="flowsafe-field flowsafe-checkbox">
+        <input
+          id={id}
+          type="checkbox"
+          checked={checked}
+          disabled={disabled}
+          onChange={(event) => onChange(event.currentTarget.checked)}
+        />
+        <label htmlFor={id}>{label}</label>
+      </div>
+    );
+  },
+  Select: ({ label, value, options, onChange, disabled }) => {
+    const id = useId();
+    return (
+      <div className="flowsafe-field">
+        <label htmlFor={id}>{label}</label>
+        <select
+          id={id}
+          className="flowsafe-select"
+          value={value}
+          disabled={disabled}
+          onChange={(event) => onChange(event.currentTarget.value)}
+        >
+          {options.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      </div>
+    );
+  },
   MetadataList: ({ children }) => (
     <dl className="flowsafe-metadata">{children}</dl>
   ),
@@ -292,7 +365,8 @@ export const htmlComponents: ApprovalUIComponents = {
 
 // ---- Injection seam --------------------------------------------------------
 
-const ApprovalUIContext = createContext<ApprovalUIComponents>(htmlComponents);
+const ApprovalUIContext =
+  createContext<ResolvedApprovalUIComponents>(htmlComponents);
 
 export interface ApprovalUIProviderProps {
   /** Override any subset of slots; the rest fall back to `htmlComponents`. */
@@ -315,6 +389,6 @@ export function ApprovalUIProvider({
   );
 }
 
-export function useApprovalUIComponents(): ApprovalUIComponents {
+export function useApprovalUIComponents(): ResolvedApprovalUIComponents {
   return useContext(ApprovalUIContext);
 }

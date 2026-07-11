@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The token-verification seam identity flows through. Both routers accept an
 // `authenticate(request)`; bearerActorAuthenticator (bearer-auth.ts) extracts
 // the bearer token and delegates to a TokenVerifier:

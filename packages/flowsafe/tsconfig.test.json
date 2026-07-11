@@ -29,6 +29,8 @@
     // Imports the .tsx contract, which this workers-typed (jsx-free) program
     // cannot compile; the approval-ui UI test pass typechecks it instead.
     "src/approval-ui/components.test.ts",
+    // Imports FilterBar.tsx — same JSX-import exclusion as components.test.ts.
+    "src/approval-ui/filter-bar.test.ts",
     // Imports react-dom/client, which needs DOM types this workers-typed
     // program lacks; the approval-ui UI test pass typechecks it instead.
     "src/approval-ui/use-approval-dashboard.render.test.ts"

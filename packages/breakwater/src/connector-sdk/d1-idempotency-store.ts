@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // D1-backed AtomicIdempotencyStore — durable replay protection for
 // production connectors. Cross-isolate atomicity comes from the database:
 // reserve()'s INSERT ... ON CONFLICT DO NOTHING RETURNING admits exactly one
@@ -12,6 +13,7 @@ import type {
   IdempotencyRecord,
   IdempotencyReservation,
 } from './index.js';
+import { newToken } from './new-token.js';
 
 /** The subset of D1Database this store uses. */
 export interface IdempotencyDatabase {
@@ -28,6 +30,8 @@ interface IdempotencyRow {
   key: string;
   state: string;
   result: string | null;
+  /** Reservation lease token (audit D2); NULL on pre-token rows. */
+  token: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -60,6 +64,13 @@ function parseRecord(json: string | null): IdempotencyRecord {
   return JSON.parse(json) as IdempotencyRecord;
 }
 
+// The `token` column is added by both CREATE (fresh DBs) and a defensive
+// ALTER (pre-token DBs). Whichever runs second is a duplicate-column no-op;
+// swallow only that error so a real schema failure still surfaces.
+function isDuplicateColumn(error: unknown): boolean {
+  return error instanceof Error && /duplicate column/i.test(error.message);
+}
+
 export class D1IdempotencyStore implements AtomicIdempotencyStore {
   readonly #db: IdempotencyDatabase;
   readonly #table: string;
@@ -81,17 +92,19 @@ export class D1IdempotencyStore implements AtomicIdempotencyStore {
   async reserve(key: string): Promise<IdempotencyReservation> {
     await this.#ready();
     const nowIso = new Date(this.#now()).toISOString();
+    // The reservation lease: put()/release() CAS on it (audit D2).
+    const token = newToken();
     // The INSERT is the atomic claim: exactly one isolate gets the row.
     const claimed = await this.#db
       .prepare(
-        `INSERT INTO ${this.#table} (key, state, result, created_at, updated_at)
-         VALUES (?, 'pending', NULL, ?, ?)
+        `INSERT INTO ${this.#table} (key, state, result, token, created_at, updated_at)
+         VALUES (?, 'pending', NULL, ?, ?, ?)
          ON CONFLICT(key) DO NOTHING
          RETURNING key`,
       )
-      .bind(key, nowIso, nowIso)
+      .bind(key, token, nowIso, nowIso)
       .first<{ key: string }>();
-    if (claimed) return { state: 'reserved' };
+    if (claimed) return { state: 'reserved', token };
     const row = await this.#db
       .prepare(`SELECT * FROM ${this.#table} WHERE key = ?`)
       .bind(key)
@@ -109,32 +122,55 @@ export class D1IdempotencyStore implements AtomicIdempotencyStore {
     const staleBefore = new Date(this.#now() - this.pendingTtlMs).toISOString();
     if (row.updated_at >= staleBefore) return { state: 'pending' };
     // Stale-pending takeover (crash safety — a dead isolate must not poison
-    // the key forever): refresh updated_at under the same CAS shape; losing
-    // the takeover race means another isolate now holds the key. tookOver is
+    // the key forever): refresh updated_at AND rotate the lease token under
+    // the same CAS shape; losing the takeover race means another isolate now
+    // holds the key. Rotating the token is what closes audit D2: after this,
+    // the previous holder's token no longer matches, so its put()/release()
+    // become no-ops and cannot finalize or delete this new claim. tookOver is
     // reported (not just 'reserved') so the wrapper can raise a dedicated
     // audit signal — the "stale" holder was merely slow, not dead, whenever
     // pendingTtlMs was set too low relative to the real execute duration.
     const takenOver = await this.#db
       .prepare(
-        `UPDATE ${this.#table} SET updated_at = ?
+        `UPDATE ${this.#table} SET updated_at = ?, token = ?
          WHERE key = ? AND state = 'pending' AND updated_at < ?
          RETURNING key`,
       )
-      .bind(nowIso, key, staleBefore)
+      .bind(nowIso, token, key, staleBefore)
       .first<{ key: string }>();
     return takenOver
-      ? { state: 'reserved', tookOver: true }
+      ? { state: 'reserved', token, tookOver: true }
       : { state: 'pending' };
   }
 
-  async put(key: string, record: IdempotencyRecord): Promise<void> {
+  async put(
+    key: string,
+    record: IdempotencyRecord,
+    token?: string,
+  ): Promise<void> {
     await this.#ready();
     // Serialize before touching the row: a non-JSON-serializable result
     // throws here without corrupting state — the same JSON-safe posture as
-    // the flowsafe approval store. UPSERT so a put() without a live
-    // reservation still lands the record.
+    // the flowsafe approval store.
     const json = JSON.stringify(record);
     const nowIso = new Date(this.#now()).toISOString();
+    if (token !== undefined) {
+      // Owner-scoped finalize (audit D2 CAS): flip to 'done' ONLY if this
+      // lease still owns the row. A stale holder whose reservation was taken
+      // over matches no row and NO-OPs — it never overwrites the new holder's
+      // claim, and deliberately does NOT re-INSERT (it lost ownership). The
+      // token rotation on takeover is what makes the mismatch happen.
+      await this.#db
+        .prepare(
+          `UPDATE ${this.#table} SET state = 'done', result = ?, updated_at = ?
+           WHERE key = ? AND token = ?`,
+        )
+        .bind(json, nowIso, key, token)
+        .run();
+      return;
+    }
+    // Legacy get/put path (no reservation): UPSERT so a put() without a live
+    // reservation still lands the record.
     await this.#db
       .prepare(
         `INSERT INTO ${this.#table} (key, state, result, created_at, updated_at)
@@ -146,8 +182,21 @@ export class D1IdempotencyStore implements AtomicIdempotencyStore {
       .run();
   }
 
-  async release(key: string): Promise<void> {
+  async release(key: string, token?: string): Promise<void> {
     await this.#ready();
+    // Owner-scoped when a lease is supplied (audit D2 CAS): only the matching
+    // lease's pending row is dropped, so a taken-over stale holder cannot
+    // delete the new holder's claim. The state='pending' guard (both branches)
+    // preserves "release never deletes a done record".
+    if (token !== undefined) {
+      await this.#db
+        .prepare(
+          `DELETE FROM ${this.#table} WHERE key = ? AND state = 'pending' AND token = ?`,
+        )
+        .bind(key, token)
+        .run();
+      return;
+    }
     await this.#db
       .prepare(`DELETE FROM ${this.#table} WHERE key = ? AND state = 'pending'`)
       .bind(key)
@@ -180,10 +229,22 @@ export class D1IdempotencyStore implements AtomicIdempotencyStore {
           key TEXT PRIMARY KEY,
           state TEXT NOT NULL,
           result TEXT,
+          token TEXT,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         )`,
       )
       .run();
+    // Backfill the token column on a pre-token table (a local/spike DB created
+    // before audit D2). On a fresh table the CREATE already added it, so this
+    // ALTER is a duplicate-column no-op — swallow only that. Mirrors flowsafe's
+    // d1-store.ts additive-column idiom.
+    try {
+      await this.#db
+        .prepare(`ALTER TABLE ${this.#table} ADD COLUMN token TEXT`)
+        .run();
+    } catch (error) {
+      if (!isDuplicateColumn(error)) throw error;
+    }
   }
 }

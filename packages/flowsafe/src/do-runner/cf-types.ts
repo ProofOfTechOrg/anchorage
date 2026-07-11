@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Structural subsets of the Cloudflare Workers runtime types the DO runner
 // forwards (D1Database) or reads from (DurableObjectState).
 // @cloudflare/workers-types is a devDependency only — its types are ambient,
