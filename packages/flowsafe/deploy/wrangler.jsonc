@@ -44,6 +44,11 @@
     "APPROVAL_SLA_SECONDS": "14400",
     "RUN_RETENTION_DAYS": "30",
     "APPROVAL_RETENTION_DAYS": "30"
+    // Separation of duties is ON by default (the requester cannot decide their
+    // own request). A single-operator deployment can exempt one role so it can
+    // self-approve; any invalid value falls back to OFF. Leave unset to keep
+    // SoD fully on.
+    // "APPROVAL_ALLOW_SELF_DECISION": "admin"
     // Client-per-subdomain deployments: set the apex and every request to
     // <tenant>.<apex> is denied unless the token's VERIFIED tenant is that
     // tenant. Defense in depth over the tenant-bound stores (INV-2) — it

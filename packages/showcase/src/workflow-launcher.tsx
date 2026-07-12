@@ -183,7 +183,11 @@ export function WorkflowLauncher({
         />
       ) : null}
       {isLoading ? <Spinner label="Loading workflows…" /> : null}
-      <Grid columns={{ minWidth: 150 }} gap={2}>
+      <Grid
+        columns={{ minWidth: 150 }}
+        gap={2}
+        className="anchorage-launcher-grid"
+      >
         {workflows.map((w) => (
           <SelectableCard
             key={w.id}

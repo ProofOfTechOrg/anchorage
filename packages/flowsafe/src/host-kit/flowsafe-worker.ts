@@ -17,9 +17,11 @@ import type {
   ApprovalAuditEvent,
   ApprovalDatabase,
   ApprovalNotificationSink,
+  SelfDecisionPolicy,
   TenantResolver,
 } from '../approval-api/index.js';
 import {
+  APPROVAL_ROLES,
   createApprovalRouter,
   createTenantResolver,
 } from '../approval-api/index.js';
@@ -33,7 +35,7 @@ import {
   type DoRunTopology,
   type RunnerNamespaceLike,
 } from './do-run-topology.js';
-import { numberVar } from './env-vars.js';
+import { numberVar, selfDecisionPolicyVar } from './env-vars.js';
 import {
   approvalStoreFactoryFor,
   buildHostApprovalService,
@@ -63,6 +65,13 @@ export interface FlowsafeWorkerEnv {
   RUNNER: RunnerNamespaceLike;
   /** Default SLA seconds for new approvals (var; default 14400 = 4h). */
   APPROVAL_SLA_SECONDS?: string;
+  /**
+   * Separation-of-duties exemption (var). Unset or a `false` spelling = SoD on
+   * (default); `true` = every decider may self-decide; a comma-separated role
+   * list (e.g. `admin` or `admin,reviewer`) = only those roles. Any invalid
+   * value falls back to OFF (fail closed).
+   */
+  APPROVAL_ALLOW_SELF_DECISION?: string;
   /** Cron purges terminal run snapshots older than this (var; default 30; 0 = immediately). */
   RUN_RETENTION_DAYS?: string;
   /** Cron purges DECIDED approval records older than this (var; default 30; 0 = immediately). */
@@ -173,6 +182,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
     topology: DoRunTopology,
     waitUntil: (promise: Promise<unknown>) => void,
     notify: ApprovalNotificationSink | undefined,
+    selfDecision: SelfDecisionPolicy,
   ): TenantResolver => {
     const base = createTenantResolver({
       authenticate: bearerActorAuthenticator(config.buildVerifier(env)),
@@ -191,10 +201,22 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           queue: env.AUDIT_QUEUE,
           waitUntil,
           notify,
+          allowSelfDecision: selfDecision,
         }),
     });
     return config.wrapResolve ? config.wrapResolve(base, env) : base;
   };
+
+  // Parse ONCE per request: the enforcement (service) and the catalog echo
+  // (run-router) must read the SAME policy, or the SPA's "you may self-decide"
+  // hint could contradict the server's verdict. Roles are validated against
+  // APPROVAL_ROLES, so the { roles } branch is an ApprovalRole[] by construction.
+  const parseSelfDecision = (env: Env): SelfDecisionPolicy =>
+    selfDecisionPolicyVar(
+      env.APPROVAL_ALLOW_SELF_DECISION,
+      'APPROVAL_ALLOW_SELF_DECISION',
+      APPROVAL_ROLES,
+    ) as SelfDecisionPolicy;
 
   async function runPurgeMaintenance(env: Env, cron: string): Promise<void> {
     let purged: number | undefined;
@@ -266,7 +288,14 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         ctx.waitUntil(promise);
       const topology = createDoRunTopology(env.RUNNER);
       const notify = config.notify?.(env);
-      const resolve = buildResolve(env, topology, waitUntil, notify);
+      const selfDecision = parseSelfDecision(env);
+      const resolve = buildResolve(
+        env,
+        topology,
+        waitUntil,
+        notify,
+        selfDecision,
+      );
 
       if (config.preRoutes) {
         const preResponse = await config.preRoutes(request, env, ctx, {
@@ -283,6 +312,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         workflows: config.workflows,
         resolve,
         systemActorId: config.systemActorId,
+        selfDecision,
         start: config.wrapStart
           ? config.wrapStart(topology.start, env)
           : topology.start,

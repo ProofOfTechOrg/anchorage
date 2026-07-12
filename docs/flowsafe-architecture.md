@@ -90,8 +90,14 @@ lost ordinal turns an already-approved action into a silent no-op — an
 availability defect, not a confidentiality one.
 
 Separation of duties: `decide()` denies the requester deciding their own
-request (`requestedBy` is attributed server-side to the creating actor);
-deployments opt out only via the explicit `allowSelfDecision` service option.
+request (`requestedBy` is attributed server-side to the creating actor).
+Deployments opt out only via the explicit `allowSelfDecision` service option,
+which accepts `boolean | { roles }` — `true` exempts every decider, `{ roles }`
+exempts only the listed roles (a single-operator deployment sets e.g.
+`{ roles: ['admin'] }`). Composed hosts reach it through the
+`APPROVAL_ALLOW_SELF_DECISION` env var (a `false` spelling, a CSV of roles, or
+`true`; any invalid value falls back to OFF). A permitted self-decision is
+audited with `detail.selfDecision: true`.
 
 ## Multi-tenancy
 

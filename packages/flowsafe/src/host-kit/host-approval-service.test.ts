@@ -1,8 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { InMemoryApprovalStoreFactory } from '../approval-api/index.js';
-import { runApprovalRetentionPurge } from './host-approval-service.js';
+import type {
+  ApprovalActor,
+  SelfDecisionPolicy,
+} from '../approval-api/index.js';
+import {
+  ApprovalAuthzError,
+  InMemoryApprovalStoreFactory,
+} from '../approval-api/index.js';
+import {
+  buildHostApprovalService,
+  runApprovalRetentionPurge,
+} from './host-approval-service.js';
+
+const OPERATOR: ApprovalActor = {
+  id: 'opal',
+  role: 'operator',
+  tenantId: 'acme',
+};
+const ADMIN: ApprovalActor = { id: 'ada', role: 'admin', tenantId: 'acme' };
 
 describe('runApprovalRetentionPurge', () => {
   afterEach(() => {
@@ -64,5 +81,56 @@ describe('runApprovalRetentionPurge', () => {
 
     // #then
     expect(purged).toBe(1);
+  });
+});
+
+describe('buildHostApprovalService allowSelfDecision passthrough', () => {
+  function buildService(allowSelfDecision?: SelfDecisionPolicy) {
+    const store = new InMemoryApprovalStoreFactory().forTenant('acme');
+    return buildHostApprovalService(store, {
+      systemActorId: 'flowsafe-system',
+      // A benign resume topology: decide() calls #resume on approve, and a
+      // non-'suspended' summary means resumeRunWithRequeue queues nothing.
+      resumeRun: async (record) => ({ runId: record.runId, status: 'success' }),
+      allowSelfDecision,
+    });
+  }
+
+  async function adminRequestedRecordId(
+    service: ReturnType<typeof buildService>,
+  ): Promise<string> {
+    const { record } = await service.create(
+      {
+        workflowId: 'wf',
+        runId: 'acme_run-1',
+        title: 'self-request',
+        requestedBy: ADMIN.id,
+      },
+      OPERATOR,
+    );
+    return record.id;
+  }
+
+  it('forwards a role-scoped exemption so admin can self-decide', async () => {
+    // #given
+    const service = buildService({ roles: ['admin'] });
+    const id = await adminRequestedRecordId(service);
+
+    // #when
+    const result = await service.decide(id, { decision: 'approve' }, ADMIN);
+
+    // #then
+    expect(result.record.status).toBe('approved');
+  });
+
+  it('defaults to SoD ON when allowSelfDecision is unset', async () => {
+    // #given
+    const service = buildService();
+    const id = await adminRequestedRecordId(service);
+
+    // #when / #then — the requester (admin) is refused their own request
+    await expect(
+      service.decide(id, { decision: 'approve' }, ADMIN),
+    ).rejects.toBeInstanceOf(ApprovalAuthzError);
   });
 });

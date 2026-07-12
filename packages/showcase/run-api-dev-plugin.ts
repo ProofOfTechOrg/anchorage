@@ -18,6 +18,7 @@
 import { InMemoryStore } from '@mastra/core/storage';
 import type {
   ApprovalActor,
+  SelfDecisionPolicy,
   TenantBoundApprovalStore,
 } from '@proofoftech/flowsafe/approval-api';
 import {
@@ -46,6 +47,14 @@ const APPROVAL_BASE = '/api/approvals';
 
 /** Id for system-created approval records (tenant is bound per request). */
 const SYSTEM_ACTOR_ID = 'showcase-dev';
+
+/**
+ * Dev SoD exemption: admin may decide its own requests (so one operator drives
+ * product-launch's two gates alone). ONE source for both the service (enforce)
+ * and the run-router (echo canSelfDecide). Mirrors the deployed showcase's
+ * `APPROVAL_ALLOW_SELF_DECISION: "admin"` var.
+ */
+const DEV_SELF_DECISION: SelfDecisionPolicy = { roles: ['admin'] };
 
 // Same auth seam as the deployed worker, over the same demo tokens the UI's
 // ActorSwitcher offers — routed through parseActorTokens so dev exercises the
@@ -104,6 +113,10 @@ export function runApiDevPlugin(): Plugin {
     const service: ApprovalService = new ApprovalService({
       store,
       defaultSlaSeconds: 3600,
+      // Admin-scoped SoD exemption so `admin` can drive product-launch's two
+      // gates solo (matches the deployed showcase's APPROVAL_ALLOW_SELF_DECISION
+      // var). The reviewer lane still 403s on a self-request — SoD stays live.
+      allowSelfDecision: DEV_SELF_DECISION,
       resumeRun: resumeRunWithRequeue(
         resumeViaRuntime(runtime),
         () => service,
@@ -128,6 +141,9 @@ export function runApiDevPlugin(): Plugin {
     workflows: SHOWCASE_MODULES.map((entry) => entry.meta),
     resolve,
     systemActorId: SYSTEM_ACTOR_ID,
+    // Same policy the service enforces, so the catalog echo's canSelfDecide
+    // matches (admin => true, others => false).
+    selfDecision: DEV_SELF_DECISION,
     start: (workflowId, runId, inputData) =>
       runtime.start(workflowId, { runId, inputData }),
     status: async (workflowId, runId) =>

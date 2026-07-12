@@ -198,7 +198,7 @@ Agentic workflows can read sensitive data, produce persuasive content, and write
 | Threat | Severity | Control |
 |---|---|---|
 | Unauthorized approval/rejection | High | RBAC + audit log |
-| Self-approval (requester decides own request) | High | Separation-of-duties default: `decide()` denies when decider == `requestedBy` (server-attributed); opt-out only via explicit `allowSelfDecision` |
+| Self-approval (requester decides own request) | High | Separation-of-duties default: `decide()` denies when decider == `requestedBy` (server-attributed); opt-out only via explicit `allowSelfDecision` (`boolean \| { roles }`, host env `APPROVAL_ALLOW_SELF_DECISION`, fail-closed to OFF), and a permitted self-decision is audited (`detail.selfDecision: true`) |
 | Approval decision tampering | High | Durable Object strongly consistent state |
 | Approval-grant forgery via requestContext injection | High | Trust boundary 6: grants minted only by trusted server-side code; requestContext never populated from client/model/tool input; `context.agent` never bypasses the grant check (forwardable) |
 | Secret leakage in logs | High | Secret resolver strips from event payloads |

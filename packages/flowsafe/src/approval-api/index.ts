@@ -20,6 +20,7 @@ export {
   BREAKWATER_ACTOR_KEY,
   BREAKWATER_APPROVED_CONNECTORS_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
+  DECIDER_ROLES,
   RUN_START_ROLES,
 } from './contract.js';
 // D1ApprovalStore itself is deliberately NOT exported: hosts obtain bound
@@ -44,12 +45,17 @@ export {
   createApprovalRouter,
   TCB_ONLY_CREATE_FIELDS,
 } from './router.js';
-export type { ApprovalServiceOptions, SweepSLAOptions } from './service.js';
+export type {
+  ApprovalServiceOptions,
+  SelfDecisionPolicy,
+  SweepSLAOptions,
+} from './service.js';
 export {
   ApprovalAuthzError,
   ApprovalConflictError,
   ApprovalService,
   InvalidApprovalInputError,
+  selfDecisionExempts,
   sweepSLA,
   UnknownApprovalError,
 } from './service.js';

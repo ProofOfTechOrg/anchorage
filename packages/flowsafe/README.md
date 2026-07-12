@@ -165,7 +165,10 @@ when the same step suspends again, the earlier approval is spent and the new
 suspension needs its own decision. Create a step-less approval for
 deliberately run-scoped standing grants. Self-approval (decider ==
 requester) is denied unless the service is constructed with
-`allowSelfDecision: true`. If a decision's
+`allowSelfDecision` — `true` exempts every decider, or `{ roles }` exempts
+only the listed roles (a single-operator deployment sets e.g.
+`{ roles: ['admin'] }`; composed hosts pass `APPROVAL_ALLOW_SELF_DECISION`).
+A permitted self-decision is audited with `detail.selfDecision: true`. If a decision's
 resume attempt fails (`resume.ok === false`), the decision is already
 durable — re-drive the run by POSTing its resume route with the record's
 `stepPath` and the `defaultResumeData` shape; grants re-derive from the

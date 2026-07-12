@@ -51,7 +51,7 @@ export const GLOSSARY = {
     'suspendedAt (epoch ms) plus resumeCount (per-step resume ordinal) name this exact suspension. Approvals bind to it, so a re-suspension needs a fresh decision.',
   resumeCount:
     'Runtime-owned resume counter per step: absent on a first suspension, 1 after the first resume. The collision-free tie-breaker for grants.',
-  sod: 'Whoever advanced a run into a gate cannot decide that request: the server answers 403, admins included. Each demo role is a distinct actor id, so switching works.',
+  sod: 'Whoever advanced a run into a gate cannot decide that request: the server answers 403. This demo relaxes the rule for admin only (so one operator can clear both product-launch gates alone); reviewer stays bound. Each role is a distinct actor id, so switching works.',
   runId:
     'Minted server-side as {tenantId}_{uuid}; a client-sent runId is rejected (400). The prefix makes snapshots, DOs, and grants tenant-disjoint by construction.',
   tenantIsolation:
@@ -92,11 +92,11 @@ export type GlossaryKey = keyof typeof GLOSSARY;
 
 export const ROLE_NOTES: Record<string, string> = {
   admin:
-    'Starts any workflow, including access-request, and decides approvals. Still blocked by separation of duties on requests it advanced itself.',
+    "Starts any workflow, including access-request, and decides approvals. This demo relaxes separation of duties for admin, so it can decide requests it advanced itself and clear product-launch's two gates alone.",
   operator:
     'Starts 4 of the 5 workflows and edits run inputs. Cannot claim or decide approvals; reviewing is reviewer/admin work.',
   reviewer:
-    'Cannot start runs. Claims, delegates, and decides approvals: the second pair of eyes this whole system exists for.',
+    'Cannot start runs. Claims, delegates, and decides approvals: the second pair of eyes this whole system exists for. Still bound by separation of duties, so it cannot decide a gate it advanced.',
   viewer:
     'Read-only. Sees runs, the queue, and metrics; every write it attempts returns 403.',
   builder:

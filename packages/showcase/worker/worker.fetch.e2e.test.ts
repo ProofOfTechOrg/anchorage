@@ -181,10 +181,13 @@ describe('showcase worker fetch(): auth composition', () => {
       actor: unknown;
       workflows: Array<{ id: string }>;
     };
+    // canSelfDecide is false here: the test env sets no
+    // APPROVAL_ALLOW_SELF_DECISION, so SoD is on and reviewer is not exempt.
     expect(body.actor).toEqual({
       id: 'rev-ray',
       role: 'reviewer',
       tenantId: 'demo',
+      canSelfDecide: false,
     });
     expect(body.workflows.map((entry) => entry.id)).toEqual([
       'gtm-outbound',
