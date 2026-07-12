@@ -203,20 +203,38 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           notify,
           allowSelfDecision: selfDecision,
         }),
+      // The resolver's canSelfDecide display hint reads the SAME policy the
+      // service enforces (passed to buildHostApprovalService above), so the
+      // /workflows echo can never contradict decide().
+      allowSelfDecision: selfDecision,
     });
     return config.wrapResolve ? config.wrapResolve(base, env) : base;
   };
 
-  // Parse ONCE per request: the enforcement (service) and the catalog echo
-  // (run-router) must read the SAME policy, or the SPA's "you may self-decide"
-  // hint could contradict the server's verdict. Roles are validated against
-  // APPROVAL_ROLES, so the { roles } branch is an ApprovalRole[] by construction.
-  const parseSelfDecision = (env: Env): SelfDecisionPolicy =>
-    selfDecisionPolicyVar(
-      env.APPROVAL_ALLOW_SELF_DECISION,
+  // Parse ONCE per deployment value, memoized by the RAW
+  // APPROVAL_ALLOW_SELF_DECISION string — NOT by env identity: a host mutates
+  // the same env object across values (unset -> 'admin' -> 'nonsense'), so an
+  // env-keyed cache would serve the first policy for all of them. The
+  // enforcement (service) and the catalog echo (run-router, via the resolver's
+  // canSelfDecide) must read the SAME policy, or the SPA's "you may
+  // self-decide" hint could contradict the server's verdict. Roles are
+  // validated against APPROVAL_ROLES, so the { roles } branch is an
+  // ApprovalRole[] by construction. selfDecisionPolicyVar never throws (garbage
+  // -> false + config-error log), so nothing thrown is cached; a policy is
+  // never undefined, so a get() miss unambiguously means "not yet computed".
+  const selfDecisionCache = new Map<string | undefined, SelfDecisionPolicy>();
+  const parseSelfDecision = (env: Env): SelfDecisionPolicy => {
+    const raw = env.APPROVAL_ALLOW_SELF_DECISION;
+    const cached = selfDecisionCache.get(raw);
+    if (cached !== undefined) return cached;
+    const policy = selfDecisionPolicyVar(
+      raw,
       'APPROVAL_ALLOW_SELF_DECISION',
       APPROVAL_ROLES,
     ) as SelfDecisionPolicy;
+    selfDecisionCache.set(raw, policy);
+    return policy;
+  };
 
   async function runPurgeMaintenance(env: Env, cron: string): Promise<void> {
     let purged: number | undefined;
@@ -312,7 +330,6 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         workflows: config.workflows,
         resolve,
         systemActorId: config.systemActorId,
-        selfDecision,
         start: config.wrapStart
           ? config.wrapStart(topology.start, env)
           : topology.start,

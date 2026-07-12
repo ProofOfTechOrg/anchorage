@@ -129,6 +129,10 @@ export function runApiDevPlugin(): Plugin {
     authenticate,
     storeFactory,
     buildService,
+    // Same SoD policy the service enforces, threaded through the resolver so
+    // the catalog echo's canSelfDecide (tenant.canSelfDecide) matches
+    // enforcement (admin => true, others => false).
+    allowSelfDecision: DEV_SELF_DECISION,
   });
   const approvalRouter = createApprovalRouter({
     resolve,
@@ -141,9 +145,6 @@ export function runApiDevPlugin(): Plugin {
     workflows: SHOWCASE_MODULES.map((entry) => entry.meta),
     resolve,
     systemActorId: SYSTEM_ACTOR_ID,
-    // Same policy the service enforces, so the catalog echo's canSelfDecide
-    // matches (admin => true, others => false).
-    selfDecision: DEV_SELF_DECISION,
     start: (workflowId, runId, inputData) =>
       runtime.start(workflowId, { runId, inputData }),
     status: async (workflowId, runId) =>

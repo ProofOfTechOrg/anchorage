@@ -40,13 +40,13 @@ import type {
 } from '../policy-engine/tool-policy.js';
 import {
   approvalRequired,
-  EGRESS_HOSTNAME_PATTERN,
+  assertEgressHostList,
   ISOLATION_SCOPE_CONTEXT_KEY,
   networkEgress,
 } from '../policy-engine/tool-policy.js';
 import { actorFromRequestContext } from '../rbac/index.js';
 import type { EgressFetchBase, EgressGuardedFetch } from './egress-fetch.js';
-import { egressFetch } from './egress-fetch.js';
+import { EgressDeniedError, egressFetch } from './egress-fetch.js';
 import { newToken } from './new-token.js';
 
 /** Permission manifest — what the connector declares about itself. */
@@ -481,13 +481,17 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     egress: Object.freeze([...(config.permissions.egress ?? [])]),
   });
 
-  for (const entry of manifest.egress ?? []) {
-    if (!EGRESS_HOSTNAME_PATTERN.test(entry)) {
-      throw new TypeError(
-        `connector ${id}: egress entry '${entry}' must be a bare hostname ('api.example.com') or wildcard ('*.example.com')`,
-      );
-    }
-  }
+  assertEgressHostList(
+    manifest.egress ?? [],
+    (entry) =>
+      `connector ${id}: egress entry '${entry}' must be a bare hostname ('api.example.com') or wildcard ('*.example.com')`,
+  );
+  // The runtime egress guard is call-invariant — declared egress and the base
+  // fetch are frozen at construction — so build it ONCE. Each call wraps it
+  // only to bind that call's requestContext for the denial audit.
+  const baseEgressGuard = egressFetch(manifest.egress ?? [], {
+    fetch: policies.fetch,
+  });
   if (manifest.idempotencyKey && !policies.idempotencyStore) {
     throw new TypeError(
       `connector ${id}: permissions.idempotencyKey requires policies.idempotencyStore (InMemoryIdempotencyStore works for dev/tests)`,
@@ -766,26 +770,34 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     const requestContext = context?.requestContext;
     const typedInput = inputData as TInput;
 
-    // Bound per call so denials audit under this call's requestContext.
-    // The org allowlist already gated the DECLARED egress list (the
-    // networkEgress evaluator below); this guard pins the connector's
-    // ACTUAL requests to that list — redirect hops included. No declared
-    // egress means the guard denies all network.
+    // The base egress guard is built once at construction; this per-call
+    // wrapper binds only this call's requestContext so an egress denial
+    // audits under it. The org allowlist already gated the DECLARED egress
+    // list (the networkEgress evaluator below); the guard pins the
+    // connector's ACTUAL requests to that list — redirect hops included. No
+    // declared egress means the guard denies all network. The denial audit
+    // fires here at the guard boundary, guaranteed even if the connector
+    // swallows the ConnectorPolicyError (recordExecuteError early-returns on
+    // this connector's own ConnectorPolicyError, so it is never re-recorded).
     const runtime: ConnectorRuntime = {
-      fetch: egressFetch(manifest.egress ?? [], {
-        fetch: policies.fetch,
-        denied: (denial) => {
-          record(requestContext, 'denied', {
-            reason: `egress-fetch: ${denial.reason}`,
-            detail: {
-              policy: 'egress-fetch',
-              host: denial.host,
-              hop: denial.hop,
-            },
-          });
-          return new ConnectorPolicyError(id, 'egress-fetch', denial.reason);
-        },
-      }),
+      fetch: async (input, init) => {
+        try {
+          return await baseEgressGuard(input, init);
+        } catch (error) {
+          if (error instanceof EgressDeniedError) {
+            record(requestContext, 'denied', {
+              reason: `egress-fetch: ${error.reason}`,
+              detail: {
+                policy: 'egress-fetch',
+                host: error.host,
+                hop: error.hop,
+              },
+            });
+            throw new ConnectorPolicyError(id, 'egress-fetch', error.reason);
+          }
+          throw error;
+        }
+      },
     };
 
     if (gates.length > 0) {

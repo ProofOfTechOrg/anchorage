@@ -8,6 +8,7 @@
 // (grants.ts) derives requestContext grants from approved records at
 // start/resume. Nothing here ever reads capability data from client input.
 
+import { tenantOwnsSaltedId } from '../do-runner/path-safe-id.js';
 import type {
   ApprovalActor,
   ApprovalAuditSink,
@@ -163,7 +164,7 @@ export class ApprovalService {
     record: ApprovalRecord,
     decision: ApprovalDecision,
   ) => Promise<unknown>;
-  readonly #selfDecisionExempts: (role: ApprovalRole) => boolean;
+  readonly #allowSelfDecision?: SelfDecisionPolicy;
   readonly #now: () => Date;
 
   constructor(options: ApprovalServiceOptions) {
@@ -172,8 +173,7 @@ export class ApprovalService {
     this.#notify = options.notify;
     this.#defaultSlaSeconds = options.defaultSlaSeconds;
     this.#resumeRun = options.resumeRun;
-    this.#selfDecisionExempts = (role) =>
-      selfDecisionExempts(options.allowSelfDecision, role);
+    this.#allowSelfDecision = options.allowSelfDecision;
     this.#now = options.now ?? (() => new Date());
   }
 
@@ -299,7 +299,7 @@ export class ApprovalService {
     // Role-scoped SoD: an exempt decider (allowSelfDecision: true, or a role
     // named in { roles }) skips the pre-read entirely; everyone else keeps
     // today's read-then-CAS self-request denial.
-    if (!this.#selfDecisionExempts(actor.role)) {
+    if (!selfDecisionExempts(this.#allowSelfDecision, actor.role)) {
       const existing = await this.#store.get(id);
       if (!existing) throw new UnknownApprovalError(id);
       // requestedBy is immutable after create, so read-then-CAS carries no
@@ -677,7 +677,7 @@ export class ApprovalService {
     // by parsing run_id), so a foreign-prefixed record would not leak — but it
     // would be an orphan row no tenant's queue ever shows. Turn it into a
     // loud error at the only write path.
-    if (!input.runId.startsWith(`${this.#store.tenantId}_`)) {
+    if (!tenantOwnsSaltedId(this.#store.tenantId, input.runId)) {
       throw new InvalidApprovalInputError(
         `runId '${input.runId}' does not carry this tenant's prefix '${this.#store.tenantId}_' — approvals bind to tenant-salted runs (INV-1)`,
       );

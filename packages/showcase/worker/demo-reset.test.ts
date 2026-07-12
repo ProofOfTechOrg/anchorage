@@ -36,6 +36,9 @@ function tenantContext(
     newThreadId: () => `${tenantId}_unused-thread`,
     newResourceId: (resourceKey: string) => `${tenantId}_${resourceKey}`,
     ownsMemoryId: (id: string) => id.startsWith(`${tenantId}_`),
+    // The reset route never reads this; a constant false satisfies the
+    // widened TenantContext interface.
+    canSelfDecide: () => false,
   };
 }
 

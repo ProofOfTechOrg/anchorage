@@ -131,8 +131,8 @@ export interface HostApprovalServiceOptions {
    * ApprovalServiceOptions.allowSelfDecision (ENFORCEMENT). Default OFF (SoD
    * on): the requester can never decide their own request. `{ roles: ['admin']
    * }` lets a single-operator deployment self-approve as admin. Pass the
-   * IDENTICAL value to the run-router's `selfDecision` so its `canSelfDecide`
-   * display hint matches what this actually enforces.
+   * IDENTICAL value to createTenantResolver's `allowSelfDecision` so the
+   * tenant's `canSelfDecide` display hint matches what this actually enforces.
    */
   allowSelfDecision?: SelfDecisionPolicy;
 }

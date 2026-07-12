@@ -432,6 +432,57 @@ describe('purgeTenant (complete offboarding)', () => {
     ).run();
   }
 
+  // The three agent-memory tables purgeTenant range-DELETEs in PARALLEL
+  // (Promise.all). Column names mirror the real @mastra/cloudflare-d1 schema
+  // mastra-schema-guard.test.ts pins: messages carry a NOT-NULL salted
+  // `thread_id` (their own `id` is unsalted by design), threads/resources key
+  // on a salted `id`.
+  function createMemoryTables(db: SqliteDatabase): void {
+    db.prepare(
+      `CREATE TABLE mastra_messages (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        resourceId TEXT
+      )`,
+    ).run();
+    db.prepare(
+      `CREATE TABLE mastra_threads (
+        id TEXT PRIMARY KEY,
+        resourceId TEXT
+      )`,
+    ).run();
+    db.prepare('CREATE TABLE mastra_resources (id TEXT PRIMARY KEY)').run();
+  }
+
+  function seedMessage(db: SqliteDatabase, id: string, threadId: string): void {
+    db.prepare(
+      'INSERT INTO mastra_messages (id, thread_id, resourceId) VALUES (?, ?, NULL)',
+    ).run(id, threadId);
+  }
+
+  function seedThread(db: SqliteDatabase, id: string): void {
+    db.prepare(
+      'INSERT INTO mastra_threads (id, resourceId) VALUES (?, NULL)',
+    ).run(id);
+  }
+
+  function seedResource(db: SqliteDatabase, id: string): void {
+    db.prepare('INSERT INTO mastra_resources (id) VALUES (?)').run(id);
+  }
+
+  function columnValues(
+    db: SqliteDatabase,
+    table: string,
+    column: string,
+  ): string[] {
+    const rows = (
+      db.prepare(
+        `SELECT ${column} AS value FROM ${table} ORDER BY ${column}`,
+      ) as unknown as { all(): Array<{ value: string }> }
+    ).all();
+    return rows.map((row) => row.value);
+  }
+
   it("reaps all three stores for the tenant and leaves the prefix-NEIGHBOR untouched ('abc' vs 'abcdefg')", async () => {
     // #given — snapshots of EVERY status for two tenants whose slugs share a
     // prefix (the range-exactness worst case), plus approvals and artifacts
@@ -691,6 +742,99 @@ describe('purgeTenant (complete offboarding)', () => {
     expect(purged.threads).toBe(0);
     expect(purged.messages).toBe(0);
     expect(purged.resources).toBe(0);
+  });
+
+  it('reaps REAL rows from all three memory tables under Promise.all, each range-exact against a prefix neighbor', async () => {
+    // #given — the three memory tables carrying target-tenant rows (salted
+    // ids: threads/resources by a salted `id`, messages by a salted
+    // `thread_id`) beside prefix-neighbor rows that straddle BOTH range bounds
+    // — 'abc5_…' ('5' 0x35 < '_' 0x5F, below the lower bound) and 'abcdefg_…'
+    // ('d' 0x64 > backtick 0x60, above the upper bound). Distinct per-table
+    // counts (messages 3 / threads 2 / resources 1) prove each CONCURRENT
+    // DELETE reports its OWN range's changes, not a shared or clobbered count.
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    createMemoryTables(sqlite);
+    for (const id of ['abc-m1', 'abc-m2', 'abc-m3']) {
+      seedMessage(sqlite, id, 'abc_thread-1');
+    }
+    seedMessage(sqlite, 'abc5-m1', 'abc5_thread-9');
+    seedMessage(sqlite, 'abcdefg-m1', 'abcdefg_thread-9');
+    for (const id of ['abc_thread-1', 'abc_thread-2']) {
+      seedThread(sqlite, id);
+    }
+    seedThread(sqlite, 'abc5_thread-9');
+    seedThread(sqlite, 'abcdefg_thread-9');
+    seedResource(sqlite, 'abc_user-1');
+    seedResource(sqlite, 'abc5_user-9');
+    seedResource(sqlite, 'abcdefg_user-9');
+
+    // #given (sanity) — the target rows are really present, so the concurrent
+    // deletes below are non-vacuous (unlike the missing-table pins this
+    // supplements, which take the isMissingTable branch and delete nothing)
+    expect(columnValues(sqlite, 'mastra_messages', 'thread_id').length).toBe(5);
+    expect(columnValues(sqlite, 'mastra_threads', 'id').length).toBe(4);
+    expect(columnValues(sqlite, 'mastra_resources', 'id').length).toBe(3);
+
+    // #when
+    const result = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
+
+    // #then — each concurrent DELETE reaped exactly its tenant's rows
+    expect(result.messages).toBe(3);
+    expect(result.threads).toBe(2);
+    expect(result.resources).toBe(1);
+
+    // #then — both prefix neighbors survive in EVERY table: the parallelized
+    // deletes stayed range-exact and never clobbered a neighbor
+    expect(columnValues(sqlite, 'mastra_messages', 'thread_id')).toEqual([
+      'abc5_thread-9',
+      'abcdefg_thread-9',
+    ]);
+    expect(columnValues(sqlite, 'mastra_threads', 'id')).toEqual([
+      'abc5_thread-9',
+      'abcdefg_thread-9',
+    ]);
+    expect(columnValues(sqlite, 'mastra_resources', 'id')).toEqual([
+      'abc5_user-9',
+      'abcdefg_user-9',
+    ]);
+  });
+
+  it('a genuine (non-missing-table) error in ONE memory DELETE rejects the whole purge — the missing-table tolerance never masks it', async () => {
+    // #given — all three memory tables with real rows (every leg has work to
+    // do), then a genuine D1_ERROR injected into exactly ONE leg's DELETE via
+    // the SAME seam the approvals-failure pin above uses. A D1_ERROR is NOT
+    // 'no such table', so the per-statement isMissingTable catch must RE-THROW
+    // it rather than swallow it — even though it fires inside the Promise.all.
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    seedRun(sqlite, { runId: 'abc_r1', status: 'suspended', updatedAt: NOW });
+    createMemoryTables(sqlite);
+    seedMessage(sqlite, 'abc-m1', 'abc_thread-1');
+    seedThread(sqlite, 'abc_thread-1');
+    seedResource(sqlite, 'abc_user-1');
+    const real = d1Like(sqlite);
+    const failing: SnapshotDatabase = {
+      prepare: (sql: string) => {
+        const statement = real.prepare(sql);
+        if (!sql.includes('DELETE FROM mastra_threads')) return statement;
+        return {
+          ...statement,
+          bind: () => ({
+            ...statement,
+            run: async () => {
+              throw new Error('D1_ERROR: network');
+            },
+          }),
+        };
+      },
+    };
+
+    // #when / #then — the first real error propagates out of Promise.all; the
+    // sibling legs' missing-table tolerance does not absorb it
+    await expect(purgeTenant(failing, { tenantId: 'abc' })).rejects.toThrow(
+      /D1_ERROR/,
+    );
   });
 
   it.each([

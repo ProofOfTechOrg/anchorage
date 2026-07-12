@@ -27,10 +27,7 @@
 
 import {
   type ApprovalActor,
-  DECIDER_ROLES,
   RUN_START_ROLES,
-  type SelfDecisionPolicy,
-  selfDecisionExempts,
   type TenantContext,
   TenantResolutionError,
   type TenantResolver,
@@ -73,17 +70,6 @@ export interface RunRouterOptions {
    * separation-of-duties check can never fire. Default: 'flowsafe-system'.
    */
   systemActorId?: string;
-  /**
-   * Separation-of-duties exemption policy. Pass the IDENTICAL value to
-   * `HostApprovalServiceOptions.allowSelfDecision` (createFlowsafeWorker wires
-   * both from one parse) — a mismatch only skews this display hint, never
-   * enforcement. The catalog echoes whether the authenticated caller may decide
-   * their OWN request (`actor.canSelfDecide`) so the SPA can drop its "the
-   * server will refuse your decision" hint for an exempt role. This is DISPLAY
-   * only; enforcement lives in ApprovalService.decide(). Absent => SoD on
-   * (`canSelfDecide: false`).
-   */
-  selfDecision?: SelfDecisionPolicy;
   /** Host topology: in-process runtime, or a DO stub fetch. */
   start: (
     workflowId: string,
@@ -227,14 +213,13 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
             role: actor.role,
             tenantId: actor.tenantId,
             // Display hint: whether THIS caller may decide its own request.
-            // Requires BOTH being a decider role AND being SoD-exempt — a
-            // non-decider can never self-decide (it cannot decide at all), so
-            // the hint never affirms a role the decide() gate would reject.
-            // Enforced server-side regardless (ApprovalService.decide); the SPA
-            // only uses this to suppress a now-false "you will be refused" hint.
-            canSelfDecide:
-              DECIDER_ROLES.includes(actor.role) &&
-              selfDecisionExempts(options.selfDecision, actor.role),
+            // The resolver built it — the DECIDER_ROLES guard plus the
+            // deployment's SoD policy, fed the SAME allowSelfDecision the
+            // service enforces — so the echo can only reflect the server's
+            // decide() verdict. The SPA uses it to suppress a now-false "you
+            // will be refused" hint. Enforced server-side regardless
+            // (ApprovalService.decide).
+            canSelfDecide: tenant.canSelfDecide(actor.role),
           },
         });
       }

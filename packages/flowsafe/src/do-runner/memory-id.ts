@@ -17,32 +17,22 @@
 // purge and every scoped query ride the salted thread_id/resourceId.
 
 import {
+  mintSaltedId,
   PATH_SAFE_ID_PATTERN,
-  RESERVED_TENANT_IDS,
-  TENANT_ID_PATTERN,
   tenantOfRunId,
+  tenantOwnsSaltedId,
 } from './path-safe-id.js';
-
-function assertTenantId(tenantId: string, caller: string): void {
-  if (!TENANT_ID_PATTERN.test(tenantId)) {
-    throw new Error(
-      `${caller}: tenantId '${tenantId}' violates INV-3 (^[a-z0-9]{3,32}$) — the prefix decode and range purge are only exact over that charset`,
-    );
-  }
-  if (RESERVED_TENANT_IDS.includes(tenantId)) {
-    throw new Error(
-      `${caller}: tenantId '${tenantId}' is reserved (the TCB's own audit identity) — refusing to mint memory ids for it`,
-    );
-  }
-}
 
 /** Mint a tenant-salted agent-memory threadId: `${tenantId}_${uuid}`. */
 export function mintThreadId(
   tenantId: string,
   mintUuid: () => string = () => crypto.randomUUID(),
 ): string {
-  assertTenantId(tenantId, 'mintThreadId');
-  return `${tenantId}_${mintUuid()}`;
+  // Pass mintUuid LAZILY (not mintUuid()): mintSaltedId validates the tenant
+  // BEFORE evaluating the suffix, so a caller-supplied uuid callback never runs
+  // (side effects) or throws (masking the INV-3/reserved rejection) for an
+  // invalid tenant.
+  return mintSaltedId(tenantId, mintUuid, 'mintThreadId');
 }
 
 /**
@@ -55,13 +45,12 @@ export function mintThreadId(
  * always the tenant boundary.
  */
 export function mintResourceId(tenantId: string, resourceKey: string): string {
-  assertTenantId(tenantId, 'mintResourceId');
   if (!PATH_SAFE_ID_PATTERN.test(resourceKey)) {
     throw new Error(
       `mintResourceId: resourceKey '${resourceKey}' must match PATH_SAFE_ID_PATTERN (RFC 3986 unreserved chars, 1-200 long, not '.' or '..')`,
     );
   }
-  return `${tenantId}_${resourceKey}`;
+  return mintSaltedId(tenantId, resourceKey, 'mintResourceId');
 }
 
 /**
@@ -75,11 +64,12 @@ export function tenantOfMemoryId(id: string): string | undefined {
 }
 
 /**
- * Exact ownership: `id.startsWith(`${tenantId}_`)` — exact for the same
- * INV-3 reason as run ownership (the delimiter cannot occur inside a
- * tenantId, so 'acme' can never own 'acmecorp_...'). Assert on EVERY memory
- * read/write path.
+ * Exact tenant ownership of a memory id — delegates to the ONE salted-id
+ * ownership predicate (`tenantOwnsSaltedId`) so memory and run ownership can
+ * never drift. Exact for the same INV-3 reason: the '_' delimiter cannot occur
+ * inside a tenantId, so 'acme' can never own 'acmecorp_...'. Assert on EVERY
+ * memory read/write path.
  */
 export function tenantOwnsMemoryId(tenantId: string, id: string): boolean {
-  return id.startsWith(`${tenantId}_`);
+  return tenantOwnsSaltedId(tenantId, id);
 }

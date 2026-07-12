@@ -17,6 +17,7 @@ import {
   ApprovalService,
   createTenantResolver,
   InMemoryApprovalStoreFactory,
+  type SelfDecisionPolicy,
 } from '../approval-api/index.js';
 import {
   InvalidRunRequestError,
@@ -89,7 +90,9 @@ interface HarnessOptions {
     body: unknown,
   ) => Promise<RunSummary>;
   reconcileApprovals?: RunRouterOptions['reconcileApprovals'];
-  selfDecision?: RunRouterOptions['selfDecision'];
+  // F9: feeds the resolver's allowSelfDecision now (the run-router no longer
+  // owns a selfDecision knob), driving the catalog's canSelfDecide echo.
+  selfDecision?: SelfDecisionPolicy;
 }
 
 function makeHarness(options: HarnessOptions = {}) {
@@ -117,12 +120,14 @@ function makeHarness(options: HarnessOptions = {}) {
     storeFactory: backend,
     buildService: (boundStore) => new ApprovalService({ store: boundStore }),
     newRunId: () => 'generated-run-id',
+    // F9: the SoD exemption policy now feeds the resolver, so the catalog echo
+    // reads tenant.canSelfDecide (the run-router no longer takes its own knob).
+    allowSelfDecision: options.selfDecision,
   });
   const handle = createRunRouter({
     workflows: WORKFLOWS,
     resolve,
     systemActorId: SYSTEM.id,
-    selfDecision: options.selfDecision,
     start:
       options.start ??
       (async (workflowId, runId, inputData) => {

@@ -70,3 +70,57 @@ export function tenantOfRunId(runId: string): string | undefined {
   const tenantId = runId.slice(0, separator);
   return TENANT_ID_PATTERN.test(tenantId) ? tenantId : undefined;
 }
+
+/**
+ * Exact tenant-salted ownership: `id.startsWith(`${tenantId}_`)`. Exact because
+ * TENANT_ID_PATTERN (INV-3) excludes '_' (0x5F) and backtick (0x60), so the
+ * FIRST '_' delimiter can never occur inside a tenantId — 'acme' can never own
+ * 'acmecorp_...'. The trailing '_' is load-bearing: it is the same delimiter the
+ * `[tid_, tid\x60)` range purge keys on, so dropping it would make 'acme' match
+ * 'acmecorp'. The ONE ownership predicate for runIds and memory ids.
+ */
+export function tenantOwnsSaltedId(tenantId: string, id: string): boolean {
+  return id.startsWith(`${tenantId}_`);
+}
+
+/**
+ * The MINT-path precondition: throws a GENERIC Error — the programmer-error
+ * contract, since a client never reaches a mint with a bad tenant — when
+ * `tenantId` fails TENANT_ID_PATTERN (INV-3) or names a RESERVED_TENANT_IDS
+ * identity. Deliberately NOT a TenantResolutionError: createTenantResolver owns
+ * that request-facing 403 contract; the mints are internal. Shared by every
+ * salted-id mint (runIds and memory ids).
+ */
+export function assertMintableTenantId(tenantId: string, caller: string): void {
+  if (!TENANT_ID_PATTERN.test(tenantId)) {
+    throw new Error(
+      `${caller}: tenantId '${tenantId}' violates INV-3 (^[a-z0-9]{3,32}$) — the prefix decode and range purge are only exact over that charset`,
+    );
+  }
+  if (RESERVED_TENANT_IDS.includes(tenantId)) {
+    throw new Error(
+      `${caller}: tenantId '${tenantId}' is reserved (the TCB's own audit identity) — refusing to mint a tenant-salted id for it`,
+    );
+  }
+}
+
+/**
+ * Mint a tenant-salted id `${tenantId}_${suffix}` after asserting the tenant is
+ * mintable. The single salted-id constructor shared by runIds and memory ids; a
+ * caller with its own suffix precondition (memory-id's PATH_SAFE resourceKey
+ * check) validates that BEFORE delegating here.
+ *
+ * The suffix may be a thunk (a uuid generator): it is evaluated ONLY after the
+ * tenant passes assertMintableTenantId, so a caller-supplied producer can never
+ * run its side effects — or throw and mask the INV-3/reserved rejection — for an
+ * invalid tenant. Callers with a callback MUST pass the function, not its call,
+ * or JS argument evaluation would defeat this ordering.
+ */
+export function mintSaltedId(
+  tenantId: string,
+  suffix: string | (() => string),
+  caller: string,
+): string {
+  assertMintableTenantId(tenantId, caller);
+  return `${tenantId}_${typeof suffix === 'function' ? suffix() : suffix}`;
+}

@@ -10,11 +10,21 @@
 
 import { mintResourceId, mintThreadId } from '../do-runner/memory-id.js';
 import {
+  mintSaltedId,
   RESERVED_TENANT_IDS,
   TENANT_ID_PATTERN,
+  tenantOwnsSaltedId,
 } from '../do-runner/path-safe-id.js';
-import type { ApprovalActor } from './contract.js';
-import type { ApprovalService } from './service.js';
+import {
+  type ApprovalActor,
+  type ApprovalRole,
+  DECIDER_ROLES,
+} from './contract.js';
+import {
+  type ApprovalService,
+  type SelfDecisionPolicy,
+  selfDecisionExempts,
+} from './service.js';
 import type { TenantBoundApprovalStore } from './tenant-brand.js';
 
 export interface TenantContext {
@@ -45,6 +55,14 @@ export interface TenantContext {
    * every memory read/write path; answer 404 on a foreign id.
    */
   ownsMemoryId(id: string): boolean;
+  /**
+   * Display hint only: whether THIS actor may decide its OWN request — true
+   * iff the actor holds a decider role AND the deployment's self-decision
+   * policy exempts that role. Enforcement stays in ApprovalService.decide();
+   * the GET /workflows echo reads this so the SPA can drop its "the server
+   * will refuse your decision" hint for an exempt role.
+   */
+  canSelfDecide(role: ApprovalRole): boolean;
 }
 
 /**
@@ -84,6 +102,13 @@ export interface CreateTenantResolverOptions {
   ) => ApprovalService;
   /** The uuid half of minted runIds. Default: crypto.randomUUID. */
   newRunId?: () => string;
+  /**
+   * The SoD exemption policy the resolver builds `canSelfDecide` from — pass
+   * the SAME value the host feeds ApprovalService so the display hint can
+   * never contradict the server's decide() verdict. Absent => SoD on
+   * (`canSelfDecide` false for every role).
+   */
+  allowSelfDecision?: SelfDecisionPolicy;
 }
 
 export function createTenantResolver(
@@ -122,15 +147,25 @@ export function createTenantResolver(
         );
         return service;
       },
-      newRunId: () => `${tenantId}_${mintUuid()}`,
-      ownsRun: (runId: string) => runId.startsWith(`${tenantId}_`),
+      // mintUuid passed LAZILY: mintSaltedId validates the tenant before
+      // evaluating it (a no-op guard here — the resolver already refused a bad
+      // tenant above — but it keeps the safe validate-then-mint idiom uniform).
+      newRunId: () => mintSaltedId(tenantId, mintUuid, 'newRunId'),
+      ownsRun: (runId: string) => tenantOwnsSaltedId(tenantId, runId),
       // Memory ids ride the same uuid seam as runIds so tests inject one
       // generator for both; mint* re-refuses reserved/non-INV-3 tenants,
       // a no-op here (this resolver already refused them above).
       newThreadId: () => mintThreadId(tenantId, mintUuid),
       newResourceId: (resourceKey: string) =>
         mintResourceId(tenantId, resourceKey),
-      ownsMemoryId: (id: string) => id.startsWith(`${tenantId}_`),
+      ownsMemoryId: (id: string) => tenantOwnsSaltedId(tenantId, id),
+      // Display hint, not enforcement: the DECIDER_ROLES guard means a
+      // non-decider never echoes true (it cannot decide at all), so the hint
+      // never affirms a role decide() would reject. Fed the SAME
+      // allowSelfDecision the service enforces (ApprovalService.decide).
+      canSelfDecide: (role: ApprovalRole) =>
+        DECIDER_ROLES.includes(role) &&
+        selfDecisionExempts(options.allowSelfDecision, role),
     };
   };
 }

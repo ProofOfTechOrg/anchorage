@@ -54,12 +54,26 @@ export interface NetworkEgressOptions {
 // allowlist line an admin believes is live (org), so both fail fast instead.
 export const EGRESS_HOSTNAME_PATTERN = /^(\*\.)?[a-z0-9][a-z0-9.-]*$/i;
 
-// 'API.x.com.' and 'api.x.com' are the same DNS name.
-function normalizeDomain(domain: string): string {
+/**
+ * 'API.x.com.' and 'api.x.com' are the same DNS name: lowercase, then strip a
+ * single trailing dot.
+ */
+export function normalizeDomain(domain: string): string {
   return domain.toLowerCase().replace(/\.$/, '');
 }
 
-function domainAllowed(domain: string, allowed: readonly string[]): boolean {
+/**
+ * Lower-level host match: exact hostname or a leading-'*.' wildcard on a label
+ * boundary (apex excluded). PRECONDITION: `domain` and every entry in
+ * `allowed` are ALREADY normalized (see normalizeDomain) — networkEgress and
+ * egressFetch normalize their allowlist ONCE at construction and call this per
+ * hop; egressDomainAllowed is the one-shot matcher that normalizes both sides
+ * for external callers.
+ */
+export function domainAllowed(
+  domain: string,
+  allowed: readonly string[],
+): boolean {
   for (const entry of allowed) {
     if (entry.startsWith('*.')) {
       // Keeping the leading dot in the suffix holds the label boundary:
@@ -77,12 +91,12 @@ function domainAllowed(domain: string, allowed: readonly string[]): boolean {
 }
 
 /**
- * Shared egress host matcher: exact hostnames and '*.wildcard' entries
- * (label-boundary safe, apex excluded), case/trailing-dot normalized on
- * both sides. The single source of match semantics for the declaration gate
- * (`networkEgress`) and the runtime guard (`egressFetch` in the connector
- * SDK) — what a manifest declares and what the guard enforces must never
- * drift.
+ * One-shot public wrapper: normalizes `domain` and every entry in
+ * `allowedDomains` (case/trailing-dot) then delegates to `domainAllowed` for
+ * the match. `networkEgress` and `egressFetch` call `domainAllowed` directly
+ * instead, each normalizing its own allowlist ONCE at construction; this
+ * wrapper is for barrel/external callers that just want a single normalized
+ * comparison without owning that memoization.
  */
 export function egressDomainAllowed(
   domain: string,
@@ -92,6 +106,24 @@ export function egressDomainAllowed(
     normalizeDomain(domain),
     allowedDomains.map(normalizeDomain),
   );
+}
+
+/**
+ * Validate an egress host list against EGRESS_HOSTNAME_PATTERN, throwing a
+ * TypeError for the first entry that is not a bare hostname or '*.' wildcard.
+ * `describe` builds each call site's exact message — networkEgress,
+ * egressFetch, and createConnector share one pattern but keep their own
+ * wording.
+ */
+export function assertEgressHostList(
+  hosts: readonly string[],
+  describe: (entry: string) => string,
+): void {
+  for (const entry of hosts) {
+    if (!EGRESS_HOSTNAME_PATTERN.test(entry)) {
+      throw new TypeError(describe(entry));
+    }
+  }
 }
 
 /**
@@ -107,25 +139,25 @@ export function egressDomainAllowed(
 export function networkEgress(
   options: NetworkEgressOptions,
 ): ToolPolicyEvaluator {
-  for (const entry of options.allowedDomains) {
-    if (!EGRESS_HOSTNAME_PATTERN.test(entry)) {
-      throw new TypeError(
-        `networkEgress: allowed domain '${entry}' must be a bare hostname ('api.example.com') or wildcard ('*.example.com'); there is no allow-all entry — omit the policy instead`,
-      );
-    }
-  }
+  assertEgressHostList(
+    options.allowedDomains,
+    (entry) =>
+      `networkEgress: allowed domain '${entry}' must be a bare hostname ('api.example.com') or wildcard ('*.example.com'); there is no allow-all entry — omit the policy instead`,
+  );
+  // Normalize the allowlist ONCE at construction and match the incoming value
+  // per call through the SAME lower-level matcher the runtime guard
+  // (egressFetch) uses — declared and enforced semantics cannot drift, and no
+  // allowlist re-normalization happens per call.
+  const normalizedAllow = options.allowedDomains.map(normalizeDomain);
   return {
     name: options.name ?? 'network-egress',
     evaluate({ egress }): PolicyDecision {
-      // Routed through the SAME exported matcher the runtime guard
-      // (egressFetch) uses, so declared and enforced semantics literally
-      // cannot drift. Declared lists are a handful of entries; the per-call
-      // re-normalization is negligible next to a single memoized map.
       for (const declared of egress) {
-        if (!egressDomainAllowed(declared, options.allowedDomains)) {
+        const normalizedDeclared = normalizeDomain(declared);
+        if (!domainAllowed(normalizedDeclared, normalizedAllow)) {
           return {
             allowed: false,
-            reason: `egress to ${normalizeDomain(declared)} is not in the allowed domains`,
+            reason: `egress to ${normalizedDeclared} is not in the allowed domains`,
           };
         }
       }
