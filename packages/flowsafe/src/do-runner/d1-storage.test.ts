@@ -453,6 +453,15 @@ describe('purgeTenant (complete offboarding)', () => {
       status: 'suspended',
       updatedAt: NOW,
     });
+    // Digit-suffixed neighbor: '5' (0x35) sorts BELOW '_' (0x5F), so this
+    // row is inside the broken range if the lower bound ever loses its
+    // trailing underscore ('abc' instead of 'abc_') — the letter neighbor
+    // above cannot catch that mutant (excluded by the upper bound alone).
+    seedRun(sqlite, {
+      runId: 'abc5_r1',
+      status: 'suspended',
+      updatedAt: NOW,
+    });
     const deletedArtifacts: string[] = [];
     const artifactStore = {
       deleteRun: async (workflowId: string, runId: string) => {
@@ -468,7 +477,7 @@ describe('purgeTenant (complete offboarding)', () => {
     });
 
     // #then — abc's rows (INCLUDING the suspended one the retention purge can
-    // never reap) are gone from all three stores; abcdefg survives intact
+    // never reap) are gone from all three stores; both neighbors survive
     expect(result).toEqual({
       snapshots: 2,
       threads: 0,
@@ -477,7 +486,7 @@ describe('purgeTenant (complete offboarding)', () => {
       approvals: 1,
       artifacts: 2,
     });
-    expect(remainingRunIds(sqlite)).toEqual(['abcdefg_r1']);
+    expect(remainingRunIds(sqlite)).toEqual(['abc5_r1', 'abcdefg_r1']);
     expect(deletedArtifacts.sort()).toEqual([
       'wf/abc_r-suspended',
       'wf/abc_r-terminal',

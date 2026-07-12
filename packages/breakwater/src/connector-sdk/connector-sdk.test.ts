@@ -1238,6 +1238,50 @@ describe('atomic idempotency (reserve path)', () => {
     ]);
   });
 
+  it('audits a keyed rate-limit store PRIMITIVE throw exactly once (wrapped, audit-once holds)', async () => {
+    // #given — nothing in the RateLimitStore contract requires Error
+    // instances; a primitive throw must not defeat the audit-once WeakSet
+    const audit = new AuditLogger();
+    const store = spyAtomicStore();
+    const { tool, execute } = makeConnector({
+      permissions: {
+        sideEffect: 'write',
+        idempotencyKey: true,
+        rateLimit: '5/min',
+      },
+      policies: {
+        audit,
+        idempotencyStore: store,
+        rateLimitStore: {
+          increment: () => {
+            // deliberately a bare string throw
+            throw 'counter backend down (primitive)';
+          },
+        },
+      },
+    });
+
+    // #when / #then — the caller receives an Error carrying the message
+    // (the primitive rides on `cause`), execute never ran
+    const failure = await run(
+      tool,
+      input,
+      makeContext({ idempotencyKey: 'k1' }),
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe('counter backend down (primitive)');
+    expect((failure as Error).cause).toBe('counter backend down (primitive)');
+    expect(execute).not.toHaveBeenCalled();
+    // #then — still exactly ONE audit record; no misattributed second
+    // 'execute threw' event
+    expect(audit.events()).toEqual([
+      expect.objectContaining({
+        decision: 'error',
+        detail: expect.objectContaining({ stage: 'rate-limit-store' }),
+      }),
+    ]);
+  });
+
   it('denies via approval before reserving', async () => {
     // #given
     const store = spyAtomicStore();

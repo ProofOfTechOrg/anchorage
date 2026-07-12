@@ -261,6 +261,10 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     };
     const abc = await seedTenant('abc');
     const xyz = await seedTenant('xyz');
+    // Digit-suffixed prefix neighbor: '5' (0x35) sorts below '_' (0x5F), so
+    // these rows fall INSIDE the broken range if the lower bound ever loses
+    // its trailing underscore — the exactness pin for the memory sweep.
+    const abc5 = await seedTenant('abc5');
     // The shared key produced DISJOINT rows — the leak class is closed by
     // construction, before any purge runs.
     expect(abc.threadId).not.toBe(xyz.threadId);
@@ -269,17 +273,21 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     // #when — offboard exactly one tenant
     const purged = await purgeTenant(snapshotDb(sqlite), { tenantId: 'abc' });
 
-    // #then — the counters name what left, and the OTHER tenant's memory
-    // survives intact and readable
+    // #then — the counters name what left (exactly abc's one row per
+    // table), and BOTH other tenants' memory survives intact and readable
     expect(purged.threads).toBe(1);
     expect(purged.messages).toBe(1);
     expect(purged.resources).toBe(1);
     const survivor = await memory.getThreadById({ threadId: xyz.threadId });
     expect(survivor?.id).toBe(xyz.threadId);
+    const neighbor = await memory.getThreadById({ threadId: abc5.threadId });
+    expect(neighbor?.id).toBe(abc5.threadId);
     const rows = sqlite
-      .prepare('SELECT thread_id FROM mastra_messages')
+      .prepare('SELECT thread_id FROM mastra_messages ORDER BY thread_id')
       .all() as { thread_id: string }[];
-    expect(rows.map((row) => row.thread_id)).toEqual([xyz.threadId]);
+    expect(rows.map((row) => row.thread_id)).toEqual(
+      [abc5.threadId, xyz.threadId].sort(),
+    );
   });
 
   it('InMemoryStore is unaffected by the guards (they pin the D1 adapter only)', () => {

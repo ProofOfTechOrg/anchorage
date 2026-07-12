@@ -34,8 +34,11 @@ export interface EgressResponseHeaders {
 
 /**
  * Response subset a guarded fetch resolves to — members every fetch
- * implementation provides. Connectors needing more (streaming body, clone)
- * cast to their own runtime's Response type.
+ * implementation provides. The guard returns the base fetch's response
+ * OBJECT untouched (it only reads status + the location header off
+ * intermediate 3xx hops), so a connector needing more (streaming body,
+ * clone) can safely cast back to its own runtime's Response type — the
+ * underlying value IS that Response, nothing is wrapped or consumed.
  */
 export interface EgressResponse {
   readonly status: number;

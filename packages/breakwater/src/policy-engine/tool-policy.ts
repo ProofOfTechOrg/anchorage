@@ -114,16 +114,18 @@ export function networkEgress(
       );
     }
   }
-  const allowed = options.allowedDomains.map(normalizeDomain);
   return {
     name: options.name ?? 'network-egress',
     evaluate({ egress }): PolicyDecision {
+      // Routed through the SAME exported matcher the runtime guard
+      // (egressFetch) uses, so declared and enforced semantics literally
+      // cannot drift. Declared lists are a handful of entries; the per-call
+      // re-normalization is negligible next to a single memoized map.
       for (const declared of egress) {
-        const domain = normalizeDomain(declared);
-        if (!domainAllowed(domain, allowed)) {
+        if (!egressDomainAllowed(declared, options.allowedDomains)) {
           return {
             allowed: false,
-            reason: `egress to ${domain} is not in the allowed domains`,
+            reason: `egress to ${normalizeDomain(declared)} is not in the allowed domains`,
           };
         }
       }

@@ -581,9 +581,18 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   // them as 'execute threw' when they propagate out through the attempt.
   const auditedErrors = new WeakSet<object>();
 
-  // WeakSet holds objects only; a primitive throw simply stays re-recordable.
-  function markAudited(error: unknown): void {
-    if (typeof error === 'object' && error !== null) auditedErrors.add(error);
+  // The WeakSet can only hold objects, so a primitive throw from a custom
+  // store is wrapped once (message preserved, original on `cause`) and the
+  // WRAPPER is what propagates — otherwise audit-once breaks and the same
+  // store crash records a second, misattributed 'execute threw' event.
+  function markAudited(error: unknown): unknown {
+    if (typeof error === 'object' && error !== null) {
+      auditedErrors.add(error);
+      return error;
+    }
+    const wrapped = new Error(errorMessage(error), { cause: error });
+    auditedErrors.add(wrapped);
+    return wrapped;
   }
 
   function recordExecuteError(
@@ -656,8 +665,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
         reason: `rate-limit store increment failed: ${errorMessage(error)}`,
         detail: { stage: 'rate-limit-store' },
       });
-      markAudited(error);
-      throw error;
+      throw markAudited(error);
     }
     if (count > rateLimit.limit) {
       deny(requestContext, 'rate-limit', `exceeded ${manifest.rateLimit}`);
@@ -887,8 +895,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
             // audited: joined twins rethrow it via joinInflight, and
             // recordExecuteError must not re-record it as 'execute threw'.
             recordStoreError(requestContext, 'reserve', error, key);
-            markAudited(error);
-            throw error;
+            throw markAudited(error);
           }
           if (reservation.state === 'replay') {
             return {
@@ -980,8 +987,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
           // safe and preserves replay protection for the retry. Marked
           // audited so joined twins do not re-record it (see reserve probe).
           recordStoreError(requestContext, 'get', error, key);
-          markAudited(error);
-          throw error;
+          throw markAudited(error);
         }
         if (cached) {
           return { kind: 'replay', result: cached.result as TOutput };

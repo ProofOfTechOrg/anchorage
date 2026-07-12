@@ -392,10 +392,12 @@ export async function purgeTenant(
   // 3. Agent-memory rows — the SAME exact range, over the salted ids the
   // memory-id chokepoint mints (threads/resources by id, messages by their
   // NOT-NULL thread_id; message ids themselves are unsalted by design).
-  // Children first so a mid-purge failure leaves threads re-sweepable, never
-  // messages whose range key is gone. A missing table reads as empty — the
-  // tables exist wherever createD1Storage ran (eager creation), but crafted
-  // test databases and non-D1Store hosts may not have them.
+  // Child-before-parent order is hygiene only, NOT load-bearing: messages
+  // range on their own thread_id column and Mastra declares no FK, so every
+  // table stays independently re-sweepable after a mid-purge failure in any
+  // order. A missing table reads as empty — the tables exist wherever
+  // createD1Storage ran (eager creation), but crafted test databases and
+  // non-D1Store hosts may not have them.
   const memoryPurges = [
     ['messages', 'mastra_messages', 'thread_id'],
     ['threads', 'mastra_threads', 'id'],
