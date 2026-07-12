@@ -50,7 +50,7 @@ export function useIntroTour(): IntroTour {
 
 const TOUR_BULLETS: readonly string[] = [
   'Launch a workflow. It runs its real steps and suspends at an approval gate within a couple of seconds.',
-  "Switch to reviewer and approve it. Separation of duties is server-enforced: whoever advanced the run into its gate can't decide it.",
+  "Switch to reviewer and approve it. Separation of duties is server-enforced: whoever advanced the run into its gate can't decide it. product-launch has two gates, so alternate reviewer and admin (or drive it all as admin, whom this demo lets self-decide).",
   'The approval derives a capability grant bound to that exact suspension, and the run resumes server-side behind four connector gates.',
   'Dangerous things are simulated (no live bindings); the machinery is real: grants, RBAC, tenant isolation, durable suspend/resume.',
 ];

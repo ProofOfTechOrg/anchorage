@@ -383,7 +383,12 @@ runtime — Mastra provides workflows, agents, memory, RAG, and observability.
   requestContext must never be populated from client input, model output,
   or tool results (`security-threat-model.md`, trust boundary 6).
   Separation of duties: `decide()` denies the requester deciding their own
-  request by default (`allowSelfDecision` is the explicit opt-out).
+  request by default. `allowSelfDecision` (`boolean | { roles }`; env
+  `APPROVAL_ALLOW_SELF_DECISION`, fail-closed to OFF) is the explicit opt-out —
+  `true` exempts every decider, `{ roles }` only the listed ones (the demo sets
+  `admin`, so one operator can clear product-launch's two gates alone); a
+  permitted self-decision is audited (`detail.selfDecision: true`), and the run
+  catalog echoes `actor.canSelfDecide`.
   Mastra-native `requireApproval` stays compiled purely as the agent pause
   UX — a per-call predicate that exempts dry-run requests (a simulation
   never reaches a side effect; runtime paths that evaluate it without a

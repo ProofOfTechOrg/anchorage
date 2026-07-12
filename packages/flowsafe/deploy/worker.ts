@@ -89,6 +89,13 @@ interface Env {
   APPROVAL_ACTOR_TOKENS?: string;
   /** Default SLA seconds for new approvals (var; default 14400 = 4h). */
   APPROVAL_SLA_SECONDS?: string;
+  /**
+   * Separation-of-duties exemption (var). Unset or a `false` spelling keeps SoD
+   * on (default); `true` lets every decider self-decide; a CSV of roles
+   * (e.g. `admin`) exempts only those — a single-operator deployment sets
+   * `admin`. Any invalid value falls back to OFF.
+   */
+  APPROVAL_ALLOW_SELF_DECISION?: string;
   /** Cron purges terminal run snapshots older than this (var; default 30; 0 = immediately). */
   RUN_RETENTION_DAYS?: string;
   /** Cron purges DECIDED (approved/rejected) approval records older than this (var; default 30; 0 = immediately). */

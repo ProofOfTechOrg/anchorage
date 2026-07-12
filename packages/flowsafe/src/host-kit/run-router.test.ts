@@ -89,6 +89,7 @@ interface HarnessOptions {
     body: unknown,
   ) => Promise<RunSummary>;
   reconcileApprovals?: RunRouterOptions['reconcileApprovals'];
+  selfDecision?: RunRouterOptions['selfDecision'];
 }
 
 function makeHarness(options: HarnessOptions = {}) {
@@ -121,6 +122,7 @@ function makeHarness(options: HarnessOptions = {}) {
     workflows: WORKFLOWS,
     resolve,
     systemActorId: SYSTEM.id,
+    selfDecision: options.selfDecision,
     start:
       options.start ??
       (async (workflowId, runId, inputData) => {
@@ -224,11 +226,17 @@ describe('createRunRouter — GET /workflows', () => {
     const response = await handle(req('/workflows', { actor: VIEWER }));
 
     // #then — the response carries the SERVER-derived identity; the SPA must
-    // never guess its own role from a local token table (fail-open)
+    // never guess its own role from a local token table (fail-open). With no
+    // exemption policy, canSelfDecide is false (SoD on).
     expect(response?.status).toBe(200);
     expect(await response?.json()).toEqual({
       workflows: [OPEN_FLOW, RESTRICTED_FLOW],
-      actor: { id: 'vic', role: 'viewer', tenantId: 'acme' },
+      actor: {
+        id: 'vic',
+        role: 'viewer',
+        tenantId: 'acme',
+        canSelfDecide: false,
+      },
     });
   });
 
@@ -246,6 +254,52 @@ describe('createRunRouter — GET /workflows', () => {
     });
     expect(await asReviewer?.json()).toMatchObject({
       actor: { id: 'ray', role: 'reviewer' },
+    });
+  });
+
+  it('echoes canSelfDecide from the deployment SoD exemption policy', async () => {
+    // #given — admin is exempt (the single-operator config)
+    const { handle } = makeHarness({ selfDecision: { roles: ['admin'] } });
+
+    // #when
+    const asAdmin = await handle(req('/workflows', { actor: ADMIN }));
+    const asReviewer = await handle(req('/workflows', { actor: REVIEWER }));
+    const asViewer = await handle(req('/workflows', { actor: VIEWER }));
+
+    // #then — only the exempt role echoes true; the SPA suppresses its
+    // "server will refuse" hint accordingly
+    expect(await asAdmin?.json()).toMatchObject({
+      actor: { role: 'admin', canSelfDecide: true },
+    });
+    expect(await asReviewer?.json()).toMatchObject({
+      actor: { role: 'reviewer', canSelfDecide: false },
+    });
+    expect(await asViewer?.json()).toMatchObject({
+      actor: { role: 'viewer', canSelfDecide: false },
+    });
+  });
+
+  it('never echoes canSelfDecide:true for a non-decider role, even if the policy names it', async () => {
+    // #given — a nonsensical policy exempting a role that cannot decide at all
+    const asBuilder = (
+      await makeHarness({ selfDecision: { roles: ['builder'] } }).handle(
+        req('/workflows', { actor: BUILDER }),
+      )
+    )?.json();
+    // #given — global `true` still cannot make a viewer a self-decider
+    const asViewer = (
+      await makeHarness({ selfDecision: true }).handle(
+        req('/workflows', { actor: VIEWER }),
+      )
+    )?.json();
+
+    // #then — the hint intersects DECIDER_ROLES, so it never affirms a role
+    // the decide() gate would reject regardless
+    expect(await asBuilder).toMatchObject({
+      actor: { role: 'builder', canSelfDecide: false },
+    });
+    expect(await asViewer).toMatchObject({
+      actor: { role: 'viewer', canSelfDecide: false },
     });
   });
 });

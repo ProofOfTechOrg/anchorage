@@ -54,6 +54,18 @@ export const RUN_START_ROLES: readonly ApprovalRole[] = [
 ];
 
 /**
+ * Roles permitted to DECIDE (claim/decide/delegate) an approval — the review
+ * gate `ApprovalService` enforces on every decision path. A strict subset of
+ * APPROVAL_ROLES; operator/builder run the system, viewer is read-only. The one
+ * source of truth: `ApprovalService`'s `CAN_REVIEW` IS this array, and a
+ * self-decision exemption is only meaningful for a role in it (a non-decider
+ * can never reach `decide()`, so exempting it from separation of duties is a
+ * no-op — the catalog's `canSelfDecide` echo intersects this set so the hint
+ * never affirms a role that could not decide anyway).
+ */
+export const DECIDER_ROLES: readonly ApprovalRole[] = ['reviewer', 'admin'];
+
+/**
  * The acting principal — breakwater's Actor shape plus the platform's tenant
  * dimension. breakwater stays tenant-agnostic (it is a standalone library);
  * flowsafe is the multi-tenant host, so ITS actor carries the tenant. The

@@ -70,3 +70,43 @@ export function boolVar(
   );
   return options.onInvalid;
 }
+
+/**
+ * Self-decision (separation-of-duties) exemption from an env var. Empty/absent
+ * or a `false` spelling => OFF (SoD stays on — the safe default). A `true`
+ * spelling => every decider may self-decide. A comma-separated role list
+ * (e.g. `admin` or `admin,reviewer`) => only those roles. ANY unrecognized
+ * token, or an empty list after splitting, logs a config-error and falls back
+ * to OFF — same fail-closed reading `boolVar` gives a garbled kill switch:
+ * a mistyped exemption must not silently widen who can self-approve.
+ *
+ * `validRoles` is passed in (rather than importing the approval-api role set)
+ * to keep this module dependency-free; callers pass APPROVAL_ROLES.
+ */
+export function selfDecisionPolicyVar(
+  raw: string | undefined,
+  name: string,
+  validRoles: readonly string[],
+): boolean | { roles: string[] } {
+  if (raw === undefined || raw === '') return false;
+  const value = raw.trim().toLowerCase();
+  if (TRUTHY.has(value)) return true;
+  if (FALSY.has(value)) return false;
+  const tokens = value
+    .split(',')
+    .map((token) => token.trim())
+    .filter(Boolean);
+  const roles = tokens.filter((token) => validRoles.includes(token));
+  if (roles.length === 0 || roles.length !== tokens.length) {
+    console.error(
+      JSON.stringify({
+        type: 'config-error',
+        var: name,
+        raw,
+        effective: false,
+      }),
+    );
+    return false;
+  }
+  return { roles };
+}

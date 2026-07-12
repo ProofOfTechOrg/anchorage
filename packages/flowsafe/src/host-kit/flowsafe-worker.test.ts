@@ -165,6 +165,35 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     expect(response?.status).toBe(401);
   });
 
+  it('threads APPROVAL_ALLOW_SELF_DECISION into the catalog canSelfDecide echo (fail-closed on garbage)', async () => {
+    // #given
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    const canSelfDecide = async (): Promise<boolean | undefined> => {
+      const response = await worker.fetch(
+        authed('http://host/workflows'),
+        env,
+        ctx,
+      );
+      const body = (await response.json()) as {
+        actor: { canSelfDecide?: boolean };
+      };
+      return body.actor.canSelfDecide;
+    };
+
+    // #when / #then — unset: SoD on, admin is not exempt
+    expect(await canSelfDecide()).toBe(false);
+
+    // #when / #then — exempt admin
+    env.APPROVAL_ALLOW_SELF_DECISION = 'admin';
+    expect(await canSelfDecide()).toBe(true);
+
+    // #when / #then — garbage falls back to OFF (fail closed)
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    env.APPROVAL_ALLOW_SELF_DECISION = 'nonsense';
+    expect(await canSelfDecide()).toBe(false);
+  });
+
   it('runs preRoutes after /healthz and before the routers, handing over resolve + topology', async () => {
     // #given
     let kitSeen: { resolve: unknown; topology: { start: unknown } } | undefined;

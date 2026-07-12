@@ -75,9 +75,12 @@ export async function ensureDemoSchema(db: DemoDatabase): Promise<void> {
   }
 }
 
-/** The four demo identities minted per visitor — DISTINCT ids, or decide()'s
- * self-approval check (requestedBy === actor.id) would 403 every decision
- * and the demo could never complete an approval. */
+/** The four demo identities minted per visitor — DISTINCT ids so the reviewer
+ * separation-of-duties lane stays demonstrable: a reviewer who advanced a run
+ * still gets a 403 on that gate, and switching to another decider clears it.
+ * admin is exempted from SoD via APPROVAL_ALLOW_SELF_DECISION (so it can drive
+ * product-launch's two gates alone); the distinct ids keep that a deliberate,
+ * per-role relaxation rather than a blanket one. */
 export const DEMO_TOKEN_ROLES: ReadonlyArray<{
   id: string;
   role: ApprovalRole;

@@ -16,6 +16,7 @@ import type {
   ApprovalAuditSink,
   ApprovalDatabase,
   ApprovalNotificationSink,
+  SelfDecisionPolicy,
   SystemApprovalStore,
   TenantBoundApprovalStore,
 } from '../approval-api/index.js';
@@ -125,6 +126,15 @@ export interface HostApprovalServiceOptions {
    * needing to outlive the response wrap themselves in the host's waitUntil.
    */
   notify?: ApprovalNotificationSink;
+  /**
+   * Separation-of-duties exemption, forwarded to
+   * ApprovalServiceOptions.allowSelfDecision (ENFORCEMENT). Default OFF (SoD
+   * on): the requester can never decide their own request. `{ roles: ['admin']
+   * }` lets a single-operator deployment self-approve as admin. Pass the
+   * IDENTICAL value to the run-router's `selfDecision` so its `canSelfDecide`
+   * display hint matches what this actually enforces.
+   */
+  allowSelfDecision?: SelfDecisionPolicy;
 }
 
 /**
@@ -156,6 +166,7 @@ export function buildHostApprovalService(
     defaultSlaSeconds: options.defaultSlaSeconds,
     audit,
     notify: options.notify,
+    allowSelfDecision: options.allowSelfDecision,
     resumeRun: resumeRunWithRequeue(
       options.resumeRun,
       () => service,
