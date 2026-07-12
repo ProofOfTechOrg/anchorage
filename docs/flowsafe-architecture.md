@@ -121,7 +121,9 @@ Tenant ids are allocated by the `tenants` registry (insert-or-fail) before any
 token naming them is issued. Offboarding is `purgeTenant(db, { tenantId })`,
 which reaps snapshot rows of *any* status — a visitor who abandons a run at an
 approval gate leaves a `suspended` row the terminal-only retention purge can
-never reap at any age — plus the tenant's approvals and R2 artifacts.
+never reap at any age — plus the tenant's agent-memory rows
+(threads/messages/resources, salted per `agent-memory-tenancy.md`), approvals,
+and R2 artifacts.
 
 ## React Dashboard
 

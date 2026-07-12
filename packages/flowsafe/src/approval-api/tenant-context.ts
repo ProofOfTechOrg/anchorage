@@ -8,6 +8,7 @@
 // the request FIRST (authenticate -> validate INV-3 -> bind), and everything
 // downstream reads tenant.service() / tenant.newRunId() / tenant.ownsRun().
 
+import { mintResourceId, mintThreadId } from '../do-runner/memory-id.js';
 import {
   RESERVED_TENANT_IDS,
   TENANT_ID_PATTERN,
@@ -26,6 +27,24 @@ export interface TenantContext {
   newRunId(): string;
   /** Exact ownership: `runId.startsWith(`${tenantId}_`)` — see INV-3. */
   ownsRun(runId: string): boolean;
+  /**
+   * Mint a tenant-salted agent-memory threadId: `${tenantId}_${uuid}` —
+   * the INV-1 carrier extended to Mastra memory
+   * (docs/agent-memory-tenancy.md). Hosts never accept a client-supplied
+   * threadId; this is the constructor.
+   */
+  newThreadId(): string;
+  /**
+   * Mint a tenant-salted agent-memory resourceId over the host's business
+   * key (a user id, a lead id): `${tenantId}_${resourceKey}`. Same key, two
+   * tenants, disjoint ids — the memory-leak class the salting closes.
+   */
+  newResourceId(resourceKey: string): string;
+  /**
+   * Exact ownership over memory ids (threadId or resourceId) — assert on
+   * every memory read/write path; answer 404 on a foreign id.
+   */
+  ownsMemoryId(id: string): boolean;
 }
 
 /**
@@ -105,6 +124,13 @@ export function createTenantResolver(
       },
       newRunId: () => `${tenantId}_${mintUuid()}`,
       ownsRun: (runId: string) => runId.startsWith(`${tenantId}_`),
+      // Memory ids ride the same uuid seam as runIds so tests inject one
+      // generator for both; mint* re-refuses reserved/non-INV-3 tenants,
+      // a no-op here (this resolver already refused them above).
+      newThreadId: () => mintThreadId(tenantId, mintUuid),
+      newResourceId: (resourceKey: string) =>
+        mintResourceId(tenantId, resourceKey),
+      ownsMemoryId: (id: string) => id.startsWith(`${tenantId}_`),
     };
   };
 }

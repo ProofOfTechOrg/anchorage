@@ -252,8 +252,18 @@ Consequences worth knowing:
 - **Offboarding is one call.** `purgeTenant(db, { tenantId, artifactStore })`
   (import from `@proofoftech/flowsafe/do-runner` or the package root)
   reaps snapshots of *any* status (a run abandoned at a gate is never eligible
-  for the terminal-only retention purge), the tenant's approval records, and
-  its R2 artifacts. Only purge tenants whose tokens have already expired.
+  for the terminal-only retention purge), the tenant's agent-memory rows
+  (threads/messages/resources — salted ids, same exact range predicate), the
+  tenant's approval records, and its R2 artifacts. Only purge tenants whose
+  tokens have already expired.
+- **Agent-memory ids are tenant-salted.** Mastra memory is keyed by
+  caller-chosen `threadId`/`resourceId`, which two tenants can legitimately
+  share. `TenantContext.newThreadId()`/`newResourceId(key)` (and the
+  underlying `mintThreadId`/`mintResourceId` from
+  `@proofoftech/flowsafe/do-runner`) are the only constructors: ids are
+  `${tenantId}_${suffix}`, ownership is an exact prefix check
+  (`ownsMemoryId`), and hosts never accept a client-supplied memory id. See
+  `docs/agent-memory-tenancy.md` for the feature-side obligations.
 
 ### Deployment & ops
 

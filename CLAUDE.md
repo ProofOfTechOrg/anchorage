@@ -133,8 +133,30 @@ consume as thin shells. Plus `pnpm docs:api` (typedoc), SPDX headers on every
 library src file (guarded by per-package `spdx.test.ts`), and a CI-run
 react-18 peer-floor probe (`typecheck:react18`).
 
+Pending-closeout batch (2026-07-12, branch `feat/pending-closeout`):
+breakwater grew fetch-level egress enforcement — `createConnector` hands
+`execute`/`dryRunExecute` a third `ConnectorRuntime` argument whose `fetch`
+(`egressFetch`, own module) pins ACTUAL requests — redirect hops included,
+manual per-hop checks, cross-origin credential-header stripping, one-shot
+stream bodies refuse 307/308 — to the manifest's declared egress (policy
+'egress-fetch'; empty manifest = no network; `egressDomainAllowed` is the
+one matcher shared with the declaration gate; `policies.fetch` injects the
+base; vendor SDKs with their own HTTP stack remain the documented
+declaration-only residual). flowsafe grew the agent-memory tenancy
+chokepoints (`docs/agent-memory-tenancy.md`; agents-with-memory is
+committed roadmap): `do-runner/memory-id.ts` mints
+(`mintThreadId`/`mintResourceId`/`tenantOfMemoryId`/`tenantOwnsMemoryId`),
+`TenantContext.newThreadId()/newResourceId()/ownsMemoryId()` (breaking for
+hand-built TenantContext literals), `purgeTenant` memory-table coverage +
+`PurgeTenantResult.{threads,messages,resources}`, schema-guard memory
+column pins + the two-tenant same-business-key adversarial case. The first
+memory FEATURE still owes: host-boundary id rejection, the recall-path
+proof, and a thread TTL (items 5–7 in the design doc). Plus: flowsafe's
+breakwater peer widened to `>=0.2.0 <1.0.0` (peer-escalation trap
+resolved).
+
 Verification gate: `pnpm lint && pnpm typecheck && pnpm test && pnpm build`
-(1119 tests; lint is ONE root Biome 2 pass, test is ONE root vitest run over
+(1119+ tests; lint is ONE root Biome 2 pass, test is ONE root vitest run over
 every package via `test.projects`). CI adds the full react-doctor gate
 (100/100 over `packages/showcase`, `--blocking warning`), the react-18
 peer-floor probe, and `spike:verify`.
@@ -180,11 +202,12 @@ runId prefix ownership check and the `[tid_, tid\x60)` range purge EXACT
 longer no-ops approved re-suspension resumes); `ISOLATION_SCOPE_CONTEXT_KEY` segments
 breakwater idempotency/rate-limit keys per tenant (no flag — absent scope keeps single-tenant
 keys; `tenantIsolation` evaluator denies scope-less calls incl. dry-run); `purgeTenant`
-offboards all three stores (any-status snapshots + approvals + artifacts;
+offboards every tenant-keyed store (any-status snapshots + agent-memory
+threads/messages/resources + approvals + artifacts;
 a missing snapshot table reads as empty so run-less tenants — expired demo
 sandboxes — still offboard, and artifacts of retention-purged runs are covered
 by that purge's own `artifactStore` pairing, not re-enumerable here); Mastra
-six-table-inventory + `run_id` schema guards; the R2 no-workflow-level-listing pin; identity
+six-table-inventory + `run_id`/memory-column schema guards; the R2 no-workflow-level-listing pin; identity
 via `TokenVerifier` (`staticTokenVerifier` + HS256 `hmacVerifier`; `ApprovalActor.tenantId`
 required; the `tenants` registry is the allocation authority — `RESERVED_FOR_ALLOCATION`
 denied at provisioning (infra slugs + `system` + `default`), `RESERVED_TENANT_IDS`
@@ -240,11 +263,13 @@ users); GitHub stays a config-only fallback.
   release-PR merge) is guarded by release.yml's tripwire: pending changeset
   files on main FAIL the publish loudly; merge the regenerated Version
   Packages PR and re-cut the release PR.
-- **Changesets peer-escalation trap:** a breakwater MINOR leaves flowsafe's
-  `^0.x` peer range, and changesets escalates an out-of-range peer dependent
-  to MAJOR (0.2.0 proposed flowsafe 1.0.0 under a "Minor Changes" heading).
-  Until the peer range is widened, override the version by editing the
-  Version Packages PR before merging it.
+- **Changesets peer-escalation trap (RESOLVED 2026-07-12):** a breakwater
+  MINOR leaving flowsafe's peer range made changesets escalate flowsafe to
+  MAJOR (0.2.0 proposed flowsafe 1.0.0). flowsafe's breakwater peer is now
+  `>=0.2.0 <1.0.0`, so breakwater 0.x minors stay in-range and no escalation
+  fires. The trap returns only if the range is re-narrowed (e.g. at
+  breakwater 1.0) — then override by editing the Version Packages PR before
+  merging it.
 - CI (`ci.yml`) runs on both `main` and `dev`, so the verification gate
   fires on every PR into the integration branch, not only at release time.
 

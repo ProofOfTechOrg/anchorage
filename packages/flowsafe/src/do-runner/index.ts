@@ -32,6 +32,14 @@ export type {
   InitSource,
 } from './init.js';
 export { init } from './init.js';
+// Agent-memory tenancy chokepoint (docs/agent-memory-tenancy.md): the only
+// constructors/decoders for salted threadId/resourceId values.
+export {
+  mintResourceId,
+  mintThreadId,
+  tenantOfMemoryId,
+  tenantOwnsMemoryId,
+} from './memory-id.js';
 export {
   PATH_SAFE_ID_PATTERN,
   TENANT_ID_PATTERN,
