@@ -200,6 +200,36 @@ function isOneShotBody(body: unknown): boolean {
   );
 }
 
+// Release a redirect response the loop is discarding. Manual following reads
+// only status + the Location header off each 3xx, then follows it or throws —
+// either way the caller never sees that response again, but its body is a live
+// stream over a connection (Node/Undici, workerd). Left unconsumed it keeps the
+// connection checked out until GC finalizes the stream, so sustained redirected
+// traffic can exhaust the pool and an unbounded 3xx body can stay live
+// indefinitely. cancel() releases the connection WITHOUT draining the body.
+// EgressResponse omits `body` (its consumers read only status + headers), so
+// the stream is reached structurally — the same discipline as isOneShotBody.
+// cancel() is best-effort and guarded on both axes: a conformant stream
+// cancel() rejects when locked/errored (swallowed via .catch), and an injected
+// vendor body (the policies.fetch transport seam) could supply a cancel() that
+// throws synchronously (swallowed via try/catch) — so disposal never masks the
+// real result or a propagating throw, nor surfaces as an unhandled rejection.
+function releaseResponse(response: EgressResponse): void {
+  const body = (response as { readonly body?: unknown }).body;
+  if (
+    typeof body !== 'object' ||
+    body === null ||
+    typeof (body as { cancel?: unknown }).cancel !== 'function'
+  ) {
+    return;
+  }
+  try {
+    Promise.resolve((body as { cancel(): unknown }).cancel()).catch(() => {});
+  } catch {
+    // cancel() threw synchronously; disposal is best-effort — nothing to do.
+  }
+}
+
 /**
  * Wrap a fetch so every request — redirect hops included — must resolve to
  * an allowed host (exact or `*.wildcard`, the same matcher as the
@@ -299,6 +329,14 @@ export function egressFetch(
       if (!REDIRECT_STATUSES.has(response.status)) return response;
       const location = response.headers.get('location');
       if (location === null) return response;
+      // Past here `response` is a redirect this loop consumes: every path below
+      // either follows the hop (reassigning `response`) or throws, so the caller
+      // never sees it again. Capture the one field the follow-up still needs,
+      // then release its body — the hop cap, a denied Location, the one-shot
+      // refusal, and the reassignment would each otherwise leak the discarded
+      // 3xx's connection.
+      const status = response.status;
+      releaseResponse(response);
       if (hop > maxRedirects) {
         throw new TypeError(`egressFetch: exceeded ${maxRedirects} redirects`);
       }
@@ -306,7 +344,7 @@ export function egressFetch(
       headers ??= new (requireGlobal<HeadersConstructor>('Headers'))(
         init?.headers,
       );
-      const nextMethod = redirectMethod(response.status, method);
+      const nextMethod = redirectMethod(status, method);
       if (nextMethod !== method) {
         body = null;
         for (const name of BODY_HEADER_NAMES) headers.delete(name);

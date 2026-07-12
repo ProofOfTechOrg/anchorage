@@ -9,13 +9,20 @@ import {
 
 // Plain structural response — breakwater's test tsconfig is lib-ES2022-only,
 // so mocks model the fetch surface the same way the guard's own types do.
-function stubResponse(status: number, headers: Record<string, string> = {}) {
+// `body` models the runtime Response body stream the guard cancels on
+// discarded redirect hops; omitted (undefined) for the common case.
+function stubResponse(
+  status: number,
+  headers: Record<string, string> = {},
+  body?: unknown,
+) {
   const lower = new Map(
     Object.entries(headers).map(([name, value]) => [name.toLowerCase(), value]),
   );
   return {
     status,
     headers: { get: (name: string) => lower.get(name.toLowerCase()) ?? null },
+    body,
   };
 }
 
@@ -324,6 +331,123 @@ describe('egressFetch redirect following', () => {
     // #then
     expect(response.status).toBe(302);
     expect(calls).toHaveLength(1);
+  });
+
+  it('cancels each intermediate redirect body but never the returned response', async () => {
+    // #given — an allowed hop then the final response; both carry a live body.
+    // Following must release the discarded 3xx's stream but leave the caller's
+    // response intact (the caller still reads it).
+    const hopCancel = vi.fn(() => Promise.resolve());
+    const finalCancel = vi.fn(() => Promise.resolve());
+    const { fn } = baseFetch(
+      stubResponse(302, { location: '/moved' }, { cancel: hopCancel }),
+      stubResponse(200, {}, { cancel: finalCancel }),
+    );
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+    // #when
+    const response = await guarded('https://api.example.com/start');
+    // #then
+    expect(response.status).toBe(200);
+    expect(hopCancel).toHaveBeenCalledTimes(1);
+    expect(finalCancel).not.toHaveBeenCalled();
+  });
+
+  it('cancels the redirect body when the hop cap is exceeded', async () => {
+    // #given — an endless loop; the throw path must still release the body it
+    // was about to discard (one release per 3xx read, the repeating stub)
+    const cancel = vi.fn(() => Promise.resolve());
+    const { fn } = baseFetch(
+      stubResponse(
+        302,
+        { location: 'https://api.example.com/loop' },
+        { cancel },
+      ),
+    );
+    const guarded = egressFetch(['api.example.com'], {
+      fetch: fn,
+      maxRedirects: 2,
+    });
+    // #when / #then
+    await expect(guarded('https://api.example.com/start')).rejects.toThrow(
+      /exceeded 2 redirects/,
+    );
+    expect(cancel).toHaveBeenCalledTimes(3);
+  });
+
+  it('cancels the redirect body when the next hop is denied', async () => {
+    // #given — a 302 to an undeclared host; the denial path must release the
+    // 3xx body it read the Location from
+    const cancel = vi.fn(() => Promise.resolve());
+    const { fn } = baseFetch(
+      stubResponse(
+        302,
+        { location: 'https://exfil.example.org/collect' },
+        { cancel },
+      ),
+    );
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+    // #when
+    await expect(
+      guarded('https://api.example.com/start'),
+    ).rejects.toBeInstanceOf(EgressDeniedError);
+    // #then
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels the redirect body when it refuses a one-shot stream re-send', async () => {
+    // #given — a 307 that would re-send a consumed stream; the refusal path
+    // must still release the 3xx body
+    const cancel = vi.fn(() => Promise.resolve());
+    const { fn } = baseFetch(
+      stubResponse(307, { location: '/retry' }, { cancel }),
+    );
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+    const streamBody = { getReader: () => ({}) };
+    // #when / #then
+    await expect(
+      guarded('https://api.example.com/things', {
+        method: 'POST',
+        body: streamBody,
+      }),
+    ).rejects.toThrow(/one-shot \(stream\) body/);
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('follows the redirect even if releasing the intermediate body rejects', async () => {
+    // #given — cancel() rejects (stream already errored); disposal is
+    // best-effort and must not surface as an unhandled rejection or fail the hop
+    const cancel = vi.fn(() => Promise.reject(new Error('already errored')));
+    const { fn } = baseFetch(
+      stubResponse(302, { location: '/moved' }, { cancel }),
+      stubResponse(200),
+    );
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+    // #when
+    const response = await guarded('https://api.example.com/start');
+    // #then — the rejected cancel is swallowed; the follow still succeeds
+    expect(response.status).toBe(200);
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('follows the redirect even if releasing the intermediate body throws synchronously', async () => {
+    // #given — an injected vendor fetch whose 3xx body has a cancel() that
+    // throws synchronously (a conformant stream would reject, not throw). The
+    // sync throw must be swallowed, never pre-empt the follow-through — else it
+    // would mask the real result, here aborting an otherwise-successful follow.
+    const cancel = vi.fn(() => {
+      throw new Error('already errored');
+    });
+    const { fn, calls } = baseFetch(
+      stubResponse(302, { location: '/moved' }, { cancel }),
+      stubResponse(200),
+    );
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+    // #when
+    const response = await guarded('https://api.example.com/start');
+    // #then — swallowed; the second hop fired and the follow reached 200
+    expect(response.status).toBe(200);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(calls).toHaveLength(2);
   });
 });
 
