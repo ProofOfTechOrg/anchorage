@@ -34,6 +34,22 @@ describe('mintThreadId', () => {
       expect(() => mintThreadId(tenantId)).toThrow(/INV-3|reserved/);
     }
   });
+
+  it('validates the tenant BEFORE invoking the uuid callback (no side effect, no masking throw)', () => {
+    // #given — the regression guard: mintThreadId used to pass mintUuid() in
+    // argument position, so the callback ran before the tenant was validated. A
+    // callback with side effects (or one that throws) must NOT run for an
+    // invalid or reserved tenant.
+    let calls = 0;
+    const mintUuid = () => {
+      calls += 1;
+      return 'uuid';
+    };
+    // #when / #then — rejected before the callback is ever reached
+    expect(() => mintThreadId('ACME', mintUuid)).toThrow(/INV-3/);
+    expect(() => mintThreadId('system', mintUuid)).toThrow(/reserved/);
+    expect(calls).toBe(0);
+  });
 });
 
 describe('mintResourceId', () => {

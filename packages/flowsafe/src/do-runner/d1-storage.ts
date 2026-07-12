@@ -391,33 +391,38 @@ export async function purgeTenant(
 
   // 3. Agent-memory rows — the SAME exact range, over the salted ids the
   // memory-id chokepoint mints (threads/resources by id, messages by their
-  // NOT-NULL thread_id; message ids themselves are unsalted by design).
-  // Child-before-parent order is hygiene only, NOT load-bearing: messages
-  // range on their own thread_id column and Mastra declares no FK, so every
-  // table stays independently re-sweepable after a mid-purge failure in any
-  // order. A missing table reads as empty — the tables exist wherever
-  // createD1Storage ran (eager creation), but crafted test databases and
-  // non-D1Store hosts may not have them.
+  // NOT-NULL thread_id; message ids themselves are unsalted by design). The
+  // three DELETEs run concurrently via Promise.all — child-before-parent order is
+  // non-load-bearing (messages range on their own thread_id column, Mastra
+  // declares no FK, every table independently re-sweepable after a mid-purge
+  // failure in any order), the memory[counter] writes hit distinct keys so
+  // there is no shared-state race, each statement keeps its own missing-table
+  // tolerance, and a first non-missing-table error still rejects. A missing
+  // table reads as empty — the tables exist wherever createD1Storage ran
+  // (eager creation), but crafted test databases and non-D1Store hosts may
+  // not have them.
   const memoryPurges = [
     ['messages', 'mastra_messages', 'thread_id'],
     ['threads', 'mastra_threads', 'id'],
     ['resources', 'mastra_resources', 'id'],
   ] as const;
   const memory = { threads: 0, messages: 0, resources: 0 };
-  for (const [counter, table, column] of memoryPurges) {
-    try {
-      memory[counter] = d1Changes(
-        await db
-          .prepare(
-            `DELETE FROM ${prefix}${table} WHERE ${column} >= ? AND ${column} < ?`,
-          )
-          .bind(lower, upper)
-          .run(),
-      );
-    } catch (error) {
-      if (!isMissingTable(error)) throw error;
-    }
-  }
+  await Promise.all(
+    memoryPurges.map(async ([counter, table, column]) => {
+      try {
+        memory[counter] = d1Changes(
+          await db
+            .prepare(
+              `DELETE FROM ${prefix}${table} WHERE ${column} >= ? AND ${column} < ?`,
+            )
+            .bind(lower, upper)
+            .run(),
+        );
+      } catch (error) {
+        if (!isMissingTable(error)) throw error;
+      }
+    }),
+  );
 
   // 4. Approvals — by the tenant_id column. Hosts without the approval queue
   // have no such table; a missing table is the only tolerated failure.

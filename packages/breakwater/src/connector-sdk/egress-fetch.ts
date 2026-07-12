@@ -17,14 +17,18 @@
 // point: with the platform's redirect: 'follow', an allowed host could 302
 // to an arbitrary one and the response would come back as if nothing left
 // the allowlist. Divergences from platform 'follow' (accepted): the final
-// response's `redirected` flag stays false (each hop was a 'manual' fetch),
-// and a one-shot stream body cannot be re-sent across a 307/308 hop (throws
+// response's `redirected` flag stays false (each hop was a 'manual' fetch);
+// a one-shot stream body cannot be re-sent across a 307/308 hop (throws
 // instead of silently truncating — buffer the body or handle the 3xx
-// yourself with redirect: 'manual').
+// yourself with redirect: 'manual'); and a browser's opaque redirect
+// response (status 0, all a browser exposes for the internal 'manual' hop) is
+// refused fail-closed rather than returned unfollowed — inert on Workers/Node,
+// which return a real 3xx status the per-hop check can inspect.
 
 import {
-  EGRESS_HOSTNAME_PATTERN,
-  egressDomainAllowed,
+  assertEgressHostList,
+  domainAllowed,
+  normalizeDomain,
 } from '../policy-engine/tool-policy.js';
 
 /** Response headers subset the guard and its callers read. */
@@ -103,12 +107,14 @@ export interface EgressDenial {
 export class EgressDeniedError extends Error {
   readonly host: string | null;
   readonly hop: number;
+  readonly reason: string;
 
   constructor(denial: EgressDenial) {
     super(`egress denied: ${denial.reason}`);
     this.name = 'EgressDeniedError';
     this.host = denial.host;
     this.hop = denial.hop;
+    this.reason = denial.reason;
   }
 }
 
@@ -190,13 +196,20 @@ const CREDENTIAL_HEADER_NAMES = [
   'proxy-authorization',
 ] as const;
 
-// A one-shot stream can be sent exactly once; re-sending across a 307/308
-// hop would silently transmit an empty body.
+// A one-shot body — a ReadableStream (getReader) or a Node Readable /
+// async-iterable (Symbol.asyncIterator) — can be sent exactly once; re-sending
+// it across a 307/308 hop would silently transmit an empty body. Buffered
+// bodies (string, ArrayBuffer, TypedArray, URLSearchParams, FormData, Blob)
+// carry neither and are not misclassified.
 function isOneShotBody(body: unknown): boolean {
+  if (typeof body !== 'object' || body === null) return false;
+  const candidate = body as {
+    getReader?: unknown;
+    [Symbol.asyncIterator]?: unknown;
+  };
   return (
-    typeof body === 'object' &&
-    body !== null &&
-    typeof (body as { getReader?: unknown }).getReader === 'function'
+    typeof candidate.getReader === 'function' ||
+    typeof candidate[Symbol.asyncIterator] === 'function'
   );
 }
 
@@ -241,16 +254,29 @@ export function egressFetch(
   allowedHosts: readonly string[],
   options: EgressFetchOptions = {},
 ): EgressGuardedFetch {
-  for (const entry of allowedHosts) {
-    if (!EGRESS_HOSTNAME_PATTERN.test(entry)) {
-      throw new TypeError(
-        `egressFetch: allowed host '${entry}' must be a bare hostname ('api.example.com') or wildcard ('*.example.com')`,
-      );
-    }
-  }
+  assertEgressHostList(
+    allowedHosts,
+    (entry) =>
+      `egressFetch: allowed host '${entry}' must be a bare hostname ('api.example.com') or wildcard ('*.example.com')`,
+  );
+  // Normalize the allowlist ONCE per guard; only the incoming host is
+  // normalized per hop (checkUrl), via the same matcher the declaration gate
+  // uses.
+  const normalizedHosts = allowedHosts.map(normalizeDomain);
   const UrlCtor = requireGlobal<UrlConstructor>('URL');
   const denied =
     options.denied ?? ((denial: EgressDenial) => new EgressDeniedError(denial));
+  // A non-negative integer, symmetric with the allowlist validation above:
+  // NaN/negative/fractional would make `hop > maxRedirects` never fire and an
+  // allowed self-redirect loop unbounded. 0 stays valid (refuse all redirects).
+  if (
+    options.maxRedirects !== undefined &&
+    !(Number.isInteger(options.maxRedirects) && options.maxRedirects >= 0)
+  ) {
+    throw new TypeError(
+      `egressFetch: maxRedirects must be a non-negative integer (got ${options.maxRedirects})`,
+    );
+  }
   const maxRedirects = options.maxRedirects ?? 20;
   const base: InternalFetch = options.fetch
     ? (options.fetch as InternalFetch)
@@ -285,7 +311,7 @@ export function egressFetch(
         hop,
       });
     }
-    if (!egressDomainAllowed(url.hostname, allowedHosts)) {
+    if (!domainAllowed(normalizeDomain(url.hostname), normalizedHosts)) {
       throw denied({
         host: url.hostname,
         reason: `host '${url.hostname}' is not in the allowed egress hosts`,
@@ -326,6 +352,17 @@ export function egressFetch(
     });
 
     for (let hop = 1; ; hop++) {
+      if (response.status === 0) {
+        // A browser's redirect: 'manual' yields an opaque status-0 response
+        // (Workers/Node return a real 3xx); its Location is unreadable, so the
+        // per-hop check cannot run. Fail closed rather than return an
+        // unfollowed redirect. Covers the initial response and every hop.
+        // Release the discarded response's body first, like the sites below.
+        releaseResponse(response);
+        throw new TypeError(
+          'egressFetch: received an opaque redirect (status 0) whose Location cannot be read — this guard cannot verify the hop, so it fails closed; on a browser use redirect: "manual" and handle the 3xx yourself',
+        );
+      }
       if (!REDIRECT_STATUSES.has(response.status)) return response;
       const location = response.headers.get('location');
       if (location === null) return response;
@@ -334,7 +371,8 @@ export function egressFetch(
       // never sees it again. Capture the one field the follow-up still needs,
       // then release its body — the hop cap, a denied Location, the one-shot
       // refusal, and the reassignment would each otherwise leak the discarded
-      // 3xx's connection.
+      // 3xx's connection (the opaque status-0 refusal above is the fifth discard
+      // site, released the same way at the top of the loop before its throw).
       const status = response.status;
       releaseResponse(response);
       if (hop > maxRedirects) {

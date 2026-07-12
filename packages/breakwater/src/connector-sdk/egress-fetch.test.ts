@@ -58,6 +58,25 @@ describe('egressFetch construction', () => {
       /bare hostname/,
     );
   });
+
+  it('rejects a non-integer or negative maxRedirects at construction', () => {
+    // #given — maxRedirects gates the redirect loop; NaN/negative/fractional
+    // would make `hop > maxRedirects` never fire and loop unbounded
+    // #when / #then
+    expect(() =>
+      egressFetch(['api.example.com'], { maxRedirects: -1 }),
+    ).toThrow(TypeError);
+    expect(() =>
+      egressFetch(['api.example.com'], { maxRedirects: 1.5 }),
+    ).toThrow(TypeError);
+    expect(() =>
+      egressFetch(['api.example.com'], { maxRedirects: Number.NaN }),
+    ).toThrow(TypeError);
+    // #then — 0 is valid: refuse all redirects
+    expect(() =>
+      egressFetch(['api.example.com'], { maxRedirects: 0 }),
+    ).not.toThrow();
+  });
 });
 
 describe('egressFetch host checks', () => {
@@ -288,6 +307,35 @@ describe('egressFetch redirect following', () => {
         body: streamBody,
       }),
     ).rejects.toThrow(/one-shot \(stream\) body/);
+  });
+
+  it('refuses to follow a 307 that would re-send a one-shot async-iterable (Node Readable) body', async () => {
+    // #given — a Node Readable / async-iterable body is one-shot but has no
+    // getReader; re-sending it across a 307 would silently transmit nothing
+    const { fn } = baseFetch(stubResponse(307, { location: '/retry' }));
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+    const streamBody = { [Symbol.asyncIterator]: () => ({}) };
+    // #when / #then
+    await expect(
+      guarded('https://api.example.com/things', {
+        method: 'POST',
+        body: streamBody,
+      }),
+    ).rejects.toThrow(/one-shot \(stream\) body/);
+  });
+
+  it('fails closed on an opaque status-0 response', async () => {
+    // #given — a browser's redirect: 'manual' returns an opaque status-0
+    // response (Workers/Node return a real 3xx); the guard cannot inspect the
+    // hop, so it must refuse rather than resolve to the unfollowed response
+    const { fn } = baseFetch(
+      stubResponse(0, { location: 'https://api.example.com/next' }),
+    );
+    const guarded = egressFetch(['api.example.com'], { fetch: fn });
+    // #when / #then
+    await expect(guarded('https://api.example.com/start')).rejects.toThrow(
+      TypeError,
+    );
   });
 
   it('throws after maxRedirects hops', async () => {

@@ -407,17 +407,14 @@ export function ShowcaseApp({
                     onToggleSelect={dashboard.toggleSelect}
                   />
                 )}
-                {selfRequested && !canSelfDecide ? (
+                {selfRequested ? (
                   <Banner
                     status="info"
-                    title="Separation of duties: you advanced this run into its gate, so the server will refuse your decision (403). Switch to a different reviewer or to admin to decide it."
-                    description={GLOSSARY.sod}
-                  />
-                ) : null}
-                {selfRequested && canSelfDecide ? (
-                  <Banner
-                    status="info"
-                    title="You advanced this run into its gate. This deployment lets your role decide its own requests, so you can approve it here."
+                    title={
+                      canSelfDecide
+                        ? 'You advanced this run into its gate. This deployment lets your role decide its own requests, so you can approve it here.'
+                        : 'Separation of duties: you advanced this run into its gate, so the server will refuse your decision (403). Switch to a different reviewer or to admin to decide it.'
+                    }
                     description={GLOSSARY.sod}
                   />
                 ) : null}

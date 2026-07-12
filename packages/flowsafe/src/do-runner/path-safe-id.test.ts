@@ -9,9 +9,12 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  assertMintableTenantId,
+  mintSaltedId,
   PATH_SAFE_ID_PATTERN,
   TENANT_ID_PATTERN,
   tenantOfRunId,
+  tenantOwnsSaltedId,
 } from './path-safe-id.js';
 
 describe('TENANT_ID_PATTERN (INV-3)', () => {
@@ -101,5 +104,74 @@ describe('tenantOfRunId — the ONE INV-1 decode', () => {
     // canonical decoder validates and refuses.
     expect('AB_x'.slice(0, 'AB_x'.indexOf('_'))).toBe('AB');
     expect(tenantOfRunId('AB_x')).toBeUndefined();
+  });
+});
+
+describe('tenantOwnsSaltedId — the ONE tenant-salted ownership predicate', () => {
+  it('is exact at the tenant boundary (the acme vs acmecorp pin)', () => {
+    // #given — INV-3 excludes '_'/backtick, so the first delimiter is the
+    // boundary and 'acme' can never own 'acmecorp_...'
+    // #when / #then
+    expect(tenantOwnsSaltedId('acme', 'acme_x')).toBe(true);
+    expect(tenantOwnsSaltedId('acme', 'acmecorp_x')).toBe(false);
+    expect(tenantOwnsSaltedId('acmecorp', 'acme_x')).toBe(false);
+  });
+
+  it('rejects the bare tenant id (no delimiter, no suffix)', () => {
+    // #when / #then — the trailing '_' delimiter is load-bearing
+    expect(tenantOwnsSaltedId('acme', 'acme')).toBe(false);
+  });
+});
+
+describe('assertMintableTenantId — the mint-path precondition (generic Error)', () => {
+  it.each([
+    ['uppercase', 'ACME'],
+    ['too short', 'ab'],
+    ['underscore (the runId delimiter)', 'a_b'],
+  ])('throws INV-3 for %s', (_label, tenantId) => {
+    // #when / #then
+    expect(() => assertMintableTenantId(tenantId, 'mint')).toThrow(/INV-3/);
+  });
+
+  it("throws for the reserved 'system' identity", () => {
+    // #when / #then
+    expect(() => assertMintableTenantId('system', 'mint')).toThrow(/reserved/);
+  });
+
+  it('does not throw for a valid INV-3 tenantId', () => {
+    // #when / #then
+    expect(() => assertMintableTenantId('acme', 'mint')).not.toThrow();
+  });
+});
+
+describe('mintSaltedId — the ONE salted-id constructor', () => {
+  it('salts the suffix onto the validated tenant', () => {
+    // #given / #when / #then
+    expect(mintSaltedId('acme', 'sfx', 't')).toBe('acme_sfx');
+  });
+
+  it('propagates the mint-path assert for a bad tenant', () => {
+    // #when / #then
+    expect(() => mintSaltedId('ACME', 'sfx', 't')).toThrow(/INV-3/);
+    expect(() => mintSaltedId('system', 'sfx', 't')).toThrow(/reserved/);
+  });
+
+  it('accepts a thunk suffix, evaluated onto the validated tenant', () => {
+    // #given / #when / #then — a suffix producer (a uuid generator) passed lazily
+    expect(mintSaltedId('acme', () => 'sfx', 't')).toBe('acme_sfx');
+  });
+
+  it('validates the tenant BEFORE evaluating a thunk suffix (no side effect, no masking throw)', () => {
+    // #given — a suffix producer that records whether it ran
+    let calls = 0;
+    const suffix = () => {
+      calls += 1;
+      return 'sfx';
+    };
+    // #when / #then — an invalid then reserved tenant is rejected...
+    expect(() => mintSaltedId('ACME', suffix, 't')).toThrow(/INV-3/);
+    expect(() => mintSaltedId('system', suffix, 't')).toThrow(/reserved/);
+    // ...and the thunk never ran, so its side effects can't precede the rejection
+    expect(calls).toBe(0);
   });
 });

@@ -152,8 +152,10 @@ hand-built TenantContext literals), `purgeTenant` memory-table coverage +
 column pins + the two-tenant same-business-key adversarial case. The first
 memory FEATURE still owes: host-boundary id rejection, the recall-path
 proof, and a thread TTL (items 5–7 in the design doc). Plus: flowsafe's
-breakwater peer widened to `>=0.2.0 <1.0.0` (peer-escalation trap
-resolved).
+breakwater peer widened to `>=0.2.0 <1.0.0` (one half of the
+peer-escalation trap fix; the changeset `onlyUpdatePeerDependentsWhenOutOfRange`
+config flag that makes the range take effect landed 2026-07-13 — see
+Branching and releases).
 
 Verification gate: `pnpm lint && pnpm typecheck && pnpm test && pnpm build`
 (1119+ tests; lint is ONE root Biome 2 pass, test is ONE root vitest run over
@@ -263,13 +265,18 @@ users); GitHub stays a config-only fallback.
   release-PR merge) is guarded by release.yml's tripwire: pending changeset
   files on main FAIL the publish loudly; merge the regenerated Version
   Packages PR and re-cut the release PR.
-- **Changesets peer-escalation trap (RESOLVED 2026-07-12):** a breakwater
+- **Changesets peer-escalation trap (RESOLVED 2026-07-13):** a breakwater
   MINOR leaving flowsafe's peer range made changesets escalate flowsafe to
-  MAJOR (0.2.0 proposed flowsafe 1.0.0). flowsafe's breakwater peer is now
-  `>=0.2.0 <1.0.0`, so breakwater 0.x minors stay in-range and no escalation
-  fires. The trap returns only if the range is re-narrowed (e.g. at
-  breakwater 1.0) — then override by editing the Version Packages PR before
-  merging it.
+  MAJOR (0.2.0 proposed flowsafe 1.0.0). Closing it needs BOTH: flowsafe's
+  breakwater peer at `>=0.2.0 <1.0.0` AND `.changeset/config.json` setting
+  `___experimentalUnsafeOptions_WILL_CHANGE_IN_PATCH.onlyUpdatePeerDependentsWhenOutOfRange:
+  true`. Without the flag, changesets escalates a peer-dependent on ANY peer
+  bump regardless of range, so the widened range alone was inert (a
+  breakwater minor still forced flowsafe to MAJOR until the flag landed
+  2026-07-13). With both, breakwater 0.x minors stay in-range and no
+  escalation fires. The trap returns if the range is re-narrowed (e.g. at
+  breakwater 1.0) OR the flag is removed — then override by editing the
+  Version Packages PR before merging it.
 - CI (`ci.yml`) runs on both `main` and `dev`, so the verification gate
   fires on every PR into the integration branch, not only at release time.
 
