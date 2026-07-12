@@ -6,16 +6,20 @@
 // 1. TABLE INVENTORY — createD1Storage eagerly creates SIX tables, and INV-1
 //    covers exactly ONE of them (mastra_workflow_snapshot, keyed by run_id).
 //    The other five (threads, messages, resources, scorers, background
-//    tasks) are keyed by ids INV-1 does not salt; they are empty today
-//    because flowsafe only persists workflow snapshots. metamind's product
-//    is Mastra AGENTS — enabling agent memory writes threads/messages keyed
-//    by threadId/resourceId, which two tenants would share. This pin makes
-//    that a CI failure forcing a tenancy decision (salt those ids like
-//    runIds), never a silent production leak.
+//    tasks) are keyed by ids INV-1 does not salt; they are empty until a
+//    host enables agent memory. The tenancy decision that pin used to force
+//    is now MADE and its chokepoints shipped (docs/agent-memory-tenancy.md):
+//    memory-id.ts mints salted threadId/resourceId values, TenantContext
+//    exposes them, and purgeTenant range-deletes the three memory tables.
+//    The pin stays: a @mastra/core bump changing the inventory (a SEVENTH
+//    table, or a rename) must fail CI and re-open the tenancy review, never
+//    silently ship.
 //
-// 2. SCHEMA GUARD — purgeTenant's range DELETE and the app-owned index
-//    depend on Mastra's snake_case `run_id` column name. A @mastra/core bump
-//    renaming it must fail here, not in a cross-tenant purge.
+// 2. SCHEMA GUARD — purgeTenant's range DELETEs and the app-owned index
+//    depend on Mastra's column names: snake_case `run_id` on the snapshot
+//    table, and `id`/`resourceId`/`thread_id` on the memory tables. A
+//    @mastra/core bump renaming any of them must fail here, not in a
+//    cross-tenant purge.
 //
 // 3. PURGE-VS-RESUME RACE — purgeTenant deletes SUSPENDED rows; a reviewer
 //    approving at that moment resumes against a vanished row. Pin the
@@ -36,6 +40,7 @@ import {
 import type { SnapshotDatabase, SnapshotStatement } from './d1-storage.js';
 import { createD1Storage, purgeTenant } from './d1-storage.js';
 import { init } from './init.js';
+import { mintResourceId, mintThreadId } from './memory-id.js';
 import type { RunnerRuntime } from './runtime.js';
 
 /** The SnapshotDatabase view over the same sqlite handle (for purgeTenant). */
@@ -174,6 +179,115 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
       .prepare('SELECT run_id FROM mastra_workflow_snapshot')
       .all();
     expect(remaining).toEqual([]);
+  });
+
+  it('the memory tables still have the columns the tenancy chokepoints ride on', async () => {
+    // #given
+    const sqlite = openSqlite();
+    const storage = createD1Storage({
+      binding: d1DatabaseLike(sqlite) as never,
+    });
+    const { runtime } = buildGated(storage);
+    await runtime.start('gated', { runId: 'abc_r1', inputData: {} });
+
+    // #when
+    const columnsOf = (table: string) =>
+      (
+        sqlite.prepare(`PRAGMA table_info(${table})`).all() as {
+          name: string;
+        }[]
+      ).map((column) => column.name);
+
+    // #then — purgeTenant's memory range predicates and the salted-id
+    // design key on exactly these names; a Mastra rename fails HERE
+    expect(columnsOf('mastra_threads')).toEqual(
+      expect.arrayContaining(['id', 'resourceId']),
+    );
+    expect(columnsOf('mastra_messages')).toEqual(
+      expect.arrayContaining(['id', 'thread_id', 'resourceId']),
+    );
+    expect(columnsOf('mastra_resources')).toEqual(
+      expect.arrayContaining(['id']),
+    );
+  });
+
+  it('salted memory ids keep two tenants disjoint and purgeTenant reaps exactly one of them', async () => {
+    // #given — the REAL adapter; both tenants key memory by the SAME
+    // business key ('user-1'), the exact collision the salting exists for.
+    // A first run creates the six tables (the eager path production rides);
+    // the node:sqlite harness cannot run the memory domain's lazy DDL.
+    const sqlite = openSqlite();
+    const storage = createD1Storage({
+      binding: d1DatabaseLike(sqlite) as never,
+    });
+    const { runtime } = buildGated(storage);
+    await runtime.start('gated', { runId: 'seed_r0', inputData: {} });
+    const memory = await storage.getStore('memory');
+    if (!memory) throw new Error('D1Store exposes no memory domain');
+    const now = new Date();
+    const seedTenant = async (tenantId: string) => {
+      const threadId = mintThreadId(tenantId, () => 'thread-1');
+      const resourceId = mintResourceId(tenantId, 'user-1');
+      await memory.saveThread({
+        thread: {
+          id: threadId,
+          resourceId,
+          title: `${tenantId} conversation`,
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+      await memory.saveMessages({
+        messages: [
+          {
+            id: `${tenantId}-m1`,
+            threadId,
+            resourceId,
+            role: 'user',
+            createdAt: now,
+            content: { format: 2, parts: [{ type: 'text', text: 'hello' }] },
+          },
+        ],
+      });
+      await memory.saveResource({
+        resource: {
+          id: resourceId,
+          workingMemory: `${tenantId} working memory`,
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+      return { threadId, resourceId };
+    };
+    const abc = await seedTenant('abc');
+    const xyz = await seedTenant('xyz');
+    // Digit-suffixed prefix neighbor: '5' (0x35) sorts below '_' (0x5F), so
+    // these rows fall INSIDE the broken range if the lower bound ever loses
+    // its trailing underscore — the exactness pin for the memory sweep.
+    const abc5 = await seedTenant('abc5');
+    // The shared key produced DISJOINT rows — the leak class is closed by
+    // construction, before any purge runs.
+    expect(abc.threadId).not.toBe(xyz.threadId);
+    expect(abc.resourceId).not.toBe(xyz.resourceId);
+
+    // #when — offboard exactly one tenant
+    const purged = await purgeTenant(snapshotDb(sqlite), { tenantId: 'abc' });
+
+    // #then — the counters name what left (exactly abc's one row per
+    // table), and BOTH other tenants' memory survives intact and readable
+    expect(purged.threads).toBe(1);
+    expect(purged.messages).toBe(1);
+    expect(purged.resources).toBe(1);
+    const survivor = await memory.getThreadById({ threadId: xyz.threadId });
+    expect(survivor?.id).toBe(xyz.threadId);
+    const neighbor = await memory.getThreadById({ threadId: abc5.threadId });
+    expect(neighbor?.id).toBe(abc5.threadId);
+    const rows = sqlite
+      .prepare('SELECT thread_id FROM mastra_messages ORDER BY thread_id')
+      .all() as { thread_id: string }[];
+    expect(rows.map((row) => row.thread_id)).toEqual(
+      [abc5.threadId, xyz.threadId].sort(),
+    );
   });
 
   it('InMemoryStore is unaffected by the guards (they pin the D1 adapter only)', () => {

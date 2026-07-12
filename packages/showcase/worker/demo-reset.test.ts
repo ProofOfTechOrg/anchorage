@@ -12,7 +12,14 @@ import type { PurgeTenantResult } from '@proofoftech/flowsafe/do-runner';
 import { describe, expect, it, vi } from 'vitest';
 import { createDemoResetRouter } from '#worker/demo-reset';
 
-const PURGED: PurgeTenantResult = { snapshots: 2, approvals: 1, artifacts: 0 };
+const PURGED: PurgeTenantResult = {
+  snapshots: 2,
+  threads: 0,
+  messages: 0,
+  resources: 0,
+  approvals: 1,
+  artifacts: 0,
+};
 
 function tenantContext(
   role: ApprovalRole,
@@ -26,6 +33,12 @@ function tenantContext(
     },
     newRunId: () => `${tenantId}_unused`,
     ownsRun: (runId: string) => runId.startsWith(`${tenantId}_`),
+    newThreadId: () => `${tenantId}_unused-thread`,
+    newResourceId: (resourceKey: string) => `${tenantId}_${resourceKey}`,
+    ownsMemoryId: (id: string) => id.startsWith(`${tenantId}_`),
+    // The reset route never reads this; a constant false satisfies the
+    // widened TenantContext interface.
+    canSelfDecide: () => false,
   };
 }
 

@@ -313,6 +313,62 @@ describe('deploy worker fetch(): the approval loop over HTTP', () => {
     });
   });
 
+  it('APPROVAL_ALLOW_SELF_DECISION=admin lets the admin requester decide its own run over HTTP', async () => {
+    // #given — the single-operator config: SoD is relaxed for admin, so the
+    // env var must thread all the way into ApprovalService.decide()
+    const { env } = makeEnv({ APPROVAL_ALLOW_SELF_DECISION: 'admin' });
+    const started = await startRun(env, 'tok-admin');
+    const approvalId = started.approval?.id;
+    if (!approvalId) throw new Error('expected an auto-queued approval');
+    expect(started.approval?.requestedBy).toBe('ada-admin');
+
+    // #when — the admin decides its OWN request (denied without the var)
+    const selfDecide = await call(env, `/api/approvals/${approvalId}/decide`, {
+      method: 'POST',
+      body: JSON.stringify({ decision: 'approve', comment: 'solo operator' }),
+      token: 'tok-admin',
+    });
+
+    // #then — permitted, grant minted, the gated publish runs under admin
+    expect(selfDecide.status).toBe(200);
+    const decided = (await selfDecide.json()) as {
+      record: ApprovalRecord;
+      resume: { attempted: boolean; ok: boolean; summary?: RunSummary };
+    };
+    expect(decided.record).toMatchObject({
+      status: 'approved',
+      decidedBy: 'ada-admin',
+    });
+    expect(decided.resume).toMatchObject({ attempted: true, ok: true });
+    expect(decided.resume.summary).toMatchObject({
+      status: 'success',
+      result: { published: true, approvedBy: 'ada-admin' },
+    });
+  });
+
+  it('APPROVAL_ALLOW_SELF_DECISION=admin still binds reviewer to SoD', async () => {
+    // #given — the exemption is role-scoped: reviewer is NOT admin, so a
+    // reviewer who advanced a run still cannot decide that gate. Modeled by an
+    // explicitly reviewer-attributed request the reviewer then tries to decide.
+    const { env } = makeEnv({ APPROVAL_ALLOW_SELF_DECISION: 'admin' });
+    const started = await startRun(env, 'tok-admin');
+    const approvalId = started.approval?.id;
+    if (!approvalId) throw new Error('expected an auto-queued approval');
+
+    // #when — a reviewer decides an admin-requested gate: allowed (not their
+    // own), proving the var did not blanket-disable SoD for everyone
+    const reviewerDecide = await call(
+      env,
+      `/api/approvals/${approvalId}/decide`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ decision: 'approve' }),
+        token: 'tok-reviewer',
+      },
+    );
+    expect(reviewerDecide.status).toBe(200);
+  });
+
   it('fails closed: a forged resume that bypasses the queue finds no grant', async () => {
     // #given — a suspended run, nothing approved
     const { env } = makeEnv();

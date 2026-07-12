@@ -17,9 +17,11 @@ import type {
   ApprovalAuditEvent,
   ApprovalDatabase,
   ApprovalNotificationSink,
+  SelfDecisionPolicy,
   TenantResolver,
 } from '../approval-api/index.js';
 import {
+  APPROVAL_ROLES,
   createApprovalRouter,
   createTenantResolver,
 } from '../approval-api/index.js';
@@ -33,7 +35,7 @@ import {
   type DoRunTopology,
   type RunnerNamespaceLike,
 } from './do-run-topology.js';
-import { numberVar } from './env-vars.js';
+import { numberVar, selfDecisionPolicyVar } from './env-vars.js';
 import {
   approvalStoreFactoryFor,
   buildHostApprovalService,
@@ -63,6 +65,13 @@ export interface FlowsafeWorkerEnv {
   RUNNER: RunnerNamespaceLike;
   /** Default SLA seconds for new approvals (var; default 14400 = 4h). */
   APPROVAL_SLA_SECONDS?: string;
+  /**
+   * Separation-of-duties exemption (var). Unset or a `false` spelling = SoD on
+   * (default); `true` = every decider may self-decide; a comma-separated role
+   * list (e.g. `admin` or `admin,reviewer`) = only those roles. Any invalid
+   * value falls back to OFF (fail closed).
+   */
+  APPROVAL_ALLOW_SELF_DECISION?: string;
   /** Cron purges terminal run snapshots older than this (var; default 30; 0 = immediately). */
   RUN_RETENTION_DAYS?: string;
   /** Cron purges DECIDED approval records older than this (var; default 30; 0 = immediately). */
@@ -173,6 +182,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
     topology: DoRunTopology,
     waitUntil: (promise: Promise<unknown>) => void,
     notify: ApprovalNotificationSink | undefined,
+    selfDecision: SelfDecisionPolicy,
   ): TenantResolver => {
     const base = createTenantResolver({
       authenticate: bearerActorAuthenticator(config.buildVerifier(env)),
@@ -191,9 +201,39 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           queue: env.AUDIT_QUEUE,
           waitUntil,
           notify,
+          allowSelfDecision: selfDecision,
         }),
+      // The resolver's canSelfDecide display hint reads the SAME policy the
+      // service enforces (passed to buildHostApprovalService above), so the
+      // /workflows echo can never contradict decide().
+      allowSelfDecision: selfDecision,
     });
     return config.wrapResolve ? config.wrapResolve(base, env) : base;
+  };
+
+  // Parse ONCE per deployment value, memoized by the RAW
+  // APPROVAL_ALLOW_SELF_DECISION string — NOT by env identity: a host mutates
+  // the same env object across values (unset -> 'admin' -> 'nonsense'), so an
+  // env-keyed cache would serve the first policy for all of them. The
+  // enforcement (service) and the catalog echo (run-router, via the resolver's
+  // canSelfDecide) must read the SAME policy, or the SPA's "you may
+  // self-decide" hint could contradict the server's verdict. Roles are
+  // validated against APPROVAL_ROLES, so the { roles } branch is an
+  // ApprovalRole[] by construction. selfDecisionPolicyVar never throws (garbage
+  // -> false + config-error log), so nothing thrown is cached; a policy is
+  // never undefined, so a get() miss unambiguously means "not yet computed".
+  const selfDecisionCache = new Map<string | undefined, SelfDecisionPolicy>();
+  const parseSelfDecision = (env: Env): SelfDecisionPolicy => {
+    const raw = env.APPROVAL_ALLOW_SELF_DECISION;
+    const cached = selfDecisionCache.get(raw);
+    if (cached !== undefined) return cached;
+    const policy = selfDecisionPolicyVar(
+      raw,
+      'APPROVAL_ALLOW_SELF_DECISION',
+      APPROVAL_ROLES,
+    ) as SelfDecisionPolicy;
+    selfDecisionCache.set(raw, policy);
+    return policy;
   };
 
   async function runPurgeMaintenance(env: Env, cron: string): Promise<void> {
@@ -266,7 +306,14 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         ctx.waitUntil(promise);
       const topology = createDoRunTopology(env.RUNNER);
       const notify = config.notify?.(env);
-      const resolve = buildResolve(env, topology, waitUntil, notify);
+      const selfDecision = parseSelfDecision(env);
+      const resolve = buildResolve(
+        env,
+        topology,
+        waitUntil,
+        notify,
+        selfDecision,
+      );
 
       if (config.preRoutes) {
         const preResponse = await config.preRoutes(request, env, ctx, {

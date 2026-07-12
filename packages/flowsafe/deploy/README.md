@@ -160,6 +160,7 @@ expressions byte-equal to crons.ts's `SWEEP_CRON`/`PURGE_CRON` constants.
 | `APPROVAL_ACTOR_TOKENS` | secret | none (all authed routes 401) | JSON map of bearer token → `{ id, role, tenantId }`; entries without an INV-3-valid `tenantId` are dropped |
 | `TENANT_APEX_DOMAIN` | var | unset (no cross-check) | Client-per-subdomain apex, e.g. `example.com`. A request to `<tenant>.<apex>` is denied unless the token's verified tenant is that tenant. Defense in depth over the tenant-bound stores |
 | `APPROVAL_SLA_SECONDS` | var | `14400` (4h) | Default SLA applied to new approvals |
+| `APPROVAL_ALLOW_SELF_DECISION` | var | unset (SoD ON) | Separation-of-duties exemption. Unset or a `false` spelling keeps SoD on; `true` lets any decider self-decide; a CSV of roles (e.g. `admin`) exempts only those — a single-operator deployment sets `admin`. Any invalid value falls back to OFF. Permitted self-decisions are audited (`detail.selfDecision: true`) |
 | `RUN_RETENTION_DAYS` | var | `30` | Terminal snapshot age before cron purge; `0` purges terminal runs immediately |
 | `APPROVAL_RETENTION_DAYS` | var | `30` | Decided (approved/rejected) approval record age before cron purge; `0` purges decided approvals immediately |
 | `AUDIT_QUEUE` | queue binding | unbound (logs only) | Enables audit export: events flow to the queue consumer |
@@ -169,12 +170,16 @@ expressions byte-equal to crons.ts's `SWEEP_CRON`/`PURGE_CRON` constants.
 ## The conventions the template encodes
 
 - **The shared pieces come from `@proofoftech/flowsafe/host-kit`, not from
-  here.** The auth seam (`parseActorTokens` + `bearerActorAuthenticator`), the
-  run routes with their RBAC gate order (`createRunRouter`), and the approval
-  bridge (`queueApprovalForSuspension`, `resumeRunWithRequeue`) are
-  security-critical and tested in the library. This file supplies only what is
-  deployment-specific: the workflows, and the DO-stub `start`/`status`/`resume`
-  thunks. Do not re-derive them.
+  here.** The whole Worker pipeline is `createFlowsafeWorker()` — the
+  `/healthz` → approvals → runs → 404 fetch order, the auth seam
+  (`parseActorTokens` + `bearerActorAuthenticator`), the run routes with
+  their RBAC gate order (`createRunRouter`), the approval bridge
+  (`queueApprovalForSuspension`, `resumeRunWithRequeue`), the two-cron
+  `scheduled()` dispatch, and the audit-export `queue()` consumer — all
+  security-critical and tested in the library. `worker.ts` supplies only what
+  is deployment-specific: the workflows, the memoized `buildVerifier`, the
+  cron expressions, and the optional subdomain cross-check (`wrapResolve`).
+  Do not re-derive them.
 - **Authenticate first, then construct.** The routers take a `TenantResolver`,
   not a bare `authenticate`: it verifies the token, validates the tenant claim,
   and binds the approval store to that tenant — so there is no pre-auth service

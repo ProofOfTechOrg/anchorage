@@ -867,7 +867,7 @@ describe('ApprovalService self-approval control', () => {
     );
   });
 
-  it('permits self-decision when allowSelfDecision is enabled', async () => {
+  it('permits self-decision when allowSelfDecision is enabled, and audits it', async () => {
     // #given
     const harness = makeHarness({ allowSelfDecision: true });
     const record = await seedPending(harness);
@@ -879,8 +879,15 @@ describe('ApprovalService self-approval control', () => {
       { id: 'opal', role: 'admin', tenantId: 'acme' },
     );
 
-    // #then
+    // #then — permitted AND the exercised exemption leaves a trail
     expect(result.record.status).toBe('approved');
+    expect(harness.events).toContainEqual(
+      expect.objectContaining({
+        action: 'approval.decide',
+        decision: 'allowed',
+        detail: expect.objectContaining({ selfDecision: true }),
+      }),
+    );
   });
 
   it('gates on an explicitly-attributed requester too', async () => {
@@ -901,6 +908,67 @@ describe('ApprovalService self-approval control', () => {
       ADMIN,
     );
     expect(other.record.status).toBe('approved');
+  });
+
+  it('role-scoped: an exempt role decides its own request; others still cannot', async () => {
+    // #given — admin is exempt, reviewer is not (the demo's single-operator config)
+    const harness = makeHarness({ allowSelfDecision: { roles: ['admin'] } });
+    const adminReq = await harness.service.create(
+      input({ requestedBy: ADMIN.id }),
+      OPERATOR,
+    );
+    // Distinct runId: create() is idempotent per open (run, step), so reusing
+    // acme_run-1 would return the admin record, not a second one.
+    const reviewerReq = await harness.service.create(
+      input({ runId: 'acme_run-2', requestedBy: REVIEWER.id }),
+      OPERATOR,
+    );
+
+    // #when / #then — admin self-decides (audited); reviewer self-request 403s
+    const decided = await harness.service.decide(
+      adminReq.record.id,
+      { decision: 'approve' },
+      ADMIN,
+    );
+    expect(decided.record.status).toBe('approved');
+    expect(harness.events).toContainEqual(
+      expect.objectContaining({
+        action: 'approval.decide',
+        decision: 'allowed',
+        detail: expect.objectContaining({ selfDecision: true }),
+      }),
+    );
+    await expect(
+      harness.service.decide(
+        reviewerReq.record.id,
+        { decision: 'approve' },
+        REVIEWER,
+      ),
+    ).rejects.toBeInstanceOf(ApprovalAuthzError);
+  });
+
+  it('role-scoped: an exempt role deciding ANOTHER actor request is not flagged self', async () => {
+    // #given — admin exempt, but this request was raised by ray
+    const harness = makeHarness({ allowSelfDecision: { roles: ['admin'] } });
+    const { record } = await harness.service.create(
+      input({ requestedBy: REVIEWER.id }),
+      OPERATOR,
+    );
+
+    // #when — admin decides someone else's request
+    const decided = await harness.service.decide(
+      record.id,
+      { decision: 'approve' },
+      ADMIN,
+    );
+
+    // #then — allowed, but NOT annotated as a self-decision
+    expect(decided.record.status).toBe('approved');
+    const decideEvent = harness.events.find(
+      (event) =>
+        event.action === 'approval.decide' && event.decision === 'allowed',
+    );
+    expect(decideEvent?.detail).not.toHaveProperty('selfDecision');
   });
 });
 
@@ -1168,6 +1236,62 @@ describe('ApprovalService.decideBatch', () => {
       comment: 'triage sweep',
     });
     expect(result.results[0]?.resume).toEqual({ attempted: false });
+  });
+
+  it('inherits the role-scoped self-decision exemption per record', async () => {
+    // #given — admin exempt; a batch mixing admin's own request with ray's
+    const harness = makeHarness({ allowSelfDecision: { roles: ['admin'] } });
+    const ownByAdmin = await harness.service.create(
+      input({ requestedBy: ADMIN.id }),
+      OPERATOR,
+    );
+    const ownByReviewer = await harness.service.create(
+      input({ runId: 'acme_run-2', requestedBy: REVIEWER.id }),
+      OPERATOR,
+    );
+
+    // #when — admin runs the batch
+    const result = await harness.service.decideBatch(
+      [ownByAdmin.record.id, ownByReviewer.record.id],
+      { decision: 'approve' },
+      ADMIN,
+    );
+
+    // #then — admin's own request clears (exemption applied per record); ray's
+    // is decidable by admin too (not a self-request for admin)
+    expect(result.decided).toBe(2);
+    expect(result.failed).toBe(0);
+  });
+
+  it('still 403s a NON-exempt actor own request inside a batch under a { roles } policy', async () => {
+    // #given — admin is exempt, reviewer is NOT; the reviewer runs the batch
+    const harness = makeHarness({ allowSelfDecision: { roles: ['admin'] } });
+    const ownByReviewer = await harness.service.create(
+      input({ requestedBy: REVIEWER.id }),
+      OPERATOR,
+    );
+    const othersRecord = await harness.service.create(
+      input({ runId: 'acme_run-2', requestedBy: ADMIN.id }),
+      OPERATOR,
+    );
+
+    // #when — reviewer batch-decides its OWN request plus another's
+    const result = await harness.service.decideBatch(
+      [ownByReviewer.record.id, othersRecord.record.id],
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then — the exemption is role-scoped: reviewer's own request is SoD-denied,
+    // the other clears
+    expect(result.decided).toBe(1);
+    expect(result.failed).toBe(1);
+    expect(result.results.map((item) => [item.id, item.ok, item.code])).toEqual(
+      [
+        [ownByReviewer.record.id, false, 'forbidden'],
+        [othersRecord.record.id, true, undefined],
+      ],
+    );
   });
 
   it('dedupes ids order-preservingly — a duplicate is not a spurious conflict', async () => {

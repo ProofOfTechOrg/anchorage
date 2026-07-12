@@ -128,8 +128,10 @@ Two purges, deliberately different:
   cron's error surface fires).
 - `purgeTenant(db, { tenantId, artifactStore })` — complete offboarding.
   Deletes snapshot rows of *any* status via an INV-3 range predicate over
-  `run_id`, the tenant's approval records, and its R2 artifacts (enumerated
-  from the *surviving* snapshot rows — hence the retention pairing above).
+  `run_id`, the tenant's agent-memory rows (threads/messages/resources by the
+  same range over their salted ids — `agent-memory-tenancy.md`), the tenant's
+  approval records, and its R2 artifacts (enumerated from the *surviving*
+  snapshot rows — hence the retention pairing above).
   This is the only way an abandoned-at-a-gate run is ever reclaimed. It races
   a live resume, so purge only tenants whose tokens have already expired; the
   resume then fails against the vanished row without re-executing the

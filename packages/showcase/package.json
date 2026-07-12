@@ -1,6 +1,6 @@
 {
   "name": "showcase",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "private": true,
   "description": "Anchorage showcase — five runnable workflows behind one React frontend, deployed as a single Cloudflare Worker",
   "type": "module",

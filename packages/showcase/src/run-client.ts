@@ -23,6 +23,13 @@ export interface CatalogActor {
   id: string;
   role: string;
   tenantId?: string;
+  /**
+   * Server's verdict on whether this identity may decide its OWN request under
+   * the deployment's separation-of-duties policy. Display hint only (the server
+   * enforces SoD on every decision regardless); the SPA uses it to suppress the
+   * "you advanced this run, so the server will refuse" banner for an exempt role.
+   */
+  canSelfDecide?: boolean;
 }
 
 /**

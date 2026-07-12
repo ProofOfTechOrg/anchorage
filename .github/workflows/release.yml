@@ -1,12 +1,19 @@
 name: Release
 
-# Changesets-driven npm publishing. On every push to main:
-# - pending changesets -> opens/updates the "Version Packages" PR (bumps +
-#   CHANGELOG entries); merging that PR re-runs this workflow;
-# - no pending changesets -> `changeset publish` publishes any public package
-#   whose version is not yet on npm (this is how the first 0.1.0 publish of
-#   breakwater + flowsafe landed on 2026-07-11, and how future unpublished
-#   versions publish), creates git tags, and pushes them.
+# Publish half of the bump-on-dev release flow (the version half is
+# version.yml, which maintains the "Version Packages" PR against dev). Version
+# bumps arrive on main INSIDE the release PR (dev -> main), so this workflow
+# never opens PRs and never creates commits: it publishes any public package
+# whose package.json version is not yet on npm, creates git tags, pushes them,
+# and creates GitHub releases. A push to main with nothing unpublished is a
+# clean no-op.
+#
+# The tripwire below is the freeze-window guard: a pending changeset file on
+# main means a feature merged into dev AFTER the Version Packages PR was
+# merged but BEFORE the release PR — its changes would publish under a version
+# whose changelog never saw them. That must be a loud failure, never a silent
+# mispublish: merge the regenerated Version Packages PR into dev and re-cut
+# the release PR.
 #
 # Requires the NPM_TOKEN repo secret (an npm automation token with publish
 # rights on the @proofoftech scope). Without it the publish step fails loudly
@@ -21,7 +28,6 @@ concurrency: release-${{ github.ref }}
 
 permissions:
   contents: write
-  pull-requests: write
   id-token: write
 
 jobs:
@@ -43,6 +49,15 @@ jobs:
           cache: pnpm
           registry-url: https://registry.npmjs.org
 
+      - name: Refuse pending changesets (freeze-window tripwire)
+        run: |
+          PENDING=$(find .changeset -maxdepth 1 -name '*.md' ! -name 'README.md')
+          if [ -n "$PENDING" ]; then
+            echo "::error::Unversioned changesets reached main. Merge the regenerated 'Version Packages' PR into dev, then re-cut the release PR (dev -> main)."
+            echo "$PENDING"
+            exit 1
+          fi
+
       - name: Install (frozen lockfile)
         run: pnpm install --frozen-lockfile
 
@@ -51,12 +66,12 @@ jobs:
       - name: Build
         run: pnpm build
 
-      - name: Version PR or publish
+      # publish-only mode: with the tripwire above, the action can never see a
+      # pending changeset here, so it never opens a Version PR against main.
+      - name: Publish unpublished versions to npm
         uses: changesets/action@v1
         with:
           publish: pnpm changeset publish
-          title: 'release: version packages'
-          commit: 'release: version packages'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

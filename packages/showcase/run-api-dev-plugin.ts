@@ -18,6 +18,7 @@
 import { InMemoryStore } from '@mastra/core/storage';
 import type {
   ApprovalActor,
+  SelfDecisionPolicy,
   TenantBoundApprovalStore,
 } from '@proofoftech/flowsafe/approval-api';
 import {
@@ -46,6 +47,14 @@ const APPROVAL_BASE = '/api/approvals';
 
 /** Id for system-created approval records (tenant is bound per request). */
 const SYSTEM_ACTOR_ID = 'showcase-dev';
+
+/**
+ * Dev SoD exemption: admin may decide its own requests (so one operator drives
+ * product-launch's two gates alone). ONE source for both the service (enforce)
+ * and the run-router (echo canSelfDecide). Mirrors the deployed showcase's
+ * `APPROVAL_ALLOW_SELF_DECISION: "admin"` var.
+ */
+const DEV_SELF_DECISION: SelfDecisionPolicy = { roles: ['admin'] };
 
 // Same auth seam as the deployed worker, over the same demo tokens the UI's
 // ActorSwitcher offers — routed through parseActorTokens so dev exercises the
@@ -104,6 +113,10 @@ export function runApiDevPlugin(): Plugin {
     const service: ApprovalService = new ApprovalService({
       store,
       defaultSlaSeconds: 3600,
+      // Admin-scoped SoD exemption so `admin` can drive product-launch's two
+      // gates solo (matches the deployed showcase's APPROVAL_ALLOW_SELF_DECISION
+      // var). The reviewer lane still 403s on a self-request — SoD stays live.
+      allowSelfDecision: DEV_SELF_DECISION,
       resumeRun: resumeRunWithRequeue(
         resumeViaRuntime(runtime),
         () => service,
@@ -116,6 +129,10 @@ export function runApiDevPlugin(): Plugin {
     authenticate,
     storeFactory,
     buildService,
+    // Same SoD policy the service enforces, threaded through the resolver so
+    // the catalog echo's canSelfDecide (tenant.canSelfDecide) matches
+    // enforcement (admin => true, others => false).
+    allowSelfDecision: DEV_SELF_DECISION,
   });
   const approvalRouter = createApprovalRouter({
     resolve,
@@ -173,6 +190,12 @@ export function runApiDevPlugin(): Plugin {
       }
       return {
         snapshots,
+        // No showcase workflow writes agent memory; when one does, sweep the
+        // in-memory store's memory domain here (docs/agent-memory-tenancy.md
+        // item 5) instead of leaving the constants.
+        threads: 0,
+        messages: 0,
+        resources: 0,
         approvals: storeFactory.purgeTenant(tenantId),
         artifacts: 0,
       };

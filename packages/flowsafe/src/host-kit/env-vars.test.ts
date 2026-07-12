@@ -6,7 +6,9 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { boolVar, numberVar } from './env-vars.js';
+import { boolVar, numberVar, selfDecisionPolicyVar } from './env-vars.js';
+
+const ROLES = ['admin', 'builder', 'operator', 'reviewer', 'viewer'] as const;
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -109,5 +111,82 @@ describe('boolVar', () => {
       true,
     );
     expect(errors).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('selfDecisionPolicyVar', () => {
+  it('reads unset/empty as OFF (SoD on) without logging', () => {
+    // #given
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when / #then
+    expect(selfDecisionPolicyVar(undefined, 'X', ROLES)).toBe(false);
+    expect(selfDecisionPolicyVar('', 'X', ROLES)).toBe(false);
+    expect(errors).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'true',
+    '1',
+    'yes',
+    'on',
+    'TRUE',
+    ' On ',
+  ])("parses '%s' as every-decider (true)", (raw) => {
+    expect(selfDecisionPolicyVar(raw, 'X', ROLES)).toBe(true);
+  });
+
+  it.each([
+    'false',
+    '0',
+    'no',
+    'off',
+    'FALSE',
+  ])("parses '%s' as OFF (false)", (raw) => {
+    expect(selfDecisionPolicyVar(raw, 'X', ROLES)).toBe(false);
+  });
+
+  it('parses a single role', () => {
+    expect(selfDecisionPolicyVar('admin', 'X', ROLES)).toEqual({
+      roles: ['admin'],
+    });
+  });
+
+  it('parses a CSV of roles, case- and space-normalized', () => {
+    expect(selfDecisionPolicyVar('Admin, Reviewer ', 'X', ROLES)).toEqual({
+      roles: ['admin', 'reviewer'],
+    });
+  });
+
+  it('falls back to OFF and logs when ANY token is not a role', () => {
+    // #given — one bad token must not silently widen who can self-approve
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when / #then
+    expect(selfDecisionPolicyVar('admin,bogus', 'X', ROLES)).toBe(false);
+    expect(selfDecisionPolicyVar('bogus', 'X', ROLES)).toBe(false);
+    expect(errors).toHaveBeenCalledTimes(2);
+  });
+
+  it('falls back to OFF and logs when the list is empty after splitting', () => {
+    // #given
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when / #then — ',' / ', ,' / ' ' have no tokens
+    expect(selfDecisionPolicyVar(',', 'X', ROLES)).toBe(false);
+    expect(selfDecisionPolicyVar(' ', 'X', ROLES)).toBe(false);
+    expect(errors).toHaveBeenCalledTimes(2);
+  });
+
+  it('tolerates a trailing comma (empty segment dropped)', () => {
+    expect(selfDecisionPolicyVar('admin,', 'X', ROLES)).toEqual({
+      roles: ['admin'],
+    });
+  });
+
+  it('does not dedupe repeated roles (harmless, membership is what matters)', () => {
+    expect(selfDecisionPolicyVar('admin,admin', 'X', ROLES)).toEqual({
+      roles: ['admin', 'admin'],
+    });
   });
 });

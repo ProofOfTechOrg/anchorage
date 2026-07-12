@@ -39,10 +39,13 @@ is where you claim/decide. Try:
   approve it in the queue → watch it reach `success`.
 - Switch to `operator` and try to launch `access-request` → blocked (RBAC:
   admin/builder only). Switch to `builder` → it starts.
-- Start a run as `admin`, then try to approve it as `admin` → denied
-  (separation of duties). Approve as `reviewer` instead.
-- `product-launch` clears **two** gates (approve gate 1 as `reviewer`, gate 2 as
-  a different reviewer or `admin`).
+- This demo relaxes separation of duties for `admin` only (via
+  `APPROVAL_ALLOW_SELF_DECISION`), so `admin` can approve its own runs — that is
+  how one operator drives everything. Every other decider stays bound.
+- `product-launch` clears **two** gates. Drive it all as `admin`, or approve
+  gate 1 as `reviewer` then gate 2 as `admin` — approving gate 2 as the *same*
+  `reviewer` who decided gate 1 is denied (separation of duties: the gate-1
+  decider becomes gate 2's requester).
 
 ## Run it — the deployed shape (workerd)
 

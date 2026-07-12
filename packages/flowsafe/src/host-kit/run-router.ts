@@ -208,7 +208,19 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
         // unknown token must not default to admin).
         return json({
           workflows,
-          actor: { id: actor.id, role: actor.role, tenantId: actor.tenantId },
+          actor: {
+            id: actor.id,
+            role: actor.role,
+            tenantId: actor.tenantId,
+            // Display hint: whether THIS caller may decide its own request.
+            // The resolver built it — the DECIDER_ROLES guard plus the
+            // deployment's SoD policy, fed the SAME allowSelfDecision the
+            // service enforces — so the echo can only reflect the server's
+            // decide() verdict. The SPA uses it to suppress a now-false "you
+            // will be refused" hint. Enforced server-side regardless
+            // (ApprovalService.decide).
+            canSelfDecide: tenant.canSelfDecide(actor.role),
+          },
         });
       }
       if (segments[0] !== 'runs') return json({ error: 'not found' }, 404);

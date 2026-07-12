@@ -13,7 +13,7 @@ the agent execution lifecycle.
 
 | Subpackage | Enforcement point | Role |
 |---|---|---|
-| `policy-engine` | Agent-boundary processors + connector execute wrapper | Egress, output-channel, retention, isolation gates around model and tool calls |
+| `policy-engine` | Agent-boundary processors + connector execute wrapper | Egress, output-channel, retention, isolation gates around model and tool calls; content inspection (`piiSecrets` PII/secret detectors, `classifierPolicy` async classifier seam) |
 | `rbac` | Workflow and tool invocation | Resolve caller identity -> role -> permissions |
 | `audit` | Shared sink used by every gate | `AuditLogger` — buffered, sink-isolated structured audit events (re-exported from `rbac` for compat); `metricsAuditSink` + `combineAuditSinks` adapt events onto counters/histograms and fan out to multiple sinks |
 | `connector-sdk` | `createConnector()` wrapping `createTool()` | Permission manifests: egress allowlist, write-approval gate, idempotent replay, dry-run simulation, fixed-window rate limits |
@@ -41,25 +41,28 @@ construction; `PolicyEngine` rejects that configuration without one rather than
 silently no-op.
 
 `createConnector()` wraps Mastra `createTool()` with an enforced permission
-manifest — network-egress allowlisting, write-approval gating (a
-requestContext grant gates every path; Mastra's native `requireApproval` is
-compiled so agent runs pause for the decision, but it never substitutes for
-the grant), keyed idempotent replay (in-memory + D1 atomic stores), per-call
-dry-run simulation, and fixed-window rate limiting. Custom tool-boundary
-evaluators register via `policies.evaluators`. Enforcement contract:
+manifest — network-egress allowlisting (declaration gate + a per-call
+`ConnectorRuntime.fetch` guard pinning actual requests, redirect hops
+included, to the declared hosts), write-approval gating (a requestContext
+grant gates every path; Mastra's native `requireApproval` is compiled so
+agent runs pause for the decision, but it never substitutes for the grant),
+keyed idempotent replay (in-memory + D1 atomic stores), per-call dry-run
+simulation, and fixed-window rate limiting. Custom tool-boundary evaluators
+register via `policies.evaluators`. Enforcement contract:
 `docs/connector-interface.md`; authoring guide: `CONNECTORS.md`.
 
 Agent CLI adapters (`@proofoftech/breakwater/agent-cli`) ship Claude Code and
 Codex as approval-gated connectors — Node-only at execution time.
 
-**Egress and rate-limit caveats.** `networkEgress` gates what a connector's
-manifest *declares* it calls, not the actual socket — there is no fetch-level
-interception (yet). It catches misconfiguration and org-policy drift, not a
-connector (or a compromised dependency) that lies about its egress; treat it
-as a declaration/allowlist control, not a network sandbox. Fixed-window
-`rateLimit` can admit up to ~2x the declared budget across two adjacent
-windows (amplified by cross-isolate clock skew) — an accepted characteristic
-of fixed windows, not a bug. See `CONNECTORS.md`'s "Known limits" for detail.
+**Egress and rate-limit caveats.** The egress guard covers code that uses
+the runtime-injected fetch: a vendor SDK carrying its own HTTP stack
+bypasses it (route the SDK's traffic through `runtime.fetch` — most SDKs
+accept a fetch/transport option — or that connector's egress posture
+degrades to declaration-only). Socket-level interception remains
+host-infrastructure territory. Fixed-window `rateLimit` can admit up to ~2x
+the declared budget across two adjacent windows (amplified by cross-isolate
+clock skew) — an accepted characteristic of fixed windows, not a bug. See
+`CONNECTORS.md`'s "Known limits" for detail.
 
 ## Usage
 
@@ -89,6 +92,16 @@ keys). Audit events buffer in memory with an injectable `sink`
 structurally-compatible events, so one `AuditLogger` can carry both. For
 durable export, flowsafe ships a Cloudflare Queues → SIEM sink
 (`@proofoftech/flowsafe/audit-export`).
+
+Output (and input) content is inspectable in the same policy chain:
+`piiSecrets()` denies text carrying PII or credential-shaped secrets — email,
+SSN, phone, Luhn-validated card numbers, AWS access keys, PEM private-key
+headers, JWTs, `key = value` secret assignments, and high-Shannon-entropy
+tokens — with allowlist exemptions and streaming-window scanning whose denial
+reasons never echo the matched text. `classifierPolicy()` plugs an async
+classifier (a moderation model, an external safety API) into the same gates
+on a streaming cadence, failing closed on error or timeout. Both are
+best-effort against adversarial encoding tricks, like `denyPatterns`.
 
 Audit events also drive metrics: `metricsAuditSink(recorder)` adapts any
 `{increment, observe}`-shaped client (StatsD, Prometheus push, OTel) onto a

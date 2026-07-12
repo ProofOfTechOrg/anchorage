@@ -91,6 +91,11 @@
   "vars": {
     "APPROVAL_SLA_SECONDS": "14400",
     "RUN_RETENTION_DAYS": "30",
+    // Separation of duties: relax it for `admin` only, so a single operator can
+    // drive product-launch's two gates alone (gate 2 would otherwise 403 the
+    // gate-1 decider). Reviewer stays SoD-bound, so the demo still shows a live
+    // 403. Unset/`false` keeps SoD fully on; a CSV widens it (e.g. `admin,reviewer`).
+    "APPROVAL_ALLOW_SELF_DECISION": "admin",
     "OUTREACH_FROM_ADDRESS": "gtm@example.com",
     "OUTREACH_FROM_NAME": "Anchorage Showcase",
     // Public-demo tuning (ops-tunable without a code change). The DAILY cap

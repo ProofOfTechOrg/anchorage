@@ -1,0 +1,54 @@
+name: Version
+
+# Bump-on-dev half of the release flow (the publish half is release.yml).
+# On every push to dev with pending changesets, the changesets action opens or
+# regenerates the standing "Version Packages" PR AGAINST DEV
+# (changeset-release/dev): version bumps + CHANGELOG entries + changeset
+# deletion all land on the integration branch, so a release never creates
+# commits on main and the old main -> dev back-sync is gone. With no pending
+# changesets this is a fast no-op.
+#
+# Release ritual (root CLAUDE.md "Branching and releases"): confirm this PR is
+# current, merge it into dev, then IMMEDIATELY cut and merge the release PR
+# (dev -> main). The freeze window between those two merges is guarded by
+# release.yml's pending-changesets tripwire, not by convention.
+
+on:
+  push:
+    branches: [dev]
+
+concurrency: version-${{ github.ref }}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Changesets reads history to compute what changed.
+          fetch-depth: 0
+
+      # Reads the pnpm version from package.json "packageManager".
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      # No `publish` input: version-PR mode only. Publishing is main's job.
+      - name: Open or update the Version Packages PR (base dev)
+        uses: changesets/action@v1
+        with:
+          title: 'release: version packages'
+          commit: 'release: version packages'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

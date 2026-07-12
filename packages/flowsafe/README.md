@@ -13,15 +13,16 @@ standalone service with a React approval UI and a DO-based workflow runner.
 
 | Subpackage | Role |
 |---|---|
-| `approval-api` | REST API for submitting and reviewing approval requests |
-| `approval-ui` | Styling-agnostic React UI surfacing pending approvals and history |
+| `approval-api` | REST API for submitting and reviewing approval requests: claim/decide/delegate, batch decide, triage filters (requester + age bounds), SLA tracking + escalation, and the `ApprovalNotificationSink` transport seam |
+| `approval-ui` | Styling-agnostic React UI surfacing pending approvals and history, with queue triage (filter bar + batch selection/decide) |
 | `do-runner` | Durable Object workflow runner (import-swap pattern) |
 | `audit-export` | Cloudflare Queues → SIEM audit export (producer sink + batch consumer) |
 | `artifacts` | R2-backed workflow artifact storage keyed by run identity |
-| `host-kit` | Host-agnostic glue: the identity seam (`TokenVerifier`), the tenant resolver, the shared `/workflows` + `/runs` routes, the tenants registry, the suspension→approval bridge |
+| `host-kit` | Host-agnostic glue: the identity seam (`TokenVerifier`), the tenant resolver, the shared `/workflows` + `/runs` routes, the tenants registry, the suspension→approval bridge, and `createFlowsafeWorker()` — the composed production Worker hosts consume as thin shells |
 
-A copy-ready production deployment lives in [`deploy/`](deploy/) — a Worker
-wiring all of the above with cron-owned SLA enforcement and retention purge.
+A copy-ready production deployment lives in [`deploy/`](deploy/) — a thin
+shell over `createFlowsafeWorker()` with cron-owned SLA enforcement and
+retention purge.
 
 ## Installation
 
@@ -164,7 +165,10 @@ when the same step suspends again, the earlier approval is spent and the new
 suspension needs its own decision. Create a step-less approval for
 deliberately run-scoped standing grants. Self-approval (decider ==
 requester) is denied unless the service is constructed with
-`allowSelfDecision: true`. If a decision's
+`allowSelfDecision` — `true` exempts every decider, or `{ roles }` exempts
+only the listed roles (a single-operator deployment sets e.g.
+`{ roles: ['admin'] }`; composed hosts pass `APPROVAL_ALLOW_SELF_DECISION`).
+A permitted self-decision is audited with `detail.selfDecision: true`. If a decision's
 resume attempt fails (`resume.ok === false`), the decision is already
 durable — re-drive the run by POSTing its resume route with the record's
 `stepPath` and the `defaultResumeData` shape; grants re-derive from the
@@ -251,8 +255,18 @@ Consequences worth knowing:
 - **Offboarding is one call.** `purgeTenant(db, { tenantId, artifactStore })`
   (import from `@proofoftech/flowsafe/do-runner` or the package root)
   reaps snapshots of *any* status (a run abandoned at a gate is never eligible
-  for the terminal-only retention purge), the tenant's approval records, and
-  its R2 artifacts. Only purge tenants whose tokens have already expired.
+  for the terminal-only retention purge), the tenant's agent-memory rows
+  (threads/messages/resources — salted ids, same exact range predicate), the
+  tenant's approval records, and its R2 artifacts. Only purge tenants whose
+  tokens have already expired.
+- **Agent-memory ids are tenant-salted.** Mastra memory is keyed by
+  caller-chosen `threadId`/`resourceId`, which two tenants can legitimately
+  share. `TenantContext.newThreadId()`/`newResourceId(key)` (and the
+  underlying `mintThreadId`/`mintResourceId` from
+  `@proofoftech/flowsafe/do-runner`) are the only constructors: ids are
+  `${tenantId}_${suffix}`, ownership is an exact prefix check
+  (`ownsMemoryId`), and hosts never accept a client-supplied memory id. See
+  `docs/agent-memory-tenancy.md` for the feature-side obligations.
 
 ### Deployment & ops
 

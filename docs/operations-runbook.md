@@ -72,7 +72,8 @@ approvals, rate limits, and artifacts.
 
 `purgeTenant(db, { tenantId, artifactStore })` (import from
 `@proofoftech/flowsafe/do-runner` or the package root) deletes the tenant's
-snapshot rows of any status, its approval records, and its R2 artifacts.
+snapshot rows of any status, its agent-memory rows
+(threads/messages/resources), its approval records, and its R2 artifacts.
 
 **Revoke the tenant's tokens first and wait for the last one to expire.** The
 purge deletes `suspended` rows, so a reviewer approving at that moment would

@@ -8,6 +8,7 @@
 // (grants.ts) derives requestContext grants from approved records at
 // start/resume. Nothing here ever reads capability data from client input.
 
+import { tenantOwnsSaltedId } from '../do-runner/path-safe-id.js';
 import type {
   ApprovalActor,
   ApprovalAuditSink,
@@ -15,7 +16,7 @@ import type {
   ApprovalNotificationSink,
   ApprovalRole,
 } from './contract.js';
-import { APPROVAL_ROLES } from './contract.js';
+import { APPROVAL_ROLES, DECIDER_ROLES } from './contract.js';
 import type { ApprovalPatch } from './store.js';
 import type {
   SystemApprovalStore,
@@ -74,6 +75,28 @@ export class InvalidApprovalInputError extends Error {
   }
 }
 
+/**
+ * Separation-of-duties exemption. `false`/absent = SoD on (the requester can
+ * never decide their own request); `true` = every decider may self-decide;
+ * `{ roles }` = only actors whose role is listed (single-operator deployments
+ * set e.g. `{ roles: ['admin'] }`).
+ */
+export type SelfDecisionPolicy = boolean | { roles: readonly ApprovalRole[] };
+
+/**
+ * Whether an actor of `role` may decide their OWN request under `policy`. Total
+ * and pure — the run-router's catalog echo and the service's decide() gate
+ * share this ONE definition so the SPA hint and the server verdict can't drift.
+ */
+export function selfDecisionExempts(
+  policy: SelfDecisionPolicy | undefined,
+  role: ApprovalRole,
+): boolean {
+  if (policy === true) return true;
+  if (!policy) return false;
+  return policy.roles.includes(role);
+}
+
 export interface ApprovalServiceOptions {
   /**
    * MUST be tenant-bound (INV-2): the service asserts every acting
@@ -110,10 +133,12 @@ export interface ApprovalServiceOptions {
   ) => Promise<unknown>;
   /**
    * Permit the requester to decide their own request. Off by default —
-   * separation of duties is the safe enterprise default; enable only for
-   * single-operator deployments.
+   * separation of duties is the safe enterprise default. `true` exempts every
+   * decider; `{ roles }` exempts only those roles (a single-operator
+   * deployment sets e.g. `{ roles: ['admin'] }`). A permitted self-decision is
+   * audited with `detail.selfDecision: true`.
    */
-  allowSelfDecision?: boolean;
+  allowSelfDecision?: SelfDecisionPolicy;
   /** Injectable clock (tests, deterministic SLA math). */
   now?: () => Date;
 }
@@ -121,7 +146,9 @@ export interface ApprovalServiceOptions {
 // Role policy from security-threat-model.md: reviewers decide, operators run
 // the system, admins do both; every authenticated role may read. (The SLA
 // sweep has no role: it is cron-owned TCB code — see sweepSLA below.)
-const CAN_REVIEW: readonly ApprovalRole[] = ['reviewer', 'admin'];
+// CAN_REVIEW IS the exported DECIDER_ROLES — one source, so the run-router's
+// canSelfDecide echo and this gate can never disagree on who may decide.
+const CAN_REVIEW: readonly ApprovalRole[] = DECIDER_ROLES;
 const CAN_CREATE: readonly ApprovalRole[] = ['operator', 'builder', 'admin'];
 
 function isNonEmptyString(value: unknown): value is string {
@@ -137,7 +164,7 @@ export class ApprovalService {
     record: ApprovalRecord,
     decision: ApprovalDecision,
   ) => Promise<unknown>;
-  readonly #allowSelfDecision: boolean;
+  readonly #allowSelfDecision?: SelfDecisionPolicy;
   readonly #now: () => Date;
 
   constructor(options: ApprovalServiceOptions) {
@@ -146,7 +173,7 @@ export class ApprovalService {
     this.#notify = options.notify;
     this.#defaultSlaSeconds = options.defaultSlaSeconds;
     this.#resumeRun = options.resumeRun;
-    this.#allowSelfDecision = options.allowSelfDecision ?? false;
+    this.#allowSelfDecision = options.allowSelfDecision;
     this.#now = options.now ?? (() => new Date());
   }
 
@@ -269,7 +296,10 @@ export class ApprovalService {
   ): Promise<DecideResult> {
     this.#authorize(actor, CAN_REVIEW, 'approval.decide', `approval:${id}`);
     this.#assertDecisionInput(input);
-    if (!this.#allowSelfDecision) {
+    // Role-scoped SoD: an exempt decider (allowSelfDecision: true, or a role
+    // named in { roles }) skips the pre-read entirely; everyone else keeps
+    // today's read-then-CAS self-request denial.
+    if (!selfDecisionExempts(this.#allowSelfDecision, actor.role)) {
       const existing = await this.#store.get(id);
       if (!existing) throw new UnknownApprovalError(id);
       // requestedBy is immutable after create, so read-then-CAS carries no
@@ -299,6 +329,10 @@ export class ApprovalService {
       from: OPEN_STATUSES,
       patch,
     });
+    // Annotate a PERMITTED self-decision from the post-transition record (no
+    // extra read): an exercised SoD exemption must leave an audit trail. Fires
+    // for both a global `true` and a role-scoped exemption.
+    const selfDecision = updated.requestedBy === actor.id;
     this.#record(actor, 'approval.decide', `approval:${id}`, 'allowed', {
       detail: {
         decision: input.decision,
@@ -310,6 +344,7 @@ export class ApprovalService {
         tenantId: updated.tenantId,
         workflowId: updated.workflowId,
         runId: updated.runId,
+        ...(selfDecision ? { selfDecision: true } : {}),
       },
     });
     return { record: updated, resume: await this.#resume(updated, actor) };
@@ -642,7 +677,7 @@ export class ApprovalService {
     // by parsing run_id), so a foreign-prefixed record would not leak — but it
     // would be an orphan row no tenant's queue ever shows. Turn it into a
     // loud error at the only write path.
-    if (!input.runId.startsWith(`${this.#store.tenantId}_`)) {
+    if (!tenantOwnsSaltedId(this.#store.tenantId, input.runId)) {
       throw new InvalidApprovalInputError(
         `runId '${input.runId}' does not carry this tenant's prefix '${this.#store.tenantId}_' — approvals bind to tenant-salted runs (INV-1)`,
       );

@@ -5,8 +5,10 @@ Instructions for Claude Code when working in this repository.
 ## Project Status
 
 Roadmap Phases 1-4 implemented (see `mvp-roadmap.md`, gitignored/local-only).
-Pinned to `@mastra/core` 1.50.0. CI (`.github/workflows/ci.yml`) runs the
-verification gate + `spike:verify` on push/PR to `main`. Phases 1-3:
+Pinned to `@mastra/core` 1.50.0. Both libraries are published to npm at
+**0.2.0**. CI (`.github/workflows/ci.yml`) runs the verification gate + the
+react-18 peer-floor probe + the full react-doctor gate + `spike:verify` on
+push/PR to `main` and `dev`. Phases 1-3:
 
 - breakwater: `PolicyEngine` + `RBACMiddleware` as real Mastra processors,
   `AuditLogger` shared sink (own module `src/audit/`, re-exported from
@@ -131,8 +133,32 @@ consume as thin shells. Plus `pnpm docs:api` (typedoc), SPDX headers on every
 library src file (guarded by per-package `spdx.test.ts`), and a CI-run
 react-18 peer-floor probe (`typecheck:react18`).
 
+Pending-closeout batch (2026-07-12, branch `feat/pending-closeout`):
+breakwater grew fetch-level egress enforcement — `createConnector` hands
+`execute`/`dryRunExecute` a third `ConnectorRuntime` argument whose `fetch`
+(`egressFetch`, own module) pins ACTUAL requests — redirect hops included,
+manual per-hop checks, cross-origin credential-header stripping, one-shot
+stream bodies refuse 307/308 — to the manifest's declared egress (policy
+'egress-fetch'; empty manifest = no network; `egressDomainAllowed` is the
+one matcher shared with the declaration gate; `policies.fetch` injects the
+base; vendor SDKs with their own HTTP stack remain the documented
+declaration-only residual). flowsafe grew the agent-memory tenancy
+chokepoints (`docs/agent-memory-tenancy.md`; agents-with-memory is
+committed roadmap): `do-runner/memory-id.ts` mints
+(`mintThreadId`/`mintResourceId`/`tenantOfMemoryId`/`tenantOwnsMemoryId`),
+`TenantContext.newThreadId()/newResourceId()/ownsMemoryId()` (breaking for
+hand-built TenantContext literals), `purgeTenant` memory-table coverage +
+`PurgeTenantResult.{threads,messages,resources}`, schema-guard memory
+column pins + the two-tenant same-business-key adversarial case. The first
+memory FEATURE still owes: host-boundary id rejection, the recall-path
+proof, and a thread TTL (items 5–7 in the design doc). Plus: flowsafe's
+breakwater peer widened to `>=0.2.0 <1.0.0` (one half of the
+peer-escalation trap fix; the changeset `onlyUpdatePeerDependentsWhenOutOfRange`
+config flag that makes the range take effect landed 2026-07-13 — see
+Branching and releases).
+
 Verification gate: `pnpm lint && pnpm typecheck && pnpm test && pnpm build`
-(1119 tests; lint is ONE root Biome 2 pass, test is ONE root vitest run over
+(1119+ tests; lint is ONE root Biome 2 pass, test is ONE root vitest run over
 every package via `test.projects`). CI adds the full react-doctor gate
 (100/100 over `packages/showcase`, `--blocking warning`), the react-18
 peer-floor probe, and `spike:verify`.
@@ -178,11 +204,12 @@ runId prefix ownership check and the `[tid_, tid\x60)` range purge EXACT
 longer no-ops approved re-suspension resumes); `ISOLATION_SCOPE_CONTEXT_KEY` segments
 breakwater idempotency/rate-limit keys per tenant (no flag — absent scope keeps single-tenant
 keys; `tenantIsolation` evaluator denies scope-less calls incl. dry-run); `purgeTenant`
-offboards all three stores (any-status snapshots + approvals + artifacts;
+offboards every tenant-keyed store (any-status snapshots + agent-memory
+threads/messages/resources + approvals + artifacts;
 a missing snapshot table reads as empty so run-less tenants — expired demo
 sandboxes — still offboard, and artifacts of retention-purged runs are covered
 by that purge's own `artifactStore` pairing, not re-enumerable here); Mastra
-six-table-inventory + `run_id` schema guards; the R2 no-workflow-level-listing pin; identity
+six-table-inventory + `run_id`/memory-column schema guards; the R2 no-workflow-level-listing pin; identity
 via `TokenVerifier` (`staticTokenVerifier` + HS256 `hmacVerifier`; `ApprovalActor.tenantId`
 required; the `tenants` registry is the allocation authority — `RESERVED_FOR_ALLOCATION`
 denied at provisioning (infra slugs + `system` + `default`), `RESERVED_TENANT_IDS`
@@ -220,19 +247,38 @@ users); GitHub stays a config-only fallback.
 - **`dev` is the integration branch — all feature/fix PRs target `dev`.**
   Branch off `dev`, open PRs into `dev`, and add a changeset describing the
   change. Do NOT open feature PRs against `main`.
-- **`main` is the release/production branch.** Only a **release PR**
-  (`dev` → `main`) lands there, bringing the accumulated changesets. Merging it
-  runs `release.yml`: the changesets action opens a "Version Packages" PR
-  (changelog + version bump), and merging THAT PR publishes to npm with
-  provenance and pushes tags. The live demo deploys from `main`.
-- `main` remains the changesets `baseBranch` and the sole `release.yml` trigger
-  (publishing never runs on `dev`); CI (`ci.yml`) runs on both `main` and `dev`,
-  so the verification gate fires on every PR into the integration branch, not
-  only at release time.
-- **After a release publishes, sync `main` → `dev`** (fast-forward or merge) so
-  `dev` carries the version bump + CHANGELOG and drops the consumed changesets
-  (the Version Packages PR commits those to `main` only) — the next release then
-  starts from a clean `dev`.
+- **Version bumps happen ON dev (bump-on-dev, 2026-07-12).** `version.yml`
+  runs on every push to `dev` and maintains a standing "Version Packages" PR
+  against dev (`changeset-release/dev`): bumps + CHANGELOGs + changeset
+  deletion all land on the integration branch. Changesets `baseBranch` is
+  `dev`.
+- **`main` is the release/production branch.** The release ritual: confirm
+  the Version Packages PR is current, merge it into `dev`, then IMMEDIATELY
+  cut and merge the release PR (`dev` → `main`) — it carries the bump, so CI
+  validates the exact tree that publishes. Merging runs `release.yml`, which
+  ONLY publishes (any package.json version not yet on npm) + tags + GitHub
+  releases; it never opens PRs or commits to main. The live demo deploys
+  from `main`.
+- **No `main` → `dev` back-sync exists anymore** — main only ever receives
+  merge commits from dev, so there is nothing to flow back. The freeze
+  window (a feature merging into dev between the Version-PR merge and the
+  release-PR merge) is guarded by release.yml's tripwire: pending changeset
+  files on main FAIL the publish loudly; merge the regenerated Version
+  Packages PR and re-cut the release PR.
+- **Changesets peer-escalation trap (RESOLVED 2026-07-13):** a breakwater
+  MINOR leaving flowsafe's peer range made changesets escalate flowsafe to
+  MAJOR (0.2.0 proposed flowsafe 1.0.0). Closing it needs BOTH: flowsafe's
+  breakwater peer at `>=0.2.0 <1.0.0` AND `.changeset/config.json` setting
+  `___experimentalUnsafeOptions_WILL_CHANGE_IN_PATCH.onlyUpdatePeerDependentsWhenOutOfRange:
+  true`. Without the flag, changesets escalates a peer-dependent on ANY peer
+  bump regardless of range, so the widened range alone was inert (a
+  breakwater minor still forced flowsafe to MAJOR until the flag landed
+  2026-07-13). With both, breakwater 0.x minors stay in-range and no
+  escalation fires. The trap returns if the range is re-narrowed (e.g. at
+  breakwater 1.0) OR the flag is removed — then override by editing the
+  Version Packages PR before merging it.
+- CI (`ci.yml`) runs on both `main` and `dev`, so the verification gate
+  fires on every PR into the integration branch, not only at release time.
 
 ## Files
 
@@ -243,8 +289,9 @@ users); GitHub stays a config-only fallback.
 | `LICENSE` | Apache-2.0 license text | Licensing questions |
 | `SECURITY.md` | Vulnerability reporting (GitHub private advisories) + scope | Reporting or triaging a security issue |
 | `.github/workflows/ci.yml` | CI — verification gate + react-18 peer-floor probe (`typecheck:react18`, after Build) + react-doctor full gate + `spike:verify` on push/PR to `main`/`dev` | Changing CI, debugging a failed check |
-| `.github/workflows/release.yml` | Changesets release: on push to `main`, opens/updates the "Version Packages" PR or publishes unpublished versions to npm with provenance (needs the `NPM_TOKEN` secret) | Changing the publish pipeline, debugging a failed release |
-| `.changeset/` | Changesets config (`config.json`: public access, main base) + contributor how-to (`README.md`); pending changesets live here between releases | Adding a changeset, changing versioning behavior |
+| `.github/workflows/version.yml` | Bump-on-dev half of the release flow: on push to `dev`, maintains the standing "Version Packages" PR against dev (version bumps + changelogs on the integration branch; no-op without pending changesets) | Changing how versions are proposed |
+| `.github/workflows/release.yml` | Publish half: on push to `main`, refuses pending changesets (freeze-window tripwire), then publishes unpublished versions to npm with provenance + tags + GitHub releases (needs the `NPM_TOKEN` secret). Never opens PRs or commits to main | Changing the publish pipeline, debugging a failed release |
+| `.changeset/` | Changesets config (`config.json`: public access, `dev` base) + contributor how-to (`README.md`); pending changesets live here between releases | Adding a changeset, changing versioning behavior |
 | `package.json` | Root workspace manifest and scripts: `build`/`typecheck` fan out with `-r`; `lint`/`lint:fix` run ONE root Biome pass; `test`/`test:watch` run ONE root vitest; `dev` = showcase dev server; `docs:api` = typedoc (on-demand, output gitignored); `react-doctor`/`react-doctor:diff` mirrors; `prepare` installs husky | Adding dependencies, modifying workspace scripts |
 | `typedoc.json` | Root typedoc config (`entryPointStrategy: packages` over breakwater + flowsafe; out `docs/api/`, gitignored). approval-ui is deliberately NOT typedoc'd — its DOM/JSX program conflicts with the workers-typed one; its README documents that surface | Changing API-reference generation |
 | `pnpm-workspace.yaml` | pnpm workspace package globs + supply-chain `minimumReleaseAge` (7-day buffer; exclusions documented inline, incl. `deslop-js` for react-doctor's dlx install) | Adding or removing workspace packages, dependency-age failures |
@@ -368,7 +415,12 @@ runtime — Mastra provides workflows, agents, memory, RAG, and observability.
   requestContext must never be populated from client input, model output,
   or tool results (`security-threat-model.md`, trust boundary 6).
   Separation of duties: `decide()` denies the requester deciding their own
-  request by default (`allowSelfDecision` is the explicit opt-out).
+  request by default. `allowSelfDecision` (`boolean | { roles }`; env
+  `APPROVAL_ALLOW_SELF_DECISION`, fail-closed to OFF) is the explicit opt-out —
+  `true` exempts every decider, `{ roles }` only the listed ones (the demo sets
+  `admin`, so one operator can clear product-launch's two gates alone); a
+  permitted self-decision is audited (`detail.selfDecision: true`), and the run
+  catalog echoes `actor.canSelfDecide`.
   Mastra-native `requireApproval` stays compiled purely as the agent pause
   UX — a per-call predicate that exempts dry-run requests (a simulation
   never reaches a side effect; runtime paths that evaluate it without a

@@ -289,15 +289,24 @@ export interface PurgeTenantOptions {
 
 export interface PurgeTenantResult {
   snapshots: number;
+  /** Agent-memory rows (docs/agent-memory-tenancy.md): salted thread ids. */
+  threads: number;
+  /** Agent-memory rows: deleted by their salted thread_id. */
+  messages: number;
+  /** Agent-memory rows: salted resource ids (working memory). */
+  resources: number;
   approvals: number;
   artifacts: number;
 }
 
 /**
- * Complete tenant offboarding: reaps ALL THREE stores — snapshot rows of ANY
- * status (a tenant's suspended-and-abandoned runs are never eligible for the
- * terminal-only retention purge at any age), the tenant's approval records
- * (titles, summaries, payloads, decider identities), and its R2 artifacts.
+ * Complete tenant offboarding: reaps EVERY tenant-keyed store — snapshot
+ * rows of ANY status (a tenant's suspended-and-abandoned runs are never
+ * eligible for the terminal-only retention purge at any age), the tenant's
+ * agent-memory rows (threads/messages/resources — salted per
+ * docs/agent-memory-tenancy.md, so the same range predicate is exact), the
+ * tenant's approval records (titles, summaries, payloads, decider
+ * identities), and its R2 artifacts.
  *
  * The snapshot predicate is a RANGE over the INV-1 salted runId:
  * `run_id >= '<tid>_' AND run_id < '<tid>' || CHAR(0x60)`. tenantId is
@@ -380,7 +389,42 @@ export async function purgeTenant(
     );
   }
 
-  // 3. Approvals — by the tenant_id column. Hosts without the approval queue
+  // 3. Agent-memory rows — the SAME exact range, over the salted ids the
+  // memory-id chokepoint mints (threads/resources by id, messages by their
+  // NOT-NULL thread_id; message ids themselves are unsalted by design). The
+  // three DELETEs run concurrently via Promise.all — child-before-parent order is
+  // non-load-bearing (messages range on their own thread_id column, Mastra
+  // declares no FK, every table independently re-sweepable after a mid-purge
+  // failure in any order), the memory[counter] writes hit distinct keys so
+  // there is no shared-state race, each statement keeps its own missing-table
+  // tolerance, and a first non-missing-table error still rejects. A missing
+  // table reads as empty — the tables exist wherever createD1Storage ran
+  // (eager creation), but crafted test databases and non-D1Store hosts may
+  // not have them.
+  const memoryPurges = [
+    ['messages', 'mastra_messages', 'thread_id'],
+    ['threads', 'mastra_threads', 'id'],
+    ['resources', 'mastra_resources', 'id'],
+  ] as const;
+  const memory = { threads: 0, messages: 0, resources: 0 };
+  await Promise.all(
+    memoryPurges.map(async ([counter, table, column]) => {
+      try {
+        memory[counter] = d1Changes(
+          await db
+            .prepare(
+              `DELETE FROM ${prefix}${table} WHERE ${column} >= ? AND ${column} < ?`,
+            )
+            .bind(lower, upper)
+            .run(),
+        );
+      } catch (error) {
+        if (!isMissingTable(error)) throw error;
+      }
+    }),
+  );
+
+  // 4. Approvals — by the tenant_id column. Hosts without the approval queue
   // have no such table; a missing table is the only tolerated failure.
   let approvals = 0;
   try {
@@ -394,7 +438,7 @@ export async function purgeTenant(
     if (!isMissingTable(error)) throw error;
   }
 
-  return { snapshots, approvals, artifacts };
+  return { snapshots, ...memory, approvals, artifacts };
 }
 
 /** Rows affected by a D1 write, read from its `{ meta: { changes } }` envelope. */

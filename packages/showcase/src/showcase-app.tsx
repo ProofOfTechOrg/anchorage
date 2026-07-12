@@ -171,6 +171,10 @@ export function ShowcaseApp({
     (selected.status === 'pending' ||
       selected.status === 'claimed' ||
       selected.status === 'escalated');
+  // Does the server exempt THIS identity from SoD (e.g. admin in this demo)?
+  // Drives which self-request notice shows: the "will refuse" warning, or the
+  // "you may decide it here" relaxation note.
+  const canSelfDecide = actor?.canSelfDecide ?? false;
 
   // The reset confirm's onAction. The button stays enabled for every role —
   // a non-admin click earns the server's 403, narrated as the RBAC lesson —
@@ -406,7 +410,11 @@ export function ShowcaseApp({
                 {selfRequested ? (
                   <Banner
                     status="info"
-                    title="Separation of duties: you advanced this run into its gate, so the server will refuse your decision (403)."
+                    title={
+                      canSelfDecide
+                        ? 'You advanced this run into its gate. This deployment lets your role decide its own requests, so you can approve it here.'
+                        : 'Separation of duties: you advanced this run into its gate, so the server will refuse your decision (403). Switch to a different reviewer or to admin to decide it.'
+                    }
                     description={GLOSSARY.sod}
                   />
                 ) : null}
