@@ -162,6 +162,8 @@ export {
   InMemoryResumeLedger,
   InvalidRunRequestError,
   init,
+  mintResourceId,
+  mintThreadId,
   PATH_SAFE_ID_PATTERN,
   purgeExpiredWorkflowRuns,
   purgeTenant,
@@ -169,7 +171,9 @@ export {
   RunNotSuspendedError,
   RunnerRuntime,
   TENANT_ID_PATTERN,
+  tenantOfMemoryId,
   tenantOfRunId,
+  tenantOwnsMemoryId,
   UnknownRunError,
   UnknownWorkflowError,
 } from './do-runner/index.js';

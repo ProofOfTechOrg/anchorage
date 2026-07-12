@@ -39,8 +39,12 @@ export function createSlackPoster(webhookHost = 'hooks.slack.com') {
       // Fixed-window budget; only actual executions consume it.
       rateLimit: '60/min',
     },
-    execute: async (input) => {
-      const response = await fetch(`https://${webhookHost}${input.webhookPath}`, {
+    // The third argument is the per-call runtime: its fetch is bound to the
+    // egress list above — an actual request (redirect hops included) to any
+    // other host is denied before bytes leave. Make every network call
+    // through it.
+    execute: async (input, _context, runtime) => {
+      const response = await runtime.fetch(`https://${webhookHost}${input.webhookPath}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ text: input.text }),
@@ -49,7 +53,8 @@ export function createSlackPoster(webhookHost = 'hooks.slack.com') {
       return { delivered: true };
     },
     // Same output shape, zero side effects — validate what you can without
-    // sending. Callers request it per call (DRY_RUN_CONTEXT_KEY).
+    // sending. Callers request it per call (DRY_RUN_CONTEXT_KEY). Gets the
+    // same egress-guarded runtime as execute.
     dryRunExecute: async () => ({ delivered: false, simulated: true }),
   });
 }
@@ -60,7 +65,7 @@ export function createSlackPoster(webhookHost = 'hooks.slack.com') {
 | Field | Meaning | Enforcement |
 | ----- | ------- | ----------- |
 | `sideEffect` | `'read'` — no state change. `'write'` — creates/updates state. `'destructive'` — deletes or irreversibly changes state. `'idempotent'` — write-class but safely repeatable. | Write-class calls (`write`/`destructive`/`idempotent`) are what the approval gate and `writePermissions` globs match; `destructive` requires approval by default under any `writePermissions` policy. Also surfaces as Mastra tool hints (`readOnlyHint`, `destructiveHint`). |
-| `egress` | Every hostname your connector contacts. | The network-egress gate runs pre-execute; calls to undeclared hosts are denied (`ConnectorPolicyError`, `policy: 'network-egress'`) and audited. Deny beats allow. |
+| `egress` | Every hostname your connector contacts. | Enforced at two levels. Pre-execute, the network-egress gate checks the DECLARED list against the org allowlist (`ConnectorPolicyError`, `policy: 'network-egress'`). At runtime, the `runtime.fetch` guard handed to `execute`/`dryRunExecute` pins the connector's ACTUAL requests — redirect hops included — to the declared list (`policy: 'egress-fetch'`; no declaration = no network). Both audited; deny beats allow. |
 | `idempotencyKey` | Caller must set `IDEMPOTENCY_KEY_CONTEXT_KEY` per call. | Replays of a stored key return the stored result without re-executing; concurrent same-key calls join one in-flight execution (atomic reserve when the store supports it). Keys are segmented by the host-minted isolation scope (`ISOLATION_SCOPE_CONTEXT_KEY`) when present — never hand-prefix a tenant into the key. |
 | `requiresApproval` | Always require a human approval, regardless of org policy. | The call is denied unless the requestContext grant (`breakwater.approvedConnectors`) names this connector id. The grant is the **only** approval token — an agent-shaped execution context never bypasses it. flowsafe's approval queue mints grants from APPROVED records at resume time. |
 | `dryRun` | Connector supports side-effect-free simulation. | Requires `dryRunExecute` (and is forbidden without it). A caller sets `DRY_RUN_CONTEXT_KEY` and gets the simulation — allowed without a grant, because a simulation never reaches a side effect; the real call still needs one. |
@@ -74,12 +79,16 @@ options, `writePermissions` (org-level approval globs), custom `evaluators`
 
 ## Known limits (accepted, not bugs)
 
-- **`egress` is declaration-based, not enforced at the socket.** The gate
-  checks what the manifest *says* it calls, not what `fetch`/the vendor SDK
-  actually reaches — there is no runtime interception yet. It catches
-  misconfiguration and org-policy drift, not a connector (or a compromised
-  dependency) that lies about its egress. Treat it as an allowlist on paper,
-  not a network sandbox, until fetch-level enforcement ships.
+- **The egress guard covers `runtime.fetch`, not the raw socket.** Requests
+  made through the runtime-injected fetch are enforced per actual request,
+  redirect hops included, with credential headers stripped on cross-origin
+  hops. What it cannot see is traffic that never goes through it: a vendor
+  SDK carrying its own HTTP stack, or code reaching for the global `fetch`.
+  Route SDK traffic through `runtime.fetch` (most SDKs accept a
+  fetch/transport option) — a connector that fetches around the runtime
+  degrades to declaration-only enforcement for that traffic. Denying the
+  isolate's raw network (socket-level interception) remains host
+  infrastructure, not library, territory.
 - **`rateLimit` is a fixed window, not a hard cap.** A burst straddling the
   boundary between two adjacent windows can admit up to ~2x the declared
   budget (worse across isolates under clock skew). This is inherent to fixed
@@ -90,9 +99,14 @@ options, `writePermissions` (org-level approval globs), custom `evaluators`
 
 - **Classify by the worst thing the connector can do.** A "create or
   replace" API is `destructive`, not `write`. When in doubt, go stricter.
+- **Make every network call through `runtime.fetch`.** It is the enforcement
+  point: requests through it are checked against your declared egress per
+  call; requests around it are not checked at all. Vendor SDKs almost always
+  accept a custom fetch/transport — pass `runtime.fetch` in.
 - **Declare all egress, including redirects and regional hosts.** An
-  undeclared host is a denial in production, so missing declarations surface
-  in your own testing — that is by design.
+  undeclared host is a denial in production — `runtime.fetch` denies actual
+  requests (redirect hops included) to hosts you forgot to declare — so
+  missing declarations surface in your own testing. That is by design.
 - **`dryRunExecute` must be genuinely side-effect-free.** It runs without an
   approval grant. If your simulation calls the vendor (e.g. a validate
   endpoint), that call must be read-only and its host declared in `egress`.
@@ -113,16 +127,19 @@ options, `writePermissions` (org-level approval globs), custom `evaluators`
 
 ## Testing expectations
 
-Ship tests with the connector — mock the vendor (inject `fetch`/SDK), never
-the wrapper. The enforcement paths worth pinning, in the repo's
+Ship tests with the connector — mock the vendor (inject the mock as
+`policies.fetch`, the base fetch the egress guard wraps), never the wrapper. The enforcement paths worth pinning, in the repo's
 `#given/#when/#then` style (see
 `src/agent-cli/agent-cli.test.ts` for a complete example of testing a
 connector through the wrapper):
 
 1. **Happy path** — declared host, grant present (if approval-gated),
    executes and returns the schema'd output.
-2. **Egress denial** — an undeclared host is denied with
-   `ConnectorPolicyError` and your vendor mock is never called.
+2. **Egress denial** — both flavors: a manifest declaring a host outside the
+   org allowlist is denied pre-execute (`policy: 'network-egress'`), and a
+   `runtime.fetch` call to an undeclared host is denied in-flight
+   (`policy: 'egress-fetch'`) with your vendor mock (injected as
+   `policies.fetch`) never called.
 3. **Approval denial** — write-class call without the grant is denied;
    with the grant it executes.
 4. **Dry-run** — `DRY_RUN_CONTEXT_KEY` returns the simulation, the vendor

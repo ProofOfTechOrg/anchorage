@@ -41,25 +41,28 @@ construction; `PolicyEngine` rejects that configuration without one rather than
 silently no-op.
 
 `createConnector()` wraps Mastra `createTool()` with an enforced permission
-manifest — network-egress allowlisting, write-approval gating (a
-requestContext grant gates every path; Mastra's native `requireApproval` is
-compiled so agent runs pause for the decision, but it never substitutes for
-the grant), keyed idempotent replay (in-memory + D1 atomic stores), per-call
-dry-run simulation, and fixed-window rate limiting. Custom tool-boundary
-evaluators register via `policies.evaluators`. Enforcement contract:
+manifest — network-egress allowlisting (declaration gate + a per-call
+`ConnectorRuntime.fetch` guard pinning actual requests, redirect hops
+included, to the declared hosts), write-approval gating (a requestContext
+grant gates every path; Mastra's native `requireApproval` is compiled so
+agent runs pause for the decision, but it never substitutes for the grant),
+keyed idempotent replay (in-memory + D1 atomic stores), per-call dry-run
+simulation, and fixed-window rate limiting. Custom tool-boundary evaluators
+register via `policies.evaluators`. Enforcement contract:
 `docs/connector-interface.md`; authoring guide: `CONNECTORS.md`.
 
 Agent CLI adapters (`@proofoftech/breakwater/agent-cli`) ship Claude Code and
 Codex as approval-gated connectors — Node-only at execution time.
 
-**Egress and rate-limit caveats.** `networkEgress` gates what a connector's
-manifest *declares* it calls, not the actual socket — there is no fetch-level
-interception (yet). It catches misconfiguration and org-policy drift, not a
-connector (or a compromised dependency) that lies about its egress; treat it
-as a declaration/allowlist control, not a network sandbox. Fixed-window
-`rateLimit` can admit up to ~2x the declared budget across two adjacent
-windows (amplified by cross-isolate clock skew) — an accepted characteristic
-of fixed windows, not a bug. See `CONNECTORS.md`'s "Known limits" for detail.
+**Egress and rate-limit caveats.** The egress guard covers code that uses
+the runtime-injected fetch: a vendor SDK carrying its own HTTP stack
+bypasses it (route the SDK's traffic through `runtime.fetch` — most SDKs
+accept a fetch/transport option — or that connector's egress posture
+degrades to declaration-only). Socket-level interception remains
+host-infrastructure territory. Fixed-window `rateLimit` can admit up to ~2x
+the declared budget across two adjacent windows (amplified by cross-isolate
+clock skew) — an accepted characteristic of fixed windows, not a bug. See
+`CONNECTORS.md`'s "Known limits" for detail.
 
 ## Usage
 

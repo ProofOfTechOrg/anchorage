@@ -453,6 +453,15 @@ describe('purgeTenant (complete offboarding)', () => {
       status: 'suspended',
       updatedAt: NOW,
     });
+    // Digit-suffixed neighbor: '5' (0x35) sorts BELOW '_' (0x5F), so this
+    // row is inside the broken range if the lower bound ever loses its
+    // trailing underscore ('abc' instead of 'abc_') — the letter neighbor
+    // above cannot catch that mutant (excluded by the upper bound alone).
+    seedRun(sqlite, {
+      runId: 'abc5_r1',
+      status: 'suspended',
+      updatedAt: NOW,
+    });
     const deletedArtifacts: string[] = [];
     const artifactStore = {
       deleteRun: async (workflowId: string, runId: string) => {
@@ -468,9 +477,16 @@ describe('purgeTenant (complete offboarding)', () => {
     });
 
     // #then — abc's rows (INCLUDING the suspended one the retention purge can
-    // never reap) are gone from all three stores; abcdefg survives intact
-    expect(result).toEqual({ snapshots: 2, approvals: 1, artifacts: 2 });
-    expect(remainingRunIds(sqlite)).toEqual(['abcdefg_r1']);
+    // never reap) are gone from all three stores; both neighbors survive
+    expect(result).toEqual({
+      snapshots: 2,
+      threads: 0,
+      messages: 0,
+      resources: 0,
+      approvals: 1,
+      artifacts: 2,
+    });
+    expect(remainingRunIds(sqlite)).toEqual(['abc5_r1', 'abcdefg_r1']);
     expect(deletedArtifacts.sort()).toEqual([
       'wf/abc_r-suspended',
       'wf/abc_r-terminal',
@@ -599,7 +615,14 @@ describe('purgeTenant (complete offboarding)', () => {
 
     // #when / #then
     const result = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
-    expect(result).toEqual({ snapshots: 1, approvals: 0, artifacts: 0 });
+    expect(result).toEqual({
+      snapshots: 1,
+      threads: 0,
+      messages: 0,
+      resources: 0,
+      approvals: 0,
+      artifacts: 0,
+    });
   });
 
   it('offboards a tenant that never started a run: a MISSING snapshot table reads as empty and approvals are still reaped', async () => {
@@ -622,7 +645,14 @@ describe('purgeTenant (complete offboarding)', () => {
     });
 
     // #then — the tenant's approval rows are gone; the neighbor survives
-    expect(result).toEqual({ snapshots: 0, approvals: 1, artifacts: 0 });
+    expect(result).toEqual({
+      snapshots: 0,
+      threads: 0,
+      messages: 0,
+      resources: 0,
+      approvals: 1,
+      artifacts: 0,
+    });
     const approvals = (
       sqlite.prepare('SELECT tenant_id FROM flowsafe_approvals') as unknown as {
         all(): Array<{ tenant_id: string }>;
@@ -638,9 +668,29 @@ describe('purgeTenant (complete offboarding)', () => {
     // #when / #then
     expect(await purgeTenant(d1Like(sqlite), { tenantId: 'abc' })).toEqual({
       snapshots: 0,
+      threads: 0,
+      messages: 0,
+      resources: 0,
       approvals: 0,
       artifacts: 0,
     });
+  });
+
+  it('reads missing agent-memory tables as empty (crafted DBs, non-D1Store hosts)', async () => {
+    // #given — a snapshot table but none of the three memory tables
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    seedRun(sqlite, { runId: 'abc_r1', status: 'success', updatedAt: NOW });
+
+    // #when
+    const purged = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
+
+    // #then — snapshots reaped; the memory sweep absorbed the missing
+    // tables as zero rows instead of wedging the offboarding
+    expect(purged.snapshots).toBe(1);
+    expect(purged.threads).toBe(0);
+    expect(purged.messages).toBe(0);
+    expect(purged.resources).toBe(0);
   });
 
   it.each([

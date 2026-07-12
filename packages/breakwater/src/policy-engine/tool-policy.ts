@@ -77,12 +77,32 @@ function domainAllowed(domain: string, allowed: readonly string[]): boolean {
 }
 
 /**
+ * Shared egress host matcher: exact hostnames and '*.wildcard' entries
+ * (label-boundary safe, apex excluded), case/trailing-dot normalized on
+ * both sides. The single source of match semantics for the declaration gate
+ * (`networkEgress`) and the runtime guard (`egressFetch` in the connector
+ * SDK) — what a manifest declares and what the guard enforces must never
+ * drift.
+ */
+export function egressDomainAllowed(
+  domain: string,
+  allowedDomains: readonly string[],
+): boolean {
+  return domainAllowed(
+    normalizeDomain(domain),
+    allowedDomains.map(normalizeDomain),
+  );
+}
+
+/**
  * Deny when the connector declares egress to a domain outside the allowlist.
  *
  * Enforcement is declaration-based: it gates the egress surface the manifest
  * claims, guarding against misconfiguration and org-policy drift — not
- * against a connector that lies about what it calls. Runtime fetch
- * interception is a later phase.
+ * against a connector that lies about what it calls. The runtime half is
+ * `egressFetch` (connector SDK): every actual request a connector makes
+ * through its `ConnectorRuntime.fetch` is checked against the manifest's
+ * declared hosts, so actual ⊆ declared ⊆ this allowlist.
  */
 export function networkEgress(
   options: NetworkEgressOptions,
@@ -94,16 +114,18 @@ export function networkEgress(
       );
     }
   }
-  const allowed = options.allowedDomains.map(normalizeDomain);
   return {
     name: options.name ?? 'network-egress',
     evaluate({ egress }): PolicyDecision {
+      // Routed through the SAME exported matcher the runtime guard
+      // (egressFetch) uses, so declared and enforced semantics literally
+      // cannot drift. Declared lists are a handful of entries; the per-call
+      // re-normalization is negligible next to a single memoized map.
       for (const declared of egress) {
-        const domain = normalizeDomain(declared);
-        if (!domainAllowed(domain, allowed)) {
+        if (!egressDomainAllowed(declared, options.allowedDomains)) {
           return {
             allowed: false,
-            reason: `egress to ${domain} is not in the allowed domains`,
+            reason: `egress to ${normalizeDomain(declared)} is not in the allowed domains`,
           };
         }
       }

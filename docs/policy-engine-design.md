@@ -80,7 +80,10 @@ The policy engine is a set of evaluator functions, not a standalone service. It 
 
 All four domains are implemented. Two tool-boundary domains -- `networkEgress` (evaluator in
 `policy-engine/tool-policy.ts`, declaration-based against the manifest's
-`egress` hostnames) and write-permission gating (`approvalRequired()`,
+`egress` hostnames; its runtime half is the connector SDK's `egressFetch`
+guard, handed to `execute` as `ConnectorRuntime.fetch`, which pins actual
+requests -- redirect hops included -- to the declared list via the shared
+`egressDomainAllowed` matcher) and write-permission gating (`approvalRequired()`,
 enforced by the connector wrapper's requestContext grant check on every
 caller; also compiled to Mastra's native `requireApproval` so agent runs
 pause for the decision -- the native outcome never substitutes for the

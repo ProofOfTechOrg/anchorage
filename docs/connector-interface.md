@@ -18,7 +18,9 @@ export const createContact = createConnector({
   description: 'Create a Salesforce contact',
   inputSchema: z.object({ name: z.string(), email: z.string() }),
   outputSchema: z.object({ id: z.string() }),
-  execute: async (inputData, context) => ({ id: '003...' }),
+  // The third argument is the per-call ConnectorRuntime: its fetch is bound
+  // to the declared egress below — actual requests anywhere else are denied.
+  execute: async (inputData, context, runtime) => ({ id: '003...' }),
   // Anchorage extension -- permission manifest (not a createTool() field)
   permissions: {
     sideEffect: 'write',
@@ -38,7 +40,7 @@ What Mastra provides vs. what breakwater adds: Mastra `createTool()` takes `id`,
 | Field | Type | Values |
 |---|---|---|
 | `sideEffect` | enum | `read`, `write`, `destructive`, `idempotent` |
-| `egress` | string[] | Hostnames the connector calls (`api.example.com`); checked against the org `networkEgress` allowlist |
+| `egress` | string[] | Hostnames the connector calls (`api.example.com`); the declared list is checked against the org `networkEgress` allowlist pre-execute, and the connector's actual requests are pinned to the declared list by the runtime fetch guard (`ConnectorRuntime.fetch`) |
 | `idempotencyKey` | boolean | Requires caller to provide an idempotency key |
 | `dryRun` | boolean | Supports simulation without side effects |
 | `rateLimit` | string | Connector-level rate limit expression (budget is per isolation scope when the host mints one) |
@@ -79,10 +81,26 @@ Every manifest field is implemented and enforced: `sideEffect`, `egress`, `idemp
 rateLimitStore, audit }`) and wraps `execute` with the gates above plus
 three more, in order:
 
-1. **Network egress** -- every manifest-declared `egress` hostname must match
-   the org allowlist (exact or `*.wildcard`, subdomains only). Declaration-based:
-   it guards against misconfiguration and policy drift, not a connector that
-   lies about its egress surface.
+1. **Network egress** -- two halves sharing one matcher
+   (`egressDomainAllowed`: exact or `*.wildcard`, subdomains only,
+   case/trailing-dot normalized). The DECLARATION gate runs pre-execute:
+   every manifest-declared `egress` hostname must match the org allowlist
+   (policy `network-egress`) -- guarding against misconfiguration and policy
+   drift. The RUNTIME guard is `ConnectorRuntime.fetch`, the third argument
+   `execute`/`dryRunExecute` receive: an `egressFetch()` wrapper bound to the
+   manifest's declared hosts, denying any actual request outside them
+   (policy `egress-fetch`) before the base fetch runs. Redirects are followed
+   manually with a per-hop allowlist check (platform `redirect: 'follow'`
+   would let an allowed host 302 anywhere), credential headers are stripped
+   on cross-origin hops, non-http(s) schemes and unparseable URLs fail
+   closed, and an empty/absent `egress` declaration denies all network.
+   Residual: traffic that never goes through `runtime.fetch` (a vendor SDK's
+   own HTTP stack, the global fetch) is not intercepted -- route SDK traffic
+   through `runtime.fetch` or that connector's egress posture degrades to
+   declaration-only. `policies.fetch` injects the base fetch (tests put the
+   vendor mock there); denials audit as decision 'denied' with
+   `detail.policy: 'egress-fetch'` and never echo the full URL (host only --
+   query strings can embed secrets).
 2. **Write approval** -- `approvalRequired()` (manifest `requiresApproval`,
    destructive-by-default, or org `writePermissions.requireApproval` connector-id
    globs). Enforcement is the wrapper's grant check on **every** path: the call

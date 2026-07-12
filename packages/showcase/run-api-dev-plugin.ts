@@ -189,6 +189,12 @@ export function runApiDevPlugin(): Plugin {
       }
       return {
         snapshots,
+        // No showcase workflow writes agent memory; when one does, sweep the
+        // in-memory store's memory domain here (docs/agent-memory-tenancy.md
+        // item 5) instead of leaving the constants.
+        threads: 0,
+        messages: 0,
+        resources: 0,
         approvals: storeFactory.purgeTenant(tenantId),
         artifacts: 0,
       };

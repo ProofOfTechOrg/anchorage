@@ -836,6 +836,7 @@ export type {
 export {
   approvalRequired,
   crossWorkflowIsolation,
+  egressDomainAllowed,
   ISOLATION_SCOPE_CONTEXT_KEY,
   networkEgress,
   tenantIsolation,

@@ -370,7 +370,14 @@ describe('showcase worker fetch(): the demo-reset mount', () => {
     expect(await response.json()).toEqual({
       ok: true,
       tenantId: DEMO_TENANT,
-      purged: { snapshots: 1, approvals: 1, artifacts: 0 },
+      purged: {
+        snapshots: 1,
+        threads: 0,
+        messages: 0,
+        resources: 0,
+        approvals: 1,
+        artifacts: 0,
+      },
     });
     // #then — the demo tenant's stores are empty, the foreign tenant's intact
     const remaining = sqlite

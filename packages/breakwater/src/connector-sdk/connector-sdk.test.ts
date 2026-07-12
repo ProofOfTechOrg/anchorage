@@ -1238,6 +1238,50 @@ describe('atomic idempotency (reserve path)', () => {
     ]);
   });
 
+  it('audits a keyed rate-limit store PRIMITIVE throw exactly once (wrapped, audit-once holds)', async () => {
+    // #given — nothing in the RateLimitStore contract requires Error
+    // instances; a primitive throw must not defeat the audit-once WeakSet
+    const audit = new AuditLogger();
+    const store = spyAtomicStore();
+    const { tool, execute } = makeConnector({
+      permissions: {
+        sideEffect: 'write',
+        idempotencyKey: true,
+        rateLimit: '5/min',
+      },
+      policies: {
+        audit,
+        idempotencyStore: store,
+        rateLimitStore: {
+          increment: () => {
+            // deliberately a bare string throw
+            throw 'counter backend down (primitive)';
+          },
+        },
+      },
+    });
+
+    // #when / #then — the caller receives an Error carrying the message
+    // (the primitive rides on `cause`), execute never ran
+    const failure = await run(
+      tool,
+      input,
+      makeContext({ idempotencyKey: 'k1' }),
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe('counter backend down (primitive)');
+    expect((failure as Error).cause).toBe('counter backend down (primitive)');
+    expect(execute).not.toHaveBeenCalled();
+    // #then — still exactly ONE audit record; no misattributed second
+    // 'execute threw' event
+    expect(audit.events()).toEqual([
+      expect.objectContaining({
+        decision: 'error',
+        detail: expect.objectContaining({ stage: 'rate-limit-store' }),
+      }),
+    ]);
+  });
+
   it('denies via approval before reserving', async () => {
     // #given
     const store = spyAtomicStore();
@@ -2128,5 +2172,136 @@ describe('in-memory store under a minted isolation scope (D5)', () => {
     // #then
     expect(warn).not.toHaveBeenCalled();
     warn.mockRestore();
+  });
+});
+
+describe('createConnector egress-fetch runtime', () => {
+  // The third execute argument: a fetch bound to the manifest's declared
+  // egress. Structural response mock (test tsconfig is lib-ES2022-only).
+  function vendorFetch(status = 200) {
+    const calls: { url: string; init: Record<string, unknown> | undefined }[] =
+      [];
+    const fn = async (url: string, init?: Record<string, unknown>) => {
+      calls.push({ url, init });
+      return {
+        status,
+        headers: { get: () => null },
+      };
+    };
+    return { fn, calls };
+  }
+
+  it('hands execute a fetch that allows declared hosts', async () => {
+    // #given
+    const vendor = vendorFetch();
+    const tool = createConnector({
+      id: 'vendor.read',
+      description: 'reads from the vendor',
+      permissions: { sideEffect: 'read', egress: ['api.vendor.com'] },
+      policies: { fetch: vendor.fn },
+      execute: async (_input, _context, runtime) => {
+        const response = await runtime.fetch('https://api.vendor.com/v1');
+        return { status: response.status };
+      },
+    });
+    // #when
+    const result = await run(tool, input);
+    // #then
+    expect(result).toEqual({ status: 200 });
+    expect(vendor.calls).toHaveLength(1);
+    expect(vendor.calls[0]?.url).toBe('https://api.vendor.com/v1');
+  });
+
+  it('denies an undeclared host at the runtime fetch and audits once', async () => {
+    // #given — declared egress is the ceiling for ACTUAL requests
+    const audit = new AuditLogger();
+    const vendor = vendorFetch();
+    const tool = createConnector({
+      id: 'vendor.read',
+      description: 'reads from the vendor',
+      permissions: { sideEffect: 'read', egress: ['api.vendor.com'] },
+      policies: { fetch: vendor.fn, audit },
+      execute: async (_input, _context, runtime) => {
+        await runtime.fetch('https://exfil.example.org/collect');
+        return { ok: true };
+      },
+    });
+    // #when
+    const failure = await run(tool, input).catch((error: unknown) => error);
+    // #then — the denial is a ConnectorPolicyError from THIS connector, so
+    // recordExecuteError must not re-record it as 'execute threw'
+    expect(failure).toBeInstanceOf(ConnectorPolicyError);
+    expect((failure as ConnectorPolicyError).policy).toBe('egress-fetch');
+    expect(vendor.calls).toHaveLength(0);
+    expect(audit.events()).toMatchObject([
+      {
+        action: 'connector.execute',
+        resource: 'vendor.read',
+        decision: 'denied',
+        detail: {
+          policy: 'egress-fetch',
+          host: 'exfil.example.org',
+          hop: 0,
+        },
+      },
+    ]);
+  });
+
+  it('denies all network for a connector with no declared egress', async () => {
+    // #given — no egress declaration means no network, not open network
+    const vendor = vendorFetch();
+    const tool = createConnector({
+      id: 'vendor.local',
+      description: 'declares no egress',
+      permissions: { sideEffect: 'read' },
+      policies: { fetch: vendor.fn },
+      execute: async (_input, _context, runtime) => {
+        await runtime.fetch('https://api.vendor.com/v1');
+        return { ok: true };
+      },
+    });
+    // #when
+    const failure = await run(tool, input).catch((error: unknown) => error);
+    // #then
+    expect(failure).toBeInstanceOf(ConnectorPolicyError);
+    expect((failure as ConnectorPolicyError).policy).toBe('egress-fetch');
+    expect(vendor.calls).toHaveLength(0);
+  });
+
+  it('hands dryRunExecute the same egress-guarded runtime', async () => {
+    // #given — a simulation's read-only vendor calls stay inside the
+    // declared egress too
+    const vendor = vendorFetch();
+    const tool = createConnector({
+      id: 'vendor.write',
+      description: 'writes to the vendor',
+      permissions: {
+        sideEffect: 'write',
+        egress: ['api.vendor.com'],
+        dryRun: true,
+      },
+      policies: { fetch: vendor.fn },
+      execute: async () => ({ simulated: false }),
+      dryRunExecute: async (_input, _context, runtime) => {
+        const denied = await runtime
+          .fetch('https://exfil.example.org/x')
+          .catch((error: unknown) => error);
+        const response = await runtime.fetch('https://api.vendor.com/check');
+        return {
+          simulated: true,
+          deniedPolicy: (denied as ConnectorPolicyError).policy,
+          checked: response.status,
+        };
+      },
+    });
+    // #when
+    const result = await run(tool, input, makeContext({ dryRun: true }));
+    // #then
+    expect(result).toEqual({
+      simulated: true,
+      deniedPolicy: 'egress-fetch',
+      checked: 200,
+    });
+    expect(vendor.calls).toHaveLength(1);
   });
 });

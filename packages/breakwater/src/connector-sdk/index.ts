@@ -45,6 +45,8 @@ import {
   networkEgress,
 } from '../policy-engine/tool-policy.js';
 import { actorFromRequestContext } from '../rbac/index.js';
+import type { EgressFetchBase, EgressGuardedFetch } from './egress-fetch.js';
+import { egressFetch } from './egress-fetch.js';
 import { newToken } from './new-token.js';
 
 /** Permission manifest — what the connector declares about itself. */
@@ -290,6 +292,29 @@ export interface ConnectorPolicies {
   /** Required when the manifest declares `rateLimit`. */
   rateLimitStore?: RateLimitStore;
   audit?: AuditLogger;
+  /**
+   * Base fetch the per-call egress guard wraps before handing it to
+   * `execute` as `ConnectorRuntime.fetch` (tests inject the vendor mock
+   * here). Defaults to the runtime's global fetch.
+   */
+  fetch?: EgressFetchBase;
+}
+
+/**
+ * Per-execution runtime handed to `execute`/`dryRunExecute` as the third
+ * argument. `fetch` is bound to the manifest's declared `egress`: every
+ * actual request — redirect hops included — must resolve to a declared host
+ * or it is denied (`ConnectorPolicyError`, policy 'egress-fetch') and
+ * audited. This is the runtime half of the egress posture (the networkEgress
+ * policy gates the declared list; this guard pins actual requests to it), so
+ * actual ⊆ declared ⊆ org-allowed. A manifest with no `egress` gets a fetch
+ * that denies everything. A vendor SDK carrying its own HTTP stack bypasses
+ * the guard — route its traffic through this fetch (most SDKs accept a
+ * fetch/transport option) or that connector's egress posture degrades to
+ * declaration-only.
+ */
+export interface ConnectorRuntime {
+  fetch: EgressGuardedFetch;
 }
 
 export interface ConnectorConfig<TInput = unknown, TOutput = unknown> {
@@ -300,15 +325,19 @@ export interface ConnectorConfig<TInput = unknown, TOutput = unknown> {
   execute: (
     inputData: TInput,
     context: ToolExecutionContext,
+    runtime: ConnectorRuntime,
   ) => Promise<TOutput>;
   /**
    * Side-effect-free simulation of `execute`, returning the same output
    * shape. Required when `permissions.dryRun` is declared, forbidden
-   * otherwise — the manifest must state what the connector supports.
+   * otherwise — the manifest must state what the connector supports. Gets
+   * the same egress-guarded runtime as `execute`: a simulation's read-only
+   * vendor calls stay inside the declared egress too.
    */
   dryRunExecute?: (
     inputData: TInput,
     context: ToolExecutionContext,
+    runtime: ConnectorRuntime,
   ) => Promise<TOutput>;
   permissions: PermissionManifest;
   /** Omit for an ungated connector (classification + audit only). */
@@ -552,9 +581,18 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   // them as 'execute threw' when they propagate out through the attempt.
   const auditedErrors = new WeakSet<object>();
 
-  // WeakSet holds objects only; a primitive throw simply stays re-recordable.
-  function markAudited(error: unknown): void {
-    if (typeof error === 'object' && error !== null) auditedErrors.add(error);
+  // The WeakSet can only hold objects, so a primitive throw from a custom
+  // store is wrapped once (message preserved, original on `cause`) and the
+  // WRAPPER is what propagates — otherwise audit-once breaks and the same
+  // store crash records a second, misattributed 'execute threw' event.
+  function markAudited(error: unknown): unknown {
+    if (typeof error === 'object' && error !== null) {
+      auditedErrors.add(error);
+      return error;
+    }
+    const wrapped = new Error(errorMessage(error), { cause: error });
+    auditedErrors.add(wrapped);
+    return wrapped;
   }
 
   function recordExecuteError(
@@ -627,8 +665,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
         reason: `rate-limit store increment failed: ${errorMessage(error)}`,
         detail: { stage: 'rate-limit-store' },
       });
-      markAudited(error);
-      throw error;
+      throw markAudited(error);
     }
     if (count > rateLimit.limit) {
       deny(requestContext, 'rate-limit', `exceeded ${manifest.rateLimit}`);
@@ -729,6 +766,28 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     const requestContext = context?.requestContext;
     const typedInput = inputData as TInput;
 
+    // Bound per call so denials audit under this call's requestContext.
+    // The org allowlist already gated the DECLARED egress list (the
+    // networkEgress evaluator below); this guard pins the connector's
+    // ACTUAL requests to that list — redirect hops included. No declared
+    // egress means the guard denies all network.
+    const runtime: ConnectorRuntime = {
+      fetch: egressFetch(manifest.egress ?? [], {
+        fetch: policies.fetch,
+        denied: (denial) => {
+          record(requestContext, 'denied', {
+            reason: `egress-fetch: ${denial.reason}`,
+            detail: {
+              policy: 'egress-fetch',
+              host: denial.host,
+              hop: denial.hop,
+            },
+          });
+          return new ConnectorPolicyError(id, 'egress-fetch', denial.reason);
+        },
+      }),
+    };
+
     if (gates.length > 0) {
       const toolCall: ToolCallContext = {
         connectorId: id,
@@ -770,7 +829,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       try {
         return finishAllowed(
           requestContext,
-          await simulate(typedInput, context),
+          await simulate(typedInput, context, runtime),
           { dryRun: true },
         );
       } catch (error) {
@@ -836,8 +895,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
             // audited: joined twins rethrow it via joinInflight, and
             // recordExecuteError must not re-record it as 'execute threw'.
             recordStoreError(requestContext, 'reserve', error, key);
-            markAudited(error);
-            throw error;
+            throw markAudited(error);
           }
           if (reservation.state === 'replay') {
             return {
@@ -889,7 +947,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
           const attempt = (async () => {
             try {
               await consumeRateLimit(requestContext);
-              const result = await config.execute(typedInput, context);
+              const result = await config.execute(typedInput, context, runtime);
               try {
                 await store.put(scoped, { result }, token);
               } catch (error) {
@@ -929,8 +987,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
           // safe and preserves replay protection for the retry. Marked
           // audited so joined twins do not re-record it (see reserve probe).
           recordStoreError(requestContext, 'get', error, key);
-          markAudited(error);
-          throw error;
+          throw markAudited(error);
         }
         if (cached) {
           return { kind: 'replay', result: cached.result as TOutput };
@@ -938,7 +995,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
         const attempt = (async () => {
           // Consume inside the attempt — see the reserve-probe note above.
           await consumeRateLimit(requestContext);
-          const result = await config.execute(typedInput, context);
+          const result = await config.execute(typedInput, context, runtime);
           // Only successful results are replayable — a thrown execute must
           // stay retryable under the same key.
           try {
@@ -960,7 +1017,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     try {
       return finishAllowed(
         requestContext,
-        await config.execute(typedInput, context),
+        await config.execute(typedInput, context, runtime),
       );
     } catch (error) {
       recordExecuteError(requestContext, error);
@@ -1021,3 +1078,15 @@ export type {
   RateLimitStatement,
 } from './d1-rate-limit-store.js';
 export { D1RateLimitStore } from './d1-rate-limit-store.js';
+export type {
+  EgressDenial,
+  EgressFetchBase,
+  EgressFetchOptions,
+  EgressGuardedFetch,
+  EgressRequestInit,
+  EgressResponse,
+  EgressResponseHeaders,
+} from './egress-fetch.js';
+// Fetch-level egress enforcement (own module; createConnector wires it per
+// call as ConnectorRuntime.fetch, but it also works standalone).
+export { EgressDeniedError, egressFetch } from './egress-fetch.js';
