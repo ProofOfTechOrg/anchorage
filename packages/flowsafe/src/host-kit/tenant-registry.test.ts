@@ -73,4 +73,23 @@ describe('provisionTenant', () => {
       }),
     ).rejects.toThrow(/INV-3/);
   });
+
+  it.each<[string, unknown]>([
+    ['undefined', undefined],
+    ['null', null],
+    // String(['acme']) === 'acme', so a bare TENANT_ID_PATTERN.test(['acme'])
+    // coerces to a valid slug and would INSERT a real 'acme' tenant row; the
+    // typeof guard refuses it (DL-002).
+    ['an array coercing to a valid-looking slug', ['acme']],
+  ])("rejects a non-string tenantId (%s) instead of coercing 'undefined' into a provisioned row", async (_label, tenantId) => {
+    // #given / #when / #then — provisionTenant takes tenantId straight from
+    // host/config-sourced options; RegExp.test would coerce undefined ->
+    // 'undefined' and INSERT it as a real tenant row (DL-002).
+    await expect(
+      provisionTenant(d1Like(openSqlite()), {
+        tenantId: tenantId as unknown as string,
+        kind: 'commercial',
+      }),
+    ).rejects.toThrow(/INV-3/);
+  });
 });

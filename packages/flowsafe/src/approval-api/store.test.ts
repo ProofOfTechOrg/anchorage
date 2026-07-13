@@ -14,13 +14,14 @@
 import { describe, expect, it } from 'vitest';
 
 import { openSqlite, type SqliteDatabase } from '../../test-support/sqlite.js';
-import type {
-  ApprovalDatabase,
-  ApprovalPreparedStatement,
+import {
+  type ApprovalDatabase,
+  type ApprovalPreparedStatement,
+  D1ApprovalStore,
 } from './d1-store.js';
 import { approvedConnectorsForLeg } from './grants.js';
 import type { ApprovalStore } from './store.js';
-import { computeApprovalMetrics } from './store.js';
+import { computeApprovalMetrics, InMemoryApprovalStore } from './store.js';
 import {
   type ApprovalStoreFactory,
   D1ApprovalStoreFactory,
@@ -79,6 +80,57 @@ function d1Like(db: SqliteDatabase): ApprovalDatabase {
     };
   }
   return { prepare: (sql: string) => statement(sql, []) };
+}
+
+// --- D1 create-race harness (F3) -------------------------------------------
+
+// Fires at the instant the store-under-test executes a #openFor SELECT or an
+// INSERT run(), letting a test interleave a concurrent decide-close (or
+// fabricate a UNIQUE violation) with byte-real SQLite semantics underneath.
+// ONLY the store-under-test's statements are wrapped; the seed store that
+// mutates the shared DB inside a hook uses a plain d1Like, so its own
+// statements never recurse through these counters.
+interface CreateRaceHooks {
+  onOpenForSelect?: (occurrence: number) => void | Promise<void>;
+  onInsert?: (occurrence: number) => void | Promise<void>;
+}
+
+function racingD1(
+  db: SqliteDatabase,
+  hooks: CreateRaceHooks,
+): ApprovalDatabase {
+  const base = d1Like(db);
+  let inserts = 0;
+  let openForReads = 0;
+  const isInsert = (sql: string): boolean => /^\s*INSERT INTO/i.test(sql);
+  // The #openFor SELECT is the only query keyed on step_key with a LIMIT 1;
+  // list()/get() never carry both, so this is an exact discriminator.
+  const isOpenFor = (sql: string): boolean =>
+    /step_key = \?/.test(sql) && /LIMIT 1/.test(sql);
+  function wrap(
+    sql: string,
+    stmt: ApprovalPreparedStatement,
+  ): ApprovalPreparedStatement {
+    return {
+      bind: (...values: unknown[]) => wrap(sql, stmt.bind(...values)),
+      first: async <T = unknown>(): Promise<T | null> => {
+        if (isOpenFor(sql)) {
+          openForReads += 1;
+          await hooks.onOpenForSelect?.(openForReads);
+        }
+        return stmt.first<T>();
+      },
+      run: async (): Promise<unknown> => {
+        if (isInsert(sql)) {
+          inserts += 1;
+          await hooks.onInsert?.(inserts);
+        }
+        return stmt.run();
+      },
+      all: <T = unknown>(): Promise<{ results: T[] }> => stmt.all<T>(),
+    };
+  }
+  return { prepare: (sql: string) => wrap(sql, base.prepare(sql)) };
 }
 
 // --- shared contract -------------------------------------------------------
@@ -310,6 +362,37 @@ function describeStoreContract(
       await expect(store.list({ createdAfter: '' })).rejects.toThrow(
         /createdAfter/,
       );
+    });
+
+    it('throws on a garbage time bound with ZERO matching records too (F6: eager validation)', async () => {
+      // #given — an EMPTY bound store: no record reaches matchesFilter, so the
+      // in-memory list() used to skip the per-record parse and return [] where
+      // D1's appendListFilters throws unconditionally (types.ts: both backends
+      // fail identically). Eager validation closes that lazy hole.
+      const store = await makeStore();
+
+      // #when / #then — a loud throw on both backends, not a silent empty page
+      await expect(store.list({ createdBefore: 'not-a-date' })).rejects.toThrow(
+        /createdBefore/,
+      );
+      await expect(store.list({ createdAfter: 'not-a-date' })).rejects.toThrow(
+        /createdAfter/,
+      );
+    });
+
+    it('the system view throws on a garbage time bound with ZERO records too (F6: both in-memory list paths closed)', async () => {
+      // #given — an EMPTY backend: the cron-only cross-tenant view shares the
+      // same lazy matchesFilter hole, so it must reject a garbage bound
+      // identically to D1's system view (DL-006 closes the whole class).
+      const backend = makeBackend();
+
+      // #when / #then
+      await expect(
+        backend.system().list({ createdBefore: 'not-a-date' }),
+      ).rejects.toThrow(/createdBefore/);
+      await expect(
+        backend.system().list({ createdAfter: 'not-a-date' }),
+      ).rejects.toThrow(/createdAfter/);
     });
 
     it('breaks a createdAt tie by id BYTEWISE on both backends (FIFO collation parity)', async () => {
@@ -928,6 +1011,196 @@ describeStoreContract(
   'D1ApprovalStore (real SQLite via node:sqlite, via D1ApprovalStoreFactory)',
   () => new D1ApprovalStoreFactory(d1Like(openSqlite())),
 );
+
+describe('InMemoryApprovalStore constructor — INV-3 non-string guard (F2, non-factory-reachable)', () => {
+  // A PUBLIC barrel export constructable WITHOUT the factory, so it must
+  // self-guard: RegExp.test coerces a non-string (undefined -> 'undefined', an
+  // INV-3-valid slug) and would collapse every such principal into ONE shared
+  // bucket (DL-002).
+  it.each<[string, unknown]>([
+    ['undefined', undefined],
+    ['null', null],
+    ['an array coercing to a valid-looking slug', ['acme']],
+  ])('throws for a non-string tenantId (%s) instead of coercing it', (_label, tenantId) => {
+    // #when / #then
+    expect(
+      () => new InMemoryApprovalStore(tenantId as unknown as string),
+    ).toThrow(/INV-3/);
+  });
+
+  it('still constructs for a valid INV-3 tenantId', () => {
+    // #when / #then — the direct (non-factory) construction path
+    expect(() => new InMemoryApprovalStore('acme')).not.toThrow();
+  });
+});
+
+describe('D1ApprovalStore constructor — INV-3 non-string guard (F2, sibling-site close)', () => {
+  // Guarded even though the class is unexported, so safety no longer rests on
+  // it staying unexported — a fragile guarantee (DL-002).
+  it.each<[string, unknown]>([
+    ['undefined', undefined],
+    ['null', null],
+    ['an array coercing to a valid-looking slug', ['acme']],
+  ])('throws for a non-string tenantId (%s) instead of coercing it', (_label, tenantId) => {
+    // #when / #then
+    expect(
+      () =>
+        new D1ApprovalStore(d1Like(openSqlite()), {
+          tenantId: tenantId as unknown as string,
+        }),
+    ).toThrow(/INV-3/);
+  });
+
+  it('still constructs for a valid INV-3 tenantId', () => {
+    // #when / #then
+    expect(
+      () => new D1ApprovalStore(d1Like(openSqlite()), { tenantId: 'acme' }),
+    ).not.toThrow();
+  });
+});
+
+describe('ApprovalStoreFactory.forTenant — INV-3 non-string guard (F2, assertTenantId path)', () => {
+  // The constructor guards above close the non-factory path; this pins the
+  // FACTORY entry — forTenant() is the only way a host obtains a bound store,
+  // and its shared assertTenantId (tenant-store.ts) must refuse a non-string
+  // tenantId at BOTH backends rather than let RegExp.test coerce it into ONE
+  // shared bucket (DL-002). The array case is the sneakiest: String(['acme'])
+  // === 'acme', a valid-looking slug the bare pattern would accept.
+  const factories: [string, () => ApprovalStoreFactory][] = [
+    ['InMemoryApprovalStoreFactory', () => new InMemoryApprovalStoreFactory()],
+    [
+      'D1ApprovalStoreFactory',
+      () => new D1ApprovalStoreFactory(d1Like(openSqlite())),
+    ],
+  ];
+  for (const [factoryName, makeFactory] of factories) {
+    it.each<[string, unknown]>([
+      ['undefined', undefined],
+      ['null', null],
+      ['an array coercing to a valid-looking slug', ['acme']],
+    ])(`${factoryName} rejects a non-string tenantId (%s)`, (_label, tenantId) => {
+      // #when / #then — a synchronous INV-3 throw before any store binds
+      expect(() =>
+        makeFactory().forTenant(tenantId as unknown as string),
+      ).toThrow(/INV-3/);
+    });
+  }
+});
+
+describe('D1ApprovalStore.create — concurrent decide-close race (F3)', () => {
+  // The idempotent-create contract ("Decided requests never block a new one")
+  // must survive a decide() closing the conflicting open row between the failed
+  // INSERT and the #openFor SELECT. D1-only (the synchronous in-memory store
+  // cannot interleave), availability-only (no capability/tenant effect).
+  it('retries the INSERT ONCE when a concurrent decide closes the conflicting open row, returning created:true', async () => {
+    // #given — a shared SQLite; a seed store opens R1 for (wf, run, gate)
+    const sqlite = openSqlite();
+    const seed = new D1ApprovalStoreFactory(d1Like(sqlite)).forTenant('acme');
+    const open1 = makeRecord({ runId: 'race-run', stepPath: ['gate'] });
+    await seed.create(open1);
+
+    // At the FIRST #openFor SELECT (between the failed INSERT and the read),
+    // transition R1 to 'approved' — the concurrent decide-close. #openFor then
+    // sees no open row (null), so create() retries the INSERT, which now
+    // succeeds because the partial open-step index is clear.
+    let closes = 0;
+    const racing = racingD1(sqlite, {
+      onOpenForSelect: async (occurrence) => {
+        if (occurrence === 1) {
+          closes += 1;
+          await seed.transition(open1.id, ['pending'], {
+            status: 'approved',
+            decidedAt: T,
+            updatedAt: T,
+          });
+        }
+      },
+    });
+    const store = new D1ApprovalStore(racing, { tenantId: 'acme' });
+
+    // #when — a fresh create for the SAME step
+    const fresh = makeRecord({ runId: 'race-run', stepPath: ['gate'] });
+    const result = await store.create(fresh);
+
+    // #then — no throw; a brand-new record was created (not R1)
+    expect(closes).toBe(1);
+    expect(result.created).toBe(true);
+    expect(result.record.id).toBe(fresh.id);
+  });
+
+  it('on a SECOND unique violation returns the now-open record (created:false), bounded to one retry', async () => {
+    // #given — seed opens R1 for (wf, run, gate)
+    const sqlite = openSqlite();
+    const seed = new D1ApprovalStoreFactory(d1Like(sqlite)).forTenant('acme');
+    const open1 = makeRecord({
+      id: 'r1-open',
+      runId: 'race-run-2',
+      stepPath: ['gate'],
+    });
+    await seed.create(open1);
+
+    // Race: at the first #openFor close R1 (=> null, forcing the retry); just
+    // before the retry INSERT a DIFFERENT concurrent create opens R2 for the
+    // same step, so INSERT#2 also hits UNIQUE; the second #openFor then finds
+    // R2 and create() returns it with created:false (no third attempt).
+    const open2 = makeRecord({
+      id: 'r2-open',
+      runId: 'race-run-2',
+      stepPath: ['gate'],
+    });
+    const racing = racingD1(sqlite, {
+      onOpenForSelect: async (occurrence) => {
+        if (occurrence === 1) {
+          await seed.transition(open1.id, ['pending'], {
+            status: 'approved',
+            decidedAt: T,
+            updatedAt: T,
+          });
+        }
+      },
+      onInsert: async (occurrence) => {
+        // occurrence 1 = the first INSERT (collides with R1); occurrence 2 =
+        // the retry: open R2 first so it ALSO collides.
+        if (occurrence === 2) await seed.create(open2);
+      },
+    });
+    const store = new D1ApprovalStore(racing, { tenantId: 'acme' });
+
+    // #when
+    const fresh = makeRecord({
+      id: 'fresh-loser',
+      runId: 'race-run-2',
+      stepPath: ['gate'],
+    });
+    const result = await store.create(fresh);
+
+    // #then — the retry lost to R2; create returns R2, created:false, no throw
+    expect(result.created).toBe(false);
+    expect(result.record.id).toBe('r2-open');
+  });
+
+  it('rethrows the second unique violation when the open row stays gone — bounded to ONE retry, never a loop', async () => {
+    // #given — an EMPTY table and a DB that fabricates a UNIQUE violation on
+    // EVERY INSERT. #openFor therefore returns null on both reads: the
+    // pathological "UNIQUE but nothing open" case the retry must not loop on.
+    const sqlite = openSqlite();
+    let inserts = 0;
+    const racing = racingD1(sqlite, {
+      onInsert: () => {
+        inserts += 1;
+        throw new Error('UNIQUE constraint failed: flowsafe_approvals.id');
+      },
+    });
+    const store = new D1ApprovalStore(racing, { tenantId: 'acme' });
+
+    // #when / #then — the second UNIQUE surfaces (no open record to return),
+    // and the INSERT was attempted EXACTLY twice (one initial + one retry)
+    await expect(
+      store.create(makeRecord({ runId: 'race-run-3', stepPath: ['gate'] })),
+    ).rejects.toThrow(/UNIQUE constraint failed/);
+    expect(inserts).toBe(2);
+  });
+});
 
 describe('InMemoryApprovalStoreFactory.purgeTenant (in-memory offboarding)', () => {
   // The in-memory mirror of D1 purgeTenant's approvals delete — the shared-Map

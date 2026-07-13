@@ -27,7 +27,10 @@ import {
 } from '../approval-api/index.js';
 import type { AuditMessageBatch, AuditQueue } from '../audit-export/index.js';
 import { createAuditQueueHandler } from '../audit-export/index.js';
-import type { SnapshotDatabase } from '../do-runner/index.js';
+import type {
+  SnapshotDatabase,
+  TenantArtifactPurger,
+} from '../do-runner/index.js';
 import { purgeExpiredWorkflowRuns } from '../do-runner/index.js';
 import { bearerActorAuthenticator } from './bearer-auth.js';
 import {
@@ -136,6 +139,18 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
    * (transports usually need secrets); undefined = no notifications.
    */
   notify?: (env: Env) => ApprovalNotificationSink | undefined;
+  /**
+   * When set, the retention purge (runPurgeMaintenance -> the built-in
+   * purgeExpiredWorkflowRuns) deletes each expired run's R2 artifacts WITH its
+   * snapshot row. The snapshot row is the only enumerable record of a run's
+   * artifact keys (R2 keys lead with workflowId — there is no run-level listing
+   * without it), so a retention purge without this pairing strands the run's
+   * artifacts beyond even purgeTenant's reach. Pass the same TenantArtifactPurger
+   * (an R2ArtifactStore) purgeTenant gets; undefined keeps the byte-identical
+   * row-only purge. NOT via extraPurgeDuties — that hook runs AFTER the rows are
+   * deleted, when the keys are already unenumerable.
+   */
+  artifactStore?: TenantArtifactPurger;
   /**
    * Extra purge-cron duties (e.g. the showcase's demo-tenant reaper). The
    * returned fields fold into the ONE combined `{type:'maintenance'}` log
@@ -249,6 +264,10 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           60 *
           60 *
           1000,
+        // Pairs each expired run's R2 artifacts with its snapshot-row deletion
+        // (artifacts BEFORE the row — the row is the only record of their keys).
+        // Undefined on hosts that wire no R2, so the purge stays byte-identical.
+        artifactStore: config.artifactStore,
       });
     } catch (error) {
       console.error(

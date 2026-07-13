@@ -836,15 +836,75 @@ describe('approval queue end to end', () => {
       },
       OPERATOR,
     );
+    // gate B must be decided by a DIFFERENT reviewer: ADMIN did not advance the
+    // run at gate A, so the cross-gate SoD bar does not apply. REVIEWER, who
+    // approved gate A causally-before gate B was filed, would now be refused here.
     const afterB = await harness.service.decide(
       recordB.id,
       { decision: 'approve' },
-      REVIEWER,
+      ADMIN,
     );
 
     // #then — both gated calls executed, one per approved leg
     expect(afterB.resume.summary).toMatchObject({ status: 'success' });
     expect(harness.publishes()).toBe(2);
+  });
+
+  it('refuses the gate-A approver at gate B even when gate B was reconcile-filed by the system actor', async () => {
+    // The reconcile hole: resumeRunWithRequeue attributes gate B to the gate-A
+    // decider (so the requestedBy self-check already bars them), but
+    // reconcileApprovalsForSummary files gate B as the SYSTEM actor — which the
+    // requestedBy check never blocks. The cross-gate bar catches it anyway,
+    // derived from the run's own APPROVED history.
+    const harness = buildHarness();
+    const started = await harness.runtime.start('double-launch', {
+      runId: `acme_${crypto.randomUUID()}`,
+      inputData: { topic: 'twice-gated-sod' },
+    });
+    const { record: recordA } = await harness.service.create(
+      {
+        workflowId: 'double-launch',
+        runId: started.runId,
+        stepPath: ['gateA'],
+        suspendedAt: suspendedAtFor(started, ['gateA']),
+        title: 'Gate A',
+        connectors: ['blog-publisher'],
+      },
+      OPERATOR,
+    );
+    // #given — REVIEWER approves gate A; the run advances and re-suspends at gate B
+    const afterA = await harness.service.decide(
+      recordA.id,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+    expect(afterA.resume.summary).toMatchObject({
+      status: 'suspended',
+      suspended: [['gateB']],
+    });
+    expect(harness.publishes()).toBe(1);
+
+    // gate B is RECONCILE-filed: attributed to the system actor, not the reviewer
+    const { record: recordB } = await harness.service.create(
+      {
+        workflowId: 'double-launch',
+        runId: started.runId,
+        stepPath: ['gateB'],
+        suspendedAt: suspendedAtFor(afterA.resume.summary, ['gateB']),
+        title: 'Gate B (reconcile-filed)',
+        connectors: ['blog-publisher'],
+        requestedBy: 'flowsafe-system',
+      },
+      OPERATOR,
+    );
+
+    // #when / #then — REVIEWER (who advanced the run at gate A) is refused gate B,
+    // despite requestedBy being the system actor rather than the reviewer, and
+    // the second publish never happens
+    await expect(
+      harness.service.decide(recordB.id, { decision: 'approve' }, REVIEWER),
+    ).rejects.toThrow(/earlier gate|separation of duties/i);
+    expect(harness.publishes()).toBe(1);
   });
 
   it('a spent approval does not mint into a re-suspension of the same step', async () => {
@@ -1092,10 +1152,14 @@ describe('approval queue end to end', () => {
       OPERATOR,
     );
     expect(second.created).toBe(true);
+    // Round 2 is decided by a DIFFERENT reviewer: REVIEWER approved round 1, so
+    // the cross-gate SoD bar refuses them at round 2 (in production the re-queue
+    // attributes round 2 to REVIEWER, and the requestedBy self-check bars them
+    // the same way). ADMIN did not advance the run, so it may decide round 2.
     const decided = await harness.service.decide(
       second.record.id,
       { decision: 'approve' },
-      REVIEWER,
+      ADMIN,
     );
 
     // #then — round 2's decision mints for round 2's suspension

@@ -292,9 +292,13 @@ function buildVerifier(env: Env): TokenVerifier {
 // two-cron maintenance (sweep vs purge never share an invocation; the
 // byte-equality contract with wrangler.jsonc lives in crons.ts), and the
 // audit-export queue consumer. This deployment supplies its workflows, its
-// verifier, and the optional client-per-subdomain cross-check; add run
-// artifacts (R2ArtifactStore) by copying the purge pairing notes in
-// host-kit's runPurgeMaintenance into an `extraPurgeDuties` hook.
+// verifier, and the optional client-per-subdomain cross-check. To add run
+// artifacts (R2ArtifactStore), set the `artifactStore` field on this config:
+// createFlowsafeWorker pairs artifact deletion INSIDE the retention purge, so
+// each expired run's artifacts are deleted BEFORE its snapshot row (the row is
+// the only enumerable record of the run's artifact keys). An `extraPurgeDuties`
+// hook cannot do this — it runs AFTER the rows are deleted, when the keys are
+// already unenumerable.
 const worker = createFlowsafeWorker<Env>({
   workflows: WORKFLOWS,
   systemActorId: SYSTEM_ACTOR_ID,

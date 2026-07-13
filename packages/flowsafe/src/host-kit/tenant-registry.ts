@@ -100,7 +100,7 @@ export async function provisionTenant(
   options: ProvisionTenantOptions,
 ): Promise<void> {
   const { tenantId, kind } = options;
-  if (!TENANT_ID_PATTERN.test(tenantId)) {
+  if (typeof tenantId !== 'string' || !TENANT_ID_PATTERN.test(tenantId)) {
     throw new Error(
       `tenantId '${tenantId}' violates INV-3 (^[a-z0-9]{3,32}$) — not provisioned`,
     );

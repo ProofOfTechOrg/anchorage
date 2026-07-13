@@ -43,10 +43,18 @@ import type {
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  type ApprovalActor,
   type ApprovalRecord,
   D1ApprovalStoreFactory,
 } from '../src/approval-api/index.js';
-import type { RunSummary } from '../src/do-runner/index.js';
+import type {
+  RunSummary,
+  TenantArtifactPurger,
+} from '../src/do-runner/index.js';
+import {
+  createFlowsafeWorker,
+  staticTokenVerifier,
+} from '../src/host-kit/index.js';
 import {
   d1DatabaseLike,
   openSqlite,
@@ -983,6 +991,91 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
       surfaces.some((line) => line.includes('approval-retention-purge')),
     ).toBe(true);
     errorSpy.mockRestore();
+  });
+});
+
+describe('createFlowsafeWorker scheduled(): artifact-paired retention purge (F4)', () => {
+  // The deploy template wires no R2, so it sets no artifactStore. This drives
+  // createFlowsafeWorker directly with one, proving runPurgeMaintenance threads
+  // config.artifactStore into the built-in purge so each expired run's artifacts
+  // are deleted BEFORE its snapshot row (the row is the only enumerable record
+  // of the run's artifact keys).
+
+  function workerWith(artifactStore: TenantArtifactPurger | undefined) {
+    return createFlowsafeWorker<Env>({
+      workflows: [],
+      systemActorId: 'flowsafe-worker',
+      buildVerifier: () =>
+        staticTokenVerifier(new Map<string, ApprovalActor>()),
+      crons: { sweep: SWEEP_CRON, purge: PURGE_CRON },
+      artifactStore,
+    });
+  }
+
+  it("deletes an expired run's artifacts BEFORE its snapshot row when artifactStore is set", async () => {
+    // #given — one stale terminal run (eligible) and one fresh terminal run
+    const { env, sqlite } = makeEnv();
+    createSnapshotTable(sqlite);
+    seedRun(sqlite, {
+      runId: 'acme_stale-done',
+      status: 'success',
+      updatedAt: Date.now() - 40 * DAY_MS,
+    });
+    seedRun(sqlite, {
+      runId: 'acme_fresh-done',
+      status: 'success',
+      updatedAt: Date.now() - 1 * DAY_MS,
+    });
+
+    // a TenantArtifactPurger that asserts the row STILL EXISTS when it runs:
+    // pairing deletes artifacts BEFORE the row, so the row (the only record of
+    // the artifact keys) must still be enumerable at this moment
+    const deletions: string[] = [];
+    const artifactStore: TenantArtifactPurger = {
+      deleteRun: vi.fn(async (_workflowId: string, runId: string) => {
+        expect(remainingRunIds(sqlite)).toContain(runId);
+        deletions.push(runId);
+        return 1;
+      }),
+    };
+
+    // #when — the PURGE cron fires
+    const { ctx, drain } = makeCtx();
+    await workerWith(artifactStore).scheduled({ cron: PURGE_CRON }, env, ctx);
+    await drain();
+
+    // #then — the stale run's artifacts were deleted (while its row still
+    // existed), then its row was purged; the fresh run is untouched
+    expect(deletions).toEqual(['acme_stale-done']);
+    expect(artifactStore.deleteRun).toHaveBeenCalledWith(
+      'wf',
+      'acme_stale-done',
+    );
+    expect(remainingRunIds(sqlite)).toEqual(['acme_fresh-done']);
+  });
+
+  it('without artifactStore the purge is unchanged — same rows deleted, no artifact store touched', async () => {
+    // #given — identical seeding, but no artifactStore wired (the deploy default)
+    const { env, sqlite } = makeEnv();
+    createSnapshotTable(sqlite);
+    seedRun(sqlite, {
+      runId: 'acme_stale-done',
+      status: 'success',
+      updatedAt: Date.now() - 40 * DAY_MS,
+    });
+    seedRun(sqlite, {
+      runId: 'acme_fresh-done',
+      status: 'success',
+      updatedAt: Date.now() - 1 * DAY_MS,
+    });
+
+    // #when
+    const { ctx, drain } = makeCtx();
+    await workerWith(undefined).scheduled({ cron: PURGE_CRON }, env, ctx);
+    await drain();
+
+    // #then — byte-identical row-only outcome
+    expect(remainingRunIds(sqlite)).toEqual(['acme_fresh-done']);
   });
 });
 

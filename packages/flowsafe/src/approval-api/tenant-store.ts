@@ -29,7 +29,10 @@ import type {
   ApprovalRecord,
   ApprovalStatus,
 } from './types.js';
-import { TERMINAL_APPROVAL_STATUSES } from './types.js';
+import {
+  assertApprovalTimeBounds,
+  TERMINAL_APPROVAL_STATUSES,
+} from './types.js';
 
 export interface ApprovalStoreFactory {
   /** Bind a store to one tenant. Throws unless tenantId satisfies INV-3. */
@@ -39,7 +42,7 @@ export interface ApprovalStoreFactory {
 }
 
 function assertTenantId(tenantId: string): void {
-  if (!TENANT_ID_PATTERN.test(tenantId)) {
+  if (typeof tenantId !== 'string' || !TENANT_ID_PATTERN.test(tenantId)) {
     throw new Error(
       `forTenant: tenantId '${tenantId}' violates INV-3 (^[a-z0-9]{3,32}$)`,
     );
@@ -119,6 +122,12 @@ export class InMemoryApprovalStoreFactory implements ApprovalStoreFactory {
       // hence the shared matchesFilter/approvalListComparator/
       // paginateApprovalList rather than a copy.
       async list(filter: ApprovalListFilter = {}): Promise<ApprovalRecord[]> {
+        // Same eager time-bound validation as the tenant-bound store's list()
+        // (store.ts): a zero-match view must reject a garbage createdBefore/
+        // createdAfter identically to D1's system view, not return [] — the
+        // shared assertApprovalTimeBounds closes the whole class across BOTH
+        // in-memory list paths (DL-006).
+        assertApprovalTimeBounds(filter);
         const matched = [...records.values()]
           .filter((record) => matchesFilter(record, filter))
           .sort(approvalListComparator(filter));

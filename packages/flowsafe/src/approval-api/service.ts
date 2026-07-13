@@ -17,7 +17,7 @@ import type {
   ApprovalRole,
 } from './contract.js';
 import { APPROVAL_ROLES, DECIDER_ROLES } from './contract.js';
-import type { ApprovalPatch } from './store.js';
+import { type ApprovalPatch, listAllApprovedForRun } from './store.js';
 import type {
   SystemApprovalStore,
   TenantBoundApprovalStore,
@@ -313,6 +313,62 @@ export class ApprovalService {
         });
         throw new ApprovalAuthzError(
           'the requester cannot decide their own approval (separation of duties; set allowSelfDecision to permit)',
+        );
+      }
+      // Cross-gate causal SoD: a reviewer who APPROVED an earlier gate of THIS
+      // run advanced it to the gate now before them, so they must not also
+      // decide this one. requestedBy attribution cannot carry this on its own —
+      // reconcileApprovalsForSummary files the next gate as the SYSTEM actor,
+      // which the requestedBy check above never blocks — so the bar is derived
+      // from the run's own APPROVED history instead.
+      //
+      // Read the COMPLETE approved history via the shared complete-reader (the
+      // same drain-all-pages helper approvedConnectorsForLeg uses, so the SoD
+      // bar and grant derivation can never drift): a many-gate run's
+      // causally-prior approval can sit past MAX_APPROVAL_LIST_LIMIT, and a
+      // single default-bounded first page would drop the newest under FIFO
+      // 'created' order and fail the bar OPEN — violating the fail-closed SoD
+      // MUST.
+      const priorApproved = await listAllApprovedForRun(
+        this.#store,
+        existing.workflowId,
+        existing.runId,
+      );
+      // APPROVED-ONLY scope: a human REJECTION also resumes the run and re-files
+      // the next gate (reject -> revise -> re-review), so barring a prior
+      // same-actor rejection would break the normal review cycle; querying
+      // 'approved' also excludes system supersede-rejections. The causal anchor
+      // priorAt <= gateAt fires for a SEQUENTIAL gate (filed after the earlier
+      // approval) but never for PARALLEL gates filed together before any
+      // decision, so independent same-actor gates are not over-blocked.
+      // existing.createdAt is mandatory so the anchor is always present;
+      // requestedBy/decidedBy/decidedAt/createdAt are immutable post-decision,
+      // so this read-then-CAS carries no TOCTOU.
+      //
+      // gateAt is constant per call — compute it once. Fail CLOSED on an
+      // unparseable stamp: `NaN <= x` and `x <= NaN` are both false, so a bare
+      // `priorAt <= gateAt` would silently DROP the bar (fail OPEN) on garbage,
+      // the opposite of the SoD MUST. A NaN priorAt OR a NaN gateAt therefore
+      // BARS (a NaN gate bars every prior-by-this-actor — the correct
+      // fail-closed direction). Unreachable today (createdAt/decidedAt are
+      // server-stamped ISO), but the security bar must not rest on that.
+      const gateAt = Date.parse(existing.createdAt);
+      const barred = priorApproved.some((prior) => {
+        if (prior.id === existing.id) return false;
+        if (prior.decidedBy !== actor.id) return false;
+        if (typeof prior.decidedAt !== 'string') return false;
+        const priorAt = Date.parse(prior.decidedAt);
+        return (
+          Number.isNaN(priorAt) || Number.isNaN(gateAt) || priorAt <= gateAt
+        );
+      });
+      if (barred) {
+        this.#record(actor, 'approval.decide', `approval:${id}`, 'denied', {
+          reason:
+            'cross-gate separation of duties: this actor approved an earlier gate of the run',
+        });
+        throw new ApprovalAuthzError(
+          'the reviewer who advanced this run at an earlier gate cannot also decide this gate (separation of duties; set allowSelfDecision to permit)',
         );
       }
     }

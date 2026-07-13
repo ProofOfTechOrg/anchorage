@@ -854,6 +854,29 @@ describe('purgeTenant (complete offboarding)', () => {
     );
   });
 
+  it.each<[string, unknown]>([
+    ['undefined', undefined],
+    ['null', null],
+    // String(['acme']) === 'acme', so a bare TENANT_ID_PATTERN.test(['acme'])
+    // coerces to a valid slug and would build the range bounds from 'acme',
+    // purging that tenant; the typeof guard refuses it.
+    ['an array coercing to a valid-looking slug', ['acme']],
+  ])('rejects a non-string tenantId (%s) BEFORE building the range bounds (red-first: today the bare .test coerces it)', async (_label, tenantId) => {
+    // #given — purgeTenant is EXPORTED and reached from demo-reset/purge-cron
+    // with a post-resolver tenant.tenantId. RegExp.test would coerce
+    // undefined -> 'undefined' and build the range bounds from that literal,
+    // purging an unintended range; the typeof guard refuses it (DL-002).
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+
+    // #when / #then
+    await expect(
+      purgeTenant(d1Like(sqlite), {
+        tenantId: tenantId as unknown as string,
+      }),
+    ).rejects.toThrow(/INV-3/);
+  });
+
   it('respects the table prefix', async () => {
     // #given
     const sqlite = openSqlite();
