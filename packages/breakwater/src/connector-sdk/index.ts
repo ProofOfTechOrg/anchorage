@@ -476,6 +476,14 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   config: ConnectorConfig<TInput, TOutput>,
 ): Tool<TInput, TOutput> {
   const { id, policies = {} } = config;
+  // One construction guard closes BOTH id-derived colon-joined store keys —
+  // the idempotency scoped key and the rate-limit budget key — since both are
+  // built from this single id (details in the thrown message).
+  if (typeof id === 'string' && id.includes(':')) {
+    throw new TypeError(
+      `connector id '${id}' must not contain a colon: id is joined UNESCAPED with ':' into BOTH id-derived store keys (the idempotency scoped key '<id>:<key>' / '<isolationScope>:<id>:<key>', and the rate-limit budget key '<scope>:<id>'), so a colon in id can collide two distinct tuples onto one key on a shared store. Use a colon-free id (camelCase or dot-delimited).`,
+    );
+  }
   const manifest: PermissionManifest = Object.freeze({
     ...config.permissions,
     egress: Object.freeze([...(config.permissions.egress ?? [])]),

@@ -11,6 +11,7 @@ import { ChunkFrom, type ChunkType } from '@mastra/core/stream';
 import { describe, expect, it } from 'vitest';
 
 import { AuditLogger } from '../audit/index.js';
+import { HIGH_ENTROPY_CANDIDATE_RE } from './content-inspection.js';
 import {
   classifierPolicy,
   type PolicyContext,
@@ -443,6 +444,64 @@ describe('piiSecrets', () => {
 
       // #then
       expect(decision).toEqual({ allowed: true });
+    });
+
+    it('does not match a 20-char candidate — below the length floor where the 4.5-bit threshold is first reachable', () => {
+      // #given — a 20-char base64-class run. Shannon entropy ceilings at
+      // log2(20) ~= 4.32 < the 4.5-bit default, so a length-20 candidate can
+      // never reach the threshold; the {23} floor drops it as a candidate.
+      // Red-first: the prior {20} floor matched it — a dead zone of candidates
+      // that could never fire.
+      const twentyCharCandidate = 'aB3xQ9mK7pL2vN8fR4tY';
+
+      // #when / #then — white-box: the candidate regex finds no match
+      expect(twentyCharCandidate.match(HIGH_ENTROPY_CANDIDATE_RE)).toBeNull();
+    });
+
+    it('still flags a maximally-random length-23 candidate (byte-identical length-23+ behavior)', async () => {
+      // #given — 23 DISTINCT base64-class chars => Shannon entropy = log2(23)
+      // ~= 4.52 >= 4.5, and the shape gate passes (digit + mixed case): the
+      // shortest length at which the detector can fire.
+      const evaluator = piiSecrets({ detectors: ['highEntropy'] });
+      const twentyThreeCharCandidate = 'aBcDeFgHiJkLmNoPqRsTuV7';
+
+      // #when
+      const decision = await evaluator.evaluate(
+        context({ text: twentyThreeCharCandidate }),
+      );
+
+      // #then
+      expect(decision).toMatchObject({
+        allowed: false,
+        reason: expect.stringContaining('highEntropy'),
+      });
+    });
+
+    it('extracts and flags a 20-char maximally-random candidate when entropyThreshold is lowered to 4.0', async () => {
+      // #given — at a 4.0-bit bar the candidate-length floor derives to
+      // max(20, ceil(2^4.0)=16) = 20, so 20..22-char candidates are extracted
+      // again. The {23} floor hardcoded to the 4.5 default silently dropped
+      // them (the recall regression this fixes). This 20-char run is all-
+      // distinct base64-class chars, so its Shannon entropy is exactly
+      // log2(20) ~= 4.32 >= 4.0 (not flaky), and the shape gate passes (digits
+      // + mixed case). RED-FIRST: on the hardcoded-{23} code the 20-char
+      // candidate is never extracted, so highEntropy returns allowed.
+      const evaluator = piiSecrets({
+        detectors: ['highEntropy'],
+        entropyThreshold: 4.0,
+      });
+      const twentyCharCandidate = 'aB3xQ9mK7pL2vN8fR4tY';
+
+      // #when
+      const decision = await evaluator.evaluate(
+        context({ text: twentyCharCandidate }),
+      );
+
+      // #then
+      expect(decision).toMatchObject({
+        allowed: false,
+        reason: expect.stringContaining('highEntropy'),
+      });
     });
   });
 

@@ -24,7 +24,16 @@ const JWT_RE =
   /\beyJ[A-Za-z0-9_-]{8,256}\.[A-Za-z0-9_-]{8,256}\.[A-Za-z0-9_-]{8,256}\b/g;
 const SECRET_ASSIGNMENT_RE =
   /(?:api[_-]?key|secret|token|passw(?:or)?d|credential)["']?\s*[:=]\s*["']?[A-Za-z0-9+/_=-]{12,128}/gi;
-const HIGH_ENTROPY_CANDIDATE_RE = /[A-Za-z0-9+/_=-]{20,256}/g;
+// DEFAULT-threshold candidate matcher (zero-alloc fast path). Floor 23 is
+// candidateFloorForThreshold(DEFAULT_ENTROPY_THRESHOLD): the shortest length
+// whose maximum Shannon entropy log2(23) ~= 4.52 reaches the 4.5 bits/char
+// default bar (log2(20..22) = 4.32..4.46 < 4.5 — those lengths can never fire
+// at 4.5, the dead zone the old {20} floor used to match). A caller-configured
+// threshold derives its OWN floor in highEntropyDetector (a 4.0 bar reaches
+// back down to floor 20, a 5.0 bar up to 32), so this constant is the default
+// only — see candidateFloorForThreshold. Exported only for the white-box
+// candidate-floor invariant test — not part of the public API.
+export const HIGH_ENTROPY_CANDIDATE_RE = /[A-Za-z0-9+/_=-]{23,256}/g;
 
 // secretAssignment's `\s*` around the separator has no regex-level upper
 // bound; for the streaming rescan window (see holdBackChars below) a
@@ -189,13 +198,42 @@ function secretAssignmentDetector(): Detector {
   };
 }
 
+// Smallest candidate length whose MAXIMUM achievable Shannon entropy — log2(L),
+// reached only when every char is distinct — still meets `threshold` bits/char,
+// floored at the original baseline 20 so a lowered bar never widens the net
+// past it. This is an EXTRACTION floor only; the per-candidate entropy check
+// (shannonEntropy >= threshold) is unchanged — deliberately NOT the rejected
+// per-candidate clamp min(threshold, log2(len)) (RA-004), which would flag any
+// all-distinct run regardless of the configured bar. DL-005 (F5) set the {23}
+// floor for the 4.5 default only; hardcoding it silently dropped the 20..22-char
+// candidates a lower configured threshold can still legitimately flag
+// (4.0 -> floor 20 -> log2(20)=4.32 >= 4.0). Examples:
+//   4.5 -> max(20, ceil(2^4.5)=23) = 23   (default; byte-identical to DL-005)
+//   4.0 -> max(20, ceil(2^4.0)=16) = 20
+//   5.0 -> max(20, ceil(2^5.0)=32) = 32
+function candidateFloorForThreshold(threshold: number): number {
+  return Math.max(20, Math.ceil(2 ** threshold));
+}
+
 function highEntropyDetector(entropyThreshold: number): Detector {
+  // Extract candidates at the floor the CONFIGURED threshold makes reachable,
+  // not the hardcoded default. The default reuses the shared module RE
+  // (zero-alloc fast path); a non-default threshold compiles a one-time RE here
+  // at detector construction (never per scan). Clamp the floor to the 256 max
+  // span so an out-of-range threshold (floor > 256 — unreachable anyway for a
+  // 66-symbol alphabet, max entropy log2(66) ~= 6.04) can't build an
+  // out-of-order {min,256} quantifier and throw at construction.
+  const floor = candidateFloorForThreshold(entropyThreshold);
+  const candidateRe =
+    floor === candidateFloorForThreshold(DEFAULT_ENTROPY_THRESHOLD)
+      ? HIGH_ENTROPY_CANDIDATE_RE
+      : new RegExp(`[A-Za-z0-9+/_=-]{${Math.min(floor, 256)},256}`, 'g');
   return {
     id: 'highEntropy',
     maxSpan: 256,
     scan(window) {
       const matches: DetectorMatch[] = [];
-      for (const candidate of matchAll(window, HIGH_ENTROPY_CANDIDATE_RE)) {
+      for (const candidate of matchAll(window, candidateRe)) {
         if (!looksLikeSecretShape(candidate.text)) continue;
         if (shannonEntropy(candidate.text) < entropyThreshold) continue;
         matches.push(candidate);

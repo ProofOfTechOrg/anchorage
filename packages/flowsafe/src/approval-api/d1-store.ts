@@ -420,7 +420,10 @@ export class D1ApprovalStore implements ApprovalStore {
   #schemaReady?: Promise<void>;
 
   constructor(db: ApprovalDatabase, options: D1ApprovalStoreOptions) {
-    if (!TENANT_ID_PATTERN.test(options.tenantId)) {
+    if (
+      typeof options.tenantId !== 'string' ||
+      !TENANT_ID_PATTERN.test(options.tenantId)
+    ) {
       throw new Error(
         `D1ApprovalStore: tenantId '${options.tenantId}' violates INV-3 (^[a-z0-9]{3,32}$)`,
       );
@@ -438,8 +441,9 @@ export class D1ApprovalStore implements ApprovalStore {
     // (the in-memory store fails at the same point), never orphan a row
     // behind a thrown create.
     const snapshot = structuredClone({ ...record, tenantId: this.tenantId });
-    try {
-      await this.#db
+    const stepKey = stepKeyOf(snapshot.stepPath);
+    const insert = (): Promise<unknown> =>
+      this.#db
         .prepare(
           `INSERT INTO ${TABLE} (
             id, tenant_id, workflow_id, run_id, step_key, step_path,
@@ -454,7 +458,7 @@ export class D1ApprovalStore implements ApprovalStore {
           this.tenantId,
           snapshot.workflowId,
           snapshot.runId,
-          stepKeyOf(snapshot.stepPath),
+          stepKey,
           snapshot.stepPath ? JSON.stringify(snapshot.stepPath) : null,
           snapshot.suspendedAt ?? null,
           snapshot.resumedAt ?? null,
@@ -482,20 +486,47 @@ export class D1ApprovalStore implements ApprovalStore {
           snapshot.slaDeadlineAt ?? null,
         )
         .run();
+
+    // The idempotent-create contract ("Decided requests never block a new
+    // one") must survive a concurrent decide-close. service.create mints a
+    // fresh crypto.randomUUID id, so the ONLY possible UNIQUE collision is the
+    // partial open-step index — a violation means an OPEN row existed at INSERT
+    // time. Between the failed INSERT and the #openFor SELECT (two D1
+    // round-trips) a concurrent decide()/transition CAS can close that row (its
+    // status leaves OPEN_STATUSES and the partial index), so #openFor returns
+    // null and the step is insertable again: retry the INSERT exactly ONCE
+    // (R-003 — bounded, never a loop). A still-open record or a non-unique
+    // error short-circuits before any retry.
+    try {
+      await insert();
+      return { record: snapshot, created: true };
+    } catch (error) {
+      if (!isUniqueViolation(error)) throw error;
+      const open = await this.#openFor(
+        snapshot.workflowId,
+        snapshot.runId,
+        stepKey,
+      );
+      if (open) return { record: open, created: false };
+      // open === null: the conflicting open row was decided-and-gone between
+      // the INSERT and this SELECT — fall through to the single retry.
+    }
+    // The ONE bounded retry. A SECOND unique violation re-reads #openFor and
+    // returns the now-open record if present, else rethrows — no third attempt.
+    try {
+      await insert();
+      return { record: snapshot, created: true };
     } catch (error) {
       if (isUniqueViolation(error)) {
-        // Could be the open-uniqueness index (expected: return the existing
-        // open record) or the id primary key (caller bug: rethrow).
         const open = await this.#openFor(
           snapshot.workflowId,
           snapshot.runId,
-          stepKeyOf(snapshot.stepPath),
+          stepKey,
         );
         if (open) return { record: open, created: false };
       }
       throw error;
     }
-    return { record: snapshot, created: true };
   }
 
   async get(id: string): Promise<ApprovalRecord | null> {

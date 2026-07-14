@@ -118,7 +118,10 @@ export function createTenantResolver(
   return async (request) => {
     const actor = await options.authenticate(request);
     if (!actor) return undefined;
-    if (!TENANT_ID_PATTERN.test(actor.tenantId)) {
+    if (
+      typeof actor.tenantId !== 'string' ||
+      !TENANT_ID_PATTERN.test(actor.tenantId)
+    ) {
       throw new TenantResolutionError(
         `authenticated actor '${actor.id}' carries a non-INV-3 tenantId — fix the verifier; refusing to scope the request`,
       );
