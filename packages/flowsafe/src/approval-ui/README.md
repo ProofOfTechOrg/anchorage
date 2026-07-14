@@ -92,3 +92,32 @@ anywhere and versioned against the wire contract alone.
   the REST JSON contract IS those types serialized.
 - `useApprovalDashboard` derives selection from the fetched list (no
   state+effect mirroring); polling is the one legitimate effect.
+
+## Live streaming (Part B)
+
+Opt-in live updates over an INJECTED, DOM-free `StreamTransport` (a structural
+seam like `FetchLike`), so the library never hard-depends on a browser
+`WebSocket`. Pass `useApprovalDashboard` a `stream: { transport, ticket }` and it
+subscribes to the tenant's approval stream and live-merges events on top of the
+interval poll, which keeps running as the periodic reconciler (DL-021). Absent
+`stream`, behavior is byte-identical to poll-only.
+
+- `stream.ts` (DOM-free, compiles in the main pass): the `StreamTransport` /
+  `StreamConnection` / `StreamHandlers` seam, the `StreamFrame` wire union, and
+  the PURE node-testable reducers — `mergeApprovalEvent` (upsert-by-id + re-sort),
+  `applyOptimisticDecide` / `reconcileDecided` (an authoritative decided event
+  clears the optimistic pending; a DIFFERENT decider surfaces a conflict),
+  `presenceReducer`, `applyMetricsDelta`. A failed decide rolls the optimistic
+  mark back and clears the pending so no later event raises a spurious conflict.
+- `subscribeApprovalStream` (in `use-approval-dashboard.ts`): the reconnect-with-
+  backoff funnel plus a client liveness HEARTBEAT — it pings and, on a missed
+  pong, force-disconnects a silently half-open socket so the run poll resumes; a
+  permanent (4xx) ticket failure stops retrying and stays cleanly poll-only.
+- `use-web-socket-transport.ts` is the ONLY module with a browser-`WebSocket`
+  dependency (read off `globalThis`, structural shape); it is a UI-pass-only file
+  the main pass excludes, and it is INJECTED, never imported by the DOM-free
+  modules.
+- `Toast?` / `PresenceIndicator?` are additive OPTIONAL `ApprovalUIComponents`
+  slots (same pattern as `Checkbox`/`Select`): defaulted in `htmlComponents`,
+  consumed via `ResolvedApprovalUIComponents`, so a full-interface adapter keeps
+  compiling (semver-minor).

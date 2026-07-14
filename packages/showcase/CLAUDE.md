@@ -46,13 +46,17 @@ BANNED in `src/` and `worker/`. Use:
   `pnpm -w build`).
 
 **Narration honesty contract:** the activity feed/toasts are derived in the
-browser from the polled snapshots (runs 3s, queue/metrics 5s) — there is no
-event API. Events restating an observed response render ● solid; events
-describing what the deployed architecture does between observations render
-○ "by design" and only ever anchor to an observed event. Event KEYS are
-deterministic, and every surface dedups by key — that (not effect guards) is
-what makes StrictMode double-invokes, racing poll streams, and
-decider-vs-observer overlap collapse to one line.
+browser from the observed run and queue updates. Those updates now arrive over a
+live WebSocket stream when streaming is enabled (a per-run runner-DO socket + a
+per-tenant hub socket, opt-in behind a `HUB` binding + `STREAM_TICKET_SECRET`),
+and over the interval polls (runs 3s, queue/metrics 5s) otherwise — and, for the
+queue, the poll keeps running as the reconciler even while the socket is healthy
+(DL-021). Events restating an observed update — a poll response OR a live stream
+frame — render ● solid; events describing what the deployed architecture does
+between observations render ○ "by design" and only ever anchor to an observed
+event. Event KEYS are deterministic, and every surface dedups by key — that (not
+effect guards) is what makes StrictMode double-invokes, racing poll/stream
+sources, and decider-vs-observer overlap collapse to one line.
 
 In `serve` mode a dev-only plugin mounts the **in-process showcase host** —
 `/api/approvals` + `/runs` + `/workflows` — so `pnpm dev` is a real working
@@ -64,7 +68,7 @@ is a pure client bundle served by the single-deploy Worker on the same origin.
 | File | What | When to read |
 | ---- | ---- | ------------ |
 | `package.json` | The package manifest: scripts (`predev` builds the two libraries — the dev plugin resolves them via dist; `dev`, `build`, `dev:worker`, `deploy:cf` — NOT `deploy`, which pnpm's builtin of the same name shadows — `test`, `typecheck`, `lint`, `react-doctor`, `react-doctor:diff`), the `#worker/*` imports field (maps to `./worker/*.ts` — LITERAL substitution, so it resolves `.ts` files ONLY; a non-.ts asset under worker/ would need its own mapping), runtime deps (Astryx, react 19, workspace flowsafe + breakwater, @mastra/core, zod) and tooling devDeps (vite, vitest, wrangler, jsdom + testing-library) | Adding a dep or script, changing the `#worker` mapping |
-| `wrangler.jsonc` | Deploy config — custom domain `anchorage.proofoftech.org` + `workers_dev: false` (single public origin: the Google OAuth callback is registered for exactly that origin), `RUNNER` DO + `DB` D1, two crons, `main: worker/worker.ts`, `tsconfig: tsconfig.worker.json` (esbuild bundles flowsafe + breakwater from SOURCE — no dist build order for wrangler), the `assets` block (serves `./dist` at `/`, `run_worker_first` keeps the API on the same origin). Carries NO credentials: `APPROVAL_ACTOR_TOKENS` is a secret, so a deploy without it 401s everywhere | Changing bindings, the public origin, or the assets/single-deploy config |
+| `wrangler.jsonc` | Deploy config — custom domain `anchorage.proofoftech.org` + `workers_dev: false` (single public origin: the Google OAuth callback is registered for exactly that origin), `RUNNER` DO + `HUB` DO (the `ShowcaseHub` streaming hub, added under an append-only `v2` migration) + `DB` D1, two crons, `main: worker/worker.ts`, `tsconfig: tsconfig.worker.json` (esbuild bundles flowsafe + breakwater from SOURCE — no dist build order for wrangler), the `assets` block (serves `./dist` at `/`, `run_worker_first` keeps the API — including `/api/stream/*` — on the same origin). Carries NO credentials: `APPROVAL_ACTOR_TOKENS` is a secret (a deploy without it 401s everywhere), and `STREAM_TICKET_SECRET` gates streaming (absent ⇒ the composer leaves it unmounted, poll-only) | Changing bindings, the public origin, the streaming hub/migration, or the assets/single-deploy config |
 | `.dev.vars.example` | Local-dev secrets (`cp .dev.vars.example .dev.vars` — REQUIRED for `dev:worker`): the demo `APPROVAL_ACTOR_TOKENS` map, plus the optional SIEM header. Lives beside wrangler.jsonc, where wrangler reads it | Running `dev:worker`, or wiring real secrets |
 | `doctor.config.jsonc` | react-doctor config: scopes the scan to the React app (worker/ + node glue ignored — deslop can't resolve `#worker/*`), plus per-file rule ignores with the WHY inline (composition root, polling-architecture session module, dev-only switcher) | Changing what the react-doctor gate ignores |
 | `index.html` | Vite entry; mounts `src/main.tsx` into `#root`; pre-stamps `data-astryx-theme="y2k"` (first-paint theming). Carries a TEMPORARY `noindex` robots meta (pre-announce; remove when the live demo should be indexed — tracked in root `CLAUDE.md`) | Changing the HTML shell, title, or the noindex posture |
@@ -91,7 +95,7 @@ is a pure client bundle served by the single-deploy Worker on the same origin.
 | `src/intro-tour.tsx` | The 60-second tour Dialog — localStorage-dismissed, reopenable | Changing onboarding |
 | `src/workflow-launcher.tsx` | `WorkflowLauncher` — SelectableCard picker (per-workflow `CARD_INK` toned text vars), first-load spinner, capability Tokens, role gates from the SERVER'S catalog actor echo, JSON input Collapsible | Changing the launcher |
 | `src/run-cards.tsx` | `RunCards` — per-run Card: step chips, suspension story, interpreted outcome badges over the raw result JSON, per-workflow reality notes, retry button | Changing the run cards |
-| `src/use-run-polling.ts` | `useRunPolling` — the self-scheduling 3s run poll with transient-failure abandonment + `retryNonce` re-arm | Changing run polling |
+| `src/use-run-polling.ts` | `useRunPolling` — the self-scheduling 3s run poll (pure `pollableRuns`/`mergeRunResults`/`allRunsSettled`) with transient-failure abandonment + `retryNonce` re-arm; also subscribes to the per-run WebSocket stream when a `runStream` option is present, updating status from the wholesale `RunSummary` frames and PAUSING a run's poll while its socket is healthy, resuming on close (DL-021 wholesale channel) | Changing run polling or the run stream |
 | `src/token-gate.tsx` | `TokenGate` (signed-out landing) + `OperatorIdentityChip` | Changing sign-in UI |
 | `src/demo-session.tsx` | Public-demo session: OAuth callback fragment read, sandbox chip + role SegmentedControl, silent JWT refresh, expiry warning, `useDemoSignIn` tri-state provider probe | Changing the public-demo UX |
 | `src/dev-actor-switcher.tsx` | DEV-ONLY: the sole app module importing the public demo-actors tokens (`#worker/demo-actors`); reachable only through main.tsx's `import.meta.env.DEV` dynamic import, so the production bundle stays token-free (`scripts/assert-clean-app-bundle.mjs` pins it) | Changing the dev identity switcher |
@@ -99,6 +103,9 @@ is a pure client bundle served by the single-deploy Worker on the same origin.
 | `src/marker-row.tsx` | `MarkerRow` — the one marker+text row primitive behind the explainer surfaces | Changing explainer-row styling |
 | `src/run-client.ts` | `RunClient` mirroring `ApprovalApiClient` — catalog/start/status plus `reset()`. Local structural types keep the browser bundle decoupled from Workers-typed server modules | Changing the run API client |
 | `src/astryx-components.tsx` | The slot adapter for LIBRARY views — maps `ApprovalUIComponents` onto `@astryxdesign/core` | Changing the slot mapping |
+| `src/astryx-stream-components.tsx` | The Astryx `Toast` + `PresenceIndicator` slot adapters (Part B streaming), merged into the provider alongside `astryx-components` | Changing the streaming slot adapters |
+| `src/web-socket-transport.ts` | Thin showcase re-export of approval-ui's browser-WebSocket `StreamTransport` (Part B) | Changing the SPA WS transport |
+| `src/hub-stream-client.ts` | Builds the hub + per-run `ticket()` thunks over the authenticated `ApprovalApiClient` (Part B); the run thunk passes the workflowId so the SERVER returns the fully-qualified run WS url (the route shape is authored once, server-side) | Changing SPA stream addressing |
 | `src/index.css` | Font `@import`s then Astryx CSS (reset → base → y2k theme), bundled by Vite; plus the sticky-column rule | Changing theme or global styles |
 | `src/test/setup.ts` | Vitest setup (jest-dom matchers; safe under node env too) | Changing test setup |
 | `src/marker-row.test.tsx` | Component smoke test proving the jsdom + testing-library pipeline | Changing the component-test plumbing |
