@@ -1,5 +1,14 @@
 # showcase
 
+## 0.0.3
+
+### Patch Changes
+
+- Updated dependencies [0c108fa]
+- Updated dependencies [dbe6a93]
+  - @proofoftech/flowsafe@0.4.0
+  - @proofoftech/breakwater@0.3.1
+
 ## 0.0.2
 
 ### Patch Changes
