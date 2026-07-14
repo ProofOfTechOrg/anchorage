@@ -1,4 +1,4 @@
-// buildShowcaseRuntime — the one place all five workflow modules are registered
+// buildShowcaseRuntime — the one place all six workflow modules are registered
 // onto a single RunnerRuntime whose requestContext is minted from APPROVED
 // approval records. One init(), one Mastra instance, one DO class, one D1.
 // register-before-first-run is satisfied because this builder registers every
@@ -26,6 +26,7 @@ import type {
   ShowcaseDeps,
   ShowcaseModuleDeps,
 } from '#worker/workflows/shared';
+import { wireTransferModule } from '#worker/workflows/wire-transfer';
 
 export type {
   EmailServiceBinding,
@@ -42,6 +43,9 @@ export const SHOWCASE_MODULES: ReadonlyArray<
   leadGenerationModule,
   productLaunchModule,
   accessRequestModule,
+  // Last: the guardrails control room's server-backed scenario also renders
+  // last in its scenario grid — keep the two surfaces' ordering in agreement.
+  wireTransferModule,
 ];
 
 const DEFAULT_FROM_ADDRESS = 'gtm@example.com';
@@ -50,7 +54,7 @@ const DEFAULT_FROM_NAME = 'Anchorage Showcase';
 /**
  * Build the showcase runtime: resolve binding-gated infra to concrete stores
  * (offline defaults are real, not fakes — InMemory artifact bucket + idempotency
- * + rate-limit), wire the grant-minting seam, and register all five modules.
+ * + rate-limit), wire the grant-minting seam, and register all six modules.
  */
 export function buildShowcaseRuntime(deps: ShowcaseDeps): RunnerRuntime {
   const audit = deps.audit ?? new AuditLogger();

@@ -195,6 +195,7 @@ describe('showcase worker fetch(): auth composition', () => {
       'lead-generation',
       'product-launch',
       'access-request',
+      'wire-transfer',
     ]);
   });
 });
