@@ -15,6 +15,15 @@
 //   POST /runs/:workflowId/:runId/resume   -> raw resume (no grants — the
 //                                             gated step fails closed)
 //   /api/approvals[...]                    -> approval queue REST surface
+//   POST /api/stream/ticket                -> mint a ~60s WS stream ticket
+//   GET  /api/stream/hub?ticket=           -> live approval-queue WebSocket
+//   GET  /api/stream/run/:wf/:runId?ticket= -> live run-progress WebSocket
+//
+// Live streaming (DL-009/DL-010): STREAM_TICKET_SECRET is set as a LOCAL-ONLY
+// spike var so the stream stage MOUNTS; DemoHub is the per-tenant fan-out hub.
+// The workerd WS proof (suspend/resume/decide fan-out, hibernation persistence,
+// expired/cross-tenant ticket fail-closed) is automated in
+// scripts/spike-verify.mjs.
 //
 // Auth: bearer tokens over the SAME host-kit seam every deployed host uses
 // (staticTokenVerifier + bearerActorAuthenticator + createRunRouter) — a
@@ -41,6 +50,7 @@ import type {
   Request as CfRequest,
   D1Database,
   DurableObjectNamespace,
+  ExecutionContext,
   ExportedHandler,
 } from '@cloudflare/workers-types';
 import { z } from 'zod';
@@ -48,6 +58,7 @@ import { z } from 'zod';
 import {
   type ApprovalActor,
   ApprovalService,
+  type ApprovalStreamSink,
   approvalGrantProvider,
   BREAKWATER_APPROVED_CONNECTORS_KEY,
   createApprovalRouter,
@@ -58,12 +69,15 @@ import {
 } from '../src/approval-api/index.js';
 import {
   DurableObjectRunner,
+  HubDurableObject,
   init,
   type RunnerRuntime,
 } from '../src/do-runner/index.js';
 import {
   bearerActorAuthenticator,
+  createHubTopology,
   createRunRouter,
+  createStreamRouter,
   doSummary,
   staticTokenVerifier,
   type WorkflowMeta,
@@ -72,6 +86,17 @@ import {
 interface Env {
   DB: D1Database;
   RUNNER: DurableObjectNamespace;
+  /** Per-tenant live-stream hub DO (idFromName(tenantId)); see DemoHub. */
+  HUB: DurableObjectNamespace;
+  /**
+   * HMAC key signing the ~60s WebSocket stream tickets. A LOCAL-ONLY spike
+   * fixture set in spike/wrangler.jsonc `vars` (and re-passed by
+   * spike-verify.mjs via `--var` so its forged-ticket probes share the exact
+   * key). Never a real secret; this worker is never deployed. Present here =>
+   * the stream stage always MOUNTS on the spike so the workerd WS proof can
+   * exercise it.
+   */
+  STREAM_TICKET_SECRET: string;
 }
 
 /** The connector id an approval grants; the publish step demands it. */
@@ -237,6 +262,17 @@ export class DemoRunner extends DurableObjectRunner<Env> {
   }
 }
 
+/**
+ * The per-tenant live-stream hub DO (DL-009). The wrangler `HUB` binding + the
+ * append-only `v2` migration resolve this named export; the base class does all
+ * the work (fan-out over hibernatable WebSockets + presence), so the body is
+ * empty. Addressed idFromName(tenantId), so id.name IS the tenant and the
+ * fan-out is tenant-disjoint by construction. The workerd spike
+ * (scripts/spike-verify.mjs) drives this over a real WebSocket to prove
+ * fan-out, hibernation persistence, and ticket fail-closed.
+ */
+export class DemoHub extends HubDurableObject<Env> {}
+
 function json(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
     status,
@@ -258,10 +294,15 @@ function runStub(
 function buildApprovalService(
   store: TenantBoundApprovalStore,
   env: Env,
+  stream: ApprovalStreamSink | undefined,
 ): ApprovalService {
   return new ApprovalService({
     store,
     defaultSlaSeconds: 15 * 60,
+    // Live fan-out: every SUCCESSFUL mutation forwards to the tenant hub, which
+    // fans it out to that tenant's open dashboard sockets. Fire-and-forget; the
+    // caller keeps the publish alive with ctx.waitUntil (see fetch below).
+    stream,
     // doSummary (host-kit) reads the DO's answer and rethrows a non-ok one as a
     // RunRouteError carrying the DO's own status — the same reader the showcase
     // and deploy hosts use. The spike keeps its own topology, not its own parsing.
@@ -283,15 +324,44 @@ function buildApprovalService(
 }
 
 const handler: ExportedHandler<Env> = {
-  async fetch(request: CfRequest, env: Env): Promise<Response> {
+  async fetch(
+    request: CfRequest,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
+    // Fetch-scope live fan-out sink (mirrors createFlowsafeWorker): each
+    // successful approval mutation forwards to the tenant hub, kept alive by
+    // ctx.waitUntil so the publish completes AFTER the mutation's response (a
+    // fire-and-forget publish would be cancelled). Contained — a failed fan-out
+    // logs and never fails the mutation.
+    const hubTopology = createHubTopology(env.HUB);
+    const streamSink: ApprovalStreamSink = (event) =>
+      ctx.waitUntil(
+        hubTopology.publish(event).catch((error: unknown) => {
+          console.error('stream publish failed', error);
+        }),
+      );
+
     // AUTHENTICATE FIRST, then construct (INV-2): the resolver binds the
     // approval store to the verified actor's tenant.
     const resolve = createTenantResolver({
       authenticate: bearerActorAuthenticator(staticTokenVerifier(SPIKE_ACTORS)),
       storeFactory: approvalStoreFactory(env.DB),
-      buildService: (store) => buildApprovalService(store, env),
+      buildService: (store) => buildApprovalService(store, env, streamSink),
     });
     const routed = request as unknown as Request;
+
+    // Stream stage BEFORE approvals (same order as the composer). The Worker is
+    // the SOLE ticket authority; the hub/runner DOs re-bind by their own
+    // idFromName identity. Every route is under /api/stream/, so it composes
+    // ahead of the approval router without overlapping it.
+    const streamResponse = await createStreamRouter({
+      resolve,
+      ticketSecret: env.STREAM_TICKET_SECRET,
+      hub: env.HUB,
+      runner: env.RUNNER,
+    })(routed);
+    if (streamResponse) return streamResponse;
 
     const approvalResponse = await createApprovalRouter({ resolve })(routed);
     if (approvalResponse) return approvalResponse;

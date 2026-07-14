@@ -42,6 +42,11 @@ export class ApprovalApiError extends Error {
 export interface ApprovalApiClientOptions {
   /** Default: '/api/approvals' (same-origin deployment). */
   baseUrl?: string;
+  /**
+   * Where streamTicket() POSTs — sibling to baseUrl, default
+   * '/api/stream/ticket'. The Worker is the sole ticket authority (M-006).
+   */
+  streamTicketUrl?: string;
   /** Default: globalThis.fetch. Injected in tests and non-browser hosts. */
   fetch?: FetchLike;
   /** Sent on every request — the deployment's auth (bearer token, etc.). */
@@ -50,11 +55,13 @@ export interface ApprovalApiClientOptions {
 
 export class ApprovalApiClient {
   readonly #baseUrl: string;
+  readonly #streamTicketUrl: string;
   readonly #fetch: FetchLike;
   readonly #headers: Record<string, string>;
 
   constructor(options: ApprovalApiClientOptions = {}) {
     this.#baseUrl = options.baseUrl ?? '/api/approvals';
+    this.#streamTicketUrl = options.streamTicketUrl ?? '/api/stream/ticket';
     const fetchFn =
       options.fetch ??
       ((globalThis as { fetch?: unknown }).fetch as FetchLike | undefined);
@@ -143,6 +150,30 @@ export class ApprovalApiClient {
     return (await this.#post('/batch/decide', body)) as BatchDecideResult;
   }
 
+  /**
+   * Mint a short-lived HMAC stream ticket for a live channel over the injected
+   * fetch (bearer-authenticated like every other call). The socket is opened by
+   * the injected StreamTransport — this method only fetches addressing, never a
+   * WebSocket. Errors surface as ApprovalApiError. For channel 'run', runId is
+   * required by the server (400 otherwise); passing workflowId lets the server
+   * return the fully-qualified run WS url so the caller need not rebuild the
+   * `/api/stream/run/:wf/:runId` path (which would duplicate the route shape).
+   */
+  async streamTicket(
+    channel: 'hub' | 'run',
+    runId?: string,
+    workflowId?: string,
+  ): Promise<{ url: string; ticket: string; expiresAt: number }> {
+    const body: Record<string, unknown> = { channel };
+    if (runId !== undefined) body.runId = runId;
+    if (workflowId !== undefined) body.workflowId = workflowId;
+    return (await this.#fetchJson(this.#streamTicketUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })) as { url: string; ticket: string; expiresAt: number };
+  }
+
   // There is deliberately no sweep() — POST /sla/sweep no longer exists. The
   // SLA sweep is cron-owned TCB code (approval-api sweepSLA over a
   // SystemApprovalStore): an HTTP-reachable sweep was an unfiltered
@@ -166,7 +197,20 @@ export class ApprovalApiClient {
       body?: string;
     } = {},
   ): Promise<unknown> {
-    const response = await this.#fetch(`${this.#baseUrl}${path}`, {
+    return this.#fetchJson(`${this.#baseUrl}${path}`, init);
+  }
+
+  // Shared fetch + error mapping against a FULL url — #request prefixes
+  // #baseUrl; streamTicket targets #streamTicketUrl. Both carry #headers.
+  async #fetchJson(
+    url: string,
+    init: {
+      method?: string;
+      headers?: Record<string, string>;
+      body?: string;
+    } = {},
+  ): Promise<unknown> {
+    const response = await this.#fetch(url, {
       ...init,
       headers: { ...this.#headers, ...init.headers },
     });

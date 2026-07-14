@@ -43,10 +43,19 @@ import type {
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  type ApprovalActor,
   type ApprovalRecord,
+  type ApprovalStreamEvent,
   D1ApprovalStoreFactory,
 } from '../src/approval-api/index.js';
-import type { RunSummary } from '../src/do-runner/index.js';
+import type {
+  RunSummary,
+  TenantArtifactPurger,
+} from '../src/do-runner/index.js';
+import {
+  createFlowsafeWorker,
+  staticTokenVerifier,
+} from '../src/host-kit/index.js';
 import {
   d1DatabaseLike,
   openSqlite,
@@ -562,6 +571,159 @@ describe('deploy worker fetch(): D4 wedge recovery (status() self-heals)', () =>
   });
 });
 
+// In-process HUB namespace: idFromName carries the name (the tenantId), and
+// get().fetch records each ApprovalStreamEvent the composer POSTs to
+// /internal/event (createHubTopology.publish). The real DO fan-out over
+// hibernatable WebSockets is workerd-only and proven by the spike; here we only
+// need to see the event reach the RIGHT tenant's hub stub.
+function fakeHubNamespace(): {
+  namespace: DurableObjectNamespace;
+  events: Array<{ tenant: string; event: ApprovalStreamEvent }>;
+} {
+  const events: Array<{ tenant: string; event: ApprovalStreamEvent }> = [];
+  const namespace = {
+    idFromName: (name: string) => ({ name }),
+    get: (id: { name: string }) => ({
+      fetch: async (input: string | Request, init?: RequestInit) => {
+        // publish() uses the string+init overload; a raw-Request subscribe
+        // forward (the WS path) is never exercised in-process.
+        if (typeof input === 'string' && typeof init?.body === 'string') {
+          events.push({
+            tenant: id.name,
+            event: JSON.parse(init.body) as ApprovalStreamEvent,
+          });
+        }
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    }),
+  };
+  return { namespace: namespace as unknown as DurableObjectNamespace, events };
+}
+
+function makeStreamEnv(overrides: Partial<Env> = {}): {
+  env: Env;
+  sqlite: SqliteDatabase;
+  hubEvents: Array<{ tenant: string; event: ApprovalStreamEvent }>;
+} {
+  const hub = fakeHubNamespace();
+  const { env, sqlite } = makeEnv({
+    STREAM_TICKET_SECRET: 'test-stream-secret',
+    HUB: hub.namespace,
+    ...overrides,
+  });
+  return { env, sqlite, hubEvents: hub.events };
+}
+
+describe('deploy worker fetch(): live stream stage (opt-in)', () => {
+  it('mints a hub ticket for an authenticated actor', async () => {
+    // #given — HUB + STREAM_TICKET_SECRET both set => the stage mounts
+    const { env } = makeStreamEnv();
+
+    // #when
+    const response = await call(env, '/api/stream/ticket', {
+      method: 'POST',
+      body: JSON.stringify({ channel: 'hub' }),
+      token: 'tok-reviewer',
+    });
+
+    // #then — a ~60s addressing ticket (payload.signature), no grant
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      url: string;
+      ticket: string;
+      expiresAt: number;
+    };
+    expect(body.url).toBe('/api/stream/hub');
+    expect(body.ticket.split('.')).toHaveLength(2);
+    expect(body.expiresAt).toBeGreaterThan(Date.now());
+  });
+
+  it('401s the ticket route without a bearer token (fail closed)', async () => {
+    // #given
+    const { env } = makeStreamEnv();
+
+    // #when / #then
+    const response = await call(env, '/api/stream/ticket', {
+      method: 'POST',
+      body: JSON.stringify({ channel: 'hub' }),
+    });
+    expect(response.status).toBe(401);
+  });
+
+  it("forwards a run-start's auto-queued approval to the tenant hub", async () => {
+    // #given — a streaming env whose HUB stub records forwarded events
+    const { env, hubEvents } = makeStreamEnv();
+
+    // #when — starting a run suspends and auto-queues an approval; the
+    // fetch-scope stream sink (ctx.waitUntil, drained by call()) forwards the
+    // 'created' event to env.HUB.idFromName(record.tenantId)
+    const started = await startRun(env);
+
+    // #then — exactly the acme hub received the created record
+    const created = hubEvents.find((e) => e.event.type === 'created');
+    expect(created).toBeDefined();
+    expect(created?.tenant).toBe('acme');
+    expect(created?.event.record.tenantId).toBe('acme');
+    expect(created?.event.record.runId).toBe(started.runId);
+    expect(created?.event.record.connectors).toEqual(['example-publisher']);
+  });
+
+  it('404s a run-channel ticket for a run the tenant does not own (no existence oracle)', async () => {
+    // #given — acme reviewer asking for a rival-prefixed runId
+    const { env } = makeStreamEnv();
+
+    // #when / #then — ownership, not authorization: 404, mirroring run-router
+    const response = await call(env, '/api/stream/ticket', {
+      method: 'POST',
+      body: JSON.stringify({ channel: 'run', runId: 'rival_r1' }),
+      token: 'tok-reviewer',
+    });
+    expect(response.status).toBe(404);
+  });
+
+  it('mints a run-channel ticket for an OWNED run', async () => {
+    // #given — acme owns the run it just started
+    const { env } = makeStreamEnv();
+    const started = await startRun(env);
+
+    // #when
+    const response = await call(env, '/api/stream/ticket', {
+      method: 'POST',
+      body: JSON.stringify({
+        channel: 'run',
+        runId: started.runId,
+        workflowId: 'example-approval',
+      }),
+      token: 'tok-reviewer',
+    });
+
+    // #then — a run-channel url qualified with the workflowId
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { url: string };
+    expect(body.url).toBe(`/api/stream/run/example-approval/${started.runId}`);
+  });
+
+  it('leaves the stream stage UNMOUNTED when STREAM_TICKET_SECRET is absent (poll-only)', async () => {
+    // #given — HUB bound but no ticket secret => opt-in gate stays closed
+    const hub = fakeHubNamespace();
+    const { env } = makeEnv({ HUB: hub.namespace });
+
+    // #when — the ticket route is not owned by any mounted router
+    const response = await call(env, '/api/stream/ticket', {
+      method: 'POST',
+      body: JSON.stringify({ channel: 'hub' }),
+      token: 'tok-reviewer',
+    });
+
+    // #then — falls through to the composer's terminal 404 (no streaming)
+    expect(response.status).toBe(404);
+    expect(hub.events).toHaveLength(0);
+  });
+});
+
 // Column set per @mastra/core storage constants for mastra_workflow_snapshot
 // (camelCase timestamps, snapshot serialized as JSON TEXT) — the cron's purge
 // targets this exact table shape. Drift from the real adapter's DDL is pinned
@@ -983,6 +1145,91 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
       surfaces.some((line) => line.includes('approval-retention-purge')),
     ).toBe(true);
     errorSpy.mockRestore();
+  });
+});
+
+describe('createFlowsafeWorker scheduled(): artifact-paired retention purge (F4)', () => {
+  // The deploy template wires no R2, so it sets no artifactStore. This drives
+  // createFlowsafeWorker directly with one, proving runPurgeMaintenance threads
+  // config.artifactStore into the built-in purge so each expired run's artifacts
+  // are deleted BEFORE its snapshot row (the row is the only enumerable record
+  // of the run's artifact keys).
+
+  function workerWith(artifactStore: TenantArtifactPurger | undefined) {
+    return createFlowsafeWorker<Env>({
+      workflows: [],
+      systemActorId: 'flowsafe-worker',
+      buildVerifier: () =>
+        staticTokenVerifier(new Map<string, ApprovalActor>()),
+      crons: { sweep: SWEEP_CRON, purge: PURGE_CRON },
+      artifactStore,
+    });
+  }
+
+  it("deletes an expired run's artifacts BEFORE its snapshot row when artifactStore is set", async () => {
+    // #given — one stale terminal run (eligible) and one fresh terminal run
+    const { env, sqlite } = makeEnv();
+    createSnapshotTable(sqlite);
+    seedRun(sqlite, {
+      runId: 'acme_stale-done',
+      status: 'success',
+      updatedAt: Date.now() - 40 * DAY_MS,
+    });
+    seedRun(sqlite, {
+      runId: 'acme_fresh-done',
+      status: 'success',
+      updatedAt: Date.now() - 1 * DAY_MS,
+    });
+
+    // a TenantArtifactPurger that asserts the row STILL EXISTS when it runs:
+    // pairing deletes artifacts BEFORE the row, so the row (the only record of
+    // the artifact keys) must still be enumerable at this moment
+    const deletions: string[] = [];
+    const artifactStore: TenantArtifactPurger = {
+      deleteRun: vi.fn(async (_workflowId: string, runId: string) => {
+        expect(remainingRunIds(sqlite)).toContain(runId);
+        deletions.push(runId);
+        return 1;
+      }),
+    };
+
+    // #when — the PURGE cron fires
+    const { ctx, drain } = makeCtx();
+    await workerWith(artifactStore).scheduled({ cron: PURGE_CRON }, env, ctx);
+    await drain();
+
+    // #then — the stale run's artifacts were deleted (while its row still
+    // existed), then its row was purged; the fresh run is untouched
+    expect(deletions).toEqual(['acme_stale-done']);
+    expect(artifactStore.deleteRun).toHaveBeenCalledWith(
+      'wf',
+      'acme_stale-done',
+    );
+    expect(remainingRunIds(sqlite)).toEqual(['acme_fresh-done']);
+  });
+
+  it('without artifactStore the purge is unchanged — same rows deleted, no artifact store touched', async () => {
+    // #given — identical seeding, but no artifactStore wired (the deploy default)
+    const { env, sqlite } = makeEnv();
+    createSnapshotTable(sqlite);
+    seedRun(sqlite, {
+      runId: 'acme_stale-done',
+      status: 'success',
+      updatedAt: Date.now() - 40 * DAY_MS,
+    });
+    seedRun(sqlite, {
+      runId: 'acme_fresh-done',
+      status: 'success',
+      updatedAt: Date.now() - 1 * DAY_MS,
+    });
+
+    // #when
+    const { ctx, drain } = makeCtx();
+    await workerWith(undefined).scheduled({ cron: PURGE_CRON }, env, ctx);
+    await drain();
+
+    // #then — byte-identical row-only outcome
+    expect(remainingRunIds(sqlite)).toEqual(['acme_fresh-done']);
   });
 });
 

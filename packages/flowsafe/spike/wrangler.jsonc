@@ -5,14 +5,30 @@
   "compatibility_date": "2025-06-01",
   "compatibility_flags": ["nodejs_compat"],
   "durable_objects": {
-    "bindings": [{ "name": "RUNNER", "class_name": "DemoRunner" }]
+    "bindings": [
+      { "name": "RUNNER", "class_name": "DemoRunner" },
+      { "name": "HUB", "class_name": "DemoHub" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DemoRunner"] }],
+  // Append-only DO migrations: the v1 runner tag is frozen; the hub ships under
+  // its own new v2 tag.
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["DemoRunner"] },
+    { "tag": "v2", "new_sqlite_classes": ["DemoHub"] }
+  ],
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "flowsafe-demo",
       "database_id": "00000000-0000-0000-0000-000000000000"
     }
-  ]
+  ],
+  // LOCAL-ONLY spike fixture (this worker is never deployed): signs the ~60s
+  // WebSocket stream tickets so the /api/stream/* stage MOUNTS under
+  // `pnpm spike`. scripts/spike-verify.mjs re-passes the SAME value via
+  // `--var STREAM_TICKET_SECRET:...` so its forged-ticket probes share the key;
+  // keep the two byte-equal (like SWEEP_CRON/PURGE_CRON). Never a real secret.
+  "vars": {
+    "STREAM_TICKET_SECRET": "spike-local-stream-secret-do-not-deploy"
+  }
 }

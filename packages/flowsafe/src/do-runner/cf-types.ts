@@ -29,16 +29,100 @@ export interface D1DatabaseBinding {
 }
 
 /**
+ * Structural subset of the Hibernatable-WebSocket surface the DO stream
+ * channels touch: send() fans a frame to the client, close() ends the socket,
+ * and the attachment (de)serializers let the hub hold per-socket presence
+ * ACROSS hibernation (workerd persists the attachment, not instance fields).
+ * Kept structural — never the workers-types `WebSocket` — so the do-runner
+ * module graph stays node/vitest-loadable and no workers-types import reaches
+ * the emitted .d.ts (same posture as the rest of this file).
+ */
+export interface WebSocketLike {
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+  serializeAttachment?(value: unknown): void;
+  deserializeAttachment?(): unknown;
+}
+
+/**
+ * Structural subset of the `WebSocketPair` runtime global's result — the
+ * [client, server] socket pair a DO mints on a 101 upgrade, accessed by the
+ * numeric 0/1 keys workerd returns. Referenced only on the workerd WS path,
+ * which is guarded by acceptWebSocket presence and never runs in node.
+ */
+export interface WebSocketPairLike {
+  readonly 0: WebSocketLike;
+  readonly 1: WebSocketLike;
+}
+
+/**
+ * The `WebSocketPair` runtime global (workerd), typed to the structural
+ * WebSocketPairLike. Read off globalThis — NOT imported from 'cloudflare:workers'
+ * — so this module graph stays node/vitest-loadable; the WS path that calls it
+ * is guarded by acceptWebSocket presence and never runs in node, where the
+ * global is absent. Mirrors the globalThis-cast idiom in
+ * connector-sdk/new-token.ts (crypto) and agent-cli (TextEncoder). Lives here
+ * (the owner of WebSocketPairLike) so the per-run runner DO and the hub DO share
+ * ONE constructor instead of hand-copying it.
+ */
+export function newWebSocketPair(): WebSocketPairLike {
+  const Ctor = (
+    globalThis as unknown as { WebSocketPair: new () => WebSocketPairLike }
+  ).WebSocketPair;
+  return new Ctor();
+}
+
+/**
+ * Send a frame to one socket, tolerating a throw. workerd's getWebSockets() can
+ * return a CLOSING/CLOSED socket whose send() throws; without per-socket
+ * isolation one dead socket would abort a fan-out loop and starve every later
+ * subscriber of the frame. A throwing send means the socket is gone and will be
+ * reaped, so swallow it. Shared by the hub DO and the per-run runner DO so the
+ * fail-safe fan-out lives in one place.
+ */
+export function safeSend(ws: WebSocketLike, frame: string): void {
+  try {
+    ws.send(frame);
+  } catch {
+    // dead/closing socket — reaped by workerd; never starve the other subscribers
+  }
+}
+
+/**
  * Structural subset of DurableObjectState — the shape DurableObjectRunner
- * reads from. Only `id.name` (tenant/run identity recovery off the DO's own
+ * reads from. `id.name` (tenant/run identity recovery off the DO's own
  * idFromName address, INV-1) and `storage` (the ctx.storage-backed resume
- * ledger — DurableStorageResumeLedger in resume-ledger.ts) are ever touched.
+ * ledger — DurableStorageResumeLedger in resume-ledger.ts) are always touched;
+ * the Hibernatable-WebSocket members are OPTIONAL so node/vitest stubs that
+ * set only id.name/storage still satisfy the type and the per-run WS stream
+ * route can guard on their presence (absent ⇒ the non-WS 426 fallback).
  */
 export interface DurableObjectRunnerState {
   readonly id: {
     readonly name?: string;
   };
   readonly storage: ResumeLedgerStorage;
+  /** Make a server socket hibernatable (workerd-only). */
+  acceptWebSocket?(ws: WebSocketLike, tags?: string[]): void;
+  /** Every hibernatable socket currently attached, optionally by tag. */
+  getWebSockets?(tag?: string): WebSocketLike[];
+}
+
+/**
+ * Structural subset of DurableObjectState the per-tenant hub DO (hub-do.ts)
+ * reads: its OWN idFromName identity — `id.name` IS the bare tenantId, with no
+ * ':' join and no runId decode, unlike DurableObjectRunner whose name is
+ * `${workflowId}:${runId}` — plus the Hibernatable-WebSocket members it fans
+ * events out over. The hub holds no D1/DO storage, so `storage` is not
+ * required here. Same OPTIONAL-WS, guard-on-presence posture as
+ * DurableObjectRunnerState.
+ */
+export interface HubDurableObjectState {
+  readonly id: {
+    readonly name?: string;
+  };
+  acceptWebSocket?(ws: WebSocketLike, tags?: string[]): void;
+  getWebSockets?(tag?: string): WebSocketLike[];
 }
 
 // Compile-time proof that the real Cloudflare types satisfy the structural
@@ -53,4 +137,21 @@ type _D1DatabaseSatisfiesBinding = AssertTrue<
 >;
 type _DurableObjectStateSatisfiesRunnerState = AssertTrue<
   DurableObjectState extends DurableObjectRunnerState ? true : false
+>;
+type _DurableObjectStateSatisfiesHubState = AssertTrue<
+  DurableObjectState extends HubDurableObjectState ? true : false
+>;
+// The widened WS members are OPTIONAL on the structural states above (so a
+// node stub with only id.name/storage still satisfies them and the WS path
+// guards on their presence). This REQUIRED-shape pin is what actually catches
+// a @cloudflare/workers-types drift: it fails typecheck if DurableObjectState
+// ever drops or renames acceptWebSocket/getWebSockets — an optional-member
+// `extends` would keep passing even then.
+type _DurableObjectStateHasHibernationApi = AssertTrue<
+  DurableObjectState extends {
+    acceptWebSocket(ws: WebSocketLike, tags?: string[]): void;
+    getWebSockets(tag?: string): WebSocketLike[];
+  }
+    ? true
+    : false
 >;

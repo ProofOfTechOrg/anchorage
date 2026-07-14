@@ -105,6 +105,33 @@ function makeConnector(
   return { tool, execute };
 }
 
+describe('connector id validation', () => {
+  it("rejects an id containing ':' at construction, naming both id-derived store keys", () => {
+    // #given / #when — a colon in id would be joined UNESCAPED into both the
+    // idempotency scoped key and the rate-limit budget key, colliding two
+    // distinct tuples onto one key on a shared store.
+    let error: unknown;
+    try {
+      makeConnector({ id: 'tenant:createContact' });
+    } catch (caught) {
+      error = caught;
+    }
+
+    // #then — one construction guard closes BOTH colon-joined key sites
+    expect(error).toBeInstanceOf(TypeError);
+    const message = (error as TypeError).message;
+    expect(message).toContain('tenant:createContact');
+    expect(message).toContain('idempotency');
+    expect(message).toContain('rate-limit');
+  });
+
+  it('constructs shipped id shapes that are colon-free (camelCase and dotted agent-cli)', () => {
+    // #when / #then — the guard rejects nothing shipped
+    expect(() => makeConnector({ id: 'createContact' })).not.toThrow();
+    expect(() => makeConnector({ id: 'agent-cli.claude-code' })).not.toThrow();
+  });
+});
+
 describe('createConnector classification', () => {
   it('compiles to a working Mastra tool', async () => {
     // #given

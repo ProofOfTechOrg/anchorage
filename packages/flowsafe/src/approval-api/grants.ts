@@ -65,14 +65,13 @@ import type {
 } from '../do-runner/index.js';
 import { tenantOfRunId } from '../do-runner/path-safe-id.js';
 import { BREAKWATER_APPROVED_CONNECTORS_KEY } from './contract.js';
-import { type ApprovalStore, stepKeyOf } from './store.js';
-import type { TenantBoundApprovalStore } from './tenant-brand.js';
 import {
-  type ApprovalDecision,
-  type ApprovalRecord,
-  approvalCursor,
-  MAX_APPROVAL_LIST_LIMIT,
-} from './types.js';
+  type ApprovalStore,
+  listAllApprovedForRun,
+  stepKeyOf,
+} from './store.js';
+import type { TenantBoundApprovalStore } from './tenant-brand.js';
+import type { ApprovalDecision, ApprovalRecord } from './types.js';
 
 // Whether a step-keyed approval is bound to the resumed step's CURRENT
 // suspension (exact (suspendedAt, resumeCount) pair match, or the legacy
@@ -136,35 +135,13 @@ export async function approvedConnectorsForLeg(
   runId: string,
   leg: RunLeg,
 ): Promise<string[]> {
-  // The `runId` predicate is LOAD-BEARING and must never be "optimized away"
-  // in favor of the store's tenant binding: under INV-1 a salted runId
-  // belongs to exactly one tenant, so this predicate is what keeps the mint
-  // tenant-safe even from an unbound or mis-bound store (the binding is
-  // defense in depth, not the fix). grants.test.ts pins these predicates on
-  // every page with a spy store.
-  //
-  // Retrieve ALL approved records for the run by explicit cursor paging: the
-  // D3 default bounds a bare tenant list() at MAX_APPROVAL_LIST_LIMIT, but this
-  // grant-derivation read must be COMPLETE — the record matching the current
-  // leg may be the newest, which a single bounded FIFO page would drop past
-  // the cap and fail the grant closed. Same complete-internal-reader pattern as
-  // sweepSLA; in practice one run's approved records are far under the cap, so
-  // this is a single page.
-  const approved: ApprovalRecord[] = [];
-  let after: string | undefined;
-  for (;;) {
-    const page = await store.list({
-      workflowId,
-      runId,
-      status: 'approved',
-      limit: MAX_APPROVAL_LIST_LIMIT,
-      after,
-    });
-    approved.push(...page);
-    const last = page.at(-1);
-    if (page.length < MAX_APPROVAL_LIST_LIMIT || !last) break;
-    after = approvalCursor(last);
-  }
+  // Retrieve ALL approved records for the run via the shared complete-reader —
+  // its docstring carries the load-bearing workflowId/runId-predicate and
+  // fail-closed paging rationale grants.test.ts pins with a spy store. Grant
+  // derivation MUST see the complete history: the record matching the current
+  // leg may be the newest, which a single bounded FIFO page would drop past the
+  // cap and fail the grant closed.
+  const approved = await listAllApprovedForRun(store, workflowId, runId);
   const targetKey =
     leg.kind === 'resume' && leg.step !== undefined
       ? stepKeyOf(leg.step)

@@ -138,6 +138,18 @@ describe('assertMintableTenantId — the mint-path precondition (generic Error)'
     expect(() => assertMintableTenantId('system', 'mint')).toThrow(/reserved/);
   });
 
+  it.each<[string, unknown]>([
+    ['undefined', undefined],
+    ['null', null],
+    ['an array coercing to a valid-looking slug', ['acme']],
+  ])('throws INV-3 for a non-string tenant (%s) instead of coercing it', (_label, tenantId) => {
+    // #when / #then — RegExp.test coerces undefined -> 'undefined' (a valid
+    // slug); the typeof guard refuses a non-string before that (DL-002).
+    expect(() =>
+      assertMintableTenantId(tenantId as unknown as string, 'mint'),
+    ).toThrow(/INV-3/);
+  });
+
   it('does not throw for a valid INV-3 tenantId', () => {
     // #when / #then
     expect(() => assertMintableTenantId('acme', 'mint')).not.toThrow();

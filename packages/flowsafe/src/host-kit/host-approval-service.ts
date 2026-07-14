@@ -16,6 +16,7 @@ import type {
   ApprovalAuditSink,
   ApprovalDatabase,
   ApprovalNotificationSink,
+  ApprovalStreamSink,
   SelfDecisionPolicy,
   SystemApprovalStore,
   TenantBoundApprovalStore,
@@ -135,6 +136,14 @@ export interface HostApprovalServiceOptions {
    * tenant's `canSelfDecide` display hint matches what this actually enforces.
    */
   allowSelfDecision?: SelfDecisionPolicy;
+  /**
+   * Live-stream fan-out sink (ApprovalServiceOptions.stream) — fired once per
+   * successful approval mutation for the tenant's hub Durable Object. The host
+   * supplies a sink that forwards each event to env.HUB.idFromName(record.tenantId)
+   * (createHubTopology), wrapping the transport keepalive in ctx.waitUntil
+   * itself (DL-020, fetch scope). Undefined => no live fan-out (poll-only host).
+   */
+  stream?: ApprovalStreamSink;
 }
 
 /**
@@ -166,6 +175,7 @@ export function buildHostApprovalService(
     defaultSlaSeconds: options.defaultSlaSeconds,
     audit,
     notify: options.notify,
+    stream: options.stream,
     allowSelfDecision: options.allowSelfDecision,
     resumeRun: resumeRunWithRequeue(
       options.resumeRun,
@@ -192,6 +202,17 @@ export interface SlaSweepMaintenanceOptions {
    * handler's waitUntil, so transports need no extra keep-alive here).
    */
   notify?: ApprovalNotificationSink;
+  /**
+   * Live-stream fan-out sink for SLA escalations — the BARE hub-publish thunk
+   * `(event) => createHubTopology(env.HUB).publish(event)`, NOT wrapped in a
+   * request-scoped waitUntil. A scheduled() handler runs under its OWN
+   * waitUntil where a nested one is unavailable, so runSlaSweepMaintenance
+   * COLLECTS each publish promise into its pendingSends and awaits it via the
+   * terminal Promise.all — never fire-and-forget (which would be cancelled when
+   * ctx.waitUntil(sweep()) settles) and never a nested waitUntil (which would
+   * throw cross-request I/O). DL-020. Undefined => no live escalation fan-out.
+   */
+  stream?: ApprovalStreamSink;
 }
 
 /**
@@ -219,6 +240,26 @@ export async function runSlaSweepMaintenance(
           keepAlive: (send) => pendingSends.push(send),
         }),
         notify: options.notify,
+        // Mirror the audit sink's keepAlive idiom: COLLECT each escalation's
+        // publish promise into pendingSends so the terminal Promise.all keeps it
+        // alive under the scheduled handler's own waitUntil (DL-020). The inner
+        // .catch keeps a failed fan-out from rejecting the whole Promise.all.
+        stream: (event) => {
+          pendingSends.push(
+            Promise.resolve(options.stream?.(event)).catch((error: unknown) =>
+              // Log a wedged cron fan-out (matching the fetch path's
+              // stream-publish-error) instead of swallowing it silently, while
+              // still containing it so it can't reject the whole Promise.all.
+              console.error(
+                JSON.stringify({
+                  type: 'stream-publish-error',
+                  reason:
+                    error instanceof Error ? error.message : String(error),
+                }),
+              ),
+            ),
+          );
+        },
         onEscalation: (record) =>
           console.log(
             JSON.stringify({

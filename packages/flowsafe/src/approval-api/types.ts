@@ -378,6 +378,25 @@ export function parseApprovalTimeBound(value: string, field: string): number {
 }
 
 /**
+ * Eagerly validates BOTH time-bound filters (createdBefore/createdAfter) when
+ * present, discarding the parsed instants — the call is purely for
+ * parseApprovalTimeBound's throw-on-garbage side effect. Both in-memory list
+ * paths (InMemoryApprovalStore.list and the cron-only system view) call this up
+ * front, BEFORE filtering, so a zero-match view rejects an unparseable bound
+ * identically to D1's unconditional appendListFilters instead of silently
+ * returning [] — single-sourcing the "both backends fail identically" contract
+ * (DL-006). Fail-closed: a garbage bound errors, never a silently empty page.
+ */
+export function assertApprovalTimeBounds(
+  filter: Pick<ApprovalListFilter, 'createdBefore' | 'createdAfter'>,
+): void {
+  if (filter.createdBefore !== undefined)
+    parseApprovalTimeBound(filter.createdBefore, 'createdBefore');
+  if (filter.createdAfter !== undefined)
+    parseApprovalTimeBound(filter.createdAfter, 'createdAfter');
+}
+
+/**
  * Hard cap on ids per decideBatch call — see ApprovalService.decideBatch.
  * Sized against the Workers request ceilings, not taste: each decided record
  * costs a store CAS plus (when resumeRun is wired, as in every DO host) a

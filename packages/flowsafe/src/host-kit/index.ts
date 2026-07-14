@@ -52,11 +52,26 @@ export {
   runSlaSweepMaintenance,
   type SlaSweepMaintenanceOptions,
 } from './host-approval-service.js';
+export {
+  createHubTopology,
+  type HubNamespaceLike,
+  type HubStubLike,
+  type HubTopology,
+} from './hub-topology.js';
 export type { WorkflowIdSource } from './registration.js';
 export { assertWorkflowsRegistered } from './registration.js';
 export { RunRouteError } from './run-route-error.js';
 export type { RunRouter, RunRouterOptions } from './run-router.js';
 export { createRunRouter } from './run-router.js';
+export type { StreamRouter, StreamRouterOptions } from './stream-router.js';
+export { createStreamRouter } from './stream-router.js';
+export type {
+  MintStreamTicketOptions,
+  StreamChannel,
+  StreamTicketClaims,
+  VerifyStreamTicketOptions,
+} from './stream-ticket.js';
+export { mintStreamTicket, verifyStreamTicket } from './stream-ticket.js';
 export type { SubdomainCrossCheckOptions } from './subdomain-check.js';
 // requestedConnectors and subdomainTenantOf stay module-internal on purpose:
 // they are the primitives beneath queueApprovalForSuspension /

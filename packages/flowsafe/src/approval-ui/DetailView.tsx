@@ -6,6 +6,7 @@ import type {
 } from '../approval-api/types.js';
 import { OPEN_STATUSES } from '../approval-api/types.js';
 import { useApprovalUIComponents } from './components.js';
+import type { PresenceMember } from './stream.js';
 import { APPROVAL_TIPS } from './tips.js';
 import { formatSlaCountdown } from './view-model.js';
 
@@ -17,6 +18,8 @@ export interface DetailViewProps {
   onClaim: () => void;
   onDecide: (decision: ApprovalDecision, comment: string) => void;
   onDelegate: (to: string) => void;
+  /** Reviewers currently connected to the live stream. Omit / empty in poll-only mode. */
+  presence?: PresenceMember[];
 }
 
 export function DetailView({
@@ -26,6 +29,7 @@ export function DetailView({
   onClaim,
   onDecide,
   onDelegate,
+  presence,
 }: DetailViewProps): JSX.Element {
   const C = useApprovalUIComponents();
   const [comment, setComment] = useState('');
@@ -52,6 +56,11 @@ export function DetailView({
             />
             {record.claimedBy ? ` (claimed by ${record.claimedBy})` : null}
           </C.MetadataItem>
+          {presence !== undefined && presence.length > 0 ? (
+            <C.MetadataItem label="Reviewers online">
+              <C.PresenceIndicator members={presence} />
+            </C.MetadataItem>
+          ) : null}
           <C.MetadataItem label="Priority">
             <C.InfoTip label={record.priority} tip={APPROVAL_TIPS.priority} />
           </C.MetadataItem>

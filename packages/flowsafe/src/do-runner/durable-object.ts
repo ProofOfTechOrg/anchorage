@@ -10,7 +10,8 @@
 // since all traffic for a run lands on one instance. `state` is captured
 // for the Phase 2 alarm-chained engine (setAlarm/alarm) but unused today.
 
-import type { DurableObjectRunnerState } from './cf-types.js';
+import type { DurableObjectRunnerState, WebSocketLike } from './cf-types.js';
+import { newWebSocketPair, safeSend } from './cf-types.js';
 import { tenantOfRunId } from './path-safe-id.js';
 import { DurableStorageResumeLedger } from './resume-ledger.js';
 import {
@@ -18,6 +19,7 @@ import {
   RunAlreadyExistsError,
   RunNotSuspendedError,
   type RunnerRuntime,
+  type RunSummary,
   UnknownRunError,
   UnknownWorkflowError,
 } from './runtime.js';
@@ -145,12 +147,14 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         );
       }
       this.#assertRunIdentity(body.workflowId, body.runId);
-      return json(
-        await runtime.start(body.workflowId, {
-          runId: body.runId,
-          inputData: body.inputData,
-        }),
-      );
+      const summary = await runtime.start(body.workflowId, {
+        runId: body.runId,
+        inputData: body.inputData,
+      });
+      // DL-018: the authoritative RunSummary is the run-progress frame; push it
+      // to any subscribed run-channel socket at this lifecycle boundary.
+      this.#broadcastRunSummary(summary);
+      return json(summary);
     }
     if (
       request.method === 'GET' &&
@@ -163,6 +167,47 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       return summary ? json(summary) : json({ error: 'run not found' }, 404);
     }
     if (
+      request.method === 'GET' &&
+      segments.length === 4 &&
+      action === 'stream' &&
+      workflowId &&
+      runId
+    ) {
+      const isUpgrade =
+        request.headers.get('upgrade')?.toLowerCase() === 'websocket';
+      const state = this.state;
+      if (!isUpgrade || !state?.acceptWebSocket) {
+        // The per-run WS stream needs an Upgrade handshake AND the workerd
+        // Hibernatable-WebSocket API; off workerd (node/vitest) or on a plain
+        // GET, poll `GET /runs/:workflowId/:runId` instead. Fail with 426
+        // (Upgrade Required), never a 500 — the WS path is proven by the spike.
+        return json(
+          {
+            error:
+              'websocket upgrade required for run streaming (workerd-only; poll GET /runs/:workflowId/:runId as the fallback)',
+          },
+          426,
+        );
+      }
+      // The trusted Worker already verified the run ticket and routed by
+      // ticket.runId to idFromName; re-bind to this instance's identity (INV-1)
+      // before accepting so a mis-routed upgrade is refused.
+      this.#assertRunIdentity(workflowId, runId);
+      const { 0: client, 1: server } = newWebSocketPair();
+      state.acceptWebSocket(server);
+      // On-connect snapshot: seed the new subscriber with the current
+      // authoritative summary (DL-018) so it need not wait for the next
+      // lifecycle transition. Nothing to send if the run is not yet queryable.
+      const snapshot = await runtime.status(workflowId, runId);
+      if (snapshot) {
+        safeSend(server, runFrame(snapshot));
+      }
+      return new Response(null, {
+        status: 101,
+        webSocket: client,
+      } as unknown as ResponseInit);
+    }
+    if (
       request.method === 'POST' &&
       segments.length === 4 &&
       action === 'resume' &&
@@ -171,15 +216,59 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     ) {
       this.#assertRunIdentity(workflowId, runId);
       const body = (await readJson<ResumeBody>(request)) ?? {};
-      return json(
-        await runtime.resume(workflowId, runId, {
-          step: body.step,
-          resumeData: body.resumeData,
-        }),
-      );
+      const summary = await runtime.resume(workflowId, runId, {
+        step: body.step,
+        resumeData: body.resumeData,
+      });
+      // DL-018: broadcast the post-resume authoritative summary.
+      this.#broadcastRunSummary(summary);
+      return json(summary);
     }
     return json({ error: 'not found' }, 404);
   }
+
+  /**
+   * Fan the authoritative RunSummary out to every subscribed run-channel
+   * socket (DL-018: at each lifecycle boundary — after start()/resume() — plus
+   * the on-connect snapshot). No-op when the DO exposes no getWebSockets
+   * (node/vitest, or any host without the Hibernatable-WebSocket API), so the
+   * HTTP surface is unchanged off workerd.
+   */
+  #broadcastRunSummary(summary: RunSummary): void {
+    const sockets = this.state?.getWebSockets?.();
+    if (!sockets) return;
+    const frame = runFrame(summary);
+    for (const ws of sockets) {
+      safeSend(ws, frame);
+    }
+  }
+
+  // Hibernation wake handlers — workerd invokes these BY NAME on the instance
+  // when a hibernated run-channel socket receives a frame, closes, or errors,
+  // so they must exist for a live socket to survive DO eviction. The run
+  // channel is broadcast-only (progress flows server->client via
+  // #broadcastRunSummary), so there is no client->server protocol beyond a
+  // keepalive and no per-socket state to release — a closed socket simply
+  // drops out of getWebSockets(). Only exercised under workerd (the spike).
+  webSocketMessage(ws: WebSocketLike, message: string | ArrayBuffer): void {
+    // Lightweight keepalive: answer a client 'ping' with 'pong'.
+    if (message === 'ping') {
+      ws.send('pong');
+    }
+  }
+
+  webSocketClose(_ws: WebSocketLike, _code: number, _reason: string): void {
+    // Nothing to reconcile; the closed socket leaves getWebSockets() on its own.
+  }
+
+  webSocketError(_ws: WebSocketLike, _error: unknown): void {
+    // Nothing to reconcile on a broadcast-only channel.
+  }
+}
+
+/** The run-channel wire frame — the authoritative RunSummary (DL-018). */
+function runFrame(summary: RunSummary): string {
+  return JSON.stringify({ type: 'run', summary });
 }
 
 async function readJson<T>(request: Request): Promise<T | null> {

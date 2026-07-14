@@ -67,6 +67,7 @@ import { AuditLogger, D1RateLimitStore } from '@proofoftech/breakwater';
 import { approvalGrantProvider } from '@proofoftech/flowsafe/approval-api';
 import {
   DurableObjectRunner,
+  HubDurableObject,
   purgeTenant,
   type RunnerRuntime,
   tenantOfRunId,
@@ -106,6 +107,12 @@ interface Env {
   DB: D1Database;
   RUNNER: DurableObjectNamespace;
   /**
+   * Per-tenant live-streaming hub DO (ShowcaseHub). Always bound (wrangler v2
+   * migration), so it is required; but streaming only mounts when
+   * STREAM_TICKET_SECRET is ALSO set (see below), so the binding alone is inert.
+   */
+  HUB: DurableObjectNamespace;
+  /**
    * Optional Cloudflare Email Service binding. Absent (Phase A) => the outreach
    * connector simulates the send (logs the envelope, sends nothing). Bound =>
    * real transactional send from an onboarded domain.
@@ -122,6 +129,15 @@ interface Env {
    * actor mapping stays inside the trusted computing base either way.
    */
   APPROVAL_ACTOR_TOKENS?: string;
+  /**
+   * Secret (`wrangler secret put STREAM_TICKET_SECRET`): the dedicated HS256
+   * key that signs short-lived WebSocket stream tickets. Present WITH the HUB
+   * binding => the composer mounts live streaming (queue + run channels);
+   * absent => streaming stays unmounted and the SPA runs on polling only
+   * (graceful degradation, DL-019). A dedicated key so a stream ticket and a
+   * session JWT can never be confused under one signing secret.
+   */
+  STREAM_TICKET_SECRET?: string;
   /** Default SLA seconds for new approvals (var; default 14400 = 4h). */
   APPROVAL_SLA_SECONDS?: string;
   /**
@@ -214,6 +230,15 @@ export class ShowcaseRunner extends DurableObjectRunner<Env> {
     return defineWorkflows(env, this.tenantId);
   }
 }
+
+/**
+ * The per-tenant live-streaming hub (wrangler HUB binding, v2 migration). The
+ * base owns everything — accept a subscriber socket, fan out approval stream
+ * events, track presence — recovering its tenant from its own idFromName
+ * identity, so the subclass body is empty. Exported SEPARATELY from the handler
+ * triple: workerd resolves the DO class by this named export.
+ */
+export class ShowcaseHub extends HubDurableObject<Env> {}
 
 /**
  * The kill switch, fail-closed via boolVar: an operator mid-incident typing

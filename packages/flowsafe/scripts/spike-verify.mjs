@@ -20,6 +20,7 @@
 // resort. Fault injection: SPIKE_VERIFY_FAULT=skip-decide skips the
 // decide step so the harness's own failure path stays testable.
 import { spawn, spawnSync } from 'node:child_process';
+import { createHmac } from 'node:crypto';
 import {
   createWriteStream,
   mkdtempSync,
@@ -49,10 +50,23 @@ const AUTH = {
   viewer: { authorization: 'Bearer spike-viewer' },
 };
 
+// Streaming (M-009). MUST equal spike/wrangler.jsonc `vars.STREAM_TICKET_SECRET`
+// — startServer ALSO re-passes it via `--var` so the worker signs tickets with
+// exactly this key. That lets the ticket probes below (a) prove a VALID forge is
+// ACCEPTED (the positive control that makes the refusals meaningful — a secret
+// mismatch would refuse everything and false-pass), and (b) craft EXPIRED and
+// CROSS-TENANT tickets the worker must refuse at the CLAIM layer, not the
+// signature. A LOCAL-ONLY spike fixture; never a real secret.
+const STREAM_TICKET_SECRET = 'spike-local-stream-secret-do-not-deploy';
+const nowSec = () => Math.floor(Date.now() / 1000);
+
 let currentStep = 'startup';
 let currentServer;
 let tmpDir;
 const servers = [];
+// Every client WebSocket opened by the stream probes, closed in cleanup() so a
+// lingering socket cannot hold the process open after the run.
+const clientSockets = [];
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -155,6 +169,10 @@ function startServer(generation, stateDir, logPath) {
       '0',
       '--persist-to',
       stateDir,
+      // Sign stream tickets with the SAME key spike-verify forges with, so the
+      // ticket fail-closed probes exercise CLAIM rejection, not signature drift.
+      '--var',
+      `STREAM_TICKET_SECRET:${STREAM_TICKET_SECRET}`,
     ],
     {
       cwd: FLOWSAFE,
@@ -257,6 +275,182 @@ async function http(method, path, { body, headers } = {}) {
   }
 }
 
+// --- Live-stream (WebSocket) probe helpers (M-009) -------------------------
+
+// Forge a stream ticket with the SAME primitives as the worker's
+// mintStreamTicket: base64url(JSON(claims)) + '.' + HMAC-SHA256 over that
+// payload (base64url). crypto.createHmac(...).digest('base64url') is byte-equal
+// to the worker's WebCrypto hmacSign, so a VALID forge is ACCEPTED (positive
+// control) and EXPIRED / CROSS-TENANT forges exercise the worker's claim
+// validation, not a signature mismatch.
+function forgeTicket(claims) {
+  const payload = Buffer.from(JSON.stringify(claims), 'utf8').toString(
+    'base64url',
+  );
+  const signature = createHmac('sha256', STREAM_TICKET_SECRET)
+    .update(payload)
+    .digest('base64url');
+  return `${payload}.${signature}`;
+}
+
+// Mint a ticket the LEGITIMATE way: over the authenticated REST route.
+async function mintTicketApi(channel, runId, headers) {
+  const body =
+    runId === undefined
+      ? { channel }
+      : { channel, runId, workflowId: 'demo-approval' };
+  const { status, body: res } = await http('POST', '/api/stream/ticket', {
+    body,
+    headers,
+  });
+  assert(status === 200, `mint ${channel} ticket -> ${status}`, res);
+  assert(typeof res.ticket === 'string', 'ticket is a string', res);
+  assert(typeof res.url === 'string', 'ticket url is a string', res);
+  return res; // { url, ticket, expiresAt }
+}
+
+function wsUrl(path, ticket) {
+  const sep = path.includes('?') ? '&' : '?';
+  return `ws://127.0.0.1:${PORT}${path}${sep}ticket=${encodeURIComponent(ticket)}`;
+}
+
+// Open a subscription and collect parsed frames. Tracked for cleanup.
+function connectWs(path, ticket) {
+  const ws = new WebSocket(wsUrl(path, ticket));
+  clientSockets.push(ws);
+  const frames = [];
+  const listeners = new Set();
+  ws.addEventListener('message', (event) => {
+    const text =
+      typeof event.data === 'string' ? event.data : String(event.data);
+    let parsed = null;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = null; // a non-JSON frame is ignored by the predicates below
+    }
+    frames.push(parsed);
+    for (const fn of [...listeners]) fn(parsed);
+  });
+  return {
+    ws,
+    frames,
+    onFrame(fn) {
+      listeners.add(fn);
+      return () => listeners.delete(fn);
+    },
+    close() {
+      try {
+        ws.close();
+      } catch {
+        // already closing/closed
+      }
+    },
+  };
+}
+
+function waitOpen(conn, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    if (conn.ws.readyState === WebSocket.OPEN) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(
+      () => reject(new Error('websocket did not open in time')),
+      timeoutMs,
+    );
+    conn.ws.addEventListener(
+      'open',
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+    conn.ws.addEventListener(
+      'error',
+      () => {
+        clearTimeout(timer);
+        reject(new Error('websocket errored before open'));
+      },
+      { once: true },
+    );
+    conn.ws.addEventListener(
+      'close',
+      (event) => {
+        clearTimeout(timer);
+        reject(new Error(`websocket closed before open (code ${event.code})`));
+      },
+      { once: true },
+    );
+  });
+}
+
+function waitFrame(conn, predicate, timeoutMs) {
+  const existing = conn.frames.find((frame) => predicate(frame));
+  if (existing !== undefined) return Promise.resolve(existing);
+  return new Promise((resolve, reject) => {
+    let off = () => {};
+    const timer = setTimeout(() => {
+      off();
+      reject(new Error('expected websocket frame not received in time'));
+    }, timeoutMs);
+    off = conn.onFrame((frame) => {
+      if (predicate(frame)) {
+        clearTimeout(timer);
+        off();
+        resolve(frame);
+      }
+    });
+  });
+}
+
+// A ticket that MUST be refused: OPENING is a LEAK (reject). A handshake error
+// or a close (the worker returned a non-101, e.g. 403) is the pass. A timeout
+// with neither is a FAILURE (ambiguous — never a silent pass).
+function expectWsRefused(path, ticket, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsUrl(path, ticket));
+    clientSockets.push(ws);
+    let timer;
+    const settle = (fn, arg) => {
+      clearTimeout(timer);
+      try {
+        ws.close();
+      } catch {
+        // already closing/closed
+      }
+      fn(arg);
+    };
+    timer = setTimeout(
+      () =>
+        settle(
+          reject,
+          new Error('websocket neither opened nor was refused (ambiguous)'),
+        ),
+      timeoutMs,
+    );
+    ws.addEventListener('open', () =>
+      settle(
+        reject,
+        new Error('LEAK: websocket opened on a ticket that must be refused'),
+      ),
+    );
+    ws.addEventListener('error', () => settle(resolve));
+    ws.addEventListener('close', () => settle(resolve));
+  });
+}
+
+function closeClientSockets() {
+  for (const ws of clientSockets.splice(0)) {
+    try {
+      ws.close();
+    } catch {
+      // already closing/closed
+    }
+  }
+}
+
 function dumpLog(server) {
   const tail = server.chunks.join('').split('\n').slice(-200);
   console.error(`\n--- ${server.generation} log tail (${server.logPath}) ---`);
@@ -266,6 +460,7 @@ function dumpLog(server) {
 // Even when the kill fails (port won't free), release what we own —
 // log fds and the temp dir — before the failure propagates.
 async function cleanup() {
+  closeClientSockets();
   try {
     if (currentServer !== undefined) {
       const server = currentServer;
@@ -499,6 +694,214 @@ async function main() {
       );
     },
   );
+
+  // --- Part B live streaming (M-009): real WebSockets over workerd ----------
+  // Each probe below opens an ACTUAL WebSocket against wrangler dev and asserts
+  // something that can FAIL (and exit non-zero): a fanned-out event is received,
+  // a cross-tenant socket stays silent, a subscription survives a kill+restart,
+  // and expired/cross-tenant/garbage/cross-channel tickets are refused.
+
+  await step(
+    'D fan-out + hub cross-tenant isolation: a decided event reaches the ' +
+      "tenant's socket and never another tenant's",
+    async () => {
+      // A fresh run -> a pending approval (requestedBy=opal) ray decides below.
+      const started = await http('POST', '/runs', {
+        body: RUN_BODY,
+        headers: AUTH.operator,
+      });
+      assert(
+        started.status === 200 && started.body.status === 'suspended',
+        'D run suspended',
+        { status: started.status, body: started.body },
+      );
+      const approvalId = started.body.approval?.id;
+      assert(typeof approvalId === 'string', 'D approval id', started.body);
+
+      // Subscribe the spike hub over a LEGITIMATELY minted ticket.
+      const spikeTicket = await mintTicketApi('hub', undefined, AUTH.viewer);
+      const spike = connectWs(spikeTicket.url, spikeTicket.ticket);
+      await waitOpen(spike, 10_000);
+      // The hub broadcasts presence on connect — a subscription barrier proving
+      // acceptWebSocket registered this socket before the mutation fans out.
+      await waitFrame(spike, (frame) => frame?.type === 'presence', 10_000);
+
+      // A forged tenant-'other' hub ticket (valid signature via the shared local
+      // secret) subscribes to tenant OTHER's hub, NEVER spike's.
+      const otherTicket = forgeTicket({
+        tenantId: 'other',
+        channel: 'hub',
+        actorId: 'mallory',
+        role: 'reviewer',
+        exp: nowSec() + 60,
+      });
+      const other = connectWs('/api/stream/hub', otherTicket);
+      await waitOpen(other, 10_000);
+
+      // Decide the spike approval -> fires a 'decided' stream event (tenant
+      // spike), fanned out over the hub to spike's sockets only.
+      const decided = await http(
+        'POST',
+        `/api/approvals/${approvalId}/decide`,
+        { headers: AUTH.reviewer, body: { decision: 'approve' } },
+      );
+      assert(decided.status === 200, 'D decide ok', decided.body);
+
+      // Fan-out: the spike socket receives the decided event.
+      const frame = await waitFrame(
+        spike,
+        (candidate) =>
+          candidate?.type === 'queue' && candidate?.event?.type === 'decided',
+        10_000,
+      );
+      assert(
+        frame.event.record.tenantId === 'spike',
+        'fanned-out event is tenant spike',
+        frame.event.record,
+      );
+      assert(
+        frame.event.record.id === approvalId,
+        'fanned-out event is the decided approval',
+        frame.event.record,
+      );
+
+      // Cross-tenant isolation: give any erroneous leak time to arrive (the
+      // spike frame already proved the event fired), then assert the 'other'
+      // socket saw NO spike queue frame.
+      await sleep(500);
+      const leaked = other.frames.find((f) => f?.type === 'queue');
+      assert(
+        leaked === undefined,
+        'LEAK: tenant other received a spike queue event',
+        leaked,
+      );
+
+      spike.close();
+      other.close();
+    },
+  );
+
+  await step(
+    'E hibernation persistence: a re-opened subscription still receives ' +
+      'events across a workerd kill+restart',
+    async () => {
+      await killServer(currentServer);
+      currentServer = undefined;
+      currentServer = startServer('gen-3', stateDir, join(tmpDir, 'gen3.log'));
+      await waitReady(currentServer, 90_000);
+      assert(
+        !/address already in use/i.test(currentServer.chunks.join('')),
+        'gen-3 log must not contain "address already in use" (orphan trap)',
+      );
+
+      // A fresh run + subscription on the RESTARTED process; a decided event
+      // still reaches the reconnected socket -> the WS subscription is not lost
+      // across a DO eviction/process restart (the hub re-binds via idFromName
+      // and fans out over the hibernatable-WebSocket API).
+      const started = await http('POST', '/runs', {
+        body: RUN_BODY,
+        headers: AUTH.operator,
+      });
+      assert(
+        started.status === 200 && started.body.status === 'suspended',
+        'E run suspended',
+        { status: started.status, body: started.body },
+      );
+      const approvalId = started.body.approval?.id;
+      assert(typeof approvalId === 'string', 'E approval id', started.body);
+
+      const ticket = await mintTicketApi('hub', undefined, AUTH.viewer);
+      const sock = connectWs(ticket.url, ticket.ticket);
+      await waitOpen(sock, 10_000);
+      await waitFrame(sock, (frame) => frame?.type === 'presence', 10_000);
+
+      const decided = await http(
+        'POST',
+        `/api/approvals/${approvalId}/decide`,
+        { headers: AUTH.reviewer, body: { decision: 'approve' } },
+      );
+      assert(decided.status === 200, 'E decide ok', decided.body);
+
+      const frame = await waitFrame(
+        sock,
+        (candidate) =>
+          candidate?.type === 'queue' && candidate?.event?.type === 'decided',
+        10_000,
+      );
+      assert(
+        frame.event.record.tenantId === 'spike',
+        'post-restart fan-out is tenant spike',
+        frame.event.record,
+      );
+      sock.close();
+    },
+  );
+
+  await step(
+    'F ticket fail-closed: a valid forge opens, but expired / cross-tenant / ' +
+      'garbage / cross-channel tickets are refused',
+    async () => {
+      const spikeRunId = run.runId; // a real spike-owned runId (from A1)
+
+      // POSITIVE CONTROL: a forged-but-VALID hub ticket (correct secret, future
+      // exp) OPENS. Proves the shared local secret matches the worker's, so the
+      // refusals below are CLAIM rejections, not signature drift. If the secret
+      // ever drifts, THIS throws and the probe fails loudly.
+      const valid = forgeTicket({
+        tenantId: 'spike',
+        channel: 'hub',
+        actorId: 'vic',
+        role: 'viewer',
+        exp: nowSec() + 60,
+      });
+      const control = connectWs('/api/stream/hub', valid);
+      await waitOpen(control, 10_000);
+      control.close();
+
+      // Expired hub ticket -> refused (exp in the past).
+      const expired = forgeTicket({
+        tenantId: 'spike',
+        channel: 'hub',
+        actorId: 'vic',
+        role: 'viewer',
+        exp: nowSec() - 30,
+      });
+      await expectWsRefused('/api/stream/hub', expired, 8_000);
+
+      // Cross-tenant RUN ticket: tenant 'other' claiming a SPIKE runId ->
+      // refused (tenantOwnsSaltedId('other', spikeRunId) is false).
+      const crossTenant = forgeTicket({
+        tenantId: 'other',
+        channel: 'run',
+        runId: spikeRunId,
+        actorId: 'mallory',
+        role: 'reviewer',
+        exp: nowSec() + 60,
+      });
+      await expectWsRefused(
+        `/api/stream/run/demo-approval/${spikeRunId}`,
+        crossTenant,
+        8_000,
+      );
+
+      // Garbage signature -> refused (signature validation).
+      await expectWsRefused('/api/stream/hub', 'forged.signature', 8_000);
+
+      // Cross-channel: a hub ticket presented on the run route -> refused.
+      const hubForRun = forgeTicket({
+        tenantId: 'spike',
+        channel: 'hub',
+        actorId: 'vic',
+        role: 'viewer',
+        exp: nowSec() + 60,
+      });
+      await expectWsRefused(
+        `/api/stream/run/demo-approval/${spikeRunId}`,
+        hubForRun,
+        8_000,
+      );
+    },
+  );
 }
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
@@ -515,7 +918,10 @@ try {
   await main();
   console.log(
     '\nSPIKE VERIFIED: run survived process death, resumed via approval ' +
-      'grant, a forged raw resume failed closed, and self-decision was denied.',
+      'grant, a forged raw resume failed closed, and self-decision was denied. ' +
+      'Live streaming (M-009): a decided event fanned out to the tenant socket, ' +
+      'stayed isolated from another tenant, survived a kill+restart, and ' +
+      'refused expired / cross-tenant / garbage / cross-channel tickets.',
   );
 } catch (error) {
   exitCode = 1;

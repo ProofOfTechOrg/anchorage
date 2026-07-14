@@ -14,6 +14,8 @@ export type {
   ApprovalNotificationEvent,
   ApprovalNotificationSink,
   ApprovalRole,
+  ApprovalStreamEvent,
+  ApprovalStreamSink,
 } from './contract.js';
 export {
   APPROVAL_ROLES,

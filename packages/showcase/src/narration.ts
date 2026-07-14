@@ -1,14 +1,16 @@
-// Client-derived narration: pure functions that turn polled snapshots and
-// one-shot API results into feed/toast events. Nothing here talks to the
-// network or the DOM — deriving the same facts twice yields the same event
-// KEYS, and the feed/toast layers dedup on key, which is what makes StrictMode
-// double-invokes and overlapping poll streams safe by construction.
+// Client-derived narration: pure functions that turn observed snapshots (now
+// live-stream-updated as well as polled) and one-shot API results into
+// feed/toast events. Nothing here talks to the network or the DOM — deriving
+// the same facts twice yields the same event KEYS, and the feed/toast layers
+// dedup on key, which is what makes StrictMode double-invokes and overlapping
+// poll/stream updates safe by construction.
 //
-// Honesty contract: `observed: true` events restate an API response the
-// browser actually saw; `observed: false` events describe what the deployed
-// architecture does BY DESIGN between those observations (DO spawn, D1
-// snapshots, server-side grant derivation) and are only ever emitted anchored
-// to an observed event.
+// Honesty contract: `observed: true` events restate something the browser
+// actually saw (a REST response, or a live stream frame now that a real event
+// API exists); `observed: false` events describe what the deployed architecture
+// does BY DESIGN between those observations (DO spawn, D1 snapshots,
+// server-side grant derivation — none of which the stream carries) and are only
+// ever emitted anchored to an observed event.
 
 import type {
   ApprovalDecision,

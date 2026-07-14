@@ -92,7 +92,7 @@ export function tenantOwnsSaltedId(tenantId: string, id: string): boolean {
  * salted-id mint (runIds and memory ids).
  */
 export function assertMintableTenantId(tenantId: string, caller: string): void {
-  if (!TENANT_ID_PATTERN.test(tenantId)) {
+  if (typeof tenantId !== 'string' || !TENANT_ID_PATTERN.test(tenantId)) {
     throw new Error(
       `${caller}: tenantId '${tenantId}' violates INV-3 (^[a-z0-9]{3,32}$) — the prefix decode and range purge are only exact over that charset`,
     );

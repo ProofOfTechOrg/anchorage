@@ -6,6 +6,8 @@ import type {
   ApprovalAuditEvent,
   ApprovalNotificationEvent,
   ApprovalNotificationSink,
+  ApprovalStreamEvent,
+  ApprovalStreamSink,
 } from './contract.js';
 import {
   ApprovalAuthzError,
@@ -101,6 +103,7 @@ function runSweep(
   options: {
     onEscalation?: (record: ApprovalRecord) => void;
     notify?: ApprovalNotificationSink;
+    stream?: ApprovalStreamSink;
   } = {},
 ): Promise<ApprovalRecord[]> {
   return sweepSLA(harness.backend.system(), {
@@ -108,6 +111,7 @@ function runSweep(
     audit: (event) => harness.events.push(event),
     onEscalation: options.onEscalation,
     notify: options.notify,
+    stream: options.stream,
     now: harness.now,
   });
 }
@@ -972,6 +976,314 @@ describe('ApprovalService self-approval control', () => {
   });
 });
 
+describe('ApprovalService cross-gate separation of duties', () => {
+  // The reconcile hole this closes: resumeRunWithRequeue attributes gate B to
+  // the gate-A decider (so the requestedBy self-check already bars them), but
+  // reconcileApprovalsForSummary files gate B as the SYSTEM actor — which the
+  // requestedBy check never blocks. The bar below is derived from the run's
+  // APPROVED history instead, so it catches BOTH filings.
+
+  it('refuses the gate-A approver at gate B even when gate B is filed by the system actor (reconcile path)', async () => {
+    // #given — ray approves gate A; the run advances and re-suspends at gate B,
+    // which is reconcile-filed attributed to the system actor (NOT ray)
+    const harness = makeHarness();
+    const gateA = await seedPending(harness, {
+      runId: 'acme_run-seq',
+      stepPath: ['gateA'],
+    });
+    await harness.service.decide(gateA.id, { decision: 'approve' }, REVIEWER);
+    // The run resumed and re-suspended; the reconcile files gate B later.
+    harness.advance(1000);
+    const gateB = await harness.service.create(
+      input({
+        runId: 'acme_run-seq',
+        stepPath: ['gateB'],
+        requestedBy: 'flowsafe-system',
+      }),
+      OPERATOR,
+    );
+
+    // #when / #then — ray (who advanced the run at gate A) cannot decide gate B,
+    // even though requestedBy is the system actor, not ray
+    let caught: unknown;
+    try {
+      await harness.service.decide(
+        gateB.record.id,
+        { decision: 'approve' },
+        REVIEWER,
+      );
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ApprovalAuthzError);
+    expect(await harness.store.get(gateB.record.id)).toMatchObject({
+      status: 'pending',
+    });
+    expect(harness.events).toContainEqual(
+      expect.objectContaining({
+        action: 'approval.decide',
+        decision: 'denied',
+        reason:
+          'cross-gate separation of duties: this actor approved an earlier gate of the run',
+      }),
+    );
+  });
+
+  it('lets a DIFFERENT reviewer decide gate B', async () => {
+    // #given — same run: ray approved gate A, gate B is reconcile-filed
+    const harness = makeHarness();
+    const gateA = await seedPending(harness, {
+      runId: 'acme_run-seq',
+      stepPath: ['gateA'],
+    });
+    await harness.service.decide(gateA.id, { decision: 'approve' }, REVIEWER);
+    harness.advance(1000);
+    const gateB = await harness.service.create(
+      input({
+        runId: 'acme_run-seq',
+        stepPath: ['gateB'],
+        requestedBy: 'flowsafe-system',
+      }),
+      OPERATOR,
+    );
+
+    // #when — a reviewer who did NOT advance the run (admin) decides gate B
+    const decided = await harness.service.decide(
+      gateB.record.id,
+      { decision: 'approve' },
+      ADMIN,
+    );
+
+    // #then — allowed: the bar is per-actor, not a blanket second-reviewer block
+    expect(decided.record.status).toBe('approved');
+  });
+
+  it('does NOT block two independent parallel gates one reviewer clears', async () => {
+    // #given — two gates filed TOGETHER before any decision (a .parallel() split)
+    const harness = makeHarness();
+    const gate1 = await seedPending(harness, {
+      runId: 'acme_run-par',
+      stepPath: ['branchA'],
+    });
+    const gate2 = await seedPending(harness, {
+      runId: 'acme_run-par',
+      stepPath: ['branchB'],
+    });
+    // Decisions happen AFTER both were filed, so a prior approval's decidedAt is
+    // strictly LATER than the sibling's createdAt — the causal anchor never fires.
+    harness.advance(1000);
+
+    // #when — ray decides both
+    const d1 = await harness.service.decide(
+      gate1.id,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+    const d2 = await harness.service.decide(
+      gate2.id,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then — both clear: independent parallel gates are not over-blocked
+    expect(d1.record.status).toBe('approved');
+    expect(d2.record.status).toBe('approved');
+  });
+
+  it('a prior same-actor REJECTION does not bar a later re-review gate (approved-only scope)', async () => {
+    // #given — ray REJECTS gate A (reject -> revise); the re-review gate is filed
+    const harness = makeHarness();
+    const gateA = await seedPending(harness, {
+      runId: 'acme_run-rej',
+      stepPath: ['review'],
+    });
+    await harness.service.decide(gateA.id, { decision: 'reject' }, REVIEWER);
+    harness.advance(1000);
+    const reReview = await harness.service.create(
+      input({
+        runId: 'acme_run-rej',
+        stepPath: ['review'],
+        requestedBy: 'flowsafe-system',
+      }),
+      OPERATOR,
+    );
+
+    // #when — ray re-reviews the revised submission
+    const decided = await harness.service.decide(
+      reReview.record.id,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then — allowed: a rejection is a denial, not an advancement, so the
+    // approved-only history query excludes it and the normal cycle is unbroken
+    expect(decided.record.status).toBe('approved');
+  });
+
+  it('still lets the demo admin ({ roles: [admin] }) clear both gates of a run', async () => {
+    // #given — the single-operator config: admin is exempt from SoD entirely
+    const harness = makeHarness({ allowSelfDecision: { roles: ['admin'] } });
+    const gateA = await seedPending(harness, {
+      runId: 'acme_run-adm',
+      stepPath: ['gateA'],
+    });
+    await harness.service.decide(gateA.id, { decision: 'approve' }, ADMIN);
+    harness.advance(1000);
+    const gateB = await harness.service.create(
+      input({
+        runId: 'acme_run-adm',
+        stepPath: ['gateB'],
+        requestedBy: 'flowsafe-system',
+      }),
+      OPERATOR,
+    );
+
+    // #when — the SAME admin decides gate B
+    const decided = await harness.service.decide(
+      gateB.record.id,
+      { decision: 'approve' },
+      ADMIN,
+    );
+
+    // #then — the exemption skips BOTH the requestedBy self-check and this bar
+    expect(decided.record.status).toBe('approved');
+  });
+
+  it('a run where the actor has no prior approval is unaffected (per-run scope)', async () => {
+    // #given — ray approves gate A on run X
+    const harness = makeHarness();
+    const gateA = await seedPending(harness, {
+      runId: 'acme_run-x',
+      stepPath: ['gateA'],
+    });
+    await harness.service.decide(gateA.id, { decision: 'approve' }, REVIEWER);
+    harness.advance(1000);
+    // ...and a gate on a DIFFERENT run Y, where ray never approved anything
+    const gateY = await seedPending(harness, {
+      runId: 'acme_run-y',
+      stepPath: ['gate'],
+    });
+
+    // #when — ray decides run Y's gate
+    const decided = await harness.service.decide(
+      gateY.id,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then — allowed: the bar is scoped to the record's OWN run
+    expect(decided.record.status).toBe('approved');
+  });
+
+  it('reads the COMPLETE approved history via after-cursor paging, barring a causally-prior approval past the default page', async () => {
+    // #given — a run with MORE approved records than one default page holds. The
+    // filler (page 1) was decided by admin; the ONE record decided by ray sits
+    // on a LATER page (newest createdAt). A single default-bounded first page
+    // would miss it and fail the bar OPEN — this pins the after-cursor paging.
+    const harness = makeHarness();
+    const runId = 'acme_run-page';
+    const base = new Date(T0).toISOString();
+    for (let index = 0; index < MAX_APPROVAL_LIST_LIMIT; index += 1) {
+      await harness.store.create({
+        id: `filler-${index}`,
+        tenantId: 'acme',
+        workflowId: 'wf',
+        runId,
+        stepPath: [`filler-${index}`],
+        title: `filler ${index}`,
+        connectors: [],
+        priority: 'normal',
+        status: 'approved',
+        createdAt: base,
+        updatedAt: base,
+        decidedBy: ADMIN.id,
+        decidedAt: base,
+      });
+    }
+    // ray's causally-prior approval — newest createdAt, so it lands on page 2
+    const rayApprovedAt = new Date(T0 + 1000).toISOString();
+    await harness.store.create({
+      id: 'ray-prior',
+      tenantId: 'acme',
+      workflowId: 'wf',
+      runId,
+      stepPath: ['gateRay'],
+      title: 'ray approved an earlier gate',
+      connectors: [],
+      priority: 'normal',
+      status: 'approved',
+      createdAt: rayApprovedAt,
+      updatedAt: rayApprovedAt,
+      decidedBy: REVIEWER.id,
+      decidedAt: rayApprovedAt,
+    });
+
+    // gate B, filed AFTER ray's approval (createdAt >= ray's decidedAt)
+    harness.advance(2000);
+    const gateB = await harness.service.create(
+      input({ runId, stepPath: ['gateB'], requestedBy: 'flowsafe-system' }),
+      OPERATOR,
+    );
+
+    // #when / #then — ray is barred: the paging read reached page 2 and found
+    // ray's causally-prior approval past the 500-record default page
+    await expect(
+      harness.service.decide(
+        gateB.record.id,
+        { decision: 'approve' },
+        REVIEWER,
+      ),
+    ).rejects.toBeInstanceOf(ApprovalAuthzError);
+  });
+
+  it('bars a same-actor approved prior whose decidedAt is unparseable (NaN causal anchor fails CLOSED)', async () => {
+    // #given — a prior gate APPROVED by ray whose decidedAt is a non-ISO string,
+    // so Date.parse(decidedAt) is NaN. A bare `priorAt <= gateAt` is FALSE for
+    // NaN, so the un-hardened predicate drops the bar and lets ray clear gate B
+    // (fail OPEN); the hardened predicate bars on NaN (fail CLOSED). Seeded
+    // straight into the store so the garbage stamp bypasses create()'s
+    // validation.
+    const harness = makeHarness();
+    const runId = 'acme_run-nan';
+    const base = new Date(T0).toISOString();
+    await harness.store.create({
+      id: 'ray-garbage-prior',
+      tenantId: 'acme',
+      workflowId: 'wf',
+      runId,
+      stepPath: ['gateA'],
+      title: 'ray approved an earlier gate (unparseable decidedAt)',
+      connectors: [],
+      priority: 'normal',
+      status: 'approved',
+      createdAt: base,
+      updatedAt: base,
+      decidedBy: REVIEWER.id,
+      decidedAt: 'not-a-real-timestamp',
+    });
+    // gate B, filed after — a valid createdAt, so gateAt is a real number and
+    // only the prior's NaN drives the fail-closed bar
+    harness.advance(1000);
+    const gateB = await harness.service.create(
+      input({ runId, stepPath: ['gateB'], requestedBy: 'flowsafe-system' }),
+      OPERATOR,
+    );
+
+    // #when / #then — ray is barred: the NaN anchor fails closed, not open
+    await expect(
+      harness.service.decide(
+        gateB.record.id,
+        { decision: 'approve' },
+        REVIEWER,
+      ),
+    ).rejects.toBeInstanceOf(ApprovalAuthzError);
+    // and gate B stays open — never silently approved
+    expect(await harness.store.get(gateB.record.id)).toMatchObject({
+      status: 'pending',
+    });
+  });
+});
+
 describe('ApprovalService payload contract', () => {
   it('rejects payloads JSON.stringify cannot represent', async () => {
     // #given
@@ -1129,6 +1441,200 @@ describe('ApprovalService notification seam', () => {
           event.action === 'approval.notify' && event.decision === 'error',
       ),
     ).toHaveLength(2);
+  });
+});
+
+describe('ApprovalService stream seam', () => {
+  it('emits one created event per actually-created record, carrying the record', async () => {
+    // #given
+    const streamed: ApprovalStreamEvent[] = [];
+    const harness = makeHarness({
+      stream: (event) => void streamed.push(event),
+    });
+
+    // #when
+    const record = await seedPending(harness);
+
+    // #then
+    expect(streamed).toEqual([
+      {
+        type: 'created',
+        record: expect.objectContaining({ id: record.id, status: 'pending' }),
+      },
+    ]);
+  });
+
+  it('does not emit on the idempotent created:false re-observation of an open step', async () => {
+    // #given
+    const stream = vi.fn();
+    const harness = makeHarness({ stream });
+    await seedPending(harness, { stepPath: ['gate'] });
+
+    // #when — same (workflowId, runId, stepKey) while still open
+    const second = await harness.service.create(
+      input({ stepPath: ['gate'] }),
+      OPERATOR,
+    );
+
+    // #then — the re-observed open record fires no second event
+    expect(second.created).toBe(false);
+    expect(stream).toHaveBeenCalledTimes(1);
+  });
+
+  it('emits one claimed event with the post-transition record', async () => {
+    // #given
+    const streamed: ApprovalStreamEvent[] = [];
+    const harness = makeHarness({
+      stream: (event) => void streamed.push(event),
+    });
+    const record = await seedPending(harness);
+    streamed.length = 0; // drop the create event; isolate the claim
+
+    // #when
+    await harness.service.claim(record.id, REVIEWER);
+
+    // #then
+    expect(streamed).toEqual([
+      {
+        type: 'claimed',
+        record: expect.objectContaining({ id: record.id, status: 'claimed' }),
+      },
+    ]);
+  });
+
+  it('emits one decided event with the post-transition record', async () => {
+    // #given
+    const streamed: ApprovalStreamEvent[] = [];
+    const harness = makeHarness({
+      stream: (event) => void streamed.push(event),
+    });
+    const record = await seedPending(harness);
+    streamed.length = 0;
+
+    // #when
+    await harness.service.decide(record.id, { decision: 'approve' }, REVIEWER);
+
+    // #then — fired after the transition, independent of #resume (unwired here)
+    expect(streamed).toEqual([
+      {
+        type: 'decided',
+        record: expect.objectContaining({ id: record.id, status: 'approved' }),
+      },
+    ]);
+  });
+
+  it('emits one delegated event with the post-transition record', async () => {
+    // #given
+    const streamed: ApprovalStreamEvent[] = [];
+    const harness = makeHarness({
+      stream: (event) => void streamed.push(event),
+    });
+    const record = await seedPending(harness);
+    streamed.length = 0;
+
+    // #when
+    await harness.service.delegate(record.id, { to: 'quinn' }, REVIEWER);
+
+    // #then
+    expect(streamed).toEqual([
+      {
+        type: 'delegated',
+        record: expect.objectContaining({ id: record.id, status: 'claimed' }),
+      },
+    ]);
+  });
+
+  it('emits one superseded event with the post-transition record', async () => {
+    // #given
+    const streamed: ApprovalStreamEvent[] = [];
+    const harness = makeHarness({
+      stream: (event) => void streamed.push(event),
+    });
+    const record = await seedPending(harness);
+    streamed.length = 0;
+
+    // #when — supersedeStale is CAN_CREATE (system reconcile), not a decision
+    const updated = await harness.service.supersedeStale(
+      record.id,
+      OPERATOR,
+      'stale suspension',
+    );
+
+    // #then
+    expect(updated?.status).toBe('rejected');
+    expect(streamed).toEqual([
+      {
+        type: 'superseded',
+        record: expect.objectContaining({ id: record.id, status: 'rejected' }),
+      },
+    ]);
+  });
+
+  it('contains a sync-throwing stream sink and audits approval.stream/error', async () => {
+    // #given — the dual-guard's try/catch arm
+    const harness = makeHarness({
+      stream: () => {
+        throw new Error('hub crashed');
+      },
+    });
+
+    // #when — the create must succeed regardless
+    const record = await seedPending(harness);
+
+    // #then
+    expect(record.status).toBe('pending');
+    expect(harness.events).toContainEqual(
+      expect.objectContaining({
+        action: 'approval.stream',
+        decision: 'error',
+        reason: expect.stringContaining('hub crashed'),
+      }),
+    );
+  });
+
+  it('contains an async-rejecting stream sink likewise', async () => {
+    // #given — the dual-guard's returned-promise .catch arm
+    const harness = makeHarness({
+      stream: () => Promise.reject(new Error('hub 500')),
+    });
+
+    // #when
+    await seedPending(harness);
+    // The rejection handler runs off the microtask queue, after create returned.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // #then
+    expect(harness.events).toContainEqual(
+      expect.objectContaining({
+        action: 'approval.stream',
+        decision: 'error',
+        reason: expect.stringContaining('hub 500'),
+      }),
+    );
+  });
+
+  it('emits one escalated event per record from the sweep', async () => {
+    // #given
+    const harness = makeHarness();
+    await seedPending(harness, { slaSeconds: 60 });
+    await seedPending(harness, { slaSeconds: 60, runId: 'acme_run-2' });
+    harness.advance(61_000);
+
+    // #when
+    const streamed: ApprovalStreamEvent[] = [];
+    const escalated = await runSweep(harness, {
+      stream: (event) => void streamed.push(event),
+    });
+
+    // #then
+    expect(escalated).toHaveLength(2);
+    expect(streamed.map((event) => event.type)).toEqual([
+      'escalated',
+      'escalated',
+    ]);
+    expect(new Set(streamed.map((event) => event.record.id))).toEqual(
+      new Set(escalated.map((record) => record.id)),
+    );
   });
 });
 
@@ -1455,6 +1961,44 @@ describe('ApprovalService.decideBatch', () => {
         detail: { requested: 2, decided: 1, failed: 1 },
       }),
     );
+  });
+
+  it('bars the SECOND of two sequential gates of one run in a single batch (inherits the cross-gate bar)', async () => {
+    // #given — gate A and gate B of ONE run, both open. In one synchronous batch
+    // the decider clears gate A first; gate B, filed at the same fixed-clock
+    // instant, then satisfies the causal anchor (createdAt <= gate A's decidedAt)
+    // and is barred — the fail-closed treatment of one reviewer clearing both
+    // sequential gates of a run alone. (Production's real-clock reconcile files
+    // gate B strictly after gate A's approval — the genuine sequential case.)
+    const harness = makeHarness();
+    const gateA = await seedPending(harness, {
+      runId: 'acme_run-batch',
+      stepPath: ['gateA'],
+    });
+    const gateB = await seedPending(harness, {
+      runId: 'acme_run-batch',
+      stepPath: ['gateB'],
+    });
+
+    // #when — one reviewer batch-decides both gates of the run
+    const result = await harness.service.decideBatch(
+      [gateA.id, gateB.id],
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then — gate A clears; gate B is SoD-forbidden by the cross-gate bar
+    expect(result.decided).toBe(1);
+    expect(result.failed).toBe(1);
+    expect(result.results.map((item) => [item.id, item.ok, item.code])).toEqual(
+      [
+        [gateA.id, true, undefined],
+        [gateB.id, false, 'forbidden'],
+      ],
+    );
+    expect(await harness.store.get(gateB.id)).toMatchObject({
+      status: 'pending',
+    });
   });
 });
 

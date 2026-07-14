@@ -334,7 +334,7 @@ export async function purgeTenant(
   options: PurgeTenantOptions,
 ): Promise<PurgeTenantResult> {
   const { tenantId } = options;
-  if (!TENANT_ID_PATTERN.test(tenantId)) {
+  if (typeof tenantId !== 'string' || !TENANT_ID_PATTERN.test(tenantId)) {
     throw new Error(
       `purgeTenant: tenantId '${tenantId}' violates INV-3 (^[a-z0-9]{3,32}$) — refusing (the range predicate is only exact over that charset)`,
     );

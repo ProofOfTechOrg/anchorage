@@ -13,7 +13,9 @@ import {
   type ApprovalMetrics,
   type ApprovalRecord,
   type ApprovalStatus,
+  approvalCursor,
   approvalListOrder,
+  assertApprovalTimeBounds,
   byReviewerOrder,
   clampApprovalLimit,
   compareStrings,
@@ -93,6 +95,47 @@ export interface ApprovalStore {
    * clock), keeping the computation deterministic under tests.
    */
   metrics(nowMs: number): Promise<ApprovalMetrics>;
+}
+
+/**
+ * Drain the COMPLETE approved history of one run by explicit after-cursor
+ * paging — the shared complete-internal-reader that BOTH grant derivation
+ * (approvedConnectorsForLeg, grants.ts) and the cross-gate SoD bar
+ * (ApprovalService.decide) depend on, so the two can never drift. A single
+ * default-bounded page is WRONG for either: the D3 default caps a bare list()
+ * at MAX_APPROVAL_LIST_LIMIT, so a many-gate run's NEWEST approvals sit past the
+ * first page under FIFO 'created' order — dropping them fails the grant CLOSED
+ * and the SoD bar OPEN. Both callers are fail-closed COMPLETE readers, so this
+ * pages to exhaustion. The `workflowId`+`runId` predicates are LOAD-BEARING and
+ * must never be "optimized away" in favor of the store's tenant binding: under
+ * INV-1 a salted runId belongs to exactly one tenant, so they keep the read
+ * tenant-safe even from an unbound or mis-bound store (the binding is defense in
+ * depth, not the fix) — grants.test.ts pins them on every page with a spy store.
+ * 'created' FIFO is the ONLY after-cursor-compatible order (approvalListOrder
+ * rejects 'reviewer' + after); in practice one run's approved records sit far
+ * under the cap, so this is a single page.
+ */
+export async function listAllApprovedForRun(
+  store: ApprovalStore,
+  workflowId: string,
+  runId: string,
+): Promise<ApprovalRecord[]> {
+  const approved: ApprovalRecord[] = [];
+  let after: string | undefined;
+  for (;;) {
+    const page = await store.list({
+      workflowId,
+      runId,
+      status: 'approved',
+      limit: MAX_APPROVAL_LIST_LIMIT,
+      after,
+    });
+    approved.push(...page);
+    const last = page.at(-1);
+    if (page.length < MAX_APPROVAL_LIST_LIMIT || !last) break;
+    after = approvalCursor(last);
+  }
+  return approved;
 }
 
 /**
@@ -270,7 +313,7 @@ export class InMemoryApprovalStore implements ApprovalStore {
   readonly #records: Map<string, ApprovalRecord>;
 
   constructor(tenantId: string, records?: Map<string, ApprovalRecord>) {
-    if (!TENANT_ID_PATTERN.test(tenantId)) {
+    if (typeof tenantId !== 'string' || !TENANT_ID_PATTERN.test(tenantId)) {
       throw new Error(
         `InMemoryApprovalStore: tenantId '${tenantId}' violates INV-3 (^[a-z0-9]{3,32}$)`,
       );
@@ -311,6 +354,14 @@ export class InMemoryApprovalStore implements ApprovalStore {
   }
 
   async list(filter: ApprovalListFilter = {}): Promise<ApprovalRecord[]> {
+    // Eagerly validate the time bounds so an unparseable createdBefore/
+    // createdAfter throws even when ZERO records reach matchesFilter (a
+    // zero-match tenant never enters the per-record predicate). D1's
+    // appendListFilters validates unconditionally; this shared assertion keeps
+    // both in-memory list paths (here and the system view in tenant-store.ts)
+    // failing identically to D1 (types.ts: "both backends fail identically").
+    // Fail-closed: a garbage bound errors, never a silently empty page.
+    assertApprovalTimeBounds(filter);
     const matched = [...this.#records.values()]
       .filter(
         (record) =>
