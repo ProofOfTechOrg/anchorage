@@ -12,6 +12,7 @@ import {
   type Tone,
   useApprovalUIComponents,
 } from './components.js';
+import type { PresenceMember } from './stream.js';
 import { APPROVAL_TIPS } from './tips.js';
 import { formatSlaCountdown, type SlaState, slaStateOf } from './view-model.js';
 
@@ -50,6 +51,11 @@ export interface QueueViewProps {
    */
   selectedIds?: readonly string[];
   onToggleSelect?: (id: string) => void;
+  /**
+   * Reviewers currently connected to the live stream. When non-empty, a
+   * presence badge leads the queue. Omit / empty in poll-only mode.
+   */
+  presence?: PresenceMember[];
 }
 
 export function QueueView({
@@ -59,6 +65,7 @@ export function QueueView({
   onSelect,
   selectedIds,
   onToggleSelect,
+  presence,
 }: QueueViewProps): JSX.Element {
   const C = useApprovalUIComponents();
 
@@ -134,7 +141,7 @@ export function QueueView({
 
   // aria-label gives the queue table an accessible name (replacing the old
   // <caption>) — a <table> supports naming via its implicit role.
-  return (
+  const table = (
     <C.Table
       aria-label="Approval queue"
       data={records}
@@ -148,4 +155,15 @@ export function QueueView({
       }
     />
   );
+
+  // A non-empty roster leads the queue; the plain table is unchanged otherwise.
+  if (presence !== undefined && presence.length > 0) {
+    return (
+      <C.Stack direction="vertical" gap="sm">
+        <C.PresenceIndicator members={presence} />
+        {table}
+      </C.Stack>
+    );
+  }
+  return table;
 }

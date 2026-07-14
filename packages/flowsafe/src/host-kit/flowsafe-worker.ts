@@ -17,6 +17,7 @@ import type {
   ApprovalAuditEvent,
   ApprovalDatabase,
   ApprovalNotificationSink,
+  ApprovalStreamSink,
   SelfDecisionPolicy,
   TenantResolver,
 } from '../approval-api/index.js';
@@ -47,7 +48,9 @@ import {
   runApprovalRetentionPurge,
   runSlaSweepMaintenance,
 } from './host-approval-service.js';
+import { createHubTopology, type HubNamespaceLike } from './hub-topology.js';
 import { createRunRouter } from './run-router.js';
+import { createStreamRouter } from './stream-router.js';
 import type { TokenVerifier } from './verifier.js';
 import type { WorkflowMeta } from './workflow-meta.js';
 
@@ -66,6 +69,15 @@ export interface FlowsafeWorkerEnv {
   DB: ApprovalDatabase & SnapshotDatabase;
   /** The runner DO namespace createDoRunTopology drives. */
   RUNNER: RunnerNamespaceLike;
+  /**
+   * Optional per-tenant hub DO namespace for live streaming (DL-009/DL-019).
+   * Present together with STREAM_TICKET_SECRET => the composer mounts the stream
+   * stage and fans approval mutations out to the tenant hub; either absent =>
+   * streaming stays unmounted and the client remains poll-only.
+   */
+  HUB?: HubNamespaceLike;
+  /** Dedicated stream-ticket signing secret (DL-019). Absent => no streaming. */
+  STREAM_TICKET_SECRET?: string;
   /** Default SLA seconds for new approvals (var; default 14400 = 4h). */
   APPROVAL_SLA_SECONDS?: string;
   /**
@@ -198,6 +210,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
     waitUntil: (promise: Promise<unknown>) => void,
     notify: ApprovalNotificationSink | undefined,
     selfDecision: SelfDecisionPolicy,
+    stream: ApprovalStreamSink | undefined,
   ): TenantResolver => {
     const base = createTenantResolver({
       authenticate: bearerActorAuthenticator(config.buildVerifier(env)),
@@ -216,6 +229,10 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           queue: env.AUDIT_QUEUE,
           waitUntil,
           notify,
+          // Fetch-scope hub fan-out: every request-path mutation reaches the
+          // tenant hub, kept alive by ctx.waitUntil (DL-020). Undefined when no
+          // HUB is bound, so a non-streaming host is byte-identical to before.
+          stream,
           allowSelfDecision: selfDecision,
         }),
       // The resolver's canSelfDecide display hint reads the SAME policy the
@@ -326,12 +343,33 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       const topology = createDoRunTopology(env.RUNNER);
       const notify = config.notify?.(env);
       const selfDecision = parseSelfDecision(env);
+      // Fetch-scope live fan-out sink: present iff a hub is bound (streaming is
+      // opt-in, DL-019). Each publish rides ctx.waitUntil (DL-020) and is
+      // contained — a failed fan-out logs and never fails the mutation.
+      const hub = env.HUB;
+      let streamSink: ApprovalStreamSink | undefined;
+      if (hub) {
+        const hubTopology = createHubTopology(hub);
+        streamSink = (event) =>
+          waitUntil(
+            hubTopology.publish(event).catch((error: unknown) =>
+              console.error(
+                JSON.stringify({
+                  type: 'stream-publish-error',
+                  reason:
+                    error instanceof Error ? error.message : String(error),
+                }),
+              ),
+            ),
+          );
+      }
       const resolve = buildResolve(
         env,
         topology,
         waitUntil,
         notify,
         selfDecision,
+        streamSink,
       );
 
       if (config.preRoutes) {
@@ -340,6 +378,20 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           topology,
         });
         if (preResponse) return preResponse;
+      }
+
+      // Optional stream stage (DL-015/DL-019): mounted only when BOTH the hub
+      // binding and the ticket secret are present. Every route is under
+      // /api/stream/, so it composes ahead of the approval router without
+      // touching the /api/* run_worker_first entry.
+      if (env.HUB && env.STREAM_TICKET_SECRET) {
+        const streamResponse = await createStreamRouter({
+          resolve,
+          ticketSecret: env.STREAM_TICKET_SECRET,
+          hub: env.HUB,
+          runner: env.RUNNER,
+        })(request);
+        if (streamResponse) return streamResponse;
       }
 
       const approvalResponse = await createApprovalRouter({ resolve })(request);
@@ -372,14 +424,23 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       // Dispatch on WHICH cron fired; an unrecognized expression (ops edited
       // wrangler without updating the config) runs both sequentially and
       // logs — availability of both duties beats purity on a misconfig.
-      const sweep = (): Promise<void> =>
-        runSlaSweepMaintenance({
+      const sweep = (): Promise<void> => {
+        const hub = env.HUB;
+        const hubTopology = hub ? createHubTopology(hub) : undefined;
+        return runSlaSweepMaintenance({
           store: approvalStoreFactoryFor(env.DB).system(),
           systemActor: maintenanceActor(config.systemActorId),
           queue: env.AUDIT_QUEUE,
           cron: controller.cron,
           notify: config.notify?.(env),
+          // BARE hub-publish thunk, NOT waitUntil-wrapped: a scheduled() handler
+          // runs under its own waitUntil, so runSlaSweepMaintenance collects
+          // each publish into pendingSends and awaits it via Promise.all (DL-020).
+          stream: hubTopology
+            ? (event) => hubTopology.publish(event)
+            : undefined,
         });
+      };
       if (controller.cron === config.crons.sweep) {
         ctx.waitUntil(sweep());
       } else if (controller.cron === config.crons.purge) {

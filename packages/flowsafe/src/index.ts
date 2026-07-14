@@ -43,6 +43,8 @@ export type {
   ApprovalStatus,
   ApprovalStore,
   ApprovalStoreFactory,
+  ApprovalStreamEvent,
+  ApprovalStreamSink,
   BatchDecideItem,
   BatchDecideResult,
   CreateApprovalInput,

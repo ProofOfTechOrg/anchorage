@@ -8,7 +8,10 @@ import { DetailView } from './DetailView.js';
 import { FilterBar } from './FilterBar.js';
 import { MetricsView } from './MetricsView.js';
 import { QueueView } from './QueueView.js';
-import { useApprovalDashboard } from './use-approval-dashboard.js';
+import {
+  type ApprovalStreamOption,
+  useApprovalDashboard,
+} from './use-approval-dashboard.js';
 
 /**
  * One line per failed record: "id: reason". The success side needs no prose;
@@ -29,15 +32,29 @@ export interface ApprovalDashboardProps {
   pollIntervalMs?: number;
   /** Injectable clock (deterministic SLA countdowns in tests/stories). */
   now?: () => number;
+  /**
+   * Live streaming (Part B): an injected transport + ticket thunk. Absent ⇒
+   * poll-only, unchanged. The host builds these (showcase, M-008).
+   */
+  stream?: ApprovalStreamOption;
+  /** Current reviewer id — attributes optimistic decides + enables conflict detection. */
+  actorId?: string;
 }
 
 export function App({
   client,
   pollIntervalMs,
   now,
+  stream,
+  actorId,
 }: ApprovalDashboardProps): JSX.Element {
   const C = useApprovalUIComponents();
-  const dashboard = useApprovalDashboard(client, { pollIntervalMs, now });
+  const dashboard = useApprovalDashboard(client, {
+    pollIntervalMs,
+    now,
+    stream,
+    actorId,
+  });
   const [batchComment, setBatchComment] = useState('');
 
   const decideSelected = (decision: 'approve' | 'reject'): void => {
@@ -50,6 +67,13 @@ export function App({
       <C.Heading level={1}>Approvals</C.Heading>
       {dashboard.error ? (
         <C.Banner tone="danger" title={dashboard.error} />
+      ) : null}
+      {dashboard.conflict ? (
+        <C.Toast
+          tone="warning"
+          title={`Request ${dashboard.conflict.id} was already decided by ${dashboard.conflict.actualDecider}`}
+          onDismiss={dashboard.dismissConflict}
+        />
       ) : null}
       <MetricsView metrics={dashboard.metrics} />
       <FilterBar
@@ -102,6 +126,7 @@ export function App({
         onSelect={dashboard.select}
         selectedIds={dashboard.selectedIds}
         onToggleSelect={dashboard.toggleSelect}
+        presence={dashboard.presence}
       />
       {dashboard.selected ? (
         <DetailView
@@ -114,6 +139,7 @@ export function App({
           onClaim={dashboard.claim}
           onDecide={dashboard.decide}
           onDelegate={dashboard.delegate}
+          presence={dashboard.presence}
         />
       ) : null}
     </C.Stack>

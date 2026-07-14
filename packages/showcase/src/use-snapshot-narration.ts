@@ -1,6 +1,9 @@
-// Diffs each polled snapshot (run results + approval records) against the
-// previous one and feeds the pure derivers. The previous snapshot lives in a
-// ref that is advanced BEFORE deriving returns, so:
+// Diffs each snapshot (run results + approval records) against the previous one
+// and feeds the pure derivers. The inputs now update from the live stream as
+// well as the interval poll (Part B) — a decision reaches this diff within one
+// round-trip instead of a poll cycle — but the diffing is unchanged: it narrates
+// whatever moved since the last snapshot, whichever channel moved it. The
+// previous snapshot lives in a ref that is advanced BEFORE deriving returns, so:
 //   - the first snapshot after mount/reload emits nothing (no toast storm),
 //   - StrictMode's second effect invoke sees the advanced ref and derives
 //     prev === next, which yields no flips.

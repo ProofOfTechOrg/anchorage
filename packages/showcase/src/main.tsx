@@ -1,7 +1,11 @@
 import { ToastViewport } from '@astryxdesign/core/Toast';
 import { Theme } from '@astryxdesign/core/theme';
 import { y2kTheme } from '@astryxdesign/theme-y2k/built';
-import { ApprovalUIProvider } from '@flowsafe/approval-ui/components';
+import {
+  type ApprovalUIComponents,
+  ApprovalUIProvider,
+} from '@flowsafe/approval-ui/components';
+import type { ApprovalStreamOption } from '@flowsafe/approval-ui/use-approval-dashboard';
 import {
   lazy,
   type ReactElement,
@@ -14,6 +18,7 @@ import {
 } from 'react';
 import { createRoot } from 'react-dom/client';
 import { astryxComponents } from '@/astryx-components';
+import { astryxStreamComponents } from '@/astryx-stream-components';
 import {
   DemoActorSwitcher,
   type DemoTokenSet,
@@ -21,14 +26,24 @@ import {
   useDemoSignIn,
 } from '@/demo-session';
 import { AppErrorBoundary } from '@/error-boundary';
+import { createHubStreamClient } from '@/hub-stream-client';
 import { NarratingApprovalClient } from '@/narrating-approval-client';
 import { sessionReadyEvent } from '@/narration';
 import { RunClient } from '@/run-client';
 import { ShowcaseApp } from '@/showcase-app';
 import { OperatorIdentityChip, TokenGate } from '@/token-gate';
 import { useActivityFeed } from '@/use-activity-feed';
-import type { RunEntry } from '@/use-run-polling';
+import type { RunEntry, RunStreamOption } from '@/use-run-polling';
+import { createShowcaseStreamTransport } from '@/web-socket-transport';
 import '@/index.css';
+
+// The slot adapter injected into ApprovalUIProvider: the base Astryx map plus
+// the streaming Toast/PresenceIndicator adapters. Module-level so its identity
+// is stable (the provider re-merges only when this reference changes).
+const approvalUIComponents: Partial<ApprovalUIComponents> = {
+  ...astryxComponents,
+  ...astryxStreamComponents,
+};
 
 const container = document.getElementById('root');
 if (!container) throw new Error('missing #root element');
@@ -90,6 +105,26 @@ function Root(): ReactElement {
     [authHeaders],
   );
 
+  // Live streaming (Part B): ONE browser-WebSocket transport (stateless, stable
+  // identity so the hooks never re-subscribe on it), and per-client ticket
+  // thunks bound to the authenticated approval client. A new client (actor
+  // switch) rebuilds the thunks, which correctly re-subscribes with new auth.
+  // Absent HUB/secret on the server => the ticket mint fails and the client
+  // stays on polling (graceful degradation, DL-019) — no SPA branch needed.
+  const streamTransport = useMemo(() => createShowcaseStreamTransport(), []);
+  const streamTickets = useMemo(
+    () => createHubStreamClient(approvalClient),
+    [approvalClient],
+  );
+  const approvalStream = useMemo<ApprovalStreamOption>(
+    () => ({ transport: streamTransport, ticket: streamTickets.hubTicket }),
+    [streamTransport, streamTickets],
+  );
+  const runStream = useMemo<RunStreamOption>(
+    () => ({ transport: streamTransport, ticket: streamTickets.runTicket }),
+    [streamTransport, streamTickets],
+  );
+
   const addRun = useCallback((entry: RunEntry) => {
     setRuns((current) => [entry, ...current]);
   }, []);
@@ -146,7 +181,7 @@ function Root(): ReactElement {
   ) : null;
 
   return (
-    <ApprovalUIProvider components={astryxComponents}>
+    <ApprovalUIProvider components={approvalUIComponents}>
       {actorToken === null ? (
         <>
           {/* The switchers bootstrap the first token, so they must mount
@@ -166,6 +201,8 @@ function Root(): ReactElement {
           canReset={canReset}
           feed={feed}
           identityControls={identityControls}
+          approvalStream={approvalStream}
+          runStream={runStream}
         />
       )}
     </ApprovalUIProvider>

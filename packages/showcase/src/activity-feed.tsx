@@ -1,8 +1,9 @@
-// The activity feed: every observed API response — and the by-design server
-// steps between them — as a reverse-chronological story. ● (solid, toned dot)
-// = the browser saw this in a response; ○ (neutral dot + "by design" token)
-// = what the deployed architecture does between observations. The header says
-// so out loud: this is reconstructed client-side from polling, and the
+// The activity feed: every observed event — and the by-design server steps
+// between them — as a reverse-chronological story. ● (solid, toned dot) = the
+// browser saw this in a response or a live stream frame; ○ (neutral dot + "by
+// design" token) = what the deployed architecture does between observations. The
+// header says so out loud: this is reconstructed client-side from the observed
+// run and queue updates (a live stream when enabled, else polling), and the
 // authoritative audit trail is in Workers Logs.
 
 import { Button } from '@astryxdesign/core/Button';
@@ -121,8 +122,8 @@ export function ActivityFeedPanel({
       </HStack>
       <Tooltip content={GLOSSARY.polling}>
         <Text size="sm" color="secondary">
-          Derived in your browser from polling; the authoritative audit trail is
-          in Workers Logs. ● observed, ○ by design.
+          Derived in your browser from the observed run and queue updates; the
+          authoritative audit trail is in Workers Logs. ● observed, ○ by design.
         </Text>
       </Tooltip>
       {feed.events.length === 0 ? (
