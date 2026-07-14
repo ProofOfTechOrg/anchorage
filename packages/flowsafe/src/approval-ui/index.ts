@@ -36,6 +36,7 @@ export type {
   InfoTipProps,
   MetadataItemProps,
   MetadataListProps,
+  PresenceIndicatorProps,
   ResolvedApprovalUIComponents,
   SectionProps,
   SelectOption,
@@ -47,6 +48,7 @@ export type {
   TableProps,
   TextFieldProps,
   TextProps,
+  ToastProps,
   Tone,
 } from './components.js';
 export {
@@ -75,10 +77,23 @@ export type { CreateApprovalDashboardOptions } from './mount.js';
 export { createApprovalDashboard } from './mount.js';
 export type { QueueViewProps } from './QueueView.js';
 export { QueueView } from './QueueView.js';
+// Live-streaming seam (M-007). The pure reducers (mergeApprovalEvent, …) and
+// parseStreamFrame stay module-level like the hook's other internal derivations
+// — not consumer API, so they are kept off the frozen public surface.
+export type {
+  DecisionConflict,
+  PresenceMember,
+  StreamConnection,
+  StreamFrame,
+  StreamHandlers,
+  StreamRunSummary,
+  StreamTransport,
+} from './stream.js';
 export type { MetricLabel } from './tips.js';
 export { APPROVAL_TIPS } from './tips.js';
 export type {
   ApprovalDashboardState,
+  ApprovalStreamOption,
   UseApprovalDashboardOptions,
 } from './use-approval-dashboard.js';
 // effectiveApprovalFilter / pruneSelection stay module-level (DOM-free tests
@@ -89,6 +104,9 @@ export {
   DEFAULT_QUEUE_FILTER,
   useApprovalDashboard,
 } from './use-approval-dashboard.js';
+// The one browser-WebSocket StreamTransport (UI-pass-only module); hosts inject
+// it into useApprovalDashboard's `stream` option (showcase, M-008).
+export { createWebSocketStreamTransport } from './use-web-socket-transport.js';
 export type { SlaState } from './view-model.js';
 export {
   DEFAULT_SLA_WARNING_MS,

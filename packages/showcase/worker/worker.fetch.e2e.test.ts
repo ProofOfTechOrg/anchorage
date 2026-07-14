@@ -439,3 +439,240 @@ describe('showcase worker fetch(): the demo-reset mount', () => {
     expect((await call(env, '/healthz')).status).toBe(200);
   });
 });
+
+describe('showcase worker fetch(): the live-stream stage', () => {
+  // A structural stub HUB namespace: it records every /internal/event POST the
+  // composer's fetch-scope stream sink forwards, so the test can assert the
+  // fan-out without workerd. Its /subscribe (raw Request) 426s — no WS here.
+  function makeHubStub(): { namespace: Env['HUB']; events: unknown[] } {
+    const events: unknown[] = [];
+    const namespace = {
+      idFromName: (name: string) => ({ name }),
+      get: () => ({
+        fetch: async (
+          input: unknown,
+          init?: { method?: string; body?: string },
+        ): Promise<Response> => {
+          if (typeof input === 'string' && init?.method === 'POST') {
+            events.push(JSON.parse(init.body ?? 'null'));
+            return new Response(JSON.stringify({ ok: true }), { status: 200 });
+          }
+          return new Response('{}', { status: 426 });
+        },
+      }),
+    };
+    return { namespace: namespace as unknown as Env['HUB'], events };
+  }
+
+  function streamingEnv(overrides: Partial<Env> = {}): {
+    env: Env;
+    events: unknown[];
+  } {
+    const { namespace, events } = makeHubStub();
+    const env = makeEnv({
+      HUB: namespace,
+      STREAM_TICKET_SECRET: 'test-stream-secret',
+      ...overrides,
+    });
+    return { env, events };
+  }
+
+  it('mints a hub stream ticket for an authenticated actor', async () => {
+    // #given the stream stage is mounted (HUB + secret both present)
+    const { env } = streamingEnv();
+
+    // #when the reviewer POSTs for a hub-channel ticket
+    const response = await call(env, '/api/stream/ticket', {
+      method: 'POST',
+      token: 'tok-reviewer',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ channel: 'hub' }),
+    });
+
+    // #then a same-origin url + a signed ticket + an expiry come back
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      url: string;
+      ticket: string;
+      expiresAt: number;
+    };
+    expect(body.url).toBe('/api/stream/hub');
+    expect(typeof body.ticket).toBe('string');
+    expect(body.ticket.length).toBeGreaterThan(0);
+    expect(typeof body.expiresAt).toBe('number');
+  });
+
+  it('401s the ticket route without a bearer token', async () => {
+    // #given / #when / #then — the ticket route authenticates like every mutation
+    const { env } = streamingEnv();
+    const response = await call(env, '/api/stream/ticket', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ channel: 'hub' }),
+    });
+    expect(response.status).toBe(401);
+  });
+
+  it('404s a run-channel ticket for a run the tenant does not own (no existence oracle)', async () => {
+    // #given the reviewer belongs to tenant 'demo'
+    const { env } = streamingEnv();
+
+    // #when they request a run ticket for another tenant's runId
+    const response = await call(env, '/api/stream/ticket', {
+      method: 'POST',
+      token: 'tok-reviewer',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        channel: 'run',
+        runId: 'acme_00000000-0000-4000-8000-000000000000',
+      }),
+    });
+
+    // #then the route is not an existence oracle: 404, not 403
+    expect(response.status).toBe(404);
+  });
+
+  it('mints a run-channel ticket for a run the tenant OWNS, returning the complete workflow-qualified url', async () => {
+    // #given the reviewer belongs to tenant 'demo'; ownership is the INV-1
+    // prefix check alone (tenantOwnsSaltedId), so no run needs to be seeded
+    const { env } = streamingEnv();
+    const runId = 'demo_run-stream-success';
+
+    // #when they request a run ticket, supplying the workflowId they hold
+    const response = await call(env, '/api/stream/ticket', {
+      method: 'POST',
+      token: 'tok-reviewer',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        channel: 'run',
+        runId,
+        workflowId: 'gtm-outbound',
+      }),
+    });
+
+    // #then the url is the complete, workflow-qualified run-channel path
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      url: string;
+      ticket: string;
+      expiresAt: number;
+    };
+    expect(body.url).toBe(`/api/stream/run/gtm-outbound/${runId}`);
+    expect(typeof body.ticket).toBe('string');
+    expect(body.ticket.length).toBeGreaterThan(0);
+  });
+
+  it('forwards an approval mutation to the tenant HUB stub as a stream event', async () => {
+    // #given a seeded pending approval for the reviewer's tenant + a stub hub
+    const sqlite = openSqlite();
+    const db = d1DatabaseLike(sqlite);
+    const approvals = new D1ApprovalStoreFactory(
+      db as ConstructorParameters<typeof D1ApprovalStoreFactory>[0],
+    );
+    const at = new Date(1_751_000_000_000).toISOString();
+    await approvals.forTenant('demo').create({
+      id: 'apr-stream-1',
+      tenantId: 'demo',
+      workflowId: 'gtm-outbound',
+      runId: 'demo_stream1',
+      title: 'stream approval',
+      connectors: [],
+      priority: 'normal',
+      status: 'pending',
+      requestedBy: 'demo-operator',
+      createdAt: at,
+      updatedAt: at,
+    });
+    const { env, events } = streamingEnv({ DB: db } as Partial<Env>);
+
+    // #when the reviewer claims it (a mutation that fires the stream sink)
+    const response = await call(env, '/api/approvals/apr-stream-1/claim', {
+      method: 'POST',
+      token: 'tok-reviewer',
+    });
+
+    // #then the claim succeeds and the hub received exactly one forwarded event
+    expect(response.status).toBe(200);
+    expect(events).toHaveLength(1);
+    const forwarded = events[0] as {
+      type: string;
+      record: { id: string; tenantId: string };
+    };
+    expect(forwarded.type).toBe('claimed');
+    expect(forwarded.record.id).toBe('apr-stream-1');
+    expect(forwarded.record.tenantId).toBe('demo');
+  });
+
+  it('contains a failing HUB publish: the mutation still succeeds and the failure is only logged (DL-011)', async () => {
+    // #given a seeded pending approval, and a HUB stub whose /internal/event
+    // THROWS — a hard transport failure, not merely a non-2xx status
+    const sqlite = openSqlite();
+    const db = d1DatabaseLike(sqlite);
+    const approvals = new D1ApprovalStoreFactory(
+      db as ConstructorParameters<typeof D1ApprovalStoreFactory>[0],
+    );
+    const at = new Date(1_751_000_000_000).toISOString();
+    await approvals.forTenant('demo').create({
+      id: 'apr-stream-fail',
+      tenantId: 'demo',
+      workflowId: 'gtm-outbound',
+      runId: 'demo_stream2',
+      title: 'stream approval (failing hub)',
+      connectors: [],
+      priority: 'normal',
+      status: 'pending',
+      requestedBy: 'demo-operator',
+      createdAt: at,
+      updatedAt: at,
+    });
+    const throwingNamespace = {
+      idFromName: (name: string) => ({ name }),
+      get: () => ({
+        fetch: async (): Promise<Response> => {
+          throw new Error('hub unreachable');
+        },
+      }),
+    } as unknown as Env['HUB'];
+    const env = makeEnv({
+      DB: db,
+      HUB: throwingNamespace,
+      STREAM_TICKET_SECRET: 'test-stream-secret',
+    } as Partial<Env>);
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when the reviewer claims it
+    const response = await call(env, '/api/approvals/apr-stream-fail/claim', {
+      method: 'POST',
+      token: 'tok-reviewer',
+    });
+
+    // #then the claim itself is UNAFFECTED — 200, and the record really claimed
+    expect(response.status).toBe(200);
+    const claimed = (await response.json()) as { status: string };
+    expect(claimed.status).toBe('claimed');
+    // #then the fan-out failure is contained: only logged, never thrown through
+    expect(
+      errorSpy.mock.calls.some(([line]) =>
+        String(line).includes('"type":"stream-publish-error"'),
+      ),
+    ).toBe(true);
+    errorSpy.mockRestore();
+  });
+
+  it('leaves streaming unmounted when the ticket secret is absent (poll-only)', async () => {
+    // #given HUB bound but NO STREAM_TICKET_SECRET
+    const { namespace } = makeHubStub();
+    const env = makeEnv({ HUB: namespace });
+
+    // #when the reviewer tries to mint a ticket
+    const response = await call(env, '/api/stream/ticket', {
+      method: 'POST',
+      token: 'tok-reviewer',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ channel: 'hub' }),
+    });
+
+    // #then the stream stage never mounted, so the route falls through to 404
+    expect(response.status).toBe(404);
+  });
+});

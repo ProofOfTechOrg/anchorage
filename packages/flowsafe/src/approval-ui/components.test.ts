@@ -119,9 +119,113 @@ describe('provider merge semantics', () => {
     expect(typeof merged.Select).toBe('function');
   });
 
+  it('falls back to default Toast/PresenceIndicator when an adapter omits the M-007 slots (additive contract)', () => {
+    // #given — an adapter written before the live-streaming slots existed
+    const preStreamAdapter: Partial<ApprovalUIComponents> = {
+      Text: htmlComponents.Text,
+      Banner: htmlComponents.Banner,
+    };
+
+    // #when
+    const merged = { ...htmlComponents, ...preStreamAdapter };
+
+    // #then — the merge fills both optional slots from the HTML defaults
+    expect(merged.Toast).toBe(htmlComponents.Toast);
+    expect(merged.PresenceIndicator).toBe(htmlComponents.PresenceIndicator);
+    expect(typeof merged.Toast).toBe('function');
+    expect(typeof merged.PresenceIndicator).toBe('function');
+  });
+
   it('prefers an adapter-supplied InfoTip over the default', () => {
     const custom: ApprovalUIComponents['InfoTip'] = ({ label }) => label;
     const merged = { ...htmlComponents, ...{ InfoTip: custom } };
     expect(merged.InfoTip).toBe(custom);
+  });
+});
+
+describe('htmlComponents.Toast', () => {
+  interface ToastElementProps {
+    role: string;
+    className: string;
+    children: unknown;
+  }
+
+  it('renders a status region carrying the tone class and title', () => {
+    // #when
+    const element = htmlComponents.Toast({
+      tone: 'warning',
+      title: 'clash',
+    }) as ReactElement<ToastElementProps>;
+
+    // #then
+    expect(element.type).toBe('div');
+    expect(element.props.role).toBe('status');
+    expect(element.props.className).toBe(
+      'flowsafe-toast flowsafe-tone-warning',
+    );
+  });
+
+  it('renders a dismiss button wired to onDismiss when provided', () => {
+    // #given
+    const onDismiss = (): void => {};
+
+    // #when
+    const element = htmlComponents.Toast({
+      tone: 'danger',
+      title: 'x',
+      onDismiss,
+    }) as ReactElement<{
+      children: Array<ReactElement<{ onClick: () => void }> | null>;
+    }>;
+
+    // #then — the second child is the dismiss button, calling back onDismiss
+    const button = element.props.children[1];
+    expect(button?.type).toBe('button');
+    expect(button?.props.onClick).toBe(onDismiss);
+  });
+
+  it('omits the dismiss button when onDismiss is absent', () => {
+    // #when
+    const element = htmlComponents.Toast({
+      tone: 'info',
+      title: 'x',
+    }) as ReactElement<{ children: unknown[] }>;
+
+    // #then
+    expect(element.props.children[1]).toBeNull();
+  });
+});
+
+describe('htmlComponents.PresenceIndicator', () => {
+  interface PresenceElementProps {
+    className: string;
+    'aria-label': string;
+    children: unknown;
+  }
+
+  it('renders a labelled list with one item per member', () => {
+    // #when
+    const element = htmlComponents.PresenceIndicator({
+      members: [
+        { actorId: 'ada', role: 'admin' },
+        { actorId: 'ray', role: 'reviewer' },
+      ],
+    }) as ReactElement<PresenceElementProps>;
+
+    // #then
+    expect(element.type).toBe('ul');
+    expect(element.props.className).toBe('flowsafe-presence');
+    expect(element.props['aria-label']).toBe('Reviewers online');
+    expect((element.props.children as unknown[]).length).toBe(2);
+  });
+
+  it('renders an empty list for an empty roster', () => {
+    // #when
+    const element = htmlComponents.PresenceIndicator({
+      members: [],
+    }) as ReactElement<PresenceElementProps>;
+
+    // #then
+    expect((element.props.children as unknown[]).length).toBe(0);
   });
 });

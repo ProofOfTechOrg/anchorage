@@ -142,3 +142,42 @@ export interface ApprovalNotificationEvent {
 export type ApprovalNotificationSink = (
   event: ApprovalNotificationEvent,
 ) => void | Promise<void>;
+
+/**
+ * A live-stream moment worth fanning out to every open dashboard of the
+ * tenant: a request was created, claimed, decided, delegated, superseded, or
+ * escalated. Distinct from ApprovalNotificationEvent (deliberately only
+ * 'created' | 'escalated', the reviewer-facing transport): a live queue also
+ * needs claimed/decided/delegated/superseded so a dashboard can upsert-by-id
+ * without a refetch. `record` is the POST-transition record.
+ */
+export interface ApprovalStreamEvent {
+  type:
+    | 'created'
+    | 'claimed'
+    | 'decided'
+    | 'delegated'
+    | 'superseded'
+    | 'escalated';
+  record: ApprovalRecord;
+}
+
+/**
+ * The live fan-out seam (a per-tenant hub Durable Object relays each event to
+ * that tenant's open dashboard sockets — flowsafe ships NO transport).
+ * Fire-and-forget with the same availability-over-delivery policy as
+ * ApprovalNotificationSink: a sink that throws or rejects never fails the
+ * approval mutation that fired it — the failure is recorded to the AUDIT sink
+ * as `approval.stream`/'error' and the mutation proceeds. Workers hosts whose
+ * transport must outlive the response wrap it in ctx.waitUntil themselves; the
+ * service never awaits the sink.
+ *
+ * TRUST: unlike ApprovalNotificationSink — which addresses lower-trust channels
+ * (email, chat) and so a transport must project or redact the record — this is
+ * a SAME-TRUST intra-tenant feed: every subscriber is already an authenticated
+ * reviewer of THIS tenant, so it carries the FULL ApprovalRecord unredacted. It
+ * is an ADDRESSING feed, never a capability — no grant ever travels on it.
+ */
+export type ApprovalStreamSink = (
+  event: ApprovalStreamEvent,
+) => void | Promise<void>;

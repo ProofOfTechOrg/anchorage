@@ -12,10 +12,26 @@ import type {
   ApprovalListFilter,
   ApprovalMetrics,
   ApprovalRecord,
+  ApprovalStatus,
   BatchDecideResult,
 } from '../approval-api/types.js';
 import { OPEN_STATUSES } from '../approval-api/types.js';
 import type { ApprovalApiClient } from './client.js';
+import {
+  applyMetricsDelta,
+  applyOptimisticDecide,
+  type DecisionConflict,
+  mergeApprovalEvent,
+  type PendingDecisions,
+  type PresenceMember,
+  parseStreamFrame,
+  presenceReducer,
+  reconcileDecided,
+  type StreamConnection,
+  type StreamFrame,
+  type StreamHandlers,
+  type StreamTransport,
+} from './stream.js';
 import { sortQueue } from './view-model.js';
 
 /**
@@ -131,6 +147,225 @@ export function effectiveApprovalFilter(
     : optionsFilter;
 }
 
+/** Normalize an ApprovalListFilter.status into a plain status array (or undefined = all). */
+function statusFilterOf(
+  filter: ApprovalListFilter,
+): readonly ApprovalStatus[] | undefined {
+  if (filter.status === undefined) return undefined;
+  return Array.isArray(filter.status) ? filter.status : [filter.status];
+}
+
+/**
+ * A cancelable timer seam — injected in tests, defaults to the host globals.
+ * Kept structural (no ambient-timer types) so it typechecks in both the UI and
+ * the transitively-included workers-typed test pass.
+ */
+export interface StreamScheduler {
+  setTimeout(handler: () => void, ms: number): ReturnType<typeof setTimeout>;
+  clearTimeout(handle: ReturnType<typeof setTimeout>): void;
+}
+
+const DEFAULT_STREAM_SCHEDULER: StreamScheduler = {
+  setTimeout: (handler, ms) => setTimeout(handler, ms),
+  clearTimeout: (handle) => {
+    clearTimeout(handle);
+  },
+};
+
+/** Reconnect backoff (ms); the last entry repeats for every further attempt. */
+export const DEFAULT_STREAM_RECONNECT_MS: readonly number[] = [
+  1_000, 2_000, 5_000, 10_000,
+];
+
+/** Heartbeat ping cadence (ms) — how often the client proves the socket is live. */
+export const DEFAULT_STREAM_HEARTBEAT_MS = 20_000;
+/** Pong deadline (ms) after a ping — a missed pong forces a reconnect. */
+export const DEFAULT_STREAM_HEARTBEAT_TIMEOUT_MS = 10_000;
+
+/**
+ * A permanent (non-retryable) ticket failure: the host is not serving streaming
+ * (no STREAM_TICKET_SECRET ⇒ the ticket route 404s), or the caller is not
+ * permitted to stream. A 4xx means a retry cannot succeed, so the subscription
+ * gives up and the client stays cleanly poll-only — never hammering the ticket
+ * route with endless background 404s (F4). A 5xx or a network error (no status)
+ * stays transient and reconnects with backoff.
+ */
+function isPermanentStreamError(cause: unknown): boolean {
+  const status = (cause as { status?: unknown } | null | undefined)?.status;
+  return typeof status === 'number' && status >= 400 && status < 500;
+}
+
+/** The injected stream option: a transport plus a ticket() thunk (both from the host). */
+export interface ApprovalStreamOption {
+  transport: StreamTransport;
+  /** Mints a fresh addressing ticket; the socket URL is `url + ticket`. */
+  ticket: () => Promise<{ url: string; ticket: string }>;
+}
+
+export interface SubscribeApprovalStreamOptions extends ApprovalStreamOption {
+  onFrame: (frame: StreamFrame) => void;
+  /** Fires on each successful (re)open — the run channel resumes pausing its poll here. */
+  onOpen?: () => void;
+  /** Fires once per disconnect (before the backoff reconnect) — poll fallback resumes here. */
+  onClose?: () => void;
+  reconnectDelaysMs?: readonly number[];
+  scheduler?: StreamScheduler;
+  /** Heartbeat ping cadence (ms). Default DEFAULT_STREAM_HEARTBEAT_MS. */
+  heartbeatMs?: number;
+  /** Pong deadline (ms) after a ping. Default DEFAULT_STREAM_HEARTBEAT_TIMEOUT_MS. */
+  heartbeatTimeoutMs?: number;
+}
+
+/**
+ * Open a stream and keep it open across drops (fetch a ticket, open the injected
+ * transport, parse each frame to onFrame, reconnect with backoff on
+ * close/error). Pure and node-testable — the React hook wires onFrame to its
+ * reducers. DOM-free: the transport and timers are injected. Returns a
+ * StreamConnection whose close() stops reconnecting and closes the live socket.
+ */
+export function subscribeApprovalStream({
+  transport,
+  ticket,
+  onFrame,
+  onOpen,
+  onClose,
+  reconnectDelaysMs = DEFAULT_STREAM_RECONNECT_MS,
+  scheduler = DEFAULT_STREAM_SCHEDULER,
+  heartbeatMs = DEFAULT_STREAM_HEARTBEAT_MS,
+  heartbeatTimeoutMs = DEFAULT_STREAM_HEARTBEAT_TIMEOUT_MS,
+}: SubscribeApprovalStreamOptions): StreamConnection {
+  let active = true;
+  let connection: StreamConnection | undefined;
+  let disconnected = false;
+  let attempt = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
+  let livenessTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const clearHeartbeat = (): void => {
+    if (heartbeatTimer !== undefined) {
+      scheduler.clearTimeout(heartbeatTimer);
+      heartbeatTimer = undefined;
+    }
+    if (livenessTimer !== undefined) {
+      scheduler.clearTimeout(livenessTimer);
+      livenessTimer = undefined;
+    }
+  };
+
+  const scheduleReconnect = (): void => {
+    if (!active) return;
+    const index = Math.min(attempt, reconnectDelaysMs.length - 1);
+    const delay = reconnectDelaysMs[index] ?? 1_000;
+    attempt += 1;
+    timer = scheduler.setTimeout(() => {
+      if (active) void connect();
+    }, delay);
+  };
+
+  // Single disconnect funnel — a socket that fires onerror THEN onclose, or a
+  // missed-pong force-close, must schedule exactly one reconnect. Closes the
+  // (possibly half-open) socket so the transport releases it.
+  const handleDisconnect = (): void => {
+    if (!active || disconnected) return;
+    disconnected = true;
+    clearHeartbeat();
+    connection?.close();
+    connection = undefined;
+    onClose?.();
+    scheduleReconnect();
+  };
+
+  // Liveness heartbeat (F1): a browser cannot detect a silently half-open socket
+  // (sleep/wake, NAT drop) — it never fires onclose — so a broadcast-only run
+  // channel would sit paused on stale state indefinitely. Ping on an interval;
+  // ANY inbound frame (the DO answers 'ping' with 'pong', which parseStreamFrame
+  // ignores) proves liveness and clears the deadline; a missed pong forces a
+  // disconnect so the poll resumes and the socket reconnects. A transport with
+  // no send() gets no heartbeat and relies on its own onClose.
+  const armLiveness = (): void => {
+    if (livenessTimer !== undefined) scheduler.clearTimeout(livenessTimer);
+    livenessTimer = scheduler.setTimeout(() => {
+      livenessTimer = undefined;
+      handleDisconnect();
+    }, heartbeatTimeoutMs);
+  };
+
+  const scheduleHeartbeat = (): void => {
+    heartbeatTimer = scheduler.setTimeout(() => {
+      heartbeatTimer = undefined;
+      if (!active) return;
+      const conn = connection;
+      if (!conn?.send) return; // no heartbeat capability — rely on the socket's onClose
+      try {
+        conn.send('ping');
+      } catch {
+        handleDisconnect();
+        return;
+      }
+      armLiveness();
+      scheduleHeartbeat();
+    }, heartbeatMs);
+  };
+
+  const handlers: StreamHandlers = {
+    onMessage: (data) => {
+      // Any inbound frame proves the socket is alive — clear the pong deadline.
+      if (livenessTimer !== undefined) {
+        scheduler.clearTimeout(livenessTimer);
+        livenessTimer = undefined;
+      }
+      const frame = parseStreamFrame(data);
+      if (frame) onFrame(frame);
+    },
+    onOpen: () => {
+      attempt = 0;
+      onOpen?.();
+      if (connection?.send) scheduleHeartbeat();
+    },
+    onClose: handleDisconnect,
+    onError: handleDisconnect,
+  };
+
+  async function connect(): Promise<void> {
+    if (!active) return;
+    disconnected = false;
+    let address: { url: string; ticket: string };
+    try {
+      address = await ticket();
+    } catch (cause) {
+      if (isPermanentStreamError(cause)) {
+        // Streaming is not mounted / not permitted here — stop retrying and stay
+        // cleanly poll-only (F4), never hammering the ticket route forever.
+        active = false;
+        clearHeartbeat();
+        return;
+      }
+      // A transient ticket() failure is a disconnect — back off and retry.
+      handleDisconnect();
+      return;
+    }
+    if (!active) return;
+    try {
+      connection = transport.open(`${address.url}${address.ticket}`, handlers);
+    } catch {
+      // A failed open() is a disconnect — back off and retry.
+      handleDisconnect();
+    }
+  }
+
+  void connect();
+
+  return {
+    close: () => {
+      active = false;
+      clearHeartbeat();
+      if (timer !== undefined) scheduler.clearTimeout(timer);
+      connection?.close();
+    },
+  };
+}
+
 export interface UseApprovalDashboardOptions {
   /** Queue/metrics refresh cadence; <= 0 disables polling. Default 10s. */
   pollIntervalMs?: number;
@@ -142,6 +377,20 @@ export interface UseApprovalDashboardOptions {
    * dashboard never issues an unfiltered full-table scan.
    */
   filter?: ApprovalListFilter;
+  /**
+   * Live streaming (Part B): an injected StreamTransport + a ticket() thunk.
+   * ABSENT ⇒ poll-only, exactly today's behavior. When present the hook opens
+   * the tenant's approval stream and live-merges events on top of the interval
+   * poll, which keeps running as the periodic reconciler (DL-021).
+   */
+  stream?: ApprovalStreamOption;
+  /**
+   * The current reviewer's id — attributes an optimistic decide so a live
+   * 'decided' event naming a DIFFERENT decider surfaces a conflict. Absent ⇒
+   * optimistic decide still greys the row, but no conflict is ever raised (no
+   * id to compare against); the host supplies it (showcase, M-008).
+   */
+  actorId?: string;
 }
 
 export interface ApprovalDashboardState {
@@ -184,6 +433,19 @@ export interface ApprovalDashboardState {
   claim: () => void;
   delegate: (to: string) => void;
   refresh: () => Promise<void>;
+  /**
+   * Reviewers currently connected to the tenant's live stream (deduped by
+   * actorId). Empty in poll-only mode.
+   */
+  presence: PresenceMember[];
+  /**
+   * Set when a live 'decided' event attributes a record this reviewer
+   * optimistically decided to a DIFFERENT decider (they decided first). null
+   * otherwise. Never set in poll-only mode or without an actorId.
+   */
+  conflict: DecisionConflict | null;
+  /** Clears the current conflict surface (Toast dismissal). */
+  dismissConflict: () => void;
 }
 
 export function useApprovalDashboard(
@@ -192,6 +454,8 @@ export function useApprovalDashboard(
     pollIntervalMs = 10_000,
     now = Date.now,
     filter = DEFAULT_QUEUE_FILTER,
+    stream,
+    actorId,
   }: UseApprovalDashboardOptions = {},
 ): ApprovalDashboardState {
   const [records, setRecords] = useState<ApprovalRecord[]>([]);
@@ -203,6 +467,12 @@ export function useApprovalDashboard(
   const [override, setOverride] = useState<ApprovalFilterOverride | null>(null);
   const [rawSelectedIds, setRawSelectedIds] = useState<readonly string[]>([]);
   const [lastBatch, setLastBatch] = useState<BatchDecideResult | null>(null);
+  const [presence, setPresence] = useState<PresenceMember[]>([]);
+  const [conflict, setConflict] = useState<DecisionConflict | null>(null);
+  // Optimistic decisions are a transient tracker, never rendered directly (the
+  // greyed row lives in `records`), so a ref avoids a re-render per mutation
+  // and gives the frame handler a synchronous read for conflict detection.
+  const pendingRef = useRef<PendingDecisions>({});
 
   // Latest-ref for the injected clock: an inline `now` (a fixed test/story
   // clock) is a new function identity every render — the same request-loop
@@ -236,6 +506,15 @@ export function useApprovalDashboard(
     () => JSON.parse(filterKey) as ApprovalListFilter,
     [filterKey],
   );
+
+  // The live-merge status filter, read by the (stable) frame handler via a ref
+  // so a filter change never re-subscribes the socket. Kept current here.
+  const statusesRef = useRef<readonly ApprovalStatus[] | undefined>(
+    statusFilterOf(stableFilter),
+  );
+  useEffect(() => {
+    statusesRef.current = statusFilterOf(stableFilter);
+  }, [stableFilter]);
 
   // `client` stays an identity dependency on purpose: a NEW client means a
   // new endpoint/authorization (the showcase actor switcher), which must
@@ -283,6 +562,51 @@ export function useApprovalDashboard(
     setRawSelectedIds([]);
   }, []);
 
+  const dismissConflict = useCallback((): void => {
+    setConflict(null);
+  }, []);
+
+  // Route one live frame into state. Stable ([] deps) — it reads current values
+  // through refs and the functional setState updaters, so the subscription
+  // effect never re-subscribes when the filter or queue changes (guideline 8.3).
+  const handleFrame = useCallback((frame: StreamFrame): void => {
+    if (frame.type === 'queue') {
+      const { event } = frame;
+      setRecords((current) =>
+        mergeApprovalEvent(current, event, { statuses: statusesRef.current }),
+      );
+      setMetrics((current) => applyMetricsDelta(current, event));
+      if (event.type === 'decided') {
+        const { pending: next, conflict: found } = reconcileDecided(
+          pendingRef.current,
+          event,
+        );
+        pendingRef.current = next;
+        if (found) setConflict(found);
+      }
+    } else if (frame.type === 'presence') {
+      setPresence(presenceReducer(frame.roster));
+    }
+    // 'run' frames carry the wholesale RunSummary for the per-run view (M-008);
+    // this queue-focused dashboard holds no run state, so it ignores them.
+  }, []);
+
+  // Live subscription — additive to the poll, which keeps running as the queue
+  // reconciler (DL-021). Narrow deps (guideline 5.7): re-subscribe only when the
+  // injected transport/ticket identity changes (a new client/auth), never on a
+  // state or filter change. Absent stream ⇒ no subscription (poll-only).
+  const streamTransport = stream?.transport;
+  const streamTicket = stream?.ticket;
+  useEffect(() => {
+    if (streamTransport === undefined || streamTicket === undefined) return;
+    const connection = subscribeApprovalStream({
+      transport: streamTransport,
+      ticket: streamTicket,
+      onFrame: handleFrame,
+    });
+    return () => connection.close();
+  }, [streamTransport, streamTicket, handleFrame]);
+
   const act = useCallback(
     async (action: () => Promise<unknown>): Promise<void> => {
       setBusy(true);
@@ -304,31 +628,102 @@ export function useApprovalDashboard(
     (decision: ApprovalDecision, comment: string): void => {
       const ids = selectedIds;
       if (ids.length === 0) return;
+      // Optimistic: grey every selected row and track each pending decision.
+      const decidedBy = actorId ?? '';
+      setRecords((current) =>
+        ids.reduce(
+          (recs, id) =>
+            applyOptimisticDecide(recs, id, decision, decidedBy).records,
+          current,
+        ),
+      );
+      const nextPending: Record<string, PendingDecisions[string]> = {
+        ...pendingRef.current,
+      };
+      for (const id of ids)
+        nextPending[id] = { id, decision, actorId: decidedBy };
+      pendingRef.current = nextPending;
       void act(async () => {
-        const outcome = await client.decideBatch(
-          ids,
-          decision,
-          comment === '' ? undefined : comment,
-        );
-        setLastBatch(outcome);
-        setRawSelectedIds([]);
+        try {
+          const outcome = await client.decideBatch(
+            ids,
+            decision,
+            comment === '' ? undefined : comment,
+          );
+          setLastBatch(outcome);
+          setRawSelectedIds([]);
+          // Reconcile each attempted id against the authoritative envelope; a
+          // failed item (no record) just drops its pending — the post-action
+          // refresh (in act) un-greys it from the server.
+          let map = pendingRef.current;
+          for (const item of outcome.results) {
+            if (item.record) {
+              map = reconcileDecided(map, {
+                type: 'decided',
+                record: item.record,
+              }).pending;
+            } else {
+              const rest: Record<string, PendingDecisions[string]> = { ...map };
+              delete rest[item.id];
+              map = rest;
+            }
+          }
+          pendingRef.current = map;
+        } catch (cause) {
+          // Wholesale batch failure (F3): clear every optimistic pending for
+          // these ids so none can later raise a spurious conflict, and resync the
+          // greyed rows from the server (covers pollIntervalMs <= 0).
+          const rest = { ...pendingRef.current };
+          for (const id of ids) delete rest[id];
+          pendingRef.current = rest;
+          await refresh();
+          throw cause;
+        }
       });
     },
-    [act, client, selectedIds],
+    [act, actorId, client, refresh, selectedIds],
   );
 
   const decide = useCallback(
     (decision: ApprovalDecision, comment: string): void => {
       if (!selected) return;
-      void act(() =>
-        client.decide(
-          selected.id,
-          decision,
-          comment === '' ? undefined : comment,
-        ),
+      const id = selected.id;
+      // Optimistic: grey the row immediately, then confirm against the server
+      // response (poll-only path) or the authoritative 'decided' stream event.
+      const decidedBy = actorId ?? '';
+      setRecords(
+        (current) =>
+          applyOptimisticDecide(current, id, decision, decidedBy).records,
       );
+      pendingRef.current = {
+        ...pendingRef.current,
+        [id]: { id, decision, actorId: decidedBy },
+      };
+      void act(async () => {
+        try {
+          const result = await client.decide(
+            id,
+            decision,
+            comment === '' ? undefined : comment,
+          );
+          pendingRef.current = reconcileDecided(pendingRef.current, {
+            type: 'decided',
+            record: result.record,
+          }).pending;
+        } catch (cause) {
+          // Roll back the optimistic decision on failure (F3): clear the pending
+          // entry so a later authoritative 'decided' event for this record does
+          // NOT read as a spurious conflict, and resync the greyed row from the
+          // server (covers pollIntervalMs <= 0, where no interval poll un-greys it).
+          const rest = { ...pendingRef.current };
+          delete rest[id];
+          pendingRef.current = rest;
+          await refresh();
+          throw cause;
+        }
+      });
     },
-    [act, client, selected],
+    [act, actorId, client, refresh, selected],
   );
 
   const claim = useCallback((): void => {
@@ -368,5 +763,8 @@ export function useApprovalDashboard(
     claim,
     delegate,
     refresh,
+    presence,
+    conflict,
+    dismissConflict,
   };
 }

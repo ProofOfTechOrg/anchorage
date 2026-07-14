@@ -450,4 +450,72 @@ describe('DurableObjectRunner.fetch', () => {
       'success',
     );
   });
+
+  it('returns a 426 non-WS fallback on the stream route when the runtime has no hibernation API', async () => {
+    // #given — a node runner (state undefined ⇒ no acceptWebSocket). The per-run
+    // WS stream is workerd-only; off workerd it must degrade, never 500. The WS
+    // runtime behavior itself is proven by the workerd spike (M-009).
+    const runner = makeRunner();
+
+    // #when — a websocket upgrade attempt on the stream route
+    const response = await runner.fetch(
+      new Request('http://do/runs/gated/run-1/stream', {
+        headers: { Upgrade: 'websocket' },
+      }),
+    );
+
+    // #then — 426 Upgrade Required (poll GET /runs/:wf/:runId instead)
+    expect(response.status).toBe(426);
+  });
+
+  it('broadcasts the authoritative RunSummary to run-channel sockets after start and resume (DL-018)', async () => {
+    // #given — a runner whose DO exposes a hibernatable-socket stub;
+    // #broadcastRunSummary reads getWebSockets() and send()s each the frame.
+    const sent: string[] = [];
+    const socket = {
+      send: (data: string) => sent.push(data),
+    };
+    const state = {
+      id: { name: 'gated:run-A' },
+      getWebSockets: () => [socket],
+    } as unknown as DurableObjectState;
+    const runner = new TestRunner(state, { storage: new InMemoryStore() });
+
+    // #when — start
+    const startResponse = await runner.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'run-A',
+        inputData: { topic: 't' },
+      }),
+    );
+
+    // #then — one broadcast frame carrying the suspended summary
+    expect(startResponse.status).toBe(200);
+    expect(sent).toHaveLength(1);
+    const startFrame = JSON.parse(sent[0] ?? '{}') as {
+      type: string;
+      summary: RunSummary;
+    };
+    expect(startFrame.type).toBe('run');
+    expect(startFrame.summary.status).toBe('suspended');
+
+    // #when — resume to completion
+    const resumeResponse = await runner.fetch(
+      post('/runs/gated/run-A/resume', {
+        step: 'gate',
+        resumeData: { approvedBy: 'bob' },
+      }),
+    );
+
+    // #then — a second broadcast carrying the success summary
+    expect(resumeResponse.status).toBe(200);
+    expect(sent).toHaveLength(2);
+    const resumeFrame = JSON.parse(sent[1] ?? '{}') as {
+      type: string;
+      summary: RunSummary;
+    };
+    expect(resumeFrame.type).toBe('run');
+    expect(resumeFrame.summary.status).toBe('success');
+  });
 });

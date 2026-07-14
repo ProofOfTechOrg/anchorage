@@ -7,6 +7,8 @@
 export type {
   D1DatabaseBinding,
   DurableObjectRunnerState,
+  HubDurableObjectState,
+  WebSocketLike,
 } from './cf-types.js';
 export type {
   D1StorageOptions,
@@ -25,6 +27,8 @@ export {
   purgeTenant,
 } from './d1-storage.js';
 export { DurableObjectRunner } from './durable-object.js';
+export type { HubStreamEvent, PresenceMember } from './hub-do.js';
+export { HubDurableObject } from './hub-do.js';
 export type {
   DORunnerEnv,
   InitOptions,

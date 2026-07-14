@@ -83,7 +83,7 @@ export const GLOSSARY = {
   destructiveClass:
     'Marked as a connector whose effect cannot be undone. Each action (deploy vs promote) carries its own idempotency key.',
   polling:
-    'This UI polls run status every 3s and the queue/metrics every 5s. There is no event API; the activity feed is reconstructed from these responses.',
+    'When live streaming is enabled, run and queue updates arrive over a WebSocket: the 3s run poll then only serves as a fallback (paused while its socket stays healthy), while the 5s queue/metrics poll keeps reconciling any drift. Without streaming, these polls are the sole source. The activity feed narrates these observations in your browser.',
   artifactStore:
     'Real writes to an in-memory bucket standing in for R2. Keys look like production (workflowId/runId/name); contents vanish with the sandbox.',
 } as const;

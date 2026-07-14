@@ -22,10 +22,22 @@
   // The worker emits structured JSON (audit + maintenance + connector previews)
   // to Workers Logs.
   "observability": { "enabled": true },
+  // RUNNER: one DO per run (workflow execution). HUB: one DO per tenant (live
+  // stream fan-out). Every stream route lives under /api/stream/, which the
+  // /api/* run_worker_first entry below already routes to the Worker, so no
+  // assets edit is needed.
   "durable_objects": {
-    "bindings": [{ "name": "RUNNER", "class_name": "ShowcaseRunner" }]
+    "bindings": [
+      { "name": "RUNNER", "class_name": "ShowcaseRunner" },
+      { "name": "HUB", "class_name": "ShowcaseHub" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ShowcaseRunner"] }],
+  // DO migrations are append-only: the v1 runner migration is UNCHANGED and the
+  // hub class gets its own v2 tag.
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ShowcaseRunner"] },
+    { "tag": "v2", "new_sqlite_classes": ["ShowcaseHub"] }
+  ],
   "d1_databases": [
     {
       "binding": "DB",
@@ -124,6 +136,13 @@
   //     `.dev.vars` beside this file (`cp .dev.vars.example .dev.vars` first).
   //     Never seed the repo's demo tokens as the real secret — they are
   //     world-known, and one of them is `admin`.
+  //   STREAM_TICKET_SECRET — turns LIVE STREAMING on: the dedicated HS256 key
+  //     that signs short-lived WebSocket stream tickets. The HUB binding above
+  //     is always declared, but streaming mounts only when this secret is ALSO
+  //     set; absent, the SPA runs on polling only (graceful degradation). A
+  //     dedicated key, separate from DEMO_JWT_SECRET, so a stream ticket and a
+  //     session JWT can never be confused under one signing secret. Generate
+  //     long + random.
   //   DEMO_JWT_SECRET — turns the public OAuth demo ON: signs the per-visitor
   //     HS256 token sets and the OAuth state. Generate long + random.
   //   GOOGLE_CLIENT_SECRET — pairs with the GOOGLE_CLIENT_ID var.

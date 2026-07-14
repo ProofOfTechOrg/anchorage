@@ -6,6 +6,8 @@ import type {
   ApprovalAuditEvent,
   ApprovalNotificationEvent,
   ApprovalNotificationSink,
+  ApprovalStreamEvent,
+  ApprovalStreamSink,
 } from './contract.js';
 import {
   ApprovalAuthzError,
@@ -101,6 +103,7 @@ function runSweep(
   options: {
     onEscalation?: (record: ApprovalRecord) => void;
     notify?: ApprovalNotificationSink;
+    stream?: ApprovalStreamSink;
   } = {},
 ): Promise<ApprovalRecord[]> {
   return sweepSLA(harness.backend.system(), {
@@ -108,6 +111,7 @@ function runSweep(
     audit: (event) => harness.events.push(event),
     onEscalation: options.onEscalation,
     notify: options.notify,
+    stream: options.stream,
     now: harness.now,
   });
 }
@@ -1437,6 +1441,200 @@ describe('ApprovalService notification seam', () => {
           event.action === 'approval.notify' && event.decision === 'error',
       ),
     ).toHaveLength(2);
+  });
+});
+
+describe('ApprovalService stream seam', () => {
+  it('emits one created event per actually-created record, carrying the record', async () => {
+    // #given
+    const streamed: ApprovalStreamEvent[] = [];
+    const harness = makeHarness({
+      stream: (event) => void streamed.push(event),
+    });
+
+    // #when
+    const record = await seedPending(harness);
+
+    // #then
+    expect(streamed).toEqual([
+      {
+        type: 'created',
+        record: expect.objectContaining({ id: record.id, status: 'pending' }),
+      },
+    ]);
+  });
+
+  it('does not emit on the idempotent created:false re-observation of an open step', async () => {
+    // #given
+    const stream = vi.fn();
+    const harness = makeHarness({ stream });
+    await seedPending(harness, { stepPath: ['gate'] });
+
+    // #when — same (workflowId, runId, stepKey) while still open
+    const second = await harness.service.create(
+      input({ stepPath: ['gate'] }),
+      OPERATOR,
+    );
+
+    // #then — the re-observed open record fires no second event
+    expect(second.created).toBe(false);
+    expect(stream).toHaveBeenCalledTimes(1);
+  });
+
+  it('emits one claimed event with the post-transition record', async () => {
+    // #given
+    const streamed: ApprovalStreamEvent[] = [];
+    const harness = makeHarness({
+      stream: (event) => void streamed.push(event),
+    });
+    const record = await seedPending(harness);
+    streamed.length = 0; // drop the create event; isolate the claim
+
+    // #when
+    await harness.service.claim(record.id, REVIEWER);
+
+    // #then
+    expect(streamed).toEqual([
+      {
+        type: 'claimed',
+        record: expect.objectContaining({ id: record.id, status: 'claimed' }),
+      },
+    ]);
+  });
+
+  it('emits one decided event with the post-transition record', async () => {
+    // #given
+    const streamed: ApprovalStreamEvent[] = [];
+    const harness = makeHarness({
+      stream: (event) => void streamed.push(event),
+    });
+    const record = await seedPending(harness);
+    streamed.length = 0;
+
+    // #when
+    await harness.service.decide(record.id, { decision: 'approve' }, REVIEWER);
+
+    // #then — fired after the transition, independent of #resume (unwired here)
+    expect(streamed).toEqual([
+      {
+        type: 'decided',
+        record: expect.objectContaining({ id: record.id, status: 'approved' }),
+      },
+    ]);
+  });
+
+  it('emits one delegated event with the post-transition record', async () => {
+    // #given
+    const streamed: ApprovalStreamEvent[] = [];
+    const harness = makeHarness({
+      stream: (event) => void streamed.push(event),
+    });
+    const record = await seedPending(harness);
+    streamed.length = 0;
+
+    // #when
+    await harness.service.delegate(record.id, { to: 'quinn' }, REVIEWER);
+
+    // #then
+    expect(streamed).toEqual([
+      {
+        type: 'delegated',
+        record: expect.objectContaining({ id: record.id, status: 'claimed' }),
+      },
+    ]);
+  });
+
+  it('emits one superseded event with the post-transition record', async () => {
+    // #given
+    const streamed: ApprovalStreamEvent[] = [];
+    const harness = makeHarness({
+      stream: (event) => void streamed.push(event),
+    });
+    const record = await seedPending(harness);
+    streamed.length = 0;
+
+    // #when — supersedeStale is CAN_CREATE (system reconcile), not a decision
+    const updated = await harness.service.supersedeStale(
+      record.id,
+      OPERATOR,
+      'stale suspension',
+    );
+
+    // #then
+    expect(updated?.status).toBe('rejected');
+    expect(streamed).toEqual([
+      {
+        type: 'superseded',
+        record: expect.objectContaining({ id: record.id, status: 'rejected' }),
+      },
+    ]);
+  });
+
+  it('contains a sync-throwing stream sink and audits approval.stream/error', async () => {
+    // #given — the dual-guard's try/catch arm
+    const harness = makeHarness({
+      stream: () => {
+        throw new Error('hub crashed');
+      },
+    });
+
+    // #when — the create must succeed regardless
+    const record = await seedPending(harness);
+
+    // #then
+    expect(record.status).toBe('pending');
+    expect(harness.events).toContainEqual(
+      expect.objectContaining({
+        action: 'approval.stream',
+        decision: 'error',
+        reason: expect.stringContaining('hub crashed'),
+      }),
+    );
+  });
+
+  it('contains an async-rejecting stream sink likewise', async () => {
+    // #given — the dual-guard's returned-promise .catch arm
+    const harness = makeHarness({
+      stream: () => Promise.reject(new Error('hub 500')),
+    });
+
+    // #when
+    await seedPending(harness);
+    // The rejection handler runs off the microtask queue, after create returned.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // #then
+    expect(harness.events).toContainEqual(
+      expect.objectContaining({
+        action: 'approval.stream',
+        decision: 'error',
+        reason: expect.stringContaining('hub 500'),
+      }),
+    );
+  });
+
+  it('emits one escalated event per record from the sweep', async () => {
+    // #given
+    const harness = makeHarness();
+    await seedPending(harness, { slaSeconds: 60 });
+    await seedPending(harness, { slaSeconds: 60, runId: 'acme_run-2' });
+    harness.advance(61_000);
+
+    // #when
+    const streamed: ApprovalStreamEvent[] = [];
+    const escalated = await runSweep(harness, {
+      stream: (event) => void streamed.push(event),
+    });
+
+    // #then
+    expect(escalated).toHaveLength(2);
+    expect(streamed.map((event) => event.type)).toEqual([
+      'escalated',
+      'escalated',
+    ]);
+    expect(new Set(streamed.map((event) => event.record.id))).toEqual(
+      new Set(escalated.map((record) => record.id)),
+    );
   });
 });
 

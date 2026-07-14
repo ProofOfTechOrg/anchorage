@@ -7,6 +7,7 @@
 // behavior — the D3 fix — is testable in plain node.
 
 import { describe, expect, it } from 'vitest';
+import type { ApprovalStreamEvent } from '../approval-api/contract.js';
 import type {
   ApprovalListFilter,
   ApprovalMetrics,
@@ -14,12 +15,20 @@ import type {
 } from '../approval-api/types.js';
 import { OPEN_STATUSES } from '../approval-api/types.js';
 import {
+  mergeApprovalEvent,
+  type StreamConnection,
+  type StreamHandlers,
+  type StreamTransport,
+} from './stream.js';
+import {
   approvalFilterKey,
   DEFAULT_QUEUE_FILTER,
   effectiveApprovalFilter,
   fetchDashboardSnapshot,
   orderRecordsForDisplay,
   pruneSelection,
+  type StreamScheduler,
+  subscribeApprovalStream,
 } from './use-approval-dashboard.js';
 
 const METRICS: ApprovalMetrics = {
@@ -304,5 +313,336 @@ describe('effectiveApprovalFilter', () => {
 
     // #when / #then — no reset effect needed; the derivation itself retires it
     expect(effectiveApprovalFilter(override, changed)).toBe(changed);
+  });
+});
+
+// ---- Live stream subscription (subscribeApprovalStream) --------------------
+// DOM-free: an injected FAKE transport drives live updates through the pure
+// reducer, and a fake scheduler proves reconnect-with-backoff — no renderer, no
+// browser WebSocket (that lives only in use-web-socket-transport.ts). This is
+// the transport-wiring the hook's stream effect uses; the reducers themselves
+// are covered in stream.test.ts.
+
+interface FakeTransport {
+  transport: StreamTransport;
+  opens: Array<{ url: string; handlers: StreamHandlers }>;
+  closes: () => number;
+  sent: () => string[];
+}
+
+function makeFakeTransport(): FakeTransport {
+  const opens: Array<{ url: string; handlers: StreamHandlers }> = [];
+  let closed = 0;
+  const sent: string[] = [];
+  const transport: StreamTransport = {
+    open(url, handlers): StreamConnection {
+      opens.push({ url, handlers });
+      return {
+        send: (data) => {
+          sent.push(data);
+        },
+        close: () => {
+          closed += 1;
+        },
+      };
+    },
+  };
+  return { transport, opens, closes: () => closed, sent: () => sent };
+}
+
+interface FakeScheduler {
+  scheduler: StreamScheduler;
+  runNext: () => void;
+  pending: () => number;
+}
+
+function makeFakeScheduler(): FakeScheduler {
+  const timers = new Map<number, () => void>();
+  let nextId = 0;
+  const scheduler: StreamScheduler = {
+    setTimeout: (handler) => {
+      nextId += 1;
+      timers.set(nextId, handler);
+      return nextId as unknown as ReturnType<typeof setTimeout>;
+    },
+    clearTimeout: (handle) => {
+      timers.delete(handle as unknown as number);
+    },
+  };
+  return {
+    scheduler,
+    runNext: () => {
+      const entry = timers.entries().next();
+      if (entry.done) return;
+      const [id, handler] = entry.value;
+      timers.delete(id);
+      handler();
+    },
+    pending: () => timers.size,
+  };
+}
+
+// Flush the ticket() microtask (subscribeApprovalStream opens after awaiting it).
+async function flush(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+describe('subscribeApprovalStream', () => {
+  it('opens the transport at url+ticket and live-merges a queue event through the reducer', async () => {
+    // #given — a fake transport and a records array the onFrame handler merges into
+    const { transport, opens } = makeFakeTransport();
+    let records: ApprovalRecord[] = [makeRecord({ id: 'apr-existing' })];
+    const connection = subscribeApprovalStream({
+      transport,
+      ticket: async () => ({
+        url: 'wss://h/api/stream/hub?ticket=',
+        ticket: 'TOK',
+      }),
+      onFrame: (frame) => {
+        if (frame.type === 'queue') {
+          records = mergeApprovalEvent(records, frame.event, {
+            statuses: OPEN_STATUSES,
+          });
+        }
+      },
+    });
+    await flush();
+
+    // #then — opened once, the ticket concatenated onto the url
+    expect(opens).toHaveLength(1);
+    expect(opens[0]?.url).toBe('wss://h/api/stream/hub?ticket=TOK');
+
+    // #when — the transport delivers a created event
+    const created: ApprovalStreamEvent = {
+      type: 'created',
+      record: makeRecord({ id: 'apr-new', priority: 'critical' }),
+    };
+    opens[0]?.handlers.onMessage(
+      JSON.stringify({ type: 'queue', event: created }),
+    );
+
+    // #then — the new record is live-merged (critical sorts ahead of the normal)
+    expect(records.map((record) => record.id)).toEqual([
+      'apr-new',
+      'apr-existing',
+    ]);
+    connection.close();
+  });
+
+  it('ignores a malformed frame without throwing', async () => {
+    // #given
+    const { transport, opens } = makeFakeTransport();
+    let frames = 0;
+    const connection = subscribeApprovalStream({
+      transport,
+      ticket: async () => ({ url: 'u?t=', ticket: 'T' }),
+      onFrame: () => {
+        frames += 1;
+      },
+    });
+    await flush();
+
+    // #when — garbage arrives on the wire
+    opens[0]?.handlers.onMessage('{not json');
+
+    // #then — no frame routed
+    expect(frames).toBe(0);
+    connection.close();
+  });
+
+  it('reconnects with backoff after a disconnect', async () => {
+    // #given
+    const { transport, opens } = makeFakeTransport();
+    const { scheduler, runNext, pending } = makeFakeScheduler();
+    const connection = subscribeApprovalStream({
+      transport,
+      ticket: async () => ({ url: 'u?t=', ticket: 'T' }),
+      onFrame: () => {},
+      reconnectDelaysMs: [10],
+      scheduler,
+    });
+    await flush();
+    expect(opens).toHaveLength(1);
+
+    // #when — the socket drops, then the backoff timer fires
+    opens[0]?.handlers.onClose?.();
+    expect(pending()).toBe(1);
+    runNext();
+    await flush();
+
+    // #then — a fresh connection was opened
+    expect(opens).toHaveLength(2);
+    connection.close();
+  });
+
+  it('schedules exactly one reconnect when a socket fires onError then onClose', async () => {
+    // #given
+    const { transport, opens } = makeFakeTransport();
+    const { scheduler, pending } = makeFakeScheduler();
+    const connection = subscribeApprovalStream({
+      transport,
+      ticket: async () => ({ url: 'u?t=', ticket: 'T' }),
+      onFrame: () => {},
+      reconnectDelaysMs: [10],
+      scheduler,
+    });
+    await flush();
+
+    // #when — both fire for a single drop
+    opens[0]?.handlers.onError?.(new Error('boom'));
+    opens[0]?.handlers.onClose?.();
+
+    // #then — one pending reconnect, not two
+    expect(pending()).toBe(1);
+    connection.close();
+  });
+
+  it('close() on a healthy connection closes the live socket', async () => {
+    // #given
+    const { transport, closes } = makeFakeTransport();
+    const connection = subscribeApprovalStream({
+      transport,
+      ticket: async () => ({ url: 'u?t=', ticket: 'T' }),
+      onFrame: () => {},
+    });
+    await flush();
+
+    // #when
+    connection.close();
+
+    // #then
+    expect(closes()).toBe(1);
+  });
+
+  it('pings after open and forces a reconnect when no pong arrives (F1 half-open liveness)', async () => {
+    // #given — a socket that opens but then goes silently half-open (never fires
+    // onClose): without a heartbeat the run poll would stay paused on stale state.
+    const { transport, opens, sent } = makeFakeTransport();
+    const { scheduler, runNext, pending } = makeFakeScheduler();
+    const connection = subscribeApprovalStream({
+      transport,
+      ticket: async () => ({ url: 'u?t=', ticket: 'T' }),
+      onFrame: () => {},
+      reconnectDelaysMs: [10],
+      scheduler,
+      heartbeatMs: 100,
+      heartbeatTimeoutMs: 50,
+    });
+    await flush();
+    expect(opens).toHaveLength(1);
+
+    // #when — the socket opens (schedules the heartbeat), then the heartbeat fires
+    opens[0]?.handlers.onOpen?.();
+    runNext(); // heartbeat: sends 'ping', arms the pong deadline
+
+    // #then — a ping went out
+    expect(sent()).toEqual(['ping']);
+
+    // #when — no pong arrives; the pong deadline fires
+    runNext(); // liveness deadline → force-disconnect → schedule reconnect
+    await flush();
+
+    // #then — the dead socket was closed and exactly one reconnect scheduled
+    expect(pending()).toBe(1);
+    runNext(); // fire the reconnect
+    await flush();
+    expect(opens).toHaveLength(2);
+    connection.close();
+  });
+
+  it('an inbound frame clears the pong deadline so a live socket is not force-closed (F1)', async () => {
+    // #given
+    const { transport, opens, sent } = makeFakeTransport();
+    const { scheduler, runNext } = makeFakeScheduler();
+    const connection = subscribeApprovalStream({
+      transport,
+      ticket: async () => ({ url: 'u?t=', ticket: 'T' }),
+      onFrame: () => {},
+      reconnectDelaysMs: [10],
+      scheduler,
+      heartbeatMs: 100,
+      heartbeatTimeoutMs: 50,
+    });
+    await flush();
+    opens[0]?.handlers.onOpen?.();
+    runNext(); // ping sent, pong deadline armed
+
+    // #when — a pong (ignored by the frame parser) proves the socket is alive
+    opens[0]?.handlers.onMessage('pong');
+    runNext(); // the next heartbeat fires (the liveness timer was cleared, not fired)
+
+    // #then — still one healthy socket (no reconnect), heartbeat kept pinging
+    expect(opens).toHaveLength(1);
+    expect(sent()).toEqual(['ping', 'ping']);
+    connection.close();
+  });
+
+  it('stops retrying when the ticket route returns a permanent 4xx (F4 poll-only)', async () => {
+    // #given — a host with no STREAM_TICKET_SECRET: the ticket route 404s. Retrying
+    // cannot succeed, so the subscription must give up (not hammer 404s forever).
+    const { transport, opens } = makeFakeTransport();
+    const { scheduler, pending } = makeFakeScheduler();
+    let ticketCalls = 0;
+    const connection = subscribeApprovalStream({
+      transport,
+      ticket: async () => {
+        ticketCalls += 1;
+        throw Object.assign(new Error('not found'), { status: 404 });
+      },
+      onFrame: () => {},
+      reconnectDelaysMs: [10],
+      scheduler,
+    });
+    await flush();
+
+    // #then — no socket opened, and NO reconnect scheduled (gave up after one try)
+    expect(opens).toHaveLength(0);
+    expect(pending()).toBe(0);
+    expect(ticketCalls).toBe(1);
+    connection.close();
+  });
+
+  it('keeps retrying on a transient ticket failure with no status (network error)', async () => {
+    // #given — a transient failure (no HTTP status) must still back off and retry.
+    const { transport } = makeFakeTransport();
+    const { scheduler, pending } = makeFakeScheduler();
+    const connection = subscribeApprovalStream({
+      transport,
+      ticket: async () => {
+        throw new Error('network down');
+      },
+      onFrame: () => {},
+      reconnectDelaysMs: [10],
+      scheduler,
+    });
+    await flush();
+
+    // #then — a reconnect IS scheduled (transient, unlike the permanent 4xx)
+    expect(pending()).toBe(1);
+    connection.close();
+  });
+
+  it('close() cancels a pending reconnect (a half-open socket never reopens)', async () => {
+    // #given
+    const { transport, opens } = makeFakeTransport();
+    const { scheduler, runNext, pending } = makeFakeScheduler();
+    const connection = subscribeApprovalStream({
+      transport,
+      ticket: async () => ({ url: 'u?t=', ticket: 'T' }),
+      onFrame: () => {},
+      reconnectDelaysMs: [10],
+      scheduler,
+    });
+    await flush();
+
+    // #when — a drop schedules a reconnect, then we close before it fires
+    opens[0]?.handlers.onClose?.();
+    connection.close();
+
+    // #then — the reconnect is cancelled; firing a stale timer re-opens nothing
+    expect(pending()).toBe(0);
+    runNext();
+    await flush();
+    expect(opens).toHaveLength(1);
   });
 });

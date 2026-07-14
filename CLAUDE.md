@@ -157,8 +157,35 @@ peer-escalation trap fix; the changeset `onlyUpdatePeerDependentsWhenOutOfRange`
 config flag that makes the range take effect landed 2026-07-13 — see
 Branching and releases).
 
+Dev-review + live-streaming (2026-07-14, TWO branches into dev, Part A first).
+Part A (branch `fix/dev-review-2026-07-13`): seven root-cause fixes from the
+2026-07-13 whole-codebase review, each fail-closed — F1 the cross-gate
+separation-of-duties bar in `ApprovalService.decide` (history-based,
+attribution-race-immune; reads the run's COMPLETE approved history via
+after-cursor paging; a non-exempt decider who approved an earlier gate is
+refused — a behavior tightening, so single-reviewer hosts must set
+`allowSelfDecision`), F2 non-string `tenantId` `typeof` guards at all seven
+externally-typed INV-3 sites, F3 the D1 `create()` decide-race retry, F4 the
+`FlowsafeWorkerConfig.artifactStore` retention-purge seam, F5 the
+threshold-tracking highEntropy candidate floor, F6 eager in-memory list
+time-bound validation, F7 the connector id ':' construction guard (flowsafe
+minor + breakwater patch). Part B (branch `feat/live-streaming`, off Part A):
+live streaming over WebSocket-over-Durable-Object — a per-tenant hub DO
+(`HubDurableObject`) + a per-run WebSocket on the runner DO broadcasting the
+authoritative RunSummary at each lifecycle boundary, an `ApprovalStreamSink`
+fired fire-and-forget on every mutation, a short-lived HMAC stream ticket
+(addressing-only, verified SOLELY at the Worker, DOs re-bind by `idFromName`), a
+DOM-free injected `StreamTransport` with optimistic decide + live-merge reducers
++ a client liveness heartbeat + additive Toast/Presence slots, an append-only
+`v2` hub migration on each host, and the workerd spike extended to prove WS
+fan-out, hibernation persistence, and expired/cross-tenant ticket fail-closed.
+Opt-in behind a `HUB` binding + `STREAM_TICKET_SECRET` (absent ⇒ poll-only,
+byte-identical); tenant-isolated on INV-1 (run channel) and id.name==tenantId
+(hub); polling retained as fallback + queue reconciler (flowsafe minor). Neither
+part changes the `ApprovalRecord` shape or any existing signature.
+
 Verification gate: `pnpm lint && pnpm typecheck && pnpm test && pnpm build`
-(1119+ tests; lint is ONE root Biome 2 pass, test is ONE root vitest run over
+(1399+ tests; lint is ONE root Biome 2 pass, test is ONE root vitest run over
 every package via `test.projects`). CI adds the full react-doctor gate
 (100/100 over `packages/showcase`, `--blocking warning`), the react-18
 peer-floor probe, and `spike:verify`.

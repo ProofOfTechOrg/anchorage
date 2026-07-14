@@ -7,9 +7,20 @@
   // The worker emits structured JSON (audit + maintenance) to Workers Logs.
   "observability": { "enabled": true },
   "durable_objects": {
-    "bindings": [{ "name": "RUNNER", "class_name": "FlowsafeRunner" }]
+    "bindings": [
+      { "name": "RUNNER", "class_name": "FlowsafeRunner" },
+      // Per-tenant live-stream fan-out hub (one instance per tenant,
+      // idFromName(tenantId)). Streaming activates only once the
+      // STREAM_TICKET_SECRET secret is also set (opt-in).
+      { "name": "HUB", "class_name": "FlowsafeHub" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["FlowsafeRunner"] }],
+  // DO migrations are APPEND-ONLY: the v1 runner tag is frozen; the hub class
+  // ships under its own new v2 tag. Never edit v1 or reuse a tag.
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["FlowsafeRunner"] },
+    { "tag": "v2", "new_sqlite_classes": ["FlowsafeHub"] }
+  ],
   "d1_databases": [
     {
       "binding": "DB",
@@ -69,4 +80,9 @@
   //     (single-tenant hosts: see README "Hosting a single tenant").
   //   SIEM_AUTH_HEADER — sent as the `authorization` header on audit export,
   //     e.g. "Splunk <hec-token>".
+  //   STREAM_TICKET_SECRET — OPTIONAL; enables live streaming. A DEDICATED HMAC
+  //     key that signs the ~60s WebSocket stream tickets (DL-010). Keep it
+  //     distinct from any session-JWT secret. Absent => the /api/stream/* stage
+  //     stays unmounted and dashboards poll (streaming is opt-in). The HUB DO
+  //     binding above is always declared; the secret is the on/off switch.
 }

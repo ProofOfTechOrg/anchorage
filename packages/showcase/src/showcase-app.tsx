@@ -22,11 +22,15 @@ import { Tooltip } from '@astryxdesign/core/Tooltip';
 import { VStack } from '@astryxdesign/core/VStack';
 
 import type { ApprovalApiClient } from '@flowsafe/approval-ui/client';
+import { useApprovalUIComponents } from '@flowsafe/approval-ui/components';
 import { DetailView } from '@flowsafe/approval-ui/DetailView';
 import { FilterBar } from '@flowsafe/approval-ui/FilterBar';
 import { MetricsView } from '@flowsafe/approval-ui/MetricsView';
 import { QueueView } from '@flowsafe/approval-ui/QueueView';
-import { useApprovalDashboard } from '@flowsafe/approval-ui/use-approval-dashboard';
+import {
+  type ApprovalStreamOption,
+  useApprovalDashboard,
+} from '@flowsafe/approval-ui/use-approval-dashboard';
 import {
   type ReactElement,
   type ReactNode,
@@ -49,7 +53,11 @@ import {
 } from '@/run-client';
 import type { ActivityFeed } from '@/use-activity-feed';
 import { useNarrationToasts } from '@/use-narration-toasts';
-import { type RunEntry, useRunPolling } from '@/use-run-polling';
+import {
+  type RunEntry,
+  type RunStreamOption,
+  useRunPolling,
+} from '@/use-run-polling';
 import { useSnapshotNarration } from '@/use-snapshot-narration';
 import { WorkflowLauncher } from '@/workflow-launcher';
 
@@ -71,6 +79,10 @@ export interface ShowcaseAppProps {
   feed: ActivityFeed;
   /** The acting-identity controls (actor switcher / operator chip). */
   identityControls?: ReactNode;
+  /** Live queue stream for the dashboard (Part B). Absent => poll-only. */
+  approvalStream?: ApprovalStreamOption;
+  /** Live per-run stream for the run poll (Part B). Absent => poll-only. */
+  runStream?: RunStreamOption;
 }
 
 export function ShowcaseApp({
@@ -82,14 +94,36 @@ export function ShowcaseApp({
   canReset,
   feed,
   identityControls,
+  approvalStream,
+  runStream,
 }: ShowcaseAppProps): ReactElement {
   const narrate = feed.record;
+
+  // The workflow catalog + the SERVER-derived identity of the presented token,
+  // hoisted here because the approval dashboard reads actor?.id as its
+  // optimistic-decide attribution (actorId). The catalog EFFECT that fills these
+  // lives below (it also drives the launcher role gates + the SoD notice).
+  const [workflows, setWorkflows] = useState<WorkflowMeta[]>([]);
+  const [actor, setActor] = useState<CatalogActor | null>(null);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
+  // FIRST-load only (never resets on an actor switch, where the previous
+  // catalog stays rendered while the refetch is in flight): before it settles
+  // the launcher shows a spinner instead of an empty panel.
+  const [catalogSettled, setCatalogSettled] = useState(false);
+
+  const C = useApprovalUIComponents();
   const dashboard = useApprovalDashboard(approvalClient, {
     pollIntervalMs: 5000,
+    // Live stream (Part B): live-merge queue events + presence on top of the
+    // poll, which stays the reconciler (DL-021). actorId attributes an
+    // optimistic decide so a live 'decided' by a DIFFERENT reviewer surfaces as
+    // a conflict.
+    stream: approvalStream,
+    actorId: actor?.id,
   });
   // Bumped by a run card's "Retry live updates" after polling abandoned a run.
   const [retryNonce, setRetryNonce] = useState(0);
-  const runResults = useRunPolling(runClient, runs, retryNonce);
+  const runResults = useRunPolling(runClient, runs, retryNonce, runStream);
   const [tab, setTab] = useState('queue');
   const [batchComment, setBatchComment] = useState('');
   const [legendOpen, setLegendOpen] = useState(false);
@@ -101,16 +135,8 @@ export function ShowcaseApp({
   const [resetEpoch, setResetEpoch] = useState(0);
   const tour = useIntroTour();
 
-  // The workflow catalog + the SERVER-derived identity of the presented token.
-  // Refetches when the acting client changes (actor switch). External-data
-  // sync — a legitimate effect.
-  const [workflows, setWorkflows] = useState<WorkflowMeta[]>([]);
-  const [actor, setActor] = useState<CatalogActor | null>(null);
-  const [catalogError, setCatalogError] = useState<string | null>(null);
-  // FIRST-load only (never resets on an actor switch, where the previous
-  // catalog stays rendered while the refetch is in flight): before it settles
-  // the launcher shows a spinner instead of an empty panel.
-  const [catalogSettled, setCatalogSettled] = useState(false);
+  // Fills the catalog state hoisted above. Refetches when the acting client
+  // changes (actor switch). External-data sync — a legitimate effect.
   useEffect(() => {
     let alive = true;
     runClient
@@ -335,6 +361,17 @@ export function ShowcaseApp({
                 {dashboard.error ? (
                   <Banner status="error" title={dashboard.error} />
                 ) : null}
+                {dashboard.conflict ? (
+                  // A live 'decided' event named a different reviewer than this
+                  // tab's optimistic decide: the queue already reconciled to the
+                  // authoritative record; the toast just explains why the row
+                  // flipped. Rendered through the injected Astryx Toast slot.
+                  <C.Toast
+                    tone="warning"
+                    title={`Another reviewer decided this request first (${dashboard.conflict.actualDecider}). The queue has been reconciled.`}
+                    onDismiss={dashboard.dismissConflict}
+                  />
+                ) : null}
                 <FilterBar
                   filter={dashboard.filter}
                   onApply={dashboard.setFilter}
@@ -405,6 +442,7 @@ export function ShowcaseApp({
                     onSelect={dashboard.select}
                     selectedIds={dashboard.selectedIds}
                     onToggleSelect={dashboard.toggleSelect}
+                    presence={dashboard.presence}
                   />
                 )}
                 {selfRequested ? (
@@ -427,6 +465,7 @@ export function ShowcaseApp({
                     onClaim={dashboard.claim}
                     onDecide={dashboard.decide}
                     onDelegate={dashboard.delegate}
+                    presence={dashboard.presence}
                   />
                 ) : null}
               </VStack>

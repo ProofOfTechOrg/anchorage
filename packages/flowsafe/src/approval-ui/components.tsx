@@ -84,6 +84,15 @@ export interface SelectProps {
   onChange: (value: string) => void;
   disabled?: boolean;
 }
+export interface ToastProps {
+  tone: Tone;
+  title: ReactNode;
+  /** When set, renders a dismiss affordance that clears the surface. */
+  onDismiss?: () => void;
+}
+export interface PresenceIndicatorProps {
+  members: { actorId: string; role: string }[];
+}
 export interface MetadataListProps {
   children: ReactNode;
 }
@@ -152,6 +161,14 @@ export interface ApprovalUIComponents {
    */
   Checkbox?: (props: CheckboxProps) => ReactNode;
   Select?: (props: SelectProps) => ReactNode;
+  /**
+   * OPTIONAL live-streaming slots (M-007), same additive contract as
+   * Checkbox/Select: a full-interface adapter written before them keeps
+   * compiling, the provider merge fills them from htmlComponents, and views
+   * consume them through ResolvedApprovalUIComponents (semver-minor).
+   */
+  Toast?: (props: ToastProps) => ReactNode;
+  PresenceIndicator?: (props: PresenceIndicatorProps) => ReactNode;
   MetadataList: (props: MetadataListProps) => ReactNode;
   MetadataItem: (props: MetadataItemProps) => ReactNode;
   Code: (props: CodeProps) => ReactNode;
@@ -334,6 +351,32 @@ export const htmlComponents: ResolvedApprovalUIComponents = {
       </div>
     );
   },
+  Toast: ({ tone, title, onDismiss }) => (
+    <div role="status" className={`flowsafe-toast flowsafe-tone-${tone}`}>
+      <span className="flowsafe-toast-title">{title}</span>
+      {onDismiss ? (
+        <button
+          type="button"
+          className="flowsafe-toast-dismiss"
+          onClick={onDismiss}
+        >
+          Dismiss
+        </button>
+      ) : null}
+    </div>
+  ),
+  PresenceIndicator: ({ members }) => (
+    <ul className="flowsafe-presence" aria-label="Reviewers online">
+      {members.map((member) => (
+        <li
+          key={`${member.actorId}:${member.role}`}
+          className="flowsafe-presence-member"
+        >
+          {member.actorId} ({member.role})
+        </li>
+      ))}
+    </ul>
+  ),
   MetadataList: ({ children }) => (
     <dl className="flowsafe-metadata">{children}</dl>
   ),

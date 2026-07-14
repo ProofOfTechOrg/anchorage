@@ -15,6 +15,8 @@ import type {
   ApprovalNotificationEvent,
   ApprovalNotificationSink,
   ApprovalRole,
+  ApprovalStreamEvent,
+  ApprovalStreamSink,
 } from './contract.js';
 import { APPROVAL_ROLES, DECIDER_ROLES } from './contract.js';
 import { type ApprovalPatch, listAllApprovedForRun } from './store.js';
@@ -120,6 +122,17 @@ export interface ApprovalServiceOptions {
    * the ctx.waitUntil convention on Workers hosts.
    */
   notify?: ApprovalNotificationSink;
+  /**
+   * Live-stream fan-out seam — fired once per SUCCESSFUL mutation
+   * (create with `created: true`, claim, decide, delegate, supersede) with the
+   * POST-transition record. Distinct from `notify` (reviewer transport,
+   * created/escalated only): this is the same-trust intra-tenant feed a
+   * per-tenant hub relays to open dashboards. Fire-and-forget with the same
+   * containment as `notify`: a throwing or rejecting sink is audited as
+   * `approval.stream`/'error' and never fails the mutation. See
+   * ApprovalStreamSink (contract.ts) for the ctx.waitUntil convention.
+   */
+  stream?: ApprovalStreamSink;
   /** Applied when CreateApprovalInput.slaSeconds is absent. */
   defaultSlaSeconds?: number;
   /**
@@ -159,6 +172,7 @@ export class ApprovalService {
   readonly #store: TenantBoundApprovalStore;
   readonly #audit?: ApprovalAuditSink;
   readonly #notify?: ApprovalNotificationSink;
+  readonly #stream?: ApprovalStreamSink;
   readonly #defaultSlaSeconds?: number;
   readonly #resumeRun?: (
     record: ApprovalRecord,
@@ -171,6 +185,7 @@ export class ApprovalService {
     this.#store = options.store;
     this.#audit = options.audit;
     this.#notify = options.notify;
+    this.#stream = options.stream;
     this.#defaultSlaSeconds = options.defaultSlaSeconds;
     this.#resumeRun = options.resumeRun;
     this.#allowSelfDecision = options.allowSelfDecision;
@@ -252,6 +267,18 @@ export class ApprovalService {
             { reason, detail: { tenantId: result.record.tenantId } },
           ),
       );
+      fireStreamEvent(
+        this.#stream,
+        { type: 'created', record: result.record },
+        (reason) =>
+          this.#record(
+            actor,
+            'approval.stream',
+            `approval:${result.record.id}`,
+            'error',
+            { reason, detail: { tenantId: result.record.tenantId } },
+          ),
+      );
     }
     return result;
   }
@@ -286,6 +313,15 @@ export class ApprovalService {
       },
     });
     this.#record(actor, 'approval.claim', `approval:${id}`, 'allowed');
+    fireStreamEvent(
+      this.#stream,
+      { type: 'claimed', record: updated },
+      (reason) =>
+        this.#record(actor, 'approval.stream', `approval:${id}`, 'error', {
+          reason,
+          detail: { tenantId: updated.tenantId },
+        }),
+    );
     return updated;
   }
 
@@ -403,6 +439,18 @@ export class ApprovalService {
         ...(selfDecision ? { selfDecision: true } : {}),
       },
     });
+    // Fire the live-stream event AFTER the transition + audit and BEFORE
+    // #resume: the queue fan-out reflects the durable decision immediately,
+    // independent of whether the subsequent run resume succeeds.
+    fireStreamEvent(
+      this.#stream,
+      { type: 'decided', record: updated },
+      (reason) =>
+        this.#record(actor, 'approval.stream', `approval:${id}`, 'error', {
+          reason,
+          detail: { tenantId: updated.tenantId },
+        }),
+    );
     return { record: updated, resume: await this.#resume(updated, actor) };
   }
 
@@ -530,6 +578,17 @@ export class ApprovalService {
         runId: updated.runId,
       },
     });
+    // `reason` here is the supersede reason (method arg); the reportError arg
+    // is renamed so it does not shadow it.
+    fireStreamEvent(
+      this.#stream,
+      { type: 'superseded', record: updated },
+      (streamError) =>
+        this.#record(actor, 'approval.stream', `approval:${id}`, 'error', {
+          reason: streamError,
+          detail: { tenantId: updated.tenantId },
+        }),
+    );
     return updated;
   }
 
@@ -563,6 +622,15 @@ export class ApprovalService {
     this.#record(actor, 'approval.delegate', `approval:${id}`, 'allowed', {
       detail: { to: input.to },
     });
+    fireStreamEvent(
+      this.#stream,
+      { type: 'delegated', record: updated },
+      (reason) =>
+        this.#record(actor, 'approval.stream', `approval:${id}`, 'error', {
+          reason,
+          detail: { tenantId: updated.tenantId },
+        }),
+    );
     return updated;
   }
 
@@ -881,6 +949,33 @@ function fireNotification(
   }
 }
 
+// Containment for the live-stream seam — the SAME house fire-and-forget
+// dual-guard idiom as fireNotification: a sync throw is caught by the
+// try/catch, an async rejection by the returned promise's .catch (a bare
+// Promise.resolve(sink(event)).catch() would miss the sync throw, which is
+// evaluated before the .catch attaches). Either failure is reported through
+// the AUDIT sink (as `approval.stream`/'error') so the mutation that fired it
+// never fails. Deliberately not awaited: a host that must keep a hub publish
+// alive past the response wraps it in ctx.waitUntil itself (see
+// ApprovalStreamSink); the cron sweep collects it into pendingSends instead.
+function fireStreamEvent(
+  stream: ApprovalStreamSink | undefined,
+  event: ApprovalStreamEvent,
+  reportError: (reason: string) => void,
+): void {
+  if (!stream) return;
+  try {
+    const outcome = stream(event);
+    if (outcome) {
+      outcome.catch((error: unknown) =>
+        reportError(`stream sink rejected: ${errorMessage(error)}`),
+      );
+    }
+  } catch (error) {
+    reportError(`stream sink threw: ${errorMessage(error)}`);
+  }
+}
+
 /** Options for the cron-owned SLA sweep. */
 export interface SweepSLAOptions {
   /**
@@ -901,6 +996,16 @@ export interface SweepSLAOptions {
    * and never abort the sweep.
    */
   notify?: ApprovalNotificationSink;
+  /**
+   * Live-stream fan-out seam — fired once per escalated record, alongside
+   * onEscalation and notify. Same containment as ApprovalServiceOptions.stream:
+   * a throwing or rejecting sink is audited as `approval.stream`/'error' and
+   * never aborts the sweep. A scheduled handler has no request-scoped
+   * waitUntil, so the cron host collects each publish into its pendingSends and
+   * awaits it there (see host-kit's runSlaSweepMaintenance) — never
+   * fire-and-forget under `scheduled()`.
+   */
+  stream?: ApprovalStreamSink;
   /** Injectable clock (tests, deterministic SLA math). */
   now?: () => Date;
 }
@@ -1007,6 +1112,15 @@ export async function sweepSLA(
         { type: 'escalated', record: updated },
         (reason) =>
           record('approval.notify', `approval:${updated.id}`, 'error', {
+            reason,
+            detail: { tenantId: updated.tenantId },
+          }),
+      );
+      fireStreamEvent(
+        options.stream,
+        { type: 'escalated', record: updated },
+        (reason) =>
+          record('approval.stream', `approval:${updated.id}`, 'error', {
             reason,
             detail: { tenantId: updated.tenantId },
           }),

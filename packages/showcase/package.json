@@ -21,6 +21,7 @@
     "deploy:cf": "pnpm build && wrangler deploy",
     "test": "vitest run",
     "test:watch": "vitest",
+    "pretypecheck": "pnpm --filter @proofoftech/breakwater --filter @proofoftech/flowsafe build",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.worker.json && tsc -p tsconfig.node.json",
     "lint": "pnpm -w exec biome check packages/showcase",
     "react-doctor": "pnpm dlx github:gcharang/react-doctor#4ad50e2e8c37104c98223e6e2ab1f8bea6bd27de --scope full --verbose --blocking warning",
