@@ -1,10 +1,13 @@
 // The signed-in composition: header (wordmark + identity + explainers), the
-// intro tour, walkthrough banner, a two-column body (launch + runs | activity
-// feed + reality legend), and the approval dashboard composed from the
-// library's headless hook + views (dropping the library App shell so run
-// cards and toasts can deep-link into the queue via select()). The catalog
-// fetch lives here because the header, the SoD notice, and the launcher all
-// need the server's actor echo.
+// intro tour, and ONE narrative page — the guardrails control room on top,
+// the approval queue it hands into directly below (id=approvals-panel), then
+// runs + the workflow launcher beside the activity feed + reality legend.
+// Everything is same-page scroll: no view switch, so following the wire story
+// never strands the visitor somewhere unfamiliar. The approval dashboard is
+// composed from the library's headless hook + views (dropping the library App
+// shell so run cards and toasts can deep-link into the queue via select()).
+// The catalog fetch lives here because the header, the SoD notice, and the
+// launcher all need the server's actor echo.
 
 import { AlertDialog } from '@astryxdesign/core/AlertDialog';
 import { Banner } from '@astryxdesign/core/Banner';
@@ -13,10 +16,6 @@ import { Card } from '@astryxdesign/core/Card';
 import { Grid } from '@astryxdesign/core/Grid';
 import { Heading } from '@astryxdesign/core/Heading';
 import { HStack } from '@astryxdesign/core/HStack';
-import {
-  SegmentedControl,
-  SegmentedControlItem,
-} from '@astryxdesign/core/SegmentedControl';
 import { Spinner } from '@astryxdesign/core/Spinner';
 import { Tab, TabList } from '@astryxdesign/core/TabList';
 import { Text } from '@astryxdesign/core/Text';
@@ -40,7 +39,6 @@ import {
   type ReactNode,
   useCallback,
   useEffect,
-  useRef,
   useState,
 } from 'react';
 
@@ -130,15 +128,6 @@ export function ShowcaseApp({
   // Bumped by a run card's "Retry live updates" after polling abandoned a run.
   const [retryNonce, setRetryNonce] = useState(0);
   const runResults = useRunPolling(runClient, runs, retryNonce, runStream);
-  // The post-login landing is the guardrails control room; the six workflows
-  // live behind the Workflows nav item. Plain state — the OAuth callback owns
-  // the URL fragment, so a hash-router would fight it.
-  const [view, setView] = useState<'guardrails' | 'workflows'>('guardrails');
-  // A cross-view jump target: switching from the control room to a run/approval
-  // must wait for the Workflows view to mount before scrollTo can find it. A
-  // ref (not state) — it only cues the post-mount effect below, is never
-  // rendered, and setting it must not trigger a render.
-  const pendingScrollRef = useRef<string | null>(null);
   const [tab, setTab] = useState('queue');
   const [batchComment, setBatchComment] = useState('');
   const [legendOpen, setLegendOpen] = useState(false);
@@ -189,42 +178,18 @@ export function ShowcaseApp({
     dashboardSettled,
   );
   const select = dashboard.select;
-  // Jump to an element in the Workflows view. If already there, the target is
-  // mounted, so scroll now. Otherwise stash the target and switch views; the
-  // effect below flushes it once the Workflows subtree has mounted.
-  const jumpTo = useCallback(
-    (targetId: string) => {
-      if (view === 'workflows') {
-        scrollTo(targetId);
-      } else {
-        pendingScrollRef.current = targetId;
-        setView('workflows');
-      }
-    },
-    [view],
-  );
+  // Every jump target lives on this one page, so a jump is a plain scroll —
+  // the panel is always mounted.
   const reviewApproval = useCallback(
     (approvalId: string) => {
       select(approvalId);
-      jumpTo('approvals-panel');
+      scrollTo('approvals-panel');
     },
-    [select, jumpTo],
+    [select],
   );
-  const viewRun = useCallback(
-    (runId: string) => {
-      jumpTo(`run-${runId}`);
-    },
-    [jumpTo],
-  );
-  // Flush a pending cross-view scroll once the Workflows view is mounted.
-  // DOM-scroll sync after a conditional subtree renders (reads/clears a ref,
-  // sets no state) — a legitimate effect, not a state-update chain.
-  useEffect(() => {
-    if (view !== 'workflows' || pendingScrollRef.current === null) return;
-    const target = pendingScrollRef.current;
-    pendingScrollRef.current = null;
-    scrollTo(target);
-  }, [view]);
+  const viewRun = useCallback((runId: string) => {
+    scrollTo(`run-${runId}`);
+  }, []);
   useNarrationToasts(feed.events, {
     onReview: reviewApproval,
     onViewRun: viewRun,
@@ -301,7 +266,7 @@ export function ShowcaseApp({
             {TAGLINE}
           </Text>
         </VStack>
-        <VStack gap={1} align="end">
+        <VStack gap={1} align="end" className="anchorage-header-tools">
           <HStack gap={2} align="center" wrap="wrap">
             <Button
               label="Where things run"
@@ -337,7 +302,10 @@ export function ShowcaseApp({
       </HStack>
 
       <WhereThingsRunDialog isOpen={legendOpen} onOpenChange={setLegendOpen} />
-      <IntroTourDialog tour={tour} onStartTour={() => jumpTo('launcher')} />
+      <IntroTourDialog
+        tour={tour}
+        onStartTour={() => scrollTo('control-room')}
+      />
       <AlertDialog
         isOpen={resetOpen}
         onOpenChange={changeResetOpen}
@@ -349,16 +317,7 @@ export function ShowcaseApp({
         onAction={() => void performReset()}
       />
 
-      <SegmentedControl
-        value={view}
-        onChange={(next) => setView(next as 'guardrails' | 'workflows')}
-        label="Primary view"
-      >
-        <SegmentedControlItem value="guardrails" label="Guardrails" />
-        <SegmentedControlItem value="workflows" label="Workflows" />
-      </SegmentedControl>
-
-      {view === 'guardrails' ? (
+      <div id="control-room">
         <ControlRoom
           actor={actor}
           runClient={runClient}
@@ -366,181 +325,178 @@ export function ShowcaseApp({
           narrate={narrate}
           onReviewApproval={reviewApproval}
         />
-      ) : (
-        <>
-          <Banner
-            status="info"
-            title="Suggested path: start a run as operator → switch to reviewer → approve → watch the run resume."
-            description={
-              actor
-                ? `Currently acting as ${actor.role}.${ROLE_NOTES[actor.role] ? ` ${ROLE_NOTES[actor.role]}` : ''}`
-                : undefined
-            }
-          />
+      </div>
 
-          <Grid
-            columns={{ minWidth: 460 }}
-            gap={5}
-            className="anchorage-body-grid"
-          >
-            <VStack gap={5} id="launcher">
-              <WorkflowLauncher
-                key={resetEpoch}
-                workflows={workflows}
-                actor={actor}
-                isLoading={!catalogSettled}
-                loadError={catalogError}
-                runClient={runClient}
-                onStarted={onStarted}
-                narrate={narrate}
-              />
-              <RunCards
-                runs={runs}
-                results={runResults}
-                records={dashboard.records}
-                onReview={reviewApproval}
-                onRetryPolling={() => setRetryNonce((nonce) => nonce + 1)}
-              />
-            </VStack>
-            <VStack gap={3} className="anchorage-activity-column">
-              <ActivityFeedPanel
-                feed={feed}
-                onReview={reviewApproval}
-                onViewRun={viewRun}
-              />
-              <WhatsRealHere />
-            </VStack>
-          </Grid>
-
-          <div id="approvals-panel">
-            <Card variant="default" padding={4} aria-label="Approvals">
+      {/* The queue sits directly under the control room: the wire scenario's
+          approve action is a short same-page scroll, never a view switch. */}
+      <div id="approvals-panel">
+        <Card variant="default" padding={4} aria-label="Approvals">
+          <VStack gap={3}>
+            <Heading level={2}>Approvals</Heading>
+            <TabList value={tab} onChange={setTab}>
+              <Tab value="queue" label="Queue" />
+              <Tab value="metrics" label="Metrics" />
+            </TabList>
+            {tab === 'queue' ? (
               <VStack gap={3}>
-                <Heading level={2}>Approvals</Heading>
-                <TabList value={tab} onChange={setTab}>
-                  <Tab value="queue" label="Queue" />
-                  <Tab value="metrics" label="Metrics" />
-                </TabList>
-                {tab === 'queue' ? (
-                  <VStack gap={3}>
-                    {dashboard.error ? (
-                      <Banner status="error" title={dashboard.error} />
-                    ) : null}
-                    {dashboard.conflict ? (
-                      // A live 'decided' event named a different reviewer than this
-                      // tab's optimistic decide: the queue already reconciled to the
-                      // authoritative record; the toast just explains why the row
-                      // flipped. Rendered through the injected Astryx Toast slot.
-                      <C.Toast
-                        tone="warning"
-                        title={`Another reviewer decided this request first (${dashboard.conflict.actualDecider}). The queue has been reconciled.`}
-                        onDismiss={dashboard.dismissConflict}
-                      />
-                    ) : null}
-                    <FilterBar
-                      filter={dashboard.filter}
-                      onApply={dashboard.setFilter}
-                      disabled={dashboard.busy}
+                {dashboard.error ? (
+                  <Banner status="error" title={dashboard.error} />
+                ) : null}
+                {dashboard.conflict ? (
+                  // A live 'decided' event named a different reviewer than this
+                  // tab's optimistic decide: the queue already reconciled to the
+                  // authoritative record; the toast just explains why the row
+                  // flipped. Rendered through the injected Astryx Toast slot.
+                  <C.Toast
+                    tone="warning"
+                    title={`Another reviewer decided this request first (${dashboard.conflict.actualDecider}). The queue has been reconciled.`}
+                    onDismiss={dashboard.dismissConflict}
+                  />
+                ) : null}
+                <FilterBar
+                  filter={dashboard.filter}
+                  onApply={dashboard.setFilter}
+                  disabled={dashboard.busy}
+                />
+                {dashboard.lastBatch && dashboard.lastBatch.failed > 0 ? (
+                  <Banner
+                    status="warning"
+                    title={`Batch decide: ${dashboard.lastBatch.decided} decided · ${dashboard.lastBatch.failed} failed`}
+                    description={dashboard.lastBatch.results
+                      .flatMap((item) =>
+                        item.ok
+                          ? []
+                          : [
+                              `${shortId(item.id)}: ${item.error ?? item.code ?? 'failed'}`,
+                            ],
+                      )
+                      .join(' · ')}
+                  />
+                ) : null}
+                {dashboard.selectedIds.length > 0 ? (
+                  <HStack gap={2} align="end" wrap="wrap">
+                    <Text size="sm">
+                      {dashboard.selectedIds.length} selected
+                    </Text>
+                    <TextInput
+                      label="Batch comment"
+                      value={batchComment}
+                      onChange={setBatchComment}
+                      isDisabled={dashboard.busy}
                     />
-                    {dashboard.lastBatch && dashboard.lastBatch.failed > 0 ? (
-                      <Banner
-                        status="warning"
-                        title={`Batch decide: ${dashboard.lastBatch.decided} decided · ${dashboard.lastBatch.failed} failed`}
-                        description={dashboard.lastBatch.results
-                          .flatMap((item) =>
-                            item.ok
-                              ? []
-                              : [
-                                  `${shortId(item.id)}: ${item.error ?? item.code ?? 'failed'}`,
-                                ],
-                          )
-                          .join(' · ')}
-                      />
-                    ) : null}
-                    {dashboard.selectedIds.length > 0 ? (
-                      <HStack gap={2} align="end" wrap="wrap">
-                        <Text size="sm">
-                          {dashboard.selectedIds.length} selected
-                        </Text>
-                        <TextInput
-                          label="Batch comment"
-                          value={batchComment}
-                          onChange={setBatchComment}
-                          isDisabled={dashboard.busy}
-                        />
-                        <Button
-                          label="Approve selected"
-                          variant="primary"
-                          isDisabled={dashboard.busy}
-                          onClick={() => {
-                            dashboard.decideSelected('approve', batchComment);
-                            setBatchComment('');
-                          }}
-                        />
-                        <Button
-                          label="Reject selected"
-                          variant="destructive"
-                          isDisabled={dashboard.busy}
-                          onClick={() => {
-                            dashboard.decideSelected('reject', batchComment);
-                            setBatchComment('');
-                          }}
-                        />
-                        <Button
-                          label="Clear selection"
-                          variant="ghost"
-                          isDisabled={dashboard.busy}
-                          onClick={dashboard.clearSelection}
-                        />
-                      </HStack>
-                    ) : null}
-                    {!dashboardSettled ? (
-                      // Before the first poll settles the queue is UNKNOWN, not
-                      // empty — mirror MetricsView's loading spinner instead of
-                      // claiming "no approval requests".
-                      <Spinner label="Loading the approval queue…" />
-                    ) : (
-                      <QueueView
-                        records={dashboard.records}
-                        nowMs={dashboard.nowMs}
-                        selectedId={dashboard.selectedId}
-                        onSelect={dashboard.select}
-                        selectedIds={dashboard.selectedIds}
-                        onToggleSelect={dashboard.toggleSelect}
-                        presence={dashboard.presence}
-                      />
-                    )}
-                    {selfRequested ? (
-                      <Banner
-                        status="info"
-                        title={
-                          canSelfDecide
-                            ? 'You advanced this run into its gate. This deployment lets your role decide its own requests, so you can approve it here.'
-                            : 'Separation of duties: you advanced this run into its gate, so the server will refuse your decision (403). Switch to a different reviewer or to admin to decide it.'
-                        }
-                        description={GLOSSARY.sod}
-                      />
-                    ) : null}
-                    {selected ? (
-                      <DetailView
-                        key={selected.id}
-                        record={selected}
-                        nowMs={dashboard.nowMs}
-                        busy={dashboard.busy}
-                        onClaim={dashboard.claim}
-                        onDecide={dashboard.decide}
-                        onDelegate={dashboard.delegate}
-                        presence={dashboard.presence}
-                      />
-                    ) : null}
-                  </VStack>
+                    <Button
+                      label="Approve selected"
+                      variant="primary"
+                      isDisabled={dashboard.busy}
+                      onClick={() => {
+                        dashboard.decideSelected('approve', batchComment);
+                        setBatchComment('');
+                      }}
+                    />
+                    <Button
+                      label="Reject selected"
+                      variant="destructive"
+                      isDisabled={dashboard.busy}
+                      onClick={() => {
+                        dashboard.decideSelected('reject', batchComment);
+                        setBatchComment('');
+                      }}
+                    />
+                    <Button
+                      label="Clear selection"
+                      variant="ghost"
+                      isDisabled={dashboard.busy}
+                      onClick={dashboard.clearSelection}
+                    />
+                  </HStack>
+                ) : null}
+                {!dashboardSettled ? (
+                  // Before the first poll settles the queue is UNKNOWN, not
+                  // empty — mirror MetricsView's loading spinner instead of
+                  // claiming "no approval requests".
+                  <Spinner label="Loading the approval queue…" />
                 ) : (
-                  <MetricsView metrics={dashboard.metrics} />
+                  <QueueView
+                    records={dashboard.records}
+                    nowMs={dashboard.nowMs}
+                    selectedId={dashboard.selectedId}
+                    onSelect={dashboard.select}
+                    selectedIds={dashboard.selectedIds}
+                    onToggleSelect={dashboard.toggleSelect}
+                    presence={dashboard.presence}
+                  />
                 )}
+                {selfRequested ? (
+                  <Banner
+                    status="info"
+                    title={
+                      canSelfDecide
+                        ? 'You advanced this run into its gate. This deployment lets your role decide its own requests, so you can approve it here.'
+                        : 'Separation of duties: you advanced this run into its gate, so the server will refuse your decision (403). Switch to a different reviewer or to admin to decide it.'
+                    }
+                    description={GLOSSARY.sod}
+                  />
+                ) : null}
+                {selected ? (
+                  <DetailView
+                    key={selected.id}
+                    record={selected}
+                    nowMs={dashboard.nowMs}
+                    busy={dashboard.busy}
+                    onClaim={dashboard.claim}
+                    onDecide={dashboard.decide}
+                    onDelegate={dashboard.delegate}
+                    presence={dashboard.presence}
+                  />
+                ) : null}
               </VStack>
-            </Card>
-          </div>
-        </>
-      )}
+            ) : (
+              <MetricsView metrics={dashboard.metrics} />
+            )}
+          </VStack>
+        </Card>
+      </div>
+
+      <Grid columns={{ minWidth: 460 }} gap={5} className="anchorage-body-grid">
+        <VStack gap={5}>
+          <RunCards
+            runs={runs}
+            results={runResults}
+            records={dashboard.records}
+            onReview={reviewApproval}
+            onRetryPolling={() => setRetryNonce((nonce) => nonce + 1)}
+          />
+          <VStack gap={3}>
+            <Banner
+              status="info"
+              title="Suggested path: start a run as operator → switch to reviewer → approve → watch the run resume."
+              description={
+                actor
+                  ? `Currently acting as ${actor.role}.${ROLE_NOTES[actor.role] ? ` ${ROLE_NOTES[actor.role]}` : ''}`
+                  : undefined
+              }
+            />
+            <WorkflowLauncher
+              key={resetEpoch}
+              workflows={workflows}
+              actor={actor}
+              isLoading={!catalogSettled}
+              loadError={catalogError}
+              runClient={runClient}
+              onStarted={onStarted}
+              narrate={narrate}
+            />
+          </VStack>
+        </VStack>
+        <VStack gap={3} className="anchorage-activity-column">
+          <ActivityFeedPanel
+            feed={feed}
+            onReview={reviewApproval}
+            onViewRun={viewRun}
+          />
+          <WhatsRealHere />
+        </VStack>
+      </Grid>
 
       <Text size="sm" color="secondary">
         Anchorage demo: flowsafe + breakwater running on Cloudflare Workers,

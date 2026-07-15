@@ -68,6 +68,32 @@ body {
   }
 }
 
+/* Narrow viewports: intrinsic-width controls must clamp to their container
+   instead of pushing past the body's overflow-x clip, which cuts them off with
+   no way to scroll them into reach. Scoped tight to the two offenders. The
+   header's right column otherwise sizes to max-content (align-items:end
+   removes stretch, so its wrapping rows never see a constraint), and the role
+   SegmentedControl cannot shrink below its label row — inside the clamped
+   column it scrolls itself instead of pushing the page wide. The approvals
+   fields (Astryx TextInput ships a fixed default width; Selector sizes to its
+   longest option) clamp so the now-wrapping filter/batch rows fit phones. */
+[data-astryx-theme="y2k"] .anchorage-header-tools,
+[data-astryx-theme="y2k"] .anchorage-header-tools .astryx-stack {
+  /* The nested stacks too: align-items:end sizes each row to max-content, so
+     without its own cap a row overflows the already-clamped column. */
+  max-width: 100%;
+}
+[data-astryx-theme="y2k"] .anchorage-header-tools .astryx-segmented-control {
+  max-width: 100%;
+  overflow-x: auto;
+}
+[data-astryx-theme="y2k"] #approvals-panel .astryx-field,
+[data-astryx-theme="y2k"] #approvals-panel .astryx-text-input,
+[data-astryx-theme="y2k"] #approvals-panel .astryx-selector {
+  max-width: 100%;
+  min-width: 0;
+}
+
 /* Selected launcher card: a high-contrast accent ring plus an outer glow, so
    the picked workflow reads clearly against the near-borderless pastel tiles
    (Astryx's stock selected state is a low-contrast same-hue inset ring). This

@@ -186,6 +186,25 @@ byte-identical); tenant-isolated on INV-1 (run channel) and id.name==tenantId
 (hub); polling retained as fallback + queue reconciler (flowsafe minor). Neither
 part changes the `ApprovalRecord` shape or any existing signature.
 
+Guardrails control room + one-page demo (control room merged 2026-07-14,
+PR #21; page unified 2026-07-15): the post-login showcase is ONE narrative
+page. On top, the control room (`packages/showcase/src/control-room/`) —
+seven client-side scenarios whose DOM-free engine drives REAL breakwater
+(policy engine, RBAC, tool-policy evaluators) over scripted token streams, no
+run budget spent, plus the server-backed wire-transfer card (hoisted run
+state; starts a real DO run). Directly below it the approvals dashboard
+(`#approvals-panel`), then runs + the six-workflow launcher beside the
+activity feed. The former Guardrails/Workflows SegmentedControl split is
+GONE — the wire card's approve action and every toast/run-card jump is a
+same-page scroll, so the wire story never dumps the visitor into an
+unfamiliar view. Tinted SelectableCard grids take toned ink from
+`src/card-ink.ts` (fixes near-white-on-pastel titles in dark mode — the y2k
+tints keep one light hex in both modes); the approval-ui slot adapter's
+horizontal `Stack` wraps (unwrapped, the FilterBar overflowed past the page's
+`overflow-x: clip` and its tail controls were unreachable); scoped
+`index.css` clamps keep the header identity tools and approvals fields inside
+phone viewports (the role SegmentedControl scrolls itself).
+
 Verification gate: `pnpm lint && pnpm typecheck && pnpm test && pnpm build`
 (1399+ tests; lint is ONE root Biome 2 pass, test is ONE root vitest run over
 every package via `test.projects`). CI adds the full react-doctor gate
