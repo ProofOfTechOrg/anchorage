@@ -1,11 +1,11 @@
-// The guardrails control room: the flagship view a visitor lands on after
+// The guardrails control room: the flagship section a visitor lands on after
 // sign-in. Pick an attack/abuse scenario; the guarded agent streams on the
 // left while the control plane on the right fills with the REAL breakwater
-// decisions the scenario triggered (audit records, the blocking layer). Six
+// decisions the scenario triggered (audit records, the blocking layer). Seven
 // scenarios run the published library in this tab (deterministic, no run-cap
 // cost); the wire-transfer scenario starts a real durable run and hands off to
-// the approval queue in the Workflows view — real approval infrastructure, not
-// a simulation of it.
+// the approval queue further down the same page — real approval
+// infrastructure, not a simulation of it.
 
 import { Badge, type BadgeVariant } from '@astryxdesign/core/Badge';
 import { Banner } from '@astryxdesign/core/Banner';
@@ -30,6 +30,7 @@ import {
   useRef,
   useState,
 } from 'react';
+import { cardInkMap } from '@/card-ink';
 import type { EngineEvent, GuardrailLayer } from '@/control-room/engine';
 import { type GuardrailScenario, SCENARIOS } from '@/control-room/scenarios';
 import { GLOSSARY } from '@/glossary';
@@ -379,7 +380,7 @@ function WireScenarioPanel({
       <HStack gap={2} align="center" wrap="wrap">
         {state === 'suspended' && approvalId ? (
           <Button
-            label="Approve this wire in the queue →"
+            label="Approve in the queue below ↓"
             variant="primary"
             onClick={() => onReviewApproval(approvalId)}
           />
@@ -389,7 +390,12 @@ function WireScenarioPanel({
             variant="primary"
             onClick={onStart}
             isLoading={state === 'starting'}
-            isDisabled={state === 'starting' || !canStart}
+            // 'suspended' also disables: a suspended response that carried no
+            // approval id would otherwise fall through to an ENABLED start
+            // button, and a click would fire a second real run at the cap.
+            isDisabled={
+              state === 'starting' || state === 'suspended' || !canStart
+            }
           />
         )}
         {!canStart && actor !== null ? (
@@ -429,6 +435,10 @@ const SCENARIO_VARIANT: Record<string, CardVariant> = {
   'tenant-isolation': 'yellow',
   'wire-transfer': 'cyan',
 };
+
+// Matched dark ink per tinted card — without it the theme's near-white
+// dark-mode text lands on the pastel tints and the titles wash out.
+const SCENARIO_INK = cardInkMap(SCENARIO_VARIANT);
 
 export function ControlRoom({
   actor,
@@ -478,8 +488,8 @@ export function ControlRoom({
   // and the sleep guard drop writes from an abandoned run, so an in-flight
   // stream cannot bleed into the newly selected scenario.
   const genRef = useRef(0);
-  // Abandon any in-flight scenario run when the control room unmounts (a
-  // Guardrails→Workflows nav switch), so an orphaned run stops making real
+  // Abandon any in-flight scenario run when the control room unmounts (sign-
+  // out tears down the app), so an orphaned run stops making real
   // PolicyEngine/audit calls into a detached instance. A mounted flag (not a
   // genRef bump) so the cleanup writes a constant instead of reading the
   // ever-changing genRef; live() below folds it in. Re-set true on mount for
@@ -604,6 +614,7 @@ export function ControlRoom({
             key={card.id}
             label={card.title}
             variant={SCENARIO_VARIANT[card.id] ?? 'default'}
+            style={SCENARIO_INK[card.id]}
             padding={3}
             isSelected={card.id === selectedId}
             onChange={(isSelected) => {

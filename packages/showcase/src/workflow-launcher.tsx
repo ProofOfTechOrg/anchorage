@@ -19,8 +19,9 @@ import { TextArea } from '@astryxdesign/core/TextArea';
 import { Token } from '@astryxdesign/core/Token';
 import { Tooltip } from '@astryxdesign/core/Tooltip';
 import { VStack } from '@astryxdesign/core/VStack';
-import { type CSSProperties, type ReactElement, useState } from 'react';
+import { type ReactElement, useState } from 'react';
 
+import { cardInkMap } from '@/card-ink';
 import { claimableSteps, GLOSSARY, WORKFLOW_GUIDES } from '@/glossary';
 import { type NarrationEvent, startErrorEvent, startEvent } from '@/narration';
 import type { CatalogActor, RunClient, WorkflowMeta } from '@/run-client';
@@ -37,38 +38,7 @@ const CARD_VARIANTS: Record<string, CardVariant> = {
   'access-request': 'pink',
 };
 
-/** The Card variants that tint their background and ship a matched text var. */
-const UNTONED_VARIANTS: readonly CardVariant[] = [
-  'default',
-  'transparent',
-  'muted',
-];
-
-/**
- * Toned ink for a tinted variant. The y2k card tints keep the SAME light hex
- * in dark mode, but --color-text-primary flips to near-white there — so an
- * unstyled card title renders near-white on pastel. Re-point the text vars at
- * the variant's matched --color-text-<variant> (dark in BOTH modes — the
- * theme's own Banner/Token pairing), and set `color` so the hover overlay's
- * currentColor tint stays dark-on-pastel too. Custom properties, not a bare
- * color: the theme styles Text via `color: var(--color-text-primary)`.
- * Mode-aware variants keep the theme's own ink.
- */
-function cardInk(variant: CardVariant): CSSProperties | undefined {
-  if (UNTONED_VARIANTS.includes(variant)) return undefined;
-  const ink = `var(--color-text-${variant})`;
-  return {
-    color: ink,
-    '--color-text-primary': ink,
-    '--color-text-secondary': ink,
-  } as CSSProperties;
-}
-
-// DERIVED from CARD_VARIANTS, never hand-repeated: a parallel id→tone map
-// would silently drift on a recolor and reinstate the wash-out this fixes.
-const CARD_INK: Record<string, CSSProperties | undefined> = Object.fromEntries(
-  Object.entries(CARD_VARIANTS).map(([id, variant]) => [id, cardInk(variant)]),
-);
+const CARD_INK = cardInkMap(CARD_VARIANTS);
 
 export function WorkflowLauncher({
   workflows,

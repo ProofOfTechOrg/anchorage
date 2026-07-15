@@ -78,7 +78,14 @@ type AstryxRow = ApprovalRecord & Record<string, unknown>;
 
 export const astryxComponents: ApprovalUIComponents = {
   Stack: ({ direction = 'vertical', gap = 'md', children }) => (
-    <AstryxStack direction={direction} gap={GAP[gap]}>
+    // Horizontal rows must reflow: the library's FilterBar puts six fields +
+    // two buttons in one Stack, which unwrapped overflows past the page's
+    // overflow-x clip and leaves the tail controls unreachable.
+    <AstryxStack
+      direction={direction}
+      gap={GAP[gap]}
+      wrap={direction === 'horizontal' ? 'wrap' : undefined}
+    >
       {children}
     </AstryxStack>
   ),
