@@ -14,6 +14,14 @@
 @import "@astryxdesign/core/astryx.css";
 @import "@astryxdesign/theme-y2k/theme.css";
 
+html {
+  /* Kill the page rubber-band: a wheel/touch past the top or bottom must not
+     bounce the whole document (the "overscroll" the demo showed on trackpads
+     and touch). The bounded scroll panes already set overscroll-behavior:
+     contain; this covers the page itself. */
+  overscroll-behavior-y: none;
+}
+
 body {
   margin: 0;
   min-height: 100vh;
@@ -22,6 +30,29 @@ body {
      The tokens resolve because <html> carries data-astryx-theme. */
   background-color: var(--color-background-body);
   font-family: var(--font-family-body, sans-serif);
+  /* Belt-and-suspenders: no view should ever scroll sideways. The grid clamp
+     below removes the real cause; this stops any long unbroken token (a runId,
+     a URL in a scenario) from re-introducing horizontal scroll. `clip` (not
+     `hidden`) because `overflow-x: hidden` computes `overflow-y` to `auto`,
+     turning <body> into a scroll container and breaking the sticky activity
+     column; `clip` clips without establishing a scroll container. */
+  overflow-x: clip;
+}
+
+/* Astryx's Grid emits `repeat(auto-fill, minmax(<minWidth>px, 1fr))` with no
+   lower clamp, so a column whose minWidth exceeds the available width forces a
+   track wider than its container — horizontal overflow on phones, and worse
+   inside a padded Card. Re-point the SAME template through `min(<minWidth>,
+   100%)` so a narrow container collapses the track to its own width (one full
+   column) instead of overflowing. Astryx sets grid-template-columns through a
+   single-class stylex rule; this `[attr] .class` selector is (0,2,0) > (0,1,0),
+   so it wins the cascade without !important. One rule per distinct minWidth
+   these app grids use. */
+[data-astryx-theme="y2k"] .anchorage-body-grid {
+  grid-template-columns: repeat(auto-fill, minmax(min(460px, 100%), 1fr));
+}
+[data-astryx-theme="y2k"] .anchorage-pane-grid {
+  grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr));
 }
 
 /* Desktop: pin the activity column while the runs column grows — the feed's
@@ -44,10 +75,13 @@ body {
    specificity — meaning its box-shadow REPLACES Astryx's, so the inset ring is
    restated here (now in --color-accent) alongside the outer --shadow-med.
    Tokens, not hex, so light and dark both stay correct; scoped to the launcher
-   grid so other SelectableCards keep the stock look. Focus outline is a
-   separate property and is unaffected. */
+   and control-room scenario grids so other SelectableCards keep the stock look.
+   Focus outline is a separate property and is unaffected. */
 [data-astryx-theme="y2k"]
   .anchorage-launcher-grid
+  .astryx-selectable-card[data-selected="true"],
+[data-astryx-theme="y2k"]
+  .anchorage-scenario-grid
   .astryx-selectable-card[data-selected="true"] {
   border-color: var(--color-accent);
   box-shadow:

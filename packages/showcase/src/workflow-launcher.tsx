@@ -24,19 +24,12 @@ import { type CSSProperties, type ReactElement, useState } from 'react';
 import { claimableSteps, GLOSSARY, WORKFLOW_GUIDES } from '@/glossary';
 import { type NarrationEvent, startErrorEvent, startEvent } from '@/narration';
 import type { CatalogActor, RunClient, WorkflowMeta } from '@/run-client';
+import { RUN_START_ROLES } from '@/run-roles';
 import type { RunEntry } from '@/use-run-polling';
-
-/**
- * Roles allowed to START any workflow — the host's coarse start-role gate,
- * applied to POST /runs before any per-workflow allowedRoles check. Mirrors
- * RUN_START_ROLES in ../../src/approval-api/contract.ts BY VALUE: the app
- * consumes the approval-ui (browser) subpackage and does not reach into the
- * approval-api (server) subpackage's internal modules.
- */
-const RUN_START_ROLES: readonly string[] = ['admin', 'operator', 'builder'];
 
 /** One y2k categorical card color per workflow; unknown ids stay neutral. */
 const CARD_VARIANTS: Record<string, CardVariant> = {
+  'wire-transfer': 'cyan',
   'gtm-outbound': 'blue',
   'content-pipeline': 'purple',
   'lead-generation': 'green',

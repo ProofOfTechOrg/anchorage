@@ -7,8 +7,10 @@ Instructions for Claude Code when working in this repository.
 Roadmap Phases 1-4 implemented (see `mvp-roadmap.md`, gitignored/local-only).
 Pinned to `@mastra/core` 1.50.0. Both libraries are published to npm at
 **0.2.0**. CI (`.github/workflows/ci.yml`) runs the verification gate + the
-react-18 peer-floor probe + the full react-doctor gate + `spike:verify` on
-push/PR to `main` and `dev`. Phases 1-3:
+react-18 peer-floor probe + the full react-doctor gate + `spike:verify`, plus
+the non-blocking `mastra-compat` canary (library suites against the newest
+core 1.x; `continue-on-error`, so red there = investigate before release, not
+a merge gate), on push/PR to `main` and `dev`. Phases 1-3:
 
 - breakwater: `PolicyEngine` + `RBACMiddleware` as real Mastra processors,
   `AuditLogger` shared sink (own module `src/audit/`, re-exported from
@@ -315,7 +317,7 @@ users); GitHub stays a config-only fallback.
 | `CONTRIBUTING.md` | Setup, workflow, and PR guidelines | Preparing a PR, first-time setup |
 | `LICENSE` | Apache-2.0 license text | Licensing questions |
 | `SECURITY.md` | Vulnerability reporting (GitHub private advisories) + scope | Reporting or triaging a security issue |
-| `.github/workflows/ci.yml` | CI — verification gate + react-18 peer-floor probe (`typecheck:react18`, after Build) + react-doctor full gate + `spike:verify` on push/PR to `main`/`dev` | Changing CI, debugging a failed check |
+| `.github/workflows/ci.yml` | CI — verification gate + react-18 peer-floor probe (`typecheck:react18`, after Build) + react-doctor full gate + `spike:verify`, plus the non-blocking `mastra-compat` canary (newest core 1.x; its update step alone disables the release-age gate) on push/PR to `main`/`dev` | Changing CI, debugging a failed check |
 | `.github/workflows/version.yml` | Bump-on-dev half of the release flow: on push to `dev`, maintains the standing "Version Packages" PR against dev (version bumps + changelogs on the integration branch; no-op without pending changesets) | Changing how versions are proposed |
 | `.github/workflows/release.yml` | Publish half: on push to `main`, refuses pending changesets (freeze-window tripwire), then publishes unpublished versions to npm with provenance + tags + GitHub releases (needs the `NPM_TOKEN` secret). Never opens PRs or commits to main | Changing the publish pipeline, debugging a failed release |
 | `.changeset/` | Changesets config (`config.json`: public access, `dev` base) + contributor how-to (`README.md`); pending changesets live here between releases | Adding a changeset, changing versioning behavior |

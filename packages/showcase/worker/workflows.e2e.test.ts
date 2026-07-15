@@ -1,9 +1,10 @@
-// Per-workflow regression guards for the four non-gtm showcase modules, driven
+// Per-workflow regression guards for the five non-gtm showcase modules, driven
 // in-process on the real Anchorage seams (DO runner + approval queue + host-kit
 // bridge + breakwater connectors) with in-memory stores. Proves each module's
 // distinctive capability end to end: content-pipeline parallel fan-in + R2
 // write, lead-generation branch routing, product-launch's two gates re-queued
-// through host-kit, access-request's grant + cross-workflow isolation denial.
+// through host-kit, access-request's grant + cross-workflow isolation denial,
+// wire-transfer's approve/reject/forged-resume triple.
 // gtm-outbound keeps its own guard in worker.e2e.test.ts.
 
 import { InMemoryStore } from '@mastra/core/storage';
@@ -30,6 +31,7 @@ import { ACCESS_CONNECTOR } from '#worker/workflows/access-request';
 import { PUBLISH_CONNECTOR } from '#worker/workflows/content-pipeline';
 import { CRM_ASSIGN_CONNECTOR } from '#worker/workflows/lead-generation';
 import { DEPLOY_CONNECTOR } from '#worker/workflows/product-launch';
+import { WIRE_CONNECTOR } from '#worker/workflows/wire-transfer';
 
 const SYSTEM: ApprovalActor = { id: 'sys', role: 'operator', tenantId: 'demo' };
 const REVIEWER: ApprovalActor = {
@@ -399,6 +401,139 @@ describe('access-request: gated grant with cross-workflow isolation', () => {
   });
 });
 
+describe('wire-transfer: gated payment release', () => {
+  const WIRE_INPUT = {
+    amount: 25000,
+    currency: 'USD',
+    beneficiary: 'Northwind Metals Ltd',
+    reference: 'INV-2311',
+  };
+
+  it('releases the wire on approve, through the granted connector', async () => {
+    // #given — the run suspends at the approval gate with the amount in the reason
+    const harness = buildHarness();
+    const started = await harness.runtime.start('wire-transfer', {
+      runId: `demo_${crypto.randomUUID()}`,
+      inputData: WIRE_INPUT,
+    });
+    expect(started.status).toBe('suspended');
+    expect(started.suspended).toEqual([['approveTransfer']]);
+    const payload = started.suspendPayload as {
+      approveTransfer: { reason: string; connectors: string[] };
+    };
+    expect(payload.approveTransfer.reason).toContain('USD 25000');
+    expect(payload.approveTransfer.reason).toContain('high value');
+    expect(payload.approveTransfer.connectors).toEqual([WIRE_CONNECTOR]);
+
+    // #when — a reviewer approves
+    const decided = await decideCurrent(
+      harness,
+      'wire-transfer',
+      started,
+      REVIEWER,
+    );
+
+    // #then — the release connector ran under the minted grant (simulated rail)
+    const summary = decided.resume.summary as RunSummary;
+    expect(summary.status).toBe('success');
+    expect(summary.result).toMatchObject({
+      released: true,
+      confirmation: 'sim-inv-2311',
+      reference: 'INV-2311',
+    });
+    expect(harness.audit.events()).toContainEqual(
+      expect.objectContaining({
+        resource: WIRE_CONNECTOR,
+        decision: 'allowed',
+      }),
+    );
+  });
+
+  it('flags high value at the inclusive 10000 boundary, not below it', async () => {
+    // #given — the threshold is `amount >= 10000` (inclusive)
+    const harness = buildHarness();
+
+    // #when — exactly at the boundary
+    const at = await harness.runtime.start('wire-transfer', {
+      runId: `demo_${crypto.randomUUID()}`,
+      inputData: { ...WIRE_INPUT, amount: 10000 },
+    });
+    // #then — flagged
+    expect(
+      (at.suspendPayload as { approveTransfer: { reason: string } })
+        .approveTransfer.reason,
+    ).toContain('high value');
+
+    // #when — one below the boundary
+    const below = await harness.runtime.start('wire-transfer', {
+      runId: `demo_${crypto.randomUUID()}`,
+      inputData: { ...WIRE_INPUT, amount: 9999 },
+    });
+    // #then — NOT flagged (off-by-one would flag everything)
+    expect(
+      (below.suspendPayload as { approveTransfer: { reason: string } })
+        .approveTransfer.reason,
+    ).not.toContain('high value');
+  });
+
+  it('a rejection resumes to a clean stop without calling the connector', async () => {
+    // #given
+    const harness = buildHarness();
+    const started = await harness.runtime.start('wire-transfer', {
+      runId: `demo_${crypto.randomUUID()}`,
+      inputData: WIRE_INPUT,
+    });
+
+    // #when — the reviewer rejects
+    const decided = await decideCurrent(
+      harness,
+      'wire-transfer',
+      started,
+      REVIEWER,
+      'reject',
+    );
+
+    // #then — declined result, and the wire connector never fired
+    const summary = decided.resume.summary as RunSummary;
+    expect(summary.status).toBe('success');
+    expect(summary.result).toMatchObject({
+      released: false,
+      reference: 'INV-2311',
+    });
+    expect(
+      harness.audit.events().some((e) => e.resource === WIRE_CONNECTOR),
+    ).toBe(false);
+  });
+
+  it('fails closed: a forged approved:true resume finds no grant', async () => {
+    // #given — a suspended run nobody approved
+    const harness = buildHarness();
+    const started = await harness.runtime.start('wire-transfer', {
+      runId: `demo_${crypto.randomUUID()}`,
+      inputData: WIRE_INPUT,
+    });
+
+    // #when — the resume forges approval in the payload
+    const forged = await harness.runtime.resume(
+      'wire-transfer',
+      started.runId,
+      {
+        step: 'approveTransfer',
+        resumeData: { approved: true },
+      },
+    );
+
+    // #then — the write gate denies (no APPROVED record, so no grant was minted)
+    expect(forged.status).toBe('failed');
+    expect(harness.audit.events()).toContainEqual(
+      expect.objectContaining({
+        resource: WIRE_CONNECTOR,
+        decision: 'denied',
+      }),
+    );
+  });
+});
+
 describe('tenant isolation: scope-less connector calls are denied, not silently shared', () => {
   // The runtime mints breakwater's isolation scope from the INV-1 runId
   // prefix; a runId without one (path-safe, but no `${tenant}_` shape) mints
@@ -507,7 +642,7 @@ describe('showcase run routes', () => {
     targetScope: 'access-request',
   };
 
-  it('serves all five workflow metas at GET /workflows', async () => {
+  it('serves all six workflow metas at GET /workflows', async () => {
     // #given
     const harness = buildHarness();
     const handle = routerFor(harness, {
@@ -532,6 +667,7 @@ describe('showcase run routes', () => {
       'lead-generation',
       'product-launch',
       'access-request',
+      'wire-transfer',
     ]);
   });
 

@@ -133,7 +133,7 @@ export function interpretRunResult(result: unknown): ResultInterpretation {
     );
   const outcome = typeof r.outcome === 'string' ? r.outcome : undefined;
 
-  if (outcome === 'declined' || r.granted === false) {
+  if (outcome === 'declined' || r.granted === false || r.released === false) {
     return {
       flavor: 'declined',
       replayed,
@@ -155,7 +155,7 @@ export function interpretRunResult(result: unknown): ResultInterpretation {
       line: `Published to the sandbox artifact store${key}. In production this write goes to R2.`,
     };
   }
-  if (outcome === 'simulated') {
+  if (outcome === 'simulated' || r.released === true) {
     return {
       flavor: 'simulated',
       replayed,
