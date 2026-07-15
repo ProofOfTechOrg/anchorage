@@ -1,10 +1,13 @@
 // The signed-in composition: header (wordmark + identity + explainers), the
-// intro tour, walkthrough banner, a two-column body (launch + runs | activity
-// feed + reality legend), and the approval dashboard composed from the
-// library's headless hook + views (dropping the library App shell so run
-// cards and toasts can deep-link into the queue via select()). The catalog
-// fetch lives here because the header, the SoD notice, and the launcher all
-// need the server's actor echo.
+// intro tour, and ONE narrative page — the guardrails control room on top,
+// the approval queue it hands into directly below (id=approvals-panel), then
+// runs + the workflow launcher beside the activity feed + reality legend.
+// Everything is same-page scroll: no view switch, so following the wire story
+// never strands the visitor somewhere unfamiliar. The approval dashboard is
+// composed from the library's headless hook + views (dropping the library App
+// shell so run cards and toasts can deep-link into the queue via select()).
+// The catalog fetch lives here because the header, the SoD notice, and the
+// launcher all need the server's actor echo.
 
 import { AlertDialog } from '@astryxdesign/core/AlertDialog';
 import { Banner } from '@astryxdesign/core/Banner';
@@ -41,6 +44,7 @@ import {
 
 import { ActivityFeedPanel } from '@/activity-feed';
 import { WhatsRealHere, WhereThingsRunDialog } from '@/architecture-legend';
+import { ControlRoom } from '@/control-room/control-room';
 import { GLOSSARY, ROLE_NOTES, TAGLINE } from '@/glossary';
 import { IntroTourDialog, useIntroTour } from '@/intro-tour';
 import { resetErrorEvent, resetEvent, shortId } from '@/narration';
@@ -174,6 +178,8 @@ export function ShowcaseApp({
     dashboardSettled,
   );
   const select = dashboard.select;
+  // Every jump target lives on this one page, so a jump is a plain scroll —
+  // the panel is always mounted.
   const reviewApproval = useCallback(
     (approvalId: string) => {
       select(approvalId);
@@ -260,7 +266,7 @@ export function ShowcaseApp({
             {TAGLINE}
           </Text>
         </VStack>
-        <VStack gap={1} align="end">
+        <VStack gap={1} align="end" className="anchorage-header-tools">
           <HStack gap={2} align="center" wrap="wrap">
             <Button
               label="Where things run"
@@ -296,7 +302,10 @@ export function ShowcaseApp({
       </HStack>
 
       <WhereThingsRunDialog isOpen={legendOpen} onOpenChange={setLegendOpen} />
-      <IntroTourDialog tour={tour} onStartTour={() => scrollTo('launcher')} />
+      <IntroTourDialog
+        tour={tour}
+        onStartTour={() => scrollTo('control-room')}
+      />
       <AlertDialog
         isOpen={resetOpen}
         onOpenChange={changeResetOpen}
@@ -308,46 +317,18 @@ export function ShowcaseApp({
         onAction={() => void performReset()}
       />
 
-      <Banner
-        status="info"
-        title="Suggested path: start a run as operator → switch to reviewer → approve → watch the run resume."
-        description={
-          actor
-            ? `Currently acting as ${actor.role}.${ROLE_NOTES[actor.role] ? ` ${ROLE_NOTES[actor.role]}` : ''}`
-            : undefined
-        }
-      />
+      <div id="control-room">
+        <ControlRoom
+          actor={actor}
+          runClient={runClient}
+          onStarted={onStarted}
+          narrate={narrate}
+          onReviewApproval={reviewApproval}
+        />
+      </div>
 
-      <Grid columns={{ minWidth: 460 }} gap={5}>
-        <VStack gap={5} id="launcher">
-          <WorkflowLauncher
-            key={resetEpoch}
-            workflows={workflows}
-            actor={actor}
-            isLoading={!catalogSettled}
-            loadError={catalogError}
-            runClient={runClient}
-            onStarted={onStarted}
-            narrate={narrate}
-          />
-          <RunCards
-            runs={runs}
-            results={runResults}
-            records={dashboard.records}
-            onReview={reviewApproval}
-            onRetryPolling={() => setRetryNonce((nonce) => nonce + 1)}
-          />
-        </VStack>
-        <VStack gap={3} className="anchorage-activity-column">
-          <ActivityFeedPanel
-            feed={feed}
-            onReview={reviewApproval}
-            onViewRun={viewRun}
-          />
-          <WhatsRealHere />
-        </VStack>
-      </Grid>
-
+      {/* The queue sits directly under the control room: the wire scenario's
+          approve action is a short same-page scroll, never a view switch. */}
       <div id="approvals-panel">
         <Card variant="default" padding={4} aria-label="Approvals">
           <VStack gap={3}>
@@ -475,6 +456,47 @@ export function ShowcaseApp({
           </VStack>
         </Card>
       </div>
+
+      <Grid columns={{ minWidth: 460 }} gap={5} className="anchorage-body-grid">
+        <VStack gap={5}>
+          <RunCards
+            runs={runs}
+            results={runResults}
+            records={dashboard.records}
+            onReview={reviewApproval}
+            onRetryPolling={() => setRetryNonce((nonce) => nonce + 1)}
+          />
+          <VStack gap={3}>
+            <Banner
+              status="info"
+              title="Suggested path: start a run as operator → switch to reviewer → approve → watch the run resume."
+              description={
+                actor
+                  ? `Currently acting as ${actor.role}.${ROLE_NOTES[actor.role] ? ` ${ROLE_NOTES[actor.role]}` : ''}`
+                  : undefined
+              }
+            />
+            <WorkflowLauncher
+              key={resetEpoch}
+              workflows={workflows}
+              actor={actor}
+              isLoading={!catalogSettled}
+              loadError={catalogError}
+              runClient={runClient}
+              onStarted={onStarted}
+              narrate={narrate}
+            />
+          </VStack>
+        </VStack>
+        <VStack gap={3} className="anchorage-activity-column">
+          <ActivityFeedPanel
+            feed={feed}
+            onReview={reviewApproval}
+            onViewRun={viewRun}
+          />
+          <WhatsRealHere />
+        </VStack>
+      </Grid>
 
       <Text size="sm" color="secondary">
         Anchorage demo: flowsafe + breakwater running on Cloudflare Workers,

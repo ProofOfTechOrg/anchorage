@@ -371,7 +371,7 @@ export function RunCards({
       {runs.length === 0 ? (
         <EmptyState
           title="Nothing running yet"
-          description="Pick a workflow on the left. It will run its real steps and suspend at an approval gate within a couple of seconds."
+          description="Start the wire transfer scenario above, or launch a workflow below. It will run its real steps and suspend at an approval gate within a couple of seconds."
         />
       ) : (
         runs.map((run) => (

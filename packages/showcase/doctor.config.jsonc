@@ -26,6 +26,17 @@
         ]
       },
       {
+        // The control room's own page root: it composes the scenario-card grid,
+        // the guarded-agent + control-plane panes, and the wire-run panel, and
+        // holds their page-level state (scenario selection + run phase/text/
+        // events/outcome, plus the hoisted wire-run state). Same call as the
+        // showcase-app root above — folding these into a reducer is a rewrite of
+        // working, browser-verified wiring, and the batched setStates React
+        // already collapses into one render.
+        "files": ["src/control-room/control-room.tsx"],
+        "rules": ["react-doctor/prefer-useReducer"]
+      },
+      {
         // The public-demo session module: polling/bootstrap effects are the
         // architecture (there is no event API — the narration honesty
         // contract derives everything from polled snapshots), and the

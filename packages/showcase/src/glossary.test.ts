@@ -9,6 +9,7 @@ import {
 } from '@/glossary';
 
 const WORKFLOW_IDS = [
+  'wire-transfer',
   'gtm-outbound',
   'content-pipeline',
   'lead-generation',
@@ -38,7 +39,7 @@ describe('glossary completeness', () => {
 });
 
 describe('workflow guides', () => {
-  it('covers exactly the five showcase workflows', () => {
+  it('covers exactly the six showcase workflows', () => {
     expect(Object.keys(WORKFLOW_GUIDES).sort()).toEqual(
       [...WORKFLOW_IDS].sort(),
     );

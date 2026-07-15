@@ -68,7 +68,7 @@
       }
     },
     {
-      "includes": ["packages/showcase/src/**", "packages/showcase/worker/**"],
+      "includes": ["packages/showcase/worker/**"],
       "linter": {
         "rules": {
           "style": {
@@ -79,6 +79,34 @@
                   {
                     "group": ["./**", "../**"],
                     "message": "Use an absolute import: @/* for src, #worker/* for worker modules, @flowsafe/* for deep flowsafe source, or the real package specifier."
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "includes": ["packages/showcase/src/**"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "patterns": [
+                  {
+                    "group": ["./**", "../**"],
+                    "message": "Use an absolute import: @/* for src, #worker/* for worker modules, @flowsafe/* for deep flowsafe source, or the real package specifier."
+                  },
+                  {
+                    "group": [
+                      "@proofoftech/breakwater",
+                      "@proofoftech/breakwater/connector-sdk",
+                      "@proofoftech/breakwater/agent-cli"
+                    ],
+                    "message": "The SPA can only bundle breakwater's browser-clean subpaths: @proofoftech/breakwater/{policy-engine,rbac,audit}. The barrel and connector-sdk pull @mastra/core/tools (node child_process/fs) and break the Vite build."
                   }
                 ]
               }

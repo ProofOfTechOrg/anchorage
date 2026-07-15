@@ -1,8 +1,10 @@
 // The 60-second tour dialog. Shows once per browser (dismissal persisted in
 // localStorage — a harmless UI flag; tokens stay memory-only), reopenable from
-// the header. The copy is the demo's four-beat story: operator starts →
-// reviewer decides (SoD is server-enforced) → the approval derives a
-// suspension-bound grant → dangerous effects are simulated, machinery is real.
+// the header. The copy is the demo's four-beat story: guardrail scenarios run
+// the real library in-browser → the wire transfer suspends at a real gate and
+// is decided in the queue below (SoD is server-enforced) → the approval
+// derives a suspension-bound grant → dangerous effects are simulated,
+// machinery is real.
 
 import { Button } from '@astryxdesign/core/Button';
 import { Dialog } from '@astryxdesign/core/Dialog';
@@ -49,10 +51,10 @@ export function useIntroTour(): IntroTour {
 }
 
 const TOUR_BULLETS: readonly string[] = [
-  'Launch a workflow. It runs its real steps and suspends at an approval gate within a couple of seconds.',
-  "Switch to reviewer and approve it. Separation of duties is server-enforced: whoever advanced the run into its gate can't decide it. product-launch has two gates, so alternate reviewer and admin (or drive it all as admin, whom this demo lets self-decide).",
+  'Pick a scenario in the control room. A scripted agent runs straight into the real breakwater enforcement path in your browser — no run budget spent. Switch roles to see the decisions change.',
+  "Run the wire transfer scenario: it starts a real durable run that suspends at an approval gate, then decide it in the queue right below. Separation of duties is server-enforced: whoever advanced the run into its gate can't decide it (this demo lets admin self-decide).",
   'The approval derives a capability grant bound to that exact suspension, and the run resumes server-side behind four connector gates.',
-  'Dangerous things are simulated (no live bindings); the machinery is real: grants, RBAC, tenant isolation, durable suspend/resume.',
+  'Want more? Further down, launch the example workflows — product-launch has two gates. Dangerous things are simulated (no live bindings); the machinery is real: grants, RBAC, tenant isolation, durable suspend/resume.',
 ];
 
 export function IntroTourDialog({
@@ -60,7 +62,7 @@ export function IntroTourDialog({
   onStartTour,
 }: {
   tour: IntroTour;
-  /** Primary CTA — dismisses and jumps to the launcher. */
+  /** Primary CTA — dismisses and jumps to the control room. */
   onStartTour: () => void;
 }): ReactElement {
   return (
@@ -83,7 +85,7 @@ export function IntroTourDialog({
         </VStack>
         <HStack gap={2}>
           <Button
-            label="Start with GTM Outbound"
+            label="Try a scenario"
             variant="primary"
             onClick={() => {
               tour.close();

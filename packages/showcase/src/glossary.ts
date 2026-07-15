@@ -94,7 +94,7 @@ export const ROLE_NOTES: Record<string, string> = {
   admin:
     "Starts any workflow, including access-request, and decides approvals. This demo relaxes separation of duties for admin, so it can decide requests it advanced itself and clear product-launch's two gates alone.",
   operator:
-    'Starts 4 of the 5 workflows and edits run inputs. Cannot claim or decide approvals; reviewing is reviewer/admin work.',
+    'Starts 5 of the 6 workflows and edits run inputs. Cannot claim or decide approvals; reviewing is reviewer/admin work.',
   reviewer:
     'Cannot start runs. Claims, delegates, and decides approvals: the second pair of eyes this whole system exists for. Still bound by separation of duties, so it cannot decide a gate it advanced.',
   viewer:
@@ -156,6 +156,17 @@ export function claimableSteps(
 }
 
 export const WORKFLOW_GUIDES: Record<string, WorkflowGuide> = {
+  'wire-transfer': {
+    steps: ['prepareTransfer', 'approveTransfer', 'releaseFunds'],
+    gateSteps: ['approveTransfer'],
+    connector: 'release-wire',
+    capabilities: [
+      { label: '1 gate', tip: GLOSSARY.approvalGate },
+      { label: 'release-wire', tip: GLOSSARY.simulated },
+      { label: 'separation of duties', tip: GLOSSARY.sod },
+    ],
+    note: 'No payment rail is wired here, so the release is logged and no money moves. The approval grant on the connector is enforced for real: a resume without a matching decision is denied.',
+  },
   'gtm-outbound': {
     steps: [
       'researchAccounts',

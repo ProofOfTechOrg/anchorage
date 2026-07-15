@@ -8,14 +8,17 @@ the workflows, DO topology, demo auth, and reset). One package because it is
 ONE deployable unit: the Worker serves the API and the built SPA on the same
 origin.
 
-The SPA is styled with the Astryx **y2k** theme: a workflow launcher, live run
-cards, a client-derived activity feed + toasts narrating what the platform
-does, and the approval dashboard — composed from the flowsafe library's
-headless hook + views (the library `App` shell is not used here). Two Astryx
-couplings, by design:
+The SPA is styled with the Astryx **y2k** theme and is ONE narrative page (no
+view switch, 2026-07-15): the guardrails control room on top (`src/
+control-room/`), the approval dashboard directly below it (`#approvals-panel`;
+the wire card's approve action is a same-page scroll), then runs + the
+workflow launcher beside the client-derived activity feed. The dashboard is
+composed from the flowsafe library's headless hook + views (the library `App`
+shell is not used here). Two Astryx couplings, by design:
 
-- **App-owned panels import Astryx directly** (launcher, run cards, feed,
-  legend, tour, switchers) — this app is the Astryx adapter's home.
+- **App-owned panels import Astryx directly** (control room, launcher, run
+  cards, feed, legend, tour, switchers) — this app is the Astryx adapter's
+  home.
 - **Library views** (Queue/Detail/Metrics) still render through the injected
   slot adapter (`src/astryx-components.tsx`), so published `approval-ui`
   consumers keep pulling zero Astryx.
@@ -81,7 +84,8 @@ is a pure client bundle served by the single-deploy Worker on the same origin.
 | `scripts/assert-clean-app-bundle.mjs` | Post-build tripwire: the production bundle in `dist/` must contain NO demo token (main.tsx keeps the dev switcher behind a DEV-only dynamic import; this proves the dead branch got eliminated) | Changing the bundle-cleanliness guarantee |
 | `scripts/resolve-react-doctor-diff-base.sh` | Resolves the `--base` ref for `react-doctor:diff` (open PR's base via `gh`, else react-doctor's `parent` fork-point heuristic); consumed by the pre-push hook | Changing the pre-push diff base |
 | `src/main.tsx` | The `Root` shell: mounts the plain-HTML `AppErrorBoundary` OUTSIDE `<Theme y2k>` + `ToastViewport`; holds the acting TOKEN + launched runs + the activity feed, derives both API clients, computes `canReset` + `clearRuns`, renders the switcher variants and `ShowcaseApp` — identity always comes from the server's actor echo | Changing app bootstrap or client wiring |
-| `src/showcase-app.tsx` | `ShowcaseApp` — the signed-in composition: header (legend + tour + "Reset sandbox" + identity chip), walkthrough banner, 2-col grid, approvals TabList over the library hook + views, SoD notice, narration + toast hooks, the reset `AlertDialog`, and the run-poll `retryNonce` | Changing the page composition |
+| `src/showcase-app.tsx` | `ShowcaseApp` — the signed-in composition, one scrolling page: header (legend + tour + "Reset sandbox" + identity chip), the control room (`#control-room`), the approvals card (`#approvals-panel`: TabList over the library hook + views, SoD notice), then runs + walkthrough banner + launcher beside the activity feed; narration + toast hooks, the reset `AlertDialog`, the run-poll `retryNonce`. Jumps (`reviewApproval`/`viewRun`) are plain same-page scrolls | Changing the page composition |
+| `src/card-ink.ts` | `cardInkMap` — toned `--color-text-*` overrides for tinted SelectableCard grids; without it dark mode paints near-white text on the pastel tints (the y2k tints keep one light hex in both modes) | Changing card tinting or adding a tinted card grid |
 | `src/error-boundary.tsx` | `AppErrorBoundary` — class boundary whose fallback is deliberately PLAIN HTML (inline styles): if the theme/Astryx is what threw, re-rendering Astryx inside the boundary would throw again | Changing crash handling |
 | `src/narration.ts` | The narration core (DOM-free, tested): `NarrationEvent` + deterministic key discipline, snapshot derivers, one-shot builders, `interpretRunResult` | Changing what gets narrated |
 | `src/glossary.ts` | All explanatory copy: `TAGLINE`, `ZONES`, `GLOSSARY`, `ROLE_NOTES`, `WORKFLOW_GUIDES` (step ids MUST match Mastra step ids), `claimableSteps`, `DRY_RUN_TRIO_FOOTER`. Bound by the truthfulness rules | Changing any user-facing copy |
@@ -93,7 +97,7 @@ is a pure client bundle served by the single-deploy Worker on the same origin.
 | `src/zone-badge.tsx` | `ZoneBadge` — one fixed Token color per architecture zone + hover blurb | Changing zone presentation |
 | `src/architecture-legend.tsx` | "Where things run" Dialog + "What's real here?" Collapsible | Changing the architecture explainers |
 | `src/intro-tour.tsx` | The 60-second tour Dialog — localStorage-dismissed, reopenable | Changing onboarding |
-| `src/workflow-launcher.tsx` | `WorkflowLauncher` — SelectableCard picker (per-workflow `CARD_INK` toned text vars), first-load spinner, capability Tokens, role gates from the SERVER'S catalog actor echo, JSON input Collapsible | Changing the launcher |
+| `src/workflow-launcher.tsx` | `WorkflowLauncher` — SelectableCard picker (toned ink via `card-ink.ts`), first-load spinner, capability Tokens, role gates from the SERVER'S catalog actor echo, JSON input Collapsible | Changing the launcher |
 | `src/run-cards.tsx` | `RunCards` — per-run Card: step chips, suspension story, interpreted outcome badges over the raw result JSON, per-workflow reality notes, retry button | Changing the run cards |
 | `src/use-run-polling.ts` | `useRunPolling` — the self-scheduling 3s run poll (pure `pollableRuns`/`mergeRunResults`/`allRunsSettled`) with transient-failure abandonment + `retryNonce` re-arm; also subscribes to the per-run WebSocket stream when a `runStream` option is present, updating status from the wholesale `RunSummary` frames and PAUSING a run's poll while its socket is healthy, resuming on close (DL-021 wholesale channel) | Changing run polling or the run stream |
 | `src/token-gate.tsx` | `TokenGate` (signed-out landing) + `OperatorIdentityChip` | Changing sign-in UI |
@@ -106,7 +110,7 @@ is a pure client bundle served by the single-deploy Worker on the same origin.
 | `src/astryx-stream-components.tsx` | The Astryx `Toast` + `PresenceIndicator` slot adapters (Part B streaming), merged into the provider alongside `astryx-components` | Changing the streaming slot adapters |
 | `src/web-socket-transport.ts` | Thin showcase re-export of approval-ui's browser-WebSocket `StreamTransport` (Part B) | Changing the SPA WS transport |
 | `src/hub-stream-client.ts` | Builds the hub + per-run `ticket()` thunks over the authenticated `ApprovalApiClient` (Part B); the run thunk passes the workflowId so the SERVER returns the fully-qualified run WS url (the route shape is authored once, server-side) | Changing SPA stream addressing |
-| `src/index.css` | Font `@import`s then Astryx CSS (reset → base → y2k theme), bundled by Vite; plus the sticky-column rule | Changing theme or global styles |
+| `src/index.css` | Font `@import`s then Astryx CSS (reset → base → y2k theme), bundled by Vite; plus the app-level layout guards: overscroll kill, `overflow-x: clip`, Grid minmax `min()` clamps, sticky activity column, selected-card ring, and the narrow-viewport clamps (header tools + approvals fields) that keep intrinsic-width Astryx controls inside phone viewports | Changing theme or global styles |
 | `src/test/setup.ts` | Vitest setup (jest-dom matchers; safe under node env too) | Changing test setup |
 | `src/marker-row.test.tsx` | Component smoke test proving the jsdom + testing-library pipeline | Changing the component-test plumbing |
 | `src/narration.test.ts` / `src/glossary.test.ts` | Derivation coverage + copy completeness | Changing narration or copy |
@@ -116,6 +120,7 @@ is a pure client bundle served by the single-deploy Worker on the same origin.
 
 | Directory | What | When to read |
 | --------- | ---- | ------------ |
+| `src/control-room/` | The guardrails control room, the page's flagship top section: `control-room.tsx` (scenario SelectableCards + the scenario/wire panels; wire run state hoisted so card switches can't double-start a real run), `engine.ts` (DOM-free harness running REAL breakwater policy/RBAC/tool evaluators over scripted token streams), `scenarios.ts` (the seven client-side scenarios + copy), `engine.test.ts` | Changing scenarios, the control-room UI, or the in-browser enforcement harness |
 | `worker/` | The Cloudflare host: `worker.ts` (DO topology, crons, auth), `runtime.ts`, `workflows/` (the 5 modules), demo-auth/demo-reset/demo-actors + their tests. Has its own `CLAUDE.md` | Changing the host, a workflow, or the demo lifecycle |
 | `dist/` | Generated Vite client bundle (served by the Worker as assets), gitignored | Never edit — rebuild with `pnpm --filter showcase build` |
 
