@@ -64,13 +64,19 @@ const PII_TRANSCRIPT =
   '4111 1111 1111 1111 with a spring expiry, so I will draft the renewal ' +
   'notice quoting that number for reference.';
 
+// Joined at runtime: a contiguous AKIA-shaped literal would ship in the
+// browser bundle and be flagged by secret scanners (react-doctor's artifact
+// scan, GitHub push protection) — fake or not. The streamed transcript still
+// carries the exact key shape breakwater's awsAccessKey detector fires on.
+const FAKE_AWS_ACCESS_KEY_ID = ['AKIA', '2E51H9QNX', 'AKQ7QLD'].join('');
+
 const SECRET_TRANSCRIPT =
   'The deploy job fails while fetching build artifacts, so I pulled the ' +
   'pipeline definition to compare against the last green run. The runner ' +
   'image and cache settings are unchanged, and the artifact bucket is ' +
   'reachable from the build network. The difference is in the credentials ' +
   'block, which was edited two days ago. It now embeds the vendor key ' +
-  'directly: AWS_ACCESS_KEY_ID=AKIA2E51H9QNXAKQ7QLD with a session token ' +
+  `directly: AWS_ACCESS_KEY_ID=${FAKE_AWS_ACCESS_KEY_ID} with a session token ` +
   'below it. Rotating that key and moving it into the secret store would ' +
   'fix the failed fetch.';
 

@@ -139,7 +139,7 @@ const abortThrowing = (reason?: string): never => {
 };
 
 /** Word-ish deltas so the transcript streams like model tokens. */
-export function tokenize(transcript: string): readonly string[] {
+function tokenize(transcript: string): readonly string[] {
   return transcript.match(/\S+\s*/g) ?? [];
 }
 
