@@ -31,7 +31,10 @@ function tenantContext(tenantId: string): TenantContext {
 interface Captured {
   name: string;
   url: string;
+  method: string;
   tenantHeader: string | null;
+  otherHeader: string | null;
+  body: string;
 }
 
 /** A namespace that records what reached the stub, without a DO behind it. */
@@ -44,7 +47,7 @@ function recordingNamespace(): {
     idFromName: (name) => name,
     get: (name): ThreadStubLike =>
       ({
-        fetch: (
+        fetch: async (
           input: Request | string,
           init?: { headers?: Record<string, string> },
         ) => {
@@ -52,12 +55,19 @@ function recordingNamespace(): {
             typeof input === 'string'
               ? new Request(input, init as RequestInit)
               : input;
+          // Capture the whole forwarded envelope — method, body, and a
+          // non-tenant header — so send's `...init` pass-through is PINNED:
+          // drop it and these assertions fail, where before a real caller
+          // silently lost its method, body, and content-type.
           calls.push({
             name,
             url: request.url,
+            method: request.method,
             tenantHeader: request.headers.get(THREAD_TENANT_HEADER),
+            otherHeader: request.headers.get('x-other'),
+            body: await request.text(),
           });
-          return Promise.resolve(new Response('{}'));
+          return new Response('{}');
         },
       }) as ThreadStubLike,
   };
@@ -88,13 +98,16 @@ describe('createThreadTopology', () => {
       body: '{}',
     });
 
-    // #then — the DO's name IS the thread, and the header carries the tenant
-    // the resolver authenticated
+    // #then — the DO's name IS the thread, the header carries the tenant the
+    // resolver authenticated, and the caller's method/body reach the stub intact
     expect(calls).toEqual([
       {
         name: 'acme_t1',
         url: 'http://thread/messages',
+        method: 'POST',
         tenantHeader: 'acme',
+        otherHeader: null,
+        body: '{}',
       },
     ]);
   });
@@ -112,7 +125,30 @@ describe('createThreadTopology', () => {
       { headers: { [THREAD_TENANT_HEADER]: 'globex', 'x-other': 'kept' } },
     );
 
-    // #then
+    // #then — the tenant is overwritten, but the route's OWN header rides
+    // through untouched (send's ...init pass-through)
+    expect(calls[0]?.tenantHeader).toBe('acme');
+    expect(calls[0]?.otherHeader).toBe('kept');
+  });
+
+  it('beats a caller-supplied header at ANY casing, not just the canonical spelling', async () => {
+    // #given — HTTP header names are case-insensitive but a plain-object spread
+    // is NOT: the pre-fix code kept `X-Flowsafe-Tenant` as a second property and
+    // Headers then appended both into "globex, acme", which the DO reads as a
+    // mismatch — a 403 that looks like an identity attack. The stamp (Headers.set)
+    // must win at every spelling; this fails on the object-spread implementation.
+    const { namespace, calls } = recordingNamespace();
+    const topology = createThreadTopology(namespace);
+
+    // #when — a DIFFERENT casing than the lowercase constant
+    await topology.send(
+      tenantContext('acme'),
+      mintThreadId('acme', () => 't1'),
+      '/messages',
+      { headers: { 'X-Flowsafe-Tenant': 'globex' } },
+    );
+
+    // #then — exactly the authenticated tenant, no appended forgery
     expect(calls[0]?.tenantHeader).toBe('acme');
   });
 

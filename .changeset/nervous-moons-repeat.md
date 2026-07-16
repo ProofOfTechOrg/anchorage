@@ -11,8 +11,8 @@ a host that configures none of it is byte-identical.
   `threadId`/`resourceId` — memory ids are minted server-side from the
   authenticated tenant via `TenantContext.newThreadId()/newResourceId()`, never
   chosen by a client — and `requireOwnedMemoryId(tenant, id)` answers 404 (not
-  403, so no existence oracle) on a foreign id. Every memory-touching route
-  calls both.
+  403, so no existence oracle) on a foreign id. Every memory-touching route MUST
+  call both (the rule the agent-domain routes in later tracks adopt).
 - **Recall-path proof**: core's own `MastraMemory` implementation over the real
   D1 store, two tenants keyed by the SAME business key, pinning that `recall()`,
   `listThreads({filter:{resourceId}})`, and resource-scoped `getWorkingMemory()`

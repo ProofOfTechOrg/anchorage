@@ -426,12 +426,14 @@ export interface RunnerRuntimeOptions {
    * init()'s runtime from build(), and nothing else in the isolate can hand this
    * object a pubsub.
    *
-   * READ BY NOTHING TODAY, deliberately. Track A (CI-M-002-002) passes it to the
-   * two `workflow.createRun({ runId })` sites below, which is the only place core
-   * accepts one; until then core defaults a fresh emitter per run. The field
-   * lands now because the seam is Track 0's deliverable and a pubsub no host can
-   * reach is not threaded — the alternative was Track A reaching outside its own
-   * file list to add it. Absent ⇒ undefined ⇒ byte-identical.
+   * NOT PASSED TO CORE TODAY, deliberately (the `pubsub` getter exposes the
+   * held identity; nothing hands it to createRun yet). Track A (CI-M-002-002)
+   * passes it to the two `workflow.createRun({ runId })` sites below, which is
+   * the only place core accepts one; until then core defaults a fresh emitter
+   * per run. The field lands now because the seam is Track 0's deliverable and a
+   * pubsub no host can reach is not threaded — the alternative was Track A
+   * reaching outside its own file list to add it. Absent ⇒ undefined ⇒
+   * byte-identical.
    */
   pubsub?: HostPubSub;
 }

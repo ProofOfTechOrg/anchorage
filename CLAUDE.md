@@ -208,9 +208,14 @@ kept) and failure-isolated in its own try/catch alongside sweepSLA +
 purgeExpiredWorkflowRuns. Plus: `TENANT_RANGE_PURGE_TABLES` makes the purge list
 and the schema-guard's `MASTRA_TABLES` inventory EXTENSIBLE per track (DL-003 —
 adopting a domain is one row plus the counter/result pair the types force in the
-SAME change, and the inventory forces the RETENTION leg too: `none` demands a
-written `because`, so an absent decision cannot read as "none needed"; the guard
-still trips on a silently added table; NO table is adopted here); the host DO's
+SAME change, and the inventory forces the RETENTION leg too: the type requires a
+`because` for `none`, and the schema-guard test rejects a blank one AND ties
+'unadopted' coverage to its reason, so adopting a table forces a real retention
+decision in the same change instead of leaving the boilerplate — each `ttl`/
+`cascade` declaration cross-checked against the exported
+`RUN_TTL_PURGE_TABLES`/`THREAD_TTL_PURGE_TABLES`, so a kind naming a purge that
+does not target the table (or a cascade onto a parent that reaps nothing) fails;
+the guard still trips on a silently added table; NO table is adopted here); the host DO's
 ONE pubsub identity flows `InitOptions.pubsub` ⇒ `InitResult.pubsub` ⇒
 `RunnerRuntimeOptions.pubsub` (threaded by `init()` like `resumeLedger`, since
 `build()` returns a RunnerRuntime — an InitResult-only echo would strand it;
