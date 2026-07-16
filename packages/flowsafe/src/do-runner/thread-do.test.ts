@@ -5,11 +5,8 @@ import { describe, expect, it } from 'vitest';
 
 import { type InitResult, init } from './init.js';
 import { mintThreadId } from './memory-id.js';
-import {
-  THREAD_TENANT_HEADER,
-  ThreadDurableObject,
-  type ThreadScope,
-} from './thread-do.js';
+import { ThreadDurableObject, type ThreadScope } from './thread-do.js';
+import { THREAD_TENANT_HEADER } from './thread-header.js';
 
 // A host subclass: build() is its init() wiring, route() its thread routes.
 // This one echoes the ASSERTED scope, so every test below reads exactly what

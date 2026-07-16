@@ -100,6 +100,12 @@ export function init(
     storage,
     requestContextForRun: options.requestContextForRun,
     resumeLedger: options.resumeLedger,
+    // Threaded like the ledger, and for the same reason: every DO subclass
+    // returns THIS runtime from build(), so a host that configures a pubsub
+    // reaches the runtime's createRun sites with no host change (Track A wires
+    // those). Handing it only to InitResult would strand it — build() returns a
+    // RunnerRuntime, not an InitResult, so the run-DO path would drop it.
+    pubsub: options.pubsub,
   });
 
   // Cast preserves core's generic call-site inference (6 type params); the

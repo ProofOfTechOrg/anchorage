@@ -26,17 +26,31 @@ a host that configures none of it is byte-identical.
 - **Extensible purge/guard inventory** (`TENANT_RANGE_PURGE_TABLES`,
   `TenantRangePurgeTable`, `TenantRangePurgeCounter`): adopting a `mastra_*`
   domain is now one additive row plus the counter/result pair the types force in
-  the same change; the schema guard still trips on any silently added table.
+  the same change; the schema guard still trips on any silently added table, and
+  its inventory now also forces each table's retention story — where "no TTL"
+  demands a written reason, so an absent decision cannot read as "none needed".
 - **Host pubsub identity** (`createHostPubSub`, `HostPubSub`): the seam for one
   in-process `EventEmitterPubSub` per host DO — passed to `init()` (new
-  `InitOptions.pubsub`) and taken back off `InitResult.pubsub`, so every consumer
-  in the isolate shares one emitter instead of each letting core default its own
-  (two such feeds never see each other's events). The identity and the seam only:
-  nothing passes it to core's `createRun` yet, so a configured pubsub is an
-  identity the host holds, not yet a feed core publishes on. Opt-in; absent
-  leaves polling as the fallback.
+  `InitOptions.pubsub`), taken back off `InitResult.pubsub`, and threaded into
+  the runtime (new `RunnerRuntimeOptions.pubsub`, readable as
+  `RunnerRuntime.pubsub`) so a host reaches it with no host change. Every
+  consumer in the isolate then shares one emitter instead of each letting core
+  default its own (two such feeds never see each other's events). The identity
+  and the seam only: nothing passes it to core's `createRun` yet, so a configured
+  pubsub is an identity the host holds, not yet a feed core publishes on. Opt-in;
+  absent leaves polling as the fallback.
 - **`ThreadDurableObject`**: per-thread DO base addressed `idFromName(threadId)`
   where the threadId is tenant-minted, so its name carries the tenant like a
   runId. Every request must state its authenticated tenant
   (`THREAD_TENANT_HEADER`) and is asserted against that prefix before the
-  subclass's `route()` runs — fail closed (403).
+  subclass's `route()` runs — fail closed (403). Everything else it throws rides
+  the shared `doErrorResponse` taxonomy, so a run driven from a thread route
+  keeps its 404/409/400 instead of collapsing to a 500.
+- **`createThreadTopology`** (`@proofoftech/flowsafe/host-kit`): the sanctioned
+  way to reach a per-thread DO, and the MINTER for the header
+  `ThreadDurableObject` verifies. `send`/`forward` refuse (404) a threadId the
+  authenticated tenant does not own — before the DO is addressed — and stamp
+  `x-flowsafe-tenant` from the resolved `TenantContext`, `forward` OVERWRITING
+  whatever a client's own request carried. Mint and verify ship together:
+  forwarding a client Request verbatim (the existing hub idiom) would otherwise
+  let the client write the very header the thread DO authenticates on.

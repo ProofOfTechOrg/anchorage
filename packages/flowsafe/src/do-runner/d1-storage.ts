@@ -96,6 +96,20 @@ export interface PurgeExpiredRunsOptions {
 }
 
 /**
+ * The tables `purgeExpiredWorkflowRuns` deletes from under the run TTL — the
+ * production anchor the schema guard cross-checks every `run-ttl` retention
+ * declaration against (DL-003), the retention-leg analog of
+ * TENANT_RANGE_PURGE_TABLES for the offboarding leg. One table, because the run
+ * TTL rides a `run_id` range paired with artifact deletion and an app-owned
+ * index (its own block below), not the tenant-range map. The guard reads THIS,
+ * not a literal copied into the test, so a purge that changes what it targets
+ * and a guard that still blesses the old set cannot drift apart silently.
+ */
+export const RUN_TTL_PURGE_TABLES: readonly string[] = [
+  'mastra_workflow_snapshot',
+];
+
+/**
  * Data-retention purge: deletes TERMINAL runs (success/failed/tripwire/
  * canceled/bailed/skipped) whose updatedAt is older than the TTL from
  * mastra_workflow_snapshot — and, when `artifactStore` is wired, each purged
@@ -254,6 +268,23 @@ function chunked<T>(values: readonly T[], size: number): T[][] {
   }
   return chunks;
 }
+
+/**
+ * The tables `purgeExpiredThreads` deletes from under the thread TTL — the
+ * production anchor the schema guard cross-checks the `thread-ttl` retention
+ * declaration against, AND the target set a `cascade` child must appear in to be
+ * believed (DL-003). BOTH tables are here because the purge reaps a thread and
+ * its messages together: `mastra_threads` by its own `updatedAt`,
+ * `mastra_messages` by cascade (a message has no idleness signal of its own — see
+ * the purge doc). So the inventory's `mastra_messages: { retention: cascade with
+ * mastra_threads }` is only legal because `mastra_messages` is genuinely a delete
+ * target here; a cascade naming a parent whose purge never touches the child is
+ * the lie the guard now catches.
+ */
+export const THREAD_TTL_PURGE_TABLES: readonly string[] = [
+  'mastra_threads',
+  'mastra_messages',
+];
 
 /**
  * Thread-level retention (docs/agent-memory-tenancy.md item 7): deletes agent

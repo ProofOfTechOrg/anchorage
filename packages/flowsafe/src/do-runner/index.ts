@@ -30,8 +30,13 @@ export {
   purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
   purgeTenant,
+  RUN_TTL_PURGE_TABLES,
   TENANT_RANGE_PURGE_TABLES,
+  THREAD_TTL_PURGE_TABLES,
 } from './d1-storage.js';
+// The DO error taxonomy and its extension point: a host DO's own route states a
+// status by extending DoStatusError (see do-error-response.ts).
+export { DoStatusError, doErrorResponse } from './do-error-response.js';
 export { DurableObjectRunner } from './durable-object.js';
 export type { HubStreamEvent, PresenceMember } from './hub-do.js';
 export { HubDurableObject } from './hub-do.js';
@@ -79,8 +84,5 @@ export {
   UnknownWorkflowError,
 } from './runtime.js';
 export type { ThreadScope } from './thread-do.js';
-export {
-  THREAD_TENANT_HEADER,
-  ThreadDurableObject,
-  ThreadIdentityError,
-} from './thread-do.js';
+export { ThreadDurableObject, ThreadIdentityError } from './thread-do.js';
+export { THREAD_TENANT_HEADER } from './thread-header.js';

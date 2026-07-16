@@ -208,16 +208,26 @@ kept) and failure-isolated in its own try/catch alongside sweepSLA +
 purgeExpiredWorkflowRuns. Plus: `TENANT_RANGE_PURGE_TABLES` makes the purge list
 and the schema-guard's `MASTRA_TABLES` inventory EXTENSIBLE per track (DL-003 —
 adopting a domain is one row plus the counter/result pair the types force in the
-SAME change; the guard still trips on a silently added table; NO table is
-adopted here); `init()` resolves the host DO's ONE pubsub identity
-(`InitOptions.pubsub` ⇒ `InitResult.pubsub` — core creates a FRESH
-EventEmitterPubSub per `createRun` when none is passed, so two defaulting sites
-publish to different feeds and `observe()` replay sees nothing); and
-`ThreadDurableObject` is the per-thread agent-loop host, addressed
-`idFromName(tenant-minted threadId)` and asserting every request's authenticated
-tenant (`THREAD_TENANT_HEADER`) against the name's prefix BEFORE the subclass's
-`route()` — the header is load-bearing, since a name-vs-path check alone cannot
-catch tenant B presenting a valid token for tenant A's thread.
+SAME change, and the inventory forces the RETENTION leg too: `none` demands a
+written `because`, so an absent decision cannot read as "none needed"; the guard
+still trips on a silently added table; NO table is adopted here); the host DO's
+ONE pubsub identity flows `InitOptions.pubsub` ⇒ `InitResult.pubsub` ⇒
+`RunnerRuntimeOptions.pubsub` (threaded by `init()` like `resumeLedger`, since
+`build()` returns a RunnerRuntime — an InitResult-only echo would strand it;
+core creates a FRESH EventEmitterPubSub per `createRun` when none is passed, so
+two defaulting sites publish to different feeds and `observe()` replay sees
+nothing). The runtime HOLDS it unread — Track A passes it to the two createRun
+sites (CI-M-002-002). `ThreadDurableObject` is the per-thread agent-loop host,
+addressed `idFromName(tenant-minted threadId)`, asserting every request's
+authenticated tenant (`THREAD_TENANT_HEADER`) against the name's prefix BEFORE
+the subclass's `route()`; its MINTER is host-kit's `createThreadTopology` —
+**reach a thread DO through the topology, never the raw namespace**, because the
+house forwarding idiom (`hub-topology`'s `stub.fetch(request)`) passes the
+CLIENT's headers verbatim, which is safe for the hub and would hand a client the
+header the thread DO authenticates on. The topology ownership-404s the threadId
+before addressing and OVERWRITES the header from the resolved TenantContext;
+mint and verify ship together for stream-ticket's reason. Both DO shells share
+ONE error taxonomy (`doErrorResponse`).
 
 Guardrails control room + one-page demo (control room merged 2026-07-14,
 PR #21; page unified 2026-07-15): the post-login showcase is ONE narrative

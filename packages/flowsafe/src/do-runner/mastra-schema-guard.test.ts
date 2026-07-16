@@ -45,7 +45,9 @@ import type { SnapshotDatabase, SnapshotStatement } from './d1-storage.js';
 import {
   createD1Storage,
   purgeTenant,
+  RUN_TTL_PURGE_TABLES,
   TENANT_RANGE_PURGE_TABLES,
+  THREAD_TTL_PURGE_TABLES,
 } from './d1-storage.js';
 import { init } from './init.js';
 import { mintResourceId, mintThreadId } from './memory-id.js';
@@ -110,7 +112,7 @@ function buildGated(storage: MastraCompositeStore): {
 }
 
 /**
- * How purgeTenant reaps a Mastra table:
+ * How purgeTenant reaps a Mastra table AT OFFBOARDING:
  * - 'run-id-range': the snapshot table's own block (INV-1 salted run_id).
  * - 'tenant-range': TENANT_RANGE_PURGE_TABLES (salted thread/resource ids).
  * - 'unadopted': no feature writes it, so no id in it is salted yet. Adopting
@@ -119,17 +121,79 @@ function buildGated(storage: MastraCompositeStore): {
  */
 type PurgeCoverage = 'run-id-range' | 'tenant-range' | 'unadopted';
 
+/**
+ * How a table's rows EXPIRE SHORT of offboarding — DL-003's third leg, and the
+ * one a track is likeliest to skip: a table can be perfectly tenant-purgeable
+ * and still grow forever, which is half the failure DL-003 names ("a
+ * tenant-unpurgeable OR never-expiring table").
+ *
+ * `none` demands a REASON in the type. That is the whole mechanism: "we decided
+ * this table needs no TTL, because X" and "nobody thought about it" are
+ * indistinguishable in a bare enum, so the field makes the second one
+ * unwritable. A track adding a table cannot leave retention undeclared (the
+ * field is required) and cannot declare 'none' without saying why.
+ */
+type RetentionStory =
+  | { kind: 'run-ttl' }
+  | { kind: 'thread-ttl' }
+  /** Rows die with their parent's TTL rather than aging out on their own. */
+  | { kind: 'cascade'; with: string }
+  | { kind: 'none'; because: string };
+
 describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
+  // The ONE reason an unadopted table carries — hoisted so the coverage↔reason
+  // biconditional below can tie them: an unadopted table has nothing to expire
+  // BECAUSE nothing writes it, so it carries exactly this, and the day a track
+  // flips its coverage to 'tenant-range' the tie forces retention off this
+  // boilerplate in the SAME change (the DL-003 "all three legs together" bar).
+  const UNADOPTED_NO_RETENTION =
+    'unadopted — no feature writes it, so there is nothing to expire yet';
+
   const MASTRA_TABLES: ReadonlyArray<{
     table: string;
     coverage: PurgeCoverage;
+    retention: RetentionStory;
   }> = [
-    { table: 'mastra_background_tasks', coverage: 'unadopted' },
-    { table: 'mastra_messages', coverage: 'tenant-range' },
-    { table: 'mastra_resources', coverage: 'tenant-range' },
-    { table: 'mastra_scorers', coverage: 'unadopted' },
-    { table: 'mastra_threads', coverage: 'tenant-range' },
-    { table: 'mastra_workflow_snapshot', coverage: 'run-id-range' },
+    {
+      table: 'mastra_background_tasks',
+      coverage: 'unadopted',
+      retention: {
+        kind: 'none',
+        because: UNADOPTED_NO_RETENTION,
+      },
+    },
+    {
+      table: 'mastra_messages',
+      coverage: 'tenant-range',
+      retention: { kind: 'cascade', with: 'mastra_threads' },
+    },
+    {
+      table: 'mastra_resources',
+      coverage: 'tenant-range',
+      retention: {
+        kind: 'none',
+        because:
+          "working memory is the OWNER's, shared across every thread they have, so one thread aging out says nothing about it — and a resource has no idleness signal of its own. Reaped at offboarding by purgeTenant",
+      },
+    },
+    {
+      table: 'mastra_scorers',
+      coverage: 'unadopted',
+      retention: {
+        kind: 'none',
+        because: UNADOPTED_NO_RETENTION,
+      },
+    },
+    {
+      table: 'mastra_threads',
+      coverage: 'tenant-range',
+      retention: { kind: 'thread-ttl' },
+    },
+    {
+      table: 'mastra_workflow_snapshot',
+      coverage: 'run-id-range',
+      retention: { kind: 'run-ttl' },
+    },
   ];
 
   it('createD1Storage creates EXACTLY the declared tables — an undeclared one is a tenancy decision, not a default', async () => {
@@ -149,6 +213,90 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     expect(tableNames(sqlite)).toEqual(
       MASTRA_TABLES.map((entry) => entry.table),
     );
+  });
+
+  it('every retention declaration is anchored to a REAL purge target (the exported inventories), not to intent', async () => {
+    // #given — DL-003's third leg: guard + purge + RETENTION land together, or a
+    // track ships a table that is tenant-purgeable and still grows forever. The
+    // type forces the DECLARATION; this pins that each declaration corresponds to
+    // a purge that really deletes the table, by cross-checking the PRODUCTION
+    // inventories RUN_TTL_PURGE_TABLES / THREAD_TTL_PURGE_TABLES (exported from
+    // d1-storage and consumed here the way TENANT_RANGE_PURGE_TABLES already is) —
+    // NOT literals copied into this test, which would drift from the SQL silently.
+    //
+    // A table is "accounted for" by a TTL if it declares that kind OR cascades
+    // onto a parent carrying it: a cascade MEANS the row dies with the parent's
+    // purge, so that purge must genuinely delete the child — i.e. the child is
+    // one of the parent's targets.
+    const retentionKindOf = (
+      table: string,
+    ): RetentionStory['kind'] | undefined =>
+      MASTRA_TABLES.find((entry) => entry.table === table)?.retention.kind;
+    const accountedFor = (kind: 'run-ttl' | 'thread-ttl'): string[] =>
+      MASTRA_TABLES.filter((entry) => {
+        if (entry.retention.kind === kind) return true;
+        // A cascade rides its parent's purge, so it is a target of that purge.
+        if (entry.retention.kind === 'cascade') {
+          return retentionKindOf(entry.retention.with) === kind;
+        }
+        return false;
+      })
+        .map((entry) => entry.table)
+        .sort();
+
+    // #then — set equality BOTH ways: a declaration with no purge target fails
+    // (declared side has it, the const does not) AND a purge target with no
+    // declaration fails (the const has it, nothing accounts for it).
+    expect(accountedFor('run-ttl')).toEqual([...RUN_TTL_PURGE_TABLES].sort());
+    expect(accountedFor('thread-ttl')).toEqual(
+      [...THREAD_TTL_PURGE_TABLES].sort(),
+    );
+
+    // ...and every cascade names a parent that EXISTS and itself expires. The
+    // set check cannot see a cascade onto a 'none'/absent parent whose child is
+    // in no inventory (it is simply absent from both sides), so catch that lie
+    // directly: a cascade onto something that expires nothing is not a real one.
+    for (const entry of MASTRA_TABLES) {
+      const { retention } = entry;
+      if (retention.kind !== 'cascade') continue;
+      const parentTable = retention.with;
+      const parent = MASTRA_TABLES.find(
+        (candidate) => candidate.table === parentTable,
+      );
+      expect(
+        parent?.retention.kind,
+        `${entry.table} cascades onto '${parentTable}', which expires nothing`,
+      ).toMatch(/^(run|thread)-ttl$/);
+    }
+  });
+
+  it("a 'none' retention carries a real reason, and 'unadopted' coverage is tied to it", async () => {
+    // #given — 'none' is the escape hatch, so it is where an undeclared decision
+    // hides. The type demands the `because` KEY but cannot demand CONTENT, so a
+    // blank string type-checks while saying nothing. Two guards close that.
+    for (const entry of MASTRA_TABLES) {
+      if (entry.retention.kind !== 'none') continue;
+      // #then — a real sentence, not a blank the type technically accepts
+      expect(
+        entry.retention.because.trim().length,
+        `${entry.table} declares retention 'none' with an empty/blank reason`,
+      ).toBeGreaterThan(20);
+    }
+
+    // #then — 'unadopted' coverage and the unadopted retention reason move
+    // together: neither changes without the other. Flipping coverage to
+    // 'tenant-range' (adopting the table) forces retention off the boilerplate in
+    // the SAME change — DL-003's third leg mechanized rather than trusted.
+    for (const entry of MASTRA_TABLES) {
+      const isUnadopted = entry.coverage === 'unadopted';
+      const hasUnadoptedReason =
+        entry.retention.kind === 'none' &&
+        entry.retention.because === UNADOPTED_NO_RETENTION;
+      expect(
+        isUnadopted,
+        `${entry.table}: 'unadopted' coverage and the unadopted retention reason must move together`,
+      ).toBe(hasUnadoptedReason);
+    }
   });
 
   it('every table declared tenant-range IS in purgeTenant’s table list, and vice versa', async () => {

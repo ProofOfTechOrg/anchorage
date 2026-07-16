@@ -31,17 +31,11 @@
 // in node/vitest, the same posture as DurableObjectRunner and HubDurableObject.
 
 import type { DurableObjectRunnerState } from './cf-types.js';
+import { DoStatusError, doErrorResponse } from './do-error-response.js';
 import type { InitResult } from './init.js';
 import { tenantOfMemoryId } from './memory-id.js';
 import { DurableStorageResumeLedger } from './resume-ledger.js';
-
-/**
- * The header the trusted Worker stamps with the AUTHENTICATED tenant on every
- * request it forwards to a thread DO. Exported so hosts and routers use ONE
- * literal — a typo on either side must fail closed (the assertion rejects), and
- * two spellings would silently disable the check on the day one side changed.
- */
-export const THREAD_TENANT_HEADER = 'x-flowsafe-tenant';
+import { THREAD_TENANT_HEADER } from './thread-header.js';
 
 /**
  * A request refused at the thread DO's identity boundary: the DO's name carries
@@ -50,8 +44,13 @@ export const THREAD_TENANT_HEADER = 'x-flowsafe-tenant';
  * client-reachable and the Worker 404s a foreign threadId before forwarding),
  * so there is no existence oracle to protect here and a distinct status keeps a
  * routing bug from reading as a generic 500.
+ *
+ * Extends DoStatusError because that is how a status opts in: this class is what
+ * doErrorResponse recognizes, not the shape of its fields.
  */
-export class ThreadIdentityError extends Error {
+export class ThreadIdentityError extends DoStatusError {
+  readonly status = 403;
+
   constructor(message: string) {
     super(message);
     this.name = 'ThreadIdentityError';
@@ -149,13 +148,12 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
         init: this.#ensureInit(),
       });
     } catch (error) {
-      if (error instanceof ThreadIdentityError) {
-        return json({ error: error.message }, 403);
-      }
-      return json(
-        { error: error instanceof Error ? error.message : String(error) },
-        500,
-      );
+      // The SAME taxonomy DurableObjectRunner answers with: route() drives runs
+      // through scope.init.runtime, so its typed errors (unknown run -> 404, not
+      // suspended -> 409, malformed -> 400) must survive to the caller rather
+      // than collapse into a 500 that reads as "this DO is broken".
+      // ThreadIdentityError carries its own 403.
+      return doErrorResponse(error);
     }
   }
 
@@ -197,11 +195,4 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
     }
     return this.#init;
   }
-}
-
-function json(payload: unknown, status = 200): Response {
-  return new Response(JSON.stringify(payload), {
-    status,
-    headers: { 'content-type': 'application/json' },
-  });
 }

@@ -96,6 +96,16 @@ export {
   RESERVED_TENANT_IDS,
   TenantCollisionError,
 } from './tenant-registry.js';
+// The sanctioned way to reach a thread DO: it MINTS the tenant header
+// ThreadDurableObject verifies, so a route never forwards a client's own
+// (see thread-topology.ts — mint and verify ship together).
+export {
+  createThreadTopology,
+  type ThreadNamespaceLike,
+  type ThreadRequestInit,
+  type ThreadStubLike,
+  type ThreadTopology,
+} from './thread-topology.js';
 export type {
   HmacVerifierOptions,
   MintHmacTokenOptions,
