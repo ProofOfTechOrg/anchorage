@@ -1,14 +1,16 @@
 # Agent-Memory Tenancy
 
-**Status: CHOKEPOINTS IMPLEMENTED (2026-07-12).** Agents-with-memory is on
-the roadmap, so the library-side chokepoints this design calls for are
-built: `do-runner/memory-id.ts` (mint/decode/ownership),
-`TenantContext.newThreadId()/newResourceId()/ownsMemoryId()`, `purgeTenant`
-coverage of the three memory tables, and the schema-guard column pins. The
-first memory FEATURE must consume them — the remaining obligations are
-listed in the checklist below. Enabling Mastra agent memory around these
-chokepoints (client-chosen ids, unsalted writes) is a cross-tenant leak by
-default, not a degraded mode.
+**Status: COMPLETE (2026-07-16, Track 0).** Both halves are built. The
+library-side chokepoints (2026-07-12): `do-runner/memory-id.ts`
+(mint/decode/ownership), `TenantContext.newThreadId()/newResourceId()/
+ownsMemoryId()`, `purgeTenant` coverage of the three memory tables, and the
+schema-guard column pins. The obligations they were built for (2026-07-16,
+items 5–7 below): the host boundary
+(`host-kit/memory-boundary.ts`), the agent-level recall-path proof
+(`do-runner/memory-recall-tenancy.test.ts`), and the thread TTL
+(`purgeExpiredThreads` on the purge cron). Enabling Mastra agent memory
+around these chokepoints (client-chosen ids, unsalted writes) is a
+cross-tenant leak by default, not a degraded mode.
 
 ## The hazard, precisely
 
@@ -114,18 +116,41 @@ tenancy dimension, no flag, no post-read filtering.
    disjoint rows, purge exactly one tenant, survivor readable
    (`mastra-schema-guard.test.ts`).
 
-### Remaining obligations (do these IN the first memory PR)
+### Shipped 2026-07-16 (Track 0 — the obligations)
 
-5. Host boundary: reject client-supplied thread/resource ids on every
-   memory-touching route; mint server-side via `TenantContext`;
-   ownership-assert (404) on read paths.
-6. Recall-path proof: an agent-level test that tenant B's semantic recall
-   over `resourceId = newResourceId('user-1')` never returns tenant A's
-   messages for the same business key.
-7. Retention: memory rows are NOT per-run, so `purgeExpiredWorkflowRuns`
-   deliberately does not touch them — decide a thread-level TTL (likely
-   keyed on the thread's `updatedAt`) in that PR and wire it into the
-   existing cron duty list.
+5. ✅ Host boundary: `host-kit/memory-boundary.ts` —
+   `assertNoClientMemoryIds(body)` 400s any body naming a
+   `TCB_ONLY_MEMORY_FIELDS` member (`threadId`/`resourceId`, the
+   `TCB_ONLY_CREATE_FIELDS` doctrine applied to memory: a client that picks
+   its own ids picks whose memory it reads), and `requireOwnedMemoryId(tenant,
+   id)` 404s a foreign id on read paths — no existence oracle. Every
+   memory-touching route calls both; ids are minted server-side via
+   `TenantContext.newThreadId()/newResourceId()`. It lives in host-kit, not
+   memory-id.ts, because the guard's contract IS its HTTP status
+   (`RunRouteError`) and `TenantContext` lives in approval-api, which already
+   imports do-runner. Tests: `host-kit/memory-boundary.test.ts`.
+6. ✅ Recall-path proof: `do-runner/memory-recall-tenancy.test.ts` drives core's
+   own `MastraMemory` implementation (`MockMemory`) over the REAL
+   `@mastra/cloudflare-d1` D1Store, with both tenants keyed by the SAME
+   business key `'user-1'`, and pins all three recall surfaces an agent turn
+   uses — `recall()`, `listThreads({filter:{resourceId}})`, and
+   resource-scoped `getWorkingMemory()`. Disjoint rows (the schema guard's
+   pin) are worthless if the recall API scopes by something else; this is what
+   says it does not.
+7. ✅ Thread TTL: `purgeExpiredThreads(db, { ttlMs, limit, tablePrefix })` in
+   `do-runner/d1-storage.ts`, wired into `createFlowsafeWorker`'s purge cron
+   behind `THREAD_RETENTION_DAYS` with its own try/catch (a wedged thread
+   purge costs the snapshot purge, the approval purge, and the extra duties
+   nothing). Keyed on `updatedAt`, since threads are not per-run and have no
+   terminal status — time since last write is the only signal one is done.
+   Messages go with their thread and BEFORE it (a message has `createdAt` but
+   no `updatedAt`, so no per-message idleness signal exists and thread-first
+   would strand them), enforced by a `NOT EXISTS` guard rather than statement
+   order — the writer is not atomic either, so an `updatedAt`-only guard would
+   delete a thread out from under a message that just landed; `mastra_resources` is
+   untouched (the owner's, not the thread's — it goes at offboarding). UNSET
+   by default: a conversation is meant to be kept, so there is no safe number
+   to pick on an operator's behalf.
 
 ## Rejected alternatives (do not re-explore)
 
@@ -147,8 +172,9 @@ tenancy dimension, no flag, no post-read filtering.
 
 ## Out of scope (deliberately)
 
-- Building the agents-with-memory feature itself — the chokepoints above are
-  its rails, not a substitute for items 5–7.
+- Building the agents-with-memory feature itself — everything above is its
+  rails, not the feature. Track A brings the first agent runs; they consume
+  `memory-boundary.ts` at their routes and mint through `TenantContext`.
 - `mastra_scorers` / `mastra_background_tasks` tenancy: same treatment IF a
   feature ever writes them; the inventory pin covers their appearance in
   the meantime.
@@ -156,7 +182,9 @@ tenancy dimension, no flag, no post-read filtering.
 ## Verification
 
 The gate is the existing one (`pnpm lint && pnpm typecheck && pnpm test &&
-pnpm build`) — the schema-guard suite now carries the column pins and the
-two-tenant adversarial case, and `spike:verify` stays green (memory writes
-ride the same D1 binding the spike exercises). The first memory feature adds
-the recall-path proof (item 6).
+pnpm build`) — the schema-guard suite carries the column pins (incl.
+`mastra_threads.updatedAt`, which the TTL rides), the table-inventory
+structure, and the two-tenant adversarial case; `memory-recall-tenancy.test.ts`
+carries the recall proof; `memory-boundary.test.ts` carries the boundary; and
+`spike:verify` stays green (memory writes ride the same D1 binding the spike
+exercises).

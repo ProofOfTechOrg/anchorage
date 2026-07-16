@@ -186,6 +186,54 @@ byte-identical); tenant-isolated on INV-1 (run channel) and id.name==tenantId
 (hub); polling retained as fallback + queue reconciler (flowsafe minor). Neither
 part changes the `ApprovalRecord` shape or any existing signature.
 
+Track 0 — long-running-agents substrate (2026-07-16, branch
+`feat/track-0-substrate`; plan `.notes/plan-long-running-agents-integration.md`
++ its `.workflow.json`, gitignored/local-only): the prerequisite for the six
+agent tracks, all additive and opt-in. **Agent-memory items 5–7 are CLOSED**
+(`docs/agent-memory-tenancy.md` — the doc's status is now COMPLETE): the host
+boundary (`host-kit/memory-boundary.ts` — `assertNoClientMemoryIds` 400s a body
+naming `threadId`/`resourceId`, `requireOwnedMemoryId` 404s a foreign id; it
+lives in host-kit, not do-runner, because the guard's contract IS its
+`RunRouteError` status and `TenantContext` would invert the layering), the
+agent-level recall-path proof (core's own `MastraMemory` over the REAL D1 store,
+two tenants on ONE business key, pinning `recall`/`listThreads`/working memory),
+and the thread TTL (`purgeExpiredThreads`, keyed on `mastra_threads.updatedAt`
+since threads have no terminal status; messages go WITH their thread and BEFORE
+it — a message has `createdAt` but no `updatedAt`, so no per-message idleness
+signal exists and thread-first would strand them — enforced by a `NOT EXISTS`
+guard rather than statement order, since the writer is not atomic either;
+`mastra_resources` untouched, it is the owner's). The TTL is the purge cron's third duty behind
+`THREAD_RETENTION_DAYS`, **unset by default** (a conversation is meant to be
+kept) and failure-isolated in its own try/catch alongside sweepSLA +
+purgeExpiredWorkflowRuns. Plus: `TENANT_RANGE_PURGE_TABLES` makes the purge list
+and the schema-guard's `MASTRA_TABLES` inventory EXTENSIBLE per track (DL-003 —
+adopting a domain is one row plus the counter/result pair the types force in the
+SAME change, and the inventory forces the RETENTION leg too: the type requires a
+`because` for `none`, and the schema-guard test rejects a blank one AND ties
+'unadopted' coverage to its reason, so adopting a table forces a real retention
+decision in the same change instead of leaving the boilerplate — each `ttl`/
+`cascade` declaration cross-checked against the exported
+`RUN_TTL_PURGE_TABLES`/`THREAD_TTL_PURGE_TABLES`, so a kind naming a purge that
+does not target the table (or a cascade onto a parent that reaps nothing) fails;
+the guard still trips on a silently added table; NO table is adopted here); the host DO's
+ONE pubsub identity flows `InitOptions.pubsub` ⇒ `InitResult.pubsub` ⇒
+`RunnerRuntimeOptions.pubsub` (threaded by `init()` like `resumeLedger`, since
+`build()` returns a RunnerRuntime — an InitResult-only echo would strand it;
+core creates a FRESH EventEmitterPubSub per `createRun` when none is passed, so
+two defaulting sites publish to different feeds and `observe()` replay sees
+nothing). The runtime HOLDS it unread — Track A passes it to the two createRun
+sites (CI-M-002-002). `ThreadDurableObject` is the per-thread agent-loop host,
+addressed `idFromName(tenant-minted threadId)`, asserting every request's
+authenticated tenant (`THREAD_TENANT_HEADER`) against the name's prefix BEFORE
+the subclass's `route()`; its MINTER is host-kit's `createThreadTopology` —
+**reach a thread DO through the topology, never the raw namespace**, because the
+house forwarding idiom (`hub-topology`'s `stub.fetch(request)`) passes the
+CLIENT's headers verbatim, which is safe for the hub and would hand a client the
+header the thread DO authenticates on. The topology ownership-404s the threadId
+before addressing and OVERWRITES the header from the resolved TenantContext;
+mint and verify ship together for stream-ticket's reason. Both DO shells share
+ONE error taxonomy (`doErrorResponse`).
+
 Guardrails control room + one-page demo (control room merged 2026-07-14,
 PR #21; page unified 2026-07-15): the post-login showcase is ONE narrative
 page. On top, the control room (`packages/showcase/src/control-room/`) —

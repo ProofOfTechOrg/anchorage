@@ -12,17 +12,10 @@
 
 import type { DurableObjectRunnerState, WebSocketLike } from './cf-types.js';
 import { newWebSocketPair, safeSend } from './cf-types.js';
+import { doErrorResponse } from './do-error-response.js';
 import { tenantOfRunId } from './path-safe-id.js';
 import { DurableStorageResumeLedger } from './resume-ledger.js';
-import {
-  InvalidRunRequestError,
-  RunAlreadyExistsError,
-  RunNotSuspendedError,
-  type RunnerRuntime,
-  type RunSummary,
-  UnknownRunError,
-  UnknownWorkflowError,
-} from './runtime.js';
+import type { RunnerRuntime, RunSummary } from './runtime.js';
 
 interface StartBody {
   workflowId?: string;
@@ -84,7 +77,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     try {
       return await this.#route(request);
     } catch (error) {
-      return errorResponse(error);
+      return doErrorResponse(error);
     }
   }
 
@@ -284,26 +277,4 @@ function json(payload: unknown, status = 200): Response {
     status,
     headers: { 'content-type': 'application/json' },
   });
-}
-
-function errorResponse(error: unknown): Response {
-  if (
-    error instanceof UnknownWorkflowError ||
-    error instanceof UnknownRunError
-  ) {
-    return json({ error: error.message }, 404);
-  }
-  if (
-    error instanceof RunNotSuspendedError ||
-    error instanceof RunAlreadyExistsError
-  ) {
-    return json({ error: error.message }, 409);
-  }
-  if (error instanceof InvalidRunRequestError) {
-    return json({ error: error.message }, 400);
-  }
-  return json(
-    { error: error instanceof Error ? error.message : String(error) },
-    500,
-  );
 }

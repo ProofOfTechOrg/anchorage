@@ -32,14 +32,21 @@ import type {
   SnapshotDatabase,
   TenantArtifactPurger,
 } from '../do-runner/index.js';
-import { purgeExpiredWorkflowRuns } from '../do-runner/index.js';
+import {
+  purgeExpiredThreads,
+  purgeExpiredWorkflowRuns,
+} from '../do-runner/index.js';
 import { bearerActorAuthenticator } from './bearer-auth.js';
 import {
   createDoRunTopology,
   type DoRunTopology,
   type RunnerNamespaceLike,
 } from './do-run-topology.js';
-import { numberVar, selfDecisionPolicyVar } from './env-vars.js';
+import {
+  numberVar,
+  optionalNumberVar,
+  selfDecisionPolicyVar,
+} from './env-vars.js';
 import {
   approvalStoreFactoryFor,
   buildHostApprovalService,
@@ -91,6 +98,19 @@ export interface FlowsafeWorkerEnv {
   RUN_RETENTION_DAYS?: string;
   /** Cron purges DECIDED approval records older than this (var; default 30; 0 = immediately). */
   APPROVAL_RETENTION_DAYS?: string;
+  /**
+   * Agent-memory thread TTL in days (var; docs/agent-memory-tenancy.md item 7):
+   * the purge cron deletes threads untouched for longer than this, with their
+   * messages. UNSET, EMPTY, or INVALID => the duty does not run and no thread
+   * ever expires — the opt-in default, because a thread is a conversation a host
+   * means to keep, not a terminal run snapshot that is finished by definition.
+   * There is no safe number to pick on an operator's behalf here, so anything
+   * short of a number the operator actually named is answered by NOT deleting
+   * (a config-error line marks the invalid case). Unlike RUN_RETENTION_DAYS this
+   * var decides whether an irreversible delete happens at all, so it does not
+   * take numberVar's fallback — see optionalNumberVar in env-vars.ts.
+   */
+  THREAD_RETENTION_DAYS?: string;
   /** Optional audit export: queue producer binding + SIEM collector config. */
   AUDIT_QUEUE?: AuditQueue<ApprovalAuditEvent>;
   SIEM_ENDPOINT?: string;
@@ -304,6 +324,41 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       retentionDays: env.APPROVAL_RETENTION_DAYS,
       cron,
     });
+    // Agent-memory thread TTL, opt-in (docs/agent-memory-tenancy.md item 7).
+    // Its OWN try/catch, like every sibling duty above and below: isolating one
+    // loop while a sibling shares its failure is a defect this codebase has
+    // already shipped once — a wedged thread purge must cost the run-snapshot
+    // purge, the approval purge, and the extra duties nothing.
+    let threadsPurged: number | undefined;
+    let threadMessagesPurged: number | undefined;
+    // optionalNumberVar, not numberVar: this var GATES the duty rather than
+    // tuning it, so unset/empty/garbage must all mean "do not delete" — never a
+    // silent fallback threshold (see its contract in env-vars.ts).
+    // allowZero: THREAD_RETENTION_DAYS=0 means "expire idle threads now", the
+    // same operator intent RUN_RETENTION_DAYS=0 states.
+    const threadRetentionDays = optionalNumberVar(
+      env.THREAD_RETENTION_DAYS,
+      'THREAD_RETENTION_DAYS',
+      { allowZero: true },
+    );
+    if (threadRetentionDays !== undefined) {
+      try {
+        const purgedThreads = await purgeExpiredThreads(env.DB, {
+          ttlMs: threadRetentionDays * 24 * 60 * 60 * 1000,
+        });
+        threadsPurged = purgedThreads.threads;
+        threadMessagesPurged = purgedThreads.messages;
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            type: 'maintenance-error',
+            surface: 'thread-retention-purge',
+            cron,
+            error: String(error),
+          }),
+        );
+      }
+    }
     let extra: Record<string, unknown> = {};
     if (config.extraPurgeDuties) {
       try {
@@ -325,6 +380,8 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         cron,
         purged,
         approvalsPurged,
+        threadsPurged,
+        threadMessagesPurged,
         ...extra,
       }),
     );

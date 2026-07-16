@@ -38,6 +38,42 @@ export function numberVar(
   return value;
 }
 
+/**
+ * A number var that GATES whether a duty runs at all, rather than tuning one
+ * that runs regardless. Absent or empty => undefined, silently (the operator
+ * named nothing). Invalid => undefined AND a config-error line.
+ *
+ * The polarity argument is `boolVar`'s, not `numberVar`'s, and the difference
+ * is which direction is unsafe. `numberVar` falls back so maintenance keeps
+ * running on a typo'd var — correct when the duty runs either way and the
+ * number only tunes it (RUN_RETENTION_DAYS). Here the value decides whether an
+ * IRREVERSIBLE delete happens at all, so a fallback would not preserve behavior,
+ * it would INVENT it — and invent a threshold the caller has already decided it
+ * cannot pick on the operator's behalf. Never expiring is recoverable; deleting
+ * a tenant's conversations because a var was mistyped is not.
+ *
+ * The empty-string case is not hypothetical: `''` is what an unset CI/CD
+ * variable interpolates to and what a blank wrangler `vars` entry produces, and
+ * `numberVar` already reads it as unset — so a caller gating on
+ * `raw !== undefined` would silently enable the duty at the fallback value.
+ */
+export function optionalNumberVar(
+  raw: string | undefined,
+  name: string,
+  options: NumberVarOptions = {},
+): number | undefined {
+  if (raw === undefined || raw === '') return undefined;
+  const value = Number(raw);
+  const belowFloor = options.allowZero ? value < 0 : value <= 0;
+  if (!Number.isFinite(value) || belowFloor) {
+    console.error(
+      JSON.stringify({ type: 'config-error', var: name, raw, skipped: true }),
+    );
+    return undefined;
+  }
+  return value;
+}
+
 const TRUTHY = new Set(['true', '1', 'yes', 'on']);
 const FALSY = new Set(['false', '0', 'no', 'off']);
 
