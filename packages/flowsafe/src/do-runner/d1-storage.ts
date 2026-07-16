@@ -221,6 +221,183 @@ export async function purgeExpiredWorkflowRuns(
   }
 }
 
+export interface PurgeExpiredThreadsOptions {
+  /** Threads untouched for longer than this are eligible, with their messages. */
+  ttlMs: number;
+  /** Must match createD1Storage's tablePrefix. */
+  tablePrefix?: string;
+  /**
+   * Threads processed per call. Default 100 — the shrinking eligible set is the
+   * cursor, so a first backlog drains across firings instead of blowing one
+   * invocation's budget (same batching rationale as purgeExpiredWorkflowRuns).
+   */
+  limit?: number;
+  /** Clock override for tests. */
+  now?: () => number;
+}
+
+export interface PurgeExpiredThreadsResult {
+  threads: number;
+  messages: number;
+}
+
+// D1 binds at most 100 parameters per query. Each id chunk below shares its
+// statement with the cutoff bind of the eligibility re-check, so the chunk
+// ceiling must leave room for it — 90 keeps comfortable headroom without
+// making the batch loop meaningfully longer.
+const D1_BIND_CHUNK = 90;
+
+function chunked<T>(values: readonly T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
+}
+
+/**
+ * Thread-level retention (docs/agent-memory-tenancy.md item 7): deletes agent
+ * memory threads whose `updatedAt` is older than the TTL, each with its
+ * messages. The terminal-status shape `purgeExpiredWorkflowRuns` uses does not
+ * transfer — threads are not per-run and have no status, so there is nothing to
+ * prove "finished" about one. Time since last write IS the only signal a thread
+ * is done, which is why the TTL keys on `updatedAt` (the D1 memory domain stamps
+ * it on every saveThread, so an active conversation never ages out).
+ *
+ * MESSAGES BEFORE THREADS: a message carries a `createdAt` but no `updatedAt`,
+ * so there is no per-message IDLENESS signal — a message's lifetime is its
+ * thread's, and its rows are reachable only through it. Deleting a thread first
+ * would strand its messages beyond every later firing of this purge (only
+ * purgeTenant, at offboarding, still ranges over their salted `thread_id`).
+ *
+ * EVERY statement re-checks the CURRENT row rather than trusting the SELECT's id
+ * list, and that is load-bearing here in a way it is not for
+ * purgeExpiredWorkflowRuns (where terminal status is absorbing, so its re-check
+ * is belt-and-braces). "Idle" is precisely NOT absorbing — a thread can come
+ * back to life mid-purge — and the writer is not atomic either: the memory
+ * domain's saveMessages issues its message insert and its `UPDATE mastra_threads
+ * SET updatedAt` as two INDEPENDENT calls under one Promise.all, so a send's
+ * message can be visible while its thread still reads idle. That TORN state is
+ * what each guard answers:
+ *
+ *  - The message DELETE re-reads the thread's current `updatedAt` (subquery) AND
+ *    bounds itself to `createdAt < cutoff`. The subquery alone would sweep a
+ *    just-arrived message into the same statement as the genuinely old ones —
+ *    it keys on the THREAD's staleness, and the bump has not landed — silently
+ *    destroying the message the user just sent. `createdAt` is the message's own
+ *    evidence of recency, and the only guard that survives a torn write.
+ *  - The thread DELETE re-checks `updatedAt < cutoff` AND fires only when `NOT
+ *    EXISTS` any message for it. Sequence alone cannot carry "messages before
+ *    threads": a message landing after the message DELETE leaves an idle-looking
+ *    thread whose row would go out from under it. The NOT EXISTS makes the
+ *    invariant — never delete a thread a message points at — a property of the
+ *    statement rather than of timing.
+ *
+ * Together: a torn or concurrent send at ANY point in the sequence keeps both
+ * its message and its thread; the thread's next firing (by then bumped, or by
+ * then genuinely idle again) decides its fate on fresh evidence.
+ *
+ * Residuals, both accepted, neither reachable by a read path: (1) a send landing
+ * between the two DELETEs loses the already-expiring history while the thread
+ * and the new message survive — strictly better than the deletion that was
+ * milliseconds away. (2) A message inserted AFTER its thread's row is already
+ * gone is orphaned by the writer, not by this purge; D1 offers no cross-statement
+ * transaction through this seam to close it. An orphan is unreachable by recall
+ * (nothing lists a thread that does not exist), stays tenant-salted on its
+ * `thread_id`, and is reaped by purgeTenant at offboarding — a hygiene cost, not
+ * a leak.
+ *
+ * `mastra_resources` (working memory) is deliberately untouched: a resource is
+ * the OWNER's, shared across every thread they have, so one thread aging out
+ * says nothing about it. It is reaped at offboarding (purgeTenant).
+ *
+ * Missing tables read as zero (a deployment with no agent memory never created
+ * them). Scheduling stays with the caller — see createFlowsafeWorker's
+ * THREAD_RETENTION_DAYS duty.
+ */
+export async function purgeExpiredThreads(
+  db: SnapshotDatabase,
+  options: PurgeExpiredThreadsOptions,
+): Promise<PurgeExpiredThreadsResult> {
+  const now = options.now ?? Date.now;
+  const prefix = options.tablePrefix ?? '';
+  // @mastra/cloudflare-d1 stores the memory tables' TIMESTAMP columns as
+  // ISO-8601 TEXT (the same serialization the snapshot rows use), so a
+  // lexicographic < against an ISO cutoff is a correct timestamp comparison.
+  const cutoff = new Date(now() - options.ttlMs).toISOString();
+  let expired: Array<{ id: string }>;
+  try {
+    ({ results: expired } = await db
+      .prepare(
+        `SELECT id FROM ${prefix}mastra_threads
+         WHERE updatedAt < ?
+         ORDER BY updatedAt
+         LIMIT ?`,
+      )
+      .bind(cutoff, options.limit ?? 100)
+      .all<{ id: string }>());
+  } catch (error) {
+    if (!isMissingTable(error)) throw error;
+    return { threads: 0, messages: 0 };
+  }
+  const ids = expired.map((row) => row.id);
+  if (ids.length === 0) return { threads: 0, messages: 0 };
+  const batches = chunked(ids, D1_BIND_CHUNK);
+  const placeholders = (chunk: string[]): string =>
+    chunk.map(() => '?').join(', ');
+  // The eligibility re-check, as a subquery so the message delete rides the
+  // thread's CURRENT updatedAt rather than the SELECT's stale membership.
+  const stillExpired = (chunk: string[]): string =>
+    `SELECT id FROM ${prefix}mastra_threads
+     WHERE id IN (${placeholders(chunk)}) AND updatedAt < ?`;
+
+  let messages = 0;
+  let hasMessagesTable = true;
+  for (const chunk of batches) {
+    try {
+      messages += d1Changes(
+        await db
+          .prepare(
+            `DELETE FROM ${prefix}mastra_messages
+             WHERE thread_id IN (${stillExpired(chunk)})
+               AND createdAt < ?`,
+          )
+          .bind(...chunk, cutoff, cutoff)
+          .run(),
+      );
+    } catch (error) {
+      // A host whose memory domain never initialized has threads but no
+      // messages table; anything else is a real failure and must reach the
+      // cron's error surface rather than silently orphan a thread's history.
+      if (!isMissingTable(error)) throw error;
+      hasMessagesTable = false;
+      break;
+    }
+  }
+  // The structural invariant: never delete a thread a message still points at
+  // (see the header — the writer's insert and its updatedAt bump are not atomic,
+  // so updatedAt alone cannot carry this). Dropped only when the table does not
+  // exist, where "no message points at it" is vacuously true and the subquery
+  // would throw instead.
+  const noMessagesLeft = hasMessagesTable
+    ? ` AND NOT EXISTS (SELECT 1 FROM ${prefix}mastra_messages
+                        WHERE thread_id = ${prefix}mastra_threads.id)`
+    : '';
+  let threads = 0;
+  for (const chunk of batches) {
+    threads += d1Changes(
+      await db
+        .prepare(
+          `DELETE FROM ${prefix}mastra_threads
+           WHERE id IN (${placeholders(chunk)}) AND updatedAt < ?${noMessagesLeft}`,
+        )
+        .bind(...chunk, cutoff)
+        .run(),
+    );
+  }
+  return { threads, messages };
+}
+
 // One CREATE INDEX per (database, prefix) per isolate: purgeTenant runs this,
 // and the demo reaper invokes purgeTenant in a LIMIT-batched loop — without
 // the memo that is one DDL round-trip to the D1 primary per tenant per cron
@@ -298,6 +475,62 @@ export interface PurgeTenantResult {
   approvals: number;
   artifacts: number;
 }
+
+/**
+ * The `PurgeTenantResult` field a range-purged table reports into. A track
+ * adopting a new `mastra_*` domain (notifications, thread-state, background
+ * tasks, schedules) adds its counter HERE, its row to
+ * TENANT_RANGE_PURGE_TABLES, and its field to PurgeTenantResult — all in the
+ * SAME change (DL-003). The union is what makes that mechanical rather than
+ * remembered: a counter with no result field fails the pin below, and a result
+ * field with no counter fails the `memory` initializer in purgeTenant.
+ */
+export type TenantRangePurgeCounter = 'threads' | 'messages' | 'resources';
+
+/** One table purgeTenant reaps by the INV-3 `[tid_, tid\x60)` range predicate. */
+export interface TenantRangePurgeTable {
+  /** The PurgeTenantResult field this table's deleted-row count lands in. */
+  counter: TenantRangePurgeCounter;
+  /** Unprefixed table name; purgeTenant applies the host's tablePrefix. */
+  table: string;
+  /**
+   * The tenant-salted column the range rides. Thread-keyed tables use their
+   * `thread_id` (a minted `${tenantId}_${uuid}`); row-keyed tables use their own
+   * salted `id`. Any column whose values are salted ids works — that is the
+   * whole reason the ids are salted at mint (docs/agent-memory-tenancy.md).
+   */
+  column: string;
+}
+
+/**
+ * The tenant-range purge inventory — EXTENSIBLE by construction (DL-003): each
+ * later track appends its adopted table here instead of editing purgeTenant's
+ * body, so adoption is one additive row plus the counter/result pair the types
+ * force alongside it. Ordering is not load-bearing (the deletes run
+ * concurrently; see purgeTenant).
+ *
+ * `mastra_workflow_snapshot` is deliberately absent: it rides the same range but
+ * over `run_id`, paired with artifact deletion and an app-owned index, so it
+ * keeps its own block. Tables no feature writes yet (`mastra_scorers`,
+ * `mastra_background_tasks`) are absent because nothing salts their ids yet —
+ * the schema-guard's inventory pin is what forces that decision when a track
+ * adopts one.
+ */
+export const TENANT_RANGE_PURGE_TABLES: readonly TenantRangePurgeTable[] = [
+  { counter: 'messages', table: 'mastra_messages', column: 'thread_id' },
+  { counter: 'threads', table: 'mastra_threads', column: 'id' },
+  { counter: 'resources', table: 'mastra_resources', column: 'id' },
+];
+
+// Compile-time DL-003 pin: every counter must be a PurgeTenantResult field, so
+// a track cannot adopt a table whose reaped rows are counted nowhere (an
+// offboarding that silently under-reports is how "we purged them" becomes
+// unfalsifiable). The reverse direction is enforced by purgeTenant's `memory`
+// initializer, which must name every counter in the union.
+type AssertTrue<T extends true> = T;
+type _EveryPurgeCounterIsReported = AssertTrue<
+  TenantRangePurgeCounter extends keyof PurgeTenantResult ? true : false
+>;
 
 /**
  * Complete tenant offboarding: reaps EVERY tenant-keyed store — snapshot
@@ -389,10 +622,11 @@ export async function purgeTenant(
     );
   }
 
-  // 3. Agent-memory rows — the SAME exact range, over the salted ids the
+  // 3. Every tenant-range table (TENANT_RANGE_PURGE_TABLES — today the
+  // agent-memory rows) — the SAME exact range, over the salted ids the
   // memory-id chokepoint mints (threads/resources by id, messages by their
   // NOT-NULL thread_id; message ids themselves are unsalted by design). The
-  // three DELETEs run concurrently via Promise.all — child-before-parent order is
+  // DELETEs run concurrently via Promise.all — child-before-parent order is
   // non-load-bearing (messages range on their own thread_id column, Mastra
   // declares no FK, every table independently re-sweepable after a mid-purge
   // failure in any order), the memory[counter] writes hit distinct keys so
@@ -401,14 +635,13 @@ export async function purgeTenant(
   // table reads as empty — the tables exist wherever createD1Storage ran
   // (eager creation), but crafted test databases and non-D1Store hosts may
   // not have them.
-  const memoryPurges = [
-    ['messages', 'mastra_messages', 'thread_id'],
-    ['threads', 'mastra_threads', 'id'],
-    ['resources', 'mastra_resources', 'id'],
-  ] as const;
-  const memory = { threads: 0, messages: 0, resources: 0 };
+  const memory: Record<TenantRangePurgeCounter, number> = {
+    threads: 0,
+    messages: 0,
+    resources: 0,
+  };
   await Promise.all(
-    memoryPurges.map(async ([counter, table, column]) => {
+    TENANT_RANGE_PURGE_TABLES.map(async ({ counter, table, column }) => {
       try {
         memory[counter] = d1Changes(
           await db

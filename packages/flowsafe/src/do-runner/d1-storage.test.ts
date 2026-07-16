@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest';
 
 import { openSqlite, type SqliteDatabase } from '../../test-support/sqlite.js';
 import {
+  purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
   purgeTenant,
   type SnapshotDatabase,
@@ -897,6 +898,502 @@ describe('purgeTenant (complete offboarding)', () => {
     // #then
     expect(result.snapshots).toBe(1);
     expect(remainingRunIds(sqlite, 'p_')).toEqual([]);
+  });
+});
+
+describe('purgeExpiredThreads (agent-memory thread TTL)', () => {
+  // The mastra_threads/mastra_messages columns mastra-schema-guard.test.ts pins
+  // against the real @mastra/cloudflare-d1 schema: TIMESTAMP columns hold
+  // ISO-8601 TEXT, messages carry a NOT-NULL thread_id and NO updatedAt of
+  // their own (why they can only be reached through their thread).
+  function createThreadTables(db: SqliteDatabase, prefix = ''): void {
+    db.prepare(
+      `CREATE TABLE ${prefix}mastra_threads (
+        id TEXT PRIMARY KEY,
+        resourceId TEXT,
+        updatedAt TEXT NOT NULL
+      )`,
+    ).run();
+    db.prepare(
+      `CREATE TABLE ${prefix}mastra_messages (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        createdAt TEXT NOT NULL
+      )`,
+    ).run();
+  }
+
+  function seedThreadAt(
+    db: SqliteDatabase,
+    id: string,
+    updatedAt: number,
+    messageIds: string[] = [],
+  ): void {
+    db.prepare(
+      `INSERT INTO mastra_threads (id, resourceId, updatedAt) VALUES (?, NULL, ?)`,
+    ).run(id, new Date(updatedAt).toISOString());
+    for (const messageId of messageIds) {
+      // A message is as old as its thread's last write unless a test says
+      // otherwise — the real invariant, since saveMessages bumps updatedAt.
+      db.prepare(
+        'INSERT INTO mastra_messages (id, thread_id, createdAt) VALUES (?, ?, ?)',
+      ).run(messageId, id, new Date(updatedAt).toISOString());
+    }
+  }
+
+  function idsIn(db: SqliteDatabase, table: string, column: string): string[] {
+    const rows = (
+      db.prepare(
+        `SELECT ${column} AS value FROM ${table} ORDER BY ${column}`,
+      ) as unknown as { all(): Array<{ value: string }> }
+    ).all();
+    return rows.map((row) => row.value);
+  }
+
+  it('deletes idle threads WITH their messages and leaves active ones intact', async () => {
+    // #given — one thread untouched past the TTL, one written to yesterday
+    const sqlite = openSqlite();
+    createThreadTables(sqlite);
+    seedThreadAt(sqlite, 'abc_idle', NOW - 40 * DAY_MS, ['m1', 'm2']);
+    seedThreadAt(sqlite, 'abc_active', NOW - 1 * DAY_MS, ['m3']);
+
+    // #when — a 30-day TTL
+    const purged = await purgeExpiredThreads(d1Like(sqlite), {
+      ttlMs: 30 * DAY_MS,
+      now: () => NOW,
+    });
+
+    // #then — the idle thread and BOTH its messages are gone; the active
+    // conversation is untouched
+    expect(purged).toEqual({ threads: 1, messages: 2 });
+    expect(idsIn(sqlite, 'mastra_threads', 'id')).toEqual(['abc_active']);
+    expect(idsIn(sqlite, 'mastra_messages', 'id')).toEqual(['m3']);
+  });
+
+  it('keys on updatedAt, not createdAt: an OLD thread still being written to never expires', async () => {
+    // #given — the distinction that makes a TTL safe for conversations: age is
+    // not idleness. A year-old thread answered this morning must survive.
+    const sqlite = openSqlite();
+    createThreadTables(sqlite);
+    seedThreadAt(sqlite, 'abc_ancient-but-live', NOW - 60_000, ['m1']);
+
+    // #when
+    const purged = await purgeExpiredThreads(d1Like(sqlite), {
+      ttlMs: 30 * DAY_MS,
+      now: () => NOW,
+    });
+
+    // #then
+    expect(purged).toEqual({ threads: 0, messages: 0 });
+    expect(idsIn(sqlite, 'mastra_threads', 'id')).toEqual([
+      'abc_ancient-but-live',
+    ]);
+  });
+
+  it('is exact at the TTL boundary (strictly older expires)', async () => {
+    // #given — one thread exactly at the cutoff, one a millisecond past it
+    const sqlite = openSqlite();
+    createThreadTables(sqlite);
+    seedThreadAt(sqlite, 'abc_at-cutoff', NOW - 30 * DAY_MS);
+    seedThreadAt(sqlite, 'abc_past-cutoff', NOW - 30 * DAY_MS - 1);
+
+    // #when
+    const purged = await purgeExpiredThreads(d1Like(sqlite), {
+      ttlMs: 30 * DAY_MS,
+      now: () => NOW,
+    });
+
+    // #then — `<` cutoff: the boundary row survives
+    expect(purged.threads).toBe(1);
+    expect(idsIn(sqlite, 'mastra_threads', 'id')).toEqual(['abc_at-cutoff']);
+  });
+
+  it('never touches mastra_resources — working memory is the OWNER’s, not the thread’s', async () => {
+    // #given — a resource whose only thread ages out. The owner still exists;
+    // their working memory outlives any one conversation and is reaped only at
+    // offboarding (purgeTenant).
+    const sqlite = openSqlite();
+    createThreadTables(sqlite);
+    sqlite.prepare('CREATE TABLE mastra_resources (id TEXT PRIMARY KEY)').run();
+    sqlite
+      .prepare('INSERT INTO mastra_resources (id) VALUES (?)')
+      .run('abc_user-1');
+    seedThreadAt(sqlite, 'abc_idle', NOW - 40 * DAY_MS);
+
+    // #when
+    await purgeExpiredThreads(d1Like(sqlite), {
+      ttlMs: 30 * DAY_MS,
+      now: () => NOW,
+    });
+
+    // #then
+    expect(idsIn(sqlite, 'mastra_resources', 'id')).toEqual(['abc_user-1']);
+  });
+
+  it('LIMIT-batches: one firing takes at most `limit`, the next resumes at the survivors', async () => {
+    // #given — more idle threads than one batch
+    const sqlite = openSqlite();
+    createThreadTables(sqlite);
+    for (let index = 0; index < 5; index += 1) {
+      seedThreadAt(sqlite, `abc_idle-${index}`, NOW - (40 + index) * DAY_MS, [
+        `m${index}`,
+      ]);
+    }
+    const db = d1Like(sqlite);
+
+    // #when — two firings at limit 3
+    const first = await purgeExpiredThreads(db, {
+      ttlMs: 30 * DAY_MS,
+      limit: 3,
+      now: () => NOW,
+    });
+    const second = await purgeExpiredThreads(db, {
+      ttlMs: 30 * DAY_MS,
+      limit: 3,
+      now: () => NOW,
+    });
+
+    // #then — the shrinking eligible set is the cursor across firings
+    expect(first).toEqual({ threads: 3, messages: 3 });
+    expect(second).toEqual({ threads: 2, messages: 2 });
+    expect(idsIn(sqlite, 'mastra_threads', 'id')).toEqual([]);
+    expect(idsIn(sqlite, 'mastra_messages', 'id')).toEqual([]);
+  });
+
+  it('deletes messages BEFORE the thread, so a crash between them leaves a retry cursor — never an orphan', async () => {
+    // #given — the ordering is load-bearing: mastra_messages has no updatedAt,
+    // so its rows are reachable only via their thread. Thread-first would put
+    // them beyond every later firing of this purge. Simulate the crash by
+    // failing the thread DELETE after the message DELETE has committed.
+    const sqlite = openSqlite();
+    createThreadTables(sqlite);
+    seedThreadAt(sqlite, 'abc_idle', NOW - 40 * DAY_MS, ['m1']);
+    const inner = d1Like(sqlite);
+    const crashingDb: SnapshotDatabase = {
+      prepare: (sql: string) => {
+        if (sql.includes('DELETE FROM mastra_threads')) {
+          throw new Error('connection lost');
+        }
+        return inner.prepare(sql);
+      },
+    };
+
+    // #when
+    await expect(
+      purgeExpiredThreads(crashingDb, { ttlMs: 30 * DAY_MS, now: () => NOW }),
+    ).rejects.toThrow('connection lost');
+
+    // #then — the thread survives as its own cursor (its messages are gone,
+    // which is exactly recoverable)...
+    expect(idsIn(sqlite, 'mastra_threads', 'id')).toEqual(['abc_idle']);
+    expect(idsIn(sqlite, 'mastra_messages', 'id')).toEqual([]);
+
+    // ...and the next firing completes the job rather than wedging
+    const retried = await purgeExpiredThreads(d1Like(sqlite), {
+      ttlMs: 30 * DAY_MS,
+      now: () => NOW,
+    });
+    expect(retried).toEqual({ threads: 1, messages: 0 });
+    expect(idsIn(sqlite, 'mastra_threads', 'id')).toEqual([]);
+  });
+
+  // The purge races ordinary traffic, not just crashes: @mastra/cloudflare-d1's
+  // saveMessages issues its message insert and its `UPDATE mastra_threads SET
+  // updatedAt` CONCURRENTLY (Promise.all), so a message arriving mid-purge is
+  // exactly the interleaving below. Both tests inject that write through the
+  // .prepare wrapper the purgeTenant race tests already use.
+  function resurrectOn(
+    sqlite: SqliteDatabase,
+    trigger: (sql: string) => boolean,
+  ): SnapshotDatabase {
+    const inner = d1Like(sqlite);
+    let fired = false;
+    const send = (): void => {
+      if (fired) return;
+      fired = true;
+      // A saveMessages-shaped write: the new message AND the thread's bump.
+      sqlite
+        .prepare(
+          'INSERT INTO mastra_messages (id, thread_id, createdAt) VALUES (?, ?, ?)',
+        )
+        .run('m-during-race', 'abc_idle', new Date(NOW).toISOString());
+      sqlite
+        .prepare('UPDATE mastra_threads SET updatedAt = ? WHERE id = ?')
+        .run(new Date(NOW).toISOString(), 'abc_idle');
+    };
+    return {
+      prepare: (sql: string) => {
+        if (trigger(sql)) send();
+        return inner.prepare(sql);
+      },
+    };
+  }
+
+  it('spares a thread resurrected between the SELECT and the message DELETE — history intact', async () => {
+    // #given — an idle thread whose user sends a message just as the purge
+    // picks it up. Keying the deletes on the SELECT's stale id list would reap
+    // the conversation AND the message that just arrived.
+    const sqlite = openSqlite();
+    createThreadTables(sqlite);
+    seedThreadAt(sqlite, 'abc_idle', NOW - 40 * DAY_MS, ['m-old']);
+
+    // #when — the write lands before either DELETE runs
+    const purged = await purgeExpiredThreads(
+      resurrectOn(sqlite, (sql) => sql.includes('DELETE FROM mastra_messages')),
+      { ttlMs: 30 * DAY_MS, now: () => NOW },
+    );
+
+    // #then — the re-check excludes it from BOTH statements: nothing is lost
+    expect(purged).toEqual({ threads: 0, messages: 0 });
+    expect(idsIn(sqlite, 'mastra_threads', 'id')).toEqual(['abc_idle']);
+    expect(idsIn(sqlite, 'mastra_messages', 'id')).toEqual([
+      'm-during-race',
+      'm-old',
+    ]);
+  });
+
+  it('never orphans a message when the resurrection lands between the two DELETEs', async () => {
+    // #given — the narrower window: the messages DELETE has already committed
+    // when the write arrives. Without the thread DELETE's own re-check, the
+    // thread row would go on stale membership and leave 'm-during-race'
+    // pointing at a thread that no longer exists — reachable then only by
+    // purgeTenant at offboarding, since nothing lists a vanished thread.
+    const sqlite = openSqlite();
+    createThreadTables(sqlite);
+    seedThreadAt(sqlite, 'abc_idle', NOW - 40 * DAY_MS, ['m-old']);
+
+    // #when — the write lands as the thread DELETE is about to run
+    const purged = await purgeExpiredThreads(
+      resurrectOn(sqlite, (sql) => sql.includes('DELETE FROM mastra_threads')),
+      { ttlMs: 30 * DAY_MS, now: () => NOW },
+    );
+
+    // #then — the thread survives with its new message; the expiring history
+    // is gone (the accepted residual), and NO row is orphaned
+    expect(purged).toEqual({ threads: 0, messages: 1 });
+    expect(idsIn(sqlite, 'mastra_threads', 'id')).toEqual(['abc_idle']);
+    expect(idsIn(sqlite, 'mastra_messages', 'id')).toEqual(['m-during-race']);
+    const orphans = (
+      sqlite.prepare(
+        `SELECT m.id AS value FROM mastra_messages m
+         LEFT JOIN mastra_threads t ON t.id = m.thread_id
+         WHERE t.id IS NULL`,
+      ) as unknown as { all(): Array<{ value: string }> }
+    ).all();
+    expect(orphans).toEqual([]);
+  });
+
+  it('never destroys a just-sent message when the writer TEARS BEFORE the message DELETE', async () => {
+    // #given — the same torn write as below, one statement earlier: the insert
+    // half commits while the updatedAt bump is still in flight, and the purge's
+    // message DELETE runs next. That DELETE's subquery keys on the THREAD's
+    // staleness, which still reads idle — so an updatedAt-only guard sweeps the
+    // message the user just sent into the same statement as the genuinely old
+    // ones, and the now-empty thread follows it. No orphan, no trace: both
+    // simply vanish. `createdAt` is the message's OWN evidence of recency and
+    // the only guard that survives a torn write.
+    const sqlite = openSqlite();
+    createThreadTables(sqlite);
+    seedThreadAt(sqlite, 'abc_idle', NOW - 40 * DAY_MS, ['m-old']);
+    const inner = d1Like(sqlite);
+    let inserted = false;
+    const tearingDb: SnapshotDatabase = {
+      prepare: (sql: string) => {
+        if (sql.includes('DELETE FROM mastra_messages') && !inserted) {
+          inserted = true;
+          sqlite
+            .prepare(
+              'INSERT INTO mastra_messages (id, thread_id, createdAt) VALUES (?, ?, ?)',
+            )
+            .run('m-just-sent', 'abc_idle', new Date(NOW).toISOString());
+        }
+        return inner.prepare(sql);
+      },
+    };
+
+    // #when
+    const purged = await purgeExpiredThreads(tearingDb, {
+      ttlMs: 30 * DAY_MS,
+      now: () => NOW,
+    });
+
+    // #then — the expiring history goes, the just-sent message stays, and the
+    // thread survives because a message still points at it
+    expect(purged).toEqual({ threads: 0, messages: 1 });
+    expect(idsIn(sqlite, 'mastra_threads', 'id')).toEqual(['abc_idle']);
+    expect(idsIn(sqlite, 'mastra_messages', 'id')).toEqual(['m-just-sent']);
+  });
+
+  it('never orphans when the writer TEARS: the message lands but its updatedAt bump is still in flight', async () => {
+    // #given — the writer is not atomic either. saveMessages issues its message
+    // insert and its `UPDATE mastra_threads SET updatedAt` as two INDEPENDENT
+    // calls under one Promise.all, so the insert can commit while the bump is
+    // still in flight. Model exactly that: the message appears after the message
+    // DELETE, but the thread STILL looks idle when the thread DELETE re-checks
+    // updatedAt — so an updatedAt-only guard deletes the thread out from under
+    // the message that just arrived. Only the NOT EXISTS catches this.
+    const sqlite = openSqlite();
+    createThreadTables(sqlite);
+    seedThreadAt(sqlite, 'abc_idle', NOW - 40 * DAY_MS, ['m-old']);
+    const inner = d1Like(sqlite);
+    let inserted = false;
+    const tearingDb: SnapshotDatabase = {
+      prepare: (sql: string) => {
+        if (sql.includes('DELETE FROM mastra_threads') && !inserted) {
+          inserted = true;
+          // The insert half commits; the updatedAt half has NOT landed.
+          sqlite
+            .prepare(
+              'INSERT INTO mastra_messages (id, thread_id, createdAt) VALUES (?, ?, ?)',
+            )
+            .run('m-torn-write', 'abc_idle', new Date(NOW).toISOString());
+        }
+        return inner.prepare(sql);
+      },
+    };
+
+    // #when
+    const purged = await purgeExpiredThreads(tearingDb, {
+      ttlMs: 30 * DAY_MS,
+      now: () => NOW,
+    });
+
+    // #then — the thread survives because a message points at it, even though
+    // its updatedAt still reads idle. No orphan.
+    expect(purged.threads).toBe(0);
+    expect(idsIn(sqlite, 'mastra_threads', 'id')).toEqual(['abc_idle']);
+    expect(idsIn(sqlite, 'mastra_messages', 'id')).toEqual(['m-torn-write']);
+    const orphans = (
+      sqlite.prepare(
+        `SELECT m.id AS value FROM mastra_messages m
+         LEFT JOIN mastra_threads t ON t.id = m.thread_id
+         WHERE t.id IS NULL`,
+      ) as unknown as { all(): Array<{ value: string }> }
+    ).all();
+    expect(orphans).toEqual([]);
+  });
+
+  it('chunks the id lists under D1’s 100-bound-parameter ceiling', async () => {
+    // #given — a batch larger than one bind chunk. An unchunked IN list would
+    // be a D1 error at exactly the scale a first backlog produces, so the purge
+    // would work in every test and fail in production.
+    const sqlite = openSqlite();
+    createThreadTables(sqlite);
+    for (let index = 0; index < 120; index += 1) {
+      seedThreadAt(sqlite, `abc_idle-${index}`, NOW - 40 * DAY_MS, [
+        `m${index}`,
+      ]);
+    }
+    const bindCounts: number[] = [];
+    const inner = d1Like(sqlite);
+    const countingDb: SnapshotDatabase = {
+      prepare: (sql: string) => {
+        const statement = inner.prepare(sql);
+        if (!sql.includes('DELETE')) return statement;
+        return {
+          ...statement,
+          bind: (...values: unknown[]) => {
+            bindCounts.push(values.length);
+            return statement.bind(...values);
+          },
+        };
+      },
+    };
+
+    // #when — one firing over all 120
+    const purged = await purgeExpiredThreads(countingDb, {
+      ttlMs: 30 * DAY_MS,
+      limit: 120,
+      now: () => NOW,
+    });
+
+    // #then — everything reaped, and no single statement bound over 100 params
+    expect(purged).toEqual({ threads: 120, messages: 120 });
+    expect(bindCounts.length).toBeGreaterThan(2);
+    expect(Math.max(...bindCounts)).toBeLessThanOrEqual(100);
+  });
+
+  it('reads missing tables as empty, so a memory-less deployment purges unchanged', async () => {
+    // #given — a fresh DB: no host has enabled agent memory, so Mastra never
+    // created the tables. The duty must no-op, not wedge the purge cron.
+    const sqlite = openSqlite();
+
+    // #when
+    const purged = await purgeExpiredThreads(d1Like(sqlite), {
+      ttlMs: 30 * DAY_MS,
+      now: () => NOW,
+    });
+
+    // #then
+    expect(purged).toEqual({ threads: 0, messages: 0 });
+  });
+
+  it('reads a missing MESSAGES table as empty but still expires the threads', async () => {
+    // #given — threads without the messages table (a host whose memory domain
+    // never fully initialized)
+    const sqlite = openSqlite();
+    sqlite
+      .prepare(
+        `CREATE TABLE mastra_threads (id TEXT PRIMARY KEY, updatedAt TEXT NOT NULL)`,
+      )
+      .run();
+    sqlite
+      .prepare('INSERT INTO mastra_threads (id, updatedAt) VALUES (?, ?)')
+      .run('abc_idle', new Date(NOW - 40 * DAY_MS).toISOString());
+
+    // #when
+    const purged = await purgeExpiredThreads(d1Like(sqlite), {
+      ttlMs: 30 * DAY_MS,
+      now: () => NOW,
+    });
+
+    // #then
+    expect(purged).toEqual({ threads: 1, messages: 0 });
+  });
+
+  it('honors the tablePrefix', async () => {
+    // #given
+    const sqlite = openSqlite();
+    createThreadTables(sqlite, 'p_');
+    sqlite
+      .prepare(
+        'INSERT INTO p_mastra_threads (id, resourceId, updatedAt) VALUES (?, NULL, ?)',
+      )
+      .run('abc_idle', new Date(NOW - 40 * DAY_MS).toISOString());
+
+    // #when
+    const purged = await purgeExpiredThreads(d1Like(sqlite), {
+      ttlMs: 30 * DAY_MS,
+      tablePrefix: 'p_',
+      now: () => NOW,
+    });
+
+    // #then
+    expect(purged.threads).toBe(1);
+  });
+
+  it('surfaces a NON-missing-table message failure rather than orphaning the history', async () => {
+    // #given — a wedged messages table. Swallowing this would delete the
+    // threads whose messages survived, stranding them forever.
+    const sqlite = openSqlite();
+    createThreadTables(sqlite);
+    seedThreadAt(sqlite, 'abc_idle', NOW - 40 * DAY_MS, ['m1']);
+    const inner = d1Like(sqlite);
+    const wedgedDb: SnapshotDatabase = {
+      prepare: (sql: string) => {
+        if (sql.includes('DELETE FROM mastra_messages')) {
+          throw new Error('database is locked');
+        }
+        return inner.prepare(sql);
+      },
+    };
+
+    // #when / #then — the cron's error surface fires and the thread survives
+    await expect(
+      purgeExpiredThreads(wedgedDb, { ttlMs: 30 * DAY_MS, now: () => NOW }),
+    ).rejects.toThrow('database is locked');
+    expect(idsIn(sqlite, 'mastra_threads', 'id')).toEqual(['abc_idle']);
+    expect(idsIn(sqlite, 'mastra_messages', 'id')).toEqual(['m1']);
   });
 });
 

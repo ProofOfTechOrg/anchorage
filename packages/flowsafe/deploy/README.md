@@ -138,6 +138,16 @@ config-error: availability of both duties beats purity on a misconfig.)
   `R2ArtifactStore` as `artifactStore` (here and to `purgeTenant`): the
   snapshot row is the only record of a run's artifact keys, so an unpaired
   retention purge strands the purged runs' artifacts.
+- **Thread retention purge** — `purgeExpiredThreads()` deletes agent-memory
+  threads whose `updatedAt` is older than `THREAD_RETENTION_DAYS`, each with
+  its messages (a message has a `createdAt` but no `updatedAt`, so there is no
+  per-message idleness signal — its lifetime is its thread's, and it is
+  reachable only through it). A thread is deleted only when no message points
+  at it, so a send racing the purge can never be orphaned. LIMIT-batched per firing, same shrinking-eligible-set cursor.
+  Unset by default: unlike a terminal run snapshot, a conversation is not
+  finished by definition, so nothing expires until you name a number.
+  Working-memory rows (`mastra_resources`) are never touched here — they
+  belong to the owner across every thread, and go at offboarding.
 - **Approval retention purge** — `purgeExpiredApprovals()` deletes DECIDED
   (`approved`/`rejected`) approval records whose terminal timestamp
   (`decidedAt`, or `updatedAt` for a decided record persisted without one)
@@ -163,6 +173,7 @@ expressions byte-equal to crons.ts's `SWEEP_CRON`/`PURGE_CRON` constants.
 | `APPROVAL_ALLOW_SELF_DECISION` | var | unset (SoD ON) | Separation-of-duties exemption. Unset or a `false` spelling keeps SoD on; `true` lets any decider self-decide; a CSV of roles (e.g. `admin`) exempts only those — a single-operator deployment sets `admin`. Any invalid value falls back to OFF. Permitted self-decisions are audited (`detail.selfDecision: true`) |
 | `RUN_RETENTION_DAYS` | var | `30` | Terminal snapshot age before cron purge; `0` purges terminal runs immediately |
 | `APPROVAL_RETENTION_DAYS` | var | `30` | Decided (approved/rejected) approval record age before cron purge; `0` purges decided approvals immediately |
+| `THREAD_RETENTION_DAYS` | var | unset (threads never expire) | Agent-memory thread TTL: idle days before the purge cron deletes a thread and its messages. Unset leaves the duty unwired |
 | `AUDIT_QUEUE` | queue binding | unbound (logs only) | Enables audit export: events flow to the queue consumer |
 | `SIEM_ENDPOINT` | var | none (consumer retries) | HTTP event-collector URL the consumer POSTs NDJSON batches to |
 | `SIEM_AUTH_HEADER` | secret | none | Sent as the `authorization` header on export POSTs |

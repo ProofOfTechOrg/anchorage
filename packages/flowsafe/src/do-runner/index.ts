@@ -13,18 +13,24 @@ export type {
 export type {
   D1StorageOptions,
   PurgeExpiredRunsOptions,
+  PurgeExpiredThreadsOptions,
+  PurgeExpiredThreadsResult,
   PurgeTenantOptions,
   PurgeTenantResult,
   SnapshotDatabase,
   SnapshotStatement,
   TenantArtifactPurger,
+  TenantRangePurgeCounter,
+  TenantRangePurgeTable,
 } from './d1-storage.js';
 export {
   createD1Storage,
   d1Changes,
   ensureSnapshotRunIdIndex,
+  purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
   purgeTenant,
+  TENANT_RANGE_PURGE_TABLES,
 } from './d1-storage.js';
 export { DurableObjectRunner } from './durable-object.js';
 export type { HubStreamEvent, PresenceMember } from './hub-do.js';
@@ -49,6 +55,8 @@ export {
   TENANT_ID_PATTERN,
   tenantOfRunId,
 } from './path-safe-id.js';
+export type { HostPubSub } from './pubsub.js';
+export { createHostPubSub } from './pubsub.js';
 export type { ResumeLedger, ResumeLedgerStorage } from './resume-ledger.js';
 export {
   DurableStorageResumeLedger,
@@ -70,3 +78,9 @@ export {
   UnknownRunError,
   UnknownWorkflowError,
 } from './runtime.js';
+export type { ThreadScope } from './thread-do.js';
+export {
+  THREAD_TENANT_HEADER,
+  ThreadDurableObject,
+  ThreadIdentityError,
+} from './thread-do.js';
