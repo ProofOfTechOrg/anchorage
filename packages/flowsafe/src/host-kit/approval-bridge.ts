@@ -5,6 +5,7 @@
 // shares one implementation instead of re-deriving the (suspendedAt, resumeCount)
 // capture and the SoD-across-gates re-queue.
 
+import { agentGateConnectors } from '../agent-runner/approval-shapes.js';
 import {
   type ApprovalActor,
   type ApprovalAuditSink,
@@ -29,14 +30,35 @@ export type ResumeRunFn = (
   decision: ApprovalDecision,
 ) => Promise<RunSummary>;
 
-/** Steps declare the grants they need in their suspend payload. */
+/**
+ * The connector ids a suspended step's decision should mint. A workflow STEP
+ * gate declares them explicitly in a `connectors` array. An AGENT gate (Track A,
+ * R-003) declares none — it names the tool the model called by `toolName` (both
+ * durable suspend shapes), which IS the breakwater connector id the write gate
+ * checks; agentGateConnectors derives [toolName] so an approved agent gate mints
+ * the grant for exactly that connector and the round-trip closes. The explicit
+ * array wins when present, so workflow gates are unaffected.
+ *
+ * ACCEPTED RISK (narrow): the agent fallback is a workflow-agnostic shape sniff —
+ * a suspend payload has no workflowId to prove it came from the durable loop. A
+ * workflow author who both omits `connectors` AND independently shapes a gate as
+ * `{type:'approval', toolName, toolCallId}` (all three, the second discriminator
+ * that agentGateConnectors demands) would derive [toolName] where the pre-Track-A
+ * code returned []. It is inert unless that toolName also names a real connector
+ * the run calls; the shipped/showcase workflows all declare `connectors`, so none
+ * collide today. The right convention for workflow gates remains the explicit
+ * `connectors` array.
+ */
 export function requestedConnectors(stepPayload: unknown): string[] {
   if (stepPayload === null || typeof stepPayload !== 'object') return [];
   const connectors = (stepPayload as Record<string, unknown>).connectors;
-  return Array.isArray(connectors) &&
+  if (
+    Array.isArray(connectors) &&
     connectors.every((c): c is string => typeof c === 'string')
-    ? connectors
-    : [];
+  ) {
+    return connectors;
+  }
+  return agentGateConnectors(stepPayload);
 }
 
 /**

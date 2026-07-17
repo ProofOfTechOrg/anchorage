@@ -4,7 +4,11 @@
 // that suspends at the approval gate, kills the dev server, restarts it
 // on the SAME persisted state, decides the approval, and asserts the run
 // resumed and published. Scenario B proves a forged raw resume (no grant
-// minted) fails closed at the connector gate.
+// minted) fails closed at the connector gate. The AG scenarios (Track A,
+// M-002) prove the durable-agent approval-suspend shape (R-003) round-trips
+// through the SAME grant-only path: the bridge derives the connector to grant
+// from the agent's `toolName` (no explicit `connectors` array), an approval
+// mints it, and a forged agent-gate resume fails closed at that gate.
 //
 // Auth rides the worker's host-kit seam: every request presents one of the
 // LOCAL-ONLY spike bearer tokens (spike/worker.ts SPIKE_ACTORS). The C probe
@@ -41,6 +45,12 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const FAULT = process.env.SPIKE_VERIFY_FAULT || undefined;
 const RUN_BODY = {
   workflowId: 'demo-approval',
+  inputData: { topic: 'launch' },
+};
+// Track A: the agent tool-call gate suspends with the durable-agent approval
+// shape (R-003) rather than an explicit `connectors` array.
+const AGENT_RUN_BODY = {
+  workflowId: 'demo-agent-gate',
   inputData: { topic: 'launch' },
 };
 const AUTH = {
@@ -691,6 +701,104 @@ async function main() {
         String(selfDecide.body.error ?? '').includes('separation of duties'),
         'denial cites separation of duties',
         selfDecide.body.error,
+      );
+    },
+  );
+
+  // --- Track A agent gate (M-002): the durable-agent approval-suspend shape --
+  // (R-003) round-trips through the SAME grant-only path on workerd + D1. The
+  // gate suspends with { type:'approval', toolName } and NO explicit
+  // `connectors`, so this proves host-kit's bridge derives connectors:[toolName]
+  // from the agent shape (S2/round-trip), and a forged resume of it fails closed
+  // at the same grant gate (S5).
+  const agentRun = await step(
+    'AG1 agent gate: start -> suspends with the agent shape, connector derived',
+    async () => {
+      const { status, body } = await http('POST', '/runs', {
+        body: AGENT_RUN_BODY,
+        headers: AUTH.operator,
+      });
+      assert(status === 200, `POST /runs (agent) -> ${status}`, body);
+      assert(body.status === 'suspended', 'agent run suspended', body.status);
+      assert(
+        JSON.stringify(body.suspended?.[0]) === JSON.stringify(['agent-gate']),
+        "suspended[0] is ['agent-gate']",
+        body.suspended,
+      );
+      // The AGENT suspend shape, not a workflow `connectors` array.
+      assert(
+        body.suspendPayload?.['agent-gate']?.type === 'approval' &&
+          body.suspendPayload?.['agent-gate']?.toolName === 'demo-publisher',
+        'suspend payload is the agent tool-call shape (type/toolName)',
+        body.suspendPayload,
+      );
+      // R-003: the bridge derived the connector to grant FROM the agent shape.
+      assert(
+        Array.isArray(body.approval?.connectors) &&
+          body.approval.connectors.includes('demo-publisher'),
+        'approval connectors derived from toolName (R-003)',
+        body.approval,
+      );
+      return { runId: body.runId, approvalId: body.approval.id };
+    },
+  );
+
+  await step(
+    'AG2 agent gate: approve -> grant round-trips -> run publishes',
+    async () => {
+      const { status, body } = await http(
+        'POST',
+        `/api/approvals/${agentRun.approvalId}/decide`,
+        { headers: AUTH.reviewer, body: { decision: 'approve' } },
+      );
+      assert(status === 200, `decide (agent) -> ${status}`, body);
+      assert(
+        body.resume?.summary?.status === 'success',
+        'agent run resumed to success (engine-leg grant reached the connector)',
+        body.resume?.summary,
+      );
+      assert(
+        body.resume?.summary?.result?.published === true,
+        'agent run published under the derived grant',
+        body.resume?.summary?.result,
+      );
+    },
+  );
+
+  await step(
+    'AG3 agent gate forged-resume: no grant -> fails closed',
+    async () => {
+      const started = await http('POST', '/runs', {
+        body: AGENT_RUN_BODY,
+        headers: AUTH.operator,
+      });
+      assert(
+        started.status === 200 && started.body.status === 'suspended',
+        'forged-probe agent run suspended',
+        { status: started.status, body: started.body },
+      );
+      const forged = await http(
+        'POST',
+        `/runs/demo-agent-gate/${started.body.runId}/resume`,
+        {
+          headers: AUTH.operator,
+          body: {
+            step: started.body.suspended[0],
+            resumeData: { approved: true, decidedBy: 'mallory' },
+          },
+        },
+      );
+      assert(
+        forged.status === 200 && forged.body.status === 'failed',
+        'forged agent resume failed closed',
+        forged.body,
+      );
+      assert(
+        String(forged.body.error ?? '').includes(
+          'approval required and not granted',
+        ),
+        'agent gate error names the missing grant',
+        forged.body.error,
       );
     },
   );
