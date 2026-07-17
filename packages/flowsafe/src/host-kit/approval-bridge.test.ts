@@ -45,6 +45,41 @@ describe('requestedConnectors', () => {
     ['connectors as a non-array', { connectors: 'a' }, []],
     ['connectors with a non-string element', { connectors: ['a', 2] }, []],
     ['a valid connectors array', { connectors: ['a', 'b'] }, ['a', 'b']],
+    // Track A (R-003): an AGENT gate declares no connectors array — the tool the
+    // model called is derived from its (flat or nested) suspend shape.
+    [
+      'a FLAT agent gate',
+      { type: 'approval', toolCallId: 'c', toolName: 'send-email' },
+      ['send-email'],
+    ],
+    [
+      'a NESTED agent gate',
+      {
+        type: 'approval',
+        requireToolApproval: { toolCallId: 'c', toolName: 'send-email' },
+      },
+      ['send-email'],
+    ],
+    // Collision narrowing: a bare {type:'approval', toolName} without the
+    // toolCallId a real agent gate carries mints nothing (fail closed).
+    [
+      'an agent shape missing toolCallId',
+      { type: 'approval', toolName: 'send-email' },
+      [],
+    ],
+    // An explicit connectors array always wins, so a workflow gate is unaffected
+    // even if it also carries a toolName.
+    [
+      'an explicit connectors array beside a toolName',
+      { type: 'approval', toolName: 'ignored', connectors: ['real'] },
+      ['real'],
+    ],
+    // A non-'approval' suspend type is not an agent gate.
+    [
+      'a non-approval type with a toolName',
+      { type: 'suspension', toolName: 'x' },
+      [],
+    ],
   ])('returns %s -> the right list', (_label, payload, expected) => {
     expect(requestedConnectors(payload)).toEqual(expected);
   });

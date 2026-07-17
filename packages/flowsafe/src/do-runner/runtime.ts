@@ -426,14 +426,12 @@ export interface RunnerRuntimeOptions {
    * init()'s runtime from build(), and nothing else in the isolate can hand this
    * object a pubsub.
    *
-   * NOT PASSED TO CORE TODAY, deliberately (the `pubsub` getter exposes the
-   * held identity; nothing hands it to createRun yet). Track A (CI-M-002-002)
-   * passes it to the two `workflow.createRun({ runId })` sites below, which is
-   * the only place core accepts one; until then core defaults a fresh emitter
-   * per run. The field lands now because the seam is Track 0's deliverable and a
-   * pubsub no host can reach is not threaded — the alternative was Track A
-   * reaching outside its own file list to add it. Absent ⇒ undefined ⇒
-   * byte-identical.
+   * PASSED TO CORE at the two `workflow.createRun({ runId, pubsub })` sites in
+   * start()/resume() (CI-M-002-002) — the only place core accepts one; the
+   * `pubsub` getter still exposes the held identity so an agent runner sharing
+   * this isolate takes THIS instance rather than building a second feed. Absent
+   * ⇒ undefined ⇒ core defaults a fresh emitter per run ⇒ byte-identical to
+   * before this seam existed.
    */
   pubsub?: HostPubSub;
 }
@@ -482,8 +480,10 @@ export class RunnerRuntime {
   // keeps one small entry until the run is purged.
   #resumeLedger: ResumeLedger;
   readonly #resumeLedgerExplicit: boolean;
-  // The host DO's pubsub identity (RunnerRuntimeOptions.pubsub). Held, not yet
-  // consulted: Track A hands it to the createRun sites below (CI-M-002-002).
+  // The host DO's pubsub identity (RunnerRuntimeOptions.pubsub), threaded into
+  // both createRun sites below (CI-M-002-002) so a configured host publishes and
+  // replays on ONE shared feed. Undefined ⇒ core defaults a fresh emitter per
+  // run ⇒ byte-identical to before this seam existed.
   readonly #pubsub?: HostPubSub;
   #mastra?: Mastra;
 
@@ -584,7 +584,16 @@ export class RunnerRuntime {
       const requestContext = await this.#requestContextFor(workflowId, runId, {
         kind: 'start',
       });
-      const run = await workflow.createRun({ runId });
+      // Thread the host DO's pubsub identity into the run (CI-M-002-002). Core
+      // accepts `createRun({ runId, pubsub })` at every one of its OWN call
+      // sites (agent/durable index.js:5224/5541) and stamps it straight onto
+      // `new Run({ ..., pubsub: options?.pubsub })`, defaulting a FRESH
+      // EventEmitterPubSub when it is undefined. So an unconfigured host
+      // (#pubsub undefined) reaches the identical `new Run({ pubsub: undefined })`
+      // the prior `createRun({ runId })` produced — byte-identical, polling
+      // stays the fallback. A configured host gets ONE shared feed so publish
+      // and observe()/replay agree (do-runner/pubsub.ts).
+      const run = await workflow.createRun({ runId, pubsub: this.#pubsub });
       let result: CoreRunResult;
       try {
         result = await run.start({
@@ -636,7 +645,9 @@ export class RunnerRuntime {
         resumeCount:
           stepKey !== undefined ? priorCounts?.get(stepKey) : undefined,
       });
-      const run = await workflow.createRun({ runId });
+      // Same host pubsub identity as start() (CI-M-002-002) — see the note
+      // there; undefined stays byte-identical to `createRun({ runId })`.
+      const run = await workflow.createRun({ runId, pubsub: this.#pubsub });
       let result: CoreRunResult;
       try {
         result = await run.resume({

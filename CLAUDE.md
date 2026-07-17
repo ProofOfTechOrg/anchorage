@@ -234,6 +234,60 @@ before addressing and OVERWRITES the header from the resolved TenantContext;
 mint and verify ship together for stream-ticket's reason. Both DO shells share
 ONE error taxonomy (`doErrorResponse`).
 
+Track A — durable agents (2026-07-17, branch `feat/track-a-durable-agents` off
+`dev`; milestone M-002 of the long-running-agents program): drive Mastra's
+durable-agent loop through the ONE `RunnerRuntime` chokepoint so agent legs
+inherit INV-1, the per-leg `requestContextForRun` grant derivation, and the
+resume ledger — additive/opt-in, no existing signature or `ApprovalRecord`
+shape changed. **Spike S1 HELD** (verified against the on-disk `@mastra/core`
+1.50.0 dist): `DurableAgent.executeWorkflow(runId, workflowInput)` is the
+documented subclass override seam, `getWorkflow()` returns the agent-agnostic
+`durable-agentic-loop` workflow, and the tool-call step hands `tool.execute`
+the ENGINE-LEG requestContext from its step params (index.js: `params.requestContext`
+:3138 → `toolOptions` :3339 → `tool.execute` :3642) — so the primary
+subclass-override design (DL-010) stands, no fallback. New subpath
+`@proofoftech/flowsafe/agent-runner` (`src/agent-runner/`, subpath-only like
+host-kit — it imports the durable `Agent`): `createFlowsafeDurableAgent({ agent,
+runtime, cache?, pubsub?, maxSteps? })` returns a `DurableAgent` subclass whose
+`executeWorkflow` calls `runtime.start('durable-agentic-loop', { runId,
+inputData })` (loop registered on the runtime idempotently — one shared id,
+`agentId` in the input routes the agent). INV-1 is enforced at the PUBLIC
+boundary: `stream()`/`generate()`/`prepare()` are overridden to REQUIRE a
+caller-minted runId, because the inherited entry points take an optional runId
+and core would otherwise mint a tenant-less `crypto.randomUUID()` upstream of
+`executeWorkflow`
+(that run's snapshot would escape `purgeTenant`); `executeWorkflow` re-guards as
+defense in depth, and the agent's stream pubsub defaults to the runtime's
+identity (one feed per DO). `resume()` is inherited but never client-wired
+(resume flows only through the approval-decision path, P8/A-D2). Plus the pure, dependency-free
+R-003 shape helpers (`approval-shapes.ts`): `parseAgentApprovalSuspend` reads
+BOTH durable approval-suspend shapes (nested `{type:'approval',
+requireToolApproval:{toolCallId,toolName,args}}` and flat `{type:'approval',
+toolCallId,toolName,args}`), `agentGateConnectors` derives `[toolName]` (the
+connector id the write gate checks — `createConnector`'s `createTool({id})` ===
+the `toolName` the model calls === the string `approvalGranted()` looks up). The
+resume-routing `threadId`-capture seam (DL-002) is deferred to Track C — Track A
+hosts per-run, where resume routes by (workflowId, runId, stepPath) and needs no
+threadId, so the seam lands with the thread-DO that consumes it. CI-M-002-003's substantive change lands in **the
+record-creation/bridge path** (the CI behavior text's own words):
+host-kit's `requestedConnectors` now derives the agent-gate connector from the
+suspend shape when there is no explicit `connectors` array, so an approved agent
+gate mints exactly that grant on resume; `ApprovalService.decide`/`#resume` are
+reused UNCHANGED. `RunnerRuntime` now threads the host pubsub identity into both
+`createRun({ runId, pubsub })` sites (CI-M-002-002; undefined ⇒ core defaults a
+fresh emitter ⇒ byte-identical). The workerd `spike:verify` grows the AG
+scenarios proving the R-003 round-trip + forged-resume fail-closed on real
+workerd + D1. Live-isolate scope: the loop resolves the tool's execute closure
+from the in-process `globalRunRegistry` (populated by `stream()`); a resume
+after DO eviction must first rehydrate it with `DurableAgent.prepare()`
+(snapshot's `messageListState` wins) before `runtime.resume` — the S3 seam,
+owned by the host that wires the resume topology (an LLM-backed spike, deferred).
+That rehydration is a TRACKED PREREQUISITE for the first agent FEATURE shipped to
+a real DO host with approval gates (DO hibernation during a human approval wait
+is the common case, not an edge) — Track A ships the correct primitive that fails
+CLOSED without it (an availability re-deny, never a capability leak), not the
+end-to-end approval-gated agent product.
+
 Guardrails control room + one-page demo (control room merged 2026-07-14,
 PR #21; page unified 2026-07-15): the post-login showcase is ONE narrative
 page. On top, the control room (`packages/showcase/src/control-room/`) —

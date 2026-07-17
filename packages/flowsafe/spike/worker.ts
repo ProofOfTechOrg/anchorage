@@ -131,6 +131,13 @@ const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
       'research -> human approval gate -> grant-gated publish (the spike workflow)',
     sampleInput: { topic: 'launch' },
   },
+  {
+    id: 'demo-agent-gate',
+    title: 'Demo agent gate',
+    description:
+      'agent tool-call approval gate (R-003 suspend shape) -> grant-gated publish (Track A)',
+    sampleInput: { topic: 'launch' },
+  },
 ];
 
 // One factory per isolate, not per request: it owns the memoized schema-init
@@ -251,6 +258,69 @@ function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
     .then(research)
     .then(approval)
     .then(publish)
+    .commit();
+
+  // Track A agent-gate probe: the SAME grant-only loop, but the gate suspends
+  // with the durable-agent tool-call shape (R-003) — { type:'approval',
+  // toolName, ... } with NO explicit `connectors` array. host-kit's
+  // requestedConnectors derives connectors:[toolName] from it, so an approved
+  // agent gate mints the grant the publish step below demands, on workerd + D1.
+  // This mirrors the durable-agentic-loop's tool-call gate without needing an
+  // LLM; the full DurableAgent -> runtime.start drive is unit-tested in
+  // agent-runner/.
+  const agentGate = createStep({
+    id: 'agent-gate',
+    inputSchema: z.object({ topic: z.string() }),
+    outputSchema: z.object({ topic: z.string(), approved: z.boolean() }),
+    suspendSchema: z.object({
+      type: z.literal('approval'),
+      toolCallId: z.string(),
+      toolName: z.string(),
+      args: z.record(z.string(), z.unknown()),
+    }),
+    resumeSchema: z.object({
+      approved: z.boolean(),
+      comment: z.string().optional(),
+      decidedBy: z.string().optional(),
+    }),
+    execute: async ({ inputData, resumeData, suspend }) => {
+      if (!resumeData) {
+        return suspend({
+          type: 'approval',
+          toolCallId: 'call-1',
+          toolName: PUBLISH_CONNECTOR,
+          args: { topic: inputData.topic },
+        });
+      }
+      return { topic: inputData.topic, approved: resumeData.approved };
+    },
+  });
+
+  const agentPublish = createStep({
+    id: 'agent-publish',
+    inputSchema: z.object({ topic: z.string(), approved: z.boolean() }),
+    outputSchema: z.object({ topic: z.string(), published: z.boolean() }),
+    execute: async ({ inputData, requestContext }) => {
+      if (!inputData.approved) {
+        return { topic: inputData.topic, published: false };
+      }
+      const grants = requestContext.get(BREAKWATER_APPROVED_CONNECTORS_KEY);
+      if (!Array.isArray(grants) || !grants.includes(PUBLISH_CONNECTOR)) {
+        throw new Error(
+          `agent-publish: approval required and not granted for '${PUBLISH_CONNECTOR}'`,
+        );
+      }
+      return { topic: inputData.topic, published: true };
+    },
+  });
+
+  createWorkflow({
+    id: 'demo-agent-gate',
+    inputSchema: z.object({ topic: z.string() }),
+    outputSchema: z.object({ topic: z.string(), published: z.boolean() }),
+  })
+    .then(agentGate)
+    .then(agentPublish)
     .commit();
 
   return runtime;
