@@ -1123,6 +1123,130 @@ async function main() {
       );
     },
   );
+
+  // --- Track F goals (M-005) ------------------------------------------------
+  // Prove the goal objective surface writes the mastra_thread_state domain and
+  // that the DURABLE goal-step read path (resolveGoalStore -> readObjective over
+  // the COMPOSED storage) reads it back — including across a workerd restart (the
+  // DO-eviction analog). No LLM: the real goal LOOP is Track A's deferred residual.
+  const GOAL_OBJECTIVE = 'ship the launch checklist';
+  let goalRecord;
+  await step(
+    'K goal set + read path (F-S1): an objective set via the route lands in D1 ' +
+      'and the durable goal-step read path returns it',
+    async () => {
+      const set = await http('POST', '/goal/set');
+      assert(set.status === 200, `goal set probe -> ${set.status}`, set.body);
+      assert(
+        set.body.status === 200,
+        `objective route accepted the set -> ${set.body.status}`,
+        set.body,
+      );
+      assert(
+        set.body.record?.objective === GOAL_OBJECTIVE &&
+          set.body.record?.status === 'active' &&
+          set.body.record?.runsUsed === 0 &&
+          set.body.record?.maxRuns === 5,
+        'stored record is the fresh active goal (byte shape)',
+        set.body.record,
+      );
+      assert(
+        set.body.audited.includes('accepted:'),
+        'the accepted write was audited (goal.objective)',
+        set.body.audited,
+      );
+      goalRecord = set.body.record;
+
+      // resolveGoalStore over our composed storage resolves the thread-state
+      // domain, and readObjective returns exactly what the route wrote.
+      const read = await http('GET', '/goal/read');
+      assert(
+        read.status === 200,
+        `goal read probe -> ${read.status}`,
+        read.body,
+      );
+      assert(
+        read.body.storeResolved === true,
+        'resolveGoalStore resolved the composed thread-state domain',
+        read.body,
+      );
+      assert(
+        read.body.record?.objective === GOAL_OBJECTIVE &&
+          read.body.record?.id === goalRecord.id,
+        'the goal-step read path returns the record the route wrote',
+        read.body.record,
+      );
+    },
+  );
+
+  await step(
+    'L goal fail-closed (F-S3): a cross-tenant write is 404 + audited, and an ' +
+      'over-cap maxRuns is rejected + audited',
+    async () => {
+      const cross = await http('POST', '/goal/cross-tenant');
+      assert(
+        cross.status === 200,
+        `cross-tenant probe -> ${cross.status}`,
+        cross.body,
+      );
+      assert(
+        cross.body.status === 404,
+        'a foreign-threadId objective write is 404 (no existence oracle)',
+        cross.body,
+      );
+      assert(
+        cross.body.audited.includes('rejected:foreign-thread'),
+        'the cross-tenant write was audited',
+        cross.body.audited,
+      );
+
+      const overCap = await http('POST', '/goal/over-cap');
+      assert(
+        overCap.status === 200,
+        `over-cap probe -> ${overCap.status}`,
+        overCap.body,
+      );
+      assert(
+        overCap.body.status === 400,
+        'an over-cap maxRuns is rejected (never clamped)',
+        overCap.body,
+      );
+      assert(
+        overCap.body.audited.includes('rejected:maxruns-over-cap'),
+        'the over-cap rejection was audited',
+        overCap.body.audited,
+      );
+    },
+  );
+
+  await step(
+    'M goal eviction (F-S2): the objective survives a workerd kill+restart and ' +
+      'the goal-step read path still returns it (D1, not a registry)',
+    async () => {
+      await killServer(currentServer);
+      currentServer = undefined;
+      currentServer = startServer('gen-4', stateDir, join(tmpDir, 'gen4.log'));
+      await waitReady(currentServer, 90_000);
+      assert(
+        !/address already in use/i.test(currentServer.chunks.join('')),
+        'gen-4 log must not contain "address already in use" (orphan trap)',
+      );
+
+      const read = await http('GET', '/goal/read');
+      assert(
+        read.status === 200,
+        `post-restart goal read -> ${read.status}`,
+        read.body,
+      );
+      assert(
+        read.body.storeResolved === true &&
+          read.body.record?.objective === GOAL_OBJECTIVE &&
+          read.body.record?.id === goalRecord.id,
+        'the DO-evicted goal record is still readable from D1 after restart',
+        read.body.record,
+      );
+    },
+  );
 }
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
@@ -1148,7 +1272,10 @@ try {
       'Track C (M-004): a send into an ACTIVE thread-DO loop drained IN-PROCESS ' +
       'via the shared-pubsub registry (C-S2, the DL-002 affinity thesis), and a ' +
       'foreign-threadId send failed closed at BOTH the topology 404 and the DO ' +
-      'header 403 (C-S4).',
+      'header 403 (C-S4). Track F (M-005): an objective set via the route landed ' +
+      'in mastra_thread_state and the durable goal-step read path returned it ' +
+      '(F-S1), survived a kill+restart (F-S2), and a cross-tenant write + over-cap ' +
+      'maxRuns failed closed and audited (F-S3).',
   );
 } catch (error) {
   exitCode = 1;

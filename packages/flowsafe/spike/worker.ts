@@ -56,6 +56,7 @@ import type {
 import { Agent } from '@mastra/core/agent';
 import { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
+import { readObjective, resolveGoalStore } from '@mastra/core/tools';
 import {
   AuditLogger,
   ConnectorPolicyError,
@@ -95,6 +96,10 @@ import {
   tenantOwnsMemoryId,
 } from '../src/do-runner/index.js';
 import {
+  createObjectiveRouter,
+  type ObjectiveAuditEvent,
+} from '../src/goals/index.js';
+import {
   bearerActorAuthenticator,
   createHubTopology,
   createRunRouter,
@@ -104,7 +109,11 @@ import {
   staticTokenVerifier,
   type WorkflowMeta,
 } from '../src/host-kit/index.js';
-import { createThreadSignalRoutes } from '../src/signals/index.js';
+import {
+  createSignalStorageDomains,
+  createThreadSignalRoutes,
+  D1ThreadStateStorage,
+} from '../src/signals/index.js';
 
 interface Env {
   DB: D1Database;
@@ -678,6 +687,120 @@ async function handleSignalProbe(
   return null;
 }
 
+// --- Track F (M-005) goal probes -------------------------------------------
+// LOCAL-ONLY worker-level probes (spike tenant 'spike'), driven by
+// scripts/spike-verify.mjs:
+//  - F-S1 (read path): an objective SET via the real createObjectiveRouter lands
+//    in mastra_thread_state; the DURABLE goal-step read path (resolveGoalStore
+//    -> readObjective over our COMPOSED storage) returns exactly what was written.
+//  - F-S2 (eviction): the record is in D1, so it survives a dev-server restart —
+//    spike-verify kills+restarts and reads it back (a DO-evicted goal still sees
+//    it, because it lives in D1, not an in-process registry).
+//  - F-S3 (fail-closed): a cross-tenant write to a foreign threadId is 404 +
+//    audited; an over-cap maxRuns is rejected + audited.
+const GOAL_THREAD_ID = 'spike_fsgoal';
+const GOAL_OBJECTIVE = 'ship the launch checklist';
+
+// The composed storage a durable host builds: the D1Store default with the Track
+// C signal domains (notifications + thread-state) over it, so
+// resolveGoalStore(mastra).getStore('threadState') resolves our D1ThreadStateStorage
+// — the EXACT store the goal step reads through.
+function goalMastra(env: Env): Mastra {
+  return new Mastra({
+    storage: createD1Storage({
+      binding: env.DB as unknown as never,
+      domains: createSignalStorageDomains(env.DB as unknown as never),
+    }),
+  });
+}
+
+async function handleGoalProbe(
+  request: Request,
+  env: Env,
+): Promise<Response | null> {
+  const path = new URL(request.url).pathname;
+  if (!path.startsWith('/goal/')) return null;
+
+  // A partial resolver createObjectiveRouter accepts: the probe controls the
+  // tenant + role (the real host uses createTenantResolver).
+  const ctxFor = (
+    tenantId: string,
+    role: ApprovalActor['role'],
+  ): TenantContext =>
+    ({
+      tenantId,
+      actor: { id: 'goal-probe', role, tenantId },
+      ownsMemoryId: (id: string) => tenantOwnsMemoryId(tenantId, id),
+    }) as unknown as TenantContext;
+
+  // The SAME D1 domain a durable host wires (createSignalStorageDomains uses it).
+  const store = new D1ThreadStateStorage(env.DB as unknown as never);
+
+  // Drive the REAL objective router (full P6-lite gate), capturing the audit.
+  const driveSet = async (
+    tenantId: string,
+    body: Record<string, unknown>,
+    maxRunsCap?: number,
+  ): Promise<{ status: number; record: unknown; audited: string[] }> => {
+    const events: ObjectiveAuditEvent[] = [];
+    const router = createObjectiveRouter({
+      resolve: async () => ctxFor(tenantId, 'operator'),
+      store,
+      audit: (event) => {
+        events.push(event);
+      },
+      ...(maxRunsCap !== undefined ? { maxRunsCap } : {}),
+    });
+    const res = await router(
+      new Request(`http://do/api/threads/${GOAL_THREAD_ID}/goal`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
+    );
+    const record =
+      res && res.status === 200
+        ? ((await res.json()) as { objective: unknown }).objective
+        : null;
+    return {
+      status: res?.status ?? 0,
+      record,
+      audited: events.map((e) => `${e.outcome}:${e.reason ?? ''}`),
+    };
+  };
+
+  if (request.method === 'POST' && path === '/goal/set') {
+    return json(
+      await driveSet('spike', { objective: GOAL_OBJECTIVE, maxRuns: 5 }),
+    );
+  }
+
+  // The DURABLE goal-step read path over our COMPOSED storage: resolveGoalStore
+  // must resolve the thread-state domain, and readObjective return the record.
+  if (request.method === 'GET' && path === '/goal/read') {
+    const resolved = await resolveGoalStore(goalMastra(env));
+    const record = await readObjective(resolved, GOAL_THREAD_ID);
+    return json({
+      storeResolved: resolved !== undefined,
+      record: record ?? null,
+    });
+  }
+
+  // F-S3: tenant 'other' writing spike's threadId -> 404 + audited (no oracle).
+  if (request.method === 'POST' && path === '/goal/cross-tenant') {
+    return json(await driveSet('other', { objective: 'foreign write' }));
+  }
+
+  // F-S3: a maxRuns above the host cap -> 400 + audited.
+  if (request.method === 'POST' && path === '/goal/over-cap') {
+    return json(
+      await driveSet('spike', { objective: 'too big', maxRuns: 999 }, 10),
+    );
+  }
+
+  return null;
+}
+
 const handler: ExportedHandler<Env> = {
   async fetch(
     request: CfRequest,
@@ -715,6 +838,11 @@ const handler: ExportedHandler<Env> = {
     // unauthenticated, ahead of the routers.
     const sigProbe = await handleSignalProbe(routed, env);
     if (sigProbe) return sigProbe;
+
+    // Track F probes (F-S1 read path, F-S2 eviction read, F-S3 fail-closed) —
+    // local, unauthenticated, ahead of the routers.
+    const goalProbe = await handleGoalProbe(routed, env);
+    if (goalProbe) return goalProbe;
 
     // Stream stage BEFORE approvals (same order as the composer). The Worker is
     // the SOLE ticket authority; the hub/runner DOs re-bind by their own
