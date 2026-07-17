@@ -42,6 +42,7 @@ import {
   approvalRequired,
   assertEgressHostList,
   ISOLATION_SCOPE_CONTEXT_KEY,
+  LLM_BACKGROUND_OVERRIDE_KEY,
   networkEgress,
 } from '../policy-engine/tool-policy.js';
 import { actorFromRequestContext } from '../rbac/index.js';
@@ -76,6 +77,18 @@ export interface PermissionManifest {
    * not).
    */
   rateLimit?: string;
+  /**
+   * Connector opts INTO Mastra background execution (DL-005). Default
+   * undefined = foreground-only: the wrapper rejects tool-call args carrying a
+   * `_background` override (core `LLMBackgroundOverride`), because a write /
+   * approval-carrying call the model silently flips to background changes its
+   * execution context, timing, and approval topology. Only a READ-ONLY
+   * connector may set this — a write-class connector opting in throws at
+   * construction (v1 keeps write connectors foreground-only). The
+   * `backgroundExecution` tool-policy evaluator is the defense-in-depth
+   * counterpart at the policy layer.
+   */
+  background?: boolean;
 }
 
 export interface IdempotencyRecord {
@@ -402,6 +415,19 @@ function approvalGranted(
   return Array.isArray(value) && value.includes(connectorId);
 }
 
+// The `_background` model-override field (core LLMBackgroundOverride) smuggled
+// into tool-call args. Presence alone is the smuggling signal — a foreground-
+// only connector must never receive it, whatever its `enabled` value — so this
+// is the field-presence check, stricter than the backgroundExecution
+// evaluator's resolved-eligibility read (which permits enabled:false).
+function hasBackgroundOverride(input: unknown): boolean {
+  return (
+    typeof input === 'object' &&
+    input !== null &&
+    LLM_BACKGROUND_OVERRIDE_KEY in input
+  );
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -513,6 +539,15 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   if (config.dryRunExecute && !manifest.dryRun) {
     throw new TypeError(
       `connector ${id}: config.dryRunExecute requires permissions.dryRun (the manifest must declare what the connector supports)`,
+    );
+  }
+  // v1: only a read-only connector may opt into background execution (DL-005).
+  // A write / destructive / idempotent connector carries a side effect whose
+  // approval topology the background flip would move off the foreground path,
+  // so opting one in is a construction-time error, not a runtime denial.
+  if (manifest.background && manifest.sideEffect !== 'read') {
+    throw new TypeError(
+      `connector ${id}: permissions.background is only allowed on a read-only connector (sideEffect 'read'); a ${manifest.sideEffect}-class connector is foreground-only in v1`,
     );
   }
   const rateLimitSpec =
@@ -777,6 +812,36 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   ): Promise<TOutput> {
     const requestContext = context?.requestContext;
     const typedInput = inputData as TInput;
+
+    // _background model-override defense (DL-005), FIRST — before the gates,
+    // the dry-run branch, and any execute. A `_background` field in the args
+    // asks the runtime to flip this call to background execution, a topology
+    // change a foreground-only connector must never take. Reject its presence
+    // outright unless the manifest opts in (read-only tools only, enforced at
+    // construction). Same argv-flag-smuggling posture as agent-cli buildFlags;
+    // fires for BOTH execute and dryRunExecute (both route through here).
+    //
+    // REACH (accuracy): this is DEFENSE-IN-DEPTH for direct / nested programmatic
+    // calls, NOT the agent-path guard. On the AGENT path core deletes
+    // `_background` from the tool-call args before dispatch (`delete args
+    // ._background`), UNCONDITIONALLY — schema or not — so this presence check
+    // sees clean args and fires on nothing there. What actually stops the model
+    // backgrounding a call on the agent path is core's OWN `resolveBackgroundConfig`
+    // baseEnabled gate: a breakwater connector sets no background config, so the
+    // tool is ineligible and the override cannot enable it. This check's
+    // independent teeth are direct / nested calls that hand args straight to
+    // execute, bypassing core's agent dispatch (and its stripping) entirely. And
+    // on EVERY path — including inside the background executor — the real write
+    // boundary is the requestContext GRANT gate below, not this check. The
+    // `backgroundExecution` tool-policy evaluator is the same defense-in-depth at
+    // the gate loop.
+    if (!manifest.background && hasBackgroundOverride(inputData)) {
+      deny(
+        requestContext,
+        'background',
+        `tool-call args carry a '${LLM_BACKGROUND_OVERRIDE_KEY}' override but this connector is foreground-only (the manifest does not opt into background execution)`,
+      );
+    }
 
     // The base egress guard is built once at construction; this per-call
     // wrapper binds only this call's requestContext so an egress denial

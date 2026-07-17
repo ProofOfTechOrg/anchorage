@@ -12,6 +12,8 @@ export type {
 } from './cf-types.js';
 export type {
   D1StorageOptions,
+  PurgeExpiredBackgroundTasksOptions,
+  PurgeExpiredBackgroundTasksResult,
   PurgeExpiredRunsOptions,
   PurgeExpiredThreadsOptions,
   PurgeExpiredThreadsResult,
@@ -24,9 +26,11 @@ export type {
   TenantRangePurgeTable,
 } from './d1-storage.js';
 export {
+  BACKGROUND_TASK_TTL_PURGE_TABLES,
   createD1Storage,
   d1Changes,
   ensureSnapshotRunIdIndex,
+  purgeExpiredBackgroundTasks,
   purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
   purgeTenant,
@@ -59,6 +63,7 @@ export {
   PATH_SAFE_ID_PATTERN,
   TENANT_ID_PATTERN,
   tenantOfRunId,
+  tenantOwnsSaltedId,
 } from './path-safe-id.js';
 export type { HostPubSub } from './pubsub.js';
 export { createHostPubSub } from './pubsub.js';

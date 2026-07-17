@@ -822,6 +822,7 @@ export {
   piiSecrets,
 } from './content-inspection.js';
 export type {
+  BackgroundExecutionOptions,
   CrossWorkflowIsolationOptions,
   NetworkEgressOptions,
   PolicyDecision,
@@ -835,9 +836,11 @@ export type {
 // there (the leaf module) and is shared by both seams.
 export {
   approvalRequired,
+  backgroundExecution,
   crossWorkflowIsolation,
   egressDomainAllowed,
   ISOLATION_SCOPE_CONTEXT_KEY,
+  LLM_BACKGROUND_OVERRIDE_KEY,
   networkEgress,
   tenantIsolation,
   WORKFLOW_SCOPE_CONTEXT_KEY,

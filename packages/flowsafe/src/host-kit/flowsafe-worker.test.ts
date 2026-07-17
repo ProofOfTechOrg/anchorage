@@ -481,6 +481,78 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     });
   });
 
+  // Track B: the background-task TTL cleanup as the purge cron's opt-in duty.
+  async function seedOldCompletedTask(env: FlowsafeWorkerEnv): Promise<void> {
+    await env.DB.prepare(
+      `CREATE TABLE mastra_background_tasks (
+        id TEXT PRIMARY KEY, run_id TEXT NOT NULL, status TEXT NOT NULL,
+        completedAt TEXT, createdAt TEXT NOT NULL)`,
+    ).run();
+    const old = new Date(Date.now() - 2 * 3_600_000).toISOString();
+    await env.DB.prepare(
+      'INSERT INTO mastra_background_tasks (id, run_id, status, completedAt, createdAt) VALUES (?, ?, ?, ?, ?)',
+    )
+      .bind('bg1', 'acme_r1', 'completed', old, old)
+      .run();
+  }
+
+  it('leaves the background-task TTL UNWIRED by default: no config.backgroundTasks, no duty', async () => {
+    // #given — the opt-in posture; background tasks are unconfigured
+    const logs = capturedLogs();
+    const worker = makeWorker();
+    const { env, ctx, flush } = makeEnv();
+    await seedOldCompletedTask(env);
+
+    // #when
+    await worker.scheduled({ cron: PURGE }, env, ctx);
+    await flush();
+
+    // #then — the duty never ran, byte-identical to before Track B
+    const lines = maintenanceLines(logs.lines());
+    expect(lines[0]).not.toHaveProperty('backgroundTasksCompletedPurged');
+    expect(logs.errors()).toEqual([]);
+  });
+
+  it('config.backgroundTasks wires the background-task TTL cleanup into the purge cron, folded into the ONE line', async () => {
+    // #given — a completed task 2h old under the default 1h completed TTL
+    const logs = capturedLogs();
+    const worker = makeWorker({ backgroundTasks: {} });
+    const { env, ctx, flush } = makeEnv();
+    await seedOldCompletedTask(env);
+
+    // #when
+    await worker.scheduled({ cron: PURGE }, env, ctx);
+    await flush();
+
+    // #then — reaped, reported in the combined maintenance line
+    const lines = maintenanceLines(logs.lines());
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({
+      backgroundTasksCompletedPurged: 1,
+      backgroundTasksFailedPurged: 0,
+      approvalsPurged: 0,
+    });
+  });
+
+  it('the SWEEP cron never runs the background-task purge (the two-cron split holds)', async () => {
+    // #given
+    const logs = capturedLogs();
+    const worker = makeWorker({ backgroundTasks: {} });
+    const { env, ctx, flush } = makeEnv();
+    await seedOldCompletedTask(env);
+
+    // #when
+    await worker.scheduled({ cron: SWEEP }, env, ctx);
+    await flush();
+
+    // #then — a CPU-limit kill is uncatchable, so the sweep carries no purge work
+    const lines = maintenanceLines(logs.lines());
+    expect(lines[0]).not.toHaveProperty('backgroundTasksCompletedPurged');
+    expect(
+      await env.DB.prepare('SELECT id FROM mastra_background_tasks').all(),
+    ).toBeDefined();
+  });
+
   it('the SWEEP cron never runs the thread purge (the two-cron split holds)', async () => {
     // #given
     const logs = capturedLogs();

@@ -43,6 +43,7 @@ import {
 } from '../../test-support/sqlite.js';
 import type { SnapshotDatabase, SnapshotStatement } from './d1-storage.js';
 import {
+  BACKGROUND_TASK_TTL_PURGE_TABLES,
   createD1Storage,
   purgeTenant,
   RUN_TTL_PURGE_TABLES,
@@ -136,9 +137,14 @@ type PurgeCoverage = 'run-id-range' | 'tenant-range' | 'unadopted';
 type RetentionStory =
   | { kind: 'run-ttl' }
   | { kind: 'thread-ttl' }
+  /** Track B: rows expire via purgeExpiredBackgroundTasks (completedAt TTL). */
+  | { kind: 'background-task-ttl' }
   /** Rows die with their parent's TTL rather than aging out on their own. */
   | { kind: 'cascade'; with: string }
   | { kind: 'none'; because: string };
+
+/** The age-based TTL kinds — each anchored to a real exported purge inventory. */
+type TtlKind = 'run-ttl' | 'thread-ttl' | 'background-task-ttl';
 
 describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
   // The ONE reason an unadopted table carries — hoisted so the coverage↔reason
@@ -156,11 +162,8 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
   }> = [
     {
       table: 'mastra_background_tasks',
-      coverage: 'unadopted',
-      retention: {
-        kind: 'none',
-        because: UNADOPTED_NO_RETENTION,
-      },
+      coverage: 'tenant-range',
+      retention: { kind: 'background-task-ttl' },
     },
     {
       table: 'mastra_messages',
@@ -232,7 +235,7 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
       table: string,
     ): RetentionStory['kind'] | undefined =>
       MASTRA_TABLES.find((entry) => entry.table === table)?.retention.kind;
-    const accountedFor = (kind: 'run-ttl' | 'thread-ttl'): string[] =>
+    const accountedFor = (kind: TtlKind): string[] =>
       MASTRA_TABLES.filter((entry) => {
         if (entry.retention.kind === kind) return true;
         // A cascade rides its parent's purge, so it is a target of that purge.
@@ -250,6 +253,9 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     expect(accountedFor('run-ttl')).toEqual([...RUN_TTL_PURGE_TABLES].sort());
     expect(accountedFor('thread-ttl')).toEqual(
       [...THREAD_TTL_PURGE_TABLES].sort(),
+    );
+    expect(accountedFor('background-task-ttl')).toEqual(
+      [...BACKGROUND_TASK_TTL_PURGE_TABLES].sort(),
     );
 
     // ...and every cascade names a parent that EXISTS and itself expires. The
@@ -378,6 +384,31 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     // HERE, not in a cross-tenant purge
     expect(columns).toContain('run_id');
     expect(columns).toContain('workflow_name');
+  });
+
+  it('mastra_background_tasks keeps the columns Track B purges ride on (run_id range + completedAt/status TTL)', async () => {
+    // #given — the real adapter creates the table eagerly (Track B adopted it)
+    const sqlite = openSqlite();
+    const storage = createD1Storage({
+      binding: d1DatabaseLike(sqlite) as never,
+    });
+    const { runtime } = buildGated(storage);
+    await runtime.start('gated', { runId: 'abc_r1', inputData: {} });
+
+    // #when
+    const columns = (
+      sqlite.prepare('PRAGMA table_info(mastra_background_tasks)').all() as {
+        name: string;
+      }[]
+    ).map((column) => column.name);
+
+    // #then — purgeTenant ranges over run_id (snake_case, the originating run's
+    // INV-1 salted id); purgeExpiredBackgroundTasks reaps by status + completedAt.
+    // A @mastra/cloudflare-d1 bump renaming any of them fails HERE, not in a
+    // cross-tenant purge or a silently-inert TTL duty.
+    expect(columns).toContain('run_id');
+    expect(columns).toContain('status');
+    expect(columns).toContain('completedAt');
   });
 
   it('a resume racing purgeTenant FAILS without re-executing the gated step or re-creating the snapshot', async () => {

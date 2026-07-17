@@ -17,6 +17,7 @@ const PURGED: PurgeTenantResult = {
   threads: 0,
   messages: 0,
   resources: 0,
+  backgroundTasks: 0,
   approvals: 1,
   artifacts: 0,
 };

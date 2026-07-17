@@ -29,10 +29,12 @@ import {
 import type { AuditMessageBatch, AuditQueue } from '../audit-export/index.js';
 import { createAuditQueueHandler } from '../audit-export/index.js';
 import type {
+  PurgeExpiredBackgroundTasksResult,
   SnapshotDatabase,
   TenantArtifactPurger,
 } from '../do-runner/index.js';
 import {
+  purgeExpiredBackgroundTasks,
   purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
 } from '../do-runner/index.js';
@@ -117,6 +119,18 @@ export interface FlowsafeWorkerEnv {
   SIEM_AUTH_HEADER?: string;
 }
 
+/**
+ * Track B background-task TTL cleanup config, surfaced through
+ * FlowsafeWorkerConfig (DL-003). Mirrors core BackgroundTaskManager.cleanup's
+ * two windows.
+ */
+export interface BackgroundTasksCleanupConfig {
+  /** Completed rows past this age expire. Default 3_600_000 (1h). */
+  completedTtlMs?: number;
+  /** Failed / cancelled / timed_out rows past this age expire. Default 86_400_000 (24h). */
+  failedTtlMs?: number;
+}
+
 export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
   /** The catalog createRunRouter serves and gates (hosts pass their metas). */
   workflows: ReadonlyArray<WorkflowMeta>;
@@ -183,6 +197,15 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
    * deleted, when the keys are already unenumerable.
    */
   artifactStore?: TenantArtifactPurger;
+  /**
+   * Opt-in background-task TTL cleanup (Track B). When present, the purge cron
+   * reaps terminal `mastra_background_tasks` rows past the TTL as its OWN
+   * failure-isolated duty — the storage-layer belt to a hosting DO's manager
+   * cleanup (which needs the DO alive). Absent => no duty, byte-identical
+   * (background tasks are opt-in). NOT via extraPurgeDuties: this needs its own
+   * try/catch and its own log fields, like every sibling purge duty.
+   */
+  backgroundTasks?: BackgroundTasksCleanupConfig;
   /**
    * Extra purge-cron duties (e.g. the showcase's demo-tenant reaper). The
    * returned fields fold into the ONE combined `{type:'maintenance'}` log
@@ -359,6 +382,27 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         );
       }
     }
+    // Background-task TTL cleanup (Track B, opt-in). Its OWN try/catch, like
+    // every sibling duty: a wedged background-task purge must cost the
+    // run-snapshot, approval, and thread purges nothing.
+    let backgroundTasksPurged: PurgeExpiredBackgroundTasksResult | undefined;
+    if (config.backgroundTasks) {
+      try {
+        backgroundTasksPurged = await purgeExpiredBackgroundTasks(env.DB, {
+          completedTtlMs: config.backgroundTasks.completedTtlMs,
+          failedTtlMs: config.backgroundTasks.failedTtlMs,
+        });
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            type: 'maintenance-error',
+            surface: 'background-task-purge',
+            cron,
+            error: String(error),
+          }),
+        );
+      }
+    }
     let extra: Record<string, unknown> = {};
     if (config.extraPurgeDuties) {
       try {
@@ -382,6 +426,8 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         approvalsPurged,
         threadsPurged,
         threadMessagesPurged,
+        backgroundTasksCompletedPurged: backgroundTasksPurged?.completed,
+        backgroundTasksFailedPurged: backgroundTasksPurged?.failed,
         ...extra,
       }),
     );
