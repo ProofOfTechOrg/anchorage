@@ -1,0 +1,56 @@
+# signals/
+
+Track C (M-004): signals, subscriptions, notifications — additive, opt-in
+ingestion for the long-running-agents program. Subpath-only export
+`@proofoftech/flowsafe/signals` (like `agent-runner`/`background-tasks`): host
+wiring a consumer opts into, never the root barrel.
+
+The two halves mirror the run surface's Worker-gate → DO-execution split:
+`createSignalRouter` is the Worker-side P6 ingestion trust boundary (DL-006);
+`createThreadSignalRoutes` runs ON the per-thread DO, after its tenant identity
+is asserted (DL-002). Between them, `createThreadTopology` (host-kit) stamps the
+tenant header the thread DO authenticates on.
+
+## Files
+
+| File | What | When to read |
+| ---- | ---- | ------------ |
+| `router.ts` | `createSignalRouter` — the P6 ingestion gate (DL-006): resolve → role → thread-prefix ownership (404, no oracle) → size-cap → memory-id refusal → attribute-key allowlist → per-tenant rate cap → audit → forward via the topology. Every ingest is audited (`signal.ingest`), accepted OR rejected, INCLUDING the three post-auth denials (role 403, cross-tenant 404, memory-id 400); pre-auth failures (401 / resolver throw) are not audited. `createInMemorySignalRateLimiter` is the single-instance default limiter | Changing the ingestion gate, its order, the audit surface, or the rate seam |
+| `thread-do-routes.ts` | `createThreadSignalRoutes` — the message/queue/signal/state/notification routes hosted on the thread DO. Stamps `scope.init.pubsub` onto the agent so a send drains IN-PROCESS into an active loop (the DL-002 affinity carrier). The idle-WAKE is the only path that starts a run, so it requires a RUNTIME-DRIVEN agent (`RUNTIME_DRIVEN_AGENT` brand, `isRuntimeDrivenAgent`) — a plain agent's wake is refused fail-closed (degraded to a durable persist, `wakeRefused:'not-runtime-driven'`); an allowed wake consults the run cap (DL-007). Validates `tagName` as an XML name at ingest (C-S5 route-level defense) | Changing the thread routes, the wake gate, the affinity stamp, or the tagName defense |
+| `notifications-d1.ts` | `D1NotificationsStorage` over `mastra_notifications` (the AGENT inbox), mirroring core's InMemory reference incl. `#findCoalescable` coalescing (deterministic `ORDER BY createdAt`). Composed into `createD1Storage` via `createSignalStorageDomains` | Changing the notifications domain or coalescing |
+| `thread-state-d1.ts` | `D1ThreadStateStorage` over `mastra_thread_state` — the state-signal lanes (snapshot/delta, cacheKey dedupe) and, reused by Track F, the goal record | Changing the thread-state domain |
+| `d1-shared.ts` | The structural `SignalDatabase`/`SignalStatement` D1 subset (workers-types-free) both domains share, plus the ISO/JSON column helpers | Changing the D1 seam or column encodings |
+| `storage.ts` | `createSignalStorageDomains(binding)` — packages the two D1 domains for injection into `createD1Storage({ domains })` (do-runner cannot import signals directly — it would cycle) | Wiring D1-durable notifications + thread-state into a host |
+| `client.ts` | `SignalClient` — a DOM-free client in the `ApprovalApiClient` mold (injected fetch). The SEND surface only; live subscribe (DL-016) is phase 2 | Changing the client wire surface |
+| `index.ts` | Subpath barrel (`@proofoftech/flowsafe/signals`) | Finding the signals export surface |
+| `router.test.ts` | The P6 gate: order, each fail-closed status, and the audit assertions (accepted + the three post-auth rejections; 401 NOT audited) | Changing the gate or its audit |
+| `thread-do-routes.test.ts` | The thread routes: affinity stamp, channel routing, the wake gate (runtime-driven vs plain agent), the tagName defense, state de-dupe — plus the C-S5 `signalToXmlMarkup` render pin (core neutralizes contents/attribute values) | Changing the thread routes or the C-S5 pin |
+| `notifications-d1.test.ts` | Round-trip / coalescing / `listDue` (summaryAt, `<=` boundary, batch ordering + limit) / `#findCoalescable` determinism | Changing the notifications domain |
+| `thread-state-d1.test.ts` | Thread-state round-trip / snapshot-replace / delete | Changing the thread-state domain |
+| `client.test.ts` | `SignalClient` wire-format + error mapping | Changing the client |
+| `signal-ingestion.integration.test.ts` | The FULL chain, no LLM: `createSignalRouter` → real `createThreadTopology` → real `ThreadDurableObject` → a runtime-driven reserve agent — idle wake with the run cap allowing and capping, and a foreign threadId 404'd at the topology | Changing any seam on the ingestion boundary |
+
+## Close-before-wiring notes
+
+- **`listDueNotifications` is GLOBALLY UNSCOPED by tenant** (mirrors core's
+  InMemory reference — a cron dispatcher's cross-thread sweep). It is a TCB-only
+  read (no client route reaches it), so it is not a leak here. But when Track A
+  wires the delivery dispatcher, that dispatcher MUST scope each dispatch by the
+  row's salted `resourceId` (`${tenantId}_…`) / per-thread `threadId` before it
+  acts, or a cross-tenant sweep would deliver one tenant's inbox into another's
+  loop. Close this before the dispatcher ships (F3).
+- **Phase-2 live subscribe must be scoped SERVER-side per thread / per
+  resourceId** — NOT the per-tenant Part B hub + client-side threadId filter,
+  which would put one end-user's thread bytes on every same-tenant operator's
+  socket (a within-tenant confidentiality leak). See `client.ts` (DL-016
+  corrected).
+
+## Browser-clean barrel (F3-arch)
+
+The `signals` **barrel** (`index.ts`) transitively pulls the Node graph — `router`
+imports host-kit + do-runner, `thread-do-routes` imports `agent-runner` (which
+drags the durable `Agent` and `@mastra`'s Node built-ins). So the SPA MUST import
+`SignalClient` from a DOM-clean deep path (`@flowsafe/signals/client` /
+`packages/flowsafe/src/signals/client.ts`), NEVER the barrel — mirroring the
+breakwater browser-clean-subpath rule (only `/policy-engine` `/rbac` `/audit` are
+bundle-safe). `client.ts` imports nothing heavy; keep it that way.

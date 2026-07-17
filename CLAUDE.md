@@ -234,6 +234,46 @@ before addressing and OVERWRITES the header from the resolved TenantContext;
 mint and verify ship together for stream-ticket's reason. Both DO shells share
 ONE error taxonomy (`doErrorResponse`).
 
+Track C — signals, subscriptions, notifications (M-004, 2026-07-17, branch
+`feat/track-c-signals`; additive, opt-in). New subpath
+`@proofoftech/flowsafe/signals`: `createThreadSignalRoutes` mounts the thread-DO
+signal routes (message/queue/signal/state/notification) and stamps
+`scope.init.pubsub` onto the agent before every call — the DL-002 AFFINITY
+carrier: core keys its in-process signal registry (`#statesByPubSub`) by the
+pubsub instance, so a send drains into an active loop ONLY when both share the DO
+isolate AND the pubsub (proven on workerd, spike C-S2 step I: an idle-wake
+reserves a run, a second send resolves `action:'deliver'` to it — in-process, no
+LLM; the real LLM-driven loop consuming the signal is Track A's deferred
+residual). `agentThreadStreamRuntime` is NOT on core's exports map, so the routes
+drive the public Agent methods only (no deep-dist import, R-001).
+`D1NotificationsStorage` + `D1ThreadStateStorage` are flowsafe-owned D1 domains
+over `mastra_notifications`/`mastra_thread_state` (the `@mastra/cloudflare-d1`
+1.1.1 adapter ships neither), mirroring core's InMemory reference incl.
+`findCoalescable`; composed into `createD1Storage` via an INJECTED `domains`
+param (`createSignalStorageDomains` — do-runner cannot import signals/, which
+imports it back) as a wrapping `MastraCompositeStore({ default: d1, domains })`,
+so `agent.sendNotificationSignal` persists to D1. Both tables register in the
+DL-003 triad in the SAME change: `TENANT_RANGE_PURGE_TABLES` (ranged over their
+salted `thread_id`, counters `notifications`/`threadState` + the
+`PurgeTenantResult` fields the compile-pin forces), the schema-guard
+`MASTRA_TABLES` inventory (now 8 tables, tenant-range +
+`notification-ttl`/`thread-state-ttl`), and their own TTL purges
+(`purgeExpiredNotifications` reaps terminal rows past `updatedAt` keeping pending;
+`purgeExpiredThreadState` by `updatedAt`; both opt-in via
+`NOTIFICATION_RETENTION_DAYS`/`THREAD_STATE_RETENTION_DAYS`, each a
+failure-isolated purge-cron duty). `createSignalRouter` is the P6 ingestion trust
+boundary (DL-006): resolve → coarse role → thread-prefix ownership (404 before
+the DO, no oracle) → `assertNoClientMemoryIds` → attribute-key allowlist + 16 KiB
+size cap → per-tenant rate cap → `signal.ingest` audit → forward via
+`createThreadTopology.send` (which OVERWRITES the tenant header, so a forged one
+can't ride along — cross-tenant fail-closed at BOTH the topology 404 and the DO
+403, spike C-S4 step J). `createFlowsafeWorker` mounts the signal stage via an
+injected `buildSignalRouter` seam (host builds the router — avoids the
+host-kit→signals cycle), gated on the host wiring it; absent ⇒ byte-identical.
+DOM-free `SignalClient` (ApprovalApiClient mold). Signals never mint capability —
+`sendToolApproval` is not an approval surface (P8), the dashboard stays the
+decision path. Live subscribe reuses the Part B hub transport (DL-016) — phase 2.
+
 Track A — durable agents (2026-07-17, branch `feat/track-a-durable-agents` off
 `dev`; milestone M-002 of the long-running-agents program): drive Mastra's
 durable-agent loop through the ONE `RunnerRuntime` chokepoint so agent legs

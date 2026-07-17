@@ -6,9 +6,18 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { openSqlite, type SqliteDatabase } from '../../test-support/sqlite.js';
+import {
+  d1DatabaseLike,
+  openSqlite,
+  type SqliteDatabase,
+} from '../../test-support/sqlite.js';
+import type { SignalDatabase } from '../signals/d1-shared.js';
+import { D1NotificationsStorage } from '../signals/notifications-d1.js';
+import { D1ThreadStateStorage } from '../signals/thread-state-d1.js';
 import {
   purgeExpiredBackgroundTasks,
+  purgeExpiredNotifications,
+  purgeExpiredThreadState,
   purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
   purgeTenant,
@@ -537,6 +546,8 @@ describe('purgeTenant (complete offboarding)', () => {
       messages: 0,
       resources: 0,
       backgroundTasks: 0,
+      notifications: 0,
+      threadState: 0,
       approvals: 1,
       artifacts: 2,
     });
@@ -675,6 +686,8 @@ describe('purgeTenant (complete offboarding)', () => {
       messages: 0,
       resources: 0,
       backgroundTasks: 0,
+      notifications: 0,
+      threadState: 0,
       approvals: 0,
       artifacts: 0,
     });
@@ -706,6 +719,8 @@ describe('purgeTenant (complete offboarding)', () => {
       messages: 0,
       resources: 0,
       backgroundTasks: 0,
+      notifications: 0,
+      threadState: 0,
       approvals: 1,
       artifacts: 0,
     });
@@ -728,6 +743,8 @@ describe('purgeTenant (complete offboarding)', () => {
       messages: 0,
       resources: 0,
       backgroundTasks: 0,
+      notifications: 0,
+      threadState: 0,
       approvals: 0,
       artifacts: 0,
     });
@@ -1689,5 +1706,182 @@ describe('purgeTenant background-task coverage (DL-003)', () => {
     // #when / #then — no throw, counter is zero
     const result = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
     expect(result.backgroundTasks).toBe(0);
+  });
+});
+
+// --- Track C (M-004) signal-domain retention + offboarding -----------------
+// The two flowsafe-owned tables are created by their D1 domains (the adapter
+// ships neither), then seeded with RAW inserts so the timestamps are precise.
+async function signalDb(sqlite: SqliteDatabase): Promise<SignalDatabase> {
+  const db = d1DatabaseLike(sqlite) as unknown as SignalDatabase;
+  await new D1NotificationsStorage(db, '').init();
+  await new D1ThreadStateStorage(db, '').init();
+  return db;
+}
+
+function seedNotification(
+  db: SqliteDatabase,
+  row: { id: string; threadId: string; status: string; updatedAt: number },
+): void {
+  const iso = new Date(row.updatedAt).toISOString();
+  db.prepare(
+    `INSERT INTO mastra_notifications
+       (id, thread_id, source, kind, priority, status, summary, coalescedCount,
+        createdAt, updatedAt, deliveryAttempts)
+     VALUES (?, ?, 'x', 'y', 'medium', ?, 'z', 1, ?, ?, 0)`,
+  ).run(row.id, row.threadId, row.status, iso, iso);
+}
+
+function seedThreadState(
+  db: SqliteDatabase,
+  row: { threadId: string; type: string; updatedAt: number },
+): void {
+  const iso = new Date(row.updatedAt).toISOString();
+  db.prepare(
+    `INSERT INTO mastra_thread_state (thread_id, type, value, updatedAt)
+     VALUES (?, ?, '{}', ?)`,
+  ).run(row.threadId, row.type, iso);
+}
+
+describe('purgeExpiredNotifications', () => {
+  it('reaps TERMINAL rows past the TTL and keeps pending ones', async () => {
+    // #given — a delivered row long past the TTL, a fresh delivered row, and a
+    // pending row (even an ancient one) that must survive.
+    const sqlite = openSqlite();
+    await signalDb(sqlite);
+    seedNotification(sqlite, {
+      id: 'old-delivered',
+      threadId: 'abc_t1',
+      status: 'delivered',
+      updatedAt: NOW - 2 * DAY_MS,
+    });
+    seedNotification(sqlite, {
+      id: 'fresh-delivered',
+      threadId: 'abc_t1',
+      status: 'delivered',
+      updatedAt: NOW,
+    });
+    seedNotification(sqlite, {
+      id: 'ancient-pending',
+      threadId: 'abc_t1',
+      status: 'pending',
+      updatedAt: NOW - 30 * DAY_MS,
+    });
+
+    // #when — one-day TTL
+    const deleted = await purgeExpiredNotifications(d1Like(sqlite), {
+      ttlMs: DAY_MS,
+      now: () => NOW,
+    });
+
+    // #then — only the old TERMINAL row went; pending is never reaped by age.
+    expect(deleted).toBe(1);
+    const ids = (
+      sqlite
+        .prepare('SELECT id FROM mastra_notifications ORDER BY id')
+        .all() as { id: string }[]
+    ).map((r) => r.id);
+    expect(ids).toEqual(['ancient-pending', 'fresh-delivered']);
+  });
+
+  it('reads a missing table as zero', async () => {
+    const sqlite = openSqlite();
+    expect(
+      await purgeExpiredNotifications(d1Like(sqlite), { ttlMs: DAY_MS }),
+    ).toBe(0);
+  });
+});
+
+describe('purgeExpiredThreadState', () => {
+  it('reaps rows past the updatedAt TTL and keeps fresh ones', async () => {
+    // #given — an abandoned goal (old) and an active one (fresh)
+    const sqlite = openSqlite();
+    await signalDb(sqlite);
+    seedThreadState(sqlite, {
+      threadId: 'abc_t1',
+      type: 'goal',
+      updatedAt: NOW - 10 * DAY_MS,
+    });
+    seedThreadState(sqlite, {
+      threadId: 'abc_t2',
+      type: 'goal',
+      updatedAt: NOW,
+    });
+
+    // #when
+    const deleted = await purgeExpiredThreadState(d1Like(sqlite), {
+      ttlMs: DAY_MS,
+      now: () => NOW,
+    });
+
+    // #then
+    expect(deleted).toBe(1);
+    const rows = sqlite
+      .prepare('SELECT thread_id FROM mastra_thread_state')
+      .all() as { thread_id: string }[];
+    expect(rows.map((r) => r.thread_id)).toEqual(['abc_t2']);
+  });
+
+  it('reads a missing table as zero', async () => {
+    const sqlite = openSqlite();
+    expect(
+      await purgeExpiredThreadState(d1Like(sqlite), { ttlMs: DAY_MS }),
+    ).toBe(0);
+  });
+});
+
+describe('purgeTenant — Track C signal tables', () => {
+  it('reaps notifications + thread-state by the salted thread_id range, exactly one tenant', async () => {
+    // #given — two tenants' rows keyed by salted threadIds (same suffix)
+    const sqlite = openSqlite();
+    await signalDb(sqlite);
+    seedNotification(sqlite, {
+      id: 'abc-n1',
+      threadId: 'abc_t1',
+      status: 'pending',
+      updatedAt: NOW,
+    });
+    seedNotification(sqlite, {
+      id: 'xyz-n1',
+      threadId: 'xyz_t1',
+      status: 'pending',
+      updatedAt: NOW,
+    });
+    seedThreadState(sqlite, {
+      threadId: 'abc_t1',
+      type: 'goal',
+      updatedAt: NOW,
+    });
+    seedThreadState(sqlite, {
+      threadId: 'xyz_t1',
+      type: 'goal',
+      updatedAt: NOW,
+    });
+    // A prefix-neighbor ('abc5') that must NOT fall in the 'abc' range.
+    seedNotification(sqlite, {
+      id: 'abc5-n1',
+      threadId: 'abc5_t1',
+      status: 'pending',
+      updatedAt: NOW,
+    });
+
+    // #when — offboard exactly 'abc'
+    const purged = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
+
+    // #then — abc's rows only; the counters name them; xyz + abc5 survive.
+    expect(purged.notifications).toBe(1);
+    expect(purged.threadState).toBe(1);
+    const notifIds = (
+      sqlite
+        .prepare('SELECT id FROM mastra_notifications ORDER BY id')
+        .all() as { id: string }[]
+    ).map((r) => r.id);
+    expect(notifIds).toEqual(['abc5-n1', 'xyz-n1']);
+    const stateThreads = (
+      sqlite.prepare('SELECT thread_id FROM mastra_thread_state').all() as {
+        thread_id: string;
+      }[]
+    ).map((r) => r.thread_id);
+    expect(stateThreads).toEqual(['xyz_t1']);
   });
 });

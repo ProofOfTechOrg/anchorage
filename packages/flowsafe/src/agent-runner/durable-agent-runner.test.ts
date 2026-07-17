@@ -26,6 +26,7 @@ import {
   createFlowsafeDurableAgent,
   DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
   type FlowsafeDurableAgent,
+  isRuntimeDrivenAgent,
 } from './durable-agent-runner.js';
 
 // A fake runtime that records register() and start() and models the shared-id
@@ -113,6 +114,19 @@ describe('createFlowsafeDurableAgent', () => {
     createFlowsafeDurableAgent({ agent: testAgent('b'), runtime });
     // #then register fires once, not twice ('duplicate workflow id' avoided)
     expect(register).toHaveBeenCalledTimes(1);
+  });
+
+  it('carries the RUNTIME_DRIVEN_AGENT brand; a plain Agent does not', () => {
+    // #given a durable agent + a plain core Agent
+    const { runtime } = fakeRuntime();
+    const durable = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
+    // #then the brand distinguishes the runtime-driven agent from a plain one —
+    // the property Track C's thread-DO wake gate requires (a plain Agent's wake
+    // would run the loop OFF the runtime).
+    expect(isRuntimeDrivenAgent(durable)).toBe(true);
+    expect(isRuntimeDrivenAgent(testAgent())).toBe(false);
+    expect(isRuntimeDrivenAgent({})).toBe(false);
+    expect(isRuntimeDrivenAgent(undefined)).toBe(false);
   });
 });
 

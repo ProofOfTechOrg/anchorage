@@ -35,6 +35,8 @@ import type {
 } from '../do-runner/index.js';
 import {
   purgeExpiredBackgroundTasks,
+  purgeExpiredNotifications,
+  purgeExpiredThreadState,
   purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
 } from '../do-runner/index.js';
@@ -113,6 +115,21 @@ export interface FlowsafeWorkerEnv {
    * take numberVar's fallback — see optionalNumberVar in env-vars.ts.
    */
   THREAD_RETENTION_DAYS?: string;
+  /**
+   * Track C agent-inbox TTL in days (var). The purge cron reaps TERMINAL
+   * `mastra_notifications` rows past this age (pending rows are never reaped —
+   * one may await a future deliverAt). UNSET/EMPTY/INVALID => the duty does not
+   * run and no notification ever expires (opt-in, like THREAD_RETENTION_DAYS —
+   * a durable inbox is meant to be readable until the host says otherwise).
+   */
+  NOTIFICATION_RETENTION_DAYS?: string;
+  /**
+   * Track C thread-state TTL in days (var). The purge cron reaps
+   * `mastra_thread_state` rows (state-signal lanes + goals) untouched for longer
+   * than this. UNSET/EMPTY/INVALID => the duty does not run (opt-in; an active
+   * goal bumps updatedAt so it never ages out).
+   */
+  THREAD_STATE_RETENTION_DAYS?: string;
   /** Optional audit export: queue producer binding + SIEM collector config. */
   AUDIT_QUEUE?: AuditQueue<ApprovalAuditEvent>;
   SIEM_ENDPOINT?: string;
@@ -206,6 +223,20 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
    * try/catch and its own log fields, like every sibling purge duty.
    */
   backgroundTasks?: BackgroundTasksCleanupConfig;
+  /**
+   * Opt-in Track C signal ingestion stage (P6, DL-006). The host builds its
+   * `createSignalRouter` (which needs its per-thread DO namespace via
+   * createThreadTopology, plus its audit/rate/allowlist config) and returns it
+   * here, closed over the request's resolved TenantResolver; the composer mounts
+   * it after preRoutes, ahead of approvals/runs (its `/api/threads/*` routes
+   * don't overlap). INJECTED rather than built here because createSignalRouter
+   * lives in `signals/`, which imports host-kit — host-kit importing it back
+   * would cycle. Absent (or returns undefined) => no signal stage, byte-identical.
+   */
+  buildSignalRouter?: (
+    resolve: TenantResolver,
+    env: Env,
+  ) => ((request: Request) => Promise<Response | null>) | undefined;
   /**
    * Extra purge-cron duties (e.g. the showcase's demo-tenant reaper). The
    * returned fields fold into the ONE combined `{type:'maintenance'}` log
@@ -403,6 +434,53 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         );
       }
     }
+    // Track C notification TTL (opt-in). Its OWN try/catch, like every sibling
+    // duty. optionalNumberVar (GATES the duty; unset/garbage => do not delete).
+    let notificationsPurged: number | undefined;
+    const notificationRetentionDays = optionalNumberVar(
+      env.NOTIFICATION_RETENTION_DAYS,
+      'NOTIFICATION_RETENTION_DAYS',
+      { allowZero: true },
+    );
+    if (notificationRetentionDays !== undefined) {
+      try {
+        notificationsPurged = await purgeExpiredNotifications(env.DB, {
+          ttlMs: notificationRetentionDays * 24 * 60 * 60 * 1000,
+        });
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            type: 'maintenance-error',
+            surface: 'notification-purge',
+            cron,
+            error: String(error),
+          }),
+        );
+      }
+    }
+    // Track C thread-state TTL (opt-in). Same isolation + opt-in posture.
+    let threadStatePurged: number | undefined;
+    const threadStateRetentionDays = optionalNumberVar(
+      env.THREAD_STATE_RETENTION_DAYS,
+      'THREAD_STATE_RETENTION_DAYS',
+      { allowZero: true },
+    );
+    if (threadStateRetentionDays !== undefined) {
+      try {
+        threadStatePurged = await purgeExpiredThreadState(env.DB, {
+          ttlMs: threadStateRetentionDays * 24 * 60 * 60 * 1000,
+        });
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            type: 'maintenance-error',
+            surface: 'thread-state-purge',
+            cron,
+            error: String(error),
+          }),
+        );
+      }
+    }
     let extra: Record<string, unknown> = {};
     if (config.extraPurgeDuties) {
       try {
@@ -428,6 +506,8 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         threadMessagesPurged,
         backgroundTasksCompletedPurged: backgroundTasksPurged?.completed,
         backgroundTasksFailedPurged: backgroundTasksPurged?.failed,
+        notificationsPurged,
+        threadStatePurged,
         ...extra,
       }),
     );
@@ -495,6 +575,15 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           runner: env.RUNNER,
         })(request);
         if (streamResponse) return streamResponse;
+      }
+
+      // Optional Track C signal stage (P6): the host-built createSignalRouter,
+      // closed over THIS request's resolver. `/api/threads/*` — composes ahead
+      // of approvals/runs without overlap. Absent seam => unmounted.
+      const signalRouter = config.buildSignalRouter?.(resolve, env);
+      if (signalRouter) {
+        const signalResponse = await signalRouter(request);
+        if (signalResponse) return signalResponse;
       }
 
       const approvalResponse = await createApprovalRouter({ resolve })(request);

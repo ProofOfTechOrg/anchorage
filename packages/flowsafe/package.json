@@ -36,6 +36,7 @@
     "./do-runner": "./dist/do-runner/index.js",
     "./host-kit": "./dist/host-kit/index.js",
     "./host-kit/module": "./dist/host-kit/module.js",
+    "./signals": "./dist/signals/index.js",
     "./package.json": "./package.json"
   },
   "scripts": {

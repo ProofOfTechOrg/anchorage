@@ -7,14 +7,16 @@
   "durable_objects": {
     "bindings": [
       { "name": "RUNNER", "class_name": "DemoRunner" },
-      { "name": "HUB", "class_name": "DemoHub" }
+      { "name": "HUB", "class_name": "DemoHub" },
+      { "name": "THREAD", "class_name": "DemoThread" }
     ]
   },
-  // Append-only DO migrations: the v1 runner tag is frozen; the hub ships under
-  // its own new v2 tag.
+  // Append-only DO migrations: the v1 runner + v2 hub tags are frozen; the Track
+  // C per-thread DO ships under its own new v3 tag.
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["DemoRunner"] },
-    { "tag": "v2", "new_sqlite_classes": ["DemoHub"] }
+    { "tag": "v2", "new_sqlite_classes": ["DemoHub"] },
+    { "tag": "v3", "new_sqlite_classes": ["DemoThread"] }
   ],
   "d1_databases": [
     {

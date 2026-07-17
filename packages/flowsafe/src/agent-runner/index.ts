@@ -17,4 +17,6 @@ export {
   DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
   FlowsafeDurableAgent,
   type FlowsafeDurableAgentOptions,
+  isRuntimeDrivenAgent,
+  RUNTIME_DRIVEN_AGENT,
 } from './durable-agent-runner.js';
