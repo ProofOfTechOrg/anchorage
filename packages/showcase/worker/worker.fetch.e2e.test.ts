@@ -379,6 +379,8 @@ describe('showcase worker fetch(): the demo-reset mount', () => {
         backgroundTasks: 0,
         notifications: 0,
         threadState: 0,
+        schedules: 0,
+        scheduleTriggers: 0,
         approvals: 1,
         artifacts: 0,
       },

@@ -302,6 +302,10 @@ export function runApiDevPlugin(): Plugin {
         // sweep the in-memory notifications + thread-state domains here.
         notifications: 0,
         threadState: 0,
+        // No showcase workflow registers schedules (Track D); when one does,
+        // sweep the in-memory schedules + schedule-triggers domains here.
+        schedules: 0,
+        scheduleTriggers: 0,
         approvals: storeFactory.purgeTenant(tenantId),
         artifacts: 0,
       };

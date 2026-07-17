@@ -110,6 +110,10 @@ import {
   type WorkflowMeta,
 } from '../src/host-kit/index.js';
 import {
+  createScheduleTick,
+  D1SchedulesStorage,
+} from '../src/schedules/index.js';
+import {
   createSignalStorageDomains,
   createThreadSignalRoutes,
   D1ThreadStateStorage,
@@ -355,6 +359,53 @@ function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
   })
     .then(agentGate)
     .then(agentPublish)
+    .commit();
+
+  // Track D (M-006) D-S2 probe: a workflow the schedule tick fires through the DO.
+  // Its ONE step ECHOES what reached the leg, so the spike can assert the
+  // stored-context barrier. The FORGED connector id planted in the schedule ROW's
+  // stored requestContext must NOT appear in the leg's grant list: the topology
+  // start carries only inputData (stored context dropped), and the DO's own
+  // approvalGrantProvider mints `breakwater.approvedConnectors` from APPROVED
+  // records (an EMPTY [] for this fresh run) which WINS via #requestContextFor's
+  // last-spread — two independent reasons the forged value can never become a
+  // grant. `reservedLeaked` checks the VALUE (does the grant include the forged
+  // id), NOT mere key presence (the key is legitimately present as []). The
+  // runtime-derived scope keys ARE present (it ran through RunnerRuntime), and the
+  // benign stored key is absent (stored context dropped on the DO path).
+  const schedEcho = createStep({
+    id: 'echo',
+    inputSchema: z.object({}),
+    outputSchema: z.object({
+      reservedLeaked: z.boolean(),
+      workflowScopePresent: z.boolean(),
+      isolationScopePresent: z.boolean(),
+      customPresent: z.boolean(),
+    }),
+    execute: async ({ requestContext }) => {
+      const grants = requestContext.get(BREAKWATER_APPROVED_CONNECTORS_KEY);
+      return {
+        reservedLeaked:
+          Array.isArray(grants) && grants.includes('forged-connector'),
+        workflowScopePresent:
+          requestContext.get('breakwater.workflowScope') !== undefined,
+        isolationScopePresent:
+          requestContext.get('breakwater.isolationScope') !== undefined,
+        customPresent: requestContext.get('sched.note') !== undefined,
+      };
+    },
+  });
+  createWorkflow({
+    id: 'sched-echo',
+    inputSchema: z.object({}),
+    outputSchema: z.object({
+      reservedLeaked: z.boolean(),
+      workflowScopePresent: z.boolean(),
+      isolationScopePresent: z.boolean(),
+      customPresent: z.boolean(),
+    }),
+  })
+    .then(schedEcho)
     .commit();
 
   return runtime;
@@ -801,6 +852,115 @@ async function handleGoalProbe(
   return null;
 }
 
+// --- Track D (M-006) schedule probes ---------------------------------------
+// LOCAL-ONLY worker-level probes (spike tenant 'spike'), driven by
+// scripts/spike-verify.mjs, over the flowsafe-owned D1 schedules domain:
+//  - D-S1 (exactly-once): two CONCURRENT ticks over one due schedule fire EXACTLY
+//    once (the CAS updateScheduleNextFire), one 'published' trigger row, nextFireAt
+//    advanced once — on real workerd + D1.
+//  - D-S2 (barrier + INV-1): a workflow-target schedule fires through the DO's
+//    RunnerRuntime with a fresh INV-1 runId (`spike_<uuid>`); a reserved key
+//    planted directly in the ROW's stored requestContext (a compromised row) is
+//    ABSENT from the executing leg — the DO derives the leg context solely via
+//    #requestContextFor (the topology start carries only inputData), so the DO's
+//    own scope keys ARE present and the stored context is dropped fail-closed.
+async function handleScheduleProbe(
+  request: Request,
+  env: Env,
+): Promise<Response | null> {
+  const path = new URL(request.url).pathname;
+  if (!path.startsWith('/sched/')) return null;
+  const store = new D1SchedulesStorage(env.DB as unknown as never);
+  const now = Date.now();
+
+  if (request.method === 'POST' && path === '/sched/exactly-once') {
+    const id = `schedule_${crypto.randomUUID()}`;
+    await store.createSchedule({
+      id,
+      target: { type: 'workflow', workflowId: 'sched-echo', inputData: {} },
+      cron: '* * * * *',
+      status: 'active',
+      nextFireAt: now - 1000,
+      createdAt: now,
+      updatedAt: now,
+      metadata: { tenantId: 'spike' },
+    });
+    // A recording start seam — D-S1 proves the CAS, not the run itself.
+    let fireCount = 0;
+    const tick = createScheduleTick({
+      store,
+      start: async (_wf, runId) => {
+        fireCount += 1;
+        return { runId };
+      },
+    });
+    const [a, b] = await Promise.all([tick(), tick()]);
+    const triggers = await store.listTriggers(id);
+    const sched = await store.getSchedule(id);
+    return json({
+      fires: a.fired + b.fired,
+      lost: a.lost + b.lost,
+      fireCount,
+      published: triggers.filter((t) => t.outcome === 'published').length,
+      advanced: (sched?.nextFireAt ?? 0) > now - 1000,
+    });
+  }
+
+  if (request.method === 'POST' && path === '/sched/barrier') {
+    const id = `schedule_${crypto.randomUUID()}`;
+    await store.createSchedule({
+      id,
+      target: {
+        type: 'workflow',
+        workflowId: 'sched-echo',
+        inputData: {},
+        // A reserved key planted in the ROW (simulating a compromised row that
+        // bypassed the facade's create-time rejection) + a benign one.
+        requestContext: {
+          [BREAKWATER_APPROVED_CONNECTORS_KEY]: ['forged-connector'],
+          'sched.note': 'benign',
+        },
+      },
+      cron: '* * * * *',
+      status: 'active',
+      nextFireAt: now - 1000,
+      createdAt: now,
+      updatedAt: now,
+      metadata: { tenantId: 'spike' },
+    });
+    let firedRunId: string | undefined;
+    let firedStatus: string | undefined;
+    let firedLeg: unknown;
+    const tick = createScheduleTick({
+      store,
+      // Fire through the DO topology (the production path) — the tick mints the
+      // INV-1 runId and the DO runs sched-echo, echoing its leg context keys.
+      start: async (workflowId, runId, inputData) => {
+        firedRunId = runId;
+        const summary = await doSummary(
+          await runStub(env, workflowId, runId).fetch('http://do/runs', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ workflowId, runId, inputData }),
+          }),
+        );
+        firedStatus = summary.status;
+        firedLeg = summary.result;
+        return summary;
+      },
+    });
+    const result = await tick();
+    return json({
+      fired: result.fired,
+      runId: firedRunId ?? null,
+      status: firedStatus ?? null,
+      leg: firedLeg ?? null,
+    });
+  }
+
+  return null;
+}
+
 const handler: ExportedHandler<Env> = {
   async fetch(
     request: CfRequest,
@@ -843,6 +1003,11 @@ const handler: ExportedHandler<Env> = {
     // local, unauthenticated, ahead of the routers.
     const goalProbe = await handleGoalProbe(routed, env);
     if (goalProbe) return goalProbe;
+
+    // Track D probes (D-S1 exactly-once, D-S2 barrier + INV-1) — local,
+    // unauthenticated, ahead of the routers.
+    const schedProbe = await handleScheduleProbe(routed, env);
+    if (schedProbe) return schedProbe;
 
     // Stream stage BEFORE approvals (same order as the composer). The Worker is
     // the SOLE ticket authority; the hub/runner DOs re-bind by their own

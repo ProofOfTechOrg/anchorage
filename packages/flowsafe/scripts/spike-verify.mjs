@@ -1247,6 +1247,82 @@ async function main() {
       );
     },
   );
+
+  // --- Track D schedules (M-006) --------------------------------------------
+  // WE OWN THE TICK (DL-012): listDueSchedules -> CAS claim -> fire, bypassing
+  // core's pubsub worker loop. The two load-bearing proofs: exactly-once under
+  // concurrent ticks (the CAS), and the stored-context barrier + INV-1 mint on a
+  // real DO fire.
+  await step(
+    'N schedule exactly-once (D-S1): two CONCURRENT ticks over one due schedule ' +
+      'fire EXACTLY once (CAS), one trigger row, nextFireAt advanced once',
+    async () => {
+      const { status, body } = await http('POST', '/sched/exactly-once');
+      assert(status === 200, `sched exactly-once probe -> ${status}`, body);
+      // One of the two concurrent ticks won the CAS; the other lost — proving the
+      // updateScheduleNextFire compare-and-swap serializes the claim on real D1.
+      assert(
+        body.fires === 1,
+        'exactly ONE fire across two concurrent ticks',
+        body,
+      );
+      assert(body.lost === 1, 'the OTHER tick lost the CAS claim', body);
+      assert(body.fireCount === 1, 'the start seam ran exactly once', body);
+      assert(body.published === 1, 'exactly one published trigger row', body);
+      assert(
+        body.advanced === true,
+        'nextFireAt advanced once (the fire is consumed, never hot-looped)',
+        body,
+      );
+    },
+  );
+
+  await step(
+    'O schedule barrier + INV-1 (D-S2): a workflow schedule fires through ' +
+      'RunnerRuntime with a fresh INV-1 runId and the stored-context barrier holds',
+    async () => {
+      const { status, body } = await http('POST', '/sched/barrier');
+      assert(status === 200, `sched barrier probe -> ${status}`, body);
+      assert(body.fired === 1, 'the workflow target fired', body);
+      // INV-1: the tick minted a tenant-salted `spike_<uuid>` runId, never a bare
+      // crypto.randomUUID.
+      assert(
+        typeof body.runId === 'string' && body.runId.startsWith('spike_'),
+        'the fired runId is INV-1 (<tenantId>_<uuid>)',
+        body,
+      );
+      assert(
+        body.status === 'success',
+        'the DO ran sched-echo through RunnerRuntime to completion',
+        body,
+      );
+      // The barrier: the FORGED connector id planted in the schedule ROW's stored
+      // requestContext never becomes a grant on the executing leg — the topology
+      // start carries only inputData (stored context dropped), and the DO's own
+      // approvalGrantProvider mints an EMPTY grant list that wins. (The grant KEY
+      // is legitimately present as []; the forged VALUE is what must not appear.)
+      assert(
+        body.leg?.reservedLeaked === false,
+        'the forged connector planted in the row did NOT become a grant (barrier holds)',
+        body.leg,
+      );
+      // ...while the DO's OWN scope keys (minted by #requestContextFor) ARE
+      // present — proving the run went through RunnerRuntime, not a forked path.
+      assert(
+        body.leg?.workflowScopePresent === true &&
+          body.leg?.isolationScopePresent === true,
+        'the runtime-derived scope keys ARE present (ran through RunnerRuntime)',
+        body.leg,
+      );
+      // and the stored NON-reserved key is dropped on the DO path (the topology
+      // start seam carries only inputData) — strictly more fail-closed.
+      assert(
+        body.leg?.customPresent === false,
+        'stored non-reserved context is dropped on the DO path (fail-closed)',
+        body.leg,
+      );
+    },
+  );
 }
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
@@ -1275,7 +1351,10 @@ try {
       'header 403 (C-S4). Track F (M-005): an objective set via the route landed ' +
       'in mastra_thread_state and the durable goal-step read path returned it ' +
       '(F-S1), survived a kill+restart (F-S2), and a cross-tenant write + over-cap ' +
-      'maxRuns failed closed and audited (F-S3).',
+      'maxRuns failed closed and audited (F-S3). Track D (M-006): two concurrent ' +
+      'ticks over one due schedule fired EXACTLY once via the CAS (D-S1), and a ' +
+      'workflow schedule fired through RunnerRuntime with a fresh INV-1 runId ' +
+      'while a reserved key planted in the row stayed ABSENT from the leg (D-S2).',
   );
 } catch (error) {
   exitCode = 1;
