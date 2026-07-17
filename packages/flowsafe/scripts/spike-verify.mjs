@@ -1010,6 +1010,59 @@ async function main() {
       );
     },
   );
+
+  // --- Track B background tasks (M-003) -------------------------------------
+  await step(
+    'G _background rejection (B-S3): a write connector rejects a smuggled ' +
+      '_background arg and audits it',
+    async () => {
+      const { status, body } = await http('POST', '/bg/background-reject');
+      assert(status === 200, `bg reject probe -> ${status}`, body);
+      assert(body.denied === true, 'the _background arg was rejected', body);
+      assert(
+        body.policy === 'background',
+        "denial policy is 'background'",
+        body,
+      );
+      assert(body.audited === true, 'the denial was audited', body);
+    },
+  );
+
+  await step(
+    'H recovery seam (B-S2): a FRESH init() recovers a task left running in D1',
+    async () => {
+      // Seed a task the "evicted" instance left 'running' in durable D1.
+      const seeded = await http('POST', '/bg/seed-stranded');
+      assert(
+        seeded.status === 200 && seeded.body.seeded === true,
+        'stranded task seeded in D1',
+        seeded.body,
+      );
+      const before = await http('GET', '/bg/task/spike_bs2');
+      assert(
+        before.body.status === 'running',
+        'task is stranded running before recovery',
+        before.body,
+      );
+
+      // A FRESH BackgroundTaskHost's PUBLIC init() fires recoverStaleTasks (the
+      // R-002 pin — no private method). Bodies cannot execute on D1
+      // (supportsConcurrentUpdates() === false, R-B1/R-B2), so a maxRetries-0
+      // stranded task recovers to 'failed' — the seam firing, on real workerd + D1.
+      const recovered = await http('POST', '/bg/recover');
+      assert(
+        recovered.status === 200 && recovered.body.recovered === true,
+        'recover boot ran init()',
+        recovered.body,
+      );
+      const after = await http('GET', '/bg/task/spike_bs2');
+      assert(
+        after.body.status === 'failed',
+        'the stranded task was recovered by the init() seam',
+        after.body,
+      );
+    },
+  );
 }
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
@@ -1029,7 +1082,9 @@ try {
       'grant, a forged raw resume failed closed, and self-decision was denied. ' +
       'Live streaming (M-009): a decided event fanned out to the tenant socket, ' +
       'stayed isolated from another tenant, survived a kill+restart, and ' +
-      'refused expired / cross-tenant / garbage / cross-channel tickets.',
+      'refused expired / cross-tenant / garbage / cross-channel tickets. ' +
+      'Track B (M-003): a smuggled _background arg was rejected + audited ' +
+      '(B-S3), and a fresh init() recovered a task left running in D1 (B-S2).',
   );
 } catch (error) {
   exitCode = 1;

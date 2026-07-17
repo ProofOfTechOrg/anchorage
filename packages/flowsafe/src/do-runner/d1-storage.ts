@@ -429,6 +429,112 @@ export async function purgeExpiredThreads(
   return { threads, messages };
 }
 
+/**
+ * The table `purgeExpiredBackgroundTasks` deletes from under the background-task
+ * TTL — the production anchor the schema guard cross-checks the
+ * `background-task-ttl` retention declaration against (DL-003), the Track B
+ * analog of RUN_TTL_PURGE_TABLES. One table: the TTL rides `completedAt` on
+ * `mastra_background_tasks` alone, no cascade.
+ */
+export const BACKGROUND_TASK_TTL_PURGE_TABLES: readonly string[] = [
+  'mastra_background_tasks',
+];
+
+export interface PurgeExpiredBackgroundTasksOptions {
+  /**
+   * Completed task records untouched for longer than this expire. Default
+   * 3_600_000 (1h) — core `BackgroundTaskManager.cleanup`'s `completedTtlMs`.
+   */
+  completedTtlMs?: number;
+  /**
+   * Failed / cancelled / timed_out task records older than this expire. Default
+   * 86_400_000 (24h) — core's `failedTtlMs`. Kept longer than completed so a
+   * failure stays inspectable.
+   */
+  failedTtlMs?: number;
+  /** Must match createD1Storage's tablePrefix. */
+  tablePrefix?: string;
+  /** Clock override for tests. */
+  now?: () => number;
+}
+
+export interface PurgeExpiredBackgroundTasksResult {
+  /** Deleted 'completed' rows. */
+  completed: number;
+  /** Deleted 'failed' | 'cancelled' | 'timed_out' rows. */
+  failed: number;
+}
+
+/** Terminal statuses the failed-class TTL reaps together (core cleanup mirrors this set). */
+const BACKGROUND_TASK_FAILED_STATUSES = [
+  'failed',
+  'cancelled',
+  'timed_out',
+] as const;
+
+/**
+ * Background-task TTL cleanup (DL-003 retention leg): deletes terminal task
+ * rows from `mastra_background_tasks` once their `completedAt` is older than the
+ * TTL, mirroring core `BackgroundTaskManager.cleanup()` at the storage layer so
+ * a purge cron can reap them WITHOUT a live manager — the same posture as
+ * purgeExpiredWorkflowRuns/purgeExpiredThreads (raw D1 binding, failure-isolated
+ * as a cron duty). Two windows, exactly as core: completed rows expire fast
+ * (default 1h), failed/cancelled/timed_out slowly (default 24h) so a failure
+ * stays inspectable.
+ *
+ * `completedAt` is stored as ISO-8601 TEXT (`toISOString()`), so lexicographic
+ * `<` against an ISO cutoff is a correct timestamp comparison — the same bet the
+ * other purges take. `completedAt IS NOT NULL` is load-bearing: a row without a
+ * completion stamp cannot be proven old, so it survives (fail safe). Live rows
+ * (pending / running / suspended) are never matched — deleting a suspended task
+ * mid-flight would strand its resume. A missing table reads as zero (background
+ * tasks may never have run). Scheduling stays with the caller.
+ */
+export async function purgeExpiredBackgroundTasks(
+  db: SnapshotDatabase,
+  options: PurgeExpiredBackgroundTasksOptions = {},
+): Promise<PurgeExpiredBackgroundTasksResult> {
+  const now = options.now ?? Date.now;
+  const prefix = options.tablePrefix ?? '';
+  const table = `${prefix}mastra_background_tasks`;
+  const completedCutoff = new Date(
+    now() - (options.completedTtlMs ?? 3_600_000),
+  ).toISOString();
+  const failedCutoff = new Date(
+    now() - (options.failedTtlMs ?? 86_400_000),
+  ).toISOString();
+  const failedPlaceholders = BACKGROUND_TASK_FAILED_STATUSES.map(
+    () => '?',
+  ).join(', ');
+
+  try {
+    const completed = d1Changes(
+      await db
+        .prepare(
+          `DELETE FROM ${table}
+           WHERE status = 'completed'
+             AND completedAt IS NOT NULL AND completedAt < ?`,
+        )
+        .bind(completedCutoff)
+        .run(),
+    );
+    const failed = d1Changes(
+      await db
+        .prepare(
+          `DELETE FROM ${table}
+           WHERE status IN (${failedPlaceholders})
+             AND completedAt IS NOT NULL AND completedAt < ?`,
+        )
+        .bind(...BACKGROUND_TASK_FAILED_STATUSES, failedCutoff)
+        .run(),
+    );
+    return { completed, failed };
+  } catch (error) {
+    if (!isMissingTable(error)) throw error;
+    return { completed: 0, failed: 0 };
+  }
+}
+
 // One CREATE INDEX per (database, prefix) per isolate: purgeTenant runs this,
 // and the demo reaper invokes purgeTenant in a LIMIT-batched loop — without
 // the memo that is one DDL round-trip to the D1 primary per tenant per cron
@@ -503,6 +609,8 @@ export interface PurgeTenantResult {
   messages: number;
   /** Agent-memory rows: salted resource ids (working memory). */
   resources: number;
+  /** Track B: background-task rows, ranged over their INV-1 salted `run_id`. */
+  backgroundTasks: number;
   approvals: number;
   artifacts: number;
 }
@@ -516,7 +624,11 @@ export interface PurgeTenantResult {
  * remembered: a counter with no result field fails the pin below, and a result
  * field with no counter fails the `memory` initializer in purgeTenant.
  */
-export type TenantRangePurgeCounter = 'threads' | 'messages' | 'resources';
+export type TenantRangePurgeCounter =
+  | 'threads'
+  | 'messages'
+  | 'resources'
+  | 'backgroundTasks';
 
 /** One table purgeTenant reaps by the INV-3 `[tid_, tid\x60)` range predicate. */
 export interface TenantRangePurgeTable {
@@ -542,15 +654,22 @@ export interface TenantRangePurgeTable {
  *
  * `mastra_workflow_snapshot` is deliberately absent: it rides the same range but
  * over `run_id`, paired with artifact deletion and an app-owned index, so it
- * keeps its own block. Tables no feature writes yet (`mastra_scorers`,
- * `mastra_background_tasks`) are absent because nothing salts their ids yet —
- * the schema-guard's inventory pin is what forces that decision when a track
- * adopts one.
+ * keeps its own block. `mastra_background_tasks` (Track B) rides the range over
+ * its own `run_id` — the originating run's INV-1 salted id, always present on a
+ * task row — without artifacts or an app index, so it lives here. Tables no
+ * feature writes yet (`mastra_scorers`) are absent because nothing salts their
+ * ids yet — the schema-guard's inventory pin is what forces that decision when a
+ * track adopts one.
  */
 export const TENANT_RANGE_PURGE_TABLES: readonly TenantRangePurgeTable[] = [
   { counter: 'messages', table: 'mastra_messages', column: 'thread_id' },
   { counter: 'threads', table: 'mastra_threads', column: 'id' },
   { counter: 'resources', table: 'mastra_resources', column: 'id' },
+  {
+    counter: 'backgroundTasks',
+    table: 'mastra_background_tasks',
+    column: 'run_id',
+  },
 ];
 
 // Compile-time DL-003 pin: every counter must be a PurgeTenantResult field, so
@@ -670,6 +789,7 @@ export async function purgeTenant(
     threads: 0,
     messages: 0,
     resources: 0,
+    backgroundTasks: 0,
   };
   await Promise.all(
     TENANT_RANGE_PURGE_TABLES.map(async ({ counter, table, column }) => {

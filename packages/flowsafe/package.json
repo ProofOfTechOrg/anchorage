@@ -29,6 +29,7 @@
     ".": "./dist/index.js",
     "./agent-runner": "./dist/agent-runner/index.js",
     "./approval-api": "./dist/approval-api/index.js",
+    "./background-tasks": "./dist/background-tasks/index.js",
     "./approval-ui": "./dist/approval-ui/index.js",
     "./artifacts": "./dist/artifacts/index.js",
     "./audit-export": "./dist/audit-export/index.js",

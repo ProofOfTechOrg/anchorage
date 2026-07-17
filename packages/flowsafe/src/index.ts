@@ -141,6 +141,8 @@ export type {
   InitOptions,
   InitResult,
   InitSource,
+  PurgeExpiredBackgroundTasksOptions,
+  PurgeExpiredBackgroundTasksResult,
   PurgeExpiredRunsOptions,
   PurgeExpiredThreadsOptions,
   PurgeExpiredThreadsResult,
@@ -162,6 +164,7 @@ export type {
   ThreadScope,
 } from './do-runner/index.js';
 export {
+  BACKGROUND_TASK_TTL_PURGE_TABLES,
   createD1Storage,
   createHostPubSub,
   DoStatusError,
@@ -176,6 +179,7 @@ export {
   mintResourceId,
   mintThreadId,
   PATH_SAFE_ID_PATTERN,
+  purgeExpiredBackgroundTasks,
   purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
   purgeTenant,

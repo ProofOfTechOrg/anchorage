@@ -31,6 +31,7 @@ export {
 } from './do-run-topology.js';
 export { boolVar, type NumberVarOptions, numberVar } from './env-vars.js';
 export type {
+  BackgroundTasksCleanupConfig,
   FlowsafeWorker,
   FlowsafeWorkerConfig,
   FlowsafeWorkerContext,

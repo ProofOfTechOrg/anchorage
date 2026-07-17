@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest';
 
 import { openSqlite, type SqliteDatabase } from '../../test-support/sqlite.js';
 import {
+  purgeExpiredBackgroundTasks,
   purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
   purgeTenant,
@@ -535,6 +536,7 @@ describe('purgeTenant (complete offboarding)', () => {
       threads: 0,
       messages: 0,
       resources: 0,
+      backgroundTasks: 0,
       approvals: 1,
       artifacts: 2,
     });
@@ -672,6 +674,7 @@ describe('purgeTenant (complete offboarding)', () => {
       threads: 0,
       messages: 0,
       resources: 0,
+      backgroundTasks: 0,
       approvals: 0,
       artifacts: 0,
     });
@@ -702,6 +705,7 @@ describe('purgeTenant (complete offboarding)', () => {
       threads: 0,
       messages: 0,
       resources: 0,
+      backgroundTasks: 0,
       approvals: 1,
       artifacts: 0,
     });
@@ -723,6 +727,7 @@ describe('purgeTenant (complete offboarding)', () => {
       threads: 0,
       messages: 0,
       resources: 0,
+      backgroundTasks: 0,
       approvals: 0,
       artifacts: 0,
     });
@@ -1488,5 +1493,201 @@ describe('ensureSnapshotRunIdIndex memoization (via purgeTenant)', () => {
     // #then — retried (2 DDL statements total) and the rows were reaped
     expect(indexStatements()).toBe(2);
     expect(second.snapshots).toBe(1);
+  });
+});
+
+// mastra_background_tasks per @mastra/cloudflare-d1 DDL: run_id snake_case
+// (the INV-1 salted originating run), status machine, camelCase completedAt as
+// ISO TEXT — exactly the columns Track B's two purges ride on.
+function createBackgroundTasksTable(db: SqliteDatabase, prefix = ''): void {
+  db.prepare(
+    `CREATE TABLE ${prefix}mastra_background_tasks (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      completedAt TEXT,
+      createdAt TEXT NOT NULL
+    )`,
+  ).run();
+}
+
+function seedTask(
+  db: SqliteDatabase,
+  options: {
+    id: string;
+    runId: string;
+    status: string;
+    completedAt?: number | null;
+    prefix?: string;
+  },
+): void {
+  const completed =
+    options.completedAt === undefined || options.completedAt === null
+      ? null
+      : new Date(options.completedAt).toISOString();
+  db.prepare(
+    `INSERT INTO ${options.prefix ?? ''}mastra_background_tasks
+     (id, run_id, status, completedAt, createdAt)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(
+    options.id,
+    options.runId,
+    options.status,
+    completed,
+    new Date(NOW).toISOString(),
+  );
+}
+
+function taskIds(db: SqliteDatabase, prefix = ''): string[] {
+  return (
+    db
+      .prepare(`SELECT id FROM ${prefix}mastra_background_tasks ORDER BY id`)
+      .all() as Array<{ id: string }>
+  ).map((row) => row.id);
+}
+
+describe('purgeExpiredBackgroundTasks', () => {
+  it('reaps completed rows past completedTtlMs and keeps recent ones', async () => {
+    // #given — one completed 2h ago, one 30m ago; default completedTtlMs 1h
+    const sqlite = openSqlite();
+    createBackgroundTasksTable(sqlite);
+    seedTask(sqlite, {
+      id: 'old',
+      runId: 'abc_r1',
+      status: 'completed',
+      completedAt: NOW - 2 * 3_600_000,
+    });
+    seedTask(sqlite, {
+      id: 'fresh',
+      runId: 'abc_r2',
+      status: 'completed',
+      completedAt: NOW - 30 * 60_000,
+    });
+
+    // #when
+    const result = await purgeExpiredBackgroundTasks(d1Like(sqlite), {
+      now: () => NOW,
+    });
+
+    // #then — only the old one goes
+    expect(result).toEqual({ completed: 1, failed: 0 });
+    expect(taskIds(sqlite)).toEqual(['fresh']);
+  });
+
+  it('reaps failed / cancelled / timed_out on the SLOWER failed window, not the completed one', async () => {
+    // #given — a failed row 2h old: past the 1h completed window but INSIDE the
+    // 24h failed window, so it must survive (a failure stays inspectable)
+    const sqlite = openSqlite();
+    createBackgroundTasksTable(sqlite);
+    seedTask(sqlite, {
+      id: 'failed-2h',
+      runId: 'abc_r1',
+      status: 'failed',
+      completedAt: NOW - 2 * 3_600_000,
+    });
+    seedTask(sqlite, {
+      id: 'cancelled-2d',
+      runId: 'abc_r2',
+      status: 'cancelled',
+      completedAt: NOW - 2 * DAY_MS,
+    });
+    seedTask(sqlite, {
+      id: 'timedout-2d',
+      runId: 'abc_r3',
+      status: 'timed_out',
+      completedAt: NOW - 2 * DAY_MS,
+    });
+
+    // #when
+    const result = await purgeExpiredBackgroundTasks(d1Like(sqlite), {
+      now: () => NOW,
+    });
+
+    // #then — the two 2-day rows go; the 2-hour failure survives its slow window
+    expect(result).toEqual({ completed: 0, failed: 2 });
+    expect(taskIds(sqlite)).toEqual(['failed-2h']);
+  });
+
+  it('never reaps live rows (pending / running / suspended) whatever their age', async () => {
+    // #given — an ancient suspended task; deleting it would strand its resume
+    const sqlite = openSqlite();
+    createBackgroundTasksTable(sqlite);
+    for (const status of ['pending', 'running', 'suspended']) {
+      seedTask(sqlite, {
+        id: status,
+        runId: `abc_${status}`,
+        status,
+        completedAt: NOW - 10 * DAY_MS,
+      });
+    }
+
+    // #when
+    const result = await purgeExpiredBackgroundTasks(d1Like(sqlite), {
+      now: () => NOW,
+    });
+
+    // #then — nothing terminal, nothing deleted
+    expect(result).toEqual({ completed: 0, failed: 0 });
+    expect(taskIds(sqlite)).toEqual(['pending', 'running', 'suspended']);
+  });
+
+  it('keeps a terminal row with a NULL completedAt (cannot be proven old — fail safe)', async () => {
+    // #given
+    const sqlite = openSqlite();
+    createBackgroundTasksTable(sqlite);
+    seedTask(sqlite, {
+      id: 'no-stamp',
+      runId: 'abc_r1',
+      status: 'completed',
+      completedAt: null,
+    });
+
+    // #when
+    const result = await purgeExpiredBackgroundTasks(d1Like(sqlite), {
+      now: () => NOW,
+    });
+
+    // #then
+    expect(result).toEqual({ completed: 0, failed: 0 });
+    expect(taskIds(sqlite)).toEqual(['no-stamp']);
+  });
+
+  it('reads a missing table as zero (background tasks may never have run)', async () => {
+    // #given — no table created
+    const sqlite = openSqlite();
+
+    // #when / #then
+    expect(
+      await purgeExpiredBackgroundTasks(d1Like(sqlite), { now: () => NOW }),
+    ).toEqual({ completed: 0, failed: 0 });
+  });
+});
+
+describe('purgeTenant background-task coverage (DL-003)', () => {
+  it('reaps a tenant’s background-task rows by the run_id range, exactly one tenant', async () => {
+    // #given — abc and its digit-suffixed prefix neighbor abc5 (the range
+    // exactness case), plus another tenant xyz, all keyed by run_id
+    const sqlite = openSqlite();
+    createBackgroundTasksTable(sqlite);
+    seedTask(sqlite, { id: 't-abc', runId: 'abc_r1', status: 'completed' });
+    seedTask(sqlite, { id: 't-abc5', runId: 'abc5_r1', status: 'running' });
+    seedTask(sqlite, { id: 't-xyz', runId: 'xyz_r1', status: 'suspended' });
+
+    // #when — offboard exactly abc
+    const result = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
+
+    // #then — only abc's task goes (running included: offboarding ignores
+    // status); abc5 and xyz survive — the range is exact over run_id
+    expect(result.backgroundTasks).toBe(1);
+    expect(taskIds(sqlite)).toEqual(['t-abc5', 't-xyz']);
+  });
+
+  it('missing background-tasks table offboards cleanly (run-less tenant)', async () => {
+    // #given — a tenant with no background tasks table at all
+    const sqlite = openSqlite();
+
+    // #when / #then — no throw, counter is zero
+    const result = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
+    expect(result.backgroundTasks).toBe(0);
   });
 });

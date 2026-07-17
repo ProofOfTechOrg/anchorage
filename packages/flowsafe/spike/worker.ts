@@ -53,8 +53,14 @@ import type {
   ExecutionContext,
   ExportedHandler,
 } from '@cloudflare/workers-types';
+import { Mastra } from '@mastra/core/mastra';
+import { RequestContext } from '@mastra/core/request-context';
+import {
+  AuditLogger,
+  ConnectorPolicyError,
+  createConnector,
+} from '@proofoftech/breakwater';
 import { z } from 'zod';
-
 import {
   type ApprovalActor,
   ApprovalService,
@@ -67,7 +73,14 @@ import {
   defaultResumeData,
   type TenantBoundApprovalStore,
 } from '../src/approval-api/index.js';
+
 import {
+  BackgroundTaskHost,
+  backgroundTasksStore,
+} from '../src/background-tasks/index.js';
+import {
+  createD1Storage,
+  createHostPubSub,
   DurableObjectRunner,
   HubDurableObject,
   init,
@@ -393,6 +406,107 @@ function buildApprovalService(
   });
 }
 
+// --- Track B (M-003) background-task probes --------------------------------
+// LOCAL-ONLY worker-level probes (spike tenant 'spike'), driven by
+// scripts/spike-verify.mjs:
+//  - B-S3: createConnector rejects a smuggled `_background` arg and audits it.
+//  - B-S2: the recovery SEAM — a FRESH BackgroundTaskHost's PUBLIC init()
+//    recovers a task a prior instance left 'running' in D1 (no private call,
+//    R-002 pin). Bodies do NOT execute on D1 (R-B1/R-B2 — @mastra/cloudflare-d1
+//    reports supportsConcurrentUpdates() === false), so a maxRetries-0 stranded
+//    task recovers to 'failed' — the seam firing, on real workerd + D1.
+const BG_TASK_ID = 'spike_bs2';
+const BG_RUN_ID = 'spike_bg-run';
+
+function bgMastra(env: Env): Mastra {
+  return new Mastra({
+    storage: createD1Storage({ binding: env.DB as unknown as never }),
+  });
+}
+
+async function handleBackgroundTaskProbe(
+  request: Request,
+  env: Env,
+): Promise<Response | null> {
+  const url = new URL(request.url);
+  const path = url.pathname;
+
+  if (request.method === 'POST' && path === '/bg/background-reject') {
+    const audit = new AuditLogger();
+    const writer = createConnector({
+      id: 'bg-probe-writer',
+      description:
+        'B-S3: a write connector must reject a smuggled _background arg',
+      execute: async () => ({ ok: true }),
+      permissions: { sideEffect: 'write' },
+      policies: { audit },
+    });
+    let denied = false;
+    let policy = '';
+    try {
+      await (writer.execute as (i: unknown, c: unknown) => Promise<unknown>)(
+        { topic: 'x', _background: { enabled: true } },
+        { requestContext: new RequestContext() },
+      );
+    } catch (error) {
+      if (error instanceof ConnectorPolicyError) {
+        denied = true;
+        policy = error.policy;
+      }
+    }
+    const audited = audit
+      .events()
+      .some(
+        (event) =>
+          event.decision === 'denied' &&
+          (event.detail as { policy?: string } | undefined)?.policy ===
+            'background',
+      );
+    return json({ denied, policy, audited });
+  }
+
+  if (request.method === 'POST' && path === '/bg/seed-stranded') {
+    const store = await backgroundTasksStore(bgMastra(env));
+    const now = new Date();
+    await store.createTask({
+      id: BG_TASK_ID,
+      status: 'running',
+      toolName: 'bgProbe',
+      toolCallId: 'call-1',
+      args: {},
+      agentId: 'agent-1',
+      runId: BG_RUN_ID,
+      createdAt: now,
+      startedAt: now,
+      retryCount: 0,
+      maxRetries: 0,
+      timeoutMs: 300_000,
+    });
+    return json({ seeded: true });
+  }
+
+  if (request.method === 'POST' && path === '/bg/recover') {
+    // A FRESH host: its init() fires the manager's recoverStaleTasks (the R-002
+    // seam) over the SAME durable D1 the seed wrote to.
+    const host = new BackgroundTaskHost({
+      mastra: bgMastra(env),
+      pubsub: createHostPubSub(),
+      executors: {},
+    });
+    await host.boot();
+    return json({ recovered: true });
+  }
+
+  if (request.method === 'GET' && path.startsWith('/bg/task/')) {
+    const taskId = decodeURIComponent(path.slice('/bg/task/'.length));
+    const store = await backgroundTasksStore(bgMastra(env));
+    const task = await store.getTask(taskId);
+    return json({ status: task?.status ?? null });
+  }
+
+  return null;
+}
+
 const handler: ExportedHandler<Env> = {
   async fetch(
     request: CfRequest,
@@ -420,6 +534,11 @@ const handler: ExportedHandler<Env> = {
       buildService: (store) => buildApprovalService(store, env, streamSink),
     });
     const routed = request as unknown as Request;
+
+    // Track B probes (B-S2 recovery seam, B-S3 _background rejection) — local,
+    // unauthenticated, ahead of the routers.
+    const bgProbe = await handleBackgroundTaskProbe(routed, env);
+    if (bgProbe) return bgProbe;
 
     // Stream stage BEFORE approvals (same order as the composer). The Worker is
     // the SOLE ticket authority; the hub/runner DOs re-bind by their own
