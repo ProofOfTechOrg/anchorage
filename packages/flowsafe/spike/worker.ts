@@ -53,6 +53,7 @@ import type {
   ExecutionContext,
   ExportedHandler,
 } from '@cloudflare/workers-types';
+import { Agent } from '@mastra/core/agent';
 import { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
 import {
@@ -72,6 +73,7 @@ import {
   D1ApprovalStoreFactory,
   defaultResumeData,
   type TenantBoundApprovalStore,
+  type TenantContext,
 } from '../src/approval-api/index.js';
 
 import {
@@ -83,24 +85,34 @@ import {
   createHostPubSub,
   DurableObjectRunner,
   HubDurableObject,
+  type InitResult,
   init,
+  mintResourceId,
+  mintThreadId,
   type RunnerRuntime,
+  ThreadDurableObject,
+  type ThreadScope,
+  tenantOwnsMemoryId,
 } from '../src/do-runner/index.js';
 import {
   bearerActorAuthenticator,
   createHubTopology,
   createRunRouter,
   createStreamRouter,
+  createThreadTopology,
   doSummary,
   staticTokenVerifier,
   type WorkflowMeta,
 } from '../src/host-kit/index.js';
+import { createThreadSignalRoutes } from '../src/signals/index.js';
 
 interface Env {
   DB: D1Database;
   RUNNER: DurableObjectNamespace;
   /** Per-tenant live-stream hub DO (idFromName(tenantId)); see DemoHub. */
   HUB: DurableObjectNamespace;
+  /** Per-thread agent-loop / signal DO (idFromName(threadId)); see DemoThread (Track C). */
+  THREAD: DurableObjectNamespace;
   /**
    * HMAC key signing the ~60s WebSocket stream tickets. A LOCAL-ONLY spike
    * fixture set in spike/wrangler.jsonc `vars` (and re-passed by
@@ -356,6 +368,93 @@ export class DemoRunner extends DurableObjectRunner<Env> {
  */
 export class DemoHub extends HubDurableObject<Env> {}
 
+/**
+ * Track C (M-004): the per-thread signal DO (idFromName(threadId), tenant-minted,
+ * so id.name carries the tenant). `build()` wires init() with the ONE host pubsub
+ * identity (createHostPubSub) — the affinity carrier: core keys its in-process
+ * signal registry by the pubsub instance, so a send only drains into an active
+ * loop when both share this isolate's ONE pubsub (DL-002). `route()` composes the
+ * production Track C signal routes plus a spike-only C-S2 affinity probe. The
+ * base class asserts the request's authenticated tenant against the name's prefix
+ * BEFORE route() runs, so a forged cross-tenant request never reaches here (C-S4).
+ */
+export class DemoThread extends ThreadDurableObject<Env> {
+  #agent?: Agent;
+
+  protected build(env: Env): InitResult {
+    return init(env, { pubsub: createHostPubSub() });
+  }
+
+  // One agent per DO instance. `model` is a CONSTRUCTION placeholder — the C-S2
+  // proof never drives the LLM (Track A's deferred real-loop boundary): an
+  // idle-wake RESERVES a run synchronously, which is all the in-process-drain
+  // proof needs. Stamp the DO's pubsub so the agent's registry state is the one
+  // this isolate shares.
+  #getAgent(scope: ThreadScope): Agent {
+    this.#agent ??= new Agent({
+      id: 'demo-thread-signal-agent',
+      name: 'demo-thread-signal-agent',
+      instructions: 'signal affinity probe',
+      // A model-router id string (never invoked): the affinity proof drives the
+      // signal registry, not the LLM, so the agent only has to construct.
+      model: 'openai/gpt-4o-mini',
+    });
+    if (scope.init.pubsub) this.#agent.__setPubSub(scope.init.pubsub);
+    return this.#agent;
+  }
+
+  #signalRoutes = createThreadSignalRoutes({
+    resolveAgent: (scope) => this.#getAgent(scope),
+    resolveResourceId: (scope) => mintResourceId(scope.tenantId, 'demo-thread'),
+  });
+
+  protected async route(
+    request: Request,
+    scope: ThreadScope,
+  ): Promise<Response> {
+    const url = new URL(request.url);
+    if (request.method === 'POST' && url.pathname === '/probe/affinity') {
+      return this.#affinityProbe(scope);
+    }
+    const signalResponse = await this.#signalRoutes(request, scope);
+    if (signalResponse) return signalResponse;
+    return json({ error: 'not found' }, 404);
+  }
+
+  /**
+   * C-S2 structural proof (no LLM): a sendSignal into an ACTIVE (reserved) run on
+   * THIS isolate drains IN-PROCESS via core's pubsub-keyed registry.
+   *   1. idle-wake RESERVES a run synchronously (core sets activeThreadRunIds
+   *      before the async stream setup); contain the async setup rejection.
+   *   2. the thread now reads ACTIVE in this isolate.
+   *   3. a second signal resolves to action 'deliver' with the reserved runId —
+   *      it JOINED the in-process run, not persisted to storage (idle) or
+   *      discarded. That distinction IS the affinity.
+   */
+  async #affinityProbe(scope: ThreadScope): Promise<Response> {
+    const agent = this.#getAgent(scope);
+    const resourceId = mintResourceId(scope.tenantId, 'affinity-probe');
+    const target = { threadId: scope.threadId, resourceId };
+    const reserve = agent.sendSignal(
+      { type: 'user', contents: 'wake' },
+      { ...target, ifIdle: { behavior: 'wake' } },
+    );
+    void reserve.accepted.catch(() => {});
+    const activeRunId = agent.getActiveThreadRunId(target);
+    const deliver = agent.sendSignal(
+      { type: 'reactive', contents: 'follow-up' },
+      { ...target, ifActive: { behavior: 'deliver' } },
+    );
+    const decision = await deliver.accepted;
+    return json({
+      threadId: scope.threadId,
+      tenantId: scope.tenantId,
+      activeRunId,
+      decision,
+    });
+  }
+}
+
 function json(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
     status,
@@ -507,6 +606,78 @@ async function handleBackgroundTaskProbe(
   return null;
 }
 
+// --- Track C (M-004) signal probes -----------------------------------------
+// LOCAL-ONLY worker-level probes (spike tenant 'spike'), driven by
+// scripts/spike-verify.mjs:
+//  - C-S2 (affinity): a signal into an ACTIVE loop on the thread DO drains
+//    IN-PROCESS. Driven THROUGH createThreadTopology (the sanctioned reach — it
+//    stamps the tenant header the DO authenticates on), so the send lands in the
+//    isolate hosting the (reserved) loop and resolves to action 'deliver'.
+//  - C-S4 (isolation): a cross-tenant foreign-threadId send fails CLOSED at BOTH
+//    barriers — the topology ownership 404 (before the DO is addressed) and the
+//    DO's own header 403 (a direct forged-header fetch).
+async function handleSignalProbe(
+  request: Request,
+  env: Env,
+): Promise<Response | null> {
+  const url = new URL(request.url);
+  const path = url.pathname;
+
+  // The topology uses only .tenantId + .ownsMemoryId; a partial context suffices
+  // for a local probe (the real resolver builds the full TenantContext).
+  const ctxFor = (tenantId: string): TenantContext =>
+    ({
+      tenantId,
+      ownsMemoryId: (id: string) => tenantOwnsMemoryId(tenantId, id),
+    }) as unknown as TenantContext;
+
+  const topology = createThreadTopology(env.THREAD);
+
+  if (request.method === 'POST' && path === '/sig/affinity') {
+    const threadId = mintThreadId('spike');
+    const response = await topology.send(
+      ctxFor('spike'),
+      threadId,
+      '/probe/affinity',
+      { method: 'POST', body: '{}' },
+    );
+    const probe = (await response.json()) as Record<string, unknown>;
+    return json({ status: response.status, ...probe });
+  }
+
+  if (request.method === 'POST' && path === '/sig/cross-tenant') {
+    const ownerThreadId = mintThreadId('spike');
+    // Barrier 1: tenant 'other' driving 'spike's threadId through the topology is
+    // 404'd (ownership) BEFORE the DO is addressed — no wake, no oracle.
+    let ownershipStatus = 0;
+    try {
+      const r = await topology.send(
+        ctxFor('other'),
+        ownerThreadId,
+        '/probe/affinity',
+        { method: 'POST', body: '{}' },
+      );
+      ownershipStatus = r.status;
+    } catch (error) {
+      ownershipStatus = (error as { status?: number }).status ?? -1;
+    }
+    // Barrier 2: a DIRECT forged-header fetch (bypassing the topology) is 403'd by
+    // the DO's own #assertTenantIdentity (name tenant 'spike' != header 'other').
+    const stub = env.THREAD.get(env.THREAD.idFromName(ownerThreadId));
+    const forged = await stub.fetch('http://thread/probe/affinity', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-flowsafe-tenant': 'other',
+      },
+      body: '{}',
+    });
+    return json({ ownershipStatus, headerStatus: forged.status });
+  }
+
+  return null;
+}
+
 const handler: ExportedHandler<Env> = {
   async fetch(
     request: CfRequest,
@@ -539,6 +710,11 @@ const handler: ExportedHandler<Env> = {
     // unauthenticated, ahead of the routers.
     const bgProbe = await handleBackgroundTaskProbe(routed, env);
     if (bgProbe) return bgProbe;
+
+    // Track C probes (C-S2 affinity, C-S4 cross-tenant fail-closed) — local,
+    // unauthenticated, ahead of the routers.
+    const sigProbe = await handleSignalProbe(routed, env);
+    if (sigProbe) return sigProbe;
 
     // Stream stage BEFORE approvals (same order as the composer). The Worker is
     // the SOLE ticket authority; the hub/runner DOs re-bind by their own

@@ -41,13 +41,16 @@ import {
   openSqlite,
   type SqliteDatabase,
 } from '../../test-support/sqlite.js';
+import { createSignalStorageDomains } from '../signals/storage.js';
 import type { SnapshotDatabase, SnapshotStatement } from './d1-storage.js';
 import {
   BACKGROUND_TASK_TTL_PURGE_TABLES,
   createD1Storage,
+  NOTIFICATION_TTL_PURGE_TABLES,
   purgeTenant,
   RUN_TTL_PURGE_TABLES,
   TENANT_RANGE_PURGE_TABLES,
+  THREAD_STATE_TTL_PURGE_TABLES,
   THREAD_TTL_PURGE_TABLES,
 } from './d1-storage.js';
 import { init } from './init.js';
@@ -139,12 +142,21 @@ type RetentionStory =
   | { kind: 'thread-ttl' }
   /** Track B: rows expire via purgeExpiredBackgroundTasks (completedAt TTL). */
   | { kind: 'background-task-ttl' }
+  /** Track C: agent-inbox rows expire via purgeExpiredNotifications (terminal + updatedAt TTL). */
+  | { kind: 'notification-ttl' }
+  /** Track C: thread-state rows expire via purgeExpiredThreadState (updatedAt TTL). */
+  | { kind: 'thread-state-ttl' }
   /** Rows die with their parent's TTL rather than aging out on their own. */
   | { kind: 'cascade'; with: string }
   | { kind: 'none'; because: string };
 
 /** The age-based TTL kinds — each anchored to a real exported purge inventory. */
-type TtlKind = 'run-ttl' | 'thread-ttl' | 'background-task-ttl';
+type TtlKind =
+  | 'run-ttl'
+  | 'thread-ttl'
+  | 'background-task-ttl'
+  | 'notification-ttl'
+  | 'thread-state-ttl';
 
 describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
   // The ONE reason an unadopted table carries — hoisted so the coverage↔reason
@@ -171,6 +183,11 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
       retention: { kind: 'cascade', with: 'mastra_threads' },
     },
     {
+      table: 'mastra_notifications',
+      coverage: 'tenant-range',
+      retention: { kind: 'notification-ttl' },
+    },
+    {
       table: 'mastra_resources',
       coverage: 'tenant-range',
       retention: {
@@ -187,6 +204,14 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
         because: UNADOPTED_NO_RETENTION,
       },
     },
+    // 'mastra_thread_state' sorts BEFORE 'mastra_threads' under BINARY collation
+    // ('_' 0x5F < 's' 0x73), which is the order sqlite_master's ORDER BY name
+    // returns and the toEqual below pins.
+    {
+      table: 'mastra_thread_state',
+      coverage: 'tenant-range',
+      retention: { kind: 'thread-state-ttl' },
+    },
     {
       table: 'mastra_threads',
       coverage: 'tenant-range',
@@ -200,15 +225,23 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
   ];
 
   it('createD1Storage creates EXACTLY the declared tables — an undeclared one is a tenancy decision, not a default', async () => {
-    // #given — the real storage adapter over sqlite
+    // #given — the real storage adapter over sqlite, WITH the Track C signal
+    // domains composed (createD1Storage takes them injected — signals/ imports
+    // do-runner, so do-runner cannot import back). @mastra/cloudflare-d1 ships no
+    // notifications/thread-state domain, so those two tables come from the
+    // flowsafe-owned D1 domains, not the adapter.
     const sqlite = openSqlite();
+    const binding = d1DatabaseLike(sqlite);
     const storage = createD1Storage({
-      binding: d1DatabaseLike(sqlite) as never,
+      binding: binding as never,
+      domains: createSignalStorageDomains(binding as never),
     });
     const { runtime } = buildGated(storage);
 
-    // #when — first persistence op triggers table creation
+    // #when — the workflow run triggers the adapter's six tables; init() then
+    // creates the two signal-domain tables (they build their schema on init()).
     await runtime.start('gated', { runId: 'abc_r1', inputData: {} });
+    await storage.init();
 
     // #then — the exact inventory, pinned. A Mastra bump that adds a table (or
     // a track that enables a domain) fails HERE until someone declares how the
@@ -256,6 +289,12 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     );
     expect(accountedFor('background-task-ttl')).toEqual(
       [...BACKGROUND_TASK_TTL_PURGE_TABLES].sort(),
+    );
+    expect(accountedFor('notification-ttl')).toEqual(
+      [...NOTIFICATION_TTL_PURGE_TABLES].sort(),
+    );
+    expect(accountedFor('thread-state-ttl')).toEqual(
+      [...THREAD_STATE_TTL_PURGE_TABLES].sort(),
     );
 
     // ...and every cascade names a parent that EXISTS and itself expires. The
@@ -409,6 +448,37 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     expect(columns).toContain('run_id');
     expect(columns).toContain('status');
     expect(columns).toContain('completedAt');
+  });
+
+  it('the Track C signal tables keep the columns their purges ride on (thread_id range + status/updatedAt TTL)', async () => {
+    // #given — these two tables are flowsafe-owned (the adapter ships neither),
+    // so compose the domains and init to create them.
+    const sqlite = openSqlite();
+    const binding = d1DatabaseLike(sqlite);
+    const storage = createD1Storage({
+      binding: binding as never,
+      domains: createSignalStorageDomains(binding as never),
+    });
+    await storage.init();
+
+    // #when
+    const columnsOf = (table: string) =>
+      (
+        sqlite.prepare(`PRAGMA table_info(${table})`).all() as {
+          name: string;
+        }[]
+      ).map((column) => column.name);
+
+    // #then — purgeTenant ranges both over `thread_id` (the salted memory
+    // threadId); purgeExpiredNotifications reaps by status + updatedAt, and
+    // purgeExpiredThreadState by updatedAt. These are OUR column names, so this
+    // pins US against a self-inflicted rename that would inert a purge.
+    expect(columnsOf('mastra_notifications')).toEqual(
+      expect.arrayContaining(['thread_id', 'status', 'updatedAt']),
+    );
+    expect(columnsOf('mastra_thread_state')).toEqual(
+      expect.arrayContaining(['thread_id', 'type', 'updatedAt']),
+    );
   });
 
   it('a resume racing purgeTenant FAILS without re-executing the gated step or re-creating the snapshot', async () => {

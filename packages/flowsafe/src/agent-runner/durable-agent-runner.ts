@@ -76,6 +76,46 @@ import {
  */
 export const DURABLE_AGENTIC_LOOP_WORKFLOW_ID = 'durable-agentic-loop';
 
+/**
+ * Brand marking an agent as RUNTIME-DRIVEN: its inherited signal wake
+ * (`agent.stream` under `ifIdle:'wake'`) re-enters the INV-1-guarded
+ * {@link FlowsafeDurableAgent.executeWorkflow}, which drives
+ * `runtime.start('durable-agentic-loop', …)` rather than the base
+ * `createRun + run.start` on the DEFAULT engine. Track C's thread-DO signal
+ * routes REQUIRE this brand before honoring an idle wake, because the wake is the
+ * one signal path that starts a run: a plain core `Agent` (or a STOCK
+ * `DurableAgent`, whose `stream()` mints a tenant-less UUID and whose
+ * `executeWorkflow` runs on the default engine) would start a run OUTSIDE
+ * RunnerRuntime — a second execution path DL-001 forbids, tenant-unscoped and
+ * grant-underivable. Structural (a `unique symbol`-keyed truthy field) so a test
+ * double can opt in without constructing a real durable agent.
+ *
+ * The brand does NOT by itself make a woken run INV-1 tenant-scoped: core mints
+ * the wake's runId as a bare `crypto.randomUUID()` inside
+ * `agentThreadStreamRuntime.sendSignal` and the public send API cannot override
+ * it, so full `${tenantId}_${uuid}` scoping of idle-wake runs is owned by Track
+ * A's real-loop wiring (which must supply the wake's tenant→runId seam). The
+ * brand closes the immediate escape — a plain/ephemeral agent running the loop
+ * off the runtime entirely.
+ */
+export const RUNTIME_DRIVEN_AGENT: unique symbol = Symbol(
+  'flowsafe.runtimeDrivenAgent',
+);
+
+/**
+ * Does this value carry the {@link RUNTIME_DRIVEN_AGENT} brand — i.e. is its
+ * signal wake driven through RunnerRuntime rather than the default engine?
+ * Takes `unknown` so a caller holding a core `Agent` (whose type has no index
+ * for the brand symbol) can check without a cast.
+ */
+export function isRuntimeDrivenAgent(agent: unknown): boolean {
+  return (
+    typeof agent === 'object' &&
+    agent !== null &&
+    (agent as Record<symbol, unknown>)[RUNTIME_DRIVEN_AGENT] === true
+  );
+}
+
 /** Options for {@link createFlowsafeDurableAgent}. */
 export interface FlowsafeDurableAgentOptions<
   TAgentId extends string = string,
@@ -121,6 +161,12 @@ export class FlowsafeDurableAgent<
   TTools extends ToolsInput = ToolsInput,
   TOutput = undefined,
 > extends DurableAgent<TAgentId, TTools, TOutput> {
+  /**
+   * The runtime-driven brand Track C's thread-DO signal wake requires (see
+   * {@link RUNTIME_DRIVEN_AGENT}). A `unique symbol` field, so it cannot collide
+   * with an inherited property and a plain `Agent` never carries it.
+   */
+  readonly [RUNTIME_DRIVEN_AGENT] = true;
   readonly #runtime: RunnerRuntime;
 
   constructor(options: FlowsafeDurableAgentOptions<TAgentId, TTools, TOutput>) {

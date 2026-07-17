@@ -1063,6 +1063,66 @@ async function main() {
       );
     },
   );
+
+  // --- Track C signals (M-004) ---------------------------------------------
+  // The load-bearing proofs the DL-002 affinity thesis rests on (the DO IS the
+  // serialization lease, replacing Redis distributed leasing).
+  await step(
+    'I affinity (C-S2): a send into an ACTIVE (reserved) loop on the thread ' +
+      'DO drains IN-PROCESS via the shared-pubsub registry',
+    async () => {
+      const { status, body } = await http('POST', '/sig/affinity');
+      assert(status === 200, `sig affinity probe -> ${status}`, body);
+      assert(
+        body.status === 200,
+        `thread DO affinity route -> ${body.status}`,
+        body,
+      );
+      // An idle-wake RESERVED a run; the thread now reads ACTIVE in THIS isolate's
+      // pubsub-keyed registry (no LLM — Track A's real-loop drive is deferred).
+      assert(
+        typeof body.activeRunId === 'string',
+        'thread reads ACTIVE after the reserve (activeRunId present)',
+        body,
+      );
+      // The second signal resolved to 'deliver' — it JOINED the in-process run
+      // rather than being persisted to storage (idle) or discarded. That is the
+      // affinity: the send landed in the same isolate hosting the reserved loop.
+      assert(
+        body.decision?.action === 'deliver',
+        "second signal action is 'deliver' (in-process drain, not persist)",
+        body.decision,
+      );
+      assert(
+        body.decision?.runId === body.activeRunId,
+        'delivered to the SAME reserved run (runId matches)',
+        body,
+      );
+    },
+  );
+
+  await step(
+    'J cross-tenant fail-closed (C-S4): a foreign-threadId send is refused at ' +
+      'BOTH the topology ownership 404 and the DO header 403',
+    async () => {
+      const { status, body } = await http('POST', '/sig/cross-tenant');
+      assert(status === 200, `sig cross-tenant probe -> ${status}`, body);
+      // Barrier 1: the topology 404s the foreign threadId BEFORE the DO is
+      // addressed — no wake, no existence oracle.
+      assert(
+        body.ownershipStatus === 404,
+        'topology ownership 404 (tenant does not own the threadId)',
+        body,
+      );
+      // Barrier 2: a DIRECT forged-header fetch (bypassing the topology) is 403'd
+      // by the DO's own #assertTenantIdentity (name tenant != forged header).
+      assert(
+        body.headerStatus === 403,
+        'DO header assertion 403 (a forged x-flowsafe-tenant cannot pass)',
+        body,
+      );
+    },
+  );
 }
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
@@ -1084,7 +1144,11 @@ try {
       'stayed isolated from another tenant, survived a kill+restart, and ' +
       'refused expired / cross-tenant / garbage / cross-channel tickets. ' +
       'Track B (M-003): a smuggled _background arg was rejected + audited ' +
-      '(B-S3), and a fresh init() recovered a task left running in D1 (B-S2).',
+      '(B-S3), and a fresh init() recovered a task left running in D1 (B-S2). ' +
+      'Track C (M-004): a send into an ACTIVE thread-DO loop drained IN-PROCESS ' +
+      'via the shared-pubsub registry (C-S2, the DL-002 affinity thesis), and a ' +
+      'foreign-threadId send failed closed at BOTH the topology 404 and the DO ' +
+      'header 403 (C-S4).',
   );
 } catch (error) {
   exitCode = 1;

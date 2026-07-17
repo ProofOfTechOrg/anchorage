@@ -7,6 +7,10 @@
 
 import type { D1Database } from '@cloudflare/workers-types';
 import { D1Store } from '@mastra/cloudflare-d1';
+import {
+  MastraCompositeStore,
+  type MastraStorageDomains,
+} from '@mastra/core/storage';
 
 import type { D1DatabaseBinding } from './cf-types.js';
 import { TENANT_ID_PATTERN } from './path-safe-id.js';
@@ -18,10 +22,21 @@ export interface D1StorageOptions {
   id?: string;
   /** Table name prefix (letters, numbers, underscores). */
   tablePrefix?: string;
+  /**
+   * Additional storage domains composed OVER the D1Store default (Track C:
+   * notifications + thread-state, which @mastra/cloudflare-d1 does not ship, so
+   * they are flowsafe-owned D1 impls). Injected rather than imported so this
+   * lower layer never depends on `signals/` (which imports do-runner) — build
+   * them with `createSignalStorageDomains()` and pass them here. Absent ⇒ the
+   * bare D1Store, byte-identical to before this seam existed.
+   */
+  domains?: MastraStorageDomains;
 }
 
-export function createD1Storage(options: D1StorageOptions): D1Store {
-  return new D1Store({
+export function createD1Storage(
+  options: D1StorageOptions,
+): MastraCompositeStore {
+  const d1 = new D1Store({
     id: options.id ?? 'flowsafe',
     // @mastra/cloudflare-d1's own D1Store signature wants the real
     // D1Database; D1DatabaseBinding is the structural subset this package
@@ -31,6 +46,18 @@ export function createD1Storage(options: D1StorageOptions): D1Store {
     ...(options.tablePrefix !== undefined
       ? { tablePrefix: options.tablePrefix }
       : {}),
+  });
+  // No extra domains ⇒ return the D1Store itself (it IS a MastraCompositeStore),
+  // preserving byte-identical behavior for every host that does not opt into
+  // signals. With domains, compose them OVER d1 as the default: its own init()
+  // (all adapter tables, DDL ordering, coalesced callers) runs first via the
+  // parentDefault path, THEN each override domain's init() — the composite never
+  // double-inits a parent's domain (validated: chunk #runInit).
+  if (!options.domains) return d1;
+  return new MastraCompositeStore({
+    id: options.id ?? 'flowsafe',
+    default: d1,
+    domains: options.domains,
   });
 }
 
@@ -535,6 +562,128 @@ export async function purgeExpiredBackgroundTasks(
   }
 }
 
+/**
+ * The table `purgeExpiredNotifications` deletes from under the notification TTL
+ * — the anchor the schema guard cross-checks the `notification-ttl` retention
+ * declaration against (DL-003), the Track C analog of
+ * BACKGROUND_TASK_TTL_PURGE_TABLES.
+ */
+export const NOTIFICATION_TTL_PURGE_TABLES: readonly string[] = [
+  'mastra_notifications',
+];
+
+/** Terminal notification statuses the TTL reaps (a delivered/seen/… inbox item is done). */
+const NOTIFICATION_TERMINAL_STATUSES = [
+  'delivered',
+  'seen',
+  'dismissed',
+  'archived',
+  'discarded',
+] as const;
+
+export interface PurgeExpiredNotificationsOptions {
+  /**
+   * Resolved (delivered/seen/dismissed/archived/discarded) notifications whose
+   * `updatedAt` is older than this expire. PENDING rows are never touched — one
+   * may be waiting on a future `deliverAt`, and reaping it would drop a signal
+   * the model has not seen. No default: the caller (createFlowsafeWorker's cron)
+   * gates this on an opt-in retention window, since a durable inbox is meant to
+   * be readable until the host says otherwise.
+   */
+  ttlMs: number;
+  /** Must match createD1Storage's tablePrefix. */
+  tablePrefix?: string;
+  /** Clock override for tests. */
+  now?: () => number;
+}
+
+/**
+ * Notification TTL cleanup (DL-003 retention leg): deletes TERMINAL agent-inbox
+ * rows from `mastra_notifications` once their `updatedAt` is older than the TTL,
+ * at the storage layer so a cron reaps them without a live agent — the same
+ * posture as the other purges (raw D1 binding, failure-isolated as a cron duty).
+ * `updatedAt` is ISO-8601 TEXT, so lexicographic `<` is a correct timestamp
+ * comparison. A missing table reads as zero (notifications may never have been
+ * sent). Scheduling stays with the caller.
+ */
+export async function purgeExpiredNotifications(
+  db: SnapshotDatabase,
+  options: PurgeExpiredNotificationsOptions,
+): Promise<number> {
+  const now = options.now ?? Date.now;
+  const prefix = options.tablePrefix ?? '';
+  const cutoff = new Date(now() - options.ttlMs).toISOString();
+  const placeholders = NOTIFICATION_TERMINAL_STATUSES.map(() => '?').join(', ');
+  try {
+    return d1Changes(
+      await db
+        .prepare(
+          `DELETE FROM ${prefix}mastra_notifications
+           WHERE status IN (${placeholders}) AND updatedAt < ?`,
+        )
+        .bind(...NOTIFICATION_TERMINAL_STATUSES, cutoff)
+        .run(),
+    );
+  } catch (error) {
+    if (!isMissingTable(error)) throw error;
+    return 0;
+  }
+}
+
+/**
+ * The table `purgeExpiredThreadState` deletes from under the thread-state TTL —
+ * the anchor the schema guard cross-checks the `thread-state-ttl` retention
+ * declaration against (DL-003).
+ */
+export const THREAD_STATE_TTL_PURGE_TABLES: readonly string[] = [
+  'mastra_thread_state',
+];
+
+export interface PurgeExpiredThreadStateOptions {
+  /**
+   * Thread-state rows (state-signal lanes + goals) whose `updatedAt` is older
+   * than this expire. An actively-updated goal or task lane bumps `updatedAt`
+   * on every write, so it never ages out; an abandoned thread's state does. No
+   * default (opt-in, like the notification and thread TTLs — durable state is
+   * kept until the host sets a window).
+   */
+  ttlMs: number;
+  /** Must match createD1Storage's tablePrefix. */
+  tablePrefix?: string;
+  /** Clock override for tests. */
+  now?: () => number;
+}
+
+/**
+ * Thread-state TTL cleanup (DL-003 retention leg): deletes thread-state rows
+ * from `mastra_thread_state` once their `updatedAt` is older than the TTL. Keys
+ * on `updatedAt` for the same reason `purgeExpiredThreads` does — thread state
+ * has no terminal status, so time-since-last-write is the only "done" signal.
+ * ISO-8601 TEXT encoding; missing table reads as zero; scheduling stays with the
+ * caller. Independent of the thread TTL (an orphan row is reaped here or at
+ * offboarding by purgeTenant), so it self-bounds without touching the delicate
+ * messages-before-threads ordering of purgeExpiredThreads.
+ */
+export async function purgeExpiredThreadState(
+  db: SnapshotDatabase,
+  options: PurgeExpiredThreadStateOptions,
+): Promise<number> {
+  const now = options.now ?? Date.now;
+  const prefix = options.tablePrefix ?? '';
+  const cutoff = new Date(now() - options.ttlMs).toISOString();
+  try {
+    return d1Changes(
+      await db
+        .prepare(`DELETE FROM ${prefix}mastra_thread_state WHERE updatedAt < ?`)
+        .bind(cutoff)
+        .run(),
+    );
+  } catch (error) {
+    if (!isMissingTable(error)) throw error;
+    return 0;
+  }
+}
+
 // One CREATE INDEX per (database, prefix) per isolate: purgeTenant runs this,
 // and the demo reaper invokes purgeTenant in a LIMIT-batched loop — without
 // the memo that is one DDL round-trip to the D1 primary per tenant per cron
@@ -611,6 +760,10 @@ export interface PurgeTenantResult {
   resources: number;
   /** Track B: background-task rows, ranged over their INV-1 salted `run_id`. */
   backgroundTasks: number;
+  /** Track C: agent-inbox rows, ranged over their salted `thread_id`. */
+  notifications: number;
+  /** Track C: thread-state rows (state lanes + goals), ranged over `thread_id`. */
+  threadState: number;
   approvals: number;
   artifacts: number;
 }
@@ -628,7 +781,9 @@ export type TenantRangePurgeCounter =
   | 'threads'
   | 'messages'
   | 'resources'
-  | 'backgroundTasks';
+  | 'backgroundTasks'
+  | 'notifications'
+  | 'threadState';
 
 /** One table purgeTenant reaps by the INV-3 `[tid_, tid\x60)` range predicate. */
 export interface TenantRangePurgeTable {
@@ -669,6 +824,18 @@ export const TENANT_RANGE_PURGE_TABLES: readonly TenantRangePurgeTable[] = [
     counter: 'backgroundTasks',
     table: 'mastra_background_tasks',
     column: 'run_id',
+  },
+  // Track C — both thread-keyed: their `thread_id` holds the salted memory
+  // threadId (`${tenantId}_${uuid}`), so the same exact range applies.
+  {
+    counter: 'notifications',
+    table: 'mastra_notifications',
+    column: 'thread_id',
+  },
+  {
+    counter: 'threadState',
+    table: 'mastra_thread_state',
+    column: 'thread_id',
   },
 ];
 
@@ -790,6 +957,8 @@ export async function purgeTenant(
     messages: 0,
     resources: 0,
     backgroundTasks: 0,
+    notifications: 0,
+    threadState: 0,
   };
   await Promise.all(
     TENANT_RANGE_PURGE_TABLES.map(async ({ counter, table, column }) => {
