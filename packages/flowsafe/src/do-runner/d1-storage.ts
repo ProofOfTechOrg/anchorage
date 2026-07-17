@@ -684,6 +684,66 @@ export async function purgeExpiredThreadState(
   }
 }
 
+/**
+ * The table `purgeExpiredScheduleTriggers` deletes from under the trigger-row TTL
+ * — the anchor the schema guard cross-checks the `schedule-trigger-ttl` retention
+ * declaration against (DL-003), the Track D analog of THREAD_STATE_TTL_PURGE_TABLES.
+ * Only the trigger HISTORY expires; the schedule rows themselves are standing
+ * config (retention 'none', reaped at offboarding by purgeTenant).
+ */
+export const SCHEDULE_TRIGGER_TTL_PURGE_TABLES: readonly string[] = [
+  'mastra_schedule_triggers',
+];
+
+export interface PurgeExpiredScheduleTriggersOptions {
+  /**
+   * Trigger-history rows whose `actualFireAt` is older than this expire. No
+   * default (opt-in, like the notification/thread-state TTLs): a schedule's fire
+   * history is inspectable until the host sets a window.
+   */
+  ttlMs: number;
+  /** Must match createD1Storage's tablePrefix. */
+  tablePrefix?: string;
+  /** Clock override for tests. */
+  now?: () => number;
+}
+
+/**
+ * Schedule-trigger TTL cleanup (DL-003 retention leg): deletes trigger-history
+ * rows from `mastra_schedule_triggers` once their `actualFireAt` is older than the
+ * TTL, at the storage layer so a cron reaps them without a live tick — the same
+ * posture as the other purges (raw D1 binding, failure-isolated as a cron duty).
+ *
+ * `actualFireAt` is stored as INTEGER ms-epoch (core types
+ * `ScheduleTrigger.actualFireAt` as `number`, unlike the ISO-TEXT timestamp
+ * columns the other domains use), so the comparison is a NUMERIC `<` against a
+ * numeric cutoff — a correct timestamp comparison over integers. A missing table
+ * reads as zero (schedules may never have fired). Scheduling stays with the
+ * caller. Deleting trigger history never touches a live schedule (its own row is
+ * in `mastra_schedules`), so there is no ordering constraint.
+ */
+export async function purgeExpiredScheduleTriggers(
+  db: SnapshotDatabase,
+  options: PurgeExpiredScheduleTriggersOptions,
+): Promise<number> {
+  const now = options.now ?? Date.now;
+  const prefix = options.tablePrefix ?? '';
+  const cutoff = now() - options.ttlMs;
+  try {
+    return d1Changes(
+      await db
+        .prepare(
+          `DELETE FROM ${prefix}mastra_schedule_triggers WHERE actualFireAt < ?`,
+        )
+        .bind(cutoff)
+        .run(),
+    );
+  } catch (error) {
+    if (!isMissingTable(error)) throw error;
+    return 0;
+  }
+}
+
 // One CREATE INDEX per (database, prefix) per isolate: purgeTenant runs this,
 // and the demo reaper invokes purgeTenant in a LIMIT-batched loop — without
 // the memo that is one DDL round-trip to the D1 primary per tenant per cron
@@ -764,6 +824,10 @@ export interface PurgeTenantResult {
   notifications: number;
   /** Track C: thread-state rows (state lanes + goals), ranged over `thread_id`. */
   threadState: number;
+  /** Track D: schedule rows, METADATA-filtered on their `metadata.tenantId`. */
+  schedules: number;
+  /** Track D: schedule-trigger rows, METADATA-filtered on their `metadata.tenantId`. */
+  scheduleTriggers: number;
   approvals: number;
   artifacts: number;
 }
@@ -847,6 +911,48 @@ export const TENANT_RANGE_PURGE_TABLES: readonly TenantRangePurgeTable[] = [
 type AssertTrue<T extends true> = T;
 type _EveryPurgeCounterIsReported = AssertTrue<
   TenantRangePurgeCounter extends keyof PurgeTenantResult ? true : false
+>;
+
+/**
+ * The `PurgeTenantResult` field a METADATA-filtered table reports into. Track D's
+ * schedule rows key on slugified ids (`agent_<slug>`/`schedule_<slug>`), NOT
+ * tenant-salted ids, so the `[tid_, tid\x60)` range predicate cannot reach them —
+ * the tenant lives in `metadata.tenantId` (DL-013). This is the second
+ * offboarding KIND alongside the range counter: a track adopting a metadata-keyed
+ * domain adds its counter HERE, its row to TENANT_METADATA_PURGE_TABLES, and its
+ * PurgeTenantResult field, all in the SAME change (DL-003), pinned the same way.
+ */
+export type TenantMetadataPurgeCounter = 'schedules' | 'scheduleTriggers';
+
+/** One table purgeTenant reaps by `json_extract(metadata, '$.tenantId') = ?`. */
+export interface TenantMetadataPurgeTable {
+  /** The PurgeTenantResult field this table's deleted-row count lands in. */
+  counter: TenantMetadataPurgeCounter;
+  /** Unprefixed table name; purgeTenant applies the host's tablePrefix. */
+  table: string;
+}
+
+/**
+ * The metadata-filtered purge inventory (DL-003) — the offboarding coverage for
+ * tables whose tenant is a JSON `metadata.tenantId` (stamped by the schedules
+ * facade at create + the tick on every trigger), not a salted id column. Both
+ * Track D tables are here: schedule rows and their trigger history. The DELETE is
+ * `WHERE json_extract(metadata, '$.tenantId') = ?` (the same SQLite json_extract
+ * the run-snapshot purge already uses on `snapshot`), so a NULL/absent metadata
+ * never matches — every row our facade/tick writes carries it, so this reaps them
+ * all. Ordering is not load-bearing (deletes run concurrently; see purgeTenant).
+ */
+export const TENANT_METADATA_PURGE_TABLES: readonly TenantMetadataPurgeTable[] =
+  [
+    { counter: 'schedules', table: 'mastra_schedules' },
+    { counter: 'scheduleTriggers', table: 'mastra_schedule_triggers' },
+  ];
+
+// Compile-time DL-003 pin (the metadata analog of the range pin above): every
+// metadata counter must be a PurgeTenantResult field, so a table whose reaped
+// rows are counted nowhere cannot be adopted.
+type _EveryMetadataCounterIsReported = AssertTrue<
+  TenantMetadataPurgeCounter extends keyof PurgeTenantResult ? true : false
 >;
 
 /**
@@ -977,6 +1083,32 @@ export async function purgeTenant(
     }),
   );
 
+  // 3b. Metadata-filtered tables (Track D schedules + triggers): their tenant is
+  // a JSON metadata.tenantId, not a salted id, so they cannot ride the range
+  // above. Same posture — concurrent deletes, per-table missing-table tolerance,
+  // a first real error still rejects. json_extract on a NULL metadata yields NULL
+  // and matches nothing (a row our facade/tick never wrote).
+  const metadataCounts: Record<TenantMetadataPurgeCounter, number> = {
+    schedules: 0,
+    scheduleTriggers: 0,
+  };
+  await Promise.all(
+    TENANT_METADATA_PURGE_TABLES.map(async ({ counter, table }) => {
+      try {
+        metadataCounts[counter] = d1Changes(
+          await db
+            .prepare(
+              `DELETE FROM ${prefix}${table} WHERE json_extract(metadata, '$.tenantId') = ?`,
+            )
+            .bind(tenantId)
+            .run(),
+        );
+      } catch (error) {
+        if (!isMissingTable(error)) throw error;
+      }
+    }),
+  );
+
   // 4. Approvals — by the tenant_id column. Hosts without the approval queue
   // have no such table; a missing table is the only tolerated failure.
   let approvals = 0;
@@ -991,7 +1123,7 @@ export async function purgeTenant(
     if (!isMissingTable(error)) throw error;
   }
 
-  return { snapshots, ...memory, approvals, artifacts };
+  return { snapshots, ...memory, ...metadataCounts, approvals, artifacts };
 }
 
 /** Rows affected by a D1 write, read from its `{ meta: { changes } }` envelope. */

@@ -41,6 +41,7 @@ import {
   openSqlite,
   type SqliteDatabase,
 } from '../../test-support/sqlite.js';
+import { createScheduleStorageDomains } from '../schedules/storage.js';
 import { createSignalStorageDomains } from '../signals/storage.js';
 import type { SnapshotDatabase, SnapshotStatement } from './d1-storage.js';
 import {
@@ -49,6 +50,8 @@ import {
   NOTIFICATION_TTL_PURGE_TABLES,
   purgeTenant,
   RUN_TTL_PURGE_TABLES,
+  SCHEDULE_TRIGGER_TTL_PURGE_TABLES,
+  TENANT_METADATA_PURGE_TABLES,
   TENANT_RANGE_PURGE_TABLES,
   THREAD_STATE_TTL_PURGE_TABLES,
   THREAD_TTL_PURGE_TABLES,
@@ -119,11 +122,18 @@ function buildGated(storage: MastraCompositeStore): {
  * How purgeTenant reaps a Mastra table AT OFFBOARDING:
  * - 'run-id-range': the snapshot table's own block (INV-1 salted run_id).
  * - 'tenant-range': TENANT_RANGE_PURGE_TABLES (salted thread/resource ids).
+ * - 'metadata-tenant': TENANT_METADATA_PURGE_TABLES (Track D schedules — the
+ *   tenant is a JSON metadata.tenantId, since ids are slugified not salted, so the
+ *   salted range predicate cannot reach them).
  * - 'unadopted': no feature writes it, so no id in it is salted yet. Adopting
  *   one means salting its ids and moving it to 'tenant-range' in the SAME
  *   change (DL-003) — the guard below is what makes that non-optional.
  */
-type PurgeCoverage = 'run-id-range' | 'tenant-range' | 'unadopted';
+type PurgeCoverage =
+  | 'run-id-range'
+  | 'tenant-range'
+  | 'metadata-tenant'
+  | 'unadopted';
 
 /**
  * How a table's rows EXPIRE SHORT of offboarding — DL-003's third leg, and the
@@ -146,6 +156,8 @@ type RetentionStory =
   | { kind: 'notification-ttl' }
   /** Track C: thread-state rows expire via purgeExpiredThreadState (updatedAt TTL). */
   | { kind: 'thread-state-ttl' }
+  /** Track D: schedule-trigger history expires via purgeExpiredScheduleTriggers (actualFireAt TTL). */
+  | { kind: 'schedule-trigger-ttl' }
   /** Rows die with their parent's TTL rather than aging out on their own. */
   | { kind: 'cascade'; with: string }
   | { kind: 'none'; because: string };
@@ -156,7 +168,8 @@ type TtlKind =
   | 'thread-ttl'
   | 'background-task-ttl'
   | 'notification-ttl'
-  | 'thread-state-ttl';
+  | 'thread-state-ttl'
+  | 'schedule-trigger-ttl';
 
 describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
   // The ONE reason an unadopted table carries — hoisted so the coverage↔reason
@@ -194,6 +207,25 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
         kind: 'none',
         because:
           "working memory is the OWNER's, shared across every thread they have, so one thread aging out says nothing about it — and a resource has no idleness signal of its own. Reaped at offboarding by purgeTenant",
+      },
+    },
+    // Track D — both metadata-tenant (their tenant is a JSON metadata.tenantId,
+    // since ids are slugified `agent_`/`schedule_`, not tenant-salted). Sorted:
+    // 'mastra_schedule_triggers' precedes 'mastra_schedules' under BINARY
+    // collation ('_' 0x5F < 's' 0x73, the same order 'mastra_thread_state' <
+    // 'mastra_threads' takes), and both precede 'mastra_scorers' ('sch' < 'sco').
+    {
+      table: 'mastra_schedule_triggers',
+      coverage: 'metadata-tenant',
+      retention: { kind: 'schedule-trigger-ttl' },
+    },
+    {
+      table: 'mastra_schedules',
+      coverage: 'metadata-tenant',
+      retention: {
+        kind: 'none',
+        because:
+          'a schedule is standing config a tenant creates and deletes explicitly — it has no terminal state to age out; its fire HISTORY expires (mastra_schedule_triggers, schedule-trigger-ttl) but the config row is reaped only at offboarding by purgeTenant',
       },
     },
     {
@@ -234,12 +266,16 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     const binding = d1DatabaseLike(sqlite);
     const storage = createD1Storage({
       binding: binding as never,
-      domains: createSignalStorageDomains(binding as never),
+      domains: {
+        ...createSignalStorageDomains(binding as never),
+        ...createScheduleStorageDomains(binding as never),
+      },
     });
     const { runtime } = buildGated(storage);
 
     // #when — the workflow run triggers the adapter's six tables; init() then
-    // creates the two signal-domain tables (they build their schema on init()).
+    // creates the flowsafe-owned domain tables (signals' two + schedules' two —
+    // each builds its schema on init()).
     await runtime.start('gated', { runId: 'abc_r1', inputData: {} });
     await storage.init();
 
@@ -295,6 +331,9 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     );
     expect(accountedFor('thread-state-ttl')).toEqual(
       [...THREAD_STATE_TTL_PURGE_TABLES].sort(),
+    );
+    expect(accountedFor('schedule-trigger-ttl')).toEqual(
+      [...SCHEDULE_TRIGGER_TTL_PURGE_TABLES].sort(),
     );
 
     // ...and every cascade names a parent that EXISTS and itself expires. The
@@ -359,6 +398,54 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
 
     // #then — set equality in both directions
     expect(wired.slice().sort()).toEqual(declared.slice().sort());
+  });
+
+  it('every table declared metadata-tenant IS in purgeTenant’s metadata list, and vice versa', async () => {
+    // #given — the DL-003 "same change" bar for the SECOND offboarding kind:
+    // Track D schedules key on slugified ids, so they are reaped by a JSON
+    // metadata.tenantId filter, not the salted range. Declaring the coverage
+    // without wiring TENANT_METADATA_PURGE_TABLES would strand a tenant's schedule
+    // rows at offboarding — a leak the inventory pin cannot see (the table exists).
+    const declared = MASTRA_TABLES.filter(
+      (entry) => entry.coverage === 'metadata-tenant',
+    ).map((entry) => entry.table);
+
+    // #when
+    const wired = TENANT_METADATA_PURGE_TABLES.map((entry) => entry.table);
+
+    // #then — set equality in both directions
+    expect(wired.slice().sort()).toEqual(declared.slice().sort());
+  });
+
+  it('the Track D schedule tables keep the columns their purge + tick ride on (metadata + nextFireAt/actualFireAt)', async () => {
+    // #given — flowsafe-owned tables (the adapter ships neither); compose the
+    // schedules domain and init to create them.
+    const sqlite = openSqlite();
+    const binding = d1DatabaseLike(sqlite);
+    const storage = createD1Storage({
+      binding: binding as never,
+      domains: createScheduleStorageDomains(binding as never),
+    });
+    await storage.init();
+
+    // #when
+    const columnsOf = (table: string) =>
+      (
+        sqlite.prepare(`PRAGMA table_info(${table})`).all() as {
+          name: string;
+        }[]
+      ).map((column) => column.name);
+
+    // #then — purgeTenant metadata-filters BOTH over `metadata` (json_extract
+    // '$.tenantId'); listDueSchedules rides (status, nextFireAt) and the trigger
+    // TTL reaps by actualFireAt. These are OUR column names, so this pins US
+    // against a self-inflicted rename that would inert a purge or the tick.
+    expect(columnsOf('mastra_schedules')).toEqual(
+      expect.arrayContaining(['metadata', 'status', 'nextFireAt']),
+    );
+    expect(columnsOf('mastra_schedule_triggers')).toEqual(
+      expect.arrayContaining(['metadata', 'scheduleId', 'actualFireAt']),
+    );
   });
 
   it("mastra_threads.updatedAt is still ISO-8601 TEXT — the encoding the thread TTL's comparison rides", async () => {

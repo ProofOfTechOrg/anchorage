@@ -333,6 +333,40 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     // #then — no goal handling, as before the seam existed
     expect(unmounted.status).toBe(404);
   });
+
+  it('mounts an opt-in buildScheduleRouter; absent seam is byte-identical (unmounted)', async () => {
+    // #given — a worker WITH a schedule stage that claims /api/schedules
+    const worker = makeWorker({
+      buildScheduleRouter: () => async (request) => {
+        const url = new URL(request.url);
+        return url.pathname.startsWith('/api/schedules')
+          ? new Response('schedule-stage', { status: 299 })
+          : null;
+      },
+    });
+    const { env, ctx } = makeEnv();
+
+    // #when — a schedules path reaches the mounted stage…
+    const mounted = await worker.fetch(
+      authed('http://host/api/schedules'),
+      env,
+      ctx,
+    );
+    // #then
+    expect(mounted.status).toBe(299);
+
+    // #given — a worker WITHOUT the seam
+    const bare = makeWorker();
+    const { env: env2, ctx: ctx2 } = makeEnv();
+    // #when — /api/schedules is not a run/approval route; it falls to the 404 tail
+    const unmounted = await bare.fetch(
+      authed('http://host/api/schedules'),
+      env2,
+      ctx2,
+    );
+    // #then — no schedule handling, as before the seam existed
+    expect(unmounted.status).toBe(404);
+  });
 });
 
 describe('createFlowsafeWorker scheduled dispatch', () => {
@@ -819,5 +853,116 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
       },
     ]);
     expect(logs.lines().length).toBeGreaterThan(0);
+  });
+});
+
+describe('createFlowsafeWorker schedule tick dispatch (Track D)', () => {
+  const TICK = '*/2 * * * *';
+
+  it('the tick cron runs ONLY the schedule tick, not the sweep/purge', async () => {
+    // #given a worker with a tick cron + a scheduleTick builder
+    const logs = capturedLogs();
+    const tickFn = vi.fn(async () => ({
+      due: 1,
+      fired: 1,
+      skipped: 0,
+      failed: 0,
+      lost: 0,
+    }));
+    const worker = makeWorker({
+      crons: { sweep: SWEEP, purge: PURGE, tick: TICK },
+      scheduleTick: () => tickFn,
+    });
+    const { env, ctx, flush } = makeEnv();
+
+    // #when the tick cron fires
+    await worker.scheduled({ cron: TICK }, env, ctx);
+    await flush();
+
+    // #then the tick ran once, logged its own line, and NO maintenance ran
+    expect(tickFn).toHaveBeenCalledTimes(1);
+    const tickLines = logs
+      .lines()
+      .map((l) => {
+        try {
+          return JSON.parse(l) as Record<string, unknown>;
+        } catch {
+          return undefined;
+        }
+      })
+      .filter((p): p is Record<string, unknown> => p?.type === 'schedule-tick');
+    expect(tickLines).toHaveLength(1);
+    expect(tickLines[0]?.result).toMatchObject({ fired: 1 });
+    expect(logs.lines().some((l) => l.includes('"type":"maintenance"'))).toBe(
+      false,
+    );
+  });
+
+  it('the tick cron with NO scheduleTick builder logs a config-error, runs nothing else', async () => {
+    // #given the tick cron is set but no builder is wired (a misconfig)
+    const logs = capturedLogs();
+    const worker = makeWorker({
+      crons: { sweep: SWEEP, purge: PURGE, tick: TICK },
+    });
+    const { env, ctx, flush } = makeEnv();
+
+    // #when
+    await worker.scheduled({ cron: TICK }, env, ctx);
+    await flush();
+
+    // #then a config-error naming crons.tick; NO maintenance (the invocation is
+    // the tick's — it does not fall through to sweep/purge)
+    expect(
+      logs
+        .errors()
+        .some((l) => l.includes('config-error') && l.includes('crons.tick')),
+    ).toBe(true);
+    expect(logs.lines().some((l) => l.includes('"type":"maintenance"'))).toBe(
+      false,
+    );
+  });
+
+  it('a throwing tick is CONTAINED (schedule-tick-error), never an unhandled rejection', async () => {
+    // #given a tick that throws
+    const logs = capturedLogs();
+    const worker = makeWorker({
+      crons: { sweep: SWEEP, purge: PURGE, tick: TICK },
+      scheduleTick: () => async () => {
+        throw new Error('D1 down');
+      },
+    });
+    const { env, ctx, flush } = makeEnv();
+
+    // #when
+    await worker.scheduled({ cron: TICK }, env, ctx);
+    await flush();
+
+    // #then the error was contained + logged
+    expect(
+      logs
+        .errors()
+        .some(
+          (l) => l.includes('schedule-tick-error') && l.includes('D1 down'),
+        ),
+    ).toBe(true);
+  });
+
+  it('an unconfigured worker (no crons.tick) is byte-identical — the tick branch is unreachable', async () => {
+    // #given a default worker (no tick cron/builder)
+    const logs = capturedLogs();
+    const tickFn = vi.fn();
+    const worker = makeWorker({ scheduleTick: () => tickFn });
+    const { env, ctx, flush } = makeEnv();
+
+    // #when the purge cron fires (the tick builder is present but crons.tick is
+    // unset, so the tick never runs)
+    await worker.scheduled({ cron: PURGE }, env, ctx);
+    await flush();
+
+    // #then the tick was never invoked; the purge ran as before
+    expect(tickFn).not.toHaveBeenCalled();
+    expect(logs.lines().some((l) => l.includes('"type":"maintenance"'))).toBe(
+      true,
+    );
   });
 });

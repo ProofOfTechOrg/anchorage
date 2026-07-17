@@ -36,6 +36,7 @@ import type {
 import {
   purgeExpiredBackgroundTasks,
   purgeExpiredNotifications,
+  purgeExpiredScheduleTriggers,
   purgeExpiredThreadState,
   purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
@@ -130,6 +131,14 @@ export interface FlowsafeWorkerEnv {
    * goal bumps updatedAt so it never ages out).
    */
   THREAD_STATE_RETENTION_DAYS?: string;
+  /**
+   * Track D schedule-trigger history TTL in days (var). The purge cron reaps
+   * `mastra_schedule_triggers` rows past this age by their `actualFireAt`.
+   * UNSET/EMPTY/INVALID => the duty does not run (opt-in; a schedule's fire
+   * history is inspectable until the host sets a window). The schedule rows
+   * themselves are standing config — never TTL'd, reaped only at offboarding.
+   */
+  SCHEDULE_TRIGGER_RETENTION_DAYS?: string;
   /** Optional audit export: queue producer binding + SIEM collector config. */
   AUDIT_QUEUE?: AuditQueue<ApprovalAuditEvent>;
   SIEM_ENDPOINT?: string;
@@ -165,12 +174,17 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
    */
   buildVerifier: (env: Env) => TokenVerifier;
   /**
-   * The two cron expressions scheduled() dispatches on. Keep byte-equal to
-   * wrangler.jsonc's `triggers.crons`; an unrecognized expression runs BOTH
-   * duties sequentially and logs a config-error (availability of both beats
-   * purity on a misconfig).
+   * The cron expressions scheduled() dispatches on. `sweep` + `purge` are
+   * required and must never share an invocation. `tick` is OPTIONAL (Track D
+   * schedules): when set AND `scheduleTick` is provided, the schedule tick runs
+   * on it as its OWN failure-isolated invocation (a runaway fire pass gets its
+   * own CPU budget, the same rationale that keeps sweep and purge apart). Keep
+   * these byte-equal to wrangler.jsonc's `triggers.crons`; an unrecognized
+   * expression runs the sweep + purge duties sequentially and logs a
+   * config-error (availability beats purity on a misconfig). Absent `tick` ⇒ no
+   * schedule-tick invocation, byte-identical.
    */
-  crons: { sweep: string; purge: string };
+  crons: { sweep: string; purge: string; tick?: string };
   /**
    * Deployment-specific routes tried AFTER /healthz and BEFORE the approval
    * and run routers (the showcase mounts its demo sign-in and sandbox reset
@@ -252,6 +266,31 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
     resolve: TenantResolver,
     env: Env,
   ) => ((request: Request) => Promise<Response | null>) | undefined;
+  /**
+   * Opt-in Track D schedule CRUD facade (DL-013). Mirrors buildSignalRouter/
+   * buildObjectiveRouter: the host builds its `createScheduleRouter` (which needs
+   * the schedules store from its D1 domains + its audit/cap config) and returns it
+   * here, closed over the request's resolved TenantResolver; the composer mounts it
+   * after the goal stage. Its `/api/schedules/*` routes don't overlap the others.
+   * INJECTED (not built here, typed structurally) because createScheduleRouter
+   * lives in `schedules/`, which transitively imports host-kit — importing it back
+   * would cycle. Absent (or returns undefined) ⇒ no schedule surface, byte-identical.
+   */
+  buildScheduleRouter?: (
+    resolve: TenantResolver,
+    env: Env,
+  ) => ((request: Request) => Promise<Response | null>) | undefined;
+  /**
+   * Opt-in Track D schedule tick (DL-012). The host builds its `createScheduleTick`
+   * (which needs the schedules store, its run-start seam — topology.start — and
+   * the run-cap + audit config) and returns the closure here. The composer runs
+   * it on the `crons.tick` cron as its OWN failure-isolated duty (own try/catch,
+   * own `schedule-tick` log line). INJECTED (not built here, structurally typed as
+   * `() => Promise<unknown>`) because createScheduleTick lives in `schedules/`,
+   * which transitively imports host-kit — host-kit importing it back would cycle.
+   * Absent (or `crons.tick` unset) ⇒ no tick invocation, byte-identical.
+   */
+  scheduleTick?: (env: Env) => (() => Promise<unknown>) | undefined;
   /**
    * Extra purge-cron duties (e.g. the showcase's demo-tenant reaper). The
    * returned fields fold into the ONE combined `{type:'maintenance'}` log
@@ -496,6 +535,31 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         );
       }
     }
+    // Track D schedule-trigger history TTL (opt-in). Same isolation + opt-in
+    // posture. Only the fire HISTORY expires; schedule config rows are reaped
+    // only at offboarding (purgeTenant).
+    let scheduleTriggersPurged: number | undefined;
+    const scheduleTriggerRetentionDays = optionalNumberVar(
+      env.SCHEDULE_TRIGGER_RETENTION_DAYS,
+      'SCHEDULE_TRIGGER_RETENTION_DAYS',
+      { allowZero: true },
+    );
+    if (scheduleTriggerRetentionDays !== undefined) {
+      try {
+        scheduleTriggersPurged = await purgeExpiredScheduleTriggers(env.DB, {
+          ttlMs: scheduleTriggerRetentionDays * 24 * 60 * 60 * 1000,
+        });
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            type: 'maintenance-error',
+            surface: 'schedule-trigger-purge',
+            cron,
+            error: String(error),
+          }),
+        );
+      }
+    }
     let extra: Record<string, unknown> = {};
     if (config.extraPurgeDuties) {
       try {
@@ -523,9 +587,42 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         backgroundTasksFailedPurged: backgroundTasksPurged?.failed,
         notificationsPurged,
         threadStatePurged,
+        scheduleTriggersPurged,
         ...extra,
       }),
     );
+  }
+
+  // Track D schedule tick — its OWN failure-isolated duty (own try/catch, own log
+  // line), run on the `crons.tick` invocation. A wedged fire pass must cost the
+  // sweep + purge nothing, and vice versa (the two-cron isolation rationale).
+  async function runScheduleTickDuty(env: Env, cron: string): Promise<void> {
+    const tick = config.scheduleTick?.(env);
+    if (!tick) {
+      // The tick cron fired but no scheduleTick builder is wired — a misconfig.
+      // Do NOT fall through to sweep/purge (this invocation is the tick's).
+      console.error(
+        JSON.stringify({
+          type: 'config-error',
+          var: 'crons.tick',
+          cron,
+          reason: 'tick cron fired but no scheduleTick builder is configured',
+        }),
+      );
+      return;
+    }
+    try {
+      const result = await tick();
+      console.log(JSON.stringify({ type: 'schedule-tick', cron, result }));
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          type: 'schedule-tick-error',
+          cron,
+          error: String(error),
+        }),
+      );
+    }
   }
 
   return {
@@ -611,6 +708,16 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         if (objectiveResponse) return objectiveResponse;
       }
 
+      // Optional Track D schedule CRUD stage (DL-013): the host-built
+      // createScheduleRouter, closed over THIS request's resolver. `/api/schedules/*`
+      // — composes after goals (non-overlapping), ahead of approvals/runs. Absent
+      // seam ⇒ unmounted, byte-identical.
+      const scheduleRouter = config.buildScheduleRouter?.(resolve, env);
+      if (scheduleRouter) {
+        const scheduleResponse = await scheduleRouter(request);
+        if (scheduleResponse) return scheduleResponse;
+      }
+
       const approvalResponse = await createApprovalRouter({ resolve })(request);
       if (approvalResponse) return approvalResponse;
 
@@ -662,6 +769,13 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         ctx.waitUntil(sweep());
       } else if (controller.cron === config.crons.purge) {
         ctx.waitUntil(runPurgeMaintenance(env, controller.cron));
+      } else if (
+        config.crons.tick !== undefined &&
+        controller.cron === config.crons.tick
+      ) {
+        // Track D: the schedule tick's OWN invocation (opt-in; unset ⇒ this
+        // branch is unreachable, byte-identical).
+        ctx.waitUntil(runScheduleTickDuty(env, controller.cron));
       } else {
         console.error(
           JSON.stringify({

@@ -11,12 +11,17 @@ import {
   openSqlite,
   type SqliteDatabase,
 } from '../../test-support/sqlite.js';
+import {
+  D1SchedulesStorage,
+  type ScheduleDatabase,
+} from '../schedules/schedules-d1.js';
 import type { SignalDatabase } from '../signals/d1-shared.js';
 import { D1NotificationsStorage } from '../signals/notifications-d1.js';
 import { D1ThreadStateStorage } from '../signals/thread-state-d1.js';
 import {
   purgeExpiredBackgroundTasks,
   purgeExpiredNotifications,
+  purgeExpiredScheduleTriggers,
   purgeExpiredThreadState,
   purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
@@ -548,6 +553,8 @@ describe('purgeTenant (complete offboarding)', () => {
       backgroundTasks: 0,
       notifications: 0,
       threadState: 0,
+      schedules: 0,
+      scheduleTriggers: 0,
       approvals: 1,
       artifacts: 2,
     });
@@ -688,6 +695,8 @@ describe('purgeTenant (complete offboarding)', () => {
       backgroundTasks: 0,
       notifications: 0,
       threadState: 0,
+      schedules: 0,
+      scheduleTriggers: 0,
       approvals: 0,
       artifacts: 0,
     });
@@ -721,6 +730,8 @@ describe('purgeTenant (complete offboarding)', () => {
       backgroundTasks: 0,
       notifications: 0,
       threadState: 0,
+      schedules: 0,
+      scheduleTriggers: 0,
       approvals: 1,
       artifacts: 0,
     });
@@ -745,6 +756,8 @@ describe('purgeTenant (complete offboarding)', () => {
       backgroundTasks: 0,
       notifications: 0,
       threadState: 0,
+      schedules: 0,
+      scheduleTriggers: 0,
       approvals: 0,
       artifacts: 0,
     });
@@ -1883,5 +1896,121 @@ describe('purgeTenant — Track C signal tables', () => {
       }[]
     ).map((r) => r.thread_id);
     expect(stateThreads).toEqual(['xyz_t1']);
+  });
+
+  it('purgeTenant reaps a tenant’s schedules + trigger history by metadata.tenantId, sparing others', async () => {
+    // #given — two tenants' schedules + trigger rows in the flowsafe-owned Track
+    // D tables. Their ids are slugified (schedule_<x>), NOT tenant-salted, so the
+    // range predicate cannot reach them — the metadata-filter is what does.
+    const sqlite = openSqlite();
+    const store = new D1SchedulesStorage(
+      d1DatabaseLike(sqlite) as unknown as ScheduleDatabase,
+    );
+    const seed = async (tenantId: string, id: string) => {
+      await store.createSchedule({
+        id,
+        target: { type: 'workflow', workflowId: 'wf' },
+        cron: '* * * * *',
+        status: 'active',
+        nextFireAt: NOW,
+        createdAt: NOW,
+        updatedAt: NOW,
+        metadata: { tenantId },
+      });
+      await store.recordTrigger({
+        scheduleId: id,
+        runId: `${tenantId}_r1`,
+        scheduledFireAt: NOW,
+        actualFireAt: NOW,
+        outcome: 'published',
+        metadata: { tenantId },
+      });
+    };
+    await seed('abc', 'schedule_a');
+    await seed('xyz', 'schedule_x');
+
+    // #when — offboard exactly 'abc'
+    const purged = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
+
+    // #then — abc's schedule + its one trigger left; the counters name them; xyz
+    // survives, proving the metadata filter is exact (not a substring match).
+    expect(purged.schedules).toBe(1);
+    expect(purged.scheduleTriggers).toBe(1);
+    const scheduleIds = (
+      sqlite.prepare('SELECT id FROM mastra_schedules').all() as {
+        id: string;
+      }[]
+    ).map((r) => r.id);
+    expect(scheduleIds).toEqual(['schedule_x']);
+    const triggerTenants = (
+      sqlite
+        .prepare(
+          "SELECT json_extract(metadata,'$.tenantId') AS t FROM mastra_schedule_triggers",
+        )
+        .all() as { t: string }[]
+    ).map((r) => r.t);
+    expect(triggerTenants).toEqual(['xyz']);
+  });
+
+  it('purgeExpiredScheduleTriggers reaps trigger rows past the actualFireAt TTL, keeping recent ones (numeric compare)', async () => {
+    // #given — one old + one recent trigger. actualFireAt is INTEGER ms-epoch, so
+    // the TTL is a NUMERIC comparison (not the ISO-text bet the other purges take).
+    const sqlite = openSqlite();
+    const store = new D1SchedulesStorage(
+      d1DatabaseLike(sqlite) as unknown as ScheduleDatabase,
+    );
+    await store.createSchedule({
+      id: 'schedule_a',
+      target: { type: 'workflow', workflowId: 'wf' },
+      cron: '* * * * *',
+      status: 'active',
+      nextFireAt: NOW,
+      createdAt: NOW,
+      updatedAt: NOW,
+      metadata: { tenantId: 'abc' },
+    });
+    await store.recordTrigger({
+      id: 'old',
+      scheduleId: 'schedule_a',
+      runId: 'abc_r1',
+      scheduledFireAt: NOW - 10 * DAY_MS,
+      actualFireAt: NOW - 10 * DAY_MS,
+      outcome: 'published',
+      metadata: { tenantId: 'abc' },
+    });
+    await store.recordTrigger({
+      id: 'recent',
+      scheduleId: 'schedule_a',
+      runId: 'abc_r2',
+      scheduledFireAt: NOW - 1000,
+      actualFireAt: NOW - 1000,
+      outcome: 'published',
+      metadata: { tenantId: 'abc' },
+    });
+
+    // #when — a 7-day window at NOW
+    const deleted = await purgeExpiredScheduleTriggers(d1Like(sqlite), {
+      ttlMs: 7 * DAY_MS,
+      now: () => NOW,
+    });
+
+    // #then — the 10-day-old row is reaped; the recent one stays.
+    expect(deleted).toBe(1);
+    const ids = (
+      sqlite.prepare('SELECT id FROM mastra_schedule_triggers').all() as {
+        id: string;
+      }[]
+    ).map((r) => r.id);
+    expect(ids).toEqual(['recent']);
+  });
+
+  it('purgeExpiredScheduleTriggers reads a missing trigger table as zero', async () => {
+    // #given — a fresh db, no schedule tables (schedules may never have fired)
+    const sqlite = openSqlite();
+
+    // #then — no throw, zero deleted
+    expect(
+      await purgeExpiredScheduleTriggers(d1Like(sqlite), { ttlMs: DAY_MS }),
+    ).toBe(0);
   });
 });
