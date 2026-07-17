@@ -293,6 +293,46 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     expect(resumed.status).toBe(200);
     expect(wrapped).toEqual(['start:wf', `resume:wf:${summary.runId}`]);
   });
+
+  it('mounts an opt-in buildObjectiveRouter; absent seam is byte-identical (unmounted)', async () => {
+    // #given — a worker WITH a goal stage that claims /api/threads/:id/goal
+    const worker = makeWorker({
+      buildObjectiveRouter: () => async (request) => {
+        const url = new URL(request.url);
+        return url.pathname.endsWith('/goal')
+          ? new Response('goal-stage', { status: 299 })
+          : null;
+      },
+    });
+    const { env, ctx } = makeEnv();
+
+    // #when — a goal path reaches the mounted stage…
+    const mounted = await worker.fetch(
+      authed('http://host/api/threads/acme_t1/goal', {
+        method: 'PUT',
+        body: '{}',
+      }),
+      env,
+      ctx,
+    );
+    // #then
+    expect(mounted.status).toBe(299);
+
+    // #given — a worker WITHOUT the seam
+    const bare = makeWorker();
+    const { env: env2, ctx: ctx2 } = makeEnv();
+    // #when — the same path is not a goal stage; it falls through to the 404 tail
+    const unmounted = await bare.fetch(
+      authed('http://host/api/threads/acme_t1/goal', {
+        method: 'PUT',
+        body: '{}',
+      }),
+      env2,
+      ctx2,
+    );
+    // #then — no goal handling, as before the seam existed
+    expect(unmounted.status).toBe(404);
+  });
 });
 
 describe('createFlowsafeWorker scheduled dispatch', () => {

@@ -238,6 +238,21 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
     env: Env,
   ) => ((request: Request) => Promise<Response | null>) | undefined;
   /**
+   * Opt-in Track F goal objective stage (P6-lite, DL-018). Mirrors
+   * buildSignalRouter: the host builds its `createObjectiveRouter` (which needs
+   * the thread-state store from its D1 domains, plus its audit/maxRuns config)
+   * and returns it here, closed over the request's resolved TenantResolver; the
+   * composer mounts it after the signal stage. Both live under `/api/threads/*`
+   * but do not overlap — goals use the `/goal` segment, signals the channel
+   * segments. INJECTED rather than built here because createObjectiveRouter lives
+   * in `goals/`, which imports host-kit — host-kit importing it back would cycle.
+   * Absent (or returns undefined) ⇒ no goal stage, byte-identical.
+   */
+  buildObjectiveRouter?: (
+    resolve: TenantResolver,
+    env: Env,
+  ) => ((request: Request) => Promise<Response | null>) | undefined;
+  /**
    * Extra purge-cron duties (e.g. the showcase's demo-tenant reaper). The
    * returned fields fold into the ONE combined `{type:'maintenance'}` log
    * line. Isolated: a throw here logs a maintenance-error and never blocks
@@ -584,6 +599,16 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       if (signalRouter) {
         const signalResponse = await signalRouter(request);
         if (signalResponse) return signalResponse;
+      }
+
+      // Optional Track F goal stage (P6-lite, DL-018): the host-built
+      // createObjectiveRouter, closed over THIS request's resolver.
+      // `/api/threads/:threadId/goal` — composes after signals (non-overlapping)
+      // and ahead of approvals/runs. Absent seam ⇒ unmounted, byte-identical.
+      const objectiveRouter = config.buildObjectiveRouter?.(resolve, env);
+      if (objectiveRouter) {
+        const objectiveResponse = await objectiveRouter(request);
+        if (objectiveResponse) return objectiveResponse;
       }
 
       const approvalResponse = await createApprovalRouter({ resolve })(request);
