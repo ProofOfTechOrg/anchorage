@@ -627,121 +627,137 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
 
   return {
     async fetch(request, env, ctx) {
-      const url = new URL(request.url);
+      try {
+        const url = new URL(request.url);
 
-      if (request.method === 'GET' && url.pathname === '/healthz') {
-        return json({ ok: true });
-      }
+        if (request.method === 'GET' && url.pathname === '/healthz') {
+          return json({ ok: true });
+        }
 
-      const waitUntil = (promise: Promise<unknown>): void =>
-        ctx.waitUntil(promise);
-      const topology = createDoRunTopology(env.RUNNER);
-      const notify = config.notify?.(env);
-      const selfDecision = parseSelfDecision(env);
-      // Fetch-scope live fan-out sink: present iff a hub is bound (streaming is
-      // opt-in, DL-019). Each publish rides ctx.waitUntil (DL-020) and is
-      // contained — a failed fan-out logs and never fails the mutation.
-      const hub = env.HUB;
-      let streamSink: ApprovalStreamSink | undefined;
-      if (hub) {
-        const hubTopology = createHubTopology(hub);
-        streamSink = (event) =>
-          waitUntil(
-            hubTopology.publish(event).catch((error: unknown) =>
-              console.error(
-                JSON.stringify({
-                  type: 'stream-publish-error',
-                  reason:
-                    error instanceof Error ? error.message : String(error),
-                }),
+        const waitUntil = (promise: Promise<unknown>): void =>
+          ctx.waitUntil(promise);
+        const topology = createDoRunTopology(env.RUNNER);
+        const notify = config.notify?.(env);
+        const selfDecision = parseSelfDecision(env);
+        // Fetch-scope live fan-out sink: present iff a hub is bound (streaming is
+        // opt-in, DL-019). Each publish rides ctx.waitUntil (DL-020) and is
+        // contained — a failed fan-out logs and never fails the mutation.
+        const hub = env.HUB;
+        let streamSink: ApprovalStreamSink | undefined;
+        if (hub) {
+          const hubTopology = createHubTopology(hub);
+          streamSink = (event) =>
+            waitUntil(
+              hubTopology.publish(event).catch((error: unknown) =>
+                console.error(
+                  JSON.stringify({
+                    type: 'stream-publish-error',
+                    reason:
+                      error instanceof Error ? error.message : String(error),
+                  }),
+                ),
               ),
-            ),
-          );
-      }
-      const resolve = buildResolve(
-        env,
-        topology,
-        waitUntil,
-        notify,
-        selfDecision,
-        streamSink,
-      );
-
-      if (config.preRoutes) {
-        const preResponse = await config.preRoutes(request, env, ctx, {
-          resolve,
+            );
+        }
+        const resolve = buildResolve(
+          env,
           topology,
-        });
-        if (preResponse) return preResponse;
-      }
-
-      // Optional stream stage (DL-015/DL-019): mounted only when BOTH the hub
-      // binding and the ticket secret are present. Every route is under
-      // /api/stream/, so it composes ahead of the approval router without
-      // touching the /api/* run_worker_first entry.
-      if (env.HUB && env.STREAM_TICKET_SECRET) {
-        const streamResponse = await createStreamRouter({
-          resolve,
-          ticketSecret: env.STREAM_TICKET_SECRET,
-          hub: env.HUB,
-          runner: env.RUNNER,
-        })(request);
-        if (streamResponse) return streamResponse;
-      }
-
-      // Optional Track C signal stage (P6): the host-built createSignalRouter,
-      // closed over THIS request's resolver. `/api/threads/*` — composes ahead
-      // of approvals/runs without overlap. Absent seam => unmounted.
-      const signalRouter = config.buildSignalRouter?.(resolve, env);
-      if (signalRouter) {
-        const signalResponse = await signalRouter(request);
-        if (signalResponse) return signalResponse;
-      }
-
-      // Optional Track F goal stage (P6-lite, DL-018): the host-built
-      // createObjectiveRouter, closed over THIS request's resolver.
-      // `/api/threads/:threadId/goal` — composes after signals (non-overlapping)
-      // and ahead of approvals/runs. Absent seam ⇒ unmounted, byte-identical.
-      const objectiveRouter = config.buildObjectiveRouter?.(resolve, env);
-      if (objectiveRouter) {
-        const objectiveResponse = await objectiveRouter(request);
-        if (objectiveResponse) return objectiveResponse;
-      }
-
-      // Optional Track D schedule CRUD stage (DL-013): the host-built
-      // createScheduleRouter, closed over THIS request's resolver. `/api/schedules/*`
-      // — composes after goals (non-overlapping), ahead of approvals/runs. Absent
-      // seam ⇒ unmounted, byte-identical.
-      const scheduleRouter = config.buildScheduleRouter?.(resolve, env);
-      if (scheduleRouter) {
-        const scheduleResponse = await scheduleRouter(request);
-        if (scheduleResponse) return scheduleResponse;
-      }
-
-      const approvalResponse = await createApprovalRouter({ resolve })(request);
-      if (approvalResponse) return approvalResponse;
-
-      const runResponse = await createRunRouter({
-        workflows: config.workflows,
-        resolve,
-        systemActorId: config.systemActorId,
-        start: config.wrapStart
-          ? config.wrapStart(topology.start, env)
-          : topology.start,
-        status: topology.status,
-        resume: config.wrapResume
-          ? config.wrapResume(topology.resume, env)
-          : topology.resume,
-        // D4 self-healing, waitUntil-detached — the shared wrapper owns the
-        // detach + reconcile-error logging.
-        reconcileApprovals: reconcileApprovalsOnStatusDetached(
-          config.systemActorId,
           waitUntil,
-        ),
-      })(request);
-      if (runResponse) return runResponse;
+          notify,
+          selfDecision,
+          streamSink,
+        );
 
-      return json({ error: 'not found' }, 404);
+        if (config.preRoutes) {
+          const preResponse = await config.preRoutes(request, env, ctx, {
+            resolve,
+            topology,
+          });
+          if (preResponse) return preResponse;
+        }
+
+        // Optional stream stage (DL-015/DL-019): mounted only when BOTH the hub
+        // binding and the ticket secret are present. Every route is under
+        // /api/stream/, so it composes ahead of the approval router without
+        // touching the /api/* run_worker_first entry.
+        if (env.HUB && env.STREAM_TICKET_SECRET) {
+          const streamResponse = await createStreamRouter({
+            resolve,
+            ticketSecret: env.STREAM_TICKET_SECRET,
+            hub: env.HUB,
+            runner: env.RUNNER,
+          })(request);
+          if (streamResponse) return streamResponse;
+        }
+
+        // Optional Track C signal stage (P6): the host-built createSignalRouter,
+        // closed over THIS request's resolver. `/api/threads/*` — composes ahead
+        // of approvals/runs without overlap. Absent seam => unmounted.
+        const signalRouter = config.buildSignalRouter?.(resolve, env);
+        if (signalRouter) {
+          const signalResponse = await signalRouter(request);
+          if (signalResponse) return signalResponse;
+        }
+
+        // Optional Track F goal stage (P6-lite, DL-018): the host-built
+        // createObjectiveRouter, closed over THIS request's resolver.
+        // `/api/threads/:threadId/goal` — composes after signals (non-overlapping)
+        // and ahead of approvals/runs. Absent seam ⇒ unmounted, byte-identical.
+        const objectiveRouter = config.buildObjectiveRouter?.(resolve, env);
+        if (objectiveRouter) {
+          const objectiveResponse = await objectiveRouter(request);
+          if (objectiveResponse) return objectiveResponse;
+        }
+
+        // Optional Track D schedule CRUD stage (DL-013): the host-built
+        // createScheduleRouter, closed over THIS request's resolver. `/api/schedules/*`
+        // — composes after goals (non-overlapping), ahead of approvals/runs. Absent
+        // seam ⇒ unmounted, byte-identical.
+        const scheduleRouter = config.buildScheduleRouter?.(resolve, env);
+        if (scheduleRouter) {
+          const scheduleResponse = await scheduleRouter(request);
+          if (scheduleResponse) return scheduleResponse;
+        }
+
+        const approvalResponse = await createApprovalRouter({ resolve })(
+          request,
+        );
+        if (approvalResponse) return approvalResponse;
+
+        const runResponse = await createRunRouter({
+          workflows: config.workflows,
+          resolve,
+          systemActorId: config.systemActorId,
+          start: config.wrapStart
+            ? config.wrapStart(topology.start, env)
+            : topology.start,
+          status: topology.status,
+          resume: config.wrapResume
+            ? config.wrapResume(topology.resume, env)
+            : topology.resume,
+          // D4 self-healing, waitUntil-detached — the shared wrapper owns the
+          // detach + reconcile-error logging.
+          reconcileApprovals: reconcileApprovalsOnStatusDetached(
+            config.systemActorId,
+            waitUntil,
+          ),
+        })(request);
+        if (runResponse) return runResponse;
+
+        return json({ error: 'not found' }, 404);
+      } catch (error) {
+        // Backstop: a mounted router (or any handler fault) that THROWS before
+        // returning a Response — e.g. a future unguarded path decode — is
+        // contained as a generic 500 here rather than rejecting out of fetch()
+        // as an unhandled promise. Never surface error.message to the client.
+        console.error(
+          JSON.stringify({
+            type: 'worker-fetch-error',
+            reason: error instanceof Error ? error.message : String(error),
+          }),
+        );
+        return json({ error: 'internal error' }, 500);
+      }
     },
 
     async scheduled(controller, env, ctx) {

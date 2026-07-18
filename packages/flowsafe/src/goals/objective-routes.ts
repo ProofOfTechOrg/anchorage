@@ -79,6 +79,7 @@ import {
   RunRouteError,
   requireOwnedMemoryId,
 } from '../host-kit/index.js';
+import { safeDecodeSegment } from '../host-kit/route-path.js';
 
 /**
  * requestContext key @mastra/core surfaces the current objective under WITHIN a
@@ -390,7 +391,10 @@ export function createObjectiveRouter(
     ) {
       return null;
     }
-    const threadId = decodeURIComponent(segments[baseSegments.length] ?? '');
+    // Malformed percent-encoding in the threadId is not a real route target —
+    // route-absent, never a pre-auth decodeURIComponent throw out of the handler.
+    const threadId = safeDecodeSegment(segments[baseSegments.length]);
+    if (threadId === undefined) return null;
     const operation = OPERATION_BY_METHOD[request.method];
     if (operation === undefined) {
       return json({ error: 'method not allowed' }, 405);

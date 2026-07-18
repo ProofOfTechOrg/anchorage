@@ -56,6 +56,7 @@ import {
   requireOwnedMemoryId,
   type ThreadTopology,
 } from '../host-kit/index.js';
+import { safeDecodeSegment } from '../host-kit/route-path.js';
 
 /** The ingest channels, each mapped to a thread-DO route. */
 const CHANNEL_PATHS = {
@@ -152,7 +153,10 @@ export function createSignalRouter(options: SignalRouterOptions): SignalRouter {
     ) {
       return null;
     }
-    const threadId = decodeURIComponent(segments[baseSegments.length] ?? '');
+    // Malformed percent-encoding in the threadId is not a real route target —
+    // route-absent, never a pre-auth decodeURIComponent throw out of the handler.
+    const threadId = safeDecodeSegment(segments[baseSegments.length]);
+    if (threadId === undefined) return null;
     const channelSeg = segments[baseSegments.length + 1] ?? '';
     if (!(channelSeg in CHANNEL_PATHS)) return null;
     const channel = channelSeg as SignalChannel;

@@ -61,6 +61,7 @@ import {
   TenantResolutionError,
   type TenantResolver,
 } from '../approval-api/index.js';
+import { safeDecodeSegment } from '../host-kit/route-path.js';
 import { isReservedScheduleContextKey } from './tick.js';
 
 /** The storage subset the facade reads/writes (a subset of D1SchedulesStorage). */
@@ -541,10 +542,13 @@ export function createScheduleRouter(
     ) {
       return null;
     }
-    const id =
-      segments.length > baseSegments.length
-        ? decodeURIComponent(segments[baseSegments.length] ?? '')
-        : undefined;
+    // Malformed percent-encoding in the id is not a real route target —
+    // route-absent, never a pre-auth decodeURIComponent throw out of the handler.
+    let id: string | undefined;
+    if (segments.length > baseSegments.length) {
+      id = safeDecodeSegment(segments[baseSegments.length]);
+      if (id === undefined) return null;
+    }
     const sub =
       segments.length === baseSegments.length + 2
         ? segments[baseSegments.length + 1]

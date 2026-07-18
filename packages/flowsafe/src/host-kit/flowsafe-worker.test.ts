@@ -334,6 +334,35 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     expect(unmounted.status).toBe(404);
   });
 
+  it('contains a throwing mounted router as a generic 500 (backstop), never an unhandled rejection', async () => {
+    // #given — a mounted stage whose router THROWS (a URIError from an unguarded
+    // path decode is the concrete case this backstops)
+    const worker = makeWorker({
+      buildSignalRouter: () => async () => {
+        throw new URIError('URI malformed');
+      },
+    });
+    const { env, ctx } = makeEnv();
+    const logs = capturedLogs();
+
+    // #when
+    const res = await worker.fetch(
+      authed('http://host/api/threads/acme_t1/message', {
+        method: 'POST',
+        body: '{}',
+      }),
+      env,
+      ctx,
+    );
+
+    // #then — a generic 500 (no error.message leaked), and the fault is logged
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: 'internal error' });
+    expect(logs.errors().some((l) => l.includes('worker-fetch-error'))).toBe(
+      true,
+    );
+  });
+
   it('mounts an opt-in buildScheduleRouter; absent seam is byte-identical (unmounted)', async () => {
     // #given — a worker WITH a schedule stage that claims /api/schedules
     const worker = makeWorker({

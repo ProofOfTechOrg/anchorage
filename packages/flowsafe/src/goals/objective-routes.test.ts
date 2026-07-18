@@ -98,6 +98,24 @@ describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
     ).toBeNull();
   });
 
+  it('is route-absent on a malformed percent-encoded threadId (no pre-auth URIError)', async () => {
+    // A lone '%' in the threadId segment — bare decodeURIComponent would THROW
+    // out of the handler BEFORE auth; safeDecodeSegment makes it route-absent.
+    const { store, raw } = memoryStore();
+    const router = createObjectiveRouter({
+      resolve: async () => tenantCtx('operator'),
+      store,
+    });
+    const res = await router(
+      new Request('http://host/api/threads/%/goal', {
+        method: 'PUT',
+        body: '{}',
+      }),
+    );
+    expect(res).toBeNull();
+    expect(raw.size).toBe(0); // never resolved, never written
+  });
+
   it('405 for an unsupported method on the goal path', async () => {
     const { store } = memoryStore();
     const router = createObjectiveRouter({
