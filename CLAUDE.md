@@ -328,6 +328,105 @@ is the common case, not an edge) — Track A ships the correct primitive that fa
 CLOSED without it (an availability re-deny, never a capability leak), not the
 end-to-end approval-gated agent product.
 
+Track F — goals (M-005, 2026-07-17, branch `feat/track-f-goals`; additive,
+opt-in; merged PR #29). New subpath `@proofoftech/flowsafe/goals`:
+`createObjectiveRouter` — role-gated + audited set/get/update/clear
+(PUT/GET/PATCH/DELETE on `/api/threads/:threadId/goal`) over the thread-scoped
+goal record in Track C's `mastra_thread_state` domain (GOAL_STATE_TYPE 'goal',
+DL-018), persisting through core's OWN
+writeObjective/readObjective/clearObjective so the stored shape is
+byte-identical to what the durable goal step reads via `resolveGoalStore` —
+proven on workerd (spike K/L/M: route-write → durable read path, kill+restart
+survival, cross-tenant 404 + over-cap 400 both audited). The write path is a
+P6-lite ingestion boundary (objectives are STANDING INSTRUCTIONS injected into
+future turns): createSignalRouter's gate order, audit on accept + EVERY
+post-auth denial, benign GET un-audited. maxRuns capped by host config
+(over-cap 400 REJECTED, never clamped; default core DEFAULT_GOAL_MAX_RUNS 50,
+DL-007); Track F starts NO runs — run budgets stay at the existing seams.
+`GOAL_REQUEST_CONTEXT_KEY` 'mastra:goal' is MIRRORED (not exports-reachable —
+no `@mastra/core/agent/goal` subpath) + no-collision-pinned against the
+`#requestContextFor` base keys + drift-pinned against the core dist
+declaration. update is a non-atomic read-modify-write and clear an
+unconditional delete at the Worker (core-parity, within-tenant last-write-wins
+— the DL-018 direct-D1 consequence; deliberately weaker serialization than
+signals' thread-DO lease). Opt-in `buildObjectiveRouter` seam in
+createFlowsafeWorker; NO new table (thread_state registered since C); absent ⇒
+byte-identical.
+
+Track D — schedules (M-006, 2026-07-18, branch `feat/track-d-schedules`;
+additive, opt-in; merged PR #31). New subpath
+`@proofoftech/flowsafe/schedules`: `D1SchedulesStorage` (AUTHORED —
+`@mastra/cloudflare-d1` 1.1.1 ships no schedules domain and core TABLE_SCHEMAS
+has no schedules DDL; ONE class over `mastra_schedules` +
+`mastra_schedule_triggers` like core's abstract, INTEGER ms-epoch timestamps),
+`createScheduleTick` — WE own the tick (DL-012; adopting core's pubsub worker
+rejected, RA-007): listDueSchedules → CAS updateScheduleNextFire claim (with a
+`status='active'` guard closing the pause race) → workflow targets mint a fresh
+INV-1 `${tenantId}_${uuid}` from INV-3-revalidated `metadata.tenantId` (DL-013
+— rows have no tenant column and ids are slugified, so tenant rides metadata)
+and fire through RunnerRuntime; per-schedule failure isolation; every
+unattended start consults an injectable run-cap seam (capped ⇒
+skipped-equivalent, audited, schedule stays healthy). **Agent-target EXECUTION
+is substrate-blocked in core 1.50.0** (`Schedules.run(id)` is publish-only onto
+core's AgentScheduleWorker pubsub loop for BOTH target kinds; the inline
+`executeAgentSchedule` is not exports-reachable): agent-schedule CRUD ships,
+and a due agent schedule is CAS-consumed + recorded as an audited 'skipped'
+trigger (`agent-target-unsupported`) — fail-closed, no hot-loop; the unblock is
+the tracked first-agent-feature (tick → `createFlowsafeDurableAgent` →
+RunnerRuntime.start on the thread-DO, landing spike D-S3), NOT a core bump.
+`createScheduleRouter` — server-minted slug-safe schedule ids (client ids
+refused: slugify drift + a cross-tenant 409 oracle), tenant-filtered reads,
+per-tenant count + fire-rate caps, read-only trigger history; P4
+stored-context barrier (DL-004/R-004): create/update reject the `breakwater.`
+namespace + the four runtime base keys + 'mastra:goal' on BOTH kinds and BOTH
+carriers (top-level `requestContext` + the nested agent
+`ifIdle.streamOptions.requestContext`), and the tick spreads stored keys FIRST
+/ runtime-derived LAST so the grant key is never row-overridable (spike N/O:
+CAS exactly-once under concurrent ticks; a forged connector planted directly
+in a ROW never becomes a grant on the leg). DL-003 triad: schema-guard
+inventory 8→10; a NEW `metadata-tenant` purge kind
+(`json_extract(metadata,'$.tenantId') = ?` exact-match — slugified ids cannot
+ride the salted range; `PurgeTenantResult.schedules`/`scheduleTriggers`);
+trigger TTL opt-in (`SCHEDULE_TRIGGER_RETENTION_DAYS`, failure-isolated cron
+duty); schedules retention 'none' (standing config, reaped at offboarding).
+Opt-in `buildScheduleRouter` + `crons.tick` in createFlowsafeWorker; absent ⇒
+byte-identical.
+
+Track E — signal providers (M-007, 2026-07-18, branch
+`feat/track-e-signal-providers` off `dev`; the FINAL track of the
+long-running-agents program; additive, opt-in). New subpath
+`@proofoftech/flowsafe/signal-providers`. **Pre-flight B/D finding**: core's
+`SignalProvider` (`@mastra/core/signals`, exports-reachable) delivers IN-PROCESS
+— `poll()`/`handleWebhook()` → `this.notify()` → `agent.sendNotificationSignal()`
+on a CONNECTED agent, matching webhooks against an in-memory registry — neither of
+which fits a Cloudflare host (the agent loop is on a DIFFERENT per-thread DO; the
+registry is lost on eviction and tenant-blind). So flowsafe drives providers
+through a `SignalProviderAdapter` seam and routes every delivery through Track C's
+`createThreadTopology.send` into `/signal/notification` (the DO alarm replaces
+`startPolling`; D1 replaces the registry, DL-017). A provider still IS a core
+`SignalProvider` (it extends the base), so `new Agent({signals:[p]})` still merges
+it in-process. `SignalProviderHost` — a per-tenant provider host DO
+(`idFromName(tenantId)`, the hub-DO pattern) whose alarm rehydrates subscriptions
+from D1 and polls the tenant's providers with per-provider + per-delivery failure
+isolation; `/poll` is the deterministic direct-alarm probe. `D1SubscriptionStoreFactory`
+— the flowsafe-OWNED `flowsafe_signal_subscriptions` table (NOT `mastra_*`),
+mirroring the approval store's INV-2 posture (`.forTenant()` tenant-bound + brand;
+`.system().listByResource()` the webhook's cross-tenant authority — a webhook names
+no tenant, the ROW does); registered in `purgeTenant` (`PurgeTenantResult.subscriptions`,
+the `flowsafe_approvals` leg), retention `none` (standing config reaped only at
+offboarding, so absent from the schema-guard's `mastra_%` inventory — it does not
+trip the guard). `createWebhookRouter` — verify-BEFORE-parse over the RAW bytes,
+payload→tenant via the subscription ROW only, per provider+tenant rate cap, and a
+BOUNDED forgery audit (the reject is unbounded, the log is not). `createSubscriptionRouter`
+— human-only HTTP subscribe/unsubscribe (RA-009: never model tools; P8: no
+capability), the createSignalRouter gate order. `githubSignalProvider` — the
+binding-gated showcase reference (constant-time `X-Hub-Signature-256` via
+WebCrypto). Proven on the workerd spike (`spike:verify` steps P–S: E-S2 forged
+rejected+audited, E-S1 delivery→inbox, E-S3 D1-rehydration after kill+restart,
+cross-tenant fail-closed) + an E-S1 integration test. The minimal `deploy/`
+template stays unwired (it has no thread DO, the Track C/D/F precedent). Absent
+binding/secret ⇒ byte-identical.
+
 Guardrails control room + one-page demo (control room merged 2026-07-14,
 PR #21; page unified 2026-07-15): the post-login showcase is ONE narrative
 page. On top, the control room (`packages/showcase/src/control-room/`) —

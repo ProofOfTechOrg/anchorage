@@ -114,8 +114,19 @@ import {
   D1SchedulesStorage,
 } from '../src/schedules/index.js';
 import {
+  createWebhookRouter,
+  createWebhookSignalProvider,
+  D1SubscriptionStoreFactory,
+  githubSignalProvider,
+  type SignalProviderAdapter,
+  type SignalProviderAuditEvent,
+  SignalProviderHost,
+  type SignalProviderHostWiring,
+} from '../src/signal-providers/index.js';
+import {
   createSignalStorageDomains,
   createThreadSignalRoutes,
+  D1NotificationsStorage,
   D1ThreadStateStorage,
 } from '../src/signals/index.js';
 
@@ -126,6 +137,15 @@ interface Env {
   HUB: DurableObjectNamespace;
   /** Per-thread agent-loop / signal DO (idFromName(threadId)); see DemoThread (Track C). */
   THREAD: DurableObjectNamespace;
+  /** Per-tenant signal-provider host DO (idFromName(tenantId)); see DemoSignalProviderHost (Track E). */
+  SIGNAL_PROVIDER_HOST: DurableObjectNamespace;
+  /**
+   * GitHub webhook signing secret (Track E). A LOCAL-ONLY spike fixture set in
+   * spike/wrangler.jsonc `vars`; spike-verify.mjs re-passes it via `--var` and
+   * signs its webhook probes with it. Absent ⇒ the github webhook route is absent
+   * (byte-identical). Never a real secret; this worker is never deployed.
+   */
+  GITHUB_WEBHOOK_SECRET?: string;
   /**
    * HMAC key signing the ~60s WebSocket stream tickets. A LOCAL-ONLY spike
    * fixture set in spike/wrangler.jsonc `vars` (and re-passed by
@@ -448,17 +468,27 @@ export class DemoThread extends ThreadDurableObject<Env> {
   // One agent per DO instance. `model` is a CONSTRUCTION placeholder — the C-S2
   // proof never drives the LLM (Track A's deferred real-loop boundary): an
   // idle-wake RESERVES a run synchronously, which is all the in-process-drain
-  // proof needs. Stamp the DO's pubsub so the agent's registry state is the one
-  // this isolate shares.
+  // proof needs. Registered with a Mastra whose D1 storage composes the Track C
+  // signal domains, so `sendNotificationSignal` (the Track E delivery target)
+  // PERSISTS to mastra_notifications. Stamp the DO's pubsub so the agent's
+  // registry state is the one this isolate shares (C-S2 affinity).
   #getAgent(scope: ThreadScope): Agent {
-    this.#agent ??= new Agent({
-      id: 'demo-thread-signal-agent',
-      name: 'demo-thread-signal-agent',
-      instructions: 'signal affinity probe',
-      // A model-router id string (never invoked): the affinity proof drives the
-      // signal registry, not the LLM, so the agent only has to construct.
-      model: 'openai/gpt-4o-mini',
-    });
+    if (!this.#agent) {
+      const bare = new Agent({
+        id: 'demo-thread-signal-agent',
+        name: 'demo-thread-signal-agent',
+        instructions: 'signal affinity + notification delivery target',
+        model: 'openai/gpt-4o-mini',
+      });
+      const mastra = new Mastra({
+        storage: createD1Storage({
+          binding: this.env.DB as unknown as never,
+          domains: createSignalStorageDomains(this.env.DB as unknown as never),
+        }),
+        agents: { 'demo-thread-signal-agent': bare },
+      });
+      this.#agent = mastra.getAgent('demo-thread-signal-agent');
+    }
     if (scope.init.pubsub) this.#agent.__setPubSub(scope.init.pubsub);
     return this.#agent;
   }
@@ -520,6 +550,166 @@ function json(payload: unknown, status = 200): Response {
     status,
     headers: { 'content-type': 'application/json' },
   });
+}
+
+// --- Track E (M-007) signal providers --------------------------------------
+// The GitHub webhook reference provider + a DETERMINISTIC poll provider (no
+// external HTTP — it emits one notification per subscription, for the E-S3
+// alarm/rehydration proof). One subscription-store factory + one webhook router
+// per isolate (the router's forgery-audit window and the DDL memo persist).
+
+const subscriptionFactories = new WeakMap<
+  D1Database,
+  D1SubscriptionStoreFactory
+>();
+function subscriptionFactory(db: D1Database): D1SubscriptionStoreFactory {
+  let factory = subscriptionFactories.get(db);
+  if (!factory) {
+    factory = new D1SubscriptionStoreFactory(db as unknown as never);
+    subscriptionFactories.set(db, factory);
+  }
+  return factory;
+}
+
+const spikePollProvider: SignalProviderAdapter = createWebhookSignalProvider({
+  id: 'spike-poller',
+  pollInterval: 60_000,
+  buildNotification: (_payload, subscription) => ({
+    source: 'spike-poller',
+    kind: 'poll',
+    summary: `polled ${subscription.externalResourceId}`,
+  }),
+  pollForDeliveries: async (subscriptions) =>
+    subscriptions.map((subscription) => ({
+      subscription,
+      notification: {
+        source: 'spike-poller',
+        kind: 'poll',
+        summary: `polled ${subscription.externalResourceId}`,
+      },
+    })),
+});
+
+function spikeProviders(): SignalProviderAdapter[] {
+  return [githubSignalProvider(), spikePollProvider];
+}
+
+/**
+ * The per-tenant provider host DO (idFromName(tenantId), Track E). `build()`
+ * binds the subscription store to this instance's tenant, the thread topology
+ * (delivery), and the spike's providers. The base class drives the alarm poll +
+ * the `/poll` probe route.
+ */
+export class DemoSignalProviderHost extends SignalProviderHost<Env> {
+  protected build(env: Env, tenantId: string): SignalProviderHostWiring {
+    return {
+      store: subscriptionFactory(env.DB).forTenant(tenantId),
+      topology: createThreadTopology(env.THREAD),
+      providers: spikeProviders(),
+    };
+  }
+}
+
+// The webhook audit stream the /sigp/audit probe reads (module-level so the
+// forgery-audit bound persists across requests in the isolate).
+const sigpAudit: SignalProviderAuditEvent[] = [];
+const webhookRouters = new WeakMap<
+  D1Database,
+  ReturnType<typeof createWebhookRouter>
+>();
+function webhookRouter(env: Env): ReturnType<typeof createWebhookRouter> {
+  let router = webhookRouters.get(env.DB);
+  if (!router) {
+    router = createWebhookRouter({
+      providers: Object.fromEntries(spikeProviders().map((p) => [p.id, p])),
+      subscriptions: subscriptionFactory(env.DB).system(),
+      topology: createThreadTopology(env.THREAD),
+      // Only GitHub is a real webhook provider here; the poll provider signs nothing.
+      secretForProvider: (id) =>
+        id === 'github' ? env.GITHUB_WEBHOOK_SECRET : undefined,
+      audit: (event) => {
+        sigpAudit.push(event);
+      },
+    });
+    webhookRouters.set(env.DB, router);
+  }
+  return router;
+}
+
+const SIGP_THREAD_ID = mintThreadId('spike', () => 'sigp'); // 'spike_sigp'
+// Matches DemoThread.resolveResourceId (mintResourceId(tenant,'demo-thread')), so
+// delivery keys the inbox on the thread's owner.
+const SIGP_RESOURCE_ID = mintResourceId('spike', 'demo-thread');
+const SIGP_FOREIGN_THREAD_ID = 'other_victim'; // NOT owned by tenant 'spike'
+
+// LOCAL-ONLY Track E probes (tenant 'spike'), driven by spike-verify.mjs:
+//  E-S2 (forged): a bad-signature webhook is rejected BEFORE parse + audited.
+//  E-S1 (delivery): subscribe -> signed webhook -> notification lands in the inbox.
+//  E-S3 (rehydration): after a kill+restart, the host DO's /poll rehydrates
+//    subscriptions from D1 and fires poll delivery (the in-memory-lost proof).
+//  cross-tenant: a valid webhook for a TAMPERED row (foreign thread) delivers to none.
+async function handleSignalProviderProbe(
+  request: Request,
+  env: Env,
+): Promise<Response | null> {
+  const path = new URL(request.url).pathname;
+  if (!path.startsWith('/sigp/')) return null;
+  const store = subscriptionFactory(env.DB).forTenant('spike');
+
+  if (request.method === 'POST' && path === '/sigp/subscribe') {
+    await store.subscribe({
+      providerId: 'github',
+      externalResourceId: 'github:acme/repo',
+      threadId: SIGP_THREAD_ID,
+      resourceId: SIGP_RESOURCE_ID,
+    });
+    await store.subscribe({
+      providerId: 'spike-poller',
+      externalResourceId: 'poller:demo',
+      threadId: SIGP_THREAD_ID,
+      resourceId: SIGP_RESOURCE_ID,
+    });
+    return json({ subscribed: true, threadId: SIGP_THREAD_ID });
+  }
+
+  if (request.method === 'POST' && path === '/sigp/subscribe-foreign') {
+    // A tampered row: tenant 'spike' but a thread it does not own — the topology
+    // must 404 any delivery to it (cross-tenant fail-closed).
+    await store.subscribe({
+      providerId: 'github',
+      externalResourceId: 'github:cross/repo',
+      threadId: SIGP_FOREIGN_THREAD_ID,
+      resourceId: SIGP_RESOURCE_ID,
+    });
+    return json({ tampered: true });
+  }
+
+  if (request.method === 'GET' && path === '/sigp/audit') {
+    return json({ events: sigpAudit });
+  }
+
+  if (request.method === 'POST' && path === '/sigp/poll') {
+    // E-S3 direct-alarm probe: drive the host DO's /poll (deterministic — no
+    // dependency on wrangler's alarm timer). A FRESH post-restart host rehydrates
+    // its subscriptions from D1 here.
+    const stub = env.SIGNAL_PROVIDER_HOST.get(
+      env.SIGNAL_PROVIDER_HOST.idFromName('spike'),
+    );
+    const response = await stub.fetch('http://host/poll', { method: 'POST' });
+    return json({ status: response.status, result: await response.json() });
+  }
+
+  if (request.method === 'GET' && path === '/sigp/notifications') {
+    const threadId =
+      new URL(request.url).searchParams.get('threadId') ?? SIGP_THREAD_ID;
+    const notifications = new D1NotificationsStorage(
+      env.DB as unknown as never,
+    );
+    const inbox = await notifications.listNotifications({ threadId });
+    return json({ count: inbox.length, sources: inbox.map((n) => n.source) });
+  }
+
+  return null;
 }
 
 function runStub(
@@ -1008,6 +1198,16 @@ const handler: ExportedHandler<Env> = {
     // unauthenticated, ahead of the routers.
     const schedProbe = await handleScheduleProbe(routed, env);
     if (schedProbe) return schedProbe;
+
+    // Track E probes (E-S2 forged, E-S1 delivery, E-S3 rehydration, cross-tenant)
+    // — local, unauthenticated, ahead of the routers.
+    const sigpProbe = await handleSignalProviderProbe(routed, env);
+    if (sigpProbe) return sigpProbe;
+
+    // Track E webhook ingress: the github webhook route TERMINATES on the Worker,
+    // signature-authed (not bearer), route-absent when its secret is unset.
+    const webhookResponse = await webhookRouter(env)(routed);
+    if (webhookResponse) return webhookResponse;
 
     // Stream stage BEFORE approvals (same order as the composer). The Worker is
     // the SOLE ticket authority; the hub/runner DOs re-bind by their own

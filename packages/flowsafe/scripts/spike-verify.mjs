@@ -70,6 +70,13 @@ const AUTH = {
 const STREAM_TICKET_SECRET = 'spike-local-stream-secret-do-not-deploy';
 const nowSec = () => Math.floor(Date.now() / 1000);
 
+// Track E (M-007): the github webhook signing secret. MUST equal
+// spike/wrangler.jsonc `vars.GITHUB_WEBHOOK_SECRET`; startServer re-passes it via
+// `--var` so the worker verifies with exactly this key, letting a VALID-signed
+// webhook be ACCEPTED (the positive control) and a forged one REJECTED at the
+// signature. A LOCAL-ONLY spike fixture; never a real secret.
+const GITHUB_WEBHOOK_SECRET = 'spike-local-github-secret-do-not-deploy';
+
 let currentStep = 'startup';
 let currentServer;
 let tmpDir;
@@ -183,6 +190,10 @@ function startServer(generation, stateDir, logPath) {
       // ticket fail-closed probes exercise CLAIM rejection, not signature drift.
       '--var',
       `STREAM_TICKET_SECRET:${STREAM_TICKET_SECRET}`,
+      // Track E: verify github webhooks with the SAME secret spike-verify signs
+      // with, so a valid webhook is ACCEPTED and a forged one REJECTED (E-S2).
+      '--var',
+      `GITHUB_WEBHOOK_SECRET:${GITHUB_WEBHOOK_SECRET}`,
     ],
     {
       cwd: FLOWSAFE,
@@ -282,6 +293,44 @@ async function http(method, path, { body, headers } = {}) {
     throw new Error(
       `${method} ${path} -> ${response.status} non-JSON: ${text.slice(0, 300)}`,
     );
+  }
+}
+
+// --- Track E (M-007) webhook probe helpers ---------------------------------
+
+// GitHub's X-Hub-Signature-256 = 'sha256=' + hex HMAC-SHA256(secret, rawBody).
+// crypto.createHmac(...).digest('hex') is byte-equal to the worker's WebCrypto
+// verify, so a VALID signature is ACCEPTED and a forged one REJECTED.
+function githubSign(secret, rawBody) {
+  return `sha256=${createHmac('sha256', secret).update(rawBody).digest('hex')}`;
+}
+
+// POST a webhook with the RAW body the signature is computed over (never a
+// re-stringify — the signature must cover the exact bytes sent). `forge` presents
+// a valid-LENGTH wrong signature (32 zero bytes), so the reject is at the
+// signature verify, not a length short-circuit.
+async function postWebhook(providerId, payload, { forge } = {}) {
+  const raw = JSON.stringify(payload);
+  const signature = forge
+    ? `sha256=${'0'.repeat(64)}`
+    : githubSign(GITHUB_WEBHOOK_SECRET, raw);
+  const response = await fetch(
+    `${BASE}/api/signal-providers/${providerId}/webhook`,
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-hub-signature-256': signature,
+      },
+      body: raw,
+      signal: AbortSignal.timeout(30_000),
+    },
+  );
+  const text = await response.text();
+  try {
+    return { status: response.status, body: JSON.parse(text) };
+  } catch {
+    return { status: response.status, body: text };
   }
 }
 
@@ -1323,6 +1372,164 @@ async function main() {
       );
     },
   );
+
+  // --- Track E signal providers (M-007) -------------------------------------
+  // Webhooks terminate on the Worker, verified BEFORE parse; delivery routes
+  // through the topology into the thread inbox; a poll provider survives DO
+  // eviction by rehydrating its subscriptions from D1; the ROW is the sole
+  // tenant authority (a tampered/foreign row fails closed at the topology).
+  await step(
+    'P forged webhook (E-S2): a bad-signature github webhook is rejected BEFORE ' +
+      'parse and audited, with no lookup/delivery/state change',
+    async () => {
+      const forged = await postWebhook(
+        'github',
+        { repository: { full_name: 'acme/repo' } },
+        { forge: true },
+      );
+      // Rejected at the signature — before any parse, lookup, or delivery.
+      assert(
+        forged.status === 401,
+        `forged webhook -> HTTP ${forged.status} (expected 401)`,
+        forged.body,
+      );
+      // The forgery IS audited (assert content, not just status): the webhook's
+      // "auth" IS the signature, so E-S2 requires the forgery recorded.
+      const audit = await http('GET', '/sigp/audit');
+      assert(audit.status === 200, `audit read -> ${audit.status}`, audit.body);
+      const event = audit.body.events.find(
+        (e) => e.providerId === 'github' && e.reason === 'forged-signature',
+      );
+      assert(
+        event !== undefined && event.outcome === 'rejected',
+        'the forgery was audited as a rejection (forged-signature)',
+        audit.body.events,
+      );
+      // No state change: nothing was delivered (the inbox is still empty here —
+      // no subscription has been created yet, and the reject never looked one up).
+      const inbox = await http(
+        'GET',
+        '/sigp/notifications?threadId=spike_sigp',
+      );
+      assert(
+        inbox.body.count === 0,
+        'no notification landed from the forgery (no delivery/state change)',
+        inbox.body,
+      );
+    },
+  );
+
+  await step(
+    'Q webhook delivery (E-S1): subscribe -> a SIGNED webhook -> notification ' +
+      'lands in the thread inbox (mastra_notifications), visible on the read path',
+    async () => {
+      const sub = await http('POST', '/sigp/subscribe');
+      assert(
+        sub.status === 200 && sub.body.subscribed === true,
+        'subscribed the demo thread to github + the poll provider',
+        sub.body,
+      );
+      // A correctly signed github webhook for the subscribed repo.
+      const delivered = await postWebhook('github', {
+        action: 'opened',
+        repository: { full_name: 'acme/repo' },
+        issue: { number: 7 },
+      });
+      assert(
+        delivered.status === 200,
+        `signed webhook -> HTTP ${delivered.status}`,
+        delivered.body,
+      );
+      assert(
+        delivered.body.matched === 1 && delivered.body.delivered === 1,
+        'the webhook matched the subscription ROW and delivered through the topology',
+        delivered.body,
+      );
+      const inbox = await http(
+        'GET',
+        '/sigp/notifications?threadId=spike_sigp',
+      );
+      assert(
+        inbox.body.count >= 1 && inbox.body.sources.includes('github'),
+        'a github notification landed in mastra_notifications (visible on the read path)',
+        inbox.body,
+      );
+    },
+  );
+
+  await step(
+    'R poll rehydration (E-S3): after a kill+restart the host DO rehydrates its ' +
+      'subscriptions from D1 and fires poll delivery (in-memory-lost, D1-restored)',
+    async () => {
+      await killServer(currentServer);
+      currentServer = undefined;
+      currentServer = startServer('gen-5', stateDir, join(tmpDir, 'gen5.log'));
+      await waitReady(currentServer, 90_000);
+      assert(
+        !/address already in use/i.test(currentServer.chunks.join('')),
+        'gen-5 log must not contain "address already in use" (orphan trap)',
+      );
+      // A FRESH host DO instance: core's in-memory subscription registry is empty,
+      // so a correct poll can ONLY come from rehydrating D1 (the E-S3 thesis).
+      const poll = await http('POST', '/sigp/poll');
+      assert(
+        poll.status === 200 && poll.body.status === 200,
+        `host DO /poll -> ${poll.body.status}`,
+        poll.body,
+      );
+      assert(
+        poll.body.result?.providersPolled === 1,
+        'the poll provider was rehydrated from D1 and polled',
+        poll.body.result,
+      );
+      assert(
+        poll.body.result?.delivered === 1,
+        'the poll fired a delivery (D1-restored subscription -> thread inbox)',
+        poll.body.result,
+      );
+      const inbox = await http(
+        'GET',
+        '/sigp/notifications?threadId=spike_sigp',
+      );
+      assert(
+        inbox.body.sources.includes('spike-poller'),
+        'the poll notification landed in the thread inbox after the restart',
+        inbox.body,
+      );
+    },
+  );
+
+  await step(
+    'S cross-tenant fail-closed: a VALID-signed webhook for a TAMPERED row ' +
+      '(tenant spike, a thread it does not own) delivers to NO thread',
+    async () => {
+      const tamper = await http('POST', '/sigp/subscribe-foreign');
+      assert(
+        tamper.status === 200 && tamper.body.tampered === true,
+        'a tampered row was created (tenant spike, foreign thread)',
+        tamper.body,
+      );
+      const webhook = await postWebhook('github', {
+        repository: { full_name: 'cross/repo' },
+      });
+      assert(
+        webhook.status === 200,
+        `cross webhook -> HTTP ${webhook.status}`,
+        webhook.body,
+      );
+      assert(
+        webhook.body.matched === 1,
+        'the tampered row matched by resource (the row IS the authority)',
+        webhook.body,
+      );
+      // The topology ownership check 404s the foreign threadId — delivered to none.
+      assert(
+        webhook.body.delivered === 0,
+        'delivery to the foreign thread was 404 by the topology (fail closed)',
+        webhook.body,
+      );
+    },
+  );
 }
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
@@ -1354,7 +1561,13 @@ try {
       'maxRuns failed closed and audited (F-S3). Track D (M-006): two concurrent ' +
       'ticks over one due schedule fired EXACTLY once via the CAS (D-S1), and a ' +
       'workflow schedule fired through RunnerRuntime with a fresh INV-1 runId ' +
-      'while a reserved key planted in the row stayed ABSENT from the leg (D-S2).',
+      'while a reserved key planted in the row stayed ABSENT from the leg (D-S2). ' +
+      'Track E (M-007): a forged webhook was rejected BEFORE parse and audited ' +
+      '(E-S2), a signed webhook matched its subscription row and landed a ' +
+      'notification in the thread inbox (E-S1), a poll provider rehydrated its ' +
+      'subscriptions from D1 after a kill+restart and fired delivery (E-S3), and ' +
+      'a valid webhook for a tampered foreign-thread row delivered to NONE ' +
+      '(cross-tenant fail-closed at the topology).',
   );
 } catch (error) {
   exitCode = 1;
