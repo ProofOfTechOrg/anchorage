@@ -44,6 +44,7 @@ import {
   requireOwnedMemoryId,
   type ThreadTopology,
 } from '../host-kit/index.js';
+import { safeDecodeSegment } from '../host-kit/route-path.js';
 import { deliverNotification } from './delivery.js';
 import { PROVIDER_ID_PATTERN, type SignalProviderAdapter } from './provider.js';
 import type {
@@ -134,22 +135,6 @@ function json(payload: unknown, status = 200): Response {
       'cache-control': 'no-store',
     },
   });
-}
-
-/**
- * Decode a URL path segment, returning undefined on malformed percent-encoding
- * (a lone `%`) rather than THROWING as bare `decodeURIComponent` does —
- * `new URL(...).pathname` passes an invalid `%` through unnormalized, so an
- * unguarded decode is a pre-auth crash (a URIError escapes the handler). The
- * callers treat undefined as "not a real route target".
- */
-function safeDecodeSegment(segment: string | undefined): string | undefined {
-  if (segment === undefined) return undefined;
-  try {
-    return decodeURIComponent(segment);
-  } catch {
-    return undefined;
-  }
 }
 
 export function createWebhookRouter(

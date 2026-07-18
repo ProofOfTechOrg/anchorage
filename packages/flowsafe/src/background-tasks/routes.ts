@@ -23,6 +23,7 @@ import type {
 } from '@mastra/core/background-tasks';
 
 import { tenantOwnsSaltedId } from '../do-runner/index.js';
+import { safeDecodeSegment } from '../host-kit/route-path.js';
 
 export interface BackgroundTaskRoutesOptions {
   /** The manager to read through — WRAPPED, never exposed over the wire. */
@@ -114,8 +115,11 @@ export function createBackgroundTaskRoutes(
 
     // GET {base}/task/:taskId — one task, 404 on missing OR foreign (no oracle).
     if (path.startsWith(`${base}/task/`)) {
-      const taskId = decodeURIComponent(path.slice(`${base}/task/`.length));
-      if (taskId === '' || taskId.includes('/'))
+      // Malformed percent-encoding in the taskId is not a real task — 404 (the
+      // no-oracle response), never a decodeURIComponent throw out of the DO
+      // handler (this route is post-auth, but the same fail-shut posture).
+      const taskId = safeDecodeSegment(path.slice(`${base}/task/`.length));
+      if (taskId === undefined || taskId === '' || taskId.includes('/'))
         return json({ error: 'not found' }, 404);
       const task = await manager.getTask(taskId);
       if (!task || !tenantOwnsSaltedId(tenantId, task.runId)) {

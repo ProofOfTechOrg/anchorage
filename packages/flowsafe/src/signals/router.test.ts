@@ -68,6 +68,24 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
     expect(await router(new Request('http://host/workflows'))).toBeNull();
   });
 
+  it('is route-absent on a malformed percent-encoded threadId (no pre-auth URIError)', async () => {
+    // A lone '%' in the threadId segment — bare decodeURIComponent would THROW
+    // out of the handler BEFORE auth; safeDecodeSegment makes it route-absent.
+    const { topology, calls } = recordingTopology();
+    const router = createSignalRouter({
+      resolve: async () => tenantCtx('operator'),
+      topology,
+    });
+    const res = await router(
+      new Request('http://host/api/threads/%/message', {
+        method: 'POST',
+        body: '{}',
+      }),
+    );
+    expect(res).toBeNull();
+    expect(calls).toHaveLength(0); // never resolved, never addressed
+  });
+
   it('401 when unauthenticated', async () => {
     const { topology, calls } = recordingTopology();
     const router = createSignalRouter({

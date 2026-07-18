@@ -163,6 +163,14 @@ describe('createBackgroundTaskRoutes', () => {
       expect(body.task.id).toBe('mine');
     });
 
+    it('404s a malformed percent-encoded taskId (no decodeURIComponent throw)', async () => {
+      // A lone '%' would make bare decodeURIComponent throw a URIError out of
+      // the DO handler; safeDecodeSegment routes it to the no-oracle 404 instead.
+      const routes = createBackgroundTaskRoutes({ manager: stubManager([]) });
+      const res = await routes(get('/background-tasks/task/%'), TENANT);
+      expect(res?.status).toBe(404);
+    });
+
     it('404s a taskId containing a path separator (never splits into a subpath)', async () => {
       const routes = createBackgroundTaskRoutes({ manager: stubManager([]) });
       const res = await routes(get('/background-tasks/task/a%2Fb'), TENANT);

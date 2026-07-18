@@ -135,6 +135,19 @@ describe('createScheduleRouter — gate order', () => {
     expect(res.status).toBe(200);
   });
 
+  it('is route-absent on a malformed percent-encoded id (no pre-auth URIError)', async () => {
+    // A lone '%' in the schedule-id segment — bare decodeURIComponent would THROW
+    // out of the handler BEFORE auth; safeDecodeSegment makes it route-absent.
+    const router = createScheduleRouter({
+      resolve: resolveAs(ctx('acme', 'operator')),
+      store: new MemStore(),
+    });
+    const res = await router(
+      new Request('http://host/api/schedules/%', { method: 'GET' }),
+    );
+    expect(res).toBeNull();
+  });
+
   it('401s an unauthenticated request (resolve -> undefined), not audited', async () => {
     const { call, events } = harness(undefined);
     const res = await call('POST', '/api/schedules', WORKFLOW_CREATE);
