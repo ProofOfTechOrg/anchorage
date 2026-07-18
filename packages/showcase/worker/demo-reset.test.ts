@@ -23,6 +23,7 @@ const PURGED: PurgeTenantResult = {
   schedules: 0,
   scheduleTriggers: 0,
   approvals: 1,
+  subscriptions: 0,
   artifacts: 0,
 };
 

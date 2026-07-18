@@ -448,6 +448,30 @@ describe('purgeTenant (complete offboarding)', () => {
     ).run();
   }
 
+  // Track E: the flowsafe-owned signal-subscription table purgeTenant reaps by
+  // its `tenant_id` column (the flowsafe_approvals leg, not the salted range).
+  function seedSubscriptionsTable(db: SqliteDatabase): void {
+    db.prepare(
+      `CREATE TABLE flowsafe_signal_subscriptions (
+        id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        provider_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        resource_id TEXT NOT NULL,
+        external_resource_id TEXT NOT NULL,
+        subscribed_at TEXT NOT NULL,
+        metadata TEXT
+      )`,
+    ).run();
+    db.prepare(
+      `INSERT INTO flowsafe_signal_subscriptions
+         (id, tenant_id, provider_id, thread_id, resource_id, external_resource_id, subscribed_at, metadata)
+       VALUES
+         ('s1', 'abc', 'github', 'abc_t1', 'abc_o', 'github:x', '2026-01-01T00:00:00Z', NULL),
+         ('s2', 'abcdefg', 'github', 'abcdefg_t1', 'abcdefg_o', 'github:y', '2026-01-01T00:00:00Z', NULL)`,
+    ).run();
+  }
+
   // The three agent-memory tables purgeTenant range-DELETEs in PARALLEL
   // (Promise.all). Column names mirror the real @mastra/cloudflare-d1 schema
   // mastra-schema-guard.test.ts pins: messages carry a NOT-NULL salted
@@ -556,6 +580,7 @@ describe('purgeTenant (complete offboarding)', () => {
       schedules: 0,
       scheduleTriggers: 0,
       approvals: 1,
+      subscriptions: 0,
       artifacts: 2,
     });
     expect(remainingRunIds(sqlite)).toEqual(['abc5_r1', 'abcdefg_r1']);
@@ -569,6 +594,24 @@ describe('purgeTenant (complete offboarding)', () => {
       }
     ).all();
     expect(approvals).toEqual([{ tenant_id: 'abcdefg' }]);
+  });
+
+  it('reaps Track E signal subscriptions by tenant_id and leaves the neighbor tenant intact', async () => {
+    // #given — two tenants' subscriptions in the flowsafe-owned table
+    const sqlite = openSqlite();
+    seedSubscriptionsTable(sqlite);
+
+    // #when
+    const result = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
+
+    // #then — only abc's row reaped (exact tenant_id match); abcdefg survives
+    expect(result.subscriptions).toBe(1);
+    const rows = (
+      sqlite.prepare(
+        'SELECT tenant_id FROM flowsafe_signal_subscriptions',
+      ) as unknown as { all(): Array<{ tenant_id: string }> }
+    ).all();
+    expect(rows).toEqual([{ tenant_id: 'abcdefg' }]);
   });
 
   it('a run landing INSIDE the artifact-SELECT → snapshot-DELETE window is still deleted, and its artifacts are NOT enumerated', async () => {
@@ -698,6 +741,7 @@ describe('purgeTenant (complete offboarding)', () => {
       schedules: 0,
       scheduleTriggers: 0,
       approvals: 0,
+      subscriptions: 0,
       artifacts: 0,
     });
   });
@@ -733,6 +777,7 @@ describe('purgeTenant (complete offboarding)', () => {
       schedules: 0,
       scheduleTriggers: 0,
       approvals: 1,
+      subscriptions: 0,
       artifacts: 0,
     });
     const approvals = (
@@ -759,6 +804,7 @@ describe('purgeTenant (complete offboarding)', () => {
       schedules: 0,
       scheduleTriggers: 0,
       approvals: 0,
+      subscriptions: 0,
       artifacts: 0,
     });
   });

@@ -829,6 +829,8 @@ export interface PurgeTenantResult {
   /** Track D: schedule-trigger rows, METADATA-filtered on their `metadata.tenantId`. */
   scheduleTriggers: number;
   approvals: number;
+  /** Track E: signal-subscription rows, by the `tenant_id` column (the approvals leg). */
+  subscriptions: number;
   artifacts: number;
 }
 
@@ -1123,7 +1125,35 @@ export async function purgeTenant(
     if (!isMissingTable(error)) throw error;
   }
 
-  return { snapshots, ...memory, ...metadataCounts, approvals, artifacts };
+  // 5. Signal subscriptions (Track E) — the same flowsafe-owned tenant_id-column
+  // delete as approvals (NOT a mastra_* table, so not in the ranged/metadata
+  // inventories above; retention is 'none' — standing config reaped only here).
+  // The table name is the literal signal-providers/subscription-d1.ts owns
+  // (SIGNAL_SUBSCRIPTIONS_TABLE); a do-runner import of signals/signal-providers
+  // would cycle, so it is hardcoded like flowsafe_approvals. Missing table (a
+  // host with no signal providers) is the only tolerated failure.
+  let subscriptions = 0;
+  try {
+    subscriptions = d1Changes(
+      await db
+        .prepare(
+          'DELETE FROM flowsafe_signal_subscriptions WHERE tenant_id = ?',
+        )
+        .bind(tenantId)
+        .run(),
+    );
+  } catch (error) {
+    if (!isMissingTable(error)) throw error;
+  }
+
+  return {
+    snapshots,
+    ...memory,
+    ...metadataCounts,
+    approvals,
+    subscriptions,
+    artifacts,
+  };
 }
 
 /** Rows affected by a D1 write, read from its `{ meta: { changes } }` envelope. */

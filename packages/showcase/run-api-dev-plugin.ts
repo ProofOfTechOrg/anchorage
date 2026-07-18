@@ -307,6 +307,9 @@ export function runApiDevPlugin(): Plugin {
         schedules: 0,
         scheduleTriggers: 0,
         approvals: storeFactory.purgeTenant(tenantId),
+        // No showcase workflow registers signal providers (Track E); when one
+        // does, sweep the in-memory subscription store here.
+        subscriptions: 0,
         artifacts: 0,
       };
     },

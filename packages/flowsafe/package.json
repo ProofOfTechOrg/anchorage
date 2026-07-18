@@ -38,6 +38,7 @@
     "./host-kit": "./dist/host-kit/index.js",
     "./host-kit/module": "./dist/host-kit/module.js",
     "./schedules": "./dist/schedules/index.js",
+    "./signal-providers": "./dist/signal-providers/index.js",
     "./signals": "./dist/signals/index.js",
     "./package.json": "./package.json"
   },
