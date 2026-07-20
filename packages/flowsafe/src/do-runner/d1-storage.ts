@@ -535,6 +535,39 @@ export async function purgeExpiredBackgroundTasks(
   ).join(', ');
 
   try {
+    // Internal evented-engine snapshots use the UNSALTED task id. Consume that
+    // association before deleting the task rows that make tenant/retention
+    // ownership discoverable.
+    try {
+      await db
+        .prepare(
+          `DELETE FROM ${prefix}mastra_workflow_snapshot
+           WHERE workflow_name = '__background-task'
+             AND run_id IN (
+               SELECT id FROM ${table}
+               WHERE status = 'completed'
+                 AND completedAt IS NOT NULL AND completedAt < ?
+             )`,
+        )
+        .bind(completedCutoff)
+        .run();
+      await db
+        .prepare(
+          `DELETE FROM ${prefix}mastra_workflow_snapshot
+           WHERE workflow_name = '__background-task'
+             AND run_id IN (
+               SELECT id FROM ${table}
+               WHERE status IN (${failedPlaceholders})
+                 AND completedAt IS NOT NULL AND completedAt < ?
+             )`,
+        )
+        .bind(...BACKGROUND_TASK_FAILED_STATUSES, failedCutoff)
+        .run();
+    } catch (error) {
+      // A deployment may have task rows before its workflow table is created;
+      // no associated snapshots can exist in that case.
+      if (!isMissingTable(error)) throw error;
+    }
     const completed = d1Changes(
       await db
         .prepare(
@@ -1000,6 +1033,19 @@ export async function purgeTenant(
   const prefix = options.tablePrefix ?? '';
   const lower = `${tenantId}_`;
   const upper = `${tenantId}\x60`;
+  let backgroundTaskIds: string[] = [];
+  try {
+    const { results } = await db
+      .prepare(
+        `SELECT id FROM ${prefix}mastra_background_tasks
+         WHERE run_id >= ? AND run_id < ?`,
+      )
+      .bind(lower, upper)
+      .all<{ id: string }>();
+    backgroundTaskIds = results.map((row) => row.id);
+  } catch (error) {
+    if (!isMissingTable(error)) throw error;
+  }
   // The snapshot table exists only once Mastra lazily creates it for the
   // first persisted run. A tenant that never started one — routine for an
   // expired demo sandbox — has zero snapshots and artifacts, and its
@@ -1027,7 +1073,25 @@ export async function purgeTenant(
         )
         .bind(lower, upper)
         .all<{ workflow_name: string; run_id: string }>();
-      for (const row of results) {
+      const artifactRows = [...results];
+      for (const ids of chunked(backgroundTaskIds, D1_BIND_CHUNK)) {
+        if (ids.length === 0) continue;
+        const associated = await db
+          .prepare(
+            `SELECT workflow_name, run_id
+             FROM ${prefix}mastra_workflow_snapshot
+             WHERE workflow_name = '__background-task'
+               AND run_id IN (${ids.map(() => '?').join(', ')})`,
+          )
+          .bind(...ids)
+          .all<{ workflow_name: string; run_id: string }>();
+        artifactRows.push(...associated.results);
+      }
+      const seen = new Set<string>();
+      for (const row of artifactRows) {
+        const key = `${row.workflow_name}\0${row.run_id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
         artifacts += await options.artifactStore.deleteRun(
           row.workflow_name,
           row.run_id,
@@ -1045,6 +1109,19 @@ export async function purgeTenant(
         .bind(lower, upper)
         .run(),
     );
+    for (const ids of chunked(backgroundTaskIds, D1_BIND_CHUNK)) {
+      if (ids.length === 0) continue;
+      snapshots += d1Changes(
+        await db
+          .prepare(
+            `DELETE FROM ${prefix}mastra_workflow_snapshot
+             WHERE workflow_name = '__background-task'
+               AND run_id IN (${ids.map(() => '?').join(', ')})`,
+          )
+          .bind(...ids)
+          .run(),
+      );
+    }
   }
 
   // 3. Every tenant-range table (TENANT_RANGE_PURGE_TABLES — today the
@@ -1069,7 +1146,9 @@ export async function purgeTenant(
     threadState: 0,
   };
   await Promise.all(
-    TENANT_RANGE_PURGE_TABLES.map(async ({ counter, table, column }) => {
+    TENANT_RANGE_PURGE_TABLES.filter(
+      ({ counter }) => counter !== 'backgroundTasks',
+    ).map(async ({ counter, table, column }) => {
       try {
         memory[counter] = d1Changes(
           await db
@@ -1084,6 +1163,22 @@ export async function purgeTenant(
       }
     }),
   );
+  // The task row is the only durable association between its salted parent run
+  // and the unsalted __background-task snapshot. Delete it only after the
+  // associated snapshots/artifacts above have been consumed.
+  try {
+    memory.backgroundTasks = d1Changes(
+      await db
+        .prepare(
+          `DELETE FROM ${prefix}mastra_background_tasks
+           WHERE run_id >= ? AND run_id < ?`,
+        )
+        .bind(lower, upper)
+        .run(),
+    );
+  } catch (error) {
+    if (!isMissingTable(error)) throw error;
+  }
 
   // 3b. Metadata-filtered tables (Track D schedules + triggers): their tenant is
   // a JSON metadata.tenantId, not a salted id, so they cannot ride the range

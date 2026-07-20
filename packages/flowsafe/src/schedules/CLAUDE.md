@@ -13,18 +13,12 @@ Workflow targets mint a fresh INV-1 runId and fire through the host's run-start
 seam (the DO topology / `RunnerRuntime.start`), inheriting INV-1, the per-leg
 `requestContextForRun` derivation, and the resume ledger.
 
-**Agent-target firing is GUARDED OFF (substrate-blocked, a reshape input for the
-orchestrator).** Verified against the on-disk `@mastra/core` 1.50.0 dist
-(`chunk-F3BBI4YR.js` `run()`): the only public agent-fire entry,
-`mastra.schedules.run(id)`, PUBLISHES an `agent-schedule.fire` event onto the
-`agent-schedules` pubsub topic for core's `AgentScheduleWorker` — it does NOT
-execute inline, and `executeAgentSchedule` is NOT on the exports map (R-001). We
-run no such worker (P1), so a due agent schedule is recorded as an audited,
-guarded SKIP with `nextFireAt` advanced (consumed, never hot-looped) — a
-fail-closed non-execution, not a silently-forked private path (RA-007). Agent
-schedules are still creatable/manageable through the facade (the rows persist);
-their EXECUTION needs a durable-agent drive on our substrate (Track A's deferred
-real-loop + the thread-DO) and is out of scope here.
+Agent targets use the optional `startAgent` seam to reach the runtime-driven
+per-thread DO. The tick mints the tenant-owned run ID before the compare-and-swap
+(CAS) claim, validates stored thread and resource IDs, strips reserved context
+keys, and applies runtime-derived context last. Threadless targets use an
+ephemeral tenant-owned topology thread without enabling memory. Hosts that omit
+`startAgent` retain the audited `agent-target-unsupported` skip.
 
 ## Files
 
@@ -32,11 +26,11 @@ real-loop + the thread-DO) and is out of scope here.
 | ---- | ---- | ------------ |
 | `schedules-d1.ts` | `D1SchedulesStorage` — ONE domain over BOTH `mastra_schedules` + `mastra_schedule_triggers` (mirrors core's single `SchedulesStorage` / `InMemorySchedulesStorage`, NOT the two classes the milestone named), incl. the CAS `updateScheduleNextFire` (the exactly-once claim). Tenant-AGNOSTIC (persists rows verbatim); tenancy is one layer up. INTEGER ms-epoch timestamps (core types them as `number`, unlike the ISO-TEXT signal domains) | Changing the domain, the CAS, or the DDL |
 | `storage.ts` | `createScheduleStorageDomains(binding)` — packages the domain for `createD1Storage({ domains })` (do-runner cannot import schedules — it would cycle); registers under the `schedules` domain key core resolves via `getStore('schedules')` | Wiring D1-durable schedules into a host |
-| `tick.ts` | `createScheduleTick` (DL-012): the CAS tick + the agent-target guard-off + the injectable run-cap seam (DL-007, a capped fire is skipped + audited, schedule stays healthy). P4 barrier (b): `stripReservedScheduleContext` / `isReservedScheduleContextKey` / `buildScheduledLegContext` — the reserved set is the whole `breakwater.` namespace + `mastra:goal` (imported from breakwater-keys + goals), which IS exactly the runtime-derived key set, so a stripped stored context cannot collide; `buildScheduledLegContext` keeps the R-004 stored-first/runtime-last order as defense-in-depth. The DO topology start carries only inputData, so stored context is DROPPED on the DO path (fail-closed); a local-runtime host can apply the tick-provided requestContext | Changing the tick, the guard-off, the cap seam, or the barrier |
+| `tick.ts` | `createScheduleTick` (DL-012): CAS claim, workflow and optional agent dispatch, run-cap seam, tenant memory checks, and reserved-context barrier. A lost claim reloads the row and records `concurrent-claim`, `paused`, or `disappeared`. Post-dispatch failures log `schedule-tick-bookkeeping-error` without reclassifying a successful fire | Changing dispatch, claim accounting, the cap seam, or the context barrier |
 | `router.ts` | `createScheduleRouter` — the tenant facade (DL-013): server-minted `${prefix}${uuid}` ids (INV-1 posture; client ids are not honored — avoids a slugify-drift + existence oracle), `metadata.tenantId` stamping, tenant-filtered reads (post-filter, scale caveat), ownership 404s (no oracle), per-tenant COUNT + fire-RATE caps (DL-007), and the P4 reserved-key rejection on create/update (both kinds). The P6-lite gate order (resolve → role on mutations → ownership 404 → size cap → validation/caps → reserved-key → audit + persist), same as `createSignalRouter`/`createObjectiveRouter`. Persists through core's exported `computeNextFireAt`/`validateCron` + `toScheduleView` (row/view shape can't drift) | Changing the CRUD gate, the caps, or the reserved-key barrier |
 | `index.ts` | Subpath barrel (`@proofoftech/flowsafe/schedules`) | The export surface |
 | `schedules-d1.test.ts` | The domain: CAS win/lose (the concurrent-tick loser), listDue predicate, trigger history newest-first + limit, delete-with-history, round-trip | Changing the domain |
-| `tick.test.ts` | The tick: INV-1 mint, P4 barrier (b) strip, D-S4 cap → skip + healthy, agent guard-off, invalid-tenant fail-closed, start-throw, in-process exactly-once, per-schedule isolation, and the reserved-key helpers | Changing the tick |
+| `tick.test.ts` | INV-1 minting, context stripping, cap behavior, agent start present and absent, memory ownership, CAS loss classification, post-dispatch bookkeeping, exactly-once claims, and per-schedule failure isolation | Changing the tick |
 | `router.test.ts` | The facade: gate order (401/403/404 no-oracle), create (server-id, tenant-stamp, target-ambiguous, reserved-key incl. `mastra:goal`, count + fire-rate caps, field allowlist), tenant-filtered list, pause/resume/delete/triggers, audit coverage | Changing the facade |
 
 ## The DL-003 storage triad (do-runner/d1-storage.ts + mastra-schema-guard.test.ts)
@@ -56,10 +50,10 @@ guard trips on a silent addition or an unwired coverage).
 
 `createFlowsafeWorker` mounts the tick opt-in through the `scheduleTick` seam +
 a `crons.tick` cron (its own failure-isolated invocation, absent ⇒
-byte-identical). A host builds `createScheduleTick({ store, start, runCap?,
-audit? })` with the schedules store from its D1 domains and `topology.start` as
-the run-start seam. The CRUD facade mounts opt-in through the `buildScheduleRouter`
+byte-identical). A thread-capable host also passes `startAgent` and routes it
+through `createThreadTopology`. The CRUD facade mounts opt-in through the `buildScheduleRouter`
 seam (mirrors `buildSignalRouter`/`buildObjectiveRouter`; the host builds
 `createScheduleRouter` closed over the request's resolver — absent ⇒ unmounted,
-byte-identical). Verified on workerd: `spike:verify` steps N (D-S1 exactly-once)
-+ O (D-S2 barrier + INV-1).
+byte-identical). The deterministic workerd spike proves D-S1 and D-S2. The
+credentialed `spike:verify:llm` command proves D-S3 through the real durable
+agent loop and approval queue.

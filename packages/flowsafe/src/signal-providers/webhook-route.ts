@@ -45,6 +45,7 @@ import {
   type ThreadTopology,
 } from '../host-kit/index.js';
 import { safeDecodeSegment } from '../host-kit/route-path.js';
+import { internalErrorResponse } from '../internal-error-response.js';
 import { deliverNotification } from './delivery.js';
 import { PROVIDER_ID_PATTERN, type SignalProviderAdapter } from './provider.js';
 import type {
@@ -551,10 +552,12 @@ export function createSubscriptionRouter(
       if (error instanceof TenantResolutionError) {
         return json({ error: 'forbidden' }, 403);
       }
-      return json(
-        { error: error instanceof Error ? error.message : String(error) },
-        500,
-      );
+      try {
+        await audit('rejected', { reason: 'internal-error' });
+      } catch {
+        // Best-effort audit must not replace the generic response.
+      }
+      return internalErrorResponse('signal-providers.subscription', error);
     }
   };
 }

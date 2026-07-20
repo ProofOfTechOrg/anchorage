@@ -15,7 +15,10 @@ import {
   TENANT_ID_PATTERN,
   tenantOwnsSaltedId,
 } from '../do-runner/path-safe-id.js';
-import { THREAD_TENANT_HEADER } from '../do-runner/thread-header.js';
+import {
+  THREAD_ACTOR_HEADER,
+  THREAD_TENANT_HEADER,
+} from '../do-runner/thread-header.js';
 import {
   type ApprovalActor,
   type ApprovalRole,
@@ -127,9 +130,12 @@ export function createTenantResolver(
     // client's chosen thread. `Headers.has` is case-insensitive, so no spelling
     // slips past. Same posture as the RESERVED_TENANT_IDS belt below: this
     // resolver is the one chokepoint every routed request crosses.
-    if (request.headers.has(THREAD_TENANT_HEADER)) {
+    if (
+      request.headers.has(THREAD_TENANT_HEADER) ||
+      request.headers.has(THREAD_ACTOR_HEADER)
+    ) {
       throw new TenantResolutionError(
-        `inbound request carries the server-stamped '${THREAD_TENANT_HEADER}' header — refusing to scope it`,
+        `inbound request carries a server-stamped thread header — refusing to scope it`,
       );
     }
     const actor = await options.authenticate(request);

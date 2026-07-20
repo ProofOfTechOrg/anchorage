@@ -31,11 +31,13 @@ import { createSignalRouter } from './router.js';
 import {
   createThreadSignalRoutes,
   type RunCapConsult,
+  type StartIdleRun,
 } from './thread-do-routes.js';
 
 interface TestEnv {
   agent: Agent;
   consultRunCap?: RunCapConsult;
+  startIdleRun?: StartIdleRun;
 }
 
 // A minimal host thread DO: build() its init() wiring, route() the PRODUCTION
@@ -48,6 +50,7 @@ class TestThread extends ThreadDurableObject<TestEnv> {
     resolveResourceId: (scope: ThreadScope) =>
       mintResourceId(scope.tenantId, 'itest'),
     consultRunCap: this.env.consultRunCap,
+    startIdleRun: this.env.startIdleRun,
   });
 
   protected build(): InitResult {
@@ -148,8 +151,9 @@ describe('signal ingestion — full chain (router → topology → thread DO →
     // #given
     const { agent, targets } = reserveAgent();
     const consultRunCap = vi.fn(async () => true);
+    const startIdleRun = vi.fn(async ({ runId }) => ({ runId }));
     const topology = createThreadTopology(
-      threadNamespace({ agent, consultRunCap }),
+      threadNamespace({ agent, consultRunCap, startIdleRun }),
     );
     const router = createSignalRouter({
       resolve: async () => tenantCtx(),
@@ -161,18 +165,23 @@ describe('signal ingestion — full chain (router → topology → thread DO →
 
     // #then — the wake reached the thread routes THROUGH the DO's identity
     // assertion (which passes only because the topology stamped the header from
-    // the resolved tenant), the run cap was consulted, and the agent got a wake.
+    // the resolved tenant), the run cap was consulted, and the runtime start
+    // seam got a tenant-salted run id without asking core to mint one.
     expect(res?.status).toBe(200);
     expect(consultRunCap).toHaveBeenCalledWith('acme');
-    expect(targets[0]?.ifIdle).toEqual({ behavior: 'wake' });
+    expect(startIdleRun).toHaveBeenCalledWith(
+      expect.objectContaining({ runId: expect.stringMatching(/^acme_/) }),
+    );
+    expect(targets).toHaveLength(0);
   });
 
   it('degrades the wake to persist when the tenant is over its run cap', async () => {
     // #given — the cap refuses
     const { agent, targets } = reserveAgent();
     const consultRunCap = vi.fn(async () => false);
+    const startIdleRun = vi.fn(async ({ runId }) => ({ runId }));
     const topology = createThreadTopology(
-      threadNamespace({ agent, consultRunCap }),
+      threadNamespace({ agent, consultRunCap, startIdleRun }),
     );
     const router = createSignalRouter({
       resolve: async () => tenantCtx(),
@@ -189,6 +198,7 @@ describe('signal ingestion — full chain (router → topology → thread DO →
     });
     expect(consultRunCap).toHaveBeenCalledWith('acme');
     expect(targets[0]?.ifIdle).toEqual({ behavior: 'persist' });
+    expect(startIdleRun).not.toHaveBeenCalled();
   });
 
   it('404s a foreign threadId at the topology — the DO is never addressed', async () => {

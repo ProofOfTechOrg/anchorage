@@ -33,10 +33,10 @@
 // pre-auth failure (401 / resolver throw -> 403) is NOT audited: an
 // unauthenticated flood must never be able to write the log.
 //
-// AGENT schedules are creatable/manageable here (they persist fine); their FIRING
-// is guarded off in the tick (agent-target execution is substrate-blocked — see
-// tick.ts). This surface never mints capability (P8) and starts NO runs — the tick
-// owns the fire path.
+// AGENT schedules are creatable/manageable here. Their firing belongs solely to
+// the tick's optional runtime-driven `startAgent` seam; without it, the tick
+// retains the audited fail-closed skip. This surface mints no capability and
+// starts no runs.
 
 import {
   AGENT_SCHEDULE_PREFIX,
@@ -62,6 +62,7 @@ import {
   type TenantResolver,
 } from '../approval-api/index.js';
 import { safeDecodeSegment } from '../host-kit/route-path.js';
+import { internalErrorResponse } from '../internal-error-response.js';
 import { isReservedScheduleContextKey } from './tick.js';
 
 /** The storage subset the facade reads/writes (a subset of D1SchedulesStorage). */
@@ -743,10 +744,7 @@ export function createScheduleRouter(
         // Pre-auth: unauthenticated, so not audited.
         return json({ error: 'forbidden' }, 403);
       }
-      return json(
-        { error: error instanceof Error ? error.message : String(error) },
-        500,
-      );
+      return internalErrorResponse('schedules', error);
     }
   };
 }

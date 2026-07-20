@@ -9,6 +9,7 @@
       { "name": "RUNNER", "class_name": "DemoRunner" },
       { "name": "HUB", "class_name": "DemoHub" },
       { "name": "THREAD", "class_name": "DemoThread" },
+      { "name": "BACKGROUND_TASKS", "class_name": "DemoBackgroundTasks" },
       {
         "name": "SIGNAL_PROVIDER_HOST",
         "class_name": "DemoSignalProviderHost"
@@ -21,7 +22,8 @@
     { "tag": "v1", "new_sqlite_classes": ["DemoRunner"] },
     { "tag": "v2", "new_sqlite_classes": ["DemoHub"] },
     { "tag": "v3", "new_sqlite_classes": ["DemoThread"] },
-    { "tag": "v4", "new_sqlite_classes": ["DemoSignalProviderHost"] }
+    { "tag": "v4", "new_sqlite_classes": ["DemoSignalProviderHost"] },
+    { "tag": "v5", "new_sqlite_classes": ["DemoBackgroundTasks"] }
   ],
   "d1_databases": [
     {

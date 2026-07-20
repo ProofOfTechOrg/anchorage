@@ -4,7 +4,8 @@
 // idle run-cap consult (DL-007), and the resourceId gating — over a mock agent.
 
 import { type Agent, signalToXmlMarkup } from '@mastra/core/agent';
-import { describe, expect, it } from 'vitest';
+import { InMemoryNotificationsStorage } from '@mastra/core/notifications';
+import { describe, expect, it, vi } from 'vitest';
 
 import { RUNTIME_DRIVEN_AGENT } from '../agent-runner/index.js';
 import type { ThreadScope } from '../do-runner/index.js';
@@ -13,6 +14,7 @@ import { createThreadSignalRoutes } from './thread-do-routes.js';
 interface AgentCall {
   method: string;
   target: {
+    runId?: string;
     threadId: string;
     resourceId?: string;
     ifIdle?: unknown;
@@ -69,6 +71,7 @@ function scopeWith(pubsub: unknown): ThreadScope {
   return {
     threadId: 'acme_t1',
     tenantId: 'acme',
+    requestedBy: 'operator',
     init: { pubsub },
   } as unknown as ThreadScope;
 }
@@ -189,6 +192,32 @@ describe('createThreadSignalRoutes', () => {
     expect(res?.status).toBe(400);
   });
 
+  it('returns a generic 500 when thread route wiring throws', async () => {
+    const logged: string[] = [];
+    const log = vi.spyOn(console, 'error').mockImplementation((value) => {
+      logged.push(String(value));
+    });
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => {
+        throw new Error('private thread wiring detail');
+      },
+      resolveResourceId: () => 'acme_res',
+    });
+
+    try {
+      const response = await routes(
+        post('/signal', { contents: 'hi' }),
+        scopeWith(undefined),
+      );
+      expect(response?.status).toBe(500);
+      expect(await response?.json()).toEqual({ error: 'internal error' });
+      expect(response?.headers.get('cache-control')).toBe('no-store');
+      expect(logged.join('\n')).toContain('private thread wiring detail');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it('refuses an idle WAKE on a NON-runtime-driven agent (fail-closed to persist)', async () => {
     // #given — a plain agent (no RUNTIME_DRIVEN_AGENT brand): its stream would run
     // the loop OFF RunnerRuntime, so a wake must not start a run through it.
@@ -211,12 +240,13 @@ describe('createThreadSignalRoutes', () => {
     expect(calls[0]?.target.ifIdle).toEqual({ behavior: 'persist' });
   });
 
-  it('honors an idle WAKE on a runtime-driven agent (the brand allows it)', async () => {
+  it('starts an idle WAKE through the host seam with a tenant-salted run id', async () => {
     // #given — the default mock IS runtime-driven; no run cap wired
     const { agent, calls } = mockAgent();
     const routes = createThreadSignalRoutes({
       resolveAgent: () => agent,
       resolveResourceId: () => 'acme_res',
+      startIdleRun: async ({ runId }) => ({ runId, signalId: 'started' }),
     });
 
     // #when
@@ -232,7 +262,140 @@ describe('createThreadSignalRoutes', () => {
     };
     expect(body.wakeRefused).toBeUndefined();
     expect(body.capped).toBe(false);
-    expect(calls[0]?.target.ifIdle).toEqual({ behavior: 'wake' });
+    expect(body).toMatchObject({
+      decision: {
+        action: 'wake',
+        runId: expect.stringMatching(/^acme_/),
+      },
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('serializes concurrent idle wakes and joins the run started by the winner', async () => {
+    const { agent, calls } = mockAgent();
+    let activeRunId: string | undefined;
+    (
+      agent as unknown as { getActiveThreadRunId: () => string | undefined }
+    ).getActiveThreadRunId = () => activeRunId;
+    const startIdleRun = vi.fn(async ({ runId }: { runId: string }) => {
+      activeRunId = runId;
+      return { runId };
+    });
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      startIdleRun,
+    });
+
+    const responses = await Promise.all([
+      routes(
+        post('/signal/message', { contents: 'one', ifIdle: 'wake' }),
+        scopeWith(undefined),
+      ),
+      routes(
+        post('/signal/message', { contents: 'two', ifIdle: 'wake' }),
+        scopeWith(undefined),
+      ),
+    ]);
+    const bodies = await Promise.all(
+      responses.map((response) => response?.json() as Promise<unknown>),
+    );
+
+    expect(startIdleRun).toHaveBeenCalledTimes(1);
+    expect(bodies).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          decision: { action: 'wake', runId: activeRunId },
+        }),
+        expect.objectContaining({
+          decision: { action: 'deliver', runId: 'run-1' },
+        }),
+      ]),
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.target.runId).toBe(activeRunId);
+  });
+
+  it('dispatches a due notification through a salted idle wake and marks it delivered', async () => {
+    const { agent } = mockAgent();
+    const storage = new InMemoryNotificationsStorage();
+    const record = await storage.createNotification({
+      id: 'due-idle',
+      threadId: 'acme_t1',
+      resourceId: 'acme_res',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'ready',
+      summary: 'ready',
+      deliverAt: new Date(0),
+    });
+    const starts: string[] = [];
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+      startIdleRun: async ({ runId }) => {
+        starts.push(runId);
+        return { runId, signalId: 'wake-signal' };
+      },
+    });
+
+    const response = await routes(
+      post('/signal/notifications/dispatch', {
+        notificationIds: [record.id],
+        resourceId: 'acme_res',
+        now: '2026-07-20T12:00:00.000Z',
+      }),
+      scopeWith(undefined),
+    );
+
+    expect(await response?.json()).toEqual({ delivered: 1, failed: 0 });
+    expect(starts).toHaveLength(1);
+    expect(starts[0]).toMatch(/^acme_/);
+    expect(
+      await storage.getNotification({ threadId: 'acme_t1', id: record.id }),
+    ).toMatchObject({
+      status: 'delivered',
+      deliveredSignalId: 'wake-signal',
+    });
+  });
+
+  it('joins an active durable run when dispatching a due notification', async () => {
+    const { agent, calls } = mockAgent();
+    (
+      agent as unknown as { getActiveThreadRunId: () => string }
+    ).getActiveThreadRunId = () => 'acme_active-run';
+    const storage = new InMemoryNotificationsStorage();
+    const record = await storage.createNotification({
+      id: 'due-active',
+      threadId: 'acme_t1',
+      resourceId: 'acme_res',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'ready',
+      summary: 'ready',
+      deliverAt: new Date(0),
+    });
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+    });
+
+    const response = await routes(
+      post('/signal/notifications/dispatch', {
+        notificationIds: [record.id],
+        resourceId: 'acme_res',
+        now: '2026-07-20T12:00:00.000Z',
+      }),
+      scopeWith(undefined),
+    );
+
+    expect(await response?.json()).toEqual({ delivered: 1, failed: 0 });
+    expect(calls.at(-1)).toMatchObject({
+      method: 'sendSignal',
+      target: { runId: 'acme_active-run' },
+    });
   });
 
   it('400s a signal whose tagName is not a valid XML name (C-S5 route-level defense)', async () => {

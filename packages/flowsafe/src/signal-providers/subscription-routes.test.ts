@@ -3,7 +3,7 @@
 // (RA-009: NEVER exposed as model tools; nothing here mints capability, P8). The
 // gate order mirrors createSignalRouter: resolve → role → thread-ownership →
 // memory-id refusal → mutate, every outcome audited.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { ApprovalRole, TenantContext } from '../approval-api/index.js';
 import { mintResourceId, tenantOwnsMemoryId } from '../do-runner/index.js';
@@ -199,5 +199,41 @@ describe('createSubscriptionRouter', () => {
       outcome: 'rejected',
       reason: 'forbidden-role',
     });
+  });
+
+  it('returns a generic internal error, logs detail, and audits the rejection', async () => {
+    const events: SignalProviderAuditEvent[] = [];
+    const logged: string[] = [];
+    const log = vi.spyOn(console, 'error').mockImplementation((value) => {
+      logged.push(String(value));
+    });
+    const router = createSubscriptionRouter({
+      resolve: async () => ctx('acme', 'operator'),
+      subscriptions: {
+        forTenant: () => ({
+          listForThread: async () => {
+            throw new Error('private database detail');
+          },
+        }),
+      } as never,
+      knownProviders: ['github'],
+      audit: (event) => {
+        events.push(event);
+      },
+    });
+
+    try {
+      const response = await router(req('GET', 'acme_t1'));
+      expect(response?.status).toBe(500);
+      expect(await response?.json()).toEqual({ error: 'internal error' });
+      expect(response?.headers.get('cache-control')).toBe('no-store');
+      expect(events.at(-1)).toMatchObject({
+        outcome: 'rejected',
+        reason: 'internal-error',
+      });
+      expect(logged.join('\n')).toContain('private database detail');
+    } finally {
+      log.mockRestore();
+    }
   });
 });

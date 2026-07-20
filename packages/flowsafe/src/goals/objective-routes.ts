@@ -80,6 +80,7 @@ import {
   requireOwnedMemoryId,
 } from '../host-kit/index.js';
 import { safeDecodeSegment } from '../host-kit/route-path.js';
+import { internalErrorResponse } from '../internal-error-response.js';
 
 /**
  * requestContext key @mastra/core surfaces the current objective under WITHIN a
@@ -531,10 +532,7 @@ export function createObjectiveRouter(
         // Pre-auth (the resolver itself threw): unauthenticated, so not audited.
         return json({ error: 'forbidden' }, 403);
       }
-      return json(
-        { error: error instanceof Error ? error.message : String(error) },
-        500,
-      );
+      return internalErrorResponse('goals.objective', error);
     }
   };
 }

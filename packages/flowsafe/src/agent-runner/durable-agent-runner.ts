@@ -60,13 +60,16 @@ import {
   DurableAgent,
   type DurableAgentConfig,
   type DurableAgenticWorkflowInput,
+  type DurableAgentStreamOptions,
 } from '@mastra/core/agent/durable';
+import type { Mastra } from '@mastra/core/mastra';
 import type { AnyWorkflow } from '@mastra/core/workflows';
 
 import {
   InvalidRunRequestError,
   PATH_SAFE_ID_PATTERN,
   type RunnerRuntime,
+  type RunSummary,
 } from '../do-runner/index.js';
 
 /**
@@ -90,13 +93,9 @@ export const DURABLE_AGENTIC_LOOP_WORKFLOW_ID = 'durable-agentic-loop';
  * grant-underivable. Structural (a `unique symbol`-keyed truthy field) so a test
  * double can opt in without constructing a real durable agent.
  *
- * The brand does NOT by itself make a woken run INV-1 tenant-scoped: core mints
- * the wake's runId as a bare `crypto.randomUUID()` inside
- * `agentThreadStreamRuntime.sendSignal` and the public send API cannot override
- * it, so full `${tenantId}_${uuid}` scoping of idle-wake runs is owned by Track
- * A's real-loop wiring (which must supply the wake's tenant→runId seam). The
- * brand closes the immediate escape — a plain/ephemeral agent running the loop
- * off the runtime entirely.
+ * The brand is paired with Track C's host-owned idle-start seam: the thread DO
+ * mints the tenant-salted run id and invokes the wrapper directly, avoiding
+ * core's tenant-less idle-wake id generation.
  */
 export const RUNTIME_DRIVEN_AGENT: unique symbol = Symbol(
   'flowsafe.runtimeDrivenAgent',
@@ -147,6 +146,12 @@ export interface FlowsafeDurableAgentOptions<
    * empty feed. Pass an explicit instance only to override that default.
    */
   pubsub?: DurableAgentConfig<TAgentId, TTools, TOutput>['pubsub'];
+  /**
+   * Public Mastra thread runtime (`mastra.agentThreadStreamRuntime`). When
+   * present, started and rehydrated outputs are registered on the same pubsub
+   * identity so active-thread signals join the durable loop.
+   */
+  threadRuntime?: Mastra['agentThreadStreamRuntime'];
   /** Max steps for the agentic loop (bakes into the shared loop's isTaskComplete step). */
   maxSteps?: number;
 }
@@ -168,6 +173,7 @@ export class FlowsafeDurableAgent<
    */
   readonly [RUNTIME_DRIVEN_AGENT] = true;
   readonly #runtime: RunnerRuntime;
+  readonly #threadRuntime?: Mastra['agentThreadStreamRuntime'];
 
   constructor(options: FlowsafeDurableAgentOptions<TAgentId, TTools, TOutput>) {
     super({
@@ -185,6 +191,7 @@ export class FlowsafeDurableAgent<
       maxSteps: options.maxSteps,
     });
     this.#runtime = options.runtime;
+    this.#threadRuntime = options.threadRuntime;
   }
 
   /**
@@ -223,7 +230,18 @@ export class FlowsafeDurableAgent<
     Awaited<ReturnType<DurableAgent<TAgentId, TTools, TOutput>['stream']>>
   > {
     this.#assertCallerRunId(options?.runId);
-    return super.stream(messages, options);
+    const result = await super.stream(messages, options);
+    await this.#threadRuntime?.registerRun(
+      this as unknown as Parameters<
+        Mastra['agentThreadStreamRuntime']['registerRun']
+      >[0],
+      result.output,
+      (options ?? {}) as Parameters<
+        Mastra['agentThreadStreamRuntime']['registerRun']
+      >[2],
+      this.pubsub,
+    );
+    return result;
   }
 
   /**
@@ -263,6 +281,45 @@ export class FlowsafeDurableAgent<
   > {
     this.#assertCallerRunId(options?.runId);
     return super.prepare(messages, options);
+  }
+
+  /**
+   * Rehydrate a suspended durable-agent run after isolate eviction, restore its
+   * active thread registration, then resume through RunnerRuntime so approval
+   * grant derivation and the durable resume ledger remain authoritative.
+   * Hosts expose this only from their trusted approval-decision topology.
+   */
+  async resumeViaRuntime(options: {
+    runId: string;
+    step?: string | string[];
+    resumeData?: unknown;
+    memory?: DurableAgentStreamOptions<TOutput>['memory'];
+  }): Promise<RunSummary> {
+    this.#assertCallerRunId(options.runId);
+    await this.prepare([], {
+      runId: options.runId,
+      ...(options.memory !== undefined ? { memory: options.memory } : {}),
+    } as NonNullable<
+      Parameters<DurableAgent<TAgentId, TTools, TOutput>['prepare']>[1]
+    >);
+    const observed = await this.observe(options.runId);
+    await this.#threadRuntime?.registerRun(
+      this as unknown as Parameters<
+        Mastra['agentThreadStreamRuntime']['registerRun']
+      >[0],
+      observed.output,
+      {
+        runId: options.runId,
+        ...(options.memory !== undefined ? { memory: options.memory } : {}),
+      } as Parameters<Mastra['agentThreadStreamRuntime']['registerRun']>[2],
+      this.pubsub,
+    );
+    return this.#runtime.resume(this.getWorkflow().id, options.runId, {
+      ...(options.step !== undefined ? { step: options.step } : {}),
+      ...(options.resumeData !== undefined
+        ? { resumeData: options.resumeData }
+        : {}),
+    });
   }
 
   /**

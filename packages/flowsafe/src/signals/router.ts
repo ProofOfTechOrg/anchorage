@@ -57,6 +57,7 @@ import {
   type ThreadTopology,
 } from '../host-kit/index.js';
 import { safeDecodeSegment } from '../host-kit/route-path.js';
+import { internalErrorResponse } from '../internal-error-response.js';
 
 /** The ingest channels, each mapped to a thread-DO route. */
 const CHANNEL_PATHS = {
@@ -300,10 +301,7 @@ export function createSignalRouter(options: SignalRouterOptions): SignalRouter {
         // Pre-auth (the resolver itself threw): unauthenticated, so not audited.
         return json({ error: 'forbidden' }, 403);
       }
-      return json(
-        { error: error instanceof Error ? error.message : String(error) },
-        500,
-      );
+      return internalErrorResponse('signals.ingest', error);
     }
   };
 }

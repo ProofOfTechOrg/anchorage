@@ -11,6 +11,7 @@ import {
   type ApprovalAuditSink,
   type ApprovalDecision,
   type ApprovalRecord,
+  type ApprovalResumeTarget,
   type ApprovalService,
   approvalCursor,
   MAX_APPROVAL_LIST_LIMIT,
@@ -86,6 +87,7 @@ export async function queueApprovalForSuspension(
   summary: RunSummary,
   requestedBy: string,
   systemActor: ApprovalActor,
+  resumeTarget?: ApprovalResumeTarget,
 ): Promise<ApprovalRecord[]> {
   const suspended = summary.suspended ?? [];
   const records: ApprovalRecord[] = [];
@@ -113,6 +115,7 @@ export async function queueApprovalForSuspension(
           requestedBy,
         },
         systemActor,
+        resumeTarget,
       );
       records.push(record);
     } catch (error) {
@@ -184,6 +187,7 @@ export function resumeRunWithRequeue(
           summary,
           record.decidedBy,
           systemActor,
+          record.resumeTarget,
         );
       } catch (error) {
         // Best-effort: a crashing sink must not mask the resume failure it is
@@ -297,6 +301,7 @@ export async function reconcileApprovalsForSummary(
   workflowId: string,
   summary: RunSummary,
   systemActor: ApprovalActor,
+  resumeTarget?: ApprovalResumeTarget,
 ): Promise<ApprovalRecord[]> {
   const suspended = summary.suspended ?? [];
   if (suspended.length === 0) return [];
@@ -343,6 +348,7 @@ export async function reconcileApprovalsForSummary(
     { ...summary, suspended: toFile },
     systemActor.id,
     systemActor,
+    resumeTarget,
   );
 }
 

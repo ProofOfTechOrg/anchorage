@@ -15,7 +15,10 @@
 // the package barrel.
 
 import { d1Changes } from '../do-runner/d1-storage.js';
-import { TENANT_ID_PATTERN } from '../do-runner/path-safe-id.js';
+import {
+  TENANT_ID_PATTERN,
+  tenantOwnsSaltedId,
+} from '../do-runner/path-safe-id.js';
 import {
   type ApprovalPatch,
   type ApprovalStore,
@@ -27,6 +30,7 @@ import {
   type ApprovalListFilter,
   type ApprovalMetrics,
   type ApprovalRecord,
+  type ApprovalResumeTarget,
   type ApprovalStatus,
   approvalListOrder,
   clampApprovalLimit,
@@ -77,6 +81,7 @@ const SCHEMA_STATEMENTS: readonly string[] = [
     resumed_at INTEGER,
     resume_count INTEGER,
     run_scoped INTEGER,
+    resume_target TEXT,
     title TEXT NOT NULL,
     summary TEXT,
     payload TEXT,
@@ -118,6 +123,7 @@ interface ApprovalRow {
   resume_count: number | null;
   /** SQLite has no boolean: 1 = run-scoped standing grant, 0/NULL = not. */
   run_scoped: number | null;
+  resume_target: string | null;
   title: string;
   summary: string | null;
   payload: string | null;
@@ -335,6 +341,35 @@ function rowToRecord(row: ApprovalRow): ApprovalRecord {
   if (row.resumed_at != null) record.resumedAt = row.resumed_at;
   if (row.resume_count != null) record.resumeCount = row.resume_count;
   if (row.run_scoped != null) record.runScoped = row.run_scoped === 1;
+  if (row.resume_target != null) {
+    let target: unknown;
+    try {
+      target = JSON.parse(row.resume_target);
+    } catch {
+      throw new Error(`approval '${row.id}' has invalid resume_target JSON`);
+    }
+    if (
+      typeof target !== 'object' ||
+      target === null ||
+      (target as Record<string, unknown>).kind !== 'thread' ||
+      typeof (target as Record<string, unknown>).threadId !== 'string' ||
+      !tenantOwnsSaltedId(
+        row.tenant_id,
+        (target as Record<string, unknown>).threadId as string,
+      ) ||
+      ((target as Record<string, unknown>).resourceId !== undefined &&
+        (typeof (target as Record<string, unknown>).resourceId !== 'string' ||
+          !tenantOwnsSaltedId(
+            row.tenant_id,
+            (target as Record<string, unknown>).resourceId as string,
+          )))
+    ) {
+      throw new Error(
+        `approval '${row.id}' has an invalid or foreign resume_target`,
+      );
+    }
+    record.resumeTarget = target as ApprovalResumeTarget;
+  }
   if (row.summary !== null) record.summary = row.summary;
   if (row.payload !== null) record.payload = JSON.parse(row.payload);
   if (row.requested_by !== null) record.requestedBy = row.requested_by;
@@ -410,6 +445,13 @@ export async function createApprovalSchema(
       if (!isDuplicateColumn(error)) throw error;
     }
   }
+  try {
+    await db
+      .prepare(`ALTER TABLE ${TABLE} ADD COLUMN resume_target TEXT`)
+      .run();
+  } catch (error) {
+    if (!isDuplicateColumn(error)) throw error;
+  }
 }
 
 export class D1ApprovalStore implements ApprovalStore {
@@ -448,10 +490,10 @@ export class D1ApprovalStore implements ApprovalStore {
           `INSERT INTO ${TABLE} (
             id, tenant_id, workflow_id, run_id, step_key, step_path,
             suspended_at, resumed_at, resume_count, run_scoped, title, summary,
-            payload, connectors, priority, status, requested_by, claimed_by,
+            resume_target, payload, connectors, priority, status, requested_by, claimed_by,
             decided_by, decision, comment, delegated_to, created_at, updated_at,
             claimed_at, decided_at, escalated_at, sla_deadline_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .bind(
           snapshot.id,
@@ -466,6 +508,9 @@ export class D1ApprovalStore implements ApprovalStore {
           snapshot.runScoped === undefined ? null : snapshot.runScoped ? 1 : 0,
           snapshot.title,
           snapshot.summary ?? null,
+          snapshot.resumeTarget === undefined
+            ? null
+            : JSON.stringify(snapshot.resumeTarget),
           snapshot.payload === undefined
             ? null
             : JSON.stringify(snapshot.payload),

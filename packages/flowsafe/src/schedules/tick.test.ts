@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Track D (M-006) — createScheduleTick: the mint posture (INV-1), the run-cap
-// seam (D-S4), the agent-target guard-off (substrate-blocked), fail-closed skips,
-// in-process exactly-once (CAS), and the P4 stored-context barrier (b).
+// seam (D-S4), optional agent start, fail-closed fallback, in-process exactly-once
+// (CAS), lost-claim classification, and the P4 stored-context barrier (b).
 
 import type { Schedule, ScheduleTrigger } from '@mastra/core/storage';
 import { describe, expect, it, vi } from 'vitest';
@@ -32,6 +32,10 @@ class FakeStore implements ScheduleTickStore {
       (s) => s.status === 'active' && s.nextFireAt <= now,
     );
     return limit !== undefined ? due.slice(0, limit) : due;
+  }
+
+  async getSchedule(id: string): Promise<Schedule | null> {
+    return this.schedules.get(id) ?? null;
   }
 
   async updateScheduleNextFire(
@@ -157,7 +161,7 @@ describe('createScheduleTick', () => {
     );
   });
 
-  it('GUARDS OFF an agent target (substrate-blocked): no run, audited skip, schedule advanced', async () => {
+  it('retains the audited agent fallback when no startAgent seam is configured', async () => {
     // #given a due AGENT schedule
     const store = new FakeStore();
     store.seed(
@@ -173,8 +177,7 @@ describe('createScheduleTick', () => {
     // #when
     const result = await createScheduleTick({ store, start, now: () => NOW })();
 
-    // #then the tick NEVER calls run(id)/start for an agent target — it records a
-    // guarded skip and advances the schedule (no hot-loop)
+    // #then the tick records a guarded skip and advances the schedule
     expect(result.skipped).toBe(1);
     expect(start).not.toHaveBeenCalled();
     expect(store.triggers[0]).toMatchObject({
@@ -182,6 +185,117 @@ describe('createScheduleTick', () => {
       metadata: { tenantId: 'acme', reason: 'agent-target-unsupported' },
     });
     expect(store.schedules.get('agent_a')?.nextFireAt).toBeGreaterThan(NOW);
+  });
+
+  it('fires an agent target through the runtime seam with sanitized contexts', async () => {
+    const store = new FakeStore();
+    store.seed(
+      workflowSchedule({
+        id: 'agent_a',
+        target: {
+          type: 'agent',
+          agentId: 'a1',
+          prompt: 'go',
+          threadId: 'acme_thread',
+          resourceId: 'acme_resource',
+          requestContext: {
+            keep: 1,
+            'breakwater.approvedConnectors': ['forged'],
+          },
+          ifIdle: {
+            behavior: 'wake',
+            streamOptions: {
+              requestContext: { nested: true, 'mastra:goal': 'forged' },
+            },
+          },
+        },
+        ownerType: 'agent',
+        ownerId: 'a1',
+      }),
+    );
+    const start = vi.fn(async (_wf, runId) => ({ runId }));
+    const startAgent = vi.fn(async () => ({ runId: 'acme_joined-run' }));
+
+    const result = await createScheduleTick({
+      store,
+      start,
+      startAgent,
+      now: () => NOW,
+    })();
+
+    expect(result).toMatchObject({ fired: 1, failed: 0, skipped: 0 });
+    expect(startAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tenantId: 'acme',
+        runId: expect.stringMatching(/^acme_/),
+        topologyThreadId: 'acme_thread',
+        threaded: true,
+        requestContext: { keep: 1 },
+        streamRequestContext: { nested: true },
+      }),
+    );
+    expect(store.triggers[0]).toMatchObject({
+      outcome: 'published',
+      runId: 'acme_joined-run',
+    });
+  });
+
+  it('mints an ephemeral tenant topology for a threadless agent target', async () => {
+    const store = new FakeStore();
+    store.seed(
+      workflowSchedule({
+        id: 'agent_threadless',
+        target: { type: 'agent', agentId: 'a1', prompt: 'go' },
+        ownerType: 'agent',
+        ownerId: 'a1',
+      }),
+    );
+    const startAgent = vi.fn(async ({ runId }) => ({ runId }));
+
+    const result = await createScheduleTick({
+      store,
+      start: vi.fn(),
+      startAgent,
+      now: () => NOW,
+    })();
+
+    expect(result.fired).toBe(1);
+    expect(startAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        threaded: false,
+        topologyThreadId: expect.stringMatching(/^acme_/),
+      }),
+    );
+  });
+
+  it('fails closed before agent dispatch for a foreign stored memory id', async () => {
+    const store = new FakeStore();
+    store.seed(
+      workflowSchedule({
+        target: {
+          type: 'agent',
+          agentId: 'a1',
+          prompt: 'go',
+          threadId: 'globex_thread',
+          resourceId: 'globex_resource',
+        },
+      }),
+    );
+    const startAgent = vi.fn(async ({ runId }) => ({ runId }));
+
+    const result = await createScheduleTick({
+      store,
+      start: vi.fn(),
+      startAgent,
+      now: () => NOW,
+    })();
+
+    expect(result.failed).toBe(1);
+    expect(startAgent).not.toHaveBeenCalled();
+    expect(store.triggers[0]).toMatchObject({
+      outcome: 'failed',
+      metadata: { reason: 'foreign-memory-id' },
+    });
   });
 
   it('fails closed on an invalid/missing metadata.tenantId (no runId can be minted)', async () => {
@@ -234,13 +348,60 @@ describe('createScheduleTick', () => {
     // #when both ticks run concurrently
     const [a, b] = await Promise.all([tick(), tick()]);
 
-    // #then exactly one fired, one lost the CAS, one trigger row total
+    // #then exactly one fired and one lost the CAS
     expect(a.fired + b.fired).toBe(1);
     expect(a.lost + b.lost).toBe(1);
     expect(start).toHaveBeenCalledTimes(1);
     expect(
       store.triggers.filter((t) => t.outcome === 'published'),
     ).toHaveLength(1);
+  });
+
+  it.each([
+    'concurrent-claim',
+    'paused',
+    'disappeared',
+  ] as const)('reloads and records a lost CAS as %s', async (reason) => {
+    const store = new FakeStore();
+    store.seed(workflowSchedule());
+    const events: ScheduleTickAuditEvent[] = [];
+    const losingStore: ScheduleTickStore = {
+      listDueSchedules: (now, limit) => store.listDueSchedules(now, limit),
+      getSchedule: (id) => store.getSchedule(id),
+      updateScheduleNextFire: async (id) => {
+        const current = store.schedules.get(id);
+        if (reason === 'disappeared') store.schedules.delete(id);
+        else if (current) {
+          store.schedules.set(id, {
+            ...current,
+            ...(reason === 'paused'
+              ? { status: 'paused' as const }
+              : { nextFireAt: NOW + 60_000 }),
+          });
+        }
+        return false;
+      },
+      recordTrigger: (trigger) => store.recordTrigger(trigger),
+    };
+
+    const result = await createScheduleTick({
+      store: losingStore,
+      start: vi.fn(),
+      audit: (event) => {
+        events.push(event);
+      },
+      now: () => NOW,
+    })();
+
+    expect(result).toMatchObject({ lost: 1, fired: 0, failed: 0 });
+    expect(store.triggers[0]).toMatchObject({
+      outcome: 'skipped',
+      metadata: { reason: `lost: ${reason}` },
+    });
+    expect(events[0]).toMatchObject({
+      outcome: 'lost',
+      reason: `lost: ${reason}`,
+    });
   });
 
   it('a post-dispatch bookkeeping failure is NOT reclassified as a start failure (M1)', async () => {
@@ -252,6 +413,7 @@ describe('createScheduleTick', () => {
     const events: ScheduleTickAuditEvent[] = [];
     const throwingStore: ScheduleTickStore = {
       listDueSchedules: (n, l) => store.listDueSchedules(n, l),
+      getSchedule: (id) => store.getSchedule(id),
       updateScheduleNextFire: (...args) =>
         store.updateScheduleNextFire(...args),
       recordTrigger: async () => {
@@ -288,6 +450,7 @@ describe('createScheduleTick', () => {
     let claims = 0;
     const throwingStore: ScheduleTickStore = {
       listDueSchedules: (n, l) => store.listDueSchedules(n, l),
+      getSchedule: (id) => store.getSchedule(id),
       updateScheduleNextFire: (...args) => {
         claims += 1;
         if (claims === 1) throw new Error('transient store failure');

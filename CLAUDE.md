@@ -241,11 +241,11 @@ signal routes (message/queue/signal/state/notification) and stamps
 `scope.init.pubsub` onto the agent before every call — the DL-002 AFFINITY
 carrier: core keys its in-process signal registry (`#statesByPubSub`) by the
 pubsub instance, so a send drains into an active loop ONLY when both share the DO
-isolate AND the pubsub (proven on workerd, spike C-S2 step I: an idle-wake
-reserves a run, a second send resolves `action:'deliver'` to it — in-process, no
-LLM; the real LLM-driven loop consuming the signal is Track A's deferred
-residual). `agentThreadStreamRuntime` is NOT on core's exports map, so the routes
-drive the public Agent methods only (no deep-dist import, R-001).
+isolate AND the pubsub (proven on workerd, spike C-S2 step I). Runtime-driven
+idle wakes serialize an active-run recheck, mint an INV-1 run ID, and call the
+host's `startIdleRun` seam. The credentialed spike drives the real loop. The host
+obtains the thread stream runtime from Mastra's public
+`agentThreadStreamRuntime` getter; no deep import is used.
 `D1NotificationsStorage` + `D1ThreadStateStorage` are flowsafe-owned D1 domains
 over `mastra_notifications`/`mastra_thread_state` (the `@mastra/cloudflare-d1`
 1.1.1 adapter ships neither), mirroring core's InMemory reference incl.
@@ -306,9 +306,8 @@ requireToolApproval:{toolCallId,toolName,args}}` and flat `{type:'approval',
 toolCallId,toolName,args}`), `agentGateConnectors` derives `[toolName]` (the
 connector id the write gate checks — `createConnector`'s `createTool({id})` ===
 the `toolName` the model calls === the string `approvalGranted()` looks up). The
-resume-routing `threadId`-capture seam (DL-002) is deferred to Track C — Track A
-hosts per-run, where resume routes by (workflowId, runId, stepPath) and needs no
-threadId, so the seam lands with the thread-DO that consumes it. CI-M-002-003's substantive change lands in **the
+resume-routing `threadId` capture seam (DL-002) is implemented by the trusted
+`ApprovalResumeTarget` stored separately from reviewer payload. CI-M-002-003's substantive change lands in **the
 record-creation/bridge path** (the CI behavior text's own words):
 host-kit's `requestedConnectors` now derives the agent-gate connector from the
 suspend shape when there is no explicit `connectors` array, so an approved agent
@@ -320,13 +319,10 @@ scenarios proving the R-003 round-trip + forged-resume fail-closed on real
 workerd + D1. Live-isolate scope: the loop resolves the tool's execute closure
 from the in-process `globalRunRegistry` (populated by `stream()`); a resume
 after DO eviction must first rehydrate it with `DurableAgent.prepare()`
-(snapshot's `messageListState` wins) before `runtime.resume` — the S3 seam,
-owned by the host that wires the resume topology (an LLM-backed spike, deferred).
-That rehydration is a TRACKED PREREQUISITE for the first agent FEATURE shipped to
-a real DO host with approval gates (DO hibernation during a human approval wait
-is the common case, not an edge) — Track A ships the correct primitive that fails
-CLOSED without it (an availability re-deny, never a capability leak), not the
-end-to-end approval-gated agent product.
+(snapshot's `messageListState` wins) before `runtime.resume`. `resumeViaRuntime`
+performs prepare, observe/register, then `RunnerRuntime.resume`; the thread host
+validates the persisted memory binding first. The credentialed workerd spike
+exercises this path across restart with a real model and connector.
 
 Track F — goals (M-005, 2026-07-17, branch `feat/track-f-goals`; additive,
 opt-in; merged PR #29). New subpath `@proofoftech/flowsafe/goals`:
@@ -366,14 +362,11 @@ INV-1 `${tenantId}_${uuid}` from INV-3-revalidated `metadata.tenantId` (DL-013
 — rows have no tenant column and ids are slugified, so tenant rides metadata)
 and fire through RunnerRuntime; per-schedule failure isolation; every
 unattended start consults an injectable run-cap seam (capped ⇒
-skipped-equivalent, audited, schedule stays healthy). **Agent-target EXECUTION
-is substrate-blocked in core 1.50.0** (`Schedules.run(id)` is publish-only onto
-core's AgentScheduleWorker pubsub loop for BOTH target kinds; the inline
-`executeAgentSchedule` is not exports-reachable): agent-schedule CRUD ships,
-and a due agent schedule is CAS-consumed + recorded as an audited 'skipped'
-trigger (`agent-target-unsupported`) — fail-closed, no hot-loop; the unblock is
-the tracked first-agent-feature (tick → `createFlowsafeDurableAgent` →
-RunnerRuntime.start on the thread-DO, landing spike D-S3), NOT a core bump.
+skipped-equivalent, audited, schedule stays healthy). Agent targets use the
+optional `startAgent` callback to reach the runtime-driven thread DO; hosts that
+omit it retain the audited `agent-target-unsupported` skip. The tick validates
+stored memory IDs, strips reserved contexts, supports threadless ephemeral
+topology, and records the actual joined run ID.
 `createScheduleRouter` — server-minted slug-safe schedule ids (client ids
 refused: slugify drift + a cross-tenant 409 oracle), tenant-filtered reads,
 per-tenant count + fire-rate caps, read-only trigger history; P4
@@ -426,6 +419,22 @@ rejected+audited, E-S1 delivery→inbox, E-S3 D1-rehydration after kill+restart,
 cross-tenant fail-closed) + an E-S1 integration test. The minimal `deploy/`
 template stays unwired (it has no thread DO, the Track C/D/F precedent). Absent
 binding/secret ⇒ byte-identical.
+
+Long-running-agent residual closeout (2026-07-20, uncommitted worktree based on
+`b942d9a76d005668628f60f9295492096097dff6`): the spike's per-thread DO now
+hosts a real runtime-driven durable agent. Starts register with Mastra's public
+thread runtime; approval records may carry a server-only, tenant-validated
+`resumeTarget`; restart resume performs prepare → observe/register → runtime
+resume after validating the snapshot memory binding. Tenant-safe idle wake,
+agent schedules, and `createNotificationDispatchTick` all route through the same
+thread topology. The live proof is separate from the deterministic CI spike:
+`pnpm --filter @proofoftech/flowsafe spike:verify:llm`, with required
+`SPIKE_LLM_MODEL_ID` (`provider/model`) and `SPIKE_LLM_API_KEY`, plus optional
+`SPIKE_LLM_BASE_URL`. Track B execution is enabled through
+`createBackgroundTaskD1Domains` and `BackgroundTaskHost.execution`, one manager
+per tenant DO. The serialized D1 workflow adapter, tenant-scoped task domain,
+store/TTL/offboarding snapshot cascades, and workerd restart proof close
+R-B1/R-B2/R-B3 and tenant-blind recovery without a core version bump.
 
 Guardrails control room + one-page demo (control room merged 2026-07-14,
 PR #21; page unified 2026-07-15): the post-login showcase is ONE narrative

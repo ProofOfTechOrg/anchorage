@@ -30,6 +30,7 @@ import {
   type ApprovalListFilter,
   type ApprovalMetrics,
   type ApprovalRecord,
+  type ApprovalResumeTarget,
   type ApprovalStatus,
   approvalCursor,
   type BatchDecideItem,
@@ -195,6 +196,7 @@ export class ApprovalService {
   async create(
     input: CreateApprovalInput,
     actor: ApprovalActor,
+    resumeTarget?: ApprovalResumeTarget,
   ): Promise<{ record: ApprovalRecord; created: boolean }> {
     this.#authorize(actor, CAN_CREATE, 'approval.create', 'approval');
     this.#validateCreate(input);
@@ -227,6 +229,10 @@ export class ApprovalService {
     if (input.runScoped !== undefined) record.runScoped = input.runScoped;
     if (input.summary !== undefined) record.summary = input.summary;
     if (input.payload !== undefined) record.payload = input.payload;
+    if (resumeTarget !== undefined) {
+      this.#validateResumeTarget(resumeTarget);
+      record.resumeTarget = structuredClone(resumeTarget);
+    }
     // Attribution powers the self-approval check: default to the creating
     // actor. An explicit override stays possible for system bridges — the
     // caller already holds a CAN_CREATE role either way.
@@ -905,6 +911,21 @@ export class ApprovalService {
           `payload must be JSON-serializable: ${errorMessage(error)}`,
         );
       }
+    }
+  }
+
+  #validateResumeTarget(target: ApprovalResumeTarget): void {
+    if (
+      target.kind !== 'thread' ||
+      typeof target.threadId !== 'string' ||
+      !tenantOwnsSaltedId(this.#store.tenantId, target.threadId) ||
+      (target.resourceId !== undefined &&
+        (typeof target.resourceId !== 'string' ||
+          !tenantOwnsSaltedId(this.#store.tenantId, target.resourceId)))
+    ) {
+      throw new InvalidApprovalInputError(
+        'resumeTarget must name thread/resource ids owned by the bound tenant',
+      );
     }
   }
 }

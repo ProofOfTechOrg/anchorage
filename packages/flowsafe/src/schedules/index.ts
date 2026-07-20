@@ -25,6 +25,7 @@ export {
 export { createScheduleStorageDomains } from './storage.js';
 // The CAS tick (CI-M-006-002).
 export {
+  type AgentScheduleTarget,
   buildScheduledLegContext,
   createScheduleTick,
   isReservedScheduleContextKey,
@@ -36,6 +37,8 @@ export {
   type ScheduleTickResult,
   type ScheduleTickRunCap,
   type ScheduleTickStart,
+  type ScheduleTickStartAgent,
+  type ScheduleTickStartAgentInput,
   type ScheduleTickStore,
   stripReservedScheduleContext,
 } from './tick.js';

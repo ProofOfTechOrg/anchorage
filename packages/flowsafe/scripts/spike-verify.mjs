@@ -1113,6 +1113,58 @@ async function main() {
     },
   );
 
+  await step(
+    'H2 D1 execution: serialized workflow updates complete and a killed task recovers tenant-scoped',
+    async () => {
+      const pollTask = async (taskId, wanted, timeoutMs = 30_000) => {
+        const deadline = Date.now() + timeoutMs;
+        let seen;
+        while (Date.now() < deadline) {
+          seen = await http(
+            'GET',
+            `/bg/execution-task/${encodeURIComponent(taskId)}`,
+          );
+          if (seen.body.status === wanted) return seen.body;
+          if (['failed', 'cancelled', 'timed_out'].includes(seen.body.status)) {
+            throw new Error(
+              `background task terminated: ${JSON.stringify(seen.body)}`,
+            );
+          }
+          await sleep(100);
+        }
+        throw new Error(
+          `background task did not reach ${wanted}: ${JSON.stringify(seen?.body)}`,
+        );
+      };
+
+      const fast = await http('POST', '/bg/execute');
+      assert(fast.status === 200, 'execution task enqueued', fast.body);
+      const completed = await pollTask(fast.body.taskId, 'completed');
+      assert(
+        completed.result?.executed === true,
+        'D1 task body executed',
+        completed,
+      );
+
+      const slow = await http('POST', '/bg/execute-recover');
+      assert(slow.status === 200, 'recoverable task enqueued', slow.body);
+      await pollTask(slow.body.taskId, 'running');
+      await killServer(currentServer);
+      currentServer = startServer(
+        'bg-recovery',
+        stateDir,
+        join(tmpDir, 'bg-recovery.log'),
+      );
+      await waitReady(currentServer, 90_000);
+      const recovered = await pollTask(slow.body.taskId, 'completed', 45_000);
+      assert(
+        recovered.result?.executed === true,
+        'killed D1 task recovered and completed',
+        recovered,
+      );
+    },
+  );
+
   // --- Track C signals (M-004) ---------------------------------------------
   // The load-bearing proofs the DL-002 affinity thesis rests on (the DO IS the
   // serialization lease, replacing Redis distributed leasing).
@@ -1552,6 +1604,8 @@ try {
       'refused expired / cross-tenant / garbage / cross-channel tickets. ' +
       'Track B (M-003): a smuggled _background arg was rejected + audited ' +
       '(B-S3), and a fresh init() recovered a task left running in D1 (B-S2). ' +
+      'The serialized tenant-scoped D1 domains executed a task to completion ' +
+      'and recovered a killed in-flight task after restart (H2). ' +
       'Track C (M-004): a send into an ACTIVE thread-DO loop drained IN-PROCESS ' +
       'via the shared-pubsub registry (C-S2, the DL-002 affinity thesis), and a ' +
       'foreign-threadId send failed closed at BOTH the topology 404 and the DO ' +

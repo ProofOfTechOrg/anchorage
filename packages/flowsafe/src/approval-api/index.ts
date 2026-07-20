@@ -90,6 +90,7 @@ export type {
   ApprovalMetrics,
   ApprovalPriority,
   ApprovalRecord,
+  ApprovalResumeTarget,
   ApprovalStatus,
   BatchDecideItem,
   BatchDecideResult,

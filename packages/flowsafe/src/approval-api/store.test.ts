@@ -151,6 +151,11 @@ function describeStoreContract(
         resumedAt: 1751882460000,
         resumeCount: 2,
         runScoped: true,
+        resumeTarget: {
+          kind: 'thread',
+          threadId: 'acme_thread-1',
+          resourceId: 'acme_resource-1',
+        },
         summary: 'publish the launch post',
         payload: { reason: 'human approval required', nested: { n: 1 } },
         connectors: ['blog-publisher', 'mailer'],
@@ -1279,8 +1284,8 @@ describe('D1ApprovalStore schema upgrade', () => {
     sla_deadline_at TEXT
   )`;
 
-  // A tenant-ful table missing the nullable INTEGER columns — the only shape
-  // the defensive ALTER loop still upgrades in place.
+  // A tenant-ful table missing the additive nullable columns. The defensive
+  // ALTER loop upgrades this shape in place.
   const TENANTED_MINUS_INTEGERS_DDL = `CREATE TABLE flowsafe_approvals (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL,
@@ -1361,7 +1366,7 @@ describe('D1ApprovalStore schema upgrade', () => {
     expect(names).toContain('flowsafe_approvals_open_step_v2');
   });
 
-  it('still backfills the nullable INTEGER columns onto a tenant-ful table missing them', async () => {
+  it('backfills nullable suspension and resume-target columns on a legacy tenant table', async () => {
     // #given — tenant_id present, suspended_at/resumed_at/resume_count/
     // run_scoped absent (the one in-place upgrade that remains legal)
     const sqlite = openSqlite();
@@ -1375,6 +1380,11 @@ describe('D1ApprovalStore schema upgrade', () => {
       resumedAt: 1751882460000,
       resumeCount: 2,
       runScoped: true,
+      resumeTarget: {
+        kind: 'thread',
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+      },
     });
     await store.create(fresh);
     const readBack = await store.get(fresh.id);
@@ -1384,6 +1394,7 @@ describe('D1ApprovalStore schema upgrade', () => {
     expect(readBack?.resumedAt).toBe(1751882460000);
     expect(readBack?.resumeCount).toBe(2);
     expect(readBack?.runScoped).toBe(true);
+    expect(readBack?.resumeTarget).toEqual(fresh.resumeTarget);
   });
 
   it('a legacy step-less approval (no run_scoped) mints NOTHING on the upgraded table', async () => {

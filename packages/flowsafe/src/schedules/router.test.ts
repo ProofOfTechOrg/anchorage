@@ -8,7 +8,7 @@ import type {
   ScheduleTrigger,
   ScheduleUpdate,
 } from '@mastra/core/storage';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   type ApprovalRole,
@@ -484,5 +484,32 @@ describe('createScheduleRouter — mutations', () => {
     const res = await call('GET', `/api/schedules/${id}/triggers`);
     expect(res.status).toBe(200);
     expect(res.body.triggers as unknown[]).toHaveLength(1);
+  });
+});
+
+describe('createScheduleRouter internal errors', () => {
+  it('returns a generic 500 and logs the private store detail', async () => {
+    const logged: string[] = [];
+    const log = vi.spyOn(console, 'error').mockImplementation((value) => {
+      logged.push(String(value));
+    });
+    const store = new MemStore();
+    store.listSchedules = async () => {
+      throw new Error('private schedule store detail');
+    };
+    const router = createScheduleRouter({
+      resolve: resolveAs(ctx('acme', 'operator')),
+      store,
+    });
+
+    try {
+      const response = await router(new Request('http://host/api/schedules'));
+      expect(response?.status).toBe(500);
+      expect(await response?.json()).toEqual({ error: 'internal error' });
+      expect(response?.headers.get('cache-control')).toBe('no-store');
+      expect(logged.join('\n')).toContain('private schedule store detail');
+    } finally {
+      log.mockRestore();
+    }
   });
 });

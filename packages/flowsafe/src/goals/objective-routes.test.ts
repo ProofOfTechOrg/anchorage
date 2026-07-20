@@ -560,3 +560,32 @@ describe('GOAL_REQUEST_CONTEXT_KEY reservation (DL-018 no-collision pin)', () =>
     expect(GOAL_REQUEST_CONTEXT_KEY.startsWith('breakwater.')).toBe(false);
   });
 });
+
+describe('createObjectiveRouter internal errors', () => {
+  it('returns a generic 500 and logs the private store detail', async () => {
+    const logged: string[] = [];
+    const log = vi.spyOn(console, 'error').mockImplementation((value) => {
+      logged.push(String(value));
+    });
+    const router = createObjectiveRouter({
+      resolve: async () => tenantCtx('operator'),
+      store: {
+        getState: async () => {
+          throw new Error('private objective store detail');
+        },
+        setState: async () => {},
+        deleteState: async () => {},
+      },
+    });
+
+    try {
+      const response = await router(req('GET', OWNED_THREAD));
+      expect(response?.status).toBe(500);
+      expect(await response?.json()).toEqual({ error: 'internal error' });
+      expect(response?.headers.get('cache-control')).toBe('no-store');
+      expect(logged.join('\n')).toContain('private objective store detail');
+    } finally {
+      log.mockRestore();
+    }
+  });
+});

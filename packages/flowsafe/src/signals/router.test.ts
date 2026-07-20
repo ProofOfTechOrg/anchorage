@@ -371,4 +371,31 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
     );
     expect(res?.status).toBe(405);
   });
+
+  it('returns a generic 500 while retaining internal detail in structured logs', async () => {
+    const logged: string[] = [];
+    const log = vi.spyOn(console, 'error').mockImplementation((value) => {
+      logged.push(String(value));
+    });
+    const router = createSignalRouter({
+      resolve: async () => tenantCtx('operator'),
+      topology: {
+        send: async () => {
+          throw new Error('private signal backend detail');
+        },
+      } as unknown as ThreadTopology,
+    });
+
+    try {
+      const response = await router(
+        post(`/api/threads/${OWNED_THREAD}/message`, { contents: 'hi' }),
+      );
+      expect(response?.status).toBe(500);
+      expect(await response?.json()).toEqual({ error: 'internal error' });
+      expect(response?.headers.get('cache-control')).toBe('no-store');
+      expect(logged.join('\n')).toContain('private signal backend detail');
+    } finally {
+      log.mockRestore();
+    }
+  });
 });
