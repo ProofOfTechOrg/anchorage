@@ -28,6 +28,7 @@ interface DeliveryGroup {
   tenantId: string;
   threadId: string;
   resourceId: string;
+  agentId: string;
   records: NotificationRecord[];
 }
 
@@ -96,13 +97,24 @@ export function createNotificationDispatchTick(
         );
         continue;
       }
+      if (typeof record.agentId !== 'string' || record.agentId.length === 0) {
+        result.failed += 1;
+        await recordFailure(
+          options.storage,
+          record,
+          now,
+          new Error('notification has no agent id'),
+        );
+        continue;
+      }
       const resourceId = record.resourceId;
       if (!resourceId) continue;
-      const key = `${threadTenant}\0${record.threadId}\0${resourceId}`;
+      const key = `${threadTenant}\0${record.threadId}\0${resourceId}\0${record.agentId}`;
       const group = groups.get(key) ?? {
         tenantId: threadTenant,
         threadId: record.threadId,
         resourceId,
+        agentId: record.agentId,
         records: [] as NotificationRecord[],
       };
       group.records.push(record);
@@ -122,6 +134,7 @@ export function createNotificationDispatchTick(
             body: JSON.stringify({
               notificationIds: group.records.map((record) => record.id),
               resourceId: group.resourceId,
+              agentId: group.agentId,
               now: now.toISOString(),
             }),
           },

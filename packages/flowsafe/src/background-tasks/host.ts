@@ -10,13 +10,15 @@
 // -> chunk .init -> `await this.recoverStaleTasks()`), guarded by its own
 // initPromise so it runs once per manager INSTANCE. A DO evicted mid-task leaves
 // its task row 'running'/'pending' in D1; when the DO is next instantiated (a
-// FRESH manager), `boot()` re-registers the static tool executors and calls
-// `init(pubsub)`, whose recovery resets the stranded 'running' task (maxRetries
-// > 0) to 'pending' and re-dispatches it — its workflow step resolves the
-// executor by tool name via the re-registered static registry (the cross-process
-// path core ships `registerStaticExecutor` for). The DO ALARM is what WAKES an
-// evicted DO so this happens without waiting for a request. No private method is
-// ever called; the seam is `registerStaticExecutor` + `init(pubsub)`, both
+// FRESH manager), `boot()` re-registers the static tool executors, starts the
+// workflow workers, and only then calls `init(pubsub)`. Init's recovery resets a
+// stranded 'running' task (maxRetries > 0) to 'pending' and re-dispatches it;
+// starting workers first guarantees that the workflow event published by that
+// dispatch has a subscriber. Its workflow step resolves the executor by tool
+// name via the re-registered static registry (the cross-process path core ships
+// `registerStaticExecutor` for). The DO ALARM is what WAKES an evicted DO so
+// this happens without waiting for a request. No private method is ever called;
+// the seam is `registerStaticExecutor` + `startWorkers()` + `init(pubsub)`, all
 // public.
 //
 // v1 policy (DL-005/P8): connectors are foreground-only, so approval-carrying
@@ -119,12 +121,12 @@ export class BackgroundTaskHost {
 
   /**
    * DO-boot wiring (DL-015). Fail-fast if the backgroundTasks storage domain is
-   * missing, re-register the static executors, THEN `init(pubsub)` — whose
-   * internal `recoverStaleTasks()` re-drives any task the evicted instance left
-   * mid-flight. Executors go in BEFORE init so a recovered task's workflow step
-   * can resolve its executor by name. Memoized per instance: `init` is itself
-   * idempotent (initPromise), and `boot()` from both `fetch()` and `alarm()`
-   * must not double-register.
+   * missing, re-register the static executors, start execution-mode workflow
+   * workers, THEN call `init(pubsub)` — whose internal `recoverStaleTasks()`
+   * re-drives any task the evicted instance left mid-flight. Executors and the
+   * workflow subscriber both go in BEFORE recovery publishes work. Memoized per
+   * instance: `init` is itself idempotent (initPromise), and `boot()` from both
+   * `fetch()` and `alarm()` must not double-register.
    */
   boot(): Promise<void> {
     if (!this.#booted) {
@@ -172,8 +174,8 @@ export class BackgroundTaskHost {
     for (const [toolName, executor] of Object.entries(this.#executors)) {
       this.manager.registerStaticExecutor(toolName, executor);
     }
-    await this.manager.init(this.#pubsub);
     if (this.#execution) await this.#mastra.startWorkers();
+    await this.manager.init(this.#pubsub);
   }
 
   async #warnIfBodiesCannotExecute(): Promise<void> {

@@ -99,9 +99,11 @@ export interface ThreadSignalRoutesOptions {
    * MUST be a runtime-driven durable agent for an idle wake. The host-provided
    * `startIdleRun` seam starts it through RunnerRuntime with a topology-minted,
    * tenant-salted run id. Without either requirement, wake degrades to durable
-   * persistence and never escapes onto core's default execution engine.
+   * persistence and never escapes onto core's default execution engine. Trusted
+   * notification dispatch supplies the persisted agent id; other routes pass
+   * `undefined`.
    */
-  resolveAgent: (scope: ThreadScope) => Agent;
+  resolveAgent: (scope: ThreadScope, agentId?: string) => Agent;
   /**
    * The thread's tenant-owned memory resourceId — part of core's `(resourceId,
    * threadId)` signal key, so it MUST match whatever the loop registered under
@@ -221,11 +223,33 @@ export function createThreadSignalRoutes(
     if (!body) return json({ error: 'a JSON body is required' }, 400);
 
     try {
+      const requestedAgentId =
+        path === '/signal/notifications/dispatch'
+          ? typeof body.agentId === 'string' && body.agentId.trim().length > 0
+            ? body.agentId
+            : undefined
+          : undefined;
+      if (
+        path === '/signal/notifications/dispatch' &&
+        requestedAgentId === undefined
+      ) {
+        return json(
+          { error: 'agentId is required for notification dispatch' },
+          400,
+        );
+      }
+
       // Affinity: stamp the DO's ONE pubsub identity onto the agent so its signal
       // methods share the registry state the loop registered under. Keep host
       // resolution inside this catch-all: construction/storage failures are
       // internal and must not escape through the outer DO error response.
-      const agent = resolveAgent(scope);
+      const agent = resolveAgent(scope, requestedAgentId);
+      if (requestedAgentId !== undefined && agent.id !== requestedAgentId) {
+        return json(
+          { error: 'notification agent binding does not match' },
+          404,
+        );
+      }
       const runtimeDriven = isRuntimeDrivenAgent(agent);
       const pubsub = scope.init.pubsub;
       if (pubsub) agent.__setPubSub(pubsub);
@@ -272,7 +296,7 @@ export function createThreadSignalRoutes(
       if (path === '/signal/state') {
         return await handleState(agent, body, threadId, resourceId);
       }
-      if (path === '/signal/notifications/dispatch') {
+      if (requestedAgentId !== undefined) {
         if (!resolveNotificationsStorage) {
           return json(
             { error: 'notification dispatch is not configured' },
@@ -291,6 +315,7 @@ export function createThreadSignalRoutes(
           startIdleRun,
           serializeWake,
           storage: await resolveNotificationsStorage(scope),
+          agentId: requestedAgentId,
         });
       }
       // POST /signal/notification — the durable AGENT inbox (mastra_notifications).
@@ -319,6 +344,7 @@ async function handleNotificationDispatch(options: {
   startIdleRun?: StartIdleRun;
   serializeWake<T>(operation: () => Promise<T>): Promise<T>;
   storage: NotificationsStorage;
+  agentId: string;
 }): Promise<Response> {
   const ids = options.body.notificationIds;
   if (
@@ -350,13 +376,14 @@ async function handleNotificationDispatch(options: {
       threadId: options.threadId,
       id,
     });
+    if (current?.status !== 'pending' || current.deliveredSignalId) continue;
     if (
-      current?.status === 'pending' &&
-      current.resourceId === options.resourceId &&
-      !current.deliveredSignalId
+      current.resourceId !== options.resourceId ||
+      current.agentId !== options.agentId
     ) {
-      records.push(current);
+      return json({ error: 'notification binding does not match' }, 404);
     }
+    records.push(current);
   }
 
   let delivered = 0;
@@ -403,15 +430,29 @@ async function handleNotificationDispatch(options: {
     if (!result.signalId) throw new Error('notification signal has no id');
     return result.signalId;
   };
+  const persistWithoutWake = async (signal: AgentSignal): Promise<string> => {
+    const result = options.agent.sendSignal(signal, {
+      threadId: options.threadId,
+      resourceId,
+      ifActive: { behavior: 'deliver' },
+      ifIdle: { behavior: 'persist' },
+    });
+    await result.accepted;
+    if (result.persisted) await result.persisted;
+    return result.signal.id;
+  };
 
   const summaries = records.filter(
     (record) => record.summaryAt && record.summaryAt.getTime() <= now.getTime(),
   );
   if (summaries.length > 0) {
     try {
-      const signalId = await send(
-        createNotificationSummarySignal(summarizeNotifications(summaries)),
+      const signal = createNotificationSummarySignal(
+        summarizeNotifications(summaries),
       );
+      const signalId = summaries.every((record) => record.priority === 'low')
+        ? await persistWithoutWake(signal)
+        : await send(signal);
       for (const record of summaries) {
         await options.storage.updateNotification({
           id: record.id,
@@ -475,6 +516,7 @@ function requestedIdle(body: Record<string, unknown>): IdleBehavior {
 interface WakeDelivery {
   accepted: Promise<unknown>;
   signal: { id: string };
+  persisted?: Promise<void>;
 }
 
 async function handleWake(options: {
@@ -521,8 +563,10 @@ async function handleWake(options: {
         : false;
     if (refusal || capped) {
       const persisted = options.persist();
+      const decision = await persisted.accepted;
+      if (persisted.persisted) await persisted.persisted;
       return json({
-        decision: await persisted.accepted,
+        decision,
         capped,
         ...(refusal ? { wakeRefused: refusal } : {}),
         signalId: persisted.signal.id,
@@ -546,10 +590,11 @@ async function handleWake(options: {
       ...(options.message !== undefined ? { message: options.message } : {}),
       ...(options.signal !== undefined ? { signal: options.signal } : {}),
     });
+    const signalId = started.signalId ?? options.signal?.id;
     return json({
       decision: { action: 'wake', runId: started.runId },
       capped: false,
-      ...(started.signalId !== undefined ? { signalId: started.signalId } : {}),
+      ...(signalId !== undefined ? { signalId } : {}),
     });
   });
 }
@@ -825,9 +870,10 @@ async function handleNotification(
       409,
     );
   }
-  const record = await agent.sendNotificationSignal(notification, {
+  const result = await agent.sendNotificationSignal(notification, {
     threadId,
     resourceId,
   });
-  return json({ record });
+  if (result.persisted) await result.persisted;
+  return json({ record: result });
 }

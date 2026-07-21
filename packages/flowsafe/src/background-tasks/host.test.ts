@@ -1,21 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track B host wiring + the B-S2 recovery SEAM (R-002 pin: the PUBLIC async
+// Track B host wiring + the B-S2 recovery seam (R-002 pin: the PUBLIC async
 // init(pubsub) fires recoverStaleTasks internally — no private method is
-// called). The seam is proven at the storage layer, where it is deterministic
-// and store-agnostic: a task an evicted instance left 'running' with no retry
-// budget is resolved to 'failed' by a fresh instance's init(). That transition
-// is the recovery seam firing; it needs no workflow execution.
-//
-// DISPATCH -> EXECUTE -> COMPLETE is NOT unit-proven here, on purpose. Core runs
-// task bodies on the EVENTED execution engine, which (a) refuses to run unless
-// the workflows store reports supportsConcurrentUpdates() — @mastra/cloudflare-d1
-// returns false (R-B1) — and (b) drives step progress through an event loop the
-// bare manager does not stand up in-process, so even on a concurrent-update
-// store (InMemoryStore) a dispatched task never reaches terminal in a unit test
-// (R-B2). Both findings are documented in host.ts; durable background-task
-// EXECUTION on the Cloudflare substrate is a P9 follow-up, not shipped here. The
-// persistence domain, recovery seam, purge/TTL, tenant-bound routes, and the
-// _background defense — everything Track B actually adds — all work regardless.
+// called). Execution-mode recovery is proven over the serialized, tenant-bound
+// D1 domains: workers subscribe before init publishes the recovered dispatch,
+// and a static executor takes the stranded task through to completion.
 
 import type { ToolExecutor } from '@mastra/core/background-tasks';
 import { Mastra } from '@mastra/core/mastra';
@@ -25,7 +13,10 @@ import { z } from 'zod';
 
 import { d1DatabaseLike, openSqlite } from '../../test-support/sqlite.js';
 import { createD1Storage, createHostPubSub, init } from '../do-runner/index.js';
-import { backgroundTasksStore } from './d1-storage.js';
+import {
+  backgroundTasksStore,
+  createBackgroundTaskD1Domains,
+} from './d1-storage.js';
 import { BackgroundTaskHost } from './host.js';
 
 function baseTask(overrides: Record<string, unknown>) {
@@ -240,5 +231,65 @@ describe('BackgroundTaskHost — on D1 (R-B1: persistence + recovery seam, no bo
     expect(got?.status).toBe('suspended');
     const listed = await store.listTasks({ runId: 'abc_r1' });
     expect(listed.tasks.map((t) => t.id)).toContain('persisted');
+  });
+});
+
+describe('BackgroundTaskHost — execution-mode recovery on D1', () => {
+  it('subscribes workflow workers before recovery re-dispatches a retryable task', async () => {
+    const binding = d1DatabaseLike(openSqlite()) as never;
+    const seedStorage = createD1Storage({
+      binding,
+      domains: createBackgroundTaskD1Domains({
+        binding,
+        tenantId: 'acme',
+      }),
+    });
+    await seedStorage.init();
+    const seedStore = await backgroundTasksStore(
+      new Mastra({ storage: seedStorage }),
+    );
+    await seedStore.createTask(
+      baseTask({
+        id: 'retryable-execution',
+        runId: 'acme_r1',
+        maxRetries: 1,
+      }),
+    );
+
+    const storage = createD1Storage({
+      binding,
+      domains: createBackgroundTaskD1Domains({
+        binding,
+        tenantId: 'acme',
+      }),
+    });
+    await storage.init();
+    const pubsub = createHostPubSub();
+    const mastra = new Mastra({ storage, pubsub });
+    const hostPubsub = mastra.pubsub as ReturnType<typeof createHostPubSub>;
+    const execute = vi.fn(async () => ({ recovered: true }));
+    const host = new BackgroundTaskHost({
+      mastra,
+      pubsub: hostPubsub,
+      execution: { tenantId: 'acme' },
+      executors: { longResearch: { execute } },
+    });
+
+    let booted = false;
+    try {
+      await host.boot();
+      booted = true;
+      await vi.waitFor(
+        async () => {
+          expect(
+            (await host.manager.getTask('retryable-execution'))?.status,
+          ).toBe('completed');
+        },
+        { timeout: 5_000, interval: 10 },
+      );
+      expect(execute).toHaveBeenCalledTimes(1);
+    } finally {
+      if (booted) await host.shutdown();
+    }
   });
 });
