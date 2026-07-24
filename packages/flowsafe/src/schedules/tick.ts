@@ -579,9 +579,8 @@ export function createScheduleTick(
       return;
     }
     // The run WAS dispatched. Record it as `published` (write-once at dispatch,
-    // per core's ScheduleTriggerOutcome doc). If THIS bookkeeping throws it
-    // propagates to the loop's per-schedule catch (logged, `fired` already
-    // counted) rather than masquerading as a start failure.
+    // per core's ScheduleTriggerOutcome doc). Bookkeeping failures are logged
+    // locally and do not reclassify the successful dispatch as a start failure.
     const dispatchedRunId = summary.runId ?? firedRunId;
     result.fired += 1;
     try {

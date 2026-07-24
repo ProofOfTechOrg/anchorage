@@ -180,6 +180,15 @@ const PUBLISH_CONNECTOR = 'demo-publisher';
  */
 const SYSTEM_ACTOR_ID = 'demo-worker';
 
+function requiredToolProviderOptions(modelId: string | undefined) {
+  // DeepSeek V4 defaults to thinking mode, which rejects toolChoice=required.
+  // Disable thinking for this function-calling proof, matching the provider's
+  // documented request option. Other providers receive no DeepSeek metadata.
+  return modelId?.startsWith('deepseek/')
+    ? { deepseek: { thinking: { type: 'disabled' as const } } }
+    : undefined;
+}
+
 // LOCAL-ONLY spike identities (wrangler dev; never deployed). One tenant so
 // every probe sees the same queue; ids/roles chosen so spike-verify.mjs can
 // exercise RBAC, the grant loop, and separation of duties:
@@ -647,7 +656,10 @@ export class DemoThread extends ThreadDurableObject<Env> {
         : {}),
     };
     const write = createConnector({
-      id: 'spike.recordWrite',
+      // Agent approval payloads carry the provider-visible tool name. Keep the
+      // connector id provider-safe so Mastra does not rewrite it and the
+      // approved record grants the exact id the breakwater gate checks.
+      id: 'spike_recordWrite',
       description: 'Record the required durable-agent write exactly once',
       inputSchema: z.object({ value: z.string().optional() }),
       outputSchema: z.object({ recorded: z.boolean() }),
@@ -672,16 +684,16 @@ export class DemoThread extends ThreadDurableObject<Env> {
       },
       permissions: { sideEffect: 'write' },
       policies: {
-        writePermissions: { requireApproval: ['spike.recordWrite'] },
+        writePermissions: { requireApproval: ['spike_recordWrite'] },
       },
     });
     const bare = new Agent({
       id: 'spike-live-agent',
       name: 'spike-live-agent',
       instructions:
-        'You must call spike.recordWrite exactly once. Do not answer before using it.',
+        'You must call spike_recordWrite exactly once. Do not answer before using it.',
       model,
-      tools: { 'spike.recordWrite': write },
+      tools: { spike_recordWrite: write },
       defaultOptions: { toolChoice: 'required' },
     });
     this.#mastra = new Mastra({
@@ -694,7 +706,10 @@ export class DemoThread extends ThreadDurableObject<Env> {
       runtime: scope.init.runtime,
       pubsub: scope.init.pubsub,
       threadRuntime: this.#mastra.agentThreadStreamRuntime,
-      maxSteps: 3,
+      // toolChoice=required applies to every model step. One step guarantees
+      // the proof requests exactly one write instead of forcing another tool
+      // call after the approved result.
+      maxSteps: 1,
     });
     return this.#durableAgent;
   }
@@ -775,9 +790,13 @@ export class DemoThread extends ThreadDurableObject<Env> {
       input.threaded === false || input.resourceId === undefined
         ? undefined
         : { thread: scope.threadId, resource: input.resourceId };
+    const providerOptions = requiredToolProviderOptions(
+      this.env.SPIKE_LLM_MODEL_ID,
+    );
     await agent.stream(content as never, {
       runId: input.runId,
       toolChoice: 'required',
+      ...(providerOptions ? { providerOptions } : {}),
       ...(memory ? { memory } : {}),
     });
     const summary = await this.#bridge(scope, input.runId, memory?.resource);
@@ -836,7 +855,6 @@ export class DemoThread extends ThreadDurableObject<Env> {
     });
     const input = snapshot?.context.input as
       | {
-          __workflowKind?: unknown;
           messageListState?: {
             memoryInfo?: { threadId?: unknown; resourceId?: unknown } | null;
           };
@@ -847,7 +865,24 @@ export class DemoThread extends ThreadDurableObject<Env> {
       ? memoryInfo?.threadId === scope.threadId &&
         memoryInfo.resourceId === resourceId
       : memoryInfo === null;
-    if (input?.__workflowKind !== 'durable-agent' || !matches) {
+    // loadWorkflowSnapshot already selects the durable-agentic-loop workflow.
+    // Core's input type carries __workflowKind, but the persisted context.input
+    // projection drops that marker; the credentialed restart proof pins this
+    // actual shape. The tenant-owned memory binding is the host route's check.
+    if (!matches) {
+      console.error(
+        JSON.stringify({
+          type: 'spike-agent-snapshot-binding-mismatch',
+          runId,
+          expected: {
+            threadId: scope.threadId,
+            resourceId: resourceId ?? null,
+          },
+          actual: {
+            memoryInfo: memoryInfo ?? null,
+          },
+        }),
+      );
       throw new Error(
         'agent snapshot memory binding does not match its thread',
       );

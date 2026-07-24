@@ -1180,7 +1180,8 @@ async function main() {
         body,
       );
       // An idle-wake RESERVED a run; the thread now reads ACTIVE in THIS isolate's
-      // pubsub-keyed registry (no LLM — Track A's real-loop drive is deferred).
+      // pubsub-keyed registry. This deterministic probe uses the reserve agent;
+      // spike:verify:llm exercises the credentialed real loop separately.
       assert(
         typeof body.activeRunId === 'string',
         'thread reads ACTIVE after the reserve (activeRunId present)',
@@ -1229,7 +1230,8 @@ async function main() {
   // Prove the goal objective surface writes the mastra_thread_state domain and
   // that the DURABLE goal-step read path (resolveGoalStore -> readObjective over
   // the COMPOSED storage) reads it back — including across a workerd restart (the
-  // DO-eviction analog). No LLM: the real goal LOOP is Track A's deferred residual.
+  // DO-eviction analog). The deterministic gate does not need a model; the
+  // credentialed durable-agent loop has its own spike:verify:llm proof.
   const GOAL_OBJECTIVE = 'ship the launch checklist';
   let goalRecord;
   await step(

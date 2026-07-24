@@ -12,14 +12,19 @@ import type { DurableObjectState } from '@cloudflare/workers-types';
 import type { Agent } from '@mastra/core/agent';
 import { InMemoryStore } from '@mastra/core/storage';
 import { describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 
+import { d1DatabaseLike, openSqlite } from '../../test-support/sqlite.js';
 import { RUNTIME_DRIVEN_AGENT } from '../agent-runner/index.js';
 import type { ApprovalActor, TenantContext } from '../approval-api/index.js';
 import {
+  createD1Storage,
   type InitResult,
   init,
   mintResourceId,
   mintThreadId,
+  purgeTenant,
+  type SnapshotDatabase,
   ThreadDurableObject,
   type ThreadScope,
 } from '../do-runner/index.js';
@@ -173,6 +178,66 @@ describe('signal ingestion — full chain (router → topology → thread DO →
       expect.objectContaining({ runId: expect.stringMatching(/^acme_/) }),
     );
     expect(targets).toHaveLength(0);
+  });
+
+  it("reaps the real snapshot created by an idle wake during the tenant's offboarding purge", async () => {
+    // #given — a real D1-backed runtime behind the host-owned idle-start seam
+    const sqlite = openSqlite();
+    const binding = d1DatabaseLike(sqlite);
+    const storage = createD1Storage({ binding: binding as never });
+    const { createWorkflow, createStep, runtime } = init({ storage });
+    const complete = createStep({
+      id: 'complete',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      execute: async () => ({}),
+    });
+    createWorkflow({
+      id: 'idle-wake',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(complete)
+      .commit();
+
+    const { agent } = reserveAgent();
+    let startedRunId: string | undefined;
+    const startIdleRun: StartIdleRun = async ({ runId }) => {
+      startedRunId = runId;
+      return runtime.start('idle-wake', { runId, inputData: {} });
+    };
+    const topology = createThreadTopology(
+      threadNamespace({
+        agent,
+        consultRunCap: async () => true,
+        startIdleRun,
+      }),
+    );
+    const router = createSignalRouter({
+      resolve: async () => tenantCtx(),
+      topology,
+    });
+
+    // #when — the production wake path mints the run id and persists its
+    // workflow snapshot through the real Mastra D1 adapter
+    const res = await router(wake(THREAD_ID));
+
+    // #then — INV-1 places that exact row inside purgeTenant's range
+    expect(res?.status).toBe(200);
+    expect(startedRunId).toMatch(/^acme_/);
+    expect(
+      sqlite
+        .prepare('SELECT run_id FROM mastra_workflow_snapshot WHERE run_id = ?')
+        .all(startedRunId),
+    ).toEqual([{ run_id: startedRunId }]);
+
+    const purged = await purgeTenant(binding as SnapshotDatabase, {
+      tenantId: 'acme',
+    });
+    expect(purged.snapshots).toBe(1);
+    expect(
+      sqlite.prepare('SELECT run_id FROM mastra_workflow_snapshot').all(),
+    ).toEqual([]);
   });
 
   it('degrades the wake to persist when the tenant is over its run cap', async () => {

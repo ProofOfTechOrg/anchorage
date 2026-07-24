@@ -35,10 +35,12 @@ export type ResumeRunFn = (
  * The connector ids a suspended step's decision should mint. A workflow STEP
  * gate declares them explicitly in a `connectors` array. An AGENT gate (Track A,
  * R-003) declares none — it names the tool the model called by `toolName` (both
- * durable suspend shapes), which IS the breakwater connector id the write gate
- * checks; agentGateConnectors derives [toolName] so an approved agent gate mints
- * the grant for exactly that connector and the round-trip closes. The explicit
- * array wins when present, so workflow gates are unaffected.
+ * durable suspend shapes). For automatic grant derivation, that provider-visible
+ * name MUST already be the breakwater connector's provider-safe id
+ * (`[A-Za-z0-9_-]+`); providers can rewrite punctuation-bearing ids and the
+ * suspend payload carries no reversible original-id field. agentGateConnectors
+ * derives [toolName] so an approved agent gate mints exactly that connector's
+ * grant. The explicit array wins when present, so workflow gates are unaffected.
  *
  * ACCEPTED RISK (narrow): the agent fallback is a workflow-agnostic shape sniff —
  * a suspend payload has no workflowId to prove it came from the durable loop. A

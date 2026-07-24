@@ -420,7 +420,8 @@ cross-tenant fail-closed) + an E-S1 integration test. The minimal `deploy/`
 template stays unwired (it has no thread DO, the Track C/D/F precedent). Absent
 binding/secret ⇒ byte-identical.
 
-Long-running-agent residual closeout (2026-07-20, uncommitted worktree based on
+Long-running-agent residual closeout (2026-07-20, implementation commits
+`eca3b6e` + `51e602c`, based on
 `b942d9a76d005668628f60f9295492096097dff6`): the spike's per-thread DO now
 hosts a real runtime-driven durable agent. Starts register with Mastra's public
 thread runtime; approval records may carry a server-only, tenant-validated
@@ -430,7 +431,10 @@ agent schedules, and `createNotificationDispatchTick` all route through the same
 thread topology. The live proof is separate from the deterministic CI spike:
 `pnpm --filter @proofoftech/flowsafe spike:verify:llm`, with required
 `SPIKE_LLM_MODEL_ID` (`provider/model`) and `SPIKE_LLM_API_KEY`, plus optional
-`SPIKE_LLM_BASE_URL`. Track B execution is enabled through
+`SPIKE_LLM_BASE_URL`; `DEEPSEEK_MODEL` + `DEEPSEEK_API_KEY` are accepted aliases.
+The 2026-07-24 DeepSeek V4 Pro pass also pins the provider boundary: required
+tool calls disable thinking, automatic agent grants use a provider-safe connector
+id, and the one-step proof cannot request a duplicate write. Track B execution is enabled through
 `createBackgroundTaskD1Domains` and `BackgroundTaskHost.execution`, one manager
 per tenant DO. The serialized D1 workflow adapter, tenant-scoped task domain,
 store/TTL/offboarding snapshot cascades, and workerd restart proof close

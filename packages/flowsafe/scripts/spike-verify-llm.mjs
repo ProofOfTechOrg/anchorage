@@ -11,8 +11,12 @@ const WRANGLER = join(FLOWSAFE, 'node_modules/.bin/wrangler');
 const CONFIG = join(FLOWSAFE, 'spike/wrangler.jsonc');
 const PORT = Number(process.env.SPIKE_LLM_PORT ?? 8801);
 const BASE = `http://127.0.0.1:${PORT}`;
-const MODEL_ID = process.env.SPIKE_LLM_MODEL_ID;
-const API_KEY = process.env.SPIKE_LLM_API_KEY;
+const MODEL_ID =
+  process.env.SPIKE_LLM_MODEL_ID ??
+  (process.env.DEEPSEEK_MODEL
+    ? `deepseek/${process.env.DEEPSEEK_MODEL}`
+    : undefined);
+const API_KEY = process.env.SPIKE_LLM_API_KEY ?? process.env.DEEPSEEK_API_KEY;
 const BASE_URL = process.env.SPIKE_LLM_BASE_URL;
 const AUTH = {
   operator: { authorization: 'Bearer spike-operator' },
@@ -22,7 +26,7 @@ const AUTH = {
 
 if (!MODEL_ID?.includes('/') || !API_KEY) {
   throw new Error(
-    'SPIKE_LLM_MODEL_ID (provider/model) and SPIKE_LLM_API_KEY are required; SPIKE_LLM_BASE_URL is optional',
+    'SPIKE_LLM_MODEL_ID (provider/model) and SPIKE_LLM_API_KEY are required; DEEPSEEK_MODEL plus DEEPSEEK_API_KEY are accepted aliases; SPIKE_LLM_BASE_URL is optional',
   );
 }
 
@@ -47,6 +51,13 @@ const assert = (condition, message, detail) => {
     );
   }
 };
+
+function workerdDiagnostics() {
+  return server.output
+    .join('')
+    .replaceAll(API_KEY, '[REDACTED]')
+    .slice(-20_000);
+}
 
 async function request(method, path, options = {}) {
   const response = await fetch(`${BASE}${path}`, {
@@ -143,19 +154,28 @@ async function stop() {
 
 async function waitSuspended(ids) {
   const deadline = Date.now() + 180_000;
+  let lastStatus;
   while (Date.now() < deadline) {
     const status = await request(
       'GET',
       `/agent/live/status?threadId=${encodeURIComponent(ids.threadId)}&resourceId=${encodeURIComponent(ids.resourceId)}&runId=${encodeURIComponent(ids.runId)}`,
       { headers: AUTH.operator },
     );
+    lastStatus = status;
     if (status.body?.status === 'suspended')
       return { ...ids, summary: status.body };
     if (status.body?.status === 'failed')
       throw new Error(`agent failed: ${JSON.stringify(status.body)}`);
+    if (status.body?.status === 'success') {
+      throw new Error(
+        `agent completed without the required approval suspension: ${JSON.stringify(status.body)}`,
+      );
+    }
     await sleep(500);
   }
-  throw new Error(`agent did not suspend: ${JSON.stringify(ids)}`);
+  throw new Error(
+    `agent did not suspend: ${JSON.stringify({ ...ids, lastStatus, workerdOutput: workerdDiagnostics() })}`,
+  );
 }
 
 async function startSuspended() {
@@ -225,7 +245,8 @@ try {
   });
   await sleep(500);
   assert(
-    rawResume.status === 200 && rawResume.body?.status === 'failed',
+    rawResume.status === 404 &&
+      String(rawResume.body?.error ?? '').includes('unknown workflow'),
     'raw resume did not fail closed',
     rawResume,
   );
@@ -239,14 +260,12 @@ try {
     body: forged,
   });
   await sleep(500);
+  const forgedResult = JSON.stringify(forgedResume.body);
   assert(
     forgedResume.status === 200 &&
-      forgedResume.body?.status === 'failed' &&
-      String(forgedResume.body?.error ?? '').includes(
-        'approval required and not granted',
-      ),
+      forgedResult.includes('approval required and not granted'),
     'prepared forged resume did not fail at the connector approval gate',
-    forgedResume,
+    { forgedResume, workerdOutput: workerdDiagnostics() },
   );
   assert(
     (await effects()) === 0,
@@ -262,6 +281,12 @@ try {
   assert(
     approval?.resumeTarget?.threadId === actual.threadId,
     'trusted resume target missing',
+    approval,
+  );
+  assert(
+    approval.connectors?.length === 1 &&
+      approval.connectors[0] === 'spike_recordWrite',
+    'approval did not grant the provider-safe connector id',
     approval,
   );
 

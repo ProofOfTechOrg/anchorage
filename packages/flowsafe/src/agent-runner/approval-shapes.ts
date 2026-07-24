@@ -11,13 +11,14 @@
 // Both carry `resumeLabel: toolCallId` and a `{ approved: boolean }` resume
 // schema. A workflow STEP gate declares its own grants in an explicit
 // `connectors` array; an AGENT gate instead names the tool the model wants to
-// call by `toolName` — which IS the breakwater connector id the write gate
-// checks: createConnector wraps createTool({ id }), the `toolName` the model
-// calls equals that id, and that id is the string approvalGranted() looks up in
-// `breakwater.approvedConnectors` (connector-sdk index.ts). So an approved
-// agent gate must mint a grant for [toolName]; agentGateConnectors() feeds that
-// round-trip and the runtime's approvalGrantProvider derives the grant from the
-// APPROVED record's connectors on resume.
+// call by its provider-visible `toolName`. For a breakwater connector this must
+// be the SAME provider-safe id (`[A-Za-z0-9_-]+`) the write gate checks.
+// Providers rewrite punctuation-bearing ids such as `salesforce.createContact`
+// before returning a tool call, and that rewrite is not reversible in the
+// suspend payload. Hosts using automatic agent-gate grants must therefore give
+// those connectors provider-safe ids. agentGateConnectors() mints [toolName],
+// and the runtime's approvalGrantProvider derives that exact grant from the
+// APPROVED record on resume.
 //
 // Pure and dependency-free (no @mastra import): it inspects a plain payload
 // object only, so the record-creation/bridge path (host-kit/approval-bridge.ts)
@@ -26,6 +27,8 @@
 
 /** The suspend-payload `type` discriminator core stamps on an approval gate. */
 export const AGENT_APPROVAL_SUSPEND_TYPE = 'approval';
+
+const PROVIDER_SAFE_TOOL_NAME = /^[A-Za-z0-9_-]+$/;
 
 /** The tool-call identity parsed out of an agent approval suspend payload. */
 export interface AgentApprovalSuspend {
@@ -83,7 +86,8 @@ export function parseAgentApprovalSuspend(
 
 /**
  * The breakwater connector ids an approved agent gate should grant: the single
- * tool the model called (== the connector id the write gate checks). Requires
+ * provider-safe tool id the model called (== the connector id the write gate
+ * checks; see the file header's provider-rewrite constraint). Requires
  * BOTH a non-empty `toolName` AND a non-empty `toolCallId` — a real
  * durable-agent gate always carries both (toolCallId is the suspend's
  * `resumeLabel`), so demanding both never rejects a real gate while narrowing
@@ -97,6 +101,7 @@ export function agentGateConnectors(payload: unknown): string[] {
   const parsed = parseAgentApprovalSuspend(payload);
   return parsed?.toolName !== undefined &&
     parsed.toolName.length > 0 &&
+    PROVIDER_SAFE_TOOL_NAME.test(parsed.toolName) &&
     parsed.toolCallId !== undefined &&
     parsed.toolCallId.length > 0
     ? [parsed.toolName]
