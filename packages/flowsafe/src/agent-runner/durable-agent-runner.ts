@@ -231,16 +231,18 @@ export class FlowsafeDurableAgent<
   > {
     this.#assertCallerRunId(options?.runId);
     const result = await super.stream(messages, options);
-    await this.#threadRuntime?.registerRun(
-      this as unknown as Parameters<
-        Mastra['agentThreadStreamRuntime']['registerRun']
-      >[0],
-      result.output,
-      (options ?? {}) as Parameters<
-        Mastra['agentThreadStreamRuntime']['registerRun']
-      >[2],
-      this.pubsub,
-    );
+    if (!options?.untilIdle) {
+      await this.#threadRuntime?.registerRun(
+        this as unknown as Parameters<
+          Mastra['agentThreadStreamRuntime']['registerRun']
+        >[0],
+        result.output,
+        (options ?? {}) as Parameters<
+          Mastra['agentThreadStreamRuntime']['registerRun']
+        >[2],
+        this.pubsub,
+      );
+    }
     return result;
   }
 
@@ -303,23 +305,57 @@ export class FlowsafeDurableAgent<
       Parameters<DurableAgent<TAgentId, TTools, TOutput>['prepare']>[1]
     >);
     const observed = await this.observe(options.runId);
-    await this.#threadRuntime?.registerRun(
-      this as unknown as Parameters<
-        Mastra['agentThreadStreamRuntime']['registerRun']
-      >[0],
-      observed.output,
-      {
-        runId: options.runId,
-        ...(options.memory !== undefined ? { memory: options.memory } : {}),
-      } as Parameters<Mastra['agentThreadStreamRuntime']['registerRun']>[2],
-      this.pubsub,
-    );
-    return this.#runtime.resume(this.getWorkflow().id, options.runId, {
-      ...(options.step !== undefined ? { step: options.step } : {}),
-      ...(options.resumeData !== undefined
-        ? { resumeData: options.resumeData }
-        : {}),
-    });
+    const emitTerminalError = async (error: unknown): Promise<void> => {
+      try {
+        await this.emitError(
+          options.runId,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      } catch (publicationError) {
+        console.error(
+          JSON.stringify({
+            type: 'durable-agent-resume-error-publication-failed',
+            runId: options.runId,
+            error:
+              publicationError instanceof Error
+                ? publicationError.message
+                : String(publicationError),
+          }),
+        );
+      }
+    };
+    try {
+      await this.#threadRuntime?.registerRun(
+        this as unknown as Parameters<
+          Mastra['agentThreadStreamRuntime']['registerRun']
+        >[0],
+        observed.output,
+        {
+          runId: options.runId,
+          ...(options.memory !== undefined ? { memory: options.memory } : {}),
+        } as Parameters<Mastra['agentThreadStreamRuntime']['registerRun']>[2],
+        this.pubsub,
+      );
+      const summary = await this.#runtime.resume(
+        this.getWorkflow().id,
+        options.runId,
+        {
+          ...(options.step !== undefined ? { step: options.step } : {}),
+          ...(options.resumeData !== undefined
+            ? { resumeData: options.resumeData }
+            : {}),
+        },
+      );
+      if (summary.status === 'failed') {
+        await emitTerminalError(
+          new Error(summary.error ?? 'Durable agent workflow resume failed'),
+        );
+      }
+      return summary;
+    } catch (error) {
+      await emitTerminalError(error);
+      throw error;
+    }
   }
 
   /**

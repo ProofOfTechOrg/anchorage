@@ -26,4 +26,8 @@ host bridge stores the server-only, tenant-validated `ApprovalResumeTarget`
 separately from reviewer input so approval resume can route back to the owning
 thread DO. After DO eviction, `resumeViaRuntime()` calls
 `DurableAgent.prepare()` first (the snapshot's `messageListState` wins), then
-observes/registers the run before `runtime.resume`.
+observes/registers the run before `runtime.resume`. The outer aggregate
+`untilIdle` stream is deliberately not registered; core's recursive concrete
+turns register individually. Once observation exists, registration/resume
+throws and returned failed summaries publish a terminal stream error so the
+thread runtime cannot remain falsely active.

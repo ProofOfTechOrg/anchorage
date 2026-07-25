@@ -36,6 +36,29 @@ describe('backgroundTasksStore — fail-closed accessor', () => {
 });
 
 describe('D1 execution domains', () => {
+  it.each([
+    '',
+    'bad tenant',
+    'bad/tenant',
+    'bad_tenant',
+    'a'.repeat(129),
+  ])('rejects an unmintable tenant synchronously: %j', (tenantId) => {
+    const binding = d1DatabaseLike(openSqlite()) as never;
+    expect(() =>
+      createBackgroundTaskD1Domains({ binding, tenantId }),
+    ).toThrow();
+  });
+
+  it('rejects a non-string tenant at the runtime boundary', () => {
+    const binding = d1DatabaseLike(openSqlite()) as never;
+    expect(() =>
+      createBackgroundTaskD1Domains({
+        binding,
+        tenantId: 123 as unknown as string,
+      }),
+    ).toThrow();
+  });
+
   it('serializes partial workflow updates and reports concurrent-update support', async () => {
     const binding = d1DatabaseLike(openSqlite()) as never;
     const storage = createD1Storage({

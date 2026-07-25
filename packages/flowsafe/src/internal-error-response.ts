@@ -5,7 +5,11 @@ function errorText(error: unknown): string {
 }
 
 /** Package-internal catch-all for public HTTP routes. */
-export function internalErrorResponse(route: string, error: unknown): Response {
+export function internalErrorResponse(
+  route: string,
+  error: unknown,
+  status: 500 | 502 = 500,
+): Response {
   console.error(
     JSON.stringify({
       type: 'route-internal-error',
@@ -14,7 +18,7 @@ export function internalErrorResponse(route: string, error: unknown): Response {
     }),
   );
   return new Response(JSON.stringify({ error: 'internal error' }), {
-    status: 500,
+    status,
     headers: {
       'content-type': 'application/json',
       'cache-control': 'no-store',

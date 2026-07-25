@@ -1,34 +1,33 @@
 // Credentialed closeout proof for the real per-thread durable-agent loop.
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  createSpikeServerLifecycle,
+  parseLlmSpikeConfig,
+  parseSpikePort,
+} from './spike-server-lifecycle.mjs';
 
 const FLOWSAFE = dirname(dirname(fileURLToPath(import.meta.url)));
 const WRANGLER = join(FLOWSAFE, 'node_modules/.bin/wrangler');
 const CONFIG = join(FLOWSAFE, 'spike/wrangler.jsonc');
-const PORT = Number(process.env.SPIKE_LLM_PORT ?? 8801);
+const PORT = parseSpikePort(
+  process.env.SPIKE_LLM_PORT ?? 8801,
+  'SPIKE_LLM_PORT',
+);
 const BASE = `http://127.0.0.1:${PORT}`;
-const MODEL_ID =
-  process.env.SPIKE_LLM_MODEL_ID ??
-  (process.env.DEEPSEEK_MODEL
-    ? `deepseek/${process.env.DEEPSEEK_MODEL}`
-    : undefined);
-const API_KEY = process.env.SPIKE_LLM_API_KEY ?? process.env.DEEPSEEK_API_KEY;
-const BASE_URL = process.env.SPIKE_LLM_BASE_URL;
+const {
+  modelId: MODEL_ID,
+  apiKey: API_KEY,
+  baseUrl: BASE_URL,
+} = parseLlmSpikeConfig(process.env);
 const AUTH = {
   operator: { authorization: 'Bearer spike-operator' },
   reviewer: { authorization: 'Bearer spike-reviewer' },
   viewer: { authorization: 'Bearer spike-viewer' },
 };
-
-if (!MODEL_ID?.includes('/') || !API_KEY) {
-  throw new Error(
-    'SPIKE_LLM_MODEL_ID (provider/model) and SPIKE_LLM_API_KEY are required; DEEPSEEK_MODEL plus DEEPSEEK_API_KEY are accepted aliases; SPIKE_LLM_BASE_URL is optional',
-  );
-}
 
 const stateDir = mkdtempSync(join(tmpdir(), 'flowsafe-llm-spike-'));
 const envFile = join(stateDir, '.dev.vars');
@@ -42,6 +41,7 @@ writeFileSync(
   { mode: 0o600 },
 );
 let server;
+const serverLifecycle = createSpikeServerLifecycle({ port: PORT });
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const assert = (condition, message, detail) => {
@@ -113,42 +113,13 @@ function start() {
   return { child, output };
 }
 
-async function portOpen() {
-  return new Promise((resolve) => {
-    const socket = net.connect({ port: PORT, host: '127.0.0.1' });
-    socket.setTimeout(500);
-    socket.once('connect', () => {
-      socket.destroy();
-      resolve(true);
-    });
-    const closed = () => {
-      socket.destroy();
-      resolve(false);
-    };
-    socket.once('error', closed);
-    socket.once('timeout', closed);
-  });
-}
-
-async function waitReady() {
-  const deadline = Date.now() + 90_000;
-  while (Date.now() < deadline) {
-    if (await portOpen()) return;
-    if (server.child.exitCode !== null) {
-      throw new Error(`wrangler exited early: ${server.output.join('')}`);
-    }
-    await sleep(250);
-  }
-  throw new Error(`wrangler did not listen: ${server.output.join('')}`);
+async function launch() {
+  server = await serverLifecycle.start('llm-spike', start, 90_000);
 }
 
 async function stop() {
   if (!server) return;
-  try {
-    process.kill(-server.child.pid, 'SIGKILL');
-  } catch {}
-  const deadline = Date.now() + 15_000;
-  while ((await portOpen()) && Date.now() < deadline) await sleep(200);
+  await serverLifecycle.stop();
   server = undefined;
 }
 
@@ -200,11 +171,11 @@ async function effects() {
 }
 
 try {
+  await serverLifecycle.preflight();
   console.log(
     '> start workerd and drive three real model tool calls to suspension',
   );
-  server = start();
-  await waitReady();
+  await launch();
   const actual = await startSuspended();
   const raw = await startSuspended();
   const forged = await startSuspended();
@@ -212,8 +183,7 @@ try {
 
   console.log('> kill workerd and restart on persisted D1');
   await stop();
-  server = start();
-  await waitReady();
+  await launch();
 
   console.log(
     '> due agent schedule reaches the durable thread loop and approval queue',
@@ -313,6 +283,8 @@ try {
     '\nLLM durable-agent closeout passed: suspend → kill → prepare → approve → exactly-once write.',
   );
 } finally {
-  await stop();
-  rmSync(stateDir, { recursive: true, force: true });
+  await serverLifecycle.cleanup(() => {
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+  server = undefined;
 }

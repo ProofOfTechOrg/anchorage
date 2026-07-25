@@ -83,6 +83,36 @@ interface GoalRecord {
 }
 
 describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
+  it.each([
+    { maxRunsCap: 0 },
+    { maxRunsCap: 1.5 },
+    { maxRunsCap: Number.NaN },
+    { maxContentBytes: -1 },
+    { maxContentBytes: Number.POSITIVE_INFINITY },
+  ])('rejects invalid numeric configuration synchronously: %o', (numeric) => {
+    const { store } = memoryStore();
+    expect(() =>
+      createObjectiveRouter({
+        resolve: async () => tenantCtx('operator'),
+        store,
+        ...numeric,
+      }),
+    ).toThrow(RangeError);
+  });
+
+  it('accepts a zero body cap and rejects a non-empty mutation body', async () => {
+    const { store } = memoryStore();
+    const router = createObjectiveRouter({
+      resolve: async () => tenantCtx('operator'),
+      store,
+      maxContentBytes: 0,
+    });
+    expect(
+      (await router(req('PUT', OWNED_THREAD, { objective: 'ship it' })))
+        ?.status,
+    ).toBe(413);
+  });
+
   it('returns null for a non-goal path (composes ahead of others)', async () => {
     const { store } = memoryStore();
     const router = createObjectiveRouter({

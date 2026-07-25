@@ -62,6 +62,54 @@ async function seededD1(): Promise<MastraCompositeStore> {
 }
 
 describe('BackgroundTaskHost — wiring', () => {
+  it.each([
+    { globalConcurrency: -1 },
+    { perAgentConcurrency: 1.5 },
+    { defaultTimeoutMs: 0 },
+    { progressThrottleMs: Number.NaN },
+    { waitTimeoutMs: Number.POSITIVE_INFINITY },
+    { defaultRetries: { maxRetries: Number.MAX_SAFE_INTEGER + 1 } },
+    { defaultRetries: { retryDelayMs: -1 } },
+    { defaultRetries: { maxRetryDelayMs: 0.5 } },
+    { defaultRetries: { backoffMultiplier: -0.1 } },
+    { cleanup: { completedTtlMs: -1 } },
+    { cleanup: { failedTtlMs: Number.NaN } },
+    { cleanup: { cleanupIntervalMs: 0 } },
+  ])('rejects invalid manager configuration synchronously: %o', (manager) => {
+    expect(
+      () =>
+        new BackgroundTaskHost({
+          mastra: new Mastra({ storage: new InMemoryStore() }),
+          pubsub: createHostPubSub(),
+          executors: {},
+          manager,
+        }),
+    ).toThrow(RangeError);
+  });
+
+  it('accepts deliberate zero concurrency, retry, TTL, and throttle values', () => {
+    expect(
+      () =>
+        new BackgroundTaskHost({
+          mastra: new Mastra({ storage: new InMemoryStore() }),
+          pubsub: createHostPubSub(),
+          executors: {},
+          manager: {
+            globalConcurrency: 0,
+            perAgentConcurrency: 0,
+            progressThrottleMs: 0,
+            defaultRetries: {
+              maxRetries: 0,
+              retryDelayMs: 0,
+              maxRetryDelayMs: 0,
+              backoffMultiplier: 0,
+            },
+            cleanup: { completedTtlMs: 0, failedTtlMs: 0 },
+          },
+        }),
+    ).not.toThrow();
+  });
+
   it('boot() re-registers the static executors (survives DO eviction, DL-015)', async () => {
     // #given
     const executor: ToolExecutor = { execute: async () => ({ done: true }) };

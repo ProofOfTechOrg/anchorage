@@ -35,6 +35,7 @@
 // context is DROPPED entirely (strictly more fail-closed); a local-runtime host
 // can apply the tick-provided requestContext.
 
+import { ScheduleInputSchema } from '@mastra/core/schedules';
 import { computeNextFireAt } from '@mastra/core/workflows';
 import {
   BREAKWATER_ACTOR_KEY,
@@ -48,6 +49,7 @@ import {
   tenantOwnsSaltedId,
 } from '../do-runner/index.js';
 import { GOAL_REQUEST_CONTEXT_KEY } from '../goals/objective-routes.js';
+import { nonnegativeSafeInteger } from '../numeric-config.js';
 import type { Schedule, ScheduleTrigger } from './schedules-d1.js';
 
 /** The `breakwater.` namespace prefix — every runtime-owned key starts with it. */
@@ -68,6 +70,9 @@ export const RESERVED_SCHEDULE_CONTEXT_KEYS: readonly string[] = [
   BREAKWATER_WORKFLOW_SCOPE_KEY,
   BREAKWATER_ISOLATION_SCOPE_KEY,
   GOAL_REQUEST_CONTEXT_KEY,
+  '__proto__',
+  'constructor',
+  'prototype',
 ];
 
 /**
@@ -75,11 +80,16 @@ export const RESERVED_SCHEDULE_CONTEXT_KEYS: readonly string[] = [
  * base keys AND any future breakwater key) or is core's goal key. A stored
  * schedule context carrying any of these would inject a standing capability /
  * objective into every woken run — the same stored-capability class as the
- * approval create-route leak.
+ * approval create-route leak. The three object meta-keys are also reserved so
+ * parsed JSON cannot mutate a copied context's prototype.
  */
 export function isReservedScheduleContextKey(key: string): boolean {
   return (
-    key.startsWith(BREAKWATER_KEY_PREFIX) || key === GOAL_REQUEST_CONTEXT_KEY
+    key.startsWith(BREAKWATER_KEY_PREFIX) ||
+    key === GOAL_REQUEST_CONTEXT_KEY ||
+    key === '__proto__' ||
+    key === 'constructor' ||
+    key === 'prototype'
   );
 }
 
@@ -90,7 +100,14 @@ export function stripReservedScheduleContext(
   if (!stored) return {};
   const safe: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(stored)) {
-    if (!isReservedScheduleContextKey(key)) safe[key] = value;
+    if (!isReservedScheduleContextKey(key)) {
+      Object.defineProperty(safe, key, {
+        value,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
   }
   return safe;
 }
@@ -207,7 +224,10 @@ export interface ScheduleTickOptions {
   runCap?: ScheduleTickRunCap;
   /** Every fire attempt is audited through this (accepted OR skipped/failed). Absent ⇒ no audit. */
   audit?: ScheduleTickAuditSink;
-  /** Max due schedules processed per tick pass. Default 100. */
+  /**
+   * Max due schedules processed per tick pass. Must be a nonnegative safe
+   * integer; zero is an intentional no-op. Default 100.
+   */
   limit?: number;
   /** Clock override for tests. */
   now?: () => number;
@@ -237,6 +257,97 @@ function isMintableTenant(tenantId: unknown): tenantId is string {
   }
 }
 
+function contextObject(
+  value: unknown,
+): Record<string, unknown> | undefined | null {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function normalizeAndSanitizeAgentTarget(
+  scheduleId: string,
+  stored: AgentScheduleTarget,
+): AgentScheduleTarget | undefined {
+  if (
+    typeof stored.agentId !== 'string' ||
+    stored.agentId.length === 0 ||
+    typeof stored.prompt !== 'string' ||
+    stored.prompt.length === 0 ||
+    (stored.name !== undefined && typeof stored.name !== 'string')
+  ) {
+    return undefined;
+  }
+  const legacyContext = contextObject(stored.requestContext);
+  if (legacyContext === null) return undefined;
+
+  const rawIdle = stored.ifIdle;
+  let normalizedIdle = rawIdle;
+  if (
+    rawIdle !== undefined &&
+    typeof rawIdle === 'object' &&
+    rawIdle !== null &&
+    !Array.isArray(rawIdle) &&
+    rawIdle.streamOptions !== undefined
+  ) {
+    const rawStreamOptions = rawIdle.streamOptions;
+    if (
+      typeof rawStreamOptions !== 'object' ||
+      rawStreamOptions === null ||
+      Array.isArray(rawStreamOptions)
+    ) {
+      return undefined;
+    }
+    const streamContext = contextObject(rawStreamOptions.requestContext);
+    if (streamContext === null) return undefined;
+    normalizedIdle = {
+      ...rawIdle,
+      streamOptions: {
+        ...rawStreamOptions,
+        ...(streamContext !== undefined
+          ? {
+              requestContext: stripReservedScheduleContext(streamContext),
+            }
+          : {}),
+      },
+    };
+  }
+
+  const parsed = ScheduleInputSchema.safeParse({
+    scheduleId,
+    agentId: stored.agentId,
+    prompt: stored.prompt,
+    threadId: stored.threadId,
+    resourceId: stored.resourceId,
+    signalType: stored.signalType,
+    tagName: stored.tagName,
+    attributes: stored.attributes,
+    providerOptions: stored.providerOptions,
+    ifActive: stored.ifActive,
+    ifIdle: normalizedIdle,
+  });
+  if (!parsed.success) return undefined;
+
+  const {
+    scheduleId: _scheduleId,
+    agentId,
+    prompt,
+    ...runtimeFields
+  } = parsed.data;
+  return {
+    type: 'agent',
+    agentId,
+    prompt,
+    ...(stored.name !== undefined ? { name: stored.name } : {}),
+    ...runtimeFields,
+    ...(legacyContext !== undefined
+      ? { requestContext: stripReservedScheduleContext(legacyContext) }
+      : {}),
+  };
+}
+
 /**
  * Build the schedule tick: a `() => Promise<ScheduleTickResult>` a host slots
  * into its cron dispatch as its OWN failure-isolated duty (own try/catch, own
@@ -249,7 +360,10 @@ export function createScheduleTick(
 ): () => Promise<ScheduleTickResult> {
   const { store, start } = options;
   const now = options.now ?? Date.now;
-  const limit = options.limit ?? 100;
+  const limit = nonnegativeSafeInteger(
+    options.limit ?? 100,
+    'schedule tick limit',
+  );
 
   const audit = async (
     event: Omit<ScheduleTickAuditEvent, 'type' | 'timestamp'>,
@@ -392,7 +506,29 @@ export function createScheduleTick(
         return;
       }
 
-      const target = schedule.target;
+      const target = normalizeAndSanitizeAgentTarget(
+        schedule.id,
+        schedule.target,
+      );
+      if (!target) {
+        result.failed += 1;
+        await store.recordTrigger({
+          scheduleId: schedule.id,
+          runId: null,
+          scheduledFireAt,
+          actualFireAt: at,
+          outcome: 'failed',
+          metadata: { tenantId, reason: 'invalid-agent-target' },
+        });
+        await audit({
+          scheduleId: schedule.id,
+          tenantId,
+          target: 'agent',
+          outcome: 'failed',
+          reason: 'invalid-agent-target',
+        });
+        return;
+      }
       if (
         (target.threadId !== undefined &&
           !tenantOwnsSaltedId(tenantId, target.threadId)) ||
@@ -415,6 +551,31 @@ export function createScheduleTick(
           target: 'agent',
           outcome: 'failed',
           reason: 'foreign-memory-id',
+        });
+        return;
+      }
+      if (
+        target.threadId === undefined &&
+        (target.resourceId !== undefined ||
+          target.signalType !== undefined ||
+          target.ifActive !== undefined ||
+          target.ifIdle !== undefined)
+      ) {
+        result.failed += 1;
+        await store.recordTrigger({
+          scheduleId: schedule.id,
+          runId: null,
+          scheduledFireAt,
+          actualFireAt: at,
+          outcome: 'failed',
+          metadata: { tenantId, reason: 'invalid-agent-target' },
+        });
+        await audit({
+          scheduleId: schedule.id,
+          tenantId,
+          target: 'agent',
+          outcome: 'failed',
+          reason: 'invalid-agent-target',
         });
         return;
       }
@@ -457,10 +618,9 @@ export function createScheduleTick(
           runId: firedRunId,
           topologyThreadId,
           threaded,
-          requestContext: stripReservedScheduleContext(target.requestContext),
-          streamRequestContext: stripReservedScheduleContext(
-            target.ifIdle?.streamOptions?.requestContext,
-          ),
+          requestContext: target.requestContext ?? {},
+          streamRequestContext:
+            target.ifIdle?.streamOptions?.requestContext ?? {},
         });
       } catch (error) {
         result.failed += 1;
@@ -612,6 +772,9 @@ export function createScheduleTick(
   };
 
   return async () => {
+    if (limit === 0) {
+      return { due: 0, fired: 0, skipped: 0, failed: 0, lost: 0 };
+    }
     const at = now();
     const due = await store.listDueSchedules(at, limit);
     const result: ScheduleTickResult = {

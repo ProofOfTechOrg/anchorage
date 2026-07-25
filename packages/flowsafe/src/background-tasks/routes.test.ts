@@ -5,16 +5,21 @@
 
 import type {
   BackgroundTask,
-  BackgroundTaskManager,
+  BackgroundTaskManager as BackgroundTaskManagerType,
   TaskFilter,
 } from '@mastra/core/background-tasks';
+import { BackgroundTaskManager } from '@mastra/core/background-tasks';
+import { Mastra } from '@mastra/core/mastra';
+import { InMemoryStore } from '@mastra/core/storage';
 import { describe, expect, it } from 'vitest';
 
+import { createHostPubSub } from '../do-runner/index.js';
+import { backgroundTasksStore } from './d1-storage.js';
 import { createBackgroundTaskRoutes } from './routes.js';
 
 // A minimal stand-in for BackgroundTaskManager exposing only what the routes
 // read. The routes wrap this — they must never return it over the wire.
-function stubManager(tasks: BackgroundTask[]): BackgroundTaskManager {
+function stubManager(tasks: BackgroundTask[]): BackgroundTaskManagerType {
   return {
     getTask: async (taskId: string) =>
       tasks.find((task) => task.id === taskId) ?? null,
@@ -27,7 +32,7 @@ function stubManager(tasks: BackgroundTask[]): BackgroundTaskManager {
       return { tasks: matched, total: matched.length };
     },
     stream: () => new ReadableStream({ start: (c) => c.close() }),
-  } as unknown as BackgroundTaskManager;
+  } as unknown as BackgroundTaskManagerType;
 }
 
 function task(overrides: Partial<BackgroundTask>): BackgroundTask {
@@ -208,19 +213,17 @@ describe('createBackgroundTaskRoutes', () => {
           new ReadableStream<Record<string, unknown>>({
             start(controller) {
               controller.enqueue({
-                type: 'task.running',
-                runId: 'abc_r1',
-                taskId: 'mine',
+                type: 'background-task-running',
+                payload: { runId: 'abc_r1', taskId: 'mine' },
               });
               controller.enqueue({
-                type: 'task.running',
-                runId: 'xyz_r9',
-                taskId: 'foreign',
+                type: 'background-task-running',
+                payload: { runId: 'xyz_r9', taskId: 'foreign' },
               });
               controller.close();
             },
           }),
-      } as unknown as BackgroundTaskManager;
+      } as unknown as BackgroundTaskManagerType;
       const routes = createBackgroundTaskRoutes({ manager });
       // #when — the SSE body is drained
       const res = await routes(
@@ -233,6 +236,71 @@ describe('createBackgroundTaskRoutes', () => {
       expect(text).toContain('mine');
       expect(text).not.toContain('xyz_r9');
       expect(text).not.toContain('foreign');
+    });
+
+    it('drops malformed and flat legacy chunks fail-closed', async () => {
+      const manager = {
+        stream: () =>
+          new ReadableStream<Record<string, unknown>>({
+            start(controller) {
+              controller.enqueue({
+                type: 'background-task-running',
+                runId: 'abc_r1',
+                taskId: 'flat',
+              });
+              controller.enqueue({
+                type: 'background-task-running',
+                payload: [],
+              });
+              controller.enqueue({
+                type: 'background-task-running',
+                payload: null,
+              });
+              controller.close();
+            },
+          }),
+      } as unknown as BackgroundTaskManagerType;
+      const routes = createBackgroundTaskRoutes({ manager });
+      const res = await routes(
+        get('/background-tasks/stream?runId=abc_r1'),
+        TENANT,
+      );
+
+      expect(await new Response(res?.body).text()).toBe('');
+    });
+
+    it('forwards the exact nested event shape emitted by the real manager stream', async () => {
+      const storage = new InMemoryStore();
+      const mastra = new Mastra({ storage });
+      const manager = new BackgroundTaskManager({ enabled: true });
+      manager.__registerMastra(mastra);
+      await manager.init(createHostPubSub());
+      const stored = await backgroundTasksStore(mastra);
+      await stored.createTask(
+        task({ id: 'real', runId: 'abc_r1', status: 'running' }),
+      );
+      const routes = createBackgroundTaskRoutes({ manager });
+
+      try {
+        const res = await routes(
+          get('/background-tasks/stream?runId=abc_r1'),
+          TENANT,
+        );
+        const reader = res?.body?.getReader();
+        const first = await reader?.read();
+        await reader?.cancel();
+        const text = new TextDecoder().decode(first?.value);
+        const serialized = text.slice('data: '.length).trim();
+        expect(JSON.parse(serialized)).toMatchObject({
+          type: 'background-task-running',
+          payload: {
+            taskId: 'real',
+            runId: 'abc_r1',
+          },
+        });
+      } finally {
+        await manager.shutdown();
+      }
     });
   });
 });

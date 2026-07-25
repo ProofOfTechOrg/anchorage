@@ -337,6 +337,51 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     expect(registerRun).toHaveBeenCalledWith(agent, output, options, pubsub);
   });
 
+  it.each([
+    ['boolean true', true],
+    ['object-valued untilIdle', { maxWaitMs: 1000 }],
+  ])('does not register the outer aggregate stream for %s', async (_label, untilIdle) => {
+    const pubsub = new EventEmitterPubSub();
+    const { runtime } = fakeRuntime({ pubsub });
+    const registerRun = vi.fn(async () => undefined);
+    const agent = createFlowsafeDurableAgent({
+      agent: testAgent(),
+      runtime,
+      cache: false,
+      threadRuntime: { registerRun } as never,
+    });
+    vi.spyOn(DurableAgent.prototype, 'stream').mockResolvedValue({
+      output: { id: 'aggregate' },
+    } as never);
+
+    await agent.stream('hello', {
+      runId: 'acme_run1',
+      untilIdle,
+    } as never);
+
+    expect(registerRun).not.toHaveBeenCalled();
+  });
+
+  it('registers a concrete stream when untilIdle is explicitly false', async () => {
+    const { runtime } = fakeRuntime();
+    const registerRun = vi.fn(async () => undefined);
+    const agent = createFlowsafeDurableAgent({
+      agent: testAgent(),
+      runtime,
+      threadRuntime: { registerRun } as never,
+    });
+    vi.spyOn(DurableAgent.prototype, 'stream').mockResolvedValue({
+      output: { id: 'concrete' },
+    } as never);
+
+    await agent.stream('hello', {
+      runId: 'acme_run1',
+      untilIdle: false,
+    } as never);
+
+    expect(registerRun).toHaveBeenCalledTimes(1);
+  });
+
   it('prepares, observes, registers, then resumes through RunnerRuntime', async () => {
     const order: string[] = [];
     const pubsub = new EventEmitterPubSub();
@@ -377,6 +422,98 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
       { step: ['tool-call'], resumeData: { approved: true } },
     );
     expect(summary).toMatchObject({ runId: 'acme_run1', status: 'success' });
+  });
+
+  it('publishes a registration failure and rethrows the original object', async () => {
+    const { runtime, resume } = fakeRuntime();
+    const original = new Error('registration failed');
+    const agent = createFlowsafeDurableAgent({
+      agent: testAgent(),
+      runtime,
+      threadRuntime: {
+        registerRun: vi.fn(async () => {
+          throw original;
+        }),
+      } as never,
+    });
+    vi.spyOn(agent, 'prepare').mockResolvedValue({} as never);
+    vi.spyOn(agent, 'observe').mockResolvedValue({
+      output: { id: 'rehydrated' },
+    } as never);
+    const emitError = vi
+      .spyOn(
+        agent as unknown as {
+          emitError: (id: string, error: Error) => Promise<void>;
+        },
+        'emitError',
+      )
+      .mockResolvedValue(undefined);
+
+    await expect(agent.resumeViaRuntime({ runId: 'acme_run1' })).rejects.toBe(
+      original,
+    );
+    expect(emitError).toHaveBeenCalledWith('acme_run1', original);
+    expect(resume).not.toHaveBeenCalled();
+  });
+
+  it('publishes a resume rejection and preserves it if publication also fails', async () => {
+    const { runtime, resume } = fakeRuntime();
+    const original = new Error('resume rejected');
+    resume.mockRejectedValue(original);
+    const agent = createFlowsafeDurableAgent({
+      agent: testAgent(),
+      runtime,
+      threadRuntime: { registerRun: vi.fn(async () => undefined) } as never,
+    });
+    vi.spyOn(agent, 'prepare').mockResolvedValue({} as never);
+    vi.spyOn(agent, 'observe').mockResolvedValue({
+      output: { id: 'rehydrated' },
+    } as never);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(
+      agent as unknown as {
+        emitError: (id: string, error: Error) => Promise<void>;
+      },
+      'emitError',
+    ).mockRejectedValue(new Error('publication failed'));
+
+    await expect(agent.resumeViaRuntime({ runId: 'acme_run1' })).rejects.toBe(
+      original,
+    );
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining('durable-agent-resume-error-publication-failed'),
+    );
+  });
+
+  it('publishes a failed resume summary and returns it', async () => {
+    const { runtime, resume } = fakeRuntime();
+    resume.mockResolvedValue({
+      runId: 'acme_run1',
+      status: 'failed',
+      error: 'resume failed',
+    } as never);
+    const agent = createFlowsafeDurableAgent({
+      agent: testAgent(),
+      runtime,
+      threadRuntime: { registerRun: vi.fn(async () => undefined) } as never,
+    });
+    vi.spyOn(agent, 'prepare').mockResolvedValue({} as never);
+    vi.spyOn(agent, 'observe').mockResolvedValue({
+      output: { id: 'rehydrated' },
+    } as never);
+    const emitError = vi
+      .spyOn(
+        agent as unknown as {
+          emitError: (id: string, error: Error) => Promise<void>;
+        },
+        'emitError',
+      )
+      .mockResolvedValue(undefined);
+
+    const summary = await agent.resumeViaRuntime({ runId: 'acme_run1' });
+
+    expect(summary).toMatchObject({ status: 'failed', error: 'resume failed' });
+    expect(emitError.mock.calls[0]?.[1]?.message).toBe('resume failed');
   });
 });
 

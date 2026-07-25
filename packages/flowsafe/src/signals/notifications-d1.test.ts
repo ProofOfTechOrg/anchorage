@@ -13,6 +13,14 @@ function store(): D1NotificationsStorage {
   return new D1NotificationsStorage(db, '');
 }
 
+function sharedStores(): [D1NotificationsStorage, D1NotificationsStorage] {
+  const db = d1DatabaseLike(openSqlite()) as unknown as SignalDatabase;
+  return [
+    new D1NotificationsStorage(db, ''),
+    new D1NotificationsStorage(db, ''),
+  ];
+}
+
 describe('D1NotificationsStorage', () => {
   it('creates and round-trips a notification with defaults', async () => {
     const s = store();
@@ -57,6 +65,81 @@ describe('D1NotificationsStorage', () => {
     expect(second.coalescedCount).toBe(2);
     const list = await s.listNotifications({ threadId: 'acme_t1' });
     expect(list).toHaveLength(1);
+  });
+
+  it('atomically coalesces two simultaneous first creates from separate adapters', async () => {
+    const [left, right] = sharedStores();
+    await Promise.all([left.init(), right.init()]);
+    const input = {
+      threadId: 'acme_t1',
+      source: 'github',
+      kind: 'ci',
+      summary: 'CI update',
+      coalesceKey: 'ci-run-9',
+    };
+
+    const created = await Promise.all([
+      left.createNotification({ ...input, attributes: { left: true } }),
+      right.createNotification({ ...input, attributes: { right: true } }),
+    ]);
+
+    expect(new Set(created.map((record) => record.id))).toHaveLength(1);
+    const listed = await left.listNotifications({ threadId: 'acme_t1' });
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.coalescedCount).toBe(2);
+    expect(listed[0]?.attributes).toEqual({ left: true, right: true });
+  });
+
+  it('preserves concurrent map merges while incrementing coalescedCount in SQL', async () => {
+    const [left, right] = sharedStores();
+    await Promise.all([left.init(), right.init()]);
+    await left.createNotification({
+      id: 'base',
+      threadId: 'acme_t1',
+      source: 'github',
+      kind: 'ci',
+      summary: 'base',
+      coalesceKey: 'ci-run-9',
+      attributes: { base: true },
+      metadata: { base: true },
+    });
+
+    await Promise.all([
+      left.createNotification({
+        threadId: 'acme_t1',
+        source: 'github',
+        kind: 'ci',
+        summary: 'left',
+        coalesceKey: 'ci-run-9',
+        attributes: { left: true },
+        metadata: { left: true },
+      }),
+      right.createNotification({
+        threadId: 'acme_t1',
+        source: 'github',
+        kind: 'ci',
+        summary: 'right',
+        coalesceKey: 'ci-run-9',
+        attributes: { right: true },
+        metadata: { right: true },
+      }),
+    ]);
+
+    const record = await left.getNotification({
+      threadId: 'acme_t1',
+      id: 'base',
+    });
+    expect(record?.coalescedCount).toBe(3);
+    expect(record?.attributes).toEqual({
+      base: true,
+      left: true,
+      right: true,
+    });
+    expect(record?.metadata).toEqual({
+      base: true,
+      left: true,
+      right: true,
+    });
   });
 
   it('does NOT coalesce across a different kind, source, or resource', async () => {
@@ -130,6 +213,55 @@ describe('D1NotificationsStorage', () => {
       status: ['delivered', 'seen'],
     });
     expect(delivered).toHaveLength(1);
+  });
+
+  it('composes disjoint concurrent updates without replacing the whole row', async () => {
+    const [left, right] = sharedStores();
+    await Promise.all([left.init(), right.init()]);
+    await left.createNotification({
+      id: 'n1',
+      threadId: 'acme_t1',
+      source: 'x',
+      kind: 'a',
+      summary: 'hi',
+    });
+
+    await Promise.all([
+      left.updateNotification({
+        threadId: 'acme_t1',
+        id: 'n1',
+        deliveryAttempts: 4,
+      }),
+      right.updateNotification({
+        threadId: 'acme_t1',
+        id: 'n1',
+        lastDeliveryError: 'temporary',
+      }),
+    ]);
+
+    expect(
+      await left.getNotification({ threadId: 'acme_t1', id: 'n1' }),
+    ).toMatchObject({
+      deliveryAttempts: 4,
+      lastDeliveryError: 'temporary',
+    });
+  });
+
+  it('treats empty status and priority arrays as filters matching nothing', async () => {
+    const s = store();
+    await s.createNotification({
+      threadId: 'acme_t1',
+      source: 'x',
+      kind: 'a',
+      summary: 'hi',
+    });
+
+    await expect(
+      s.listNotifications({ threadId: 'acme_t1', status: [] }),
+    ).resolves.toEqual([]);
+    await expect(
+      s.listNotifications({ threadId: 'acme_t1', priority: [] }),
+    ).resolves.toEqual([]);
   });
 
   it('updateNotification throws for a missing record', async () => {
@@ -264,5 +396,30 @@ describe('D1NotificationsStorage', () => {
     expect(due.map((r) => r.summary)).toEqual(['first', 'second', 'third']);
     const limited = await s.listDueNotifications({ now, limit: 2 });
     expect(limited.map((r) => r.summary)).toEqual(['first', 'second']);
+  });
+
+  it('orders by the earliest of deliverAt and summaryAt before applying the SQL limit', async () => {
+    const s = store();
+    const now = new Date('2026-01-02T00:00:00.000Z');
+    await s.createNotification({
+      id: 'both',
+      threadId: 'acme_t1',
+      source: 'x',
+      kind: 'a',
+      summary: 'both',
+      deliverAt: new Date(now.getTime() - 1_000),
+      summaryAt: new Date(now.getTime() - 9_000),
+    });
+    await s.createNotification({
+      id: 'delivery',
+      threadId: 'acme_t1',
+      source: 'x',
+      kind: 'b',
+      summary: 'delivery',
+      deliverAt: new Date(now.getTime() - 5_000),
+    });
+
+    const due = await s.listDueNotifications({ now, limit: 1 });
+    expect(due.map((record) => record.id)).toEqual(['both']);
   });
 });

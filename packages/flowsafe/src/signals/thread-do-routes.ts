@@ -42,6 +42,7 @@ import {
 import { isRuntimeDrivenAgent } from '../agent-runner/index.js';
 import { mintSaltedId, type ThreadScope } from '../do-runner/index.js';
 import { internalErrorResponse } from '../internal-error-response.js';
+import { MAX_NOTIFICATION_DISPATCH_IDS } from './notification-dispatch.js';
 
 /**
  * The idle-thread delivery behavior a send may ask for. `wake` starts a run
@@ -212,6 +213,17 @@ export function createThreadSignalRoutes(
     );
     return next;
   };
+  let notificationTail: Promise<unknown> = Promise.resolve();
+  const serializeNotification = <T>(
+    operation: () => Promise<T>,
+  ): Promise<T> => {
+    const next = notificationTail.then(operation, operation);
+    notificationTail = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  };
 
   return async (request, scope) => {
     if (request.method !== 'POST') return null;
@@ -303,31 +315,35 @@ export function createThreadSignalRoutes(
             404,
           );
         }
-        return await handleNotificationDispatch({
-          agent,
-          body,
-          threadId,
-          resourceId,
-          tenantId: scope.tenantId,
-          requestedBy: scope.requestedBy,
-          runtimeDriven,
-          consultRunCap,
-          startIdleRun,
-          serializeWake,
-          storage: await resolveNotificationsStorage(scope),
-          agentId: requestedAgentId,
-        });
+        return await serializeNotification(async () =>
+          handleNotificationDispatch({
+            agent,
+            body,
+            threadId,
+            resourceId,
+            tenantId: scope.tenantId,
+            requestedBy: scope.requestedBy,
+            runtimeDriven,
+            consultRunCap,
+            startIdleRun,
+            serializeWake,
+            storage: await resolveNotificationsStorage(scope),
+            agentId: requestedAgentId,
+          }),
+        );
       }
       // POST /signal/notification — the durable AGENT inbox (mastra_notifications).
       if (path === '/signal/notification') {
-        return await handleNotification(agent, body, threadId, resourceId);
+        return await serializeNotification(() =>
+          handleNotification(agent, body, threadId, resourceId),
+        );
       }
       return json({ error: 'not found' }, 404);
     } catch (error) {
       // A send that cannot be routed at all (e.g. an idle wake whose stream setup
       // throws — no model) rejects `accepted`; surface it as a 502 rather than a
       // 500 so a model/config fault reads distinctly from a route bug.
-      return internalErrorResponse('signals.thread', error);
+      return internalErrorResponse('signals.thread', error, 502);
     }
   };
 }
@@ -350,11 +366,12 @@ async function handleNotificationDispatch(options: {
   if (
     !Array.isArray(ids) ||
     ids.length === 0 ||
-    ids.length > 100 ||
+    ids.length > MAX_NOTIFICATION_DISPATCH_IDS ||
     !ids.every((id): id is string => typeof id === 'string' && id.length > 0)
   ) {
     return json({ error: 'notificationIds must contain 1-100 strings' }, 400);
   }
+  const uniqueIds = [...new Set(ids)];
   if (
     options.resourceId === undefined ||
     options.body.resourceId !== options.resourceId
@@ -371,17 +388,30 @@ async function handleNotificationDispatch(options: {
   }
 
   const records: NotificationRecord[] = [];
-  for (const id of ids) {
+  let skipped = 0;
+  for (const id of uniqueIds) {
     const current = await options.storage.getNotification({
       threadId: options.threadId,
       id,
     });
-    if (current?.status !== 'pending' || current.deliveredSignalId) continue;
+    if (current?.status !== 'pending' || current.deliveredSignalId) {
+      skipped += 1;
+      continue;
+    }
     if (
       current.resourceId !== options.resourceId ||
       current.agentId !== options.agentId
     ) {
       return json({ error: 'notification binding does not match' }, 404);
+    }
+    const due =
+      (current.deliverAt !== undefined &&
+        current.deliverAt.getTime() <= now.getTime()) ||
+      (current.summaryAt !== undefined &&
+        current.summaryAt.getTime() <= now.getTime());
+    if (!due) {
+      skipped += 1;
+      continue;
     }
     records.push(current);
   }
@@ -491,7 +521,11 @@ async function handleNotificationDispatch(options: {
     }
   }
 
-  return json({ delivered, failed });
+  return json({
+    delivered,
+    failed,
+    ...(skipped > 0 ? { skipped } : {}),
+  });
 }
 
 /** The reason a requested wake was refused and degraded to a durable persist. */

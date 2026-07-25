@@ -46,6 +46,11 @@ import type { Mastra } from '@mastra/core/mastra';
 
 import type { HostPubSub } from '../do-runner/index.js';
 import {
+  finiteNonnegativeNumber,
+  nonnegativeSafeInteger,
+  positiveSafeInteger,
+} from '../numeric-config.js';
+import {
   backgroundTasksStore,
   SERIALIZED_WORKFLOWS_D1,
   TENANT_SCOPED_BACKGROUND_TASKS_D1,
@@ -79,7 +84,10 @@ export interface BackgroundTaskHostOptions {
   /**
    * Manager config (core `BackgroundTaskManagerConfig` minus `enabled`, which is
    * forced on): concurrency, backpressure ('queue'|'reject'|'fallback-sync'),
-   * timeouts, retries, and `cleanup` TTLs. Omitted => core defaults.
+   * timeouts, retries, and `cleanup` TTLs. Numeric values are validated before
+   * constructing core's manager: concurrency/retry delays/TTLs/throttle are
+   * nonnegative, timeout/cleanup intervals are positive, and all integer
+   * quantities must be safe integers. Omitted => core defaults.
    */
   manager?: Omit<BackgroundTaskManagerConfig, 'enabled'>;
   /**
@@ -87,6 +95,86 @@ export interface BackgroundTaskHostOptions {
    * the persistence/recovery-only behavior.
    */
   execution?: { tenantId: string };
+}
+
+function validateManagerConfig(
+  config: Omit<BackgroundTaskManagerConfig, 'enabled'> | undefined,
+): void {
+  if (!config) return;
+  if (config.globalConcurrency !== undefined) {
+    nonnegativeSafeInteger(
+      config.globalConcurrency,
+      'backgroundTasks.manager.globalConcurrency',
+    );
+  }
+  if (config.perAgentConcurrency !== undefined) {
+    nonnegativeSafeInteger(
+      config.perAgentConcurrency,
+      'backgroundTasks.manager.perAgentConcurrency',
+    );
+  }
+  if (config.defaultTimeoutMs !== undefined) {
+    positiveSafeInteger(
+      config.defaultTimeoutMs,
+      'backgroundTasks.manager.defaultTimeoutMs',
+    );
+  }
+  if (config.progressThrottleMs !== undefined) {
+    nonnegativeSafeInteger(
+      config.progressThrottleMs,
+      'backgroundTasks.manager.progressThrottleMs',
+    );
+  }
+  if (config.waitTimeoutMs !== undefined) {
+    positiveSafeInteger(
+      config.waitTimeoutMs,
+      'backgroundTasks.manager.waitTimeoutMs',
+    );
+  }
+  const retries = config.defaultRetries;
+  if (retries?.maxRetries !== undefined) {
+    nonnegativeSafeInteger(
+      retries.maxRetries,
+      'backgroundTasks.manager.defaultRetries.maxRetries',
+    );
+  }
+  if (retries?.retryDelayMs !== undefined) {
+    nonnegativeSafeInteger(
+      retries.retryDelayMs,
+      'backgroundTasks.manager.defaultRetries.retryDelayMs',
+    );
+  }
+  if (retries?.maxRetryDelayMs !== undefined) {
+    nonnegativeSafeInteger(
+      retries.maxRetryDelayMs,
+      'backgroundTasks.manager.defaultRetries.maxRetryDelayMs',
+    );
+  }
+  if (retries?.backoffMultiplier !== undefined) {
+    finiteNonnegativeNumber(
+      retries.backoffMultiplier,
+      'backgroundTasks.manager.defaultRetries.backoffMultiplier',
+    );
+  }
+  const cleanup = config.cleanup;
+  if (cleanup?.completedTtlMs !== undefined) {
+    nonnegativeSafeInteger(
+      cleanup.completedTtlMs,
+      'backgroundTasks.manager.cleanup.completedTtlMs',
+    );
+  }
+  if (cleanup?.failedTtlMs !== undefined) {
+    nonnegativeSafeInteger(
+      cleanup.failedTtlMs,
+      'backgroundTasks.manager.cleanup.failedTtlMs',
+    );
+  }
+  if (cleanup?.cleanupIntervalMs !== undefined) {
+    positiveSafeInteger(
+      cleanup.cleanupIntervalMs,
+      'backgroundTasks.manager.cleanup.cleanupIntervalMs',
+    );
+  }
 }
 
 /**
@@ -106,6 +194,7 @@ export class BackgroundTaskHost {
   #booted?: Promise<void>;
 
   constructor(options: BackgroundTaskHostOptions) {
+    validateManagerConfig(options.manager);
     this.#mastra = options.mastra;
     this.#pubsub = options.pubsub;
     this.#executors = options.executors;

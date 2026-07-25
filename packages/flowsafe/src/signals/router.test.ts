@@ -59,6 +59,39 @@ function post(path: string, body: unknown): Request {
 }
 
 describe('createSignalRouter — the P6 ingestion gate', () => {
+  it.each([
+    -1,
+    1.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1,
+  ])('rejects an invalid body cap synchronously: %s', (maxContentBytes) => {
+    const { topology } = recordingTopology();
+    expect(() =>
+      createSignalRouter({
+        resolve: async () => tenantCtx('operator'),
+        topology,
+        maxContentBytes,
+      }),
+    ).toThrow(RangeError);
+  });
+
+  it('accepts a zero body cap and rejects every non-empty body', async () => {
+    const { topology } = recordingTopology();
+    const router = createSignalRouter({
+      resolve: async () => tenantCtx('operator'),
+      topology,
+      maxContentBytes: 0,
+    });
+    expect(
+      (
+        await router(
+          post(`/api/threads/${OWNED_THREAD}/message`, { contents: 'hi' }),
+        )
+      )?.status,
+    ).toBe(413);
+  });
+
   it('returns null for a non-signal path (composes ahead of others)', async () => {
     const { topology } = recordingTopology();
     const router = createSignalRouter({

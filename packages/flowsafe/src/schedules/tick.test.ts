@@ -12,6 +12,7 @@ import {
   isReservedScheduleContextKey,
   RESERVED_SCHEDULE_CONTEXT_KEYS,
   type ScheduleTickAuditEvent,
+  type ScheduleTickStartAgentInput,
   type ScheduleTickStore,
   stripReservedScheduleContext,
 } from './tick.js';
@@ -206,15 +207,20 @@ describe('createScheduleTick', () => {
             behavior: 'wake',
             streamOptions: {
               requestContext: { nested: true, 'mastra:goal': 'forged' },
+              unsupported: 'drop',
             },
+            unsupported: 'drop',
           },
-        },
+          unsupported: 'drop',
+        } as never,
         ownerType: 'agent',
         ownerId: 'a1',
       }),
     );
     const start = vi.fn(async (_wf, runId) => ({ runId }));
-    const startAgent = vi.fn(async () => ({ runId: 'acme_joined-run' }));
+    const startAgent = vi.fn(async (_input: ScheduleTickStartAgentInput) => ({
+      runId: 'acme_joined-run',
+    }));
 
     const result = await createScheduleTick({
       store,
@@ -234,6 +240,16 @@ describe('createScheduleTick', () => {
         streamRequestContext: { nested: true },
       }),
     );
+    const dispatched = startAgent.mock.calls[0]?.[0]?.target;
+    expect(dispatched).not.toBe(store.schedules.get('agent_a')?.target);
+    expect(JSON.stringify(dispatched)).not.toContain('unsupported');
+    expect(
+      (
+        store.schedules.get('agent_a')?.target as unknown as {
+          unsupported: string;
+        }
+      ).unsupported,
+    ).toBe('drop');
     expect(store.triggers[0]).toMatchObject({
       outcome: 'published',
       runId: 'acme_joined-run',
@@ -296,6 +312,65 @@ describe('createScheduleTick', () => {
       outcome: 'failed',
       metadata: { reason: 'foreign-memory-id' },
     });
+  });
+
+  it('consumes and audits a malformed stored agent target without dispatching it', async () => {
+    const store = new FakeStore();
+    store.seed(
+      workflowSchedule({
+        id: 'agent_malformed',
+        target: {
+          type: 'agent',
+          agentId: 'a1',
+          prompt: '',
+        },
+      }),
+    );
+    const startAgent = vi.fn();
+
+    const result = await createScheduleTick({
+      store,
+      start: vi.fn(),
+      startAgent,
+      now: () => NOW,
+    })();
+
+    expect(result).toMatchObject({ failed: 1, fired: 0 });
+    expect(startAgent).not.toHaveBeenCalled();
+    expect(store.triggers[0]).toMatchObject({
+      outcome: 'failed',
+      metadata: { tenantId: 'acme', reason: 'invalid-agent-target' },
+    });
+    expect(store.schedules.get('agent_malformed')?.nextFireAt).toBeGreaterThan(
+      NOW,
+    );
+  });
+
+  it('rejects invalid limits synchronously and treats zero as a no-op', async () => {
+    const store = new FakeStore();
+    store.seed(workflowSchedule());
+    for (const limit of [
+      -1,
+      1.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.MAX_SAFE_INTEGER + 1,
+    ]) {
+      expect(() =>
+        createScheduleTick({ store, start: vi.fn(), limit }),
+      ).toThrow(RangeError);
+    }
+    const start = vi.fn();
+    await expect(
+      createScheduleTick({ store, start, limit: 0 })(),
+    ).resolves.toEqual({
+      due: 0,
+      fired: 0,
+      skipped: 0,
+      failed: 0,
+      lost: 0,
+    });
+    expect(start).not.toHaveBeenCalled();
   });
 
   it('fails closed on an invalid/missing metadata.tenantId (no runId can be minted)', async () => {
@@ -510,6 +585,20 @@ describe('the P4 reserved-key barrier helpers', () => {
       }),
     ).toEqual({ 'my.custom': 1 });
     expect(stripReservedScheduleContext(undefined)).toEqual({});
+  });
+
+  it('drops object meta-keys parsed from JSON without changing the result prototype', () => {
+    const stored = JSON.parse(
+      '{"__proto__":{"breakwater.approvedConnectors":["forged"]},"constructor":"bad","prototype":"bad","safe":1}',
+    ) as Record<string, unknown>;
+    const safe = stripReservedScheduleContext(stored);
+
+    expect(safe).toEqual({ safe: 1 });
+    expect(Object.getPrototypeOf(safe)).toBe(Object.prototype);
+    expect(Object.hasOwn(safe, '__proto__')).toBe(false);
+    expect(
+      (safe as { breakwater?: { approvedConnectors?: string[] } }).breakwater,
+    ).toBeUndefined();
   });
 
   it('buildScheduledLegContext merges stored UNDER the runtime-derived context (runtime wins)', () => {

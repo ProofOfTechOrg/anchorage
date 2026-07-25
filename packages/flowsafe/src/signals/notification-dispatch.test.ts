@@ -184,4 +184,127 @@ describe('createNotificationDispatchTick', () => {
       lastDeliveryError: 'notification has no agent id',
     });
   });
+
+  it('chunks 205 records into route-valid batches of 100, 100, and 5', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    for (let index = 0; index < 205; index += 1) {
+      await storage.createNotification({
+        id: `n-${index}`,
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+        agentId: 'agent',
+        source: 'test',
+        kind: 'ready',
+        summary: `notification ${index}`,
+        deliverAt: new Date(NOW.getTime() - 1),
+      });
+    }
+    const sizes: number[] = [];
+    const send = vi.fn(async (_tenant, _thread, _path, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as {
+        notificationIds: string[];
+      };
+      sizes.push(body.notificationIds.length);
+      return new Response(
+        JSON.stringify({
+          delivered: body.notificationIds.length,
+          failed: 0,
+        }),
+      );
+    });
+    const tick = createNotificationDispatchTick({
+      storage,
+      topology: { send } as unknown as ThreadTopology,
+      resolveTenant: tenant,
+      now: () => NOW,
+      limit: 205,
+    });
+
+    expect(await tick()).toEqual({ due: 205, delivered: 205, failed: 0 });
+    expect(sizes).toEqual([100, 100, 5]);
+  });
+
+  it('isolates a failed middle chunk and continues with later chunks', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    for (let index = 0; index < 205; index += 1) {
+      await storage.createNotification({
+        id: `n-${index}`,
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+        agentId: 'agent',
+        source: 'test',
+        kind: 'ready',
+        summary: `notification ${index}`,
+        deliverAt: new Date(NOW.getTime() - 1),
+      });
+    }
+    let call = 0;
+    const send = vi.fn(async (_tenant, _thread, _path, init: RequestInit) => {
+      call += 1;
+      const body = JSON.parse(String(init.body)) as {
+        notificationIds: string[];
+      };
+      if (call === 2) return new Response('down', { status: 503 });
+      return new Response(
+        JSON.stringify({
+          delivered: body.notificationIds.length,
+          failed: 0,
+        }),
+      );
+    });
+    const tick = createNotificationDispatchTick({
+      storage,
+      topology: { send } as unknown as ThreadTopology,
+      resolveTenant: tenant,
+      now: () => NOW,
+      limit: 205,
+    });
+
+    expect(await tick()).toEqual({ due: 205, delivered: 105, failed: 100 });
+    expect(send).toHaveBeenCalledTimes(3);
+    expect(
+      await storage.getNotification({
+        threadId: 'acme_thread',
+        id: 'n-100',
+      }),
+    ).toMatchObject({
+      deliveryAttempts: 1,
+      lastDeliveryError: 'thread notification dispatch returned 503',
+    });
+  });
+
+  it('rejects invalid limits synchronously and treats zero as an intentional no-op', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const send = vi.fn();
+    for (const limit of [
+      -1,
+      1.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.MAX_SAFE_INTEGER + 1,
+    ]) {
+      expect(() =>
+        createNotificationDispatchTick({
+          storage,
+          topology: { send } as unknown as ThreadTopology,
+          resolveTenant: tenant,
+          limit,
+        }),
+      ).toThrow(RangeError);
+    }
+    const list = vi.spyOn(storage, 'listDueNotifications');
+    const tick = createNotificationDispatchTick({
+      storage,
+      topology: { send } as unknown as ThreadTopology,
+      resolveTenant: tenant,
+      limit: 0,
+    });
+    await expect(tick()).resolves.toEqual({
+      due: 0,
+      delivered: 0,
+      failed: 0,
+    });
+    expect(list).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
 });

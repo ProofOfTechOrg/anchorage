@@ -28,6 +28,7 @@ import {
 } from '@mastra/core/notifications';
 
 import {
+  d1Changes,
   dateOrUndefined,
   isoOrNull,
   jsonOrNull,
@@ -88,14 +89,42 @@ function statusTimestampColumn(status: NotificationStatus): string | undefined {
   }
 }
 
-/** The earliest of deliverAt/summaryAt, or +Infinity when neither is set (core dueTime). */
-function dueTime(record: NotificationRecord): number {
-  const deliverAt = record.deliverAt?.getTime();
-  const summaryAt = record.summaryAt?.getTime();
-  if (deliverAt !== undefined && summaryAt !== undefined) {
-    return Math.min(deliverAt, summaryAt);
-  }
-  return deliverAt ?? summaryAt ?? Number.POSITIVE_INFINITY;
+const NOTIFICATION_COLUMNS = [
+  'id',
+  'thread_id',
+  'source',
+  'kind',
+  'priority',
+  'status',
+  'summary',
+  'payload',
+  'resourceId',
+  'agentId',
+  'sourceId',
+  'dedupeKey',
+  'coalesceKey',
+  'coalescedCount',
+  'attributes',
+  'createdAt',
+  'updatedAt',
+  'deliverAt',
+  'summaryAt',
+  'deliveryReason',
+  'deliveryAttempts',
+  'lastDeliveryAttemptAt',
+  'lastDeliveryError',
+  'deliveredSignalId',
+  'summarySignalId',
+  'deliveredAt',
+  'seenAt',
+  'dismissedAt',
+  'archivedAt',
+  'discardedAt',
+  'metadata',
+] as const;
+
+function validLimit(limit: number | undefined): limit is number {
+  return limit !== undefined && Number.isSafeInteger(limit) && limit >= 0;
 }
 
 export class D1NotificationsStorage extends NotificationsStorage {
@@ -189,30 +218,6 @@ export class D1NotificationsStorage extends NotificationsStorage {
     input: CreateNotificationInput,
   ): Promise<NotificationRecord> {
     await this.#ensureSchema();
-    // Coalesce onto an existing pending record with the same dedupe/coalesce key
-    // (bump the count, refresh the summary), exactly as the InMemory reference.
-    const existing = await this.#findCoalescable(input);
-    if (existing) {
-      const next: NotificationRecord = {
-        ...existing,
-        summary: input.summary,
-        payload: input.payload ?? existing.payload,
-        priority: input.priority ?? existing.priority,
-        attributes: input.attributes
-          ? { ...existing.attributes, ...input.attributes }
-          : existing.attributes,
-        updatedAt: new Date(),
-        deliverAt: input.deliverAt ?? existing.deliverAt,
-        summaryAt: input.summaryAt ?? existing.summaryAt,
-        deliveryReason: input.deliveryReason ?? existing.deliveryReason,
-        coalescedCount: (existing.coalescedCount ?? 1) + 1,
-        metadata: input.metadata
-          ? { ...existing.metadata, ...input.metadata }
-          : existing.metadata,
-      };
-      await this.#insert(next);
-      return next;
-    }
     const now = input.createdAt ?? new Date();
     const record: NotificationRecord = {
       id: input.id ?? crypto.randomUUID(),
@@ -238,8 +243,79 @@ export class D1NotificationsStorage extends NotificationsStorage {
       deliveryAttempts: 0,
       metadata: input.metadata,
     };
-    await this.#insert(record);
-    return record;
+    if (input.id !== undefined || (!input.dedupeKey && !input.coalesceKey)) {
+      await this.#insert(record);
+      return record;
+    }
+
+    for (let attempt = 0; attempt < 16; attempt += 1) {
+      if (await this.#insertUnlessCoalescable(record, input)) {
+        return record;
+      }
+      const existing = await this.#findCoalescableRow(input);
+      if (!existing) continue;
+      const existingRecord = rowToRecord(existing);
+      const mergedAttributes = input.attributes
+        ? { ...existingRecord.attributes, ...input.attributes }
+        : existingRecord.attributes;
+      const mergedMetadata = input.metadata
+        ? { ...existingRecord.metadata, ...input.metadata }
+        : existingRecord.metadata;
+      const updatedAt = new Date();
+      const sets = [
+        'summary = ?',
+        'payload = ?',
+        'priority = ?',
+        'attributes = ?',
+        'updatedAt = ?',
+        'deliverAt = ?',
+        'summaryAt = ?',
+        'deliveryReason = ?',
+        'coalescedCount = coalescedCount + 1',
+        'metadata = ?',
+      ];
+      const binds: unknown[] = [
+        input.summary,
+        jsonOrNull(input.payload ?? existingRecord.payload),
+        input.priority ?? existingRecord.priority,
+        jsonOrNull(mergedAttributes),
+        updatedAt.toISOString(),
+        isoOrNull(input.deliverAt ?? existingRecord.deliverAt),
+        isoOrNull(input.summaryAt ?? existingRecord.summaryAt),
+        input.deliveryReason ?? existingRecord.deliveryReason ?? null,
+        jsonOrNull(mergedMetadata),
+        existing.thread_id,
+        existing.id,
+        existing.coalescedCount,
+      ];
+      const guards = [
+        'thread_id = ?',
+        'id = ?',
+        "status = 'pending'",
+        'coalescedCount = ?',
+      ];
+      if (input.attributes) {
+        guards.push('attributes IS ?');
+        binds.push(existing.attributes);
+      }
+      if (input.metadata) {
+        guards.push('metadata IS ?');
+        binds.push(existing.metadata);
+      }
+      const updated = await this.#db
+        .prepare(
+          `UPDATE ${this.#table}
+           SET ${sets.join(', ')}
+           WHERE ${guards.join(' AND ')}
+           RETURNING *`,
+        )
+        .bind(...binds)
+        .first<NotificationRow>();
+      if (updated) return rowToRecord(updated);
+    }
+    throw new Error(
+      'Notification coalescing failed after 16 contention attempts',
+    );
   }
 
   async listNotifications(
@@ -262,10 +338,15 @@ export class D1NotificationsStorage extends NotificationsStorage {
       clauses.push('agentId = ?');
       binds.push(input.agentId);
     }
+    const sqlLimit =
+      input.search === undefined && validLimit(input.limit)
+        ? input.limit
+        : undefined;
+    if (sqlLimit !== undefined) binds.push(sqlLimit);
     const { results } = await this.#db
       .prepare(
         `SELECT * FROM ${this.#table} WHERE ${clauses.join(' AND ')}
-         ORDER BY updatedAt DESC`,
+         ORDER BY updatedAt DESC${sqlLimit !== undefined ? ' LIMIT ?' : ''}`,
       )
       .bind(...binds)
       .all<NotificationRow>();
@@ -281,7 +362,10 @@ export class D1NotificationsStorage extends NotificationsStorage {
           r.source.toLowerCase().includes(needle),
       );
     }
-    return input.limit !== undefined ? records.slice(0, input.limit) : records;
+    return input.search !== undefined ||
+      (input.limit !== undefined && !validLimit(input.limit))
+      ? records.slice(0, input.limit)
+      : records;
   }
 
   /**
@@ -313,20 +397,27 @@ export class D1NotificationsStorage extends NotificationsStorage {
       clauses.push('resourceId = ?');
       binds.push(input.resourceId);
     }
+    const sqlLimit = validLimit(input.limit) ? input.limit : undefined;
+    if (sqlLimit !== undefined) binds.push(sqlLimit);
     const { results } = await this.#db
-      .prepare(`SELECT * FROM ${this.#table} WHERE ${clauses.join(' AND ')}`)
+      .prepare(
+        `SELECT * FROM ${this.#table}
+         WHERE ${clauses.join(' AND ')}
+         ORDER BY
+           CASE
+             WHEN deliverAt IS NULL THEN summaryAt
+             WHEN summaryAt IS NULL THEN deliverAt
+             WHEN deliverAt <= summaryAt THEN deliverAt
+             ELSE summaryAt
+           END ASC,
+           updatedAt ASC${sqlLimit !== undefined ? ' LIMIT ?' : ''}`,
+      )
       .bind(...binds)
       .all<NotificationRow>();
-    // dueTime ordering (earliest deliver/summary first, then updatedAt) is a
-    // min-of-two-nullables — computed in JS to mirror the reference exactly.
-    const records = results
-      .map(rowToRecord)
-      .sort(
-        (a, b) =>
-          dueTime(a) - dueTime(b) ||
-          a.updatedAt.getTime() - b.updatedAt.getTime(),
-      );
-    return input.limit !== undefined ? records.slice(0, input.limit) : records;
+    const records = results.map(rowToRecord);
+    return input.limit !== undefined && !validLimit(input.limit)
+      ? records.slice(0, input.limit)
+      : records;
   }
 
   async getNotification(input: {
@@ -345,52 +436,82 @@ export class D1NotificationsStorage extends NotificationsStorage {
     input: UpdateNotificationInput,
   ): Promise<NotificationRecord> {
     await this.#ensureSchema();
-    const existing = await this.getNotification({
-      threadId: input.threadId,
-      id: input.id,
-    });
-    if (!existing) {
+    const now = new Date();
+    const sets = ['updatedAt = ?'];
+    const binds: unknown[] = [now.toISOString()];
+    if (input.status !== undefined) {
+      sets.push('status = ?');
+      binds.push(input.status);
+      const column = statusTimestampColumn(input.status);
+      if (column) {
+        sets.push(`${column} = ?`);
+        binds.push(now.toISOString());
+      }
+    }
+    if (input.summary !== undefined) {
+      sets.push('summary = ?');
+      binds.push(input.summary);
+    }
+    if (input.payload !== undefined) {
+      sets.push('payload = ?');
+      binds.push(jsonOrNull(input.payload));
+    }
+    if (input.attributes !== undefined) {
+      sets.push('attributes = ?');
+      binds.push(jsonOrNull(input.attributes));
+    }
+    if (input.metadata !== undefined) {
+      sets.push('metadata = ?');
+      binds.push(jsonOrNull(input.metadata));
+    }
+    if (input.deliverAt !== undefined) {
+      sets.push('deliverAt = ?');
+      binds.push(isoOrNull(input.deliverAt ?? undefined));
+    }
+    if (input.summaryAt !== undefined) {
+      sets.push('summaryAt = ?');
+      binds.push(isoOrNull(input.summaryAt ?? undefined));
+    }
+    if (input.deliveryReason !== undefined) {
+      sets.push('deliveryReason = ?');
+      binds.push(input.deliveryReason);
+    }
+    if (input.deliveryAttempts !== undefined) {
+      sets.push('deliveryAttempts = ?');
+      binds.push(input.deliveryAttempts);
+    }
+    if (input.lastDeliveryAttemptAt !== undefined) {
+      sets.push('lastDeliveryAttemptAt = ?');
+      binds.push(isoOrNull(input.lastDeliveryAttemptAt));
+    }
+    if (input.lastDeliveryError !== undefined) {
+      sets.push('lastDeliveryError = ?');
+      binds.push(input.lastDeliveryError);
+    }
+    if (input.deliveredSignalId !== undefined) {
+      sets.push('deliveredSignalId = ?');
+      binds.push(input.deliveredSignalId);
+    }
+    if (input.summarySignalId !== undefined) {
+      sets.push('summarySignalId = ?');
+      binds.push(input.summarySignalId);
+    }
+    binds.push(input.threadId, input.id);
+    const updated = await this.#db
+      .prepare(
+        `UPDATE ${this.#table}
+         SET ${sets.join(', ')}
+         WHERE thread_id = ? AND id = ?
+         RETURNING *`,
+      )
+      .bind(...binds)
+      .first<NotificationRow>();
+    if (!updated) {
       throw new Error(
         `Notification ${input.id} was not found for thread ${input.threadId}`,
       );
     }
-    const now = new Date();
-    const next: NotificationRecord = { ...existing, updatedAt: now };
-    if (input.status !== undefined) {
-      next.status = input.status;
-      const column = statusTimestampColumn(input.status);
-      if (column) {
-        (next as unknown as Record<string, Date>)[column] = now;
-      }
-    }
-    if (input.summary !== undefined) next.summary = input.summary;
-    if (input.payload !== undefined) next.payload = input.payload;
-    if (input.attributes !== undefined) next.attributes = input.attributes;
-    if (input.metadata !== undefined) next.metadata = input.metadata;
-    if (input.deliverAt !== undefined)
-      next.deliverAt = input.deliverAt ?? undefined;
-    if (input.summaryAt !== undefined)
-      next.summaryAt = input.summaryAt ?? undefined;
-    if (input.deliveryReason !== undefined) {
-      next.deliveryReason = input.deliveryReason;
-    }
-    if (input.deliveryAttempts !== undefined) {
-      next.deliveryAttempts = input.deliveryAttempts;
-    }
-    if (input.lastDeliveryAttemptAt !== undefined) {
-      next.lastDeliveryAttemptAt = input.lastDeliveryAttemptAt;
-    }
-    if (input.lastDeliveryError !== undefined) {
-      next.lastDeliveryError = input.lastDeliveryError;
-    }
-    if (input.deliveredSignalId !== undefined) {
-      next.deliveredSignalId = input.deliveredSignalId;
-    }
-    if (input.summarySignalId !== undefined) {
-      next.summarySignalId = input.summarySignalId;
-    }
-    await this.#insert(next);
-    return next;
+    return rowToRecord(updated);
   }
 
   async dangerouslyClearAll(): Promise<void> {
@@ -407,7 +528,10 @@ export class D1NotificationsStorage extends NotificationsStorage {
   ): void {
     if (filter === undefined) return;
     const values = Array.isArray(filter) ? filter : [filter];
-    if (values.length === 0) return;
+    if (values.length === 0) {
+      clauses.push('0 = 1');
+      return;
+    }
     clauses.push(`${column} IN (${values.map(() => '?').join(', ')})`);
     binds.push(...values);
   }
@@ -427,76 +551,116 @@ export class D1NotificationsStorage extends NotificationsStorage {
    * (only updatedAt bumps), so it is the stable insertion key; `id` breaks a
    * same-millisecond tie deterministically.
    */
-  async #findCoalescable(
+  async #findCoalescableRow(
     input: CreateNotificationInput,
-  ): Promise<NotificationRecord | undefined> {
+  ): Promise<NotificationRow | undefined> {
     if (!input.dedupeKey && !input.coalesceKey) return undefined;
-    const { results } = await this.#db
+    const match = this.#coalescableMatch(input);
+    const row = await this.#db
       .prepare(
         `SELECT * FROM ${this.#table}
-         WHERE thread_id = ? AND source = ? AND kind = ? AND status = 'pending'
-         ORDER BY createdAt ASC, id ASC`,
+         WHERE ${match.clause}
+         ORDER BY createdAt ASC, id ASC
+         LIMIT 1`,
       )
-      .bind(input.threadId, input.source, input.kind)
-      .all<NotificationRow>();
-    return results.map(rowToRecord).find((record) => {
-      if (record.agentId !== input.agentId) return false;
-      if (record.resourceId !== input.resourceId) return false;
-      return Boolean(
-        (input.dedupeKey && record.dedupeKey === input.dedupeKey) ||
-          (input.coalesceKey && record.coalesceKey === input.coalesceKey),
-      );
-    });
+      .bind(...match.binds)
+      .first<NotificationRow>();
+    return row ?? undefined;
+  }
+
+  #coalescableMatch(input: CreateNotificationInput): {
+    clause: string;
+    binds: unknown[];
+  } {
+    return {
+      clause: `thread_id = ?
+        AND source = ?
+        AND kind = ?
+        AND status = 'pending'
+        AND agentId IS ?
+        AND resourceId IS ?
+        AND (
+          (? IS NOT NULL AND dedupeKey = ?)
+          OR (? IS NOT NULL AND coalesceKey = ?)
+        )`,
+      binds: [
+        input.threadId,
+        input.source,
+        input.kind,
+        input.agentId ?? null,
+        input.resourceId ?? null,
+        input.dedupeKey ?? null,
+        input.dedupeKey ?? null,
+        input.coalesceKey ?? null,
+        input.coalesceKey ?? null,
+      ],
+    };
+  }
+
+  async #insertUnlessCoalescable(
+    record: NotificationRecord,
+    input: CreateNotificationInput,
+  ): Promise<boolean> {
+    const match = this.#coalescableMatch(input);
+    const result = await this.#db
+      .prepare(
+        `INSERT OR REPLACE INTO ${this.#table} (${NOTIFICATION_COLUMNS.join(', ')})
+         SELECT ${NOTIFICATION_COLUMNS.map(() => '?').join(', ')}
+         WHERE NOT EXISTS (
+           SELECT 1 FROM ${this.#table} WHERE ${match.clause}
+         )`,
+      )
+      .bind(...recordValues(record), ...match.binds)
+      .run();
+    return d1Changes(result) > 0;
   }
 
   /** INSERT-or-REPLACE the full record (create, coalesce-merge, and update share it). */
   async #insert(record: NotificationRecord): Promise<void> {
     await this.#db
       .prepare(
-        `INSERT OR REPLACE INTO ${this.#table} (
-           id, thread_id, source, kind, priority, status, summary, payload,
-           resourceId, agentId, sourceId, dedupeKey, coalesceKey, coalescedCount,
-           attributes, createdAt, updatedAt, deliverAt, summaryAt, deliveryReason,
-           deliveryAttempts, lastDeliveryAttemptAt, lastDeliveryError,
-           deliveredSignalId, summarySignalId, deliveredAt, seenAt, dismissedAt,
-           archivedAt, discardedAt, metadata
-         ) VALUES (${Array(31).fill('?').join(', ')})`,
+        `INSERT OR REPLACE INTO ${this.#table} (${NOTIFICATION_COLUMNS.join(', ')})
+         VALUES (${NOTIFICATION_COLUMNS.map(() => '?').join(', ')})`,
       )
-      .bind(
-        record.id,
-        record.threadId,
-        record.source,
-        record.kind,
-        record.priority,
-        record.status,
-        record.summary,
-        jsonOrNull(record.payload),
-        record.resourceId ?? null,
-        record.agentId ?? null,
-        record.sourceId ?? null,
-        record.dedupeKey ?? null,
-        record.coalesceKey ?? null,
-        record.coalescedCount ?? 1,
-        jsonOrNull(record.attributes),
-        record.createdAt.toISOString(),
-        record.updatedAt.toISOString(),
-        isoOrNull(record.deliverAt),
-        isoOrNull(record.summaryAt),
-        record.deliveryReason ?? null,
-        record.deliveryAttempts ?? 0,
-        isoOrNull(record.lastDeliveryAttemptAt),
-        record.lastDeliveryError ?? null,
-        record.deliveredSignalId ?? null,
-        record.summarySignalId ?? null,
-        isoOrNull(record.deliveredAt),
-        isoOrNull(record.seenAt),
-        isoOrNull(record.dismissedAt),
-        isoOrNull(record.archivedAt),
-        isoOrNull(record.discardedAt),
-        jsonOrNull(record.metadata),
-      )
+      .bind(...recordValues(record))
       .run();
   }
+}
+
+function recordValues(record: NotificationRecord): unknown[] {
+  return [
+    record.id,
+    record.threadId,
+    record.source,
+    record.kind,
+    record.priority,
+    record.status,
+    record.summary,
+    jsonOrNull(record.payload),
+    record.resourceId ?? null,
+    record.agentId ?? null,
+    record.sourceId ?? null,
+    record.dedupeKey ?? null,
+    record.coalesceKey ?? null,
+    record.coalescedCount ?? 1,
+    jsonOrNull(record.attributes),
+    record.createdAt.toISOString(),
+    record.updatedAt.toISOString(),
+    isoOrNull(record.deliverAt),
+    isoOrNull(record.summaryAt),
+    record.deliveryReason ?? null,
+    record.deliveryAttempts ?? 0,
+    isoOrNull(record.lastDeliveryAttemptAt),
+    record.lastDeliveryError ?? null,
+    record.deliveredSignalId ?? null,
+    record.summarySignalId ?? null,
+    isoOrNull(record.deliveredAt),
+    isoOrNull(record.seenAt),
+    isoOrNull(record.dismissedAt),
+    isoOrNull(record.archivedAt),
+    isoOrNull(record.discardedAt),
+    jsonOrNull(record.metadata),
+  ];
 }
 
 /** Map a stored row back to the core NotificationRecord shape. */

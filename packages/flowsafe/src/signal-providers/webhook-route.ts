@@ -46,6 +46,10 @@ import {
 } from '../host-kit/index.js';
 import { safeDecodeSegment } from '../host-kit/route-path.js';
 import { internalErrorResponse } from '../internal-error-response.js';
+import {
+  nonnegativeSafeInteger,
+  positiveSafeInteger,
+} from '../numeric-config.js';
 import { deliverNotification } from './delivery.js';
 import { PROVIDER_ID_PATTERN, type SignalProviderAdapter } from './provider.js';
 import type {
@@ -116,11 +120,17 @@ export interface WebhookRouterOptions {
   rateLimit?: WebhookRateLimiter;
   /** Route prefix. Default '/api/signal-providers'. */
   basePath?: string;
-  /** Max raw webhook body in bytes. Default 1 MiB. */
+  /**
+   * Max raw webhook body in bytes. Must be a nonnegative safe integer; zero
+   * denies every non-empty body. Default 1 MiB.
+   */
   maxBodyBytes?: number;
-  /** Forgery audits per provider per window (bounds log amplification). Default 10. */
+  /**
+   * Forgery audits per provider per window. Must be a nonnegative safe integer;
+   * zero disables forgery audit writes without accepting forgeries. Default 10.
+   */
   maxForgeryAuditsPerWindow?: number;
-  /** Forgery-audit window in ms. Default 60000. */
+  /** Positive safe-integer forgery-audit window in ms. Default 60000. */
   forgeryAuditWindowMs?: number;
   /** Epoch-ms clock for the forgery window, injectable for tests. Default Date.now. */
   now?: () => number;
@@ -151,9 +161,18 @@ export function createWebhookRouter(
   } = options;
   const base = options.basePath ?? '/api/signal-providers';
   const baseSegments = base.split('/').filter(Boolean);
-  const maxBodyBytes = options.maxBodyBytes ?? 1_048_576;
-  const maxForgeryAudits = options.maxForgeryAuditsPerWindow ?? 10;
-  const forgeryWindowMs = options.forgeryAuditWindowMs ?? 60_000;
+  const maxBodyBytes = nonnegativeSafeInteger(
+    options.maxBodyBytes ?? 1_048_576,
+    'webhook maxBodyBytes',
+  );
+  const maxForgeryAudits = nonnegativeSafeInteger(
+    options.maxForgeryAuditsPerWindow ?? 10,
+    'maxForgeryAuditsPerWindow',
+  );
+  const forgeryWindowMs = positiveSafeInteger(
+    options.forgeryAuditWindowMs ?? 60_000,
+    'forgeryAuditWindowMs',
+  );
   const now = options.now ?? Date.now;
 
   // Bounded forgery-audit windows, per provider. A forgery is ALWAYS rejected;
@@ -161,6 +180,7 @@ export function createWebhookRouter(
   // write one log line per attempt.
   const forgeryWindows = new Map<string, { count: number; resetAt: number }>();
   const shouldAuditForgery = (providerId: string): boolean => {
+    if (maxForgeryAudits === 0) return false;
     const current = now();
     const window = forgeryWindows.get(providerId);
     if (!window || current >= window.resetAt) {
@@ -363,7 +383,10 @@ export interface SubscriptionRouterOptions {
   audit?: SignalProviderAuditSink;
   /** Route prefix. Default '/api/threads'. Routes: `<base>/:threadId/subscriptions`. */
   basePath?: string;
-  /** Max request body in bytes. Default 4096 (a subscription body is tiny). */
+  /**
+   * Max request body in bytes. Must be a nonnegative safe integer; zero denies
+   * every non-empty mutation body. Default 4096.
+   */
   maxBodyBytes?: number;
 }
 
@@ -376,7 +399,10 @@ export function createSubscriptionRouter(
   const roles = options.roles ?? RUN_START_ROLES;
   const base = options.basePath ?? '/api/threads';
   const baseSegments = base.split('/').filter(Boolean);
-  const maxBodyBytes = options.maxBodyBytes ?? 4096;
+  const maxBodyBytes = nonnegativeSafeInteger(
+    options.maxBodyBytes ?? 4096,
+    'subscription maxBodyBytes',
+  );
   const known = options.knownProviders
     ? new Set(options.knownProviders)
     : undefined;

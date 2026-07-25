@@ -23,7 +23,11 @@ function ctx(tenantId: string, role: ApprovalRole): TenantContext {
 }
 
 function setup(
-  opts: { resolveTo?: TenantContext | undefined; role?: ApprovalRole } = {},
+  opts: {
+    resolveTo?: TenantContext | undefined;
+    role?: ApprovalRole;
+    maxBodyBytes?: number;
+  } = {},
 ) {
   const factory = new InMemorySubscriptionStoreFactory();
   const events: SignalProviderAuditEvent[] = [];
@@ -36,6 +40,9 @@ function setup(
     audit: (e) => {
       events.push(e);
     },
+    ...(opts.maxBodyBytes !== undefined
+      ? { maxBodyBytes: opts.maxBodyBytes }
+      : {}),
   });
   return { router, factory, events };
 }
@@ -49,6 +56,31 @@ function req(method: string, threadId: string, body?: unknown): Request {
 }
 
 describe('createSubscriptionRouter', () => {
+  it.each([
+    -1,
+    1.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1,
+  ])('rejects an invalid body cap synchronously: %s', (maxBodyBytes) => {
+    expect(() => setup({ maxBodyBytes })).toThrow(RangeError);
+  });
+
+  it('accepts a zero body cap and rejects every non-empty mutation body', async () => {
+    const { router } = setup({ maxBodyBytes: 0 });
+    expect(
+      (
+        await router(
+          req('POST', 'acme_t1', {
+            providerId: 'github',
+            externalResourceId: 'github:acme/repo',
+            resourceKey: 'owner',
+          }),
+        )
+      )?.status,
+    ).toBe(413);
+  });
+
   it('returns null for a path it does not own', async () => {
     const { router } = setup();
     expect(await router(new Request('http://host/api/other'))).toBeNull();

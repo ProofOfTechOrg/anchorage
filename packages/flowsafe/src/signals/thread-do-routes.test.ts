@@ -206,7 +206,7 @@ describe('createThreadSignalRoutes', () => {
     expect(res?.status).toBe(400);
   });
 
-  it('returns a generic 500 when thread route wiring throws', async () => {
+  it('returns the documented generic 502 when thread route wiring throws', async () => {
     const logged: string[] = [];
     const log = vi.spyOn(console, 'error').mockImplementation((value) => {
       logged.push(String(value));
@@ -223,7 +223,7 @@ describe('createThreadSignalRoutes', () => {
         post('/signal', { contents: 'hi' }),
         scopeWith(undefined),
       );
-      expect(response?.status).toBe(500);
+      expect(response?.status).toBe(502);
       expect(await response?.json()).toEqual({ error: 'internal error' });
       expect(response?.headers.get('cache-control')).toBe('no-store');
       expect(logged.join('\n')).toContain('private thread wiring detail');
@@ -376,6 +376,283 @@ describe('createThreadSignalRoutes', () => {
       status: 'delivered',
       deliveredSignalId: startedSignalId,
     });
+  });
+
+  it('deduplicates notification ids in first-seen order', async () => {
+    const { agent } = mockAgent();
+    const storage = new InMemoryNotificationsStorage();
+    const record = await storage.createNotification({
+      id: 'duplicate',
+      threadId: 'acme_t1',
+      resourceId: 'acme_res',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'ready',
+      summary: 'ready',
+      deliverAt: new Date(0),
+    });
+    const starts = vi.fn(async ({ runId }) => ({ runId }));
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+      startIdleRun: starts,
+    });
+
+    const response = await routes(
+      post('/signal/notifications/dispatch', {
+        notificationIds: [record.id, record.id, record.id],
+        resourceId: 'acme_res',
+        agentId: 'agent',
+        now: '2026-07-20T12:00:00.000Z',
+      }),
+      scopeWith(undefined),
+    );
+
+    expect(await response?.json()).toEqual({ delivered: 1, failed: 0 });
+    expect(starts).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips a future notification after re-fetching under the lane', async () => {
+    const { agent, calls } = mockAgent();
+    const storage = new InMemoryNotificationsStorage();
+    const record = await storage.createNotification({
+      id: 'future',
+      threadId: 'acme_t1',
+      resourceId: 'acme_res',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'ready',
+      summary: 'not yet',
+      deliverAt: new Date('2026-07-21T12:00:00.000Z'),
+    });
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+    });
+
+    const response = await routes(
+      post('/signal/notifications/dispatch', {
+        notificationIds: [record.id],
+        resourceId: 'acme_res',
+        agentId: 'agent',
+        now: '2026-07-20T12:00:00.000Z',
+      }),
+      scopeWith(undefined),
+    );
+
+    expect(await response?.json()).toEqual({
+      delivered: 0,
+      failed: 0,
+      skipped: 1,
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('serializes overlapping dispatches so one delivers and one skips', async () => {
+    const { agent } = mockAgent();
+    const persistence = deferred<void>();
+    const sendSignal = vi.fn(() => ({
+      signal: { id: 'once' },
+      accepted: Promise.resolve({ action: 'persist' as const }),
+      persisted: persistence.promise,
+    }));
+    (agent as unknown as { sendSignal: typeof sendSignal }).sendSignal =
+      sendSignal;
+    const storage = new InMemoryNotificationsStorage();
+    const record = await storage.createNotification({
+      id: 'overlap',
+      threadId: 'acme_t1',
+      resourceId: 'acme_res',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'ready',
+      summary: 'ready',
+      deliverAt: new Date(0),
+    });
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+    });
+    const request = () =>
+      routes(
+        post('/signal/notifications/dispatch', {
+          notificationIds: [record.id],
+          resourceId: 'acme_res',
+          agentId: 'agent',
+          now: '2026-07-20T12:00:00.000Z',
+        }),
+        scopeWith(undefined),
+      );
+
+    const first = request();
+    const second = request();
+    await vi.waitFor(() => expect(sendSignal).toHaveBeenCalledTimes(1));
+    persistence.resolve();
+    const bodies = await Promise.all(
+      [first, second].map(async (response) => (await response)?.json()),
+    );
+
+    expect(bodies).toEqual([
+      { delivered: 1, failed: 0 },
+      { delivered: 0, failed: 0, skipped: 1 },
+    ]);
+    expect(sendSignal).toHaveBeenCalledTimes(1);
+  });
+
+  it('serializes overlapping summary dispatches so one summary is emitted', async () => {
+    const { agent } = mockAgent();
+    const persistence = deferred<void>();
+    const sendSignal = vi.fn(() => ({
+      signal: { id: 'summary-once' },
+      accepted: Promise.resolve({ action: 'persist' as const }),
+      persisted: persistence.promise,
+    }));
+    (agent as unknown as { sendSignal: typeof sendSignal }).sendSignal =
+      sendSignal;
+    const storage = new InMemoryNotificationsStorage();
+    const record = await storage.createNotification({
+      id: 'summary-overlap',
+      threadId: 'acme_t1',
+      resourceId: 'acme_res',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'digest',
+      summary: 'digest',
+      priority: 'low',
+      summaryAt: new Date(0),
+    });
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+    });
+    const request = () =>
+      routes(
+        post('/signal/notifications/dispatch', {
+          notificationIds: [record.id],
+          resourceId: 'acme_res',
+          agentId: 'agent',
+          now: '2026-07-20T12:00:00.000Z',
+        }),
+        scopeWith(undefined),
+      );
+
+    const first = request();
+    const second = request();
+    await vi.waitFor(() => expect(sendSignal).toHaveBeenCalledTimes(1));
+    persistence.resolve();
+    const bodies = await Promise.all(
+      [first, second].map(async (response) => (await response)?.json()),
+    );
+
+    expect(bodies).toEqual([
+      { delivered: 1, failed: 0 },
+      { delivered: 0, failed: 0, skipped: 1 },
+    ]);
+    expect(sendSignal).toHaveBeenCalledTimes(1);
+  });
+
+  it('holds notification creation behind an in-flight dispatch transaction', async () => {
+    const { agent } = mockAgent();
+    const persistence = deferred<void>();
+    const sendSignal = vi.fn(() => ({
+      signal: { id: 'dispatch-first' },
+      accepted: Promise.resolve({ action: 'persist' as const }),
+      persisted: persistence.promise,
+    }));
+    const sendNotificationSignal = vi.fn(async () => ({
+      record: { id: 'created', threadId: 'acme_t1', status: 'pending' },
+      decision: { action: 'persist' as const },
+    }));
+    (
+      agent as unknown as {
+        sendSignal: typeof sendSignal;
+        sendNotificationSignal: typeof sendNotificationSignal;
+      }
+    ).sendSignal = sendSignal;
+    (
+      agent as unknown as {
+        sendNotificationSignal: typeof sendNotificationSignal;
+      }
+    ).sendNotificationSignal = sendNotificationSignal;
+    const storage = new InMemoryNotificationsStorage();
+    const record = await storage.createNotification({
+      id: 'lane-order',
+      threadId: 'acme_t1',
+      resourceId: 'acme_res',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'ready',
+      summary: 'ready',
+      deliverAt: new Date(0),
+    });
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+    });
+
+    const dispatch = routes(
+      post('/signal/notifications/dispatch', {
+        notificationIds: [record.id],
+        resourceId: 'acme_res',
+        agentId: 'agent',
+        now: '2026-07-20T12:00:00.000Z',
+      }),
+      scopeWith(undefined),
+    );
+    const creation = routes(
+      post('/signal/notification', {
+        source: 'test',
+        kind: 'created',
+        summary: 'created',
+      }),
+      scopeWith(undefined),
+    );
+    await vi.waitFor(() => expect(sendSignal).toHaveBeenCalledTimes(1));
+    expect(sendNotificationSignal).not.toHaveBeenCalled();
+
+    persistence.resolve();
+    await Promise.all([dispatch, creation]);
+    expect(sendNotificationSignal).toHaveBeenCalledTimes(1);
+  });
+
+  it('enforces the 100-id route boundary after validating every raw id', async () => {
+    const { agent } = mockAgent();
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => new InMemoryNotificationsStorage(),
+    });
+    const input = (count: number) => ({
+      notificationIds: Array.from(
+        { length: count },
+        (_, index) => `n-${index}`,
+      ),
+      resourceId: 'acme_res',
+      agentId: 'agent',
+      now: '2026-07-20T12:00:00.000Z',
+    });
+
+    expect(
+      (
+        await routes(
+          post('/signal/notifications/dispatch', input(100)),
+          scopeWith(undefined),
+        )
+      )?.status,
+    ).toBe(200);
+    expect(
+      (
+        await routes(
+          post('/signal/notifications/dispatch', input(101)),
+          scopeWith(undefined),
+        )
+      )?.status,
+    ).toBe(400);
   });
 
   it('joins an active durable run when dispatching a due notification', async () => {

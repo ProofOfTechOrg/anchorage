@@ -30,6 +30,7 @@ import {
 import type { StepResult, WorkflowRunState } from '@mastra/core/workflows';
 
 import {
+  assertMintableTenantId,
   type D1DatabaseBinding,
   tenantOwnsSaltedId,
 } from '../do-runner/index.js';
@@ -194,10 +195,8 @@ export class TenantScopedBackgroundTasksStorageD1 extends BackgroundTasksStorage
     },
   ) {
     super(config);
+    assertMintableTenantId(options.tenantId, 'backgroundTasks');
     this.tenantId = options.tenantId;
-    if (!tenantOwnsSaltedId(options.tenantId, `${options.tenantId}_probe`)) {
-      throw new Error('background-tasks: execution tenantId violates INV-3');
-    }
     this.#workflows = options.workflows;
   }
 

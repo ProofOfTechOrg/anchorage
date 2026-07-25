@@ -81,6 +81,10 @@ import {
 } from '../host-kit/index.js';
 import { safeDecodeSegment } from '../host-kit/route-path.js';
 import { internalErrorResponse } from '../internal-error-response.js';
+import {
+  nonnegativeSafeInteger,
+  positiveSafeInteger,
+} from '../numeric-config.js';
 
 /**
  * requestContext key @mastra/core surfaces the current objective under WITHIN a
@@ -164,10 +168,13 @@ export interface ObjectiveRouterOptions {
   /**
    * The ceiling on a per-objective maxRuns (DL-007). A request above it is
    * REJECTED; the stored record never carries a higher value. Default the core
-   * DEFAULT_GOAL_MAX_RUNS (50).
+   * DEFAULT_GOAL_MAX_RUNS (50). Must be a positive safe integer.
    */
   maxRunsCap?: number;
-  /** Max raw request-body size in bytes (bounds the objective text). Default 16384. */
+  /**
+   * Max raw request-body size in bytes. Must be a nonnegative safe integer;
+   * zero denies every non-empty body. Default 16384.
+   */
   maxContentBytes?: number;
   /** Route prefix. Default '/api/threads' (goals mount at `/:threadId/goal`). */
   basePath?: string;
@@ -375,8 +382,14 @@ export function createObjectiveRouter(
 ): ObjectiveRouter {
   const { resolve, store } = options;
   const roles = options.roles ?? RUN_START_ROLES;
-  const maxRunsCap = options.maxRunsCap ?? DEFAULT_GOAL_MAX_RUNS;
-  const maxContentBytes = options.maxContentBytes ?? 16_384;
+  const maxRunsCap = positiveSafeInteger(
+    options.maxRunsCap ?? DEFAULT_GOAL_MAX_RUNS,
+    'maxRunsCap',
+  );
+  const maxContentBytes = nonnegativeSafeInteger(
+    options.maxContentBytes ?? 16_384,
+    'objective maxContentBytes',
+  );
   const base = options.basePath ?? '/api/threads';
   const baseSegments = base.split('/').filter(Boolean);
 
