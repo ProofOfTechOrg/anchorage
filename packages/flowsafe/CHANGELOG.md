@@ -1,5 +1,104 @@
 # @proofoftech/flowsafe
 
+## 0.6.0
+
+### Minor Changes
+
+- eca3b6e: Close the durable-agent, agent-schedule, notification-dispatch, and D1 background-task execution residuals with tenant-safe thread routing and eviction-safe approval resume. Harden stored schedule context and core schedule-contract validation; make D1 notification creation preserve explicit-id coalescing, insertion-order targets, rollback-safe atomic migration, and concurrent partial updates; priority-plan summary and individual delivery across state-stable 100-id batches; accept Mastra's raw constructor pubsub with rollback-safe workers and a synchronous enqueue shutdown gate; close failed resume streams; validate public numeric configuration synchronously; preserve nested Mastra background-task SSE events; and require a proven process shutdown before spike restart.
+- d54d2be: Track D — schedules (`@proofoftech/flowsafe/schedules`, additive, opt-in). A new
+  subpath ships the D1 schedules domain, a CAS-driven tick we own, and a tenant
+  facade — all on the single DO + D1 RunnerRuntime substrate (P1), no new
+  `ApprovalRecord` shape or existing signature changed, unconfigured hosts
+  byte-identical.
+
+  - `D1SchedulesStorage` + `createScheduleStorageDomains` — the flowsafe-owned D1
+    domain over `mastra_schedules` / `mastra_schedule_triggers` (the
+    `@mastra/cloudflare-d1` adapter ships neither), mirroring core's
+    `SchedulesStorage` contract incl. the CAS `updateScheduleNextFire`. Composed
+    into `createD1Storage` via the injected `domains` seam.
+  - `createScheduleTick` — we OWN the tick (DL-012): `listDueSchedules` → CAS claim
+    → workflow targets mint a fresh INV-1 runId and fire through the host's
+    run-start seam; agent targets are GUARDED OFF (their only public fire path,
+    `schedules.run(id)`, enqueues onto core's pubsub worker loop we do not run, so
+    firing is a fail-closed audited skip — agent-target execution is deferred). An
+    injectable run-cap seam (DL-007) skips a capped tenant while the schedule stays
+    healthy. The P4 stored-context barrier strips reserved keys before any leg.
+  - `createScheduleRouter` — the tenant facade (DL-013): server-minted ids,
+    `metadata.tenantId` stamping, tenant-filtered reads, ownership 404s (no
+    oracle), per-tenant count + fire-rate caps, and P4 reserved-key rejection on
+    create/update (the whole `breakwater.` namespace + `mastra:goal`).
+  - Storage triad (DL-003): both tables register in the schema-guard inventory
+    (8 → 10) with a new metadata-filtered `purgeTenant` kind
+    (`TENANT_METADATA_PURGE_TABLES`), plus `purgeExpiredScheduleTriggers` for the
+    trigger-history TTL. `createFlowsafeWorker` gains an opt-in `scheduleTick` seam
+    (its own failure-isolated cron duty) and a `SCHEDULE_TRIGGER_RETENTION_DAYS`
+    purge duty.
+
+- 0f4f70a: Track E (M-007) — signal providers: a new subpath `@proofoftech/flowsafe/signal-providers`
+  (additive, opt-in, subpath-only). Host external-event providers on a Durable
+  Object with alarm-driven polling, terminate provider webhooks on the Worker, and
+  persist subscriptions in a flowsafe-owned D1 table.
+
+  - `SignalProviderHost` — a per-tenant provider host DO (`idFromName(tenantId)`)
+    whose alarm rehydrates subscriptions from D1 (core's registry is in-memory,
+    lost on eviction) and polls each of the tenant's providers with per-provider +
+    per-delivery failure isolation, delivering through Track C's thread-DO topology.
+  - `D1SubscriptionStoreFactory` — a flowsafe-owned, tenant-columned
+    `flowsafe_signal_subscriptions` store mirroring the approval store's INV-2
+    posture (`.forTenant()` tenant-bound, `.system().listByResource()` the webhook's
+    cross-tenant authority). Registered in `purgeTenant` (`PurgeTenantResult.subscriptions`);
+    retention is `none` (standing config reaped only at offboarding).
+  - `createWebhookRouter` — webhook ingress that verifies the provider signature
+    over the RAW bytes BEFORE parsing, maps the payload to a tenant via the
+    subscription ROW only (never the payload), rate-caps per provider+tenant, and
+    audits every ingest with a bounded forgery audit. `createSubscriptionRouter` —
+    the human-only HTTP subscribe/unsubscribe surface (never exposed as model
+    tools; mints no capability).
+  - `githubSignalProvider` — a binding-gated GitHub reference provider
+    (`X-Hub-Signature-256` verified constant-time via WebCrypto). `createWebhookSignalProvider`
+    is the generic path.
+
+  Also adds a `subscriptions` counter to `PurgeTenantResult` (the DL-003 offboarding
+  coverage for the new flowsafe-owned table).
+
+- 6c80e92: Track F (M-005) — goals. New subpath-only export `@proofoftech/flowsafe/goals`:
+  `createObjectiveRouter`, a role-gated + audited objective HTTP surface
+  (set/get/update/clear over `/api/threads/:threadId/goal`) that writes the
+  thread-scoped goal record in Track C's `mastra_thread_state` domain
+  (`GOAL_STATE_TYPE` 'goal'). The write path is a P6-lite ingestion boundary
+  (auth → coarse role → thread-prefix ownership 404 → size cap →
+  `assertNoClientMemoryIds` → field allowlist → maxRuns host cap → audit) and
+  persists through `@mastra/core`'s own `writeObjective`/`readObjective`/
+  `clearObjective`, so a record it writes is byte-identical to what the durable
+  goal step reads via `resolveGoalStore` (DL-018 — no thread-DO affinity needed
+  for the write). A requested `maxRuns` above the host cap is rejected, not
+  clamped (default the core `DEFAULT_GOAL_MAX_RUNS`, 50; DL-007). Goals never mint
+  capability (P8) and Track F starts no runs — per-tenant run budgets stay
+  enforced at the existing seams. `GOAL_REQUEST_CONTEXT_KEY` ('mastra:goal') is
+  reserved with a no-collision pin against the runtime's requestContext base keys.
+  Hosts mount the surface opt-in through `createFlowsafeWorker`'s new
+  `buildObjectiveRouter` seam; absent config is byte-identical. Additive only — no
+  new table, schema-guard, purge, or TTL change (reuses the Track C thread-state
+  domain), and no existing signature or `ApprovalRecord` shape changes.
+
+### Patch Changes
+
+- 8e3562f: Make approval filing atomic across terminal and open records for the same captured suspension fingerprint, preventing stale reconciliation from filing over a decision.
+- 97cb097: Harden the P6 ingestion routers against a pre-auth malformed-path fault. The
+  signal, goal, and schedule routers decoded the threadId/schedule-id path
+  segment with bare `decodeURIComponent` before authentication, and
+  `createFlowsafeWorker`'s fetch handler did not wrap the router calls — so an
+  unauthenticated request with malformed percent-encoding (e.g.
+  `POST /api/threads/%/message`) threw a `URIError` out of `fetch()` as a
+  per-request 500. The three routers now use a shared `safeDecodeSegment`
+  (host-kit) that treats malformed encoding as route-absent (byte-identical to a
+  non-matching path), matching the Track E webhook router; the worker fetch
+  handler gains a top-level try/catch that contains any handler throw as a
+  generic 500 without leaking `error.message`. The same helper closes the whole
+  class: the background-tasks read route (post-auth, DO-mounted) adopts it too, so
+  a malformed taskId returns the no-oracle 404 instead of throwing. Additive and
+  behavior-preserving for all valid paths.
+
 ## 0.5.0
 
 ### Minor Changes
