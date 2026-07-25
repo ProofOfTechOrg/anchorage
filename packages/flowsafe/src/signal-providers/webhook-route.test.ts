@@ -83,6 +83,59 @@ function webhookRequest(sig: string, body: unknown): Request {
 }
 
 describe('createWebhookRouter — verify before parse', () => {
+  it.each([
+    { maxBodyBytes: -1 },
+    { maxBodyBytes: 1.5 },
+    { maxForgeryAuditsPerWindow: Number.NaN },
+    { maxForgeryAuditsPerWindow: Number.POSITIVE_INFINITY },
+    { forgeryAuditWindowMs: 0 },
+    { forgeryAuditWindowMs: Number.MAX_SAFE_INTEGER + 1 },
+  ])('rejects invalid numeric configuration synchronously: %o', (numeric) => {
+    const factory = new InMemorySubscriptionStoreFactory();
+    const threads = stubThreads();
+    expect(() =>
+      createWebhookRouter({
+        providers: { test: testProvider() },
+        subscriptions: factory.system(),
+        topology: createThreadTopology(threads.namespace),
+        secretForProvider: () => 'secret',
+        ...numeric,
+      }),
+    ).toThrow(RangeError);
+  });
+
+  it('supports zero body and forgery-audit caps', async () => {
+    const factory = new InMemorySubscriptionStoreFactory();
+    const threads = stubThreads();
+    const audit = vi.fn();
+    const router = createWebhookRouter({
+      providers: { test: testProvider() },
+      subscriptions: factory.system(),
+      topology: createThreadTopology(threads.namespace),
+      secretForProvider: () => 'secret',
+      maxBodyBytes: 0,
+      maxForgeryAuditsPerWindow: 0,
+      audit,
+    });
+
+    expect((await router(webhookRequest('bad', {})))?.status).toBe(413);
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'payload-too-large' }),
+    );
+
+    const noForgeryAudit = vi.fn();
+    const forgeryRouter = createWebhookRouter({
+      providers: { test: testProvider() },
+      subscriptions: factory.system(),
+      topology: createThreadTopology(threads.namespace),
+      secretForProvider: () => 'secret',
+      maxForgeryAuditsPerWindow: 0,
+      audit: noForgeryAudit,
+    });
+    expect((await forgeryRouter(webhookRequest('bad', {})))?.status).toBe(401);
+    expect(noForgeryAudit).not.toHaveBeenCalled();
+  });
+
   it('rejects a forged signature BEFORE any lookup or delivery, and audits it', async () => {
     // #given
     const factory = new InMemorySubscriptionStoreFactory();

@@ -124,6 +124,11 @@ describe('queueApprovalForSuspension', () => {
       summary,
       'reviewer-of-gate1',
       SYSTEM,
+      {
+        kind: 'thread',
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+      },
     );
 
     // #then — the binding fingerprint is copied verbatim from the summary
@@ -136,6 +141,11 @@ describe('queueApprovalForSuspension', () => {
       resumeCount: 2,
       connectors: ['deploy-conn'],
       requestedBy: 'reviewer-of-gate1',
+      resumeTarget: {
+        kind: 'thread',
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+      },
       status: 'pending',
     });
   });
@@ -256,6 +266,11 @@ describe('resumeRunWithRequeue', () => {
         requestedBy: 'starter',
       },
       SYSTEM,
+      {
+        kind: 'thread',
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+      },
     );
 
     // #when — the reviewer approves gate1; resume re-suspends at gate2
@@ -270,6 +285,11 @@ describe('resumeRunWithRequeue', () => {
       suspendedAt: 2020,
       resumeCount: 1,
       requestedBy: REVIEWER.id,
+      resumeTarget: {
+        kind: 'thread',
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+      },
     });
   });
 

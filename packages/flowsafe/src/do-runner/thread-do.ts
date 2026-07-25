@@ -35,7 +35,7 @@ import { DoStatusError, doErrorResponse } from './do-error-response.js';
 import type { InitResult } from './init.js';
 import { tenantOfMemoryId } from './memory-id.js';
 import { DurableStorageResumeLedger } from './resume-ledger.js';
-import { THREAD_TENANT_HEADER } from './thread-header.js';
+import { THREAD_ACTOR_HEADER, THREAD_TENANT_HEADER } from './thread-header.js';
 
 /**
  * A request refused at the thread DO's identity boundary: the DO's name carries
@@ -63,6 +63,8 @@ export interface ThreadScope {
   readonly threadId: string;
   /** The tenant the threadId carries, equal to the request's authenticated one. */
   readonly tenantId: string;
+  /** Server-stamped requester identity; clients cannot author this header. */
+  readonly requestedBy: string;
   /** This DO's storage/runtime/pubsub wiring, built once per instance. */
   readonly init: InitResult;
 }
@@ -174,7 +176,13 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
         `thread identity mismatch: instance '${threadId}' belongs to tenant '${tenantId}' but the request authenticates as '${claimed ?? '<none>'}' — refusing`,
       );
     }
-    return { threadId, tenantId };
+    const requestedBy = request.headers.get(THREAD_ACTOR_HEADER);
+    if (!requestedBy) {
+      throw new ThreadIdentityError(
+        `thread identity mismatch: request for '${threadId}' carries no trusted actor`,
+      );
+    }
+    return { threadId, tenantId, requestedBy };
   }
 
   #ensureInit(): InitResult {

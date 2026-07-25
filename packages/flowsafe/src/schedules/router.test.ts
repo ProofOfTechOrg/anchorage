@@ -8,7 +8,7 @@ import type {
   ScheduleTrigger,
   ScheduleUpdate,
 } from '@mastra/core/storage';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   type ApprovalRole,
@@ -57,6 +57,7 @@ function ctx(tenantId: string, role: ApprovalRole): TenantContext {
   return {
     tenantId,
     actor: { id: `${role}-1`, role, tenantId },
+    ownsMemoryId: (id: string) => id.startsWith(`${tenantId}_`),
   } as unknown as TenantContext;
 }
 
@@ -80,6 +81,7 @@ function harness(
     resolve?: TenantResolver;
     maxSchedulesPerTenant?: number;
     minFireIntervalMs?: number;
+    maxContentBytes?: number;
   } = {},
 ): Harness {
   const store = new MemStore();
@@ -95,6 +97,9 @@ function harness(
       : {}),
     ...(overrides.minFireIntervalMs !== undefined
       ? { minFireIntervalMs: overrides.minFireIntervalMs }
+      : {}),
+    ...(overrides.maxContentBytes !== undefined
+      ? { maxContentBytes: overrides.maxContentBytes }
       : {}),
   });
   const call = async (method: string, path: string, body?: unknown) => {
@@ -212,6 +217,101 @@ describe('createScheduleRouter — create', () => {
     });
     expect(res.status).toBe(201);
     expect((res.body.schedule as { id: string }).id).toMatch(/^agent_/);
+  });
+
+  it('normalizes a valid threaded agent target and strips unsupported nested fields', async () => {
+    const { call, store } = harness(ctx('acme', 'operator'));
+    const res = await call('POST', '/api/schedules', {
+      agentId: 'a1',
+      prompt: 'go',
+      cron: '*/5 * * * *',
+      threadId: 'acme_thread',
+      resourceId: 'acme_resource',
+      ifIdle: {
+        streamOptions: {
+          requestContext: { safe: 'kept' },
+          temperature: 0.5,
+          unsupported: 'dropped',
+        },
+        unsupported: 'dropped',
+      },
+    });
+
+    expect(res.status).toBe(201);
+    const id = (res.body.schedule as { id: string }).id;
+    expect(store.m.get(id)?.target).toMatchObject({
+      type: 'agent',
+      threadId: 'acme_thread',
+      resourceId: 'acme_resource',
+      ifIdle: {
+        streamOptions: {
+          requestContext: { safe: 'kept' },
+        },
+      },
+    });
+    expect(JSON.stringify(store.m.get(id)?.target)).not.toContain(
+      'unsupported',
+    );
+  });
+
+  it.each([
+    [{ resourceId: 'acme_resource' }, 'resourceId'],
+    [{ signalType: 'ping' }, 'signalType'],
+    [{ ifActive: { strategy: 'join' } }, 'ifActive'],
+    [{ ifIdle: { strategy: 'start' } }, 'ifIdle'],
+  ])('rejects threadless agent option %s', async (extra, expectedField) => {
+    const { call } = harness(ctx('acme', 'operator'));
+    const res = await call('POST', '/api/schedules', {
+      agentId: 'a1',
+      prompt: 'go',
+      cron: '*/5 * * * *',
+      ...extra,
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain(expectedField);
+  });
+
+  it('requires both owned memory ids for a threaded agent schedule', async () => {
+    const { call, events } = harness(ctx('acme', 'operator'));
+    expect(
+      (
+        await call('POST', '/api/schedules', {
+          agentId: 'a1',
+          prompt: 'go',
+          cron: '*/5 * * * *',
+          threadId: 'acme_thread',
+        })
+      ).status,
+    ).toBe(400);
+    const foreign = await call('POST', '/api/schedules', {
+      agentId: 'a1',
+      prompt: 'go',
+      cron: '*/5 * * * *',
+      threadId: 'acme_thread',
+      resourceId: 'other_resource',
+    });
+    expect(foreign.status).toBe(404);
+    expect(events).toContainEqual(
+      expect.objectContaining({ reason: 'foreign-memory-id' }),
+    );
+  });
+
+  it('rejects agent top-level requestContext and malformed metadata', async () => {
+    const { call } = harness(ctx('acme', 'operator'));
+    const context = await call('POST', '/api/schedules', {
+      agentId: 'a1',
+      prompt: 'go',
+      cron: '*/5 * * * *',
+      requestContext: { safe: true },
+    });
+    expect(context.status).toBe(400);
+    expect(context.body.error).toMatch(/requestContext/);
+    const metadata = await call('POST', '/api/schedules', {
+      ...WORKFLOW_CREATE,
+      metadata: [],
+    });
+    expect(metadata.status).toBe(400);
+    expect(metadata.body.error).toMatch(/metadata/);
   });
 
   it('a client-supplied metadata.tenantId cannot override the server tenant', async () => {
@@ -414,6 +514,20 @@ describe('createScheduleRouter — mutations', () => {
     return { ...h, id };
   }
 
+  async function seedAgent(): Promise<Harness & { id: string }> {
+    const h = harness(ctx('acme', 'operator'));
+    const created = await h.call('POST', '/api/schedules', {
+      agentId: 'a1',
+      prompt: 'go',
+      cron: '*/5 * * * *',
+      threadId: 'acme_thread',
+      resourceId: 'acme_resource',
+    });
+    const id = (created.body.schedule as { id: string }).id;
+    h.events.length = 0;
+    return { ...h, id };
+  }
+
   it('pause then resume flips status', async () => {
     const { call, id } = await seed();
     expect(
@@ -447,12 +561,63 @@ describe('createScheduleRouter — mutations', () => {
   });
 
   it('update rejects a reserved key in the agent ifIdle.streamOptions.requestContext', async () => {
-    const { call, id } = await seed();
+    const { call, id } = await seedAgent();
     const res = await call('PATCH', `/api/schedules/${id}`, {
       ifIdle: { streamOptions: { requestContext: { 'mastra:goal': 'x' } } },
     });
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/ifIdle\.streamOptions\.requestContext/);
+  });
+
+  it('rejects wrong-kind update fields instead of accepting a no-op', async () => {
+    const workflow = await seed();
+    const workflowResult = await workflow.call(
+      'PATCH',
+      `/api/schedules/${workflow.id}`,
+      { prompt: 'wrong kind' },
+    );
+    expect(workflowResult.status).toBe(400);
+    expect(workflowResult.body.error).toMatch(/prompt/);
+
+    const agent = await seedAgent();
+    const agentResult = await agent.call(
+      'PATCH',
+      `/api/schedules/${agent.id}`,
+      { inputData: { wrong: true } },
+    );
+    expect(agentResult.status).toBe(400);
+    expect(agentResult.body.error).toMatch(/inputData/);
+  });
+
+  it('updates an agent prompt and persists the normalized target', async () => {
+    const { call, store, id } = await seedAgent();
+    const res = await call('PATCH', `/api/schedules/${id}`, {
+      prompt: 'updated',
+      ifIdle: {
+        streamOptions: {
+          requestContext: { safe: true },
+          unsupported: 'dropped',
+        },
+      },
+    });
+    expect(res.status).toBe(200);
+    expect(store.m.get(id)?.target).toMatchObject({
+      type: 'agent',
+      prompt: 'updated',
+      ifIdle: { streamOptions: { requestContext: { safe: true } } },
+    });
+    expect(JSON.stringify(store.m.get(id)?.target)).not.toContain(
+      'unsupported',
+    );
+  });
+
+  it('rejects malformed update metadata', async () => {
+    const { call, id } = await seed();
+    const res = await call('PATCH', `/api/schedules/${id}`, {
+      metadata: 'not-an-object',
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/metadata/);
   });
 
   it('update 400s a non-string timezone (the create guard, now enforced on update too)', async () => {
@@ -484,5 +649,61 @@ describe('createScheduleRouter — mutations', () => {
     const res = await call('GET', `/api/schedules/${id}/triggers`);
     expect(res.status).toBe(200);
     expect(res.body.triggers as unknown[]).toHaveLength(1);
+  });
+});
+
+describe('createScheduleRouter — numeric configuration', () => {
+  it.each([
+    [{ maxSchedulesPerTenant: -1 }],
+    [{ maxSchedulesPerTenant: Number.NaN }],
+    [{ maxSchedulesPerTenant: 1.5 }],
+    [{ maxContentBytes: Number.POSITIVE_INFINITY }],
+    [{ maxContentBytes: Number.MAX_SAFE_INTEGER + 1 }],
+    [{ minFireIntervalMs: 0 }],
+  ])('fails synchronously for invalid numeric options: %o', (overrides) => {
+    expect(() => harness(ctx('acme', 'operator'), overrides)).toThrow(
+      RangeError,
+    );
+  });
+
+  it('supports intentional zero count/body caps', async () => {
+    const count = harness(ctx('acme', 'operator'), {
+      maxSchedulesPerTenant: 0,
+    });
+    expect(
+      (await count.call('POST', '/api/schedules', WORKFLOW_CREATE)).status,
+    ).toBe(400);
+
+    const body = harness(ctx('acme', 'operator'), { maxContentBytes: 0 });
+    expect(
+      (await body.call('POST', '/api/schedules', WORKFLOW_CREATE)).status,
+    ).toBe(413);
+  });
+});
+
+describe('createScheduleRouter internal errors', () => {
+  it('returns a generic 500 and logs the private store detail', async () => {
+    const logged: string[] = [];
+    const log = vi.spyOn(console, 'error').mockImplementation((value) => {
+      logged.push(String(value));
+    });
+    const store = new MemStore();
+    store.listSchedules = async () => {
+      throw new Error('private schedule store detail');
+    };
+    const router = createScheduleRouter({
+      resolve: resolveAs(ctx('acme', 'operator')),
+      store,
+    });
+
+    try {
+      const response = await router(new Request('http://host/api/schedules'));
+      expect(response?.status).toBe(500);
+      expect(await response?.json()).toEqual({ error: 'internal error' });
+      expect(response?.headers.get('cache-control')).toBe('no-store');
+      expect(logged.join('\n')).toContain('private schedule store detail');
+    } finally {
+      log.mockRestore();
+    }
   });
 });

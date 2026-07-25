@@ -83,6 +83,36 @@ interface GoalRecord {
 }
 
 describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
+  it.each([
+    { maxRunsCap: 0 },
+    { maxRunsCap: 1.5 },
+    { maxRunsCap: Number.NaN },
+    { maxContentBytes: -1 },
+    { maxContentBytes: Number.POSITIVE_INFINITY },
+  ])('rejects invalid numeric configuration synchronously: %o', (numeric) => {
+    const { store } = memoryStore();
+    expect(() =>
+      createObjectiveRouter({
+        resolve: async () => tenantCtx('operator'),
+        store,
+        ...numeric,
+      }),
+    ).toThrow(RangeError);
+  });
+
+  it('accepts a zero body cap and rejects a non-empty mutation body', async () => {
+    const { store } = memoryStore();
+    const router = createObjectiveRouter({
+      resolve: async () => tenantCtx('operator'),
+      store,
+      maxContentBytes: 0,
+    });
+    expect(
+      (await router(req('PUT', OWNED_THREAD, { objective: 'ship it' })))
+        ?.status,
+    ).toBe(413);
+  });
+
   it('returns null for a non-goal path (composes ahead of others)', async () => {
     const { store } = memoryStore();
     const router = createObjectiveRouter({
@@ -558,5 +588,34 @@ describe('GOAL_REQUEST_CONTEXT_KEY reservation (DL-018 no-collision pin)', () =>
       expect(key.startsWith('breakwater.')).toBe(true);
     }
     expect(GOAL_REQUEST_CONTEXT_KEY.startsWith('breakwater.')).toBe(false);
+  });
+});
+
+describe('createObjectiveRouter internal errors', () => {
+  it('returns a generic 500 and logs the private store detail', async () => {
+    const logged: string[] = [];
+    const log = vi.spyOn(console, 'error').mockImplementation((value) => {
+      logged.push(String(value));
+    });
+    const router = createObjectiveRouter({
+      resolve: async () => tenantCtx('operator'),
+      store: {
+        getState: async () => {
+          throw new Error('private objective store detail');
+        },
+        setState: async () => {},
+        deleteState: async () => {},
+      },
+    });
+
+    try {
+      const response = await router(req('GET', OWNED_THREAD));
+      expect(response?.status).toBe(500);
+      expect(await response?.json()).toEqual({ error: 'internal error' });
+      expect(response?.headers.get('cache-control')).toBe('no-store');
+      expect(logged.join('\n')).toContain('private objective store detail');
+    } finally {
+      log.mockRestore();
+    }
   });
 });

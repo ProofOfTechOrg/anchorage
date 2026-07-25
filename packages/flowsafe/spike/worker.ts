@@ -50,10 +50,12 @@ import type {
   Request as CfRequest,
   D1Database,
   DurableObjectNamespace,
+  DurableObjectState,
   ExecutionContext,
   ExportedHandler,
 } from '@cloudflare/workers-types';
 import { Agent } from '@mastra/core/agent';
+import type { OpenAICompatibleConfig } from '@mastra/core/llm';
 import { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
 import { readObjective, resolveGoalStore } from '@mastra/core/tools';
@@ -63,6 +65,10 @@ import {
   createConnector,
 } from '@proofoftech/breakwater';
 import { z } from 'zod';
+import {
+  createFlowsafeDurableAgent,
+  type FlowsafeDurableAgent,
+} from '../src/agent-runner/index.js';
 import {
   type ApprovalActor,
   ApprovalService,
@@ -80,6 +86,7 @@ import {
 import {
   BackgroundTaskHost,
   backgroundTasksStore,
+  createBackgroundTaskD1Domains,
 } from '../src/background-tasks/index.js';
 import {
   createD1Storage,
@@ -94,18 +101,21 @@ import {
   ThreadDurableObject,
   type ThreadScope,
   tenantOwnsMemoryId,
+  tenantOwnsSaltedId,
 } from '../src/do-runner/index.js';
 import {
   createObjectiveRouter,
   type ObjectiveAuditEvent,
 } from '../src/goals/index.js';
 import {
+  assertNoClientMemoryIds,
   bearerActorAuthenticator,
   createHubTopology,
   createRunRouter,
   createStreamRouter,
   createThreadTopology,
   doSummary,
+  reconcileApprovalsForSummary,
   staticTokenVerifier,
   type WorkflowMeta,
 } from '../src/host-kit/index.js';
@@ -139,6 +149,10 @@ interface Env {
   THREAD: DurableObjectNamespace;
   /** Per-tenant signal-provider host DO (idFromName(tenantId)); see DemoSignalProviderHost (Track E). */
   SIGNAL_PROVIDER_HOST: DurableObjectNamespace;
+  BACKGROUND_TASKS: DurableObjectNamespace;
+  SPIKE_LLM_MODEL_ID?: string;
+  SPIKE_LLM_API_KEY?: string;
+  SPIKE_LLM_BASE_URL?: string;
   /**
    * GitHub webhook signing secret (Track E). A LOCAL-ONLY spike fixture set in
    * spike/wrangler.jsonc `vars`; spike-verify.mjs re-passes it via `--var` and
@@ -165,6 +179,15 @@ const PUBLISH_CONNECTOR = 'demo-publisher';
  * (operator role, the request's resolved tenant) — matching showcase/deploy.
  */
 const SYSTEM_ACTOR_ID = 'demo-worker';
+
+function requiredToolProviderOptions(modelId: string | undefined) {
+  // DeepSeek V4 defaults to thinking mode, which rejects toolChoice=required.
+  // Disable thinking for this function-calling proof, matching the provider's
+  // documented request option. Other providers receive no DeepSeek metadata.
+  return modelId?.startsWith('deepseek/')
+    ? { deepseek: { thinking: { type: 'disabled' as const } } }
+    : undefined;
+}
 
 // LOCAL-ONLY spike identities (wrangler dev; never deployed). One tenant so
 // every probe sees the same queue; ids/roles chosen so spike-verify.mjs can
@@ -448,6 +471,107 @@ export class DemoRunner extends DurableObjectRunner<Env> {
  */
 export class DemoHub extends HubDurableObject<Env> {}
 
+/** One execution-capable background-task manager per tenant DO. */
+export class DemoBackgroundTasks {
+  readonly #state: DurableObjectState;
+  readonly #env: Env;
+  #host?: Promise<BackgroundTaskHost>;
+
+  constructor(state: DurableObjectState, env: Env) {
+    this.#state = state;
+    this.#env = env;
+  }
+
+  #boot(): Promise<BackgroundTaskHost> {
+    if (!this.#host) {
+      this.#host = (async () => {
+        const tenantId = this.#state.id.name;
+        if (!tenantId)
+          throw new Error('background-task DO requires idFromName(tenantId)');
+        const pubsub = createHostPubSub();
+        const storage = createD1Storage({
+          binding: this.#env.DB as unknown as never,
+          domains: createBackgroundTaskD1Domains({
+            binding: this.#env.DB as unknown as never,
+            tenantId,
+          }),
+        });
+        await storage.init();
+        const mastra = new Mastra({ storage, pubsub });
+        const host = new BackgroundTaskHost({
+          mastra,
+          pubsub,
+          execution: { tenantId },
+          executors: {
+            bgProbe: {
+              execute: async (args) => {
+                if (typeof args.delayMs === 'number' && args.delayMs > 0) {
+                  await new Promise((resolve) =>
+                    setTimeout(resolve, args.delayMs as number),
+                  );
+                }
+                return { executed: true, args };
+              },
+            },
+          },
+        });
+        await host.boot();
+        return host;
+      })();
+    }
+    return this.#host;
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    try {
+      const host = await this.#boot();
+      const url = new URL(request.url);
+      if (request.method === 'POST' && url.pathname === '/enqueue') {
+        const body = (await request.json()) as {
+          runId?: string;
+          delayMs?: number;
+        };
+        const tenantId = this.#state.id.name;
+        if (
+          !tenantId ||
+          !body.runId ||
+          !tenantOwnsMemoryId(tenantId, body.runId)
+        ) {
+          return json({ error: 'tenant-owned parent runId required' }, 404);
+        }
+        const queued = await host.manager.enqueue({
+          runId: body.runId,
+          toolName: 'bgProbe',
+          toolCallId: `call-${crypto.randomUUID()}`,
+          args: {
+            value: 'durable',
+            ...(body.delayMs ? { delayMs: body.delayMs } : {}),
+          },
+          agentId: 'background-probe-agent',
+          maxRetries: body.delayMs ? 1 : 0,
+        });
+        return json({ taskId: queued.task.id, status: queued.task.status });
+      }
+      if (request.method === 'GET' && url.pathname.startsWith('/task/')) {
+        const task = await host.manager.getTask(
+          decodeURIComponent(url.pathname.slice('/task/'.length)),
+        );
+        return task ? json(task) : json({ error: 'not found' }, 404);
+      }
+      return json({ error: 'not found' }, 404);
+    } catch (error) {
+      return json(
+        { error: error instanceof Error ? error.message : String(error) },
+        500,
+      );
+    }
+  }
+
+  async alarm(): Promise<void> {
+    await (await this.#boot()).onAlarm();
+  }
+}
+
 /**
  * Track C (M-004): the per-thread signal DO (idFromName(threadId), tenant-minted,
  * so id.name carries the tenant). `build()` wires init() with the ONE host pubsub
@@ -460,18 +584,31 @@ export class DemoHub extends HubDurableObject<Env> {}
  */
 export class DemoThread extends ThreadDurableObject<Env> {
   #agent?: Agent;
+  #durableAgent?: FlowsafeDurableAgent;
+  #mastra?: Mastra;
+  #storage?: ReturnType<typeof createD1Storage>;
 
   protected build(env: Env): InitResult {
-    return init(env, { pubsub: createHostPubSub() });
+    const storage = createD1Storage({
+      binding: env.DB as unknown as never,
+      domains: createSignalStorageDomains(env.DB as unknown as never),
+    });
+    this.#storage = storage;
+    return init(
+      { storage },
+      {
+        pubsub: createHostPubSub(),
+        requestContextForRun: approvalGrantProvider(
+          approvalStoreFactory(env.DB).forTenant(this.tenantId),
+        ),
+      },
+    );
   }
 
-  // One agent per DO instance. `model` is a CONSTRUCTION placeholder — the C-S2
-  // proof never drives the LLM (Track A's deferred real-loop boundary): an
-  // idle-wake RESERVES a run synchronously, which is all the in-process-drain
-  // proof needs. Registered with a Mastra whose D1 storage composes the Track C
-  // signal domains, so `sendNotificationSignal` (the Track E delivery target)
-  // PERSISTS to mastra_notifications. Stamp the DO's pubsub so the agent's
-  // registry state is the one this isolate shares (C-S2 affinity).
+  // The deterministic signal-affinity probe retains a non-driven model so
+  // `spike:verify` needs no credential. The separate live agent below uses the
+  // configured OpenAI-compatible model. Both agents share this DO's D1 storage
+  // and pubsub identity.
   #getAgent(scope: ThreadScope): Agent {
     if (!this.#agent) {
       const bare = new Agent({
@@ -481,10 +618,7 @@ export class DemoThread extends ThreadDurableObject<Env> {
         model: 'openai/gpt-4o-mini',
       });
       const mastra = new Mastra({
-        storage: createD1Storage({
-          binding: this.env.DB as unknown as never,
-          domains: createSignalStorageDomains(this.env.DB as unknown as never),
-        }),
+        storage: this.#storage,
         agents: { 'demo-thread-signal-agent': bare },
       });
       this.#agent = mastra.getAgent('demo-thread-signal-agent');
@@ -493,16 +627,348 @@ export class DemoThread extends ThreadDurableObject<Env> {
     return this.#agent;
   }
 
+  async #ensureSideEffectTable(): Promise<void> {
+    await this.env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS spike_agent_side_effects (
+         tool_call_id TEXT PRIMARY KEY,
+         thread_id TEXT NOT NULL,
+         resource_id TEXT NOT NULL,
+         created_at TEXT NOT NULL
+       )`,
+    ).run();
+  }
+
+  #getDurableAgent(scope: ThreadScope): FlowsafeDurableAgent {
+    if (this.#durableAgent) return this.#durableAgent;
+    const modelId = this.env.SPIKE_LLM_MODEL_ID;
+    const apiKey = this.env.SPIKE_LLM_API_KEY;
+    if (!modelId || !apiKey || !modelId.includes('/')) {
+      throw new Error(
+        'live agent requires SPIKE_LLM_MODEL_ID (provider/model) and SPIKE_LLM_API_KEY',
+      );
+    }
+    const model: OpenAICompatibleConfig = {
+      id: modelId as `${string}/${string}`,
+      apiKey,
+      ...(this.env.SPIKE_LLM_BASE_URL
+        ? { url: this.env.SPIKE_LLM_BASE_URL }
+        : {}),
+    };
+    const write = createConnector({
+      // Agent approval payloads carry the provider-visible tool name. Keep the
+      // connector id provider-safe so Mastra does not rewrite it and the
+      // approved record grants the exact id the breakwater gate checks.
+      id: 'spike_recordWrite',
+      description: 'Record the required durable-agent write exactly once',
+      inputSchema: z.object({ value: z.string().optional() }),
+      outputSchema: z.object({ recorded: z.boolean() }),
+      execute: async (_input, context) => {
+        const toolCallId = context.agent?.toolCallId;
+        const threadId = context.agent?.threadId;
+        const resourceId = context.agent?.resourceId;
+        if (!toolCallId || !threadId || !resourceId) {
+          throw new Error(
+            'agent tool context is missing its durable memory binding',
+          );
+        }
+        await this.#ensureSideEffectTable();
+        await this.env.DB.prepare(
+          `INSERT OR IGNORE INTO spike_agent_side_effects
+           (tool_call_id, thread_id, resource_id, created_at)
+           VALUES (?, ?, ?, ?)`,
+        )
+          .bind(toolCallId, threadId, resourceId, new Date().toISOString())
+          .run();
+        return { recorded: true };
+      },
+      permissions: { sideEffect: 'write' },
+      policies: {
+        writePermissions: { requireApproval: ['spike_recordWrite'] },
+      },
+    });
+    const bare = new Agent({
+      id: 'spike-live-agent',
+      name: 'spike-live-agent',
+      instructions:
+        'You must call spike_recordWrite exactly once. Do not answer before using it.',
+      model,
+      tools: { spike_recordWrite: write },
+      defaultOptions: { toolChoice: 'required' },
+    });
+    this.#mastra = new Mastra({
+      storage: this.#storage,
+      agents: { 'spike-live-agent': bare },
+    });
+    const agent = this.#mastra.getAgent('spike-live-agent');
+    this.#durableAgent = createFlowsafeDurableAgent({
+      agent,
+      runtime: scope.init.runtime,
+      pubsub: scope.init.pubsub,
+      threadRuntime: this.#mastra.agentThreadStreamRuntime,
+      // toolChoice=required applies to every model step. One step guarantees
+      // the proof requests exactly one write instead of forcing another tool
+      // call after the approved result.
+      maxSteps: 1,
+    });
+    return this.#durableAgent;
+  }
+
+  async #bridge(
+    scope: ThreadScope,
+    runId: string,
+    resourceId?: string,
+  ): Promise<Awaited<ReturnType<RunnerRuntime['status']>>> {
+    const summary = await scope.init.runtime.status(
+      'durable-agentic-loop',
+      runId,
+    );
+    if (!summary) return null;
+    if (summary.status === 'suspended') {
+      const service = new ApprovalService({
+        store: approvalStoreFactory(this.env.DB).forTenant(scope.tenantId),
+      });
+      const actor: ApprovalActor = {
+        id: SYSTEM_ACTOR_ID,
+        role: 'operator',
+        tenantId: scope.tenantId,
+      };
+      await reconcileApprovalsForSummary(
+        service,
+        'durable-agentic-loop',
+        summary,
+        actor,
+        {
+          kind: 'thread',
+          threadId: scope.threadId,
+          ...(resourceId ? { resourceId } : {}),
+        },
+      );
+    }
+    return summary;
+  }
+
+  async #startAgent(
+    scope: ThreadScope,
+    input: {
+      runId: string;
+      resourceId?: string;
+      prompt?: string;
+      message?: unknown;
+      signal?: unknown;
+      threaded?: boolean;
+    },
+  ): Promise<Response> {
+    if (
+      typeof input.runId !== 'string' ||
+      !scope.tenantId ||
+      !input.runId.startsWith(`${scope.tenantId}_`)
+    ) {
+      return json({ error: 'runId is not owned by this tenant' }, 404);
+    }
+    if (
+      input.resourceId !== undefined &&
+      !tenantOwnsMemoryId(scope.tenantId, input.resourceId)
+    ) {
+      return json({ error: 'resourceId is not owned by this tenant' }, 404);
+    }
+    const agent = this.#getDurableAgent(scope);
+    if (input.threaded !== false && input.resourceId !== undefined) {
+      const activeRunId = agent.getActiveThreadRunId({
+        threadId: scope.threadId,
+        resourceId: input.resourceId,
+      });
+      if (activeRunId) {
+        return json({ runId: activeRunId, joined: true });
+      }
+    }
+    const content =
+      typeof input.prompt === 'string'
+        ? input.prompt
+        : (input.message ?? input.signal ?? 'Perform the required write now.');
+    const memory =
+      input.threaded === false || input.resourceId === undefined
+        ? undefined
+        : { thread: scope.threadId, resource: input.resourceId };
+    const providerOptions = requiredToolProviderOptions(
+      this.env.SPIKE_LLM_MODEL_ID,
+    );
+    await agent.stream(content as never, {
+      runId: input.runId,
+      toolChoice: 'required',
+      ...(providerOptions ? { providerOptions } : {}),
+      ...(memory ? { memory } : {}),
+    });
+    const summary = await this.#bridge(scope, input.runId, memory?.resource);
+    return json({ summary, runId: input.runId });
+  }
+
   #signalRoutes = createThreadSignalRoutes({
-    resolveAgent: (scope) => this.#getAgent(scope),
+    resolveAgent: (scope) =>
+      this.env.SPIKE_LLM_MODEL_ID && this.env.SPIKE_LLM_API_KEY
+        ? (this.#getDurableAgent(scope) as unknown as Agent)
+        : this.#getAgent(scope),
     resolveResourceId: (scope) => mintResourceId(scope.tenantId, 'demo-thread'),
+    resolveNotificationsStorage: async () => {
+      const store = await this.#storage?.getStore('notifications');
+      if (!store) throw new Error('notifications storage unavailable');
+      return store;
+    },
+    startIdleRun: async (input) => {
+      const scope = {
+        threadId: input.threadId,
+        tenantId: this.tenantId,
+        requestedBy: input.requestedBy,
+        init: this.#ensureLiveInit(),
+      };
+      const response = await this.#startAgent(scope, {
+        runId: input.runId,
+        resourceId: input.resourceId,
+        message: input.message,
+        signal: input.signal,
+      });
+      if (!response.ok)
+        throw new Error(`idle agent start failed: ${response.status}`);
+      return { runId: input.runId };
+    },
   });
+
+  #lastScope?: ThreadScope;
+
+  #ensureLiveInit(): InitResult {
+    if (!this.#lastScope) throw new Error('thread scope is not initialized');
+    return this.#lastScope.init;
+  }
+
+  async #assertSnapshotMemoryBinding(
+    scope: ThreadScope,
+    runId: string,
+    resourceId?: string,
+  ): Promise<void> {
+    if (!tenantOwnsSaltedId(scope.tenantId, runId)) {
+      throw new Error('agent run is not owned by this tenant');
+    }
+    const workflows = await this.#storage?.getStore('workflows');
+    const snapshot = await workflows?.loadWorkflowSnapshot({
+      workflowName: 'durable-agentic-loop',
+      runId,
+    });
+    const input = snapshot?.context.input as
+      | {
+          messageListState?: {
+            memoryInfo?: { threadId?: unknown; resourceId?: unknown } | null;
+          };
+        }
+      | undefined;
+    const memoryInfo = input?.messageListState?.memoryInfo;
+    const matches = resourceId
+      ? memoryInfo?.threadId === scope.threadId &&
+        memoryInfo.resourceId === resourceId
+      : memoryInfo === null;
+    // loadWorkflowSnapshot already selects the durable-agentic-loop workflow.
+    // Core's input type carries __workflowKind, but the persisted context.input
+    // projection drops that marker; the credentialed restart proof pins this
+    // actual shape. The tenant-owned memory binding is the host route's check.
+    if (!matches) {
+      console.error(
+        JSON.stringify({
+          type: 'spike-agent-snapshot-binding-mismatch',
+          runId,
+          expected: {
+            threadId: scope.threadId,
+            resourceId: resourceId ?? null,
+          },
+          actual: {
+            memoryInfo: memoryInfo ?? null,
+          },
+        }),
+      );
+      throw new Error(
+        'agent snapshot memory binding does not match its thread',
+      );
+    }
+  }
 
   protected async route(
     request: Request,
     scope: ThreadScope,
   ): Promise<Response> {
+    this.#lastScope = scope;
     const url = new URL(request.url);
+    if (request.method === 'POST' && url.pathname === '/agent/start') {
+      return this.#startAgent(scope, (await request.json()) as never);
+    }
+    if (request.method === 'GET' && url.pathname === '/agent/status') {
+      const runId = url.searchParams.get('runId');
+      const resourceId = url.searchParams.get('resourceId');
+      if (!runId || !resourceId)
+        return json({ error: 'runId and resourceId required' }, 400);
+      const summary = await this.#bridge(scope, runId, resourceId);
+      return summary ? json(summary) : json({ error: 'not found' }, 404);
+    }
+    if (request.method === 'POST' && url.pathname === '/agent/resume') {
+      const body = (await request.json()) as {
+        runId?: string;
+        resourceId?: string;
+        step?: string[];
+        resumeData?: unknown;
+      };
+      if (
+        !body.runId ||
+        (body.resourceId !== undefined &&
+          !tenantOwnsMemoryId(scope.tenantId, body.resourceId))
+      ) {
+        return json({ error: 'owned runId and resourceId are required' }, 404);
+      }
+      await this.#assertSnapshotMemoryBinding(
+        scope,
+        body.runId,
+        body.resourceId,
+      );
+      const summary = await this.#getDurableAgent(scope).resumeViaRuntime({
+        runId: body.runId,
+        step: body.step,
+        resumeData: body.resumeData,
+        ...(body.resourceId
+          ? { memory: { thread: scope.threadId, resource: body.resourceId } }
+          : {}),
+      });
+      await this.#bridge(scope, body.runId, body.resourceId);
+      return json(summary);
+    }
+    if (request.method === 'POST' && url.pathname === '/agent/raw-resume') {
+      const body = (await request.json()) as { runId: string; step?: string[] };
+      const summary = await scope.init.runtime.resume(
+        'durable-agentic-loop',
+        body.runId,
+        { step: body.step, resumeData: { approved: true } },
+      );
+      return json(summary);
+    }
+    if (
+      request.method === 'POST' &&
+      url.pathname === '/agent/prepared-resume'
+    ) {
+      const body = (await request.json()) as {
+        runId: string;
+        resourceId: string;
+        step?: string[];
+      };
+      if (!tenantOwnsMemoryId(scope.tenantId, body.resourceId)) {
+        return json({ error: 'resourceId is not owned by this tenant' }, 404);
+      }
+      await this.#assertSnapshotMemoryBinding(
+        scope,
+        body.runId,
+        body.resourceId,
+      );
+      const summary = await this.#getDurableAgent(scope).resumeViaRuntime({
+        runId: body.runId,
+        step: body.step,
+        resumeData: { approved: true },
+        memory: { thread: scope.threadId, resource: body.resourceId },
+      });
+      return json(summary);
+    }
     if (request.method === 'POST' && url.pathname === '/probe/affinity') {
       return this.#affinityProbe(scope);
     }
@@ -720,6 +1186,117 @@ function runStub(
   return env.RUNNER.get(env.RUNNER.idFromName(`${workflowId}:${runId}`));
 }
 
+async function handleLiveAgentRoute(
+  request: Request,
+  env: Env,
+  resolve: ReturnType<typeof createTenantResolver>,
+): Promise<Response | null> {
+  const url = new URL(request.url);
+  if (!url.pathname.startsWith('/agent/live/')) return null;
+  const tenant = await resolve(request);
+  if (!tenant) return json({ error: 'unauthorized' }, 401);
+  if (!['admin', 'operator'].includes(tenant.actor.role)) {
+    return json({ error: 'forbidden' }, 403);
+  }
+  const topology = createThreadTopology(env.THREAD);
+
+  if (request.method === 'POST' && url.pathname === '/agent/live/start') {
+    const body = (await request.json()) as Record<string, unknown>;
+    try {
+      assertNoClientMemoryIds(body);
+    } catch (error) {
+      return json(
+        { error: error instanceof Error ? error.message : String(error) },
+        400,
+      );
+    }
+    const threadId = tenant.newThreadId();
+    const resourceId = tenant.newResourceId(`live-${crypto.randomUUID()}`);
+    const runId = tenant.newRunId();
+    const response = await topology.send(tenant, threadId, '/agent/start', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        runId,
+        resourceId,
+        prompt:
+          typeof body.prompt === 'string'
+            ? body.prompt
+            : 'Call the required write tool now.',
+        threaded: true,
+      }),
+    });
+    const result = await response.json();
+    return json({ threadId, resourceId, runId, result }, response.status);
+  }
+
+  if (request.method === 'GET' && url.pathname === '/agent/live/status') {
+    const threadId = url.searchParams.get('threadId');
+    const resourceId = url.searchParams.get('resourceId');
+    const runId = url.searchParams.get('runId');
+    if (!threadId || !resourceId || !runId) {
+      return json(
+        { error: 'threadId, resourceId, and runId are required' },
+        400,
+      );
+    }
+    const response = await topology.send(
+      tenant,
+      threadId,
+      `/agent/status?runId=${encodeURIComponent(runId)}&resourceId=${encodeURIComponent(resourceId)}`,
+    );
+    return new Response(response.body, response);
+  }
+
+  if (
+    request.method === 'POST' &&
+    (url.pathname === '/agent/live/raw-resume' ||
+      url.pathname === '/agent/live/prepared-resume')
+  ) {
+    const body = (await request.json()) as {
+      threadId?: string;
+      resourceId?: string;
+      runId?: string;
+      step?: string[];
+    };
+    if (!body.threadId || !body.resourceId || !body.runId) {
+      return json(
+        { error: 'threadId, resourceId, and runId are required' },
+        400,
+      );
+    }
+    const route = url.pathname.endsWith('/raw-resume')
+      ? '/agent/raw-resume'
+      : '/agent/prepared-resume';
+    const response = await topology.send(tenant, body.threadId, route, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return new Response(response.body, response);
+  }
+
+  if (request.method === 'GET' && url.pathname === '/agent/live/effects') {
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS spike_agent_side_effects (
+         tool_call_id TEXT PRIMARY KEY,
+         thread_id TEXT NOT NULL,
+         resource_id TEXT NOT NULL,
+         created_at TEXT NOT NULL
+       )`,
+    ).run();
+    const rows = await env.DB.prepare(
+      `SELECT tool_call_id FROM spike_agent_side_effects
+       WHERE thread_id >= ? AND thread_id < ?`,
+    )
+      .bind(`${tenant.tenantId}_`, `${tenant.tenantId}\x60`)
+      .all();
+    return json({ count: rows.results.length });
+  }
+
+  return json({ error: 'not found' }, 404);
+}
+
 // Worker-level approval service: shares the DO's D1 database; decisions
 // resume the run through its DO stub (grants come from the store via the
 // DO-side provider, never from this request).
@@ -738,8 +1315,37 @@ function buildApprovalService(
     // doSummary (host-kit) reads the DO's answer and rethrows a non-ok one as a
     // RunRouteError carrying the DO's own status — the same reader the showcase
     // and deploy hosts use. The spike keeps its own topology, not its own parsing.
-    resumeRun: async (record, decision) =>
-      doSummary(
+    resumeRun: async (record, decision) => {
+      if (record.resumeTarget?.kind === 'thread') {
+        const actor: ApprovalActor = {
+          id: SYSTEM_ACTOR_ID,
+          role: 'operator',
+          tenantId: record.tenantId,
+        };
+        const tenant = {
+          actor,
+          tenantId: record.tenantId,
+          ownsMemoryId: (id: string) => tenantOwnsMemoryId(record.tenantId, id),
+        } as unknown as TenantContext;
+        return doSummary(
+          await createThreadTopology(env.THREAD).send(
+            tenant,
+            record.resumeTarget.threadId,
+            '/agent/resume',
+            {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                runId: record.runId,
+                resourceId: record.resumeTarget.resourceId,
+                step: record.stepPath,
+                resumeData: defaultResumeData(record, decision),
+              }),
+            },
+          ),
+        );
+      }
+      return doSummary(
         await runStub(env, record.workflowId, record.runId).fetch(
           `http://do/runs/${record.workflowId}/${record.runId}/resume`,
           {
@@ -751,7 +1357,8 @@ function buildApprovalService(
             }),
           },
         ),
-      ),
+      );
+    },
   });
 }
 
@@ -759,11 +1366,10 @@ function buildApprovalService(
 // LOCAL-ONLY worker-level probes (spike tenant 'spike'), driven by
 // scripts/spike-verify.mjs:
 //  - B-S3: createConnector rejects a smuggled `_background` arg and audits it.
-//  - B-S2: the recovery SEAM — a FRESH BackgroundTaskHost's PUBLIC init()
-//    recovers a task a prior instance left 'running' in D1 (no private call,
-//    R-002 pin). Bodies do NOT execute on D1 (R-B1/R-B2 — @mastra/cloudflare-d1
-//    reports supportsConcurrentUpdates() === false), so a maxRetries-0 stranded
-//    task recovers to 'failed' — the seam firing, on real workerd + D1.
+//  - B-S2: the persistence-only compatibility path recovers a task through
+//    public init() with the stock D1 domains.
+//  - H2: DemoBackgroundTasks composes the serialized and tenant-scoped domains,
+//    executes a body, and recovers a killed in-flight task after restart.
 const BG_TASK_ID = 'spike_bs2';
 const BG_RUN_ID = 'spike_bg-run';
 
@@ -779,6 +1385,34 @@ async function handleBackgroundTaskProbe(
 ): Promise<Response | null> {
   const url = new URL(request.url);
   const path = url.pathname;
+
+  const executionStub = () =>
+    env.BACKGROUND_TASKS.get(env.BACKGROUND_TASKS.idFromName('spike'));
+
+  if (
+    request.method === 'POST' &&
+    (path === '/bg/execute' || path === '/bg/execute-recover')
+  ) {
+    const response = await executionStub().fetch('http://background/enqueue', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        runId: `spike_${crypto.randomUUID()}`,
+        ...(path.endsWith('execute-recover') ? { delayMs: 5000 } : {}),
+      }),
+    });
+    return new Response(response.body, response);
+  }
+
+  if (request.method === 'GET' && path.startsWith('/bg/execution-task/')) {
+    const taskId = encodeURIComponent(
+      decodeURIComponent(path.slice('/bg/execution-task/'.length)),
+    );
+    const response = await executionStub().fetch(
+      `http://background/task/${taskId}`,
+    );
+    return new Response(response.body, response);
+  }
 
   if (request.method === 'POST' && path === '/bg/background-reject') {
     const audit = new AuditLogger();
@@ -873,11 +1507,11 @@ async function handleSignalProbe(
   const url = new URL(request.url);
   const path = url.pathname;
 
-  // The topology uses only .tenantId + .ownsMemoryId; a partial context suffices
-  // for a local probe (the real resolver builds the full TenantContext).
+  // Local probe context; the topology overwrites both trusted headers from it.
   const ctxFor = (tenantId: string): TenantContext =>
     ({
       tenantId,
+      actor: { id: 'signal-probe', role: 'operator', tenantId },
       ownsMemoryId: (id: string) => tenantOwnsMemoryId(tenantId, id),
     }) as unknown as TenantContext;
 
@@ -1054,6 +1688,8 @@ async function handleGoalProbe(
 //    ABSENT from the executing leg — the DO derives the leg context solely via
 //    #requestContextFor (the topology start carries only inputData), so the DO's
 //    own scope keys ARE present and the stored context is dropped fail-closed.
+//  - D-S3: an agent target reaches the same per-thread runtime-driven loop and
+//    approval bridge as an interactive start.
 async function handleScheduleProbe(
   request: Request,
   env: Env,
@@ -1148,6 +1784,78 @@ async function handleScheduleProbe(
     });
   }
 
+  if (request.method === 'POST' && path === '/sched/agent') {
+    if (!env.SPIKE_LLM_MODEL_ID || !env.SPIKE_LLM_API_KEY) {
+      return json({ error: 'live LLM configuration is required' }, 503);
+    }
+    const id = `schedule_${crypto.randomUUID()}`;
+    const threadId = mintThreadId('spike');
+    const resourceId = mintResourceId(
+      'spike',
+      `schedule-${crypto.randomUUID()}`,
+    );
+    await store.createSchedule({
+      id,
+      target: {
+        type: 'agent',
+        agentId: 'spike-live-agent',
+        prompt: 'Use the required write tool exactly once.',
+        threadId,
+        resourceId,
+      },
+      cron: '* * * * *',
+      status: 'active',
+      nextFireAt: now - 1000,
+      createdAt: now,
+      updatedAt: now,
+      metadata: { tenantId: 'spike' },
+    });
+    const actor: ApprovalActor = {
+      id: SYSTEM_ACTOR_ID,
+      role: 'operator',
+      tenantId: 'spike',
+    };
+    const tenant = {
+      actor,
+      tenantId: 'spike',
+      ownsMemoryId: (value: string) => tenantOwnsMemoryId('spike', value),
+    } as unknown as TenantContext;
+    const tick = createScheduleTick({
+      store,
+      start: async (_workflowId, runId) => ({ runId }),
+      startAgent: async ({ target, runId, topologyThreadId, threaded }) => {
+        const response = await createThreadTopology(env.THREAD).send(
+          tenant,
+          topologyThreadId,
+          '/agent/start',
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              runId,
+              resourceId: threaded ? target.resourceId : undefined,
+              prompt: target.prompt,
+              threaded,
+            }),
+          },
+        );
+        if (!response.ok)
+          throw new Error(`agent schedule start returned ${response.status}`);
+        const started = (await response.json()) as { runId?: string };
+        return { runId: started.runId ?? runId };
+      },
+    });
+    const result = await tick();
+    const trigger = (await store.listTriggers(id))[0];
+    return json({
+      result,
+      scheduleId: id,
+      threadId,
+      resourceId,
+      runId: trigger?.runId ?? null,
+    });
+  }
+
   return null;
 }
 
@@ -1178,6 +1886,9 @@ const handler: ExportedHandler<Env> = {
       buildService: (store) => buildApprovalService(store, env, streamSink),
     });
     const routed = request as unknown as Request;
+
+    const liveAgentResponse = await handleLiveAgentRoute(routed, env, resolve);
+    if (liveAgentResponse) return liveAgentResponse;
 
     // Track B probes (B-S2 recovery seam, B-S3 _background rejection) — local,
     // unauthenticated, ahead of the routers.

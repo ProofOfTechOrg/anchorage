@@ -6,13 +6,19 @@
 // re-exported here for a single import surface.
 
 export type {
+  CreateBackgroundTaskD1DomainsOptions,
   PurgeExpiredBackgroundTasksOptions,
   PurgeExpiredBackgroundTasksResult,
 } from './d1-storage.js';
 export {
   BACKGROUND_TASK_TTL_PURGE_TABLES,
   backgroundTasksStore,
+  createBackgroundTaskD1Domains,
+  DurableObjectWorkflowsStorageD1,
   purgeExpiredBackgroundTasks,
+  SERIALIZED_WORKFLOWS_D1,
+  TENANT_SCOPED_BACKGROUND_TASKS_D1,
+  TenantScopedBackgroundTasksStorageD1,
 } from './d1-storage.js';
 export type { BackgroundTaskHostOptions } from './host.js';
 export { BackgroundTaskHost } from './host.js';

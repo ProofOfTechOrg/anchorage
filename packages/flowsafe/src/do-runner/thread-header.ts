@@ -20,3 +20,6 @@
  * is why `createTenantResolver` refuses one that does, before any store binds.
  */
 export const THREAD_TENANT_HEADER = 'x-flowsafe-tenant';
+
+/** The trusted Worker-stamped actor that caused a thread operation. */
+export const THREAD_ACTOR_HEADER = 'x-flowsafe-actor';

@@ -3,7 +3,7 @@
 // ApprovalApiClient mold: fetch injected behind a minimal structural type, so it
 // typechecks in the workers-typed pass, runs under plain node in tests, and gets
 // the global fetch by default in a browser. Subpath-only
-// (`@proofoftech/flowsafe/signals`) — host-side wiring, never the root barrel.
+// (`@proofoftech/flowsafe/signals/client`) — never the host-side signals barrel.
 //
 // The SEND surface targets the createSignalRouter routes
 // (`POST /api/threads/:threadId/{message,queue,signal,state,notification}`), so

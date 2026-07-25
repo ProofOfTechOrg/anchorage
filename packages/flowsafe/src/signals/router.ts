@@ -57,6 +57,8 @@ import {
   type ThreadTopology,
 } from '../host-kit/index.js';
 import { safeDecodeSegment } from '../host-kit/route-path.js';
+import { internalErrorResponse } from '../internal-error-response.js';
+import { nonnegativeSafeInteger } from '../numeric-config.js';
 
 /** The ingest channels, each mapped to a thread-DO route. */
 const CHANNEL_PATHS = {
@@ -114,7 +116,10 @@ export interface SignalRouterOptions {
    * name validation). Absent ⇒ attributes pass through (the host opted out).
    */
   attributeAllowlist?: readonly string[];
-  /** Max ingest payload size in bytes. Default 16384 (16 KiB). */
+  /**
+   * Max ingest payload size in bytes. Must be a nonnegative safe integer; zero
+   * denies every non-empty body. Default 16384 (16 KiB).
+   */
   maxContentBytes?: number;
   /** Route prefix. Default '/api/threads'. */
   basePath?: string;
@@ -135,7 +140,10 @@ function json(payload: unknown, status = 200): Response {
 export function createSignalRouter(options: SignalRouterOptions): SignalRouter {
   const { resolve, topology } = options;
   const roles = options.roles ?? RUN_START_ROLES;
-  const maxContentBytes = options.maxContentBytes ?? 16_384;
+  const maxContentBytes = nonnegativeSafeInteger(
+    options.maxContentBytes ?? 16_384,
+    'signal maxContentBytes',
+  );
   const base = options.basePath ?? '/api/threads';
   const allowlist = options.attributeAllowlist
     ? new Set(options.attributeAllowlist)
@@ -300,10 +308,7 @@ export function createSignalRouter(options: SignalRouterOptions): SignalRouter {
         // Pre-auth (the resolver itself threw): unauthenticated, so not audited.
         return json({ error: 'forbidden' }, 403);
       }
-      return json(
-        { error: error instanceof Error ? error.message : String(error) },
-        500,
-      );
+      return internalErrorResponse('signals.ingest', error);
     }
   };
 }

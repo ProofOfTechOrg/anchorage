@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { type InitResult, init } from './init.js';
 import { mintThreadId } from './memory-id.js';
 import { ThreadDurableObject, type ThreadScope } from './thread-do.js';
-import { THREAD_TENANT_HEADER } from './thread-header.js';
+import { THREAD_ACTOR_HEADER, THREAD_TENANT_HEADER } from './thread-header.js';
 
 // A host subclass: build() is its init() wiring, route() its thread routes.
 // This one echoes the ASSERTED scope, so every test below reads exactly what
@@ -35,10 +35,16 @@ function threadWith(name: string | undefined): TestThread {
   return new TestThread({ id: { name } } as unknown as DurableObjectState, {});
 }
 
-function request(tenantId?: string): Request {
+function request(
+  tenantId?: string,
+  requestedBy: string | null = 'operator',
+): Request {
+  const headers = new Headers();
+  if (tenantId !== undefined) headers.set(THREAD_TENANT_HEADER, tenantId);
+  if (requestedBy !== null) headers.set(THREAD_ACTOR_HEADER, requestedBy);
   return new Request('http://thread/messages', {
     method: 'POST',
-    headers: tenantId === undefined ? {} : { [THREAD_TENANT_HEADER]: tenantId },
+    headers,
   });
 }
 
@@ -84,6 +90,15 @@ describe('ThreadDurableObject tenant assertion', () => {
     // #then
     expect(response.status).toBe(403);
     expect(await response.text()).toMatch(/authenticates as '<none>'/);
+  });
+
+  it('refuses a request without the topology-owned actor identity', async () => {
+    const thread = threadWith(mintThreadId('acme', () => 't1'));
+
+    const response = await thread.fetch(request('acme', null));
+
+    expect(response.status).toBe(403);
+    expect(await response.text()).toMatch(/carries no trusted actor/);
   });
 
   it('is exact at the tenant boundary (the acme vs acmecorp pin)', async () => {

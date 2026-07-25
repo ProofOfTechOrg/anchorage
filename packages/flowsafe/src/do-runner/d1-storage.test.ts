@@ -1623,6 +1623,31 @@ function taskIds(db: SqliteDatabase, prefix = ''): string[] {
 }
 
 describe('purgeExpiredBackgroundTasks', () => {
+  it('deletes each terminal task internal workflow snapshot before its row', async () => {
+    const sqlite = openSqlite();
+    createBackgroundTasksTable(sqlite);
+    createSnapshotTable(sqlite);
+    seedTask(sqlite, {
+      id: 'task-old',
+      runId: 'abc_r1',
+      status: 'completed',
+      completedAt: NOW - 2 * 3_600_000,
+    });
+    const iso = new Date(NOW - 2 * 3_600_000).toISOString();
+    sqlite
+      .prepare(
+        `INSERT INTO mastra_workflow_snapshot
+         (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
+         VALUES ('__background-task', 'task-old', NULL, '{}', ?, ?)`,
+      )
+      .run(iso, iso);
+
+    await purgeExpiredBackgroundTasks(d1Like(sqlite), { now: () => NOW });
+
+    expect(taskIds(sqlite)).toEqual([]);
+    expect(remainingRunIds(sqlite)).toEqual([]);
+  });
+
   it('reaps completed rows past completedTtlMs and keeps recent ones', async () => {
     // #given — one completed 2h ago, one 30m ago; default completedTtlMs 1h
     const sqlite = openSqlite();
@@ -1740,6 +1765,31 @@ describe('purgeExpiredBackgroundTasks', () => {
 });
 
 describe('purgeTenant background-task coverage (DL-003)', () => {
+  it('reaps unsalted internal snapshots associated through tenant-owned task rows', async () => {
+    const sqlite = openSqlite();
+    createBackgroundTasksTable(sqlite);
+    createSnapshotTable(sqlite);
+    seedTask(sqlite, { id: 'task-a', runId: 'abc_r1', status: 'running' });
+    seedTask(sqlite, { id: 'task-b', runId: 'xyz_r1', status: 'running' });
+    const iso = new Date(NOW).toISOString();
+    for (const id of ['task-a', 'task-b']) {
+      sqlite
+        .prepare(
+          `INSERT INTO mastra_workflow_snapshot
+           (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
+           VALUES ('__background-task', ?, NULL, '{}', ?, ?)`,
+        )
+        .run(id, iso, iso);
+    }
+
+    const result = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
+
+    expect(result.snapshots).toBe(1);
+    expect(result.backgroundTasks).toBe(1);
+    expect(remainingRunIds(sqlite)).toEqual(['task-b']);
+    expect(taskIds(sqlite)).toEqual(['task-b']);
+  });
+
   it('reaps a tenant’s background-task rows by the run_id range, exactly one tenant', async () => {
     // #given — abc and its digit-suffixed prefix neighbor abc5 (the range
     // exactness case), plus another tenant xyz, all keyed by run_id

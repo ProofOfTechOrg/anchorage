@@ -11,6 +11,7 @@ import {
   type ApprovalAuditSink,
   type ApprovalDecision,
   type ApprovalRecord,
+  type ApprovalResumeTarget,
   type ApprovalService,
   approvalCursor,
   MAX_APPROVAL_LIST_LIMIT,
@@ -34,10 +35,12 @@ export type ResumeRunFn = (
  * The connector ids a suspended step's decision should mint. A workflow STEP
  * gate declares them explicitly in a `connectors` array. An AGENT gate (Track A,
  * R-003) declares none — it names the tool the model called by `toolName` (both
- * durable suspend shapes), which IS the breakwater connector id the write gate
- * checks; agentGateConnectors derives [toolName] so an approved agent gate mints
- * the grant for exactly that connector and the round-trip closes. The explicit
- * array wins when present, so workflow gates are unaffected.
+ * durable suspend shapes). For automatic grant derivation, that provider-visible
+ * name MUST already be the breakwater connector's provider-safe id
+ * (`[A-Za-z0-9_-]+`); providers can rewrite punctuation-bearing ids and the
+ * suspend payload carries no reversible original-id field. agentGateConnectors
+ * derives [toolName] so an approved agent gate mints exactly that connector's
+ * grant. The explicit array wins when present, so workflow gates are unaffected.
  *
  * ACCEPTED RISK (narrow): the agent fallback is a workflow-agnostic shape sniff —
  * a suspend payload has no workflowId to prove it came from the durable loop. A
@@ -86,6 +89,7 @@ export async function queueApprovalForSuspension(
   summary: RunSummary,
   requestedBy: string,
   systemActor: ApprovalActor,
+  resumeTarget?: ApprovalResumeTarget,
 ): Promise<ApprovalRecord[]> {
   const suspended = summary.suspended ?? [];
   const records: ApprovalRecord[] = [];
@@ -113,6 +117,7 @@ export async function queueApprovalForSuspension(
           requestedBy,
         },
         systemActor,
+        resumeTarget,
       );
       records.push(record);
     } catch (error) {
@@ -184,6 +189,7 @@ export function resumeRunWithRequeue(
           summary,
           record.decidedBy,
           systemActor,
+          record.resumeTarget,
         );
       } catch (error) {
         // Best-effort: a crashing sink must not mask the resume failure it is
@@ -297,6 +303,7 @@ export async function reconcileApprovalsForSummary(
   workflowId: string,
   summary: RunSummary,
   systemActor: ApprovalActor,
+  resumeTarget?: ApprovalResumeTarget,
 ): Promise<ApprovalRecord[]> {
   const suspended = summary.suspended ?? [];
   if (suspended.length === 0) return [];
@@ -343,6 +350,7 @@ export async function reconcileApprovalsForSummary(
     { ...summary, suspended: toFile },
     systemActor.id,
     systemActor,
+    resumeTarget,
   );
 }
 

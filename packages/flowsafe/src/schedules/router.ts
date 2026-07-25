@@ -33,15 +33,20 @@
 // pre-auth failure (401 / resolver throw -> 403) is NOT audited: an
 // unauthenticated flood must never be able to write the log.
 //
-// AGENT schedules are creatable/manageable here (they persist fine); their FIRING
-// is guarded off in the tick (agent-target execution is substrate-blocked — see
-// tick.ts). This surface never mints capability (P8) and starts NO runs — the tick
-// owns the fire path.
+// AGENT schedules are creatable/manageable here. Their firing belongs solely to
+// the tick's optional runtime-driven `startAgent` seam; without it, the tick
+// retains the audited fail-closed skip. This surface mints no capability and
+// starts no runs.
 
 import {
   AGENT_SCHEDULE_PREFIX,
   type AnySchedule,
+  type CreateAgentScheduleInput,
+  type CreateWorkflowScheduleInput,
+  ScheduleInputSchema,
   toScheduleView,
+  type UpdateAgentScheduleInput,
+  type UpdateWorkflowScheduleInput,
   WORKFLOW_SCHEDULE_PREFIX,
 } from '@mastra/core/schedules';
 import type {
@@ -53,7 +58,6 @@ import type {
   ScheduleUpdate,
 } from '@mastra/core/storage';
 import { computeNextFireAt, validateCron } from '@mastra/core/workflows';
-
 import {
   type ApprovalRole,
   RUN_START_ROLES,
@@ -61,7 +65,13 @@ import {
   TenantResolutionError,
   type TenantResolver,
 } from '../approval-api/index.js';
+import { RunRouteError, requireOwnedMemoryId } from '../host-kit/index.js';
 import { safeDecodeSegment } from '../host-kit/route-path.js';
+import { internalErrorResponse } from '../internal-error-response.js';
+import {
+  nonnegativeSafeInteger,
+  positiveSafeInteger,
+} from '../numeric-config.js';
 import { isReservedScheduleContextKey } from './tick.js';
 
 /** The storage subset the facade reads/writes (a subset of D1SchedulesStorage). */
@@ -122,17 +132,22 @@ export interface ScheduleRouterOptions {
   audit?: ScheduleRouteAuditSink;
   /**
    * Per-tenant COUNT cap (DL-007): the max schedules a tenant may own. A create
-   * at or over it is REJECTED. Default 100.
+   * at or over it is REJECTED. Must be a nonnegative safe integer; zero denies
+   * every create. Default 100.
    */
   maxSchedulesPerTenant?: number;
   /**
    * Per-schedule fire-RATE cap (DL-007): the minimum interval between two
    * consecutive fires of a schedule's cron, in ms. A cron whose interval is
    * shorter is REJECTED at create/update — bounding the aggregate fire rate a
-   * tenant can schedule (with the count cap). Default 60000 (1 minute).
+   * tenant can schedule (with the count cap). Must be a positive safe integer.
+   * Default 60000 (1 minute).
    */
   minFireIntervalMs?: number;
-  /** Max raw request-body size in bytes. Default 16384 (16 KiB). */
+  /**
+   * Max raw request-body size in bytes. Must be a nonnegative safe integer;
+   * zero denies every non-empty body. Default 16384 (16 KiB).
+   */
   maxContentBytes?: number;
   /** Route prefix. Default '/api/schedules'. */
   basePath?: string;
@@ -178,17 +193,20 @@ function ownsSchedule(schedule: Schedule, tenantId: string): boolean {
  */
 function reservedContextRejection(
   body: Record<string, unknown>,
+  target: 'workflow' | 'agent',
 ): Rejection | undefined {
   const idle = body.ifIdle as
     | { streamOptions?: { requestContext?: unknown } }
     | undefined;
-  const surfaces: Array<[string, unknown]> = [
-    ['requestContext', body.requestContext],
-    [
-      'ifIdle.streamOptions.requestContext',
-      idle?.streamOptions?.requestContext,
-    ],
-  ];
+  const surfaces: Array<[string, unknown]> =
+    target === 'workflow'
+      ? [['requestContext', body.requestContext]]
+      : [
+          [
+            'ifIdle.streamOptions.requestContext',
+            idle?.streamOptions?.requestContext,
+          ],
+        ];
   for (const [label, ctx] of surfaces) {
     if (ctx === undefined) continue;
     if (typeof ctx !== 'object' || ctx === null || Array.isArray(ctx)) {
@@ -268,7 +286,10 @@ function checkFireRate(
 // 400 (defense-in-depth, the goals/signals allowlist posture). tenantId is never
 // settable (server-stamped), and id/nextFireAt/lastFireAt/lastRunId/createdAt/
 // updatedAt/ownerType/ownerId are server-owned.
-const WORKFLOW_CREATE_FIELDS = new Set([
+type WorkflowCreateField = Exclude<keyof CreateWorkflowScheduleInput, 'id'>;
+type AgentCreateField = Exclude<keyof CreateAgentScheduleInput, 'id'>;
+
+const WORKFLOW_CREATE_FIELDS = new Set<WorkflowCreateField>([
   'workflowId',
   'cron',
   'timezone',
@@ -278,7 +299,7 @@ const WORKFLOW_CREATE_FIELDS = new Set([
   'metadata',
   'status',
 ]);
-const AGENT_CREATE_FIELDS = new Set([
+const AGENT_CREATE_FIELDS = new Set<AgentCreateField>([
   'agentId',
   'cron',
   'prompt',
@@ -292,17 +313,22 @@ const AGENT_CREATE_FIELDS = new Set([
   'providerOptions',
   'ifActive',
   'ifIdle',
-  'requestContext',
   'metadata',
   'status',
 ]);
-const UPDATE_FIELDS = new Set([
+const WORKFLOW_UPDATE_FIELDS = new Set<keyof UpdateWorkflowScheduleInput>([
   'cron',
   'timezone',
   'status',
   'inputData',
   'initialState',
   'requestContext',
+  'metadata',
+]);
+const AGENT_UPDATE_FIELDS = new Set<keyof UpdateAgentScheduleInput>([
+  'cron',
+  'timezone',
+  'status',
   'prompt',
   'name',
   'signalType',
@@ -316,7 +342,7 @@ const UPDATE_FIELDS = new Set([
 
 function firstUnknownField(
   body: Record<string, unknown>,
-  allowed: Set<string>,
+  allowed: ReadonlySet<string>,
 ): string | undefined {
   return Object.keys(body).find((key) => !allowed.has(key));
 }
@@ -325,13 +351,111 @@ function nonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
 }
 
+function metadataOrReject(value: unknown): Validated<Record<string, unknown>> {
+  if (
+    value === undefined ||
+    typeof value !== 'object' ||
+    value === null ||
+    Array.isArray(value)
+  ) {
+    return {
+      ok: false,
+      error: reject('metadata-invalid', 'metadata must be an object'),
+    };
+  }
+  return { ok: true, value: value as Record<string, unknown> };
+}
+
+function validateMemoryIds(
+  body: Record<string, unknown>,
+  tenant: TenantContext,
+): Rejection | undefined {
+  const hasThread = body.threadId !== undefined;
+  const hasResource = body.resourceId !== undefined;
+  if (hasThread && !nonEmptyString(body.threadId)) {
+    return reject('threadId-invalid', 'threadId must be a non-empty string');
+  }
+  if (hasResource && !nonEmptyString(body.resourceId)) {
+    return reject(
+      'resourceId-invalid',
+      'resourceId must be a non-empty string',
+    );
+  }
+  if (!hasThread) {
+    const offender = ['resourceId', 'signalType', 'ifActive', 'ifIdle'].find(
+      (field) => body[field] !== undefined,
+    );
+    if (offender !== undefined) {
+      return reject(
+        `threadless-field:${offender}`,
+        `${offender} requires threadId`,
+      );
+    }
+    return undefined;
+  }
+  if (!hasResource) {
+    return reject(
+      'resourceId-required',
+      'resourceId is required when threadId is set',
+    );
+  }
+  requireOwnedMemoryId(tenant, body.threadId as string, 'threadId');
+  requireOwnedMemoryId(tenant, body.resourceId as string, 'resourceId');
+  return undefined;
+}
+
+function normalizeAgentTarget(
+  scheduleId: string,
+  values: Record<string, unknown>,
+): Validated<ScheduleTarget> {
+  const parsed = ScheduleInputSchema.safeParse({
+    scheduleId,
+    agentId: values.agentId,
+    prompt: values.prompt,
+    threadId: values.threadId,
+    resourceId: values.resourceId,
+    signalType: values.signalType,
+    tagName: values.tagName,
+    attributes: values.attributes,
+    providerOptions: values.providerOptions,
+    ifActive: values.ifActive,
+    ifIdle: values.ifIdle,
+  });
+  if (!parsed.success) {
+    return {
+      ok: false,
+      error: reject(
+        'agent-options-invalid',
+        parsed.error.issues[0]?.message ?? 'invalid agent schedule options',
+      ),
+    };
+  }
+  const {
+    scheduleId: _scheduleId,
+    agentId,
+    prompt,
+    ...runtimeFields
+  } = parsed.data;
+  return {
+    ok: true,
+    value: {
+      type: 'agent',
+      agentId,
+      prompt,
+      ...(values.name !== undefined ? { name: values.name as string } : {}),
+      ...runtimeFields,
+    },
+  };
+}
+
 /** Build a fresh Schedule row from a create body, tenant-stamped + server-id'd. */
 function buildCreateRow(
   body: Record<string, unknown>,
-  tenantId: string,
+  tenant: TenantContext,
   now: number,
   minFireIntervalMs: number,
 ): Validated<Schedule> {
+  const tenantId = tenant.tenantId;
   const hasWorkflow = 'workflowId' in body && body.workflowId !== undefined;
   const hasAgent = 'agentId' in body && body.agentId !== undefined;
   if (hasWorkflow === hasAgent) {
@@ -381,20 +505,17 @@ function buildCreateRow(
     };
   }
 
-  // P4 barrier (a): reject reserved keys on BOTH requestContext surfaces
-  // (top-level + agent ifIdle.streamOptions.requestContext) in one place.
-  const reserved = reservedContextRejection(body);
-  if (reserved) return { ok: false, error: reserved };
-
-  const clientMetadata =
-    body.metadata !== undefined &&
-    typeof body.metadata === 'object' &&
-    body.metadata !== null &&
-    !Array.isArray(body.metadata)
-      ? (body.metadata as Record<string, unknown>)
-      : {};
+  let clientMetadata: Record<string, unknown> = {};
+  if (body.metadata !== undefined) {
+    const parsedMetadata = metadataOrReject(body.metadata);
+    if (!parsedMetadata.ok) return parsedMetadata;
+    clientMetadata = parsedMetadata.value;
+  }
   // tenantId is stamped LAST so a client value can never override it (DL-013).
-  const metadata: Record<string, unknown> = { ...clientMetadata, tenantId };
+  const metadata: Record<string, unknown> = {
+    ...clientMetadata,
+    tenantId,
+  };
 
   // checkFireRate above already proved the cron has a future occurrence, so this
   // cannot throw; nextFireOrReject keeps it defensive without a bare computeNextFireAt.
@@ -431,6 +552,8 @@ function buildCreateRow(
         ),
       };
     }
+    const reserved = reservedContextRejection(body, 'workflow');
+    if (reserved) return { ok: false, error: reserved };
     const target: ScheduleTarget = {
       type: 'workflow',
       workflowId: body.workflowId,
@@ -475,45 +598,23 @@ function buildCreateRow(
       error: reject('prompt-invalid', 'prompt must be a non-empty string'),
     };
   }
-  // Core's rule: threaded agent schedules require resourceId.
-  if (body.threadId !== undefined && body.resourceId === undefined) {
+  if (body.name !== undefined && typeof body.name !== 'string') {
     return {
       ok: false,
-      error: reject(
-        'resourceId-required',
-        'resourceId is required when threadId is set',
-      ),
+      error: reject('name-invalid', 'name must be a string'),
     };
   }
-  // (The agent ifIdle.streamOptions.requestContext reserved-key barrier is
-  // already applied by reservedContextRejection above, covering both surfaces.)
-  // Build from the validated body values, then cast once to the agent target
-  // shape (the fields are all optional passthroughs core stores verbatim; only
-  // the settable subset is copied — id/nextFireAt/… are server-owned).
-  const agentTarget: Record<string, unknown> = {
-    type: 'agent',
-    agentId: body.agentId,
-    prompt: body.prompt,
-  };
-  for (const key of [
-    'name',
-    'threadId',
-    'resourceId',
-    'signalType',
-    'tagName',
-    'attributes',
-    'providerOptions',
-    'ifActive',
-    'ifIdle',
-    'requestContext',
-  ]) {
-    if (body[key] !== undefined) agentTarget[key] = body[key];
-  }
+  const memory = validateMemoryIds(body, tenant);
+  if (memory) return { ok: false, error: memory };
+  const reserved = reservedContextRejection(body, 'agent');
+  if (reserved) return { ok: false, error: reserved };
+  const agentTarget = normalizeAgentTarget('pending', body);
+  if (!agentTarget.ok) return agentTarget;
   return {
     ok: true,
     value: {
       id: `${AGENT_SCHEDULE_PREFIX}${crypto.randomUUID()}`,
-      target: agentTarget as ScheduleTarget,
+      target: agentTarget.value,
       ...common,
       ownerType: 'agent',
       ownerId: body.agentId,
@@ -526,9 +627,18 @@ export function createScheduleRouter(
 ): ScheduleRouter {
   const { resolve, store } = options;
   const roles = options.roles ?? RUN_START_ROLES;
-  const maxSchedules = options.maxSchedulesPerTenant ?? 100;
-  const minFireIntervalMs = options.minFireIntervalMs ?? 60_000;
-  const maxContentBytes = options.maxContentBytes ?? 16_384;
+  const maxSchedules = nonnegativeSafeInteger(
+    options.maxSchedulesPerTenant ?? 100,
+    'maxSchedulesPerTenant',
+  );
+  const minFireIntervalMs = positiveSafeInteger(
+    options.minFireIntervalMs ?? 60_000,
+    'minFireIntervalMs',
+  );
+  const maxContentBytes = nonnegativeSafeInteger(
+    options.maxContentBytes ?? 16_384,
+    'schedule maxContentBytes',
+  );
   const base = options.basePath ?? '/api/schedules';
   const baseSegments = base.split('/').filter(Boolean);
 
@@ -636,7 +746,7 @@ export function createScheduleRouter(
         }
         const built = buildCreateRow(
           parsed,
-          tenant.tenantId,
+          tenant,
           Date.now(),
           minFireIntervalMs,
         );
@@ -739,14 +849,20 @@ export function createScheduleRouter(
       await audit('accepted');
       return json({ schedule: toView(updated) });
     } catch (error) {
+      if (error instanceof RunRouteError) {
+        await audit(
+          'rejected',
+          error.status === 404
+            ? 'foreign-memory-id'
+            : `route-error-${error.status}`,
+        );
+        return json({ error: error.message }, error.status);
+      }
       if (error instanceof TenantResolutionError) {
         // Pre-auth: unauthenticated, so not audited.
         return json({ error: 'forbidden' }, 403);
       }
-      return json(
-        { error: error instanceof Error ? error.message : String(error) },
-        500,
-      );
+      return internalErrorResponse('schedules', error);
     }
   };
 }
@@ -783,7 +899,11 @@ function buildUpdatePatch(
   minFireIntervalMs: number,
   now: number,
 ): Validated<ScheduleUpdate> {
-  const unknown = firstUnknownField(body, UPDATE_FIELDS);
+  const allowed =
+    existing.target.type === 'workflow'
+      ? WORKFLOW_UPDATE_FIELDS
+      : AGENT_UPDATE_FIELDS;
+  const unknown = firstUnknownField(body, allowed);
   if (unknown !== undefined) {
     return {
       ok: false,
@@ -852,26 +972,22 @@ function buildUpdatePatch(
     patch.status = body.status;
   }
 
-  // P4 barrier (a) on update too — both requestContext surfaces, one helper.
-  const reserved = reservedContextRejection(body);
+  const reserved = reservedContextRejection(body, existing.target.type);
   if (reserved) return { ok: false, error: reserved };
 
   // Patch the target in place (kind is fixed at create — a workflow schedule
   // stays a workflow schedule). Only the settable target fields are merged.
-  const nextTarget = patchTarget(existing.target, body);
-  if (nextTarget !== undefined) patch.target = nextTarget;
+  const nextTarget = patchTarget(existing, body);
+  if (!nextTarget.ok) return nextTarget;
+  if (nextTarget.value !== undefined) patch.target = nextTarget.value;
 
   if (body.metadata !== undefined) {
     // A client may not change tenantId — re-stamp the existing owner.
     const owner = (existing.metadata as Record<string, unknown> | undefined)
       ?.tenantId;
-    const clientMeta =
-      typeof body.metadata === 'object' &&
-      body.metadata !== null &&
-      !Array.isArray(body.metadata)
-        ? (body.metadata as Record<string, unknown>)
-        : {};
-    patch.metadata = { ...clientMeta, tenantId: owner };
+    const clientMeta = metadataOrReject(body.metadata);
+    if (!clientMeta.ok) return clientMeta;
+    patch.metadata = { ...clientMeta.value, tenantId: owner };
   }
 
   return { ok: true, value: patch };
@@ -879,24 +995,28 @@ function buildUpdatePatch(
 
 /** Merge the settable target fields; returns undefined when nothing target-side changed. */
 function patchTarget(
-  target: ScheduleTarget,
+  existing: Schedule,
   body: Record<string, unknown>,
-): ScheduleTarget | undefined {
+): Validated<ScheduleTarget | undefined> {
+  const target = existing.target;
   if (target.type === 'workflow') {
     const changed =
       body.inputData !== undefined ||
       body.initialState !== undefined ||
       body.requestContext !== undefined;
-    if (!changed) return undefined;
+    if (!changed) return { ok: true, value: undefined };
     return {
-      ...target,
-      ...(body.inputData !== undefined ? { inputData: body.inputData } : {}),
-      ...(body.initialState !== undefined
-        ? { initialState: body.initialState }
-        : {}),
-      ...(body.requestContext !== undefined
-        ? { requestContext: body.requestContext as Record<string, unknown> }
-        : {}),
+      ok: true,
+      value: {
+        ...target,
+        ...(body.inputData !== undefined ? { inputData: body.inputData } : {}),
+        ...(body.initialState !== undefined
+          ? { initialState: body.initialState }
+          : {}),
+        ...(body.requestContext !== undefined
+          ? { requestContext: body.requestContext as Record<string, unknown> }
+          : {}),
+      },
     };
   }
   const agentKeys = [
@@ -908,14 +1028,51 @@ function patchTarget(
     'providerOptions',
     'ifActive',
     'ifIdle',
-    'requestContext',
   ];
-  if (!agentKeys.some((key) => body[key] !== undefined)) return undefined;
+  if (!agentKeys.some((key) => body[key] !== undefined)) {
+    return { ok: true, value: undefined };
+  }
   const merged = { ...target } as Record<string, unknown>;
   for (const key of agentKeys) {
     if (body[key] !== undefined) merged[key] = body[key];
   }
-  return merged as ScheduleTarget;
+  if (!nonEmptyString(merged.prompt)) {
+    return {
+      ok: false,
+      error: reject('prompt-invalid', 'prompt must be a non-empty string'),
+    };
+  }
+  if (merged.name !== undefined && typeof merged.name !== 'string') {
+    return {
+      ok: false,
+      error: reject('name-invalid', 'name must be a string'),
+    };
+  }
+  if (
+    merged.threadId === undefined &&
+    ['resourceId', 'signalType', 'ifActive', 'ifIdle'].some(
+      (field) => merged[field] !== undefined,
+    )
+  ) {
+    return {
+      ok: false,
+      error: reject(
+        'threadless-options',
+        'resourceId, signalType, ifActive, and ifIdle require threadId',
+      ),
+    };
+  }
+  if (merged.threadId !== undefined && merged.resourceId === undefined) {
+    return {
+      ok: false,
+      error: reject(
+        'resourceId-required',
+        'resourceId is required when threadId is set',
+      ),
+    };
+  }
+  const normalized = normalizeAgentTarget(existing.id, merged);
+  return normalized.ok ? { ok: true, value: normalized.value } : normalized;
 }
 
 function toView(schedule: Schedule): AnySchedule {

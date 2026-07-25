@@ -10,13 +10,15 @@
 // -> chunk .init -> `await this.recoverStaleTasks()`), guarded by its own
 // initPromise so it runs once per manager INSTANCE. A DO evicted mid-task leaves
 // its task row 'running'/'pending' in D1; when the DO is next instantiated (a
-// FRESH manager), `boot()` re-registers the static tool executors and calls
-// `init(pubsub)`, whose recovery resets the stranded 'running' task (maxRetries
-// > 0) to 'pending' and re-dispatches it — its workflow step resolves the
-// executor by tool name via the re-registered static registry (the cross-process
-// path core ships `registerStaticExecutor` for). The DO ALARM is what WAKES an
-// evicted DO so this happens without waiting for a request. No private method is
-// ever called; the seam is `registerStaticExecutor` + `init(pubsub)`, both
+// FRESH manager), `boot()` re-registers the static tool executors, starts the
+// workflow workers, and only then calls `init(pubsub)`. Init's recovery resets a
+// stranded 'running' task (maxRetries > 0) to 'pending' and re-dispatches it;
+// starting workers first guarantees that the workflow event published by that
+// dispatch has a subscriber. Its workflow step resolves the executor by tool
+// name via the re-registered static registry (the cross-process path core ships
+// `registerStaticExecutor` for). The DO ALARM is what WAKES an evicted DO so
+// this happens without waiting for a request. No private method is ever called;
+// the seam is `registerStaticExecutor` + `startWorkers()` + `init(pubsub)`, all
 // public.
 //
 // v1 policy (DL-005/P8): connectors are foreground-only, so approval-carrying
@@ -24,65 +26,17 @@
 // stays available for NON-gated tools (e.g. a long research tool awaiting an
 // external webhook); such a task's resume mints no capability.
 //
-// SUBSTRATE LIMITATIONS + THE P9 UNBLOCK CONTRACT (spike B-S1). Durable
-// background-task EXECUTION does not run on the Cloudflare substrate yet. Core's
-// `__background-task` workflow runs on the EVENTED execution engine; the items
-// below block it, and each MUST be closed BEFORE execution is enabled — the
-// first two make dispatch impossible, R-B3 is a SILENT tenant-isolation leak
-// that only surfaces once R-B1 is fixed.
+// Execution is opt-in. The host accepts it only with the serialized D1 workflow
+// adapter and a task domain bound to the same tenant. One DO isolate owns that
+// manager and both domains, so core's tenant-blind recovery sees only that
+// tenant's rows. `boot()` then starts Mastra's public evented workers on the
+// raw pubsub instance the caller passed to Mastra. Persistence-only hosts retain
+// the earlier warning.
 //
-//   R-B1 — the evented engine refuses to `createRun` unless the workflows store
-//   reports `supportsConcurrentUpdates()` (chunk-JGDMZZAO.js
-//   `ATOMIC_STORAGE_OPERATIONS_NOT_SUPPORTED`). At @mastra/cloudflare-d1 1.1.1
-//   `WorkflowsStorageD1.supportsConcurrentUpdates()` returns **false** AND its
-//   `updateWorkflowResults`/`updateWorkflowState` are UNIMPLEMENTED THROWS
-//   ("D1 does not support atomic read-modify-write operations…", index.cjs). So
-//   R-B1 is NOT a flag to flip: overriding `supportsConcurrentUpdates` to true
-//   passes core's gate and then THROWS on the first per-step update, stranding
-//   the task at `running` (reproduced). Closing R-B1 is a P9 adapter that
-//   IMPLEMENTS atomic partial-updates — the DO's single-threaded lease makes that
-//   implementation safe (serialized read-modify-write), it does NOT make an
-//   override safe. `InMemoryStore`/libsql return true, so the manager, the
-//   recovery seam, and the dispatch->complete path are real on a concurrent-update
-//   store — but see R-B2.
-//
-//   R-B2 — even on a concurrent-update store the evented engine drives step
-//   progress through workers the bare manager does not stand up. The host must
-//   ALSO call `mastra.startWorkers()`. R-B1 and R-B2 close TOGETHER: a store that
-//   persists concurrent updates with no workers running still never completes a
-//   body.
-//
-//   R-B3 — LATENT tenant-isolation residual, inert TODAY only because R-B1 blocks
-//   execution (no `__background-task` snapshot row is ever written). Core keys the
-//   internal `__background-task` run by the UNSALTED `taskId`
-//   (`mastra.generateId()`, chunk-PPPKTVCG.js; then `createRun({ runId: taskId })`).
-//   That run's `mastra_workflow_snapshot` row therefore has an UNSALTED `run_id`,
-//   so it ESCAPES both tenant offboarding (`purgeTenant` reaps
-//   `mastra_workflow_snapshot` over the salted `[tid_, tid\x60)` `run_id` range)
-//   AND, while suspended (non-terminal), `purgeExpiredWorkflowRuns`
-//   (terminal-status-only). The task's OWN `mastra_background_tasks` row is fine —
-//   it carries the salted parent `run_id` and purgeTenant covers it — but the
-//   internal engine run it spawns does not. The moment a P9 concurrent-update
-//   adapter lands (R-B1 closed), this goes LIVE and SILENT: an offboarded /
-//   right-to-be-forgotten tenant's background-task engine runs would leak.
-//   Unblocking execution REQUIRES closing R-B3 in the SAME change — salt the
-//   internal `__background-task` runId with the parent tenant, or reap the
-//   snapshot by the task's salted originating `run_id`. An enforcement guard
-//   (background-tasks/d1-storage.test.ts) FAILS CI the instant
-//   `supportsConcurrentUpdates()` returns true, so execution cannot be enabled
-//   without closing R-B3.
-//
-//   L3 — core's `recoverStaleTasks()` (fired by `init()` below) is TENANT-BLIND:
-//   it lists ALL 'running' tasks and re-dispatches ALL 'pending' tasks with no
-//   tenant filter (chunk-PPPKTVCG.js). Harmless while a DO hosts one tenant, but
-//   a multi-tenant manager would recover across tenants; closing this needs a
-//   tenant filter or a host-topology revisit before execution is enabled.
-//
-// Everything else Track B adds works on D1 regardless of all the above: the
-// `mastra_background_tasks` PERSISTENCE domain, tenant-range purge + TTL cleanup,
-// the tenant-bound read routes, and the `_background` defense. `boot()` WARNS
-// (once) when the store cannot execute bodies so R-B1 is loud rather than a
-// cryptic async throw at first dispatch.
+// Core still keys an internal `__background-task` workflow by the unsalted task
+// ID. The tenant-scoped store, TTL purge, and offboarding paths therefore delete
+// the internal snapshot before deleting the task row that supplies its tenant
+// association.
 
 import {
   BackgroundTaskManager,
@@ -92,7 +46,17 @@ import {
 import type { Mastra } from '@mastra/core/mastra';
 
 import type { HostPubSub } from '../do-runner/index.js';
-import { backgroundTasksStore } from './d1-storage.js';
+import {
+  finiteNonnegativeNumber,
+  nonnegativeSafeInteger,
+  positiveSafeInteger,
+} from '../numeric-config.js';
+import {
+  backgroundTasksStore,
+  SERIALIZED_WORKFLOWS_D1,
+  TENANT_SCOPED_BACKGROUND_TASKS_D1,
+  type TenantScopedBackgroundTasksStorageD1,
+} from './d1-storage.js';
 
 export interface BackgroundTaskHostOptions {
   /**
@@ -102,12 +66,14 @@ export interface BackgroundTaskHostOptions {
    */
   mastra: Mastra;
   /**
-   * The DO's ONE pubsub identity (DL-001, `createHostPubSub()`). REQUIRED: the
-   * manager both publishes dispatch events and subscribes the worker callback on
-   * it, and inside a DO one isolate serializes publisher and subscriber, so an
-   * in-process `EventEmitterPubSub` is exactly right (no cross-process bus). A
-   * host that streams lifecycle events to its hub passes the SAME instance it
-   * gave `init()`.
+   * The DO's ONE raw pubsub instance (DL-001, `createHostPubSub()`). Pass this
+   * same object to `new Mastra({ pubsub })`; Mastra 1.50 exposes a proxy from
+   * its public `pubsub` getter, so that getter is not the constructor identity.
+   * The manager both publishes dispatch events and subscribes the worker
+   * callback on the raw instance, and inside a DO one isolate serializes
+   * publisher and subscriber, so an in-process `EventEmitterPubSub` is exactly
+   * right (no cross-process bus). A host that streams lifecycle events to its
+   * hub also passes this same raw instance to `init()`.
    */
   pubsub: HostPubSub;
   /**
@@ -121,9 +87,97 @@ export interface BackgroundTaskHostOptions {
   /**
    * Manager config (core `BackgroundTaskManagerConfig` minus `enabled`, which is
    * forced on): concurrency, backpressure ('queue'|'reject'|'fallback-sync'),
-   * timeouts, retries, and `cleanup` TTLs. Omitted => core defaults.
+   * timeouts, retries, and `cleanup` TTLs. Numeric values are validated before
+   * constructing core's manager: concurrency/retry delays/TTLs/throttle are
+   * nonnegative, timeout/cleanup intervals are positive, and all integer
+   * quantities must be safe integers. Omitted => core defaults.
    */
   manager?: Omit<BackgroundTaskManagerConfig, 'enabled'>;
+  /**
+   * Enable real evented-worker execution for one tenant DO. Omit to preserve
+   * the persistence/recovery-only behavior.
+   */
+  execution?: { tenantId: string };
+}
+
+function validateManagerConfig(
+  config: Omit<BackgroundTaskManagerConfig, 'enabled'> | undefined,
+): void {
+  if (!config) return;
+  if (config.globalConcurrency !== undefined) {
+    nonnegativeSafeInteger(
+      config.globalConcurrency,
+      'backgroundTasks.manager.globalConcurrency',
+    );
+  }
+  if (config.perAgentConcurrency !== undefined) {
+    nonnegativeSafeInteger(
+      config.perAgentConcurrency,
+      'backgroundTasks.manager.perAgentConcurrency',
+    );
+  }
+  if (config.defaultTimeoutMs !== undefined) {
+    positiveSafeInteger(
+      config.defaultTimeoutMs,
+      'backgroundTasks.manager.defaultTimeoutMs',
+    );
+  }
+  if (config.progressThrottleMs !== undefined) {
+    nonnegativeSafeInteger(
+      config.progressThrottleMs,
+      'backgroundTasks.manager.progressThrottleMs',
+    );
+  }
+  if (config.waitTimeoutMs !== undefined) {
+    positiveSafeInteger(
+      config.waitTimeoutMs,
+      'backgroundTasks.manager.waitTimeoutMs',
+    );
+  }
+  const retries = config.defaultRetries;
+  if (retries?.maxRetries !== undefined) {
+    nonnegativeSafeInteger(
+      retries.maxRetries,
+      'backgroundTasks.manager.defaultRetries.maxRetries',
+    );
+  }
+  if (retries?.retryDelayMs !== undefined) {
+    nonnegativeSafeInteger(
+      retries.retryDelayMs,
+      'backgroundTasks.manager.defaultRetries.retryDelayMs',
+    );
+  }
+  if (retries?.maxRetryDelayMs !== undefined) {
+    nonnegativeSafeInteger(
+      retries.maxRetryDelayMs,
+      'backgroundTasks.manager.defaultRetries.maxRetryDelayMs',
+    );
+  }
+  if (retries?.backoffMultiplier !== undefined) {
+    finiteNonnegativeNumber(
+      retries.backoffMultiplier,
+      'backgroundTasks.manager.defaultRetries.backoffMultiplier',
+    );
+  }
+  const cleanup = config.cleanup;
+  if (cleanup?.completedTtlMs !== undefined) {
+    nonnegativeSafeInteger(
+      cleanup.completedTtlMs,
+      'backgroundTasks.manager.cleanup.completedTtlMs',
+    );
+  }
+  if (cleanup?.failedTtlMs !== undefined) {
+    nonnegativeSafeInteger(
+      cleanup.failedTtlMs,
+      'backgroundTasks.manager.cleanup.failedTtlMs',
+    );
+  }
+  if (cleanup?.cleanupIntervalMs !== undefined) {
+    positiveSafeInteger(
+      cleanup.cleanupIntervalMs,
+      'backgroundTasks.manager.cleanup.cleanupIntervalMs',
+    );
+  }
 }
 
 /**
@@ -139,12 +193,20 @@ export class BackgroundTaskHost {
   readonly #mastra: Mastra;
   readonly #pubsub: HostPubSub;
   readonly #executors: Record<string, ToolExecutor>;
+  readonly #execution?: { tenantId: string };
   #booted?: Promise<void>;
+  #bootSettled = false;
+  #managerNeedsShutdown = false;
+  #workersNeedStop = false;
+  #shutdownRequested = false;
+  #shutdown?: Promise<void>;
 
   constructor(options: BackgroundTaskHostOptions) {
+    validateManagerConfig(options.manager);
     this.#mastra = options.mastra;
     this.#pubsub = options.pubsub;
     this.#executors = options.executors;
+    this.#execution = options.execution;
     this.manager = new BackgroundTaskManager({
       enabled: true,
       ...options.manager,
@@ -156,16 +218,24 @@ export class BackgroundTaskHost {
 
   /**
    * DO-boot wiring (DL-015). Fail-fast if the backgroundTasks storage domain is
-   * missing, re-register the static executors, THEN `init(pubsub)` — whose
-   * internal `recoverStaleTasks()` re-drives any task the evicted instance left
-   * mid-flight. Executors go in BEFORE init so a recovered task's workflow step
-   * can resolve its executor by name. Memoized per instance: `init` is itself
-   * idempotent (initPromise), and `boot()` from both `fetch()` and `alarm()`
-   * must not double-register.
+   * missing, re-register the static executors, start execution-mode workflow
+   * workers, THEN call `init(pubsub)` — whose internal `recoverStaleTasks()`
+   * re-drives any task the evicted instance left mid-flight. Executors and the
+   * workflow subscriber both go in BEFORE recovery publishes work. A failed
+   * startup unwinds attempted components in reverse order. Memoized per
+   * instance: `init` is itself idempotent (initPromise), and `boot()` from both
+   * `fetch()` and `alarm()` must not double-register.
    */
   boot(): Promise<void> {
+    if (this.#shutdownRequested) {
+      return Promise.reject(
+        new Error('background-tasks: host is shutting down'),
+      );
+    }
     if (!this.#booted) {
-      this.#booted = this.#doBoot();
+      this.#booted = this.#doBoot().finally(() => {
+        this.#bootSettled = true;
+      });
     }
     return this.#booted;
   }
@@ -173,16 +243,69 @@ export class BackgroundTaskHost {
   async #doBoot(): Promise<void> {
     // Fail-fast with a clear message before any dispatch could surface core's
     // terser error deep in a lifecycle callback.
-    await backgroundTasksStore(this.#mastra);
-    // Surface R-B1 loudly: a store whose workflows domain cannot do concurrent
-    // updates (e.g. @mastra/cloudflare-d1) will let init()/recovery run and rows
-    // persist, but a dispatched task's evented workflow cannot execute — warn
-    // once so an operator learns it here, not from a stray async throw.
-    await this.#warnIfBodiesCannotExecute();
+    const tasks = await backgroundTasksStore(this.#mastra);
+    // Execution mode validates every required ownership and concurrency seam.
+    if (this.#execution) {
+      const workflows = await this.#mastra.getStorage()?.getStore('workflows');
+      if (
+        !workflows ||
+        (workflows as unknown as Record<symbol, unknown>)[
+          SERIALIZED_WORKFLOWS_D1
+        ] !== true
+      ) {
+        throw new Error(
+          'background-tasks: execution requires DurableObjectWorkflowsStorageD1',
+        );
+      }
+      const tenantTasks = tasks as TenantScopedBackgroundTasksStorageD1;
+      if (
+        (tenantTasks as unknown as Record<symbol, unknown>)[
+          TENANT_SCOPED_BACKGROUND_TASKS_D1
+        ] !== true ||
+        tenantTasks.tenantId !== this.#execution.tenantId
+      ) {
+        throw new Error(
+          'background-tasks: execution requires a task store branded for the same tenant',
+        );
+      }
+    } else {
+      await this.#warnIfBodiesCannotExecute();
+    }
     for (const [toolName, executor] of Object.entries(this.#executors)) {
       this.manager.registerStaticExecutor(toolName, executor);
     }
-    await this.manager.init(this.#pubsub);
+    try {
+      if (this.#execution) {
+        this.#workersNeedStop = true;
+        await this.#mastra.startWorkers();
+      }
+      this.#managerNeedsShutdown = true;
+      await this.manager.init(this.#pubsub);
+    } catch (primary) {
+      const cleanupErrors: unknown[] = [];
+      if (this.#managerNeedsShutdown) {
+        try {
+          await this.manager.shutdown();
+          this.#managerNeedsShutdown = false;
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
+      if (this.#workersNeedStop) {
+        try {
+          await this.#mastra.stopWorkers();
+          this.#workersNeedStop = false;
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
+      if (cleanupErrors.length === 0) throw primary;
+      throw new AggregateError(
+        [primary, ...cleanupErrors],
+        'background-tasks: boot failed and cleanup also failed',
+        { cause: primary },
+      );
+    }
   }
 
   async #warnIfBodiesCannotExecute(): Promise<void> {
@@ -192,7 +315,7 @@ export class BackgroundTaskHost {
     const supports = workflows?.supportsConcurrentUpdates?.() ?? false;
     if (!supports) {
       console.warn(
-        'background-tasks: the workflows storage domain does not support concurrent updates, so DISPATCHED task bodies cannot execute (core runs them on the evented engine). Persistence, recovery, purge, and the read routes still work; execution needs a concurrent-update adapter (e.g. libsql). @mastra/cloudflare-d1 does not yet qualify — see R-B1.',
+        'background-tasks: persistence-only mode cannot execute task bodies because the workflows domain does not support concurrent updates; configure createBackgroundTaskD1Domains and execution.tenantId on one single-tenant Durable Object to enable execution',
       );
     }
   }
@@ -211,8 +334,54 @@ export class BackgroundTaskHost {
     await this.manager.cleanup();
   }
 
-  /** Graceful teardown — drains the manager's cleanup interval + in-flight state. */
+  /**
+   * Graceful teardown. Stop the manager first: its shutdown flag rejects new
+   * enqueues synchronously before the workflow consumers disappear. Worker
+   * teardown is still attempted if manager teardown fails.
+   */
+  async #doShutdown(): Promise<void> {
+    if (this.#booted && !this.#bootSettled) {
+      try {
+        await this.#booted;
+      } catch {
+        // #doBoot already unwound every component it managed to stop. Any
+        // component whose cleanup failed remains flagged for the retry below.
+      }
+    }
+    const errors: unknown[] = [];
+    if (this.#managerNeedsShutdown) {
+      try {
+        await this.manager.shutdown();
+        this.#managerNeedsShutdown = false;
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (this.#workersNeedStop) {
+      try {
+        await this.#mastra.stopWorkers();
+        this.#workersNeedStop = false;
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) {
+      throw new AggregateError(errors, 'background-tasks: shutdown failed', {
+        cause: errors[0],
+      });
+    }
+  }
+
   async shutdown(): Promise<void> {
-    await this.manager.shutdown();
+    this.#shutdownRequested = true;
+    if (this.#shutdown) return this.#shutdown;
+    const pending = this.#doShutdown();
+    this.#shutdown = pending;
+    try {
+      await pending;
+    } finally {
+      if (this.#shutdown === pending) this.#shutdown = undefined;
+    }
   }
 }

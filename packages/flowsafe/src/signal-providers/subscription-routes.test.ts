@@ -3,7 +3,7 @@
 // (RA-009: NEVER exposed as model tools; nothing here mints capability, P8). The
 // gate order mirrors createSignalRouter: resolve → role → thread-ownership →
 // memory-id refusal → mutate, every outcome audited.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { ApprovalRole, TenantContext } from '../approval-api/index.js';
 import { mintResourceId, tenantOwnsMemoryId } from '../do-runner/index.js';
@@ -23,7 +23,11 @@ function ctx(tenantId: string, role: ApprovalRole): TenantContext {
 }
 
 function setup(
-  opts: { resolveTo?: TenantContext | undefined; role?: ApprovalRole } = {},
+  opts: {
+    resolveTo?: TenantContext | undefined;
+    role?: ApprovalRole;
+    maxBodyBytes?: number;
+  } = {},
 ) {
   const factory = new InMemorySubscriptionStoreFactory();
   const events: SignalProviderAuditEvent[] = [];
@@ -36,6 +40,9 @@ function setup(
     audit: (e) => {
       events.push(e);
     },
+    ...(opts.maxBodyBytes !== undefined
+      ? { maxBodyBytes: opts.maxBodyBytes }
+      : {}),
   });
   return { router, factory, events };
 }
@@ -49,6 +56,31 @@ function req(method: string, threadId: string, body?: unknown): Request {
 }
 
 describe('createSubscriptionRouter', () => {
+  it.each([
+    -1,
+    1.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1,
+  ])('rejects an invalid body cap synchronously: %s', (maxBodyBytes) => {
+    expect(() => setup({ maxBodyBytes })).toThrow(RangeError);
+  });
+
+  it('accepts a zero body cap and rejects every non-empty mutation body', async () => {
+    const { router } = setup({ maxBodyBytes: 0 });
+    expect(
+      (
+        await router(
+          req('POST', 'acme_t1', {
+            providerId: 'github',
+            externalResourceId: 'github:acme/repo',
+            resourceKey: 'owner',
+          }),
+        )
+      )?.status,
+    ).toBe(413);
+  });
+
   it('returns null for a path it does not own', async () => {
     const { router } = setup();
     expect(await router(new Request('http://host/api/other'))).toBeNull();
@@ -199,5 +231,41 @@ describe('createSubscriptionRouter', () => {
       outcome: 'rejected',
       reason: 'forbidden-role',
     });
+  });
+
+  it('returns a generic internal error, logs detail, and audits the rejection', async () => {
+    const events: SignalProviderAuditEvent[] = [];
+    const logged: string[] = [];
+    const log = vi.spyOn(console, 'error').mockImplementation((value) => {
+      logged.push(String(value));
+    });
+    const router = createSubscriptionRouter({
+      resolve: async () => ctx('acme', 'operator'),
+      subscriptions: {
+        forTenant: () => ({
+          listForThread: async () => {
+            throw new Error('private database detail');
+          },
+        }),
+      } as never,
+      knownProviders: ['github'],
+      audit: (event) => {
+        events.push(event);
+      },
+    });
+
+    try {
+      const response = await router(req('GET', 'acme_t1'));
+      expect(response?.status).toBe(500);
+      expect(await response?.json()).toEqual({ error: 'internal error' });
+      expect(response?.headers.get('cache-control')).toBe('no-store');
+      expect(events.at(-1)).toMatchObject({
+        outcome: 'rejected',
+        reason: 'internal-error',
+      });
+      expect(logged.join('\n')).toContain('private database detail');
+    } finally {
+      log.mockRestore();
+    }
   });
 });

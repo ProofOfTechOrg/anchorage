@@ -117,6 +117,30 @@ function runSweep(
 }
 
 describe('ApprovalService.create', () => {
+  it('accepts a tenant-owned trusted resume target only through the server seam', async () => {
+    const harness = makeHarness();
+    const target = {
+      kind: 'thread' as const,
+      threadId: 'acme_thread-1',
+      resourceId: 'acme_resource-1',
+    };
+
+    const { record } = await harness.service.create(input(), OPERATOR, target);
+
+    expect(record.resumeTarget).toEqual(target);
+    expect(record.resumeTarget).not.toBe(target);
+  });
+
+  it('rejects a trusted resume target containing a foreign memory id', async () => {
+    const harness = makeHarness();
+    await expect(
+      harness.service.create(input(), OPERATOR, {
+        kind: 'thread',
+        threadId: 'globex_thread-1',
+      }),
+    ).rejects.toBeInstanceOf(InvalidApprovalInputError);
+  });
+
   it("rejects a runId that does not carry the store's tenant prefix (INV-1 belt)", async () => {
     // #given — every read path filters on the tenant_id column, so a foreign
     // prefix would only orphan a row; the belt makes it a loud error instead

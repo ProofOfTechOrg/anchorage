@@ -18,6 +18,11 @@ export {
 
 // D1 storage domains + the injectable composition helper (CI-M-004-002/003).
 export type { SignalDatabase, SignalStatement } from './d1-shared.js';
+export {
+  createNotificationDispatchTick,
+  type NotificationDispatchTickOptions,
+  type NotificationDispatchTickResult,
+} from './notification-dispatch.js';
 export { D1NotificationsStorage } from './notifications-d1.js';
 // The P6 ingestion trust boundary router (CI-M-004-004).
 export {
@@ -39,6 +44,9 @@ export {
   IDLE_BEHAVIORS,
   type IdleBehavior,
   type RunCapConsult,
+  type StartIdleRun,
+  type StartIdleRunInput,
+  type StartIdleRunResult,
   type ThreadSignalRouter,
   type ThreadSignalRoutesOptions,
 } from './thread-do-routes.js';

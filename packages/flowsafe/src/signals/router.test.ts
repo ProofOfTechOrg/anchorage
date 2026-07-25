@@ -59,6 +59,39 @@ function post(path: string, body: unknown): Request {
 }
 
 describe('createSignalRouter — the P6 ingestion gate', () => {
+  it.each([
+    -1,
+    1.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1,
+  ])('rejects an invalid body cap synchronously: %s', (maxContentBytes) => {
+    const { topology } = recordingTopology();
+    expect(() =>
+      createSignalRouter({
+        resolve: async () => tenantCtx('operator'),
+        topology,
+        maxContentBytes,
+      }),
+    ).toThrow(RangeError);
+  });
+
+  it('accepts a zero body cap and rejects every non-empty body', async () => {
+    const { topology } = recordingTopology();
+    const router = createSignalRouter({
+      resolve: async () => tenantCtx('operator'),
+      topology,
+      maxContentBytes: 0,
+    });
+    expect(
+      (
+        await router(
+          post(`/api/threads/${OWNED_THREAD}/message`, { contents: 'hi' }),
+        )
+      )?.status,
+    ).toBe(413);
+  });
+
   it('returns null for a non-signal path (composes ahead of others)', async () => {
     const { topology } = recordingTopology();
     const router = createSignalRouter({
@@ -370,5 +403,32 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
       }),
     );
     expect(res?.status).toBe(405);
+  });
+
+  it('returns a generic 500 while retaining internal detail in structured logs', async () => {
+    const logged: string[] = [];
+    const log = vi.spyOn(console, 'error').mockImplementation((value) => {
+      logged.push(String(value));
+    });
+    const router = createSignalRouter({
+      resolve: async () => tenantCtx('operator'),
+      topology: {
+        send: async () => {
+          throw new Error('private signal backend detail');
+        },
+      } as unknown as ThreadTopology,
+    });
+
+    try {
+      const response = await router(
+        post(`/api/threads/${OWNED_THREAD}/message`, { contents: 'hi' }),
+      );
+      expect(response?.status).toBe(500);
+      expect(await response?.json()).toEqual({ error: 'internal error' });
+      expect(response?.headers.get('cache-control')).toBe('no-store');
+      expect(logged.join('\n')).toContain('private signal backend detail');
+    } finally {
+      log.mockRestore();
+    }
   });
 });

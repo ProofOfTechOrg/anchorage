@@ -124,6 +124,16 @@ describe('agentGateConnectors', () => {
     ).toEqual([]);
   });
 
+  it('mints nothing for a punctuation-bearing tool name that a provider can rewrite', () => {
+    expect(
+      agentGateConnectors({
+        type: 'approval',
+        toolName: 'salesforce.createContact',
+        toolCallId: 'c',
+      }),
+    ).toEqual([]);
+  });
+
   it('requires a toolCallId too, narrowing the workflow-gate collision (fail closed)', () => {
     // #given a payload shaped like an agent gate but WITHOUT the toolCallId a
     // real durable-agent suspension always carries (its resumeLabel)

@@ -170,7 +170,13 @@ function streamResponse(
       transform(chunk, controller) {
         // Same per-row scope guard the list route applies — one predicate so the
         // two surfaces never drift (DL-014, defense-in-depth over core's filter).
-        if (!ownsScope(chunk, scopeValue)) return;
+        const payload =
+          typeof chunk.payload === 'object' &&
+          chunk.payload !== null &&
+          !Array.isArray(chunk.payload)
+            ? (chunk.payload as Record<string, unknown>)
+            : undefined;
+        if (!payload || !ownsScope(payload, scopeValue)) return;
         controller.enqueue(
           encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`),
         );

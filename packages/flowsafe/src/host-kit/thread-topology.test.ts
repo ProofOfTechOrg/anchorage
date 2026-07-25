@@ -21,6 +21,7 @@ import {
 
 function tenantContext(tenantId: string): TenantContext {
   return {
+    actor: { id: 'operator-1', role: 'operator', tenantId },
     tenantId,
     // The production predicate, not a hand-copy — the exactness pins below ride
     // the real one (see memory-boundary.test.ts).

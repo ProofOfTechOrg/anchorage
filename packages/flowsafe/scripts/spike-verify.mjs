@@ -23,24 +23,24 @@
 // interactive `pnpm spike` on 8787 or other repos' servers) is the last
 // resort. Fault injection: SPIKE_VERIFY_FAULT=skip-decide skips the
 // decide step so the harness's own failure path stays testable.
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createHmac } from 'node:crypto';
-import {
-  createWriteStream,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-} from 'node:fs';
-import net from 'node:net';
+import { createWriteStream, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  createSpikeServerLifecycle,
+  parseSpikePort,
+} from './spike-server-lifecycle.mjs';
 
 const FLOWSAFE = dirname(dirname(fileURLToPath(import.meta.url)));
 const WRANGLER = join(FLOWSAFE, 'node_modules/.bin/wrangler');
 const CONFIG = join(FLOWSAFE, 'spike/wrangler.jsonc');
-const PORT = Number(process.env.SPIKE_VERIFY_PORT ?? 8799);
+const PORT = parseSpikePort(
+  process.env.SPIKE_VERIFY_PORT ?? 8799,
+  'SPIKE_VERIFY_PORT',
+);
 const BASE = `http://127.0.0.1:${PORT}`;
 const FAULT = process.env.SPIKE_VERIFY_FAULT || undefined;
 const RUN_BODY = {
@@ -104,73 +104,6 @@ async function step(label, fn) {
   return result;
 }
 
-// 'listening' | 'refused' | 'timeout' | 'error:<code>' — only a clean
-// ECONNREFUSED counts as free; anything else is treated as occupied.
-function portState() {
-  return new Promise((resolve) => {
-    const socket = net.connect({ host: '127.0.0.1', port: PORT });
-    let settled = false;
-    const done = (state) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      resolve(state);
-    };
-    socket.setTimeout(1000, () => done('timeout'));
-    socket.once('connect', () => done('listening'));
-    socket.once('error', (error) => {
-      done(error.code === 'ECONNREFUSED' ? 'refused' : `error:${error.code}`);
-    });
-  });
-}
-
-async function waitRefused(deadlineMs) {
-  const deadline = Date.now() + deadlineMs;
-  let state = await portState();
-  while (state !== 'refused' && Date.now() < deadline) {
-    await sleep(250);
-    state = await portState();
-  }
-  return state;
-}
-
-// Transitive children of pid via /proc ppid links. Must run BEFORE the
-// group kill: orphans reparent to init afterwards and become untraceable.
-function descendantsOf(rootPid) {
-  const childrenByParent = new Map();
-  for (const entry of readdirSync('/proc')) {
-    if (!/^\d+$/.test(entry)) continue;
-    let stat;
-    try {
-      stat = readFileSync(`/proc/${entry}/stat`, 'utf8');
-    } catch {
-      continue; // process exited mid-scan
-    }
-    // format: pid (comm) state ppid ... — comm may contain spaces/parens
-    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-    const ppid = Number(fields[1]);
-    if (!childrenByParent.has(ppid)) childrenByParent.set(ppid, []);
-    childrenByParent.get(ppid).push(Number(entry));
-  }
-  const found = [];
-  const queue = [rootPid];
-  while (queue.length > 0) {
-    const children = childrenByParent.get(queue.shift()) ?? [];
-    found.push(...children);
-    queue.push(...children);
-  }
-  return found;
-}
-
-function alive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function startServer(generation, stateDir, logPath) {
   const child = spawn(
     WRANGLER,
@@ -218,62 +151,24 @@ function startServer(generation, stateDir, logPath) {
   return server;
 }
 
-async function waitReady(server, deadlineMs) {
-  const deadline = Date.now() + deadlineMs;
-  while (Date.now() < deadline) {
-    const { child, spawnError } = server;
-    if (spawnError) {
-      throw new Error(`${server.generation} failed to spawn: ${spawnError}`);
-    }
-    if (child.exitCode !== null || child.signalCode !== null) {
-      throw new Error(
-        `${server.generation} exited before ready ` +
-          `(code ${child.exitCode}, signal ${child.signalCode})`,
-      );
-    }
-    try {
-      // Any HTTP response counts: the worker 404s unknown paths.
-      await fetch(`${BASE}/`, { signal: AbortSignal.timeout(2000) });
-      return;
-    } catch {
-      await sleep(500);
-    }
-  }
-  throw new Error(`${server.generation} not ready within ${deadlineMs}ms`);
+const serverLifecycle = createSpikeServerLifecycle({ port: PORT });
+const portState = () => serverLifecycle.portState();
+
+async function launchServer(generation, stateDir, logPath) {
+  currentServer = await serverLifecycle.start(
+    generation,
+    () => startServer(generation, stateDir, logPath),
+    90_000,
+  );
+  return currentServer;
 }
 
 async function killServer(server) {
-  const rootPid = server.child.pid;
-  const pids =
-    rootPid === undefined ? [] : [rootPid, ...descendantsOf(rootPid)];
-  if (rootPid !== undefined) {
-    try {
-      process.kill(-rootPid, 'SIGKILL');
-    } catch {
-      // group already gone — the port checks below still apply
-    }
+  if (server !== currentServer || server !== serverLifecycle.activeServer) {
+    throw new Error('refusing to stop a server that is not the active server');
   }
-  const pidDeadline = Date.now() + 5000;
-  let survivors = pids.filter(alive);
-  while (survivors.length > 0 && Date.now() < pidDeadline) {
-    await sleep(250);
-    survivors = survivors.filter(alive);
-  }
-  if (survivors.length > 0) {
-    console.warn(`  pids still visible after kill: ${survivors.join(', ')}`);
-  }
-  let state = await waitRefused(5000);
-  if (state !== 'refused') {
-    // Last resort, still scoped: kills exactly the port holder.
-    spawnSync('fuser', ['-k', '-9', `${PORT}/tcp`], { stdio: 'ignore' });
-    state = await waitRefused(5000);
-  }
-  if (state !== 'refused') {
-    throw new Error(
-      `port ${PORT} still ${state} after group kill + fuser ` +
-        `(inspect: fuser -v ${PORT}/tcp; ss -ltnp 'sport = :${PORT}')`,
-    );
-  }
+  await serverLifecycle.stop();
+  currentServer = undefined;
 }
 
 async function http(method, path, { body, headers } = {}) {
@@ -520,13 +415,7 @@ function dumpLog(server) {
 // log fds and the temp dir — before the failure propagates.
 async function cleanup() {
   closeClientSockets();
-  try {
-    if (currentServer !== undefined) {
-      const server = currentServer;
-      currentServer = undefined;
-      await killServer(server);
-    }
-  } finally {
+  await serverLifecycle.cleanup(() => {
     for (const server of servers) {
       server.file.end();
     }
@@ -534,7 +423,8 @@ async function cleanup() {
       rmSync(tmpDir, { recursive: true, force: true });
       tmpDir = undefined;
     }
-  }
+  });
+  currentServer = undefined;
 }
 
 async function main() {
@@ -545,19 +435,15 @@ async function main() {
   }
 
   await step(`preflight: port ${PORT} must be free`, async () => {
-    const state = await portState();
-    assert(
-      state === 'refused',
-      `port ${PORT} is already in use (state: ${state}); pick another with ` +
-        `SPIKE_VERIFY_PORT=<port>, or inspect with: fuser -v ${PORT}/tcp`,
-    );
+    await serverLifecycle.preflight();
   });
 
   tmpDir = mkdtempSync(join(tmpdir(), 'spike-verify-'));
   const stateDir = join(tmpDir, 'state');
 
-  currentServer = startServer('gen-1', stateDir, join(tmpDir, 'gen1.log'));
-  await step('gen-1: server ready', () => waitReady(currentServer, 90_000));
+  await step('gen-1: server ready', () =>
+    launchServer('gen-1', stateDir, join(tmpDir, 'gen1.log')),
+  );
 
   const run = await step(
     'A1 start: run suspends at approval gate',
@@ -601,12 +487,10 @@ async function main() {
 
   await step('A2 kill: group-SIGKILL gen-1, prove port refused', async () => {
     await killServer(currentServer);
-    currentServer = undefined;
   });
 
-  currentServer = startServer('gen-2', stateDir, join(tmpDir, 'gen2.log'));
   await step('A2 restart: gen-2 on the same persisted state', async () => {
-    await waitReady(currentServer, 90_000);
+    await launchServer('gen-2', stateDir, join(tmpDir, 'gen2.log'));
     assert(
       !/address already in use/i.test(currentServer.chunks.join('')),
       'gen-2 log must not contain "address already in use" (orphan trap)',
@@ -943,9 +827,7 @@ async function main() {
       'events across a workerd kill+restart',
     async () => {
       await killServer(currentServer);
-      currentServer = undefined;
-      currentServer = startServer('gen-3', stateDir, join(tmpDir, 'gen3.log'));
-      await waitReady(currentServer, 90_000);
+      await launchServer('gen-3', stateDir, join(tmpDir, 'gen3.log'));
       assert(
         !/address already in use/i.test(currentServer.chunks.join('')),
         'gen-3 log must not contain "address already in use" (orphan trap)',
@@ -1113,6 +995,57 @@ async function main() {
     },
   );
 
+  await step(
+    'H2 D1 execution: serialized workflow updates complete and a killed task recovers tenant-scoped',
+    async () => {
+      const pollTask = async (taskId, wanted, timeoutMs = 30_000) => {
+        const deadline = Date.now() + timeoutMs;
+        let seen;
+        while (Date.now() < deadline) {
+          seen = await http(
+            'GET',
+            `/bg/execution-task/${encodeURIComponent(taskId)}`,
+          );
+          if (seen.body.status === wanted) return seen.body;
+          if (['failed', 'cancelled', 'timed_out'].includes(seen.body.status)) {
+            throw new Error(
+              `background task terminated: ${JSON.stringify(seen.body)}`,
+            );
+          }
+          await sleep(100);
+        }
+        throw new Error(
+          `background task did not reach ${wanted}: ${JSON.stringify(seen?.body)}`,
+        );
+      };
+
+      const fast = await http('POST', '/bg/execute');
+      assert(fast.status === 200, 'execution task enqueued', fast.body);
+      const completed = await pollTask(fast.body.taskId, 'completed');
+      assert(
+        completed.result?.executed === true,
+        'D1 task body executed',
+        completed,
+      );
+
+      const slow = await http('POST', '/bg/execute-recover');
+      assert(slow.status === 200, 'recoverable task enqueued', slow.body);
+      await pollTask(slow.body.taskId, 'running');
+      await killServer(currentServer);
+      await launchServer(
+        'bg-recovery',
+        stateDir,
+        join(tmpDir, 'bg-recovery.log'),
+      );
+      const recovered = await pollTask(slow.body.taskId, 'completed', 45_000);
+      assert(
+        recovered.result?.executed === true,
+        'killed D1 task recovered and completed',
+        recovered,
+      );
+    },
+  );
+
   // --- Track C signals (M-004) ---------------------------------------------
   // The load-bearing proofs the DL-002 affinity thesis rests on (the DO IS the
   // serialization lease, replacing Redis distributed leasing).
@@ -1128,7 +1061,8 @@ async function main() {
         body,
       );
       // An idle-wake RESERVED a run; the thread now reads ACTIVE in THIS isolate's
-      // pubsub-keyed registry (no LLM — Track A's real-loop drive is deferred).
+      // pubsub-keyed registry. This deterministic probe uses the reserve agent;
+      // spike:verify:llm exercises the credentialed real loop separately.
       assert(
         typeof body.activeRunId === 'string',
         'thread reads ACTIVE after the reserve (activeRunId present)',
@@ -1177,7 +1111,8 @@ async function main() {
   // Prove the goal objective surface writes the mastra_thread_state domain and
   // that the DURABLE goal-step read path (resolveGoalStore -> readObjective over
   // the COMPOSED storage) reads it back — including across a workerd restart (the
-  // DO-eviction analog). No LLM: the real goal LOOP is Track A's deferred residual.
+  // DO-eviction analog). The deterministic gate does not need a model; the
+  // credentialed durable-agent loop has its own spike:verify:llm proof.
   const GOAL_OBJECTIVE = 'ship the launch checklist';
   let goalRecord;
   await step(
@@ -1273,9 +1208,7 @@ async function main() {
       'the goal-step read path still returns it (D1, not a registry)',
     async () => {
       await killServer(currentServer);
-      currentServer = undefined;
-      currentServer = startServer('gen-4', stateDir, join(tmpDir, 'gen4.log'));
-      await waitReady(currentServer, 90_000);
+      await launchServer('gen-4', stateDir, join(tmpDir, 'gen4.log'));
       assert(
         !/address already in use/i.test(currentServer.chunks.join('')),
         'gen-4 log must not contain "address already in use" (orphan trap)',
@@ -1462,9 +1395,7 @@ async function main() {
       'subscriptions from D1 and fires poll delivery (in-memory-lost, D1-restored)',
     async () => {
       await killServer(currentServer);
-      currentServer = undefined;
-      currentServer = startServer('gen-5', stateDir, join(tmpDir, 'gen5.log'));
-      await waitReady(currentServer, 90_000);
+      await launchServer('gen-5', stateDir, join(tmpDir, 'gen5.log'));
       assert(
         !/address already in use/i.test(currentServer.chunks.join('')),
         'gen-5 log must not contain "address already in use" (orphan trap)',
@@ -1552,6 +1483,8 @@ try {
       'refused expired / cross-tenant / garbage / cross-channel tickets. ' +
       'Track B (M-003): a smuggled _background arg was rejected + audited ' +
       '(B-S3), and a fresh init() recovered a task left running in D1 (B-S2). ' +
+      'The serialized tenant-scoped D1 domains executed a task to completion ' +
+      'and recovered a killed in-flight task after restart (H2). ' +
       'Track C (M-004): a send into an ACTIVE thread-DO loop drained IN-PROCESS ' +
       'via the shared-pubsub registry (C-S2, the DL-002 affinity thesis), and a ' +
       'foreign-threadId send failed closed at BOTH the topology 404 and the DO ' +

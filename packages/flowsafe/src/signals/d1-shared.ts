@@ -22,6 +22,12 @@ export interface SignalStatement {
 /** The D1 database subset both signal domains use. */
 export interface SignalDatabase {
   prepare(query: string): SignalStatement;
+  /**
+   * D1's transactional prepared-statement batch. Optional because the simpler
+   * signal domains need only `prepare`; notification schema migration requires
+   * it so rollback writers cannot interleave with ordinal backfill.
+   */
+  batch?(statements: SignalStatement[]): Promise<unknown[]>;
 }
 
 /** Rows affected by a D1 write, read from its `{ meta: { changes } }` envelope. */

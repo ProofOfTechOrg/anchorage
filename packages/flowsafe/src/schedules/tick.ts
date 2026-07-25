@@ -11,17 +11,9 @@
 //    through the host's run-start seam (topology.start / RunnerRuntime.start),
 //    so the run inherits INV-1, the per-leg requestContext derivation, and the
 //    resume ledger. This is the fully-owned path.
-//  - AGENT targets: GUARDED OFF (substrate-blocked). The only public agent-fire
-//    entry, `mastra.schedules.run(id)`, does NOT execute inline — it PUBLISHES an
-//    `agent-schedule.fire` event onto core's `agent-schedules` pubsub topic for
-//    the AgentScheduleWorker to consume (verified against the 1.50.0 dist:
-//    chunk-F3BBI4YR.js run() publishes, never runs). We do not run that worker
-//    loop (P1), and `executeAgentSchedule` is NOT on the package exports map
-//    (R-001). So an agent fire is recorded as an audited, guarded skip and the
-//    schedule is advanced (consumed, never hot-looped) — a fail-closed
-//    non-execution, NOT a silently-forked private execution path. Agent-target
-//    EXECUTION is a reshape decision for the orchestrator (needs a durable-agent
-//    drive on OUR substrate, Track A's deferred real-loop + the thread-DO).
+//  - AGENT targets: `startAgent` routes the claimed target through the host's
+//    runtime-driven thread DO. Without that seam, the tick retains the audited
+//    `agent-target-unsupported` skip and never adopts core's worker.
 //
 // CAP (DL-007, P7): every unattended workflow start consults an INJECTABLE
 // run-cap seam (host-agnostic; the showcase's demo caps are one implementation).
@@ -43,6 +35,7 @@
 // context is DROPPED entirely (strictly more fail-closed); a local-runtime host
 // can apply the tick-provided requestContext.
 
+import { ScheduleInputSchema } from '@mastra/core/schedules';
 import { computeNextFireAt } from '@mastra/core/workflows';
 import {
   BREAKWATER_ACTOR_KEY,
@@ -50,8 +43,13 @@ import {
   BREAKWATER_ISOLATION_SCOPE_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
 } from '../do-runner/breakwater-keys.js';
-import { assertMintableTenantId, mintSaltedId } from '../do-runner/index.js';
+import {
+  assertMintableTenantId,
+  mintSaltedId,
+  tenantOwnsSaltedId,
+} from '../do-runner/index.js';
 import { GOAL_REQUEST_CONTEXT_KEY } from '../goals/objective-routes.js';
+import { nonnegativeSafeInteger } from '../numeric-config.js';
 import type { Schedule, ScheduleTrigger } from './schedules-d1.js';
 
 /** The `breakwater.` namespace prefix — every runtime-owned key starts with it. */
@@ -72,6 +70,9 @@ export const RESERVED_SCHEDULE_CONTEXT_KEYS: readonly string[] = [
   BREAKWATER_WORKFLOW_SCOPE_KEY,
   BREAKWATER_ISOLATION_SCOPE_KEY,
   GOAL_REQUEST_CONTEXT_KEY,
+  '__proto__',
+  'constructor',
+  'prototype',
 ];
 
 /**
@@ -79,11 +80,16 @@ export const RESERVED_SCHEDULE_CONTEXT_KEYS: readonly string[] = [
  * base keys AND any future breakwater key) or is core's goal key. A stored
  * schedule context carrying any of these would inject a standing capability /
  * objective into every woken run — the same stored-capability class as the
- * approval create-route leak.
+ * approval create-route leak. The three object meta-keys are also reserved so
+ * parsed JSON cannot mutate a copied context's prototype.
  */
 export function isReservedScheduleContextKey(key: string): boolean {
   return (
-    key.startsWith(BREAKWATER_KEY_PREFIX) || key === GOAL_REQUEST_CONTEXT_KEY
+    key.startsWith(BREAKWATER_KEY_PREFIX) ||
+    key === GOAL_REQUEST_CONTEXT_KEY ||
+    key === '__proto__' ||
+    key === 'constructor' ||
+    key === 'prototype'
   );
 }
 
@@ -94,7 +100,14 @@ export function stripReservedScheduleContext(
   if (!stored) return {};
   const safe: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(stored)) {
-    if (!isReservedScheduleContextKey(key)) safe[key] = value;
+    if (!isReservedScheduleContextKey(key)) {
+      Object.defineProperty(safe, key, {
+        value,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
   }
   return safe;
 }
@@ -119,6 +132,7 @@ export function buildScheduledLegContext(
 /** The storage subset the tick reads/writes (a subset of D1SchedulesStorage). */
 export interface ScheduleTickStore {
   listDueSchedules(now: number, limit?: number): Promise<Schedule[]>;
+  getSchedule(id: string): Promise<Schedule | null>;
   updateScheduleNextFire(
     id: string,
     expectedNextFireAt: number,
@@ -143,6 +157,26 @@ export type ScheduleTickStart = (
   requestContext?: Record<string, unknown>,
 ) => Promise<{ runId: string }>;
 
+export type AgentScheduleTarget = Extract<
+  Schedule['target'],
+  { type: 'agent' }
+>;
+
+export interface ScheduleTickStartAgentInput {
+  target: AgentScheduleTarget;
+  tenantId: string;
+  runId: string;
+  /** DO address; ephemeral and memoryless when `threaded` is false. */
+  topologyThreadId: string;
+  threaded: boolean;
+  requestContext: Record<string, unknown>;
+  streamRequestContext: Record<string, unknown>;
+}
+
+export type ScheduleTickStartAgent = (
+  input: ScheduleTickStartAgentInput,
+) => Promise<{ runId: string }>;
+
 /**
  * The injectable per-tenant run cap (DL-007): return false to REFUSE an
  * unattended start (a capped fire is skipped + audited, the schedule stays
@@ -155,9 +189,9 @@ export type ScheduleTickRunCap = (
 /** Outcome of one due-schedule fire attempt in a tick pass. */
 export type ScheduleFireOutcome =
   | 'published' // a workflow run was dispatched
-  | 'skipped' // agent-target guarded-off OR run-capped (deliberate non-fire)
+  | 'skipped' // agent start unavailable OR run-capped (deliberate non-fire)
   | 'failed' // invalid tenant OR the start seam threw
-  | 'lost'; // the CAS claim lost to a concurrent tick (no fire, no trigger)
+  | 'lost'; // the row advanced, paused, or disappeared before the claim
 
 /** The structured audit event a tick emits per fire attempt (accepted OR not). */
 export interface ScheduleTickAuditEvent {
@@ -169,7 +203,7 @@ export interface ScheduleTickAuditEvent {
   outcome: ScheduleFireOutcome;
   /** The minted runId for a published fire. */
   runId?: string;
-  /** Present for skipped/failed — WHY (agent-target-unsupported, run-capped, …). */
+  /** Present for non-published outcomes: the structured reason. */
   reason?: string;
   timestamp: string;
 }
@@ -184,11 +218,16 @@ export interface ScheduleTickOptions {
   store: ScheduleTickStore;
   /** The run-start seam (topology.start / a local runtime start wrapper). */
   start: ScheduleTickStart;
+  /** Runtime-driven agent start. Absent preserves the guarded skip. */
+  startAgent?: ScheduleTickStartAgent;
   /** The per-tenant run cap (DL-007). Absent ⇒ uncapped. */
   runCap?: ScheduleTickRunCap;
   /** Every fire attempt is audited through this (accepted OR skipped/failed). Absent ⇒ no audit. */
   audit?: ScheduleTickAuditSink;
-  /** Max due schedules processed per tick pass. Default 100. */
+  /**
+   * Max due schedules processed per tick pass. Must be a nonnegative safe
+   * integer; zero is an intentional no-op. Default 100.
+   */
   limit?: number;
   /** Clock override for tests. */
   now?: () => number;
@@ -198,13 +237,13 @@ export interface ScheduleTickOptions {
 export interface ScheduleTickResult {
   /** Due schedules the pass considered. */
   due: number;
-  /** Workflow runs dispatched. */
+  /** Workflow or agent runs dispatched. */
   fired: number;
-  /** Deliberate non-fires (agent-guarded + run-capped). */
+  /** Deliberate non-fires (agent start unavailable or run-capped). */
   skipped: number;
   /** Errors (invalid tenant + start threw); the schedule was still advanced. */
   failed: number;
-  /** CAS claims lost to a concurrent tick (no fire, no trigger). */
+  /** CAS claims lost because the row advanced, paused, or disappeared. */
   lost: number;
 }
 
@@ -216,6 +255,97 @@ function isMintableTenant(tenantId: unknown): tenantId is string {
   } catch {
     return false;
   }
+}
+
+function contextObject(
+  value: unknown,
+): Record<string, unknown> | undefined | null {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function normalizeAndSanitizeAgentTarget(
+  scheduleId: string,
+  stored: AgentScheduleTarget,
+): AgentScheduleTarget | undefined {
+  if (
+    typeof stored.agentId !== 'string' ||
+    stored.agentId.length === 0 ||
+    typeof stored.prompt !== 'string' ||
+    stored.prompt.length === 0 ||
+    (stored.name !== undefined && typeof stored.name !== 'string')
+  ) {
+    return undefined;
+  }
+  const legacyContext = contextObject(stored.requestContext);
+  if (legacyContext === null) return undefined;
+
+  const rawIdle = stored.ifIdle;
+  let normalizedIdle = rawIdle;
+  if (
+    rawIdle !== undefined &&
+    typeof rawIdle === 'object' &&
+    rawIdle !== null &&
+    !Array.isArray(rawIdle) &&
+    rawIdle.streamOptions !== undefined
+  ) {
+    const rawStreamOptions = rawIdle.streamOptions;
+    if (
+      typeof rawStreamOptions !== 'object' ||
+      rawStreamOptions === null ||
+      Array.isArray(rawStreamOptions)
+    ) {
+      return undefined;
+    }
+    const streamContext = contextObject(rawStreamOptions.requestContext);
+    if (streamContext === null) return undefined;
+    normalizedIdle = {
+      ...rawIdle,
+      streamOptions: {
+        ...rawStreamOptions,
+        ...(streamContext !== undefined
+          ? {
+              requestContext: stripReservedScheduleContext(streamContext),
+            }
+          : {}),
+      },
+    };
+  }
+
+  const parsed = ScheduleInputSchema.safeParse({
+    scheduleId,
+    agentId: stored.agentId,
+    prompt: stored.prompt,
+    threadId: stored.threadId,
+    resourceId: stored.resourceId,
+    signalType: stored.signalType,
+    tagName: stored.tagName,
+    attributes: stored.attributes,
+    providerOptions: stored.providerOptions,
+    ifActive: stored.ifActive,
+    ifIdle: normalizedIdle,
+  });
+  if (!parsed.success) return undefined;
+
+  const {
+    scheduleId: _scheduleId,
+    agentId,
+    prompt,
+    ...runtimeFields
+  } = parsed.data;
+  return {
+    type: 'agent',
+    agentId,
+    prompt,
+    ...(stored.name !== undefined ? { name: stored.name } : {}),
+    ...runtimeFields,
+    ...(legacyContext !== undefined
+      ? { requestContext: stripReservedScheduleContext(legacyContext) }
+      : {}),
+  };
 }
 
 /**
@@ -230,7 +360,10 @@ export function createScheduleTick(
 ): () => Promise<ScheduleTickResult> {
   const { store, start } = options;
   const now = options.now ?? Date.now;
-  const limit = options.limit ?? 100;
+  const limit = nonnegativeSafeInteger(
+    options.limit ?? 100,
+    'schedule tick limit',
+  );
 
   const audit = async (
     event: Omit<ScheduleTickAuditEvent, 'type' | 'timestamp'>,
@@ -281,7 +414,7 @@ export function createScheduleTick(
     // 3. Provisional runId — only a workflow target with a valid tenant mints one
     // (the CAS lastRunId). Agent / capped / invalid fires carry no run.
     const runId =
-      targetType === 'workflow' && tenantId !== undefined
+      tenantId !== undefined
         ? mintSaltedId(tenantId, () => crypto.randomUUID(), 'scheduleTick')
         : undefined;
 
@@ -302,6 +435,28 @@ export function createScheduleTick(
     );
     if (!claimed) {
       result.lost += 1;
+      const current = await store.getSchedule(schedule.id);
+      const reason = !current
+        ? 'disappeared'
+        : current.status === 'paused'
+          ? 'paused'
+          : 'concurrent-claim';
+      const lostReason = `lost: ${reason}`;
+      await store.recordTrigger({
+        scheduleId: schedule.id,
+        runId: null,
+        scheduledFireAt: schedule.nextFireAt,
+        actualFireAt: at,
+        outcome: 'skipped',
+        metadata: { ...(tenantId ? { tenantId } : {}), reason: lostReason },
+      });
+      await audit({
+        scheduleId: schedule.id,
+        ...(tenantId ? { tenantId } : {}),
+        target: targetType,
+        outcome: 'lost',
+        reason: lostReason,
+      });
       return;
     }
 
@@ -331,23 +486,191 @@ export function createScheduleTick(
     }
 
     if (targetType === 'agent') {
-      // GUARDED OFF: agent-target execution is substrate-blocked (see header).
-      result.skipped += 1;
-      await store.recordTrigger({
-        scheduleId: schedule.id,
-        runId: null,
-        scheduledFireAt,
-        actualFireAt: at,
-        outcome: 'skipped',
-        metadata: { tenantId, reason: 'agent-target-unsupported' },
-      });
-      await audit({
-        scheduleId: schedule.id,
-        tenantId,
-        target: 'agent',
-        outcome: 'skipped',
-        reason: 'agent-target-unsupported',
-      });
+      if (!options.startAgent) {
+        result.skipped += 1;
+        await store.recordTrigger({
+          scheduleId: schedule.id,
+          runId: null,
+          scheduledFireAt,
+          actualFireAt: at,
+          outcome: 'skipped',
+          metadata: { tenantId, reason: 'agent-target-unsupported' },
+        });
+        await audit({
+          scheduleId: schedule.id,
+          tenantId,
+          target: 'agent',
+          outcome: 'skipped',
+          reason: 'agent-target-unsupported',
+        });
+        return;
+      }
+
+      const target = normalizeAndSanitizeAgentTarget(
+        schedule.id,
+        schedule.target,
+      );
+      if (!target) {
+        result.failed += 1;
+        await store.recordTrigger({
+          scheduleId: schedule.id,
+          runId: null,
+          scheduledFireAt,
+          actualFireAt: at,
+          outcome: 'failed',
+          metadata: { tenantId, reason: 'invalid-agent-target' },
+        });
+        await audit({
+          scheduleId: schedule.id,
+          tenantId,
+          target: 'agent',
+          outcome: 'failed',
+          reason: 'invalid-agent-target',
+        });
+        return;
+      }
+      if (
+        (target.threadId !== undefined &&
+          !tenantOwnsSaltedId(tenantId, target.threadId)) ||
+        (target.resourceId !== undefined &&
+          !tenantOwnsSaltedId(tenantId, target.resourceId)) ||
+        (target.threadId !== undefined && target.resourceId === undefined)
+      ) {
+        result.failed += 1;
+        await store.recordTrigger({
+          scheduleId: schedule.id,
+          runId: null,
+          scheduledFireAt,
+          actualFireAt: at,
+          outcome: 'failed',
+          metadata: { tenantId, reason: 'foreign-memory-id' },
+        });
+        await audit({
+          scheduleId: schedule.id,
+          tenantId,
+          target: 'agent',
+          outcome: 'failed',
+          reason: 'foreign-memory-id',
+        });
+        return;
+      }
+      if (
+        target.threadId === undefined &&
+        (target.resourceId !== undefined ||
+          target.signalType !== undefined ||
+          target.ifActive !== undefined ||
+          target.ifIdle !== undefined)
+      ) {
+        result.failed += 1;
+        await store.recordTrigger({
+          scheduleId: schedule.id,
+          runId: null,
+          scheduledFireAt,
+          actualFireAt: at,
+          outcome: 'failed',
+          metadata: { tenantId, reason: 'invalid-agent-target' },
+        });
+        await audit({
+          scheduleId: schedule.id,
+          tenantId,
+          target: 'agent',
+          outcome: 'failed',
+          reason: 'invalid-agent-target',
+        });
+        return;
+      }
+
+      const allowed = options.runCap ? await options.runCap(tenantId) : true;
+      if (!allowed) {
+        result.skipped += 1;
+        await store.recordTrigger({
+          scheduleId: schedule.id,
+          runId: null,
+          scheduledFireAt,
+          actualFireAt: at,
+          outcome: 'skipped',
+          metadata: { tenantId, reason: 'run-capped' },
+        });
+        await audit({
+          scheduleId: schedule.id,
+          tenantId,
+          target: 'agent',
+          outcome: 'skipped',
+          reason: 'run-capped',
+        });
+        return;
+      }
+
+      const firedRunId = runId as string;
+      const threaded = target.threadId !== undefined;
+      const topologyThreadId =
+        target.threadId ??
+        mintSaltedId(
+          tenantId,
+          () => crypto.randomUUID(),
+          'schedule agent thread',
+        );
+      let summary: { runId: string };
+      try {
+        summary = await options.startAgent({
+          target,
+          tenantId,
+          runId: firedRunId,
+          topologyThreadId,
+          threaded,
+          requestContext: target.requestContext ?? {},
+          streamRequestContext:
+            target.ifIdle?.streamOptions?.requestContext ?? {},
+        });
+      } catch (error) {
+        result.failed += 1;
+        await store.recordTrigger({
+          scheduleId: schedule.id,
+          runId: firedRunId,
+          scheduledFireAt,
+          actualFireAt: at,
+          outcome: 'failed',
+          error: error instanceof Error ? error.message : String(error),
+          metadata: { tenantId },
+        });
+        await audit({
+          scheduleId: schedule.id,
+          tenantId,
+          target: 'agent',
+          outcome: 'failed',
+          runId: firedRunId,
+          reason: 'start-error',
+        });
+        return;
+      }
+      const dispatchedRunId = summary.runId ?? firedRunId;
+      result.fired += 1;
+      try {
+        await store.recordTrigger({
+          scheduleId: schedule.id,
+          runId: dispatchedRunId,
+          scheduledFireAt,
+          actualFireAt: at,
+          outcome: 'published',
+          metadata: { tenantId },
+        });
+        await audit({
+          scheduleId: schedule.id,
+          tenantId,
+          target: 'agent',
+          outcome: 'published',
+          runId: dispatchedRunId,
+        });
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            type: 'schedule-tick-bookkeeping-error',
+            scheduleId: schedule.id,
+            runId: dispatchedRunId,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }
       return;
     }
 
@@ -416,29 +739,42 @@ export function createScheduleTick(
       return;
     }
     // The run WAS dispatched. Record it as `published` (write-once at dispatch,
-    // per core's ScheduleTriggerOutcome doc). If THIS bookkeeping throws it
-    // propagates to the loop's per-schedule catch (logged, `fired` already
-    // counted) rather than masquerading as a start failure.
+    // per core's ScheduleTriggerOutcome doc). Bookkeeping failures are logged
+    // locally and do not reclassify the successful dispatch as a start failure.
     const dispatchedRunId = summary.runId ?? firedRunId;
     result.fired += 1;
-    await store.recordTrigger({
-      scheduleId: schedule.id,
-      runId: dispatchedRunId,
-      scheduledFireAt,
-      actualFireAt: at,
-      outcome: 'published',
-      metadata: { tenantId },
-    });
-    await audit({
-      scheduleId: schedule.id,
-      tenantId,
-      target: 'workflow',
-      outcome: 'published',
-      runId: dispatchedRunId,
-    });
+    try {
+      await store.recordTrigger({
+        scheduleId: schedule.id,
+        runId: dispatchedRunId,
+        scheduledFireAt,
+        actualFireAt: at,
+        outcome: 'published',
+        metadata: { tenantId },
+      });
+      await audit({
+        scheduleId: schedule.id,
+        tenantId,
+        target: 'workflow',
+        outcome: 'published',
+        runId: dispatchedRunId,
+      });
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          type: 'schedule-tick-bookkeeping-error',
+          scheduleId: schedule.id,
+          runId: dispatchedRunId,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    }
   };
 
   return async () => {
+    if (limit === 0) {
+      return { due: 0, fired: 0, skipped: 0, failed: 0, lost: 0 };
+    }
     const at = now();
     const due = await store.listDueSchedules(at, limit);
     const result: ScheduleTickResult = {
