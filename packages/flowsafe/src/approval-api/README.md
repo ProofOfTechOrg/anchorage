@@ -121,8 +121,9 @@ grant in its requestContext.
 - **A wrong-tenant id behaves exactly like an unknown id.** `get`/`transition`
   return null and reuse the existing 404/409 paths, so the API is not an
   oracle for another tenant's record ids.
-- **Open-uniqueness is per tenant.** The partial unique index leads with
-  `tenant_id`. It had to be `DROP`ped and recreated under a NEW name:
+- **Open-uniqueness and captured-fingerprint uniqueness are per tenant.** The
+  partial open-step index leads with `tenant_id`. It had to be `DROP`ped and
+  recreated under a NEW name:
   `CREATE UNIQUE INDEX IF NOT EXISTS` matches on name alone, so redefining it
   in place is a silent no-op on any database that already has it — and tenant
   B's create would collapse into tenant A's open record.
@@ -152,8 +153,10 @@ grant in its requestContext.
   path.
 - Every state change goes through `transition(id, from[], patch)`.
 - At most one OPEN request per (workflowId, runId, stepKey) — enforced by a
-  partial unique index; decided records never block a re-suspension's fresh
-  request.
+  partial unique index. For a captured step suspension, at most one record of
+  ANY status exists per (workflowId, runId, stepKey, suspendedAt, resumeCount):
+  terminal records atomically block stale reconciliation from re-filing the
+  same suspension, while a changed fingerprint opens the re-suspension fresh.
 - The provider returns the grant key on EVERY leg (empty when nothing
   applies): Mastra merges resume-provided context over the persisted
   snapshot, so omission would inherit a previous leg's grants instead of

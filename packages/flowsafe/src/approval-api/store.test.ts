@@ -200,7 +200,7 @@ function describeStoreContract(
     });
 
     it('opens a fresh request for the same step once the previous one is decided', async () => {
-      // #given — a decided request for the step
+      // #given — a legacy/unbound decided request with no captured suspension
       const store = await makeStore();
       const first = makeRecord({ runId: 'run-again', stepPath: ['approval'] });
       await store.create(first);
@@ -217,6 +217,75 @@ function describeStoreContract(
       // #then
       expect(second.created).toBe(true);
       expect(second.record.id).not.toBe(first.id);
+    });
+
+    it.each([
+      'approved',
+      'rejected',
+    ] as const)('returns the terminal %s record for the same captured suspension fingerprint', async (status) => {
+      // #given — reconciliation listed before another request filed + decided
+      const store = await makeStore();
+      expect(await store.list({ workflowId: 'wf', runId: 'run-race' })).toEqual(
+        [],
+      );
+      const winner = makeRecord({
+        runId: 'run-race',
+        stepPath: ['approval'],
+        suspendedAt: 1000,
+      });
+      await store.create(winner);
+      await store.transition(winner.id, ['pending'], {
+        status,
+        updatedAt: T,
+        decidedAt: T,
+      });
+
+      // #when — the stale reconciliation queues after that terminal decision
+      const staleCreate = await store.create(
+        makeRecord({
+          runId: 'run-race',
+          stepPath: ['approval'],
+          suspendedAt: 1000,
+        }),
+      );
+
+      // #then — NULL first-suspension resumeCount compares equal; no pending
+      expect(staleCreate).toMatchObject({
+        created: false,
+        record: { id: winner.id, status },
+      });
+      expect(await store.list({ runId: 'run-race' })).toHaveLength(1);
+      expect(
+        await store.list({ runId: 'run-race', status: 'pending' }),
+      ).toHaveLength(0);
+    });
+
+    it('opens fresh when the same step has a later captured suspension fingerprint', async () => {
+      const store = await makeStore();
+      const first = makeRecord({
+        runId: 'run-resuspended',
+        stepPath: ['approval'],
+        suspendedAt: 1000,
+      });
+      await store.create(first);
+      await store.transition(first.id, ['pending'], {
+        status: 'approved',
+        updatedAt: T,
+        decidedAt: T,
+      });
+
+      const later = await store.create(
+        makeRecord({
+          runId: 'run-resuspended',
+          stepPath: ['approval'],
+          suspendedAt: 1000,
+          resumeCount: 1,
+        }),
+      );
+
+      expect(later.created).toBe(true);
+      expect(later.record.id).not.toBe(first.id);
+      expect(await store.list({ runId: 'run-resuspended' })).toHaveLength(2);
     });
 
     it('keeps distinct steps of the same run independently open', async () => {
@@ -1101,7 +1170,11 @@ describe('D1ApprovalStore.create — concurrent decide-close race (F3)', () => {
     // #given — a shared SQLite; a seed store opens R1 for (wf, run, gate)
     const sqlite = openSqlite();
     const seed = new D1ApprovalStoreFactory(d1Like(sqlite)).forTenant('acme');
-    const open1 = makeRecord({ runId: 'race-run', stepPath: ['gate'] });
+    const open1 = makeRecord({
+      runId: 'race-run',
+      stepPath: ['gate'],
+      suspendedAt: 1000,
+    });
     await seed.create(open1);
 
     // At the FIRST #openFor SELECT (between the failed INSERT and the read),
@@ -1124,7 +1197,12 @@ describe('D1ApprovalStore.create — concurrent decide-close race (F3)', () => {
     const store = new D1ApprovalStore(racing, { tenantId: 'acme' });
 
     // #when — a fresh create for the SAME step
-    const fresh = makeRecord({ runId: 'race-run', stepPath: ['gate'] });
+    const fresh = makeRecord({
+      runId: 'race-run',
+      stepPath: ['gate'],
+      suspendedAt: 2000,
+      resumeCount: 1,
+    });
     const result = await store.create(fresh);
 
     // #then — no throw; a brand-new record was created (not R1)
@@ -1141,6 +1219,7 @@ describe('D1ApprovalStore.create — concurrent decide-close race (F3)', () => {
       id: 'r1-open',
       runId: 'race-run-2',
       stepPath: ['gate'],
+      suspendedAt: 1000,
     });
     await seed.create(open1);
 
@@ -1152,6 +1231,8 @@ describe('D1ApprovalStore.create — concurrent decide-close race (F3)', () => {
       id: 'r2-open',
       runId: 'race-run-2',
       stepPath: ['gate'],
+      suspendedAt: 3000,
+      resumeCount: 2,
     });
     const racing = racingD1(sqlite, {
       onOpenForSelect: async (occurrence) => {
@@ -1176,6 +1257,8 @@ describe('D1ApprovalStore.create — concurrent decide-close race (F3)', () => {
       id: 'fresh-loser',
       runId: 'race-run-2',
       stepPath: ['gate'],
+      suspendedAt: 2000,
+      resumeCount: 1,
     });
     const result = await store.create(fresh);
 
@@ -1395,6 +1478,34 @@ describe('D1ApprovalStore schema upgrade', () => {
     expect(readBack?.resumeCount).toBe(2);
     expect(readBack?.runScoped).toBe(true);
     expect(readBack?.resumeTarget).toEqual(fresh.resumeTarget);
+  });
+
+  it('fails closed when legacy rows duplicate a captured suspension fingerprint', async () => {
+    const sqlite = openSqlite();
+    sqlite.prepare(TENANTED_MINUS_INTEGERS_DDL).run();
+    sqlite
+      .prepare(`ALTER TABLE flowsafe_approvals ADD COLUMN suspended_at INTEGER`)
+      .run();
+    sqlite
+      .prepare(`ALTER TABLE flowsafe_approvals ADD COLUMN resume_count INTEGER`)
+      .run();
+    for (const id of ['duplicate-a', 'duplicate-b']) {
+      sqlite
+        .prepare(
+          `INSERT INTO flowsafe_approvals
+           (id, tenant_id, workflow_id, run_id, step_key, step_path,
+            suspended_at, resume_count, title, connectors, priority, status,
+            created_at, updated_at)
+           VALUES (?, 'acme', 'wf', 'run-duplicate', 'gate', '["gate"]',
+                   1000, NULL, 'duplicate', '[]', 'normal', 'approved', ?, ?)`,
+        )
+        .run(id, T, T);
+    }
+    const store = new D1ApprovalStoreFactory(d1Like(sqlite)).forTenant('acme');
+
+    await expect(store.list()).rejects.toThrow(
+      /duplicate captured suspension fingerprints/,
+    );
   });
 
   it('a legacy step-less approval (no run_scoped) mints NOTHING on the upgraded table', async () => {
