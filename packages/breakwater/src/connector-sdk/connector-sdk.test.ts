@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { resolveBackgroundConfig } from '@mastra/core/background-tasks';
 import { RequestContext } from '@mastra/core/request-context';
 import type { ToolExecutionContext } from '@mastra/core/tools';
 import { describe, expect, it, vi } from 'vitest';
@@ -2376,5 +2377,151 @@ describe('createConnector egress-fetch runtime', () => {
       checked: 200,
     });
     expect(vendor.calls).toHaveLength(1);
+  });
+});
+
+describe('_background model-override defense (DL-005)', () => {
+  // These connectors declare NO stripping inputSchema, so a `_background` arg
+  // reaches gatedExecute — the paths this check has teeth on (a schema'd
+  // connector on the agent path already has `_background` stripped by core's
+  // cleanedArgs and by Mastra's schema validation; the check is belt-and-braces
+  // there and the real guard on no-schema / passthrough / direct calls).
+  function bgWriteConnector(audit?: AuditLogger) {
+    const execute = vi.fn(async () => ({ ok: true }));
+    const tool = createConnector({
+      id: 'crm.assign',
+      description: 'foreground-only write connector',
+      execute,
+      permissions: { sideEffect: 'write' },
+      ...(audit ? { policies: { audit } } : {}),
+    });
+    return { tool, execute };
+  }
+
+  it('rejects tool-call args carrying a _background field on a foreground-only connector, and audits', async () => {
+    // #given — a write-class connector never opts into background
+    const audit = new AuditLogger();
+    const { tool, execute } = bgWriteConnector(audit);
+    // #when — the model smuggles a _background override into the args
+    const failure = await run(tool, {
+      account: 'acme',
+      _background: { enabled: true },
+    }).catch((error: unknown) => error);
+    // #then — denied before execute, fail-closed, audited under policy 'background'
+    expect(failure).toBeInstanceOf(ConnectorPolicyError);
+    expect((failure as ConnectorPolicyError).policy).toBe('background');
+    expect(execute).not.toHaveBeenCalled();
+    expect(audit.events()).toMatchObject([
+      {
+        action: 'connector.execute',
+        resource: 'crm.assign',
+        decision: 'denied',
+        detail: { policy: 'background', sideEffect: 'write' },
+      },
+    ]);
+  });
+
+  it('rejects a _background field even when it forces foreground (presence is the smuggling signal)', async () => {
+    // #given
+    const { tool, execute } = bgWriteConnector();
+    // #when — enabled:false still carries the forbidden field on a foreground-only connector
+    const failure = await run(tool, {
+      account: 'acme',
+      _background: { enabled: false },
+    }).catch((error: unknown) => error);
+    // #then
+    expect(failure).toBeInstanceOf(ConnectorPolicyError);
+    expect((failure as ConnectorPolicyError).policy).toBe('background');
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('rejects a _background arg on a dry-run request too (the smuggling attempt precedes the dry-run branch)', async () => {
+    // #given — a dry-run-capable read connector, still foreground-only
+    // (execute and dryRunExecute share the output shape, per createConnector)
+    const dryRunExecute = vi.fn(async () => ({ ok: true }));
+    const tool = createConnector({
+      id: 'crm.lookup',
+      description: 'dry-run-capable read',
+      execute: async () => ({ ok: true }),
+      dryRunExecute,
+      permissions: { sideEffect: 'read', dryRun: true },
+    });
+    // #when
+    const failure = await run(
+      tool,
+      { account: 'acme', _background: { enabled: true } },
+      makeContext({ dryRun: true }),
+    ).catch((error: unknown) => error);
+    // #then — rejected before dryRunExecute runs
+    expect(failure).toBeInstanceOf(ConnectorPolicyError);
+    expect((failure as ConnectorPolicyError).policy).toBe('background');
+    expect(dryRunExecute).not.toHaveBeenCalled();
+  });
+
+  it('lets a read-only connector that OPTS IN receive _background args', async () => {
+    // #given — a read-only tool that deliberately supports background
+    const execute = vi.fn(async () => ({ ok: true }));
+    const tool = createConnector({
+      id: 'search.web',
+      description: 'Background-eligible read',
+      execute,
+      permissions: { sideEffect: 'read', background: true },
+    });
+    // #when — the override passes through to the opted-in tool
+    const result = await run(tool, { q: 'x', _background: { enabled: true } });
+    // #then
+    expect(result).toEqual({ ok: true });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects permissions.background on a write-class connector at construction', () => {
+    // #given / #when — a write connector opting into background is a construction error
+    let error: unknown;
+    try {
+      createConnector({
+        id: 'crm.assign',
+        description: 'write with illegal background opt-in',
+        execute: async () => ({ ok: true }),
+        permissions: { sideEffect: 'write', background: true },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    // #then
+    expect(error).toBeInstanceOf(TypeError);
+    expect((error as TypeError).message).toContain('background');
+    expect((error as TypeError).message).toContain('read-only');
+  });
+
+  it('passes ordinary args (no _background field) straight through', async () => {
+    // #given
+    const { tool, execute } = bgWriteConnector();
+    // #when
+    const result = await run(tool, { account: 'acme' });
+    // #then
+    expect(result).toEqual({ ok: true });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  // HONESTY (QA): every test above exercises the DIRECT/nested path — args flow
+  // straight into gatedExecute, where the presence check has teeth. The AGENT
+  // path is different, and NOT what these tests cover: core deletes `_background`
+  // from the tool-call args before dispatch AND resolves eligibility itself. So
+  // the breakwater `_background` reads catch nothing on the agent path; this test
+  // pins the mechanism that makes it core's responsibility, against core's REAL
+  // resolver, so the suite does not manufacture false confidence.
+  it("is INERT on the agent path: core's resolveBackgroundConfig keeps a no-background-config connector foreground even under an LLM _background:enabled override (baseEnabled gate)", () => {
+    // #given — a breakwater connector sets NO tool background config, so
+    // core's baseEnabled (agent/tool `enabled`) resolves false
+    // #when — the model asks for background via the LLM override
+    const resolved = resolveBackgroundConfig({
+      llmBgOverrides: { enabled: true },
+      toolName: 'crm.assign',
+      // toolConfig/agentConfig omitted — exactly what createConnector produces
+    });
+    // #then — core refuses to background an ineligible tool regardless of the
+    // override, so the breakwater _background presence check is defense-in-depth
+    // for direct/nested calls only (the grant is the real agent-path boundary)
+    expect(resolved.runInBackground).toBe(false);
   });
 });

@@ -293,6 +293,109 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     expect(resumed.status).toBe(200);
     expect(wrapped).toEqual(['start:wf', `resume:wf:${summary.runId}`]);
   });
+
+  it('mounts an opt-in buildObjectiveRouter; absent seam is byte-identical (unmounted)', async () => {
+    // #given — a worker WITH a goal stage that claims /api/threads/:id/goal
+    const worker = makeWorker({
+      buildObjectiveRouter: () => async (request) => {
+        const url = new URL(request.url);
+        return url.pathname.endsWith('/goal')
+          ? new Response('goal-stage', { status: 299 })
+          : null;
+      },
+    });
+    const { env, ctx } = makeEnv();
+
+    // #when — a goal path reaches the mounted stage…
+    const mounted = await worker.fetch(
+      authed('http://host/api/threads/acme_t1/goal', {
+        method: 'PUT',
+        body: '{}',
+      }),
+      env,
+      ctx,
+    );
+    // #then
+    expect(mounted.status).toBe(299);
+
+    // #given — a worker WITHOUT the seam
+    const bare = makeWorker();
+    const { env: env2, ctx: ctx2 } = makeEnv();
+    // #when — the same path is not a goal stage; it falls through to the 404 tail
+    const unmounted = await bare.fetch(
+      authed('http://host/api/threads/acme_t1/goal', {
+        method: 'PUT',
+        body: '{}',
+      }),
+      env2,
+      ctx2,
+    );
+    // #then — no goal handling, as before the seam existed
+    expect(unmounted.status).toBe(404);
+  });
+
+  it('contains a throwing mounted router as a generic 500 (backstop), never an unhandled rejection', async () => {
+    // #given — a mounted stage whose router THROWS (a URIError from an unguarded
+    // path decode is the concrete case this backstops)
+    const worker = makeWorker({
+      buildSignalRouter: () => async () => {
+        throw new URIError('URI malformed');
+      },
+    });
+    const { env, ctx } = makeEnv();
+    const logs = capturedLogs();
+
+    // #when
+    const res = await worker.fetch(
+      authed('http://host/api/threads/acme_t1/message', {
+        method: 'POST',
+        body: '{}',
+      }),
+      env,
+      ctx,
+    );
+
+    // #then — a generic 500 (no error.message leaked), and the fault is logged
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: 'internal error' });
+    expect(logs.errors().some((l) => l.includes('worker-fetch-error'))).toBe(
+      true,
+    );
+  });
+
+  it('mounts an opt-in buildScheduleRouter; absent seam is byte-identical (unmounted)', async () => {
+    // #given — a worker WITH a schedule stage that claims /api/schedules
+    const worker = makeWorker({
+      buildScheduleRouter: () => async (request) => {
+        const url = new URL(request.url);
+        return url.pathname.startsWith('/api/schedules')
+          ? new Response('schedule-stage', { status: 299 })
+          : null;
+      },
+    });
+    const { env, ctx } = makeEnv();
+
+    // #when — a schedules path reaches the mounted stage…
+    const mounted = await worker.fetch(
+      authed('http://host/api/schedules'),
+      env,
+      ctx,
+    );
+    // #then
+    expect(mounted.status).toBe(299);
+
+    // #given — a worker WITHOUT the seam
+    const bare = makeWorker();
+    const { env: env2, ctx: ctx2 } = makeEnv();
+    // #when — /api/schedules is not a run/approval route; it falls to the 404 tail
+    const unmounted = await bare.fetch(
+      authed('http://host/api/schedules'),
+      env2,
+      ctx2,
+    );
+    // #then — no schedule handling, as before the seam existed
+    expect(unmounted.status).toBe(404);
+  });
 });
 
 describe('createFlowsafeWorker scheduled dispatch', () => {
@@ -406,6 +509,312 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     expect(lines[0]?.purged).toBeUndefined();
   });
 
+  // The agent-memory thread TTL (docs/agent-memory-tenancy.md item 7) as the
+  // purge cron's third duty. Seeds the two memory tables the real
+  // @mastra/cloudflare-d1 schema creates (mastra-schema-guard.test.ts pins the
+  // column names); a fresh test DB has neither, which is itself the
+  // memory-less-deployment case the first test below rides.
+  async function seedIdleThread(env: FlowsafeWorkerEnv): Promise<void> {
+    await env.DB.prepare(
+      'CREATE TABLE mastra_threads (id TEXT PRIMARY KEY, updatedAt TEXT NOT NULL)',
+    ).run();
+    await env.DB.prepare(
+      'CREATE TABLE mastra_messages (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, createdAt TEXT NOT NULL)',
+    ).run();
+    const idleSince = new Date(Date.now() - 90 * 86_400_000).toISOString();
+    await env.DB.prepare(
+      'INSERT INTO mastra_threads (id, updatedAt) VALUES (?, ?)',
+    )
+      .bind('acme_idle', idleSince)
+      .run();
+    await env.DB.prepare(
+      'INSERT INTO mastra_messages (id, thread_id, createdAt) VALUES (?, ?, ?)',
+    )
+      .bind('m1', 'acme_idle', idleSince)
+      .run();
+  }
+
+  async function threadIds(env: FlowsafeWorkerEnv): Promise<string[]> {
+    const { results } = await env.DB.prepare(
+      'SELECT id FROM mastra_threads ORDER BY id',
+    ).all<{ id: string }>();
+    return results.map((row) => row.id);
+  }
+
+  it('leaves the thread TTL UNWIRED by default: no THREAD_RETENTION_DAYS, no duty', async () => {
+    // #given — the opt-in posture. A hidden default would start deleting agent
+    // memory the day a host enabled agents, so its absence must be inert.
+    const logs = capturedLogs();
+    const worker = makeWorker();
+    const { env, ctx, flush } = makeEnv();
+    await seedIdleThread(env);
+
+    // #when
+    await worker.scheduled({ cron: PURGE }, env, ctx);
+    await flush();
+
+    // #then — the duty never ran: nothing in the log, nothing deleted
+    const lines = maintenanceLines(logs.lines());
+    expect(lines[0]).not.toHaveProperty('threadsPurged');
+    expect(logs.errors()).toEqual([]);
+  });
+
+  it('THREAD_RETENTION_DAYS wires the thread purge into the purge cron, folded into the ONE maintenance line', async () => {
+    // #given — an agent-memory thread idle for 90 days under a 30-day TTL
+    const logs = capturedLogs();
+    const worker = makeWorker();
+    const { env, ctx, flush } = makeEnv();
+    await seedIdleThread(env);
+
+    // #when
+    await worker.scheduled(
+      { cron: PURGE },
+      { ...env, THREAD_RETENTION_DAYS: '30' },
+      ctx,
+    );
+    await flush();
+
+    // #then — reaped WITH its messages, reported in the combined line
+    const lines = maintenanceLines(logs.lines());
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({
+      threadsPurged: 1,
+      threadMessagesPurged: 1,
+      approvalsPurged: 0,
+    });
+  });
+
+  // Track B: the background-task TTL cleanup as the purge cron's opt-in duty.
+  async function seedOldCompletedTask(env: FlowsafeWorkerEnv): Promise<void> {
+    await env.DB.prepare(
+      `CREATE TABLE mastra_background_tasks (
+        id TEXT PRIMARY KEY, run_id TEXT NOT NULL, status TEXT NOT NULL,
+        completedAt TEXT, createdAt TEXT NOT NULL)`,
+    ).run();
+    const old = new Date(Date.now() - 2 * 3_600_000).toISOString();
+    await env.DB.prepare(
+      'INSERT INTO mastra_background_tasks (id, run_id, status, completedAt, createdAt) VALUES (?, ?, ?, ?, ?)',
+    )
+      .bind('bg1', 'acme_r1', 'completed', old, old)
+      .run();
+  }
+
+  it('leaves the background-task TTL UNWIRED by default: no config.backgroundTasks, no duty', async () => {
+    // #given — the opt-in posture; background tasks are unconfigured
+    const logs = capturedLogs();
+    const worker = makeWorker();
+    const { env, ctx, flush } = makeEnv();
+    await seedOldCompletedTask(env);
+
+    // #when
+    await worker.scheduled({ cron: PURGE }, env, ctx);
+    await flush();
+
+    // #then — the duty never ran, byte-identical to before Track B
+    const lines = maintenanceLines(logs.lines());
+    expect(lines[0]).not.toHaveProperty('backgroundTasksCompletedPurged');
+    expect(logs.errors()).toEqual([]);
+  });
+
+  it('config.backgroundTasks wires the background-task TTL cleanup into the purge cron, folded into the ONE line', async () => {
+    // #given — a completed task 2h old under the default 1h completed TTL
+    const logs = capturedLogs();
+    const worker = makeWorker({ backgroundTasks: {} });
+    const { env, ctx, flush } = makeEnv();
+    await seedOldCompletedTask(env);
+
+    // #when
+    await worker.scheduled({ cron: PURGE }, env, ctx);
+    await flush();
+
+    // #then — reaped, reported in the combined maintenance line
+    const lines = maintenanceLines(logs.lines());
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({
+      backgroundTasksCompletedPurged: 1,
+      backgroundTasksFailedPurged: 0,
+      approvalsPurged: 0,
+    });
+  });
+
+  it('the SWEEP cron never runs the background-task purge (the two-cron split holds)', async () => {
+    // #given
+    const logs = capturedLogs();
+    const worker = makeWorker({ backgroundTasks: {} });
+    const { env, ctx, flush } = makeEnv();
+    await seedOldCompletedTask(env);
+
+    // #when
+    await worker.scheduled({ cron: SWEEP }, env, ctx);
+    await flush();
+
+    // #then — a CPU-limit kill is uncatchable, so the sweep carries no purge work
+    const lines = maintenanceLines(logs.lines());
+    expect(lines[0]).not.toHaveProperty('backgroundTasksCompletedPurged');
+    expect(
+      await env.DB.prepare('SELECT id FROM mastra_background_tasks').all(),
+    ).toBeDefined();
+  });
+
+  it('the SWEEP cron never runs the thread purge (the two-cron split holds)', async () => {
+    // #given
+    const logs = capturedLogs();
+    const worker = makeWorker();
+    const { env, ctx, flush } = makeEnv();
+    await seedIdleThread(env);
+
+    // #when
+    await worker.scheduled(
+      { cron: SWEEP },
+      { ...env, THREAD_RETENTION_DAYS: '30' },
+      ctx,
+    );
+    await flush();
+
+    // #then — a CPU-limit kill is uncatchable, so the sweep must not carry
+    // purge work; the idle thread waits for the purge cron
+    const lines = maintenanceLines(logs.lines());
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toHaveProperty('threadsPurged');
+  });
+
+  it('isolates a THROWING thread purge: neither the snapshot purge, the approval purge, nor extra duties are starved', async () => {
+    // #given — a DB whose mastra_threads statements THROW (not merely missing).
+    // Isolating one duty while a sibling shares its failure is a defect class
+    // this codebase has already shipped once.
+    const logs = capturedLogs();
+    const { env, ctx, flush } = makeEnv();
+    const realDb = env.DB;
+    const throwingDb = {
+      prepare: (query: string) => {
+        if (query.includes('mastra_threads')) {
+          throw new Error('threads table wedged');
+        }
+        return realDb.prepare(query);
+      },
+    } as FlowsafeWorkerEnv['DB'];
+    const worker = makeWorker({
+      extraPurgeDuties: async () => ({ extraDuty: 'ran' }),
+    });
+
+    // #when
+    await worker.scheduled(
+      { cron: PURGE },
+      { ...env, DB: throwingDb, THREAD_RETENTION_DAYS: '30' },
+      ctx,
+    );
+    await flush();
+
+    // #then — its own error surface, and every sibling duty still folded into
+    // the one combined line
+    expect(
+      logs
+        .errors()
+        .some(
+          (line) =>
+            line.includes('maintenance-error') &&
+            line.includes('thread-retention-purge'),
+        ),
+    ).toBe(true);
+    const lines = maintenanceLines(logs.lines());
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({
+      purged: 0,
+      approvalsPurged: 0,
+      extraDuty: 'ran',
+    });
+    expect(lines[0]?.threadsPurged).toBeUndefined();
+  });
+
+  it('a wedged SNAPSHOT purge does not starve the thread purge (the sibling direction)', async () => {
+    // #given
+    const logs = capturedLogs();
+    const { env, ctx, flush } = makeEnv();
+    await seedIdleThread(env);
+    const realDb = env.DB;
+    const throwingDb = {
+      prepare: (query: string) => {
+        if (query.includes('mastra_workflow_snapshot')) {
+          throw new Error('snapshot table wedged');
+        }
+        return realDb.prepare(query);
+      },
+    } as FlowsafeWorkerEnv['DB'];
+    const worker = makeWorker();
+
+    // #when
+    await worker.scheduled(
+      { cron: PURGE },
+      { ...env, DB: throwingDb, THREAD_RETENTION_DAYS: '30' },
+      ctx,
+    );
+    await flush();
+
+    // #then — the thread TTL ran anyway
+    const lines = maintenanceLines(logs.lines());
+    expect(lines[0]).toMatchObject({ threadsPurged: 1 });
+  });
+
+  it('SKIPS the duty on an EMPTY THREAD_RETENTION_DAYS rather than inventing a default', async () => {
+    // #given — `''` is what an unset CI/CD variable interpolates to and what a
+    // blank wrangler vars entry produces, and numberVar reads it as unset. A
+    // `!== undefined` gate would admit it, silently resolve the fallback, and
+    // start irreversibly deleting conversations nobody asked to expire.
+    const logs = capturedLogs();
+    const worker = makeWorker();
+    const { env, ctx, flush } = makeEnv();
+    await seedIdleThread(env);
+
+    // #when
+    await worker.scheduled(
+      { cron: PURGE },
+      { ...env, THREAD_RETENTION_DAYS: '' },
+      ctx,
+    );
+    await flush();
+
+    // #then — inert, exactly as if unset
+    expect(maintenanceLines(logs.lines())[0]).not.toHaveProperty(
+      'threadsPurged',
+    );
+    expect(await threadIds(env)).toEqual(['acme_idle']);
+  });
+
+  it('SKIPS the duty on a typo’d THREAD_RETENTION_DAYS, logging the tripwire', async () => {
+    // #given — the polarity that separates this var from RUN_RETENTION_DAYS:
+    // there, falling back keeps a duty running that runs regardless; here it
+    // would INVENT an irreversible delete at a threshold the operator never
+    // named. Never expiring is recoverable; deleting a tenant's conversations
+    // because a var was mistyped is not.
+    const logs = capturedLogs();
+    const worker = makeWorker();
+    const { env, ctx, flush } = makeEnv();
+    await seedIdleThread(env);
+
+    // #when
+    await worker.scheduled(
+      { cron: PURGE },
+      { ...env, THREAD_RETENTION_DAYS: '-5' },
+      ctx,
+    );
+    await flush();
+
+    // #then — the operator's tripwire fires and NOTHING was deleted
+    expect(
+      logs
+        .errors()
+        .some(
+          (line) =>
+            line.includes('config-error') &&
+            line.includes('THREAD_RETENTION_DAYS'),
+        ),
+    ).toBe(true);
+    expect(maintenanceLines(logs.lines())[0]).not.toHaveProperty(
+      'threadsPurged',
+    );
+    expect(await threadIds(env)).toEqual(['acme_idle']);
+  });
+
   it('isolates a THROWING extraPurgeDuties behind its own maintenance-error', async () => {
     // #given
     const logs = capturedLogs();
@@ -473,5 +882,116 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
       },
     ]);
     expect(logs.lines().length).toBeGreaterThan(0);
+  });
+});
+
+describe('createFlowsafeWorker schedule tick dispatch (Track D)', () => {
+  const TICK = '*/2 * * * *';
+
+  it('the tick cron runs ONLY the schedule tick, not the sweep/purge', async () => {
+    // #given a worker with a tick cron + a scheduleTick builder
+    const logs = capturedLogs();
+    const tickFn = vi.fn(async () => ({
+      due: 1,
+      fired: 1,
+      skipped: 0,
+      failed: 0,
+      lost: 0,
+    }));
+    const worker = makeWorker({
+      crons: { sweep: SWEEP, purge: PURGE, tick: TICK },
+      scheduleTick: () => tickFn,
+    });
+    const { env, ctx, flush } = makeEnv();
+
+    // #when the tick cron fires
+    await worker.scheduled({ cron: TICK }, env, ctx);
+    await flush();
+
+    // #then the tick ran once, logged its own line, and NO maintenance ran
+    expect(tickFn).toHaveBeenCalledTimes(1);
+    const tickLines = logs
+      .lines()
+      .map((l) => {
+        try {
+          return JSON.parse(l) as Record<string, unknown>;
+        } catch {
+          return undefined;
+        }
+      })
+      .filter((p): p is Record<string, unknown> => p?.type === 'schedule-tick');
+    expect(tickLines).toHaveLength(1);
+    expect(tickLines[0]?.result).toMatchObject({ fired: 1 });
+    expect(logs.lines().some((l) => l.includes('"type":"maintenance"'))).toBe(
+      false,
+    );
+  });
+
+  it('the tick cron with NO scheduleTick builder logs a config-error, runs nothing else', async () => {
+    // #given the tick cron is set but no builder is wired (a misconfig)
+    const logs = capturedLogs();
+    const worker = makeWorker({
+      crons: { sweep: SWEEP, purge: PURGE, tick: TICK },
+    });
+    const { env, ctx, flush } = makeEnv();
+
+    // #when
+    await worker.scheduled({ cron: TICK }, env, ctx);
+    await flush();
+
+    // #then a config-error naming crons.tick; NO maintenance (the invocation is
+    // the tick's — it does not fall through to sweep/purge)
+    expect(
+      logs
+        .errors()
+        .some((l) => l.includes('config-error') && l.includes('crons.tick')),
+    ).toBe(true);
+    expect(logs.lines().some((l) => l.includes('"type":"maintenance"'))).toBe(
+      false,
+    );
+  });
+
+  it('a throwing tick is CONTAINED (schedule-tick-error), never an unhandled rejection', async () => {
+    // #given a tick that throws
+    const logs = capturedLogs();
+    const worker = makeWorker({
+      crons: { sweep: SWEEP, purge: PURGE, tick: TICK },
+      scheduleTick: () => async () => {
+        throw new Error('D1 down');
+      },
+    });
+    const { env, ctx, flush } = makeEnv();
+
+    // #when
+    await worker.scheduled({ cron: TICK }, env, ctx);
+    await flush();
+
+    // #then the error was contained + logged
+    expect(
+      logs
+        .errors()
+        .some(
+          (l) => l.includes('schedule-tick-error') && l.includes('D1 down'),
+        ),
+    ).toBe(true);
+  });
+
+  it('an unconfigured worker (no crons.tick) is byte-identical — the tick branch is unreachable', async () => {
+    // #given a default worker (no tick cron/builder)
+    const logs = capturedLogs();
+    const tickFn = vi.fn();
+    const worker = makeWorker({ scheduleTick: () => tickFn });
+    const { env, ctx, flush } = makeEnv();
+
+    // #when the purge cron fires (the tick builder is present but crons.tick is
+    // unset, so the tick never runs)
+    await worker.scheduled({ cron: PURGE }, env, ctx);
+    await flush();
+
+    // #then the tick was never invoked; the purge ran as before
+    expect(tickFn).not.toHaveBeenCalled();
+    expect(logs.lines().some((l) => l.includes('"type":"maintenance"'))).toBe(
+      true,
+    );
   });
 });

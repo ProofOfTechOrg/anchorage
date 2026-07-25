@@ -9,7 +9,7 @@ resume); the `pnpm spike` target, not shipped. (Formerly `demo/` — renamed so
 
 | File | What | When to read |
 | ---- | ---- | ------------ |
-| `worker.ts` | Complete spike Worker — grant-gated Mastra workflow, `DurableObjectRunner` subclass with `approvalGrantProvider` wired through `init()`, approval REST routes (header-auth demo), auto-create-approval-on-suspend, decide→DO-stub resume; curl script in the header comment | Seeing an end-to-end Worker + DO + approval-queue wiring, reproducing the spike |
+| `worker.ts` | Complete spike Worker — grant-gated Mastra workflow, `DurableObjectRunner` subclass with `approvalGrantProvider` wired through `init()`, approval REST routes (header-auth demo), auto-create-approval-on-suspend, decide→DO-stub resume, and the credentialed per-thread durable-agent host. The live connector uses one provider-safe id end to end; DeepSeek required-tool calls disable thinking; post-eviction resume validates the persisted memory binding before prepare → observe/register → runtime resume | Seeing an end-to-end Worker + DO + approval-queue wiring, reproducing either spike |
 | `wrangler.jsonc` | wrangler config — `RUNNER` DO binding (class `DemoRunner`, SQLite migration) + `DB` D1 database | Changing the spike's DO/D1 bindings or compat flags |
 | `tsconfig.json` | Spike TS config (type-checked by the package `typecheck` script) | Debugging spike typecheck failures |
 
@@ -31,6 +31,21 @@ requester cannot decide their own approval (separation of duties); exits 0/1
 ```bash
 pnpm --filter @proofoftech/flowsafe spike:verify
 ```
+
+Credentialed durable-agent proof — drives real model tool calls to approval
+suspension, kills and restarts workerd on persisted D1, proves raw and forged
+resume paths fail closed, then approves and asserts exactly one write:
+
+```bash
+SPIKE_LLM_MODEL_ID=provider/model \
+SPIKE_LLM_API_KEY=secret \
+pnpm --filter @proofoftech/flowsafe spike:verify:llm
+```
+
+`SPIKE_LLM_BASE_URL` and `SPIKE_LLM_PORT` are optional. For DeepSeek,
+`DEEPSEEK_MODEL` plus `DEEPSEEK_API_KEY` are accepted aliases; V4 required-tool
+calls run with thinking disabled because the provider rejects
+`tool_choice=required` in thinking mode.
 
 Interactive server (port 8787; manual curl protocol in the `worker.ts`
 header comment):

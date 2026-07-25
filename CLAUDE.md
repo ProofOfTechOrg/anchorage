@@ -186,6 +186,278 @@ byte-identical); tenant-isolated on INV-1 (run channel) and id.name==tenantId
 (hub); polling retained as fallback + queue reconciler (flowsafe minor). Neither
 part changes the `ApprovalRecord` shape or any existing signature.
 
+Track 0 — long-running-agents substrate (2026-07-16, branch
+`feat/track-0-substrate`; plan `.notes/plan-long-running-agents-integration.md`
++ its `.workflow.json`, gitignored/local-only): the prerequisite for the six
+agent tracks, all additive and opt-in. **Agent-memory items 5–7 are CLOSED**
+(`docs/agent-memory-tenancy.md` — the doc's status is now COMPLETE): the host
+boundary (`host-kit/memory-boundary.ts` — `assertNoClientMemoryIds` 400s a body
+naming `threadId`/`resourceId`, `requireOwnedMemoryId` 404s a foreign id; it
+lives in host-kit, not do-runner, because the guard's contract IS its
+`RunRouteError` status and `TenantContext` would invert the layering), the
+agent-level recall-path proof (core's own `MastraMemory` over the REAL D1 store,
+two tenants on ONE business key, pinning `recall`/`listThreads`/working memory),
+and the thread TTL (`purgeExpiredThreads`, keyed on `mastra_threads.updatedAt`
+since threads have no terminal status; messages go WITH their thread and BEFORE
+it — a message has `createdAt` but no `updatedAt`, so no per-message idleness
+signal exists and thread-first would strand them — enforced by a `NOT EXISTS`
+guard rather than statement order, since the writer is not atomic either;
+`mastra_resources` untouched, it is the owner's). The TTL is the purge cron's third duty behind
+`THREAD_RETENTION_DAYS`, **unset by default** (a conversation is meant to be
+kept) and failure-isolated in its own try/catch alongside sweepSLA +
+purgeExpiredWorkflowRuns. Plus: `TENANT_RANGE_PURGE_TABLES` makes the purge list
+and the schema-guard's `MASTRA_TABLES` inventory EXTENSIBLE per track (DL-003 —
+adopting a domain is one row plus the counter/result pair the types force in the
+SAME change, and the inventory forces the RETENTION leg too: the type requires a
+`because` for `none`, and the schema-guard test rejects a blank one AND ties
+'unadopted' coverage to its reason, so adopting a table forces a real retention
+decision in the same change instead of leaving the boilerplate — each `ttl`/
+`cascade` declaration cross-checked against the exported
+`RUN_TTL_PURGE_TABLES`/`THREAD_TTL_PURGE_TABLES`, so a kind naming a purge that
+does not target the table (or a cascade onto a parent that reaps nothing) fails;
+the guard still trips on a silently added table; NO table is adopted here); the host DO's
+ONE pubsub identity flows `InitOptions.pubsub` ⇒ `InitResult.pubsub` ⇒
+`RunnerRuntimeOptions.pubsub` (threaded by `init()` like `resumeLedger`, since
+`build()` returns a RunnerRuntime — an InitResult-only echo would strand it;
+core creates a FRESH EventEmitterPubSub per `createRun` when none is passed, so
+two defaulting sites publish to different feeds and `observe()` replay sees
+nothing). The runtime HOLDS it unread — Track A passes it to the two createRun
+sites (CI-M-002-002). `ThreadDurableObject` is the per-thread agent-loop host,
+addressed `idFromName(tenant-minted threadId)`, asserting every request's
+authenticated tenant (`THREAD_TENANT_HEADER`) against the name's prefix BEFORE
+the subclass's `route()`; its MINTER is host-kit's `createThreadTopology` —
+**reach a thread DO through the topology, never the raw namespace**, because the
+house forwarding idiom (`hub-topology`'s `stub.fetch(request)`) passes the
+CLIENT's headers verbatim, which is safe for the hub and would hand a client the
+header the thread DO authenticates on. The topology ownership-404s the threadId
+before addressing and OVERWRITES the header from the resolved TenantContext;
+mint and verify ship together for stream-ticket's reason. Both DO shells share
+ONE error taxonomy (`doErrorResponse`).
+
+Track C — signals, subscriptions, notifications (M-004, 2026-07-17, branch
+`feat/track-c-signals`; additive, opt-in). New subpath
+`@proofoftech/flowsafe/signals`: `createThreadSignalRoutes` mounts the thread-DO
+signal routes (message/queue/signal/state/notification) and stamps
+`scope.init.pubsub` onto the agent before every call — the DL-002 AFFINITY
+carrier: core keys its in-process signal registry (`#statesByPubSub`) by the
+pubsub instance, so a send drains into an active loop ONLY when both share the DO
+isolate AND the pubsub (proven on workerd, spike C-S2 step I). Runtime-driven
+idle wakes serialize an active-run recheck, mint an INV-1 run ID, and call the
+host's `startIdleRun` seam. The credentialed spike drives the real loop. The host
+obtains the thread stream runtime from Mastra's public
+`agentThreadStreamRuntime` getter; no deep import is used.
+`D1NotificationsStorage` + `D1ThreadStateStorage` are flowsafe-owned D1 domains
+over `mastra_notifications`/`mastra_thread_state` (the `@mastra/cloudflare-d1`
+1.1.1 adapter ships neither), mirroring core's InMemory reference incl.
+`findCoalescable`; composed into `createD1Storage` via an INJECTED `domains`
+param (`createSignalStorageDomains` — do-runner cannot import signals/, which
+imports it back) as a wrapping `MastraCompositeStore({ default: d1, domains })`,
+so `agent.sendNotificationSignal` persists to D1. Both tables register in the
+DL-003 triad in the SAME change: `TENANT_RANGE_PURGE_TABLES` (ranged over their
+salted `thread_id`, counters `notifications`/`threadState` + the
+`PurgeTenantResult` fields the compile-pin forces), the schema-guard
+`MASTRA_TABLES` inventory (now 8 tables, tenant-range +
+`notification-ttl`/`thread-state-ttl`), and their own TTL purges
+(`purgeExpiredNotifications` reaps terminal rows past `updatedAt` keeping pending;
+`purgeExpiredThreadState` by `updatedAt`; both opt-in via
+`NOTIFICATION_RETENTION_DAYS`/`THREAD_STATE_RETENTION_DAYS`, each a
+failure-isolated purge-cron duty). `createSignalRouter` is the P6 ingestion trust
+boundary (DL-006): resolve → coarse role → thread-prefix ownership (404 before
+the DO, no oracle) → `assertNoClientMemoryIds` → attribute-key allowlist + 16 KiB
+size cap → per-tenant rate cap → `signal.ingest` audit → forward via
+`createThreadTopology.send` (which OVERWRITES the tenant header, so a forged one
+can't ride along — cross-tenant fail-closed at BOTH the topology 404 and the DO
+403, spike C-S4 step J). `createFlowsafeWorker` mounts the signal stage via an
+injected `buildSignalRouter` seam (host builds the router — avoids the
+host-kit→signals cycle), gated on the host wiring it; absent ⇒ byte-identical.
+DOM-free `SignalClient` (ApprovalApiClient mold). Signals never mint capability —
+`sendToolApproval` is not an approval surface (P8), the dashboard stays the
+decision path. Live subscribe reuses the Part B hub transport (DL-016) — phase 2.
+
+Track A — durable agents (2026-07-17, branch `feat/track-a-durable-agents` off
+`dev`; milestone M-002 of the long-running-agents program): drive Mastra's
+durable-agent loop through the ONE `RunnerRuntime` chokepoint so agent legs
+inherit INV-1, the per-leg `requestContextForRun` grant derivation, and the
+resume ledger — additive/opt-in, no existing signature or `ApprovalRecord`
+shape changed. **Spike S1 HELD** (verified against the on-disk `@mastra/core`
+1.50.0 dist): `DurableAgent.executeWorkflow(runId, workflowInput)` is the
+documented subclass override seam, `getWorkflow()` returns the agent-agnostic
+`durable-agentic-loop` workflow, and the tool-call step hands `tool.execute`
+the ENGINE-LEG requestContext from its step params (index.js: `params.requestContext`
+:3138 → `toolOptions` :3339 → `tool.execute` :3642) — so the primary
+subclass-override design (DL-010) stands, no fallback. New subpath
+`@proofoftech/flowsafe/agent-runner` (`src/agent-runner/`, subpath-only like
+host-kit — it imports the durable `Agent`): `createFlowsafeDurableAgent({ agent,
+runtime, cache?, pubsub?, maxSteps? })` returns a `DurableAgent` subclass whose
+`executeWorkflow` calls `runtime.start('durable-agentic-loop', { runId,
+inputData })` (loop registered on the runtime idempotently — one shared id,
+`agentId` in the input routes the agent). INV-1 is enforced at the PUBLIC
+boundary: `stream()`/`generate()`/`prepare()` are overridden to REQUIRE a
+caller-minted runId, because the inherited entry points take an optional runId
+and core would otherwise mint a tenant-less `crypto.randomUUID()` upstream of
+`executeWorkflow`
+(that run's snapshot would escape `purgeTenant`); `executeWorkflow` re-guards as
+defense in depth, and the agent's stream pubsub defaults to the runtime's
+identity (one feed per DO). `resume()` is inherited but never client-wired
+(resume flows only through the approval-decision path, P8/A-D2). Plus the pure, dependency-free
+R-003 shape helpers (`approval-shapes.ts`): `parseAgentApprovalSuspend` reads
+BOTH durable approval-suspend shapes (nested `{type:'approval',
+requireToolApproval:{toolCallId,toolName,args}}` and flat `{type:'approval',
+toolCallId,toolName,args}`), `agentGateConnectors` derives `[toolName]` (the
+connector id the write gate checks — `createConnector`'s `createTool({id})` ===
+the `toolName` the model calls === the string `approvalGranted()` looks up). The
+resume-routing `threadId` capture seam (DL-002) is implemented by the trusted
+`ApprovalResumeTarget` stored separately from reviewer payload. CI-M-002-003's substantive change lands in **the
+record-creation/bridge path** (the CI behavior text's own words):
+host-kit's `requestedConnectors` now derives the agent-gate connector from the
+suspend shape when there is no explicit `connectors` array, so an approved agent
+gate mints exactly that grant on resume; `ApprovalService.decide`/`#resume` are
+reused UNCHANGED. `RunnerRuntime` now threads the host pubsub identity into both
+`createRun({ runId, pubsub })` sites (CI-M-002-002; undefined ⇒ core defaults a
+fresh emitter ⇒ byte-identical). The workerd `spike:verify` grows the AG
+scenarios proving the R-003 round-trip + forged-resume fail-closed on real
+workerd + D1. Live-isolate scope: the loop resolves the tool's execute closure
+from the in-process `globalRunRegistry` (populated by `stream()`); a resume
+after DO eviction must first rehydrate it with `DurableAgent.prepare()`
+(snapshot's `messageListState` wins) before `runtime.resume`. `resumeViaRuntime`
+performs prepare, observe/register, then `RunnerRuntime.resume`; the thread host
+validates the persisted memory binding first. The credentialed workerd spike
+exercises this path across restart with a real model and connector.
+
+Track F — goals (M-005, 2026-07-17, branch `feat/track-f-goals`; additive,
+opt-in; merged PR #29). New subpath `@proofoftech/flowsafe/goals`:
+`createObjectiveRouter` — role-gated + audited set/get/update/clear
+(PUT/GET/PATCH/DELETE on `/api/threads/:threadId/goal`) over the thread-scoped
+goal record in Track C's `mastra_thread_state` domain (GOAL_STATE_TYPE 'goal',
+DL-018), persisting through core's OWN
+writeObjective/readObjective/clearObjective so the stored shape is
+byte-identical to what the durable goal step reads via `resolveGoalStore` —
+proven on workerd (spike K/L/M: route-write → durable read path, kill+restart
+survival, cross-tenant 404 + over-cap 400 both audited). The write path is a
+P6-lite ingestion boundary (objectives are STANDING INSTRUCTIONS injected into
+future turns): createSignalRouter's gate order, audit on accept + EVERY
+post-auth denial, benign GET un-audited. maxRuns capped by host config
+(over-cap 400 REJECTED, never clamped; default core DEFAULT_GOAL_MAX_RUNS 50,
+DL-007); Track F starts NO runs — run budgets stay at the existing seams.
+`GOAL_REQUEST_CONTEXT_KEY` 'mastra:goal' is MIRRORED (not exports-reachable —
+no `@mastra/core/agent/goal` subpath) + no-collision-pinned against the
+`#requestContextFor` base keys + drift-pinned against the core dist
+declaration. update is a non-atomic read-modify-write and clear an
+unconditional delete at the Worker (core-parity, within-tenant last-write-wins
+— the DL-018 direct-D1 consequence; deliberately weaker serialization than
+signals' thread-DO lease). Opt-in `buildObjectiveRouter` seam in
+createFlowsafeWorker; NO new table (thread_state registered since C); absent ⇒
+byte-identical.
+
+Track D — schedules (M-006, 2026-07-18, branch `feat/track-d-schedules`;
+additive, opt-in; merged PR #31). New subpath
+`@proofoftech/flowsafe/schedules`: `D1SchedulesStorage` (AUTHORED —
+`@mastra/cloudflare-d1` 1.1.1 ships no schedules domain and core TABLE_SCHEMAS
+has no schedules DDL; ONE class over `mastra_schedules` +
+`mastra_schedule_triggers` like core's abstract, INTEGER ms-epoch timestamps),
+`createScheduleTick` — WE own the tick (DL-012; adopting core's pubsub worker
+rejected, RA-007): listDueSchedules → CAS updateScheduleNextFire claim (with a
+`status='active'` guard closing the pause race) → workflow targets mint a fresh
+INV-1 `${tenantId}_${uuid}` from INV-3-revalidated `metadata.tenantId` (DL-013
+— rows have no tenant column and ids are slugified, so tenant rides metadata)
+and fire through RunnerRuntime; per-schedule failure isolation; every
+unattended start consults an injectable run-cap seam (capped ⇒
+skipped-equivalent, audited, schedule stays healthy). Agent targets use the
+optional `startAgent` callback to reach the runtime-driven thread DO; hosts that
+omit it retain the audited `agent-target-unsupported` skip. The tick validates
+stored memory IDs, strips reserved contexts, supports threadless ephemeral
+topology, and records the actual joined run ID.
+`createScheduleRouter` — server-minted slug-safe schedule ids (client ids
+refused: slugify drift + a cross-tenant 409 oracle), tenant-filtered reads,
+per-tenant count + fire-rate caps, read-only trigger history; P4
+stored-context barrier (DL-004/R-004): create/update reject the `breakwater.`
+namespace + the four runtime base keys + 'mastra:goal' on BOTH kinds and BOTH
+carriers (top-level `requestContext` + the nested agent
+`ifIdle.streamOptions.requestContext`), and the tick spreads stored keys FIRST
+/ runtime-derived LAST so the grant key is never row-overridable (spike N/O:
+CAS exactly-once under concurrent ticks; a forged connector planted directly
+in a ROW never becomes a grant on the leg). DL-003 triad: schema-guard
+inventory 8→10; a NEW `metadata-tenant` purge kind
+(`json_extract(metadata,'$.tenantId') = ?` exact-match — slugified ids cannot
+ride the salted range; `PurgeTenantResult.schedules`/`scheduleTriggers`);
+trigger TTL opt-in (`SCHEDULE_TRIGGER_RETENTION_DAYS`, failure-isolated cron
+duty); schedules retention 'none' (standing config, reaped at offboarding).
+Opt-in `buildScheduleRouter` + `crons.tick` in createFlowsafeWorker; absent ⇒
+byte-identical.
+
+Track E — signal providers (M-007, 2026-07-18, branch
+`feat/track-e-signal-providers` off `dev`; the FINAL track of the
+long-running-agents program; additive, opt-in). New subpath
+`@proofoftech/flowsafe/signal-providers`. **Pre-flight B/D finding**: core's
+`SignalProvider` (`@mastra/core/signals`, exports-reachable) delivers IN-PROCESS
+— `poll()`/`handleWebhook()` → `this.notify()` → `agent.sendNotificationSignal()`
+on a CONNECTED agent, matching webhooks against an in-memory registry — neither of
+which fits a Cloudflare host (the agent loop is on a DIFFERENT per-thread DO; the
+registry is lost on eviction and tenant-blind). So flowsafe drives providers
+through a `SignalProviderAdapter` seam and routes every delivery through Track C's
+`createThreadTopology.send` into `/signal/notification` (the DO alarm replaces
+`startPolling`; D1 replaces the registry, DL-017). A provider still IS a core
+`SignalProvider` (it extends the base), so `new Agent({signals:[p]})` still merges
+it in-process. `SignalProviderHost` — a per-tenant provider host DO
+(`idFromName(tenantId)`, the hub-DO pattern) whose alarm rehydrates subscriptions
+from D1 and polls the tenant's providers with per-provider + per-delivery failure
+isolation; `/poll` is the deterministic direct-alarm probe. `D1SubscriptionStoreFactory`
+— the flowsafe-OWNED `flowsafe_signal_subscriptions` table (NOT `mastra_*`),
+mirroring the approval store's INV-2 posture (`.forTenant()` tenant-bound + brand;
+`.system().listByResource()` the webhook's cross-tenant authority — a webhook names
+no tenant, the ROW does); registered in `purgeTenant` (`PurgeTenantResult.subscriptions`,
+the `flowsafe_approvals` leg), retention `none` (standing config reaped only at
+offboarding, so absent from the schema-guard's `mastra_%` inventory — it does not
+trip the guard). `createWebhookRouter` — verify-BEFORE-parse over the RAW bytes,
+payload→tenant via the subscription ROW only, per provider+tenant rate cap, and a
+BOUNDED forgery audit (the reject is unbounded, the log is not). `createSubscriptionRouter`
+— human-only HTTP subscribe/unsubscribe (RA-009: never model tools; P8: no
+capability), the createSignalRouter gate order. `githubSignalProvider` — the
+binding-gated showcase reference (constant-time `X-Hub-Signature-256` via
+WebCrypto). Proven on the workerd spike (`spike:verify` steps P–S: E-S2 forged
+rejected+audited, E-S1 delivery→inbox, E-S3 D1-rehydration after kill+restart,
+cross-tenant fail-closed) + an E-S1 integration test. The minimal `deploy/`
+template stays unwired (it has no thread DO, the Track C/D/F precedent). Absent
+binding/secret ⇒ byte-identical.
+
+Long-running-agent residual closeout (2026-07-20, implementation commits
+`eca3b6e` + `51e602c`, based on
+`b942d9a76d005668628f60f9295492096097dff6`): the spike's per-thread DO now
+hosts a real runtime-driven durable agent. Starts register with Mastra's public
+thread runtime; approval records may carry a server-only, tenant-validated
+`resumeTarget`; restart resume performs prepare → observe/register → runtime
+resume after validating the snapshot memory binding. Tenant-safe idle wake,
+agent schedules, and `createNotificationDispatchTick` all route through the same
+thread topology. The live proof is separate from the deterministic CI spike:
+`pnpm --filter @proofoftech/flowsafe spike:verify:llm`, with required
+`SPIKE_LLM_MODEL_ID` (`provider/model`) and `SPIKE_LLM_API_KEY`, plus optional
+`SPIKE_LLM_BASE_URL`; `DEEPSEEK_MODEL` + `DEEPSEEK_API_KEY` are accepted aliases.
+The 2026-07-24 DeepSeek V4 Pro pass also pins the provider boundary: required
+tool calls disable thinking, automatic agent grants use a provider-safe connector
+id, and the one-step proof cannot request a duplicate write. Track B execution is enabled through
+`createBackgroundTaskD1Domains` and `BackgroundTaskHost.execution`, one manager
+per tenant DO. The serialized D1 workflow adapter, tenant-scoped task domain,
+store/TTL/offboarding snapshot cascades, and workerd restart proof close
+R-B1/R-B2/R-B3 and tenant-blind recovery without a core version bump.
+
+Regression closeout (2026-07-25): schedule CRUD now follows core 1.50's
+kind-specific contract and the tick clones stored agent targets through
+`ScheduleInputSchema`, stripping reserved and object meta-keys before dispatch.
+D1 notification keyed creation—including explicit ids—uses atomic conditional
+insert + complete-identity guarded coalescing CAS, insertion ordinals preserve
+core's `Map` target order across supplied timestamps and same-id upserts, partial
+updates compose with concurrent coalescing, the ordinal migration is atomic
+against rollback writers, and due reads are SQL-ordered.
+Thread delivery is serialized, priority-planned across summaries + individuals,
+batch-state-stable across 100-id chunks, and suppresses summarized high rows
+while the thread was active. Durable aggregate
+`untilIdle` streams no longer double-register and every post-observation resume
+failure closes the live stream. Background-task tenants/configuration fail
+synchronously, execution accepts the raw constructor pubsub despite Mastra's
+public proxy, boot failures unwind partial workers/subscriptions, shutdown closes
+enqueue before workers, SSE scopes the real nested Mastra payload, and both
+spike verifiers share a lifecycle that proves the port is refused before restart.
+
 Guardrails control room + one-page demo (control room merged 2026-07-14,
 PR #21; page unified 2026-07-15): the post-login showcase is ONE narrative
 page. On top, the control room (`packages/showcase/src/control-room/`) —

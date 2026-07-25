@@ -6,7 +6,9 @@ Architecture, design, security, and operations docs for Anchorage, plus TS workf
 
 | File | What | When to read |
 | ---- | ---- | ------------ |
-| `breakwater-architecture.md` | Safety middleware architecture (processor chain + tool/workflow wrappers) | Implementing or modifying breakwater |
+| `breakwater-architecture.md` | Safety middleware architecture (agent processor chain + connector/tool wrappers; workflow RBAC lives in flowsafe) | Implementing or modifying breakwater |
+| `breakwater-purpose-and-boundaries.md` | Plain-language purpose, actual agent RBAC scope, Mastra comparison, breakwater/flowsafe ownership split, caveats, and defensible positioning | Explaining what breakwater adds beyond Mastra or resolving ownership/enforcement confusion |
+| `breakwater-improvement-roadmap.md` | Prioritized must/should/could roadmap for agent access, mandatory guards, context capabilities, approval scope, permissions, connector assurance, testing, and operational hardening | Planning improvements after reviewing breakwater's actual boundaries and gaps |
 | `flowsafe-architecture.md` | Approval UX + DO runner architecture, the approval REST surface, and the three multi-tenancy invariants | Implementing or modifying flowsafe |
 | `do-runner-design.md` | Durable Object import-swap pattern, lifecycle, run identity + tenant scoping (INV-1), the ctx.storage resume ledger, retention vs tenant purge, and known Workers constraints | Implementing the DO runner, understanding Cloudflare-native execution |
 | `policy-engine-design.md` | Four policy domains (egress, write, retention, isolation — cross-workflow AND cross-tenant) beyond Mastra processors | Extending policy domains, implementing custom policies |

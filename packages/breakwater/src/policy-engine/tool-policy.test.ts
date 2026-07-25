@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   approvalRequired,
+  backgroundExecution,
   crossWorkflowIsolation,
   ISOLATION_SCOPE_CONTEXT_KEY,
   networkEgress,
@@ -351,5 +352,76 @@ describe('tenantIsolation', () => {
     expect(await policy.evaluate(scopedCall('anything:at all'))).toEqual({
       allowed: true,
     });
+  });
+});
+
+describe('backgroundExecution', () => {
+  function bgCall(sideEffect: SideEffect, input: unknown): ToolCallContext {
+    return { connectorId: 'crm.assign', sideEffect, egress: [], input };
+  }
+
+  const policy = backgroundExecution();
+
+  it('allows a write-class call with no _background override', async () => {
+    // #when / #then — nothing asks for background, so nothing is denied
+    expect(await policy.evaluate(bgCall('write', { topic: 'x' }))).toEqual({
+      allowed: true,
+    });
+  });
+
+  it.each([
+    ['write', 'write' as SideEffect],
+    ['destructive', 'destructive' as SideEffect],
+    ['idempotent', 'idempotent' as SideEffect],
+  ])('denies a %s call whose _background override would enable background', async (_label, sideEffect) => {
+    // #when / #then — the model trying to flip an approval-carrying call off
+    // the foreground path
+    expect(
+      await policy.evaluate(
+        bgCall(sideEffect, { topic: 'x', _background: { enabled: true } }),
+      ),
+    ).toMatchObject({ allowed: false });
+  });
+
+  it('denies when _background is present with enabled undefined (defaults to background when eligible)', async () => {
+    // #when / #then — enabled omitted resolves to true when a base config
+    // enabled it; deny-by-default treats the bare override as a background enable
+    expect(
+      await policy.evaluate(bgCall('write', { _background: { timeoutMs: 5 } })),
+    ).toMatchObject({ allowed: false });
+  });
+
+  it('allows a write-class call that explicitly forces FOREGROUND (enabled:false)', async () => {
+    // #when / #then — forcing foreground is the safe direction
+    expect(
+      await policy.evaluate(
+        bgCall('write', { _background: { enabled: false } }),
+      ),
+    ).toEqual({ allowed: true });
+  });
+
+  it('allows a read-only call to run in the background', async () => {
+    // #when / #then — a read has no side effect whose timing the flip would move
+    expect(
+      await policy.evaluate(bgCall('read', { _background: { enabled: true } })),
+    ).toEqual({ allowed: true });
+  });
+
+  it('ignores a non-object _background arg (only a real override shape denies)', async () => {
+    // #when / #then — a scalar `_background` is not the LLMBackgroundOverride shape
+    expect(
+      await policy.evaluate(bgCall('write', { _background: 'true' })),
+    ).toEqual({ allowed: true });
+  });
+
+  it('honors a custom writeClass — an idempotent call passes when only destructive is gated', async () => {
+    // #given
+    const strict = backgroundExecution({ writeClass: ['destructive'] });
+    // #when / #then
+    expect(
+      await strict.evaluate(
+        bgCall('idempotent', { _background: { enabled: true } }),
+      ),
+    ).toEqual({ allowed: true });
   });
 });

@@ -16,6 +16,10 @@ import {
   tenantOwnsSaltedId,
 } from '../do-runner/path-safe-id.js';
 import {
+  THREAD_ACTOR_HEADER,
+  THREAD_TENANT_HEADER,
+} from '../do-runner/thread-header.js';
+import {
   type ApprovalActor,
   type ApprovalRole,
   DECIDER_ROLES,
@@ -116,6 +120,24 @@ export function createTenantResolver(
 ): TenantResolver {
   const mintUuid = options.newRunId ?? (() => crypto.randomUUID());
   return async (request) => {
+    // The thread-DO tenant header is SERVER-STAMPED by createThreadTopology on
+    // the stub fetches it forwards, which never traverse this request pipeline,
+    // so no legitimate inbound request carries it. Refuse one that does, before
+    // authenticating or binding — it closes the last inch of the forged-header
+    // write the topology's minter guards against: a route copying the house
+    // `stub.fetch(request)` idiom would forward a client's own x-flowsafe-tenant
+    // verbatim, and the DO's name-prefix assertion would then PASS for the
+    // client's chosen thread. `Headers.has` is case-insensitive, so no spelling
+    // slips past. Same posture as the RESERVED_TENANT_IDS belt below: this
+    // resolver is the one chokepoint every routed request crosses.
+    if (
+      request.headers.has(THREAD_TENANT_HEADER) ||
+      request.headers.has(THREAD_ACTOR_HEADER)
+    ) {
+      throw new TenantResolutionError(
+        `inbound request carries a server-stamped thread header — refusing to scope it`,
+      );
+    }
     const actor = await options.authenticate(request);
     if (!actor) return undefined;
     if (

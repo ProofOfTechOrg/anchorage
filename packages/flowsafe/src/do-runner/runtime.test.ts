@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 
 import { init } from './init.js';
+import { createHostPubSub } from './pubsub.js';
 import {
   DurableStorageResumeLedger,
   type ResumeLedgerStorage,
@@ -91,6 +92,30 @@ function buildRuntime(storage: InMemoryStore): {
 
   return { runtime, counters };
 }
+
+describe('RunnerRuntime host pubsub identity', () => {
+  it('threads the pubsub instance from init() through to runtime.pubsub', () => {
+    // #given — a host builds ONE pubsub identity for its DO
+    const pubsub = createHostPubSub();
+
+    // #when — init() threads it (InitOptions.pubsub -> RunnerRuntimeOptions.pubsub)
+    const { runtime } = init({ storage: new InMemoryStore() }, { pubsub });
+
+    // #then — the SAME instance is reachable, so Track A's createRun sites and
+    // observe() replay share one feed. Delete the thread in init.ts and this
+    // fails: runtime.pubsub is undefined and the two createRun sites would each
+    // let core default a separate emitter — the DL-001 bug this seam prevents.
+    expect(runtime.pubsub).toBe(pubsub);
+  });
+
+  it('leaves runtime.pubsub undefined when the host configures none (byte-identical)', () => {
+    // #when — no pubsub passed
+    const { runtime } = init({ storage: new InMemoryStore() });
+
+    // #then — undefined, the polling-fallback posture existing hosts keep
+    expect(runtime.pubsub).toBeUndefined();
+  });
+});
 
 describe('RunnerRuntime', () => {
   it('runs a workflow to suspension and resumes it to success', async () => {

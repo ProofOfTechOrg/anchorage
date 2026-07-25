@@ -256,6 +256,90 @@ export function tenantIsolation(
   };
 }
 
+/**
+ * The field the LLM can include in tool-call args to override background
+ * behavior per call (core `LLMBackgroundOverride` — `{ enabled?, timeoutMs?,
+ * maxRetries? }`, background-tasks/types.d.ts). Shared by the connector SDK's
+ * hard rejection and the `backgroundExecution` evaluator below so the one name
+ * the model would smuggle lives in one place.
+ */
+export const LLM_BACKGROUND_OVERRIDE_KEY = '_background';
+
+/** The `_background` override shape, as seen at the tool boundary. */
+interface LlmBackgroundOverride {
+  enabled?: boolean;
+  timeoutMs?: number;
+  maxRetries?: number;
+}
+
+function backgroundOverrideOf(
+  input: unknown,
+): LlmBackgroundOverride | undefined {
+  if (typeof input !== 'object' || input === null) return undefined;
+  const value = (input as Record<string, unknown>)[LLM_BACKGROUND_OVERRIDE_KEY];
+  if (typeof value !== 'object' || value === null) return undefined;
+  return value as LlmBackgroundOverride;
+}
+
+export interface BackgroundExecutionOptions {
+  /**
+   * Side effects treated as write-class — background execution denied for
+   * these. A write / destructive / idempotent connector carries a side effect
+   * whose approval topology and timing the background flip would move off the
+   * foreground path, so v1 keeps them foreground-only. Default: everything but
+   * 'read'.
+   */
+  writeClass?: readonly SideEffect[];
+  name?: string;
+}
+
+/**
+ * Deny a write-class connector call carrying an LLM `_background` override that
+ * asks for background execution (DL-005) — the defense-in-depth counterpart to
+ * `createConnector`'s hard `_background` arg rejection.
+ *
+ * ACCURACY / REACH: this evaluator does NOT observe core's *resolved* background
+ * eligibility. Core resolves it agent config -> tool config -> LLM `_background`
+ * -> defaults (`resolveBackgroundConfig`) and gates it on `baseEnabled` (the
+ * agent/tool `enabled` flags), all of which live in the agent definition, out of
+ * view at the tool boundary. The only signal here is the LLM override in the call
+ * args — and on the AGENT path core has already deleted `_background` from those
+ * args before dispatch, so this fires on NOTHING there. What actually keeps the
+ * model from backgrounding an approval-carrying call on the agent path is core's
+ * own `baseEnabled` gate: a breakwater connector sets no background config, so
+ * the tool is ineligible and the override cannot enable it. This evaluator's real
+ * teeth are DIRECT / NESTED programmatic calls whose args reach the gate loop
+ * unstripped: a `_background` arg that would ENABLE background (`enabled !==
+ * false`) is refused. A read-only tool is untouched (a read has no side effect
+ * whose timing/approval the flip would move); forcing FOREGROUND (`enabled:
+ * false`) is the safe direction and passes. The real write boundary on every
+ * path — agent, direct, or the background executor itself — is the requestContext
+ * GRANT, not this check. Register through `ConnectorPolicies.evaluators`.
+ */
+export function backgroundExecution(
+  options: BackgroundExecutionOptions = {},
+): ToolPolicyEvaluator {
+  const writeClass = options.writeClass ?? [
+    'write',
+    'destructive',
+    'idempotent',
+  ];
+  return {
+    name: options.name ?? 'background-execution',
+    evaluate({ sideEffect, input, connectorId }): PolicyDecision {
+      if (!writeClass.includes(sideEffect)) return { allowed: true };
+      const override = backgroundOverrideOf(input);
+      if (override !== undefined && override.enabled !== false) {
+        return {
+          allowed: false,
+          reason: `write-class connector '${connectorId}' may not run in background: an LLM _background override would move it off the foreground path (v1 connectors are foreground-only)`,
+        };
+      }
+      return { allowed: true };
+    },
+  };
+}
+
 /** Org-level approval policy for write-class connector calls. */
 export interface WritePermissionsPolicy {
   /**

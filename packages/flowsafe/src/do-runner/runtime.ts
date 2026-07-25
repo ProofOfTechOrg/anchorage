@@ -33,6 +33,7 @@ import {
   BREAKWATER_WORKFLOW_SCOPE_KEY,
 } from './breakwater-keys.js';
 import { PATH_SAFE_ID_PATTERN, tenantOfRunId } from './path-safe-id.js';
+import type { HostPubSub } from './pubsub.js';
 import { InMemoryResumeLedger, type ResumeLedger } from './resume-ledger.js';
 
 export class UnknownWorkflowError extends Error {
@@ -418,6 +419,21 @@ export interface RunnerRuntimeOptions {
    * ledger here wins over that adoption.
    */
   resumeLedger?: ResumeLedger;
+  /**
+   * The host DO's ONE pubsub identity (DL-001, do-runner/pubsub.ts), threaded
+   * here by init() alongside storage and the ledger so a host that configures it
+   * reaches the runtime with no host change: every DO subclass already returns
+   * init()'s runtime from build(), and nothing else in the isolate can hand this
+   * object a pubsub.
+   *
+   * PASSED TO CORE at the two `workflow.createRun({ runId, pubsub })` sites in
+   * start()/resume() (CI-M-002-002) — the only place core accepts one; the
+   * `pubsub` getter still exposes the held identity so an agent runner sharing
+   * this isolate takes THIS instance rather than building a second feed. Absent
+   * ⇒ undefined ⇒ core defaults a fresh emitter per run ⇒ byte-identical to
+   * before this seam existed.
+   */
+  pubsub?: HostPubSub;
 }
 
 export interface StartRunOptions {
@@ -464,6 +480,11 @@ export class RunnerRuntime {
   // keeps one small entry until the run is purged.
   #resumeLedger: ResumeLedger;
   readonly #resumeLedgerExplicit: boolean;
+  // The host DO's pubsub identity (RunnerRuntimeOptions.pubsub), threaded into
+  // both createRun sites below (CI-M-002-002) so a configured host publishes and
+  // replays on ONE shared feed. Undefined ⇒ core defaults a fresh emitter per
+  // run ⇒ byte-identical to before this seam existed.
+  readonly #pubsub?: HostPubSub;
   #mastra?: Mastra;
 
   constructor(options: RunnerRuntimeOptions) {
@@ -472,6 +493,18 @@ export class RunnerRuntime {
     this.#requestContextForRun = options.requestContextForRun;
     this.#resumeLedgerExplicit = options.resumeLedger !== undefined;
     this.#resumeLedger = options.resumeLedger ?? new InMemoryResumeLedger();
+    this.#pubsub = options.pubsub;
+  }
+
+  /**
+   * The host pubsub identity this runtime was built with, or undefined when the
+   * host configured none. Exposed so the identity is verifiable from outside the
+   * class (a private field held for a milestone is otherwise unobservable) and so
+   * an agent runner sharing this runtime's isolate takes THIS instance rather
+   * than building a second feed.
+   */
+  get pubsub(): HostPubSub | undefined {
+    return this.#pubsub;
   }
 
   /**
@@ -551,7 +584,16 @@ export class RunnerRuntime {
       const requestContext = await this.#requestContextFor(workflowId, runId, {
         kind: 'start',
       });
-      const run = await workflow.createRun({ runId });
+      // Thread the host DO's pubsub identity into the run (CI-M-002-002). Core
+      // accepts `createRun({ runId, pubsub })` at every one of its OWN call
+      // sites (agent/durable index.js:5224/5541) and stamps it straight onto
+      // `new Run({ ..., pubsub: options?.pubsub })`, defaulting a FRESH
+      // EventEmitterPubSub when it is undefined. So an unconfigured host
+      // (#pubsub undefined) reaches the identical `new Run({ pubsub: undefined })`
+      // the prior `createRun({ runId })` produced — byte-identical, polling
+      // stays the fallback. A configured host gets ONE shared feed so publish
+      // and observe()/replay agree (do-runner/pubsub.ts).
+      const run = await workflow.createRun({ runId, pubsub: this.#pubsub });
       let result: CoreRunResult;
       try {
         result = await run.start({
@@ -603,7 +645,9 @@ export class RunnerRuntime {
         resumeCount:
           stepKey !== undefined ? priorCounts?.get(stepKey) : undefined,
       });
-      const run = await workflow.createRun({ runId });
+      // Same host pubsub identity as start() (CI-M-002-002) — see the note
+      // there; undefined stays byte-identical to `createRun({ runId })`.
+      const run = await workflow.createRun({ runId, pubsub: this.#pubsub });
       let result: CoreRunResult;
       try {
         result = await run.resume({

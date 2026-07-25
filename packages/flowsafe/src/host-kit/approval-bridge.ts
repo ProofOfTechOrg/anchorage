@@ -5,11 +5,13 @@
 // shares one implementation instead of re-deriving the (suspendedAt, resumeCount)
 // capture and the SoD-across-gates re-queue.
 
+import { agentGateConnectors } from '../agent-runner/approval-shapes.js';
 import {
   type ApprovalActor,
   type ApprovalAuditSink,
   type ApprovalDecision,
   type ApprovalRecord,
+  type ApprovalResumeTarget,
   type ApprovalService,
   approvalCursor,
   MAX_APPROVAL_LIST_LIMIT,
@@ -29,14 +31,37 @@ export type ResumeRunFn = (
   decision: ApprovalDecision,
 ) => Promise<RunSummary>;
 
-/** Steps declare the grants they need in their suspend payload. */
+/**
+ * The connector ids a suspended step's decision should mint. A workflow STEP
+ * gate declares them explicitly in a `connectors` array. An AGENT gate (Track A,
+ * R-003) declares none — it names the tool the model called by `toolName` (both
+ * durable suspend shapes). For automatic grant derivation, that provider-visible
+ * name MUST already be the breakwater connector's provider-safe id
+ * (`[A-Za-z0-9_-]+`); providers can rewrite punctuation-bearing ids and the
+ * suspend payload carries no reversible original-id field. agentGateConnectors
+ * derives [toolName] so an approved agent gate mints exactly that connector's
+ * grant. The explicit array wins when present, so workflow gates are unaffected.
+ *
+ * ACCEPTED RISK (narrow): the agent fallback is a workflow-agnostic shape sniff —
+ * a suspend payload has no workflowId to prove it came from the durable loop. A
+ * workflow author who both omits `connectors` AND independently shapes a gate as
+ * `{type:'approval', toolName, toolCallId}` (all three, the second discriminator
+ * that agentGateConnectors demands) would derive [toolName] where the pre-Track-A
+ * code returned []. It is inert unless that toolName also names a real connector
+ * the run calls; the shipped/showcase workflows all declare `connectors`, so none
+ * collide today. The right convention for workflow gates remains the explicit
+ * `connectors` array.
+ */
 export function requestedConnectors(stepPayload: unknown): string[] {
   if (stepPayload === null || typeof stepPayload !== 'object') return [];
   const connectors = (stepPayload as Record<string, unknown>).connectors;
-  return Array.isArray(connectors) &&
+  if (
+    Array.isArray(connectors) &&
     connectors.every((c): c is string => typeof c === 'string')
-    ? connectors
-    : [];
+  ) {
+    return connectors;
+  }
+  return agentGateConnectors(stepPayload);
 }
 
 /**
@@ -64,6 +89,7 @@ export async function queueApprovalForSuspension(
   summary: RunSummary,
   requestedBy: string,
   systemActor: ApprovalActor,
+  resumeTarget?: ApprovalResumeTarget,
 ): Promise<ApprovalRecord[]> {
   const suspended = summary.suspended ?? [];
   const records: ApprovalRecord[] = [];
@@ -91,6 +117,7 @@ export async function queueApprovalForSuspension(
           requestedBy,
         },
         systemActor,
+        resumeTarget,
       );
       records.push(record);
     } catch (error) {
@@ -162,6 +189,7 @@ export function resumeRunWithRequeue(
           summary,
           record.decidedBy,
           systemActor,
+          record.resumeTarget,
         );
       } catch (error) {
         // Best-effort: a crashing sink must not mask the resume failure it is
@@ -275,6 +303,7 @@ export async function reconcileApprovalsForSummary(
   workflowId: string,
   summary: RunSummary,
   systemActor: ApprovalActor,
+  resumeTarget?: ApprovalResumeTarget,
 ): Promise<ApprovalRecord[]> {
   const suspended = summary.suspended ?? [];
   if (suspended.length === 0) return [];
@@ -321,6 +350,7 @@ export async function reconcileApprovalsForSummary(
     { ...summary, suspended: toFile },
     systemActor.id,
     systemActor,
+    resumeTarget,
   );
 }
 

@@ -77,6 +77,7 @@ export {
   InMemoryRateLimitStore,
 } from './connector-sdk/index.js';
 export type {
+  BackgroundExecutionOptions,
   ClassifierPolicyOptions,
   CrossWorkflowIsolationOptions,
   NetworkEgressOptions,
@@ -95,12 +96,14 @@ export type {
 } from './policy-engine/index.js';
 export {
   approvalRequired,
+  backgroundExecution,
   classifierPolicy,
   crossWorkflowIsolation,
   denyPatterns,
   egressDomainAllowed,
   extractMessageText,
   ISOLATION_SCOPE_CONTEXT_KEY,
+  LLM_BACKGROUND_OVERRIDE_KEY,
   maxTextLength,
   networkEgress,
   PII_SECRETS_DETECTOR_IDS,

@@ -32,7 +32,11 @@ export function stepKeyOf(stepPath: string[] | undefined): string {
 
 export interface CreateResult {
   record: ApprovalRecord;
-  /** false when an open request for the same (workflowId, runId, stepKey) already existed and was returned instead. */
+  /**
+   * false when an open request for the same (workflowId, runId, stepKey), or
+   * any record for the same captured suspension fingerprint, already existed
+   * and was returned instead.
+   */
   created: boolean;
 }
 
@@ -56,11 +60,11 @@ export interface ApprovalPatch {
 export interface ApprovalStore {
   /**
    * Insert — unless an OPEN request (pending | claimed | escalated) already
-   * exists for the same (workflowId, runId, stepKey); then that record is
-   * returned with created: false (idempotent create, so the runner glue can
-   * fire on every suspend observation without duplicating queue entries).
-   * Decided requests never block a new one: a later re-suspension of the
-   * same step opens a fresh approval.
+   * exists for the same (workflowId, runId, stepKey), or any record already
+   * carries the same captured (stepPath, suspendedAt, resumeCount)
+   * fingerprint. The existing record is returned with created: false, so a
+   * stale reconciler cannot file over a decision that landed after its history
+   * read. A later re-suspension changes the fingerprint and opens fresh.
    */
   create(record: ApprovalRecord): Promise<CreateResult>;
   get(id: string): Promise<ApprovalRecord | null>;
@@ -330,6 +334,26 @@ export class InMemoryApprovalStore implements ApprovalStore {
     // Stamp, never trust: the bound store is the tenant authority.
     const stamped: ApprovalRecord = { ...record, tenantId: this.tenantId };
     const key = stepKeyOf(stamped.stepPath);
+    if (stamped.stepPath !== undefined && stamped.suspendedAt !== undefined) {
+      const fingerprint = [...this.#records.values()].filter(
+        (existing) =>
+          existing.tenantId === this.tenantId &&
+          existing.workflowId === stamped.workflowId &&
+          existing.runId === stamped.runId &&
+          stepKeyOf(existing.stepPath) === key &&
+          existing.stepPath !== undefined &&
+          existing.suspendedAt === stamped.suspendedAt &&
+          existing.resumeCount === stamped.resumeCount,
+      );
+      if (fingerprint.length > 1) {
+        throw new Error(
+          `approval suspension fingerprint has ${fingerprint.length} existing records`,
+        );
+      }
+      if (fingerprint[0]) {
+        return { record: clone(fingerprint[0]), created: false };
+      }
+    }
     for (const existing of this.#records.values()) {
       if (
         existing.tenantId === this.tenantId &&

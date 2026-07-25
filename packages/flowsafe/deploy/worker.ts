@@ -141,6 +141,14 @@ interface Env {
   /** Cron purges DECIDED (approved/rejected) approval records older than this (var; default 30; 0 = immediately). */
   APPROVAL_RETENTION_DAYS?: string;
   /**
+   * Agent-memory thread TTL in days (var; docs/agent-memory-tenancy.md): the
+   * purge cron deletes threads untouched for longer than this, with their
+   * messages. UNSET (the default) => no thread ever expires — a conversation is
+   * something a host means to keep, unlike a terminal run snapshot, so this
+   * deployment only starts expiring memory when an operator names a number.
+   */
+  THREAD_RETENTION_DAYS?: string;
+  /**
    * Optional audit export to a SIEM: bind a queue producer (wrangler.jsonc
    * `queues` block) and audit events flow producer -> queue -> the `queue`
    * consumer below -> HTTP POST to SIEM_ENDPOINT (auth via the

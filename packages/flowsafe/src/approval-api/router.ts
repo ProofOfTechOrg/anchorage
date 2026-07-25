@@ -61,6 +61,7 @@ export const TCB_ONLY_CREATE_FIELDS = [
   'resumeCount',
   'runScoped',
   'requestedBy',
+  'resumeTarget',
 ] as const;
 
 /**

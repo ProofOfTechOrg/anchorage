@@ -44,6 +44,12 @@ jobs:
       - name: Build
         run: pnpm build
 
+      # Pack the built package and resolve the public deep import under browser
+      # conditions. This catches Node-only transitive imports that source-level
+      # tests cannot see.
+      - name: Verify browser-clean signals client export
+        run: pnpm --filter @proofoftech/flowsafe test:signals-client-export
+
       # Peer-floor probe: the approval-ui d.ts is EMITTED under
       # @types/react@19; this compiles the built dist against aliased
       # @types/react@18 (skipLibCheck OFF), proving the React >=18 peer range

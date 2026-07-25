@@ -19,6 +19,7 @@ import {
 
 import type { D1DatabaseBinding } from './cf-types.js';
 import { createD1Storage } from './d1-storage.js';
+import type { HostPubSub } from './pubsub.js';
 import type { ResumeLedger } from './resume-ledger.js';
 import type { RequestContextProvider } from './runtime.js';
 import { RunnerRuntime } from './runtime.js';
@@ -47,12 +48,31 @@ export interface InitOptions {
    * ctx.storage-backed ledger.
    */
   resumeLedger?: ResumeLedger;
+  /**
+   * The host DO's ONE pubsub identity (DL-001) — `createHostPubSub()` for the
+   * default in-process emitter, or any PubSub the host built. init() is where a
+   * DO's identity is established: it echoes the instance on InitResult, so every
+   * consumer in the isolate takes THAT one rather than building its own (core
+   * defaults a fresh emitter per createRun, and two such feeds never see each
+   * other's events — see pubsub.ts).
+   *
+   * OPT-IN: absent, InitResult.pubsub is undefined and no consumer has one to
+   * pass, so the host is byte-identical to before this seam existed (polling
+   * stays the fallback).
+   */
+  pubsub?: HostPubSub;
 }
 
 export interface InitResult {
   createWorkflow: typeof coreCreateWorkflow;
   createStep: typeof createStep;
   runtime: RunnerRuntime;
+  /**
+   * The host pubsub identity, or undefined when unconfigured. THE accessor for
+   * it: consumers take the identity from here instead of constructing their own,
+   * which is what keeps it single per DO.
+   */
+  pubsub?: HostPubSub;
 }
 
 export function init(
@@ -80,6 +100,12 @@ export function init(
     storage,
     requestContextForRun: options.requestContextForRun,
     resumeLedger: options.resumeLedger,
+    // Threaded like the ledger, and for the same reason: every DO subclass
+    // returns THIS runtime from build(), so a host that configures a pubsub
+    // reaches the runtime's createRun sites with no host change (Track A wires
+    // those). Handing it only to InitResult would strand it — build() returns a
+    // RunnerRuntime, not an InitResult, so the run-DO path would drop it.
+    pubsub: options.pubsub,
   });
 
   // Cast preserves core's generic call-site inference (6 type params); the
@@ -92,5 +118,10 @@ export function init(
     return workflow;
   }) as typeof coreCreateWorkflow;
 
-  return { createWorkflow: boundCreateWorkflow, createStep, runtime };
+  return {
+    createWorkflow: boundCreateWorkflow,
+    createStep,
+    runtime,
+    pubsub: options.pubsub,
+  };
 }

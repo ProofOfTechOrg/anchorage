@@ -1,6 +1,6 @@
 {
   "name": "@proofoftech/flowsafe",
-  "version": "0.4.0",
+  "version": "0.6.0",
   "publishConfig": {
     "access": "public"
   },
@@ -27,19 +27,27 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": "./dist/index.js",
+    "./agent-runner": "./dist/agent-runner/index.js",
     "./approval-api": "./dist/approval-api/index.js",
+    "./background-tasks": "./dist/background-tasks/index.js",
     "./approval-ui": "./dist/approval-ui/index.js",
     "./artifacts": "./dist/artifacts/index.js",
     "./audit-export": "./dist/audit-export/index.js",
     "./do-runner": "./dist/do-runner/index.js",
+    "./goals": "./dist/goals/index.js",
     "./host-kit": "./dist/host-kit/index.js",
     "./host-kit/module": "./dist/host-kit/module.js",
+    "./schedules": "./dist/schedules/index.js",
+    "./signal-providers": "./dist/signal-providers/index.js",
+    "./signals": "./dist/signals/index.js",
+    "./signals/client": "./dist/signals/client.js",
     "./package.json": "./package.json"
   },
   "scripts": {
     "build": "tsc && tsc -p src/approval-ui/tsconfig.json",
     "dev": "tsc --watch",
     "test": "vitest run",
+    "test:signals-client-export": "node scripts/signals-client-pack-test.mjs",
     "test:watch": "vitest",
     "example:gtm": "vitest run examples/gtm-outbound.e2e.test.ts",
     "lint": "pnpm -w exec biome check packages/flowsafe",
@@ -47,6 +55,7 @@
     "typecheck:react18": "tsc -p scripts/react18-probe/tsconfig.json",
     "spike": "wrangler dev --config spike/wrangler.jsonc",
     "spike:verify": "node scripts/spike-verify.mjs",
+    "spike:verify:llm": "node scripts/spike-verify-llm.mjs",
     "deploy:cf": "wrangler deploy --config deploy/wrangler.jsonc",
     "deploy:dev": "wrangler dev --config deploy/wrangler.jsonc",
     "prepublishOnly": "pnpm run build"

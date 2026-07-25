@@ -29,17 +29,29 @@ import {
 import type { AuditMessageBatch, AuditQueue } from '../audit-export/index.js';
 import { createAuditQueueHandler } from '../audit-export/index.js';
 import type {
+  PurgeExpiredBackgroundTasksResult,
   SnapshotDatabase,
   TenantArtifactPurger,
 } from '../do-runner/index.js';
-import { purgeExpiredWorkflowRuns } from '../do-runner/index.js';
+import {
+  purgeExpiredBackgroundTasks,
+  purgeExpiredNotifications,
+  purgeExpiredScheduleTriggers,
+  purgeExpiredThreadState,
+  purgeExpiredThreads,
+  purgeExpiredWorkflowRuns,
+} from '../do-runner/index.js';
 import { bearerActorAuthenticator } from './bearer-auth.js';
 import {
   createDoRunTopology,
   type DoRunTopology,
   type RunnerNamespaceLike,
 } from './do-run-topology.js';
-import { numberVar, selfDecisionPolicyVar } from './env-vars.js';
+import {
+  numberVar,
+  optionalNumberVar,
+  selfDecisionPolicyVar,
+} from './env-vars.js';
 import {
   approvalStoreFactoryFor,
   buildHostApprovalService,
@@ -91,10 +103,58 @@ export interface FlowsafeWorkerEnv {
   RUN_RETENTION_DAYS?: string;
   /** Cron purges DECIDED approval records older than this (var; default 30; 0 = immediately). */
   APPROVAL_RETENTION_DAYS?: string;
+  /**
+   * Agent-memory thread TTL in days (var; docs/agent-memory-tenancy.md item 7):
+   * the purge cron deletes threads untouched for longer than this, with their
+   * messages. UNSET, EMPTY, or INVALID => the duty does not run and no thread
+   * ever expires — the opt-in default, because a thread is a conversation a host
+   * means to keep, not a terminal run snapshot that is finished by definition.
+   * There is no safe number to pick on an operator's behalf here, so anything
+   * short of a number the operator actually named is answered by NOT deleting
+   * (a config-error line marks the invalid case). Unlike RUN_RETENTION_DAYS this
+   * var decides whether an irreversible delete happens at all, so it does not
+   * take numberVar's fallback — see optionalNumberVar in env-vars.ts.
+   */
+  THREAD_RETENTION_DAYS?: string;
+  /**
+   * Track C agent-inbox TTL in days (var). The purge cron reaps TERMINAL
+   * `mastra_notifications` rows past this age (pending rows are never reaped —
+   * one may await a future deliverAt). UNSET/EMPTY/INVALID => the duty does not
+   * run and no notification ever expires (opt-in, like THREAD_RETENTION_DAYS —
+   * a durable inbox is meant to be readable until the host says otherwise).
+   */
+  NOTIFICATION_RETENTION_DAYS?: string;
+  /**
+   * Track C thread-state TTL in days (var). The purge cron reaps
+   * `mastra_thread_state` rows (state-signal lanes + goals) untouched for longer
+   * than this. UNSET/EMPTY/INVALID => the duty does not run (opt-in; an active
+   * goal bumps updatedAt so it never ages out).
+   */
+  THREAD_STATE_RETENTION_DAYS?: string;
+  /**
+   * Track D schedule-trigger history TTL in days (var). The purge cron reaps
+   * `mastra_schedule_triggers` rows past this age by their `actualFireAt`.
+   * UNSET/EMPTY/INVALID => the duty does not run (opt-in; a schedule's fire
+   * history is inspectable until the host sets a window). The schedule rows
+   * themselves are standing config — never TTL'd, reaped only at offboarding.
+   */
+  SCHEDULE_TRIGGER_RETENTION_DAYS?: string;
   /** Optional audit export: queue producer binding + SIEM collector config. */
   AUDIT_QUEUE?: AuditQueue<ApprovalAuditEvent>;
   SIEM_ENDPOINT?: string;
   SIEM_AUTH_HEADER?: string;
+}
+
+/**
+ * Track B background-task TTL cleanup config, surfaced through
+ * FlowsafeWorkerConfig (DL-003). Mirrors core BackgroundTaskManager.cleanup's
+ * two windows.
+ */
+export interface BackgroundTasksCleanupConfig {
+  /** Completed rows past this age expire. Default 3_600_000 (1h). */
+  completedTtlMs?: number;
+  /** Failed / cancelled / timed_out rows past this age expire. Default 86_400_000 (24h). */
+  failedTtlMs?: number;
 }
 
 export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
@@ -114,12 +174,17 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
    */
   buildVerifier: (env: Env) => TokenVerifier;
   /**
-   * The two cron expressions scheduled() dispatches on. Keep byte-equal to
-   * wrangler.jsonc's `triggers.crons`; an unrecognized expression runs BOTH
-   * duties sequentially and logs a config-error (availability of both beats
-   * purity on a misconfig).
+   * The cron expressions scheduled() dispatches on. `sweep` + `purge` are
+   * required and must never share an invocation. `tick` is OPTIONAL (Track D
+   * schedules): when set AND `scheduleTick` is provided, the schedule tick runs
+   * on it as its OWN failure-isolated invocation (a runaway fire pass gets its
+   * own CPU budget, the same rationale that keeps sweep and purge apart). Keep
+   * these byte-equal to wrangler.jsonc's `triggers.crons`; an unrecognized
+   * expression runs the sweep + purge duties sequentially and logs a
+   * config-error (availability beats purity on a misconfig). Absent `tick` ⇒ no
+   * schedule-tick invocation, byte-identical.
    */
-  crons: { sweep: string; purge: string };
+  crons: { sweep: string; purge: string; tick?: string };
   /**
    * Deployment-specific routes tried AFTER /healthz and BEFORE the approval
    * and run routers (the showcase mounts its demo sign-in and sandbox reset
@@ -163,6 +228,69 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
    * deleted, when the keys are already unenumerable.
    */
   artifactStore?: TenantArtifactPurger;
+  /**
+   * Opt-in background-task TTL cleanup (Track B). When present, the purge cron
+   * reaps terminal `mastra_background_tasks` rows past the TTL as its OWN
+   * failure-isolated duty — the storage-layer belt to a hosting DO's manager
+   * cleanup (which needs the DO alive). Absent => no duty, byte-identical
+   * (background tasks are opt-in). NOT via extraPurgeDuties: this needs its own
+   * try/catch and its own log fields, like every sibling purge duty.
+   */
+  backgroundTasks?: BackgroundTasksCleanupConfig;
+  /**
+   * Opt-in Track C signal ingestion stage (P6, DL-006). The host builds its
+   * `createSignalRouter` (which needs its per-thread DO namespace via
+   * createThreadTopology, plus its audit/rate/allowlist config) and returns it
+   * here, closed over the request's resolved TenantResolver; the composer mounts
+   * it after preRoutes, ahead of approvals/runs (its `/api/threads/*` routes
+   * don't overlap). INJECTED rather than built here because createSignalRouter
+   * lives in `signals/`, which imports host-kit — host-kit importing it back
+   * would cycle. Absent (or returns undefined) => no signal stage, byte-identical.
+   */
+  buildSignalRouter?: (
+    resolve: TenantResolver,
+    env: Env,
+  ) => ((request: Request) => Promise<Response | null>) | undefined;
+  /**
+   * Opt-in Track F goal objective stage (P6-lite, DL-018). Mirrors
+   * buildSignalRouter: the host builds its `createObjectiveRouter` (which needs
+   * the thread-state store from its D1 domains, plus its audit/maxRuns config)
+   * and returns it here, closed over the request's resolved TenantResolver; the
+   * composer mounts it after the signal stage. Both live under `/api/threads/*`
+   * but do not overlap — goals use the `/goal` segment, signals the channel
+   * segments. INJECTED rather than built here because createObjectiveRouter lives
+   * in `goals/`, which imports host-kit — host-kit importing it back would cycle.
+   * Absent (or returns undefined) ⇒ no goal stage, byte-identical.
+   */
+  buildObjectiveRouter?: (
+    resolve: TenantResolver,
+    env: Env,
+  ) => ((request: Request) => Promise<Response | null>) | undefined;
+  /**
+   * Opt-in Track D schedule CRUD facade (DL-013). Mirrors buildSignalRouter/
+   * buildObjectiveRouter: the host builds its `createScheduleRouter` (which needs
+   * the schedules store from its D1 domains + its audit/cap config) and returns it
+   * here, closed over the request's resolved TenantResolver; the composer mounts it
+   * after the goal stage. Its `/api/schedules/*` routes don't overlap the others.
+   * INJECTED (not built here, typed structurally) because createScheduleRouter
+   * lives in `schedules/`, which transitively imports host-kit — importing it back
+   * would cycle. Absent (or returns undefined) ⇒ no schedule surface, byte-identical.
+   */
+  buildScheduleRouter?: (
+    resolve: TenantResolver,
+    env: Env,
+  ) => ((request: Request) => Promise<Response | null>) | undefined;
+  /**
+   * Opt-in Track D schedule tick (DL-012). The host builds its `createScheduleTick`
+   * (which needs the schedules store, its run-start seam — topology.start — and
+   * the run-cap + audit config) and returns the closure here. The composer runs
+   * it on the `crons.tick` cron as its OWN failure-isolated duty (own try/catch,
+   * own `schedule-tick` log line). INJECTED (not built here, structurally typed as
+   * `() => Promise<unknown>`) because createScheduleTick lives in `schedules/`,
+   * which transitively imports host-kit — host-kit importing it back would cycle.
+   * Absent (or `crons.tick` unset) ⇒ no tick invocation, byte-identical.
+   */
+  scheduleTick?: (env: Env) => (() => Promise<unknown>) | undefined;
   /**
    * Extra purge-cron duties (e.g. the showcase's demo-tenant reaper). The
    * returned fields fold into the ONE combined `{type:'maintenance'}` log
@@ -304,6 +432,134 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       retentionDays: env.APPROVAL_RETENTION_DAYS,
       cron,
     });
+    // Agent-memory thread TTL, opt-in (docs/agent-memory-tenancy.md item 7).
+    // Its OWN try/catch, like every sibling duty above and below: isolating one
+    // loop while a sibling shares its failure is a defect this codebase has
+    // already shipped once — a wedged thread purge must cost the run-snapshot
+    // purge, the approval purge, and the extra duties nothing.
+    let threadsPurged: number | undefined;
+    let threadMessagesPurged: number | undefined;
+    // optionalNumberVar, not numberVar: this var GATES the duty rather than
+    // tuning it, so unset/empty/garbage must all mean "do not delete" — never a
+    // silent fallback threshold (see its contract in env-vars.ts).
+    // allowZero: THREAD_RETENTION_DAYS=0 means "expire idle threads now", the
+    // same operator intent RUN_RETENTION_DAYS=0 states.
+    const threadRetentionDays = optionalNumberVar(
+      env.THREAD_RETENTION_DAYS,
+      'THREAD_RETENTION_DAYS',
+      { allowZero: true },
+    );
+    if (threadRetentionDays !== undefined) {
+      try {
+        const purgedThreads = await purgeExpiredThreads(env.DB, {
+          ttlMs: threadRetentionDays * 24 * 60 * 60 * 1000,
+        });
+        threadsPurged = purgedThreads.threads;
+        threadMessagesPurged = purgedThreads.messages;
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            type: 'maintenance-error',
+            surface: 'thread-retention-purge',
+            cron,
+            error: String(error),
+          }),
+        );
+      }
+    }
+    // Background-task TTL cleanup (Track B, opt-in). Its OWN try/catch, like
+    // every sibling duty: a wedged background-task purge must cost the
+    // run-snapshot, approval, and thread purges nothing.
+    let backgroundTasksPurged: PurgeExpiredBackgroundTasksResult | undefined;
+    if (config.backgroundTasks) {
+      try {
+        backgroundTasksPurged = await purgeExpiredBackgroundTasks(env.DB, {
+          completedTtlMs: config.backgroundTasks.completedTtlMs,
+          failedTtlMs: config.backgroundTasks.failedTtlMs,
+        });
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            type: 'maintenance-error',
+            surface: 'background-task-purge',
+            cron,
+            error: String(error),
+          }),
+        );
+      }
+    }
+    // Track C notification TTL (opt-in). Its OWN try/catch, like every sibling
+    // duty. optionalNumberVar (GATES the duty; unset/garbage => do not delete).
+    let notificationsPurged: number | undefined;
+    const notificationRetentionDays = optionalNumberVar(
+      env.NOTIFICATION_RETENTION_DAYS,
+      'NOTIFICATION_RETENTION_DAYS',
+      { allowZero: true },
+    );
+    if (notificationRetentionDays !== undefined) {
+      try {
+        notificationsPurged = await purgeExpiredNotifications(env.DB, {
+          ttlMs: notificationRetentionDays * 24 * 60 * 60 * 1000,
+        });
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            type: 'maintenance-error',
+            surface: 'notification-purge',
+            cron,
+            error: String(error),
+          }),
+        );
+      }
+    }
+    // Track C thread-state TTL (opt-in). Same isolation + opt-in posture.
+    let threadStatePurged: number | undefined;
+    const threadStateRetentionDays = optionalNumberVar(
+      env.THREAD_STATE_RETENTION_DAYS,
+      'THREAD_STATE_RETENTION_DAYS',
+      { allowZero: true },
+    );
+    if (threadStateRetentionDays !== undefined) {
+      try {
+        threadStatePurged = await purgeExpiredThreadState(env.DB, {
+          ttlMs: threadStateRetentionDays * 24 * 60 * 60 * 1000,
+        });
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            type: 'maintenance-error',
+            surface: 'thread-state-purge',
+            cron,
+            error: String(error),
+          }),
+        );
+      }
+    }
+    // Track D schedule-trigger history TTL (opt-in). Same isolation + opt-in
+    // posture. Only the fire HISTORY expires; schedule config rows are reaped
+    // only at offboarding (purgeTenant).
+    let scheduleTriggersPurged: number | undefined;
+    const scheduleTriggerRetentionDays = optionalNumberVar(
+      env.SCHEDULE_TRIGGER_RETENTION_DAYS,
+      'SCHEDULE_TRIGGER_RETENTION_DAYS',
+      { allowZero: true },
+    );
+    if (scheduleTriggerRetentionDays !== undefined) {
+      try {
+        scheduleTriggersPurged = await purgeExpiredScheduleTriggers(env.DB, {
+          ttlMs: scheduleTriggerRetentionDays * 24 * 60 * 60 * 1000,
+        });
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            type: 'maintenance-error',
+            surface: 'schedule-trigger-purge',
+            cron,
+            error: String(error),
+          }),
+        );
+      }
+    }
     let extra: Record<string, unknown> = {};
     if (config.extraPurgeDuties) {
       try {
@@ -325,99 +581,183 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         cron,
         purged,
         approvalsPurged,
+        threadsPurged,
+        threadMessagesPurged,
+        backgroundTasksCompletedPurged: backgroundTasksPurged?.completed,
+        backgroundTasksFailedPurged: backgroundTasksPurged?.failed,
+        notificationsPurged,
+        threadStatePurged,
+        scheduleTriggersPurged,
         ...extra,
       }),
     );
   }
 
+  // Track D schedule tick — its OWN failure-isolated duty (own try/catch, own log
+  // line), run on the `crons.tick` invocation. A wedged fire pass must cost the
+  // sweep + purge nothing, and vice versa (the two-cron isolation rationale).
+  async function runScheduleTickDuty(env: Env, cron: string): Promise<void> {
+    const tick = config.scheduleTick?.(env);
+    if (!tick) {
+      // The tick cron fired but no scheduleTick builder is wired — a misconfig.
+      // Do NOT fall through to sweep/purge (this invocation is the tick's).
+      console.error(
+        JSON.stringify({
+          type: 'config-error',
+          var: 'crons.tick',
+          cron,
+          reason: 'tick cron fired but no scheduleTick builder is configured',
+        }),
+      );
+      return;
+    }
+    try {
+      const result = await tick();
+      console.log(JSON.stringify({ type: 'schedule-tick', cron, result }));
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          type: 'schedule-tick-error',
+          cron,
+          error: String(error),
+        }),
+      );
+    }
+  }
+
   return {
     async fetch(request, env, ctx) {
-      const url = new URL(request.url);
+      try {
+        const url = new URL(request.url);
 
-      if (request.method === 'GET' && url.pathname === '/healthz') {
-        return json({ ok: true });
-      }
+        if (request.method === 'GET' && url.pathname === '/healthz') {
+          return json({ ok: true });
+        }
 
-      const waitUntil = (promise: Promise<unknown>): void =>
-        ctx.waitUntil(promise);
-      const topology = createDoRunTopology(env.RUNNER);
-      const notify = config.notify?.(env);
-      const selfDecision = parseSelfDecision(env);
-      // Fetch-scope live fan-out sink: present iff a hub is bound (streaming is
-      // opt-in, DL-019). Each publish rides ctx.waitUntil (DL-020) and is
-      // contained — a failed fan-out logs and never fails the mutation.
-      const hub = env.HUB;
-      let streamSink: ApprovalStreamSink | undefined;
-      if (hub) {
-        const hubTopology = createHubTopology(hub);
-        streamSink = (event) =>
-          waitUntil(
-            hubTopology.publish(event).catch((error: unknown) =>
-              console.error(
-                JSON.stringify({
-                  type: 'stream-publish-error',
-                  reason:
-                    error instanceof Error ? error.message : String(error),
-                }),
+        const waitUntil = (promise: Promise<unknown>): void =>
+          ctx.waitUntil(promise);
+        const topology = createDoRunTopology(env.RUNNER);
+        const notify = config.notify?.(env);
+        const selfDecision = parseSelfDecision(env);
+        // Fetch-scope live fan-out sink: present iff a hub is bound (streaming is
+        // opt-in, DL-019). Each publish rides ctx.waitUntil (DL-020) and is
+        // contained — a failed fan-out logs and never fails the mutation.
+        const hub = env.HUB;
+        let streamSink: ApprovalStreamSink | undefined;
+        if (hub) {
+          const hubTopology = createHubTopology(hub);
+          streamSink = (event) =>
+            waitUntil(
+              hubTopology.publish(event).catch((error: unknown) =>
+                console.error(
+                  JSON.stringify({
+                    type: 'stream-publish-error',
+                    reason:
+                      error instanceof Error ? error.message : String(error),
+                  }),
+                ),
               ),
-            ),
-          );
-      }
-      const resolve = buildResolve(
-        env,
-        topology,
-        waitUntil,
-        notify,
-        selfDecision,
-        streamSink,
-      );
-
-      if (config.preRoutes) {
-        const preResponse = await config.preRoutes(request, env, ctx, {
-          resolve,
+            );
+        }
+        const resolve = buildResolve(
+          env,
           topology,
-        });
-        if (preResponse) return preResponse;
-      }
-
-      // Optional stream stage (DL-015/DL-019): mounted only when BOTH the hub
-      // binding and the ticket secret are present. Every route is under
-      // /api/stream/, so it composes ahead of the approval router without
-      // touching the /api/* run_worker_first entry.
-      if (env.HUB && env.STREAM_TICKET_SECRET) {
-        const streamResponse = await createStreamRouter({
-          resolve,
-          ticketSecret: env.STREAM_TICKET_SECRET,
-          hub: env.HUB,
-          runner: env.RUNNER,
-        })(request);
-        if (streamResponse) return streamResponse;
-      }
-
-      const approvalResponse = await createApprovalRouter({ resolve })(request);
-      if (approvalResponse) return approvalResponse;
-
-      const runResponse = await createRunRouter({
-        workflows: config.workflows,
-        resolve,
-        systemActorId: config.systemActorId,
-        start: config.wrapStart
-          ? config.wrapStart(topology.start, env)
-          : topology.start,
-        status: topology.status,
-        resume: config.wrapResume
-          ? config.wrapResume(topology.resume, env)
-          : topology.resume,
-        // D4 self-healing, waitUntil-detached — the shared wrapper owns the
-        // detach + reconcile-error logging.
-        reconcileApprovals: reconcileApprovalsOnStatusDetached(
-          config.systemActorId,
           waitUntil,
-        ),
-      })(request);
-      if (runResponse) return runResponse;
+          notify,
+          selfDecision,
+          streamSink,
+        );
 
-      return json({ error: 'not found' }, 404);
+        if (config.preRoutes) {
+          const preResponse = await config.preRoutes(request, env, ctx, {
+            resolve,
+            topology,
+          });
+          if (preResponse) return preResponse;
+        }
+
+        // Optional stream stage (DL-015/DL-019): mounted only when BOTH the hub
+        // binding and the ticket secret are present. Every route is under
+        // /api/stream/, so it composes ahead of the approval router without
+        // touching the /api/* run_worker_first entry.
+        if (env.HUB && env.STREAM_TICKET_SECRET) {
+          const streamResponse = await createStreamRouter({
+            resolve,
+            ticketSecret: env.STREAM_TICKET_SECRET,
+            hub: env.HUB,
+            runner: env.RUNNER,
+          })(request);
+          if (streamResponse) return streamResponse;
+        }
+
+        // Optional Track C signal stage (P6): the host-built createSignalRouter,
+        // closed over THIS request's resolver. `/api/threads/*` — composes ahead
+        // of approvals/runs without overlap. Absent seam => unmounted.
+        const signalRouter = config.buildSignalRouter?.(resolve, env);
+        if (signalRouter) {
+          const signalResponse = await signalRouter(request);
+          if (signalResponse) return signalResponse;
+        }
+
+        // Optional Track F goal stage (P6-lite, DL-018): the host-built
+        // createObjectiveRouter, closed over THIS request's resolver.
+        // `/api/threads/:threadId/goal` — composes after signals (non-overlapping)
+        // and ahead of approvals/runs. Absent seam ⇒ unmounted, byte-identical.
+        const objectiveRouter = config.buildObjectiveRouter?.(resolve, env);
+        if (objectiveRouter) {
+          const objectiveResponse = await objectiveRouter(request);
+          if (objectiveResponse) return objectiveResponse;
+        }
+
+        // Optional Track D schedule CRUD stage (DL-013): the host-built
+        // createScheduleRouter, closed over THIS request's resolver. `/api/schedules/*`
+        // — composes after goals (non-overlapping), ahead of approvals/runs. Absent
+        // seam ⇒ unmounted, byte-identical.
+        const scheduleRouter = config.buildScheduleRouter?.(resolve, env);
+        if (scheduleRouter) {
+          const scheduleResponse = await scheduleRouter(request);
+          if (scheduleResponse) return scheduleResponse;
+        }
+
+        const approvalResponse = await createApprovalRouter({ resolve })(
+          request,
+        );
+        if (approvalResponse) return approvalResponse;
+
+        const runResponse = await createRunRouter({
+          workflows: config.workflows,
+          resolve,
+          systemActorId: config.systemActorId,
+          start: config.wrapStart
+            ? config.wrapStart(topology.start, env)
+            : topology.start,
+          status: topology.status,
+          resume: config.wrapResume
+            ? config.wrapResume(topology.resume, env)
+            : topology.resume,
+          // D4 self-healing, waitUntil-detached — the shared wrapper owns the
+          // detach + reconcile-error logging.
+          reconcileApprovals: reconcileApprovalsOnStatusDetached(
+            config.systemActorId,
+            waitUntil,
+          ),
+        })(request);
+        if (runResponse) return runResponse;
+
+        return json({ error: 'not found' }, 404);
+      } catch (error) {
+        // Backstop: a mounted router (or any handler fault) that THROWS before
+        // returning a Response — e.g. a future unguarded path decode — is
+        // contained as a generic 500 here rather than rejecting out of fetch()
+        // as an unhandled promise. Never surface error.message to the client.
+        console.error(
+          JSON.stringify({
+            type: 'worker-fetch-error',
+            reason: error instanceof Error ? error.message : String(error),
+          }),
+        );
+        return json({ error: 'internal error' }, 500);
+      }
     },
 
     async scheduled(controller, env, ctx) {
@@ -445,6 +785,13 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         ctx.waitUntil(sweep());
       } else if (controller.cron === config.crons.purge) {
         ctx.waitUntil(runPurgeMaintenance(env, controller.cron));
+      } else if (
+        config.crons.tick !== undefined &&
+        controller.cron === config.crons.tick
+      ) {
+        // Track D: the schedule tick's OWN invocation (opt-in; unset ⇒ this
+        // branch is unreachable, byte-identical).
+        ctx.waitUntil(runScheduleTickDuty(env, controller.cron));
       } else {
         console.error(
           JSON.stringify({

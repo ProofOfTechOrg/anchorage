@@ -295,7 +295,21 @@ export function runApiDevPlugin(): Plugin {
         threads: 0,
         messages: 0,
         resources: 0,
+        // No showcase workflow dispatches background tasks (Track B); when one
+        // does, sweep the in-memory backgroundTasks domain here.
+        backgroundTasks: 0,
+        // No showcase workflow sends agent signals (Track C); when one does,
+        // sweep the in-memory notifications + thread-state domains here.
+        notifications: 0,
+        threadState: 0,
+        // No showcase workflow registers schedules (Track D); when one does,
+        // sweep the in-memory schedules + schedule-triggers domains here.
+        schedules: 0,
+        scheduleTriggers: 0,
         approvals: storeFactory.purgeTenant(tenantId),
+        // No showcase workflow registers signal providers (Track E); when one
+        // does, sweep the in-memory subscription store here.
+        subscriptions: 0,
         artifacts: 0,
       };
     },

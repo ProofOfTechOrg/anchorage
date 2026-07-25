@@ -7,14 +7,23 @@
   "durable_objects": {
     "bindings": [
       { "name": "RUNNER", "class_name": "DemoRunner" },
-      { "name": "HUB", "class_name": "DemoHub" }
+      { "name": "HUB", "class_name": "DemoHub" },
+      { "name": "THREAD", "class_name": "DemoThread" },
+      { "name": "BACKGROUND_TASKS", "class_name": "DemoBackgroundTasks" },
+      {
+        "name": "SIGNAL_PROVIDER_HOST",
+        "class_name": "DemoSignalProviderHost"
+      }
     ]
   },
-  // Append-only DO migrations: the v1 runner tag is frozen; the hub ships under
-  // its own new v2 tag.
+  // Append-only DO migrations: the v1 runner + v2 hub + v3 thread tags are
+  // frozen; the Track E per-tenant provider host DO ships under its own new v4 tag.
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["DemoRunner"] },
-    { "tag": "v2", "new_sqlite_classes": ["DemoHub"] }
+    { "tag": "v2", "new_sqlite_classes": ["DemoHub"] },
+    { "tag": "v3", "new_sqlite_classes": ["DemoThread"] },
+    { "tag": "v4", "new_sqlite_classes": ["DemoSignalProviderHost"] },
+    { "tag": "v5", "new_sqlite_classes": ["DemoBackgroundTasks"] }
   ],
   "d1_databases": [
     {
@@ -29,6 +38,10 @@
   // `--var STREAM_TICKET_SECRET:...` so its forged-ticket probes share the key;
   // keep the two byte-equal (like SWEEP_CRON/PURGE_CRON). Never a real secret.
   "vars": {
-    "STREAM_TICKET_SECRET": "spike-local-stream-secret-do-not-deploy"
+    "STREAM_TICKET_SECRET": "spike-local-stream-secret-do-not-deploy",
+    // Track E: the github webhook signing secret. spike-verify.mjs re-passes it
+    // via `--var` and signs its webhook probes with it (byte-equal). Never a real
+    // secret; this worker is never deployed.
+    "GITHUB_WEBHOOK_SECRET": "spike-local-github-secret-do-not-deploy"
   }
 }

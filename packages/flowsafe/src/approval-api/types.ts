@@ -50,6 +50,13 @@ export const APPROVAL_STATUSES: readonly ApprovalStatus[] = [
   'escalated',
 ];
 
+/** Trusted host topology used to resume a durable agent after DO eviction. */
+export interface ApprovalResumeTarget {
+  kind: 'thread';
+  threadId: string;
+  resourceId?: string;
+}
+
 export interface ApprovalRecord {
   id: string;
   /**
@@ -119,6 +126,8 @@ export interface ApprovalRecord {
    * deliberately wants a run-wide capability does.
    */
   runScoped?: boolean;
+  /** Server-authored resume topology. Never accepted from the HTTP create body. */
+  resumeTarget?: ApprovalResumeTarget;
 }
 
 export interface CreateApprovalInput {

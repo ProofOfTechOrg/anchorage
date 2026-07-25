@@ -15,7 +15,10 @@
 // the package barrel.
 
 import { d1Changes } from '../do-runner/d1-storage.js';
-import { TENANT_ID_PATTERN } from '../do-runner/path-safe-id.js';
+import {
+  TENANT_ID_PATTERN,
+  tenantOwnsSaltedId,
+} from '../do-runner/path-safe-id.js';
 import {
   type ApprovalPatch,
   type ApprovalStore,
@@ -27,6 +30,7 @@ import {
   type ApprovalListFilter,
   type ApprovalMetrics,
   type ApprovalRecord,
+  type ApprovalResumeTarget,
   type ApprovalStatus,
   approvalListOrder,
   clampApprovalLimit,
@@ -54,9 +58,10 @@ export interface ApprovalPreparedStatement {
 
 const TABLE = 'flowsafe_approvals';
 
-// Partial unique index = the open-uniqueness invariant, now tenant-first.
-// Decided rows fall out of the index, so a re-suspension of the same step can
-// open a fresh request.
+// The partial index preserves open-step uniqueness. Captured suspensions add a
+// second, all-status fingerprint index after the legacy nullable columns are
+// present: terminal records must block a stale reconciler filing the SAME
+// suspension, while a later re-suspension changes suspended_at/resume_count.
 //
 // THE FATAL TRAP, spelled out: `CREATE UNIQUE INDEX IF NOT EXISTS` matches on
 // NAME ONLY — redefining the old `flowsafe_approvals_open_step` with a
@@ -77,6 +82,7 @@ const SCHEMA_STATEMENTS: readonly string[] = [
     resumed_at INTEGER,
     resume_count INTEGER,
     run_scoped INTEGER,
+    resume_target TEXT,
     title TEXT NOT NULL,
     summary TEXT,
     payload TEXT,
@@ -106,6 +112,20 @@ const SCHEMA_STATEMENTS: readonly string[] = [
     ON ${TABLE} (tenant_id, workflow_id, run_id)`,
 ];
 
+// First suspensions have a NULL resume_count; SQLite UNIQUE indexes otherwise
+// treat every NULL as distinct, so normalize it to text outside the number
+// domain. Scope this to captured step suspensions only: legacy/unbound records
+// keep the original open-only create semantics. This statement deliberately
+// runs after the additive ALTER loop. If a legacy database already contains
+// duplicate fingerprints, index creation fails closed instead of choosing one
+// audit record silently.
+const FINGERPRINT_INDEX = `CREATE UNIQUE INDEX IF NOT EXISTS ${TABLE}_fingerprint_v1
+  ON ${TABLE} (
+    tenant_id, workflow_id, run_id, step_key, suspended_at,
+    COALESCE(resume_count, 'none')
+  )
+  WHERE step_path IS NOT NULL AND suspended_at IS NOT NULL`;
+
 interface ApprovalRow {
   id: string;
   tenant_id: string;
@@ -118,6 +138,7 @@ interface ApprovalRow {
   resume_count: number | null;
   /** SQLite has no boolean: 1 = run-scoped standing grant, 0/NULL = not. */
   run_scoped: number | null;
+  resume_target: string | null;
   title: string;
   summary: string | null;
   payload: string | null;
@@ -335,6 +356,35 @@ function rowToRecord(row: ApprovalRow): ApprovalRecord {
   if (row.resumed_at != null) record.resumedAt = row.resumed_at;
   if (row.resume_count != null) record.resumeCount = row.resume_count;
   if (row.run_scoped != null) record.runScoped = row.run_scoped === 1;
+  if (row.resume_target != null) {
+    let target: unknown;
+    try {
+      target = JSON.parse(row.resume_target);
+    } catch {
+      throw new Error(`approval '${row.id}' has invalid resume_target JSON`);
+    }
+    if (
+      typeof target !== 'object' ||
+      target === null ||
+      (target as Record<string, unknown>).kind !== 'thread' ||
+      typeof (target as Record<string, unknown>).threadId !== 'string' ||
+      !tenantOwnsSaltedId(
+        row.tenant_id,
+        (target as Record<string, unknown>).threadId as string,
+      ) ||
+      ((target as Record<string, unknown>).resourceId !== undefined &&
+        (typeof (target as Record<string, unknown>).resourceId !== 'string' ||
+          !tenantOwnsSaltedId(
+            row.tenant_id,
+            (target as Record<string, unknown>).resourceId as string,
+          )))
+    ) {
+      throw new Error(
+        `approval '${row.id}' has an invalid or foreign resume_target`,
+      );
+    }
+    record.resumeTarget = target as ApprovalResumeTarget;
+  }
   if (row.summary !== null) record.summary = row.summary;
   if (row.payload !== null) record.payload = JSON.parse(row.payload);
   if (row.requested_by !== null) record.requestedBy = row.requested_by;
@@ -410,6 +460,22 @@ export async function createApprovalSchema(
       if (!isDuplicateColumn(error)) throw error;
     }
   }
+  try {
+    await db
+      .prepare(`ALTER TABLE ${TABLE} ADD COLUMN resume_target TEXT`)
+      .run();
+  } catch (error) {
+    if (!isDuplicateColumn(error)) throw error;
+  }
+  try {
+    await db.prepare(FINGERPRINT_INDEX).run();
+  } catch (error) {
+    if (!isUniqueViolation(error)) throw error;
+    throw new Error(
+      `${TABLE} contains duplicate captured suspension fingerprints; repair the duplicate approval history before serving this database`,
+      { cause: error },
+    );
+  }
 }
 
 export class D1ApprovalStore implements ApprovalStore {
@@ -448,10 +514,10 @@ export class D1ApprovalStore implements ApprovalStore {
           `INSERT INTO ${TABLE} (
             id, tenant_id, workflow_id, run_id, step_key, step_path,
             suspended_at, resumed_at, resume_count, run_scoped, title, summary,
-            payload, connectors, priority, status, requested_by, claimed_by,
+            resume_target, payload, connectors, priority, status, requested_by, claimed_by,
             decided_by, decision, comment, delegated_to, created_at, updated_at,
             claimed_at, decided_at, escalated_at, sla_deadline_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .bind(
           snapshot.id,
@@ -466,6 +532,9 @@ export class D1ApprovalStore implements ApprovalStore {
           snapshot.runScoped === undefined ? null : snapshot.runScoped ? 1 : 0,
           snapshot.title,
           snapshot.summary ?? null,
+          snapshot.resumeTarget === undefined
+            ? null
+            : JSON.stringify(snapshot.resumeTarget),
           snapshot.payload === undefined
             ? null
             : JSON.stringify(snapshot.payload),
@@ -487,21 +556,18 @@ export class D1ApprovalStore implements ApprovalStore {
         )
         .run();
 
-    // The idempotent-create contract ("Decided requests never block a new
-    // one") must survive a concurrent decide-close. service.create mints a
-    // fresh crypto.randomUUID id, so the ONLY possible UNIQUE collision is the
-    // partial open-step index — a violation means an OPEN row existed at INSERT
-    // time. Between the failed INSERT and the #openFor SELECT (two D1
-    // round-trips) a concurrent decide()/transition CAS can close that row (its
-    // status leaves OPEN_STATUSES and the partial index), so #openFor returns
-    // null and the step is insertable again: retry the INSERT exactly ONCE
-    // (R-003 — bounded, never a loop). A still-open record or a non-unique
-    // error short-circuits before any retry.
+    // A UNIQUE collision can now be either the all-status exact fingerprint or
+    // the open-step index. Resolve the exact fingerprint FIRST: a decision may
+    // have landed after a reconciler's history read, and returning that terminal
+    // record is the atomic no-refile verdict. Otherwise retain the bounded
+    // decide-close retry for a different-fingerprint open row.
     try {
       await insert();
       return { record: snapshot, created: true };
     } catch (error) {
       if (!isUniqueViolation(error)) throw error;
+      const current = await this.#fingerprintFor(snapshot, stepKey);
+      if (current) return { record: current, created: false };
       const open = await this.#openFor(
         snapshot.workflowId,
         snapshot.runId,
@@ -518,6 +584,8 @@ export class D1ApprovalStore implements ApprovalStore {
       return { record: snapshot, created: true };
     } catch (error) {
       if (isUniqueViolation(error)) {
+        const current = await this.#fingerprintFor(snapshot, stepKey);
+        if (current) return { record: current, created: false };
         const open = await this.#openFor(
           snapshot.workflowId,
           snapshot.runId,
@@ -602,6 +670,32 @@ export class D1ApprovalStore implements ApprovalStore {
          LIMIT 1`,
       )
       .bind(this.tenantId, workflowId, runId, stepKey, ...OPEN_STATUSES)
+      .first<ApprovalRow>();
+    return row ? rowToRecord(row) : null;
+  }
+
+  async #fingerprintFor(
+    record: ApprovalRecord,
+    stepKey: string,
+  ): Promise<ApprovalRecord | null> {
+    if (record.stepPath === undefined || record.suspendedAt === undefined) {
+      return null;
+    }
+    const row = await this.#db
+      .prepare(
+        `SELECT * FROM ${TABLE}
+         WHERE tenant_id = ? AND workflow_id = ? AND run_id = ? AND step_key = ?
+           AND step_path IS NOT NULL AND suspended_at = ? AND resume_count IS ?
+         LIMIT 1`,
+      )
+      .bind(
+        this.tenantId,
+        record.workflowId,
+        record.runId,
+        stepKey,
+        record.suspendedAt,
+        record.resumeCount ?? null,
+      )
       .first<ApprovalRow>();
     return row ? rowToRecord(row) : null;
   }

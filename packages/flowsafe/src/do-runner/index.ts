@@ -12,20 +12,47 @@ export type {
 } from './cf-types.js';
 export type {
   D1StorageOptions,
+  PurgeExpiredBackgroundTasksOptions,
+  PurgeExpiredBackgroundTasksResult,
+  PurgeExpiredNotificationsOptions,
   PurgeExpiredRunsOptions,
+  PurgeExpiredScheduleTriggersOptions,
+  PurgeExpiredThreadStateOptions,
+  PurgeExpiredThreadsOptions,
+  PurgeExpiredThreadsResult,
   PurgeTenantOptions,
   PurgeTenantResult,
   SnapshotDatabase,
   SnapshotStatement,
   TenantArtifactPurger,
+  TenantMetadataPurgeCounter,
+  TenantMetadataPurgeTable,
+  TenantRangePurgeCounter,
+  TenantRangePurgeTable,
 } from './d1-storage.js';
 export {
+  BACKGROUND_TASK_TTL_PURGE_TABLES,
   createD1Storage,
   d1Changes,
   ensureSnapshotRunIdIndex,
+  NOTIFICATION_TTL_PURGE_TABLES,
+  purgeExpiredBackgroundTasks,
+  purgeExpiredNotifications,
+  purgeExpiredScheduleTriggers,
+  purgeExpiredThreadState,
+  purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
   purgeTenant,
+  RUN_TTL_PURGE_TABLES,
+  SCHEDULE_TRIGGER_TTL_PURGE_TABLES,
+  TENANT_METADATA_PURGE_TABLES,
+  TENANT_RANGE_PURGE_TABLES,
+  THREAD_STATE_TTL_PURGE_TABLES,
+  THREAD_TTL_PURGE_TABLES,
 } from './d1-storage.js';
+// The DO error taxonomy and its extension point: a host DO's own route states a
+// status by extending DoStatusError (see do-error-response.ts).
+export { DoStatusError, doErrorResponse } from './do-error-response.js';
 export { DurableObjectRunner } from './durable-object.js';
 export type { HubStreamEvent, PresenceMember } from './hub-do.js';
 export { HubDurableObject } from './hub-do.js';
@@ -45,10 +72,16 @@ export {
   tenantOwnsMemoryId,
 } from './memory-id.js';
 export {
+  assertMintableTenantId,
+  mintSaltedId,
   PATH_SAFE_ID_PATTERN,
+  RESERVED_TENANT_IDS,
   TENANT_ID_PATTERN,
   tenantOfRunId,
+  tenantOwnsSaltedId,
 } from './path-safe-id.js';
+export type { HostPubSub } from './pubsub.js';
+export { createHostPubSub } from './pubsub.js';
 export type { ResumeLedger, ResumeLedgerStorage } from './resume-ledger.js';
 export {
   DurableStorageResumeLedger,
@@ -70,3 +103,9 @@ export {
   UnknownRunError,
   UnknownWorkflowError,
 } from './runtime.js';
+export type { ThreadScope } from './thread-do.js';
+export { ThreadDurableObject, ThreadIdentityError } from './thread-do.js';
+export {
+  THREAD_ACTOR_HEADER,
+  THREAD_TENANT_HEADER,
+} from './thread-header.js';

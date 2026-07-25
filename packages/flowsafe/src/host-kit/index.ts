@@ -31,6 +31,7 @@ export {
 } from './do-run-topology.js';
 export { boolVar, type NumberVarOptions, numberVar } from './env-vars.js';
 export type {
+  BackgroundTasksCleanupConfig,
   FlowsafeWorker,
   FlowsafeWorkerConfig,
   FlowsafeWorkerContext,
@@ -58,6 +59,14 @@ export {
   type HubStubLike,
   type HubTopology,
 } from './hub-topology.js';
+// The agent-memory host boundary every memory-touching route calls
+// (docs/agent-memory-tenancy.md item 5).
+export {
+  assertNoClientMemoryIds,
+  requireOwnedMemoryId,
+  TCB_ONLY_MEMORY_FIELDS,
+  type TcbOnlyMemoryField,
+} from './memory-boundary.js';
 export type { WorkflowIdSource } from './registration.js';
 export { assertWorkflowsRegistered } from './registration.js';
 export { RunRouteError } from './run-route-error.js';
@@ -88,6 +97,16 @@ export {
   RESERVED_TENANT_IDS,
   TenantCollisionError,
 } from './tenant-registry.js';
+// The sanctioned way to reach a thread DO: it MINTS the tenant header
+// ThreadDurableObject verifies, so a route never forwards a client's own
+// (see thread-topology.ts — mint and verify ship together).
+export {
+  createThreadTopology,
+  type ThreadNamespaceLike,
+  type ThreadRequestInit,
+  type ThreadStubLike,
+  type ThreadTopology,
+} from './thread-topology.js';
 export type {
   HmacVerifierOptions,
   MintHmacTokenOptions,
