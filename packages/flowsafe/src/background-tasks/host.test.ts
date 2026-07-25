@@ -61,6 +61,18 @@ async function seededD1(): Promise<MastraCompositeStore> {
   return storage;
 }
 
+async function executionHostDependencies(tenantId = 'acme') {
+  const binding = d1DatabaseLike(openSqlite()) as never;
+  const storage = createD1Storage({
+    binding,
+    domains: createBackgroundTaskD1Domains({ binding, tenantId }),
+  });
+  await storage.init();
+  const pubsub = createHostPubSub();
+  const mastra = new Mastra({ storage, pubsub });
+  return { mastra, pubsub };
+}
+
 describe('BackgroundTaskHost — wiring', () => {
   it.each([
     { globalConcurrency: -1 },
@@ -217,6 +229,301 @@ describe('BackgroundTaskHost — wiring', () => {
   });
 });
 
+describe('BackgroundTaskHost — execution lifecycle', () => {
+  it('unwinds a partially failed worker start without initializing or shutting down the manager', async () => {
+    // #given
+    const { mastra, pubsub } = await executionHostDependencies();
+    const host = new BackgroundTaskHost({
+      mastra,
+      pubsub,
+      execution: { tenantId: 'acme' },
+      executors: {},
+    });
+    const primary = new Error('partial worker start');
+    const calls: string[] = [];
+    vi.spyOn(mastra, 'startWorkers').mockImplementation(async () => {
+      calls.push('start-workers');
+      throw primary;
+    });
+    vi.spyOn(mastra, 'stopWorkers').mockImplementation(async () => {
+      calls.push('stop-workers');
+    });
+    const init = vi.spyOn(host.manager, 'init');
+    const managerShutdown = vi.spyOn(host.manager, 'shutdown');
+
+    // #when / #then
+    await expect(host.boot()).rejects.toBe(primary);
+    expect(calls).toEqual(['start-workers', 'stop-workers']);
+    expect(init).not.toHaveBeenCalled();
+    expect(managerShutdown).not.toHaveBeenCalled();
+
+    await expect(host.shutdown()).resolves.toBeUndefined();
+    expect(calls).toEqual(['start-workers', 'stop-workers']);
+    expect(managerShutdown).not.toHaveBeenCalled();
+  });
+
+  it('unwinds a failed manager init in reverse order and preserves the primary error', async () => {
+    // #given
+    const { mastra, pubsub } = await executionHostDependencies();
+    const host = new BackgroundTaskHost({
+      mastra,
+      pubsub,
+      execution: { tenantId: 'acme' },
+      executors: {},
+    });
+    const primary = new Error('manager init');
+    const calls: string[] = [];
+    vi.spyOn(mastra, 'startWorkers').mockImplementation(async () => {
+      calls.push('start-workers');
+    });
+    vi.spyOn(host.manager, 'init').mockImplementation(async () => {
+      calls.push('manager-init');
+      throw primary;
+    });
+    vi.spyOn(host.manager, 'shutdown').mockImplementation(async () => {
+      calls.push('manager-shutdown');
+    });
+    vi.spyOn(mastra, 'stopWorkers').mockImplementation(async () => {
+      calls.push('stop-workers');
+    });
+
+    // #when / #then
+    await expect(host.boot()).rejects.toBe(primary);
+    expect(calls).toEqual([
+      'start-workers',
+      'manager-init',
+      'manager-shutdown',
+      'stop-workers',
+    ]);
+  });
+
+  it('aggregates boot cleanup failures after the primary error in cleanup order', async () => {
+    // #given
+    const { mastra, pubsub } = await executionHostDependencies();
+    const host = new BackgroundTaskHost({
+      mastra,
+      pubsub,
+      execution: { tenantId: 'acme' },
+      executors: {},
+    });
+    const primary = new Error('manager init');
+    const managerCleanup = new Error('manager cleanup');
+    const workerCleanup = new Error('worker cleanup');
+    const calls: string[] = [];
+    vi.spyOn(mastra, 'startWorkers').mockImplementation(async () => {
+      calls.push('start-workers');
+    });
+    vi.spyOn(host.manager, 'init').mockImplementation(async () => {
+      calls.push('manager-init');
+      throw primary;
+    });
+    vi.spyOn(host.manager, 'shutdown').mockImplementation(async () => {
+      calls.push('manager-shutdown');
+      throw managerCleanup;
+    });
+    vi.spyOn(mastra, 'stopWorkers').mockImplementation(async () => {
+      calls.push('stop-workers');
+      throw workerCleanup;
+    });
+
+    // #when
+    const failure = await host.boot().catch((error: unknown) => error);
+
+    // #then
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([
+      primary,
+      managerCleanup,
+      workerCleanup,
+    ]);
+    expect((failure as Error).cause).toBe(primary);
+    expect(calls).toEqual([
+      'start-workers',
+      'manager-init',
+      'manager-shutdown',
+      'stop-workers',
+    ]);
+  });
+
+  it('shuts the manager down before stopping workers', async () => {
+    // #given
+    const { mastra, pubsub } = await executionHostDependencies();
+    const host = new BackgroundTaskHost({
+      mastra,
+      pubsub,
+      execution: { tenantId: 'acme' },
+      executors: {},
+    });
+    vi.spyOn(mastra, 'startWorkers').mockResolvedValue();
+    vi.spyOn(host.manager, 'init').mockResolvedValue();
+    await host.boot();
+    const calls: string[] = [];
+    vi.spyOn(host.manager, 'shutdown').mockImplementation(async () => {
+      calls.push('manager-shutdown');
+    });
+    vi.spyOn(mastra, 'stopWorkers').mockImplementation(async () => {
+      calls.push('stop-workers');
+    });
+
+    // #when
+    await host.shutdown();
+
+    // #then
+    expect(calls).toEqual(['manager-shutdown', 'stop-workers']);
+  });
+
+  it('closes the enqueue gate synchronously once boot has settled', async () => {
+    // #given
+    const storage = new InMemoryStore();
+    const pubsub = createHostPubSub();
+    const host = new BackgroundTaskHost({
+      mastra: new Mastra({ storage, pubsub }),
+      pubsub,
+      executors: {},
+    });
+    await host.boot();
+
+    // #when — do not await shutdown before racing a new enqueue against it.
+    const shutdown = host.shutdown();
+    const enqueue = host.manager.enqueue({
+      runId: 'acme_r1',
+      toolName: 'late',
+      toolCallId: 'call-late',
+      args: {},
+      agentId: 'agent-1',
+    });
+
+    // #then — BackgroundTaskManager.shutdown flips its guard before its first
+    // await, so the task cannot persist or publish after consumers disappear.
+    await expect(enqueue).rejects.toThrow(/shutting down/i);
+    await expect(shutdown).resolves.toBeUndefined();
+    const tasks = await storage.getStore('backgroundTasks');
+    await expect(tasks?.listTasks({ runId: 'acme_r1' })).resolves.toMatchObject(
+      {
+        tasks: [],
+      },
+    );
+  });
+
+  it('treats shutdown as terminal even when boot was never started', async () => {
+    const host = new BackgroundTaskHost({
+      mastra: new Mastra({ storage: new InMemoryStore() }),
+      pubsub: createHostPubSub(),
+      executors: {},
+    });
+
+    await host.shutdown();
+
+    await expect(host.boot()).rejects.toThrow(/shutting down/i);
+  });
+
+  it('waits for an in-flight boot before tearing its initialized components down', async () => {
+    // #given
+    const { mastra, pubsub } = await executionHostDependencies();
+    const host = new BackgroundTaskHost({
+      mastra,
+      pubsub,
+      execution: { tenantId: 'acme' },
+      executors: {},
+    });
+    let releaseStart: () => void = () => undefined;
+    const startReleased = new Promise<void>((resolve) => {
+      releaseStart = resolve;
+    });
+    let signalStart: () => void = () => undefined;
+    const startEntered = new Promise<void>((resolve) => {
+      signalStart = resolve;
+    });
+    const calls: string[] = [];
+    vi.spyOn(mastra, 'startWorkers').mockImplementation(async () => {
+      calls.push('start-workers');
+      signalStart();
+      await startReleased;
+    });
+    vi.spyOn(host.manager, 'init').mockImplementation(async () => {
+      calls.push('manager-init');
+    });
+    vi.spyOn(host.manager, 'shutdown').mockImplementation(async () => {
+      calls.push('manager-shutdown');
+    });
+    vi.spyOn(mastra, 'stopWorkers').mockImplementation(async () => {
+      calls.push('stop-workers');
+    });
+
+    // #when
+    const boot = host.boot();
+    const shutdown = host.shutdown();
+    await startEntered;
+    expect(calls).toEqual(['start-workers']);
+    releaseStart();
+    await Promise.all([boot, shutdown]);
+
+    // #then
+    expect(calls).toEqual([
+      'start-workers',
+      'manager-init',
+      'manager-shutdown',
+      'stop-workers',
+    ]);
+  });
+
+  it('still stops workers and preserves a lone manager shutdown failure', async () => {
+    // #given
+    const { mastra, pubsub } = await executionHostDependencies();
+    const host = new BackgroundTaskHost({
+      mastra,
+      pubsub,
+      execution: { tenantId: 'acme' },
+      executors: {},
+    });
+    vi.spyOn(mastra, 'startWorkers').mockResolvedValue();
+    vi.spyOn(host.manager, 'init').mockResolvedValue();
+    await host.boot();
+    const primary = new Error('manager shutdown');
+    const calls: string[] = [];
+    vi.spyOn(host.manager, 'shutdown').mockImplementation(async () => {
+      calls.push('manager-shutdown');
+      throw primary;
+    });
+    vi.spyOn(mastra, 'stopWorkers').mockImplementation(async () => {
+      calls.push('stop-workers');
+    });
+
+    // #when / #then
+    await expect(host.shutdown()).rejects.toBe(primary);
+    expect(calls).toEqual(['manager-shutdown', 'stop-workers']);
+  });
+
+  it('aggregates manager and worker shutdown failures in operation order', async () => {
+    // #given
+    const { mastra, pubsub } = await executionHostDependencies();
+    const host = new BackgroundTaskHost({
+      mastra,
+      pubsub,
+      execution: { tenantId: 'acme' },
+      executors: {},
+    });
+    vi.spyOn(mastra, 'startWorkers').mockResolvedValue();
+    vi.spyOn(host.manager, 'init').mockResolvedValue();
+    await host.boot();
+    const primary = new Error('manager shutdown');
+    const workerCleanup = new Error('worker shutdown');
+    vi.spyOn(host.manager, 'shutdown').mockRejectedValue(primary);
+    vi.spyOn(mastra, 'stopWorkers').mockRejectedValue(workerCleanup);
+
+    // #when
+    const failure = await host.shutdown().catch((error: unknown) => error);
+
+    // #then
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([
+      primary,
+      workerCleanup,
+    ]);
+    expect((failure as Error).cause).toBe(primary);
+  });
+});
+
 describe('BackgroundTaskHost — on D1 (R-B1: persistence + recovery seam, no body execution)', () => {
   let storage: MastraCompositeStore;
 
@@ -314,17 +621,17 @@ describe('BackgroundTaskHost — execution-mode recovery on D1', () => {
     await storage.init();
     const pubsub = createHostPubSub();
     const mastra = new Mastra({ storage, pubsub });
-    const hostPubsub = mastra.pubsub as ReturnType<typeof createHostPubSub>;
     const execute = vi.fn(async () => ({ recovered: true }));
     const host = new BackgroundTaskHost({
       mastra,
-      pubsub: hostPubsub,
+      pubsub,
       execution: { tenantId: 'acme' },
       executors: { longResearch: { execute } },
     });
 
     let booted = false;
     try {
+      expect(mastra.pubsub).not.toBe(pubsub);
       await host.boot();
       booted = true;
       await vi.waitFor(

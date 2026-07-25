@@ -185,6 +185,220 @@ describe('createNotificationDispatchTick', () => {
     });
   });
 
+  it('plans the full group before packing so urgent rows cross the 100-id boundary', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    for (let index = 0; index < 100; index += 1) {
+      await storage.createNotification({
+        id: `low-${index}`,
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+        agentId: 'agent',
+        source: 'test',
+        kind: 'ready',
+        summary: `low ${index}`,
+        priority: 'low',
+        deliverAt: new Date(NOW.getTime() - 2_000),
+      });
+    }
+    await storage.createNotification({
+      id: 'urgent',
+      threadId: 'acme_thread',
+      resourceId: 'acme_resource',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'ready',
+      summary: 'urgent',
+      priority: 'urgent',
+      deliverAt: new Date(NOW.getTime() - 1_000),
+    });
+    const bodies: Array<{ notificationIds: string[] }> = [];
+    const send = vi.fn(async (_tenant, _thread, _path, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as {
+        notificationIds: string[];
+      };
+      bodies.push(body);
+      return new Response(
+        JSON.stringify({
+          delivered: body.notificationIds.length,
+          failed: 0,
+        }),
+      );
+    });
+    const tick = createNotificationDispatchTick({
+      storage,
+      topology: { send } as unknown as ThreadTopology,
+      resolveTenant: tenant,
+      now: () => NOW,
+      limit: 101,
+    });
+
+    expect(await tick()).toEqual({ due: 101, delivered: 101, failed: 0 });
+    expect(bodies.map((body) => body.notificationIds.length)).toEqual([100, 1]);
+    expect(bodies[0]?.notificationIds[0]).toBe('urgent');
+  });
+
+  it('keeps a route-sized summary intact while packing higher-priority individuals first', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const summaryIds: string[] = [];
+    const createSummary = async (index: number) => {
+      const id = `summary-${index}`;
+      summaryIds.push(id);
+      await storage.createNotification({
+        id,
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+        agentId: 'agent',
+        source: 'test',
+        kind: 'digest',
+        summary: id,
+        priority: 'medium',
+        summaryAt: new Date(NOW.getTime() - 3_000),
+      });
+    };
+    for (let index = 0; index < 30; index += 1) await createSummary(index);
+    for (let index = 0; index < 60; index += 1) {
+      await storage.createNotification({
+        id: `urgent-${index}`,
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+        agentId: 'agent',
+        source: 'test',
+        kind: 'ready',
+        summary: `urgent ${index}`,
+        priority: 'urgent',
+        deliverAt: new Date(NOW.getTime() - 2_000),
+      });
+    }
+    for (let index = 30; index < 60; index += 1) await createSummary(index);
+    const batches: string[][] = [];
+    const send = vi.fn(async (_tenant, _thread, _path, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as {
+        notificationIds: string[];
+      };
+      batches.push(body.notificationIds);
+      return new Response(
+        JSON.stringify({
+          delivered: body.notificationIds.length,
+          failed: 0,
+        }),
+      );
+    });
+    const tick = createNotificationDispatchTick({
+      storage,
+      topology: { send } as unknown as ThreadTopology,
+      resolveTenant: tenant,
+      now: () => NOW,
+      limit: 120,
+    });
+
+    expect(await tick()).toEqual({ due: 120, delivered: 120, failed: 0 });
+    expect(batches.map((batch) => batch.length)).toEqual([60, 60]);
+    expect(batches[0]).toEqual(
+      Array.from({ length: 60 }, (_, index) => `urgent-${index}`),
+    );
+    expect(batches[1]).toEqual(summaryIds);
+  });
+
+  it('fragments an oversized summary into consecutive summary-only requests', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    for (let index = 0; index < 205; index += 1) {
+      await storage.createNotification({
+        id: `summary-${index}`,
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+        agentId: 'agent',
+        source: 'test',
+        kind: 'digest',
+        summary: `notification ${index}`,
+        summaryAt: new Date(NOW.getTime() - 1),
+      });
+    }
+    const batches: string[][] = [];
+    const send = vi.fn(async (_tenant, _thread, _path, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as {
+        notificationIds: string[];
+      };
+      batches.push(body.notificationIds);
+      return new Response(
+        JSON.stringify({
+          delivered: body.notificationIds.length,
+          failed: 0,
+        }),
+      );
+    });
+    const tick = createNotificationDispatchTick({
+      storage,
+      topology: { send } as unknown as ThreadTopology,
+      resolveTenant: tenant,
+      now: () => NOW,
+      limit: 205,
+    });
+
+    expect(await tick()).toEqual({ due: 205, delivered: 205, failed: 0 });
+    expect(batches.map((batch) => batch.length)).toEqual([100, 100, 5]);
+    expect(batches.flat()).toEqual(
+      Array.from({ length: 205 }, (_, index) => `summary-${index}`),
+    );
+  });
+
+  it('carries one echoed thread-state snapshot within a group and resets it for the next group', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    for (const tenantId of ['acme', 'globex']) {
+      for (let index = 0; index < 101; index += 1) {
+        await storage.createNotification({
+          id: `${tenantId}-${index}`,
+          threadId: `${tenantId}_thread`,
+          resourceId: `${tenantId}_resource`,
+          agentId: 'agent',
+          source: 'test',
+          kind: 'ready',
+          summary: `${tenantId} ${index}`,
+          deliverAt: new Date(NOW.getTime() - 1),
+        });
+      }
+    }
+    const bodies: Array<{
+      threadId: string;
+      batchThreadState: 'active' | 'idle' | null;
+    }> = [];
+    const send = vi.fn(
+      async (
+        _tenant: TenantContext,
+        threadId: string,
+        _path: string,
+        init: RequestInit,
+      ) => {
+        const body = JSON.parse(String(init.body)) as {
+          notificationIds: string[];
+          batchThreadState: 'active' | 'idle' | null;
+        };
+        bodies.push({ threadId, batchThreadState: body.batchThreadState });
+        return new Response(
+          JSON.stringify({
+            delivered: body.notificationIds.length,
+            failed: 0,
+            batchThreadState: threadId.startsWith('acme_') ? 'active' : 'idle',
+          }),
+        );
+      },
+    );
+    const tick = createNotificationDispatchTick({
+      storage,
+      topology: { send } as unknown as ThreadTopology,
+      resolveTenant: tenant,
+      now: () => NOW,
+      limit: 202,
+    });
+
+    expect(await tick()).toEqual({ due: 202, delivered: 202, failed: 0 });
+    expect(bodies).toEqual([
+      { threadId: 'acme_thread', batchThreadState: null },
+      { threadId: 'acme_thread', batchThreadState: 'active' },
+      { threadId: 'globex_thread', batchThreadState: null },
+      { threadId: 'globex_thread', batchThreadState: 'idle' },
+    ]);
+  });
+
   it('chunks 205 records into route-valid batches of 100, 100, and 5', async () => {
     const storage = new InMemoryNotificationsStorage();
     for (let index = 0; index < 205; index += 1) {

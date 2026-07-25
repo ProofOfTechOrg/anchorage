@@ -498,10 +498,9 @@ export class DemoBackgroundTasks {
         });
         await storage.init();
         const mastra = new Mastra({ storage, pubsub });
-        const hostPubsub = mastra.pubsub as ReturnType<typeof createHostPubSub>;
         const host = new BackgroundTaskHost({
           mastra,
-          pubsub: hostPubsub,
+          pubsub,
           execution: { tenantId },
           executors: {
             bgProbe: {

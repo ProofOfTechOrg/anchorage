@@ -443,13 +443,20 @@ R-B1/R-B2/R-B3 and tenant-blind recovery without a core version bump.
 Regression closeout (2026-07-25): schedule CRUD now follows core 1.50's
 kind-specific contract and the tick clones stored agent targets through
 `ScheduleInputSchema`, stripping reserved and object meta-keys before dispatch.
-D1 notification keyed creation uses atomic conditional insert + guarded
-coalescing CAS, partial updates use targeted SQL, due reads are SQL-ordered, and
-thread delivery is serialized and chunked at 100 IDs. Durable aggregate
+D1 notification keyed creation—including explicit ids—uses atomic conditional
+insert + complete-identity guarded coalescing CAS, insertion ordinals preserve
+core's `Map` target order across supplied timestamps and same-id upserts, partial
+updates compose with concurrent coalescing, the ordinal migration is atomic
+against rollback writers, and due reads are SQL-ordered.
+Thread delivery is serialized, priority-planned across summaries + individuals,
+batch-state-stable across 100-id chunks, and suppresses summarized high rows
+while the thread was active. Durable aggregate
 `untilIdle` streams no longer double-register and every post-observation resume
 failure closes the live stream. Background-task tenants/configuration fail
-synchronously, SSE scopes the real nested Mastra payload, and both spike
-verifiers share a lifecycle that proves the port is refused before restart.
+synchronously, execution accepts the raw constructor pubsub despite Mastra's
+public proxy, boot failures unwind partial workers/subscriptions, shutdown closes
+enqueue before workers, SSE scopes the real nested Mastra payload, and both
+spike verifiers share a lifecycle that proves the port is refused before restart.
 
 Guardrails control room + one-page demo (control room merged 2026-07-14,
 PR #21; page unified 2026-07-15): the post-login showcase is ONE narrative

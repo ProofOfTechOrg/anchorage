@@ -40,6 +40,134 @@ interface DeliveryGroup {
   records: NotificationRecord[];
 }
 
+export type NotificationDispatchItem =
+  | {
+      type: 'individual';
+      record: NotificationRecord;
+      priority: NotificationRecord['priority'];
+      createdAt: Date;
+    }
+  | {
+      type: 'summary';
+      records: NotificationRecord[];
+      priority: NotificationRecord['priority'];
+      createdAt: Date;
+    };
+
+const DELIVERY_PRIORITY: Record<NotificationRecord['priority'], number> = {
+  urgent: 0,
+  high: 1,
+  medium: 2,
+  low: 3,
+};
+
+function isSummaryDue(record: NotificationRecord, now: Date): boolean {
+  return Boolean(
+    record.summaryAt && record.summaryAt.getTime() <= now.getTime(),
+  );
+}
+
+/**
+ * Build the same logical delivery items as Mastra's dispatcher. Individuals
+ * are constructed before the aggregate summary so a stable equal-key sort
+ * preserves Mastra's individual-before-summary tie behavior.
+ */
+export function planNotificationDispatch(
+  records: NotificationRecord[],
+  now: Date,
+): NotificationDispatchItem[] {
+  const summaryRecords: NotificationRecord[] = [];
+  const individualRecords: NotificationRecord[] = [];
+  for (const record of records) {
+    (isSummaryDue(record, now) ? summaryRecords : individualRecords).push(
+      record,
+    );
+  }
+
+  const items: NotificationDispatchItem[] = individualRecords.map((record) => ({
+    type: 'individual',
+    record,
+    priority: record.priority,
+    createdAt: record.createdAt,
+  }));
+  const firstSummary = summaryRecords[0];
+  if (firstSummary) {
+    const priority = summaryRecords.reduce(
+      (highest, record) =>
+        DELIVERY_PRIORITY[record.priority] < DELIVERY_PRIORITY[highest]
+          ? record.priority
+          : highest,
+      'low' as NotificationRecord['priority'],
+    );
+    const createdAt = summaryRecords.reduce(
+      (earliest, record) =>
+        record.createdAt.getTime() < earliest.getTime()
+          ? record.createdAt
+          : earliest,
+      firstSummary.createdAt,
+    );
+    items.push({
+      type: 'summary',
+      records: summaryRecords,
+      priority,
+      createdAt,
+    });
+  }
+
+  items.sort(
+    (left, right) =>
+      DELIVERY_PRIORITY[left.priority] - DELIVERY_PRIORITY[right.priority] ||
+      left.createdAt.getTime() - right.createdAt.getTime(),
+  );
+  return items;
+}
+
+/**
+ * Pack logical items into route-valid requests without splitting a summary
+ * that fits the route limit. An oversized summary is emitted as consecutive,
+ * summary-only fragments because the trusted route has a strict 100-id bound.
+ */
+export function packNotificationDispatchItems(
+  items: NotificationDispatchItem[],
+): NotificationRecord[][] {
+  const batches: NotificationRecord[][] = [];
+  let current: NotificationRecord[] = [];
+  const flush = () => {
+    if (current.length === 0) return;
+    batches.push(current);
+    current = [];
+  };
+
+  for (const item of items) {
+    if (item.type === 'individual') {
+      if (current.length === MAX_NOTIFICATION_DISPATCH_IDS) flush();
+      current.push(item.record);
+      continue;
+    }
+
+    if (item.records.length > MAX_NOTIFICATION_DISPATCH_IDS) {
+      flush();
+      for (
+        let offset = 0;
+        offset < item.records.length;
+        offset += MAX_NOTIFICATION_DISPATCH_IDS
+      ) {
+        batches.push(
+          item.records.slice(offset, offset + MAX_NOTIFICATION_DISPATCH_IDS),
+        );
+      }
+      continue;
+    }
+
+    if (current.length + item.records.length > MAX_NOTIFICATION_DISPATCH_IDS) {
+      flush();
+    }
+    current.push(...item.records);
+  }
+  flush();
+  return batches;
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -135,15 +263,11 @@ export function createNotificationDispatchTick(
     }
 
     for (const group of groups.values()) {
-      for (
-        let offset = 0;
-        offset < group.records.length;
-        offset += MAX_NOTIFICATION_DISPATCH_IDS
-      ) {
-        const records = group.records.slice(
-          offset,
-          offset + MAX_NOTIFICATION_DISPATCH_IDS,
-        );
+      const batches = packNotificationDispatchItems(
+        planNotificationDispatch(group.records, now),
+      );
+      let batchThreadState: 'active' | 'idle' | null = null;
+      for (const records of batches) {
         try {
           const tenant = options.resolveTenant(group.tenantId);
           const response = await options.topology.send(
@@ -158,6 +282,7 @@ export function createNotificationDispatchTick(
                 resourceId: group.resourceId,
                 agentId: group.agentId,
                 now: now.toISOString(),
+                batchThreadState,
               }),
             },
           );
@@ -169,9 +294,17 @@ export function createNotificationDispatchTick(
           const body = (await response.json()) as {
             delivered?: number;
             failed?: number;
+            batchThreadState?: unknown;
           };
           result.delivered += body.delivered ?? 0;
           result.failed += body.failed ?? 0;
+          if (
+            batchThreadState === null &&
+            (body.batchThreadState === 'active' ||
+              body.batchThreadState === 'idle')
+          ) {
+            batchThreadState = body.batchThreadState;
+          }
         } catch (error) {
           result.failed += records.length;
           for (const record of records) {

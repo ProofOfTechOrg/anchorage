@@ -42,7 +42,10 @@ import {
 import { isRuntimeDrivenAgent } from '../agent-runner/index.js';
 import { mintSaltedId, type ThreadScope } from '../do-runner/index.js';
 import { internalErrorResponse } from '../internal-error-response.js';
-import { MAX_NOTIFICATION_DISPATCH_IDS } from './notification-dispatch.js';
+import {
+  MAX_NOTIFICATION_DISPATCH_IDS,
+  planNotificationDispatch,
+} from './notification-dispatch.js';
 
 /**
  * The idle-thread delivery behavior a send may ask for. `wake` starts a run
@@ -386,6 +389,22 @@ async function handleNotificationDispatch(options: {
   if (Number.isNaN(now.getTime())) {
     return json({ error: 'now must be an ISO timestamp' }, 400);
   }
+  const carriesBatchThreadState = Object.hasOwn(
+    options.body,
+    'batchThreadState',
+  );
+  const requestedBatchThreadState = options.body.batchThreadState;
+  if (
+    carriesBatchThreadState &&
+    requestedBatchThreadState !== null &&
+    requestedBatchThreadState !== 'active' &&
+    requestedBatchThreadState !== 'idle'
+  ) {
+    return json(
+      { error: 'batchThreadState must be null, active, or idle' },
+      400,
+    );
+  }
 
   const records: NotificationRecord[] = [];
   let skipped = 0;
@@ -415,6 +434,18 @@ async function handleNotificationDispatch(options: {
     }
     records.push(current);
   }
+
+  const batchThreadState: 'active' | 'idle' =
+    requestedBatchThreadState === 'active' ||
+    requestedBatchThreadState === 'idle'
+      ? requestedBatchThreadState
+      : typeof options.agent.getActiveThreadRunId === 'function' &&
+          options.agent.getActiveThreadRunId({
+            threadId: options.threadId,
+            resourceId,
+          })
+        ? 'active'
+        : 'idle';
 
   let delivered = 0;
   let failed = 0;
@@ -472,35 +503,64 @@ async function handleNotificationDispatch(options: {
     return result.signal.id;
   };
 
-  const summaries = records.filter(
-    (record) => record.summaryAt && record.summaryAt.getTime() <= now.getTime(),
-  );
-  if (summaries.length > 0) {
-    try {
-      const signal = createNotificationSummarySignal(
-        summarizeNotifications(summaries),
-      );
-      const signalId = summaries.every((record) => record.priority === 'low')
-        ? await persistWithoutWake(signal)
-        : await send(signal);
-      for (const record of summaries) {
-        await options.storage.updateNotification({
-          id: record.id,
-          threadId: record.threadId,
-          summaryAt: null,
-          summarySignalId: signalId,
-          lastDeliveryAttemptAt: now,
-        });
-        delivered += 1;
+  for (const item of planNotificationDispatch(records, now)) {
+    if (item.type === 'summary') {
+      try {
+        const signal = createNotificationSummarySignal(
+          summarizeNotifications(item.records),
+        );
+        const signalId = item.records.every(
+          (record) => record.priority === 'low',
+        )
+          ? await persistWithoutWake(signal)
+          : await send(signal);
+        for (const record of item.records) {
+          await options.storage.updateNotification({
+            id: record.id,
+            threadId: record.threadId,
+            summaryAt: null,
+            summarySignalId: signalId,
+            lastDeliveryAttemptAt: now,
+          });
+          delivered += 1;
+        }
+      } catch (error) {
+        for (const record of item.records) await updateFailure(record, error);
       }
-    } catch (error) {
-      for (const record of summaries) await updateFailure(record, error);
+      continue;
     }
-  }
 
-  for (const record of records) {
-    if (summaries.includes(record)) continue;
+    const selected = item.record;
     try {
+      const record = await options.storage.getNotification({
+        threadId: selected.threadId,
+        id: selected.id,
+      });
+      const summaryDue = Boolean(
+        record?.summaryAt && record.summaryAt.getTime() <= now.getTime(),
+      );
+      const deliveryDue = Boolean(
+        record?.deliverAt && record.deliverAt.getTime() <= now.getTime(),
+      );
+      if (
+        record?.status !== 'pending' ||
+        record.deliveredSignalId ||
+        record.resourceId !== resourceId ||
+        record.agentId !== options.agentId ||
+        summaryDue ||
+        !deliveryDue
+      ) {
+        skipped += 1;
+        continue;
+      }
+      if (
+        record.priority === 'high' &&
+        record.summarySignalId &&
+        batchThreadState === 'active'
+      ) {
+        skipped += 1;
+        continue;
+      }
       const signalId = await send(
         createNotificationSignal({
           ...record,
@@ -517,7 +577,7 @@ async function handleNotificationDispatch(options: {
       });
       delivered += 1;
     } catch (error) {
-      await updateFailure(record, error);
+      await updateFailure(selected, error);
     }
   }
 
@@ -525,6 +585,7 @@ async function handleNotificationDispatch(options: {
     delivered,
     failed,
     ...(skipped > 0 ? { skipped } : {}),
+    ...(carriesBatchThreadState ? { batchThreadState } : {}),
   });
 }
 

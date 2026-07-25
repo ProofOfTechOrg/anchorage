@@ -30,7 +30,8 @@
 // adapter and a task domain bound to the same tenant. One DO isolate owns that
 // manager and both domains, so core's tenant-blind recovery sees only that
 // tenant's rows. `boot()` then starts Mastra's public evented workers on the
-// manager's pubsub identity. Persistence-only hosts retain the earlier warning.
+// raw pubsub instance the caller passed to Mastra. Persistence-only hosts retain
+// the earlier warning.
 //
 // Core still keys an internal `__background-task` workflow by the unsalted task
 // ID. The tenant-scoped store, TTL purge, and offboarding paths therefore delete
@@ -65,12 +66,14 @@ export interface BackgroundTaskHostOptions {
    */
   mastra: Mastra;
   /**
-   * The DO's ONE pubsub identity (DL-001, `createHostPubSub()`). REQUIRED: the
-   * manager both publishes dispatch events and subscribes the worker callback on
-   * it, and inside a DO one isolate serializes publisher and subscriber, so an
-   * in-process `EventEmitterPubSub` is exactly right (no cross-process bus). A
-   * host that streams lifecycle events to its hub passes the SAME instance it
-   * gave `init()`.
+   * The DO's ONE raw pubsub instance (DL-001, `createHostPubSub()`). Pass this
+   * same object to `new Mastra({ pubsub })`; Mastra 1.50 exposes a proxy from
+   * its public `pubsub` getter, so that getter is not the constructor identity.
+   * The manager both publishes dispatch events and subscribes the worker
+   * callback on the raw instance, and inside a DO one isolate serializes
+   * publisher and subscriber, so an in-process `EventEmitterPubSub` is exactly
+   * right (no cross-process bus). A host that streams lifecycle events to its
+   * hub also passes this same raw instance to `init()`.
    */
   pubsub: HostPubSub;
   /**
@@ -192,6 +195,11 @@ export class BackgroundTaskHost {
   readonly #executors: Record<string, ToolExecutor>;
   readonly #execution?: { tenantId: string };
   #booted?: Promise<void>;
+  #bootSettled = false;
+  #managerNeedsShutdown = false;
+  #workersNeedStop = false;
+  #shutdownRequested = false;
+  #shutdown?: Promise<void>;
 
   constructor(options: BackgroundTaskHostOptions) {
     validateManagerConfig(options.manager);
@@ -213,13 +221,21 @@ export class BackgroundTaskHost {
    * missing, re-register the static executors, start execution-mode workflow
    * workers, THEN call `init(pubsub)` — whose internal `recoverStaleTasks()`
    * re-drives any task the evicted instance left mid-flight. Executors and the
-   * workflow subscriber both go in BEFORE recovery publishes work. Memoized per
+   * workflow subscriber both go in BEFORE recovery publishes work. A failed
+   * startup unwinds attempted components in reverse order. Memoized per
    * instance: `init` is itself idempotent (initPromise), and `boot()` from both
    * `fetch()` and `alarm()` must not double-register.
    */
   boot(): Promise<void> {
+    if (this.#shutdownRequested) {
+      return Promise.reject(
+        new Error('background-tasks: host is shutting down'),
+      );
+    }
     if (!this.#booted) {
-      this.#booted = this.#doBoot();
+      this.#booted = this.#doBoot().finally(() => {
+        this.#bootSettled = true;
+      });
     }
     return this.#booted;
   }
@@ -252,19 +268,44 @@ export class BackgroundTaskHost {
           'background-tasks: execution requires a task store branded for the same tenant',
         );
       }
-      if (this.#mastra.pubsub !== this.#pubsub) {
-        throw new Error(
-          'background-tasks: manager, Mastra, and host must share one pubsub identity',
-        );
-      }
     } else {
       await this.#warnIfBodiesCannotExecute();
     }
     for (const [toolName, executor] of Object.entries(this.#executors)) {
       this.manager.registerStaticExecutor(toolName, executor);
     }
-    if (this.#execution) await this.#mastra.startWorkers();
-    await this.manager.init(this.#pubsub);
+    try {
+      if (this.#execution) {
+        this.#workersNeedStop = true;
+        await this.#mastra.startWorkers();
+      }
+      this.#managerNeedsShutdown = true;
+      await this.manager.init(this.#pubsub);
+    } catch (primary) {
+      const cleanupErrors: unknown[] = [];
+      if (this.#managerNeedsShutdown) {
+        try {
+          await this.manager.shutdown();
+          this.#managerNeedsShutdown = false;
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
+      if (this.#workersNeedStop) {
+        try {
+          await this.#mastra.stopWorkers();
+          this.#workersNeedStop = false;
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
+      if (cleanupErrors.length === 0) throw primary;
+      throw new AggregateError(
+        [primary, ...cleanupErrors],
+        'background-tasks: boot failed and cleanup also failed',
+        { cause: primary },
+      );
+    }
   }
 
   async #warnIfBodiesCannotExecute(): Promise<void> {
@@ -293,9 +334,54 @@ export class BackgroundTaskHost {
     await this.manager.cleanup();
   }
 
-  /** Graceful teardown — drains the manager's cleanup interval + in-flight state. */
+  /**
+   * Graceful teardown. Stop the manager first: its shutdown flag rejects new
+   * enqueues synchronously before the workflow consumers disappear. Worker
+   * teardown is still attempted if manager teardown fails.
+   */
+  async #doShutdown(): Promise<void> {
+    if (this.#booted && !this.#bootSettled) {
+      try {
+        await this.#booted;
+      } catch {
+        // #doBoot already unwound every component it managed to stop. Any
+        // component whose cleanup failed remains flagged for the retry below.
+      }
+    }
+    const errors: unknown[] = [];
+    if (this.#managerNeedsShutdown) {
+      try {
+        await this.manager.shutdown();
+        this.#managerNeedsShutdown = false;
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (this.#workersNeedStop) {
+      try {
+        await this.#mastra.stopWorkers();
+        this.#workersNeedStop = false;
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) {
+      throw new AggregateError(errors, 'background-tasks: shutdown failed', {
+        cause: errors[0],
+      });
+    }
+  }
+
   async shutdown(): Promise<void> {
-    if (this.#execution) await this.#mastra.stopWorkers();
-    await this.manager.shutdown();
+    this.#shutdownRequested = true;
+    if (this.#shutdown) return this.#shutdown;
+    const pending = this.#doShutdown();
+    this.#shutdown = pending;
+    try {
+      await pending;
+    } finally {
+      if (this.#shutdown === pending) this.#shutdown = undefined;
+    }
   }
 }

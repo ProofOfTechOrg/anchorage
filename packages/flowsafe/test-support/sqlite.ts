@@ -43,7 +43,19 @@ export function openSqlite(): SqliteDatabase {
  * Returns unknown: callers cast to the D1Database their seam needs.
  */
 export function d1DatabaseLike(db: SqliteDatabase): unknown {
+  const runSync = Symbol('runSync');
+  let batchTail: Promise<void> = Promise.resolve();
+
   function statement(sql: string, params: unknown[]): Record<string, unknown> {
+    const execute = () => {
+      const outcome = db.prepare(sql).run(...params) as {
+        changes?: number | bigint;
+      };
+      return {
+        success: true,
+        meta: { changes: Number(outcome?.changes ?? 0) },
+      };
+    };
     return {
       bind: (...values: unknown[]) => statement(sql, values),
       first: async (column?: string) => {
@@ -53,15 +65,8 @@ export function d1DatabaseLike(db: SqliteDatabase): unknown {
         if (row === undefined) return null;
         return column !== undefined ? (row[column] ?? null) : row;
       },
-      run: async () => {
-        const outcome = db.prepare(sql).run(...params) as {
-          changes?: number | bigint;
-        };
-        return {
-          success: true,
-          meta: { changes: Number(outcome?.changes ?? 0) },
-        };
-      },
+      run: async () => execute(),
+      [runSync]: execute,
       all: async () => ({
         success: true,
         results: db.prepare(sql).all(...params),
@@ -81,10 +86,32 @@ export function d1DatabaseLike(db: SqliteDatabase): unknown {
       db.exec(sql);
       return { count: 1, duration: 0 };
     },
-    batch: async (statements: Array<{ run: () => Promise<unknown> }>) => {
-      const results = [];
-      for (const stmt of statements) results.push(await stmt.run());
-      return results;
+    batch: (
+      statements: Array<{
+        run: () => Promise<unknown>;
+        [runSync]?: () => unknown;
+      }>,
+    ) => {
+      const execute = async () => {
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          const results = [];
+          for (const stmt of statements) {
+            results.push(stmt[runSync] ? stmt[runSync]() : await stmt.run());
+          }
+          db.exec('COMMIT');
+          return results;
+        } catch (error) {
+          db.exec('ROLLBACK');
+          throw error;
+        }
+      };
+      const pending = batchTail.then(execute, execute);
+      batchTail = pending.then(
+        () => undefined,
+        () => undefined,
+      );
+      return pending;
     },
     dump: async () => new ArrayBuffer(0),
   };
