@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// RBAC — actor identity + role authorization. RBAC is EE-licensed in Mastra;
-// this is the open implementation.
+// RBAC — actor identity + role authorization.
 //
 // RBACMiddleware runs as a Mastra input processor: it authorizes the actor
 // before the model call and records every decision on the shared AuditLogger
@@ -16,8 +15,10 @@ import type { RequestContext } from '@mastra/core/request-context';
 
 import type { AuditLogger } from '../audit/index.js';
 
+/** Role labels accepted by the built-in actor contract. */
 export type Role = 'admin' | 'builder' | 'operator' | 'reviewer' | 'viewer';
 
+/** All role labels accepted by `RBACMiddleware`. */
 export const ROLES: readonly Role[] = [
   'admin',
   'builder',
@@ -26,8 +27,11 @@ export const ROLES: readonly Role[] = [
   'viewer',
 ];
 
+/** Authenticated identity evaluated by RBAC and attached to audit events. */
 export interface Actor {
+  /** Stable actor identifier from the host authentication system. */
   id: string;
+  /** Role used by the middleware's exact allowlist. */
   role: Role;
 }
 
@@ -60,14 +64,19 @@ export function actorFromRequestContext(
     : undefined;
 }
 
+/** Configuration for `RBACMiddleware`. */
 export interface RBACMiddlewareOptions {
+  /** Exact roles authorized to call the agent. */
   allowedRoles: readonly Role[];
+  /** Optional audit logger for authorization decisions and lookup failures. */
   audit?: AuditLogger;
   /** Override actor sourcing. Default reads ACTOR_CONTEXT_KEY from requestContext. */
   getActor?: (args: ProcessInputArgs) => Actor | undefined;
 }
 
+/** Mastra input processor that authorizes an actor before model execution. */
 export class RBACMiddleware implements Processor<'breakwater-rbac'> {
+  /** Stable Mastra processor identifier. */
   readonly id = 'breakwater-rbac' as const;
   readonly #allowedRoles: readonly Role[];
   readonly #audit?: AuditLogger;
@@ -90,13 +99,14 @@ export class RBACMiddleware implements Processor<'breakwater-rbac'> {
       actor = this.#getActor(args);
     } catch (error) {
       // A crashing actor lookup is worse than a denial; it must not leave
-      // less audit evidence than one. Record, then fail the request as-is.
+      // less audit evidence than one. Keep the sink free of opaque exception
+      // text, then fail the request with the original error.
       this.#audit?.record({
         actor: null,
         action: 'agent.input.authorize',
         resource: this.id,
         decision: 'error',
-        reason: `getActor threw: ${error instanceof Error ? error.message : String(error)}`,
+        reason: 'actor lookup failed',
       });
       throw error;
     }

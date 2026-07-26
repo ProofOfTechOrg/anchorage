@@ -8,7 +8,7 @@
 // RunnerRuntime's per-run FIFO lock; routing one DO instance per run
 // (idFromName(`${workflowId}:${runId}`)) makes that lock authoritative,
 // since all traffic for a run lands on one instance. `state` is captured
-// for the Phase 2 alarm-chained engine (setAlarm/alarm) but unused today.
+// for a future alarm-chained engine (setAlarm/alarm) but unused today.
 
 import type { DurableObjectRunnerState, WebSocketLike } from './cf-types.js';
 import { newWebSocketPair, safeSend } from './cf-types.js';
@@ -30,7 +30,7 @@ interface ResumeBody {
 
 export abstract class DurableObjectRunner<TEnv = unknown> {
   protected readonly env: TEnv;
-  /** Absent in node tests; present under workerd. Reserved for Phase 2 alarms. */
+  /** Absent in Node tests; present under workerd and reserved for alarms. */
   protected readonly state?: DurableObjectRunnerState;
   #runtime?: RunnerRuntime;
 
@@ -48,7 +48,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
    * idFromName(`${workflowId}:${runId}`) and is unforgeable at this boundary
    * (`id.name` is populated only for idFromName-created ids). Safe to parse:
    * PATH_SAFE_ID_PATTERN excludes ':' from workflowId, so the first ':' is
-   * the join; INV-3 excludes '_' from tenantId, so the first '_' in the runId
+   * the join; the tenant-ID pattern excludes '_' from tenantId, so the first '_' in the runId
    * is the tenant boundary.
    *
    * THROWS rather than defaulting — an unscoped grant store is a cross-tenant
@@ -222,7 +222,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
 
   /**
    * Fan the authoritative RunSummary out to every subscribed run-channel
-   * socket (DL-018: at each lifecycle boundary — after start()/resume() — plus
+   * socket at each lifecycle boundary — after start()/resume() — plus
    * the on-connect snapshot). No-op when the DO exposes no getWebSockets
    * (node/vitest, or any host without the Hibernatable-WebSocket API), so the
    * HTTP surface is unchanged off workerd.
@@ -259,7 +259,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
   }
 }
 
-/** The run-channel wire frame — the authoritative RunSummary (DL-018). */
+/** The run-channel wire frame containing the authoritative RunSummary. */
 function runFrame(summary: RunSummary): string {
   return JSON.stringify({ type: 'run', summary });
 }

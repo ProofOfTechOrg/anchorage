@@ -33,8 +33,8 @@ export interface ApprovalDashboardProps {
   /** Injectable clock (deterministic SLA countdowns in tests/stories). */
   now?: () => number;
   /**
-   * Live streaming (Part B): an injected transport + ticket thunk. Absent ⇒
-   * poll-only, unchanged. The host builds these (showcase, M-008).
+   * An injected live-stream transport and ticket thunk. When absent, the
+   * dashboard remains poll-only. The host builds both values.
    */
   stream?: ApprovalStreamOption;
   /** Current reviewer id — attributes optimistic decides + enables conflict detection. */

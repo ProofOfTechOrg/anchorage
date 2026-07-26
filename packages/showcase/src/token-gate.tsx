@@ -42,7 +42,7 @@ function providerDisplayName(provider: string): string {
  * derived server-side, refusals are real server responses.
  */
 const DEMO_POINTS = [
-  'Five real agent workflows execute server-side and suspend durably at human approval gates, including multi-gate, branching, and re-suspension shapes.',
+  'Six real agent workflows execute server-side and suspend durably at human approval gates, including multi-gate, branching, and re-suspension shapes.',
   'Four roles (operator, reviewer, admin, viewer): RBAC and separation of duties are enforced server-side. Watch your own requests get refused.',
   'Every approval derives a capability grant bound to that exact suspension; a forged resume finds no grant and fails closed.',
   'Dangerous side effects are simulated: emails and deploys are logged, never delivered. The grants, tenant isolation, and durable suspend/resume are real.',
@@ -174,6 +174,36 @@ export function TokenGate({
                 Proof of Tech
               </Link>
             </Text>
+          </HStack>
+          <HStack gap={3} align="center" wrap="wrap">
+            <Link
+              href="https://github.com/ProofOfTechOrg/anchorage/tree/main/docs"
+              size="sm"
+              isExternalLink
+            >
+              Docs
+            </Link>
+            <Link
+              href="https://proofoftechorg.github.io/anchorage/"
+              size="sm"
+              isExternalLink
+            >
+              API
+            </Link>
+            <Link
+              href="https://www.npmjs.com/package/@proofoftech/breakwater"
+              size="sm"
+              isExternalLink
+            >
+              breakwater
+            </Link>
+            <Link
+              href="https://www.npmjs.com/package/@proofoftech/flowsafe"
+              size="sm"
+              isExternalLink
+            >
+              flowsafe
+            </Link>
           </HStack>
         </VStack>
       </Card>

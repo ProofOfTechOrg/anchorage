@@ -2,8 +2,40 @@
   "$schema": "https://typedoc.org/schema.json",
   "entryPoints": [
     "src/index.ts",
+    "src/agent-runner/index.ts",
+    "src/approval-api/index.ts",
+    "src/background-tasks/index.ts",
+    "src/artifacts/index.ts",
+    "src/audit-export/index.ts",
+    "src/do-runner/index.ts",
+    "src/goals/index.ts",
     "src/host-kit/index.ts",
-    "src/host-kit/module.ts"
+    "src/host-kit/module.ts",
+    "src/schedules/index.ts",
+    "src/signal-providers/index.ts",
+    "src/signals/index.ts",
+    "src/signals/client.ts"
   ],
-  "tsconfig": "tsconfig.json"
+  "entryPointStrategy": "resolve",
+  "tsconfig": "tsconfig.json",
+  "name": "@proofoftech/flowsafe",
+  "excludeExternals": true,
+  "excludeInternal": true,
+  "externalSymbolLinkMappings": {
+    "@mastra/core": {
+      "Agent.resumeGenerate": "https://mastra.ai/reference/agents/agent",
+      "DurableAgent.resume": "https://mastra.ai/reference/agents/durable-agent#resumerunid-resumedata-options",
+      "FullOutput": "https://mastra.ai/reference/agents/durable-agent",
+      "PruneResult": "https://mastra.ai/docs/storage/overview#configure-for-production"
+    },
+    "global": {
+      "AgentScheduleWorker": "https://mastra.ai/docs/long-running-agents/schedules"
+    }
+  },
+  "intentionallyNotExported": ["CHANNEL_PATHS"],
+  "validation": {
+    "notExported": true,
+    "invalidLink": true,
+    "invalidPath": true
+  }
 }

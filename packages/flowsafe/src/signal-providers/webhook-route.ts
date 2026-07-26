@@ -51,6 +51,7 @@ import {
   positiveSafeInteger,
 } from '../numeric-config.js';
 import { deliverNotification } from './delivery.js';
+import type { ReconcileSignalProviderPolling } from './host-topology.js';
 import { PROVIDER_ID_PATTERN, type SignalProviderAdapter } from './provider.js';
 import type {
   StoredSubscription,
@@ -85,6 +86,8 @@ export interface SubscriptionAuditEvent {
   outcome: 'accepted' | 'rejected';
   providerId?: string;
   externalResourceId?: string;
+  /** Present only when mutation-to-alarm reconciliation is configured. */
+  pollingLifecycle?: 'reconciled' | 'failed';
   reason?: string;
   timestamp: string;
 }
@@ -372,15 +375,20 @@ export function createWebhookRouter(
 // --- Subscription CRUD (human-only HTTP; RA-009) --------------------------
 
 export interface SubscriptionRouterOptions {
-  /** authenticate → INV-3 → bind; undefined ⇒ 401. */
+  /** Authenticate, validate the tenant ID, and bind it; undefined means 401. */
   resolve: TenantResolver;
-  /** Tenant-bound store factory — bound per request to the resolved tenant (INV-2). */
+  /** Tenant-bound store factory, bound per request to the resolved tenant. */
   subscriptions: SubscriptionStoreFactory;
   /** Who may manage subscriptions. Default RUN_START_ROLES (operator/admin). */
   roles?: readonly ApprovalRole[];
   /** The provider ids a subscription may name. Absent ⇒ any PROVIDER_ID_PATTERN slug. */
   knownProviders?: readonly string[];
   audit?: SignalProviderAuditSink;
+  /**
+   * Reconcile the tenant provider-host alarm after a subscription row commits.
+   * Absent preserves the original row-only behavior.
+   */
+  reconcilePolling?: ReconcileSignalProviderPolling;
   /** Route prefix. Default '/api/threads'. Routes: `<base>/:threadId/subscriptions`. */
   basePath?: string;
   /**
@@ -447,6 +455,7 @@ export function createSubscriptionRouter(
       extra: {
         providerId?: string;
         externalResourceId?: string;
+        pollingLifecycle?: 'reconciled' | 'failed';
         reason?: string;
       } = {},
     ): Promise<void> => {
@@ -461,6 +470,67 @@ export function createSubscriptionRouter(
         ...extra,
         timestamp: new Date().toISOString(),
       });
+    };
+
+    const finishCommittedMutation = async (
+      resolvedTenant: TenantContext,
+      providerId: string,
+      externalResourceId: string,
+    ): Promise<Response | undefined> => {
+      let pollingLifecycle: 'reconciled' | 'failed' | undefined;
+      let reconcileFailed = false;
+      if (options.reconcilePolling) {
+        try {
+          await options.reconcilePolling(resolvedTenant);
+          pollingLifecycle = 'reconciled';
+        } catch (error) {
+          pollingLifecycle = 'failed';
+          reconcileFailed = true;
+          console.error(
+            JSON.stringify({
+              type: 'signal-provider.polling-reconcile-error',
+              tenantId: resolvedTenant.tenantId,
+              providerId,
+              action,
+              reason: error instanceof Error ? error.message : String(error),
+            }),
+          );
+        }
+      }
+
+      // The row mutation has committed. An audit-sink failure cannot turn that
+      // success into a rejected audit or a generic 500 response.
+      try {
+        await audit('accepted', {
+          providerId,
+          externalResourceId,
+          ...(pollingLifecycle === undefined ? {} : { pollingLifecycle }),
+          ...(pollingLifecycle === 'failed'
+            ? { reason: 'polling-reconcile-failed' }
+            : {}),
+        });
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            type: 'signal-provider.subscription-audit-error',
+            tenantId: resolvedTenant.tenantId,
+            providerId,
+            action,
+            reason: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }
+
+      if (reconcileFailed) {
+        return json(
+          {
+            error: 'polling lifecycle unavailable',
+            mutationApplied: true,
+          },
+          502,
+        );
+      }
+      return undefined;
     };
 
     try {
@@ -530,7 +600,12 @@ export function createSubscriptionRouter(
           externalResourceId,
           threadId,
         );
-        await audit('accepted', { providerId, externalResourceId });
+        const lifecycleFailure = await finishCommittedMutation(
+          tenant,
+          providerId,
+          externalResourceId,
+        );
+        if (lifecycleFailure) return lifecycleFailure;
         return json({ removed });
       }
 
@@ -561,7 +636,12 @@ export function createSubscriptionRouter(
           ? { metadata: body.metadata as Record<string, unknown> }
           : {}),
       });
-      await audit('accepted', { providerId, externalResourceId });
+      const lifecycleFailure = await finishCommittedMutation(
+        tenant,
+        providerId,
+        externalResourceId,
+      );
+      if (lifecycleFailure) return lifecycleFailure;
       return json({ subscription });
     } catch (error) {
       if (error instanceof RunRouteError) {

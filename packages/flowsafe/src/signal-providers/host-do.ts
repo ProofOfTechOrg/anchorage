@@ -37,6 +37,7 @@ import {
   TENANT_ID_PATTERN,
 } from '../do-runner/index.js';
 import type { ThreadTopology } from '../host-kit/index.js';
+import { positiveSafeInteger } from '../numeric-config.js';
 import { deliverNotification } from './delivery.js';
 import type { SignalProviderAdapter } from './provider.js';
 import type {
@@ -48,6 +49,8 @@ import type {
 export interface AlarmStorage {
   setAlarm(scheduledTime: number): void | Promise<void>;
   deleteAlarm(): void | Promise<void>;
+  /** Current alarm time, when the runtime exposes it. */
+  getAlarm?(): number | null | Promise<number | null>;
 }
 
 /**
@@ -69,7 +72,7 @@ type _StateSatisfies = AssertTrue<
 >;
 
 /**
- * A host DO whose name carries no INV-3 tenant. 403 — this boundary is internal
+ * A host Durable Object whose name carries no valid tenant. 403 — this boundary is internal
  * (not client-reachable), so there is no oracle to protect and a distinct status
  * keeps a routing bug from reading as a 500. Extends DoStatusError so
  * doErrorResponse recognizes it.
@@ -109,9 +112,9 @@ function json(payload: unknown, status = 200): Response {
  * subscription store + thread topology + provider list from env), and bind the
  * subclass under a wrangler namespace addressed `idFromName(tenantId)`.
  *
- * Routes: `POST /arm` (boot + arm the alarm), `POST /poll` (run one poll cycle —
- * the deterministic probe the spike drives so E-S3 does not depend on wrangler's
- * alarm timer). `alarm()` polls then re-arms.
+ * Routes: `POST /arm` boots and arms the alarm; `POST /poll` runs one poll
+ * cycle directly for deterministic health checks that do not depend on the
+ * alarm timer. `alarm()` polls and then re-arms.
  */
 export abstract class SignalProviderHost<TEnv = unknown> {
   protected readonly env: TEnv;
@@ -131,7 +134,7 @@ export abstract class SignalProviderHost<TEnv = unknown> {
 
   /**
    * The tenant this host serves, recovered from its OWN idFromName identity —
-   * `id.name` IS the bare tenantId (the hub DO posture). Validated INV-3 and
+   * `id.name` is the bare tenantId. It is pattern-validated and
    * fail-closed: a name carrying no valid tenant cannot scope a store.
    */
   protected get tenantId(): string {
@@ -198,8 +201,8 @@ export abstract class SignalProviderHost<TEnv = unknown> {
    * each provider's subscriptions from D1 first (the eviction-survivable path).
    * PER-PROVIDER isolation: a provider whose poll throws is logged and skipped,
    * the rest still run; PER-DELIVERY isolation: a failing/tampered delivery is
-   * logged and skipped, the batch continues. Public so a host/test drives it
-   * directly (the E-S3 probe).
+   * logged and skipped, the batch continues. Public so a host or test can drive
+   * it directly.
    */
   async poll(): Promise<PollResult> {
     const { store, topology, providers } = this.#ensureWiring();
@@ -263,10 +266,12 @@ export abstract class SignalProviderHost<TEnv = unknown> {
   }
 
   /**
-   * Arm the alarm at the MIN pollInterval of providers that both poll AND have
-   * subscriptions. Nothing to poll ⇒ delete the alarm (self-terminating: a
-   * tenant with no live subscriptions costs no wakeups). No storage (node/vitest)
-   * ⇒ no-op, and tests drive `poll()` directly.
+   * Arm at the MIN positive pollInterval of providers that both poll AND have
+   * subscriptions, without postponing an already earlier alarm. Absent/zero
+   * intervals remain manually pollable but schedule no wake. Nothing automatic
+   * left ⇒ delete the alarm (self-terminating: a tenant with no live
+   * subscriptions costs no wakeups). No storage (node/vitest) ⇒ no-op, and
+   * tests drive `poll()` directly.
    */
   async #arm(): Promise<void> {
     const storage = this.state?.storage;
@@ -274,18 +279,30 @@ export abstract class SignalProviderHost<TEnv = unknown> {
     const { store, providers } = this.#ensureWiring();
     let interval: number | undefined;
     for (const provider of providers) {
-      if (!provider.pollForDeliveries || !provider.pollInterval) continue;
+      if (!provider.pollForDeliveries) continue;
+      const configured = provider.pollInterval;
+      if (configured === undefined || configured === 0) continue;
+      const providerInterval = positiveSafeInteger(
+        configured,
+        `signal provider '${provider.id}' pollInterval`,
+      );
       const subscriptions = await store.listForProvider(provider.id);
       if (subscriptions.length === 0) continue;
       interval =
         interval === undefined
-          ? provider.pollInterval
-          : Math.min(interval, provider.pollInterval);
+          ? providerInterval
+          : Math.min(interval, providerInterval);
     }
     if (interval === undefined) {
       await storage.deleteAlarm();
       return;
     }
-    await storage.setAlarm(Date.now() + interval);
+    const desired = Date.now() + interval;
+    const current = await storage.getAlarm?.();
+    // Subscription write traffic must not continually postpone an already
+    // imminent alarm. A newly added faster provider can still move it earlier.
+    if (current === undefined || current === null || current > desired) {
+      await storage.setAlarm(desired);
+    }
   }
 }

@@ -1,6 +1,23 @@
 # @proofoftech/flowsafe
 
+## 0.7.0
+
+### Minor Changes
+
+- def3b37: Complete and document the public flowsafe surface. The root entry point now
+  re-exports the approval API, Durable Object runner, artifacts, and audit export
+  surfaces with parity tests. Signal-provider hosts gain a tenant-safe topology,
+  stable polling alarms, and automatic post-mutation polling reconciliation.
+  Publish comprehensive package, deployment, approval, durable-agent, operations,
+  and API-reference documentation, plus a full advanced starter host.
+
 ## 0.6.0
+
+> **Final 0.6.0 state:** The `eca3b6e` closeout entry below supersedes earlier
+> statements in this release section that agent schedule targets and durable D1
+> background-task execution were deferred. Both are supported in 0.6.0 when
+> their opt-in host wiring is configured. Durable-agent restart resume and
+> notification dispatch are also closed and verified.
 
 ### Minor Changes
 
@@ -99,7 +116,10 @@
   a malformed taskId returns the no-oracle 404 instead of throwing. Additive and
   behavior-preserving for all valid paths.
 
-## 0.5.0
+## Unpublished 0.5.0 draft (included in 0.6.0)
+
+No `@proofoftech/flowsafe@0.5.0` package was published. These changes shipped in
+0.6.0 and remain here as their original generated release notes.
 
 ### Minor Changes
 

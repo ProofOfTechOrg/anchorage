@@ -91,7 +91,7 @@ export function safeSend(ws: WebSocketLike, frame: string): void {
 /**
  * Structural subset of DurableObjectState — the shape DurableObjectRunner
  * reads from. `id.name` (tenant/run identity recovery off the DO's own
- * idFromName address, INV-1) and `storage` (the ctx.storage-backed resume
+ * tenant-scoped idFromName address) and `storage` (the ctx.storage-backed resume
  * ledger — DurableStorageResumeLedger in resume-ledger.ts) are always touched;
  * the Hibernatable-WebSocket members are OPTIONAL so node/vitest stubs that
  * set only id.name/storage still satisfy the type and the per-run WS stream

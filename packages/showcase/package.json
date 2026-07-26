@@ -1,8 +1,8 @@
 {
   "name": "showcase",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "private": true,
-  "description": "Anchorage showcase — five runnable workflows behind one React frontend, deployed as a single Cloudflare Worker",
+  "description": "Anchorage showcase — six runnable workflows and seven guardrail scenarios behind one React frontend",
   "type": "module",
   "imports": {
     "#worker/*": "./worker/*.ts"
@@ -15,7 +15,7 @@
   "scripts": {
     "predev": "pnpm --filter @proofoftech/breakwater --filter @proofoftech/flowsafe build",
     "dev": "vite",
-    "build": "vite build && node scripts/assert-clean-app-bundle.mjs",
+    "build": "vite build && node scripts/assert-clean-app-bundle.mjs && node scripts/assert-public-metadata.mjs",
     "preview": "vite preview",
     "dev:worker": "wrangler dev",
     "deploy:cf": "pnpm build && wrangler deploy",
@@ -24,8 +24,8 @@
     "pretypecheck": "pnpm --filter @proofoftech/breakwater --filter @proofoftech/flowsafe build",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.worker.json && tsc -p tsconfig.node.json",
     "lint": "pnpm -w exec biome check packages/showcase",
-    "react-doctor": "pnpm dlx github:gcharang/react-doctor#4ad50e2e8c37104c98223e6e2ab1f8bea6bd27de --scope full --verbose --blocking warning",
-    "react-doctor:diff": "pnpm dlx github:gcharang/react-doctor#4ad50e2e8c37104c98223e6e2ab1f8bea6bd27de --scope changed --base \"$(sh scripts/resolve-react-doctor-diff-base.sh)\" --verbose --blocking warning"
+    "react-doctor": "node scripts/run-react-doctor.mjs full",
+    "react-doctor:diff": "node scripts/run-react-doctor.mjs changed \"$(sh scripts/resolve-react-doctor-diff-base.sh)\""
   },
   "dependencies": {
     "@astryxdesign/core": "0.1.3",

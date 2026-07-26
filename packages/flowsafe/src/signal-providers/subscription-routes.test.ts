@@ -11,6 +11,7 @@ import { InMemorySubscriptionStoreFactory } from './subscription-d1.js';
 import {
   createSubscriptionRouter,
   type SignalProviderAuditEvent,
+  type SignalProviderAuditSink,
 } from './webhook-route.js';
 
 function ctx(tenantId: string, role: ApprovalRole): TenantContext {
@@ -27,6 +28,8 @@ function setup(
     resolveTo?: TenantContext | undefined;
     role?: ApprovalRole;
     maxBodyBytes?: number;
+    reconcilePolling?: (tenant: TenantContext) => Promise<void>;
+    audit?: SignalProviderAuditSink;
   } = {},
 ) {
   const factory = new InMemorySubscriptionStoreFactory();
@@ -37,9 +40,14 @@ function setup(
     resolve: async () => resolved,
     subscriptions: factory,
     knownProviders: ['github'],
-    audit: (e) => {
-      events.push(e);
-    },
+    audit:
+      opts.audit ??
+      ((e) => {
+        events.push(e);
+      }),
+    ...(opts.reconcilePolling
+      ? { reconcilePolling: opts.reconcilePolling }
+      : {}),
     ...(opts.maxBodyBytes !== undefined
       ? { maxBodyBytes: opts.maxBodyBytes }
       : {}),
@@ -179,6 +187,7 @@ describe('createSubscriptionRouter', () => {
       action: 'subscribe',
       outcome: 'accepted',
     });
+    expect(events.at(-1)).not.toHaveProperty('pollingLifecycle');
 
     // #when list
     const list = await router(req('GET', 'acme_t1'));
@@ -195,6 +204,175 @@ describe('createSubscriptionRouter', () => {
     );
     expect(await del?.json()).toEqual({ removed: true });
     expect(events.at(-1)).toMatchObject({ action: 'unsubscribe' });
+  });
+
+  it('reconciles polling after subscribe and every idempotent unsubscribe', async () => {
+    const reconcilePolling = vi.fn(async (_tenant: TenantContext) => {});
+    const { router, events } = setup({ reconcilePolling });
+
+    const subscribed = await router(
+      req('POST', 'acme_t1', {
+        providerId: 'github',
+        externalResourceId: 'github:acme/repo',
+        resourceKey: 'owner',
+      }),
+    );
+    expect(subscribed?.status).toBe(200);
+    expect(reconcilePolling).toHaveBeenCalledTimes(1);
+    expect(reconcilePolling.mock.calls[0]?.[0]).toMatchObject({
+      tenantId: 'acme',
+      actor: { tenantId: 'acme' },
+    });
+    expect(events.at(-1)).toMatchObject({
+      action: 'subscribe',
+      outcome: 'accepted',
+      pollingLifecycle: 'reconciled',
+    });
+
+    const removed = await router(
+      req('DELETE', 'acme_t1', {
+        providerId: 'github',
+        externalResourceId: 'github:acme/repo',
+      }),
+    );
+    expect(await removed?.json()).toEqual({ removed: true });
+
+    const alreadyAbsent = await router(
+      req('DELETE', 'acme_t1', {
+        providerId: 'github',
+        externalResourceId: 'github:acme/repo',
+      }),
+    );
+    expect(await alreadyAbsent?.json()).toEqual({ removed: false });
+    expect(reconcilePolling).toHaveBeenCalledTimes(3);
+    expect(events.at(-1)).toMatchObject({
+      action: 'unsubscribe',
+      outcome: 'accepted',
+      pollingLifecycle: 'reconciled',
+    });
+  });
+
+  it('reports a post-commit reconcile failure as retry-safe 502 while retaining the row', async () => {
+    const reconcilePolling = vi.fn(async () => {
+      throw new Error('private provider-host failure');
+    });
+    const logged: string[] = [];
+    const log = vi.spyOn(console, 'error').mockImplementation((value) => {
+      logged.push(String(value));
+    });
+    const { router, factory, events } = setup({ reconcilePolling });
+
+    try {
+      const response = await router(
+        req('POST', 'acme_t1', {
+          providerId: 'github',
+          externalResourceId: 'github:acme/repo',
+          resourceKey: 'owner',
+        }),
+      );
+
+      expect(response?.status).toBe(502);
+      const payload = await response?.json();
+      expect(payload).toEqual({
+        error: 'polling lifecycle unavailable',
+        mutationApplied: true,
+      });
+      expect(
+        await factory.forTenant('acme').listForThread('acme_t1'),
+      ).toHaveLength(1);
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        action: 'subscribe',
+        outcome: 'accepted',
+        pollingLifecycle: 'failed',
+        reason: 'polling-reconcile-failed',
+      });
+      expect(logged.join('\n')).toContain('private provider-host failure');
+      expect(JSON.stringify(payload)).not.toContain(
+        'private provider-host failure',
+      );
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('does not reconcile GETs or requests rejected before a mutation', async () => {
+    const reconcilePolling = vi.fn(async () => {});
+    const { router } = setup({ reconcilePolling });
+
+    expect((await router(req('GET', 'acme_t1')))?.status).toBe(200);
+    expect(
+      (
+        await router(
+          req('POST', 'acme_t1', {
+            providerId: 'unknown',
+            externalResourceId: 'resource',
+            resourceKey: 'owner',
+          }),
+        )
+      )?.status,
+    ).toBe(400);
+    expect(reconcilePolling).not.toHaveBeenCalled();
+  });
+
+  it('contains an audit failure after commit instead of returning a false mutation failure', async () => {
+    const audit = vi.fn(async (_event: SignalProviderAuditEvent) => {
+      throw new Error('audit sink unavailable');
+    });
+    const logged: string[] = [];
+    const log = vi.spyOn(console, 'error').mockImplementation((value) => {
+      logged.push(String(value));
+    });
+    const { router, factory } = setup({ audit });
+
+    try {
+      const response = await router(
+        req('POST', 'acme_t1', {
+          providerId: 'github',
+          externalResourceId: 'github:acme/repo',
+          resourceKey: 'owner',
+        }),
+      );
+
+      expect(response?.status).toBe(200);
+      expect(
+        await factory.forTenant('acme').listForThread('acme_t1'),
+      ).toHaveLength(1);
+      expect(audit).toHaveBeenCalledTimes(1);
+      expect(audit.mock.calls[0]?.[0]).toMatchObject({
+        action: 'subscribe',
+        outcome: 'accepted',
+      });
+      expect(logged.join('\n')).toContain('audit sink unavailable');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('does not reconcile when the durable row mutation fails', async () => {
+    const reconcilePolling = vi.fn(async () => {});
+    const router = createSubscriptionRouter({
+      resolve: async () => ctx('acme', 'operator'),
+      subscriptions: {
+        forTenant: () => ({
+          subscribe: async () => {
+            throw new Error('database unavailable');
+          },
+        }),
+      } as never,
+      knownProviders: ['github'],
+      reconcilePolling,
+    });
+
+    const response = await router(
+      req('POST', 'acme_t1', {
+        providerId: 'github',
+        externalResourceId: 'github:acme/repo',
+        resourceKey: 'owner',
+      }),
+    );
+    expect(response?.status).toBe(500);
+    expect(reconcilePolling).not.toHaveBeenCalled();
   });
 
   it('405s a method it does not handle', async () => {

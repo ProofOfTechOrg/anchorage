@@ -1,186 +1,232 @@
-# DO Runner Design
+# Durable Object runner design
 
-The Durable Object runner is the Cloudflare-native equivalent of `@mastra/temporal`. It wraps Mastra workflows in Durable Objects for durable execution that survives Worker CPU time limits.
+Flowsafe supplies a Cloudflare execution backend for Mastra workflows. The Durable Object serializes calls for one run; Mastra's D1 snapshot is the durable workflow state.
 
-## Import-Swap Pattern
+## Import swap
 
-Mastra ships this pattern in `@mastra/inngest` and the experimental `@mastra/temporal`: an `init()` call returns backend-bound `createWorkflow`/`createStep`, imported in place of the `@mastra/core/workflows` versions -- the swap happens at the import, and the workflow definition code is unchanged. The DO runner follows the same pattern:
+`init()` returns backend-bound workflow factories:
 
 ```typescript
+import {
+  DurableObjectRunner,
+  init,
+  type RunnerRuntime,
+} from '@proofoftech/flowsafe/do-runner';
 import { z } from 'zod';
-import { init } from '@proofoftech/flowsafe/do-runner';
 
-// Import-swap: DO-bound factories in place of @mastra/core/workflows.
-const { createWorkflow, createStep } = init(env);
+interface Env {
+  DB: D1Database;
+}
 
-const research = createStep({ id: 'research', inputSchema: z.object({}), outputSchema: z.object({}), execute: async ({ inputData }) => ({}) });
-const generate = createStep({ id: 'generate', inputSchema: z.object({}), outputSchema: z.object({}), execute: async ({ inputData }) => ({}) });
-const approve = createStep({ id: 'approve', inputSchema: z.object({}), outputSchema: z.object({}), execute: async ({ inputData }) => ({}) });
+export class WorkflowRunner extends DurableObjectRunner<Env> {
+  protected build(env: Env): RunnerRuntime {
+    const { createStep, createWorkflow, runtime } = init(env);
 
-// Standard Mastra definition -- builder chain committed in place.
-const myWorkflow = createWorkflow({
-  id: 'my-workflow',
-  inputSchema: z.object({}),
-  outputSchema: z.object({}),
-})
-  .then(research)
-  .then(generate)
-  .then(approve)
-  .commit();
+    const prepare = createStep({
+      id: 'prepare',
+      inputSchema: z.object({ subject: z.string() }),
+      outputSchema: z.object({ subject: z.string() }),
+      execute: async ({ inputData }) => inputData,
+    });
 
-// Execution and suspend/resume state live in a Durable Object. Definition
-// code is unchanged; STARTING is not: the runtime requires a server-minted
-// runId (`${tenantId}_${uuid}`, INV-1) — in the flowsafe hosts createRunRouter
-// mints it and passes it in; there is no generation fallback. See "Run
-// Identity and Tenant Scoping" below.
-const run = await myWorkflow.createRun({ runId });
-await run.start({ inputData: {} });
-```
+    createWorkflow({
+      id: 'example',
+      inputSchema: z.object({ subject: z.string() }),
+      outputSchema: z.object({ subject: z.string() }),
+    })
+      .then(prepare)
+      .commit();
 
-## Durable Object Lifecycle
-
-```
-1. Workflow started: DO created, initial state persisted
-2. Step A: DO calls Mastra step, stores result, sets alarm for next step
-3. Worker CPU limit reached: DO hibernates, state in DO storage
-4. Alarm fires: DO wakes, loads state, calls next step
-5. Step B (requires approval): DO sets suspense state, waits for flowsafe API
-6. Reviewer approves: flowsafe API calls DO, DO resumes step execution
-7. Final step completes: DO marks terminal, cleans up alarm
-```
-
-## State Schema
-
-```
-{
-  workflowId: string,
-  runId: string,
-  status: 'running' | 'suspended' | 'completed' | 'failed',
-  currentStep: string,
-  stepResults: Record<string, unknown>,
-  approvalRequests: ApprovalRequest[],
-  createdAt: number,
-  updatedAt: number,
+    return runtime;
+  }
 }
 ```
 
-## Run Identity and Tenant Scoping
+Workflow definitions retain Mastra's schema and builder API. The difference is where `createRun()`, `start()`, `resume()`, and storage are driven.
 
-The `runId` is the tenant carrier, not an opaque token: it is minted
-server-side as `` `${tenantId}_${uuid}` `` from the authenticated tenant, and
-the runner enforces that at three points.
+## One object per run
 
-- `RunnerRuntime.start()` **requires** a `runId`. There is deliberately no
-  `?? crypto.randomUUID()` fallback: a caller that omitted one would mint a
-  bare, tenant-less run whose snapshot row no tenant purge can reach and no
-  actor can own.
-- The DO's HTTP surface refuses a start without a `runId`, and every route
-  asserts the request's `(workflowId, runId)` equals the identity the instance
-  was addressed with. `ctx.id.name` is populated only for `idFromName`-created
-  ids and is unforgeable at the DO boundary, so a request that disagrees with
-  it routed around the name join.
-- `DurableObjectRunner.tenantId` recovers the tenant from that same identity
-  and **throws** when it cannot. Defaulting would hand the instance an
-  unscoped grant store — a cross-tenant capability mint. The parse is safe
-  because `PATH_SAFE_ID_PATTERN` excludes `:` from `workflowId` (so the first
-  `:` is the join) and the tenant charset excludes `_` (so the first `_` in
-  the runId is the tenant boundary). It has exactly one implementation,
-  `tenantOfRunId`.
+The Worker addresses:
 
-Every leg also mints two opaque requestContext scopes the trusted runtime
-owns: `breakwater.workflowScope` (always) and `breakwater.isolationScope` (for
-tenant-salted run ids). breakwater never parses either.
+```text
+idFromName(`${workflowId}:${runId}`)
+```
 
-## Storage Beyond the Snapshot
+The object checks every request's workflow and run against its own `id.name`. The run router also checks tenant ownership before it addresses the namespace.
 
-Run state lives in D1, which is what lets a run survive a restart. Two things
-live in the DO's own `ctx.storage`:
+Inside the object, `RunnerRuntime` keeps a FIFO lock keyed by the same `workflowId:runId`. Cloudflare sends one object's requests to one instance, and the in-instance lock prevents two concurrent resumes from both passing the suspended precondition.
 
-- **The resume ledger** — the monotonic per-`(run, step)` resume ordinal that
-  the approval grant binding uses as its collision-free tie-breaker. It must be
-  durable: in-memory state dies with the isolate on idle eviction (~70–140 s),
-  hibernation, and code deploys, and a lost ordinal turns an already-approved
-  action into a silent no-op. Losing it fails closed for *grants* — never a
-  leak — but it is an availability defect, so the DO shell adopts a
-  `ctx.storage`-backed ledger automatically rather than making each host
-  remember to thread one.
-- **Alarms** — reserved. The DO captures `state` for a future alarm-chained
-  engine (`setAlarm()` + an `alarm()` handler); no alarm is scheduled today,
-  and resume is driven by the approval decision rather than by polling.
+This single-writer property is load-bearing because the Mastra snapshot store uses ordinary writes, not an application-level version CAS. A future path that lets a second object or external process write the same run must add optimistic concurrency before it is safe.
 
-## Retention and Offboarding
+## Run identity
 
-Two purges, deliberately different:
+`workflowId` and `runId` must match the exported path-safe pattern. Connector ids use a separate contract and cannot contain the key delimiter that would make stored tuple keys collide.
 
-- `purgeExpiredWorkflowRuns(db, { ttlMs, artifactStore })` — the retention
-  purge. Deletes only TERMINAL snapshot rows older than the TTL. A suspended
-  run is never eligible at any age, because expiring one would kill a pending
-  approval. Hosts that store artifacts in R2 must pass the same
-  `artifactStore` here as to `purgeTenant`: the snapshot row is the only
-  enumerable record of a run's artifact keys (R2 keys lead with `workflowId`,
-  so there is no run-level listing), and each run's artifacts are deleted
-  BEFORE its row so a crash between the two retries instead of stranding them.
-  The paired path is `limit`-batched per firing (default 100 runs — each run
-  costs ~2+N subrequests, so an unbounded backlog would blow the Workers
-  per-invocation cap); the shrinking eligible set is the cursor, and per-run
-  failures are isolated (a wedged run keeps its row as its own retry cursor
-  while the pass continues, then the failures re-throw aggregated so the
-  cron's error surface fires).
-- `purgeTenant(db, { tenantId, artifactStore })` — complete offboarding.
-  Deletes snapshot rows of *any* status via an INV-3 range predicate over
-  `run_id`, the tenant's agent-memory rows (threads/messages/resources by the
-  same range over their salted ids — `agent-memory-tenancy.md`), the tenant's
-  approval records, and its R2 artifacts (enumerated from the *surviving*
-  snapshot rows — hence the retention pairing above).
-  This is the only way an abandoned-at-a-gate run is ever reclaimed. It races
-  a live resume, so purge only tenants whose tokens have already expired; the
-  resume then fails against the vanished row without re-executing the
-  workflow (pinned by regression test).
+For tenant hosts, every run id is minted as:
 
-Both purges treat a missing snapshot table as empty: Mastra creates it lazily
-with the first persisted run, and a tenant (or a whole fresh deployment) that
-never started one must still offboard cleanly — approvals are reaped even
-when there are no snapshots.
+```text
+tenantId_uuid
+```
 
-## Error Handling
+The host derives `tenantId` from verified credentials. `RunnerRuntime.start()` requires the run id and never generates one. `DurableObjectRunner.tenantId` recovers the tenant from the object's own name and throws if it cannot.
 
-- Step execution failure: DO retries per workflow retry policy, marks step failed after exhausting retries
-- DO storage failure: Cloudflare auto-handles via DO storage replication
-- State corruption: DO can be reset to last known good state via admin API
+The tenant charset excludes `_`, so the prefix is exact. The run id should remain opaque to ordinary application code.
 
-## Concurrency and D1 Consistency
+## Runtime lifecycle
 
-Run state is persisted with plain, unconditional writes — last-write-wins, no
-optimistic-concurrency check in the storage layer. That is safe **only** because
-every run has a single writer:
+Start:
 
-- One Durable Object instance per run (`idFromName(workflowId:runId)`) serializes
-  all start/resume calls for that run across the whole fleet.
-- Within the instance, the `RunnerRuntime` FIFO run-lock (`#withRunLock`, keyed
-  `workflowId:runId`) serializes concurrent calls. The in-process lock granularity
-  deliberately matches the cross-instance routing granularity, so two writers never
-  race on one run's rows.
+1. The Worker authenticates, resolves the tenant, authorizes the workflow, and mints the run id.
+2. The run topology addresses the owning Durable Object.
+3. The runtime checks that no snapshot already exists.
+4. It obtains the trusted per-leg request context.
+5. It calls Mastra `createRun({ runId, pubsub })` and starts with input.
+6. Mastra persists its workflow snapshot after engine boundaries.
+7. The runtime projects the outcome to a JSON-safe `RunSummary`.
+8. The object broadcasts the summary to connected run sockets.
 
-Invariant — this single-writer-per-run guarantee is load-bearing, not incidental.
-Any future path that lets more than one writer touch a run's state (multi-instance
-fan-in, or an external durable resume that bypasses the owning DO) must add
-optimistic concurrency itself — e.g. a `version`/etag column with a conditional
-`UPDATE … WHERE version = ?` — because the current storage layer performs no atomic
-compare-and-swap.
+Resume:
 
-## Cloudflare Workers Runtime Constraints
+1. The approval service or trusted recovery path reaches the same object.
+2. The FIFO lock reads the current snapshot and requires `suspended`.
+3. The resume ledger increments the selected step's ordinal.
+4. The runtime recomputes trusted request context, including workflow scope, tenant isolation scope, and approved connectors.
+5. Mastra resumes the selected step from D1.
+6. The new summary is persisted and broadcast.
+7. A new suspension is bridged to a new approval.
 
-The Workers runtime differs from Node.js in ways that shape the DO runner design:
-no `new Function()` (so tool validation stays pure-Zod rather than JSON Schema);
-no Node built-ins such as `@mastra/pg` (D1 is the storage path); a bundle-size
-ceiling on the paid tier; and no code at module load time, since env bindings are
-undefined until a request/handler runs (so all initialization happens inside
-`init(env)`).
+No JavaScript promise remains alive while a reviewer waits. The persisted suspension is the wait.
 
-Design implications for the DO runner:
+## Durable state
 
-- Pure-Zod schemas only; no JSON Schema tools until #17301 is fixed
-- D1 for storage, never `@mastra/pg`
-- Track bundle size against the 10MB Workers limit in CI
-- All Mastra initialization inside `init(env)` / request handlers, nothing at
-  module scope -- this constraint is why `init()` takes `env`
+### D1 snapshot
+
+Mastra's `mastra_workflow_snapshot` row is authoritative for:
+
+- run status;
+- step state and results;
+- suspend payload and selected step paths;
+- timestamps;
+- durable-agent message-list state where applicable.
+
+Flowsafe does not maintain a parallel custom workflow state object.
+
+### Durable Object storage
+
+The runner uses the object's local durable storage for the `ResumeLedger`. It records a monotonic ordinal per run and step:
+
+- absent on the first suspension;
+- `1` after the first resume;
+- `2` after the second;
+- continuing on every resume, including a resume without payload.
+
+Approvals bind `suspendedAt` with this ordinal. The ledger survives isolate eviction, hibernation, and deploys. Losing it would fail grants closed but could strand an approved action, so the base Durable Object adopts the durable implementation automatically.
+
+The workflow runner does not currently chain workflow execution through Durable Object alarms. Approval resumes arrive by request. Other flowsafe classes use alarms for provider polling.
+
+## Run summary
+
+`RunSummary` is the public projection:
+
+```typescript
+interface RunSummary {
+  runId: string;
+  status: WorkflowRunStatus;
+  result?: unknown;
+  error?: string;
+  suspended?: string[][];
+  suspendPayload?: unknown;
+  suspendedAt?: Record<string, number>;
+  resumedAt?: Record<string, number>;
+  resumeCount?: Record<string, number>;
+  createdAt?: string;
+  updatedAt?: string;
+}
+```
+
+The runtime maps serialized error objects to a useful error string. `resumedAt` is informational because Mastra does not stamp it for every resume shape. Grant binding uses `resumeCount`.
+
+Run WebSockets send the entire authoritative summary at start, resume, and connection. Consumers can replace their cached summary rather than reconstructing state from deltas.
+
+## HTTP surface inside the object
+
+The base object accepts:
+
+```text
+POST /runs
+GET  /runs/:workflowId/:runId
+GET  /runs/:workflowId/:runId/stream
+POST /runs/:workflowId/:runId/resume
+```
+
+The public Worker normally exposes its own authenticated route facade and forwards to these internal routes. A stream request requires a WebSocket upgrade and workerd's hibernatable socket API; otherwise it returns 426 and the client polls status.
+
+The raw resume surface carries no approval grant. A protected connector still requires a matching stored decision.
+
+## Request context
+
+Before every create or resume, the runtime sets:
+
+- run id;
+- workflow id;
+- `breakwater.workflowScope`;
+- `breakwater.isolationScope` when the run carries a tenant;
+- values returned by the host's `requestContextForRun` provider.
+
+Runtime-derived base keys win over stored or client-provided context. Schedules additionally reject these reserved namespaces when data is written.
+
+`approvalGrantProvider()` is the normal provider. A provider failure happens before `createRun()` or resume, so a failed start leaves its run id retryable.
+
+## Import-safe workflow modules
+
+`@proofoftech/flowsafe/host-kit/module` defines a workflow module that receives the factories and deployment dependencies rather than importing a singleton runtime. This supports:
+
+- registering many modules on one runtime;
+- testing a module with in-memory dependencies;
+- keeping Cloudflare bindings out of module scope;
+- avoiding a build-order dependency on generated `dist/`.
+
+`assertWorkflowsRegistered()` compares host metadata with the committed runtime definitions.
+
+## Error taxonomy
+
+The runtime distinguishes:
+
+- unknown workflow;
+- unknown run;
+- duplicate run;
+- run not suspended;
+- client-fixable input, resume-data, or step errors;
+- internal execution or storage errors.
+
+The Durable Object maps known errors to stable HTTP status codes through `doErrorResponse()`. Unknown failures return an internal error without copying arbitrary thrown data to an audit sink.
+
+The runner does not provide an administrative “reset to last good state” API. Recovery uses authoritative D1 state, the approval redrive path, or tenant offboarding.
+
+## Retention
+
+`purgeExpiredWorkflowRuns(db, options)`:
+
+- selects only terminal statuses;
+- uses a bounded batch;
+- deletes paired R2 artifacts before the snapshot row;
+- keeps a failed row as a retry anchor while allowing later rows to proceed;
+- aggregates per-run failures after the pass;
+- treats a not-yet-created snapshot table as empty.
+
+Running and suspended rows are never age-purged.
+
+`purgeTenant(db, options)` deletes all statuses and every adopted tenant domain after credentials are revoked. It is the cleanup path for an abandoned suspension.
+
+See [Deployment reference](deployment-reference.md) for the full domain lifecycle.
+
+## Worker constraints
+
+- Initialize Mastra after bindings exist, not at module load.
+- Use D1-backed storage on the execution path.
+- Keep workflows and schemas compatible with the Workers bundle.
+- Route every writer for a run through its one Durable Object.
+- Add Durable Object migrations as new append-only tags.
+- Keep WebSocket polling fallback because sockets and isolates can close.
+
+The deterministic `spike:verify` command kills and restarts workerd around a suspension, then proves resume, forged-resume denial, stream recovery, and the advanced agent domains.

@@ -1,9 +1,13 @@
-# Anchorage Showcase — five workflows, one frontend, one deploy
+# Anchorage showcase: six workflows, seven guardrail scenarios, one deploy
 
-The five `docs/examples/*` design sketches grown into **actually executing**
-workflows on the flowsafe Durable Object runner, unified behind one React
-frontend (a launcher + the approval dashboard + an actor switcher) and shipped as
-a **single Cloudflare deploy** — one Worker serving both the API and the SPA.
+The showcase runs six workflows on the flowsafe Durable Object runner and seven
+deterministic guardrail scenarios through breakwater. One React application
+combines the control room, workflow launcher, approval dashboard, run status,
+and actor switcher. One Cloudflare Worker serves both the API and the SPA.
+
+Five workflows are available from the launcher. The sixth, `wire-transfer`, is
+the server-backed control-room scenario that hands a real durable approval into
+the same review queue.
 
 | # | id | shape | what it showcases |
 |---|----|-------|-------------------|
@@ -12,6 +16,14 @@ a **single Cloudflare deploy** — one Worker serving both the API and the SPA.
 | 3 | `lead-generation` | `.branch()` hot/cold → gate → assign | conditional branch, egress allowlist + rate-limit on the CRM write |
 | 4 | `product-launch` | serial, **2 gates** | multi-checkpoint re-suspension, destructive + idempotent deploy, dry-run pre-flight |
 | 5 | `access-request` | serial + gate, RBAC-scoped | route-level `allowedRoles`, cross-workflow isolation, separation of duties |
+| 6 | `wire-transfer` | control-room agent + gate | prompt-injection defense, durable human approval, exact-suspension grant |
+
+The seven in-browser scenarios exercise real breakwater policies and evaluators:
+PII leakage, secret exfiltration, prompt injection, role enforcement, egress
+allowlists, cross-workflow isolation, and tenant isolation. Their inputs are
+deterministic and require no model key. The adjacent wire-transfer card is the
+eighth control-room card and the only scenario that starts a server-side
+workflow.
 
 ## Binding-gated: real spine, zero secrets offline
 
@@ -31,7 +43,7 @@ pnpm dev        # Vite on :4321 + the in-process showcase host
 ```
 
 Open http://localhost:4321. The **ActorSwitcher** picks a demo identity; the
-**LauncherPanel** starts any of the five workflows (edit the sample JSON); the
+**LauncherPanel** starts any of the five launcher workflows (edit the sample JSON); the
 **RunStatusPanel** polls each run to `success`; the **approval dashboard** below
 is where you claim/decide. Try:
 
@@ -50,7 +62,7 @@ is where you claim/decide. Try:
 ## Run it — the deployed shape (workerd)
 
 ```bash
-cp .dev.vars.example .dev.vars      # REQUIRED — the demo bearer tokens
+cp packages/showcase/.dev.vars.example packages/showcase/.dev.vars # REQUIRED — demo bearer tokens
 pnpm --filter showcase build        # SPA → ./dist (served as assets)
 pnpm --filter showcase dev:worker   # wrangler dev on :8787 — SPA at / + API same origin
 ```
@@ -159,19 +171,21 @@ isolate and cannot be caught, so a slow sweep would starve the purge forever).
 pnpm showcase:deploy            # builds, then wrangler deploy
 ```
 
-The deploy binds ONE public origin — `anchorage.proofoftech.org` (a Workers
+The deploy binds ONE public origin: `anchorage.proofoftech.org` (a Workers
 custom domain; the zone must live on the deploying Cloudflare account) with
 `workers_dev: false`, because the OAuth callback is registered for exactly
-that origin. The SPA ships a TEMPORARY `noindex` robots meta
-(`index.html`) until the demo is ready to be indexed.
+that origin. The SPA publishes indexable metadata, `robots.txt`, a sitemap, and
+a 1200×630 social card for that canonical URL.
 
 A fresh deploy **401s on every authenticated route until you set the auth
 secret** — no credentials are baked into `wrangler.jsonc`, so there is no state
 in which the service is reachable with a token an attacker can read off GitHub:
 
 ```bash
-wrangler d1 create anchorage-showcase       # paste the id into wrangler.jsonc
-wrangler secret put APPROVAL_ACTOR_TOKENS   # then flip connector bindings to go live
+pnpm --filter showcase exec wrangler d1 create anchorage-showcase
+# Paste the returned id into packages/showcase/wrangler.jsonc.
+pnpm --filter showcase exec wrangler secret put APPROVAL_ACTOR_TOKENS
+# Then flip connector bindings to go live.
 ```
 
 > **Do not paste the demo tokens in as that secret.** They are checked into this

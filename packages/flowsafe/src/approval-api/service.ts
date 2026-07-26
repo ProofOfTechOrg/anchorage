@@ -102,7 +102,7 @@ export function selfDecisionExempts(
 
 export interface ApprovalServiceOptions {
   /**
-   * MUST be tenant-bound (INV-2): the service asserts every acting
+   * Must be tenant-bound: the service asserts every acting
    * principal's tenant against this binding, and the store's predicates are
    * what scope reads/writes. Obtain via a store factory's forTenant().
    */
@@ -525,14 +525,13 @@ export class ApprovalService {
   }
 
   /**
-   * D4 follow-up (2026-07-11 audit): CAS-transitions a STALE OPEN record
-   * (pending/claimed/escalated, bound to a suspension its step has since
-   * moved past) straight to 'rejected'. host-kit's reconcileApprovalsForSummary
-   * calls this before filing a fresh record for a step whose only open
-   * record no longer matches the run's CURRENT (suspendedAt, resumeCount)
-   * fingerprint — the loop where a stale-but-open record otherwise never
-   * heals (every poll re-lists, finds the same open record via the
-   * open-step uniqueness index, and re-files nothing).
+   * CAS-transitions a stale open record (pending/claimed/escalated, bound to
+   * a suspension its step has since moved past) straight to 'rejected'.
+   * host-kit's reconcileApprovalsForSummary calls this before filing a fresh
+   * record for a step whose only open record no longer matches the run's
+   * current (suspendedAt, resumeCount) fingerprint. Without this transition,
+   * every poll would re-list the stale record through the open-step
+   * uniqueness index and file nothing.
    *
    * Deliberately bypasses decide(): a rejection decision resumes the run
    * with declined semantics via #resume(), and a stale record must die

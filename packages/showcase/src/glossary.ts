@@ -149,9 +149,8 @@ export function claimableSteps(
     if (gateIndex < 0) return undefined;
     upToGate = guide.steps.slice(0, gateIndex);
   }
-  const unconditional = upToGate.filter(
-    (step) => !guide.conditionalSteps?.includes(step),
-  );
+  const conditionalSteps = new Set(guide.conditionalSteps ?? []);
+  const unconditional = upToGate.filter((step) => !conditionalSteps.has(step));
   return unconditional.length > 0 ? unconditional : undefined;
 }
 

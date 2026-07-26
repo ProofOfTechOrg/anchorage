@@ -30,8 +30,8 @@ import { newWebSocketPair, safeSend } from './cf-types.js';
  * `event.record.tenantId` (the defense-in-depth tenant assertion) and
  * re-serializes the whole event to subscribers, so this local subset is
  * sufficient. The real ApprovalStreamEvent (approval-api/contract.ts) is
- * bridged onto the hub's POST body at the host-kit layer (M-006,
- * createHubTopology), which may import both packages.
+ * bridged onto the hub's POST body by host-kit through `createHubTopology`,
+ * which may import both packages.
  */
 export interface HubStreamEvent {
   record: { tenantId: string };

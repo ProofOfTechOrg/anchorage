@@ -73,6 +73,11 @@ function prefersReducedMotion(): boolean {
 
 type RunPhase = 'idle' | 'running' | 'done';
 
+interface ControlPlaneEntry {
+  id: number;
+  event: EngineEvent;
+}
+
 function LayerBadges({
   layers,
 }: {
@@ -184,7 +189,7 @@ function ClientScenarioPanel({
   actor: CatalogActor | null;
   phase: RunPhase;
   agentText: string;
-  events: readonly EngineEvent[];
+  events: readonly ControlPlaneEntry[];
   outcome: { status: 'blocked' | 'clean'; headline: string } | null;
   onRun: () => void;
 }): ReactElement {
@@ -276,11 +281,8 @@ function ClientScenarioPanel({
                 Guardrail decisions stream here as the agent runs.
               </Text>
             ) : (
-              events.map((event, index) => (
-                // Append-only per run (the pane remounts per scenario and
-                // resets on each run), so position is a stable identity; the
-                // content prefix keeps the key readable and collision-free.
-                <ControlPlaneRow key={`${event.kind}-${index}`} event={event} />
+              events.map((entry) => (
+                <ControlPlaneRow key={entry.id} event={entry.event} />
               ))
             )}
           </ScrollPane>
@@ -471,7 +473,7 @@ export function ControlRoom({
   const [selectedId, setSelectedId] = useState<string>(cards[0]?.id ?? '');
   const [phase, setPhase] = useState<RunPhase>('idle');
   const [agentText, setAgentText] = useState('');
-  const [events, setEvents] = useState<EngineEvent[]>([]);
+  const [events, setEvents] = useState<ControlPlaneEntry[]>([]);
   const [outcome, setOutcome] = useState<{
     status: 'blocked' | 'clean';
     headline: string;
@@ -488,6 +490,7 @@ export function ControlRoom({
   // and the sleep guard drop writes from an abandoned run, so an in-flight
   // stream cannot bleed into the newly selected scenario.
   const genRef = useRef(0);
+  const nextControlPlaneEventIdRef = useRef(0);
   // Abandon any in-flight scenario run when the control room unmounts (sign-
   // out tears down the app), so an orphaned run stops making real
   // PolicyEngine/audit calls into a detached instance. A mounted flag (not a
@@ -504,6 +507,12 @@ export function ControlRoom({
 
   const scenario = SCENARIOS.find((s) => s.id === selectedId) ?? null;
   const isWire = selectedId === 'wire-transfer';
+
+  function appendControlPlaneEvent(event: EngineEvent): void {
+    const id = nextControlPlaneEventIdRef.current;
+    nextControlPlaneEventIdRef.current += 1;
+    setEvents((previous) => [...previous, { id, event }]);
+  }
 
   async function startWire(): Promise<void> {
     if (actor === null) return;
@@ -565,7 +574,7 @@ export function ControlRoom({
           if (live()) setAgentText((prev) => prev + text);
         },
         emitEvent: (event) => {
-          if (live()) setEvents((prev) => [...prev, event]);
+          if (live()) appendControlPlaneEvent(event);
         },
         sleep: (ms) =>
           new Promise<void>((resolve, reject) => {
@@ -582,13 +591,10 @@ export function ControlRoom({
       })
       .catch((caught: unknown) => {
         if (caught instanceof AbandonedError || !live()) return;
-        setEvents((prev) => [
-          ...prev,
-          {
-            kind: 'note',
-            text: `Scenario error: ${caught instanceof Error ? caught.message : String(caught)}`,
-          },
-        ]);
+        appendControlPlaneEvent({
+          kind: 'note',
+          text: `Scenario error: ${caught instanceof Error ? caught.message : String(caught)}`,
+        });
         setPhase('done');
       });
   }

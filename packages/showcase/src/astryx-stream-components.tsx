@@ -28,44 +28,51 @@ const TOAST_STATUS: Record<Tone, BannerStatus> = {
 // text always states the true total.
 const MAX_PRESENCE_AVATARS = 5;
 
-export const astryxStreamComponents: Required<
-  Pick<ApprovalUIComponents, 'Toast' | 'PresenceIndicator'>
-> = {
-  // A live surface (a decision conflict, a transient stream event): an Astryx
-  // Banner rendered INLINE — this is a render slot, not the imperative toast
-  // viewport — dismissable when onDismiss is supplied.
-  Toast: ({ tone, title, onDismiss }) => (
-    <Banner
-      status={TOAST_STATUS[tone]}
-      title={title}
-      isDismissable={onDismiss !== undefined}
-      onDismiss={onDismiss}
-    />
-  ),
-  // Reviewers currently on the tenant's live stream, as overlapping avatars
-  // (initials from the actor id) plus a count. a11y: each avatar's alt names its
-  // actor and role (Avatar surfaces alt on hover and to screen readers).
-  PresenceIndicator: ({ members }) => {
-    if (members.length === 0) return null;
-    const shown = members.slice(0, MAX_PRESENCE_AVATARS);
-    return (
-      <HStack gap={2} align="center" wrap="wrap">
-        <AvatarGroup size="small">
-          {shown.map((member) => (
-            <Avatar
-              key={`${member.actorId}:${member.role}`}
-              name={member.actorId}
-              alt={`${member.actorId}, ${member.role}`}
-              size="small"
-            />
-          ))}
-        </AvatarGroup>
-        <Text size="sm" color="secondary">
-          {members.length === 1
-            ? '1 reviewer online'
-            : `${members.length} reviewers online`}
-        </Text>
-      </HStack>
-    );
-  },
+type StreamSlot<Name extends 'Toast' | 'PresenceIndicator'> = NonNullable<
+  ApprovalUIComponents[Name]
+>;
+
+// A live surface (a decision conflict, a transient stream event): an Astryx
+// Banner rendered INLINE — this is a render slot, not the imperative toast
+// viewport — dismissable when onDismiss is supplied.
+export const AstryxToast: StreamSlot<'Toast'> = ({
+  tone,
+  title,
+  onDismiss,
+}) => (
+  <Banner
+    status={TOAST_STATUS[tone]}
+    title={title}
+    isDismissable={onDismiss !== undefined}
+    onDismiss={onDismiss}
+  />
+);
+
+// Reviewers currently on the tenant's live stream, as overlapping avatars
+// (initials from the actor id) plus a count. a11y: each avatar's alt names its
+// actor and role (Avatar surfaces alt on hover and to screen readers).
+export const AstryxPresenceIndicator: StreamSlot<'PresenceIndicator'> = ({
+  members,
+}) => {
+  if (members.length === 0) return null;
+  const shown = members.slice(0, MAX_PRESENCE_AVATARS);
+  return (
+    <HStack gap={2} align="center" wrap="wrap">
+      <AvatarGroup size="small">
+        {shown.map((member) => (
+          <Avatar
+            key={`${member.actorId}:${member.role}`}
+            name={member.actorId}
+            alt={`${member.actorId}, ${member.role}`}
+            size="small"
+          />
+        ))}
+      </AvatarGroup>
+      <Text size="sm" color="secondary">
+        {members.length === 1
+          ? '1 reviewer online'
+          : `${members.length} reviewers online`}
+      </Text>
+    </HStack>
+  );
 };

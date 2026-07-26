@@ -1,98 +1,215 @@
-# Breakwater Architecture
+# Breakwater architecture
 
-Breakwater is the safety middleware package (`@proofoftech/breakwater`). It plugs into Mastra as input/output processors (agent boundary), providing open-source RBAC and audit logging as Mastra middleware. The tool-boundary connector wrapper is specified in [`connector-interface.md`](connector-interface.md). Workflow-level role gating is not a breakwater wrapper: it is realized at the HTTP boundary by flowsafe's host-kit run router (`WorkflowMeta.allowedRoles`), because Mastra processors run only around agent/model calls, not arbitrary workflow steps.
+Breakwater is the guardrail package in Anchorage. It integrates with Mastra at two different boundaries:
 
-## Package Structure
+- Mastra processors authorize and inspect an agent's input and output.
+- `createConnector()` wraps a Mastra tool so permission checks run immediately before every execution path.
 
-Breakwater contains three subpackages. RBACMiddleware and PolicyEngine compose as a Mastra processor chain around an agent's model call, with AuditLogger as a shared sink both gates write to:
+These boundaries solve different problems. A processor cannot protect a tool invoked directly or from an ordinary workflow step, while a tool wrapper cannot inspect the model's full response stream.
 
+## Public modules
+
+| Module | Responsibility |
+| --- | --- |
+| `@proofoftech/breakwater/policy-engine` | Input/output processor, content policies, and tool-policy evaluators |
+| `@proofoftech/breakwater/rbac` | Actor contract, five roles, and agent input authorization |
+| `@proofoftech/breakwater/audit` | Shared audit logger, metrics adapter, and sink fan-out |
+| `@proofoftech/breakwater/connector-sdk` | Enforced permission manifest, guarded fetch, replay, dry-run, rate limit, and stores |
+| `@proofoftech/breakwater/agent-cli` | Approval-gated Claude Code and Codex workspace connectors |
+
+The package root re-exports all five modules, including the agent CLI. Prefer the explicit `@proofoftech/breakwater/agent-cli` subpath for CLI connectors so their Node-specific process boundary remains visible at the import site.
+
+## Enforcement flow
+
+```text
+verified host identity
+        |
+        v
+Mastra RequestContext
+        |
+        +--> RBACMiddleware ----------> allow or abort before model call
+        |
+        +--> PolicyEngine input ------> inspect all input text
+        |
+        v
+model and agent loop
+        |
+        +--> createConnector tool ----> declaration egress
+        |                              custom evaluators
+        |                              approval grant
+        |                              idempotency reservation/replay
+        |                              shared rate budget
+        |                              runtime.fetch per-hop egress
+        |
+        v
+PolicyEngine output stream/result ----> inspect answer, reasoning, object
+        |
+        v
+client
+
+Every gate ---------------------------> shared AuditLogger
 ```
-┌───────────────────────────────────────────────────────┐
-│                     Breakwater                          │
-│  ┌─────────────────────────────────────────────────┐  │
-│  │  RBACMiddleware                                  │  │
-│  │  Roles, scopes, authorization                    │  │
-│  │  (@proofoftech/breakwater/rbac)                  │  │
-│  └──────────────────────┬────────────────────────────┘  │
-│                         │                              │
-│  ┌──────────────────────┴────────────────────────────┐  │
-│  │  AuditLogger                                     │  │
-│  │  Structured audit logging                        │  │
-│  │  (@proofoftech/breakwater/rbac)                  │  │
-│  └──────────────────────┬────────────────────────────┘  │
-│                         │                              │
-│  ┌──────────────────────┴────────────────────────────┐  │
-│  │  PolicyEngine                                    │  │
-│  │  Pre/post gate evaluation                        │  │
-│  │  (@proofoftech/breakwater/policy-engine)         │  │
-│  └─────────────────────────────────────────────────┘  │
-└───────────────────────────────────────────────────────┘
-```
 
-## Integration with Mastra
+Array order determines processor order. A denial aborts the chain, so `AuditLogger` is an injected sink rather than a processor placed after the gates.
 
-Breakwater's agent-boundary controls integrate as a Mastra processor chain (`@mastra/core/processors`, part of `@mastra/core@^1.50.0`):
+## Agent-boundary integration
 
 ```typescript
 import { Agent } from '@mastra/core/agent';
-import { AuditLogger, RBACMiddleware } from '@proofoftech/breakwater/rbac';
-import { denyPatterns, PolicyEngine } from '@proofoftech/breakwater/policy-engine';
+import {
+  AuditLogger,
+  denyPatterns,
+  piiSecrets,
+  PolicyEngine,
+  RBACMiddleware,
+} from '@proofoftech/breakwater';
 
-// RBAC and PolicyEngine implement Mastra's Processor interface and run as input
-// (pre-gate) and/or output (post-gate) processors, sequentially in array order.
-// AuditLogger is a shared sink injected into each gate -- NOT a peer processor:
-// a denial aborts the chain, so a processor placed after the gate could never
-// observe it. Each gate emits an audit event as it evaluates, so a denial is
-// recorded at whichever gate fires. A shared PolicyEngine spans both gates so
-// pre/post state is shared.
 const audit = new AuditLogger();
-const policy = new PolicyEngine({ policies: [denyPatterns(['rm -rf'])], audit });
+const policy = new PolicyEngine({
+  policies: [
+    denyPatterns(['ignore previous instructions']),
+    piiSecrets(),
+  ],
+  audit,
+  holdBack: true,
+});
 
-const guardedAgent = new Agent({
+const model = process.env.MASTRA_MODEL_ID;
+if (!model) throw new Error('MASTRA_MODEL_ID is required');
+
+export const agent = new Agent({
   id: 'guarded-agent',
-  name: 'guarded-agent',
-  instructions: 'Domain agent guarded by breakwater.',
-  model: 'openai/gpt-4o',
-  inputProcessors: [new RBACMiddleware({ allowedRoles: ['operator', 'admin'], audit }), policy],
+  name: 'Guarded agent',
+  instructions: 'Act only within the supplied permissions.',
+  model,
+  inputProcessors: [
+    new RBACMiddleware({
+      allowedRoles: ['operator', 'admin'],
+      audit,
+    }),
+    policy,
+  ],
   outputProcessors: [policy],
 });
 ```
 
-Input processors run before the model call (pre-gate); output processors run after the response is produced (post-gate), each in array order. A processor runs only in the phase(s) it is registered for; the shared PolicyEngine sits in both arrays, so it gates pre and post. Because a denial aborts the chain, AuditLogger is a shared sink each gate writes to rather than a peer processor — a denial is recorded at whichever gate fires, which a processor placed after that gate could not observe.
+`RBACMiddleware` reads `breakwater.actor` by default. The host must verify identity before creating that context. Its flat role membership check is intentionally smaller than an identity provider or general ACL service.
 
-This snippet shows breakwater's **agent-boundary** integration: processors gate an Agent's model call. **Workflow-level role gating** is a separate, realized mechanism that lives in flowsafe, not breakwater: the host-kit run router checks the authenticated actor's role against each workflow's `WorkflowMeta.allowedRoles` before a run starts or resumes, because Mastra processors run only around agent/model calls, not arbitrary workflow steps. The [`custom-workflow-scoping` sketch](examples/custom-workflow-scoping.ts) is a non-runnable design sketch of that idea, not a shipped breakwater API.
+`PolicyEngine` can gate:
 
-## Subpackages
+- input message text;
+- answer deltas and final text;
+- reasoning deltas;
+- structured-object stream snapshots;
+- custom synchronous or asynchronous policy evaluators.
 
-### RBACMiddleware (@proofoftech/breakwater/rbac)
+Structured-object values are available on Mastra's streaming path. Under the supported Mastra version, non-streaming `generate()` exposes structured output through answer text rather than a separate result object. A policy scoped only to `object` therefore has no non-streaming result coverage; the engine requires an audit sink for that configuration and records the limitation.
 
-Five roles: admin, builder, operator, reviewer, viewer. The check is a deliberate flat `allowedRoles` membership test on the actor, read from `requestContext` (`ACTOR_CONTEXT_KEY`) or a custom `getActor` seam — API keys and JWTs plug in through that seam (flowsafe's host-kit ships the bearer-token and HS256 verifiers); no OIDC provider ships today. As a Mastra input processor it authorizes an agent's model call; per-workflow role gating happens at the HTTP boundary in flowsafe's host-kit run router (`WorkflowMeta.allowedRoles`), not in this package.
+## Streaming behavior
 
-### AuditLogger (@proofoftech/breakwater/audit)
+The engine accumulates each output channel independently. Built-in incremental policies keep scan cursors so work grows with the new data rather than rescanning the entire stream.
 
-Structured audit log for every action: who, what, when, result, reason. Buffers in memory with an injectable `sink` seam (re-exported from `/rbac` for compatibility); the durable Cloudflare Queues → SIEM export path ships in `@proofoftech/flowsafe/audit-export` and plugs into that seam.
+With `holdBack: true`, the engine retains the largest trailing window requested by policies on each answer or reasoning segment. Clean text behind the window is released; the tail is reprocessed at the channel end. Structured-object intermediate snapshots are withheld until a passing result.
 
-### PolicyEngine (@proofoftech/breakwater/policy-engine)
+The guarantee is per stream segment. A custom policy participates only when it supplies an appropriate `holdBackChars` hint. An asynchronous classifier has no natural bounded window; use `Infinity` when the full segment must remain buffered until classification.
 
-Pre-gate and post-gate content evaluation over the answer/reasoning/object output channels (deny patterns, length limits, PII/secret content inspection via `piiSecrets` — regex + entropy + Luhn detectors with allowlist exemptions — a pluggable async classifier via `classifierPolicy`, and opt-in hold-back buffering), with custom policies as evaluator functions returning `{ allowed: boolean, reason?: string }`. Tool-boundary policies (network-egress declaration gate, write approval, tenant and cross-workflow isolation) live in `tool-policy.ts` and are enforced by the connector SDK before a connector executes — pre-execute deny, not post-execute redaction.
+## Tool-boundary integration
 
-## Tenancy
+`createConnector()` returns a Mastra `Tool` with a permission manifest compiled into its `execute` path. The gates apply to agent calls, workflow calls, nested calls, and direct calls.
 
-Breakwater is **tenant-agnostic by design**: it is a standalone Apache-2.0
-library, and no gate needs tenant identity — `RBACMiddleware` decides on
-`actor.role`, `PolicyEngine` on message content. Its `Actor` therefore has no
-`tenantId`, and its audit events carry none.
+The execution order is:
 
-A multi-tenant host passes one **opaque scope string** through requestContext
-(`breakwater.isolationScope`), which breakwater never interprets — the same
-arrangement `crossWorkflowIsolation` already uses for
-`breakwater.workflowScope`. The scope segments the connector SDK's idempotency
-and rate-limit keys, and the optional `tenantIsolation()` evaluator denies a
-call that arrives without one. Absent scope reproduces the single-tenant
-behaviour exactly. See [`connector-interface.md`](connector-interface.md).
+1. Validate connector construction and input.
+2. Check declared egress against the host's organization allowlist.
+3. Run custom tool evaluators such as tenant and workflow isolation.
+4. Select dry-run or real execution.
+5. Require the server-derived connector grant when policy demands approval.
+6. Reserve or replay an idempotency key.
+7. Consume a shared fixed-window rate budget.
+8. Call the connector with a `ConnectorRuntime.fetch` bound to declared egress.
+9. Validate output and commit the replay record.
+10. Audit the final decision or contained error at the gate that observed it.
 
-## Dependencies
+Mastra's native `requireApproval` predicate is also set so an agent loop can pause for a reviewer. It does not replace the request-context grant. The wrapper remains the authority on every invocation path.
 
-- Requires `@mastra/core@^1.50.0` (Processor API)
-- No direct dependency on `flowsafe` or Cloudflare DO
-- Works in any Mastra deployment target (Node.js, Workers, Vercel, etc.)
+Read [Connector interface](connector-interface.md) for the complete contract.
+
+## Egress boundary
+
+The manifest declaration and injected fetch are separate checks:
+
+- `networkEgress()` compares the connector's declared hosts with deployment policy before execution.
+- `runtime.fetch` checks the actual URL and every redirect hop against the connector declaration.
+
+Cross-origin redirect hops strip credential headers. A 307/308 redirect with a one-shot stream body is refused because replaying it safely is impossible.
+
+This is not socket interception. Code that calls global `fetch`, opens a socket, or uses an SDK with an independent HTTP stack bypasses runtime-fetch enforcement. Inject `runtime.fetch` into compatible SDKs and apply infrastructure egress controls around the process.
+
+## Replay and rate budgets
+
+An idempotency record can be:
+
+- absent, so the caller reserves it;
+- pending, so a same-key caller waits or a durable store later takes over a stale reservation;
+- complete, so the stored result is replayed without execution.
+
+`AtomicIdempotencyStore` uses lease tokens for release and stale takeover. `D1IdempotencyStore` uses an insert claim and compare-and-swap updates across isolates. Set its pending TTL longer than the maximum connector execution.
+
+Rate limits use fixed windows. A burst across adjacent windows can approach twice the nominal count, and clock skew can amplify this across isolates. Use `D1RateLimitStore` when the budget must be shared across per-run Durable Objects.
+
+Only actual executions consume the budget. Denials, dry-runs, stored replays, and joined in-flight twins do not.
+
+## Isolation context
+
+Breakwater remains tenant-agnostic. Its `Actor` has no tenant id.
+
+A trusted multi-tenant runtime writes an opaque value to `breakwater.isolationScope`. The connector SDK uses it to segment idempotency and rate keys, and `tenantIsolation()` refuses a call without it. Breakwater does not parse the scope.
+
+Similarly, `breakwater.workflowScope` identifies the current runtime leg for `crossWorkflowIsolation()`. A connector-specific `targetScopeOf` extracts the workflow a call wants to access. Missing caller scope or a different target fails closed.
+
+Flowsafe mints both values on every run leg. A single-tenant host may omit tenant isolation and retain unsegmented keys.
+
+## Audit and metrics
+
+Every gate writes an `AuditEvent` with timestamp, actor, action, resource, decision, optional reason, and structured detail.
+
+`AuditLogger` keeps a bounded in-memory ring and invokes its sink without making export availability part of the agent path. Supply `onSinkError` to surface failures.
+
+`metricsAuditSink()` maps events to:
+
+- `breakwater.audit.decision`, tagged by action and decision;
+- `breakwater.audit.duration_seconds`, when a non-negative finite duration is present.
+
+`combineAuditSinks()` runs every sink and aggregates failures after all settle. Flowsafe's Queue sink can carry the same events to a SIEM.
+
+## Agent CLI boundary
+
+The Claude Code and Codex adapters are write-class connectors. They preserve the connector grant, idempotency, rate-limit, audit, and dry-run behavior, then add:
+
+- an argv array with no shell;
+- an explicit `--` before the prompt;
+- option values bound with `--flag=value`;
+- a trusted working directory;
+- timeout and bounded UTF-8 output capture;
+- prompt-free commands, errors, validation, replay output, and audit summaries;
+- static workspace-edit permission flags for the supported vendor CLIs.
+
+The default runner requires Node. Infrastructure must still isolate the child process, workspace, credentials, and network.
+
+See [Agent CLI connectors](agent-cli-connectors.md).
+
+## Ownership split
+
+Breakwater does not implement:
+
+- authentication or OAuth;
+- workflow route authorization;
+- a tenant registry;
+- approval queue persistence or reviewer UX;
+- durable workflow execution;
+- data retention scheduling;
+- network perimeter isolation.
+
+Flowsafe owns workflow route authorization, durable approvals, runtime-derived grants, tenant execution context, D1 retention, and Cloudflare deployment helpers. The host owns identity, business policy, secrets, infrastructure boundaries, and which optional features are exposed.
+
+See [Product boundaries](breakwater-purpose-and-boundaries.md) for the Mastra comparison.

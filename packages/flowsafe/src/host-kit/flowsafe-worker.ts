@@ -82,13 +82,13 @@ export interface FlowsafeWorkerEnv {
   /** The runner DO namespace createDoRunTopology drives. */
   RUNNER: RunnerNamespaceLike;
   /**
-   * Optional per-tenant hub DO namespace for live streaming (DL-009/DL-019).
+   * Optional per-tenant hub Durable Object namespace for live streaming.
    * Present together with STREAM_TICKET_SECRET => the composer mounts the stream
    * stage and fans approval mutations out to the tenant hub; either absent =>
    * streaming stays unmounted and the client remains poll-only.
    */
   HUB?: HubNamespaceLike;
-  /** Dedicated stream-ticket signing secret (DL-019). Absent => no streaming. */
+  /** Dedicated stream-ticket signing secret. Absent means no streaming. */
   STREAM_TICKET_SECRET?: string;
   /** Default SLA seconds for new approvals (var; default 14400 = 4h). */
   APPROVAL_SLA_SECONDS?: string;
@@ -117,7 +117,7 @@ export interface FlowsafeWorkerEnv {
    */
   THREAD_RETENTION_DAYS?: string;
   /**
-   * Track C agent-inbox TTL in days (var). The purge cron reaps TERMINAL
+   * Agent-inbox TTL in days. The purge cron reaps terminal
    * `mastra_notifications` rows past this age (pending rows are never reaped —
    * one may await a future deliverAt). UNSET/EMPTY/INVALID => the duty does not
    * run and no notification ever expires (opt-in, like THREAD_RETENTION_DAYS —
@@ -125,14 +125,14 @@ export interface FlowsafeWorkerEnv {
    */
   NOTIFICATION_RETENTION_DAYS?: string;
   /**
-   * Track C thread-state TTL in days (var). The purge cron reaps
+   * Thread-state TTL in days. The purge cron reaps
    * `mastra_thread_state` rows (state-signal lanes + goals) untouched for longer
    * than this. UNSET/EMPTY/INVALID => the duty does not run (opt-in; an active
    * goal bumps updatedAt so it never ages out).
    */
   THREAD_STATE_RETENTION_DAYS?: string;
   /**
-   * Track D schedule-trigger history TTL in days (var). The purge cron reaps
+   * Schedule-trigger history TTL in days. The purge cron reaps
    * `mastra_schedule_triggers` rows past this age by their `actualFireAt`.
    * UNSET/EMPTY/INVALID => the duty does not run (opt-in; a schedule's fire
    * history is inspectable until the host sets a window). The schedule rows
@@ -146,8 +146,8 @@ export interface FlowsafeWorkerEnv {
 }
 
 /**
- * Track B background-task TTL cleanup config, surfaced through
- * FlowsafeWorkerConfig (DL-003). Mirrors core BackgroundTaskManager.cleanup's
+ * Background-task TTL cleanup config, surfaced through
+ * FlowsafeWorkerConfig. Mirrors core BackgroundTaskManager.cleanup's
  * two windows.
  */
 export interface BackgroundTasksCleanupConfig {
@@ -175,8 +175,8 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
   buildVerifier: (env: Env) => TokenVerifier;
   /**
    * The cron expressions scheduled() dispatches on. `sweep` + `purge` are
-   * required and must never share an invocation. `tick` is OPTIONAL (Track D
-   * schedules): when set AND `scheduleTick` is provided, the schedule tick runs
+   * required and must never share an invocation. `tick` is optional for
+   * schedules: when set and `scheduleTick` is provided, the schedule tick runs
    * on it as its OWN failure-isolated invocation (a runaway fire pass gets its
    * own CPU budget, the same rationale that keeps sweep and purge apart). Keep
    * these byte-equal to wrangler.jsonc's `triggers.crons`; an unrecognized
@@ -229,7 +229,7 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
    */
   artifactStore?: TenantArtifactPurger;
   /**
-   * Opt-in background-task TTL cleanup (Track B). When present, the purge cron
+   * Opt-in background-task TTL cleanup. When present, the purge cron
    * reaps terminal `mastra_background_tasks` rows past the TTL as its OWN
    * failure-isolated duty — the storage-layer belt to a hosting DO's manager
    * cleanup (which needs the DO alive). Absent => no duty, byte-identical
@@ -238,7 +238,7 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
    */
   backgroundTasks?: BackgroundTasksCleanupConfig;
   /**
-   * Opt-in Track C signal ingestion stage (P6, DL-006). The host builds its
+   * Opt-in signal-ingestion stage. The host builds its
    * `createSignalRouter` (which needs its per-thread DO namespace via
    * createThreadTopology, plus its audit/rate/allowlist config) and returns it
    * here, closed over the request's resolved TenantResolver; the composer mounts
@@ -252,7 +252,7 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
     env: Env,
   ) => ((request: Request) => Promise<Response | null>) | undefined;
   /**
-   * Opt-in Track F goal objective stage (P6-lite, DL-018). Mirrors
+   * Opt-in goal-objective stage. Mirrors
    * buildSignalRouter: the host builds its `createObjectiveRouter` (which needs
    * the thread-state store from its D1 domains, plus its audit/maxRuns config)
    * and returns it here, closed over the request's resolved TenantResolver; the
@@ -267,7 +267,7 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
     env: Env,
   ) => ((request: Request) => Promise<Response | null>) | undefined;
   /**
-   * Opt-in Track D schedule CRUD facade (DL-013). Mirrors buildSignalRouter/
+   * Opt-in schedule CRUD facade. Mirrors buildSignalRouter/
    * buildObjectiveRouter: the host builds its `createScheduleRouter` (which needs
    * the schedules store from its D1 domains + its audit/cap config) and returns it
    * here, closed over the request's resolved TenantResolver; the composer mounts it
@@ -281,7 +281,7 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
     env: Env,
   ) => ((request: Request) => Promise<Response | null>) | undefined;
   /**
-   * Opt-in Track D schedule tick (DL-012). The host builds its `createScheduleTick`
+   * Opt-in schedule tick. The host builds its `createScheduleTick`
    * (which needs the schedules store, its run-start seam — topology.start — and
    * the run-cap + audit config) and returns the closure here. The composer runs
    * it on the `crons.tick` cron as its OWN failure-isolated duty (own try/catch,

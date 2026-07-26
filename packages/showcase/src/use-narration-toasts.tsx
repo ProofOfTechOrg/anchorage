@@ -31,7 +31,9 @@ export function useNarrationToasts(
   // Read the latest actions from the effect without re-running it when the
   // callbacks' identities churn.
   const actionsRef = useRef(actions);
-  actionsRef.current = actions;
+  useEffect(() => {
+    actionsRef.current = actions;
+  }, [actions]);
 
   useEffect(() => {
     if (seenRef.current === null) {

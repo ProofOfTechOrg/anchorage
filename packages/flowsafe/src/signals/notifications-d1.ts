@@ -510,12 +510,11 @@ export class D1NotificationsStorage extends NotificationsStorage {
    * Due pending notifications across ALL threads/tenants, filtered only by the
    * optional agentId/resourceId — GLOBALLY UNSCOPED by tenant, exactly like
    * core's InMemory reference (a cron dispatcher's cross-thread sweep). It is a
-   * TCB-only read (no client route reaches it), so this is not a leak here — but
-   * it is a CLOSE-BEFORE-WIRING constraint for Track A: whatever dispatcher
-   * drives delivery from this list MUST scope each dispatch by the row's salted
+   * trusted-computing-base-only read (no client route reaches it), so this is
+   * not a leak here. The trusted dispatcher that drives delivery from this list
+   * must scope each dispatch by the row's tenant-salted
    * `resourceId` (`${tenantId}_…`) / per-thread `threadId` before it acts, or a
    * cross-tenant sweep would deliver one tenant's inbox into another's loop.
-   * (See signals/CLAUDE.md — the F3 dispatcher-scope note.)
    */
   async listDueNotifications(
     input: ListDueNotificationsInput,

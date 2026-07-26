@@ -170,8 +170,9 @@ describe('RBACMiddleware', () => {
     expect(audit.events()[0]).toMatchObject({
       decision: 'error',
       actor: null,
-      reason: 'getActor threw: jwt decode failed',
+      reason: 'actor lookup failed',
     });
+    expect(JSON.stringify(audit.events())).not.toContain('jwt decode failed');
   });
 
   it('rejects an empty allowedRoles list at construction', () => {

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["index.ts"],
+  "entryPointStrategy": "resolve",
+  "tsconfig": "tsconfig.json",
+  "name": "@proofoftech/flowsafe/approval-ui",
+  "excludeInternal": true,
+  "intentionallyNotExported": [
+    "ApprovalDecision",
+    "ApprovalListFilter",
+    "ApprovalMetrics",
+    "ApprovalRecord",
+    "ApprovalStatus",
+    "ApprovalStreamEvent",
+    "BatchDecideResult",
+    "DecideResult",
+    "METRIC_TIPS"
+  ],
+  "validation": {
+    "notExported": true,
+    "invalidLink": true,
+    "invalidPath": true
+  }
+}

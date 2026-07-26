@@ -1,0 +1,42 @@
+name: Feature request
+description: Propose a new capability or public API.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and use case
+      description: Describe the concrete user, threat, workflow, or operational problem.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the API or behavior and the conditions under which it must work.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Explain current workarounds and why they are insufficient.
+  - type: dropdown
+    id: package
+    attributes:
+      label: Likely scope
+      options:
+        - "@proofoftech/breakwater"
+        - "@proofoftech/flowsafe"
+        - Both packages
+        - Showcase, documentation, or tooling
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and tenancy impact
+      description: Note changes to trust boundaries, capability minting, tenant isolation, retention, or unattended execution.

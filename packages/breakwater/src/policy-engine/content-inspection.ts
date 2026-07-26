@@ -55,6 +55,7 @@ export const PII_SECRETS_DETECTOR_IDS = [
   'highEntropy',
 ] as const;
 
+/** Identifier accepted by {@link PiiSecretsOptions.detectors}. */
 export type PiiSecretsDetectorId = (typeof PII_SECRETS_DETECTOR_IDS)[number];
 
 const DEFAULT_ENTROPY_THRESHOLD = 4.5;
@@ -294,7 +295,9 @@ function scanForDenial(
   return undefined;
 }
 
+/** Configuration for {@link piiSecrets}. */
 export interface PiiSecretsOptions {
+  /** Policy name used in denials and audit records. */
   name?: string;
   /** Subset of detector ids to run. Default: all. */
   detectors?: readonly PiiSecretsDetectorId[];
@@ -305,6 +308,7 @@ export interface PiiSecretsOptions {
   allowlist?: readonly (string | RegExp)[];
   /** Minimum bits/char for the highEntropy detector. Default 4.5. */
   entropyThreshold?: number;
+  /** Agent lifecycle phases to inspect. Default: both input and output. */
   phases?: readonly PolicyPhase[];
   /** Default: ['answer', 'reasoning', 'object'] — leak prevention, matching denyPatterns' default. */
   channels?: readonly OutputChannel[];
@@ -387,13 +391,16 @@ export function piiSecrets(options: PiiSecretsOptions = {}): PolicyEvaluator {
 const DEFAULT_EVALUATE_EVERY_CHARS = 512;
 const DEFAULT_CLASSIFIER_CHANNELS: readonly OutputChannel[] = ['answer'];
 
+/** Configuration for {@link classifierPolicy}. */
 export interface ClassifierPolicyOptions {
+  /** Policy name used in denials and audit records. */
   name?: string;
   /** Async (or sync) classification of `text`; the authoritative decision for this call. */
   classify: (
     text: string,
     info: { phase: PolicyPhase; channel: OutputChannel },
   ) => PolicyDecision | Promise<PolicyDecision>;
+  /** Agent lifecycle phases to classify. Default: both input and output. */
   phases?: readonly PolicyPhase[];
   /** Default: ['answer']. */
   channels?: readonly OutputChannel[];

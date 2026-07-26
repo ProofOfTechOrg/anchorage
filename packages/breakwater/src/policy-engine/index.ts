@@ -33,6 +33,7 @@ import type { AuditLogger } from '../audit/index.js';
 import { type Actor, actorFromRequestContext } from '../rbac/index.js';
 import type { PolicyDecision } from './tool-policy.js';
 
+/** Agent lifecycle phase evaluated by a policy. */
 export type PolicyPhase = 'input' | 'output';
 
 /**
@@ -41,30 +42,17 @@ export type PolicyPhase = 'input' | 'output';
  * under); 'reasoning' is the model's reasoning trace; 'object' is structured
  * output, gated as the JSON-stringified latest snapshot.
  *
- * Coverage caveat: the 'object' channel is enforced on the STREAMING path
- * only ('object'/'object-result' chunks). Verified against the installed
- * @mastra/core 1.50.0 dist: OutputResult is exactly `{ text, usage,
- * finishReason, steps }` (dist/processors/index.d.ts) and steps carry no
- * object field either (LLMStepResult, dist/stream/types.d.ts) — there is no
- * structured-object value reachable at the result phase under ANY
- * structured-output mode. In core's DEFAULT mode ("direct" — used whenever
- * `output`/`experimental_output` is set without a separate structuring
- * model, dist/chunk-JGDMZZAO.js), the model's JSON is piped through as
- * ordinary text-delta chunks alongside the derived object/object-result
- * chunks (dist/chunk-XJNAKXUS.js's createObjectStreamTransformer forwards
- * the delta unchanged after deriving the object snapshot), so it lands in
- * result.text and IS caught by any policy whose channels include 'answer' —
- * this is a confirmed, designed cover for the common case, not a hedge. A
- * policy explicitly narrowed to channels that EXCLUDE 'answer' (e.g.
- * `channels: ['object']`) has zero result-phase coverage; PolicyEngine
- * detects that at construction — it REJECTS the engine when no audit sink is
- * present (the one-time warning would otherwise have nowhere to go), and with
- * a sink emits that warning the first time processOutputResult runs (see the
- * class doc).
+ * Under `@mastra/core` 1.50, the `object` channel is available only during
+ * streaming because the final output result has no structured-object field.
+ * Direct structured output is also emitted as answer text, so policies that
+ * include `answer` still inspect it. An object-only policy requires an audit
+ * sink so the engine can report the non-streaming coverage gap.
  */
 export type OutputChannel = 'answer' | 'reasoning' | 'object';
 
+/** Input passed to one policy evaluation. */
 export interface PolicyContext {
+  /** Lifecycle phase being evaluated. */
   phase: PolicyPhase;
   /** Output channel `text` came from. Always 'answer' in the input phase. */
   channel: OutputChannel;
@@ -78,6 +66,7 @@ export interface PolicyContext {
    * the streamed output accumulated so far, or the final output result.
    */
   text: string;
+  /** Mastra request context associated with the agent call. */
   requestContext?: RequestContext;
   /**
    * Streaming only: a scratch object private to this policy instance that
@@ -88,7 +77,9 @@ export interface PolicyContext {
   streamState?: Record<string, unknown>;
 }
 
+/** Policy evaluated by `PolicyEngine` at selected phases and channels. */
 export interface PolicyEvaluator {
+  /** Stable policy name used in audit events and denial messages. */
   name: string;
   /** Phases this policy gates. Default: both. */
   phases?: readonly PolicyPhase[];
@@ -105,6 +96,7 @@ export interface PolicyEvaluator {
    * hold-back coverage. `Infinity` buffers everything until stream finish.
    */
   holdBackChars?: number;
+  /** Decide whether the supplied policy context is allowed. */
   evaluate(context: PolicyContext): PolicyDecision | Promise<PolicyDecision>;
 }
 
@@ -246,8 +238,11 @@ function holdBackWindowFor(
   return window;
 }
 
+/** Configuration for `PolicyEngine`. */
 export interface PolicyEngineOptions {
+  /** Policies evaluated in array order. */
   policies: readonly PolicyEvaluator[];
+  /** Optional audit logger for policy decisions and evaluator failures. */
   audit?: AuditLogger;
   /**
    * Opt-in zero-leak streaming: hold back a trailing window of each text
@@ -275,28 +270,17 @@ export interface PolicyEngineOptions {
  * Mastra Processor implementing input/output policy gating — see the module
  * comment for the phase/channel model.
  *
- * Object-channel result-phase gap (audit D1): @mastra/core 1.50.0's
- * OutputResult has no structured-object field, so processOutputResult (the
- * only gate for non-streaming generate()) cannot evaluate an 'object'
- * channel as such — see OutputChannel's coverage caveat for the full
- * investigation. The constructor precomputes which registered policies are
- * scoped to 'object' WITHOUT 'answer' — the only configuration with zero
- * result-phase coverage, since an answer-inclusive policy is still caught
- * via the text-mirroring described there. If any exist, construction REJECTS
- * the engine when no audit sink is present (audit D1 — the one-time warning
- * would otherwise silently vanish); with a sink, the first processOutputResult
- * call emits one audit warning (`action: 'agent.output.policy'`, `decision:
- * 'error'`) and never repeats it for this engine instance. Policies left on
- * default channels are never warned about.
+ * Under `@mastra/core` 1.50, a final output result has no structured-object
+ * field. The constructor therefore requires an audit sink when a policy
+ * selects `object` without `answer`. The first final-result call then emits
+ * one coverage warning for that engine instance. Policies that include
+ * `answer` inspect the JSON text emitted by direct structured output.
  *
- * K2 config guard: the constructor also rejects a policy whose EXPLICIT
- * `phases` includes 'input' while its EXPLICIT `channels` excludes 'answer'
- * — processInput (below) hardcodes `channel: 'answer'`, so that combination
- * would otherwise silently never run on input. A policy that left either
- * field to its own default is not narrowing itself into the trap on
- * purpose, so it is not rejected.
+ * The constructor also rejects an explicit input policy whose channels
+ * exclude `answer`, because input evaluation has no other channel.
  */
 export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
+  /** Stable Mastra processor identifier. */
   readonly id = 'breakwater-policy-engine' as const;
   readonly #policies: readonly PolicyEvaluator[];
   readonly #audit?: AuditLogger;
@@ -610,8 +594,9 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
         );
       } catch (error) {
         // An evaluator crash is worse than a denial; it must not leave less
-        // audit evidence than one. Record, then fail closed.
-        const reason = `${policy.name} threw: ${error instanceof Error ? error.message : String(error)}`;
+        // audit evidence than one. Opaque exception text may contain the
+        // inspected payload, so the audit and streaming tripwire stay static.
+        const reason = 'policy evaluation failed';
         this.#audit?.record({
           actor,
           action: `agent.${phase}.policy`,

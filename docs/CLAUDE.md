@@ -1,27 +1,23 @@
-# docs/
+# Documentation navigation
 
-Architecture, design, security, and operations docs for Anchorage, plus TS workflow examples.
+Use [`README.md`](README.md) as the public documentation index. Author task-oriented guides in sentence case and keep uncommitted designs under [`proposals/`](proposals/) with a proposal banner.
 
-## Files
+Key references:
 
-| File | What | When to read |
-| ---- | ---- | ------------ |
-| `breakwater-architecture.md` | Safety middleware architecture (agent processor chain + connector/tool wrappers; workflow RBAC lives in flowsafe) | Implementing or modifying breakwater |
-| `breakwater-purpose-and-boundaries.md` | Plain-language purpose, actual agent RBAC scope, Mastra comparison, breakwater/flowsafe ownership split, caveats, and defensible positioning | Explaining what breakwater adds beyond Mastra or resolving ownership/enforcement confusion |
-| `breakwater-improvement-roadmap.md` | Prioritized must/should/could roadmap for agent access, mandatory guards, context capabilities, approval scope, permissions, connector assurance, testing, and operational hardening | Planning improvements after reviewing breakwater's actual boundaries and gaps |
-| `flowsafe-architecture.md` | Approval UX + DO runner architecture, the approval REST surface, and the three multi-tenancy invariants | Implementing or modifying flowsafe |
-| `do-runner-design.md` | Durable Object import-swap pattern, lifecycle, run identity + tenant scoping (INV-1), the ctx.storage resume ledger, retention vs tenant purge, and known Workers constraints | Implementing the DO runner, understanding Cloudflare-native execution |
-| `policy-engine-design.md` | Four policy domains (egress, write, retention, isolation — cross-workflow AND cross-tenant) beyond Mastra processors | Extending policy domains, implementing custom policies |
-| `connector-interface.md` | Connector permission / idempotency / dry-run manifest wrapping `createTool()` (`createConnector()`), and the opaque isolation scope that segments idempotency + rate-limit keys per tenant | Implementing or extending the connector SDK |
-| `model-gateway-policy.md` | Processor-based pre/post gates around `Agent.generate()` | Implementing guardrails around model calls |
-| `security-threat-model.md` | Assets, seven trust boundaries (incl. tenant↔tenant: INV-1/2/3 and the residuals they do not cover), threats (incl. content-inspection, notification-exposure, and agent-memory rows), RBAC model, audit log schema | Security review, threat modeling, RBAC design |
-| `agent-memory-tenancy.md` | Agent-memory tenancy: why Mastra threads/messages/resources are a cross-tenant leak unsalted, the INV-1 extension (salted threadId/resourceId, memory-id chokepoints, purgeTenant coverage — SHIPPED 2026-07-12), and the obligations the first agents-with-memory feature must implement (host boundary, recall-path proof, thread TTL) | Building or reviewing anything that touches Mastra agent memory |
-| `observability-and-quality.md` | Approval metrics, the audit→metrics adapter (`metricsAuditSink`), the notification seam, audit export, quality gates | Implementing observability, notification, and audit features |
-| `operations-runbook.md` | Build, deploy, tenant provisioning + offboarding, the two-cron split, incident response, and tuning | Deploying, operating, responding to incidents |
+- [`getting-started.md`](getting-started.md)
+- [`connector-interface.md`](connector-interface.md)
+- [`approval-system.md`](approval-system.md)
+- [`durable-agents.md`](durable-agents.md)
+- [`deployment-reference.md`](deployment-reference.md)
+- [`security-threat-model.md`](security-threat-model.md)
+- [`operations-runbook.md`](operations-runbook.md)
+- [`api-reference.md`](api-reference.md)
 
-## Subdirectories
+Commands:
 
-| Directory | What | When to read |
-| --------- | ---- | ------------ |
-| `examples/` | TypeScript `createWorkflow()` design sketches (serial, parallel, conditional, approval, RBAC scoping) — illustrative, not runnable | Learning Mastra workflow patterns and breakwater/flowsafe integration points |
-| `api/` | GENERATED typedoc output (`pnpm docs:api`), gitignored — never edit or commit | Browsing the generated API reference locally |
+```bash
+pnpm docs:check
+pnpm docs:api
+```
+
+`api/` is generated. Do not edit it by hand.

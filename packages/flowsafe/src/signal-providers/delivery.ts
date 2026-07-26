@@ -28,7 +28,7 @@ import type { StoredSubscription } from './subscription-d1.js';
 
 /**
  * A TenantContext for the SERVER-DERIVED delivery path — built from a trusted,
- * INV-3 tenantId recovered from a subscription row, never from client input. The
+ * validated tenantId recovered from a subscription row, never from client input. The
  * topology reads only `.tenantId` and `.ownsMemoryId`; the pure id helpers are
  * provided for completeness, and the request-scoped `service()` throws (a
  * delivery has no request, no store) so a misuse is loud rather than silent.

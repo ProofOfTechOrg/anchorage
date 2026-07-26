@@ -90,6 +90,7 @@ function bareRun(
 }
 
 const input = { email: 'ada@example.com' };
+const PRIVATE_BACKEND_SENTINEL = 'private-backend-sentinel-4a78e093';
 
 function makeConnector(
   overrides: Partial<Parameters<typeof createConnector>[0]> = {},
@@ -437,18 +438,25 @@ describe('custom tool-boundary evaluators', () => {
           {
             name: 'flaky',
             evaluate: () => {
-              throw new Error('policy backend down');
+              throw new Error(PRIVATE_BACKEND_SENTINEL);
             },
           },
         ],
       },
     });
     // #when / #then
-    await expect(run(tool, input)).rejects.toThrow('policy backend down');
+    await expect(run(tool, input)).rejects.toThrow(PRIVATE_BACKEND_SENTINEL);
     expect(execute).not.toHaveBeenCalled();
     expect(audit.events()).toMatchObject([
-      { decision: 'error', detail: { policy: 'flaky' } },
+      {
+        decision: 'error',
+        reason: 'flaky evaluator failed',
+        detail: { policy: 'flaky' },
+      },
     ]);
+    expect(JSON.stringify(audit.events())).not.toContain(
+      PRIVATE_BACKEND_SENTINEL,
+    );
   });
 });
 
@@ -898,7 +906,7 @@ describe('idempotency', () => {
     const store: IdempotencyStore = {
       get: () => undefined,
       put: () => {
-        throw new Error('d1 write failed');
+        throw new Error(PRIVATE_BACKEND_SENTINEL);
       },
     };
     const execute = vi.fn(async () => ({ ok: true }));
@@ -920,11 +928,22 @@ describe('idempotency', () => {
     ).toEqual({ ok: true });
     expect(execute).toHaveBeenCalledTimes(2);
     expect(audit.events()).toMatchObject([
-      { decision: 'error', detail: { stage: 'idempotency-store' } },
+      {
+        decision: 'error',
+        reason: 'idempotency store put failed',
+        detail: { stage: 'idempotency-store' },
+      },
       { decision: 'allowed', detail: { idempotencyKey: 'k1' } },
-      { decision: 'error', detail: { stage: 'idempotency-store' } },
+      {
+        decision: 'error',
+        reason: 'idempotency store put failed',
+        detail: { stage: 'idempotency-store' },
+      },
       { decision: 'allowed', detail: { idempotencyKey: 'k1' } },
     ]);
+    expect(JSON.stringify(audit.events())).not.toContain(
+      PRIVATE_BACKEND_SENTINEL,
+    );
   });
 
   it('fails closed when the store get fails', async () => {
@@ -932,7 +951,7 @@ describe('idempotency', () => {
     const audit = new AuditLogger();
     const store: IdempotencyStore = {
       get: () => {
-        throw new Error('d1 read failed');
+        throw new Error(PRIVATE_BACKEND_SENTINEL);
       },
       put: () => {},
     };
@@ -947,11 +966,18 @@ describe('idempotency', () => {
     // #when / #then
     await expect(
       run(tool, input, makeContext({ idempotencyKey: 'k1' })),
-    ).rejects.toThrow('d1 read failed');
+    ).rejects.toThrow(PRIVATE_BACKEND_SENTINEL);
     expect(execute).not.toHaveBeenCalled();
     expect(audit.events()).toMatchObject([
-      { decision: 'error', detail: { stage: 'idempotency-store' } },
+      {
+        decision: 'error',
+        reason: 'idempotency store get failed',
+        detail: { stage: 'idempotency-store' },
+      },
     ]);
+    expect(JSON.stringify(audit.events())).not.toContain(
+      PRIVATE_BACKEND_SENTINEL,
+    );
   });
 
   it('scopes keys per connector in a shared store', async () => {
@@ -1332,7 +1358,7 @@ describe('atomic idempotency (reserve path)', () => {
       get: () => undefined,
       put: () => {},
       reserve: () => {
-        throw new Error('d1 claim failed');
+        throw new Error(PRIVATE_BACKEND_SENTINEL);
       },
       release: () => {},
     };
@@ -1343,11 +1369,18 @@ describe('atomic idempotency (reserve path)', () => {
     // #when / #then
     await expect(
       run(tool, input, makeContext({ idempotencyKey: 'k1' })),
-    ).rejects.toThrow('d1 claim failed');
+    ).rejects.toThrow(PRIVATE_BACKEND_SENTINEL);
     expect(execute).not.toHaveBeenCalled();
     expect(audit.events()).toMatchObject([
-      { decision: 'error', detail: { stage: 'idempotency-store' } },
+      {
+        decision: 'error',
+        reason: 'idempotency store reserve failed',
+        detail: { stage: 'idempotency-store' },
+      },
     ]);
+    expect(JSON.stringify(audit.events())).not.toContain(
+      PRIVATE_BACKEND_SENTINEL,
+    );
   });
 
   it('audits a dedicated event when the reservation came from a stale-pending takeover', async () => {
@@ -1818,18 +1851,25 @@ describe('rate limit', () => {
       policies: {
         rateLimitStore: {
           increment: () => {
-            throw new Error('counter backend down');
+            throw new Error(PRIVATE_BACKEND_SENTINEL);
           },
         },
         audit,
       },
     });
     // #when / #then
-    await expect(run(tool, input)).rejects.toThrow('counter backend down');
+    await expect(run(tool, input)).rejects.toThrow(PRIVATE_BACKEND_SENTINEL);
     expect(execute).not.toHaveBeenCalled();
     expect(audit.events()).toMatchObject([
-      { decision: 'error', detail: { stage: 'rate-limit-store' } },
+      {
+        decision: 'error',
+        reason: 'rate-limit store increment failed',
+        detail: { stage: 'rate-limit-store' },
+      },
     ]);
+    expect(JSON.stringify(audit.events())).not.toContain(
+      PRIVATE_BACKEND_SENTINEL,
+    );
   });
 });
 
@@ -1976,8 +2016,9 @@ describe('audit attribution', () => {
   it('records execute crashes as errors and rethrows', async () => {
     // #given
     const audit = new AuditLogger();
+    const sentinel = 'private-prompt-and-stderr-sentinel';
     const execute = vi.fn(async () => {
-      throw new Error('boom');
+      throw new Error(sentinel);
     });
     const tool = createConnector({
       id: 'salesforce.createContact',
@@ -1987,14 +2028,15 @@ describe('audit attribution', () => {
       policies: { audit },
     });
     // #when / #then
-    await expect(run(tool, input)).rejects.toThrow('boom');
+    await expect(run(tool, input)).rejects.toThrow(sentinel);
     expect(audit.events()).toMatchObject([
       {
         decision: 'error',
-        reason: 'execute threw: boom',
+        reason: 'connector execution failed',
         detail: { stage: 'execute' },
       },
     ]);
+    expect(JSON.stringify(audit.events())).not.toContain(sentinel);
   });
 });
 

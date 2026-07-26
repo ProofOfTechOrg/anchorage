@@ -44,6 +44,12 @@ import type {
   StackGap,
   Tone,
 } from '@flowsafe/approval-ui/components';
+import { ApprovalUIProvider } from '@flowsafe/approval-ui/components';
+import type { ReactNode } from 'react';
+import {
+  AstryxPresenceIndicator,
+  AstryxToast,
+} from '@/astryx-stream-components';
 
 const BADGE_VARIANT: Record<Tone, BadgeVariant> = {
   neutral: 'neutral',
@@ -76,7 +82,7 @@ const GAP: Record<StackGap, 2 | 3 | 4> = { sm: 2, md: 3, lg: 4 };
 // (not the library), and Table only reads rows.
 type AstryxRow = ApprovalRecord & Record<string, unknown>;
 
-export const astryxComponents: ApprovalUIComponents = {
+const astryxComponents: ApprovalUIComponents = {
   Stack: ({ direction = 'vertical', gap = 'md', children }) => (
     // Horizontal rows must reflow: the library's FilterBar puts six fields +
     // two buttons in one Stack, which unwrapped overflows past the page's
@@ -172,6 +178,8 @@ export const astryxComponents: ApprovalUIComponents = {
       isDisabled={disabled}
     />
   ),
+  Toast: AstryxToast,
+  PresenceIndicator: AstryxPresenceIndicator,
   MetadataList: ({ children }) => (
     <AstryxMetadataList columns="multi">{children}</AstryxMetadataList>
   ),
@@ -228,3 +236,15 @@ export const astryxComponents: ApprovalUIComponents = {
     );
   },
 };
+
+export function AstryxApprovalUIProvider({
+  children,
+}: {
+  children: ReactNode;
+}) {
+  return (
+    <ApprovalUIProvider components={astryxComponents}>
+      {children}
+    </ApprovalUIProvider>
+  );
+}

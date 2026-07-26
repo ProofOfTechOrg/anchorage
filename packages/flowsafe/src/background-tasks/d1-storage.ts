@@ -46,9 +46,9 @@ export {
 
 /**
  * The D1 background-tasks storage domain the manager persists to, reached
- * through the manager's OWN access path — `mastra.getStorage()` then
- * `getStore('backgroundTasks')`, BOTH async, so this awaits (the CI-M-003-001
- * "getStorage() is async — await it" note). Fail-closed with a clear message
+ * through the manager's own access path — `mastra.getStorage()` then
+ * `getStore('backgroundTasks')`. The store lookup is asynchronous, so this
+ * helper awaits it. It fails closed with a clear message
  * when a host wired a Mastra with no storage, or a storage adapter that does not
  * implement the `backgroundTasks` domain, rather than surfacing core's terser
  * "Background tasks storage is not available" only once the first task

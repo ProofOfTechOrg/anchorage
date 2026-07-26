@@ -1,0 +1,69 @@
+name: Bug report
+description: Report a reproducible defect in Anchorage.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, tenant data, or other secrets. Report exploitable security defects through the private vulnerability-reporting link instead.
+  - type: dropdown
+    id: package
+    attributes:
+      label: Affected package or surface
+      options:
+        - "@proofoftech/breakwater"
+        - "@proofoftech/flowsafe"
+        - Showcase
+        - Documentation or tooling
+        - Multiple packages
+        - Unsure
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Include the Anchorage package version, @mastra/core version, and Node or Workers runtime.
+      placeholder: "@proofoftech/flowsafe 0.x, @mastra/core 1.x, Workers runtime date or Node 22.x"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Provide a repository, test, or complete sequence that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: topology
+    attributes:
+      label: Runtime and deployment topology
+      description: Describe Durable Object, D1, R2, Queue, WebSocket, binding, and multi-tenant details that affect the reproduction.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs or output
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues and documentation.
+          required: true
+        - label: This report does not disclose an exploitable vulnerability or secret.
+          required: true

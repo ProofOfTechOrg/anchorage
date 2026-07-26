@@ -1,190 +1,199 @@
-# Agent-Memory Tenancy
+# Agent-memory tenancy
 
-**Status: COMPLETE (2026-07-16, Track 0).** Both halves are built. The
-library-side chokepoints (2026-07-12): `do-runner/memory-id.ts`
-(mint/decode/ownership), `TenantContext.newThreadId()/newResourceId()/
-ownsMemoryId()`, `purgeTenant` coverage of the three memory tables, and the
-schema-guard column pins. The obligations they were built for (2026-07-16,
-items 5–7 below): the host boundary
-(`host-kit/memory-boundary.ts`), the agent-level recall-path proof
-(`do-runner/memory-recall-tenancy.test.ts`), and the thread TTL
-(`purgeExpiredThreads` on the purge cron). Enabling Mastra agent memory
-around these chokepoints (client-chosen ids, unsalted writes) is a
-cross-tenant leak by default, not a degraded mode.
+Mastra memory uses caller-selected thread and resource ids. Two tenants can choose the same business key, so a shared D1 database needs server-minted tenant identities before any agent reads or writes memory.
 
-## The hazard, precisely
+Flowsafe ships the complete boundary:
 
-Mastra agent memory persists conversation state in tables keyed by ids that
-INV-1 does **not** salt. `createD1Storage` eagerly creates six tables, and
-the multi-tenant invariants cover exactly one of them:
+- memory-id mint and ownership helpers;
+- `TenantContext` constructors;
+- public-body rejection and foreign-id 404;
+- thread Durable Object topology and identity assertion;
+- real Mastra D1 recall-path isolation proof;
+- offboarding for threads, messages, resources, notifications, state, and tasks;
+- opt-in idle-thread retention.
 
-| Table | Key | Covered today? |
-| ----- | --- | -------------- |
-| `mastra_workflow_snapshot` | `run_id` | Yes — INV-1: runIds are server-minted `${tenantId}_${uuid}`, so rows are tenant-disjoint and `purgeTenant`'s range delete is exact |
-| `mastra_threads` | `id` (threadId), `resourceId` | No — empty today; agent memory writes it |
-| `mastra_messages` | `id`, `thread_id` | No — empty today; agent memory writes it |
-| `mastra_resources` | `id` (resourceId) | No — empty today; agent-memory working memory writes it |
-| `mastra_scorers` | scorer run ids | No — empty today |
-| `mastra_background_tasks` | task ids | No — empty today |
+Using unsalted client-selected ids in a multi-tenant host is a cross-tenant disclosure, not a degraded mode.
 
-In Mastra's memory API, `threadId` and `resourceId` are **caller-chosen
-business identity** (a user id, an email, a conversation slug). Two tenants
-naming the same `resourceId` — trivially likely when hosts derive it from
-user identity — would read and write the *same* memory: semantic recall
-would retrieve tenant A's messages into tenant B's agent context. That is a
-fail-open cross-tenant leak on both the write and the read path. Before this
-design shipped, no chokepoint intercepted it: the flowsafe surface only
-persisted workflow snapshots, so none of INV-1/2/3 ever saw a thread or
-resource id.
+## Identity shape
 
-The standing tripwire is the table-inventory pin in
-`packages/flowsafe/src/do-runner/mastra-schema-guard.test.ts`: it fails CI
-when a `@mastra/core` bump changes the persistence inventory (a seventh
-table, a rename), forcing a re-read of this design. It **cannot** detect a
-feature that writes the memory tables around the chokepoints — that
-protection is doctrinal (this doc, root `CLAUDE.md`, and review).
+### Thread
 
-## Design: extend INV-1 to memory ids
+```text
+tenantId_uuid
+```
 
-One sentence: **salt memory ids at mint exactly like runIds, validate them
-at the boundary, and purge them by the same range predicate.** No new
-tenancy dimension, no flag, no post-read filtering.
+Create it with:
 
-### Identity shape (implemented)
+```typescript
+const threadId = tenant.newThreadId();
+```
 
-- `threadId` is server-minted `${tenantId}_${uuid}` — the INV-1 shape,
-  minted from the AUTHENTICATED tenant (never accepted from a client body,
-  mirroring `createRunRouter`'s 400 on client runIds). Constructor:
-  `mintThreadId(tenantId, mintUuid?)` in
-  `packages/flowsafe/src/do-runner/memory-id.ts`, or
-  `TenantContext.newThreadId()` in request scope.
-- `resourceId` is `${tenantId}_${resourceKey}` where `resourceKey` is the
-  host's business identity for the memory owner (user id, lead id),
-  validated against the do-runner's exported `PATH_SAFE_ID_PATTERN`.
-  Constructor: `mintResourceId(tenantId, resourceKey)` /
-  `TenantContext.newResourceId(resourceKey)`.
-- The INV-3 charset argument transfers verbatim and must not be re-derived:
-  `TENANT_ID_PATTERN = /^[a-z0-9]{3,32}$/` excludes `_` (0x5F) and backtick
-  (0x60), so the first `_` in any salted id is unambiguously the tenant
-  separator — prefix decode is exact (`tenantOfMemoryId` delegates to
-  `tenantOfRunId`, the ONE decode), and the `[`${tenantId}_`,
-  `${tenantId}\x60`)` range predicate `purgeTenant` uses for `run_id` is
-  exact over thread/resource/message keys too. Message ids themselves stay
-  unsalted by design: every purge and scoped query rides the salted
-  `thread_id`/`resourceId`.
+or the lower-level `mintThreadId(tenantId)`.
 
-### Chokepoints (one per resource class, INV-2 style — implemented)
+### Resource
 
-- **Minting** lives in one module (`do-runner/memory-id.ts`), exporting
-  `mintThreadId`/`mintResourceId` + `tenantOfMemoryId` +
-  `tenantOwnsMemoryId`. Both mints re-refuse non-INV-3 and reserved
-  (`system`) tenants. Hosts and the runtime import it; nothing else
-  constructs memory ids.
-- **Ownership assertion** on every memory read/write path: derive the tenant
-  from the authenticated actor (`TenantResolver` output, never the payload)
-  and require `threadId`/`resourceId` to carry that prefix
-  (`TenantContext.ownsMemoryId` / `tenantOwnsMemoryId`). This is the memory
-  analogue of the run-router's INV-1 ownership check, and 404 (not 403) on
-  foreign ids — no existence oracle.
-- **Runtime propagation** rides the seams that already exist: the DO runner
-  mints ids inside the trusted computing base and passes them through
-  requestContext (trust boundary 6 — never populated from client input,
-  model output, or tool results). `ISOLATION_SCOPE_CONTEXT_KEY` already
-  carries the opaque tenant scope per leg; memory id minting slots into the
-  same `requestContextForRun` seam the grant provider uses.
-- **Offboarding**: `purgeTenant`
-  (`packages/flowsafe/src/do-runner/d1-storage.ts`) range-deletes
-  `mastra_messages.thread_id`, `mastra_threads.id`, and
-  `mastra_resources.id` (children first) with the identical `[lower, upper)`
-  bounds it computes for `run_id`, reporting
-  `PurgeTenantResult.{threads,messages,resources}`. A missing table reads as
-  zero rows (same posture as the snapshot table), so memory-less deployments
-  purge unchanged.
+```text
+tenantId_resourceKey
+```
 
-### Shipped 2026-07-12 (library chokepoints)
+Create it with:
 
-1. ✅ Mint/validate module + decoders (`memory-id.ts`, exported from
-   `@proofoftech/flowsafe/do-runner` and the root barrel) with exhaustive
-   tests (`memory-id.test.ts`).
-2. ✅ `TenantContext.newThreadId()/newResourceId()/ownsMemoryId()` — minted
-   over the same uuid seam as `newRunId` (`tenant-context.test.ts`).
-3. ✅ `purgeTenant` coverage for the three memory tables + result counters,
-   incl. the missing-table posture (`d1-storage.test.ts`).
-4. ✅ Schema-guard extension: column pins for `mastra_threads.id`/
-   `.resourceId`, `mastra_messages.id`/`.thread_id`/`.resourceId`,
-   `mastra_resources.id`, plus the two-tenant same-key adversarial case:
-   disjoint rows, purge exactly one tenant, survivor readable
-   (`mastra-schema-guard.test.ts`).
+```typescript
+const resourceId = tenant.newResourceId(resourceKey);
+```
 
-### Shipped 2026-07-16 (Track 0 — the obligations)
+or `mintResourceId(tenantId, resourceKey)`.
 
-5. ✅ Host boundary: `host-kit/memory-boundary.ts` —
-   `assertNoClientMemoryIds(body)` 400s any body naming a
-   `TCB_ONLY_MEMORY_FIELDS` member (`threadId`/`resourceId`, the
-   `TCB_ONLY_CREATE_FIELDS` doctrine applied to memory: a client that picks
-   its own ids picks whose memory it reads), and `requireOwnedMemoryId(tenant,
-   id)` 404s a foreign id on read paths — no existence oracle. Every
-   memory-touching route calls both; ids are minted server-side via
-   `TenantContext.newThreadId()/newResourceId()`. It lives in host-kit, not
-   memory-id.ts, because the guard's contract IS its HTTP status
-   (`RunRouteError`) and `TenantContext` lives in approval-api, which already
-   imports do-runner. Tests: `host-kit/memory-boundary.test.ts`.
-6. ✅ Recall-path proof: `do-runner/memory-recall-tenancy.test.ts` drives core's
-   own `MastraMemory` implementation (`MockMemory`) over the REAL
-   `@mastra/cloudflare-d1` D1Store, with both tenants keyed by the SAME
-   business key `'user-1'`, and pins all three recall surfaces an agent turn
-   uses — `recall()`, `listThreads({filter:{resourceId}})`, and
-   resource-scoped `getWorkingMemory()`. Disjoint rows (the schema guard's
-   pin) are worthless if the recall API scopes by something else; this is what
-   says it does not.
-7. ✅ Thread TTL: `purgeExpiredThreads(db, { ttlMs, limit, tablePrefix })` in
-   `do-runner/d1-storage.ts`, wired into `createFlowsafeWorker`'s purge cron
-   behind `THREAD_RETENTION_DAYS` with its own try/catch (a wedged thread
-   purge costs the snapshot purge, the approval purge, and the extra duties
-   nothing). Keyed on `updatedAt`, since threads are not per-run and have no
-   terminal status — time since last write is the only signal one is done.
-   Messages go with their thread and BEFORE it (a message has `createdAt` but
-   no `updatedAt`, so no per-message idleness signal exists and thread-first
-   would strand them), enforced by a `NOT EXISTS` guard rather than statement
-   order — the writer is not atomic either, so an `updatedAt`-only guard would
-   delete a thread out from under a message that just landed; `mastra_resources` is
-   untouched (the owner's, not the thread's — it goes at offboarding). UNSET
-   by default: a conversation is meant to be kept, so there is no safe number
-   to pick on an operator's behalf.
+The resource key must satisfy the runner's path-safe pattern. It is a host-selected business identity, not a client-provided full memory id.
 
-## Rejected alternatives (do not re-explore)
+### Ownership
 
-- **Per-tenant D1 databases.** Reverses the shipped row-level architecture
-  (INV-2 decided one database + tenant-bound stores after weighing this);
-  multiplies migration/ops surface; still needs id discipline for DO names
-  and R2 keys, so it does not even remove the salting work.
-- **Post-read filtering** (a processor/middleware that drops foreign rows).
-  Fail-open: forgetting the filter on one new read path is a silent leak.
-  Salting is fail-closed by construction — foreign rows cannot be addressed
-  at all.
-- **Trusting Mastra memory scoping options.** Mastra scopes recall by
-  thread/resource id equality; with shared ids there is nothing to scope.
-  Upstream adds no tenant concept (verified against `@mastra/core` 1.50.0's
-  memory/storage surface — threads/messages carry no tenant column).
-- **A tenancy flag** (`memoryTenancy: true`). Same doctrine as the isolation
-  scope: absence of a flag means there is no default-false switch to forget;
-  the salted path must be the only path.
+Use `tenant.ownsMemoryId(id)` or `tenantOwnsMemoryId(tenantId, id)`. Decode through `tenantOfMemoryId()`; do not split the string in application code.
 
-## Out of scope (deliberately)
+Tenant ids exclude `_`, making the first delimiter unambiguous.
 
-- Building the agents-with-memory feature itself — everything above is its
-  rails, not the feature. Track A brings the first agent runs; they consume
-  `memory-boundary.ts` at their routes and mint through `TenantContext`.
-- `mastra_scorers` / `mastra_background_tasks` tenancy: same treatment IF a
-  feature ever writes them; the inventory pin covers their appearance in
-  the meantime.
+## Public host boundary
+
+Memory-touching routes apply:
+
+```typescript
+assertNoClientMemoryIds(body);
+requireOwnedMemoryId(tenant, threadId, 'threadId');
+```
+
+`assertNoClientMemoryIds()` rejects nested body fields named `threadId` or `resourceId`. A client that can choose the full id can choose another tenant's memory.
+
+`requireOwnedMemoryId()` returns the owned id or throws a route error that maps to 404 for a foreign id. The response is not an existence oracle.
+
+The path can reference an already owned thread, like a run-status path references an owned run. Creation mints a new id server-side.
+
+## Thread Durable Object boundary
+
+`createThreadTopology()` is the only supported path to a thread object:
+
+1. Check ownership before addressing the namespace.
+2. Use `idFromName(threadId)`.
+3. Clone forwarded requests.
+4. Overwrite the internal tenant and actor headers from resolved context.
+5. Let `ThreadDurableObject` compare the tenant header with the tenant decoded from its own name.
+
+Do not use `namespace.get(...).fetch(request)` directly. That pattern forwards an attacker's version of the header the object is supposed to verify.
+
+## Recall-path proof
+
+The integration test creates one real `@mastra/cloudflare-d1` store and one Mastra memory implementation. Two tenants use the same business resource key.
+
+It verifies isolation through the exact surfaces an agent turn uses:
+
+- `recall()`;
+- `listThreads({ filter: { resourceId } })`;
+- resource-scoped working memory.
+
+Schema separation alone is insufficient if a recall query uses a different key. This test pins the read path as well as row identity.
+
+## D1 table coverage
+
+With the opt-in signal and schedule domains composed, the guarded Mastra inventory is:
+
+| Table | Tenant key | Retention |
+| --- | --- | --- |
+| `mastra_workflow_snapshot` | Salted `run_id` | Terminal-run TTL |
+| `mastra_threads` | Salted `id` | Optional idle-thread TTL |
+| `mastra_messages` | Salted `thread_id` | Deletes with thread |
+| `mastra_resources` | Salted `id` | Offboarding only |
+| `mastra_notifications` | Salted `thread_id` | Optional terminal TTL |
+| `mastra_thread_state` | Salted `thread_id` | Optional updated-time TTL |
+| `mastra_background_tasks` | Salted `run_id` | Terminal-task TTL |
+| `mastra_schedules` | Exact `metadata.tenantId` | Offboarding only |
+| `mastra_schedule_triggers` | Exact `metadata.tenantId` | Optional trigger-history TTL |
+| `mastra_scorers` | Unadopted | No feature writes it |
+
+Flowsafe's schema guard fails when the inventory changes. Adopting a table requires declaring its tenant purge and retention treatment in the same change.
+
+Provider subscriptions live in the flowsafe-owned `flowsafe_signal_subscriptions` table rather than `mastra_*`; its tenant-bound store and offboarding path are separately tested.
+
+## Offboarding
+
+`purgeTenant()` range-deletes:
+
+- messages by `thread_id`;
+- threads by `id`;
+- resources by `id`;
+- notifications and thread state by `thread_id`;
+- background tasks by `run_id`.
+
+It deletes schedules and trigger history through exact `metadata.tenantId`, plus workflows, approvals, subscriptions, and artifacts through their domain-specific paths.
+
+The range is:
+
+```text
+[`${tenantId}_`, `${tenantId}\x60`)
+```
+
+under the expected binary ordering. The restricted tenant charset makes it exact.
+
+Missing lazily created tables report zero rows so a memory-less tenant still offboards cleanly.
+
+## Thread retention
+
+`purgeExpiredThreads(db, { ttlMs, limit, tablePrefix })` selects `mastra_threads.updatedAt`.
+
+A thread has no terminal status, so idleness is the only available lifecycle signal. The helper:
+
+- is disabled unless the operator sets a thread TTL;
+- deletes messages with their thread;
+- prevents an orphan through a `NOT EXISTS` guard;
+- keeps `mastra_resources`, because working memory belongs to the resource across threads;
+- uses bounded batches.
+
+A conversation is intended to persist, so no default TTL is selected.
+
+## Notifications and state
+
+Signal features add:
+
+- `mastra_notifications`, keyed by salted thread and purging terminal records only;
+- `mastra_thread_state`, keyed by salted thread and holding state lanes plus goals.
+
+Both TTLs are opt-in and use separate failure boundaries in the retention invocation.
+
+An active goal updates its timestamp. An operator must choose a state TTL that does not silently remove standing instructions still needed by a tenant.
+
+## Durable-agent resume
+
+An approval for a durable agent stores a server-authored `resumeTarget` with the thread and optional resource id.
+
+Before restart resume, the host:
+
+1. validates that the target belongs to the record's tenant;
+2. validates the persisted snapshot's memory binding;
+3. prepares Mastra's in-process durable-agent registry from stored message state;
+4. restores observation on the thread runtime;
+5. resumes through `RunnerRuntime`.
+
+A reviewer payload cannot choose this target.
+
+## Rules for new memory features
+
+Any new route or background path that touches memory must:
+
+1. resolve verified tenant context;
+2. refuse client-selected full memory ids;
+3. mint or ownership-check through the exported helpers;
+4. route a thread through `createThreadTopology()`;
+5. use a tenant-aware storage predicate;
+6. include an adversarial same-business-key test;
+7. add offboarding counters and retention policy;
+8. update the schema inventory if a new Mastra table appears.
+
+Do not use post-read filtering as the primary isolation control. A forgotten filter fails open; an unaddressable salted id fails closed.
 
 ## Verification
 
-The gate is the existing one (`pnpm lint && pnpm typecheck && pnpm test &&
-pnpm build`) — the schema-guard suite carries the column pins (incl.
-`mastra_threads.updatedAt`, which the TTL rides), the table-inventory
-structure, and the two-tenant adversarial case; `memory-recall-tenancy.test.ts`
-carries the recall proof; `memory-boundary.test.ts` carries the boundary; and
-`spike:verify` stays green (memory writes ride the same D1 binding the spike
-exercises).
+```bash
+pnpm --filter @proofoftech/flowsafe test
+pnpm --filter @proofoftech/flowsafe typecheck
+pnpm --filter @proofoftech/flowsafe spike:verify
+```
+
+The focused coverage includes memory ids, host boundary, thread topology, real D1 recall, schema inventory, thread retention, tenant purge, signals, and durable-agent restart resume.

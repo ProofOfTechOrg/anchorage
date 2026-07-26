@@ -1,8 +1,6 @@
-# rbac/
+# RBAC navigation
 
-## Files
+- `index.ts`: roles, actor request-context lookup, and `RBACMiddleware`
+- `rbac.test.ts`: authorization and audit coverage
 
-| File | What | When to read |
-| ---- | ---- | ------------ |
-| `index.ts` | `RBACMiddleware` processor, `ROLES` (admin/builder/operator/reviewer/viewer), `actorFromRequestContext` + `ACTOR_CONTEXT_KEY`; re-exports the audit surface from `../audit` for compat | Changing roles/permissions or actor sourcing |
-| `rbac.test.ts` | RBAC authorization tests (AuditLogger's own tests live in `../audit/audit.test.ts`) | Adding RBAC tests, debugging an allow/deny decision |
+Authentication remains a host responsibility. See [`../../../../docs/breakwater-purpose-and-boundaries.md`](../../../../docs/breakwater-purpose-and-boundaries.md).

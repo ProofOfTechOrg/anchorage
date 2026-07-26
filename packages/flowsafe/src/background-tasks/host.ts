@@ -66,7 +66,7 @@ export interface BackgroundTaskHostOptions {
    */
   mastra: Mastra;
   /**
-   * The DO's ONE raw pubsub instance (DL-001, `createHostPubSub()`). Pass this
+   * The Durable Object's single raw pubsub instance from `createHostPubSub()`. Pass this
    * same object to `new Mastra({ pubsub })`; Mastra 1.50 exposes a proxy from
    * its public `pubsub` getter, so that getter is not the constructor identity.
    * The manager both publishes dispatch events and subscribes the worker
@@ -79,7 +79,7 @@ export interface BackgroundTaskHostOptions {
   /**
    * Static tool executors, keyed by tool name, RE-REGISTERED at every boot so a
    * task recovered on a fresh DO instance (post-eviction) resolves its executor
-   * by name (DL-015). Tools are static — their executor closures are safe to
+   * by name. Tools are static — their executor closures are safe to
    * rebuild deterministically at boot, unlike per-task closures which core
    * documents are "never serialized".
    */
@@ -186,7 +186,7 @@ function validateManagerConfig(
  * alarm arming (it needs `ctx.storage.setAlarm`); this class owns the manager
  * wiring, the recovery-firing `boot()`, and the alarm `cleanup()` duty. The raw
  * manager is reachable as `.manager` for the tenant-bound routes to wrap — never
- * expose it directly over HTTP (DL-014).
+ * expose it directly over HTTP.
  */
 export class BackgroundTaskHost {
   readonly manager: BackgroundTaskManager;
@@ -217,7 +217,7 @@ export class BackgroundTaskHost {
   }
 
   /**
-   * DO-boot wiring (DL-015). Fail-fast if the backgroundTasks storage domain is
+   * Durable-Object boot wiring. Fail fast if the backgroundTasks storage domain is
    * missing, re-register the static executors, start execution-mode workflow
    * workers, THEN call `init(pubsub)` — whose internal `recoverStaleTasks()`
    * re-drives any task the evicted instance left mid-flight. Executors and the

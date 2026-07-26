@@ -16,6 +16,7 @@ import { Card } from '@astryxdesign/core/Card';
 import { Grid } from '@astryxdesign/core/Grid';
 import { Heading } from '@astryxdesign/core/Heading';
 import { HStack } from '@astryxdesign/core/HStack';
+import { Link } from '@astryxdesign/core/Link';
 import { Spinner } from '@astryxdesign/core/Spinner';
 import { Tab, TabList } from '@astryxdesign/core/TabList';
 import { Text } from '@astryxdesign/core/Text';
@@ -39,6 +40,7 @@ import {
   type ReactNode,
   useCallback,
   useEffect,
+  useMemo,
   useState,
 } from 'react';
 
@@ -190,10 +192,11 @@ export function ShowcaseApp({
   const viewRun = useCallback((runId: string) => {
     scrollTo(`run-${runId}`);
   }, []);
-  useNarrationToasts(feed.events, {
-    onReview: reviewApproval,
-    onViewRun: viewRun,
-  });
+  const narrationToastActions = useMemo(
+    () => ({ onReview: reviewApproval, onViewRun: viewRun }),
+    [reviewApproval, viewRun],
+  );
+  useNarrationToasts(feed.events, narrationToastActions);
 
   const selected = dashboard.selected;
   const selfRequested =
@@ -503,6 +506,43 @@ export function ShowcaseApp({
         Durable Objects, and D1. Connectors are offline; your sandbox and
         everything in it self-destructs at expiry. · Theme: Astryx y2k.
       </Text>
+      <HStack gap={3} align="center" wrap="wrap">
+        <Link
+          href="https://github.com/ProofOfTechOrg/anchorage"
+          size="sm"
+          isExternalLink
+        >
+          GitHub
+        </Link>
+        <Link
+          href="https://github.com/ProofOfTechOrg/anchorage/tree/main/docs"
+          size="sm"
+          isExternalLink
+        >
+          Docs
+        </Link>
+        <Link
+          href="https://proofoftechorg.github.io/anchorage/"
+          size="sm"
+          isExternalLink
+        >
+          API
+        </Link>
+        <Link
+          href="https://www.npmjs.com/package/@proofoftech/breakwater"
+          size="sm"
+          isExternalLink
+        >
+          breakwater
+        </Link>
+        <Link
+          href="https://www.npmjs.com/package/@proofoftech/flowsafe"
+          size="sm"
+          isExternalLink
+        >
+          flowsafe
+        </Link>
+      </HStack>
     </VStack>
   );
 }

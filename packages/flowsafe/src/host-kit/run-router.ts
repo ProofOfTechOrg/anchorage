@@ -57,7 +57,7 @@ export interface RunRouterOptions {
    */
   workflows: ReadonlyArray<WorkflowMeta>;
   /**
-   * Authenticates the request and binds the tenant scope (INV-2): the
+   * Authenticates the request and binds the tenant scope: the
    * approval service, the runId mint, and the ownership predicate all come
    * from the resolved TenantContext. undefined yields 401.
    */
@@ -86,18 +86,17 @@ export interface RunRouterOptions {
     body: unknown,
   ) => Promise<RunSummary>;
   /**
-   * D4 self-healing hook (2026-07-11 audit): invoked after a status() read
-   * reports the run suspended, so every status poll of a stuck run doubles
-   * as a check for a gate whose approval never made it into the queue (a
-   * re-queue failure previously left it there with no recovery path — see
+   * Self-healing hook invoked after a status() read reports the run
+   * suspended, so every status poll of a stuck run doubles as a check for a
+   * gate whose approval never made it into the queue (see
    * reconcileApprovalsForSummary in approval-bridge.ts). Awaited rather than
-   * fire-and-forget by DEFAULT: this host-agnostic layer has no ctx.waitUntil
+   * fire-and-forget by default: this host-agnostic layer has no ctx.waitUntil
    * of its own to keep a detached promise alive past the response, so a
-   * plain awaited call is what it can offer on its own. The work is no
-   * longer cheap (2026-07-11 audit follow-up): reconcile now pages the run's
-   * full approval history and may supersede stale open records before
-   * filing a fresh one, so the two ctx-capable hosts (deploy/worker.ts, the
-   * showcase worker) hand this hook a wrapper that detaches the real work
+   * plain awaited call is what it can offer on its own. Reconciliation pages
+   * the run's full approval history and may supersede stale open records
+   * before filing a fresh one, so the two ctx-capable hosts
+   * (deploy/worker.ts and the showcase worker) hand this hook a wrapper that
+   * detaches the real work
    * via ctx.waitUntil and resolves immediately — this option's contract (an
    * awaited function of this exact shape) is unchanged either way, only
    * what a given host's function actually blocks on. A throw is caught and

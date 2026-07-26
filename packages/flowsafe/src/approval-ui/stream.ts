@@ -85,7 +85,7 @@ export interface StreamRunSummary {
 }
 
 /**
- * The wire union every DO emits (M-005): the per-tenant hub fans out `queue`
+ * The wire union every Durable Object emits: the per-tenant hub fans out `queue`
  * (an ApprovalStreamEvent) and `presence` (the roster) frames; the per-run
  * runner DO emits `run` (the wholesale authoritative RunSummary) frames.
  */
@@ -237,9 +237,9 @@ export function presenceReducer(
 }
 
 /**
- * Optimistic metrics counter deltas (DL-013): apply the derivable movement on
+ * Optimistic metrics counter deltas: apply the derivable movement on
  * each event for instant feedback; the interval poll's wholesale metrics()
- * refetch is the authoritative reconciler (DL-021). Counts never go negative.
+ * refetch is the authoritative reconciler. Counts never go negative.
  * Returns the same reference when nothing derivable changed (no re-render), and
  * null when metrics have not loaded yet.
  */

@@ -227,6 +227,135 @@ describe('SignalProviderHost alarm + routes', () => {
     expect(setAlarm).not.toHaveBeenCalled();
   });
 
+  it('keeps an already earlier alarm instead of postponing it on subscription writes', async () => {
+    const factory = new InMemorySubscriptionStoreFactory();
+    await seed(factory, 'acme', 'poller', 'acme_t1');
+    const setAlarm = vi.fn();
+    const deleteAlarm = vi.fn();
+    const getAlarm = vi.fn(async () => 20_000);
+    const now = vi.spyOn(Date, 'now').mockReturnValue(10_000);
+    const host = new TestHost(
+      state('acme', { setAlarm, deleteAlarm, getAlarm }),
+      {
+        factory,
+        topology: stubTopology([]),
+        providers: [pollProvider('poller', 30_000)],
+      },
+    );
+
+    try {
+      const response = await host.fetch(
+        new Request('http://host/arm', { method: 'POST' }),
+      );
+      expect(response.status).toBe(200);
+      expect(getAlarm).toHaveBeenCalledTimes(1);
+      expect(setAlarm).not.toHaveBeenCalled();
+      expect(deleteAlarm).not.toHaveBeenCalled();
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('moves an existing alarm earlier when a faster cadence requires it', async () => {
+    const factory = new InMemorySubscriptionStoreFactory();
+    await seed(factory, 'acme', 'fast', 'acme_t1');
+    const setAlarm = vi.fn();
+    const deleteAlarm = vi.fn();
+    const getAlarm = vi.fn(async () => 100_000);
+    const now = vi.spyOn(Date, 'now').mockReturnValue(10_000);
+    const host = new TestHost(
+      state('acme', { setAlarm, deleteAlarm, getAlarm }),
+      {
+        factory,
+        topology: stubTopology([]),
+        providers: [pollProvider('fast', 5_000)],
+      },
+    );
+
+    try {
+      const response = await host.fetch(
+        new Request('http://host/arm', { method: 'POST' }),
+      );
+      expect(response.status).toBe(200);
+      expect(setAlarm).toHaveBeenCalledWith(15_000);
+      expect(deleteAlarm).not.toHaveBeenCalled();
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('sets an alarm when storage reports none', async () => {
+    const factory = new InMemorySubscriptionStoreFactory();
+    await seed(factory, 'acme', 'poller', 'acme_t1');
+    const setAlarm = vi.fn();
+    const deleteAlarm = vi.fn();
+    const getAlarm = vi.fn(async () => null);
+    const now = vi.spyOn(Date, 'now').mockReturnValue(10_000);
+    const host = new TestHost(
+      state('acme', { setAlarm, deleteAlarm, getAlarm }),
+      {
+        factory,
+        topology: stubTopology([]),
+        providers: [pollProvider('poller', 30_000)],
+      },
+    );
+
+    try {
+      await host.fetch(new Request('http://host/arm', { method: 'POST' }));
+      expect(setAlarm).toHaveBeenCalledWith(40_000);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('treats zero as manual-only polling and disarms automatic wakeups', async () => {
+    const factory = new InMemorySubscriptionStoreFactory();
+    await seed(factory, 'acme', 'manual', 'acme_t1');
+    const setAlarm = vi.fn();
+    const deleteAlarm = vi.fn();
+    const host = new TestHost(state('acme', { setAlarm, deleteAlarm }), {
+      factory,
+      topology: stubTopology([]),
+      providers: [pollProvider('manual', 0)],
+    });
+
+    const response = await host.fetch(
+      new Request('http://host/arm', { method: 'POST' }),
+    );
+    expect(response.status).toBe(200);
+    expect(deleteAlarm).toHaveBeenCalledTimes(1);
+    expect(setAlarm).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    -1,
+    1.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+  ])('defensively refuses a hand-built provider with invalid interval %s', async (pollInterval) => {
+    const factory = new InMemorySubscriptionStoreFactory();
+    await seed(factory, 'acme', 'invalid', 'acme_t1');
+    const setAlarm = vi.fn();
+    const deleteAlarm = vi.fn();
+    const host = new TestHost(state('acme', { setAlarm, deleteAlarm }), {
+      factory,
+      topology: stubTopology([]),
+      providers: [pollProvider('invalid', pollInterval)],
+    });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      const response = await host.fetch(
+        new Request('http://host/arm', { method: 'POST' }),
+      );
+      expect(response.status).toBe(500);
+      expect(setAlarm).not.toHaveBeenCalled();
+      expect(deleteAlarm).not.toHaveBeenCalled();
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it('POST /poll runs a poll; an unknown route 404s', async () => {
     // #given
     const factory = new InMemorySubscriptionStoreFactory();

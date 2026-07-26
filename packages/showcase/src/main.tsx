@@ -1,10 +1,6 @@
 import { ToastViewport } from '@astryxdesign/core/Toast';
 import { Theme } from '@astryxdesign/core/theme';
 import { y2kTheme } from '@astryxdesign/theme-y2k/built';
-import {
-  type ApprovalUIComponents,
-  ApprovalUIProvider,
-} from '@flowsafe/approval-ui/components';
 import type { ApprovalStreamOption } from '@flowsafe/approval-ui/use-approval-dashboard';
 import {
   lazy,
@@ -17,8 +13,7 @@ import {
   useState,
 } from 'react';
 import { createRoot } from 'react-dom/client';
-import { astryxComponents } from '@/astryx-components';
-import { astryxStreamComponents } from '@/astryx-stream-components';
+import { AstryxApprovalUIProvider } from '@/astryx-components';
 import {
   DemoActorSwitcher,
   type DemoTokenSet,
@@ -36,14 +31,6 @@ import { useActivityFeed } from '@/use-activity-feed';
 import type { RunEntry, RunStreamOption } from '@/use-run-polling';
 import { createShowcaseStreamTransport } from '@/web-socket-transport';
 import '@/index.css';
-
-// The slot adapter injected into ApprovalUIProvider: the base Astryx map plus
-// the streaming Toast/PresenceIndicator adapters. Module-level so its identity
-// is stable (the provider re-merges only when this reference changes).
-const approvalUIComponents: Partial<ApprovalUIComponents> = {
-  ...astryxComponents,
-  ...astryxStreamComponents,
-};
 
 const container = document.getElementById('root');
 if (!container) throw new Error('missing #root element');
@@ -181,7 +168,7 @@ function Root(): ReactElement {
   ) : null;
 
   return (
-    <ApprovalUIProvider components={approvalUIComponents}>
+    <AstryxApprovalUIProvider>
       {actorToken === null ? (
         <>
           {/* The switchers bootstrap the first token, so they must mount
@@ -205,7 +192,7 @@ function Root(): ReactElement {
           runStream={runStream}
         />
       )}
-    </ApprovalUIProvider>
+    </AstryxApprovalUIProvider>
   );
 }
 

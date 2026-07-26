@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// Roadmap Phase 1: "D1 storage adapter (wrap Mastra's)". The wrap pins
-// flowsafe defaults and is the seam where audit export / Queues hooks
-// attach in later phases. Table auto-creation (CREATE TABLE IF NOT EXISTS)
+// The D1 adapter wraps Mastra's store to pin flowsafe defaults and provide the
+// seam where audit export and Queues hooks attach. Table auto-creation
+// (CREATE TABLE IF NOT EXISTS)
 // happens lazily via Mastra's storage-init proxy once the store is handed
 // to `new Mastra({ storage })` — no migration step needed for the runner.
 
@@ -23,8 +23,8 @@ export interface D1StorageOptions {
   /** Table name prefix (letters, numbers, underscores). */
   tablePrefix?: string;
   /**
-   * Additional storage domains composed OVER the D1Store default (Track C:
-   * notifications + thread-state, which @mastra/cloudflare-d1 does not ship, so
+   * Additional storage domains composed over the D1Store default, such as
+   * notifications and thread state, which @mastra/cloudflare-d1 does not ship, so
    * they are flowsafe-owned D1 impls). Injected rather than imported so this
    * lower layer never depends on `signals/` (which imports do-runner) — build
    * them with `createSignalStorageDomains()` and pass them here. Absent ⇒ the
@@ -125,7 +125,7 @@ export interface PurgeExpiredRunsOptions {
 /**
  * The tables `purgeExpiredWorkflowRuns` deletes from under the run TTL — the
  * production anchor the schema guard cross-checks every `run-ttl` retention
- * declaration against (DL-003), the retention-leg analog of
+ * declaration against, the retention counterpart of
  * TENANT_RANGE_PURGE_TABLES for the offboarding leg. One table, because the run
  * TTL rides a `run_id` range paired with artifact deletion and an app-owned
  * index (its own block below), not the tenant-range map. The guard reads THIS,
@@ -300,7 +300,7 @@ function chunked<T>(values: readonly T[], size: number): T[][] {
  * The tables `purgeExpiredThreads` deletes from under the thread TTL — the
  * production anchor the schema guard cross-checks the `thread-ttl` retention
  * declaration against, AND the target set a `cascade` child must appear in to be
- * believed (DL-003). BOTH tables are here because the purge reaps a thread and
+ * believed. Both tables are here because the purge reaps a thread and
  * its messages together: `mastra_threads` by its own `updatedAt`,
  * `mastra_messages` by cascade (a message has no idleness signal of its own — see
  * the purge doc). So the inventory's `mastra_messages: { retention: cascade with
@@ -459,8 +459,8 @@ export async function purgeExpiredThreads(
 /**
  * The table `purgeExpiredBackgroundTasks` deletes from under the background-task
  * TTL — the production anchor the schema guard cross-checks the
- * `background-task-ttl` retention declaration against (DL-003), the Track B
- * analog of RUN_TTL_PURGE_TABLES. One table: the TTL rides `completedAt` on
+ * `background-task-ttl` retention declaration against. It is the background-task
+ * counterpart to RUN_TTL_PURGE_TABLES. One table: the TTL rides `completedAt` on
  * `mastra_background_tasks` alone, no cascade.
  */
 export const BACKGROUND_TASK_TTL_PURGE_TABLES: readonly string[] = [
@@ -500,7 +500,7 @@ const BACKGROUND_TASK_FAILED_STATUSES = [
 ] as const;
 
 /**
- * Background-task TTL cleanup (DL-003 retention leg): deletes terminal task
+ * Background-task TTL cleanup: deletes terminal task
  * rows from `mastra_background_tasks` once their `completedAt` is older than the
  * TTL, mirroring core `BackgroundTaskManager.cleanup()` at the storage layer so
  * a purge cron can reap them WITHOUT a live manager — the same posture as
@@ -598,7 +598,7 @@ export async function purgeExpiredBackgroundTasks(
 /**
  * The table `purgeExpiredNotifications` deletes from under the notification TTL
  * — the anchor the schema guard cross-checks the `notification-ttl` retention
- * declaration against (DL-003), the Track C analog of
+ * declaration against. It is the notification counterpart to
  * BACKGROUND_TASK_TTL_PURGE_TABLES.
  */
 export const NOTIFICATION_TTL_PURGE_TABLES: readonly string[] = [
@@ -631,7 +631,7 @@ export interface PurgeExpiredNotificationsOptions {
 }
 
 /**
- * Notification TTL cleanup (DL-003 retention leg): deletes TERMINAL agent-inbox
+ * Notification TTL cleanup: deletes terminal agent-inbox
  * rows from `mastra_notifications` once their `updatedAt` is older than the TTL,
  * at the storage layer so a cron reaps them without a live agent — the same
  * posture as the other purges (raw D1 binding, failure-isolated as a cron duty).
@@ -666,7 +666,7 @@ export async function purgeExpiredNotifications(
 /**
  * The table `purgeExpiredThreadState` deletes from under the thread-state TTL —
  * the anchor the schema guard cross-checks the `thread-state-ttl` retention
- * declaration against (DL-003).
+ * declaration against.
  */
 export const THREAD_STATE_TTL_PURGE_TABLES: readonly string[] = [
   'mastra_thread_state',
@@ -688,7 +688,7 @@ export interface PurgeExpiredThreadStateOptions {
 }
 
 /**
- * Thread-state TTL cleanup (DL-003 retention leg): deletes thread-state rows
+ * Thread-state TTL cleanup: deletes thread-state rows
  * from `mastra_thread_state` once their `updatedAt` is older than the TTL. Keys
  * on `updatedAt` for the same reason `purgeExpiredThreads` does — thread state
  * has no terminal status, so time-since-last-write is the only "done" signal.
@@ -720,7 +720,8 @@ export async function purgeExpiredThreadState(
 /**
  * The table `purgeExpiredScheduleTriggers` deletes from under the trigger-row TTL
  * — the anchor the schema guard cross-checks the `schedule-trigger-ttl` retention
- * declaration against (DL-003), the Track D analog of THREAD_STATE_TTL_PURGE_TABLES.
+ * declaration against. It is the schedule-trigger counterpart to
+ * THREAD_STATE_TTL_PURGE_TABLES.
  * Only the trigger HISTORY expires; the schedule rows themselves are standing
  * config (retention 'none', reaped at offboarding by purgeTenant).
  */
@@ -742,7 +743,7 @@ export interface PurgeExpiredScheduleTriggersOptions {
 }
 
 /**
- * Schedule-trigger TTL cleanup (DL-003 retention leg): deletes trigger-history
+ * Schedule-trigger TTL cleanup: deletes trigger-history
  * rows from `mastra_schedule_triggers` once their `actualFireAt` is older than the
  * TTL, at the storage layer so a cron reaps them without a live tick — the same
  * posture as the other purges (raw D1 binding, failure-isolated as a cron duty).
@@ -828,7 +829,7 @@ export async function ensureSnapshotRunIdIndex(
 }
 
 export interface PurgeTenantOptions {
-  /** MUST satisfy INV-3 (^[a-z0-9]{3,32}$) — see the range note below. */
+  /** Must satisfy the tenant-ID pattern `^[a-z0-9]{3,32}$`; see the range note below. */
   tenantId: string;
   /** Must match createD1Storage's tablePrefix. */
   tablePrefix?: string;
@@ -851,28 +852,28 @@ export interface PurgeTenantResult {
   messages: number;
   /** Agent-memory rows: salted resource ids (working memory). */
   resources: number;
-  /** Track B: background-task rows, ranged over their INV-1 salted `run_id`. */
+  /** Background-task rows, ranged over their tenant-salted `run_id`. */
   backgroundTasks: number;
-  /** Track C: agent-inbox rows, ranged over their salted `thread_id`. */
+  /** Agent-inbox rows, ranged over their tenant-salted `thread_id`. */
   notifications: number;
-  /** Track C: thread-state rows (state lanes + goals), ranged over `thread_id`. */
+  /** Thread-state rows (state lanes + goals), ranged over `thread_id`. */
   threadState: number;
-  /** Track D: schedule rows, METADATA-filtered on their `metadata.tenantId`. */
+  /** Schedule rows, metadata-filtered on their `metadata.tenantId`. */
   schedules: number;
-  /** Track D: schedule-trigger rows, METADATA-filtered on their `metadata.tenantId`. */
+  /** Schedule-trigger rows, metadata-filtered on their `metadata.tenantId`. */
   scheduleTriggers: number;
   approvals: number;
-  /** Track E: signal-subscription rows, by the `tenant_id` column (the approvals leg). */
+  /** Signal-subscription rows, filtered by the `tenant_id` column. */
   subscriptions: number;
   artifacts: number;
 }
 
 /**
- * The `PurgeTenantResult` field a range-purged table reports into. A track
+ * The `PurgeTenantResult` field a range-purged table reports into. A feature
  * adopting a new `mastra_*` domain (notifications, thread-state, background
  * tasks, schedules) adds its counter HERE, its row to
  * TENANT_RANGE_PURGE_TABLES, and its field to PurgeTenantResult — all in the
- * SAME change (DL-003). The union is what makes that mechanical rather than
+ * same change. The union is what makes that mechanical rather than
  * remembered: a counter with no result field fails the pin below, and a result
  * field with no counter fails the `memory` initializer in purgeTenant.
  */
@@ -884,7 +885,7 @@ export type TenantRangePurgeCounter =
   | 'notifications'
   | 'threadState';
 
-/** One table purgeTenant reaps by the INV-3 `[tid_, tid\x60)` range predicate. */
+/** One table purgeTenant reaps by the tenant-exact `[tid_, tid\x60)` range predicate. */
 export interface TenantRangePurgeTable {
   /** The PurgeTenantResult field this table's deleted-row count lands in. */
   counter: TenantRangePurgeCounter;
@@ -900,20 +901,20 @@ export interface TenantRangePurgeTable {
 }
 
 /**
- * The tenant-range purge inventory — EXTENSIBLE by construction (DL-003): each
- * later track appends its adopted table here instead of editing purgeTenant's
+ * The tenant-range purge inventory, extensible by construction: each
+ * later feature appends its adopted table here instead of editing purgeTenant's
  * body, so adoption is one additive row plus the counter/result pair the types
  * force alongside it. Ordering is not load-bearing (the deletes run
  * concurrently; see purgeTenant).
  *
  * `mastra_workflow_snapshot` is deliberately absent: it rides the same range but
  * over `run_id`, paired with artifact deletion and an app-owned index, so it
- * keeps its own block. `mastra_background_tasks` (Track B) rides the range over
- * its own `run_id` — the originating run's INV-1 salted id, always present on a
+ * keeps its own block. `mastra_background_tasks` rides the range over
+ * its own `run_id` — the originating run's tenant-salted id, always present on a
  * task row — without artifacts or an app index, so it lives here. Tables no
  * feature writes yet (`mastra_scorers`) are absent because nothing salts their
  * ids yet — the schema-guard's inventory pin is what forces that decision when a
- * track adopts one.
+ * feature adopts one.
  */
 export const TENANT_RANGE_PURGE_TABLES: readonly TenantRangePurgeTable[] = [
   { counter: 'messages', table: 'mastra_messages', column: 'thread_id' },
@@ -949,13 +950,13 @@ type _EveryPurgeCounterIsReported = AssertTrue<
 >;
 
 /**
- * The `PurgeTenantResult` field a METADATA-filtered table reports into. Track D's
+ * The `PurgeTenantResult` field a metadata-filtered table reports into. Schedule
  * schedule rows key on slugified ids (`agent_<slug>`/`schedule_<slug>`), NOT
  * tenant-salted ids, so the `[tid_, tid\x60)` range predicate cannot reach them —
- * the tenant lives in `metadata.tenantId` (DL-013). This is the second
- * offboarding KIND alongside the range counter: a track adopting a metadata-keyed
+ * the tenant lives in `metadata.tenantId`. This is the second
+ * offboarding kind alongside the range counter: a feature adopting a metadata-keyed
  * domain adds its counter HERE, its row to TENANT_METADATA_PURGE_TABLES, and its
- * PurgeTenantResult field, all in the SAME change (DL-003), pinned the same way.
+ * PurgeTenantResult field in the same change, pinned the same way.
  */
 export type TenantMetadataPurgeCounter = 'schedules' | 'scheduleTriggers';
 
@@ -968,10 +969,10 @@ export interface TenantMetadataPurgeTable {
 }
 
 /**
- * The metadata-filtered purge inventory (DL-003) — the offboarding coverage for
+ * The metadata-filtered purge inventory — the offboarding coverage for
  * tables whose tenant is a JSON `metadata.tenantId` (stamped by the schedules
  * facade at create + the tick on every trigger), not a salted id column. Both
- * Track D tables are here: schedule rows and their trigger history. The DELETE is
+ * schedule tables are here: schedule rows and their trigger history. The DELETE is
  * `WHERE json_extract(metadata, '$.tenantId') = ?` (the same SQLite json_extract
  * the run-snapshot purge already uses on `snapshot`), so a NULL/absent metadata
  * never matches — every row our facade/tick writes carries it, so this reaps them
@@ -999,9 +1000,9 @@ type _EveryMetadataCounterIsReported = AssertTrue<
  * tenant's approval records (titles, summaries, payloads, decider
  * identities), and its R2 artifacts.
  *
- * The snapshot predicate is a RANGE over the INV-1 salted runId:
+ * The snapshot predicate is a range over the tenant-salted runId:
  * `run_id >= '<tid>_' AND run_id < '<tid>' || CHAR(0x60)`. tenantId is
- * re-validated against INV-3 here — not for injection safety (every query is
+ * revalidated against the tenant-ID pattern here — not for injection safety (every query is
  * parameter-bound) but for RANGE-EXACTNESS: the predicate selects exactly one
  * tenant only because the charset excludes every character in [0x5F, 0x60]
  * ('_' is 0x5F; its successor 0x60, backtick, closes the range under BINARY

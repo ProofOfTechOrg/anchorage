@@ -420,14 +420,14 @@ export interface RunnerRuntimeOptions {
    */
   resumeLedger?: ResumeLedger;
   /**
-   * The host DO's ONE pubsub identity (DL-001, do-runner/pubsub.ts), threaded
+   * The host Durable Object's single pubsub identity from do-runner/pubsub.ts, threaded
    * here by init() alongside storage and the ledger so a host that configures it
    * reaches the runtime with no host change: every DO subclass already returns
    * init()'s runtime from build(), and nothing else in the isolate can hand this
    * object a pubsub.
    *
    * PASSED TO CORE at the two `workflow.createRun({ runId, pubsub })` sites in
-   * start()/resume() (CI-M-002-002) — the only place core accepts one; the
+   * start()/resume() — the only place core accepts one; the
    * `pubsub` getter still exposes the held identity so an agent runner sharing
    * this isolate takes THIS instance rather than building a second feed. Absent
    * ⇒ undefined ⇒ core defaults a fresh emitter per run ⇒ byte-identical to
@@ -438,7 +438,7 @@ export interface RunnerRuntimeOptions {
 
 export interface StartRunOptions {
   /**
-   * REQUIRED — the runtime never generates a runId (INV-1). Multi-tenant
+   * Required: the runtime never generates a runId. Multi-tenant
    * hosts mint `${tenantId}_${uuid}` server-side (createRunRouter) so the
    * runId carries its tenant everywhere it becomes a key (D1 snapshot row,
    * DO name, R2 segment, grant-list predicate). A generation fallback here
@@ -498,8 +498,7 @@ export class RunnerRuntime {
 
   /**
    * The host pubsub identity this runtime was built with, or undefined when the
-   * host configured none. Exposed so the identity is verifiable from outside the
-   * class (a private field held for a milestone is otherwise unobservable) and so
+   * host configured none. Exposed so callers can verify the identity and so
    * an agent runner sharing this runtime's isolate takes THIS instance rather
    * than building a second feed.
    */

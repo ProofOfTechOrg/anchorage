@@ -35,7 +35,7 @@ import {
 } from './types.js';
 
 export interface ApprovalStoreFactory {
-  /** Bind a store to one tenant. Throws unless tenantId satisfies INV-3. */
+  /** Bind a store to one tenant. Throws unless tenantId satisfies TENANT_ID_PATTERN. */
   forTenant(tenantId: string): TenantBoundApprovalStore;
   /** The cron-only cross-tenant view (SLA sweep). Never request-scoped. */
   system(): SystemApprovalStore;

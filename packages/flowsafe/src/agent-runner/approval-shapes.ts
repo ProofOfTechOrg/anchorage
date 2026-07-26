@@ -50,7 +50,7 @@ function asString(value: unknown): string | undefined {
 /**
  * Parse a durable-agent approval suspend payload — a PER-STEP payload, already
  * unwrapped from RunSummary.suspendPayload's step-keyed map — into its tool-call
- * identity, reading BOTH shapes (R-003): the NESTED `requireToolApproval` object
+ * identity, reading both supported shapes: the nested `requireToolApproval` object
  * when present, else the FLAT top-level fields.
  *
  * Returns undefined for any payload that is NOT an agent tool-call gate: a

@@ -104,7 +104,7 @@ export function assertNoClientMemoryIds(body: unknown): void {
  * FULL past this point (pinned in do-runner/memory-recall-tenancy.test.ts). Call
  * it on EVERY memory read path; there is no second line.
  *
- * `tenant.ownsMemoryId` is exact rather than a prefix startsWith by luck: INV-3
+ * `tenant.ownsMemoryId` is exact because the tenant-ID pattern
  * excludes '_' from tenant ids, so 'acme' can never own 'acmecorp_...'
  * (do-runner/path-safe-id.ts).
  */

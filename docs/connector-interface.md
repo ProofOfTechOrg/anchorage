@@ -1,193 +1,323 @@
-# Connector Interface
+# Connector interface
 
-Connectors integrate workflow tasks with business systems. Built on Mastra's `createTool()` -- each connector is a tool plus a permission manifest declaring its safety properties. Connectors are separate from agent adapters because connector behavior is structured, scoped, and side-effectful.
+A breakwater connector is a Mastra tool whose safety declaration is enforced in the returned tool's execution path.
 
-## Connector as Mastra Tool
+Use `createConnector()` instead of `createTool()` for code that can reach a network, change state, require human review, need replay protection, or consume a shared budget.
 
-Mastra's `createTool()` (`@mastra/core/tools`) has no permission-manifest field, so the manifest cannot ride on the tool config itself. Breakwater's connector SDK provides `createConnector()`, a wrapper factory: the tool fields pass through to a real `createTool()` call, while the `permissions` manifest is stripped and enforced by wrapping `execute` (network egress, idempotency, dry-run, rate limiting). `requiresApproval` compiles to Mastra's native `requireApproval` tool option.
+## Basic connector
 
 ```typescript
-import { z } from 'zod';
 import { createConnector } from '@proofoftech/breakwater/connector-sdk';
+import { z } from 'zod';
 
-// Compiles to a real Mastra createTool() call. `permissions` is the
-// Anchorage manifest: stripped before the tool is created, enforced by
-// wrapping execute; requiresApproval maps to Mastra's requireApproval.
 export const createContact = createConnector({
-  id: 'salesforce.createContact',
-  description: 'Create a Salesforce contact',
-  inputSchema: z.object({ name: z.string(), email: z.string() }),
-  outputSchema: z.object({ id: z.string() }),
-  // The third argument is the per-call ConnectorRuntime: its fetch is bound
-  // to the declared egress below — actual requests anywhere else are denied.
-  execute: async (inputData, context, runtime) => ({ id: '003...' }),
-  // Anchorage extension -- permission manifest (not a createTool() field)
+  id: 'salesforce.create-contact',
+  description: 'Create one Salesforce contact',
+  inputSchema: z.object({
+    name: z.string(),
+    email: z.string().email(),
+  }),
+  outputSchema: z.object({
+    id: z.string(),
+    simulated: z.boolean().optional(),
+  }),
   permissions: {
     sideEffect: 'write',
     egress: ['api.salesforce.com'],
+    requiresApproval: true,
     idempotencyKey: true,
     dryRun: true,
     rateLimit: '100/min',
-    requiresApproval: true,
+  },
+  execute: async (input, _context, runtime) => {
+    const response = await runtime.fetch(
+      'https://api.salesforce.com/services/data/contacts',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Salesforce returned ${response.status}`);
+    }
+    const body = (await response.json()) as { id: string };
+    return { id: body.id };
+  },
+  dryRunExecute: async () => ({
+    id: 'not-created',
+    simulated: true,
+  }),
+});
+```
+
+`execute` and `dryRunExecute` receive `ConnectorRuntime` as their third argument. Its fetch is bound to the manifest's declared hosts.
+
+## Permission manifest
+
+```typescript
+interface PermissionManifest {
+  sideEffect: 'read' | 'write' | 'destructive' | 'idempotent';
+  egress?: readonly string[];
+  idempotencyKey?: boolean;
+  requiresApproval?: boolean;
+  dryRun?: boolean;
+  rateLimit?: string;
+  background?: boolean;
+}
+```
+
+### `sideEffect`
+
+Classify by the strongest possible effect:
+
+| Value | Meaning |
+| --- | --- |
+| `read` | No external or durable state change |
+| `write` | Creates or updates state |
+| `destructive` | Deletes or irreversibly changes state |
+| `idempotent` | A write-class effect that is safe to repeat according to the connector's domain contract |
+
+Destructive connectors require approval by default. Deployment write-policy patterns can require approval for any write-class connector.
+
+The classification also produces truthful MCP annotations. Those annotations are descriptive; the wrapper is the enforcement.
+
+### `egress`
+
+List bare hostnames the connector may contact. An omitted or empty list gives `runtime.fetch` no network permission.
+
+Hostnames:
+
+- may use an exact name such as `api.example.com`;
+- may use a leading wildcard such as `*.googleapis.com`;
+- may not include a scheme, port, path, or allow-all token;
+- are normalized for case and one trailing dot;
+- use label-boundary wildcard matching, and a wildcard does not include its apex.
+
+Declare redirect and regional hosts. Actual redirect hops must also remain within the list.
+
+### `idempotencyKey`
+
+When `true`, every real call needs a non-empty key in `breakwater.idempotencyKey`. The wrapper stores the successful result and replays it on another call with the same scoped key.
+
+The application chooses the business key. Flowsafe supplies the trusted tenant isolation scope but does not invent a connector-specific idempotency key.
+
+### `requiresApproval`
+
+When `true`, every real call needs the connector id in `breakwater.approvedConnectors`.
+
+The same decision is compiled into Mastra's native `requireApproval` predicate so an agent can suspend. The native approval signal never replaces the request-context capability.
+
+### `dryRun`
+
+When `true`, `dryRunExecute` is required. A caller sets `breakwater.dryRun` to `true`.
+
+Dry-run:
+
+- runs declaration egress and custom evaluators;
+- uses the same egress-bound runtime fetch;
+- skips the approval grant;
+- skips Mastra's approval pause on the standard agent path;
+- skips idempotency;
+- skips rate-budget consumption;
+- audits the simulation;
+- never falls back to real execution.
+
+Declaring `dryRun` without an implementation, or providing an implementation without the declaration, fails at construction.
+
+### `rateLimit`
+
+Use `<count>/<unit>`, where count is positive and unit is a supported singular second, minute, hour, or day spelling such as `100/min`.
+
+The store atomically increments an epoch-aligned fixed window. Only a real, non-replayed execution consumes one count.
+
+Fixed windows can admit a burst near twice the nominal count across adjacent windows. A hard rolling cap requires a different store contract.
+
+### `background`
+
+The default is foreground-only. `background: true` is allowed only for a read-only connector.
+
+A write, destructive, or idempotent-write connector cannot opt into Mastra background execution because moving it off the foreground path changes its timing and approval topology.
+
+The wrapper also rejects direct or passthrough `_background` overrides on connectors that did not opt in. Core may strip that field on schema-controlled agent paths; its own tool eligibility keeps the connector foreground there.
+
+## Deployment policy
+
+```typescript
+interface ConnectorPolicies {
+  networkEgress?: NetworkEgressOptions;
+  writePermissions?: WritePermissionsPolicy;
+  evaluators?: readonly ToolPolicyEvaluator[];
+  idempotencyStore?: IdempotencyStore;
+  rateLimitStore?: RateLimitStore;
+  audit?: AuditLogger;
+  fetch?: EgressFetchBase;
+}
+```
+
+The connector definition binds these values once. `fetch` is the underlying HTTP implementation wrapped by guarded fetch, and is the normal test seam.
+
+## Execution order
+
+```text
+schema validation
+  -> declared egress against organization allowlist
+  -> custom evaluators in registration order
+  -> dry-run branch
+  -> approval grant
+  -> idempotency reservation or replay
+  -> rate-limit increment for a new attempt
+  -> connector execute with guarded fetch
+  -> output validation
+  -> idempotency commit
+```
+
+A denial throws `ConnectorPolicyError` with connector id, policy name, and reason. Every gate records its decision through the supplied audit logger.
+
+An arbitrary execution, store, evaluator, or parser throw is not copied verbatim into audit. Safe built-in errors can register a static reason and bounded metadata.
+
+## Network egress
+
+Egress has two nested policies:
+
+```text
+actual request host <= connector declaration <= deployment allowlist
+```
+
+### Declaration gate
+
+`networkEgress({ allowedDomains })` compares every manifest host with the deployment list before execution. It catches a connector that declares more access than deployment policy permits.
+
+Omit the policy when the deployment intentionally does not restrict declarations. An empty allowlist denies every declared host.
+
+### Runtime fetch
+
+`runtime.fetch`:
+
+- accepts HTTP and HTTPS only;
+- rejects invalid URLs;
+- checks the initial request and every redirect hop;
+- follows redirects manually;
+- strips authorization, cookie, and proxy credential headers on a cross-origin redirect;
+- rewrites method/body according to redirect status semantics;
+- refuses a 307/308 that would require replaying a one-shot stream body;
+- enforces a bounded redirect count;
+- reports the hostname, not a full query-bearing URL, in denial audit.
+
+The base fetch never runs for a denied hop.
+
+### Residual boundary
+
+The wrapper does not intercept:
+
+- global `fetch`;
+- sockets;
+- a vendor SDK's private transport;
+- the child process used by an Agent CLI connector.
+
+Inject `runtime.fetch` into compatible SDKs. Apply infrastructure network policy for process-wide enforcement.
+
+## Approval context
+
+`breakwater.approvedConnectors` is a read-only string array in Mastra's `RequestContext`. Whoever can write it can authorize a connector, so only trusted runtime code may populate it.
+
+Flowsafe's approval provider reads approved D1 records and derives it for a runtime leg. A public resume body, signal, model output, workflow input, or tool result cannot supply the key.
+
+Grant checks happen on every attempt. A retry without the matching context fails closed.
+
+The dry-run branch is the only approval exemption because its separate implementation is required to have no side effect.
+
+## Idempotency
+
+The effective key is:
+
+```text
+[isolationScope:]connectorId:idempotencyKey
+```
+
+The connector id cannot contain the internal tuple delimiter. The isolation prefix appears when the trusted host sets `breakwater.isolationScope`.
+
+### In-memory store
+
+`InMemoryIdempotencyStore` supports atomic reservation and same-isolate in-flight joining. It is bounded and evictable. It does not protect two Worker isolates or two per-run Durable Objects.
+
+### D1 store
+
+`D1IdempotencyStore` claims a key through an atomic insert. A reservation carries a lease token:
+
+- `reserved`: this caller executes;
+- `replay`: return the stored result;
+- `pending`: another owner still executes.
+
+A stale pending row can be taken over after `pendingTtlMs`. Token-guarded commit and release stop a stale holder from overwriting or deleting the new lease.
+
+Set the TTL above the longest connector or Agent CLI timeout.
+
+Execution failures release the reservation. A successful side effect followed by a failed result-store write returns the result and audits degraded replay protection; throwing at that point would invite a duplicate retry.
+
+## Rate-limit store
+
+`InMemoryRateLimitStore` is per isolate. In a one-Durable-Object-per-run host, that is effectively per run.
+
+`D1RateLimitStore` shares the window across isolates. Use it for per-tenant or deployment-wide enforcement.
+
+Both idempotency and rate keys include the isolation scope when present. Add `tenantIsolation()` to every multi-tenant connector so a missing scope becomes a denial rather than silently shared storage.
+
+## Workflow isolation
+
+Flowsafe writes the current workflow id to `breakwater.workflowScope`.
+
+Register:
+
+```typescript
+crossWorkflowIsolation({
+  targetScopeOf: ({ input }) => {
+    if (
+      typeof input === 'object' &&
+      input !== null &&
+      'workflowId' in input
+    ) {
+      return String(input.workflowId);
+    }
+    return undefined;
   },
 });
 ```
 
-What Mastra provides vs. what breakwater adds: Mastra `createTool()` takes `id`, `description`, `inputSchema`/`outputSchema`, `execute(inputData, context)`, optional suspend/resume schemas, and a native `requireApproval` option (boolean or per-call predicate); MCP-style annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`) exist only as descriptive MCP metadata that nothing enforces. Breakwater adds the enforced manifest: side-effect classification evaluated by the policy engine, idempotency-key storage, dry-run simulation, and rate limiting.
+No target means the call is not accessing workflow state. A target with a missing or different caller scope is denied.
 
-## Permission Manifest
+The target extractor must identify a server-relevant state namespace. It must not transform a client value into trusted caller scope.
 
-| Field | Type | Values |
-|---|---|---|
-| `sideEffect` | enum | `read`, `write`, `destructive`, `idempotent` |
-| `egress` | string[] | Hostnames the connector calls (`api.example.com`); the declared list is checked against the org `networkEgress` allowlist pre-execute, and the connector's actual requests are pinned to the declared list by the runtime fetch guard (`ConnectorRuntime.fetch`) |
-| `idempotencyKey` | boolean | Requires caller to provide an idempotency key |
-| `dryRun` | boolean | Supports simulation without side effects |
-| `rateLimit` | string | Connector-level rate limit expression (budget is per isolation scope when the host mints one) |
-| `requiresApproval` | boolean | Gates execution on human approval (compiled to a Mastra-native `requireApproval` per-call predicate that exempts dry-run requests) |
+## Direct, workflow, and agent calls
 
-Every manifest field is implemented and enforced: `sideEffect`, `egress`, `idempotencyKey`, `requiresApproval`, `dryRun`, and `rateLimit`.
+The wrapped `execute` is the common enforcement point:
 
-- **`dryRun`** declares the connector supports side-effect-free simulation and
-  requires `ConnectorConfig.dryRunExecute` (same output shape as `execute`);
-  declaring one without the other is a definition-time `TypeError`. A caller
-  requests a simulation per call by setting requestContext
-  `breakwater.dryRun` (`DRY_RUN_CONTEXT_KEY`) to `true`: pre-execute gates
-  (egress + custom evaluators) still apply, then the wrapper skips the
-  approval grant, rate-limit consumption, and all idempotency machinery (no
-  side effect to protect; a simulation must not poison the replay store) and
-  runs `dryRunExecute`, auditing `{ dryRun: true }`. Mastra's native approval
-  pause is skipped too: the compiled `requireApproval` predicate returns
-  false for dry-run requests on the standard agent path (runtime paths that
-  evaluate the predicate without a context — network tool execution, the
-  durable agent — still pause, fail closed). A dry-run request
-  against a connector without `dryRun` support is DENIED (policy `dry-run`),
-  never silently executed for real.
-- **`rateLimit`** is `'<count>/<unit>'` — count >= 1, unit one of the singular
-  `s|sec|second|m|min|minute|h|hour|d|day` (e.g. `'100/min'`); malformed
-  expressions are a definition-time `TypeError`, and the manifest requires
-  `policies.rateLimitStore` (`InMemoryRateLimitStore` for dev/tests).
-  Semantics are FIXED WINDOWS (epoch-aligned buckets; a burst may span two
-  adjacent windows), and the budget counts actual executions only: calls
-  denied by other gates, cached replays, and shared in-flight joins never
-  consume it — which is why enforcement is an internal gate immediately
-  before `execute`, not a pre-execute evaluator. Over-budget calls deny with
-  policy `rate-limit`.
+- direct application call;
+- Mastra workflow step;
+- nested tool call;
+- ordinary agent tool call;
+- durable-agent tool call;
+- idempotent replay;
+- dry-run.
 
-## Enforcement
+Mastra input/output processors are complementary and do not replace this wrapper.
 
-`createConnector()` binds org policy at definition time
-(`policies: { networkEgress, writePermissions, evaluators, idempotencyStore,
-rateLimitStore, audit }`) and wraps `execute` with the gates above plus
-three more, in order:
+## Authoring and tests
 
-1. **Network egress** -- two halves sharing one matcher
-   (`egressDomainAllowed`: exact or `*.wildcard`, subdomains only,
-   case/trailing-dot normalized). The DECLARATION gate runs pre-execute:
-   every manifest-declared `egress` hostname must match the org allowlist
-   (policy `network-egress`) -- guarding against misconfiguration and policy
-   drift. The RUNTIME guard is `ConnectorRuntime.fetch`, the third argument
-   `execute`/`dryRunExecute` receive: an `egressFetch()` wrapper bound to the
-   manifest's declared hosts, denying any actual request outside them
-   (policy `egress-fetch`) before the base fetch runs. Redirects are followed
-   manually with a per-hop allowlist check (platform `redirect: 'follow'`
-   would let an allowed host 302 anywhere), credential headers are stripped
-   on cross-origin hops, non-http(s) schemes and unparseable URLs fail
-   closed, and an empty/absent `egress` declaration denies all network.
-   Residual: traffic that never goes through `runtime.fetch` (a vendor SDK's
-   own HTTP stack, the global fetch) is not intercepted -- route SDK traffic
-   through `runtime.fetch` or that connector's egress posture degrades to
-   declaration-only. `policies.fetch` injects the base fetch (tests put the
-   vendor mock there); denials audit as decision 'denied' with
-   `detail.policy: 'egress-fetch'` and never echo the full URL (host only --
-   query strings can embed secrets).
-2. **Write approval** -- `approvalRequired()` (manifest `requiresApproval`,
-   destructive-by-default, or org `writePermissions.requireApproval` connector-id
-   globs). Enforcement is the wrapper's grant check on **every** path: the call
-   is denied unless the request carries a grant -- requestContext
-   `breakwater.approvedConnectors` containing the connector id. The predicate
-   also compiles to Mastra's native `requireApproval` -- a per-call predicate
-   that requires approval unless the request is a dry-run (simulations never
-   reach a side effect, so there is nothing to approve) -- so agent runs pause
-   for a decision and an unapproved resume never reaches `execute` -- but the
-   native outcome never substitutes for the grant: the runtime strips the pure
-   `{approved: true}` resume before invoking the tool (no in-band signal at
-   execute time), and an agent-shaped context is forwardable into nested or
-   direct calls, so `context.agent` proves nothing about approval. Whatever
-   approves a call must mint the grant into the requestContext the resumed
-   call executes under; the flowsafe approval API does this on
-   resume. Minting code is part of the trusted computing base: the grant is a
-   capability token, and requestContext must never be populated from client
-   input, model output, or tool results (see `security-threat-model.md`,
-   trust boundary 6). Grants are checked on every attempt: a retried or
-   resumed call must carry the grant again, or it fails closed.
-3. **Idempotency** -- the per-call key comes from requestContext
-   `breakwater.idempotencyKey`; results are stored per
-   `[<isolationScope>:]${connectorId}:${key}`. A stored key replays the stored
-   result without re-executing; concurrent duplicates share one attempt;
-   failures are never cached, so retries re-execute. Nothing injects keys on
-   the agent path, so idempotency-keyed connectors fail closed under an agent
-   until the flowsafe runtime supplies keys.
+Follow the [connector authoring guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/breakwater/CONNECTORS.md).
 
-## Isolation Scope (Multi-Tenant Hosts)
+At minimum, test:
 
-breakwater is tenant-agnostic: it is a standalone library, and no gate needs
-tenant *identity* -- `RBACMiddleware` decides on `actor.role`, `PolicyEngine`
-on message content. What a multi-tenant host supplies instead is one **opaque
-string** through requestContext `breakwater.isolationScope`
-(`ISOLATION_SCOPE_CONTEXT_KEY`), which breakwater never parses -- the same
-pattern `crossWorkflowIsolation` already uses for `breakwater.workflowScope`.
-flowsafe's runtime mints it on every leg of a tenant-salted run.
+1. permitted execution;
+2. declaration egress denial;
+3. actual fetch denial, including redirect;
+4. approval denial and grant success;
+5. dry-run with zero side effects;
+6. idempotent replay and concurrent callers;
+7. rate-limit boundary;
+8. missing tenant scope in a multi-tenant host;
+9. workflow target mismatch where relevant;
+10. audit safety for arbitrary throws;
+11. packed npm consumer behavior.
 
-It does two things:
-
-- **Segments the connector's keys.** Both the idempotency key and the
-  rate-limit budget key are prefixed with the scope when one is present. This
-  matters because an idempotency key is *caller-supplied* and its canonical use
-  is cross-run business identity (`send-email:bob@acme.com`), which two tenants
-  can legitimately share: without the segment, tenant B's send would be
-  suppressed as a replay of tenant A's, or would return A's cached result
-  object. Likewise, one tenant exhausting a connector's `rateLimit` would
-  throttle every other tenant. There is **no flag**: absent scope reproduces
-  the single-tenant keys byte for byte, so there is no default-false switch to
-  forget.
-- **Feeds the `tenantIsolation` evaluator.** "Absence of a scope is an error"
-  is a property of the *deployment*, not of the library, so it ships as an
-  evaluator a platform adds to its policy set:
-  `tenantIsolation()` denies any call whose requestContext carries no scope.
-  It runs in the pre-execute gates loop, which is load-bearing: the dry-run
-  branch returns *before* both the idempotency and rate-limit machinery, so a
-  constraint that must also bind simulations cannot live on those paths.
-
-Custom `ToolPolicyEvaluator`s registered via `policies.evaluators` run
-pre-execute after the built-in egress gate, in order -- the slot later policy
-domains (retention/isolation pre-checks) plug into.
-
-Denials throw `ConnectorPolicyError` (`connector`, `policy`, `reason`); every
-decision is recorded to the shared `AuditLogger` as action `connector.execute`.
-The manifest also compiles to truthful MCP annotations (`readOnlyHint`,
-`destructiveHint`, `idempotentHint`, `openWorldHint`) -- descriptive metadata;
-enforcement stays in the wrapper.
-
-## Idempotency
-
-Write connectors must bind idempotency storage
-(`policies.idempotencyStore`; `createConnector()` rejects an
-`idempotencyKey: true` manifest without one). The breakwater/flowsafe runtime
-provides the idempotency key via requestContext -- Mastra has no idempotency
-machinery, only the descriptive MCP `idempotentHint` annotation; the wrapper
-stores the result by key and returns the stored result on replay. This
-prevents duplicate side effects across retries and DO lifecycle boundaries.
-The store interface grew the atomic reserve the durable path required:
-`AtomicIdempotencyStore` extends `get`/`put` with `reserve(key)` — a
-compare-and-set claim returning `'reserved'` (this caller executes),
-`'replay'` (a completed record to return), or `'pending'` (another isolate is
-executing; the call denies honestly and a retry replays the winner's result)
-— and `release(key)` so failed executions stay retryable. The wrapper prefers
-the reserve path whenever a store implements it; plain `get`/`put` stores
-keep the legacy same-isolate-only flow. `D1IdempotencyStore` is the shipped
-durable implementation (structural D1 typing — no `@cloudflare/workers-types`
-dependency): the claim is `INSERT ... ON CONFLICT DO NOTHING RETURNING`, and
-a stale-pending takeover (default TTL 300s; must exceed the longest expected
-execute) recovers keys a crashed isolate would otherwise poison forever.
-`InMemoryIdempotencyStore` implements the same atomic shape for dev/tests.
+For Agent CLIs, also read [Agent CLI connectors](agent-cli-connectors.md).

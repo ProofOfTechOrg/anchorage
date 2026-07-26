@@ -72,8 +72,8 @@ export const DECIDER_ROLES: readonly ApprovalRole[] = ['reviewer', 'admin'];
  * e2e mirror tripwire pins "breakwater's Actor fields + tenantId".
  *
  * `tenantId` crosses an authentication boundary (bearer map or JWT claims):
- * every verifier must validate it against TENANT_ID_PATTERN (INV-3,
- * do-runner/path-safe-id.ts) before constructing an ApprovalActor — the type
+ * every verifier must validate it against TENANT_ID_PATTERN in
+ * do-runner/path-safe-id.ts before constructing an ApprovalActor — the type
  * says `string`, but the type system has no authority over a decoded token.
  */
 export interface ApprovalActor {

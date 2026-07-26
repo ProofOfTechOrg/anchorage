@@ -44,7 +44,7 @@ export interface ApprovalApiClientOptions {
   baseUrl?: string;
   /**
    * Where streamTicket() POSTs — sibling to baseUrl, default
-   * '/api/stream/ticket'. The Worker is the sole ticket authority (M-006).
+   * '/api/stream/ticket'. The Worker is the sole ticket authority.
    */
   streamTicketUrl?: string;
   /** Default: globalThis.fetch. Injected in tests and non-browser hosts. */

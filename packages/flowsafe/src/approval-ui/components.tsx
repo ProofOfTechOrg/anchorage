@@ -162,7 +162,7 @@ export interface ApprovalUIComponents {
   Checkbox?: (props: CheckboxProps) => ReactNode;
   Select?: (props: SelectProps) => ReactNode;
   /**
-   * OPTIONAL live-streaming slots (M-007), same additive contract as
+   * Optional live-streaming slots with the same additive contract as
    * Checkbox/Select: a full-interface adapter written before them keeps
    * compiling, the provider merge fills them from htmlComponents, and views
    * consume them through ResolvedApprovalUIComponents (semver-minor).

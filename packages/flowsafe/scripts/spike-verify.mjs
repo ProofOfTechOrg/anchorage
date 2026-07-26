@@ -367,7 +367,10 @@ function expectWsRefused(path, ticket, timeoutMs) {
     const ws = new WebSocket(wsUrl(path, ticket));
     clientSockets.push(ws);
     let timer;
+    let settled = false;
     const settle = (fn, arg) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       try {
         ws.close();

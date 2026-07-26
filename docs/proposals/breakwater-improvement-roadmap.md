@@ -1,7 +1,9 @@
-# Breakwater Improvement Roadmap
+# Proposal: breakwater improvement roadmap
+
+> This document records uncommitted design work. It is not implemented or supported product behavior. Shipped behavior is documented in [Breakwater architecture](../breakwater-architecture.md), [Policy engine](../policy-engine-design.md), and [Connector interface](../connector-interface.md).
 
 This document turns the limitations and ownership boundaries described in
-[`breakwater-purpose-and-boundaries.md`](breakwater-purpose-and-boundaries.md)
+[`breakwater-purpose-and-boundaries.md`](../breakwater-purpose-and-boundaries.md)
 into an actionable improvement plan.
 
 It distinguishes among:

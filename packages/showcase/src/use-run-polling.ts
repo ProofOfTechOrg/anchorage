@@ -58,6 +58,31 @@ export const UNAVAILABLE = 'unavailable';
 const POLL_INTERVAL_MS = 3000;
 
 /**
+ * Start a non-overlapping poll chain and return the one owner of its timer.
+ * The next delay begins only after the current asynchronous poll settles.
+ */
+export function startPollingLoop(
+  poll: () => Promise<boolean>,
+  intervalMs: number,
+): () => void {
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  function tick(): void {
+    void poll().then((done) => {
+      if (stopped || done) return;
+      timer = setTimeout(tick, intervalMs);
+    });
+  }
+
+  tick();
+  return () => {
+    stopped = true;
+    if (timer !== undefined) clearTimeout(timer);
+  };
+}
+
+/**
  * Consecutive transient failures tolerated before a run stops being polled.
  * At POLL_INTERVAL_MS that is ~15s of grace — ample for a just-started run's
  * snapshot to materialize.
@@ -165,7 +190,6 @@ export function useRunPolling(
     void retryNonce;
     if (runs.length === 0) return;
     let alive = true;
-    let timer: ReturnType<typeof setTimeout> | undefined;
     // Per-effect-run bookkeeping, deliberately NOT a ref: re-arming (a new run,
     // an actor switch) should forgive earlier failures, and StrictMode's double
     // invoke gets its own counters instead of sharing one set.
@@ -276,18 +300,11 @@ export function useRunPolling(
       return allRunsSettled(runs, settled, abandoned);
     }
 
-    // Self-scheduling rather than setInterval: a poll slower than the interval
-    // cannot stack behind itself, and the chain simply stops when done.
-    async function tick(): Promise<void> {
-      const done = await poll();
-      if (!alive || done) return;
-      timer = setTimeout(() => void tick(), POLL_INTERVAL_MS);
-    }
-    void tick();
+    const stopPolling = startPollingLoop(poll, POLL_INTERVAL_MS);
 
     return () => {
       alive = false;
-      if (timer !== undefined) clearTimeout(timer);
+      stopPolling();
       for (const connection of connections) connection.close();
     };
   }, [runClient, runs, retryNonce, stream]);

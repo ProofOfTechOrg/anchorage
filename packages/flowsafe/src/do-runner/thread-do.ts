@@ -99,8 +99,8 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
   /**
    * Serve a request whose tenant has already been asserted against this
    * instance's identity. Abstract because the skeleton hosts no routes of its
-   * own: Track A drives the agent loop through `scope.init.runtime`, Track C
-   * mounts the signal routes — both on this asserted scope.
+   * own: the durable-agent host drives the loop through `scope.init.runtime`,
+   * and the signals package mounts signal routes on the same asserted scope.
    */
   protected abstract route(
     request: Request,
@@ -125,8 +125,8 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
 
   /**
    * The tenant this instance serves, decoded from its own thread id — the same
-   * salted-prefix decode INV-1 uses for runIds (ONE decode, tenantOfMemoryId ->
-   * tenantOfRunId). Throws on a name carrying no INV-3 prefix: a hand-built or
+   * salted-prefix decode used for runIds (one decode, tenantOfMemoryId to
+   * tenantOfRunId). Throws on a name carrying no valid tenant prefix: a hand-built or
    * client-chosen threadId never reaches a tenant-scoped store.
    */
   protected get tenantId(): string {
