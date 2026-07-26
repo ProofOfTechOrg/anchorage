@@ -1,287 +1,331 @@
-# flowsafe
+# @proofoftech/flowsafe
 
-Approval UX and durable execution for Mastra workflows, running on Cloudflare
-Workers and Durable Objects.
+Durable approvals and tenant-safe long-running execution for Mastra on Cloudflare.
 
-## Purpose
+Flowsafe runs Mastra workflows and agents through Cloudflare Durable Objects, stores their snapshots in D1, turns suspensions into human approval requests, and derives connector grants from stored decisions when a run resumes.
 
-flowsafe provides human-in-the-loop approval gates for Mastra workflows and
-durable execution via the Durable Object import-swap pattern. It ships as a
-standalone service with a React approval UI and a DO-based workflow runner.
+[Documentation](https://github.com/ProofOfTechOrg/anchorage/tree/main/docs) · [Getting started](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/getting-started.md) · [API reference](https://proofoftechorg.github.io/anchorage/) · [Live demo](https://anchorage.proofoftech.org/)
 
-## Subpackages
+## Install
 
-| Subpackage | Role |
-|---|---|
-| `approval-api` | REST API for submitting and reviewing approval requests: claim/decide/delegate, batch decide, triage filters (requester + age bounds), SLA tracking + escalation, and the `ApprovalNotificationSink` transport seam |
-| `approval-ui` | Styling-agnostic React UI surfacing pending approvals and history, with queue triage (filter bar + batch selection/decide) |
-| `do-runner` | Durable Object workflow runner (import-swap pattern) |
-| `audit-export` | Cloudflare Queues → SIEM audit export (producer sink + batch consumer) |
-| `artifacts` | R2-backed workflow artifact storage keyed by run identity |
-| `host-kit` | Host-agnostic glue: the identity seam (`TokenVerifier`), the tenant resolver, the shared `/workflows` + `/runs` routes, the tenants registry, the suspension→approval bridge, and `createFlowsafeWorker()` — the composed production Worker hosts consume as thin shells |
-
-A copy-ready production deployment lives in [`deploy/`](deploy/) — a thin
-shell over `createFlowsafeWorker()` with cron-owned SLA enforcement and
-retention purge.
-
-## Installation
-
-```
-npm install @proofoftech/flowsafe
+```bash
+npm install @mastra/core@^1.50.0 @proofoftech/flowsafe
 ```
 
-Support matrix: Node >= 22, ESM only (TypeScript `moduleResolution`
-`node16`/`nodenext`/`bundler`; no CJS build), `@mastra/core` ^1.50.0 as a
-peer. React 18 or 19 is an optional peer used only by `./approval-ui`;
-`@proofoftech/breakwater` is an optional peer whose types only the
-`./host-kit/module` subpath references.
+Install `@proofoftech/breakwater` when resumed steps call approval-protected connectors:
 
-## Status
+```bash
+npm install @proofoftech/breakwater
+```
 
-Implemented, tested, and spike-verified. The do-runner + D1 adapter run a
-Mastra workflow on Workers + DO under `wrangler dev`, suspend at an approval
-step, survive a full dev-server restart, and resume to completion from the
-D1 snapshot — proven as a pass/fail command by
-`pnpm --filter @proofoftech/flowsafe spike:verify`.
+Install React and React DOM only when you import `@proofoftech/flowsafe/approval-ui`.
 
-The approval queue + dashboard + SLA are implemented, tested, and
-spike-verified on workerd: a suspension queues a D1-backed approval request
-(CAS-guarded store, one open request per suspended step); a reviewer decision
-— role-checked, audited, SLA-tracked, self-approval denied by default —
-resumes the run through its Durable Object; and the runtime's
-`requestContextForRun` provider derives the breakwater connector grant
-(`breakwater.approvedConnectors`) from APPROVED records on every
-start/resume, leg-scoped to the resumed step. Grants never travel in HTTP
-bodies: a resume that bypasses `decide()` for its step finds no grant and
-fails closed at the connector gate — even when the same connector was
-approved at an earlier gate of the run.
+Compatibility:
 
-flowsafe is **multi-tenant by construction** (see
-[Multi-tenancy](#multi-tenancy) below): run ids carry their tenant, approval
-stores are bound to one tenant at construction, and the cross-tenant SLA sweep
-is cron-only code that a request handler cannot reach — enforced by the type
-system, not by convention.
+- Node.js 22 or later (engine range `>=22`)
+- ESM only
+- TypeScript `moduleResolution: "NodeNext"`, `"Node16"`, or `"Bundler"`
+- `@mastra/core` in the declared `^1.50.0` peer range
+- `react` and `react-dom` `>=18 <20` (React 18 or 19) for the optional approval UI
+- `@proofoftech/breakwater` `>=0.2.0 <1.0.0` when used
 
-## Usage
+## Choose an export
+
+| Import | Purpose |
+| --- | --- |
+| `@proofoftech/flowsafe` | Compatibility barrel for approval API, runner, artifacts, and audit export |
+| `@proofoftech/flowsafe/approval-api` | Approval records, service, tenant-bound stores, REST router, grants, SLA, retention, notifications, and stream events |
+| `@proofoftech/flowsafe/do-runner` | Durable Object runner, D1 storage, run summaries, identities, pub/sub, resume ledger, retention, and offboarding |
+| `@proofoftech/flowsafe/approval-ui` | Styling-library-agnostic React dashboard, DOM-free API client, headless hook, and live transport |
+| `@proofoftech/flowsafe/host-kit` | Auth seams, tenant resolver, topologies, run/stream routers, approval bridges, and composed Worker |
+| `@proofoftech/flowsafe/host-kit/module` | Import-safe workflow module contract |
+| `@proofoftech/flowsafe/artifacts` | R2 artifact store and in-memory test bucket |
+| `@proofoftech/flowsafe/audit-export` | Cloudflare Queue producer sink and NDJSON SIEM consumer |
+| `@proofoftech/flowsafe/agent-runner` | Runtime-driven Mastra durable agents and restart-safe approval resume |
+| `@proofoftech/flowsafe/signals` | Thread signal routes, ingestion router, D1 notification/state domains, dispatch, and client |
+| `@proofoftech/flowsafe/signals/client` | DOM-free signal client without Worker code |
+| `@proofoftech/flowsafe/goals` | Durable objective router |
+| `@proofoftech/flowsafe/schedules` | D1 schedules, tenant facade, reserved-context controls, and CAS tick |
+| `@proofoftech/flowsafe/background-tasks` | Tenant task host, D1 task domains, routes, and cleanup |
+| `@proofoftech/flowsafe/signal-providers` | Alarm-driven provider host, topology, subscriptions, verified webhooks, and GitHub reference provider |
+
+New host-side and React features are subpath-only. This keeps the root import free of durable-agent and UI dependency graphs.
+
+## Start with the baseline Worker
+
+Copy the [reference deployment](https://github.com/ProofOfTechOrg/anchorage/tree/main/packages/flowsafe/deploy). It supplies:
+
+- one Durable Object per run;
+- D1-backed Mastra snapshots and approvals;
+- bearer-authentication seam and tenant resolver;
+- workflow catalog, start, status, and resume routes;
+- suspension-to-approval bridge;
+- exact suspension-bound breakwater grant derivation;
+- role checks and separation of duties;
+- optional live approval/run WebSockets;
+- cron-owned SLA sweep and retention purge;
+- structured audit and optional Queue-to-SIEM export;
+- a sample gated workflow.
+
+Replace the example workflow and identity verifier. Keep the trusted host-kit composition and grant provider.
 
 ```typescript
-import { z } from 'zod';
-import { DurableObjectRunner, init, type RunnerRuntime } from '@proofoftech/flowsafe/do-runner';
+import {
+  approvalGrantProvider,
+} from '@proofoftech/flowsafe/approval-api';
+import {
+  DurableObjectRunner,
+  init,
+  type RunnerRuntime,
+} from '@proofoftech/flowsafe/do-runner';
+import { approvalStoreFactoryFor } from '@proofoftech/flowsafe/host-kit';
 
-// Inside the Durable Object: init(env) builds D1-backed storage from the
-// conventional `DB` binding (or pass { storage } explicitly, e.g. in tests)
-// and returns import-swapped factories. Workflow definition code is
-// unchanged Mastra code.
-export class MyRunner extends DurableObjectRunner<Env> {
+export class AppRunner extends DurableObjectRunner<Env> {
   protected build(env: Env): RunnerRuntime {
-    const { createWorkflow, createStep, runtime } = init(env);
-    const gate = createStep({
-      id: 'approval',
-      inputSchema: z.object({ topic: z.string() }),
-      outputSchema: z.object({ topic: z.string(), approvedBy: z.string() }),
-      suspendSchema: z.object({ reason: z.string() }),
-      resumeSchema: z.object({ approvedBy: z.string() }),
-      execute: async ({ inputData, resumeData, suspend }) => {
-        if (!resumeData) return suspend({ reason: 'approval required' });
-        return { topic: inputData.topic, approvedBy: resumeData.approvedBy };
-      },
+    const approvals = approvalStoreFactoryFor(env.DB).forTenant(this.tenantId);
+    const { createWorkflow, createStep, runtime } = init(env, {
+      requestContextForRun: approvalGrantProvider(approvals),
     });
-    createWorkflow({
-      id: 'gated',
-      inputSchema: z.object({ topic: z.string() }),
-      outputSchema: z.object({ topic: z.string(), approvedBy: z.string() }),
-    })
-      .then(gate)
-      .commit();
+
+    // Define and commit workflows through the import-swapped factories.
+
     return runtime;
   }
 }
 ```
 
-The DO exposes `POST /runs`, `GET /runs/:workflowId/:runId`, and
-`POST /runs/:workflowId/:runId/resume`; route one DO instance per run
-(`idFromName(workflowId + ':' + runId)`) from your Worker. See
-`spike/worker.ts` for a complete Worker, and run the end-to-end spike with
-`pnpm spike` (wrangler dev on `spike/wrangler.jsonc`).
+`init()` creates D1-backed Mastra storage from the conventional `DB` binding unless you inject storage. Workflow definitions use the same `createWorkflow()` and `createStep()` shape as Mastra.
 
-### Approval queue (`@proofoftech/flowsafe/approval-api`)
+## Approval lifecycle
+
+When a workflow or durable agent suspends:
+
+1. The authoritative run summary captures `stepPath`, `suspendedAt`, and `resumeCount`.
+2. The trusted host bridge creates one open approval in a tenant-bound store.
+3. The record's connector ids come from a server-authored suspend payload.
+4. A reviewer claims, delegates, approves, or rejects through the service or REST router.
+5. A compare-and-swap commits the mutation.
+6. An approval re-enters the owning runtime.
+7. `approvalGrantProvider()` reads D1 and writes only the matching approved connectors into the resumed leg's request context.
+8. Another suspension creates a new approval. A completed or failed run ends the loop.
+
+Grants never travel in public request bodies. A raw or forged resume finds no stored capability and fails at the breakwater connector gate.
+
+### REST surface
+
+The default approval base is `/api/approvals`.
+
+```text
+GET  /
+GET  /metrics
+GET  /:id
+POST /:id/claim
+POST /:id/delegate
+POST /:id/decide
+POST /batch/decide
+```
+
+The create route is disabled by default. If enabled, it rejects capability, attribution, fingerprint, and resume-target fields.
+
+Queue filters cover status, workflow, run, claimant, requester, strict creation-time bounds, bounded pagination, and reviewer-priority ordering. Batch decisions contain per-record outcomes and preserve all single-record checks.
+
+### Separation of duties
+
+Self-decision is denied by default. A non-exempt actor also cannot approve a later gate after approving an earlier gate that advanced the run. Set a narrow role exemption only for an installation that cannot supply an independent reviewer.
+
+### SLA, notifications, and retention
+
+`sweepSLA()` accepts the system-only cross-tenant store and escalates overdue open records. It is intended for a scheduled invocation and is not an HTTP service method.
+
+`ApprovalNotificationSink` receives creation and escalation events. Failures are contained and audited. `ApprovalStreamSink` publishes mutations to the optional tenant hub.
+
+`purgeExpiredApprovals()` deletes only approved and rejected records past the configured age. Pending, claimed, and escalated records remain live at any age.
+
+Read the [approval-system guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/approval-system.md) for exact grant binding and recovery behavior.
+
+## Approval dashboard
+
+The optional UI exports a plain-HTML default and an injected component contract:
 
 ```typescript
 import {
-  approvalGrantProvider,
-  ApprovalService,
-  createApprovalRouter,
-  createTenantResolver,
-  D1ApprovalStoreFactory,
-  resumeViaRuntime,
-  sweepSLA,
-} from '@proofoftech/flowsafe/approval-api';
-import { bearerActorAuthenticator, staticTokenVerifier, parseActorTokens }
-  from '@proofoftech/flowsafe/host-kit';
+  ApprovalApiClient,
+  createApprovalDashboard,
+} from '@proofoftech/flowsafe/approval-ui';
 
-// Hoist the factory to module scope: it owns one memoized schema-init pass,
-// so rebuilding it per request re-runs the DDL every time.
-const factory = new D1ApprovalStoreFactory(env.DB); // shares the runner's D1
-
-// 1. Grant-minting seam. Inside a Durable Object, bind the store to THIS
-//    instance's tenant (recovered from its own idFromName identity), so the
-//    mint can only ever read its own tenant's records.
-const { createWorkflow, createStep, runtime } = init(env, {
-  requestContextForRun: approvalGrantProvider(factory.forTenant(this.tenantId)),
+const client = new ApprovalApiClient({
+  headers: {
+    authorization: `Bearer ${token}`,
+  },
 });
 
-// 2. Authenticate FIRST, then construct. The resolver validates the actor's
-//    tenant and binds the store to it, so there is no pre-auth service for a
-//    later refactor to reach for.
-const resolve = createTenantResolver({
-  authenticate: bearerActorAuthenticator(
-    staticTokenVerifier(parseActorTokens(env.APPROVAL_ACTOR_TOKENS)),
-  ),
-  storeFactory: factory,
-  buildService: (store) =>
-    new ApprovalService({
-      store,                                  // tenant-bound; required
-      defaultSlaSeconds: 15 * 60,
-      resumeRun: resumeViaRuntime(runtime),   // or a DO-stub fetch
-      audit: (event) => auditLogger.record(event),
-    }),
+createApprovalDashboard(document.getElementById('root')!, {
+  client,
 });
-
-// 3. REST surface (list/get/claim/decide/delegate/metrics). The create route
-//    is off unless you pass allowCreate.
-const router = createApprovalRouter({ resolve });
 ```
 
-Escalation is **cron-only**. There is deliberately no HTTP sweep route: the
-sweep is an unfiltered cross-tenant read *and write*, so it lives in a
-standalone `sweepSLA(factory.system(), { systemActor, audit, onEscalation })`
-that takes a `SystemApprovalStore` — a type a request handler cannot obtain.
-Call it from `scheduled()`. Breached open requests transition to `escalated`
-(still decidable) and fire `onEscalation`.
+The package includes:
 
-Grant scope: a step-keyed approval unlocks its connectors only for the leg
-that resumes that step, and only for the suspension it was decided during —
-when the same step suspends again, the earlier approval is spent and the new
-suspension needs its own decision. Create a step-less approval for
-deliberately run-scoped standing grants. Self-approval (decider ==
-requester) is denied unless the service is constructed with
-`allowSelfDecision` — `true` exempts every decider, or `{ roles }` exempts
-only the listed roles (a single-operator deployment sets e.g.
-`{ roles: ['admin'] }`; composed hosts pass `APPROVAL_ALLOW_SELF_DECISION`).
-A permitted self-decision is audited with `detail.selfDecision: true`. If a decision's
-resume attempt fails (`resume.ok === false`), the decision is already
-durable — re-drive the run by POSTing its resume route with the record's
-`stepPath` and the `defaultResumeData` shape; grants re-derive from the
-store.
+- queue, detail, metrics, filter, and batch-decision views;
+- `useApprovalDashboard()` for headless composition;
+- `ApprovalUIProvider` and `ApprovalUIComponents` slots;
+- optional checkbox, select, toast, and presence slots;
+- optimistic decisions with conflict reporting;
+- polling reconciliation;
+- WebSocket live merge and liveness heartbeat;
+- `ApprovalApiClient` without a DOM dependency.
 
-### Dashboard (`@proofoftech/flowsafe/approval-ui`)
-
-A React dashboard over the REST API — queue, detail + decision form, metrics.
-It is **styling-library agnostic**: the views render through injected slot
-components, so you plug in your own design system — or use the built-in unstyled
-HTML default. `react`/`react-dom` are optional peers needed only for this
-subpath, and it runs on React 18+.
-
-```typescript
-import { ApprovalApiClient, createApprovalDashboard } from '@proofoftech/flowsafe/approval-ui';
-
-const client = new ApprovalApiClient({ headers: { authorization: `Bearer ${token}` } });
-
-// Unstyled HTML default — zero extra deps; style via the flowsafe-* class hooks.
-const dashboard = createApprovalDashboard(document.getElementById('root')!, { client });
-
-// …or supply a design-system adapter for the ApprovalUIComponents slots:
-// createApprovalDashboard(el, { client, components: myAdapter });
-```
-
-For a headless integration, drive `useApprovalDashboard(client)` yourself and
-render any UI you like. A ready-to-run reference app lives in the repo's
-`showcase` package (`packages/showcase/` — `pnpm --filter showcase dev`, or
-`pnpm dev` at the root): a full Vite build that injects an
-[Astryx](https://astryx.atmeta.com) adapter, bundles that library's CSS, and —
-in dev — mounts a live seeded approval-api at `/api/approvals` so
-claim/decide/delegate drive real state.
+Flowsafe has no Astryx or CSS dependency. The repository showcase injects Astryx in the application only.
 
 ## Multi-tenancy
 
-Three invariants, each enforced at a single chokepoint. Everything else is a
-corollary.
+Flowsafe applies three base invariants.
 
-**INV-1 — the run id carries the tenant.** Every `runId` is minted
-server-side as `` `${tenantId}_${uuid}` `` from the *authenticated* tenant.
-`createRunRouter` rejects a client-supplied `body.runId` with 400,
-`RunnerRuntime.start` requires a `runId` (there is no generation fallback),
-and the Durable Object refuses any request whose `(workflowId, runId)`
-disagrees with its own `ctx.id.name`. Because `runId` is the key everything
-else derives from, this makes the Mastra snapshot row, the DO instance, the
-per-run lock, the grant-mint predicate, and the R2 key tenant-disjoint with
-no schema change and no signature change. Status and resume additionally
-check ownership and answer **404** — not 403 — for another tenant's run, so
-the route is not an existence oracle.
+### The run id carries the tenant
 
-**INV-2 — the store is bound to one tenant at construction.** Approval
-stores come only from a factory (`D1ApprovalStoreFactory.forTenant()`), and
-the bound type carries a `unique symbol` brand: an unbound store, or the
-cron-only `SystemApprovalStore`, is a *compile error* wherever a request
-handler expects a bound one. `tenantId` is deliberately not a member of
-`ApprovalListFilter` — an omissible tenant filter is the canonical fail-open.
-Requests flow through a `TenantResolver` (authenticate → validate → bind), so
-no pre-auth store exists.
+The host mints `${tenantId}_${uuid}` from authenticated context. `RunnerRuntime.start()` requires a run id and has no generation fallback. Status and resume return 404 for a foreign run.
 
-**INV-3 — the charset makes the prefix exact.** `tenantId` matches
-`^[a-z0-9]{3,32}$`. That set contains no character in `[0x5F, 0x60]` —
-neither `_` nor `` ` `` — so `runId.startsWith(tenantId + '_')` cannot match
-another tenant (`acme` never matches `acmecorp`), and the offboarding range
-delete `` run_id >= '<tid>_' AND run_id < '<tid>`' `` selects exactly one
-tenant's rows. Loosening the charset silently breaks both; a
-character-exhaustive test pins it.
+The run id scopes the snapshot, Durable Object, connector isolation context, approval lookup, and artifact path.
 
-Consequences worth knowing:
+### Stores bind at construction
 
-- **Provision before you issue tokens.** `provisionTenant(db, { tenantId, kind })`
-  (import from `@proofoftech/flowsafe/host-kit`)
-  inserts into the `tenants` registry or fails. Nothing else enforces tenant-id
-  uniqueness, and two clients slugged `acme` would merge entirely.
-- **Every actor carries a tenant.** `ApprovalActor` is `{ id, role, tenantId }`;
-  a bearer-map entry or JWT claim without an INV-3-valid `tenantId` is dropped
-  and its token 401s. breakwater's own `Actor` stays tenant-agnostic.
-- **Connector budgets are per-tenant.** The runtime mints an opaque
-  `breakwater.isolationScope` on every leg of a tenant-salted run, and
-  breakwater segments its idempotency and rate-limit keys by it — so one
-  tenant exhausting a connector's budget cannot throttle another, and two
-  tenants sharing a business-level idempotency key do not replay each other's
-  results. Absent scope preserves the single-tenant keys exactly; there is no
-  flag to forget.
-- **Offboarding is one call.** `purgeTenant(db, { tenantId, artifactStore })`
-  (import from `@proofoftech/flowsafe/do-runner` or the package root)
-  reaps snapshots of *any* status (a run abandoned at a gate is never eligible
-  for the terminal-only retention purge), the tenant's agent-memory rows
-  (threads/messages/resources — salted ids, same exact range predicate), the
-  tenant's approval records, and its R2 artifacts. Only purge tenants whose
-  tokens have already expired.
-- **Agent-memory ids are tenant-salted.** Mastra memory is keyed by
-  caller-chosen `threadId`/`resourceId`, which two tenants can legitimately
-  share. `TenantContext.newThreadId()`/`newResourceId(key)` (and the
-  underlying `mintThreadId`/`mintResourceId` from
-  `@proofoftech/flowsafe/do-runner`) are the only constructors: ids are
-  `${tenantId}_${suffix}`, ownership is an exact prefix check
-  (`ownsMemoryId`), and hosts never accept a client-supplied memory id. See
-  `docs/agent-memory-tenancy.md` for the feature-side obligations.
+`D1ApprovalStoreFactory.forTenant()` returns a branded tenant-bound store. Request handlers cannot pass an unbound or system store where a tenant store is required.
 
-### Deployment & ops
+Construct the store after authentication through `createTenantResolver()`. The system store exists only for scheduled cross-tenant maintenance.
 
-Copy [`deploy/`](deploy/) as a production starting point: a Worker wiring one
-DO per run, the D1 approval queue, the tenant resolver over a bearer-token
-verifier, an optional subdomain↔tenant cross-check, and a cron trigger that
-owns the SLA sweep and snapshot retention purge. `pnpm deploy:dev` runs it on
-local workerd (no Cloudflare account); `pnpm deploy:cf` deploys it. Checklist
-and configuration table: [`deploy/README.md`](deploy/README.md).
+### The tenant charset makes prefix ownership exact
 
-Audit export ships as a Cloudflare Queues sink + SIEM consumer
-(`@proofoftech/flowsafe/audit-export`): `queueAuditSink(env.QUEUE)` plugs into
-any breakwater/approval audit sink, and `createAuditQueueConsumer({ endpoint })`
-POSTs each batch as NDJSON, acking on 2xx and retrying otherwise. Workflow
-artifacts persist to R2 via `R2ArtifactStore`
-(`@proofoftech/flowsafe/artifacts`), keyed `workflowId/runId/name`.
+Tenant ids match `^[a-z0-9]{3,32}$`. This excludes the `_` run and memory delimiter, making prefix ownership and D1 range deletion exact.
 
-See `docs/flowsafe-architecture.md` and `docs/do-runner-design.md` for design details.
+Provision each named tenant before issuing credentials. Do not infer customer identity from a slug without the registry.
+
+## Memory, retention, and offboarding
+
+Mastra memory ids are caller-chosen by default. In a multi-tenant host:
+
+- mint threads with `TenantContext.newThreadId()`;
+- mint resources with `TenantContext.newResourceId(key)`;
+- reject client bodies that name memory ids;
+- return 404 for foreign stored ids;
+- reach a thread Durable Object only through `createThreadTopology()`.
+
+Retention helpers cover:
+
+- terminal workflow snapshots;
+- decided approvals;
+- idle threads and their messages;
+- terminal notifications;
+- thread state and goals;
+- schedule trigger history;
+- terminal background tasks.
+
+Schedules, resources/working memory, and provider subscriptions are standing state and delete at offboarding, not by default TTL.
+
+`purgeTenant()` deletes every adopted tenant domain. Pass the artifact store so R2 objects delete with their owning run rows.
+
+## Artifacts
+
+`R2ArtifactStore` uses keys shaped as:
+
+```text
+[prefix/]workflowId/runId/name
+```
+
+Workflow and run ids use the runner's path-safe pattern. Artifact names are validated segment by segment. `deleteRun()` pairs with terminal-run retention; tenant purge removes the remaining tenant artifacts.
+
+`InMemoryArtifactBucket` is available for tests and offline demos.
+
+## Audit export
+
+`queueAuditSink(queue)` turns the shared audit contract into Cloudflare Queue messages. `createAuditQueueConsumer()` batches records as NDJSON, posts them to the configured collector, acknowledges the batch on 2xx, and retries otherwise.
+
+The types are structural and do not require `@cloudflare/workers-types`. A transform seam can map internal events to your SIEM schema.
+
+## Live streaming
+
+Live updates are opt-in behind a `HUB` Durable Object binding and `STREAM_TICKET_SECRET`.
+
+An authenticated REST request mints a short-lived HMAC ticket. The browser presents it when opening a queue or run WebSocket. The Worker is the only verifier, and each Durable Object rebinds the addressed tenant or run through its own identity.
+
+Tickets carry addressing information only. They contain no connector grant or approval decision. Polling remains available as fallback and reconciliation.
+
+## Long-running agents
+
+The following surfaces are supported and opt-in: they are tested and covered by package compatibility guarantees, but the host must explicitly wire the required routes, bindings, storage domains, or scheduled duties.
+
+### Durable agents
+
+`createFlowsafeDurableAgent()` routes Mastra's durable-agent workflow through `RunnerRuntime`. Public start entry points require a caller-minted tenant run id. After an isolate restart, `resumeViaRuntime()` prepares the agent registry, registers observation, and resumes through the runtime after validating memory ownership.
+
+### Signals and notifications
+
+`createThreadSignalRoutes()` hosts message, queue, signal, state, and notification delivery in the thread Durable Object. `createSignalRouter()` is the Worker trust boundary: authenticate, authorize, ownership-check, cap, parse, reject memory ids, allowlist attributes, rate-limit, audit, then forward.
+
+`D1NotificationsStorage` and `D1ThreadStateStorage` mirror Mastra's in-memory domains on D1. `SignalClient` is available from the browser-safe `signals/client` export.
+
+### Goals
+
+`createObjectiveRouter()` manages one durable objective per thread through Mastra's own goal read/write shape. Writes are role-gated, size- and run-budget-capped, and audited.
+
+### Schedules
+
+`D1SchedulesStorage` implements the schedule domain. `createScheduleRouter()` provides tenant-filtered CRUD and read-only trigger history. `createScheduleTick()` claims due fires with CAS, protects reserved context keys, checks unattended-run caps, mints a tenant run id, and starts a workflow or agent through the correct topology.
+
+### Background tasks
+
+`createBackgroundTaskD1Domains()` supplies serialized workflow and tenant task storage. `BackgroundTaskHost` owns one manager per tenant Durable Object, while `createBackgroundTaskRoutes()` exposes its host surface. Terminal task cleanup is opt-in through the composed Worker.
+
+### Signal providers
+
+Flowsafe providers route polling and webhook deliveries through the thread topology instead of Mastra's in-process registry.
+
+`SignalProviderHost` runs one alarm-driven host per tenant. `D1SubscriptionStoreFactory` persists subscriptions. Human-only subscription routes reconcile provider alarms after each committed mutation. Webhook routes verify raw bytes before parsing, derive the tenant from the stored subscription, apply a provider-and-tenant rate cap, and bound forgery audit.
+
+`githubSignalProvider()` is the reference provider.
+
+Complete wiring is in the [durable-agents guide](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/durable-agents.md) and [advanced starter](https://github.com/ProofOfTechOrg/anchorage/tree/main/packages/agent-starter).
+
+## Deployment and operations
+
+The composed `createFlowsafeWorker()` owns the shared route, scheduled, and Queue pipeline. Hosts inject workflows, identity verification, topology-backed optional routers, budget wrappers, notification transport, artifact pairing, schedule tick, and extra purge duties.
+
+Use separate cron expressions for approval SLA sweep, retention purge, and schedule fire. Provider polling uses per-tenant Durable Object alarms.
+
+Read:
+
+- [Deployment reference](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/deployment-reference.md)
+- [Operations runbook](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/operations-runbook.md)
+- [Security threat model](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/security-threat-model.md)
+
+## Security boundaries
+
+Flowsafe does not authenticate users, execute an identity-provider protocol, provide a network sandbox, or decide which business action is safe. It supplies enforcement seams after your host has verified identity and selected policy.
+
+Critical host obligations:
+
+- derive tenants and actors from verified credentials;
+- mint run, thread, resource, schedule, and subscription identities server-side;
+- keep connector lists and resume targets server-authored;
+- expose decisions only through the approval path;
+- configure shared stores for cross-isolate connector budgets;
+- keep raw Durable Object namespaces behind the exported topologies;
+- schedule every enabled domain's retention and offboarding path;
+- protect model, provider, stream-ticket, webhook, and SIEM secrets separately.
+
+## Verification
+
+The repository's deterministic workerd spike proves suspend, process restart, resume, forged-resume denial, repeated gates, tenant isolation, live streaming, durable-agent recovery, signals, goals, schedules, providers, notifications, and background-task restart.
+
+```bash
+pnpm --filter @proofoftech/flowsafe spike:verify
+```
+
+The optional live-model proof requires `SPIKE_LLM_MODEL_ID` and `SPIKE_LLM_API_KEY`:
+
+```bash
+pnpm --filter @proofoftech/flowsafe spike:verify:llm
+```
+
+## License
+
+Apache-2.0.

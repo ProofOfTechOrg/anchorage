@@ -36,7 +36,7 @@ export const BREAKWATER_WORKFLOW_SCOPE_KEY = 'breakwater.workflowScope';
 /**
  * requestContext key breakwater's tenantIsolation evaluator and connector
  * key-scoping read: the caller's OPAQUE isolation scope. RunnerRuntime mints
- * the runId's tenant prefix here on every leg of a tenant-salted run (INV-1),
+ * the runId's tenant prefix here on every leg of a tenant-salted run,
  * so connector idempotency + rate-limit keys segment per tenant. Absent on
  * non-tenant runs — breakwater then preserves its single-tenant keys.
  */

@@ -81,19 +81,19 @@ export const DURABLE_AGENTIC_LOOP_WORKFLOW_ID = 'durable-agentic-loop';
 
 /**
  * Brand marking an agent as RUNTIME-DRIVEN: its inherited signal wake
- * (`agent.stream` under `ifIdle:'wake'`) re-enters the INV-1-guarded
+ * (`agent.stream` under `ifIdle:'wake'`) re-enters the tenant-run-ID-guarded
  * {@link FlowsafeDurableAgent.executeWorkflow}, which drives
  * `runtime.start('durable-agentic-loop', …)` rather than the base
- * `createRun + run.start` on the DEFAULT engine. Track C's thread-DO signal
- * routes REQUIRE this brand before honoring an idle wake, because the wake is the
+ * `createRun + run.start` on the default engine. The thread-Durable-Object signal
+ * routes require this brand before honoring an idle wake, because the wake is the
  * one signal path that starts a run: a plain core `Agent` (or a STOCK
  * `DurableAgent`, whose `stream()` mints a tenant-less UUID and whose
  * `executeWorkflow` runs on the default engine) would start a run OUTSIDE
- * RunnerRuntime — a second execution path DL-001 forbids, tenant-unscoped and
+ * RunnerRuntime — an unsafe second execution path that is tenant-unscoped and
  * grant-underivable. Structural (a `unique symbol`-keyed truthy field) so a test
  * double can opt in without constructing a real durable agent.
  *
- * The brand is paired with Track C's host-owned idle-start seam: the thread DO
+ * The brand is paired with the host-owned idle-start seam: the thread Durable Object
  * mints the tenant-salted run id and invokes the wrapper directly, avoiding
  * core's tenant-less idle-wake id generation.
  */
@@ -124,10 +124,10 @@ export interface FlowsafeDurableAgentOptions<
   /** The Agent to wrap with durable, runtime-driven execution. */
   agent: Agent<TAgentId, TTools, TOutput>;
   /**
-   * The RunnerRuntime the loop is driven through (DL-001/DL-010). REQUIRED —
+   * The RunnerRuntime through which the loop is driven. Required because
    * this is the whole point of the flowsafe wrapper: executeWorkflow() calls
    * `runtime.start('durable-agentic-loop', ...)` instead of the base
-   * `createRun + start`, so INV-1, the per-leg grant context, and the resume
+   * `createRun + start`, so tenant-scoped run IDs, the per-leg grant context, and the resume
    * ledger apply to agent legs. The loop workflow is registered on this runtime
    * by the factory (idempotently — one shared id serves every durable agent).
    */
@@ -140,7 +140,7 @@ export interface FlowsafeDurableAgentOptions<
   cache?: DurableAgentConfig<TAgentId, TTools, TOutput>['cache'];
   /**
    * PubSub for the agent's own stream events (observe()/onChunk). DEFAULTS to
-   * `runtime.pubsub` (the host DO's ONE identity, DL-001) when omitted, so the
+   * `runtime.pubsub` (the host Durable Object's single identity) when omitted, so the
    * run's events and the agent's observe()/emitError feed agree without the host
    * wiring it twice — a mismatched pubsub would leave observe() replaying an
    * empty feed. Pass an explicit instance only to override that default.
@@ -167,7 +167,7 @@ export class FlowsafeDurableAgent<
   TOutput = undefined,
 > extends DurableAgent<TAgentId, TTools, TOutput> {
   /**
-   * The runtime-driven brand Track C's thread-DO signal wake requires (see
+   * The runtime-driven brand the thread-Durable-Object signal wake requires (see
    * {@link RUNTIME_DRIVEN_AGENT}). A `unique symbol` field, so it cannot collide
    * with an inherited property and a plain `Agent` never carries it.
    */
@@ -195,10 +195,10 @@ export class FlowsafeDurableAgent<
   }
 
   /**
-   * INV-1 at the public boundary. The durable-agent entry points (stream /
+   * Tenant-scoped run-ID enforcement at the public boundary. The durable-agent entry points (stream /
    * generate / prepare) take an OPTIONAL runId, and when it is omitted core's
    * `prepareForDurableExecution` mints `crypto.randomUUID()`
-   * (agent/durable/index.js:589) — the exact tenant-less fallback INV-1 forbids —
+   * (agent/durable/index.js:589) — the exact tenant-less fallback this wrapper forbids —
    * and hands it to `executeWorkflow` BELOW this class's own guard, where a bare
    * UUID is already indistinguishable from a legitimately caller-minted one. So
    * the guard must ALSO fire HERE, before `super.stream()/generate()/prepare()`,
@@ -218,9 +218,11 @@ export class FlowsafeDurableAgent<
   }
 
   /**
-   * Enforce INV-1 before the inherited durable `stream()` runs: without this the
+   * Enforce a caller-minted tenant-scoped run ID before the inherited durable
+   * `stream()` runs: without this the
    * optional `options.runId` would let core mint a tenant-less
-   * `crypto.randomUUID()` upstream (see {@link FlowsafeDurableAgent.#assertCallerRunId}).
+   * `crypto.randomUUID()` upstream. The private run-ID guard rejects a missing or
+   * non-path-safe value before delegating to core.
    * A host mints `${tenantId}_${uuid}` and passes it as `options.runId`.
    */
   override async stream(
@@ -247,7 +249,8 @@ export class FlowsafeDurableAgent<
   }
 
   /**
-   * Same INV-1 boundary guard as {@link FlowsafeDurableAgent.stream} — `generate()`
+   * The same tenant-scoped run-ID guard as {@link FlowsafeDurableAgent.stream} —
+   * `generate()`
    * re-implements the durable setup and mints its own runId the same way when
    * one is not supplied.
    */
@@ -266,13 +269,14 @@ export class FlowsafeDurableAgent<
   }
 
   /**
-   * Same INV-1 boundary guard as {@link FlowsafeDurableAgent.stream}. `prepare()`
+   * The same tenant-scoped run-ID guard as {@link FlowsafeDurableAgent.stream}.
+   * `prepare()`
    * is the third inherited minting entry point: it forwards `options?.runId` into
    * core's `prepareForDurableExecution` (agent/durable/index.js:5980), which mints
    * a tenant-less `crypto.randomUUID()` when it is absent (index.js:589) AND
    * REGISTERS a run under that id (index.js:5984) — so a later
    * `resume(runId)`/`executeWorkflow` sees a bare UUID `PATH_SAFE_ID_PATTERN`
-   * already accepts, past every downstream guard. Enforce INV-1 HERE, while
+   * already accepts, past every downstream guard. Enforce the caller-minted ID here, while
    * "absent" is still visible.
    */
   override async prepare(
@@ -360,12 +364,12 @@ export class FlowsafeDurableAgent<
 
   /**
    * Drive the durable-agentic-loop through RunnerRuntime instead of the base
-   * `createRun + run.start` (DL-010). stream()/generate() have already parked the
+   * `createRun + run.start`. stream()/generate() have already parked the
    * non-serializables (model/tools/messageList) on the in-process run registry
    * keyed by this runId, so the loop the runtime starts resolves them in-isolate
    * while the runtime mints the per-leg grant context. The runId guard here is
    * defense in depth — the public boundary (stream/generate) already enforced
-   * INV-1; this catches any future internal caller.
+   * the tenant-scoped run-ID rule; this catches any future internal caller.
    */
   protected override async executeWorkflow(
     runId: string,

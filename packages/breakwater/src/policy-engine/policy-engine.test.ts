@@ -276,9 +276,12 @@ describe('PolicyEngine', () => {
     expect(audit.events()).toHaveLength(1);
     expect(audit.events()[0]).toMatchObject({
       decision: 'error',
-      reason: 'crashy threw: evaluator internal failure',
+      reason: 'policy evaluation failed',
       detail: { policy: 'crashy' },
     });
+    expect(JSON.stringify(audit.events())).not.toContain(
+      'evaluator internal failure',
+    );
   });
 
   it('records an error audit event when an async evaluator rejects', async () => {
@@ -585,9 +588,12 @@ describe('PolicyEngine.processOutputStream', () => {
     ).rejects.toThrowError(Tripwire);
     expect(audit.events()[0]).toMatchObject({
       decision: 'error',
-      reason: 'crashy threw: evaluator internal failure',
+      reason: 'policy evaluation failed',
       detail: { policy: 'crashy' },
     });
+    expect(JSON.stringify(audit.events())).not.toContain(
+      'evaluator internal failure',
+    );
   });
 
   it('fails closed when streamParts omits the current part', async () => {

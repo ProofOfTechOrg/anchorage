@@ -12,10 +12,13 @@ Design sketches illustrating Mastra `createWorkflow()` patterns for Anchorage. T
 | `product-launch.ts` | Approval checkpoints | Multi-step serial approval | `packages/showcase/worker/workflows/product-launch.ts` |
 | `custom-workflow-scoping.ts` | Role-gated workflow access | Design sketch only — the shipped mechanism is flowsafe host-kit's run router checking `WorkflowMeta.allowedRoles`, not a breakwater wrapper | `packages/showcase/worker/workflows/access-request.ts` (role-gated approval workflow) |
 
-The showcase runs a fifth workflow with no sketch here: `access-request`
-(`packages/showcase/worker/workflows/access-request.ts`) — an access-grant
-approval flow demonstrating per-workflow `allowedRoles` and approval-gated
-provisioning.
+The showcase runs two workflows with no direct sketch here:
+
+- `access-request` is an access-grant approval flow demonstrating per-workflow
+  `allowedRoles` and approval-gated provisioning.
+- `wire-transfer` is the server-backed control-room scenario. It joins
+  prompt-injection defense to a real durable approval and exact-suspension
+  grant.
 
 ## Source
 

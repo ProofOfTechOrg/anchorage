@@ -44,6 +44,21 @@ jobs:
       - name: Build
         run: pnpm build
 
+      - name: Check documentation
+        run: pnpm docs:check
+
+      - name: Test documentation checker
+        run: pnpm docs:check:test
+
+      - name: Build API documentation
+        run: pnpm docs:api
+
+      # Build and install the actual tarball in an offline consumer. Keep this
+      # after Build so manifest exports, declarations, docs, and runtime imports
+      # are verified against the publish surface rather than workspace source.
+      - name: Verify packed breakwater surface
+        run: pnpm test:packed-breakwater
+
       # Pack the built package and resolve the public deep import under browser
       # conditions. This catches Node-only transitive imports that source-level
       # tests cannot see.
@@ -60,6 +75,8 @@ jobs:
       # React quality gate: the FULL react-doctor scan over the showcase app
       # (pre-push runs the fast changed-files subset; this is the
       # authoritative pass, incl. dead-code rules that only run at full scope).
+      # The wrapper pins the audited analyzer commit and rejects skipped or
+      # incomplete checks even if the analyzer process itself exits zero.
       - name: React Doctor (full gate)
         timeout-minutes: 10
         run: pnpm --filter showcase run react-doctor

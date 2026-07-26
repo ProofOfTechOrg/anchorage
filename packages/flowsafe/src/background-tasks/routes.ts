@@ -52,7 +52,7 @@ function json(payload: unknown, status = 200): Response {
 /**
  * Resolve the tenant-scoped filter (runId XOR threadId) from the query, or a
  * fail-closed Response. Both ids are salted `${tenantId}_...`, so
- * `tenantOwnsSaltedId` is exact for either (INV-3). Absent => 400; foreign =>
+ * `tenantOwnsSaltedId` is exact for either. Absent means 400; foreign means
  * 404 (no oracle — a foreign id gets the same answer as a nonexistent one).
  */
 function resolveScopedFilter(
@@ -81,7 +81,7 @@ function resolveScopedFilter(
 }
 
 /**
- * The scope-ownership predicate shared by list AND stream (DL-014): a row is in
+ * The scope-ownership predicate shared by list and stream: a row is in
  * scope iff its runId or threadId equals the validated, tenant-owned scope value
  * the request was filtered by. Defense-in-depth OVER core's own filter — a future
  * regression in core's `listTasks`/`stream` scoping cannot leak a foreign or
@@ -154,7 +154,7 @@ export function createBackgroundTaskRoutes(
  * on-connect snapshot and its live events; a second exact-match guard in the
  * transform drops any chunk whose runId/threadId is not the requested one, so a
  * cross-tenant leak is impossible even if core's filter ever loosened
- * (defense-in-depth, DL-014). `abortSignal` is the request's own, so a client
+ * as defense in depth. `abortSignal` is the request's own, so a client
  * disconnect closes the upstream subscription.
  */
 function streamResponse(

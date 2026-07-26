@@ -33,6 +33,7 @@ import {
 
 /** Response headers subset the guard and its callers read. */
 export interface EgressResponseHeaders {
+  /** Return a header value by case-insensitive name, or `null` when absent. */
   get(name: string): string | null;
 }
 
@@ -45,13 +46,21 @@ export interface EgressResponseHeaders {
  * underlying value IS that Response, nothing is wrapped or consumed.
  */
 export interface EgressResponse {
+  /** Numeric HTTP status code. */
   readonly status: number;
+  /** Whether the status is in the successful 200–299 range. */
   readonly ok: boolean;
+  /** HTTP status text supplied by the transport. */
   readonly statusText: string;
+  /** Final response URL reported by the transport. */
   readonly url: string;
+  /** Response headers. */
   readonly headers: EgressResponseHeaders;
+  /** Parse the response body as JSON. */
   json(): Promise<unknown>;
+  /** Read the response body as text. */
   text(): Promise<string>;
+  /** Read the response body as an `ArrayBuffer`. */
   arrayBuffer(): Promise<ArrayBuffer>;
 }
 
@@ -61,6 +70,7 @@ export interface EgressResponse {
  * untouched via the index signature.
  */
 export interface EgressRequestInit {
+  /** HTTP method. Defaults to the base fetch implementation's default. */
   method?: string;
   /**
    * 'follow' (default) follows redirects with a per-hop allowlist check.
@@ -68,8 +78,11 @@ export interface EgressRequestInit {
    * happens here, so nothing escapes the initial check.
    */
   redirect?: 'follow' | 'error' | 'manual';
+  /** Header initializer forwarded to the base fetch. */
   headers?: unknown;
+  /** Request body forwarded to the base fetch. */
   body?: unknown;
+  /** Cancellation signal forwarded to the base fetch. */
   signal?: unknown;
   [key: string]: unknown;
 }
@@ -99,14 +112,21 @@ export type EgressFetchBase = (...args: never[]) => Promise<unknown>;
  * embed secrets that must not reach a log sink.
  */
 export interface EgressDenial {
+  /** Normalized denied hostname, or `null` when the URL was invalid. */
   readonly host: string | null;
+  /** Safe explanation that excludes the path and query string. */
   readonly reason: string;
+  /** Zero for the initial request, or the one-based redirect hop number. */
   readonly hop: number;
 }
 
+/** Error thrown when {@link egressFetch} refuses a request. */
 export class EgressDeniedError extends Error {
+  /** Normalized denied hostname, or `null` when the URL was invalid. */
   readonly host: string | null;
+  /** Zero for the initial request, or the one-based redirect hop number. */
   readonly hop: number;
+  /** Safe explanation that excludes the path and query string. */
   readonly reason: string;
 
   constructor(denial: EgressDenial) {
@@ -118,9 +138,12 @@ export class EgressDeniedError extends Error {
   }
 }
 
+/** Configuration for {@link egressFetch}. */
 export interface EgressFetchOptions {
-  /** Base fetch the guard wraps (tests inject the vendor mock here).
-   * Defaults to the runtime's global fetch, resolved per call. */
+  /**
+   * Base fetch the guard wraps. Defaults to the runtime's global fetch,
+   * resolved per call.
+   */
   fetch?: EgressFetchBase;
   /**
    * Map a denial to the error thrown to the caller — the audit seam

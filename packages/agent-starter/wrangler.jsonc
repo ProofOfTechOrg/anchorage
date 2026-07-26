@@ -1,0 +1,76 @@
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "anchorage-agent-starter",
+  "main": "./src/worker.ts",
+  "compatibility_date": "2026-07-26",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true
+    }
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "RUNNER", "class_name": "StarterRunner" },
+      { "name": "HUB", "class_name": "StarterHub" },
+      { "name": "THREAD", "class_name": "StarterThread" },
+      {
+        "name": "SIGNAL_PROVIDER_HOST",
+        "class_name": "StarterSignalProviderHost"
+      },
+      {
+        "name": "BACKGROUND_TASKS",
+        "class_name": "StarterBackgroundTasks"
+      }
+    ]
+  },
+  "exports": {
+    "StarterRunner": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "StarterHub": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "StarterThread": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "StarterSignalProviderHost": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "StarterBackgroundTasks": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "anchorage-agent-starter",
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID"
+    }
+  ],
+  "triggers": {
+    "crons": ["*/5 * * * *", "17 * * * *", "* * * * *"]
+  },
+  "vars": {
+    "AUTH_JWT_ISSUER": "anchorage-agent-starter",
+    "AUTH_JWT_AUDIENCE": "anchorage-agent-starter-api",
+    "MODEL_ID": "provider/model",
+    "APPROVAL_SLA_SECONDS": "14400",
+    "RUN_RETENTION_DAYS": "30",
+    "APPROVAL_RETENTION_DAYS": "30",
+    "THREAD_RETENTION_DAYS": "90",
+    "NOTIFICATION_RETENTION_DAYS": "30",
+    "THREAD_STATE_RETENTION_DAYS": "90",
+    "SCHEDULE_TRIGGER_RETENTION_DAYS": "30",
+    "SIGNAL_ATTRIBUTE_ALLOWLIST": "source,kind,priority,resource,action",
+    "GITHUB_RESOURCE_ALLOWLIST": "{}",
+    "TENANT_APEX_DOMAIN": ""
+  }
+}

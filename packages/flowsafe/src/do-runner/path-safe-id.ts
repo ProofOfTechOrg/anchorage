@@ -51,8 +51,8 @@ export const TENANT_ID_PATTERN = /^[a-z0-9]{3,32}$/;
 export const RESERVED_TENANT_IDS: readonly string[] = ['system'];
 
 /**
- * The ONE place INV-1's `${tenantId}_${uuid}` carrier is decoded. Returns the
- * INV-3-validated tenant prefix, or undefined when the runId carries none.
+ * The single place the `${tenantId}_${uuid}` carrier is decoded. Returns the
+ * validated tenant prefix, or undefined when the runId carries none.
  *
  * Centralized for the same reason RunnerRuntime composes `#runKey` in one
  * place: this parse IS the tenant boundary, so four hand-rolled
@@ -61,7 +61,7 @@ export const RESERVED_TENANT_IDS: readonly string[] = ['system'];
  * unscoped grant store is a cross-tenant mint), the grant provider mints an
  * empty list, the runtime mints no isolation scope.
  *
- * Safe: INV-3 excludes '_' from tenantId, so the FIRST underscore is always
+ * Safe: the tenant-ID pattern excludes '_' from tenantId, so the first underscore is always
  * the boundary regardless of what the uuid half contains.
  */
 export function tenantOfRunId(runId: string): string | undefined {
@@ -73,7 +73,7 @@ export function tenantOfRunId(runId: string): string | undefined {
 
 /**
  * Exact tenant-salted ownership: `id.startsWith(`${tenantId}_`)`. Exact because
- * TENANT_ID_PATTERN (INV-3) excludes '_' (0x5F) and backtick (0x60), so the
+ * TENANT_ID_PATTERN excludes '_' (0x5F) and backtick (0x60), so the
  * FIRST '_' delimiter can never occur inside a tenantId — 'acme' can never own
  * 'acmecorp_...'. The trailing '_' is load-bearing: it is the same delimiter the
  * `[tid_, tid\x60)` range purge keys on, so dropping it would make 'acme' match
@@ -86,7 +86,7 @@ export function tenantOwnsSaltedId(tenantId: string, id: string): boolean {
 /**
  * The MINT-path precondition: throws a GENERIC Error — the programmer-error
  * contract, since a client never reaches a mint with a bad tenant — when
- * `tenantId` fails TENANT_ID_PATTERN (INV-3) or names a RESERVED_TENANT_IDS
+ * `tenantId` fails TENANT_ID_PATTERN or names a RESERVED_TENANT_IDS
  * identity. Deliberately NOT a TenantResolutionError: createTenantResolver owns
  * that request-facing 403 contract; the mints are internal. Shared by every
  * salted-id mint (runIds and memory ids).
@@ -112,7 +112,7 @@ export function assertMintableTenantId(tenantId: string, caller: string): void {
  *
  * The suffix may be a thunk (a uuid generator): it is evaluated ONLY after the
  * tenant passes assertMintableTenantId, so a caller-supplied producer can never
- * run its side effects — or throw and mask the INV-3/reserved rejection — for an
+ * run its side effects — or throw and mask tenant validation — for an
  * invalid tenant. Callers with a callback MUST pass the function, not its call,
  * or JS argument evaluation would defeat this ordering.
  */

@@ -10,9 +10,11 @@
 
 import type { Actor } from '../rbac/index.js';
 
+/** Structured record emitted by a breakwater enforcement boundary. */
 export interface AuditEvent {
   /** ISO 8601 */
   timestamp: string;
+  /** Actor attributed to the decision, or `null` when none was resolved. */
   actor: Actor | null;
   /** Dotted verb, e.g. 'agent.input.authorize' */
   action: string;
@@ -20,14 +22,18 @@ export interface AuditEvent {
   resource: string;
   /** 'error' = the gate itself failed (evaluator/getActor threw), not a denial. */
   decision: 'allowed' | 'denied' | 'error';
+  /** Human-readable decision or failure reason. */
   reason?: string;
+  /** Additional structured fields supplied by the emitting boundary. */
   detail?: Record<string, unknown>;
 }
 
+/** Destination for one synchronous or asynchronous audit event. */
 export type AuditSink = (event: AuditEvent) => void | Promise<void>;
 
+/** Configuration for `AuditLogger`. */
 export interface AuditLoggerOptions {
-  /** External export path (D1 / Queues in Phase 3). Buffer records regardless. */
+  /** Optional external destination. The logger buffers records regardless. */
   sink?: AuditSink;
   /** Sink failures must not break the agent path; surface them here instead. */
   onSinkError?: (error: unknown, event: AuditEvent) => void;
@@ -35,6 +41,7 @@ export interface AuditLoggerOptions {
   maxBuffered?: number;
 }
 
+/** In-memory audit ring buffer with an optional failure-isolated sink. */
 export class AuditLogger {
   readonly #sink?: AuditSink;
   readonly #onSinkError?: (error: unknown, event: AuditEvent) => void;
@@ -47,6 +54,7 @@ export class AuditLogger {
     this.#maxBuffered = options.maxBuffered ?? 1000;
   }
 
+  /** Stamp, buffer, and optionally export an audit event. */
   record(event: Omit<AuditEvent, 'timestamp'>): AuditEvent {
     const stamped: AuditEvent = {
       timestamp: new Date().toISOString(),
@@ -72,10 +80,12 @@ export class AuditLogger {
     return stamped;
   }
 
+  /** Return a snapshot of the currently buffered events. */
   events(): readonly AuditEvent[] {
     return [...this.#buffer];
   }
 
+  /** Remove every buffered event without changing the configured sink. */
   clear(): void {
     this.#buffer = [];
   }
@@ -83,7 +93,9 @@ export class AuditLogger {
 
 /** Counters/histograms sink — any metrics client (StatsD, Prometheus push, OTel) can implement this. */
 export interface MetricsRecorder {
+  /** Increment a named counter with optional string tags. */
   increment(name: string, tags?: Record<string, string>): void;
+  /** Observe a numeric value for a named metric with optional string tags. */
   observe(name: string, value: number, tags?: Record<string, string>): void;
 }
 

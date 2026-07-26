@@ -118,7 +118,7 @@ export type ScheduleRouteAuditSink = (
 ) => void | Promise<void>;
 
 export interface ScheduleRouterOptions {
-  /** authenticate -> INV-3 -> bind; undefined ⇒ 401 (the createRunRouter seam). */
+  /** Authenticate, validate the tenant ID, and bind it; undefined means 401. */
   resolve: TenantResolver;
   /** The schedules domain the facade reads/writes. */
   store: ScheduleFacadeStore;
@@ -131,13 +131,13 @@ export interface ScheduleRouterOptions {
   /** Every mutation (and denied read) is audited through this. Absent ⇒ no audit. */
   audit?: ScheduleRouteAuditSink;
   /**
-   * Per-tenant COUNT cap (DL-007): the max schedules a tenant may own. A create
+   * Per-tenant count cap: the maximum number of schedules a tenant may own. A create
    * at or over it is REJECTED. Must be a nonnegative safe integer; zero denies
    * every create. Default 100.
    */
   maxSchedulesPerTenant?: number;
   /**
-   * Per-schedule fire-RATE cap (DL-007): the minimum interval between two
+   * Per-schedule fire-rate cap: the minimum interval between two
    * consecutive fires of a schedule's cron, in ms. A cron whose interval is
    * shorter is REJECTED at create/update — bounding the aggregate fire rate a
    * tenant can schedule (with the count cap). Must be a positive safe integer.
@@ -184,7 +184,7 @@ function ownsSchedule(schedule: Schedule, tenantId: string): boolean {
 }
 
 /**
- * The P4 barrier (a) over BOTH requestContext-carrying surfaces of a create/update
+ * The stored-context barrier over both requestContext-carrying surfaces of a create/update
  * body: the top-level `requestContext` (workflow + non-standard agent) and the
  * agent `ifIdle.streamOptions.requestContext` (core's only other stored-context
  * location — `ScheduleIfActive` has none). Returns a Rejection naming the offending
@@ -257,7 +257,7 @@ function nextFireOrReject(
   }
 }
 
-/** Reject a cron whose two-consecutive-fire interval is under the floor (DL-007). */
+/** Reject a cron whose interval between two consecutive fires is under the floor. */
 function checkFireRate(
   cron: string,
   timezone: string | undefined,

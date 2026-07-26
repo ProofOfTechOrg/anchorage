@@ -1,0 +1,10 @@
+# Copy to .dev.vars. Never commit the real file.
+AUTH_HMAC_SECRET=replace-with-at-least-32-random-bytes
+STREAM_TICKET_SECRET=replace-with-a-different-32-byte-secret
+MODEL_API_KEY=replace-with-your-provider-api-key
+MODEL_ID=provider/model
+GITHUB_WEBHOOK_SECRET=replace-with-your-github-webhook-secret
+GITHUB_RESOURCE_ALLOWLIST={"acme":["github:example/repository"]}
+
+# Optional for an OpenAI-compatible provider:
+# MODEL_BASE_URL=https://api.example.com/v1

@@ -36,7 +36,7 @@ interface BrowserWebSocketConstructor {
  * globalThis, mirroring ApprovalApiClient's globalThis.fetch default so a
  * non-browser host gets a clear error instead of a ReferenceError). Inject the
  * returned transport into useApprovalDashboard's `stream` option; the host
- * builds the ticket() thunk (showcase, M-008).
+ * builds the ticket() thunk.
  */
 export function createWebSocketStreamTransport(): StreamTransport {
   return {

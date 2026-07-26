@@ -14,6 +14,8 @@
 export type {
   AgentCliConnectorOptions,
   AgentCliDefinition,
+  AgentCliErrorCode,
+  AgentCliErrorMetadata,
   AgentCliExec,
   AgentCliExecResult,
   AgentCliInput,

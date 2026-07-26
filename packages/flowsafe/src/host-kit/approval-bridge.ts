@@ -33,8 +33,8 @@ export type ResumeRunFn = (
 
 /**
  * The connector ids a suspended step's decision should mint. A workflow STEP
- * gate declares them explicitly in a `connectors` array. An AGENT gate (Track A,
- * R-003) declares none — it names the tool the model called by `toolName` (both
+ * gate declares them explicitly in a `connectors` array. An agent gate
+ * declares none — it names the tool the model called by `toolName` in both
  * durable suspend shapes). For automatic grant derivation, that provider-visible
  * name MUST already be the breakwater connector's provider-safe id
  * (`[A-Za-z0-9_-]+`); providers can rewrite punctuation-bearing ids and the
@@ -46,8 +46,8 @@ export type ResumeRunFn = (
  * a suspend payload has no workflowId to prove it came from the durable loop. A
  * workflow author who both omits `connectors` AND independently shapes a gate as
  * `{type:'approval', toolName, toolCallId}` (all three, the second discriminator
- * that agentGateConnectors demands) would derive [toolName] where the pre-Track-A
- * code returned []. It is inert unless that toolName also names a real connector
+ * that agentGateConnectors demands) would derive [toolName] where earlier
+ * behavior returned []. It is inert unless that toolName also names a real connector
  * the run calls; the shipped/showcase workflows all declare `connectors`, so none
  * collide today. The right convention for workflow gates remains the explicit
  * `connectors` array.
@@ -164,9 +164,9 @@ export async function queueApprovalForSuspension(
  * `audit` is optional and should be the SAME sink the service itself uses
  * (buildHostApprovalService wires it that way): the base resume above has
  * already durably advanced the run by the time the re-queue below can fail,
- * so a throw here (D4, 2026-07-11 audit) leaves a gate suspended with no
- * approval record and no other signal that happened. reconcileApprovalsForSummary
- * is the recovery; this event is what tells an operator it was needed.
+ * so a throw here leaves a gate suspended with no approval record and no
+ * other signal that happened. reconcileApprovalsForSummary is the recovery;
+ * this event is what tells an operator it was needed.
  */
 export function resumeRunWithRequeue(
   base: ResumeRunFn,
@@ -225,7 +225,7 @@ export function resumeRunWithRequeue(
 }
 
 /**
- * Pages service.list() to completion via the D3 cursor instead of one
+ * Pages service.list() to completion via an explicit cursor instead of one
  * unbounded call (`filter.limit` unset otherwise means "no limit" —
  * types.ts's clampApprovalLimit). reconcileApprovalsForSummary needs a
  * suspended run's FULL approval history — every status, every past
@@ -254,7 +254,7 @@ async function listAllApprovals(
 }
 
 /**
- * D4 recovery primitive: given a run's suspended RunSummary, heals every
+ * Recovery primitive: given a run's suspended RunSummary, heals every
  * CURRENTLY suspended step whose exact (suspendedAt, resumeCount)
  * fingerprint has no approval record of ANY status, then files it fresh.
  * Safe to call on every status() read of a suspended run, rather than only

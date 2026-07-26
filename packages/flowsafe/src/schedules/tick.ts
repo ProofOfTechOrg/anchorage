@@ -3,8 +3,7 @@
 // a cron-triggered scheduled() (or DO alarm) drives listDueSchedules -> CAS
 // updateScheduleNextFire claim -> fire, bypassing core's pubsub worker loop
 // entirely (the P1 "one chokepoint, no second execution path" rule). Core's own
-// consumer (SchedulerWorker + AgentScheduleWorker) is a pubsub-driven loop we do
-// NOT adopt.
+// pubsub-driven schedule-worker loop is deliberately not adopted.
 //
 // TARGET KINDS:
 //  - WORKFLOW targets: mint a fresh INV-1 runId `${tenantId}_${uuid}` and fire
@@ -56,7 +55,7 @@ import type { Schedule, ScheduleTrigger } from './schedules-d1.js';
 const BREAKWATER_KEY_PREFIX = 'breakwater.';
 
 /**
- * The explicit reserved requestContext keys (DL-004): the four runtime base keys
+ * The explicit reserved requestContext keys: the four runtime base keys
  * (all `breakwater.`-prefixed) + core's goal key. This is the canonical LIST for
  * introspection and the drift-guard test — NOT the runtime matcher. The strip and
  * the router both use `isReservedScheduleContextKey` (the `breakwater.` PREFIX +
@@ -114,8 +113,9 @@ export function stripReservedScheduleContext(
 
 /**
  * Build a fired leg's context: the stored NON-reserved keys UNDER the
- * runtime-derived context. R-004: spread stored FIRST, runtime-derived LAST so
- * the runtime value wins on any collision — the same last-spread-wins ordering
+ * runtime-derived context. Stored values are spread first and runtime-derived
+ * values last so the runtime value wins on any collision — the same
+ * last-spread-wins ordering
  * #requestContextFor uses (runtime.ts:701). After stripping, the stored keys
  * share no key with the runtime-derived set (the reserved set IS the
  * runtime-owned set), so the order is defense-in-depth: a reserved key that ever
@@ -178,7 +178,7 @@ export type ScheduleTickStartAgent = (
 ) => Promise<{ runId: string }>;
 
 /**
- * The injectable per-tenant run cap (DL-007): return false to REFUSE an
+ * The injectable per-tenant run cap: return false to refuse an
  * unattended start (a capped fire is skipped + audited, the schedule stays
  * healthy). Async so a D1/KV-backed cap fits. Absent ⇒ uncapped.
  */
@@ -220,7 +220,7 @@ export interface ScheduleTickOptions {
   start: ScheduleTickStart;
   /** Runtime-driven agent start. Absent preserves the guarded skip. */
   startAgent?: ScheduleTickStartAgent;
-  /** The per-tenant run cap (DL-007). Absent ⇒ uncapped. */
+  /** The per-tenant run cap. Absent means uncapped. */
   runCap?: ScheduleTickRunCap;
   /** Every fire attempt is audited through this (accepted OR skipped/failed). Absent ⇒ no audit. */
   audit?: ScheduleTickAuditSink;

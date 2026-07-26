@@ -16,15 +16,21 @@ import type { RateLimitStore } from './index.js';
 
 /** The subset of D1Database this store uses. */
 export interface RateLimitDatabase {
+  /** Prepare a SQL statement. */
   prepare(query: string): RateLimitStatement;
 }
 
+/** Prepared-statement subset required by {@link D1RateLimitStore}. */
 export interface RateLimitStatement {
+  /** Bind positional parameters and return the bound statement. */
   bind(...values: unknown[]): RateLimitStatement;
+  /** Return the first result row, or `null` when no row matched. */
   first<T = unknown>(): Promise<T | null>;
+  /** Execute a statement that does not need to return rows. */
   run(): Promise<unknown>;
 }
 
+/** Configuration for {@link D1RateLimitStore}. */
 export interface D1RateLimitStoreOptions {
   /** Table name (default 'breakwater_rate_limit'). */
   table?: string;

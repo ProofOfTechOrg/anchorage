@@ -140,8 +140,8 @@ export interface HostApprovalServiceOptions {
    * Live-stream fan-out sink (ApprovalServiceOptions.stream) — fired once per
    * successful approval mutation for the tenant's hub Durable Object. The host
    * supplies a sink that forwards each event to env.HUB.idFromName(record.tenantId)
-   * (createHubTopology), wrapping the transport keepalive in ctx.waitUntil
-   * itself (DL-020, fetch scope). Undefined => no live fan-out (poll-only host).
+   * (`createHubTopology`), wrapping the transport keepalive in `ctx.waitUntil`
+   * at fetch scope. Undefined means no live fan-out (a poll-only host).
    */
   stream?: ApprovalStreamSink;
 }
@@ -153,9 +153,9 @@ export interface HostApprovalServiceOptions {
  * suspends again at a later gate, the next approval is queued right here, so
  * multi-gate workflows keep flowing through the queue.
  *
- * One audit sink instance backs both the service's own trail AND the
- * bridge's re-queue-failure signal (D4): a re-queue that fails after a
- * durable resume is reported through it rather than silently absorbed.
+ * One audit sink instance backs both the service's own trail and the
+ * bridge's re-queue-failure signal: a re-queue that fails after a durable
+ * resume is reported through it rather than silently absorbed.
  */
 export function buildHostApprovalService(
   store: TenantBoundApprovalStore,
@@ -210,7 +210,7 @@ export interface SlaSweepMaintenanceOptions {
    * COLLECTS each publish promise into its pendingSends and awaits it via the
    * terminal Promise.all — never fire-and-forget (which would be cancelled when
    * ctx.waitUntil(sweep()) settles) and never a nested waitUntil (which would
-   * throw cross-request I/O). DL-020. Undefined => no live escalation fan-out.
+   * throw cross-request I/O). Undefined means no live escalation fan-out.
    */
   stream?: ApprovalStreamSink;
 }
@@ -291,13 +291,13 @@ export async function runSlaSweepMaintenance(
 
 /**
  * waitUntil-detached wrapper over reconcileApprovalsOnStatus for
- * ExecutionContext-capable hosts (D4, 2026-07-11 audit follow-up): the heal
- * only matters to a LATER poll, never the response being built, so its D1
- * reads AND writes (the supersede CAS + the fresh create) leave the
- * status-response path. A rejection is logged as `reconcile-error`, never
- * left unhandled inside waitUntil. Hosts without an ExecutionContext keep
- * passing reconcileApprovalsOnStatus(...) directly (awaited in-path) — the
- * host-agnostic default createRunRouter documents.
+ * ExecutionContext-capable hosts. The heal only matters to a later poll,
+ * never the response being built, so its D1 reads and writes (the supersede
+ * CAS plus the fresh create) leave the status-response path. A rejection is
+ * logged as `reconcile-error`, never left unhandled inside waitUntil. Hosts
+ * without an ExecutionContext keep passing reconcileApprovalsOnStatus(...)
+ * directly (awaited in-path), as documented by the host-agnostic
+ * createRunRouter default.
  */
 export function reconcileApprovalsOnStatusDetached(
   systemActorId: string,

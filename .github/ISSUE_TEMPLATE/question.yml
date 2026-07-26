@@ -1,0 +1,41 @@
+name: Usage question
+description: Ask for public setup or integration help.
+title: "[Question]: "
+labels:
+  - question
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to build?
+      description: Describe the desired workflow and which Anchorage package or feature you are using.
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried?
+      description: Include relevant documentation, code, configuration, and sanitized output.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions and runtime
+      placeholder: "Anchorage package, @mastra/core, Node or Workers runtime"
+    validations:
+      required: true
+  - type: textarea
+    id: topology
+    attributes:
+      label: Deployment topology
+      description: Include relevant Durable Object, D1, R2, Queue, binding, authentication, and tenant details.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched the documentation and existing issues.
+          required: true
+        - label: I removed credentials, tenant data, and other secrets.
+          required: true

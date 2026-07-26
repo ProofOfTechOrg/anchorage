@@ -17,7 +17,7 @@ import { type TokenVerifier, toApprovalActor } from './verifier.js';
  * Parse the `APPROVAL_ACTOR_TOKENS` secret:
  * `{"<token>": {"id","role","tenantId"}}`. Every entry passes the real
  * validator (toApprovalActor) — unknown roles, empty ids, and missing,
- * non-INV-3, or reserved-identity ('system') tenantIds are dropped rather
+ * invalid, or reserved-identity ('system') tenantIds are dropped rather
  * than trusted; there is no `as`-cast at this JSON boundary.
  */
 export function parseActorTokens(

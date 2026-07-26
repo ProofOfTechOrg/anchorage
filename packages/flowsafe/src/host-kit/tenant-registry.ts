@@ -89,7 +89,7 @@ function isUniqueViolation(error: unknown): boolean {
 }
 
 /**
- * Allocate a tenantId, or throw. INV-3 is validated here too — a tenant that
+ * Allocate a tenantId, or throw. The tenant-ID pattern is validated here too — a tenant that
  * cannot be range-purged or prefix-matched must never exist in the first
  * place. Insert-or-fail: a collision throws TenantCollisionError instead of
  * silently adopting the existing row, because "provisioned twice" means two

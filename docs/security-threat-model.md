@@ -1,261 +1,301 @@
-# Security Threat Model
+# Security threat model
 
-Agentic workflows can read sensitive data, produce persuasive content, and write to business systems. Security is designed in. This threat model covers Anchorage's components layered on Mastra; Mastra's own security is assumed as the foundation.
+Anchorage adds enforcement to a Mastra application, but the application owner remains responsible for identity, business authorization, deployment isolation, provider credentials, and incident response.
+
+This document covers breakwater and flowsafe at their supported public boundaries. It does not treat a model, vendor CLI, third-party connector, OAuth provider, Cloudflare account, or Mastra itself as trusted merely because Anchorage integrates with it.
+
+## Security objectives
+
+Anchorage is designed to preserve these properties:
+
+1. A connector side effect runs only after all configured tool policies pass.
+2. A human approval grants only the named connector on the exact authorized suspension.
+3. A client, model, signal, workflow input, or raw resume cannot mint a capability.
+4. One tenant cannot read, resume, signal, schedule, replay, throttle, or delete another tenant's state through supported routes.
+5. Concurrent reviewers and workers do not commit two conflicting transitions.
+6. A restart does not erase the run snapshot or resume fingerprint.
+7. Enforcement errors and audit failures do not expose raw prompts, process output, secrets, or URLs with credential-bearing queries.
+8. Retention never deletes live authorization work merely because it is old.
+
+Availability is secondary to these properties. When context, storage, identity, or configuration is missing, the supported path fails closed.
 
 ## Assets
 
-| Asset | Sensitivity | Location |
-|---|---|---|
-| Workflow definitions | Medium | D1 |
-| Workflow state | Medium | D1 |
-| Approval decisions | High | D1 (`flowsafe_approvals`) |
-| Model API keys | Critical | Cloudflare Secrets |
-| Connector credentials | Critical | Cloudflare Secrets |
-| Workflow outputs | Variable | D1, R2 |
-| Approval grants (`breakwater.approvedConnectors`) | High | Mastra RequestContext (in-process, per run) |
-| Actor identity (`breakwater.actor`) | High | Mastra RequestContext (in-process, per run) |
-| Tenant identity (`ApprovalActor.tenantId`, the `runId` prefix) | Critical | Bearer map / JWT claim, then every store predicate |
-| Token-signing secret (`DEMO_JWT_SECRET`, or your IdP's key) | Critical | Cloudflare Secrets |
-| Resume ordinals (the grant-binding tie-breaker) | Medium | Durable Object `ctx.storage` |
+| Asset | Location | Impact if compromised |
+| --- | --- | --- |
+| Workflow and agent definitions | Worker bundle | Unauthorized behavior or policy bypass |
+| Mastra workflow snapshots | D1 | Run disclosure, corruption, replay, or denial of service |
+| Approvals and reviewer context | D1 | Unauthorized capability or sensitive context disclosure |
+| Memory threads, messages, resources, goals, notifications | D1 | Cross-tenant conversation or instruction disclosure |
+| Schedules, background tasks, provider subscriptions | D1 | Unauthorized unattended execution |
+| Artifacts | R2 | Business-data disclosure or loss |
+| Actor and tenant identity | Verified host context | All authorization and isolation can fail |
+| Approval, workflow, tenant, run, thread, resource context | Mastra `RequestContext` and topology headers | Capability or namespace forgery |
+| Resume ordinals | Durable Object storage | Approved run can strand or mis-bind |
+| Model, connector, OAuth, webhook, stream, SIEM, and token keys | Cloudflare secrets or external secret manager | Provider or control-plane compromise |
+| Audit and metrics stream | Memory, Logs, Queue, SIEM | Evidence loss or tenant-sensitive metadata disclosure |
+| Agent CLI prompt and workspace | Child-process argv and filesystem | Source, secret, or code-integrity compromise |
 
-## Trust Boundaries
+## Trust boundaries
 
-1. **End user <-> Approval dashboard** -- authenticated via OIDC/JWT
-2. **Approval dashboard <-> flowsafe API** -- requires API key or session
-3. **flowsafe API <-> Durable Object** -- Cloudflare internal network
-4. **breakwater middleware <-> Mastra runtime** -- in-process
-5. **Mastra runtime <-> External APIs** -- model providers, business connectors
-6. **Untrusted input <-> Mastra RequestContext** -- the requestContext is a
-   server-side trusted channel. breakwater reads capability tokens from it:
-   `breakwater.actor` (RBAC identity) and `breakwater.approvedConnectors`
-   (write-approval grants -- whoever can write this key can authorize any
-   write-class connector). Any code that constructs or mutates a run's
-   requestContext is part of the trusted computing base. No client input,
-   model output, or tool result may ever be written into these keys. The
-   flowsafe DO runner forwards no requestContext values from request bodies;
-   the only requestContext source is the `requestContextForRun` provider
-   (`RunnerRuntime`), and the approval-api implements it by
-   DERIVATION: `approvalGrantProvider(store)` recomputes grants from
-   APPROVED approval records on every start/resume, so grants never cross an
-   HTTP boundary. Grants are SUSPENSION-SCOPED: a step-keyed approval
-   unlocks its connectors only for the leg that resumes that step, and only
-   when the decision binds to the step's CURRENT suspension. The primary
-   binding is EXACT and clock-free on the `(suspendedAt, resumeCount)`
-   fingerprint: the creating bridge captures both into the record
-   (`CreateApprovalInput.{suspendedAt,resumeCount}`, observed from
-   `RunSummary.{suspendedAt,resumeCount}`), and minting requires both to equal
-   the values the runner passes to the provider. `suspendedAt` comes from the
-   core clock; `resumeCount` is the runtime-owned monotonic per-(run,step)
-   resume ordinal, so no cross-clock comparison exists and clock skew between a
-   split approval service and runner cannot mis-mint. `resumeCount` is the
-   categorical tie-breaker -- undefined on a step's first suspension, `1,2,...`
-   on re-suspensions, and incremented by the runtime on EVERY resume regardless
-   of payload -- so a spent first-suspension approval never mints into a
-   re-suspension even if the two `suspendedAt` stamps collide within a
-   millisecond (possible only on the synchronous in-process path; production's
-   HTTP+D1 round-trips keep them seconds apart), and a no-payload re-suspension
-   (which Mastra leaves without a `resumedAt`, the reason the earlier
-   `resumedAt`-based binding leaked) stays distinguishable. So approving a
-   connector at one approval point never unlocks it at another point of the run,
-   and when the same step suspends again the earlier approval is spent -- the
-   new suspension needs its own decision, and a rejected re-request never falls
-   back to an old approval. Because the ordinal strictly increments it never
-   collides, so this binding also closes the deep-chain (three-plus
-   re-suspension) residual the prior `(suspendedAt, resumedAt)` binding left
-   open; `resumedAt` is retained as informational audit metadata only. The
-   ordinal lives in a `ResumeLedger`; the Durable Object shell backs it with
-   `ctx.storage`, which survives eviction, hibernation, and code deploys. A
-   LOST ledger was never a leak -- the leg would read `resumeCount: undefined`
-   against a re-suspension record's defined count, mismatch, and deny -- but it
-   was an AVAILABILITY defect: an already-approved action would silently
-   no-op after a ~70-second idle eviction. Non-DO hosts keep the in-memory
-   default, where the mutual-exclusion argument still holds (a same-ms
-   `suspendedAt` collision requires a synchronous store with no I/O between the
-   two suspends, so same-ms-collision and surviving-a-restart cannot co-occur).
-   Records created WITHOUT
-   capturing the suspension (legacy/pre-capture bridges) fall back to
-   chronology (`decidedAt` strictly after `suspendedAt` -- deny-deterministic
-   under a shared clock); only that fallback carries the same-clock
-   constraint, so deployments splitting the approval service and the runner
-   across machines must either capture `suspendedAt` at create time (the
-   demo bridge does) or keep the clocks in sync. Run-scope is EXPLICIT: a
-   step-less approval is a standing grant on every leg only when it carries
-   `runScoped: true`, and mints nothing otherwise -- bridges always set
-   `stepPath` and never `runScoped`. (Treating an absent `stepPath` as
-   run-wide privilege was an inverted default: any record whose step was
-   merely omitted became a standing capability.) Mastra merges resume-provided
-   context OVER
-   the persisted snapshot (pinned by test), so the provider returns the
-   grant key on EVERY leg -- an empty list when nothing applies -- and the
-   overwrite retires the previous leg's grants. Net invariant (proven in
-   `approval-api/end-to-end.test.ts`, including the two-gate and
-   re-suspension cases, and the workerd spike): a resume that bypasses
-   `decide()` for the targeted suspension finds no grant and fails closed
-   at the connector gate. The `connectors`
-   list on an approval request is asserted by the CAN_CREATE caller
-   (operator/builder/admin) -- creation is part of the trusted computing
-   base; requests must be created from a trusted suspend-observation bridge
-   (as the demo Worker does) rather than hand-built payloads.
+### Public client to Worker
 
-   **The create route can never author capability.** An approval record's
-   `connectors` list IS the grant a decision mints, and its `requestedBy` is
-   the field the separation-of-duties check compares against -- so both are
-   TCB-only. `createApprovalRouter`'s `POST <basePath>` is therefore
-   **off by default** (`allowCreate`), and when a host deliberately mounts it as
-   a "file a request" affordance it 400s on any body naming a
-   `TCB_ONLY_CREATE_FIELDS` member -- `connectors`, `runScoped`, `stepPath`,
-   `suspendedAt`, `resumedAt`, `resumeCount`, `requestedBy` -- and forces
-   `requestedBy` to the authenticated actor. `stepPath` and the binding pair are
-   on that list because they select WHICH leg a grant mints on: a step-keyed
-   body with no `suspendedAt` would otherwise ride the legacy
-   `decidedAt`-after fallback and mint. Without these controls one principal
-   holding both `CAN_CREATE` and `CAN_REVIEW` (i.e. `admin`) could file a
-   request naming an arbitrary connector, spoof `requestedBy` so the
-   self-decision check compared the wrong identity, approve it alone, and --
-   because the step-less record was implicitly run-scoped -- mint that
-   capability on every leg of an arbitrary run. Regression-pinned in
-   `approval-api/end-to-end.test.ts`.
+The Worker must authenticate the request, validate actor and tenant claims, enforce coarse and resource-specific roles, reject client-selected trusted ids/context, cap untrusted bodies, and return 404 for foreign resource ids.
 
-7. **Tenant <-> tenant** -- one deployment serves many tenants on one Worker,
-   one D1, and one Durable Object namespace. There is no per-tenant database.
-   Isolation rests on three invariants, each with exactly one enforcement
-   chokepoint, and each fails closed:
+The library supplies verifier and router seams, not an identity provider. A static bearer map in the reference deployment is an inspectable example, not production identity guidance.
 
-   **INV-1 -- the run id is the tenant carrier.** Every `runId` is minted
-   server-side as `` `${tenantId}_${uuid}` `` from the AUTHENTICATED tenant.
-   Three enforcement points, all required: `createRunRouter` rejects a
-   client-supplied `body.runId` (400) and mints from `actor.tenantId`;
-   `RunnerRuntime.start` REQUIRES a `runId` and has no generation fallback (a
-   fallback would mint a bare, tenant-less uuid whose snapshot row is
-   unreachable by tenant purge and un-ownable by everyone); and the Durable
-   Object asserts the request's `(workflowId, runId)` equals the identity it
-   was addressed with (`ctx.id.name`, set by the trusted Worker via
-   `idFromName` and unforgeable at that boundary). Because `runId` is the key
-   everything derives from, the Mastra snapshot row (`UNIQUE (workflow_name,
-   run_id)`), the DO instance, the per-run lock, the grant-derivation
-   predicate, and the R2 key are tenant-disjoint with no schema change. Run
-   status and resume additionally verify ownership and answer **404** rather
-   than 403, so the route is not an existence oracle for another tenant's run
-   ids. Attribution is not authorization.
+### Worker to request context
 
-   **INV-2 -- the store is bound to one tenant at construction, and the tenant
-   comes from the authenticated actor.** INV-1 does not cover
-   `flowsafe_approvals`, whose rows are addressed by opaque `id` — that is
-   where an IDOR would live. Approval stores are therefore obtainable only
-   from a factory's `forTenant(tenantId)`, and every `SELECT`/`UPDATE`/`DELETE`
-   carries `tenant_id = ?` sourced from that constructor field, never from a
-   request parameter. `tenantId` is deliberately NOT a member of
-   `ApprovalListFilter`: an omissible tenant filter is the canonical fail-open,
-   because an empty filter would scan every tenant. The bound type carries a
-   module-private `unique symbol` brand, so an unbranded store — or the
-   cross-tenant `SystemApprovalStore` — is a COMPILE ERROR wherever request
-   scope expects a bound one. Requests reach the store only through a
-   `TenantResolver` (authenticate -> validate -> bind), which is what makes the
-   binding constructible: the store cannot exist before the actor does.
-   Cross-tenant reads are legitimate inside the TCB, so that distinction is a
-   TYPE (`SystemApprovalStore`), not a comment: the SLA sweep left
-   `ApprovalService` for a standalone cron-only function and its HTTP route was
-   DELETED. It had been an unfiltered cross-tenant read *and write* reachable
-   by any actor holding the sweep role.
+Breakwater context keys are capabilities or trusted namespace claims:
 
-   **INV-3 -- the charset makes the prefix exact.** `tenantId` matches
-   `^[a-z0-9]{3,32}$`. That set is `0x30-0x39` union `0x61-0x7A` and contains
-   no character in `[0x5F, 0x60]` -- neither `_` (0x5F) nor `` ` `` (0x60).
-   So the ownership check `runId.startsWith(tenantId + '_')` cannot match
-   another tenant (`acme` vs `acmecorp`: at index 4 one has `_`, the other
-   `c`), and the offboarding range delete
-   `` run_id >= '<tid>_' AND run_id < '<tid>`' `` selects exactly one tenant's
-   rows under BINARY collation. Any other tenant's character at the delimiter
-   position sorts below 0x5F or above 0x60. A later loosening of this charset
-   silently breaks BOTH properties, so a character-exhaustive test pins it.
-   The `runId` -> tenant decode has exactly one implementation
-   (`tenantOfRunId`), which validates the prefix; four hand-rolled copies had
-   already drifted apart.
-
-   **What the invariants do not cover** (and how each residual is closed):
-   connector idempotency keys are caller-supplied and legitimately cross-run
-   (`never email this lead twice`), so two tenants can collide on one key --
-   the runtime mints an opaque `breakwater.isolationScope` and breakwater
-   prefixes both the idempotency and the rate-limit key with it, so one
-   tenant can neither read another's cached result nor exhaust its budget.
-   Five of the six `mastra_*` tables (`threads`, `messages`, `resources`,
-   `scorers`, `background_tasks`) are keyed by ids INV-1 does not salt; they
-   are empty today because flowsafe persists only workflow snapshots, and a
-   table-inventory test fails CI if that changes, forcing a tenancy decision
-   rather than a silent leak. R2 keys put `workflowId` -- a tenant-SHARED
-   literal -- outermost, so isolation holds only because every artifact
-   operation demands the full `(workflowId, runId)` pair; a
-   "list artifacts for workflow W" API would enumerate every tenant, and its
-   absence is pinned by test. Tenant-id uniqueness is enforced by the
-   `tenants` registry (insert-or-fail); nothing else does, and two clients
-   slugged `acme` would merge entirely. breakwater's single audit ring buffer
-   is shared across tenants, but no host exposes `events()` over HTTP, so it
-   is not an exfiltration path -- a known limitation, recorded here rather
-   than assumed away.
-
-## Threats and Controls
-
-| Threat | Severity | Control |
-|---|---|---|
-| Unauthorized approval/rejection | High | RBAC + audit log |
-| Self-approval (requester decides own request) | High | Separation-of-duties default: `decide()` denies when decider == `requestedBy` (server-attributed); opt-out only via explicit `allowSelfDecision` (`boolean \| { roles }`, host env `APPROVAL_ALLOW_SELF_DECISION`, fail-closed to OFF), and a permitted self-decision is audited (`detail.selfDecision: true`) |
-| Approval decision tampering | High | Durable Object strongly consistent state |
-| Approval-grant forgery via requestContext injection | High | Trust boundary 6: grants minted only by trusted server-side code; requestContext never populated from client/model/tool input; `context.agent` never bypasses the grant check (forwardable) |
-| Secret leakage in logs | High | Secret resolver strips from event payloads |
-| API key theft | Critical | Short-lived tokens, OIDC |
-| Workflow data cross-contamination | Medium | `crossWorkflowIsolation` evaluator over the runtime-minted `breakwater.workflowScope` |
-| Cross-tenant read of approvals (IDOR on an opaque record id) | Critical | INV-2: `tenant_id = ?` on every store predicate, sourced from the constructor; a wrong tenant matches zero rows and reuses the 404 path |
-| Cross-tenant read/resume of a run | Critical | INV-1: ownership check on the salted `runId`, answering 404 (not 403) so the route is no existence oracle |
-| Cross-tenant grant mint | Critical | INV-1: the grant query filters on `runId`, which belongs to one tenant by construction; INV-2 binds the store as defense in depth |
-| Cross-tenant enumeration via an empty list filter | High | `tenantId` is not an `ApprovalListFilter` member; the bound store seeds `tenant_id = ?` before every optional clause |
-| Cross-tenant escalation via the SLA sweep | High | The HTTP sweep route is removed; the sweep takes a `SystemApprovalStore`, unobtainable in request scope |
-| Cross-tenant connector replay or budget exhaustion | High | `breakwater.isolationScope` segments the idempotency and rate-limit keys; `tenantIsolation` denies a scope-less call, including on dry-run |
-| Tenant-id collision merging two clients | Critical | `provisionTenant` insert-or-fail against the `tenants` registry, before any token naming that tenant is issued |
-| Confused deputy: tenant A's token used on tenant B's subdomain | Medium | Optional `withSubdomainCrossCheck` (routing-level; INV-2 remains the enforcing layer) |
-| Data surviving offboarding | High | `purgeTenant` reaps snapshots of any status, agent-memory rows (threads/messages/resources), approvals, and R2 artifacts; run only after the tenant's tokens expire |
-| Cross-tenant agent-memory recall (Mastra threads/messages keyed by caller-chosen ids two tenants can share) | High | Memory ids are tenant-salted at mint (`mintThreadId`/`mintResourceId`; `TenantContext.newThreadId()`/`newResourceId()` are the only constructors — clients never supply one), ownership prefix-checked, and range-purged; the first agents-with-memory feature must consume these chokepoints per `agent-memory-tenancy.md` |
-| PII/secret leakage through model output | High | `piiSecrets` policy (regex + entropy + Luhn detectors over answer/reasoning/object channels, denial reasons never echo the match) + `classifierPolicy` async-classifier seam, both fail-closed; best-effort against adversarial encodings, like `denyPatterns` |
-| Sensitive suspend payloads exiting via a notification transport | Medium | `ApprovalNotificationEvent` deliberately carries the full record (reviewer context) — MORE than audit `detail`s, which stay id-scoped; the documented contract requires host transports on lower-trust channels (email, chat) to project/redact, sink failures are contained + audited as `approval.notify`, and flowsafe ships no transport |
-
-## RBAC Model
-
-Five roles in `@proofoftech/breakwater`. flowsafe's `ApprovalActor` is
-`{ id, role, tenantId }` — breakwater's own `Actor` stays tenant-agnostic (it
-is a standalone library with no notion of tenancy). A bearer-map entry or JWT
-claim carrying no INV-3-valid `tenantId` is dropped, and its token 401s.
-`ApprovalService` additionally asserts the acting principal's tenant equals
-its store's binding — a belt that can only fire on a wiring bug, which is
-exactly when it must fail closed.
-
-
-| Role | Scope | Actions |
-|---|---|---|
-| `admin` | Global | Manage users, roles, policies |
-| `builder` | Per-workflow | Create, update, deploy |
-| `operator` | Global | Start, stop, retry, cancel runs |
-| `reviewer` | Per-workflow | View and approve/reject |
-| `viewer` | Global | Read-only access |
-
-## Audit Log Schema
-
-Every action records: actor, action, resource, result, timestamp, reason.
-
+```text
+breakwater.actor
+breakwater.approvedConnectors
+breakwater.idempotencyKey
+breakwater.dryRun
+breakwater.workflowScope
+breakwater.isolationScope
 ```
-{
-  actor: string,
-  action: 'approve' | 'reject' | 'start' | 'cancel' | 'retry' | 'configure',
-  resource: { type: 'workflow' | 'run' | 'approval', id: string },
-  result: 'allowed' | 'denied' | 'error',
-  reason?: string,
-  timestamp: ISO8601
+
+Only trusted host/runtime code may populate actor, grant, workflow, or tenant isolation values. Idempotency keys and dry-run selection may originate from authorized application logic, but must not overwrite the other keys.
+
+Flowsafe constructs base runtime context after request data has been validated. Schedules reject reserved namespaces on write and spread runtime-derived keys after stored keys.
+
+### Worker to Durable Object
+
+The Worker chooses the object name through `idFromName()`. Each object reasserts the addressed identity:
+
+- runner object: `workflowId:runId`;
+- thread object: tenant-minted `threadId` and internal tenant header;
+- hub object: `tenantId`;
+- provider host object: `tenantId`.
+
+Use exported topologies. A direct `stub.fetch(request)` into a thread object forwards attacker-controlled headers and is outside the supported boundary.
+
+### Tenant to tenant
+
+One deployment can share D1 and namespaces. Isolation rests on exact server-minted identities, branded tenant-bound stores, metadata tenant predicates where needed, and topology checks before object addressing.
+
+Attribution alone is not authorization. Every route must still check ownership.
+
+### Runtime to persistent storage
+
+D1 is authoritative for snapshots and flowsafe-owned domains. Compare-and-swap protects approval decisions, schedule fire claims, subscription updates where applicable, and idempotency leases.
+
+The runner snapshot is single-writer by topology rather than version-CAS. Any new writer outside the owning runner Durable Object invalidates that assumption.
+
+### Connector to external system
+
+Breakwater enforces declared hosts and actual HTTP hops only for requests made through `ConnectorRuntime.fetch`. Global fetch, sockets, child processes, and private SDK transports require deployment controls.
+
+Provider output and successful connector output are untrusted data even after transport policy passes.
+
+### Agent CLI to workspace and host
+
+Claude Code and Codex run as child processes with workspace-edit permissions. Approval authorizes dispatch, not every file or command the child will choose.
+
+The supported adapter avoids a shell, separates prompt from flags, bounds time/output, and sanitizes diagnostics. Operating-system, container, credential, filesystem, and network isolation remain host responsibilities.
+
+### Notifications, live streams, audit, and SIEM
+
+Approval notifications and live events can carry a full `ApprovalRecord`, including reviewer context. Send them only to a tenant-confidential channel or project a lower-sensitivity shape.
+
+Stream tickets authorize an address for a short period. They do not carry a connector grant. The Worker verifies them and each target object rebinds identity.
+
+Audit events can contain actor, workflow, run, tenant, connector, and denial metadata. Queue export deliberately co-batches tenants; the SIEM must enforce its own access policy.
+
+## Tenant invariants
+
+### Server-minted run identity
+
+The host mints `${tenantId}_${uuid}` from authenticated context. `RunnerRuntime` requires it, and `DurableObjectRunner` checks it against `id.name`.
+
+This identity scopes snapshots, runner objects, grants, live run channels, connector isolation, and artifact keys.
+
+### Tenant-bound stores
+
+`D1ApprovalStoreFactory.forTenant()` and `D1SubscriptionStoreFactory.forTenant()` return branded request-scope stores. Their tenant value comes from construction and appears in every predicate.
+
+System views are distinct types used by cron or verified webhook lookup. Request routes cannot obtain them through the normal resolver.
+
+### Exact charset
+
+Tenant ids match `^[a-z0-9]{3,32}$`. This excludes `_` and makes `${tenantId}_` ownership and the D1 range-purge bounds exact. Loosening the charset requires redesigning both properties.
+
+### Tenant-minted memory
+
+Threads and resources use the same prefix discipline. The public boundary rejects bodies naming `threadId` or `resourceId`; the path may reference an owned thread and receives 404 for a foreign one.
+
+Mastra recall-path tests use the real D1 memory store and adversarial same-business-key tenants.
+
+### Metadata-scoped domains
+
+Schedules carry validated `metadata.tenantId` because their slug ids cannot use the salted range pattern. Purge and query use exact JSON metadata predicates.
+
+Webhook ingress derives tenant only from the stored subscription row because a provider webhook has no authenticated Anchorage tenant.
+
+## Approval capability invariant
+
+The trusted suspension bridge records:
+
+- tenant, workflow, and run;
+- step path;
+- `suspendedAt`;
+- `resumeCount`;
+- server-authored connector ids;
+- requester attribution;
+- optional server-authored durable-agent resume target.
+
+`approvalGrantProvider()` reads only approved records and requires an exact match on the current leg. The runtime-owned resume count distinguishes repeated same-step suspensions even when timestamps collide.
+
+An explicit trusted `runScoped: true` record is a standing grant. A step-less record without that flag grants nothing.
+
+The HTTP create route is disabled by default and cannot set connectors, attribution, fingerprint, run scope, or resume target when enabled.
+
+The provider returns the grant key on every leg, including an empty array, so prior context is overwritten rather than inherited.
+
+## Separation of duties
+
+`ApprovalService` denies:
+
+- an actor deciding a request they requested;
+- a non-exempt actor deciding a later gate after approving an earlier gate that advanced the run.
+
+The earlier-gate check pages complete approved history. A deployment can configure a role or global exemption, and permitted self-decision is audited.
+
+A host with only one human reviewer must consciously choose availability or separation of duties.
+
+## Threats and controls
+
+| Threat | Control | Residual |
+| --- | --- | --- |
+| Client forges approval in resume body | Stored grant derivation; raw resume is grant-free | A workflow must protect the actual side effect with a connector, not trust `resumeData.approved` |
+| Old approval reused at another gate | Exact step, `suspendedAt`, and `resumeCount` match | Trusted run-scoped grants intentionally span legs |
+| Reviewer races another reviewer | Store CAS and terminal-state immutability | Batch decisions are partial, not globally transactional |
+| Reviewer approves their own action | Requester and cross-gate history checks | Explicit exemptions weaken this control |
+| Approval resume fails after commit | Decision stays durable; trusted redrive/prepare path | Operator may need to redrive; no automatic rollback |
+| Foreign approval id read or changed | Tenant-bound store predicates and 404 | A verifier that assigns the wrong tenant defeats the boundary |
+| Foreign run or thread reached | Exact prefix ownership, topology check, DO identity check, 404 | Raw namespace access outside exported topology is unsupported |
+| Client smuggles memory id | Recursive body rejection and server minters | Application-specific aliases must not bypass the minter |
+| Schedule row plants grant/context | Reserved-key rejection and runtime-last merge | Direct database writers remain part of the trusted computing base |
+| Webhook claims victim tenant | Verify raw bytes first; tenant from subscription row | Provider secret compromise can forge provider events |
+| Provider alarm lost after subscription | Post-commit reconcile callback and retryable mutation-applied response | Hosts that omit reconciliation must arm polling themselves |
+| Duplicate connector side effect | Atomic idempotency lease and shared store | Poor business keys or too-short pending TTL can still duplicate |
+| One tenant exhausts another's budget | Runtime isolation scope in D1 rate key; tenant evaluator | Fixed-window boundary burst remains |
+| Connector redirects to attacker host | Manual per-hop guarded fetch | Transport outside runtime fetch is invisible |
+| Credentials forwarded on redirect | Cross-origin credential-header stripping | Connector body may itself contain secrets |
+| Prompt becomes CLI flag | Wrapper-owned `--` and `--flag=value` | Vendor semantics can change; packed consumer tests pin current definitions |
+| Prompt/output leaks in error or audit | Static errors, redacted command, bounded metadata, safe audit registry | Successful functional text remains sensitive and caller-owned |
+| PII or secret in model output | Multi-channel detectors, classifier seam, optional hold-back | Encodings and adversarial transformations can evade detection |
+| Open approval or suspended run age-purged | Terminal-only retention | Abandoned live records require offboarding |
+| R2 artifacts stranded | Artifact deletion paired before snapshot row | A host that omits the artifact store from purge can strand objects |
+| Tenant offboarding races new work | Revoke credentials first; delete every adopted domain | In-flight work can return errors during the drain |
+| Audit sink outage blocks agent | Sink failure containment and ring buffer | In-memory buffer is not durable and can drop old events |
+| Notification exposes reviewer payload | Host projection obligation | Flowsafe cannot know the trust level of a transport |
+| Stream ticket replay | Short TTL, HMAC, address binding, Worker verification | Ticket in logs or browser history is usable until expiry |
+
+## RBAC model
+
+Breakwater exports five role labels:
+
+```text
+admin
+builder
+operator
+reviewer
+viewer
+```
+
+`RBACMiddleware` performs only a configured `allowedRoles` membership check around an agent model turn.
+
+Flowsafe applies separate role sets in its run router, approval service, signal/objective/schedule/subscription routers, and deployment configuration. The exact allowed operation is defined by that service, not an implied global hierarchy.
+
+The role names do not themselves implement:
+
+- user provisioning;
+- role inheritance;
+- organization membership;
+- resource ACLs;
+- OIDC or session validation;
+- business-specific authorization.
+
+## Audit contract
+
+Breakwater's event shape is:
+
+```typescript
+interface AuditEvent {
+  timestamp: string;
+  actor: { id: string; role: Role } | null;
+  action: string;
+  resource: string;
+  decision: 'allowed' | 'denied' | 'error';
+  reason?: string;
+  detail?: Record<string, unknown>;
 }
 ```
 
-Approval-service events carry `tenantId` in `detail` alongside
-`workflowId`/`runId`. This matters most for the SLA sweep: it is the one
-cross-tenant writer, so an escalation without a tenant in its detail would be
-unattributable.
+Flowsafe's `ApprovalAuditEvent` is structurally compatible with the input
+accepted by `AuditLogger.record()` and includes tenant, workflow, run, approval,
+or operation detail where applicable. It intentionally has no `timestamp`;
+`AuditLogger.record()` adds one. The default Flowsafe host sink logs and queues
+the raw, unstamped event.
 
-## Secret Lifecycle
+Example after routing a Flowsafe event through `AuditLogger.record()`:
 
-Secrets are stored in Cloudflare Secrets, never in D1. Workflow definitions reference secrets by name; the runtime resolves them at execution time. Raw secrets never appear in event payloads, logs, or workflow state.
+```json
+{
+  "timestamp": "2026-07-26T10:00:00.000Z",
+  "actor": {
+    "id": "reviewer-42",
+    "role": "reviewer"
+  },
+  "action": "approval.decide",
+  "resource": "approval:7d4b",
+  "decision": "allowed",
+  "detail": {
+    "tenantId": "acme",
+    "workflowId": "release",
+    "runId": "acme_9d3f"
+  }
+}
+```
+
+Do not assume every event has the same action vocabulary or resource object. Use the string contract and documented detail for each producer.
+
+## Secrets
+
+Anchorage does not include a generic secret resolver.
+
+Store deployment secrets in Cloudflare Secrets or an external manager and inject only what each component needs. Keep separate keys for:
+
+- identity/session verification;
+- stream tickets;
+- OAuth client credentials;
+- webhook providers;
+- model providers;
+- business connectors;
+- SIEM authorization.
+
+Do not persist raw keys in workflow input, suspend payload, approval context, schedule request context, notification body, audit detail, or artifact metadata.
+
+An Agent CLI inherits its environment unless an injected executor changes it. Supply an allowlisted environment in the process/container boundary.
+
+## Deployment obligations
+
+Before a public endpoint:
+
+1. Replace the static token example with a verified production identity seam.
+2. Provision tenant ids and test foreign-resource 404 behavior.
+3. Use D1-backed connector stores across per-run objects.
+4. Register tenant isolation on every multi-tenant connector.
+5. Route connector HTTP through `runtime.fetch` and add infrastructure egress policy.
+6. Keep approval connector lists and durable-agent resume targets server-authored.
+7. Mount only configured optional routers.
+8. Configure all retention and offboarding duties for adopted domains.
+9. Protect Durable Object namespaces behind the Worker topologies.
+10. Project notifications and audit to the receiving channel's trust level.
+11. Isolate Agent CLI workspaces and review their diffs.
+12. Run the deterministic workerd restart, forgery, and cross-tenant proof.
+
+Report vulnerabilities through [`SECURITY.md`](../SECURITY.md), not a public issue.

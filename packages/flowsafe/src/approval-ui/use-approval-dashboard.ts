@@ -36,14 +36,11 @@ import { sortQueue } from './view-model.js';
 
 /**
  * The dashboard's default queue slice: open (non-terminal) requests only,
- * page-bounded at 100 in REVIEWER order. The bound is D3 — an unfiltered
- * client.list() repeated every poll is a full-table scan on every open
- * dashboard (2026-07-11 audit). orderBy: 'reviewer' makes the server rank
- * priority → SLA → FIFO BEFORE cutting the page, so the 100 rows are the
- * top of the queue — under the default FIFO cut, a fresh critical request
- * beyond the oldest 100 never reached the dashboard at all (2026-07-11
- * review). This is the fallback whenever a caller does not override
- * UseApprovalDashboardOptions.filter.
+ * page-bounded at 100 in reviewer order. The bound prevents an unfiltered
+ * client.list() on every poll from scanning the full table. `orderBy:
+ * 'reviewer'` makes the server rank priority → SLA → FIFO before cutting the
+ * page, so the 100 rows are the top of the queue. This is the fallback
+ * whenever a caller does not override UseApprovalDashboardOptions.filter.
  */
 export const DEFAULT_QUEUE_FILTER: ApprovalListFilter = {
   status: [...OPEN_STATUSES],
@@ -187,7 +184,7 @@ export const DEFAULT_STREAM_HEARTBEAT_TIMEOUT_MS = 10_000;
  * (no STREAM_TICKET_SECRET ⇒ the ticket route 404s), or the caller is not
  * permitted to stream. A 4xx means a retry cannot succeed, so the subscription
  * gives up and the client stays cleanly poll-only — never hammering the ticket
- * route with endless background 404s (F4). A 5xx or a network error (no status)
+ * route with endless background 404s. A 5xx or a network error (no status)
  * stays transient and reconnects with backoff.
  */
 function isPermanentStreamError(cause: unknown): boolean {
@@ -378,17 +375,17 @@ export interface UseApprovalDashboardOptions {
    */
   filter?: ApprovalListFilter;
   /**
-   * Live streaming (Part B): an injected StreamTransport + a ticket() thunk.
-   * ABSENT ⇒ poll-only, exactly today's behavior. When present the hook opens
+   * Live streaming through an injected StreamTransport and ticket() thunk.
+   * Absent means poll-only. When present the hook opens
    * the tenant's approval stream and live-merges events on top of the interval
-   * poll, which keeps running as the periodic reconciler (DL-021).
+   * poll, which keeps running as the periodic reconciler.
    */
   stream?: ApprovalStreamOption;
   /**
    * The current reviewer's id — attributes an optimistic decide so a live
    * 'decided' event naming a DIFFERENT decider surfaces a conflict. Absent ⇒
    * optimistic decide still greys the row, but no conflict is ever raised (no
-   * id to compare against); the host supplies it (showcase, M-008).
+   * id to compare against); the host supplies it.
    */
   actorId?: string;
 }

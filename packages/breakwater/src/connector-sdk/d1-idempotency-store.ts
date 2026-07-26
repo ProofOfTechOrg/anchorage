@@ -17,12 +17,17 @@ import { newToken } from './new-token.js';
 
 /** The subset of D1Database this store uses. */
 export interface IdempotencyDatabase {
+  /** Prepare a SQL statement. */
   prepare(query: string): IdempotencyStatement;
 }
 
+/** Prepared-statement subset required by {@link D1IdempotencyStore}. */
 export interface IdempotencyStatement {
+  /** Bind positional parameters and return the bound statement. */
   bind(...values: unknown[]): IdempotencyStatement;
+  /** Return the first result row, or `null` when no row matched. */
   first<T = unknown>(): Promise<T | null>;
+  /** Execute a statement that does not need to return rows. */
   run(): Promise<unknown>;
 }
 
@@ -30,12 +35,13 @@ interface IdempotencyRow {
   key: string;
   state: string;
   result: string | null;
-  /** Reservation lease token (audit D2); NULL on pre-token rows. */
+  /** Reservation lease token; `NULL` on rows created before lease tokens existed. */
   token: string | null;
   created_at: string;
   updated_at: string;
 }
 
+/** Configuration for {@link D1IdempotencyStore}. */
 export interface D1IdempotencyStoreOptions {
   /** Table name (default 'breakwater_idempotency'). */
   table?: string;
@@ -43,8 +49,8 @@ export interface D1IdempotencyStoreOptions {
    * Age (ms) after which a 'pending' reservation counts as abandoned — a
    * crashed isolate — and may be taken over. Must exceed the longest
    * expected execute duration, or a slow-but-alive execution races its own
-   * takeover (audit D2: a takeover while the original holder is still
-   * running double-executes a write connector). Default 900 000 — above
+   * takeover. A takeover while the original holder is still running can
+   * execute a write connector twice. Default 900 000 — above
    * agent-cli's default 600 000ms execute timeout; agent-cli's
    * `idempotencyKey` option additionally throws at definition time when a
    * configured store's `pendingTtlMs` does not clear its `timeoutMs`.
@@ -89,6 +95,7 @@ export class D1IdempotencyStore implements AtomicIdempotencyStore {
     this.#now = options.now ?? Date.now;
   }
 
+  /** Atomically reserve a key, replay a completed result, or report contention. */
   async reserve(key: string): Promise<IdempotencyReservation> {
     await this.#ready();
     const nowIso = new Date(this.#now()).toISOString();
@@ -203,6 +210,7 @@ export class D1IdempotencyStore implements AtomicIdempotencyStore {
       .run();
   }
 
+  /** Return a completed record for `key`, or `undefined` while absent or pending. */
   async get(key: string): Promise<IdempotencyRecord | undefined> {
     await this.#ready();
     const row = await this.#db

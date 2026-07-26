@@ -29,7 +29,7 @@ export interface TokenVerifier {
 /**
  * Validate an untyped candidate into an ApprovalActor — the ONE place a
  * decoded token/map entry becomes an identity. No `as`-casting at the JSON
- * boundary: id non-empty, role recognized, tenantId INV-3-valid and not a
+ * boundary: id non-empty, role recognized, tenantId pattern-valid and not a
  * reserved identity.
  */
 export function toApprovalActor(candidate: unknown): ApprovalActor | undefined {

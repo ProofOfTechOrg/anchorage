@@ -86,6 +86,7 @@ function StepChips({
   const guide = WORKFLOW_GUIDES[workflowId];
   if (!guide) return null;
   const chips: ReactNode[] = [];
+  const gateSteps = new Set(guide.gateSteps);
   guide.steps.forEach((step, index) => {
     if (index > 0) {
       chips.push(
@@ -94,7 +95,7 @@ function StepChips({
         </Text>,
       );
     }
-    const isGate = guide.gateSteps.includes(step);
+    const isGate = gateSteps.has(step);
     const isSuspendedHere = step === suspendedStep;
     const color = isSuspendedHere ? 'yellow' : isGate ? 'cyan' : 'default';
     chips.push(

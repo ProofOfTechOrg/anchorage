@@ -56,7 +56,7 @@ export interface SubscribeInput {
 }
 
 /**
- * The tenant-bound subscription store INV-2 keeps request scope on. Obtain via
+ * The tenant-bound subscription store that keeps request scope isolated. Obtain via
  * `SubscriptionStoreFactory.forTenant`; the brand makes an unbound/system store a
  * compile error where one of these is required.
  */
@@ -95,13 +95,13 @@ export interface SystemSubscriptionStore {
   ): Promise<StoredSubscription[]>;
 }
 
-/** The brand (INV-2). A unique symbol, satisfied only by a store this module builds. */
+/** A unique-symbol brand satisfied only by a tenant-bound store this module builds. */
 export const SUBSCRIPTION_TENANT_BOUND: unique symbol = Symbol(
   'flowsafe.signalSubscriptionTenantBound',
 );
 
 export interface SubscriptionStoreFactory {
-  /** Bind a store to one tenant. Throws unless tenantId satisfies INV-3. */
+  /** Bind a store to one tenant. Throws unless tenantId satisfies TENANT_ID_PATTERN. */
   forTenant(tenantId: string): TenantBoundSubscriptionStore;
   /** The cron/webhook-only cross-tenant view. Never request-scoped. */
   system(): SystemSubscriptionStore;

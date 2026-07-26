@@ -24,6 +24,14 @@ export {
   type SignalProviderHostState,
   type SignalProviderHostWiring,
 } from './host-do.js';
+// The Worker -> provider-host lifecycle seam.
+export {
+  createSignalProviderHostTopology,
+  type ReconcileSignalProviderPolling,
+  type SignalProviderHostNamespaceLike,
+  type SignalProviderHostStubLike,
+  type SignalProviderHostTopology,
+} from './host-topology.js';
 // The provider contract (CI-M-007-001).
 export {
   createWebhookSignalProvider,

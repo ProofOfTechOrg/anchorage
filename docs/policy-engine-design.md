@@ -1,123 +1,206 @@
-# Policy Engine Design
+# Policy engine design
 
-The policy engine covers four gap domains that Mastra's processor pipeline does not cover. It ships as part of `@proofoftech/breakwater/policy-engine`.
+Breakwater policy runs at the boundary that has enough information to enforce it:
 
-## Four Gap Domains
+- `PolicyEngine` is a Mastra processor for agent input and output content.
+- Tool-policy evaluators run inside `createConnector()` immediately before a tool executes.
+- Data lifecycle enforcement runs against persistent storage from flowsafe maintenance duties.
 
-| Domain | What Mastra Covers | What Anchorage Adds |
-|---|---|---|
-| Network egress | Nothing | Restrict which domains tools and connectors can call |
-| Write permission gates | Per-tool `requireApproval` flag (boolean or predicate) -- no classification, no org policy | Classify write vs read vs destructive; gate writes behind org-level approval policy |
-| Data retention | Nothing | Enforce workflow output TTLs; auto-expire after retention period |
-| Cross-workflow isolation | Nothing | Prevent workflow A from reading workflow B's state; on a multi-tenant host, also require a tenant scope on every connector call |
+There is no YAML policy loader or standalone policy service. Applications construct typed evaluators in code.
 
-## Architecture
+## Content policy
 
-The policy engine runs at two seams, matching `breakwater-architecture.md`:
-
-```
-Agent boundary (Mastra processor chain):
-  inputProcessors:  RBAC → PolicyEngine (pre) → model call
-  outputProcessors: model response → PolicyEngine (post)
-  AuditLogger = shared sink each gate emits to (a denial aborts the
-  chain, so audit cannot be a downstream peer processor)
-
-Tool boundary (breakwater connector wrapper):
-  egress + write checks (pre) → tool execute → retention + isolation (post)
-```
-
-Mastra's processor seam is the agent loop -- `processOutputStep` can inspect pending tool calls and abort before they execute, and per-tool `requireApproval` gates individual tools -- but nothing chains around workflow steps or tools invoked outside an agent loop (`createStep(tool)`, direct calls). Caller-independent tool-boundary gates therefore live in the connector SDK's `execute` wrapper.
-
-Each policy is an evaluator function registered by name:
+`PolicyEngine` takes an ordered array of `PolicyEvaluator` values:
 
 ```typescript
 interface PolicyEvaluator {
   name: string;
-  evaluate(context: PolicyContext): PolicyResult;
-}
-
-interface PolicyResult {
-  allowed: boolean;
-  reason?: string;
+  phases?: readonly ('input' | 'output')[];
+  channels?: readonly ('answer' | 'reasoning' | 'object')[];
+  holdBackChars?: number;
+  evaluate(context: PolicyContext):
+    | PolicyDecision
+    | Promise<PolicyDecision>;
 }
 ```
 
-Policy evaluation order is configurable. By default: network egress, write permissions, data retention, cross-workflow isolation (plus cross-tenant isolation on a multi-tenant host).
+Each decision is either `{ allowed: true }` or `{ allowed: false, reason }`. An evaluator exception is a policy-engine failure, is audited as an error, and fails the request closed.
 
-## Policy Configuration
+Policies run in array order. The first denial aborts the phase.
 
-Policies are defined per-workflow or globally:
+## Phases and channels
 
-```yaml
-policies:
-  networkEgress:
-    allowedDomains: ['api.openai.com', 'api.anthropic.com']
-  writePermissions:
-    requireApproval: ['salesforce.*', 'github.*']
-  dataRetention:
-    workflowOutputTTL: '90d'
-  crossWorkflowIsolation:
-    enabled: true
-    namespace: 'workflow-${workflowId}'
+Input processing joins textual message parts and evaluates them under the `answer` channel. Output processing maintains independent accumulated text for:
+
+| Channel | Source |
+| --- | --- |
+| `answer` | Client-visible answer text |
+| `reasoning` | Reasoning stream deltas |
+| `object` | JSON-stringified structured-output snapshots |
+
+A policy defaults to both phases and the `answer` channel. Set `phases` and `channels` when a policy applies more narrowly.
+
+Mastra exposes structured objects to the processor on the streaming path. Under the supported core version, the non-streaming output result has no separate object field. JSON carried in answer text is still inspected by policies that include `answer`; an object-only policy has no final `generate()` coverage.
+
+## Built-in content policies
+
+### Deny patterns
+
+`denyPatterns(patterns, options)` performs literal or regular-expression-style configured matching according to its exported options. Its streaming implementation scans only the new suffix plus the largest pattern overlap. The default channels cover answer, reasoning, and object so a forbidden string cannot move to another output surface.
+
+Denial reasons identify the configured pattern, not the matched input span. Do not configure a literal secret itself as a pattern if the reason will enter a lower-trust audit sink.
+
+### Maximum length
+
+`maxTextLength(limit, options)` denies accumulated text beyond a configured bound. Apply different policies per channel when answer and reasoning budgets differ.
+
+### PII and secrets
+
+`piiSecrets(options)` combines:
+
+- email, phone, and US Social Security number patterns;
+- Luhn-validated payment-card candidates;
+- AWS access key, JWT, PEM private-key header, and secret-assignment patterns;
+- high-Shannon-entropy token detection with a minimum candidate floor;
+- allowlist exemptions;
+- streaming overlap windows sized to the enabled detectors.
+
+The detector is a guardrail, not a semantic data-loss-prevention system. Encodings, fragmented values beyond configured windows, domain-specific identifiers, and adversarial transformations can evade pattern detectors.
+
+### Asynchronous classifier
+
+`classifierPolicy(options)` adapts a synchronous or asynchronous classification function:
+
+```typescript
+const moderation = classifierPolicy({
+  name: 'moderation',
+  classify: async (text, { phase, channel }) => {
+    const result = await classify(text, { phase, channel });
+    return result.allowed
+      ? { allowed: true }
+      : { allowed: false, reason: result.category };
+  },
+  evaluateEveryChars: 512,
+  timeoutMs: 2_000,
+});
 ```
 
-## Evaluation Flow
+Input and final-result phases always classify. During append-only streaming, the evaluator runs when accumulated text grows by the configured cadence; object snapshots classify individually.
 
-1. Pre-execute gates: every tool-boundary evaluator — network egress, write
-   permission (the requestContext grant check), cross-workflow isolation, and
-   tenant isolation — runs before the connector executes. A deny throws
-   `ConnectorPolicyError` and the tool never runs; there is no post-execute
-   redaction stage.
-2. Execution: the Mastra tool runs normally (or the dry-run simulation runs
-   instead — the pre-execute gates above fire either way).
-3. Data retention is not part of this flow at all: TTL enforcement is a
-   storage-layer property, shipped as flowsafe's cron-driven purge helpers
-   (see below).
+A timeout or classifier failure fails closed. No fail-open option is provided.
 
-## Implementation
+## Hold-back and leakage
 
-The policy engine is a set of evaluator functions, not a standalone service. It runs in-process -- as Mastra processors at the agent boundary and inside the connector SDK's `execute` wrapper at the tool boundary -- with no external dependencies beyond the breakwater package.
+Without hold-back, a streaming policy can detect a violation only after enough of the matching span has arrived. Earlier clean-looking characters may already have reached the client.
 
-All four domains are implemented. Two tool-boundary domains -- `networkEgress` (evaluator in
-`policy-engine/tool-policy.ts`, declaration-based against the manifest's
-`egress` hostnames; its runtime half is the connector SDK's `egressFetch`
-guard, handed to `execute` as `ConnectorRuntime.fetch`, which pins actual
-requests -- redirect hops included -- to the declared list via the shared
-`egressDomainAllowed` matcher) and write-permission gating (`approvalRequired()`,
-enforced by the connector wrapper's requestContext grant check on every
-caller; also compiled to Mastra's native `requireApproval` so agent runs
-pause for the decision -- the native outcome never substitutes for the
-grant; see `connector-interface.md`). Custom tool-boundary evaluators
-register via the connector's `policies.evaluators`.
+`new PolicyEngine({ holdBack: true, ... })` retains a trailing window per answer and reasoning channel. The largest `holdBackChars` hint among applicable policies wins. Once a passing buffer exceeds the window, the older portion is emitted. The tail is reprocessed at the channel end or stream finish.
 
-The remaining two domains are each enforced where enforcement naturally lives:
+Object snapshots are replacement values rather than append-only text, so intermediate snapshots are suppressed and only a passing result is emitted.
 
-- **Cross-workflow isolation** is a tool-boundary evaluator,
-  `crossWorkflowIsolation({ targetScopeOf })` in `tool-policy.ts`, registered
-  through `policies.evaluators`. The caller's scope comes from requestContext
-  `breakwater.workflowScope` (`WORKFLOW_SCOPE_CONTEXT_KEY`), which flowsafe's
-  `RunnerRuntime` mints on EVERY start/resume leg (trusted-runtime-only —
-  trust boundary 6; provider values can deliberately override). The
-  connector-specific `targetScopeOf` extractor names the workflow a call
-  addresses; calls without a target pass, calls targeting another workflow's
-  state — or targeting workflow state without a minted caller scope — fail
-  closed.
-- **Cross-tenant isolation** is its sibling, `tenantIsolation()`, reading the
-  opaque `breakwater.isolationScope` key. It deliberately does not re-qualify
-  the workflow-scope key's value (a consumer may parse that as a bare
-  `workflowId`). A multi-tenant platform adds it to its policy set, and any
-  connector call arriving without a scope is denied — including a dry-run,
-  because the evaluator runs in the pre-execute gates loop while the dry-run
-  branch returns before the idempotency and rate-limit paths. The scope also
-  segments those two keys per tenant. See `connector-interface.md`.
-- **Data retention** is deliberately NOT a policy evaluator: TTL enforcement
-  is a storage-layer property (the data outlives any single call, so a
-  call-time gate cannot expire it). It ships as flowsafe's
-  `purgeExpiredWorkflowRuns(db, { ttlMs, tablePrefix })` — a callable helper
-  that deletes TERMINAL runs (success/failed/tripwire/canceled/bailed/
-  skipped) older than the `workflowOutputTTL` from `mastra_workflow_snapshot`
-  and never touches live runs (expiring a suspended run would kill a pending
-  approval). Its counterpart `purgeTenant(db, { tenantId, artifactStore })`
-  reaps a departing tenant's snapshots of ANY status, its approval records,
-  and its R2 artifacts — the only path that reclaims a run abandoned at an
-  approval gate. Scheduling stays with the caller (a Worker cron).
+Properties:
+
+- The guarantee is per segment, because end markers flush each segment.
+- A policy with no hint adds no window.
+- A finite pattern policy can provide its maximum match span minus one.
+- A classifier that must see the full output should opt into `holdBackChars: Infinity`, accepting full buffering.
+- Hold-back changes delta boundaries. Consumers must treat text deltas as chunks, not semantic tokens.
+
+## Tool policy
+
+`ToolPolicyEvaluator` receives the connector manifest, input, request context, and connector identity before execution.
+
+### Declared network egress
+
+`networkEgress({ allowedDomains })` compares every declared connector hostname with a deployment allowlist. An empty allowlist denies every egress declaration; omit the policy when the deployment does not apply an organization declaration gate. Invalid host declarations and allowlist entries fail at construction.
+
+The connector SDK separately builds `runtime.fetch` from the manifest. It checks actual HTTP(S) requests and redirect hops against the declared list.
+
+### Approval required
+
+`approvalRequired(writePolicy)` determines whether a connector needs approval from:
+
+- explicit `permissions.requiresApproval`;
+- destructive side-effect classification;
+- deployment write-permission patterns.
+
+The connector then reads `breakwater.approvedConnectors` from request context and checks its own id. Flowsafe derives this list from approved records. A dry-run bypasses the capability because its configured implementation must have no side effect.
+
+### Cross-workflow isolation
+
+`crossWorkflowIsolation({ targetScopeOf })` reads the trusted caller scope from `breakwater.workflowScope` and compares it with the connector-specific target extracted from input.
+
+- No target means the connector is not addressing workflow-scoped state.
+- A target with no caller scope fails closed.
+- A different target fails closed.
+
+### Tenant isolation
+
+`tenantIsolation()` requires a non-empty opaque `breakwater.isolationScope`. The same scope segments idempotency and rate-limit keys.
+
+Run this evaluator on every connector in a multi-tenant host, including dry-run calls. Breakwater does not parse or validate the tenant value; the trusted host is its source.
+
+### Background execution
+
+`backgroundExecution()` and the connector wrapper protect Mastra's `_background` model override. A connector is foreground-only unless its manifest declares `background: true`, and only a read-only connector can opt in. Write, destructive, and idempotent connectors remain foreground-only. A read-only connector may opt in even when its manifest separately requires approval; the grant check still runs at execution.
+
+Schema validation may strip `_background` on some agent paths. The connector check still protects no-schema, passthrough, workflow, and direct calls.
+
+### Custom evaluators
+
+Add evaluators through `ConnectorPolicies.evaluators`. Keep them deterministic and side-effect-free; they run before the connector and before a dry-run return.
+
+An evaluator may inspect trusted request-context values, but must never promote client input into an approval grant or isolation scope.
+
+## Connector execution order
+
+The SDK uses this order:
+
+```text
+input validation
+  -> declared egress
+  -> custom evaluators
+  -> dry-run selection
+  -> approval grant
+  -> idempotency reserve/replay
+  -> rate-limit increment
+  -> execute with guarded fetch
+  -> output validation
+  -> idempotency commit
+```
+
+Only real executions consume rate budget. An execution failure releases an owned idempotency reservation so a later attempt can retry.
+
+Every allow, denial, and gate failure emits structured audit. Arbitrary thrown values are mapped to static safe audit reasons rather than copied into audit output.
+
+## Data lifecycle policy
+
+Retention cannot be enforced by an in-process call evaluator because persisted data outlives the call. Flowsafe exports storage helpers:
+
+- terminal workflow snapshot purge;
+- approved/rejected approval purge;
+- idle thread and message purge;
+- terminal notification purge;
+- thread-state and goal purge;
+- schedule-trigger purge;
+- terminal background-task purge;
+- complete tenant offboarding.
+
+Live runs and open approvals are not age-purged. Schedules, resources, and subscriptions are standing state and delete at offboarding.
+
+See [Deployment reference](deployment-reference.md) and [Operations runbook](operations-runbook.md).
+
+## Choosing the boundary
+
+| Requirement | Correct boundary |
+| --- | --- |
+| Deny a prompt before the model | Input processor |
+| Inspect answer/reasoning/object output | Output processor |
+| Require a grant on every tool invocation path | Connector wrapper |
+| Restrict actual connector HTTP redirects | `ConnectorRuntime.fetch` |
+| Enforce tenant and workflow call scope | Tool evaluator plus trusted runtime context |
+| Suspend an agent for review | Mastra native approval predicate compiled by connector |
+| Mint the resumed connector capability | Flowsafe approval provider |
+| Expire persisted state | Scheduled storage purge |
+| Prevent any process socket from reaching the internet | Deployment infrastructure |
+
+Read [Breakwater architecture](breakwater-architecture.md) and [Connector interface](connector-interface.md) for the surrounding contracts.

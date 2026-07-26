@@ -12,9 +12,11 @@ anywhere and versioned against the wire contract alone.
   primitive through injected slot components — the `ApprovalUIComponents`
   contract + `ApprovalUIProvider` context in `components.tsx` — with a plain-HTML
   default adapter (`htmlComponents`, `flowsafe-*` class hooks). An importer
-  supplies their own design system (the `app/` ships an Astryx adapter); the
-  library has no design-system or CSS dependency and runs on React 18+. This is
-  the react-select / react-markdown / MDX `components` pattern.
+  supplies their own design system (the showcase ships Astryx adapters in
+  `packages/showcase/src/astryx-components.tsx` and
+  `packages/showcase/src/astryx-stream-components.tsx`); the library has no
+  design-system or CSS dependency and runs on React 18 or 19. This is the
+  react-select / react-markdown / MDX `components` pattern.
   `useApprovalDashboard` is the headless core beneath the views, so a consumer
   can skip the views entirely and render a fully custom UI. Rejected: baking in
   one design system (couples every consumer to it and forces its React version —
@@ -69,8 +71,8 @@ anywhere and versioned against the wire contract alone.
   `view-model.ts` and `client.ts` and tested in plain node. Rejected:
   @testing-library/react + jsdom — three more age-gated dev dependencies
   plus a third test environment for marginal coverage of markup. Amended
-  2026-07-11: that rationale covers MARKUP, but the P1 filter-identity
-  request loop lived in `useApprovalDashboard`'s dependency wiring (the
+  2026-07-11: that rationale covers markup, but the filter-identity request
+  loop lived in `useApprovalDashboard`'s dependency wiring (the
   useMemo/useCallback/effect interplay), which no pure extraction can
   execute — `approvalFilterKey`'s stability test cannot prove the mounted
   hook stops refetching. `use-approval-dashboard.render.test.ts` is the one
@@ -99,7 +101,7 @@ Opt-in live updates over an INJECTED, DOM-free `StreamTransport` (a structural
 seam like `FetchLike`), so the library never hard-depends on a browser
 `WebSocket`. Pass `useApprovalDashboard` a `stream: { transport, ticket }` and it
 subscribes to the tenant's approval stream and live-merges events on top of the
-interval poll, which keeps running as the periodic reconciler (DL-021). Absent
+interval poll, which keeps running as the periodic reconciler. Absent
 `stream`, behavior is byte-identical to poll-only.
 
 - `stream.ts` (DOM-free, compiles in the main pass): the `StreamTransport` /

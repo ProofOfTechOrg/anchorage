@@ -27,7 +27,7 @@ import { createHubTopology, type HubNamespaceLike } from './hub-topology.js';
 import { mintStreamTicket, verifyStreamTicket } from './stream-ticket.js';
 
 export interface StreamRouterOptions {
-  /** The shared resolver (authenticate -> INV-3 -> bind) the ticket route uses. */
+  /** The shared authenticate, validate, and tenant-bind resolver used by the ticket route. */
   resolve: TenantResolver;
   /** The dedicated stream-ticket signing secret (STREAM_TICKET_SECRET). */
   ticketSecret: string;

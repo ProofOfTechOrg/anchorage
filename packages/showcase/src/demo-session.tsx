@@ -81,7 +81,7 @@ export function useDemoSignIn(): DemoSignIn {
   const [signIn, setSignIn] = useState<DemoSignIn>({ status: 'loading' });
   useEffect(() => {
     let alive = true;
-    fetch('/auth/config')
+    void fetch('/auth/config')
       .then(async (response) => {
         if (!response.ok) return undefined;
         const config = (await response.json()) as {
@@ -92,7 +92,6 @@ export function useDemoSignIn(): DemoSignIn {
           ? config.provider
           : undefined;
       })
-      .catch(() => undefined)
       .then((provider) => {
         if (!alive) return;
         setSignIn(
@@ -100,6 +99,9 @@ export function useDemoSignIn(): DemoSignIn {
             ? { status: 'none' }
             : { status: 'oauth', provider },
         );
+      })
+      .catch(() => {
+        if (alive) setSignIn({ status: 'none' });
       });
     return () => {
       alive = false;
@@ -144,20 +146,30 @@ export function DemoActorSwitcher({
   // session/actorToken are read through refs so a role switch (or the refresh
   // itself replacing the session) does NOT re-arm the interval — resetting
   // the 30-minute countdown on every switch could outlast the 1h JWT TTL.
+  // Synchronize the refs after commit so render remains replay-safe.
   const sessionRef = useRef(session);
-  sessionRef.current = session;
   const actorTokenRef = useRef(actorToken);
-  actorTokenRef.current = actorToken;
   useEffect(() => {
+    sessionRef.current = session;
+    actorTokenRef.current = actorToken;
+  }, [session, actorToken]);
+  useEffect(() => {
+    let alive = true;
+    let refreshing = false;
+    const controller = new AbortController();
     const timer = setInterval(() => {
+      if (refreshing) return;
       const current = sessionRef.current.tokens[0];
       if (!current) return;
+      refreshing = true;
       void fetch('/auth/refresh', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ token: current.token }),
+        signal: controller.signal,
       })
         .then(async (response) => {
+          if (!alive) return;
           if (response.status === 401) {
             narrate([sessionExpiredEvent()]);
             onExpired();
@@ -165,6 +177,7 @@ export function DemoActorSwitcher({
           }
           if (!response.ok) return; // transient — retry next tick
           const next = (await response.json()) as DemoTokenSet;
+          if (!alive) return;
           onSession(next);
           narrate([tokenRefreshedEvent()]);
           // Keep the selected ROLE across the rotation.
@@ -179,9 +192,16 @@ export function DemoActorSwitcher({
         // A network blip (or a malformed body) is transient like a non-ok
         // response: swallow and retry next tick — same posture as
         // useDemoSignIn — instead of surfacing an unhandled rejection.
-        .catch(() => undefined);
+        .catch(() => undefined)
+        .finally(() => {
+          refreshing = false;
+        });
     }, REFRESH_INTERVAL_MS);
-    return () => clearInterval(timer);
+    return () => {
+      alive = false;
+      controller.abort();
+      clearInterval(timer);
+    };
   }, [onSelect, onSession, onExpired, narrate]);
 
   // One heads-up before the tenant reaches end of life (key-deduped, so the

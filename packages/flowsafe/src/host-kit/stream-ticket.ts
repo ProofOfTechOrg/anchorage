@@ -35,7 +35,7 @@ import {
 } from '../do-runner/path-safe-id.js';
 import { base64UrlEncode, hmacSign } from './verifier.js';
 
-/** The two live channels (DL-009): the per-tenant hub, or a per-run WebSocket. */
+/** The two live channels: the per-tenant hub or a per-run WebSocket. */
 export type StreamChannel = 'hub' | 'run';
 
 /**
@@ -57,7 +57,7 @@ export interface StreamTicketClaims {
 export interface MintStreamTicketOptions {
   /** The dedicated stream-ticket signing secret (STREAM_TICKET_SECRET). */
   secret: string;
-  /** The AUTHENTICATED tenant the ticket is bound to (INV-3-valid upstream). */
+  /** The authenticated, previously validated tenant to which the ticket is bound. */
   tenantId: string;
   channel: StreamChannel;
   /** REQUIRED for the `'run'` channel; omitted for `'hub'`. */
@@ -114,7 +114,7 @@ export async function mintStreamTicket(
  * Verify a stream ticket, returning its claims or `undefined` (fail closed).
  * The signature is recomputed over the presented payload segment and compared
  * CONSTANT-TIME; then every claim is validated: `exp` unexpired, `tenantId`
- * INV-3-valid and not reserved, `channel` known, `runId` present IFF the run
+ * pattern-valid and not reserved, `channel` known, `runId` present if and only if the run
  * channel (and when present PATH_SAFE and tenant-owned), `actorId` non-empty,
  * and `role` a recognized APPROVAL_ROLE. Any failure returns `undefined`.
  */

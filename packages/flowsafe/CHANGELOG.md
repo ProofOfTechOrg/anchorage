@@ -2,6 +2,12 @@
 
 ## 0.6.0
 
+> **Final 0.6.0 state:** The `eca3b6e` closeout entry below supersedes earlier
+> statements in this release section that agent schedule targets and durable D1
+> background-task execution were deferred. Both are supported in 0.6.0 when
+> their opt-in host wiring is configured. Durable-agent restart resume and
+> notification dispatch are also closed and verified.
+
 ### Minor Changes
 
 - eca3b6e: Close the durable-agent, agent-schedule, notification-dispatch, and D1 background-task execution residuals with tenant-safe thread routing and eviction-safe approval resume. Harden stored schedule context and core schedule-contract validation; make D1 notification creation preserve explicit-id coalescing, insertion-order targets, rollback-safe atomic migration, and concurrent partial updates; priority-plan summary and individual delivery across state-stable 100-id batches; accept Mastra's raw constructor pubsub with rollback-safe workers and a synchronous enqueue shutdown gate; close failed resume streams; validate public numeric configuration synchronously; preserve nested Mastra background-task SSE events; and require a proven process shutdown before spike restart.
@@ -99,7 +105,10 @@
   a malformed taskId returns the no-oracle 404 instead of throwing. Additive and
   behavior-preserving for all valid paths.
 
-## 0.5.0
+## Unpublished 0.5.0 draft (included in 0.6.0)
+
+No `@proofoftech/flowsafe@0.5.0` package was published. These changes shipped in
+0.6.0 and remain here as their original generated release notes.
 
 ### Minor Changes
 

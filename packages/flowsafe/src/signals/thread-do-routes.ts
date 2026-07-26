@@ -49,7 +49,7 @@ import {
 
 /**
  * The idle-thread delivery behavior a send may ask for. `wake` starts a run
- * (run cap consulted first, DL-007); `persist` writes the signal to the durable
+ * after consulting the run cap; `persist` writes the signal to the durable
  * inbox for the next turn; `discard` drops it. Mirrors core
  * `AgentSignalIdleBehavior`, re-declared so the route body validates the wire
  * value rather than trusting an `as`.
@@ -62,7 +62,7 @@ export const ACTIVE_BEHAVIORS = ['deliver', 'persist', 'discard'] as const;
 export type ActiveBehavior = (typeof ACTIVE_BEHAVIORS)[number];
 
 /**
- * A run-cap consult for an idle-thread WAKE (DL-007): starting a run with nobody
+ * A run-cap consult for an idle-thread wake: starting a run with nobody
  * watching must charge the same per-tenant + global budget an unattended
  * schedule fire does, or a signal storm bills Cloudflare instead of exhausting a
  * quota. Returns false to REFUSE the wake (over cap) — the route then falls back
@@ -118,7 +118,7 @@ export interface ThreadSignalRoutesOptions {
    * binding expected by the registered durable run.
    */
   resolveResourceId?: (scope: ThreadScope) => string | undefined;
-  /** Run-cap seam for idle-thread wakes (DL-007). Absent ⇒ wakes are unmetered. */
+  /** Run-cap seam for idle-thread wakes. Absent means wakes are unmetered. */
   consultRunCap?: RunCapConsult;
   /** Runtime-driven start seam. Absent wakes degrade to durable persistence. */
   startIdleRun?: StartIdleRun;
@@ -131,7 +131,7 @@ export interface ThreadSignalRoutesOptions {
 /**
  * A thread-DO signal router: `(request, scope) => Response | null`. `null` means
  * the path is not one of ours, so the subclass's `route()` can compose it ahead
- * of its own routes (Track A's agent-loop drive). `scope` is the already-asserted
+ * of its own durable-agent routes. `scope` is the already-asserted
  * ThreadScope (threadId, tenantId, init) the template-method `fetch` hands down.
  */
 export type ThreadSignalRouter = (
@@ -161,7 +161,7 @@ async function readJson(
 
 /**
  * The wire surface accepts STRING contents only — the common case, and the one
- * the P6 ingestion gate can size-cap and (defense-in-depth) escape uniformly.
+ * the ingestion gate can size-cap and escape uniformly as defense in depth.
  * Core's multimodal `AgentSignalContents` array form (TextPart/FilePart) is a
  * documented residual, not exposed over this untrusted channel in v1.
  */
@@ -174,10 +174,10 @@ function isContents(value: unknown): value is string {
  * (and attribute names) inside `signalToXmlMarkup` — MIRRORED here, not
  * deep-imported: `XML_NAME_PATTERN` / `assertXmlName` are not on core's exports
  * map. Validating the caller-supplied `tagName` at INGEST turns an invalid one
- * into a 400 at the route (the "route-level defense" C-S5 names) rather than a
+ * into a 400 at the route rather than a
  * throw at render time inside the agent turn. Kept byte-identical to core
- * (chunk `signalToXmlMarkup`: `/^[A-Za-z_][A-Za-z0-9_.-]*$/`); the C-S5 render
- * test pins core's own neutralization of contents/attribute values so this
+ * (chunk `signalToXmlMarkup`: `/^[A-Za-z_][A-Za-z0-9_.-]*$/`); the render test
+ * pins core's own neutralization of contents/attribute values so this
  * mirror and that layer are checked together.
  */
 const XML_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
@@ -598,7 +598,7 @@ type WakeRefusal = 'not-runtime-driven' | 'no-start-idle-run';
  * next turn rather than dropping or billing):
  *   - the agent must be RUNTIME-DRIVEN (its stream re-enters RunnerRuntime, not
  *     the default engine) — else `wakeRefused:'not-runtime-driven'`;
- *   - the per-tenant run cap must allow it (DL-007) — else `capped:true`.
+ *   - the per-tenant run cap must allow it — otherwise `capped:true`.
  */
 function requestedIdle(body: Record<string, unknown>): IdleBehavior {
   const requested = body.ifIdle;

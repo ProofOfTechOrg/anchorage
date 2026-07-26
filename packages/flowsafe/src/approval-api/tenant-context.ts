@@ -32,18 +32,18 @@ import {
 import type { TenantBoundApprovalStore } from './tenant-brand.js';
 
 export interface TenantContext {
-  /** Already authenticated; tenantId === actor.tenantId, INV-3-validated. */
+  /** Already authenticated; tenantId equals actor.tenantId and matches the tenant-ID pattern. */
   readonly actor: ApprovalActor;
   readonly tenantId: string;
   /** The approval service over a store bound to THIS tenant. */
   service(): ApprovalService;
-  /** Mint a tenant-salted runId: `${tenantId}_${uuid}` (INV-1). */
+  /** Mint a tenant-salted runId: `${tenantId}_${uuid}`. */
   newRunId(): string;
-  /** Exact ownership: `runId.startsWith(`${tenantId}_`)` — see INV-3. */
+  /** Exact ownership: `runId.startsWith(`${tenantId}_`)`. */
   ownsRun(runId: string): boolean;
   /**
    * Mint a tenant-salted agent-memory threadId: `${tenantId}_${uuid}` —
-   * the INV-1 carrier extended to Mastra memory
+   * extending the tenant-salted identifier scheme to Mastra memory
    * (docs/agent-memory-tenancy.md). Hosts never accept a client-supplied
    * threadId; this is the constructor.
    */
@@ -71,10 +71,10 @@ export interface TenantContext {
 
 /**
  * undefined => no identity => 401. Throws TenantResolutionError when an
- * AUTHENTICATED actor carries a tenant that fails INV-3 or names a reserved
+ * authenticated actor carries an invalid tenant ID or names a reserved
  * identity ('system') — either is a verifier or claim-mapping bug, surfaced
  * as 403 by the routers, never concatenated into a runId ("undefined" is
- * itself an INV-3-valid string, so an unvalidated `String(undefined)` would
+ * itself a pattern-valid string, so an unvalidated `String(undefined)` would
  * silently authorize a tenant literally named 'undefined').
  */
 export type TenantResolver = (

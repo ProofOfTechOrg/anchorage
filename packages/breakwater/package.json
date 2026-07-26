@@ -15,7 +15,7 @@
   "engines": {
     "node": ">=22"
   },
-  "description": "Safety middleware for AI agent workflows — policy engine, RBAC + audit, connector SDK",
+  "description": "Runtime guardrails for Mastra agents: policy, RBAC, audit, enforced connectors, and approval-gated coding CLIs",
   "type": "module",
   "repository": {
     "type": "git",
@@ -39,6 +39,7 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "test": "vitest run",
+    "test:packed-consumer": "node scripts/packed-consumer-test.mjs",
     "test:watch": "vitest",
     "lint": "pnpm -w exec biome check packages/breakwater",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
@@ -47,12 +48,14 @@
   "peerDependencies": {
     "@mastra/core": "^1.50.0"
   },
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
   "devDependencies": {
     "@mastra/core": "^1.50.0",
     "@types/node": "^22.20.0",
     "typescript": "^5.6",
-    "vitest": "^4.1.8",
-    "zod": "^4.4.3"
+    "vitest": "^4.1.8"
   },
   "keywords": [
     "mastra",
@@ -60,7 +63,11 @@
     "security",
     "rbac",
     "policy-engine",
-    "audit-log"
+    "audit-log",
+    "connectors",
+    "idempotency",
+    "claude-code",
+    "codex"
   ],
   "license": "Apache-2.0"
 }

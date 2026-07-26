@@ -62,9 +62,9 @@ export function statusDraftOf(filter: ApprovalListFilter): StatusDraft {
  * Drafts -> ApprovalListFilter, evaluated at APPLY time. `nowMs` is injected
  * (the click handler passes its clock) so the age cutoff is deterministic
  * under test and no Date.now sits in a render path. The base filter's
- * limit/orderBy carry over — the D3 page bound and reviewer ranking are not
- * the user's to lose — while any `after` cursor is deliberately dropped: a
- * new filter starts at page one (and 'reviewer' order rejects cursors).
+ * limit/orderBy carry over so the page bound and reviewer ranking are not
+ * lost, while any `after` cursor is deliberately dropped: a new filter
+ * starts at page one (and 'reviewer' order rejects cursors).
  */
 export function buildTriageFilter(
   drafts: TriageFilterDrafts,

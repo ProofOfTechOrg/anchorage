@@ -1,4 +1,6 @@
-# Model Gateway And Policy
+# Proposal: model gateway policy
+
+> This document is a proposal. It is not implemented or supported product behavior. Shipped policy enforcement is documented in [Policy engine](../policy-engine-design.md) and [Connector interface](../connector-interface.md).
 
 Mastra's `Agent` class handles model routing, provider normalization, and tool calling natively. This document covers the policy layer Anchorage adds on top of `Agent.generate()`.
 

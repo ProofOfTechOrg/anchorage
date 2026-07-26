@@ -15,27 +15,43 @@ import type { RequestContext } from '@mastra/core/request-context';
  * module — so neither seam imports the other for it.
  */
 export type PolicyDecision =
-  | { allowed: true }
-  | { allowed: false; reason: string };
+  | {
+      /** Allow the operation. */
+      allowed: true;
+    }
+  | {
+      /** Deny the operation. */
+      allowed: false;
+      /** Human-readable denial reason suitable for audit records. */
+      reason: string;
+    };
 
 /** Side-effect classification a connector declares in its manifest. */
 export type SideEffect = 'read' | 'write' | 'destructive' | 'idempotent';
 
 /** One connector call, as seen by tool-boundary policies. */
 export interface ToolCallContext {
+  /** Connector id declared by the tool. */
   connectorId: string;
+  /** Side-effect classification declared by the connector. */
   sideEffect: SideEffect;
   /** Hostnames the connector's manifest declares it calls. */
   egress: readonly string[];
+  /** Validated connector input. */
   input: unknown;
+  /** Trusted per-call context supplied by the host, when available. */
   requestContext?: RequestContext;
 }
 
+/** Evaluates one policy at the connector execution boundary. */
 export interface ToolPolicyEvaluator {
+  /** Stable policy name used in denials and audit records. */
   name: string;
+  /** Return whether this connector call may proceed. */
   evaluate(context: ToolCallContext): PolicyDecision | Promise<PolicyDecision>;
 }
 
+/** Configuration for {@link networkEgress}. */
 export interface NetworkEgressOptions {
   /**
    * Hostnames connectors may call: exact entries ('api.openai.com') or
@@ -44,6 +60,7 @@ export interface NetworkEgressOptions {
    * omit the policy instead. Malformed entries throw at construction.
    */
   allowedDomains: readonly string[];
+  /** Policy name used in denials and audit records. */
   name?: string;
 }
 
@@ -174,6 +191,7 @@ export function networkEgress(
  */
 export const WORKFLOW_SCOPE_CONTEXT_KEY = 'breakwater.workflowScope';
 
+/** Configuration for {@link crossWorkflowIsolation}. */
 export interface CrossWorkflowIsolationOptions {
   /**
    * Extract the workflow scope this call TARGETS (connector-specific — e.g.
@@ -181,6 +199,7 @@ export interface CrossWorkflowIsolationOptions {
    * address workflow state and passes untouched.
    */
   targetScopeOf: (call: ToolCallContext) => string | undefined;
+  /** Policy name used in denials and audit records. */
   name?: string;
 }
 
@@ -281,6 +300,7 @@ function backgroundOverrideOf(
   return value as LlmBackgroundOverride;
 }
 
+/** Configuration for {@link backgroundExecution}. */
 export interface BackgroundExecutionOptions {
   /**
    * Side effects treated as write-class — background execution denied for
@@ -290,31 +310,23 @@ export interface BackgroundExecutionOptions {
    * 'read'.
    */
   writeClass?: readonly SideEffect[];
+  /** Policy name used in denials and audit records. */
   name?: string;
 }
 
 /**
- * Deny a write-class connector call carrying an LLM `_background` override that
- * asks for background execution (DL-005) — the defense-in-depth counterpart to
- * `createConnector`'s hard `_background` arg rejection.
+ * Deny a write-class connector call carrying an LLM `_background` override
+ * that asks for background execution. This complements `createConnector`'s
+ * hard `_background` argument rejection.
  *
- * ACCURACY / REACH: this evaluator does NOT observe core's *resolved* background
- * eligibility. Core resolves it agent config -> tool config -> LLM `_background`
- * -> defaults (`resolveBackgroundConfig`) and gates it on `baseEnabled` (the
- * agent/tool `enabled` flags), all of which live in the agent definition, out of
- * view at the tool boundary. The only signal here is the LLM override in the call
- * args — and on the AGENT path core has already deleted `_background` from those
- * args before dispatch, so this fires on NOTHING there. What actually keeps the
- * model from backgrounding an approval-carrying call on the agent path is core's
- * own `baseEnabled` gate: a breakwater connector sets no background config, so
- * the tool is ineligible and the override cannot enable it. This evaluator's real
- * teeth are DIRECT / NESTED programmatic calls whose args reach the gate loop
- * unstripped: a `_background` arg that would ENABLE background (`enabled !==
- * false`) is refused. A read-only tool is untouched (a read has no side effect
- * whose timing/approval the flip would move); forcing FOREGROUND (`enabled:
- * false`) is the safe direction and passes. The real write boundary on every
- * path — agent, direct, or the background executor itself — is the requestContext
- * GRANT, not this check. Register through `ConnectorPolicies.evaluators`.
+ * This evaluator sees only the override present in the connector arguments.
+ * Mastra removes `_background` before dispatching agent tool calls, so the
+ * check primarily protects direct and nested programmatic calls. Breakwater
+ * connectors do not enable Mastra background execution by default, which
+ * prevents an agent override from opting them in upstream. Read-only calls and
+ * explicit `{ enabled: false }` overrides pass. Approval grants in the trusted
+ * request context remain the final write boundary on every execution path.
+ * Register the evaluator through `ConnectorPolicies.evaluators`.
  */
 export function backgroundExecution(
   options: BackgroundExecutionOptions = {},

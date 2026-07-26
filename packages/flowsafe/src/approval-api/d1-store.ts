@@ -260,8 +260,8 @@ function listOrderBy(filter: ApprovalListFilter): string {
 }
 
 /**
- * One aggregate query, computed once per call — the D3 replacement for
- * loading every record into JS just to count. Must match
+ * One aggregate query, computed once per call, instead of loading every
+ * record into JavaScript just to count. Must match
  * store.ts's computeApprovalMetrics field-for-field (store.test.ts pins the
  * cross-backend parity, including the AVG-over-julianday vs JS Date-ms/1000
  * arithmetic landing on the same value for round-second fixtures). SUM over

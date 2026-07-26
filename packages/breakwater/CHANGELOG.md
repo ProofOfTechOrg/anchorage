@@ -2,6 +2,13 @@
 
 ## 0.4.0
 
+> **Scope correction:** This package release added the `_background` permission
+> and the `backgroundExecution` policy described in the first bullet below. The
+> flowsafe storage, Durable Object host, recovery, and execution-status material
+> was included by the shared changeset but is not part of breakwater. See the
+> [flowsafe changelog](https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/flowsafe/CHANGELOG.md)
+> for that package's final behavior.
+
 ### Minor Changes
 
 - 15d4ec3: Track B (background tasks): the additive, opt-in substrate + defenses for

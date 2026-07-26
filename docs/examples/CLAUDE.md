@@ -1,14 +1,15 @@
-# examples/
+# Example navigation
 
-TypeScript `createWorkflow()` design sketches for Anchorage — illustrative, not runnable; they show API shape and breakwater/flowsafe integration points.
+[`README.md`](README.md) labels which examples are runnable and which are design sketches.
 
-## Files
+- `gtm-outbound.ts`: serial approval
+- `content-pipeline.ts`: parallel work
+- `lead-generation.ts`: branching
+- `product-launch.ts`: repeated gates
+- `custom-workflow-scoping.ts`: host-level workflow authorization sketch
 
-| File | What | When to read |
-| ---- | ---- | ------------ |
-| `README.md` | Index of the sketches with pattern + highlights and their YAML origin | Choosing an example, understanding what each demonstrates |
-| `gtm-outbound.ts` | Serial pipeline with a flowsafe approval gate | Implementing a serial approval pipeline |
-| `content-pipeline.ts` | Parallel step execution | Implementing parallel workflow branches |
-| `lead-generation.ts` | Conditional branching (`.branch()` hot/cold routing) | Implementing conditional routing |
-| `product-launch.ts` | Multi-step serial approval checkpoints | Implementing multi-checkpoint approval |
-| `custom-workflow-scoping.ts` | Role-gated workflow access (design sketch; the shipped mechanism is flowsafe host-kit's `WorkflowMeta.allowedRoles` run-router gate, not a breakwater wrapper) | Implementing role-scoped workflow access |
+Run the executable flowsafe example with:
+
+```bash
+pnpm --filter @proofoftech/flowsafe example:gtm
+```

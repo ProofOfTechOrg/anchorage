@@ -1,5 +1,20 @@
 {
   "$schema": "https://typedoc.org/schema.json",
-  "entryPoints": ["src/index.ts"],
-  "tsconfig": "tsconfig.json"
+  "entryPoints": [
+    "src/index.ts",
+    "src/policy-engine/index.ts",
+    "src/rbac/index.ts",
+    "src/audit/index.ts",
+    "src/connector-sdk/index.ts",
+    "src/agent-cli/index.ts"
+  ],
+  "entryPointStrategy": "resolve",
+  "tsconfig": "tsconfig.json",
+  "name": "@proofoftech/breakwater",
+  "excludeInternal": true,
+  "validation": {
+    "notExported": true,
+    "invalidLink": true,
+    "invalidPath": true
+  }
 }

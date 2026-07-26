@@ -63,7 +63,7 @@ export interface ApprovalRecord {
    * The owning tenant. STAMPED by the bound store from its own constructor
    * field — never accepted from input (CreateApprovalInput deliberately has
    * no tenantId: a field that cannot be supplied cannot be spoofed). Every
-   * read/write predicate carries it (INV-2).
+   * read/write predicate carries it.
    */
   tenantId: string;
   workflowId: string;
@@ -194,8 +194,8 @@ export interface ApprovalListFilter {
   /**
    * Max records to return (clamped to [1, MAX_APPROVAL_LIST_LIMIT] — see
    * clampApprovalLimit). undefined requests no explicit limit: a tenant-bound
-   * store then DEFAULTS to MAX_APPROVAL_LIST_LIMIT (D3 — a bare list() is
-   * never an unbounded scan), while the cron-only SystemApprovalStore view
+   * store then defaults to MAX_APPROVAL_LIST_LIMIT so a bare list() never
+   * becomes an unbounded scan, while the cron-only SystemApprovalStore view
    * stays complete. Page complete history with an explicit `after` cursor.
    */
   limit?: number;
@@ -394,7 +394,8 @@ export function parseApprovalTimeBound(value: string, field: string): number {
  * front, BEFORE filtering, so a zero-match view rejects an unparseable bound
  * identically to D1's unconditional appendListFilters instead of silently
  * returning [] — single-sourcing the "both backends fail identically" contract
- * (DL-006). Fail-closed: a garbage bound errors, never a silently empty page.
+ * across both stores. Fail-closed: a garbage bound errors, never a silently
+ * empty page.
  */
 export function assertApprovalTimeBounds(
   filter: Pick<ApprovalListFilter, 'createdBefore' | 'createdAfter'>,

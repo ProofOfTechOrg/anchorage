@@ -1,0 +1,36 @@
+name: Documentation issue
+description: Report missing, incorrect, stale, or confusing documentation.
+title: "[Docs]: "
+labels:
+  - documentation
+body:
+  - type: input
+    id: page
+    attributes:
+      label: Page or section
+      description: Link to the affected page, heading, API entry, or source file.
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is wrong or missing?
+      description: Explain what a new user cannot understand or what contradicts the product.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Proposed correction
+      description: Include corrected wording, setup steps, or links when possible.
+  - type: dropdown
+    id: package
+    attributes:
+      label: Affected package
+      options:
+        - "@proofoftech/breakwater"
+        - "@proofoftech/flowsafe"
+        - Both packages
+        - Repository or showcase
+    validations:
+      required: true

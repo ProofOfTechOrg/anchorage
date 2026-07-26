@@ -3,14 +3,17 @@ import { RequestContext } from '@mastra/core/request-context';
 import type { ToolExecutionContext } from '@mastra/core/tools';
 import { describe, expect, it, type Mock, vi } from 'vitest';
 
+import { AuditLogger } from '../audit/index.js';
 import {
   APPROVED_CONNECTORS_CONTEXT_KEY,
   ConnectorPolicyError,
   connectorManifest,
   DRY_RUN_CONTEXT_KEY,
+  IDEMPOTENCY_KEY_CONTEXT_KEY,
   InMemoryIdempotencyStore,
 } from '../connector-sdk/index.js';
 import {
+  type AgentCliDefinition,
   AgentCliError,
   type AgentCliExec,
   type AgentCliInput,
@@ -21,7 +24,11 @@ import {
 import { tailAccumulator } from './tail-accumulator.js';
 
 function makeContext(
-  options: { approved?: readonly string[]; dryRun?: boolean } = {},
+  options: {
+    approved?: readonly string[];
+    dryRun?: boolean;
+    idempotencyKey?: string;
+  } = {},
 ): ToolExecutionContext {
   const requestContext = new RequestContext();
   if (options.approved) {
@@ -29,6 +36,9 @@ function makeContext(
   }
   if (options.dryRun) {
     requestContext.set(DRY_RUN_CONTEXT_KEY, true);
+  }
+  if (options.idempotencyKey) {
+    requestContext.set(IDEMPOTENCY_KEY_CONTEXT_KEY, options.idempotencyKey);
   }
   return { requestContext } as unknown as ToolExecutionContext;
 }
@@ -64,6 +74,38 @@ function mockExec(
 }
 
 const GRANTED = (id: string) => makeContext({ approved: [id] });
+const PRIVATE_PROMPT = 'private-prompt-7b3b631a';
+const PRIVATE_PROCESS_OUTPUT = 'private-process-output-10fd1f62';
+
+function errorSurface(error: unknown): string {
+  if (!(error instanceof Error)) return JSON.stringify(error);
+  const structured = error as Error & Partial<AgentCliError>;
+  return JSON.stringify({
+    name: structured.name,
+    message: structured.message,
+    code: structured.code,
+    connectorId: structured.connectorId,
+    command: structured.command,
+    exitCode: structured.exitCode,
+    timeoutMs: structured.timeoutMs,
+    systemCode: structured.systemCode,
+    stdoutCaptured: structured.stdoutCaptured,
+    stderrCaptured: structured.stderrCaptured,
+  });
+}
+
+function privateDefinition(
+  overrides: Partial<AgentCliDefinition> = {},
+): AgentCliDefinition {
+  return {
+    id: 'agent-cli.private-probe',
+    description: 'private surface probe',
+    binary: 'private-probe',
+    egress: [],
+    buildFlags: () => [],
+    ...overrides,
+  };
+}
 
 describe('createClaudeCodeConnector', () => {
   it('builds headless args, forwards cwd/timeout, parses the JSON result', async () => {
@@ -88,6 +130,7 @@ describe('createClaudeCodeConnector', () => {
       [
         '-p',
         '--output-format=json',
+        '--permission-mode=acceptEdits',
         '--model=claude-sonnet-5',
         '--',
         'add tests',
@@ -133,11 +176,13 @@ describe('createCodexConnector', () => {
     // #then
     expect(exec).toHaveBeenCalledWith(
       'codex',
-      ['exec', '--model=o5', '--', 'fix the bug'],
+      ['exec', '--sandbox=workspace-write', '--model=o5', '--', 'fix the bug'],
       { cwd: undefined, timeoutMs: 600_000 },
     );
     expect(output.text).toBe('codex says hi');
-    expect(output.command).toBe('codex exec --model=o5 -- fix the bug');
+    expect(output.command).toBe(
+      'codex exec --sandbox=<value:redacted> --model=<value:redacted> -- <prompt:redacted>',
+    );
   });
 });
 
@@ -186,7 +231,7 @@ describe('agent CLI connector enforcement', () => {
     expect(output).toEqual({
       text: '',
       exitCode: 0,
-      command: 'codex exec -- refactor',
+      command: 'codex exec --sandbox=<value:redacted> -- <prompt:redacted>',
       simulated: true,
     });
     expect(exec).not.toHaveBeenCalled();
@@ -206,7 +251,7 @@ describe('agent CLI connector enforcement', () => {
     expect(output.text).toBe('ok');
   });
 
-  it('surfaces a non-zero exit as AgentCliError carrying stderr', async () => {
+  it('surfaces a non-zero exit as a safe structured AgentCliError', async () => {
     // #given
     const exec = mockExec({ exitCode: 2, stderr: 'not logged in' });
     const tool = createClaudeCodeConnector({ exec });
@@ -220,8 +265,16 @@ describe('agent CLI connector enforcement', () => {
 
     // #then
     expect(failure).toBeInstanceOf(AgentCliError);
-    expect(String(failure)).toContain('exited 2');
-    expect(String(failure)).toContain('not logged in');
+    expect(failure).toMatchObject({
+      code: 'nonzero-exit',
+      connectorId: 'agent-cli.claude-code',
+      exitCode: 2,
+      stdoutCaptured: false,
+      stderrCaptured: true,
+      command:
+        'claude -p --output-format=<value:redacted> --permission-mode=<value:redacted> -- <prompt:redacted>',
+    });
+    expect(String(failure)).not.toContain('not logged in');
   });
 
   it('supports binaryPath and id overrides for parallel configurations', async () => {
@@ -250,7 +303,7 @@ describe('agent CLI connector enforcement', () => {
       cwd: undefined,
       timeoutMs: 600_000,
     });
-    expect(output.command).toBe('/opt/bin/claude -p -- p');
+    expect(output.command).toBe('/opt/bin/claude -p -- <prompt:redacted>');
   });
 
   it('neutralizes a flag-shaped prompt by placing it behind the -- separator', async () => {
@@ -308,6 +361,317 @@ describe('agent CLI connector enforcement', () => {
     // #then
     expect(result.error).toBe(true);
     expect(exec).not.toHaveBeenCalled();
+  });
+});
+
+describe('agent CLI private-data boundaries', () => {
+  it('passes the real prompt only in argv and returns a redacted display command', async () => {
+    const audit = new AuditLogger();
+    const exec = mockExec({ stdout: 'safe result' });
+    const tool = createCodexConnector({
+      exec,
+      requiresApproval: false,
+      policies: { audit },
+    });
+
+    const output = (await run(
+      tool,
+      { prompt: PRIVATE_PROMPT },
+      makeContext(),
+    )) as { text: string; command: string };
+
+    expect(exec).toHaveBeenCalledWith(
+      'codex',
+      ['exec', '--sandbox=workspace-write', '--', PRIVATE_PROMPT],
+      {
+        cwd: undefined,
+        timeoutMs: 600_000,
+      },
+    );
+    expect(output).toEqual({
+      text: 'safe result',
+      exitCode: 0,
+      command: 'codex exec --sandbox=<value:redacted> -- <prompt:redacted>',
+    });
+    expect(JSON.stringify(output.command)).not.toContain(PRIVATE_PROMPT);
+    expect(JSON.stringify(audit.events())).not.toContain(PRIVATE_PROMPT);
+  });
+
+  it('gives buildFlags a frozen input with a redacted prompt on real and dry-run paths', async () => {
+    const audit = new AuditLogger();
+    const observed: Array<{ prompt: string; frozen: boolean }> = [];
+    const definition = privateDefinition({
+      buildFlags: (input) => {
+        observed.push({
+          prompt: input.prompt,
+          frozen: Object.isFrozen(input),
+        });
+        throw new Error(PRIVATE_PROMPT);
+      },
+    });
+    const tool = createAgentCliConnector(definition, {
+      exec: mockExec(),
+      requiresApproval: false,
+      policies: { audit },
+    });
+
+    const realFailure = await run(
+      tool,
+      { prompt: PRIVATE_PROMPT },
+      makeContext(),
+    ).catch((error: unknown) => error);
+    const dryFailure = await run(
+      tool,
+      { prompt: PRIVATE_PROMPT },
+      makeContext({ dryRun: true }),
+    ).catch((error: unknown) => error);
+
+    expect(observed).toEqual([
+      { prompt: '<prompt:redacted>', frozen: true },
+      { prompt: '<prompt:redacted>', frozen: true },
+    ]);
+    expect(realFailure).toMatchObject({ code: 'flags-failed' });
+    expect(dryFailure).toMatchObject({ code: 'flags-failed' });
+    expect(errorSurface(realFailure)).not.toContain(PRIVATE_PROMPT);
+    expect(errorSurface(dryFailure)).not.toContain(PRIVATE_PROMPT);
+    expect(JSON.stringify(audit.events())).not.toContain(PRIVATE_PROMPT);
+  });
+
+  it('contains injected executor failures and process output', async () => {
+    const audit = new AuditLogger();
+    const rejectingExec = vi
+      .fn<AgentCliExec>()
+      .mockRejectedValue(
+        new Error(`${PRIVATE_PROMPT}:${PRIVATE_PROCESS_OUTPUT}`),
+      );
+    const rejectedTool = createAgentCliConnector(privateDefinition(), {
+      exec: rejectingExec,
+      requiresApproval: false,
+      policies: { audit },
+    });
+
+    const rejected = await run(
+      rejectedTool,
+      { prompt: PRIVATE_PROMPT },
+      makeContext(),
+    ).catch((error: unknown) => error);
+
+    expect(rejected).toMatchObject({
+      code: 'exec-failed',
+      command: 'private-probe -- <prompt:redacted>',
+    });
+    expect(errorSurface(rejected)).not.toContain(PRIVATE_PROMPT);
+    expect(errorSurface(rejected)).not.toContain(PRIVATE_PROCESS_OUTPUT);
+
+    const nonzeroTool = createAgentCliConnector(privateDefinition(), {
+      exec: mockExec({
+        stdout: PRIVATE_PROCESS_OUTPUT,
+        stderr: PRIVATE_PROCESS_OUTPUT,
+        exitCode: 9,
+      }),
+      requiresApproval: false,
+      policies: { audit },
+    });
+    const nonzero = await run(
+      nonzeroTool,
+      { prompt: PRIVATE_PROMPT },
+      makeContext(),
+    ).catch((error: unknown) => error);
+
+    expect(nonzero).toMatchObject({
+      code: 'nonzero-exit',
+      exitCode: 9,
+      stdoutCaptured: true,
+      stderrCaptured: true,
+    });
+    expect(errorSurface(nonzero)).not.toContain(PRIVATE_PROMPT);
+    expect(errorSurface(nonzero)).not.toContain(PRIVATE_PROCESS_OUTPUT);
+    expect(JSON.stringify(audit.events())).not.toContain(PRIVATE_PROMPT);
+    expect(JSON.stringify(audit.events())).not.toContain(
+      PRIVATE_PROCESS_OUTPUT,
+    );
+  });
+
+  it('contains parser exceptions and malformed parser values', async () => {
+    const audit = new AuditLogger();
+    const throwing = createAgentCliConnector(
+      privateDefinition({
+        parseOutput: () => {
+          throw new Error(`${PRIVATE_PROMPT}:${PRIVATE_PROCESS_OUTPUT}`);
+        },
+      }),
+      {
+        exec: mockExec({ stdout: PRIVATE_PROCESS_OUTPUT }),
+        requiresApproval: false,
+        policies: { audit },
+      },
+    );
+    const invalid = createAgentCliConnector(
+      privateDefinition({
+        parseOutput: (() => PRIVATE_PROCESS_OUTPUT.length) as unknown as (
+          stdout: string,
+        ) => string,
+      }),
+      {
+        exec: mockExec({ stdout: PRIVATE_PROCESS_OUTPUT }),
+        requiresApproval: false,
+        policies: { audit },
+      },
+    );
+
+    const thrown = await run(
+      throwing,
+      { prompt: PRIVATE_PROMPT },
+      makeContext(),
+    ).catch((error: unknown) => error);
+    const malformed = await run(
+      invalid,
+      { prompt: PRIVATE_PROMPT },
+      makeContext(),
+    ).catch((error: unknown) => error);
+
+    expect(thrown).toMatchObject({ code: 'parse-output-failed' });
+    expect(malformed).toMatchObject({ code: 'parse-output-failed' });
+    expect(errorSurface(thrown)).not.toContain(PRIVATE_PROMPT);
+    expect(errorSurface(thrown)).not.toContain(PRIVATE_PROCESS_OUTPUT);
+    expect(errorSurface(malformed)).not.toContain(PRIVATE_PROMPT);
+    expect(errorSurface(malformed)).not.toContain(PRIVATE_PROCESS_OUTPUT);
+    expect(JSON.stringify(audit.events())).not.toContain(PRIVATE_PROMPT);
+    expect(JSON.stringify(audit.events())).not.toContain(
+      PRIVATE_PROCESS_OUTPUT,
+    );
+  });
+
+  it('contains malformed executor results and schema validation messages', async () => {
+    const audit = new AuditLogger();
+    const malformedExec = vi.fn<AgentCliExec>().mockResolvedValue({
+      stdout: PRIVATE_PROCESS_OUTPUT,
+      stderr: PRIVATE_PROCESS_OUTPUT,
+      exitCode: Number.NaN,
+    });
+    const tool = createAgentCliConnector(privateDefinition(), {
+      exec: malformedExec,
+      requiresApproval: false,
+      policies: { audit },
+    });
+
+    const malformed = await run(
+      tool,
+      { prompt: PRIVATE_PROMPT },
+      makeContext(),
+    ).catch((error: unknown) => error);
+    const validation = await run(
+      tool,
+      {
+        prompt: PRIVATE_PROMPT,
+        cwd: 42 as unknown as string,
+      },
+      makeContext(),
+    );
+
+    expect(malformed).toMatchObject({ code: 'invalid-exec-result' });
+    expect(errorSurface(malformed)).not.toContain(PRIVATE_PROMPT);
+    expect(errorSurface(malformed)).not.toContain(PRIVATE_PROCESS_OUTPUT);
+    expect(validation).toMatchObject({
+      error: true,
+      message: 'Agent CLI input or output validation failed.',
+    });
+    expect(JSON.stringify(validation)).not.toContain(PRIVATE_PROMPT);
+    expect(JSON.stringify(validation)).not.toContain(PRIVATE_PROCESS_OUTPUT);
+    expect(JSON.stringify(audit.events())).not.toContain(PRIVATE_PROMPT);
+    expect(JSON.stringify(audit.events())).not.toContain(
+      PRIVATE_PROCESS_OUTPUT,
+    );
+  });
+
+  it('redacts legacy replay commands and sanitizes invalid cached output', async () => {
+    const audit = new AuditLogger();
+    const store = new InMemoryIdempotencyStore();
+    store.put('agent-cli.codex:legacy-valid', {
+      result: {
+        text: 'cached result',
+        exitCode: 0,
+        command: `codex exec --model=${PRIVATE_PROCESS_OUTPUT} -- ${PRIVATE_PROMPT}`,
+      },
+    });
+    store.put('agent-cli.codex:legacy-invalid', {
+      result: {
+        text: 7,
+        exitCode: 0,
+        command: `codex exec -- ${PRIVATE_PROMPT}`,
+        raw: PRIVATE_PROCESS_OUTPUT,
+      },
+    });
+    const exec = mockExec();
+    const tool = createCodexConnector({
+      exec,
+      idempotencyKey: true,
+      requiresApproval: false,
+      policies: { audit, idempotencyStore: store },
+    });
+
+    const replay = await run(
+      tool,
+      { prompt: PRIVATE_PROMPT },
+      makeContext({ idempotencyKey: 'legacy-valid' }),
+    );
+    const invalid = await run(
+      tool,
+      { prompt: PRIVATE_PROMPT },
+      makeContext({ idempotencyKey: 'legacy-invalid' }),
+    );
+
+    expect(replay).toEqual({
+      text: 'cached result',
+      exitCode: 0,
+      command: '<command:redacted>',
+    });
+    expect(invalid).toMatchObject({
+      error: true,
+      message: 'Agent CLI input or output validation failed.',
+    });
+    expect(JSON.stringify(replay)).not.toContain(PRIVATE_PROMPT);
+    expect(JSON.stringify(replay)).not.toContain(PRIVATE_PROCESS_OUTPUT);
+    expect(JSON.stringify(invalid)).not.toContain(PRIVATE_PROMPT);
+    expect(JSON.stringify(invalid)).not.toContain(PRIVATE_PROCESS_OUTPUT);
+    expect(JSON.stringify(audit.events())).not.toContain(PRIVATE_PROMPT);
+    expect(JSON.stringify(audit.events())).not.toContain(
+      PRIVATE_PROCESS_OUTPUT,
+    );
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('contains evaluator exceptions at the connector boundary and in audit', async () => {
+    const audit = new AuditLogger();
+    const tool = createCodexConnector({
+      exec: mockExec(),
+      requiresApproval: false,
+      policies: {
+        audit,
+        evaluators: [
+          {
+            name: 'private-evaluator',
+            evaluate: () => {
+              throw new Error(`${PRIVATE_PROMPT}:${PRIVATE_PROCESS_OUTPUT}`);
+            },
+          },
+        ],
+      },
+    });
+
+    const failure = await run(
+      tool,
+      { prompt: PRIVATE_PROMPT },
+      makeContext(),
+    ).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ code: 'connector-failed' });
+    expect(errorSurface(failure)).not.toContain(PRIVATE_PROMPT);
+    expect(errorSurface(failure)).not.toContain(PRIVATE_PROCESS_OUTPUT);
+    expect(JSON.stringify(audit.events())).not.toContain(PRIVATE_PROMPT);
+    expect(JSON.stringify(audit.events())).not.toContain(
+      PRIVATE_PROCESS_OUTPUT,
+    );
   });
 });
 
@@ -564,6 +928,7 @@ describe('defaultExec (real node:child_process spawn)', () => {
     script: string,
     timeoutMs?: number,
     maxOutputBytes?: number,
+    audit?: AuditLogger,
   ) {
     return createAgentCliConnector(
       {
@@ -575,7 +940,12 @@ describe('defaultExec (real node:child_process spawn)', () => {
         // which Node exposes as process.argv (ignored here).
         buildFlags: () => ['-e', script],
       },
-      { timeoutMs, requiresApproval: false, maxOutputBytes },
+      {
+        timeoutMs,
+        requiresApproval: false,
+        maxOutputBytes,
+        policies: audit ? { audit } : undefined,
+      },
     );
   }
 
@@ -596,20 +966,34 @@ describe('defaultExec (real node:child_process spawn)', () => {
 
   it('SIGKILLs and rejects when the child exceeds the timeout', async () => {
     // #given — a child that would sleep far past the budget
-    const tool = nodeScriptConnector('setTimeout(() => {}, 30000)', 250);
+    const audit = new AuditLogger();
+    const tool = nodeScriptConnector(
+      'setTimeout(() => {}, 30000)',
+      250,
+      undefined,
+      audit,
+    );
 
     // #when
-    const failure = await run(tool, { prompt: 'p' }, makeContext()).catch(
-      (error: unknown) => error,
-    );
+    const failure = await run(
+      tool,
+      { prompt: PRIVATE_PROMPT },
+      makeContext(),
+    ).catch((error: unknown) => error);
 
     // #then
     expect(failure).toBeInstanceOf(AgentCliError);
-    expect(String(failure)).toContain('timed out');
+    expect(failure).toMatchObject({
+      code: 'timeout',
+      timeoutMs: 250,
+    });
+    expect(errorSurface(failure)).not.toContain(PRIVATE_PROMPT);
+    expect(JSON.stringify(audit.events())).not.toContain(PRIVATE_PROMPT);
   });
 
   it('wraps a spawn failure (nonexistent binary) as AgentCliError', async () => {
     // #given
+    const audit = new AuditLogger();
     const tool = createAgentCliConnector(
       {
         id: 'agent-cli.missing',
@@ -618,20 +1002,27 @@ describe('defaultExec (real node:child_process spawn)', () => {
         egress: [],
         buildFlags: () => [],
       },
-      { requiresApproval: false },
+      { requiresApproval: false, policies: { audit } },
     );
 
     // #when
-    const failure = await run(tool, { prompt: 'p' }, makeContext()).catch(
-      (error: unknown) => error,
-    );
+    const failure = await run(
+      tool,
+      { prompt: PRIVATE_PROMPT },
+      makeContext(),
+    ).catch((error: unknown) => error);
 
     // #then
     expect(failure).toBeInstanceOf(AgentCliError);
-    expect(String(failure)).toContain('failed to spawn');
+    expect(failure).toMatchObject({
+      code: 'spawn-failed',
+      systemCode: 'ENOENT',
+    });
+    expect(errorSurface(failure)).not.toContain(PRIVATE_PROMPT);
+    expect(JSON.stringify(audit.events())).not.toContain(PRIVATE_PROMPT);
   });
 
-  it('surfaces a nonzero child exit as AgentCliError with stderr', async () => {
+  it('surfaces a nonzero child exit without copying stderr into the error', async () => {
     // #given — writes to stderr and exits 3
     const tool = nodeScriptConnector(
       'process.stderr.write("boom"); process.exit(3)',
@@ -644,8 +1035,12 @@ describe('defaultExec (real node:child_process spawn)', () => {
 
     // #then
     expect(failure).toBeInstanceOf(AgentCliError);
-    expect(String(failure)).toContain('exited 3');
-    expect(String(failure)).toContain('boom');
+    expect(failure).toMatchObject({
+      code: 'nonzero-exit',
+      exitCode: 3,
+      stderrCaptured: true,
+    });
+    expect(String(failure)).not.toContain('boom');
   });
 
   it('caps retained stdout to the tail and marks truncation (audit D5)', async () => {

@@ -49,7 +49,7 @@ export interface InitOptions {
    */
   resumeLedger?: ResumeLedger;
   /**
-   * The host DO's ONE pubsub identity (DL-001) — `createHostPubSub()` for the
+   * The host Durable Object's single pubsub identity — `createHostPubSub()` for the
    * default in-process emitter, or any PubSub the host built. init() is where a
    * DO's identity is established: it echoes the instance on InitResult, so every
    * consumer in the isolate takes THAT one rather than building its own (core

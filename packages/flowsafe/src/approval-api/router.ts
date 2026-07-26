@@ -89,7 +89,7 @@ export const CLIENT_CREATE_FIELDS = [
 
 export interface ApprovalRouterOptions {
   /**
-   * Authenticates the request and binds the tenant-scoped service (INV-2).
+   * Authenticates the request and binds the tenant-scoped service.
    * The router's first line is `resolve(request)`; the store the service
    * wraps is constructed AFTER authentication, bound to the actor's tenant —
    * there is no pre-auth service to leak through. undefined yields 401.

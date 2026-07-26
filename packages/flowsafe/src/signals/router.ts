@@ -100,7 +100,7 @@ export type SignalRateLimiter = (
 ) => boolean | Promise<boolean>;
 
 export interface SignalRouterOptions {
-  /** authenticate → INV-3 → bind; undefined ⇒ 401 (same seam as createRunRouter). */
+  /** Authenticate, validate the tenant ID, and bind it; undefined means 401. */
   resolve: TenantResolver;
   /** The sanctioned reach into a thread DO — stamps the tenant header, 404s a foreign threadId. */
   topology: ThreadTopology;

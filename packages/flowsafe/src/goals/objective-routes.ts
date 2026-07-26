@@ -92,8 +92,8 @@ import {
  * dist/agent/goal/objective.js, which the package `exports` map does NOT expose
  * (there is no `@mastra/core/agent/goal` subpath, and neither `@mastra/core/tools`
  * nor `@mastra/core/agent` re-exports it), so importing it would mean a forbidden
- * deep dist/ import (R-001). Signals took the same mirror-not-deep-import stance
- * for core's XML-name validation. This surface never WRITES this key (P8); it is
+ * deep `dist/` import. Signals take the same mirror-not-deep-import stance
+ * for core's XML-name validation. This surface never writes this key; it is
  * reserved here only so the no-collision test pins that it does not collide with
  * the runtime's #requestContextFor base keys. The mirror is defensive-only
  * (nothing here ever writes the key), and the test suite pins it BOTH ways: the
@@ -107,7 +107,7 @@ export const GOAL_REQUEST_CONTEXT_KEY = 'mastra:goal';
  * The thread-scoped state store the goal record lives in — structurally core's
  * ResolvedGoalStore (getState/setState/deleteState over a (threadId, type)
  * pair), which core does not export through a mapped subpath, so it is mirrored.
- * A host injects Track C's `createSignalStorageDomains(binding).threadState` (a
+ * A host injects `createSignalStorageDomains(binding).threadState` (a
  * D1ThreadStateStorage) — the SAME domain the durable goal step resolves through
  * resolveGoalStore, so a record this surface writes is what the loop reads.
  */
@@ -153,9 +153,9 @@ export type ObjectiveAuditSink = (
 ) => void | Promise<void>;
 
 export interface ObjectiveRouterOptions {
-  /** authenticate -> INV-3 -> bind; undefined ⇒ 401 (the createRunRouter seam). */
+  /** Authenticate, validate the tenant ID, and bind it; undefined means 401. */
   resolve: TenantResolver;
-  /** The thread-state domain the goal record lives in (host: the Track C domain). */
+  /** The thread-state domain in which the goal record lives. */
   store: ObjectiveStore;
   /**
    * Who may SET/UPDATE/CLEAR an objective. Default RUN_START_ROLES
@@ -166,7 +166,7 @@ export interface ObjectiveRouterOptions {
   /** Every mutation (and denied read) is audited through this. Absent ⇒ no audit. */
   audit?: ObjectiveAuditSink;
   /**
-   * The ceiling on a per-objective maxRuns (DL-007). A request above it is
+   * The ceiling on a per-objective maxRuns. A request above it is
    * REJECTED; the stored record never carries a higher value. Default the core
    * DEFAULT_GOAL_MAX_RUNS (50). Must be a positive safe integer.
    */
@@ -281,7 +281,7 @@ function firstDisallowedField(
  * is the in-record correlation tag core always mints for a goal — NOT an
  * addressing/memory id (it never keys a store, addresses a DO, or crosses the
  * tenancy boundary; the whole row rides the already-tenant-salted threadId), so
- * a randomUUID here is faithful to core and untouched by INV-1's mint discipline.
+ * a randomUUID here is faithful to core and does not need a tenant prefix.
  */
 function buildSetRecord(
   body: Record<string, unknown>,

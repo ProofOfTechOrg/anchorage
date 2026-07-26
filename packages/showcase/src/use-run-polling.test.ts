@@ -5,7 +5,7 @@
 // same "prefer pure extraction over a renderer" convention the flowsafe
 // approval-ui package documents (use-approval-dashboard.render.test.ts).
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { RunSummary } from '@/run-client';
 import {
   allRunsSettled,
@@ -13,6 +13,7 @@ import {
   pollableRuns,
   type RunEntry,
   type RunResult,
+  startPollingLoop,
 } from '@/use-run-polling';
 
 function run(runId: string, workflowId = 'gtm-outbound'): RunEntry {
@@ -149,5 +150,36 @@ describe('allRunsSettled', () => {
       ['a', summaryResult('success')],
     ]);
     expect(allRunsSettled(runs, settled, new Map())).toBe(true);
+  });
+});
+
+describe('startPollingLoop', () => {
+  it('waits for each poll to settle and cancels its pending timer', async () => {
+    vi.useFakeTimers();
+    let finishFirst: ((done: boolean) => void) | undefined;
+    const first = new Promise<boolean>((resolve) => {
+      finishFirst = resolve;
+    });
+    const poll = vi
+      .fn<() => Promise<boolean>>()
+      .mockImplementationOnce(() => first)
+      .mockResolvedValue(true);
+
+    const stop = startPollingLoop(poll, 100);
+    expect(poll).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(poll).toHaveBeenCalledTimes(1);
+
+    finishFirst?.(false);
+    await first;
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(poll).toHaveBeenCalledTimes(2);
+
+    stop();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(poll).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
   });
 });

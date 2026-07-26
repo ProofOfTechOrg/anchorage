@@ -30,6 +30,7 @@ import type { PublicSchema } from '@mastra/core/schema';
 import type { Tool, ToolExecutionContext } from '@mastra/core/tools';
 import { createTool } from '@mastra/core/tools';
 import type { AuditLogger } from '../audit/index.js';
+import { safeAuditErrorSummary } from '../audit/safe-error.js';
 import type {
   NetworkEgressOptions,
   PolicyDecision,
@@ -52,6 +53,7 @@ import { newToken } from './new-token.js';
 
 /** Permission manifest — what the connector declares about itself. */
 export interface PermissionManifest {
+  /** Worst side effect the connector can cause. */
   sideEffect: SideEffect;
   /** Hostnames this connector calls; gated by the networkEgress policy. */
   egress?: readonly string[];
@@ -78,20 +80,16 @@ export interface PermissionManifest {
    */
   rateLimit?: string;
   /**
-   * Connector opts INTO Mastra background execution (DL-005). Default
-   * undefined = foreground-only: the wrapper rejects tool-call args carrying a
-   * `_background` override (core `LLMBackgroundOverride`), because a write /
-   * approval-carrying call the model silently flips to background changes its
-   * execution context, timing, and approval topology. Only a READ-ONLY
-   * connector may set this — a write-class connector opting in throws at
-   * construction (v1 keeps write connectors foreground-only). The
-   * `backgroundExecution` tool-policy evaluator is the defense-in-depth
-   * counterpart at the policy layer.
+   * Allow Mastra background intent for this connector. The default is
+   * foreground-only. Only a read-only connector may enable this field;
+   * write-class connectors fail at construction.
    */
   background?: boolean;
 }
 
+/** Completed result stored for idempotent replay. */
 export interface IdempotencyRecord {
+  /** Connector result returned by future calls with the same scoped key. */
   result: unknown;
 }
 
@@ -105,14 +103,16 @@ export interface IdempotencyRecord {
  * missing get() and both executing. D1IdempotencyStore ships that shape.
  */
 export interface IdempotencyStore {
+  /** Return the completed record for a scoped key, or `undefined` on a miss. */
   get(
     key: string,
   ): IdempotencyRecord | undefined | Promise<IdempotencyRecord | undefined>;
   /**
    * Finalize a key's record. `token` is the lease returned by an atomic
    * reserve(): when supplied, the store finalizes ONLY if the key still
-   * belongs to that lease (audit D2 CAS) — a stale, taken-over holder's put
-   * is a no-op. Omitted on the legacy get/put path, which upserts
+   * belongs to that lease. A stale holder whose lease was taken over cannot
+   * overwrite the new result. Omit the token on the legacy get/put path,
+   * which upserts
    * unconditionally (same-isolate protection only).
    */
   put(
@@ -123,23 +123,28 @@ export interface IdempotencyStore {
 }
 
 /**
- * Outcome of an atomic reserve():
- * - 'reserved' — this caller claimed the key: execute, then put(token);
- *   release(token) after a failed execute so the key stays retryable. The
- *   opaque `token` is the reservation lease — put()/release() compare-and-set
- *   on it, so a holder whose reservation was taken over as stale (audit D2)
- *   can no longer finalize or delete the new holder's claim. `tookOver` is
- *   set when the claim came from a stale-pending takeover rather than a fresh
- *   key (D1IdempotencyStore's pendingTtlMs) — worth a dedicated audit signal,
- *   since a takeover fired too early means the previous holder may still be
- *   executing (audit D2).
- * - 'replay'   — a completed execution's record: return it, do not execute.
- * - 'pending'  — another isolate is executing this key right now.
+ * Outcome of an atomic reservation: execute a newly reserved key, replay a
+ * completed record, or report that another isolate still owns the key.
  */
 export type IdempotencyReservation =
-  | { state: 'reserved'; token: string; tookOver?: boolean }
-  | { state: 'replay'; record: IdempotencyRecord }
-  | { state: 'pending' };
+  | {
+      /** This caller owns the reservation and may execute. */
+      state: 'reserved';
+      /** Opaque lease required to finalize or release the reservation. */
+      token: string;
+      /** Whether this reservation replaced a stale pending holder. */
+      tookOver?: boolean;
+    }
+  | {
+      /** A completed result exists and must be replayed without execution. */
+      state: 'replay';
+      /** Completed result associated with the key. */
+      record: IdempotencyRecord;
+    }
+  | {
+      /** Another isolate owns a non-stale reservation. */
+      state: 'pending';
+    };
 
 /**
  * Idempotency store with an atomic claim — the shape durable, cross-isolate
@@ -148,14 +153,15 @@ export type IdempotencyReservation =
  * wrapper prefers this path whenever a store implements it.
  */
 export interface AtomicIdempotencyStore extends IdempotencyStore {
+  /** Atomically reserve a scoped key or return its current state. */
   reserve(
     key: string,
   ): IdempotencyReservation | Promise<IdempotencyReservation>;
   /**
    * Drop a pending reservation after a failed execute — failures stay
    * retryable. `token` is the lease from reserve(): when supplied, only the
-   * matching lease's pending row is dropped (audit D2 CAS), so a stale,
-   * taken-over holder cannot delete the new holder's claim.
+   * matching lease's pending row is dropped, so a stale holder cannot delete
+   * a newer claim.
    */
   release(key: string, token?: string): void | Promise<void>;
 }
@@ -209,10 +215,12 @@ export class InMemoryIdempotencyStore implements AtomicIdempotencyStore {
     this.#maxEntries = options.maxEntries ?? 1000;
   }
 
+  /** Return a completed in-memory record, or `undefined` on a miss. */
   get(key: string): IdempotencyRecord | undefined {
     return this.#entries.get(key);
   }
 
+  /** Atomically reserve a key within this JavaScript isolate. */
   reserve(key: string): IdempotencyReservation {
     const record = this.#entries.get(key);
     if (record) return { state: 'replay', record };
@@ -247,6 +255,7 @@ export class InMemoryIdempotencyStore implements AtomicIdempotencyStore {
     }
   }
 
+  /** Remove all completed records and pending reservations. */
   clear(): void {
     this.#entries.clear();
     this.#pending.clear();
@@ -293,17 +302,20 @@ export class InMemoryRateLimitStore implements RateLimitStore {
 
 /** Org-level policy bindings enforced by the connector's execute wrapper. */
 export interface ConnectorPolicies {
+  /** Organization allowlist applied to the manifest's declared hosts. */
   networkEgress?: NetworkEgressOptions;
+  /** Organization approval rules for write-class connector IDs. */
   writePermissions?: WritePermissionsPolicy;
   /**
    * Custom tool-boundary evaluators, run pre-execute after the built-in
-   * network-egress gate, in registration order. The slot later policy
-   * domains (e.g. retention/isolation pre-checks) plug into.
+   * network-egress gate, in registration order.
    */
   evaluators?: readonly ToolPolicyEvaluator[];
+  /** Store used when the manifest requires an idempotency key. */
   idempotencyStore?: IdempotencyStore;
   /** Required when the manifest declares `rateLimit`. */
   rateLimitStore?: RateLimitStore;
+  /** Optional audit logger for connector decisions and failures. */
   audit?: AuditLogger;
   /**
    * Base fetch the per-call egress guard wraps before handing it to
@@ -327,14 +339,21 @@ export interface ConnectorPolicies {
  * declaration-only.
  */
 export interface ConnectorRuntime {
+  /** Fetch guarded by the connector manifest's declared egress hosts. */
   fetch: EgressGuardedFetch;
 }
 
+/** Definition compiled by `createConnector()` into an enforced Mastra tool. */
 export interface ConnectorConfig<TInput = unknown, TOutput = unknown> {
+  /** Stable, colon-free connector identifier. */
   id: string;
+  /** Description presented to the model and tool consumers. */
   description: string;
+  /** Optional schema that Mastra validates before connector policies run. */
   inputSchema?: PublicSchema<TInput>;
+  /** Optional schema that Mastra validates after execution. */
   outputSchema?: PublicSchema<TOutput>;
+  /** Execute the connector after every configured gate has allowed the call. */
   execute: (
     inputData: TInput,
     context: ToolExecutionContext,
@@ -352,6 +371,7 @@ export interface ConnectorConfig<TInput = unknown, TOutput = unknown> {
     context: ToolExecutionContext,
     runtime: ConnectorRuntime,
   ) => Promise<TOutput>;
+  /** Enforced declaration of side effects and supported controls. */
   permissions: PermissionManifest;
   /** Omit for an ungated connector (classification + audit only). */
   policies?: ConnectorPolicies;
@@ -362,9 +382,8 @@ export interface ConnectorConfig<TInput = unknown, TOutput = unknown> {
  * request. A capability token — whoever can write this key can authorize
  * any write-class connector — so it must only ever be set by trusted
  * server-side code after an out-of-band approval, never derived from client
- * input, model output, or tool results. The flowsafe approval API (Phase 3)
- * mints these on resume and is part of the trusted computing base. See
- * docs/security-threat-model.md, trust boundary 6.
+ * input, model output, or tool results. A trusted approval service can mint
+ * these grants when it resumes an approved run.
  */
 export const APPROVED_CONNECTORS_CONTEXT_KEY = 'breakwater.approvedConnectors';
 
@@ -384,9 +403,13 @@ export const IDEMPOTENCY_KEY_CONTEXT_KEY = 'breakwater.idempotencyKey';
  */
 export const DRY_RUN_CONTEXT_KEY = 'breakwater.dryRun';
 
+/** Policy denial raised before a connector side effect is allowed to run. */
 export class ConnectorPolicyError extends Error {
+  /** Connector ID associated with the denial. */
   readonly connector: string;
+  /** Name of the policy that denied the call. */
   readonly policy: string;
+  /** Policy-supplied denial reason. */
   readonly reason: string;
 
   constructor(connector: string, policy: string, reason: string) {
@@ -662,9 +685,10 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     ) {
       return;
     }
+    const safe = safeAuditErrorSummary(error);
     record(requestContext, 'error', {
-      reason: `execute threw: ${errorMessage(error)}`,
-      detail: { stage: 'execute', ...detail },
+      reason: safe?.reason ?? 'connector execution failed',
+      detail: { stage: 'execute', ...safe?.detail, ...detail },
     });
   }
 
@@ -709,7 +733,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     } catch (error) {
       // Fail closed: an unbudgeted execution would break the declared cap.
       record(requestContext, 'error', {
-        reason: `rate-limit store increment failed: ${errorMessage(error)}`,
+        reason: 'rate-limit store increment failed',
         detail: { stage: 'rate-limit-store' },
       });
       throw markAudited(error);
@@ -722,11 +746,11 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   function recordStoreError(
     requestContext: RequestContext | undefined,
     op: 'get' | 'put' | 'reserve' | 'release',
-    error: unknown,
+    _error: unknown,
     key: string,
   ): void {
     record(requestContext, 'error', {
-      reason: `idempotency store ${op} failed: ${errorMessage(error)}`,
+      reason: `idempotency store ${op} failed`,
       detail: { stage: 'idempotency-store', idempotencyKey: key },
     });
   }
@@ -889,7 +913,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
           // Mirror PolicyEngine: an evaluator crash must not leave less
           // audit evidence than a denial. Record, then fail closed.
           record(requestContext, 'error', {
-            reason: `${gate.name} threw: ${errorMessage(error)}`,
+            reason: `${gate.name} evaluator failed`,
             detail: { policy: gate.name },
           });
           throw error;

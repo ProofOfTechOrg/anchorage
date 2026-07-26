@@ -1,0 +1,181 @@
+# Approval system
+
+Flowsafe turns a Mastra suspension into a durable, tenant-bound approval request. An approval resumes the run through its owning Durable Object and gives the resumed leg only the connector capabilities stored on that record. A rejection resumes with `approved: false` and no connector grant so the workflow can handle the denial.
+
+Use this system for human authorization of side effects. Do not use a client-provided boolean, a raw resume body, or a model response as proof of approval.
+
+## Lifecycle
+
+```text
+workflow or agent reaches a gate
+        |
+        v
+run snapshot records suspendedAt + resumeCount
+        |
+        v
+trusted host bridge creates one open approval
+        |
+        +--> notification sink and live-stream sink
+        |
+reviewer claims, delegates, approves, or rejects
+        |
+        v
+CAS commits the terminal decision
+        |
+        +--> approved: prepare runtime if needed, derive grants, resume with approved: true
+        |
+        +--> rejected: resume with approved: false and no grant
+        |
+        v
+another suspension creates a new record; terminal run ends the loop
+```
+
+The database decision and the resume are separate operations. Once a CAS commits an approval or rejection, a failed resume does not roll the decision back. Redrive the decided record through the trusted resume path.
+
+## Approval states
+
+| Status | Meaning | Decidable |
+| --- | --- | --- |
+| `pending` | Open and unclaimed | Yes |
+| `claimed` | Assigned to a reviewer | Yes |
+| `escalated` | SLA expired; still open with higher visibility | Yes |
+| `approved` | Terminal approval | No |
+| `rejected` | Terminal rejection | No |
+
+Only terminal records are eligible for approval retention. An old open request is still a live authorization decision and is never age-purged.
+
+## Create records at the trusted boundary
+
+`queueApprovalForSuspension()` is the normal creation path. It observes the authoritative run summary and records:
+
+- `tenantId` from the tenant-bound store
+- `workflowId` and server-minted `runId`
+- the suspended `stepPath`
+- `suspendedAt` and the runtime-owned `resumeCount`
+- `requestedBy` from the human who advanced the run
+- `connectors` from the server-authored suspend payload
+- an optional server-authored durable-agent `resumeTarget`
+
+The HTTP create route is disabled by default. If a host enables it, the router rejects every field that could select a capability, change attribution, or choose a resume target. An HTTP-created request can collect a human decision, but cannot mint a connector grant.
+
+Do not derive a suspension's `connectors` array from workflow input, model output, signal attributes, or another client-controlled value.
+
+## Derive grants from stored decisions
+
+`approvalGrantProvider(tenantBoundStore)` reads approved records on every start or resume. A step-bound grant is available only when all of these values match the leg being resumed:
+
+- tenant
+- workflow and run
+- step path
+- `suspendedAt`
+- `resumeCount`
+
+This pairing keeps multiple suspensions of the same step distinct even when their millisecond timestamps collide. An older approval is spent when the step suspends again.
+
+A trusted host can create an explicit `runScoped` record for a standing grant. A step-less record without `runScoped: true` mints nothing. The suspend bridge never creates run-scoped grants.
+
+The derived connector ids are written to `breakwater.approvedConnectors` in the Mastra request context. They never cross the public API in a resume payload.
+
+## Enforce separation of duties
+
+`ApprovalService` denies self-decision by default. The current decider cannot:
+
+- decide a record they requested;
+- decide a later gate when they approved an earlier gate that led to it.
+
+The second check pages the complete approved history for the run, so an older gate cannot disappear behind a bounded list.
+
+Set `APPROVAL_ALLOW_SELF_DECISION` only when your operating model has no independent reviewer. Prefer a role list such as `admin` over `true`. Every permitted self-decision is marked in audit detail.
+
+Roles are enforced server-side:
+
+- `reviewer` and `admin` can perform review operations according to the service rules.
+- Other roles may list or inspect only where the host's configured policy permits it.
+- Per-workflow start and resume authorization belongs to the run router, not the approval record.
+
+Authentication and actor-to-role mapping remain host responsibilities.
+
+## REST API
+
+The default base path is `/api/approvals`.
+
+| Method and path | Purpose |
+| --- | --- |
+| `GET /api/approvals` | List the tenant's records |
+| `GET /api/approvals/metrics` | Return queue metrics |
+| `GET /api/approvals/:id` | Read one record |
+| `POST /api/approvals/:id/claim` | Claim an open record |
+| `POST /api/approvals/:id/delegate` | Delegate to another reviewer |
+| `POST /api/approvals/:id/decide` | Approve or reject one record |
+| `POST /api/approvals/batch/decide` | Decide up to 100 records through the same per-record checks |
+| `POST /api/approvals` | Optional, capability-free create route; disabled by default |
+
+List filters include `status`, `workflowId`, `runId`, `claimedBy`, `requestedBy`, strict `createdBefore` and `createdAfter` bounds, `limit`, `after`, and `orderBy`.
+
+`orderBy=created` is FIFO and supports cursor pagination. `orderBy=reviewer` sorts by priority, nearest SLA deadline, then FIFO; it cannot be combined with `after`.
+
+Batch decisions return per-record outcomes. They are not a transaction across the batch, and partial success is expected when ownership, status, or separation-of-duties checks differ.
+
+## Concurrency behavior
+
+Both D1 and in-memory stores implement compare-and-swap transitions:
+
+- one open request exists for a suspension;
+- competing claims cannot both win;
+- a terminal decision cannot be overwritten;
+- a delegate or decision that loses a race receives the current state;
+- record creation retries the D1 decision race instead of returning a phantom conflict.
+
+The service always routes batch work through the same single-record methods. Batch APIs do not bypass authorization, attribution, notification, audit, or resume logic.
+
+## SLA and notifications
+
+`sweepSLA(systemStore, options)` reads across tenants and transitions overdue open requests to `escalated`. It accepts a `SystemApprovalStore`, which a tenant request handler cannot obtain. Run it from a scheduled Worker invocation, never an HTTP route.
+
+`ApprovalNotificationSink` receives contained callbacks when a record is created or escalated. A transport failure does not undo the approval mutation; flowsafe writes an `approval.notify` audit failure.
+
+`ApprovalStreamSink` carries mutation events to the live hub. It is also contained and must not be treated as the source of record truth.
+
+## Dashboard and live updates
+
+`@proofoftech/flowsafe/approval-ui` provides:
+
+- `ApprovalApiClient`, which has no DOM dependency;
+- `createApprovalDashboard()` for a mounted plain-HTML dashboard;
+- `useApprovalDashboard()` for headless React integration;
+- queue, detail, filters, metrics, and batch-decision views;
+- injected slots through `ApprovalUIComponents`;
+- WebSocket transport, optimistic decision state, live merge, presence, toast slots, and polling reconciliation.
+
+React and React DOM are optional peers required only for this subpath. The component contract supports React 18 and 19.
+
+Live streaming is optional. When the host has both a `HUB` Durable Object binding and `STREAM_TICKET_SECRET`, an authenticated client can mint a short-lived HMAC ticket and open:
+
+- a tenant queue channel at `/api/stream/hub`;
+- a run channel at `/api/stream/run/:workflowId/:runId`.
+
+The ticket carries addressing data, not approval authority. The Worker verifies it; each Durable Object rebinds the addressed tenant or run through `idFromName()`. Polling remains the reconciliation path if a socket fails or streaming is absent.
+
+## Resume failure recovery
+
+An approval may be terminal while its resume result reports failure. Causes include a transient Durable Object failure, an evicted durable-agent isolate that needs preparation, or a downstream step error.
+
+Recovery rules:
+
+1. Read the stored record and authoritative run status.
+2. Do not create another approval for the same suspension.
+3. For a workflow, invoke the trusted resume bridge again.
+4. For a durable agent, validate the persisted memory binding, call `prepare()` to restore the in-process tool registry, observe/register the stream, then resume through `RunnerRuntime`.
+5. Let `approvalGrantProvider()` derive the same approved capability from D1.
+6. If the run immediately suspends at another gate, queue a new approval for the new fingerprint.
+
+Never copy `breakwater.approvedConnectors` into a recovery request.
+
+## Retention and audit
+
+- `purgeExpiredApprovals()` deletes only `approved` and `rejected` records past the configured age.
+- `purgeTenant()` removes all of a tenant's approvals during offboarding, including open records.
+- Approval audit events use the same structural sink as breakwater, so one logger or queue can carry the complete enforcement narrative.
+- The full `ApprovalRecord` may contain reviewer context. Treat notification and stream sinks as tenant-confidential channels.
+
+See [Deployment reference](deployment-reference.md), [Operations runbook](operations-runbook.md), and [Security threat model](security-threat-model.md) before production.

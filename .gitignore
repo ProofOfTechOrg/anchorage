@@ -8,6 +8,7 @@
 !/.github/
 !/packages/
 !/docs/
+!/scripts/
 # Git hooks (husky's runtime shim dir keeps itself out via .husky/_/.gitignore)
 !/.husky/
 
@@ -24,6 +25,7 @@
 !/pnpm-workspace.yaml
 !/README.md
 !/SECURITY.md
+!/SUPPORT.md
 !/tsconfig.base.json
 !/typedoc.json
 !/vitest.config.ts

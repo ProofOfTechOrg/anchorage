@@ -74,9 +74,9 @@ export interface ApprovalStore {
    * FIFO, byReviewerOrder) under 'reviewer' — applied BEFORE filter.limit,
    * so a bounded page is the top of the reviewer queue. Bounded by
    * filter.limit/filter.after; a tenant-bound bare list() with no limit
-   * defaults to MAX_APPROVAL_LIST_LIMIT (D3: an unbounded list() repeated on
-   * every dashboard poll is a full-table scan), so page complete history with
-   * an explicit `after` cursor. The cron-only SystemApprovalStore view stays
+   * defaults to MAX_APPROVAL_LIST_LIMIT so repeated dashboard polls cannot
+   * trigger unbounded full-table scans. Page complete history with an
+   * explicit `after` cursor. The cron-only SystemApprovalStore view stays
    * complete (no default) for reconciliation and the SLA sweep.
    */
   list(filter?: ApprovalListFilter): Promise<ApprovalRecord[]>;
@@ -93,10 +93,10 @@ export interface ApprovalStore {
   ): Promise<ApprovalRecord | null>;
   /**
    * Aggregate queue metrics for this store's tenant — field semantics on
-   * ApprovalMetrics (types.ts), computed here instead of by the caller
-   * loading every record into JS (D3: metrics() used to do exactly that).
-   * `nowMs` is the SLA-breach reference instant (the service's injected
-   * clock), keeping the computation deterministic under tests.
+   * ApprovalMetrics (types.ts), computed here instead of requiring callers
+   * to load every record into JavaScript. `nowMs` is the SLA-breach
+   * reference instant (the service's injected clock), keeping the
+   * computation deterministic under tests.
    */
   metrics(nowMs: number): Promise<ApprovalMetrics>;
 }
@@ -106,13 +106,14 @@ export interface ApprovalStore {
  * paging — the shared complete-internal-reader that BOTH grant derivation
  * (approvedConnectorsForLeg, grants.ts) and the cross-gate SoD bar
  * (ApprovalService.decide) depend on, so the two can never drift. A single
- * default-bounded page is WRONG for either: the D3 default caps a bare list()
- * at MAX_APPROVAL_LIST_LIMIT, so a many-gate run's NEWEST approvals sit past the
- * first page under FIFO 'created' order — dropping them fails the grant CLOSED
- * and the SoD bar OPEN. Both callers are fail-closed COMPLETE readers, so this
- * pages to exhaustion. The `workflowId`+`runId` predicates are LOAD-BEARING and
- * must never be "optimized away" in favor of the store's tenant binding: under
- * INV-1 a salted runId belongs to exactly one tenant, so they keep the read
+ * default-bounded page is insufficient for either: a bare list() is capped at
+ * MAX_APPROVAL_LIST_LIMIT, so a many-gate run's newest approvals sit past the
+ * first page under FIFO 'created' order. Dropping them fails the grant closed
+ * and the separation-of-duties check open. Both callers are fail-closed
+ * complete readers, so this pages to exhaustion. The `workflowId`+`runId`
+ * predicates are load-bearing and must never be "optimized away" in favor of
+ * the store's tenant binding: under
+ * a tenant-salted runId belongs to exactly one tenant, so they keep the read
  * tenant-safe even from an unbound or mis-bound store (the binding is defense in
  * depth, not the fix) — grants.test.ts pins them on every page with a spy store.
  * 'created' FIFO is the ONLY after-cursor-compatible order (approvalListOrder
@@ -300,8 +301,8 @@ function clone(record: ApprovalRecord): ApprovalRecord {
 }
 
 /**
- * In-memory reference implementation, BOUND to one tenant at construction
- * (INV-2). Mirrors D1ApprovalStore semantics — both run the same contract
+ * In-memory reference implementation, bound to one tenant at construction.
+ * Mirrors D1ApprovalStore semantics — both run the same contract
  * test suite, including the cross-tenant cases over ONE shared backend (pass
  * the same `records` Map to two instances; the InMemoryApprovalStoreFactory
  * does exactly that). CAS atomicity holds because the check-and-mutate

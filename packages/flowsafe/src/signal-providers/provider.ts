@@ -28,6 +28,8 @@ import type { SendNotificationSignalInput } from '@mastra/core/notifications';
 import type { SignalSubscription } from '@mastra/core/signals';
 import { SignalProvider } from '@mastra/core/signals';
 
+import { nonnegativeSafeInteger } from '../numeric-config.js';
+
 export type { SendNotificationSignalInput } from '@mastra/core/notifications';
 export type { SignalSubscription } from '@mastra/core/signals';
 
@@ -61,7 +63,10 @@ export interface ProviderDelivery {
  */
 export interface SignalProviderAdapter {
   readonly id: string;
-  /** Poll cadence in ms for the host DO's alarm; absent/0 ⇒ webhook-only (no alarm). */
+  /**
+   * Poll cadence in ms for the host DO's alarm. Absent/0 disables automatic
+   * alarms; a supplied `pollForDeliveries` remains callable through `/poll`.
+   */
   readonly pollInterval?: number;
   /**
    * Verify a webhook's provider signature over the RAW request bytes, BEFORE the
@@ -96,12 +101,10 @@ export interface SignalProviderAdapter {
 }
 
 /**
- * Provider-id charset: a lowercase slug with NO underscore, because a provider
- * host DO is named `${tenantId}_${providerId}` and the tenant is decoded by the
- * FIRST '_' (tenantOfRunId) — a '_' in the providerId would split the name at
- * the wrong place. Kept stricter than PATH_SAFE_ID_PATTERN for exactly that
- * reason (the same discipline TENANT_ID_PATTERN keeps for the other half of the
- * join).
+ * Provider-id charset: a stable lowercase URL/config slug. The provider host is
+ * addressed by the bare tenant id, not by a tenant/provider composite; this
+ * deliberately strict grammar keeps provider ids portable across route
+ * segments, configuration keys, audit dimensions, and durable rows.
  */
 export const PROVIDER_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
@@ -143,7 +146,7 @@ export interface WebhookSignalProviderConfig {
 }
 
 /**
- * A generic webhook signal provider (the DL-017 generic path). Extends core's
+ * A generic webhook signal provider. Extends core's
  * `SignalProvider` so it remains a real, mergeable provider for in-process
  * `new Agent({ signals: [p] })` use, while implementing the flowsafe adapter the
  * DO host + webhook route drive. GitHub (github-provider.ts) is a specialization
@@ -168,12 +171,18 @@ class WebhookSignalProviderAdapter
     super();
     if (!PROVIDER_ID_PATTERN.test(config.id)) {
       throw new Error(
-        `signal provider id '${config.id}' must match ${PROVIDER_ID_PATTERN} (lowercase slug, no '_': it delimits the tenant in the host-DO name)`,
+        `signal provider id '${config.id}' must match ${PROVIDER_ID_PATTERN} (stable lowercase URL/config slug)`,
       );
     }
     this.id = config.id;
     this.name = config.name;
-    this.pollInterval = config.pollInterval;
+    this.pollInterval =
+      config.pollInterval === undefined
+        ? undefined
+        : nonnegativeSafeInteger(
+            config.pollInterval,
+            `signal provider '${config.id}' pollInterval`,
+          );
     this.buildNotification = config.buildNotification;
     const { verifyWebhookSignature, extractResourceIds, pollForDeliveries } =
       config;

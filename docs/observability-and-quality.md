@@ -1,64 +1,257 @@
-# Observability And Quality
+# Observability and quality
 
-Mastra provides OTel tracing, Studio visual debugger, 20+ evaluation scorers, and Langfuse/Datadog/Sentry exporters. Anchorage adds approval-specific observability for the flowsafe layer.
+Mastra supplies traces, execution events, evaluation, and its own observability integrations. Anchorage adds decision-oriented evidence around policy, connectors, approvals, tenant boundaries, unattended starts, maintenance, and durable recovery.
 
-## Mastra Surfaces (Used As-Is)
+Use both. A trace explains what executed; an Anchorage audit event explains what a specific enforcement point allowed, denied, or failed.
 
-- Run list and current status (Mastra Studio)
-- Per-run timeline (Mastra Studio)
-- Trace inspection and replay (Mastra Studio)
-- Eval scorer results (Mastra Studio)
+## Audit logger
 
-## Anchorage Addition: Approval Metrics
+`AuditLogger` keeps a bounded in-memory ring and calls an optional sink:
 
-| Metric | Source | Description |
-|---|---|---|
-| `approval.pending.count` | flowsafe API | Number of pending approvals |
-| `approval.sla_breach.count` | flowsafe API | Approvals past their SLA |
-| `approval.avg_resolution_time` | flowsafe API | Mean time to approve or reject |
-| `approval.escalation.count` | flowsafe API | Escalations triggered |
+```typescript
+import {
+  AuditLogger,
+  combineAuditSinks,
+  metricsAuditSink,
+} from '@proofoftech/breakwater/audit';
+import { queueAuditSink } from '@proofoftech/flowsafe/audit-export';
 
-Metrics are read through the caller's tenant-bound store, so
-`GET /api/approvals/metrics` reports that tenant's queue, never the fleet's.
+const audit = new AuditLogger({
+  maxBuffered: 1_000,
+  sink: combineAuditSinks(
+    metricsAuditSink(metrics),
+    queueAuditSink(queue),
+  ),
+  onSinkError: (error, event) => {
+    console.error('audit sink failed', {
+      action: event.action,
+      decision: event.decision,
+      error,
+    });
+  },
+});
+```
 
-## Anchorage Addition: Metrics Over Audit Events
+Sink failure does not change the gated application decision. The event remains in the ring until eviction. This improves application availability but means export health needs a separate alert.
 
-breakwater's `metricsAuditSink(recorder)` adapts the audit stream onto any
-`{increment, observe}`-shaped metrics client (StatsD, Prometheus push, OTel):
-every event increments `breakwater.audit.decision` tagged
-`{action, decision}` — so denials, tripwires, rate-limit rejections, and SLA
-escalations are queryable without enumerating actions — and any event
-carrying a finite, non-negative `detail.durationSeconds` observes
-`breakwater.audit.duration_seconds` tagged `{action}` (flowsafe's `decide()`
-emits queue dwell time on this convention). `combineAuditSinks(...)` fans one
-`AuditLogger` out to several sinks — e.g. metrics alongside the Queues → SIEM
-export — isolating per-sink failures. Counters and histograms only; Mastra's
-OTel tracing is not duplicated.
+`combineAuditSinks()` invokes every sink and aggregates synchronous and asynchronous failures after all sinks settle.
 
-## Anchorage Addition: Approval Notifications
+## Audit-derived metrics
 
-`ApprovalNotificationSink` is the reviewer-facing transport seam: fired once
-per record actually entering the queue (`created`) and once per SLA
-escalation (`escalated`), contained fire-and-forget — a throwing or rejecting
-transport audits as `approval.notify`/'error' and never fails the approval
-action. flowsafe ships NO transport; hosts wire email/chat/pager adapters
-through `HostApprovalServiceOptions.notify`, `SweepSLAOptions.notify`, or
-`createFlowsafeWorker`'s `notify` hook. The event carries the full
-`ApprovalRecord` (reviewer context); transports addressing lower-trust
-channels must project/redact — see the threat model.
+`metricsAuditSink()` uses a structural recorder:
 
-## Audit Export
+```typescript
+interface MetricsRecorder {
+  increment(name: string, tags?: Record<string, string>): void;
+  observe(
+    name: string,
+    value: number,
+    tags?: Record<string, string>,
+  ): void;
+}
+```
 
-Audit log is exported as JSON Lines via Cloudflare Queues for SIEM ingestion.
-Each line is a single audit event in the schema defined in
-`security-threat-model.md`. Approval-service events carry `tenantId` in
-`detail`; the SLA sweep — the one cross-tenant writer — would otherwise emit
-unattributable escalations. Export deliberately co-batches all tenants into one
-NDJSON POST: payload-level tagging is sufficient for a shared SIEM, and
-per-tenant fan-out is a non-goal.
+It records:
 
-## Quality Gates
+| Metric | Tags | Meaning |
+| --- | --- | --- |
+| `breakwater.audit.decision` | `action`, `decision` | One audit verdict |
+| `breakwater.audit.duration_seconds` | `action` | Non-negative finite `detail.durationSeconds`, when supplied |
 
-- Connector idempotency verification (post-execution check for duplicate keys)
-- Policy compliance checks (did execution violate any pre-gate policy?)
-- Approval SLA attainment (percentage of approvals resolved within SLA)
+This adapter does not create tracing spans or define a backend-specific metrics package.
+
+## Approval metrics
+
+`GET /api/approvals/metrics` returns the authenticated tenant's aggregate:
+
+```typescript
+interface ApprovalMetrics {
+  openCount: number;
+  slaBreachedCount: number;
+  escalationCount: number;
+  decidedCount: number;
+  approvedCount: number;
+  rejectedCount: number;
+  avgResolutionSeconds: number | null;
+}
+```
+
+D1 computes this through SQL aggregation rather than loading every record into the Worker. The in-memory store uses equivalent reduction.
+
+Useful derived service indicators:
+
+- approval backlog by tenant;
+- breached/open ratio;
+- approval and rejection rate;
+- decision latency percentiles from events or traces;
+- resume success after an approved decision;
+- re-suspension frequency;
+- reviewer conflict and separation-of-duties denial rate.
+
+The built-in aggregate reports a mean, not percentiles.
+
+## Approval notifications
+
+`ApprovalNotificationSink` receives `created` and `escalated` events. A failure emits an `approval.notify` error event and does not reverse the record mutation.
+
+The event contains a full approval record. Project or redact it before sending to an email, chat, or pager channel with lower trust than the approval dashboard.
+
+Track notification-delivery success separately from approval creation. “Record exists” and “reviewer was notified” are different service levels.
+
+## Live-stream observability
+
+`ApprovalStreamSink` emits mutation frames to the tenant hub. The run Durable Object emits complete `RunSummary` frames.
+
+Clients retain polling:
+
+- approval polling continuously reconciles queue/metrics drift;
+- run polling pauses while the socket is healthy and resumes after closure;
+- heartbeat/liveness detects a socket that appears open but no longer delivers.
+
+Monitor ticket-mint failures, WebSocket upgrade failures, unexpected closures, reconnect rate, and poll-reconciliation corrections.
+
+Live delivery is not the source of truth. D1 and run status are.
+
+## Signals, schedules, tasks, and providers
+
+Opt-in domains have their own structured audit types:
+
+- `signal.ingest`: tenant, actor, thread, channel, outcome, reason, and content bytes;
+- `schedule.route`: authenticated schedule CRUD outcome;
+- `schedule.fire`: claim, skip, start, or failure details;
+- objective mutations;
+- subscription route and webhook verification outcomes;
+- provider polling and delivery;
+- background-task lifecycle and cleanup;
+- notification dispatch.
+
+Post-auth denials that look like probes are audited. Anonymous rejection is deliberately bounded or omitted on high-volume webhook/signal boundaries so an attacker cannot create unbounded evidence storage.
+
+## Maintenance logs
+
+The composed Worker emits structured configuration and maintenance results for:
+
+- SLA sweep;
+- workflow and approval retention;
+- thread, notification, thread-state, trigger, and task retention;
+- deployment-owned purge duties;
+- unknown cron expressions;
+- provider alarm reconciliation;
+- Queue export.
+
+Each duty has its own failure boundary. Alert on both explicit error events and the absence of an expected success heartbeat.
+
+## Queue and SIEM export
+
+`queueAuditSink()` sends events to Cloudflare Queues. `createAuditQueueConsumer()`:
+
+1. optionally transforms each event;
+2. serializes a batch as NDJSON;
+3. posts to the collector;
+4. acknowledges only on a 2xx response;
+5. retries the batch otherwise.
+
+Configure Queue retry and a dead-letter queue. Monitor:
+
+- producer send failures;
+- queue age and depth;
+- consumer invocation and HTTP status;
+- retry count;
+- dead-letter arrival;
+- collector parse failures;
+- tenant/event schema drift.
+
+The consumer co-batches tenants. Enforce tenant-aware access in the SIEM.
+
+## Safe error surfaces
+
+Arbitrary thrown values are untrusted. A connector, evaluator, process, parser, store, or provider can throw secrets.
+
+Breakwater's safe-error registry lets a built-in error expose a static audit reason and bounded metadata. Unregistered throws use a static class-level reason.
+
+Agent CLI errors additionally guarantee:
+
+- prompt-free command display;
+- no stdout/stderr body in error or audit;
+- sanitized system error code;
+- booleans for captured output;
+- numeric exit/timeout data only.
+
+Do not log caught errors again through a generic serializer without reapplying the same policy.
+
+## Recommended dashboards
+
+### Guardrails
+
+- decisions by `action` and `decision`;
+- deny and error rate by connector/policy;
+- classifier timeout and failure;
+- detected PII/secret category, without matched text;
+- egress declaration and runtime-fetch denial;
+- idempotency reservation, replay, pending, takeover, and store degradation;
+- rate-limit denial by tenant-scoped connector.
+
+### Approvals
+
+- open, breached, escalated, approved, and rejected counts;
+- resolution time;
+- self-decision and cross-gate denial;
+- decision CAS conflict;
+- resume failure and redrive;
+- queue notification failure.
+
+### Durable execution
+
+- start/resume/status latency and errors;
+- runs by current status and age;
+- suspended runs by workflow and gate age;
+- restart recovery;
+- live socket connections and reconciliation;
+- purge rows/artifacts by domain and failures.
+
+### Long-running agents
+
+- active and idle wakes;
+- signal rate/size rejection;
+- notification backlog and dispatch;
+- goal mutations and max-run rejection;
+- schedule due/claimed/skipped/started;
+- unattended-run-cap denial;
+- background task queue/worker/failure/cleanup;
+- provider alarm, poll, webhook verification, and delivery;
+- subscription mutation with failed post-commit reconciliation.
+
+## Repository quality gates
+
+The merge gate covers:
+
+- Biome lint and formatting;
+- strict TypeScript across source, tests, Worker, React UI, and React 18 peer-floor probe;
+- Vitest workspace suites;
+- production builds;
+- packed consumer tests for public npm exports;
+- generated API documentation;
+- documentation links, anchors, exports, npm-safe links, and orphan checks;
+- showcase public metadata and token-free bundle assertions;
+- react-doctor;
+- deterministic workerd restart/security spike;
+- supply-chain minimum release age;
+- SPDX source guards;
+- a non-blocking newest-Mastra canary.
+
+The exact commands are in [Maintainer guide](maintainer-guide.md).
+
+## Release evidence
+
+Before announcing a release, retain:
+
+- CI run and commit SHA;
+- package tarball contents and packed-consumer result;
+- changeset and changelog;
+- TypeDoc Pages deployment;
+- workerd spike output;
+- demo build metadata assertion;
+- optional live-model provider proof when relevant;
+- migration and rollback notes for any Durable Object or D1 change.
+
+Do not publish a test-count claim in product copy. The count changes frequently and does not explain which security invariants are covered.

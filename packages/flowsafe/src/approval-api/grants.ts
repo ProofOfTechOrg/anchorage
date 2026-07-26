@@ -194,7 +194,7 @@ export function approvalGrantProvider(
 /**
  * Factory-backed provider for hosts whose ONE runtime serves every tenant
  * in-process (the dev plugin; DO hosts bind per-instance instead). The
- * tenant is recovered from the leg's runId prefix — the same INV-1 carrier
+ * tenant is recovered from the leg's tenant-prefixed runId
  * the DO name join uses — and the store is bound per leg. A runId without a
  * valid tenant prefix mints an EMPTY grant list (fail closed), never a
  * cross-tenant read.

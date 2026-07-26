@@ -1,190 +1,195 @@
-# approval-api
+# Understand the approval API
 
-## Overview
+The approval API is the human-in-the-loop gate for Durable Object workflows. A
+workflow suspension creates a queue record. A reviewer decision resumes the
+run, and the runner derives a Breakwater connector grant from the stored
+decision. Grants never cross an HTTP boundary.
 
-Human-in-the-loop gate for DO-runner workflows. A workflow suspension becomes
-a queue record; a reviewer decision resumes the run; the decision becomes an
-in-run capability (a breakwater connector grant) by derivation from the store
-— never by transport. No single file shows this loop; this README records the
-cross-file contract and the rules that are not enforced by the compiler.
-
-## Architecture
+## Follow an approval through the system
 
 - `store.ts` / `d1-store.ts`: persistence. The store is the authoritative
-  record of decisions — the grant provider reads it, so it sits inside the
-  trust boundary. Every mutation is a status-guarded compare-and-swap, and
+  record of decisions because the grant provider reads it. Every mutation is
+  a status-guarded compare-and-swap, and
   every read and write carries a `tenant_id` predicate sourced from the
   store's constructor.
 - `tenant-brand.ts` / `tenant-store.ts` / `tenant-context.ts`: the tenancy
   seam. Stores come only from a factory's `forTenant()`; the bound type carries
   a `unique symbol` brand, so an unbound store or the cron-only
   `SystemApprovalStore` is a compile error in request scope. `TenantResolver`
-  authenticates, validates the tenant against INV-3, and binds — which is what
-  makes "bind at construction from the authenticated actor" have a valid call
-  site at all.
-- `service.ts`: business rules (roles, SLA, audit, self-approval). Writes the
-  store under RBAC; triggers the post-decision resume via an injected
-  `resumeRun` callback so it stays deployment-agnostic (same-process =
-  `resumeViaRuntime`, cross-Worker = DO stub fetch).
+  authenticates the request, validates `tenantId` against
+  `^[a-z0-9]{3,32}$`, then constructs the tenant-bound service.
+- `service.ts`: business rules for roles, service-level agreement (SLA)
+  deadlines, audit, notifications, streaming, and separation of duties. It
+  resumes a decided run through an injected `resumeRun` callback. Use
+  `resumeViaRuntime` in one process or a Durable Object stub across Workers.
 - `router.ts`: REST surface. Returns null off-prefix so a host Worker
   composes it ahead of its own routes. It takes a `TenantResolver` (injected,
-  part of the trusted computing base) and resolves it as its first act, so no
-  route body ever sees an unbound service. There is no `/sla/sweep` route.
+  identity-verifying code) and resolves it before reading a route body. There
+  is no `/sla/sweep` route.
 - `grants.ts`: the seam between the queue and the runner. Plugs into the
-  DO runner's `requestContextForRun`; on every start/resume it derives the
-  breakwater grant key from APPROVED records.
-- The create "bridge" is deployment glue (see `spike/worker.ts`): whatever
+  Durable Object runner's `requestContextForRun`. On every start or resume, it
+  derives the Breakwater grant key from `approved` records.
+- The host bridge is deployment glue (see `spike/worker.ts`): whatever
   observes a suspension creates the queue record, carrying the suspended
   step's path and the connectors that approval should unlock.
 
-Flow: suspend → bridge creates record (idempotent per open step) → reviewer
-decides (CAS) → resume through the run's DO → runner consults the provider →
-provider mints grants from the store → the gated connector call sees the
-grant in its requestContext.
+The approval flow has six steps:
 
-## Design Decisions
+1. The workflow suspends.
+2. The host bridge creates one record for each suspended step.
+3. A reviewer decides the record through a compare-and-swap transition.
+4. The service resumes the run through its Durable Object.
+5. The runner derives grants from the tenant-bound store.
+6. The gated connector reads the grant from `requestContext`.
 
-- **Notifications are a seam, not a transport.** `ApprovalNotificationSink`
-  (contract.ts) fires on the two moments a reviewer is NOT already looking at
-  the dashboard: a record actually entering the queue (`created: true` only —
-  the idempotent re-observation of an open step never re-notifies) and an SLA
-  escalation (per record, from the cron sweep). Same
-  availability-over-delivery containment as the audit sink: a throwing or
-  rejecting transport is recorded as `approval.notify`/'error' and the
-  approval action proceeds. flowsafe ships NO transport (email/Slack adapters
-  stay with hosts); Workers hosts whose send must outlive the response wrap
-  it in `ctx.waitUntil` themselves. Rejected: notifying on decisions (the
-  decider is looking at the dashboard) and awaiting the sink (a slow
-  transport must never hold an approval hostage).
-- **Batch decide is fan-out, not a new decision model.** `decideBatch` runs
-  the EXISTING `decide()` per unique id (≤`MAX_APPROVAL_BATCH_DECIDE`),
-  sequentially — per-record CAS, separation-of-duties, audit, and resume
-  semantics untouched, so the one-decision-per-suspension model is not
-  widened. Partial failure is data (`BatchDecideItem.code`), never an HTTP
-  error; only record-independent problems (role, cap, malformed input)
-  reject the whole batch. Rejected: a store-level bulk transition (would
-  fork the CAS semantics) and `Promise.all` (audit-order scrambling + D1/DO
-  write contention for a path that is a reviewer clicking once).
-- **Grants by derivation, never transport.** The DO's public resume route
-  carries only `{step, resumeData}`. Anything a proxying Worker forwards can
-  be forged; a grant that never crosses HTTP cannot be. Rejected: signed
-  grant tokens (needless crypto — the store is already the authoritative,
-  RBAC-gated record).
-- **Suspension-scoped minting.** A step-keyed approval mints only for the leg
-  resuming its step AND only when `decidedAt` is strictly after that step's
-  current `suspendedAt` (passed in by the runner from the snapshot). This
-  closes two leak shapes: approving connector X at gate A
-  unlocking X at gate B, and a re-suspension of the same step riding the
-  earlier approval — including the window before the bridge creates the new
-  request. Rejected: latest-request-wins (leaves that window open);
-  a step-aware breakwater gate (tool calls cannot see workflow steps).
-- **Strictly-after, not at-or-after.** Under a shared clock, a decision
-  stamped before a suspension chronologically can never satisfy strictly-
-  after, so the deny direction is deterministic even at millisecond ties.
-  The allow direction relies on real reviewer latency; in-process tests need
-  a few milliseconds between suspension and decision (`settleClock` in the
-  e2e suite).
-- **No runtime dependency on breakwater.** The repo gate runs typecheck
-  before build, so flowsafe source must never need breakwater's dist. The
-  wire contract (key literals, role union, audit-event shape) is mirrored in
-  `contract.ts` and pinned by literal-equality tests in
-  `end-to-end.test.ts`, which resolve breakwater FROM SOURCE (vitest alias +
-  tsconfig.test paths). Drift is a test failure, not a runtime surprise.
-- **CAS-only mutation.** There is deliberately no unconditional update path;
-  racing writers resolve to one winner and losers surface as HTTP 409. The
-  one exception is `delegate`: last-writer-wins by design, because
-  reassignment moves a pointer and guards no side effect.
-- **Decision durable even when the resume fails.** `decide()` persists
-  before resuming; a failed resume is reported (`DecideResult.resume`), not
-  rolled back. Retry is safe: the suspension timestamp is unchanged until a
-  resume succeeds, so the same decision still mints on the retried leg.
-- **Self-approval denied by default.** `requestedBy` is attributed
-  server-side to the creating actor; `decide()` rejects when the decider is
-  the requester unless the service opts in via `allowSelfDecision`. An
-  absent `requestedBy` passes by design — only records injected straight
-  into the store (trusted code) can lack it.
-- **D1 SQL tested against real SQLite** via `node:sqlite`
-  (`process.getBuiltinModule` sidesteps both vite resolution and
-  @types/node); workerd-level verification lives in the demo spike.
-  Rejected: vitest-pool-workers (heavy config), better-sqlite3 (native dep
-  through the supply-chain age gate).
+## Use the HTTP API
 
-## Tenancy invariants
+`createApprovalRouter()` uses `/api/approvals` by default. Every authenticated
+role may read approvals and metrics. Only `reviewer` and `admin` may claim,
+decide, or delegate records.
+
+| Method and route | Behavior |
+| --- | --- |
+| `GET /api/approvals` | List tenant-bound records |
+| `GET /api/approvals/metrics` | Return tenant-bound queue metrics |
+| `GET /api/approvals/:id` | Return one record or 404 |
+| `POST /api/approvals/:id/claim` | Claim a `pending` or `escalated` record |
+| `POST /api/approvals/:id/decide` | Approve or reject an open record and attempt resume |
+| `POST /api/approvals/:id/delegate` | Assign an open record to another reviewer |
+| `POST /api/approvals/batch/decide` | Apply one decision to at most 100 unique IDs |
+| `POST /api/approvals` | Create a non-capability record only when `allowCreate: true` |
+
+The list route accepts `status`, `workflowId`, `runId`, `claimedBy`,
+`requestedBy`, `createdBefore`, `createdAfter`, `limit`, `after`, and
+`orderBy`. `limit` must be an integer from 1 through 500. `status` accepts a
+comma-separated list. `orderBy=reviewer` sorts by priority, SLA deadline, then
+creation time. It cannot be combined with the creation-order `after` cursor.
+
+First-party hosts leave `allowCreate` false. Their bridges create approval
+records only after observing a real suspension. If you enable HTTP creation,
+only `operator`, `builder`, and `admin` may use it, and the body cannot set
+connector grants, step binding, requester attribution, or resume topology.
+
+## Understand the design choices
+
+- **Inject notifications instead of choosing a transport**:
+  `ApprovalNotificationSink` fires when a record first enters the queue and
+  when the SLA sweep escalates it. Re-observing the same open suspension does
+  not notify again. A transport failure records an `approval.notify` error but
+  does not fail the approval action. Flowsafe does not ship an email or chat
+  adapter; a Worker host can keep a send alive with `ctx.waitUntil`.
+- **Process batch decisions through the single-record path**: `decideBatch()`
+  deduplicates at most 100 IDs and calls `decide()` sequentially for each one.
+  Every record retains the same compare-and-swap, separation-of-duties, audit,
+  and resume behavior. Per-record failures appear in the HTTP 200 response;
+  malformed input, an unauthorized role, or more than 100 unique IDs rejects
+  the whole request.
+- **Derive grants instead of transporting them**: The public resume route
+  carries only `{ step, resumeData }`. The runner reads approved records from
+  the tenant-bound store and writes the resulting connector list into
+  `requestContext`. A proxy cannot forge a value that never appears in HTTP.
+- **Bind a decision to one exact suspension**: The bridge captures
+  `(suspendedAt, resumeCount)` when it creates a step approval. Grant
+  derivation requires both values to match the leg being resumed. Approval at
+  one step cannot unlock another step, and an earlier approval cannot unlock a
+  later suspension of the same step.
+- **Retain the timestamp comparison only for legacy rows**: Records created by
+  older bridges may lack a captured `suspendedAt`. Those rows use the
+  transitional rule `decidedAt > suspendedAt` and require the service and
+  runner clocks to agree. Current bridges always write the exact suspension
+  fingerprint, so new records do not depend on decision timing.
+- **Keep Breakwater out of the runtime dependency graph**: `contract.ts`
+  mirrors the shared request-context keys, role union, and audit shape.
+  Literal-equality tests compare those values against Breakwater source and
+  fail if the two packages drift.
+- **Use compare-and-swap for guarded state changes**: A claim, decision, SLA
+  escalation, or supersede applies only when the current status is eligible.
+  Racing writers produce one winner, while losers receive HTTP 409. Delegation
+  deliberately uses last-writer-wins because it only changes the assignee.
+- **Keep the decision when resume fails**: `decide()` persists before it
+  invokes `resumeRun`. `DecideResult.resume` reports any resume failure without
+  rolling back the decision. Retry the run resume through the host's runtime
+  or Durable Object path; do not submit the decision again. The stored decision
+  still derives the grant for that suspension.
+- **Enforce separation of duties by default**: `decide()` rejects the
+  requester and a reviewer who approved an earlier sequential gate in the same
+  run. Parallel gates filed before either decision do not trigger the
+  cross-gate bar. `allowSelfDecision` may exempt every decider or named roles
+  from both checks, and permitted requester self-decisions are audited.
+- **Test D1 behavior against SQLite and Workers**: The unit suite runs the D1
+  SQL against `node:sqlite`. The Workerd spike verifies suspend, persistence,
+  restart, decision, and grant-derived resume on the Workers runtime.
+
+## Isolate every tenant
 
 - **No caller can obtain a store that is not bound to exactly one tenant.**
-  `D1ApprovalStore` is not exported; `forTenant()` throws on a non-INV-3
-  tenant. `create()` STAMPS the tenant from the binding — `CreateApprovalInput`
+  `D1ApprovalStore` is not exported; `forTenant()` throws when the tenant ID
+  does not match `^[a-z0-9]{3,32}$`. The `create()` method stamps the tenant
+  from the binding. `CreateApprovalInput`
   has no `tenantId`, and a field that cannot be supplied cannot be spoofed.
 - **`tenantId` is not an `ApprovalListFilter` member.** An omissible tenant
   filter is the canonical fail-open: an empty filter would scan every tenant.
   The bound store seeds `tenant_id = ?` before every optional clause.
-- **A wrong-tenant id behaves exactly like an unknown id.** `get`/`transition`
-  return null and reuse the existing 404/409 paths, so the API is not an
-  oracle for another tenant's record ids.
-- **Open-uniqueness and captured-fingerprint uniqueness are per tenant.** The
-  partial open-step index leads with `tenant_id`. It had to be `DROP`ped and
-  recreated under a NEW name:
-  `CREATE UNIQUE INDEX IF NOT EXISTS` matches on name alone, so redefining it
-  in place is a silent no-op on any database that already has it — and tenant
-  B's create would collapse into tenant A's open record.
+- **A wrong-tenant ID behaves like an unknown ID.** `get()` and `transition()`
+  return null, and the service returns 404. The API does not reveal whether
+  another tenant owns the record.
+- **Uniqueness includes the tenant.** The open-step and captured-suspension
+  indexes begin with `tenant_id`. Identical workflow, run, and step values in
+  two tenants therefore remain independent. Schema initialization recreates
+  the legacy non-tenant index under a new name because SQLite does not change
+  an existing index definition when `CREATE INDEX IF NOT EXISTS` reuses its
+  name.
 - **A pre-tenant table refuses to serve.** `ALTER TABLE … ADD COLUMN tenant_id
   TEXT NOT NULL` has no valid backfill (SQLite rejects it even on an empty
   table, and a NULL or `''` tenant is an isolation hole), so the store throws a
-  loud error naming the fix rather than half-upgrading.
-- **The cross-tenant sweep is a type, not a comment.** `sweepSLA` is a
+  configuration error rather than serving partially migrated data.
+- **Only scheduled maintenance can scan tenants.** `sweepSLA()` is a
   standalone function over `SystemApprovalStore`, which declares
   `[TENANT_BOUND]?: never` and is therefore unassignable wherever a bound store
   is required.
-- **The grant query's `runId` predicate is load-bearing.** Under INV-1 a salted
-  runId belongs to exactly one tenant, so the mint is tenant-safe even from a
-  mis-bound store. The store binding is defense in depth, not the fix. A spy
-  test pins the exact filter, because "optimizing away" that predicate would
-  reopen the leak with a green build.
+- **Grant queries require `workflowId` and `runId`.** A tenant-salted run ID
+  belongs to exactly one tenant, so grant derivation remains tenant-safe even
+  from a mis-bound store. The store binding provides a second independent
+  check. A spy test pins both predicates on every page.
 
-## Invariants
+## Preserve the security guarantees
 
-- The requestContext capability keys (`breakwater.approvedConnectors`,
+- The `requestContext` capability keys (`breakwater.approvedConnectors`,
   `breakwater.actor`) must never be populated from client input, model
-  output, or tool results. Grant-minting code — the provider, the service,
-  and any bridge — is inside the trust boundary.
-- `service.create` asserts the input `runId` carries the store's tenant prefix.
-  Not a leak (every read filters on the `tenant_id` column, never by parsing
-  `run_id`), but it turns an orphan row into a loud error at the only write
-  path.
+  output, or tool results. Only the provider, service, and trusted host bridge
+  may set them.
+- `service.create()` requires the input `runId` to carry the store's tenant
+  prefix. Reads still filter on `tenant_id`; the prefix check prevents an
+  orphan approval record at the write boundary.
 - Every state change goes through `transition(id, from[], patch)`.
-- At most one OPEN request per (workflowId, runId, stepKey) — enforced by a
-  partial unique index. For a captured step suspension, at most one record of
-  ANY status exists per (workflowId, runId, stepKey, suspendedAt, resumeCount):
-  terminal records atomically block stale reconciliation from re-filing the
+- At most one open request exists per `(workflowId, runId, stepKey)`. For a
+  captured step suspension, at most one record of any status exists per
+  `(workflowId, runId, stepKey, suspendedAt, resumeCount)`.
+  Terminal records atomically block stale reconciliation from re-filing the
   same suspension, while a changed fingerprint opens the re-suspension fresh.
-- The provider returns the grant key on EVERY leg (empty when nothing
-  applies): Mastra merges resume-provided context over the persisted
+- The provider returns the grant key on every leg, using an empty list when
+  nothing applies. Mastra merges resume-provided context over the persisted
   snapshot, so omission would inherit a previous leg's grants instead of
   retiring them.
-- Bridges must set `stepPath` when creating from a suspension. Run-scope is
-  EXPLICIT: a step-less record mints on every leg only when it also carries
+- Bridges must set `stepPath` when creating from a suspension. Run scope is
+  explicit: a step-less record mints on every leg only when it also carries
   `runScoped: true`, and mints nothing otherwise. "Absent `stepPath` implies
   run-wide privilege" was an inverted default.
-- The HTTP create route is OFF by default (`createApprovalRouter`'s
-  `allowCreate`), and when a host deliberately mounts it, it cannot author
-  capability: it 400s on any body naming a `TCB_ONLY_CREATE_FIELDS` member
+- The HTTP create route is off by default through
+  `createApprovalRouter({ allowCreate: false })`. When a host enables it, the
+  route returns 400 for any body containing a server-only field
   (`connectors`, `stepPath`, `suspendedAt`, `resumedAt`, `resumeCount`,
-  `runScoped`, `requestedBy`) and forces `requestedBy` to the authenticated
-  actor. `service.create` still honours an explicit `requestedBy` — the
-  in-process bridge attributes the human who advanced the run, which is exactly
-  what makes the separation-of-duties check fireable. The tightening is at the
-  HTTP boundary only.
+  `runScoped`, `requestedBy`, or `resumeTarget`) and forces `requestedBy` to
+  the authenticated actor. `service.create()` still honors an explicit
+  `requestedBy`: the in-process bridge attributes the human who advanced the
+  run, which is what makes the separation-of-duties check effective.
 - Records are JSON-safe end to end (validated at create) so the two store
   implementations cannot diverge on exotic payloads.
-- `decidedAt` (service clock) is compared against `suspendedAt` (engine
-  clock): deployments must keep them on a shared clock (true same-Worker and
-  on Cloudflare). The clock-free hardening — capturing the
-  `(suspendedAt, resumeCount)` pair into the record at create time and matching
-  both exactly — is implemented as the exact-match suspension binding.
-  `resumeCount` is the runtime-owned monotonic per-(run,step) resume ordinal
-  (undefined on a first suspension, `1,2,…` on re-suspensions), incremented on
-  every resume regardless of payload, so it keeps same-step suspensions distinct
-  when their `suspendedAt` collide — even a no-payload re-suspension (which
-  Mastra leaves without a `resumedAt`) — and, being strictly increasing, never
-  collides across deep chains. `resumedAt` is retained as informational only.
+- Current bridges capture `(suspendedAt, resumeCount)`, and grant derivation
+  matches both exactly. `resumeCount` is undefined on the first suspension,
+  then increases on every resume. It distinguishes repeated suspensions even
+  if their millisecond timestamps match. `resumedAt` remains informational
+  because Mastra records it only for payload-bearing resumes. Only legacy rows
+  without a captured `suspendedAt` use the shared-clock
+  `decidedAt > suspendedAt` fallback.
 - `escalated` stays decidable; `approved`/`rejected` are terminal.

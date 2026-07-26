@@ -41,7 +41,7 @@ export function mintThreadId(
  * lead id) and is deliberately stable across runs — two tenants using the
  * SAME key stay disjoint because the prefix differs. The key must match the
  * do-runner's PATH_SAFE_ID_PATTERN (RFC 3986 unreserved); '_' inside it is
- * fine — INV-3 excludes '_' from tenant ids, so the FIRST underscore is
+ * fine — the tenant-ID pattern excludes '_' from tenant ids, so the first underscore is
  * always the tenant boundary.
  */
 export function mintResourceId(tenantId: string, resourceKey: string): string {
@@ -54,7 +54,7 @@ export function mintResourceId(tenantId: string, resourceKey: string): string {
 }
 
 /**
- * Recover the INV-3-validated tenant prefix of a memory id (threadId or
+ * Recover the validated tenant prefix of a memory id (threadId or
  * resourceId), or undefined when it carries none. Memory ids share the runId
  * carrier deliberately, so this delegates to the ONE decode (`tenantOfRunId`)
  * instead of growing a second parse that could drift.
@@ -66,7 +66,7 @@ export function tenantOfMemoryId(id: string): string | undefined {
 /**
  * Exact tenant ownership of a memory id — delegates to the ONE salted-id
  * ownership predicate (`tenantOwnsSaltedId`) so memory and run ownership can
- * never drift. Exact for the same INV-3 reason: the '_' delimiter cannot occur
+ * never drift. Exact because the '_' delimiter cannot occur
  * inside a tenantId, so 'acme' can never own 'acmecorp_...'. Assert on EVERY
  * memory read/write path.
  */

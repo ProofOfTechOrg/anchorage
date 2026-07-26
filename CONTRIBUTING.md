@@ -3,7 +3,7 @@
 Anchorage is implemented and tested.
 Contributions — new connectors, policies, bug fixes, and docs — are welcome.
 
-## Where To Start
+## Where to start
 
 1. Read [`README.md`](README.md) for the project overview, architecture, and
    package map.
@@ -13,7 +13,7 @@ Contributions — new connectors, policies, bug fixes, and docs — are welcome.
 3. To build a connector, read
    [`packages/breakwater/CONNECTORS.md`](packages/breakwater/CONNECTORS.md).
 
-## How To Contribute
+## How to contribute
 
 - **Connectors** — wrap a tool or CLI with an enforced permission manifest;
   follow [`packages/breakwater/CONNECTORS.md`](packages/breakwater/CONNECTORS.md)
@@ -28,28 +28,48 @@ Contributions — new connectors, policies, bug fixes, and docs — are welcome.
 Every PR must pass the verification gate below; CI
 (`.github/workflows/ci.yml`) runs it on push and PR.
 
-## Development Setup
+## Development setup
 
 ```bash
 git clone https://github.com/ProofOfTechOrg/anchorage.git
 cd anchorage
 pnpm install
 # The full verification gate (what CI runs):
-pnpm lint && pnpm typecheck && pnpm test && pnpm build
-# Plus the end-to-end workerd durability proof:
+pnpm lint
+pnpm typecheck
+pnpm test
+pnpm build
+pnpm docs:check
+pnpm docs:check:test
+pnpm docs:api
+pnpm test:packed-breakwater
+pnpm --filter @proofoftech/flowsafe test:signals-client-export
+pnpm --filter @proofoftech/flowsafe typecheck:react18
+pnpm --filter showcase run react-doctor
 pnpm --filter @proofoftech/flowsafe spike:verify
 ```
 
 Lint is one Biome pass at the root, and `pnpm test` is one root vitest run
-covering every package (978 tests). Git hooks (husky) back the gate up:
+covering every package. Git hooks (husky) back the gate up:
 pre-commit runs Biome on staged files (lint-staged); pre-push runs
 react-doctor on the branch's changed files (`pnpm react-doctor:diff`; bypass
-with `git push --no-verify`). CI additionally runs the full react-doctor gate
-(100/100, `--blocking warning`) over `packages/showcase`, plus `spike:verify`.
+with `git push --no-verify`). CI also runs a non-blocking compatibility probe
+against the newest `@mastra/core` 1.x release.
 
 The showcase app uses mandatory absolute imports — `@/*` for `src`,
 `#worker/*` for worker modules, `@flowsafe/*` for deep flowsafe source
 imports — enforced by Biome.
+
+`pnpm docs:check` validates local links, Markdown anchors, documentation
+reachability, package README export coverage, published-package links, and
+TypeDoc entry-point coverage. `pnpm docs:api` builds the generated API site in
+`docs/api/`; that directory is ignored and must not be committed. The scheduled
+external-link workflow runs `pnpm docs:check:external`.
+
+Add or update tests for behavioral changes. Update the relevant package README
+and authored guides when public behavior, setup, configuration, or exports
+change. Add a changeset for a user-visible change to a published package; pure
+repository maintenance and docs-only changes do not need one.
 
 ## Releasing
 
@@ -71,23 +91,18 @@ commits of its own. Publishing needs the `NPM_TOKEN` repository secret (an npm
 automation token with publish rights on the `@proofoftech` scope). `showcase`
 is private and never publishes.
 
-## Code Of Conduct
-
-This project follows industry-standard open-source conduct guidelines. Be
-respectful, constructive, and inclusive in all interactions.
-
 ## Governance
 
 - Maintainer: [ProofOfTechOrg](https://github.com/ProofOfTechOrg) — final
   review and merge authority.
 - Contributions flow through the standard GitHub PR process.
-- **Significant contributions** (new subsystems, connectors, or public API
-  surface) require a Contributor License Agreement, requested and approved by
-  the maintainer on the PR. Small fixes and docs changes need none.
+- Anchorage does not require a Contributor License Agreement or Developer
+  Certificate of Origin sign-off.
 
 ## License
 
-Contributions will be licensed under Apache-2.0. See [`LICENSE`](LICENSE).
+By submitting a contribution, you agree that it is licensed under Apache-2.0,
+the project's license. See [`LICENSE`](LICENSE).
 Everything in this repository — including enterprise-oriented features such as
 SSO seams and audit export — is Apache-2.0; nothing is held back for a paid
 tier.
