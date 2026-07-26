@@ -63,6 +63,25 @@ test('link extraction ignores examples in code fences and inline code', () => {
   assert.deepEqual(links, [{ target: 'guide.md', line: 2 }]);
 });
 
+test('shorter fences cannot close longer Markdown code blocks', () => {
+  const markdown = `
+\`\`\`\`md
+# Hidden heading
+[hidden](missing.md)
+\`\`\`
+# Still hidden
+[also hidden](missing-too.md)
+\`\`\`\`
+# Visible heading
+[visible](guide.md)
+`;
+
+  assert.deepEqual([...collectMarkdownAnchors(markdown)], ['visible-heading']);
+  assert.deepEqual(collectMarkdownLinks(markdown), [
+    { target: 'guide.md', line: 10 },
+  ]);
+});
+
 test('local files, directory READMEs, and Markdown anchors pass', () => {
   const root = fixture({
     'README.md': `# Start

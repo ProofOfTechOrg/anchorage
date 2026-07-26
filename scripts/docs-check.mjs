@@ -99,9 +99,11 @@ export function collectMarkdownAnchors(markdown) {
   for (const line of lines) {
     const fenceMatch = line.match(/^\s{0,3}(`{3,}|~{3,})/);
     if (fenceMatch) {
-      const marker = fenceMatch[1][0];
-      if (!fence) fence = marker;
-      else if (fence === marker) fence = undefined;
+      const delimiter = fenceMatch[1];
+      if (!fence) fence = delimiter;
+      else if (fence[0] === delimiter[0] && delimiter.length >= fence.length) {
+        fence = undefined;
+      }
       previousLine = undefined;
       continue;
     }
@@ -135,9 +137,14 @@ function sanitizedMarkdown(markdown) {
     .map((line) => {
       const fenceMatch = line.match(/^\s{0,3}(`{3,}|~{3,})/);
       if (fenceMatch) {
-        const marker = fenceMatch[1][0];
-        if (!fence) fence = marker;
-        else if (fence === marker) fence = undefined;
+        const delimiter = fenceMatch[1];
+        if (!fence) fence = delimiter;
+        else if (
+          fence[0] === delimiter[0] &&
+          delimiter.length >= fence.length
+        ) {
+          fence = undefined;
+        }
         return line.replace(/[^\n]/g, ' ');
       }
       if (fence) return line.replace(/[^\n]/g, ' ');
