@@ -1,5 +1,16 @@
 # @proofoftech/flowsafe
 
+## 0.7.0
+
+### Minor Changes
+
+- def3b37: Complete and document the public flowsafe surface. The root entry point now
+  re-exports the approval API, Durable Object runner, artifacts, and audit export
+  surfaces with parity tests. Signal-provider hosts gain a tenant-safe topology,
+  stable polling alarms, and automatic post-mutation polling reconciliation.
+  Publish comprehensive package, deployment, approval, durable-agent, operations,
+  and API-reference documentation, plus a full advanced starter host.
+
 ## 0.6.0
 
 > **Final 0.6.0 state:** The `eca3b6e` closeout entry below supersedes earlier
