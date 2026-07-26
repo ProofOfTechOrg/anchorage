@@ -27,13 +27,14 @@ Compatibility:
 - TypeScript `moduleResolution: "NodeNext"`, `"Node16"`, or `"Bundler"`
 - `@mastra/core` in the declared `^1.50.0` peer range
 - `react` and `react-dom` `>=18 <20` (React 18 or 19) for the optional approval UI
-- `@proofoftech/breakwater` `>=0.2.0 <1.0.0` when used
+- `@proofoftech/breakwater` `>=0.6.0 <1.0.0` when used
 
 ## Choose an export
 
 | Import | Purpose |
 | --- | --- |
 | `@proofoftech/flowsafe` | Compatibility barrel for approval API, runner, artifacts, and audit export |
+| `@proofoftech/flowsafe/agent-host` | Server-only guarded-agent catalogs, authenticated run routes, thread hosting, NDJSON observation, and approval-only resume |
 | `@proofoftech/flowsafe/approval-api` | Approval records, service, tenant-bound stores, REST router, grants, SLA, retention, notifications, and stream events |
 | `@proofoftech/flowsafe/do-runner` | Durable Object runner, D1 storage, run summaries, identities, pub/sub, resume ledger, retention, and offboarding |
 | `@proofoftech/flowsafe/approval-ui` | Styling-library-agnostic React dashboard, DOM-free API client, headless hook, and live transport |
@@ -49,7 +50,7 @@ Compatibility:
 | `@proofoftech/flowsafe/background-tasks` | Tenant task host, D1 task domains, routes, and cleanup |
 | `@proofoftech/flowsafe/signal-providers` | Alarm-driven provider host, topology, subscriptions, verified webhooks, and GitHub reference provider |
 
-New host-side and React features are subpath-only. This keeps the root import free of durable-agent and UI dependency graphs.
+New host-side and React features are subpath-only. This keeps the root import free of Breakwater, durable-agent-host, and UI dependency graphs.
 
 ## Start with the baseline Worker
 
@@ -255,7 +256,15 @@ The following surfaces are supported and opt-in: they are tested and covered by 
 
 ### Durable agents
 
-`createFlowsafeDurableAgent()` routes Mastra's durable-agent workflow through `RunnerRuntime`. Public start entry points require a caller-minted tenant run id. After an isolate restart, `resumeViaRuntime()` prepares the agent registry, registers observation, and resumes through the runtime after validating memory ownership.
+Use `@proofoftech/flowsafe/agent-host` for a public protected surface. `createAgentRouter()` lists server-owned metadata and exposes authenticated start, status, and newline-delimited JSON observation routes. The router mints every id, rejects trusted context and execution overrides, and authorizes mutations against both the global start roles and the selected agent's roles.
+
+`createThreadAgentHost()` validates Breakwater's guarded-handle brand before it registers the agent with Mastra. It persists the thread/agent binding and original run principal, so eviction recovery and approval resume cannot switch agents or actors.
+
+Agent resume is approval-only. `createAgentApprovalResumer()` rejects legacy agent targets without the original principal, rechecks current catalog roles, and delegates non-agent workflow records to the existing resume function.
+
+`createFlowsafeDurableAgent()` remains the lower-level compatibility API. It routes Mastra's durable-agent workflow through `RunnerRuntime`, but it does not guard an arbitrary raw agent. Use `agent-host` when an HTTP surface must enforce catalog and Breakwater invariants.
+
+Agent event replay lasts only as long as the configured Mastra cache. The default in-memory cache does not survive process restart. A 409 stream response means the client must read the authoritative status route.
 
 ### Signals and notifications
 
@@ -305,7 +314,8 @@ Critical host obligations:
 
 - derive tenants and actors from verified credentials;
 - mint run, thread, resource, schedule, and subscription identities server-side;
-- keep connector lists and resume targets server-authored;
+- keep connector lists and agent resume targets server-authored;
+- persist the original authorized agent requester and resume execution as that principal;
 - expose decisions only through the approval path;
 - configure shared stores for cross-isolate connector budgets;
 - keep raw Durable Object namespaces behind the exported topologies;

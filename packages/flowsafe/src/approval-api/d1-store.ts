@@ -16,9 +16,11 @@
 
 import { d1Changes } from '../do-runner/d1-storage.js';
 import {
+  PATH_SAFE_ID_PATTERN,
   TENANT_ID_PATTERN,
   tenantOwnsSaltedId,
 } from '../do-runner/path-safe-id.js';
+import { APPROVAL_ROLES } from './contract.js';
 import {
   type ApprovalPatch,
   type ApprovalStore,
@@ -363,22 +365,34 @@ function rowToRecord(row: ApprovalRow): ApprovalRecord {
     } catch {
       throw new Error(`approval '${row.id}' has invalid resume_target JSON`);
     }
-    if (
-      typeof target !== 'object' ||
-      target === null ||
-      (target as Record<string, unknown>).kind !== 'thread' ||
-      typeof (target as Record<string, unknown>).threadId !== 'string' ||
-      !tenantOwnsSaltedId(
-        row.tenant_id,
-        (target as Record<string, unknown>).threadId as string,
-      ) ||
-      ((target as Record<string, unknown>).resourceId !== undefined &&
-        (typeof (target as Record<string, unknown>).resourceId !== 'string' ||
-          !tenantOwnsSaltedId(
-            row.tenant_id,
-            (target as Record<string, unknown>).resourceId as string,
-          )))
-    ) {
+    const ownsPathSafeId = (value: unknown): value is string =>
+      typeof value === 'string' &&
+      PATH_SAFE_ID_PATTERN.test(value) &&
+      tenantOwnsSaltedId(row.tenant_id, value);
+    const object =
+      typeof target === 'object' && target !== null
+        ? (target as Record<string, unknown>)
+        : undefined;
+    const validThreadTarget =
+      object?.kind === 'thread' &&
+      ownsPathSafeId(object.threadId) &&
+      (object.resourceId === undefined || ownsPathSafeId(object.resourceId));
+    const principal =
+      object?.principal !== null && typeof object?.principal === 'object'
+        ? (object.principal as Record<string, unknown>)
+        : undefined;
+    const validAgentTarget =
+      object?.kind === 'agent-thread' &&
+      typeof object.agentId === 'string' &&
+      PATH_SAFE_ID_PATTERN.test(object.agentId) &&
+      ownsPathSafeId(object.threadId) &&
+      ownsPathSafeId(object.resourceId) &&
+      typeof principal?.id === 'string' &&
+      principal.id.trim() !== '' &&
+      typeof principal.role === 'string' &&
+      (APPROVAL_ROLES as readonly string[]).includes(principal.role) &&
+      principal.tenantId === row.tenant_id;
+    if (!validThreadTarget && !validAgentTarget) {
       throw new Error(
         `approval '${row.id}' has an invalid or foreign resume_target`,
       );

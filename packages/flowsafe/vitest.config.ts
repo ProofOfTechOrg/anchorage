@@ -11,17 +11,35 @@ export default defineConfig({
         replacement: new URL('../breakwater/src/index.ts', import.meta.url)
           .pathname,
       },
+      {
+        find: /^@proofoftech\/breakwater\/agent$/,
+        replacement: new URL(
+          '../breakwater/src/agent/index.ts',
+          import.meta.url,
+        ).pathname,
+      },
+      {
+        find: /^@proofoftech\/breakwater\/audit$/,
+        replacement: new URL(
+          '../breakwater/src/audit/index.ts',
+          import.meta.url,
+        ).pathname,
+      },
       // deploy/worker.e2e.test.ts imports the copy-ready template, whose
       // package-specifier imports must resolve to THIS package's source (the
       // exports map points at dist/, which tests must not depend on).
       // tsconfig.test.json mirrors these with `paths`.
-      ...['approval-api', 'audit-export', 'do-runner', 'host-kit'].map(
-        (subpath) => ({
-          find: new RegExp(`^@proofoftech/flowsafe/${subpath}$`),
-          replacement: new URL(`./src/${subpath}/index.ts`, import.meta.url)
-            .pathname,
-        }),
-      ),
+      ...[
+        'agent-host',
+        'approval-api',
+        'audit-export',
+        'do-runner',
+        'host-kit',
+      ].map((subpath) => ({
+        find: new RegExp(`^@proofoftech/flowsafe/${subpath}$`),
+        replacement: new URL(`./src/${subpath}/index.ts`, import.meta.url)
+          .pathname,
+      })),
     ],
   },
   test: {

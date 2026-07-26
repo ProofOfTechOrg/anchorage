@@ -129,10 +129,13 @@ try {
     `import {
   AgentCliError,
   AuditLogger,
+  createGuardedAgent,
   createCodexConnector,
   type AgentCliErrorCode,
   type AgentCliErrorMetadata,
+  type GuardedAgentHandle,
 } from '@proofoftech/breakwater';
+import { isGuardedAgentHandle } from '@proofoftech/breakwater/agent';
 import { connectorManifest } from '@proofoftech/breakwater/connector-sdk';
 import { PolicyEngine } from '@proofoftech/breakwater/policy-engine';
 import { RBACMiddleware } from '@proofoftech/breakwater/rbac';
@@ -142,6 +145,17 @@ import { CODEX_CLI } from '@proofoftech/breakwater/agent-cli';
 const code: AgentCliErrorCode = 'nonzero-exit';
 const metadata: AgentCliErrorMetadata = { code };
 const event = null as AuditEvent | null;
+const guarded: GuardedAgentHandle = createGuardedAgent({
+  id: 'packed-agent',
+  name: 'Packed agent',
+  instructions: 'Answer.',
+  model: 'openai/gpt-5',
+  allowedRoles: ['operator'],
+  policies: [],
+  audit: new AuditLogger(),
+  maxSteps: 1,
+  toolChoice: 'none',
+});
 const tool = createCodexConnector({ exec: async () => ({
   stdout: 'ok',
   stderr: '',
@@ -154,6 +168,7 @@ void PolicyEngine;
 void RBACMiddleware;
 void CODEX_CLI;
 void connectorManifest(tool);
+void isGuardedAgentHandle(guarded);
 void metadata;
 void event;
 `,
@@ -165,19 +180,42 @@ import { RequestContext } from '@mastra/core/request-context';
 import {
   AgentCliError,
   AuditLogger,
+  createGuardedAgent,
   createCodexConnector,
 } from '@proofoftech/breakwater';
+import { isGuardedAgentHandle } from '@proofoftech/breakwater/agent';
 import {
   DRY_RUN_CONTEXT_KEY,
   connectorManifest,
 } from '@proofoftech/breakwater/connector-sdk';
 
 await Promise.all([
+  import('@proofoftech/breakwater/agent'),
   import('@proofoftech/breakwater/policy-engine'),
   import('@proofoftech/breakwater/rbac'),
   import('@proofoftech/breakwater/audit'),
   import('@proofoftech/breakwater/agent-cli'),
 ]);
+
+const guarded = createGuardedAgent({
+  id: 'packed-agent',
+  name: 'Packed agent',
+  instructions: 'Answer.',
+  model: 'openai/gpt-5',
+  allowedRoles: ['operator'],
+  policies: [],
+  audit: new AuditLogger(),
+  maxSteps: 1,
+  toolChoice: 'none',
+});
+assert.equal(isGuardedAgentHandle(guarded), true);
+assert.equal(isGuardedAgentHandle({
+  id: guarded.id,
+  allowedRoles: guarded.allowedRoles,
+  maxSteps: guarded.maxSteps,
+  generate: guarded.generate,
+  stream: guarded.stream,
+}), false);
 
 const prompt = 'packed-private-prompt-46e08f9f';
 const processOutput = 'packed-private-output-04d1043c';

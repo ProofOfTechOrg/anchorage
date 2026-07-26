@@ -1,14 +1,14 @@
 // Automates the flowsafe workerd spike end-to-end so "durable execution
 // across real process death" is a pass/fail command instead of a manual
-// curl ritual (protocol: spike/worker.ts header). Scenario A starts a run
-// that suspends at the approval gate, kills the dev server, restarts it
-// on the SAME persisted state, decides the approval, and asserts the run
-// resumed and published. Scenario B proves a forged raw resume (no grant
-// minted) fails closed at the connector gate. The AG scenarios (Track A,
-// M-002) prove the durable-agent approval-suspend shape (R-003) round-trips
-// through the SAME grant-only path: the bridge derives the connector to grant
-// from the agent's `toolName` (no explicit `connectors` array), an approval
-// mints it, and a forged agent-gate resume fails closed at that gate.
+// curl ritual (protocol: spike/worker.ts header). Phase A drives the guarded,
+// catalog-hosted agent through authenticated start, suspension before its
+// connector, a real workerd restart, approval by a different reviewer,
+// restoration of the original requester principal, and exactly-once connector
+// execution. Its negative matrix covers forged headers/context, disallowed
+// roles, wrong tenants/agents/bindings, absent raw resume, stale decision replay,
+// and restart-evicted stream replay with authoritative status fallback.
+// The remaining scenarios retain the lower-level workflow, stream, background
+// task, signal, goal, schedule, and webhook compatibility proofs.
 //
 // Auth rides the worker's host-kit seam: every request presents one of the
 // LOCAL-ONLY spike bearer tokens (spike/worker.ts SPIKE_ACTORS). The C probe
@@ -53,11 +53,16 @@ const AGENT_RUN_BODY = {
   workflowId: 'demo-agent-gate',
   inputData: { topic: 'launch' },
 };
+const GUARDED_AGENT_ID = 'spike-guarded-agent';
+const GUARDED_AGENT_START_PATH = `/agents/${GUARDED_AGENT_ID}/runs`;
 const AUTH = {
   admin: { authorization: 'Bearer spike-admin' },
   operator: { authorization: 'Bearer spike-operator' },
   reviewer: { authorization: 'Bearer spike-reviewer' },
   viewer: { authorization: 'Bearer spike-viewer' },
+  otherOperator: { authorization: 'Bearer other-operator' },
+  otherReviewer: { authorization: 'Bearer other-reviewer' },
+  otherViewer: { authorization: 'Bearer other-viewer' },
 };
 
 // Streaming (M-009). MUST equal spike/wrangler.jsonc `vars.STREAM_TICKET_SECRET`
@@ -189,6 +194,30 @@ async function http(method, path, { body, headers } = {}) {
       `${method} ${path} -> ${response.status} non-JSON: ${text.slice(0, 300)}`,
     );
   }
+}
+
+async function httpRaw(method, path, rawBody, headers = {}) {
+  const response = await fetch(`${BASE}${path}`, {
+    method,
+    headers: {
+      'content-type': 'application/json',
+      ...headers,
+    },
+    body: rawBody,
+    signal: AbortSignal.timeout(30_000),
+  });
+  const text = await response.text();
+  try {
+    return { status: response.status, body: JSON.parse(text) };
+  } catch {
+    throw new Error(
+      `${method} ${path} -> ${response.status} non-JSON: ${text.slice(0, 300)}`,
+    );
+  }
+}
+
+function guardedStatusPath(run) {
+  return `/agents/${GUARDED_AGENT_ID}/runs/${encodeURIComponent(run.threadId)}/${encodeURIComponent(run.runId)}`;
 }
 
 // --- Track E (M-007) webhook probe helpers ---------------------------------
@@ -448,6 +477,212 @@ async function main() {
     launchServer('gen-1', stateDir, join(tmpDir, 'gen1.log')),
   );
 
+  await step(
+    'PA0 boundary: authenticated catalog, role gates, and forged context/header rejection',
+    async () => {
+      const missing = await http('GET', '/agents');
+      assert(
+        missing.status === 401,
+        'agent catalog requires bearer authentication',
+        missing,
+      );
+
+      const catalog = await http('GET', '/agents', {
+        headers: AUTH.viewer,
+      });
+      assert(
+        catalog.status === 200,
+        'authenticated catalog is readable',
+        catalog,
+      );
+      assert(
+        catalog.body.actor?.id === 'vic' &&
+          catalog.body.actor?.role === 'viewer' &&
+          catalog.body.actor?.tenantId === 'spike',
+        'catalog echoes the authenticated actor',
+        catalog.body.actor,
+      );
+      assert(
+        catalog.body.agents?.length === 1 &&
+          catalog.body.agents[0]?.id === GUARDED_AGENT_ID,
+        'catalog exposes the registered guarded agent metadata',
+        catalog.body.agents,
+      );
+
+      const forgedHeader = await http('GET', '/agents', {
+        headers: {
+          ...AUTH.operator,
+          'X-FloWsAfE-RoLe': 'admin',
+        },
+      });
+      assert(
+        forgedHeader.status === 403,
+        'a mixed-case forged server role header is refused before scoping',
+        forgedHeader,
+      );
+
+      for (const [label, headers] of [
+        ['viewer', AUTH.viewer],
+        ['reviewer', AUTH.reviewer],
+      ]) {
+        const denied = await http('POST', GUARDED_AGENT_START_PATH, {
+          headers,
+          body: { prompt: 'Call the required write tool.' },
+        });
+        assert(
+          denied.status === 403,
+          `${label} cannot mutate the guarded agent`,
+          denied,
+        );
+      }
+
+      const unknownBeforeRole = await http(
+        'POST',
+        '/agents/not-registered/runs',
+        {
+          headers: AUTH.viewer,
+          body: { prompt: 'must not run' },
+        },
+      );
+      assert(
+        unknownBeforeRole.status === 404,
+        'unknown agent stays 404 before mutation-role disclosure',
+        unknownBeforeRole,
+      );
+
+      for (const forbiddenBody of [
+        {
+          prompt: 'must not run',
+          inputProcessors: [],
+        },
+        {
+          prompt: 'must not run',
+          requestContext: { 'breakwater.actor': { id: 'mallory' } },
+        },
+        { prompt: 'must not run', runId: 'spike_forged' },
+        { prompt: 'must not run', threadId: 'spike_forged' },
+      ]) {
+        const rejected = await http('POST', GUARDED_AGENT_START_PATH, {
+          headers: AUTH.operator,
+          body: forbiddenBody,
+        });
+        assert(
+          rejected.status === 400,
+          'processor/context/id overrides are rejected at the HTTP boundary',
+          { forbiddenBody, rejected },
+        );
+      }
+
+      const prototypeKey = await httpRaw(
+        'POST',
+        GUARDED_AGENT_START_PATH,
+        '{"prompt":"must not run","__proto__":{"polluted":true}}',
+        AUTH.operator,
+      );
+      assert(
+        prototypeKey.status === 400,
+        'prototype meta-keys are rejected',
+        prototypeKey,
+      );
+
+      const untouched = await http('GET', '/agent/live/effects', {
+        headers: AUTH.viewer,
+      });
+      assert(
+        untouched.status === 200 &&
+          untouched.body.modelCalls === 0 &&
+          untouched.body.connectorCalls === 0 &&
+          untouched.body.effects === 0,
+        'no rejected boundary probe reached the model or connector',
+        untouched,
+      );
+    },
+  );
+
+  const guardedRun = await step(
+    'PA1 guarded start: server-minted run suspends before the connector',
+    async () => {
+      const started = await http('POST', GUARDED_AGENT_START_PATH, {
+        headers: AUTH.operator,
+        body: { prompt: 'Call the required write tool exactly once.' },
+      });
+      assert(started.status === 200, 'guarded agent start succeeded', started);
+      const envelope = started.body;
+      assert(
+        envelope.agentId === GUARDED_AGENT_ID,
+        'start envelope identifies the catalog agent',
+        envelope,
+      );
+      assert(
+        typeof envelope.threadId === 'string' &&
+          envelope.threadId.startsWith('spike_') &&
+          typeof envelope.resourceId === 'string' &&
+          envelope.resourceId.startsWith('spike_') &&
+          typeof envelope.runId === 'string' &&
+          envelope.runId.startsWith('spike_'),
+        'thread/resource/run IDs are server-minted and tenant-owned',
+        envelope,
+      );
+      assert(
+        envelope.summary?.status === 'suspended',
+        'guarded run suspended at the connector gate',
+        envelope.summary,
+      );
+      assert(
+        envelope.approval?.status === 'pending' &&
+          envelope.approval?.connectors?.includes('spike_recordWrite'),
+        'suspension filed the exact connector approval',
+        envelope.approval,
+      );
+      assert(
+        envelope.approval?.requestedBy === 'opal' &&
+          envelope.approval?.resumeTarget?.kind === 'agent-thread' &&
+          envelope.approval.resumeTarget.agentId === GUARDED_AGENT_ID &&
+          envelope.approval.resumeTarget.threadId === envelope.threadId &&
+          envelope.approval.resumeTarget.resourceId === envelope.resourceId &&
+          envelope.approval.resumeTarget.principal?.id === 'opal' &&
+          envelope.approval.resumeTarget.principal?.role === 'operator' &&
+          envelope.approval.resumeTarget.principal?.tenantId === 'spike',
+        'approval target durably carries the original authorized principal and binding',
+        envelope.approval,
+      );
+
+      const effects = await http(
+        'GET',
+        `/agent/live/effects?runId=${encodeURIComponent(envelope.runId)}`,
+        { headers: AUTH.viewer },
+      );
+      assert(
+        effects.body.modelCalls === 1 &&
+          effects.body.connectorCalls === 0 &&
+          effects.body.effects === 0,
+        'the model requested the tool but the connector did not run before approval',
+        effects.body,
+      );
+
+      const rawResume = await http(
+        'POST',
+        `${guardedStatusPath(envelope)}/resume`,
+        {
+          headers: AUTH.operator,
+          body: { approved: true, decidedBy: 'mallory' },
+        },
+      );
+      assert(
+        rawResume.status === 404,
+        'the public agent surface has no raw resume route',
+        rawResume,
+      );
+      return {
+        agentId: envelope.agentId,
+        threadId: envelope.threadId,
+        resourceId: envelope.resourceId,
+        runId: envelope.runId,
+        approvalId: envelope.approval.id,
+      };
+    },
+  );
+
   const run = await step(
     'A1 start: run suspends at approval gate',
     async () => {
@@ -499,6 +734,194 @@ async function main() {
       'gen-2 log must not contain "address already in use" (orphan trap)',
     );
   });
+
+  await step(
+    'PA2 restart: replay cache is gone, authoritative status and principal survive',
+    async () => {
+      const replay = await http(
+        'GET',
+        `${guardedStatusPath(guardedRun)}/stream?offset=0`,
+        { headers: AUTH.viewer },
+      );
+      assert(
+        replay.status === 409 &&
+          String(replay.body.error ?? '').includes('status'),
+        'restart-evicted stream replay returns 409 with status fallback',
+        replay,
+      );
+
+      const status = await http('GET', guardedStatusPath(guardedRun), {
+        headers: AUTH.viewer,
+      });
+      assert(
+        status.status === 200 &&
+          status.body.summary?.status === 'suspended' &&
+          status.body.agentId === GUARDED_AGENT_ID &&
+          status.body.threadId === guardedRun.threadId &&
+          status.body.resourceId === guardedRun.resourceId &&
+          status.body.runId === guardedRun.runId,
+        'authoritative durable status survives the workerd restart',
+        status,
+      );
+      assert(
+        status.body.approval?.id === guardedRun.approvalId &&
+          status.body.approval?.resumeTarget?.principal?.id === 'opal' &&
+          status.body.approval?.resumeTarget?.principal?.role === 'operator',
+        'status reconciliation retained the original execution principal',
+        status.body.approval,
+      );
+
+      const listed = await http('GET', '/api/approvals', {
+        headers: AUTH.viewer,
+      });
+      const record = listed.body.find(
+        (candidate) => candidate.id === guardedRun.approvalId,
+      );
+      assert(
+        listed.status === 200 &&
+          record?.status === 'pending' &&
+          record?.resumeTarget?.kind === 'agent-thread' &&
+          record?.resumeTarget?.agentId === GUARDED_AGENT_ID &&
+          record?.resumeTarget?.principal?.id === 'opal' &&
+          record?.resumeTarget?.principal?.role === 'operator' &&
+          record?.resumeTarget?.principal?.tenantId === 'spike',
+        'D1 approval record survived with its agent binding and principal',
+        record,
+      );
+
+      const foreign = await http('GET', guardedStatusPath(guardedRun), {
+        headers: AUTH.otherViewer,
+      });
+      assert(
+        foreign.status === 404,
+        'a foreign tenant receives no run-existence oracle',
+        foreign,
+      );
+      const wrongAgent = await http(
+        'GET',
+        guardedStatusPath(guardedRun).replace(
+          `/agents/${GUARDED_AGENT_ID}/`,
+          '/agents/not-registered/',
+        ),
+        { headers: AUTH.viewer },
+      );
+      assert(
+        wrongAgent.status === 404,
+        'a mismatched agent id is not found',
+        wrongAgent,
+      );
+    },
+  );
+
+  await step(
+    'PA3 approval resume: reviewer differs, requester principal restored, connector exactly once',
+    async () => {
+      const decided = await http(
+        'POST',
+        `/api/approvals/${guardedRun.approvalId}/decide`,
+        {
+          headers: AUTH.reviewer,
+          body: { decision: 'approve' },
+        },
+      );
+      assert(
+        decided.status === 200 &&
+          decided.body.record?.decidedBy === 'ray' &&
+          decided.body.resume?.attempted === true &&
+          decided.body.resume?.ok === true &&
+          decided.body.resume?.summary?.status === 'success',
+        'a different authorized reviewer resumed the guarded run to success',
+        decided,
+      );
+
+      const finalStatus = await http('GET', guardedStatusPath(guardedRun), {
+        headers: AUTH.viewer,
+      });
+      assert(
+        finalStatus.status === 200 &&
+          finalStatus.body.summary?.status === 'success' &&
+          finalStatus.body.approval === undefined &&
+          finalStatus.body.approvals === undefined,
+        'terminal status is authoritative and omits suspension-only approvals',
+        finalStatus,
+      );
+
+      const effects = await http(
+        'GET',
+        `/agent/live/effects?runId=${encodeURIComponent(guardedRun.runId)}`,
+        { headers: AUTH.viewer },
+      );
+      const call = effects.body.calls?.[0];
+      assert(
+        effects.status === 200 &&
+          effects.body.modelCalls === 1 &&
+          effects.body.connectorCalls === 1 &&
+          effects.body.effects === 1,
+        'the deterministic model ran once and the connector executed exactly once',
+        effects.body,
+      );
+      assert(
+        call?.run_id === guardedRun.runId &&
+          call?.thread_id === guardedRun.threadId &&
+          call?.resource_id === guardedRun.resourceId &&
+          call?.actor_id === 'opal' &&
+          call?.actor_role === 'operator' &&
+          call?.tenant_id === 'spike' &&
+          call?.entry_path === 'approval.resume',
+        'the connector saw the original requester principal, not reviewer ray',
+        call,
+      );
+
+      const staleDecision = await http(
+        'POST',
+        `/api/approvals/${guardedRun.approvalId}/decide`,
+        {
+          headers: AUTH.reviewer,
+          body: { decision: 'approve' },
+        },
+      );
+      assert(
+        staleDecision.status === 409,
+        'a stale/replayed approval decision cannot mint another execution leg',
+        staleDecision,
+      );
+      const afterReplay = await http(
+        'GET',
+        `/agent/live/effects?runId=${encodeURIComponent(guardedRun.runId)}`,
+        { headers: AUTH.viewer },
+      );
+      assert(
+        afterReplay.body.connectorCalls === 1 && afterReplay.body.effects === 1,
+        'stale approval replay did not execute the connector again',
+        afterReplay.body,
+      );
+    },
+  );
+
+  await step(
+    'PA4 binding mismatch: a run cannot be read through another bound thread',
+    async () => {
+      const second = await http('POST', GUARDED_AGENT_START_PATH, {
+        headers: AUTH.operator,
+        body: { prompt: 'Call the required write tool exactly once.' },
+      });
+      assert(
+        second.status === 200 && second.body.summary?.status === 'suspended',
+        'second guarded run suspended',
+        second,
+      );
+      const mismatched = await http(
+        'GET',
+        `/agents/${GUARDED_AGENT_ID}/runs/${encodeURIComponent(guardedRun.threadId)}/${encodeURIComponent(second.body.runId)}`,
+        { headers: AUTH.viewer },
+      );
+      assert(
+        mismatched.status === 404,
+        'stored thread/run binding mismatch returns 404',
+        mismatched,
+      );
+    },
+  );
 
   await step('A3 list: approval survived the restart', async () => {
     const { status, body } = await http('GET', '/api/approvals', {
@@ -1479,7 +1902,13 @@ let exitCode = 0;
 try {
   await main();
   console.log(
-    '\nSPIKE VERIFIED: run survived process death, resumed via approval ' +
+    '\nSPIKE VERIFIED: the authenticated Phase A catalog minted a guarded run, ' +
+      'suspended it before the connector, survived process death, rejected ' +
+      'evicted stream replay with authoritative status fallback, and restored ' +
+      'the original requester when a different reviewer approved. The connector ' +
+      'executed exactly once; forged context/headers, disallowed roles, wrong ' +
+      'tenants/agents/bindings, public raw resume, and stale decision replay all ' +
+      'failed closed. The lower-level workflow resumed via its exact-leg approval ' +
       'grant, a forged raw resume failed closed, and self-decision was denied. ' +
       'Live streaming (M-009): a decided event fanned out to the tenant socket, ' +
       'stayed isolated from another tenant, survived a kill+restart, and ' +

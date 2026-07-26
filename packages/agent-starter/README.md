@@ -69,10 +69,7 @@ notifications, thread-state, and schedules domains on Mastra's D1 store. The
 background-task Durable Object deliberately uses a separate tenant-scoped
 domain composition because Mastra's recovery scan is otherwise tenant-blind.
 
-The Worker itself uses `createFlowsafeWorker()` for health, live stream tickets,
-signals, goals, schedules, approvals, workflows/runs, SLA sweep, retention, and
-schedule/notification ticks. `preRoutes` adds the provider webhook, durable
-agent, subscription, and background-task facades.
+The Worker itself uses `createFlowsafeWorker()` for health, the guarded agent catalog, live stream tickets, signals, goals, schedules, approvals, workflows/runs, SLA sweep, retention, and schedule/notification ticks. `buildAgentRouter` mounts the metadata-only catalog, while `buildResumeRun` composes approval-only agent resume with the generic workflow path. `preRoutes` remains for provider webhook, subscription, and background-task facades.
 
 ## Quick start
 
@@ -184,16 +181,13 @@ host name is only a defense-in-depth cross-check.
 Start a run. IDs are intentionally absent from the body:
 
 ```bash
-curl -sS -X POST http://localhost:8787/api/agent/runs \
+curl -sS -X POST http://localhost:8787/agents/anchorage-agent/runs \
   -H "authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d '{"prompt":"Record that the launch checklist was completed"}'
 ```
 
-The response contains `threadId`, `resourceId`, `runId`, and a suspended
-summary. Keep all three IDs. The resource ID is deterministically minted from
-the server-minted thread ID, so notification delivery and restart resume can
-recover the same memory binding without trusting client state.
+The response envelope contains `agentId`, `threadId`, `resourceId`, `runId`, a suspended `summary`, and its approval record. Keep all three ids. The resource id is deterministically minted from the server-minted thread id, so notification delivery and restart resume can recover the same memory binding without trusting client state.
 
 List the queue:
 
@@ -217,9 +211,19 @@ thread/resource binding, and resumes through `RunnerRuntime`. Query status:
 
 ```bash
 curl -sS \
-  "http://localhost:8787/api/agent/runs/THREAD_ID/RUN_ID?resourceId=RESOURCE_ID" \
+  "http://localhost:8787/agents/anchorage-agent/runs/THREAD_ID/RUN_ID" \
   -H "authorization: Bearer $TOKEN"
 ```
+
+Observe newline-delimited JSON events with a reconnect cursor:
+
+```bash
+curl -sS \
+  "http://localhost:8787/agents/anchorage-agent/runs/THREAD_ID/RUN_ID/stream?offset=0" \
+  -H "authorization: Bearer $TOKEN"
+```
+
+Each line contains `offset`, the next reconnect cursor, and `event`. Replay is short-lived and in memory by default. If the stream returns 409 after eviction or restart, use the status route because the durable summary remains authoritative.
 
 To prove restart safety locally, stop `wrangler dev` after the suspended
 response, start it again, then make the approval decision.
@@ -234,8 +238,10 @@ requires a valid short-lived ticket minted by the bearer-authenticated
 | Method and route | Purpose |
 | --- | --- |
 | `GET /healthz` | Liveness |
-| `POST /api/agent/runs` | Server-mint a thread/resource/run and start the durable agent |
-| `GET /api/agent/runs/:threadId/:runId?resourceId=...` | Authoritative durable-agent status |
+| `GET /agents` | Registered agent metadata and authenticated actor |
+| `POST /agents/:agentId/runs` | Server-mint a thread/resource/run and start the guarded durable agent |
+| `GET /agents/:agentId/runs/:threadId/:runId` | Authoritative durable-agent status |
+| `GET /agents/:agentId/runs/:threadId/:runId/stream?offset=N` | Authenticated NDJSON observation |
 | `GET /workflows` | Generic workflow catalog (`starter-echo` included) |
 | `POST /runs` | Start a server-ID'd generic workflow |
 | `GET /runs/:workflowId/:runId` | Generic workflow status |
@@ -331,7 +337,7 @@ The one-minute tick does two independent jobs:
 - dispatches due notifications through the owning thread Durable Object.
 
 Agent schedules must name `agentId: "anchorage-agent"`. For a threaded schedule,
-use a `threadId` and `resourceId` returned by `POST /api/agent/runs`. Stored
+use a `threadId` and `resourceId` returned by `POST /agents/anchorage-agent/runs`. Stored
 request context cannot contain Breakwater grant keys or runtime-reserved keys.
 The tick mints a fresh tenant-salted run ID for every fire.
 
@@ -393,8 +399,9 @@ terminal by definition.
 
 Replace `MODEL_ID=provider/model` with the provider and model ID configured for
 your Mastra deployment. Set `MODEL_BASE_URL` when that provider uses a custom
-OpenAI-compatible endpoint. Provider-specific options can be added at the
-`agent.stream()` call without changing the durable runtime.
+OpenAI-compatible endpoint. Configure provider-specific model behavior when
+constructing the guarded agent; its `generate()` and `stream()` call options
+remain deliberately narrow.
 
 ## Security properties to preserve
 
@@ -425,7 +432,7 @@ OpenAI-compatible endpoint. Provider-specific options can be added at the
 
 ## Customize the starter
 
-1. Replace `createStarterAgent()` instructions and tools.
+1. Replace `createStarterAgentModule()` instructions, tools, metadata, and matching allowed roles.
 2. Keep every external side effect behind `createConnector()`.
 3. Add each connector's actual egress hosts to its permission manifest and pass
    outbound traffic through the connector runtime's guarded `fetch`.
@@ -458,17 +465,8 @@ the complete Worker without deploying.
 For a live proof, run the start → stop/restart → decide → status sequence above
 with real `MODEL_ID`/`MODEL_API_KEY` values.
 
-## Current composer limitation
+## Agent host composition
 
-`createFlowsafeWorker()` currently builds its default approval resolver around
-the generic run-Durable-Object resume topology. An advanced durable agent
-approval carries a thread resume target, which must rehydrate the agent registry
-inside the thread Durable Object before `RunnerRuntime.resume()`.
+The starter uses only the public `@proofoftech/flowsafe/agent-host` subpath. The Worker router receives `STARTER_AGENT_META`, while each `StarterThread` constructs its complete module from instance-scoped model, storage, runtime, pub/sub, connector, and database objects.
 
-This starter handles that case entirely through public APIs: a custom approval
-router runs in `preRoutes`, uses `buildHostApprovalService()`, sends thread
-targets through `createThreadTopology()`, and delegates ordinary workflow
-records to the composer topology. Because `preRoutes` runs before the built-in
-approval router, there is still one public approval surface. A future composer
-resume-topology injection seam could remove this small adapter; it does not
-weaken or bypass the runtime guarantees.
+`createThreadAgentHost()` owns the internal start/status/observe/resume topology. Application code does not author private `/agent/*` Durable Object URLs or keep mutable current-request scope. `createAgentApprovalResumer()` restores the original requester principal from the persisted approval target and delegates generic workflow records to the existing run topology.

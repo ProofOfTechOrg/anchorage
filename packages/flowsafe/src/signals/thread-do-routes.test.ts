@@ -11,7 +11,7 @@ import {
 import { describe, expect, it, vi } from 'vitest';
 
 import { RUNTIME_DRIVEN_AGENT } from '../agent-runner/index.js';
-import type { ThreadScope } from '../do-runner/index.js';
+import { DoStatusError, type ThreadScope } from '../do-runner/index.js';
 import { createThreadSignalRoutes } from './thread-do-routes.js';
 
 interface AgentCall {
@@ -78,6 +78,7 @@ function scopeWith(pubsub: unknown): ThreadScope {
   return {
     threadId: 'acme_t1',
     tenantId: 'acme',
+    actor: { id: 'operator', role: 'operator', tenantId: 'acme' },
     requestedBy: 'operator',
     init: { pubsub },
   } as unknown as ThreadScope;
@@ -233,6 +234,29 @@ describe('createThreadSignalRoutes', () => {
     } finally {
       log.mockRestore();
     }
+  });
+
+  it.each([
+    [403, 'forbidden'],
+    [404, 'not found'],
+    [409, 'conflict'],
+  ] as const)('preserves a trusted agent-host %s refusal without exposing its detail', async (status, message) => {
+    class AgentHostRefusal extends DoStatusError {
+      readonly status = status;
+    }
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => {
+        throw new AgentHostRefusal('private catalog detail');
+      },
+    });
+
+    const response = await routes(
+      post('/signal', { contents: 'hi' }),
+      scopeWith(undefined),
+    );
+
+    expect(response?.status).toBe(status);
+    expect(await response?.json()).toEqual({ error: message });
   });
 
   it('refuses an idle WAKE on a NON-runtime-driven agent (fail-closed to persist)', async () => {
@@ -1504,6 +1528,7 @@ describe('createThreadSignalRoutes', () => {
     expect(resolveAgent).toHaveBeenLastCalledWith(
       expect.any(Object),
       'other-agent',
+      'notification.dispatch',
     );
     expect(calls).toHaveLength(0);
   });

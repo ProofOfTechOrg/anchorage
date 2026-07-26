@@ -21,7 +21,10 @@
 import type { IMastraLogger } from '@mastra/core/logger';
 import { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
-import type { MastraCompositeStore } from '@mastra/core/storage';
+import type {
+  MastraCompositeStore,
+  UpdateWorkflowStateOptions,
+} from '@mastra/core/storage';
 import type {
   AnyWorkflow,
   WorkflowRunStatus,
@@ -29,6 +32,8 @@ import type {
 } from '@mastra/core/workflows';
 
 import {
+  BREAKWATER_ACTOR_KEY,
+  BREAKWATER_APPROVED_CONNECTORS_KEY,
   BREAKWATER_ISOLATION_SCOPE_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
 } from './breakwater-keys.js';
@@ -163,6 +168,66 @@ type CoreRunResult =
         'success' | 'failed' | 'suspended' | 'tripwire'
       >;
     };
+
+const NONTERMINAL_RUN_STATUSES = new Set<WorkflowRunStatus>([
+  'running',
+  'suspended',
+  'waiting',
+  'pending',
+  'paused',
+]);
+
+function terminalStateUpdate(
+  result: CoreRunResult,
+): UpdateWorkflowStateOptions | undefined {
+  if (NONTERMINAL_RUN_STATUSES.has(result.status)) return undefined;
+  const common = {
+    status: result.status,
+    result: undefined,
+    error: undefined,
+    suspendedPaths: {},
+    waitingPaths: {},
+    resumeLabels: {},
+    activePaths: [],
+    activeStepsPath: {},
+  };
+  if (result.status === 'success') {
+    return {
+      ...common,
+      result: result.result as UpdateWorkflowStateOptions['result'],
+    };
+  }
+  if (result.status === 'failed') {
+    const error = result.error;
+    const name =
+      error instanceof Error
+        ? error.name
+        : error !== null &&
+            typeof error === 'object' &&
+            'name' in error &&
+            typeof (error as { name: unknown }).name === 'string'
+          ? (error as { name: string }).name
+          : 'Error';
+    const stack =
+      error instanceof Error
+        ? error.stack
+        : error !== null &&
+            typeof error === 'object' &&
+            'stack' in error &&
+            typeof (error as { stack: unknown }).stack === 'string'
+          ? (error as { stack: string }).stack
+          : undefined;
+    return {
+      ...common,
+      error: {
+        name,
+        message: errorText(error),
+        ...(stack !== undefined ? { stack } : {}),
+      },
+    };
+  }
+  return common;
+}
 
 // Failed runs carry the step's thrown error as an Error instance, a string,
 // or — once it crossed an engine/persistence boundary — a serialized
@@ -407,6 +472,49 @@ export type RequestContextProvider = (
   | undefined
   | Promise<Record<string, unknown> | undefined>;
 
+const TRUSTED_IDENTITY_CONTEXT_KEYS = new Set([
+  BREAKWATER_ACTOR_KEY,
+  'breakwater.auditContext',
+  'runId',
+  'threadId',
+  'resourceId',
+]);
+
+function orderedRequestContext(
+  runtimeContext: Record<string, unknown>,
+  provided: Record<string, unknown> | undefined,
+): RequestContext {
+  const stored: Array<[string, unknown]> = [];
+  const capabilities: Array<[string, unknown]> = [];
+  const identity: Array<[string, unknown]> = [];
+  for (const entry of Object.entries(provided ?? {})) {
+    const [key] = entry;
+    if (
+      key === BREAKWATER_WORKFLOW_SCOPE_KEY ||
+      key === BREAKWATER_ISOLATION_SCOPE_KEY
+    ) {
+      continue;
+    }
+    if (TRUSTED_IDENTITY_CONTEXT_KEYS.has(key)) {
+      identity.push(entry);
+    } else if (
+      key === BREAKWATER_APPROVED_CONNECTORS_KEY ||
+      key.startsWith('breakwater.') ||
+      key === 'mastra:goal'
+    ) {
+      capabilities.push(entry);
+    } else {
+      stored.push(entry);
+    }
+  }
+  return new RequestContext([
+    ...stored,
+    ...Object.entries(runtimeContext),
+    ...capabilities,
+    ...identity,
+  ]);
+}
+
 export interface RunnerRuntimeOptions {
   storage: MastraCompositeStore;
   logger?: IMastraLogger | false;
@@ -602,6 +710,7 @@ export class RunnerRuntime {
       } catch (error) {
         throw asClientError(error) ?? error;
       }
+      await this.#reconcileTerminalState(workflowId, run.runId, result);
       return summarize(run.runId, result);
     });
   }
@@ -627,23 +736,13 @@ export class RunnerRuntime {
       // Provider before createRun for symmetry with start(): a resume-time
       // createRun only reattaches (no snapshot write), but failing before it
       // still does the least work and keeps the ordering invariant uniform.
-      const step = resolveResumeStep(options.step, state);
-      const stepKey = step?.join('.');
-      // resumeCount is read BEFORE this resume increments it: it is the count
-      // of prior resumes = the ordinal of the CURRENT suspension being resumed
-      // (undefined for a first suspension), which the minting approval captured
-      // at that suspension. suspendedAt still comes from the snapshot.
-      const priorCounts = await this.#resumeLedger.counts(runKey);
-      const requestContext = await this.#requestContextFor(workflowId, runId, {
-        kind: 'resume',
-        step,
-        suspendedAt:
-          stepKey !== undefined
-            ? suspendedAtOf(state.steps, stepKey)
-            : undefined,
-        resumeCount:
-          stepKey !== undefined ? priorCounts?.get(stepKey) : undefined,
-      });
+      const { stepKey, priorCounts, requestContext } =
+        await this.#trustedResumePreparation(
+          workflowId,
+          runId,
+          state,
+          options.step,
+        );
       // Same host pubsub identity as start() (CI-M-002-002) — see the note
       // there; undefined stays byte-identical to `createRun({ runId })`.
       const run = await workflow.createRun({ runId, pubsub: this.#pubsub });
@@ -673,6 +772,7 @@ export class RunnerRuntime {
         );
       }
       const summary = summarize(run.runId, result, counts);
+      await this.#reconcileTerminalState(workflowId, run.runId, result);
       // Terminal run: drop the ledger (no further suspension can occur).
       if (summary.status !== 'suspended') {
         await this.#resumeLedger.delete(runKey);
@@ -697,6 +797,33 @@ export class RunnerRuntime {
     return summarizeState(runId, state, counts);
   }
 
+  /**
+   * Derive the exact trusted context the next resume leg will receive without
+   * advancing the run. Durable-agent hosts use it while rehydrating the
+   * in-process registry, then call resume(); resume independently re-derives
+   * the same suspension fingerprint before execution.
+   */
+  async trustedRequestContextForResume(
+    workflowId: string,
+    runId: string,
+    options: Pick<ResumeRunOptions, 'step'> = {},
+  ): Promise<RequestContext> {
+    const workflow = this.#getWorkflow(workflowId);
+    const state = await workflow.getWorkflowRunById(runId);
+    if (!state) throw new UnknownRunError(workflowId, runId);
+    if (state.status !== 'suspended') {
+      throw new RunNotSuspendedError(workflowId, runId, state.status);
+    }
+    return (
+      await this.#trustedResumePreparation(
+        workflowId,
+        runId,
+        state,
+        options.step,
+      )
+    ).requestContext;
+  }
+
   // A provider crash propagates (fail loud): silently starting the leg with
   // fewer capabilities than intended would mask the fault. Missing grants can
   // only ever deny downstream (fail closed), so loud propagation is safe.
@@ -704,8 +831,9 @@ export class RunnerRuntime {
   // Every leg — provider or not — carries a base context minting the
   // workflow-scope key (breakwater's crossWorkflowIsolation reads it): the
   // runtime is the trusted authority for "which workflow is executing", so
-  // the scope is never client-suppliable. Provider values merge OVER the
-  // base, so a provider can override the scope deliberately.
+  // the scope is never client-suppliable. Provider values are partitioned into
+  // stored application context, capabilities, and trusted identity so every
+  // layer has an explicit order and a provider cannot replace runtime scope.
   async #requestContextFor(
     workflowId: string,
     runId: string,
@@ -741,7 +869,70 @@ export class RunnerRuntime {
     const values = this.#requestContextForRun
       ? await this.#requestContextForRun(workflowId, runId, leg)
       : undefined;
-    return new RequestContext(Object.entries({ ...base, ...values }));
+    return orderedRequestContext(base, values);
+  }
+
+  async #trustedResumePreparation(
+    workflowId: string,
+    runId: string,
+    state: WorkflowState,
+    selectedStep: string | string[] | undefined,
+  ): Promise<{
+    stepKey: string | undefined;
+    priorCounts: ReadonlyMap<string, number> | undefined;
+    requestContext: RequestContext;
+  }> {
+    const step = resolveResumeStep(selectedStep, state);
+    const stepKey = step?.join('.');
+    // resumeCount is read BEFORE this resume increments it: it is the count
+    // of prior resumes = the ordinal of the CURRENT suspension being resumed
+    // (undefined for a first suspension), which the minting approval captured.
+    const priorCounts = await this.#resumeLedger.counts(
+      this.#runKey(workflowId, runId),
+    );
+    const requestContext = await this.#requestContextFor(workflowId, runId, {
+      kind: 'resume',
+      step,
+      suspendedAt:
+        stepKey !== undefined ? suspendedAtOf(state.steps, stepKey) : undefined,
+      resumeCount:
+        stepKey !== undefined ? priorCounts?.get(stepKey) : undefined,
+    });
+    return { stepKey, priorCounts, requestContext };
+  }
+
+  async #reconcileTerminalState(
+    workflowId: string,
+    runId: string,
+    result: CoreRunResult,
+  ): Promise<void> {
+    const opts = terminalStateUpdate(result);
+    if (!opts) return;
+    const workflows = await this.#storage.getStore('workflows');
+    if (!workflows) {
+      throw new Error(
+        'RunnerRuntime: workflows storage is unavailable while persisting terminal state',
+      );
+    }
+    const snapshot = await workflows.loadWorkflowSnapshot({
+      workflowName: workflowId,
+      runId,
+    });
+    if (!snapshot) {
+      throw new Error(
+        `RunnerRuntime: run '${runId}' of workflow '${workflowId}' completed without a durable snapshot`,
+      );
+    }
+    if (snapshot.status === result.status) return;
+    await workflows.persistWorkflowSnapshot({
+      workflowName: workflowId,
+      runId,
+      snapshot: {
+        ...snapshot,
+        ...opts,
+        timestamp: Date.now(),
+      },
+    });
   }
 
   #getWorkflow(workflowId: string): AnyWorkflow {

@@ -17,8 +17,9 @@
 //
 // Export rule: this root barrel mirrors the approval-api, do-runner,
 // artifacts, and audit-export subpath barrels COMPLETELY — anything those
-// subpaths export is also importable from the package root. approval-ui and
-// host-kit are subpath-only by design (React peer / host glue).
+// subpaths export is also importable from the package root. approval-ui,
+// host-kit, and agent-host are subpath-only by design (React peer, host glue,
+// and the guarded host's optional Breakwater runtime dependency).
 
 export * from './approval-api/index.js';
 export * from './artifacts/index.js';

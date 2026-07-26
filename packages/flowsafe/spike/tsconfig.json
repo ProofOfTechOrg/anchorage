@@ -7,7 +7,8 @@
     // never depends on a built breakwater dist — a fresh checkout typechecks
     // before any build.
     "paths": {
-      "@proofoftech/breakwater": ["../../breakwater/src/index.ts"]
+      "@proofoftech/breakwater": ["../../breakwater/src/index.ts"],
+      "@proofoftech/breakwater/*": ["../../breakwater/src/*/index.ts"]
     }
   },
   "include": ["./worker.ts", "../src/**/*.ts"],

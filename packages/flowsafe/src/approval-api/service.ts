@@ -8,7 +8,10 @@
 // (grants.ts) derives requestContext grants from approved records at
 // start/resume. Nothing here ever reads capability data from client input.
 
-import { tenantOwnsSaltedId } from '../do-runner/path-safe-id.js';
+import {
+  PATH_SAFE_ID_PATTERN,
+  tenantOwnsSaltedId,
+} from '../do-runner/path-safe-id.js';
 import type {
   ApprovalActor,
   ApprovalAuditSink,
@@ -914,18 +917,49 @@ export class ApprovalService {
   }
 
   #validateResumeTarget(target: ApprovalResumeTarget): void {
-    if (
-      target.kind !== 'thread' ||
-      typeof target.threadId !== 'string' ||
-      !tenantOwnsSaltedId(this.#store.tenantId, target.threadId) ||
-      (target.resourceId !== undefined &&
-        (typeof target.resourceId !== 'string' ||
-          !tenantOwnsSaltedId(this.#store.tenantId, target.resourceId)))
-    ) {
+    if (target === null || typeof target !== 'object') {
       throw new InvalidApprovalInputError(
-        'resumeTarget must name thread/resource ids owned by the bound tenant',
+        'resumeTarget must be a trusted thread or agent-thread target',
       );
     }
+    const ownsPathSafeId = (value: unknown): value is string =>
+      typeof value === 'string' &&
+      PATH_SAFE_ID_PATTERN.test(value) &&
+      tenantOwnsSaltedId(this.#store.tenantId, value);
+    if (target.kind === 'thread') {
+      if (
+        !ownsPathSafeId(target.threadId) ||
+        (target.resourceId !== undefined && !ownsPathSafeId(target.resourceId))
+      ) {
+        throw new InvalidApprovalInputError(
+          'resumeTarget must name path-safe thread/resource ids owned by the bound tenant',
+        );
+      }
+      return;
+    }
+    if (target.kind === 'agent-thread') {
+      const principal = target.principal;
+      if (
+        typeof target.agentId !== 'string' ||
+        !PATH_SAFE_ID_PATTERN.test(target.agentId) ||
+        !ownsPathSafeId(target.threadId) ||
+        !ownsPathSafeId(target.resourceId) ||
+        principal === null ||
+        typeof principal !== 'object' ||
+        typeof principal.id !== 'string' ||
+        principal.id.trim() === '' ||
+        !(APPROVAL_ROLES as readonly string[]).includes(principal.role) ||
+        principal.tenantId !== this.#store.tenantId
+      ) {
+        throw new InvalidApprovalInputError(
+          'agent resumeTarget must name path-safe ids and a valid principal owned by the bound tenant',
+        );
+      }
+      return;
+    }
+    throw new InvalidApprovalInputError(
+      'resumeTarget must be a trusted thread or agent-thread target',
+    );
   }
 }
 

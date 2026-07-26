@@ -72,6 +72,17 @@ Before deployment:
 7. Confirm audit Queue dead-letter policy and collector authorization.
 8. Confirm a rollback bundle remains compatible with the deployed database and migration tags.
 
+Before the first guarded agent-host deployment, drain approvals created by the legacy raw-agent target. Approve or reject them through the existing API so the state machine and audit record every transition, then verify that no open records remain:
+
+```bash
+pnpm exec wrangler d1 execute anchorage-agent-starter \
+  --remote \
+  --config packages/agent-starter/wrangler.jsonc \
+  --command "SELECT COUNT(*) AS open_agent_approvals FROM flowsafe_approvals WHERE workflow_id = 'durable-agentic-loop' AND status IN ('pending', 'claimed', 'escalated');"
+```
+
+Deploy only when `open_agent_approvals` is zero. Do not close these records through direct SQL mutation.
+
 ## Provision a tenant
 
 Tenant ids match `^[a-z0-9]{3,32}$`. They are permanent identifiers, not display names.
@@ -171,9 +182,12 @@ Exercise:
 3. attempt self-decision and expect the configured result;
 4. approve as an independent reviewer;
 5. observe run completion;
-6. forge a raw resume on a fresh protected gate and confirm connector denial;
-7. disconnect the live socket and confirm polling catches up;
-8. if enabled, send a signal, fire a schedule, run a task, and reconcile a provider subscription.
+6. start a guarded agent and observe its suspension;
+7. confirm every public agent resume path returns 404;
+8. restart the Worker, approve as a different reviewer, and confirm the original requester remains the execution principal;
+9. disconnect the live socket and confirm polling catches up;
+10. evict agent stream replay and confirm status remains authoritative after the stream returns 409;
+11. if enabled, send a signal, fire a schedule, run a task, and reconcile a provider subscription.
 
 ## Audit and alerting
 
@@ -206,6 +220,7 @@ Audit records are security evidence. Queue depth and SIEM ingestion status must 
 | Start returns duplicate-run conflict | Client retried after a response loss | Query the server-minted run id; do not mint a replacement blindly |
 | Run stays `suspended` after approval | Decision result and resume outcome | Read stored decision, status, and audit; redrive through trusted resume |
 | Durable agent resume fails after eviction | Prepare/observe registration and memory binding | Use `resumeViaRuntime()` through the thread topology; never raw inherited resume |
+| Agent stream returns 409 | In-memory replay cache was evicted or the isolate restarted | Read the authoritative status route; reconnect only for events still present in the configured cache |
 | Connector says approval missing after an approved record | Fingerprint, connector id, tenant-bound store | Confirm the record matches current step, `suspendedAt`, `resumeCount`, and exact connector id |
 | Connector repeats an external write | Idempotency key, shared store, pending TTL | Fix the business key/store reach/TTL; inspect vendor idempotency evidence |
 | One tenant throttles another | Missing isolation scope or in-memory rate store | Register `tenantIsolation()` and use D1 rate storage |

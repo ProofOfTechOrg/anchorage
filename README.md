@@ -27,8 +27,8 @@ Anchorage is not a model provider, identity provider, hosted SaaS, generic proce
 
 | Package | Install when you need | Main surfaces |
 | --- | --- | --- |
-| [`@proofoftech/breakwater`](packages/breakwater/README.md) | Guardrails around Mastra agents and tools | Policy processors, RBAC, audit and metrics, connector SDK, Claude Code and Codex CLI connectors |
-| [`@proofoftech/flowsafe`](packages/flowsafe/README.md) | Durable execution and human approval on Cloudflare | Durable Object runner, approval API and React UI, tenant-safe agents, signals, goals, schedules, background tasks, provider subscriptions, R2 artifacts, SIEM export |
+| [`@proofoftech/breakwater`](packages/breakwater/README.md) | Guardrails around Mastra agents and tools | Guarded agent handles, policy processors, RBAC, audit and metrics, connector SDK, Claude Code and Codex CLI connectors |
+| [`@proofoftech/flowsafe`](packages/flowsafe/README.md) | Durable execution and human approval on Cloudflare | Guarded agent catalog/host, Durable Object runner, approval API and React UI, signals, goals, schedules, background tasks, provider subscriptions, R2 artifacts, SIEM export |
 
 Both packages are ESM-only, require Node 22 or later, and declare
 `@mastra/core` `^1.50.0` as their peer range. React 18 or 19 is needed only
@@ -40,17 +40,15 @@ for the optional flowsafe approval UI.
 npm install @mastra/core@^1.50.0 @proofoftech/breakwater
 ```
 
-Register breakwater processors on a Mastra agent and pass the authenticated actor through Mastra's `RequestContext`:
+Create a guarded agent and pass the authenticated actor through Mastra's `RequestContext`:
 
 ```typescript
-import { Agent } from '@mastra/core/agent';
 import { RequestContext } from '@mastra/core/request-context';
 import {
   ACTOR_CONTEXT_KEY,
   AuditLogger,
+  createGuardedAgent,
   denyPatterns,
-  PolicyEngine,
-  RBACMiddleware,
 } from '@proofoftech/breakwater';
 
 const audit = new AuditLogger({
@@ -59,28 +57,19 @@ const audit = new AuditLogger({
   },
 });
 
-const policy = new PolicyEngine({
-  policies: [denyPatterns(['private key', 'ignore previous instructions'])],
-  audit,
-  holdBack: true,
-});
-
 const model = process.env.MASTRA_MODEL_ID;
 if (!model) throw new Error('MASTRA_MODEL_ID is required');
 
-const agent = new Agent({
+const agent = createGuardedAgent({
   id: 'release-agent',
   name: 'Release agent',
   instructions: 'Prepare releases without exposing secrets.',
   model,
-  inputProcessors: [
-    new RBACMiddleware({
-      allowedRoles: ['operator', 'admin'],
-      audit,
-    }),
-    policy,
-  ],
-  outputProcessors: [policy],
+  allowedRoles: ['operator', 'admin'],
+  policies: [denyPatterns(['private key', 'ignore previous instructions'])],
+  audit,
+  maxSteps: 8,
+  toolChoice: 'auto',
 });
 
 const requestContext = new RequestContext();
@@ -179,6 +168,8 @@ The full path from install to first approval is in [`docs/getting-started.md`](d
 
 The following surfaces are supported and opt-in: they are tested and covered by package compatibility guarantees, but the host must explicitly wire the required routes, bindings, storage domains, or scheduled duties.
 
+- Server-owned guarded-agent catalog with authenticated list, start, status, and NDJSON observation routes
+- Approval-only durable agent resume that restores the original authorized principal
 - Runtime-driven Mastra durable agents with restart-safe approval resume
 - Tenant-minted thread and resource identities with D1-backed recall isolation
 - Thread signals, messages, state, notifications, idle wake, and a DOM-free client

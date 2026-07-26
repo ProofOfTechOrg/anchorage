@@ -1,17 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { Agent } from '@mastra/core/agent';
 import type { MastraModelConfig } from '@mastra/core/llm';
 import {
+  type AuditLogger,
   createConnector,
+  createGuardedAgent,
   D1RateLimitStore,
   type RateLimitDatabase,
   tenantIsolation,
 } from '@proofoftech/breakwater';
+import type { AgentMeta, AgentModule } from '@proofoftech/flowsafe/agent-host';
 import { z } from 'zod';
 
 export const STARTER_AGENT_ID = 'anchorage-agent';
 export const RECORD_ACTION_CONNECTOR_ID = 'starter_recordAction';
+export const STARTER_AGENT_META = {
+  id: STARTER_AGENT_ID,
+  title: 'Anchorage durable agent',
+  description:
+    'Records one approval-gated operation in the tenant-isolated starter ledger.',
+  allowedRoles: ['admin', 'operator', 'builder'],
+} as const satisfies AgentMeta;
 
 const actionInput = z.object({
   action: z.string().min(1).max(500),
@@ -86,12 +95,13 @@ export function createRecordActionConnector(db: Env['DB']) {
   });
 }
 
-export function createStarterAgent(options: {
+export function createStarterAgentModule(options: {
   model: MastraModelConfig;
   db: Env['DB'];
-}) {
+  audit: AuditLogger;
+}): AgentModule {
   const recordAction = createRecordActionConnector(options.db);
-  return new Agent({
+  const agent = createGuardedAgent({
     id: STARTER_AGENT_ID,
     name: 'Anchorage durable agent',
     instructions: [
@@ -103,5 +113,14 @@ export function createStarterAgent(options: {
     tools: {
       [RECORD_ACTION_CONNECTOR_ID]: recordAction,
     },
+    allowedRoles: STARTER_AGENT_META.allowedRoles,
+    policies: [],
+    audit: options.audit,
+    maxSteps: 1,
+    toolChoice: 'required',
   });
+  return {
+    meta: STARTER_AGENT_META,
+    agent,
+  };
 }

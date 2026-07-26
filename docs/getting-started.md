@@ -19,17 +19,15 @@ npm install @mastra/core@^1.50.0 @proofoftech/breakwater
 
 ### Add agent-boundary policy
 
-Construct one `AuditLogger` and give it to every gate. A denial aborts the processor chain, so each gate records its own decision rather than relying on a trailing audit processor.
+Construct one `AuditLogger`, then create the agent through the guarded factory. The returned handle exposes only unstructured `generate()` and `stream()` calls with a mandatory request context.
 
 ```typescript
-import { Agent } from '@mastra/core/agent';
 import {
   AuditLogger,
   classifierPolicy,
+  createGuardedAgent,
   denyPatterns,
   piiSecrets,
-  PolicyEngine,
-  RBACMiddleware,
 } from '@proofoftech/breakwater';
 
 const audit = new AuditLogger({
@@ -41,9 +39,16 @@ const audit = new AuditLogger({
   },
 });
 
-const policy = new PolicyEngine({
+const model = process.env.MASTRA_MODEL_ID;
+if (!model) throw new Error('MASTRA_MODEL_ID is required');
+
+export const agent = createGuardedAgent({
+  id: 'guarded-agent',
+  name: 'Guarded agent',
+  instructions: 'Complete the task within the supplied permissions.',
+  model,
+  allowedRoles: ['operator', 'admin'],
   audit,
-  holdBack: true,
   policies: [
     denyPatterns(['ignore previous instructions']),
     piiSecrets(),
@@ -54,28 +59,14 @@ const policy = new PolicyEngine({
       timeoutMs: 2_000,
     }),
   ],
-});
-
-const model = process.env.MASTRA_MODEL_ID;
-if (!model) throw new Error('MASTRA_MODEL_ID is required');
-
-export const agent = new Agent({
-  id: 'guarded-agent',
-  name: 'Guarded agent',
-  instructions: 'Complete the task within the supplied permissions.',
-  model,
-  inputProcessors: [
-    new RBACMiddleware({
-      allowedRoles: ['operator', 'admin'],
-      audit,
-    }),
-    policy,
-  ],
-  outputProcessors: [policy],
+  maxSteps: 8,
+  toolChoice: 'auto',
 });
 ```
 
-`holdBack: true` keeps each policy's declared trailing window from being emitted until the engine can determine that it is safe. The guarantee applies per stream segment. Policies that do not declare `holdBackChars` do not gain a window automatically.
+`createGuardedAgent()` forces policy hold-back, disables background continuations, and rejects per-call processor, tool, model, callback, hook, structured-output, and execution-limit overrides. Application input processors can enforce only initial input. Application output processors must enforce both streamed and final results.
+
+The narrow handle prevents accidental bypass through Mastra's larger `Agent` API. It is a trusted in-process API, not a sandbox against hostile code running with the same imports and credentials.
 
 ### Supply the authenticated actor
 
@@ -176,7 +167,11 @@ Start from [`packages/flowsafe/deploy/`](../packages/flowsafe/deploy/README.md).
 6. Configure the sweep and purge cron expressions.
 7. Deploy, start a run, approve its queued suspension as a different actor, and inspect the terminal status.
 
-The baseline template deliberately exposes a raw resume route for recovery and testing, but raw resume data never carries a connector grant. Side-effecting steps remain protected by the server-derived approval context.
+The baseline template deliberately exposes a raw resume route for generic
+workflow recovery and testing, but raw resume data never carries a connector
+grant. Side-effecting steps remain protected by the server-derived approval
+context. The agent host has no public resume route; an agent run advances only
+through an approval decision.
 
 ## Define an approval gate
 

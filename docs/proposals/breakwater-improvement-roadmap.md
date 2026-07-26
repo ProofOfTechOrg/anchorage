@@ -1,6 +1,6 @@
 # Proposal: breakwater improvement roadmap
 
-> This document records uncommitted design work. It is not implemented or supported product behavior. Shipped behavior is documented in [Breakwater architecture](../breakwater-architecture.md), [Policy engine](../policy-engine-design.md), and [Connector interface](../connector-interface.md).
+> This document records roadmap decisions and remaining uncommitted work. Phase A is shipped through guarded Breakwater agents and Flowsafe's catalog-driven agent host. Supported behavior is documented in [Breakwater architecture](../breakwater-architecture.md), [Durable agents](../durable-agents.md), [Policy engine](../policy-engine-design.md), and [Connector interface](../connector-interface.md).
 
 This document turns the limitations and ownership boundaries described in
 [`breakwater-purpose-and-boundaries.md`](../breakwater-purpose-and-boundaries.md)
@@ -25,13 +25,13 @@ testable, and appropriately placed.
 
 | Priority | Improvement | Why |
 |---|---|---|
-| **P0** | Add an authenticated agent catalog and host-level agent run router | There is no central place that says who may start or resume each agent |
-| **P0** | Make mandatory agent processors impossible to omit or override | `RBACMiddleware` currently protects an agent only when every caller wires it correctly |
-| **P0** | Centralize reserved request-context stripping and server derivation | All actor, tenant, workflow, approval, and idempotency capabilities must remain runtime-owned |
-| **P0** | Bind audit events to the actual agent/run/tenant context | Current RBAC events identify the processor, not the agent being authorized |
-| **P0 decision** | Narrow or explicitly accept connector-wide approval grants within one leg | Suspension binding is strong, but the execution capability is still a connector-ID grant for that leg |
-| **P0** | Ship end-to-end invariant tests for every invocation path | Unit tests cannot prove that route, agent, workflow, nested, direct, and resume paths compose safely |
-| **P0** | Align public documentation with shipped enforcement | Design sketches and broad package descriptions must not be mistaken for implemented controls |
+| **Shipped** | Authenticated agent catalog and host-level agent run router | Flowsafe resolves metadata before mutation authorization and exposes no public agent resume |
+| **Shipped** | Mandatory agent processors that callers cannot omit or override | `createGuardedAgent()` exposes only the validated unstructured invocation surface |
+| **Shipped** | Central reserved request-context stripping and server derivation | Actor, tenant, workflow, approval, isolation, and audit correlation remain runtime-owned |
+| **Shipped** | Agent/run/tenant audit correlation | Guarded RBAC and policy events use `agent:<id>` plus safe host-derived correlation |
+| **Phase A decision** | Accept exact-leg connector-ID approval grants | Structured tool-call and argument grants remain Phase B work |
+| **Shipped** | End-to-end invariant tests for supported invocation paths | The deterministic workerd proof covers restart, approval resume, forgery, tenancy, and exactly-once execution |
+| **Shipped** | Public documentation aligned with guarded agent hosting | The architecture, durable-agent, deployment, threat-model, operations, starter, and API guides define the supported boundary |
 | **P1** | Add permission-based authorization without role inheritance | Fine-grained permissions scale better than hard-coded role semantics |
 | **P1** | Add optional connector invocation permissions | Human/service authorization and human approval answer different questions |
 | **P1** | Publish secure single-tenant and multi-tenant policy presets | Optional evaluators and stores are otherwise easy to omit |
@@ -42,7 +42,9 @@ testable, and appropriately placed.
 | **P2** | Add stricter rate-limit algorithms and operational maintenance | Fixed windows and durable stores need production-scale alternatives and cleanup |
 | **P2** | Rationalize overlap with new Mastra features on every upgrade | Mastra now supplies auth, processors, approval, hooks, and observability that should be reused where appropriate |
 
-## P0: Required Before General Production Agent Access
+## Phase A decision record
+
+The following sections preserve the investigation and acceptance criteria that produced the shipped guarded-agent boundary. Their “current state” subsections describe the pre-Phase A baseline, not current package behavior.
 
 ### 1. Add a Central Agent Catalog and Host-Level Authorization Boundary
 
@@ -775,26 +777,24 @@ dependency.
 
 ## Recommended Delivery Sequence
 
-### Phase A: Agent access foundation
+### Phase A: Agent access foundation (shipped)
 
 1. Define `AgentMeta`/`AgentModule` and a server-owned catalog.
-2. Implement authenticated start/resume/status/stream routes with tenant
-   ownership and route-level role enforcement.
-3. Implement `createGuardedAgent` or an equivalent non-bypassable handle.
-4. Centralize reserved-context sanitization and trusted derivation.
-5. Add resource-specific audit attribution.
-6. Ship the end-to-end enforcement matrix.
+2. Implement authenticated start/status/stream routes with tenant ownership and route-level role enforcement.
+3. Keep agent resume approval-only and restore the original authorized principal.
+4. Implement `createGuardedAgent` with a narrow, non-overridable handle.
+5. Centralize reserved-context sanitization and trusted derivation.
+6. Add resource-specific audit attribution.
+7. Ship the end-to-end enforcement matrix.
 
-This phase should complete before a general-purpose public agent endpoint is
-enabled.
+The shipped host deliberately omits a public raw-resume route. It accepts connector-ID grants bound to the exact `(suspendedAt, resumeCount)` leg.
 
-### Phase B: Approval and principal hardening
+### Phase B: Approval capability and principal hardening
 
-1. Trace grant lifetime through a real durable agent resume.
-2. Choose connector/leg/tool-call/input/nonce grant scope.
-3. Define human/service/agent/system principals.
-4. Prove scheduled, signal, background, and nested execution cannot inherit a
-   stale or broader grant.
+1. Define human, service, agent, and system principals beyond the Phase A human-role snapshot.
+2. Choose connector/leg/tool-call/input/nonce grant scope for structured grants.
+3. Prove scheduled, signal, background, and nested execution cannot inherit a stale or broader grant.
+4. Add dynamic principal re-resolution only when a concrete identity-provider contract exists.
 
 ### Phase C: Fine-grained authorization
 

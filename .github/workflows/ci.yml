@@ -53,11 +53,20 @@ jobs:
       - name: Build API documentation
         run: pnpm docs:api
 
+      - name: Verify release package order
+        run: pnpm test:release-order
+
       # Build and install the actual tarball in an offline consumer. Keep this
       # after Build so manifest exports, declarations, docs, and runtime imports
       # are verified against the publish surface rather than workspace source.
       - name: Verify packed breakwater surface
         run: pnpm test:packed-breakwater
+
+      # The guarded host is subpath-only and carries an optional Breakwater
+      # peer. Compile and import the packed tarball so the export, declarations,
+      # peer floor, and runtime graph are checked as a consumer sees them.
+      - name: Verify packed flowsafe agent-host surface
+        run: pnpm test:packed-flowsafe-agent-host
 
       # Pack the built package and resolve the public deep import under browser
       # conditions. This catches Node-only transitive imports that source-level

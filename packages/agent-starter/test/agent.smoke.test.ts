@@ -3,6 +3,8 @@
 import { RequestContext } from '@mastra/core/request-context';
 import type { ToolExecutionContext } from '@mastra/core/tools';
 import {
+  ACTOR_CONTEXT_KEY,
+  AuditLogger,
   ConnectorPolicyError,
   ISOLATION_SCOPE_CONTEXT_KEY,
 } from '@proofoftech/breakwater';
@@ -10,8 +12,8 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   createRecordActionConnector,
-  createStarterAgent,
-  RECORD_ACTION_CONNECTOR_ID,
+  createStarterAgentModule,
+  STARTER_AGENT_META,
 } from '../src/agent.js';
 import { deterministicModel } from './deterministic-model.js';
 
@@ -31,16 +33,38 @@ function sideEffectTrap(): {
 describe('advanced starter agent', () => {
   it('generates deterministically without a provider credential or side effect', async () => {
     const { db, prepare } = sideEffectTrap();
-    const agent = createStarterAgent({
+    const events: unknown[] = [];
+    const module = createStarterAgentModule({
       model: deterministicModel,
       db,
+      audit: new AuditLogger({
+        sink: (event) => {
+          events.push(event);
+        },
+      }),
+    });
+    const requestContext = new RequestContext();
+    requestContext.set(ACTOR_CONTEXT_KEY, {
+      id: 'starter-operator',
+      role: 'operator',
     });
 
-    const result = await agent.generate('smoke test');
-    const tools = await agent.listTools();
+    const result = await module.agent.generate('smoke test', {
+      requestContext,
+    });
 
     expect(result.text).toBe('deterministic starter response');
-    expect(tools).toHaveProperty(RECORD_ACTION_CONNECTOR_ID);
+    expect(module.meta).toEqual(STARTER_AGENT_META);
+    expect(module.agent.allowedRoles).toEqual(STARTER_AGENT_META.allowedRoles);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          action: 'agent.input.authorize',
+          resource: `agent:${STARTER_AGENT_META.id}`,
+          decision: 'allowed',
+        }),
+      ]),
+    );
     expect(prepare).not.toHaveBeenCalled();
   });
 

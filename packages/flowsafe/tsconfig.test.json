@@ -8,10 +8,13 @@
     "rootDir": "../..",
     "paths": {
       "@proofoftech/breakwater": ["../breakwater/src/index.ts"],
+      "@proofoftech/breakwater/agent": ["../breakwater/src/agent/index.ts"],
+      "@proofoftech/breakwater/audit": ["../breakwater/src/audit/index.ts"],
       // deploy/worker.ts (pulled in by its e2e test) imports the package
       // specifiers a copy-ready consumer would; resolve them to source here
       // (matches the vitest aliases).
       "@proofoftech/flowsafe/approval-api": ["./src/approval-api/index.ts"],
+      "@proofoftech/flowsafe/agent-host": ["./src/agent-host/index.ts"],
       "@proofoftech/flowsafe/audit-export": ["./src/audit-export/index.ts"],
       "@proofoftech/flowsafe/do-runner": ["./src/do-runner/index.ts"],
       "@proofoftech/flowsafe/host-kit": ["./src/host-kit/index.ts"]

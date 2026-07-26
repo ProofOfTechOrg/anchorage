@@ -30,12 +30,25 @@
 // DurableObject` from 'cloudflare:workers' — so this module and its graph load
 // in node/vitest, the same posture as DurableObjectRunner and HubDurableObject.
 
+import type { ApprovalActor, ApprovalRole } from '../approval-api/contract.js';
 import type { DurableObjectRunnerState } from './cf-types.js';
 import { DoStatusError, doErrorResponse } from './do-error-response.js';
 import type { InitResult } from './init.js';
 import { tenantOfMemoryId } from './memory-id.js';
 import { DurableStorageResumeLedger } from './resume-ledger.js';
-import { THREAD_ACTOR_HEADER, THREAD_TENANT_HEADER } from './thread-header.js';
+import {
+  THREAD_ACTOR_HEADER,
+  THREAD_ACTOR_ROLE_HEADER,
+  THREAD_TENANT_HEADER,
+} from './thread-header.js';
+
+const THREAD_ACTOR_ROLES: readonly ApprovalRole[] = [
+  'admin',
+  'builder',
+  'operator',
+  'reviewer',
+  'viewer',
+];
 
 /**
  * A request refused at the thread DO's identity boundary: the DO's name carries
@@ -63,7 +76,9 @@ export interface ThreadScope {
   readonly threadId: string;
   /** The tenant the threadId carries, equal to the request's authenticated one. */
   readonly tenantId: string;
-  /** Server-stamped requester identity; clients cannot author this header. */
+  /** Complete server-stamped requester principal. */
+  readonly actor: ApprovalActor;
+  /** Compatibility alias for actor.id. */
   readonly requestedBy: string;
   /** This DO's storage/runtime/pubsub wiring, built once per instance. */
   readonly init: InitResult;
@@ -176,13 +191,27 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
         `thread identity mismatch: instance '${threadId}' belongs to tenant '${tenantId}' but the request authenticates as '${claimed ?? '<none>'}' — refusing`,
       );
     }
-    const requestedBy = request.headers.get(THREAD_ACTOR_HEADER);
-    if (!requestedBy) {
+    const actorId = request.headers.get(THREAD_ACTOR_HEADER);
+    if (!actorId) {
       throw new ThreadIdentityError(
         `thread identity mismatch: request for '${threadId}' carries no trusted actor`,
       );
     }
-    return { threadId, tenantId, requestedBy };
+    const role = request.headers.get(THREAD_ACTOR_ROLE_HEADER);
+    if (
+      role === null ||
+      !(THREAD_ACTOR_ROLES as readonly string[]).includes(role)
+    ) {
+      throw new ThreadIdentityError(
+        `thread identity mismatch: request for '${threadId}' carries no valid trusted actor role`,
+      );
+    }
+    const actor: ApprovalActor = {
+      id: actorId,
+      role: role as ApprovalRole,
+      tenantId,
+    };
+    return { threadId, tenantId, actor, requestedBy: actor.id };
   }
 
   #ensureInit(): InitResult {

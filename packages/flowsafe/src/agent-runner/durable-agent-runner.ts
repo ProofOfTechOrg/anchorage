@@ -174,6 +174,13 @@ export class FlowsafeDurableAgent<
   readonly [RUNTIME_DRIVEN_AGENT] = true;
   readonly #runtime: RunnerRuntime;
   readonly #threadRuntime?: Mastra['agentThreadStreamRuntime'];
+  readonly #persistenceWaiters = new Map<
+    string,
+    {
+      resolve: () => void;
+      reject: (error: unknown) => void;
+    }
+  >();
 
   constructor(options: FlowsafeDurableAgentOptions<TAgentId, TTools, TOutput>) {
     super({
@@ -249,6 +256,60 @@ export class FlowsafeDurableAgent<
   }
 
   /**
+   * Start a durable stream and wait until RunnerRuntime has persisted the
+   * first suspended or terminal summary.
+   *
+   * The regular durable `stream()` returns after subscription setup while its
+   * workflow starts asynchronously. Agent hosts need an authoritative summary
+   * before answering a start request, but must keep the stream subscription
+   * and replay cache intact for later HTTP observation.
+   *
+   * @internal
+   */
+  async streamUntilPersisted(
+    messages: Parameters<DurableAgent<TAgentId, TTools, TOutput>['stream']>[0],
+    options: NonNullable<
+      Parameters<DurableAgent<TAgentId, TTools, TOutput>['stream']>[1]
+    >,
+  ): Promise<
+    Awaited<ReturnType<DurableAgent<TAgentId, TTools, TOutput>['stream']>>
+  > {
+    this.#assertCallerRunId(options.runId);
+    const runId = options.runId;
+    if (this.#persistenceWaiters.has(runId)) {
+      throw new InvalidRunRequestError(
+        `run '${runId}' already has a pending durable start`,
+      );
+    }
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const persisted = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    void persisted.catch(() => undefined);
+    this.#persistenceWaiters.set(runId, { resolve, reject });
+    const onError = options.onError;
+    try {
+      const result = await this.stream(messages, {
+        ...options,
+        onError: async (data) => {
+          reject(
+            data.error instanceof Error
+              ? data.error
+              : new Error(String(data.error)),
+          );
+          await onError?.(data);
+        },
+      });
+      await persisted;
+      return result;
+    } finally {
+      this.#persistenceWaiters.delete(runId);
+    }
+  }
+
+  /**
    * The same tenant-scoped run-ID guard as {@link FlowsafeDurableAgent.stream} —
    * `generate()`
    * re-implements the durable setup and mints its own runId the same way when
@@ -302,8 +363,14 @@ export class FlowsafeDurableAgent<
     memory?: DurableAgentStreamOptions<TOutput>['memory'];
   }): Promise<RunSummary> {
     this.#assertCallerRunId(options.runId);
+    const requestContext = await this.#runtime.trustedRequestContextForResume(
+      this.getWorkflow().id,
+      options.runId,
+      options.step !== undefined ? { step: options.step } : {},
+    );
     await this.prepare([], {
       runId: options.runId,
+      requestContext,
       ...(options.memory !== undefined ? { memory: options.memory } : {}),
     } as NonNullable<
       Parameters<DurableAgent<TAgentId, TTools, TOutput>['prepare']>[1]
@@ -340,11 +407,15 @@ export class FlowsafeDurableAgent<
         } as Parameters<Mastra['agentThreadStreamRuntime']['registerRun']>[2],
         this.pubsub,
       );
+      // The approval fingerprint is the parent suspension recorded above.
+      // Do not forward that collapsed parent path to Mastra: omitting `step`
+      // lets it append the nested tool-call path stored in __workflow_meta.
+      // RunnerRuntime independently resolves the same single parent step for
+      // exact-leg capability derivation before execution.
       const summary = await this.#runtime.resume(
         this.getWorkflow().id,
         options.runId,
         {
-          ...(options.step !== undefined ? { step: options.step } : {}),
           ...(options.resumeData !== undefined
             ? { resumeData: options.resumeData }
             : {}),
@@ -376,13 +447,21 @@ export class FlowsafeDurableAgent<
     workflowInput: DurableAgenticWorkflowInput,
   ): Promise<void> {
     this.#assertCallerRunId(runId);
-    // getWorkflow() is memoized and its id is the shared loop id the factory
-    // registered; driving that exact id keeps the started run and the
-    // registered workflow in lockstep.
-    const summary = await this.#runtime.start(this.getWorkflow().id, {
-      runId,
-      inputData: workflowInput,
-    });
+    const waiter = this.#persistenceWaiters.get(runId);
+    let summary: RunSummary;
+    try {
+      // getWorkflow() is memoized and its id is the shared loop id the factory
+      // registered; driving that exact id keeps the started run and the
+      // registered workflow in lockstep.
+      summary = await this.#runtime.start(this.getWorkflow().id, {
+        runId,
+        inputData: workflowInput,
+      });
+      waiter?.resolve();
+    } catch (error) {
+      waiter?.reject(error);
+      throw error;
+    }
     // Mirror the base: a FAILED run emits an error onto the agent's stream so
     // observe()/onError see it. A SUSPENDED run is the approval-gate path — it
     // returns normally and the host bridges the suspension to the approval

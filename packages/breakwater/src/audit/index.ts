@@ -8,7 +8,93 @@
 // aborts the processor chain, so a processor placed after a gate could never
 // observe the denial. Each gate records its own audit event as it fires.
 
+import type { RequestContext } from '@mastra/core/request-context';
+
 import type { Actor } from '../rbac/index.js';
+
+/** Request-context key for trusted agent and run correlation fields. */
+export const AGENT_AUDIT_CONTEXT_KEY = 'breakwater.auditContext';
+
+/**
+ * Trusted scalar correlation attached to agent authorization and policy
+ * events. Hosts must derive these values instead of accepting them from
+ * prompts, tool inputs, or other untrusted payloads.
+ */
+export interface AgentAuditContext {
+  /** Guarded agent identifier. */
+  agentId: string;
+  /** Tenant identifier asserted by the authenticated host. */
+  tenantId?: string;
+  /** Server-minted run identifier. */
+  runId?: string;
+  /** Server-minted or tenant-owned thread identifier. */
+  threadId?: string;
+  /** Server-derived memory resource identifier. */
+  resourceId?: string;
+  /** Trusted invocation path, such as an HTTP start or approval resume. */
+  entryPath: string;
+}
+
+const AGENT_AUDIT_OPTIONAL_FIELDS = [
+  'tenantId',
+  'runId',
+  'threadId',
+  'resourceId',
+] as const;
+
+/**
+ * Read only the documented scalar fields from trusted request context.
+ *
+ * Unknown properties are ignored, so prompts, tool inputs, URLs, secrets, and
+ * model output cannot reach audit detail through this correlation seam.
+ */
+export function agentAuditContextFromRequestContext(
+  requestContext: RequestContext | undefined,
+): AgentAuditContext | undefined {
+  const value = requestContext?.get(AGENT_AUDIT_CONTEXT_KEY);
+  if (!value || typeof value !== 'object') return undefined;
+  try {
+    const candidate = value as Record<string, unknown>;
+    if (
+      typeof candidate.agentId !== 'string' ||
+      candidate.agentId.length === 0 ||
+      typeof candidate.entryPath !== 'string' ||
+      candidate.entryPath.length === 0
+    ) {
+      return undefined;
+    }
+    const context: AgentAuditContext = {
+      agentId: candidate.agentId,
+      entryPath: candidate.entryPath,
+    };
+    for (const field of AGENT_AUDIT_OPTIONAL_FIELDS) {
+      const fieldValue = candidate[field];
+      if (typeof fieldValue === 'string' && fieldValue.length > 0) {
+        context[field] = fieldValue;
+      }
+    }
+    return context;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Merge trusted correlation with boundary-specific detail.
+ *
+ * Boundary fields win if names collide so a policy or channel decision cannot
+ * be relabeled by request context.
+ *
+ * @internal
+ */
+export function agentAuditDetail(
+  requestContext: RequestContext | undefined,
+  detail?: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  const correlation = agentAuditContextFromRequestContext(requestContext);
+  if (!correlation) return detail;
+  return { ...correlation, ...detail };
+}
 
 /** Structured record emitted by a breakwater enforcement boundary. */
 export interface AuditEvent {

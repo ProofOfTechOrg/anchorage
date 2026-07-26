@@ -55,22 +55,38 @@ import type {
   ExportedHandler,
 } from '@cloudflare/workers-types';
 import { Agent } from '@mastra/core/agent';
-import type { OpenAICompatibleConfig } from '@mastra/core/llm';
+import type {
+  MastraModelConfig,
+  OpenAICompatibleConfig,
+} from '@mastra/core/llm';
 import { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
 import { readObjective, resolveGoalStore } from '@mastra/core/tools';
+import { createGuardedAgent } from '@proofoftech/breakwater/agent';
 import {
+  AGENT_AUDIT_CONTEXT_KEY,
   AuditLogger,
+} from '@proofoftech/breakwater/audit';
+import {
   ConnectorPolicyError,
   createConnector,
-} from '@proofoftech/breakwater';
+} from '@proofoftech/breakwater/connector-sdk';
+import { ACTOR_CONTEXT_KEY } from '@proofoftech/breakwater/rbac';
 import { z } from 'zod';
 import {
-  createFlowsafeDurableAgent,
-  type FlowsafeDurableAgent,
-} from '../src/agent-runner/index.js';
+  type AgentMeta,
+  type AgentModule,
+  createAgentApprovalResumer,
+  createAgentRouter,
+  createAgentThreadTopology,
+  createThreadAgentHost,
+  type ThreadAgentHost,
+} from '../src/agent-host/index.js';
+import { readAgentThreadBinding } from '../src/agent-runner/index.js';
 import {
   type ApprovalActor,
+  type ApprovalDecision,
+  type ApprovalRecord,
   ApprovalService,
   type ApprovalStreamSink,
   approvalGrantProvider,
@@ -96,6 +112,7 @@ import {
   type InitResult,
   init,
   mintResourceId,
+  mintSaltedId,
   mintThreadId,
   type RunnerRuntime,
   ThreadDurableObject,
@@ -108,14 +125,12 @@ import {
   type ObjectiveAuditEvent,
 } from '../src/goals/index.js';
 import {
-  assertNoClientMemoryIds,
   bearerActorAuthenticator,
   createHubTopology,
   createRunRouter,
   createStreamRouter,
   createThreadTopology,
   doSummary,
-  reconcileApprovalsForSummary,
   staticTokenVerifier,
   type WorkflowMeta,
 } from '../src/host-kit/index.js';
@@ -180,13 +195,225 @@ const PUBLISH_CONNECTOR = 'demo-publisher';
  */
 const SYSTEM_ACTOR_ID = 'demo-worker';
 
-function requiredToolProviderOptions(modelId: string | undefined) {
-  // DeepSeek V4 defaults to thinking mode, which rejects toolChoice=required.
-  // Disable thinking for this function-calling proof, matching the provider's
-  // documented request option. Other providers receive no DeepSeek metadata.
-  return modelId?.startsWith('deepseek/')
-    ? { deepseek: { thinking: { type: 'disabled' as const } } }
-    : undefined;
+const SPIKE_AGENT_ID = 'spike-guarded-agent';
+const SPIKE_WRITE_CONNECTOR_ID = 'spike_recordWrite';
+const SPIKE_AGENT_META = {
+  id: SPIKE_AGENT_ID,
+  title: 'Spike guarded agent',
+  description:
+    'Calls one approval-gated write connector through the catalog-driven durable host.',
+  allowedRoles: ['admin', 'operator'],
+} as const satisfies AgentMeta;
+
+const modelUsage = {
+  inputTokens: 1,
+  outputTokens: 1,
+  totalTokens: 2,
+};
+
+const agentProbeTableInitializers = new WeakMap<D1Database, Promise<void>>();
+
+function ensureAgentProbeTables(db: D1Database): Promise<void> {
+  let initialized = agentProbeTableInitializers.get(db);
+  if (!initialized) {
+    initialized = db
+      .batch([
+        db.prepare(
+          `CREATE TABLE IF NOT EXISTS spike_agent_model_calls (
+             call_id TEXT PRIMARY KEY,
+             created_at TEXT NOT NULL
+           )`,
+        ),
+        db.prepare(
+          `CREATE TABLE IF NOT EXISTS spike_agent_connector_calls (
+             call_id TEXT PRIMARY KEY,
+             tool_call_id TEXT NOT NULL,
+             run_id TEXT NOT NULL,
+             thread_id TEXT NOT NULL,
+             resource_id TEXT NOT NULL,
+             actor_id TEXT NOT NULL,
+             actor_role TEXT NOT NULL,
+             tenant_id TEXT NOT NULL,
+             entry_path TEXT NOT NULL,
+             created_at TEXT NOT NULL
+           )`,
+        ),
+        db.prepare(
+          `CREATE TABLE IF NOT EXISTS spike_agent_side_effects (
+             tool_call_id TEXT PRIMARY KEY,
+             thread_id TEXT NOT NULL,
+             resource_id TEXT NOT NULL,
+             created_at TEXT NOT NULL
+           )`,
+        ),
+      ])
+      .then(() => undefined)
+      .catch((error: unknown) => {
+        agentProbeTableInitializers.delete(db);
+        throw error;
+      });
+    agentProbeTableInitializers.set(db, initialized);
+  }
+  return initialized;
+}
+
+function deterministicToolModel(db: D1Database): MastraModelConfig {
+  const toolCall = () => ({
+    type: 'tool-call' as const,
+    toolCallId: `call_${crypto.randomUUID()}`,
+    toolName: SPIKE_WRITE_CONNECTOR_ID,
+    input: JSON.stringify({ value: 'phase-a' }),
+  });
+  const recordModelCall = async () => {
+    await ensureAgentProbeTables(db);
+    await db
+      .prepare(
+        `INSERT INTO spike_agent_model_calls (call_id, created_at)
+         VALUES (?, ?)`,
+      )
+      .bind(crypto.randomUUID(), new Date().toISOString())
+      .run();
+  };
+  return {
+    specificationVersion: 'v2',
+    provider: 'flowsafe-spike',
+    modelId: 'deterministic-tool-call',
+    supportedUrls: {},
+    doGenerate: async () => {
+      await recordModelCall();
+      return {
+        content: [toolCall()],
+        finishReason: 'tool-calls',
+        usage: modelUsage,
+        warnings: [],
+      };
+    },
+    doStream: async () => {
+      await recordModelCall();
+      const call = toolCall();
+      return {
+        stream: new ReadableStream({
+          start(controller) {
+            controller.enqueue({ type: 'stream-start', warnings: [] });
+            controller.enqueue(call);
+            controller.enqueue({
+              type: 'finish',
+              finishReason: 'tool-calls',
+              usage: modelUsage,
+            });
+            controller.close();
+          },
+        }),
+      };
+    },
+  };
+}
+
+function agentModel(env: Env): MastraModelConfig {
+  const modelId = env.SPIKE_LLM_MODEL_ID;
+  const apiKey = env.SPIKE_LLM_API_KEY;
+  if (!modelId || !apiKey) return deterministicToolModel(env.DB);
+  if (!modelId.includes('/')) {
+    throw new Error('SPIKE_LLM_MODEL_ID must use provider/model form');
+  }
+  const model: OpenAICompatibleConfig = {
+    id: modelId as `${string}/${string}`,
+    apiKey,
+    ...(env.SPIKE_LLM_BASE_URL ? { url: env.SPIKE_LLM_BASE_URL } : {}),
+  };
+  return model;
+}
+
+function createSpikeAgentModule(env: Env, audit: AuditLogger): AgentModule {
+  const write = createConnector({
+    id: SPIKE_WRITE_CONNECTOR_ID,
+    description: 'Record the required guarded-agent write exactly once',
+    inputSchema: z.object({ value: z.string().optional() }),
+    outputSchema: z.object({ recorded: z.boolean() }),
+    execute: async (_input, context) => {
+      const toolCallId = context.agent?.toolCallId;
+      const threadId = context.agent?.threadId;
+      const resourceId = context.agent?.resourceId;
+      const actor = context.requestContext?.get(ACTOR_CONTEXT_KEY) as
+        | { id?: unknown; role?: unknown }
+        | undefined;
+      const correlation = context.requestContext?.get(
+        AGENT_AUDIT_CONTEXT_KEY,
+      ) as
+        | {
+            tenantId?: unknown;
+            runId?: unknown;
+            threadId?: unknown;
+            resourceId?: unknown;
+            entryPath?: unknown;
+          }
+        | undefined;
+      if (
+        !toolCallId ||
+        !threadId ||
+        !resourceId ||
+        typeof actor?.id !== 'string' ||
+        typeof actor.role !== 'string' ||
+        typeof correlation?.tenantId !== 'string' ||
+        typeof correlation.runId !== 'string' ||
+        correlation.threadId !== threadId ||
+        correlation.resourceId !== resourceId ||
+        typeof correlation.entryPath !== 'string'
+      ) {
+        throw new Error(
+          'guarded connector is missing its trusted principal or durable binding',
+        );
+      }
+      await ensureAgentProbeTables(env.DB);
+      const createdAt = new Date().toISOString();
+      await env.DB.batch([
+        env.DB.prepare(
+          `INSERT INTO spike_agent_connector_calls
+             (call_id, tool_call_id, run_id, thread_id, resource_id,
+              actor_id, actor_role, tenant_id, entry_path, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).bind(
+          crypto.randomUUID(),
+          toolCallId,
+          correlation.runId,
+          threadId,
+          resourceId,
+          actor.id,
+          actor.role,
+          correlation.tenantId,
+          correlation.entryPath,
+          createdAt,
+        ),
+        env.DB.prepare(
+          `INSERT OR IGNORE INTO spike_agent_side_effects
+             (tool_call_id, thread_id, resource_id, created_at)
+             VALUES (?, ?, ?, ?)`,
+        ).bind(toolCallId, threadId, resourceId, createdAt),
+      ]);
+      return { recorded: true };
+    },
+    permissions: { sideEffect: 'write' },
+    policies: {
+      writePermissions: { requireApproval: [SPIKE_WRITE_CONNECTOR_ID] },
+      audit,
+    },
+  });
+  return {
+    meta: SPIKE_AGENT_META,
+    agent: createGuardedAgent({
+      id: SPIKE_AGENT_ID,
+      name: 'Flowsafe Phase A spike agent',
+      instructions:
+        'Call spike_recordWrite exactly once, then stop after the tool result.',
+      model: agentModel(env),
+      tools: { [SPIKE_WRITE_CONNECTOR_ID]: write },
+      allowedRoles: SPIKE_AGENT_META.allowedRoles,
+      policies: [],
+      audit,
+      maxSteps: 1,
+      toolChoice: 'required',
+    }),
+  };
 }
 
 // LOCAL-ONLY spike identities (wrangler dev; never deployed). One tenant so
@@ -202,6 +429,9 @@ const SPIKE_ACTORS = new Map<string, ApprovalActor>([
   ['spike-operator', { id: 'opal', role: 'operator', tenantId: 'spike' }],
   ['spike-reviewer', { id: 'ray', role: 'reviewer', tenantId: 'spike' }],
   ['spike-viewer', { id: 'vic', role: 'viewer', tenantId: 'spike' }],
+  ['other-operator', { id: 'oliver', role: 'operator', tenantId: 'other' }],
+  ['other-reviewer', { id: 'ruth', role: 'reviewer', tenantId: 'other' }],
+  ['other-viewer', { id: 'vera', role: 'viewer', tenantId: 'other' }],
 ]);
 
 const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
@@ -583,10 +813,11 @@ export class DemoBackgroundTasks {
  * BEFORE route() runs, so a forged cross-tenant request never reaches here (C-S4).
  */
 export class DemoThread extends ThreadDurableObject<Env> {
-  #agent?: Agent;
-  #durableAgent?: FlowsafeDurableAgent;
-  #mastra?: Mastra;
+  #signalAgent?: Agent;
   #storage?: ReturnType<typeof createD1Storage>;
+  #agentHost?: ThreadAgentHost;
+  #approvalService?: ApprovalService;
+  #threadInit?: InitResult;
 
   protected build(env: Env): InitResult {
     const storage = createD1Storage({
@@ -594,23 +825,64 @@ export class DemoThread extends ThreadDurableObject<Env> {
       domains: createSignalStorageDomains(env.DB as unknown as never),
     });
     this.#storage = storage;
-    return init(
+    const approvals = approvalStoreFactory(env.DB).forTenant(this.tenantId);
+    const audit = new AuditLogger({
+      sink: (event) => {
+        console.log(JSON.stringify(event));
+      },
+    });
+    const agentHost = createThreadAgentHost({
+      buildModules: () => [createSpikeAgentModule(this.env, audit)],
+      storage: () => storage,
+      stateStorage: () => {
+        if (!this.state?.storage) {
+          throw new Error('thread Durable Object storage is unavailable');
+        }
+        return this.state.storage;
+      },
+      approvalService: () => {
+        this.#approvalService ??= new ApprovalService({
+          store: approvals,
+          stream: (event) => createHubTopology(this.env.HUB).publish(event),
+        });
+        return this.#approvalService;
+      },
+      systemActorId: SYSTEM_ACTOR_ID,
+      audit: (event) => audit.record(event),
+    });
+    this.#agentHost = agentHost;
+    const threadInit = init(
       { storage },
       {
         pubsub: createHostPubSub(),
-        requestContextForRun: approvalGrantProvider(
-          approvalStoreFactory(env.DB).forTenant(this.tenantId),
+        requestContextForRun: agentHost.requestContextForRun(
+          approvalGrantProvider(approvals),
         ),
       },
     );
+    this.#threadInit = threadInit;
+    return threadInit;
   }
 
-  // The deterministic signal-affinity probe retains a non-driven model so
-  // `spike:verify` needs no credential. The separate live agent below uses the
-  // configured OpenAI-compatible model. Both agents share this DO's D1 storage
-  // and pubsub identity.
-  #getAgent(scope: ThreadScope): Agent {
-    if (!this.#agent) {
+  #host(): ThreadAgentHost {
+    if (!this.#agentHost) {
+      throw new Error('thread agent host is not initialized');
+    }
+    return this.#agentHost;
+  }
+
+  #initResult(): InitResult {
+    if (!this.#threadInit) {
+      throw new Error('thread agent host is not initialized');
+    }
+    return this.#threadInit;
+  }
+
+  // Compatibility-only affinity and notification probes retain a raw,
+  // non-driven agent on unbound threads. Catalog-bound threads always resolve
+  // through the guarded host below.
+  #getSignalAgent(scope: ThreadScope): Agent {
+    if (!this.#signalAgent) {
       const bare = new Agent({
         id: 'demo-thread-signal-agent',
         name: 'demo-thread-signal-agent',
@@ -621,192 +893,30 @@ export class DemoThread extends ThreadDurableObject<Env> {
         storage: this.#storage,
         agents: { 'demo-thread-signal-agent': bare },
       });
-      this.#agent = mastra.getAgent('demo-thread-signal-agent');
+      this.#signalAgent = mastra.getAgent('demo-thread-signal-agent');
     }
-    if (scope.init.pubsub) this.#agent.__setPubSub(scope.init.pubsub);
-    return this.#agent;
-  }
-
-  async #ensureSideEffectTable(): Promise<void> {
-    await this.env.DB.prepare(
-      `CREATE TABLE IF NOT EXISTS spike_agent_side_effects (
-         tool_call_id TEXT PRIMARY KEY,
-         thread_id TEXT NOT NULL,
-         resource_id TEXT NOT NULL,
-         created_at TEXT NOT NULL
-       )`,
-    ).run();
-  }
-
-  #getDurableAgent(scope: ThreadScope): FlowsafeDurableAgent {
-    if (this.#durableAgent) return this.#durableAgent;
-    const modelId = this.env.SPIKE_LLM_MODEL_ID;
-    const apiKey = this.env.SPIKE_LLM_API_KEY;
-    if (!modelId || !apiKey || !modelId.includes('/')) {
-      throw new Error(
-        'live agent requires SPIKE_LLM_MODEL_ID (provider/model) and SPIKE_LLM_API_KEY',
-      );
+    if (scope.init.pubsub) {
+      this.#signalAgent.__setPubSub(scope.init.pubsub);
     }
-    const model: OpenAICompatibleConfig = {
-      id: modelId as `${string}/${string}`,
-      apiKey,
-      ...(this.env.SPIKE_LLM_BASE_URL
-        ? { url: this.env.SPIKE_LLM_BASE_URL }
-        : {}),
-    };
-    const write = createConnector({
-      // Agent approval payloads carry the provider-visible tool name. Keep the
-      // connector id provider-safe so Mastra does not rewrite it and the
-      // approved record grants the exact id the breakwater gate checks.
-      id: 'spike_recordWrite',
-      description: 'Record the required durable-agent write exactly once',
-      inputSchema: z.object({ value: z.string().optional() }),
-      outputSchema: z.object({ recorded: z.boolean() }),
-      execute: async (_input, context) => {
-        const toolCallId = context.agent?.toolCallId;
-        const threadId = context.agent?.threadId;
-        const resourceId = context.agent?.resourceId;
-        if (!toolCallId || !threadId || !resourceId) {
-          throw new Error(
-            'agent tool context is missing its durable memory binding',
-          );
-        }
-        await this.#ensureSideEffectTable();
-        await this.env.DB.prepare(
-          `INSERT OR IGNORE INTO spike_agent_side_effects
-           (tool_call_id, thread_id, resource_id, created_at)
-           VALUES (?, ?, ?, ?)`,
-        )
-          .bind(toolCallId, threadId, resourceId, new Date().toISOString())
-          .run();
-        return { recorded: true };
-      },
-      permissions: { sideEffect: 'write' },
-      policies: {
-        writePermissions: { requireApproval: ['spike_recordWrite'] },
-      },
-    });
-    const bare = new Agent({
-      id: 'spike-live-agent',
-      name: 'spike-live-agent',
-      instructions:
-        'You must call spike_recordWrite exactly once. Do not answer before using it.',
-      model,
-      tools: { spike_recordWrite: write },
-      defaultOptions: { toolChoice: 'required' },
-    });
-    this.#mastra = new Mastra({
-      storage: this.#storage,
-      agents: { 'spike-live-agent': bare },
-    });
-    const agent = this.#mastra.getAgent('spike-live-agent');
-    this.#durableAgent = createFlowsafeDurableAgent({
-      agent,
-      runtime: scope.init.runtime,
-      pubsub: scope.init.pubsub,
-      threadRuntime: this.#mastra.agentThreadStreamRuntime,
-      // toolChoice=required applies to every model step. One step guarantees
-      // the proof requests exactly one write instead of forcing another tool
-      // call after the approved result.
-      maxSteps: 1,
-    });
-    return this.#durableAgent;
-  }
-
-  async #bridge(
-    scope: ThreadScope,
-    runId: string,
-    resourceId?: string,
-  ): Promise<Awaited<ReturnType<RunnerRuntime['status']>>> {
-    const summary = await scope.init.runtime.status(
-      'durable-agentic-loop',
-      runId,
-    );
-    if (!summary) return null;
-    if (summary.status === 'suspended') {
-      const service = new ApprovalService({
-        store: approvalStoreFactory(this.env.DB).forTenant(scope.tenantId),
-      });
-      const actor: ApprovalActor = {
-        id: SYSTEM_ACTOR_ID,
-        role: 'operator',
-        tenantId: scope.tenantId,
-      };
-      await reconcileApprovalsForSummary(
-        service,
-        'durable-agentic-loop',
-        summary,
-        actor,
-        {
-          kind: 'thread',
-          threadId: scope.threadId,
-          ...(resourceId ? { resourceId } : {}),
-        },
-      );
-    }
-    return summary;
-  }
-
-  async #startAgent(
-    scope: ThreadScope,
-    input: {
-      runId: string;
-      resourceId?: string;
-      prompt?: string;
-      message?: unknown;
-      signal?: unknown;
-      threaded?: boolean;
-    },
-  ): Promise<Response> {
-    if (
-      typeof input.runId !== 'string' ||
-      !scope.tenantId ||
-      !input.runId.startsWith(`${scope.tenantId}_`)
-    ) {
-      return json({ error: 'runId is not owned by this tenant' }, 404);
-    }
-    if (
-      input.resourceId !== undefined &&
-      !tenantOwnsMemoryId(scope.tenantId, input.resourceId)
-    ) {
-      return json({ error: 'resourceId is not owned by this tenant' }, 404);
-    }
-    const agent = this.#getDurableAgent(scope);
-    if (input.threaded !== false && input.resourceId !== undefined) {
-      const activeRunId = agent.getActiveThreadRunId({
-        threadId: scope.threadId,
-        resourceId: input.resourceId,
-      });
-      if (activeRunId) {
-        return json({ runId: activeRunId, joined: true });
-      }
-    }
-    const content =
-      typeof input.prompt === 'string'
-        ? input.prompt
-        : (input.message ?? input.signal ?? 'Perform the required write now.');
-    const memory =
-      input.threaded === false || input.resourceId === undefined
-        ? undefined
-        : { thread: scope.threadId, resource: input.resourceId };
-    const providerOptions = requiredToolProviderOptions(
-      this.env.SPIKE_LLM_MODEL_ID,
-    );
-    await agent.stream(content as never, {
-      runId: input.runId,
-      toolChoice: 'required',
-      ...(providerOptions ? { providerOptions } : {}),
-      ...(memory ? { memory } : {}),
-    });
-    const summary = await this.#bridge(scope, input.runId, memory?.resource);
-    return json({ summary, runId: input.runId });
+    return this.#signalAgent;
   }
 
   #signalRoutes = createThreadSignalRoutes({
-    resolveAgent: (scope) =>
-      this.env.SPIKE_LLM_MODEL_ID && this.env.SPIKE_LLM_API_KEY
-        ? (this.#getDurableAgent(scope) as unknown as Agent)
-        : this.#getAgent(scope),
+    resolveAgent: async (scope, agentId, entryPath) => {
+      if (!this.state?.storage) {
+        throw new Error('thread Durable Object storage is unavailable');
+      }
+      const binding = await readAgentThreadBinding(this.state.storage);
+      if (binding || agentId) {
+        return (
+          await this.#host().resolveBoundAgent(scope, {
+            agentId,
+            entryPath,
+          })
+        ).durableAgent as unknown as Agent;
+      }
+      return this.#getSignalAgent(scope);
+    },
     resolveResourceId: (scope) => mintResourceId(scope.tenantId, 'demo-thread'),
     resolveNotificationsStorage: async () => {
       const store = await this.#storage?.getStore('notifications');
@@ -817,158 +927,39 @@ export class DemoThread extends ThreadDurableObject<Env> {
       const scope = {
         threadId: input.threadId,
         tenantId: this.tenantId,
+        actor: input.actor,
         requestedBy: input.requestedBy,
-        init: this.#ensureLiveInit(),
+        init: this.#initResult(),
       };
-      const response = await this.#startAgent(scope, {
+      const result = await this.#host().start(scope, {
+        agentId: input.agent.id,
+        threadId: input.threadId,
         runId: input.runId,
-        resourceId: input.resourceId,
-        message: input.message,
-        signal: input.signal,
+        resourceId:
+          input.resourceId ?? mintResourceId(scope.tenantId, scope.threadId),
+        messages:
+          input.message !== undefined
+            ? typeof input.message === 'string'
+              ? input.message
+              : Array.isArray(input.message)
+                ? [{ role: 'user', content: input.message }]
+                : [{ role: 'user', content: input.message.contents }]
+            : input.signal !== undefined
+              ? [{ role: 'user', content: input.signal.contents }]
+              : 'Perform the required write now.',
+        entryPath: input.entryPath,
       });
-      if (!response.ok)
-        throw new Error(`idle agent start failed: ${response.status}`);
-      return { runId: input.runId };
+      return { runId: result.runId };
     },
   });
-
-  #lastScope?: ThreadScope;
-
-  #ensureLiveInit(): InitResult {
-    if (!this.#lastScope) throw new Error('thread scope is not initialized');
-    return this.#lastScope.init;
-  }
-
-  async #assertSnapshotMemoryBinding(
-    scope: ThreadScope,
-    runId: string,
-    resourceId?: string,
-  ): Promise<void> {
-    if (!tenantOwnsSaltedId(scope.tenantId, runId)) {
-      throw new Error('agent run is not owned by this tenant');
-    }
-    const workflows = await this.#storage?.getStore('workflows');
-    const snapshot = await workflows?.loadWorkflowSnapshot({
-      workflowName: 'durable-agentic-loop',
-      runId,
-    });
-    const input = snapshot?.context.input as
-      | {
-          messageListState?: {
-            memoryInfo?: { threadId?: unknown; resourceId?: unknown } | null;
-          };
-        }
-      | undefined;
-    const memoryInfo = input?.messageListState?.memoryInfo;
-    const matches = resourceId
-      ? memoryInfo?.threadId === scope.threadId &&
-        memoryInfo.resourceId === resourceId
-      : memoryInfo === null;
-    // loadWorkflowSnapshot already selects the durable-agentic-loop workflow.
-    // Core's input type carries __workflowKind, but the persisted context.input
-    // projection drops that marker; the credentialed restart proof pins this
-    // actual shape. The tenant-owned memory binding is the host route's check.
-    if (!matches) {
-      console.error(
-        JSON.stringify({
-          type: 'spike-agent-snapshot-binding-mismatch',
-          runId,
-          expected: {
-            threadId: scope.threadId,
-            resourceId: resourceId ?? null,
-          },
-          actual: {
-            memoryInfo: memoryInfo ?? null,
-          },
-        }),
-      );
-      throw new Error(
-        'agent snapshot memory binding does not match its thread',
-      );
-    }
-  }
 
   protected async route(
     request: Request,
     scope: ThreadScope,
   ): Promise<Response> {
-    this.#lastScope = scope;
     const url = new URL(request.url);
-    if (request.method === 'POST' && url.pathname === '/agent/start') {
-      return this.#startAgent(scope, (await request.json()) as never);
-    }
-    if (request.method === 'GET' && url.pathname === '/agent/status') {
-      const runId = url.searchParams.get('runId');
-      const resourceId = url.searchParams.get('resourceId');
-      if (!runId || !resourceId)
-        return json({ error: 'runId and resourceId required' }, 400);
-      const summary = await this.#bridge(scope, runId, resourceId);
-      return summary ? json(summary) : json({ error: 'not found' }, 404);
-    }
-    if (request.method === 'POST' && url.pathname === '/agent/resume') {
-      const body = (await request.json()) as {
-        runId?: string;
-        resourceId?: string;
-        step?: string[];
-        resumeData?: unknown;
-      };
-      if (
-        !body.runId ||
-        (body.resourceId !== undefined &&
-          !tenantOwnsMemoryId(scope.tenantId, body.resourceId))
-      ) {
-        return json({ error: 'owned runId and resourceId are required' }, 404);
-      }
-      await this.#assertSnapshotMemoryBinding(
-        scope,
-        body.runId,
-        body.resourceId,
-      );
-      const summary = await this.#getDurableAgent(scope).resumeViaRuntime({
-        runId: body.runId,
-        step: body.step,
-        resumeData: body.resumeData,
-        ...(body.resourceId
-          ? { memory: { thread: scope.threadId, resource: body.resourceId } }
-          : {}),
-      });
-      await this.#bridge(scope, body.runId, body.resourceId);
-      return json(summary);
-    }
-    if (request.method === 'POST' && url.pathname === '/agent/raw-resume') {
-      const body = (await request.json()) as { runId: string; step?: string[] };
-      const summary = await scope.init.runtime.resume(
-        'durable-agentic-loop',
-        body.runId,
-        { step: body.step, resumeData: { approved: true } },
-      );
-      return json(summary);
-    }
-    if (
-      request.method === 'POST' &&
-      url.pathname === '/agent/prepared-resume'
-    ) {
-      const body = (await request.json()) as {
-        runId: string;
-        resourceId: string;
-        step?: string[];
-      };
-      if (!tenantOwnsMemoryId(scope.tenantId, body.resourceId)) {
-        return json({ error: 'resourceId is not owned by this tenant' }, 404);
-      }
-      await this.#assertSnapshotMemoryBinding(
-        scope,
-        body.runId,
-        body.resourceId,
-      );
-      const summary = await this.#getDurableAgent(scope).resumeViaRuntime({
-        runId: body.runId,
-        step: body.step,
-        resumeData: { approved: true },
-        memory: { thread: scope.threadId, resource: body.resourceId },
-      });
-      return json(summary);
-    }
+    const agentResponse = await this.#host().route(request, scope);
+    if (agentResponse) return agentResponse;
     if (request.method === 'POST' && url.pathname === '/probe/affinity') {
       return this.#affinityProbe(scope);
     }
@@ -988,7 +979,7 @@ export class DemoThread extends ThreadDurableObject<Env> {
    *      discarded. That distinction IS the affinity.
    */
   async #affinityProbe(scope: ThreadScope): Promise<Response> {
-    const agent = this.#getAgent(scope);
+    const agent = this.#getSignalAgent(scope);
     const resourceId = mintResourceId(scope.tenantId, 'affinity-probe');
     const target = { threadId: scope.threadId, resourceId };
     const reserve = agent.sendSignal(
@@ -1192,109 +1183,88 @@ async function handleLiveAgentRoute(
   resolve: ReturnType<typeof createTenantResolver>,
 ): Promise<Response | null> {
   const url = new URL(request.url);
-  if (!url.pathname.startsWith('/agent/live/')) return null;
+  if (url.pathname !== '/agent/live/effects') return null;
   const tenant = await resolve(request);
   if (!tenant) return json({ error: 'unauthorized' }, 401);
-  if (!['admin', 'operator'].includes(tenant.actor.role)) {
-    return json({ error: 'forbidden' }, 403);
+  if (request.method !== 'GET') {
+    return json({ error: 'method not allowed' }, 405);
   }
-  const topology = createThreadTopology(env.THREAD);
-
-  if (request.method === 'POST' && url.pathname === '/agent/live/start') {
-    const body = (await request.json()) as Record<string, unknown>;
-    try {
-      assertNoClientMemoryIds(body);
-    } catch (error) {
-      return json(
-        { error: error instanceof Error ? error.message : String(error) },
-        400,
-      );
-    }
-    const threadId = tenant.newThreadId();
-    const resourceId = tenant.newResourceId(`live-${crypto.randomUUID()}`);
-    const runId = tenant.newRunId();
-    const response = await topology.send(tenant, threadId, '/agent/start', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        runId,
-        resourceId,
-        prompt:
-          typeof body.prompt === 'string'
-            ? body.prompt
-            : 'Call the required write tool now.',
-        threaded: true,
-      }),
-    });
-    const result = await response.json();
-    return json({ threadId, resourceId, runId, result }, response.status);
+  await ensureAgentProbeTables(env.DB);
+  const requestedRunId = url.searchParams.get('runId');
+  if (requestedRunId && !tenant.ownsRun(requestedRunId)) {
+    return json({ error: 'run not found' }, 404);
   }
+  const statement = requestedRunId
+    ? env.DB.prepare(
+        `SELECT c.call_id, c.tool_call_id, c.run_id, c.thread_id,
+                  c.resource_id, c.actor_id, c.actor_role, c.tenant_id,
+                  c.entry_path,
+                  CASE WHEN EXISTS (
+                    SELECT 1 FROM spike_agent_side_effects s
+                    WHERE s.tool_call_id = c.tool_call_id
+                  ) THEN 1 ELSE 0 END AS recorded
+           FROM spike_agent_connector_calls c
+           WHERE c.tenant_id = ? AND c.run_id = ?
+           ORDER BY c.created_at`,
+      ).bind(tenant.tenantId, requestedRunId)
+    : env.DB.prepare(
+        `SELECT c.call_id, c.tool_call_id, c.run_id, c.thread_id,
+                  c.resource_id, c.actor_id, c.actor_role, c.tenant_id,
+                  c.entry_path,
+                  CASE WHEN EXISTS (
+                    SELECT 1 FROM spike_agent_side_effects s
+                    WHERE s.tool_call_id = c.tool_call_id
+                  ) THEN 1 ELSE 0 END AS recorded
+           FROM spike_agent_connector_calls c
+           WHERE c.tenant_id = ?
+           ORDER BY c.created_at`,
+      ).bind(tenant.tenantId);
+  const calls = await statement.all<{
+    call_id: string;
+    tool_call_id: string;
+    run_id: string;
+    thread_id: string;
+    resource_id: string;
+    actor_id: string;
+    actor_role: string;
+    tenant_id: string;
+    entry_path: string;
+    recorded: number;
+  }>();
+  const modelCalls = await env.DB.prepare(
+    'SELECT COUNT(*) AS count FROM spike_agent_model_calls',
+  ).first<{ count: number }>();
+  return json({
+    connectorCalls: calls.results.length,
+    effects: calls.results.filter((call) => call.recorded === 1).length,
+    modelCalls: modelCalls?.count ?? 0,
+    calls: calls.results,
+  });
+}
 
-  if (request.method === 'GET' && url.pathname === '/agent/live/status') {
-    const threadId = url.searchParams.get('threadId');
-    const resourceId = url.searchParams.get('resourceId');
-    const runId = url.searchParams.get('runId');
-    if (!threadId || !resourceId || !runId) {
-      return json(
-        { error: 'threadId, resourceId, and runId are required' },
-        400,
-      );
-    }
-    const response = await topology.send(
-      tenant,
-      threadId,
-      `/agent/status?runId=${encodeURIComponent(runId)}&resourceId=${encodeURIComponent(resourceId)}`,
-    );
-    return new Response(response.body, response);
-  }
-
-  if (
-    request.method === 'POST' &&
-    (url.pathname === '/agent/live/raw-resume' ||
-      url.pathname === '/agent/live/prepared-resume')
-  ) {
-    const body = (await request.json()) as {
-      threadId?: string;
-      resourceId?: string;
-      runId?: string;
-      step?: string[];
-    };
-    if (!body.threadId || !body.resourceId || !body.runId) {
-      return json(
-        { error: 'threadId, resourceId, and runId are required' },
-        400,
-      );
-    }
-    const route = url.pathname.endsWith('/raw-resume')
-      ? '/agent/raw-resume'
-      : '/agent/prepared-resume';
-    const response = await topology.send(tenant, body.threadId, route, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    return new Response(response.body, response);
-  }
-
-  if (request.method === 'GET' && url.pathname === '/agent/live/effects') {
-    await env.DB.prepare(
-      `CREATE TABLE IF NOT EXISTS spike_agent_side_effects (
-         tool_call_id TEXT PRIMARY KEY,
-         thread_id TEXT NOT NULL,
-         resource_id TEXT NOT NULL,
-         created_at TEXT NOT NULL
-       )`,
-    ).run();
-    const rows = await env.DB.prepare(
-      `SELECT tool_call_id FROM spike_agent_side_effects
-       WHERE thread_id >= ? AND thread_id < ?`,
-    )
-      .bind(`${tenant.tenantId}_`, `${tenant.tenantId}\x60`)
-      .all();
-    return json({ count: rows.results.length });
-  }
-
-  return json({ error: 'not found' }, 404);
+function tenantContextForActor(actor: ApprovalActor, env: Env): TenantContext {
+  let service: ApprovalService | undefined;
+  return {
+    actor,
+    tenantId: actor.tenantId,
+    service: () => {
+      service ??= new ApprovalService({
+        store: approvalStoreFactory(env.DB).forTenant(actor.tenantId),
+      });
+      return service;
+    },
+    newRunId: () =>
+      mintSaltedId(
+        actor.tenantId,
+        () => crypto.randomUUID(),
+        'tenantContextForActor.newRunId',
+      ),
+    ownsRun: (runId) => tenantOwnsSaltedId(actor.tenantId, runId),
+    newThreadId: () => mintThreadId(actor.tenantId),
+    newResourceId: (resourceKey) => mintResourceId(actor.tenantId, resourceKey),
+    ownsMemoryId: (id) => tenantOwnsMemoryId(actor.tenantId, id),
+    canSelfDecide: () => false,
+  };
 }
 
 // Worker-level approval service: shares the DO's D1 database; decisions
@@ -1305,6 +1275,26 @@ function buildApprovalService(
   env: Env,
   stream: ApprovalStreamSink | undefined,
 ): ApprovalService {
+  const fallback = async (record: ApprovalRecord, decision: ApprovalDecision) =>
+    doSummary(
+      await runStub(env, record.workflowId, record.runId).fetch(
+        `http://do/runs/${record.workflowId}/${record.runId}/resume`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            step: record.stepPath,
+            resumeData: defaultResumeData(record, decision),
+          }),
+        },
+      ),
+    );
+  const resumeRun = createAgentApprovalResumer({
+    fallback,
+    agents: [SPIKE_AGENT_META],
+    topology: createAgentThreadTopology(env.THREAD),
+    tenantForActor: (actor) => tenantContextForActor(actor, env),
+  });
   return new ApprovalService({
     store,
     defaultSlaSeconds: 15 * 60,
@@ -1312,53 +1302,7 @@ function buildApprovalService(
     // fans it out to that tenant's open dashboard sockets. Fire-and-forget; the
     // caller keeps the publish alive with ctx.waitUntil (see fetch below).
     stream,
-    // doSummary (host-kit) reads the DO's answer and rethrows a non-ok one as a
-    // RunRouteError carrying the DO's own status — the same reader the showcase
-    // and deploy hosts use. The spike keeps its own topology, not its own parsing.
-    resumeRun: async (record, decision) => {
-      if (record.resumeTarget?.kind === 'thread') {
-        const actor: ApprovalActor = {
-          id: SYSTEM_ACTOR_ID,
-          role: 'operator',
-          tenantId: record.tenantId,
-        };
-        const tenant = {
-          actor,
-          tenantId: record.tenantId,
-          ownsMemoryId: (id: string) => tenantOwnsMemoryId(record.tenantId, id),
-        } as unknown as TenantContext;
-        return doSummary(
-          await createThreadTopology(env.THREAD).send(
-            tenant,
-            record.resumeTarget.threadId,
-            '/agent/resume',
-            {
-              method: 'POST',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({
-                runId: record.runId,
-                resourceId: record.resumeTarget.resourceId,
-                step: record.stepPath,
-                resumeData: defaultResumeData(record, decision),
-              }),
-            },
-          ),
-        );
-      }
-      return doSummary(
-        await runStub(env, record.workflowId, record.runId).fetch(
-          `http://do/runs/${record.workflowId}/${record.runId}/resume`,
-          {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              step: record.stepPath,
-              resumeData: defaultResumeData(record, decision),
-            }),
-          },
-        ),
-      );
-    },
+    resumeRun,
   });
 }
 
@@ -1785,20 +1729,14 @@ async function handleScheduleProbe(
   }
 
   if (request.method === 'POST' && path === '/sched/agent') {
-    if (!env.SPIKE_LLM_MODEL_ID || !env.SPIKE_LLM_API_KEY) {
-      return json({ error: 'live LLM configuration is required' }, 503);
-    }
     const id = `schedule_${crypto.randomUUID()}`;
     const threadId = mintThreadId('spike');
-    const resourceId = mintResourceId(
-      'spike',
-      `schedule-${crypto.randomUUID()}`,
-    );
+    const resourceId = mintResourceId('spike', threadId);
     await store.createSchedule({
       id,
       target: {
         type: 'agent',
-        agentId: 'spike-live-agent',
+        agentId: SPIKE_AGENT_ID,
         prompt: 'Use the required write tool exactly once.',
         threadId,
         resourceId,
@@ -1815,34 +1753,36 @@ async function handleScheduleProbe(
       role: 'operator',
       tenantId: 'spike',
     };
-    const tenant = {
-      actor,
-      tenantId: 'spike',
-      ownsMemoryId: (value: string) => tenantOwnsMemoryId('spike', value),
-    } as unknown as TenantContext;
+    const tenant = tenantContextForActor(actor, env);
+    const topology = createAgentThreadTopology(env.THREAD);
     const tick = createScheduleTick({
       store,
       start: async (_workflowId, runId) => ({ runId }),
-      startAgent: async ({ target, runId, topologyThreadId, threaded }) => {
-        const response = await createThreadTopology(env.THREAD).send(
-          tenant,
-          topologyThreadId,
-          '/agent/start',
-          {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              runId,
-              resourceId: threaded ? target.resourceId : undefined,
-              prompt: target.prompt,
-              threaded,
-            }),
-          },
-        );
-        if (!response.ok)
-          throw new Error(`agent schedule start returned ${response.status}`);
-        const started = (await response.json()) as { runId?: string };
-        return { runId: started.runId ?? runId };
+      startAgent: async ({
+        target,
+        runId,
+        topologyThreadId,
+        threaded,
+        entryPath,
+        requestContext,
+        streamRequestContext,
+      }) => {
+        const started = await topology.start(tenant, {
+          agentId: target.agentId,
+          runId,
+          prompt: target.prompt,
+          entryPath,
+          threaded,
+          requestContext,
+          streamRequestContext,
+          ...(threaded
+            ? {
+                threadId: topologyThreadId,
+                resourceId: target.resourceId,
+              }
+            : {}),
+        });
+        return { runId: started.runId };
       },
     });
     const result = await tick();
@@ -1887,8 +1827,8 @@ const handler: ExportedHandler<Env> = {
     });
     const routed = request as unknown as Request;
 
-    const liveAgentResponse = await handleLiveAgentRoute(routed, env, resolve);
-    if (liveAgentResponse) return liveAgentResponse;
+    const agentProbeResponse = await handleLiveAgentRoute(routed, env, resolve);
+    if (agentProbeResponse) return agentProbeResponse;
 
     // Track B probes (B-S2 recovery seam, B-S3 _background rejection) — local,
     // unauthenticated, ahead of the routers.
@@ -1931,6 +1871,13 @@ const handler: ExportedHandler<Env> = {
       runner: env.RUNNER,
     })(routed);
     if (streamResponse) return streamResponse;
+
+    const agentResponse = await createAgentRouter({
+      agents: [SPIKE_AGENT_META],
+      resolve,
+      topology: createAgentThreadTopology(env.THREAD),
+    })(routed);
+    if (agentResponse) return agentResponse;
 
     const approvalResponse = await createApprovalRouter({ resolve })(routed);
     if (approvalResponse) return approvalResponse;

@@ -38,9 +38,16 @@ import {
   type SendNotificationSignalInput,
   summarizeNotifications,
 } from '@mastra/core/notifications';
-
-import { isRuntimeDrivenAgent } from '../agent-runner/index.js';
-import { mintSaltedId, type ThreadScope } from '../do-runner/index.js';
+import {
+  type AgentEntryPath,
+  isRuntimeDrivenAgent,
+} from '../agent-runner/index.js';
+import type { ApprovalActor } from '../approval-api/index.js';
+import {
+  DoStatusError,
+  mintSaltedId,
+  type ThreadScope,
+} from '../do-runner/index.js';
 import { internalErrorResponse } from '../internal-error-response.js';
 import {
   MAX_NOTIFICATION_DISPATCH_IDS,
@@ -76,6 +83,9 @@ export interface StartIdleRunInput {
   runId: string;
   threadId: string;
   resourceId?: string;
+  actor: ApprovalActor;
+  entryPath: AgentEntryPath;
+  /** Compatibility alias for actor.id. */
   requestedBy: string;
   message?: AgentMessageInput;
   signal?: AgentSignal;
@@ -107,7 +117,11 @@ export interface ThreadSignalRoutesOptions {
    * notification dispatch supplies the persisted agent id; other routes pass
    * `undefined`.
    */
-  resolveAgent: (scope: ThreadScope, agentId?: string) => Agent;
+  resolveAgent: (
+    scope: ThreadScope,
+    agentId: string | undefined,
+    entryPath: AgentEntryPath,
+  ) => Agent | Promise<Agent>;
   /**
    * The thread's tenant-owned memory resourceId — part of core's `(resourceId,
    * threadId)` signal key, so it MUST match whatever the loop registered under
@@ -138,6 +152,25 @@ export type ThreadSignalRouter = (
   request: Request,
   scope: ThreadScope,
 ) => Promise<Response | null>;
+
+function entryPathForSignalRoute(path: string): AgentEntryPath | undefined {
+  switch (path) {
+    case '/signal/message':
+      return 'signal.message';
+    case '/signal/queue':
+      return 'signal.queue';
+    case '/signal':
+      return 'signal.reactive';
+    case '/signal/state':
+      return 'signal.state';
+    case '/signal/notification':
+      return 'signal.notification';
+    case '/signal/notifications/dispatch':
+      return 'notification.dispatch';
+    default:
+      return undefined;
+  }
+}
 
 function json(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
@@ -233,6 +266,8 @@ export function createThreadSignalRoutes(
     const url = new URL(request.url);
     const path = url.pathname;
     if (path !== '/signal' && !path.startsWith('/signal/')) return null;
+    const entryPath = entryPathForSignalRoute(path);
+    if (entryPath === undefined) return json({ error: 'not found' }, 404);
 
     const body = await readJson(request);
     if (!body) return json({ error: 'a JSON body is required' }, 400);
@@ -258,7 +293,7 @@ export function createThreadSignalRoutes(
       // methods share the registry state the loop registered under. Keep host
       // resolution inside this catch-all: construction/storage failures are
       // internal and must not escape through the outer DO error response.
-      const agent = resolveAgent(scope, requestedAgentId);
+      const agent = await resolveAgent(scope, requestedAgentId, entryPath);
       if (requestedAgentId !== undefined && agent.id !== requestedAgentId) {
         return json(
           { error: 'notification agent binding does not match' },
@@ -283,7 +318,8 @@ export function createThreadSignalRoutes(
           consultRunCap,
           scope.tenantId,
           runtimeDriven,
-          scope.requestedBy,
+          scope.actor,
+          entryPath,
           startIdleRun,
           serializeWake,
         );
@@ -302,7 +338,8 @@ export function createThreadSignalRoutes(
           consultRunCap,
           scope.tenantId,
           runtimeDriven,
-          scope.requestedBy,
+          scope.actor,
+          entryPath,
           startIdleRun,
           serializeWake,
         );
@@ -325,7 +362,8 @@ export function createThreadSignalRoutes(
             threadId,
             resourceId,
             tenantId: scope.tenantId,
-            requestedBy: scope.requestedBy,
+            actor: scope.actor,
+            entryPath,
             runtimeDriven,
             consultRunCap,
             startIdleRun,
@@ -343,6 +381,18 @@ export function createThreadSignalRoutes(
       }
       return json({ error: 'not found' }, 404);
     } catch (error) {
+      if (
+        error instanceof DoStatusError &&
+        (error.status === 403 || error.status === 404 || error.status === 409)
+      ) {
+        const message =
+          error.status === 403
+            ? 'forbidden'
+            : error.status === 404
+              ? 'not found'
+              : 'conflict';
+        return json({ error: message }, error.status);
+      }
       // A send that cannot be routed at all (e.g. an idle wake whose stream setup
       // throws — no model) rejects `accepted`; surface it as a 502 rather than a
       // 500 so a model/config fault reads distinctly from a route bug.
@@ -357,7 +407,8 @@ async function handleNotificationDispatch(options: {
   threadId: string;
   resourceId: string | undefined;
   tenantId: string;
-  requestedBy: string;
+  actor: ApprovalActor;
+  entryPath: AgentEntryPath;
   runtimeDriven: boolean;
   consultRunCap?: RunCapConsult;
   startIdleRun?: StartIdleRun;
@@ -465,7 +516,8 @@ async function handleNotificationDispatch(options: {
       tenantId: options.tenantId,
       threadId: options.threadId,
       resourceId,
-      requestedBy: options.requestedBy,
+      actor: options.actor,
+      entryPath: options.entryPath,
       runtimeDriven: options.runtimeDriven,
       consultRunCap: options.consultRunCap,
       startIdleRun: options.startIdleRun,
@@ -619,7 +671,8 @@ async function handleWake(options: {
   tenantId: string;
   threadId: string;
   resourceId: string;
-  requestedBy: string;
+  actor: ApprovalActor;
+  entryPath: AgentEntryPath;
   runtimeDriven: boolean;
   consultRunCap?: RunCapConsult;
   startIdleRun?: StartIdleRun;
@@ -681,7 +734,9 @@ async function handleWake(options: {
       runId,
       threadId: options.threadId,
       resourceId: options.resourceId,
-      requestedBy: options.requestedBy,
+      actor: options.actor,
+      entryPath: options.entryPath,
+      requestedBy: options.actor.id,
       ...(options.message !== undefined ? { message: options.message } : {}),
       ...(options.signal !== undefined ? { signal: options.signal } : {}),
     });
@@ -702,7 +757,8 @@ async function handleMessage(
   consultRunCap: RunCapConsult | undefined,
   tenantId: string,
   runtimeDriven: boolean,
-  requestedBy: string,
+  actor: ApprovalActor,
+  entryPath: AgentEntryPath,
   startIdleRun: StartIdleRun | undefined,
   serializeWake: <T>(operation: () => Promise<T>) => Promise<T>,
 ): Promise<Response> {
@@ -731,7 +787,8 @@ async function handleMessage(
       tenantId,
       threadId,
       resourceId,
-      requestedBy,
+      actor,
+      entryPath,
       runtimeDriven,
       consultRunCap,
       startIdleRun,
@@ -797,7 +854,8 @@ async function handleSignal(
   consultRunCap: RunCapConsult | undefined,
   tenantId: string,
   runtimeDriven: boolean,
-  requestedBy: string,
+  actor: ApprovalActor,
+  entryPath: AgentEntryPath,
   startIdleRun: StartIdleRun | undefined,
   serializeWake: <T>(operation: () => Promise<T>) => Promise<T>,
 ): Promise<Response> {
@@ -842,7 +900,8 @@ async function handleSignal(
       tenantId,
       threadId,
       resourceId,
-      requestedBy,
+      actor,
+      entryPath,
       runtimeDriven,
       consultRunCap,
       startIdleRun,

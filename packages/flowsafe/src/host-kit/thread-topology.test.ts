@@ -7,6 +7,8 @@ import {
   type InitResult,
   init,
   mintThreadId,
+  THREAD_ACTOR_HEADER,
+  THREAD_ACTOR_ROLE_HEADER,
   THREAD_TENANT_HEADER,
   ThreadDurableObject,
   type ThreadScope,
@@ -34,6 +36,8 @@ interface Captured {
   url: string;
   method: string;
   tenantHeader: string | null;
+  actorHeader: string | null;
+  roleHeader: string | null;
   otherHeader: string | null;
   body: string;
 }
@@ -65,6 +69,8 @@ function recordingNamespace(): {
             url: request.url,
             method: request.method,
             tenantHeader: request.headers.get(THREAD_TENANT_HEADER),
+            actorHeader: request.headers.get(THREAD_ACTOR_HEADER),
+            roleHeader: request.headers.get(THREAD_ACTOR_ROLE_HEADER),
             otherHeader: request.headers.get('x-other'),
             body: await request.text(),
           });
@@ -107,6 +113,8 @@ describe('createThreadTopology', () => {
         url: 'http://thread/messages',
         method: 'POST',
         tenantHeader: 'acme',
+        actorHeader: 'operator-1',
+        roleHeader: 'operator',
         otherHeader: null,
         body: '{}',
       },
@@ -151,6 +159,26 @@ describe('createThreadTopology', () => {
 
     // #then — exactly the authenticated tenant, no appended forgery
     expect(calls[0]?.tenantHeader).toBe('acme');
+  });
+
+  it('case-insensitively overwrites forged actor id and role headers', async () => {
+    const { namespace, calls } = recordingNamespace();
+    const topology = createThreadTopology(namespace);
+
+    await topology.send(
+      tenantContext('acme'),
+      mintThreadId('acme', () => 't1'),
+      '/messages',
+      {
+        headers: {
+          'X-Flowsafe-Actor': 'attacker',
+          'X-Flowsafe-Role': 'admin',
+        },
+      },
+    );
+
+    expect(calls[0]?.actorHeader).toBe('operator-1');
+    expect(calls[0]?.roleHeader).toBe('operator');
   });
 
   it('OVERWRITES a FORGED client header on a forwarded request (the trap the house idiom sets)', async () => {

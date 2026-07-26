@@ -29,7 +29,7 @@ import type {
 import type { RequestContext } from '@mastra/core/request-context';
 import type { ChunkType } from '@mastra/core/stream';
 
-import type { AuditLogger } from '../audit/index.js';
+import { type AuditLogger, agentAuditDetail } from '../audit/index.js';
 import { type Actor, actorFromRequestContext } from '../rbac/index.js';
 import type { PolicyDecision } from './tool-policy.js';
 
@@ -244,6 +244,8 @@ export interface PolicyEngineOptions {
   policies: readonly PolicyEvaluator[];
   /** Optional audit logger for policy decisions and evaluator failures. */
   audit?: AuditLogger;
+  /** Audit resource. Defaults to the stable processor identifier. */
+  resource?: string;
   /**
    * Opt-in zero-leak streaming: hold back a trailing window of each text
    * channel so a violating span is caught BEFORE any of it is emitted.
@@ -284,6 +286,7 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
   readonly id = 'breakwater-policy-engine' as const;
   readonly #policies: readonly PolicyEvaluator[];
   readonly #audit?: AuditLogger;
+  readonly #resource: string;
   readonly #holdBack: boolean;
   readonly #holdBackWindow: Record<HoldableChannel, number>;
   readonly #objectOnlyPolicyNames: readonly string[];
@@ -303,6 +306,7 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
     }
     this.#policies = options.policies;
     this.#audit = options.audit;
+    this.#resource = options.resource ?? this.id;
     this.#holdBack = options.holdBack ?? false;
     this.#holdBackWindow = {
       answer: holdBackWindowFor(options.policies, 'answer'),
@@ -343,14 +347,14 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
       actor,
       args.abort,
     );
-    this.#recordAllowed('input', actor, evaluated);
+    this.#recordAllowed('input', actor, evaluated, args.requestContext);
     return args.messages;
   }
 
   async processOutputResult(
     args: ProcessOutputResultArgs,
   ): Promise<MastraDBMessage[]> {
-    this.#warnObjectChannelGapOnce();
+    this.#warnObjectChannelGapOnce(args.requestContext);
     // result.text is the authoritative generation output (non-optional in
     // core); messages also carry earlier conversation turns the output
     // policies should not re-gate. This is the final gate for both
@@ -392,7 +396,12 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
     }
     // ONE terminal allowed record per result — channel passes aggregated,
     // deduplicated — not one record per channel.
-    this.#recordAllowed('output', actor, [...new Set(evaluated)]);
+    this.#recordAllowed(
+      'output',
+      actor,
+      [...new Set(evaluated)],
+      args.requestContext,
+    );
     return args.messages;
   }
 
@@ -600,10 +609,13 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
         this.#audit?.record({
           actor,
           action: `agent.${phase}.policy`,
-          resource: this.id,
+          resource: this.#resource,
           decision: 'error',
           reason,
-          detail: { policy: policy.name, channel },
+          detail: agentAuditDetail(context.requestContext, {
+            policy: policy.name,
+            channel,
+          }),
         });
         if (abortOnError) abort(reason);
         throw error;
@@ -613,10 +625,13 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
         this.#audit?.record({
           actor,
           action: `agent.${phase}.policy`,
-          resource: this.id,
+          resource: this.#resource,
           decision: 'denied',
-          reason,
-          detail: { policy: policy.name, channel },
+          reason: 'policy denied',
+          detail: agentAuditDetail(context.requestContext, {
+            policy: policy.name,
+            channel,
+          }),
         });
         abort(reason);
       }
@@ -631,7 +646,7 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
   // constructor now REJECTS this configuration when no audit sink is present
   // (D1), so #audit is guaranteed to exist whenever there is an object-only
   // policy to warn about; the optional-chain remains only as defense in depth.
-  #warnObjectChannelGapOnce(): void {
+  #warnObjectChannelGapOnce(requestContext?: RequestContext): void {
     if (
       this.#objectChannelFenceWarned ||
       this.#objectOnlyPolicyNames.length === 0
@@ -644,10 +659,12 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
     this.#audit?.record({
       actor: null,
       action: 'agent.output.policy',
-      resource: this.id,
+      resource: this.#resource,
       decision: 'error',
       reason: `polic${plural} [${names}] scoped to the 'object' channel without 'answer' cannot be enforced on non-streaming generate() results under @mastra/core 1.50.0 (OutputResult carries no structured-object field) — gate via agent.stream() or include 'answer' in channels`,
-      detail: { policies: [...this.#objectOnlyPolicyNames] },
+      detail: agentAuditDetail(requestContext, {
+        policies: [...this.#objectOnlyPolicyNames],
+      }),
     });
   }
 
@@ -655,13 +672,14 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
     phase: PolicyPhase,
     actor: Actor | null,
     evaluated: string[],
+    requestContext?: RequestContext,
   ): void {
     this.#audit?.record({
       actor,
       action: `agent.${phase}.policy`,
-      resource: this.id,
+      resource: this.#resource,
       decision: 'allowed',
-      detail: { evaluated },
+      detail: agentAuditDetail(requestContext, { evaluated }),
     });
   }
 }

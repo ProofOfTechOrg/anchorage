@@ -133,6 +133,10 @@ The stream routes mount only when streaming is configured. The approval create r
 ### Advanced routes
 
 ```text
+GET    /agents
+POST   /agents/:agentId/runs
+GET    /agents/:agentId/runs/:threadId/:runId
+GET    /agents/:agentId/runs/:threadId/:runId/stream?offset=N
 POST   /api/threads/:threadId/message
 POST   /api/threads/:threadId/queue
 POST   /api/threads/:threadId/signal
@@ -148,7 +152,9 @@ DELETE /api/threads/:threadId/goal
 ... provider webhook routes under the configured webhook base
 ```
 
-Route factories accept a `basePath` when the exact public prefix is host-specific. The generated [API reference](https://proofoftechorg.github.io/anchorage/) documents each option.
+The agent host has no public resume route. An approval decision resumes the original authorized requester through the persisted `agent-thread` target. The agent event stream uses authenticated newline-delimited JSON with an offset cursor. If its short-lived replay cache is unavailable, the stream returns 409 and the client reads the authoritative status route.
+
+Other route factories accept a `basePath` when the exact public prefix is host-specific. The generated [API reference](https://proofoftechorg.github.io/anchorage/) documents each option.
 
 ## Host composition
 
@@ -160,6 +166,8 @@ Route factories accept a `basePath` when the exact public prefix is host-specifi
 - `preRoutes` for deployment-specific routes
 - `wrapResolve` for subdomain or additional identity checks
 - `wrapStart` and `wrapResume` for budgets
+- `buildAgentRouter` for the metadata-only public catalog and run routes
+- `buildResumeRun` to compose approval-only agent resume with generic workflow resume
 - `notify` for reviewer delivery
 - `artifactStore` to pair R2 deletion with snapshot retention
 - `backgroundTasks` for task cleanup
@@ -226,12 +234,14 @@ Before exposing traffic:
 2. Run the starter smoke test against a deterministic model.
 3. Verify no route works without authentication except `/healthz` and
    explicitly configured signature-verified webhook routes.
-4. Verify a foreign run and thread return 404 without waking the target object.
-5. Forge a raw resume and confirm the connector denies the missing grant.
-6. Kill the local Worker while a run is suspended, restart it, approve, and confirm completion.
-7. Verify every configured cron and provider alarm emits a success or contained failure event.
-8. Confirm Queue retries and dead-letter handling against a failing SIEM endpoint.
-9. Confirm retention deletes matching artifacts and leaves live rows.
-10. Exercise tenant offboarding in a non-production database.
+4. Verify forged tenant, actor, and role headers return 403.
+5. Verify a foreign run, thread, agent, or binding mismatch returns 404 without model or connector execution.
+6. Confirm no public agent raw-resume route exists.
+7. Kill the local Worker while an agent run is suspended, restart it, approve as a different reviewer, and confirm the connector runs once as the original requester.
+8. Evict the agent stream cache and confirm the stream returns 409 while status remains available.
+9. Verify every configured cron and provider alarm emits a success or contained failure event.
+10. Confirm Queue retries and dead-letter handling against a failing SIEM endpoint.
+11. Confirm retention deletes matching artifacts and leaves live rows.
+12. Exercise tenant offboarding in a non-production database.
 
 Operational procedures are in [Operations runbook](operations-runbook.md).

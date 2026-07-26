@@ -54,6 +54,14 @@ export {
 // status by extending DoStatusError (see do-error-response.ts).
 export { DoStatusError, doErrorResponse } from './do-error-response.js';
 export { DurableObjectRunner } from './durable-object.js';
+export {
+  assertNoReservedExecutionContext,
+  findReservedExecutionContextKey,
+  isReservedExecutionContextKey,
+  RESERVED_EXECUTION_CONTEXT_KEYS,
+  ReservedExecutionContextError,
+  stripReservedExecutionContext,
+} from './execution-context.js';
 export type { HubStreamEvent, PresenceMember } from './hub-do.js';
 export { HubDurableObject } from './hub-do.js';
 export type {
@@ -107,5 +115,6 @@ export type { ThreadScope } from './thread-do.js';
 export { ThreadDurableObject, ThreadIdentityError } from './thread-do.js';
 export {
   THREAD_ACTOR_HEADER,
+  THREAD_ACTOR_ROLE_HEADER,
   THREAD_TENANT_HEADER,
 } from './thread-header.js';
