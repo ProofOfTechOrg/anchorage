@@ -12,6 +12,7 @@
     "dev": "wrangler dev",
     "test": "pnpm run check:imports && vitest run",
     "token": "node scripts/mint-token.mjs",
+    "pretypecheck": "pnpm --filter @proofoftech/breakwater --filter @proofoftech/flowsafe build",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
