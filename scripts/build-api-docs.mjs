@@ -119,6 +119,8 @@ const temporaryDirectory = mkdtempSync(join(tmpdir(), 'anchorage-api-docs-'));
 const revision = gitRevision();
 
 try {
+  run(pnpm, ['--filter', '@proofoftech/breakwater', 'build']);
+
   const passes = [
     {
       options: 'packages/breakwater/typedoc.json',
