@@ -61,6 +61,11 @@ const incompleteProjects = projects.filter(
   (project) => project.complete !== true,
 );
 const missingFullProject = scope === 'full' && projects.length === 0;
+const emptyChangedScan =
+  scope === 'changed' &&
+  report.reactDetected !== true &&
+  report.error == null &&
+  projects.length === 0;
 const summary = report.summary ?? {};
 
 console.log(
@@ -69,14 +74,16 @@ console.log(
 );
 
 if (
-  report.reactDetected !== true ||
+  (!emptyChangedScan && report.reactDetected !== true) ||
   report.error != null ||
   missingFullProject ||
   incompleteProjects.length > 0 ||
   skipped.length > 0
 ) {
   const reasons = [
-    report.reactDetected === true ? undefined : 'React was not detected',
+    report.reactDetected === true || emptyChangedScan
+      ? undefined
+      : 'React was not detected',
     report.error == null ? undefined : String(report.error),
     missingFullProject ? 'no project was analyzed' : undefined,
     incompleteProjects.length > 0
