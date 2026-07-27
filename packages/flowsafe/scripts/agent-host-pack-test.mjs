@@ -116,7 +116,7 @@ void envelope;
     }),
   );
   run(
-    join(repositoryRoot, 'node_modules', '.bin', 'tsc'),
+    join(packageRoot, 'node_modules', '.bin', 'tsc'),
     ['-p', 'tsconfig.json'],
     consumer,
   );

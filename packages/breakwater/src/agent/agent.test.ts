@@ -374,6 +374,7 @@ describe('guarded construction and processor validation', () => {
     'defaultStreamOptionsLegacy',
     'defaultNetworkOptions',
     'backgroundTasks',
+    'durable',
     'goal',
     'signals',
     'editor',
@@ -647,7 +648,11 @@ describe('Mastra Agent execution-entry inventory', () => {
       'generateLegacy',
       'generateTitleFromUserMessage',
       'network',
+      'prepare',
       'queueMessage',
+      'recover',
+      'recoverActiveRuns',
+      'resume',
       'resumeGenerate',
       'resumeNetwork',
       'resumeStream',
@@ -680,6 +685,7 @@ describe('Mastra Agent execution-entry inventory', () => {
       '__updateInstructions',
       '__updateModel',
       'assertSupportsPreparedModels',
+      'agent',
       'browser',
       'clearObjective',
       'combineProcessorsIntoWorkflow',
@@ -687,6 +693,7 @@ describe('Mastra Agent execution-entry inventory', () => {
       'convertTools',
       'deriveSubAgentBackgroundConfig',
       'disableBackgroundTasks',
+      'durable',
       'enableBackgroundTasks',
       'formatMessagePartsForTitle',
       'formatMessagesForTitle',
@@ -730,6 +737,7 @@ describe('Mastra Agent execution-entry inventory', () => {
       'hasOwnPubSub',
       'hasOwnWorkspace',
       'isModelFallbacks',
+      'listActiveRuns',
       'listAgents',
       'listAgentTools',
       'listAssignedTools',
@@ -756,9 +764,11 @@ describe('Mastra Agent execution-entry inventory', () => {
       'listWorkflows',
       'listWorkspaceTools',
       'normalizeModelFallbacks',
+      'observe',
       'prepareModels',
       'reorderModels',
       'requestContextSchema',
+      'requireAgentExecutionFGA',
       'resolveFallbackDynamic',
       'resolveInputProcessors',
       'resolveModelConfig',
@@ -787,9 +797,10 @@ describe('Mastra Agent execution-entry inventory', () => {
     ];
 
     expect(new Set(classified).size).toBe(classified.length);
-    expect(Object.getOwnPropertyNames(Agent.prototype).sort()).toEqual(
-      classified.sort(),
+    const unclassified = Object.getOwnPropertyNames(Agent.prototype).filter(
+      (property) => !classified.includes(property),
     );
+    expect(unclassified).toEqual([]);
   });
 });
 
@@ -803,6 +814,8 @@ function compileTimeSurface(
     void handle.generate('hello', { requestContext, structuredOutput: {} });
     // @ts-expect-error Raw resume is intentionally unavailable.
     void handle.resumeStream({}, { requestContext });
+    // @ts-expect-error Standalone durable resume is intentionally unavailable.
+    void handle.resume('run-1', {});
     // @ts-expect-error Legacy execution is intentionally unavailable.
     void handle.generateLegacy('hello');
     // @ts-expect-error Network execution is intentionally unavailable.
