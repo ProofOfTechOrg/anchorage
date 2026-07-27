@@ -6,7 +6,11 @@ import { describe, expect, it } from 'vitest';
 import { type InitResult, init } from './init.js';
 import { mintThreadId } from './memory-id.js';
 import { ThreadDurableObject, type ThreadScope } from './thread-do.js';
-import { THREAD_ACTOR_HEADER, THREAD_TENANT_HEADER } from './thread-header.js';
+import {
+  THREAD_ACTOR_HEADER,
+  THREAD_ACTOR_ROLE_HEADER,
+  THREAD_TENANT_HEADER,
+} from './thread-header.js';
 
 // A host subclass: build() is its init() wiring, route() its thread routes.
 // This one echoes the ASSERTED scope, so every test below reads exactly what
@@ -23,6 +27,8 @@ class TestThread extends ThreadDurableObject {
         JSON.stringify({
           threadId: scope.threadId,
           tenantId: scope.tenantId,
+          actor: scope.actor,
+          requestedBy: scope.requestedBy,
         }),
       ),
     );
@@ -42,6 +48,7 @@ function request(
   const headers = new Headers();
   if (tenantId !== undefined) headers.set(THREAD_TENANT_HEADER, tenantId);
   if (requestedBy !== null) headers.set(THREAD_ACTOR_HEADER, requestedBy);
+  headers.set(THREAD_ACTOR_ROLE_HEADER, 'operator');
   return new Request('http://thread/messages', {
     method: 'POST',
     headers,
@@ -62,6 +69,12 @@ describe('ThreadDurableObject tenant assertion', () => {
     expect(await response.json()).toEqual({
       threadId: 'acme_t1',
       tenantId: 'acme',
+      actor: {
+        id: 'operator',
+        role: 'operator',
+        tenantId: 'acme',
+      },
+      requestedBy: 'operator',
     });
   });
 
@@ -99,6 +112,17 @@ describe('ThreadDurableObject tenant assertion', () => {
 
     expect(response.status).toBe(403);
     expect(await response.text()).toMatch(/carries no trusted actor/);
+  });
+
+  it('refuses a request without a valid topology-owned actor role', async () => {
+    const thread = threadWith(mintThreadId('acme', () => 't1'));
+    const forged = request('acme');
+    forged.headers.set(THREAD_ACTOR_ROLE_HEADER, 'owner');
+
+    const response = await thread.fetch(forged);
+
+    expect(response.status).toBe(403);
+    expect(await response.text()).toMatch(/valid trusted actor role/);
   });
 
   it('is exact at the tenant boundary (the acme vs acmecorp pin)', async () => {

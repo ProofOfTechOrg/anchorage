@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-import { describe, expect, it } from 'vitest';
-
+import { describe, expect, it, vi } from 'vitest';
+import {
+  THREAD_ACTOR_HEADER,
+  THREAD_ACTOR_ROLE_HEADER,
+  THREAD_TENANT_HEADER,
+} from '../do-runner/thread-header.js';
 import type {
   CreateTenantResolverOptions,
   TenantContext,
@@ -117,5 +121,58 @@ describe('createTenantResolver — non-string tenantId refusal (INV-3 belt, F2)'
     await expect(
       resolve(new Request('https://host.example/')),
     ).rejects.toBeInstanceOf(TenantResolutionError);
+  });
+});
+
+describe('createTenantResolver authenticated actor validation', () => {
+  it.each([
+    ['empty actor id', { id: '', role: 'admin', tenantId: 'acme' }],
+    ['whitespace actor id', { id: '   ', role: 'admin', tenantId: 'acme' }],
+    [
+      'header-invalid actor id',
+      { id: 'actor-1\r\nx-forged: yes', role: 'admin', tenantId: 'acme' },
+    ],
+    ['unknown actor role', { id: 'actor-1', role: 'root', tenantId: 'acme' }],
+  ])('rejects an %s from a custom authenticator', async (_label, actor) => {
+    const resolve = createTenantResolver({
+      authenticate: () => actor as never,
+      storeFactory: new InMemoryApprovalStoreFactory(),
+      buildService: () => {
+        throw new Error('service must not be built');
+      },
+    });
+
+    await expect(
+      resolve(new Request('https://host.example/')),
+    ).rejects.toBeInstanceOf(TenantResolutionError);
+  });
+});
+
+describe('createTenantResolver server-stamped header boundary', () => {
+  it.each([
+    THREAD_TENANT_HEADER,
+    THREAD_ACTOR_HEADER,
+    THREAD_ACTOR_ROLE_HEADER,
+  ])('refuses a mixed-case inbound %s header before authentication', async (header) => {
+    const authenticate = vi.fn(() => ({
+      id: 'actor-1',
+      role: 'admin' as const,
+      tenantId: 'acme',
+    }));
+    const resolve = createTenantResolver({
+      authenticate,
+      storeFactory: new InMemoryApprovalStoreFactory(),
+      buildService: () => {
+        throw new Error('service must not be built');
+      },
+    });
+    const request = new Request('https://host.example/', {
+      headers: { [header.toUpperCase()]: 'forged' },
+    });
+
+    await expect(resolve(request)).rejects.toBeInstanceOf(
+      TenantResolutionError,
+    );
+    expect(authenticate).not.toHaveBeenCalled();
   });
 });

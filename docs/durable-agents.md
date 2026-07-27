@@ -29,9 +29,46 @@ authenticated Worker
 
 Address thread and provider Durable Objects through the exported topologies. Do not forward the inbound request directly to a raw namespace stub.
 
-## Drive an agent through `RunnerRuntime`
+## Host a guarded agent catalog
 
-Create the ordinary Mastra `Agent`, then wrap it:
+Use `@proofoftech/flowsafe/agent-host` for a public agent surface. Each catalog entry couples public metadata to a Breakwater `GuardedAgentHandle`:
+
+```typescript
+interface AgentModule {
+  meta: {
+    id: string;
+    title: string;
+    description: string;
+    allowedRoles?: readonly ApprovalRole[];
+  };
+  agent: GuardedAgentHandle;
+}
+```
+
+The Worker receives metadata only. The thread Durable Object constructs the complete module because its model, storage, runtime, pub/sub, connector, and database objects belong to that instance.
+
+Catalog construction rejects path-unsafe or duplicate ids, empty descriptions, invalid role lists, metadata/handle id mismatches, and metadata roles that differ from the guarded handle. An omitted role list uses `RUN_START_ROLES`.
+
+Mount `createAgentRouter()` through `createFlowsafeWorker({ buildAgentRouter })`. It exposes:
+
+| Method and route | Purpose |
+| --- | --- |
+| `GET /agents` | List the registered metadata and authenticated actor |
+| `POST /agents/:agentId/runs` | Mint ids and start a guarded durable run |
+| `GET /agents/:agentId/runs/:threadId/:runId` | Read authoritative durable status |
+| `GET /agents/:agentId/runs/:threadId/:runId/stream?offset=N` | Observe authenticated newline-delimited JSON events |
+
+Every authenticated role may list agents and inspect same-tenant runs. Starts require both `RUN_START_ROLES` and the agent's effective roles. There is no public agent-resume route.
+
+The start body accepts only `{"prompt":"..."}`. The router caps the raw UTF-8 body at 16,384 bytes, requires non-whitespace prompt content, preserves that content, and rejects ids, trusted context, overrides, unknown fields, and prototype meta-keys.
+
+Each stream line contains the next reconnect cursor and one event. Replay depends on the configured Mastra cache and is not process-restart durable. When the durable run exists but its replay cache does not, the stream route returns 409 and the client must use the status route.
+
+Approval records store an `agent-thread` target with the agent, thread, resource, and original authorized principal. `createAgentApprovalResumer()` rechecks the current catalog roles, reconstructs the guarded module after eviction, and resumes as that original principal. Before resume, the wrapper rebuilds Mastra's local and global run registries from fresh trusted context. It invokes only Breakwater's reserved RBAC `processInput` hook during rehydration, then installs the complete input, LLM-request, and output processor lists for resumed loop execution. It does not replay application or policy `processInput` hooks. An authorization denial stops before registry installation, observation, or tool execution. The reviewer identity remains attached to the approval decision.
+
+## Use the lower-level durable wrapper
+
+`createFlowsafeDurableAgent()` remains available for compatibility. Create an ordinary Mastra `Agent`, then wrap it:
 
 ```typescript
 import { Agent } from '@mastra/core/agent';
@@ -56,11 +93,11 @@ const durableAgent = createFlowsafeDurableAgent({
 });
 ```
 
-`createFlowsafeDurableAgent()` registers Mastra's `durable-agentic-loop` workflow on the supplied runtime. Its `stream()`, `generate()`, and `prepare()` entry points require a caller-minted run id. The host must mint `${tenantId}_${uuid}`; flowsafe does not fall back to a tenant-less UUID.
+`createFlowsafeDurableAgent()` registers Mastra's `durable-agentic-loop` workflow on the supplied runtime. Its `stream()`, `generate()`, and `prepare()` entry points require a caller-minted run id. The host must mint `${tenantId}_${uuid}`; flowsafe does not fall back to a tenant-less UUID. `prepare()` remains an initial-execution API and runs the full initial processor chain. `resumeViaRuntime()` uses the dedicated registry rehydration behavior described above.
 
 The runtime's pub/sub identity is reused by default. This lets the durable loop, observer, and active-thread signal delivery share one feed inside the thread Durable Object.
 
-Do not expose the inherited `resume()`, `approveToolCall()`, or `declineToolCall()` methods as client routes. Resume through the approval service and `resumeViaRuntime()`, which prepares an evicted run before the trusted runtime resume.
+This wrapper does not add the guarded-agent brand or catalog authorization to a raw agent. Use `agent-host` for the supported protected public surface. Do not expose inherited `resume()`, `approveToolCall()`, or `declineToolCall()` methods as client routes.
 
 ## Mint and protect memory identities
 
@@ -79,8 +116,8 @@ Host rules:
 2. Resolve the authenticated `TenantContext`.
 3. Return 404 for a foreign stored id with `requireOwnedMemoryId()`.
 4. Address the thread Durable Object through `createThreadTopology()`.
-5. Let the topology overwrite `x-flowsafe-tenant` and actor headers from the resolved context.
-6. Have `ThreadDurableObject` verify the stamped tenant against its own `id.name` prefix.
+5. Let the topology overwrite `x-flowsafe-tenant`, `x-flowsafe-actor`, and `x-flowsafe-role` from the resolved context.
+6. Have `ThreadDurableObject` reconstruct the actor and verify the stamped tenant against its own `id.name` prefix.
 
 The D1 recall-path tests use one database and the same business key for two tenants. They prove isolated `recall`, `listThreads`, and working memory behavior through Mastra's own memory implementation.
 
@@ -102,7 +139,7 @@ When you adopt a storage domain, wire its offboarding and retention duties in th
 
 ## Host the thread Durable Object
 
-Subclass `ThreadDurableObject` and install `createThreadSignalRoutes()` inside the subclass route. The route factory:
+Subclass `ThreadDurableObject`, construct the catalog modules for that instance, and install `createThreadAgentHost()` and `createThreadSignalRoutes()` inside the subclass route. These factories share the asserted `ThreadScope` instead of mutable module or request-global state.
 
 - stamps the runtime pub/sub identity onto the agent before each call;
 - serializes delivery into the thread;
@@ -119,6 +156,8 @@ The host's idle-start seam must:
 3. mint a fresh tenant-salted run id;
 4. start the durable agent through `RunnerRuntime`;
 5. persist and report the authoritative run id.
+
+The agent host persists a thread-to-agent binding and per-run principal record in Durable Object storage. It rejects a second simultaneous operation for the same run with 409 instead of replacing the active execution context.
 
 Thread delivery is priority-planned across summaries and individual notifications, remains stable across 100-record chunks, and suppresses summarized high-priority rows while the thread was active.
 
@@ -178,7 +217,9 @@ The tick:
 - starts agent targets through the injected thread topology callback;
 - isolates each schedule's failure and records the actual joined run id.
 
-Runtime-derived request-context keys are spread after stored keys. A row planted directly in D1 cannot override an approval grant, workflow scope, isolation scope, run id, thread id, resource id, or goal context.
+The shared execution-context boundary strips reserved keys from persisted compatibility paths and rejects them at external HTTP boundaries. Reserved keys include every `breakwater.*` key, `mastra:goal`, run/thread/resource ids, and JavaScript prototype meta-keys.
+
+Runtime workflow and isolation values overwrite sanitized context. The exact-leg connector grant then overwrites any prior grant, including with an empty list, and trusted actor/audit correlation is merged last. A row planted directly in D1 cannot override a grant, principal, workflow scope, isolation scope, run id, thread id, resource id, or goal context.
 
 Schedules are standing configuration and have no TTL. Trigger history has an opt-in retention duty.
 

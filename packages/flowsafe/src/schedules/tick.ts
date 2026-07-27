@@ -37,42 +37,21 @@
 import { ScheduleInputSchema } from '@mastra/core/schedules';
 import { computeNextFireAt } from '@mastra/core/workflows';
 import {
-  BREAKWATER_ACTOR_KEY,
-  BREAKWATER_APPROVED_CONNECTORS_KEY,
-  BREAKWATER_ISOLATION_SCOPE_KEY,
-  BREAKWATER_WORKFLOW_SCOPE_KEY,
-} from '../do-runner/breakwater-keys.js';
-import {
   assertMintableTenantId,
+  isReservedExecutionContextKey,
   mintSaltedId,
+  RESERVED_EXECUTION_CONTEXT_KEYS,
+  stripReservedExecutionContext,
   tenantOwnsSaltedId,
 } from '../do-runner/index.js';
-import { GOAL_REQUEST_CONTEXT_KEY } from '../goals/objective-routes.js';
 import { nonnegativeSafeInteger } from '../numeric-config.js';
 import type { Schedule, ScheduleTrigger } from './schedules-d1.js';
 
-/** The `breakwater.` namespace prefix — every runtime-owned key starts with it. */
-const BREAKWATER_KEY_PREFIX = 'breakwater.';
-
 /**
- * The explicit reserved requestContext keys: the four runtime base keys
- * (all `breakwater.`-prefixed) + core's goal key. This is the canonical LIST for
- * introspection and the drift-guard test — NOT the runtime matcher. The strip and
- * the router both use `isReservedScheduleContextKey` (the `breakwater.` PREFIX +
- * the goal key), so a FUTURE breakwater key is covered without editing this list;
- * a test pins that every key here is matched by the predicate, so the explicit
- * list and the prefix matcher cannot diverge.
+ * Compatibility alias for the former schedule-specific inventory. New code
+ * should use RESERVED_EXECUTION_CONTEXT_KEYS from do-runner.
  */
-export const RESERVED_SCHEDULE_CONTEXT_KEYS: readonly string[] = [
-  BREAKWATER_APPROVED_CONNECTORS_KEY,
-  BREAKWATER_ACTOR_KEY,
-  BREAKWATER_WORKFLOW_SCOPE_KEY,
-  BREAKWATER_ISOLATION_SCOPE_KEY,
-  GOAL_REQUEST_CONTEXT_KEY,
-  '__proto__',
-  'constructor',
-  'prototype',
-];
+export const RESERVED_SCHEDULE_CONTEXT_KEYS = RESERVED_EXECUTION_CONTEXT_KEYS;
 
 /**
  * A key is reserved iff it is in the `breakwater.` namespace (covers all four
@@ -83,32 +62,14 @@ export const RESERVED_SCHEDULE_CONTEXT_KEYS: readonly string[] = [
  * parsed JSON cannot mutate a copied context's prototype.
  */
 export function isReservedScheduleContextKey(key: string): boolean {
-  return (
-    key.startsWith(BREAKWATER_KEY_PREFIX) ||
-    key === GOAL_REQUEST_CONTEXT_KEY ||
-    key === '__proto__' ||
-    key === 'constructor' ||
-    key === 'prototype'
-  );
+  return isReservedExecutionContextKey(key);
 }
 
 /** Drop every reserved key from a stored schedule context (barrier b's core job). */
 export function stripReservedScheduleContext(
   stored: Record<string, unknown> | undefined,
 ): Record<string, unknown> {
-  if (!stored) return {};
-  const safe: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(stored)) {
-    if (!isReservedScheduleContextKey(key)) {
-      Object.defineProperty(safe, key, {
-        value,
-        enumerable: true,
-        configurable: true,
-        writable: true,
-      });
-    }
-  }
-  return safe;
+  return stripReservedExecutionContext(stored);
 }
 
 /**
@@ -169,6 +130,7 @@ export interface ScheduleTickStartAgentInput {
   /** DO address; ephemeral and memoryless when `threaded` is false. */
   topologyThreadId: string;
   threaded: boolean;
+  entryPath: 'schedule.fire';
   requestContext: Record<string, unknown>;
   streamRequestContext: Record<string, unknown>;
 }
@@ -618,6 +580,7 @@ export function createScheduleTick(
           runId: firedRunId,
           topologyThreadId,
           threaded,
+          entryPath: 'schedule.fire',
           requestContext: target.requestContext ?? {},
           streamRequestContext:
             target.ifIdle?.streamOptions?.requestContext ?? {},

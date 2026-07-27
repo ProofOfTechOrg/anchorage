@@ -17,9 +17,11 @@ import {
 } from '../do-runner/path-safe-id.js';
 import {
   THREAD_ACTOR_HEADER,
+  THREAD_ACTOR_ROLE_HEADER,
   THREAD_TENANT_HEADER,
 } from '../do-runner/thread-header.js';
 import {
+  APPROVAL_ROLES,
   type ApprovalActor,
   type ApprovalRole,
   DECIDER_ROLES,
@@ -88,6 +90,14 @@ export class TenantResolutionError extends Error {
   }
 }
 
+function containsHeaderControl(value: string): boolean {
+  for (const character of value) {
+    const code = character.charCodeAt(0);
+    if (code <= 0x1f || code === 0x7f) return true;
+  }
+  return false;
+}
+
 export interface CreateTenantResolverOptions {
   /** The host's authenticate seam (bearerActorAuthenticator over a verifier). */
   authenticate: (
@@ -132,7 +142,8 @@ export function createTenantResolver(
     // resolver is the one chokepoint every routed request crosses.
     if (
       request.headers.has(THREAD_TENANT_HEADER) ||
-      request.headers.has(THREAD_ACTOR_HEADER)
+      request.headers.has(THREAD_ACTOR_HEADER) ||
+      request.headers.has(THREAD_ACTOR_ROLE_HEADER)
     ) {
       throw new TenantResolutionError(
         `inbound request carries a server-stamped thread header — refusing to scope it`,
@@ -140,6 +151,18 @@ export function createTenantResolver(
     }
     const actor = await options.authenticate(request);
     if (!actor) return undefined;
+    if (
+      typeof actor !== 'object' ||
+      typeof actor.id !== 'string' ||
+      actor.id.trim() === '' ||
+      containsHeaderControl(actor.id) ||
+      typeof actor.role !== 'string' ||
+      !(APPROVAL_ROLES as readonly string[]).includes(actor.role)
+    ) {
+      throw new TenantResolutionError(
+        'authenticated claims carry an invalid actor id or role — fix the verifier; refusing to scope the request',
+      );
+    }
     if (
       typeof actor.tenantId !== 'string' ||
       !TENANT_ID_PATTERN.test(actor.tenantId)

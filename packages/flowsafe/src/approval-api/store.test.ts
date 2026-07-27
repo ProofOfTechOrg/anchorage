@@ -172,6 +172,28 @@ function describeStoreContract(
       expect(await store.get(record.id)).toEqual(record);
     });
 
+    it('round-trips a trusted agent-thread resume target', async () => {
+      const store = await makeStore();
+      const record = makeRecord({
+        resumeTarget: {
+          kind: 'agent-thread',
+          agentId: 'writer',
+          threadId: 'acme_thread-agent',
+          resourceId: 'acme_resource-agent',
+          principal: {
+            id: 'requester-1',
+            role: 'operator',
+            tenantId: 'acme',
+          },
+        },
+      });
+
+      const created = await store.create(record);
+
+      expect(created.created).toBe(true);
+      expect(await store.get(record.id)).toEqual(record);
+    });
+
     it('returns null for unknown ids', async () => {
       // #given
       const store = await makeStore();
@@ -1085,6 +1107,94 @@ describeStoreContract(
   'D1ApprovalStore (real SQLite via node:sqlite, via D1ApprovalStoreFactory)',
   () => new D1ApprovalStoreFactory(d1Like(openSqlite())),
 );
+
+describe('D1ApprovalStore persisted resume-target validation', () => {
+  it.each([
+    ['malformed JSON', '{'],
+    [
+      'path-unsafe agent id',
+      JSON.stringify({
+        kind: 'agent-thread',
+        agentId: 'bad/agent',
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+        principal: { id: 'actor', role: 'operator', tenantId: 'acme' },
+      }),
+    ],
+    [
+      'foreign thread id',
+      JSON.stringify({
+        kind: 'agent-thread',
+        agentId: 'writer',
+        threadId: 'bravo_thread',
+        resourceId: 'acme_resource',
+        principal: { id: 'actor', role: 'operator', tenantId: 'acme' },
+      }),
+    ],
+    [
+      'foreign resource id',
+      JSON.stringify({
+        kind: 'agent-thread',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: 'bravo_resource',
+        principal: { id: 'actor', role: 'operator', tenantId: 'acme' },
+      }),
+    ],
+    [
+      'empty principal id',
+      JSON.stringify({
+        kind: 'agent-thread',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+        principal: { id: '', role: 'operator', tenantId: 'acme' },
+      }),
+    ],
+    [
+      'whitespace principal id',
+      JSON.stringify({
+        kind: 'agent-thread',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+        principal: { id: '   ', role: 'operator', tenantId: 'acme' },
+      }),
+    ],
+    [
+      'invalid principal role',
+      JSON.stringify({
+        kind: 'agent-thread',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+        principal: { id: 'actor', role: 'owner', tenantId: 'acme' },
+      }),
+    ],
+    [
+      'foreign principal tenant',
+      JSON.stringify({
+        kind: 'agent-thread',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+        principal: { id: 'actor', role: 'operator', tenantId: 'bravo' },
+      }),
+    ],
+  ])('fails closed on a persisted %s', async (_label, resumeTarget) => {
+    const sqlite = openSqlite();
+    const store = new D1ApprovalStoreFactory(d1Like(sqlite)).forTenant('acme');
+    const record = makeRecord();
+    await store.create(record);
+    sqlite
+      .prepare(`UPDATE flowsafe_approvals SET resume_target = ? WHERE id = ?`)
+      .run(resumeTarget, record.id);
+
+    await expect(store.get(record.id)).rejects.toThrow(
+      /invalid resume_target JSON|invalid or foreign resume_target/,
+    );
+  });
+});
 
 describe('InMemoryApprovalStore constructor — INV-3 non-string guard (F2, non-factory-reachable)', () => {
   // A PUBLIC barrel export constructable WITHOUT the factory, so it must

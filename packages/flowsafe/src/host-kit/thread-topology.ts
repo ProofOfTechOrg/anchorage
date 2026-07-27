@@ -27,6 +27,7 @@
 import type { TenantContext } from '../approval-api/index.js';
 import {
   THREAD_ACTOR_HEADER,
+  THREAD_ACTOR_ROLE_HEADER,
   THREAD_TENANT_HEADER,
 } from '../do-runner/index.js';
 import { requireOwnedMemoryId } from './memory-boundary.js';
@@ -120,6 +121,7 @@ export function createThreadTopology<Id>(
       const merged = new Headers(init.headers);
       merged.set(THREAD_TENANT_HEADER, tenant.tenantId);
       merged.set(THREAD_ACTOR_HEADER, tenant.actor.id);
+      merged.set(THREAD_ACTOR_ROLE_HEADER, tenant.actor.role);
       const headers: Record<string, string> = {};
       merged.forEach((value, key) => {
         headers[key] = value;
@@ -138,6 +140,7 @@ export function createThreadTopology<Id>(
       const forwarded = new Request(request);
       forwarded.headers.set(THREAD_TENANT_HEADER, tenant.tenantId);
       forwarded.headers.set(THREAD_ACTOR_HEADER, tenant.actor.id);
+      forwarded.headers.set(THREAD_ACTOR_ROLE_HEADER, tenant.actor.role);
       return stub(addressed).fetch(forwarded);
     },
   };

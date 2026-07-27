@@ -30,6 +30,7 @@ pnpm typecheck
 pnpm test
 pnpm build
 pnpm --filter @proofoftech/breakwater test:packed-consumer
+pnpm --filter @proofoftech/flowsafe test:agent-host-export
 pnpm --filter @proofoftech/flowsafe test:signals-client-export
 pnpm --filter @proofoftech/flowsafe typecheck:react18
 pnpm --filter @proofoftech/flowsafe example:gtm
@@ -78,7 +79,7 @@ The changesets base is `dev`. `onlyUpdatePeerDependentsWhenOutOfRange` prevents 
 5. Open the promotion pull request from `dev` to `main`.
 6. Confirm the promotion contains no pending changeset files.
 7. Merge to `main`.
-8. The release workflow publishes unpublished package versions to npm with provenance, creates tags, and creates GitHub releases.
+8. The release workflow publishes unpublished package versions to npm with provenance, creates tags, and creates GitHub releases. When both packages change, publish breakwater before flowsafe so the guarded-agent peer minimum is available.
 9. Confirm npm tarballs, export smoke tests, release notes, Pages API docs, and the production showcase.
 
 The release workflow never opens version pull requests or commits to `main`. A pending changeset on `main` is a freeze-window failure.

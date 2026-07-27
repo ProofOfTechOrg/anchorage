@@ -435,6 +435,92 @@ describe('RunnerRuntime', () => {
 const ISO_8601 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
 
 describe('RunnerRuntime.status projection', () => {
+  it('persists a terminal status when a workflow retains only resume snapshots', async () => {
+    const storage = new InMemoryStore();
+    const { createWorkflow, createStep, runtime } = init({ storage });
+    const gate = createStep({
+      id: 'gate',
+      inputSchema: z.object({ value: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+      suspendSchema: z.object({ reason: z.string() }),
+      resumeSchema: z.object({ approved: z.boolean() }),
+      execute: async ({ inputData, resumeData, suspend }) =>
+        resumeData?.approved
+          ? inputData
+          : suspend({ reason: 'approval required' }),
+    });
+    createWorkflow({
+      id: 'resume-artifact-only',
+      inputSchema: z.object({ value: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+      options: {
+        shouldPersistSnapshot: ({ workflowStatus }) =>
+          workflowStatus === 'pending' || workflowStatus === 'suspended',
+      },
+    })
+      .then(gate)
+      .commit();
+    const started = await runtime.start('resume-artifact-only', {
+      runId: 'acme_terminal-status',
+      inputData: { value: 'durable' },
+    });
+
+    const resumed = await runtime.resume(
+      'resume-artifact-only',
+      started.runId,
+      {
+        resumeData: { approved: true },
+      },
+    );
+    const status = await runtime.status('resume-artifact-only', started.runId);
+
+    expect(resumed).toMatchObject({
+      status: 'success',
+      result: { value: 'durable' },
+    });
+    expect(status).toMatchObject({
+      status: 'success',
+      result: { value: 'durable' },
+    });
+  });
+
+  it('persists a terminal start when the engine omits terminal snapshots', async () => {
+    const storage = new InMemoryStore();
+    const { createWorkflow, createStep, runtime } = init({ storage });
+    const echo = createStep({
+      id: 'echo-once',
+      inputSchema: z.object({ value: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+      execute: async ({ inputData }) => inputData,
+    });
+    createWorkflow({
+      id: 'start-artifact-only',
+      inputSchema: z.object({ value: z.string() }),
+      outputSchema: z.object({ value: z.string() }),
+      options: {
+        shouldPersistSnapshot: ({ workflowStatus }) =>
+          workflowStatus === 'pending',
+      },
+    })
+      .then(echo)
+      .commit();
+
+    const done = await runtime.start('start-artifact-only', {
+      runId: 'acme_terminal-start',
+      inputData: { value: 'durable' },
+    });
+    const status = await runtime.status('start-artifact-only', done.runId);
+
+    expect(done).toMatchObject({
+      status: 'success',
+      result: { value: 'durable' },
+    });
+    expect(status).toMatchObject({
+      status: 'success',
+      result: { value: 'durable' },
+    });
+  });
+
   it('projects suspended detail — paths, payload, timestamps — from the snapshot', async () => {
     // #given
     const { runtime } = buildRuntime(new InMemoryStore());
@@ -847,8 +933,8 @@ describe('RunnerRuntime requestContextForRun', () => {
     ]);
   });
 
-  it('lets a provider override the minted workflow scope (merge-over)', async () => {
-    // #given — a provider that deliberately overrides the scope key
+  it('does not let a provider override the runtime-minted workflow scope', async () => {
+    // #given — a provider that attempts to override the scope key
     const seen: unknown[] = [];
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
@@ -881,8 +967,71 @@ describe('RunnerRuntime requestContextForRun', () => {
       inputData: {},
     });
 
-    // #then — provider values merge OVER the runtime base
-    expect(seen).toEqual(['overridden']);
+    // #then — runtime identity merges over provider values
+    expect(seen).toEqual(['scoped-wf']);
+  });
+
+  it('orders stored context before runtime scope, grants, and trusted identity', async () => {
+    const seen: Array<{ keys: string[]; values: Record<string, unknown> }> = [];
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      {
+        requestContextForRun: () => ({
+          stored: 'kept',
+          'breakwater.workflowScope': 'forged-workflow',
+          'breakwater.isolationScope': 'forged-tenant',
+          'breakwater.approvedConnectors': [],
+          runId: 'acme_forged',
+          threadId: 'acme_thread',
+          resourceId: 'acme_resource',
+          'breakwater.actor': { id: 'operator-1', role: 'operator' },
+          'breakwater.auditContext': {
+            agentId: 'writer',
+            entryPath: 'http.start',
+          },
+        }),
+      },
+    );
+    const probe = createStep({
+      id: 'probe',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      execute: async ({ requestContext }) => {
+        seen.push({
+          keys: [...requestContext.keys()],
+          values: requestContext.toJSON(),
+        });
+        return {};
+      },
+    });
+    createWorkflow({
+      id: 'ordered-context',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(probe)
+      .commit();
+
+    await runtime.start('ordered-context', {
+      runId: 'acme_ordered',
+      inputData: {},
+    });
+
+    expect(seen[0]?.keys).toEqual([
+      'stored',
+      'breakwater.workflowScope',
+      'breakwater.isolationScope',
+      'breakwater.approvedConnectors',
+      'runId',
+      'threadId',
+      'resourceId',
+      'breakwater.actor',
+      'breakwater.auditContext',
+    ]);
+    expect(seen[0]?.values).toMatchObject({
+      'breakwater.workflowScope': 'ordered-context',
+      'breakwater.isolationScope': 'acme',
+    });
   });
 
   it('leaves nothing persisted when the provider fails on start — the runId stays retryable', async () => {
@@ -988,6 +1137,35 @@ describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
     expect(reSuspended.resumeCount?.gate2x).toBe(1);
     expect(reSuspended.suspendedAt?.gate2x).toBeTypeOf('number');
     expect(reSuspended.resumedAt?.gate2x).toBeTypeOf('number');
+  });
+
+  it('derives the same trusted resume fingerprint for preparation and execution', async () => {
+    const legs: RunLeg[] = [];
+    const runtime = buildReSuspender((leg) => legs.push(structuredClone(leg)));
+    const started = await runtime.start('resuspend', {
+      runId: 'acme_resume-context',
+      inputData: {},
+    });
+    legs.length = 0;
+
+    const prepared = await runtime.trustedRequestContextForResume(
+      'resuspend',
+      started.runId,
+      { step: 'gate2x' },
+    );
+    await runtime.resume('resuspend', started.runId, {
+      step: 'gate2x',
+      resumeData: { go: true },
+    });
+
+    expect(prepared.get('breakwater.workflowScope')).toBe('resuspend');
+    expect(prepared.get('breakwater.isolationScope')).toBe('acme');
+    expect(legs).toHaveLength(2);
+    expect(legs[0]).toEqual(legs[1]);
+    expect(legs[0]).toMatchObject({
+      kind: 'resume',
+      step: ['gate2x'],
+    });
   });
 
   it('carries resumeCount on a NO-PAYLOAD re-suspension even though Mastra omits resumedAt', async () => {

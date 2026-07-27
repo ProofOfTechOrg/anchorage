@@ -23,6 +23,11 @@ Cloudflare Worker
         |                                              +--> RunnerRuntime
         |                                              +--> Mastra D1 snapshots
         |
+        +--> agent router ------------> thread topology
+        |                                    |
+        |                                    +--> guarded catalog module
+        |                                    +--> durable agent run/status/stream
+        |
         +--> thread routers ----------> thread topology
         |                                    |
         |                                    +--> one thread DO per thread
@@ -46,7 +51,7 @@ The package root mirrors approval API, do-runner, artifacts, and audit export fo
 | Core workflow approvals | `approval-api`, `do-runner`, `host-kit`, `host-kit/module` |
 | UI and live updates | `approval-ui`, hub and stream helpers |
 | Data integrations | `artifacts`, `audit-export` |
-| Long-running agents | `agent-runner`, `signals`, `goals`, `schedules`, `background-tasks`, `signal-providers` |
+| Long-running agents | `agent-host`, `agent-runner`, `signals`, `goals`, `schedules`, `background-tasks`, `signal-providers` |
 
 See [API reference map](api-reference.md) for exact import paths.
 
@@ -122,18 +127,22 @@ Threads and resource ids extend the run-id pattern:
 - public bodies may not name memory ids;
 - foreign stored ids return 404;
 - `createThreadTopology()` checks ownership before addressing a Durable Object;
-- the topology overwrites internal tenant and actor headers;
-- `ThreadDurableObject` compares the stamped tenant with its own name.
+- the topology overwrites internal tenant, actor, and role headers;
+- `ThreadDurableObject` reconstructs the complete actor and compares the stamped tenant with its own name.
 
 D1-backed memory recall uses the salted ids through Mastra's own memory implementation. See [Agent-memory tenancy](agent-memory-tenancy.md).
 
 ## Durable agent architecture
 
-`createFlowsafeDurableAgent()` subclasses Mastra's durable agent at its documented workflow-execution seam. The shared `durable-agentic-loop` is registered on `RunnerRuntime`, and each input selects the in-process agent by id.
+`createFlowsafeDurableAgent()` remains the lower-level compatibility wrapper around Mastra's durable-agent workflow seam. It does not make an arbitrary raw agent guarded.
 
-Public `stream()`, `generate()`, and `prepare()` require the host's tenant-salted run id. Tool execution receives the runtime leg's request context, so approval grants reach breakwater without a second channel.
+`@proofoftech/flowsafe/agent-host` is the supported protected host. It validates Breakwater's package-local guarded-handle brand, resolves each agent from a server-owned catalog, and constructs the complete module inside the thread Durable Object. The Worker receives metadata only.
 
-After Durable Object eviction, the in-process tool registry is gone while D1 state remains. `resumeViaRuntime()` prepares the agent from its stored messages, restores observation, validates the memory binding, then resumes through the runtime.
+Public starts mint the thread, resource, and run ids after authentication. Status and NDJSON observation recheck the stored agent/thread/run binding and return 404 for foreign or mismatched ids. Stream replay lasts only as long as Mastra's configured cache; authoritative status remains available after replay eviction.
+
+An agent has no public raw-resume route. Approval records persist the original authorized principal, and an approval decision resumes as that principal after rechecking the current catalog roles. The reviewer remains the actor on the approval decision event.
+
+After Durable Object eviction, the in-process tool registry is gone while D1 state remains. The agent host validates the memory binding, reconstructs the guarded module, and derives fresh trusted resume context. It then rehydrates Mastra's registries by invoking only Breakwater's reserved RBAC `processInput` hook. Before installation, it restores the complete input, LLM-request, application output, and mandatory output-processor lists for resumed loop execution. Initial application and policy `processInput` hooks do not run again. The host then starts observation and resumes through `RunnerRuntime`.
 
 See [Durable agents](durable-agents.md).
 
@@ -187,12 +196,13 @@ Flowsafe differentiates terminal data, idle data, and standing configuration:
 `createFlowsafeWorker()` owns the common:
 
 - health, approval, run, and stream route ordering;
+- agent catalog routing between deployment `preRoutes` and other optional feature routers;
 - tenant resolver construction;
 - suspension-to-approval and resume-to-requeue bridges;
 - separate SLA, purge, and optional schedule-tick cron dispatch;
 - Queue consumer.
 
-Hosts inject identity verification, workflow metadata, optional feature routers, budget wrappers, notification transport, artifact store, schedule tick, and deployment-owned purge duties.
+Hosts inject identity verification, workflow and agent metadata, optional feature routers, approval-resume composition, budget wrappers, notification transport, artifact store, schedule tick, and deployment-owned purge duties.
 
 The [baseline deployment](https://github.com/ProofOfTechOrg/anchorage/tree/main/packages/flowsafe/deploy) uses only core workflows and approvals. The [advanced starter](https://github.com/ProofOfTechOrg/anchorage/tree/main/packages/agent-starter) composes the long-running agent features.
 

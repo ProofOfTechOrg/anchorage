@@ -8,7 +8,8 @@ Use public package exports only. Paths under `src/` and generated `dist/` files 
 
 | Import path | Use it for |
 | --- | --- |
-| `@proofoftech/breakwater` | Convenience barrel for policy engine, RBAC, audit, connector SDK, and agent CLI adapters |
+| `@proofoftech/breakwater` | Convenience barrel for guarded agents, policy engine, RBAC, audit, connector SDK, and agent CLI adapters |
+| `@proofoftech/breakwater/agent` | `createGuardedAgent`, its narrow invocation handle, validated application processor contracts, and guarded-handle validation |
 | `@proofoftech/breakwater/policy-engine` | `PolicyEngine`, content inspection, output channels, hold-back, and tool evaluators |
 | `@proofoftech/breakwater/rbac` | Actor roles, request-context lookup, and `RBACMiddleware` |
 | `@proofoftech/breakwater/audit` | `AuditLogger`, metrics adapter, sink fan-out, and audit types |
@@ -35,6 +36,7 @@ New host-side and React features remain subpath-only so importing the root does 
 
 | Import path | Use it for |
 | --- | --- |
+| `@proofoftech/flowsafe/agent-host` | Server-only guarded-agent catalogs, authenticated start/status/NDJSON routes, thread hosting, and approval-only resume |
 | `@proofoftech/flowsafe/agent-runner` | Runtime-driven Mastra durable agents, approval suspend parsing, and restart resume |
 | `@proofoftech/flowsafe/approval-api` | Records, tenant-bound stores, service, router, grant providers, retention, SLA, notifications, and stream events |
 | `@proofoftech/flowsafe/background-tasks` | D1 task domains, tenant task host, routes, and terminal-task purge |
@@ -61,7 +63,7 @@ Safe browser imports:
 Server or Worker imports:
 
 - breakwater processors and connector SDK
-- flowsafe approval API, runner, host kit, agents, schedules, signals, providers, tasks, artifacts, and audit export
+- flowsafe approval API, agent host, runner, host kit, agents, schedules, signals, providers, tasks, artifacts, and audit export
 
 Node-only execution:
 
@@ -74,7 +76,7 @@ The agent CLI module can be constructed in another runtime when you inject `Agen
 | Peer | Required by |
 | --- | --- |
 | `@mastra/core` | Both packages |
-| `@proofoftech/breakwater` | flowsafe host-kit module types and grant-protected connector integrations |
+| `@proofoftech/breakwater` | flowsafe `agent-host`, host-kit module types, and grant-protected connector integrations |
 | `react` and `react-dom` | flowsafe approval UI only |
 
 Flowsafe does not impose a CSS or design-system dependency. Its default approval views render semantic HTML.

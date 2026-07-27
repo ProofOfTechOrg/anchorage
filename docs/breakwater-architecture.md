@@ -11,13 +11,14 @@ These boundaries solve different problems. A processor cannot protect a tool inv
 
 | Module | Responsibility |
 | --- | --- |
+| `@proofoftech/breakwater/agent` | Guarded agent construction, mandatory processor composition, and narrow direct execution |
 | `@proofoftech/breakwater/policy-engine` | Input/output processor, content policies, and tool-policy evaluators |
 | `@proofoftech/breakwater/rbac` | Actor contract, five roles, and agent input authorization |
 | `@proofoftech/breakwater/audit` | Shared audit logger, metrics adapter, and sink fan-out |
 | `@proofoftech/breakwater/connector-sdk` | Enforced permission manifest, guarded fetch, replay, dry-run, rate limit, and stores |
 | `@proofoftech/breakwater/agent-cli` | Approval-gated Claude Code and Codex workspace connectors |
 
-The package root re-exports all five modules, including the agent CLI. Prefer the explicit `@proofoftech/breakwater/agent-cli` subpath for CLI connectors so their Node-specific process boundary remains visible at the import site.
+The package root re-exports all six modules, including the guarded agent and agent CLI. Prefer the explicit `@proofoftech/breakwater/agent-cli` subpath for CLI connectors so their Node-specific process boundary remains visible at the import site.
 
 ## Enforcement flow
 
@@ -27,7 +28,9 @@ verified host identity
         v
 Mastra RequestContext
         |
-        +--> RBACMiddleware ----------> allow or abort before model call
+        +--> guarded preauthorization -> allow or abort before app code
+        |
+        +--> application input -------> initial-input-only processing
         |
         +--> PolicyEngine input ------> inspect all input text
         |
@@ -54,46 +57,51 @@ Array order determines processor order. A denial aborts the chain, so `AuditLogg
 
 ## Agent-boundary integration
 
+`createGuardedAgent()` is the supported construction path for protected agent execution:
+
 ```typescript
-import { Agent } from '@mastra/core/agent';
 import {
   AuditLogger,
+  createGuardedAgent,
   denyPatterns,
   piiSecrets,
-  PolicyEngine,
-  RBACMiddleware,
 } from '@proofoftech/breakwater';
 
 const audit = new AuditLogger();
-const policy = new PolicyEngine({
+export const agent = createGuardedAgent({
+  id: 'guarded-agent',
+  name: 'Guarded agent',
+  instructions: 'Act only within the supplied permissions.',
+  model: 'openai/gpt-5',
+  allowedRoles: ['operator', 'admin'],
   policies: [
     denyPatterns(['ignore previous instructions']),
     piiSecrets(),
   ],
   audit,
-  holdBack: true,
-});
-
-const model = process.env.MASTRA_MODEL_ID;
-if (!model) throw new Error('MASTRA_MODEL_ID is required');
-
-export const agent = new Agent({
-  id: 'guarded-agent',
-  name: 'Guarded agent',
-  instructions: 'Act only within the supplied permissions.',
-  model,
-  inputProcessors: [
-    new RBACMiddleware({
-      allowedRoles: ['operator', 'admin'],
-      audit,
-    }),
-    policy,
-  ],
-  outputProcessors: [policy],
+  maxSteps: 4,
+  toolChoice: 'auto',
 });
 ```
 
-`RBACMiddleware` reads `breakwater.actor` by default. The host must verify identity before creating that context. Its flat role membership check is intentionally smaller than an identity provider or general ACL service.
+The factory constructs a protected `Agent` subclass but returns `GuardedAgentHandle`. Its package-local brand lets the Flowsafe agent host validate the object before its internal Mastra cast. No public unwrap operation exists.
+
+Direct calls preauthorize the `breakwater.actor`, then pass exact application and mandatory processor arrays to Mastra. Initial durable preparation uses the subclass processor listing. Approval resume after isolate eviction uses Flowsafe's registry rehydration path, which authorizes the fresh trusted resume context without replaying initial application or policy input. These paths have these orders:
+
+```text
+direct: RBAC preauthorization -> app input -> policy input
+initial durable: RBAC processor -> app input -> policy input
+durable resume processInput during rehydration: RBAC only
+output: model/tools -> app output -> policy output
+```
+
+The durable resume line describes which `processInput` hook runs during rehydration. Before installing the registries, Flowsafe restores the complete input and LLM-request processor lists for later loop hooks. It also restores the same tools, memory, model, application output processors, and mandatory policy output processor as initial preparation. An RBAC denial stops rehydration before registry installation or resumed tool execution.
+
+The call allowlist contains `requestContext`, `runId`, `memory`, and `abortSignal`. Unknown own properties fail even when their value is `undefined`. Construction fixes `maxSteps` and `toolChoice`, enables policy hold-back, and disables background continuations.
+
+Application input processors may implement only `processInput`. Application output processors must implement both stream and final-result enforcement. Processor workflows and the reserved IDs `breakwater-rbac` and `breakwater-policy-engine` fail construction.
+
+`RBACMiddleware` remains available for lower-level composition and reads `breakwater.actor` by default. The host must verify identity before creating that context. Its flat role membership check is intentionally smaller than an identity provider or general access-control list service.
 
 `PolicyEngine` can gate:
 
@@ -172,6 +180,8 @@ Flowsafe mints both values on every run leg. A single-tenant host may omit tenan
 ## Audit and metrics
 
 Every gate writes an `AuditEvent` with timestamp, actor, action, resource, decision, optional reason, and structured detail.
+
+Guarded agents use `agent:<agentId>` as the RBAC and policy resource. A trusted host may set `breakwater.auditContext` with `agentId`, `tenantId`, `runId`, `threadId`, `resourceId`, and `entryPath`. Breakwater copies only these scalar fields into agent audit detail. It does not copy prompts, tool inputs, URLs, secrets, or model output.
 
 `AuditLogger` keeps a bounded in-memory ring and invokes its sink without making export availability part of the agent path. Supply `onSinkError` to surface failures.
 

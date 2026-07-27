@@ -22,7 +22,7 @@ reviewer claims, delegates, approves, or rejects
         v
 CAS commits the terminal decision
         |
-        +--> approved: prepare runtime if needed, derive grants, resume with approved: true
+        +--> approved: rehydrate agent registry if needed, derive grants, resume with approved: true
         |
         +--> rejected: resume with approved: false and no grant
         |
@@ -158,18 +158,18 @@ The ticket carries addressing data, not approval authority. The Worker verifies 
 
 ## Resume failure recovery
 
-An approval may be terminal while its resume result reports failure. Causes include a transient Durable Object failure, an evicted durable-agent isolate that needs preparation, or a downstream step error.
+An approval may be terminal while its resume result reports failure. Causes include a transient Durable Object failure, an evicted durable-agent isolate that needs registry rehydration, or a downstream step error.
 
 Recovery rules:
 
 1. Read the stored record and authoritative run status.
 2. Do not create another approval for the same suspension.
 3. For a workflow, invoke the trusted resume bridge again.
-4. For a durable agent, validate the persisted memory binding, call `prepare()` to restore the in-process tool registry, observe/register the stream, then resume through `RunnerRuntime`.
+4. For a durable agent, validate the persisted memory binding and redrive the trusted approval-resume bridge. It derives fresh trusted context and invokes only RBAC's `processInput` hook during rehydration. It then restores both Mastra registries with the complete runtime processor lists, observes and registers the stream, and resumes through `RunnerRuntime`.
 5. Let `approvalGrantProvider()` derive the same approved capability from D1.
 6. If the run immediately suspends at another gate, queue a new approval for the new fingerprint.
 
-Never copy `breakwater.approvedConnectors` into a recovery request.
+Do not call public `prepare()` for durable-agent recovery. It is an initial-execution API that runs application and policy input processors. Never copy `breakwater.approvedConnectors` into a recovery request.
 
 ## Retention and audit
 

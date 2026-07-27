@@ -1,6 +1,7 @@
 # breakwater source navigation
 
 - `index.ts`: root public barrel
+- `agent/`: guarded agent construction and narrow execution handle
 - `policy-engine/`: agent processors, content policy, and tool evaluators
 - `rbac/`: actor roles and input authorization
 - `audit/`: audit logger, metrics, and sink composition

@@ -2,6 +2,7 @@
   "$schema": "https://typedoc.org/schema.json",
   "entryPoints": [
     "src/index.ts",
+    "src/agent-host/index.ts",
     "src/agent-runner/index.ts",
     "src/approval-api/index.ts",
     "src/background-tasks/index.ts",

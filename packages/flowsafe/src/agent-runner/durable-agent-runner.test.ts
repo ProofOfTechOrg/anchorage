@@ -14,8 +14,28 @@ import { Agent } from '@mastra/core/agent';
 import {
   DurableAgent,
   type DurableAgenticWorkflowInput,
+  type ExtendedRunRegistry,
+  globalRunRegistry,
+  type RunRegistryEntry,
 } from '@mastra/core/agent/durable';
+import {
+  type MastraDBMessage,
+  MessageList,
+} from '@mastra/core/agent/message-list';
 import { EventEmitterPubSub } from '@mastra/core/events';
+import {
+  type OutputResult,
+  type Processor,
+  ProcessorRunner,
+} from '@mastra/core/processors';
+import { RequestContext } from '@mastra/core/request-context';
+import {
+  ACTOR_CONTEXT_KEY,
+  AuditLogger,
+  createGuardedAgent,
+  denyPatterns,
+  type Role,
+} from '@proofoftech/breakwater';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -54,14 +74,25 @@ function fakeRuntime(
     runId,
     status: 'success' as const,
   }));
+  const trustedRequestContextForResume = vi.fn(
+    async () => new RequestContext(),
+  );
   const runtime = {
     register,
     workflowIds,
     start,
     resume,
+    trustedRequestContextForResume,
     ...(overrides.pubsub !== undefined ? { pubsub: overrides.pubsub } : {}),
   } as unknown as RunnerRuntime;
-  return { runtime, register, workflowIds, start, resume };
+  return {
+    runtime,
+    register,
+    workflowIds,
+    start,
+    resume,
+    trustedRequestContextForResume,
+  };
 }
 
 function testAgent(id = 'writer'): Agent {
@@ -73,6 +104,93 @@ function testAgent(id = 'writer'): Agent {
     // runtime, not the LLM, so the agent only has to construct.
     model: 'openai/gpt-4o-mini',
   });
+}
+
+function actorContext(role: Role = 'operator'): RequestContext {
+  const context = new RequestContext();
+  context.set(ACTOR_CONTEXT_KEY, { id: 'actor-1', role });
+  return context;
+}
+
+function registryFor(agent: FlowsafeDurableAgent): ExtendedRunRegistry {
+  return (
+    agent as unknown as {
+      readonly runRegistryInternal: ExtendedRunRegistry;
+    }
+  ).runRegistryInternal;
+}
+
+function processorTestAgent(options: {
+  inputInvocation: () => void;
+  outputInvocation: () => void;
+}): Agent {
+  const guarded = createGuardedAgent({
+    id: 'writer',
+    name: 'Writer',
+    instructions: 'You are a test agent.',
+    model: 'openai/gpt-4o-mini',
+    allowedRoles: ['operator', 'admin'],
+    policies: [denyPatterns(['blocked-resume-output'], { phases: ['output'] })],
+    audit: new AuditLogger(),
+    maxSteps: 2,
+    toolChoice: 'auto',
+    applicationInputProcessors: [
+      {
+        id: 'application-input',
+        processInput: (args) => {
+          options.inputInvocation();
+          if (args.messages.length === 0) {
+            args.abort('application input processor received empty messages');
+          }
+          return args.messages;
+        },
+      },
+    ],
+    applicationOutputProcessors: [
+      {
+        id: 'application-output',
+        processOutputStream: async (args) => args.part,
+        processOutputResult: (args) => {
+          options.outputInvocation();
+          return args.messages;
+        },
+      },
+    ],
+  });
+  return guarded as unknown as Agent;
+}
+
+async function runOutputResultProcessors(
+  entry: RunRegistryEntry,
+  text: string,
+): Promise<void> {
+  const message: MastraDBMessage = {
+    id: 'output-message',
+    role: 'assistant',
+    createdAt: new Date(),
+    content: { format: 2, parts: [{ type: 'text', text }] },
+  };
+  const result: OutputResult = {
+    text,
+    usage: {} as OutputResult['usage'],
+    finishReason: 'stop',
+    steps: [],
+  };
+  for (const item of entry.outputProcessors ?? []) {
+    const processor = item as Processor;
+    if (!processor.processOutputResult) continue;
+    await processor.processOutputResult({
+      messages: [message],
+      messageList: new MessageList(),
+      state: {},
+      retryCount: 0,
+      requestContext: actorContext(),
+      abort: (reason) => {
+        throw new Error(reason ?? 'output processor aborted');
+      },
+      result,
+    });
+  }
 }
 
 // executeWorkflow is protected — the durable loop calls it, and no route ever
@@ -174,6 +292,60 @@ describe('FlowsafeDurableAgent.executeWorkflow', () => {
       InvalidRunRequestError,
     );
     expect(start).not.toHaveBeenCalled();
+  });
+});
+
+describe('FlowsafeDurableAgent.streamUntilPersisted', () => {
+  it('does not resolve until the runtime has persisted the first summary', async () => {
+    const { runtime, start } = fakeRuntime();
+    let releaseStart!: () => void;
+    start.mockImplementation(
+      (_workflowId, options: { runId: string }) =>
+        new Promise((resolve) => {
+          releaseStart = () =>
+            resolve({
+              runId: options.runId,
+              status: 'suspended' as const,
+              suspended: [['gate']],
+            });
+        }),
+    );
+    const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
+    const streamResult = { output: { id: 'output' } };
+    vi.spyOn(agent, 'stream').mockResolvedValue(streamResult as never);
+    let settled = false;
+
+    const pending = agent
+      .streamUntilPersisted('hello', { runId: 'acme_run1' })
+      .finally(() => {
+        settled = true;
+      });
+    await vi.waitFor(() => expect(agent.stream).toHaveBeenCalledOnce());
+    const execution = drive(agent, 'acme_run1', INPUT);
+    await vi.waitFor(() => expect(start).toHaveBeenCalledOnce());
+    expect(settled).toBe(false);
+
+    releaseStart();
+
+    await expect(pending).resolves.toBe(streamResult);
+    await execution;
+  });
+
+  it('rejects when durable persistence fails', async () => {
+    const { runtime, start } = fakeRuntime();
+    start.mockRejectedValue(new Error('D1 unavailable'));
+    const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
+    vi.spyOn(agent, 'stream').mockResolvedValue({
+      output: { id: 'output' },
+    } as never);
+
+    const pending = agent.streamUntilPersisted('hello', {
+      runId: 'acme_run1',
+    });
+    const execution = drive(agent, 'acme_run1', INPUT);
+
+    await expect(pending).rejects.toThrow('D1 unavailable');
+    await expect(execution).rejects.toThrow('D1 unavailable');
   });
 });
 
@@ -310,6 +482,7 @@ describe('FlowsafeDurableAgent pubsub identity (DL-001)', () => {
 
 describe('FlowsafeDurableAgent thread runtime registration and rehydration', () => {
   afterEach(() => {
+    globalRunRegistry.clear();
     vi.restoreAllMocks();
   });
 
@@ -382,10 +555,16 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     expect(registerRun).toHaveBeenCalledTimes(1);
   });
 
-  it('prepares, observes, registers, then resumes through RunnerRuntime', async () => {
+  it('rehydrates guarded registries without replaying application input processors', async () => {
     const order: string[] = [];
     const pubsub = new EventEmitterPubSub();
-    const { runtime, resume } = fakeRuntime({ pubsub });
+    const { runtime, resume, trustedRequestContextForResume } = fakeRuntime({
+      pubsub,
+    });
+    trustedRequestContextForResume.mockImplementation(async () => {
+      order.push('context');
+      return actorContext();
+    });
     resume.mockImplementation(async (_workflowId, runId) => {
       order.push('resume');
       return { runId, status: 'success' as const };
@@ -393,17 +572,27 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     const registerRun = vi.fn(async () => {
       order.push('register');
     });
+    const inputInvocation = vi.fn();
+    const outputInvocation = vi.fn();
     const agent = createFlowsafeDurableAgent({
-      agent: testAgent(),
+      agent: processorTestAgent({ inputInvocation, outputInvocation }),
       runtime,
       cache: false,
       threadRuntime: { registerRun } as never,
     });
-    vi.spyOn(agent, 'prepare').mockImplementation(async () => {
-      order.push('prepare');
-      return {} as never;
+    const prepare = vi.spyOn(agent, 'prepare');
+    await agent.prepare('initial request', {
+      runId: 'acme_run1',
+      requestContext: actorContext(),
+      memory: { thread: 'acme_thread', resource: 'acme_resource' },
     });
+    expect(inputInvocation).toHaveBeenCalledTimes(1);
+    prepare.mockClear();
+    registryFor(agent).clear();
+    globalRunRegistry.clear();
     vi.spyOn(agent, 'observe').mockImplementation(async () => {
+      expect(registryFor(agent).has('acme_run1')).toBe(true);
+      expect(globalRunRegistry.has('acme_run1')).toBe(true);
       order.push('observe');
       return { output: { id: 'rehydrated' } } as never;
     });
@@ -415,13 +604,178 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
       memory: { thread: 'acme_thread', resource: 'acme_resource' },
     });
 
-    expect(order).toEqual(['prepare', 'observe', 'register', 'resume']);
+    expect(order).toEqual(['context', 'observe', 'register', 'resume']);
+    expect(trustedRequestContextForResume).toHaveBeenCalledWith(
+      DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
+      'acme_run1',
+      { step: ['tool-call'] },
+    );
+    expect(prepare).not.toHaveBeenCalled();
     expect(resume).toHaveBeenCalledWith(
       DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
       'acme_run1',
-      { step: ['tool-call'], resumeData: { approved: true } },
+      { resumeData: { approved: true } },
     );
     expect(summary).toMatchObject({ runId: 'acme_run1', status: 'success' });
+    expect(inputInvocation).toHaveBeenCalledTimes(1);
+
+    const instanceEntry = registryFor(agent).get('acme_run1');
+    const globalEntry = globalRunRegistry.get('acme_run1');
+    expect(instanceEntry?.inputProcessors?.map(({ id }) => id)).toEqual([
+      'breakwater-rbac',
+      'application-input',
+      'breakwater-policy-engine',
+    ]);
+    expect(globalEntry?.inputProcessors?.map(({ id }) => id)).toEqual([
+      'breakwater-rbac',
+      'application-input',
+      'breakwater-policy-engine',
+    ]);
+    expect(
+      instanceEntry?.llmRequestInputProcessors?.map(({ id }) => id),
+    ).toEqual(['application-input']);
+    expect(globalEntry?.llmRequestInputProcessors?.map(({ id }) => id)).toEqual(
+      ['application-input'],
+    );
+    expect(instanceEntry?.outputProcessors?.map(({ id }) => id)).toEqual([
+      'application-output',
+      'breakwater-policy-engine',
+    ]);
+    expect(globalEntry?.outputProcessors?.map(({ id }) => id)).toEqual([
+      'application-output',
+      'breakwater-policy-engine',
+    ]);
+
+    await expect(
+      runOutputResultProcessors(
+        globalEntry as RunRegistryEntry,
+        'blocked-resume-output',
+      ),
+    ).rejects.toThrow('matched blocked pattern blocked-resume-output');
+    expect(outputInvocation).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves raw-agent step and LLM-request processors without replaying processInput', async () => {
+    const processInput = vi.fn(
+      (args: Parameters<NonNullable<Processor['processInput']>>[0]) =>
+        args.messages,
+    );
+    const processInputStep = vi.fn(
+      (_args: Parameters<NonNullable<Processor['processInputStep']>>[0]) =>
+        undefined,
+    );
+    const processLLMRequest = vi.fn(
+      (args: Parameters<NonNullable<Processor['processLLMRequest']>>[0]) => ({
+        prompt: args.prompt,
+      }),
+    );
+    const runtimeProcessor = {
+      id: 'raw-runtime-processor',
+      processInput,
+      processInputStep,
+      processLLMRequest,
+    } satisfies Processor;
+    const rawAgent = new Agent({
+      id: 'raw-writer',
+      name: 'Raw writer',
+      instructions: 'You are a raw test agent.',
+      model: 'openai/gpt-4o-mini',
+      inputProcessors: [runtimeProcessor],
+    });
+    const { runtime } = fakeRuntime();
+    const agent = createFlowsafeDurableAgent({ agent: rawAgent, runtime });
+    await agent.prepare('initial request', {
+      runId: 'acme_raw_run',
+      requestContext: new RequestContext(),
+    });
+    expect(processInput).toHaveBeenCalledTimes(1);
+    const initialEntry = registryFor(agent).get('acme_raw_run');
+    const initialInputProcessorIds = initialEntry?.inputProcessors?.map(
+      ({ id }) => id,
+    );
+    const initialLLMRequestProcessorIds =
+      initialEntry?.llmRequestInputProcessors?.map(({ id }) => id);
+
+    registryFor(agent).clear();
+    globalRunRegistry.clear();
+    vi.spyOn(agent, 'observe').mockResolvedValue({
+      output: { id: 'rehydrated' },
+    } as never);
+
+    await agent.resumeViaRuntime({ runId: 'acme_raw_run' });
+
+    expect(processInput).toHaveBeenCalledTimes(1);
+    const rehydratedEntry = globalRunRegistry.get('acme_raw_run');
+    expect(rehydratedEntry?.inputProcessors?.map(({ id }) => id)).toEqual(
+      initialInputProcessorIds,
+    );
+    expect(
+      rehydratedEntry?.llmRequestInputProcessors?.map(({ id }) => id),
+    ).toEqual(initialLLMRequestProcessorIds);
+
+    const messageList = new MessageList();
+    messageList.add('follow-up', 'input');
+    const stepRunner = new ProcessorRunner({
+      inputProcessors: rehydratedEntry?.inputProcessors,
+      logger: {} as never,
+      agentName: rawAgent.name,
+      processorStates: rehydratedEntry?.processorStates,
+    });
+    await stepRunner.runProcessInputStep({
+      messageList,
+      stepNumber: 1,
+      steps: [],
+      model: rehydratedEntry?.model as never,
+      requestContext: new RequestContext(),
+    });
+    const llmRequestRunner = new ProcessorRunner({
+      inputProcessors: rehydratedEntry?.llmRequestInputProcessors,
+      logger: {} as never,
+      agentName: rawAgent.name,
+      processorStates: rehydratedEntry?.processorStates,
+    });
+    await llmRequestRunner.runProcessLLMRequest({
+      prompt: [],
+      model: {},
+      stepNumber: 1,
+      steps: [],
+      requestContext: new RequestContext(),
+    });
+
+    expect(processInputStep).toHaveBeenCalledTimes(1);
+    expect(processLLMRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['missing actor', undefined],
+    ['disallowed actor', 'viewer' as const],
+  ])('denies registry rehydration for a %s before installation or resume', async (_label, role) => {
+    const { runtime, resume, trustedRequestContextForResume } = fakeRuntime();
+    trustedRequestContextForResume.mockResolvedValue(
+      role === undefined ? new RequestContext() : actorContext(role),
+    );
+    const registerRun = vi.fn(async () => undefined);
+    const inputInvocation = vi.fn();
+    const agent = createFlowsafeDurableAgent({
+      agent: processorTestAgent({
+        inputInvocation,
+        outputInvocation: vi.fn(),
+      }),
+      runtime,
+      threadRuntime: { registerRun } as never,
+    });
+    const observe = vi.spyOn(agent, 'observe');
+
+    await expect(
+      agent.resumeViaRuntime({ runId: 'acme_run1' }),
+    ).rejects.toThrow(/^Durable agent registry rehydration denied: /);
+
+    expect(inputInvocation).not.toHaveBeenCalled();
+    expect(registryFor(agent).has('acme_run1')).toBe(false);
+    expect(globalRunRegistry.has('acme_run1')).toBe(false);
+    expect(observe).not.toHaveBeenCalled();
+    expect(registerRun).not.toHaveBeenCalled();
+    expect(resume).not.toHaveBeenCalled();
   });
 
   it('publishes a registration failure and rethrows the original object', async () => {
@@ -436,7 +790,6 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
         }),
       } as never,
     });
-    vi.spyOn(agent, 'prepare').mockResolvedValue({} as never);
     vi.spyOn(agent, 'observe').mockResolvedValue({
       output: { id: 'rehydrated' },
     } as never);
@@ -465,7 +818,6 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
       runtime,
       threadRuntime: { registerRun: vi.fn(async () => undefined) } as never,
     });
-    vi.spyOn(agent, 'prepare').mockResolvedValue({} as never);
     vi.spyOn(agent, 'observe').mockResolvedValue({
       output: { id: 'rehydrated' },
     } as never);
@@ -497,7 +849,6 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
       runtime,
       threadRuntime: { registerRun: vi.fn(async () => undefined) } as never,
     });
-    vi.spyOn(agent, 'prepare').mockResolvedValue({} as never);
     vi.spyOn(agent, 'observe').mockResolvedValue({
       output: { id: 'rehydrated' },
     } as never);

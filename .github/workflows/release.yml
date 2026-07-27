@@ -66,12 +66,12 @@ jobs:
       - name: Build
         run: pnpm build
 
-      # publish-only mode: with the tripwire above, the action can never see a
-      # pending changeset here, so it never opens a Version PR against main.
+      # Publish Breakwater and wait for registry visibility before Changesets
+      # publishes Flowsafe, whose agent-host peer floor requires that release.
       - name: Publish unpublished versions to npm
         uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
         with:
-          publish: pnpm changeset publish
+          publish: pnpm release:publish
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

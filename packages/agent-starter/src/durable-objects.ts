@@ -2,14 +2,14 @@
 
 import { DurableObject } from 'cloudflare:workers';
 import type { Agent } from '@mastra/core/agent';
+import type { MessageListInput } from '@mastra/core/agent/message-list';
 import { Mastra } from '@mastra/core/mastra';
+import { AuditLogger } from '@proofoftech/breakwater';
 import {
-  createFlowsafeDurableAgent,
-  DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
-  type FlowsafeDurableAgent,
-} from '@proofoftech/flowsafe/agent-runner';
+  createThreadAgentHost,
+  type ThreadAgentHost,
+} from '@proofoftech/flowsafe/agent-host';
 import {
-  type ApprovalActor,
   ApprovalService,
   approvalGrantProvider,
 } from '@proofoftech/flowsafe/approval-api';
@@ -27,18 +27,14 @@ import {
   init,
   mintResourceId,
   RESERVED_TENANT_IDS,
-  type RunSummary,
   TENANT_ID_PATTERN,
   ThreadDurableObject,
   type ThreadScope,
-  tenantOwnsMemoryId,
-  tenantOwnsSaltedId,
 } from '@proofoftech/flowsafe/do-runner';
 import {
   approvalStoreFactoryFor,
   createHubTopology,
   createThreadTopology,
-  reconcileApprovalsForSummary,
 } from '@proofoftech/flowsafe/host-kit';
 import {
   githubSignalProvider,
@@ -50,7 +46,7 @@ import {
   type StartIdleRunInput,
 } from '@proofoftech/flowsafe/signals';
 
-import { createStarterAgent, STARTER_AGENT_ID } from './agent.js';
+import { createStarterAgentModule } from './agent.js';
 import { modelConfig, SYSTEM_ACTOR_ID } from './config.js';
 import { createComposedStorage, subscriptionStoreFactory } from './storage.js';
 import { defineWorkflows } from './workflows.js';
@@ -62,15 +58,18 @@ function json(payload: unknown, status = 200): Response {
   return Response.json(payload, { status });
 }
 
-function readObject(request: Request): Promise<Record<string, unknown> | null> {
-  return request
-    .json<unknown>()
-    .then((value) =>
-      typeof value === 'object' && value !== null && !Array.isArray(value)
-        ? (value as Record<string, unknown>)
-        : null,
-    )
-    .catch(() => null);
+function idleRunMessages(input: StartIdleRunInput): MessageListInput {
+  if (input.message !== undefined) {
+    if (typeof input.message === 'string') return input.message;
+    if (Array.isArray(input.message)) {
+      return [{ role: 'user', content: input.message }];
+    }
+    return [{ role: 'user', content: input.message.contents }];
+  }
+  if (input.signal !== undefined) {
+    return [{ role: 'user', content: input.signal.contents }];
+  }
+  return 'Record the requested operation through the approved tool.';
 }
 
 export class StarterRunner extends DurableObjectRunner<Env> {
@@ -93,182 +92,78 @@ export class StarterSignalProviderHost extends SignalProviderHost<Env> {
 
 export class StarterThread extends ThreadDurableObject<Env> {
   #storage?: ReturnType<typeof createComposedStorage>;
-  #mastra?: Mastra;
-  #agent?: FlowsafeDurableAgent;
-  #currentScope?: ThreadScope;
+  #agentHost?: ThreadAgentHost;
+  #approvalService?: ApprovalService;
+  #threadInit?: InitResult;
 
   protected build(env: Env): InitResult {
     const storage = createComposedStorage(env.DB);
     this.#storage = storage;
-    return init(
+    const audit = new AuditLogger({
+      sink: (event) => {
+        console.log(JSON.stringify(event));
+      },
+    });
+    const approvals = approvalStoreFactoryFor(env.DB).forTenant(this.tenantId);
+    const agentHost = createThreadAgentHost({
+      buildModules: () => [
+        createStarterAgentModule({
+          model: modelConfig(this.env),
+          db: this.env.DB,
+          audit,
+        }),
+      ],
+      storage: () => storage,
+      stateStorage: () => {
+        if (!this.state?.storage) {
+          throw new Error('thread Durable Object storage is unavailable');
+        }
+        return this.state.storage;
+      },
+      approvalService: () => {
+        this.#approvalService ??= new ApprovalService({
+          store: approvals,
+          ...(this.env.STREAM_TICKET_SECRET
+            ? {
+                stream: (event) =>
+                  createHubTopology(this.env.HUB).publish(event),
+              }
+            : {}),
+        });
+        return this.#approvalService;
+      },
+      systemActorId: SYSTEM_ACTOR_ID,
+      audit: (event) => audit.record(event),
+    });
+    this.#agentHost = agentHost;
+    const threadInit = init(
       { storage },
       {
         pubsub: createHostPubSub(),
-        requestContextForRun: approvalGrantProvider(
-          approvalStoreFactoryFor(env.DB).forTenant(this.tenantId),
+        requestContextForRun: agentHost.requestContextForRun(
+          approvalGrantProvider(approvals),
         ),
       },
     );
+    this.#threadInit = threadInit;
+    return threadInit;
+  }
+
+  #host(): ThreadAgentHost {
+    if (!this.#agentHost) {
+      throw new Error('thread agent host is not initialized');
+    }
+    return this.#agentHost;
   }
 
   #resourceId(scope: ThreadScope): string {
     return mintResourceId(scope.tenantId, scope.threadId);
   }
 
-  #getAgent(scope: ThreadScope): FlowsafeDurableAgent {
-    if (this.#agent) return this.#agent;
-    if (!this.#storage) {
-      throw new Error('thread storage is not initialized');
-    }
-    const bare = createStarterAgent({
-      model: modelConfig(this.env),
-      db: this.env.DB,
-    });
-    this.#mastra = new Mastra({
-      storage: this.#storage,
-      agents: { [STARTER_AGENT_ID]: bare },
-      ...(scope.init.pubsub ? { pubsub: scope.init.pubsub } : {}),
-    });
-    const agent = this.#mastra.getAgent(STARTER_AGENT_ID);
-    this.#agent = createFlowsafeDurableAgent({
-      agent,
-      runtime: scope.init.runtime,
-      pubsub: scope.init.pubsub,
-      threadRuntime: this.#mastra.agentThreadStreamRuntime,
-      maxSteps: 1,
-    });
-    return this.#agent;
-  }
-
-  async #bridge(
-    scope: ThreadScope,
-    runId: string,
-    resourceId?: string,
-  ): Promise<RunSummary | null> {
-    const summary = await scope.init.runtime.status(
-      DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
-      runId,
-    );
-    if (!summary) return null;
-    if (summary.status === 'suspended') {
-      const service = new ApprovalService({
-        store: approvalStoreFactoryFor(this.env.DB).forTenant(scope.tenantId),
-        ...(this.env.STREAM_TICKET_SECRET
-          ? {
-              stream: (event) => createHubTopology(this.env.HUB).publish(event),
-            }
-          : {}),
-      });
-      const actor: ApprovalActor = {
-        id: SYSTEM_ACTOR_ID,
-        role: 'operator',
-        tenantId: scope.tenantId,
-      };
-      await reconcileApprovalsForSummary(
-        service,
-        DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
-        summary,
-        actor,
-        {
-          kind: 'thread',
-          threadId: scope.threadId,
-          ...(resourceId ? { resourceId } : {}),
-        },
-      );
-    }
-    return summary;
-  }
-
-  async #startAgent(
-    scope: ThreadScope,
-    input: {
-      runId?: unknown;
-      resourceId?: unknown;
-      prompt?: unknown;
-      message?: StartIdleRunInput['message'];
-      signal?: StartIdleRunInput['signal'];
-      threaded?: unknown;
-    },
-  ): Promise<Response> {
-    if (
-      typeof input.runId !== 'string' ||
-      !tenantOwnsSaltedId(scope.tenantId, input.runId)
-    ) {
-      return json({ error: 'run not found' }, 404);
-    }
-    const threaded = input.threaded !== false;
-    const expectedResourceId = threaded ? this.#resourceId(scope) : undefined;
-    if (input.resourceId !== expectedResourceId) {
-      return json({ error: 'resource not found' }, 404);
-    }
-
-    const agent = this.#getAgent(scope);
-    if (threaded && expectedResourceId) {
-      const activeRunId = agent.getActiveThreadRunId({
-        threadId: scope.threadId,
-        resourceId: expectedResourceId,
-      });
-      if (activeRunId) {
-        return json({ runId: activeRunId, joined: true });
-      }
-    }
-
-    const content =
-      typeof input.prompt === 'string'
-        ? input.prompt
-        : (input.message ??
-          input.signal ??
-          'Record the requested operation through the approved tool.');
-    const memory =
-      threaded && expectedResourceId
-        ? { thread: scope.threadId, resource: expectedResourceId }
-        : undefined;
-    await agent.stream(
-      content as Parameters<FlowsafeDurableAgent['stream']>[0],
-      {
-        runId: input.runId,
-        toolChoice: 'required',
-        ...(memory ? { memory } : {}),
-      },
-    );
-    const summary = await this.#bridge(scope, input.runId, expectedResourceId);
-    return json({ runId: input.runId, summary });
-  }
-
-  async #snapshotBindingMatches(
-    scope: ThreadScope,
-    runId: string,
-    resourceId?: string,
-  ): Promise<boolean> {
-    if (!tenantOwnsSaltedId(scope.tenantId, runId)) {
-      return false;
-    }
-    const workflows = await this.#storage?.getStore('workflows');
-    const snapshot = await workflows?.loadWorkflowSnapshot({
-      workflowName: DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
-      runId,
-    });
-    const input = snapshot?.context.input as
-      | {
-          messageListState?: {
-            memoryInfo?: {
-              threadId?: unknown;
-              resourceId?: unknown;
-            } | null;
-          };
-        }
-      | undefined;
-    const memory = input?.messageListState?.memoryInfo;
-    const matches = resourceId
-      ? memory?.threadId === scope.threadId && memory.resourceId === resourceId
-      : memory === null;
-    return matches;
-  }
-
   #signalRoutes = createThreadSignalRoutes({
-    // DurableAgent narrows generate() options, so core's generic Agent type is
-    // invariant even though the runtime object is an Agent subclass.
-    resolveAgent: (scope): Agent => this.#getAgent(scope) as unknown as Agent,
+    resolveAgent: async (scope, agentId, entryPath): Promise<Agent> =>
+      (await this.#host().resolveBoundAgent(scope, { agentId, entryPath }))
+        .durableAgent as unknown as Agent,
     resolveResourceId: (scope) => this.#resourceId(scope),
     resolveNotificationsStorage: async () => {
       const storage = await this.#storage?.getStore('notifications');
@@ -276,106 +171,38 @@ export class StarterThread extends ThreadDurableObject<Env> {
       return storage;
     },
     startIdleRun: async (input) => {
-      const scope = this.#currentScope;
-      if (!scope) throw new Error('thread scope is not initialized');
-      const response = await this.#startAgent(scope, {
-        runId: input.runId,
-        resourceId: input.resourceId,
-        message: input.message,
-        signal: input.signal,
-        threaded: true,
-      });
-      if (!response.ok) {
-        throw new Error(`idle agent start failed with ${response.status}`);
-      }
-      const result = (await response.json()) as { runId?: unknown };
-      return {
-        runId: typeof result.runId === 'string' ? result.runId : input.runId,
+      const scope: ThreadScope = {
+        threadId: input.threadId,
+        tenantId: input.actor.tenantId,
+        actor: input.actor,
+        requestedBy: input.actor.id,
+        init: this.#initResult(),
       };
+      const result = await this.#host().start(scope, {
+        agentId: input.agent.id,
+        threadId: input.threadId,
+        runId: input.runId,
+        resourceId: input.resourceId ?? this.#resourceId(scope),
+        messages: idleRunMessages(input),
+        entryPath: input.entryPath,
+      });
+      return { runId: result.runId };
     },
   });
+
+  #initResult(): InitResult {
+    if (!this.#threadInit) {
+      throw new Error('thread agent host is not initialized');
+    }
+    return this.#threadInit;
+  }
 
   protected async route(
     request: Request,
     scope: ThreadScope,
   ): Promise<Response> {
-    this.#currentScope = scope;
-    const url = new URL(request.url);
-
-    if (request.method === 'POST' && url.pathname === '/agent/start') {
-      const body = await readObject(request);
-      return body
-        ? this.#startAgent(scope, body)
-        : json({ error: 'a JSON object body is required' }, 400);
-    }
-
-    if (request.method === 'GET' && url.pathname === '/agent/status') {
-      const runId = url.searchParams.get('runId');
-      const resourceId = url.searchParams.get('resourceId');
-      if (
-        !runId ||
-        resourceId !== this.#resourceId(scope) ||
-        !tenantOwnsMemoryId(scope.tenantId, resourceId)
-      ) {
-        return json({ error: 'not found' }, 404);
-      }
-      if (!(await this.#snapshotBindingMatches(scope, runId, resourceId))) {
-        return json({ error: 'not found' }, 404);
-      }
-      const summary = await this.#bridge(scope, runId, resourceId);
-      return summary ? json(summary) : json({ error: 'not found' }, 404);
-    }
-
-    if (request.method === 'POST' && url.pathname === '/agent/resume') {
-      const body = await readObject(request);
-      const runId = body?.runId;
-      const resourceId = body?.resourceId;
-      if (
-        typeof runId !== 'string' ||
-        (resourceId !== undefined && resourceId !== this.#resourceId(scope))
-      ) {
-        return json({ error: 'not found' }, 404);
-      }
-      if (
-        !(await this.#snapshotBindingMatches(
-          scope,
-          runId,
-          typeof resourceId === 'string' ? resourceId : undefined,
-        ))
-      ) {
-        throw new Error(
-          'agent snapshot memory binding does not match this thread',
-        );
-      }
-      const step =
-        typeof body?.step === 'string' ||
-        (Array.isArray(body?.step) &&
-          body.step.every((part) => typeof part === 'string'))
-          ? body.step
-          : undefined;
-      const summary = await this.#getAgent(scope).resumeViaRuntime({
-        runId,
-        ...(step !== undefined ? { step } : {}),
-        ...(body && 'resumeData' in body
-          ? { resumeData: body.resumeData }
-          : {}),
-        ...(typeof resourceId === 'string'
-          ? {
-              memory: {
-                thread: scope.threadId,
-                resource: resourceId,
-              },
-            }
-          : {}),
-      });
-      await this.#bridge(
-        scope,
-        runId,
-        typeof resourceId === 'string' ? resourceId : undefined,
-      );
-      return json(summary);
-    }
-
+    const agent = await this.#host().route(request, scope);
+    if (agent) return agent;
     const signal = await this.#signalRoutes(request, scope);
     return signal ?? json({ error: 'not found' }, 404);
   }

@@ -41,6 +41,7 @@ import {
   purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
 } from '../do-runner/index.js';
+import type { ResumeRunFn } from './approval-bridge.js';
 import { bearerActorAuthenticator } from './bearer-auth.js';
 import {
   createDoRunTopology,
@@ -157,6 +158,9 @@ export interface BackgroundTasksCleanupConfig {
   failedTtlMs?: number;
 }
 
+/** Structurally typed to keep host-kit independent of the agent-host subpath. */
+export type AgentRouter = (request: Request) => Promise<Response | null>;
+
 export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
   /** The catalog createRunRouter serves and gates (hosts pass their metas). */
   workflows: ReadonlyArray<WorkflowMeta>;
@@ -211,6 +215,11 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
     env: Env,
   ) => DoRunTopology['resume'];
   /**
+   * Compose approval-driven resume handling. Agent hosts use this to handle
+   * agent-thread targets and delegate generic workflow targets to fallback.
+   */
+  buildResumeRun?: (fallback: ResumeRunFn, env: Env) => ResumeRunFn;
+  /**
    * Reviewer-facing notification transport (ApprovalNotificationSink) for
    * created records and SLA escalations. Built per invocation from env
    * (transports usually need secrets); undefined = no notifications.
@@ -237,6 +246,14 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
    * try/catch and its own log fields, like every sibling purge duty.
    */
   backgroundTasks?: BackgroundTasksCleanupConfig;
+  /**
+   * Opt-in authenticated agent catalog/run router. Structurally typed so this
+   * module does not import the server-only agent-host subpath.
+   */
+  buildAgentRouter?: (
+    resolve: TenantResolver,
+    env: Env,
+  ) => AgentRouter | undefined;
   /**
    * Opt-in signal-ingestion stage. The host builds its
    * `createSignalRouter` (which needs its per-thread DO namespace via
@@ -353,7 +370,9 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           ),
           // The one topology-specific piece: decisions resume the run
           // through its DO stub.
-          resumeRun: topology.resumeRecord,
+          resumeRun: config.buildResumeRun
+            ? config.buildResumeRun(topology.resumeRecord, env)
+            : topology.resumeRecord,
           queue: env.AUDIT_QUEUE,
           waitUntil,
           notify,
@@ -674,6 +693,12 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
             topology,
           });
           if (preResponse) return preResponse;
+        }
+
+        const agentRouter = config.buildAgentRouter?.(resolve, env);
+        if (agentRouter) {
+          const agentResponse = await agentRouter(request);
+          if (agentResponse) return agentResponse;
         }
 
         // Optional stream stage (DL-015/DL-019): mounted only when BOTH the hub
