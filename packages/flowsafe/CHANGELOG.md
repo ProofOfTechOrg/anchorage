@@ -1,5 +1,15 @@
 # @proofoftech/flowsafe
 
+## 0.8.0
+
+### Minor Changes
+
+- 09a4406: Add guarded Breakwater agents and Flowsafe's authenticated, catalog-driven agent host. Agent starts now derive trusted identity and execution context, agent resumes require an approval-bound capability, and status and NDJSON observation remain tenant-bound.
+
+### Patch Changes
+
+- 6670285: Prevent approval resume after isolate eviction from rerunning application input processors or input policy evaluation. Durable-agent recovery now reauthorizes the stored principal, restores both Mastra run registries with complete runtime processor chains, and fails before resumed tool execution when authorization is denied.
+
 ## 0.7.0
 
 ### Minor Changes
