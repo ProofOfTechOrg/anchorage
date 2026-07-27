@@ -591,9 +591,10 @@ async function main() {
       assert(
         untouched.status === 200 &&
           untouched.body.modelCalls === 0 &&
+          untouched.body.inputProcessorCalls === 0 &&
           untouched.body.connectorCalls === 0 &&
           untouched.body.effects === 0,
-        'no rejected boundary probe reached the model or connector',
+        'no rejected boundary probe reached the input processor, model, or connector',
         untouched,
       );
     },
@@ -654,9 +655,11 @@ async function main() {
       );
       assert(
         effects.body.modelCalls === 1 &&
+          effects.body.inputProcessorCalls === 1 &&
+          JSON.stringify(effects.body.inputProcessorMessageCounts) === '[1]' &&
           effects.body.connectorCalls === 0 &&
           effects.body.effects === 0,
-        'the model requested the tool but the connector did not run before approval',
+        'the non-empty input ran once and the connector did not run before approval',
         effects.body,
       );
 
@@ -789,6 +792,19 @@ async function main() {
         record,
       );
 
+      const effects = await http(
+        'GET',
+        `/agent/live/effects?runId=${encodeURIComponent(guardedRun.runId)}`,
+        { headers: AUTH.viewer },
+      );
+      assert(
+        effects.status === 200 &&
+          effects.body.inputProcessorCalls === 1 &&
+          JSON.stringify(effects.body.inputProcessorMessageCounts) === '[1]',
+        'the persisted input processor invocation survived the restart exactly once',
+        effects.body,
+      );
+
       const foreign = await http('GET', guardedStatusPath(guardedRun), {
         headers: AUTH.otherViewer,
       });
@@ -855,9 +871,11 @@ async function main() {
       assert(
         effects.status === 200 &&
           effects.body.modelCalls === 1 &&
+          effects.body.inputProcessorCalls === 1 &&
+          JSON.stringify(effects.body.inputProcessorMessageCounts) === '[1]' &&
           effects.body.connectorCalls === 1 &&
           effects.body.effects === 1,
-        'the deterministic model ran once and the connector executed exactly once',
+        'resume did not replay application input and the connector executed exactly once',
         effects.body,
       );
       assert(
@@ -891,8 +909,10 @@ async function main() {
         { headers: AUTH.viewer },
       );
       assert(
-        afterReplay.body.connectorCalls === 1 && afterReplay.body.effects === 1,
-        'stale approval replay did not execute the connector again',
+        afterReplay.body.inputProcessorCalls === 1 &&
+          afterReplay.body.connectorCalls === 1 &&
+          afterReplay.body.effects === 1,
+        'stale approval replay did not rerun input processing or the connector',
         afterReplay.body,
       );
     },
@@ -1905,8 +1925,9 @@ try {
     '\nSPIKE VERIFIED: the authenticated Phase A catalog minted a guarded run, ' +
       'suspended it before the connector, survived process death, rejected ' +
       'evicted stream replay with authoritative status fallback, and restored ' +
-      'the original requester when a different reviewer approved. The connector ' +
-      'executed exactly once; forged context/headers, disallowed roles, wrong ' +
+      'the original requester when a different reviewer approved. The application ' +
+      'input processor and connector each executed exactly once; forged ' +
+      'context/headers, disallowed roles, wrong ' +
       'tenants/agents/bindings, public raw resume, and stale decision replay all ' +
       'failed closed. The lower-level workflow resumed via its exact-leg approval ' +
       'grant, a forged raw resume failed closed, and self-decision was denied. ' +

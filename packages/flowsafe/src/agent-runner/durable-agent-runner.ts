@@ -51,9 +51,10 @@
 // Live-isolate scope: the loop resolves the tool's execute closure from the
 // in-process globalRunRegistry (populated by stream()). A DO holds one run in
 // one isolate (P1), so a resume decided before eviction finds it. A resume
-// AFTER eviction must first rehydrate that registry with DurableAgent.prepare()
-// (the snapshot's messageListState wins) before runtime.resume — the S3 seam,
-// wired by the host that owns the resume topology (see the CLAUDE.md note).
+// AFTER eviction must first rehydrate that registry without replaying
+// application input processors. resumeViaRuntime() rebuilds the registry with
+// complete runtime processor lists after invoking only reserved RBAC during
+// empty-message preparation, then drives runtime.resume().
 
 import type { Agent, ToolsInput } from '@mastra/core/agent';
 import {
@@ -61,8 +62,11 @@ import {
   type DurableAgentConfig,
   type DurableAgenticWorkflowInput,
   type DurableAgentStreamOptions,
+  globalRunRegistry,
+  prepareForDurableExecution,
 } from '@mastra/core/agent/durable';
 import type { Mastra } from '@mastra/core/mastra';
+import type { RequestContext } from '@mastra/core/request-context';
 import type { AnyWorkflow } from '@mastra/core/workflows';
 
 import {
@@ -173,6 +177,7 @@ export class FlowsafeDurableAgent<
    */
   readonly [RUNTIME_DRIVEN_AGENT] = true;
   readonly #runtime: RunnerRuntime;
+  readonly #wrappedAgent: Agent<TAgentId, TTools, TOutput>;
   readonly #threadRuntime?: Mastra['agentThreadStreamRuntime'];
   readonly #persistenceWaiters = new Map<
     string,
@@ -198,6 +203,7 @@ export class FlowsafeDurableAgent<
       maxSteps: options.maxSteps,
     });
     this.#runtime = options.runtime;
+    this.#wrappedAgent = options.agent;
     this.#threadRuntime = options.threadRuntime;
   }
 
@@ -350,6 +356,82 @@ export class FlowsafeDurableAgent<
     return super.prepare(messages, options);
   }
 
+  async #rehydrateRegistry(options: {
+    runId: string;
+    requestContext: RequestContext;
+    memory?: DurableAgentStreamOptions<TOutput>['memory'];
+  }): Promise<void> {
+    const wrappedAgent = this.#wrappedAgent;
+    let inputProcessors: Awaited<
+      ReturnType<Agent<TAgentId, TTools, TOutput>['listInputProcessors']>
+    > = [];
+    let llmRequestInputProcessors: Awaited<
+      ReturnType<Agent<TAgentId, TTools, TOutput>['__listLLMRequestProcessors']>
+    > = [];
+    const rehydrationAgent = new Proxy(wrappedAgent, {
+      get(target, property) {
+        if (property === 'listInputProcessors') {
+          return async (requestContext?: RequestContext) => {
+            inputProcessors = await target.listInputProcessors(requestContext);
+            return inputProcessors.filter(
+              (processor) => processor.id === 'breakwater-rbac',
+            );
+          };
+        }
+        if (property === '__listLLMRequestProcessors') {
+          return async (requestContext?: RequestContext) => {
+            llmRequestInputProcessors =
+              await target.__listLLMRequestProcessors(requestContext);
+            return [];
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const preparationOptions =
+      options.memory !== undefined
+        ? ({
+            memory: options.memory,
+          } as NonNullable<
+            Parameters<DurableAgent<TAgentId, TTools, TOutput>['prepare']>[1]
+          >)
+        : undefined;
+    const preparation = await prepareForDurableExecution({
+      agent: rehydrationAgent,
+      messages: [],
+      ...(preparationOptions !== undefined
+        ? { options: preparationOptions }
+        : {}),
+      runId: options.runId,
+      requestContext: options.requestContext,
+      mastra: this.getMastraInstance(),
+    });
+    const tripwire = preparation.registryEntry.tripwire;
+    if (tripwire) {
+      preparation.registryEntry.cleanup?.();
+      throw new Error(
+        `Durable agent registry rehydration denied: ${tripwire.reason}`,
+      );
+    }
+    preparation.registryEntry.inputProcessors = inputProcessors;
+    preparation.registryEntry.llmRequestInputProcessors =
+      llmRequestInputProcessors;
+    this.runRegistryInternal.registerWithMessageList(
+      options.runId,
+      preparation.registryEntry,
+      preparation.messageList,
+      {
+        threadId: preparation.threadId,
+        resourceId: preparation.resourceId,
+      },
+    );
+    globalRunRegistry.set(options.runId, {
+      ...preparation.registryEntry,
+      messageList: preparation.messageList,
+    });
+  }
+
   /**
    * Rehydrate a suspended durable-agent run after isolate eviction, restore its
    * active thread registration, then resume through RunnerRuntime so approval
@@ -368,13 +450,11 @@ export class FlowsafeDurableAgent<
       options.runId,
       options.step !== undefined ? { step: options.step } : {},
     );
-    await this.prepare([], {
+    await this.#rehydrateRegistry({
       runId: options.runId,
       requestContext,
       ...(options.memory !== undefined ? { memory: options.memory } : {}),
-    } as NonNullable<
-      Parameters<DurableAgent<TAgentId, TTools, TOutput>['prepare']>[1]
-    >);
+    });
     const observed = await this.observe(options.runId);
     const emitTerminalError = async (error: unknown): Promise<void> => {
       try {

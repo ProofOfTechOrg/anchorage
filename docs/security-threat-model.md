@@ -181,7 +181,7 @@ A host with only one human reviewer must consciously choose availability or sepa
 | Old approval reused at another gate | Exact step, `suspendedAt`, and `resumeCount` match | Trusted run-scoped grants intentionally span legs |
 | Reviewer races another reviewer | Store CAS and terminal-state immutability | Batch decisions are partial, not globally transactional |
 | Reviewer approves their own action | Requester and cross-gate history checks | Explicit exemptions weaken this control |
-| Approval resume fails after commit | Decision stays durable; trusted redrive/prepare path | Operator may need to redrive; no automatic rollback |
+| Approval resume fails after commit | Decision stays durable; trusted redrive/registry rehydration invokes only RBAC's initial `processInput` hook, then restores complete processor lists for resumed loop hooks | Operator may need to redrive; no automatic rollback |
 | Foreign approval id read or changed | Tenant-bound store predicates and 404 | A verifier that assigns the wrong tenant defeats the boundary |
 | Foreign run or thread reached | Exact prefix ownership, topology check, DO identity check, 404 | Raw namespace access outside exported topology is unsupported |
 | Foreign or mismatched agent binding reached | Server catalog plus persisted thread/run/agent binding checks before mutation authorization | Raw namespace access outside the agent topology is unsupported |

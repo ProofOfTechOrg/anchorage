@@ -86,13 +86,16 @@ export const agent = createGuardedAgent({
 
 The factory constructs a protected `Agent` subclass but returns `GuardedAgentHandle`. Its package-local brand lets the Flowsafe agent host validate the object before its internal Mastra cast. No public unwrap operation exists.
 
-Direct calls preauthorize the `breakwater.actor`, then pass exact application and mandatory processor arrays to Mastra. Durable preparation uses the subclass processor listing. The two paths have these orders:
+Direct calls preauthorize the `breakwater.actor`, then pass exact application and mandatory processor arrays to Mastra. Initial durable preparation uses the subclass processor listing. Approval resume after isolate eviction uses Flowsafe's registry rehydration path, which authorizes the fresh trusted resume context without replaying initial application or policy input. These paths have these orders:
 
 ```text
 direct: RBAC preauthorization -> app input -> policy input
-durable: RBAC processor -> app input -> policy input
+initial durable: RBAC processor -> app input -> policy input
+durable resume processInput during rehydration: RBAC only
 output: model/tools -> app output -> policy output
 ```
+
+The durable resume line describes which `processInput` hook runs during rehydration. Before installing the registries, Flowsafe restores the complete input and LLM-request processor lists for later loop hooks. It also restores the same tools, memory, model, application output processors, and mandatory policy output processor as initial preparation. An RBAC denial stops rehydration before registry installation or resumed tool execution.
 
 The call allowlist contains `requestContext`, `runId`, `memory`, and `abortSignal`. Unknown own properties fail even when their value is `undefined`. Construction fixes `maxSteps` and `toolChoice`, enables policy hold-back, and disables background continuations.
 

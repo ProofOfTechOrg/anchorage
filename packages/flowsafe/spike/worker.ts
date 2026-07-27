@@ -246,6 +246,15 @@ function ensureAgentProbeTables(db: D1Database): Promise<void> {
              created_at TEXT NOT NULL
            )`,
         ),
+        db.prepare(
+          `CREATE TABLE IF NOT EXISTS spike_agent_input_processor_calls (
+             call_id TEXT PRIMARY KEY,
+             run_id TEXT NOT NULL,
+             tenant_id TEXT NOT NULL,
+             message_count INTEGER NOT NULL,
+             created_at TEXT NOT NULL
+           )`,
+        ),
       ])
       .then(() => undefined)
       .catch((error: unknown) => {
@@ -412,6 +421,49 @@ function createSpikeAgentModule(env: Env, audit: AuditLogger): AgentModule {
       audit,
       maxSteps: 1,
       toolChoice: 'required',
+      applicationInputProcessors: [
+        {
+          id: 'spike-input-probe',
+          processInput: async (args) => {
+            const correlation = args.requestContext?.get(
+              AGENT_AUDIT_CONTEXT_KEY,
+            ) as
+              | {
+                  tenantId?: unknown;
+                  runId?: unknown;
+                }
+              | undefined;
+            if (
+              typeof correlation?.tenantId !== 'string' ||
+              typeof correlation.runId !== 'string'
+            ) {
+              throw new Error(
+                'guarded input processor is missing its durable correlation',
+              );
+            }
+            await ensureAgentProbeTables(env.DB);
+            await env.DB.prepare(
+              `INSERT INTO spike_agent_input_processor_calls
+                 (call_id, run_id, tenant_id, message_count, created_at)
+                 VALUES (?, ?, ?, ?, ?)`,
+            )
+              .bind(
+                crypto.randomUUID(),
+                correlation.runId,
+                correlation.tenantId,
+                args.messages.length,
+                new Date().toISOString(),
+              )
+              .run();
+            if (args.messages.length === 0) {
+              args.abort(
+                'spike application input processor received empty messages',
+              );
+            }
+            return args.messages;
+          },
+        },
+      ],
     }),
   };
 }
@@ -1231,12 +1283,32 @@ async function handleLiveAgentRoute(
     entry_path: string;
     recorded: number;
   }>();
+  const inputProcessorStatement = requestedRunId
+    ? env.DB.prepare(
+        `SELECT message_count
+           FROM spike_agent_input_processor_calls
+           WHERE tenant_id = ? AND run_id = ?
+           ORDER BY created_at`,
+      ).bind(tenant.tenantId, requestedRunId)
+    : env.DB.prepare(
+        `SELECT message_count
+           FROM spike_agent_input_processor_calls
+           WHERE tenant_id = ?
+           ORDER BY created_at`,
+      ).bind(tenant.tenantId);
+  const inputProcessorCalls = await inputProcessorStatement.all<{
+    message_count: number;
+  }>();
   const modelCalls = await env.DB.prepare(
     'SELECT COUNT(*) AS count FROM spike_agent_model_calls',
   ).first<{ count: number }>();
   return json({
     connectorCalls: calls.results.length,
     effects: calls.results.filter((call) => call.recorded === 1).length,
+    inputProcessorCalls: inputProcessorCalls.results.length,
+    inputProcessorMessageCounts: inputProcessorCalls.results.map(
+      (call) => call.message_count,
+    ),
     modelCalls: modelCalls?.count ?? 0,
     calls: calls.results,
   });

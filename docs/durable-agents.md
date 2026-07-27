@@ -64,7 +64,7 @@ The start body accepts only `{"prompt":"..."}`. The router caps the raw UTF-8 bo
 
 Each stream line contains the next reconnect cursor and one event. Replay depends on the configured Mastra cache and is not process-restart durable. When the durable run exists but its replay cache does not, the stream route returns 409 and the client must use the status route.
 
-Approval records store an `agent-thread` target with the agent, thread, resource, and original authorized principal. `createAgentApprovalResumer()` rechecks the current catalog roles, reconstructs the guarded module after eviction, and resumes as that original principal. The reviewer identity remains attached to the approval decision.
+Approval records store an `agent-thread` target with the agent, thread, resource, and original authorized principal. `createAgentApprovalResumer()` rechecks the current catalog roles, reconstructs the guarded module after eviction, and resumes as that original principal. Before resume, the wrapper rebuilds Mastra's local and global run registries from fresh trusted context. It invokes only Breakwater's reserved RBAC `processInput` hook during rehydration, then installs the complete input, LLM-request, and output processor lists for resumed loop execution. It does not replay application or policy `processInput` hooks. An authorization denial stops before registry installation, observation, or tool execution. The reviewer identity remains attached to the approval decision.
 
 ## Use the lower-level durable wrapper
 
@@ -93,7 +93,7 @@ const durableAgent = createFlowsafeDurableAgent({
 });
 ```
 
-`createFlowsafeDurableAgent()` registers Mastra's `durable-agentic-loop` workflow on the supplied runtime. Its `stream()`, `generate()`, and `prepare()` entry points require a caller-minted run id. The host must mint `${tenantId}_${uuid}`; flowsafe does not fall back to a tenant-less UUID.
+`createFlowsafeDurableAgent()` registers Mastra's `durable-agentic-loop` workflow on the supplied runtime. Its `stream()`, `generate()`, and `prepare()` entry points require a caller-minted run id. The host must mint `${tenantId}_${uuid}`; flowsafe does not fall back to a tenant-less UUID. `prepare()` remains an initial-execution API and runs the full initial processor chain. `resumeViaRuntime()` uses the dedicated registry rehydration behavior described above.
 
 The runtime's pub/sub identity is reused by default. This lets the durable loop, observer, and active-thread signal delivery share one feed inside the thread Durable Object.
 

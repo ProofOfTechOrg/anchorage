@@ -142,7 +142,7 @@ Public starts mint the thread, resource, and run ids after authentication. Statu
 
 An agent has no public raw-resume route. Approval records persist the original authorized principal, and an approval decision resumes as that principal after rechecking the current catalog roles. The reviewer remains the actor on the approval decision event.
 
-After Durable Object eviction, the in-process tool registry is gone while D1 state remains. The agent host reconstructs the guarded module, derives fresh trusted context for preparation, restores observation, validates the memory binding, then resumes through `RunnerRuntime`.
+After Durable Object eviction, the in-process tool registry is gone while D1 state remains. The agent host validates the memory binding, reconstructs the guarded module, and derives fresh trusted resume context. It then rehydrates Mastra's registries by invoking only Breakwater's reserved RBAC `processInput` hook. Before installation, it restores the complete input, LLM-request, application output, and mandatory output-processor lists for resumed loop execution. Initial application and policy `processInput` hooks do not run again. The host then starts observation and resumes through `RunnerRuntime`.
 
 See [Durable agents](durable-agents.md).
 
