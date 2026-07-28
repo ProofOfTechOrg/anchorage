@@ -8,3 +8,7 @@ Zero-dependency repository documentation and publication checks.
 - `docs-check.mjs` — validates local docs, public exports, TypeDoc coverage,
   and external links.
 - `docs-check.test.mjs` — `node:test` fixtures for the documentation checker.
+- `publish-ordered.mjs` — publishes Breakwater before the Changesets remainder.
+- `publish-ordered.test.mjs` — `node:test` fixtures for publish ordering, the
+  publish argv and cwd shape, and the tag line `changesets/action` greps for.
+- `publish-invocation-check.mjs` — dry-runs the real publish command per package.
