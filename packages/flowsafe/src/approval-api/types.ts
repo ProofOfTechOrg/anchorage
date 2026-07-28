@@ -50,12 +50,20 @@ export const APPROVAL_STATUSES: readonly ApprovalStatus[] = [
   'escalated',
 ];
 
-/** Trusted host topology used to resume a durable agent after DO eviction. */
-export interface ApprovalResumeTarget {
-  kind: 'thread';
-  threadId: string;
-  resourceId?: string;
-}
+/** Trusted host topology used to resume a run after Durable Object eviction. */
+export type ApprovalResumeTarget =
+  | {
+      kind: 'thread';
+      threadId: string;
+      resourceId?: string;
+    }
+  | {
+      kind: 'agent-thread';
+      agentId: string;
+      threadId: string;
+      resourceId: string;
+      principal: import('./contract.js').ApprovalActor;
+    };
 
 export interface ApprovalRecord {
   id: string;

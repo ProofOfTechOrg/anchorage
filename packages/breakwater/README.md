@@ -23,6 +23,7 @@ together.
 
 | Boundary | Public API | What it enforces |
 | --- | --- | --- |
+| Guarded agent entry | `createGuardedAgent()` | Mandatory role and policy order, fixed execution limits, and a narrow call-option allowlist |
 | Agent input and output | `PolicyEngine` | Content policies across input, final output, and streaming channels |
 | Agent input | `RBACMiddleware` | Actor presence and an explicit role allowlist |
 | Tool execution | `createConnector()` | Permission manifests, egress, approvals, dry runs, idempotency, rate limits, isolation, and custom policies |
@@ -49,10 +50,11 @@ Connector authors who define Zod schemas should also declare Zod directly:
 npm install zod
 ```
 
-The package supports the root import and five focused subpaths:
+The package supports the root import and six focused subpaths:
 
 ```typescript
 import { PolicyEngine } from '@proofoftech/breakwater';
+import { createGuardedAgent } from '@proofoftech/breakwater/agent';
 import { AuditLogger } from '@proofoftech/breakwater/audit';
 import { createConnector } from '@proofoftech/breakwater/connector-sdk';
 import { RBACMiddleware } from '@proofoftech/breakwater/rbac';
@@ -62,54 +64,48 @@ import { denyPatterns } from '@proofoftech/breakwater/policy-engine';
 
 ## Guard an agent
 
-Register the same policy engine as both an input and output processor. Put RBAC
-first so an unauthorized call never reaches the model.
+Use `createGuardedAgent()` for supported protected agent execution. The factory installs role-based access control (RBAC) before application input processors and policy, then installs policy after application output processors.
 
 ```typescript
-import { Agent } from '@mastra/core/agent';
 import { RequestContext } from '@mastra/core/request-context';
-import type { ToolExecutionContext } from '@mastra/core/tools';
 import {
   ACTOR_CONTEXT_KEY,
+  AGENT_AUDIT_CONTEXT_KEY,
   AuditLogger,
+  createGuardedAgent,
   denyPatterns,
   piiSecrets,
-  PolicyEngine,
-  RBACMiddleware,
 } from '@proofoftech/breakwater';
 
 const audit = new AuditLogger();
-const policy = new PolicyEngine({
-  audit,
-  holdBack: true,
+const agent = createGuardedAgent({
+  id: 'guarded-agent',
+  name: 'Guarded agent',
+  instructions: 'Answer only from approved business data.',
+  model: 'openai/gpt-5',
+  allowedRoles: ['operator', 'admin'],
   policies: [
     denyPatterns(['private signing key']),
     piiSecrets({ detectors: ['privateKey', 'awsAccessKey', 'jwt'] }),
   ],
+  audit,
+  maxSteps: 4,
+  toolChoice: 'auto',
 });
+```
 
-const model = process.env.MASTRA_MODEL_ID;
-if (!model) throw new Error('MASTRA_MODEL_ID is required');
+The host must authenticate the caller and derive trusted request context before invoking the handle:
 
-const agent = new Agent({
-  id: 'guarded-agent',
-  name: 'Guarded agent',
-  instructions: 'Answer only from approved business data.',
-  model,
-  inputProcessors: [
-    new RBACMiddleware({
-      allowedRoles: ['operator', 'admin'],
-      audit,
-    }),
-    policy,
-  ],
-  outputProcessors: [policy],
-});
-
+```typescript
 const requestContext = new RequestContext();
 requestContext.set(ACTOR_CONTEXT_KEY, {
   id: 'user-42',
   role: 'operator',
+});
+requestContext.set(AGENT_AUDIT_CONTEXT_KEY, {
+  agentId: agent.id,
+  runId: 'server_minted_run_id',
+  entryPath: 'http-start',
 });
 
 const result = await agent.generate('Summarize the account.', {
@@ -117,10 +113,11 @@ const result = await agent.generate('Summarize the account.', {
 });
 ```
 
-`RBACMiddleware` does not define a role hierarchy. The five role names are
-stable labels, and `allowedRoles` is the exact allowlist for that agent. Use
-`getActor` to derive an actor from your authenticated host context instead of
-setting `ACTOR_CONTEXT_KEY` directly.
+The handle exposes only unstructured `generate()` and `stream()`. Each call requires `requestContext` and may accept only `runId`, `memory`, and `abortSignal`. The factory fixes `maxSteps` and `toolChoice`, forces streaming policy hold-back, disables background continuations, and rejects processor or model overrides.
+
+`allowedRoles` is an exact allowlist with no role hierarchy. Application input processors may implement only `processInput`. Application output processors must implement both `processOutputStream` and `processOutputResult`.
+
+The narrow handle prevents accidental use of raw Mastra execution methods. It is not a sandbox against hostile code in the same JavaScript process. Use the authenticated Flowsafe agent host when callers cross an HTTP or tenant boundary.
 
 ## Choose agent policies
 

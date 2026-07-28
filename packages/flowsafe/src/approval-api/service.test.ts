@@ -141,6 +141,43 @@ describe('ApprovalService.create', () => {
     ).rejects.toBeInstanceOf(InvalidApprovalInputError);
   });
 
+  it('accepts an agent-thread target only with a same-tenant valid principal', async () => {
+    const harness = makeHarness();
+    const target = {
+      kind: 'agent-thread' as const,
+      agentId: 'writer',
+      threadId: 'acme_thread-1',
+      resourceId: 'acme_resource-1',
+      principal: {
+        id: 'starter',
+        role: 'operator' as const,
+        tenantId: 'acme',
+      },
+    };
+
+    const { record } = await harness.service.create(input(), OPERATOR, target);
+
+    expect(record.resumeTarget).toEqual(target);
+    await expect(
+      harness.service.create(input({ runId: 'acme_run-2' }), OPERATOR, {
+        ...target,
+        principal: { ...target.principal, tenantId: 'globex' },
+      }),
+    ).rejects.toBeInstanceOf(InvalidApprovalInputError);
+    await expect(
+      harness.service.create(input({ runId: 'acme_run-3' }), OPERATOR, {
+        ...target,
+        agentId: '../writer',
+      }),
+    ).rejects.toBeInstanceOf(InvalidApprovalInputError);
+    await expect(
+      harness.service.create(input({ runId: 'acme_run-4' }), OPERATOR, {
+        ...target,
+        principal: { ...target.principal, id: '   ' },
+      }),
+    ).rejects.toBeInstanceOf(InvalidApprovalInputError);
+  });
+
   it("rejects a runId that does not carry the store's tenant prefix (INV-1 belt)", async () => {
     // #given — every read path filters on the tenant_id column, so a foreign
     // prefix would only orphan a row; the belt makes it a loud error instead

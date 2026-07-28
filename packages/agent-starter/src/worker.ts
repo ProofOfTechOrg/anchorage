@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import {
-  createApprovalRouter,
-  defaultResumeData,
+  createAgentApprovalResumer,
+  createAgentRouter,
+  createAgentThreadTopology,
+} from '@proofoftech/flowsafe/agent-host';
+import {
   RUN_START_ROLES,
   type TenantContext,
   TenantResolutionError,
@@ -10,17 +13,9 @@ import {
 } from '@proofoftech/flowsafe/approval-api';
 import { createObjectiveRouter } from '@proofoftech/flowsafe/goals';
 import {
-  approvalStoreFactoryFor,
-  assertNoClientMemoryIds,
-  buildHostApprovalService,
   createDoRunTopology,
   createFlowsafeWorker,
-  createHubTopology,
   createThreadTopology,
-  type DoRunTopology,
-  doSummary,
-  type FlowsafeWorkerContext,
-  numberVar,
   RunRouteError,
   withSubdomainCrossCheck,
 } from '@proofoftech/flowsafe/host-kit';
@@ -40,7 +35,7 @@ import {
   createSignalRouter,
 } from '@proofoftech/flowsafe/signals';
 
-import { STARTER_AGENT_ID } from './agent.js';
+import { STARTER_AGENT_META } from './agent.js';
 import {
   buildVerifier,
   githubResourceAllowed,
@@ -63,7 +58,7 @@ import {
   subscriptionStoreFactory,
   threadStateStore,
 } from './storage.js';
-import { systemTenant } from './system-tenant.js';
+import { systemTenant, tenantForActor } from './system-tenant.js';
 import { WORKFLOWS } from './workflows.js';
 
 export {
@@ -86,26 +81,6 @@ const webhookRouters = new WeakMap<
 
 function json(payload: unknown, status = 200): Response {
   return Response.json(payload, { status });
-}
-
-async function bodyObject(
-  request: Request,
-  maxBytes = 16_384,
-): Promise<Record<string, unknown> | Response> {
-  const text = await request.text();
-  if (new TextEncoder().encode(text).length > maxBytes) {
-    return json({ error: 'payload too large' }, 413);
-  }
-  try {
-    const parsed = text === '' ? {} : JSON.parse(text);
-    return typeof parsed === 'object' &&
-      parsed !== null &&
-      !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : json({ error: 'a JSON object body is required' }, 400);
-  } catch {
-    return json({ error: 'a JSON object body is required' }, 400);
-  }
 }
 
 function decoded(value: string): string | undefined {
@@ -136,106 +111,6 @@ function webhookRouter(env: Env) {
   return router;
 }
 
-async function handleAgentRoutes(
-  request: Request,
-  env: Env,
-  resolve: TenantResolver,
-): Promise<Response | null> {
-  const url = new URL(request.url);
-  const segments = url.pathname.split('/').filter(Boolean);
-  if (
-    segments[0] !== 'api' ||
-    segments[1] !== 'agent' ||
-    segments[2] !== 'runs'
-  ) {
-    return null;
-  }
-
-  const tenant = await resolve(request);
-  if (!tenant) return json({ error: 'authentication required' }, 401);
-
-  if (request.method === 'POST' && segments.length === 3) {
-    if (!RUN_START_ROLES.includes(tenant.actor.role)) {
-      return json({ error: 'forbidden' }, 403);
-    }
-    const body = await bodyObject(request);
-    if (body instanceof Response) return body;
-    try {
-      assertNoClientMemoryIds(body);
-    } catch {
-      return json(
-        {
-          error:
-            'threadId and resourceId are server-assigned and may not appear in the body',
-        },
-        400,
-      );
-    }
-    const unknownField = Object.keys(body).find((field) => field !== 'prompt');
-    if (unknownField) {
-      return json({ error: `field '${unknownField}' is not allowed` }, 400);
-    }
-    if (
-      body.prompt !== undefined &&
-      (typeof body.prompt !== 'string' || body.prompt.length > 10_000)
-    ) {
-      return json(
-        { error: 'prompt must be a string of at most 10000 chars' },
-        400,
-      );
-    }
-
-    const threadId = tenant.newThreadId();
-    const resourceId = tenant.newResourceId(threadId);
-    const runId = tenant.newRunId();
-    const response = await createThreadTopology(env.THREAD).send(
-      tenant,
-      threadId,
-      '/agent/start',
-      {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          runId,
-          resourceId,
-          prompt:
-            typeof body.prompt === 'string'
-              ? body.prompt
-              : 'Record a starter action through the approved connector.',
-          threaded: true,
-        }),
-      },
-    );
-    const result = await response.json();
-    return json(
-      {
-        threadId,
-        resourceId,
-        runId,
-        result,
-      },
-      response.status,
-    );
-  }
-
-  if (request.method === 'GET' && segments.length === 5) {
-    const threadId = decoded(segments[3] ?? '');
-    const runId = decoded(segments[4] ?? '');
-    const resourceId = url.searchParams.get('resourceId');
-    if (!threadId || !runId || !resourceId) {
-      return json({ error: 'not found' }, 404);
-    }
-    const response = await createThreadTopology(env.THREAD).send(
-      tenant,
-      threadId,
-      `/agent/status?runId=${encodeURIComponent(runId)}&resourceId=${encodeURIComponent(resourceId)}`,
-    );
-    return new Response(response.body, response);
-  }
-
-  return json({ error: 'method not allowed' }, 405);
-}
-
 async function handleBackgroundRoutes(
   request: Request,
   env: Env,
@@ -262,77 +137,6 @@ async function handleBackgroundRoutes(
     redirect: request.redirect,
   });
   return env.BACKGROUND_TASKS.get(id).fetch(forwarded);
-}
-
-function customApprovalResolver(
-  env: Env,
-  ctx: FlowsafeWorkerContext,
-  baseResolve: TenantResolver,
-  topology: DoRunTopology,
-): TenantResolver {
-  return async (request) => {
-    const tenant = await baseResolve(request);
-    if (!tenant) return undefined;
-    let custom: ReturnType<typeof buildHostApprovalService> | undefined;
-    const scoped: TenantContext = {
-      ...tenant,
-      service: () => {
-        custom ??= buildHostApprovalService(
-          approvalStoreFactoryFor(env.DB).forTenant(tenant.tenantId),
-          {
-            systemActorId: SYSTEM_ACTOR_ID,
-            defaultSlaSeconds: numberVar(
-              env.APPROVAL_SLA_SECONDS,
-              4 * 60 * 60,
-              'APPROVAL_SLA_SECONDS',
-            ),
-            waitUntil: (promise) => ctx.waitUntil(promise),
-            stream: env.STREAM_TICKET_SECRET
-              ? (event) =>
-                  ctx.waitUntil(
-                    createHubTopology(env.HUB)
-                      .publish(event)
-                      .catch((error: unknown) => {
-                        console.error(
-                          JSON.stringify({
-                            type: 'starter.stream-publish-error',
-                            reason:
-                              error instanceof Error
-                                ? error.message
-                                : String(error),
-                          }),
-                        );
-                      }),
-                  )
-              : undefined,
-            resumeRun: async (record, decision) => {
-              if (record.resumeTarget?.kind !== 'thread') {
-                return topology.resumeRecord(record, decision);
-              }
-              const response = await createThreadTopology(env.THREAD).send(
-                systemTenant(env, record.tenantId),
-                record.resumeTarget.threadId,
-                '/agent/resume',
-                {
-                  method: 'POST',
-                  headers: { 'content-type': 'application/json' },
-                  body: JSON.stringify({
-                    runId: record.runId,
-                    resourceId: record.resumeTarget.resourceId,
-                    step: record.stepPath,
-                    resumeData: defaultResumeData(record, decision),
-                  }),
-                },
-              );
-              return doSummary(response);
-            },
-          },
-        );
-        return custom;
-      },
-    };
-    return scoped;
-  };
 }
 
 function subscriptionResolver(
@@ -424,12 +228,9 @@ const worker = createFlowsafeWorker<Env>({
           apexDomain: env.TENANT_APEX_DOMAIN,
         })
       : resolve,
-  preRoutes: async (request, env, ctx, kit) => {
+  preRoutes: async (request, env, _ctx, kit) => {
     const webhook = await webhookRouter(env)(request);
     if (webhook) return webhook;
-
-    const agent = await handleAgentRoutes(request, env, kit.resolve);
-    if (agent) return agent;
 
     const subscriptions = await createSubscriptionRouter({
       resolve: subscriptionResolver(env, kit.resolve),
@@ -444,12 +245,21 @@ const worker = createFlowsafeWorker<Env>({
 
     const background = await handleBackgroundRoutes(request, env, kit.resolve);
     if (background) return background;
-
-    const approval = await createApprovalRouter({
-      resolve: customApprovalResolver(env, ctx, kit.resolve, kit.topology),
-    })(request);
-    return approval;
+    return null;
   },
+  buildAgentRouter: (resolve, env) =>
+    createAgentRouter({
+      agents: [STARTER_AGENT_META],
+      resolve,
+      topology: createAgentThreadTopology(env.THREAD),
+    }),
+  buildResumeRun: (fallback, env) =>
+    createAgentApprovalResumer({
+      fallback,
+      agents: [STARTER_AGENT_META],
+      topology: createAgentThreadTopology(env.THREAD),
+      tenantForActor: (actor) => tenantForActor(env, actor),
+    }),
   buildSignalRouter: (resolve, env) =>
     createSignalRouter({
       resolve,
@@ -476,6 +286,7 @@ const worker = createFlowsafeWorker<Env>({
   scheduleTick: (env) => {
     const runTopology = createDoRunTopology(env.RUNNER);
     const threadTopology = createThreadTopology(env.THREAD);
+    const agentTopology = createAgentThreadTopology(env.THREAD);
     const schedules = createScheduleTick({
       store: schedulesStore(env.DB),
       start: runTopology.start,
@@ -485,34 +296,26 @@ const worker = createFlowsafeWorker<Env>({
         runId,
         topologyThreadId,
         threaded,
+        entryPath,
+        requestContext,
+        streamRequestContext,
       }) => {
-        if (target.agentId !== STARTER_AGENT_ID) {
-          throw new Error(`unknown scheduled agent '${target.agentId}'`);
-        }
-        const response = await threadTopology.send(
-          systemTenant(env, tenantId),
-          topologyThreadId,
-          '/agent/start',
-          {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              runId,
-              resourceId: threaded ? target.resourceId : undefined,
-              prompt: target.prompt,
-              threaded,
-            }),
-          },
-        );
-        if (!response.ok) {
-          throw new Error(
-            `scheduled agent start failed with ${response.status}`,
-          );
-        }
-        const started = (await response.json()) as { runId?: unknown };
-        return {
-          runId: typeof started.runId === 'string' ? started.runId : runId,
-        };
+        const started = await agentTopology.start(systemTenant(env, tenantId), {
+          agentId: target.agentId,
+          runId,
+          prompt: target.prompt,
+          entryPath,
+          threaded,
+          requestContext,
+          streamRequestContext,
+          ...(threaded
+            ? {
+                threadId: topologyThreadId,
+                resourceId: target.resourceId,
+              }
+            : {}),
+        });
+        return { runId: started.runId };
       },
       audit,
     });

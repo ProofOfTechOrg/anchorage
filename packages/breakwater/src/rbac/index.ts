@@ -14,6 +14,7 @@ import type {
 import type { RequestContext } from '@mastra/core/request-context';
 
 import type { AuditLogger } from '../audit/index.js';
+import { authorizeActor } from './authorize.js';
 
 /** Role labels accepted by the built-in actor contract. */
 export type Role = 'admin' | 'builder' | 'operator' | 'reviewer' | 'viewer';
@@ -56,7 +57,11 @@ export function actorFromRequestContext(
   const value = requestContext?.get(ACTOR_CONTEXT_KEY);
   if (!value || typeof value !== 'object') return undefined;
   const candidate = value as Partial<Actor>;
-  if (typeof candidate.id !== 'string' || typeof candidate.role !== 'string') {
+  if (
+    typeof candidate.id !== 'string' ||
+    candidate.id.trim() === '' ||
+    typeof candidate.role !== 'string'
+  ) {
     return undefined;
   }
   return (ROLES as readonly string[]).includes(candidate.role)
@@ -70,6 +75,8 @@ export interface RBACMiddlewareOptions {
   allowedRoles: readonly Role[];
   /** Optional audit logger for authorization decisions and lookup failures. */
   audit?: AuditLogger;
+  /** Audit resource. Defaults to the stable processor identifier. */
+  resource?: string;
   /** Override actor sourcing. Default reads ACTOR_CONTEXT_KEY from requestContext. */
   getActor?: (args: ProcessInputArgs) => Actor | undefined;
 }
@@ -81,6 +88,7 @@ export class RBACMiddleware implements Processor<'breakwater-rbac'> {
   readonly #allowedRoles: readonly Role[];
   readonly #audit?: AuditLogger;
   readonly #getActor: (args: ProcessInputArgs) => Actor | undefined;
+  readonly #resource: string;
 
   constructor(options: RBACMiddlewareOptions) {
     if (options.allowedRoles.length === 0) {
@@ -88,55 +96,20 @@ export class RBACMiddleware implements Processor<'breakwater-rbac'> {
     }
     this.#allowedRoles = options.allowedRoles;
     this.#audit = options.audit;
+    this.#resource = options.resource ?? this.id;
     this.#getActor =
       options.getActor ??
       ((args) => actorFromRequestContext(args.requestContext));
   }
 
   processInput(args: ProcessInputArgs): ProcessInputResult {
-    let actor: Actor | undefined;
-    try {
-      actor = this.#getActor(args);
-    } catch (error) {
-      // A crashing actor lookup is worse than a denial; it must not leave
-      // less audit evidence than one. Keep the sink free of opaque exception
-      // text, then fail the request with the original error.
-      this.#audit?.record({
-        actor: null,
-        action: 'agent.input.authorize',
-        resource: this.id,
-        decision: 'error',
-        reason: 'actor lookup failed',
-      });
-      throw error;
-    }
-    if (!actor) {
-      const reason = `no actor in request context (key '${ACTOR_CONTEXT_KEY}')`;
-      this.#audit?.record({
-        actor: null,
-        action: 'agent.input.authorize',
-        resource: this.id,
-        decision: 'denied',
-        reason,
-      });
-      args.abort(reason);
-    }
-    if (!this.#allowedRoles.includes(actor.role)) {
-      const reason = `role '${actor.role}' is not in allowed roles [${this.#allowedRoles.join(', ')}]`;
-      this.#audit?.record({
-        actor,
-        action: 'agent.input.authorize',
-        resource: this.id,
-        decision: 'denied',
-        reason,
-      });
-      args.abort(reason);
-    }
-    this.#audit?.record({
-      actor,
-      action: 'agent.input.authorize',
-      resource: this.id,
-      decision: 'allowed',
+    authorizeActor({
+      allowedRoles: this.#allowedRoles,
+      audit: this.#audit,
+      resource: this.#resource,
+      requestContext: args.requestContext,
+      resolveActor: () => this.#getActor(args),
+      deny: (reason) => args.abort(reason),
     });
     return args.messages;
   }

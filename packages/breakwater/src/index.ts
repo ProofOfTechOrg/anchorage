@@ -2,15 +2,28 @@
 // @proofoftech/breakwater — Safety middleware for Mastra
 //
 // breakwater plugs into Mastra as processors and tool/workflow wrappers:
-// 1. Policy engine — pre/post gates around the agent's model call
-// 2. RBAC + audit — 5 roles, actor authorization, structured audit log
-// 3. Connector SDK — enforced permission manifests: side-effect
+// 1. Guarded agent — narrow execution with mandatory RBAC and policy ordering
+// 2. Policy engine — pre/post gates around the agent's model call
+// 3. RBAC + audit — 5 roles, actor authorization, structured audit log
+// 4. Connector SDK — enforced permission manifests: side-effect
 //    classification, network egress, write-approval gates, idempotent replay
-// 4. Agent CLI adapters — Claude Code / Codex as approval-gated connectors
+// 5. Agent CLI adapters — Claude Code / Codex as approval-gated connectors
 //    (Node-only at execution time)
 //
 // These are Mastra Processor implementations plus tool/workflow wrappers, not a custom runtime.
 
+export type {
+  GuardedAgentCallOptions,
+  GuardedAgentConfig,
+  GuardedAgentHandle,
+  GuardedInputProcessor,
+  GuardedOutputProcessor,
+  GuardedToolChoice,
+} from './agent/index.js';
+export {
+  createGuardedAgent,
+  isGuardedAgentHandle,
+} from './agent/index.js';
 export type {
   AgentCliConnectorOptions,
   AgentCliDefinition,
@@ -30,12 +43,14 @@ export {
   createCodexConnector,
 } from './agent-cli/index.js';
 export type {
+  AgentAuditContext,
   AuditEvent,
   AuditLoggerOptions,
   AuditSink,
   MetricsRecorder,
 } from './audit/index.js';
 export {
+  AGENT_AUDIT_CONTEXT_KEY,
   AuditLogger,
   combineAuditSinks,
   metricsAuditSink,

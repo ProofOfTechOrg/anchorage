@@ -16,6 +16,7 @@ import type {
   ApprovalRecord,
 } from '../approval-api/index.js';
 import type { RunSummary } from '../do-runner/index.js';
+import type { ResumeRunFn } from './approval-bridge.js';
 import {
   createFlowsafeWorker,
   type FlowsafeWorkerConfig,
@@ -228,6 +229,48 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     // #then
     expect(list.status).toBe(200);
     expect(await list.json()).toEqual([]);
+  });
+
+  it('mounts the agent router after preRoutes and before the signal router', async () => {
+    const order: string[] = [];
+    const worker = makeWorker({
+      preRoutes: async () => {
+        order.push('pre');
+        return null;
+      },
+      buildAgentRouter: () => async () => {
+        order.push('agent');
+        return new Response('agent', { status: 299 });
+      },
+      buildSignalRouter: () => async () => {
+        order.push('signal');
+        return new Response('signal', { status: 298 });
+      },
+    });
+    const { env, ctx } = makeEnv();
+
+    const response = await worker.fetch(authed('http://host/agents'), env, ctx);
+
+    expect(response.status).toBe(299);
+    expect(order).toEqual(['pre', 'agent']);
+  });
+
+  it('uses buildResumeRun while constructing the request-scoped approval service', async () => {
+    const buildResumeRun = vi.fn(
+      (fallback: ResumeRunFn, _env: FlowsafeWorkerEnv) => fallback,
+    );
+    const worker = makeWorker({ buildResumeRun });
+    const { env, ctx } = makeEnv();
+
+    const response = await worker.fetch(
+      authed('http://host/api/approvals'),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(200);
+    expect(buildResumeRun).toHaveBeenCalledOnce();
+    expect(buildResumeRun.mock.calls[0]?.[1]).toBe(env);
   });
 
   it('applies wrapResolve to the resolver both routers use', async () => {

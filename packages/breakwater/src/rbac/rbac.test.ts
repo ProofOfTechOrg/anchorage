@@ -5,7 +5,7 @@ import type { ProcessInputArgs } from '@mastra/core/processors';
 import { RequestContext } from '@mastra/core/request-context';
 import { describe, expect, it } from 'vitest';
 
-import { AuditLogger } from '../audit/index.js';
+import { AGENT_AUDIT_CONTEXT_KEY, AuditLogger } from '../audit/index.js';
 import { ACTOR_CONTEXT_KEY, type Actor, RBACMiddleware } from './index.js';
 
 class Tripwire extends Error {}
@@ -65,6 +65,29 @@ describe('RBACMiddleware', () => {
       actor: OPERATOR,
       resource: 'breakwater-rbac',
     });
+  });
+
+  it('uses a configured resource and safe request correlation', () => {
+    const audit = new AuditLogger();
+    const rbac = new RBACMiddleware({
+      allowedRoles: ['operator'],
+      audit,
+      resource: 'agent:writer',
+    });
+    const args = makeInputArgs({ contextValue: OPERATOR });
+    args.requestContext?.set(AGENT_AUDIT_CONTEXT_KEY, {
+      agentId: 'writer',
+      entryPath: 'http-start',
+      prompt: 'private prompt',
+    });
+
+    rbac.processInput(args);
+
+    expect(audit.events()[0]).toMatchObject({
+      resource: 'agent:writer',
+      detail: { agentId: 'writer', entryPath: 'http-start' },
+    });
+    expect(JSON.stringify(audit.events())).not.toContain('private prompt');
   });
 
   it('allows the builder and reviewer roles when listed', () => {
@@ -127,6 +150,8 @@ describe('RBACMiddleware', () => {
       42,
       'admin',
       { id: 'x' },
+      { id: '', role: 'admin' },
+      { id: '   ', role: 'admin' },
       { id: 'x', role: 'superuser' },
     ];
 
@@ -148,6 +173,17 @@ describe('RBACMiddleware', () => {
 
     // #when / #then
     expect(rbac.processInput(args)).toBe(args.messages);
+  });
+
+  it('fails closed when a custom actor source returns a malformed actor', () => {
+    const rbac = new RBACMiddleware({
+      allowedRoles: ['reviewer'],
+      getActor: () => ({ id: '   ', role: 'reviewer' }),
+    });
+
+    expect(() => rbac.processInput(makeInputArgs())).toThrowError(
+      /no actor in request context/,
+    );
   });
 
   it('records an error audit event and rethrows when getActor throws', () => {

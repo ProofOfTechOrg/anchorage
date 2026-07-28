@@ -16,7 +16,7 @@ tool's own execution path.
 | Layer | Responsibility in this repository |
 | --- | --- |
 | Mastra | Agents, processors, tools, workflows, request context, suspension, and storage interfaces |
-| breakwater | Agent-turn RBAC, content policy, connector manifests and gates, guarded fetch, replay/rate stores, and decision audit |
+| breakwater | Guarded agent construction, agent-turn RBAC, content policy, connector manifests and gates, guarded fetch, replay/rate stores, and decision audit |
 | flowsafe | Authenticated tenant context, Durable Object execution, D1 persistence, approval records, grant derivation, long-running agents, retention, and offboarding |
 
 Several controls are composed across these layers. For example, Mastra pauses a
@@ -28,7 +28,21 @@ write.
 
 ### Agent-turn authorization
 
-`RBACMiddleware` is a Mastra input processor. It accepts five role labels:
+`createGuardedAgent()` is the supported in-process boundary for protected agent execution. It accepts construction-time agent configuration instead of an existing raw `Agent`, then returns a narrow handle with unstructured `generate()` and `stream()` methods.
+
+The factory fixes the step budget and tool choice, requires an audit logger, forces streaming policy hold-back, and disables agent background continuations. A call must include trusted `requestContext`; the only other accepted keys are `runId`, `memory`, and `abortSignal`. Unknown keys fail even when their value is `undefined`.
+
+The direct path authorizes before application processors run. Durable preparation lists the same gates in this order:
+
+```text
+RBAC -> application input -> policy input
+model and tools
+application output -> policy output
+```
+
+Only initial-input application processors and stream-plus-result output processors are accepted. The factory rejects workflows, post-input mutation hooks, incomplete output enforcement, and mandatory processor IDs claimed by application code.
+
+`RBACMiddleware` implements the same authorization check as a Mastra input processor. It accepts five role labels:
 `admin`, `builder`, `operator`, `reviewer`, and `viewer`. Its default lookup
 reads an `{ id, role }` actor from the `breakwater.actor` request-context key.
 A custom `getActor` can adapt another trusted host source.
@@ -41,9 +55,9 @@ It uses an exact per-agent allowlist. There is no role inheritance. A missing,
 malformed, disallowed, or throwing actor lookup fails closed and can be
 audited.
 
-The middleware does not authenticate a request, choose a tenant, authorize an
-HTTP workflow route, or decide an approval record. Install it on every agent
-that needs this boundary.
+The middleware and guarded handle do not authenticate a request, choose a tenant, authorize an HTTP route, or decide an approval record. Use the authenticated Flowsafe agent host across HTTP and tenant boundaries.
+
+The handle is a trusted in-process API. It reduces accidental bypass by hiding raw Mastra execution methods, but it does not isolate hostile code in the same JavaScript process. Same-process code can still inspect objects, patch globals, or import Mastra directly.
 
 ### Input and output policy
 
@@ -159,9 +173,9 @@ optional structured detail. It has an in-memory ring and an optional sink.
 `combineAuditSinks()` fans out events, and `metricsAuditSink()` adapts decisions
 to counters and duration histograms.
 
-The in-memory ring is not durable. Use the flowsafe queue exporter or another
-sink for production evidence. Do not place secrets in connector ids, policy
-names, idempotency keys, or custom audit detail.
+Guarded RBAC and policy events use `agent:<agentId>` as their resource. A trusted host can set `breakwater.auditContext` with scalar agent, tenant, run, thread, resource, and entry-path correlation. Breakwater ignores every other property and lets decision-specific policy or channel detail win on collision.
+
+The in-memory ring is not durable. Use the flowsafe queue exporter or another sink for production evidence. Do not place secrets in connector IDs, policy names, idempotency keys, or custom audit detail.
 
 ### Coding-agent connectors
 
@@ -182,7 +196,7 @@ checkout, container, or remote executor. See
 | --- | --- |
 | Is an HTTP caller authenticated and tenant-valid? | Application or flowsafe host |
 | May a role start this workflow? | Flowsafe run router and `WorkflowMeta.allowedRoles` |
-| May a role begin this agent turn? | Installed breakwater `RBACMiddleware` |
+| May a role begin this agent turn? | Breakwater guarded preauthorization and `RBACMiddleware` |
 | May an actor decide this approval? | Flowsafe `ApprovalService` |
 | Does a connector require approval? | Breakwater manifest and organization policy |
 | Does this exact leg have a valid grant? | Breakwater check over a flowsafe-derived context |
@@ -209,7 +223,7 @@ A production deployment must satisfy these conditions:
 
 1. Authenticate callers before minting actor, tenant, workflow, or isolation
    context.
-2. Install processors on every agent path that needs them.
+2. Construct protected agents through `createGuardedAgent()`.
 3. Wrap side-effecting tools with `createConnector()`.
 4. Keep reserved request-context keys server-only.
 5. Use shared D1 stores when a rate or replay guarantee must span isolates.

@@ -173,8 +173,44 @@ describe('PolicyEngine', () => {
     ).rejects.toThrowError(/deny-patterns: matched blocked pattern/);
     expect(audit.events()[0]).toMatchObject({
       decision: 'denied',
+      reason: 'policy denied',
       detail: { policy: 'deny-patterns' },
     });
+  });
+
+  it('never copies evaluator reasons or blocked patterns into audit events', async () => {
+    const sentinel = 'sk_live_audit-must-not-contain-this';
+    const evaluatorAudit = new AuditLogger();
+    const evaluator = new PolicyEngine({
+      policies: [
+        {
+          name: 'opaque-denial',
+          evaluate: () => ({
+            allowed: false,
+            reason: `prompt contained ${sentinel}`,
+          }),
+        },
+      ],
+      audit: evaluatorAudit,
+    });
+    const patternAudit = new AuditLogger();
+    const pattern = new PolicyEngine({
+      policies: [denyPatterns([sentinel])],
+      audit: patternAudit,
+    });
+
+    await expect(
+      evaluator.processInput(makeInputArgs(sentinel)),
+    ).rejects.toThrow(sentinel);
+    await expect(pattern.processInput(makeInputArgs(sentinel))).rejects.toThrow(
+      sentinel,
+    );
+
+    expect(evaluatorAudit.events()[0]?.reason).toBe('policy denied');
+    expect(patternAudit.events()[0]?.reason).toBe('policy denied');
+    expect(
+      JSON.stringify([...evaluatorAudit.events(), ...patternAudit.events()]),
+    ).not.toContain(sentinel);
   });
 
   it('attributes audit events to the actor from requestContext', async () => {

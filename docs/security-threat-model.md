@@ -44,6 +44,8 @@ The Worker must authenticate the request, validate actor and tenant claims, enfo
 
 The library supplies verifier and router seams, not an identity provider. A static bearer map in the reference deployment is an inspectable example, not production identity guidance.
 
+The guarded agent router resolves route syntax, authenticates, resolves the server catalog, checks stored tenant/agent/thread/run bindings, authorizes mutations, validates input, then invokes the trusted topology. This order prevents a disallowed role from using error differences to enumerate foreign agents or runs.
+
 ### Worker to request context
 
 Breakwater context keys are capabilities or trusted namespace claims:
@@ -59,7 +61,9 @@ breakwater.isolationScope
 
 Only trusted host/runtime code may populate actor, grant, workflow, or tenant isolation values. Idempotency keys and dry-run selection may originate from authorized application logic, but must not overwrite the other keys.
 
-Flowsafe constructs base runtime context after request data has been validated. Schedules reject reserved namespaces on write and spread runtime-derived keys after stored keys.
+Flowsafe's shared execution-context boundary reserves every `breakwater.*` key, `mastra:goal`, `runId`, `threadId`, `resourceId`, `__proto__`, `constructor`, and `prototype`. External HTTP bodies reject these fields. Persisted compatibility paths strip them before trusted derivation.
+
+Trusted merges apply sanitized external or stored context first, then workflow and isolation scope, the exact-leg connector grant, and trusted actor/audit correlation. An empty connector grant overwrites any stale value.
 
 ### Worker to Durable Object
 
@@ -101,6 +105,8 @@ The supported adapter avoids a shell, separates prompt from flags, bounds time/o
 Approval notifications and live events can carry a full `ApprovalRecord`, including reviewer context. Send them only to a tenant-confidential channel or project a lower-sensitivity shape.
 
 Stream tickets authorize an address for a short period. They do not carry a connector grant. The Worker verifies them and each target object rebinds identity.
+
+Agent observation uses Bearer-authenticated newline-delimited JSON. Its offset cursor reconnects only while Mastra's configured replay cache survives. Durable status remains authoritative; the default in-memory event replay does not survive process restart.
 
 Audit events can contain actor, workflow, run, tenant, connector, and denial metadata. Queue export deliberately co-batches tenants; the SIEM must enforce its own access policy.
 
@@ -148,6 +154,8 @@ The trusted suspension bridge records:
 
 `approvalGrantProvider()` reads only approved records and requires an exact match on the current leg. The runtime-owned resume count distinguishes repeated same-step suspensions even when timestamps collide.
 
+An agent resume target contains the agent, thread, resource, and original authorized principal. A reviewer decision resumes execution as that principal after current catalog-role validation; the reviewer cannot replace it. Legacy agent approvals without this principal fail closed.
+
 An explicit trusted `runScoped: true` record is a standing grant. A step-less record without that flag grants nothing.
 
 The HTTP create route is disabled by default and cannot set connectors, attribution, fingerprint, run scope, or resume target when enabled.
@@ -173,11 +181,13 @@ A host with only one human reviewer must consciously choose availability or sepa
 | Old approval reused at another gate | Exact step, `suspendedAt`, and `resumeCount` match | Trusted run-scoped grants intentionally span legs |
 | Reviewer races another reviewer | Store CAS and terminal-state immutability | Batch decisions are partial, not globally transactional |
 | Reviewer approves their own action | Requester and cross-gate history checks | Explicit exemptions weaken this control |
-| Approval resume fails after commit | Decision stays durable; trusted redrive/prepare path | Operator may need to redrive; no automatic rollback |
+| Approval resume fails after commit | Decision stays durable; trusted redrive/registry rehydration invokes only RBAC's initial `processInput` hook, then restores complete processor lists for resumed loop hooks | Operator may need to redrive; no automatic rollback |
 | Foreign approval id read or changed | Tenant-bound store predicates and 404 | A verifier that assigns the wrong tenant defeats the boundary |
 | Foreign run or thread reached | Exact prefix ownership, topology check, DO identity check, 404 | Raw namespace access outside exported topology is unsupported |
+| Foreign or mismatched agent binding reached | Server catalog plus persisted thread/run/agent binding checks before mutation authorization | Raw namespace access outside the agent topology is unsupported |
 | Client smuggles memory id | Recursive body rejection and server minters | Application-specific aliases must not bypass the minter |
 | Schedule row plants grant/context | Reserved-key rejection and runtime-last merge | Direct database writers remain part of the trusted computing base |
+| Reviewer becomes agent execution principal | Persist original requester in the approval target and recheck current catalog roles on resume | The stored principal is an authorization snapshot, not a dynamic identity-provider lookup |
 | Webhook claims victim tenant | Verify raw bytes first; tenant from subscription row | Provider secret compromise can forge provider events |
 | Provider alarm lost after subscription | Post-commit reconcile callback and retryable mutation-applied response | Hosts that omit reconciliation must arm polling themselves |
 | Duplicate connector side effect | Atomic idempotency lease and shared store | Poor business keys or too-short pending TTL can still duplicate |
@@ -193,6 +203,15 @@ A host with only one human reviewer must consciously choose availability or sepa
 | Audit sink outage blocks agent | Sink failure containment and ring buffer | In-memory buffer is not durable and can drop old events |
 | Notification exposes reviewer payload | Host projection obligation | Flowsafe cannot know the trust level of a transport |
 | Stream ticket replay | Short TTL, HMAC, address binding, Worker verification | Ticket in logs or browser history is usable until expiry |
+| Agent event replay requested after restart | Return 409 and direct the client to durable status | Event history is available only for the configured cache window |
+
+## Guarded agent boundary
+
+`createGuardedAgent()` fixes RBAC, policy, execution limits, tool choice, and application processor ordering at construction. Its public handle exposes only unstructured `generate()` and `stream()` calls with a mandatory `RequestContext`.
+
+The handle rejects unknown call options even when a key is present with `undefined`. It disables background continuations, forces policy hold-back, and keeps the raw Mastra agent package-private. Flowsafe validates an unforgeable package-local brand before accepting a catalog module.
+
+This boundary protects trusted application code from accidental or unsupported invocation paths. It is not a sandbox against hostile code running in the same process; such code can import Mastra, construct another agent, access host credentials, or bypass the supported HTTP topology.
 
 ## RBAC model
 

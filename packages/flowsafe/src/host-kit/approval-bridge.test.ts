@@ -325,6 +325,56 @@ describe('resumeRunWithRequeue', () => {
     expect(await store.list({ status: 'pending' })).toHaveLength(0);
   });
 
+  it('keeps the original agent principal across a reviewer-driven re-suspension', async () => {
+    const store = new InMemoryApprovalStore('acme');
+    const base: ResumeRunFn = async () =>
+      suspendedSummary('acme_run-agent', 'gate2', ['connector'], 2020, 1);
+    const service: ApprovalService = new ApprovalService({
+      store,
+      resumeRun: resumeRunWithRequeue(base, () => service, SYSTEM),
+    });
+    const { record } = await service.create(
+      {
+        workflowId: 'durable-agentic-loop',
+        runId: 'acme_run-agent',
+        stepPath: ['gate1'],
+        suspendedAt: 1010,
+        title: 'Approve agent action',
+        connectors: ['connector'],
+        requestedBy: 'starter',
+      },
+      SYSTEM,
+      {
+        kind: 'agent-thread',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+        principal: {
+          id: 'starter',
+          role: 'operator',
+          tenantId: 'acme',
+        },
+      },
+    );
+
+    await service.decide(record.id, { decision: 'approve' }, REVIEWER);
+
+    const open = await store.list({ status: 'pending' });
+    expect(open).toHaveLength(1);
+    expect(open[0]).toMatchObject({
+      stepPath: ['gate2'],
+      requestedBy: 'starter',
+      resumeTarget: {
+        kind: 'agent-thread',
+        principal: {
+          id: 'starter',
+          role: 'operator',
+          tenantId: 'acme',
+        },
+      },
+    });
+  });
+
   it('fails closed: refuses to re-queue a suspension with no decider', async () => {
     // #given — the wrapper invoked directly with a record lacking decidedBy
     const store = new InMemoryApprovalStore('acme');
@@ -464,6 +514,45 @@ describe('reconcileApprovalsForSummary', () => {
     expect(filed.every((record) => record.requestedBy === SYSTEM.id)).toBe(
       true,
     );
+  });
+
+  it('uses an explicitly recovered agent principal for reconcile attribution', async () => {
+    const store = new InMemoryApprovalStore('acme');
+    const service = new ApprovalService({ store });
+    const summary = suspendedSummary(
+      'acme_agent-reconcile',
+      'gate',
+      ['connector'],
+      333,
+    );
+
+    const filed = await reconcileApprovalsForSummary(
+      service,
+      'durable-agentic-loop',
+      summary,
+      SYSTEM,
+      {
+        kind: 'agent-thread',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+        principal: {
+          id: 'starter',
+          role: 'operator',
+          tenantId: 'acme',
+        },
+      },
+      'starter',
+    );
+
+    expect(filed).toHaveLength(1);
+    expect(filed[0]).toMatchObject({
+      requestedBy: 'starter',
+      resumeTarget: {
+        kind: 'agent-thread',
+        principal: { id: 'starter' },
+      },
+    });
   });
 
   it('does not file when a PENDING record already matches the current fingerprint', async () => {

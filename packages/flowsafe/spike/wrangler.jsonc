@@ -4,6 +4,12 @@
   "main": "./worker.ts",
   "compatibility_date": "2025-06-01",
   "compatibility_flags": ["nodejs_compat"],
+  // Keep every import of the guarded-agent brand on one module instance. The
+  // spike typechecks against Breakwater source before package builds exist,
+  // while package subpath imports otherwise resolve to dist during bundling.
+  "alias": {
+    "@proofoftech/breakwater/agent": "../../breakwater/src/agent/index.ts"
+  },
   "durable_objects": {
     "bindings": [
       { "name": "RUNNER", "class_name": "DemoRunner" },

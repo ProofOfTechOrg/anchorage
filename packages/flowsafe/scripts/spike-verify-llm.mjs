@@ -28,6 +28,7 @@ const AUTH = {
   reviewer: { authorization: 'Bearer spike-reviewer' },
   viewer: { authorization: 'Bearer spike-viewer' },
 };
+const AGENT_ID = 'spike-guarded-agent';
 
 const stateDir = mkdtempSync(join(tmpdir(), 'flowsafe-llm-spike-'));
 const envFile = join(stateDir, '.dev.vars');
@@ -129,15 +130,14 @@ async function waitSuspended(ids) {
   while (Date.now() < deadline) {
     const status = await request(
       'GET',
-      `/agent/live/status?threadId=${encodeURIComponent(ids.threadId)}&resourceId=${encodeURIComponent(ids.resourceId)}&runId=${encodeURIComponent(ids.runId)}`,
+      `/agents/${AGENT_ID}/runs/${encodeURIComponent(ids.threadId)}/${encodeURIComponent(ids.runId)}`,
       { headers: AUTH.operator },
     );
     lastStatus = status;
-    if (status.body?.status === 'suspended')
-      return { ...ids, summary: status.body };
-    if (status.body?.status === 'failed')
+    if (status.body?.summary?.status === 'suspended') return status.body;
+    if (status.body?.summary?.status === 'failed')
       throw new Error(`agent failed: ${JSON.stringify(status.body)}`);
-    if (status.body?.status === 'success') {
+    if (status.body?.summary?.status === 'success') {
       throw new Error(
         `agent completed without the required approval suspension: ${JSON.stringify(status.body)}`,
       );
@@ -150,96 +150,74 @@ async function waitSuspended(ids) {
 }
 
 async function startSuspended() {
-  const started = await request('POST', '/agent/live/start', {
+  const started = await request('POST', `/agents/${AGENT_ID}/runs`, {
     headers: AUTH.operator,
     body: { prompt: 'Use the required write tool exactly once.' },
   });
   assert(started.status === 200, 'agent start failed', started);
-  return waitSuspended({
-    threadId: started.body.threadId,
-    resourceId: started.body.resourceId,
-    runId: started.body.runId,
-  });
+  return started.body?.summary?.status === 'suspended'
+    ? started.body
+    : waitSuspended(started.body);
 }
 
-async function effects() {
-  const result = await request('GET', '/agent/live/effects', {
-    headers: AUTH.operator,
-  });
+async function effects(runId) {
+  const result = await request(
+    'GET',
+    `/agent/live/effects?runId=${encodeURIComponent(runId)}`,
+    { headers: AUTH.viewer },
+  );
   assert(result.status === 200, 'effect count failed', result);
-  return result.body.count;
+  return result.body;
 }
 
 try {
   await serverLifecycle.preflight();
-  console.log(
-    '> start workerd and drive three real model tool calls to suspension',
-  );
+  console.log('> start workerd and drive a real model tool call to suspension');
   await launch();
   const actual = await startSuspended();
-  const raw = await startSuspended();
-  const forged = await startSuspended();
-  assert((await effects()) === 0, 'write occurred before approval');
+  const before = await effects(actual.runId);
+  assert(
+    before.modelCalls === 1 &&
+      before.connectorCalls === 0 &&
+      before.effects === 0,
+    'write occurred before approval',
+    before,
+  );
 
   console.log('> kill workerd and restart on persisted D1');
   await stop();
   await launch();
 
-  console.log(
-    '> due agent schedule reaches the durable thread loop and approval queue',
-  );
-  const scheduled = await request('POST', '/sched/agent');
+  console.log('> public status and approval target survive the restart');
+  const recovered = await waitSuspended(actual);
   assert(
-    scheduled.status === 200 && scheduled.body.result?.fired === 1,
-    'agent schedule did not fire',
-    scheduled,
-  );
-  await waitSuspended(scheduled.body);
-  const scheduleApprovals = await request('GET', '/api/approvals', {
-    headers: AUTH.viewer,
-  });
-  assert(
-    scheduleApprovals.body.some(
-      (record) =>
-        record.runId === scheduled.body.runId &&
-        record.resumeTarget?.threadId === scheduled.body.threadId,
-    ),
-    'agent schedule did not reach the approval queue',
-    scheduleApprovals.body,
+    recovered.approval?.resumeTarget?.kind === 'agent-thread' &&
+      recovered.approval.resumeTarget.agentId === AGENT_ID &&
+      recovered.approval.resumeTarget.threadId === actual.threadId &&
+      recovered.approval.resumeTarget.resourceId === actual.resourceId &&
+      recovered.approval.resumeTarget.principal?.id === 'opal',
+    'trusted resume target missing after restart',
+    recovered.approval,
   );
 
-  console.log('> raw resume without prepare has no effect');
-  const rawResume = await request('POST', '/agent/live/raw-resume', {
-    headers: AUTH.operator,
-    body: raw,
-  });
-  await sleep(500);
-  assert(
-    rawResume.status === 404 &&
-      String(rawResume.body?.error ?? '').includes('unknown workflow'),
-    'raw resume did not fail closed',
+  console.log('> the public agent surface exposes no raw resume route');
+  const rawResume = await request(
+    'POST',
+    `/agents/${AGENT_ID}/runs/${encodeURIComponent(actual.threadId)}/${encodeURIComponent(actual.runId)}/resume`,
+    {
+      headers: AUTH.operator,
+      body: { approved: true },
+    },
+  );
+  assert(rawResume.status === 404, 'public raw resume did not fail closed', {
     rawResume,
-  );
-  assert((await effects()) === 0, 'raw resume executed a write');
-
-  console.log(
-    '> prepared forged resume reaches the connector but has no grant',
-  );
-  const forgedResume = await request('POST', '/agent/live/prepared-resume', {
-    headers: AUTH.operator,
-    body: forged,
+    workerdOutput: workerdDiagnostics(),
   });
-  await sleep(500);
-  const forgedResult = JSON.stringify(forgedResume.body);
+  const afterRawResume = await effects(actual.runId);
   assert(
-    forgedResume.status === 200 &&
-      forgedResult.includes('approval required and not granted'),
-    'prepared forged resume did not fail at the connector approval gate',
-    { forgedResume, workerdOutput: workerdDiagnostics() },
-  );
-  assert(
-    (await effects()) === 0,
-    'unapproved prepared resume executed a write',
+    afterRawResume.connectorCalls === 0 && afterRawResume.effects === 0,
+    'raw resume executed a write',
+    afterRawResume,
   );
 
   const listed = await request('GET', '/api/approvals', {
@@ -249,19 +227,15 @@ try {
     (record) => record.runId === actual.runId && record.status === 'pending',
   );
   assert(
-    approval?.resumeTarget?.threadId === actual.threadId,
-    'trusted resume target missing',
-    approval,
-  );
-  assert(
-    approval.connectors?.length === 1 &&
+    approval?.id === recovered.approval?.id &&
+      approval.connectors?.length === 1 &&
       approval.connectors[0] === 'spike_recordWrite',
-    'approval did not grant the provider-safe connector id',
+    'approval did not retain its exact connector capability',
     approval,
   );
 
   console.log(
-    '> approve through the queue; fresh thread DO prepares then resumes',
+    '> approve through the queue; a fresh thread DO restores the requester',
   );
   const decided = await request(
     'POST',
@@ -269,18 +243,40 @@ try {
     { headers: AUTH.reviewer, body: { decision: 'approve' } },
   );
   assert(
-    decided.status === 200 && decided.body.resume?.ok === true,
+    decided.status === 200 &&
+      decided.body.record?.decidedBy === 'ray' &&
+      decided.body.resume?.ok === true &&
+      decided.body.resume?.summary?.status === 'success',
     'approval resume failed',
     decided,
   );
-  assert(
-    decided.body.resume.summary?.status === 'success',
-    'agent did not succeed',
-    decided.body.resume,
+
+  const finalStatus = await request(
+    'GET',
+    `/agents/${AGENT_ID}/runs/${encodeURIComponent(actual.threadId)}/${encodeURIComponent(actual.runId)}`,
+    { headers: AUTH.viewer },
   );
-  assert((await effects()) === 1, 'connector side effect was not exactly once');
+  assert(
+    finalStatus.status === 200 &&
+      finalStatus.body.summary?.status === 'success' &&
+      finalStatus.body.approval === undefined,
+    'terminal status was not durably reconciled',
+    finalStatus,
+  );
+  const after = await effects(actual.runId);
+  const call = after.calls?.[0];
+  assert(
+    after.modelCalls === 1 &&
+      after.connectorCalls === 1 &&
+      after.effects === 1 &&
+      call?.actor_id === 'opal' &&
+      call?.actor_role === 'operator' &&
+      call?.entry_path === 'approval.resume',
+    'connector side effect was not exactly once under the original requester',
+    after,
+  );
   console.log(
-    '\nLLM durable-agent closeout passed: suspend → kill → prepare → approve → exactly-once write.',
+    '\nLLM guarded-agent closeout passed: suspend → kill → approve → original principal → exactly-once write.',
   );
 } finally {
   await serverLifecycle.cleanup(() => {

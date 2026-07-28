@@ -23,3 +23,6 @@ export const THREAD_TENANT_HEADER = 'x-flowsafe-tenant';
 
 /** The trusted Worker-stamped actor that caused a thread operation. */
 export const THREAD_ACTOR_HEADER = 'x-flowsafe-actor';
+
+/** The trusted Worker-stamped role of the actor causing a thread operation. */
+export const THREAD_ACTOR_ROLE_HEADER = 'x-flowsafe-role';

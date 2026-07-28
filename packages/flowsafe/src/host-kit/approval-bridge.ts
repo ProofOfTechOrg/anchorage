@@ -182,12 +182,16 @@ export function resumeRunWithRequeue(
           'resumeRunWithRequeue: decidedBy unset — refusing to re-queue an approval without a requester',
         );
       }
+      const requestedBy =
+        record.resumeTarget?.kind === 'agent-thread'
+          ? record.resumeTarget.principal.id
+          : record.decidedBy;
       try {
         await queueApprovalForSuspension(
           getService(),
           record.workflowId,
           summary,
-          record.decidedBy,
+          requestedBy,
           systemActor,
           record.resumeTarget,
         );
@@ -289,14 +293,11 @@ async function listAllApprovals(
  *
  * Delegates the actual filing to queueApprovalForSuspension against a copy of
  * `summary` narrowed to only the healed paths, so a step with a live or
- * in-flight record is never touched. `requestedBy` on a reconciled record is
- * the SYSTEM actor, not a human: on the re-queue-failure trigger a reviewer
- * DID cause the suspension, but reconcile has only the RunSummary to work
- * from and no reliable way to recover who — so it attributes to the system
- * actor rather than guess (see the SoD note in retention.ts and the
- * operations runbook). That is a deliberate, narrow SoD relaxation on this
- * recovery path only: the gate-A decider MAY legally decide the reconciled
- * gate B, same as the retention-purge recovery path.
+ * in-flight record is never touched. `requestedBy` defaults to the SYSTEM
+ * actor because generic workflow reconciliation cannot reliably recover the
+ * initiating principal. Agent hosts persist the original requester and pass
+ * that id explicitly so separation of duties survives eviction and filing
+ * retries.
  */
 export async function reconcileApprovalsForSummary(
   service: ApprovalService,
@@ -304,6 +305,7 @@ export async function reconcileApprovalsForSummary(
   summary: RunSummary,
   systemActor: ApprovalActor,
   resumeTarget?: ApprovalResumeTarget,
+  requestedBy = systemActor.id,
 ): Promise<ApprovalRecord[]> {
   const suspended = summary.suspended ?? [];
   if (suspended.length === 0) return [];
@@ -348,7 +350,7 @@ export async function reconcileApprovalsForSummary(
     service,
     workflowId,
     { ...summary, suspended: toFile },
-    systemActor.id,
+    requestedBy,
     systemActor,
     resumeTarget,
   );

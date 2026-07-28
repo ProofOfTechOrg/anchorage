@@ -1,6 +1,6 @@
 {
   "name": "@proofoftech/breakwater",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "publishConfig": {
     "access": "public"
   },
@@ -28,6 +28,7 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": "./dist/index.js",
+    "./agent": "./dist/agent/index.js",
     "./policy-engine": "./dist/policy-engine/index.js",
     "./rbac": "./dist/rbac/index.js",
     "./audit": "./dist/audit/index.js",
