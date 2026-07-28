@@ -1,5 +1,11 @@
 # @proofoftech/breakwater
 
+## 0.6.0
+
+### Minor Changes
+
+- 09a4406: Add guarded Breakwater agents and Flowsafe's authenticated, catalog-driven agent host. Agent starts now derive trusted identity and execution context, agent resumes require an approval-bound capability, and status and NDJSON observation remain tenant-bound.
+
 ## 0.5.0
 
 ### Minor Changes
