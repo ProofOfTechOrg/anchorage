@@ -24,6 +24,7 @@
     "test:packed-breakwater": "pnpm --filter @proofoftech/breakwater test:packed-consumer",
     "test:packed-flowsafe-agent-host": "pnpm --filter @proofoftech/flowsafe test:agent-host-export",
     "test:release-order": "node --test scripts/publish-ordered.test.mjs",
+    "test:release-invocation": "node scripts/publish-invocation-check.mjs",
     "release:publish": "node scripts/publish-ordered.mjs",
     "react-doctor": "pnpm --filter showcase react-doctor",
     "react-doctor:diff": "pnpm --filter showcase react-doctor:diff",
