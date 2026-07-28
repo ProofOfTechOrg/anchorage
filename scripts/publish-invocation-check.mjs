@@ -14,6 +14,12 @@
 // with no credentials, and it is also the limit: this cannot catch
 // authentication, scope permissions, provenance/OIDC, or an already-published
 // version. Those remain first-run-on-main risks, and all of them fail loudly.
+//
+// It also covers only PUBLISH_PREREQUISITES, not the `changeset publish`
+// remainder, which has no dry-run of its own. Accepted deliberately: that
+// command was the release workflow's direct `publish:` input before 09a4406 and
+// published from main repeatedly, so only the wrapper around it is new, and the
+// wrapper passes it no arguments. Revisit if the remainder ever grows flags.
 
 import {
   command,
