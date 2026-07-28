@@ -15,8 +15,8 @@ import {
   type ApprovalRecord,
   ApprovalService,
   approvedConnectorsForLeg,
-  type ExecutionPrincipal,
   InMemoryApprovalStore,
+  trustAutomationPrincipal,
 } from '../approval-api/index.js';
 import type { RunSummary } from '../do-runner/index.js';
 // requestedConnectors is module-internal (not on the barrel): it is the
@@ -29,12 +29,12 @@ import {
   resumeRunWithRequeue,
 } from './index.js';
 
-const SYSTEM: ExecutionPrincipal = {
+const SYSTEM = trustAutomationPrincipal({
   kind: 'system',
   id: 'sys',
   tenantId: 'acme',
   purpose: 'test-reconcile',
-};
+});
 const REVIEWER: ApprovalActor = {
   id: 'ray',
   role: 'reviewer',

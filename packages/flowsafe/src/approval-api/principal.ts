@@ -88,11 +88,52 @@ export type ExecutionPrincipal =
       delegatedBy?: never;
     };
 
-export class ExecutionPrincipalError extends Error {
-  constructor(message: string) {
-    super(`execution principal: ${message}`);
-    this.name = 'ExecutionPrincipalError';
+/**
+ * The trusted-automation brand, following the TENANT_BOUND idiom for the same
+ * reason: TypeScript is structural, so a parameter typed plain
+ * `ExecutionPrincipal` is satisfied by any object literal. Without this, the
+ * service's automated entries authorize on the CALLER'S OWN ASSERTION that it
+ * is a robot — which would give automation strictly more create authority than
+ * a human `viewer`.
+ *
+ * The symbol is exported because declaration emit cannot reference a
+ * module-private name from an exported type. The residual is the same one
+ * TENANT_BOUND accepts and is grep-visible: forging requires
+ * `import { TRUSTED_AUTOMATION }` plus stamping it, a deliberate TCB bypass on
+ * par with an `as` cast. What it eliminates is accidental satisfaction and the
+ * rushed fix that hands a request-derived principal to a trusted entry.
+ */
+export const TRUSTED_AUTOMATION: unique symbol = Symbol(
+  'flowsafe.trustedAutomation',
+);
+
+/**
+ * An automated principal that trusted platform code vouched for. The only kind
+ * accepted by `ApprovalService.createAsPrincipal` and
+ * `supersedeStaleAsPrincipal`.
+ */
+export type TrustedAutomationPrincipal = Extract<
+  ExecutionPrincipal,
+  { kind: AutomatedPrincipalKind }
+> & { readonly [TRUSTED_AUTOMATION]: true };
+
+/**
+ * Vouch for an automated principal. Calling this IS the trust assertion, which
+ * is why it is a named function rather than a cast: it should be greppable, and
+ * it should never appear on a path that took the principal from a request.
+ *
+ * Throws on a human or a malformed principal — those must use the
+ * role-authorized entries.
+ */
+export function trustAutomationPrincipal(
+  principal: ExecutionPrincipal,
+): TrustedAutomationPrincipal {
+  if (!isExecutionPrincipal(principal) || principal.kind === 'human') {
+    throw new Error(
+      'execution principal: only a valid automated principal can be trusted for platform work',
+    );
   }
+  return principal as TrustedAutomationPrincipal;
 }
 
 /**
@@ -168,11 +209,11 @@ export function assertExecutionPrincipal(
   label: string,
 ): ExecutionPrincipal {
   if (!isExecutionPrincipal(value)) {
-    throw new ExecutionPrincipalError(`${label} is malformed`);
+    throw new Error(`execution principal: ${label} is malformed`);
   }
   if (value.tenantId !== expectedTenantId) {
-    throw new ExecutionPrincipalError(
-      `${label} belongs to tenant '${value.tenantId}', not '${expectedTenantId}'`,
+    throw new Error(
+      `execution principal: ${label} belongs to tenant '${value.tenantId}', not '${expectedTenantId}'`,
     );
   }
   return value;

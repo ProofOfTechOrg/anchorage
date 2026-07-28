@@ -14,12 +14,13 @@ import {
   type ApprovalResumeTarget,
   type ApprovalService,
   approvalCursor,
-  type ExecutionPrincipal,
   MAX_APPROVAL_LIST_LIMIT,
   OPEN_STATUSES,
   principalActor,
   stepKeyOf,
   type TenantContext,
+  type TrustedAutomationPrincipal,
+  trustAutomationPrincipal,
 } from '../approval-api/index.js';
 import type { RunSummary } from '../do-runner/index.js';
 
@@ -92,7 +93,7 @@ export async function queueApprovalForSuspension(
   workflowId: string,
   summary: RunSummary,
   requestedBy: string,
-  systemPrincipal: ExecutionPrincipal,
+  systemPrincipal: TrustedAutomationPrincipal,
   resumeTarget?: ApprovalResumeTarget,
 ): Promise<ApprovalRecord[]> {
   const suspended = summary.suspended ?? [];
@@ -175,7 +176,7 @@ export async function queueApprovalForSuspension(
 export function resumeRunWithRequeue(
   base: ResumeRunFn,
   getService: () => ApprovalService,
-  systemPrincipal: ExecutionPrincipal,
+  systemPrincipal: TrustedAutomationPrincipal,
   audit?: ApprovalAuditSink,
 ): ResumeRunFn {
   return async (record, decision) => {
@@ -307,7 +308,7 @@ export async function reconcileApprovalsForSummary(
   service: ApprovalService,
   workflowId: string,
   summary: RunSummary,
-  systemPrincipal: ExecutionPrincipal,
+  systemPrincipal: TrustedAutomationPrincipal,
   resumeTarget?: ApprovalResumeTarget,
   requestedBy = systemPrincipal.id,
 ): Promise<ApprovalRecord[]> {
@@ -375,11 +376,16 @@ export function reconcileApprovalsOnStatus(
   summary: RunSummary,
 ) => Promise<void> {
   return async (tenant, workflowId, summary) => {
-    await reconcileApprovalsForSummary(tenant.service(), workflowId, summary, {
-      kind: 'system',
-      id: systemActorId,
-      tenantId: tenant.tenantId,
-      purpose: 'approval-suspension-reconcile',
-    });
+    await reconcileApprovalsForSummary(
+      tenant.service(),
+      workflowId,
+      summary,
+      trustAutomationPrincipal({
+        kind: 'system',
+        id: systemActorId,
+        tenantId: tenant.tenantId,
+        purpose: 'approval-suspension-reconcile',
+      }),
+    );
   };
 }

@@ -100,3 +100,28 @@ describe('agent-host subpath isolation', () => {
     expect(result.bare).toContain('@proofoftech/breakwater/agent');
   });
 });
+
+describe('do-runner -> approval-api edge', () => {
+  // contract.ts documents approval-api -> do-runner as the intended direction.
+  // thread-do.ts now reaches BACK for the execution-principal validator, because
+  // reconstructing a principal at the DO trust boundary must use the same
+  // validator every other consumer does. That one edge is accepted; pin it so a
+  // future import cannot widen the direction silently.
+  const ALLOWED = new Set([
+    'approval-api/principal.ts', // the validator thread-do.ts reaches for
+    'approval-api/contract.ts', // principal.ts's role vocabulary
+    // Reached only by contract.ts's `import type { ApprovalRecord }`, which
+    // erases — it is in the source graph, never in the runtime one.
+    'approval-api/types.ts',
+  ]);
+
+  it('reaches approval-api only through the principal and contract leaves', () => {
+    const result = graph(path.resolve(here, '..', 'do-runner', 'index.ts'));
+    expect(result.unresolved).toEqual([]);
+    const reached = [...result.visited]
+      .filter((file) => file.includes('/approval-api/'))
+      .map((file) => file.slice(file.indexOf('approval-api/')))
+      .sort();
+    expect(reached.filter((entry) => !ALLOWED.has(entry))).toEqual([]);
+  });
+});

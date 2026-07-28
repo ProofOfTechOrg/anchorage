@@ -43,6 +43,7 @@ export type {
   AutomatedPrincipalKind,
   ExecutionPrincipal,
   ExecutionPrincipalKind,
+  TrustedAutomationPrincipal,
 } from './principal.js';
 export {
   AUTOMATED_PRINCIPAL_KINDS,
@@ -51,13 +52,14 @@ export {
   breakwaterActorFor,
   decodeExecutionPrincipal,
   EXECUTION_PRINCIPAL_KINDS,
-  ExecutionPrincipalError,
   encodeExecutionPrincipal,
   humanPrincipal,
   isExecutionPrincipal,
   principalActor,
   principalAuditFields,
   samePrincipal,
+  TRUSTED_AUTOMATION,
+  trustAutomationPrincipal,
 } from './principal.js';
 export type { PurgeExpiredApprovalsOptions } from './retention.js';
 export { purgeExpiredApprovals } from './retention.js';

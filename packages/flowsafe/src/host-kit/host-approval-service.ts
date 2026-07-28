@@ -16,7 +16,6 @@ import type {
   ApprovalDatabase,
   ApprovalNotificationSink,
   ApprovalStreamSink,
-  ExecutionPrincipal,
   SelfDecisionPolicy,
   SystemApprovalStore,
   TenantBoundApprovalStore,
@@ -26,6 +25,8 @@ import {
   D1ApprovalStoreFactory,
   purgeExpiredApprovals,
   sweepSLA,
+  type TrustedAutomationPrincipal,
+  trustAutomationPrincipal,
 } from '../approval-api/index.js';
 import { type AuditQueue, queueAuditSink } from '../audit-export/index.js';
 import {
@@ -43,13 +44,13 @@ import { numberVar } from './env-vars.js';
  */
 export function maintenancePrincipal(
   systemActorId: string,
-): ExecutionPrincipal {
-  return {
+): TrustedAutomationPrincipal {
+  return trustAutomationPrincipal({
     kind: 'system',
     id: systemActorId,
     tenantId: 'system',
     purpose: 'approval-sla-maintenance',
-  };
+  });
 }
 
 // One factory per isolate, not per request: it owns the memoized schema-init
@@ -170,12 +171,12 @@ export function buildHostApprovalService(
 ): ApprovalService {
   // Re-queueing a gate after a durable resume is platform work, not a person's
   // action, so it files through the service's trusted system entry.
-  const systemPrincipal: ExecutionPrincipal = {
+  const systemPrincipal = trustAutomationPrincipal({
     kind: 'system',
     id: options.systemActorId,
     tenantId: store.tenantId,
     purpose: 'approval-requeue',
-  };
+  });
   const audit = hostAuditSink({
     queue: options.queue,
     keepAlive: options.waitUntil,
@@ -201,7 +202,7 @@ export interface SlaSweepMaintenanceOptions {
   /** factory.system() — the cron-only cross-tenant view. */
   store: SystemApprovalStore;
   /** maintenancePrincipal(systemActorId). */
-  systemPrincipal: ExecutionPrincipal;
+  systemPrincipal: TrustedAutomationPrincipal;
   /** Optional audit export queue. */
   queue?: AuditQueue<ApprovalAuditEvent>;
   /** The firing cron expression — log correlation only. */

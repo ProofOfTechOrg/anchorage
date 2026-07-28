@@ -5,7 +5,6 @@ import { describe, expect, it } from 'vitest';
 import {
   createTrustedAgentRequestContext,
   deriveTrustedAgentContext,
-  rejectReservedAgentContext,
   sanitizeStoredAgentContext,
 } from './trusted-context.js';
 import type { TrustedAgentExecution } from './types.js';
@@ -30,15 +29,6 @@ const execution: TrustedAgentExecution = {
 };
 
 describe('trusted agent context boundary', () => {
-  it('rejects reserved external keys, including the complete breakwater namespace', () => {
-    expect(() =>
-      rejectReservedAgentContext({ 'breakwater.futureCapability': true }),
-    ).toThrow("reserved key 'breakwater.futureCapability'");
-    expect(() => rejectReservedAgentContext({ runId: 'forged' })).toThrow(
-      "reserved key 'runId'",
-    );
-  });
-
   it('strips reserved persisted values without mutating the source', () => {
     const source = {
       safe: 'preserved',

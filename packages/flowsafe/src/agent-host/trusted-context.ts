@@ -8,21 +8,10 @@ import {
   breakwaterActorFor,
   principalAuditFields,
 } from '../approval-api/index.js';
-import {
-  assertNoReservedExecutionContext,
-  stripReservedExecutionContext,
-} from '../do-runner/index.js';
+import { stripReservedExecutionContext } from '../do-runner/index.js';
 import type { TrustedAgentExecution } from './types.js';
 
 export { AGENT_AUDIT_CONTEXT_KEY };
-
-export function rejectReservedAgentContext(
-  context: Record<string, unknown>,
-  label = 'agent request context',
-): Record<string, unknown> {
-  assertNoReservedExecutionContext(context, label);
-  return { ...context };
-}
 
 export function sanitizeStoredAgentContext(
   context: Record<string, unknown> | undefined,

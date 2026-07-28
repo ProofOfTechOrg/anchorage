@@ -28,6 +28,7 @@ import {
   principalAuditFields,
   RUN_START_ROLES,
   samePrincipal,
+  trustAutomationPrincipal,
 } from '../approval-api/index.js';
 import {
   DoStatusError,
@@ -493,12 +494,13 @@ export function createThreadAgentHost(
   // Reconciling approvals is trusted platform work with no person behind it.
   // It used to mint role:'operator', which is why an approval bridge looked
   // indistinguishable from a human operator in the audit trail.
-  const systemPrincipal = (scope: ThreadScope): ExecutionPrincipal => ({
-    kind: 'system',
-    id: options.systemActorId ?? 'flowsafe-system',
-    tenantId: scope.tenantId,
-    purpose: 'approval-suspension-reconcile',
-  });
+  const systemPrincipal = (scope: ThreadScope) =>
+    trustAutomationPrincipal({
+      kind: 'system',
+      id: options.systemActorId ?? 'flowsafe-system',
+      tenantId: scope.tenantId,
+      purpose: 'approval-suspension-reconcile',
+    });
 
   const currentApprovals = async (
     scope: ThreadScope,

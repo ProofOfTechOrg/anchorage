@@ -27,6 +27,7 @@ import {
   isExecutionPrincipal,
   principalActor,
   principalAuditFields,
+  type TrustedAutomationPrincipal,
 } from './principal.js';
 import { type ApprovalPatch, listAllApprovedForRun } from './store.js';
 import type {
@@ -229,7 +230,7 @@ export class ApprovalService {
    */
   async createAsPrincipal(
     input: CreateApprovalInput,
-    principal: ExecutionPrincipal,
+    principal: TrustedAutomationPrincipal,
     resumeTarget?: ApprovalResumeTarget,
   ): Promise<{ record: ApprovalRecord; created: boolean }> {
     this.#authorizeAutomated(principal, 'approval.create', 'approval');
@@ -628,7 +629,7 @@ export class ApprovalService {
    */
   async supersedeStaleAsPrincipal(
     id: string,
-    principal: ExecutionPrincipal,
+    principal: TrustedAutomationPrincipal,
     reason: string,
   ): Promise<ApprovalRecord | null> {
     this.#authorizeAutomated(principal, 'approval.supersede', `approval:${id}`);
@@ -835,34 +836,27 @@ export class ApprovalService {
    * through the automation entry would let a `viewer` create records the role
    * gate exists to refuse them.
    */
+  /**
+   * The tenant half of the automated authorization. The KIND half is carried by
+   * the type: only `trustAutomationPrincipal` mints a TrustedAutomationPrincipal,
+   * and it refuses humans and malformed principals, so this cannot be reached by
+   * a caller asserting robot-hood in an object literal.
+   *
+   * The tenant is still checked at runtime, for the same reason `#authorize`
+   * checks it: the resolver builds the service from the principal's own tenant,
+   * so a mismatch can only be a wiring bug — exactly when it must fail closed.
+   */
   #authorizeAutomated(
-    principal: ExecutionPrincipal,
+    principal: TrustedAutomationPrincipal,
     action: string,
     resource: string,
   ): void {
-    // Full validation, not a three-field subset: `purpose` is the provenance
-    // this whole model exists to restore, so the trusted entry must not be the
-    // one place it can be omitted.
-    const valid = isExecutionPrincipal(principal);
-    const automated = valid && principal.kind !== 'human';
-    if (automated && principal.tenantId === this.#store.tenantId) return;
-    this.#record(
-      valid ? principalActor(principal) : null,
-      action,
-      resource,
-      'denied',
-      {
-        reason: !valid
-          ? 'principal is malformed'
-          : !automated
-            ? `principal kind '${principal.kind}' must use the role-authorized entry`
-            : `principal tenant '${principal.tenantId}' does not match the store binding '${this.#store.tenantId}'`,
-      },
-    );
+    if (principal.tenantId === this.#store.tenantId) return;
+    this.#record(principalActor(principal), action, resource, 'denied', {
+      reason: `principal tenant '${principal.tenantId}' does not match the store binding '${this.#store.tenantId}'`,
+    });
     throw new ApprovalAuthzError(
-      automated
-        ? `${action}: principal tenant does not match this service's tenant binding`
-        : `${action} requires a valid automated execution principal`,
+      `${action}: principal tenant does not match this service's tenant binding`,
     );
   }
 

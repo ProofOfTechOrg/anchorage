@@ -47,7 +47,6 @@ export {
   AGENT_AUDIT_CONTEXT_KEY,
   createTrustedAgentRequestContext,
   deriveTrustedAgentContext,
-  rejectReservedAgentContext,
   sanitizeStoredAgentContext,
 } from './trusted-context.js';
 export type {

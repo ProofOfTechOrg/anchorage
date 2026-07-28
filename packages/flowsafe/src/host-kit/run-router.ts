@@ -26,11 +26,11 @@
 // step re-checks and fails closed. Approve through the queue, not this route.
 
 import {
-  type ExecutionPrincipal,
   RUN_START_ROLES,
   type TenantContext,
   TenantResolutionError,
   type TenantResolver,
+  trustAutomationPrincipal,
 } from '../approval-api/index.js';
 import {
   InvalidRunRequestError,
@@ -261,12 +261,12 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
         if (summary.status !== 'suspended') return json(summary);
         // Filing the gate is platform work, not the requester's action, and
         // not a person's. It files through the service's trusted system entry.
-        const systemPrincipal: ExecutionPrincipal = {
+        const systemPrincipal = trustAutomationPrincipal({
           kind: 'system',
           id: systemActorId,
           tenantId: tenant.tenantId,
           purpose: 'approval-suspension-reconcile',
-        };
+        });
         const approvals = await queueApprovalForSuspension(
           tenant.service(),
           body.workflowId,
