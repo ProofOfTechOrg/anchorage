@@ -22,6 +22,7 @@ import type {
   ApprovalStreamSink,
 } from './contract.js';
 import { APPROVAL_ROLES, DECIDER_ROLES } from './contract.js';
+import { isExecutionPrincipal } from './principal.js';
 import { type ApprovalPatch, listAllApprovedForRun } from './store.js';
 import type {
   SystemApprovalStore,
@@ -938,21 +939,19 @@ export class ApprovalService {
       return;
     }
     if (target.kind === 'agent-thread') {
-      const principal = target.principal;
       if (
         typeof target.agentId !== 'string' ||
         !PATH_SAFE_ID_PATTERN.test(target.agentId) ||
         !ownsPathSafeId(target.threadId) ||
         !ownsPathSafeId(target.resourceId) ||
-        principal === null ||
-        typeof principal !== 'object' ||
-        typeof principal.id !== 'string' ||
-        principal.id.trim() === '' ||
-        !(APPROVAL_ROLES as readonly string[]).includes(principal.role) ||
-        principal.tenantId !== this.#store.tenantId
+        // Fails closed on the pre-principal `{id, role, tenantId}` form: an
+        // ApprovalActor is not an ExecutionPrincipal, and coercing one would
+        // resurrect a fabricated operator as a human.
+        !isExecutionPrincipal(target.principal) ||
+        target.principal.tenantId !== this.#store.tenantId
       ) {
         throw new InvalidApprovalInputError(
-          'agent resumeTarget must name path-safe ids and a valid principal owned by the bound tenant',
+          'agent resumeTarget must name path-safe ids and a valid execution principal owned by the bound tenant',
         );
       }
       return;

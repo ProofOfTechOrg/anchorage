@@ -39,6 +39,24 @@ export {
   defaultResumeData,
   resumeViaRuntime,
 } from './grants.js';
+export type {
+  AutomatedPrincipalKind,
+  ExecutionPrincipal,
+  ExecutionPrincipalKind,
+} from './principal.js';
+export {
+  assertExecutionPrincipal,
+  AUTOMATED_PRINCIPAL_KINDS,
+  AUTOMATED_PROJECTED_ROLE,
+  EXECUTION_PRINCIPAL_KINDS,
+  ExecutionPrincipalError,
+  humanPrincipal,
+  isAutomatedPrincipal,
+  isExecutionPrincipal,
+  principalActor,
+  principalAuditFields,
+  samePrincipal,
+} from './principal.js';
 export type { PurgeExpiredApprovalsOptions } from './retention.js';
 export { purgeExpiredApprovals } from './retention.js';
 export type { ApprovalRouter, ApprovalRouterOptions } from './router.js';

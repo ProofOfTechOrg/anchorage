@@ -12,7 +12,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { AGENT_AUDIT_CONTEXT_KEY, AuditLogger } from '../audit/index.js';
 import { denyPatterns, type PolicyEvaluator } from '../policy-engine/index.js';
-import { ACTOR_CONTEXT_KEY } from '../rbac/index.js';
+import { ACTOR_CONTEXT_KEY, type PrincipalKind } from '../rbac/index.js';
 import {
   createGuardedAgent,
   type GuardedAgentConfig,
@@ -626,6 +626,132 @@ describe('guarded audit behavior', () => {
     expect(JSON.stringify(audit.events())).not.toContain(
       'private evaluator failure',
     );
+  });
+});
+
+describe('createGuardedAgent principal kinds', () => {
+  function automatedContext(
+    kind: 'service' | 'agent' | 'system',
+    role: 'admin' | 'operator' | 'viewer' = 'operator',
+  ): RequestContext {
+    const context = new RequestContext();
+    context.set(ACTOR_CONTEXT_KEY, { id: 'scheduler-1', role, kind });
+    context.set(AGENT_AUDIT_CONTEXT_KEY, {
+      agentId: 'writer',
+      entryPath: 'schedule.fire',
+      principalKind: kind,
+      principalId: 'scheduler-1',
+      purpose: 'scheduled-agent-execution',
+    });
+    return context;
+  }
+
+  it('defaults to humans only, so an existing agent denies automation', async () => {
+    // #given — `guarded()` names allowedRoles and nothing else, exactly as
+    // every agent written before principal kinds existed.
+    const modelCall = vi.fn();
+    const agent = guarded({ model: testModel('generated', modelCall) });
+
+    // #when / #then — 'operator' IS an allowed role; only the kind stops it.
+    await expect(
+      agent.generate('hello', { requestContext: automatedContext('system') }),
+    ).rejects.toThrow(
+      /principal kind 'system' is not in allowed kinds \[human\]/,
+    );
+    expect(modelCall).not.toHaveBeenCalled();
+    expect(agent.allowedPrincipalKinds).toEqual(['human']);
+  });
+
+  it.each([
+    'generate',
+    'stream',
+  ] as const)('denies an unnamed kind on the direct %s path, not just in the processor chain', async (method) => {
+    // #given — the direct entries pre-authorize OUTSIDE the processor chain,
+    // so a kind gate wired only into RBACMiddleware would leave them open.
+    const modelCall = vi.fn();
+    const agent = guarded({
+      model: testModel('generated', modelCall),
+      allowedPrincipalKinds: ['human', 'service'],
+    });
+
+    // #when / #then
+    await expect(
+      agent[method]('hello', { requestContext: automatedContext('agent') }),
+    ).rejects.toThrow(/principal kind 'agent' is not in allowed kinds/);
+    expect(modelCall).not.toHaveBeenCalled();
+  });
+
+  it('runs an automated principal whose kind is named, ignoring its role', async () => {
+    // #given — 'viewer' is deliberately outside allowedRoles: an automated
+    // principal must not need a human role to be admitted, because needing one
+    // would also admit the humans who hold it.
+    const modelCall = vi.fn();
+    const agent = guarded({
+      model: testModel('generated', modelCall),
+      allowedRoles: ['admin'],
+      allowedPrincipalKinds: ['system'],
+    });
+
+    // #when
+    const result = await agent.generate('hello', {
+      requestContext: automatedContext('system', 'viewer'),
+    });
+
+    // #then
+    expect(result.text).toBe('generated');
+    expect(modelCall).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the human role gate intact once automation is enabled', async () => {
+    // #given
+    const modelCall = vi.fn();
+    const agent = guarded({
+      model: testModel('generated', modelCall),
+      allowedRoles: ['admin'],
+      allowedPrincipalKinds: ['human', 'system'],
+    });
+
+    // #when / #then — a real human operator is still refused.
+    await expect(
+      agent.generate('hello', { requestContext: actorContext('operator') }),
+    ).rejects.toThrow(/role 'operator' is not in allowed roles \[admin\]/);
+    expect(modelCall).not.toHaveBeenCalled();
+  });
+
+  it('carries principal correlation into the authorization audit event', async () => {
+    // #given
+    const audit = new AuditLogger();
+    const agent = guarded({
+      audit,
+      allowedPrincipalKinds: ['system'],
+    });
+
+    // #when
+    await agent.generate('hello', {
+      requestContext: automatedContext('system'),
+    });
+
+    // #then — provenance a fabricated operator could never have carried.
+    expect(audit.events()[0]).toMatchObject({
+      decision: 'allowed',
+      actor: { id: 'scheduler-1', kind: 'system' },
+      detail: {
+        entryPath: 'schedule.fire',
+        principalKind: 'system',
+        principalId: 'scheduler-1',
+        purpose: 'scheduled-agent-execution',
+      },
+    });
+  });
+
+  it('rejects an invalid kind allowlist at construction', () => {
+    // #when / #then
+    expect(() => guarded({ allowedPrincipalKinds: [] })).toThrowError(
+      /allowedPrincipalKinds must be a non-empty array/,
+    );
+    expect(() =>
+      guarded({ allowedPrincipalKinds: ['root' as PrincipalKind] }),
+    ).toThrowError(/unknown principal kind 'root'/);
   });
 });
 

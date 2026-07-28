@@ -20,7 +20,7 @@ import {
   TENANT_ID_PATTERN,
   tenantOwnsSaltedId,
 } from '../do-runner/path-safe-id.js';
-import { APPROVAL_ROLES } from './contract.js';
+import { isExecutionPrincipal } from './principal.js';
 import {
   type ApprovalPatch,
   type ApprovalStore,
@@ -377,21 +377,19 @@ function rowToRecord(row: ApprovalRow): ApprovalRecord {
       object?.kind === 'thread' &&
       ownsPathSafeId(object.threadId) &&
       (object.resourceId === undefined || ownsPathSafeId(object.resourceId));
-    const principal =
-      object?.principal !== null && typeof object?.principal === 'object'
-        ? (object.principal as Record<string, unknown>)
-        : undefined;
+    // Rows written before execution principals stored an ApprovalActor here.
+    // isExecutionPrincipal rejects that shape, which is the intended migration:
+    // a run started by the schedule tick stored `role: 'operator'`, so reading
+    // it back as a human principal would hand a scheduled job the authority of
+    // a human operator. Such a row fails closed and its run cannot resume.
     const validAgentTarget =
       object?.kind === 'agent-thread' &&
       typeof object.agentId === 'string' &&
       PATH_SAFE_ID_PATTERN.test(object.agentId) &&
       ownsPathSafeId(object.threadId) &&
       ownsPathSafeId(object.resourceId) &&
-      typeof principal?.id === 'string' &&
-      principal.id.trim() !== '' &&
-      typeof principal.role === 'string' &&
-      (APPROVAL_ROLES as readonly string[]).includes(principal.role) &&
-      principal.tenantId === row.tenant_id;
+      isExecutionPrincipal(object.principal) &&
+      object.principal.tenantId === row.tenant_id;
     if (!validThreadTarget && !validAgentTarget) {
       throw new Error(
         `approval '${row.id}' has an invalid or foreign resume_target`,
