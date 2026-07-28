@@ -9,6 +9,7 @@ import type {
   ApprovalStreamEvent,
   ApprovalStreamSink,
 } from './contract.js';
+import type { ExecutionPrincipal } from './principal.js';
 import {
   ApprovalAuthzError,
   ApprovalConflictError,
@@ -28,6 +29,13 @@ import {
 } from './types.js';
 
 const ADMIN: ApprovalActor = { id: 'ada', role: 'admin', tenantId: 'acme' };
+const SWEEP_PRINCIPAL: ExecutionPrincipal = {
+  kind: 'system',
+  id: 'sweeper',
+  tenantId: 'system',
+  purpose: 'approval-sla-maintenance',
+};
+
 const OPERATOR: ApprovalActor = {
   id: 'opal',
   role: 'operator',
@@ -107,7 +115,7 @@ function runSweep(
   } = {},
 ): Promise<ApprovalRecord[]> {
   return sweepSLA(harness.backend.system(), {
-    systemActor: OPERATOR,
+    systemPrincipal: SWEEP_PRINCIPAL,
     audit: (event) => harness.events.push(event),
     onEscalation: options.onEscalation,
     notify: options.notify,
@@ -149,9 +157,10 @@ describe('ApprovalService.create', () => {
       threadId: 'acme_thread-1',
       resourceId: 'acme_resource-1',
       principal: {
+        kind: 'human' as const,
         id: 'starter',
-        role: 'operator' as const,
         tenantId: 'acme',
+        role: 'operator' as const,
       },
     };
 
@@ -1732,7 +1741,7 @@ describe('ApprovalService audit sink promise containment', () => {
       await seedPending(harness, { slaSeconds: 60, runId: 'acme_run-2' });
       harness.advance(61_000);
       await sweepSLA(harness.backend.system(), {
-        systemActor: OPERATOR,
+        systemPrincipal: SWEEP_PRINCIPAL,
         audit: () => Promise.reject(new Error('siem down')),
         now: harness.now,
       });

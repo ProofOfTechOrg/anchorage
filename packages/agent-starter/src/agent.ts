@@ -20,6 +20,10 @@ export const STARTER_AGENT_META = {
   description:
     'Records one approval-gated operation in the tenant-isolated starter ledger.',
   allowedRoles: ['admin', 'operator', 'builder'],
+  // Unattended schedule fires only. Naming the entry path rather than just the
+  // kind means a system principal cannot reach this agent through a signal or
+  // a notification dispatch just because it may fire on a schedule.
+  allowedAutomation: [{ kind: 'system', entryPaths: ['schedule.fire'] }],
 } as const satisfies AgentMeta;
 
 const actionInput = z.object({
@@ -114,6 +118,9 @@ export function createStarterAgentModule(options: {
       [RECORD_ACTION_CONNECTOR_ID]: recordAction,
     },
     allowedRoles: STARTER_AGENT_META.allowedRoles,
+    // Must mirror STARTER_AGENT_META.allowedAutomation's kinds; the catalog
+    // refuses the module at construction if the two ever drift.
+    allowedPrincipalKinds: ['human', 'system'],
     policies: [],
     audit: options.audit,
     maxSteps: 1,

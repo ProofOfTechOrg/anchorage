@@ -48,7 +48,7 @@ export {
   approvalStoreFactoryFor,
   buildHostApprovalService,
   type HostApprovalServiceOptions,
-  maintenanceActor,
+  maintenancePrincipal,
   reconcileApprovalsOnStatusDetached,
   runApprovalRetentionPurge,
   runSlaSweepMaintenance,

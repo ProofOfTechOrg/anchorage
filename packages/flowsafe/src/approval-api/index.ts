@@ -45,9 +45,9 @@ export type {
   ExecutionPrincipalKind,
 } from './principal.js';
 export {
-  assertExecutionPrincipal,
   AUTOMATED_PRINCIPAL_KINDS,
   AUTOMATED_PROJECTED_ROLE,
+  assertExecutionPrincipal,
   EXECUTION_PRINCIPAL_KINDS,
   ExecutionPrincipalError,
   humanPrincipal,

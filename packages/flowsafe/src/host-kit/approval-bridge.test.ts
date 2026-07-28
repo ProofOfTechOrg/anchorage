@@ -15,6 +15,7 @@ import {
   type ApprovalRecord,
   ApprovalService,
   approvedConnectorsForLeg,
+  type ExecutionPrincipal,
   InMemoryApprovalStore,
 } from '../approval-api/index.js';
 import type { RunSummary } from '../do-runner/index.js';
@@ -28,7 +29,12 @@ import {
   resumeRunWithRequeue,
 } from './index.js';
 
-const SYSTEM: ApprovalActor = { id: 'sys', role: 'operator', tenantId: 'acme' };
+const SYSTEM: ExecutionPrincipal = {
+  kind: 'system',
+  id: 'sys',
+  tenantId: 'acme',
+  purpose: 'test-reconcile',
+};
 const REVIEWER: ApprovalActor = {
   id: 'ray',
   role: 'reviewer',
@@ -255,7 +261,7 @@ describe('resumeRunWithRequeue', () => {
     });
 
     // a first-gate approval, requested by someone OTHER than the reviewer
-    const { record: gate1 } = await service.create(
+    const { record: gate1 } = await service.createAsPrincipal(
       {
         workflowId: 'product-launch',
         runId: 'acme_run-1',
@@ -305,7 +311,7 @@ describe('resumeRunWithRequeue', () => {
       store,
       resumeRun: resumeRunWithRequeue(base, () => service, SYSTEM),
     });
-    const { record } = await service.create(
+    const { record } = await service.createAsPrincipal(
       {
         workflowId: 'gtm-outbound',
         runId: 'acme_run-2',
@@ -333,7 +339,7 @@ describe('resumeRunWithRequeue', () => {
       store,
       resumeRun: resumeRunWithRequeue(base, () => service, SYSTEM),
     });
-    const { record } = await service.create(
+    const { record } = await service.createAsPrincipal(
       {
         workflowId: 'durable-agentic-loop',
         runId: 'acme_run-agent',
@@ -350,9 +356,10 @@ describe('resumeRunWithRequeue', () => {
         threadId: 'acme_thread',
         resourceId: 'acme_resource',
         principal: {
+          kind: 'human',
           id: 'starter',
-          role: 'operator',
           tenantId: 'acme',
+          role: 'operator',
         },
       },
     );
@@ -367,9 +374,10 @@ describe('resumeRunWithRequeue', () => {
       resumeTarget: {
         kind: 'agent-thread',
         principal: {
+          kind: 'human',
           id: 'starter',
-          role: 'operator',
           tenantId: 'acme',
+          role: 'operator',
         },
       },
     });
@@ -409,7 +417,7 @@ describe('resumeRunWithRequeue', () => {
       audit,
       resumeRun: resumeRunWithRequeue(base, () => service, SYSTEM, audit),
     });
-    const { record: gate1 } = await service.create(
+    const { record: gate1 } = await service.createAsPrincipal(
       {
         workflowId: 'product-launch',
         runId: 'acme_run-4',
@@ -537,9 +545,10 @@ describe('reconcileApprovalsForSummary', () => {
         threadId: 'acme_thread',
         resourceId: 'acme_resource',
         principal: {
+          kind: 'human',
           id: 'starter',
-          role: 'operator',
           tenantId: 'acme',
+          role: 'operator',
         },
       },
       'starter',

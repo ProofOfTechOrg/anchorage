@@ -26,7 +26,7 @@
 // step re-checks and fails closed. Approve through the queue, not this route.
 
 import {
-  type ApprovalActor,
+  type ExecutionPrincipal,
   RUN_START_ROLES,
   type TenantContext,
   TenantResolutionError,
@@ -259,17 +259,20 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
           body.inputData,
         );
         if (summary.status !== 'suspended') return json(summary);
-        const systemActor: ApprovalActor = {
+        // Filing the gate is platform work, not the requester's action, and
+        // not a person's. It files through the service's trusted system entry.
+        const systemPrincipal: ExecutionPrincipal = {
+          kind: 'system',
           id: systemActorId,
-          role: 'operator',
           tenantId: tenant.tenantId,
+          purpose: 'approval-suspension-reconcile',
         };
         const approvals = await queueApprovalForSuspension(
           tenant.service(),
           body.workflowId,
           summary,
           actor.id,
-          systemActor,
+          systemPrincipal,
         );
         // `approval` remains the single-gate response contract (what the SPA
         // links); `approvals` carries every record a parallel multi-step

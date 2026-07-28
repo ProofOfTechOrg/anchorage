@@ -14,6 +14,7 @@ import {
   ApprovalService,
   approvalGrantProviderFromFactory,
   createTenantResolver,
+  type ExecutionPrincipal,
   type InMemoryApprovalStore,
   InMemoryApprovalStoreFactory,
   resumeViaRuntime,
@@ -33,7 +34,12 @@ import { CRM_ASSIGN_CONNECTOR } from '#worker/workflows/lead-generation';
 import { DEPLOY_CONNECTOR } from '#worker/workflows/product-launch';
 import { WIRE_CONNECTOR } from '#worker/workflows/wire-transfer';
 
-const SYSTEM: ApprovalActor = { id: 'sys', role: 'operator', tenantId: 'demo' };
+const SYSTEM: ExecutionPrincipal = {
+  kind: 'system',
+  id: 'sys',
+  tenantId: 'demo',
+  purpose: 'test-reconcile',
+};
 const REVIEWER: ApprovalActor = {
   id: 'ray',
   role: 'reviewer',

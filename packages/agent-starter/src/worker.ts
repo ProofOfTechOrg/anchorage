@@ -58,7 +58,7 @@ import {
   subscriptionStoreFactory,
   threadStateStore,
 } from './storage.js';
-import { systemTenant, tenantForActor } from './system-tenant.js';
+import { systemTenant, tenantForPrincipal } from './system-tenant.js';
 import { WORKFLOWS } from './workflows.js';
 
 export {
@@ -258,7 +258,7 @@ const worker = createFlowsafeWorker<Env>({
       fallback,
       agents: [STARTER_AGENT_META],
       topology: createAgentThreadTopology(env.THREAD),
-      tenantForActor: (actor) => tenantForActor(env, actor),
+      tenantForPrincipal: (principal) => tenantForPrincipal(env, principal),
     }),
   buildSignalRouter: (resolve, env) =>
     createSignalRouter({

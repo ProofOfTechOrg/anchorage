@@ -33,6 +33,7 @@ function tenantContext(
 ): TenantContext {
   return {
     actor: { id: `demo-${role}`, role, tenantId },
+    principal: { kind: 'human', id: `demo-${role}`, tenantId, role },
     tenantId,
     service: () => {
       throw new Error('service() must not be touched by the reset route');

@@ -181,9 +181,10 @@ function describeStoreContract(
           threadId: 'acme_thread-agent',
           resourceId: 'acme_resource-agent',
           principal: {
+            kind: 'human',
             id: 'requester-1',
-            role: 'operator',
             tenantId: 'acme',
+            role: 'operator',
           },
         },
       });

@@ -18,6 +18,7 @@ import {
 import {
   THREAD_ACTOR_HEADER,
   THREAD_ACTOR_ROLE_HEADER,
+  THREAD_PRINCIPAL_HEADER,
   THREAD_TENANT_HEADER,
 } from '../do-runner/thread-header.js';
 import {
@@ -26,6 +27,7 @@ import {
   type ApprovalRole,
   DECIDER_ROLES,
 } from './contract.js';
+import { type ExecutionPrincipal, humanPrincipal } from './principal.js';
 import {
   type ApprovalService,
   type SelfDecisionPolicy,
@@ -36,6 +38,12 @@ import type { TenantBoundApprovalStore } from './tenant-brand.js';
 export interface TenantContext {
   /** Already authenticated; tenantId equals actor.tenantId and matches the tenant-ID pattern. */
   readonly actor: ApprovalActor;
+  /**
+   * WHO is executing. For an authenticated HTTP request this is the human in
+   * `actor`; trusted internal contexts (schedule ticks, provider delivery, cron
+   * maintenance) carry an automated principal instead of fabricating a role.
+   */
+  readonly principal: ExecutionPrincipal;
   readonly tenantId: string;
   /** The approval service over a store bound to THIS tenant. */
   service(): ApprovalService;
@@ -143,7 +151,11 @@ export function createTenantResolver(
     if (
       request.headers.has(THREAD_TENANT_HEADER) ||
       request.headers.has(THREAD_ACTOR_HEADER) ||
-      request.headers.has(THREAD_ACTOR_ROLE_HEADER)
+      request.headers.has(THREAD_ACTOR_ROLE_HEADER) ||
+      // Without this an external caller could assert its own principal kind,
+      // and the agent host's automation gate would be answering a question the
+      // client got to ask.
+      request.headers.has(THREAD_PRINCIPAL_HEADER)
     ) {
       throw new TenantResolutionError(
         `inbound request carries a server-stamped thread header — refusing to scope it`,
@@ -187,6 +199,9 @@ export function createTenantResolver(
     let service: ApprovalService | undefined;
     return {
       actor,
+      // An authenticated HTTP request is by definition a person; automated
+      // principals never arrive through this resolver.
+      principal: humanPrincipal(actor),
       tenantId,
       service: () => {
         service ??= options.buildService(

@@ -31,6 +31,11 @@
 // in node/vitest, the same posture as DurableObjectRunner and HubDurableObject.
 
 import type { ApprovalActor, ApprovalRole } from '../approval-api/contract.js';
+import {
+  type ExecutionPrincipal,
+  isExecutionPrincipal,
+  principalActor,
+} from '../approval-api/principal.js';
 import type { DurableObjectRunnerState } from './cf-types.js';
 import { DoStatusError, doErrorResponse } from './do-error-response.js';
 import type { InitResult } from './init.js';
@@ -39,6 +44,7 @@ import { DurableStorageResumeLedger } from './resume-ledger.js';
 import {
   THREAD_ACTOR_HEADER,
   THREAD_ACTOR_ROLE_HEADER,
+  THREAD_PRINCIPAL_HEADER,
   THREAD_TENANT_HEADER,
 } from './thread-header.js';
 
@@ -76,8 +82,18 @@ export interface ThreadScope {
   readonly threadId: string;
   /** The tenant the threadId carries, equal to the request's authenticated one. */
   readonly tenantId: string;
-  /** Complete server-stamped requester principal. */
+  /**
+   * Complete server-stamped requester identity, in human shape. Kept for the
+   * approval service and every existing thread route; for automated principals
+   * it is the least-privileged projection of `principal`.
+   */
   readonly actor: ApprovalActor;
+  /**
+   * WHO is executing — the authority the agent host gates on. A human here is
+   * the same identity as `actor`; anything else is automation that must have
+   * been declared by the target agent.
+   */
+  readonly principal: ExecutionPrincipal;
   /** Compatibility alias for actor.id. */
   readonly requestedBy: string;
   /** This DO's storage/runtime/pubsub wiring, built once per instance. */
@@ -206,12 +222,62 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
         `thread identity mismatch: request for '${threadId}' carries no valid trusted actor role`,
       );
     }
-    const actor: ApprovalActor = {
-      id: actorId,
-      role: role as ApprovalRole,
+    const principal = this.#principalFrom(
+      request,
+      actorId,
+      role as ApprovalRole,
       tenantId,
+    );
+    return {
+      threadId,
+      tenantId,
+      actor: principalActor(principal),
+      principal,
+      requestedBy: principal.id,
     };
-    return { threadId, tenantId, actor, requestedBy: actor.id };
+  }
+
+  /**
+   * Reconstruct the execution principal from the trusted headers.
+   *
+   * An absent principal header means a human — see THREAD_PRINCIPAL_HEADER for
+   * why that default cannot grant authority. A header that IS present but
+   * malformed, or that names an automated kind without a purpose, is refused
+   * rather than downgraded to human: a caller that tried to assert automation
+   * and got it wrong must not silently become a person.
+   */
+  #principalFrom(
+    request: Request,
+    actorId: string,
+    role: ApprovalRole,
+    tenantId: string,
+  ): ExecutionPrincipal {
+    const header = request.headers.get(THREAD_PRINCIPAL_HEADER);
+    if (header === null) {
+      return { kind: 'human', id: actorId, tenantId, role };
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(header);
+    } catch {
+      throw new ThreadIdentityError(
+        `thread identity mismatch: request for '${this.threadId}' carries an unparseable principal`,
+      );
+    }
+    const fields =
+      parsed !== null && typeof parsed === 'object'
+        ? (parsed as Record<string, unknown>)
+        : undefined;
+    const candidate =
+      fields?.kind === 'human'
+        ? { kind: 'human', id: actorId, tenantId, role }
+        : { ...fields, id: actorId, tenantId };
+    if (!isExecutionPrincipal(candidate)) {
+      throw new ThreadIdentityError(
+        `thread identity mismatch: request for '${this.threadId}' carries an invalid principal`,
+      );
+    }
+    return candidate;
   }
 
   #ensureInit(): InitResult {

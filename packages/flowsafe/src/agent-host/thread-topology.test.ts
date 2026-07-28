@@ -70,6 +70,12 @@ function tenant() {
   let threadMints = 0;
   const value: TenantContext = {
     actor: { id: 'operator-1', role: 'operator', tenantId: 'acme' },
+    principal: {
+      kind: 'human',
+      id: 'operator-1',
+      tenantId: 'acme',
+      role: 'operator',
+    },
     tenantId: 'acme',
     service: () => {
       throw new Error('unused');

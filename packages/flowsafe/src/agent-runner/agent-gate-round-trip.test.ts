@@ -26,12 +26,18 @@ import {
   approvalGrantProvider,
   resumeViaRuntime,
 } from '../approval-api/grants.js';
+import type { ExecutionPrincipal } from '../approval-api/principal.js';
 import { ApprovalService } from '../approval-api/service.js';
 import { InMemoryApprovalStore } from '../approval-api/store.js';
 import { init } from '../do-runner/init.js';
 import { queueApprovalForSuspension } from '../host-kit/approval-bridge.js';
 
-const SYSTEM: ApprovalActor = { id: 'sys', role: 'operator', tenantId: 'acme' };
+const SYSTEM: ExecutionPrincipal = {
+  kind: 'system',
+  id: 'sys',
+  tenantId: 'acme',
+  purpose: 'test-reconcile',
+};
 const REVIEWER: ApprovalActor = {
   id: 'rev',
   role: 'reviewer',

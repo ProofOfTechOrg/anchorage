@@ -26,3 +26,18 @@ export const THREAD_ACTOR_HEADER = 'x-flowsafe-actor';
 
 /** The trusted Worker-stamped role of the actor causing a thread operation. */
 export const THREAD_ACTOR_ROLE_HEADER = 'x-flowsafe-role';
+
+/**
+ * The trusted Worker-stamped EXECUTION PRINCIPAL fields that the id/role/tenant
+ * headers cannot express: the principal kind, its purpose, and any delegation.
+ *
+ * Carried as compact JSON, and ABSENT means `kind: 'human'`. That default is
+ * not an "absent field grants privilege" inversion: absence means the request
+ * came through a topology send that predates this header, the role header still
+ * governs, and the result is the pre-existing human path — which for agent entry
+ * is the STRICTER one, since automation additionally requires the target agent
+ * to have declared it. Forging this header is exactly as hard as forging the
+ * role header: `createTenantResolver` refuses any inbound request carrying
+ * either, before a store binds.
+ */
+export const THREAD_PRINCIPAL_HEADER = 'x-flowsafe-principal';

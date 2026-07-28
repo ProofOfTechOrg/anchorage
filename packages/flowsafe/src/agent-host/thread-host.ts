@@ -503,7 +503,7 @@ export function createThreadAgentHost(
   const currentApprovals = async (
     scope: ThreadScope,
     summary: RunSummary,
-    principal: ApprovalActor,
+    principal: ExecutionPrincipal,
     agentId: string,
     resourceId: string,
   ): Promise<ApprovalRecord[]> => {
@@ -528,7 +528,7 @@ export function createThreadAgentHost(
         workflowId: DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
         runId: summary.runId,
       },
-      systemPrincipal(scope),
+      principalActor(systemPrincipal(scope)),
     );
     const keys = new Set(
       (summary.suspended ?? []).map((path) => path.join('.')),
@@ -551,7 +551,7 @@ export function createThreadAgentHost(
       resourceId: string;
       runId: string;
     },
-    principal: ApprovalActor,
+    principal: ExecutionPrincipal,
     summary: RunSummary,
   ): Promise<AgentRunEnvelope> => {
     const base: AgentRunEnvelope = {
@@ -670,7 +670,9 @@ export function createThreadAgentHost(
         'suspended agent run has no recoverable execution principal',
       );
     }
-    const principal = stored?.principal ?? scope.actor;
+    // The scope's PRINCIPAL, not its actor: falling back to the requester's
+    // human identity would relabel an automated run as whoever polled status.
+    const principal = stored?.principal ?? scope.principal;
     const result = await envelopeFor(scope, ref, principal, summary);
     if (isTerminalRunStatus(summary.status) && stored) {
       await deleteAgentRunRecord(options.stateStorage(), ref.runId);
@@ -711,13 +713,18 @@ export function createThreadAgentHost(
         throw new AgentHostRequestError(400, 'agent input is required');
       }
       const entry = entryPath(input.entryPath);
-      const { current, module } = await authorize(scope, ref.agentId, entry);
+      const { current, module } = await authorize(
+        scope,
+        ref.agentId,
+        entry,
+        scope.principal,
+      );
       if (ref.resourceId !== mintResourceId(scope.tenantId, scope.threadId)) {
         throw new AgentHostRequestError(404, 'run not found');
       }
       const execution: TrustedAgentExecution = {
         agentId: ref.agentId,
-        actor: scope.actor,
+        principal: scope.principal,
         threadId: scope.threadId,
         resourceId: ref.resourceId,
         runId: ref.runId,
@@ -766,9 +773,9 @@ export function createThreadAgentHost(
           });
         }
         const stored: AgentRunRecord = {
-          version: 1,
+          version: 2,
           agentId: ref.agentId,
-          principal: scope.actor,
+          principal: scope.principal,
           originEntryPath: entry,
         };
         await writeAgentRunRecord(options.stateStorage(), ref.runId, stored);
@@ -792,7 +799,12 @@ export function createThreadAgentHost(
             ref.runId,
           );
           if (!summary) throw new Error('agent run did not persist a summary');
-          const result = await envelopeFor(scope, ref, scope.actor, summary);
+          const result = await envelopeFor(
+            scope,
+            ref,
+            scope.principal,
+            summary,
+          );
           if (isTerminalRunStatus(result.summary.status)) {
             await deleteAgentRunRecord(options.stateStorage(), ref.runId);
           }
@@ -829,6 +841,7 @@ export function createThreadAgentHost(
         scope,
         binding.agentId,
         entryPath(input.entryPath),
+        scope.principal,
       );
       const durableAgent = current.agents.get(binding.agentId);
       if (!durableAgent) throw new Error('guarded agent was not registered');
@@ -874,7 +887,7 @@ export function createThreadAgentHost(
         if (
           !stored ||
           stored.agentId !== ref.agentId ||
-          !sameActor(stored.principal, scope.actor)
+          !samePrincipal(stored.principal, scope.principal)
         ) {
           throw new AgentHostRequestError(404, 'run not found');
         }
@@ -882,6 +895,7 @@ export function createThreadAgentHost(
           scope,
           ref.agentId,
           entryPath(body.entryPath),
+          stored.principal,
         );
         const durable = current.agents.get(module.meta.id);
         if (!durable) throw new Error('guarded agent was not registered');
@@ -893,7 +907,7 @@ export function createThreadAgentHost(
             : undefined;
         const execution: TrustedAgentExecution = {
           agentId: ref.agentId,
-          actor: stored.principal,
+          principal: stored.principal,
           threadId: scope.threadId,
           resourceId: ref.resourceId,
           runId: ref.runId,

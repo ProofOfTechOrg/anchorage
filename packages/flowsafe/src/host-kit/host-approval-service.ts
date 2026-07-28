@@ -11,12 +11,12 @@
 // span the isolate, not one request).
 
 import type {
-  ApprovalActor,
   ApprovalAuditEvent,
   ApprovalAuditSink,
   ApprovalDatabase,
   ApprovalNotificationSink,
   ApprovalStreamSink,
+  ExecutionPrincipal,
   SelfDecisionPolicy,
   SystemApprovalStore,
   TenantBoundApprovalStore,
@@ -41,8 +41,15 @@ import { numberVar } from './env-vars.js';
  * identity (RESERVED_TENANT_IDS), which no verifier admits and no store
  * binds to; per-record tenants ride in the audit detail.
  */
-export function maintenanceActor(systemActorId: string): ApprovalActor {
-  return { id: systemActorId, role: 'operator', tenantId: 'system' };
+export function maintenancePrincipal(
+  systemActorId: string,
+): ExecutionPrincipal {
+  return {
+    kind: 'system',
+    id: systemActorId,
+    tenantId: 'system',
+    purpose: 'approval-sla-maintenance',
+  };
 }
 
 // One factory per isolate, not per request: it owns the memoized schema-init
@@ -161,10 +168,13 @@ export function buildHostApprovalService(
   store: TenantBoundApprovalStore,
   options: HostApprovalServiceOptions,
 ): ApprovalService {
-  const systemActor: ApprovalActor = {
+  // Re-queueing a gate after a durable resume is platform work, not a person's
+  // action, so it files through the service's trusted system entry.
+  const systemPrincipal: ExecutionPrincipal = {
+    kind: 'system',
     id: options.systemActorId,
-    role: 'operator',
     tenantId: store.tenantId,
+    purpose: 'approval-requeue',
   };
   const audit = hostAuditSink({
     queue: options.queue,
@@ -180,7 +190,7 @@ export function buildHostApprovalService(
     resumeRun: resumeRunWithRequeue(
       options.resumeRun,
       () => service,
-      systemActor,
+      systemPrincipal,
       audit,
     ),
   });
@@ -190,8 +200,8 @@ export function buildHostApprovalService(
 export interface SlaSweepMaintenanceOptions {
   /** factory.system() — the cron-only cross-tenant view. */
   store: SystemApprovalStore;
-  /** maintenanceActor(systemActorId). */
-  systemActor: ApprovalActor;
+  /** maintenancePrincipal(systemActorId). */
+  systemPrincipal: ExecutionPrincipal;
   /** Optional audit export queue. */
   queue?: AuditQueue<ApprovalAuditEvent>;
   /** The firing cron expression — log correlation only. */
@@ -234,7 +244,7 @@ export async function runSlaSweepMaintenance(
   try {
     escalated = (
       await sweepSLA(options.store, {
-        systemActor: options.systemActor,
+        systemPrincipal: options.systemPrincipal,
         audit: hostAuditSink({
           queue: options.queue,
           keepAlive: (send) => pendingSends.push(send),

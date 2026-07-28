@@ -12,7 +12,12 @@ import type { TrustedAgentExecution } from './types.js';
 
 const execution: TrustedAgentExecution = {
   agentId: 'writer',
-  actor: { id: 'operator-1', role: 'operator', tenantId: 'acme' },
+  principal: {
+    kind: 'human',
+    id: 'operator-1',
+    tenantId: 'acme',
+    role: 'operator',
+  },
   threadId: 'acme_thread',
   resourceId: 'acme_resource',
   runId: 'acme_run',
@@ -76,6 +81,7 @@ describe('trusted agent context boundary', () => {
     expect(context.get('breakwater.actor')).toEqual({
       id: 'operator-1',
       role: 'operator',
+      kind: 'human',
     });
     expect(context.get('breakwater.auditContext')).toMatchObject({
       agentId: 'writer',

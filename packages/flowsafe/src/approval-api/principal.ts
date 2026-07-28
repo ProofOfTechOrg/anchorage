@@ -19,8 +19,8 @@
 // `PrincipalKind`), never the tenant or the purpose.
 
 import {
-  type ApprovalActor,
   APPROVAL_ROLES,
+  type ApprovalActor,
   type ApprovalRole,
 } from './contract.js';
 

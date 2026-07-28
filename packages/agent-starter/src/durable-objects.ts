@@ -12,6 +12,7 @@ import {
 import {
   ApprovalService,
   approvalGrantProvider,
+  humanPrincipal,
 } from '@proofoftech/flowsafe/approval-api';
 import {
   BackgroundTaskHost,
@@ -175,6 +176,7 @@ export class StarterThread extends ThreadDurableObject<Env> {
         threadId: input.threadId,
         tenantId: input.actor.tenantId,
         actor: input.actor,
+        principal: humanPrincipal(input.actor),
         requestedBy: input.actor.id,
         init: this.#initResult(),
       };

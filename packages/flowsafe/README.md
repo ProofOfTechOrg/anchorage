@@ -27,7 +27,7 @@ Compatibility:
 - TypeScript `moduleResolution: "NodeNext"`, `"Node16"`, or `"Bundler"`
 - `@mastra/core` in the declared `^1.50.0` peer range
 - `react` and `react-dom` `>=18 <20` (React 18 or 19) for the optional approval UI
-- `@proofoftech/breakwater` `>=0.6.0 <1.0.0` when used
+- `@proofoftech/breakwater` `>=0.7.0 <1.0.0` when used
 
 ## Choose an export
 

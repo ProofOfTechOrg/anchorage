@@ -197,6 +197,13 @@ export function validateAgentModule(module: AgentModule): AgentModule {
   // execute at all. If they disagree, the host either advertises automation
   // breakwater will refuse, or declares an agent automation-capable that its
   // catalog will never route to. Both are wiring bugs, so fail at construction.
+  // A handle from a breakwater older than the principal-kinds release has no
+  // such field. Say so, rather than throwing on `.filter` of undefined.
+  if (!Array.isArray(module.agent.allowedPrincipalKinds)) {
+    fail(
+      `agent '${meta.id}' was built by a @proofoftech/breakwater without principal kinds; >=0.7.0 is required`,
+    );
+  }
   const metaKinds = new Set(
     (meta.allowedAutomation ?? []).map((rule) => rule.kind),
   );
