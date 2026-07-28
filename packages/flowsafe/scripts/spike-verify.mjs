@@ -1706,6 +1706,32 @@ async function main() {
   );
 
   await step(
+    'O2 scheduled agent principal (D-S3): an unattended SYSTEM principal reaches ' +
+      'the guarded agent through the real Worker->DO hop, and arrives as automation',
+    async () => {
+      const { status, body } = await http('POST', '/sched/agent');
+      assert(status === 200, `sched agent probe -> ${status}`, body);
+      // The composition this proves: systemTenant mints kind:'system', the
+      // topology stamps x-flowsafe-principal, the DO rebuilds it as SYSTEM (not
+      // as a human), and the agent host admits it because SPIKE_AGENT_META
+      // declares system+schedule.fire. Before the principal header was stamped
+      // this failed 403 with the whole feature unreachable, and no unit test
+      // noticed because they all build the ThreadScope in-process.
+      assert(
+        body.result?.fired === 1,
+        'the agent target fired under an automated principal',
+        body,
+      );
+      assert(body.result?.failed === 0, 'no schedule fire was refused', body);
+      assert(
+        typeof body.runId === 'string' && body.runId.startsWith('spike_'),
+        'the fired agent runId is INV-1 (<tenantId>_<uuid>)',
+        body,
+      );
+    },
+  );
+
+  await step(
     'O schedule barrier + INV-1 (D-S2): a workflow schedule fires through ' +
       'RunnerRuntime with a fresh INV-1 runId and the stored-context barrier holds',
     async () => {

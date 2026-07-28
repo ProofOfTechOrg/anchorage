@@ -32,8 +32,8 @@
 
 import type { ApprovalActor, ApprovalRole } from '../approval-api/contract.js';
 import {
+  decodeExecutionPrincipal,
   type ExecutionPrincipal,
-  isExecutionPrincipal,
   principalActor,
 } from '../approval-api/principal.js';
 import type { DurableObjectRunnerState } from './cf-types.js';
@@ -238,13 +238,12 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
   }
 
   /**
-   * Reconstruct the execution principal from the trusted headers.
+   * Reconstruct the execution principal from the trusted header.
    *
-   * An absent principal header means a human — see THREAD_PRINCIPAL_HEADER for
-   * why that default cannot grant authority. A header that IS present but
-   * malformed, or that names an automated kind without a purpose, is refused
-   * rather than downgraded to human: a caller that tried to assert automation
-   * and got it wrong must not silently become a person.
+   * ABSENT IS A REFUSAL, not a human default. `createThreadTopology` stamps
+   * this on every send and forward — the only sanctioned way to reach a thread
+   * DO — so a request without it did not come through the topology. Defaulting
+   * to a human here would let a dropped header turn automation into a person.
    */
   #principalFrom(
     request: Request,
@@ -254,30 +253,26 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
   ): ExecutionPrincipal {
     const header = request.headers.get(THREAD_PRINCIPAL_HEADER);
     if (header === null) {
-      return { kind: 'human', id: actorId, tenantId, role };
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(header);
-    } catch {
       throw new ThreadIdentityError(
-        `thread identity mismatch: request for '${this.threadId}' carries an unparseable principal`,
+        `thread identity mismatch: request for '${this.threadId}' carries no trusted execution principal`,
       );
     }
-    const fields =
-      parsed !== null && typeof parsed === 'object'
-        ? (parsed as Record<string, unknown>)
-        : undefined;
-    const candidate =
-      fields?.kind === 'human'
-        ? { kind: 'human', id: actorId, tenantId, role }
-        : { ...fields, id: actorId, tenantId };
-    if (!isExecutionPrincipal(candidate)) {
+    const principal = decodeExecutionPrincipal(header, tenantId);
+    if (!principal) {
       throw new ThreadIdentityError(
-        `thread identity mismatch: request for '${this.threadId}' carries an invalid principal`,
+        `thread identity mismatch: request for '${this.threadId}' carries an invalid execution principal`,
       );
     }
-    return candidate;
+    // The two channels must agree: the id and role headers are what the tenant
+    // assertion and every existing thread route read, so a principal that
+    // disagrees with them would make the DO act as two identities at once.
+    const projected = principalActor(principal);
+    if (projected.id !== actorId || projected.role !== role) {
+      throw new ThreadIdentityError(
+        `thread identity mismatch: request for '${this.threadId}' carries a principal that disagrees with its actor headers`,
+      );
+    }
+    return principal;
   }
 
   #ensureInit(): InitResult {

@@ -111,3 +111,55 @@ describe('durable agent thread/run metadata', () => {
     ).rejects.toBeInstanceOf(AgentRunStateError);
   });
 });
+
+describe('agent run metadata migration', () => {
+  it('rejects a version-1 record rather than upgrading it to a human', async () => {
+    // #given — exactly what the previous release wrote for a schedule.fire run:
+    // an ApprovalActor whose fabricated role was 'operator'.
+    const storage = memoryStorage();
+    await storage.put('flowsafe:agent-run:v1:acme_run-1', {
+      version: 1,
+      agentId: 'writer',
+      principal: { id: 'flowsafe-system', role: 'operator', tenantId: 'acme' },
+      originEntryPath: 'schedule.fire',
+    });
+
+    // #when / #then — reading it back as a human would hand a scheduled job
+    // the authority of a human operator, so it fails closed instead.
+    await expect(
+      readAgentRunRecord(storage, 'acme_run-1'),
+    ).rejects.toBeInstanceOf(AgentRunStateError);
+  });
+
+  it('rejects a version-2 record whose principal is still an ApprovalActor', async () => {
+    // #given — the shape change, not just the version number.
+    const storage = memoryStorage();
+    await storage.put('flowsafe:agent-run:v1:acme_run-2', {
+      version: 2,
+      agentId: 'writer',
+      principal: { id: 'starter', role: 'operator', tenantId: 'acme' },
+      originEntryPath: 'http.start',
+    });
+
+    // #when / #then
+    await expect(
+      readAgentRunRecord(storage, 'acme_run-2'),
+    ).rejects.toBeInstanceOf(AgentRunStateError);
+  });
+
+  it('rejects an automated principal that carries no purpose', async () => {
+    // #given — purpose is the provenance the whole model restores.
+    const storage = memoryStorage();
+    await storage.put('flowsafe:agent-run:v1:acme_run-3', {
+      version: 2,
+      agentId: 'writer',
+      principal: { kind: 'system', id: 'sched', tenantId: 'acme' },
+      originEntryPath: 'schedule.fire',
+    });
+
+    // #when / #then
+    await expect(
+      readAgentRunRecord(storage, 'acme_run-3'),
+    ).rejects.toBeInstanceOf(AgentRunStateError);
+  });
+});

@@ -18,7 +18,8 @@ export interface AgentApprovalResumerOptions {
   topology: AgentThreadTopology;
   /**
    * Builds the tenant context the resume runs under, from the STORED principal.
-   * It must return that principal unchanged; the guard above enforces it.
+   * It must return that principal unchanged; createAgentApprovalResumer
+   * enforces that with an exact comparison after calling this.
    */
   tenantForPrincipal: (
     principal: ExecutionPrincipal,

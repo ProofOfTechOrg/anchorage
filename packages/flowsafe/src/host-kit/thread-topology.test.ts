@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 import { InMemoryStore } from '@mastra/core/storage';
 import { describe, expect, it } from 'vitest';
-
 import type { TenantContext } from '../approval-api/index.js';
+import {
+  type ExecutionPrincipal,
+  principalActor,
+} from '../approval-api/index.js';
 import {
   type InitResult,
   init,
   mintThreadId,
   THREAD_ACTOR_HEADER,
   THREAD_ACTOR_ROLE_HEADER,
+  THREAD_PRINCIPAL_HEADER,
   THREAD_TENANT_HEADER,
   ThreadDurableObject,
   type ThreadScope,
@@ -21,9 +25,19 @@ import {
   type ThreadStubLike,
 } from './thread-topology.js';
 
-function tenantContext(tenantId: string): TenantContext {
+function tenantContext(
+  tenantId: string,
+  principal?: ExecutionPrincipal,
+): TenantContext {
+  const effective: ExecutionPrincipal = principal ?? {
+    kind: 'human',
+    id: 'operator-1',
+    tenantId,
+    role: 'operator',
+  };
   return {
-    actor: { id: 'operator-1', role: 'operator', tenantId },
+    actor: principalActor(effective),
+    principal: effective,
     tenantId,
     // The production predicate, not a hand-copy — the exactness pins below ride
     // the real one (see memory-boundary.test.ts).
@@ -394,5 +408,134 @@ describe('createThreadTopology <-> ThreadDurableObject (mint meets verify)', () 
 
     // #then — the DO's own assertion catches it
     expect(response.status).toBe(403);
+  });
+});
+
+describe('execution principal on the wire (mint meets verify)', () => {
+  // The gap this closes: the principal header was defined, read by the DO, and
+  // refused inbound — but stamped by nothing. Every automated caller therefore
+  // arrived as a human and the agent host's automation gate was unreachable,
+  // while the whole suite stayed green because the agent-host tests build a
+  // ThreadScope in-process and never cross this boundary.
+  class ScopeThread extends ThreadDurableObject {
+    protected build(): InitResult {
+      return init({ storage: new InMemoryStore() });
+    }
+    protected route(_request: Request, scope: ThreadScope): Promise<Response> {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ principal: scope.principal, actor: scope.actor }),
+        ),
+      );
+    }
+  }
+
+  function scopeNamespace(): ThreadNamespaceLike<string> {
+    return {
+      idFromName: (name) => name,
+      get: (name): ThreadStubLike => {
+        const thread = new ScopeThread(
+          { id: { name } } as never,
+          {},
+        ) as unknown as { fetch(request: Request): Promise<Response> };
+        return {
+          fetch: (input: Request | string, init?: RequestInit) =>
+            thread.fetch(
+              typeof input === 'string' ? new Request(input, init) : input,
+            ),
+        } as ThreadStubLike;
+      },
+    };
+  }
+
+  const SCHEDULER: ExecutionPrincipal = {
+    kind: 'system',
+    id: 'flowsafe-scheduler',
+    tenantId: 'acme',
+    purpose: 'scheduled-agent-execution',
+  };
+
+  it('delivers an automated principal to the DO as automation, not as a human', async () => {
+    // #given
+    const topology = createThreadTopology(scopeNamespace());
+    const threadId = mintThreadId('acme', () => 't1');
+
+    // #when
+    const response = await topology.send(
+      tenantContext('acme', SCHEDULER),
+      threadId,
+      '/x',
+    );
+
+    // #then — kind survives the hop; without it the DO would rebuild a human.
+    await expect(response.json()).resolves.toEqual({
+      principal: SCHEDULER,
+      actor: { id: 'flowsafe-scheduler', role: 'viewer', tenantId: 'acme' },
+    });
+  });
+
+  it('delivers a human principal unchanged', async () => {
+    // #given
+    const topology = createThreadTopology(scopeNamespace());
+
+    // #when
+    const response = await topology.send(
+      tenantContext('acme'),
+      mintThreadId('acme', () => 't1'),
+      '/x',
+    );
+
+    // #then
+    await expect(response.json()).resolves.toEqual({
+      principal: {
+        kind: 'human',
+        id: 'operator-1',
+        tenantId: 'acme',
+        role: 'operator',
+      },
+      actor: { id: 'operator-1', role: 'operator', tenantId: 'acme' },
+    });
+  });
+
+  it('refuses a forged client principal, and a request that carries none', async () => {
+    // #given — the client asserts system automation on its own request.
+    const topology = createThreadTopology(scopeNamespace());
+    const threadId = mintThreadId('acme', () => 't1');
+    const forged = new Request('http://host/x', {
+      headers: {
+        [THREAD_PRINCIPAL_HEADER]: JSON.stringify({
+          kind: 'system',
+          id: 'operator-1',
+          purpose: 'privilege-escalation',
+        }),
+      },
+    });
+
+    // #when — forwarded under a HUMAN tenant context.
+    const response = await topology.forward(
+      tenantContext('acme'),
+      threadId,
+      forged,
+    );
+
+    // #then — the minter overwrites, so the DO sees the human.
+    const seen = (await response.json()) as { principal: ExecutionPrincipal };
+    expect(seen.principal.kind).toBe('human');
+
+    // #and — a request that never went through the minter is refused outright,
+    // rather than defaulting to a human.
+    const bare = new ScopeThread({ id: { name: threadId } } as never, {});
+    const direct = await (
+      bare as unknown as { fetch(request: Request): Promise<Response> }
+    ).fetch(
+      new Request('http://thread/x', {
+        headers: {
+          'x-flowsafe-tenant': 'acme',
+          'x-flowsafe-actor': 'operator-1',
+          'x-flowsafe-role': 'operator',
+        },
+      }),
+    );
+    expect(direct.status).toBe(403);
   });
 });

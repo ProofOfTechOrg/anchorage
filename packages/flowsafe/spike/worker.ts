@@ -96,7 +96,6 @@ import {
   D1ApprovalStoreFactory,
   defaultResumeData,
   type ExecutionPrincipal,
-  humanPrincipal,
   principalActor,
   type TenantBoundApprovalStore,
   type TenantContext,
@@ -987,8 +986,8 @@ export class DemoThread extends ThreadDurableObject<Env> {
       const scope = {
         threadId: input.threadId,
         tenantId: this.tenantId,
-        actor: input.actor,
-        principal: humanPrincipal(input.actor),
+        actor: principalActor(input.principal),
+        principal: input.principal,
         requestedBy: input.requestedBy,
         init: this.#initResult(),
       };
@@ -1543,6 +1542,12 @@ async function handleSignalProbe(
     ({
       tenantId,
       actor: { id: 'signal-probe', role: 'operator', tenantId },
+      principal: {
+        kind: 'human',
+        id: 'signal-probe',
+        tenantId,
+        role: 'operator',
+      },
       ownsMemoryId: (id: string) => tenantOwnsMemoryId(tenantId, id),
     }) as unknown as TenantContext;
 
@@ -1636,6 +1641,7 @@ async function handleGoalProbe(
     ({
       tenantId,
       actor: { id: 'goal-probe', role, tenantId },
+      principal: { kind: 'human', id: 'goal-probe', tenantId, role },
       ownsMemoryId: (id: string) => tenantOwnsMemoryId(tenantId, id),
     }) as unknown as TenantContext;
 
@@ -1819,6 +1825,28 @@ async function handleScheduleProbe(
     const id = `schedule_${crypto.randomUUID()}`;
     const threadId = mintThreadId('spike');
     const resourceId = mintResourceId('spike', threadId);
+    // A threaded schedule fires only through an EXISTING binding, so bind the
+    // thread with a human start first. That is also what makes the probe
+    // meaningful: the thread belongs to a person, and the later unattended fire
+    // must still arrive as SYSTEM rather than inheriting that person's role.
+    await createAgentThreadTopology(env.THREAD).start(
+      tenantContextForPrincipal(
+        {
+          kind: 'human',
+          id: 'sched-owner',
+          tenantId: 'spike',
+          role: 'operator',
+        },
+        env,
+      ),
+      {
+        agentId: SPIKE_AGENT_ID,
+        prompt: 'Bind this thread.',
+        entryPath: 'http.start',
+        threadId,
+        resourceId,
+      },
+    );
     await store.createSchedule({
       id,
       target: {
@@ -1883,6 +1911,7 @@ async function handleScheduleProbe(
       threadId,
       resourceId,
       runId: trigger?.runId ?? null,
+      error: trigger?.error ?? null,
     });
   }
 

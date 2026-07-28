@@ -237,6 +237,7 @@ export class ApprovalService {
       input,
       principalActor(principal),
       resumeTarget,
+      principalAuditFields(principal),
     );
   }
 
@@ -244,6 +245,7 @@ export class ApprovalService {
     input: CreateApprovalInput,
     actor: ApprovalActor,
     resumeTarget?: ApprovalResumeTarget,
+    provenance?: Record<string, unknown>,
   ): Promise<{ record: ApprovalRecord; created: boolean }> {
     this.#validateCreate(input);
     const now = this.#now();
@@ -300,6 +302,7 @@ export class ApprovalService {
           workflowId: result.record.workflowId,
           runId: result.record.runId,
           created: result.created,
+          ...provenance,
         },
       },
     );
@@ -629,13 +632,19 @@ export class ApprovalService {
     reason: string,
   ): Promise<ApprovalRecord | null> {
     this.#authorizeAutomated(principal, 'approval.supersede', `approval:${id}`);
-    return this.#supersedeAuthorized(id, principalActor(principal), reason);
+    return this.#supersedeAuthorized(
+      id,
+      principalActor(principal),
+      reason,
+      principalAuditFields(principal),
+    );
   }
 
   async #supersedeAuthorized(
     id: string,
     actor: ApprovalActor,
     reason: string,
+    provenance?: Record<string, unknown>,
   ): Promise<ApprovalRecord | null> {
     const now = this.#now().toISOString();
     const updated = await this.#store.transition(id, OPEN_STATUSES, {
@@ -653,6 +662,7 @@ export class ApprovalService {
         tenantId: updated.tenantId,
         workflowId: updated.workflowId,
         runId: updated.runId,
+        ...provenance,
       },
     });
     // `reason` here is the supersede reason (method arg); the reportError arg
@@ -830,24 +840,20 @@ export class ApprovalService {
     action: string,
     resource: string,
   ): void {
-    const automated =
-      principal?.kind !== undefined && principal.kind !== 'human';
-    if (
-      automated &&
-      isNonEmptyString(principal.id) &&
-      isNonEmptyString(principal.tenantId) &&
-      principal.tenantId === this.#store.tenantId
-    ) {
-      return;
-    }
+    // Full validation, not a three-field subset: `purpose` is the provenance
+    // this whole model exists to restore, so the trusted entry must not be the
+    // one place it can be omitted.
+    const valid = isExecutionPrincipal(principal);
+    const automated = valid && principal.kind !== 'human';
+    if (automated && principal.tenantId === this.#store.tenantId) return;
     this.#record(
-      principal ? principalActor(principal) : null,
+      valid ? principalActor(principal) : null,
       action,
       resource,
       'denied',
       {
-        reason: !principal
-          ? 'no principal'
+        reason: !valid
+          ? 'principal is malformed'
           : !automated
             ? `principal kind '${principal.kind}' must use the role-authorized entry`
             : `principal tenant '${principal.tenantId}' does not match the store binding '${this.#store.tenantId}'`,
@@ -856,7 +862,7 @@ export class ApprovalService {
     throw new ApprovalAuthzError(
       automated
         ? `${action}: principal tenant does not match this service's tenant binding`
-        : `${action} requires an automated execution principal`,
+        : `${action} requires a valid automated execution principal`,
     );
   }
 

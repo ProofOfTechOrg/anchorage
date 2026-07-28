@@ -24,10 +24,14 @@
 // keeping host-kit free of @cloudflare/workers-types — same convention as
 // RunnerNamespaceLike / HubNamespaceLike.
 
-import type { TenantContext } from '../approval-api/index.js';
+import {
+  encodeExecutionPrincipal,
+  type TenantContext,
+} from '../approval-api/index.js';
 import {
   THREAD_ACTOR_HEADER,
   THREAD_ACTOR_ROLE_HEADER,
+  THREAD_PRINCIPAL_HEADER,
   THREAD_TENANT_HEADER,
 } from '../do-runner/index.js';
 import { requireOwnedMemoryId } from './memory-boundary.js';
@@ -122,6 +126,13 @@ export function createThreadTopology<Id>(
       merged.set(THREAD_TENANT_HEADER, tenant.tenantId);
       merged.set(THREAD_ACTOR_HEADER, tenant.actor.id);
       merged.set(THREAD_ACTOR_ROLE_HEADER, tenant.actor.role);
+      // WHO is executing, not just what role they project. Without this the DO
+      // reconstructs every caller as a human and the agent host's automation
+      // gate is unreachable.
+      merged.set(
+        THREAD_PRINCIPAL_HEADER,
+        encodeExecutionPrincipal(tenant.principal),
+      );
       const headers: Record<string, string> = {};
       merged.forEach((value, key) => {
         headers[key] = value;
@@ -141,6 +152,10 @@ export function createThreadTopology<Id>(
       forwarded.headers.set(THREAD_TENANT_HEADER, tenant.tenantId);
       forwarded.headers.set(THREAD_ACTOR_HEADER, tenant.actor.id);
       forwarded.headers.set(THREAD_ACTOR_ROLE_HEADER, tenant.actor.role);
+      forwarded.headers.set(
+        THREAD_PRINCIPAL_HEADER,
+        encodeExecutionPrincipal(tenant.principal),
+      );
       return stub(addressed).fetch(forwarded);
     },
   };

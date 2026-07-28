@@ -3,12 +3,15 @@ import type { DurableObjectState } from '@cloudflare/workers-types';
 import { InMemoryStore } from '@mastra/core/storage';
 import { describe, expect, it } from 'vitest';
 
+import { encodeExecutionPrincipal } from '../approval-api/index.js';
+
 import { type InitResult, init } from './init.js';
 import { mintThreadId } from './memory-id.js';
 import { ThreadDurableObject, type ThreadScope } from './thread-do.js';
 import {
   THREAD_ACTOR_HEADER,
   THREAD_ACTOR_ROLE_HEADER,
+  THREAD_PRINCIPAL_HEADER,
   THREAD_TENANT_HEADER,
 } from './thread-header.js';
 
@@ -49,6 +52,19 @@ function request(
   if (tenantId !== undefined) headers.set(THREAD_TENANT_HEADER, tenantId);
   if (requestedBy !== null) headers.set(THREAD_ACTOR_HEADER, requestedBy);
   headers.set(THREAD_ACTOR_ROLE_HEADER, 'operator');
+  // The topology stamps this on every send; the DO refuses a request without
+  // it rather than rebuilding the caller as a human.
+  if (requestedBy !== null) {
+    headers.set(
+      THREAD_PRINCIPAL_HEADER,
+      encodeExecutionPrincipal({
+        kind: 'human',
+        id: requestedBy,
+        tenantId: tenantId ?? 'acme',
+        role: 'operator',
+      }),
+    );
+  }
   return new Request('http://thread/messages', {
     method: 'POST',
     headers,

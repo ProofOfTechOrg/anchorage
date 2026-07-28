@@ -12,10 +12,18 @@
 // production.
 
 // The requestContext key literals live in do-runner/breakwater-keys.ts —
-// the runtime mints the workflow-scope key itself, and homing the literals
-// in a do-runner leaf keeps approval-api -> do-runner as the only
-// cross-directory dependency direction. Re-exported here because this
-// module is the approval-api's contract surface.
+// the runtime mints the workflow-scope key itself, and homing the literals in a
+// do-runner leaf kept approval-api -> do-runner as the only cross-directory
+// dependency direction. Re-exported here because this module is the
+// approval-api's contract surface.
+//
+// That is no longer the ONLY direction: do-runner/thread-do.ts imports
+// approval-api/principal.js, because reconstructing an ExecutionPrincipal at
+// the DO trust boundary needs the same validator every other consumer uses, and
+// the principal's role vocabulary lives here. No runtime cycle exists
+// (principal.ts -> contract.ts -> breakwater-keys.ts, a pure-const leaf), but
+// the graph is bidirectional at the directory level. Homing the principal in a
+// do-runner leaf instead would require moving the role vocabulary with it.
 import type { ApprovalRecord } from './types.js';
 
 export {

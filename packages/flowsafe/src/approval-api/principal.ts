@@ -69,6 +69,8 @@ export type ExecutionPrincipal =
       id: string;
       tenantId: string;
       purpose: string;
+      /** Only an agent delegates; `never` makes a wrong shape a type error. */
+      delegatedBy?: never;
     }
   | {
       kind: 'agent';
@@ -83,6 +85,7 @@ export type ExecutionPrincipal =
       id: string;
       tenantId: string;
       purpose: string;
+      delegatedBy?: never;
     };
 
 export class ExecutionPrincipalError extends Error {
@@ -92,10 +95,21 @@ export class ExecutionPrincipalError extends Error {
   }
 }
 
+/**
+ * Bounded, non-empty, and free of header control characters — the principal is
+ * serialized into a request header on the way to a thread DO, so a newline in
+ * any field would be header injection. Mirrors the `containsHeaderControl`
+ * check `createTenantResolver` already applies to an actor id.
+ */
 function boundedText(value: unknown, max: number): value is string {
-  return (
-    typeof value === 'string' && value.trim() !== '' && value.length <= max
-  );
+  if (typeof value !== 'string' || value.trim() === '' || value.length > max) {
+    return false;
+  }
+  for (const character of value) {
+    const code = character.charCodeAt(0);
+    if (code <= 0x1f || code === 0x7f) return false;
+  }
+  return true;
 }
 
 /**
@@ -164,32 +178,30 @@ export function assertExecutionPrincipal(
   return value;
 }
 
-export function isAutomatedPrincipal(
-  principal: ExecutionPrincipal,
-): principal is Extract<ExecutionPrincipal, { kind: AutomatedPrincipalKind }> {
-  return principal.kind !== 'human';
-}
-
-/** Structural equality across every kind-specific field. */
+/**
+ * Structural equality across every kind-specific field.
+ *
+ * Cast-free: the union narrows on `kind`, so a future variant with a new
+ * discriminating field becomes a compile error here rather than silently
+ * comparing equal. Three rebinding guards depend on that.
+ */
 export function samePrincipal(
   left: ExecutionPrincipal,
   right: ExecutionPrincipal,
 ): boolean {
-  if (
-    left.kind !== right.kind ||
-    left.id !== right.id ||
-    left.tenantId !== right.tenantId
-  ) {
-    return false;
+  if (left.id !== right.id || left.tenantId !== right.tenantId) return false;
+  if (left.kind === 'human' || right.kind === 'human') {
+    return (
+      left.kind === 'human' &&
+      right.kind === 'human' &&
+      left.role === right.role
+    );
   }
-  if (left.kind === 'human') {
-    return left.role === (right as typeof left).role;
-  }
-  const a = left as Extract<ExecutionPrincipal, { purpose: string }> & {
-    delegatedBy?: string;
-  };
-  const b = right as typeof a;
-  return a.purpose === b.purpose && a.delegatedBy === b.delegatedBy;
+  return (
+    left.kind === right.kind &&
+    left.purpose === right.purpose &&
+    left.delegatedBy === right.delegatedBy
+  );
 }
 
 /**
@@ -214,12 +226,82 @@ export const AUTOMATED_PROJECTED_ROLE: ApprovalRole = 'viewer';
  * gates (CAN_CREATE, DECIDER_ROLES) treat them as read-only.
  */
 export function principalActor(principal: ExecutionPrincipal): ApprovalActor {
+  const { id, role } = breakwaterActorFor(principal);
+  return { id, role, tenantId: principal.tenantId };
+}
+
+/**
+ * The principal as breakwater's `Actor`. The ONE place the projection rule is
+ * written; `principalActor` and the trusted request context both go through it
+ * so the breakwater-facing and approval-facing identities cannot disagree.
+ */
+export function breakwaterActorFor(principal: ExecutionPrincipal): {
+  id: string;
+  role: ApprovalRole;
+  kind: ExecutionPrincipalKind;
+} {
   return {
     id: principal.id,
     role:
       principal.kind === 'human' ? principal.role : AUTOMATED_PROJECTED_ROLE,
-    tenantId: principal.tenantId,
+    kind: principal.kind,
   };
+}
+
+/**
+ * Serialize a principal for the trusted thread header. Every field is already
+ * bounded and header-control-free (`boundedText`), so plain JSON is safe and
+ * stays readable in a trace.
+ */
+export function encodeExecutionPrincipal(
+  principal: ExecutionPrincipal,
+): string {
+  return JSON.stringify(
+    principal.kind === 'human'
+      ? { kind: 'human', id: principal.id, role: principal.role }
+      : {
+          kind: principal.kind,
+          id: principal.id,
+          purpose: principal.purpose,
+          ...(principal.delegatedBy !== undefined
+            ? { delegatedBy: principal.delegatedBy }
+            : {}),
+        },
+  );
+}
+
+/**
+ * Rebuild a principal from the trusted header, binding it to the tenant the DO
+ * already authenticated. Fields are picked EXPLICITLY rather than spread, so an
+ * attacker-supplied extra property cannot ride into DO storage or D1.
+ *
+ * Returns undefined on anything malformed; the caller fails closed.
+ */
+export function decodeExecutionPrincipal(
+  header: string,
+  tenantId: string,
+): ExecutionPrincipal | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(header);
+  } catch {
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== 'object') return undefined;
+  const fields = parsed as Record<string, unknown>;
+  const candidate =
+    fields.kind === 'human'
+      ? { kind: 'human', id: fields.id, tenantId, role: fields.role }
+      : {
+          kind: fields.kind,
+          id: fields.id,
+          tenantId,
+          purpose: fields.purpose,
+          ...(fields.delegatedBy !== undefined
+            ? { delegatedBy: fields.delegatedBy }
+            : {}),
+        };
+  return isExecutionPrincipal(candidate) ? candidate : undefined;
 }
 
 /** An authenticated human at the HTTP boundary, as an execution principal. */

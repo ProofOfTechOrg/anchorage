@@ -116,7 +116,7 @@ Host rules:
 2. Resolve the authenticated `TenantContext`.
 3. Return 404 for a foreign stored id with `requireOwnedMemoryId()`.
 4. Address the thread Durable Object through `createThreadTopology()`.
-5. Let the topology overwrite `x-flowsafe-tenant`, `x-flowsafe-actor`, and `x-flowsafe-role` from the resolved context.
+5. Let the topology overwrite `x-flowsafe-tenant`, `x-flowsafe-actor`, `x-flowsafe-role`, and `x-flowsafe-principal` from the resolved context. The Durable Object refuses a request that carries no principal header rather than treating the caller as a human.
 6. Have `ThreadDurableObject` reconstruct the actor and verify the stamped tenant against its own `id.name` prefix.
 
 The D1 recall-path tests use one database and the same business key for two tenants. They prove isolated `recall`, `listThreads`, and working memory behavior through Mastra's own memory implementation.

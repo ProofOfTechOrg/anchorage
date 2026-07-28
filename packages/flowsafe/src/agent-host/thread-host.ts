@@ -670,8 +670,11 @@ export function createThreadAgentHost(
         'suspended agent run has no recoverable execution principal',
       );
     }
-    // The scope's PRINCIPAL, not its actor: falling back to the requester's
-    // human identity would relabel an automated run as whoever polled status.
+    // Inert today — a suspended run without a stored record already threw 409
+    // above, and only a suspended run consults this. Kept as the scope's
+    // PRINCIPAL rather than its actor so that if those two conditions are ever
+    // decoupled, the fallback still cannot relabel an automated run as whoever
+    // happened to poll its status.
     const principal = stored?.principal ?? scope.principal;
     const result = await envelopeFor(scope, ref, principal, summary);
     if (isTerminalRunStatus(summary.status) && stored) {

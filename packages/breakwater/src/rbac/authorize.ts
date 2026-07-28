@@ -4,16 +4,16 @@ import type { RequestContext } from '@mastra/core/request-context';
 
 import { type AuditLogger, agentAuditDetail } from '../audit/index.js';
 import type { Actor, Role } from './index.js';
-import {
-  DEFAULT_ALLOWED_PRINCIPAL_KINDS,
-  type PrincipalKind,
-  principalKindOf,
-} from './principal.js';
+import { type PrincipalKind, principalKindOf } from './principal.js';
 
 export interface ActorAuthorizationOptions {
   allowedRoles: readonly Role[];
-  /** Defaults to `['human']` — automated principals are denied unless named. */
-  allowedPrincipalKinds?: readonly PrincipalKind[];
+  /**
+   * Required, because both call sites normalize it through
+   * `assertPrincipalKinds` first. A default here would be a second place the
+   * human-only policy could drift from that one.
+   */
+  allowedPrincipalKinds: readonly PrincipalKind[];
   audit?: AuditLogger;
   resource: string;
   requestContext?: RequestContext;
@@ -61,8 +61,7 @@ export function authorizeActor(options: ActorAuthorizationOptions): Actor {
   // Kind before role, and fail closed on an unnamed kind: a host that has not
   // thought about automation must not have its human role allowlist quietly
   // answer a question about a scheduled job.
-  const allowedKinds =
-    options.allowedPrincipalKinds ?? DEFAULT_ALLOWED_PRINCIPAL_KINDS;
+  const allowedKinds = options.allowedPrincipalKinds;
   const kind = principalKindOf(actor);
   if (!allowedKinds.includes(kind)) {
     const reason = `principal kind '${kind}' is not in allowed kinds [${allowedKinds.join(', ')}]`;

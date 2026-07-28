@@ -4,8 +4,8 @@ import { RequestContext } from '@mastra/core/request-context';
 import { AGENT_AUDIT_CONTEXT_KEY } from '@proofoftech/breakwater/audit';
 
 import {
-  AUTOMATED_PROJECTED_ROLE,
   BREAKWATER_ACTOR_KEY,
+  breakwaterActorFor,
   principalAuditFields,
 } from '../approval-api/index.js';
 import {
@@ -43,16 +43,10 @@ export function deriveTrustedAgentContext(
     runId: execution.runId,
     threadId: execution.threadId,
     resourceId: execution.resourceId,
-    // The `kind` is what breakwater's mandatory gate authorizes on. `role` is
-    // required by breakwater's Actor and is authoritative only for humans; an
-    // automated principal projects the least-privileged label so that anything
-    // reading `role` without understanding `kind` sees the minimum.
-    [BREAKWATER_ACTOR_KEY]: {
-      id: principal.id,
-      role:
-        principal.kind === 'human' ? principal.role : AUTOMATED_PROJECTED_ROLE,
-      kind: principal.kind,
-    },
+    // `kind` is what breakwater's mandatory gate authorizes on; the projection
+    // rule itself lives in breakwaterActorFor so this and the approval-facing
+    // actor cannot drift apart.
+    [BREAKWATER_ACTOR_KEY]: breakwaterActorFor(principal),
     [AGENT_AUDIT_CONTEXT_KEY]: {
       agentId: execution.agentId,
       tenantId: principal.tenantId,
