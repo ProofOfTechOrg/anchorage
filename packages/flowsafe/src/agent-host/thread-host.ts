@@ -493,11 +493,13 @@ export function createThreadAgentHost(
 
   // Reconciling approvals is trusted platform work with no person behind it.
   // It used to mint role:'operator', which is why an approval bridge looked
-  // indistinguishable from a human operator in the audit trail.
+  // indistinguishable from a human operator in the audit trail. The bridge
+  // mints its own principal from this id against the service's tenant.
+  const systemActorId = options.systemActorId ?? 'flowsafe-system';
   const systemPrincipal = (scope: ThreadScope) =>
     trustAutomationPrincipal({
       kind: 'system',
-      id: options.systemActorId ?? 'flowsafe-system',
+      id: systemActorId,
       tenantId: scope.tenantId,
       purpose: 'approval-suspension-reconcile',
     });
@@ -515,7 +517,7 @@ export function createThreadAgentHost(
       service,
       DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
       summary,
-      systemPrincipal(scope),
+      systemActorId,
       {
         kind: 'agent-thread',
         agentId,

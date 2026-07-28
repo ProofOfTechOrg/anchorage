@@ -30,7 +30,7 @@
 // DurableObject` from 'cloudflare:workers' — so this module and its graph load
 // in node/vitest, the same posture as DurableObjectRunner and HubDurableObject.
 
-import type { ApprovalActor, ApprovalRole } from '../approval-api/contract.js';
+import type { ApprovalActor } from '../approval-api/contract.js';
 import {
   decodeExecutionPrincipal,
   type ExecutionPrincipal,
@@ -42,19 +42,9 @@ import type { InitResult } from './init.js';
 import { tenantOfMemoryId } from './memory-id.js';
 import { DurableStorageResumeLedger } from './resume-ledger.js';
 import {
-  THREAD_ACTOR_HEADER,
-  THREAD_ACTOR_ROLE_HEADER,
   THREAD_PRINCIPAL_HEADER,
   THREAD_TENANT_HEADER,
 } from './thread-header.js';
-
-const THREAD_ACTOR_ROLES: readonly ApprovalRole[] = [
-  'admin',
-  'builder',
-  'operator',
-  'reviewer',
-  'viewer',
-];
 
 /**
  * A request refused at the thread DO's identity boundary: the DO's name carries
@@ -207,27 +197,7 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
         `thread identity mismatch: instance '${threadId}' belongs to tenant '${tenantId}' but the request authenticates as '${claimed ?? '<none>'}' — refusing`,
       );
     }
-    const actorId = request.headers.get(THREAD_ACTOR_HEADER);
-    if (!actorId) {
-      throw new ThreadIdentityError(
-        `thread identity mismatch: request for '${threadId}' carries no trusted actor`,
-      );
-    }
-    const role = request.headers.get(THREAD_ACTOR_ROLE_HEADER);
-    if (
-      role === null ||
-      !(THREAD_ACTOR_ROLES as readonly string[]).includes(role)
-    ) {
-      throw new ThreadIdentityError(
-        `thread identity mismatch: request for '${threadId}' carries no valid trusted actor role`,
-      );
-    }
-    const principal = this.#principalFrom(
-      request,
-      actorId,
-      role as ApprovalRole,
-      tenantId,
-    );
+    const principal = this.#principalFrom(request, tenantId);
     return {
       threadId,
       tenantId,
@@ -244,13 +214,11 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
    * this on every send and forward — the only sanctioned way to reach a thread
    * DO — so a request without it did not come through the topology. Defaulting
    * to a human here would let a dropped header turn automation into a person.
+   *
+   * This is the SOLE identity channel: `scope.actor` is projected from the
+   * principal rather than carried alongside it, so the two can never disagree.
    */
-  #principalFrom(
-    request: Request,
-    actorId: string,
-    role: ApprovalRole,
-    tenantId: string,
-  ): ExecutionPrincipal {
+  #principalFrom(request: Request, tenantId: string): ExecutionPrincipal {
     const header = request.headers.get(THREAD_PRINCIPAL_HEADER);
     if (header === null) {
       throw new ThreadIdentityError(
@@ -261,15 +229,6 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
     if (!principal) {
       throw new ThreadIdentityError(
         `thread identity mismatch: request for '${this.threadId}' carries an invalid execution principal`,
-      );
-    }
-    // The two channels must agree: the id and role headers are what the tenant
-    // assertion and every existing thread route read, so a principal that
-    // disagrees with them would make the DO act as two identities at once.
-    const projected = principalActor(principal);
-    if (projected.id !== actorId || projected.role !== role) {
-      throw new ThreadIdentityError(
-        `thread identity mismatch: request for '${this.threadId}' carries a principal that disagrees with its actor headers`,
       );
     }
     return principal;

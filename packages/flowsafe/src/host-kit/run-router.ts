@@ -30,7 +30,6 @@ import {
   type TenantContext,
   TenantResolutionError,
   type TenantResolver,
-  trustAutomationPrincipal,
 } from '../approval-api/index.js';
 import {
   InvalidRunRequestError,
@@ -259,20 +258,12 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
           body.inputData,
         );
         if (summary.status !== 'suspended') return json(summary);
-        // Filing the gate is platform work, not the requester's action, and
-        // not a person's. It files through the service's trusted system entry.
-        const systemPrincipal = trustAutomationPrincipal({
-          kind: 'system',
-          id: systemActorId,
-          tenantId: tenant.tenantId,
-          purpose: 'approval-suspension-reconcile',
-        });
         const approvals = await queueApprovalForSuspension(
           tenant.service(),
           body.workflowId,
           summary,
           actor.id,
-          systemPrincipal,
+          systemActorId,
         );
         // `approval` remains the single-gate response contract (what the SPA
         // links); `approvals` carries every record a parallel multi-step

@@ -192,6 +192,15 @@ export class ApprovalService {
   readonly #allowSelfDecision?: SelfDecisionPolicy;
   readonly #now: () => Date;
 
+  /**
+   * The tenant this service is bound to. Exposed so the host-kit bridges can
+   * mint their own bookkeeping principal against it instead of making every
+   * host construct one and vouch for it.
+   */
+  get tenantId(): string {
+    return this.#store.tenantId;
+  }
+
   constructor(options: ApprovalServiceOptions) {
     this.#store = options.store;
     this.#audit = options.audit;

@@ -222,8 +222,10 @@ function harness(
     approvalService: (instanceScope) => {
       approvalScopes.push(instanceScope);
       return {
+        // The bridge mints its bookkeeping principal against this binding.
+        tenantId: 'acme',
         list: async () => [],
-        create: async () => {
+        createAsPrincipal: async () => {
           throw new Error('unexpected approval creation');
         },
       } as unknown as import('../approval-api/index.js').ApprovalService;

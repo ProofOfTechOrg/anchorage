@@ -27,7 +27,6 @@ import {
   createTenantResolver,
   InMemoryApprovalStoreFactory,
   resumeViaRuntime,
-  trustAutomationPrincipal,
 } from '@proofoftech/flowsafe/approval-api';
 import { tenantOfRunId } from '@proofoftech/flowsafe/do-runner';
 import {
@@ -201,12 +200,6 @@ export function runApiDevPlugin(): Plugin {
   // later decision) — the same const-with-deferred-ref pattern the worker
   // uses. resumeRunWithRequeue resumes in-process and re-queues the next gate.
   function buildService(store: TenantBoundApprovalStore): ApprovalService {
-    const systemPrincipal = trustAutomationPrincipal({
-      kind: 'system',
-      id: SYSTEM_ACTOR_ID,
-      tenantId: store.tenantId,
-      purpose: 'approval-requeue',
-    });
     const service: ApprovalService = new ApprovalService({
       store,
       defaultSlaSeconds: 3600,
@@ -220,7 +213,7 @@ export function runApiDevPlugin(): Plugin {
       resumeRun: resumeRunWithRequeue(
         resumeViaRuntime(runtime),
         () => service,
-        systemPrincipal,
+        SYSTEM_ACTOR_ID,
       ),
     });
     return service;

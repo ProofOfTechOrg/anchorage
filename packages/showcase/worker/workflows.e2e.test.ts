@@ -17,7 +17,6 @@ import {
   type InMemoryApprovalStore,
   InMemoryApprovalStoreFactory,
   resumeViaRuntime,
-  trustAutomationPrincipal,
 } from '@proofoftech/flowsafe/approval-api';
 import { InMemoryArtifactBucket } from '@proofoftech/flowsafe/artifacts';
 import type { RunSummary } from '@proofoftech/flowsafe/do-runner';
@@ -34,12 +33,7 @@ import { CRM_ASSIGN_CONNECTOR } from '#worker/workflows/lead-generation';
 import { DEPLOY_CONNECTOR } from '#worker/workflows/product-launch';
 import { WIRE_CONNECTOR } from '#worker/workflows/wire-transfer';
 
-const SYSTEM = trustAutomationPrincipal({
-  kind: 'system',
-  id: 'sys',
-  tenantId: 'demo',
-  purpose: 'test-reconcile',
-});
+const SYSTEM = 'sys';
 const REVIEWER: ApprovalActor = {
   id: 'ray',
   role: 'reviewer',
@@ -618,7 +612,7 @@ describe('showcase run routes', () => {
             ),
           }),
       }),
-      systemActorId: SYSTEM.id,
+      systemActorId: SYSTEM,
       start: (workflowId, runId, inputData) =>
         harness.runtime.start(workflowId, { runId, inputData }),
       status: async (workflowId, runId) =>

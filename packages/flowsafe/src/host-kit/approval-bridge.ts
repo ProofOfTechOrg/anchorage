@@ -84,18 +84,43 @@ export function requestedConnectors(stepPayload: unknown): string[] {
  * next gate. It must NOT be the system actor: the library's self-decision
  * separation-of-duties check compares `requestedBy` to the deciding actor, so
  * attributing every request to the system actor would make that check unfireable.
- * `systemPrincipal` is only the record's creator. It is an automated
- * ExecutionPrincipal filed through the service's trusted system entry, never a
- * fabricated human role.
+ * `systemActorId` names only the record's creator. The bridge mints its own
+ * automated principal from it against the service's tenant binding, so a host
+ * never performs the trust assertion for the platform's own bookkeeping.
  */
+/**
+ * The platform's own bookkeeping identity for one service. Minted here rather
+ * than taken from the caller: every in-repo user files under a system principal
+ * with a fixed purpose and the service's own tenant, so requiring hosts to
+ * construct and vouch for one only spread `trustAutomationPrincipal` into host
+ * code — and into the sample every consumer copies.
+ */
+function bookkeepingPrincipal(
+  service: ApprovalService,
+  systemActorId: string,
+  purpose: string,
+): TrustedAutomationPrincipal {
+  return trustAutomationPrincipal({
+    kind: 'system',
+    id: systemActorId,
+    tenantId: service.tenantId,
+    purpose,
+  });
+}
+
 export async function queueApprovalForSuspension(
   service: ApprovalService,
   workflowId: string,
   summary: RunSummary,
   requestedBy: string,
-  systemPrincipal: TrustedAutomationPrincipal,
+  systemActorId: string,
   resumeTarget?: ApprovalResumeTarget,
 ): Promise<ApprovalRecord[]> {
+  const systemPrincipal = bookkeepingPrincipal(
+    service,
+    systemActorId,
+    'approval-suspension-reconcile',
+  );
   const suspended = summary.suspended ?? [];
   const records: ApprovalRecord[] = [];
   const failures: Array<{ stepKey: string; message: string }> = [];
@@ -176,7 +201,7 @@ export async function queueApprovalForSuspension(
 export function resumeRunWithRequeue(
   base: ResumeRunFn,
   getService: () => ApprovalService,
-  systemPrincipal: TrustedAutomationPrincipal,
+  systemActorId: string,
   audit?: ApprovalAuditSink,
 ): ResumeRunFn {
   return async (record, decision) => {
@@ -197,7 +222,7 @@ export function resumeRunWithRequeue(
           record.workflowId,
           summary,
           requestedBy,
-          systemPrincipal,
+          systemActorId,
           record.resumeTarget,
         );
       } catch (error) {
@@ -206,7 +231,11 @@ export function resumeRunWithRequeue(
         // ApprovalService's own #record).
         try {
           const outcome = audit?.({
-            actor: principalActor(systemPrincipal),
+            actor: {
+              id: systemActorId,
+              role: 'viewer',
+              tenantId: record.tenantId,
+            },
             action: 'approval.requeue',
             resource: `approval:${record.id}`,
             decision: 'error',
@@ -308,10 +337,15 @@ export async function reconcileApprovalsForSummary(
   service: ApprovalService,
   workflowId: string,
   summary: RunSummary,
-  systemPrincipal: TrustedAutomationPrincipal,
+  systemActorId: string,
   resumeTarget?: ApprovalResumeTarget,
-  requestedBy = systemPrincipal.id,
+  requestedBy = systemActorId,
 ): Promise<ApprovalRecord[]> {
+  const systemPrincipal = bookkeepingPrincipal(
+    service,
+    systemActorId,
+    'approval-suspension-reconcile',
+  );
   const suspended = summary.suspended ?? [];
   if (suspended.length === 0) return [];
   const existing = await listAllApprovals(
@@ -356,7 +390,7 @@ export async function reconcileApprovalsForSummary(
     workflowId,
     { ...summary, suspended: toFile },
     requestedBy,
-    systemPrincipal,
+    systemActorId,
     resumeTarget,
   );
 }
@@ -380,12 +414,7 @@ export function reconcileApprovalsOnStatus(
       tenant.service(),
       workflowId,
       summary,
-      trustAutomationPrincipal({
-        kind: 'system',
-        id: systemActorId,
-        tenantId: tenant.tenantId,
-        purpose: 'approval-suspension-reconcile',
-      }),
+      systemActorId,
     );
   };
 }

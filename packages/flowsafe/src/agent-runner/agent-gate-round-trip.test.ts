@@ -26,18 +26,12 @@ import {
   approvalGrantProvider,
   resumeViaRuntime,
 } from '../approval-api/grants.js';
-import { trustAutomationPrincipal } from '../approval-api/principal.js';
 import { ApprovalService } from '../approval-api/service.js';
 import { InMemoryApprovalStore } from '../approval-api/store.js';
 import { init } from '../do-runner/init.js';
 import { queueApprovalForSuspension } from '../host-kit/approval-bridge.js';
 
-const SYSTEM = trustAutomationPrincipal({
-  kind: 'system',
-  id: 'sys',
-  tenantId: 'acme',
-  purpose: 'test-reconcile',
-});
+const SYSTEM = 'sys';
 const REVIEWER: ApprovalActor = {
   id: 'rev',
   role: 'reviewer',

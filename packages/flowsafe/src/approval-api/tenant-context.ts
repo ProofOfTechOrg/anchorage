@@ -16,8 +16,6 @@ import {
   tenantOwnsSaltedId,
 } from '../do-runner/path-safe-id.js';
 import {
-  THREAD_ACTOR_HEADER,
-  THREAD_ACTOR_ROLE_HEADER,
   THREAD_PRINCIPAL_HEADER,
   THREAD_TENANT_HEADER,
 } from '../do-runner/thread-header.js';
@@ -150,8 +148,11 @@ export function createTenantResolver(
     // resolver is the one chokepoint every routed request crosses.
     if (
       request.headers.has(THREAD_TENANT_HEADER) ||
-      request.headers.has(THREAD_ACTOR_HEADER) ||
-      request.headers.has(THREAD_ACTOR_ROLE_HEADER) ||
+      // Retired from the wire, still refused: a client forging them means it
+      // expects an older flowsafe, and a mixed-version deployment should fail
+      // loudly rather than have the header quietly ignored.
+      request.headers.has('x-flowsafe-actor') ||
+      request.headers.has('x-flowsafe-role') ||
       // Without this an external caller could assert its own principal kind,
       // and the agent host's automation gate would be answering a question the
       // client got to ask.

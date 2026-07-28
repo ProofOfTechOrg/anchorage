@@ -169,14 +169,6 @@ export function buildHostApprovalService(
   store: TenantBoundApprovalStore,
   options: HostApprovalServiceOptions,
 ): ApprovalService {
-  // Re-queueing a gate after a durable resume is platform work, not a person's
-  // action, so it files through the service's trusted system entry.
-  const systemPrincipal = trustAutomationPrincipal({
-    kind: 'system',
-    id: options.systemActorId,
-    tenantId: store.tenantId,
-    purpose: 'approval-requeue',
-  });
   const audit = hostAuditSink({
     queue: options.queue,
     keepAlive: options.waitUntil,
@@ -191,7 +183,7 @@ export function buildHostApprovalService(
     resumeRun: resumeRunWithRequeue(
       options.resumeRun,
       () => service,
-      systemPrincipal,
+      options.systemActorId,
       audit,
     ),
   });

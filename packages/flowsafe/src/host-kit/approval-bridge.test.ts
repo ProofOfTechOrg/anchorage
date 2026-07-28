@@ -29,9 +29,12 @@ import {
   resumeRunWithRequeue,
 } from './index.js';
 
-const SYSTEM = trustAutomationPrincipal({
+const SYSTEM = 'sys';
+// The direct-service calls below bypass the bridge, so they must vouch the way
+// a host would; the bridge itself now mints from the id.
+const SYSTEM_PRINCIPAL = trustAutomationPrincipal({
   kind: 'system',
-  id: 'sys',
+  id: SYSTEM,
   tenantId: 'acme',
   purpose: 'test-reconcile',
 });
@@ -271,7 +274,7 @@ describe('resumeRunWithRequeue', () => {
         connectors: ['deploy-conn'],
         requestedBy: 'starter',
       },
-      SYSTEM,
+      SYSTEM_PRINCIPAL,
       {
         kind: 'thread',
         threadId: 'acme_thread',
@@ -321,7 +324,7 @@ describe('resumeRunWithRequeue', () => {
         connectors: ['outreach-email'],
         requestedBy: 'starter',
       },
-      SYSTEM,
+      SYSTEM_PRINCIPAL,
     );
 
     // #when — the reviewer approves and the run finishes
@@ -349,7 +352,7 @@ describe('resumeRunWithRequeue', () => {
         connectors: ['connector'],
         requestedBy: 'starter',
       },
-      SYSTEM,
+      SYSTEM_PRINCIPAL,
       {
         kind: 'agent-thread',
         agentId: 'writer',
@@ -427,7 +430,7 @@ describe('resumeRunWithRequeue', () => {
         connectors: ['deploy-conn'],
         requestedBy: 'starter',
       },
-      SYSTEM,
+      SYSTEM_PRINCIPAL,
     );
 
     // #when — the reviewer approves gate1; the base resume durably advances
@@ -519,9 +522,7 @@ describe('reconcileApprovalsForSummary', () => {
     // #then — unlike a human-attributed queueApprovalForSuspension call,
     // reconcile has no reviewer whose decision caused the suspension
     expect(filed).toHaveLength(2);
-    expect(filed.every((record) => record.requestedBy === SYSTEM.id)).toBe(
-      true,
-    );
+    expect(filed.every((record) => record.requestedBy === SYSTEM)).toBe(true);
   });
 
   it('uses an explicitly recovered agent principal for reconcile attribution', async () => {
@@ -675,7 +676,7 @@ describe('reconcileApprovalsForSummary', () => {
       stepPath: ['gate1'],
       suspendedAt: 5000,
       resumeCount: 1,
-      requestedBy: SYSTEM.id,
+      requestedBy: SYSTEM,
     });
   });
 
@@ -785,7 +786,7 @@ describe('reconcileApprovalsForSummary', () => {
     const supersededRecord = await store.get(stale?.id ?? '');
     expect(supersededRecord).toMatchObject({
       status: 'rejected',
-      decidedBy: SYSTEM.id,
+      decidedBy: SYSTEM,
       decision: 'reject',
     });
     expect(supersededRecord?.comment).toMatch(/stale suspension fingerprint/);
@@ -934,7 +935,7 @@ describe('reconcileApprovalsForSummary', () => {
       decidedBy: REVIEWER.id,
     });
     const afterB = await store.get(staleB?.id ?? '');
-    expect(afterB).toMatchObject({ status: 'rejected', decidedBy: SYSTEM.id });
+    expect(afterB).toMatchObject({ status: 'rejected', decidedBy: SYSTEM });
   });
 
   it('excludes a superseded record from grant derivation even queried at its ORIGINAL fingerprint', async () => {

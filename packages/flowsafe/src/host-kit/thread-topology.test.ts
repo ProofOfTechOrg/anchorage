@@ -10,8 +10,6 @@ import {
   type InitResult,
   init,
   mintThreadId,
-  THREAD_ACTOR_HEADER,
-  THREAD_ACTOR_ROLE_HEADER,
   THREAD_PRINCIPAL_HEADER,
   THREAD_TENANT_HEADER,
   ThreadDurableObject,
@@ -83,8 +81,8 @@ function recordingNamespace(): {
             url: request.url,
             method: request.method,
             tenantHeader: request.headers.get(THREAD_TENANT_HEADER),
-            actorHeader: request.headers.get(THREAD_ACTOR_HEADER),
-            roleHeader: request.headers.get(THREAD_ACTOR_ROLE_HEADER),
+            actorHeader: request.headers.get('x-flowsafe-actor'),
+            roleHeader: request.headers.get('x-flowsafe-role'),
             otherHeader: request.headers.get('x-other'),
             body: await request.text(),
           });
@@ -127,8 +125,8 @@ describe('createThreadTopology', () => {
         url: 'http://thread/messages',
         method: 'POST',
         tenantHeader: 'acme',
-        actorHeader: 'operator-1',
-        roleHeader: 'operator',
+        actorHeader: null,
+        roleHeader: null,
         otherHeader: null,
         body: '{}',
       },
@@ -175,7 +173,7 @@ describe('createThreadTopology', () => {
     expect(calls[0]?.tenantHeader).toBe('acme');
   });
 
-  it('case-insensitively overwrites forged actor id and role headers', async () => {
+  it('case-insensitively strips forged retired identity headers', async () => {
     const { namespace, calls } = recordingNamespace();
     const topology = createThreadTopology(namespace);
 
@@ -191,8 +189,9 @@ describe('createThreadTopology', () => {
       },
     );
 
-    expect(calls[0]?.actorHeader).toBe('operator-1');
-    expect(calls[0]?.roleHeader).toBe('operator');
+    // Retired: send() no longer stamps them, and never echoes a caller's.
+    expect(calls[0]?.actorHeader).toBeNull();
+    expect(calls[0]?.roleHeader).toBeNull();
   });
 
   it('OVERWRITES a FORGED client header on a forwarded request (the trap the house idiom sets)', async () => {
