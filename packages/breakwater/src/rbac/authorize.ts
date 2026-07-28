@@ -58,7 +58,7 @@ export function authorizeActor(options: ActorAuthorizationOptions): Actor {
     });
     options.deny(reason);
   }
-  // Kind before role, and fail closed on an unnamed kind: a host that has not
+  // Kind before role, and fail closed on an UNDECLARED kind: a host that has not
   // thought about automation must not have its human role allowlist quietly
   // answer a question about a scheduled job.
   const allowedKinds = options.allowedPrincipalKinds;

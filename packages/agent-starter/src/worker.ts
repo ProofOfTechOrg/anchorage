@@ -322,7 +322,8 @@ const worker = createFlowsafeWorker<Env>({
     const notifications = createNotificationDispatchTick({
       storage: notificationsStore(env.DB),
       topology: threadTopology,
-      resolveTenant: (tenantId) => systemTenant(env, tenantId),
+      resolveTenant: (tenantId) =>
+        systemTenant(env, tenantId, 'notification-dispatch'),
       limit: 100,
     });
     return async () => ({

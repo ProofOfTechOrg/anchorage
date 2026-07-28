@@ -830,13 +830,6 @@ export class ApprovalService {
   }
 
   /**
-   * Authorize an automated principal by KIND and tenant instead of by role.
-   *
-   * A human is refused here on purpose: humans have a role, and routing them
-   * through the automation entry would let a `viewer` create records the role
-   * gate exists to refuse them.
-   */
-  /**
    * The tenant half of the automated authorization. The KIND half is carried by
    * the type: only `trustAutomationPrincipal` mints a TrustedAutomationPrincipal,
    * and it refuses humans and malformed principals, so this cannot be reached by

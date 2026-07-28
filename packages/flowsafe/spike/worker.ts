@@ -205,10 +205,12 @@ const SPIKE_AGENT_META = {
   description:
     'Calls one approval-gated write connector through the catalog-driven durable host.',
   allowedRoles: ['admin', 'operator'],
-  // Unattended schedule fires only. The schedule probe proves both halves: a
-  // declared system fire runs, and the same principal on any other entry path
-  // is refused.
-  allowedAutomation: [{ kind: 'system', entryPaths: ['schedule.fire'] }],
+  // The automated entries the spike drives. 'approval.resume' is implied by the
+  // kind, so a scheduled run that suspends for approval still resumes.
+  allowedAutomation: [
+    { kind: 'system', entryPaths: ['schedule.fire', 'notification.dispatch'] },
+    { kind: 'service', entryPaths: ['signal.notification'] },
+  ],
 } as const satisfies AgentMeta;
 
 const modelUsage = {
@@ -423,7 +425,7 @@ function createSpikeAgentModule(env: Env, audit: AuditLogger): AgentModule {
       model: agentModel(env),
       tools: { [SPIKE_WRITE_CONNECTOR_ID]: write },
       allowedRoles: SPIKE_AGENT_META.allowedRoles,
-      allowedPrincipalKinds: ['human', 'system'],
+      allowedPrincipalKinds: ['human', 'system', 'service'],
       policies: [],
       audit,
       maxSteps: 1,
@@ -1822,6 +1824,9 @@ async function handleScheduleProbe(
   }
 
   if (request.method === 'POST' && path === '/sched/agent') {
+    // `?entryPath=` drives the NEGATIVE half: the same SYSTEM principal on an
+    // entry path SPIKE_AGENT_META never declared must be refused at the host.
+    const requestedEntry = new URL(request.url).searchParams.get('entryPath');
     const id = `schedule_${crypto.randomUUID()}`;
     const threadId = mintThreadId('spike');
     const resourceId = mintResourceId('spike', threadId);
@@ -1889,7 +1894,7 @@ async function handleScheduleProbe(
           agentId: target.agentId,
           runId,
           prompt: target.prompt,
-          entryPath,
+          entryPath: (requestedEntry ?? entryPath) as typeof entryPath,
           threaded,
           requestContext,
           streamRequestContext,

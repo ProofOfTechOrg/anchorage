@@ -137,10 +137,14 @@ export function trustAutomationPrincipal(
 }
 
 /**
- * Bounded, non-empty, and free of header control characters — the principal is
- * serialized into a request header on the way to a thread DO, so a newline in
- * any field would be header injection. Mirrors the `containsHeaderControl`
- * check `createTenantResolver` already applies to an actor id.
+ * Bounded, non-empty, and free of control characters.
+ *
+ * Not an injection barrier — the principal reaches the wire through
+ * `JSON.stringify`, which escapes U+0000–U+001F. It matters because `id` ALSO
+ * travels raw in `x-flowsafe-actor`, and because refusing here produces a clean
+ * validation error instead of a `Headers.set` TypeError deep in the topology.
+ * Mirrors the `containsHeaderControl` check `createTenantResolver` already
+ * applies to an actor id.
  */
 function boundedText(value: unknown, max: number): value is string {
   if (typeof value !== 'string' || value.trim() === '' || value.length > max) {

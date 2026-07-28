@@ -82,6 +82,11 @@ function normalizedAutomation(
     }
     const seenPaths = new Set<AgentEntryPath>();
     for (const entryPath of rule.entryPaths) {
+      if (entryPath === 'approval.resume') {
+        fail(
+          `agent '${agentId}' must not declare 'approval.resume'; resuming is implied by the kind that started the run`,
+        );
+      }
       if (!(AGENT_ENTRY_PATHS as readonly string[]).includes(entryPath)) {
         fail(
           `agent '${agentId}' allowedAutomation names unknown entry path '${String(entryPath)}'`,
@@ -113,6 +118,16 @@ function automationCheckFor(
     if (principal.kind === 'human') return false;
     const rules = automationById.get(agentId);
     if (!rules) return false;
+    // Resuming is CONTINUING a run this kind was already admitted to start, so
+    // it asks a different question: may this kind still drive this agent at
+    // all? Demanding that hosts also list 'approval.resume' would mean any
+    // automated agent that suspends for approval loses the run the moment a
+    // human approves it — a decided approval and a stranded run. The narrowing
+    // that matters is still enforced: a kind removed from the declaration
+    // entirely can no longer resume.
+    if (entryPath === 'approval.resume') {
+      return rules.some((rule) => rule.kind === principal.kind);
+    }
     return rules.some(
       (rule) =>
         rule.kind === principal.kind && rule.entryPaths.includes(entryPath),

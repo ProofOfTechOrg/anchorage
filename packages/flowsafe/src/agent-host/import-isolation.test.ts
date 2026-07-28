@@ -110,8 +110,10 @@ describe('do-runner -> approval-api edge', () => {
   const ALLOWED = new Set([
     'approval-api/principal.ts', // the validator thread-do.ts reaches for
     'approval-api/contract.ts', // principal.ts's role vocabulary
-    // Reached only by contract.ts's `import type { ApprovalRecord }`, which
-    // erases — it is in the source graph, never in the runtime one.
+    // Reached today only by contract.ts's `import type { ApprovalRecord }`,
+    // which erases. NOTE: this pin is file-level — the walker does not
+    // distinguish `import type` from a runtime import, so it catches a NEW file
+    // being reached, not this one being reached a new way.
     'approval-api/types.ts',
   ]);
 

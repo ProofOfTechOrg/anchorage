@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import {
-  type ApprovalActor,
   ApprovalService,
   type ExecutionPrincipal,
-  humanPrincipal,
   principalActor,
   type TenantContext,
 } from '@proofoftech/flowsafe/approval-api';
@@ -24,17 +22,17 @@ import { SYSTEM_ACTOR_ID } from './config.js';
  * human operator: an agent it fires must have declared `system` on the
  * `schedule.fire` entry path, or the host denies the start.
  */
-export function systemTenant(env: Env, tenantId: string): TenantContext {
+export function systemTenant(
+  env: Env,
+  tenantId: string,
+  purpose = 'scheduled-agent-execution',
+): TenantContext {
   return tenantForPrincipal(env, {
     kind: 'system',
     id: SYSTEM_ACTOR_ID,
     tenantId,
-    purpose: 'scheduled-agent-execution',
+    purpose,
   });
-}
-
-export function tenantForActor(env: Env, actor: ApprovalActor): TenantContext {
-  return tenantForPrincipal(env, humanPrincipal(actor));
 }
 
 export function tenantForPrincipal(

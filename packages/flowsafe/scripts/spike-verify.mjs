@@ -1732,6 +1732,33 @@ async function main() {
   );
 
   await step(
+    'O3 automated entry DENIED (D-S4): the same SYSTEM principal on an entry ' +
+      'path the agent never declared is refused at the host, through the real hop',
+    async () => {
+      // The deny direction. Without this the gate is only ever proven to admit,
+      // which is how an unreachable gate looked healthy for a whole branch.
+      const { status, body } = await http(
+        'POST',
+        '/sched/agent?entryPath=signal.wake',
+      );
+      assert(status === 200, `sched agent deny probe -> ${status}`, body);
+      assert(
+        body.result?.fired === 0 && body.result?.failed === 1,
+        'the undeclared entry path did NOT fire',
+        body,
+      );
+      // Generic to the caller on purpose: the entry path and principal kind go
+      // to the audit sink, not into a response that a client can probe policy
+      // with.
+      assert(
+        body.error === 'forbidden',
+        'the refusal is a generic 403, leaking no policy detail',
+        body,
+      );
+    },
+  );
+
+  await step(
     'O schedule barrier + INV-1 (D-S2): a workflow schedule fires through ' +
       'RunnerRuntime with a fresh INV-1 runId and the stored-context barrier holds',
     async () => {

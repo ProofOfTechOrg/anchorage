@@ -42,10 +42,7 @@ import {
   type AgentEntryPath,
   isRuntimeDrivenAgent,
 } from '../agent-runner/index.js';
-import type {
-  ApprovalActor,
-  ExecutionPrincipal,
-} from '../approval-api/index.js';
+import type { ExecutionPrincipal } from '../approval-api/index.js';
 import {
   DoStatusError,
   mintSaltedId,
@@ -371,7 +368,6 @@ export function createThreadSignalRoutes(
             threadId,
             resourceId,
             tenantId: scope.tenantId,
-            actor: scope.actor,
             principal: scope.principal,
             entryPath,
             runtimeDriven,
@@ -417,7 +413,6 @@ async function handleNotificationDispatch(options: {
   threadId: string;
   resourceId: string | undefined;
   tenantId: string;
-  actor: ApprovalActor;
   principal: ExecutionPrincipal;
   entryPath: AgentEntryPath;
   runtimeDriven: boolean;
