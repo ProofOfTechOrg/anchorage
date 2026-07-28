@@ -66,6 +66,14 @@ jobs:
       - name: Build
         run: pnpm build
 
+      # ci.yml runs this too, but ci.yml and this workflow start CONCURRENTLY on
+      # a push to main and main requires no status check, so a red CI cannot
+      # stop a publish. Repeating it here fails in this job, before the publish
+      # step, on this checkout. It is fully offline, so it adds seconds and no
+      # new dependency.
+      - name: Verify release publish invocation
+        run: pnpm test:release-invocation
+
       # Publish Breakwater and wait for registry visibility before Changesets
       # publishes Flowsafe, whose agent-host peer floor requires that release.
       - name: Publish unpublished versions to npm
