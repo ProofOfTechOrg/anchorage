@@ -215,8 +215,9 @@ function ownField(value: object, key: PropertyKey): unknown {
 export function isTrustedAutomationPrincipal(
   value: unknown,
 ): value is TrustedAutomationPrincipal {
+  if (value === null || typeof value !== 'object') return false;
   return (
-    isAutomatedPrincipal(value) &&
+    canonicalAutomatedPrincipal(value) !== undefined &&
     // The brand is read as an OWN DATA property for the same reason every other
     // field is: a plain read would accept one inherited from a prototype, which
     // nobody stamped.
@@ -230,15 +231,19 @@ export function isTrustedAutomationPrincipal(
 }
 
 /**
- * A valid principal that is not a person. Authority-free; provenance only.
+ * Validate and return a canonical principal that is not a person.
  *
- * The kind read is plain because `isExecutionPrincipal` has already proven
- * `kind` is an own data property — see `ownField`.
+ * The returned snapshot contains the exact values that passed validation, so
+ * callers never need to re-read a mutable or adversarial input. Kept off the
+ * package barrel: this is an internal enforcement helper, not public API.
  */
-export function isAutomatedPrincipal(
+export function canonicalAutomatedPrincipal(
   value: unknown,
-): value is AutomatedExecutionPrincipal {
-  return isExecutionPrincipal(value) && value.kind !== 'human';
+): AutomatedExecutionPrincipal | undefined {
+  const principal = canonicalPrincipal(value);
+  return principal !== undefined && principal.kind !== 'human'
+    ? principal
+    : undefined;
 }
 
 /**

@@ -305,42 +305,22 @@ serialization and redaction behavior are defined.
   calls in one resumed leg unless that is an explicit, audited run-scoped
   policy.
 
-### 6. Define Human, Service, and Agent Principals
+### 6. Define execution principals (shipped)
 
-#### Current state
+#### Shipped implementation
 
-`RBACMiddleware` assumes an actor with a human-style role. Scheduled work,
-signals, background tasks, service-to-service execution, and agent-to-agent
-delegation do not naturally have a logged-in human actor. Treating all of them
-as a fabricated `operator` loses provenance and may accidentally grant human
-permissions to autonomous execution.
+Flowsafe defines `ExecutionPrincipal` for human, service, agent, and system execution. Human principals carry a role. Every automated principal requires `purpose`, and agent principals may also carry `delegatedBy`.
 
-#### Improvement
+Breakwater accepts the projected principal kind but does not resolve identity. Its `allowedPrincipalKinds` gate runs before role authorization and never consults human roles for an automated principal. Flowsafe's agent catalog uses `allowedAutomation` to constrain each automated kind to declared entry paths; human starts continue to use `allowedRoles`.
 
-Before enabling automated agent entry points, define a host-level principal
-model:
+`trustAutomationPrincipal()` canonicalizes and freezes principals used by trusted platform entries. Audit events preserve the tenant, principal kind, principal ID, purpose, and delegation provenance. Approval decisions remain attributed to the human decider.
 
-```ts
-type Principal =
-  | { kind: 'human'; id: string; role: ApprovalRole; tenantId: string }
-  | { kind: 'service'; id: string; permissions: readonly Permission[]; tenantId: string }
-  | { kind: 'agent'; id: string; delegatedBy?: string; permissions: readonly Permission[]; tenantId: string }
-  | { kind: 'system'; id: string; purpose: string; tenantId: string };
-```
-
-Breakwater does not need to become the source of this identity. Flowsafe should
-resolve the principal and project the minimum actor/permission context needed
-by each gate.
-
-#### Acceptance criteria
+#### Shipped guarantees
 
 - Scheduled or service execution never masquerades as an arbitrary human.
-- Every autonomous call has tenant, principal kind, principal ID, and
-  delegation provenance in audit events.
-- Service/agent permissions are narrower than administrative human roles by
-  default.
-- Human approval remains attributable to the human decider even when the
-  requester is a service or agent.
+- Agent entry and approval-maintenance audit events implemented in this phase carry tenant, principal kind, principal ID, and delegation provenance when applicable.
+- Automated principals cannot derive authority from administrative human roles.
+- Human approval remains attributable to the human decider even when the requester is a service or agent.
 
 ### 7. Add an End-to-End Enforcement Matrix
 

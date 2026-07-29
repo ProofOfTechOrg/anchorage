@@ -24,7 +24,7 @@ import type {
 import { APPROVAL_ROLES, DECIDER_ROLES } from './contract.js';
 import {
   type AutomatedExecutionPrincipal,
-  isAutomatedPrincipal,
+  canonicalAutomatedPrincipal,
   isExecutionPrincipal,
   isTrustedAutomationPrincipal,
   principalActor,
@@ -1230,7 +1230,8 @@ export async function sweepSLA(
   // function that CARRIES an attribution principal (purgeExpiredApprovals takes
   // none, so it has no attribution to corrupt), and a bad principal here makes
   // every escalation it emits, for every tenant, unattributable.
-  if (!isAutomatedPrincipal(options.systemPrincipal)) {
+  const systemPrincipal = canonicalAutomatedPrincipal(options.systemPrincipal);
+  if (systemPrincipal === undefined) {
     throw new Error(
       'sweepSLA: systemPrincipal must be a valid automated execution principal',
     );
@@ -1245,7 +1246,7 @@ export async function sweepSLA(
     if (!options.audit) return;
     try {
       const outcome = options.audit({
-        actor: principalActor(options.systemPrincipal),
+        actor: principalActor(systemPrincipal),
         action,
         resource,
         decision,
@@ -1254,7 +1255,7 @@ export async function sweepSLA(
         // kind of principal swept, under whose id, and why.
         detail: {
           ...extra.detail,
-          ...principalAuditFields(options.systemPrincipal),
+          ...principalAuditFields(systemPrincipal),
         },
       });
       // Same promise containment as ApprovalService's #record: a composed

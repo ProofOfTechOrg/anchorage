@@ -20,6 +20,7 @@ import {
   UnknownApprovalError,
 } from './service.js';
 import type { InMemoryApprovalStore } from './store.js';
+import type { SystemApprovalStore } from './tenant-brand.js';
 import { InMemoryApprovalStoreFactory } from './tenant-store.js';
 import {
   type ApprovalRecord,
@@ -833,6 +834,67 @@ describe('ApprovalService.sweepSLA', () => {
           detail: expect.objectContaining({ tenantId: record.tenantId }),
         }),
       );
+    }
+  });
+
+  it('keeps canonical audit provenance on every event when the source principal mutates during store I/O', async () => {
+    // #given — the caller retains a mutable alias and rewrites it while the
+    // sweep is suspended in its first store read.
+    const harness = makeHarness();
+    await seedPending(harness, { slaSeconds: 60 });
+    harness.advance(61_000);
+    harness.events.length = 0;
+    const source: Record<string, unknown> = { ...SWEEP_PRINCIPAL };
+    const backing = harness.backend.system();
+    const store: SystemApprovalStore = {
+      list: async (filter) => {
+        const records = await backing.list(filter);
+        source.kind = 'human';
+        source.role = 'admin';
+        source.purpose = undefined;
+        return records;
+      },
+      transition: (id, from, patch) => backing.transition(id, from, patch),
+      purgeExpired: (cutoffIso, limit) =>
+        backing.purgeExpired(cutoffIso, limit),
+    };
+
+    // #when
+    const escalated = await sweepSLA(store, {
+      systemPrincipal: source as unknown as AutomatedExecutionPrincipal,
+      audit: (event) => harness.events.push(event),
+      onEscalation: () => {
+        throw new Error('pager down');
+      },
+      notify: () => {
+        throw new Error('smtp down');
+      },
+      stream: () => {
+        throw new Error('hub down');
+      },
+      now: harness.now,
+    });
+
+    // #then — attribution comes from the entry snapshot, not the mutated alias.
+    expect(escalated).toHaveLength(1);
+    expect(harness.events).toHaveLength(4);
+    expect(
+      harness.events.map((event) => [event.action, event.decision]),
+    ).toEqual([
+      ['approval.escalate', 'allowed'],
+      ['approval.escalate', 'error'],
+      ['approval.notify', 'error'],
+      ['approval.stream', 'error'],
+    ]);
+    for (const event of harness.events) {
+      expect(event).toMatchObject({
+        actor: { id: 'sweeper', role: 'viewer', tenantId: 'system' },
+        detail: {
+          principalKind: 'system',
+          principalId: 'sweeper',
+          purpose: 'approval-sla-maintenance',
+        },
+      });
     }
   });
 });

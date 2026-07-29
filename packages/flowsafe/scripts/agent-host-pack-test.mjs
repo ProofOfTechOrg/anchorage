@@ -94,21 +94,36 @@ try {
   createAgentThreadTopology,
   createThreadAgentHost,
   createAgentApprovalResumer,
+  type AgentAutomationRule,
   type AgentMeta,
   type AgentRunEnvelope,
+  type AutomatedEntryAuthorizer,
+  type AutomatedEntryRequest,
+  type AutomationCheck,
 } from '@proofoftech/flowsafe/agent-host';
 
+const automation: AgentAutomationRule = {
+  kind: 'system',
+  entryPaths: ['schedule.fire'],
+};
 const meta: AgentMeta = {
   id: 'writer',
   title: 'Writer',
   description: 'Writes an approved record',
+  allowedAutomation: [automation],
 };
+const automationCheck: AutomationCheck = () => true;
+const authorizeAutomatedEntry: AutomatedEntryAuthorizer = (
+  request: AutomatedEntryRequest,
+) => request.agentId === meta.id;
 const envelope = null as AgentRunEnvelope | null;
 void createAgentCatalog([meta]);
 void createAgentRouter;
 void createAgentThreadTopology;
 void createThreadAgentHost;
 void createAgentApprovalResumer;
+void automationCheck;
+void authorizeAutomatedEntry;
 void envelope;
 `,
   );
