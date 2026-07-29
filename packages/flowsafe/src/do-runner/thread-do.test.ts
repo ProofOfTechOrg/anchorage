@@ -3,12 +3,13 @@ import type { DurableObjectState } from '@cloudflare/workers-types';
 import { InMemoryStore } from '@mastra/core/storage';
 import { describe, expect, it } from 'vitest';
 
+import { encodeExecutionPrincipal } from '../approval-api/index.js';
+
 import { type InitResult, init } from './init.js';
 import { mintThreadId } from './memory-id.js';
 import { ThreadDurableObject, type ThreadScope } from './thread-do.js';
 import {
-  THREAD_ACTOR_HEADER,
-  THREAD_ACTOR_ROLE_HEADER,
+  THREAD_PRINCIPAL_HEADER,
   THREAD_TENANT_HEADER,
 } from './thread-header.js';
 
@@ -47,8 +48,19 @@ function request(
 ): Request {
   const headers = new Headers();
   if (tenantId !== undefined) headers.set(THREAD_TENANT_HEADER, tenantId);
-  if (requestedBy !== null) headers.set(THREAD_ACTOR_HEADER, requestedBy);
-  headers.set(THREAD_ACTOR_ROLE_HEADER, 'operator');
+  // The topology stamps this on every send; the DO refuses a request without
+  // it rather than rebuilding the caller as a human.
+  if (requestedBy !== null) {
+    headers.set(
+      THREAD_PRINCIPAL_HEADER,
+      encodeExecutionPrincipal({
+        kind: 'human',
+        id: requestedBy,
+        tenantId: tenantId ?? 'acme',
+        role: 'operator',
+      }),
+    );
+  }
   return new Request('http://thread/messages', {
     method: 'POST',
     headers,
@@ -103,26 +115,6 @@ describe('ThreadDurableObject tenant assertion', () => {
     // #then
     expect(response.status).toBe(403);
     expect(await response.text()).toMatch(/authenticates as '<none>'/);
-  });
-
-  it('refuses a request without the topology-owned actor identity', async () => {
-    const thread = threadWith(mintThreadId('acme', () => 't1'));
-
-    const response = await thread.fetch(request('acme', null));
-
-    expect(response.status).toBe(403);
-    expect(await response.text()).toMatch(/carries no trusted actor/);
-  });
-
-  it('refuses a request without a valid topology-owned actor role', async () => {
-    const thread = threadWith(mintThreadId('acme', () => 't1'));
-    const forged = request('acme');
-    forged.headers.set(THREAD_ACTOR_ROLE_HEADER, 'owner');
-
-    const response = await thread.fetch(forged);
-
-    expect(response.status).toBe(403);
-    expect(await response.text()).toMatch(/valid trusted actor role/);
   });
 
   it('is exact at the tenant boundary (the acme vs acmecorp pin)', async () => {

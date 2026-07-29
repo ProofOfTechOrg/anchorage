@@ -22,6 +22,15 @@ import type {
   ApprovalStreamSink,
 } from './contract.js';
 import { APPROVAL_ROLES, DECIDER_ROLES } from './contract.js';
+import {
+  type AutomatedExecutionPrincipal,
+  canonicalAutomatedPrincipal,
+  isExecutionPrincipal,
+  isTrustedAutomationPrincipal,
+  principalActor,
+  principalAuditFields,
+  type TrustedAutomationPrincipal,
+} from './principal.js';
 import { type ApprovalPatch, listAllApprovedForRun } from './store.js';
 import type {
   SystemApprovalStore,
@@ -185,6 +194,15 @@ export class ApprovalService {
   readonly #allowSelfDecision?: SelfDecisionPolicy;
   readonly #now: () => Date;
 
+  /**
+   * The tenant this service is bound to. Exposed so the host-kit bridges can
+   * mint their own bookkeeping principal against it instead of making every
+   * host construct one and vouch for it.
+   */
+  get tenantId(): string {
+    return this.#store.tenantId;
+  }
+
   constructor(options: ApprovalServiceOptions) {
     this.#store = options.store;
     this.#audit = options.audit;
@@ -202,6 +220,45 @@ export class ApprovalService {
     resumeTarget?: ApprovalResumeTarget,
   ): Promise<{ record: ApprovalRecord; created: boolean }> {
     this.#authorize(actor, CAN_CREATE, 'approval.create', 'approval');
+    return this.#createAuthorized(input, actor, resumeTarget);
+  }
+
+  /**
+   * File an approval on behalf of an AUTOMATED principal — the trusted entry
+   * for platform bridges (suspension reconcile, agent host) that have no person
+   * behind them.
+   *
+   * These callers used to fabricate `role: 'operator'` to satisfy CAN_CREATE.
+   * They cannot simply project onto a role instead: automated principals
+   * project to the least-privileged role precisely so they can never decide,
+   * and `viewer` is not in CAN_CREATE. So the role gate is replaced here — not
+   * widened — by a kind-and-tenant check.
+   *
+   * There is deliberately NO principal-taking claim/decide/delegate. Filing a
+   * request is trusted platform work; deciding one is a human judgement, and an
+   * automated principal approving its own request is the separation-of-duties
+   * hole this whole model exists to close.
+   */
+  async createAsPrincipal(
+    input: CreateApprovalInput,
+    principal: TrustedAutomationPrincipal,
+    resumeTarget?: ApprovalResumeTarget,
+  ): Promise<{ record: ApprovalRecord; created: boolean }> {
+    this.#authorizeAutomated(principal, 'approval.create', 'approval');
+    return this.#createAuthorized(
+      input,
+      principalActor(principal),
+      resumeTarget,
+      principalAuditFields(principal),
+    );
+  }
+
+  async #createAuthorized(
+    input: CreateApprovalInput,
+    actor: ApprovalActor,
+    resumeTarget?: ApprovalResumeTarget,
+    provenance?: Record<string, unknown>,
+  ): Promise<{ record: ApprovalRecord; created: boolean }> {
     this.#validateCreate(input);
     const now = this.#now();
     const slaSeconds = input.slaSeconds ?? this.#defaultSlaSeconds;
@@ -257,6 +314,7 @@ export class ApprovalService {
           workflowId: result.record.workflowId,
           runId: result.record.runId,
           created: result.created,
+          ...provenance,
         },
       },
     );
@@ -264,6 +322,10 @@ export class ApprovalService {
     // (created: false) returns the EXISTING open record, which already
     // notified when it entered the queue.
     if (result.created) {
+      // `provenance` rides the subordinate events too. An automated operation
+      // whose primary event carries principalKind/principalId/purpose but whose
+      // notify and stream failures do not leaves exactly the gaps that make an
+      // incident unreconstructable: the failures are the rows an operator reads.
       fireNotification(
         this.#notify,
         { type: 'created', record: result.record },
@@ -273,7 +335,10 @@ export class ApprovalService {
             'approval.notify',
             `approval:${result.record.id}`,
             'error',
-            { reason, detail: { tenantId: result.record.tenantId } },
+            {
+              reason,
+              detail: { tenantId: result.record.tenantId, ...provenance },
+            },
           ),
       );
       fireStreamEvent(
@@ -285,7 +350,10 @@ export class ApprovalService {
             'approval.stream',
             `approval:${result.record.id}`,
             'error',
-            { reason, detail: { tenantId: result.record.tenantId } },
+            {
+              reason,
+              detail: { tenantId: result.record.tenantId, ...provenance },
+            },
           ),
       );
     }
@@ -568,6 +636,38 @@ export class ApprovalService {
     reason: string,
   ): Promise<ApprovalRecord | null> {
     this.#authorize(actor, CAN_CREATE, 'approval.supersede', `approval:${id}`);
+    return this.#supersedeAuthorized(id, actor, reason);
+  }
+
+  /**
+   * Supersede on behalf of an AUTOMATED principal — the reconcile bridge's
+   * half of `createAsPrincipal`, and authorized the same way.
+   *
+   * Superseding is bookkeeping, not a decision: the record's suspension
+   * fingerprint no longer matches the run, so it can never be resumed and is
+   * closed to stop it shadowing the fresh filing. It is deliberately not
+   * reachable through `decide`, so this does not give automation a decision.
+   */
+  async supersedeStaleAsPrincipal(
+    id: string,
+    principal: TrustedAutomationPrincipal,
+    reason: string,
+  ): Promise<ApprovalRecord | null> {
+    this.#authorizeAutomated(principal, 'approval.supersede', `approval:${id}`);
+    return this.#supersedeAuthorized(
+      id,
+      principalActor(principal),
+      reason,
+      principalAuditFields(principal),
+    );
+  }
+
+  async #supersedeAuthorized(
+    id: string,
+    actor: ApprovalActor,
+    reason: string,
+    provenance?: Record<string, unknown>,
+  ): Promise<ApprovalRecord | null> {
     const now = this.#now().toISOString();
     const updated = await this.#store.transition(id, OPEN_STATUSES, {
       status: 'rejected',
@@ -584,6 +684,7 @@ export class ApprovalService {
         tenantId: updated.tenantId,
         workflowId: updated.workflowId,
         runId: updated.runId,
+        ...provenance,
       },
     });
     // `reason` here is the supersede reason (method arg); the reportError arg
@@ -594,7 +695,7 @@ export class ApprovalService {
       (streamError) =>
         this.#record(actor, 'approval.stream', `approval:${id}`, 'error', {
           reason: streamError,
-          detail: { tenantId: updated.tenantId },
+          detail: { tenantId: updated.tenantId, ...provenance },
         }),
     );
     return updated;
@@ -746,6 +847,49 @@ export class ApprovalService {
       roleOk && actor
         ? `${action}: actor tenant does not match this service's tenant binding`
         : `${action} requires one of roles [${roles.join(', ')}]`,
+    );
+  }
+
+  /**
+   * Authorize an automated caller on kind, brand, and tenant.
+   *
+   * The parameter type is NOT the enforcement. `trustAutomationPrincipal` is
+   * the only minter, but TypeScript is erased at runtime, so a cast or a value
+   * rebuilt from storage reaches here typed correctly and shaped however the
+   * caller left it. Re-reading the brand and the shape is what turns "only the
+   * minter produces this" from a convention into a check — and it is what stops
+   * a principal validated as `system` from being read back as a human `admin`.
+   *
+   * The tenant is checked for the same reason `#authorize` checks it: the
+   * resolver builds the service from the principal's own tenant, so a mismatch
+   * can only be a wiring bug — exactly when it must fail closed.
+   */
+  #authorizeAutomated(
+    principal: TrustedAutomationPrincipal,
+    action: string,
+    resource: string,
+  ): void {
+    if (!isTrustedAutomationPrincipal(principal)) {
+      // No actor: an unvouched value has no attribution worth recording, and
+      // projecting one through principalActor would read the very fields the
+      // check just refused to trust.
+      this.#record(null, action, resource, 'denied', {
+        reason:
+          'principal is not a vouched automated principal (missing trust brand or invalid automated shape)',
+      });
+      throw new ApprovalAuthzError(
+        `${action}: principal is not a vouched automated principal`,
+      );
+    }
+    if (principal.tenantId === this.#store.tenantId) return;
+    this.#record(principalActor(principal), action, resource, 'denied', {
+      reason: `principal tenant '${principal.tenantId}' does not match the store binding '${this.#store.tenantId}'`,
+      // A denial is an automated event too: without these the only automated
+      // audit rows carrying provenance would be the ones that succeeded.
+      detail: principalAuditFields(principal),
+    });
+    throw new ApprovalAuthzError(
+      `${action}: principal tenant does not match this service's tenant binding`,
     );
   }
 
@@ -938,21 +1082,19 @@ export class ApprovalService {
       return;
     }
     if (target.kind === 'agent-thread') {
-      const principal = target.principal;
       if (
         typeof target.agentId !== 'string' ||
         !PATH_SAFE_ID_PATTERN.test(target.agentId) ||
         !ownsPathSafeId(target.threadId) ||
         !ownsPathSafeId(target.resourceId) ||
-        principal === null ||
-        typeof principal !== 'object' ||
-        typeof principal.id !== 'string' ||
-        principal.id.trim() === '' ||
-        !(APPROVAL_ROLES as readonly string[]).includes(principal.role) ||
-        principal.tenantId !== this.#store.tenantId
+        // Fails closed on the pre-principal `{id, role, tenantId}` form: an
+        // ApprovalActor is not an ExecutionPrincipal, and coercing one would
+        // resurrect a fabricated operator as a human.
+        !isExecutionPrincipal(target.principal) ||
+        target.principal.tenantId !== this.#store.tenantId
       ) {
         throw new InvalidApprovalInputError(
-          'agent resumeTarget must name path-safe ids and a valid principal owned by the bound tenant',
+          'agent resumeTarget must name path-safe ids and a valid execution principal owned by the bound tenant',
         );
       }
       return;
@@ -1037,8 +1179,12 @@ export interface SweepSLAOptions {
    * Attribution only — the sweep runs inside the trusted computing base
    * (cron), so there is no role check: the TYPE of the store argument is the
    * authorization (a SystemApprovalStore is unobtainable from request scope).
+   *
+   * Automated kinds only, and REFUSED at runtime as well: a human here would
+   * stamp `principalKind: 'human'` onto cross-tenant cron escalations, which is
+   * the synthetic operator this whole model exists to remove.
    */
-  systemActor: ApprovalActor;
+  systemPrincipal: AutomatedExecutionPrincipal;
   audit?: ApprovalAuditSink;
   /** Fired for each record escalated. */
   onEscalation?: (record: ApprovalRecord) => void;
@@ -1078,6 +1224,18 @@ export async function sweepSLA(
   store: SystemApprovalStore,
   options: SweepSLAOptions,
 ): Promise<ApprovalRecord[]> {
+  // The principal is attribution, not authorization — the SystemApprovalStore
+  // type is the authorization. The parameter type already excludes a human;
+  // this is the erased-type half, because this is the one exported cross-tenant
+  // function that CARRIES an attribution principal (purgeExpiredApprovals takes
+  // none, so it has no attribution to corrupt), and a bad principal here makes
+  // every escalation it emits, for every tenant, unattributable.
+  const systemPrincipal = canonicalAutomatedPrincipal(options.systemPrincipal);
+  if (systemPrincipal === undefined) {
+    throw new Error(
+      'sweepSLA: systemPrincipal must be a valid automated execution principal',
+    );
+  }
   const now = options.now ?? (() => new Date());
   const record = (
     action: string,
@@ -1088,12 +1246,17 @@ export async function sweepSLA(
     if (!options.audit) return;
     try {
       const outcome = options.audit({
-        actor: options.systemActor,
+        actor: principalActor(systemPrincipal),
         action,
         resource,
         decision,
         reason: extra.reason,
-        detail: extra.detail,
+        // Provenance the fabricated maintenance operator never carried: which
+        // kind of principal swept, under whose id, and why.
+        detail: {
+          ...extra.detail,
+          ...principalAuditFields(systemPrincipal),
+        },
       });
       // Same promise containment as ApprovalService's #record: a composed
       // sink's rejection must never surface as an unhandled rejection.

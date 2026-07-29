@@ -16,6 +16,7 @@ import {
   ApprovalService,
   approvedConnectorsForLeg,
   InMemoryApprovalStore,
+  trustAutomationPrincipal,
 } from '../approval-api/index.js';
 import type { RunSummary } from '../do-runner/index.js';
 // requestedConnectors is module-internal (not on the barrel): it is the
@@ -28,7 +29,15 @@ import {
   resumeRunWithRequeue,
 } from './index.js';
 
-const SYSTEM: ApprovalActor = { id: 'sys', role: 'operator', tenantId: 'acme' };
+const SYSTEM = 'sys';
+// The direct-service calls below bypass the bridge, so they must vouch the way
+// a host would; the bridge itself now mints from the id.
+const SYSTEM_PRINCIPAL = trustAutomationPrincipal({
+  kind: 'system',
+  id: SYSTEM,
+  tenantId: 'acme',
+  purpose: 'test-reconcile',
+});
 const REVIEWER: ApprovalActor = {
   id: 'ray',
   role: 'reviewer',
@@ -255,7 +264,7 @@ describe('resumeRunWithRequeue', () => {
     });
 
     // a first-gate approval, requested by someone OTHER than the reviewer
-    const { record: gate1 } = await service.create(
+    const { record: gate1 } = await service.createAsPrincipal(
       {
         workflowId: 'product-launch',
         runId: 'acme_run-1',
@@ -265,7 +274,7 @@ describe('resumeRunWithRequeue', () => {
         connectors: ['deploy-conn'],
         requestedBy: 'starter',
       },
-      SYSTEM,
+      SYSTEM_PRINCIPAL,
       {
         kind: 'thread',
         threadId: 'acme_thread',
@@ -305,7 +314,7 @@ describe('resumeRunWithRequeue', () => {
       store,
       resumeRun: resumeRunWithRequeue(base, () => service, SYSTEM),
     });
-    const { record } = await service.create(
+    const { record } = await service.createAsPrincipal(
       {
         workflowId: 'gtm-outbound',
         runId: 'acme_run-2',
@@ -315,7 +324,7 @@ describe('resumeRunWithRequeue', () => {
         connectors: ['outreach-email'],
         requestedBy: 'starter',
       },
-      SYSTEM,
+      SYSTEM_PRINCIPAL,
     );
 
     // #when — the reviewer approves and the run finishes
@@ -333,7 +342,7 @@ describe('resumeRunWithRequeue', () => {
       store,
       resumeRun: resumeRunWithRequeue(base, () => service, SYSTEM),
     });
-    const { record } = await service.create(
+    const { record } = await service.createAsPrincipal(
       {
         workflowId: 'durable-agentic-loop',
         runId: 'acme_run-agent',
@@ -343,16 +352,17 @@ describe('resumeRunWithRequeue', () => {
         connectors: ['connector'],
         requestedBy: 'starter',
       },
-      SYSTEM,
+      SYSTEM_PRINCIPAL,
       {
         kind: 'agent-thread',
         agentId: 'writer',
         threadId: 'acme_thread',
         resourceId: 'acme_resource',
         principal: {
+          kind: 'human',
           id: 'starter',
-          role: 'operator',
           tenantId: 'acme',
+          role: 'operator',
         },
       },
     );
@@ -367,9 +377,10 @@ describe('resumeRunWithRequeue', () => {
       resumeTarget: {
         kind: 'agent-thread',
         principal: {
+          kind: 'human',
           id: 'starter',
-          role: 'operator',
           tenantId: 'acme',
+          role: 'operator',
         },
       },
     });
@@ -388,6 +399,59 @@ describe('resumeRunWithRequeue', () => {
     // silent fall back to the system id
     await expect(wrapped(record, 'approve')).rejects.toThrow(/decidedBy unset/);
     expect(await store.list({ status: 'pending' })).toHaveLength(0);
+  });
+
+  it('still emits the re-queue event, unattributed, when minting its own principal fails', async () => {
+    // #given — a blank systemActorId: the vouch itself throws, which is the
+    // SAME input class that makes the re-queue throw. The event names the
+    // suspended step paths and is the only signal an operator gets, so it must
+    // not die of the cause it is reporting. There is no identity to derive, so
+    // it is attributed to nobody rather than to a fabricated actor.
+    const store = new InMemoryApprovalStore('acme');
+    const events: ApprovalAuditEvent[] = [];
+    const audit = (event: ApprovalAuditEvent) => events.push(event);
+    const base: ResumeRunFn = async () =>
+      suspendedSummary('acme_run-9', 'gate2', ['deploy-conn'], 3030, 1);
+    const service: ApprovalService = new ApprovalService({
+      store,
+      audit,
+      resumeRun: resumeRunWithRequeue(base, () => service, '', audit),
+    });
+    const { record: gate1 } = await service.createAsPrincipal(
+      {
+        workflowId: 'product-launch',
+        runId: 'acme_run-9',
+        stepPath: ['approveLaunch'],
+        suspendedAt: 1000,
+        title: 'Approve launch',
+        connectors: ['deploy-conn'],
+        requestedBy: 'starter',
+      },
+      SYSTEM_PRINCIPAL,
+    );
+
+    // #when
+    const decided = await service.decide(
+      gate1.id,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then — the mint error surfaces, not a swallowed one
+    expect(decided.resume).toMatchObject({ attempted: true, ok: false });
+    expect(decided.resume.error).toMatch(/only a valid automated principal/);
+
+    // #then — the event still fires, with no actor and no provenance
+    const requeue = events.filter(
+      (event) => event.action === 'approval.requeue',
+    );
+    expect(requeue).toHaveLength(1);
+    expect(requeue[0]).toMatchObject({
+      decision: 'error',
+      actor: null,
+      detail: { runId: 'acme_run-9', suspended: [['gate2']] },
+    });
+    expect(requeue[0]?.detail).not.toHaveProperty('principalKind');
   });
 
   it('emits an audit event and reports resume.ok=false when the post-resume re-queue throws (D4)', async () => {
@@ -409,7 +473,7 @@ describe('resumeRunWithRequeue', () => {
       audit,
       resumeRun: resumeRunWithRequeue(base, () => service, SYSTEM, audit),
     });
-    const { record: gate1 } = await service.create(
+    const { record: gate1 } = await service.createAsPrincipal(
       {
         workflowId: 'product-launch',
         runId: 'acme_run-4',
@@ -419,7 +483,7 @@ describe('resumeRunWithRequeue', () => {
         connectors: ['deploy-conn'],
         requestedBy: 'starter',
       },
-      SYSTEM,
+      SYSTEM_PRINCIPAL,
     );
 
     // #when — the reviewer approves gate1; the base resume durably advances
@@ -444,10 +508,17 @@ describe('resumeRunWithRequeue', () => {
     expect(requeueEvents[0]).toMatchObject({
       decision: 'error',
       resource: `approval:${gate1.id}`,
+      // The event is emitted by automation, so it is attributed to the
+      // platform's own bookkeeping principal — a derived least-privileged role
+      // and full provenance, never a hand-shaped viewer actor.
+      actor: { id: SYSTEM, role: 'viewer', tenantId: 'acme' },
       detail: {
         workflowId: 'product-launch',
         runId: 'acme_run-4',
         suspended: [['gate2']],
+        principalKind: 'system',
+        principalId: SYSTEM,
+        purpose: 'approval-suspension-reconcile',
       },
     });
   });
@@ -511,9 +582,7 @@ describe('reconcileApprovalsForSummary', () => {
     // #then — unlike a human-attributed queueApprovalForSuspension call,
     // reconcile has no reviewer whose decision caused the suspension
     expect(filed).toHaveLength(2);
-    expect(filed.every((record) => record.requestedBy === SYSTEM.id)).toBe(
-      true,
-    );
+    expect(filed.every((record) => record.requestedBy === SYSTEM)).toBe(true);
   });
 
   it('uses an explicitly recovered agent principal for reconcile attribution', async () => {
@@ -537,9 +606,10 @@ describe('reconcileApprovalsForSummary', () => {
         threadId: 'acme_thread',
         resourceId: 'acme_resource',
         principal: {
+          kind: 'human',
           id: 'starter',
-          role: 'operator',
           tenantId: 'acme',
+          role: 'operator',
         },
       },
       'starter',
@@ -666,7 +736,7 @@ describe('reconcileApprovalsForSummary', () => {
       stepPath: ['gate1'],
       suspendedAt: 5000,
       resumeCount: 1,
-      requestedBy: SYSTEM.id,
+      requestedBy: SYSTEM,
     });
   });
 
@@ -776,7 +846,7 @@ describe('reconcileApprovalsForSummary', () => {
     const supersededRecord = await store.get(stale?.id ?? '');
     expect(supersededRecord).toMatchObject({
       status: 'rejected',
-      decidedBy: SYSTEM.id,
+      decidedBy: SYSTEM,
       decision: 'reject',
     });
     expect(supersededRecord?.comment).toMatch(/stale suspension fingerprint/);
@@ -925,7 +995,7 @@ describe('reconcileApprovalsForSummary', () => {
       decidedBy: REVIEWER.id,
     });
     const afterB = await store.get(staleB?.id ?? '');
-    expect(afterB).toMatchObject({ status: 'rejected', decidedBy: SYSTEM.id });
+    expect(afterB).toMatchObject({ status: 'rejected', decidedBy: SYSTEM });
   });
 
   it('excludes a superseded record from grant derivation even queried at its ORIGINAL fingerprint', async () => {

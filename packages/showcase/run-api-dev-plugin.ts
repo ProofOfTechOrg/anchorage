@@ -17,7 +17,6 @@
 
 import { InMemoryStore } from '@mastra/core/storage';
 import type {
-  ApprovalActor,
   SelfDecisionPolicy,
   TenantBoundApprovalStore,
 } from '@proofoftech/flowsafe/approval-api';
@@ -201,11 +200,6 @@ export function runApiDevPlugin(): Plugin {
   // later decision) — the same const-with-deferred-ref pattern the worker
   // uses. resumeRunWithRequeue resumes in-process and re-queues the next gate.
   function buildService(store: TenantBoundApprovalStore): ApprovalService {
-    const systemActor: ApprovalActor = {
-      id: SYSTEM_ACTOR_ID,
-      role: 'operator',
-      tenantId: store.tenantId,
-    };
     const service: ApprovalService = new ApprovalService({
       store,
       defaultSlaSeconds: 3600,
@@ -219,7 +213,7 @@ export function runApiDevPlugin(): Plugin {
       resumeRun: resumeRunWithRequeue(
         resumeViaRuntime(runtime),
         () => service,
-        systemActor,
+        SYSTEM_ACTOR_ID,
       ),
     });
     return service;

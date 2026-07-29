@@ -32,7 +32,7 @@ import {
 } from './flowsafe-worker.js';
 import {
   buildHostApprovalService,
-  maintenanceActor,
+  maintenancePrincipal,
   runSlaSweepMaintenance,
 } from './host-approval-service.js';
 import { createHubTopology, type HubNamespaceLike } from './hub-topology.js';
@@ -501,7 +501,7 @@ describe('hub fan-out wiring (host-approval-service, tested here — see file he
     const order: string[] = [];
     const sweep = runSlaSweepMaintenance({
       store: factory.system(),
-      systemActor: maintenanceActor('sys'),
+      systemPrincipal: maintenancePrincipal('sys'),
       cron: '*/15 * * * *',
       stream: (event) => hubTopology.publish(event),
     }).then(() => order.push('sweep-resolved'));

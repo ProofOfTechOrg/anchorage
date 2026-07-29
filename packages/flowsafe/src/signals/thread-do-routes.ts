@@ -42,7 +42,7 @@ import {
   type AgentEntryPath,
   isRuntimeDrivenAgent,
 } from '../agent-runner/index.js';
-import type { ApprovalActor } from '../approval-api/index.js';
+import type { ExecutionPrincipal } from '../approval-api/index.js';
 import {
   DoStatusError,
   mintSaltedId,
@@ -83,9 +83,15 @@ export interface StartIdleRunInput {
   runId: string;
   threadId: string;
   resourceId?: string;
-  actor: ApprovalActor;
+  /**
+   * WHO is waking the run. Carries the KIND, so a host synthesizing a
+   * ThreadScope for the idle run cannot downgrade automation to a human — which
+   * would let it past the agent host's role branch without its agent ever
+   * declaring the entry.
+   */
+  principal: ExecutionPrincipal;
   entryPath: AgentEntryPath;
-  /** Compatibility alias for actor.id. */
+  /** Compatibility alias for principal.id. */
   requestedBy: string;
   message?: AgentMessageInput;
   signal?: AgentSignal;
@@ -318,7 +324,7 @@ export function createThreadSignalRoutes(
           consultRunCap,
           scope.tenantId,
           runtimeDriven,
-          scope.actor,
+          scope.principal,
           entryPath,
           startIdleRun,
           serializeWake,
@@ -338,7 +344,7 @@ export function createThreadSignalRoutes(
           consultRunCap,
           scope.tenantId,
           runtimeDriven,
-          scope.actor,
+          scope.principal,
           entryPath,
           startIdleRun,
           serializeWake,
@@ -362,7 +368,7 @@ export function createThreadSignalRoutes(
             threadId,
             resourceId,
             tenantId: scope.tenantId,
-            actor: scope.actor,
+            principal: scope.principal,
             entryPath,
             runtimeDriven,
             consultRunCap,
@@ -407,7 +413,7 @@ async function handleNotificationDispatch(options: {
   threadId: string;
   resourceId: string | undefined;
   tenantId: string;
-  actor: ApprovalActor;
+  principal: ExecutionPrincipal;
   entryPath: AgentEntryPath;
   runtimeDriven: boolean;
   consultRunCap?: RunCapConsult;
@@ -516,7 +522,7 @@ async function handleNotificationDispatch(options: {
       tenantId: options.tenantId,
       threadId: options.threadId,
       resourceId,
-      actor: options.actor,
+      principal: options.principal,
       entryPath: options.entryPath,
       runtimeDriven: options.runtimeDriven,
       consultRunCap: options.consultRunCap,
@@ -671,7 +677,7 @@ async function handleWake(options: {
   tenantId: string;
   threadId: string;
   resourceId: string;
-  actor: ApprovalActor;
+  principal: ExecutionPrincipal;
   entryPath: AgentEntryPath;
   runtimeDriven: boolean;
   consultRunCap?: RunCapConsult;
@@ -734,9 +740,9 @@ async function handleWake(options: {
       runId,
       threadId: options.threadId,
       resourceId: options.resourceId,
-      actor: options.actor,
+      principal: options.principal,
       entryPath: options.entryPath,
-      requestedBy: options.actor.id,
+      requestedBy: options.principal.id,
       ...(options.message !== undefined ? { message: options.message } : {}),
       ...(options.signal !== undefined ? { signal: options.signal } : {}),
     });
@@ -757,7 +763,7 @@ async function handleMessage(
   consultRunCap: RunCapConsult | undefined,
   tenantId: string,
   runtimeDriven: boolean,
-  actor: ApprovalActor,
+  principal: ExecutionPrincipal,
   entryPath: AgentEntryPath,
   startIdleRun: StartIdleRun | undefined,
   serializeWake: <T>(operation: () => Promise<T>) => Promise<T>,
@@ -787,7 +793,7 @@ async function handleMessage(
       tenantId,
       threadId,
       resourceId,
-      actor,
+      principal,
       entryPath,
       runtimeDriven,
       consultRunCap,
@@ -854,7 +860,7 @@ async function handleSignal(
   consultRunCap: RunCapConsult | undefined,
   tenantId: string,
   runtimeDriven: boolean,
-  actor: ApprovalActor,
+  principal: ExecutionPrincipal,
   entryPath: AgentEntryPath,
   startIdleRun: StartIdleRun | undefined,
   serializeWake: <T>(operation: () => Promise<T>) => Promise<T>,
@@ -900,7 +906,7 @@ async function handleSignal(
       tenantId,
       threadId,
       resourceId,
-      actor,
+      principal,
       entryPath,
       runtimeDriven,
       consultRunCap,

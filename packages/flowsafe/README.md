@@ -27,7 +27,7 @@ Compatibility:
 - TypeScript `moduleResolution: "NodeNext"`, `"Node16"`, or `"Bundler"`
 - `@mastra/core` in the declared `^1.50.0` peer range
 - `react` and `react-dom` `>=18 <20` (React 18 or 19) for the optional approval UI
-- `@proofoftech/breakwater` `>=0.6.0 <1.0.0` when used
+- `@proofoftech/breakwater` `>=0.7.0 <1.0.0` when used
 
 ## Choose an export
 
@@ -256,11 +256,11 @@ The following surfaces are supported and opt-in: they are tested and covered by 
 
 ### Durable agents
 
-Use `@proofoftech/flowsafe/agent-host` for a public protected surface. `createAgentRouter()` lists server-owned metadata and exposes authenticated start, status, and newline-delimited JSON observation routes. The router mints every id, rejects trusted context and execution overrides, and authorizes mutations against both the global start roles and the selected agent's roles.
+Use `@proofoftech/flowsafe/agent-host` for a public protected surface. `createAgentRouter()` lists server-owned metadata and exposes authenticated start, status, and newline-delimited JSON observation routes. The router mints every ID and rejects trusted context and execution overrides. Authenticated human starts must satisfy both the global start roles and the selected agent's `allowedRoles`. Automated entry uses trusted host paths instead: it never consults human roles and requires a matching principal kind and entry path in the selected agent's `allowedAutomation`.
 
 `createThreadAgentHost()` validates Breakwater's guarded-handle brand before it registers the agent with Mastra. It persists the thread/agent binding and original run principal, so eviction recovery and approval resume cannot switch agents or actors.
 
-Agent resume is approval-only. `createAgentApprovalResumer()` rejects legacy agent targets without the original principal, rechecks current catalog roles, and delegates non-agent workflow records to the existing resume function.
+Agent resume is approval-only. `createAgentApprovalResumer()` rejects legacy agent targets without the original principal, then rechecks that principal against the current catalog. A human must still satisfy the selected agent's `allowedRoles`. An automated principal's kind must still appear in `allowedAutomation`; `approval.resume` is implied for a declared kind. The resumer delegates non-agent workflow records to the existing resume function.
 
 `createFlowsafeDurableAgent()` remains the lower-level compatibility API. It routes Mastra's durable-agent workflow through `RunnerRuntime`, but it does not guard an arbitrary raw agent. Use `agent-host` when an HTTP surface must enforce catalog and Breakwater invariants.
 

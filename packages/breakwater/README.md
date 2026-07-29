@@ -117,6 +117,24 @@ The handle exposes only unstructured `generate()` and `stream()`. Each call requ
 
 `allowedRoles` is an exact allowlist with no role hierarchy. Application input processors may implement only `processInput`. Application output processors must implement both `processOutputStream` and `processOutputResult`.
 
+### Admit automated callers
+
+`Actor` carries an optional `kind` — `human`, `service`, `agent`, or `system`. An absent `kind` means `human`, so existing hosts are unaffected.
+
+`createGuardedAgent()` and `RBACMiddleware` both accept `allowedPrincipalKinds`, which **defaults to `['human']`**. An agent written before this option denies every automated caller until you widen it:
+
+```typescript
+const agent = createGuardedAgent({
+  // ...
+  allowedRoles: ['operator', 'admin'],
+  allowedPrincipalKinds: ['human', 'system', 'service'],
+});
+```
+
+The gate checks `kind` before `role`, and it does **not** consult `allowedRoles` for a non-human kind. An automated caller carries a role only because `Actor.role` is required; consulting it would either admit whatever role the host projected, or force you to allow that role and thereby admit real humans holding it. Both the processor gate and the direct-call gate enforce this.
+
+Flowsafe's agent host declares the matching half with `allowedAutomation`, which names each admitted kind together with the exact entry paths it may arrive on. See [Durable agents](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/durable-agents.md).
+
 The narrow handle prevents accidental use of raw Mastra execution methods. It is not a sandbox against hostile code in the same JavaScript process. Use the authenticated Flowsafe agent host when callers cross an HTTP or tenant boundary.
 
 ## Choose agent policies
@@ -228,7 +246,7 @@ The connector wrapper reads these keys:
 
 | Constant | Runtime key | Value | Who should set it |
 | --- | --- | --- | --- |
-| `ACTOR_CONTEXT_KEY` | `breakwater.actor` | `{ id, role }` | Authenticated host or `getActor` |
+| `ACTOR_CONTEXT_KEY` | `breakwater.actor` | `{ id, role, kind? }` | Authenticated host or `getActor` |
 | `APPROVED_CONNECTORS_CONTEXT_KEY` | `breakwater.approvedConnectors` | Connector ID array | Trusted approval service only |
 | `DRY_RUN_CONTEXT_KEY` | `breakwater.dryRun` | `true` | Caller requesting simulation |
 | `IDEMPOTENCY_KEY_CONTEXT_KEY` | `breakwater.idempotencyKey` | Non-empty string | Host-derived operation identity |
@@ -413,8 +431,8 @@ Type exports: `PolicyEngineOptions`, `PolicyEvaluator`, `PolicyContext`,
 | `RBACMiddleware`, `ROLES`, `ACTOR_CONTEXT_KEY`, `actorFromRequestContext` | Actor authorization and lookup |
 | `AuditLogger`, `combineAuditSinks`, `metricsAuditSink` | Buffered audit, sink fan-out, and metrics adaptation |
 
-Type exports: `Actor`, `Role`, `RBACMiddlewareOptions`, `AuditEvent`,
-`AuditSink`, `AuditLoggerOptions`, and `MetricsRecorder`.
+Type exports: `Actor`, `Role`, `PrincipalKind`, `RBACMiddlewareOptions`,
+`AuditEvent`, `AuditSink`, `AuditLoggerOptions`, and `MetricsRecorder`.
 The `rbac` subpath also re-exports `AuditLogger` and its original audit types
 for compatibility.
 

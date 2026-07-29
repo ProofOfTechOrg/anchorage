@@ -15,7 +15,11 @@
 
 import type { SendNotificationSignalInput } from '@mastra/core/notifications';
 
-import type { ApprovalActor, TenantContext } from '../approval-api/index.js';
+import {
+  type ExecutionPrincipal,
+  principalActor,
+  type TenantContext,
+} from '../approval-api/index.js';
 import {
   assertMintableTenantId,
   mintResourceId,
@@ -35,13 +39,18 @@ import type { StoredSubscription } from './subscription-d1.js';
  */
 export function deliveryTenantContext(tenantId: string): TenantContext {
   assertMintableTenantId(tenantId, 'deliveryTenantContext');
-  const actor: ApprovalActor = {
+  // A provider delivery is service-to-service work with no person behind it.
+  // It used to mint role:'operator', which handed webhook and poll delivery the
+  // authority of a human operator.
+  const principal: ExecutionPrincipal = {
+    kind: 'service',
     id: 'signal-provider-delivery',
-    role: 'operator',
     tenantId,
+    purpose: 'signal-provider-delivery',
   };
   return {
-    actor,
+    principal,
+    actor: principalActor(principal),
     tenantId,
     service: () => {
       throw new Error(

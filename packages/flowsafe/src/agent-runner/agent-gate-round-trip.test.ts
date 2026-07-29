@@ -31,7 +31,7 @@ import { InMemoryApprovalStore } from '../approval-api/store.js';
 import { init } from '../do-runner/init.js';
 import { queueApprovalForSuspension } from '../host-kit/approval-bridge.js';
 
-const SYSTEM: ApprovalActor = { id: 'sys', role: 'operator', tenantId: 'acme' };
+const SYSTEM = 'sys';
 const REVIEWER: ApprovalActor = {
   id: 'rev',
   role: 'reviewer',

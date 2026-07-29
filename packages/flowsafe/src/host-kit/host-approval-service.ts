@@ -11,7 +11,6 @@
 // span the isolate, not one request).
 
 import type {
-  ApprovalActor,
   ApprovalAuditEvent,
   ApprovalAuditSink,
   ApprovalDatabase,
@@ -23,9 +22,12 @@ import type {
 } from '../approval-api/index.js';
 import {
   ApprovalService,
+  type AutomatedExecutionPrincipal,
   D1ApprovalStoreFactory,
   purgeExpiredApprovals,
   sweepSLA,
+  type TrustedAutomationPrincipal,
+  trustAutomationPrincipal,
 } from '../approval-api/index.js';
 import { type AuditQueue, queueAuditSink } from '../audit-export/index.js';
 import {
@@ -41,8 +43,15 @@ import { numberVar } from './env-vars.js';
  * identity (RESERVED_TENANT_IDS), which no verifier admits and no store
  * binds to; per-record tenants ride in the audit detail.
  */
-export function maintenanceActor(systemActorId: string): ApprovalActor {
-  return { id: systemActorId, role: 'operator', tenantId: 'system' };
+export function maintenancePrincipal(
+  systemActorId: string,
+): TrustedAutomationPrincipal {
+  return trustAutomationPrincipal({
+    kind: 'system',
+    id: systemActorId,
+    tenantId: 'system',
+    purpose: 'approval-sla-maintenance',
+  });
 }
 
 // One factory per isolate, not per request: it owns the memoized schema-init
@@ -161,11 +170,6 @@ export function buildHostApprovalService(
   store: TenantBoundApprovalStore,
   options: HostApprovalServiceOptions,
 ): ApprovalService {
-  const systemActor: ApprovalActor = {
-    id: options.systemActorId,
-    role: 'operator',
-    tenantId: store.tenantId,
-  };
   const audit = hostAuditSink({
     queue: options.queue,
     keepAlive: options.waitUntil,
@@ -180,7 +184,7 @@ export function buildHostApprovalService(
     resumeRun: resumeRunWithRequeue(
       options.resumeRun,
       () => service,
-      systemActor,
+      options.systemActorId,
       audit,
     ),
   });
@@ -190,8 +194,13 @@ export function buildHostApprovalService(
 export interface SlaSweepMaintenanceOptions {
   /** factory.system() — the cron-only cross-tenant view. */
   store: SystemApprovalStore;
-  /** maintenanceActor(systemActorId). */
-  systemActor: ApprovalActor;
+  /**
+   * `maintenancePrincipal(systemActorId)`. Typed as merely automated, not
+   * vouched: the sweep derives no authority from the principal (the
+   * `SystemApprovalStore` type is its authorization), so demanding the trust
+   * brand here would ask for a token nothing on this path reads.
+   */
+  systemPrincipal: AutomatedExecutionPrincipal;
   /** Optional audit export queue. */
   queue?: AuditQueue<ApprovalAuditEvent>;
   /** The firing cron expression — log correlation only. */
@@ -234,7 +243,7 @@ export async function runSlaSweepMaintenance(
   try {
     escalated = (
       await sweepSLA(options.store, {
-        systemActor: options.systemActor,
+        systemPrincipal: options.systemPrincipal,
         audit: hostAuditSink({
           queue: options.queue,
           keepAlive: (send) => pendingSends.push(send),

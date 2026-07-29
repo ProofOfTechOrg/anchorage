@@ -25,6 +25,7 @@ import {
   ROLES,
   type Role,
 } from '../rbac/index.js';
+import { assertPrincipalKinds, type PrincipalKind } from '../rbac/principal.js';
 
 const RESERVED_PROCESSOR_IDS = new Set([
   'breakwater-rbac',
@@ -171,6 +172,12 @@ export type GuardedAgentConfig<
 > & {
   /** Exact actor roles authorized for direct and durable execution. */
   allowedRoles: readonly Role[];
+  /**
+   * Exact principal kinds authorized for direct and durable execution.
+   * Defaults to `['human']`: an agent that does not name its automation denies
+   * every scheduled, signal, service, and agent-delegated entry.
+   */
+  allowedPrincipalKinds?: readonly PrincipalKind[];
   /** Mandatory input and output policies, evaluated in array order. */
   policies: readonly PolicyEvaluator[];
   /** Required failure-isolated audit logger for every mandatory gate. */
@@ -209,6 +216,8 @@ export interface GuardedAgentHandle {
   readonly id: string;
   /** Exact role allowlist enforced at every guarded entry. */
   readonly allowedRoles: readonly Role[];
+  /** Exact principal-kind allowlist enforced at every guarded entry. */
+  readonly allowedPrincipalKinds: readonly PrincipalKind[];
   /** Fixed maximum execution steps. */
   readonly maxSteps: number;
 
@@ -428,6 +437,7 @@ class GuardedAgent<
   TRequestContext extends Record<string, unknown> | unknown,
 > extends Agent<TAgentId, TTools, undefined, TRequestContext, false> {
   readonly allowedRoles: readonly Role[];
+  readonly allowedPrincipalKinds: readonly PrincipalKind[];
   readonly maxSteps: number;
   readonly #audit: AuditLogger;
   readonly #applicationInputProcessors: readonly GuardedInputProcessor[];
@@ -450,6 +460,10 @@ class GuardedAgent<
       throw new TypeError('createGuardedAgent: policies must be an array');
     }
     const allowedRoles = assertRoles(options.allowedRoles);
+    const allowedPrincipalKinds = assertPrincipalKinds(
+      options.allowedPrincipalKinds,
+      'createGuardedAgent',
+    );
     const maxSteps = options.maxSteps;
     const toolChoice = assertToolChoice(options.toolChoice);
     const applicationInputProcessors = validateInputProcessors(
@@ -460,6 +474,7 @@ class GuardedAgent<
     );
     const {
       allowedRoles: _allowedRoles,
+      allowedPrincipalKinds: _allowedPrincipalKinds,
       policies,
       audit,
       maxSteps: _maxSteps,
@@ -476,6 +491,7 @@ class GuardedAgent<
     });
     const rbac = new RBACMiddleware({
       allowedRoles,
+      allowedPrincipalKinds,
       audit,
       resource: `agent:${options.id}`,
     });
@@ -494,6 +510,7 @@ class GuardedAgent<
       },
     } as AgentConfig<TAgentId, TTools, undefined, TRequestContext, false>);
     this.allowedRoles = allowedRoles;
+    this.allowedPrincipalKinds = allowedPrincipalKinds;
     this.maxSteps = maxSteps;
     this.#audit = audit;
     this.#applicationInputProcessors = applicationInputProcessors;
@@ -539,6 +556,9 @@ class GuardedAgent<
   #preauthorize(requestContext: RequestContext): void {
     authorizeActor({
       allowedRoles: this.allowedRoles,
+      // Direct calls bypass the processor chain entirely, so this gate must
+      // carry the same kind allowlist or it is a hole around the middleware.
+      allowedPrincipalKinds: this.allowedPrincipalKinds,
       audit: this.#audit,
       resource: `agent:${this.id}`,
       requestContext,

@@ -21,6 +21,7 @@ import {
   AuditLogger,
   createConnector,
   ISOLATION_SCOPE_CONTEXT_KEY,
+  PRINCIPAL_KINDS,
   ROLES,
   WORKFLOW_SCOPE_CONTEXT_KEY,
 } from '@proofoftech/breakwater';
@@ -40,6 +41,7 @@ import {
   BREAKWATER_ACTOR_KEY,
   BREAKWATER_APPROVED_CONNECTORS_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
+  DECIDER_ROLES,
   RUN_START_ROLES,
 } from './contract.js';
 import {
@@ -47,6 +49,11 @@ import {
   approvedConnectorsForLeg,
   resumeViaRuntime,
 } from './grants.js';
+import {
+  AUTOMATED_PRINCIPAL_KINDS,
+  AUTOMATED_PROJECTED_ROLE,
+  EXECUTION_PRINCIPAL_KINDS,
+} from './principal.js';
 import { createApprovalRouter } from './router.js';
 import { ApprovalService } from './service.js';
 import { InMemoryApprovalStore } from './store.js';
@@ -154,6 +161,25 @@ describe('breakwater contract tripwires', () => {
     // @ts-expect-error tenantId is required on ApprovalActor — dropping it must not compile
     const tenantless: ApprovalActor = { id: 'x', role: 'admin' };
     void tenantless;
+  });
+
+  it('mirrors breakwater PrincipalKind by value', () => {
+    // #given / #when / #then — flowsafe does not import breakwater at runtime,
+    // so this union is mirrored. Drift makes the catalog reject a kind
+    // breakwater accepts, at host construction, with no test going red.
+    expect([...EXECUTION_PRINCIPAL_KINDS]).toEqual([...PRINCIPAL_KINDS]);
+    expect([...AUTOMATED_PRINCIPAL_KINDS]).toEqual(
+      PRINCIPAL_KINDS.filter((kind) => kind !== 'human'),
+    );
+  });
+
+  it('keeps the automated projected role out of every start gate', () => {
+    // #given / #when / #then — the load-bearing invariant behind projecting an
+    // inert role: nothing that gates on a HUMAN role may admit it. If this ever
+    // fails, an automated principal reaching a role check is admitted without
+    // its agent ever declaring allowedAutomation.
+    expect(RUN_START_ROLES).not.toContain(AUTOMATED_PROJECTED_ROLE);
+    expect(DECIDER_ROLES).not.toContain(AUTOMATED_PROJECTED_ROLE);
   });
 
   it('pins RUN_START_ROLES to the start-capable subset', () => {

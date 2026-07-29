@@ -16,8 +16,12 @@ import {
   approvalCursor,
   MAX_APPROVAL_LIST_LIMIT,
   OPEN_STATUSES,
+  principalActor,
+  principalAuditFields,
   stepKeyOf,
   type TenantContext,
+  type TrustedAutomationPrincipal,
+  trustAutomationPrincipal,
 } from '../approval-api/index.js';
 import type { RunSummary } from '../do-runner/index.js';
 
@@ -65,6 +69,33 @@ export function requestedConnectors(stepPayload: unknown): string[] {
 }
 
 /**
+ * One purpose string for every audit event this module emits — filing a
+ * suspension's gates, re-filing them after a decision, and reporting a re-queue
+ * failure are the same duty, so they must not drift into different provenances.
+ */
+const RECONCILE_PURPOSE = 'approval-suspension-reconcile';
+
+/**
+ * The platform's own bookkeeping identity for one service. Minted here rather
+ * than taken from the caller: every in-repo user files under a system principal
+ * with a fixed purpose and the service's own tenant, so requiring hosts to
+ * construct and vouch for one only spread `trustAutomationPrincipal` into host
+ * code — and into the sample every consumer copies.
+ */
+function bookkeepingPrincipal(
+  service: ApprovalService,
+  systemActorId: string,
+  purpose: string,
+): TrustedAutomationPrincipal {
+  return trustAutomationPrincipal({
+    kind: 'system',
+    id: systemActorId,
+    tenantId: service.tenantId,
+    purpose,
+  });
+}
+
+/**
  * A suspension IS an approval request: queue one record per suspended step
  * path (idempotently — the store's partial unique open-step index collapses
  * duplicates, so re-queuing an already-queued gate is a no-op). EVERY path
@@ -81,16 +112,23 @@ export function requestedConnectors(stepPayload: unknown): string[] {
  * next gate. It must NOT be the system actor: the library's self-decision
  * separation-of-duties check compares `requestedBy` to the deciding actor, so
  * attributing every request to the system actor would make that check unfireable.
- * `systemActor` is only the record's creator (needs a create-capable role).
+ * `systemActorId` names only the record's creator. The bridge mints its own
+ * automated principal from it against the service's tenant binding, so a host
+ * never performs the trust assertion for the platform's own bookkeeping.
  */
 export async function queueApprovalForSuspension(
   service: ApprovalService,
   workflowId: string,
   summary: RunSummary,
   requestedBy: string,
-  systemActor: ApprovalActor,
+  systemActorId: string,
   resumeTarget?: ApprovalResumeTarget,
 ): Promise<ApprovalRecord[]> {
+  const systemPrincipal = bookkeepingPrincipal(
+    service,
+    systemActorId,
+    RECONCILE_PURPOSE,
+  );
   const suspended = summary.suspended ?? [];
   const records: ApprovalRecord[] = [];
   const failures: Array<{ stepKey: string; message: string }> = [];
@@ -103,7 +141,7 @@ export async function queueApprovalForSuspension(
         : undefined;
     const connectors = requestedConnectors(stepPayload);
     try {
-      const { record } = await service.create(
+      const { record } = await service.createAsPrincipal(
         {
           workflowId,
           runId: summary.runId,
@@ -116,7 +154,7 @@ export async function queueApprovalForSuspension(
           connectors: connectors.length > 0 ? connectors : undefined,
           requestedBy,
         },
-        systemActor,
+        systemPrincipal,
         resumeTarget,
       );
       records.push(record);
@@ -171,7 +209,7 @@ export async function queueApprovalForSuspension(
 export function resumeRunWithRequeue(
   base: ResumeRunFn,
   getService: () => ApprovalService,
-  systemActor: ApprovalActor,
+  systemActorId: string,
   audit?: ApprovalAuditSink,
 ): ResumeRunFn {
   return async (record, decision) => {
@@ -186,13 +224,26 @@ export function resumeRunWithRequeue(
         record.resumeTarget?.kind === 'agent-thread'
           ? record.resumeTarget.principal.id
           : record.decidedBy;
+      // Declared out here, minted INSIDE the try. Vouching validates and can
+      // throw on the same inputs the re-queue throws on (a blank or over-long
+      // systemActorId, an empty service tenant), so minting outside any handler
+      // would lose the audit event entirely for exactly that class — the event
+      // is the only signal that names the suspended step paths. Minting inside
+      // and reporting with whatever identity we managed to derive keeps the
+      // event unconditional, which is what it was before principals existed.
+      let principal: TrustedAutomationPrincipal | undefined;
       try {
+        principal = bookkeepingPrincipal(
+          getService(),
+          systemActorId,
+          RECONCILE_PURPOSE,
+        );
         await queueApprovalForSuspension(
           getService(),
           record.workflowId,
           summary,
           requestedBy,
-          systemActor,
+          systemActorId,
           record.resumeTarget,
         );
       } catch (error) {
@@ -200,8 +251,15 @@ export function resumeRunWithRequeue(
         // reporting (same "availability over export reliability" posture as
         // ApprovalService's own #record).
         try {
+          // The platform's own principal, not a hand-shaped viewer actor: this
+          // event is emitted by automation, so it carries the same
+          // principalKind/principalId/purpose provenance every other automated
+          // audit event carries, and its role is derived rather than asserted.
+          // If the mint itself was what failed there is no identity to derive,
+          // and an unattributed event beats no event — `#authorizeAutomated`
+          // records a null actor for the same reason.
           const outcome = audit?.({
-            actor: systemActor,
+            actor: principal ? principalActor(principal) : null,
             action: 'approval.requeue',
             resource: `approval:${record.id}`,
             decision: 'error',
@@ -211,6 +269,7 @@ export function resumeRunWithRequeue(
               workflowId: record.workflowId,
               runId: record.runId,
               suspended: summary.suspended,
+              ...(principal ? principalAuditFields(principal) : {}),
             },
           });
           if (outcome instanceof Promise) {
@@ -294,7 +353,7 @@ async function listAllApprovals(
  * Delegates the actual filing to queueApprovalForSuspension against a copy of
  * `summary` narrowed to only the healed paths, so a step with a live or
  * in-flight record is never touched. `requestedBy` defaults to the SYSTEM
- * actor because generic workflow reconciliation cannot reliably recover the
+ * principal because generic workflow reconciliation cannot reliably recover the
  * initiating principal. Agent hosts persist the original requester and pass
  * that id explicitly so separation of duties survives eviction and filing
  * retries.
@@ -303,16 +362,21 @@ export async function reconcileApprovalsForSummary(
   service: ApprovalService,
   workflowId: string,
   summary: RunSummary,
-  systemActor: ApprovalActor,
+  systemActorId: string,
   resumeTarget?: ApprovalResumeTarget,
-  requestedBy = systemActor.id,
+  requestedBy = systemActorId,
 ): Promise<ApprovalRecord[]> {
+  const systemPrincipal = bookkeepingPrincipal(
+    service,
+    systemActorId,
+    RECONCILE_PURPOSE,
+  );
   const suspended = summary.suspended ?? [];
   if (suspended.length === 0) return [];
   const existing = await listAllApprovals(
     service,
     { workflowId, runId: summary.runId },
-    systemActor,
+    principalActor(systemPrincipal),
   );
   const toFile: string[][] = [];
   for (const stepPath of suspended) {
@@ -332,9 +396,9 @@ export async function reconcileApprovalsForSummary(
     let lostRace = false;
     for (const record of stepRecords) {
       if (!OPEN_STATUSES.includes(record.status)) continue;
-      const superseded = await service.supersedeStale(
+      const superseded = await service.supersedeStaleAsPrincipal(
         record.id,
-        systemActor,
+        systemPrincipal,
         'superseded: stale suspension fingerprint',
       );
       // null = a real decision won the CAS between the list() above and this
@@ -351,7 +415,7 @@ export async function reconcileApprovalsForSummary(
     workflowId,
     { ...summary, suspended: toFile },
     requestedBy,
-    systemActor,
+    systemActorId,
     resumeTarget,
   );
 }
@@ -371,10 +435,11 @@ export function reconcileApprovalsOnStatus(
   summary: RunSummary,
 ) => Promise<void> {
   return async (tenant, workflowId, summary) => {
-    await reconcileApprovalsForSummary(tenant.service(), workflowId, summary, {
-      id: systemActorId,
-      role: 'operator',
-      tenantId: tenant.tenantId,
-    });
+    await reconcileApprovalsForSummary(
+      tenant.service(),
+      workflowId,
+      summary,
+      systemActorId,
+    );
   };
 }

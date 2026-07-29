@@ -26,7 +26,6 @@
 // step re-checks and fails closed. Approve through the queue, not this route.
 
 import {
-  type ApprovalActor,
   RUN_START_ROLES,
   type TenantContext,
   TenantResolutionError,
@@ -259,17 +258,12 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
           body.inputData,
         );
         if (summary.status !== 'suspended') return json(summary);
-        const systemActor: ApprovalActor = {
-          id: systemActorId,
-          role: 'operator',
-          tenantId: tenant.tenantId,
-        };
         const approvals = await queueApprovalForSuspension(
           tenant.service(),
           body.workflowId,
           summary,
           actor.id,
-          systemActor,
+          systemActorId,
         );
         // `approval` remains the single-gate response contract (what the SPA
         // links); `approvals` carries every record a parallel multi-step

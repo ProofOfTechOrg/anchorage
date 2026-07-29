@@ -95,6 +95,8 @@ import {
   createTenantResolver,
   D1ApprovalStoreFactory,
   defaultResumeData,
+  type ExecutionPrincipal,
+  principalActor,
   type TenantBoundApprovalStore,
   type TenantContext,
 } from '../src/approval-api/index.js';
@@ -203,6 +205,12 @@ const SPIKE_AGENT_META = {
   description:
     'Calls one approval-gated write connector through the catalog-driven durable host.',
   allowedRoles: ['admin', 'operator'],
+  // The automated entries the spike drives. 'approval.resume' is implied by the
+  // kind, so a scheduled run that suspends for approval still resumes.
+  allowedAutomation: [
+    { kind: 'system', entryPaths: ['schedule.fire', 'notification.dispatch'] },
+    { kind: 'service', entryPaths: ['signal.notification'] },
+  ],
 } as const satisfies AgentMeta;
 
 const modelUsage = {
@@ -417,6 +425,7 @@ function createSpikeAgentModule(env: Env, audit: AuditLogger): AgentModule {
       model: agentModel(env),
       tools: { [SPIKE_WRITE_CONNECTOR_ID]: write },
       allowedRoles: SPIKE_AGENT_META.allowedRoles,
+      allowedPrincipalKinds: ['human', 'system', 'service'],
       policies: [],
       audit,
       maxSteps: 1,
@@ -979,7 +988,8 @@ export class DemoThread extends ThreadDurableObject<Env> {
       const scope = {
         threadId: input.threadId,
         tenantId: this.tenantId,
-        actor: input.actor,
+        actor: principalActor(input.principal),
+        principal: input.principal,
         requestedBy: input.requestedBy,
         init: this.#initResult(),
       };
@@ -1314,10 +1324,15 @@ async function handleLiveAgentRoute(
   });
 }
 
-function tenantContextForActor(actor: ApprovalActor, env: Env): TenantContext {
+function tenantContextForPrincipal(
+  principal: ExecutionPrincipal,
+  env: Env,
+): TenantContext {
+  const actor = principalActor(principal);
   let service: ApprovalService | undefined;
   return {
     actor,
+    principal,
     tenantId: actor.tenantId,
     service: () => {
       service ??= new ApprovalService({
@@ -1365,7 +1380,8 @@ function buildApprovalService(
     fallback,
     agents: [SPIKE_AGENT_META],
     topology: createAgentThreadTopology(env.THREAD),
-    tenantForActor: (actor) => tenantContextForActor(actor, env),
+    tenantForPrincipal: (principal) =>
+      tenantContextForPrincipal(principal, env),
   });
   return new ApprovalService({
     store,
@@ -1528,6 +1544,12 @@ async function handleSignalProbe(
     ({
       tenantId,
       actor: { id: 'signal-probe', role: 'operator', tenantId },
+      principal: {
+        kind: 'human',
+        id: 'signal-probe',
+        tenantId,
+        role: 'operator',
+      },
       ownsMemoryId: (id: string) => tenantOwnsMemoryId(tenantId, id),
     }) as unknown as TenantContext;
 
@@ -1621,6 +1643,7 @@ async function handleGoalProbe(
     ({
       tenantId,
       actor: { id: 'goal-probe', role, tenantId },
+      principal: { kind: 'human', id: 'goal-probe', tenantId, role },
       ownsMemoryId: (id: string) => tenantOwnsMemoryId(tenantId, id),
     }) as unknown as TenantContext;
 
@@ -1801,9 +1824,34 @@ async function handleScheduleProbe(
   }
 
   if (request.method === 'POST' && path === '/sched/agent') {
+    // `?entryPath=` drives the NEGATIVE half: the same SYSTEM principal on an
+    // entry path SPIKE_AGENT_META never declared must be refused at the host.
+    const requestedEntry = new URL(request.url).searchParams.get('entryPath');
     const id = `schedule_${crypto.randomUUID()}`;
     const threadId = mintThreadId('spike');
     const resourceId = mintResourceId('spike', threadId);
+    // A threaded schedule fires only through an EXISTING binding, so bind the
+    // thread with a human start first. That is also what makes the probe
+    // meaningful: the thread belongs to a person, and the later unattended fire
+    // must still arrive as SYSTEM rather than inheriting that person's role.
+    await createAgentThreadTopology(env.THREAD).start(
+      tenantContextForPrincipal(
+        {
+          kind: 'human',
+          id: 'sched-owner',
+          tenantId: 'spike',
+          role: 'operator',
+        },
+        env,
+      ),
+      {
+        agentId: SPIKE_AGENT_ID,
+        prompt: 'Bind this thread.',
+        entryPath: 'http.start',
+        threadId,
+        resourceId,
+      },
+    );
     await store.createSchedule({
       id,
       target: {
@@ -1820,12 +1868,15 @@ async function handleScheduleProbe(
       updatedAt: now,
       metadata: { tenantId: 'spike' },
     });
-    const actor: ApprovalActor = {
+    // The schedule tick fires as SYSTEM automation, not as a synthetic human
+    // operator — the agent it targets must have declared this entry.
+    const principal: ExecutionPrincipal = {
+      kind: 'system',
       id: SYSTEM_ACTOR_ID,
-      role: 'operator',
       tenantId: 'spike',
+      purpose: 'scheduled-agent-execution',
     };
-    const tenant = tenantContextForActor(actor, env);
+    const tenant = tenantContextForPrincipal(principal, env);
     const topology = createAgentThreadTopology(env.THREAD);
     const tick = createScheduleTick({
       store,
@@ -1843,7 +1894,7 @@ async function handleScheduleProbe(
           agentId: target.agentId,
           runId,
           prompt: target.prompt,
-          entryPath,
+          entryPath: (requestedEntry ?? entryPath) as typeof entryPath,
           threaded,
           requestContext,
           streamRequestContext,
@@ -1865,6 +1916,7 @@ async function handleScheduleProbe(
       threadId,
       resourceId,
       runId: trigger?.runId ?? null,
+      error: trigger?.error ?? null,
     });
   }
 

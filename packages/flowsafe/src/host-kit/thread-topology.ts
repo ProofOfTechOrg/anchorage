@@ -24,10 +24,13 @@
 // keeping host-kit free of @cloudflare/workers-types — same convention as
 // RunnerNamespaceLike / HubNamespaceLike.
 
-import type { TenantContext } from '../approval-api/index.js';
 import {
-  THREAD_ACTOR_HEADER,
-  THREAD_ACTOR_ROLE_HEADER,
+  assertExecutionPrincipal,
+  encodeExecutionPrincipal,
+  type TenantContext,
+} from '../approval-api/index.js';
+import {
+  THREAD_PRINCIPAL_HEADER,
   THREAD_TENANT_HEADER,
 } from '../do-runner/index.js';
 import { requireOwnedMemoryId } from './memory-boundary.js';
@@ -89,6 +92,26 @@ export interface ThreadTopology {
   ): Promise<Response>;
 }
 
+/**
+ * The identity this hop carries, validated against the tenant it is being sent
+ * to. The principal is the ONLY identity on the wire: the DO projects
+ * `scope.actor` from it, so a host's separate `TenantContext.actor` can never
+ * disagree with what executes.
+ *
+ * The tenant check matters because `encodeExecutionPrincipal` deliberately omits
+ * `tenantId` and the DO re-binds it from its own authenticated tenant: without
+ * this, a context whose principal belongs to another tenant would be silently
+ * re-tenanted, and the audit trail would name the wrong tenant's principal with
+ * nothing flagging it.
+ */
+function stampedPrincipal(tenant: TenantContext) {
+  return assertExecutionPrincipal(
+    tenant.principal,
+    tenant.tenantId,
+    'thread topology principal',
+  );
+}
+
 export function createThreadTopology<Id>(
   namespace: ThreadNamespaceLike<Id>,
 ): ThreadTopology {
@@ -119,9 +142,13 @@ export function createThreadTopology<Id>(
       // relies on; it overwrites at every spelling. The value is the RESOLVED
       // tenant context (authenticate -> INV-3 -> bind), never a header or body.
       const merged = new Headers(init.headers);
+      const principal = stampedPrincipal(tenant);
       merged.set(THREAD_TENANT_HEADER, tenant.tenantId);
-      merged.set(THREAD_ACTOR_HEADER, tenant.actor.id);
-      merged.set(THREAD_ACTOR_ROLE_HEADER, tenant.actor.role);
+      merged.set(THREAD_PRINCIPAL_HEADER, encodeExecutionPrincipal(principal));
+      // Retired identity headers: nothing reads them, but a caller's value must
+      // not ride into the DO as if the topology had stamped it.
+      merged.delete('x-flowsafe-actor');
+      merged.delete('x-flowsafe-role');
       const headers: Record<string, string> = {};
       merged.forEach((value, key) => {
         headers[key] = value;
@@ -138,9 +165,16 @@ export function createThreadTopology<Id>(
       // is what makes a forged client value vanish rather than ride along as a
       // second value the DO might read.
       const forwarded = new Request(request);
+      const principal = stampedPrincipal(tenant);
       forwarded.headers.set(THREAD_TENANT_HEADER, tenant.tenantId);
-      forwarded.headers.set(THREAD_ACTOR_HEADER, tenant.actor.id);
-      forwarded.headers.set(THREAD_ACTOR_ROLE_HEADER, tenant.actor.role);
+      // Retired identity headers: nothing reads them, but a client's forged
+      // value must not ride into the DO as if the topology had stamped it.
+      forwarded.headers.delete('x-flowsafe-actor');
+      forwarded.headers.delete('x-flowsafe-role');
+      forwarded.headers.set(
+        THREAD_PRINCIPAL_HEADER,
+        encodeExecutionPrincipal(principal),
+      );
       return stub(addressed).fetch(forwarded);
     },
   };

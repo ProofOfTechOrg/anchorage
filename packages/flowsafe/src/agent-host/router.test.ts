@@ -8,11 +8,11 @@ import type {
 } from '../approval-api/index.js';
 import {
   createTenantResolver,
+  humanPrincipal,
   InMemoryApprovalStoreFactory,
   TenantResolutionError,
 } from '../approval-api/index.js';
 import { RunRouteError } from '../host-kit/index.js';
-
 import { createAgentRouter } from './router.js';
 import type { AgentThreadTopology } from './thread-topology.js';
 import type { AgentRunEnvelope } from './types.js';
@@ -30,6 +30,7 @@ function tenant(role: ApprovalRole = 'operator'): TenantContext {
   const actor: ApprovalActor = { id: `${role}-1`, role, tenantId: 'acme' };
   return {
     actor,
+    principal: humanPrincipal(actor),
     tenantId: actor.tenantId,
     service: () => {
       throw new Error('unused');

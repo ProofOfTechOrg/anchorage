@@ -29,6 +29,8 @@ export {
 export {
   type AgentThreadInstanceScope,
   type AgentThreadStateStorage,
+  type AutomatedEntryAuthorizer,
+  type AutomatedEntryRequest,
   type BoundThreadAgent,
   createThreadAgentHost,
   type ThreadAgentHost,
@@ -47,15 +49,16 @@ export {
   AGENT_AUDIT_CONTEXT_KEY,
   createTrustedAgentRequestContext,
   deriveTrustedAgentContext,
-  rejectReservedAgentContext,
   sanitizeStoredAgentContext,
 } from './trusted-context.js';
 export type {
+  AgentAutomationRule,
   AgentCatalog,
   AgentEntryPath,
   AgentMeta,
   AgentModule,
   AgentModuleCatalog,
   AgentRunEnvelope,
+  AutomationCheck,
   TrustedAgentExecution,
 } from './types.js';

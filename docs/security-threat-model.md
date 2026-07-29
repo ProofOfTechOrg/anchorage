@@ -154,7 +154,7 @@ The trusted suspension bridge records:
 
 `approvalGrantProvider()` reads only approved records and requires an exact match on the current leg. The runtime-owned resume count distinguishes repeated same-step suspensions even when timestamps collide.
 
-An agent resume target contains the agent, thread, resource, and original authorized principal. A reviewer decision resumes execution as that principal after current catalog-role validation; the reviewer cannot replace it. Legacy agent approvals without this principal fail closed.
+An agent resume target contains the agent, thread, resource, and original authorized principal. A reviewer decision resumes execution as that principal after re-authorizing it against the current catalog: a human principal against the agent's roles, an automated principal against its `allowedAutomation` declaration. The reviewer cannot replace it. Legacy agent approvals without this principal fail closed.
 
 An explicit trusted `runScoped: true` record is a standing grant. A step-less record without that flag grants nothing.
 
@@ -187,7 +187,10 @@ A host with only one human reviewer must consciously choose availability or sepa
 | Foreign or mismatched agent binding reached | Server catalog plus persisted thread/run/agent binding checks before mutation authorization | Raw namespace access outside the agent topology is unsupported |
 | Client smuggles memory id | Recursive body rejection and server minters | Application-specific aliases must not bypass the minter |
 | Schedule row plants grant/context | Reserved-key rejection and runtime-last merge | Direct database writers remain part of the trusted computing base |
-| Reviewer becomes agent execution principal | Persist original requester in the approval target and recheck current catalog roles on resume | The stored principal is an authorization snapshot, not a dynamic identity-provider lookup |
+| Reviewer becomes agent execution principal | Persist the original execution principal in the approval target and re-authorize it on resume: roles for a human, `allowedAutomation` for an automated principal | The stored principal is an authorization snapshot, not a dynamic identity-provider lookup |
+| Automation acquires a human's authority | Automated work carries a non-human `ExecutionPrincipal` with a required `purpose`; Breakwater gates on `allowedPrincipalKinds` before roles and never consults the role allowlist for a non-human kind; the agent host requires an `allowedAutomation` declaration naming the kind and the exact entry path | Host code inside the trusted computing base still vouches for its own automated principals |
+| Automated principal mutated after it is vouched | `trustAutomationPrincipal()` returns a branded, frozen canonical clone; the trusted service entries recheck the own brand, the shape, the kind, and that every field is a plain data property, rather than trusting the erased parameter type | In-process code can recover the brand by reflection from any vouched principal and stamp a frozen object of its own, the same deliberate residual the tenant-binding brand accepts |
+| Vouched principal answers differently on a later read | Accessor properties are refused outright: a getter survives `Object.freeze`, and the trusted entries read a principal several times per call | A caller inside the trusted computing base can still pass a plain object built to its own liking |
 | Webhook claims victim tenant | Verify raw bytes first; tenant from subscription row | Provider secret compromise can forge provider events |
 | Provider alarm lost after subscription | Post-commit reconcile callback and retryable mutation-applied response | Hosts that omit reconciliation must arm polling themselves |
 | Duplicate connector side effect | Atomic idempotency lease and shared store | Poor business keys or too-short pending TTL can still duplicate |

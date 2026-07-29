@@ -40,14 +40,34 @@ interface AgentModule {
     title: string;
     description: string;
     allowedRoles?: readonly ApprovalRole[];
+    allowedAutomation?: readonly {
+      kind: 'service' | 'agent' | 'system';
+      entryPaths: readonly AgentEntryPath[];
+    }[];
   };
   agent: GuardedAgentHandle;
 }
 ```
 
+`allowedRoles` governs authenticated humans. `allowedAutomation` governs everything else, and **an omitted or empty list denies every automated entry.** A schedule tick, a signal-provider delivery, a notification dispatch, or a delegating agent reaches an agent only if that agent names the principal kind together with the exact entry path. Naming the path and not just the kind is what stops an agent that may fire on a schedule from also accepting webhook-delivered signals.
+
+`approval.resume` is never declared: resuming is implied by the kind that started the run. Requiring hosts to list it would mean an automated run that suspends for approval is stranded the moment a human approves it. A kind removed from the declaration entirely can still no longer resume.
+
+The guarded handle must agree. `createGuardedAgent({ allowedPrincipalKinds })` decides which kinds may execute at all, and catalog construction refuses a module whose declared automation kinds differ from it — so a host cannot advertise automation Breakwater will refuse, or register an automation-capable agent its catalog will never route to.
+
+```typescript
+// An agent driven by a schedule and by provider deliveries.
+allowedAutomation: [
+  { kind: 'system', entryPaths: ['schedule.fire', 'notification.dispatch'] },
+  { kind: 'service', entryPaths: ['signal.notification'] },
+],
+// and on the guarded agent:
+allowedPrincipalKinds: ['human', 'system', 'service'],
+```
+
 The Worker receives metadata only. The thread Durable Object constructs the complete module because its model, storage, runtime, pub/sub, connector, and database objects belong to that instance.
 
-Catalog construction rejects path-unsafe or duplicate ids, empty descriptions, invalid role lists, metadata/handle id mismatches, and metadata roles that differ from the guarded handle. An omitted role list uses `RUN_START_ROLES`.
+Catalog construction rejects path-unsafe or duplicate ids, empty descriptions, invalid role lists, metadata/handle id mismatches, metadata roles that differ from the guarded handle, and automation declarations that name a human kind, an unknown entry path, `approval.resume`, a repeated kind, or a kind set differing from the guarded handle. An omitted role list uses `RUN_START_ROLES`; an omitted automation list denies all automated entry.
 
 Mount `createAgentRouter()` through `createFlowsafeWorker({ buildAgentRouter })`. It exposes:
 
@@ -64,7 +84,7 @@ The start body accepts only `{"prompt":"..."}`. The router caps the raw UTF-8 bo
 
 Each stream line contains the next reconnect cursor and one event. Replay depends on the configured Mastra cache and is not process-restart durable. When the durable run exists but its replay cache does not, the stream route returns 409 and the client must use the status route.
 
-Approval records store an `agent-thread` target with the agent, thread, resource, and original authorized principal. `createAgentApprovalResumer()` rechecks the current catalog roles, reconstructs the guarded module after eviction, and resumes as that original principal. Before resume, the wrapper rebuilds Mastra's local and global run registries from fresh trusted context. It invokes only Breakwater's reserved RBAC `processInput` hook during rehydration, then installs the complete input, LLM-request, and output processor lists for resumed loop execution. It does not replay application or policy `processInput` hooks. An authorization denial stops before registry installation, observation, or tool execution. The reviewer identity remains attached to the approval decision.
+Approval records store an `agent-thread` target with the agent, thread, resource, and original authorized principal. `createAgentApprovalResumer()` re-authorizes that stored principal against the current catalog — a human against the agent's roles, an automated principal against its `allowedAutomation` declaration on the `approval.resume` entry path — reconstructs the guarded module after eviction, and resumes as that original principal. Before resume, the wrapper rebuilds Mastra's local and global run registries from fresh trusted context. It invokes only Breakwater's reserved RBAC `processInput` hook during rehydration, then installs the complete input, LLM-request, and output processor lists for resumed loop execution. It does not replay application or policy `processInput` hooks. An authorization denial stops before registry installation, observation, or tool execution. The reviewer identity remains attached to the approval decision.
 
 ## Use the lower-level durable wrapper
 
@@ -116,8 +136,8 @@ Host rules:
 2. Resolve the authenticated `TenantContext`.
 3. Return 404 for a foreign stored id with `requireOwnedMemoryId()`.
 4. Address the thread Durable Object through `createThreadTopology()`.
-5. Let the topology overwrite `x-flowsafe-tenant`, `x-flowsafe-actor`, and `x-flowsafe-role` from the resolved context.
-6. Have `ThreadDurableObject` reconstruct the actor and verify the stamped tenant against its own `id.name` prefix.
+5. Let the topology stamp `x-flowsafe-tenant` and `x-flowsafe-principal` from the resolved context. The principal is the sole identity channel: the retired `x-flowsafe-actor` and `x-flowsafe-role` headers are stripped on send and forward, and `createTenantResolver` refuses an inbound request that carries either. The Durable Object refuses a request that carries no principal header rather than treating the caller as a human.
+6. Have `ThreadDurableObject` project the actor from the stamped principal and verify the stamped tenant against its own `id.name` prefix.
 
 The D1 recall-path tests use one database and the same business key for two tenants. They prove isolated `recall`, `listThreads`, and working memory behavior through Mastra's own memory implementation.
 
@@ -241,6 +261,8 @@ Only connectors whose permission manifest is read-only may opt into model-reques
 
 ## Add signal providers
 
+Provider deliveries arrive as a `service` principal on the `signal.notification` entry path. The target agent must declare that pair in `allowedAutomation`, or delivery is refused.
+
 Core signal providers deliver through an in-process agent registry, which is not durable or tenant-aware enough for this topology. Flowsafe preserves the provider contract while routing delivery through the thread topology.
 
 Wire:
@@ -280,5 +302,7 @@ Keep independent duties in separate failure boundaries. CPU termination is not a
 | Background-task purge | When background tasks are enabled |
 | Notification dispatch tick | When delayed notifications are enabled |
 | Provider polling alarm | Per tenant when a pollable subscription exists |
+
+Each duty that reaches an agent carries an automated principal: the schedule tick fires as `system` on `schedule.fire`, the notification dispatch tick as `system` on `notification.dispatch`, and provider delivery as `service` on `signal.notification`. Enabling a duty is not enough — the target agent must declare that kind and entry path in `allowedAutomation`, or the run is refused at the host.
 
 The advanced starter makes these responsibilities visible in one host. The [Deployment reference](deployment-reference.md) lists bindings and configuration, and the [Operations runbook](operations-runbook.md) covers recovery and offboarding.

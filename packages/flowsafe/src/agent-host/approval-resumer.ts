@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { DURABLE_AGENTIC_LOOP_WORKFLOW_ID } from '../agent-runner/index.js';
-import type {
-  ApprovalActor,
-  ApprovalRecord,
-  TenantContext,
+import {
+  type ApprovalRecord,
+  type ExecutionPrincipal,
+  samePrincipal,
+  type TenantContext,
 } from '../approval-api/index.js';
 import type { ResumeRunFn } from '../host-kit/index.js';
 import { createAgentCatalog } from './catalog.js';
@@ -15,8 +16,13 @@ export interface AgentApprovalResumerOptions {
   fallback: ResumeRunFn;
   agents: readonly AgentMeta[];
   topology: AgentThreadTopology;
-  tenantForActor: (
-    actor: ApprovalActor,
+  /**
+   * Builds the tenant context the resume runs under, from the STORED principal.
+   * It must return that principal unchanged; createAgentApprovalResumer
+   * enforces that with an exact comparison after calling this.
+   */
+  tenantForPrincipal: (
+    principal: ExecutionPrincipal,
     record: ApprovalRecord,
   ) => TenantContext | Promise<TenantContext>;
 }
@@ -44,30 +50,42 @@ export function createAgentApprovalResumer(
       );
     }
     const meta = catalog.get(target.agentId);
-    const roles = catalog.allowedRoles(target.agentId);
-    if (!meta || !roles?.includes(target.principal.role)) {
+    const principal = target.principal;
+    // Re-authorize the STORED principal against the CURRENT catalog: a decision
+    // taken yesterday must not resume an agent whose policy has since narrowed.
+    // Split by kind for the same reason the entry gate is: a human resumes
+    // under the role rules, automation under its declared entry paths, and
+    // neither may answer for the other. Note this authorizes the principal that
+    // STARTED the run, never the reviewer who approved it — a human decision
+    // does not transfer that human's authority into the resumed leg.
+    const authorized =
+      meta !== undefined &&
+      (principal.kind === 'human'
+        ? catalog.allowedRoles(target.agentId)?.includes(principal.role) ===
+          true
+        : catalog.automationAllowed(
+            target.agentId,
+            principal,
+            'approval.resume',
+          ));
+    if (!authorized) {
       throw new Error(
-        `principal role '${target.principal.role}' may no longer resume agent '${target.agentId}'`,
+        `principal kind '${principal.kind}' may no longer resume agent '${target.agentId}'`,
       );
     }
-    if (
-      target.principal.tenantId !== record.tenantId ||
-      target.principal.id.trim() === ''
-    ) {
+    if (principal.tenantId !== record.tenantId || principal.id.trim() === '') {
       throw new Error(
         'agent approval principal does not match the record tenant',
       );
     }
 
-    const tenant = await options.tenantForActor(target.principal, record);
+    const tenant = await options.tenantForPrincipal(principal, record);
     if (
       tenant.tenantId !== record.tenantId ||
-      tenant.actor.id !== target.principal.id ||
-      tenant.actor.role !== target.principal.role ||
-      tenant.actor.tenantId !== target.principal.tenantId
+      !samePrincipal(tenant.principal, principal)
     ) {
       throw new Error(
-        'tenantForActor must preserve the stored agent execution principal exactly',
+        'tenantForPrincipal must preserve the stored agent execution principal exactly',
       );
     }
     const envelope = await options.topology.resume(tenant, record, decision);

@@ -33,6 +33,19 @@ export interface AgentAuditContext {
   resourceId?: string;
   /** Trusted invocation path, such as an HTTP start or approval resume. */
   entryPath: string;
+  /** Which kind of principal is executing: human, service, agent, or system. */
+  principalKind?: string;
+  /**
+   * Stable principal identifier. Distinct from the audit event's `actor.id`,
+   * which is the identity the gate evaluated: on an approval resume the actor
+   * is the restored original principal while the decision belongs to a human
+   * reviewer, and a correlated trail needs to name both.
+   */
+  principalId?: string;
+  /** Why an automated principal exists, as declared by the host. */
+  purpose?: string;
+  /** The principal that delegated this execution, for agent-to-agent work. */
+  delegatedBy?: string;
 }
 
 const AGENT_AUDIT_OPTIONAL_FIELDS = [
@@ -40,6 +53,10 @@ const AGENT_AUDIT_OPTIONAL_FIELDS = [
   'runId',
   'threadId',
   'resourceId',
+  'principalKind',
+  'principalId',
+  'purpose',
+  'delegatedBy',
 ] as const;
 
 /**

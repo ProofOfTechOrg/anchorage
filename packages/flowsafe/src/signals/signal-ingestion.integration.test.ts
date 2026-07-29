@@ -17,6 +17,7 @@ import { z } from 'zod';
 import { d1DatabaseLike, openSqlite } from '../../test-support/sqlite.js';
 import { RUNTIME_DRIVEN_AGENT } from '../agent-runner/index.js';
 import type { ApprovalActor, TenantContext } from '../approval-api/index.js';
+import { humanPrincipal } from '../approval-api/index.js';
 import {
   createD1Storage,
   type InitResult,
@@ -117,6 +118,7 @@ function tenantCtx(): TenantContext {
   };
   return {
     actor,
+    principal: humanPrincipal(actor),
     tenantId: 'acme',
     ownsMemoryId: (id: string) => id === THREAD_ID,
   } as unknown as TenantContext;

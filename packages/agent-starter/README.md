@@ -407,9 +407,12 @@ remain deliberately narrow.
 
 - Mint run, thread, and resource IDs after authentication. Never accept them in
   a create body.
-- Reach thread Durable Objects only through `createThreadTopology()`. It
-  overwrites the internal tenant/actor headers and checks ownership before
-  addressing the namespace.
+- Reach thread Durable Objects only through `createThreadTopology()`. It stamps
+  the internal tenant and execution-principal headers and checks ownership
+  before addressing the namespace.
+- Declare every automated entry the agent should accept in
+  `allowedAutomation`. Enabling a duty is not enough, and an omitted list
+  denies all automated entry.
 - Keep approval grants server-derived through `approvalGrantProvider()`. Do not
   copy grants from a decision body, schedule row, model output, or signal.
 - Keep agent resume behind `ApprovalService.decide()`. A public raw resume path
@@ -469,4 +472,17 @@ with real `MODEL_ID`/`MODEL_API_KEY` values.
 
 The starter uses only the public `@proofoftech/flowsafe/agent-host` subpath. The Worker router receives `STARTER_AGENT_META`, while each `StarterThread` constructs its complete module from instance-scoped model, storage, runtime, pub/sub, connector, and database objects.
 
-`createThreadAgentHost()` owns the internal start/status/observe/resume topology. Application code does not author private `/agent/*` Durable Object URLs or keep mutable current-request scope. `createAgentApprovalResumer()` restores the original requester principal from the persisted approval target and delegates generic workflow records to the existing run topology.
+`createThreadAgentHost()` owns the internal start/status/observe/resume topology. Application code does not author private `/agent/*` Durable Object URLs or keep mutable current-request scope. `createAgentApprovalResumer()` restores the original execution principal from the persisted approval target and delegates generic workflow records to the existing run topology.
+
+### Declare which automation may run the agent
+
+Unattended work arrives as a non-human execution principal, and an agent accepts none of it by default. `STARTER_AGENT_META` names each admitted kind together with the exact entry paths it may arrive on:
+
+```typescript
+allowedAutomation: [
+  { kind: 'system', entryPaths: ['schedule.fire', 'notification.dispatch'] },
+  { kind: 'service', entryPaths: ['signal.notification'] },
+],
+```
+
+That covers the starter's three automated paths: the schedule tick, the notification dispatch tick, and signal-provider delivery. The guarded agent declares the matching `allowedPrincipalKinds: ['human', 'system', 'service']`, and catalog construction refuses the module if the two ever drift. Removing a kind from either half stops that automation at the host, with no other change needed.

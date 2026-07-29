@@ -5,14 +5,18 @@ import { describe, expect, it } from 'vitest';
 import {
   createTrustedAgentRequestContext,
   deriveTrustedAgentContext,
-  rejectReservedAgentContext,
   sanitizeStoredAgentContext,
 } from './trusted-context.js';
 import type { TrustedAgentExecution } from './types.js';
 
 const execution: TrustedAgentExecution = {
   agentId: 'writer',
-  actor: { id: 'operator-1', role: 'operator', tenantId: 'acme' },
+  principal: {
+    kind: 'human',
+    id: 'operator-1',
+    tenantId: 'acme',
+    role: 'operator',
+  },
   threadId: 'acme_thread',
   resourceId: 'acme_resource',
   runId: 'acme_run',
@@ -25,15 +29,6 @@ const execution: TrustedAgentExecution = {
 };
 
 describe('trusted agent context boundary', () => {
-  it('rejects reserved external keys, including the complete breakwater namespace', () => {
-    expect(() =>
-      rejectReservedAgentContext({ 'breakwater.futureCapability': true }),
-    ).toThrow("reserved key 'breakwater.futureCapability'");
-    expect(() => rejectReservedAgentContext({ runId: 'forged' })).toThrow(
-      "reserved key 'runId'",
-    );
-  });
-
   it('strips reserved persisted values without mutating the source', () => {
     const source = {
       safe: 'preserved',
@@ -76,6 +71,7 @@ describe('trusted agent context boundary', () => {
     expect(context.get('breakwater.actor')).toEqual({
       id: 'operator-1',
       role: 'operator',
+      kind: 'human',
     });
     expect(context.get('breakwater.auditContext')).toMatchObject({
       agentId: 'writer',

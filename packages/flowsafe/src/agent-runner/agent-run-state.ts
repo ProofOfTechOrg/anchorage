@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import type { ApprovalActor, ApprovalRole } from '../approval-api/contract.js';
+import {
+  type ExecutionPrincipal,
+  isExecutionPrincipal,
+  samePrincipal,
+} from '../approval-api/principal.js';
 import {
   PATH_SAFE_ID_PATTERN,
   tenantOwnsSaltedId,
@@ -32,20 +36,20 @@ export interface AgentThreadBinding {
   resourceId: string;
 }
 
+/**
+ * Version 2 carries an ExecutionPrincipal where version 1 carried an
+ * ApprovalActor. There is deliberately no v1 upgrade path: a run started from
+ * `schedule.fire` stored the fabricated `role: 'operator'` that this work
+ * exists to remove, so reading a v1 record back as a human principal would
+ * launder that authority through a migration. `validRunRecord` rejects v1 and
+ * the run fails closed — a suspended pre-upgrade agent run cannot resume.
+ */
 export interface AgentRunRecord {
-  version: 1;
+  version: 2;
   agentId: string;
-  principal: ApprovalActor;
+  principal: ExecutionPrincipal;
   originEntryPath: AgentEntryPath;
 }
-
-const APPROVAL_ROLES: readonly ApprovalRole[] = [
-  'admin',
-  'builder',
-  'operator',
-  'reviewer',
-  'viewer',
-];
 
 export class AgentRunStateError extends Error {
   constructor(message: string) {
@@ -79,19 +83,14 @@ function validRunRecord(
 ): value is AgentRunRecord {
   if (value === null || typeof value !== 'object') return false;
   const candidate = value as Partial<AgentRunRecord>;
-  const principal = candidate.principal;
   return (
-    candidate.version === 1 &&
+    candidate.version === 2 &&
     typeof candidate.agentId === 'string' &&
     PATH_SAFE_ID_PATTERN.test(candidate.agentId) &&
-    principal !== null &&
-    typeof principal === 'object' &&
-    typeof principal.id === 'string' &&
-    principal.id.trim() !== '' &&
-    typeof principal.role === 'string' &&
-    (APPROVAL_ROLES as readonly string[]).includes(principal.role) &&
-    typeof principal.tenantId === 'string' &&
-    tenantOwnsSaltedId(principal.tenantId, runId) &&
+    isExecutionPrincipal(candidate.principal) &&
+    // The stored principal must own the run it is stored under, so a record
+    // moved or forged into another tenant's key space fails closed.
+    tenantOwnsSaltedId(candidate.principal.tenantId, runId) &&
     typeof candidate.originEntryPath === 'string' &&
     (AGENT_ENTRY_PATHS as readonly string[]).includes(candidate.originEntryPath)
   );
@@ -164,12 +163,13 @@ export async function writeAgentRunRecord(
   }
   const current = await readAgentRunRecord(storage, runId);
   if (current) {
+    // Structural comparison across every kind-specific field: comparing only
+    // id/role/tenant would let a run rebind from one automated purpose to
+    // another, or from an agent's delegation chain to a different one.
     if (
       current.agentId !== record.agentId ||
       current.originEntryPath !== record.originEntryPath ||
-      current.principal.id !== record.principal.id ||
-      current.principal.role !== record.principal.role ||
-      current.principal.tenantId !== record.principal.tenantId
+      !samePrincipal(current.principal, record.principal)
     ) {
       throw new AgentRunStateConflictError(
         `run '${runId}' is already bound to a different agent principal`,

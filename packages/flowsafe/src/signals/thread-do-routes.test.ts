@@ -79,6 +79,12 @@ function scopeWith(pubsub: unknown): ThreadScope {
     threadId: 'acme_t1',
     tenantId: 'acme',
     actor: { id: 'operator', role: 'operator', tenantId: 'acme' },
+    principal: {
+      kind: 'human',
+      id: 'operator',
+      tenantId: 'acme',
+      role: 'operator',
+    },
     requestedBy: 'operator',
     init: { pubsub },
   } as unknown as ThreadScope;
