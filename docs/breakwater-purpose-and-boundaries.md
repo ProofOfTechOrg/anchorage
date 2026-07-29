@@ -131,15 +131,16 @@ enforce the remaining network boundary in the host.
 
 Mastra-native `requireApproval` provides the pause experience. When the
 manifest or deployment write policy requires approval, Breakwater also checks
-the connector id in the server-authored `breakwater.approvedConnectors`
-request-context value before executing. The native resume event alone is not
+the server-authored `breakwater.connectorGrants` capability against
+`breakwater.connectorExecution` before executing. A durable-agent grant also
+must match `context.agent.toolCallId`. The native resume event alone is not
 authority.
 
 This second gate protects direct and nested calls and makes a forged resume
 fail closed. Breakwater consumes the grant; it does not mint it. Flowsafe
 derives grants from approved D1 records for the exact suspended leg. Never
-accept the grant key from a client, model, tool argument, schedule row, or
-other untrusted stored context.
+accept either request-context capability from a client, model, tool argument,
+schedule row, or other untrusted stored context.
 
 ### Idempotency and rate limits
 

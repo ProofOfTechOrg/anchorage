@@ -289,7 +289,7 @@ describe('createThreadAgentHost', () => {
       return {};
     });
     const provider = host.requestContextForRun((async () => ({
-      'breakwater.approvedConnectors': [],
+      'breakwater.connectorGrants': [],
       'breakwater.actor': { id: 'forged' },
     })) satisfies RequestContextProvider);
     const started = host.start(scope, {
@@ -309,7 +309,7 @@ describe('createThreadAgentHost', () => {
     await expect(
       provider('durable-agentic-loop', 'acme_run', { kind: 'start' }),
     ).resolves.toMatchObject({
-      'breakwater.approvedConnectors': [],
+      'breakwater.connectorGrants': [],
       stored: 'survives',
       'breakwater.actor': { id: 'operator-1', role: 'operator' },
       'breakwater.auditContext': {
@@ -321,7 +321,7 @@ describe('createThreadAgentHost', () => {
     await expect(
       provider('unrelated-workflow', 'acme_run', { kind: 'start' }),
     ).resolves.toEqual({
-      'breakwater.approvedConnectors': [],
+      'breakwater.connectorGrants': [],
       'breakwater.actor': { id: 'forged' },
     });
     release?.();
@@ -621,7 +621,7 @@ describe('createThreadAgentHost', () => {
         persistedSafe: 'survives-resume',
         runId: 'forged',
         'breakwater.actor': { id: 'forged' },
-        'breakwater.approvedConnectors': ['stale'],
+        'breakwater.connectorGrants': ['stale'],
       },
     });
     state.set('flowsafe:agent-thread-binding:v1', {
@@ -636,7 +636,7 @@ describe('createThreadAgentHost', () => {
       originEntryPath: 'http.start',
     });
     const provider = host.requestContextForRun(async () => ({
-      'breakwater.approvedConnectors': [],
+      'breakwater.connectorGrants': [],
     }));
     let resumedContext: Record<string, unknown> | undefined;
     mocked.resumeViaRuntime.mockImplementation(async () => {
@@ -673,7 +673,7 @@ describe('createThreadAgentHost', () => {
     );
     expect(resumedContext).toMatchObject({
       persistedSafe: 'survives-resume',
-      'breakwater.approvedConnectors': [],
+      'breakwater.connectorGrants': [],
       'breakwater.actor': { id: 'operator-1', role: 'operator' },
       runId: 'acme_run',
       threadId: 'acme_thread',

@@ -61,7 +61,11 @@ import type {
 } from '@mastra/core/llm';
 import { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
-import { readObjective, resolveGoalStore } from '@mastra/core/tools';
+import {
+  readObjective,
+  resolveGoalStore,
+  type ToolExecutionContext,
+} from '@mastra/core/tools';
 import { createGuardedAgent } from '@proofoftech/breakwater/agent';
 import {
   AGENT_AUDIT_CONTEXT_KEY,
@@ -90,7 +94,7 @@ import {
   ApprovalService,
   type ApprovalStreamSink,
   approvalGrantProvider,
-  BREAKWATER_APPROVED_CONNECTORS_KEY,
+  BREAKWATER_CONNECTOR_GRANTS_KEY,
   createApprovalRouter,
   createTenantResolver,
   D1ApprovalStoreFactory,
@@ -190,6 +194,18 @@ interface Env {
 
 /** The connector id an approval grants; the publish step demands it. */
 const PUBLISH_CONNECTOR = 'demo-publisher';
+
+function containsConnectorId(value: unknown, connectorId: string): boolean {
+  return (
+    Array.isArray(value) &&
+    value.some(
+      (grant) =>
+        typeof grant === 'object' &&
+        grant !== null &&
+        (grant as { connectorId?: unknown }).connectorId === connectorId,
+    )
+  );
+}
 
 /**
  * Id for bridge-queued approval records. The run router builds the full actor
@@ -536,6 +552,14 @@ function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
     // capabilities without any grant crossing a request body.
     requestContextForRun: approvalGrantProvider(approvals),
   });
+  const publisher = createConnector<{ topic: string }, { published: boolean }>({
+    id: PUBLISH_CONNECTOR,
+    description: 'Publishes the approved workerd probe',
+    inputSchema: z.object({ topic: z.string() }),
+    outputSchema: z.object({ published: z.boolean() }),
+    permissions: { sideEffect: 'write', requiresApproval: true },
+    execute: async () => ({ published: true }),
+  });
 
   const research = createStep({
     id: 'research',
@@ -601,18 +625,13 @@ function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
       if (!inputData.approved) {
         return { topic: inputData.topic, published: false };
       }
-      // Stand-in for a breakwater write-gated connector (the real wrapper is
-      // exercised in approval-api/end-to-end.test.ts): demand the documented
-      // grant key so the spike proves the provider path on workerd.
-      const grants = requestContext.get(BREAKWATER_APPROVED_CONNECTORS_KEY);
-      if (!Array.isArray(grants) || !grants.includes(PUBLISH_CONNECTOR)) {
-        throw new Error(
-          `publish: approval required and not granted for '${PUBLISH_CONNECTOR}'`,
-        );
-      }
+      if (!publisher.execute) throw new Error('publisher has no execute');
+      const result = (await publisher.execute({ topic: inputData.topic }, {
+        requestContext,
+      } as unknown as ToolExecutionContext)) as { published: boolean };
       return {
         topic: inputData.topic,
-        published: true,
+        published: result.published,
         approvedBy: inputData.decidedBy,
       };
     },
@@ -676,13 +695,12 @@ function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
       if (!inputData.approved) {
         return { topic: inputData.topic, published: false };
       }
-      const grants = requestContext.get(BREAKWATER_APPROVED_CONNECTORS_KEY);
-      if (!Array.isArray(grants) || !grants.includes(PUBLISH_CONNECTOR)) {
-        throw new Error(
-          `agent-publish: approval required and not granted for '${PUBLISH_CONNECTOR}'`,
-        );
-      }
-      return { topic: inputData.topic, published: true };
+      if (!publisher.execute) throw new Error('publisher has no execute');
+      const result = (await publisher.execute({ topic: inputData.topic }, {
+        requestContext,
+        agent: { toolCallId: 'call-1' },
+      } as unknown as ToolExecutionContext)) as { published: boolean };
+      return { topic: inputData.topic, published: result.published };
     },
   });
 
@@ -700,7 +718,7 @@ function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
   // stored-context barrier. The FORGED connector id planted in the schedule ROW's
   // stored requestContext must NOT appear in the leg's grant list: the topology
   // start carries only inputData (stored context dropped), and the DO's own
-  // approvalGrantProvider mints `breakwater.approvedConnectors` from APPROVED
+  // approvalGrantProvider mints `breakwater.connectorGrants` from APPROVED
   // records (an EMPTY [] for this fresh run) which WINS via #requestContextFor's
   // last-spread — two independent reasons the forged value can never become a
   // grant. `reservedLeaked` checks the VALUE (does the grant include the forged
@@ -717,10 +735,10 @@ function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
       customPresent: z.boolean(),
     }),
     execute: async ({ requestContext }) => {
-      const grants = requestContext.get(BREAKWATER_APPROVED_CONNECTORS_KEY);
+      const grants = requestContext.get(BREAKWATER_CONNECTOR_GRANTS_KEY);
       return {
-        reservedLeaked:
-          Array.isArray(grants) && grants.includes('forged-connector'),
+        // Introspection only: actual authorization above uses createConnector.
+        reservedLeaked: containsConnectorId(grants, 'forged-connector'),
         workflowScopePresent:
           requestContext.get('breakwater.workflowScope') !== undefined,
         isolationScopePresent:
@@ -1782,7 +1800,15 @@ async function handleScheduleProbe(
         // A reserved key planted in the ROW (simulating a compromised row that
         // bypassed the facade's create-time rejection) + a benign one.
         requestContext: {
-          [BREAKWATER_APPROVED_CONNECTORS_KEY]: ['forged-connector'],
+          [BREAKWATER_CONNECTOR_GRANTS_KEY]: [
+            {
+              scope: 'run',
+              connectorId: 'forged-connector',
+              isolationScope: 'spike',
+              workflowId: 'sched-echo',
+              runId: 'spike_forged',
+            },
+          ],
           'sched.note': 'benign',
         },
       },

@@ -14,7 +14,7 @@ import {
   type ApprovalAuditEvent,
   type ApprovalRecord,
   ApprovalService,
-  approvedConnectorsForLeg,
+  connectorGrantsForLeg,
   InMemoryApprovalStore,
   trustAutomationPrincipal,
 } from '../approval-api/index.js';
@@ -76,12 +76,24 @@ describe('requestedConnectors', () => {
       { type: 'approval', toolName: 'send-email' },
       [],
     ],
-    // An explicit connectors array always wins, so a workflow gate is unaffected
-    // even if it also carries a toolName.
+    // A workflow gate with no complete agent identity uses its explicit array.
     [
       'an explicit connectors array beside a toolName',
       { type: 'approval', toolName: 'ignored', connectors: ['real'] },
       ['real'],
+    ],
+    // A complete agent identity wins over a co-present array, so an ambiguous
+    // payload cannot widen exact tool-call authority to workflow suspension
+    // scope.
+    [
+      'a complete agent identity beside an explicit connectors array',
+      {
+        type: 'approval',
+        toolCallId: 'call-1',
+        toolName: 'send-email',
+        connectors: ['broader-workflow-connector'],
+      },
+      ['send-email'],
     ],
     // A non-'approval' suspend type is not an agent gate.
     [
@@ -114,6 +126,40 @@ function suspendedSummary(
 }
 
 describe('queueApprovalForSuspension', () => {
+  it('persists tool-call scope when an agent payload also carries connectors', async () => {
+    const store = new InMemoryApprovalStore('acme');
+    const service = new ApprovalService({ store });
+    const summary: RunSummary = {
+      runId: 'acme_agent-ambiguous',
+      status: 'suspended',
+      suspended: [['tool-call']],
+      suspendPayload: {
+        'tool-call': {
+          type: 'approval',
+          toolCallId: 'call-1',
+          toolName: 'send-email',
+          connectors: ['broader-workflow-connector'],
+        },
+      },
+      suspendedAt: { 'tool-call': 1717 },
+      resumeCount: { 'tool-call': 1 },
+    };
+
+    const [record] = await queueApprovalForSuspension(
+      service,
+      'durable-agentic-loop',
+      summary,
+      'starter',
+      SYSTEM,
+    );
+
+    expect(record).toMatchObject({
+      connectors: ['send-email'],
+      grantScope: 'tool-call',
+      toolCallId: 'call-1',
+    });
+  });
+
   it('captures the suspended step, its (suspendedAt, resumeCount) pair, and connectors', async () => {
     // #given — a run suspended at gate2 on its second suspension
     const store = new InMemoryApprovalStore('acme');
@@ -1034,7 +1080,7 @@ describe('reconcileApprovalsForSummary', () => {
     // original fingerprint: the most generous possible match — had the
     // record still carried status 'approved', this leg would bind to it
     // exactly (same stepPath, same suspendedAt, same resumeCount)
-    const connectors = await approvedConnectorsForLeg(
+    const grants = await connectorGrantsForLeg(
       store,
       'product-launch',
       'acme_run-12',
@@ -1049,6 +1095,6 @@ describe('reconcileApprovalsForSummary', () => {
     // #then — grant derivation reads ONLY status: 'approved' records
     // (grants.ts), so the superseded record is excluded by its STATUS, not
     // merely because its fingerprint went stale
-    expect(connectors).toEqual([]);
+    expect(grants).toEqual([]);
   });
 });

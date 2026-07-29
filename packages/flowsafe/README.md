@@ -103,14 +103,16 @@ When a workflow or durable agent suspends:
 
 1. The authoritative run summary captures `stepPath`, `suspendedAt`, and `resumeCount`.
 2. The trusted host bridge creates one open approval in a tenant-bound store.
-3. The record's connector ids come from a server-authored suspend payload.
+3. The record’s connector IDs and optional Mastra `toolCallId` come from a server-authored suspend payload.
 4. A reviewer claims, delegates, approves, or rejects through the service or REST router.
 5. A compare-and-swap commits the mutation.
 6. An approval re-enters the owning runtime.
-7. `approvalGrantProvider()` reads D1 and writes only the matching approved connectors into the resumed leg's request context.
+7. `approvalGrantProvider()` reads D1 and writes only the matching structured grants into the resumed leg’s request context.
 8. Another suspension creates a new approval. A completed or failed run ends the loop.
 
-Grants never travel in public request bodies. A raw or forged resume finds no stored capability and fails at the breakwater connector gate.
+Durable-agent records produce `tool-call` scope. Workflow gates produce exact `suspension` scope. Trusted `runScoped` records produce explicit `run` scope. Grants never travel in public request bodies. A raw or forged resume finds no stored capability and fails at the Breakwater connector gate.
+
+The same durable tool call may retry with its persisted `toolCallId`; a new model tool call requires approval. Legacy records without explicit scope and legacy connector ID arrays fail closed.
 
 ### REST surface
 

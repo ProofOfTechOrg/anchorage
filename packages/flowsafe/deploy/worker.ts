@@ -72,10 +72,9 @@ import type {
   Queue,
   ScheduledController,
 } from '@cloudflare/workers-types';
-import {
-  approvalGrantProvider,
-  BREAKWATER_APPROVED_CONNECTORS_KEY,
-} from '@proofoftech/flowsafe/approval-api';
+import type { ToolExecutionContext } from '@mastra/core/tools';
+import { createConnector } from '@proofoftech/breakwater/connector-sdk';
+import { approvalGrantProvider } from '@proofoftech/flowsafe/approval-api';
 import {
   DurableObjectRunner,
   HubDurableObject,
@@ -202,6 +201,14 @@ function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
     // capabilities without any grant crossing a request body.
     requestContextForRun: approvalGrantProvider(approvals),
   });
+  const publisher = createConnector<{ topic: string }, { published: boolean }>({
+    id: EXAMPLE_CONNECTOR,
+    description: 'Publishes the approved example topic',
+    inputSchema: z.object({ topic: z.string() }),
+    outputSchema: z.object({ published: z.boolean() }),
+    permissions: { sideEffect: 'write', requiresApproval: true },
+    execute: async () => ({ published: true }),
+  });
 
   // Replace from here down with your workflows. Conventions to keep:
   //  - a gate step suspends with { reason, connectors }, where `connectors` is
@@ -265,18 +272,13 @@ function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
       if (!inputData.approved) {
         return { topic: inputData.topic, published: false };
       }
-      // Stand-in for a breakwater write-gated connector: demand the grant
-      // the approval minted. Real deployments call a createConnector() tool
-      // here and the wrapper enforces this same key.
-      const grants = requestContext.get(BREAKWATER_APPROVED_CONNECTORS_KEY);
-      if (!Array.isArray(grants) || !grants.includes(EXAMPLE_CONNECTOR)) {
-        throw new Error(
-          `publish: approval required and not granted for '${EXAMPLE_CONNECTOR}'`,
-        );
-      }
+      if (!publisher.execute) throw new Error('publisher has no execute');
+      const result = (await publisher.execute({ topic: inputData.topic }, {
+        requestContext,
+      } as unknown as ToolExecutionContext)) as { published: boolean };
       return {
         topic: inputData.topic,
-        published: true,
+        published: result.published,
         approvedBy: inputData.decidedBy,
       };
     },

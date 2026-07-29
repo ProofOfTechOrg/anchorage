@@ -401,7 +401,9 @@ describe('deploy worker fetch(): the approval loop over HTTP', () => {
     expect(forged.status).toBe(200);
     const summary = (await forged.json()) as RunSummary;
     expect(summary.status).toBe('failed');
-    expect(summary.error).toContain('approval required and not granted');
+    expect(summary.error).toContain(
+      'approval required and no matching structured grant was found',
+    );
   });
 });
 

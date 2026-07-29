@@ -33,7 +33,8 @@ import type {
 
 import {
   BREAKWATER_ACTOR_KEY,
-  BREAKWATER_APPROVED_CONNECTORS_KEY,
+  BREAKWATER_CONNECTOR_EXECUTION_KEY,
+  BREAKWATER_CONNECTOR_GRANTS_KEY,
   BREAKWATER_ISOLATION_SCOPE_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
 } from './breakwater-keys.js';
@@ -451,7 +452,7 @@ export type RunLeg =
  * This is the trusted-computing-base seam (security-threat-model.md, trust
  * boundary 6): the DO HTTP boundary never maps requestContext from request
  * bodies, so capability keys — e.g. breakwater's approval grants
- * ('breakwater.approvedConnectors') — can only enter a run through this
+ * ('breakwater.connectorGrants') — can only enter a run through this
  * provider. Wire it to derive values from trusted server-side state (the
  * flowsafe approval store), never from client input, model output, or tool
  * results.
@@ -475,7 +476,6 @@ export type RequestContextProvider = (
 const TRUSTED_IDENTITY_CONTEXT_KEYS = new Set([
   BREAKWATER_ACTOR_KEY,
   'breakwater.auditContext',
-  'runId',
   'threadId',
   'resourceId',
 ]);
@@ -491,14 +491,16 @@ function orderedRequestContext(
     const [key] = entry;
     if (
       key === BREAKWATER_WORKFLOW_SCOPE_KEY ||
-      key === BREAKWATER_ISOLATION_SCOPE_KEY
+      key === BREAKWATER_ISOLATION_SCOPE_KEY ||
+      key === BREAKWATER_CONNECTOR_EXECUTION_KEY ||
+      key === 'runId'
     ) {
       continue;
     }
     if (TRUSTED_IDENTITY_CONTEXT_KEYS.has(key)) {
       identity.push(entry);
     } else if (
-      key === BREAKWATER_APPROVED_CONNECTORS_KEY ||
+      key === BREAKWATER_CONNECTOR_GRANTS_KEY ||
       key.startsWith('breakwater.') ||
       key === 'mastra:goal'
     ) {
@@ -841,6 +843,7 @@ export class RunnerRuntime {
   ): Promise<RequestContext> {
     const base: Record<string, unknown> = {
       [BREAKWATER_WORKFLOW_SCOPE_KEY]: workflowId,
+      runId,
     };
     // Tenant-salted runs (INV-1: `${tenantId}_${uuid}`) also mint the OPAQUE
     // isolation scope, segmenting breakwater's connector idempotency and
@@ -866,6 +869,29 @@ export class RunnerRuntime {
     if (tenantId !== undefined) {
       base[BREAKWATER_ISOLATION_SCOPE_KEY] = tenantId;
     }
+    base[BREAKWATER_CONNECTOR_EXECUTION_KEY] =
+      leg.kind === 'start'
+        ? {
+            kind: 'start',
+            workflowId,
+            runId,
+            ...(tenantId === undefined ? {} : { isolationScope: tenantId }),
+          }
+        : leg.step !== undefined && leg.suspendedAt !== undefined
+          ? {
+              kind: 'resume',
+              workflowId,
+              runId,
+              ...(tenantId === undefined ? {} : { isolationScope: tenantId }),
+              suspension: {
+                stepPath: [...leg.step],
+                suspendedAt: leg.suspendedAt,
+                ...(leg.resumeCount === undefined
+                  ? {}
+                  : { resumeCount: leg.resumeCount }),
+              },
+            }
+          : null;
     const values = this.#requestContextForRun
       ? await this.#requestContextForRun(workflowId, runId, leg)
       : undefined;

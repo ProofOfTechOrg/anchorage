@@ -247,20 +247,20 @@ The connector wrapper reads these keys:
 | Constant | Runtime key | Value | Who should set it |
 | --- | --- | --- | --- |
 | `ACTOR_CONTEXT_KEY` | `breakwater.actor` | `{ id, role, kind? }` | Authenticated host or `getActor` |
-| `APPROVED_CONNECTORS_CONTEXT_KEY` | `breakwater.approvedConnectors` | Connector ID array | Trusted approval service only |
+| `CONNECTOR_GRANTS_CONTEXT_KEY` | `breakwater.connectorGrants` | `ConnectorApprovalGrant[]` | Trusted approval service only |
+| `CONNECTOR_EXECUTION_CONTEXT_KEY` | `breakwater.connectorExecution` | `ConnectorExecutionIdentity` | Trusted runtime only |
 | `DRY_RUN_CONTEXT_KEY` | `breakwater.dryRun` | `true` | Caller requesting simulation |
 | `IDEMPOTENCY_KEY_CONTEXT_KEY` | `breakwater.idempotencyKey` | Non-empty string | Host-derived operation identity |
 | `ISOLATION_SCOPE_CONTEXT_KEY` | `breakwater.isolationScope` | Opaque non-empty string | Multi-tenant runtime only |
 | `WORKFLOW_SCOPE_CONTEXT_KEY` | `breakwater.workflowScope` | Current workflow ID | Workflow runtime only |
 
-Approval and isolation values are capabilities. Never accept them from a
-request body, model output, tool result, or client-controlled header.
-flowsafe derives approval grants from approved records and mints workflow and
-tenant scopes on each run leg.
+Approval and isolation values are capabilities. Never accept them from a request body, model output, tool result, or client-controlled header. Flowsafe derives structured approval grants from approved records and mints the current execution identity, workflow scope, run ID, and tenant scope on each run leg.
 
-Mastra's native `requireApproval` pauses an agent run, but it does not replace
-the breakwater grant. Every execution path checks
-`APPROVED_CONNECTORS_CONTEXT_KEY`.
+Mastra's native `requireApproval` pauses an agent run, but it does not replace the Breakwater grant. Every execution path checks the structured grant against the runtime-owned identity. Legacy connector ID arrays fail closed.
+
+Durable-agent approvals use `tool-call` scope: connector ID, tenant, workflow, run, exact `(stepPath, suspendedAt, resumeCount)` suspension, and Mastra `toolCallId` must match. Workflow approvals use `suspension` scope because Mastra exposes no reproducible tool-call identity for an arbitrary workflow gate. Trusted standing grants use an explicit `run` scope.
+
+The same durable tool-call attempt may retry with the same `toolCallId`. A new model tool call has a new ID and requires approval. Use connector idempotency for side-effect replay protection; the grant is not a one-shot token.
 
 ## Choose replay and rate-limit stores
 
@@ -442,13 +442,16 @@ for compatibility.
 | --- | --- |
 | `createConnector`, `connectorManifest` | Build an enforced Mastra tool and inspect its immutable manifest |
 | `ConnectorPolicyError` | Structured policy denial |
-| `APPROVED_CONNECTORS_CONTEXT_KEY`, `DRY_RUN_CONTEXT_KEY`, `IDEMPOTENCY_KEY_CONTEXT_KEY` | Stable connector request-context keys |
+| `CONNECTOR_GRANTS_CONTEXT_KEY`, `CONNECTOR_EXECUTION_CONTEXT_KEY`, `DRY_RUN_CONTEXT_KEY`, `IDEMPOTENCY_KEY_CONTEXT_KEY` | Stable connector request-context keys |
 | `InMemoryIdempotencyStore`, `D1IdempotencyStore` | Development and durable replay stores |
 | `InMemoryRateLimitStore`, `D1RateLimitStore` | Development and durable fixed-window stores |
 | `egressFetch`, `EgressDeniedError` | Standalone fetch guard and its default denial |
 
 Type exports: `PermissionManifest`, `ConnectorConfig`, `ConnectorPolicies`,
-`ConnectorRuntime`, `IdempotencyStore`, `AtomicIdempotencyStore`,
+`ConnectorApprovalGrant`, `ConnectorApprovalGrantBase`,
+`ConnectorApprovalSuspension`, `ConnectorExecutionIdentity`,
+`ConnectorRuntime`, `IdempotencyStore`,
+`AtomicIdempotencyStore`,
 `IdempotencyRecord`, `IdempotencyReservation`, `RateLimitStore`,
 `D1IdempotencyStoreOptions`, `IdempotencyDatabase`,
 `IdempotencyStatement`, `D1RateLimitStoreOptions`, `RateLimitDatabase`,

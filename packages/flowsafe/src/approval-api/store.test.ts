@@ -19,7 +19,7 @@ import {
   type ApprovalPreparedStatement,
   D1ApprovalStore,
 } from './d1-store.js';
-import { approvedConnectorsForLeg } from './grants.js';
+import { connectorGrantsForLeg } from './grants.js';
 import type { ApprovalStore } from './store.js';
 import { computeApprovalMetrics, InMemoryApprovalStore } from './store.js';
 import {
@@ -142,7 +142,7 @@ function describeStoreContract(
   // Single-tenant cases run over the default 'acme' view of a fresh backend.
   const makeStore = (): ApprovalStore => makeBackend().forTenant('acme');
   describe(name, () => {
-    it('round-trips a record with every optional field through create/get', async () => {
+    it('round-trips a suspension-scoped record through create/get', async () => {
       // #given
       const store = await makeStore();
       const record = makeRecord({
@@ -150,7 +150,7 @@ function describeStoreContract(
         suspendedAt: 1751882400000,
         resumedAt: 1751882460000,
         resumeCount: 2,
-        runScoped: true,
+        grantScope: 'suspension',
         resumeTarget: {
           kind: 'thread',
           threadId: 'acme_thread-1',
@@ -170,6 +170,36 @@ function describeStoreContract(
       // #then
       expect(created.created).toBe(true);
       expect(await store.get(record.id)).toEqual(record);
+    });
+
+    it('round-trips mutually exclusive run- and tool-call-scoped fields', async () => {
+      const store = await makeStore();
+      const runScoped = makeRecord({
+        runScoped: true,
+        grantScope: 'run',
+        connectors: ['mailer'],
+      });
+      const toolCallScoped = makeRecord({
+        stepPath: ['approval'],
+        suspendedAt: 1751882400000,
+        resumeCount: 1,
+        grantScope: 'tool-call',
+        toolCallId: 'call-1',
+        connectors: ['mailer'],
+      });
+
+      await expect(store.create(runScoped)).resolves.toEqual({
+        created: true,
+        record: runScoped,
+      });
+      await expect(store.create(toolCallScoped)).resolves.toEqual({
+        created: true,
+        record: toolCallScoped,
+      });
+      await expect(store.get(runScoped.id)).resolves.toEqual(runScoped);
+      await expect(store.get(toolCallScoped.id)).resolves.toEqual(
+        toolCallScoped,
+      );
     });
 
     it('round-trips a trusted agent-thread resume target', async () => {
@@ -1588,18 +1618,19 @@ describe('D1ApprovalStore schema upgrade', () => {
 
   it('backfills nullable suspension and resume-target columns on a legacy tenant table', async () => {
     // #given — tenant_id present, suspended_at/resumed_at/resume_count/
-    // run_scoped absent (the one in-place upgrade that remains legal)
+    // run_scoped/grant_scope/tool_call_id absent (the in-place upgrade)
     const sqlite = openSqlite();
     sqlite.prepare(TENANTED_MINUS_INTEGERS_DDL).run();
     const store = new D1ApprovalStoreFactory(d1Like(sqlite)).forTenant('acme');
 
-    // #when — a fresh record round-trips all four backfilled columns
+    // #when — a fresh record round-trips the backfilled columns
     const fresh = makeRecord({
       stepPath: ['gate'],
       suspendedAt: 1751882400000,
       resumedAt: 1751882460000,
       resumeCount: 2,
-      runScoped: true,
+      grantScope: 'tool-call',
+      toolCallId: 'call-1',
       resumeTarget: {
         kind: 'thread',
         threadId: 'acme_thread',
@@ -1613,7 +1644,8 @@ describe('D1ApprovalStore schema upgrade', () => {
     expect(readBack?.suspendedAt).toBe(1751882400000);
     expect(readBack?.resumedAt).toBe(1751882460000);
     expect(readBack?.resumeCount).toBe(2);
-    expect(readBack?.runScoped).toBe(true);
+    expect(readBack?.grantScope).toBe('tool-call');
+    expect(readBack?.toolCallId).toBe('call-1');
     expect(readBack?.resumeTarget).toEqual(fresh.resumeTarget);
   });
 
@@ -1666,7 +1698,7 @@ describe('D1ApprovalStore schema upgrade', () => {
     const legacy = await store.get('legacy-1');
     expect(legacy?.runScoped).toBeUndefined();
     expect(
-      await approvedConnectorsForLeg(store, 'wf', 'run-legacy', {
+      await connectorGrantsForLeg(store, 'wf', 'run-legacy', {
         kind: 'start',
       }),
     ).toEqual([]);

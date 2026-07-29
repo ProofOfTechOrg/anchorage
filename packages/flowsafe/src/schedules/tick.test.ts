@@ -112,7 +112,15 @@ describe('createScheduleTick', () => {
           type: 'workflow',
           workflowId: 'wf',
           requestContext: {
-            'breakwater.approvedConnectors': ['forged'],
+            'breakwater.connectorGrants': [
+              {
+                scope: 'run',
+                connectorId: 'forged',
+                workflowId: 'wf',
+                runId: 'acme_stale-run',
+                isolationScope: 'acme',
+              },
+            ],
             'mastra:goal': 'injected objective',
             'my.custom': 'kept',
           },
@@ -201,7 +209,7 @@ describe('createScheduleTick', () => {
           resourceId: 'acme_resource',
           requestContext: {
             keep: 1,
-            'breakwater.approvedConnectors': ['forged'],
+            'breakwater.connectorGrants': ['forged'],
           },
           ifIdle: {
             behavior: 'wake',
@@ -553,7 +561,7 @@ describe('createScheduleTick', () => {
 
 describe('the P4 reserved-key barrier helpers', () => {
   it('isReservedScheduleContextKey covers the whole breakwater namespace + the goal key', () => {
-    expect(isReservedScheduleContextKey('breakwater.approvedConnectors')).toBe(
+    expect(isReservedScheduleContextKey('breakwater.connectorGrants')).toBe(
       true,
     );
     expect(isReservedScheduleContextKey('breakwater.actor')).toBe(true);
@@ -589,7 +597,7 @@ describe('the P4 reserved-key barrier helpers', () => {
 
   it('drops object meta-keys parsed from JSON without changing the result prototype', () => {
     const stored = JSON.parse(
-      '{"__proto__":{"breakwater.approvedConnectors":["forged"]},"constructor":"bad","prototype":"bad","safe":1}',
+      '{"__proto__":{"breakwater.connectorGrants":["forged"]},"constructor":"bad","prototype":"bad","safe":1}',
     ) as Record<string, unknown>;
     const safe = stripReservedScheduleContext(stored);
 
@@ -597,7 +605,7 @@ describe('the P4 reserved-key barrier helpers', () => {
     expect(Object.getPrototypeOf(safe)).toBe(Object.prototype);
     expect(Object.hasOwn(safe, '__proto__')).toBe(false);
     expect(
-      (safe as { breakwater?: { approvedConnectors?: string[] } }).breakwater,
+      (safe as { breakwater?: { connectorGrants?: unknown[] } }).breakwater,
     ).toBeUndefined();
   });
 

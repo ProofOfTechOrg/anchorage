@@ -5,7 +5,7 @@
 // shares one implementation instead of re-deriving the (suspendedAt, resumeCount)
 // capture and the SoD-across-gates re-queue.
 
-import { agentGateConnectors } from '../agent-runner/approval-shapes.js';
+import { agentGateGrantRequest } from '../agent-runner/approval-shapes.js';
 import {
   type ApprovalActor,
   type ApprovalAuditSink,
@@ -44,7 +44,10 @@ export type ResumeRunFn = (
  * (`[A-Za-z0-9_-]+`); providers can rewrite punctuation-bearing ids and the
  * suspend payload carries no reversible original-id field. agentGateConnectors
  * derives [toolName] so an approved agent gate mints exactly that connector's
- * grant. The explicit array wins when present, so workflow gates are unaffected.
+ * grant. A valid agent identity wins over a co-present `connectors` array:
+ * otherwise an ambiguous payload could downgrade exact tool-call authority to
+ * workflow suspension scope. Workflow gates remain on their explicit array
+ * because they do not carry both valid agent identities.
  *
  * ACCEPTED RISK (narrow): the agent fallback is a workflow-agnostic shape sniff —
  * a suspend payload has no workflowId to prove it came from the durable loop. A
@@ -57,15 +60,31 @@ export type ResumeRunFn = (
  * `connectors` array.
  */
 export function requestedConnectors(stepPayload: unknown): string[] {
-  if (stepPayload === null || typeof stepPayload !== 'object') return [];
+  return requestedGrantIdentity(stepPayload).connectors;
+}
+
+function requestedGrantIdentity(stepPayload: unknown): {
+  connectors: string[];
+  toolCallId?: string;
+} {
+  if (stepPayload === null || typeof stepPayload !== 'object') {
+    return { connectors: [] };
+  }
+  const agentGrant = agentGateGrantRequest(stepPayload);
+  if (agentGrant) {
+    return {
+      connectors: [agentGrant.connectorId],
+      toolCallId: agentGrant.toolCallId,
+    };
+  }
   const connectors = (stepPayload as Record<string, unknown>).connectors;
   if (
     Array.isArray(connectors) &&
     connectors.every((c): c is string => typeof c === 'string')
   ) {
-    return connectors;
+    return { connectors };
   }
-  return agentGateConnectors(stepPayload);
+  return { connectors: [] };
 }
 
 /**
@@ -139,7 +158,8 @@ export async function queueApprovalForSuspension(
       typeof summary.suspendPayload === 'object'
         ? (summary.suspendPayload as Record<string, unknown>)[stepKey]
         : undefined;
-    const connectors = requestedConnectors(stepPayload);
+    const grantIdentity = requestedGrantIdentity(stepPayload);
+    const { connectors } = grantIdentity;
     try {
       const { record } = await service.createAsPrincipal(
         {
@@ -152,6 +172,7 @@ export async function queueApprovalForSuspension(
           title: `Approve '${workflowId}' run`,
           payload: summary.suspendPayload,
           connectors: connectors.length > 0 ? connectors : undefined,
+          toolCallId: grantIdentity.toolCallId,
           requestedBy,
         },
         systemPrincipal,

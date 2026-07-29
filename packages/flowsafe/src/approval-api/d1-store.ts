@@ -89,6 +89,8 @@ const SCHEMA_STATEMENTS: readonly string[] = [
     summary TEXT,
     payload TEXT,
     connectors TEXT NOT NULL DEFAULT '[]',
+    grant_scope TEXT,
+    tool_call_id TEXT,
     priority TEXT NOT NULL,
     status TEXT NOT NULL,
     requested_by TEXT,
@@ -145,6 +147,8 @@ interface ApprovalRow {
   summary: string | null;
   payload: string | null;
   connectors: string;
+  grant_scope: string | null;
+  tool_call_id: string | null;
   priority: string;
   status: string;
   requested_by: string | null;
@@ -338,18 +342,43 @@ function buildPatchSets(patch: ApprovalPatch): {
 }
 
 function rowToRecord(row: ApprovalRow): ApprovalRecord {
+  let connectors: unknown;
+  try {
+    connectors = JSON.parse(row.connectors);
+  } catch {
+    throw new Error(`approval '${row.id}' has invalid connectors JSON`);
+  }
+  if (
+    !Array.isArray(connectors) ||
+    !connectors.every(
+      (connector): connector is string =>
+        typeof connector === 'string' && connector.length > 0,
+    )
+  ) {
+    throw new Error(`approval '${row.id}' has invalid connectors`);
+  }
   const record: ApprovalRecord = {
     id: row.id,
     tenantId: row.tenant_id,
     workflowId: row.workflow_id,
     runId: row.run_id,
     title: row.title,
-    connectors: JSON.parse(row.connectors) as string[],
+    connectors,
     priority: row.priority as ApprovalRecord['priority'],
     status: row.status as ApprovalStatus,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+  if (
+    row.grant_scope === 'tool-call' ||
+    row.grant_scope === 'suspension' ||
+    row.grant_scope === 'run'
+  ) {
+    record.grantScope = row.grant_scope;
+  } else if (row.grant_scope != null) {
+    throw new Error(`approval '${row.id}' has invalid grant_scope`);
+  }
+  if (row.tool_call_id != null) record.toolCallId = row.tool_call_id;
   if (row.step_path !== null)
     record.stepPath = JSON.parse(row.step_path) as string[];
   // != null covers a pre-migration row read before the ALTER backfilled the
@@ -472,6 +501,13 @@ export async function createApprovalSchema(
       if (!isDuplicateColumn(error)) throw error;
     }
   }
+  for (const column of ['grant_scope', 'tool_call_id']) {
+    try {
+      await db.prepare(`ALTER TABLE ${TABLE} ADD COLUMN ${column} TEXT`).run();
+    } catch (error) {
+      if (!isDuplicateColumn(error)) throw error;
+    }
+  }
   try {
     await db
       .prepare(`ALTER TABLE ${TABLE} ADD COLUMN resume_target TEXT`)
@@ -526,10 +562,11 @@ export class D1ApprovalStore implements ApprovalStore {
           `INSERT INTO ${TABLE} (
             id, tenant_id, workflow_id, run_id, step_key, step_path,
             suspended_at, resumed_at, resume_count, run_scoped, title, summary,
-            resume_target, payload, connectors, priority, status, requested_by, claimed_by,
+            resume_target, payload, connectors, grant_scope, tool_call_id,
+            priority, status, requested_by, claimed_by,
             decided_by, decision, comment, delegated_to, created_at, updated_at,
             claimed_at, decided_at, escalated_at, sla_deadline_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .bind(
           snapshot.id,
@@ -551,6 +588,8 @@ export class D1ApprovalStore implements ApprovalStore {
             ? null
             : JSON.stringify(snapshot.payload),
           JSON.stringify(snapshot.connectors),
+          snapshot.grantScope ?? null,
+          snapshot.toolCallId ?? null,
           snapshot.priority,
           snapshot.status,
           snapshot.requestedBy ?? null,

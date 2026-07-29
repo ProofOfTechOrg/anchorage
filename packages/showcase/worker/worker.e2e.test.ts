@@ -57,9 +57,8 @@ async function queueApproval(
 ) {
   const stepPath = suspended?.[0];
   if (!stepPath) throw new Error('expected a suspended step');
-  // Bind the approval to THIS suspension by its exact timestamp (clock-free
-  // grant binding). Fail loudly if it goes missing rather than silently
-  // degrade to the legacy decidedAt-after path.
+  // Bind the approval to THIS suspension by its exact timestamp. Fail loudly
+  // if it goes missing because an unbound capability record is inert.
   const suspendedAt = suspendedAtMap?.[stepPath.join('.')];
   if (typeof suspendedAt !== 'number') {
     throw new Error('expected a numeric suspendedAt for exact-match binding');
@@ -136,7 +135,9 @@ describe('gtm-app: outreach pipeline on real Anchorage seams (simulated send)', 
 
     // #then — the connector write gate denies (no grant); the run failed
     expect(forged.status).toBe('failed');
-    expect(forged.error).toContain('approval required and not granted');
+    expect(forged.error).toContain(
+      'approval required and no matching structured grant was found',
+    );
     expect(audit.events()).toContainEqual(
       expect.objectContaining({
         resource: OUTREACH_CONNECTOR,

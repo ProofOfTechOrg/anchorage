@@ -37,6 +37,12 @@ export interface AgentApprovalSuspend {
   args?: Record<string, unknown>;
 }
 
+/** Exact connector/tool-call request carried by a durable-agent approval. */
+export interface AgentGateGrantRequest {
+  connectorId: string;
+  toolCallId: string;
+}
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object'
     ? (value as Record<string, unknown>)
@@ -92,18 +98,31 @@ export function parseAgentApprovalSuspend(
  * durable-agent gate always carries both (toolCallId is the suspend's
  * `resumeLabel`), so demanding both never rejects a real gate while narrowing
  * the surface where a workflow-step gate COINCIDENTALLY shaped `{type:'approval',
- * toolName}` would mint an unintended grant (a workflow author's own convention
- * is an explicit `connectors` array, which requestedConnectors takes first).
- * Returns [] otherwise, so a decision never invents a grant the suspension did
- * not request (fail-closed).
+ * toolName}` would mint an unintended grant. Returns [] otherwise, so a decision
+ * never invents a grant the suspension did not request (fail-closed). The host
+ * bridge prioritizes this exact identity over any co-present workflow
+ * `connectors` array so ambiguity cannot widen a tool-call grant to suspension
+ * scope.
  */
 export function agentGateConnectors(payload: unknown): string[] {
+  const request = agentGateGrantRequest(payload);
+  return request ? [request.connectorId] : [];
+}
+
+/**
+ * Parse the exact durable-agent grant request. Both identities are mandatory;
+ * malformed or provider-rewritten names that cannot match a connector fail
+ * closed.
+ */
+export function agentGateGrantRequest(
+  payload: unknown,
+): AgentGateGrantRequest | undefined {
   const parsed = parseAgentApprovalSuspend(payload);
   return parsed?.toolName !== undefined &&
     parsed.toolName.length > 0 &&
     PROVIDER_SAFE_TOOL_NAME.test(parsed.toolName) &&
     parsed.toolCallId !== undefined &&
     parsed.toolCallId.length > 0
-    ? [parsed.toolName]
-    : [];
+    ? { connectorId: parsed.toolName, toolCallId: parsed.toolCallId }
+    : undefined;
 }

@@ -104,7 +104,7 @@ export interface ApprovalStore {
 /**
  * Drain the COMPLETE approved history of one run by explicit after-cursor
  * paging — the shared complete-internal-reader that BOTH grant derivation
- * (approvedConnectorsForLeg, grants.ts) and the cross-gate SoD bar
+ * (connectorGrantsForLeg, grants.ts) and the cross-gate SoD bar
  * (ApprovalService.decide) depend on, so the two can never drift. A single
  * default-bounded page is insufficient for either: a bare list() is capped at
  * MAX_APPROVAL_LIST_LIMIT, so a many-gate run's newest approvals sit past the

@@ -104,7 +104,7 @@ The application chooses the business key. Flowsafe supplies the trusted tenant i
 
 ### `requiresApproval`
 
-When `true`, every real call needs the connector id in `breakwater.approvedConnectors`.
+When `true`, every real call needs a structured grant in `breakwater.connectorGrants`. Breakwater compares the grant with the runtime-owned `breakwater.connectorExecution` identity and the connector’s actual Mastra `toolCallId` when the grant uses `tool-call` scope.
 
 The same decision is compiled into Mastra's native `requireApproval` predicate so an agent can suspend. The native approval signal never replaces the request-context capability.
 
@@ -219,11 +219,21 @@ Inject `runtime.fetch` into compatible SDKs. Apply infrastructure network policy
 
 ## Approval context
 
-`breakwater.approvedConnectors` is a read-only string array in Mastra's `RequestContext`. Whoever can write it can authorize a connector, so only trusted runtime code may populate it.
+`breakwater.connectorGrants` is a structured capability array in Mastra’s `RequestContext`. `breakwater.connectorExecution` identifies the current runtime leg. Whoever can write either value can affect authorization, so only trusted runtime code may populate them.
 
-Flowsafe's approval provider reads approved D1 records and derives it for a runtime leg. A public resume body, signal, model output, workflow input, or tool result cannot supply the key.
+Flowsafe’s approval provider reads approved D1 records and derives grants for each runtime leg. A public resume body, signal, model output, workflow input, tool result, schedule row, or background task cannot supply either key.
 
-Grant checks happen on every attempt. A retry without the matching context fails closed.
+Breakwater supports three explicit scopes:
+
+- `tool-call`: connector, tenant, workflow, run, exact suspension, and Mastra `toolCallId`
+- `suspension`: connector, tenant, workflow, run, and exact suspension
+- `run`: connector, tenant, workflow, and run for a trusted standing grant
+
+Durable-agent approvals use `tool-call` scope because Mastra persists and reproduces `toolCallId` through retry and reconstruction. Workflow gates use `suspension` scope because an arbitrary workflow suspension has no reproducible tool-call identity.
+
+Grant checks run on every attempt. A retry of the same durable tool call keeps the same identity and remains authorized. A new model tool call receives a new ID and requires approval. Use `breakwater.idempotencyKey` when retrying a side effect must replay instead of execute again.
+
+Legacy connector ID arrays and malformed structured grants fail closed. Breakwater does not hash inputs or consume one-shot nonces: canonical serialization, redaction, retry, and atomic consumption semantics are not established at this boundary.
 
 The dry-run branch is the only approval exemption because its separate implementation is required to have no side effect.
 

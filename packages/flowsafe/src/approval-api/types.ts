@@ -14,6 +14,42 @@ export type ApprovalDecision = 'approve' | 'reject';
 
 export type ApprovalPriority = 'low' | 'normal' | 'high' | 'critical';
 
+export type ApprovalGrantScope = 'tool-call' | 'suspension' | 'run';
+
+/** Exact suspension identity mirrored from breakwater's public grant contract. */
+export interface ConnectorApprovalSuspension {
+  stepPath: readonly string[];
+  suspendedAt: number;
+  resumeCount?: number;
+}
+
+/** Identity fields shared by every structured connector grant scope. */
+export interface ConnectorApprovalGrantBase {
+  connectorId: string;
+  workflowId: string;
+  runId: string;
+  isolationScope?: string;
+}
+
+/**
+ * Structured breakwater connector grant minted by Flowsafe. This is mirrored
+ * structurally rather than imported so Flowsafe can typecheck before
+ * Breakwater's declaration output exists; cross-package tests pin parity.
+ */
+export type ConnectorApprovalGrant =
+  | (ConnectorApprovalGrantBase & {
+      scope: 'tool-call';
+      suspension: ConnectorApprovalSuspension;
+      toolCallId: string;
+    })
+  | (ConnectorApprovalGrantBase & {
+      scope: 'suspension';
+      suspension: ConnectorApprovalSuspension;
+    })
+  | (ConnectorApprovalGrantBase & {
+      scope: 'run';
+    });
+
 /**
  * Statuses that still await a decision. 'escalated' stays decidable —
  * escalation raises visibility, it does not close the request.
@@ -98,6 +134,13 @@ export interface ApprovalRecord {
    * requestContext grants from these on approved records only.
    */
   connectors: string[];
+  /**
+   * Explicit effective capability scope. Missing on capability-free records
+   * and legacy rows; grant derivation treats absence as inert.
+   */
+  grantScope?: ApprovalGrantScope;
+  /** Mastra tool-call identity for a `tool-call` scoped grant. */
+  toolCallId?: string;
   priority: ApprovalPriority;
   status: ApprovalStatus;
   requestedBy?: string;
@@ -156,6 +199,11 @@ export interface CreateApprovalInput {
   summary?: string;
   payload?: unknown;
   connectors?: string[];
+  /**
+   * Mastra tool-call identity captured from a durable-agent suspension.
+   * Trusted creation only; never accepted over HTTP.
+   */
+  toolCallId?: string;
   priority?: ApprovalPriority;
   /** Seconds from creation to the SLA deadline; overrides the service default. */
   slaSeconds?: number;
@@ -164,8 +212,8 @@ export interface CreateApprovalInput {
    * Epoch-ms suspendedAt of the suspension this approval binds to, observed
    * from RunSummary.suspendedAt by the creating bridge (core clock, so grant
    * minting is clock-free: mint requires record.suspendedAt to EXACTLY match
-   * the resumed leg's suspension). Step-keyed approvals created without it
-   * fall back to the same-clock decidedAt-after-suspension comparison.
+   * the resumed leg's suspension). A capability-bearing record without it is
+   * inert.
    */
   suspendedAt?: number;
   /**

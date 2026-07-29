@@ -89,6 +89,16 @@ try {
   writeFileSync(
     join(consumer, 'consumer.ts'),
     `import {
+  BREAKWATER_CONNECTOR_EXECUTION_KEY,
+  BREAKWATER_CONNECTOR_GRANTS_KEY,
+  connectorGrantsForLeg,
+  type ConnectorApprovalGrant,
+} from '@proofoftech/flowsafe';
+import type {
+  ApprovalGrantScope,
+  ConnectorApprovalSuspension,
+} from '@proofoftech/flowsafe/approval-api';
+import {
   createAgentCatalog,
   createAgentRouter,
   createAgentThreadTopology,
@@ -117,6 +127,24 @@ const authorizeAutomatedEntry: AutomatedEntryAuthorizer = (
   request: AutomatedEntryRequest,
 ) => request.agentId === meta.id;
 const envelope = null as AgentRunEnvelope | null;
+const scope: ApprovalGrantScope = 'tool-call';
+const suspension: ConnectorApprovalSuspension = {
+  stepPath: ['publish'],
+  suspendedAt: 1,
+  resumeCount: 1,
+};
+const grant: ConnectorApprovalGrant = {
+  scope,
+  connectorId: 'publisher',
+  workflowId: 'launch',
+  runId: 'run-1',
+  isolationScope: 'acme',
+  suspension,
+  toolCallId: 'call-1',
+};
+void BREAKWATER_CONNECTOR_EXECUTION_KEY;
+void BREAKWATER_CONNECTOR_GRANTS_KEY;
+void connectorGrantsForLeg;
 void createAgentCatalog([meta]);
 void createAgentRouter;
 void createAgentThreadTopology;
@@ -125,6 +153,7 @@ void createAgentApprovalResumer;
 void automationCheck;
 void authorizeAutomatedEntry;
 void envelope;
+void grant;
 `,
   );
   writeFileSync(
@@ -150,11 +179,26 @@ void envelope;
     join(consumer, 'runtime.mjs'),
     `import assert from 'node:assert/strict';
 import * as host from '@proofoftech/flowsafe/agent-host';
+import * as flowsafe from '@proofoftech/flowsafe';
+import * as approvals from '@proofoftech/flowsafe/approval-api';
 assert.equal(typeof host.createAgentCatalog, 'function');
 assert.equal(typeof host.createAgentRouter, 'function');
 assert.equal(typeof host.createAgentThreadTopology, 'function');
 assert.equal(typeof host.createThreadAgentHost, 'function');
 assert.equal(typeof host.createAgentApprovalResumer, 'function');
+assert.equal(
+  flowsafe.BREAKWATER_CONNECTOR_GRANTS_KEY,
+  'breakwater.connectorGrants',
+);
+assert.equal(
+  flowsafe.BREAKWATER_CONNECTOR_EXECUTION_KEY,
+  'breakwater.connectorExecution',
+);
+assert.equal(typeof flowsafe.connectorGrantsForLeg, 'function');
+assert.equal(
+  approvals.BREAKWATER_CONNECTOR_GRANTS_KEY,
+  flowsafe.BREAKWATER_CONNECTOR_GRANTS_KEY,
+);
 `,
   );
   run(process.execPath, ['runtime.mjs'], consumer);

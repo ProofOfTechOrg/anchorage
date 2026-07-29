@@ -16,20 +16,29 @@
 // requestContext), which is exactly the mechanic the real loop uses
 // (agent/durable index.js: params.requestContext -> toolOptions -> tool.execute).
 
+import { Agent } from '@mastra/core/agent';
+import { globalRunRegistry } from '@mastra/core/agent/durable';
+import type { MastraModelConfig } from '@mastra/core/llm';
+import { RequestContext } from '@mastra/core/request-context';
 import { InMemoryStore } from '@mastra/core/storage';
 import type { ToolExecutionContext } from '@mastra/core/tools';
 import { AuditLogger, createConnector } from '@proofoftech/breakwater';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import type { ApprovalActor } from '../approval-api/contract.js';
 import {
   approvalGrantProvider,
+  defaultResumeData,
   resumeViaRuntime,
 } from '../approval-api/grants.js';
 import { ApprovalService } from '../approval-api/service.js';
 import { InMemoryApprovalStore } from '../approval-api/store.js';
 import { init } from '../do-runner/init.js';
 import { queueApprovalForSuspension } from '../host-kit/approval-bridge.js';
+import {
+  createFlowsafeDurableAgent,
+  DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
+} from './durable-agent-runner.js';
 
 const SYSTEM = 'sys';
 const REVIEWER: ApprovalActor = {
@@ -40,6 +49,53 @@ const REVIEWER: ApprovalActor = {
 const STARTER = 'starter'; // the human who advanced the run (requestedBy)
 
 const CONNECTOR_ID = 'blog-publisher';
+const MODEL_USAGE = {
+  inputTokens: 1,
+  outputTokens: 1,
+  totalTokens: 2,
+};
+
+function toolCallModel(onCall: () => void): MastraModelConfig {
+  const toolCall = () => ({
+    type: 'tool-call' as const,
+    toolCallId: 'call-1',
+    toolName: CONNECTOR_ID,
+    input: JSON.stringify({ topic: 'ship-it' }),
+  });
+  return {
+    specificationVersion: 'v2',
+    provider: 'flowsafe-test',
+    modelId: 'deterministic-tool-call',
+    supportedUrls: {},
+    doGenerate: async () => {
+      onCall();
+      return {
+        content: [toolCall()],
+        finishReason: 'tool-calls',
+        usage: MODEL_USAGE,
+        warnings: [],
+      };
+    },
+    doStream: async () => {
+      onCall();
+      const call = toolCall();
+      return {
+        stream: new ReadableStream({
+          start(controller) {
+            controller.enqueue({ type: 'stream-start', warnings: [] });
+            controller.enqueue(call);
+            controller.enqueue({
+              type: 'finish',
+              finishReason: 'tool-calls',
+              usage: MODEL_USAGE,
+            });
+            controller.close();
+          },
+        }),
+      };
+    },
+  };
+}
 
 // The two durable approval-suspend shapes (verbatim from @mastra/core dist).
 const flatShape = (topic: string) => ({
@@ -57,7 +113,7 @@ const nestedShape = (topic: string) => ({
   },
 });
 
-function buildHarness() {
+function buildHarness(workflowId = 'agent-launch') {
   const storage = new InMemoryStore();
   const store = new InMemoryApprovalStore('acme');
   const connectorAudit = new AuditLogger();
@@ -137,12 +193,13 @@ function buildHarness() {
         if (!publisher.execute) throw new Error('connector has no execute');
         return (await publisher.execute({ topic: inputData.topic }, {
           requestContext,
+          agent: { toolCallId: 'call-1' },
         } as unknown as ToolExecutionContext)) as { published: boolean };
       },
     });
 
     createWorkflow({
-      id: 'agent-launch',
+      id: workflowId,
       inputSchema: z.object({
         topic: z.string(),
         shape: z.enum(['flat', 'nested']),
@@ -169,6 +226,7 @@ function buildHarness() {
     store,
     publishes: () => publishes,
     connectorAudit,
+    workflowId,
   };
 }
 
@@ -195,6 +253,10 @@ describe('agent gate grant round-trip (R-003, both shapes)', () => {
       );
       // #then — connectors:[toolName] was parsed out of the agent shape
       expect(record?.connectors).toEqual([CONNECTOR_ID]);
+      expect(record).toMatchObject({
+        grantScope: 'tool-call',
+        toolCallId: 'call-1',
+      });
 
       // #when — the reviewer approves; decide() resumes via the runtime, whose
       // provider derives the grant from the now-approved record on the resumed
@@ -214,8 +276,13 @@ describe('agent gate grant round-trip (R-003, both shapes)', () => {
       expect(h.publishes()).toBe(1);
       expect(h.connectorAudit.events()).toContainEqual(
         expect.objectContaining({
+          action: 'connector.approval',
           resource: CONNECTOR_ID,
           decision: 'allowed',
+          detail: expect.objectContaining({
+            grantScope: 'tool-call',
+            toolCallId: 'call-1',
+          }),
         }),
       );
     });
@@ -238,7 +305,9 @@ describe('agent gate grant round-trip (R-003, both shapes)', () => {
 
     // #then — no grant, the write gate denies, nothing published
     expect(resumed.status).toBe('failed');
-    expect(resumed.error).toContain('approval required and not granted');
+    expect(resumed.error).toContain(
+      'approval required and no matching structured grant was found',
+    );
     expect(h.publishes()).toBe(0);
     expect(h.connectorAudit.events()).toContainEqual(
       expect.objectContaining({ resource: CONNECTOR_ID, decision: 'denied' }),
@@ -313,16 +382,8 @@ describe('agent gate grant round-trip (R-003, both shapes)', () => {
     // never any in-process registry, so the approved connector still runs.
     //
     // This pins BARRIER 1: the capability survives eviction because it is
-    // durable-state derived. BARRIER 2 — the REAL durable-agentic-loop
-    // additionally cannot resolve the tool's execute closure from the emptied
-    // globalRunRegistry on a post-eviction resume (ToolNotFoundError against the
-    // runtime's workflow-only Mastra — runtime.ts #ensureMastra registers NO
-    // tools/agents — fail-closing BEFORE tool.execute) — needs the LLM-driven
-    // loop to place a real tool call, so it stays the deferred S3 spike (the
-    // scope note in durable-agent-runner.ts). This harness's `use` step closes
-    // over the connector instead of resolving it from the registry, so it cannot
-    // exercise barrier 2 without an LLM; it proves the grant-survives-eviction
-    // half that IS testable.
+    // durable-state derived. The next test pins BARRIER 2 with the real
+    // durable-agentic-loop and a deterministic tool-calling model.
     const h = buildHarness();
 
     // #given — runtime1 suspends the agent gate and durably persists the snapshot
@@ -364,5 +425,139 @@ describe('agent gate grant round-trip (R-003, both shapes)', () => {
     expect(h.connectorAudit.events()).toContainEqual(
       expect.objectContaining({ resource: CONNECTOR_ID, decision: 'allowed' }),
     );
+  });
+
+  it('eviction reconstruction resolves and executes the approved connector from the rehydrated durable-agent registry', async () => {
+    globalRunRegistry.clear();
+    const storage = new InMemoryStore();
+    const store = new InMemoryApprovalStore('acme');
+    const connectorAudit = new AuditLogger();
+    const makeRuntime = () =>
+      init({ storage }, { requestContextForRun: approvalGrantProvider(store) })
+        .runtime;
+    const modelCalls = vi.fn();
+    let initialPublishes = 0;
+    let rehydratedPublishes = 0;
+    let resolvedFromRehydratedRegistry = false;
+    const connector = (generation: 'initial' | 'rehydrated') =>
+      createConnector<{ topic: string }, { published: boolean }>({
+        id: CONNECTOR_ID,
+        description: 'Publishes the launch post',
+        inputSchema: z.object({ topic: z.string() }),
+        outputSchema: z.object({ published: z.boolean() }),
+        permissions: { sideEffect: 'write', requiresApproval: true },
+        policies: { audit: connectorAudit },
+        execute: async (_input, context) => {
+          expect(context.agent?.toolCallId).toBe('call-1');
+          if (generation === 'initial') {
+            initialPublishes += 1;
+          } else {
+            rehydratedPublishes += 1;
+            const registeredTool =
+              globalRunRegistry.get(runId)?.tools?.[CONNECTOR_ID];
+            resolvedFromRehydratedRegistry =
+              registeredTool?.id === CONNECTOR_ID &&
+              typeof registeredTool.execute === 'function';
+          }
+          return { published: true };
+        },
+      });
+    const initialConnector = connector('initial');
+    const rawAgent = (tool: typeof initialConnector, onModelCall: () => void) =>
+      new Agent({
+        id: 'writer',
+        name: 'Writer',
+        instructions: 'Publish only after approval.',
+        model: toolCallModel(onModelCall),
+        tools: { [CONNECTOR_ID]: tool },
+      });
+    const runtime = makeRuntime();
+    const beforeEviction = createFlowsafeDurableAgent({
+      agent: rawAgent(initialConnector, modelCalls),
+      runtime,
+      cache: false,
+      maxSteps: 1,
+    });
+    const runId = 'acme_evict_registry';
+    await beforeEviction.streamUntilPersisted('publish', {
+      runId,
+      requestContext: new RequestContext(),
+      maxSteps: 1,
+    });
+    const started = await runtime.status(
+      DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
+      runId,
+    );
+    if (!started) throw new Error('durable run did not persist');
+    expect(started.status).toBe('suspended');
+    expect(globalRunRegistry.has(runId)).toBe(true);
+    expect(modelCalls).toHaveBeenCalledOnce();
+    expect(initialPublishes).toBe(0);
+
+    // Simulate isolate eviction: both Mastra registry layers disappear. A new
+    // runtime and durable-agent wrapper attach to the persisted workflow state.
+    (
+      beforeEviction as unknown as {
+        runRegistryInternal: { clear(): void };
+      }
+    ).runRegistryInternal.clear();
+    globalRunRegistry.clear();
+    const evictedRuntime = makeRuntime();
+    const rehydratedConnector = connector('rehydrated');
+    const reconstructed = createFlowsafeDurableAgent({
+      agent: rawAgent(rehydratedConnector, modelCalls),
+      runtime: evictedRuntime,
+      cache: false,
+      maxSteps: 1,
+    });
+    vi.spyOn(reconstructed, 'observe').mockResolvedValue({
+      output: { id: 'rehydrated-output' },
+    } as never);
+    const service = new ApprovalService({
+      store,
+      resumeRun: (record, decision) =>
+        reconstructed.resumeViaRuntime({
+          runId: record.runId,
+          step: record.stepPath,
+          resumeData: defaultResumeData(record, decision),
+        }),
+    });
+    const [record] = await queueApprovalForSuspension(
+      service,
+      DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
+      started,
+      STARTER,
+      SYSTEM,
+    );
+
+    const decided = await service.decide(
+      record?.id ?? '',
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    expect(decided.resume).toMatchObject({
+      attempted: true,
+      ok: true,
+      summary: {
+        status: 'success',
+      },
+    });
+    expect(initialPublishes).toBe(0);
+    expect(rehydratedPublishes).toBe(1);
+    expect(resolvedFromRehydratedRegistry).toBe(true);
+    expect(modelCalls).toHaveBeenCalledOnce();
+    expect(connectorAudit.events()).toContainEqual(
+      expect.objectContaining({
+        action: 'connector.approval',
+        resource: CONNECTOR_ID,
+        decision: 'allowed',
+        detail: expect.objectContaining({
+          grantScope: 'tool-call',
+          toolCallId: 'call-1',
+        }),
+      }),
+    );
+    globalRunRegistry.clear();
   });
 });

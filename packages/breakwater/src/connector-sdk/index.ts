@@ -45,6 +45,7 @@ import {
   ISOLATION_SCOPE_CONTEXT_KEY,
   LLM_BACKGROUND_OVERRIDE_KEY,
   networkEgress,
+  WORKFLOW_SCOPE_CONTEXT_KEY,
 } from '../policy-engine/tool-policy.js';
 import { actorFromRequestContext } from '../rbac/index.js';
 import type { EgressFetchBase, EgressGuardedFetch } from './egress-fetch.js';
@@ -377,15 +378,79 @@ export interface ConnectorConfig<TInput = unknown, TOutput = unknown> {
   policies?: ConnectorPolicies;
 }
 
+/** Exact suspension identity shared by a resume leg and its grants. */
+export interface ConnectorApprovalSuspension {
+  /** Suspended workflow step path. */
+  stepPath: readonly string[];
+  /** Epoch-ms timestamp of the suspension in Mastra's persisted snapshot. */
+  suspendedAt: number;
+  /** Runtime-owned ordinal; absent only for the step's first suspension. */
+  resumeCount?: number;
+}
+
+/** Identity fields shared by every structured connector grant scope. */
+export interface ConnectorApprovalGrantBase {
+  /** Connector this grant can authorize. */
+  connectorId: string;
+  /** Workflow whose runtime minted the grant. */
+  workflowId: string;
+  /** Server-minted run whose runtime minted the grant. */
+  runId: string;
+  /** Opaque tenant/isolation scope, when the runtime has one. */
+  isolationScope?: string;
+}
+
 /**
- * requestContext key: readonly string[] of connector ids approved for this
- * request. A capability token — whoever can write this key can authorize
- * any write-class connector — so it must only ever be set by trusted
- * server-side code after an out-of-band approval, never derived from client
- * input, model output, or tool results. A trusted approval service can mint
- * these grants when it resumes an approved run.
+ * Structured connector capability. Tool-call grants are the default for
+ * durable-agent approvals because Mastra persists and reproduces that identity.
+ * Workflow gates without a reproducible tool call use exact suspension scope.
+ * Run scope is a deliberate standing grant and is never inferred.
  */
-export const APPROVED_CONNECTORS_CONTEXT_KEY = 'breakwater.approvedConnectors';
+export type ConnectorApprovalGrant =
+  | (ConnectorApprovalGrantBase & {
+      scope: 'tool-call';
+      suspension: ConnectorApprovalSuspension;
+      toolCallId: string;
+    })
+  | (ConnectorApprovalGrantBase & {
+      scope: 'suspension';
+      suspension: ConnectorApprovalSuspension;
+    })
+  | (ConnectorApprovalGrantBase & {
+      scope: 'run';
+    });
+
+/** Runtime-owned identity of the leg currently executing the connector. */
+export type ConnectorExecutionIdentity =
+  | {
+      kind: 'start';
+      workflowId: string;
+      runId: string;
+      isolationScope?: string;
+    }
+  | {
+      kind: 'resume';
+      workflowId: string;
+      runId: string;
+      isolationScope?: string;
+      suspension: ConnectorApprovalSuspension;
+    };
+
+/**
+ * requestContext key containing readonly structured connector grants. Only
+ * trusted runtime code may populate it. Legacy connector-ID arrays are invalid
+ * and fail closed.
+ */
+export const CONNECTOR_GRANTS_CONTEXT_KEY = 'breakwater.connectorGrants';
+
+/**
+ * requestContext key containing the runtime-owned current execution identity.
+ * The connector compares grants against it so a stale exact-leg grant cannot
+ * authorize a later suspension even if context propagation regresses.
+ */
+export const CONNECTOR_EXECUTION_CONTEXT_KEY = 'breakwater.connectorExecution';
+
+const LEGACY_CONNECTOR_GRANTS_CONTEXT_KEY = 'breakwater.approvedConnectors';
 
 /** requestContext key: per-call idempotency key (non-empty string). */
 export const IDEMPOTENCY_KEY_CONTEXT_KEY = 'breakwater.idempotencyKey';
@@ -430,12 +495,135 @@ export function connectorManifest(
   return manifests.get(tool);
 }
 
-function approvalGranted(
-  requestContext: RequestContext | undefined,
-  connectorId: string,
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function validSuspension(value: unknown): value is ConnectorApprovalSuspension {
+  if (value === null || typeof value !== 'object') return false;
+  const suspension = value as Record<string, unknown>;
+  return (
+    Array.isArray(suspension.stepPath) &&
+    suspension.stepPath.length > 0 &&
+    suspension.stepPath.every(nonEmptyString) &&
+    typeof suspension.suspendedAt === 'number' &&
+    Number.isFinite(suspension.suspendedAt) &&
+    suspension.suspendedAt > 0 &&
+    (suspension.resumeCount === undefined ||
+      (typeof suspension.resumeCount === 'number' &&
+        Number.isInteger(suspension.resumeCount) &&
+        suspension.resumeCount > 0))
+  );
+}
+
+function validGrant(value: unknown): value is ConnectorApprovalGrant {
+  if (value === null || typeof value !== 'object') return false;
+  const grant = value as Record<string, unknown>;
+  if (
+    !nonEmptyString(grant.connectorId) ||
+    !nonEmptyString(grant.workflowId) ||
+    !nonEmptyString(grant.runId) ||
+    (grant.isolationScope !== undefined &&
+      !nonEmptyString(grant.isolationScope))
+  ) {
+    return false;
+  }
+  if (grant.scope === 'run') {
+    return grant.suspension === undefined && grant.toolCallId === undefined;
+  }
+  if (
+    (grant.scope !== 'suspension' && grant.scope !== 'tool-call') ||
+    !validSuspension(grant.suspension)
+  ) {
+    return false;
+  }
+  return grant.scope === 'tool-call'
+    ? nonEmptyString(grant.toolCallId)
+    : grant.toolCallId === undefined;
+}
+
+function validExecutionIdentity(
+  value: unknown,
+): value is ConnectorExecutionIdentity {
+  if (value === null || typeof value !== 'object') return false;
+  const identity = value as Record<string, unknown>;
+  if (
+    !nonEmptyString(identity.workflowId) ||
+    !nonEmptyString(identity.runId) ||
+    (identity.isolationScope !== undefined &&
+      !nonEmptyString(identity.isolationScope))
+  ) {
+    return false;
+  }
+  if (identity.kind === 'start') return identity.suspension === undefined;
+  return identity.kind === 'resume' && validSuspension(identity.suspension);
+}
+
+function sameSuspension(
+  left: ConnectorApprovalSuspension,
+  right: ConnectorApprovalSuspension,
 ): boolean {
-  const value = requestContext?.get(APPROVED_CONNECTORS_CONTEXT_KEY);
-  return Array.isArray(value) && value.includes(connectorId);
+  return (
+    left.suspendedAt === right.suspendedAt &&
+    left.resumeCount === right.resumeCount &&
+    left.stepPath.length === right.stepPath.length &&
+    left.stepPath.every((segment, index) => segment === right.stepPath[index])
+  );
+}
+
+function grantForExecution(
+  context: ToolExecutionContext,
+  connectorId: string,
+): ConnectorApprovalGrant | undefined {
+  const requestContext = context.requestContext;
+  if (requestContext?.get(LEGACY_CONNECTOR_GRANTS_CONTEXT_KEY) !== undefined) {
+    return undefined;
+  }
+  const grants = requestContext?.get(CONNECTOR_GRANTS_CONTEXT_KEY);
+  const identity = requestContext?.get(CONNECTOR_EXECUTION_CONTEXT_KEY);
+  if (
+    !Array.isArray(grants) ||
+    !grants.every(validGrant) ||
+    !validExecutionIdentity(identity)
+  ) {
+    return undefined;
+  }
+
+  const workflowScope = requestContext?.get(WORKFLOW_SCOPE_CONTEXT_KEY);
+  const isolationScope = isolationScopeOf(requestContext);
+  const requestRunId = requestContext?.get('runId');
+  if (
+    workflowScope !== identity.workflowId ||
+    requestRunId !== identity.runId ||
+    isolationScope !== identity.isolationScope ||
+    (context.workflow !== undefined &&
+      (context.workflow.workflowId !== identity.workflowId ||
+        context.workflow.runId !== identity.runId))
+  ) {
+    return undefined;
+  }
+
+  return grants.find((grant) => {
+    if (
+      grant.connectorId !== connectorId ||
+      grant.workflowId !== identity.workflowId ||
+      grant.runId !== identity.runId ||
+      grant.isolationScope !== identity.isolationScope
+    ) {
+      return false;
+    }
+    if (grant.scope === 'run') return true;
+    if (
+      identity.kind !== 'resume' ||
+      !sameSuspension(grant.suspension, identity.suspension)
+    ) {
+      return false;
+    }
+    return (
+      grant.scope === 'suspension' ||
+      grant.toolCallId === context.agent?.toolCallId
+    );
+  });
 }
 
 // The `_background` model-override field (core LLMBackgroundOverride) smuggled
@@ -517,9 +705,8 @@ function parseRateLimit(
  * pause for approval before execute — but enforcement is the wrapper's
  * grant check, on every caller: an agent-shaped context is forwardable into
  * nested and direct calls, and the native approval outcome is not
- * observable at execute time, so approving a call means minting the grant
- * (APPROVED_CONNECTORS_CONTEXT_KEY) into the requestContext the resumed
- * call executes under.
+ * observable at execute time, so approving a call means minting a structured
+ * grant into the requestContext the resumed call executes under.
  */
 export function createConnector<TInput = unknown, TOutput = unknown>(
   config: ConnectorConfig<TInput, TOutput>,
@@ -606,10 +793,11 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     requestContext: RequestContext | undefined,
     decision: 'allowed' | 'denied' | 'error',
     extra: { reason?: string; detail?: Record<string, unknown> } = {},
+    action = 'connector.execute',
   ): void {
     audit?.record({
       actor: actorFromRequestContext(requestContext) ?? null,
-      action: 'connector.execute',
+      action,
       resource: id,
       decision,
       reason: extra.reason,
@@ -956,11 +1144,38 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     // of approval and does not bypass this gate: whatever approves the call
     // must mint the grant into the requestContext the resumed call runs
     // under (the Phase 3 approval API's job).
-    if (needsApproval && !approvalGranted(requestContext, id)) {
-      deny(
+    if (needsApproval) {
+      const grant = grantForExecution(context, id);
+      if (!grant) {
+        deny(
+          requestContext,
+          'write-permissions',
+          'approval required and no matching structured grant was found',
+        );
+      }
+      record(
         requestContext,
-        'write-permissions',
-        'approval required and not granted for this request',
+        'allowed',
+        {
+          reason: 'structured approval grant matched',
+          detail: {
+            policy: 'write-permissions',
+            grantScope: grant.scope,
+            workflowId: grant.workflowId,
+            runId: grant.runId,
+            ...(grant.scope === 'run'
+              ? {}
+              : {
+                  stepPath: [...grant.suspension.stepPath],
+                  suspendedAt: grant.suspension.suspendedAt,
+                  resumeCount: grant.suspension.resumeCount,
+                }),
+            ...(grant.scope === 'tool-call'
+              ? { toolCallId: grant.toolCallId }
+              : {}),
+          },
+        },
+        'connector.approval',
       );
     }
 

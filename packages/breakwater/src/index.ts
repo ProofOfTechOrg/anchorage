@@ -57,7 +57,11 @@ export {
 } from './audit/index.js';
 export type {
   AtomicIdempotencyStore,
+  ConnectorApprovalGrant,
+  ConnectorApprovalGrantBase,
+  ConnectorApprovalSuspension,
   ConnectorConfig,
+  ConnectorExecutionIdentity,
   ConnectorPolicies,
   ConnectorRuntime,
   D1IdempotencyStoreOptions,
@@ -80,7 +84,8 @@ export type {
   RateLimitStore,
 } from './connector-sdk/index.js';
 export {
-  APPROVED_CONNECTORS_CONTEXT_KEY,
+  CONNECTOR_EXECUTION_CONTEXT_KEY,
+  CONNECTOR_GRANTS_CONTEXT_KEY,
   ConnectorPolicyError,
   connectorManifest,
   createConnector,

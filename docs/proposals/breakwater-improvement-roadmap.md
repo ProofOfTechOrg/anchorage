@@ -29,7 +29,7 @@ testable, and appropriately placed.
 | **Shipped** | Mandatory agent processors that callers cannot omit or override | `createGuardedAgent()` exposes only the validated unstructured invocation surface |
 | **Shipped** | Central reserved request-context stripping and server derivation | Actor, tenant, workflow, approval, isolation, and audit correlation remain runtime-owned |
 | **Shipped** | Agent/run/tenant audit correlation | Guarded RBAC and policy events use `agent:<id>` plus safe host-derived correlation |
-| **Phase A decision** | Accept exact-leg connector-ID approval grants | Structured tool-call and argument grants remain Phase B work |
+| **Shipped** | Structured connector approval grants | Durable agents use exact tool-call scope, workflow gates use exact suspension scope, and standing grants use explicit run scope |
 | **Shipped** | End-to-end invariant tests for supported invocation paths | The deterministic workerd proof covers restart, approval resume, forgery, tenancy, and exactly-once execution |
 | **Shipped** | Public documentation aligned with guarded agent hosting | The architecture, durable-agent, deployment, threat-model, operations, starter, and API guides define the supported boundary |
 | **P1** | Add permission-based authorization without role inheritance | Fine-grained permissions scale better than hard-coded role semantics |
@@ -189,7 +189,8 @@ The sanitizer must reject or strip:
 The derivation helper must be the only normal producer of:
 
 - `breakwater.actor`.
-- `breakwater.approvedConnectors`.
+- `breakwater.connectorGrants`.
+- `breakwater.connectorExecution`.
 - `breakwater.workflowScope`.
 - `breakwater.isolationScope`.
 - Runtime-derived idempotency context.
@@ -249,61 +250,31 @@ in authorization audit detail.
 - Audit-event schemas distinguish stable machine-readable fields from safe
   human-readable reasons.
 
-### 5. Decide and Tighten Approval-Grant Scope
+### 5. Tighten approval-grant scope (shipped)
 
-#### Current state
+#### Shipped implementation
 
-Flowsafe derives grants only from approved records matching the current
-`(suspendedAt, resumeCount)` leg fingerprint. This correctly prevents old
-decisions from minting on later suspensions. The request-context capability
-given to breakwater is nevertheless a list of connector IDs. Within the
-authorized leg, possession of `send-email` authorizes that connector ID rather
-than a specific tool call and argument set.
+Flowsafe persists an explicit `grantScope` on every capability-bearing approval. Durable-agent approvals also persist Mastra `toolCallId`. Breakwater accepts only structured grants in `breakwater.connectorGrants` and compares them with the runtime-owned `breakwater.connectorExecution` identity.
 
-This may be acceptable when the resumed snapshot deterministically executes
-one already-suspended tool call and the grant disappears after the leg. It is
-too broad if arbitrary code in the same leg can reuse the context to invoke the
-same connector again with different inputs.
+The shipped scopes are:
 
-#### Improvement
+- `tool-call`: connector, tenant, workflow, run, exact suspension, and `toolCallId`
+- `suspension`: connector, tenant, workflow, run, and exact suspension
+- `run`: connector, tenant, workflow, and run
 
-Perform a focused threat-model and runtime trace before enabling high-value
-agent writes. Prefer a structured, least-authority grant:
+Durable-agent suspensions use `tool-call` scope. Mastra persists `toolCallId` in the durable tool-call input and reproduces it in `context.agent.toolCallId` across resume, retry, background dispatch, and Durable Object reconstruction. Arbitrary workflow gates use `suspension` scope because Mastra exposes no corresponding tool-call identity there. Only an explicit trusted `runScoped: true` record produces `run` scope.
 
-```ts
-interface ConnectorGrant {
-  connectorId: string;
-  runId: string;
-  stepId?: string;
-  toolCallId?: string;
-  inputDigest?: string;
-  suspension: { suspendedAt: number; resumeCount?: number };
-  expiresAt?: number;
-  nonce?: string;
-}
-```
+Legacy connector ID arrays and records without explicit scope fail closed. The public approval and resume bodies cannot set connector, scope, suspension, tool-call, or runtime-execution identity.
 
-Possible enforcement levels, in increasing strength:
+#### Retry and rejected alternatives
 
-1. Connector plus exact suspension leg.
-2. Connector plus `toolCallId`.
-3. Connector plus tool call and canonical input digest.
-4. One-shot nonce consumed atomically at connector execution.
+The same durable tool call can retry with the same `toolCallId`; a new model tool call requires approval. Connector idempotency remains a separate control and prevents repeated side effects when configured.
 
-Use the narrowest level the Mastra durable execution path can reproduce
-reliably across eviction and retry. Do not add argument hashing until canonical
-serialization and redaction behavior are defined.
+Input digests were rejected because canonical serialization and redaction behavior are not defined across Mastra and connector schemas. One-shot nonces were rejected because Mastra does not expose an atomic consume-and-execute transaction; consuming before execution breaks retry and eviction recovery, while consuming after execution permits duplicate races.
 
-#### Acceptance criteria
+#### Residual
 
-- The chosen scope and residual risk are documented explicitly.
-- A grant cannot authorize another run, tenant, suspension leg, connector, or
-  tool call outside the accepted scope.
-- Retry behavior is defined: either the same approved attempt can retry safely
-  with idempotency, or a new approval is required.
-- One approval cannot silently authorize an unbounded number of same-connector
-  calls in one resumed leg unless that is an explicit, audited run-scoped
-  policy.
+Workflow approvals remain suspension-scoped because no narrower reproducible identity exists. Code inside an approved connector remains trusted and can repeat its own connector operation under the same tool-call identity. Use connector idempotency when repeated execution must replay.
 
 ### 6. Define execution principals (shipped)
 
@@ -767,13 +738,13 @@ dependency.
 6. Add resource-specific audit attribution.
 7. Ship the end-to-end enforcement matrix.
 
-The shipped host deliberately omits a public raw-resume route. It accepts connector-ID grants bound to the exact `(suspendedAt, resumeCount)` leg.
+The shipped host deliberately omits a public raw-resume route. It accepts structured grants derived from approved records and authoritative runtime identity.
 
 ### Phase B: Approval capability and principal hardening
 
 1. ~~Define human, service, agent, and system principals beyond the Phase A human-role snapshot.~~ Shipped. `ExecutionPrincipal` carries a kind, a required `purpose` on every automated kind, and optional delegation. Breakwater's `Actor` gained `kind`, and `RBACMiddleware`/`createGuardedAgent` gate on `allowedPrincipalKinds` before roles. The agent host routes automated entry through each agent's `allowedAutomation` declaration.
-2. Choose connector/leg/tool-call/input/nonce grant scope for structured grants.
-3. Prove scheduled, signal, background, and nested execution cannot inherit a stale or broader grant.
+2. ~~Choose connector/leg/tool-call/input/nonce grant scope for structured grants.~~ Shipped. Durable agents use `tool-call`; workflow gates use `suspension`; trusted standing grants use explicit `run`.
+3. ~~Prove scheduled, signal, background, and nested execution cannot inherit a stale or broader grant.~~ Shipped. Reserved-context boundaries reject client and stored capabilities, every leg overwrites grants, and Breakwater compares exact connector and execution identity.
 4. Add dynamic principal re-resolution only when a concrete identity-provider contract exists.
 
 ### Phase C: Fine-grained authorization

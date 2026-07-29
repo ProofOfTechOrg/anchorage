@@ -10,7 +10,8 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ApprovalActor, TenantContext } from '../approval-api/index.js';
 import {
   BREAKWATER_ACTOR_KEY,
-  BREAKWATER_APPROVED_CONNECTORS_KEY,
+  BREAKWATER_CONNECTOR_EXECUTION_KEY,
+  BREAKWATER_CONNECTOR_GRANTS_KEY,
   BREAKWATER_ISOLATION_SCOPE_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
 } from '../do-runner/breakwater-keys.js';
@@ -530,7 +531,8 @@ describe('GOAL_REQUEST_CONTEXT_KEY reservation (DL-018 no-collision pin)', () =>
   const RUNTIME_BASE_KEYS = [
     BREAKWATER_WORKFLOW_SCOPE_KEY,
     BREAKWATER_ISOLATION_SCOPE_KEY,
-    BREAKWATER_APPROVED_CONNECTORS_KEY,
+    BREAKWATER_CONNECTOR_EXECUTION_KEY,
+    BREAKWATER_CONNECTOR_GRANTS_KEY,
     BREAKWATER_ACTOR_KEY,
   ];
 

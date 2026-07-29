@@ -26,7 +26,7 @@
 // `tool.execute(cleanedArgs, toolOptions)` :3642), NOT the stream()-time
 // registry copy. Under runtime drive that engine-leg context is exactly what
 // #requestContextFor mints per leg — so approvalGrantProvider's
-// `breakwater.approvedConnectors` grant reaches the connector write gate with
+// `breakwater.connectorGrants` grant reaches the connector write gate with
 // zero extra wiring, and a forged/self resume that mints no grant fails closed
 // there (the registry copy is read only for the fail-closed, over-require-safe
 // approval PRE-check, S5).

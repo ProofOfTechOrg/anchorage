@@ -17,8 +17,10 @@ import type { ToolExecutionContext } from '@mastra/core/tools';
 import {
   ACTOR_CONTEXT_KEY,
   type Actor,
-  APPROVED_CONNECTORS_CONTEXT_KEY,
   AuditLogger,
+  type ConnectorApprovalGrant as BreakwaterConnectorApprovalGrant,
+  CONNECTOR_EXECUTION_CONTEXT_KEY,
+  CONNECTOR_GRANTS_CONTEXT_KEY,
   createConnector,
   ISOLATION_SCOPE_CONTEXT_KEY,
   PRINCIPAL_KINDS,
@@ -28,7 +30,10 @@ import {
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
-import { BREAKWATER_ISOLATION_SCOPE_KEY } from '../do-runner/breakwater-keys.js';
+import {
+  BREAKWATER_CONNECTOR_EXECUTION_KEY,
+  BREAKWATER_ISOLATION_SCOPE_KEY,
+} from '../do-runner/breakwater-keys.js';
 import { init } from '../do-runner/init.js';
 import type {
   RunLeg,
@@ -39,14 +44,14 @@ import type { ApprovalActor, ApprovalAuditSink } from './contract.js';
 import {
   APPROVAL_ROLES,
   BREAKWATER_ACTOR_KEY,
-  BREAKWATER_APPROVED_CONNECTORS_KEY,
+  BREAKWATER_CONNECTOR_GRANTS_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
   DECIDER_ROLES,
   RUN_START_ROLES,
 } from './contract.js';
 import {
   approvalGrantProvider,
-  approvedConnectorsForLeg,
+  connectorGrantsForLeg,
   resumeViaRuntime,
 } from './grants.js';
 import {
@@ -58,6 +63,7 @@ import { createApprovalRouter } from './router.js';
 import { ApprovalService } from './service.js';
 import { InMemoryApprovalStore } from './store.js';
 import { createTenantResolver } from './tenant-context.js';
+import type { ConnectorApprovalGrant } from './types.js';
 
 const OPERATOR: ApprovalActor = {
   id: 'opal',
@@ -72,14 +78,6 @@ const REVIEWER: ApprovalActor = {
 // admin holds BOTH CAN_CREATE and CAN_REVIEW — the single principal the
 // create-route capability chain needed.
 const ADMIN: ApprovalActor = { id: 'ada', role: 'admin', tenantId: 'acme' };
-
-// LEGACY-fallback timing nudge: a step-keyed record created WITHOUT
-// suspendedAt mints only when decidedAt lands STRICTLY after the
-// suspension's timestamp, and these in-process tests can decide within the
-// same millisecond. Suites whose creates capture suspendedAt (the preferred
-// bridge behavior) bind by exact match and need no clock choreography.
-const settleClock = (): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, 5));
 
 // The bridge's capture: the summary's suspension timestamp for a step.
 // Accepts unknown because ResumeOutcome.summary is untyped wire data; the
@@ -123,10 +121,34 @@ function resumeCountFor(
 }
 
 describe('breakwater contract tripwires', () => {
-  it('mirrors the approved-connectors key literally', () => {
-    expect(BREAKWATER_APPROVED_CONNECTORS_KEY).toBe(
-      APPROVED_CONNECTORS_CONTEXT_KEY,
+  it('mirrors the structured connector-grants key literally', () => {
+    expect(BREAKWATER_CONNECTOR_GRANTS_KEY).toBe(CONNECTOR_GRANTS_CONTEXT_KEY);
+  });
+
+  it('mirrors the runtime execution-identity key literally', () => {
+    expect(BREAKWATER_CONNECTOR_EXECUTION_KEY).toBe(
+      CONNECTOR_EXECUTION_CONTEXT_KEY,
     );
+  });
+
+  it('keeps the structured grant types mutually assignable', () => {
+    const flowsafeGrant: ConnectorApprovalGrant = {
+      scope: 'tool-call',
+      connectorId: 'send-email',
+      workflowId: 'workflow-1',
+      runId: 'acme_run-1',
+      isolationScope: 'acme',
+      suspension: {
+        stepPath: ['agent-gate'],
+        suspendedAt: 1_000,
+        resumeCount: 2,
+      },
+      toolCallId: 'call-1',
+    };
+    const breakwaterGrant: BreakwaterConnectorApprovalGrant = flowsafeGrant;
+    const roundTrip: ConnectorApprovalGrant = breakwaterGrant;
+
+    expect(roundTrip).toBe(flowsafeGrant);
   });
 
   it('mirrors the actor key literally', () => {
@@ -501,18 +523,19 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
     const store = new InMemoryApprovalStore('acme');
     const { handle } = routerOver(store, { allowCreate: true });
 
-    // #when / #then — connectors IS the grant; stepPath + the binding pair
-    // select the leg it mints on (a step-keyed record with no suspendedAt
-    // would ride the legacy decidedAt-after fallback); requestedBy is what SoD
-    // compares. Rejecting connectors alone would be insufficient.
+    // #when / #then — connectors and scope select authority; stepPath,
+    // toolCallId, and the binding pair select identity; requestedBy drives SoD.
     for (const field of [
       'connectors',
+      'grantScope',
+      'toolCallId',
       'stepPath',
       'suspendedAt',
       'resumedAt',
       'resumeCount',
       'runScoped',
       'requestedBy',
+      'resumeTarget',
     ]) {
       const response = await handle(
         post({
@@ -575,7 +598,7 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
     ];
     for (const leg of legs) {
       expect(
-        await approvedConnectorsForLeg(store, 'launch', 'acme_run-poc', leg),
+        await connectorGrantsForLeg(store, 'launch', 'acme_run-poc', leg),
       ).toEqual([]);
     }
   });
@@ -598,14 +621,23 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
       updatedAt: decidedAt,
       decidedAt,
       runScoped: true,
+      grantScope: 'run',
     });
 
     // #when / #then
     expect(
-      await approvedConnectorsForLeg(store, 'launch', 'acme_run-ok', {
+      await connectorGrantsForLeg(store, 'launch', 'acme_run-ok', {
         kind: 'start',
       }),
-    ).toEqual(['release-deploy']);
+    ).toEqual([
+      {
+        scope: 'run',
+        connectorId: 'release-deploy',
+        workflowId: 'launch',
+        runId: 'acme_run-ok',
+        isolationScope: 'acme',
+      },
+    ]);
   });
 
   it('barrier 3: an APPROVED http-authored record carries no capability to mint', async () => {
@@ -651,14 +683,26 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
 
     // #when / #then — mints on its bound leg, and nowhere else
     expect(
-      await approvedConnectorsForLeg(store, 'launch', 'acme_run-ok', {
+      await connectorGrantsForLeg(store, 'launch', 'acme_run-ok', {
         kind: 'resume',
         step: ['approval'],
         suspendedAt,
       }),
-    ).toEqual(['release-deploy']);
+    ).toEqual([
+      {
+        scope: 'suspension',
+        connectorId: 'release-deploy',
+        workflowId: 'launch',
+        runId: 'acme_run-ok',
+        isolationScope: 'acme',
+        suspension: {
+          stepPath: ['approval'],
+          suspendedAt,
+        },
+      },
+    ]);
     expect(
-      await approvedConnectorsForLeg(store, 'launch', 'acme_run-ok', {
+      await connectorGrantsForLeg(store, 'launch', 'acme_run-ok', {
         kind: 'start',
       }),
     ).toEqual([]);
@@ -683,7 +727,9 @@ describe('approval queue end to end', () => {
 
     // #then — the write gate denies (no grant), the run fails, nothing published
     expect(resumed.status).toBe('failed');
-    expect(resumed.error).toContain('approval required and not granted');
+    expect(resumed.error).toContain(
+      'approval required and no matching structured grant was found',
+    );
     expect(harness.publishes()).toBe(0);
     expect(harness.connectorAudit.events()).toContainEqual(
       expect.objectContaining({
@@ -695,8 +741,7 @@ describe('approval queue end to end', () => {
 
   it('approve loop: decide() mints the grant the connector demands and the run completes', async () => {
     // #given — a suspended run with a queued approval carrying the connector
-    // id. Deliberately created WITHOUT suspendedAt: this pins the LEGACY
-    // decidedAt-after-suspension fallback (hence the settleClock below).
+    // id and the runtime-observed exact suspension identity
     const harness = buildHarness();
     const started = await harness.runtime.start('launch', {
       runId: `acme_${crypto.randomUUID()}`,
@@ -711,13 +756,13 @@ describe('approval queue end to end', () => {
         title: 'Publish launch post',
         payload: started.suspendPayload,
         connectors: ['blog-publisher'],
+        suspendedAt: suspendedAtFor(started, ['approval']),
       },
       OPERATOR,
     );
 
     // #when — the reviewer approves; decide() resumes via the runtime, whose
     // provider derives the grant from the now-approved record
-    await settleClock();
     const decided = await harness.service.decide(
       record.id,
       { decision: 'approve', comment: 'lgtm' },
@@ -753,12 +798,12 @@ describe('approval queue end to end', () => {
         stepPath: ['approval'],
         title: 'Publish launch post',
         connectors: ['blog-publisher'],
+        suspendedAt: suspendedAtFor(started, ['approval']),
       },
       OPERATOR,
     );
 
     // #when
-    await settleClock();
     const decided = await harness.service.decide(
       record.id,
       { decision: 'reject', comment: 'not yet' },
@@ -815,7 +860,9 @@ describe('approval queue end to end', () => {
     // #then — gateA's approval does not travel: the gateB leg mints nothing,
     // the connector denies, and the second publish never happens
     expect(forged.status).toBe('failed');
-    expect(forged.error).toContain('approval required and not granted');
+    expect(forged.error).toContain(
+      'approval required and no matching structured grant was found',
+    );
     expect(harness.publishes()).toBe(1);
   });
 
@@ -985,7 +1032,9 @@ describe('approval queue end to end', () => {
     // differing (they can collide in-process) or on decidedAt ordering (without
     // the pair binding, this fail-closed path relied on settleClock ordering).
     expect(forged.status).toBe('failed');
-    expect(forged.error).toContain('approval required and not granted');
+    expect(forged.error).toContain(
+      'approval required and no matching structured grant was found',
+    );
     expect(harness.publishes()).toBe(0);
   });
 
@@ -1017,6 +1066,7 @@ describe('approval queue end to end', () => {
         stepPath: ['gateFalsy'],
         title: 'Gate — round 1',
         connectors: ['blog-publisher'],
+        grantScope: 'suspension',
         priority: 'normal',
         status: 'approved',
         createdAt: decidedAt,
@@ -1050,7 +1100,9 @@ describe('approval queue end to end', () => {
       // collide, so the connector denies. On the superseded resumedAt binding
       // (undefined on both sides) this leaked and published.
       expect(forged.status).toBe('failed');
-      expect(forged.error).toContain('approval required and not granted');
+      expect(forged.error).toContain(
+        'approval required and no matching structured grant was found',
+      );
       expect(harness.publishes()).toBe(0);
     } finally {
       nowSpy.mockRestore();
@@ -1092,6 +1144,7 @@ describe('approval queue end to end', () => {
         stepPath: ['gate2xNoSchema'],
         title: 'Depth-2 approval',
         connectors: ['blog-publisher'],
+        grantScope: 'suspension',
         priority: 'normal',
         status: 'approved',
         createdAt: decidedAt,
@@ -1125,7 +1178,9 @@ describe('approval queue end to end', () => {
       // so the connector denies. On the old (suspendedAt, resumedAt) binding
       // both pairs were equal, so this leaked and published.
       expect(forged.status).toBe('failed');
-      expect(forged.error).toContain('approval required and not granted');
+      expect(forged.error).toContain(
+        'approval required and no matching structured grant was found',
+      );
       expect(harness.publishes()).toBe(0);
     } finally {
       nowSpy.mockRestore();

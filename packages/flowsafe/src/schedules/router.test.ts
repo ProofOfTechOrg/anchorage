@@ -336,7 +336,7 @@ describe('createScheduleRouter — create', () => {
     const { call, events } = harness(ctx('acme', 'operator'));
     const res = await call('POST', '/api/schedules', {
       ...WORKFLOW_CREATE,
-      requestContext: { 'breakwater.approvedConnectors': ['forged'] },
+      requestContext: { 'breakwater.connectorGrants': ['forged'] },
     });
     expect(res.status).toBe(400);
     expect(events).toContainEqual(

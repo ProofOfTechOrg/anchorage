@@ -90,7 +90,7 @@ Resume:
 1. The approval service or trusted recovery path reaches the same object.
 2. The FIFO lock reads the current snapshot and requires `suspended`.
 3. The resume ledger increments the selected step's ordinal.
-4. The runtime recomputes trusted request context, including workflow scope, tenant isolation scope, and approved connectors.
+4. The runtime recomputes trusted request context, including workflow scope, run ID, tenant isolation scope, current execution identity, and structured connector grants.
 5. Mastra resumes the selected step from D1.
 6. The new summary is persisted and broadcast.
 7. A new suspension is bridged to a new approval.

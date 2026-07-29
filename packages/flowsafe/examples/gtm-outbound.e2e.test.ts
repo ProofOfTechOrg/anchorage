@@ -279,7 +279,9 @@ describe('example: gtm-outbound runs end to end on real Anchorage seams', () => 
 
     // #then — the write gate denies (no grant); nothing sent
     expect(forged.status).toBe('failed');
-    expect(forged.error).toContain('approval required and not granted');
+    expect(forged.error).toContain(
+      'approval required and no matching structured grant was found',
+    );
     expect(harness.sends()).toBe(0);
     expect(harness.audit.events()).toContainEqual(
       expect.objectContaining({
