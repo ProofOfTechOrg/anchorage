@@ -375,19 +375,29 @@ function rowToRecord(row: ApprovalRow): ApprovalRecord {
     row.grant_scope === 'run'
   ) {
     record.grantScope = row.grant_scope;
-  } else if (row.grant_scope != null) {
+  } else if (row.grant_scope !== null && row.grant_scope !== undefined) {
     throw new Error(`approval '${row.id}' has invalid grant_scope`);
   }
-  if (row.tool_call_id != null) record.toolCallId = row.tool_call_id;
+  if (row.tool_call_id !== null && row.tool_call_id !== undefined) {
+    record.toolCallId = row.tool_call_id;
+  }
   if (row.step_path !== null)
     record.stepPath = JSON.parse(row.step_path) as string[];
-  // != null covers a pre-migration row read before the ALTER backfilled the
-  // column (undefined) as well as the stored NULL.
-  if (row.suspended_at != null) record.suspendedAt = row.suspended_at;
-  if (row.resumed_at != null) record.resumedAt = row.resumed_at;
-  if (row.resume_count != null) record.resumeCount = row.resume_count;
-  if (row.run_scoped != null) record.runScoped = row.run_scoped === 1;
-  if (row.resume_target != null) {
+  // The explicit null and undefined checks cover a pre-migration row read
+  // before the ALTER backfilled the column as well as the stored NULL.
+  if (row.suspended_at !== null && row.suspended_at !== undefined) {
+    record.suspendedAt = row.suspended_at;
+  }
+  if (row.resumed_at !== null && row.resumed_at !== undefined) {
+    record.resumedAt = row.resumed_at;
+  }
+  if (row.resume_count !== null && row.resume_count !== undefined) {
+    record.resumeCount = row.resume_count;
+  }
+  if (row.run_scoped !== null && row.run_scoped !== undefined) {
+    record.runScoped = row.run_scoped === 1;
+  }
+  if (row.resume_target !== null && row.resume_target !== undefined) {
     let target: unknown;
     try {
       target = JSON.parse(row.resume_target);

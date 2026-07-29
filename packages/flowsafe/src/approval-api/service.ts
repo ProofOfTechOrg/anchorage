@@ -263,14 +263,16 @@ export class ApprovalService {
     const now = this.#now();
     const slaSeconds = input.slaSeconds ?? this.#defaultSlaSeconds;
     const connectors = [...(input.connectors ?? [])];
-    const grantScope =
-      connectors.length === 0
-        ? undefined
-        : input.runScoped === true
-          ? ('run' as const)
-          : input.toolCallId !== undefined
-            ? ('tool-call' as const)
-            : ('suspension' as const);
+    let grantScope: ApprovalRecord['grantScope'];
+    if (connectors.length === 0) {
+      grantScope = undefined;
+    } else if (input.runScoped === true) {
+      grantScope = 'run';
+    } else if (input.toolCallId !== undefined) {
+      grantScope = 'tool-call';
+    } else {
+      grantScope = 'suspension';
+    }
     const record: ApprovalRecord = {
       id: crypto.randomUUID(),
       // The bound store re-stamps this from its own field either way; setting

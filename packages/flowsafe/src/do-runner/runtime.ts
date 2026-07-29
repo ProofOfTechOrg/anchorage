@@ -869,29 +869,30 @@ export class RunnerRuntime {
     if (tenantId !== undefined) {
       base[BREAKWATER_ISOLATION_SCOPE_KEY] = tenantId;
     }
-    base[BREAKWATER_CONNECTOR_EXECUTION_KEY] =
-      leg.kind === 'start'
-        ? {
-            kind: 'start',
-            workflowId,
-            runId,
-            ...(tenantId === undefined ? {} : { isolationScope: tenantId }),
-          }
-        : leg.step !== undefined && leg.suspendedAt !== undefined
-          ? {
-              kind: 'resume',
-              workflowId,
-              runId,
-              ...(tenantId === undefined ? {} : { isolationScope: tenantId }),
-              suspension: {
-                stepPath: [...leg.step],
-                suspendedAt: leg.suspendedAt,
-                ...(leg.resumeCount === undefined
-                  ? {}
-                  : { resumeCount: leg.resumeCount }),
-              },
-            }
-          : null;
+    if (leg.kind === 'start') {
+      base[BREAKWATER_CONNECTOR_EXECUTION_KEY] = {
+        kind: 'start',
+        workflowId,
+        runId,
+        ...(tenantId === undefined ? {} : { isolationScope: tenantId }),
+      };
+    } else if (leg.step !== undefined && leg.suspendedAt !== undefined) {
+      base[BREAKWATER_CONNECTOR_EXECUTION_KEY] = {
+        kind: 'resume',
+        workflowId,
+        runId,
+        ...(tenantId === undefined ? {} : { isolationScope: tenantId }),
+        suspension: {
+          stepPath: [...leg.step],
+          suspendedAt: leg.suspendedAt,
+          ...(leg.resumeCount === undefined
+            ? {}
+            : { resumeCount: leg.resumeCount }),
+        },
+      };
+    } else {
+      base[BREAKWATER_CONNECTOR_EXECUTION_KEY] = null;
+    }
     const values = this.#requestContextForRun
       ? await this.#requestContextForRun(workflowId, runId, leg)
       : undefined;
