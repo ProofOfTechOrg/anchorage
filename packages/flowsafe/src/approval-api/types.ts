@@ -62,7 +62,17 @@ export type ApprovalResumeTarget =
       agentId: string;
       threadId: string;
       resourceId: string;
-      principal: import('./contract.js').ApprovalActor;
+      /**
+       * The principal to RESTORE on resume — never the reviewer who approved.
+       * A human decision must not transfer the decider's authority into the
+       * resumed run, and an automated run must resume as the automation it
+       * started as. Persisted, so its shape is versioned by validation:
+       * `#validateResumeTarget` rejects the pre-principal `ApprovalActor` form
+       * rather than coercing it (a `schedule.fire` run stored `role:'operator'`,
+       * and reading that back as a human would grant exactly the authority
+       * this type exists to withhold).
+       */
+      principal: import('./principal.js').ExecutionPrincipal;
     };
 
 export interface ApprovalRecord {

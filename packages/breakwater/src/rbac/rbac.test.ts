@@ -6,7 +6,12 @@ import { RequestContext } from '@mastra/core/request-context';
 import { describe, expect, it } from 'vitest';
 
 import { AGENT_AUDIT_CONTEXT_KEY, AuditLogger } from '../audit/index.js';
-import { ACTOR_CONTEXT_KEY, type Actor, RBACMiddleware } from './index.js';
+import {
+  ACTOR_CONTEXT_KEY,
+  type Actor,
+  type PrincipalKind,
+  RBACMiddleware,
+} from './index.js';
 
 class Tripwire extends Error {}
 
@@ -216,6 +221,138 @@ describe('RBACMiddleware', () => {
     expect(() => new RBACMiddleware({ allowedRoles: [] })).toThrowError(
       /must not be empty/,
     );
+  });
+});
+
+describe('RBACMiddleware principal kinds', () => {
+  const SCHEDULER: Actor = {
+    id: 'flowsafe-system',
+    role: 'operator',
+    kind: 'system',
+  };
+
+  it('denies an automated principal when the caller never opted in', () => {
+    // #given — the pre-existing configuration shape: roles only.
+    const audit = new AuditLogger();
+    const rbac = new RBACMiddleware({
+      allowedRoles: ['operator', 'admin'],
+      audit,
+    });
+
+    // #when / #then — 'operator' is an allowed ROLE, so before principal kinds
+    // this scheduled principal executed with human authority.
+    expect(() =>
+      rbac.processInput(makeInputArgs({ contextValue: SCHEDULER })),
+    ).toThrowError(Tripwire);
+    expect(audit.events()[0]).toMatchObject({
+      decision: 'denied',
+      reason: "principal kind 'system' is not in allowed kinds [human]",
+    });
+  });
+
+  it('admits an automated principal only when its kind is named', () => {
+    // #given
+    const audit = new AuditLogger();
+    const rbac = new RBACMiddleware({
+      allowedRoles: ['operator'],
+      allowedPrincipalKinds: ['system'],
+      audit,
+    });
+    const args = makeInputArgs({ contextValue: SCHEDULER });
+
+    // #when
+    const result = rbac.processInput(args);
+
+    // #then
+    expect(result).toBe(args.messages);
+    expect(audit.events()[0]).toMatchObject({ decision: 'allowed' });
+  });
+
+  it('ignores the role allowlist for an automated principal', () => {
+    // #given — an automated principal carries a role only because Actor.role is
+    // required. Whatever the host projected must not decide the outcome.
+    const audit = new AuditLogger();
+    const rbac = new RBACMiddleware({
+      allowedRoles: ['admin'],
+      allowedPrincipalKinds: ['service'],
+      audit,
+    });
+    const args = makeInputArgs({
+      contextValue: { id: 'delivery', role: 'viewer', kind: 'service' },
+    });
+
+    // #when / #then — 'viewer' is not in allowedRoles, yet the kind is allowed.
+    expect(rbac.processInput(args)).toBe(args.messages);
+    expect(audit.events()[0]).toMatchObject({ decision: 'allowed' });
+  });
+
+  it('still enforces the role allowlist for humans when automation is enabled', () => {
+    // #given — opting in to automation must not widen the human path.
+    const audit = new AuditLogger();
+    const rbac = new RBACMiddleware({
+      allowedRoles: ['admin'],
+      allowedPrincipalKinds: ['human', 'system'],
+      audit,
+    });
+
+    // #when / #then
+    expect(() =>
+      rbac.processInput(makeInputArgs({ contextValue: OPERATOR })),
+    ).toThrowError(Tripwire);
+    expect(audit.events()[0]).toMatchObject({
+      decision: 'denied',
+      reason: "role 'operator' is not in allowed roles [admin]",
+    });
+  });
+
+  it('denies an unrecognized kind rather than defaulting it to human', () => {
+    // #given — a kind this build does not know must not fall through to the
+    // default every guarded agent already admits.
+    const audit = new AuditLogger();
+    const rbac = new RBACMiddleware({
+      allowedRoles: ['operator'],
+      allowedPrincipalKinds: ['human', 'system'],
+      audit,
+    });
+
+    // #when / #then — actorFromRequestContext resolves no actor at all.
+    expect(() =>
+      rbac.processInput(
+        makeInputArgs({
+          contextValue: { id: 'u', role: 'operator', kind: 'superuser' },
+        }),
+      ),
+    ).toThrowError(Tripwire);
+    expect(audit.events()[0]).toMatchObject({
+      decision: 'denied',
+      actor: null,
+      reason: "no actor in request context (key 'breakwater.actor')",
+    });
+  });
+
+  it('rejects an unknown or empty kind allowlist at construction', () => {
+    // #when / #then
+    expect(
+      () =>
+        new RBACMiddleware({
+          allowedRoles: ['admin'],
+          allowedPrincipalKinds: [],
+        }),
+    ).toThrowError(/must be a non-empty array/);
+    expect(
+      () =>
+        new RBACMiddleware({
+          allowedRoles: ['admin'],
+          allowedPrincipalKinds: ['root' as PrincipalKind],
+        }),
+    ).toThrowError(/unknown principal kind 'root'/);
+    expect(
+      () =>
+        new RBACMiddleware({
+          allowedRoles: ['admin'],
+          allowedPrincipalKinds: ['system', 'system'],
+        }),
+    ).toThrowError(/duplicate principal kind 'system'/);
   });
 });
 

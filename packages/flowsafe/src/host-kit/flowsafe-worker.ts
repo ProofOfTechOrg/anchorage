@@ -56,7 +56,7 @@ import {
 import {
   approvalStoreFactoryFor,
   buildHostApprovalService,
-  maintenanceActor,
+  maintenancePrincipal,
   reconcileApprovalsOnStatusDetached,
   runApprovalRetentionPurge,
   runSlaSweepMaintenance,
@@ -794,7 +794,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         const hubTopology = hub ? createHubTopology(hub) : undefined;
         return runSlaSweepMaintenance({
           store: approvalStoreFactoryFor(env.DB).system(),
-          systemActor: maintenanceActor(config.systemActorId),
+          systemPrincipal: maintenancePrincipal(config.systemActorId),
           queue: env.AUDIT_QUEUE,
           cron: controller.cron,
           notify: config.notify?.(env),

@@ -3,6 +3,7 @@
 import type { MastraCompositeStore } from '@mastra/core/storage';
 import type { GuardedAgentHandle } from '@proofoftech/breakwater/agent';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { ExecutionPrincipal } from '../approval-api/index.js';
 import type {
   InitResult,
   RequestContextProvider,
@@ -13,8 +14,10 @@ import { mintResourceId } from '../do-runner/index.js';
 import {
   type AgentThreadInstanceScope,
   type AgentThreadStateStorage,
+  type AutomatedEntryAuthorizer,
   createThreadAgentHost,
 } from './thread-host.js';
+import type { AgentAutomationRule } from './types.js';
 
 const mocked = vi.hoisted(() => ({
   stream: vi.fn(),
@@ -93,16 +96,27 @@ interface Harness {
   }): void;
 }
 
-function guarded(id = 'writer'): GuardedAgentHandle {
+function guarded(
+  id = 'writer',
+  automationKinds: readonly string[] = [],
+): GuardedAgentHandle {
   return {
     guarded: true,
     id,
     allowedRoles: ['operator'],
+    allowedPrincipalKinds: ['human', ...automationKinds],
     maxSteps: 1,
   } as unknown as GuardedAgentHandle;
 }
 
-function harness(agentIds: readonly string[] = ['writer']): Harness {
+function harness(
+  agentIds: readonly string[] = ['writer'],
+  options: {
+    principal?: ExecutionPrincipal;
+    allowedAutomation?: readonly AgentAutomationRule[];
+    authorizeAutomatedEntry?: AutomatedEntryAuthorizer;
+  } = {},
+): Harness {
   const state = new Map<string, unknown>();
   const stateStorage: AgentThreadStateStorage = {
     get: async <T>(key: string) => state.get(key) as T | undefined,
@@ -163,6 +177,12 @@ function harness(agentIds: readonly string[] = ['writer']): Harness {
     threadId: 'acme_thread',
     tenantId: 'acme',
     actor: { id: 'operator-1', role: 'operator', tenantId: 'acme' },
+    principal: options.principal ?? {
+      kind: 'human',
+      id: 'operator-1',
+      tenantId: 'acme',
+      role: 'operator',
+    },
     requestedBy: 'operator-1',
     init: {
       runtime,
@@ -173,6 +193,9 @@ function harness(agentIds: readonly string[] = ['writer']): Harness {
   const storageScopes: AgentThreadInstanceScope[] = [];
   const approvalScopes: AgentThreadInstanceScope[] = [];
   const host = createThreadAgentHost({
+    ...(options.authorizeAutomatedEntry
+      ? { authorizeAutomatedEntry: options.authorizeAutomatedEntry }
+      : {}),
     buildModules: (instanceScope) => {
       moduleScopes.push(instanceScope);
       return agentIds.map((agentId) => ({
@@ -181,8 +204,14 @@ function harness(agentIds: readonly string[] = ['writer']): Harness {
           title: agentId,
           description: 'Writes an approved record',
           allowedRoles: ['operator'],
+          ...(options.allowedAutomation
+            ? { allowedAutomation: options.allowedAutomation }
+            : {}),
         },
-        agent: guarded(agentId),
+        agent: guarded(
+          agentId,
+          (options.allowedAutomation ?? []).map((rule) => rule.kind),
+        ),
       }));
     },
     storage: (instanceScope) => {
@@ -193,8 +222,10 @@ function harness(agentIds: readonly string[] = ['writer']): Harness {
     approvalService: (instanceScope) => {
       approvalScopes.push(instanceScope);
       return {
+        // The bridge mints its bookkeeping principal against this binding.
+        tenantId: 'acme',
         list: async () => [],
-        create: async () => {
+        createAsPrincipal: async () => {
           throw new Error('unexpected approval creation');
         },
       } as unknown as import('../approval-api/index.js').ApprovalService;
@@ -301,6 +332,7 @@ describe('createThreadAgentHost', () => {
     expect(streamOptions.requestContext.get('breakwater.actor')).toEqual({
       id: 'operator-1',
       role: 'operator',
+      kind: 'human',
     });
   });
 
@@ -435,9 +467,9 @@ describe('createThreadAgentHost', () => {
       resourceId: RESOURCE_ID,
     });
     state.set('flowsafe:agent-run:v1:acme_run', {
-      version: 1,
+      version: 2,
       agentId: 'writer',
-      principal: scope.actor,
+      principal: scope.principal,
       originEntryPath: 'http.start',
     });
     await host.route(
@@ -458,9 +490,9 @@ describe('createThreadAgentHost', () => {
       resourceId: RESOURCE_ID,
     });
     state.set('flowsafe:agent-run:v1:acme_run', {
-      version: 1,
+      version: 2,
       agentId: 'writer',
-      principal: scope.actor,
+      principal: scope.principal,
       originEntryPath: 'http.start',
     });
     await host.route(
@@ -598,9 +630,9 @@ describe('createThreadAgentHost', () => {
       resourceId: RESOURCE_ID,
     });
     state.set('flowsafe:agent-run:v1:acme_run', {
-      version: 1,
+      version: 2,
       agentId: 'writer',
-      principal: scope.actor,
+      principal: scope.principal,
       originEntryPath: 'http.start',
     });
     const provider = host.requestContextForRun(async () => ({
@@ -659,9 +691,9 @@ describe('createThreadAgentHost', () => {
     setSummary({ runId: 'acme_run', status: 'suspended' });
     setSnapshot({ memory: false });
     state.set('flowsafe:agent-run:v1:acme_run', {
-      version: 1,
+      version: 2,
       agentId: 'writer',
-      principal: scope.actor,
+      principal: scope.principal,
       originEntryPath: 'schedule.fire',
     });
     mocked.resumeViaRuntime.mockResolvedValue({
@@ -819,5 +851,160 @@ describe('createThreadAgentHost', () => {
     expect(response?.status).toBe(200);
     await expect(response?.text()).resolves.toBe('');
     expect(mocked.observe).not.toHaveBeenCalled();
+  });
+});
+
+describe('createThreadAgentHost automated entry', () => {
+  const SCHEDULER: ExecutionPrincipal = {
+    kind: 'system',
+    id: 'flowsafe-scheduler',
+    tenantId: 'acme',
+    purpose: 'scheduled-agent-execution',
+  };
+  const DECLARED: readonly AgentAutomationRule[] = [
+    { kind: 'system', entryPaths: ['schedule.fire'] },
+  ];
+
+  function scheduledStart() {
+    return {
+      agentId: 'writer',
+      threadId: 'acme_thread',
+      resourceId: RESOURCE_ID,
+      runId: 'acme_scheduled',
+      prompt: 'scheduled',
+      entryPath: 'schedule.fire' as const,
+    };
+  }
+
+  function bind(state: Map<string, unknown>) {
+    state.set('flowsafe:agent-thread-binding:v1', {
+      version: 1,
+      agentId: 'writer',
+      resourceId: RESOURCE_ID,
+    });
+  }
+
+  it('denies a scheduled start when the agent declares no automation', async () => {
+    // #given — the agent's roles still include 'operator', which is exactly the
+    // role the schedule path used to fabricate to get in.
+    const { host, scope, state } = harness(['writer'], {
+      principal: SCHEDULER,
+    });
+    bind(state);
+
+    // #when / #then
+    await expect(host.start(scope, scheduledStart())).rejects.toMatchObject({
+      status: 403,
+    });
+    expect(mocked.stream).not.toHaveBeenCalled();
+  });
+
+  it('denies a declared automated kind arriving on an undeclared entry path', async () => {
+    // #given
+    const { host, scope, state } = harness(['writer'], {
+      principal: SCHEDULER,
+      allowedAutomation: DECLARED,
+    });
+    bind(state);
+
+    // #when / #then
+    await expect(
+      host.start(scope, { ...scheduledStart(), entryPath: 'signal.wake' }),
+    ).rejects.toMatchObject({ status: 403 });
+    expect(mocked.stream).not.toHaveBeenCalled();
+  });
+
+  it('runs a declared scheduled start and persists the SYSTEM principal', async () => {
+    // #given
+    const { host, scope, state } = harness(['writer'], {
+      principal: SCHEDULER,
+      allowedAutomation: DECLARED,
+    });
+    bind(state);
+    // Read the record DURING the run: this harness's runs complete terminally,
+    // and a terminal run deletes its own metadata on the way out.
+    let persisted: unknown;
+    mocked.stream.mockImplementation(async () => {
+      persisted = state.get('flowsafe:agent-run:v1:acme_scheduled');
+      return {};
+    });
+
+    // #when
+    await host.start(scope, scheduledStart());
+
+    // #then — the run is attributable to the scheduler, not to a human.
+    expect(mocked.stream).toHaveBeenCalledOnce();
+    expect(persisted).toMatchObject({
+      version: 2,
+      principal: SCHEDULER,
+      originEntryPath: 'schedule.fire',
+    });
+  });
+
+  it('projects the automated principal into breakwater as a non-human actor', async () => {
+    // #given
+    const { host, scope, state } = harness(['writer'], {
+      principal: SCHEDULER,
+      allowedAutomation: DECLARED,
+    });
+    bind(state);
+
+    // #when
+    await host.start(scope, scheduledStart());
+
+    // #then — kind is what breakwater's mandatory gate authorizes on, and the
+    // projected role is the least-privileged one, never 'operator'.
+    const options = mocked.stream.mock.calls[0]?.[1];
+    expect(options?.requestContext.get('breakwater.actor')).toEqual({
+      id: 'flowsafe-scheduler',
+      role: 'viewer',
+      kind: 'system',
+    });
+    expect(
+      options?.requestContext.get('breakwater.auditContext'),
+    ).toMatchObject({
+      entryPath: 'schedule.fire',
+      principalKind: 'system',
+      principalId: 'flowsafe-scheduler',
+      purpose: 'scheduled-agent-execution',
+    });
+  });
+
+  it('lets the host authorizer narrow, never widen, the declaration', async () => {
+    // #given — the authorizer says yes to everything.
+    const permissive = vi.fn(async () => true);
+    const undeclared = harness(['writer'], {
+      principal: SCHEDULER,
+      authorizeAutomatedEntry: permissive as AutomatedEntryAuthorizer,
+    });
+    bind(undeclared.state);
+
+    // #when / #then — still denied: the agent declared nothing.
+    await expect(
+      undeclared.host.start(undeclared.scope, scheduledStart()),
+    ).rejects.toMatchObject({ status: 403 });
+    expect(permissive).not.toHaveBeenCalled();
+
+    // #given — declared, but the host refuses this one.
+    const denying = vi.fn(async () => false);
+    const declared = harness(['writer'], {
+      principal: SCHEDULER,
+      allowedAutomation: DECLARED,
+      authorizeAutomatedEntry: denying as AutomatedEntryAuthorizer,
+    });
+    bind(declared.state);
+
+    // #when / #then
+    await expect(
+      declared.host.start(declared.scope, scheduledStart()),
+    ).rejects.toMatchObject({ status: 403 });
+    expect(denying).toHaveBeenCalledWith(
+      expect.objectContaining({
+        principal: SCHEDULER,
+        agentId: 'writer',
+        entryPath: 'schedule.fire',
+        tenantId: 'acme',
+      }),
+    );
   });
 });

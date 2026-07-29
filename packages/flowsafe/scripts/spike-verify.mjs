@@ -1706,6 +1706,59 @@ async function main() {
   );
 
   await step(
+    'O2 scheduled agent principal (D-S3): an unattended SYSTEM principal reaches ' +
+      'the guarded agent through the real Worker->DO hop, and arrives as automation',
+    async () => {
+      const { status, body } = await http('POST', '/sched/agent');
+      assert(status === 200, `sched agent probe -> ${status}`, body);
+      // The composition this proves: systemTenant mints kind:'system', the
+      // topology stamps x-flowsafe-principal, the DO rebuilds it as SYSTEM (not
+      // as a human), and the agent host admits it because SPIKE_AGENT_META
+      // declares system+schedule.fire. Before the principal header was stamped
+      // this failed 403 with the whole feature unreachable, and no unit test
+      // noticed because they all build the ThreadScope in-process.
+      assert(
+        body.result?.fired === 1,
+        'the agent target fired under an automated principal',
+        body,
+      );
+      assert(body.result?.failed === 0, 'no schedule fire was refused', body);
+      assert(
+        typeof body.runId === 'string' && body.runId.startsWith('spike_'),
+        'the fired agent runId is INV-1 (<tenantId>_<uuid>)',
+        body,
+      );
+    },
+  );
+
+  await step(
+    'O3 automated entry DENIED (D-S4): the same SYSTEM principal on an entry ' +
+      'path the agent never declared is refused at the host, through the real hop',
+    async () => {
+      // The deny direction. Without this the gate is only ever proven to admit,
+      // which is how an unreachable gate looked healthy for a whole branch.
+      const { status, body } = await http(
+        'POST',
+        '/sched/agent?entryPath=signal.wake',
+      );
+      assert(status === 200, `sched agent deny probe -> ${status}`, body);
+      assert(
+        body.result?.fired === 0 && body.result?.failed === 1,
+        'the undeclared entry path did NOT fire',
+        body,
+      );
+      // Generic to the caller on purpose: the entry path and principal kind go
+      // to the audit sink, not into a response that a client can probe policy
+      // with.
+      assert(
+        body.error === 'forbidden',
+        'the refusal is a generic 403, leaking no policy detail',
+        body,
+      );
+    },
+  );
+
+  await step(
     'O schedule barrier + INV-1 (D-S2): a workflow schedule fires through ' +
       'RunnerRuntime with a fresh INV-1 runId and the stored-context barrier holds',
     async () => {

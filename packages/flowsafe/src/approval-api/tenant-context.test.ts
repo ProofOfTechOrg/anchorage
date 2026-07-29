@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it, vi } from 'vitest';
-import {
-  THREAD_ACTOR_HEADER,
-  THREAD_ACTOR_ROLE_HEADER,
-  THREAD_TENANT_HEADER,
-} from '../do-runner/thread-header.js';
+import { THREAD_TENANT_HEADER } from '../do-runner/thread-header.js';
 import type {
   CreateTenantResolverOptions,
   TenantContext,
@@ -151,8 +147,8 @@ describe('createTenantResolver authenticated actor validation', () => {
 describe('createTenantResolver server-stamped header boundary', () => {
   it.each([
     THREAD_TENANT_HEADER,
-    THREAD_ACTOR_HEADER,
-    THREAD_ACTOR_ROLE_HEADER,
+    'x-flowsafe-actor',
+    'x-flowsafe-role',
   ])('refuses a mixed-case inbound %s header before authentication', async (header) => {
     const authenticate = vi.fn(() => ({
       id: 'actor-1',

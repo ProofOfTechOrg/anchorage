@@ -70,6 +70,12 @@ function tenant() {
   let threadMints = 0;
   const value: TenantContext = {
     actor: { id: 'operator-1', role: 'operator', tenantId: 'acme' },
+    principal: {
+      kind: 'human',
+      id: 'operator-1',
+      tenantId: 'acme',
+      role: 'operator',
+    },
     tenantId: 'acme',
     service: () => {
       throw new Error('unused');
@@ -89,7 +95,7 @@ function tenant() {
 }
 
 describe('createAgentThreadTopology', () => {
-  it('mints each HTTP start identity exactly once and stamps the full actor', async () => {
+  it('mints each HTTP start identity exactly once and stamps the principal', async () => {
     const { topology, hits } = harness();
     const scoped = tenant();
     const result = await topology.start(scoped.value, {
@@ -101,9 +107,11 @@ describe('createAgentThreadTopology', () => {
     expect(scoped.runMints()).toBe(1);
     expect(scoped.threadMints()).toBe(1);
     expect(hits[0]?.init?.headers).toMatchObject({
-      'x-flowsafe-actor': 'operator-1',
-      'x-flowsafe-role': 'operator',
       'x-flowsafe-tenant': 'acme',
+      // The principal is the sole identity channel; the DO projects the actor
+      // from it rather than trusting a second header.
+      'x-flowsafe-principal':
+        '{"kind":"human","id":"operator-1","role":"operator"}',
     });
   });
 

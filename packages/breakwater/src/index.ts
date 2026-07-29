@@ -131,12 +131,16 @@ export {
 } from './policy-engine/index.js';
 export type {
   Actor,
+  PrincipalKind,
   RBACMiddlewareOptions,
   Role,
 } from './rbac/index.js';
 export {
   ACTOR_CONTEXT_KEY,
   actorFromRequestContext,
+  DEFAULT_ALLOWED_PRINCIPAL_KINDS,
+  PRINCIPAL_KINDS,
+  principalKindOf,
   RBACMiddleware,
   ROLES,
 } from './rbac/index.js';

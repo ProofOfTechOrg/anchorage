@@ -12,6 +12,7 @@ import {
 import {
   ApprovalService,
   approvalGrantProvider,
+  principalActor,
 } from '@proofoftech/flowsafe/approval-api';
 import {
   BackgroundTaskHost,
@@ -173,9 +174,10 @@ export class StarterThread extends ThreadDurableObject<Env> {
     startIdleRun: async (input) => {
       const scope: ThreadScope = {
         threadId: input.threadId,
-        tenantId: input.actor.tenantId,
-        actor: input.actor,
-        requestedBy: input.actor.id,
+        tenantId: input.principal.tenantId,
+        actor: principalActor(input.principal),
+        principal: input.principal,
+        requestedBy: input.principal.id,
         init: this.#initResult(),
       };
       const result = await this.#host().start(scope, {

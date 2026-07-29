@@ -15,6 +15,11 @@ import type { RequestContext } from '@mastra/core/request-context';
 
 import type { AuditLogger } from '../audit/index.js';
 import { authorizeActor } from './authorize.js';
+import {
+  assertPrincipalKinds,
+  PRINCIPAL_KINDS,
+  type PrincipalKind,
+} from './principal.js';
 
 /** Role labels accepted by the built-in actor contract. */
 export type Role = 'admin' | 'builder' | 'operator' | 'reviewer' | 'viewer';
@@ -28,12 +33,27 @@ export const ROLES: readonly Role[] = [
   'viewer',
 ];
 
+// Re-exported for hosts; `assertPrincipalKinds` stays internal to the package.
+export type { PrincipalKind } from './principal.js';
+export {
+  DEFAULT_ALLOWED_PRINCIPAL_KINDS,
+  PRINCIPAL_KINDS,
+  principalKindOf,
+} from './principal.js';
+
 /** Authenticated identity evaluated by RBAC and attached to audit events. */
 export interface Actor {
   /** Stable actor identifier from the host authentication system. */
   id: string;
-  /** Role used by the middleware's exact allowlist. */
+  /**
+   * Role used by the middleware's exact allowlist. Meaningful only for the
+   * 'human' kind; for automated kinds the role allowlist is not consulted at
+   * all and hosts should project the least-privileged label. See
+   * `authorizeActor`.
+   */
   role: Role;
+  /** Absent means 'human', so an existing host keeps its exact behavior. */
+  kind?: PrincipalKind;
 }
 
 export type {
@@ -64,15 +84,34 @@ export function actorFromRequestContext(
   ) {
     return undefined;
   }
+  // An unrecognized kind resolves to no actor rather than to a human: a value
+  // this build does not understand must never fall through to the default that
+  // every guarded agent already admits.
+  if (
+    candidate.kind !== undefined &&
+    !(PRINCIPAL_KINDS as readonly unknown[]).includes(candidate.kind)
+  ) {
+    return undefined;
+  }
   return (ROLES as readonly string[]).includes(candidate.role)
-    ? { id: candidate.id, role: candidate.role }
+    ? {
+        id: candidate.id,
+        role: candidate.role,
+        ...(candidate.kind !== undefined ? { kind: candidate.kind } : {}),
+      }
     : undefined;
 }
 
 /** Configuration for `RBACMiddleware`. */
 export interface RBACMiddlewareOptions {
-  /** Exact roles authorized to call the agent. */
+  /** Exact roles authorized to call the agent. Consulted for humans only. */
   allowedRoles: readonly Role[];
+  /**
+   * Exact principal kinds authorized to call the agent. Defaults to
+   * `['human']`, so an existing configuration denies every automated principal
+   * without changing a line — the caller must name the automation it wants.
+   */
+  allowedPrincipalKinds?: readonly PrincipalKind[];
   /** Optional audit logger for authorization decisions and lookup failures. */
   audit?: AuditLogger;
   /** Audit resource. Defaults to the stable processor identifier. */
@@ -86,6 +125,7 @@ export class RBACMiddleware implements Processor<'breakwater-rbac'> {
   /** Stable Mastra processor identifier. */
   readonly id = 'breakwater-rbac' as const;
   readonly #allowedRoles: readonly Role[];
+  readonly #allowedPrincipalKinds: readonly PrincipalKind[];
   readonly #audit?: AuditLogger;
   readonly #getActor: (args: ProcessInputArgs) => Actor | undefined;
   readonly #resource: string;
@@ -95,6 +135,10 @@ export class RBACMiddleware implements Processor<'breakwater-rbac'> {
       throw new Error('RBACMiddleware: allowedRoles must not be empty');
     }
     this.#allowedRoles = options.allowedRoles;
+    this.#allowedPrincipalKinds = assertPrincipalKinds(
+      options.allowedPrincipalKinds,
+      'RBACMiddleware',
+    );
     this.#audit = options.audit;
     this.#resource = options.resource ?? this.id;
     this.#getActor =
@@ -105,6 +149,7 @@ export class RBACMiddleware implements Processor<'breakwater-rbac'> {
   processInput(args: ProcessInputArgs): ProcessInputResult {
     authorizeActor({
       allowedRoles: this.#allowedRoles,
+      allowedPrincipalKinds: this.#allowedPrincipalKinds,
       audit: this.#audit,
       resource: this.#resource,
       requestContext: args.requestContext,

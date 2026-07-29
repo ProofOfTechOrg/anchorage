@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it, vi } from 'vitest';
-import type {
-  ApprovalActor,
-  ApprovalRecord,
-  TenantContext,
-} from '../approval-api/index.js';
 
+import {
+  type ApprovalRecord,
+  type ExecutionPrincipal,
+  principalActor,
+  type TenantContext,
+} from '../approval-api/index.js';
 import { createAgentApprovalResumer } from './approval-resumer.js';
 import type { AgentThreadTopology } from './thread-topology.js';
 
-const principal: ApprovalActor = {
+const principal: ExecutionPrincipal = {
+  kind: 'human',
   id: 'operator-1',
-  role: 'operator',
   tenantId: 'acme',
+  role: 'operator',
 };
 
 function record(overrides: Partial<ApprovalRecord> = {}): ApprovalRecord {
@@ -39,10 +41,12 @@ function record(overrides: Partial<ApprovalRecord> = {}): ApprovalRecord {
   };
 }
 
-function tenantFor(actor: ApprovalActor): TenantContext {
+function tenantFor(principal: ExecutionPrincipal): TenantContext {
+  const actor = principalActor(principal);
   return {
     actor,
-    tenantId: actor.tenantId,
+    principal,
+    tenantId: principal.tenantId,
     service: () => {
       throw new Error('unused');
     },
@@ -82,7 +86,7 @@ const agents = [
 describe('createAgentApprovalResumer', () => {
   it('restores the original principal, not the reviewer', async () => {
     const agentTopology = topology();
-    const tenantForActor = vi.fn(async (actor: ApprovalActor) =>
+    const tenantForPrincipal = vi.fn(async (actor: ExecutionPrincipal) =>
       tenantFor(actor),
     );
     const fallback = vi.fn();
@@ -90,14 +94,17 @@ describe('createAgentApprovalResumer', () => {
       fallback,
       agents,
       topology: agentTopology,
-      tenantForActor,
+      tenantForPrincipal,
     });
     await expect(resume(record(), 'approve')).resolves.toMatchObject({
       status: 'success',
     });
-    expect(tenantForActor).toHaveBeenCalledWith(principal, expect.anything());
+    expect(tenantForPrincipal).toHaveBeenCalledWith(
+      principal,
+      expect.anything(),
+    );
     expect(agentTopology.resume).toHaveBeenCalledWith(
-      expect.objectContaining({ actor: principal }),
+      expect.objectContaining({ principal }),
       expect.objectContaining({ runId: 'acme_run' }),
       'approve',
     );
@@ -113,7 +120,7 @@ describe('createAgentApprovalResumer', () => {
       fallback,
       agents,
       topology: topology(),
-      tenantForActor: async (actor) => tenantFor(actor),
+      tenantForPrincipal: async (principal) => tenantFor(principal),
     });
     await expect(
       resume(
@@ -133,7 +140,7 @@ describe('createAgentApprovalResumer', () => {
       fallback: vi.fn(),
       agents,
       topology: topology(),
-      tenantForActor: async (actor) => tenantFor(actor),
+      tenantForPrincipal: async (principal) => tenantFor(principal),
     });
     await expect(
       legacy(
@@ -155,7 +162,7 @@ describe('createAgentApprovalResumer', () => {
         },
       ],
       topology: topology(),
-      tenantForActor: async (actor) => tenantFor(actor),
+      tenantForPrincipal: async (principal) => tenantFor(principal),
     });
     await expect(restricted(record(), 'approve')).rejects.toThrow(
       'may no longer resume',
@@ -167,7 +174,7 @@ describe('createAgentApprovalResumer', () => {
       fallback: vi.fn(),
       agents,
       topology: topology(),
-      tenantForActor: async () =>
+      tenantForPrincipal: async () =>
         tenantFor({ ...principal, id: 'reviewer-1', role: 'reviewer' }),
     });
     await expect(resume(record(), 'approve')).rejects.toThrow(

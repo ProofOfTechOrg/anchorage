@@ -114,7 +114,6 @@ export {
 export type { ThreadScope } from './thread-do.js';
 export { ThreadDurableObject, ThreadIdentityError } from './thread-do.js';
 export {
-  THREAD_ACTOR_HEADER,
-  THREAD_ACTOR_ROLE_HEADER,
+  THREAD_PRINCIPAL_HEADER,
   THREAD_TENANT_HEADER,
 } from './thread-header.js';

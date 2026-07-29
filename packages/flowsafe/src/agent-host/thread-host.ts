@@ -20,11 +20,14 @@ import {
   writeAgentRunRecord,
 } from '../agent-runner/index.js';
 import {
-  type ApprovalActor,
   type ApprovalAuditSink,
   type ApprovalRecord,
   type ApprovalService,
+  type ExecutionPrincipal,
+  principalActor,
+  principalAuditFields,
   RUN_START_ROLES,
+  samePrincipal,
 } from '../approval-api/index.js';
 import {
   DoStatusError,
@@ -62,7 +65,31 @@ export interface AgentThreadInstanceScope {
   readonly init: ThreadScope['init'];
 }
 
+/** What the host is asked to authorize. Never a human — those go by role. */
+export interface AutomatedEntryRequest {
+  principal: Extract<
+    ExecutionPrincipal,
+    { kind: 'service' | 'agent' | 'system' }
+  >;
+  agentId: string;
+  entryPath: AgentEntryPath;
+  tenantId: string;
+  threadId: string;
+}
+
+/**
+ * Optional host policy over automated entry, AND-composed with the agent's own
+ * `allowedAutomation`. It can only DENY: returning true where the agent did not
+ * declare the entry changes nothing, so a host cannot widen automation from its
+ * wiring. Absent means "no additional restriction", not "allow".
+ */
+export type AutomatedEntryAuthorizer = (
+  request: AutomatedEntryRequest,
+) => boolean | Promise<boolean>;
+
 export interface ThreadAgentHostOptions {
+  /** Narrows automated entry beyond what each agent's metadata declares. */
+  authorizeAutomatedEntry?: AutomatedEntryAuthorizer;
   buildModules:
     | ((scope: AgentThreadInstanceScope) => readonly AgentModule[])
     | ((scope: AgentThreadInstanceScope) => Promise<readonly AgentModule[]>);
@@ -153,14 +180,6 @@ async function objectBody(request: Request): Promise<Record<string, unknown>> {
     throw new AgentHostRequestError(400, 'a JSON object body is required');
   }
   return value as Record<string, unknown>;
-}
-
-function sameActor(left: ApprovalActor, right: ApprovalActor): boolean {
-  return (
-    left.id === right.id &&
-    left.role === right.role &&
-    left.tenantId === right.tenantId
-  );
 }
 
 const TERMINAL_RUN_STATUSES: readonly RunSummary['status'][] = [
@@ -383,31 +402,63 @@ export function createThreadAgentHost(
     return runtime;
   };
 
+  /**
+   * The one entry gate, split by principal kind because the two kinds are
+   * authorized by different things and must not fall through to each other.
+   *
+   * A human passes the route-level start roles intersected with the agent's own
+   * allowedRoles, exactly as before. An automated principal never consults
+   * roles at all: it must be declared in the agent's `allowedAutomation` for
+   * this precise entry path, AND survive the host's optional authorizer. Absent
+   * declaration denies — which is why a scheduled start of an agent that has
+   * not opted in fails here rather than executing as a synthetic operator.
+   */
   const authorize = async (
     scope: ThreadScope,
     agentId: string,
-    entry: string,
+    entry: AgentEntryPath,
+    principal: ExecutionPrincipal,
   ) => {
     const current = await runtimeFor(scope);
     const module = current.catalog.get(agentId);
-    const allowed = current.catalog.allowedRoles(agentId);
-    const granted =
-      module !== undefined &&
-      RUN_START_ROLES.includes(scope.actor.role) &&
-      allowed?.includes(scope.actor.role) === true;
+    let reason: string | undefined;
+    let granted = false;
+    if (module === undefined) {
+      reason = 'agent is not registered';
+    } else if (principal.kind === 'human') {
+      const allowed = current.catalog.allowedRoles(agentId);
+      granted =
+        RUN_START_ROLES.includes(principal.role) &&
+        allowed?.includes(principal.role) === true;
+      if (!granted) reason = 'role is not allowed to mutate this agent';
+    } else if (!current.catalog.automationAllowed(agentId, principal, entry)) {
+      reason = `agent does not accept '${principal.kind}' principals on entry path '${entry}'`;
+    } else {
+      // AND-composed: the injected authorizer can only narrow what the agent
+      // already declared. A host cannot widen automation from wiring.
+      const hostAllows =
+        (await options.authorizeAutomatedEntry?.({
+          principal,
+          agentId,
+          entryPath: entry,
+          tenantId: scope.tenantId,
+          threadId: scope.threadId,
+        })) ?? true;
+      granted = hostAllows;
+      if (!granted) reason = 'host denied this automated entry';
+    }
     audit(options.audit, {
-      actor: scope.actor,
+      actor: principalActor(principal),
       action: 'agent.entry.authorize',
       resource: `agent:${agentId}`,
       decision: granted ? 'allowed' : 'denied',
-      ...(!granted
-        ? { reason: 'role is not allowed to mutate this agent' }
-        : {}),
+      ...(reason !== undefined ? { reason } : {}),
       detail: {
         agentId,
         tenantId: scope.tenantId,
         threadId: scope.threadId,
         entryPath: entry,
+        ...principalAuditFields(principal),
       },
     });
     if (!module) throw new AgentHostRequestError(404, 'agent not found');
@@ -439,16 +490,32 @@ export function createThreadAgentHost(
     }
   };
 
-  const systemActor = (scope: ThreadScope): ApprovalActor => ({
-    id: options.systemActorId ?? 'flowsafe-system',
-    role: 'operator',
+  // Reconciling approvals is trusted platform work with no person behind it.
+  // It used to mint role:'operator', which is why an approval bridge looked
+  // indistinguishable from a human operator in the audit trail. The bridge
+  // mints its own principal from this id against the service's tenant.
+  const systemActorId = options.systemActorId ?? 'flowsafe-system';
+  // Deliberately NOT vouched. Its only consumer projects it to an ApprovalActor
+  // for a role-gated READ, which grants nothing an automated principal does not
+  // already have — so calling the trust assertion here would assert trust that
+  // nothing consumes, and `trustAutomationPrincipal` has to stay greppable as
+  // "this is where authority is conferred" to be worth anything.
+  //
+  // `purpose` is likewise inert here: principalActor drops it, and a successful
+  // list() emits no audit event, so this string reaches nothing. It is not
+  // shared with the bridge's RECONCILE_PURPOSE for that reason — there is no
+  // provenance here to drift.
+  const systemPrincipal = (scope: ThreadScope): ExecutionPrincipal => ({
+    kind: 'system',
+    id: systemActorId,
     tenantId: scope.tenantId,
+    purpose: 'approval-suspension-reconcile',
   });
 
   const currentApprovals = async (
     scope: ThreadScope,
     summary: RunSummary,
-    principal: ApprovalActor,
+    principal: ExecutionPrincipal,
     agentId: string,
     resourceId: string,
   ): Promise<ApprovalRecord[]> => {
@@ -458,7 +525,7 @@ export function createThreadAgentHost(
       service,
       DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
       summary,
-      systemActor(scope),
+      systemActorId,
       {
         kind: 'agent-thread',
         agentId,
@@ -473,7 +540,7 @@ export function createThreadAgentHost(
         workflowId: DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
         runId: summary.runId,
       },
-      systemActor(scope),
+      principalActor(systemPrincipal(scope)),
     );
     const keys = new Set(
       (summary.suspended ?? []).map((path) => path.join('.')),
@@ -496,7 +563,7 @@ export function createThreadAgentHost(
       resourceId: string;
       runId: string;
     },
-    principal: ApprovalActor,
+    principal: ExecutionPrincipal,
     summary: RunSummary,
   ): Promise<AgentRunEnvelope> => {
     const base: AgentRunEnvelope = {
@@ -615,7 +682,12 @@ export function createThreadAgentHost(
         'suspended agent run has no recoverable execution principal',
       );
     }
-    const principal = stored?.principal ?? scope.actor;
+    // Inert today — a suspended run without a stored record already threw 409
+    // above, and only a suspended run consults this. Kept as the scope's
+    // PRINCIPAL rather than its actor so that if those two conditions are ever
+    // decoupled, the fallback still cannot relabel an automated run as whoever
+    // happened to poll its status.
+    const principal = stored?.principal ?? scope.principal;
     const result = await envelopeFor(scope, ref, principal, summary);
     if (isTerminalRunStatus(summary.status) && stored) {
       await deleteAgentRunRecord(options.stateStorage(), ref.runId);
@@ -656,13 +728,18 @@ export function createThreadAgentHost(
         throw new AgentHostRequestError(400, 'agent input is required');
       }
       const entry = entryPath(input.entryPath);
-      const { current, module } = await authorize(scope, ref.agentId, entry);
+      const { current, module } = await authorize(
+        scope,
+        ref.agentId,
+        entry,
+        scope.principal,
+      );
       if (ref.resourceId !== mintResourceId(scope.tenantId, scope.threadId)) {
         throw new AgentHostRequestError(404, 'run not found');
       }
       const execution: TrustedAgentExecution = {
         agentId: ref.agentId,
-        actor: scope.actor,
+        principal: scope.principal,
         threadId: scope.threadId,
         resourceId: ref.resourceId,
         runId: ref.runId,
@@ -711,9 +788,9 @@ export function createThreadAgentHost(
           });
         }
         const stored: AgentRunRecord = {
-          version: 1,
+          version: 2,
           agentId: ref.agentId,
-          principal: scope.actor,
+          principal: scope.principal,
           originEntryPath: entry,
         };
         await writeAgentRunRecord(options.stateStorage(), ref.runId, stored);
@@ -737,7 +814,12 @@ export function createThreadAgentHost(
             ref.runId,
           );
           if (!summary) throw new Error('agent run did not persist a summary');
-          const result = await envelopeFor(scope, ref, scope.actor, summary);
+          const result = await envelopeFor(
+            scope,
+            ref,
+            scope.principal,
+            summary,
+          );
           if (isTerminalRunStatus(result.summary.status)) {
             await deleteAgentRunRecord(options.stateStorage(), ref.runId);
           }
@@ -774,6 +856,7 @@ export function createThreadAgentHost(
         scope,
         binding.agentId,
         entryPath(input.entryPath),
+        scope.principal,
       );
       const durableAgent = current.agents.get(binding.agentId);
       if (!durableAgent) throw new Error('guarded agent was not registered');
@@ -819,7 +902,7 @@ export function createThreadAgentHost(
         if (
           !stored ||
           stored.agentId !== ref.agentId ||
-          !sameActor(stored.principal, scope.actor)
+          !samePrincipal(stored.principal, scope.principal)
         ) {
           throw new AgentHostRequestError(404, 'run not found');
         }
@@ -827,6 +910,7 @@ export function createThreadAgentHost(
           scope,
           ref.agentId,
           entryPath(body.entryPath),
+          stored.principal,
         );
         const durable = current.agents.get(module.meta.id);
         if (!durable) throw new Error('guarded agent was not registered');
@@ -838,7 +922,7 @@ export function createThreadAgentHost(
             : undefined;
         const execution: TrustedAgentExecution = {
           agentId: ref.agentId,
-          actor: stored.principal,
+          principal: stored.principal,
           threadId: scope.threadId,
           resourceId: ref.resourceId,
           runId: ref.runId,

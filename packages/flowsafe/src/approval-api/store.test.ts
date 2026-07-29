@@ -181,9 +181,10 @@ function describeStoreContract(
           threadId: 'acme_thread-agent',
           resourceId: 'acme_resource-agent',
           principal: {
+            kind: 'human',
             id: 'requester-1',
-            role: 'operator',
             tenantId: 'acme',
+            role: 'operator',
           },
         },
       });
@@ -1111,6 +1112,32 @@ describeStoreContract(
 describe('D1ApprovalStore persisted resume-target validation', () => {
   it.each([
     ['malformed JSON', '{'],
+    [
+      // Exactly what the previous release persisted for an agent run. Reading
+      // it as a human would resurrect the fabricated operator this removes.
+      'pre-principal ApprovalActor shape',
+      JSON.stringify({
+        kind: 'agent-thread',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+        principal: {
+          id: 'flowsafe-system',
+          role: 'operator',
+          tenantId: 'acme',
+        },
+      }),
+    ],
+    [
+      'automated principal with no purpose',
+      JSON.stringify({
+        kind: 'agent-thread',
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        resourceId: 'acme_resource',
+        principal: { kind: 'system', id: 'sched', tenantId: 'acme' },
+      }),
+    ],
     [
       'path-unsafe agent id',
       JSON.stringify({

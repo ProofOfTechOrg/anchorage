@@ -39,6 +39,33 @@ export {
   defaultResumeData,
   resumeViaRuntime,
 } from './grants.js';
+export type {
+  AutomatedExecutionPrincipal,
+  AutomatedPrincipalKind,
+  ExecutionPrincipal,
+  ExecutionPrincipalKind,
+  TrustedAutomationPrincipal,
+} from './principal.js';
+export {
+  AUTOMATED_PRINCIPAL_KINDS,
+  AUTOMATED_PROJECTED_ROLE,
+  assertExecutionPrincipal,
+  breakwaterActorFor,
+  decodeExecutionPrincipal,
+  EXECUTION_PRINCIPAL_KINDS,
+  encodeExecutionPrincipal,
+  humanPrincipal,
+  isExecutionPrincipal,
+  principalActor,
+  principalAuditFields,
+  samePrincipal,
+  // TRUSTED_AUTOMATION is deliberately NOT re-exported: `trustAutomationPrincipal`
+  // is the sanctioned constructor and covers every legitimate case, so naming the
+  // raw symbol here would only widen the public surface with plumbing. This is
+  // API hygiene, not a capability boundary — the brand stays recoverable by
+  // reflection from any vouched principal, and the threat model says so.
+  trustAutomationPrincipal,
+} from './principal.js';
 export type { PurgeExpiredApprovalsOptions } from './retention.js';
 export { purgeExpiredApprovals } from './retention.js';
 export type { ApprovalRouter, ApprovalRouterOptions } from './router.js';

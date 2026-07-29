@@ -44,9 +44,20 @@ try {
     readFileSync(join(packageDirectory, 'package.json'), 'utf8'),
   );
   assert.equal(manifest.exports['./agent-host'], './dist/agent-host/index.js');
+  // Compared against the SOURCE manifest, not a copy of its value: this script
+  // is a CI-only step, so a hardcoded range silently goes stale the moment the
+  // peer floor moves and only fails after the change is pushed.
+  const sourceManifest = JSON.parse(
+    readFileSync(join(packageRoot, 'package.json'), 'utf8'),
+  );
   assert.equal(
     manifest.peerDependencies['@proofoftech/breakwater'],
-    '>=0.6.0 <1.0.0',
+    sourceManifest.peerDependencies['@proofoftech/breakwater'],
+  );
+  assert.match(
+    manifest.peerDependencies['@proofoftech/breakwater'],
+    /^>=\d+\.\d+\.\d+ <1\.0\.0$/,
+    'the packed peer range must stay a bounded 0.x floor',
   );
   readFileSync(join(packageDirectory, 'dist/agent-host/index.js'), 'utf8');
   readFileSync(join(packageDirectory, 'dist/agent-host/index.d.ts'), 'utf8');
@@ -83,21 +94,36 @@ try {
   createAgentThreadTopology,
   createThreadAgentHost,
   createAgentApprovalResumer,
+  type AgentAutomationRule,
   type AgentMeta,
   type AgentRunEnvelope,
+  type AutomatedEntryAuthorizer,
+  type AutomatedEntryRequest,
+  type AutomationCheck,
 } from '@proofoftech/flowsafe/agent-host';
 
+const automation: AgentAutomationRule = {
+  kind: 'system',
+  entryPaths: ['schedule.fire'],
+};
 const meta: AgentMeta = {
   id: 'writer',
   title: 'Writer',
   description: 'Writes an approved record',
+  allowedAutomation: [automation],
 };
+const automationCheck: AutomationCheck = () => true;
+const authorizeAutomatedEntry: AutomatedEntryAuthorizer = (
+  request: AutomatedEntryRequest,
+) => request.agentId === meta.id;
 const envelope = null as AgentRunEnvelope | null;
 void createAgentCatalog([meta]);
 void createAgentRouter;
 void createAgentThreadTopology;
 void createThreadAgentHost;
 void createAgentApprovalResumer;
+void automationCheck;
+void authorizeAutomatedEntry;
 void envelope;
 `,
   );

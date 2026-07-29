@@ -4,9 +4,16 @@ import type { RequestContext } from '@mastra/core/request-context';
 
 import { type AuditLogger, agentAuditDetail } from '../audit/index.js';
 import type { Actor, Role } from './index.js';
+import { type PrincipalKind, principalKindOf } from './principal.js';
 
 export interface ActorAuthorizationOptions {
   allowedRoles: readonly Role[];
+  /**
+   * Required, because both call sites normalize it through
+   * `assertPrincipalKinds` first. A default here would be a second place the
+   * human-only policy could drift from that one.
+   */
+  allowedPrincipalKinds: readonly PrincipalKind[];
   audit?: AuditLogger;
   resource: string;
   requestContext?: RequestContext;
@@ -51,7 +58,30 @@ export function authorizeActor(options: ActorAuthorizationOptions): Actor {
     });
     options.deny(reason);
   }
-  if (!options.allowedRoles.includes(actor.role)) {
+  // Kind before role, and fail closed on an UNDECLARED kind: a host that has not
+  // thought about automation must not have its human role allowlist quietly
+  // answer a question about a scheduled job.
+  const allowedKinds = options.allowedPrincipalKinds;
+  const kind = principalKindOf(actor);
+  if (!allowedKinds.includes(kind)) {
+    const reason = `principal kind '${kind}' is not in allowed kinds [${allowedKinds.join(', ')}]`;
+    options.audit?.record({
+      actor,
+      action: 'agent.input.authorize',
+      resource: options.resource,
+      decision: 'denied',
+      reason,
+      detail: agentAuditDetail(options.requestContext),
+    });
+    options.deny(reason);
+  }
+  // Roles describe human authority, so they are authoritative only for humans.
+  // An automated principal carries a role solely because `Actor.role` is
+  // required; checking it here would mean either admitting whichever human role
+  // the host projected, or forcing hosts to add that role to `allowedRoles` and
+  // thereby admitting real humans holding it. The kind allowlist above is the
+  // whole gate for automation, and it is opt-in.
+  if (kind === 'human' && !options.allowedRoles.includes(actor.role)) {
     const reason = `role '${actor.role}' is not in allowed roles [${options.allowedRoles.join(', ')}]`;
     options.audit?.record({
       actor,

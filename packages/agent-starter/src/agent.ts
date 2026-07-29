@@ -20,6 +20,22 @@ export const STARTER_AGENT_META = {
   description:
     'Records one approval-gated operation in the tenant-isolated starter ledger.',
   allowedRoles: ['admin', 'operator', 'builder'],
+  // Every automated entry this starter actually wires, and nothing else.
+  // Naming entry paths rather than just kinds is what stops a scheduler from
+  // also arriving through a signal. 'approval.resume' is deliberately absent:
+  // resuming is implied by the kind that started the run, so an automated run
+  // that suspends for approval is not stranded once a human approves it.
+  //
+  // worker.ts wires all three: scheduleTick.startAgent (system/schedule.fire),
+  // createNotificationDispatchTick (system/notification.dispatch), and the
+  // signal-provider host whose deliveries arrive as a service principal.
+  allowedAutomation: [
+    {
+      kind: 'system',
+      entryPaths: ['schedule.fire', 'notification.dispatch'],
+    },
+    { kind: 'service', entryPaths: ['signal.notification'] },
+  ],
 } as const satisfies AgentMeta;
 
 const actionInput = z.object({
@@ -114,6 +130,9 @@ export function createStarterAgentModule(options: {
       [RECORD_ACTION_CONNECTOR_ID]: recordAction,
     },
     allowedRoles: STARTER_AGENT_META.allowedRoles,
+    // Must mirror STARTER_AGENT_META.allowedAutomation's kinds; the catalog
+    // refuses the module at construction if the two ever drift.
+    allowedPrincipalKinds: ['human', 'system', 'service'],
     policies: [],
     audit: options.audit,
     maxSteps: 1,
