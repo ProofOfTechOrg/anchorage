@@ -791,7 +791,7 @@ The shipped host deliberately omits a public raw-resume route. It accepts connec
 
 ### Phase B: Approval capability and principal hardening
 
-1. Define human, service, agent, and system principals beyond the Phase A human-role snapshot.
+1. ~~Define human, service, agent, and system principals beyond the Phase A human-role snapshot.~~ Shipped. `ExecutionPrincipal` carries a kind, a required `purpose` on every automated kind, and optional delegation. Breakwater's `Actor` gained `kind`, and `RBACMiddleware`/`createGuardedAgent` gate on `allowedPrincipalKinds` before roles. The agent host routes automated entry through each agent's `allowedAutomation` declaration.
 2. Choose connector/leg/tool-call/input/nonce grant scope for structured grants.
 3. Prove scheduled, signal, background, and nested execution cannot inherit a stale or broader grant.
 4. Add dynamic principal re-resolution only when a concrete identity-provider contract exists.

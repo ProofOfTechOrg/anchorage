@@ -22,6 +22,7 @@ import type {
 } from '../approval-api/index.js';
 import {
   ApprovalService,
+  type AutomatedExecutionPrincipal,
   D1ApprovalStoreFactory,
   purgeExpiredApprovals,
   sweepSLA,
@@ -193,8 +194,13 @@ export function buildHostApprovalService(
 export interface SlaSweepMaintenanceOptions {
   /** factory.system() — the cron-only cross-tenant view. */
   store: SystemApprovalStore;
-  /** maintenancePrincipal(systemActorId). */
-  systemPrincipal: TrustedAutomationPrincipal;
+  /**
+   * `maintenancePrincipal(systemActorId)`. Typed as merely automated, not
+   * vouched: the sweep derives no authority from the principal (the
+   * `SystemApprovalStore` type is its authorization), so demanding the trust
+   * brand here would ask for a token nothing on this path reads.
+   */
+  systemPrincipal: AutomatedExecutionPrincipal;
   /** Optional audit export queue. */
   queue?: AuditQueue<ApprovalAuditEvent>;
   /** The firing cron expression — log correlation only. */

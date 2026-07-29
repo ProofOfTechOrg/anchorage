@@ -84,7 +84,7 @@ The start body accepts only `{"prompt":"..."}`. The router caps the raw UTF-8 bo
 
 Each stream line contains the next reconnect cursor and one event. Replay depends on the configured Mastra cache and is not process-restart durable. When the durable run exists but its replay cache does not, the stream route returns 409 and the client must use the status route.
 
-Approval records store an `agent-thread` target with the agent, thread, resource, and original authorized principal. `createAgentApprovalResumer()` rechecks the current catalog roles, reconstructs the guarded module after eviction, and resumes as that original principal. Before resume, the wrapper rebuilds Mastra's local and global run registries from fresh trusted context. It invokes only Breakwater's reserved RBAC `processInput` hook during rehydration, then installs the complete input, LLM-request, and output processor lists for resumed loop execution. It does not replay application or policy `processInput` hooks. An authorization denial stops before registry installation, observation, or tool execution. The reviewer identity remains attached to the approval decision.
+Approval records store an `agent-thread` target with the agent, thread, resource, and original authorized principal. `createAgentApprovalResumer()` re-authorizes that stored principal against the current catalog — a human against the agent's roles, an automated principal against its `allowedAutomation` declaration on the `approval.resume` entry path — reconstructs the guarded module after eviction, and resumes as that original principal. Before resume, the wrapper rebuilds Mastra's local and global run registries from fresh trusted context. It invokes only Breakwater's reserved RBAC `processInput` hook during rehydration, then installs the complete input, LLM-request, and output processor lists for resumed loop execution. It does not replay application or policy `processInput` hooks. An authorization denial stops before registry installation, observation, or tool execution. The reviewer identity remains attached to the approval decision.
 
 ## Use the lower-level durable wrapper
 
@@ -136,8 +136,8 @@ Host rules:
 2. Resolve the authenticated `TenantContext`.
 3. Return 404 for a foreign stored id with `requireOwnedMemoryId()`.
 4. Address the thread Durable Object through `createThreadTopology()`.
-5. Let the topology overwrite `x-flowsafe-tenant`, `x-flowsafe-actor`, `x-flowsafe-role`, and `x-flowsafe-principal` from the resolved context. The Durable Object refuses a request that carries no principal header rather than treating the caller as a human.
-6. Have `ThreadDurableObject` reconstruct the actor and verify the stamped tenant against its own `id.name` prefix.
+5. Let the topology stamp `x-flowsafe-tenant` and `x-flowsafe-principal` from the resolved context. The principal is the sole identity channel: the retired `x-flowsafe-actor` and `x-flowsafe-role` headers are stripped on send and forward, and `createTenantResolver` refuses an inbound request that carries either. The Durable Object refuses a request that carries no principal header rather than treating the caller as a human.
+6. Have `ThreadDurableObject` project the actor from the stamped principal and verify the stamped tenant against its own `id.name` prefix.
 
 The D1 recall-path tests use one database and the same business key for two tenants. They prove isolated `recall`, `listThreads`, and working memory behavior through Mastra's own memory implementation.
 

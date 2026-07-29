@@ -28,7 +28,6 @@ import {
   principalAuditFields,
   RUN_START_ROLES,
   samePrincipal,
-  trustAutomationPrincipal,
 } from '../approval-api/index.js';
 import {
   DoStatusError,
@@ -496,13 +495,22 @@ export function createThreadAgentHost(
   // indistinguishable from a human operator in the audit trail. The bridge
   // mints its own principal from this id against the service's tenant.
   const systemActorId = options.systemActorId ?? 'flowsafe-system';
-  const systemPrincipal = (scope: ThreadScope) =>
-    trustAutomationPrincipal({
-      kind: 'system',
-      id: systemActorId,
-      tenantId: scope.tenantId,
-      purpose: 'approval-suspension-reconcile',
-    });
+  // Deliberately NOT vouched. Its only consumer projects it to an ApprovalActor
+  // for a role-gated READ, which grants nothing an automated principal does not
+  // already have — so calling the trust assertion here would assert trust that
+  // nothing consumes, and `trustAutomationPrincipal` has to stay greppable as
+  // "this is where authority is conferred" to be worth anything.
+  //
+  // `purpose` is likewise inert here: principalActor drops it, and a successful
+  // list() emits no audit event, so this string reaches nothing. It is not
+  // shared with the bridge's RECONCILE_PURPOSE for that reason — there is no
+  // provenance here to drift.
+  const systemPrincipal = (scope: ThreadScope): ExecutionPrincipal => ({
+    kind: 'system',
+    id: systemActorId,
+    tenantId: scope.tenantId,
+    purpose: 'approval-suspension-reconcile',
+  });
 
   const currentApprovals = async (
     scope: ThreadScope,

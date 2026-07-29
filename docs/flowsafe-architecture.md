@@ -140,7 +140,7 @@ D1-backed memory recall uses the salted ids through Mastra's own memory implemen
 
 Public starts mint the thread, resource, and run ids after authentication. Status and NDJSON observation recheck the stored agent/thread/run binding and return 404 for foreign or mismatched ids. Stream replay lasts only as long as Mastra's configured cache; authoritative status remains available after replay eviction.
 
-An agent has no public raw-resume route. Approval records persist the original authorized principal, and an approval decision resumes as that principal after rechecking the current catalog roles. The reviewer remains the actor on the approval decision event.
+An agent has no public raw-resume route. Approval records persist the original authorized principal, and an approval decision resumes as that principal after re-authorizing it against the current catalog: a human principal against the agent's roles, an automated principal against its `allowedAutomation` declaration on the `approval.resume` entry path. The reviewer remains the actor on the approval decision event.
 
 After Durable Object eviction, the in-process tool registry is gone while D1 state remains. The agent host validates the memory binding, reconstructs the guarded module, and derives fresh trusted resume context. It then rehydrates Mastra's registries by invoking only Breakwater's reserved RBAC `processInput` hook. Before installation, it restores the complete input, LLM-request, application output, and mandatory output-processor lists for resumed loop execution. Initial application and policy `processInput` hooks do not run again. The host then starts observation and resumes through `RunnerRuntime`.
 

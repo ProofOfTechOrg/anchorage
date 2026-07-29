@@ -401,6 +401,59 @@ describe('resumeRunWithRequeue', () => {
     expect(await store.list({ status: 'pending' })).toHaveLength(0);
   });
 
+  it('still emits the re-queue event, unattributed, when minting its own principal fails', async () => {
+    // #given — a blank systemActorId: the vouch itself throws, which is the
+    // SAME input class that makes the re-queue throw. The event names the
+    // suspended step paths and is the only signal an operator gets, so it must
+    // not die of the cause it is reporting. There is no identity to derive, so
+    // it is attributed to nobody rather than to a fabricated actor.
+    const store = new InMemoryApprovalStore('acme');
+    const events: ApprovalAuditEvent[] = [];
+    const audit = (event: ApprovalAuditEvent) => events.push(event);
+    const base: ResumeRunFn = async () =>
+      suspendedSummary('acme_run-9', 'gate2', ['deploy-conn'], 3030, 1);
+    const service: ApprovalService = new ApprovalService({
+      store,
+      audit,
+      resumeRun: resumeRunWithRequeue(base, () => service, '', audit),
+    });
+    const { record: gate1 } = await service.createAsPrincipal(
+      {
+        workflowId: 'product-launch',
+        runId: 'acme_run-9',
+        stepPath: ['approveLaunch'],
+        suspendedAt: 1000,
+        title: 'Approve launch',
+        connectors: ['deploy-conn'],
+        requestedBy: 'starter',
+      },
+      SYSTEM_PRINCIPAL,
+    );
+
+    // #when
+    const decided = await service.decide(
+      gate1.id,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then — the mint error surfaces, not a swallowed one
+    expect(decided.resume).toMatchObject({ attempted: true, ok: false });
+    expect(decided.resume.error).toMatch(/only a valid automated principal/);
+
+    // #then — the event still fires, with no actor and no provenance
+    const requeue = events.filter(
+      (event) => event.action === 'approval.requeue',
+    );
+    expect(requeue).toHaveLength(1);
+    expect(requeue[0]).toMatchObject({
+      decision: 'error',
+      actor: null,
+      detail: { runId: 'acme_run-9', suspended: [['gate2']] },
+    });
+    expect(requeue[0]?.detail).not.toHaveProperty('principalKind');
+  });
+
   it('emits an audit event and reports resume.ok=false when the post-resume re-queue throws (D4)', async () => {
     // #given — deciding gate1 durably resumes to a re-suspended gate2, but
     // the store rejects gate2's filing (a transient D1 failure) — the base
@@ -455,10 +508,17 @@ describe('resumeRunWithRequeue', () => {
     expect(requeueEvents[0]).toMatchObject({
       decision: 'error',
       resource: `approval:${gate1.id}`,
+      // The event is emitted by automation, so it is attributed to the
+      // platform's own bookkeeping principal — a derived least-privileged role
+      // and full provenance, never a hand-shaped viewer actor.
+      actor: { id: SYSTEM, role: 'viewer', tenantId: 'acme' },
       detail: {
         workflowId: 'product-launch',
         runId: 'acme_run-4',
         suspended: [['gate2']],
+        principalKind: 'system',
+        principalId: SYSTEM,
+        purpose: 'approval-suspension-reconcile',
       },
     });
   });

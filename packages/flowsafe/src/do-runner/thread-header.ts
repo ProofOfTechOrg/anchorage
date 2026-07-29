@@ -25,14 +25,16 @@ export const THREAD_TENANT_HEADER = 'x-flowsafe-tenant';
  * The trusted Worker-stamped EXECUTION PRINCIPAL — WHO is executing, which the
  * id/role/tenant headers cannot express.
  *
- * REQUIRED. `createThreadTopology` stamps it on every `send` and `forward`, the
+ * REQUIRED, and the SOLE identity channel: the DO projects `scope.actor` from
+ * it, so there is no separate actor or role header to disagree with what
+ * executes. `createThreadTopology` stamps it on every `send` and `forward`, the
  * only sanctioned way to reach a thread DO, and `ThreadDurableObject` refuses a
- * request without it. There is deliberately no human default: the role header
- * for an automated principal carries the least-privileged projected role, so a
- * dropped principal header would have made automation arrive as a human whose
- * entry the agent host never authorized against `allowedAutomation`.
+ * request without it. There is deliberately no human default — a dropped
+ * principal header fails the request rather than admitting automation as a
+ * human whose entry the agent host never authorized against `allowedAutomation`.
  *
- * Forging it is exactly as hard as forging the role header: `createTenantResolver`
- * refuses any inbound request that carries either, before a store binds.
+ * `createTenantResolver` refuses any inbound request that carries this header,
+ * or the retired `x-flowsafe-actor` / `x-flowsafe-role` names, before a store
+ * binds — so a mixed-version client fails loudly instead of being trusted.
  */
 export const THREAD_PRINCIPAL_HEADER = 'x-flowsafe-principal';

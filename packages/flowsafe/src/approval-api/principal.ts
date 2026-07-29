@@ -56,36 +56,43 @@ const MAX_PRINCIPAL_ID_LENGTH = 200;
  * sketch had it. The failure being fixed is that fabricated operators "lose
  * provenance"; an optional field would let each new automated path skip the one
  * thing that restores it. A human needs no purpose — the person is the reason.
+ *
+ * Fields are `readonly` because a principal is an authorization snapshot, not a
+ * mutable record: every consumer re-reads `kind` to decide what the holder may
+ * do, so a principal that can change between two reads has no meaning. The
+ * modifier is the compile-time half; `trustAutomationPrincipal` freezes the
+ * runtime half. `readonly` is not checked in assignability, so producers may
+ * still build one from an ordinary object literal.
  */
 export type ExecutionPrincipal =
   | {
-      kind: 'human';
-      id: string;
-      tenantId: string;
-      role: ApprovalRole;
+      readonly kind: 'human';
+      readonly id: string;
+      readonly tenantId: string;
+      readonly role: ApprovalRole;
     }
   | {
-      kind: 'service';
-      id: string;
-      tenantId: string;
-      purpose: string;
+      readonly kind: 'service';
+      readonly id: string;
+      readonly tenantId: string;
+      readonly purpose: string;
       /** Only an agent delegates; `never` makes a wrong shape a type error. */
-      delegatedBy?: never;
+      readonly delegatedBy?: never;
     }
   | {
-      kind: 'agent';
-      id: string;
-      tenantId: string;
-      purpose: string;
+      readonly kind: 'agent';
+      readonly id: string;
+      readonly tenantId: string;
+      readonly purpose: string;
       /** The principal that delegated this run, for agent-to-agent work. */
-      delegatedBy?: string;
+      readonly delegatedBy?: string;
     }
   | {
-      kind: 'system';
-      id: string;
-      tenantId: string;
-      purpose: string;
-      delegatedBy?: never;
+      readonly kind: 'system';
+      readonly id: string;
+      readonly tenantId: string;
+      readonly purpose: string;
+      readonly delegatedBy?: never;
     };
 
 /**
@@ -97,25 +104,38 @@ export type ExecutionPrincipal =
  * a human `viewer`.
  *
  * The symbol is exported because declaration emit cannot reference a
- * module-private name from an exported type. The residual is the same one
- * TENANT_BOUND accepts and is grep-visible: forging requires
- * `import { TRUSTED_AUTOMATION }` plus stamping it, a deliberate TCB bypass on
- * par with an `as` cast. What it eliminates is accidental satisfaction and the
- * rushed fix that hands a request-derived principal to a trusted entry.
+ * module-private name from an exported type. It is deliberately absent from the
+ * package barrel, but that is API-surface hygiene, NOT a capability boundary:
+ * the brand is recoverable by reflection from any vouched principal
+ * (`Object.getOwnPropertySymbols(maintenancePrincipal('x'))`), so in-process
+ * code that means to forge one still can. That residual is the same one
+ * TENANT_BOUND accepts, and it is deliberate — a TCB bypass on par with an `as`
+ * cast. What the brand eliminates is accidental satisfaction and the rushed fix
+ * that hands a request-derived principal to a trusted entry.
  */
 export const TRUSTED_AUTOMATION: unique symbol = Symbol(
   'flowsafe.trustedAutomation',
 );
 
 /**
+ * Any non-human principal — the shape a duty needs when it wants provenance but
+ * derives no authority from the principal (the cron SLA sweep is the case).
+ * Separate from `TrustedAutomationPrincipal` so the brand is demanded only
+ * where it is actually read, which is `ApprovalService`'s two trusted entries.
+ */
+export type AutomatedExecutionPrincipal = Extract<
+  ExecutionPrincipal,
+  { kind: AutomatedPrincipalKind }
+>;
+
+/**
  * An automated principal that trusted platform code vouched for. The only kind
  * accepted by `ApprovalService.createAsPrincipal` and
  * `supersedeStaleAsPrincipal`.
  */
-export type TrustedAutomationPrincipal = Extract<
-  ExecutionPrincipal,
-  { kind: AutomatedPrincipalKind }
-> & { readonly [TRUSTED_AUTOMATION]: true };
+export type TrustedAutomationPrincipal = AutomatedExecutionPrincipal & {
+  readonly [TRUSTED_AUTOMATION]: true;
+};
 
 /**
  * Vouch for an automated principal. Calling this IS the trust assertion, which
@@ -124,27 +144,113 @@ export type TrustedAutomationPrincipal = Extract<
  *
  * Throws on a human or a malformed principal — those must use the
  * role-authorized entries.
+ *
+ * Returns a CANONICAL CLONE, branded and frozen. Validating the caller's object
+ * and handing the same reference back made the vouch time-of-check/time-of-use:
+ * the caller kept a mutable alias, so a validated `system` principal could be
+ * rewritten into `{kind:'human', role:'admin'}` after the check and before the
+ * service read it — and `#authorizeAutomated` re-reads `kind`. The clone comes
+ * from `canonicalPrincipal`, so it holds the exact values that were validated
+ * and no extra property rides into the trusted computing base; the brand lets
+ * consumers prove the value came from here, and the freeze keeps both true for
+ * the object's whole life.
  */
 export function trustAutomationPrincipal(
   principal: ExecutionPrincipal,
 ): TrustedAutomationPrincipal {
-  if (!isExecutionPrincipal(principal) || principal.kind === 'human') {
+  // The brand is stamped onto the CANONICAL SNAPSHOT, never onto the argument.
+  // Validating one object and minting from another is how a value that passed
+  // the automated check came back out as a human admin; taking both from the
+  // same read makes that impossible rather than merely difficult.
+  const canonical = canonicalPrincipal(principal);
+  if (canonical === undefined || canonical.kind === 'human') {
     throw new Error(
       'execution principal: only a valid automated principal can be trusted for platform work',
     );
   }
-  return principal as TrustedAutomationPrincipal;
+  return Object.freeze({
+    ...canonical,
+    [TRUSTED_AUTOMATION]: true as const,
+  });
+}
+
+/**
+ * Read one field as an OWN DATA property, or `undefined`.
+ *
+ * Every principal field is read through this rather than by `value.kind`,
+ * because a plain read is not a stable observation of a value someone else
+ * built: it walks the prototype chain, so an inherited getter answers it, and
+ * an own accessor's getter can answer differently each time. `Object.freeze`
+ * is no substitute — it constrains a value's own data properties and says
+ * nothing about accessors, inherited fields, or virtual ones.
+ *
+ * This does NOT by itself prove the field cannot lie: over a Proxy with an
+ * extensible target, `Object.getOwnPropertyDescriptor` is a trap as
+ * unconstrained as `get`. What closes the class is that the single read is
+ * captured — see `canonicalPrincipal`, which returns a snapshot built from
+ * these reads, so nothing downstream re-reads the caller's object at all.
+ *
+ * The minter emits plain own data properties, so this refuses nothing real.
+ */
+function ownField(value: object, key: PropertyKey): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor !== undefined && 'value' in descriptor
+    ? descriptor.value
+    : undefined;
+}
+
+/**
+ * Does this value carry the brand AND still hold a valid automated shape?
+ *
+ * The parameter type alone proves nothing at runtime — TypeScript is erased,
+ * and the ways in that remain (an `as` cast, a value rebuilt from storage or a
+ * structured clone across a boundary) all produce something the type accepts.
+ * This is the check that makes the brand load-bearing rather than decorative,
+ * so the trusted service entries call it instead of trusting their signature.
+ *
+ * Deliberately NOT on the package barrel: it is the enforcement half of an
+ * internal invariant, and exporting it would put a runtime shape check into the
+ * public API that consumers would have to keep working across minor versions.
+ */
+export function isTrustedAutomationPrincipal(
+  value: unknown,
+): value is TrustedAutomationPrincipal {
+  return (
+    isAutomatedPrincipal(value) &&
+    // The brand is read as an OWN DATA property for the same reason every other
+    // field is: a plain read would accept one inherited from a prototype, which
+    // nobody stamped.
+    ownField(value, TRUSTED_AUTOMATION) === true &&
+    // A branded-but-UNFROZEN principal is by definition one somebody stamped
+    // onto a live mutable object rather than minting. It is also what forces a
+    // Proxy's descriptor and `get` channels to agree, since the spec invariants
+    // only bind over a non-extensible target.
+    Object.isFrozen(value)
+  );
+}
+
+/**
+ * A valid principal that is not a person. Authority-free; provenance only.
+ *
+ * The kind read is plain because `isExecutionPrincipal` has already proven
+ * `kind` is an own data property — see `ownField`.
+ */
+export function isAutomatedPrincipal(
+  value: unknown,
+): value is AutomatedExecutionPrincipal {
+  return isExecutionPrincipal(value) && value.kind !== 'human';
 }
 
 /**
  * Bounded, non-empty, and free of control characters.
  *
- * Not an injection barrier — the principal reaches the wire through
- * `JSON.stringify`, which escapes U+0000–U+001F. It matters because `id` ALSO
- * travels raw in `x-flowsafe-actor`, and because refusing here produces a clean
- * validation error instead of a `Headers.set` TypeError deep in the topology.
- * Mirrors the `containsHeaderControl` check `createTenantResolver` already
- * applies to an actor id.
+ * Not an injection barrier for the wire — the principal travels through
+ * `JSON.stringify`, which escapes U+0000–U+001F. It matters because these
+ * fields do not stop at the wire: `id` becomes `requestedBy`/`decidedBy` in D1
+ * and the actor on every audit row, and `purpose` rides into the SIEM export.
+ * The bounds keep an audit row bounded; the control-character refusal keeps
+ * those strings clean at the boundary rather than downstream. Mirrors the
+ * `containsHeaderControl` check `createTenantResolver` applies to an actor id.
  */
 function boundedText(value: unknown, max: number): value is string {
   if (typeof value !== 'string' || value.trim() === '' || value.length > max) {
@@ -158,46 +264,77 @@ function boundedText(value: unknown, max: number): value is string {
 }
 
 /**
+ * Validate AND canonicalize in one pass: every field is read exactly once, and
+ * the result is a fresh plain object built from THOSE reads.
+ *
+ * Validating a caller's object and then reading it again is the mistake this
+ * module keeps re-learning. The first version handed back the caller's own
+ * mutable reference; the second cloned but re-read plainly, which an accessor
+ * or a prototype getter could answer differently; reading through descriptors
+ * narrows the channel but does not close it, because
+ * `Object.getOwnPropertyDescriptor` is itself a Proxy trap and, over an
+ * extensible target, is as unconstrained as `get`.
+ *
+ * Returning the snapshot ends the class rather than narrowing it: "validated"
+ * and "used" become the same values, so no consumer can be handed something
+ * other than what was checked, whatever the input was built from.
+ *
+ * Fields are picked EXPLICITLY. tsc catches a new kind (the returns stop being
+ * exhaustive) and a new REQUIRED field (the literal stops matching), but NOT a
+ * new optional one — that compiles clean and is silently dropped, so add it to
+ * the pick by hand (`delegatedBy` is the existing example).
+ */
+function canonicalPrincipal(value: unknown): ExecutionPrincipal | undefined {
+  if (value === null || typeof value !== 'object') return undefined;
+  const id = ownField(value, 'id');
+  const tenantId = ownField(value, 'tenantId');
+  const kind = ownField(value, 'kind');
+  if (
+    !boundedText(id, MAX_PRINCIPAL_ID_LENGTH) ||
+    typeof tenantId !== 'string' ||
+    tenantId === ''
+  ) {
+    return undefined;
+  }
+  if (kind === 'human') {
+    const role = ownField(value, 'role');
+    return typeof role === 'string' &&
+      (APPROVAL_ROLES as readonly string[]).includes(role)
+      ? { kind: 'human', id, tenantId, role: role as ApprovalRole }
+      : undefined;
+  }
+  if (kind !== 'service' && kind !== 'agent' && kind !== 'system') {
+    return undefined;
+  }
+  const purpose = ownField(value, 'purpose');
+  if (!boundedText(purpose, MAX_PURPOSE_LENGTH)) return undefined;
+  const delegatedBy = ownField(value, 'delegatedBy');
+  if (delegatedBy !== undefined) {
+    return kind === 'agent' && boundedText(delegatedBy, MAX_PRINCIPAL_ID_LENGTH)
+      ? { kind: 'agent', id, tenantId, purpose, delegatedBy }
+      : undefined;
+  }
+  if (kind === 'agent') return { kind: 'agent', id, tenantId, purpose };
+  if (kind === 'service') return { kind: 'service', id, tenantId, purpose };
+  return { kind: 'system', id, tenantId, purpose };
+}
+
+/**
  * Structural validation only. The TENANT binding is checked separately by
  * `assertExecutionPrincipal`, because "is this shaped like a principal" and "is
  * this principal allowed here" are different questions and conflating them
  * produces call sites that answer neither.
+ *
+ * This answers only "was a valid principal readable from this value". It does
+ * NOT promise a later plain read returns what was validated — nothing can, for
+ * an object built to lie. Anything that goes on to USE the fields must take
+ * them from `canonicalPrincipal`'s snapshot (as `trustAutomationPrincipal` and
+ * `assertExecutionPrincipal` do) rather than from the argument.
  */
 export function isExecutionPrincipal(
   value: unknown,
 ): value is ExecutionPrincipal {
-  if (value === null || typeof value !== 'object') return false;
-  const candidate = value as Partial<ExecutionPrincipal>;
-  if (
-    !boundedText(candidate.id, MAX_PRINCIPAL_ID_LENGTH) ||
-    typeof candidate.tenantId !== 'string' ||
-    candidate.tenantId === ''
-  ) {
-    return false;
-  }
-  if (candidate.kind === 'human') {
-    return (
-      typeof candidate.role === 'string' &&
-      (APPROVAL_ROLES as readonly string[]).includes(candidate.role)
-    );
-  }
-  if (
-    candidate.kind !== 'service' &&
-    candidate.kind !== 'agent' &&
-    candidate.kind !== 'system'
-  ) {
-    return false;
-  }
-  if (!boundedText(candidate.purpose, MAX_PURPOSE_LENGTH)) return false;
-  const delegatedBy = (candidate as { delegatedBy?: unknown }).delegatedBy;
-  if (
-    delegatedBy !== undefined &&
-    (candidate.kind !== 'agent' ||
-      !boundedText(delegatedBy, MAX_PRINCIPAL_ID_LENGTH))
-  ) {
-    return false;
-  }
-  return true;
+  return canonicalPrincipal(value) !== undefined;
 }
 
 /**
@@ -206,21 +343,25 @@ export function isExecutionPrincipal(
  * `tenantId` on a decoded principal crosses an authentication boundary exactly
  * as `ApprovalActor.tenantId` does — the type says `string`, and the type system
  * has no authority over a value read back out of D1 or a DO's storage.
+ *
+ * Returns the canonical snapshot, not the argument: the tenant that was
+ * compared and the tenant the caller goes on to use are then the same string.
  */
 export function assertExecutionPrincipal(
   value: unknown,
   expectedTenantId: string,
   label: string,
 ): ExecutionPrincipal {
-  if (!isExecutionPrincipal(value)) {
+  const principal = canonicalPrincipal(value);
+  if (principal === undefined) {
     throw new Error(`execution principal: ${label} is malformed`);
   }
-  if (value.tenantId !== expectedTenantId) {
+  if (principal.tenantId !== expectedTenantId) {
     throw new Error(
-      `execution principal: ${label} belongs to tenant '${value.tenantId}', not '${expectedTenantId}'`,
+      `execution principal: ${label} belongs to tenant '${principal.tenantId}', not '${expectedTenantId}'`,
     );
   }
-  return value;
+  return principal;
 }
 
 /**

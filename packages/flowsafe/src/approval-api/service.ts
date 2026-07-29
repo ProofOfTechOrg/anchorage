@@ -23,8 +23,10 @@ import type {
 } from './contract.js';
 import { APPROVAL_ROLES, DECIDER_ROLES } from './contract.js';
 import {
-  type ExecutionPrincipal,
+  type AutomatedExecutionPrincipal,
+  isAutomatedPrincipal,
   isExecutionPrincipal,
+  isTrustedAutomationPrincipal,
   principalActor,
   principalAuditFields,
   type TrustedAutomationPrincipal,
@@ -320,6 +322,10 @@ export class ApprovalService {
     // (created: false) returns the EXISTING open record, which already
     // notified when it entered the queue.
     if (result.created) {
+      // `provenance` rides the subordinate events too. An automated operation
+      // whose primary event carries principalKind/principalId/purpose but whose
+      // notify and stream failures do not leaves exactly the gaps that make an
+      // incident unreconstructable: the failures are the rows an operator reads.
       fireNotification(
         this.#notify,
         { type: 'created', record: result.record },
@@ -329,7 +335,10 @@ export class ApprovalService {
             'approval.notify',
             `approval:${result.record.id}`,
             'error',
-            { reason, detail: { tenantId: result.record.tenantId } },
+            {
+              reason,
+              detail: { tenantId: result.record.tenantId, ...provenance },
+            },
           ),
       );
       fireStreamEvent(
@@ -341,7 +350,10 @@ export class ApprovalService {
             'approval.stream',
             `approval:${result.record.id}`,
             'error',
-            { reason, detail: { tenantId: result.record.tenantId } },
+            {
+              reason,
+              detail: { tenantId: result.record.tenantId, ...provenance },
+            },
           ),
       );
     }
@@ -683,7 +695,7 @@ export class ApprovalService {
       (streamError) =>
         this.#record(actor, 'approval.stream', `approval:${id}`, 'error', {
           reason: streamError,
-          detail: { tenantId: updated.tenantId },
+          detail: { tenantId: updated.tenantId, ...provenance },
         }),
     );
     return updated;
@@ -839,23 +851,42 @@ export class ApprovalService {
   }
 
   /**
-   * The tenant half of the automated authorization. The KIND half is carried by
-   * the type: only `trustAutomationPrincipal` mints a TrustedAutomationPrincipal,
-   * and it refuses humans and malformed principals, so this cannot be reached by
-   * a caller asserting robot-hood in an object literal.
+   * Authorize an automated caller on kind, brand, and tenant.
    *
-   * The tenant is still checked at runtime, for the same reason `#authorize`
-   * checks it: the resolver builds the service from the principal's own tenant,
-   * so a mismatch can only be a wiring bug — exactly when it must fail closed.
+   * The parameter type is NOT the enforcement. `trustAutomationPrincipal` is
+   * the only minter, but TypeScript is erased at runtime, so a cast or a value
+   * rebuilt from storage reaches here typed correctly and shaped however the
+   * caller left it. Re-reading the brand and the shape is what turns "only the
+   * minter produces this" from a convention into a check — and it is what stops
+   * a principal validated as `system` from being read back as a human `admin`.
+   *
+   * The tenant is checked for the same reason `#authorize` checks it: the
+   * resolver builds the service from the principal's own tenant, so a mismatch
+   * can only be a wiring bug — exactly when it must fail closed.
    */
   #authorizeAutomated(
     principal: TrustedAutomationPrincipal,
     action: string,
     resource: string,
   ): void {
+    if (!isTrustedAutomationPrincipal(principal)) {
+      // No actor: an unvouched value has no attribution worth recording, and
+      // projecting one through principalActor would read the very fields the
+      // check just refused to trust.
+      this.#record(null, action, resource, 'denied', {
+        reason:
+          'principal is not a vouched automated principal (missing trust brand or invalid automated shape)',
+      });
+      throw new ApprovalAuthzError(
+        `${action}: principal is not a vouched automated principal`,
+      );
+    }
     if (principal.tenantId === this.#store.tenantId) return;
     this.#record(principalActor(principal), action, resource, 'denied', {
       reason: `principal tenant '${principal.tenantId}' does not match the store binding '${this.#store.tenantId}'`,
+      // A denial is an automated event too: without these the only automated
+      // audit rows carrying provenance would be the ones that succeeded.
+      detail: principalAuditFields(principal),
     });
     throw new ApprovalAuthzError(
       `${action}: principal tenant does not match this service's tenant binding`,
@@ -1148,8 +1179,12 @@ export interface SweepSLAOptions {
    * Attribution only — the sweep runs inside the trusted computing base
    * (cron), so there is no role check: the TYPE of the store argument is the
    * authorization (a SystemApprovalStore is unobtainable from request scope).
+   *
+   * Automated kinds only, and REFUSED at runtime as well: a human here would
+   * stamp `principalKind: 'human'` onto cross-tenant cron escalations, which is
+   * the synthetic operator this whole model exists to remove.
    */
-  systemPrincipal: ExecutionPrincipal;
+  systemPrincipal: AutomatedExecutionPrincipal;
   audit?: ApprovalAuditSink;
   /** Fired for each record escalated. */
   onEscalation?: (record: ApprovalRecord) => void;
@@ -1189,6 +1224,17 @@ export async function sweepSLA(
   store: SystemApprovalStore,
   options: SweepSLAOptions,
 ): Promise<ApprovalRecord[]> {
+  // The principal is attribution, not authorization — the SystemApprovalStore
+  // type is the authorization. The parameter type already excludes a human;
+  // this is the erased-type half, because this is the one exported cross-tenant
+  // function that CARRIES an attribution principal (purgeExpiredApprovals takes
+  // none, so it has no attribution to corrupt), and a bad principal here makes
+  // every escalation it emits, for every tenant, unattributable.
+  if (!isAutomatedPrincipal(options.systemPrincipal)) {
+    throw new Error(
+      'sweepSLA: systemPrincipal must be a valid automated execution principal',
+    );
+  }
   const now = options.now ?? (() => new Date());
   const record = (
     action: string,

@@ -40,6 +40,7 @@ export {
   resumeViaRuntime,
 } from './grants.js';
 export type {
+  AutomatedExecutionPrincipal,
   AutomatedPrincipalKind,
   ExecutionPrincipal,
   ExecutionPrincipalKind,
@@ -58,7 +59,11 @@ export {
   principalActor,
   principalAuditFields,
   samePrincipal,
-  TRUSTED_AUTOMATION,
+  // TRUSTED_AUTOMATION is deliberately NOT re-exported: `trustAutomationPrincipal`
+  // is the sanctioned constructor and covers every legitimate case, so naming the
+  // raw symbol here would only widen the public surface with plumbing. This is
+  // API hygiene, not a capability boundary — the brand stays recoverable by
+  // reflection from any vouched principal, and the threat model says so.
   trustAutomationPrincipal,
 } from './principal.js';
 export type { PurgeExpiredApprovalsOptions } from './retention.js';

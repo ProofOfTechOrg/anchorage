@@ -9,7 +9,7 @@ import type {
   ApprovalStreamEvent,
   ApprovalStreamSink,
 } from './contract.js';
-import type { ExecutionPrincipal } from './principal.js';
+import type { AutomatedExecutionPrincipal } from './principal.js';
 import {
   ApprovalAuthzError,
   ApprovalConflictError,
@@ -29,7 +29,7 @@ import {
 } from './types.js';
 
 const ADMIN: ApprovalActor = { id: 'ada', role: 'admin', tenantId: 'acme' };
-const SWEEP_PRINCIPAL: ExecutionPrincipal = {
+const SWEEP_PRINCIPAL: AutomatedExecutionPrincipal = {
   kind: 'system',
   id: 'sweeper',
   tenantId: 'system',
@@ -1753,6 +1753,35 @@ describe('ApprovalService audit sink promise containment', () => {
     } finally {
       proc.off('unhandledRejection', onUnhandled);
     }
+  });
+
+  it.each([
+    [
+      'a human principal',
+      { kind: 'human', id: 'ada', tenantId: 'system', role: 'admin' },
+    ],
+    [
+      'a principal with no purpose',
+      { kind: 'system', id: 'sweeper', tenantId: 'system' },
+    ],
+    ['a non-object', 'sweeper'],
+  ])('refuses to sweep on behalf of %s', async (_label, principal) => {
+    // #given — the sweep writes across EVERY tenant, so a bad attribution
+    // identity makes every escalation it emits unattributable. The type
+    // excludes a human; this is the erased-type half.
+    const harness = makeHarness();
+    await seedPending(harness, { slaSeconds: 60 });
+    harness.advance(61_000);
+
+    // #when / #then — refused before any store write, so nothing escalates.
+    await expect(
+      sweepSLA(harness.backend.system(), {
+        systemPrincipal: principal as unknown as AutomatedExecutionPrincipal,
+        audit: (event) => harness.events.push(event),
+        now: harness.now,
+      }),
+    ).rejects.toThrow(/must be a valid automated execution principal/);
+    expect(await harness.store.list({ status: ['escalated'] })).toEqual([]);
   });
 });
 
