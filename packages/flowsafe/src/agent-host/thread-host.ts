@@ -38,6 +38,7 @@ import {
   tenantOwnsMemoryId,
   tenantOwnsSaltedId,
 } from '../do-runner/index.js';
+import { mastraRegistryEntries } from '../do-runner/mastra-registry.js';
 import { reconcileApprovalsForSummary } from '../host-kit/index.js';
 import { createAgentModuleCatalog } from './catalog.js';
 import { AGENT_HOST_ROUTE_PREFIX } from './thread-topology.js';
@@ -376,11 +377,16 @@ export function createThreadAgentHost(
     const catalog = await catalogFor(scope);
     const mastra = new Mastra({
       storage: options.storage(instanceScopeFor(scope)),
+      // Preserve ordinary key lookup, but remap Object.prototype collisions in
+      // Mastra's plain-object registry. Resolve those agents by intrinsic id.
       agents: Object.fromEntries(
-        catalog.modules.map((module) => [
-          module.meta.id,
-          module.agent as unknown as Agent,
-        ]),
+        mastraRegistryEntries(
+          catalog.modules.map(
+            (module) =>
+              [module.meta.id, module.agent as unknown as Agent] as const,
+          ),
+          'catalog-agent',
+        ),
       ),
       ...(scope.init.pubsub ? { pubsub: scope.init.pubsub } : {}),
     });
@@ -389,7 +395,7 @@ export function createThreadAgentHost(
       agents.set(
         module.meta.id,
         createFlowsafeDurableAgent({
-          agent: mastra.getAgent(module.meta.id),
+          agent: mastra.getAgentById(module.meta.id),
           runtime: scope.init.runtime,
           pubsub: scope.init.pubsub,
           threadRuntime: mastra.agentThreadStreamRuntime,

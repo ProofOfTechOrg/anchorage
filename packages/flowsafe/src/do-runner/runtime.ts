@@ -18,6 +18,7 @@
 // cross-instance serialization comes from routing one DO instance per run
 // (see durable-object.ts).
 
+import type { Agent, ToolsInput } from '@mastra/core/agent';
 import type { IMastraLogger } from '@mastra/core/logger';
 import { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
@@ -38,6 +39,7 @@ import {
   BREAKWATER_ISOLATION_SCOPE_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
 } from './breakwater-keys.js';
+import { mastraRegistryEntries } from './mastra-registry.js';
 import { PATH_SAFE_ID_PATTERN, tenantOfRunId } from './path-safe-id.js';
 import type { HostPubSub } from './pubsub.js';
 import { InMemoryResumeLedger, type ResumeLedger } from './resume-ledger.js';
@@ -177,6 +179,11 @@ const NONTERMINAL_RUN_STATUSES = new Set<WorkflowRunStatus>([
   'pending',
   'paused',
 ]);
+
+// Registered agents may carry incompatible tool/output generics. The public
+// method preserves each concrete type; this erased form is only for handing
+// the heterogeneous registry to Mastra.
+type ErasedRuntimeAgent = Agent<string, ToolsInput, unknown>;
 
 function terminalStateUpdate(
   result: CoreRunResult,
@@ -569,6 +576,7 @@ export class RunnerRuntime {
   readonly #storage: MastraCompositeStore;
   readonly #logger: IMastraLogger | false;
   readonly #requestContextForRun?: RequestContextProvider;
+  readonly #agents = new Map<string, ErasedRuntimeAgent>();
   readonly #workflows = new Map<string, AnyWorkflow>();
   readonly #runLocks = new Map<string, Promise<unknown>>();
   // Per-run resume ledger: #runKey(workflowId, runId) -> (stepKey -> times that
@@ -632,6 +640,27 @@ export class RunnerRuntime {
     }
     if (this.#resumeLedgerExplicit) return;
     this.#resumeLedger = ledger;
+  }
+
+  /**
+   * Register an agent that a runtime-owned workflow resolves by id.
+   *
+   * Durable-agent workflows persist only the agent id. Keeping the raw agent
+   * on the same Mastra instance as the workflow lets a resumed run resolve it
+   * after isolate eviction, when the original DurableAgent instance is gone.
+   */
+  registerAgent<TAgentId extends string, TTools extends ToolsInput, TOutput>(
+    agent: Agent<TAgentId, TTools, TOutput>,
+  ): void {
+    if (this.#mastra) {
+      throw new Error(
+        'RunnerRuntime: register all agents before the first run — the Mastra instance is frozen once runs start',
+      );
+    }
+    if (this.#agents.has(agent.id)) {
+      throw new Error(`RunnerRuntime: duplicate agent id '${agent.id}'`);
+    }
+    this.#agents.set(agent.id, agent as unknown as ErasedRuntimeAgent);
   }
 
   register(workflow: AnyWorkflow): void {
@@ -972,9 +1001,19 @@ export class RunnerRuntime {
   #ensureMastra(): void {
     if (this.#mastra) return;
     this.#mastra = new Mastra({
-      workflows: Object.fromEntries(this.#workflows),
+      // Mastra uses plain-object registries. Remap inherited object keys only,
+      // preserving normal getAgent(id) lookups; collision IDs use intrinsic-id lookup.
+      agents: Object.fromEntries(
+        mastraRegistryEntries(this.#agents, 'runtime-agent'),
+      ),
+      // The same rule keeps normal getWorkflow(id) behavior while making
+      // `__proto__`/`constructor` workflows available via intrinsic id.
+      workflows: Object.fromEntries(
+        mastraRegistryEntries(this.#workflows, 'runtime-workflow'),
+      ),
       storage: this.#storage,
       logger: this.#logger,
+      ...(this.#pubsub !== undefined ? { pubsub: this.#pubsub } : {}),
     });
   }
 

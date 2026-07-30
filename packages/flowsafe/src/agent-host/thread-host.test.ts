@@ -43,8 +43,10 @@ vi.mock('@mastra/core/mastra', () => ({
       this.agents = options.agents;
     }
 
-    getAgent(id: string) {
-      return this.agents[id];
+    getAgentById(id: string) {
+      return (Object.values(this.agents) as Array<{ id?: string }>).find(
+        (agent) => agent.id === id,
+      );
     }
   },
 }));
@@ -254,6 +256,24 @@ beforeEach(() => {
 });
 
 describe('createThreadAgentHost', () => {
+  it.each([
+    '__proto__',
+    'constructor',
+  ])("resolves prototype-collision agent id '%s'", async (agentId) => {
+    const { host, scope } = harness([agentId]);
+
+    await host.start(scope, {
+      agentId,
+      threadId: 'acme_thread',
+      resourceId: RESOURCE_ID,
+      runId: 'acme_run',
+      prompt: 'go',
+      entryPath: 'http.start',
+    });
+
+    expect(mocked.stream).toHaveBeenCalledOnce();
+  });
+
   it('constructs cached dependencies with actor-free instance scope', async () => {
     const { host, scope, moduleScopes, storageScopes } = harness();
     await host.start(scope, {
