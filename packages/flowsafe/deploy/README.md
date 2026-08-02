@@ -290,13 +290,14 @@ expressions byte-equal to crons.ts's `SWEEP_CRON`/`PURGE_CRON` constants.
   `allowedRoles` (a subset of the coarse `RUN_START_ROLES` check that runs
   first). `defineWorkflows` asserts every listed id was actually committed.
 - **Derive grants on the server**: The Durable Object-side
-  `approvalGrantProvider` derives `breakwater.approvedConnectors` from
-  `approved` records on every start or resume. The public raw-resume route stays
-  grant-free and gated steps fail closed on forged resumes. A forged
-  `resumeData.approved` can cosmetically flip a workflow boolean but grants
-  no connector capability — the side-effecting step re-checks the
-  server-derived grant, so treat `resumeData` as untrusted, never as the
-  security boundary.
+  `approvalGrantProvider` derives `breakwater.connectorGrants` from `approved`
+  records on every start or resume. `RunnerRuntime` derives
+  `breakwater.connectorExecution` from the authoritative leg. The public
+  raw-resume route stays grant-free and gated steps fail closed on forged
+  resumes. A forged `resumeData.approved` can cosmetically flip a workflow
+  boolean but grants no connector capability. The side-effecting step
+  re-checks the server-derived structured grant, so treat `resumeData` as
+  untrusted, never as the security boundary.
 - **Preserve separation of duties across gates**: `queueApprovalForSuspension`
   attributes each auto-queued approval to the human who advanced the run
   (`requestedBy` = the starting actor, or the reviewer whose decision caused

@@ -262,6 +262,17 @@ export class ApprovalService {
     this.#validateCreate(input);
     const now = this.#now();
     const slaSeconds = input.slaSeconds ?? this.#defaultSlaSeconds;
+    const connectors = [...(input.connectors ?? [])];
+    let grantScope: ApprovalRecord['grantScope'];
+    if (connectors.length === 0) {
+      grantScope = undefined;
+    } else if (input.runScoped === true) {
+      grantScope = 'run';
+    } else if (input.toolCallId !== undefined) {
+      grantScope = 'tool-call';
+    } else {
+      grantScope = 'suspension';
+    }
     const record: ApprovalRecord = {
       id: crypto.randomUUID(),
       // The bound store re-stamps this from its own field either way; setting
@@ -270,13 +281,15 @@ export class ApprovalService {
       workflowId: input.workflowId,
       runId: input.runId,
       title: input.title,
-      connectors: [...(input.connectors ?? [])],
+      connectors,
       priority: input.priority ?? 'normal',
       status: 'pending',
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
     };
     if (input.stepPath !== undefined) record.stepPath = [...input.stepPath];
+    if (grantScope !== undefined) record.grantScope = grantScope;
+    if (input.toolCallId !== undefined) record.toolCallId = input.toolCallId;
     if (input.suspendedAt !== undefined) {
       record.suspendedAt = input.suspendedAt;
     }
@@ -313,6 +326,7 @@ export class ApprovalService {
           tenantId: result.record.tenantId,
           workflowId: result.record.workflowId,
           runId: result.record.runId,
+          grantScope: result.record.grantScope,
           created: result.created,
           ...provenance,
         },
@@ -436,7 +450,7 @@ export class ApprovalService {
       // from the run's own APPROVED history instead.
       //
       // Read the COMPLETE approved history via the shared complete-reader (the
-      // same drain-all-pages helper approvedConnectorsForLeg uses, so the SoD
+      // same drain-all-pages helper connectorGrantsForLeg uses, so the SoD
       // bar and grant derivation can never drift): a many-gate run's
       // causally-prior approval can sit past MAX_APPROVAL_LIST_LIMIT, and a
       // single default-bounded first page would drop the newest under FIFO
@@ -513,6 +527,20 @@ export class ApprovalService {
         tenantId: updated.tenantId,
         workflowId: updated.workflowId,
         runId: updated.runId,
+        grantScope: updated.grantScope,
+        connectorCount: updated.connectors.length,
+        ...(updated.stepPath === undefined
+          ? {}
+          : { stepPath: updated.stepPath }),
+        ...(updated.suspendedAt === undefined
+          ? {}
+          : { suspendedAt: updated.suspendedAt }),
+        ...(updated.resumeCount === undefined
+          ? {}
+          : { resumeCount: updated.resumeCount }),
+        ...(updated.toolCallId === undefined
+          ? {}
+          : { toolCallId: updated.toolCallId }),
         ...(selfDecision ? { selfDecision: true } : {}),
       },
     });
@@ -608,7 +636,7 @@ export class ApprovalService {
    * with declined semantics via #resume(), and a stale record must die
    * WITHOUT touching a run that is already suspended at a DIFFERENT
    * (current) fingerprint — this method never calls #resume(). 'rejected'
-   * (not 'approved') is the deliberate terminal choice: approvedConnectorsForLeg
+   * (not 'approved') is the deliberate terminal choice: connectorGrantsForLeg
    * (grants.ts) reads ONLY status: 'approved' records when deriving a leg's
    * grants, so a superseded record is excluded by its STATUS alone, not
    * merely by its stale fingerprint — it can never mint even if a future
@@ -979,6 +1007,15 @@ export class ApprovalService {
         'connectors must be an array of non-empty strings',
       );
     }
+    const connectorCount = input.connectors?.length ?? 0;
+    if (
+      input.toolCallId !== undefined &&
+      (!isNonEmptyString(input.toolCallId) || connectorCount !== 1)
+    ) {
+      throw new InvalidApprovalInputError(
+        'toolCallId requires exactly one connector and must be a non-empty string',
+      );
+    }
     // Attribution is what the separation-of-duties check compares, so an
     // explicit one must be a usable identity — an empty string would silently
     // match no actor and, worse, read as "attributed" to any later reader.
@@ -994,6 +1031,39 @@ export class ApprovalService {
     // boolean opts in, never a truthy string from a lax caller.
     if (input.runScoped !== undefined && typeof input.runScoped !== 'boolean') {
       throw new InvalidApprovalInputError('runScoped must be a boolean');
+    }
+    if (input.runScoped === true) {
+      if (
+        connectorCount === 0 ||
+        input.stepPath !== undefined ||
+        input.suspendedAt !== undefined ||
+        input.resumeCount !== undefined ||
+        input.toolCallId !== undefined
+      ) {
+        throw new InvalidApprovalInputError(
+          'runScoped grants require connectors and may not carry step, suspension, resume-count, or tool-call identity',
+        );
+      }
+    } else if (connectorCount > 0) {
+      if (input.stepPath === undefined || input.suspendedAt === undefined) {
+        throw new InvalidApprovalInputError(
+          'step-scoped connector grants require stepPath and suspendedAt',
+        );
+      }
+    }
+    if (
+      input.runScoped !== true &&
+      input.stepPath === undefined &&
+      (input.suspendedAt !== undefined ||
+        input.resumeCount !== undefined ||
+        input.toolCallId !== undefined)
+    ) {
+      throw new InvalidApprovalInputError(
+        'suspension and tool-call identity require a stepPath',
+      );
+    }
+    if (input.resumeCount !== undefined && input.suspendedAt === undefined) {
+      throw new InvalidApprovalInputError('resumeCount requires suspendedAt');
     }
     if (
       input.priority !== undefined &&

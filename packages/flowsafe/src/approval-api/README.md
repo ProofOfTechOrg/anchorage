@@ -28,7 +28,7 @@ decision. Grants never cross an HTTP boundary.
   is no `/sla/sweep` route.
 - `grants.ts`: the seam between the queue and the runner. Plugs into the
   Durable Object runner's `requestContextForRun`. On every start or resume, it
-  derives the Breakwater grant key from `approved` records.
+  derives structured Breakwater grants from `approved` records.
 - The host bridge is deployment glue (see `spike/worker.ts`): whatever
   observes a suspension creates the queue record, carrying the suspended
   step's path and the connectors that approval should unlock.
@@ -86,18 +86,18 @@ connector grants, step binding, requester attribution, or resume topology.
   the whole request.
 - **Derive grants instead of transporting them**: The public resume route
   carries only `{ step, resumeData }`. The runner reads approved records from
-  the tenant-bound store and writes the resulting connector list into
-  `requestContext`. A proxy cannot forge a value that never appears in HTTP.
+  the tenant-bound store and writes structured grants plus the current
+  execution identity into `requestContext`. A proxy cannot forge a value that
+  never appears in HTTP.
 - **Bind a decision to one exact suspension**: The bridge captures
   `(suspendedAt, resumeCount)` when it creates a step approval. Grant
   derivation requires both values to match the leg being resumed. Approval at
   one step cannot unlock another step, and an earlier approval cannot unlock a
   later suspension of the same step.
-- **Retain the timestamp comparison only for legacy rows**: Records created by
-  older bridges may lack a captured `suspendedAt`. Those rows use the
-  transitional rule `decidedAt > suspendedAt` and require the service and
-  runner clocks to agree. Current bridges always write the exact suspension
-  fingerprint, so new records do not depend on decision timing.
+- **Fail closed on legacy identity**: Capability-bearing rows need an explicit
+  `grantScope` and exact suspension identity. Durable-agent rows also need one
+  connector and a non-empty `toolCallId`. Older rows without these fields mint
+  nothing.
 - **Keep Breakwater out of the runtime dependency graph**: `contract.ts`
   mirrors the shared request-context keys, role union, and audit shape.
   Literal-equality tests compare those values against Breakwater source and
@@ -154,10 +154,10 @@ connector grants, step binding, requester attribution, or resume topology.
 
 ## Preserve the security guarantees
 
-- The `requestContext` capability keys (`breakwater.approvedConnectors`,
-  `breakwater.actor`) must never be populated from client input, model
-  output, or tool results. Only the provider, service, and trusted host bridge
-  may set them.
+- The `requestContext` capability keys (`breakwater.connectorGrants`,
+  `breakwater.connectorExecution`, `breakwater.actor`) must never be populated
+  from client input, model output, or tool results. Only the provider, service,
+  trusted runtime, and trusted host bridge may set them.
 - `service.create()` requires the input `runId` to carry the store's tenant
   prefix. Reads still filter on `tenant_id`; the prefix check prevents an
   orphan approval record at the write boundary.
@@ -175,12 +175,15 @@ connector grants, step binding, requester attribution, or resume topology.
   explicit: a step-less record mints on every leg only when it also carries
   `runScoped: true`, and mints nothing otherwise. "Absent `stepPath` implies
   run-wide privilege" was an inverted default.
+- Durable-agent bridges persist `toolCallId` and derive `tool-call` scope.
+  Workflow gates derive `suspension` scope. Explicit `runScoped: true` records
+  derive `run` scope.
 - The HTTP create route is off by default through
   `createApprovalRouter({ allowCreate: false })`. When a host enables it, the
   route returns 400 for any body containing a server-only field
-  (`connectors`, `stepPath`, `suspendedAt`, `resumedAt`, `resumeCount`,
-  `runScoped`, `requestedBy`, or `resumeTarget`) and forces `requestedBy` to
-  the authenticated actor. `service.create()` still honors an explicit
+  (`connectors`, `grantScope`, `toolCallId`, `stepPath`, `suspendedAt`,
+  `resumedAt`, `resumeCount`, `runScoped`, `requestedBy`, or `resumeTarget`)
+  and forces `requestedBy` to the authenticated actor. `service.create()` still honors an explicit
   `requestedBy`: the in-process bridge attributes the human who advanced the
   run, which is what makes the separation-of-duties check effective.
 - Records are JSON-safe end to end (validated at create) so the two store
@@ -189,7 +192,6 @@ connector grants, step binding, requester attribution, or resume topology.
   matches both exactly. `resumeCount` is undefined on the first suspension,
   then increases on every resume. It distinguishes repeated suspensions even
   if their millisecond timestamps match. `resumedAt` remains informational
-  because Mastra records it only for payload-bearing resumes. Only legacy rows
-  without a captured `suspendedAt` use the shared-clock
-  `decidedAt > suspendedAt` fallback.
+  because Mastra records it only for payload-bearing resumes. Legacy rows
+  without an exact identity mint nothing.
 - `escalated` stays decidable; `approved`/`rejected` are terminal.

@@ -14,8 +14,9 @@ import {
 } from '../policy-engine/index.js';
 import { ACTOR_CONTEXT_KEY, type Actor } from '../rbac/index.js';
 import {
-  APPROVED_CONNECTORS_CONTEXT_KEY,
   type AtomicIdempotencyStore,
+  CONNECTOR_EXECUTION_CONTEXT_KEY,
+  CONNECTOR_GRANTS_CONTEXT_KEY,
   ConnectorPolicyError,
   connectorManifest,
   createConnector,
@@ -40,7 +41,44 @@ function makeContext(
   const requestContext = new RequestContext();
   if (options.actor) requestContext.set(ACTOR_CONTEXT_KEY, options.actor);
   if (options.approved) {
-    requestContext.set(APPROVED_CONNECTORS_CONTEXT_KEY, options.approved);
+    requestContext.set(WORKFLOW_SCOPE_CONTEXT_KEY, 'workflow-1');
+    requestContext.set('runId', 'run-1');
+    requestContext.set(CONNECTOR_EXECUTION_CONTEXT_KEY, {
+      kind: 'resume',
+      workflowId: 'workflow-1',
+      runId: 'run-1',
+      suspension: {
+        stepPath: ['gate'],
+        suspendedAt: 1_000,
+      },
+    });
+    requestContext.set(
+      CONNECTOR_GRANTS_CONTEXT_KEY,
+      options.approved.map((connectorId) =>
+        options.agent
+          ? {
+              scope: 'tool-call',
+              connectorId,
+              workflowId: 'workflow-1',
+              runId: 'run-1',
+              suspension: {
+                stepPath: ['gate'],
+                suspendedAt: 1_000,
+              },
+              toolCallId: 'call-1',
+            }
+          : {
+              scope: 'suspension',
+              connectorId,
+              workflowId: 'workflow-1',
+              runId: 'run-1',
+              suspension: {
+                stepPath: ['gate'],
+                suspendedAt: 1_000,
+              },
+            },
+      ),
+    );
   }
   if (options.idempotencyKey) {
     requestContext.set(IDEMPOTENCY_KEY_CONTEXT_KEY, options.idempotencyKey);
@@ -61,6 +99,83 @@ function makeContext(
     };
   }
   return context;
+}
+
+function makeToolCallGrantContext(
+  options: {
+    connectorId?: string;
+    grantWorkflowId?: string;
+    grantRunId?: string;
+    grantIsolationScope?: string;
+    grantStepPath?: readonly string[];
+    grantSuspendedAt?: number;
+    grantResumeCount?: number;
+    grantToolCallId?: string;
+    executionWorkflowId?: string;
+    executionRunId?: string;
+    executionIsolationScope?: string;
+    executionStepPath?: readonly string[];
+    executionSuspendedAt?: number;
+    executionResumeCount?: number;
+    workflowScope?: string;
+    requestRunId?: string;
+    requestIsolationScope?: string;
+    agentToolCallId?: string;
+    grants?: unknown;
+    legacyGrant?: unknown;
+  } = {},
+): ToolExecutionContext {
+  const requestContext = new RequestContext();
+  requestContext.set(
+    WORKFLOW_SCOPE_CONTEXT_KEY,
+    options.workflowScope ?? 'workflow-1',
+  );
+  requestContext.set('runId', options.requestRunId ?? 'tenant_run-1');
+  requestContext.set(
+    ISOLATION_SCOPE_CONTEXT_KEY,
+    options.requestIsolationScope ?? 'tenant',
+  );
+  requestContext.set(CONNECTOR_EXECUTION_CONTEXT_KEY, {
+    kind: 'resume',
+    workflowId: options.executionWorkflowId ?? 'workflow-1',
+    runId: options.executionRunId ?? 'tenant_run-1',
+    isolationScope: options.executionIsolationScope ?? 'tenant',
+    suspension: {
+      stepPath: options.executionStepPath ?? ['gate'],
+      suspendedAt: options.executionSuspendedAt ?? 1_000,
+      resumeCount: options.executionResumeCount ?? 2,
+    },
+  });
+  requestContext.set(
+    CONNECTOR_GRANTS_CONTEXT_KEY,
+    options.grants ?? [
+      {
+        scope: 'tool-call',
+        connectorId: options.connectorId ?? 'salesforce.createContact',
+        workflowId: options.grantWorkflowId ?? 'workflow-1',
+        runId: options.grantRunId ?? 'tenant_run-1',
+        isolationScope: options.grantIsolationScope ?? 'tenant',
+        suspension: {
+          stepPath: options.grantStepPath ?? ['gate'],
+          suspendedAt: options.grantSuspendedAt ?? 1_000,
+          resumeCount: options.grantResumeCount ?? 2,
+        },
+        toolCallId: options.grantToolCallId ?? 'call-1',
+      },
+    ],
+  );
+  if (options.legacyGrant !== undefined) {
+    requestContext.set('breakwater.approvedConnectors', options.legacyGrant);
+  }
+  return {
+    requestContext,
+    agent: {
+      agentId: 'agent-1',
+      toolCallId: options.agentToolCallId ?? 'call-1',
+      messages: [],
+      suspend: async () => {},
+    },
+  } as unknown as ToolExecutionContext;
 }
 
 // Structural on purpose: connectors infer different TOutput per test, and
@@ -492,6 +607,144 @@ describe('write permission gate', () => {
     expect(execute).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    ['connector', { connectorId: 'salesforce.otherCall' }],
+    ['workflow', { grantWorkflowId: 'workflow-2' }],
+    ['run', { grantRunId: 'tenant_run-2' }],
+    ['tenant', { grantIsolationScope: 'other-tenant' }],
+    ['step', { grantStepPath: ['other-gate'] }],
+    ['suspension', { grantSuspendedAt: 999 }],
+    ['resume count', { grantResumeCount: 1 }],
+    ['tool call', { grantToolCallId: 'call-2' }],
+  ] as const)('denies a tool-call grant with the wrong %s identity', async (_field, options) => {
+    const { tool, execute } = makeConnector({
+      permissions: { sideEffect: 'destructive' },
+    });
+
+    await expect(
+      run(tool, input, makeToolCallGrantContext(options)),
+    ).rejects.toThrow(ConnectorPolicyError);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('fails closed for legacy connector arrays and malformed structured grants', async () => {
+    const { tool, execute } = makeConnector({
+      permissions: { sideEffect: 'destructive' },
+    });
+    const legacyOnly = makeToolCallGrantContext({
+      grants: ['salesforce.createContact'],
+    });
+    const mixed = makeToolCallGrantContext({
+      grants: [
+        {
+          scope: 'tool-call',
+          connectorId: 'salesforce.createContact',
+          workflowId: 'workflow-1',
+          runId: 'tenant_run-1',
+          isolationScope: 'tenant',
+          suspension: {
+            stepPath: ['gate'],
+            suspendedAt: 1_000,
+            resumeCount: 2,
+          },
+          toolCallId: 'call-1',
+        },
+        { connectorId: 'malformed' },
+      ],
+    });
+    const legacyAlongsideStructured = makeToolCallGrantContext({
+      legacyGrant: ['salesforce.createContact'],
+    });
+
+    for (const context of [legacyOnly, mixed, legacyAlongsideStructured]) {
+      await expect(run(tool, input, context)).rejects.toThrow(
+        ConnectorPolicyError,
+      );
+    }
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('keeps retry authority on the same toolCallId but denies a new call identity', async () => {
+    const { tool, execute } = makeConnector({
+      permissions: { sideEffect: 'destructive' },
+    });
+    const approvedAttempt = makeToolCallGrantContext();
+
+    expect(await run(tool, input, approvedAttempt)).toEqual({ ok: true });
+    expect(await run(tool, input, approvedAttempt)).toEqual({ ok: true });
+    await expect(
+      run(
+        tool,
+        input,
+        makeToolCallGrantContext({ agentToolCallId: 'call-retried-by-model' }),
+      ),
+    ).rejects.toThrow(ConnectorPolicyError);
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+
+  it('authorizes an explicit run-scoped grant independently of suspension grants', async () => {
+    const { tool, execute } = makeConnector({
+      permissions: { sideEffect: 'destructive' },
+    });
+    const requestContext = new RequestContext();
+    requestContext.set(WORKFLOW_SCOPE_CONTEXT_KEY, 'workflow-1');
+    requestContext.set('runId', 'tenant_run-1');
+    requestContext.set(ISOLATION_SCOPE_CONTEXT_KEY, 'tenant');
+    requestContext.set(CONNECTOR_EXECUTION_CONTEXT_KEY, {
+      kind: 'start',
+      workflowId: 'workflow-1',
+      runId: 'tenant_run-1',
+      isolationScope: 'tenant',
+    });
+    requestContext.set(CONNECTOR_GRANTS_CONTEXT_KEY, [
+      {
+        scope: 'run',
+        connectorId: 'salesforce.createContact',
+        workflowId: 'workflow-1',
+        runId: 'tenant_run-1',
+        isolationScope: 'tenant',
+      },
+    ]);
+
+    expect(
+      await run(tool, input, {
+        requestContext,
+      } as unknown as ToolExecutionContext),
+    ).toEqual({ ok: true });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('audits effective grant scope and identity without connector input', async () => {
+    const audit = new AuditLogger();
+    const { tool } = makeConnector({
+      permissions: { sideEffect: 'destructive' },
+      policies: { audit },
+    });
+    const privateInput = { email: PRIVATE_BACKEND_SENTINEL };
+
+    await run(tool, privateInput, makeToolCallGrantContext());
+
+    expect(audit.events()).toContainEqual(
+      expect.objectContaining({
+        action: 'connector.approval',
+        resource: 'salesforce.createContact',
+        decision: 'allowed',
+        detail: expect.objectContaining({
+          grantScope: 'tool-call',
+          workflowId: 'workflow-1',
+          runId: 'tenant_run-1',
+          stepPath: ['gate'],
+          suspendedAt: 1_000,
+          resumeCount: 2,
+          toolCallId: 'call-1',
+        }),
+      }),
+    );
+    expect(JSON.stringify(audit.events())).not.toContain(
+      PRIVATE_BACKEND_SENTINEL,
+    );
+  });
+
   it('ignores grants for other connectors', async () => {
     // #given
     const { tool } = makeConnector({
@@ -541,11 +794,16 @@ describe('write permission gate', () => {
       execute: async (_input, context) => run(inner.tool, input, context),
       permissions: { sideEffect: 'read' },
     });
-    // #when
+    // #when — the outer tool's valid grant is forwarded too. It must not become
+    // a wildcard for the inner connector even though the tool-call identity
+    // and exact suspension leg are otherwise unchanged.
     const denied = await run(
       composite,
       input,
-      makeContext({ agent: true }),
+      makeContext({
+        agent: true,
+        approved: ['crm.cleanupPipeline'],
+      }),
     ).catch((error: unknown) => error);
     // #then
     expect(denied).toBeInstanceOf(ConnectorPolicyError);
@@ -2472,6 +2730,30 @@ describe('_background model-override defense (DL-005)', () => {
       _background: { enabled: false },
     }).catch((error: unknown) => error);
     // #then
+    expect(failure).toBeInstanceOf(ConnectorPolicyError);
+    expect((failure as ConnectorPolicyError).policy).toBe('background');
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('does not let an exact structured grant make a write connector background-eligible', async () => {
+    const execute = vi.fn(async () => ({ ok: true }));
+    const tool = createConnector({
+      id: 'crm.assign',
+      description: 'approval-gated foreground-only write connector',
+      execute,
+      permissions: { sideEffect: 'write', requiresApproval: true },
+    });
+    const context = makeContext({
+      agent: true,
+      approved: ['crm.assign'],
+    });
+
+    const failure = await run(
+      tool,
+      { account: 'acme', _background: { enabled: true } },
+      context,
+    ).catch((error: unknown) => error);
+
     expect(failure).toBeInstanceOf(ConnectorPolicyError);
     expect((failure as ConnectorPolicyError).policy).toBe('background');
     expect(execute).not.toHaveBeenCalled();

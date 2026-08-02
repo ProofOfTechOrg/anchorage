@@ -27,7 +27,9 @@ export {
 export {
   AGENT_APPROVAL_SUSPEND_TYPE,
   type AgentApprovalSuspend,
+  type AgentGateGrantRequest,
   agentGateConnectors,
+  agentGateGrantRequest,
   parseAgentApprovalSuspend,
 } from './approval-shapes.js';
 export {

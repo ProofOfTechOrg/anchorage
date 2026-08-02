@@ -129,14 +129,21 @@ try {
     `import {
   AgentCliError,
   AuditLogger,
+  CONNECTOR_EXECUTION_CONTEXT_KEY,
+  CONNECTOR_GRANTS_CONTEXT_KEY,
   createGuardedAgent,
   createCodexConnector,
   type AgentCliErrorCode,
   type AgentCliErrorMetadata,
+  type ConnectorApprovalGrant,
+  type ConnectorExecutionIdentity,
   type GuardedAgentHandle,
 } from '@proofoftech/breakwater';
 import { isGuardedAgentHandle } from '@proofoftech/breakwater/agent';
-import { connectorManifest } from '@proofoftech/breakwater/connector-sdk';
+import {
+  connectorManifest,
+  type ConnectorApprovalSuspension,
+} from '@proofoftech/breakwater/connector-sdk';
 import { PolicyEngine } from '@proofoftech/breakwater/policy-engine';
 import { RBACMiddleware } from '@proofoftech/breakwater/rbac';
 import type { AuditEvent } from '@proofoftech/breakwater/audit';
@@ -145,6 +152,27 @@ import { CODEX_CLI } from '@proofoftech/breakwater/agent-cli';
 const code: AgentCliErrorCode = 'nonzero-exit';
 const metadata: AgentCliErrorMetadata = { code };
 const event = null as AuditEvent | null;
+const suspension: ConnectorApprovalSuspension = {
+  stepPath: ['publish'],
+  suspendedAt: 1,
+  resumeCount: 1,
+};
+const grant: ConnectorApprovalGrant = {
+  scope: 'tool-call',
+  connectorId: 'publisher',
+  workflowId: 'launch',
+  runId: 'run-1',
+  isolationScope: 'acme',
+  suspension,
+  toolCallId: 'call-1',
+};
+const execution: ConnectorExecutionIdentity = {
+  kind: 'resume',
+  workflowId: grant.workflowId,
+  runId: grant.runId,
+  isolationScope: grant.isolationScope,
+  suspension,
+};
 const guarded: GuardedAgentHandle = createGuardedAgent({
   id: 'packed-agent',
   name: 'Packed agent',
@@ -164,6 +192,8 @@ const tool = createCodexConnector({ exec: async () => ({
 
 void AgentCliError;
 void AuditLogger;
+void CONNECTOR_EXECUTION_CONTEXT_KEY;
+void CONNECTOR_GRANTS_CONTEXT_KEY;
 void PolicyEngine;
 void RBACMiddleware;
 void CODEX_CLI;
@@ -171,6 +201,8 @@ void connectorManifest(tool);
 void isGuardedAgentHandle(guarded);
 void metadata;
 void event;
+void grant;
+void execution;
 `,
   );
   await writeFile(
@@ -186,6 +218,8 @@ import {
 import { isGuardedAgentHandle } from '@proofoftech/breakwater/agent';
 import {
   DRY_RUN_CONTEXT_KEY,
+  CONNECTOR_EXECUTION_CONTEXT_KEY,
+  CONNECTOR_GRANTS_CONTEXT_KEY,
   connectorManifest,
 } from '@proofoftech/breakwater/connector-sdk';
 
@@ -196,6 +230,11 @@ await Promise.all([
   import('@proofoftech/breakwater/audit'),
   import('@proofoftech/breakwater/agent-cli'),
 ]);
+assert.equal(CONNECTOR_GRANTS_CONTEXT_KEY, 'breakwater.connectorGrants');
+assert.equal(
+  CONNECTOR_EXECUTION_CONTEXT_KEY,
+  'breakwater.connectorExecution',
+);
 
 const guarded = createGuardedAgent({
   id: 'packed-agent',

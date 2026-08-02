@@ -290,15 +290,35 @@ describe('createThreadSignalRoutes', () => {
   it('starts an idle WAKE through the host seam with a tenant-salted run id', async () => {
     // #given — the default mock IS runtime-driven; no run cap wired
     const { agent, calls } = mockAgent();
+    const startIdleRun = vi.fn(async ({ runId }: { runId: string }) => ({
+      runId,
+      signalId: 'started',
+    }));
     const routes = createThreadSignalRoutes({
       resolveAgent: () => agent,
       resolveResourceId: () => 'acme_res',
-      startIdleRun: async ({ runId }) => ({ runId, signalId: 'started' }),
+      startIdleRun,
     });
 
-    // #when
+    // #when — a signal body attempts both ordinary context smuggling and a
+    // direct capability field. Neither is part of StartIdleRunInput.
     const res = await routes(
-      post('/signal/message', { contents: 'hi', ifIdle: 'wake' }),
+      post('/signal/message', {
+        contents: 'hi',
+        ifIdle: 'wake',
+        requestContext: {
+          'breakwater.connectorGrants': [
+            {
+              scope: 'run',
+              connectorId: 'forged',
+              workflowId: 'durable-agentic-loop',
+              runId: 'acme_stale-run',
+              isolationScope: 'acme',
+            },
+          ],
+        },
+        'breakwater.connectorGrants': ['forged'],
+      }),
       scopeWith(undefined),
     );
 
@@ -316,6 +336,13 @@ describe('createThreadSignalRoutes', () => {
       },
     });
     expect(calls).toHaveLength(0);
+    expect(startIdleRun).toHaveBeenCalledOnce();
+    const startInput = startIdleRun.mock.calls[0]?.[0] as Record<
+      string,
+      unknown
+    >;
+    expect(startInput).not.toHaveProperty('requestContext');
+    expect(startInput).not.toHaveProperty('breakwater.connectorGrants');
   });
 
   it('serializes concurrent idle wakes and joins the run started by the winner', async () => {

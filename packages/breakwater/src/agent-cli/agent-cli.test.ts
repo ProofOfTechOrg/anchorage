@@ -5,13 +5,15 @@ import { describe, expect, it, type Mock, vi } from 'vitest';
 
 import { AuditLogger } from '../audit/index.js';
 import {
-  APPROVED_CONNECTORS_CONTEXT_KEY,
+  CONNECTOR_EXECUTION_CONTEXT_KEY,
+  CONNECTOR_GRANTS_CONTEXT_KEY,
   ConnectorPolicyError,
   connectorManifest,
   DRY_RUN_CONTEXT_KEY,
   IDEMPOTENCY_KEY_CONTEXT_KEY,
   InMemoryIdempotencyStore,
 } from '../connector-sdk/index.js';
+import { WORKFLOW_SCOPE_CONTEXT_KEY } from '../policy-engine/index.js';
 import {
   type AgentCliDefinition,
   AgentCliError,
@@ -32,7 +34,30 @@ function makeContext(
 ): ToolExecutionContext {
   const requestContext = new RequestContext();
   if (options.approved) {
-    requestContext.set(APPROVED_CONNECTORS_CONTEXT_KEY, options.approved);
+    requestContext.set(WORKFLOW_SCOPE_CONTEXT_KEY, 'workflow-1');
+    requestContext.set('runId', 'run-1');
+    requestContext.set(CONNECTOR_EXECUTION_CONTEXT_KEY, {
+      kind: 'resume',
+      workflowId: 'workflow-1',
+      runId: 'run-1',
+      suspension: {
+        stepPath: ['gate'],
+        suspendedAt: 1_000,
+      },
+    });
+    requestContext.set(
+      CONNECTOR_GRANTS_CONTEXT_KEY,
+      options.approved.map((connectorId) => ({
+        scope: 'suspension',
+        connectorId,
+        workflowId: 'workflow-1',
+        runId: 'run-1',
+        suspension: {
+          stepPath: ['gate'],
+          suspendedAt: 1_000,
+        },
+      })),
+    );
   }
   if (options.dryRun) {
     requestContext.set(DRY_RUN_CONTEXT_KEY, true);

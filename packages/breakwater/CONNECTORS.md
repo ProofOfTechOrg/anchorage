@@ -139,7 +139,7 @@ degraded store or a stale idempotency reservation takeover.
 | --- | --- | --- |
 | `sideEffect` | The worst state change the connector can cause | `read` is read-only. `write`, `destructive`, and `idempotent` are write-class. `destructive` requires approval by default. Mastra MCP hints are derived from this value. |
 | `egress` | Every hostname the connector contacts | Entries must be bare hosts or leading `*.` wildcards. The organization policy gates the declared list. `runtime.fetch` gates actual HTTP(S) requests and redirect hops against the declaration. An empty or absent list means no network through that fetch. |
-| `requiresApproval` | This connector always needs human approval | Real execution requires its ID in `breakwater.approvedConnectors`, regardless of call path. Mastra's native approval pause is also enabled, but the grant remains the authorization token. |
+| `requiresApproval` | This connector always needs human approval | Real execution requires a matching structured grant in `breakwater.connectorGrants`, regardless of call path. Mastra's native approval pause is also enabled, but the grant remains the authorization token. |
 | `dryRun` | A side-effect-free simulation exists | Requires `dryRunExecute`. The wrapper rejects a `dryRunExecute` that the manifest does not declare. A dry-run request never falls through to real execution. |
 | `idempotencyKey` | Repeated operation identities must replay | Requires `policies.idempotencyStore` and a non-empty `breakwater.idempotencyKey` for each real call. |
 | `rateLimit` | Fixed-window execution budget | Uses `<count>/<unit>`, where unit is `s`, `sec`, `second`, `m`, `min`, `minute`, `h`, `hour`, `d`, or `day`. Requires `policies.rateLimitStore`. |
@@ -206,18 +206,33 @@ resume would receive.
 import { RequestContext } from '@mastra/core/request-context';
 import type { ToolExecutionContext } from '@mastra/core/tools';
 import {
-  APPROVED_CONNECTORS_CONTEXT_KEY,
+  CONNECTOR_EXECUTION_CONTEXT_KEY,
+  CONNECTOR_GRANTS_CONTEXT_KEY,
   IDEMPOTENCY_KEY_CONTEXT_KEY,
 } from '@proofoftech/breakwater/connector-sdk';
+import { WORKFLOW_SCOPE_CONTEXT_KEY } from '@proofoftech/breakwater/policy-engine';
 
 const requestContext = new RequestContext();
-requestContext.set(APPROVED_CONNECTORS_CONTEXT_KEY, [
-  'slack.post-message',
-]);
-requestContext.set(
-  IDEMPOTENCY_KEY_CONTEXT_KEY,
-  'incident-481:initial-notice',
-);
+requestContext.set(WORKFLOW_SCOPE_CONTEXT_KEY, 'incident-response');
+requestContext.set('runId', 'server_minted_run_id');
+const suspension = {
+  stepPath: ['approve-notice'],
+  suspendedAt: 1751882400000,
+};
+requestContext.set(CONNECTOR_EXECUTION_CONTEXT_KEY, {
+  kind: 'resume',
+  workflowId: 'incident-response',
+  runId: 'server_minted_run_id',
+  suspension,
+});
+requestContext.set(CONNECTOR_GRANTS_CONTEXT_KEY, [{
+  scope: 'suspension',
+  connectorId: 'slack.post-message',
+  workflowId: 'incident-response',
+  runId: 'server_minted_run_id',
+  suspension,
+}]);
+requestContext.set(IDEMPOTENCY_KEY_CONTEXT_KEY, 'incident-481:notice');
 
 const result = await slackPoster.execute?.(
   {
@@ -228,11 +243,7 @@ const result = await slackPoster.execute?.(
 );
 ```
 
-Do not accept `APPROVED_CONNECTORS_CONTEXT_KEY`,
-`ISOLATION_SCOPE_CONTEXT_KEY`, or `WORKFLOW_SCOPE_CONTEXT_KEY` from clients.
-They are capabilities minted after authentication or approval. A
-multi-tenant host should also register `tenantIsolation()` so an accidentally
-missing scope is a denial instead of a shared cache or budget.
+This example shows the values a trusted runtime must produce. Application routes must not construct them from client data. Do not accept `CONNECTOR_GRANTS_CONTEXT_KEY`, `CONNECTOR_EXECUTION_CONTEXT_KEY`, `ISOLATION_SCOPE_CONTEXT_KEY`, `runId`, or `WORKFLOW_SCOPE_CONTEXT_KEY` from clients. A multi-tenant host should also register `tenantIsolation()` so a missing scope becomes a denial instead of a shared cache or budget.
 
 To request simulation:
 

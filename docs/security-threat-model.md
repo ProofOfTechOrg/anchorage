@@ -52,7 +52,8 @@ Breakwater context keys are capabilities or trusted namespace claims:
 
 ```text
 breakwater.actor
-breakwater.approvedConnectors
+breakwater.connectorGrants
+breakwater.connectorExecution
 breakwater.idempotencyKey
 breakwater.dryRun
 breakwater.workflowScope
@@ -63,7 +64,7 @@ Only trusted host/runtime code may populate actor, grant, workflow, or tenant is
 
 Flowsafe's shared execution-context boundary reserves every `breakwater.*` key, `mastra:goal`, `runId`, `threadId`, `resourceId`, `__proto__`, `constructor`, and `prototype`. External HTTP bodies reject these fields. Persisted compatibility paths strip them before trusted derivation.
 
-Trusted merges apply sanitized external or stored context first, then workflow and isolation scope, the exact-leg connector grant, and trusted actor/audit correlation. An empty connector grant overwrites any stale value.
+Trusted merges apply sanitized external or stored context first, then workflow, run, isolation, current execution identity, structured connector grants, and trusted actor/audit correlation. An empty grant array overwrites any stale value.
 
 ### Worker to Durable Object
 
@@ -149,14 +150,20 @@ The trusted suspension bridge records:
 - `suspendedAt`;
 - `resumeCount`;
 - server-authored connector ids;
+- an explicit grant scope;
+- Mastra `toolCallId` for durable-agent tool-call approvals;
 - requester attribution;
 - optional server-authored durable-agent resume target.
 
-`approvalGrantProvider()` reads only approved records and requires an exact match on the current leg. The runtime-owned resume count distinguishes repeated same-step suspensions even when timestamps collide.
+`approvalGrantProvider()` reads only approved records. A durable-agent record produces `tool-call` scope and binds connector, tenant, workflow, run, step path, `suspendedAt`, `resumeCount`, and `toolCallId`. A workflow record produces `suspension` scope and binds every field except `toolCallId`, which Mastra cannot reproduce for an arbitrary workflow gate. The runtime-owned resume count distinguishes repeated same-step suspensions even when timestamps collide.
 
 An agent resume target contains the agent, thread, resource, and original authorized principal. A reviewer decision resumes execution as that principal after re-authorizing it against the current catalog: a human principal against the agent's roles, an automated principal against its `allowedAutomation` declaration. The reviewer cannot replace it. Legacy agent approvals without this principal fail closed.
 
-An explicit trusted `runScoped: true` record is a standing grant. A step-less record without that flag grants nothing.
+An explicit trusted `runScoped: true` record produces `run` scope and is a standing grant. A step-less record without that flag grants nothing. Legacy rows without explicit scope and malformed grants fail closed.
+
+The capability is retryable, not one-shot. Mastra persists the durable tool-call ID and reuses it while retrying that call. A new model call receives a new ID and requires approval. Connector idempotency remains responsible for replaying a completed side effect.
+
+Input digests are not part of the grant because canonical serialization and redaction behavior are undefined. One-shot nonces are also excluded because consuming them atomically without breaking retry or eviction recovery requires a connector-execution transaction that Mastra does not expose.
 
 The HTTP create route is disabled by default and cannot set connectors, attribution, fingerprint, run scope, or resume target when enabled.
 

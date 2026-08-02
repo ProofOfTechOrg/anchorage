@@ -94,14 +94,14 @@ These flags allow workspace changes without granting arbitrary host access beyon
 
 ## Approval and dry-run
 
-The adapters declare `sideEffect: "write"` and `requiresApproval: true`. Execution requires the connector id in `breakwater.approvedConnectors`:
+The adapters declare `sideEffect: "write"` and `requiresApproval: true`. Execution requires a matching structured grant in `breakwater.connectorGrants`:
 
 ```text
 agent-cli.claude-code
 agent-cli.codex
 ```
 
-Flowsafe can place one of these ids in a server-authored suspension, store the reviewer decision, and derive the matching grant for the resumed leg.
+Flowsafe can place one of these IDs in a server-authored suspension, store the reviewer decision, and derive the matching exact-suspension grant for the resumed leg. A legacy connector ID array does not authorize execution.
 
 A caller can set breakwater's dry-run request-context key to preview the redacted command. Dry-run never spawns a process and does not need an approval grant.
 

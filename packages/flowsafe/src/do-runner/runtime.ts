@@ -18,6 +18,7 @@
 // cross-instance serialization comes from routing one DO instance per run
 // (see durable-object.ts).
 
+import type { Agent, ToolsInput } from '@mastra/core/agent';
 import type { IMastraLogger } from '@mastra/core/logger';
 import { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
@@ -33,10 +34,12 @@ import type {
 
 import {
   BREAKWATER_ACTOR_KEY,
-  BREAKWATER_APPROVED_CONNECTORS_KEY,
+  BREAKWATER_CONNECTOR_EXECUTION_KEY,
+  BREAKWATER_CONNECTOR_GRANTS_KEY,
   BREAKWATER_ISOLATION_SCOPE_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
 } from './breakwater-keys.js';
+import { mastraRegistryEntries } from './mastra-registry.js';
 import { PATH_SAFE_ID_PATTERN, tenantOfRunId } from './path-safe-id.js';
 import type { HostPubSub } from './pubsub.js';
 import { InMemoryResumeLedger, type ResumeLedger } from './resume-ledger.js';
@@ -176,6 +179,11 @@ const NONTERMINAL_RUN_STATUSES = new Set<WorkflowRunStatus>([
   'pending',
   'paused',
 ]);
+
+// Registered agents may carry incompatible tool/output generics. The public
+// method preserves each concrete type; this erased form is only for handing
+// the heterogeneous registry to Mastra.
+type ErasedRuntimeAgent = Agent<string, ToolsInput, unknown>;
 
 function terminalStateUpdate(
   result: CoreRunResult,
@@ -451,7 +459,7 @@ export type RunLeg =
  * This is the trusted-computing-base seam (security-threat-model.md, trust
  * boundary 6): the DO HTTP boundary never maps requestContext from request
  * bodies, so capability keys — e.g. breakwater's approval grants
- * ('breakwater.approvedConnectors') — can only enter a run through this
+ * ('breakwater.connectorGrants') — can only enter a run through this
  * provider. Wire it to derive values from trusted server-side state (the
  * flowsafe approval store), never from client input, model output, or tool
  * results.
@@ -475,7 +483,6 @@ export type RequestContextProvider = (
 const TRUSTED_IDENTITY_CONTEXT_KEYS = new Set([
   BREAKWATER_ACTOR_KEY,
   'breakwater.auditContext',
-  'runId',
   'threadId',
   'resourceId',
 ]);
@@ -491,14 +498,16 @@ function orderedRequestContext(
     const [key] = entry;
     if (
       key === BREAKWATER_WORKFLOW_SCOPE_KEY ||
-      key === BREAKWATER_ISOLATION_SCOPE_KEY
+      key === BREAKWATER_ISOLATION_SCOPE_KEY ||
+      key === BREAKWATER_CONNECTOR_EXECUTION_KEY ||
+      key === 'runId'
     ) {
       continue;
     }
     if (TRUSTED_IDENTITY_CONTEXT_KEYS.has(key)) {
       identity.push(entry);
     } else if (
-      key === BREAKWATER_APPROVED_CONNECTORS_KEY ||
+      key === BREAKWATER_CONNECTOR_GRANTS_KEY ||
       key.startsWith('breakwater.') ||
       key === 'mastra:goal'
     ) {
@@ -567,6 +576,7 @@ export class RunnerRuntime {
   readonly #storage: MastraCompositeStore;
   readonly #logger: IMastraLogger | false;
   readonly #requestContextForRun?: RequestContextProvider;
+  readonly #agents = new Map<string, ErasedRuntimeAgent>();
   readonly #workflows = new Map<string, AnyWorkflow>();
   readonly #runLocks = new Map<string, Promise<unknown>>();
   // Per-run resume ledger: #runKey(workflowId, runId) -> (stepKey -> times that
@@ -630,6 +640,27 @@ export class RunnerRuntime {
     }
     if (this.#resumeLedgerExplicit) return;
     this.#resumeLedger = ledger;
+  }
+
+  /**
+   * Register an agent that a runtime-owned workflow resolves by id.
+   *
+   * Durable-agent workflows persist only the agent id. Keeping the raw agent
+   * on the same Mastra instance as the workflow lets a resumed run resolve it
+   * after isolate eviction, when the original DurableAgent instance is gone.
+   */
+  registerAgent<TAgentId extends string, TTools extends ToolsInput, TOutput>(
+    agent: Agent<TAgentId, TTools, TOutput>,
+  ): void {
+    if (this.#mastra) {
+      throw new Error(
+        'RunnerRuntime: register all agents before the first run — the Mastra instance is frozen once runs start',
+      );
+    }
+    if (this.#agents.has(agent.id)) {
+      throw new Error(`RunnerRuntime: duplicate agent id '${agent.id}'`);
+    }
+    this.#agents.set(agent.id, agent as unknown as ErasedRuntimeAgent);
   }
 
   register(workflow: AnyWorkflow): void {
@@ -841,6 +872,7 @@ export class RunnerRuntime {
   ): Promise<RequestContext> {
     const base: Record<string, unknown> = {
       [BREAKWATER_WORKFLOW_SCOPE_KEY]: workflowId,
+      runId,
     };
     // Tenant-salted runs (INV-1: `${tenantId}_${uuid}`) also mint the OPAQUE
     // isolation scope, segmenting breakwater's connector idempotency and
@@ -865,6 +897,30 @@ export class RunnerRuntime {
     const tenantId = tenantOfRunId(runId);
     if (tenantId !== undefined) {
       base[BREAKWATER_ISOLATION_SCOPE_KEY] = tenantId;
+    }
+    if (leg.kind === 'start') {
+      base[BREAKWATER_CONNECTOR_EXECUTION_KEY] = {
+        kind: 'start',
+        workflowId,
+        runId,
+        ...(tenantId === undefined ? {} : { isolationScope: tenantId }),
+      };
+    } else if (leg.step !== undefined && leg.suspendedAt !== undefined) {
+      base[BREAKWATER_CONNECTOR_EXECUTION_KEY] = {
+        kind: 'resume',
+        workflowId,
+        runId,
+        ...(tenantId === undefined ? {} : { isolationScope: tenantId }),
+        suspension: {
+          stepPath: [...leg.step],
+          suspendedAt: leg.suspendedAt,
+          ...(leg.resumeCount === undefined
+            ? {}
+            : { resumeCount: leg.resumeCount }),
+        },
+      };
+    } else {
+      base[BREAKWATER_CONNECTOR_EXECUTION_KEY] = null;
     }
     const values = this.#requestContextForRun
       ? await this.#requestContextForRun(workflowId, runId, leg)
@@ -945,9 +1001,19 @@ export class RunnerRuntime {
   #ensureMastra(): void {
     if (this.#mastra) return;
     this.#mastra = new Mastra({
-      workflows: Object.fromEntries(this.#workflows),
+      // Mastra uses plain-object registries. Remap inherited object keys only,
+      // preserving normal getAgent(id) lookups; collision IDs use intrinsic-id lookup.
+      agents: Object.fromEntries(
+        mastraRegistryEntries(this.#agents, 'runtime-agent'),
+      ),
+      // The same rule keeps normal getWorkflow(id) behavior while making
+      // `__proto__`/`constructor` workflows available via intrinsic id.
+      workflows: Object.fromEntries(
+        mastraRegistryEntries(this.#workflows, 'runtime-workflow'),
+      ),
       storage: this.#storage,
       logger: this.#logger,
+      ...(this.#pubsub !== undefined ? { pubsub: this.#pubsub } : {}),
     });
   }
 

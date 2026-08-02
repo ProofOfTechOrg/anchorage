@@ -20,7 +20,8 @@ export type {
 export {
   APPROVAL_ROLES,
   BREAKWATER_ACTOR_KEY,
-  BREAKWATER_APPROVED_CONNECTORS_KEY,
+  BREAKWATER_CONNECTOR_EXECUTION_KEY,
+  BREAKWATER_CONNECTOR_GRANTS_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
   DECIDER_ROLES,
   RUN_START_ROLES,
@@ -35,7 +36,7 @@ export type {
 export {
   approvalGrantProvider,
   approvalGrantProviderFromFactory,
-  approvedConnectorsForLeg,
+  connectorGrantsForLeg,
   defaultResumeData,
   resumeViaRuntime,
 } from './grants.js';
@@ -112,6 +113,7 @@ export {
 export type {
   ApprovalCursor,
   ApprovalDecision,
+  ApprovalGrantScope,
   ApprovalListFilter,
   ApprovalListOrder,
   ApprovalMetrics,
@@ -121,6 +123,9 @@ export type {
   ApprovalStatus,
   BatchDecideItem,
   BatchDecideResult,
+  ConnectorApprovalGrant,
+  ConnectorApprovalGrantBase,
+  ConnectorApprovalSuspension,
   CreateApprovalInput,
   DecideResult,
   ResumeOutcome,

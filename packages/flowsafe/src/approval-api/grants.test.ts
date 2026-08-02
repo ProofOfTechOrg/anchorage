@@ -2,11 +2,11 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { RunLeg, RunnerRuntime } from '../do-runner/index.js';
-import { BREAKWATER_APPROVED_CONNECTORS_KEY } from './contract.js';
+import { BREAKWATER_CONNECTOR_GRANTS_KEY } from './contract.js';
 import {
   approvalGrantProvider,
   approvalGrantProviderFromFactory,
-  approvedConnectorsForLeg,
+  connectorGrantsForLeg,
   defaultResumeData,
   resumeViaRuntime,
 } from './grants.js';
@@ -19,6 +19,7 @@ let seq = 0;
 function record(overrides: Partial<ApprovalRecord>): ApprovalRecord {
   seq += 1;
   const at = new Date(1700000000000 + seq * 1000).toISOString();
+  const connectorCount = overrides.connectors?.length ?? 0;
   return {
     id: `apr-${seq}`,
     tenantId: 'acme',
@@ -30,6 +31,17 @@ function record(overrides: Partial<ApprovalRecord>): ApprovalRecord {
     status: 'pending',
     createdAt: at,
     updatedAt: at,
+    ...(connectorCount > 0 && overrides.stepPath !== undefined
+      ? {
+          grantScope:
+            overrides.toolCallId === undefined
+              ? ('suspension' as const)
+              : ('tool-call' as const),
+          suspendedAt: SUSPENDED_AT,
+        }
+      : connectorCount > 0 && overrides.runScoped === true
+        ? { grantScope: 'run' as const }
+        : {}),
     ...overrides,
   };
 }
@@ -61,7 +73,59 @@ const RESUME_GATE_RESUSPENDED: RunLeg = {
   resumeCount: RESUME_COUNT,
 };
 
-describe('approvedConnectorsForLeg', () => {
+function suspensionGrant(
+  connectorId: string,
+  options: {
+    stepPath?: readonly string[];
+    suspendedAt?: number;
+    resumeCount?: number;
+    toolCallId?: string;
+  } = {},
+) {
+  const suspension = {
+    stepPath: options.stepPath ?? ['gate'],
+    suspendedAt: options.suspendedAt ?? SUSPENDED_AT,
+    ...(options.resumeCount === undefined
+      ? {}
+      : { resumeCount: options.resumeCount }),
+  };
+  return options.toolCallId === undefined
+    ? {
+        scope: 'suspension' as const,
+        connectorId,
+        workflowId: 'wf',
+        runId: 'run-1',
+        isolationScope: 'acme',
+        suspension,
+      }
+    : {
+        scope: 'tool-call' as const,
+        connectorId,
+        workflowId: 'wf',
+        runId: 'run-1',
+        isolationScope: 'acme',
+        suspension,
+        toolCallId: options.toolCallId,
+      };
+}
+
+function runGrant(
+  connectorId: string,
+  options: {
+    tenantId?: string;
+    runId?: string;
+  } = {},
+) {
+  return {
+    scope: 'run' as const,
+    connectorId,
+    workflowId: 'wf',
+    runId: options.runId ?? 'run-1',
+    isolationScope: options.tenantId ?? 'acme',
+  };
+}
+
+describe('connectorGrantsForLeg', () => {
   it('unions run-scoped records with step records decided during the current suspension', async () => {
     // #given — approved for 'gate' during this suspension, approved
     // run-scoped (no stepPath), approved for a DIFFERENT step, and
@@ -98,7 +162,7 @@ describe('approvedConnectorsForLeg', () => {
     );
 
     // #when
-    const connectors = await approvedConnectorsForLeg(
+    const grants = await connectorGrantsForLeg(
       store,
       'wf',
       'run-1',
@@ -106,43 +170,35 @@ describe('approvedConnectorsForLeg', () => {
     );
 
     // #then — 'other' step's approval does NOT leak into this leg
-    expect(connectors.sort()).toEqual(['blog', 'mailer', 'run-wide']);
+    expect(grants).toEqual(
+      expect.arrayContaining([
+        suspensionGrant('mailer'),
+        suspensionGrant('blog'),
+        runGrant('run-wide'),
+      ]),
+    );
+    expect(grants).toHaveLength(3);
   });
 
-  it('never mints an approval decided before the current suspension began', async () => {
-    // #given — the step suspended once, was approved, ran, and suspended
-    // AGAIN at SUSPENDED_AT; the old approval predates the new suspension
+  it('never falls back to decision chronology for a legacy capability record', async () => {
+    // #given — a pre-upgrade record names a connector but has neither the
+    // explicit grant scope nor an exact suspension fingerprint
     const store = new InMemoryApprovalStore('acme');
     await store.create(
       record({
         status: 'approved',
         stepPath: ['gate'],
         connectors: ['mailer'],
+        grantScope: undefined,
+        suspendedAt: undefined,
         decidedAt: DECIDED_BEFORE,
       }),
     );
 
-    // #when / #then — the earlier incarnation's approval is spent; the new
-    // suspension needs its own decision (a rejected or pending re-quest must
-    // never fall back to it). Equality is also excluded (strictly-after):
-    // chronology under a shared clock then guarantees the deny direction.
+    // #when / #then — even moving decidedAt after the leg would not mint:
+    // legacy identity is inert rather than reconstructed from timestamps
     expect(
-      await approvedConnectorsForLeg(store, 'wf', 'run-1', RESUME_GATE),
-    ).toEqual([]);
-    await store.create(
-      record({
-        status: 'approved',
-        stepPath: ['gate2'],
-        connectors: ['boundary'],
-        decidedAt: new Date(SUSPENDED_AT).toISOString(),
-      }),
-    );
-    expect(
-      await approvedConnectorsForLeg(store, 'wf', 'run-1', {
-        kind: 'resume',
-        step: ['gate2'],
-        suspendedAt: SUSPENDED_AT,
-      }),
+      await connectorGrantsForLeg(store, 'wf', 'run-1', RESUME_GATE),
     ).toEqual([]);
   });
 
@@ -162,13 +218,13 @@ describe('approvedConnectorsForLeg', () => {
     );
 
     // #when — a resume leg whose snapshot carried no suspendedAt
-    const connectors = await approvedConnectorsForLeg(store, 'wf', 'run-1', {
+    const grants = await connectorGrantsForLeg(store, 'wf', 'run-1', {
       kind: 'resume',
       step: ['gate'],
     });
 
     // #then — only the standing run-scoped grant applies
-    expect(connectors).toEqual(['run-wide']);
+    expect(grants).toEqual([runGrant('run-wide')]);
   });
 
   it('mints only run-scoped approvals on start legs', async () => {
@@ -187,12 +243,12 @@ describe('approvedConnectorsForLeg', () => {
     );
 
     // #when
-    const connectors = await approvedConnectorsForLeg(store, 'wf', 'run-1', {
+    const grants = await connectorGrantsForLeg(store, 'wf', 'run-1', {
       kind: 'start',
     });
 
     // #then
-    expect(connectors).toEqual(['run-wide']);
+    expect(grants).toEqual([runGrant('run-wide')]);
   });
 
   it('fails closed: a step-less record without runScoped mints nothing', async () => {
@@ -207,13 +263,13 @@ describe('approvedConnectorsForLeg', () => {
 
     // #when / #then — start, resume-with-step, and unresolvable resume alike
     expect(
-      await approvedConnectorsForLeg(store, 'wf', 'run-1', { kind: 'start' }),
+      await connectorGrantsForLeg(store, 'wf', 'run-1', { kind: 'start' }),
     ).toEqual([]);
     expect(
-      await approvedConnectorsForLeg(store, 'wf', 'run-1', RESUME_GATE),
+      await connectorGrantsForLeg(store, 'wf', 'run-1', RESUME_GATE),
     ).toEqual([]);
     expect(
-      await approvedConnectorsForLeg(store, 'wf', 'run-1', { kind: 'resume' }),
+      await connectorGrantsForLeg(store, 'wf', 'run-1', { kind: 'resume' }),
     ).toEqual([]);
   });
 
@@ -227,12 +283,12 @@ describe('approvedConnectorsForLeg', () => {
 
     // #when / #then
     expect(
-      await approvedConnectorsForLeg(store, 'wf', 'run-1', { kind: 'start' }),
+      await connectorGrantsForLeg(store, 'wf', 'run-1', { kind: 'start' }),
     ).toEqual([]);
   });
 });
 
-describe('approvedConnectorsForLeg — exact suspension binding', () => {
+describe('connectorGrantsForLeg — exact suspension binding', () => {
   it('mints on an exact suspendedAt match regardless of decide timing', async () => {
     // #given — the record is bound to this suspension; decidedAt even
     // PRECEDES the suspension (impossible under one clock, routine under
@@ -250,8 +306,8 @@ describe('approvedConnectorsForLeg — exact suspension binding', () => {
 
     // #when / #then
     expect(
-      await approvedConnectorsForLeg(store, 'wf', 'run-1', RESUME_GATE),
-    ).toEqual(['mailer']);
+      await connectorGrantsForLeg(store, 'wf', 'run-1', RESUME_GATE),
+    ).toEqual([suspensionGrant('mailer')]);
   });
 
   it('denies a mismatched suspendedAt even when decidedAt succeeds the suspension', async () => {
@@ -271,7 +327,7 @@ describe('approvedConnectorsForLeg — exact suspension binding', () => {
 
     // #when / #then
     expect(
-      await approvedConnectorsForLeg(store, 'wf', 'run-1', RESUME_GATE),
+      await connectorGrantsForLeg(store, 'wf', 'run-1', RESUME_GATE),
     ).toEqual([]);
   });
 
@@ -290,16 +346,16 @@ describe('approvedConnectorsForLeg — exact suspension binding', () => {
 
     // #when / #then — unresolvable suspension: step grants never mint
     expect(
-      await approvedConnectorsForLeg(store, 'wf', 'run-1', {
+      await connectorGrantsForLeg(store, 'wf', 'run-1', {
         kind: 'resume',
         step: ['gate'],
       }),
     ).toEqual([]);
   });
 
-  it('run-scopes a step-less runScoped record even when it carries suspendedAt', async () => {
-    // #given — step-less + runScoped = the deliberate run-scoped opt-out;
-    // suspendedAt on it is inert (the applies-rule keys binding off stepPath)
+  it('fails closed when a run-scoped record also carries suspension identity', async () => {
+    // #given — a malformed standing grant mixes broad run scope with an exact
+    // suspension fingerprint
     const store = new InMemoryApprovalStore('acme');
     await store.create(
       record({
@@ -312,12 +368,12 @@ describe('approvedConnectorsForLeg — exact suspension binding', () => {
 
     // #when / #then
     expect(
-      await approvedConnectorsForLeg(store, 'wf', 'run-1', RESUME_GATE),
-    ).toEqual(['run-wide']);
+      await connectorGrantsForLeg(store, 'wf', 'run-1', RESUME_GATE),
+    ).toEqual([]);
   });
 });
 
-describe('approvedConnectorsForLeg — same-step re-suspension pair binding', () => {
+describe('connectorGrantsForLeg — same-step re-suspension pair binding', () => {
   it('denies a first-suspension approval on a re-suspension leg even when suspendedAt collides', async () => {
     // #given — an approval bound to the step's FIRST suspension (resumeCount
     // undefined); the leg is a RE-suspension of the SAME step at the SAME
@@ -339,7 +395,7 @@ describe('approvedConnectorsForLeg — same-step re-suspension pair binding', ()
 
     // #when / #then — the spent round-1 approval must not mint into round 2
     expect(
-      await approvedConnectorsForLeg(
+      await connectorGrantsForLeg(
         store,
         'wf',
         'run-1',
@@ -365,13 +421,13 @@ describe('approvedConnectorsForLeg — same-step re-suspension pair binding', ()
 
     // #when / #then
     expect(
-      await approvedConnectorsForLeg(
+      await connectorGrantsForLeg(
         store,
         'wf',
         'run-1',
         RESUME_GATE_RESUSPENDED,
       ),
-    ).toEqual(['mailer']);
+    ).toEqual([suspensionGrant('mailer', { resumeCount: RESUME_COUNT })]);
   });
 
   it('denies when resumeCount differs even though suspendedAt matches (deep-chain)', async () => {
@@ -394,7 +450,7 @@ describe('approvedConnectorsForLeg — same-step re-suspension pair binding', ()
 
     // #when / #then
     expect(
-      await approvedConnectorsForLeg(
+      await connectorGrantsForLeg(
         store,
         'wf',
         'run-1',
@@ -423,7 +479,7 @@ describe('approvedConnectorsForLeg — same-step re-suspension pair binding', ()
 
     // #when / #then — RESUME_GATE is a leg with resumeCount undefined
     expect(
-      await approvedConnectorsForLeg(store, 'wf', 'run-1', RESUME_GATE),
+      await connectorGrantsForLeg(store, 'wf', 'run-1', RESUME_GATE),
     ).toEqual([]);
   });
 
@@ -455,13 +511,13 @@ describe('approvedConnectorsForLeg — same-step re-suspension pair binding', ()
 
     // #when / #then — only the count-2 approval mints; the spent count-1 does not
     expect(
-      await approvedConnectorsForLeg(store, 'wf', 'run-1', {
+      await connectorGrantsForLeg(store, 'wf', 'run-1', {
         kind: 'resume',
         step: ['gate'],
         suspendedAt: SUSPENDED_AT,
         resumeCount: 2,
       }),
-    ).toEqual(['fresh']);
+    ).toEqual([suspensionGrant('fresh', { resumeCount: 2 })]);
   });
 });
 
@@ -489,7 +545,7 @@ describe('approvalGrantProvider', () => {
 
     // #when / #then
     expect(await provider('wf', 'run-1', RESUME_GATE)).toEqual({
-      [BREAKWATER_APPROVED_CONNECTORS_KEY]: ['mailer'],
+      [BREAKWATER_CONNECTOR_GRANTS_KEY]: [suspensionGrant('mailer')],
     });
   });
 
@@ -510,13 +566,13 @@ describe('approvalGrantProvider', () => {
     // snapshot, so an omitted key would leave an earlier leg's grant alive;
     // the empty list is the revocation.
     expect(await provider('wf', 'run-1', RESUME_GATE)).toEqual({
-      [BREAKWATER_APPROVED_CONNECTORS_KEY]: [],
+      [BREAKWATER_CONNECTOR_GRANTS_KEY]: [],
     });
     expect(await provider('wf', 'run-1', { kind: 'start' })).toEqual({
-      [BREAKWATER_APPROVED_CONNECTORS_KEY]: [],
+      [BREAKWATER_CONNECTOR_GRANTS_KEY]: [],
     });
     expect(await provider('wf', 'run-1', { kind: 'resume' })).toEqual({
-      [BREAKWATER_APPROVED_CONNECTORS_KEY]: [],
+      [BREAKWATER_CONNECTOR_GRANTS_KEY]: [],
     });
   });
 });
@@ -602,7 +658,7 @@ describe('grant derivation — tenant hardening (INV-1 + INV-2)', () => {
     });
 
     // #when
-    await approvedConnectorsForLeg(spy, 'wf', 'acme_run-1', { kind: 'start' });
+    await connectorGrantsForLeg(spy, 'wf', 'acme_run-1', { kind: 'start' });
 
     // #then — one page (the fixture is far under the cap) whose filter carries
     // all three load-bearing predicates; explicit paging adds limit/after but
@@ -621,7 +677,7 @@ describe('grant derivation — tenant hardening (INV-1 + INV-2)', () => {
     // MAX run-scoped 'noise' records, then a NEWEST run-scoped record carrying
     // 'newest-connector'. A single bounded FIFO page (the D3 tenant-store
     // default) returns the oldest MAX and DROPS the newest, failing the grant
-    // CLOSED. approvedConnectorsForLeg must page the complete set instead.
+    // CLOSED. connectorGrantsForLeg must page the complete set instead.
     const store = new InMemoryApprovalStore('acme');
     for (let index = 0; index < MAX_APPROVAL_LIST_LIMIT; index += 1) {
       await store.create(
@@ -637,13 +693,13 @@ describe('grant derivation — tenant hardening (INV-1 + INV-2)', () => {
     );
 
     // #when — a start leg mints run-scoped grants
-    const connectors = await approvedConnectorsForLeg(store, 'wf', 'run-1', {
+    const grants = await connectorGrantsForLeg(store, 'wf', 'run-1', {
       kind: 'start',
     });
 
     // #then — the newest record's connector is present (complete paging, not a
     // truncated first page)
-    expect(connectors).toContain('newest-connector');
+    expect(grants).toContainEqual(runGrant('newest-connector'));
   });
 
   it('approvalGrantProviderFromFactory binds per leg from the runId prefix and fails closed on a bare runId', async () => {
@@ -675,14 +731,21 @@ describe('grant derivation — tenant hardening (INV-1 + INV-2)', () => {
 
     // #when / #then — each leg mints from ITS tenant's records only
     expect(await provider('wf', 'acme_r1', { kind: 'start' })).toEqual({
-      [BREAKWATER_APPROVED_CONNECTORS_KEY]: ['acme-conn'],
+      [BREAKWATER_CONNECTOR_GRANTS_KEY]: [
+        runGrant('acme-conn', { runId: 'acme_r1' }),
+      ],
     });
     expect(await provider('wf', 'bravo_r1', { kind: 'start' })).toEqual({
-      [BREAKWATER_APPROVED_CONNECTORS_KEY]: ['bravo-conn'],
+      [BREAKWATER_CONNECTOR_GRANTS_KEY]: [
+        runGrant('bravo-conn', {
+          tenantId: 'bravo',
+          runId: 'bravo_r1',
+        }),
+      ],
     });
     // a runId with no tenant prefix mints an EMPTY grant list, never a read
     expect(await provider('wf', 'bare-run', { kind: 'start' })).toEqual({
-      [BREAKWATER_APPROVED_CONNECTORS_KEY]: [],
+      [BREAKWATER_CONNECTOR_GRANTS_KEY]: [],
     });
   });
 

@@ -45,16 +45,20 @@ import {
  *
  * - `connectors` IS the minted grant — an approved record's connectors become
  *   the requestContext grant the write gate checks.
+ * - `grantScope` is persisted capability metadata. It is record-only, but is
+ *   named here so an attempted body field is rejected rather than ignored.
+ * - `toolCallId` narrows a durable-agent grant to one persisted tool call.
  * - `runScoped` turns a step-less record into a standing grant on every leg.
  * - `stepPath`, `suspendedAt`, `resumedAt`, `resumeCount` select WHICH leg a
- *   grant mints on. A step-keyed body with no `suspendedAt` would fall into
- *   grants.ts's legacy decidedAt-after fallback and mint, so rejecting
- *   `connectors` alone is insufficient — reject the whole set.
+ *   grant mints on. Rejecting `connectors` alone is insufficient because a
+ *   future trusted merge must never inherit client-selected identity.
  * - `requestedBy` is the field decide()'s separation-of-duties check compares
  *   against; spoofing it lets one principal approve their own request.
  */
 export const TCB_ONLY_CREATE_FIELDS = [
   'connectors',
+  'grantScope',
+  'toolCallId',
   'stepPath',
   'suspendedAt',
   'resumedAt',

@@ -43,8 +43,10 @@ vi.mock('@mastra/core/mastra', () => ({
       this.agents = options.agents;
     }
 
-    getAgent(id: string) {
-      return this.agents[id];
+    getAgentById(id: string) {
+      return (Object.values(this.agents) as Array<{ id?: string }>).find(
+        (agent) => agent.id === id,
+      );
     }
   },
 }));
@@ -254,6 +256,24 @@ beforeEach(() => {
 });
 
 describe('createThreadAgentHost', () => {
+  it.each([
+    '__proto__',
+    'constructor',
+  ])("resolves prototype-collision agent id '%s'", async (agentId) => {
+    const { host, scope } = harness([agentId]);
+
+    await host.start(scope, {
+      agentId,
+      threadId: 'acme_thread',
+      resourceId: RESOURCE_ID,
+      runId: 'acme_run',
+      prompt: 'go',
+      entryPath: 'http.start',
+    });
+
+    expect(mocked.stream).toHaveBeenCalledOnce();
+  });
+
   it('constructs cached dependencies with actor-free instance scope', async () => {
     const { host, scope, moduleScopes, storageScopes } = harness();
     await host.start(scope, {
@@ -289,7 +309,7 @@ describe('createThreadAgentHost', () => {
       return {};
     });
     const provider = host.requestContextForRun((async () => ({
-      'breakwater.approvedConnectors': [],
+      'breakwater.connectorGrants': [],
       'breakwater.actor': { id: 'forged' },
     })) satisfies RequestContextProvider);
     const started = host.start(scope, {
@@ -309,7 +329,7 @@ describe('createThreadAgentHost', () => {
     await expect(
       provider('durable-agentic-loop', 'acme_run', { kind: 'start' }),
     ).resolves.toMatchObject({
-      'breakwater.approvedConnectors': [],
+      'breakwater.connectorGrants': [],
       stored: 'survives',
       'breakwater.actor': { id: 'operator-1', role: 'operator' },
       'breakwater.auditContext': {
@@ -321,7 +341,7 @@ describe('createThreadAgentHost', () => {
     await expect(
       provider('unrelated-workflow', 'acme_run', { kind: 'start' }),
     ).resolves.toEqual({
-      'breakwater.approvedConnectors': [],
+      'breakwater.connectorGrants': [],
       'breakwater.actor': { id: 'forged' },
     });
     release?.();
@@ -621,7 +641,7 @@ describe('createThreadAgentHost', () => {
         persistedSafe: 'survives-resume',
         runId: 'forged',
         'breakwater.actor': { id: 'forged' },
-        'breakwater.approvedConnectors': ['stale'],
+        'breakwater.connectorGrants': ['stale'],
       },
     });
     state.set('flowsafe:agent-thread-binding:v1', {
@@ -636,7 +656,7 @@ describe('createThreadAgentHost', () => {
       originEntryPath: 'http.start',
     });
     const provider = host.requestContextForRun(async () => ({
-      'breakwater.approvedConnectors': [],
+      'breakwater.connectorGrants': [],
     }));
     let resumedContext: Record<string, unknown> | undefined;
     mocked.resumeViaRuntime.mockImplementation(async () => {
@@ -673,7 +693,7 @@ describe('createThreadAgentHost', () => {
     );
     expect(resumedContext).toMatchObject({
       persistedSafe: 'survives-resume',
-      'breakwater.approvedConnectors': [],
+      'breakwater.connectorGrants': [],
       'breakwater.actor': { id: 'operator-1', role: 'operator' },
       runId: 'acme_run',
       threadId: 'acme_thread',

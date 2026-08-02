@@ -54,15 +54,17 @@ Only terminal records are eligible for approval retention. An old open request i
 - `suspendedAt` and the runtime-owned `resumeCount`
 - `requestedBy` from the human who advanced the run
 - `connectors` from the server-authored suspend payload
+- `grantScope` derived by the service
+- `toolCallId` from a durable-agent approval suspension
 - an optional server-authored durable-agent `resumeTarget`
 
 The HTTP create route is disabled by default. If a host enables it, the router rejects every field that could select a capability, change attribution, or choose a resume target. An HTTP-created request can collect a human decision, but cannot mint a connector grant.
 
-Do not derive a suspension's `connectors` array from workflow input, model output, signal attributes, or another client-controlled value.
+Do not derive a workflow suspension’s `connectors` array from workflow input, model output, signal attributes, or another client-controlled value. Durable-agent `toolName` and `toolCallId` come from Mastra’s persisted approval payload in one of its two supported shapes.
 
 ## Derive grants from stored decisions
 
-`approvalGrantProvider(tenantBoundStore)` reads approved records on every start or resume. A step-bound grant is available only when all of these values match the leg being resumed:
+`approvalGrantProvider(tenantBoundStore)` reads approved records on every start or resume. A step-bound grant is available only when these values match the leg being resumed:
 
 - tenant
 - workflow and run
@@ -72,9 +74,13 @@ Do not derive a suspension's `connectors` array from workflow input, model outpu
 
 This pairing keeps multiple suspensions of the same step distinct even when their millisecond timestamps collide. An older approval is spent when the step suspends again.
 
-A trusted host can create an explicit `runScoped` record for a standing grant. A step-less record without `runScoped: true` mints nothing. The suspend bridge never creates run-scoped grants.
+A durable-agent approval also binds the connector’s Mastra `toolCallId`. Mastra persists that ID in the durable tool-call input and reproduces it in `context.agent.toolCallId` after resume or Durable Object reconstruction. The grant scope is `tool-call`.
 
-The derived connector ids are written to `breakwater.approvedConnectors` in the Mastra request context. They never cross the public API in a resume payload.
+An arbitrary workflow gate has no reproducible tool-call identity. Its grant scope is `suspension`, which uses the exact leg fields above. A trusted host can create an explicit `runScoped` record for `run` scope. A step-less record without `runScoped: true` mints nothing. The suspend bridge never creates run-scoped grants.
+
+The provider writes the structured grants to `breakwater.connectorGrants`. `RunnerRuntime` writes the current leg to `breakwater.connectorExecution`. Neither value crosses the public API in a resume payload. Missing scope, legacy connector ID arrays, and malformed records fail closed.
+
+Retries of the same durable tool call reuse `toolCallId` and remain authorized. A new model tool call receives a new ID and requires approval. The grant does not make retries idempotent; configure the connector’s idempotency policy when duplicate side effects are unsafe.
 
 ## Enforce separation of duties
 
@@ -169,13 +175,13 @@ Recovery rules:
 5. Let `approvalGrantProvider()` derive the same approved capability from D1.
 6. If the run immediately suspends at another gate, queue a new approval for the new fingerprint.
 
-Do not call public `prepare()` for durable-agent recovery. It is an initial-execution API that runs application and policy input processors. Never copy `breakwater.approvedConnectors` into a recovery request.
+Do not call public `prepare()` for durable-agent recovery. It is an initial-execution API that runs application and policy input processors. Never copy `breakwater.connectorGrants` or `breakwater.connectorExecution` into a recovery request.
 
 ## Retention and audit
 
 - `purgeExpiredApprovals()` deletes only `approved` and `rejected` records past the configured age.
 - `purgeTenant()` removes all of a tenant's approvals during offboarding, including open records.
-- Approval audit events use the same structural sink as breakwater, so one logger or queue can carry the complete enforcement narrative.
+- Approval audit events use the same structural sink as Breakwater. Decision and connector-approval events identify `tool-call`, `suspension`, or `run` scope without recording connector inputs.
 - The full `ApprovalRecord` may contain reviewer context. Treat notification and stream sinks as tenant-confidential channels.
 
 See [Deployment reference](deployment-reference.md), [Operations runbook](operations-runbook.md), and [Security threat model](security-threat-model.md) before production.

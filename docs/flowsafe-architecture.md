@@ -85,7 +85,7 @@ The snapshot remains Mastra's workflow state. Flowsafe does not invent a second 
 
 The normal host bridge observes a suspension and creates one approval with the server-authored connector ids and attribution. Reviewer mutations use compare-and-swap transitions.
 
-`approvalGrantProvider()` recomputes `breakwater.approvedConnectors` on every runtime leg. A step approval matches the exact tenant, run, step, `suspendedAt`, and `resumeCount`. Re-suspending the same step creates a distinct approval. Explicit `runScoped` records are the only standing grants.
+`approvalGrantProvider()` recomputes `breakwater.connectorGrants` on every runtime leg, while `RunnerRuntime` writes `breakwater.connectorExecution`. A workflow approval matches the exact tenant, workflow, run, step, `suspendedAt`, and `resumeCount`. A durable-agent approval also matches Mastra `toolCallId`. Re-suspending the same step creates a distinct approval. Explicit `runScoped` records are the only standing grants.
 
 See [Approval system](approval-system.md) for endpoints, separation of duties, live updates, and recovery.
 

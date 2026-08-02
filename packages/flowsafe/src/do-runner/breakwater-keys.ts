@@ -15,13 +15,12 @@
 // contract.ts re-exports them, keeping approval-api -> do-runner as the only
 // cross-directory dependency direction.
 
-/**
- * requestContext key the breakwater connector write-gate reads. The value is
- * a plain array of approved connector ids (breakwater's approvalGranted does
- * `Array.isArray(value) && value.includes(connectorId)`).
- */
-export const BREAKWATER_APPROVED_CONNECTORS_KEY =
-  'breakwater.approvedConnectors';
+/** requestContext key containing structured connector approval grants. */
+export const BREAKWATER_CONNECTOR_GRANTS_KEY = 'breakwater.connectorGrants';
+
+/** requestContext key containing the runtime-owned current leg identity. */
+export const BREAKWATER_CONNECTOR_EXECUTION_KEY =
+  'breakwater.connectorExecution';
 
 /** requestContext key breakwater actor resolution reads ({ id, role }). */
 export const BREAKWATER_ACTOR_KEY = 'breakwater.actor';

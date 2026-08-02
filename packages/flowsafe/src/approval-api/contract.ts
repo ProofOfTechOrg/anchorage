@@ -28,7 +28,8 @@ import type { ApprovalRecord } from './types.js';
 
 export {
   BREAKWATER_ACTOR_KEY,
-  BREAKWATER_APPROVED_CONNECTORS_KEY,
+  BREAKWATER_CONNECTOR_EXECUTION_KEY,
+  BREAKWATER_CONNECTOR_GRANTS_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
 } from '../do-runner/breakwater-keys.js';
 

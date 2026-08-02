@@ -237,6 +237,7 @@ describe('ApprovalService.create', () => {
         priority: 'high',
         slaSeconds: 3600,
         stepPath: ['approval'],
+        suspendedAt: T0,
         payload: { reason: 'needs sign-off' },
       }),
       OPERATOR,
@@ -250,7 +251,9 @@ describe('ApprovalService.create', () => {
       status: 'pending',
       priority: 'high',
       connectors: ['blog-publisher'],
+      grantScope: 'suspension',
       stepPath: ['approval'],
+      suspendedAt: T0,
       createdAt: '2026-07-06T12:00:00.000Z',
       slaDeadlineAt: '2026-07-06T13:00:00.000Z',
     });
@@ -352,13 +355,53 @@ describe('ApprovalService.create', () => {
 
     // #when
     const { record } = await harness.service.create(
-      input({ requestedBy: 'starter', runScoped: true }),
+      input({
+        requestedBy: 'starter',
+        runScoped: true,
+        connectors: ['blog-publisher'],
+      }),
       OPERATOR,
     );
 
     // #then
     expect(record.requestedBy).toBe('starter');
     expect(record.runScoped).toBe(true);
+    expect(record.grantScope).toBe('run');
+  });
+
+  it('derives an exact tool-call scope only from one connector and a suspension identity', async () => {
+    const harness = makeHarness();
+
+    const { record } = await harness.service.create(
+      input({
+        stepPath: ['agent-gate'],
+        suspendedAt: T0,
+        resumeCount: 2,
+        connectors: ['send-email'],
+        toolCallId: 'call-1',
+      }),
+      OPERATOR,
+    );
+
+    expect(record).toMatchObject({
+      grantScope: 'tool-call',
+      toolCallId: 'call-1',
+      connectors: ['send-email'],
+      stepPath: ['agent-gate'],
+      suspendedAt: T0,
+      resumeCount: 2,
+    });
+    await expect(
+      harness.service.create(
+        input({
+          stepPath: ['agent-gate'],
+          suspendedAt: T0,
+          connectors: ['send-email', 'post-message'],
+          toolCallId: 'call-2',
+        }),
+        OPERATOR,
+      ),
+    ).rejects.toBeInstanceOf(InvalidApprovalInputError);
   });
 
   it('defaults runScoped to absent — a record is never run-scoped by omission', async () => {
@@ -1863,6 +1906,33 @@ describe('ApprovalService decide audit detail', () => {
         action: 'approval.decide',
         decision: 'allowed',
         detail: expect.objectContaining({ durationSeconds: 90 }),
+      }),
+    );
+  });
+
+  it('identifies tool-call scope while preserving human decision attribution', async () => {
+    const harness = makeHarness();
+    const record = await seedPending(harness, {
+      stepPath: ['agent-gate'],
+      suspendedAt: T0,
+      connectors: ['send-email'],
+      toolCallId: 'call-1',
+    });
+
+    await harness.service.decide(record.id, { decision: 'approve' }, REVIEWER);
+
+    expect(harness.events).toContainEqual(
+      expect.objectContaining({
+        actor: REVIEWER,
+        action: 'approval.decide',
+        decision: 'allowed',
+        detail: expect.objectContaining({
+          grantScope: 'tool-call',
+          connectorCount: 1,
+          stepPath: ['agent-gate'],
+          suspendedAt: T0,
+          toolCallId: 'call-1',
+        }),
       }),
     );
   });

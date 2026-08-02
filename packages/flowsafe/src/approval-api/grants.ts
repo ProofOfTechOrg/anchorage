@@ -6,8 +6,8 @@
 // requestContext the resumed leg executes under is minted server-side by
 // approvalGrantProvider on EVERY start/resume.
 //
-// Grants are SUSPENSION-SCOPED: a step-keyed approval unlocks its connectors
-// only for the leg that resumes THAT step, and only when the decision binds
+// Grants are STRUCTURED and SUSPENSION-SCOPED: a step-keyed approval unlocks
+// its connectors only for the leg that resumes THAT step, and only when the decision binds
 // to the step's CURRENT suspension. The preferred binding is clock-free and
 // exact on the (suspendedAt, resumeCount) fingerprint: the creating bridge
 // captures both into the record (CreateApprovalInput), and minting requires
@@ -36,10 +36,8 @@
 // distinguishes them. A reset ledger only yields leg.resumeCount=undefined
 // against a re-suspension record's defined count → deny (fail-closed re-deny),
 // then a fresh decision mints.
-// Records created WITHOUT observing the suspension (pre-capture bridges)
-// fall back to chronology — service-clock decidedAt strictly after the
-// core-clock suspendedAt — correct only where the two clocks are one
-// (single-Worker/Cloudflare deployments; see the threat model, boundary 6).
+// Records created without observing the suspension are legacy capability
+// records and mint nothing.
 //
 // Run-scoped standing grants are EXPLICIT: a step-less record mints on every
 // leg only when it also carries runScoped === true. A step-less record without
@@ -50,8 +48,8 @@
 // is settable over HTTP (router.ts, TCB_ONLY_CREATE_FIELDS);
 // suspend-observation bridges always set stepPath and never runScoped.
 //
-// The provider always returns the grant key — an empty list when nothing
-// applies — because Mastra merges provided context over the persisted
+// The provider always returns the structured grant key — an empty list when
+// nothing applies — because Mastra merges provided context over the persisted
 // snapshot: overwriting each leg retires the previous leg's grants instead
 // of letting them leak forward. A resume that bypasses decide() (or targets
 // a suspension nothing was decided for) therefore finds no grant — fail
@@ -64,19 +62,21 @@ import type {
   RunSummary,
 } from '../do-runner/index.js';
 import { tenantOfRunId } from '../do-runner/path-safe-id.js';
-import { BREAKWATER_APPROVED_CONNECTORS_KEY } from './contract.js';
+import { BREAKWATER_CONNECTOR_GRANTS_KEY } from './contract.js';
 import {
   type ApprovalStore,
   listAllApprovedForRun,
   stepKeyOf,
 } from './store.js';
 import type { TenantBoundApprovalStore } from './tenant-brand.js';
-import type { ApprovalDecision, ApprovalRecord } from './types.js';
+import type {
+  ApprovalDecision,
+  ApprovalRecord,
+  ConnectorApprovalGrant,
+} from './types.js';
 
 // Whether a step-keyed approval is bound to the resumed step's CURRENT
-// suspension (exact (suspendedAt, resumeCount) pair match, or the legacy
-// decidedAt-after fallback) — the predicate that decides whether a decision
-// mints.
+// suspension. Legacy records without a captured suspendedAt fail closed.
 function boundToCurrentSuspension(
   record: ApprovalRecord,
   suspendedAt: number | undefined,
@@ -85,7 +85,7 @@ function boundToCurrentSuspension(
   // Unknown suspension time (snapshot without step timestamps, or an
   // unresolvable resume target) — fail closed for step-keyed grants.
   if (suspendedAt === undefined) return false;
-  // Preferred, clock-free binding on the (suspendedAt, resumeCount)
+  // Clock-free binding on the (suspendedAt, resumeCount)
   // fingerprint. suspendedAt comes from the core clock; resumeCount is the
   // runtime's monotonic per-(run,step) resume ordinal (undefined on a first
   // suspension, 1,2,… on re-suspensions), captured by the bridge at create
@@ -95,46 +95,27 @@ function boundToCurrentSuspension(
   // approval (resumeCount undefined) can never mint into a re-suspension leg
   // (resumeCount defined) even when their suspendedAt collide within one ms,
   // and successive re-suspensions carry strictly increasing counts that never
-  // collide. A pre-`resume_count` record (suspendedAt defined, resumeCount
-  // undefined from the upgrade window) still mints on a first-suspension leg
-  // (undefined === undefined) and fails closed on a re-suspension leg — the
-  // documented re-deny, resolved by a fresh decision.
-  if (record.suspendedAt !== undefined) {
-    return (
-      record.suspendedAt === suspendedAt && record.resumeCount === resumeCount
-    );
-  }
-  // Legacy fallback for records created without observing the suspension
-  // (pre-capture bridges): service-clock decidedAt strictly after the core-
-  // clock suspendedAt — correct on same-clock (single-Worker/Cloudflare)
-  // topologies only; see security-threat-model.md boundary 6.
-  //
-  // TRANSITIONAL and self-draining — it fires only while pre-capture rows
-  // remain undecided, and no client can force it (`suspendedAt` is in
-  // TCB_ONLY_CREATE_FIELDS). INVARIANT for writers: every NEW step-keyed
-  // record MUST capture `suspendedAt` (host-kit's bridge does); creating one
-  // without it would re-open the clock-dependence this exact-match binding
-  // exists to close.
+  // collide. A first-suspension record has no resumeCount and only matches a
+  // first-suspension leg (`undefined === undefined`); it fails closed on every
+  // re-suspension leg, which always carries a positive count.
   return (
-    record.decidedAt !== undefined && Date.parse(record.decidedAt) > suspendedAt
+    record.suspendedAt !== undefined &&
+    record.suspendedAt === suspendedAt &&
+    record.resumeCount === resumeCount
   );
 }
 
 /**
- * Union of connector ids across APPROVED records that apply to this leg:
- * step-keyed records matching the resumed step AND bound to the step's
- * CURRENT suspension (exact `(suspendedAt, resumeCount)` pair match, or the
- * legacy decidedAt-after fallback for records created without the capture),
- * plus step-less records that explicitly opted in with `runScoped: true`.
- * Start legs and unresolvable resume targets mint run-scoped records only. A
- * step-less record without `runScoped` is inert on every leg — fail closed.
+ * Structured grants across approved records that apply to this leg. Every
+ * capability-bearing record must carry an explicit persisted grantScope;
+ * legacy or malformed records make the whole derivation empty.
  */
-export async function approvedConnectorsForLeg(
+export async function connectorGrantsForLeg(
   store: ApprovalStore,
   workflowId: string,
   runId: string,
   leg: RunLeg,
-): Promise<string[]> {
+): Promise<ConnectorApprovalGrant[]> {
   // Retrieve ALL approved records for the run via the shared complete-reader —
   // its docstring carries the load-bearing workflowId/runId-predicate and
   // fail-closed paging rationale grants.test.ts pins with a spy store. Grant
@@ -148,21 +129,100 @@ export async function approvedConnectorsForLeg(
       : undefined;
   const suspendedAt = leg.kind === 'resume' ? leg.suspendedAt : undefined;
   const resumeCount = leg.kind === 'resume' ? leg.resumeCount : undefined;
-  const connectors = new Set<string>();
+  const grants: ConnectorApprovalGrant[] = [];
   for (const record of approved) {
     const recordKey = stepKeyOf(record.stepPath);
-    const applies =
+    if (record.connectors.length === 0) continue;
+    if (
+      record.workflowId !== workflowId ||
+      record.runId !== runId ||
+      !record.connectors.every(
+        (connector) => typeof connector === 'string' && connector.length > 0,
+      )
+    ) {
+      return [];
+    }
+
+    if (record.grantScope === 'run') {
+      if (
+        record.runScoped !== true ||
+        recordKey !== '' ||
+        record.suspendedAt !== undefined ||
+        record.resumeCount !== undefined ||
+        record.toolCallId !== undefined
+      ) {
+        return [];
+      }
+      for (const connectorId of record.connectors) {
+        grants.push({
+          scope: 'run',
+          connectorId,
+          workflowId,
+          runId,
+          isolationScope: record.tenantId,
+        });
+      }
+      continue;
+    }
+
+    if (
+      (record.grantScope !== 'suspension' &&
+        record.grantScope !== 'tool-call') ||
+      record.runScoped === true ||
       recordKey === ''
-        ? record.runScoped === true
-        : targetKey !== undefined &&
-          recordKey === targetKey &&
-          boundToCurrentSuspension(record, suspendedAt, resumeCount);
-    if (!applies) continue;
-    for (const connector of record.connectors) {
-      connectors.add(connector);
+    ) {
+      return [];
+    }
+    if (
+      record.stepPath === undefined ||
+      record.suspendedAt === undefined ||
+      (record.grantScope === 'tool-call'
+        ? record.connectors.length !== 1 ||
+          typeof record.toolCallId !== 'string' ||
+          record.toolCallId.length === 0
+        : record.toolCallId !== undefined)
+    ) {
+      return [];
+    }
+    if (
+      targetKey === undefined ||
+      recordKey !== targetKey ||
+      !boundToCurrentSuspension(record, suspendedAt, resumeCount)
+    ) {
+      continue;
+    }
+    const suspension = {
+      stepPath: [...record.stepPath],
+      suspendedAt: record.suspendedAt,
+      ...(record.resumeCount === undefined
+        ? {}
+        : { resumeCount: record.resumeCount }),
+    };
+    for (const connectorId of record.connectors) {
+      grants.push(
+        record.grantScope === 'tool-call'
+          ? {
+              scope: 'tool-call',
+              connectorId,
+              workflowId,
+              runId,
+              isolationScope: record.tenantId,
+              suspension,
+              toolCallId: record.toolCallId as string,
+            }
+          : {
+              scope: 'suspension',
+              connectorId,
+              workflowId,
+              runId,
+              isolationScope: record.tenantId,
+              suspension,
+            },
+      );
     }
   }
-  return [...connectors];
+  const unique = new Map(grants.map((grant) => [JSON.stringify(grant), grant]));
+  return [...unique.values()];
 }
 
 /**
@@ -179,15 +239,10 @@ export function approvalGrantProvider(
   store: TenantBoundApprovalStore,
 ): RequestContextProvider {
   return async (workflowId, runId, leg) => {
-    const connectors = await approvedConnectorsForLeg(
-      store,
-      workflowId,
-      runId,
-      leg,
-    );
+    const grants = await connectorGrantsForLeg(store, workflowId, runId, leg);
     // Always return the key (even empty) — see the header: overwrite, don't
     // inherit, so stale grants from earlier legs cannot survive the merge.
-    return { [BREAKWATER_APPROVED_CONNECTORS_KEY]: connectors };
+    return { [BREAKWATER_CONNECTOR_GRANTS_KEY]: grants };
   };
 }
 
@@ -205,15 +260,15 @@ export function approvalGrantProviderFromFactory(factory: {
   return async (workflowId, runId, leg) => {
     const tenantId = tenantOfRunId(runId);
     if (tenantId === undefined) {
-      return { [BREAKWATER_APPROVED_CONNECTORS_KEY]: [] };
+      return { [BREAKWATER_CONNECTOR_GRANTS_KEY]: [] };
     }
-    const connectors = await approvedConnectorsForLeg(
+    const grants = await connectorGrantsForLeg(
       factory.forTenant(tenantId),
       workflowId,
       runId,
       leg,
     );
-    return { [BREAKWATER_APPROVED_CONNECTORS_KEY]: connectors };
+    return { [BREAKWATER_CONNECTOR_GRANTS_KEY]: grants };
   };
 }
 

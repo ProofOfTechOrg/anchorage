@@ -1032,7 +1032,7 @@ async function main() {
     );
     assert(
       String(forged.body.error ?? '').includes(
-        'approval required and not granted',
+        'approval required and no matching structured grant was found',
       ),
       'gate error names the missing grant',
       forged.body.error,
@@ -1174,7 +1174,7 @@ async function main() {
       );
       assert(
         String(forged.body.error ?? '').includes(
-          'approval required and not granted',
+          'approval required and no matching structured grant was found',
         ),
         'agent gate error names the missing grant',
         forged.body.error,

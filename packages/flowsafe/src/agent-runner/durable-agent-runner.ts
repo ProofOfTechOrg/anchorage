@@ -26,7 +26,7 @@
 // `tool.execute(cleanedArgs, toolOptions)` :3642), NOT the stream()-time
 // registry copy. Under runtime drive that engine-leg context is exactly what
 // #requestContextFor mints per leg — so approvalGrantProvider's
-// `breakwater.approvedConnectors` grant reaches the connector write gate with
+// `breakwater.connectorGrants` grant reaches the connector write gate with
 // zero extra wiring, and a forged/self resume that mints no grant fails closed
 // there (the registry copy is read only for the fail-closed, over-require-safe
 // approval PRE-check, S5).
@@ -558,16 +558,17 @@ export class FlowsafeDurableAgent<
 
 /**
  * Wrap an Agent as a {@link FlowsafeDurableAgent} and register its loop workflow
- * on the runtime — the same `runtime.register` path init()'s boundCreateWorkflow
- * uses.
+ * and raw agent on the runtime. The workflow uses the same `runtime.register`
+ * path init()'s boundCreateWorkflow uses; the raw agent lets Mastra resolve the
+ * durable input's `agentId` after isolate eviction.
  *
- * Registration is IDEMPOTENT by id: every durable agent compiles to the ONE
- * shared 'durable-agentic-loop' workflow (the `agentId` in each run's input
- * routes to the right agent via the per-run registry), so a second
- * createFlowsafeDurableAgent on a shared runtime must not throw 'duplicate
- * workflow id'. Like init()'s createWorkflow, register() also throws once runs
- * have started (the Mastra instance is frozen) — call this at host setup, before
- * any run.
+ * Workflow registration is IDEMPOTENT by its shared id: every durable agent
+ * compiles to the ONE 'durable-agentic-loop' workflow, while the `agentId` in
+ * each run's input selects one of the uniquely registered raw agents. A second
+ * createFlowsafeDurableAgent on a shared runtime therefore registers its agent
+ * but must not throw 'duplicate workflow id'. Like init()'s createWorkflow,
+ * registration also throws once runs have started (the Mastra instance is
+ * frozen) — call this at host setup, before any run.
  *
  * Multi-agent caveat: the shared loop bakes in the FIRST registrant's `maxSteps`
  * (it is compiled into the isTaskComplete step) as the DEFAULT — a per-call
@@ -583,6 +584,7 @@ export function createFlowsafeDurableAgent<
   options: FlowsafeDurableAgentOptions<TAgentId, TTools, TOutput>,
 ): FlowsafeDurableAgent<TAgentId, TTools, TOutput> {
   const durableAgent = new FlowsafeDurableAgent(options);
+  options.runtime.registerAgent(options.agent);
   const workflow = durableAgent.getWorkflow();
   if (!options.runtime.workflowIds().includes(workflow.id)) {
     // getWorkflow()'s concrete engine generics are not single-cast-assignable to

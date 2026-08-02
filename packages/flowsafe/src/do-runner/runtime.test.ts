@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+import { Agent } from '@mastra/core/agent';
 import { InMemoryStore } from '@mastra/core/storage';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 import { init } from './init.js';
@@ -24,6 +25,15 @@ interface Counters {
   approvalResumes: number;
   /** Times the echo step executed. */
   echoRuns: number;
+}
+
+function runtimeAgent(id: string): Agent {
+  return new Agent({
+    id,
+    name: id,
+    instructions: 'Test agent.',
+    model: 'openai/gpt-4o-mini',
+  });
 }
 
 // demo-approval: research -> approval (suspends; counts resumed executions).
@@ -363,6 +373,159 @@ describe('RunnerRuntime', () => {
     ).toThrowError(/duplicate workflow id/);
   });
 
+  it('rejects duplicate agent ids at registration', () => {
+    // #given
+    const { runtime } = init({ storage: new InMemoryStore() });
+    runtime.registerAgent(runtimeAgent('writer'));
+
+    // #when / #then
+    expect(() => runtime.registerAgent(runtimeAgent('writer'))).toThrowError(
+      /duplicate agent id/,
+    );
+  });
+
+  it('exposes every registered agent to workflow execution', async () => {
+    // #given
+    const { createWorkflow, createStep, runtime } = init({
+      storage: new InMemoryStore(),
+    });
+    const agents = [
+      runtimeAgent('a'),
+      runtimeAgent('b'),
+      runtimeAgent('__proto__'),
+      runtimeAgent('runtime-agent:__proto__'),
+    ];
+    for (const agent of agents) runtime.registerAgent(agent);
+    const resolveAgents = createStep({
+      id: 'resolve-agents',
+      inputSchema: z.object({}),
+      outputSchema: z.object({
+        firstByKey: z.string(),
+        secondById: z.string(),
+        collisionById: z.string(),
+        prefixedByKey: z.string(),
+        workflowByKey: z.string(),
+      }),
+      execute: async ({ mastra }) => ({
+        firstByKey: mastra.getAgent('a').id,
+        secondById: mastra.getAgentById('b').id,
+        collisionById: mastra.getAgentById('__proto__').id,
+        prefixedByKey: mastra.getAgent('runtime-agent:__proto__').id,
+        workflowByKey: mastra.getWorkflow('agent-resolution').id,
+      }),
+    });
+    createWorkflow({
+      id: 'agent-resolution',
+      inputSchema: z.object({}),
+      outputSchema: z.object({
+        firstByKey: z.string(),
+        secondById: z.string(),
+        collisionById: z.string(),
+        prefixedByKey: z.string(),
+        workflowByKey: z.string(),
+      }),
+    })
+      .then(resolveAgents)
+      .commit();
+
+    // #when
+    const summary = await runtime.start('agent-resolution', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+
+    // #then
+    expect(summary).toMatchObject({
+      status: 'success',
+      result: {
+        firstByKey: 'a',
+        secondById: 'b',
+        collisionById: '__proto__',
+        prefixedByKey: 'runtime-agent:__proto__',
+        workflowByKey: 'agent-resolution',
+      },
+    });
+  });
+
+  it('passes the runtime pubsub to registered agents', async () => {
+    // #given
+    const pubsub = createHostPubSub();
+    const publish = vi.spyOn(pubsub, 'publish');
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      { pubsub },
+    );
+    const agent = runtimeAgent('writer');
+    runtime.registerAgent(agent);
+    const noop = createStep({
+      id: 'noop',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      execute: async () => ({}),
+    });
+    createWorkflow({
+      id: 'pubsub-agent',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(noop)
+      .commit();
+    await runtime.start('pubsub-agent', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+    publish.mockClear();
+
+    // #when
+    const agentPubsub = agent.getPubSub();
+    expect(agentPubsub).toBeDefined();
+    await agentPubsub?.publish('runtime-agent-test', {
+      type: 'runtime-agent-test',
+      data: agent.id,
+      runId: 'runtime-agent-test',
+    });
+
+    // #then
+    expect(publish).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    '__proto__',
+    'constructor',
+  ])("executes prototype-collision workflow id '%s'", async (workflowId) => {
+    // #given
+    const { createWorkflow, createStep, runtime } = init({
+      storage: new InMemoryStore(),
+    });
+    const noop = createStep({
+      id: 'noop',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ resolved: z.string() }),
+      execute: async ({ mastra }) => ({
+        resolved: mastra.getWorkflowById(workflowId).id,
+      }),
+    });
+    createWorkflow({
+      id: workflowId,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ resolved: z.string() }),
+    })
+      .then(noop)
+      .commit();
+
+    // #when
+    const summary = await runtime.start(workflowId, {
+      runId: crypto.randomUUID(),
+      inputData: {},
+    });
+
+    // #then
+    expect(summary).toMatchObject({
+      status: 'success',
+      result: { resolved: workflowId },
+    });
+  });
+
   it.each([
     'team:wf',
     'a/b',
@@ -429,6 +592,9 @@ describe('RunnerRuntime', () => {
         outputSchema: z.object({}),
       }),
     ).toThrowError(/before the first run/);
+    expect(() => runtime.registerAgent(runtimeAgent('late'))).toThrowError(
+      /before the first run/,
+    );
   });
 });
 
@@ -980,7 +1146,8 @@ describe('RunnerRuntime requestContextForRun', () => {
           stored: 'kept',
           'breakwater.workflowScope': 'forged-workflow',
           'breakwater.isolationScope': 'forged-tenant',
-          'breakwater.approvedConnectors': [],
+          'breakwater.connectorExecution': { kind: 'start' },
+          'breakwater.connectorGrants': [],
           runId: 'acme_forged',
           threadId: 'acme_thread',
           resourceId: 'acme_resource',
@@ -1020,9 +1187,10 @@ describe('RunnerRuntime requestContextForRun', () => {
     expect(seen[0]?.keys).toEqual([
       'stored',
       'breakwater.workflowScope',
-      'breakwater.isolationScope',
-      'breakwater.approvedConnectors',
       'runId',
+      'breakwater.isolationScope',
+      'breakwater.connectorExecution',
+      'breakwater.connectorGrants',
       'threadId',
       'resourceId',
       'breakwater.actor',

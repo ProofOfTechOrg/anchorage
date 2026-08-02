@@ -4,7 +4,8 @@
 // LLM (executeWorkflow never invokes the model — it only drives runtime.start):
 //   - the loop is driven via runtime.start('durable-agentic-loop', { runId, inputData })
 //   - runId is REQUIRED with INV-1 posture — NO crypto.randomUUID fallback
-//   - the loop workflow is registered on the runtime, idempotently (shared id)
+//   - the raw agent and loop workflow are registered on the runtime; workflow
+//     registration is idempotent because the loop id is shared
 //
 // The engine-leg-context -> tool -> grant round-trip (S1/S2) is proven end to
 // end against the REAL runtime + connector + grant provider in
@@ -58,6 +59,7 @@ function fakeRuntime(
   overrides: { pubsub?: unknown; startResult?: unknown } = {},
 ) {
   const registered: string[] = [];
+  const registerAgent = vi.fn();
   const register = vi.fn((wf: { id: string }) => {
     registered.push(wf.id);
   });
@@ -78,6 +80,7 @@ function fakeRuntime(
     async () => new RequestContext(),
   );
   const runtime = {
+    registerAgent,
     register,
     workflowIds,
     start,
@@ -87,6 +90,7 @@ function fakeRuntime(
   } as unknown as RunnerRuntime;
   return {
     runtime,
+    registerAgent,
     register,
     workflowIds,
     start,
@@ -217,25 +221,33 @@ const INPUT = {
 } as unknown as DurableAgenticWorkflowInput;
 
 describe('createFlowsafeDurableAgent', () => {
-  it('registers the durable-agentic-loop workflow on the runtime', () => {
+  it('registers the raw agent and durable-agentic-loop workflow on the runtime', () => {
     // #given a runtime with nothing registered
-    const { runtime, register } = fakeRuntime();
+    const { runtime, register, registerAgent } = fakeRuntime();
+    const rawAgent = testAgent();
     // #when a durable agent is created
-    createFlowsafeDurableAgent({ agent: testAgent(), runtime });
-    // #then the shared loop workflow is registered exactly once
+    createFlowsafeDurableAgent({ agent: rawAgent, runtime });
+    // #then the raw agent and shared loop workflow are registered exactly once
+    expect(registerAgent).toHaveBeenCalledOnce();
+    expect(registerAgent).toHaveBeenCalledWith(rawAgent);
     expect(register).toHaveBeenCalledTimes(1);
     expect(register.mock.calls[0]?.[0]).toMatchObject({
       id: DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
     });
   });
 
-  it('registers idempotently: a second agent on the same runtime does not re-register', () => {
+  it('registers the shared workflow once for multiple agents', () => {
     // #given two agents sharing one runtime (both compile to the same loop id)
-    const { runtime, register } = fakeRuntime();
+    const { runtime, register, registerAgent } = fakeRuntime();
+    const first = testAgent('a');
+    const second = testAgent('b');
     // #when
-    createFlowsafeDurableAgent({ agent: testAgent('a'), runtime });
-    createFlowsafeDurableAgent({ agent: testAgent('b'), runtime });
-    // #then register fires once, not twice ('duplicate workflow id' avoided)
+    createFlowsafeDurableAgent({ agent: first, runtime });
+    createFlowsafeDurableAgent({ agent: second, runtime });
+    // #then both agents register, but the shared workflow does so only once
+    expect(registerAgent).toHaveBeenCalledTimes(2);
+    expect(registerAgent).toHaveBeenNthCalledWith(1, first);
+    expect(registerAgent).toHaveBeenNthCalledWith(2, second);
     expect(register).toHaveBeenCalledTimes(1);
   });
 

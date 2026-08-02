@@ -3,7 +3,7 @@
 // "Agent CLI adapters"). Each adapter is a breakwater connector, so the full
 // permission manifest governs it: an agent CLI edits files and runs commands
 // on the host, which makes it write-class and approval-gated by default (the
-// APPROVED_CONNECTORS_CONTEXT_KEY grant, mintable through flowsafe's
+// CONNECTOR_GRANTS_CONTEXT_KEY grant, mintable through flowsafe's
 // approval queue), with dry-run simulation always available (the command
 // preview, never a spawn) and optional rate limiting.
 //
