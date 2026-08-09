@@ -3,7 +3,10 @@
 import type { MastraCompositeStore } from '@mastra/core/storage';
 import type { GuardedAgentHandle } from '@proofoftech/breakwater/agent';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ExecutionPrincipal } from '../approval-api/index.js';
+import type {
+  ApprovalAuditEvent,
+  ExecutionPrincipal,
+} from '../approval-api/index.js';
 import type {
   InitResult,
   RequestContextProvider,
@@ -16,8 +19,9 @@ import {
   type AgentThreadStateStorage,
   type AutomatedEntryAuthorizer,
   createThreadAgentHost,
+  type PrincipalPermissionResolver,
 } from './thread-host.js';
-import type { AgentAutomationRule } from './types.js';
+import type { AgentAutomationRule, Permission } from './types.js';
 
 const mocked = vi.hoisted(() => ({
   stream: vi.fn(),
@@ -88,6 +92,7 @@ interface Harness {
   moduleScopes: AgentThreadInstanceScope[];
   storageScopes: AgentThreadInstanceScope[];
   approvalScopes: AgentThreadInstanceScope[];
+  auditEvents: ApprovalAuditEvent[];
   setSummary(summary: RunSummary | null): void;
   setSnapshot(values?: {
     agentId?: string;
@@ -117,6 +122,8 @@ function harness(
     principal?: ExecutionPrincipal;
     allowedAutomation?: readonly AgentAutomationRule[];
     authorizeAutomatedEntry?: AutomatedEntryAuthorizer;
+    requiredPermissions?: readonly Permission[];
+    resolvePrincipalPermissions?: PrincipalPermissionResolver;
   } = {},
 ): Harness {
   const state = new Map<string, unknown>();
@@ -194,9 +201,13 @@ function harness(
   const moduleScopes: AgentThreadInstanceScope[] = [];
   const storageScopes: AgentThreadInstanceScope[] = [];
   const approvalScopes: AgentThreadInstanceScope[] = [];
+  const auditEvents: ApprovalAuditEvent[] = [];
   const host = createThreadAgentHost({
     ...(options.authorizeAutomatedEntry
       ? { authorizeAutomatedEntry: options.authorizeAutomatedEntry }
+      : {}),
+    ...(options.resolvePrincipalPermissions
+      ? { resolvePrincipalPermissions: options.resolvePrincipalPermissions }
       : {}),
     buildModules: (instanceScope) => {
       moduleScopes.push(instanceScope);
@@ -208,6 +219,9 @@ function harness(
           allowedRoles: ['operator'],
           ...(options.allowedAutomation
             ? { allowedAutomation: options.allowedAutomation }
+            : {}),
+          ...(options.requiredPermissions
+            ? { requiredPermissions: options.requiredPermissions }
             : {}),
         },
         agent: guarded(
@@ -232,6 +246,7 @@ function harness(
         },
       } as unknown as import('../approval-api/index.js').ApprovalService;
     },
+    audit: (event) => auditEvents.push(event),
   });
   return {
     host,
@@ -240,6 +255,7 @@ function harness(
     moduleScopes,
     storageScopes,
     approvalScopes,
+    auditEvents,
     setSummary: (value) => {
       summary = value;
       statusVisible = true;
@@ -871,6 +887,306 @@ describe('createThreadAgentHost', () => {
     expect(response?.status).toBe(200);
     await expect(response?.text()).resolves.toBe('');
     expect(mocked.observe).not.toHaveBeenCalled();
+  });
+});
+
+describe('createThreadAgentHost permission authorization', () => {
+  const requiredPermissions = ['agents.run', 'reports.read'] as const;
+  const startInput = {
+    agentId: 'writer',
+    threadId: 'acme_thread',
+    resourceId: RESOURCE_ID,
+    runId: 'acme_run',
+    prompt: 'go',
+    entryPath: 'http.start' as const,
+  };
+
+  it('requires every declared permission for a human and audits the policy snapshot without effective-authority leakage', async () => {
+    const resolver = vi.fn(async (_principal: ExecutionPrincipal) => ({
+      permissions: ['agents.run', 'reports.read', 'records.observe'],
+      policyVersion: 'permissions-2026-08-08',
+    }));
+    const { host, scope, auditEvents } = harness(['writer'], {
+      requiredPermissions,
+      resolvePrincipalPermissions: resolver,
+    });
+
+    await host.start(scope, startInput);
+
+    expect(resolver).toHaveBeenCalledOnce();
+    expect(resolver).toHaveBeenCalledWith(scope.principal);
+    expect(mocked.stream).toHaveBeenCalledOnce();
+    expect(auditEvents.at(-1)).toMatchObject({
+      action: 'agent.entry.authorize',
+      decision: 'allowed',
+      detail: {
+        requiredPermissions: ['agents.run', 'reports.read'],
+        permissionPolicyVersion: 'permissions-2026-08-08',
+        principalKind: 'human',
+        principalId: 'operator-1',
+      },
+    });
+    expect(auditEvents.at(-1)?.detail).not.toHaveProperty('permissions');
+    expect(auditEvents.at(-1)?.detail).not.toHaveProperty(
+      'effectivePermissions',
+    );
+  });
+
+  it('denies when any one required permission is absent', async () => {
+    const resolver = vi.fn(async () => ({
+      permissions: ['agents.run'],
+      policyVersion: 'permissions-v2',
+    }));
+    const { host, scope, auditEvents } = harness(['writer'], {
+      requiredPermissions,
+      resolvePrincipalPermissions: resolver,
+    });
+
+    await expect(host.start(scope, startInput)).rejects.toMatchObject({
+      status: 403,
+      message: 'forbidden',
+    });
+
+    expect(mocked.stream).not.toHaveBeenCalled();
+    expect(auditEvents.at(-1)).toMatchObject({
+      decision: 'denied',
+      reason: 'required permissions are not satisfied',
+      detail: {
+        requiredPermissions: ['agents.run', 'reports.read'],
+        permissionPolicyVersion: 'permissions-v2',
+      },
+    });
+    expect(auditEvents.at(-1)?.detail).not.toHaveProperty('permissions');
+  });
+
+  it('fails closed when permissions are required but no resolver is configured', async () => {
+    const { host, scope, auditEvents } = harness(['writer'], {
+      requiredPermissions,
+    });
+
+    await expect(host.start(scope, startInput)).rejects.toMatchObject({
+      status: 403,
+      message: 'forbidden',
+    });
+
+    expect(mocked.stream).not.toHaveBeenCalled();
+    expect(auditEvents.at(-1)).toMatchObject({
+      decision: 'denied',
+      reason: 'permission resolver is not configured',
+      detail: {
+        requiredPermissions: ['agents.run', 'reports.read'],
+        permissionPolicyVersion: null,
+      },
+    });
+  });
+
+  it('re-resolves permissions before approval resume and stops a revoked principal', async () => {
+    const resolver = vi.fn(async () => ({
+      permissions: [],
+      policyVersion: 'permissions-revoked-v3',
+    }));
+    const { host, scope, state, auditEvents, setSummary } = harness(
+      ['writer'],
+      {
+        requiredPermissions,
+        resolvePrincipalPermissions: resolver,
+      },
+    );
+    setSummary({ runId: 'acme_run', status: 'suspended' });
+    state.set('flowsafe:agent-thread-binding:v1', {
+      version: 1,
+      agentId: 'writer',
+      resourceId: RESOURCE_ID,
+    });
+    state.set('flowsafe:agent-run:v1:acme_run', {
+      version: 2,
+      agentId: 'writer',
+      principal: scope.principal,
+      originEntryPath: 'http.start',
+    });
+
+    await expect(
+      host.route(
+        new Request('https://thread/_flowsafe/agent-host/resume', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            agentId: 'writer',
+            threadId: 'acme_thread',
+            resourceId: RESOURCE_ID,
+            runId: 'acme_run',
+            entryPath: 'approval.resume',
+            resumeData: { approved: true },
+          }),
+        }),
+        scope,
+      ),
+    ).rejects.toMatchObject({ status: 403 });
+
+    expect(resolver).toHaveBeenCalledOnce();
+    expect(mocked.resumeViaRuntime).not.toHaveBeenCalled();
+    expect(auditEvents.at(-1)).toMatchObject({
+      decision: 'denied',
+      detail: {
+        entryPath: 'approval.resume',
+        requiredPermissions: ['agents.run', 'reports.read'],
+        permissionPolicyVersion: 'permissions-revoked-v3',
+      },
+    });
+  });
+
+  it.each([
+    [
+      'a thrown error',
+      () => {
+        throw new Error('private identity-provider failure');
+      },
+    ],
+    [
+      'a rejected promise',
+      async () => {
+        throw new Error('private asynchronous failure');
+      },
+    ],
+    ['a non-object result', () => null],
+    [
+      'a non-array permission set',
+      () => ({ permissions: 'agents.run', policyVersion: 'permissions-v1' }),
+    ],
+    [
+      'a malformed permission identifier',
+      () => ({ permissions: ['Agents.run'], policyVersion: 'permissions-v1' }),
+    ],
+    [
+      'a duplicate permission identifier',
+      () => ({
+        permissions: ['agents.run', 'agents.run'],
+        policyVersion: 'permissions-v1',
+      }),
+    ],
+    [
+      'a malformed policy version',
+      () => ({ permissions: requiredPermissions, policyVersion: '\n' }),
+    ],
+  ])('fails closed and audits resolver error for %s', async (_label, value) => {
+    const resolver = vi.fn(value) as unknown as PrincipalPermissionResolver;
+    const { host, scope, auditEvents } = harness(['writer'], {
+      requiredPermissions,
+      resolvePrincipalPermissions: resolver,
+    });
+
+    await expect(host.start(scope, startInput)).rejects.toMatchObject({
+      status: 403,
+      message: 'forbidden',
+    });
+
+    expect(mocked.stream).not.toHaveBeenCalled();
+    expect(auditEvents.at(-1)).toMatchObject({
+      decision: 'error',
+      reason: 'permission resolution failed',
+      detail: {
+        requiredPermissions: ['agents.run', 'reports.read'],
+        permissionPolicyVersion: null,
+      },
+    });
+    expect(JSON.stringify(auditEvents.at(-1))).not.toContain('private');
+  });
+
+  it('enforces required permissions for an automated principal without consulting its projected role', async () => {
+    const scheduler: ExecutionPrincipal = {
+      kind: 'system',
+      id: 'flowsafe-scheduler',
+      tenantId: 'acme',
+      purpose: 'scheduled-agent-execution',
+    };
+    const resolver = vi.fn(async () => ({
+      permissions: ['agents.run'],
+      policyVersion: 'automation-v3',
+    }));
+    const { host, scope, state, auditEvents } = harness(['writer'], {
+      principal: scheduler,
+      allowedAutomation: [{ kind: 'system', entryPaths: ['schedule.fire'] }],
+      requiredPermissions,
+      resolvePrincipalPermissions: resolver,
+    });
+    state.set('flowsafe:agent-thread-binding:v1', {
+      version: 1,
+      agentId: 'writer',
+      resourceId: RESOURCE_ID,
+    });
+
+    await expect(
+      host.start(scope, {
+        ...startInput,
+        runId: 'acme_scheduled',
+        entryPath: 'schedule.fire',
+      }),
+    ).rejects.toMatchObject({ status: 403 });
+
+    expect(resolver).toHaveBeenCalledWith(scheduler);
+    expect(mocked.stream).not.toHaveBeenCalled();
+    expect(auditEvents.at(-1)).toMatchObject({
+      decision: 'denied',
+      detail: {
+        principalKind: 'system',
+        principalId: 'flowsafe-scheduler',
+        requiredPermissions: ['agents.run', 'reports.read'],
+        permissionPolicyVersion: 'automation-v3',
+      },
+    });
+  });
+
+  it('does not invoke or require the resolver for a role-only agent', async () => {
+    const resolver = vi.fn(() => {
+      throw new Error('must not run');
+    });
+    const { host, scope, auditEvents } = harness(['writer'], {
+      resolvePrincipalPermissions: resolver,
+    });
+
+    await host.start(scope, startInput);
+
+    expect(resolver).not.toHaveBeenCalled();
+    expect(mocked.stream).toHaveBeenCalledOnce();
+    expect(auditEvents.at(-1)).toMatchObject({ decision: 'allowed' });
+    expect(auditEvents.at(-1)?.detail).not.toHaveProperty(
+      'requiredPermissions',
+    );
+    expect(auditEvents.at(-1)?.detail).not.toHaveProperty(
+      'permissionPolicyVersion',
+    );
+  });
+
+  it('does not consult permissions when the existing human-role gate denies first', async () => {
+    const viewer: ExecutionPrincipal = {
+      kind: 'human',
+      id: 'viewer-1',
+      tenantId: 'acme',
+      role: 'viewer',
+    };
+    const resolver = vi.fn(async () => ({
+      permissions: requiredPermissions,
+      policyVersion: 'permissions-v4',
+    }));
+    const { host, scope, auditEvents } = harness(['writer'], {
+      principal: viewer,
+      requiredPermissions,
+      resolvePrincipalPermissions: resolver,
+    });
+
+    await expect(host.start(scope, startInput)).rejects.toMatchObject({
+      status: 403,
+    });
+
+    expect(resolver).not.toHaveBeenCalled();
+    expect(auditEvents.at(-1)).toMatchObject({
+      decision: 'denied',
+      reason: 'role is not allowed to mutate this agent',
+      detail: {
+        requiredPermissions: ['agents.run', 'reports.read'],
+        permissionPolicyVersion: null,
+      },
+    });
   });
 });
 

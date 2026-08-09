@@ -47,11 +47,13 @@ import {
   deriveTrustedAgentContext,
   sanitizeStoredAgentContext,
 } from './trusted-context.js';
-import type {
-  AgentModule,
-  AgentModuleCatalog,
-  AgentRunEnvelope,
-  TrustedAgentExecution,
+import {
+  type AgentModule,
+  type AgentModuleCatalog,
+  type AgentRunEnvelope,
+  isPermissionIdentifier,
+  type Permission,
+  type TrustedAgentExecution,
 } from './types.js';
 
 export interface AgentThreadStateStorage {
@@ -88,9 +90,35 @@ export type AutomatedEntryAuthorizer = (
   request: AutomatedEntryRequest,
 ) => boolean | Promise<boolean>;
 
+/** The server-derived permissions for one trusted execution principal. */
+export interface PrincipalPermissionResolution {
+  /** Exact permission identifiers granted by this policy snapshot. */
+  permissions: readonly Permission[];
+  /** Stable version or hash identifying the policy snapshot used. */
+  policyVersion: string;
+}
+
+/**
+ * Resolve a trusted principal to permissions owned by the host.
+ *
+ * The resolver receives no request body or caller-provided context. Human
+ * roles and automated identity/provenance are already carried by the validated
+ * principal, so both kinds use the same server-side boundary without treating
+ * an automated principal's compatibility role projection as authority.
+ */
+export type PrincipalPermissionResolver = (
+  principal: ExecutionPrincipal,
+) => PrincipalPermissionResolution | Promise<PrincipalPermissionResolution>;
+
 export interface ThreadAgentHostOptions {
   /** Narrows automated entry beyond what each agent's metadata declares. */
   authorizeAutomatedEntry?: AutomatedEntryAuthorizer;
+  /**
+   * Server-owned principal-to-permission resolver. Required only when a
+   * catalog agent declares `requiredPermissions`; such an agent fails closed
+   * when this seam is absent.
+   */
+  resolvePrincipalPermissions?: PrincipalPermissionResolver;
   buildModules:
     | ((scope: AgentThreadInstanceScope) => readonly AgentModule[])
     | ((scope: AgentThreadInstanceScope) => Promise<readonly AgentModule[]>);
@@ -265,6 +293,63 @@ function audit(
   }
 }
 
+const MAX_PERMISSION_POLICY_VERSION_LENGTH = 200;
+
+function boundedPolicyVersion(value: unknown): value is string {
+  if (
+    typeof value !== 'string' ||
+    value.trim() === '' ||
+    value.length > MAX_PERMISSION_POLICY_VERSION_LENGTH
+  ) {
+    return false;
+  }
+  for (const character of value) {
+    const code = character.charCodeAt(0);
+    if (code <= 0x1f || code === 0x7f) return false;
+  }
+  return true;
+}
+
+function normalizedPermissionResolution(
+  value: unknown,
+): PrincipalPermissionResolution {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('permission resolution must be an object');
+  }
+  const candidate = value as {
+    permissions?: unknown;
+    policyVersion?: unknown;
+  };
+  const sourcePermissions = candidate.permissions;
+  const policyVersion = candidate.policyVersion;
+  if (!Array.isArray(sourcePermissions)) {
+    throw new Error('permission resolution permissions must be an array');
+  }
+  const permissions: Permission[] = [];
+  const seen = new Set<Permission>();
+  for (const permission of sourcePermissions as readonly unknown[]) {
+    if (!isPermissionIdentifier(permission)) {
+      throw new Error(
+        'permission resolution contains a malformed permission identifier',
+      );
+    }
+    if (seen.has(permission)) {
+      throw new Error(
+        'permission resolution contains a duplicate permission identifier',
+      );
+    }
+    seen.add(permission);
+    permissions.push(permission);
+  }
+  if (!boundedPolicyVersion(policyVersion)) {
+    throw new Error('permission resolution policyVersion is malformed');
+  }
+  return Object.freeze({
+    permissions: Object.freeze(permissions),
+    policyVersion,
+  });
+}
+
 function ndjson(
   stream: ReadableStream<unknown>,
   initialOffset: number,
@@ -418,6 +503,8 @@ export function createThreadAgentHost(
    * this precise entry path, AND survive the host's optional authorizer. Absent
    * declaration denies — which is why a scheduled start of an agent that has
    * not opted in fails here rather than executing as a synthetic operator.
+   * After that kind-specific gate, an agent that declares required permissions
+   * also requires every identifier from the server-owned principal resolver.
    */
   const authorize = async (
     scope: ThreadScope,
@@ -427,6 +514,9 @@ export function createThreadAgentHost(
   ) => {
     const current = await runtimeFor(scope);
     const module = current.catalog.get(agentId);
+    const requiredPermissions = module?.meta.requiredPermissions;
+    let permissionPolicyVersion: string | null = null;
+    let decision: 'allowed' | 'denied' | 'error' = 'denied';
     let reason: string | undefined;
     let granted = false;
     if (module === undefined) {
@@ -453,11 +543,40 @@ export function createThreadAgentHost(
       granted = hostAllows;
       if (!granted) reason = 'host denied this automated entry';
     }
+    if (granted && requiredPermissions !== undefined) {
+      const resolver = options.resolvePrincipalPermissions;
+      if (!resolver) {
+        granted = false;
+        reason = 'permission resolver is not configured';
+      } else {
+        let resolution: PrincipalPermissionResolution | undefined;
+        try {
+          resolution = normalizedPermissionResolution(
+            await resolver(principal),
+          );
+        } catch {
+          decision = 'error';
+          granted = false;
+          reason = 'permission resolution failed';
+        }
+        if (resolution) {
+          permissionPolicyVersion = resolution.policyVersion;
+          const effective = new Set(resolution.permissions);
+          granted = requiredPermissions.every((permission) =>
+            effective.has(permission),
+          );
+          if (!granted) {
+            reason = 'required permissions are not satisfied';
+          }
+        }
+      }
+    }
+    if (granted) decision = 'allowed';
     audit(options.audit, {
       actor: principalActor(principal),
       action: 'agent.entry.authorize',
       resource: `agent:${agentId}`,
-      decision: granted ? 'allowed' : 'denied',
+      decision,
       ...(reason !== undefined ? { reason } : {}),
       detail: {
         agentId,
@@ -465,6 +584,9 @@ export function createThreadAgentHost(
         threadId: scope.threadId,
         entryPath: entry,
         ...principalAuditFields(principal),
+        ...(requiredPermissions !== undefined
+          ? { requiredPermissions, permissionPolicyVersion }
+          : {}),
       },
     });
     if (!module) throw new AgentHostRequestError(404, 'agent not found');

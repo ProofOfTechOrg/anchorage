@@ -40,7 +40,7 @@ Availability is secondary to these properties. When context, storage, identity, 
 
 ### Public client to Worker
 
-The Worker must authenticate the request, validate actor and tenant claims, enforce coarse and resource-specific roles, reject client-selected trusted ids/context, cap untrusted bodies, and return 404 for foreign resource ids.
+The public host must authenticate the request, validate actor and tenant claims, enforce coarse and resource-specific roles, enforce server-owned agent permission requirements, reject client-selected trusted ids/context, cap untrusted bodies, and return 404 for foreign resource ids.
 
 The library supplies verifier and router seams, not an identity provider. A static bearer map in the reference deployment is an inspectable example, not production identity guidance.
 
@@ -157,7 +157,7 @@ The trusted suspension bridge records:
 
 `approvalGrantProvider()` reads only approved records. A durable-agent record produces `tool-call` scope and binds connector, tenant, workflow, run, step path, `suspendedAt`, `resumeCount`, and `toolCallId`. A workflow record produces `suspension` scope and binds every field except `toolCallId`, which Mastra cannot reproduce for an arbitrary workflow gate. The runtime-owned resume count distinguishes repeated same-step suspensions even when timestamps collide.
 
-An agent resume target contains the agent, thread, resource, and original authorized principal. A reviewer decision resumes execution as that principal after re-authorizing it against the current catalog: a human principal against the agent's roles, an automated principal against its `allowedAutomation` declaration. The reviewer cannot replace it. Legacy agent approvals without this principal fail closed.
+An agent resume target contains the agent, thread, resource, and original authorized principal. A reviewer decision resumes execution as that principal after re-authorizing it against the current catalog. The host checks a human against the agent’s roles and an automated principal against its `allowedAutomation` declaration. It then checks any `requiredPermissions` through the current server-owned resolver policy. The reviewer cannot replace the principal. Legacy agent approvals without this principal fail closed.
 
 An explicit trusted `runScoped: true` record produces `run` scope and is a standing grant. A step-less record without that flag grants nothing. Legacy rows without explicit scope and malformed grants fail closed.
 
@@ -194,8 +194,10 @@ A host with only one human reviewer must consciously choose availability or sepa
 | Foreign or mismatched agent binding reached | Server catalog plus persisted thread/run/agent binding checks before mutation authorization | Raw namespace access outside the agent topology is unsupported |
 | Client smuggles memory id | Recursive body rejection and server minters | Application-specific aliases must not bypass the minter |
 | Schedule row plants grant/context | Reserved-key rejection and runtime-last merge | Direct database writers remain part of the trusted computing base |
-| Reviewer becomes agent execution principal | Persist the original execution principal in the approval target and re-authorize it on resume: roles for a human, `allowedAutomation` for an automated principal | The stored principal is an authorization snapshot, not a dynamic identity-provider lookup |
+| Reviewer becomes agent execution principal | Persist the original execution principal in the approval target and re-authorize it on resume: roles for a human, `allowedAutomation` for an automated principal, then any `requiredPermissions` | The stored principal is an authorization snapshot, not a dynamic identity-provider lookup |
 | Automation acquires a human's authority | Automated work carries a non-human `ExecutionPrincipal` with a required `purpose`; Breakwater gates on `allowedPrincipalKinds` before roles and never consults the role allowlist for a non-human kind; the agent host requires an `allowedAutomation` declaration naming the kind and the exact entry path | Host code inside the trusted computing base still vouches for its own automated principals |
+| Client supplies effective permissions | `AgentMeta` and `PrincipalPermissionResolver` remain server-owned; the resolver receives only the trusted `ExecutionPrincipal` | A faulty host resolver can grant excessive permissions |
+| Required permission policy is missing or unavailable | The thread host denies when no resolver is configured, the resolver fails, or its output is malformed | A resolver outage makes permission-protected agents unavailable |
 | Automated principal mutated after it is vouched | `trustAutomationPrincipal()` returns a branded, frozen canonical clone; the trusted service entries recheck the own brand, the shape, the kind, and that every field is a plain data property, rather than trusting the erased parameter type | In-process code can recover the brand by reflection from any vouched principal and stamp a frozen object of its own, the same deliberate residual the tenant-binding brand accepts |
 | Vouched principal answers differently on a later read | Accessor properties are refused outright: a getter survives `Object.freeze`, and the trusted entries read a principal several times per call | A caller inside the trusted computing base can still pass a plain object built to its own liking |
 | Webhook claims victim tenant | Verify raw bytes first; tenant from subscription row | Provider secret compromise can forge provider events |
@@ -248,6 +250,16 @@ The role names do not themselves implement:
 - OIDC or session validation;
 - business-specific authorization.
 
+## Agent permission model
+
+Flowsafe adds explicit host-owned permissions to the guarded agent boundary without adding role inheritance. `Permission` identifiers use canonical lowercase dotted form. `AgentMeta.requiredPermissions` uses all-of semantics, so the principal must hold every identifier in the list.
+
+Catalog validation rejects `requiredPermissions` when it is not an array, is empty, contains duplicates, or contains malformed identifiers. Agents that omit the field keep their existing `allowedRoles` and `allowedAutomation` behavior.
+
+Configure `ThreadAgentHostOptions.resolvePrincipalPermissions` with a `PrincipalPermissionResolver`. The resolver receives only the trusted human, service, agent, or system `ExecutionPrincipal`. It returns a `PrincipalPermissionResolution` containing effective permissions and `policyVersion`.
+
+The thread host calls the resolver only after the existing human-role or automated-entry gate succeeds. A required-permission agent fails closed when the resolver is absent, throws, rejects, or returns malformed permissions or policy version. Role-only agents do not invoke or require the resolver.
+
 ## Audit contract
 
 Breakwater's event shape is:
@@ -292,6 +304,8 @@ Example after routing a Flowsafe event through `AuditLogger.record()`:
 
 Do not assume every event has the same action vocabulary or resource object. Use the string contract and documented detail for each producer.
 
+An `agent.entry.authorize` event for a permission-protected agent records `requiredPermissions` and `permissionPolicyVersion`. The version is `null` when no valid resolution exists. The event omits effective permissions and identity-provider groups.
+
 ## Secrets
 
 Anchorage does not include a generic secret resolver.
@@ -316,15 +330,16 @@ Before a public endpoint:
 
 1. Replace the static token example with a verified production identity seam.
 2. Provision tenant ids and test foreign-resource 404 behavior.
-3. Use D1-backed connector stores across per-run objects.
-4. Register tenant isolation on every multi-tenant connector.
-5. Route connector HTTP through `runtime.fetch` and add infrastructure egress policy.
-6. Keep approval connector lists and durable-agent resume targets server-authored.
-7. Mount only configured optional routers.
-8. Configure all retention and offboarding duties for adopted domains.
-9. Protect Durable Object namespaces behind the Worker topologies.
-10. Project notifications and audit to the receiving channel's trust level.
-11. Isolate Agent CLI workspaces and review their diffs.
-12. Run the deterministic workerd restart, forgery, and cross-tenant proof.
+3. Configure and version `resolvePrincipalPermissions` before registering an agent with `requiredPermissions`.
+4. Use D1-backed connector stores across per-run objects.
+5. Register tenant isolation on every multi-tenant connector.
+6. Route connector HTTP through `runtime.fetch` and add infrastructure egress policy.
+7. Keep approval connector lists and durable-agent resume targets server-authored.
+8. Mount only configured optional routers.
+9. Configure all retention and offboarding duties for adopted domains.
+10. Protect Durable Object namespaces behind the Worker topologies.
+11. Project notifications and audit to the receiving channel’s trust level.
+12. Isolate Agent CLI workspaces and review their diffs.
+13. Run the deterministic workerd restart, forgery, and cross-tenant proof.
 
 Report vulnerabilities through [`SECURITY.md`](../SECURITY.md), not a public issue.

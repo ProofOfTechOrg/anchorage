@@ -26,6 +26,7 @@ Cloudflare Worker
         +--> agent router ------------> thread topology
         |                                    |
         |                                    +--> guarded catalog module
+        |                                    +--> principal permission resolver
         |                                    +--> durable agent run/status/stream
         |
         +--> thread routers ----------> thread topology
@@ -138,9 +139,15 @@ D1-backed memory recall uses the salted ids through Mastra's own memory implemen
 
 `@proofoftech/flowsafe/agent-host` is the supported protected host. It validates Breakwater's package-local guarded-handle brand, resolves each agent from a server-owned catalog, and constructs the complete module inside the thread Durable Object. The Worker receives metadata only.
 
+`AgentMeta.requiredPermissions` declares an all-of list of canonical lowercase dotted `Permission` identifiers. Catalog validation rejects a non-array, an empty list, duplicates, and malformed identifiers. Agents that omit the field keep the existing role and automation path.
+
+`ThreadAgentHostOptions.resolvePrincipalPermissions` accepts a server-owned `PrincipalPermissionResolver`. It receives only the trusted `ExecutionPrincipal` and returns a `PrincipalPermissionResolution` containing effective permissions and `policyVersion`. The host calls it after the human-role or automated-entry gate succeeds. Missing configuration, resolver failure, and malformed output deny an agent that requires permissions.
+
+Permission authorization audit detail records `requiredPermissions` and `permissionPolicyVersion`. It omits effective permissions and identity-provider groups.
+
 Public starts mint the thread, resource, and run ids after authentication. Status and NDJSON observation recheck the stored agent/thread/run binding and return 404 for foreign or mismatched ids. Stream replay lasts only as long as Mastra's configured cache; authoritative status remains available after replay eviction.
 
-An agent has no public raw-resume route. Approval records persist the original authorized principal, and an approval decision resumes as that principal after re-authorizing it against the current catalog: a human principal against the agent's roles, an automated principal against its `allowedAutomation` declaration on the `approval.resume` entry path. The reviewer remains the actor on the approval decision event.
+An agent has no public raw-resume route. Approval records persist the original authorized principal, and an approval decision resumes as that principal after re-authorizing it against the current catalog. The host checks a human against the agent’s roles and an automated principal against its `allowedAutomation` declaration. It then checks any `requiredPermissions` through the current resolver policy. The reviewer remains the actor on the approval decision event.
 
 After Durable Object eviction, the in-process tool registry is gone while D1 state remains. The agent host validates the memory binding, reconstructs the guarded module, and derives fresh trusted resume context. It then rehydrates Mastra's registries by invoking only Breakwater's reserved RBAC `processInput` hook. Before installation, it restores the complete input, LLM-request, application output, and mandatory output-processor lists for resumed loop execution. Initial application and policy `processInput` hooks do not run again. The host then starts observation and resumes through `RunnerRuntime`.
 

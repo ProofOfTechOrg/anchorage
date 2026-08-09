@@ -1,6 +1,6 @@
 # Proposal: breakwater improvement roadmap
 
-> This document records roadmap decisions and remaining uncommitted work. Phase A is shipped through guarded Breakwater agents and Flowsafe's catalog-driven agent host. Supported behavior is documented in [Breakwater architecture](../breakwater-architecture.md), [Durable agents](../durable-agents.md), [Policy engine](../policy-engine-design.md), and [Connector interface](../connector-interface.md).
+> This document records roadmap decisions and remaining uncommitted work. Phase A, Phase B steps 1 through 3, and Phase C steps 1 and 2 are shipped. Supported behavior is documented in [Breakwater architecture](../breakwater-architecture.md), [Durable agents](../durable-agents.md), [Policy engine](../policy-engine-design.md), and [Connector interface](../connector-interface.md).
 
 This document turns the limitations and ownership boundaries described in
 [`breakwater-purpose-and-boundaries.md`](../breakwater-purpose-and-boundaries.md)
@@ -32,7 +32,7 @@ testable, and appropriately placed.
 | **Shipped** | Structured connector approval grants | Durable agents use exact tool-call scope, workflow gates use exact suspension scope, and standing grants use explicit run scope |
 | **Shipped** | End-to-end invariant tests for supported invocation paths | The deterministic workerd proof covers restart, approval resume, forgery, tenancy, and exactly-once execution |
 | **Shipped** | Public documentation aligned with guarded agent hosting | The architecture, durable-agent, deployment, threat-model, operations, starter, and API guides define the supported boundary |
-| **P1** | Add permission-based authorization without role inheritance | Fine-grained permissions scale better than hard-coded role semantics |
+| **Shipped** | Agent permission authorization without role inheritance | Flowsafe resolves trusted principals through a versioned host policy and enforces all required permissions |
 | **P1** | Add optional connector invocation permissions | Human/service authorization and human approval answer different questions |
 | **P1** | Publish secure single-tenant and multi-tenant policy presets | Optional evaluators and stores are otherwise easy to omit |
 | **P1** | Add manifest-conformance tooling and stronger egress posture | Runtime safety depends on honest manifests and use of `runtime.fetch` |
@@ -81,7 +81,7 @@ workflow run router:
 2. Apply the coarse agent-run role/permission gate.
 3. Resolve the agent from the server catalog.
 4. Check tenant ownership for any thread, resource, or run identifiers.
-5. Apply `AgentMeta.allowedRoles` and, later, `requiredPermissions`.
+5. Apply `AgentMeta.allowedRoles` and any configured `requiredPermissions`.
 6. Mint the run/thread/resource identifiers server-side.
 7. Derive trusted request context.
 8. Invoke only the guarded agent handle.
@@ -346,51 +346,23 @@ Acceptance criteria:
 
 ## P1: Security and Authorization Improvements
 
-### 8. Add Permissions, Not Role Inheritance
+### 8. Add permissions, not role inheritance (agent host shipped)
 
-#### Recommendation
+#### Shipped agent-host implementation
 
-Do not start by introducing hierarchical roles. Role inheritance looks simple
-but creates implicit authority that is difficult to audit. Prefer explicit
-permissions:
+Flowsafe exports the canonical lowercase dotted `Permission` identifier type. `AgentMeta.requiredPermissions` declares a non-empty all-of list. Catalog construction rejects a non-array, an empty list, duplicate identifiers, and malformed identifiers.
 
-```ts
-type Permission =
-  | 'agents.run'
-  | 'agents.report.run'
-  | 'workflows.start'
-  | 'reports.read'
-  | 'crm.contacts.write'
-  | 'payments.release';
-```
+`ThreadAgentHostOptions.resolvePrincipalPermissions` accepts a server-owned `PrincipalPermissionResolver`. The resolver receives only the trusted human, service, agent, or system `ExecutionPrincipal`. It returns a `PrincipalPermissionResolution` containing effective permissions and `policyVersion`.
 
-Flowsafe should map authenticated roles/groups/service identities to
-permissions. Breakwater should consume already-derived permissions or an
-authorization callback; it should not own user/group membership.
+The thread-host authorization gate calls the resolver after the existing human-role or automated-entry gate succeeds. Missing configuration, resolver failure, and malformed output fail closed for an agent that requires permissions. Agents that use only `allowedRoles` and `allowedAutomation` do not invoke or require the resolver.
 
-Preserve `allowedRoles` as the small, compatible option. Add one of:
+Every permission-protected agent decision records `requiredPermissions` and `permissionPolicyVersion`. Audit events omit the effective permission set and identity-provider groups.
 
-```ts
-requiredPermissions: ['reports.read']
-```
+#### Preserved boundary
 
-or:
+Flowsafe maps authenticated roles, groups, and service identities to permissions. Breakwater does not own user or group membership, and this change adds no role inheritance.
 
-```ts
-authorize: ({ actor, requestContext }) => AuthorizationDecision
-```
-
-Define whether required permissions use all-of or any-of semantics; do not
-leave it implicit.
-
-#### Acceptance criteria
-
-- Existing role-only agents remain compatible.
-- Effective permissions are derived server-side and cannot come from a client
-  body.
-- Every decision records the required permission identifiers and policy
-  version, but does not expose sensitive group membership unnecessarily.
-- No role acquires a permission through undocumented inheritance.
+Connector invocation permissions remain planned in the next section. Resource authorization evaluators also remain planned.
 
 ### 9. Add Optional Connector Invocation Authorization
 
@@ -749,11 +721,11 @@ The shipped host deliberately omits a public raw-resume route. It accepts struct
 
 ### Phase C: Fine-grained authorization
 
-1. Introduce explicit permissions and a host role-to-permission mapper.
-2. Add `AgentMeta.requiredPermissions`.
+1. ~~Introduce explicit permissions and a host role-to-permission mapper.~~ Shipped for the agent host. `PrincipalPermissionResolver` maps a trusted `ExecutionPrincipal`, including a human role, to effective permissions and `policyVersion`.
+2. ~~Add `AgentMeta.requiredPermissions`.~~ Shipped with all-of semantics, catalog validation, fail-closed resolver enforcement, versioned audit attribution, and unchanged role-only behavior.
 3. Add optional connector `requiredPermissions`.
 4. Add resource authorization evaluators for concrete use cases.
-5. Keep role-only configuration as the simple compatibility path.
+5. Keep role-only configuration as the compatibility path.
 
 ### Phase D: Connector assurance
 

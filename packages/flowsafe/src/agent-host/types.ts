@@ -13,6 +13,23 @@ import type { RunSummary } from '../do-runner/index.js';
 export type { AgentEntryPath } from '../agent-runner/index.js';
 
 /**
+ * A canonical server-owned permission identifier.
+ *
+ * The runtime form is two or more lowercase ASCII segments separated by dots,
+ * with each segment starting with a letter and continuing with letters or
+ * digits. Identifiers are bounded to 200 characters.
+ */
+export type Permission = string;
+
+const PERMISSION_IDENTIFIER_PATTERN =
+  /^(?=.{3,200}$)[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)+$/;
+
+/** Whether a value is a canonical permission identifier. */
+export function isPermissionIdentifier(value: unknown): value is Permission {
+  return typeof value === 'string' && PERMISSION_IDENTIFIER_PATTERN.test(value);
+}
+
+/**
  * One automated entry an agent accepts: a principal kind paired with the exact
  * entry paths it may arrive on. Kind alone is too coarse — a schedule-driven
  * agent should not thereby accept webhook-delivered signals.
@@ -28,6 +45,13 @@ export interface AgentMeta {
   description: string;
   /** Human roles permitted to start the agent over authenticated HTTP. */
   allowedRoles?: readonly ApprovalRole[];
+  /**
+   * Server-derived permissions required to enter this agent. Semantics are
+   * explicitly ALL-OF: the principal must hold every listed identifier.
+   * Omission preserves the role/automation-only authorization path; a present
+   * list must be non-empty.
+   */
+  requiredPermissions?: readonly Permission[];
   /**
    * Automated entries the agent accepts. ABSENT OR EMPTY DENIES EVERY
    * automated start and resume — a schedule, signal, provider, or delegating
