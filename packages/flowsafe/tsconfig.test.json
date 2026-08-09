@@ -13,6 +13,7 @@
       "@proofoftech/breakwater/connector-sdk": [
         "../breakwater/src/connector-sdk/index.ts"
       ],
+      "@proofoftech/breakwater/rbac": ["../breakwater/src/rbac/index.ts"],
       // deploy/worker.ts (pulled in by its e2e test) imports the package
       // specifiers a copy-ready consumer would; resolve them to source here
       // (matches the vitest aliases).

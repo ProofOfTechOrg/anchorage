@@ -32,6 +32,11 @@ export default defineConfig({
           import.meta.url,
         ).pathname,
       },
+      {
+        find: /^@proofoftech\/breakwater\/rbac$/,
+        replacement: new URL('../breakwater/src/rbac/index.ts', import.meta.url)
+          .pathname,
+      },
       // deploy/worker.e2e.test.ts imports the copy-ready template, whose
       // package-specifier imports must resolve to THIS package's source (the
       // exports map points at dist/, which tests must not depend on).
