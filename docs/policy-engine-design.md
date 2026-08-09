@@ -123,7 +123,7 @@ The connector SDK separately builds `runtime.fetch` from the manifest. It checks
 - destructive side-effect classification;
 - deployment write-permission patterns.
 
-The connector reads `breakwater.connectorGrants` and `breakwater.connectorExecution` from request context. It compares connector, tenant, workflow, run, and exact suspension identity. A `tool-call` grant also must match Mastra’s `context.agent.toolCallId`. Flowsafe derives these values from approved records and authoritative runtime state. A dry run bypasses the capability because its configured implementation must have no side effect.
+The connector reads `breakwater.connectorGrants` and `breakwater.connectorExecution` from request context. It compares connector, tenant, workflow, run, and exact suspension identity. A `tool-call` grant also must match Mastra's `context.agent.toolCallId`. Flowsafe derives these values from approved records and authoritative runtime state. A dry run bypasses the capability because its configured implementation must have no side effect.
 
 ### Cross-workflow isolation
 

@@ -104,7 +104,7 @@ The application chooses the business key. Flowsafe supplies the trusted tenant i
 
 ### `requiresApproval`
 
-When `true`, every real call needs a structured grant in `breakwater.connectorGrants`. Breakwater compares the grant with the runtime-owned `breakwater.connectorExecution` identity and the connector’s actual Mastra `toolCallId` when the grant uses `tool-call` scope.
+When `true`, every real call needs a structured grant in `breakwater.connectorGrants`. Breakwater compares the grant with the runtime-owned `breakwater.connectorExecution` identity and the connector's actual Mastra `toolCallId` when the grant uses `tool-call` scope.
 
 The same decision is compiled into Mastra's native `requireApproval` predicate so an agent can suspend. The native approval signal never replaces the request-context capability.
 
@@ -219,9 +219,9 @@ Inject `runtime.fetch` into compatible SDKs. Apply infrastructure network policy
 
 ## Approval context
 
-`breakwater.connectorGrants` is a structured capability array in Mastra’s `RequestContext`. `breakwater.connectorExecution` identifies the current runtime leg. Whoever can write either value can affect authorization, so only trusted runtime code may populate them.
+`breakwater.connectorGrants` is a structured capability array in Mastra's `RequestContext`. `breakwater.connectorExecution` identifies the current runtime leg. Whoever can write either value can affect authorization, so only trusted runtime code may populate them.
 
-Flowsafe’s approval provider reads approved D1 records and derives grants for each runtime leg. A public resume body, signal, model output, workflow input, tool result, schedule row, or background task cannot supply either key.
+Flowsafe's approval provider reads approved D1 records and derives grants for each runtime leg. A public resume body, signal, model output, workflow input, tool result, schedule row, or background task cannot supply either key.
 
 Breakwater supports three explicit scopes:
 

@@ -94,7 +94,11 @@ export type AutomatedEntryAuthorizer = (
 export interface PrincipalPermissionResolution {
   /** Exact permission identifiers granted by this policy snapshot. */
   permissions: readonly Permission[];
-  /** Stable version or hash identifying the policy snapshot used. */
+  /**
+   * Stable version or hash identifying the policy snapshot used. Must be
+   * non-blank, at most 200 characters, and free of ASCII control characters;
+   * anything else is malformed output and fails closed.
+   */
   policyVersion: string;
 }
 
@@ -105,6 +109,10 @@ export interface PrincipalPermissionResolution {
  * roles and automated identity/provenance are already carried by the validated
  * principal, so both kinds use the same server-side boundary without treating
  * an automated principal's compatibility role projection as authority.
+ *
+ * A throw or rejection denies with the generic audit reason `permission
+ * resolution failed`; the underlying error is never re-exported, so log
+ * failures inside the resolver itself.
  */
 export type PrincipalPermissionResolver = (
   principal: ExecutionPrincipal,
@@ -325,27 +333,23 @@ function normalizedPermissionResolution(
   if (!Array.isArray(sourcePermissions)) {
     throw new Error('permission resolution permissions must be an array');
   }
-  const permissions: Permission[] = [];
-  const seen = new Set<Permission>();
+  // Duplicates are tolerated rather than treated as malformed: the all-of
+  // check has set semantics, so a host that unions role bundles must not take
+  // an availability hit for a repeat that cannot change any decision.
+  const permissions = new Set<Permission>();
   for (const permission of sourcePermissions as readonly unknown[]) {
     if (!isPermissionIdentifier(permission)) {
       throw new Error(
         'permission resolution contains a malformed permission identifier',
       );
     }
-    if (seen.has(permission)) {
-      throw new Error(
-        'permission resolution contains a duplicate permission identifier',
-      );
-    }
-    seen.add(permission);
-    permissions.push(permission);
+    permissions.add(permission);
   }
   if (!boundedPolicyVersion(policyVersion)) {
     throw new Error('permission resolution policyVersion is malformed');
   }
   return Object.freeze({
-    permissions: Object.freeze(permissions),
+    permissions: Object.freeze([...permissions]),
     policyVersion,
   });
 }

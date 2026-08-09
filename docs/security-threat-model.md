@@ -157,7 +157,7 @@ The trusted suspension bridge records:
 
 `approvalGrantProvider()` reads only approved records. A durable-agent record produces `tool-call` scope and binds connector, tenant, workflow, run, step path, `suspendedAt`, `resumeCount`, and `toolCallId`. A workflow record produces `suspension` scope and binds every field except `toolCallId`, which Mastra cannot reproduce for an arbitrary workflow gate. The runtime-owned resume count distinguishes repeated same-step suspensions even when timestamps collide.
 
-An agent resume target contains the agent, thread, resource, and original authorized principal. A reviewer decision resumes execution as that principal after re-authorizing it against the current catalog. The host checks a human against the agent’s roles and an automated principal against its `allowedAutomation` declaration. It then checks any `requiredPermissions` through the current server-owned resolver policy. The reviewer cannot replace the principal. Legacy agent approvals without this principal fail closed.
+An agent resume target contains the agent, thread, resource, and original authorized principal. A reviewer decision resumes execution as that principal after re-authorizing it against the current catalog. The host checks a human against the agent's roles and an automated principal against its `allowedAutomation` declaration. It then checks any `requiredPermissions` through the current server-owned resolver policy. The reviewer cannot replace the principal. Legacy agent approvals without this principal fail closed.
 
 An explicit trusted `runScoped: true` record produces `run` scope and is a standing grant. A step-less record without that flag grants nothing. Legacy rows without explicit scope and malformed grants fail closed.
 
@@ -338,7 +338,7 @@ Before a public endpoint:
 8. Mount only configured optional routers.
 9. Configure all retention and offboarding duties for adopted domains.
 10. Protect Durable Object namespaces behind the Worker topologies.
-11. Project notifications and audit to the receiving channel’s trust level.
+11. Project notifications and audit to the receiving channel's trust level.
 12. Isolate Agent CLI workspaces and review their diffs.
 13. Run the deterministic workerd restart, forgery, and cross-tenant proof.
 

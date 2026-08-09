@@ -70,7 +70,7 @@ allowedAutomation: [
 allowedPrincipalKinds: ['human', 'system', 'service'],
 ```
 
-Pass a server-owned `PrincipalPermissionResolver` through `ThreadAgentHostOptions.resolvePrincipalPermissions`. The resolver receives only the trusted `ExecutionPrincipal`. It returns a `PrincipalPermissionResolution` with effective permissions and the policy snapshot’s `policyVersion`:
+Pass a server-owned `PrincipalPermissionResolver` through `ThreadAgentHostOptions.resolvePrincipalPermissions`. The resolver receives only the trusted `ExecutionPrincipal`. It returns a `PrincipalPermissionResolution` with effective permissions and the policy snapshot's `policyVersion`:
 
 ```typescript
 import {
@@ -111,7 +111,7 @@ const agentHost = createThreadAgentHost({
 
 The resolver can map a human role or an automated identity to the same `Permission` vocabulary. Keep `permissionsForRole`, `permissionsForPrincipal`, and `accessPolicyVersion` in trusted host configuration.
 
-The thread host evaluates required permissions only after the existing human-role or automated-entry gate succeeds. A missing resolver, a thrown or rejected call, or malformed resolver output fails closed. Role-only agents do not invoke or require the resolver.
+The thread host evaluates required permissions only after the existing human-role or automated-entry gate succeeds. A missing resolver, a thrown or rejected call, or malformed resolver output fails closed. Malformed output is a non-object resolution, a permission set that is not an array of canonical identifiers, or a `policyVersion` that is blank, longer than 200 characters, or contains ASCII control characters. Duplicate identifiers in the resolved set are tolerated because a repeat cannot change an all-of decision. A resolver failure surfaces only the generic audit reason `permission resolution failed`, so log failures inside the resolver itself. Role-only agents do not invoke or require the resolver.
 
 Permission authorization audit detail includes `requiredPermissions` and `permissionPolicyVersion`. The policy version is `null` when no valid resolution exists. The event does not include the effective permission set or identity-provider groups.
 
@@ -134,7 +134,7 @@ The start body accepts only `{"prompt":"..."}`. The router caps the raw UTF-8 bo
 
 Each stream line contains the next reconnect cursor and one event. Replay depends on the configured Mastra cache and is not process-restart durable. When the durable run exists but its replay cache does not, the stream route returns 409 and the client must use the status route.
 
-Approval records store an `agent-thread` target with the agent, thread, resource, and original authorized principal. `createAgentApprovalResumer()` re-authorizes that stored principal against the current catalog: a human against the agent’s roles and an automated principal against its `allowedAutomation` declaration on the `approval.resume` entry path. The thread host then enforces any `requiredPermissions` through the current resolver policy. It reconstructs the guarded module after eviction and resumes as the original principal. Before resume, the wrapper rebuilds Mastra’s local and global run registries from fresh trusted context. It invokes only Breakwater’s reserved RBAC `processInput` hook during rehydration, then installs the complete input, LLM-request, and output processor lists for resumed loop execution. It does not replay application or policy `processInput` hooks. An authorization denial stops before registry installation, observation, or tool execution. The reviewer identity remains attached to the approval decision.
+Approval records store an `agent-thread` target with the agent, thread, resource, and original authorized principal. `createAgentApprovalResumer()` re-authorizes that stored principal against the current catalog: a human against the agent's roles and an automated principal against its `allowedAutomation` declaration on the `approval.resume` entry path. The thread host then enforces any `requiredPermissions` through the current resolver policy. It reconstructs the guarded module after eviction and resumes as the original principal. Before resume, the wrapper rebuilds Mastra's local and global run registries from fresh trusted context. It invokes only Breakwater's reserved RBAC `processInput` hook during rehydration, then installs the complete input, LLM-request, and output processor lists for resumed loop execution. It does not replay application or policy `processInput` hooks. An authorization denial stops before registry installation, observation, or tool execution. The reviewer identity remains attached to the approval decision.
 
 ## Use the lower-level durable wrapper
 

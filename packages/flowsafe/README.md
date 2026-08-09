@@ -103,11 +103,11 @@ When a workflow or durable agent suspends:
 
 1. The authoritative run summary captures `stepPath`, `suspendedAt`, and `resumeCount`.
 2. The trusted host bridge creates one open approval in a tenant-bound store.
-3. The record’s connector IDs and optional Mastra `toolCallId` come from a server-authored suspend payload.
+3. The record's connector IDs and optional Mastra `toolCallId` come from a server-authored suspend payload.
 4. A reviewer claims, delegates, approves, or rejects through the service or REST router.
 5. A compare-and-swap commits the mutation.
 6. An approval re-enters the owning runtime.
-7. `approvalGrantProvider()` reads D1 and writes only the matching structured grants into the resumed leg’s request context.
+7. `approvalGrantProvider()` reads D1 and writes only the matching structured grants into the resumed leg's request context.
 8. Another suspension creates a new approval. A completed or failed run ends the loop.
 
 Durable-agent records produce `tool-call` scope. Workflow gates produce exact `suspension` scope. Trusted `runScoped` records produce explicit `run` scope. Grants never travel in public request bodies. A raw or forged resume finds no stored capability and fails at the Breakwater connector gate.
@@ -268,7 +268,7 @@ Agents that use only `allowedRoles` and `allowedAutomation` do not invoke or req
 
 `createThreadAgentHost()` validates Breakwater's guarded-handle brand before it registers the agent with Mastra. It persists the thread/agent binding and original run principal, so eviction recovery and approval resume cannot switch agents or actors.
 
-Agent resume is approval-only. `createAgentApprovalResumer()` rejects legacy agent targets without the original principal, then rechecks that principal against the current catalog. A human must still satisfy the selected agent’s `allowedRoles`. An automated principal’s kind must still appear in `allowedAutomation`; `approval.resume` is implied for a declared kind. The thread host then enforces any `requiredPermissions` through the current resolver policy. The resumer delegates non-agent workflow records to the existing resume function.
+Agent resume is approval-only. `createAgentApprovalResumer()` rejects legacy agent targets without the original principal, then rechecks that principal against the current catalog. A human must still satisfy the selected agent's `allowedRoles`. An automated principal's kind must still appear in `allowedAutomation`; `approval.resume` is implied for a declared kind. The thread host then enforces any `requiredPermissions` through the current resolver policy. The resumer delegates non-agent workflow records to the existing resume function.
 
 `createFlowsafeDurableAgent()` remains the lower-level compatibility API. It routes Mastra's durable-agent workflow through `RunnerRuntime`, but it does not guard an arbitrary raw agent. Use `agent-host` when an HTTP surface must enforce catalog and Breakwater invariants.
 

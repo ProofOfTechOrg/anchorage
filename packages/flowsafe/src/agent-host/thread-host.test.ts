@@ -959,6 +959,28 @@ describe('createThreadAgentHost permission authorization', () => {
     expect(auditEvents.at(-1)?.detail).not.toHaveProperty('permissions');
   });
 
+  it('tolerates duplicate identifiers in resolver output because a repeat cannot change an all-of decision', async () => {
+    const resolver = vi.fn(async () => ({
+      permissions: ['agents.run', 'agents.run', 'reports.read'],
+      policyVersion: 'permissions-v2',
+    }));
+    const { host, scope, auditEvents } = harness(['writer'], {
+      requiredPermissions,
+      resolvePrincipalPermissions: resolver,
+    });
+
+    await host.start(scope, startInput);
+
+    expect(mocked.stream).toHaveBeenCalledOnce();
+    expect(auditEvents.at(-1)).toMatchObject({
+      decision: 'allowed',
+      detail: {
+        requiredPermissions: ['agents.run', 'reports.read'],
+        permissionPolicyVersion: 'permissions-v2',
+      },
+    });
+  });
+
   it('fails closed when permissions are required but no resolver is configured', async () => {
     const { host, scope, auditEvents } = harness(['writer'], {
       requiredPermissions,
@@ -1058,15 +1080,26 @@ describe('createThreadAgentHost permission authorization', () => {
       () => ({ permissions: ['Agents.run'], policyVersion: 'permissions-v1' }),
     ],
     [
-      'a duplicate permission identifier',
+      'a non-string permission entry',
       () => ({
-        permissions: ['agents.run', 'agents.run'],
+        permissions: ['agents.run', 42],
         policyVersion: 'permissions-v1',
       }),
     ],
     [
       'a malformed policy version',
       () => ({ permissions: requiredPermissions, policyVersion: '\n' }),
+    ],
+    [
+      'a blank policy version',
+      () => ({ permissions: requiredPermissions, policyVersion: '   ' }),
+    ],
+    [
+      'a policy version over the 200-character bound',
+      () => ({
+        permissions: requiredPermissions,
+        policyVersion: 'v'.repeat(201),
+      }),
     ],
   ])('fails closed and audits resolver error for %s', async (_label, value) => {
     const resolver = vi.fn(value) as unknown as PrincipalPermissionResolver;
@@ -1130,6 +1163,49 @@ describe('createThreadAgentHost permission authorization', () => {
       detail: {
         principalKind: 'system',
         principalId: 'flowsafe-scheduler',
+        requiredPermissions: ['agents.run', 'reports.read'],
+        permissionPolicyVersion: 'automation-v3',
+      },
+    });
+  });
+
+  it('allows an automated principal that holds every required permission', async () => {
+    const scheduler: ExecutionPrincipal = {
+      kind: 'system',
+      id: 'flowsafe-scheduler',
+      tenantId: 'acme',
+      purpose: 'scheduled-agent-execution',
+    };
+    const resolver = vi.fn(async () => ({
+      permissions: ['agents.run', 'reports.read'],
+      policyVersion: 'automation-v3',
+    }));
+    const { host, scope, state, auditEvents } = harness(['writer'], {
+      principal: scheduler,
+      allowedAutomation: [{ kind: 'system', entryPaths: ['schedule.fire'] }],
+      requiredPermissions,
+      resolvePrincipalPermissions: resolver,
+    });
+    state.set('flowsafe:agent-thread-binding:v1', {
+      version: 1,
+      agentId: 'writer',
+      resourceId: RESOURCE_ID,
+    });
+
+    await host.start(scope, {
+      ...startInput,
+      runId: 'acme_scheduled',
+      entryPath: 'schedule.fire',
+    });
+
+    expect(resolver).toHaveBeenCalledWith(scheduler);
+    expect(mocked.stream).toHaveBeenCalledOnce();
+    expect(auditEvents.at(-1)).toMatchObject({
+      decision: 'allowed',
+      detail: {
+        principalKind: 'system',
+        principalId: 'flowsafe-scheduler',
+        entryPath: 'schedule.fire',
         requiredPermissions: ['agents.run', 'reports.read'],
         permissionPolicyVersion: 'automation-v3',
       },
