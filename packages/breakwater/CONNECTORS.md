@@ -117,17 +117,19 @@ wrapper then applies:
 1. The foreground-only `_background` override check.
 2. The organization egress policy and custom evaluators, in registration
    order.
-3. The dry-run branch, when requested.
-4. The approval grant check.
-5. The idempotency lookup or atomic reservation, when declared.
-6. The rate-limit increment for an actual execution.
-7. Your `execute()` function.
-8. Per-request and per-redirect host checks whenever `runtime.fetch()` runs.
-9. Mastra output-schema validation.
+3. The required-permissions authorization check, when declared.
+4. The dry-run branch, when requested.
+5. The approval grant check.
+6. The idempotency lookup or atomic reservation, when declared.
+7. The rate-limit increment for an actual execution.
+8. Your `execute()` function.
+9. Per-request and per-redirect host checks whenever `runtime.fetch()` runs.
+10. Mastra output-schema validation.
 
-Dry runs pass through the pre-execute evaluators but skip approval,
-idempotency, and rate-limit consumption. Replays and same-isolate in-flight
-joins do not consume rate budget.
+Dry runs pass through the pre-execute evaluators and the
+required-permissions check but skip approval, idempotency, and rate-limit
+consumption. Replays and same-isolate in-flight joins do not consume rate
+budget.
 
 Calls that reach the wrapper record the relevant allow, deny, or failure events
 through the configured `AuditLogger`. Secondary events can also report a
@@ -144,6 +146,7 @@ degraded store or a stale idempotency reservation takeover.
 | `idempotencyKey` | Repeated operation identities must replay | Requires `policies.idempotencyStore` and a non-empty `breakwater.idempotencyKey` for each real call. |
 | `rateLimit` | Fixed-window execution budget | Uses `<count>/<unit>`, where unit is `s`, `sec`, `second`, `m`, `min`, `minute`, `h`, `hour`, `d`, or `day`. Requires `policies.rateLimitStore`. |
 | `background` | The connector permits a model background override | Allowed only on `read` connectors. Write-class connectors are foreground-only in v1. This permission does not itself configure Mastra background-task eligibility. |
+| `requiredPermissions` | Server-derived permissions the principal must hold to invoke the connector at all | All-of list of canonical dotted identifiers, validated at construction. Every call — dry-runs included — requires a trusted `breakwater.principalPermissions` projection holding every identifier, checked before the approval grant so an approval cannot elevate an unauthorized principal. Missing or malformed projections fail closed. |
 
 Classify by the worst operation reachable from `execute()`. A create-or-replace
 operation is destructive if it can overwrite existing state. An idempotent
@@ -211,6 +214,7 @@ import {
   IDEMPOTENCY_KEY_CONTEXT_KEY,
 } from '@proofoftech/breakwater/connector-sdk';
 import { WORKFLOW_SCOPE_CONTEXT_KEY } from '@proofoftech/breakwater/policy-engine';
+import { PRINCIPAL_PERMISSIONS_CONTEXT_KEY } from '@proofoftech/breakwater/rbac';
 
 const requestContext = new RequestContext();
 requestContext.set(WORKFLOW_SCOPE_CONTEXT_KEY, 'incident-response');
@@ -232,6 +236,12 @@ requestContext.set(CONNECTOR_GRANTS_CONTEXT_KEY, [{
   runId: 'server_minted_run_id',
   suspension,
 }]);
+// Only when the connector declares requiredPermissions: the executing
+// principal's server-resolved permissions and the policy snapshot version.
+requestContext.set(PRINCIPAL_PERMISSIONS_CONTEXT_KEY, {
+  permissions: ['incidents.notify'],
+  policyVersion: 'access-policy-2026-08',
+});
 requestContext.set(IDEMPOTENCY_KEY_CONTEXT_KEY, 'incident-481:notice');
 
 const result = await slackPoster.execute?.(
@@ -243,7 +253,7 @@ const result = await slackPoster.execute?.(
 );
 ```
 
-This example shows the values a trusted runtime must produce. Application routes must not construct them from client data. Do not accept `CONNECTOR_GRANTS_CONTEXT_KEY`, `CONNECTOR_EXECUTION_CONTEXT_KEY`, `ISOLATION_SCOPE_CONTEXT_KEY`, `runId`, or `WORKFLOW_SCOPE_CONTEXT_KEY` from clients. A multi-tenant host should also register `tenantIsolation()` so a missing scope becomes a denial instead of a shared cache or budget.
+This example shows the values a trusted runtime must produce. Application routes must not construct them from client data. Do not accept `CONNECTOR_GRANTS_CONTEXT_KEY`, `CONNECTOR_EXECUTION_CONTEXT_KEY`, `PRINCIPAL_PERMISSIONS_CONTEXT_KEY`, `ISOLATION_SCOPE_CONTEXT_KEY`, `runId`, or `WORKFLOW_SCOPE_CONTEXT_KEY` from clients. A multi-tenant host should also register `tenantIsolation()` so a missing scope becomes a denial instead of a shared cache or budget.
 
 To request simulation:
 
@@ -256,7 +266,9 @@ requestContext.set(DRY_RUN_CONTEXT_KEY, true);
 ```
 
 A dry-run call does not need an approval grant or idempotency key. It still
-passes the organization egress and custom evaluator gates.
+passes the organization egress and custom evaluator gates, and — when the
+manifest declares `requiredPermissions` — the authorization gate: a
+simulation still needs an authorized principal.
 
 ## Use the right idempotency store
 
@@ -536,18 +548,22 @@ Cover the paths your manifest declares:
    the vendor mock receives that hop.
 4. A write-class call without a grant is denied, and the same call with a
    trusted grant executes.
-5. A dry run returns the simulation without approval, vendor calls,
+5. A declared `requiredPermissions` list denies a call without a valid
+   `breakwater.principalPermissions` projection — a valid grant included —
+   and executes once the projection holds every identifier.
+6. A dry run returns the simulation without approval, vendor calls,
    idempotency activity, or budget consumption.
-6. The same idempotency key replays without a second side effect.
-7. Concurrent same-key calls produce one execution.
-8. Rate-limit exhaustion denies the next actual execution.
-9. Store and evaluator failures fail closed and produce static audit reasons.
-10. Tenant and workflow scopes cannot cross boundaries.
-11. A no-schema or passthrough direct call whose arguments reach the wrapper
+7. The same idempotency key replays without a second side effect.
+8. Concurrent same-key calls produce one execution.
+9. Rate-limit exhaustion denies the next actual execution.
+10. Store and evaluator failures fail closed and produce static audit reasons.
+11. Tenant and workflow scopes cannot cross boundaries.
+12. A no-schema or passthrough direct call whose arguments reach the wrapper
     cannot enable `_background` on a write connector, while an opted-in read
     connector follows the intended host behavior.
-12. Audit and error surfaces do not contain prompt, credential, request-body,
-    stdout, or stderr sentinels.
+13. Audit and error surfaces do not contain prompt, credential, request-body,
+    stdout, or stderr sentinels — nor the principal's effective permission
+    set.
 
 For an Agent CLI adapter, also pin:
 

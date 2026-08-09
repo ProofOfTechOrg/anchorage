@@ -211,10 +211,18 @@ assert.equal(
   flowsafe.BREAKWATER_CONNECTOR_EXECUTION_KEY,
   'breakwater.connectorExecution',
 );
+assert.equal(
+  flowsafe.BREAKWATER_PRINCIPAL_PERMISSIONS_KEY,
+  'breakwater.principalPermissions',
+);
 assert.equal(typeof flowsafe.connectorGrantsForLeg, 'function');
 assert.equal(
   approvals.BREAKWATER_CONNECTOR_GRANTS_KEY,
   flowsafe.BREAKWATER_CONNECTOR_GRANTS_KEY,
+);
+assert.equal(
+  approvals.BREAKWATER_PRINCIPAL_PERMISSIONS_KEY,
+  flowsafe.BREAKWATER_PRINCIPAL_PERMISSIONS_KEY,
 );
 `,
   );

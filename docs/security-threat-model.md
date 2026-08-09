@@ -54,17 +54,18 @@ Breakwater context keys are capabilities or trusted namespace claims:
 breakwater.actor
 breakwater.connectorGrants
 breakwater.connectorExecution
+breakwater.principalPermissions
 breakwater.idempotencyKey
 breakwater.dryRun
 breakwater.workflowScope
 breakwater.isolationScope
 ```
 
-Only trusted host/runtime code may populate actor, grant, workflow, or tenant isolation values. Idempotency keys and dry-run selection may originate from authorized application logic, but must not overwrite the other keys.
+Only trusted host/runtime code may populate actor, grant, principal-permission, workflow, or tenant isolation values. Idempotency keys and dry-run selection may originate from authorized application logic, but must not overwrite the other keys.
 
 Flowsafe's shared execution-context boundary reserves every `breakwater.*` key, `mastra:goal`, `runId`, `threadId`, `resourceId`, `__proto__`, `constructor`, and `prototype`. External HTTP bodies reject these fields. Persisted compatibility paths strip them before trusted derivation.
 
-Trusted merges apply sanitized external or stored context first, then workflow, run, isolation, current execution identity, structured connector grants, and trusted actor/audit correlation. An empty grant array overwrites any stale value.
+Trusted merges apply sanitized external or stored context first, then workflow, run, isolation, current execution identity, structured connector grants, and trusted actor/audit correlation. An empty grant array overwrites any stale value, and the agent host projects the principal-permission resolution — or an explicit `null` — on every leg so a stale persisted projection cannot survive a resume.
 
 ### Worker to Durable Object
 
@@ -196,8 +197,9 @@ A host with only one human reviewer must consciously choose availability or sepa
 | Schedule row plants grant/context | Reserved-key rejection and runtime-last merge | Direct database writers remain part of the trusted computing base |
 | Reviewer becomes agent execution principal | Persist the original execution principal in the approval target and re-authorize it on resume: roles for a human, `allowedAutomation` for an automated principal, then any `requiredPermissions` | The stored principal is an authorization snapshot, not a dynamic identity-provider lookup |
 | Automation acquires a human's authority | Automated work carries a non-human `ExecutionPrincipal` with a required `purpose`; Breakwater gates on `allowedPrincipalKinds` before roles and never consults the role allowlist for a non-human kind; the agent host requires an `allowedAutomation` declaration naming the kind and the exact entry path | Host code inside the trusted computing base still vouches for its own automated principals |
-| Client supplies effective permissions | `AgentMeta` and `PrincipalPermissionResolver` remain server-owned; the resolver receives only the trusted `ExecutionPrincipal` | A faulty host resolver can grant excessive permissions |
-| Required permission policy is missing or unavailable | The thread host denies when no resolver is configured, the resolver fails, or its output is malformed | A resolver outage makes permission-protected agents unavailable |
+| Client supplies effective permissions | `AgentMeta`, `PermissionManifest.requiredPermissions`, and `PrincipalPermissionResolver` remain server-owned; the resolver receives only the trusted `ExecutionPrincipal`, and the `breakwater.principalPermissions` projection is reserved at every external boundary | A faulty host resolver can grant excessive permissions |
+| Required permission policy is missing or unavailable | The thread host denies a permission-requiring agent when no resolver is configured, the resolver fails, or its output is malformed; any other run proceeds with a `null` projection, so a permission-declaring connector inside it denies | A resolver outage makes permission-protected agents and connectors unavailable |
+| Approval elevates an unauthorized principal | The connector wrapper checks `requiredPermissions` against the trusted projection before the dry-run branch and before approval-grant consumption | Delegated execution, where an approval should confer authority, is not modeled |
 | Automated principal mutated after it is vouched | `trustAutomationPrincipal()` returns a branded, frozen canonical clone; the trusted service entries recheck the own brand, the shape, the kind, and that every field is a plain data property, rather than trusting the erased parameter type | In-process code can recover the brand by reflection from any vouched principal and stamp a frozen object of its own, the same deliberate residual the tenant-binding brand accepts |
 | Vouched principal answers differently on a later read | Accessor properties are refused outright: a getter survives `Object.freeze`, and the trusted entries read a principal several times per call | A caller inside the trusted computing base can still pass a plain object built to its own liking |
 | Webhook claims victim tenant | Verify raw bytes first; tenant from subscription row | Provider secret compromise can forge provider events |
@@ -250,15 +252,17 @@ The role names do not themselves implement:
 - OIDC or session validation;
 - business-specific authorization.
 
-## Agent permission model
+## Agent and connector permission model
 
-Flowsafe adds explicit host-owned permissions to the guarded agent boundary without adding role inheritance. `Permission` identifiers use canonical lowercase dotted form. `AgentMeta.requiredPermissions` uses all-of semantics, so the principal must hold every identifier in the list.
+Flowsafe adds explicit host-owned permissions to the guarded agent boundary without adding role inheritance. `Permission` identifiers use canonical lowercase dotted form and are defined by breakwater, so the agent-entry gate and the connector invocation gate share one grammar. `AgentMeta.requiredPermissions` uses all-of semantics, so the principal must hold every identifier in the list.
 
 Catalog validation rejects `requiredPermissions` when it is not an array, is empty, contains duplicates, or contains malformed identifiers. Agents that omit the field keep their existing `allowedRoles` and `allowedAutomation` behavior.
 
 Configure `ThreadAgentHostOptions.resolvePrincipalPermissions` with a `PrincipalPermissionResolver`. The resolver receives only the trusted human, service, agent, or system `ExecutionPrincipal`. It returns a `PrincipalPermissionResolution` containing effective permissions and `policyVersion`.
 
-The thread host calls the resolver only after the existing human-role or automated-entry gate succeeds. A required-permission agent fails closed when the resolver is absent, throws, rejects, or returns malformed permissions or policy version. Role-only agents do not invoke or require the resolver.
+The thread host calls the resolver on every authorized entry, after the existing human-role or automated-entry gate succeeds. A required-permission agent fails closed when the resolver is absent, throws, rejects, or returns malformed permissions or policy version. A role-only agent invokes a configured resolver but does not require it: a failed resolution starts the run with a `null` projection and an `agent.permissions.resolve` error event.
+
+Connector invocation authorization is the composed second half. `PermissionManifest.requiredPermissions` declares the all-of list a connector demands; breakwater enforces it inside `createConnector()`'s execute path against the trusted `breakwater.principalPermissions` projection, before the dry-run branch and before approval-grant consumption — a valid approval never elevates a principal that may not invoke the connector at all. Flowsafe's thread host mints the projection from the resolver's output on every start and resume leg (an explicit `null` when no resolution exists, so a stale persisted projection is retired rather than inherited); a workflow host may mint the key from its own trusted `RequestContextProvider`. A path with no projection denies every permission-declaring connector.
 
 ## Audit contract
 
@@ -304,7 +308,7 @@ Example after routing a Flowsafe event through `AuditLogger.record()`:
 
 Do not assume every event has the same action vocabulary or resource object. Use the string contract and documented detail for each producer.
 
-An `agent.entry.authorize` event for a permission-protected agent records `requiredPermissions` and `permissionPolicyVersion`. The version is `null` when no valid resolution exists. The event omits effective permissions and identity-provider groups.
+An `agent.entry.authorize` event for a permission-protected agent records `requiredPermissions` and `permissionPolicyVersion`. The version is `null` when no valid resolution exists. A failed resolution on a role-only agent emits a separate `agent.permissions.resolve` error event. Breakwater's connector gate mirrors the contract: `connector.authorize` and its denial events record the manifest's `requiredPermissions` and the projection's `permissionPolicyVersion`. None of these events include effective permissions or identity-provider groups.
 
 ## Secrets
 
@@ -330,7 +334,7 @@ Before a public endpoint:
 
 1. Replace the static token example with a verified production identity seam.
 2. Provision tenant ids and test foreign-resource 404 behavior.
-3. Configure and version `resolvePrincipalPermissions` before registering an agent with `requiredPermissions`.
+3. Configure and version `resolvePrincipalPermissions` before registering an agent or connector with `requiredPermissions`; permission-declaring connectors deny on any path without a trusted projection.
 4. Use D1-backed connector stores across per-run objects.
 5. Register tenant isolation on every multi-tenant connector.
 6. Route connector HTTP through `runtime.fetch` and add infrastructure egress policy.

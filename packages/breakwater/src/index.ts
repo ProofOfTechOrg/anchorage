@@ -136,7 +136,9 @@ export {
 } from './policy-engine/index.js';
 export type {
   Actor,
+  Permission,
   PrincipalKind,
+  PrincipalPermissions,
   RBACMiddlewareOptions,
   Role,
 } from './rbac/index.js';
@@ -144,7 +146,10 @@ export {
   ACTOR_CONTEXT_KEY,
   actorFromRequestContext,
   DEFAULT_ALLOWED_PRINCIPAL_KINDS,
+  isPermissionIdentifier,
+  isPrincipalPermissions,
   PRINCIPAL_KINDS,
+  PRINCIPAL_PERMISSIONS_CONTEXT_KEY,
   principalKindOf,
   RBACMiddleware,
   ROLES,

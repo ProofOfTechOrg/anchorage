@@ -39,6 +39,7 @@ model and agent loop
         |
         +--> createConnector tool ----> declaration egress
         |                              custom evaluators
+        |                              required permissions
         |                              approval grant
         |                              idempotency reservation/replay
         |                              shared rate budget
@@ -130,13 +131,14 @@ The execution order is:
 1. Validate connector construction and input.
 2. Check declared egress against the host's organization allowlist.
 3. Run custom tool evaluators such as tenant and workflow isolation.
-4. Select dry-run or real execution.
-5. Require the server-derived connector grant when policy demands approval.
-6. Reserve or replay an idempotency key.
-7. Consume a shared fixed-window rate budget.
-8. Call the connector with a `ConnectorRuntime.fetch` bound to declared egress.
-9. Validate output and commit the replay record.
-10. Audit the final decision or contained error at the gate that observed it.
+4. Require the trusted principal-permissions projection to hold every declared `requiredPermissions` identifier — before dry-run selection and before the approval grant, so an approval cannot elevate an unauthorized principal.
+5. Select dry-run or real execution.
+6. Require the server-derived connector grant when policy demands approval.
+7. Reserve or replay an idempotency key.
+8. Consume a shared fixed-window rate budget.
+9. Call the connector with a `ConnectorRuntime.fetch` bound to declared egress.
+10. Validate output and commit the replay record.
+11. Audit the final decision or contained error at the gate that observed it.
 
 Mastra's native `requireApproval` predicate is also set so an agent loop can pause for a reviewer. It does not replace the request-context grant. The wrapper remains the authority on every invocation path.
 

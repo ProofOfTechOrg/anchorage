@@ -27,7 +27,7 @@ Compatibility:
 - TypeScript `moduleResolution: "NodeNext"`, `"Node16"`, or `"Bundler"`
 - `@mastra/core` in the declared `^1.50.0` peer range
 - `react` and `react-dom` `>=18 <20` (React 18 or 19) for the optional approval UI
-- `@proofoftech/breakwater` `>=0.7.0 <1.0.0` when used
+- `@proofoftech/breakwater` `>=0.9.0 <1.0.0` when used
 
 ## Choose an export
 
@@ -264,7 +264,9 @@ Agents can add `AgentMeta.requiredPermissions` as an all-of list of `Permission`
 
 Configure `ThreadAgentHostOptions.resolvePrincipalPermissions` with a server-owned `PrincipalPermissionResolver`. The resolver receives only the trusted `ExecutionPrincipal` and returns a `PrincipalPermissionResolution` containing effective permissions and `policyVersion`. The host evaluates permissions after the existing human-role or automated-entry gate. A missing resolver, a resolver failure, or malformed output denies an agent that requires permissions.
 
-Agents that use only `allowedRoles` and `allowedAutomation` do not invoke or require the resolver. Permission authorization audit detail records `requiredPermissions` and `permissionPolicyVersion`; it does not record effective permissions or identity-provider groups.
+A configured resolver runs on every authorized entry, and its resolution is projected into the run's derived request context as `breakwater.principalPermissions` on every start and resume leg (an explicit `null` when no resolution exists). Breakwater connectors that declare `PermissionManifest.requiredPermissions` enforce their own all-of list against that projection before their dry-run branch and approval grant. Agents that use only `allowedRoles` and `allowedAutomation` invoke a configured resolver but do not require it: a failed resolution still starts the run, is audited as `agent.permissions.resolve`, and leaves the projection `null`, so permission-declaring connectors inside that run fail closed.
+
+Permission authorization audit detail records `requiredPermissions` and `permissionPolicyVersion`; it does not record effective permissions or identity-provider groups.
 
 `createThreadAgentHost()` validates Breakwater's guarded-handle brand before it registers the agent with Mastra. It persists the thread/agent binding and original run principal, so eviction recovery and approval resume cannot switch agents or actors.
 

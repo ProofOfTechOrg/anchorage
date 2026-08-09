@@ -24,6 +24,7 @@ import {
   createConnector,
   ISOLATION_SCOPE_CONTEXT_KEY,
   PRINCIPAL_KINDS,
+  PRINCIPAL_PERMISSIONS_CONTEXT_KEY,
   ROLES,
   WORKFLOW_SCOPE_CONTEXT_KEY,
 } from '@proofoftech/breakwater';
@@ -45,6 +46,7 @@ import {
   APPROVAL_ROLES,
   BREAKWATER_ACTOR_KEY,
   BREAKWATER_CONNECTOR_GRANTS_KEY,
+  BREAKWATER_PRINCIPAL_PERMISSIONS_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
   DECIDER_ROLES,
   RUN_START_ROLES,
@@ -153,6 +155,12 @@ describe('breakwater contract tripwires', () => {
 
   it('mirrors the actor key literally', () => {
     expect(BREAKWATER_ACTOR_KEY).toBe(ACTOR_CONTEXT_KEY);
+  });
+
+  it('mirrors the principal-permissions key literally', () => {
+    expect(BREAKWATER_PRINCIPAL_PERMISSIONS_KEY).toBe(
+      PRINCIPAL_PERMISSIONS_CONTEXT_KEY,
+    );
   });
 
   it('mirrors the workflow-scope key literally', () => {

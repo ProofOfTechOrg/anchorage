@@ -142,16 +142,38 @@ try {
 import { isGuardedAgentHandle } from '@proofoftech/breakwater/agent';
 import {
   connectorManifest,
+  createConnector,
   type ConnectorApprovalSuspension,
 } from '@proofoftech/breakwater/connector-sdk';
 import { PolicyEngine } from '@proofoftech/breakwater/policy-engine';
-import { RBACMiddleware } from '@proofoftech/breakwater/rbac';
+import {
+  isPermissionIdentifier,
+  isPrincipalPermissions,
+  PRINCIPAL_PERMISSIONS_CONTEXT_KEY,
+  RBACMiddleware,
+  type Permission,
+  type PrincipalPermissions,
+} from '@proofoftech/breakwater/rbac';
 import type { AuditEvent } from '@proofoftech/breakwater/audit';
 import { CODEX_CLI } from '@proofoftech/breakwater/agent-cli';
 
 const code: AgentCliErrorCode = 'nonzero-exit';
 const metadata: AgentCliErrorMetadata = { code };
 const event = null as AuditEvent | null;
+const permission: Permission = 'payments.release';
+const projection: PrincipalPermissions = {
+  permissions: [permission],
+  policyVersion: 'permissions-v1',
+};
+const authorized = createConnector({
+  id: 'payments.release',
+  description: 'Releases one payment',
+  execute: async () => ({ released: true }),
+  permissions: {
+    sideEffect: 'write',
+    requiredPermissions: [permission],
+  },
+});
 const suspension: ConnectorApprovalSuspension = {
   stepPath: ['publish'],
   suspendedAt: 1,
@@ -194,11 +216,15 @@ void AgentCliError;
 void AuditLogger;
 void CONNECTOR_EXECUTION_CONTEXT_KEY;
 void CONNECTOR_GRANTS_CONTEXT_KEY;
+void PRINCIPAL_PERMISSIONS_CONTEXT_KEY;
 void PolicyEngine;
 void RBACMiddleware;
 void CODEX_CLI;
 void connectorManifest(tool);
+void connectorManifest(authorized)?.requiredPermissions;
 void isGuardedAgentHandle(guarded);
+void isPermissionIdentifier(permission);
+void isPrincipalPermissions(projection);
 void metadata;
 void event;
 void grant;
@@ -212,6 +238,8 @@ import { RequestContext } from '@mastra/core/request-context';
 import {
   AgentCliError,
   AuditLogger,
+  ConnectorPolicyError,
+  createConnector,
   createGuardedAgent,
   createCodexConnector,
 } from '@proofoftech/breakwater';
@@ -222,6 +250,11 @@ import {
   CONNECTOR_GRANTS_CONTEXT_KEY,
   connectorManifest,
 } from '@proofoftech/breakwater/connector-sdk';
+import {
+  isPermissionIdentifier,
+  isPrincipalPermissions,
+  PRINCIPAL_PERMISSIONS_CONTEXT_KEY,
+} from '@proofoftech/breakwater/rbac';
 
 await Promise.all([
   import('@proofoftech/breakwater/agent'),
@@ -234,6 +267,44 @@ assert.equal(CONNECTOR_GRANTS_CONTEXT_KEY, 'breakwater.connectorGrants');
 assert.equal(
   CONNECTOR_EXECUTION_CONTEXT_KEY,
   'breakwater.connectorExecution',
+);
+assert.equal(
+  PRINCIPAL_PERMISSIONS_CONTEXT_KEY,
+  'breakwater.principalPermissions',
+);
+assert.equal(isPermissionIdentifier('payments.release'), true);
+assert.equal(isPermissionIdentifier('Payments.release'), false);
+assert.equal(
+  isPrincipalPermissions({
+    permissions: ['payments.release'],
+    policyVersion: 'permissions-v1',
+  }),
+  true,
+);
+assert.equal(isPrincipalPermissions(null), false);
+
+const release = createConnector({
+  id: 'payments.release',
+  description: 'Releases one payment',
+  execute: async () => ({ released: true }),
+  permissions: {
+    sideEffect: 'write',
+    requiredPermissions: ['payments.release'],
+  },
+});
+const unauthorized = await release.execute({}, {
+  requestContext: new RequestContext(),
+}).catch((error) => error);
+assert.equal(unauthorized instanceof ConnectorPolicyError, true);
+assert.equal(unauthorized.policy, 'required-permissions');
+const authorizedContext = new RequestContext();
+authorizedContext.set(PRINCIPAL_PERMISSIONS_CONTEXT_KEY, {
+  permissions: ['payments.release'],
+  policyVersion: 'permissions-v1',
+});
+assert.deepEqual(
+  await release.execute({}, { requestContext: authorizedContext }),
+  { released: true },
 );
 
 const guarded = createGuardedAgent({

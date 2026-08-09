@@ -1148,6 +1148,10 @@ describe('RunnerRuntime requestContextForRun', () => {
           'breakwater.isolationScope': 'forged-tenant',
           'breakwater.connectorExecution': { kind: 'start' },
           'breakwater.connectorGrants': [],
+          'breakwater.principalPermissions': {
+            permissions: ['reports.read'],
+            policyVersion: 'permissions-v1',
+          },
           runId: 'acme_forged',
           threadId: 'acme_thread',
           resourceId: 'acme_resource',
@@ -1191,6 +1195,7 @@ describe('RunnerRuntime requestContextForRun', () => {
       'breakwater.isolationScope',
       'breakwater.connectorExecution',
       'breakwater.connectorGrants',
+      'breakwater.principalPermissions',
       'threadId',
       'resourceId',
       'breakwater.actor',
@@ -1199,6 +1204,12 @@ describe('RunnerRuntime requestContextForRun', () => {
     expect(seen[0]?.values).toMatchObject({
       'breakwater.workflowScope': 'ordered-context',
       'breakwater.isolationScope': 'acme',
+      // A trusted provider's projection passes through like the grant key —
+      // this is the seam a workflow host uses to authorize its connectors.
+      'breakwater.principalPermissions': {
+        permissions: ['reports.read'],
+        policyVersion: 'permissions-v1',
+      },
     });
   });
 

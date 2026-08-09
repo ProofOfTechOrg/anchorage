@@ -26,6 +26,17 @@ export const BREAKWATER_CONNECTOR_EXECUTION_KEY =
 export const BREAKWATER_ACTOR_KEY = 'breakwater.actor';
 
 /**
+ * requestContext key breakwater's connector required-permissions gate reads:
+ * the executing principal's server-resolved effective permissions plus the
+ * policy snapshot version ({ permissions, policyVersion }), or null when no
+ * resolution exists. Trusted-runtime-only, like the grant key above — the
+ * agent thread host mints it from its PrincipalPermissionResolver on every
+ * leg, and a workflow host may mint it from its own RequestContextProvider.
+ */
+export const BREAKWATER_PRINCIPAL_PERMISSIONS_KEY =
+  'breakwater.principalPermissions';
+
+/**
  * requestContext key breakwater's crossWorkflowIsolation evaluator reads:
  * the calling workflow's scope (its workflowId). RunnerRuntime mints it on
  * every start/resume leg — trusted-runtime-only, like the grant key above.

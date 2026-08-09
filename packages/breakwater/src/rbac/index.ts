@@ -34,6 +34,12 @@ export const ROLES: readonly Role[] = [
 ];
 
 // Re-exported for hosts; `assertPrincipalKinds` stays internal to the package.
+export type { Permission, PrincipalPermissions } from './permission.js';
+export {
+  isPermissionIdentifier,
+  isPrincipalPermissions,
+  PRINCIPAL_PERMISSIONS_CONTEXT_KEY,
+} from './permission.js';
 export type { PrincipalKind } from './principal.js';
 export {
   DEFAULT_ALLOWED_PRINCIPAL_KINDS,

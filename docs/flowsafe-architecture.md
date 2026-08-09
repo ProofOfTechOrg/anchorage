@@ -141,7 +141,9 @@ D1-backed memory recall uses the salted ids through Mastra's own memory implemen
 
 `AgentMeta.requiredPermissions` declares an all-of list of canonical lowercase dotted `Permission` identifiers. Catalog validation rejects a non-array, an empty list, duplicates, and malformed identifiers. Agents that omit the field keep the existing role and automation path.
 
-`ThreadAgentHostOptions.resolvePrincipalPermissions` accepts a server-owned `PrincipalPermissionResolver`. It receives only the trusted `ExecutionPrincipal` and returns a `PrincipalPermissionResolution` containing effective permissions and `policyVersion`. The host calls it after the human-role or automated-entry gate succeeds. Missing configuration, resolver failure, and malformed output deny an agent that requires permissions.
+`ThreadAgentHostOptions.resolvePrincipalPermissions` accepts a server-owned `PrincipalPermissionResolver`. It receives only the trusted `ExecutionPrincipal` and returns a `PrincipalPermissionResolution` containing effective permissions and `policyVersion`. The host calls it on every authorized entry, after the human-role or automated-entry gate succeeds. Missing configuration, resolver failure, and malformed output deny an agent that requires permissions; a role-only agent proceeds without a projection and the failure is audited.
+
+The resolution is projected into the run's derived request context as `breakwater.principalPermissions` on every start and resume leg — an explicit `null` when no resolution exists, so a resume retires a stale persisted value. Breakwater's connector wrapper enforces `PermissionManifest.requiredPermissions` against that projection before its dry-run branch and approval grant, so a valid approval cannot elevate a principal that may not invoke the connector.
 
 Permission authorization audit detail records `requiredPermissions` and `permissionPolicyVersion`. It omits effective permissions and identity-provider groups.
 

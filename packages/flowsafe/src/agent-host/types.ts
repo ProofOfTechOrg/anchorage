@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { GuardedAgentHandle } from '@proofoftech/breakwater/agent';
+import type { Permission } from '@proofoftech/breakwater/rbac';
 import type { AgentEntryPath } from '../agent-runner/index.js';
 import type {
   ApprovalRecord,
@@ -10,24 +11,43 @@ import type {
 } from '../approval-api/index.js';
 import type { RunSummary } from '../do-runner/index.js';
 
+// The permission identifier vocabulary moved to breakwater so the agent-entry
+// gate here and the connector invocation gate there share one grammar;
+// re-exported to keep this subpath's public surface stable.
+export type { Permission } from '@proofoftech/breakwater/rbac';
+export { isPermissionIdentifier } from '@proofoftech/breakwater/rbac';
 export type { AgentEntryPath } from '../agent-runner/index.js';
 
-/**
- * A canonical server-owned permission identifier.
- *
- * The runtime form is two or more lowercase ASCII segments separated by dots,
- * with each segment starting with a letter and continuing with letters or
- * digits. Identifiers are bounded to 200 characters.
- */
-export type Permission = string;
-
-const PERMISSION_IDENTIFIER_PATTERN =
-  /^(?=.{3,200}$)[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)+$/;
-
-/** Whether a value is a canonical permission identifier. */
-export function isPermissionIdentifier(value: unknown): value is Permission {
-  return typeof value === 'string' && PERMISSION_IDENTIFIER_PATTERN.test(value);
+/** The server-derived permissions for one trusted execution principal. */
+export interface PrincipalPermissionResolution {
+  /** Exact permission identifiers granted by this policy snapshot. */
+  permissions: readonly Permission[];
+  /**
+   * Stable version or hash identifying the policy snapshot used. Must be
+   * non-blank, at most 200 characters, and free of ASCII control characters;
+   * anything else is malformed output and fails closed.
+   */
+  policyVersion: string;
 }
+
+/**
+ * Resolve a trusted principal to permissions owned by the host.
+ *
+ * The resolver receives no request body or caller-provided context. Human
+ * roles and automated identity/provenance are already carried by the validated
+ * principal, so both kinds use the same server-side boundary without treating
+ * an automated principal's compatibility role projection as authority.
+ *
+ * A throw, rejection, or malformed result fails closed: it denies an agent
+ * that declares `requiredPermissions`, and it costs any other run its
+ * permission projection — so a connector that declares `requiredPermissions`
+ * denies inside that run. Both outcomes audit the generic reason `permission
+ * resolution failed`; the underlying error is never re-exported, so log
+ * failures inside the resolver itself.
+ */
+export type PrincipalPermissionResolver = (
+  principal: ExecutionPrincipal,
+) => PrincipalPermissionResolution | Promise<PrincipalPermissionResolution>;
 
 /**
  * One automated entry an agent accepts: a principal kind paired with the exact
@@ -120,6 +140,15 @@ export interface TrustedAgentExecution {
   resourceId: string;
   runId: string;
   entryPath: AgentEntryPath;
+  /**
+   * The server-resolved permissions this execution runs under, projected into
+   * derived request context as `breakwater.principalPermissions` on every
+   * leg. `null` when no resolution exists — no resolver configured, or the
+   * resolution failed on an agent that requires no permissions. The null is
+   * projected explicitly rather than omitted so a resume leg retires any
+   * stale persisted projection instead of inheriting it.
+   */
+  principalPermissions: PrincipalPermissionResolution | null;
   /**
    * Non-reserved context accepted only from trusted internal entry paths.
    * Public HTTP agent starts never populate this field.
