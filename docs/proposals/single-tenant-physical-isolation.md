@@ -2,6 +2,8 @@
 
 > This document is a proposal. It is not implemented or supported product behavior. It records the analysis, decision, delivery plan, and Cloudflare cost model for moving the packages to a single-tenant runtime contract with physical (per-deployment) tenant isolation. Shipped behavior is documented in [Flowsafe architecture](../flowsafe-architecture.md), [Breakwater architecture](../breakwater-architecture.md), and the [security threat model](../security-threat-model.md). If accepted, this proposal supersedes the pooled multi-tenant posture assumed in parts of the [breakwater improvement roadmap](breakwater-improvement-roadmap.md).
 
+The product target is the **Super platform**: a hosted agent cloud where customers author agent projects locally and deploy them onto the platform, which runs them durably with metered capability access. These packages supply the Super platform's execution-security slice — breakwater as the policy-enforcement point, flowsafe as the durable approval-gated runtime. The capability marketplace, provider adapters, MCP/SDK surfaces, build service, developer studio, and the economic plane (payment authorization and settlement) are Super platform components maintained outside this repository.
+
 Baseline: branch `dev`, commit `d78e779` ("feat: add connector invocation authorization"), written 2026-08-09. Line numbers and package behavior below are as of this commit and must be re-confirmed before editing. All Cloudflare pricing and limits were verified against the linked Cloudflare docs on 2026-08-09; re-verify before relying on them for a purchase decision.
 
 ## Decision summary
@@ -12,7 +14,8 @@ Adopt **tenant = deployment**:
 2. Keep every per-principal and per-run control: authentication seams, roles, permissions, approval grants, reserved-context stripping, egress, idempotency, rate limits, audit.
 3. Replace logical tenant isolation with a small deployment-identity guard plus a provisioning control plane that is treated as security-critical.
 4. Sequence the removal **before** the remaining roadmap work (secure preset, provisioning control plane), so later features land once, on the final foundation. Connector `requiredPermissions` shipped at this baseline; its per-principal projection (`breakwater.principalPermissions`) is tenancy-independent and survives the removal.
-5. **Commit to plain Workers (one Worker per tenant) as the initial fleet topology**, and move all deployment maintenance from cron triggers onto Durable Object alarms so no per-tenant platform trigger exists. Workers for Platforms becomes a pre-planned escape hatch behind defined triggers — a control-plane change, not a data-plane migration (see "Switching to Workers for Platforms later").
+5. **Run a two-stage topology.** Pre-launch, the fleet runs on plain Workers ($5/month account) because every deployed artifact is team-authored. From the first externally authored artifact, the execution plane runs on Workers for Platforms untrusted dispatch namespaces. The boundary is a security rule, not a scaling threshold: **no customer-built artifact ever executes on a plain Worker or in a trusted namespace.** Move all deployment maintenance from cron triggers onto Durable Object alarms now, so no per-tenant platform trigger exists in either stage (see "The launch switch").
+6. **Benchmark the durable-run protocol before the control plane hardens.** Flowsafe's Durable Object runner and Cloudflare Workflows are competing durability authorities; the Super platform requires exactly one. It becomes its own delivery slice.
 
 Status: proposed. The decisive inputs are that the packages currently have **no consumers and no production deployments**, so a breaking simplification is free today and only gets more expensive.
 
@@ -107,18 +110,22 @@ Added:
 - **Dynamic dispatch Worker.** A router we own. It receives every request, resolves the tenant (for example from the hostname), and invokes the tenant's user Worker via `env.DISPATCHER.get(name)`. Requests across the dispatch → user → outbound chain bill as a single request.
 - **User Workers.** Per-tenant instances of the flowsafe host. Uploaded via API (not wrangler config), with per-script bindings: each tenant's D1 database, Durable Object namespaces, queue producers, R2 buckets, and secrets are attached only to that tenant's Worker. This binding-level attachment is the physical isolation mechanism.
 - **Outbound Workers (optional).** Intercept `fetch()` egress from user Workers. For us this is defense-in-depth under breakwater's `runtime.fetch` manifest enforcement: an infrastructure-level egress choke point that connector code cannot bypass, closing part of the "do not market `runtime.fetch` as a complete sandbox" residual.
-- **Isolation modes.** Namespaces default to "untrusted" (isolated caches, no `request.cf`). Since we author all tenant Workers, "trusted" mode is acceptable; untrusted is a defensible default anyway.
+- **Isolation modes.** Namespaces default to "untrusted" (isolated caches, no `request.cf`). Under the Super platform target, customer-built artifacts make untrusted mode mandatory, not merely a defensible default.
 - **Custom limits.** Per-script CPU caps let the platform bound a runaway tenant — a denial-of-wallet control that plain Workers do not offer per-Worker.
 
-### Committed topology: plain Workers, one per tenant
+### Committed topology: two stages, one security boundary
 
-The initial fleet runs on plain Workers: one normal Worker per tenant, deployed by a control-plane loop with generated per-tenant configuration, each with its own D1/DO/queue-producer bindings, routed by hostname or route pattern. No dispatch hop, no platform subscription, no per-script fee.
+**Stage one (pre-launch): plain Workers, one per tenant deployment.** Every artifact is team-authored, so trusted execution on the $5/month Workers Paid plan is safe and sufficient: one normal Worker per deployment via a control-plane loop with generated configuration, each with its own D1/DO/queue-producer bindings, routed by hostname. No dispatch hop, no platform subscription, no per-script fee.
 
-Verified constraints on the Workers Paid plan ([limits](https://developers.cloudflare.com/workers/platform/limits/)), after the maintenance redesign below:
+**Stage two (from the first external artifact): Workers for Platforms untrusted dispatch namespaces.** The trigger is not scale — it is the first time a customer-built artifact must run. All four platform features that only Workers for Platforms provides become mandatory at that moment: untrusted-mode isolation for code we did not author, per-script CPU caps (denial-of-wallet containment against customer code), outbound-Worker egress interception beneath breakwater's `runtime.fetch`, and Upload-API deploys for customer-initiated deployment frequency. Design partners and beta users count as external: the boundary is authorship of the artifact, not the marketing launch date.
+
+The packages already satisfy the untrusted-namespace constraints at zero cost: nothing in `packages/` touches `request.cf` or the Cache API (verified at the baseline commit), and after the alarm redesign nothing depends on platform triggers.
+
+Verified constraints on the Workers Paid plan for stage one ([limits](https://developers.cloudflare.com/workers/platform/limits/)), after the maintenance redesign below:
 
 | Constraint | Value | Consequence |
 | --- | --- | --- |
-| Workers per account | 500 | The remaining hard tenant ceiling; the documented trigger for Workers for Platforms |
+| Workers per account | 500 | Ample for a pre-launch fleet of team-authored deployments; irrelevant after the switch |
 | Cron Triggers per account | 250 | **Removed as a constraint** by the alarm redesign (previously the binding limit: two crons per deployment capped the fleet near 125 tenants) |
 | Environment variables per Worker | 128 | Fine per tenant |
 | Worker size | 10 MB | Fine |
@@ -126,9 +133,11 @@ Verified constraints on the Workers Paid plan ([limits](https://developers.cloud
 
 ### Agents per deployment
 
-The deployment unit is the client, not the agent. A client's Worker hosts that client's entire agent catalog: `createAgentModuleCatalog()` (`packages/flowsafe/src/agent-host/catalog.ts`) takes a plural module list and indexes it by id, the thread host resolves `agentId` per request and applies that agent's own `allowedRoles`/`allowedAutomation`/`requiredPermissions`, and workflows register the same way (the baseline Worker's `WORKFLOWS` array). Adding an agent to a client is a catalog entry plus a redeploy of that client's Worker — no new Worker, database, or namespaces. Durable runs of every agent are instances of the same Durable Object classes, and instances are unlimited.
+For platform-authored work, the deployment unit is the client, not the agent. A client's Worker hosts that client's entire agent catalog: `createAgentModuleCatalog()` (`packages/flowsafe/src/agent-host/catalog.ts`) takes a plural module list and indexes it by id, the thread host resolves `agentId` per request and applies that agent's own `allowedRoles`/`allowedAutomation`/`requiredPermissions`, and workflows register the same way (the baseline Worker's `WORKFLOWS` array). Adding an agent to a client is a catalog entry plus a redeploy of that client's Worker — no new Worker, database, or namespaces. Durable runs of every agent are instances of the same Durable Object classes, and instances are unlimited.
 
 The 500-Workers ceiling therefore bounds **client count, not agent count** (and on Workers for Platforms even that bound disappears). The practical per-Worker bounds on catalog size are generous: the 10 MB script limit (packages and Mastra are shared; per-agent cost is instructions, schemas, and any unique connector code), the 1-second startup limit (the thread host already constructs the catalog lazily), and the 128-secret budget for per-connector credentials.
+
+**Customer-deployed projects use a finer unit: one user Worker per project × environment.** The Super platform contract requires immutable builds, independent promotion, and rollback per project, which a shared mutable catalog Worker cannot provide — redeploying a client-wide catalog to update one project would violate the others' version pins. Each deployed project version becomes its own uploaded script; promotion and rollback re-point the dispatch lookup. Script counts then scale with projects × environments, which only the platform topology supports (unlimited scripts at $0.02/month each past the included thousand). Both units coexist: platform-authored client catalogs and customer-deployed project Workers are just different provisioning profiles over the same packages.
 
 Two intra-client consequences are deliberate design points, not defects:
 
@@ -149,27 +158,29 @@ Design: one singleton maintenance Durable Object per deployment (fixed instance 
 
 This also removes a real Workers for Platforms incompatibility rather than an assumed one: `triggers.crons` is silently dropped when deploying into a dispatch namespace (see "Resolved platform questions"). With no cron dependency anywhere, the fleet is trigger-portable by construction.
 
-### Switching to Workers for Platforms later: easy? necessary? code changes?
+### The launch switch: scheduled, not contingent
 
-**Is it easy?** Yes — by design, provided the plain-Workers phase holds four portability invariants (all adopted by this proposal):
+Under the Super platform target the move to Workers for Platforms is a **scheduled launch step**, not a contingency. Stage one exists to avoid the $25/month subscription while every artifact is team-authored; the switch date is pinned to the first external artifact, not to any scale threshold.
+
+**Why the deferral is safe.** The stage-one fleet holds five portability invariants (all adopted by this proposal), which make the switch a control-plane change with zero data-plane migration:
 
 1. **No platform triggers.** No `scheduled()` handler, no cron expressions; all timing lives in Durable Object alarms inside the deployment (the alarm redesign above).
 2. **Tenant Workers produce to queues but never consume them.** The audit pipeline is producer-only in the data plane; the shared audit queue's consumer lives in the control plane. (The current baseline Worker consumes the audit queue itself — `queue()` in `packages/flowsafe/deploy/worker.ts`; the fleet reference moves that consumer out, since dispatch-namespace scripts cannot be queue-consumer targets.)
 3. **Host-based routing only.** Tenant resolution comes from the hostname, so a dispatch Worker can replicate routing with a lookup table; nothing depends on per-Worker routes or `workers.dev` URLs.
 4. **Provisioning behind an interface.** The control plane deploys tenants through a `ProvisioningBackend` seam (create/update script, attach bindings, run migrations). The wrangler-loop backend and the Workers for Platforms Upload-API backend are two implementations of the same interface.
+5. **No `request.cf`, no Cache API.** Untrusted namespaces disable both; the packages use neither today (verified at the baseline commit), and CI should keep it that way.
 
-Additionally, avoid `request.cf` in the data plane (untrusted namespaces disable it) — the packages do not depend on it today; keep it that way or accept trusted mode later.
+**What changes at switch time.** The packages and the per-tenant Worker: **zero changes** — a user Worker's handler signature and bindings model are identical to a plain Worker's. Durable state needs **no migration**: flowsafe persists runs, approvals, schedules, and memory in each tenant's D1 database, and the D1 databases, DO namespaces, and queues simply get re-bound to the new scripts. The switch consists of new, additive components: a small dispatch Worker (hostname → tenant script → `env.DISPATCHER.get(name).fetch(request)`), the Upload-API `ProvisioningBackend` (multipart metadata bindings, `keep_bindings`, DO migration metadata), route/custom-hostname re-pointing, and the outbound Worker for infrastructure-level egress interception (required for customer code, not optional). Existing team-authored deployments migrate tenant-by-tenant (deploy user Worker with identical bindings, flip the hostname, delete the plain Worker); rollback is the reverse flip.
 
-**What code changes at switch time?** The packages and the per-tenant Worker: **zero changes** — a user Worker's handler signature and bindings model are identical to a plain Worker's. Durable state needs **no migration**: flowsafe persists runs, approvals, schedules, and memory in each tenant's D1 database, and the D1 databases, DO namespaces, and queues simply get re-bound to the new scripts. The switch consists of new, additive components: a small dispatch Worker (hostname → tenant script → `env.DISPATCHER.get(name).fetch(request)`), a second `ProvisioningBackend` implementation targeting the Upload User Worker API (multipart metadata bindings, `keep_bindings`, DO migration metadata), route/custom-hostname re-pointing from per-tenant Workers to the dispatch Worker, and optionally an outbound Worker for infrastructure-level egress interception. Migration can run tenant-by-tenant (deploy user Worker with identical bindings, flip the hostname, delete the plain Worker), with rollback being the reverse flip.
+**Switch timeline and budget.** Buy the subscription roughly one integration month before the first external artifact, not at marketing launch. The pre-purchase window can use local simulation where wrangler supports dispatch-namespace bindings in dev, but the conformance items below need a real namespace. Total pre-launch platform spend is therefore $5/month, plus one to two months of $25 for the integration window.
 
-**Is it necessary?** Only when one of these binds — none is expected soon:
+Conformance items to prove on the real namespace before any external artifact runs:
 
-- Fleet size approaching the 500-Workers-per-account ceiling (the one plain-Workers limit the alarm redesign does not remove).
-- Per-tenant CPU caps for denial-of-wallet containment (custom limits exist only on Workers for Platforms).
-- The outbound-Worker egress layer as defense-in-depth under breakwater's `runtime.fetch`.
-- Fleet-deploy ergonomics: hundreds of sequential wrangler deploys against API rate limits versus namespace uploads.
-
-If none binds, plain Workers remain the permanent topology; the $25 base fee and dispatch hop buy nothing at small fleet sizes.
+- Durable Object class bindings and migrations via the Upload API metadata (open question below).
+- WebSocket upgrades traversing the dispatch hop (flowsafe's approval hub and live streams are WebSocket-based).
+- Custom CPU limits enforced per user Worker, with the platform's chosen defaults.
+- Outbound-Worker interception composing correctly under breakwater's `runtime.fetch` (egress denials still attribute to the connector manifest).
+- The full flowsafe spike/e2e suite passing against a namespaced deployment.
 
 ### Cost comparison between the topologies
 
@@ -264,7 +275,7 @@ Scripts: 2,001 → 1,001 over → **$20.02**. Active usage similar to Scenario A
 **Scenario C — heavy production, 200 tenants, 10k runs/tenant/month (2M runs).**
 Requests 20M → 10M over (plain) → $3.00. CPU 300M CPU-ms → 270M over → $5.40. DO requests 12M → 11M over → $1.65. DO duration 2M × 45 s × 0.125 = 11.25M GB-s → **$135.63** (dominant). D1 reads 1B (included); writes 120M → 70M over → **$70.00**. Queue ops 60M → 59M over → $23.60. **Total ≈ $244/month on plain Workers, ≈ $260 on Workers for Platforms** (higher base, larger included allotments, script fee zero at 201 scripts). Alarm-driven maintenance adds ~0.72M Durable Object requests and rows written at this scale (~$0.11 + $0.72) — noise.
 
-Conclusions: Durable Object duration and D1 row writes are the meters to engineer against (hibernate aggressively; batch writes; keep audit events lean). The plain-vs-platforms delta is small and operational, not financial. Tenancy count is financially irrelevant below thousands of tenants.
+Conclusions: Durable Object duration and D1 row writes are the meters to engineer against (hibernate aggressively; batch writes; keep audit events lean). The plain-vs-platforms delta is small and operational, not financial. Tenancy count is financially irrelevant below thousands of tenants. Pre-launch platform spend under the two-stage topology is $5/month, rising to $25/month plus usage only from the switch integration window onward.
 
 ## Delivery plan
 
@@ -277,16 +288,20 @@ Remove the deleted-list mechanisms from flowsafe; re-key stores without tenant c
 **Slice B — maintenance onto Durable Object alarms.** Implement the singleton maintenance Durable Object described above (re-arm-first, one due task per invocation, `ensure-maintenance` bootstrap endpoint, health fields); delete the `scheduled()` handler, `deploy/crons.ts`, and the wrangler `triggers` block; move the audit-queue consumer out of the tenant Worker template so the data plane is queue-producer-only (the portability invariant). Removes the cron-count ceiling and every platform-trigger dependency.
 *Verification:* deploy Worker e2e test asserts alarm-driven sweep/purge, failure isolation between the tasks (a throwing sweep does not starve the purge), and re-arm after a crashed invocation; spike scenario covers alarm-chain recovery.
 
-**Slice C — single-tenant secure preset.** The reduced roadmap section 11: one validated `singleTenantConnectorPolicies()`-style builder that requires durable stores, audit posture, and egress policy, and rejects contradictory configuration at construction. The multi-tenant preset item is dropped. (Connector `requiredPermissions`, previously planned here, shipped at the baseline commit — roadmap Phase C step 3 — so the preset can require permission wiring from day one.)
+**Slice C — durable-run-protocol benchmark (Super platform prerequisite).** Implement one representative approval-gated agent workflow twice: on flowsafe's Durable Object runner, and as a Cloudflare Workflow with Mastra compiled into its steps. Compare snapshot/resume fidelity, grant reconstruction, retry semantics, recovery after process loss, inspectability, and code volume. The Super platform must have exactly one durability authority — two independent orchestrators produce two run identities and two answers to whether a step completed — and this slice decides whether flowsafe's runner *is* the Super platform's run protocol or must interop with Workflows.
+*Verification:* a deterministic failure matrix — worker termination before/after approval, duplicate resume, duplicate provider delivery, cross-run identifiers, store contention — passing on the chosen protocol.
 
-**Slice D — provisioning control plane (reference implementation, plain Workers first).** A `ProvisioningBackend` seam with the wrangler-loop implementation as the shipped backend: create tenant (D1 create → migrate → seed sentinel → deploy Worker with generated per-tenant config and bindings → call `ensure-maintenance`), fleet migration loop with per-tenant schema-version state and canary ordering, drift audit (one-to-one tenant/database/namespace mapping plus maintenance-staleness watchdog), decommission runbook (revoke credentials → delete Worker → export-then-delete database), fleet version-drift report, and the shared audit-queue consumer. The Workers for Platforms backend is specified as a playbook (dispatch Worker, Upload-API backend, hostname re-pointing) but not built until a switch trigger binds.
-*Verification:* an end-to-end provisioning test against a scratch Cloudflare account: create two tenants, prove sentinel mismatch fails closed, prove maintenance self-arms, prove decommission leaves no orphan resources; throttle the loop within the global API budget (1,200 requests per 5 minutes per account token).
+**Slice D — single-tenant secure preset.** The reduced roadmap section 11: one validated `singleTenantConnectorPolicies()`-style builder that requires durable stores, audit posture, and egress policy, and rejects contradictory configuration at construction. The multi-tenant preset item is dropped. (Connector `requiredPermissions`, previously planned here, shipped at the baseline commit — roadmap Phase C step 3 — so the preset can require permission wiring from day one.)
+
+**Slice E — provisioning control plane (two backends, one seam).** A `ProvisioningBackend` interface with both implementations: the wrangler-loop backend for stage one (create tenant: D1 create → migrate → seed sentinel → deploy Worker with generated config and bindings → call `ensure-maintenance`), and the Workers for Platforms Upload-API backend for stage two (same steps against a dispatch namespace, plus the dispatch Worker and outbound Worker). Shared machinery: fleet migration loop with per-tenant schema-version state and canary ordering, drift audit (one-to-one tenant/database/namespace mapping plus maintenance-staleness watchdog), decommission runbook (revoke credentials → delete Worker → export-then-delete database), fleet version-drift report, and the shared audit-queue consumer. The stage-two backend is built and conformance-tested during the pre-launch integration window (see "The launch switch"), then activated at the first external artifact.
+*Verification:* an end-to-end provisioning test against a scratch Cloudflare account: create two tenants, prove sentinel mismatch fails closed, prove maintenance self-arms, prove decommission leaves no orphan resources; throttle the loop within the global API budget (1,200 requests per 5 minutes per account token); the launch-switch conformance checklist on a real namespace.
 
 ## Out of scope — must not change
 
 - **Breakwater's tenant-agnostic `Actor` and opaque isolation scope.** Already correct for this future; do not delete `ISOLATION_SCOPE_CONTEXT_KEY` or `crossWorkflowIsolation` — they scope non-tenant concerns.
 - **Per-user authorization, approval grants, reserved-context stripping, 404-before-role checks.** These protect users from each other inside one deployment; they are not tenancy code.
 - **The control plane's own multi-tenancy.** Signup, billing, and provisioning inherently span tenants; keep that plane thin rather than pretending it away.
+- **The Super platform planes.** The capability marketplace and gateway, provider adapters, remote MCP and SDK surfaces, build service, developer studio, and the economic plane (quote/reserve/capture/reconcile, two-ledger accounting) are Super platform components maintained outside this repository. These packages supply the execution-security slice they compose with; connector manifests are the enforcement seam for capability calls, and the external economic authority owns the money.
 - **LLM/provider cost controls.** Model-token spend dominates platform spend at every scale above; it is a separate workstream.
 
 ## Resolved platform questions
@@ -295,13 +310,14 @@ Verified 2026-08-09; kept here so future sessions do not re-investigate:
 
 - **Cron triggers do not work on dispatch-namespace user Workers.** Wrangler silently drops `triggers.crons` when deploying with `--dispatch-namespace`, and the namespace scripts API has no `/schedules` subresource ([workers-sdk #13840](https://github.com/cloudflare/workers-sdk/issues/13840)). Irrelevant to us after Slice B removes cron dependence everywhere.
 - **User Workers cannot be queue consumers.** The consumer registration API does not accept namespace scripts and the Upload API's `queue` binding type attaches producers only ([workers-sdk #6758](https://github.com/cloudflare/workers-sdk/issues/6758)). Slice B's producer-only data plane matches this by design.
-- **Fleet API budget.** The global Cloudflare API limit is 1,200 requests per 5 minutes per account token ([Workers for Platforms limits](https://developers.cloudflare.com/cloudflare-for-platforms/workers-for-platforms/platform/limits/)); the Slice D migration loop must throttle within it.
+- **Fleet API budget.** The global Cloudflare API limit is 1,200 requests per 5 minutes per account token ([Workers for Platforms limits](https://developers.cloudflare.com/cloudflare-for-platforms/workers-for-platforms/platform/limits/)); the Slice E migration loop must throttle within it.
 - **No gradual deployments for user Workers** (all-at-once per script). Acceptable: the fleet canaries per tenant, not per script version.
 
 ## Open questions to verify before the switch (not before build)
 
-1. **Workers for Platforms + Durable Object bindings mechanics.** The bindings documentation lists Durable Objects among attachable resources; confirm the exact API shape for namespace-class bindings on user Workers (including migrations for new classes) on a scratch account when executing the switch playbook.
-2. **Data-residency options per tenant** (Durable Object jurisdictions, D1 location hints) if a regulated-customer tier materializes.
+1. **Workers for Platforms + Durable Object bindings mechanics.** The bindings documentation lists Durable Objects among attachable resources; confirm the exact API shape for namespace-class bindings on user Workers (including migrations for new classes) on a scratch account during the integration window.
+2. **Local dispatch-namespace simulation.** Confirm how much of the dispatch topology wrangler's local dev can simulate without the subscription; whatever it cannot cover moves into the paid integration window.
+3. **Data-residency options per tenant** (Durable Object jurisdictions, D1 location hints) if a regulated-customer tier materializes.
 
 ## Appendix: current-state anchors
 
