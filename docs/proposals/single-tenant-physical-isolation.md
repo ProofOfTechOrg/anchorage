@@ -124,6 +124,17 @@ Verified constraints on the Workers Paid plan ([limits](https://developers.cloud
 | Worker size | 10 MB | Fine |
 | No per-script fee | — | Tenant count itself costs nothing on plain Workers |
 
+### Agents per deployment
+
+The deployment unit is the client, not the agent. A client's Worker hosts that client's entire agent catalog: `createAgentModuleCatalog()` (`packages/flowsafe/src/agent-host/catalog.ts`) takes a plural module list and indexes it by id, the thread host resolves `agentId` per request and applies that agent's own `allowedRoles`/`allowedAutomation`/`requiredPermissions`, and workflows register the same way (the baseline Worker's `WORKFLOWS` array). Adding an agent to a client is a catalog entry plus a redeploy of that client's Worker — no new Worker, database, or namespaces. Durable runs of every agent are instances of the same Durable Object classes, and instances are unlimited.
+
+The 500-Workers ceiling therefore bounds **client count, not agent count** (and on Workers for Platforms even that bound disappears). The practical per-Worker bounds on catalog size are generous: the 10 MB script limit (packages and Mastra are shared; per-agent cost is instructions, schemas, and any unique connector code), the 1-second startup limit (the thread host already constructs the catalog lazily), and the 128-secret budget for per-connector credentials.
+
+Two intra-client consequences are deliberate design points, not defects:
+
+- **Shared version, shared blast radius.** All of a client's agents deploy atomically; a bad deploy affects all of them, and only them. A client wanting isolation between agent tiers (production versus experimental) shards into two deployments — deployment unit = client × environment — spending one extra Worker from the budget.
+- **Shared stores, shared budgets by default.** One D1 per client means its agents share idempotency and rate-limit stores. Rate budgets key per connector plus scope, and the opaque isolation scope with `crossWorkflowIsolation` remains available to partition budgets per workflow or agent when one noisy agent must not starve the client's others — an in-deployment policy concern, exactly where per-principal authorization already lives.
+
 ### Maintenance on Durable Object alarms, not cron triggers
 
 The baseline deployment currently declares two cron expressions per deployment (`packages/flowsafe/deploy/wrangler.jsonc` `"crons": ["*/15 * * * *", "7 * * * *"]`) for the SLA sweep and the retention purge. `deploy/crons.ts` documents why they never share an invocation: a CPU-limit kill is uncatchable, so a slow sweep sharing an invocation could permanently starve the purge. Any replacement must preserve that failure-isolation property, not just the schedule.
