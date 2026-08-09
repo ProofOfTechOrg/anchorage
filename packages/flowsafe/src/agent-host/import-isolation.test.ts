@@ -94,10 +94,13 @@ describe('agent-host subpath isolation', () => {
     ).toEqual([]);
   });
 
-  it('positive control: agent-host alone imports the guarded Breakwater subpath', () => {
+  it('positive control: agent-host alone imports the guarded Breakwater subpaths', () => {
     const result = graph(path.resolve(here, 'index.ts'));
     expect(result.unresolved).toEqual([]);
     expect(result.bare).toContain('@proofoftech/breakwater/agent');
+    // The permission vocabulary and projection guard the thread host mints
+    // with live in breakwater's rbac subpath.
+    expect(result.bare).toContain('@proofoftech/breakwater/rbac');
   });
 });
 

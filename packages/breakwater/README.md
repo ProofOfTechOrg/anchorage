@@ -227,6 +227,9 @@ The permission manifest is enforced:
   allowlist gates the declaration, and `runtime.fetch` gates each actual
   request and redirect hop.
 - `requiresApproval` makes the server-minted approval grant mandatory.
+- `requiredPermissions` makes the trusted principal-permissions projection
+  mandatory: the executing principal must hold every listed identifier,
+  checked before dry-run and before the approval grant.
 - `dryRun` requires `dryRunExecute` and allows callers to request a
   side-effect-free simulation.
 - `idempotencyKey` requires a per-call key and a configured store.
@@ -249,12 +252,13 @@ The connector wrapper reads these keys:
 | `ACTOR_CONTEXT_KEY` | `breakwater.actor` | `{ id, role, kind? }` | Authenticated host or `getActor` |
 | `CONNECTOR_GRANTS_CONTEXT_KEY` | `breakwater.connectorGrants` | `ConnectorApprovalGrant[]` | Trusted approval service only |
 | `CONNECTOR_EXECUTION_CONTEXT_KEY` | `breakwater.connectorExecution` | `ConnectorExecutionIdentity` | Trusted runtime only |
+| `PRINCIPAL_PERMISSIONS_CONTEXT_KEY` | `breakwater.principalPermissions` | `PrincipalPermissions` or `null` | Trusted host resolver only |
 | `DRY_RUN_CONTEXT_KEY` | `breakwater.dryRun` | `true` | Caller requesting simulation |
 | `IDEMPOTENCY_KEY_CONTEXT_KEY` | `breakwater.idempotencyKey` | Non-empty string | Host-derived operation identity |
 | `ISOLATION_SCOPE_CONTEXT_KEY` | `breakwater.isolationScope` | Opaque non-empty string | Multi-tenant runtime only |
 | `WORKFLOW_SCOPE_CONTEXT_KEY` | `breakwater.workflowScope` | Current workflow ID | Workflow runtime only |
 
-Approval and isolation values are capabilities. Never accept them from a request body, model output, tool result, or client-controlled header. Flowsafe derives structured approval grants from approved records and mints the current execution identity, workflow scope, run ID, and tenant scope on each run leg.
+Approval, permission, and isolation values are capabilities. Never accept them from a request body, model output, tool result, or client-controlled header. Flowsafe derives structured approval grants from approved records, projects the server-resolved principal permissions, and mints the current execution identity, workflow scope, run ID, and tenant scope on each run leg.
 
 Mastra's native `requireApproval` pauses an agent run, but it does not replace the Breakwater grant. Every execution path checks the structured grant against the runtime-owned identity. Legacy connector ID arrays fail closed.
 
@@ -429,9 +433,11 @@ Type exports: `PolicyEngineOptions`, `PolicyEvaluator`, `PolicyContext`,
 | Runtime exports | Purpose |
 | --- | --- |
 | `RBACMiddleware`, `ROLES`, `ACTOR_CONTEXT_KEY`, `actorFromRequestContext` | Actor authorization and lookup |
+| `isPermissionIdentifier`, `isPrincipalPermissions`, `PRINCIPAL_PERMISSIONS_CONTEXT_KEY` | Canonical permission identifiers and the trusted principal-permissions projection |
 | `AuditLogger`, `combineAuditSinks`, `metricsAuditSink` | Buffered audit, sink fan-out, and metrics adaptation |
 
-Type exports: `Actor`, `Role`, `PrincipalKind`, `RBACMiddlewareOptions`,
+Type exports: `Actor`, `Role`, `Permission`, `PrincipalKind`,
+`PrincipalPermissions`, `RBACMiddlewareOptions`,
 `AuditEvent`, `AuditSink`, `AuditLoggerOptions`, and `MetricsRecorder`.
 The `rbac` subpath also re-exports `AuditLogger` and its original audit types
 for compatibility.

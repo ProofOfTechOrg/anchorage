@@ -26,6 +26,7 @@ import { AuditLogger, createConnector } from '@proofoftech/breakwater';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import type { ApprovalActor } from '../approval-api/contract.js';
+import { BREAKWATER_PRINCIPAL_PERMISSIONS_KEY } from '../approval-api/contract.js';
 import {
   approvalGrantProvider,
   defaultResumeData,
@@ -113,7 +114,15 @@ const nestedShape = (topic: string) => ({
   },
 });
 
-function buildHarness(workflowId = 'agent-launch') {
+function buildHarness(
+  workflowId = 'agent-launch',
+  options: {
+    /** Connector-level authorization the projection must satisfy. */
+    requiredPermissions?: readonly string[];
+    /** Trusted principal-permissions projection minted on every leg. */
+    principalPermissions?: unknown;
+  } = {},
+) {
   const storage = new InMemoryStore();
   const store = new InMemoryApprovalStore('acme');
   const connectorAudit = new AuditLogger();
@@ -124,7 +133,13 @@ function buildHarness(workflowId = 'agent-launch') {
     description: 'Publishes the launch post',
     inputSchema: z.object({ topic: z.string() }),
     outputSchema: z.object({ published: z.boolean() }),
-    permissions: { sideEffect: 'write', requiresApproval: true },
+    permissions: {
+      sideEffect: 'write',
+      requiresApproval: true,
+      ...(options.requiredPermissions
+        ? { requiredPermissions: options.requiredPermissions }
+        : {}),
+    },
     policies: { audit: connectorAudit },
     execute: async () => {
       publishes += 1;
@@ -137,9 +152,23 @@ function buildHarness(workflowId = 'agent-launch') {
   // isolate (empty in-process resume ledger, gone Mastra/registry) reattaching to
   // the SAME durable snapshot already persisted in `storage`.
   const makeRuntime = () => {
+    // The trusted-provider seam: grants from the approval store, plus — when
+    // the harness models a permission-aware host — the principal-permissions
+    // projection minted on every leg, exactly as the agent thread host does.
+    const grantProvider = approvalGrantProvider(store);
     const { createWorkflow, createStep, runtime } = init(
       { storage },
-      { requestContextForRun: approvalGrantProvider(store) },
+      {
+        requestContextForRun: async (id, runId, leg) => ({
+          ...(await grantProvider(id, runId, leg)),
+          ...(options.principalPermissions !== undefined
+            ? {
+                [BREAKWATER_PRINCIPAL_PERMISSIONS_KEY]:
+                  options.principalPermissions,
+              }
+            : {}),
+        }),
+      },
     );
 
     // The agent tool-call gate: suspends with the AGENT payload shape (chosen per
@@ -311,6 +340,102 @@ describe('agent gate grant round-trip (R-003, both shapes)', () => {
     expect(h.publishes()).toBe(0);
     expect(h.connectorAudit.events()).toContainEqual(
       expect.objectContaining({ resource: CONNECTOR_ID, decision: 'denied' }),
+    );
+  });
+
+  it('approved but unauthorized: a valid grant does not elevate a principal missing a required permission (§9)', async () => {
+    // #given — the connector demands a permission the projected principal
+    // does not hold, while the approval flow will mint a perfectly valid
+    // tool-call grant for it
+    const h = buildHarness('agent-launch', {
+      requiredPermissions: ['payments.release'],
+      principalPermissions: {
+        permissions: ['contacts.write'],
+        policyVersion: 'permissions-v1',
+      },
+    });
+    const started = await h.runtime.start('agent-launch', {
+      runId: 'acme_run8',
+      inputData: { topic: 'ship-it', shape: 'flat' },
+    });
+    const [record] = await queueApprovalForSuspension(
+      h.service,
+      'agent-launch',
+      started,
+      STARTER,
+      SYSTEM,
+    );
+
+    // #when — a real reviewer approval resumes the run with the minted grant
+    const decided = await h.service.decide(
+      record?.id ?? '',
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then — authorization ran BEFORE the grant was consulted: the run
+    // fails at the connector, nothing publishes, and no approval event was
+    // recorded for the denied call
+    expect(decided.resume).toMatchObject({ attempted: true, ok: true });
+    expect(decided.resume.summary).toMatchObject({
+      status: 'failed',
+      error: expect.stringContaining('denied by required-permissions'),
+    });
+    expect(h.publishes()).toBe(0);
+    expect(h.connectorAudit.events()).toContainEqual(
+      expect.objectContaining({
+        resource: CONNECTOR_ID,
+        decision: 'denied',
+        detail: expect.objectContaining({
+          policy: 'required-permissions',
+          requiredPermissions: ['payments.release'],
+          permissionPolicyVersion: 'permissions-v1',
+        }),
+      }),
+    );
+    expect(
+      h.connectorAudit.events().map((event) => event.action),
+    ).not.toContain('connector.approval');
+  });
+
+  it('approved and authorized: the projection satisfies the connector and the grant still gates the write', async () => {
+    // #given — same wiring, but the principal holds the required permission
+    const h = buildHarness('agent-launch', {
+      requiredPermissions: ['payments.release'],
+      principalPermissions: {
+        permissions: ['payments.release', 'contacts.write'],
+        policyVersion: 'permissions-v2',
+      },
+    });
+    const started = await h.runtime.start('agent-launch', {
+      runId: 'acme_run9',
+      inputData: { topic: 'ship-it', shape: 'flat' },
+    });
+    const [record] = await queueApprovalForSuspension(
+      h.service,
+      'agent-launch',
+      started,
+      STARTER,
+      SYSTEM,
+    );
+
+    // #when
+    const decided = await h.service.decide(
+      record?.id ?? '',
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then — both gates passed in order: authorize, then approval
+    expect(decided.resume.summary).toMatchObject({
+      status: 'success',
+      result: { published: true },
+    });
+    expect(h.publishes()).toBe(1);
+    const actions = h.connectorAudit.events().map((event) => event.action);
+    expect(actions.indexOf('connector.authorize')).toBeGreaterThanOrEqual(0);
+    expect(actions.indexOf('connector.approval')).toBeGreaterThan(
+      actions.indexOf('connector.authorize'),
     );
   });
 

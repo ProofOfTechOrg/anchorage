@@ -104,28 +104,40 @@ import {
   createAgentThreadTopology,
   createThreadAgentHost,
   createAgentApprovalResumer,
+  isPermissionIdentifier,
   type AgentAutomationRule,
   type AgentMeta,
   type AgentRunEnvelope,
   type AutomatedEntryAuthorizer,
   type AutomatedEntryRequest,
   type AutomationCheck,
+  type Permission,
+  type PrincipalPermissionResolution,
+  type PrincipalPermissionResolver,
 } from '@proofoftech/flowsafe/agent-host';
 
 const automation: AgentAutomationRule = {
   kind: 'system',
   entryPaths: ['schedule.fire'],
 };
+const permission: Permission = 'reports.write';
 const meta: AgentMeta = {
   id: 'writer',
   title: 'Writer',
   description: 'Writes an approved record',
   allowedAutomation: [automation],
+  requiredPermissions: [permission],
 };
 const automationCheck: AutomationCheck = () => true;
 const authorizeAutomatedEntry: AutomatedEntryAuthorizer = (
   request: AutomatedEntryRequest,
 ) => request.agentId === meta.id;
+const permissionResolution: PrincipalPermissionResolution = {
+  permissions: [permission],
+  policyVersion: 'permissions-v1',
+};
+const resolvePrincipalPermissions: PrincipalPermissionResolver = () =>
+  permissionResolution;
 const envelope = null as AgentRunEnvelope | null;
 const scope: ApprovalGrantScope = 'tool-call';
 const suspension: ConnectorApprovalSuspension = {
@@ -150,8 +162,10 @@ void createAgentRouter;
 void createAgentThreadTopology;
 void createThreadAgentHost;
 void createAgentApprovalResumer;
+void isPermissionIdentifier;
 void automationCheck;
 void authorizeAutomatedEntry;
+void resolvePrincipalPermissions;
 void envelope;
 void grant;
 `,
@@ -186,6 +200,9 @@ assert.equal(typeof host.createAgentRouter, 'function');
 assert.equal(typeof host.createAgentThreadTopology, 'function');
 assert.equal(typeof host.createThreadAgentHost, 'function');
 assert.equal(typeof host.createAgentApprovalResumer, 'function');
+assert.equal(typeof host.isPermissionIdentifier, 'function');
+assert.equal(host.isPermissionIdentifier('reports.read'), true);
+assert.equal(host.isPermissionIdentifier('Reports.read'), false);
 assert.equal(
   flowsafe.BREAKWATER_CONNECTOR_GRANTS_KEY,
   'breakwater.connectorGrants',
@@ -194,10 +211,18 @@ assert.equal(
   flowsafe.BREAKWATER_CONNECTOR_EXECUTION_KEY,
   'breakwater.connectorExecution',
 );
+assert.equal(
+  flowsafe.BREAKWATER_PRINCIPAL_PERMISSIONS_KEY,
+  'breakwater.principalPermissions',
+);
 assert.equal(typeof flowsafe.connectorGrantsForLeg, 'function');
 assert.equal(
   approvals.BREAKWATER_CONNECTOR_GRANTS_KEY,
   flowsafe.BREAKWATER_CONNECTOR_GRANTS_KEY,
+);
+assert.equal(
+  approvals.BREAKWATER_PRINCIPAL_PERMISSIONS_KEY,
+  flowsafe.BREAKWATER_PRINCIPAL_PERMISSIONS_KEY,
 );
 `,
   );

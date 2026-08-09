@@ -5,6 +5,7 @@ import { AGENT_AUDIT_CONTEXT_KEY } from '@proofoftech/breakwater/audit';
 
 import {
   BREAKWATER_ACTOR_KEY,
+  BREAKWATER_PRINCIPAL_PERMISSIONS_KEY,
   breakwaterActorFor,
   principalAuditFields,
 } from '../approval-api/index.js';
@@ -32,6 +33,12 @@ export function deriveTrustedAgentContext(
     runId: execution.runId,
     threadId: execution.threadId,
     resourceId: execution.resourceId,
+    // Always present, even as null: a resume leg merges over the persisted
+    // start-time context, so an OMITTED key would let a projection minted
+    // under an older policy snapshot survive the merge. An explicit null
+    // overwrites it, and breakwater's connector gate fails closed on null.
+    [BREAKWATER_PRINCIPAL_PERMISSIONS_KEY]:
+      execution.principalPermissions ?? null,
     // `kind` is what breakwater's mandatory gate authorizes on; the projection
     // rule itself lives in breakwaterActorFor so this and the approval-facing
     // actor cannot drift apart.

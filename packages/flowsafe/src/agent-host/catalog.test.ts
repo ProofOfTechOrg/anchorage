@@ -3,7 +3,7 @@
 import type { GuardedAgentHandle } from '@proofoftech/breakwater/agent';
 import { describe, expect, it, vi } from 'vitest';
 import type { ApprovalRole } from '../approval-api/index.js';
-import type { AgentMeta } from './types.js';
+import { type AgentMeta, isPermissionIdentifier } from './types.js';
 
 vi.mock('@proofoftech/breakwater/agent', () => ({
   isGuardedAgentHandle: (value: unknown) =>
@@ -51,6 +51,7 @@ describe('agent catalog', () => {
       'builder',
     ]);
     expect(catalog.agents[0]).not.toHaveProperty('allowedRoles');
+    expect(catalog.agents[0]).not.toHaveProperty('requiredPermissions');
   });
 
   it.each([
@@ -96,6 +97,50 @@ describe('agent catalog', () => {
         },
       ]),
     ).toThrow('metadata roles must exactly match guarded agent roles');
+  });
+});
+
+describe('agent permission declaration', () => {
+  it('preserves a canonical all-of declaration as an immutable copy', () => {
+    const requiredPermissions = ['reports.read', 'agents.report.run'];
+    const catalog = createAgentCatalog([{ ...meta, requiredPermissions }]);
+    const normalized = catalog.get(meta.id)?.requiredPermissions;
+
+    expect(normalized).toEqual(requiredPermissions);
+    expect(Object.isFrozen(normalized)).toBe(true);
+    requiredPermissions[0] = 'payments.release';
+    expect(normalized).toEqual(['reports.read', 'agents.report.run']);
+  });
+
+  it.each([
+    ['reports.read', true],
+    ['agents.report.run', true],
+    ['', false],
+    ['reports', false],
+    ['Reports.read', false],
+    ['reports..read', false],
+    ['reports.write-all', false],
+    [`${'a'.repeat(198)}.b`, true],
+    [`${'a'.repeat(199)}.b`, false],
+  ])('validates the public permission grammar for %j', (value, valid) => {
+    expect(isPermissionIdentifier(value)).toBe(valid);
+  });
+
+  it.each([
+    ['reports.read', 'must be an array'],
+    [[], 'must not be empty'],
+    [[''], 'malformed permission identifier'],
+    [['reports'], 'malformed permission identifier'],
+    [['Reports.read'], 'malformed permission identifier'],
+    [['reports..read'], 'malformed permission identifier'],
+    [[42], 'malformed permission identifier'],
+    [['reports.read', 'reports.read'], "contains duplicate 'reports.read'"],
+  ])('rejects invalid requiredPermissions %#', (requiredPermissions, message) => {
+    expect(() =>
+      createAgentCatalog([
+        { ...meta, requiredPermissions } as unknown as AgentMeta,
+      ]),
+    ).toThrow(message as string);
   });
 });
 

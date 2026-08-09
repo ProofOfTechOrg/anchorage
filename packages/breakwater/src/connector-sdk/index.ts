@@ -5,19 +5,23 @@
 // from the config, compiled, and enforced by wrapping execute:
 //
 // 1. Network egress — declared domains checked against the org allowlist
-// 2. Write gate     — write-class calls needing approval are denied unless
+// 2. Authorization  — declared requiredPermissions checked against the
+//                     trusted principal-permissions projection, before the
+//                     dry-run branch and the approval gate; an approval must
+//                     not elevate an unauthorized principal
+// 3. Write gate     — write-class calls needing approval are denied unless
 //                     the request carries a grant, on every path; Mastra's
 //                     native requireApproval is also compiled so agent runs
 //                     pause for the decision, but it never substitutes for
 //                     the grant
-// 3. Idempotency    — keyed replay returns the stored result, so retries
+// 4. Idempotency    — keyed replay returns the stored result, so retries
 //                     and DO lifecycle boundaries cannot duplicate a side
 //                     effect
-// 4. Dry-run        — a caller-requested simulation (DRY_RUN_CONTEXT_KEY)
+// 5. Dry-run        — a caller-requested simulation (DRY_RUN_CONTEXT_KEY)
 //                     runs the connector's side-effect-free dryRunExecute;
 //                     connectors that do not declare dry-run support fail
 //                     the request closed instead of executing for real
-// 5. Rate limit     — a '<count>/<unit>' manifest budget enforced against a
+// 6. Rate limit     — a '<count>/<unit>' manifest budget enforced against a
 //                     fixed-window counter store; only actual executions
 //                     consume it
 //
@@ -48,6 +52,12 @@ import {
   WORKFLOW_SCOPE_CONTEXT_KEY,
 } from '../policy-engine/tool-policy.js';
 import { actorFromRequestContext } from '../rbac/index.js';
+import type { Permission } from '../rbac/permission.js';
+import {
+  isPermissionIdentifier,
+  isPrincipalPermissions,
+  PRINCIPAL_PERMISSIONS_CONTEXT_KEY,
+} from '../rbac/permission.js';
 import type { EgressFetchBase, EgressGuardedFetch } from './egress-fetch.js';
 import { EgressDeniedError, egressFetch } from './egress-fetch.js';
 import { newToken } from './new-token.js';
@@ -86,6 +96,17 @@ export interface PermissionManifest {
    * write-class connectors fail at construction.
    */
   background?: boolean;
+  /**
+   * Server-derived permissions required to invoke this connector, with
+   * explicit ALL-OF semantics: the executing principal must hold every
+   * listed identifier. Enforced against the trusted
+   * `breakwater.principalPermissions` projection BEFORE the dry-run branch
+   * and the approval-grant gate — authorization applies to simulations too,
+   * and a valid approval must not elevate an unauthorized principal. A call
+   * with no valid projection fails closed. Omission preserves the existing
+   * approval/policy-only behavior; a present list must be non-empty.
+   */
+  requiredPermissions?: readonly Permission[];
 }
 
 /** Completed result stored for idempotent replay. */
@@ -698,6 +719,42 @@ function parseRateLimit(
   return { limit, windowMs };
 }
 
+// Same construction contract as flowsafe's agent catalog: a declared list
+// must be non-empty, duplicate-free, and canonical — a permission gate that
+// can never pass (or a typo that silently never matches) is a wiring bug,
+// not a runtime denial.
+function normalizedRequiredPermissions(
+  connectorId: string,
+  permissions: readonly Permission[] | undefined,
+): readonly Permission[] | undefined {
+  if (permissions === undefined) return undefined;
+  if (!Array.isArray(permissions)) {
+    throw new TypeError(
+      `connector ${connectorId}: permissions.requiredPermissions must be an array`,
+    );
+  }
+  if (permissions.length === 0) {
+    throw new TypeError(
+      `connector ${connectorId}: permissions.requiredPermissions must not be empty`,
+    );
+  }
+  const unique = new Set<Permission>();
+  for (const permission of permissions) {
+    if (!isPermissionIdentifier(permission)) {
+      throw new TypeError(
+        `connector ${connectorId}: permissions.requiredPermissions contains a malformed permission identifier`,
+      );
+    }
+    if (unique.has(permission)) {
+      throw new TypeError(
+        `connector ${connectorId}: permissions.requiredPermissions contains duplicate '${permission}'`,
+      );
+    }
+    unique.add(permission);
+  }
+  return Object.freeze([...permissions]);
+}
+
 /**
  * Compile a connector: a real Mastra createTool() call whose execute is
  * wrapped with the manifest's enforcement. `requiresApproval` (and the org
@@ -720,9 +777,14 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       `connector id '${id}' must not contain a colon: id is joined UNESCAPED with ':' into BOTH id-derived store keys (the idempotency scoped key '<id>:<key>' / '<isolationScope>:<id>:<key>', and the rate-limit budget key '<scope>:<id>'), so a colon in id can collide two distinct tuples onto one key on a shared store. Use a colon-free id (camelCase or dot-delimited).`,
     );
   }
+  const requiredPermissions = normalizedRequiredPermissions(
+    id,
+    config.permissions.requiredPermissions,
+  );
   const manifest: PermissionManifest = Object.freeze({
     ...config.permissions,
     egress: Object.freeze([...(config.permissions.egress ?? [])]),
+    ...(requiredPermissions !== undefined ? { requiredPermissions } : {}),
   });
 
   assertEgressHostList(
@@ -805,14 +867,19 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     });
   }
 
+  // `detail` merges into the denial's audit detail beside `policy` — for
+  // gates whose audit contract carries more than the policy name (the
+  // required-permissions gate records requiredPermissions and the policy
+  // snapshot version on every decision).
   function deny(
     requestContext: RequestContext | undefined,
     policy: string,
     reason: string,
+    detail: Record<string, unknown> = {},
   ): never {
     record(requestContext, 'denied', {
       reason: `${policy}: ${reason}`,
-      detail: { policy },
+      detail: { policy, ...detail },
     });
     throw new ConnectorPolicyError(id, policy, reason);
   }
@@ -1110,6 +1177,53 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
           deny(requestContext, gate.name, decision.reason);
         }
       }
+    }
+
+    // Authorization before capability (roadmap §9): required permissions ask
+    // WHO may invoke this connector at all, so the gate runs before the
+    // dry-run branch (a simulation still needs an authorized principal) and
+    // before the approval-grant gate (a valid approval must not elevate an
+    // otherwise unauthorized principal). Its input is the trusted
+    // `breakwater.principalPermissions` projection, mintable only by host/
+    // runtime code — a missing or malformed projection fails closed. Audit
+    // records the required identifiers and the policy snapshot version,
+    // never the principal's effective permission set.
+    if (manifest.requiredPermissions !== undefined) {
+      const required = manifest.requiredPermissions;
+      const projection = requestContext?.get(PRINCIPAL_PERMISSIONS_CONTEXT_KEY);
+      if (!isPrincipalPermissions(projection)) {
+        deny(
+          requestContext,
+          'required-permissions',
+          'no valid principal permission projection is present; only a trusted host may mint it',
+          { requiredPermissions: required, permissionPolicyVersion: null },
+        );
+      }
+      const effective = new Set(projection.permissions);
+      if (!required.every((permission) => effective.has(permission))) {
+        deny(
+          requestContext,
+          'required-permissions',
+          'required permissions are not satisfied',
+          {
+            requiredPermissions: required,
+            permissionPolicyVersion: projection.policyVersion,
+          },
+        );
+      }
+      record(
+        requestContext,
+        'allowed',
+        {
+          reason: 'required permissions are satisfied',
+          detail: {
+            policy: 'required-permissions',
+            requiredPermissions: required,
+            permissionPolicyVersion: projection.policyVersion,
+          },
+        },
+        'connector.authorize',
+      );
     }
 
     if (requestContext?.get(DRY_RUN_CONTEXT_KEY) === true) {

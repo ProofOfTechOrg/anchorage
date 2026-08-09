@@ -4,6 +4,7 @@ import type { Agent } from '@mastra/core/agent';
 import { AGENT_STREAM_TOPIC } from '@mastra/core/agent/durable';
 import { Mastra } from '@mastra/core/mastra';
 import type { MastraCompositeStore } from '@mastra/core/storage';
+import { isPrincipalPermissions } from '@proofoftech/breakwater/rbac';
 
 import {
   type AgentEntryPath,
@@ -51,6 +52,8 @@ import type {
   AgentModule,
   AgentModuleCatalog,
   AgentRunEnvelope,
+  PrincipalPermissionResolution,
+  PrincipalPermissionResolver,
   TrustedAgentExecution,
 } from './types.js';
 
@@ -88,9 +91,25 @@ export type AutomatedEntryAuthorizer = (
   request: AutomatedEntryRequest,
 ) => boolean | Promise<boolean>;
 
+// Moved to types.ts beside the execution shape that now carries a resolution;
+// re-exported so '@proofoftech/flowsafe/agent-host' keeps its surface.
+export type {
+  PrincipalPermissionResolution,
+  PrincipalPermissionResolver,
+} from './types.js';
+
 export interface ThreadAgentHostOptions {
   /** Narrows automated entry beyond what each agent's metadata declares. */
   authorizeAutomatedEntry?: AutomatedEntryAuthorizer;
+  /**
+   * Server-owned principal-to-permission resolver. Required by any catalog
+   * agent that declares `requiredPermissions` — such an agent fails closed
+   * when this seam is absent. When configured, it runs on EVERY authorized
+   * entry and its resolution is projected into the run's derived request
+   * context as `breakwater.principalPermissions`, which is what a connector
+   * declaring `requiredPermissions` enforces against.
+   */
+  resolvePrincipalPermissions?: PrincipalPermissionResolver;
   buildModules:
     | ((scope: AgentThreadInstanceScope) => readonly AgentModule[])
     | ((scope: AgentThreadInstanceScope) => Promise<readonly AgentModule[]>);
@@ -265,6 +284,24 @@ function audit(
   }
 }
 
+function normalizedPermissionResolution(
+  value: unknown,
+): PrincipalPermissionResolution {
+  // Delegate the shape check to breakwater's guard — the SAME predicate its
+  // connector required-permissions gate applies to the projection — so this
+  // host can never mint a resolution breakwater would reject. Duplicates are
+  // tolerated rather than treated as malformed: the all-of check has set
+  // semantics, so a host that unions role bundles must not take an
+  // availability hit for a repeat that cannot change any decision.
+  if (!isPrincipalPermissions(value)) {
+    throw new Error('permission resolution is malformed');
+  }
+  return Object.freeze({
+    permissions: Object.freeze([...new Set(value.permissions)]),
+    policyVersion: value.policyVersion,
+  });
+}
+
 function ndjson(
   stream: ReadableStream<unknown>,
   initialOffset: number,
@@ -418,6 +455,16 @@ export function createThreadAgentHost(
    * this precise entry path, AND survive the host's optional authorizer. Absent
    * declaration denies — which is why a scheduled start of an agent that has
    * not opted in fails here rather than executing as a synthetic operator.
+   *
+   * After that kind-specific gate, a configured server-owned resolver runs for
+   * EVERY granted entry: an agent that declares required permissions also
+   * requires every identifier from the resolution, and the resolution itself
+   * is returned so the execution projects it into derived request context —
+   * the input to breakwater's connector required-permissions gate. A failed
+   * resolution fails closed at the matching scope: it denies a
+   * permission-requiring agent, and it costs any other run its projection
+   * (audited as `agent.permissions.resolve`), so a permission-declaring
+   * connector inside that run denies rather than executing unauthorized.
    */
   const authorize = async (
     scope: ThreadScope,
@@ -427,6 +474,10 @@ export function createThreadAgentHost(
   ) => {
     const current = await runtimeFor(scope);
     const module = current.catalog.get(agentId);
+    const requiredPermissions = module?.meta.requiredPermissions;
+    let permissionPolicyVersion: string | null = null;
+    let principalPermissions: PrincipalPermissionResolution | null = null;
+    let decision: 'allowed' | 'denied' | 'error' = 'denied';
     let reason: string | undefined;
     let granted = false;
     if (module === undefined) {
@@ -453,11 +504,61 @@ export function createThreadAgentHost(
       granted = hostAllows;
       if (!granted) reason = 'host denied this automated entry';
     }
+    const resolver = options.resolvePrincipalPermissions;
+    if (granted && resolver) {
+      try {
+        principalPermissions = normalizedPermissionResolution(
+          await resolver(principal),
+        );
+        permissionPolicyVersion = principalPermissions.policyVersion;
+      } catch {
+        if (requiredPermissions !== undefined) {
+          decision = 'error';
+          granted = false;
+          reason = 'permission resolution failed';
+        } else {
+          // The entry stays granted — this agent requires no permissions —
+          // but the run loses its projection, so a permission-declaring
+          // connector inside it fails closed. A dedicated event says so,
+          // because the entry event below reports this entry as allowed.
+          audit(options.audit, {
+            actor: principalActor(principal),
+            action: 'agent.permissions.resolve',
+            resource: `agent:${agentId}`,
+            decision: 'error',
+            reason: 'permission resolution failed',
+            detail: {
+              agentId,
+              tenantId: scope.tenantId,
+              threadId: scope.threadId,
+              entryPath: entry,
+              ...principalAuditFields(principal),
+              permissionPolicyVersion: null,
+            },
+          });
+        }
+      }
+    }
+    if (granted && requiredPermissions !== undefined) {
+      if (!resolver) {
+        granted = false;
+        reason = 'permission resolver is not configured';
+      } else if (principalPermissions) {
+        const effective = new Set(principalPermissions.permissions);
+        granted = requiredPermissions.every((permission) =>
+          effective.has(permission),
+        );
+        if (!granted) {
+          reason = 'required permissions are not satisfied';
+        }
+      }
+    }
+    if (granted) decision = 'allowed';
     audit(options.audit, {
       actor: principalActor(principal),
       action: 'agent.entry.authorize',
       resource: `agent:${agentId}`,
-      decision: granted ? 'allowed' : 'denied',
+      decision,
       ...(reason !== undefined ? { reason } : {}),
       detail: {
         agentId,
@@ -465,11 +566,14 @@ export function createThreadAgentHost(
         threadId: scope.threadId,
         entryPath: entry,
         ...principalAuditFields(principal),
+        ...(requiredPermissions !== undefined
+          ? { requiredPermissions, permissionPolicyVersion }
+          : {}),
       },
     });
     if (!module) throw new AgentHostRequestError(404, 'agent not found');
     if (!granted) throw new AgentHostRequestError(403, 'forbidden');
-    return { current, module };
+    return { current, module, principalPermissions };
   };
 
   const readBinding = (): Promise<AgentThreadBinding | undefined> =>
@@ -734,7 +838,7 @@ export function createThreadAgentHost(
         throw new AgentHostRequestError(400, 'agent input is required');
       }
       const entry = entryPath(input.entryPath);
-      const { current, module } = await authorize(
+      const { current, module, principalPermissions } = await authorize(
         scope,
         ref.agentId,
         entry,
@@ -750,6 +854,7 @@ export function createThreadAgentHost(
         resourceId: ref.resourceId,
         runId: ref.runId,
         entryPath: entry,
+        principalPermissions,
         safeContext: safeContext(input.safeContext),
       };
       const durable = current.agents.get(module.meta.id);
@@ -912,7 +1017,7 @@ export function createThreadAgentHost(
         ) {
           throw new AgentHostRequestError(404, 'run not found');
         }
-        const { current, module } = await authorize(
+        const { current, module, principalPermissions } = await authorize(
           scope,
           ref.agentId,
           entryPath(body.entryPath),
@@ -933,6 +1038,10 @@ export function createThreadAgentHost(
           resourceId: ref.resourceId,
           runId: ref.runId,
           entryPath: 'approval.resume',
+          // The re-derived resolution, not the start leg's: the resume merges
+          // over the persisted context, so this leg's projection retires a
+          // stale one minted under an older policy snapshot.
+          principalPermissions,
           safeContext: snapshotExecution.safeContext,
         };
         const summary = await withExecution(execution, () =>

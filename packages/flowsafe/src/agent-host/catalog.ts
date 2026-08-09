@@ -10,14 +10,16 @@ import {
   RUN_START_ROLES,
 } from '../approval-api/index.js';
 import { PATH_SAFE_ID_PATTERN } from '../do-runner/index.js';
-import type {
-  AgentAutomationRule,
-  AgentCatalog,
-  AgentEntryPath,
-  AgentMeta,
-  AgentModule,
-  AgentModuleCatalog,
-  AutomationCheck,
+import {
+  type AgentAutomationRule,
+  type AgentCatalog,
+  type AgentEntryPath,
+  type AgentMeta,
+  type AgentModule,
+  type AgentModuleCatalog,
+  type AutomationCheck,
+  isPermissionIdentifier,
+  type Permission,
 } from './types.js';
 
 function fail(message: string): never {
@@ -43,6 +45,34 @@ function normalizedRoles(
     unique.add(role);
   }
   return Object.freeze([...effective]);
+}
+
+function normalizedPermissions(
+  permissions: readonly Permission[] | undefined,
+  agentId: string,
+): readonly Permission[] | undefined {
+  if (permissions === undefined) return undefined;
+  if (!Array.isArray(permissions)) {
+    fail(`agent '${agentId}' requiredPermissions must be an array`);
+  }
+  if (permissions.length === 0) {
+    fail(`agent '${agentId}' requiredPermissions must not be empty`);
+  }
+  const unique = new Set<Permission>();
+  for (const permission of permissions) {
+    if (!isPermissionIdentifier(permission)) {
+      fail(
+        `agent '${agentId}' requiredPermissions contains a malformed permission identifier`,
+      );
+    }
+    if (unique.has(permission)) {
+      fail(
+        `agent '${agentId}' requiredPermissions contains duplicate '${permission}'`,
+      );
+    }
+    unique.add(permission);
+  }
+  return Object.freeze([...permissions]);
 }
 
 /**
@@ -146,12 +176,14 @@ export function validateAgentMeta(meta: AgentMeta): AgentMeta {
     fail(`agent '${meta.id}' description must not be empty`);
   }
   const roles = normalizedRoles(meta.allowedRoles, meta.id);
+  const permissions = normalizedPermissions(meta.requiredPermissions, meta.id);
   const automation = normalizedAutomation(meta.allowedAutomation, meta.id);
   return Object.freeze({
     id: meta.id,
     title: meta.title,
     description: meta.description,
     ...(meta.allowedRoles !== undefined ? { allowedRoles: roles } : {}),
+    ...(permissions !== undefined ? { requiredPermissions: permissions } : {}),
     ...(automation !== undefined ? { allowedAutomation: automation } : {}),
   });
 }

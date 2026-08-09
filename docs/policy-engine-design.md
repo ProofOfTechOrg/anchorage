@@ -123,7 +123,7 @@ The connector SDK separately builds `runtime.fetch` from the manifest. It checks
 - destructive side-effect classification;
 - deployment write-permission patterns.
 
-The connector reads `breakwater.connectorGrants` and `breakwater.connectorExecution` from request context. It compares connector, tenant, workflow, run, and exact suspension identity. A `tool-call` grant also must match Mastra’s `context.agent.toolCallId`. Flowsafe derives these values from approved records and authoritative runtime state. A dry run bypasses the capability because its configured implementation must have no side effect.
+The connector reads `breakwater.connectorGrants` and `breakwater.connectorExecution` from request context. It compares connector, tenant, workflow, run, and exact suspension identity. A `tool-call` grant also must match Mastra's `context.agent.toolCallId`. Flowsafe derives these values from approved records and authoritative runtime state. A dry run bypasses the capability because its configured implementation must have no side effect.
 
 ### Cross-workflow isolation
 
@@ -196,6 +196,7 @@ See [Deployment reference](deployment-reference.md) and [Operations runbook](ope
 | Deny a prompt before the model | Input processor |
 | Inspect answer/reasoning/object output | Output processor |
 | Require a grant on every tool invocation path | Connector wrapper |
+| Require a permission on every tool invocation path | Connector wrapper (`requiredPermissions` against the trusted projection) |
 | Restrict actual connector HTTP redirects | `ConnectorRuntime.fetch` |
 | Enforce tenant and workflow call scope | Tool evaluator plus trusted runtime context |
 | Suspend an agent for review | Mastra native approval predicate compiled by connector |

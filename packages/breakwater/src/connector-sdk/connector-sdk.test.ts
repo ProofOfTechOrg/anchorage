@@ -12,7 +12,11 @@ import {
   tenantIsolation,
   WORKFLOW_SCOPE_CONTEXT_KEY,
 } from '../policy-engine/index.js';
-import { ACTOR_CONTEXT_KEY, type Actor } from '../rbac/index.js';
+import {
+  ACTOR_CONTEXT_KEY,
+  type Actor,
+  PRINCIPAL_PERMISSIONS_CONTEXT_KEY,
+} from '../rbac/index.js';
 import {
   type AtomicIdempotencyStore,
   CONNECTOR_EXECUTION_CONTEXT_KEY,
@@ -36,10 +40,17 @@ function makeContext(
     idempotencyKey?: string;
     agent?: boolean;
     dryRun?: boolean;
+    principalPermissions?: unknown;
   } = {},
 ): ToolExecutionContext {
   const requestContext = new RequestContext();
   if (options.actor) requestContext.set(ACTOR_CONTEXT_KEY, options.actor);
+  if (options.principalPermissions !== undefined) {
+    requestContext.set(
+      PRINCIPAL_PERMISSIONS_CONTEXT_KEY,
+      options.principalPermissions,
+    );
+  }
   if (options.approved) {
     requestContext.set(WORKFLOW_SCOPE_CONTEXT_KEY, 'workflow-1');
     requestContext.set('runId', 'run-1');
@@ -852,6 +863,335 @@ describe('write permission gate', () => {
   });
 });
 
+describe('required-permissions gate', () => {
+  const REQUIRED = ['contacts.write', 'crm.access'] as const;
+  const PRIVATE_EFFECTIVE_SENTINEL = 'privatebackend.effectiveonly';
+
+  function permissionConnector(
+    overrides: Partial<Parameters<typeof createConnector>[0]> = {},
+  ) {
+    return makeConnector({
+      permissions: { sideEffect: 'read', requiredPermissions: REQUIRED },
+      ...overrides,
+    });
+  }
+
+  it.each([
+    ['a non-array', 'contacts.write'],
+    ['an empty list', []],
+    ['a duplicate identifier', ['contacts.write', 'contacts.write']],
+    ['a malformed identifier', ['Contacts.write']],
+    ['a non-string entry', ['contacts.write', 42]],
+  ])('rejects a manifest declaring %s at construction', (_label, requiredPermissions) => {
+    expect(() =>
+      makeConnector({
+        permissions: {
+          sideEffect: 'read',
+          requiredPermissions:
+            requiredPermissions as unknown as readonly string[],
+        },
+      }),
+    ).toThrow(/permissions\.requiredPermissions/);
+  });
+
+  it('exposes the frozen requiredPermissions via connectorManifest()', () => {
+    const { tool } = permissionConnector();
+    const manifest = connectorManifest(tool);
+    expect(manifest?.requiredPermissions).toEqual([...REQUIRED]);
+    expect(Object.isFrozen(manifest?.requiredPermissions)).toBe(true);
+  });
+
+  it('runs when the projection holds every required permission, tolerating duplicates and extras', async () => {
+    // #given
+    const audit = new AuditLogger();
+    const { tool, execute } = permissionConnector({ policies: { audit } });
+    const context = makeContext({
+      principalPermissions: {
+        permissions: [
+          'contacts.write',
+          'contacts.write',
+          'crm.access',
+          'unrelated.extra',
+        ],
+        policyVersion: 'permissions-v7',
+      },
+    });
+    // #when / #then
+    expect(await run(tool, input, context)).toEqual({ ok: true });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(audit.events()).toMatchObject([
+      {
+        action: 'connector.authorize',
+        decision: 'allowed',
+        detail: {
+          policy: 'required-permissions',
+          requiredPermissions: [...REQUIRED],
+          permissionPolicyVersion: 'permissions-v7',
+        },
+      },
+      { action: 'connector.execute', decision: 'allowed' },
+    ]);
+  });
+
+  it('denies when any one required permission is absent and audits the policy snapshot without effective-authority leakage', async () => {
+    // #given — the projection holds one required permission plus a private
+    // effective-only identifier that must never appear in audit
+    const audit = new AuditLogger();
+    const { tool, execute } = permissionConnector({ policies: { audit } });
+    const context = makeContext({
+      principalPermissions: {
+        permissions: ['contacts.write', PRIVATE_EFFECTIVE_SENTINEL],
+        policyVersion: 'permissions-v8',
+      },
+    });
+    // #when
+    const failure = await run(tool, input, context).catch(
+      (error: unknown) => error,
+    );
+    // #then
+    expect(failure).toBeInstanceOf(ConnectorPolicyError);
+    expect((failure as ConnectorPolicyError).policy).toBe(
+      'required-permissions',
+    );
+    expect(execute).not.toHaveBeenCalled();
+    expect(audit.events()).toMatchObject([
+      {
+        decision: 'denied',
+        detail: {
+          policy: 'required-permissions',
+          requiredPermissions: [...REQUIRED],
+          permissionPolicyVersion: 'permissions-v8',
+        },
+      },
+    ]);
+    expect(JSON.stringify(audit.events())).not.toContain(
+      PRIVATE_EFFECTIVE_SENTINEL,
+    );
+    expect((failure as ConnectorPolicyError).message).not.toContain(
+      PRIVATE_EFFECTIVE_SENTINEL,
+    );
+  });
+
+  it.each([
+    ['no projection at all', undefined],
+    ['a null projection (explicit host retirement)', null],
+    ['a non-object projection', 'contacts.write'],
+    ['an array projection', ['contacts.write']],
+    [
+      'a non-array permission set',
+      { permissions: 'contacts.write', policyVersion: 'v1' },
+    ],
+    [
+      'a malformed permission identifier',
+      { permissions: ['Contacts.write'], policyVersion: 'v1' },
+    ],
+    [
+      'a non-string permission entry',
+      { permissions: ['contacts.write', 42], policyVersion: 'v1' },
+    ],
+    [
+      'a blank policy version',
+      { permissions: [...REQUIRED], policyVersion: '   ' },
+    ],
+    [
+      'a control-character policy version',
+      { permissions: [...REQUIRED], policyVersion: '\n' },
+    ],
+    [
+      'a policy version over the 200-character bound',
+      { permissions: [...REQUIRED], policyVersion: 'v'.repeat(201) },
+    ],
+    ['a missing policy version', { permissions: [...REQUIRED] }],
+  ])('fails closed for %s', async (_label, principalPermissions) => {
+    // #given
+    const audit = new AuditLogger();
+    const { tool, execute } = permissionConnector({ policies: { audit } });
+    // #when
+    const failure = await run(
+      tool,
+      input,
+      makeContext({ principalPermissions }),
+    ).catch((error: unknown) => error);
+    // #then
+    expect(failure).toBeInstanceOf(ConnectorPolicyError);
+    expect((failure as ConnectorPolicyError).policy).toBe(
+      'required-permissions',
+    );
+    expect(execute).not.toHaveBeenCalled();
+    expect(audit.events()).toMatchObject([
+      {
+        decision: 'denied',
+        detail: {
+          policy: 'required-permissions',
+          requiredPermissions: [...REQUIRED],
+          permissionPolicyVersion: null,
+        },
+      },
+    ]);
+  });
+
+  it('ignores the projection entirely on a connector that declares no required permissions', async () => {
+    // #given — garbage under the key must not affect an undeclared manifest
+    const { tool, execute } = makeConnector();
+    const context = makeContext({
+      principalPermissions: { permissions: 'garbage', policyVersion: 42 },
+    });
+    // #when / #then
+    expect(await run(tool, input, context)).toEqual({ ok: true });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('a nested connector call cannot broaden authority: the inner requirement is checked against the same projection', async () => {
+    // #given — the outer connector is authorized; the nested one requires a
+    // permission the projection does not hold
+    const inner = makeConnector({
+      id: 'payments.release',
+      permissions: {
+        sideEffect: 'read',
+        requiredPermissions: ['payments.release'],
+      },
+    });
+    const composite = createConnector({
+      id: 'crm.settleAccount',
+      description: 'Composite settlement calling a nested connector',
+      execute: async (_input, context) => run(inner.tool, input, context),
+      permissions: {
+        sideEffect: 'read',
+        requiredPermissions: ['contacts.write'],
+      },
+    });
+    const context = makeContext({
+      principalPermissions: {
+        permissions: ['contacts.write'],
+        policyVersion: 'permissions-v9',
+      },
+    });
+    // #when
+    const denied = await run(composite, input, context).catch(
+      (error: unknown) => error,
+    );
+    // #then
+    expect(denied).toBeInstanceOf(ConnectorPolicyError);
+    expect((denied as ConnectorPolicyError).connector).toBe('payments.release');
+    expect((denied as ConnectorPolicyError).policy).toBe(
+      'required-permissions',
+    );
+    expect(inner.execute).not.toHaveBeenCalled();
+  });
+
+  it('denies an unauthorized dry-run request: a simulation still needs an authorized principal', async () => {
+    // #given
+    const dryRunExecute = vi.fn(async () => ({ ok: true, simulated: true }));
+    const { tool, execute } = permissionConnector({
+      permissions: {
+        sideEffect: 'write',
+        requiredPermissions: REQUIRED,
+        dryRun: true,
+      },
+      dryRunExecute,
+    });
+    // #when
+    const failure = await run(tool, input, makeContext({ dryRun: true })).catch(
+      (error: unknown) => error,
+    );
+    // #then — denied by authorization, not by the dry-run branch
+    expect((failure as ConnectorPolicyError).policy).toBe(
+      'required-permissions',
+    );
+    expect(dryRunExecute).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('an authorized dry-run still simulates without an approval grant', async () => {
+    // #given
+    const dryRunExecute = vi.fn(async () => ({ ok: true, simulated: true }));
+    const { tool, execute } = permissionConnector({
+      permissions: {
+        sideEffect: 'write',
+        requiredPermissions: REQUIRED,
+        requiresApproval: true,
+        dryRun: true,
+      },
+      dryRunExecute,
+    });
+    const context = makeContext({
+      dryRun: true,
+      principalPermissions: {
+        permissions: [...REQUIRED],
+        policyVersion: 'permissions-v10',
+      },
+    });
+    // #when / #then
+    expect(await run(tool, input, context)).toEqual({
+      ok: true,
+      simulated: true,
+    });
+    expect(dryRunExecute).toHaveBeenCalledTimes(1);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('a valid approval grant does not elevate an unauthorized principal', async () => {
+    // #given — the write gate WOULD pass (exact structured grant), but the
+    // principal is not authorized to invoke this connector at all
+    const audit = new AuditLogger();
+    const { tool, execute } = permissionConnector({
+      permissions: {
+        sideEffect: 'destructive',
+        requiredPermissions: REQUIRED,
+      },
+      policies: { audit },
+    });
+    const context = makeContext({
+      approved: ['salesforce.createContact'],
+      principalPermissions: {
+        permissions: ['contacts.write'],
+        policyVersion: 'permissions-v11',
+      },
+    });
+    // #when
+    const failure = await run(tool, input, context).catch(
+      (error: unknown) => error,
+    );
+    // #then — denied by authorization BEFORE the grant is even consulted
+    expect((failure as ConnectorPolicyError).policy).toBe(
+      'required-permissions',
+    );
+    expect(execute).not.toHaveBeenCalled();
+    expect(audit.events().map((event) => event.action)).not.toContain(
+      'connector.approval',
+    );
+  });
+
+  it('a satisfied permission gate does not replace the approval grant', async () => {
+    // #given — authorization passes, approval is still missing
+    const audit = new AuditLogger();
+    const { tool, execute } = permissionConnector({
+      permissions: {
+        sideEffect: 'destructive',
+        requiredPermissions: REQUIRED,
+      },
+      policies: { audit },
+    });
+    const context = makeContext({
+      principalPermissions: {
+        permissions: [...REQUIRED],
+        policyVersion: 'permissions-v12',
+      },
+    });
+    // #when
+    const failure = await run(tool, input, context).catch(
+      (error: unknown) => error,
+    );
+    // #then — the authorize event fired, then the write gate denied
+    expect((failure as ConnectorPolicyError).policy).toBe('write-permissions');
+    expect(execute).not.toHaveBeenCalled();
+    expect(audit.events()).toMatchObject([
+      { action: 'connector.authorize', decision: 'allowed' },
+      { decision: 'denied', detail: { policy: 'write-permissions' } },
+    ]);
+  });
+});
+
 describe('gate ordering', () => {
   it('denies via egress before the approval gate', async () => {
     // #given — both gates would deny; egress must fire first
@@ -886,6 +1226,57 @@ describe('gate ordering', () => {
     // #then
     expect((failure as ConnectorPolicyError).policy).toBe('write-permissions');
     expect(get).not.toHaveBeenCalled();
+  });
+
+  it('denies via egress before the required-permissions gate', async () => {
+    // #given — both gates would deny; the evaluator loop must fire first
+    const audit = new AuditLogger();
+    const { tool } = makeConnector({
+      permissions: {
+        sideEffect: 'read',
+        egress: ['api.evil.com'],
+        requiredPermissions: ['contacts.write'],
+      },
+      policies: {
+        networkEgress: { allowedDomains: ['api.salesforce.com'] },
+        audit,
+      },
+    });
+    // #when
+    const failure = await run(tool, input).catch((error: unknown) => error);
+    // #then
+    expect((failure as ConnectorPolicyError).policy).toBe('network-egress');
+    expect(audit.events()).toHaveLength(1);
+  });
+
+  it('denies via required-permissions before reading the idempotency store or consuming rate budget', async () => {
+    // #given — an unauthorized keyed call: no store read, no budget spend
+    const get = vi.fn(() => undefined);
+    const increment = vi.fn(() => 1);
+    const { tool } = makeConnector({
+      permissions: {
+        sideEffect: 'write',
+        requiredPermissions: ['contacts.write'],
+        idempotencyKey: true,
+        rateLimit: '100/min',
+      },
+      policies: {
+        idempotencyStore: { get, put: () => {} },
+        rateLimitStore: { increment },
+      },
+    });
+    // #when
+    const failure = await run(
+      tool,
+      input,
+      makeContext({ idempotencyKey: 'k1' }),
+    ).catch((error: unknown) => error);
+    // #then
+    expect((failure as ConnectorPolicyError).policy).toBe(
+      'required-permissions',
+    );
+    expect(get).not.toHaveBeenCalled();
+    expect(increment).not.toHaveBeenCalled();
   });
 });
 

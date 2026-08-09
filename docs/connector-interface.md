@@ -64,6 +64,7 @@ interface PermissionManifest {
   dryRun?: boolean;
   rateLimit?: string;
   background?: boolean;
+  requiredPermissions?: readonly Permission[];
 }
 ```
 
@@ -104,7 +105,7 @@ The application chooses the business key. Flowsafe supplies the trusted tenant i
 
 ### `requiresApproval`
 
-When `true`, every real call needs a structured grant in `breakwater.connectorGrants`. Breakwater compares the grant with the runtime-owned `breakwater.connectorExecution` identity and the connector’s actual Mastra `toolCallId` when the grant uses `tool-call` scope.
+When `true`, every real call needs a structured grant in `breakwater.connectorGrants`. Breakwater compares the grant with the runtime-owned `breakwater.connectorExecution` identity and the connector's actual Mastra `toolCallId` when the grant uses `tool-call` scope.
 
 The same decision is compiled into Mastra's native `requireApproval` predicate so an agent can suspend. The native approval signal never replaces the request-context capability.
 
@@ -115,6 +116,7 @@ When `true`, `dryRunExecute` is required. A caller sets `breakwater.dryRun` to `
 Dry-run:
 
 - runs declaration egress and custom evaluators;
+- runs the `requiredPermissions` authorization gate;
 - uses the same egress-bound runtime fetch;
 - skips the approval grant;
 - skips Mastra's approval pause on the standard agent path;
@@ -141,6 +143,18 @@ A write, destructive, or idempotent-write connector cannot opt into Mastra backg
 
 The wrapper also rejects direct or passthrough `_background` overrides on connectors that did not opt in. Core may strip that field on schema-controlled agent paths; its own tool eligibility keeps the connector foreground there.
 
+### `requiredPermissions`
+
+Authorization and approval answer different questions: authorization asks whether this principal may ever invoke the connector, approval asks whether this particular proposed call may proceed now.
+
+A declared list uses all-of semantics over canonical `Permission` identifiers (lowercase dotted form). Construction rejects a non-array, an empty list, duplicates, and malformed identifiers.
+
+Every real call and every dry-run then requires the trusted `breakwater.principalPermissions` projection — `{ permissions, policyVersion }`, validated by `isPrincipalPermissions()` — to contain every listed identifier. The gate runs before the dry-run branch and before the approval grant, so a valid approval cannot elevate a principal that is not authorized to invoke the connector at all. A missing, `null`, or malformed projection fails closed.
+
+Only trusted host or runtime code may mint the projection. Flowsafe's agent thread host derives it from its configured `PrincipalPermissionResolver` on every start and resume leg; a workflow host may return the key from its own `RequestContextProvider`. A path that mints no projection denies every permission-declaring connector.
+
+Authorization audit records the required identifiers and the resolution's `policyVersion`, never the principal's effective permission set. Avoid hard-coding human role names into manifests; permissions keep the connector reusable across hosts and service principals.
+
 ## Deployment policy
 
 ```typescript
@@ -163,6 +177,7 @@ The connector definition binds these values once. `fetch` is the underlying HTTP
 schema validation
   -> declared egress against organization allowlist
   -> custom evaluators in registration order
+  -> required permissions against the trusted projection
   -> dry-run branch
   -> approval grant
   -> idempotency reservation or replay
@@ -219,9 +234,9 @@ Inject `runtime.fetch` into compatible SDKs. Apply infrastructure network policy
 
 ## Approval context
 
-`breakwater.connectorGrants` is a structured capability array in Mastra’s `RequestContext`. `breakwater.connectorExecution` identifies the current runtime leg. Whoever can write either value can affect authorization, so only trusted runtime code may populate them.
+`breakwater.connectorGrants` is a structured capability array in Mastra's `RequestContext`. `breakwater.connectorExecution` identifies the current runtime leg. `breakwater.principalPermissions` carries the executing principal's server-resolved permissions for the `requiredPermissions` gate. Whoever can write any of these values can affect authorization, so only trusted runtime code may populate them.
 
-Flowsafe’s approval provider reads approved D1 records and derives grants for each runtime leg. A public resume body, signal, model output, workflow input, tool result, schedule row, or background task cannot supply either key.
+Flowsafe's approval provider reads approved D1 records and derives grants for each runtime leg, and its agent thread host projects the permission resolution the same way. A public resume body, signal, model output, workflow input, tool result, schedule row, or background task cannot supply any of these keys.
 
 Breakwater supports three explicit scopes:
 
@@ -321,13 +336,14 @@ At minimum, test:
 1. permitted execution;
 2. declaration egress denial;
 3. actual fetch denial, including redirect;
-4. approval denial and grant success;
-5. dry-run with zero side effects;
-6. idempotent replay and concurrent callers;
-7. rate-limit boundary;
-8. missing tenant scope in a multi-tenant host;
-9. workflow target mismatch where relevant;
-10. audit safety for arbitrary throws;
-11. packed npm consumer behavior.
+4. required-permission denial without a valid projection, where declared;
+5. approval denial and grant success;
+6. dry-run with zero side effects;
+7. idempotent replay and concurrent callers;
+8. rate-limit boundary;
+9. missing tenant scope in a multi-tenant host;
+10. workflow target mismatch where relevant;
+11. audit safety for arbitrary throws;
+12. packed npm consumer behavior.
 
 For Agent CLIs, also read [Agent CLI connectors](agent-cli-connectors.md).

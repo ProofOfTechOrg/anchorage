@@ -33,6 +33,8 @@ export {
   type AutomatedEntryRequest,
   type BoundThreadAgent,
   createThreadAgentHost,
+  type PrincipalPermissionResolution,
+  type PrincipalPermissionResolver,
   type ThreadAgentHost,
   type ThreadAgentHostOptions,
   type ThreadAgentStartInput,
@@ -60,5 +62,7 @@ export type {
   AgentModuleCatalog,
   AgentRunEnvelope,
   AutomationCheck,
+  Permission,
   TrustedAgentExecution,
 } from './types.js';
+export { isPermissionIdentifier } from './types.js';

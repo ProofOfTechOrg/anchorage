@@ -60,7 +60,7 @@ Only terminal records are eligible for approval retention. An old open request i
 
 The HTTP create route is disabled by default. If a host enables it, the router rejects every field that could select a capability, change attribution, or choose a resume target. An HTTP-created request can collect a human decision, but cannot mint a connector grant.
 
-Do not derive a workflow suspension’s `connectors` array from workflow input, model output, signal attributes, or another client-controlled value. Durable-agent `toolName` and `toolCallId` come from Mastra’s persisted approval payload in one of its two supported shapes.
+Do not derive a workflow suspension's `connectors` array from workflow input, model output, signal attributes, or another client-controlled value. Durable-agent `toolName` and `toolCallId` come from Mastra's persisted approval payload in one of its two supported shapes.
 
 ## Derive grants from stored decisions
 
@@ -74,13 +74,13 @@ Do not derive a workflow suspension’s `connectors` array from workflow input, 
 
 This pairing keeps multiple suspensions of the same step distinct even when their millisecond timestamps collide. An older approval is spent when the step suspends again.
 
-A durable-agent approval also binds the connector’s Mastra `toolCallId`. Mastra persists that ID in the durable tool-call input and reproduces it in `context.agent.toolCallId` after resume or Durable Object reconstruction. The grant scope is `tool-call`.
+A durable-agent approval also binds the connector's Mastra `toolCallId`. Mastra persists that ID in the durable tool-call input and reproduces it in `context.agent.toolCallId` after resume or Durable Object reconstruction. The grant scope is `tool-call`.
 
 An arbitrary workflow gate has no reproducible tool-call identity. Its grant scope is `suspension`, which uses the exact leg fields above. A trusted host can create an explicit `runScoped` record for `run` scope. A step-less record without `runScoped: true` mints nothing. The suspend bridge never creates run-scoped grants.
 
 The provider writes the structured grants to `breakwater.connectorGrants`. `RunnerRuntime` writes the current leg to `breakwater.connectorExecution`. Neither value crosses the public API in a resume payload. Missing scope, legacy connector ID arrays, and malformed records fail closed.
 
-Retries of the same durable tool call reuse `toolCallId` and remain authorized. A new model tool call receives a new ID and requires approval. The grant does not make retries idempotent; configure the connector’s idempotency policy when duplicate side effects are unsafe.
+Retries of the same durable tool call reuse `toolCallId` and remain authorized. A new model tool call receives a new ID and requires approval. The grant does not make retries idempotent; configure the connector's idempotency policy when duplicate side effects are unsafe.
 
 ## Enforce separation of duties
 
