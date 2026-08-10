@@ -9,7 +9,10 @@ import type {
   ApprovalStreamEvent,
   ApprovalStreamSink,
 } from './contract.js';
-import type { AutomatedExecutionPrincipal } from './principal.js';
+import {
+  type AutomatedExecutionPrincipal,
+  trustAutomationPrincipal,
+} from './principal.js';
 import {
   ApprovalAuthzError,
   ApprovalConflictError,
@@ -19,9 +22,8 @@ import {
   sweepSLA,
   UnknownApprovalError,
 } from './service.js';
-import type { InMemoryApprovalStore } from './store.js';
-import type { SystemApprovalStore } from './tenant-brand.js';
-import { InMemoryApprovalStoreFactory } from './tenant-store.js';
+import type { ApprovalStore, InMemoryApprovalStore } from './store.js';
+import { InMemoryApprovalStoreFactory } from './store-factory.js';
 import {
   type ApprovalRecord,
   type CreateApprovalInput,
@@ -29,25 +31,22 @@ import {
   MAX_APPROVAL_LIST_LIMIT,
 } from './types.js';
 
-const ADMIN: ApprovalActor = { id: 'ada', role: 'admin', tenantId: 'acme' };
+const ADMIN: ApprovalActor = { id: 'ada', role: 'admin' };
 const SWEEP_PRINCIPAL: AutomatedExecutionPrincipal = {
   kind: 'system',
   id: 'sweeper',
-  tenantId: 'system',
   purpose: 'approval-sla-maintenance',
 };
 
 const OPERATOR: ApprovalActor = {
   id: 'opal',
   role: 'operator',
-  tenantId: 'acme',
 };
 const REVIEWER: ApprovalActor = {
   id: 'ray',
   role: 'reviewer',
-  tenantId: 'acme',
 };
-const VIEWER: ApprovalActor = { id: 'vic', role: 'viewer', tenantId: 'acme' };
+const VIEWER: ApprovalActor = { id: 'vic', role: 'viewer' };
 
 const T0 = Date.parse('2026-07-06T12:00:00.000Z');
 
@@ -62,7 +61,7 @@ interface Harness {
 
 function makeHarness(options: Partial<ApprovalServiceOptions> = {}): Harness {
   const backend = new InMemoryApprovalStoreFactory();
-  const store = backend.forTenant('acme') as InMemoryApprovalStore;
+  const store = backend.store() as InMemoryApprovalStore;
   const events: ApprovalAuditEvent[] = [];
   let nowMs = T0;
   const service = new ApprovalService({
@@ -86,10 +85,16 @@ function makeHarness(options: Partial<ApprovalServiceOptions> = {}): Harness {
 function input(
   overrides: Partial<CreateApprovalInput> = {},
 ): CreateApprovalInput {
+  const pairedRequesterKind =
+    overrides.requestedBy !== undefined &&
+    overrides.requestedByKind === undefined
+      ? ({ requestedByKind: 'human' } as const)
+      : {};
   return {
     workflowId: 'wf',
     runId: 'acme_run-1',
     title: 'publish launch post',
+    ...pairedRequesterKind,
     ...overrides,
   };
 }
@@ -115,7 +120,7 @@ function runSweep(
     stream?: ApprovalStreamSink;
   } = {},
 ): Promise<ApprovalRecord[]> {
-  return sweepSLA(harness.backend.system(), {
+  return sweepSLA(harness.backend.store(), {
     systemPrincipal: SWEEP_PRINCIPAL,
     audit: (event) => harness.events.push(event),
     onEscalation: options.onEscalation,
@@ -126,7 +131,7 @@ function runSweep(
 }
 
 describe('ApprovalService.create', () => {
-  it('accepts a tenant-owned trusted resume target only through the server seam', async () => {
+  it('accepts a path-safe trusted resume target only through the server seam', async () => {
     const harness = makeHarness();
     const target = {
       kind: 'thread' as const,
@@ -140,17 +145,29 @@ describe('ApprovalService.create', () => {
     expect(record.resumeTarget).not.toBe(target);
   });
 
-  it('rejects a trusted resume target containing a foreign memory id', async () => {
+  it('accepts another host-minted path-safe memory id', async () => {
+    const harness = makeHarness();
+    const created = await harness.service.create(input(), OPERATOR, {
+      kind: 'thread',
+      threadId: 'globex_thread-1',
+    });
+    expect(created.record.resumeTarget).toEqual({
+      kind: 'thread',
+      threadId: 'globex_thread-1',
+    });
+  });
+
+  it('rejects a path-unsafe trusted resume target', async () => {
     const harness = makeHarness();
     await expect(
       harness.service.create(input(), OPERATOR, {
         kind: 'thread',
-        threadId: 'globex_thread-1',
+        threadId: 'bad/thread',
       }),
     ).rejects.toBeInstanceOf(InvalidApprovalInputError);
   });
 
-  it('accepts an agent-thread target only with a same-tenant valid principal', async () => {
+  it('accepts an agent-thread target only with a valid principal and ids', async () => {
     const harness = makeHarness();
     const target = {
       kind: 'agent-thread' as const,
@@ -160,7 +177,6 @@ describe('ApprovalService.create', () => {
       principal: {
         kind: 'human' as const,
         id: 'starter',
-        tenantId: 'acme',
         role: 'operator' as const,
       },
     };
@@ -168,12 +184,15 @@ describe('ApprovalService.create', () => {
     const { record } = await harness.service.create(input(), OPERATOR, target);
 
     expect(record.resumeTarget).toEqual(target);
-    await expect(
-      harness.service.create(input({ runId: 'acme_run-2' }), OPERATOR, {
+    const cloned = await harness.service.create(
+      input({ runId: 'acme_run-2' }),
+      OPERATOR,
+      {
         ...target,
-        principal: { ...target.principal, tenantId: 'globex' },
-      }),
-    ).rejects.toBeInstanceOf(InvalidApprovalInputError);
+        principal: { ...target.principal },
+      },
+    );
+    expect(cloned.record.resumeTarget).toEqual(target);
     await expect(
       harness.service.create(input({ runId: 'acme_run-3' }), OPERATOR, {
         ...target,
@@ -188,42 +207,33 @@ describe('ApprovalService.create', () => {
     ).rejects.toBeInstanceOf(InvalidApprovalInputError);
   });
 
-  it("rejects a runId that does not carry the store's tenant prefix (INV-1 belt)", async () => {
-    // #given — every read path filters on the tenant_id column, so a foreign
-    // prefix would only orphan a row; the belt makes it a loud error instead
+  it('accepts opaque path-safe runIds and rejects path-unsafe ones', async () => {
     const harness = makeHarness();
 
-    // #when / #then
     await expect(
       harness.service.create(input({ runId: 'bravo_run-1' }), OPERATOR),
-    ).rejects.toBeInstanceOf(InvalidApprovalInputError);
+    ).resolves.toMatchObject({ created: true });
     await expect(
       harness.service.create(input({ runId: 'bare-run' }), OPERATOR),
+    ).resolves.toMatchObject({ created: true });
+    await expect(
+      harness.service.create(input({ runId: 'bad/run' }), OPERATOR),
     ).rejects.toBeInstanceOf(InvalidApprovalInputError);
   });
 
-  it('denies EVERY action to an actor whose tenant differs from the store binding', async () => {
-    // #given — a valid role, wrong tenant: the service-layer INV-2 belt
+  it('authorizes from actor id and role without a tenant claim', async () => {
     const harness = makeHarness();
-    const intruder: ApprovalActor = {
+    const admin: ApprovalActor = {
       id: 'eve',
       role: 'admin',
-      tenantId: 'bravo',
     };
 
-    // #when / #then
-    await expect(
-      harness.service.create(input(), intruder),
-    ).rejects.toBeInstanceOf(ApprovalAuthzError);
-    await expect(harness.service.list({}, intruder)).rejects.toBeInstanceOf(
-      ApprovalAuthzError,
+    await expect(harness.service.create(input(), admin)).resolves.toMatchObject(
+      {
+        created: true,
+      },
     );
-    expect(harness.events).toContainEqual(
-      expect.objectContaining({
-        decision: 'denied',
-        reason: expect.stringContaining('tenant'),
-      }),
-    );
+    await expect(harness.service.list({}, admin)).resolves.toHaveLength(1);
   });
 
   it('creates a pending record with an SLA deadline from slaSeconds', async () => {
@@ -333,7 +343,11 @@ describe('ApprovalService.create', () => {
       // string is not an identity: it matches no actor, yet reads as
       // "attributed" to anything downstream inspecting the record.
       { requestedBy: '' },
+      { requestedBy: ' '.repeat(8) },
+      { requestedBy: 'r'.repeat(201) },
+      { requestedBy: 'requester\nforged' },
       { requestedBy: 42 as unknown as string },
+      { requestedByKind: 'human' },
       // runScoped is a capability switch (mints on every leg of the run), so
       // only a real boolean opts in — never a truthy string from a lax caller.
       { runScoped: 'true' as unknown as boolean },
@@ -346,6 +360,31 @@ describe('ApprovalService.create', () => {
         harness.service.create(input(overrides), OPERATOR),
       ).rejects.toBeInstanceOf(InvalidApprovalInputError);
     }
+  });
+
+  it('rejects a requester id without its principal kind', async () => {
+    const harness = makeHarness();
+
+    await expect(
+      harness.service.create(
+        { ...input(), requestedBy: 'requester' },
+        OPERATOR,
+      ),
+    ).rejects.toThrow(
+      'requestedBy and requestedByKind must be provided together',
+    );
+  });
+
+  it('accepts a requestedBy at the canonical principal-id length limit', async () => {
+    const harness = makeHarness();
+    const requestedBy = 'r'.repeat(200);
+
+    const { record } = await harness.service.create(
+      input({ requestedBy }),
+      OPERATOR,
+    );
+
+    expect(record.requestedBy).toBe(requestedBy);
   });
 
   it('accepts an explicit requestedBy and copies runScoped through', async () => {
@@ -527,7 +566,7 @@ describe('ApprovalService.decide', () => {
     // #given
     const resumeRun = vi.fn().mockResolvedValue({ status: 'success' });
     const harness = makeHarness({ resumeRun });
-    const record = await seedPending(harness);
+    const record = await seedPending(harness, { stepPath: ['approval'] });
 
     // #when
     const result = await harness.service.decide(
@@ -553,7 +592,7 @@ describe('ApprovalService.decide', () => {
     const harness = makeHarness({
       resumeRun: vi.fn().mockRejectedValue(new Error('DO unreachable')),
     });
-    const record = await seedPending(harness);
+    const record = await seedPending(harness, { stepPath: ['approval'] });
 
     // #when
     const result = await harness.service.decide(
@@ -580,7 +619,10 @@ describe('ApprovalService.decide', () => {
     // #given
     const resumeRun = vi.fn().mockResolvedValue({ status: 'success' });
     const harness = makeHarness({ resumeRun });
-    const record = await seedPending(harness);
+    const record = await seedPending(harness, {
+      runScoped: true,
+      connectors: ['blog-publisher'],
+    });
 
     // #when
     const result = await harness.service.decide(
@@ -594,6 +636,60 @@ describe('ApprovalService.decide', () => {
     expect(resumeRun).toHaveBeenCalledWith(
       expect.objectContaining({ decision: 'reject' }),
       'reject',
+    );
+  });
+
+  it.each([
+    'approve',
+    'reject',
+  ] as const)('does not resume a decision-only record after %s', async (decision) => {
+    // #given — this is the exact inert shape the optional HTTP create
+    // route authors: no step binding, explicit run scope, or trusted target.
+    const resumeRun = vi.fn().mockResolvedValue({ status: 'success' });
+    const harness = makeHarness({ resumeRun });
+    const record = await seedPending(harness);
+
+    // #when
+    const result = await harness.service.decide(
+      record.id,
+      { decision },
+      REVIEWER,
+    );
+
+    // #then — the review decision is durable, but attacker-selected run
+    // addressing on a plain queue record never becomes a target call.
+    expect(result.record.status).toBe(
+      decision === 'approve' ? 'approved' : 'rejected',
+    );
+    expect(result.resume).toEqual({ attempted: false });
+    expect(resumeRun).not.toHaveBeenCalled();
+  });
+
+  it('resumes a record carrying a trusted server-authored resume target', async () => {
+    // #given
+    const resumeRun = vi.fn().mockResolvedValue({ status: 'success' });
+    const harness = makeHarness({ resumeRun });
+    const { record } = await harness.service.create(
+      input({ runId: 'acme_agent-run' }),
+      OPERATOR,
+      { kind: 'thread', threadId: 'acme_thread-1' },
+    );
+
+    // #when
+    const result = await harness.service.decide(
+      record.id,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then
+    expect(result.resume).toMatchObject({ attempted: true, ok: true });
+    expect(resumeRun).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: record.id,
+        resumeTarget: { kind: 'thread', threadId: 'acme_thread-1' },
+      }),
+      'approve',
     );
   });
 
@@ -633,6 +729,52 @@ describe('ApprovalService.decide', () => {
     await expect(
       harness.service.decide(record.id, { decision: 'approve' }, VIEWER),
     ).rejects.toBeInstanceOf(ApprovalAuthzError);
+  });
+
+  it('uses one canonical actor snapshot across awaited store operations', async () => {
+    const harness = makeHarness();
+    const record = await seedPending(harness);
+    const source: ApprovalActor = { id: 'ray', role: 'reviewer' };
+    const mutableSource = source as {
+      id: string;
+      role: ApprovalActor['role'];
+    };
+    const backing = harness.backend.store();
+    const store: ApprovalStore = {
+      create: (input) => backing.create(input),
+      get: async (id) => {
+        const current = await backing.get(id);
+        mutableSource.id = 'mutated';
+        mutableSource.role = 'admin';
+        return current;
+      },
+      list: (filter) => backing.list(filter),
+      transition: (id, from, patch) => backing.transition(id, from, patch),
+      metrics: (nowMs) => backing.metrics(nowMs),
+      purgeExpired: (cutoffIso, limit) =>
+        backing.purgeExpired(cutoffIso, limit),
+    };
+    const events: ApprovalAuditEvent[] = [];
+    const service = new ApprovalService({
+      store,
+      audit: (event) => events.push(event),
+      now: harness.now,
+    });
+
+    const decided = await service.decide(
+      record.id,
+      { decision: 'approve' },
+      source,
+    );
+
+    expect(decided.record.decidedBy).toBe('ray');
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        actor: { id: 'ray', role: 'reviewer' },
+        action: 'approval.decide',
+        decision: 'allowed',
+      }),
+    );
   });
 });
 
@@ -717,7 +859,7 @@ describe('ApprovalService.sweepSLA', () => {
     );
   });
 
-  it('escalates ALL breached requests across more than one page (>MAX), paging the system view (D3)', async () => {
+  it('escalates ALL breached requests across more than one page (>MAX)', async () => {
     // #given — more breached requests than a single page holds, so the sweep
     // must cursor-page the (un-defaulted) system view instead of one SELECT;
     // pre-D3 this bare list() was unbounded, post-D3 a naive single list would
@@ -738,8 +880,8 @@ describe('ApprovalService.sweepSLA', () => {
     // #then — every breached request escalated, none dropped past the first page
     expect(escalated).toHaveLength(total);
     expect(
-      await harness.backend.system().list({ status: ['escalated'] }),
-    ).toHaveLength(total);
+      await harness.backend.store().get(escalated.at(-1)?.id ?? ''),
+    ).toMatchObject({ status: 'escalated' });
   });
 
   it('is idempotent — a second sweep escalates nothing new', async () => {
@@ -841,12 +983,12 @@ describe('ApprovalService.sweepSLA', () => {
     expect(await runSweep(harness)).toEqual([]);
   });
 
-  it('sweeps ACROSS tenants — the one legitimate cross-tenant write, cron-only', async () => {
-    // #given — breached records under two tenants sharing the backend
+  it('sweeps every breached record in the deployment-wide store', async () => {
+    // #given — two breached records sharing the deployment store
     const harness = makeHarness();
     await seedPending(harness, { slaSeconds: 60 });
     const bravoService = new ApprovalService({
-      store: harness.backend.forTenant('bravo'),
+      store: harness.backend.store(),
       now: harness.now,
     });
     await bravoService.create(
@@ -856,28 +998,21 @@ describe('ApprovalService.sweepSLA', () => {
         title: 'bravo approval',
         slaSeconds: 60,
       },
-      { id: 'opal', role: 'operator', tenantId: 'bravo' },
+      { id: 'opal', role: 'operator' },
     );
     harness.advance(120_000);
 
     // #when
     const escalated = await runSweep(harness);
 
-    // #then — both tenants' breaches escalate, each audit event attributed
-    // to its record's tenant
-    expect(escalated.map((record) => record.tenantId).sort()).toEqual([
-      'acme',
-      'bravo',
+    // #then — both deployment records escalate
+    expect(escalated.map((record) => record.runId).sort()).toEqual([
+      'acme_run-1',
+      'bravo_run-1',
     ]);
-    for (const record of escalated) {
-      expect(harness.events).toContainEqual(
-        expect.objectContaining({
-          action: 'approval.escalate',
-          decision: 'allowed',
-          detail: expect.objectContaining({ tenantId: record.tenantId }),
-        }),
-      );
-    }
+    expect(
+      harness.events.filter((event) => event.action === 'approval.escalate'),
+    ).toHaveLength(2);
   });
 
   it('keeps canonical audit provenance on every event when the source principal mutates during store I/O', async () => {
@@ -888,8 +1023,10 @@ describe('ApprovalService.sweepSLA', () => {
     harness.advance(61_000);
     harness.events.length = 0;
     const source: Record<string, unknown> = { ...SWEEP_PRINCIPAL };
-    const backing = harness.backend.system();
-    const store: SystemApprovalStore = {
+    const backing = harness.backend.store();
+    const store: ApprovalStore = {
+      create: (record) => backing.create(record),
+      get: (id) => backing.get(id),
       list: async (filter) => {
         const records = await backing.list(filter);
         source.kind = 'human';
@@ -898,6 +1035,7 @@ describe('ApprovalService.sweepSLA', () => {
         return records;
       },
       transition: (id, from, patch) => backing.transition(id, from, patch),
+      metrics: (nowMs) => backing.metrics(nowMs),
       purgeExpired: (cutoffIso, limit) =>
         backing.purgeExpired(cutoffIso, limit),
     };
@@ -931,7 +1069,7 @@ describe('ApprovalService.sweepSLA', () => {
     ]);
     for (const event of harness.events) {
       expect(event).toMatchObject({
-        actor: { id: 'sweeper', role: 'viewer', tenantId: 'system' },
+        actor: { id: 'sweeper', role: 'viewer' },
         detail: {
           principalKind: 'system',
           principalId: 'sweeper',
@@ -1014,11 +1152,75 @@ describe('ApprovalService.metrics', () => {
 });
 
 describe('ApprovalService self-approval control', () => {
+  it('distinguishes automated requesters from humans with the same id and treats legacy rows as human', async () => {
+    const harness = makeHarness();
+    const sharedReviewer: ApprovalActor = {
+      id: 'shared-principal',
+      role: 'reviewer',
+    };
+    const automation = trustAutomationPrincipal({
+      kind: 'system',
+      id: sharedReviewer.id,
+      purpose: 'scheduled-workflow-execution',
+    });
+    const automated = await harness.service.createAsPrincipal(
+      input({
+        runId: 'run-automated-origin',
+        requestedBy: sharedReviewer.id,
+        requestedByKind: automation.kind,
+      }),
+      automation,
+    );
+    const human = await harness.service.create(
+      input({
+        runId: 'run-human-origin',
+        requestedBy: sharedReviewer.id,
+      }),
+      OPERATOR,
+    );
+    const legacy: ApprovalRecord = {
+      id: 'legacy-requester-kind',
+      workflowId: 'wf',
+      runId: 'run-legacy-origin',
+      title: 'legacy approval',
+      connectors: [],
+      priority: 'normal',
+      status: 'pending',
+      requestedBy: sharedReviewer.id,
+      createdAt: new Date(T0).toISOString(),
+      updatedAt: new Date(T0).toISOString(),
+    };
+    await harness.store.create(legacy);
+
+    await expect(
+      harness.service.decide(
+        automated.record.id,
+        { decision: 'approve' },
+        sharedReviewer,
+      ),
+    ).resolves.toMatchObject({ record: { status: 'approved' } });
+    await expect(
+      harness.service.decide(
+        human.record.id,
+        { decision: 'approve' },
+        sharedReviewer,
+      ),
+    ).rejects.toBeInstanceOf(ApprovalAuthzError);
+    await expect(
+      harness.service.decide(
+        legacy.id,
+        { decision: 'approve' },
+        sharedReviewer,
+      ),
+    ).rejects.toBeInstanceOf(ApprovalAuthzError);
+  });
+
   it('denies the requester deciding their own request by default', async () => {
     // #given — created by opal; requestedBy defaults to the creating actor
     const harness = makeHarness();
     const record = await seedPending(harness);
     expect(record.requestedBy).toBe('opal');
+    expect(record.requestedByKind).toBe('human');
 
     // #when — opal comes back wearing a decision-capable role
     let caught: unknown;
@@ -1026,7 +1228,7 @@ describe('ApprovalService self-approval control', () => {
       await harness.service.decide(
         record.id,
         { decision: 'approve' },
-        { id: 'opal', role: 'admin', tenantId: 'acme' },
+        { id: 'opal', role: 'admin' },
       );
     } catch (error) {
       caught = error;
@@ -1055,7 +1257,7 @@ describe('ApprovalService self-approval control', () => {
     const result = await harness.service.decide(
       record.id,
       { decision: 'approve' },
-      { id: 'opal', role: 'admin', tenantId: 'acme' },
+      { id: 'opal', role: 'admin' },
     );
 
     // #then — permitted AND the exercised exemption leaves a trail
@@ -1154,13 +1356,13 @@ describe('ApprovalService self-approval control', () => {
 describe('ApprovalService cross-gate separation of duties', () => {
   // The reconcile hole this closes: resumeRunWithRequeue attributes gate B to
   // the gate-A decider (so the requestedBy self-check already bars them), but
-  // reconcileApprovalsForSummary files gate B as the SYSTEM actor — which the
+  // reconcileApprovalsForSummary files gate B as the SYSTEM principal — which the
   // requestedBy check never blocks. The bar below is derived from the run's
   // APPROVED history instead, so it catches BOTH filings.
 
-  it('refuses the gate-A approver at gate B even when gate B is filed by the system actor (reconcile path)', async () => {
+  it('refuses the gate-A approver at gate B even when gate B is filed by the system principal (reconcile path)', async () => {
     // #given — ray approves gate A; the run advances and re-suspends at gate B,
-    // which is reconcile-filed attributed to the system actor (NOT ray)
+    // which is reconcile-filed attributed to the system principal (NOT ray)
     const harness = makeHarness();
     const gateA = await seedPending(harness, {
       runId: 'acme_run-seq',
@@ -1179,7 +1381,7 @@ describe('ApprovalService cross-gate separation of duties', () => {
     );
 
     // #when / #then — ray (who advanced the run at gate A) cannot decide gate B,
-    // even though requestedBy is the system actor, not ray
+    // even though requestedBy is the system principal, not ray
     let caught: unknown;
     try {
       await harness.service.decide(
@@ -1361,7 +1563,6 @@ describe('ApprovalService cross-gate separation of duties', () => {
     for (let index = 0; index < MAX_APPROVAL_LIST_LIMIT; index += 1) {
       await harness.store.create({
         id: `filler-${index}`,
-        tenantId: 'acme',
         workflowId: 'wf',
         runId,
         stepPath: [`filler-${index}`],
@@ -1379,7 +1580,6 @@ describe('ApprovalService cross-gate separation of duties', () => {
     const rayApprovedAt = new Date(T0 + 1000).toISOString();
     await harness.store.create({
       id: 'ray-prior',
-      tenantId: 'acme',
       workflowId: 'wf',
       runId,
       stepPath: ['gateRay'],
@@ -1423,7 +1623,6 @@ describe('ApprovalService cross-gate separation of duties', () => {
     const base = new Date(T0).toISOString();
     await harness.store.create({
       id: 'ray-garbage-prior',
-      tenantId: 'acme',
       workflowId: 'wf',
       runId,
       stepPath: ['gateA'],
@@ -1845,7 +2044,7 @@ describe('ApprovalService audit sink promise containment', () => {
       );
       await seedPending(harness, { slaSeconds: 60, runId: 'acme_run-2' });
       harness.advance(61_000);
-      await sweepSLA(harness.backend.system(), {
+      await sweepSLA(harness.backend.store(), {
         systemPrincipal: SWEEP_PRINCIPAL,
         audit: () => Promise.reject(new Error('siem down')),
         now: harness.now,
@@ -1861,18 +2060,12 @@ describe('ApprovalService audit sink promise containment', () => {
   });
 
   it.each([
-    [
-      'a human principal',
-      { kind: 'human', id: 'ada', tenantId: 'system', role: 'admin' },
-    ],
-    [
-      'a principal with no purpose',
-      { kind: 'system', id: 'sweeper', tenantId: 'system' },
-    ],
+    ['a human principal', { kind: 'human', id: 'ada', role: 'admin' }],
+    ['a principal with no purpose', { kind: 'system', id: 'sweeper' }],
     ['a non-object', 'sweeper'],
   ])('refuses to sweep on behalf of %s', async (_label, principal) => {
-    // #given — the sweep writes across EVERY tenant, so a bad attribution
-    // identity makes every escalation it emits unattributable. The type
+    // #given — the sweep can write every overdue record in the deployment, so
+    // a bad identity makes every escalation it emits unattributable. The type
     // excludes a human; this is the erased-type half.
     const harness = makeHarness();
     await seedPending(harness, { slaSeconds: 60 });
@@ -1880,7 +2073,7 @@ describe('ApprovalService audit sink promise containment', () => {
 
     // #when / #then — refused before any store write, so nothing escalates.
     await expect(
-      sweepSLA(harness.backend.system(), {
+      sweepSLA(harness.backend.store(), {
         systemPrincipal: principal as unknown as AutomatedExecutionPrincipal,
         audit: (event) => harness.events.push(event),
         now: harness.now,
@@ -1973,6 +2166,38 @@ describe('ApprovalService.decideBatch', () => {
       comment: 'triage sweep',
     });
     expect(result.results[0]?.resume).toEqual({ attempted: false });
+  });
+
+  it('resumes only records with trusted resumability provenance in a batch', async () => {
+    // #given — one inert decision record and one suspension-bound record.
+    const resumeRun = vi.fn().mockResolvedValue({ status: 'success' });
+    const harness = makeHarness({ resumeRun });
+    const inert = await seedPending(harness, { runId: 'acme_run-inert' });
+    const stepBound = await seedPending(harness, {
+      runId: 'acme_run-bound',
+      stepPath: ['approval'],
+    });
+
+    // #when
+    const result = await harness.service.decideBatch(
+      [inert.id, stepBound.id],
+      { decision: 'approve' },
+      REVIEWER,
+    );
+
+    // #then
+    expect(result.decided).toBe(2);
+    expect(result.failed).toBe(0);
+    expect(result.results[0]?.resume).toEqual({ attempted: false });
+    expect(result.results[1]?.resume).toMatchObject({
+      attempted: true,
+      ok: true,
+    });
+    expect(resumeRun).toHaveBeenCalledTimes(1);
+    expect(resumeRun).toHaveBeenCalledWith(
+      expect.objectContaining({ id: stepBound.id }),
+      'approve',
+    );
   });
 
   it('inherits the role-scoped self-decision exemption per record', async () => {
@@ -2135,15 +2360,12 @@ describe('ApprovalService.decideBatch', () => {
     expect(result.failed).toBe(0);
   });
 
-  it("reads another tenant's id as not-found with no content leak", async () => {
-    // #given — a foreign-tenant record in the SAME shared backend (INV-2)
+  it('decides records created through another deployment-store alias', async () => {
+    // #given — another alias over the same deployment-wide backend
     const harness = makeHarness();
-    const rivalStore = harness.backend.forTenant(
-      'bravo',
-    ) as InMemoryApprovalStore;
+    const rivalStore = harness.backend.store() as InMemoryApprovalStore;
     const { record: rival } = await rivalStore.create({
       id: 'rival-1',
-      tenantId: 'bravo',
       workflowId: 'wf',
       runId: 'bravo_run-1',
       title: 'RIVAL SECRET TITLE',
@@ -2162,14 +2384,10 @@ describe('ApprovalService.decideBatch', () => {
       REVIEWER,
     );
 
-    // #then — foreign id behaves exactly like an unknown id, leaks nothing,
-    // and the foreign record is untouched
-    expect(result.decided).toBe(1);
-    expect(result.results[1]).toMatchObject({ ok: false, code: 'not-found' });
-    expect(JSON.stringify(result.results[1])).not.toContain(
-      'RIVAL SECRET TITLE',
-    );
-    expect((await rivalStore.get(rival.id))?.status).toBe('pending');
+    // #then — both records belong to this deployment
+    expect(result.decided).toBe(2);
+    expect(result.failed).toBe(0);
+    expect((await rivalStore.get(rival.id))?.status).toBe('approved');
   });
 
   it('emits one approval.decide.batch summary audit event with tallies', async () => {

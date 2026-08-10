@@ -21,12 +21,12 @@ export const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
   },
 ];
 
-export function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
+export function defineWorkflows(env: Env): RunnerRuntime {
   const { createStep, createWorkflow, runtime } = init(
     { storage: createComposedStorage(env.DB) },
     {
       requestContextForRun: approvalGrantProvider(
-        approvalStoreFactoryFor(env.DB).forTenant(tenantId),
+        approvalStoreFactoryFor(env.DB).store(),
       ),
     },
   );

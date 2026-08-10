@@ -2,10 +2,10 @@
 
 import { DURABLE_AGENTIC_LOOP_WORKFLOW_ID } from '../agent-runner/index.js';
 import {
+  type ActorContext,
   type ApprovalRecord,
   type ExecutionPrincipal,
   samePrincipal,
-  type TenantContext,
 } from '../approval-api/index.js';
 import type { ResumeRunFn } from '../host-kit/index.js';
 import { createAgentCatalog } from './catalog.js';
@@ -17,14 +17,14 @@ export interface AgentApprovalResumerOptions {
   agents: readonly AgentMeta[];
   topology: AgentThreadTopology;
   /**
-   * Builds the tenant context the resume runs under, from the STORED principal.
+   * Builds the actor context the resume runs under, from the stored principal.
    * It must return that principal unchanged; createAgentApprovalResumer
    * enforces that with an exact comparison after calling this.
    */
-  tenantForPrincipal: (
+  contextForPrincipal: (
     principal: ExecutionPrincipal,
     record: ApprovalRecord,
-  ) => TenantContext | Promise<TenantContext>;
+  ) => ActorContext | Promise<ActorContext>;
 }
 
 export type AgentApprovalResumer = ResumeRunFn;
@@ -73,22 +73,17 @@ export function createAgentApprovalResumer(
         `principal kind '${principal.kind}' may no longer resume agent '${target.agentId}'`,
       );
     }
-    if (principal.tenantId !== record.tenantId || principal.id.trim() === '') {
-      throw new Error(
-        'agent approval principal does not match the record tenant',
-      );
+    if (principal.id.trim() === '') {
+      throw new Error('agent approval principal is invalid');
     }
 
-    const tenant = await options.tenantForPrincipal(principal, record);
-    if (
-      tenant.tenantId !== record.tenantId ||
-      !samePrincipal(tenant.principal, principal)
-    ) {
+    const context = await options.contextForPrincipal(principal, record);
+    if (!samePrincipal(context.principal, principal)) {
       throw new Error(
-        'tenantForPrincipal must preserve the stored agent execution principal exactly',
+        'contextForPrincipal must preserve the stored agent execution principal exactly',
       );
     }
-    const envelope = await options.topology.resume(tenant, record, decision);
+    const envelope = await options.topology.resume(context, record, decision);
     if (
       envelope.agentId !== target.agentId ||
       envelope.threadId !== target.threadId ||

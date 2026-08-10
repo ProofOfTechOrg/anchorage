@@ -21,49 +21,20 @@
 
 export type DemoRole = 'admin' | 'builder' | 'operator' | 'reviewer' | 'viewer';
 
-/**
- * The one tenant every demo identity shares. RBAC and separation-of-duties
- * are only clickable when the approver can SEE the requester's record, so the
- * demo actors must be co-tenants; INV-3-valid (^[a-z0-9]{3,32}$) so
- * parseActorTokens admits them.
- */
-export const DEMO_TENANT_ID = 'demo';
-
 export interface DemoActor {
   /** Bearer token presented as `Authorization: Bearer <token>`. */
   token: string;
   /** The actor id the approval queue attributes decisions to (also the UI label). */
   id: string;
   role: DemoRole;
-  tenantId: string;
 }
 
 export const DEMO_ACTORS: readonly DemoActor[] = [
-  { token: 'demo-admin', id: 'admin', role: 'admin', tenantId: DEMO_TENANT_ID },
-  {
-    token: 'demo-builder',
-    id: 'builder',
-    role: 'builder',
-    tenantId: DEMO_TENANT_ID,
-  },
-  {
-    token: 'demo-operator',
-    id: 'operator',
-    role: 'operator',
-    tenantId: DEMO_TENANT_ID,
-  },
-  {
-    token: 'demo-reviewer',
-    id: 'reviewer',
-    role: 'reviewer',
-    tenantId: DEMO_TENANT_ID,
-  },
-  {
-    token: 'demo-viewer',
-    id: 'viewer',
-    role: 'viewer',
-    tenantId: DEMO_TENANT_ID,
-  },
+  { token: 'demo-admin', id: 'admin', role: 'admin' },
+  { token: 'demo-builder', id: 'builder', role: 'builder' },
+  { token: 'demo-operator', id: 'operator', role: 'operator' },
+  { token: 'demo-reviewer', id: 'reviewer', role: 'reviewer' },
+  { token: 'demo-viewer', id: 'viewer', role: 'viewer' },
 ];
 
 /** The demo actors serialized into the APPROVAL_ACTOR_TOKENS wire shape. */
@@ -72,7 +43,7 @@ export function demoActorTokensJson(): string {
     Object.fromEntries(
       DEMO_ACTORS.map((actor) => [
         actor.token,
-        { id: actor.id, role: actor.role, tenantId: actor.tenantId },
+        { id: actor.id, role: actor.role },
       ]),
     ),
   );

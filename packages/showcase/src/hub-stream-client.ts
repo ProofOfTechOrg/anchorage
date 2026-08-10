@@ -20,7 +20,7 @@ export interface StreamAddress {
 }
 
 export interface ShowcaseStreamTickets {
-  /** Mint + shape the tenant hub (queue) channel address. */
+  /** Mint + shape the deployment hub (queue) channel address. */
   hubTicket: () => Promise<StreamAddress>;
   /** Mint + shape a per-run channel address (the server returns the wf-qualified url). */
   runTicket: (workflowId: string, runId: string) => Promise<StreamAddress>;

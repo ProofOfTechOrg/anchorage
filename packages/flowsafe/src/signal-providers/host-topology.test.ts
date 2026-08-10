@@ -1,21 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it, vi } from 'vitest';
 
-import type { TenantContext } from '../approval-api/index.js';
 import {
   createSignalProviderHostTopology,
+  SIGNAL_PROVIDER_HOST_INSTANCE_NAME,
   type SignalProviderHostNamespaceLike,
 } from './host-topology.js';
 
-function tenant(tenantId = 'acme', actorTenantId = tenantId): TenantContext {
-  return {
-    tenantId,
-    actor: { id: 'operator-1', role: 'operator', tenantId: actorTenantId },
-  } as TenantContext;
-}
+const DEPLOYMENT_IDENTITY_SECRET = 'test-deployment-identity-secret-0001';
 
 describe('createSignalProviderHostTopology', () => {
-  it('addresses only the authenticated tenant and sends the internal arm command', async () => {
+  it('addresses the deployment singleton and sends the internal arm command', async () => {
     const fetch = vi
       .fn()
       .mockResolvedValue(new Response('not parsed', { status: 200 }));
@@ -26,56 +21,55 @@ describe('createSignalProviderHostTopology', () => {
       get,
     };
 
-    await createSignalProviderHostTopology(namespace).reconcilePolling(
-      tenant(),
+    await createSignalProviderHostTopology(
+      namespace,
+      DEPLOYMENT_IDENTITY_SECRET,
+    ).reconcilePolling();
+
+    expect(idFromName).toHaveBeenCalledWith(SIGNAL_PROVIDER_HOST_INSTANCE_NAME);
+    expect(get).toHaveBeenCalledWith(
+      `id:${SIGNAL_PROVIDER_HOST_INSTANCE_NAME}`,
     );
-
-    expect(idFromName).toHaveBeenCalledWith('acme');
-    expect(get).toHaveBeenCalledWith('id:acme');
-    expect(fetch).toHaveBeenCalledWith('http://provider-host/arm', {
-      method: 'POST',
-    });
-  });
-
-  it.each([
-    ['malformed tenant', tenant('Bad_Name')],
-    ['reserved tenant', tenant('system')],
-    ['actor mismatch', tenant('acme', 'globex')],
-  ])('refuses %s before addressing a namespace', async (_label, context) => {
-    const idFromName = vi.fn((name: string) => name);
-    const get = vi.fn(() => ({
-      fetch: () => Promise.resolve(new Response(null, { status: 204 })),
-    }));
-    const topology = createSignalProviderHostTopology({ idFromName, get });
-
-    await expect(topology.reconcilePolling(context)).rejects.toThrow();
-    expect(idFromName).not.toHaveBeenCalled();
-    expect(get).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledWith(
+      'http://provider-host/arm',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({
+          'x-flowsafe-deployment-identity': DEPLOYMENT_IDENTITY_SECRET,
+        }),
+      }),
+    );
   });
 
   it('rejects a non-success host response without parsing its body', async () => {
-    const topology = createSignalProviderHostTopology({
-      idFromName: (name: string) => name,
-      get: () => ({
-        fetch: () =>
-          Promise.resolve(new Response('private host detail', { status: 503 })),
-      }),
-    });
-
-    await expect(topology.reconcilePolling(tenant())).rejects.toThrow(
-      'status 503',
+    const topology = createSignalProviderHostTopology(
+      {
+        idFromName: (name: string) => name,
+        get: () => ({
+          fetch: () =>
+            Promise.resolve(
+              new Response('private host detail', { status: 503 }),
+            ),
+        }),
+      },
+      DEPLOYMENT_IDENTITY_SECRET,
     );
+
+    await expect(topology.reconcilePolling()).rejects.toThrow('status 503');
   });
 
   it('propagates a host fetch failure', async () => {
-    const topology = createSignalProviderHostTopology({
-      idFromName: (name: string) => name,
-      get: () => ({
-        fetch: () => Promise.reject(new Error('host unavailable')),
-      }),
-    });
+    const topology = createSignalProviderHostTopology(
+      {
+        idFromName: (name: string) => name,
+        get: () => ({
+          fetch: () => Promise.reject(new Error('host unavailable')),
+        }),
+      },
+      DEPLOYMENT_IDENTITY_SECRET,
+    );
 
-    await expect(topology.reconcilePolling(tenant())).rejects.toThrow(
+    await expect(topology.reconcilePolling()).rejects.toThrow(
       'host unavailable',
     );
   });

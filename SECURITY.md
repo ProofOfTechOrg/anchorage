@@ -28,22 +28,26 @@ including:
 - approval authorization, separation of duties, batch decisions, live-stream
   tickets, suspension binding, forged-resume rejection, and server-only resume
   targets;
-- tenant ownership of workflow runs, agent memory, thread Durable Objects,
-  signals, goals, schedules, provider subscriptions, notifications, background
-  tasks, artifacts, retention, and offboarding purge;
+- deployment binding and sentinel verification, internal Durable Object caller
+  authentication, per-principal authorization for workflow runs, agent memory,
+  signals, goals, schedules, and artifacts, resource-bound authorization for
+  provider subscriptions, and trusted-entry controls for notifications,
+  background tasks, retention, and deployment decommissioning;
 - webhook signature verification, stored request-context barriers, unattended
   run caps, and any path that lets untrusted input mint a capability.
 
-**Tenant isolation is the highest-value target.** Any path that lets one
-tenant read, write, enumerate, resume, or purge another tenant's runs,
-approvals, grants, memory, schedules, signals, subscriptions, notifications,
-background tasks, artifacts, connector replay cache, or rate-limit budget is
-critical. This includes a run ID or memory ID that reaches a store without its
-tenant prefix, a query that loses its tenant predicate, or a system-wide store
-escaping a maintenance path into a request handler. The invariants and trust
-boundaries are stated in
-[`docs/security-threat-model.md`](docs/security-threat-model.md), including the
-tenant-to-tenant boundary, tenant invariants, and audit schema.
+**Physical deployment isolation is the highest-value target.** Any path that
+lets one organization's Worker reach another organization's D1 data, Durable
+Objects, R2 artifacts, queues, secrets, connector replay cache, or rate-limit
+budget is critical. This includes accepting a mismatched or malformed
+deployment sentinel, adopting a non-empty unowned database, accepting a
+Worker-to-Durable-Object call without the target deployment's internal
+credential, or routing more than one organization into the same data-plane
+resource set. A path that lets one principal read, write, enumerate, resume, or
+delete another principal's protected resource without its documented role is
+also in scope. The physical deployment boundary, resource-authorization
+invariants, provisioning rules, and audit attribution are stated in
+[`docs/security-threat-model.md`](docs/security-threat-model.md).
 
 Out of scope: vulnerabilities in Mastra itself (report upstream at
 [mastra-ai/mastra](https://github.com/mastra-ai/mastra)), and issues

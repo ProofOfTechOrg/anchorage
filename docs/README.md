@@ -3,7 +3,7 @@
 Anchorage is a pair of open-source packages for Mastra applications on Cloudflare:
 
 - **breakwater** enforces policy at agent and connector boundaries.
-- **flowsafe** runs workflows and agents durably, turns suspensions into human approvals, and keeps long-running state tenant-safe.
+- **flowsafe** runs workflows and agents durably, turns suspensions into human approvals, and verifies physically isolated deployment state.
 
 Start with the task you need to complete. The generated API reference is useful after you understand the lifecycle and trust boundaries.
 
@@ -31,17 +31,17 @@ Start with the task you need to complete. The generated API reference is useful 
 | Topic | What it covers |
 | --- | --- |
 | [Approval system](approval-system.md) | Queue lifecycle, REST API, separation of duties, grant derivation, live UI, and failure recovery |
-| [Flowsafe architecture](flowsafe-architecture.md) | Components, tenant boundaries, storage, and host composition |
-| [Durable Object runner](do-runner-design.md) | Run identity, D1 snapshots, restart behavior, concurrency, retention, and offboarding |
+| [Flowsafe architecture](flowsafe-architecture.md) | Components, deployment boundaries, storage, and host composition |
+| [Durable Object runner](do-runner-design.md) | Run identity, D1 snapshots, restart behavior, concurrency, retention, and decommissioning |
 | [Durable agents](durable-agents.md) | Threads, memory, signals, goals, schedules, background tasks, providers, and restart resume |
-| [Agent-memory tenancy](agent-memory-tenancy.md) | Tenant-minted thread/resource ids, host rejection, recall isolation, and TTL |
+| [Agent memory isolation](agent-memory-isolation.md) | Opaque thread ids, validated resource keys, deployment verification, recall isolation, and TTL |
 
 ## Deploy and operate
 
 | Topic | What it covers |
 | --- | --- |
 | [Deployment reference](deployment-reference.md) | Baseline and advanced host choices, bindings, secrets, routes, and scheduled duties |
-| [Operations runbook](operations-runbook.md) | Local validation, production checks, retention, offboarding, and incident response |
+| [Operations runbook](operations-runbook.md) | Local validation, production checks, retention, decommissioning, and incident response |
 | [Security threat model](security-threat-model.md) | Assets, trust boundaries, controls, residual risks, and deployment obligations |
 | [Observability and quality](observability-and-quality.md) | Audit, metrics, notifications, SIEM export, and repository gates |
 
@@ -65,4 +65,4 @@ Start with the task you need to complete. The generated API reference is useful 
 - [Changelog: breakwater](../packages/breakwater/CHANGELOG.md)
 - [Changelog: flowsafe](../packages/flowsafe/CHANGELOG.md)
 
-Documents under [`proposals/`](proposals/) describe uncommitted ideas. They are not supported product behavior. Shipped behavior is documented in the guides above and in exported types.
+Documents under [`proposals/`](proposals/) are design records with an explicit status. Shipped behavior is documented in the guides above and in exported types.

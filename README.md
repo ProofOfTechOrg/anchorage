@@ -1,6 +1,6 @@
 # Anchorage
 
-Anchorage adds enforceable guardrails, durable approvals, and tenant-safe long-running execution to [Mastra](https://mastra.ai) on Cloudflare.
+Anchorage adds enforceable guardrails, durable approvals, and physically isolated long-running execution to [Mastra](https://mastra.ai) on Cloudflare.
 
 [![CI](https://github.com/ProofOfTechOrg/anchorage/actions/workflows/ci.yml/badge.svg)](https://github.com/ProofOfTechOrg/anchorage/actions/workflows/ci.yml)
 [![npm: breakwater](https://img.shields.io/npm/v/%40proofoftech%2Fbreakwater?label=breakwater)](https://www.npmjs.com/package/@proofoftech/breakwater)
@@ -16,10 +16,10 @@ Mastra supplies the agent and workflow runtime. Anchorage adds the controls that
 - Every side-effecting connector declares its permissions, then enforces egress, approval, idempotency, dry-run, rate-limit, and isolation policy at the tool boundary.
 - Runs suspend without keeping compute alive, survive Worker and Durable Object restarts, and resume from authoritative D1 snapshots.
 - Approval grants are derived from stored decisions and bound to the exact suspension. A client cannot mint a capability by forging a resume body.
-- Tenant identity is carried through run, thread, memory, schedule, task, subscription, notification, artifact, and approval storage.
+- Each organization runs in its own Worker, D1 database, and Durable Object namespaces. A strict deployment sentinel and internal caller credential fail closed on database or object-binding drift.
 - Structured audit events can feed metrics, Cloudflare Queues, and a SIEM.
 
-Use Anchorage when you already use Mastra and Cloudflare, and your agents perform writes, need human review, run for a long time, accept signals, or operate across tenants.
+Use Anchorage when you already use Mastra and Cloudflare, and your agents perform writes, need human review, run for a long time, or accept signals. Deploy one Flowsafe data plane per organization.
 
 Anchorage is not a model provider, identity provider, hosted SaaS, generic process sandbox, or complete network perimeter. You provide authentication and deployment policy. Socket-level egress control still belongs in your infrastructure.
 
@@ -32,7 +32,8 @@ Anchorage is not a model provider, identity provider, hosted SaaS, generic proce
 
 Both packages are ESM-only, require Node 22 or later, and declare
 `@mastra/core` `^1.50.0` as their peer range. React 18 or 19 is needed only
-for the optional flowsafe approval UI.
+for the optional flowsafe approval UI. The optional `flowsafe-provision` CLI
+requires a consumer-installed Wrangler `>=4 <5` peer.
 
 ## Start with breakwater
 
@@ -150,7 +151,7 @@ The full path from install to first approval is in [`docs/getting-started.md`](d
 - Permission manifests for side effects, declared egress, approval, idempotency, dry-run, background eligibility, and fixed-window rate limits
 - Per-hop egress enforcement for calls made through the injected connector runtime, including redirect checks and cross-origin credential stripping
 - In-memory and D1-backed idempotency and rate-limit stores
-- Workflow and tenant isolation evaluators
+- Workflow and opaque isolation-scope evaluators
 - Approval-gated Claude Code and Codex connectors with argv separation, bounded execution, dry-run previews, and safe diagnostics
 - Structured audit sinks, metrics adapters, and sink fan-out
 
@@ -160,8 +161,8 @@ The full path from install to first approval is in [`docs/getting-started.md`](d
 - CAS-guarded approval claim, decision, delegation, batch decision, SLA escalation, and notification
 - Separation of duties across repeated gates and exact suspension-bound grant derivation
 - Styling-library-agnostic React 18/19 dashboard, headless hook, polling fallback, optimistic decisions, live WebSocket merge, presence, and injected UI slots
-- Per-tenant live approval and run streams using short-lived HMAC addressing tickets
-- R2 artifact storage, lifecycle pairing, terminal-run retention, thread retention, and complete tenant offboarding
+- Deployment-wide live approval and per-run streams using short-lived HMAC addressing tickets
+- R2 artifact storage, lifecycle pairing, terminal-run retention, and thread retention
 - Cloudflare Queues to SIEM NDJSON export
 
 ### Long-running agents
@@ -171,18 +172,18 @@ The following surfaces are supported and opt-in: they are tested and covered by 
 - Server-owned guarded-agent catalog with authenticated list, start, status, and NDJSON observation routes
 - Approval-only durable agent resume that restores the original authorized principal
 - Runtime-driven Mastra durable agents with restart-safe approval resume
-- Tenant-minted thread and resource identities with D1-backed recall isolation
+- Server-minted thread ids and validated host-owned resource keys with D1-backed memory
 - Thread signals, messages, state, notifications, idle wake, and a DOM-free client
 - Durable objectives and bounded goal updates
 - Workflow and agent schedules with CAS fire claims and reserved-context protection
-- Tenant-scoped background task execution and cleanup
+- Deployment-scoped background task execution and cleanup
 - Alarm-driven signal providers, human-managed subscriptions, verified webhooks, and GitHub reference integration
 
 See [`docs/durable-agents.md`](docs/durable-agents.md) for the wiring and lifecycle.
 
 ## Demo
 
-The [public showcase](https://anchorage.proofoftech.org/) runs the open-source stack against isolated, short-lived tenants. It includes six server-side workflows and seven deterministic guardrail scenarios covering PII, secrets, prompt injection, RBAC, egress, workflow isolation, and tenant isolation. External side effects are simulated unless the corresponding binding is configured; the approval, grant, audit, tenancy, and suspend/resume paths are real.
+The [public showcase](https://anchorage.proofoftech.org/) runs the open-source stack in one shared demo organization. It includes six server-side workflows and seven deterministic guardrail scenarios covering personally identifiable information (PII), secrets, prompt injection, role-based access control (RBAC), egress, workflow isolation, and opaque isolation scopes. External side effects are simulated unless the corresponding binding is configured. Approval, grant, audit, deployment identity, and suspend/resume paths are real.
 
 Run it locally:
 
@@ -220,7 +221,7 @@ pnpm docs:api
 pnpm --filter @proofoftech/flowsafe spike:verify
 ```
 
-The deterministic workerd spike proves suspension, restart, resume, forged-resume denial, tenancy, live streaming, durable agent recovery, schedules, signals, goals, provider delivery, and background tasks without an external model. The separate `spike:verify:llm` gate is optional and requires provider credentials.
+The deterministic workerd spike proves suspension, restart, resume, forged-resume denial, deployment isolation, live streaming, durable agent recovery, schedules, signals, goals, provider delivery, and background tasks without an external model. The separate `spike:verify:llm` gate is optional and requires provider credentials.
 
 ## Support, security, and contributing
 

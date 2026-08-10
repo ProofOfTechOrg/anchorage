@@ -24,8 +24,8 @@ const TOAST_STATUS: Record<Tone, BannerStatus> = {
   danger: 'error',
 };
 
-// Cap the avatar row so a busy tenant does not overflow the header; the count
-// text always states the true total.
+// Cap the avatar row so a busy shared queue does not overflow the header; the
+// count text always states the true total.
 const MAX_PRESENCE_AVATARS = 5;
 
 type StreamSlot<Name extends 'Toast' | 'PresenceIndicator'> = NonNullable<
@@ -48,7 +48,7 @@ export const AstryxToast: StreamSlot<'Toast'> = ({
   />
 );
 
-// Reviewers currently on the tenant's live stream, as overlapping avatars
+// Reviewers currently on the deployment's live stream, as overlapping avatars
 // (initials from the actor id) plus a count. a11y: each avatar's alt names its
 // actor and role (Avatar surfaces alt on hover and to screen readers).
 export const AstryxPresenceIndicator: StreamSlot<'PresenceIndicator'> = ({

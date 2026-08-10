@@ -7,7 +7,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Do not include credentials, tenant data, or other secrets. Report exploitable security defects through the private vulnerability-reporting link instead.
+        Do not include credentials, organization data, or other secrets. Report exploitable security defects through the private vulnerability-reporting link instead.
   - type: dropdown
     id: package
     attributes:
@@ -52,7 +52,7 @@ body:
     id: topology
     attributes:
       label: Runtime and deployment topology
-      description: Describe Durable Object, D1, R2, Queue, WebSocket, binding, and multi-tenant details that affect the reproduction.
+      description: Describe Durable Object, D1, R2, Queue, WebSocket, deployment identity, and binding details that affect the reproduction.
   - type: textarea
     id: logs
     attributes:

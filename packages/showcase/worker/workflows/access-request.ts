@@ -1,4 +1,4 @@
-// Module 5/5 — Access Request: request access to a resource, grant it after
+// Module 5/6 — Access Request: request access to a resource, grant it after
 // approval. Capabilities shown: route-level RBAC (meta.allowedRoles restricts
 // START to admin/builder — enforced by the host route), cross-workflow
 // isolation on the grant connector (a request naming another workflow's scope is
@@ -10,7 +10,6 @@
 import {
   createConnector,
   crossWorkflowIsolation,
-  tenantIsolation,
 } from '@proofoftech/breakwater';
 import type { WorkflowModule } from '@proofoftech/flowsafe/host-kit/module';
 import { z } from 'zod';
@@ -65,10 +64,6 @@ export const accessRequestModule: WorkflowModule<ShowcaseModuleDeps> = {
             targetScopeOf: (call) =>
               (call.input as { targetScope?: string }).targetScope,
           }),
-          // tenantIsolation: scope-less calls deny instead of collapsing to
-          // unsegmented keys — mandatory on a multi-tenant host (see
-          // gtm-outbound).
-          tenantIsolation(),
         ],
       },
       execute: async ({ resource, role }) => {

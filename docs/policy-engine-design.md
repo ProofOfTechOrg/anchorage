@@ -123,7 +123,7 @@ The connector SDK separately builds `runtime.fetch` from the manifest. It checks
 - destructive side-effect classification;
 - deployment write-permission patterns.
 
-The connector reads `breakwater.connectorGrants` and `breakwater.connectorExecution` from request context. It compares connector, tenant, workflow, run, and exact suspension identity. A `tool-call` grant also must match Mastra's `context.agent.toolCallId`. Flowsafe derives these values from approved records and authoritative runtime state. A dry run bypasses the capability because its configured implementation must have no side effect.
+The connector reads `breakwater.connectorGrants` and `breakwater.connectorExecution` from request context. It compares connector, workflow, run, optional opaque isolation scope, and exact suspension identity. A `tool-call` grant also must match Mastra's `context.agent.toolCallId`. Flowsafe derives grants without an isolation scope from approved records and authoritative runtime state. A dry run bypasses the capability because its configured implementation must have no side effect.
 
 ### Cross-workflow isolation
 
@@ -133,11 +133,11 @@ The connector reads `breakwater.connectorGrants` and `breakwater.connectorExecut
 - A target with no caller scope fails closed.
 - A different target fails closed.
 
-### Tenant isolation
+### Opaque isolation scope
 
-`tenantIsolation()` requires a non-empty opaque `breakwater.isolationScope`. The same scope segments idempotency and rate-limit keys.
+`tenantIsolation()` is the Breakwater API for requiring a non-empty opaque `breakwater.isolationScope`. The same scope segments idempotency and rate-limit keys.
 
-Run this evaluator on every connector in a multi-tenant host, including dry-run calls. Breakwater does not parse or validate the tenant value; the trusted host is its source.
+Use it only in a host that has another trusted logical partition and mints the scope on every path, including dry runs. Breakwater does not parse the value. Flowsafe's physically isolated data plane deliberately mints no isolation scope and drops provider attempts to add one, so its connector budgets are deployment-wide.
 
 ### Background execution
 
@@ -183,9 +183,9 @@ Retention cannot be enforced by an in-process call evaluator because persisted d
 - thread-state and goal purge;
 - schedule-trigger purge;
 - terminal background-task purge;
-- complete tenant offboarding.
+- physical deployment decommissioning.
 
-Live runs and open approvals are not age-purged. Schedules, resources, and subscriptions are standing state and delete at offboarding.
+Live runs and open approvals are not age-purged. Schedules, resources, and subscriptions are standing state and delete with the physical deployment.
 
 See [Deployment reference](deployment-reference.md) and [Operations runbook](operations-runbook.md).
 
@@ -198,7 +198,7 @@ See [Deployment reference](deployment-reference.md) and [Operations runbook](ope
 | Require a grant on every tool invocation path | Connector wrapper |
 | Require a permission on every tool invocation path | Connector wrapper (`requiredPermissions` against the trusted projection) |
 | Restrict actual connector HTTP redirects | `ConnectorRuntime.fetch` |
-| Enforce tenant and workflow call scope | Tool evaluator plus trusted runtime context |
+| Enforce opaque logical and workflow call scope | Tool evaluator plus trusted runtime context |
 | Suspend an agent for review | Mastra native approval predicate compiled by connector |
 | Mint the resumed connector capability | Flowsafe approval provider |
 | Expire persisted state | Scheduled storage purge |

@@ -1,9 +1,9 @@
-// Anchorage Showcase — the runnable multi-workflow host.
+// Anchorage Showcase — the runnable single-deployment multi-workflow host.
 //
-// The five design-sketch workflows grown into an actual deployed service: all
-// five (gtm-outbound, content-pipeline, lead-generation, product-launch,
-// access-request) running on a real Cloudflare Worker + Durable Object + D1,
-// behind the approval queue, bearer auth, and cron maintenance. This file is
+// Six workflows run on the deployed service: the five original design sketches
+// plus wire-transfer, which appears in both the launcher and control room. They
+// run on a real Cloudflare Worker, Durable Object, and D1 database behind the
+// approval queue, bearer auth, and cron maintenance. This file is
 // host wiring only: it delegates every workflow to buildShowcaseRuntime(), and
 // auth + the run routes + the approval bridge + the service assembly to
 // src/host-kit (shared with `deploy/worker.ts`). What stays here is this
@@ -34,23 +34,19 @@
 //                                            are minted in-process from an
 //                                            observed suspension, never from a
 //                                            request body.
-//   POST /demo/reset                      -> self-service sandbox wipe (admin
-//                                            role + demo tenant only): purges
-//                                            the caller's runs + approvals via
-//                                            purgeTenant; the run budget is
-//                                            deliberately NOT refilled
 //   GET  /healthz                         -> liveness (unauthenticated)
 //
 // All routes except /healthz and /auth/* require `Authorization: Bearer
 // <token>`. Two verifiers feed one seam: the APPROVAL_ACTOR_TOKENS static map
 // (local dev / operators) and, when DEMO_JWT_SECRET is set, the public demo's
-// OAuth-minted HS256 JWTs (see demo-auth.ts: GET /auth/<provider> ->
-// per-visitor ephemeral tenant + a four-role token set). Neither is baked in:
+// OAuth-minted HS256 JWTs (see demo-auth.ts: GET /auth/<provider> -> an
+// expiring session in the shared demo organization + four role tokens).
+// Neither is baked in:
 // a deploy without secrets 401s everywhere (fail closed by construction).
 // DEMO_DISABLED is the kill switch — checked in the AUTH middleware, so
 // already-issued demo JWTs die with it, and at the mint/refresh routes; it
 // parses fail-CLOSED (any unrecognized non-empty value disables the demo).
-// Local dev reads showcase/.dev.vars.
+// Wrangler local development reads packages/showcase/.dev.vars.
 
 import type {
   Request as CfRequest,
@@ -62,15 +58,21 @@ import type {
   Queue,
   ScheduledController,
 } from '@cloudflare/workers-types';
-import { AuditLogger, D1RateLimitStore } from '@proofoftech/breakwater';
+import {
+  AGENT_AUDIT_CONTEXT_KEY,
+  AuditLogger,
+  D1RateLimitStore,
+} from '@proofoftech/breakwater';
 
-import { approvalGrantProvider } from '@proofoftech/flowsafe/approval-api';
+import {
+  type ActorContext,
+  approvalGrantProvider,
+} from '@proofoftech/flowsafe/approval-api';
 import {
   DurableObjectRunner,
   HubDurableObject,
-  purgeTenant,
+  type RequestContextProvider,
   type RunnerRuntime,
-  tenantOfRunId,
 } from '@proofoftech/flowsafe/do-runner';
 import {
   approvalStoreFactoryFor,
@@ -90,13 +92,12 @@ import {
   DEMO_JWT_ISSUER,
   DEMO_JWT_KID,
   DemoRunLimitError,
+  deleteExpiredDemoSessions,
+  demoSessionIdOfActor,
   githubProvider,
   googleProvider,
-  isDemoTenant,
   type OAuthProvider,
-  purgeExpiredDemoTenants,
 } from '#worker/demo-auth';
-import { createDemoResetRouter } from '#worker/demo-reset';
 import {
   buildShowcaseRuntime,
   type EmailServiceBinding,
@@ -105,10 +106,14 @@ import {
 
 interface Env {
   DB: D1Database;
+  /** Provisioning-stamped tag; must match the sentinel row in DB. */
+  DEPLOYMENT_TENANT: string;
+  /** Secret credential shared only by this deployment's Worker and DOs. */
+  DEPLOYMENT_IDENTITY_SECRET: string;
   RUNNER: DurableObjectNamespace;
   /**
-   * Per-tenant live-streaming hub DO (ShowcaseHub). Always bound (wrangler v2
-   * migration), so it is required; but streaming only mounts when
+   * Deployment live-streaming hub DO (ShowcaseHub). Always bound (wrangler v2
+   * migration), so it is required, but streaming only mounts when
    * STREAM_TICKET_SECRET is ALSO set (see below), so the binding alone is inert.
    */
   HUB: DurableObjectNamespace;
@@ -158,12 +163,12 @@ interface Env {
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
   DEMO_DISABLED?: string;
-  /** Max runs per demo tenant lifetime (var; default 20; 0 freezes). */
-  DEMO_TENANT_RUN_CAP?: string;
+  /** Max runs per demo session lifetime (var; default 20; 0 freezes). */
+  DEMO_SESSION_RUN_CAP?: string;
   /** Global demo runs per UTC day — the spend backstop (var; default 500; 0 freezes). */
   DEMO_DAILY_RUN_CAP?: string;
-  /** Demo tenant lifetime hours (var; default 24). */
-  DEMO_TENANT_TTL_HOURS?: string;
+  /** Demo session lifetime hours (var; default 24). */
+  DEMO_SESSION_TTL_HOURS?: string;
   /** Demo JWT lifetime seconds (var; default 3600 = 1h, silent refresh). */
   DEMO_JWT_TTL_SECONDS?: string;
   /** Cron purges terminal run snapshots older than this (var; default 30; 0 = immediately). */
@@ -181,8 +186,8 @@ interface Env {
   SIEM_AUTH_HEADER?: string;
 }
 
-/** Id for system-created records; the tenant is bound per request/instance. */
-const SYSTEM_ACTOR_ID = 'flowsafe-worker';
+/** Id for system-created records. */
+const SYSTEM_PRINCIPAL_ID = 'flowsafe-worker';
 
 // One durable rate-limit store per isolate: it memoizes its own schema DDL,
 // and each DO instance building a fresh store would re-issue CREATE TABLE
@@ -200,14 +205,26 @@ function rateLimitStoreFor(db: D1Database): D1RateLimitStore {
   return store;
 }
 
-function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
+function grantProviderFor(env: Env): RequestContextProvider {
+  const grants = approvalGrantProvider(approvalStoreFactoryFor(env.DB).store());
+  return async (workflowId, runId, leg) => ({
+    ...(await grants(workflowId, runId, leg)),
+    [AGENT_AUDIT_CONTEXT_KEY]: {
+      agentId: workflowId,
+      tenantId: env.DEPLOYMENT_TENANT,
+      runId,
+      entryPath: leg.kind === 'start' ? 'workflow.start' : 'workflow.resume',
+    },
+  });
+}
+
+function defineWorkflows(env: Env): RunnerRuntime {
   return buildShowcaseRuntime({
     initInput: env,
-    // The DO topology binds the grant store to THIS instance's tenant,
-    // recovered from the DO's own idFromName identity (INV-1 -> INV-2).
-    grantProvider: approvalGrantProvider(
-      approvalStoreFactoryFor(env.DB).forTenant(tenantId),
-    ),
+    // Grants are per run. The deployment tag is infrastructure-provided and
+    // reaches Breakwater only as trusted audit correlation; connector rate and
+    // idempotency keys are deployment-wide by physical isolation.
+    grantProvider: grantProviderFor(env),
     email: env.EMAIL,
     fromAddress: env.OUTREACH_FROM_ADDRESS,
     fromName: env.OUTREACH_FROM_NAME,
@@ -217,7 +234,7 @@ function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
         console.log(JSON.stringify({ type: 'connector-audit', ...event })),
     }),
     // Rate-limit budgets share one D1 window across every DO instance, so a
-    // manifest cap holds per tenant, not per run.
+    // manifest cap holds per deployment, not per run.
     rateLimitStore: rateLimitStoreFor(env.DB),
     // crm/deploy egress bindings + artifact bucket are left unset: the showcase
     // runs offline (R2 via InMemoryArtifactBucket, CRM/deploy simulated). Bind
@@ -227,16 +244,18 @@ function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
 
 export class ShowcaseRunner extends DurableObjectRunner<Env> {
   protected build(env: Env): RunnerRuntime {
-    return defineWorkflows(env, this.tenantId);
+    return defineWorkflows(env);
+  }
+
+  protected runOwnership(env: Env) {
+    return approvalStoreFactoryFor(env.DB).resources();
   }
 }
 
 /**
- * The per-tenant live-streaming hub (wrangler HUB binding, v2 migration). The
- * base owns everything — accept a subscriber socket, fan out approval stream
- * events, track presence — recovering its tenant from its own idFromName
- * identity, so the subclass body is empty. Exported SEPARATELY from the handler
- * triple: workerd resolves the DO class by this named export.
+ * The deployment live-streaming hub (wrangler HUB binding, v2 migration). The
+ * base owns subscriber sockets, approval fan-out, and presence. Exported
+ * separately from the handler because workerd resolves the class by name.
  */
 export class ShowcaseHub extends HubDurableObject<Env> {}
 
@@ -328,7 +347,7 @@ function oauthPair(
  * unmounted). Configured means the FULL id+secret pair — a half-set pair is
  * a config-error and never mounts (see oauthPair). Identities are
  * provider-scoped (`google:<sub>` vs `github:<id>`), so switching providers
- * mints fresh sandboxes rather than colliding subjects. Both pairs set is
+ * mints a fresh session rather than colliding subjects. Both pairs set is
  * tolerated — Google wins — but logged (same tripwire convention as
  * numberVar's config-error), so stale fallback credentials never linger
  * silently. The fetch handler selects per request, but only while the demo
@@ -367,26 +386,22 @@ export function selectOAuthProvider(env: Env): OAuthProvider | undefined {
   return undefined;
 }
 
-/** Demo sandboxes pay for runs from two atomic budgets; others start freely. */
-async function chargeDemoBudget(env: Env, runId: string): Promise<void> {
-  const tenantId = tenantOfRunId(runId);
-  // Demo-ness is read from `tenants.kind` (the allocation authority), never
-  // guessed from the slug: a commercial tenant slugged 'dmart' would be
-  // charged against a demo_tenants row that does not exist and 429 forever,
-  // and a change to the demo slug scheme would silently stop budgeting the
-  // traffic the ceiling exists to bound.
-  if (tenantId === undefined || !(await isDemoTenant(env.DB, tenantId))) {
-    return;
-  }
+/** Public demo sessions pay for runs from two atomic budgets. */
+async function chargeDemoBudget(
+  env: Env,
+  context: ActorContext,
+): Promise<void> {
+  const sessionId = demoSessionIdOfActor(context.actor);
+  if (sessionId === undefined) return;
   try {
     await consumeRunBudget(env.DB, {
-      tenantId,
+      sessionId,
       // allowZero: a 0 cap is the incident freeze ("no more demo runs"), and
       // silently reverting it to the fallback would make the freeze a no-op.
-      tenantRunCap: numberVar(
-        env.DEMO_TENANT_RUN_CAP,
+      sessionRunCap: numberVar(
+        env.DEMO_SESSION_RUN_CAP,
         20,
-        'DEMO_TENANT_RUN_CAP',
+        'DEMO_SESSION_RUN_CAP',
         { allowZero: true },
       ),
       dailyRunCap: numberVar(
@@ -427,14 +442,13 @@ const PURGE_CRON = '7 * * * *';
 
 const worker = createFlowsafeWorker<Env>({
   workflows: SHOWCASE_MODULES.map((entry) => entry.meta),
-  systemActorId: SYSTEM_ACTOR_ID,
+  systemPrincipalId: SYSTEM_PRINCIPAL_ID,
   buildVerifier,
   crons: { sweep: SWEEP_CRON, purge: PURGE_CRON },
-  // The showcase's own mounts, in the order they always ran: the public demo
-  // sign-in first (no auth — it MINTS identity; the kill switch 503s it),
-  // then the self-service sandbox reset, which authenticates through the
-  // SAME resolve the API routers use.
-  preRoutes: async (request, env, _ctx, kit) => {
+  // The public demo sign-in is unauthenticated because it mints identity; the
+  // kill switch 503s it. There is no deployment-wide reset route: one visitor
+  // must never erase the shared organization's data.
+  preRoutes: async (request, env) => {
     // Provider selection runs only with the demo switched on: a half-set
     // OAuth pair on a demo-off deployment is inert, so its config-error
     // tripwire would be per-request noise.
@@ -450,73 +464,53 @@ const worker = createFlowsafeWorker<Env>({
             3600,
             'DEMO_JWT_TTL_SECONDS',
           ),
-          tenantTtlMs:
-            numberVar(env.DEMO_TENANT_TTL_HOURS, 24, 'DEMO_TENANT_TTL_HOURS') *
+          sessionTtlMs:
+            numberVar(
+              env.DEMO_SESSION_TTL_HOURS,
+              24,
+              'DEMO_SESSION_TTL_HOURS',
+            ) *
             60 *
             60 *
             1000,
-          purgeTenantData: (tenantId) => purgeTenant(env.DB, { tenantId }),
           disabled: demoDisabledOf(env),
         })(request);
         if (authResponse) return authResponse;
       }
     }
-    // Self-service sandbox reset (admin role + demo tenant only): the same
-    // purge primitive as the reaper. Deliberately leaves run_count/demo_daily
-    // alone — a reset must never refill the spend budget. (A future
-    // budget-refill would extend this purgeTenantData arrow, nothing else.)
-    return createDemoResetRouter({
-      resolve: kit.resolve,
-      isDemoTenant: (tenantId) => isDemoTenant(env.DB, tenantId),
-      purgeTenantData: (tenantId) => purgeTenant(env.DB, { tenantId }),
-    })(request);
+    return null;
   },
-  // Budget BEFORE the DO round-trip: a capped tenant must not consume DO CPU.
-  wrapStart: (start, env) => async (workflowId, runId, inputData) => {
-    await chargeDemoBudget(env, runId);
-    return start(workflowId, runId, inputData);
-  },
+  // Budget before the DO round-trip: a capped session must not consume DO CPU.
+  beforeStart: (context, env) => chargeDemoBudget(env, context),
   // Resumes are metered like starts: every attempt — including one that
   // fails resumeSchema validation and leaves the run suspended — costs a
   // DO round-trip plus a D1 snapshot read, so an uncharged resume would
-  // be an unbounded spend loop for an already-capped tenant. Queue
+  // be an unbounded spend loop for an already-capped session. Queue
   // DECISIONS stay uncharged, bounded by a different pair of facts:
   // decide()'s one-shot CAS makes each approval record decidable exactly
   // once, and a workflow's gate count is a small server-authored
   // constant — a later gate's record is filed by the (uncharged)
   // decision resume itself, so the uncharged multiplier is gates-per-run
   // (2 at most today), never client-controlled.
-  wrapResume: (resume, env) => async (workflowId, runId, body) => {
-    await chargeDemoBudget(env, runId);
-    return resume(workflowId, runId, body);
-  },
-  // Expired demo sandboxes: complete offboarding per tenant (snapshots of
-  // ANY status — a visitor who closed the tab mid-approval left a
-  // suspended row the terminal-only retention purge can never reap — plus
-  // approvals). No R2 artifactStore here: the showcase's artifact bucket
-  // is in-memory. LIMIT-batched; the shrinking table is the durable cursor.
-  // Own try/catch (D3: a failure in any one purge duty must never stop the
-  // others) so the error surface stays 'demo-tenant-purge', not the
-  // composer's generic one.
+  beforeResume: (context, env) => chargeDemoBudget(env, context),
+  // Expired demo sessions are only auth/budget metadata. Shared run and
+  // approval records stay under the normal deployment retention duties.
   extraPurgeDuties: async (env, cron) => {
     try {
-      const demoTenantsPurged = await purgeExpiredDemoTenants(env.DB, {
-        purgeTenantData: (tenantId) => purgeTenant(env.DB, { tenantId }),
-        // Wait out the JWT lifetime past expires_at: a refresh at the last
-        // live instant mints a token good until ~expires_at + jwtTtl, and
-        // purgeTenant deletes suspended rows. Without the grace, a visitor's
-        // still-valid token would find its own runs gone.
+      const demoSessionsDeleted = await deleteExpiredDemoSessions(env.DB, {
+        // Wait out the final JWT lifetime so session metadata remains
+        // diagnosable until every issued token has expired.
         graceMs:
           numberVar(env.DEMO_JWT_TTL_SECONDS, 3600, 'DEMO_JWT_TTL_SECONDS') *
           1000,
         limit: 25,
       });
-      return { demoTenantsPurged };
+      return { demoSessionsDeleted };
     } catch (error) {
       console.error(
         JSON.stringify({
           type: 'maintenance-error',
-          surface: 'demo-tenant-purge',
+          surface: 'demo-session-cleanup',
           cron,
           error: String(error),
         }),

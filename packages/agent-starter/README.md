@@ -1,51 +1,36 @@
 # Anchorage advanced agent starter
 
-This private workspace package is a consumer-sized Cloudflare Worker showing how
-to compose the public `@proofoftech/flowsafe` and
-`@proofoftech/breakwater` APIs into a durable, multi-tenant agent host.
+This private workspace package shows how to compose the public `@proofoftech/flowsafe` and `@proofoftech/breakwater` APIs into a durable, approval-gated Cloudflare agent host for one organization.
 
-Use it when an agent must do more than answer a request:
+Use it when an agent must:
 
 - pause before a write and require a human decision;
-- survive Worker or Durable Object eviction while it waits;
-- resume with a server-derived connector grant that never crosses a client
-  request;
-- keep agent memory, signals, goals, notifications, schedules, subscriptions,
-  approvals, and run snapshots in D1;
-- stream run and approval changes over tenant-isolated WebSockets;
-- accept signed provider webhooks and alarm-driven provider polling;
-- run and recover non-gated background tasks; and
-- apply the same authenticated tenant boundary to every route.
+- survive Worker or Durable Object eviction;
+- resume with a server-derived connector grant that never crosses a client request;
+- persist memory, signals, goals, notifications, schedules, subscriptions, approvals, tasks, and run snapshots in D1;
+- stream run and approval changes;
+- accept signed provider webhooks and alarm-driven polling; or
+- recover non-gated background work.
 
-This is an advanced composition example, not another published package. Copy it
-into your application, replace the example agent and connector, and retain the
-security boundaries called out below.
+This is an advanced composition example, not another published package. Copy it into your application, replace the example agent and connector, and preserve the boundaries below.
 
-## What the two packages do
+## Understand the package boundary
 
-`@proofoftech/breakwater` governs what model output and tools may do. Its
-connector wrapper enforces a permission manifest at execution time. The
-`starter_recordAction` example is write-class, requires approval, has a
-tenant-scoped shared D1 rate limit, and cannot run when Flowsafe has not derived
-the current approval grant.
+`@proofoftech/breakwater` governs what model output and tools may do. The `starter_recordAction` connector is write-class, requires approval, uses a shared D1 rate store, and refuses execution unless Flowsafe derives a matching grant for the current leg.
 
-`@proofoftech/flowsafe` governs where and when work runs. It supplies the D1
-storage composition, Durable Object runtime, approval queue, restart-safe
-durable agent wrapper, live hub, memory-tenancy helpers, signals, goals,
-schedules, provider subscriptions/webhooks, background-task host, and retention
-jobs.
+`@proofoftech/flowsafe` governs where and when work runs. It supplies storage composition, Durable Object execution, the approval queue, durable agent resume, live streams, memory helpers, signals, goals, schedules, provider subscriptions and webhooks, background tasks, and retention.
 
-The important boundary is:
+The critical flow is:
 
 ```text
-authenticated request
-  -> server mints tenant-salted run/thread/resource IDs
+authenticated actor
+  -> host mints opaque run and thread ids and derives a resource id from a validated host key
   -> thread Durable Object starts the runtime-driven agent
-  -> Breakwater write tool asks for approval and the runtime suspends
+  -> Breakwater write tool requires approval and the runtime suspends
   -> Flowsafe records the exact suspension in D1
   -> a different authorized human approves
   -> approval service routes back to the thread Durable Object
-  -> prepare -> observe/register -> runtime resume
+  -> registry rehydration -> observe/register -> runtime resume
   -> Flowsafe derives the connector grant from D1 for that exact leg
   -> Breakwater executes the write
 ```
@@ -58,18 +43,33 @@ The Worker binds five Durable Object classes:
 
 | Binding | Identity | Responsibility |
 | --- | --- | --- |
-| `RUNNER` | `workflowId:runId` | Generic Flowsafe workflow execution and per-run WebSocket progress |
-| `THREAD` | server-minted `threadId` | Runtime-driven durable agent, memory binding, signal affinity, approval resume |
-| `HUB` | authenticated `tenantId` | Hibernatable tenant approval fan-out and presence |
-| `SIGNAL_PROVIDER_HOST` | authenticated `tenantId` | D1 subscription rehydration and provider alarm lifecycle |
-| `BACKGROUND_TASKS` | authenticated `tenantId` | Tenant-scoped background manager, recovery, cleanup, read/SSE facade |
+| `RUNNER` | `workflowId:runId` | Generic workflow execution and per-run progress |
+| `THREAD` | Server-minted `threadId` | Durable agent, memory binding, signal affinity, and approval resume |
+| `HUB` | Fixed deployment singleton | Hibernatable approval fan-out and presence |
+| `SIGNAL_PROVIDER_HOST` | Fixed deployment singleton | D1 subscription rehydration and provider alarm lifecycle |
+| `BACKGROUND_TASKS` | `deployment-background-tasks` singleton | Background manager, recovery, cleanup, and read/SSE facade |
 
-All five share one D1 database. `createComposedStorage()` overlays Flowsafe's
-notifications, thread-state, and schedules domains on Mastra's D1 store. The
-background-task Durable Object deliberately uses a separate tenant-scoped
-domain composition because Mastra's recovery scan is otherwise tenant-blind.
+All five use the deployment's D1 database. `createComposedStorage()` overlays notification, thread-state, and schedule domains on Mastra storage. The background-task Durable Object composes its own task and serialized-workflow domains for the same database.
 
-The Worker itself uses `createFlowsafeWorker()` for health, the guarded agent catalog, live stream tickets, signals, goals, schedules, approvals, workflows/runs, SLA sweep, retention, and schedule/notification ticks. `buildAgentRouter` mounts the metadata-only catalog, while `buildResumeRun` composes approval-only agent resume with the generic workflow path. `preRoutes` remains for provider webhook, subscription, and background-task facades.
+`createFlowsafeWorker()` owns deployment verification, health, the guarded agent catalog, stream tickets, signals, goals, schedules, approvals, workflows, SLA sweep, retention, and schedule or notification ticks. `preRoutes` adds provider webhooks, subscriptions, and the background-task facade.
+
+## Provision one physical deployment
+
+Each organization needs a dedicated Worker, D1 database, Durable Object namespaces, and internal Durable Object credential. Replace every `replace-me` segment in `wrangler.jsonc` with the stable lowercase deployment tag before creating resources. For tag `acme`, use Worker `anchorage-agent-starter-acme` and D1 database `anchorage-agent-starter-acme`; the unique Worker name creates the deployment's Durable Object namespaces. Then stamp the same tag into the new D1 database before any application schema or traffic:
+
+```bash
+pnpm --dir packages/flowsafe provision:deployment -- \
+  --database anchorage-agent-starter-acme \
+  --tag acme \
+  --remote \
+  --config ../agent-starter/wrangler.jsonc
+pnpm --filter anchorage-agent-starter exec wrangler secret put \
+  DEPLOYMENT_IDENTITY_SECRET
+```
+
+The provisioning command verifies the exact singleton sentinel schema. It is idempotent for the same tag, refuses a database already stamped for another deployment, and refuses an unowned database with application tables. The Worker validates the tag and sentinel. Every Worker-to-object topology also stamps the internal credential, which the target compares before reading storage; this prevents a cross-script binding from reaching another deployment's objects.
+
+Do not expose provisioning as a public route. Do not share or reuse this resource set between organizations. A control plane may route hostnames to deployments, but request identity never chooses the database or namespaces. A physical-isolation cutover must use a new tag-suffixed Worker name, D1 database, and Durable Object namespaces; an in-place deploy under a legacy script name retains its old namespaces.
 
 ## Quick start
 
@@ -78,7 +78,7 @@ Requirements:
 - Node.js 22 or newer;
 - pnpm;
 - a Cloudflare account with Workers, Durable Objects, and D1;
-- a configured Mastra model provider for a live agent run.
+- a Mastra model provider for live runs.
 
 From the repository root:
 
@@ -88,22 +88,19 @@ cp packages/agent-starter/.dev.vars.example packages/agent-starter/.dev.vars
 pnpm --filter anchorage-agent-starter check
 ```
 
-The deterministic smoke test uses an in-process model and never contacts a
-provider. It also invokes the write connector without a grant and proves the
-denial happens before D1. Live runs require a real `MODEL_ID` and
-`MODEL_API_KEY`; the committed `provider/model` placeholder throws a clear
-configuration error.
+The deterministic smoke test uses an in-process model and never contacts a provider. It also invokes the write connector without a grant and proves denial happens before D1. Live runs require a real `MODEL_ID` and `MODEL_API_KEY`; the committed `provider/model` placeholder fails closed.
 
-Create the production database:
+Create the production database and paste its id into `wrangler.jsonc`:
 
 ```bash
-pnpm --filter anchorage-agent-starter exec wrangler d1 create anchorage-agent-starter
+pnpm --filter anchorage-agent-starter exec wrangler d1 create anchorage-agent-starter-acme
 ```
 
-Put the returned ID in `wrangler.jsonc`, then set secrets:
+Set `DEPLOYMENT_TENANT`, run the provisioning command above, then configure distinct secrets:
 
 ```bash
 cd packages/agent-starter
+pnpm exec wrangler secret put DEPLOYMENT_IDENTITY_SECRET
 pnpm exec wrangler secret put AUTH_HMAC_SECRET
 pnpm exec wrangler secret put STREAM_TICKET_SECRET
 pnpm exec wrangler secret put MODEL_API_KEY
@@ -111,70 +108,39 @@ pnpm exec wrangler secret put GITHUB_WEBHOOK_SECRET
 pnpm run deploy
 ```
 
-Use different random values for the auth and stream-ticket secrets. A stream
-ticket is addressing-only, but sharing its signing key with session JWTs would
-collapse two trust domains.
-
 For local work:
 
 ```bash
+pnpm --dir packages/flowsafe provision:deployment -- \
+  --database anchorage-agent-starter-acme \
+  --tag acme \
+  --local \
+  --config ../agent-starter/wrangler.jsonc \
+  --persist-to ../agent-starter/.wrangler/state
 pnpm --filter anchorage-agent-starter dev
 ```
 
-Wrangler reads `.dev.vars`. D1 tables are created lazily by the public storage
-adapters.
+Set `DEPLOYMENT_TENANT` to `acme` before running that command. Wrangler reads `.dev.vars` and opens the seeded local state directory. Use different values for the internal Durable Object credential, authentication, and stream-ticket signing.
 
-## Authentication and tenants
+## Authenticate actors
 
-The starter accepts HS256 bearer JWTs through Flowsafe's `hmacVerifier()`.
-Required claims are:
+The starter accepts HS256 bearer JWTs through `hmacVerifier()`. Required claims are:
 
-- `sub`: non-empty actor ID;
+- `sub`: non-empty actor id;
 - `role`: `admin`, `builder`, `operator`, `reviewer`, or `viewer`;
-- `tenantId`: lowercase 3–32 character tenant slug;
 - `iss`, `aud`, and a future `exp`.
 
-Provision every production tenant before issuing any token that names it. The
-tenant registry is the allocation authority that prevents two customers from
-being assigned the same slug—and therefore the same runs, approvals, budgets,
-and memory. Call the starter's `provisionCommercialTenant(env, tenantId)` from
-your private deployment control plane or one-off authenticated administration
-Worker:
-
-```ts
-import { provisionCommercialTenant } from './src/provisioning.js';
-
-await provisionCommercialTenant(env, 'acme');
-```
-
-It delegates to Flowsafe's insert-or-fail `provisionTenant()` API. A duplicate
-or reserved slug fails instead of adopting an existing tenant. The starter
-deliberately does not mount public tenant-provisioning HTTP. Keep the registry
-record as an offboarding tombstone and never recycle a tenant ID.
-
-Mint a one-hour development token:
+The token does not carry deployment identity. Mint a one-hour development token:
 
 ```bash
 export AUTH_HMAC_SECRET='the same value used in .dev.vars'
 export AUTH_JWT_ISSUER='anchorage-agent-starter'
 export AUTH_JWT_AUDIENCE='anchorage-agent-starter-api'
-TOKEN="$(pnpm --filter anchorage-agent-starter token acme operator alice)"
+TOKEN="$(pnpm --filter anchorage-agent-starter token operator alice)"
+REVIEWER_TOKEN="$(pnpm --filter anchorage-agent-starter token reviewer bob)"
 ```
 
-Mint a separate reviewer token for separation of duties:
-
-```bash
-REVIEWER_TOKEN="$(pnpm --filter anchorage-agent-starter token acme reviewer bob)"
-```
-
-The default is strict separation of duties: the actor who requested a gate may
-not decide it, and an actor who approved an earlier gate may not approve a later
-gate in the same run. Do not use one actor for the walkthrough.
-
-Set `TENANT_APEX_DOMAIN` for tenant-per-subdomain deployments. A request to
-`acme.example.com` then fails unless the verified token tenant is `acme`.
-Authorization still comes from the verified token and tenant-bound store; the
-host name is only a defense-in-depth cross-check.
+Strict separation of duties is the default. The actor who requested a gate cannot decide it, and an actor who approved an earlier gate cannot approve a later gate in the same run.
 
 ## Run the durable agent
 
@@ -187,18 +153,14 @@ curl -sS -X POST http://localhost:8787/agents/anchorage-agent/runs \
   -d '{"prompt":"Record that the launch checklist was completed"}'
 ```
 
-The response envelope contains `agentId`, `threadId`, `resourceId`, `runId`, a suspended `summary`, and its approval record. Keep all three ids. The resource id is deterministically minted from the server-minted thread id, so notification delivery and restart resume can recover the same memory binding without trusting client state.
+The response contains `agentId`, `threadId`, `resourceId`, `runId`, a suspended summary, and its approval record. The host mints opaque run and thread ids and derives the resource id from trusted configuration. Treat the returned ids as whole identifiers; do not parse deployment or ownership from them.
 
-List the queue:
+List and decide the approval:
 
 ```bash
 curl -sS http://localhost:8787/api/approvals \
   -H "authorization: Bearer $REVIEWER_TOKEN"
-```
 
-Approve the returned record:
-
-```bash
 curl -sS -X POST \
   http://localhost:8787/api/approvals/APPROVAL_ID/decide \
   -H "authorization: Bearer $REVIEWER_TOKEN" \
@@ -206,94 +168,75 @@ curl -sS -X POST \
   -d '{"decision":"approve","comment":"reviewed"}'
 ```
 
-The decision route rehydrates the agent after eviction, validates the snapshot's
-thread/resource binding, and resumes through `RunnerRuntime`. Query status:
+The decision route rehydrates the agent after eviction, validates the persisted thread, resource, run, agent, and principal bindings, then resumes through `RunnerRuntime`.
+
+Query status and observe newline-delimited events:
 
 ```bash
 curl -sS \
   "http://localhost:8787/agents/anchorage-agent/runs/THREAD_ID/RUN_ID" \
   -H "authorization: Bearer $TOKEN"
-```
 
-Observe newline-delimited JSON events with a reconnect cursor:
-
-```bash
 curl -sS \
   "http://localhost:8787/agents/anchorage-agent/runs/THREAD_ID/RUN_ID/stream?offset=0" \
   -H "authorization: Bearer $TOKEN"
 ```
 
-Each line contains `offset`, the next reconnect cursor, and `event`. Replay is short-lived and in memory by default. If the stream returns 409 after eviction or restart, use the status route because the durable summary remains authoritative.
-
-To prove restart safety locally, stop `wrangler dev` after the suspended
-response, start it again, then make the approval decision.
+Replay is short-lived and in memory. If the stream returns `409` after eviction or restart, read the durable status route. To prove restart safety, stop `wrangler dev` after suspension, restart it, then decide the approval.
 
 ## HTTP surface
 
-All routes except `/healthz`, a correctly signed provider webhook, and the two
-WebSocket upgrade routes require a bearer token. A WebSocket upgrade instead
-requires a valid short-lived ticket minted by the bearer-authenticated
-`POST /api/stream/ticket` route.
+Every route except `/healthz`, a correctly signed provider webhook, and WebSocket upgrades requires a bearer token. `/healthz` still verifies the deployment sentinel. A WebSocket upgrade requires a short-lived ticket minted by the authenticated `POST /api/stream/ticket` route.
 
 | Method and route | Purpose |
 | --- | --- |
-| `GET /healthz` | Liveness |
-| `GET /agents` | Registered agent metadata and authenticated actor |
-| `POST /agents/:agentId/runs` | Server-mint a thread/resource/run and start the guarded durable agent |
-| `GET /agents/:agentId/runs/:threadId/:runId` | Authoritative durable-agent status |
+| `GET /healthz` | Deployment identity and liveness |
+| `GET /agents` | Agent metadata and authenticated actor |
+| `POST /agents/:agentId/runs` | Mint ids and start the guarded durable agent |
+| `GET /agents/:agentId/runs/:threadId/:runId` | Durable agent status |
 | `GET /agents/:agentId/runs/:threadId/:runId/stream?offset=N` | Authenticated NDJSON observation |
-| `GET /workflows` | Generic workflow catalog (`starter-echo` included) |
-| `POST /runs` | Start a server-ID'd generic workflow |
+| `GET /workflows` | Generic workflow catalog |
+| `POST /runs` | Start a generic workflow with a server-minted id |
 | `GET /runs/:workflowId/:runId` | Generic workflow status |
-| `POST /runs/:workflowId/:runId/resume` | Raw generic workflow resume; never grants a connector |
-| `GET /api/approvals` | Filtered/paginated approval queue |
-| `GET /api/approvals/metrics` | Queue metrics |
+| `POST /runs/:workflowId/:runId/resume` | Grant-free generic workflow resume |
+| `GET /api/approvals` | Filtered deployment approval queue |
+| `GET /api/approvals/metrics` | Deployment queue metrics |
 | `GET /api/approvals/:id` | Approval detail |
 | `POST /api/approvals/:id/claim` | Claim for review |
-| `POST /api/approvals/:id/decide` | Approve or reject and route restart-safe resume |
+| `POST /api/approvals/:id/decide` | Decide and route restart-safe resume |
 | `POST /api/approvals/:id/delegate` | Delegate a claimed record |
-| `POST /api/approvals/batch/decide` | Decide up to 100 records through the same CAS/SoD path |
-| `POST /api/stream/ticket` | Mint a short-lived tenant/channel WebSocket ticket |
-| `GET /api/stream/hub?ticket=...` | Tenant approval/presence WebSocket |
+| `POST /api/approvals/batch/decide` | Decide up to 100 records through the same CAS and separation-of-duties path |
+| `POST /api/stream/ticket` | Mint a short-lived channel ticket |
+| `GET /api/stream/hub?ticket=...` | Deployment approval and presence WebSocket |
 | `GET /api/stream/run/:workflowId/:runId?ticket=...` | Per-run progress WebSocket |
 | `POST /api/threads/:threadId/{signal,message,queue,state,notification}` | Rate-limited, audited signal ingestion |
 | `PUT/GET/PATCH/DELETE /api/threads/:threadId/goal` | Persistent agent objective |
-| `POST/GET /api/threads/:threadId/subscriptions` | Subscribe/list provider resources |
+| `POST/GET /api/threads/:threadId/subscriptions` | Subscribe or list provider resources |
 | `DELETE /api/threads/:threadId/subscriptions` | Unsubscribe |
 | `POST /api/signal-providers/github/webhook` | Verify GitHub HMAC over raw bytes, then deliver |
-| `POST/GET /api/schedules` | Create/list workflow or agent schedules |
-| `GET/PATCH/DELETE /api/schedules/:id` | Read/update/delete a schedule |
+| `POST/GET /api/schedules` | Create or list workflow and agent schedules |
+| `GET/PATCH/DELETE /api/schedules/:id` | Read, update, or delete a schedule |
 | `POST /api/schedules/:id/{pause,resume}` | Control schedule state |
 | `GET /api/schedules/:id/triggers` | Read fire history |
-| `GET /api/background-tasks?runId=...` | Tenant-scoped task list |
-| `GET /api/background-tasks/task/:taskId` | Tenant-owned task detail |
-| `GET /api/background-tasks/stream?runId=...` | Tenant-scoped lifecycle SSE |
+| `GET /api/background-tasks?runId=...` | Task list |
+| `GET /api/background-tasks/task/:taskId` | Task detail |
+| `GET /api/background-tasks/stream?runId=...` | Task lifecycle SSE |
 
-HTTP creation of approval records is deliberately disabled. Records are created
-only after the runtime observes an actual suspension.
+HTTP creation of approval records is disabled. Records are created only after the runtime observes a suspension.
 
 ## Signals, goals, subscriptions, and webhooks
 
-Signal bodies are model input, not capabilities. The Worker enforces a 16 KiB
-body cap, a per-tenant rate limit, tenant ownership, and the
-`SIGNAL_ATTRIBUTE_ALLOWLIST` before forwarding to the thread Durable Object.
-`sendToolApproval` is not exposed; decisions remain on the approval surface.
+Signal bodies are model input, not capabilities. The Worker enforces a 16 KiB body cap, an isolate-local rate limit, thread access checks, and `SIGNAL_ATTRIBUTE_ALLOWLIST` before forwarding to the thread Durable Object. Replace the example limiter with shared durable state when the limit is contractual.
 
-Goals are standing instructions stored in `mastra_thread_state`. The starter
-caps `maxRuns` at 50. A goal write does not start a run.
+Goals are standing instructions stored in `mastra_thread_state`. The starter caps `maxRuns` at 50. A goal write does not start a run.
 
-To subscribe a returned thread to a GitHub repository:
-
-First provision ownership in `GITHUB_RESOURCE_ALLOWLIST`. It is a JSON object
-from tenant ID to exact repository resource IDs:
+`GITHUB_RESOURCE_ALLOWLIST` is a deployment-owned JSON array of exact repository resources:
 
 ```text
-GITHUB_RESOURCE_ALLOWLIST={"acme":["github:OWNER/REPOSITORY"]}
+GITHUB_RESOURCE_ALLOWLIST=["github:OWNER/REPOSITORY"]
 ```
 
-An empty or invalid map denies all new GitHub subscriptions. A repository
-entry also permits its `#issue-or-pull-number` children. This is a control-plane
-ownership assertion: never populate it from a webhook or client request.
+An empty or invalid array denies new GitHub subscriptions. A repository entry also permits its `#issue-or-pull-number` children. Populate it only from trusted configuration.
 
 ```bash
 curl -sS -X POST \
@@ -307,151 +250,93 @@ curl -sS -X POST \
   }'
 ```
 
-`resourceKey` must be the returned thread ID in this starter. Flowsafe mints the
-tenant-salted resource ID server-side. The Worker checks authentication, role,
-thread ownership, and the external-resource ownership map before committing the
-row. Removing a repository from the map blocks new subscriptions; explicitly
-delete existing rows when revoking access. A committed subscription calls
-`reconcilePolling()` on the tenant's provider-host Durable Object; GitHub itself
-is webhook-only, so the host removes an unnecessary alarm. Add polling
-providers to `StarterSignalProviderHost.providers` and the same reconciliation
-seam arms the earliest required alarm. Subscriptions live in D1 and are
-rehydrated after eviction.
+The starter requires `resourceKey` to equal the opaque thread id, checks actor role and resource configuration, then validates and stores that key as the resource id. Removing a repository from configuration blocks new subscriptions; explicitly delete existing rows when revoking access.
 
-Configure the GitHub webhook URL as:
+A committed mutation calls `reconcilePolling()` on the singleton provider-host Durable Object. GitHub is webhook-only, so the host removes an unnecessary alarm. Polling providers arm the earliest required alarm and rehydrate subscriptions from D1 after eviction.
+
+Configure the GitHub webhook at:
 
 ```text
 https://YOUR_WORKER/api/signal-providers/github/webhook
 ```
 
-The route verifies `X-Hub-Signature-256` over raw bytes before JSON parsing or
-subscription lookup. Payload tenant/thread IDs are ignored; the persisted
-subscription row is the delivery authority.
+The route verifies `X-Hub-Signature-256` over raw bytes before parsing or subscription lookup. Payload routing ids are not authoritative; the stored subscription determines delivery.
 
 ## Schedules and unattended work
 
-The one-minute tick does two independent jobs:
+The one-minute tick claims due schedules with D1 CAS, starts generic workflows or the same runtime-driven thread agent, and dispatches due notifications through the owning thread Durable Object.
 
-- claims due schedules with D1 CAS and starts generic workflows or the same
-  runtime-driven thread agent;
-- dispatches due notifications through the owning thread Durable Object.
+Agent schedules must name `agentId: "anchorage-agent"`. A threaded schedule uses a `threadId` and `resourceId` returned by the start route. Stored request context cannot contain Breakwater grant keys or runtime-reserved keys. Every fire gets a fresh opaque run id.
 
-Agent schedules must name `agentId: "anchorage-agent"`. For a threaded schedule,
-use a `threadId` and `resourceId` returned by `POST /agents/anchorage-agent/runs`. Stored
-request context cannot contain Breakwater grant keys or runtime-reserved keys.
-The tick mints a fresh tenant-salted run ID for every fire.
-
-The starter caps each tenant at 100 schedules and rejects crons faster than one
-minute. For a metered product, wire `createScheduleTick({ runCap })` and
-`createThreadSignalRoutes({ consultRunCap })` to the same durable quota store;
-the example intentionally does not invent a billing policy.
+The starter caps the deployment at 100 schedules and rejects crons faster than one minute. A metered host should wire schedule and signal starts to the same durable quota store.
 
 ## Background tasks
 
-`StarterBackgroundTasks` composes the serialized workflow domain and a
-tenant-scoped task domain, registers static executors on every boot, starts
-Mastra workers before recovery, and uses a Durable Object alarm to recover work
-after eviction. The included `starter_echo` executor is a wiring example.
+`StarterBackgroundTasks` is a deployment singleton. It composes serialized workflow and task storage domains, registers static executors on boot, starts Mastra workers before recovery, and uses a Durable Object alarm to recover work after eviction. The included `starter_echo` executor is a wiring example.
 
-The public background routes are read-only. Enqueueing, cancelling, and
-resuming are server-side operations because they change execution and must not
-be mistaken for an approval capability. Wire your read-only Breakwater
-connectors to the manager inside the tenant Durable Object. Approval-carrying
-write connectors stay foreground-only.
+Public background routes are read-only. Enqueue, cancel, and resume are server-side operations. Keep approval-carrying writes in the foreground agent topology.
 
 ## Scheduled maintenance
 
-Keep the three cron strings in `wrangler.jsonc` and `src/config.ts` exactly
-equal:
+Keep the cron strings in `wrangler.jsonc` and `src/config.ts` byte-identical:
 
 - `*/5 * * * *`: approval SLA sweep;
-- `17 * * * *`: approval, terminal run, memory, notification, thread-state,
-  schedule-trigger, and background-task retention;
+- `17 * * * *`: approval, terminal run, memory, notification, thread-state, schedule-trigger, and background-task retention;
 - `* * * * *`: schedule firing and due-notification dispatch.
 
-The sweep, purge, and tick use separate invocations so a CPU-limit termination
-in one duty cannot starve another. Thread, notification, thread-state, and
-schedule-trigger retention are explicit vars because those records are not
-terminal by definition.
+The duties use separate invocations so a CPU-limit termination in one cannot starve another. Provider and background-task maintenance use Durable Object alarms.
 
 ## Configuration
 
 | Name | Kind | Purpose |
 | --- | --- | --- |
-| `AUTH_HMAC_SECRET` | secret | HS256 bearer JWT verification; absent means every protected route returns 401 |
-| `AUTH_JWT_ISSUER` | var | Required JWT issuer |
-| `AUTH_JWT_AUDIENCE` | var | Required JWT audience |
-| `STREAM_TICKET_SECRET` | secret | Enables short-lived live-stream tickets; keep distinct from auth |
-| `MODEL_ID` | var | Required Mastra `provider/model` ID; the committed placeholder fails closed |
+| `DEPLOYMENT_TENANT` | variable | Required provisioning tag matching the D1 sentinel |
+| `DEPLOYMENT_IDENTITY_SECRET` | secret | Required internal Worker-to-Durable-Object caller credential |
+| `AUTH_HMAC_SECRET` | secret | HS256 actor verification; absent means protected routes return `401` |
+| `AUTH_JWT_ISSUER` | variable | Required JWT issuer |
+| `AUTH_JWT_AUDIENCE` | variable | Required JWT audience |
+| `STREAM_TICKET_SECRET` | secret | Short-lived stream tickets; keep distinct from authentication |
+| `MODEL_ID` | variable | Mastra `provider/model` id; the committed placeholder fails closed |
 | `MODEL_API_KEY` | secret | Live model credential |
-| `MODEL_BASE_URL` | secret/optional | OpenAI-compatible base URL |
-| `GITHUB_WEBHOOK_SECRET` | secret | Enables the GitHub webhook route |
-| `GITHUB_RESOURCE_ALLOWLIST` | var | JSON tenant → owned `github:owner/repository` resources; empty/invalid denies new subscriptions |
-| `TENANT_APEX_DOMAIN` | var/optional | Tenant subdomain cross-check |
-| `SIGNAL_ATTRIBUTE_ALLOWLIST` | var | CSV of accepted signal attribute keys |
-| `APPROVAL_SLA_SECONDS` | var | Default approval SLA |
-| `RUN_RETENTION_DAYS` | var | Terminal workflow/agent snapshot TTL |
-| `APPROVAL_RETENTION_DAYS` | var | Decided approval TTL |
-| `THREAD_RETENTION_DAYS` | var | Inactive thread/message TTL |
-| `NOTIFICATION_RETENTION_DAYS` | var | Terminal inbox row TTL |
-| `THREAD_STATE_RETENTION_DAYS` | var | Signal state and goal TTL |
-| `SCHEDULE_TRIGGER_RETENTION_DAYS` | var | Schedule fire-history TTL |
-
-Replace `MODEL_ID=provider/model` with the provider and model ID configured for
-your Mastra deployment. Set `MODEL_BASE_URL` when that provider uses a custom
-OpenAI-compatible endpoint. Configure provider-specific model behavior when
-constructing the guarded agent; its `generate()` and `stream()` call options
-remain deliberately narrow.
+| `MODEL_BASE_URL` | optional secret | OpenAI-compatible base URL |
+| `GITHUB_WEBHOOK_SECRET` | secret | GitHub webhook signature verification |
+| `GITHUB_RESOURCE_ALLOWLIST` | variable | JSON array of allowed `github:owner/repository` resources |
+| `SIGNAL_ATTRIBUTE_ALLOWLIST` | variable | CSV of accepted signal attribute keys |
+| `APPROVAL_SLA_SECONDS` | variable | Default approval SLA |
+| `RUN_RETENTION_DAYS` | variable | Terminal workflow and agent snapshot TTL |
+| `APPROVAL_RETENTION_DAYS` | variable | Decided approval TTL |
+| `THREAD_RETENTION_DAYS` | variable | Inactive thread and message TTL |
+| `NOTIFICATION_RETENTION_DAYS` | variable | Terminal inbox row TTL |
+| `THREAD_STATE_RETENTION_DAYS` | variable | Signal state and goal TTL |
+| `SCHEDULE_TRIGGER_RETENTION_DAYS` | variable | Schedule fire-history TTL |
 
 ## Security properties to preserve
 
-- Mint run, thread, and resource IDs after authentication. Never accept them in
-  a create body.
-- Reach thread Durable Objects only through `createThreadTopology()`. It stamps
-  the internal tenant and execution-principal headers and checks ownership
-  before addressing the namespace.
-- Declare every automated entry the agent should accept in
-  `allowedAutomation`. Enabling a duty is not enough, and an omitted list
-  denies all automated entry.
-- Keep approval grants server-derived through `approvalGrantProvider()`. Do not
-  copy grants from a decision body, schedule row, model output, or signal.
-- Keep agent resume behind `ApprovalService.decide()`. A public raw resume path
-  would bypass capability minting and must remain absent.
-- Bind D1 stores per authenticated tenant before constructing request-scoped
-  services.
-- Allocate every named production tenant through `provisionTenant()` before
-  credentials exist; never infer ownership from a customer-supplied slug.
-- Keep write connectors foreground-only. Background approval resume is a
-  different topology.
-- Verify webhooks over raw bytes before parsing and derive tenancy from
-  subscription rows.
-- Authorize provider subscriptions against a server-owned external-resource
-  map before persisting them.
-- Use shared stores for cross-isolate limits. The connector uses
-  `D1RateLimitStore`; the example signal limiter is isolate-local and must be
-  replaced for a hard commercial quota.
-- Keep server-authored connector IDs static. Model or client input must never
-  choose what approval grants.
+- Allocate one physical data-plane resource set per organization, verify its sentinel before every entry surface, and authenticate every Worker-to-Durable-Object call.
+- Mint run, thread, subscription, schedule, and task ids on the server. Derive resource ids from validated host-owned keys. Never accept full memory ids in a create body.
+- Preserve the principal ownership record for each run, thread, resource, and schedule; inaccessible resources must return `404` before role errors.
+- Reach thread Durable Objects only through `createThreadTopology()` or `createAgentThreadTopology()`. The topology strips retired identity headers and writes the trusted execution-principal header.
+- Declare every automated entry in `allowedAutomation`. Omission denies unattended entry.
+- Keep approval grants server-derived through `approvalGrantProvider()` and agent resume behind `ApprovalService.decide()`.
+- Authorize provider subscriptions against server-owned resource configuration before persisting them.
+- Verify webhooks over raw bytes before parsing and route through stored subscriptions.
+- Use shared stores for cross-isolate budgets and idempotency. Flowsafe's connector context is deployment-wide and does not mint a logical organization scope.
+- Keep connector ids server-authored. Model or client input must not choose approval capabilities.
+- Decommission the whole Worker, D1, Durable Object, R2, Queue, and secret resource set. There is no in-database organization purge.
 
 ## Customize the starter
 
-1. Replace `createStarterAgentModule()` instructions, tools, metadata, and matching allowed roles.
+1. Replace `createStarterAgentModule()` instructions, tools, metadata, and allowed roles.
 2. Keep every external side effect behind `createConnector()`.
-3. Add each connector's actual egress hosts to its permission manifest and pass
-   outbound traffic through the connector runtime's guarded `fetch`.
-4. Add workflow metadata and committed workflows together; the registration
-   assertion fails fast if they drift.
-5. Add provider adapters to both the webhook/provider maps and the provider-host
-   list, then add their IDs to the subscription allowlist.
-6. Replace structured console audit sinks with your queue/SIEM transport.
-7. Add a durable run-cap implementation before exposing unattended execution
-   commercially.
+3. Add each connector's real egress hosts to its permission manifest and use the guarded `fetch`.
+4. Add workflow metadata and committed workflows together; registration fails fast if they drift.
+5. Add provider adapters to both the webhook map and provider-host list, then add their ids to the subscription allowlist.
+6. Replace console audit sinks with your Queue or SIEM transport.
+7. Add a durable run-cap implementation before exposing unattended execution commercially.
 
-Every import from Anchorage in `src/` uses a documented package export. The
-`check:imports` gate rejects source/dist deep imports and relative reaches into
-the sibling packages.
+Every Anchorage import in `src/` uses a documented package export. `check:imports` rejects source or distribution deep imports and relative reaches into sibling packages.
 
-## Verification
+## Verify the starter
 
 Run:
 
@@ -461,22 +346,17 @@ pnpm --filter anchorage-agent-starter test
 pnpm --filter anchorage-agent-starter build
 ```
 
-`test` includes a deterministic model smoke, an approval-denial/no-D1-side-effect
-assertion, and the public-import boundary check. `build` asks Wrangler to bundle
-the complete Worker without deploying.
-
-For a live proof, run the start → stop/restart → decide → status sequence above
-with real `MODEL_ID`/`MODEL_API_KEY` values.
+The tests include token verification, a deterministic model smoke, an approval-denial/no-D1-side-effect assertion, and the public-import boundary. For a live proof, run the start, stop, restart, decide, and status sequence above with real model configuration.
 
 ## Agent host composition
 
-The starter uses only the public `@proofoftech/flowsafe/agent-host` subpath. The Worker router receives `STARTER_AGENT_META`, while each `StarterThread` constructs its complete module from instance-scoped model, storage, runtime, pub/sub, connector, and database objects.
+The starter uses only `@proofoftech/flowsafe/agent-host`. The Worker router receives `STARTER_AGENT_META`; each `StarterThread` constructs the complete module from instance-scoped model, storage, runtime, pub/sub, connector, and database objects.
 
-`createThreadAgentHost()` owns the internal start/status/observe/resume topology. Application code does not author private `/agent/*` Durable Object URLs or keep mutable current-request scope. `createAgentApprovalResumer()` restores the original execution principal from the persisted approval target and delegates generic workflow records to the existing run topology.
+`createThreadAgentHost()` owns the internal start, status, observe, and resume topology. Application code does not author private Durable Object URLs or keep mutable current-request scope. `createAgentApprovalResumer()` restores the original execution principal from the approval target and delegates generic workflow records to the run topology.
 
-### Declare which automation may run the agent
+### Declare allowed automation
 
-Unattended work arrives as a non-human execution principal, and an agent accepts none of it by default. `STARTER_AGENT_META` names each admitted kind together with the exact entry paths it may arrive on:
+Unattended work carries a non-human execution principal. The agent accepts none by default. `STARTER_AGENT_META` names each allowed kind and exact entry path:
 
 ```typescript
 allowedAutomation: [
@@ -485,4 +365,4 @@ allowedAutomation: [
 ],
 ```
 
-That covers the starter's three automated paths: the schedule tick, the notification dispatch tick, and signal-provider delivery. The guarded agent declares the matching `allowedPrincipalKinds: ['human', 'system', 'service']`, and catalog construction refuses the module if the two ever drift. Removing a kind from either half stops that automation at the host, with no other change needed.
+The guarded agent declares matching `allowedPrincipalKinds: ['human', 'system', 'service']`. Catalog construction refuses a mismatch. Removing a kind from either side stops that automation.

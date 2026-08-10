@@ -1,7 +1,7 @@
 # flowsafe source navigation
 
 - `index.ts`: compatibility barrel for approval API, runner, artifacts, and audit export
-- `approval-api/`: approval lifecycle and tenant-bound stores
+- `approval-api/`: approval lifecycle and deployment store
 - `do-runner/`: runtime, Durable Objects, identities, storage, retention
 - `host-kit/`: authenticated host composition and topologies
 - `approval-ui/`: optional React dashboard

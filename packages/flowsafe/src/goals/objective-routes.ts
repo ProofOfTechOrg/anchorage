@@ -16,12 +16,12 @@
 // (threadId, 'goal') key, so the stored shape can never drift from the reader's.
 //
 // An objective is a STANDING INSTRUCTION injected into every future model turn,
-// so the write path is an ingestion trust boundary (P6-lite, DL-006) — the same
-// gate order createSignalRouter (Track C) enforces:
+// so the write path is an ingestion trust boundary (P6-lite, DL-006). It uses
+// the same resource-first authorization rule as the signal router:
 //
-//   1. resolve (authenticate -> INV-3 -> bind)          -> 401 / 403
-//   2. coarse role (RUN_START_ROLES) on MUTATIONS        -> 403 (reads stay coarse)
-//   3. thread-prefix ownership (requireOwnedMemoryId)     -> 404 (no existence oracle)
+//   1. resolve (authenticate and validate actor)         -> 401 / 403
+//   2. registry-backed thread ownership                   -> 404
+//   3. coarse role (RUN_START_ROLES) on MUTATIONS        -> 403 (reads stay coarse)
 //   4. size cap on the raw body, THEN JSON parse          -> 413 / 400
 //   5. body names NO client memory id (assertNoClientMemoryIds) -> 400
 //   6. field allowlist (objective/maxRuns/judge/prompt; status on update) -> 400
@@ -29,8 +29,8 @@
 //   8. audit (goal.objective) + persist
 //
 // Every MUTATION (set/update/clear) is audited on ACCEPT and on EVERY post-auth
-// denial (role 403, foreign 404, size/body/field/cap 400) — the Track C lesson.
-// A GET is audited only on a post-auth denial (a cross-tenant read probe); a
+// denial (role 403, malformed target 404, size/body/field/cap 400) — the Track C lesson.
+// A GET is audited only on a post-auth denial; a
 // benign successful read is not a standing-instruction write and is not logged.
 // Pre-auth failures (401 / a resolver throw -> 403) are NOT audited: an
 // unauthenticated flood must never be able to write the log.
@@ -41,7 +41,7 @@
 // footgun the run router 400s a client runId to avoid — so the boundary fails
 // loud instead. The stored record therefore never carries maxRuns above the cap
 // (default the core DEFAULT_GOAL_MAX_RUNS, 50). Track F itself starts NO runs:
-// the per-tenant run-start budget stays enforced at the existing run-start seam;
+// the deployment run-start budget stays enforced at the existing run-start seam;
 // bounding maxRuns only bounds how many of those already-budgeted runs one goal
 // can drive.
 //
@@ -55,9 +55,9 @@
 // weaker than signals (whose sends ride the thread-DO lease), because DL-018
 // writes D1 directly. Core's own
 // Agent.updateObjectiveOptions has the identical non-atomic read-then-write, so
-// concurrent mutations are last-write-wins WITHIN the tenant; the maxRuns cap is
+// concurrent mutations are last-write-wins within the deployment; the maxRuns cap is
 // enforced on every write, so no interleaving can persist an over-cap value or
-// cross a tenancy/capability line.
+// cross an authorization/capability line.
 
 import type { GoalObjectiveRecord } from '@mastra/core/storage';
 import {
@@ -68,18 +68,20 @@ import {
 } from '@mastra/core/tools';
 
 import {
+  type ActorContext,
+  ActorResolutionError,
+  type ActorResolver,
   type ApprovalRole,
   RUN_START_ROLES,
-  type TenantContext,
-  TenantResolutionError,
-  type TenantResolver,
 } from '../approval-api/index.js';
 import {
   assertNoClientMemoryIds,
+  type BoundThreadTargetValidator,
   RunRouteError,
-  requireOwnedMemoryId,
+  requireResourceAccess,
 } from '../host-kit/index.js';
 import { safeDecodeSegment } from '../host-kit/route-path.js';
+import { readBoundedBody } from '../http-body.js';
 import { internalErrorResponse } from '../internal-error-response.js';
 import {
   nonnegativeSafeInteger,
@@ -137,7 +139,7 @@ const OPERATION_BY_METHOD: Record<string, ObjectiveOperation | undefined> = {
 /** The structured audit event a mutation (and a denied read) emits. */
 export interface ObjectiveAuditEvent {
   type: 'goal.objective';
-  tenantId: string;
+  deploymentTag?: string;
   actorId: string;
   threadId: string;
   operation: ObjectiveOperation;
@@ -153,10 +155,12 @@ export type ObjectiveAuditSink = (
 ) => void | Promise<void>;
 
 export interface ObjectiveRouterOptions {
-  /** Authenticate, validate the tenant ID, and bind it; undefined means 401. */
-  resolve: TenantResolver;
+  /** Authenticate and validate the actor; undefined means 401. */
+  resolve: ActorResolver;
   /** The thread-state domain in which the goal record lives. */
   store: ObjectiveStore;
+  /** Prove mutations target durable bound memory, not an ephemeral run id. */
+  validateThreadTarget: BoundThreadTargetValidator;
   /**
    * Who may SET/UPDATE/CLEAR an objective. Default RUN_START_ROLES
    * (operator/admin) — reviewers/viewers cannot author standing instructions.
@@ -279,9 +283,8 @@ function firstDisallowedField(
  * `Agent.setObjective` (id = randomUUID, status 'active', runsUsed 0, numeric
  * startedAt/updatedAt, only explicitly-provided optionals persisted). The `id`
  * is the in-record correlation tag core always mints for a goal — NOT an
- * addressing/memory id (it never keys a store, addresses a DO, or crosses the
- * tenancy boundary; the whole row rides the already-tenant-salted threadId), so
- * a randomUUID here is faithful to core and does not need a tenant prefix.
+ * addressing/memory id (it never keys a store or addresses a DO), so
+ * a randomUUID here is faithful to core and needs no addressing prefix.
  */
 function buildSetRecord(
   body: Record<string, unknown>,
@@ -417,19 +420,21 @@ export function createObjectiveRouter(
 
     // Hoisted above the try so the catch audits the post-auth denials that
     // surface as thrown RunRouteErrors (the ownership 404, the memory-id 400).
-    // `tenant` is undefined until resolve succeeds and the closure no-ops while
+    // `context` is undefined until resolve succeeds and the closure no-ops while
     // it is, so a pre-auth throw is never audited; a benign GET is not audited.
-    let tenant: TenantContext | undefined;
+    let context: ActorContext | undefined;
     const audit = async (
       outcome: 'accepted' | 'rejected',
       reason?: string,
     ): Promise<void> => {
-      if (!options.audit || !tenant) return;
+      if (!options.audit || !context) return;
       if (operation === 'get' && outcome === 'accepted') return;
       await options.audit({
         type: 'goal.objective',
-        tenantId: tenant.tenantId,
-        actorId: tenant.actor.id,
+        ...(context.deploymentTag !== undefined
+          ? { deploymentTag: context.deploymentTag }
+          : {}),
+        actorId: context.actor.id,
         threadId,
         operation,
         outcome,
@@ -437,25 +442,41 @@ export function createObjectiveRouter(
         timestamp: new Date().toISOString(),
       });
     };
+    const auditCommittedMutation = async (): Promise<void> => {
+      try {
+        await audit('accepted');
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            type: 'goal.objective-audit-error',
+            threadId,
+            operation,
+            reason: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }
+    };
 
     try {
-      // 1. Resolve (authenticate -> INV-3 -> bind).
-      tenant = await resolve(request);
-      if (!tenant) return json({ error: 'authentication required' }, 401);
+      // 1. Resolve and authenticate.
+      context = await resolve(request);
+      if (!context) return json({ error: 'authentication required' }, 401);
 
-      // 2. Coarse role on MUTATIONS: authoring a standing instruction is an
-      // operator/admin act, so a reviewer/viewer is refused before the target
-      // thread is read. Authenticated-but-unauthorized, so the rejection IS
-      // audited (a real actor, no flood risk).
-      if (isMutation && !roles.includes(tenant.actor.role)) {
+      // 2. Resolve ownership before role checks or reading thread state.
+      await requireResourceAccess(
+        context,
+        'thread',
+        threadId,
+        isMutation ? 'write' : 'read',
+        'thread',
+      );
+
+      // 3. Coarse role on mutations: authoring a standing instruction is an
+      // operator/admin act.
+      if (isMutation && !roles.includes(context.actor.role)) {
         await audit('rejected', 'forbidden-role');
         return json({ error: 'forbidden' }, 403);
       }
-
-      // 3. Thread-prefix ownership: 404 (never 403) on a foreign threadId, so a
-      // caller learns nothing about another tenant's thread ids.
-      // requireOwnedMemoryId throws RunRouteError(404), audited in the catch.
-      requireOwnedMemoryId(tenant, threadId, 'threadId');
 
       // 4. GET / CLEAR carry no validated body.
       if (operation === 'get') {
@@ -465,23 +486,30 @@ export function createObjectiveRouter(
       }
       if (operation === 'clear') {
         await clearObjective(store, threadId);
-        await audit('accepted');
+        await auditCommittedMutation();
         return json({ ok: true });
       }
 
       // 5. SET / UPDATE: size-cap the raw body at the wire, THEN parse.
-      const rawBody = await request.text();
-      const contentBytes = new TextEncoder().encode(rawBody).length;
-      if (contentBytes > maxContentBytes) {
+      const rawBody = await readBoundedBody(
+        request,
+        maxContentBytes,
+        'objective body exceeds limit',
+      );
+      if (!rawBody.ok && rawBody.reason === 'payload-too-large') {
         await audit('rejected', 'payload-too-large');
         return json(
           { error: `objective payload exceeds ${maxContentBytes} bytes` },
           413,
         );
       }
+      if (!rawBody.ok) {
+        await audit('rejected', 'malformed-body');
+        return json({ error: 'a JSON object body is required' }, 400);
+      }
       let body: Record<string, unknown>;
       try {
-        const parsed = rawBody === '' ? {} : JSON.parse(rawBody);
+        const parsed = rawBody.text === '' ? {} : JSON.parse(rawBody.text);
         if (
           typeof parsed !== 'object' ||
           parsed === null ||
@@ -507,8 +535,9 @@ export function createObjectiveRouter(
           await audit('rejected', built.error.reason);
           return json({ error: built.error.message }, built.error.status);
         }
+        await options.validateThreadTarget(context, { threadId });
         await writeObjective(store, threadId, built.value);
-        await audit('accepted');
+        await auditCommittedMutation();
         return json({ objective: built.value });
       }
 
@@ -524,24 +553,24 @@ export function createObjectiveRouter(
         await audit('rejected', built.error.reason);
         return json({ error: built.error.message }, built.error.status);
       }
+      await options.validateThreadTarget(context, { threadId });
       await writeObjective(store, threadId, built.value);
-      await audit('accepted');
+      await auditCommittedMutation();
       return json({ objective: built.value });
     } catch (error) {
       if (error instanceof RunRouteError) {
-        // A post-auth denial: the ownership 404 (foreign thread) or the
-        // memory-id 400 (a smuggled TCB-only id). tenant is set by here.
+        // A post-auth denial: the target 404 or a smuggled memory-id 400.
         await audit(
           'rejected',
           error.status === 404
-            ? 'foreign-thread'
+            ? 'invalid-thread'
             : error.status === 400
               ? 'client-memory-id'
               : `route-error-${error.status}`,
         );
         return json({ error: error.message }, error.status);
       }
-      if (error instanceof TenantResolutionError) {
+      if (error instanceof ActorResolutionError) {
         // Pre-auth (the resolver itself threw): unauthenticated, so not audited.
         return json({ error: 'forbidden' }, 403);
       }

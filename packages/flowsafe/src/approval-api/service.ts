@@ -8,10 +8,7 @@
 // (grants.ts) derives requestContext grants from approved records at
 // start/resume. Nothing here ever reads capability data from client input.
 
-import {
-  PATH_SAFE_ID_PATTERN,
-  tenantOwnsSaltedId,
-} from '../do-runner/path-safe-id.js';
+import { isPathSafeId } from '../do-runner/path-safe-id.js';
 import type {
   ApprovalActor,
   ApprovalAuditSink,
@@ -24,18 +21,22 @@ import type {
 import { APPROVAL_ROLES, DECIDER_ROLES } from './contract.js';
 import {
   type AutomatedExecutionPrincipal,
+  canonicalApprovalActor,
   canonicalAutomatedPrincipal,
-  isExecutionPrincipal,
+  EXECUTION_PRINCIPAL_KINDS,
+  type ExecutionPrincipalKind,
+  isExecutionPrincipalId,
+  isExecutionPrincipalKind,
   isTrustedAutomationPrincipal,
   principalActor,
   principalAuditFields,
   type TrustedAutomationPrincipal,
 } from './principal.js';
-import { type ApprovalPatch, listAllApprovedForRun } from './store.js';
-import type {
-  SystemApprovalStore,
-  TenantBoundApprovalStore,
-} from './tenant-brand.js';
+import {
+  type ApprovalPatch,
+  type ApprovalStore,
+  listAllApprovedForRun,
+} from './store.js';
 import {
   APPROVAL_PRIORITIES,
   type ApprovalDecision,
@@ -48,6 +49,7 @@ import {
   type BatchDecideItem,
   type BatchDecideResult,
   type CreateApprovalInput,
+  canonicalApprovalResumeTarget,
   type DecideResult,
   MAX_APPROVAL_BATCH_DECIDE,
   MAX_APPROVAL_LIST_LIMIT,
@@ -114,11 +116,10 @@ export function selfDecisionExempts(
 
 export interface ApprovalServiceOptions {
   /**
-   * Must be tenant-bound: the service asserts every acting
-   * principal's tenant against this binding, and the store's predicates are
-   * what scope reads/writes. Obtain via a store factory's forTenant().
+   * The deployment's approval store. Obtain via a store factory's store()
+   * (one memoized schema pass per isolate).
    */
-  store: TenantBoundApprovalStore;
+  store: ApprovalStore;
   /**
    * Structural match for breakwater AuditLogger.record — wire
    * `(event) => auditLogger.record(event)`. Must not throw; failures are
@@ -139,8 +140,8 @@ export interface ApprovalServiceOptions {
    * Live-stream fan-out seam — fired once per SUCCESSFUL mutation
    * (create with `created: true`, claim, decide, delegate, supersede) with the
    * POST-transition record. Distinct from `notify` (reviewer transport,
-   * created/escalated only): this is the same-trust intra-tenant feed a
-   * per-tenant hub relays to open dashboards. Fire-and-forget with the same
+   * created/escalated only): this is the same-trust in-deployment feed the
+   * deployment hub relays to open dashboards. Fire-and-forget with the same
    * containment as `notify`: a throwing or rejecting sink is audited as
    * `approval.stream`/'error' and never fails the mutation. See
    * ApprovalStreamSink (contract.ts) for the ctx.waitUntil convention.
@@ -149,9 +150,11 @@ export interface ApprovalServiceOptions {
   /** Applied when CreateApprovalInput.slaSeconds is absent. */
   defaultSlaSeconds?: number;
   /**
-   * Resumes the run after a decision (approve AND reject — the workflow
-   * learns the outcome via resumeData). Same-Worker deployments use
-   * resumeViaRuntime(runtime); cross-Worker ones fetch the run's DO.
+   * Resumes a suspension-bound, explicitly run-scoped, or trusted-target run
+   * after a decision (approve AND reject — the workflow learns the outcome via
+   * resumeData). Decision-only queue records never call this seam. Same-Worker
+   * deployments use resumeViaRuntime(runtime); cross-Worker ones fetch the
+   * run's DO.
    */
   resumeRun?: (
     record: ApprovalRecord,
@@ -182,7 +185,7 @@ function isNonEmptyString(value: unknown): value is string {
 }
 
 export class ApprovalService {
-  readonly #store: TenantBoundApprovalStore;
+  readonly #store: ApprovalStore;
   readonly #audit?: ApprovalAuditSink;
   readonly #notify?: ApprovalNotificationSink;
   readonly #stream?: ApprovalStreamSink;
@@ -193,15 +196,6 @@ export class ApprovalService {
   ) => Promise<unknown>;
   readonly #allowSelfDecision?: SelfDecisionPolicy;
   readonly #now: () => Date;
-
-  /**
-   * The tenant this service is bound to. Exposed so the host-kit bridges can
-   * mint their own bookkeeping principal against it instead of making every
-   * host construct one and vouch for it.
-   */
-  get tenantId(): string {
-    return this.#store.tenantId;
-  }
 
   constructor(options: ApprovalServiceOptions) {
     this.#store = options.store;
@@ -219,8 +213,21 @@ export class ApprovalService {
     actor: ApprovalActor,
     resumeTarget?: ApprovalResumeTarget,
   ): Promise<{ record: ApprovalRecord; created: boolean }> {
-    this.#authorize(actor, CAN_CREATE, 'approval.create', 'approval');
-    return this.#createAuthorized(input, actor, resumeTarget);
+    const authorized = this.#authorize(
+      actor,
+      CAN_CREATE,
+      'approval.create',
+      'approval',
+    );
+    if (
+      input.requestedByKind !== undefined &&
+      input.requestedByKind !== 'human'
+    ) {
+      throw new InvalidApprovalInputError(
+        "human approval creation may only use requestedByKind 'human'",
+      );
+    }
+    return this.#createAuthorized(input, authorized, 'human', resumeTarget);
   }
 
   /**
@@ -232,7 +239,7 @@ export class ApprovalService {
    * They cannot simply project onto a role instead: automated principals
    * project to the least-privileged role precisely so they can never decide,
    * and `viewer` is not in CAN_CREATE. So the role gate is replaced here — not
-   * widened — by a kind-and-tenant check.
+   * widened — by a trusted-kind check.
    *
    * There is deliberately NO principal-taking claim/decide/delegate. Filing a
    * request is trusted platform work; deciding one is a human judgement, and an
@@ -248,6 +255,7 @@ export class ApprovalService {
     return this.#createAuthorized(
       input,
       principalActor(principal),
+      principal.kind,
       resumeTarget,
       principalAuditFields(principal),
     );
@@ -256,6 +264,7 @@ export class ApprovalService {
   async #createAuthorized(
     input: CreateApprovalInput,
     actor: ApprovalActor,
+    defaultRequestedByKind: ExecutionPrincipalKind,
     resumeTarget?: ApprovalResumeTarget,
     provenance?: Record<string, unknown>,
   ): Promise<{ record: ApprovalRecord; created: boolean }> {
@@ -275,9 +284,6 @@ export class ApprovalService {
     }
     const record: ApprovalRecord = {
       id: crypto.randomUUID(),
-      // The bound store re-stamps this from its own field either way; setting
-      // it here keeps the literal honest for the type and the audit trail.
-      tenantId: this.#store.tenantId,
       workflowId: input.workflowId,
       runId: input.runId,
       title: input.title,
@@ -303,13 +309,12 @@ export class ApprovalService {
     if (input.summary !== undefined) record.summary = input.summary;
     if (input.payload !== undefined) record.payload = input.payload;
     if (resumeTarget !== undefined) {
-      this.#validateResumeTarget(resumeTarget);
-      record.resumeTarget = structuredClone(resumeTarget);
+      record.resumeTarget = this.#canonicalResumeTarget(resumeTarget);
     }
-    // Attribution powers the self-approval check: default to the creating
-    // actor. An explicit override stays possible for system bridges — the
-    // caller already holds a CAN_CREATE role either way.
+    // Attribution powers the self-approval check. Trusted bridges may file on
+    // behalf of the run requester; direct human creation defaults to its actor.
     record.requestedBy = input.requestedBy ?? actor.id;
+    record.requestedByKind = input.requestedByKind ?? defaultRequestedByKind;
     if (slaSeconds !== undefined) {
       record.slaDeadlineAt = new Date(
         now.getTime() + slaSeconds * 1000,
@@ -323,7 +328,6 @@ export class ApprovalService {
       'allowed',
       {
         detail: {
-          tenantId: result.record.tenantId,
           workflowId: result.record.workflowId,
           runId: result.record.runId,
           grantScope: result.record.grantScope,
@@ -351,7 +355,7 @@ export class ApprovalService {
             'error',
             {
               reason,
-              detail: { tenantId: result.record.tenantId, ...provenance },
+              detail: { ...provenance },
             },
           ),
       );
@@ -366,7 +370,7 @@ export class ApprovalService {
             'error',
             {
               reason,
-              detail: { tenantId: result.record.tenantId, ...provenance },
+              detail: { ...provenance },
             },
           ),
       );
@@ -390,27 +394,31 @@ export class ApprovalService {
   }
 
   async claim(id: string, actor: ApprovalActor): Promise<ApprovalRecord> {
-    this.#authorize(actor, CAN_REVIEW, 'approval.claim', `approval:${id}`);
+    const authorized = this.#authorize(
+      actor,
+      CAN_REVIEW,
+      'approval.claim',
+      `approval:${id}`,
+    );
     const now = this.#now().toISOString();
     // 'claimed' is deliberately not claimable — reassignment is delegate()'s
     // job, so a claim can never silently steal another reviewer's item.
-    const updated = await this.#transitionOrExplain(id, 'claim', actor, {
+    const updated = await this.#transitionOrExplain(id, 'claim', authorized, {
       from: ['pending', 'escalated'],
       patch: {
         status: 'claimed',
-        claimedBy: actor.id,
+        claimedBy: authorized.id,
         claimedAt: now,
         updatedAt: now,
       },
     });
-    this.#record(actor, 'approval.claim', `approval:${id}`, 'allowed');
+    this.#record(authorized, 'approval.claim', `approval:${id}`, 'allowed');
     fireStreamEvent(
       this.#stream,
       { type: 'claimed', record: updated },
       (reason) =>
-        this.#record(actor, 'approval.stream', `approval:${id}`, 'error', {
+        this.#record(authorized, 'approval.stream', `approval:${id}`, 'error', {
           reason,
-          detail: { tenantId: updated.tenantId },
         }),
     );
     return updated;
@@ -421,23 +429,36 @@ export class ApprovalService {
     input: { decision: ApprovalDecision; comment?: string },
     actor: ApprovalActor,
   ): Promise<DecideResult> {
-    this.#authorize(actor, CAN_REVIEW, 'approval.decide', `approval:${id}`);
+    const authorized = this.#authorize(
+      actor,
+      CAN_REVIEW,
+      'approval.decide',
+      `approval:${id}`,
+    );
     this.#assertDecisionInput(input);
     // Role-scoped SoD: an exempt decider (allowSelfDecision: true, or a role
     // named in { roles }) skips the pre-read entirely; everyone else keeps
     // today's read-then-CAS self-request denial.
-    if (!selfDecisionExempts(this.#allowSelfDecision, actor.role)) {
+    if (!selfDecisionExempts(this.#allowSelfDecision, authorized.role)) {
       const existing = await this.#store.get(id);
       if (!existing) throw new UnknownApprovalError(id);
-      // requestedBy is immutable after create, so read-then-CAS carries no
-      // TOCTOU hazard here. An ABSENT requestedBy passes this check by
-      // design: create() always attributes it, so only records injected
-      // straight into the store (TCB code) can lack it — a bulk-import path
-      // added later must attribute requesters or accept self-decidability.
-      if (existing.requestedBy === actor.id) {
-        this.#record(actor, 'approval.decide', `approval:${id}`, 'denied', {
-          reason: 'self-approval: decider is the requester',
-        });
+      // requestedBy and requestedByKind are immutable after create, so this
+      // read-then-CAS has no TOCTOU hazard. Missing kind denotes a legacy row
+      // and is treated as human: ambiguity must preserve the SoD bar, not let
+      // an old row become self-decidable after this field is introduced.
+      if (
+        existing.requestedBy === authorized.id &&
+        (existing.requestedByKind ?? 'human') === 'human'
+      ) {
+        this.#record(
+          authorized,
+          'approval.decide',
+          `approval:${id}`,
+          'denied',
+          {
+            reason: 'self-approval: decider is the requester',
+          },
+        );
         throw new ApprovalAuthzError(
           'the requester cannot decide their own approval (separation of duties; set allowSelfDecision to permit)',
         );
@@ -445,7 +466,7 @@ export class ApprovalService {
       // Cross-gate causal SoD: a reviewer who APPROVED an earlier gate of THIS
       // run advanced it to the gate now before them, so they must not also
       // decide this one. requestedBy attribution cannot carry this on its own —
-      // reconcileApprovalsForSummary files the next gate as the SYSTEM actor,
+      // reconcileApprovalsForSummary files the next gate as the SYSTEM principal,
       // which the requestedBy check above never blocks — so the bar is derived
       // from the run's own APPROVED history instead.
       //
@@ -482,7 +503,7 @@ export class ApprovalService {
       const gateAt = Date.parse(existing.createdAt);
       const barred = priorApproved.some((prior) => {
         if (prior.id === existing.id) return false;
-        if (prior.decidedBy !== actor.id) return false;
+        if (prior.decidedBy !== authorized.id) return false;
         if (typeof prior.decidedAt !== 'string') return false;
         const priorAt = Date.parse(prior.decidedAt);
         return (
@@ -490,10 +511,16 @@ export class ApprovalService {
         );
       });
       if (barred) {
-        this.#record(actor, 'approval.decide', `approval:${id}`, 'denied', {
-          reason:
-            'cross-gate separation of duties: this actor approved an earlier gate of the run',
-        });
+        this.#record(
+          authorized,
+          'approval.decide',
+          `approval:${id}`,
+          'denied',
+          {
+            reason:
+              'cross-gate separation of duties: this actor approved an earlier gate of the run',
+          },
+        );
         throw new ApprovalAuthzError(
           'the reviewer who advanced this run at an earlier gate cannot also decide this gate (separation of duties; set allowSelfDecision to permit)',
         );
@@ -502,21 +529,23 @@ export class ApprovalService {
     const now = this.#now().toISOString();
     const patch: ApprovalPatch = {
       status: input.decision === 'approve' ? 'approved' : 'rejected',
-      decidedBy: actor.id,
+      decidedBy: authorized.id,
       decision: input.decision,
       decidedAt: now,
       updatedAt: now,
     };
     if (input.comment !== undefined) patch.comment = input.comment;
-    const updated = await this.#transitionOrExplain(id, 'decide', actor, {
+    const updated = await this.#transitionOrExplain(id, 'decide', authorized, {
       from: OPEN_STATUSES,
       patch,
     });
     // Annotate a PERMITTED self-decision from the post-transition record (no
     // extra read): an exercised SoD exemption must leave an audit trail. Fires
     // for both a global `true` and a role-scoped exemption.
-    const selfDecision = updated.requestedBy === actor.id;
-    this.#record(actor, 'approval.decide', `approval:${id}`, 'allowed', {
+    const selfDecision =
+      updated.requestedBy === authorized.id &&
+      (updated.requestedByKind ?? 'human') === 'human';
+    this.#record(authorized, 'approval.decide', `approval:${id}`, 'allowed', {
       detail: {
         decision: input.decision,
         // Queue dwell time (created -> decided), in seconds. Feeds the
@@ -524,7 +553,6 @@ export class ApprovalService {
         // metricsAuditSink observes — any emitter may adopt the field.
         durationSeconds:
           (Date.parse(now) - Date.parse(updated.createdAt)) / 1000,
-        tenantId: updated.tenantId,
         workflowId: updated.workflowId,
         runId: updated.runId,
         grantScope: updated.grantScope,
@@ -551,12 +579,14 @@ export class ApprovalService {
       this.#stream,
       { type: 'decided', record: updated },
       (reason) =>
-        this.#record(actor, 'approval.stream', `approval:${id}`, 'error', {
+        this.#record(authorized, 'approval.stream', `approval:${id}`, 'error', {
           reason,
-          detail: { tenantId: updated.tenantId },
         }),
     );
-    return { record: updated, resume: await this.#resume(updated, actor) };
+    return {
+      record: updated,
+      resume: await this.#resume(updated, authorized),
+    };
   }
 
   /**
@@ -577,7 +607,12 @@ export class ApprovalService {
     input: { decision: ApprovalDecision; comment?: string },
     actor: ApprovalActor,
   ): Promise<BatchDecideResult> {
-    this.#authorize(actor, CAN_REVIEW, 'approval.decide', 'approval');
+    const authorized = this.#authorize(
+      actor,
+      CAN_REVIEW,
+      'approval.decide',
+      'approval',
+    );
     if (!Array.isArray(ids) || ids.length === 0) {
       throw new InvalidApprovalInputError(
         'ids must be a non-empty array of approval ids',
@@ -602,7 +637,7 @@ export class ApprovalService {
     const results: BatchDecideItem[] = [];
     for (const id of unique) {
       try {
-        const { record, resume } = await this.decide(id, input, actor);
+        const { record, resume } = await this.decide(id, input, authorized);
         results.push({ id, ok: true, record, resume });
       } catch (error) {
         results.push({
@@ -617,7 +652,7 @@ export class ApprovalService {
     const failed = results.length - decided;
     // Summary only — each decide() above already left its own per-record
     // trail (allowed/denied), so this is the batch's one-line correlation.
-    this.#record(actor, 'approval.decide.batch', 'approval', 'allowed', {
+    this.#record(authorized, 'approval.decide.batch', 'approval', 'allowed', {
       detail: { requested: unique.length, decided, failed },
     });
     return { results, decided, failed };
@@ -647,7 +682,7 @@ export class ApprovalService {
    * reconcileApprovalsForSummary, itself only invoked from createRunRouter's
    * optional reconcileApprovals hook on a status() read, never from a
    * request body. Authorized like create() (CAN_CREATE, not CAN_REVIEW):
-   * the only actor that ever calls this is the same system actor create()
+   * the only principal that ever calls this is the same system principal create()
    * already accepts for reconcile-filed records — superseding is the
    * symmetric "un-file" half of that same self-healing operation, not a
    * reviewer decision.
@@ -663,8 +698,13 @@ export class ApprovalService {
     actor: ApprovalActor,
     reason: string,
   ): Promise<ApprovalRecord | null> {
-    this.#authorize(actor, CAN_CREATE, 'approval.supersede', `approval:${id}`);
-    return this.#supersedeAuthorized(id, actor, reason);
+    const authorized = this.#authorize(
+      actor,
+      CAN_CREATE,
+      'approval.supersede',
+      `approval:${id}`,
+    );
+    return this.#supersedeAuthorized(id, authorized, reason);
   }
 
   /**
@@ -709,7 +749,6 @@ export class ApprovalService {
     this.#record(actor, 'approval.supersede', `approval:${id}`, 'allowed', {
       reason,
       detail: {
-        tenantId: updated.tenantId,
         workflowId: updated.workflowId,
         runId: updated.runId,
         ...provenance,
@@ -723,7 +762,7 @@ export class ApprovalService {
       (streamError) =>
         this.#record(actor, 'approval.stream', `approval:${id}`, 'error', {
           reason: streamError,
-          detail: { tenantId: updated.tenantId, ...provenance },
+          detail: { ...provenance },
         }),
     );
     return updated;
@@ -734,7 +773,12 @@ export class ApprovalService {
     input: { to: string },
     actor: ApprovalActor,
   ): Promise<ApprovalRecord> {
-    this.#authorize(actor, CAN_REVIEW, 'approval.delegate', `approval:${id}`);
+    const authorized = this.#authorize(
+      actor,
+      CAN_REVIEW,
+      'approval.delegate',
+      `approval:${id}`,
+    );
     if (!isNonEmptyString(input.to)) {
       throw new InvalidApprovalInputError(
         "delegate requires a non-empty 'to' reviewer id",
@@ -746,26 +790,30 @@ export class ApprovalService {
     // assignee is the last write. Delegation is reassignment — unlike decide
     // (mutual exclusion) or claim (no-steal), there is no side effect to
     // protect, only a pointer to move.
-    const updated = await this.#transitionOrExplain(id, 'delegate', actor, {
-      from: OPEN_STATUSES,
-      patch: {
-        status: 'claimed',
-        claimedBy: input.to,
-        delegatedTo: input.to,
-        claimedAt: now,
-        updatedAt: now,
+    const updated = await this.#transitionOrExplain(
+      id,
+      'delegate',
+      authorized,
+      {
+        from: OPEN_STATUSES,
+        patch: {
+          status: 'claimed',
+          claimedBy: input.to,
+          delegatedTo: input.to,
+          claimedAt: now,
+          updatedAt: now,
+        },
       },
-    });
-    this.#record(actor, 'approval.delegate', `approval:${id}`, 'allowed', {
+    );
+    this.#record(authorized, 'approval.delegate', `approval:${id}`, 'allowed', {
       detail: { to: input.to },
     });
     fireStreamEvent(
       this.#stream,
       { type: 'delegated', record: updated },
       (reason) =>
-        this.#record(actor, 'approval.stream', `approval:${id}`, 'error', {
+        this.#record(authorized, 'approval.stream', `approval:${id}`, 'error', {
           reason,
-          detail: { tenantId: updated.tenantId },
         }),
     );
     return updated;
@@ -805,7 +853,16 @@ export class ApprovalService {
     record: ApprovalRecord,
     actor: ApprovalActor,
   ): Promise<ResumeOutcome> {
-    if (!this.#resumeRun) return { attempted: false };
+    // A plain queue record is a decision log, not proof that a suspended run
+    // exists. Only trusted in-process creation can author one of these three
+    // resumability anchors; the optional HTTP create route rejects all three.
+    // Without an anchor, calling resumeRun would turn an attacker-selected
+    // runId on an inert record into a target invocation after review.
+    const resumable =
+      record.stepPath !== undefined ||
+      record.runScoped === true ||
+      record.resumeTarget !== undefined;
+    if (!this.#resumeRun || !resumable) return { attempted: false };
     // record.decision is set by decide()'s patch before this runs.
     const decision = record.decision as ApprovalDecision;
     try {
@@ -817,7 +874,6 @@ export class ApprovalService {
         'allowed',
         {
           detail: {
-            tenantId: record.tenantId,
             workflowId: record.workflowId,
             runId: record.runId,
           },
@@ -831,7 +887,6 @@ export class ApprovalService {
       this.#record(actor, 'approval.resume', `approval:${record.id}`, 'error', {
         reason: message,
         detail: {
-          tenantId: record.tenantId,
           workflowId: record.workflowId,
           runId: record.runId,
         },
@@ -845,41 +900,23 @@ export class ApprovalService {
     roles: readonly ApprovalRole[],
     action: string,
     resource: string,
-  ): void {
-    if (
-      isNonEmptyString(actor?.id) &&
-      (APPROVAL_ROLES as readonly string[]).includes(actor.role) &&
-      roles.includes(actor.role) &&
-      // INV-2 belt at the service layer: the acting principal's tenant must
-      // BE the store's binding. The resolver constructs the service from the
-      // actor's own tenant so this can only fire on a wiring bug — which is
-      // exactly when it must fail closed rather than act cross-tenant.
-      isNonEmptyString(actor.tenantId) &&
-      actor.tenantId === this.#store.tenantId
-    ) {
-      return;
+  ): ApprovalActor {
+    const canonical = canonicalApprovalActor(actor);
+    if (canonical && roles.includes(canonical.role)) {
+      return canonical;
     }
-    const roleOk =
-      actor !== null &&
-      actor !== undefined &&
-      (APPROVAL_ROLES as readonly string[]).includes(actor.role) &&
-      roles.includes(actor.role);
-    this.#record(actor ?? null, action, resource, 'denied', {
-      reason: !actor
+    this.#record(canonical ?? null, action, resource, 'denied', {
+      reason: !canonical
         ? 'no actor'
-        : !roleOk
-          ? `role '${actor.role}' is not in [${roles.join(', ')}]`
-          : `actor tenant '${actor.tenantId}' does not match the store binding '${this.#store.tenantId}'`,
+        : `role '${canonical.role}' is not in [${roles.join(', ')}]`,
     });
     throw new ApprovalAuthzError(
-      roleOk && actor
-        ? `${action}: actor tenant does not match this service's tenant binding`
-        : `${action} requires one of roles [${roles.join(', ')}]`,
+      `${action} requires one of roles [${roles.join(', ')}]`,
     );
   }
 
   /**
-   * Authorize an automated caller on kind, brand, and tenant.
+   * Authorize an automated caller on kind and brand.
    *
    * The parameter type is NOT the enforcement. `trustAutomationPrincipal` is
    * the only minter, but TypeScript is erased at runtime, so a cast or a value
@@ -887,10 +924,6 @@ export class ApprovalService {
    * caller left it. Re-reading the brand and the shape is what turns "only the
    * minter produces this" from a convention into a check — and it is what stops
    * a principal validated as `system` from being read back as a human `admin`.
-   *
-   * The tenant is checked for the same reason `#authorize` checks it: the
-   * resolver builds the service from the principal's own tenant, so a mismatch
-   * can only be a wiring bug — exactly when it must fail closed.
    */
   #authorizeAutomated(
     principal: TrustedAutomationPrincipal,
@@ -909,16 +942,6 @@ export class ApprovalService {
         `${action}: principal is not a vouched automated principal`,
       );
     }
-    if (principal.tenantId === this.#store.tenantId) return;
-    this.#record(principalActor(principal), action, resource, 'denied', {
-      reason: `principal tenant '${principal.tenantId}' does not match the store binding '${this.#store.tenantId}'`,
-      // A denial is an automated event too: without these the only automated
-      // audit rows carrying provenance would be the ones that succeeded.
-      detail: principalAuditFields(principal),
-    });
-    throw new ApprovalAuthzError(
-      `${action}: principal tenant does not match this service's tenant binding`,
-    );
   }
 
   // Callers pass the final resource string ('approval' for collection-level
@@ -977,13 +1000,13 @@ export class ApprovalService {
     if (!isNonEmptyString(input.runId)) {
       throw new InvalidApprovalInputError('runId is required');
     }
-    // Cheap INV-1 belt: every read path filters on the tenant_id COLUMN (not
-    // by parsing run_id), so a foreign-prefixed record would not leak — but it
-    // would be an orphan row no tenant's queue ever shows. Turn it into a
-    // loud error at the only write path.
-    if (!tenantOwnsSaltedId(this.#store.tenantId, input.runId)) {
+    // Cheap INV-1 belt at the only write path: an approval binds to a
+    // server-minted run, and every context a runId keys (D1 row, DO name,
+    // URL path) requires the path-safe charset. A record filed under a
+    // malformed runId would be an orphan no resume can ever reach.
+    if (!isPathSafeId(input.runId)) {
       throw new InvalidApprovalInputError(
-        `runId '${input.runId}' does not carry this tenant's prefix '${this.#store.tenantId}_' — approvals bind to tenant-salted runs (INV-1)`,
+        `runId '${input.runId}' is not path-safe — approvals bind to server-minted runs (INV-1)`,
       );
     }
     if (!isNonEmptyString(input.title)) {
@@ -1021,10 +1044,26 @@ export class ApprovalService {
     // match no actor and, worse, read as "attributed" to any later reader.
     if (
       input.requestedBy !== undefined &&
-      !isNonEmptyString(input.requestedBy)
+      !isExecutionPrincipalId(input.requestedBy)
     ) {
       throw new InvalidApprovalInputError(
-        'requestedBy must be a non-empty string',
+        'requestedBy must be a valid execution principal id',
+      );
+    }
+    if (
+      input.requestedByKind !== undefined &&
+      !isExecutionPrincipalKind(input.requestedByKind)
+    ) {
+      throw new InvalidApprovalInputError(
+        `requestedByKind must be one of [${EXECUTION_PRINCIPAL_KINDS.join(', ')}]`,
+      );
+    }
+    if (
+      (input.requestedBy === undefined) !==
+      (input.requestedByKind === undefined)
+    ) {
+      throw new InvalidApprovalInputError(
+        'requestedBy and requestedByKind must be provided together',
       );
     }
     // runScoped is a capability switch (mints on every leg); only a real
@@ -1130,48 +1169,14 @@ export class ApprovalService {
     }
   }
 
-  #validateResumeTarget(target: ApprovalResumeTarget): void {
-    if (target === null || typeof target !== 'object') {
+  #canonicalResumeTarget(target: ApprovalResumeTarget): ApprovalResumeTarget {
+    const canonical = canonicalApprovalResumeTarget(target);
+    if (!canonical) {
       throw new InvalidApprovalInputError(
-        'resumeTarget must be a trusted thread or agent-thread target',
+        'resumeTarget must be a trusted thread or agent-thread target with path-safe ids and a valid execution principal',
       );
     }
-    const ownsPathSafeId = (value: unknown): value is string =>
-      typeof value === 'string' &&
-      PATH_SAFE_ID_PATTERN.test(value) &&
-      tenantOwnsSaltedId(this.#store.tenantId, value);
-    if (target.kind === 'thread') {
-      if (
-        !ownsPathSafeId(target.threadId) ||
-        (target.resourceId !== undefined && !ownsPathSafeId(target.resourceId))
-      ) {
-        throw new InvalidApprovalInputError(
-          'resumeTarget must name path-safe thread/resource ids owned by the bound tenant',
-        );
-      }
-      return;
-    }
-    if (target.kind === 'agent-thread') {
-      if (
-        typeof target.agentId !== 'string' ||
-        !PATH_SAFE_ID_PATTERN.test(target.agentId) ||
-        !ownsPathSafeId(target.threadId) ||
-        !ownsPathSafeId(target.resourceId) ||
-        // Fails closed on the pre-principal `{id, role, tenantId}` form: an
-        // ApprovalActor is not an ExecutionPrincipal, and coercing one would
-        // resurrect a fabricated operator as a human.
-        !isExecutionPrincipal(target.principal) ||
-        target.principal.tenantId !== this.#store.tenantId
-      ) {
-        throw new InvalidApprovalInputError(
-          'agent resumeTarget must name path-safe ids and a valid execution principal owned by the bound tenant',
-        );
-      }
-      return;
-    }
-    throw new InvalidApprovalInputError(
-      'resumeTarget must be a trusted thread or agent-thread target',
-    );
+    return canonical;
   }
 }
 
@@ -1245,14 +1250,13 @@ function fireStreamEvent(
 /** Options for the cron-owned SLA sweep. */
 export interface SweepSLAOptions {
   /**
-   * Attribution identity for audit events (e.g. the worker's system actor).
-   * Attribution only — the sweep runs inside the trusted computing base
-   * (cron), so there is no role check: the TYPE of the store argument is the
-   * authorization (a SystemApprovalStore is unobtainable from request scope).
+   * Attribution identity for audit events (e.g. the worker's system principal).
+   * Attribution only — the sweep runs inside the trusted maintenance path, so
+   * there is no role check.
    *
    * Automated kinds only, and REFUSED at runtime as well: a human here would
-   * stamp `principalKind: 'human'` onto cross-tenant cron escalations, which is
-   * the synthetic operator this whole model exists to remove.
+   * stamp `principalKind: 'human'` onto maintenance escalations, which would
+   * misattribute automated work to a role-bearing human identity.
    */
   systemPrincipal: AutomatedExecutionPrincipal;
   audit?: ApprovalAuditSink;
@@ -1281,25 +1285,17 @@ export interface SweepSLAOptions {
 }
 
 /**
- * Escalate every open request past its SLA deadline, ACROSS TENANTS.
+ * Escalate every open request past its SLA deadline in this deployment.
  * Idempotent: already escalated records are not re-escalated (their status
- * left the guard set). Cron-owned TCB code — deliberately NOT a service
- * method and NOT reachable over HTTP: an unfiltered cross-tenant read+write
- * behind a role check was an IDOR-shaped hole (any CAN_SWEEP actor could
- * escalate every tenant's queue). The distinct SystemApprovalStore parameter
- * type makes "cross-tenant reads happen only inside the TCB" a compile-time
- * property, not a convention.
+ * left the guard set). Trusted-maintenance code — deliberately not a service
+ * method and not reachable over HTTP.
  */
 export async function sweepSLA(
-  store: SystemApprovalStore,
+  store: ApprovalStore,
   options: SweepSLAOptions,
 ): Promise<ApprovalRecord[]> {
-  // The principal is attribution, not authorization — the SystemApprovalStore
-  // type is the authorization. The parameter type already excludes a human;
-  // this is the erased-type half, because this is the one exported cross-tenant
-  // function that CARRIES an attribution principal (purgeExpiredApprovals takes
-  // none, so it has no attribution to corrupt), and a bad principal here makes
-  // every escalation it emits, for every tenant, unattributable.
+  // The principal is attribution, not authorization. The parameter type
+  // excludes a human, and the runtime check closes the erased-type boundary.
   const systemPrincipal = canonicalAutomatedPrincipal(options.systemPrincipal);
   if (systemPrincipal === undefined) {
     throw new Error(
@@ -1343,9 +1339,8 @@ export async function sweepSLA(
   const at = now();
   const nowIso = at.toISOString();
   const escalated: ApprovalRecord[] = [];
-  // D3: page the cross-tenant open set with an explicit cursor instead of one
-  // unbounded SELECT (the system view is deliberately un-defaulted, so a bare
-  // list() here would be the whole table). Keyset paging is on (createdAt, id);
+  // D3: page the deployment's open set with an explicit cursor. Keyset paging
+  // is on (createdAt, id);
   // escalating a record only drops it from the pending/claimed filter and never
   // changes its cursor position, so every currently-open record is visited
   // exactly once — no skips, no repeats — and every breach as of `at` still
@@ -1374,10 +1369,7 @@ export async function sweepSLA(
       escalated.push(updated);
       record('approval.escalate', `approval:${updated.id}`, 'allowed', {
         reason: `SLA deadline ${updated.slaDeadlineAt} breached`,
-        // tenantId attributes the escalation: a cross-tenant sweep without it
-        // emits unattributable audit events.
         detail: {
-          tenantId: updated.tenantId,
           workflowId: updated.workflowId,
           runId: updated.runId,
         },
@@ -1390,7 +1382,6 @@ export async function sweepSLA(
           // abort the sweep. The audit trail keeps the evidence.
           record('approval.escalate', `approval:${updated.id}`, 'error', {
             reason: `onEscalation threw: ${errorMessage(error)}`,
-            detail: { tenantId: updated.tenantId },
           });
         }
       }
@@ -1400,7 +1391,6 @@ export async function sweepSLA(
         (reason) =>
           record('approval.notify', `approval:${updated.id}`, 'error', {
             reason,
-            detail: { tenantId: updated.tenantId },
           }),
       );
       fireStreamEvent(
@@ -1409,7 +1399,6 @@ export async function sweepSLA(
         (reason) =>
           record('approval.stream', `approval:${updated.id}`, 'error', {
             reason,
-            detail: { tenantId: updated.tenantId },
           }),
       );
     }

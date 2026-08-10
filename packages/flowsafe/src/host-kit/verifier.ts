@@ -9,18 +9,14 @@
 //     worker mints these; a commercial IdP later drops in as another
 //     TokenVerifier implementation without touching the routers).
 //
-// TRUSTED-COMPUTING-BASE code: a verifier ASSERTS identity, including
-// `tenantId` — the axis every isolation predicate keys on. Every path out of
-// this module therefore validates the tenant against TENANT_ID_PATTERN
-// (INV-3) and the role against APPROVAL_ROLES before an ApprovalActor exists.
-// Fail closed: anything malformed verifies to `undefined` (a 401), never to a
-// default actor.
+// TRUSTED-COMPUTING-BASE code: a verifier asserts identity. Every path out of
+// this module validates the role before an ApprovalActor exists. Fail closed:
+// anything malformed verifies to `undefined` (a 401), never to a default actor.
 
-import { APPROVAL_ROLES, type ApprovalActor } from '../approval-api/index.js';
 import {
-  RESERVED_TENANT_IDS,
-  TENANT_ID_PATTERN,
-} from '../do-runner/path-safe-id.js';
+  type ApprovalActor,
+  canonicalApprovalActor,
+} from '../approval-api/index.js';
 
 export interface TokenVerifier {
   verify(token: string): Promise<ApprovalActor | undefined>;
@@ -29,43 +25,24 @@ export interface TokenVerifier {
 /**
  * Validate an untyped candidate into an ApprovalActor — the ONE place a
  * decoded token/map entry becomes an identity. No `as`-casting at the JSON
- * boundary: id non-empty, role recognized, tenantId pattern-valid and not a
- * reserved identity.
+ * boundary: id non-empty and role recognized.
  */
 export function toApprovalActor(candidate: unknown): ApprovalActor | undefined {
-  if (candidate === null || typeof candidate !== 'object') return undefined;
-  const { id, role, tenantId } = candidate as {
-    id?: unknown;
-    role?: unknown;
-    tenantId?: unknown;
-  };
-  if (typeof id !== 'string' || id.length === 0) return undefined;
-  if (
-    typeof role !== 'string' ||
-    !(APPROVAL_ROLES as readonly string[]).includes(role)
-  ) {
-    return undefined;
-  }
-  if (typeof tenantId !== 'string' || !TENANT_ID_PATTERN.test(tenantId)) {
-    return undefined;
-  }
-  // 'system' is the TCB's own audit identity (cron maintenance attribution);
-  // a client token claiming it would launder into the operator's maintenance
-  // log stream. Only RESERVED_TENANT_IDS bites here: rejecting the routing
-  // slugs (api/docs/...) too would 401 a single-tenant host named 'api' over
-  // a subdomain collision that cannot occur on a host with no subdomains —
-  // those stay allocation/routing concerns (RESERVED_FOR_ALLOCATION).
-  if (RESERVED_TENANT_IDS.includes(tenantId)) return undefined;
-  return { id, role: role as ApprovalActor['role'], tenantId };
+  return canonicalApprovalActor(candidate);
 }
 
 /** The parsed bearer map as a TokenVerifier (entries are pre-validated). */
 export function staticTokenVerifier(
   actors: ReadonlyMap<string, ApprovalActor>,
 ): TokenVerifier {
+  const canonical = new Map<string, ApprovalActor>();
+  for (const [token, actor] of actors) {
+    const snapshot = canonicalApprovalActor(actor);
+    if (snapshot) canonical.set(token, snapshot);
+  }
   return {
     async verify(token) {
-      return actors.get(token);
+      return canonical.get(token);
     },
   };
 }
@@ -95,7 +72,6 @@ interface JwtClaims {
   nbf?: unknown;
   sub?: unknown;
   role?: unknown;
-  tenantId?: unknown;
 }
 
 const encoder = new TextEncoder();
@@ -174,7 +150,7 @@ async function importHmacKey(
  * cannot choose its own verification scheme. Signature comparison goes
  * through crypto.subtle.verify (constant-time), never a hand-rolled string
  * compare. Claims checked: exp (required), nbf (when present), iss, aud
- * (string or array), then sub/role/tenantId through toApprovalActor.
+ * (string or array), then sub/role through toApprovalActor.
  */
 export function hmacVerifier(options: HmacVerifierOptions): TokenVerifier {
   const now = options.now ?? Date.now;
@@ -228,7 +204,6 @@ export function hmacVerifier(options: HmacVerifierOptions): TokenVerifier {
       return toApprovalActor({
         id: claims.sub,
         role: claims.role,
-        tenantId: claims.tenantId,
       });
     },
   };
@@ -262,7 +237,6 @@ export async function mintHmacToken(
     aud: options.audience,
     sub: options.actor.id,
     role: options.actor.role,
-    tenantId: options.actor.tenantId,
     iat: nowSeconds,
     exp: nowSeconds + options.ttlSeconds,
   };

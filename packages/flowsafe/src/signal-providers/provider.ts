@@ -9,12 +9,12 @@
 // agent, and it matches webhooks against a base-class subscription registry that
 // lives in an in-memory Map. Neither fits a Cloudflare provider-host DO: the
 // agent loop runs on a DIFFERENT (per-thread) DO, so there is no co-located
-// agent to notify, and the in-memory registry is empty after eviction and
-// tenant-blind. So flowsafe drives providers through THIS adapter seam and
+// agent to notify, and the in-memory registry is empty after eviction. Flowsafe
+// therefore drives providers through this adapter seam and
 // routes every delivery through `createThreadTopology.send` (host-kit) into
 // Track C's `/signal/notification` thread-DO route — the DO alarm replaces
 // core's `startPolling` timer and the D1 subscription store replaces its
-// registry (DL-017).
+// deployment registry (DL-017).
 //
 // A provider built here IS a core `SignalProvider` (it extends the base), so
 // `isSignalProvider(p)` holds and `new Agent({ signals: [p] })` still merges any
@@ -45,8 +45,8 @@ export interface WebhookHeaders {
 /**
  * One notification to deliver to one matched subscription — what a provider's
  * poll or webhook parse produces, before the host routes it through the
- * topology. The `subscription` carries the tenant/thread/resource the delivery
- * is bound to (never the payload — the row is the authority).
+ * topology. The `subscription` carries the thread/resource binding (never the
+ * payload — the persisted row is the authority).
  */
 export interface ProviderDelivery {
   subscription: SignalSubscription;
@@ -101,9 +101,8 @@ export interface SignalProviderAdapter {
 }
 
 /**
- * Provider-id charset: a stable lowercase URL/config slug. The provider host is
- * addressed by the bare tenant id, not by a tenant/provider composite; this
- * deliberately strict grammar keeps provider ids portable across route
+ * Provider-id charset: a stable lowercase URL/config slug. This deliberately
+ * strict grammar keeps provider ids portable across route
  * segments, configuration keys, audit dimensions, and durable rows.
  */
 export const PROVIDER_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;

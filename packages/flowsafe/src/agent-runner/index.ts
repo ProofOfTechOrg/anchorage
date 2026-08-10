@@ -20,6 +20,7 @@ export {
   agentRunStorageKey,
   bindAgentThread,
   deleteAgentRunRecord,
+  deleteAgentThreadBinding,
   readAgentRunRecord,
   readAgentThreadBinding,
   writeAgentRunRecord,

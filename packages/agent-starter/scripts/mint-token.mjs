@@ -7,7 +7,6 @@ import { APPROVAL_ROLES } from '@proofoftech/flowsafe/approval-api';
 import { mintHmacToken, toApprovalActor } from '@proofoftech/flowsafe/host-kit';
 
 export async function mintStarterToken({
-  tenantId,
   role,
   actorId,
   secret,
@@ -21,11 +20,9 @@ export async function mintStarterToken({
     throw new Error(`role must be one of: ${APPROVAL_ROLES.join(', ')}`);
   }
 
-  const actor = toApprovalActor({ id: actorId, role, tenantId });
+  const actor = toApprovalActor({ id: actorId, role });
   if (!actor) {
-    throw new Error(
-      'actorId must be non-empty and tenantId must be a valid, non-reserved tenant ID',
-    );
+    throw new Error('actorId must be non-empty');
   }
 
   return mintHmacToken({
@@ -39,10 +36,8 @@ export async function mintStarterToken({
 }
 
 async function main() {
-  const [tenantId = 'acme', role = 'operator', actorId = 'local-operator'] =
-    process.argv.slice(2);
+  const [role = 'operator', actorId = 'local-operator'] = process.argv.slice(2);
   const token = await mintStarterToken({
-    tenantId,
     role,
     actorId,
     secret: process.env.AUTH_HMAC_SECRET,

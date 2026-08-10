@@ -27,16 +27,14 @@
 // external webhook); such a task's resume mints no capability.
 //
 // Execution is opt-in. The host accepts it only with the serialized D1 workflow
-// adapter and a task domain bound to the same tenant. One DO isolate owns that
-// manager and both domains, so core's tenant-blind recovery sees only that
-// tenant's rows. `boot()` then starts Mastra's public evented workers on the
+// adapter and the paired task domain. One DO isolate owns that manager and both
+// domains. `boot()` then starts Mastra's public evented workers on the
 // raw pubsub instance the caller passed to Mastra. Persistence-only hosts retain
 // the earlier warning.
 //
-// Core still keys an internal `__background-task` workflow by the unsalted task
-// ID. The tenant-scoped store, TTL purge, and offboarding paths therefore delete
-// the internal snapshot before deleting the task row that supplies its tenant
-// association.
+// Core keys an internal `__background-task` workflow separately from the task
+// row. The specialized store and TTL purge therefore delete the internal
+// snapshot before deleting the task row.
 
 import {
   BackgroundTaskManager,
@@ -53,9 +51,9 @@ import {
 } from '../numeric-config.js';
 import {
   backgroundTasksStore,
+  DURABLE_OBJECT_BACKGROUND_TASKS_D1,
+  type DurableObjectBackgroundTasksStorageD1,
   SERIALIZED_WORKFLOWS_D1,
-  TENANT_SCOPED_BACKGROUND_TASKS_D1,
-  type TenantScopedBackgroundTasksStorageD1,
 } from './d1-storage.js';
 
 export interface BackgroundTaskHostOptions {
@@ -94,10 +92,10 @@ export interface BackgroundTaskHostOptions {
    */
   manager?: Omit<BackgroundTaskManagerConfig, 'enabled'>;
   /**
-   * Enable real evented-worker execution for one tenant DO. Omit to preserve
+   * Enable real evented-worker execution for this Durable Object. Omit to preserve
    * the persistence/recovery-only behavior.
    */
-  execution?: { tenantId: string };
+  execution?: boolean;
 }
 
 function validateManagerConfig(
@@ -185,7 +183,7 @@ function validateManagerConfig(
  * boot/alarm lifecycle that makes DO eviction survivable. The hosting DO owns
  * alarm arming (it needs `ctx.storage.setAlarm`); this class owns the manager
  * wiring, the recovery-firing `boot()`, and the alarm `cleanup()` duty. The raw
- * manager is reachable as `.manager` for the tenant-bound routes to wrap — never
+ * manager is reachable as `.manager` for the read-only routes to wrap — never
  * expose it directly over HTTP.
  */
 export class BackgroundTaskHost {
@@ -193,7 +191,7 @@ export class BackgroundTaskHost {
   readonly #mastra: Mastra;
   readonly #pubsub: HostPubSub;
   readonly #executors: Record<string, ToolExecutor>;
-  readonly #execution?: { tenantId: string };
+  readonly #execution: boolean;
   #booted?: Promise<void>;
   #bootSettled = false;
   #managerNeedsShutdown = false;
@@ -206,7 +204,7 @@ export class BackgroundTaskHost {
     this.#mastra = options.mastra;
     this.#pubsub = options.pubsub;
     this.#executors = options.executors;
-    this.#execution = options.execution;
+    this.#execution = options.execution ?? false;
     this.manager = new BackgroundTaskManager({
       enabled: true,
       ...options.manager,
@@ -244,7 +242,7 @@ export class BackgroundTaskHost {
     // Fail-fast with a clear message before any dispatch could surface core's
     // terser error deep in a lifecycle callback.
     const tasks = await backgroundTasksStore(this.#mastra);
-    // Execution mode validates every required ownership and concurrency seam.
+    // Execution mode validates every required storage and concurrency seam.
     if (this.#execution) {
       const workflows = await this.#mastra.getStorage()?.getStore('workflows');
       if (
@@ -257,15 +255,14 @@ export class BackgroundTaskHost {
           'background-tasks: execution requires DurableObjectWorkflowsStorageD1',
         );
       }
-      const tenantTasks = tasks as TenantScopedBackgroundTasksStorageD1;
+      const durableTasks = tasks as DurableObjectBackgroundTasksStorageD1;
       if (
-        (tenantTasks as unknown as Record<symbol, unknown>)[
-          TENANT_SCOPED_BACKGROUND_TASKS_D1
-        ] !== true ||
-        tenantTasks.tenantId !== this.#execution.tenantId
+        (durableTasks as unknown as Record<symbol, unknown>)[
+          DURABLE_OBJECT_BACKGROUND_TASKS_D1
+        ] !== true
       ) {
         throw new Error(
-          'background-tasks: execution requires a task store branded for the same tenant',
+          'background-tasks: execution requires DurableObjectBackgroundTasksStorageD1',
         );
       }
     } else {
@@ -315,7 +312,7 @@ export class BackgroundTaskHost {
     const supports = workflows?.supportsConcurrentUpdates?.() ?? false;
     if (!supports) {
       console.warn(
-        'background-tasks: persistence-only mode cannot execute task bodies because the workflows domain does not support concurrent updates; configure createBackgroundTaskD1Domains and execution.tenantId on one single-tenant Durable Object to enable execution',
+        'background-tasks: persistence-only mode cannot execute task bodies because the workflows domain does not support concurrent updates; configure createBackgroundTaskD1Domains and execution: true on one Durable Object to enable execution',
       );
     }
   }

@@ -45,7 +45,7 @@ const DEMO_POINTS = [
   'Six real agent workflows execute server-side and suspend durably at human approval gates, including multi-gate, branching, and re-suspension shapes.',
   'Four roles (operator, reviewer, admin, viewer): RBAC and separation of duties are enforced server-side. Watch your own requests get refused.',
   'Every approval derives a capability grant bound to that exact suspension; a forged resume finds no grant and fails closed.',
-  'Dangerous side effects are simulated: emails and deploys are logged, never delivered. The grants, tenant isolation, and durable suspend/resume are real.',
+  'Dangerous side effects are simulated: emails and deploys are logged, never delivered. The grants, deployment-wide limits, and durable suspend/resume are real.',
 ];
 
 /**
@@ -116,9 +116,9 @@ export function TokenGate({
           {demoSignIn.status === 'loading' ? null : oauth ? (
             <VStack gap={3}>
               <Text>
-                This demo is the full open-source platform running against a
-                sandbox, not a video or a mock. Poke at it and judge the safety
-                story yourself:
+                This demo is the full open-source platform running in one shared
+                organization, not a video or a mock. Poke at it and judge the
+                safety story yourself:
               </Text>
               <VStack gap={2}>
                 {DEMO_POINTS.map((point) => (
@@ -133,8 +133,9 @@ export function TokenGate({
                 ))}
               </VStack>
               <Text>
-                You get an isolated throwaway tenant. Nothing you do is visible
-                to anyone else, and it self-destructs in about 24 hours.
+                You join one shared demo organization. Runs and approvals are
+                visible to other signed-in visitors; your session expires in
+                about 24 hours.
               </Text>
               <Button
                 label={`Sign in with ${providerDisplayName(oauth.provider)}`}

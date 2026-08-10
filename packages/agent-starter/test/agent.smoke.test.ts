@@ -6,7 +6,6 @@ import {
   ACTOR_CONTEXT_KEY,
   AuditLogger,
   ConnectorPolicyError,
-  ISOLATION_SCOPE_CONTEXT_KEY,
 } from '@proofoftech/breakwater';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -72,14 +71,13 @@ describe('advanced starter agent', () => {
     const { db, prepare } = sideEffectTrap();
     const connector = createRecordActionConnector(db);
     const requestContext = new RequestContext();
-    requestContext.set(ISOLATION_SCOPE_CONTEXT_KEY, 'acme');
     const context = {
       requestContext,
       agent: {
         agentId: 'anchorage-agent',
         toolCallId: 'call-smoke',
-        threadId: 'acme_thread',
-        resourceId: 'acme_resource',
+        threadId: 'thread-smoke',
+        resourceId: 'resource-smoke',
         messages: [],
         suspend: async () => undefined,
       },

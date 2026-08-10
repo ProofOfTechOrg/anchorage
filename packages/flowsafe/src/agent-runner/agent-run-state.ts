@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import {
+  assertExecutionPrincipal,
   type ExecutionPrincipal,
-  isExecutionPrincipal,
   samePrincipal,
 } from '../approval-api/principal.js';
-import {
-  PATH_SAFE_ID_PATTERN,
-  tenantOwnsSaltedId,
-} from '../do-runner/path-safe-id.js';
-import type { ResumeLedgerStorage } from '../do-runner/resume-ledger.js';
+import type { DurableKeyValueStorage } from '../do-runner/cf-types.js';
+import { isPathSafeId } from '../do-runner/path-safe-id.js';
 
 export const AGENT_THREAD_BINDING_STORAGE_KEY =
   'flowsafe:agent-thread-binding:v1';
@@ -41,8 +38,8 @@ export interface AgentThreadBinding {
  * ApprovalActor. There is deliberately no v1 upgrade path: a run started from
  * `schedule.fire` stored the fabricated `role: 'operator'` that this work
  * exists to remove, so reading a v1 record back as a human principal would
- * launder that authority through a migration. `validRunRecord` rejects v1 and
- * the run fails closed — a suspended pre-upgrade agent run cannot resume.
+ * launder that authority through a migration. `canonicalRunRecord` rejects v1,
+ * so a suspended pre-upgrade agent run cannot resume.
  */
 export interface AgentRunRecord {
   version: 2;
@@ -65,67 +62,90 @@ export class AgentRunStateConflictError extends AgentRunStateError {
   }
 }
 
-function validBinding(value: unknown): value is AgentThreadBinding {
-  if (value === null || typeof value !== 'object') return false;
-  const candidate = value as Partial<AgentThreadBinding>;
-  return (
-    candidate.version === 1 &&
-    typeof candidate.agentId === 'string' &&
-    PATH_SAFE_ID_PATTERN.test(candidate.agentId) &&
-    typeof candidate.resourceId === 'string' &&
-    PATH_SAFE_ID_PATTERN.test(candidate.resourceId)
-  );
+function stateField(value: object, key: PropertyKey): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor !== undefined && 'value' in descriptor
+    ? descriptor.value
+    : undefined;
 }
 
-function validRunRecord(
+function canonicalBinding(value: unknown): AgentThreadBinding | undefined {
+  if (value === null || typeof value !== 'object') return undefined;
+  const version = stateField(value, 'version');
+  const agentId = stateField(value, 'agentId');
+  const resourceId = stateField(value, 'resourceId');
+  if (version !== 1 || !isPathSafeId(agentId) || !isPathSafeId(resourceId)) {
+    return undefined;
+  }
+  return Object.freeze({ version: 1, agentId, resourceId });
+}
+
+function canonicalRunRecord(
   runId: string,
   value: unknown,
-): value is AgentRunRecord {
-  if (value === null || typeof value !== 'object') return false;
-  const candidate = value as Partial<AgentRunRecord>;
-  return (
-    candidate.version === 2 &&
-    typeof candidate.agentId === 'string' &&
-    PATH_SAFE_ID_PATTERN.test(candidate.agentId) &&
-    isExecutionPrincipal(candidate.principal) &&
-    // The stored principal must own the run it is stored under, so a record
-    // moved or forged into another tenant's key space fails closed.
-    tenantOwnsSaltedId(candidate.principal.tenantId, runId) &&
-    typeof candidate.originEntryPath === 'string' &&
-    (AGENT_ENTRY_PATHS as readonly string[]).includes(candidate.originEntryPath)
-  );
+): AgentRunRecord | undefined {
+  if (value === null || typeof value !== 'object' || !isPathSafeId(runId)) {
+    return undefined;
+  }
+  const version = stateField(value, 'version');
+  const agentId = stateField(value, 'agentId');
+  const originEntryPath = stateField(value, 'originEntryPath');
+  if (
+    version !== 2 ||
+    !isPathSafeId(agentId) ||
+    typeof originEntryPath !== 'string' ||
+    !(AGENT_ENTRY_PATHS as readonly string[]).includes(originEntryPath)
+  ) {
+    return undefined;
+  }
+  try {
+    const principal = assertExecutionPrincipal(
+      stateField(value, 'principal'),
+      'stored agent run',
+    );
+    return Object.freeze({
+      version: 2,
+      agentId,
+      principal,
+      originEntryPath: originEntryPath as AgentEntryPath,
+    });
+  } catch {
+    return undefined;
+  }
 }
 
 export function agentRunStorageKey(runId: string): string {
-  if (typeof runId !== 'string' || !PATH_SAFE_ID_PATTERN.test(runId)) {
+  if (!isPathSafeId(runId)) {
     throw new AgentRunStateError('agent runId must be URL-path-safe');
   }
   return AGENT_RUN_STORAGE_KEY_PREFIX + runId;
 }
 
 export async function readAgentThreadBinding(
-  storage: ResumeLedgerStorage,
+  storage: DurableKeyValueStorage,
 ): Promise<AgentThreadBinding | undefined> {
   const stored = await storage.get(AGENT_THREAD_BINDING_STORAGE_KEY);
   if (stored === undefined) return undefined;
-  if (!validBinding(stored)) {
+  const canonical = canonicalBinding(stored);
+  if (!canonical) {
     throw new AgentRunStateError('stored agent thread binding is malformed');
   }
-  return stored;
+  return canonical;
 }
 
 export async function bindAgentThread(
-  storage: ResumeLedgerStorage,
+  storage: DurableKeyValueStorage,
   binding: AgentThreadBinding,
 ): Promise<AgentThreadBinding> {
-  if (!validBinding(binding)) {
+  const canonical = canonicalBinding(binding);
+  if (!canonical) {
     throw new AgentRunStateError('agent thread binding is malformed');
   }
   const current = await readAgentThreadBinding(storage);
   if (current) {
     if (
-      current.agentId !== binding.agentId ||
-      current.resourceId !== binding.resourceId
+      current.agentId !== canonical.agentId ||
+      current.resourceId !== canonical.resourceId
     ) {
       throw new AgentRunStateConflictError(
         'thread is already bound to a different agent or resource',
@@ -133,43 +153,64 @@ export async function bindAgentThread(
     }
     return current;
   }
-  const stored = structuredClone(binding);
+  const stored = structuredClone(canonical);
   await storage.put(AGENT_THREAD_BINDING_STORAGE_KEY, stored);
-  return stored;
+  return canonical;
+}
+
+export async function deleteAgentThreadBinding(
+  storage: DurableKeyValueStorage,
+  expected: Pick<AgentThreadBinding, 'agentId' | 'resourceId'>,
+): Promise<boolean> {
+  if (expected === null || typeof expected !== 'object') return false;
+  const agentId = stateField(expected, 'agentId');
+  const resourceId = stateField(expected, 'resourceId');
+  if (!isPathSafeId(agentId) || !isPathSafeId(resourceId)) return false;
+  const current = await readAgentThreadBinding(storage);
+  if (
+    !current ||
+    current.agentId !== agentId ||
+    current.resourceId !== resourceId
+  ) {
+    return false;
+  }
+  return storage.delete(AGENT_THREAD_BINDING_STORAGE_KEY);
 }
 
 export async function readAgentRunRecord(
-  storage: ResumeLedgerStorage,
+  storage: DurableKeyValueStorage,
   runId: string,
 ): Promise<AgentRunRecord | undefined> {
   const stored = await storage.get(agentRunStorageKey(runId));
   if (stored === undefined) return undefined;
-  if (!validRunRecord(runId, stored)) {
+  const canonical = canonicalRunRecord(runId, stored);
+  if (!canonical) {
     throw new AgentRunStateError(
       `stored metadata for run '${runId}' is malformed`,
     );
   }
-  return stored;
+  return canonical;
 }
 
 export async function writeAgentRunRecord(
-  storage: ResumeLedgerStorage,
+  storage: DurableKeyValueStorage,
   runId: string,
   record: AgentRunRecord,
 ): Promise<AgentRunRecord> {
   const key = agentRunStorageKey(runId);
-  if (!validRunRecord(runId, record)) {
+  const canonical = canonicalRunRecord(runId, record);
+  if (!canonical) {
     throw new AgentRunStateError('agent run metadata is malformed');
   }
   const current = await readAgentRunRecord(storage, runId);
   if (current) {
     // Structural comparison across every kind-specific field: comparing only
-    // id/role/tenant would let a run rebind from one automated purpose to
+    // id/role alone would let a run rebind from one automated purpose to
     // another, or from an agent's delegation chain to a different one.
     if (
-      current.agentId !== record.agentId ||
-      current.originEntryPath !== record.originEntryPath ||
-      !samePrincipal(current.principal, record.principal)
+      current.agentId !== canonical.agentId ||
+      current.originEntryPath !== canonical.originEntryPath ||
+      !samePrincipal(current.principal, canonical.principal)
     ) {
       throw new AgentRunStateConflictError(
         `run '${runId}' is already bound to a different agent principal`,
@@ -177,13 +218,13 @@ export async function writeAgentRunRecord(
     }
     return current;
   }
-  const stored = structuredClone(record);
+  const stored = structuredClone(canonical);
   await storage.put(key, stored);
-  return stored;
+  return canonical;
 }
 
 export async function deleteAgentRunRecord(
-  storage: ResumeLedgerStorage,
+  storage: DurableKeyValueStorage,
   runId: string,
 ): Promise<void> {
   await storage.delete(agentRunStorageKey(runId));

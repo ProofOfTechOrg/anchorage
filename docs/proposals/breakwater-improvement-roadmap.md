@@ -1,6 +1,6 @@
 # Proposal: breakwater improvement roadmap
 
-> This document records roadmap decisions and remaining uncommitted work. Phase A, Phase B steps 1 through 3, and Phase C steps 1 through 3 are shipped. Supported behavior is documented in [Breakwater architecture](../breakwater-architecture.md), [Durable agents](../durable-agents.md), [Policy engine](../policy-engine-design.md), and [Connector interface](../connector-interface.md).
+> This document records roadmap decisions and remaining uncommitted work. Phase A, Phase B steps 1 through 3, Phase C steps 1 through 3, and the physical-deployment Slice A are shipped. The [single-tenant physical-isolation decision](single-tenant-physical-isolation.md) supersedes pooled-host assumptions in the historical analysis below. Supported behavior is documented in [Breakwater architecture](../breakwater-architecture.md), [Durable agents](../durable-agents.md), [Policy engine](../policy-engine-design.md), and [Connector interface](../connector-interface.md).
 
 This document turns the limitations and ownership boundaries described in
 [`breakwater-purpose-and-boundaries.md`](../breakwater-purpose-and-boundaries.md)
@@ -27,14 +27,14 @@ testable, and appropriately placed.
 |---|---|---|
 | **Shipped** | Authenticated agent catalog and host-level agent run router | Flowsafe resolves metadata before mutation authorization and exposes no public agent resume |
 | **Shipped** | Mandatory agent processors that callers cannot omit or override | `createGuardedAgent()` exposes only the validated unstructured invocation surface |
-| **Shipped** | Central reserved request-context stripping and server derivation | Actor, tenant, workflow, approval, isolation, and audit correlation remain runtime-owned |
-| **Shipped** | Agent/run/tenant audit correlation | Guarded RBAC and policy events use `agent:<id>` plus safe host-derived correlation |
+| **Shipped** | Central reserved request-context stripping and server derivation | Actor, workflow, approval, permissions, and audit correlation remain runtime-owned; Flowsafe reserves and omits logical isolation scope |
+| **Shipped** | Agent/run/deployment audit correlation | Guarded RBAC and policy events use `agent:<id>` plus the infrastructure-verified deployment tag |
 | **Shipped** | Structured connector approval grants | Durable agents use exact tool-call scope, workflow gates use exact suspension scope, and standing grants use explicit run scope |
-| **Shipped** | End-to-end invariant tests for supported invocation paths | The deterministic workerd proof covers restart, approval resume, forgery, tenancy, and exactly-once execution |
+| **Shipped** | End-to-end invariant tests for supported invocation paths | The deterministic workerd proof covers restart, approval resume, forgery, deployment-sentinel mismatch, and exactly-once execution |
 | **Shipped** | Public documentation aligned with guarded agent hosting | The architecture, durable-agent, deployment, threat-model, operations, starter, and API guides define the supported boundary |
 | **Shipped** | Agent permission authorization without role inheritance | Flowsafe resolves trusted principals through a versioned host policy and enforces all required permissions |
 | **Shipped** | Optional connector invocation permissions | `PermissionManifest.requiredPermissions` is enforced against the trusted principal-permissions projection before dry-run and approval — authorization and approval answer different questions |
-| **P1** | Publish secure single-tenant and multi-tenant policy presets | Optional evaluators and stores are otherwise easy to omit |
+| **P1** | Publish a secure single-deployment policy preset | Durable stores, audit, egress, and permission wiring are otherwise easy to omit |
 | **P1** | Add manifest-conformance tooling and stronger egress posture | Runtime safety depends on honest manifests and use of `runtime.fetch` |
 | **P1** | Close known agent-output enforcement gaps | Structured output and override seams must not silently weaken mandatory policy |
 | **P1** | Introduce stable decision codes and richer audit correlation | Reason strings are not a durable API for alerts, metrics, or incident response |
@@ -77,12 +77,12 @@ interface AgentModule {
 Add an authenticated agent router with the same gate-order discipline as the
 workflow run router:
 
-1. Authenticate and validate the tenant.
+1. Verify deployment identity, then authenticate and validate the actor.
 2. Apply the coarse agent-run role/permission gate.
 3. Resolve the agent from the server catalog.
-4. Check tenant ownership for any thread, resource, or run identifiers.
+4. Check in-deployment access for any thread, resource, or run identifiers.
 5. Apply `AgentMeta.allowedRoles` and any configured `requiredPermissions`.
-6. Mint the run/thread/resource identifiers server-side.
+6. Mint run and thread identifiers server-side and derive resource keys from trusted host data.
 7. Derive trusted request context.
 8. Invoke only the guarded agent handle.
 
@@ -92,19 +92,18 @@ bypass policy through a weaker resume or wake route.
 
 #### Ownership
 
-- **flowsafe:** catalog, authenticated route, tenancy, IDs, and route-level
-  authorization.
+- **flowsafe:** catalog, authenticated route, deployment verification, IDs, and route-level authorization.
 - **breakwater:** agent-turn defense-in-depth middleware.
 
 #### Acceptance criteria
 
 - Unknown agents return 404.
 - Unauthenticated callers return 401.
-- Other-tenant run/thread/resource identifiers return 404 before role errors.
+- Inaccessible run/thread/resource identifiers return 404 before role errors.
 - Disallowed roles cannot start, resume, signal, or wake the agent.
 - Reads have an explicit documented policy instead of inheriting mutation
   behavior accidentally.
-- The router never accepts a client-selected run, thread, or resource ID.
+- The router never accepts a client-selected run or thread ID, or a full resource ID from an untrusted request.
 - Every route invokes the same catalog entry and guarded handle; the raw
   Mastra agent is not exposed from the host registry.
 
@@ -175,7 +174,7 @@ Provide canonical host helpers such as:
 
 ```ts
 sanitizeExternalRequestContext(input)
-deriveTrustedExecutionContext({ actor, tenant, workflow, run, approvalLeg })
+deriveTrustedExecutionContext({ actor, workflow, run, approvalLeg })
 ```
 
 The sanitizer must reject or strip:
@@ -192,7 +191,7 @@ The derivation helper must be the only normal producer of:
 - `breakwater.connectorGrants`.
 - `breakwater.connectorExecution`.
 - `breakwater.workflowScope`.
-- `breakwater.isolationScope`.
+- `breakwater.isolationScope` only in a generic host that owns a separate logical partition. Flowsafe reserves and omits it.
 - Runtime-derived idempotency context.
 
 Stored context must always merge first and runtime-derived context last.
@@ -211,9 +210,7 @@ Stored context must always merge first and runtime-derived context last.
 
 #### Current state
 
-`RBACMiddleware` records `resource: 'breakwater-rbac'`. That proves the gate
-ran but does not identify which agent was requested. Breakwater's `Actor` is
-also tenant-agnostic, so tenant/run/thread correlation must come from the host.
+`RBACMiddleware` records `resource: 'breakwater-rbac'`. That proves the gate ran but does not identify which agent was requested. Breakwater's `Actor` is organization-agnostic, so deployment/run/thread correlation must come from the host.
 
 #### Improvement
 
@@ -233,8 +230,7 @@ Add stable audit correlation fields where known:
 - Workflow ID.
 - Run ID.
 - Thread/resource ID.
-- Tenant ID, added by the flowsafe audit adapter rather than Breakwater's
-  tenant-agnostic actor.
+- Deployment tag, added by the Flowsafe audit adapter from the verified infrastructure binding rather than Breakwater's actor.
 - Policy bundle version/hash.
 - Tool call ID and connector ID for connector decisions.
 - Approval record and suspension fingerprint for grant-derived execution.
@@ -244,8 +240,7 @@ in authorization audit detail.
 
 #### Acceptance criteria
 
-- Every agent authorization event answers who, which agent, which tenant, which
-  run/thread when available, what decision, and why.
+- Every agent authorization event answers who, which agent, which deployment, which run/thread when available, what decision, and why.
 - Denials and gate errors have the same correlation quality as allows.
 - Audit-event schemas distinguish stable machine-readable fields from safe
   human-readable reasons.
@@ -258,9 +253,9 @@ Flowsafe persists an explicit `grantScope` on every capability-bearing approval.
 
 The shipped scopes are:
 
-- `tool-call`: connector, tenant, workflow, run, exact suspension, and `toolCallId`
-- `suspension`: connector, tenant, workflow, run, and exact suspension
-- `run`: connector, tenant, workflow, and run
+- `tool-call`: connector, workflow, run, exact suspension, and `toolCallId`
+- `suspension`: connector, workflow, run, and exact suspension
+- `run`: connector, workflow, and run
 
 Durable-agent suspensions use `tool-call` scope. Mastra persists `toolCallId` in the durable tool-call input and reproduces it in `context.agent.toolCallId` across resume, retry, background dispatch, and Durable Object reconstruction. Arbitrary workflow gates use `suspension` scope because Mastra exposes no corresponding tool-call identity there. Only an explicit trusted `runScoped: true` record produces `run` scope.
 
@@ -284,12 +279,12 @@ Flowsafe defines `ExecutionPrincipal` for human, service, agent, and system exec
 
 Breakwater accepts the projected principal kind but does not resolve identity. Its `allowedPrincipalKinds` gate runs before role authorization and never consults human roles for an automated principal. Flowsafe's agent catalog uses `allowedAutomation` to constrain each automated kind to declared entry paths; human starts continue to use `allowedRoles`.
 
-`trustAutomationPrincipal()` canonicalizes and freezes principals used by trusted platform entries. Audit events preserve the tenant, principal kind, principal ID, purpose, and delegation provenance. Approval decisions remain attributed to the human decider.
+`trustAutomationPrincipal()` canonicalizes and freezes principals used by trusted platform entries. Audit events preserve the verified deployment tag, principal kind, principal ID, purpose, and delegation provenance. Approval decisions remain attributed to the human decider.
 
 #### Shipped guarantees
 
 - Scheduled or service execution never masquerades as an arbitrary human.
-- Agent entry and approval-maintenance audit events implemented in this phase carry tenant, principal kind, principal ID, and delegation provenance when applicable.
+- Agent entry and approval-maintenance audit events implemented in this phase carry deployment tag, principal kind, principal ID, and delegation provenance when applicable.
 - Automated principals cannot derive authority from administrative human roles.
 - Human approval remains attributable to the human decider even when the requester is a service or agent.
 
@@ -298,19 +293,19 @@ Breakwater accepts the projected principal kind but does not resolve identity. I
 Unit tests already cover individual breakwater gates well. Add system tests
 that prove composition across every supported invocation path.
 
-| Path | RBAC/route auth | Connector policy | Trusted grant | Tenant scope | Audit |
+| Path | RBAC/route auth | Connector policy | Trusted grant | Deployment guard | Audit |
 |---|---|---|---|---|---|
-| Authenticated agent start | Required | Required when a connector runs | Per decision | Required in multi-tenant host | Correlated |
-| Agent resume after approval | Rechecked | Required | Exact current leg | Re-derived | Correlated |
-| Workflow tool step | Workflow route/in-step policy | Required | Per decision | Required | Correlated |
-| Nested connector call | Inherited principal policy | Required | Must not broaden | Required | Correlated |
-| Direct trusted internal call | Explicit trusted API | Required | Required for writes | Required | Correlated |
-| Scheduled/service execution | Service principal policy | Required | Explicit standing or interactive policy | Required | Correlated |
-| Signal/background execution | Principal and ownership policy | Required | No stale forwarded grant | Required | Correlated |
+| Authenticated agent start | Required | Required when a connector runs | Per decision | Sentinel verified | Correlated |
+| Agent resume after approval | Rechecked | Required | Exact current leg | Sentinel verified | Correlated |
+| Workflow tool step | Workflow route/in-step policy | Required | Per decision | Sentinel verified | Correlated |
+| Nested connector call | Inherited principal policy | Required | Must not broaden | Sentinel verified | Correlated |
+| Direct trusted internal call | Explicit trusted API | Required for writes | Required for writes | Bound resource set | Correlated |
+| Scheduled/service execution | Service principal policy | Required | Explicit standing or interactive policy | Sentinel verified | Correlated |
+| Signal/background execution | Principal and resource policy | Required | No stale forwarded grant | Sentinel verified | Correlated |
 
 Tests must include negative cases: forged reserved context (the
 principal-permissions projection included), stripped processor overrides,
-wrong tenant, stale approval, an approved-but-unauthorized principal at a
+wrong deployment sentinel, inaccessible resource, stale approval, an approved-but-unauthorized principal at a
 permission-declaring connector, a permission-declaring connector on a path
 that mints no projection, same connector with changed arguments, missing
 isolation scope, undeclared egress, duplicate idempotency key, and audit
@@ -420,7 +415,7 @@ authorizeResource({ principal, connectorId, input, requestContext })
 Requirements:
 
 - Fail closed on provider error or timeout.
-- Make lookup caching explicit and tenant-scoped.
+- Make lookup caching explicit and deployment/resource-scoped.
 - Do not pass secret-rich raw input into generic audit logs.
 - Bind the authorization result to the input/resource identity actually used
   by `execute`.
@@ -431,28 +426,24 @@ Requirements:
 
 #### Current risk
 
-Several important controls are optional because breakwater supports both
-single-tenant and multi-tenant hosts. It is easy for a production host to omit
-`tenantIsolation()`, durable idempotency, a rate-limit store, audit export, or
-an organization egress policy.
+Several important controls remain optional because Breakwater is a reusable processor and connector package. A physical Flowsafe deployment can still omit durable idempotency, a rate-limit store, audit export, permission resolution, or an organization egress policy.
 
 #### Improvement
 
 Publish validated presets or builders:
 
 ```ts
-singleTenantConnectorPolicies({ ... })
-multiTenantConnectorPolicies({ isolation, durableStores, audit, ... })
+singleTenantConnectorPolicies({ durableStores, audit, egress, permissions, ... })
 ```
 
-The multi-tenant preset should require:
+The preset should require:
 
-- `tenantIsolation()`.
 - Durable idempotency and rate-limit stores where configured.
-- A trusted isolation-scope contract.
 - Audit sink configuration or an explicit development-only opt-out.
 - Network-egress policy for connectors that declare hosts.
+- Permission-resolution wiring for permission-declaring connectors.
 - Background-execution policy.
+- No `tenantIsolation()` evaluator or Flowsafe-provided isolation scope, because connector keys are deployment-wide.
 
 Construction should reject contradictory or incomplete configurations before
 the first call.
@@ -511,7 +502,7 @@ RBAC_ROLE_DENIED
 AUTHZ_PERMISSION_DENIED
 CONNECTOR_APPROVAL_MISSING
 CONNECTOR_EGRESS_DENIED
-CONNECTOR_TENANT_SCOPE_MISSING
+CONNECTOR_ISOLATION_SCOPE_MISSING
 CONNECTOR_RATE_LIMITED
 POLICY_CLASSIFIER_FAILED_CLOSED
 ```
@@ -537,8 +528,7 @@ Small improvements to the current middleware:
 - Make role-denial reasons safe for public propagation.
 - Define behavior when `getActor` returns a mutable object; copy only validated
   fields.
-- Add an optional permission/authorization evaluator without changing the
-  tenant-agnostic `Actor` contract.
+- Add an optional permission/authorization evaluator without changing the organization-agnostic `Actor` contract.
 
 Treat validation tightening as a versioned behavior change because JavaScript
 callers may currently pass values TypeScript would reject.
@@ -585,7 +575,7 @@ Generate a build artifact answering:
 - Which connectors require approval?
 - Which connectors have unguarded or empty egress declarations?
 - Which write connectors lack durable idempotency?
-- Which multi-tenant connectors omit `tenantIsolation()`?
+- Which connectors require an opaque logical scope, and which trusted host mints it?
 - Which decisions lack a durable audit sink?
 
 Fail CI only for declared security invariants; warn for advisory improvements.
@@ -598,7 +588,7 @@ Keep the existing fixed-window contract for compatibility, but allow pluggable
 algorithms for stricter workloads:
 
 - Token bucket or GCRA for smoother hard limits.
-- Separate principal, tenant, connector, and organization budgets.
+- Separate principal, workflow, connector, and deployment budgets.
 - Explicit retry-after metadata.
 - Store cleanup/compaction for old rate buckets, completed idempotency records,
   and abandoned pending reservations.
@@ -679,9 +669,7 @@ consume a validated actor/principal through a narrow interface.
 
 ### Do not add `tenantId` to Breakwater's base `Actor`
 
-Tenant identity and lifecycle belong to flowsafe. Breakwater should continue
-to consume opaque isolation scope where it needs tenant segmentation. Host
-audit adapters can add tenant correlation.
+Organization identity and lifecycle belong to provisioning and Flowsafe's physical deployment guard. Breakwater should continue to consume an opaque isolation scope when a generic host needs another logical partition. Flowsafe does not mint that scope. Host audit adapters can add verified deployment correlation.
 
 ### Do not build a generic resource ACL database in Breakwater
 
@@ -697,8 +685,7 @@ directory model.
 
 ### Do not move workflow RBAC or retention into the processor package
 
-Workflow start/resume authorization belongs at flowsafe's authenticated HTTP
-boundary. TTL deletion and tenant offboarding belong at the storage layer.
+Workflow start/resume authorization belongs at Flowsafe's authenticated HTTP boundary. TTL deletion belongs at the storage layer; organization decommissioning deletes the physical deployment.
 
 ### Do not claim complete egress isolation
 
@@ -717,7 +704,7 @@ dependency.
 ### Phase A: Agent access foundation (shipped)
 
 1. Define `AgentMeta`/`AgentModule` and a server-owned catalog.
-2. Implement authenticated start/status/stream routes with tenant ownership and route-level role enforcement.
+2. Implement authenticated start/status/stream routes with in-deployment resource checks and route-level role enforcement.
 3. Keep agent resume approval-only and restore the original authorized principal.
 4. Implement `createGuardedAgent` with a narrow, non-overridable handle.
 5. Centralize reserved-context sanitization and trusted derivation.
@@ -764,20 +751,19 @@ An agent should not be described as breakwater-protected until all applicable
 statements are true:
 
 - It is registered in a server-owned catalog.
-- Every external mutation authenticates the principal and validates tenant
-  ownership.
+- Every external mutation authenticates the principal and validates in-deployment resource access.
+- Every public entry verifies the physical deployment sentinel; every Worker-to-Durable-Object fetch also authenticates the calling deployment.
 - Start, resume, signal, wake, and background paths share the same authorization
   policy.
 - Mandatory processors cannot be removed by per-call options.
 - The actor/principal and all breakwater context keys are server-derived.
-- Its audit events name the agent, tenant, run/thread, principal, and policy
-  version where available.
+- Its audit events name the agent, verified deployment, run/thread, principal, and policy version where available.
 - Every connector it can call has a reviewed permission manifest.
 - Write/destructive connectors require authorization and, where configured,
   a correctly scoped approval grant.
 - Connector network traffic uses `runtime.fetch` or has an explicitly accepted
   degraded posture.
-- Multi-tenant calls require an isolation scope.
+- Flowsafe connectors use deployment-wide keys; a separate generic host requires an opaque isolation scope only when it explicitly defines another logical partition.
 - Idempotency and rate limits use stores appropriate to the deployment.
 - Negative end-to-end tests cover agent, workflow, direct, nested, retry, and
   resume paths.
@@ -791,14 +777,13 @@ Track outcomes rather than feature count:
 
 - Percentage of registered agents reachable only through guarded handles.
 - Percentage of mutating routes using the canonical reserved-context boundary.
-- Percentage of connector calls carrying agent/run/tenant/principal audit
-  correlation.
+- Percentage of connector calls carrying agent/run/deployment/principal audit correlation.
 - Percentage of write connectors with required authorization, approval policy,
   durable idempotency, and reviewed egress.
 - Number of policy-bypass paths found by the end-to-end matrix.
 - Audit export lag, sink failures, and dropped-event count.
 - Idempotency replay/duplicate-prevention rate and stale-reservation takeover.
-- Rate-limit denials and budget contention by tenant/connector.
+- Rate-limit denials and budget contention by deployment/connector.
 - Mastra upgrade tripwire pass rate and time to certify a new core version.
 
 The desired end state is not “Breakwater has enterprise RBAC.” It is:

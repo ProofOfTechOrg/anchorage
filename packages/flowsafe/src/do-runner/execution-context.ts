@@ -11,6 +11,7 @@ import {
 
 const BREAKWATER_KEY_PREFIX = 'breakwater.';
 const GOAL_REQUEST_CONTEXT_KEY = 'mastra:goal';
+export const RUN_PROVENANCE_CONTEXT_KEY = 'flowsafe.runProvenance';
 
 /**
  * Runtime-owned request-context keys. The predicate below also reserves the
@@ -25,6 +26,7 @@ export const RESERVED_EXECUTION_CONTEXT_KEYS: readonly string[] = [
   BREAKWATER_WORKFLOW_SCOPE_KEY,
   BREAKWATER_ISOLATION_SCOPE_KEY,
   GOAL_REQUEST_CONTEXT_KEY,
+  RUN_PROVENANCE_CONTEXT_KEY,
   'runId',
   'threadId',
   'resourceId',
@@ -33,16 +35,14 @@ export const RESERVED_EXECUTION_CONTEXT_KEYS: readonly string[] = [
   'prototype',
 ];
 
+const RESERVED_EXECUTION_CONTEXT_KEY_SET = new Set(
+  RESERVED_EXECUTION_CONTEXT_KEYS,
+);
+
 export function isReservedExecutionContextKey(key: string): boolean {
   return (
     key.startsWith(BREAKWATER_KEY_PREFIX) ||
-    key === GOAL_REQUEST_CONTEXT_KEY ||
-    key === 'runId' ||
-    key === 'threadId' ||
-    key === 'resourceId' ||
-    key === '__proto__' ||
-    key === 'constructor' ||
-    key === 'prototype'
+    RESERVED_EXECUTION_CONTEXT_KEY_SET.has(key)
   );
 }
 

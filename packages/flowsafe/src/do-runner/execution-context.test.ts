@@ -6,6 +6,7 @@ import {
   isReservedExecutionContextKey,
   RESERVED_EXECUTION_CONTEXT_KEYS,
   ReservedExecutionContextError,
+  RUN_PROVENANCE_CONTEXT_KEY,
   stripReservedExecutionContext,
 } from './execution-context.js';
 
@@ -18,11 +19,14 @@ describe('execution-context trust boundary', () => {
       true,
     );
     expect(isReservedExecutionContextKey('application.locale')).toBe(false);
+    expect(isReservedExecutionContextKey(RUN_PROVENANCE_CONTEXT_KEY)).toBe(
+      true,
+    );
   });
 
   it('rejects reserved external keys and strips them from stored compatibility context', () => {
     const context = JSON.parse(
-      '{"safe":1,"runId":"forged","breakwater.actor":{"id":"forged"},"__proto__":{"polluted":true}}',
+      '{"safe":1,"runId":"forged","flowsafe.runProvenance":{"requestedBy":"forged"},"breakwater.actor":{"id":"forged"},"__proto__":{"polluted":true}}',
     ) as Record<string, unknown>;
 
     expect(() =>

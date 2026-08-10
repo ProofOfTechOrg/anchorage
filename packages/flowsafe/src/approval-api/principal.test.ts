@@ -17,6 +17,8 @@ import {
   AUTOMATED_PROJECTED_ROLE,
   assertExecutionPrincipal,
   type ExecutionPrincipal,
+  isExecutionPrincipalId,
+  isExecutionPrincipalKind,
   isTrustedAutomationPrincipal,
   principalActor,
   TRUSTED_AUTOMATION,
@@ -24,7 +26,7 @@ import {
   trustAutomationPrincipal,
 } from './principal.js';
 import { ApprovalAuthzError, ApprovalService } from './service.js';
-import { InMemoryApprovalStoreFactory } from './tenant-store.js';
+import { InMemoryApprovalStoreFactory } from './store-factory.js';
 import type { CreateApprovalInput } from './types.js';
 
 const CREATE: CreateApprovalInput = {
@@ -38,7 +40,7 @@ function harness(): { service: ApprovalService; events: ApprovalAuditEvent[] } {
   const events: ApprovalAuditEvent[] = [];
   return {
     service: new ApprovalService({
-      store: backend.forTenant('acme'),
+      store: backend.store(),
       audit: (event) => events.push(event),
     }),
     events,
@@ -49,7 +51,6 @@ function systemSource(): Record<string, unknown> {
   return {
     kind: 'system',
     id: 'flowsafe-system',
-    tenantId: 'acme',
     purpose: 'approval-suspension-reconcile',
   };
 }
@@ -59,6 +60,42 @@ function vouchRaw(source: Record<string, unknown>): TrustedAutomationPrincipal {
   return trustAutomationPrincipal(source as unknown as ExecutionPrincipal);
 }
 
+describe('execution principal value guards', () => {
+  it.each([
+    'human',
+    'service',
+    'agent',
+    'system',
+  ])("accepts the '%s' principal kind", (kind) => {
+    expect(isExecutionPrincipalKind(kind)).toBe(true);
+  });
+
+  it.each([
+    undefined,
+    null,
+    1,
+    '',
+    'operator',
+    'Human',
+  ])('rejects an invalid principal kind (%s)', (kind) => {
+    expect(isExecutionPrincipalKind(kind)).toBe(false);
+  });
+
+  it('accepts a principal id exactly at the 200-character bound', () => {
+    expect(isExecutionPrincipalId('p'.repeat(200))).toBe(true);
+  });
+
+  it.each([
+    ['an id over the bound', 'p'.repeat(201)],
+    ['an empty id', ''],
+    ['an all-whitespace id', ' '.repeat(200)],
+    ['a C0 control character', 'requester\u000aremainder'],
+    ['DEL', 'requester\u007fremainder'],
+  ])('rejects %s', (_label, id) => {
+    expect(isExecutionPrincipalId(id)).toBe(false);
+  });
+});
+
 describe('trustAutomationPrincipal', () => {
   it('refuses a human and a malformed principal', () => {
     // #given / #when / #then — these must use the role-authorized entries.
@@ -66,7 +103,6 @@ describe('trustAutomationPrincipal', () => {
       trustAutomationPrincipal({
         kind: 'human',
         id: 'ada',
-        tenantId: 'acme',
         role: 'admin',
       }),
     ).toThrow(/only a valid automated principal/);
@@ -74,7 +110,6 @@ describe('trustAutomationPrincipal', () => {
       trustAutomationPrincipal({
         kind: 'system',
         id: 'sys',
-        tenantId: 'acme',
         // Empty purpose — provenance is the point, so it is not optional.
         purpose: '   ',
       }),
@@ -105,12 +140,7 @@ describe('trustAutomationPrincipal', () => {
     const vouched = vouchRaw(source);
 
     // #then
-    expect(Object.keys(vouched).sort()).toEqual([
-      'id',
-      'kind',
-      'purpose',
-      'tenantId',
-    ]);
+    expect(Object.keys(vouched).sort()).toEqual(['id', 'kind', 'purpose']);
   });
 
   it("keeps an agent's delegatedBy and adds it to no other kind", () => {
@@ -118,14 +148,12 @@ describe('trustAutomationPrincipal', () => {
     const agent = trustAutomationPrincipal({
       kind: 'agent',
       id: 'planner',
-      tenantId: 'acme',
       purpose: 'delegated-subtask',
       delegatedBy: 'supervisor',
     });
     const system = trustAutomationPrincipal({
       kind: 'system',
       id: 'sys',
-      tenantId: 'acme',
       purpose: 'bookkeeping',
     });
 
@@ -185,7 +213,6 @@ describe('trustAutomationPrincipal', () => {
   const VALIDATED = {
     kind: 'agent',
     id: 'planner',
-    tenantId: 'acme',
     purpose: 'delegated-subtask',
   };
   const twoFaced = (lie: Record<string, unknown>): ExecutionPrincipal =>
@@ -208,7 +235,6 @@ describe('trustAutomationPrincipal', () => {
     const principal = twoFaced({
       kind: 'system',
       id: 'ghost-admin',
-      tenantId: 'globex',
       purpose: 'x'.repeat(5000),
     });
 
@@ -216,32 +242,42 @@ describe('trustAutomationPrincipal', () => {
     const minted = trustAutomationPrincipal(principal);
 
     // #then — the vouched principal is the one that passed the checks: the
-    // tenant it was validated against, and a purpose inside the bound.
+    // identity it validated and a purpose inside the bound.
     expect(minted).toMatchObject(VALIDATED);
-    expect(minted.tenantId).not.toBe('globex');
     expect(minted.purpose).toHaveLength('delegated-subtask'.length);
   });
 
-  it('binds the tenant it compared, and returns that same snapshot', () => {
+  it('returns the same canonical snapshot it validated', () => {
     // #given — the wire channel claims a human admin. If assert returned its
     // argument, the caller would encode and project THAT, not what it checked.
     const principal = twoFaced({
       kind: 'human',
       id: 'ghost-admin',
-      tenantId: 'acme',
       role: 'admin',
     });
 
     // #when
-    const asserted = assertExecutionPrincipal(principal, 'acme', 'probe');
+    const asserted = assertExecutionPrincipal(principal, 'probe');
 
     // #then
     expect(asserted).toEqual(VALIDATED);
+    expect(Object.isFrozen(asserted)).toBe(true);
     expect(principalActor(asserted)).toEqual({
       id: 'planner',
       role: AUTOMATED_PROJECTED_ROLE,
-      tenantId: 'acme',
     });
+  });
+
+  it('freezes canonical human principals too', () => {
+    const principal = assertExecutionPrincipal(
+      { kind: 'human', id: 'ada', role: 'admin' },
+      'probe',
+    );
+
+    expect(Object.isFrozen(principal)).toBe(true);
+    expect(() => {
+      (principal as unknown as Record<string, unknown>).role = 'viewer';
+    }).toThrow(TypeError);
   });
 
   it.each([
@@ -285,7 +321,6 @@ describe('automated service entries reject an unvouched principal', () => {
       forge({
         kind: 'human',
         id: 'ada',
-        tenantId: 'acme',
         role: 'admin',
         [TRUSTED_AUTOMATION]: true,
       }),
@@ -295,7 +330,6 @@ describe('automated service entries reject an unvouched principal', () => {
       forge({
         kind: 'system',
         id: 'sys',
-        tenantId: 'acme',
         [TRUSTED_AUTOMATION]: true,
       }),
     ],
@@ -319,14 +353,13 @@ describe('automated service entries reject an unvouched principal', () => {
       // is still refused. Freeze pins a data property's value but does nothing
       // to an accessor, so a getter may answer differently on the next read;
       // the trusted entries read a principal four times in one call (shape,
-      // tenant compare, principalActor, principalAuditFields). Nothing can
+      // identity compare, principalActor, principalAuditFields). Nothing can
       // prove a getter that tells the truth now will tell it then, so the shape
       // is refused outright rather than sampled.
       'a frozen object whose fields are own getters',
       forge({
         [TRUSTED_AUTOMATION]: true,
         id: 'sys',
-        tenantId: 'acme',
         get kind() {
           return 'system';
         },
@@ -351,7 +384,7 @@ describe('automated service entries reject an unvouched principal', () => {
               return 'p';
             },
           }),
-          { [TRUSTED_AUTOMATION]: true, id: 'sneaky-bot', tenantId: 'acme' },
+          { [TRUSTED_AUTOMATION]: true, id: 'sneaky-bot' },
         ),
       ),
     ],
@@ -365,7 +398,6 @@ describe('automated service entries reject an unvouched principal', () => {
         Object.freeze({
           [TRUSTED_AUTOMATION]: true,
           id: 'sneaky-bot',
-          tenantId: 'acme',
         }),
         {
           get: (target, key, receiver) =>
@@ -417,14 +449,10 @@ describe('automated service entries reject an unvouched principal', () => {
     ).rejects.toThrow(ApprovalAuthzError);
   });
 
-  it('checks the brand before the tenant, so an unvouched principal never reaches the tenant branch', async () => {
-    // #given — both checks would deny, so only the reason distinguishes which
-    // ran. Ordering matters: the tenant branch calls principalActor(), which
-    // reads the very fields an unvouched value has not earned trust for.
+  it('checks the brand before trusting automated provenance', async () => {
     const { service, events } = harness();
     const unvouchedAndForeign = {
       ...systemSource(),
-      tenantId: 'globex',
     } as unknown as TrustedAutomationPrincipal;
 
     // #when / #then
@@ -438,30 +466,23 @@ describe('automated service entries reject an unvouched principal', () => {
         reason: expect.stringContaining('not a vouched automated principal'),
       },
     ]);
-    expect(events[0]?.reason).not.toContain('does not match the store binding');
   });
 
-  it('denies a vouched principal bound to another tenant, with provenance', async () => {
-    // #given — a real vouch, wrong tenant: the wiring-bug case that must fail
-    // closed rather than act cross-tenant.
+  it('allows a vouched automated principal and audits its provenance', async () => {
     const { service, events } = harness();
-    const foreign = trustAutomationPrincipal({
+    const principal = trustAutomationPrincipal({
       kind: 'system',
       id: 'flowsafe-system',
-      tenantId: 'globex',
       purpose: 'approval-suspension-reconcile',
     });
 
-    // #when / #then
-    await expect(service.createAsPrincipal(CREATE, foreign)).rejects.toThrow(
-      /tenant does not match/,
-    );
+    await expect(
+      service.createAsPrincipal(CREATE, principal),
+    ).resolves.toMatchObject({ created: true });
     expect(events).toMatchObject([
       {
         action: 'approval.create',
-        decision: 'denied',
-        // A denial is an automated event too — it carries the same provenance
-        // the allowed path carries.
+        decision: 'allowed',
         detail: {
           principalKind: 'system',
           principalId: 'flowsafe-system',
@@ -479,7 +500,7 @@ describe('automated provenance reaches subordinate audit events', () => {
     const backend = new InMemoryApprovalStoreFactory();
     const events: ApprovalAuditEvent[] = [];
     const service = new ApprovalService({
-      store: backend.forTenant('acme'),
+      store: backend.store(),
       audit: (event) => events.push(event),
       notify: () => {
         throw new Error('sink down');
@@ -488,7 +509,6 @@ describe('automated provenance reaches subordinate audit events', () => {
     const principal = trustAutomationPrincipal({
       kind: 'agent',
       id: 'planner',
-      tenantId: 'acme',
       purpose: 'delegated-subtask',
       delegatedBy: 'supervisor',
     });
@@ -502,7 +522,6 @@ describe('automated provenance reaches subordinate audit events', () => {
     ).toMatchObject({
       decision: 'error',
       detail: {
-        tenantId: 'acme',
         principalKind: 'agent',
         principalId: 'planner',
         purpose: 'delegated-subtask',
@@ -516,7 +535,7 @@ describe('automated provenance reaches subordinate audit events', () => {
     const backend = new InMemoryApprovalStoreFactory();
     const events: ApprovalAuditEvent[] = [];
     const service = new ApprovalService({
-      store: backend.forTenant('acme'),
+      store: backend.store(),
       audit: (event) => events.push(event),
       stream: () => {
         throw new Error('hub down');
@@ -525,7 +544,6 @@ describe('automated provenance reaches subordinate audit events', () => {
     const principal = trustAutomationPrincipal({
       kind: 'system',
       id: 'flowsafe-system',
-      tenantId: 'acme',
       purpose: 'approval-suspension-reconcile',
     });
     const { record } = await service.createAsPrincipal(CREATE, principal);
@@ -544,7 +562,6 @@ describe('automated provenance reaches subordinate audit events', () => {
     expect(streamFailures.at(-1)).toMatchObject({
       decision: 'error',
       detail: {
-        tenantId: 'acme',
         principalKind: 'system',
         principalId: 'flowsafe-system',
         purpose: 'approval-suspension-reconcile',

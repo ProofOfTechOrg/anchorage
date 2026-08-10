@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // The P6 ingestion trust boundary (createSignalRouter): the gate ORDER (401 →
-// role → ownership → memory-id → allowlist/size/rate → audit → forward), each
+// ownership → role → memory-id → allowlist/size/rate → audit → forward), each
 // fail-closed, over mock resolve + topology seams.
 
 import { describe, expect, it, vi } from 'vitest';
 
-import type { ApprovalActor, TenantContext } from '../approval-api/index.js';
+import type { ActorContext, ApprovalActor } from '../approval-api/index.js';
 import type { ThreadTopology } from '../host-kit/index.js';
 import {
   createInMemorySignalRateLimiter,
@@ -15,16 +15,28 @@ import {
 
 const OWNED_THREAD = 'acme_t1';
 
-function tenantCtx(
+function actorContext(
   role: ApprovalActor['role'],
   ownedThread = OWNED_THREAD,
-): TenantContext {
-  const actor: ApprovalActor = { id: 'opal', role, tenantId: 'acme' };
+): ActorContext {
+  const actor: ApprovalActor = { id: 'opal', role };
   return {
     actor,
-    tenantId: 'acme',
-    ownsMemoryId: (id: string) => id === ownedThread,
-  } as unknown as TenantContext;
+    principal: { kind: 'human', id: actor.id, role },
+    resourceOwner: { kind: 'human', id: actor.id },
+    service: () => {
+      throw new Error('unused');
+    },
+    newRunId: () => 'run-1',
+    newThreadId: () => ownedThread,
+    resourceIdFromKey: (key) => key,
+    claimResource: async () => undefined,
+    releaseResource: async () => undefined,
+    resourceOwnerFor: async () => undefined,
+    canAccessResource: async (kind, id) =>
+      kind === 'thread' && id === ownedThread,
+    canSelfDecide: () => false,
+  };
 }
 
 function recordingTopology(): {
@@ -34,7 +46,7 @@ function recordingTopology(): {
   const calls: Array<{ threadId: string; path: string; body?: string }> = [];
   const topology = {
     send: async (
-      _tenant: TenantContext,
+      _context: ActorContext,
       threadId: string,
       path: string,
       init?: { body?: string },
@@ -69,7 +81,7 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
     const { topology } = recordingTopology();
     expect(() =>
       createSignalRouter({
-        resolve: async () => tenantCtx('operator'),
+        resolve: async () => actorContext('operator'),
         topology,
         maxContentBytes,
       }),
@@ -79,7 +91,7 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
   it('accepts a zero body cap and rejects every non-empty body', async () => {
     const { topology } = recordingTopology();
     const router = createSignalRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       topology,
       maxContentBytes: 0,
     });
@@ -95,7 +107,7 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
   it('returns null for a non-signal path (composes ahead of others)', async () => {
     const { topology } = recordingTopology();
     const router = createSignalRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       topology,
     });
     expect(await router(new Request('http://host/workflows'))).toBeNull();
@@ -106,7 +118,7 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
     // out of the handler BEFORE auth; safeDecodeSegment makes it route-absent.
     const { topology, calls } = recordingTopology();
     const router = createSignalRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       topology,
     });
     const res = await router(
@@ -135,7 +147,7 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
   it('403 for a read-only role (viewer/reviewer may not signal)', async () => {
     const { topology, calls } = recordingTopology();
     const router = createSignalRouter({
-      resolve: async () => tenantCtx('viewer'),
+      resolve: async () => actorContext('viewer'),
       topology,
     });
     const res = await router(
@@ -145,23 +157,23 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('404 for a foreign threadId (no existence oracle) — before the DO', async () => {
+  it('404s a path-safe thread owned by another actor', async () => {
     const { topology, calls } = recordingTopology();
     const router = createSignalRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       topology,
     });
     const res = await router(
       post('/api/threads/other_t9/message', { contents: 'hi' }),
     );
     expect(res?.status).toBe(404);
-    expect(calls).toHaveLength(0); // never addressed
+    expect(calls).toHaveLength(0);
   });
 
   it('400 when the body names a memory id (assertNoClientMemoryIds)', async () => {
     const { topology, calls } = recordingTopology();
     const router = createSignalRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       topology,
     });
     const res = await router(
@@ -177,7 +189,7 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
   it('413 for an oversized payload', async () => {
     const { topology, calls } = recordingTopology();
     const router = createSignalRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       topology,
       maxContentBytes: 64,
     });
@@ -193,7 +205,7 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
   it('400 for a non-allowlisted attribute key', async () => {
     const { topology, calls } = recordingTopology();
     const router = createSignalRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       topology,
       attributeAllowlist: ['severity'],
     });
@@ -207,11 +219,11 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
     expect(calls).toHaveLength(0);
   });
 
-  it('429 when the per-tenant rate cap is exceeded, and audits the rejection', async () => {
+  it('429 when the deployment rate cap is exceeded, and audits the rejection', async () => {
     const { topology } = recordingTopology();
     const events: SignalIngestAuditEvent[] = [];
     const router = createSignalRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       topology,
       rateLimit: createInMemorySignalRateLimiter({
         limit: 1,
@@ -242,7 +254,7 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
     const { topology, calls } = recordingTopology();
     const events: SignalIngestAuditEvent[] = [];
     const router = createSignalRouter({
-      resolve: async () => tenantCtx('viewer'),
+      resolve: async () => actorContext('viewer'),
       topology,
       audit: (e) => {
         events.push(e);
@@ -262,19 +274,18 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
         type: 'signal.ingest',
         outcome: 'rejected',
         reason: 'forbidden-role',
-        tenantId: 'acme',
         actorId: 'opal',
         threadId: OWNED_THREAD,
       }),
     ]);
   });
 
-  it('audits the cross-tenant 404 (a probe for another tenant’s threadId)', async () => {
-    // #given — an operator probing a threadId it does not own
+  it('audits an accepted owned thread', async () => {
+    // #given — an operator addressing its owned thread
     const { topology, calls } = recordingTopology();
     const events: SignalIngestAuditEvent[] = [];
     const router = createSignalRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       topology,
       audit: (e) => {
         events.push(e);
@@ -283,19 +294,19 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
 
     // #when
     const res = await router(
-      post('/api/threads/other_t9/message', { contents: 'hi' }),
+      post(`/api/threads/${OWNED_THREAD}/message`, { contents: 'hi' }),
     );
 
-    // #then — 404 (no oracle), never addressed, and the probe is audited
-    expect(res?.status).toBe(404);
-    expect(calls).toHaveLength(0);
+    // #then — accepted, addressed, and audited
+    expect(res?.status).toBe(200);
+    expect(calls).toEqual([
+      expect.objectContaining({ threadId: OWNED_THREAD }),
+    ]);
     expect(events).toEqual([
       expect.objectContaining({
         type: 'signal.ingest',
-        outcome: 'rejected',
-        reason: 'foreign-thread',
-        tenantId: 'acme',
-        threadId: 'other_t9',
+        outcome: 'accepted',
+        threadId: OWNED_THREAD,
       }),
     ]);
   });
@@ -305,7 +316,7 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
     const { topology, calls } = recordingTopology();
     const events: SignalIngestAuditEvent[] = [];
     const router = createSignalRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       topology,
       audit: (e) => {
         events.push(e);
@@ -328,14 +339,13 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
         type: 'signal.ingest',
         outcome: 'rejected',
         reason: 'client-memory-id',
-        tenantId: 'acme',
         threadId: OWNED_THREAD,
       }),
     ]);
   });
 
   it('does NOT audit a pre-auth 401 (unauthenticated — no flood amplification)', async () => {
-    // #given — resolve returns no tenant (unauthenticated) with an audit sink
+    // #given — resolve returns no actor (unauthenticated) with an audit sink
     const { topology } = recordingTopology();
     const events: SignalIngestAuditEvent[] = [];
     const router = createSignalRouter({
@@ -360,7 +370,7 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
     const { topology, calls } = recordingTopology();
     const audit = vi.fn();
     const router = createSignalRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       topology,
       audit,
     });
@@ -382,7 +392,6 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
     expect(audit).toHaveBeenCalledWith(
       expect.objectContaining({
         type: 'signal.ingest',
-        tenantId: 'acme',
         actorId: 'opal',
         threadId: OWNED_THREAD,
         channel: 'notification',
@@ -394,7 +403,7 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
   it('405 for a non-POST method on a signal path', async () => {
     const { topology } = recordingTopology();
     const router = createSignalRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       topology,
     });
     const res = await router(
@@ -411,7 +420,7 @@ describe('createSignalRouter — the P6 ingestion gate', () => {
       logged.push(String(value));
     });
     const router = createSignalRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       topology: {
         send: async () => {
           throw new Error('private signal backend detail');

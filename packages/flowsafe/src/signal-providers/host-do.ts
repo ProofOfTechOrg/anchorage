@@ -1,97 +1,49 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track E (M-007), CI-M-007-001 — the provider host Durable Object (DL-017).
-//
-// WHY a DO + alarm: core's SignalProvider expects a long-lived process — a
-// `startPolling` setInterval loop over an in-memory subscription registry
-// (signal-provider.d.ts). Workers has neither. So the DO ALARM drives polling
-// (it wakes an evicted DO with no live request) and D1 holds the subscriptions
-// (core's registry is lost on eviction) — the host rehydrates them from D1 at
-// each boot/poll (the E-S3 in-memory-lost, D1-restored proof).
-//
-// ADDRESSING — per TENANT (`idFromName(tenantId)`, the HubDurableObject pattern):
-// id.name IS the bare tenantId, so the instance is tenant-disjoint by
-// construction (like the hub DO) and its subscription store binds to exactly that
-// tenant (INV-2). It hosts ALL of the tenant's providers on one alarm, each
-// provider's poll+delivery wrapped in its OWN try/catch — PER-PROVIDER FAILURE
-// ISOLATION: a provider whose poll throws never starves its siblings, and one
-// tampered/failing delivery never aborts the rest of the batch. (Per-tenant, not
-// per-tenant×provider: a per-provider DO would make cross-provider isolation an
-// untestable DO boundary and multiply instances; per-tenant keeps the isolation
-// inside one alarm where it is exercised, and matches the hub DO's
-// id.name===tenantId house pattern.)
-//
-// The host is reached ONLY internally — the subscribe route arms it, the alarm
-// polls it — never by a client, so (like the hub DO) it needs no tenant-header
-// assertion: id.name === the addressing tenant by construction, validated INV-3.
-// Classic ctor(state, env) + fetch (+ alarm), NOT `extends DurableObject` — so it
-// and its graph load in node/vitest, the ThreadDurableObject/HubDurableObject
-// posture.
+// Alarm-driven provider host for one physically isolated deployment.
 
-// Type-only workers-types import: erased at build (never in the emitted .d.ts),
-// so consumers pull no workers-types dependency — the cf-types.ts convention.
 import type { DurableObjectState } from '@cloudflare/workers-types';
 
 import {
   DoStatusError,
   doErrorResponse,
-  TENANT_ID_PATTERN,
+  verifyDurableObjectDeploymentIdentity,
+  verifyDurableObjectDeploymentRequest,
 } from '../do-runner/index.js';
 import type { ThreadTopology } from '../host-kit/index.js';
 import { positiveSafeInteger } from '../numeric-config.js';
 import { deliverNotification } from './delivery.js';
+import { SIGNAL_PROVIDER_HOST_INSTANCE_NAME } from './host-topology.js';
 import type { SignalProviderAdapter } from './provider.js';
-import type {
-  StoredSubscription,
-  TenantBoundSubscriptionStore,
-} from './subscription-d1.js';
+import type { SubscriptionStore } from './subscription-d1.js';
 
-/** The `ctx.storage` alarm subset the host DO arms itself through. */
 export interface AlarmStorage {
   setAlarm(scheduledTime: number): void | Promise<void>;
   deleteAlarm(): void | Promise<void>;
-  /** Current alarm time, when the runtime exposes it. */
   getAlarm?(): number | null | Promise<number | null>;
 }
 
-/**
- * The DO-state subset the host reads: its own `id.name` (the tenant) and the
- * alarm storage. `storage` is OPTIONAL so a node/vitest stub that sets only
- * `id.name` satisfies it and drives `poll()` directly (no alarm off workerd).
- */
 export interface SignalProviderHostState {
   readonly id: { readonly name?: string };
   readonly storage?: AlarmStorage;
 }
 
-// Drift pin (type-only, erased): the real DurableObjectState must still satisfy
-// the subset — catches a workers-types rename of setAlarm/deleteAlarm, the same
-// posture cf-types.ts takes for the runner/hub states.
 type AssertTrue<T extends true> = T;
 type _StateSatisfies = AssertTrue<
   DurableObjectState extends SignalProviderHostState ? true : false
 >;
 
-/**
- * A host Durable Object whose name carries no valid tenant. 403 — this boundary is internal
- * (not client-reachable), so there is no oracle to protect and a distinct status
- * keeps a routing bug from reading as a 500. Extends DoStatusError so
- * doErrorResponse recognizes it.
- */
 export class SignalProviderHostIdentityError extends DoStatusError {
   readonly status = 403;
+
   constructor(message: string) {
     super(message);
     this.name = 'SignalProviderHostIdentityError';
   }
 }
 
-/** The per-instance wiring a subclass supplies, memoized by the base. */
 export interface SignalProviderHostWiring {
-  /** Subscription store BOUND to this host's tenant (the rehydration source). */
-  store: TenantBoundSubscriptionStore;
-  /** The sanctioned reach into a thread DO (delivery). */
+  store: SubscriptionStore;
   topology: ThreadTopology;
-  /** Every provider this tenant hosts. */
   providers: readonly SignalProviderAdapter[];
 }
 
@@ -107,55 +59,55 @@ function json(payload: unknown, status = 200): Response {
   });
 }
 
-/**
- * The provider host DO base. Subclass it, supply `build()` (the tenant-bound
- * subscription store + thread topology + provider list from env), and bind the
- * subclass under a wrangler namespace addressed `idFromName(tenantId)`.
- *
- * Routes: `POST /arm` boots and arms the alarm; `POST /poll` runs one poll
- * cycle directly for deterministic health checks that do not depend on the
- * alarm timer. `alarm()` polls and then re-arms.
- */
 export abstract class SignalProviderHost<TEnv = unknown> {
   protected readonly env: TEnv;
   protected readonly state?: SignalProviderHostState;
   #wiring?: SignalProviderHostWiring;
+  #identityReady?: Promise<void>;
+  #armTail = Promise.resolve();
 
   constructor(state: SignalProviderHostState | undefined, env: TEnv) {
     this.state = state;
     this.env = env;
   }
 
-  /** Build the tenant-bound wiring from env + the asserted tenant. Memoized. */
-  protected abstract build(
-    env: TEnv,
-    tenantId: string,
-  ): SignalProviderHostWiring;
+  protected abstract build(env: TEnv): SignalProviderHostWiring;
 
-  /**
-   * The tenant this host serves, recovered from its OWN idFromName identity —
-   * `id.name` is the bare tenantId. It is pattern-validated and
-   * fail-closed: a name carrying no valid tenant cannot scope a store.
-   */
-  protected get tenantId(): string {
-    const name = this.state?.id?.name;
-    if (name === undefined || !TENANT_ID_PATTERN.test(name)) {
+  #verifyIdentity(): Promise<void> {
+    this.#identityReady ??= verifyDurableObjectDeploymentIdentity(
+      this.state,
+      this.env,
+    )
+      .then(() => {
+        this.#verifyInstanceName();
+      })
+      .catch((error: unknown) => {
+        this.#identityReady = undefined;
+        throw error;
+      });
+    return this.#identityReady;
+  }
+
+  #verifyInstanceName(): void {
+    if (
+      this.state !== undefined &&
+      this.state.id.name !== SIGNAL_PROVIDER_HOST_INSTANCE_NAME
+    ) {
       throw new SignalProviderHostIdentityError(
-        `SignalProviderHost: id.name '${name ?? '<none>'}' is not an INV-3 tenantId — the host is addressed idFromName(tenantId); refusing to serve`,
+        `SignalProviderHost must be addressed as '${SIGNAL_PROVIDER_HOST_INSTANCE_NAME}'`,
       );
     }
-    return name;
   }
 
   #ensureWiring(): SignalProviderHostWiring {
-    if (!this.#wiring) {
-      this.#wiring = this.build(this.env, this.tenantId);
-    }
+    this.#wiring ??= this.build(this.env);
     return this.#wiring;
   }
 
   async fetch(request: Request): Promise<Response> {
     try {
+      await verifyDurableObjectDeploymentRequest(request, this.state, this.env);
+      await this.#verifyIdentity();
       const path = new URL(request.url).pathname;
       if (request.method === 'POST' && path === '/arm') {
         await this.#arm();
@@ -170,60 +122,41 @@ export abstract class SignalProviderHost<TEnv = unknown> {
     }
   }
 
-  /** DO alarm: poll, then re-arm regardless (availability — a failed poll must not stop polling). */
   async alarm(): Promise<void> {
-    try {
+    // The instance name is local and safe to reject before touching storage.
+    // D1 identity verification can fail transiently, so persist the next wake
+    // before that external I/O consumes this one-shot platform alarm.
+    this.#verifyInstanceName();
+    await this.#withArmLock(async () => {
+      const prearmedAt = await this.#prearmUnlocked();
+      await this.#verifyIdentity();
       await this.poll();
-    } catch (error) {
-      console.error(
-        JSON.stringify({
-          type: 'signal-provider.alarm-error',
-          reason: error instanceof Error ? error.message : String(error),
-        }),
-      );
-    }
-    // Re-arm in its OWN guard: #arm re-invokes build() via #ensureWiring, so a
-    // persistently broken wiring must not throw uncaught out of the alarm handler.
-    try {
-      await this.#arm();
-    } catch (error) {
-      console.error(
-        JSON.stringify({
-          type: 'signal-provider.arm-error',
-          reason: error instanceof Error ? error.message : String(error),
-        }),
-      );
-    }
+      await this.#armUnlocked(prearmedAt);
+    });
   }
 
-  /**
-   * Run one poll cycle across this tenant's poll-capable providers, rehydrating
-   * each provider's subscriptions from D1 first (the eviction-survivable path).
-   * PER-PROVIDER isolation: a provider whose poll throws is logged and skipped,
-   * the rest still run; PER-DELIVERY isolation: a failing/tampered delivery is
-   * logged and skipped, the batch continues. Public so a host or test can drive
-   * it directly.
-   */
   async poll(): Promise<PollResult> {
+    await this.#verifyIdentity();
     const { store, topology, providers } = this.#ensureWiring();
-    const tenantId = this.tenantId;
     let providersPolled = 0;
     let delivered = 0;
     for (const provider of providers) {
       if (!provider.pollForDeliveries) continue;
+      providersPolled += 1;
       try {
         const subscriptions = await store.listForProvider(provider.id);
+        const authorized = new Map(
+          subscriptions.map((subscription) => [subscription.id, subscription]),
+        );
         const deliveries = await provider.pollForDeliveries(subscriptions);
-        providersPolled += 1;
         for (const delivery of deliveries) {
           try {
-            // This host's tenant is authoritative for the poll path (the store
-            // was bound to it); attach it so delivery binds to the right tenant,
-            // and the topology re-checks ownership (a foreign threadId 404s).
-            const subscription: StoredSubscription = {
-              ...delivery.subscription,
-              tenantId,
-            };
+            const subscription = authorized.get(delivery.subscription.id);
+            if (!subscription) {
+              throw new Error(
+                `provider '${provider.id}' returned an unbound subscription`,
+              );
+            }
             const response = await deliverNotification(
               topology,
               subscription,
@@ -232,8 +165,6 @@ export abstract class SignalProviderHost<TEnv = unknown> {
             if (response.ok) {
               delivered += 1;
             } else {
-              // A matched delivery the thread DO rejected for content (not an
-              // ownership 404 — that throws): log so it is not silently dropped.
               console.error(
                 JSON.stringify({
                   type: 'signal-provider.delivery-rejected',
@@ -265,15 +196,54 @@ export abstract class SignalProviderHost<TEnv = unknown> {
     return { providersPolled, delivered };
   }
 
-  /**
-   * Arm at the MIN positive pollInterval of providers that both poll AND have
-   * subscriptions, without postponing an already earlier alarm. Absent/zero
-   * intervals remain manually pollable but schedule no wake. Nothing automatic
-   * left ⇒ delete the alarm (self-terminating: a tenant with no live
-   * subscriptions costs no wakeups). No storage (node/vitest) ⇒ no-op, and
-   * tests drive `poll()` directly.
-   */
   async #arm(): Promise<void> {
+    await this.#withArmLock(() => this.#armUnlocked());
+  }
+
+  async #withArmLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.#armTail;
+    let release: () => void = () => undefined;
+    this.#armTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  async #prearmUnlocked(): Promise<number | undefined> {
+    const storage = this.state?.storage;
+    if (!storage) return undefined;
+    let interval: number | undefined;
+    for (const provider of this.#ensureWiring().providers) {
+      if (!provider.pollForDeliveries) continue;
+      const configured = provider.pollInterval;
+      if (configured === undefined || configured === 0) continue;
+      const providerInterval = positiveSafeInteger(
+        configured,
+        `signal provider '${provider.id}' pollInterval`,
+      );
+      interval =
+        interval === undefined
+          ? providerInterval
+          : Math.min(interval, providerInterval);
+    }
+    if (interval === undefined) return undefined;
+    const desired = Date.now() + interval;
+    const current = await storage.getAlarm?.();
+    if (current === undefined || current === null || current > desired) {
+      await storage.setAlarm(desired);
+    }
+    return current === undefined || current === null || current > desired
+      ? desired
+      : current;
+  }
+
+  async #armUnlocked(prearmedAt?: number): Promise<void> {
+    await this.#verifyIdentity();
     const storage = this.state?.storage;
     if (!storage) return;
     const { store, providers } = this.#ensureWiring();
@@ -298,9 +268,7 @@ export abstract class SignalProviderHost<TEnv = unknown> {
       return;
     }
     const desired = Date.now() + interval;
-    const current = await storage.getAlarm?.();
-    // Subscription write traffic must not continually postpone an already
-    // imminent alarm. A newly added faster provider can still move it earlier.
+    const current = (await storage.getAlarm?.()) ?? prearmedAt;
     if (current === undefined || current === null || current > desired) {
       await storage.setAlarm(desired);
     }

@@ -12,6 +12,7 @@
 // turns "you asked for a run that does not exist" into "I am broken", and the
 // router's RunRouteError passthrough has nothing to pass through.
 
+import { DeploymentIdentityError } from './deployment-identity.js';
 import {
   InvalidRunRequestError,
   RunAlreadyExistsError,
@@ -32,7 +33,7 @@ import {
  * ```
  *
  * A CLASS, so opting in is `instanceof` — deliberate and nominal, the posture
- * TENANT_BOUND and AuditLogger take. The structural alternative (any thrown
+ * AuditLogger takes. The structural alternative (any thrown
  * value with a numeric `status`) cannot tell a refusal this DO authored from the
  * arbitrary values its routes throw: an upstream client's `{status: 429}` would
  * become this API's 429, and `{status: 0}` — routine on HTTP-client error
@@ -45,6 +46,10 @@ export abstract class DoStatusError extends Error {
 }
 
 function statusOf(error: unknown): number | undefined {
+  // Mis-provisioned deployment (env tag vs D1 sentinel): the operator's
+  // problem, not the caller's — 503 so monitors separate a wiring fault from
+  // a code fault. Fail closed: nothing below this line runs for one.
+  if (error instanceof DeploymentIdentityError) return 503;
   if (
     error instanceof UnknownWorkflowError ||
     error instanceof UnknownRunError

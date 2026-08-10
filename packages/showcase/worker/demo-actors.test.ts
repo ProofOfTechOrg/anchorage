@@ -93,15 +93,12 @@ describe('demo actors', () => {
     // DROPS any entry with an unknown role rather than trusting it
     const parsed = parseActorTokens(demoActorTokensJson());
 
-    // #then — no identity is silently lost, and the tenant rides along
-    // (parseActorTokens DROPS any entry without an INV-3 tenantId, so a demo
-    // actor losing its tenant surfaces here as a size mismatch)
+    // #then — no identity is silently lost
     expect(parsed.size).toBe(DEMO_ACTORS.length);
     for (const actor of DEMO_ACTORS) {
       expect(parsed.get(actor.token)).toEqual({
         id: actor.id,
         role: actor.role,
-        tenantId: actor.tenantId,
       });
     }
   });

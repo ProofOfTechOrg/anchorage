@@ -311,7 +311,7 @@ export const SCENARIOS: readonly GuardrailScenario[] = [
       });
       const requestContext = contextWith({
         [ACTOR_CONTEXT_KEY]: ctx.actor,
-        [ISOLATION_SCOPE_CONTEXT_KEY]: ctx.tenantId,
+        [ISOLATION_SCOPE_CONTEXT_KEY]: ctx.isolationScope,
       });
       ctx.emitEvent({
         kind: 'note',
@@ -379,7 +379,7 @@ export const SCENARIOS: readonly GuardrailScenario[] = [
       const requestContext = contextWith({
         [ACTOR_CONTEXT_KEY]: ctx.actor,
         [WORKFLOW_SCOPE_CONTEXT_KEY]: 'access-request',
-        [ISOLATION_SCOPE_CONTEXT_KEY]: ctx.tenantId,
+        [ISOLATION_SCOPE_CONTEXT_KEY]: ctx.isolationScope,
       });
       ctx.emitEvent({
         kind: 'note',
@@ -431,19 +431,19 @@ export const SCENARIOS: readonly GuardrailScenario[] = [
   },
   {
     id: 'tenant-isolation',
-    title: 'Tenant isolation',
+    title: 'Isolation scope',
     prompt: 'Assign this lead in the CRM.',
     blurb:
-      'Every connector call must carry a tenant scope. A call that arrives without one is denied rather than falling back to shared, unsegmented keys.',
+      'A connector configured for multiple logical scopes must carry an opaque scope. A call that arrives without one is denied rather than falling back to shared, unsegmented keys.',
     layers: ['isolation'],
     async run(ctx) {
       const isolation = tenantIsolation();
       ctx.emitEvent({
         kind: 'note',
-        text: 'tenant-isolation armed: a connector call with no tenant scope fails closed (no shared-key fallback).',
+        text: 'isolation-scope policy armed: a connector call with no scope fails closed (no shared-key fallback).',
       });
       // With scope: the normal path.
-      ctx.emitText('Assigning the lead under your tenant scope.\n');
+      ctx.emitText('Assigning the lead under the deployment scope.\n');
       const scoped = await evaluateGate(isolation, {
         connectorId: 'crm-assign',
         sideEffect: 'write',
@@ -451,20 +451,20 @@ export const SCENARIOS: readonly GuardrailScenario[] = [
         input: { lead: 'acme' },
         requestContext: contextWith({
           [ACTOR_CONTEXT_KEY]: ctx.actor,
-          [ISOLATION_SCOPE_CONTEXT_KEY]: ctx.tenantId,
+          [ISOLATION_SCOPE_CONTEXT_KEY]: ctx.isolationScope,
         }),
       });
       if (scoped.allowed) {
         ctx.emitText('Scoped call cleared isolation.\n');
         ctx.emitEvent({
           kind: 'note',
-          text: `tenant-isolation: allowed (scope ${ctx.tenantId})`,
+          text: `isolation-scope policy: allowed (scope ${ctx.isolationScope})`,
         });
       }
       await ctx.sleep(200);
       // A forged/scope-less call — the fail-closed case.
       ctx.emitText(
-        'A retry arrives with the tenant scope stripped from the context. Running it.\n',
+        'A retry arrives with the isolation scope stripped from the context. Running it.\n',
       );
       const scopeless = await evaluateGate(isolation, {
         connectorId: 'crm-assign',
@@ -482,12 +482,12 @@ export const SCENARIOS: readonly GuardrailScenario[] = [
         return {
           status: 'blocked',
           headline:
-            'The scope-less call was refused. Without a tenant scope there is no safe key to use, so breakwater denies instead of sharing one.',
+            'The scope-less call was refused. Without an infrastructure scope there is no safe key to use, so breakwater denies instead of sharing one.',
         };
       }
       return {
         status: 'clean',
-        headline: 'Both calls carried a tenant scope.',
+        headline: 'Both calls carried an isolation scope.',
       };
     },
   },

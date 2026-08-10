@@ -9,7 +9,6 @@
 // The catalog fetch lives here because the header, the SoD notice, and the
 // launcher all need the server's actor echo.
 
-import { AlertDialog } from '@astryxdesign/core/AlertDialog';
 import { Banner } from '@astryxdesign/core/Banner';
 import { Button } from '@astryxdesign/core/Button';
 import { Card } from '@astryxdesign/core/Card';
@@ -49,14 +48,9 @@ import { WhatsRealHere, WhereThingsRunDialog } from '@/architecture-legend';
 import { ControlRoom } from '@/control-room/control-room';
 import { GLOSSARY, ROLE_NOTES, TAGLINE } from '@/glossary';
 import { IntroTourDialog, useIntroTour } from '@/intro-tour';
-import { resetErrorEvent, resetEvent, shortId } from '@/narration';
+import { shortId } from '@/narration';
 import { RunCards } from '@/run-cards';
-import {
-  type CatalogActor,
-  RunApiError,
-  type RunClient,
-  type WorkflowMeta,
-} from '@/run-client';
+import type { CatalogActor, RunClient, WorkflowMeta } from '@/run-client';
 import type { ActivityFeed } from '@/use-activity-feed';
 import { useNarrationToasts } from '@/use-narration-toasts';
 import {
@@ -78,10 +72,6 @@ export interface ShowcaseAppProps {
   runClient: RunClient;
   runs: readonly RunEntry[];
   onStarted: (entry: RunEntry) => void;
-  /** Empties the root's run list after a successful sandbox reset. */
-  onRunsCleared: () => void;
-  /** Render the reset affordance (demo sandbox / dev only — see main.tsx). */
-  canReset: boolean;
   feed: ActivityFeed;
   /** The acting-identity controls (actor switcher / operator chip). */
   identityControls?: ReactNode;
@@ -96,8 +86,6 @@ export function ShowcaseApp({
   runClient,
   runs,
   onStarted,
-  onRunsCleared,
-  canReset,
   feed,
   identityControls,
   approvalStream,
@@ -133,12 +121,6 @@ export function ShowcaseApp({
   const [tab, setTab] = useState('queue');
   const [batchComment, setBatchComment] = useState('');
   const [legendOpen, setLegendOpen] = useState(false);
-  const [resetOpen, setResetOpen] = useState(false);
-  const [resetBusy, setResetBusy] = useState(false);
-  // Remount key for the launcher: a successful reset bumps it, wiping the
-  // selection/edited-JSON/error state in one move instead of threading reset
-  // props through the component.
-  const [resetEpoch, setResetEpoch] = useState(0);
   const tour = useIntroTour();
 
   // Fills the catalog state hoisted above. Refetches when the acting client
@@ -211,53 +193,6 @@ export function ShowcaseApp({
   // "you may decide it here" relaxation note.
   const canSelfDecide = actor?.canSelfDecide ?? false;
 
-  // The reset confirm's onAction. The button stays enabled for every role —
-  // a non-admin click earns the server's 403, narrated as the RBAC lesson —
-  // but the dialog warns about the refusal BEFORE the click.
-  async function performReset(): Promise<void> {
-    setResetBusy(true);
-    try {
-      const outcome = await runClient.reset();
-      onRunsCleared();
-      feed.clear();
-      narrate([resetEvent(outcome.purged)]);
-      void dashboard.refresh();
-      setTab('queue');
-      setResetEpoch((epoch) => epoch + 1);
-      setResetOpen(false);
-    } catch (error) {
-      narrate([resetErrorEvent(error, actor?.role)]);
-      // A 5xx can mean a PARTIAL purge (the server's deletes are not one
-      // transaction), so the local view is no longer authoritative — resync
-      // the queue from the server rather than assume nothing changed. A
-      // 401/403 changed nothing, but refreshing it costs one poll.
-      void dashboard.refresh();
-      if (
-        error instanceof RunApiError &&
-        (error.status === 401 || error.status === 403)
-      ) {
-        // The refusal is the story; keep the dialog only for retryable 5xx.
-        setResetOpen(false);
-      }
-    } finally {
-      setResetBusy(false);
-    }
-  }
-
-  // The dialog owns a DESTRUCTIVE request that cannot be recalled once sent:
-  // Escape and Cancel must not dismiss it mid-flight, or the wipe lands
-  // silently on a user who believes they backed out (the action button is
-  // already disabled while busy, but the dismissal paths are not).
-  function changeResetOpen(open: boolean): void {
-    if (open || !resetBusy) setResetOpen(open);
-  }
-
-  const resetDescription = `Deletes ALL of this sandbox's runs and approval records server-side and clears the local activity feed. You stay signed in, and the run budget is NOT refilled.${
-    actor && actor.role !== 'admin'
-      ? ` Requires the admin role; you are '${actor.role}', so the server will refuse (403).`
-      : ''
-  }`;
-
   return (
     <VStack gap={5} padding={5} maxWidth={1280} style={{ margin: '0 auto' }}>
       <HStack justify="between" align="center" wrap="wrap" gap={3}>
@@ -282,14 +217,6 @@ export function ShowcaseApp({
               variant="ghost"
               onClick={tour.open}
             />
-            {canReset ? (
-              <Button
-                label="Reset sandbox"
-                tooltip={GLOSSARY.reset}
-                variant="ghost"
-                onClick={() => setResetOpen(true)}
-              />
-            ) : null}
             {identityControls}
           </HStack>
           {actor ? (
@@ -309,17 +236,6 @@ export function ShowcaseApp({
         tour={tour}
         onStartTour={() => scrollTo('control-room')}
       />
-      <AlertDialog
-        isOpen={resetOpen}
-        onOpenChange={changeResetOpen}
-        title="Reset this sandbox?"
-        description={resetDescription}
-        actionLabel="Reset everything"
-        actionVariant="destructive"
-        isActionLoading={resetBusy}
-        onAction={() => void performReset()}
-      />
-
       <div id="control-room">
         <ControlRoom
           actor={actor}
@@ -480,7 +396,6 @@ export function ShowcaseApp({
               }
             />
             <WorkflowLauncher
-              key={resetEpoch}
               workflows={workflows}
               actor={actor}
               isLoading={!catalogSettled}
@@ -503,8 +418,9 @@ export function ShowcaseApp({
 
       <Text size="sm" color="secondary">
         Anchorage demo: flowsafe + breakwater running on Cloudflare Workers,
-        Durable Objects, and D1. Connectors are offline; your sandbox and
-        everything in it self-destructs at expiry. · Theme: Astryx y2k.
+        Durable Objects, and D1. Connectors are offline; session credentials
+        expire while shared records follow normal retention. · Theme: Astryx
+        y2k.
       </Text>
       <HStack gap={3} align="center" wrap="wrap">
         <Link

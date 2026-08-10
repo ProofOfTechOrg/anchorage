@@ -7,18 +7,18 @@
 //
 // The SEND surface targets the createSignalRouter routes
 // (`POST /api/threads/:threadId/{message,queue,signal,state,notification}`), so
-// every call crosses the P6 ingestion gate (auth → role → thread-prefix
+// every call crosses the P6 ingestion gate (auth → role → registry-backed thread
 // ownership → allowlist/size/rate → audit) before it reaches a thread DO.
 //
 // SUBSCRIBE / hub bridge (DL-016 — CORRECTED): a thread's live chunks are a
-// per-END-USER stream (one conversation's tokens), NOT tenant-wide fan-out. The
-// Part B hub is per-TENANT, so forwarding subscribeToThread chunks onto it and
-// filtering CLIENT-side by threadId would put one end-user's thread bytes on
-// EVERY same-tenant operator's hub socket — a within-tenant confidentiality leak
-// (and wasted fan-out). So phase-2 live subscribe MUST be scoped SERVER-side per
+// per-END-USER stream (one conversation's tokens), NOT deployment-wide fan-out.
+// Forwarding subscribeToThread chunks onto the deployment hub and filtering
+// client-side by threadId would put one end-user's thread bytes on every
+// connected operator's socket (and waste fan-out). Phase-2 live subscribe must
+// therefore be scoped server-side per
 // thread / per resourceId: a thread-addressed channel (a per-thread WS on the
-// thread DO, or a hub subscription the server filters by (tenantId, threadId)
-// before it emits), never client-side filtering of a tenant firehose. It is
+// thread DO, or a hub subscription filtered by threadId before emit), never
+// client-side filtering of a deployment firehose. It is
 // deferred to phase 2 and shares Track A's real-loop boundary (a loop must be
 // producing chunks to forward). Nothing here mints capability — sendToolApproval
 // is not an approval surface (P8).

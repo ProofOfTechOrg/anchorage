@@ -1,21 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track D (M-006), CI-M-006-003 — createScheduleRouter, the tenant facade over
-// the schedules domain. Schedule rows have NO tenant column (DL-013): the tenant
-// is stamped into metadata.tenantId at create (server-controlled, never a client
-// value) and every read/list/mutation is tenant-scoped on it. Ids are
+// Track D (M-006), CI-M-006-003 — createScheduleRouter, the authenticated facade
+// over the deployment schedules domain. Ids are
 // SERVER-MINTED `${prefix}${uuid}` (agent_/schedule_) — a client cannot name the
-// id, so it cannot collide with (or probe for) another tenant's schedule, the
+// id, so it cannot collide with (or probe for) another schedule, the
 // INV-1 posture applied to schedule ids; core's slugified client-id path is
 // avoided (a slugify-drift + existence-oracle vector).
 //
 // The write path is an ingestion trust boundary (P6-lite, DL-006) — the same gate
 // order createSignalRouter / createObjectiveRouter enforce:
 //
-//   1. resolve (authenticate -> INV-3 -> bind)             -> 401 / 403
-//   2. coarse role (RUN_START_ROLES) on MUTATIONS           -> 403 (reads stay coarse)
-//   3. per-resource ownership (metadata.tenantId match)      -> 404 (no oracle)
+//   1. resolve (authenticate and validate actor)            -> 401 / 403
+//   2. existing-schedule ownership before role or storage    -> 404
+//   3. coarse role (RUN_START_ROLES) on MUTATIONS           -> 403 (reads stay coarse)
 //   4. size cap on the raw body, THEN JSON parse             -> 413 / 400
-//   5. field validation + per-tenant COUNT cap (create) + fire-RATE cap (DL-007)
+//   5. field validation + deployment COUNT cap + fire-RATE cap (DL-007)
 //   6. P4 reserved requestContext-key rejection (DL-004)     -> 400
 //   7. audit (schedule.route) + persist
 //
@@ -28,8 +26,8 @@
 // ifIdle.streamOptions.requestContext).
 //
 // Every MUTATION is audited on ACCEPT and on EVERY post-auth denial (role 403,
-// foreign 404, cap/field/reserved-key 400). A GET/list is audited only on a
-// post-auth denial (a cross-tenant probe); a benign successful read is not. A
+// missing 404, cap/field/reserved-key 400). A GET/list is audited only on a
+// post-auth denial; a benign successful read is not. A
 // pre-auth failure (401 / resolver throw -> 403) is NOT audited: an
 // unauthenticated flood must never be able to write the log.
 //
@@ -59,28 +57,45 @@ import type {
 } from '@mastra/core/storage';
 import { computeNextFireAt, validateCron } from '@mastra/core/workflows';
 import {
+  type ActorContext,
+  ActorResolutionError,
+  type ActorResolver,
   type ApprovalRole,
+  type ResourceOwner,
   RUN_START_ROLES,
-  type TenantContext,
-  TenantResolutionError,
-  type TenantResolver,
 } from '../approval-api/index.js';
-import { RunRouteError, requireOwnedMemoryId } from '../host-kit/index.js';
+import {
+  type BoundThreadTargetValidator,
+  RunRouteError,
+  requireMemoryId,
+  requireResourceAccess,
+} from '../host-kit/index.js';
 import { safeDecodeSegment } from '../host-kit/route-path.js';
+import { readBoundedBody } from '../http-body.js';
 import { internalErrorResponse } from '../internal-error-response.js';
 import {
   nonnegativeSafeInteger,
   positiveSafeInteger,
 } from '../numeric-config.js';
+import {
+  type AuthorizedSchedule,
+  type ScheduleTargetPolicy,
+  scheduleCreatorRole,
+  scheduleWithCreatorRole,
+} from './target-policy.js';
 import { isReservedScheduleContextKey } from './tick.js';
 
 /** The storage subset the facade reads/writes (a subset of D1SchedulesStorage). */
 export interface ScheduleFacadeStore {
-  createSchedule(schedule: Schedule): Promise<Schedule>;
+  createOwnedSchedule(
+    schedule: AuthorizedSchedule,
+    owner: ResourceOwner,
+    maxSchedules: number,
+  ): Promise<Schedule | null>;
   getSchedule(id: string): Promise<Schedule | null>;
   listSchedules(filter?: ScheduleFilter): Promise<Schedule[]>;
   updateSchedule(id: string, patch: ScheduleUpdate): Promise<Schedule>;
-  deleteSchedule(id: string): Promise<void>;
+  deleteOwnedSchedule(id: string): Promise<'deleted' | 'pending'>;
   listTriggers(
     scheduleId: string,
     opts?: ScheduleTriggerListOptions,
@@ -101,7 +116,7 @@ export type ScheduleOperation =
 /** The structured audit event a mutation (and a denied read) emits. */
 export interface ScheduleRouteAuditEvent {
   type: 'schedule.route';
-  tenantId: string;
+  deploymentTag?: string;
   actorId: string;
   operation: ScheduleOperation;
   /** Present once an id is in play (all but create/list). */
@@ -118,10 +133,14 @@ export type ScheduleRouteAuditSink = (
 ) => void | Promise<void>;
 
 export interface ScheduleRouterOptions {
-  /** Authenticate, validate the tenant ID, and bind it; undefined means 401. */
-  resolve: TenantResolver;
+  /** Authenticate and validate the actor; undefined means 401. */
+  resolve: ActorResolver;
   /** The schedules domain the facade reads/writes. */
   store: ScheduleFacadeStore;
+  /** Catalog-backed target authorization shared with the fire-time tick. */
+  targetPolicy: ScheduleTargetPolicy;
+  /** Prove fixed-thread agent targets are durable bound memory. */
+  validateThreadTarget: BoundThreadTargetValidator;
   /**
    * Who may create/update/delete/pause/resume. Default RUN_START_ROLES
    * (operator/admin) — reviewers/viewers cannot author schedules. Reads (get/
@@ -131,16 +150,16 @@ export interface ScheduleRouterOptions {
   /** Every mutation (and denied read) is audited through this. Absent ⇒ no audit. */
   audit?: ScheduleRouteAuditSink;
   /**
-   * Per-tenant count cap: the maximum number of schedules a tenant may own. A create
-   * at or over it is REJECTED. Must be a nonnegative safe integer; zero denies
+   * Deployment count cap. A create at or over it is REJECTED. Must be a
+   * nonnegative safe integer; zero denies
    * every create. Default 100.
    */
-  maxSchedulesPerTenant?: number;
+  maxSchedules?: number;
   /**
    * Per-schedule fire-rate cap: the minimum interval between two
    * consecutive fires of a schedule's cron, in ms. A cron whose interval is
    * shorter is REJECTED at create/update — bounding the aggregate fire rate a
-   * tenant can schedule (with the count cap). Must be a positive safe integer.
+   * deployment can schedule (with the count cap). Must be a positive safe integer.
    * Default 60000 (1 minute).
    */
   minFireIntervalMs?: number;
@@ -165,6 +184,56 @@ function json(payload: unknown, status = 200): Response {
   });
 }
 
+function sameOwner(left: ResourceOwner, right: ResourceOwner): boolean {
+  return left.kind === right.kind && left.id === right.id;
+}
+
+async function requireTargetOwner(
+  context: ActorContext,
+  target: Schedule['target'],
+  owner: ResourceOwner,
+  validateThreadTarget: BoundThreadTargetValidator,
+): Promise<void> {
+  if (
+    target.type !== 'agent' ||
+    target.threadId === undefined ||
+    target.resourceId === undefined
+  ) {
+    return;
+  }
+  await requireResourceAccess(
+    context,
+    'thread',
+    target.threadId,
+    'write',
+    'thread',
+  );
+  await requireResourceAccess(
+    context,
+    'resource',
+    target.resourceId,
+    'write',
+    'resource',
+  );
+  const [threadOwner, resourceOwner] = await Promise.all([
+    context.resourceOwnerFor('thread', target.threadId),
+    context.resourceOwnerFor('resource', target.resourceId),
+  ]);
+  if (
+    !threadOwner ||
+    !resourceOwner ||
+    !sameOwner(threadOwner, owner) ||
+    !sameOwner(resourceOwner, owner)
+  ) {
+    throw new RunRouteError(404, 'target resource not found');
+  }
+  await validateThreadTarget(context, {
+    agentId: target.agentId,
+    threadId: target.threadId,
+    resourceId: target.resourceId,
+  });
+}
+
 interface Rejection {
   reason: string;
   message: string;
@@ -174,13 +243,6 @@ type Validated<T> = { ok: true; value: T } | { ok: false; error: Rejection };
 
 function reject(reason: string, message: string, status = 400): Rejection {
   return { reason, message, status };
-}
-
-/** A schedule is owned by the tenant iff its metadata.tenantId matches. */
-function ownsSchedule(schedule: Schedule, tenantId: string): boolean {
-  const owner = (schedule.metadata as Record<string, unknown> | undefined)
-    ?.tenantId;
-  return owner === tenantId;
 }
 
 /**
@@ -271,7 +333,7 @@ function checkFireRate(
   // NOTE (DL-007 limitation): this samples only the NEXT two fires at request
   // time. A non-uniform cron (e.g. a dense minute cluster + a long gap) can pass
   // when sampled during the gap yet still fire the dense cluster later; the
-  // per-tenant COUNT cap and the tick's run-cap seam are the real aggregate
+  // deployment COUNT cap and the tick's run-cap seam are the real aggregate
   // backstops. A precise cycle-wide bound is deliberately not attempted here.
   if (second.value - first.value < minFireIntervalMs) {
     return reject(
@@ -283,8 +345,8 @@ function checkFireRate(
 }
 
 // A body may only carry the keys of the kind it declares — an unknown key is a
-// 400 (defense-in-depth, the goals/signals allowlist posture). tenantId is never
-// settable (server-stamped), and id/nextFireAt/lastFireAt/lastRunId/createdAt/
+// 400 (defense-in-depth, the goals/signals allowlist posture). id/nextFireAt/
+// lastFireAt/lastRunId/createdAt/
 // updatedAt/ownerType/ownerId are server-owned.
 type WorkflowCreateField = Exclude<keyof CreateWorkflowScheduleInput, 'id'>;
 type AgentCreateField = Exclude<keyof CreateAgentScheduleInput, 'id'>;
@@ -368,7 +430,6 @@ function metadataOrReject(value: unknown): Validated<Record<string, unknown>> {
 
 function validateMemoryIds(
   body: Record<string, unknown>,
-  tenant: TenantContext,
 ): Rejection | undefined {
   const hasThread = body.threadId !== undefined;
   const hasResource = body.resourceId !== undefined;
@@ -399,8 +460,8 @@ function validateMemoryIds(
       'resourceId is required when threadId is set',
     );
   }
-  requireOwnedMemoryId(tenant, body.threadId as string, 'threadId');
-  requireOwnedMemoryId(tenant, body.resourceId as string, 'resourceId');
+  requireMemoryId(body.threadId as string, 'threadId');
+  requireMemoryId(body.resourceId as string, 'resourceId');
   return undefined;
 }
 
@@ -448,14 +509,12 @@ function normalizeAgentTarget(
   };
 }
 
-/** Build a fresh Schedule row from a create body, tenant-stamped + server-id'd. */
+/** Build a fresh server-id'd Schedule row from a create body. */
 function buildCreateRow(
   body: Record<string, unknown>,
-  tenant: TenantContext,
   now: number,
   minFireIntervalMs: number,
 ): Validated<Schedule> {
-  const tenantId = tenant.tenantId;
   const hasWorkflow = 'workflowId' in body && body.workflowId !== undefined;
   const hasAgent = 'agentId' in body && body.agentId !== undefined;
   if (hasWorkflow === hasAgent) {
@@ -511,12 +570,6 @@ function buildCreateRow(
     if (!parsedMetadata.ok) return parsedMetadata;
     clientMetadata = parsedMetadata.value;
   }
-  // tenantId is stamped LAST so a client value can never override it (DL-013).
-  const metadata: Record<string, unknown> = {
-    ...clientMetadata,
-    tenantId,
-  };
-
   // checkFireRate above already proved the cron has a future occurrence, so this
   // cannot throw; nextFireOrReject keeps it defensive without a bare computeNextFireAt.
   const nextFire = nextFireOrReject(cron, timezone, now);
@@ -529,7 +582,7 @@ function buildCreateRow(
     nextFireAt,
     createdAt: now,
     updatedAt: now,
-    metadata,
+    ...(body.metadata !== undefined ? { metadata: clientMetadata } : {}),
   };
 
   if (hasWorkflow) {
@@ -604,7 +657,7 @@ function buildCreateRow(
       error: reject('name-invalid', 'name must be a string'),
     };
   }
-  const memory = validateMemoryIds(body, tenant);
+  const memory = validateMemoryIds(body);
   if (memory) return { ok: false, error: memory };
   const reserved = reservedContextRejection(body, 'agent');
   if (reserved) return { ok: false, error: reserved };
@@ -625,11 +678,11 @@ function buildCreateRow(
 export function createScheduleRouter(
   options: ScheduleRouterOptions,
 ): ScheduleRouter {
-  const { resolve, store } = options;
+  const { resolve, store, targetPolicy } = options;
   const roles = options.roles ?? RUN_START_ROLES;
   const maxSchedules = nonnegativeSafeInteger(
-    options.maxSchedulesPerTenant ?? 100,
-    'maxSchedulesPerTenant',
+    options.maxSchedules ?? 100,
+    'maxSchedules',
   );
   const minFireIntervalMs = positiveSafeInteger(
     options.minFireIntervalMs ?? 60_000,
@@ -673,22 +726,24 @@ export function createScheduleRouter(
     const isMutation =
       operation !== 'get' && operation !== 'list' && operation !== 'triggers';
 
-    // `tenant` is a hoisted `let` so the `audit` closure (defined before the try)
-    // can read it. It stays undefined until resolve succeeds, and the closure
+    // `context` is hoisted so the audit closure can read it. It stays undefined
+    // until resolve succeeds, and the closure
     // no-ops while it is — so a pre-auth failure never writes the log (an
     // unauthenticated flood cannot spam the audit sink).
-    let tenant: TenantContext | undefined;
+    let context: ActorContext | undefined;
     const audit = async (
       outcome: 'accepted' | 'rejected',
       reason?: string,
     ): Promise<void> => {
-      if (!options.audit || !tenant) return;
+      if (!options.audit || !context) return;
       // A benign read is not audited; only its denial is.
       if (!isMutation && outcome === 'accepted') return;
       await options.audit({
         type: 'schedule.route',
-        tenantId: tenant.tenantId,
-        actorId: tenant.actor.id,
+        ...(context.deploymentTag !== undefined
+          ? { deploymentTag: context.deploymentTag }
+          : {}),
+        actorId: context.actor.id,
         operation,
         ...(id !== undefined ? { scheduleId: id } : {}),
         outcome,
@@ -696,26 +751,53 @@ export function createScheduleRouter(
         timestamp: new Date().toISOString(),
       });
     };
+    const auditCommittedMutation = async (): Promise<void> => {
+      try {
+        await audit('accepted');
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            type: 'schedule.route-audit-error',
+            operation,
+            ...(id !== undefined ? { scheduleId: id } : {}),
+            reason: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }
+    };
 
     try {
       // 1. Resolve.
-      tenant = await resolve(request);
-      if (!tenant) return json({ error: 'authentication required' }, 401);
-      // Captured after the guard so the closures below don't need a non-null
-      // assertion on the hoisted `tenant` let.
-      const ownerTenant = tenant.tenantId;
+      context = await resolve(request);
+      if (!context) return json({ error: 'authentication required' }, 401);
 
-      // 2. Coarse role on mutations.
-      if (isMutation && !roles.includes(tenant.actor.role)) {
+      // CREATE has no resource to resolve yet, so its coarse role gate comes
+      // immediately after authentication.
+      if (operation === 'create' && !roles.includes(context.actor.role)) {
         await audit('rejected', 'forbidden-role');
         return json({ error: 'forbidden' }, 403);
       }
 
-      // LIST — tenant-filtered (DL-013 post-filter over the domain list).
+      // LIST returns only schedules this principal may read. Reviewer/admin
+      // policy is applied by canAccessResource; owners always retain access.
       if (operation === 'list') {
+        const accessContext = context;
         const all = await store.listSchedules();
-        const mine = all.filter((s) => ownsSchedule(s, ownerTenant));
-        return json({ schedules: mine.map(toView) });
+        const accessible = await Promise.all(
+          all.map(async (schedule) => ({
+            schedule,
+            allowed: await accessContext.canAccessResource(
+              'schedule',
+              schedule.id,
+              'read',
+            ),
+          })),
+        );
+        return json({
+          schedules: accessible
+            .filter((entry) => entry.allowed)
+            .map((entry) => toView(entry.schedule)),
+        });
       }
 
       // CREATE — count cap, field/cron/fire-rate/reserved-key checks, persist.
@@ -728,51 +810,65 @@ export function createScheduleRouter(
           );
           return parsed;
         }
-        // COUNT cap (DL-007): a tenant may not exceed its schedule budget. This
-        // is check-then-act (no atomic increment through the domain seam), so N
-        // concurrent creates at count = cap-1 can each read the same count and
-        // all insert, overshooting by up to N — self-limited to the requester's
-        // own tenant. The tick's run-cap seam is the real cost backstop; a hard
-        // atomic cap would need a transaction D1 does not expose here.
-        const owned = (await store.listSchedules()).filter((s) =>
-          ownsSchedule(s, ownerTenant),
-        );
-        if (owned.length >= maxSchedules) {
-          await audit('rejected', 'schedule-count-cap');
-          return json(
-            { error: `tenant schedule cap of ${maxSchedules} reached` },
-            400,
-          );
-        }
-        const built = buildCreateRow(
-          parsed,
-          tenant,
-          Date.now(),
-          minFireIntervalMs,
-        );
+        const built = buildCreateRow(parsed, Date.now(), minFireIntervalMs);
         if (!built.ok) {
           await audit('rejected', built.error.reason);
           return json({ error: built.error.message }, built.error.status);
         }
-        const created = await store.createSchedule(built.value);
-        await audit('accepted');
+        const targetDecision = targetPolicy.authorize(
+          built.value.target,
+          context.actor.role,
+        );
+        if (!targetDecision.allowed) {
+          await audit('rejected', targetDecision.reason);
+          return json(
+            {
+              error: targetDecision.status === 404 ? 'not found' : 'forbidden',
+            },
+            targetDecision.status,
+          );
+        }
+        await requireTargetOwner(
+          context,
+          built.value.target,
+          context.resourceOwner,
+          options.validateThreadTarget,
+        );
+        const row = scheduleWithCreatorRole(built.value, context.actor.role);
+        const created = await store.createOwnedSchedule(
+          row,
+          context.resourceOwner,
+          maxSchedules,
+        );
+        if (!created) {
+          await audit('rejected', 'schedule-count-cap');
+          return json(
+            { error: `deployment schedule cap of ${maxSchedules} reached` },
+            400,
+          );
+        }
+        await auditCommittedMutation();
         return json({ schedule: toView(created) }, 201);
       }
 
       // Everything below addresses ONE schedule by id — 404 (no oracle) on a
-      // missing OR foreign one, BEFORE any work, both audited the same.
+      // missing or foreign one, before role checks or storage access.
       const scheduleId = id as string;
-      const existing = await store.getSchedule(scheduleId);
-      if (!existing || !ownsSchedule(existing, tenant.tenantId)) {
-        await audit('rejected', 'not-found');
-        return json({ error: 'not found' }, 404);
+      await requireResourceAccess(
+        context,
+        'schedule',
+        scheduleId,
+        isMutation ? 'write' : 'read',
+        'schedule',
+      );
+      if (isMutation && !roles.includes(context.actor.role)) {
+        await audit('rejected', 'forbidden-role');
+        return json({ error: 'forbidden' }, 403);
       }
-
-      if (operation === 'get') {
-        return json({ schedule: toView(existing) });
-      }
-
       if (operation === 'triggers') {
+        // A delete-requested schedule remains owned while an indeterminate
+        // dispatch is reconciled. Its trigger history is the only public handle
+        // for that run, so keep it readable until settlement finalizes deletion.
         // Default the limit so an omitted/garbage `?limit` never returns an
         // UNBOUNDED history (trigger rows grow per fire; SCHEDULE_TRIGGER_
         // RETENTION_DAYS is opt-in/unset by default).
@@ -782,26 +878,38 @@ export function createScheduleRouter(
       }
 
       if (operation === 'delete') {
-        await store.deleteSchedule(scheduleId);
-        await audit('accepted');
-        return json({ ok: true });
+        const outcome = await store.deleteOwnedSchedule(scheduleId);
+        await auditCommittedMutation();
+        return outcome === 'pending'
+          ? json({ ok: true, pending: true }, 202)
+          : json({ ok: true });
+      }
+
+      const existing = await store.getSchedule(scheduleId);
+      if (!existing) {
+        await audit('rejected', 'not-found');
+        return json({ error: 'not found' }, 404);
+      }
+
+      if (operation === 'get') {
+        return json({ schedule: toView(existing) });
       }
 
       if (operation === 'pause') {
         if (existing.status === 'paused') {
-          await audit('accepted');
+          await auditCommittedMutation();
           return json({ schedule: toView(existing) });
         }
         const updated = await store.updateSchedule(scheduleId, {
           status: 'paused',
         });
-        await audit('accepted');
+        await auditCommittedMutation();
         return json({ schedule: toView(updated) });
       }
 
       if (operation === 'resume') {
         if (existing.status === 'active') {
-          await audit('accepted');
+          await auditCommittedMutation();
           return json({ schedule: toView(existing) });
         }
         // Re-activating recomputes nextFireAt from now (core's resume semantics).
@@ -822,7 +930,7 @@ export function createScheduleRouter(
           status: 'active',
           nextFireAt,
         });
-        await audit('accepted');
+        await auditCommittedMutation();
         return json({ schedule: toView(updated) });
       }
 
@@ -845,20 +953,48 @@ export function createScheduleRouter(
         await audit('rejected', patch.error.reason);
         return json({ error: patch.error.message }, patch.error.status);
       }
+      if (patch.value.target !== undefined) {
+        const targetDecision = targetPolicy.authorize(
+          patch.value.target,
+          scheduleCreatorRole(existing),
+        );
+        if (!targetDecision.allowed) {
+          await audit('rejected', targetDecision.reason);
+          return json(
+            {
+              error: targetDecision.status === 404 ? 'not found' : 'forbidden',
+            },
+            targetDecision.status,
+          );
+        }
+        const scheduleOwner = await context.resourceOwnerFor(
+          'schedule',
+          scheduleId,
+        );
+        if (!scheduleOwner) {
+          throw new RunRouteError(404, 'schedule not found');
+        }
+        await requireTargetOwner(
+          context,
+          patch.value.target,
+          scheduleOwner,
+          options.validateThreadTarget,
+        );
+      }
       const updated = await store.updateSchedule(scheduleId, patch.value);
-      await audit('accepted');
+      await auditCommittedMutation();
       return json({ schedule: toView(updated) });
     } catch (error) {
       if (error instanceof RunRouteError) {
         await audit(
           'rejected',
           error.status === 404
-            ? 'foreign-memory-id'
+            ? 'resource-not-found'
             : `route-error-${error.status}`,
         );
         return json({ error: error.message }, error.status);
       }
-      if (error instanceof TenantResolutionError) {
+      if (error instanceof ActorResolutionError) {
         // Pre-auth: unauthenticated, so not audited.
         return json({ error: 'forbidden' }, 403);
       }
@@ -982,12 +1118,9 @@ function buildUpdatePatch(
   if (nextTarget.value !== undefined) patch.target = nextTarget.value;
 
   if (body.metadata !== undefined) {
-    // A client may not change tenantId — re-stamp the existing owner.
-    const owner = (existing.metadata as Record<string, unknown> | undefined)
-      ?.tenantId;
     const clientMeta = metadataOrReject(body.metadata);
     if (!clientMeta.ok) return clientMeta;
-    patch.metadata = { ...clientMeta.value, tenantId: owner };
+    patch.metadata = clientMeta.value;
   }
 
   return { ok: true, value: patch };
@@ -1098,13 +1231,19 @@ async function readBody(
   request: Request,
   maxContentBytes: number,
 ): Promise<Record<string, unknown> | Response> {
-  const raw = await request.text();
-  const bytes = new TextEncoder().encode(raw).length;
-  if (bytes > maxContentBytes) {
+  const raw = await readBoundedBody(
+    request,
+    maxContentBytes,
+    'schedule body exceeds limit',
+  );
+  if (!raw.ok && raw.reason === 'payload-too-large') {
     return json({ error: `payload exceeds ${maxContentBytes} bytes` }, 413);
   }
+  if (!raw.ok) {
+    return json({ error: 'a JSON object body is required' }, 400);
+  }
   try {
-    const parsed = raw === '' ? {} : JSON.parse(raw);
+    const parsed = raw.text === '' ? {} : JSON.parse(raw.text);
     if (
       typeof parsed !== 'object' ||
       parsed === null ||

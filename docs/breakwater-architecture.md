@@ -130,7 +130,7 @@ The execution order is:
 
 1. Validate connector construction and input.
 2. Check declared egress against the host's organization allowlist.
-3. Run custom tool evaluators such as tenant and workflow isolation.
+3. Run custom tool evaluators such as opaque logical-scope and workflow isolation.
 4. Require the trusted principal-permissions projection to hold every declared `requiredPermissions` identifier — before dry-run selection and before the approval grant, so an approval cannot elevate an unauthorized principal.
 5. Select dry-run or real execution.
 6. Require the server-derived connector grant when policy demands approval.
@@ -171,19 +171,19 @@ Only actual executions consume the budget. Denials, dry-runs, stored replays, an
 
 ## Isolation context
 
-Breakwater remains tenant-agnostic. Its `Actor` has no tenant id.
+Breakwater remains organization-agnostic. Its `Actor` has no organization id.
 
-A trusted multi-tenant runtime writes an opaque value to `breakwater.isolationScope`. The connector SDK uses it to segment idempotency and rate keys, and `tenantIsolation()` refuses a call without it. Breakwater does not parse the scope.
+A trusted generic host can write an opaque value to `breakwater.isolationScope`. The connector SDK uses it to segment idempotency and rate keys, and `tenantIsolation()` refuses a call without it. Breakwater does not parse the scope.
 
 Similarly, `breakwater.workflowScope` identifies the current runtime leg for `crossWorkflowIsolation()`. A connector-specific `targetScopeOf` extracts the workflow a call wants to access. Missing caller scope or a different target fails closed.
 
-Flowsafe mints both values on every run leg. A single-tenant host may omit tenant isolation and retain unsegmented keys.
+Flowsafe mints the workflow value on every run leg. It reserves and strips `breakwater.isolationScope` because each data plane serves one organization; connector keys remain deployment-wide.
 
 ## Audit and metrics
 
 Every gate writes an `AuditEvent` with timestamp, actor, action, resource, decision, optional reason, and structured detail.
 
-Guarded agents use `agent:<agentId>` as the RBAC and policy resource. A trusted host may set `breakwater.auditContext` with `agentId`, `tenantId`, `runId`, `threadId`, `resourceId`, and `entryPath`. Breakwater copies only these scalar fields into agent audit detail. It does not copy prompts, tool inputs, URLs, secrets, or model output.
+Guarded agents use `agent:<agentId>` as the RBAC and policy resource. A trusted host may set `breakwater.auditContext` with `agentId`, `tenantId`, `runId`, `threadId`, `resourceId`, and `entryPath`. Breakwater copies only these scalar fields into agent audit detail. Flowsafe maps its verified deployment tag to the legacy `tenantId` audit field; request claims cannot set it. Breakwater does not copy prompts, tool inputs, URLs, secrets, or model output.
 
 `AuditLogger` keeps a bounded in-memory ring and invokes its sink without making export availability part of the agent path. Supply `onSinkError` to surface failures.
 
@@ -216,12 +216,12 @@ Breakwater does not implement:
 
 - authentication or OAuth;
 - workflow route authorization;
-- a tenant registry;
+- a deployment provisioner or organization registry;
 - approval queue persistence or reviewer UX;
 - durable workflow execution;
 - data retention scheduling;
 - network perimeter isolation.
 
-Flowsafe owns workflow route authorization, durable approvals, runtime-derived grants, tenant execution context, D1 retention, and Cloudflare deployment helpers. The host owns identity, business policy, secrets, infrastructure boundaries, and which optional features are exposed.
+Flowsafe owns workflow route authorization, durable approvals, runtime-derived grants, actor execution context, deployment-sentinel verification, D1 retention, and Cloudflare deployment helpers. The host owns identity, one-to-one resource provisioning, business policy, secrets, infrastructure boundaries, and which optional features are exposed.
 
 See [Product boundaries](breakwater-purpose-and-boundaries.md) for the Mastra comparison.

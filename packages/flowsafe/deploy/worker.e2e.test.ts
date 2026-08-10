@@ -5,20 +5,18 @@
 // of the suite trusts: node:sqlite behind a D1-shaped adapter (real Mastra
 // D1Store + real D1ApprovalStore over real SQLite) and a DO namespace whose
 // stubs construct real FlowsafeRunner instances (stub state carries the
-// idFromName identity, so INV-1 tenant recovery runs for real).
+// idFromName identity, so the DO identity guard runs for real).
 //
 // What it pins, end to end over HTTP shapes:
 //   - the auth seam: /healthz open; everything else 401s without a mapped
-//     bearer token; a reserved `tenantId: "system"` map entry never
-//     authenticates
+//     bearer token; a malformed actor-map entry never authenticates
 //   - the full approval loop: start -> suspension auto-queues an approval ->
 //     SoD denial (the requester, wearing the decide-capable admin role) +
 //     role denial (viewer) -> reviewer approves -> the derived grant admits
 //     the gated publish -> status projection reads success
 //   - fail-closed: a forged resume (no approval) is denied at the grant gate
-//   - INV-1/INV-2 at the template's boundary: client runIds 400, viewers
-//     cannot start runs, another tenant's token 404s on status AND resume and
-//     cannot see the approval in its queue
+//   - the template boundary: client runIds 400, viewers cannot start runs,
+//     and authorized actors share the deployment's run/approval surfaces
 //   - scheduled(): the cron escalates an SLA-overdue approval and purges only
 //     stale TERMINAL snapshots; a broken approval store must not stop the
 //     retention purge (the two surfaces are isolated)
@@ -48,9 +46,11 @@ import {
   type ApprovalStreamEvent,
   D1ApprovalStoreFactory,
 } from '../src/approval-api/index.js';
-import type {
-  RunSummary,
-  TenantArtifactPurger,
+import {
+  HUB_INSTANCE_NAME,
+  PATH_SAFE_ID_PATTERN,
+  type RunArtifactPurger,
+  type RunSummary,
 } from '../src/do-runner/index.js';
 import {
   createFlowsafeWorker,
@@ -77,7 +77,7 @@ const queueHandler = required(handler.queue, 'queue');
 // In-process DO namespace: idFromName carries the name, get() memoizes a REAL
 // FlowsafeRunner per name with a stub state exposing that identity — the same
 // `{ id: { name } }` shape durable-object.ts documents for node tests, so
-// tenant recovery (INV-1) and the identity assert both execute for real.
+// request identity and deployment identity assertions both execute for real.
 function fakeRunnerNamespace(getEnv: () => Env): DurableObjectNamespace {
   const instances = new Map<string, FlowsafeRunner>();
   const namespace = {
@@ -99,19 +99,19 @@ function fakeRunnerNamespace(getEnv: () => Env): DurableObjectNamespace {
   return namespace as unknown as DurableObjectNamespace;
 }
 
-// Bearer map for the APPROVAL_ACTOR_TOKENS secret. The 'system' entry is a
-// forgery probe: parseActorTokens must drop it (reserved tenant), so the
+// Bearer map for the APPROVAL_ACTOR_TOKENS secret. The malformed entry is a
+// fail-closed probe: parseActorTokens must drop it, so the
 // token never authenticates. 'tok-admin' exists because admin is the ONLY
 // role in both RUN_START_ROLES and CAN_REVIEW — the identity that can start
 // a run AND would be role-allowed to decide it, so the separation-of-duties
 // denial (requester ≠ decider) is testable distinctly from the role gate.
 const TOKENS = {
-  'tok-admin': { id: 'ada-admin', role: 'admin', tenantId: 'acme' },
-  'tok-operator': { id: 'op-olive', role: 'operator', tenantId: 'acme' },
-  'tok-reviewer': { id: 'rev-ray', role: 'reviewer', tenantId: 'acme' },
-  'tok-viewer': { id: 'vic-viewer', role: 'viewer', tenantId: 'acme' },
-  'tok-rival': { id: 'op-rival', role: 'operator', tenantId: 'rival' },
-  'tok-system': { id: 'sneak', role: 'admin', tenantId: 'system' },
+  'tok-admin': { id: 'ada-admin', role: 'admin' },
+  'tok-operator': { id: 'op-olive', role: 'operator' },
+  'tok-reviewer': { id: 'rev-ray', role: 'reviewer' },
+  'tok-viewer': { id: 'vic-viewer', role: 'viewer' },
+  'tok-rival': { id: 'op-rival', role: 'operator' },
+  'tok-malformed': { id: '', role: 'admin' },
 };
 
 function makeEnv(overrides: Partial<Env> = {}): {
@@ -120,9 +120,26 @@ function makeEnv(overrides: Partial<Env> = {}): {
   d1: unknown;
 } {
   const sqlite = openSqlite();
+  sqlite
+    .prepare(
+      `CREATE TABLE flowsafe_deployment (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        tenant_tag TEXT NOT NULL,
+        provisioned_at TEXT NOT NULL
+      )`,
+    )
+    .run();
+  sqlite
+    .prepare(
+      `INSERT INTO flowsafe_deployment (id, tenant_tag, provisioned_at)
+       VALUES (1, 'acme', '2026-08-10T00:00:00.000Z')`,
+    )
+    .run();
   const d1 = d1DatabaseLike(sqlite);
   const env = {
     DB: d1 as D1Database,
+    DEPLOYMENT_TENANT: 'acme',
+    DEPLOYMENT_IDENTITY_SECRET: 'test-deployment-identity-secret-0001',
     APPROVAL_ACTOR_TOKENS: JSON.stringify(TOKENS),
     ...overrides,
   } as Env;
@@ -203,13 +220,13 @@ describe('deploy worker fetch(): auth seam', () => {
     ).toBe(401);
   });
 
-  it('drops a reserved `tenantId: "system"` map entry — the token never authenticates', async () => {
-    // #given — TOKENS carries 'tok-system' with the TCB's own audit identity
+  it('drops a malformed actor-map entry — the token never authenticates', async () => {
+    // #given — TOKENS carries an empty actor id
     const { env } = makeEnv();
 
     // #when / #then — parseActorTokens discards the entry, so 401 (not 403)
     expect(
-      (await call(env, '/workflows', { token: 'tok-system' })).status,
+      (await call(env, '/workflows', { token: 'tok-malformed' })).status,
     ).toBe(401);
   });
 
@@ -223,7 +240,7 @@ describe('deploy worker fetch(): auth seam', () => {
     // #then — the server's view of the actor, not a client-side guess
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({
-      actor: { id: 'rev-ray', role: 'reviewer', tenantId: 'acme' },
+      actor: { id: 'rev-ray', role: 'reviewer' },
       workflows: [{ id: 'example-approval' }],
     });
   });
@@ -235,10 +252,10 @@ describe('deploy worker fetch(): the approval loop over HTTP', () => {
     const { env } = makeEnv();
     const started = await startRun(env);
 
-    // #then — server-minted tenant-salted runId (INV-1) and a queued approval
+    // #then — server-minted path-safe runId and a queued approval
     // carrying the gate's server-authored connector request
     expect(started.status).toBe('suspended');
-    expect(started.runId).toMatch(/^acme_/);
+    expect(PATH_SAFE_ID_PATTERN.test(started.runId)).toBe(true);
     expect(started.suspended).toEqual([['gate']]);
     expect(started.approval).toMatchObject({
       status: 'pending',
@@ -407,8 +424,8 @@ describe('deploy worker fetch(): the approval loop over HTTP', () => {
   });
 });
 
-describe('deploy worker fetch(): tenant boundary (INV-1/INV-2 at the template)', () => {
-  it('400s a client-supplied runId — the id is the tenant carrier', async () => {
+describe('deploy worker fetch(): deployment boundary', () => {
+  it('400s a client-supplied runId', async () => {
     // #given
     const { env } = makeEnv();
 
@@ -446,64 +463,20 @@ describe('deploy worker fetch(): tenant boundary (INV-1/INV-2 at the template)',
     expect(response.status).toBe(403);
   });
 
-  it("another tenant's token 404s on status AND resume, and its queue never lists the approval", async () => {
-    // #given — tenant acme owns a suspended run + its approval
+  it('hides run status from another operator while retaining the shared approval queue', async () => {
     const { env } = makeEnv();
     const started = await startRun(env);
     const approvalId = started.approval?.id;
     if (!approvalId) throw new Error('expected an auto-queued approval');
 
-    // #when / #then — 404 (not 403): no existence oracle for foreign runIds
     const status = await call(env, `/runs/example-approval/${started.runId}`, {
       token: 'tok-rival',
     });
     expect(status.status).toBe(404);
-    const resume = await call(
-      env,
-      `/runs/example-approval/${started.runId}/resume`,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          step: 'gate',
-          resumeData: { approved: true },
-        }),
-        token: 'tok-rival',
-      },
-    );
-    expect(resume.status).toBe(404);
 
-    // #then — rival's tenant-bound store cannot see acme's approval
     const rivalList = await call(env, '/api/approvals', { token: 'tok-rival' });
     expect(rivalList.status).toBe(200);
-    expect(JSON.stringify(await rivalList.json())).not.toContain(approvalId);
-    const acmeList = await call(env, '/api/approvals', {
-      token: 'tok-reviewer',
-    });
-    expect(JSON.stringify(await acmeList.json())).toContain(approvalId);
-  });
-
-  it('TENANT_APEX_DOMAIN engages the subdomain cross-check: mismatched host denied, own host and off-apex hosts pass', async () => {
-    // #given — the wrap is env-var-gated; this is the only host that wires it
-    const { env } = makeEnv({ TENANT_APEX_DOMAIN: 'proof.example' });
-
-    // #when / #then — acme's token on rival's subdomain: authenticated but
-    // forbidden (the pasted-token confused-deputy the check exists to close)
-    const mismatch = await call(env, '/workflows', {
-      token: 'tok-reviewer',
-      host: 'rival.proof.example',
-    });
-    expect(mismatch.status).toBe(403);
-
-    // #then — the same token on its OWN subdomain passes
-    const match = await call(env, '/workflows', {
-      token: 'tok-reviewer',
-      host: 'acme.proof.example',
-    });
-    expect(match.status).toBe(200);
-
-    // #then — a host outside the apex skips the check (single-host topology)
-    const offApex = await call(env, '/workflows', { token: 'tok-reviewer' });
-    expect(offApex.status).toBe(200);
+    expect(JSON.stringify(await rivalList.json())).toContain(approvalId);
   });
 });
 
@@ -536,7 +509,7 @@ describe('deploy worker fetch(): D4 wedge recovery (status() self-heals)', () =>
     expect(await status.json()).toMatchObject({ status: 'suspended' });
 
     // ...and the poll healed it: a FRESH approval now exists for the same
-    // gate, attributed to the system rather than a human requester
+    // gate, retaining the run's durable human requester provenance
     const requeued = await call(env, '/api/approvals', {
       token: 'tok-reviewer',
     });
@@ -549,7 +522,8 @@ describe('deploy worker fetch(): D4 wedge recovery (status() self-heals)', () =>
     expect(refiled).toMatchObject({
       stepPath: ['gate'],
       connectors: ['example-publisher'],
-      requestedBy: 'flowsafe-worker',
+      requestedBy: 'op-olive',
+      requestedByKind: 'human',
     });
 
     // #when — the reviewer decides the RE-FILED record
@@ -573,16 +547,16 @@ describe('deploy worker fetch(): D4 wedge recovery (status() self-heals)', () =>
   });
 });
 
-// In-process HUB namespace: idFromName carries the name (the tenantId), and
+// In-process HUB namespace: idFromName carries the singleton name, and
 // get().fetch records each ApprovalStreamEvent the composer POSTs to
 // /internal/event (createHubTopology.publish). The real DO fan-out over
 // hibernatable WebSockets is workerd-only and proven by the spike; here we only
-// need to see the event reach the RIGHT tenant's hub stub.
+// need to see the event reach the deployment hub stub.
 function fakeHubNamespace(): {
   namespace: DurableObjectNamespace;
-  events: Array<{ tenant: string; event: ApprovalStreamEvent }>;
+  events: Array<{ instance: string; event: ApprovalStreamEvent }>;
 } {
-  const events: Array<{ tenant: string; event: ApprovalStreamEvent }> = [];
+  const events: Array<{ instance: string; event: ApprovalStreamEvent }> = [];
   const namespace = {
     idFromName: (name: string) => ({ name }),
     get: (id: { name: string }) => ({
@@ -591,7 +565,7 @@ function fakeHubNamespace(): {
         // forward (the WS path) is never exercised in-process.
         if (typeof input === 'string' && typeof init?.body === 'string') {
           events.push({
-            tenant: id.name,
+            instance: id.name,
             event: JSON.parse(init.body) as ApprovalStreamEvent,
           });
         }
@@ -608,7 +582,7 @@ function fakeHubNamespace(): {
 function makeStreamEnv(overrides: Partial<Env> = {}): {
   env: Env;
   sqlite: SqliteDatabase;
-  hubEvents: Array<{ tenant: string; event: ApprovalStreamEvent }>;
+  hubEvents: Array<{ instance: string; event: ApprovalStreamEvent }>;
 } {
   const hub = fakeHubNamespace();
   const { env, sqlite } = makeEnv({
@@ -655,29 +629,27 @@ describe('deploy worker fetch(): live stream stage (opt-in)', () => {
     expect(response.status).toBe(401);
   });
 
-  it("forwards a run-start's auto-queued approval to the tenant hub", async () => {
+  it("forwards a run-start's auto-queued approval to the deployment hub", async () => {
     // #given — a streaming env whose HUB stub records forwarded events
     const { env, hubEvents } = makeStreamEnv();
 
     // #when — starting a run suspends and auto-queues an approval; the
     // fetch-scope stream sink (ctx.waitUntil, drained by call()) forwards the
-    // 'created' event to env.HUB.idFromName(record.tenantId)
+    // 'created' event to the deployment hub singleton
     const started = await startRun(env);
 
-    // #then — exactly the acme hub received the created record
+    // #then — the deployment hub received the created record
     const created = hubEvents.find((e) => e.event.type === 'created');
     expect(created).toBeDefined();
-    expect(created?.tenant).toBe('acme');
-    expect(created?.event.record.tenantId).toBe('acme');
+    expect(created?.instance).toBe(HUB_INSTANCE_NAME);
     expect(created?.event.record.runId).toBe(started.runId);
     expect(created?.event.record.connectors).toEqual(['example-publisher']);
   });
 
-  it('404s a run-channel ticket for a run the tenant does not own (no existence oracle)', async () => {
-    // #given — acme reviewer asking for a rival-prefixed runId
+  it('404s a run-channel ticket for an unregistered path-safe address', async () => {
     const { env } = makeStreamEnv();
 
-    // #when / #then — ownership, not authorization: 404, mirroring run-router
+    // #when / #then
     const response = await call(env, '/api/stream/ticket', {
       method: 'POST',
       body: JSON.stringify({ channel: 'run', runId: 'rival_r1' }),
@@ -779,11 +751,10 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
     // config error and fall back to the 30-day default rather than skip
     // maintenance (the fallback keeps the purge asserts below meaningful).
     const { env, sqlite, d1 } = makeEnv({ RUN_RETENTION_DAYS: '-5' });
-    const store = new D1ApprovalStoreFactory(d1 as never).forTenant('acme');
+    const store = new D1ApprovalStoreFactory(d1 as never).store();
     const past = new Date(Date.now() - 60_000).toISOString();
     await store.create({
       id: 'apr-overdue',
-      tenantId: 'acme',
       workflowId: 'example-approval',
       runId: 'acme_r1',
       title: 'overdue approval',
@@ -877,6 +848,8 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
     } as unknown as D1Database;
     const env = {
       DB: broken,
+      DEPLOYMENT_TENANT: 'acme',
+      DEPLOYMENT_IDENTITY_SECRET: 'test-deployment-identity-secret-0001',
       APPROVAL_ACTOR_TOKENS: JSON.stringify(TOKENS),
     } as Env;
     createSnapshotTable(sqlite);
@@ -928,13 +901,14 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
     } as unknown as D1Database;
     const env = {
       DB: broken,
+      DEPLOYMENT_TENANT: 'acme',
+      DEPLOYMENT_IDENTITY_SECRET: 'test-deployment-identity-secret-0001',
       APPROVAL_ACTOR_TOKENS: JSON.stringify(TOKENS),
     } as Env;
-    const store = new D1ApprovalStoreFactory(d1 as never).forTenant('acme');
+    const store = new D1ApprovalStoreFactory(d1 as never).store();
     const past = new Date(Date.now() - 60_000).toISOString();
     await store.create({
       id: 'apr-overdue',
-      tenantId: 'acme',
       workflowId: 'example-approval',
       runId: 'acme_r1',
       title: 'overdue approval',
@@ -979,11 +953,10 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
     // #given — ops edited wrangler.jsonc without updating the constants;
     // availability of both duties beats purity on a misconfig
     const { env, sqlite, d1 } = makeEnv();
-    const store = new D1ApprovalStoreFactory(d1 as never).forTenant('acme');
+    const store = new D1ApprovalStoreFactory(d1 as never).store();
     const past = new Date(Date.now() - 60_000).toISOString();
     await store.create({
       id: 'apr-overdue',
-      tenantId: 'acme',
       workflowId: 'example-approval',
       runId: 'acme_r1',
       title: 'overdue approval',
@@ -1030,12 +1003,11 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
     // APPROVAL_RETENTION_DAYS is deliberately invalid: numberVar must log
     // the config error and fall back to 30 days rather than skip the purge.
     const { env, d1 } = makeEnv({ APPROVAL_RETENTION_DAYS: '-5' });
-    const store = new D1ApprovalStoreFactory(d1 as never).forTenant('acme');
+    const store = new D1ApprovalStoreFactory(d1 as never).store();
     const old = new Date(Date.now() - 40 * DAY_MS).toISOString();
     const fresh = new Date(Date.now() - 1 * DAY_MS).toISOString();
     await store.create({
       id: 'apr-old-decided',
-      tenantId: 'acme',
       workflowId: 'example-approval',
       runId: 'acme_r-old',
       title: 'old decided',
@@ -1048,7 +1020,6 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
     });
     await store.create({
       id: 'apr-fresh-decided',
-      tenantId: 'acme',
       workflowId: 'example-approval',
       runId: 'acme_r-fresh',
       title: 'fresh decided',
@@ -1061,7 +1032,6 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
     });
     await store.create({
       id: 'apr-old-open',
-      tenantId: 'acme',
       workflowId: 'example-approval',
       runId: 'acme_r-open',
       title: 'old but still open',
@@ -1117,6 +1087,8 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
     } as unknown as D1Database;
     const env = {
       DB: broken,
+      DEPLOYMENT_TENANT: 'acme',
+      DEPLOYMENT_IDENTITY_SECRET: 'test-deployment-identity-secret-0001',
       APPROVAL_ACTOR_TOKENS: JSON.stringify(TOKENS),
     } as Env;
     createSnapshotTable(sqlite);
@@ -1157,10 +1129,10 @@ describe('createFlowsafeWorker scheduled(): artifact-paired retention purge (F4)
   // are deleted BEFORE its snapshot row (the row is the only enumerable record
   // of the run's artifact keys).
 
-  function workerWith(artifactStore: TenantArtifactPurger | undefined) {
+  function workerWith(artifactStore: RunArtifactPurger | undefined) {
     return createFlowsafeWorker<Env>({
       workflows: [],
-      systemActorId: 'flowsafe-worker',
+      systemPrincipalId: 'flowsafe-worker',
       buildVerifier: () =>
         staticTokenVerifier(new Map<string, ApprovalActor>()),
       crons: { sweep: SWEEP_CRON, purge: PURGE_CRON },
@@ -1183,11 +1155,11 @@ describe('createFlowsafeWorker scheduled(): artifact-paired retention purge (F4)
       updatedAt: Date.now() - 1 * DAY_MS,
     });
 
-    // a TenantArtifactPurger that asserts the row STILL EXISTS when it runs:
+    // a RunArtifactPurger that asserts the row STILL EXISTS when it runs:
     // pairing deletes artifacts BEFORE the row, so the row (the only record of
     // the artifact keys) must still be enumerable at this moment
     const deletions: string[] = [];
-    const artifactStore: TenantArtifactPurger = {
+    const artifactStore: RunArtifactPurger = {
       deleteRun: vi.fn(async (_workflowId: string, runId: string) => {
         expect(remainingRunIds(sqlite)).toContain(runId);
         deletions.push(runId);

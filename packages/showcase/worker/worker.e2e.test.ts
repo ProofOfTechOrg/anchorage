@@ -7,7 +7,7 @@
 // properties that make Phase A a real safety demo rather than a bypass.
 
 import { InMemoryStore } from '@mastra/core/storage';
-import { AuditLogger } from '@proofoftech/breakwater';
+import { AGENT_AUDIT_CONTEXT_KEY, AuditLogger } from '@proofoftech/breakwater';
 import {
   type ApprovalActor,
   ApprovalService,
@@ -22,20 +22,27 @@ import { OUTREACH_CONNECTOR } from '#worker/workflows/gtm-outbound';
 const OPERATOR: ApprovalActor = {
   id: 'opal',
   role: 'operator',
-  tenantId: 'demo',
 };
 const REVIEWER: ApprovalActor = {
   id: 'ray',
   role: 'reviewer',
-  tenantId: 'demo',
 };
 
 function buildHarness() {
-  const store = new InMemoryApprovalStore('demo');
+  const store = new InMemoryApprovalStore();
   const audit = new AuditLogger();
+  const grants = approvalGrantProvider(store);
   const runtime = buildShowcaseRuntime({
     initInput: { storage: new InMemoryStore() },
-    grantProvider: approvalGrantProvider(store),
+    grantProvider: async (workflowId, runId, leg) => ({
+      ...(await grants(workflowId, runId, leg)),
+      [AGENT_AUDIT_CONTEXT_KEY]: {
+        agentId: workflowId,
+        tenantId: 'showcase-test',
+        runId,
+        entryPath: leg.kind === 'start' ? 'workflow.start' : 'workflow.resume',
+      },
+    }),
     audit,
     // no `email` binding => the connector simulates the send
   });
@@ -83,7 +90,7 @@ describe('gtm-app: outreach pipeline on real Anchorage seams (simulated send)', 
     // #given — a run suspended at the approval gate, queued as an approval
     const { runtime, service, audit } = buildHarness();
     const started = await runtime.start('gtm-outbound', {
-      runId: `demo_${crypto.randomUUID()}`,
+      runId: crypto.randomUUID(),
       inputData: { industry: 'fintech', targetCount: 50 },
     });
     expect(started.status).toBe('suspended');
@@ -122,7 +129,7 @@ describe('gtm-app: outreach pipeline on real Anchorage seams (simulated send)', 
     // #given — a suspended run, nothing approved
     const { runtime, audit } = buildHarness();
     const started = await runtime.start('gtm-outbound', {
-      runId: `demo_${crypto.randomUUID()}`,
+      runId: crypto.randomUUID(),
       inputData: { industry: 'fintech', targetCount: 50 },
     });
     expect(started.status).toBe('suspended');
@@ -150,7 +157,7 @@ describe('gtm-app: outreach pipeline on real Anchorage seams (simulated send)', 
     // #given — a suspended run queued as an approval
     const { runtime, service, audit } = buildHarness();
     const started = await runtime.start('gtm-outbound', {
-      runId: `demo_${crypto.randomUUID()}`,
+      runId: crypto.randomUUID(),
       inputData: { industry: 'fintech', targetCount: 50 },
     });
     const record = await queueApproval(

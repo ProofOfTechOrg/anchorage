@@ -3,6 +3,12 @@
 // travel over HTTP and in/out of D1, so the canonical representation is
 // JSON-safe end to end.
 
+import { isPathSafeId } from '../do-runner/path-safe-id.js';
+import {
+  assertExecutionPrincipal,
+  type ExecutionPrincipalKind,
+} from './principal.js';
+
 export type ApprovalStatus =
   | 'pending'
   | 'claimed'
@@ -89,15 +95,15 @@ export const APPROVAL_STATUSES: readonly ApprovalStatus[] = [
 /** Trusted host topology used to resume a run after Durable Object eviction. */
 export type ApprovalResumeTarget =
   | {
-      kind: 'thread';
-      threadId: string;
-      resourceId?: string;
+      readonly kind: 'thread';
+      readonly threadId: string;
+      readonly resourceId?: string;
     }
   | {
-      kind: 'agent-thread';
-      agentId: string;
-      threadId: string;
-      resourceId: string;
+      readonly kind: 'agent-thread';
+      readonly agentId: string;
+      readonly threadId: string;
+      readonly resourceId: string;
       /**
        * The principal to RESTORE on resume — never the reviewer who approved.
        * A human decision must not transfer the decider's authority into the
@@ -108,18 +114,65 @@ export type ApprovalResumeTarget =
        * and reading that back as a human would grant exactly the authority
        * this type exists to withhold).
        */
-      principal: import('./principal.js').ExecutionPrincipal;
+      readonly principal: import('./principal.js').ExecutionPrincipal;
     };
+
+function resumeTargetField(value: object, key: PropertyKey): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor !== undefined && 'value' in descriptor
+    ? descriptor.value
+    : undefined;
+}
+
+/** Validate and snapshot a trusted resume target in one pass. */
+export function canonicalApprovalResumeTarget(
+  value: unknown,
+): ApprovalResumeTarget | undefined {
+  if (value === null || typeof value !== 'object') return undefined;
+  const kind = resumeTargetField(value, 'kind');
+  const threadId = resumeTargetField(value, 'threadId');
+  const resourceId = resumeTargetField(value, 'resourceId');
+  if (kind === 'thread') {
+    if (
+      !isPathSafeId(threadId) ||
+      (resourceId !== undefined && !isPathSafeId(resourceId))
+    ) {
+      return undefined;
+    }
+    return Object.freeze({
+      kind: 'thread',
+      threadId,
+      ...(resourceId === undefined ? {} : { resourceId }),
+    });
+  }
+  if (kind !== 'agent-thread') return undefined;
+  const agentId = resumeTargetField(value, 'agentId');
+  if (
+    !isPathSafeId(agentId) ||
+    !isPathSafeId(threadId) ||
+    !isPathSafeId(resourceId)
+  ) {
+    return undefined;
+  }
+  try {
+    const principal = assertExecutionPrincipal(
+      resumeTargetField(value, 'principal'),
+      'approval resume target',
+    );
+    return Object.freeze({
+      kind: 'agent-thread',
+      agentId,
+      threadId,
+      resourceId,
+      principal,
+    });
+  } catch {
+    return undefined;
+  }
+}
 
 export interface ApprovalRecord {
   id: string;
-  /**
-   * The owning tenant. STAMPED by the bound store from its own constructor
-   * field — never accepted from input (CreateApprovalInput deliberately has
-   * no tenantId: a field that cannot be supplied cannot be spoofed). Every
-   * read/write predicate carries it.
-   */
-  tenantId: string;
   workflowId: string;
   runId: string;
   /** Suspended step path this approval unblocks, e.g. ['approval']. */
@@ -144,6 +197,11 @@ export interface ApprovalRecord {
   priority: ApprovalPriority;
   status: ApprovalStatus;
   requestedBy?: string;
+  /**
+   * Principal kind paired with `requestedBy`. Missing only on legacy rows and
+   * treated as `human` by separation-of-duties checks (fail closed).
+   */
+  requestedByKind?: ExecutionPrincipalKind;
   claimedBy?: string;
   decidedBy?: string;
   decision?: ApprovalDecision;
@@ -207,7 +265,13 @@ export interface CreateApprovalInput {
   priority?: ApprovalPriority;
   /** Seconds from creation to the SLA deadline; overrides the service default. */
   slaSeconds?: number;
+  /**
+   * Trusted requester provenance. New writes must provide it together with
+   * `requestedByKind`; the HTTP create route derives both from authentication.
+   */
   requestedBy?: string;
+  /** Trusted requester kind paired with `requestedBy`. */
+  requestedByKind?: ExecutionPrincipalKind;
   /**
    * Epoch-ms suspendedAt of the suspension this approval binds to, observed
    * from RunSummary.suspendedAt by the creating bridge (core clock, so grant
@@ -259,10 +323,9 @@ export interface ApprovalListFilter {
   createdAfter?: string;
   /**
    * Max records to return (clamped to [1, MAX_APPROVAL_LIST_LIMIT] — see
-   * clampApprovalLimit). undefined requests no explicit limit: a tenant-bound
-   * store then defaults to MAX_APPROVAL_LIST_LIMIT so a bare list() never
-   * becomes an unbounded scan, while the cron-only SystemApprovalStore view
-   * stays complete. Page complete history with an explicit `after` cursor.
+   * clampApprovalLimit). undefined requests no explicit limit: the store
+   * defaults to MAX_APPROVAL_LIST_LIMIT so a bare list() never becomes an
+   * unbounded scan. Page complete history with an explicit `after` cursor.
    */
   limit?: number;
   /**
@@ -290,8 +353,8 @@ export interface ApprovalListFilter {
  * encodes a position in (createdAt, id) order, where new records only ever
  * land PAST the cursor; under 'reviewer' order they insert anywhere, so
  * cursor pages would silently skip or repeat records. Every list()
- * implementation (both backends, both tenant views) resolves through here;
- * router.ts maps the throw to a 400 before a store sees the filter.
+ * implementation resolves through here; router.ts maps the throw to a 400
+ * before a store sees the filter.
  */
 export function approvalListOrder(
   filter: Pick<ApprovalListFilter, 'after' | 'orderBy'>,

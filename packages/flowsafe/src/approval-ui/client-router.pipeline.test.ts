@@ -9,12 +9,11 @@
 // through the whole stack.
 
 import { describe, expect, it } from 'vitest';
-
+import { createActorResolver } from '../approval-api/actor-context.js';
 import type { ApprovalRole } from '../approval-api/contract.js';
 import { createApprovalRouter } from '../approval-api/router.js';
 import { ApprovalService } from '../approval-api/service.js';
-import { createTenantResolver } from '../approval-api/tenant-context.js';
-import { InMemoryApprovalStoreFactory } from '../approval-api/tenant-store.js';
+import { InMemoryApprovalStoreFactory } from '../approval-api/store-factory.js';
 import type { ApprovalRecord } from '../approval-api/types.js';
 import {
   MAX_APPROVAL_LIST_LIMIT,
@@ -29,7 +28,6 @@ function seedRecord(
   const at = new Date(1700000000000 + index * 1000).toISOString();
   return {
     id: `apr-${index}`,
-    tenantId: 'acme',
     workflowId: 'wf',
     runId: `acme_run-${index}`,
     title: `approval ${index}`,
@@ -48,7 +46,7 @@ describe('approval pipeline (client → router → service → store)', () => {
     // MAX normal requests plus one critical created LAST (newest createdAt, so
     // a FIFO-then-cap page would drop it at position MAX+1)
     const backend = new InMemoryApprovalStoreFactory();
-    const store = backend.forTenant('acme');
+    const store = backend.store();
     for (let index = 0; index < MAX_APPROVAL_LIST_LIMIT; index += 1) {
       await store.create(seedRecord(index));
     }
@@ -59,14 +57,11 @@ describe('approval pipeline (client → router → service → store)', () => {
     });
     await store.create(critical);
 
-    const resolve = createTenantResolver({
+    const resolve = createActorResolver({
       authenticate: (request) => {
         const id = request.headers.get('x-actor-id');
         const role = request.headers.get('x-actor-role');
-        const tenantId = request.headers.get('x-actor-tenant') ?? 'acme';
-        return id && role
-          ? { id, role: role as ApprovalRole, tenantId }
-          : undefined;
+        return id && role ? { id, role: role as ApprovalRole } : undefined;
       },
       storeFactory: backend,
       buildService: (boundStore) => new ApprovalService({ store: boundStore }),
@@ -79,7 +74,6 @@ describe('approval pipeline (client → router → service → store)', () => {
       headers: {
         'x-actor-id': 'ray',
         'x-actor-role': 'reviewer',
-        'x-actor-tenant': 'acme',
       },
       fetch: async (url, init) => {
         const response = await handle(

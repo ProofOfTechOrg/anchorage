@@ -9,7 +9,7 @@ import {
   type AutomatedPrincipalKind,
   RUN_START_ROLES,
 } from '../approval-api/index.js';
-import { PATH_SAFE_ID_PATTERN } from '../do-runner/index.js';
+import { isPathSafeId } from '../do-runner/index.js';
 import {
   type AgentAutomationRule,
   type AgentCatalog,
@@ -166,7 +166,7 @@ function automationCheckFor(
 }
 
 export function validateAgentMeta(meta: AgentMeta): AgentMeta {
-  if (typeof meta.id !== 'string' || !PATH_SAFE_ID_PATTERN.test(meta.id)) {
+  if (!isPathSafeId(meta.id)) {
     fail('id must be URL-path-safe');
   }
   if (typeof meta.title !== 'string' || meta.title.trim() === '') {

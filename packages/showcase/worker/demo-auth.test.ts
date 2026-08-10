@@ -1,12 +1,12 @@
-// The public demo's identity + abuse machinery, against real SQLite: tenant
-// lifecycle (mint / reuse / expire-and-replace with inline purge), the two
-// ATOMIC run budgets, the LIMIT-batched tenant reaper, the signed OAuth
+// The public demo's identity + abuse machinery, against real SQLite: session
+// lifecycle (mint / reuse / expire-and-replace), the two atomic run budgets,
+// LIMIT-batched session cleanup, signed OAuth
 // state, the token set, the auth router's full round-trip with a fake
 // provider, and the kill switch — including its auth-middleware half (an
 // ALREADY-ISSUED JWT must die with the switch, not just new mints).
 
 import { openSqlite, type SqliteDatabase } from '@flowsafe-test/sqlite.js';
-import { hmacVerifier, provisionTenant } from '@proofoftech/flowsafe/host-kit';
+import { hmacVerifier } from '@proofoftech/flowsafe/host-kit';
 import { describe, expect, it, vi } from 'vitest';
 import {
   consumeRunBudget,
@@ -19,14 +19,13 @@ import {
   DemoRunLimitError,
   type DemoStatement,
   type DemoTokenSet,
-  findOrCreateDemoTenant,
+  deleteExpiredDemoSessions,
+  findOrCreateDemoSession,
   googleProvider,
-  isDemoTenant,
-  mintDemoTenantId,
+  mintDemoSessionId,
   mintDemoTokenSet,
   nonceOfState,
   type OAuthProvider,
-  purgeExpiredDemoTenants,
   STATE_COOKIE,
   signState,
   verifyState,
@@ -55,96 +54,93 @@ const T0 = Date.parse('2026-07-09T12:00:00.000Z');
 const HOUR = 3_600_000;
 const SECRET = 'demo-test-secret';
 
-function makeTenantOptions(purged: string[] = []) {
+function makeSessionOptions() {
   return {
     provider: 'github',
     subject: 'github:1234',
-    tenantTtlMs: 24 * HOUR,
+    sessionTtlMs: 24 * HOUR,
     now: () => T0,
-    purgeTenantData: async (tenantId: string) => {
-      purged.push(tenantId);
-    },
   };
 }
 
-describe('mintDemoTenantId', () => {
-  it('always mints an INV-3-valid, dm-prefixed slug', () => {
+describe('mintDemoSessionId', () => {
+  it('always mints an opaque 72-bit hex id', () => {
     for (let index = 0; index < 20; index += 1) {
-      const id = mintDemoTenantId();
-      expect(id).toMatch(/^dm[0-9a-f]{18}$/);
+      const id = mintDemoSessionId();
+      expect(id).toMatch(/^[0-9a-f]{18}$/);
     }
   });
 });
 
-describe('findOrCreateDemoTenant', () => {
-  it('mints a fresh tenant through the allocation registry (insert-or-fail)', async () => {
+describe('findOrCreateDemoSession', () => {
+  it('mints a fresh session without creating a logical data boundary', async () => {
     // #given
     const sqlite = openSqlite();
     const db = demoDb(sqlite);
 
     // #when
-    const tenant = await findOrCreateDemoTenant(db, makeTenantOptions());
+    const session = await findOrCreateDemoSession(db, makeSessionOptions());
 
-    // #then — provisioned in tenants (kind demo) AND registered in demo_tenants
-    expect(tenant.tenant_id).toMatch(/^dm/);
-    expect(tenant.run_count).toBe(0);
-    const registry = sqlite
-      .prepare('SELECT tenant_id, kind FROM tenants')
-      .all();
-    expect(registry).toEqual([{ tenant_id: tenant.tenant_id, kind: 'demo' }]);
+    // #then — only auth/budget metadata exists; no tenant registry is created
+    expect(session.session_id).toMatch(/^[0-9a-f]{18}$/);
+    expect(session.run_count).toBe(0);
+    expect(
+      sqlite
+        .prepare("SELECT name FROM sqlite_master WHERE name = 'tenants'")
+        .get(),
+    ).toBeUndefined();
   });
 
-  it('reuses the LIVE tenant for the same identity without extending its clock', async () => {
+  it('reuses the live session for the same identity without extending its clock', async () => {
     // #given
     const db = demoDb(openSqlite());
-    const first = await findOrCreateDemoTenant(db, makeTenantOptions());
+    const first = await findOrCreateDemoSession(db, makeSessionOptions());
 
     // #when — same subject signs in 1h later
-    const second = await findOrCreateDemoTenant(db, {
-      ...makeTenantOptions(),
+    const second = await findOrCreateDemoSession(db, {
+      ...makeSessionOptions(),
       now: () => T0 + HOUR,
     });
 
-    // #then — same tenant, same expiry (lifetime runs from FIRST sign-in)
-    expect(second.tenant_id).toBe(first.tenant_id);
+    // #then — same session, same expiry (lifetime runs from first sign-in)
+    expect(second.session_id).toBe(first.session_id);
     expect(second.expires_at).toBe(first.expires_at);
   });
 
-  it('replaces an EXPIRED tenant with a fresh one, purging the old data inline', async () => {
-    // #given — a tenant past its 24h lifetime
-    const purged: string[] = [];
+  it('replaces an expired session with fresh metadata', async () => {
+    // #given — a session past its 24h lifetime
     const db = demoDb(openSqlite());
-    const first = await findOrCreateDemoTenant(db, makeTenantOptions(purged));
+    const first = await findOrCreateDemoSession(db, makeSessionOptions());
 
     // #when — the same identity returns after expiry
-    const second = await findOrCreateDemoTenant(db, {
-      ...makeTenantOptions(purged),
+    const second = await findOrCreateDemoSession(db, {
+      ...makeSessionOptions(),
       now: () => T0 + 25 * HOUR,
     });
 
-    // #then — fresh sandbox; the old tenant's data was reaped BEFORE its row
-    // stopped referencing it (otherwise the purge cron could never find it)
-    expect(second.tenant_id).not.toBe(first.tenant_id);
-    expect(purged).toEqual([first.tenant_id]);
+    // #then — the old session row is replaced; shared run data is unrelated
+    expect(second.session_id).not.toBe(first.session_id);
+    const rows = await db.prepare('SELECT session_id FROM demo_sessions').all();
+    expect(rows.results).toEqual([{ session_id: second.session_id }]);
   });
 });
 
 describe('consumeRunBudget (atomic caps)', () => {
   async function seededDb(): Promise<{
     db: DemoDatabase;
-    tenantId: string;
+    sessionId: string;
   }> {
     const db = demoDb(openSqlite());
-    const tenant = await findOrCreateDemoTenant(db, makeTenantOptions());
-    return { db, tenantId: tenant.tenant_id };
+    const session = await findOrCreateDemoSession(db, makeSessionOptions());
+    return { db, sessionId: session.session_id };
   }
 
-  it('enforces the per-tenant cap as ONE conditional UPDATE (no TOCTOU window)', async () => {
+  it('enforces the per-session cap as one conditional UPDATE', async () => {
     // #given — cap 2
-    const { db, tenantId } = await seededDb();
+    const { db, sessionId } = await seededDb();
     const options = {
-      tenantId,
-      tenantRunCap: 2,
+      sessionId,
+      sessionRunCap: 2,
       dailyRunCap: 100,
       now: () => T0 + 1000,
     };
@@ -156,193 +152,151 @@ describe('consumeRunBudget (atomic caps)', () => {
     const refusal = consumeRunBudget(db, options);
     await expect(refusal).rejects.toBeInstanceOf(DemoRunLimitError);
     await expect(refusal).rejects.toMatchObject({
-      scope: 'tenant',
+      scope: 'session',
       reason: 'cap-reached',
     });
     const row = (await db
-      .prepare('SELECT run_count FROM demo_tenants WHERE tenant_id = ?')
-      .bind(tenantId)
+      .prepare('SELECT run_count FROM demo_sessions WHERE session_id = ?')
+      .bind(sessionId)
       .first()) as { run_count: number };
     expect(row.run_count).toBe(2);
   });
 
   it('cap 0 refuses the FIRST run — the incident freeze the worker passes via allowZero', async () => {
-    // #given — a live, provisioned tenant and DEMO_TENANT_RUN_CAP=0 (the
+    // #given — a live session and DEMO_SESSION_RUN_CAP=0 (the
     // operator's freeze; numberVar's allowZero keeps it from reverting to the
     // fallback). run_count < 0 is never satisfiable, so the very first
     // conditional UPDATE refuses.
-    const { db, tenantId } = await seededDb();
+    const { db, sessionId } = await seededDb();
 
     // #when / #then
     await expect(
       consumeRunBudget(db, {
-        tenantId,
-        tenantRunCap: 0,
+        sessionId,
+        sessionRunCap: 0,
         dailyRunCap: 100,
         now: () => T0 + 1000,
       }),
-    ).rejects.toMatchObject({ scope: 'tenant', reason: 'cap-reached' });
+    ).rejects.toMatchObject({ scope: 'session', reason: 'cap-reached' });
   });
 
-  it('daily cap 0 freezes the whole demo even when tenant budgets remain', async () => {
+  it('daily cap 0 freezes the whole demo even when session budgets remain', async () => {
     // #given
-    const { db, tenantId } = await seededDb();
+    const { db, sessionId } = await seededDb();
 
     // #when / #then
     await expect(
       consumeRunBudget(db, {
-        tenantId,
-        tenantRunCap: 10,
+        sessionId,
+        sessionRunCap: 10,
         dailyRunCap: 0,
         now: () => T0 + 1000,
       }),
     ).rejects.toMatchObject({ scope: 'global', reason: 'cap-reached' });
   });
 
-  it('refuses runs for an EXPIRED tenant even under its cap', async () => {
+  it('refuses runs for an expired session even under its cap', async () => {
     // #given
-    const { db, tenantId } = await seededDb();
+    const { db, sessionId } = await seededDb();
 
-    // #when / #then — 25h later the sandbox is dead
+    // #when / #then — 25h later the session is dead
     await expect(
       consumeRunBudget(db, {
-        tenantId,
-        tenantRunCap: 10,
+        sessionId,
+        sessionRunCap: 10,
         dailyRunCap: 100,
         now: () => T0 + 25 * HOUR,
       }),
-    ).rejects.toMatchObject({ scope: 'tenant', reason: 'expired' });
+    ).rejects.toMatchObject({ scope: 'session', reason: 'expired' });
   });
 
-  it('refuses runs for an unknown tenant (a dm-prefixed forgery)', async () => {
+  it('refuses runs for an unknown session', async () => {
     // #given
     const { db } = await seededDb();
 
     // #when / #then
     await expect(
       consumeRunBudget(db, {
-        tenantId: 'dm000000000000000000',
-        tenantRunCap: 10,
+        sessionId: '000000000000000000',
+        sessionRunCap: 10,
         dailyRunCap: 100,
         now: () => T0 + 1000,
       }),
-    ).rejects.toMatchObject({ scope: 'tenant', reason: 'not-provisioned' });
+    ).rejects.toMatchObject({ scope: 'session', reason: 'not-provisioned' });
   });
 
-  it('the GLOBAL daily ceiling stops runs across tenants — the spend backstop', async () => {
-    // #given — two tenants, daily cap 3
+  it('the global daily ceiling stops runs across sessions', async () => {
+    // #given — two sessions, daily cap 3
     const sqlite = openSqlite();
     const db = demoDb(sqlite);
-    const a = await findOrCreateDemoTenant(db, makeTenantOptions());
-    const b = await findOrCreateDemoTenant(db, {
-      ...makeTenantOptions(),
+    const a = await findOrCreateDemoSession(db, makeSessionOptions());
+    const b = await findOrCreateDemoSession(db, {
+      ...makeSessionOptions(),
       subject: 'github:5678',
     });
-    const budget = (tenantId: string) => ({
-      tenantId,
-      tenantRunCap: 100,
+    const budget = (sessionId: string) => ({
+      sessionId,
+      sessionRunCap: 100,
       dailyRunCap: 3,
       now: () => T0 + 1000,
     });
 
     // #when — three runs land (2 from A, 1 from B)
-    await consumeRunBudget(db, budget(a.tenant_id));
-    await consumeRunBudget(db, budget(a.tenant_id));
-    await consumeRunBudget(db, budget(b.tenant_id));
+    await consumeRunBudget(db, budget(a.session_id));
+    await consumeRunBudget(db, budget(a.session_id));
+    await consumeRunBudget(db, budget(b.session_id));
 
     // #then — the fourth refuses GLOBALLY, whoever asks
     await expect(
-      consumeRunBudget(db, budget(b.tenant_id)),
+      consumeRunBudget(db, budget(b.session_id)),
     ).rejects.toMatchObject({ scope: 'global', reason: 'cap-reached' });
 
     // ...and the ceiling resets on the next UTC day (T0 is 12:00Z, so +13h
-    // crosses midnight while the tenant is still live)
+    // crosses midnight while the session is still live)
     await consumeRunBudget(db, {
-      ...budget(a.tenant_id),
+      ...budget(a.session_id),
       now: () => T0 + 13 * HOUR,
     });
   });
 });
 
-describe('purgeExpiredDemoTenants', () => {
-  it('reaps at most `limit` expired tenants per call, oldest first; the table is the cursor', async () => {
-    // #given — three expired tenants, one live
+describe('deleteExpiredDemoSessions', () => {
+  it('deletes at most `limit` expired sessions per call, oldest first', async () => {
+    // #given — three expired sessions, one live
     const db = demoDb(openSqlite());
     const expired: string[] = [];
     for (const [index, subject] of ['s1', 's2', 's3'].entries()) {
-      const tenant = await findOrCreateDemoTenant(db, {
-        ...makeTenantOptions(),
+      const session = await findOrCreateDemoSession(db, {
+        ...makeSessionOptions(),
         subject,
         // Stagger expiries so "oldest first" is observable.
         now: () => T0 - (10 - index) * HOUR - 25 * HOUR,
       });
-      expired.push(tenant.tenant_id);
+      expired.push(session.session_id);
     }
-    const live = await findOrCreateDemoTenant(db, {
-      ...makeTenantOptions(),
+    const live = await findOrCreateDemoSession(db, {
+      ...makeSessionOptions(),
       subject: 'live',
     });
-    const purged: string[] = [];
-    const purgeTenantData = async (tenantId: string) => {
-      purged.push(tenantId);
-    };
-
     // #when — limit 2, then the next invocation
-    const first = await purgeExpiredDemoTenants(db, {
-      purgeTenantData,
+    const first = await deleteExpiredDemoSessions(db, {
       graceMs: 0,
       limit: 2,
       now: () => T0,
     });
-    const second = await purgeExpiredDemoTenants(db, {
-      purgeTenantData,
+    const second = await deleteExpiredDemoSessions(db, {
       graceMs: 0,
       limit: 2,
       now: () => T0,
     });
 
-    // #then — batches advance without a cursor row; the live tenant survives
+    // #then — batches advance without a cursor row; the live session survives
     expect(first).toEqual([expired[0], expired[1]]);
     expect(second).toEqual([expired[2]]);
-    expect(purged).toEqual(expired);
     const rows = (await db
-      .prepare('SELECT tenant_id FROM demo_tenants')
-      .all()) as { results: Array<{ tenant_id: string }> };
-    expect(rows.results).toEqual([{ tenant_id: live.tenant_id }]);
-  });
-
-  it("one tenant's failing purge does not head-of-line block the rest — its row survives as its own retry cursor", async () => {
-    // #given — three expired tenants; the OLDEST one's purge is wedged.
-    // Oldest-first ordering retries it first EVERY pass, so aborting on it
-    // would starve the other two (and every later expiry) forever.
-    const db = demoDb(openSqlite());
-    const expired: string[] = [];
-    for (const [index, subject] of ['s1', 's2', 's3'].entries()) {
-      const tenant = await findOrCreateDemoTenant(db, {
-        ...makeTenantOptions(),
-        subject,
-        now: () => T0 - (10 - index) * HOUR - 25 * HOUR,
-      });
-      expired.push(tenant.tenant_id);
-    }
-    const wedged = expired[0] ?? '';
-    const purgeTenantData = async (tenantId: string) => {
-      if (tenantId === wedged) throw new Error('snapshot store unavailable');
-    };
-
-    // #when / #then — the pass reaps the other two, then reports the
-    // failure (naming the tenant) so the cron's error surface still fires
-    await expect(
-      purgeExpiredDemoTenants(db, {
-        purgeTenantData,
-        graceMs: 0,
-        now: () => T0,
-      }),
-    ).rejects.toThrow(wedged);
-    const rows = (await db
-      .prepare('SELECT tenant_id FROM demo_tenants')
-      .all()) as { results: Array<{ tenant_id: string }> };
-    expect(rows.results).toEqual([{ tenant_id: wedged }]);
+      .prepare('SELECT session_id FROM demo_sessions')
+      .all()) as { results: Array<{ session_id: string }> };
+    expect(rows.results).toEqual([{ session_id: live.session_id }]);
   });
 });
 
@@ -367,12 +321,12 @@ describe('mintDemoTokenSet', () => {
   it('mints four verifiable tokens with DISTINCT actor ids (SoD must stay demonstrable)', async () => {
     // #given
     const db = demoDb(openSqlite());
-    const tenant = await findOrCreateDemoTenant(db, makeTenantOptions());
+    const session = await findOrCreateDemoSession(db, makeSessionOptions());
 
     // #when
     const set = await mintDemoTokenSet({
       secret: SECRET,
-      tenant,
+      session,
       ttlSeconds: 3600,
       now: () => T0,
     });
@@ -393,7 +347,6 @@ describe('mintDemoTokenSet', () => {
       expect(actor).toEqual({
         id: entry.id,
         role: entry.role,
-        tenantId: tenant.tenant_id,
       });
     }
   });
@@ -524,20 +477,16 @@ describe('createDemoAuthRouter (fake provider round-trip)', () => {
     } = {},
   ) {
     const db = demoDb(openSqlite());
-    const purged: string[] = [];
     const router = createDemoAuthRouter({
       db,
       provider: fakeProvider(undefined, options.providerName),
       secret: SECRET,
       jwtTtlSeconds: 3600,
-      tenantTtlMs: 24 * HOUR,
-      purgeTenantData: async (tenantId) => {
-        purged.push(tenantId);
-      },
+      sessionTtlMs: 24 * HOUR,
       disabled: options.disabled ?? false,
       now: options.now ?? (() => T0),
     });
-    return { router, db, purged };
+    return { router, db };
   }
 
   /** The nonce cookie the provider redirect set, as a Cookie header value. */
@@ -574,8 +523,8 @@ describe('createDemoAuthRouter (fake provider round-trip)', () => {
     const { router } = makeRouter();
     const tokenSet = await completeSignIn(router);
 
-    // #then — a full four-role set for a freshly-minted dm tenant
-    expect(tokenSet.tenantId).toMatch(/^dm/);
+    // #then — a full four-role set for a freshly minted session
+    expect(tokenSet.sessionId).toMatch(/^[0-9a-f]{18}$/);
     expect(tokenSet.tokens).toHaveLength(4);
   });
 
@@ -597,7 +546,7 @@ describe('createDemoAuthRouter (fake provider round-trip)', () => {
     // public /auth/github route, then walks a victim's browser through the
     // callback with the attacker's own code. Signature + expiry both pass;
     // only the browser binding stops the victim landing in the attacker's
-    // sandbox.
+    // session.
     const { router } = makeRouter();
     const attackerRedirect = await router(
       new Request('https://demo.test/auth/github'),
@@ -618,7 +567,7 @@ describe('createDemoAuthRouter (fake provider round-trip)', () => {
     const wrongCookie = await router(
       new Request(
         `https://demo.test/auth/github/callback?code=good-code&state=${encodeURIComponent(attackerState)}`,
-        { headers: { cookie: `${STATE_COOKIE}=dm000000000000000000` } },
+        { headers: { cookie: `${STATE_COOKIE}=000000000000000000` } },
       ),
     );
 
@@ -647,7 +596,7 @@ describe('createDemoAuthRouter (fake provider round-trip)', () => {
     expect(callback?.headers.get('set-cookie')).toContain('Max-Age=0');
   });
 
-  it('refreshes the token set while the tenant is live, 401s once it expired', async () => {
+  it('refreshes the token set while the session is live, then 401s', async () => {
     // #given — a signed-in visitor
     let nowMs = T0;
     const { router } = makeRouter({ now: () => nowMs });
@@ -664,12 +613,12 @@ describe('createDemoAuthRouter (fake provider round-trip)', () => {
       }),
     );
 
-    // #then — a fresh set for the SAME tenant
+    // #then — a fresh set for the same session
     expect(refreshed?.status).toBe(200);
     const refreshedSet = (await refreshed?.json()) as DemoTokenSet;
-    expect(refreshedSet.tenantId).toBe(tokenSet.tenantId);
+    expect(refreshedSet.sessionId).toBe(tokenSet.sessionId);
 
-    // #when — after the TENANT expired, refresh refuses (re-auth mints fresh)
+    // #when — after the session expired, refresh refuses
     nowMs = T0 + 25 * HOUR;
     const late = await router(
       new Request('https://demo.test/auth/refresh', {
@@ -679,6 +628,20 @@ describe('createDemoAuthRouter (fake provider round-trip)', () => {
       }),
     );
     expect(late?.status).toBe(401);
+  });
+
+  it('rejects an oversized refresh body before parsing it', async () => {
+    const { router } = makeRouter();
+    const response = await router(
+      new Request('https://demo.test/auth/refresh', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token: 'x'.repeat(20_000) }),
+      }),
+    );
+
+    expect(response?.status).toBe(413);
+    expect(await response?.json()).toEqual({ error: 'payload too large' });
   });
 
   it('the kill switch 503s every auth route and reports {enabled:false} on /auth/config', async () => {
@@ -741,15 +704,15 @@ describe('the kill switch in the AUTH middleware (worker.buildVerifier)', () => 
   it('an ALREADY-ISSUED demo JWT stops verifying when DEMO_DISABLED flips — issued tokens must not sail past the switch', async () => {
     // #given — a valid demo JWT and a static operator token
     const db = demoDb(openSqlite());
-    const tenant = await findOrCreateDemoTenant(db, makeTenantOptions());
+    const session = await findOrCreateDemoSession(db, makeSessionOptions());
     const set = await mintDemoTokenSet({
       secret: SECRET,
-      tenant,
+      session,
       ttlSeconds: 3600,
     });
     const demoJwt = set.tokens[0]?.token ?? '';
     const staticTokens = JSON.stringify({
-      'op-token': { id: 'op', role: 'operator', tenantId: 'opsteam' },
+      'op-token': { id: 'op', role: 'operator' },
     });
     const envBase = {
       DEMO_JWT_SECRET: SECRET,
@@ -764,9 +727,7 @@ describe('the kill switch in the AUTH middleware (worker.buildVerifier)', () => 
     } as never);
 
     // #then — the same JWT dies with the switch; operators keep working
-    expect(await open.verify(demoJwt)).toMatchObject({
-      tenantId: tenant.tenant_id,
-    });
+    expect(await open.verify(demoJwt)).toMatchObject({ role: 'admin' });
     expect(await killed.verify(demoJwt)).toBeUndefined();
     expect(await killed.verify('op-token')).toMatchObject({ id: 'op' });
   });
@@ -780,10 +741,10 @@ describe('the kill switch in the AUTH middleware (worker.buildVerifier)', () => 
   ])("DEMO_DISABLED='%s' also kills issued JWTs — the emergency switch parses fail-closed, never as a silent no-op", async (raw) => {
     // #given — a valid demo JWT
     const db = demoDb(openSqlite());
-    const tenant = await findOrCreateDemoTenant(db, makeTenantOptions());
+    const session = await findOrCreateDemoSession(db, makeSessionOptions());
     const set = await mintDemoTokenSet({
       secret: SECRET,
-      tenant,
+      session,
       ttlSeconds: 3600,
     });
     const demoJwt = set.tokens[0]?.token ?? '';
@@ -908,119 +869,54 @@ describe('provider selection (worker.selectOAuthProvider)', () => {
   });
 });
 
-describe('purge grace window (the purgeTenant safety precondition)', () => {
-  it('does NOT reap a tenant whose refreshed token can still be live', async () => {
-    // #given — a tenant that expired 10 minutes ago. A refresh at the last
-    // live instant mints a token good for another `jwtTtl` (refresh
-    // deliberately does not extend the sandbox), so purging now would delete
-    // suspended runs out from under a genuinely valid token — the exact race
-    // purgeTenant's "no live caller by construction" argument assumes away.
+describe('session cleanup grace window', () => {
+  it('retains metadata while a final refreshed token can still be live', async () => {
+    // #given — a session that expired 10 minutes ago. A refresh at the last
+    // live instant can leave a token valid for another jwtTtl.
     const db = demoDb(openSqlite());
-    await findOrCreateDemoTenant(db, {
-      ...makeTenantOptions(),
+    await findOrCreateDemoSession(db, {
+      ...makeSessionOptions(),
       now: () => T0 - 24 * HOUR - 10 * 60 * 1000,
     });
-    const purged: string[] = [];
-    const purgeTenantData = async (tenantId: string) => {
-      purged.push(tenantId);
-    };
     const jwtTtlMs = 3600 * 1000;
 
     // #when — the cron runs 10 min after expiry with a 1h grace
-    const early = await purgeExpiredDemoTenants(db, {
-      purgeTenantData,
+    const early = await deleteExpiredDemoSessions(db, {
       graceMs: jwtTtlMs,
       now: () => T0,
     });
 
     // #then — spared: a token minted at expires_at - ε is still valid
     expect(early).toEqual([]);
-    expect(purged).toEqual([]);
 
     // #when — an hour later every possible token has expired
-    const late = await purgeExpiredDemoTenants(db, {
-      purgeTenantData,
+    const late = await deleteExpiredDemoSessions(db, {
       graceMs: jwtTtlMs,
       now: () => T0 + jwtTtlMs,
     });
 
     // #then — now it reaps
     expect(late).toHaveLength(1);
-    expect(purged).toEqual(late);
   });
 });
 
-describe('isDemoTenant — the authoritative demo discriminator', () => {
-  it("reads tenants.kind, so a COMMERCIAL slug starting with 'dm' is not demo traffic", async () => {
-    // #given — the prefix heuristic this replaces would have charged 'dmart'
-    // against a demo_tenants row that does not exist -> 429 on every start
-    const db = demoDb(openSqlite());
-    const sandbox = await findOrCreateDemoTenant(db, makeTenantOptions());
-    await provisionTenant(db, { tenantId: 'dmart', kind: 'commercial' });
-
-    // #when / #then
-    expect(await isDemoTenant(db, sandbox.tenant_id)).toBe(true);
-    expect(await isDemoTenant(db, 'dmart')).toBe(false);
-    expect(sandbox.tenant_id.startsWith('dm')).toBe(true); // both look alike
-  });
-
-  it('treats an unprovisioned tenant (an operator from the static token map) as non-demo', async () => {
-    // #given — static-map identities are never provisioned
-    const db = demoDb(openSqlite());
-    await findOrCreateDemoTenant(db, makeTenantOptions());
-
-    // #when / #then
-    expect(await isDemoTenant(db, 'opsteam')).toBe(false);
-  });
-
-  it('reports non-demo when the registry table does not exist at all', async () => {
-    // #given — a host without the tenants registry (no demo configured)
-    const db = demoDb(openSqlite());
-
-    // #when / #then — never throws on the run-start hot path
-    expect(await isDemoTenant(db, 'anything')).toBe(false);
-  });
-
-  it('RETHROWS a transient read error rather than reporting non-demo (a blanket catch fails OPEN on the spend cap)', async () => {
-    // #given — the registry exists but the read fails transiently. Swallowing
-    // it would make a real demo tenant look commercial, skipping
-    // consumeRunBudget entirely and bypassing BOTH the per-tenant cap and the
-    // global daily ceiling.
-    const failing: DemoDatabase = {
-      prepare: () => ({
-        bind: () => failing.prepare(''),
-        run: async () => ({}),
-        first: async () => {
-          throw new Error('D1_ERROR: network');
-        },
-        all: async () => ({ results: [] }),
-      }),
-    };
-
-    // #when / #then — propagates: the run start fails closed
-    await expect(isDemoTenant(failing, 'dm00112233')).rejects.toThrow(
-      /D1_ERROR/,
-    );
-  });
-});
-
-describe('findOrCreateDemoTenant concurrency', () => {
-  it('two concurrent FIRST sign-ins for one identity resolve to ONE tenant, no 500', async () => {
+describe('findOrCreateDemoSession concurrency', () => {
+  it('two concurrent first sign-ins resolve to one session', async () => {
     // #given — the SELECT..INSERT is not transactional, so both callers take
     // the "absent" branch and race the UNIQUE(provider, subject) constraint
     const db = demoDb(openSqlite());
 
     // #when
     const [a, b] = await Promise.all([
-      findOrCreateDemoTenant(db, makeTenantOptions()),
-      findOrCreateDemoTenant(db, makeTenantOptions()),
+      findOrCreateDemoSession(db, makeSessionOptions()),
+      findOrCreateDemoSession(db, makeSessionOptions()),
     ]);
 
     // #then — the loser reads back the winner's row instead of throwing
-    expect(a.tenant_id).toBe(b.tenant_id);
+    expect(a.session_id).toBe(b.session_id);
     const rows = (await db
-      .prepare('SELECT tenant_id FROM demo_tenants')
-      .all()) as { results: Array<{ tenant_id: string }> };
+      .prepare('SELECT session_id FROM demo_sessions')
+      .all()) as { results: Array<{ session_id: string }> };
     expect(rows.results).toHaveLength(1);
   });
 });

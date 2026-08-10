@@ -30,19 +30,28 @@ import type {
   AnyWorkflow,
   WorkflowRunStatus,
   WorkflowState,
+  WorkflowStateField,
 } from '@mastra/core/workflows';
+import {
+  type ExecutionPrincipalKind,
+  isExecutionPrincipalId,
+  isExecutionPrincipalKind,
+} from '../approval-api/principal.js';
 
 import {
   BREAKWATER_ACTOR_KEY,
   BREAKWATER_CONNECTOR_EXECUTION_KEY,
-  BREAKWATER_CONNECTOR_GRANTS_KEY,
   BREAKWATER_ISOLATION_SCOPE_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
 } from './breakwater-keys.js';
+import {
+  isReservedExecutionContextKey,
+  RUN_PROVENANCE_CONTEXT_KEY,
+  stripReservedExecutionContext,
+} from './execution-context.js';
 import { mastraRegistryEntries } from './mastra-registry.js';
-import { PATH_SAFE_ID_PATTERN, tenantOfRunId } from './path-safe-id.js';
+import { isPathSafeId } from './path-safe-id.js';
 import type { HostPubSub } from './pubsub.js';
-import { InMemoryResumeLedger, type ResumeLedger } from './resume-ledger.js';
 
 export class UnknownWorkflowError extends Error {
   constructor(workflowId: string) {
@@ -111,6 +120,10 @@ function asClientError(error: unknown): InvalidRunRequestError | undefined {
 export interface RunSummary {
   runId: string;
   status: WorkflowRunStatus;
+  /** Durable execution provenance used by approval reconciliation. */
+  requestedBy?: string;
+  /** Principal kind paired with `requestedBy`; absent on legacy snapshots. */
+  requestedByKind?: ExecutionPrincipalKind;
   result?: unknown;
   error?: string;
   /** Suspended step paths, e.g. [['approval']]. Present when status is 'suspended'. */
@@ -149,6 +162,78 @@ export interface RunSummary {
   createdAt?: string;
   /** ISO 8601. Present on status() projections (read from the stored snapshot). */
   updatedAt?: string;
+}
+
+const RUN_STATE_FIELDS: WorkflowStateField[] = [
+  'result',
+  'error',
+  'steps',
+  'suspendedPaths',
+  'requestContext',
+];
+
+interface RunProvenance {
+  version: 1;
+  /** Absent on unattributed runs; may be unpaired only on legacy snapshots. */
+  requestedBy?: string;
+  /** Absent on unattributed runs and snapshots written before principal kinds. */
+  requestedByKind?: ExecutionPrincipalKind;
+  /** Token of the start that created the run; stable across resume legs. */
+  startToken: string;
+  /** Token of the current execution leg. */
+  attemptToken: string;
+  resumeCounts: Array<[string, number]>;
+}
+
+function runProvenance(
+  state: Pick<WorkflowState, 'requestContext'>,
+): RunProvenance | undefined {
+  const value = state.requestContext?.[RUN_PROVENANCE_CONTEXT_KEY];
+  if (value === undefined) return undefined;
+  if (value === null || typeof value !== 'object') {
+    throw new Error('stored run provenance is malformed');
+  }
+  const candidate = value as Partial<RunProvenance>;
+  if (
+    candidate.version !== 1 ||
+    (candidate.requestedBy !== undefined &&
+      !isExecutionPrincipalId(candidate.requestedBy)) ||
+    (candidate.requestedByKind !== undefined &&
+      !isExecutionPrincipalKind(candidate.requestedByKind)) ||
+    (candidate.requestedBy === undefined &&
+      candidate.requestedByKind !== undefined) ||
+    !isPathSafeId(candidate.attemptToken) ||
+    (candidate.startToken !== undefined &&
+      !isPathSafeId(candidate.startToken)) ||
+    !Array.isArray(candidate.resumeCounts)
+  ) {
+    throw new Error('stored run provenance is malformed');
+  }
+  const counts: Array<[string, number]> = [];
+  for (const entry of candidate.resumeCounts) {
+    if (
+      !Array.isArray(entry) ||
+      entry.length !== 2 ||
+      typeof entry[0] !== 'string' ||
+      !Number.isSafeInteger(entry[1]) ||
+      entry[1] < 1
+    ) {
+      throw new Error('stored run provenance is malformed');
+    }
+    counts.push([entry[0], entry[1]]);
+  }
+  return {
+    version: 1,
+    ...(candidate.requestedBy === undefined
+      ? {}
+      : { requestedBy: candidate.requestedBy }),
+    ...(candidate.requestedByKind === undefined
+      ? {}
+      : { requestedByKind: candidate.requestedByKind }),
+    attemptToken: candidate.attemptToken,
+    startToken: candidate.startToken ?? candidate.attemptToken,
+    resumeCounts: counts,
+  };
 }
 
 // Structural view of core's WorkflowResult union — only the fields the
@@ -259,18 +344,23 @@ function summarize(
   runId: string,
   result: CoreRunResult,
   counts?: ReadonlyMap<string, number>,
+  requestedBy?: string,
+  requestedByKind?: ExecutionPrincipalKind,
 ): RunSummary {
+  let summary: RunSummary;
   switch (result.status) {
     case 'success':
-      return { runId, status: result.status, result: result.result };
+      summary = { runId, status: result.status, result: result.result };
+      break;
     case 'failed':
-      return {
+      summary = {
         runId,
         status: result.status,
         error: errorText(result.error),
       };
+      break;
     case 'suspended': {
-      const summary: RunSummary = {
+      summary = {
         runId,
         status: result.status,
         suspended: result.suspended,
@@ -285,16 +375,26 @@ function summarize(
         resumedAtOf(result.steps, key),
       );
       if (resumedAt !== undefined) summary.resumedAt = resumedAt;
-      // resumeCount is runtime-owned (the ledger), NOT read from the snapshot.
+      // resumeCount is runtime-owned snapshot provenance, not core step state.
       const resumeCount = byStep(suspendedKeys, (key) => counts?.get(key));
       if (resumeCount !== undefined) summary.resumeCount = resumeCount;
-      return summary;
+      break;
     }
     case 'tripwire':
-      return { runId, status: result.status, error: result.tripwire.reason };
+      summary = {
+        runId,
+        status: result.status,
+        error: result.tripwire.reason,
+      };
+      break;
     default:
-      return { runId, status: result.status };
+      summary = { runId, status: result.status };
   }
+  if (requestedBy !== undefined) summary.requestedBy = requestedBy;
+  if (requestedByKind !== undefined) {
+    summary.requestedByKind = requestedByKind;
+  }
+  return summary;
 }
 
 // Storage may hand timestamps back as Date or as a serialized string
@@ -343,7 +443,7 @@ function suspendedAtOf(
  * Epoch-ms resume time of the step's latest attempt, if recorded. Feeds the
  * INFORMATIONAL RunSummary.resumedAt only — Mastra stamps it solely on a
  * payload-bearing resume, so it is unreliable as a first-vs-re-suspension
- * signal. The grant binding uses `resumeCount` (the runtime ledger) instead.
+ * signal. The grant binding uses snapshot provenance `resumeCount` instead.
  */
 function resumedAtOf(
   steps: WorkflowState['steps'] | undefined,
@@ -361,7 +461,7 @@ function resumedAtOf(
  * object literal a step named '__proto__' would route into the
  * Object.prototype setter and silently vanish (or, for an object-valued
  * payload, rewire the accumulator's prototype) — the same hazard
- * resume-ledger.ts stores [stepKey, count] pairs to avoid.
+ * snapshot provenance stores [stepKey, count] pairs to avoid.
  */
 function byStep<T>(
   suspendedKeys: readonly string[],
@@ -392,6 +492,8 @@ function summarizeState(
   runId: string,
   state: WorkflowState,
   counts?: ReadonlyMap<string, number>,
+  requestedBy?: string,
+  requestedByKind?: ExecutionPrincipalKind,
 ): RunSummary {
   const summary: RunSummary = {
     runId,
@@ -399,6 +501,10 @@ function summarizeState(
     createdAt: toIso(state.createdAt),
     updatedAt: toIso(state.updatedAt),
   };
+  if (requestedBy !== undefined) summary.requestedBy = requestedBy;
+  if (requestedByKind !== undefined) {
+    summary.requestedByKind = requestedByKind;
+  }
   if (state.status === 'success') {
     summary.result = state.result;
   } else if (state.status === 'failed' && state.error) {
@@ -464,7 +570,7 @@ export type RunLeg =
  * flowsafe approval store), never from client input, model output, or tool
  * results.
  *
- * Merge semantics (pinned by test against core 1.49.0): the context provided
+ * Merge semantics are pinned by tests against the installed Mastra core: the context provided
  * at resume merges OVER the run's persisted context — provided keys win,
  * persisted start-time keys survive. Omitting a key therefore does not
  * revoke it; a provider that scopes a capability per leg must return the key
@@ -490,8 +596,9 @@ const TRUSTED_IDENTITY_CONTEXT_KEYS = new Set([
 function orderedRequestContext(
   runtimeContext: Record<string, unknown>,
   provided: Record<string, unknown> | undefined,
+  scheduled: Record<string, unknown> | undefined,
 ): RequestContext {
-  const stored: Array<[string, unknown]> = [];
+  const application: Array<[string, unknown]> = [];
   const capabilities: Array<[string, unknown]> = [];
   const identity: Array<[string, unknown]> = [];
   for (const entry of Object.entries(provided ?? {})) {
@@ -500,24 +607,22 @@ function orderedRequestContext(
       key === BREAKWATER_WORKFLOW_SCOPE_KEY ||
       key === BREAKWATER_ISOLATION_SCOPE_KEY ||
       key === BREAKWATER_CONNECTOR_EXECUTION_KEY ||
+      key === RUN_PROVENANCE_CONTEXT_KEY ||
       key === 'runId'
     ) {
       continue;
     }
     if (TRUSTED_IDENTITY_CONTEXT_KEYS.has(key)) {
       identity.push(entry);
-    } else if (
-      key === BREAKWATER_CONNECTOR_GRANTS_KEY ||
-      key.startsWith('breakwater.') ||
-      key === 'mastra:goal'
-    ) {
+    } else if (isReservedExecutionContextKey(key)) {
       capabilities.push(entry);
     } else {
-      stored.push(entry);
+      application.push(entry);
     }
   }
   return new RequestContext([
-    ...stored,
+    ...Object.entries(stripReservedExecutionContext(scheduled)),
+    ...application,
     ...Object.entries(runtimeContext),
     ...capabilities,
     ...identity,
@@ -530,15 +635,8 @@ export interface RunnerRuntimeOptions {
   /** Consulted on every start/resume — see RequestContextProvider. */
   requestContextForRun?: RequestContextProvider;
   /**
-   * Per-run resume ledger backing RunSummary.resumeCount / RunLeg.resumeCount.
-   * Default: in-memory. The DO shell adopts a ctx.storage-backed ledger via
-   * adoptDefaultResumeLedger() so the ordinal survives eviction — an explicit
-   * ledger here wins over that adoption.
-   */
-  resumeLedger?: ResumeLedger;
-  /**
    * The host Durable Object's single pubsub identity from do-runner/pubsub.ts, threaded
-   * here by init() alongside storage and the ledger so a host that configures it
+   * here by init() alongside storage so a host that configures it
    * reaches the runtime with no host change: every DO subclass already returns
    * init()'s runtime from build(), and nothing else in the isolate can hand this
    * object a pubsub.
@@ -553,24 +651,51 @@ export interface RunnerRuntimeOptions {
   pubsub?: HostPubSub;
 }
 
-export interface StartRunOptions {
+/** @inline */
+type OptionalRunRequester =
+  | {
+      /** Trusted requester id persisted with the authoritative run snapshot. */
+      requestedBy: string;
+      /** Trusted requester kind persisted alongside `requestedBy`. */
+      requestedByKind: ExecutionPrincipalKind;
+    }
+  | {
+      requestedBy?: never;
+      requestedByKind?: never;
+    };
+
+export type StartRunOptions = {
   /**
-   * Required: the runtime never generates a runId. Multi-tenant
-   * hosts mint `${tenantId}_${uuid}` server-side (createRunRouter) so the
-   * runId carries its tenant everywhere it becomes a key (D1 snapshot row,
-   * DO name, R2 segment, grant-list predicate). A generation fallback here
-   * would let any caller that forgets to mint create a bare, tenant-less
-   * run — unreachable by tenant purge and un-ownable by every actor.
+   * Required: the runtime never generates a runId. Hosts mint it server-side
+   * (createRunRouter) so a client can never choose the identity a run is
+   * keyed by everywhere it lands (D1 snapshot row, DO name, R2 segment,
+   * grant-list predicate). A generation fallback here would let any caller
+   * that forgets to mint create a run under an id the host never issued.
    */
   runId: string;
   inputData?: unknown;
-}
+  /** Initial workflow state from an infrastructure-verified schedule target. */
+  initialState?: unknown;
+  /**
+   * Non-reserved application context from an infrastructure-verified schedule
+   * target. Runtime-owned keys are stripped again before execution.
+   */
+  storedRequestContext?: Record<string, unknown>;
+  /** Host recovery token persisted with the first executed snapshot. */
+  attemptToken?: string;
+} & OptionalRunRequester;
 
-export interface ResumeRunOptions {
+export type ResumeRunOptions = {
   /** Suspended step id (or nested path). Optional when only one step is suspended. */
   step?: string | string[];
   resumeData?: unknown;
-}
+  /**
+   * Host preparation that must consume the exact trusted context this resume
+   * will execute with. Runs once, inside the per-run lock, before createRun.
+   * @internal
+   */
+  prepareExecution?: (requestContext: RequestContext) => Promise<void>;
+} & OptionalRunRequester;
 
 export class RunnerRuntime {
   readonly #storage: MastraCompositeStore;
@@ -579,25 +704,6 @@ export class RunnerRuntime {
   readonly #agents = new Map<string, ErasedRuntimeAgent>();
   readonly #workflows = new Map<string, AnyWorkflow>();
   readonly #runLocks = new Map<string, Promise<unknown>>();
-  // Per-run resume ledger: #runKey(workflowId, runId) -> (stepKey -> times that
-  // step has been resumed). Keyed by the run's FULL identity, never runId alone
-  // (see #runKey): a shared caller runId under two workflows are distinct runs.
-  // The runtime increments it on every resume (regardless of
-  // payload) and projects it as RunSummary.resumeCount / RunLeg.resumeCount —
-  // the collision-free grant-binding tie-breaker that Mastra's
-  // payload-conditional resumedAt cannot provide.
-  //
-  // Durability: a lost ledger is fail-closed for grants (leg.resumeCount
-  // undefined vs an approval's captured ordinal -> mismatch -> deny, see
-  // grants.ts) — never a leak, but an AVAILABILITY bug: the approved action
-  // silently no-ops. DO eviction (~70-140s idle), hibernation, and code
-  // deploys all wipe in-memory state while ctx.storage survives, so the DO
-  // shell adopts a DurableStorageResumeLedger (durable-object.ts); the
-  // in-memory default covers node tests and non-DO hosts. Entries are
-  // deleted on terminal status below; a resumed-then-abandoned suspended run
-  // keeps one small entry until the run is purged.
-  #resumeLedger: ResumeLedger;
-  readonly #resumeLedgerExplicit: boolean;
   // The host DO's pubsub identity (RunnerRuntimeOptions.pubsub), threaded into
   // both createRun sites below (CI-M-002-002) so a configured host publishes and
   // replays on ONE shared feed. Undefined ⇒ core defaults a fresh emitter per
@@ -609,8 +715,6 @@ export class RunnerRuntime {
     this.#storage = options.storage;
     this.#logger = options.logger ?? false;
     this.#requestContextForRun = options.requestContextForRun;
-    this.#resumeLedgerExplicit = options.resumeLedger !== undefined;
-    this.#resumeLedger = options.resumeLedger ?? new InMemoryResumeLedger();
     this.#pubsub = options.pubsub;
   }
 
@@ -622,24 +726,6 @@ export class RunnerRuntime {
    */
   get pubsub(): HostPubSub | undefined {
     return this.#pubsub;
-  }
-
-  /**
-   * Host-shell seam: replace the DEFAULT in-memory ledger with a durable one.
-   * The DO shell calls this with a ctx.storage-backed ledger right after
-   * build(), so every DO host gets eviction-proof ordinals without threading
-   * a parameter (a forgettable thread is how the durability guarantee rots).
-   * A ledger explicitly injected via options wins; adoption is rejected once
-   * runs may have consulted the ledger.
-   */
-  adoptDefaultResumeLedger(ledger: ResumeLedger): void {
-    if (this.#mastra) {
-      throw new Error(
-        'RunnerRuntime: adopt the resume ledger before the first run — ordinals already read from the default ledger would be lost',
-      );
-    }
-    if (this.#resumeLedgerExplicit) return;
-    this.#resumeLedger = ledger;
   }
 
   /**
@@ -669,7 +755,7 @@ export class RunnerRuntime {
         'RunnerRuntime: register all workflows before the first run — the Mastra instance is frozen once runs start',
       );
     }
-    if (!PATH_SAFE_ID_PATTERN.test(workflow.id)) {
+    if (!isPathSafeId(workflow.id)) {
       throw new Error(
         `RunnerRuntime: workflow id '${workflow.id}' must be URL-path-safe (letters, digits, '.', '_', '~', '-'; 1-200 chars) — it feeds the DO name join and the /runs/:workflowId/:runId path`,
       );
@@ -699,15 +785,38 @@ export class RunnerRuntime {
     // mint a run keyed by the number 123, unreachable by the string "123" the
     // URL path later carries. There is NO generation fallback (INV-1): a
     // missing/null runId is a client error, not a request for one.
-    if (
-      typeof options.runId !== 'string' ||
-      !PATH_SAFE_ID_PATTERN.test(options.runId)
-    ) {
+    if (!isPathSafeId(options.runId)) {
       throw new InvalidRunRequestError(
         "runId is required and must be URL-path-safe (letters, digits, '.', '_', '~', '-'; 1–200 chars)",
       );
     }
     const runId = options.runId;
+    if (
+      options.requestedBy !== undefined &&
+      !isExecutionPrincipalId(options.requestedBy)
+    ) {
+      throw new InvalidRunRequestError('requestedBy is malformed');
+    }
+    if (
+      options.requestedByKind !== undefined &&
+      !isExecutionPrincipalKind(options.requestedByKind)
+    ) {
+      throw new InvalidRunRequestError('requestedByKind is malformed');
+    }
+    if (
+      (options.requestedBy === undefined) !==
+      (options.requestedByKind === undefined)
+    ) {
+      throw new InvalidRunRequestError(
+        'requestedBy and requestedByKind must be provided together',
+      );
+    }
+    if (
+      options.attemptToken !== undefined &&
+      !isPathSafeId(options.attemptToken)
+    ) {
+      throw new InvalidRunRequestError('attemptToken is malformed');
+    }
     return this.#withRunLock(workflowId, runId, async () => {
       // Supplied ids can collide with an existing run; starting it
       // again would re-execute already-executed steps.
@@ -719,9 +828,26 @@ export class RunnerRuntime {
       // initial snapshot, so a provider failure after it would strand a
       // pending-but-never-started run (a supplied runId would then be locked
       // out by RunAlreadyExistsError on retry). Failing here leaves no state.
-      const requestContext = await this.#requestContextFor(workflowId, runId, {
-        kind: 'start',
-      });
+      const startAttemptToken = options.attemptToken ?? crypto.randomUUID();
+      const provenance: RunProvenance = {
+        version: 1,
+        ...(options.requestedBy === undefined
+          ? {}
+          : {
+              requestedBy: options.requestedBy,
+              requestedByKind: options.requestedByKind,
+            }),
+        startToken: startAttemptToken,
+        attemptToken: startAttemptToken,
+        resumeCounts: [],
+      };
+      const requestContext = await this.#requestContextFor(
+        workflowId,
+        runId,
+        { kind: 'start' },
+        provenance,
+        options.storedRequestContext,
+      );
       // Thread the host DO's pubsub identity into the run (CI-M-002-002). Core
       // accepts `createRun({ runId, pubsub })` at every one of its OWN call
       // sites (agent/durable index.js:5224/5541) and stamps it straight onto
@@ -736,13 +862,41 @@ export class RunnerRuntime {
       try {
         result = await run.start({
           inputData: options.inputData,
+          initialState: options.initialState,
           requestContext,
         });
       } catch (error) {
+        const recovered = await this.#summaryForAttempt(
+          workflow,
+          runId,
+          provenance.attemptToken,
+        );
+        if (recovered) return recovered;
         throw asClientError(error) ?? error;
       }
-      await this.#reconcileTerminalState(workflowId, run.runId, result);
-      return summarize(run.runId, result);
+      try {
+        await this.#reconcileTerminalState(
+          workflowId,
+          run.runId,
+          result,
+          requestContext,
+        );
+      } catch (error) {
+        const recovered = await this.#summaryForAttempt(
+          workflow,
+          runId,
+          provenance.attemptToken,
+        );
+        if (recovered) return recovered;
+        throw error;
+      }
+      return summarize(
+        run.runId,
+        result,
+        undefined,
+        provenance.requestedBy,
+        provenance.requestedByKind,
+      );
     });
   }
 
@@ -758,8 +912,7 @@ export class RunnerRuntime {
   ): Promise<RunSummary> {
     const workflow = this.#getWorkflow(workflowId);
     return this.#withRunLock(workflowId, runId, async () => {
-      const runKey = this.#runKey(workflowId, runId);
-      const state = await workflow.getWorkflowRunById(runId);
+      const state = await this.#workflowState(workflow, runId);
       if (!state) throw new UnknownRunError(workflowId, runId);
       if (state.status !== 'suspended') {
         throw new RunNotSuspendedError(workflowId, runId, state.status);
@@ -767,13 +920,23 @@ export class RunnerRuntime {
       // Provider before createRun for symmetry with start(): a resume-time
       // createRun only reattaches (no snapshot write), but failing before it
       // still does the least work and keeps the ordering invariant uniform.
-      const { stepKey, priorCounts, requestContext } =
+      const { nextCounts, provenance, requestContext } =
         await this.#trustedResumePreparation(
           workflowId,
           runId,
           state,
           options.step,
+          options.requestedBy,
+          options.requestedByKind,
         );
+      if (options.prepareExecution) {
+        const preparationValues = structuredClone(
+          Object.fromEntries(requestContext.entries()),
+        );
+        await options.prepareExecution(
+          new RequestContext(Object.entries(preparationValues)),
+        );
+      }
       // Same host pubsub identity as start() (CI-M-002-002) — see the note
       // there; undefined stays byte-identical to `createRun({ runId })`.
       const run = await workflow.createRun({ runId, pubsub: this.#pubsub });
@@ -785,28 +948,40 @@ export class RunnerRuntime {
           requestContext,
         });
       } catch (error) {
-        // The run stayed suspended (resume threw) — do NOT increment; the
-        // prior count must persist for a later retry of this same suspension.
+        const recovered = await this.#summaryForAttempt(
+          workflow,
+          runId,
+          provenance.attemptToken,
+        );
+        if (recovered) return recovered;
+        // No authoritative snapshot carries this attempt token: the run stayed
+        // on its prior suspension, so neither requester nor ordinal advances.
         throw asClientError(error) ?? error;
       }
-      // Record THIS resume AFTER the leg fingerprint read above and BEFORE
-      // summarize: a re-suspension produced by this resume must capture the
-      // incremented ordinal so its approval binds to the new suspension.
-      // priorCounts rides along so a durable ledger need not re-read what the
-      // per-run FIFO lock guarantees unchanged since the read above.
-      let counts = priorCounts;
-      if (stepKey !== undefined) {
-        counts = await this.#resumeLedger.increment(
-          runKey,
-          stepKey,
-          priorCounts ?? new Map(),
+      // A re-suspension produced by this resume carries the incremented ordinal
+      // in the same authoritative snapshot as the new workflow state.
+      const summary = summarize(
+        run.runId,
+        result,
+        nextCounts,
+        provenance.requestedBy,
+        provenance.requestedByKind,
+      );
+      try {
+        await this.#reconcileTerminalState(
+          workflowId,
+          run.runId,
+          result,
+          requestContext,
         );
-      }
-      const summary = summarize(run.runId, result, counts);
-      await this.#reconcileTerminalState(workflowId, run.runId, result);
-      // Terminal run: drop the ledger (no further suspension can occur).
-      if (summary.status !== 'suspended') {
-        await this.#resumeLedger.delete(runKey);
+      } catch (error) {
+        const recovered = await this.#summaryForAttempt(
+          workflow,
+          runId,
+          provenance.attemptToken,
+        );
+        if (recovered) return recovered;
+        throw error;
       }
       return summary;
     });
@@ -814,45 +989,57 @@ export class RunnerRuntime {
 
   async status(workflowId: string, runId: string): Promise<RunSummary | null> {
     const workflow = this.#getWorkflow(workflowId);
-    const state = await workflow.getWorkflowRunById(runId);
+    const state = await this.#workflowState(workflow, runId);
     if (!state) return null;
-    // Ledger read only for SUSPENDED runs — the one branch that projects
-    // resumeCount (defense in depth: a bridge that ever mints off status()
-    // must not see a stale/absent ordinal). Every other status would discard
-    // the result, and under the DO shell each read is a billed
-    // ctx.storage.get the SPA's polling would pay on every terminal run.
-    const counts =
-      state.status === 'suspended'
-        ? await this.#resumeLedger.counts(this.#runKey(workflowId, runId))
-        : undefined;
-    return summarizeState(runId, state, counts);
+    const provenance = runProvenance(state);
+    // Snapshot provenance projects requester and resume ordinal alongside the
+    // authoritative workflow state, including after isolate eviction.
+    const counts = provenance ? new Map(provenance.resumeCounts) : undefined;
+    return summarizeState(
+      runId,
+      state,
+      counts,
+      provenance?.requestedBy,
+      provenance?.requestedByKind,
+    );
   }
 
   /**
-   * Derive the exact trusted context the next resume leg will receive without
-   * advancing the run. Durable-agent hosts use it while rehydrating the
-   * in-process registry, then call resume(); resume independently re-derives
-   * the same suspension fingerprint before execution.
+   * Reconcile an interrupted start against the token stored in the
+   * authoritative workflow snapshot. Mastra's `createRun()` first persists a
+   * tokenless pending shell; if no executed snapshot replaced it, the shell is
+   * abandoned and must not become a successful FlowSafe run.
    */
-  async trustedRequestContextForResume(
+  async recoverStartAttempt(
     workflowId: string,
     runId: string,
-    options: Pick<ResumeRunOptions, 'step'> = {},
-  ): Promise<RequestContext> {
-    const workflow = this.#getWorkflow(workflowId);
-    const state = await workflow.getWorkflowRunById(runId);
-    if (!state) throw new UnknownRunError(workflowId, runId);
-    if (state.status !== 'suspended') {
-      throw new RunNotSuspendedError(workflowId, runId, state.status);
+    attemptToken: string,
+  ): Promise<RunSummary | null> {
+    if (!isPathSafeId(attemptToken)) {
+      throw new InvalidRunRequestError('attemptToken is malformed');
     }
-    return (
-      await this.#trustedResumePreparation(
-        workflowId,
-        runId,
-        state,
-        options.step,
-      )
-    ).requestContext;
+    const workflow = this.#getWorkflow(workflowId);
+    return this.#withRunLock(workflowId, runId, async () => {
+      const state = await this.#workflowState(workflow, runId);
+      if (!state) return null;
+      const provenance = runProvenance(state);
+      if (provenance?.startToken === attemptToken) {
+        return summarizeState(
+          runId,
+          state,
+          new Map(provenance.resumeCounts),
+          provenance.requestedBy,
+          provenance.requestedByKind,
+        );
+      }
+      if (state.status === 'pending' && provenance === undefined) {
+        await workflow.deleteWorkflowRunById(runId);
+        return null;
+      }
+      throw new Error(
+        `run '${runId}' snapshot belongs to another start attempt`,
+      );
+    });
   }
 
   // A provider crash propagates (fail loud): silently starting the leg with
@@ -869,48 +1056,35 @@ export class RunnerRuntime {
     workflowId: string,
     runId: string,
     leg: RunLeg,
+    provenance?: RunProvenance,
+    storedRequestContext?: Record<string, unknown>,
   ): Promise<RequestContext> {
     const base: Record<string, unknown> = {
       [BREAKWATER_WORKFLOW_SCOPE_KEY]: workflowId,
       runId,
     };
-    // Tenant-salted runs (INV-1: `${tenantId}_${uuid}`) also mint the OPAQUE
-    // isolation scope, segmenting breakwater's connector idempotency and
-    // rate-limit keys per tenant. Server-authoritative like the workflow
-    // scope above — the runId was minted from the AUTHENTICATED tenant, so
-    // its prefix is trustworthy here.
-    //
-    // Structural, not flagged: a runId shaped `<inv3-slug>_<rest>` mints a
-    // scope. For this repo's hosts that is exactly the tenant (they all mint
-    // via TenantContext.newRunId). CONSTRAINT for standalone OSS consumers
-    // minting their own runIds: the scope segments breakwater's CROSS-RUN
-    // idempotency and rate-limit keys, so one logical account must keep ONE
-    // stable pre-`_` prefix (or avoid `_`-prefixed runIds entirely) — ids
-    // like `daily_<uuid>` vs `weekly_<uuid>` would split that account's key
-    // namespace per prefix, and a cross-run business key ("invoice-2026-07")
-    // would fire once per prefix instead of once. Never a cross-tenant leak
-    // (splitting only narrows sharing), but a real duplication hazard.
-    // Non-matching runIds mint nothing: the single-tenant keys stay
-    // byte-identical, and deployments that must never run scope-less enforce
-    // that with breakwater's tenantIsolation evaluator (which binds dry-run
-    // too, unlike the idempotency path).
-    const tenantId = tenantOfRunId(runId);
-    if (tenantId !== undefined) {
-      base[BREAKWATER_ISOLATION_SCOPE_KEY] = tenantId;
+    if (provenance !== undefined) {
+      base[RUN_PROVENANCE_CONTEXT_KEY] = provenance;
     }
+    // No isolation scope is minted here: a deployment serves exactly one
+    // organization, so breakwater's connector idempotency and rate-limit keys
+    // are deployment-wide by construction. Budget partitioning within a
+    // deployment stays available
+    // through breakwater's crossWorkflowIsolation, which reads the workflow
+    // scope minted above. The isolation-scope context key remains RESERVED —
+    // orderedRequestContext drops it from provider values — so a provider can
+    // never mint a scope that desyncs from the execution identity below.
     if (leg.kind === 'start') {
       base[BREAKWATER_CONNECTOR_EXECUTION_KEY] = {
         kind: 'start',
         workflowId,
         runId,
-        ...(tenantId === undefined ? {} : { isolationScope: tenantId }),
       };
     } else if (leg.step !== undefined && leg.suspendedAt !== undefined) {
       base[BREAKWATER_CONNECTOR_EXECUTION_KEY] = {
         kind: 'resume',
         workflowId,
         runId,
-        ...(tenantId === undefined ? {} : { isolationScope: tenantId }),
         suspension: {
           stepPath: [...leg.step],
           suspendedAt: leg.suspendedAt,
@@ -925,7 +1099,7 @@ export class RunnerRuntime {
     const values = this.#requestContextForRun
       ? await this.#requestContextForRun(workflowId, runId, leg)
       : undefined;
-    return orderedRequestContext(base, values);
+    return orderedRequestContext(base, values, storedRequestContext);
   }
 
   async #trustedResumePreparation(
@@ -933,34 +1107,113 @@ export class RunnerRuntime {
     runId: string,
     state: WorkflowState,
     selectedStep: string | string[] | undefined,
+    requestedBy?: string,
+    requestedByKind?: ExecutionPrincipalKind,
   ): Promise<{
-    stepKey: string | undefined;
-    priorCounts: ReadonlyMap<string, number> | undefined;
+    nextCounts: ReadonlyMap<string, number>;
+    provenance: RunProvenance;
     requestContext: RequestContext;
   }> {
+    if (requestedBy !== undefined && !isExecutionPrincipalId(requestedBy)) {
+      throw new InvalidRunRequestError('requestedBy is malformed');
+    }
+    if (
+      requestedByKind !== undefined &&
+      !isExecutionPrincipalKind(requestedByKind)
+    ) {
+      throw new InvalidRunRequestError('requestedByKind is malformed');
+    }
+    if ((requestedBy === undefined) !== (requestedByKind === undefined)) {
+      throw new InvalidRunRequestError(
+        'requestedBy and requestedByKind must be provided together',
+      );
+    }
     const step = resolveResumeStep(selectedStep, state);
     const stepKey = step?.join('.');
     // resumeCount is read BEFORE this resume increments it: it is the count
     // of prior resumes = the ordinal of the CURRENT suspension being resumed
     // (undefined for a first suspension), which the minting approval captured.
-    const priorCounts = await this.#resumeLedger.counts(
-      this.#runKey(workflowId, runId),
+    const storedProvenance = runProvenance(state);
+    if (
+      requestedBy === undefined &&
+      storedProvenance?.requestedBy !== undefined &&
+      storedProvenance.requestedByKind === undefined
+    ) {
+      throw new InvalidRunRequestError(
+        'legacy requestedBy provenance requires an explicit requestedBy and requestedByKind to resume',
+      );
+    }
+    const requester = requestedBy ?? storedProvenance?.requestedBy;
+    const requesterKind =
+      requestedBy === undefined
+        ? storedProvenance?.requestedByKind
+        : requestedByKind;
+    const priorCounts = new Map(storedProvenance?.resumeCounts ?? []);
+    const nextCounts = new Map(priorCounts);
+    if (stepKey !== undefined) {
+      nextCounts.set(stepKey, (nextCounts.get(stepKey) ?? 0) + 1);
+    }
+    const provenance: RunProvenance = {
+      version: 1,
+      ...(requester === undefined
+        ? {}
+        : { requestedBy: requester, requestedByKind: requesterKind }),
+      startToken: storedProvenance?.startToken ?? crypto.randomUUID(),
+      attemptToken: crypto.randomUUID(),
+      resumeCounts: [...nextCounts],
+    };
+    const requestContext = await this.#requestContextFor(
+      workflowId,
+      runId,
+      {
+        kind: 'resume',
+        step,
+        suspendedAt:
+          stepKey !== undefined
+            ? suspendedAtOf(state.steps, stepKey)
+            : undefined,
+        resumeCount:
+          stepKey !== undefined ? priorCounts?.get(stepKey) : undefined,
+      },
+      provenance,
     );
-    const requestContext = await this.#requestContextFor(workflowId, runId, {
-      kind: 'resume',
-      step,
-      suspendedAt:
-        stepKey !== undefined ? suspendedAtOf(state.steps, stepKey) : undefined,
-      resumeCount:
-        stepKey !== undefined ? priorCounts?.get(stepKey) : undefined,
-    });
-    return { stepKey, priorCounts, requestContext };
+    return {
+      nextCounts,
+      provenance,
+      requestContext,
+    };
+  }
+
+  #workflowState(
+    workflow: AnyWorkflow,
+    runId: string,
+  ): Promise<WorkflowState | null> {
+    return workflow.getWorkflowRunById(runId, { fields: RUN_STATE_FIELDS });
+  }
+
+  async #summaryForAttempt(
+    workflow: AnyWorkflow,
+    runId: string,
+    attemptToken: string,
+  ): Promise<RunSummary | undefined> {
+    const persisted = await this.#workflowState(workflow, runId);
+    if (!persisted) return undefined;
+    const provenance = runProvenance(persisted);
+    if (provenance?.attemptToken !== attemptToken) return undefined;
+    return summarizeState(
+      runId,
+      persisted,
+      new Map(provenance.resumeCounts),
+      provenance.requestedBy,
+      provenance.requestedByKind,
+    );
   }
 
   async #reconcileTerminalState(
     workflowId: string,
     runId: string,
     result: CoreRunResult,
+    requestContext: RequestContext,
   ): Promise<void> {
     const opts = terminalStateUpdate(result);
     if (!opts) return;
@@ -979,13 +1232,37 @@ export class RunnerRuntime {
         `RunnerRuntime: run '${runId}' of workflow '${workflowId}' completed without a durable snapshot`,
       );
     }
-    if (snapshot.status === result.status) return;
+    const persistedContext =
+      snapshot.requestContext !== null &&
+      typeof snapshot.requestContext === 'object' &&
+      !Array.isArray(snapshot.requestContext)
+        ? snapshot.requestContext
+        : {};
+    // Core merges resume context over the prior snapshot. Terminal-only repair
+    // must persist that same effective context, including application keys the
+    // current provider intentionally omitted.
+    const authoritativeContext = {
+      ...persistedContext,
+      ...Object.fromEntries(requestContext.entries()),
+    };
+    const persistedToken = runProvenance(snapshot)?.attemptToken;
+    const authoritativeToken = runProvenance({
+      ...snapshot,
+      requestContext: authoritativeContext,
+    })?.attemptToken;
+    if (
+      snapshot.status === result.status &&
+      persistedToken === authoritativeToken
+    ) {
+      return;
+    }
     await workflows.persistWorkflowSnapshot({
       workflowName: workflowId,
       runId,
       snapshot: {
         ...snapshot,
         ...opts,
+        requestContext: authoritativeContext,
         timestamp: Date.now(),
       },
     });
@@ -1020,9 +1297,9 @@ export class RunnerRuntime {
   // The run's full identity as a single map key: workflowId + runId, never runId
   // alone. The same caller-supplied runId under two workflows are DISTINCT
   // persisted runs (Mastra snapshots key on workflowName+runId) and must never
-  // share a per-run entry — the FIFO lock OR the resume ledger. Composing the key
-  // in ONE place keeps every per-run map keyed identically, so a future per-run
-  // map cannot reintroduce a runId-only key (the grant leak the ledger guards).
+  // share a per-run FIFO entry. Composing the key in ONE place keeps every
+  // per-run map keyed identically, so a future map cannot reintroduce a
+  // runId-only key and cross workflow boundaries.
   // This is the exact string the DO name join produces
   // (idFromName(`${workflowId}:${runId}`)); PATH_SAFE_ID_PATTERN excludes ':'
   // from both ids, so the join is unambiguous.

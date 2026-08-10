@@ -2,7 +2,7 @@
 // FlowsafeDurableAgent — drive Mastra's durable-agent loop through the ONE
 // RunnerRuntime chokepoint (DL-001/DL-010) so every agent leg inherits the
 // substrate's invariants: INV-1 server-minted runIds, per-leg
-// requestContextForRun grant derivation, the resume ledger, RunSummary, and
+// requestContextForRun grant derivation, snapshot provenance, RunSummary, and
 // retention purge — with no second execution path to audit.
 //
 // The mechanic (validated against @mastra/core 1.50.0 dist, spike S1):
@@ -33,13 +33,13 @@
 //
 // INV-1 at the boundary: stream()/generate()/prepare() are the THREE inherited
 // minting entry points — each takes an OPTIONAL runId and, when it is absent,
-// lets core mint a tenant-less crypto.randomUUID() upstream
+// lets core mint an unowned crypto.randomUUID() upstream
 // (prepareForDurableExecution, agent/durable index.js:589) that
 // PATH_SAFE_ID_PATTERN then accepts, slipping past executeWorkflow's guard AND
 // RunnerRuntime.start's (the exact fallback INV-1 forbids). All three are
 // overridden ONLY to REQUIRE a caller-minted runId before delegating to super —
 // and prepare() also REGISTERS the run under that id (index.js:5984), so an
-// unguarded prepare() strands a tenant-less run in the registry. streamUntilIdle()
+// unguarded prepare() strands an unowned run in the registry. streamUntilIdle()
 // needs no override: it drives agent.stream() (index.js:368), so the stream()
 // guard already covers it. resume() is NOT overridden to be client-facing
 // (A-D2/P8): resume flows ONLY through the approval-decision path
@@ -70,8 +70,13 @@ import type { RequestContext } from '@mastra/core/request-context';
 import type { AnyWorkflow } from '@mastra/core/workflows';
 
 import {
+  type ExecutionPrincipalKind,
+  isExecutionPrincipalId,
+  isExecutionPrincipalKind,
+} from '../approval-api/principal.js';
+import {
   InvalidRunRequestError,
-  PATH_SAFE_ID_PATTERN,
+  isPathSafeId,
   type RunnerRuntime,
   type RunSummary,
 } from '../do-runner/index.js';
@@ -83,23 +88,45 @@ import {
  */
 export const DURABLE_AGENTIC_LOOP_WORKFLOW_ID = 'durable-agentic-loop';
 
+function bindThreadCompletion<T extends object>(
+  output: T,
+  completion: Promise<void>,
+): T {
+  return new Proxy(output, {
+    get(target, property, receiver) {
+      if (property === '_waitUntilFinished') {
+        const wait = Reflect.get(target, property, target);
+        return () =>
+          typeof wait === 'function'
+            ? Promise.race([
+                Promise.resolve(wait.call(target) as unknown),
+                completion,
+              ])
+            : completion;
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
 /**
  * Brand marking an agent as RUNTIME-DRIVEN: its inherited signal wake
- * (`agent.stream` under `ifIdle:'wake'`) re-enters the tenant-run-ID-guarded
+ * (`agent.stream` under `ifIdle:'wake'`) re-enters the host-owned-run-ID guard in
  * {@link FlowsafeDurableAgent.executeWorkflow}, which drives
  * `runtime.start('durable-agentic-loop', …)` rather than the base
  * `createRun + run.start` on the default engine. The thread-Durable-Object signal
  * routes require this brand before honoring an idle wake, because the wake is the
  * one signal path that starts a run: a plain core `Agent` (or a STOCK
- * `DurableAgent`, whose `stream()` mints a tenant-less UUID and whose
+ * `DurableAgent`, whose `stream()` mints an unowned UUID and whose
  * `executeWorkflow` runs on the default engine) would start a run OUTSIDE
- * RunnerRuntime — an unsafe second execution path that is tenant-unscoped and
+ * RunnerRuntime — an unsafe second execution path that is unscoped and
  * grant-underivable. Structural (a `unique symbol`-keyed truthy field) so a test
  * double can opt in without constructing a real durable agent.
  *
  * The brand is paired with the host-owned idle-start seam: the thread Durable Object
- * mints the tenant-salted run id and invokes the wrapper directly, avoiding
- * core's tenant-less idle-wake id generation.
+ * mints the run id and invokes the wrapper directly, avoiding core's unowned
+ * idle-wake id generation.
  */
 export const RUNTIME_DRIVEN_AGENT: unique symbol = Symbol(
   'flowsafe.runtimeDrivenAgent',
@@ -131,8 +158,8 @@ export interface FlowsafeDurableAgentOptions<
    * The RunnerRuntime through which the loop is driven. Required because
    * this is the whole point of the flowsafe wrapper: executeWorkflow() calls
    * `runtime.start('durable-agentic-loop', ...)` instead of the base
-   * `createRun + start`, so tenant-scoped run IDs, the per-leg grant context, and the resume
-   * ledger apply to agent legs. The loop workflow is registered on this runtime
+   * `createRun + start`, so host-owned run IDs, the per-leg grant context, and
+   * persisted snapshot provenance apply to agent legs. The loop workflow is registered on this runtime
    * by the factory (idempotently — one shared id serves every durable agent).
    */
   runtime: RunnerRuntime;
@@ -186,6 +213,9 @@ export class FlowsafeDurableAgent<
       reject: (error: unknown) => void;
     }
   >();
+  readonly #startRequesters = new Map<string, string>();
+  readonly #startRequesterKinds = new Map<string, ExecutionPrincipalKind>();
+  readonly #startAttemptTokens = new Map<string, string>();
 
   constructor(options: FlowsafeDurableAgentOptions<TAgentId, TTools, TOutput>) {
     super({
@@ -208,10 +238,10 @@ export class FlowsafeDurableAgent<
   }
 
   /**
-   * Tenant-scoped run-ID enforcement at the public boundary. The durable-agent entry points (stream /
+   * Host-owned run-ID enforcement at the public boundary. The durable-agent entry points (stream /
    * generate / prepare) take an OPTIONAL runId, and when it is omitted core's
    * `prepareForDurableExecution` mints `crypto.randomUUID()`
-   * (agent/durable/index.js:589) — the exact tenant-less fallback this wrapper forbids —
+   * (agent/durable/index.js:589) — the exact unowned fallback this wrapper forbids —
    * and hands it to `executeWorkflow` BELOW this class's own guard, where a bare
    * UUID is already indistinguishable from a legitimately caller-minted one. So
    * the guard must ALSO fire HERE, before `super.stream()/generate()/prepare()`,
@@ -223,20 +253,20 @@ export class FlowsafeDurableAgent<
    * class.
    */
   #assertCallerRunId(runId: unknown): asserts runId is string {
-    if (typeof runId !== 'string' || !PATH_SAFE_ID_PATTERN.test(runId)) {
+    if (!isPathSafeId(runId)) {
       throw new InvalidRunRequestError(
-        'a caller-minted runId is required and must be URL-path-safe (INV-1: hosts mint `<tenantId>_<uuid>`) — the durable-agent runner never generates one',
+        'a caller-minted runId is required and must be URL-path-safe (INV-1: the host owns run ids) — the durable-agent runner never generates one',
       );
     }
   }
 
   /**
-   * Enforce a caller-minted tenant-scoped run ID before the inherited durable
+   * Enforce a caller-minted run ID before the inherited durable
    * `stream()` runs: without this the
-   * optional `options.runId` would let core mint a tenant-less
+   * optional `options.runId` would let core mint an unowned
    * `crypto.randomUUID()` upstream. The private run-ID guard rejects a missing or
    * non-path-safe value before delegating to core.
-   * A host mints `${tenantId}_${uuid}` and passes it as `options.runId`.
+   * A host mints an opaque path-safe id and passes it as `options.runId`.
    */
   override async stream(
     messages: Parameters<DurableAgent<TAgentId, TTools, TOutput>['stream']>[0],
@@ -277,10 +307,19 @@ export class FlowsafeDurableAgent<
     options: NonNullable<
       Parameters<DurableAgent<TAgentId, TTools, TOutput>['stream']>[1]
     >,
+    requestedBy: string,
+    requestedByKind: ExecutionPrincipalKind,
+    attemptToken = crypto.randomUUID(),
   ): Promise<
     Awaited<ReturnType<DurableAgent<TAgentId, TTools, TOutput>['stream']>>
   > {
     this.#assertCallerRunId(options.runId);
+    if (!isExecutionPrincipalId(requestedBy)) {
+      throw new InvalidRunRequestError('requestedBy is malformed');
+    }
+    if (!isExecutionPrincipalKind(requestedByKind)) {
+      throw new InvalidRunRequestError('requestedByKind is malformed');
+    }
     const runId = options.runId;
     if (this.#persistenceWaiters.has(runId)) {
       throw new InvalidRunRequestError(
@@ -295,6 +334,9 @@ export class FlowsafeDurableAgent<
     });
     void persisted.catch(() => undefined);
     this.#persistenceWaiters.set(runId, { resolve, reject });
+    this.#startRequesters.set(runId, requestedBy);
+    this.#startRequesterKinds.set(runId, requestedByKind);
+    this.#startAttemptTokens.set(runId, attemptToken);
     const onError = options.onError;
     try {
       const result = await this.stream(messages, {
@@ -312,11 +354,14 @@ export class FlowsafeDurableAgent<
       return result;
     } finally {
       this.#persistenceWaiters.delete(runId);
+      this.#startRequesters.delete(runId);
+      this.#startRequesterKinds.delete(runId);
+      this.#startAttemptTokens.delete(runId);
     }
   }
 
   /**
-   * The same tenant-scoped run-ID guard as {@link FlowsafeDurableAgent.stream} —
+   * The same host-owned run-ID guard as {@link FlowsafeDurableAgent.stream} —
    * `generate()`
    * re-implements the durable setup and mints its own runId the same way when
    * one is not supplied.
@@ -336,11 +381,11 @@ export class FlowsafeDurableAgent<
   }
 
   /**
-   * The same tenant-scoped run-ID guard as {@link FlowsafeDurableAgent.stream}.
+   * The same host-owned run-ID guard as {@link FlowsafeDurableAgent.stream}.
    * `prepare()`
    * is the third inherited minting entry point: it forwards `options?.runId` into
    * core's `prepareForDurableExecution` (agent/durable/index.js:5980), which mints
-   * a tenant-less `crypto.randomUUID()` when it is absent (index.js:589) AND
+   * an unowned `crypto.randomUUID()` when it is absent (index.js:589) AND
    * REGISTERS a run under that id (index.js:5984) — so a later
    * `resume(runId)`/`executeWorkflow` sees a bare UUID `PATH_SAFE_ID_PATTERN`
    * already accepts, past every downstream guard. Enforce the caller-minted ID here, while
@@ -417,9 +462,19 @@ export class FlowsafeDurableAgent<
     preparation.registryEntry.inputProcessors = inputProcessors;
     preparation.registryEntry.llmRequestInputProcessors =
       llmRequestInputProcessors;
+    let cleaned = false;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      preparation.registryEntry.cleanup?.();
+    };
+    const registryEntry = {
+      ...preparation.registryEntry,
+      cleanup,
+    };
     this.runRegistryInternal.registerWithMessageList(
       options.runId,
-      preparation.registryEntry,
+      registryEntry,
       preparation.messageList,
       {
         threadId: preparation.threadId,
@@ -427,7 +482,7 @@ export class FlowsafeDurableAgent<
       },
     );
     globalRunRegistry.set(options.runId, {
-      ...preparation.registryEntry,
+      ...registryEntry,
       messageList: preparation.messageList,
     });
   }
@@ -435,27 +490,19 @@ export class FlowsafeDurableAgent<
   /**
    * Rehydrate a suspended durable-agent run after isolate eviction, restore its
    * active thread registration, then resume through RunnerRuntime so approval
-   * grant derivation and the durable resume ledger remain authoritative.
+   * grant derivation and snapshot provenance remain authoritative.
    * Hosts expose this only from their trusted approval-decision topology.
    */
   async resumeViaRuntime(options: {
     runId: string;
+    requestedBy: string;
     step?: string | string[];
     resumeData?: unknown;
     memory?: DurableAgentStreamOptions<TOutput>['memory'];
   }): Promise<RunSummary> {
     this.#assertCallerRunId(options.runId);
-    const requestContext = await this.#runtime.trustedRequestContextForResume(
-      this.getWorkflow().id,
-      options.runId,
-      options.step !== undefined ? { step: options.step } : {},
-    );
-    await this.#rehydrateRegistry({
-      runId: options.runId,
-      requestContext,
-      ...(options.memory !== undefined ? { memory: options.memory } : {}),
-    });
-    const observed = await this.observe(options.runId);
+    let rehydrated = false;
+    let finishThreadRegistration: (() => void) | undefined;
     const emitTerminalError = async (error: unknown): Promise<void> => {
       try {
         await this.emitError(
@@ -476,29 +523,45 @@ export class FlowsafeDurableAgent<
       }
     };
     try {
-      await this.#threadRuntime?.registerRun(
-        this as unknown as Parameters<
-          Mastra['agentThreadStreamRuntime']['registerRun']
-        >[0],
-        observed.output,
-        {
-          runId: options.runId,
-          ...(options.memory !== undefined ? { memory: options.memory } : {}),
-        } as Parameters<Mastra['agentThreadStreamRuntime']['registerRun']>[2],
-        this.pubsub,
-      );
-      // The approval fingerprint is the parent suspension recorded above.
-      // Do not forward that collapsed parent path to Mastra: omitting `step`
-      // lets it append the nested tool-call path stored in __workflow_meta.
-      // RunnerRuntime independently resolves the same single parent step for
-      // exact-leg capability derivation before execution.
       const summary = await this.#runtime.resume(
         this.getWorkflow().id,
         options.runId,
         {
+          ...(options.step !== undefined ? { step: options.step } : {}),
           ...(options.resumeData !== undefined
             ? { resumeData: options.resumeData }
             : {}),
+          requestedBy: options.requestedBy,
+          requestedByKind: 'human',
+          prepareExecution: async (requestContext) => {
+            await this.#rehydrateRegistry({
+              runId: options.runId,
+              requestContext,
+              ...(options.memory !== undefined
+                ? { memory: options.memory }
+                : {}),
+            });
+            rehydrated = true;
+            const observed = await this.observe(options.runId);
+            const completion = new Promise<void>((resolve) => {
+              finishThreadRegistration = resolve;
+            });
+            await this.#threadRuntime?.registerRun(
+              this as unknown as Parameters<
+                Mastra['agentThreadStreamRuntime']['registerRun']
+              >[0],
+              bindThreadCompletion(observed.output, completion),
+              {
+                runId: options.runId,
+                ...(options.memory !== undefined
+                  ? { memory: options.memory }
+                  : {}),
+              } as Parameters<
+                Mastra['agentThreadStreamRuntime']['registerRun']
+              >[2],
+              this.pubsub,
+            );
+          },
         },
       );
       if (summary.status === 'failed') {
@@ -508,8 +571,14 @@ export class FlowsafeDurableAgent<
       }
       return summary;
     } catch (error) {
-      await emitTerminalError(error);
+      if (rehydrated) {
+        await emitTerminalError(error);
+        this.runRegistryInternal.cleanup(options.runId);
+        globalRunRegistry.delete(options.runId);
+      }
       throw error;
+    } finally {
+      finishThreadRegistration?.();
     }
   }
 
@@ -520,7 +589,7 @@ export class FlowsafeDurableAgent<
    * keyed by this runId, so the loop the runtime starts resolves them in-isolate
    * while the runtime mints the per-leg grant context. The runId guard here is
    * defense in depth — the public boundary (stream/generate) already enforced
-   * the tenant-scoped run-ID rule; this catches any future internal caller.
+   * the host-owned run-ID rule; this catches any future internal caller.
    */
   protected override async executeWorkflow(
     runId: string,
@@ -533,10 +602,31 @@ export class FlowsafeDurableAgent<
       // getWorkflow() is memoized and its id is the shared loop id the factory
       // registered; driving that exact id keeps the started run and the
       // registered workflow in lockstep.
-      summary = await this.#runtime.start(this.getWorkflow().id, {
+      const requestedBy = this.#startRequesters.get(runId);
+      const requestedByKind = this.#startRequesterKinds.get(runId);
+      const attemptToken = this.#startAttemptTokens.get(runId);
+      const startOptions = {
         runId,
         inputData: workflowInput,
-      });
+        ...(attemptToken === undefined ? {} : { attemptToken }),
+      };
+      if (requestedBy === undefined || requestedByKind === undefined) {
+        if (requestedBy !== undefined || requestedByKind !== undefined) {
+          throw new InvalidRunRequestError(
+            'requestedBy and requestedByKind must be provided together',
+          );
+        }
+        summary = await this.#runtime.start(
+          this.getWorkflow().id,
+          startOptions,
+        );
+      } else {
+        summary = await this.#runtime.start(this.getWorkflow().id, {
+          ...startOptions,
+          requestedBy,
+          requestedByKind,
+        });
+      }
       waiter?.resolve();
     } catch (error) {
       waiter?.reject(error);

@@ -56,8 +56,8 @@ export interface ScenarioOutcome {
 export interface ScenarioContext {
   /** The signed-in actor, from the server's catalog echo. */
   actor: { id: string; role: string };
-  /** The sandbox tenant, segmenting isolation scope. */
-  tenantId: string;
+  /** Trusted deployment value used as Breakwater's opaque isolation scope. */
+  isolationScope: string;
   /** Append already-released text to the agent transcript. */
   emitText(text: string): void;
   emitEvent(event: EngineEvent): void;

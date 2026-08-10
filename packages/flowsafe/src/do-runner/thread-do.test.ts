@@ -3,176 +3,224 @@ import type { DurableObjectState } from '@cloudflare/workers-types';
 import { InMemoryStore } from '@mastra/core/storage';
 import { describe, expect, it } from 'vitest';
 
-import { encodeExecutionPrincipal } from '../approval-api/index.js';
-
-import { type InitResult, init } from './init.js';
-import { mintThreadId } from './memory-id.js';
-import { ThreadDurableObject, type ThreadScope } from './thread-do.js';
 import {
-  THREAD_PRINCIPAL_HEADER,
-  THREAD_TENANT_HEADER,
-} from './thread-header.js';
+  deploymentIdentityDatabase,
+  deploymentIdentityRequest,
+  TEST_DEPLOYMENT_IDENTITY_SECRET,
+} from '../../test-support/deployment-identity.js';
+import { encodeExecutionPrincipal } from '../approval-api/index.js';
+import { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
+import { type InitResult, init } from './init.js';
+import { ThreadDurableObject, type ThreadScope } from './thread-do.js';
 
-// A host subclass: build() is its init() wiring, route() its thread routes.
-// This one echoes the ASSERTED scope, so every test below reads exactly what
-// the base decided before dispatch.
 class TestThread extends ThreadDurableObject {
   builds = 0;
+  events?: string[];
+  buildError?: Error;
+  alarmError?: Error;
+
   protected build(): InitResult {
     this.builds += 1;
+    this.events?.push('build');
+    if (this.buildError) throw this.buildError;
     return init({ storage: new InMemoryStore() });
   }
+
   protected route(_request: Request, scope: ThreadScope): Promise<Response> {
     return Promise.resolve(
-      new Response(
-        JSON.stringify({
-          threadId: scope.threadId,
-          tenantId: scope.tenantId,
-          actor: scope.actor,
-          requestedBy: scope.requestedBy,
-        }),
-      ),
+      Response.json({
+        threadId: scope.threadId,
+        deploymentTag: scope.deploymentTag,
+        principal: scope.principal,
+      }),
     );
+  }
+
+  protected async onAlarm(): Promise<void> {
+    this.events?.push('onAlarm');
+    if (this.alarmError) throw this.alarmError;
   }
 }
 
-function threadWith(name: string | undefined): TestThread {
-  // The thread DO reads only id.name (its identity) here; storage is absent in
-  // node, where the runtime keeps its in-memory resume ledger.
-  return new TestThread({ id: { name } } as unknown as DurableObjectState, {});
+function threadWith(
+  name: string | undefined,
+  options: {
+    envTag?: string;
+    storedTag?: string;
+    omitBindings?: boolean;
+    events?: string[];
+    buildError?: Error;
+    alarmError?: Error;
+  } = {},
+): TestThread {
+  const state = {
+    id: { name },
+    storage: {
+      setAlarm: async () => {
+        options.events?.push('setAlarm');
+      },
+      deleteAlarm: async () => {
+        options.events?.push('deleteAlarm');
+      },
+    },
+  } as unknown as DurableObjectState;
+  const identity = deploymentIdentityDatabase(options.storedTag ?? 'acme');
+  const env = options.omitBindings
+    ? {}
+    : {
+        DEPLOYMENT_TENANT: options.envTag ?? 'acme',
+        DEPLOYMENT_IDENTITY_SECRET: TEST_DEPLOYMENT_IDENTITY_SECRET,
+        DB: {
+          prepare(query: string) {
+            options.events?.push('identity');
+            return identity.prepare(query);
+          },
+        },
+      };
+  const thread = new TestThread(state, env);
+  thread.events = options.events;
+  thread.buildError = options.buildError;
+  thread.alarmError = options.alarmError;
+  return thread;
 }
 
 function request(
-  tenantId?: string,
-  requestedBy: string | null = 'operator',
+  principal = true,
+  secret = TEST_DEPLOYMENT_IDENTITY_SECRET,
 ): Request {
   const headers = new Headers();
-  if (tenantId !== undefined) headers.set(THREAD_TENANT_HEADER, tenantId);
-  // The topology stamps this on every send; the DO refuses a request without
-  // it rather than rebuilding the caller as a human.
-  if (requestedBy !== null) {
+  if (principal) {
     headers.set(
-      THREAD_PRINCIPAL_HEADER,
+      EXECUTION_PRINCIPAL_HEADER,
       encodeExecutionPrincipal({
         kind: 'human',
-        id: requestedBy,
-        tenantId: tenantId ?? 'acme',
+        id: 'operator',
         role: 'operator',
       }),
     );
   }
-  return new Request('http://thread/messages', {
-    method: 'POST',
-    headers,
-  });
+  return deploymentIdentityRequest(
+    'http://thread/messages',
+    {
+      method: 'POST',
+      headers,
+    },
+    secret,
+  );
 }
 
-describe('ThreadDurableObject tenant assertion', () => {
-  it('serves a request whose authenticated tenant is the one its name carries', async () => {
-    // #given — the DO is addressed idFromName(threadId) with a MINTED id
-    const threadId = mintThreadId('acme', () => 't1');
-    const thread = threadWith(threadId);
+describe('ThreadDurableObject identity boundary', () => {
+  it('validates its local name before pre-arming alarm storage', async () => {
+    const events: string[] = [];
+    const thread = threadWith('thread/invalid', { events });
 
-    // #when — the trusted Worker forwards the request stamped with 'acme'
-    const response = await thread.fetch(request('acme'));
+    await expect(thread.alarm()).rejects.toThrow(/path-safe id\.name/);
 
-    // #then — routed, with the identity decoded from the DO's OWN name
+    expect(events).toEqual([]);
+  });
+
+  it('pre-arms before deployment identity failure and preserves the successor', async () => {
+    const events: string[] = [];
+    const thread = threadWith('thread-1', {
+      events,
+      storedTag: 'globex',
+    });
+
+    await expect(thread.alarm()).rejects.toThrow("belongs to 'globex'");
+
+    expect(events[0]).toBe('setAlarm');
+    expect(events.filter((event) => event === 'setAlarm')).toHaveLength(2);
+    expect(events).not.toContain('build');
+  });
+
+  it.each([
+    ['build', { buildError: new Error('build failed') }],
+    ['onAlarm', { alarmError: new Error('alarm work failed') }],
+  ] as const)('preserves the prearmed successor after a %s failure', async (_label, failure) => {
+    const events: string[] = [];
+    const thread = threadWith('thread-1', { events, ...failure });
+
+    await expect(thread.alarm()).rejects.toThrow(/failed/);
+
+    expect(events[0]).toBe('setAlarm');
+    expect(events.filter((event) => event === 'setAlarm')).toHaveLength(2);
+  });
+
+  it('rejects a cross-deployment caller before building named-thread state', async () => {
+    const thread = threadWith('thread-1');
+    const denied = request(true, 'different-deployment-identity-secret');
+
+    const response = await thread.fetch(denied);
+
+    expect(response.status).toBe(503);
+    expect(thread.builds).toBe(0);
+  });
+
+  it('serves a path-safe named thread after verifying deployment identity', async () => {
+    const thread = threadWith('thread-1');
+
+    const response = await thread.fetch(request());
+
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
-      threadId: 'acme_t1',
-      tenantId: 'acme',
-      actor: {
-        id: 'operator',
-        role: 'operator',
-        tenantId: 'acme',
-      },
-      requestedBy: 'operator',
+      threadId: 'thread-1',
+      deploymentTag: 'acme',
+      principal: { kind: 'human', id: 'operator', role: 'operator' },
     });
   });
 
-  it('refuses a valid token for ANOTHER tenant’s thread (the C-S4 cross-tenant send)', async () => {
-    // #given — tenant 'globex' authenticates fine and aims a request at
-    // acme's thread. Name and path agree — only the tenant prefix vs the
-    // AUTHENTICATED tenant catches this, which is why the check exists.
-    const thread = threadWith(mintThreadId('acme', () => 't1'));
+  it('refuses a missing principal before building route wiring', async () => {
+    const thread = threadWith('thread-1');
 
-    // #when
-    const response = await thread.fetch(request('globex'));
+    const response = await thread.fetch(request(false));
 
-    // #then — fails closed at the prefix assertion, before route() runs
     expect(response.status).toBe(403);
-    expect(await response.text()).toMatch(/thread identity mismatch/);
+    expect(thread.builds).toBe(0);
   });
 
-  it('refuses a request that states no authenticated tenant', async () => {
-    // #given — no header: the request did not come through the trusted
-    // Worker's authentication, so "trust the name" would forfeit the check
-    const thread = threadWith(mintThreadId('acme', () => 't1'));
+  it.each([
+    undefined,
+    '',
+    '.',
+    '..',
+    'thread/1',
+  ])('refuses an invalid Durable Object name: %s', async (name) => {
+    const thread = threadWith(name);
 
-    // #when
     const response = await thread.fetch(request());
 
-    // #then
     expect(response.status).toBe(403);
-    expect(await response.text()).toMatch(/authenticates as '<none>'/);
-  });
-
-  it('is exact at the tenant boundary (the acme vs acmecorp pin)', async () => {
-    // #given — a prefix neighbor: 'acme' must not pass for 'acmecorp's thread
-    const thread = threadWith(mintThreadId('acmecorp', () => 't1'));
-
-    // #when / #then
-    expect((await thread.fetch(request('acme'))).status).toBe(403);
-    expect((await thread.fetch(request('acmecorp'))).status).toBe(200);
-  });
-
-  it('refuses a name carrying no INV-3 tenant segment', async () => {
-    // #given — a hand-built/client-chosen threadId that never crossed the mint
-    const thread = threadWith('legacy-thread-1');
-
-    // #when
-    const response = await thread.fetch(request('acme'));
-
-    // #then — unscoped, so it refuses to serve at all rather than guess
-    expect(response.status).toBe(403);
-    expect(await response.text()).toMatch(/carries no INV-3 tenant segment/);
-  });
-
-  it('refuses when the DO has no id.name (not addressed via idFromName)', async () => {
-    // #given
-    const thread = threadWith(undefined);
-
-    // #when
-    const response = await thread.fetch(request('acme'));
-
-    // #then
-    expect(response.status).toBe(403);
-    expect(await response.text()).toMatch(/no id\.name/);
-  });
-
-  it('builds its wiring ONCE per instance — the pubsub identity depends on it', async () => {
-    // #given — a second build() would mint a second pubsub identity, and
-    // publish/replay would address different feeds (pubsub.ts)
-    const thread = threadWith(mintThreadId('acme', () => 't1'));
-
-    // #when — three requests through the same instance
-    await thread.fetch(request('acme'));
-    await thread.fetch(request('acme'));
-    await thread.fetch(request('acme'));
-
-    // #then
-    expect(thread.builds).toBe(1);
-  });
-
-  it('does not build its wiring for a REFUSED request', async () => {
-    // #given — the assertion runs before route(), so a foreign caller never
-    // reaches storage
-    const thread = threadWith(mintThreadId('acme', () => 't1'));
-
-    // #when
-    await thread.fetch(request('globex'));
-
-    // #then
     expect(thread.builds).toBe(0);
+  });
+
+  it('fails closed when the environment tag and D1 sentinel disagree', async () => {
+    const thread = threadWith('thread-1', {
+      envTag: 'acme',
+      storedTag: 'globex',
+    });
+
+    const response = await thread.fetch(request());
+
+    expect(response.status).toBe(503);
+    expect(thread.builds).toBe(0);
+  });
+
+  it('fails closed when production bindings are absent', async () => {
+    const thread = threadWith('thread-1', { omitBindings: true });
+
+    const response = await thread.fetch(request());
+
+    expect(response.status).toBe(503);
+    expect(thread.builds).toBe(0);
+  });
+
+  it('builds its wiring once per Durable Object instance', async () => {
+    const thread = threadWith('thread-1');
+
+    await thread.fetch(request());
+    await thread.fetch(request());
+    await thread.fetch(request());
+
+    expect(thread.builds).toBe(1);
   });
 });

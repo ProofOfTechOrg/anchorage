@@ -100,7 +100,7 @@ anywhere and versioned against the wire contract alone.
 Opt-in live updates over an INJECTED, DOM-free `StreamTransport` (a structural
 seam like `FetchLike`), so the library never hard-depends on a browser
 `WebSocket`. Pass `useApprovalDashboard` a `stream: { transport, ticket }` and it
-subscribes to the tenant's approval stream and live-merges events on top of the
+subscribes to the deployment approval stream and live-merges events on top of the
 interval poll, which keeps running as the periodic reconciler. Absent
 `stream`, behavior is byte-identical to poll-only.
 

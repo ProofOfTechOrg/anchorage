@@ -16,7 +16,7 @@
 // This lives in approval-api rather than contract.ts because contract.ts is the
 // breakwater wire contract, mirrored by value and pinned by the cross-package
 // tests. A principal is a host concept: breakwater learns only the KIND (its
-// `PrincipalKind`), never the tenant or the purpose.
+// `PrincipalKind`), never the purpose.
 
 import {
   APPROVAL_ROLES,
@@ -29,14 +29,24 @@ import {
  * contract.ts mirrors the request-context keys: flowsafe does not import
  * breakwater at runtime. The cross-package contract test pins the equality.
  */
-export type ExecutionPrincipalKind = 'human' | 'service' | 'agent' | 'system';
-
-export const EXECUTION_PRINCIPAL_KINDS: readonly ExecutionPrincipalKind[] = [
+export const EXECUTION_PRINCIPAL_KINDS = [
   'human',
   'service',
   'agent',
   'system',
-];
+] as const;
+
+export type ExecutionPrincipalKind = (typeof EXECUTION_PRINCIPAL_KINDS)[number];
+
+/** Internal runtime guard for values crossing storage and request boundaries. */
+export function isExecutionPrincipalKind(
+  value: unknown,
+): value is ExecutionPrincipalKind {
+  return (
+    typeof value === 'string' &&
+    (EXECUTION_PRINCIPAL_KINDS as readonly string[]).includes(value)
+  );
+}
 
 /** Automated kinds — everything that is not a logged-in person. */
 export const AUTOMATED_PRINCIPAL_KINDS: readonly ExecutionPrincipalKind[] = [
@@ -68,13 +78,11 @@ export type ExecutionPrincipal =
   | {
       readonly kind: 'human';
       readonly id: string;
-      readonly tenantId: string;
       readonly role: ApprovalRole;
     }
   | {
       readonly kind: 'service';
       readonly id: string;
-      readonly tenantId: string;
       readonly purpose: string;
       /** Only an agent delegates; `never` makes a wrong shape a type error. */
       readonly delegatedBy?: never;
@@ -82,7 +90,6 @@ export type ExecutionPrincipal =
   | {
       readonly kind: 'agent';
       readonly id: string;
-      readonly tenantId: string;
       readonly purpose: string;
       /** The principal that delegated this run, for agent-to-agent work. */
       readonly delegatedBy?: string;
@@ -90,14 +97,13 @@ export type ExecutionPrincipal =
   | {
       readonly kind: 'system';
       readonly id: string;
-      readonly tenantId: string;
       readonly purpose: string;
       readonly delegatedBy?: never;
     };
 
 /**
- * The trusted-automation brand, following the TENANT_BOUND idiom for the same
- * reason: TypeScript is structural, so a parameter typed plain
+ * The trusted-automation brand exists because TypeScript is structural, so a
+ * parameter typed plain
  * `ExecutionPrincipal` is satisfied by any object literal. Without this, the
  * service's automated entries authorize on the CALLER'S OWN ASSERTION that it
  * is a robot — which would give automation strictly more create authority than
@@ -108,9 +114,9 @@ export type ExecutionPrincipal =
  * package barrel, but that is API-surface hygiene, NOT a capability boundary:
  * the brand is recoverable by reflection from any vouched principal
  * (`Object.getOwnPropertySymbols(maintenancePrincipal('x'))`), so in-process
- * code that means to forge one still can. That residual is the same one
- * TENANT_BOUND accepts, and it is deliberate — a TCB bypass on par with an `as`
- * cast. What the brand eliminates is accidental satisfaction and the rushed fix
+ * code that means to forge one still can. That residual is deliberate — a TCB
+ * bypass on par with an `as` cast. What the brand eliminates is accidental
+ * satisfaction and the rushed fix
  * that hands a request-derived principal to a trusted entry.
  */
 export const TRUSTED_AUTOMATION: unique symbol = Symbol(
@@ -254,8 +260,7 @@ export function canonicalAutomatedPrincipal(
  * fields do not stop at the wire: `id` becomes `requestedBy`/`decidedBy` in D1
  * and the actor on every audit row, and `purpose` rides into the SIEM export.
  * The bounds keep an audit row bounded; the control-character refusal keeps
- * those strings clean at the boundary rather than downstream. Mirrors the
- * `containsHeaderControl` check `createTenantResolver` applies to an actor id.
+ * those strings clean at the boundary rather than downstream.
  */
 function boundedText(value: unknown, max: number): value is string {
   if (typeof value !== 'string' || value.trim() === '' || value.length > max) {
@@ -266,6 +271,14 @@ function boundedText(value: unknown, max: number): value is string {
     if (code <= 0x1f || code === 0x7f) return false;
   }
   return true;
+}
+
+/**
+ * Canonical execution-principal identifier rule shared by every request and
+ * storage hydration boundary. Kept off the package barrel deliberately.
+ */
+export function isExecutionPrincipalId(value: unknown): value is string {
+  return boundedText(value, MAX_PRINCIPAL_ID_LENGTH);
 }
 
 /**
@@ -292,44 +305,33 @@ function boundedText(value: unknown, max: number): value is string {
 function canonicalPrincipal(value: unknown): ExecutionPrincipal | undefined {
   if (value === null || typeof value !== 'object') return undefined;
   const id = ownField(value, 'id');
-  const tenantId = ownField(value, 'tenantId');
   const kind = ownField(value, 'kind');
-  if (
-    !boundedText(id, MAX_PRINCIPAL_ID_LENGTH) ||
-    typeof tenantId !== 'string' ||
-    tenantId === ''
-  ) {
+  if (!isExecutionPrincipalId(id) || !isExecutionPrincipalKind(kind)) {
     return undefined;
   }
   if (kind === 'human') {
     const role = ownField(value, 'role');
     return typeof role === 'string' &&
       (APPROVAL_ROLES as readonly string[]).includes(role)
-      ? { kind: 'human', id, tenantId, role: role as ApprovalRole }
+      ? Object.freeze({ kind: 'human', id, role: role as ApprovalRole })
       : undefined;
-  }
-  if (kind !== 'service' && kind !== 'agent' && kind !== 'system') {
-    return undefined;
   }
   const purpose = ownField(value, 'purpose');
   if (!boundedText(purpose, MAX_PURPOSE_LENGTH)) return undefined;
   const delegatedBy = ownField(value, 'delegatedBy');
   if (delegatedBy !== undefined) {
-    return kind === 'agent' && boundedText(delegatedBy, MAX_PRINCIPAL_ID_LENGTH)
-      ? { kind: 'agent', id, tenantId, purpose, delegatedBy }
+    return kind === 'agent' && isExecutionPrincipalId(delegatedBy)
+      ? Object.freeze({ kind: 'agent', id, purpose, delegatedBy })
       : undefined;
   }
-  if (kind === 'agent') return { kind: 'agent', id, tenantId, purpose };
-  if (kind === 'service') return { kind: 'service', id, tenantId, purpose };
-  return { kind: 'system', id, tenantId, purpose };
+  if (kind === 'agent') return Object.freeze({ kind: 'agent', id, purpose });
+  if (kind === 'service') {
+    return Object.freeze({ kind: 'service', id, purpose });
+  }
+  return Object.freeze({ kind: 'system', id, purpose });
 }
 
 /**
- * Structural validation only. The TENANT binding is checked separately by
- * `assertExecutionPrincipal`, because "is this shaped like a principal" and "is
- * this principal allowed here" are different questions and conflating them
- * produces call sites that answer neither.
- *
  * This answers only "was a valid principal readable from this value". It does
  * NOT promise a later plain read returns what was validated — nothing can, for
  * an object built to lie. Anything that goes on to USE the fields must take
@@ -343,30 +345,48 @@ export function isExecutionPrincipal(
 }
 
 /**
- * Validate a principal AND bind it to the tenant that is about to act on it.
- *
- * `tenantId` on a decoded principal crosses an authentication boundary exactly
- * as `ApprovalActor.tenantId` does — the type says `string`, and the type system
- * has no authority over a value read back out of D1 or a DO's storage.
- *
- * Returns the canonical snapshot, not the argument: the tenant that was
- * compared and the tenant the caller goes on to use are then the same string.
+ * Validate a principal and return the canonical snapshot rather than the
+ * caller's potentially mutable value.
  */
 export function assertExecutionPrincipal(
   value: unknown,
-  expectedTenantId: string,
   label: string,
 ): ExecutionPrincipal {
   const principal = canonicalPrincipal(value);
   if (principal === undefined) {
     throw new Error(`execution principal: ${label} is malformed`);
   }
-  if (principal.tenantId !== expectedTenantId) {
-    throw new Error(
-      `execution principal: ${label} belongs to tenant '${principal.tenantId}', not '${expectedTenantId}'`,
-    );
-  }
   return principal;
+}
+
+/**
+ * Canonicalize an authenticated human identity without reusing caller-owned
+ * objects or accessors after validation.
+ */
+export function canonicalApprovalActor(
+  value: unknown,
+): ApprovalActor | undefined {
+  if (value === null || typeof value !== 'object') return undefined;
+  const id = ownField(value, 'id');
+  const role = ownField(value, 'role');
+  if (
+    !isExecutionPrincipalId(id) ||
+    typeof role !== 'string' ||
+    !(APPROVAL_ROLES as readonly string[]).includes(role)
+  ) {
+    return undefined;
+  }
+  return Object.freeze({ id, role: role as ApprovalRole });
+}
+
+/** Validate an authenticated human identity and return its canonical snapshot. */
+export function assertApprovalActor(
+  value: unknown,
+  label: string,
+): ApprovalActor {
+  const actor = canonicalApprovalActor(value);
+  if (!actor) throw new Error(`approval actor: ${label} is malformed`);
+  return actor;
 }
 
 /**
@@ -380,7 +400,7 @@ export function samePrincipal(
   left: ExecutionPrincipal,
   right: ExecutionPrincipal,
 ): boolean {
-  if (left.id !== right.id || left.tenantId !== right.tenantId) return false;
+  if (left.id !== right.id) return false;
   if (left.kind === 'human' || right.kind === 'human') {
     return (
       left.kind === 'human' &&
@@ -418,7 +438,7 @@ export const AUTOMATED_PROJECTED_ROLE: ApprovalRole = 'viewer';
  */
 export function principalActor(principal: ExecutionPrincipal): ApprovalActor {
   const { id, role } = breakwaterActorFor(principal);
-  return { id, role, tenantId: principal.tenantId };
+  return Object.freeze({ id, role });
 }
 
 /**
@@ -462,15 +482,14 @@ export function encodeExecutionPrincipal(
 }
 
 /**
- * Rebuild a principal from the trusted header, binding it to the tenant the DO
- * already authenticated. Fields are picked EXPLICITLY rather than spread, so an
- * attacker-supplied extra property cannot ride into DO storage or D1.
+ * Rebuild a principal from the trusted header. Fields are picked EXPLICITLY
+ * rather than spread, so an attacker-supplied extra property cannot ride into
+ * DO storage or D1.
  *
  * Returns undefined on anything malformed; the caller fails closed.
  */
 export function decodeExecutionPrincipal(
   header: string,
-  tenantId: string,
 ): ExecutionPrincipal | undefined {
   let parsed: unknown;
   try {
@@ -482,27 +501,26 @@ export function decodeExecutionPrincipal(
   const fields = parsed as Record<string, unknown>;
   const candidate =
     fields.kind === 'human'
-      ? { kind: 'human', id: fields.id, tenantId, role: fields.role }
+      ? { kind: 'human', id: fields.id, role: fields.role }
       : {
           kind: fields.kind,
           id: fields.id,
-          tenantId,
           purpose: fields.purpose,
           ...(fields.delegatedBy !== undefined
             ? { delegatedBy: fields.delegatedBy }
             : {}),
         };
-  return isExecutionPrincipal(candidate) ? candidate : undefined;
+  return canonicalPrincipal(candidate);
 }
 
 /** An authenticated human at the HTTP boundary, as an execution principal. */
 export function humanPrincipal(actor: ApprovalActor): ExecutionPrincipal {
-  return {
+  const canonical = assertApprovalActor(actor, 'human principal');
+  return Object.freeze({
     kind: 'human',
-    id: actor.id,
-    tenantId: actor.tenantId,
-    role: actor.role,
-  };
+    id: canonical.id,
+    role: canonical.role,
+  });
 }
 
 /** Correlation fields carried into every audit event for this principal. */

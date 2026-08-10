@@ -1,28 +1,32 @@
 {
   "$schema": "https://unpkg.com/wrangler/config-schema.json",
-  "name": "anchorage-showcase",
+  // The cutover script name creates fresh Durable Object namespaces and keeps
+  // the pre-cutover anchorage-showcase script addressable for rollback.
+  "name": "anchorage-showcase-single-tenant",
   "main": "./worker/worker.ts",
   // esbuild bundles the worker with these paths, so flowsafe + breakwater
   // bundle from SOURCE — wrangler dev/deploy need no prior dist build.
   "tsconfig": "./tsconfig.worker.json",
-  "compatibility_date": "2025-06-01",
+  "compatibility_date": "2026-07-26",
   "compatibility_flags": ["nodejs_compat"],
+  "secrets": {
+    "required": ["DEPLOYMENT_IDENTITY_SECRET"]
+  },
   // The account hosting the proofoftech.org zone (the custom domain below
   // must live on the same account). Pinned because the deploying identity
   // has access to more than one account.
   "account_id": "056cbaa6f5c3d8ff5584f1aa84bbe050",
-  // The ONLY public origin. The OAuth callback is registered for exactly this
-  // origin (the worker derives redirect_uri from url.origin), so a second
-  // reachable host would half-work: API yes, sign-in no. workers_dev off
-  // keeps the origin single — and the SPA carries a TEMPORARY noindex robots
-  // meta (index.html) until the demo should be indexable. Prerequisite:
-  // proofoftech.org must be a zone on this Cloudflare account.
-  "workers_dev": false,
-  "routes": [{ "pattern": "anchorage.proofoftech.org", "custom_domain": true }],
+  // Staging posture for the physical-isolation cutover: deploy the new script
+  // at its workers.dev URL and verify it before moving the custom-domain route.
+  // At cutover, set this false and add the anchorage.proofoftech.org custom
+  // domain route in the same deploy. The old anchorage-showcase script keeps
+  // its original database and DO namespaces as the rollback bundle.
+  "workers_dev": true,
   // The worker emits structured JSON (audit + maintenance + connector previews)
   // to Workers Logs.
   "observability": { "enabled": true },
-  // RUNNER: one DO per run (workflow execution). HUB: one DO per tenant (live
+  // RUNNER: one DO per run (workflow execution). HUB: one deployment singleton
+  // (live
   // stream fan-out). Every stream route lives under /api/stream/, which the
   // /api/* run_worker_first entry below already routes to the Worker, so no
   // assets edit is needed.
@@ -41,12 +45,11 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "anchorage-showcase",
-      // Local `wrangler dev` creates a local SQLite automatically. Tables are
-      // created lazily by the stores; no migration files needed. This id is
-      // the live anchorage.proofoftech.org database (`wrangler d1 create
-      // anchorage-showcase` on the account above).
-      "database_id": "342fd280-2b62-4ae3-90ea-afb5133a8823"
+      "database_name": "anchorage-showcase-single-tenant",
+      // Intentional non-deployable placeholder. Create and seed a fresh
+      // physical-isolation database before replacing it; never bind this code
+      // to the former pooled showcase database.
+      "database_id": "00000000-0000-0000-0000-000000000000"
     }
   ],
   // Single-deploy: serve the built SPA (dist/) at / via Workers Static
@@ -63,8 +66,7 @@
       "/runs/*",
       "/healthz",
       "/workflows",
-      "/auth/*",
-      "/demo/*"
+      "/auth/*"
     ]
   },
   // The public demo runs REAL isolate CPU per visitor run. Cap it (Workers
@@ -87,20 +89,30 @@
   // kills the isolate un-catchably and a slow sweep would otherwise starve
   // the purge forever.
   "triggers": { "crons": ["*/15 * * * *", "7 * * * *"] },
-  // Optional audit export to a SIEM: `wrangler queues create showcase-audit`
-  // (and -dlq), uncomment, then set SIEM_ENDPOINT (var) + SIEM_AUTH_HEADER
-  // (secret). Without this block, audit stays on structured Workers Logs only.
+  // Optional audit export to a SIEM. These cutover-specific names keep the
+  // pre-cutover queues addressable for rollback. Create both queues, uncomment
+  // this block, then set SIEM_ENDPOINT (var) and SIEM_AUTH_HEADER (secret).
+  // Without this block, audit stays on structured Workers Logs only.
+  //   wrangler queues create anchorage-showcase-single-tenant-audit
+  //   wrangler queues create anchorage-showcase-single-tenant-audit-dlq
   // "queues": {
-  //   "producers": [{ "binding": "AUDIT_QUEUE", "queue": "showcase-audit" }],
+  //   "producers": [
+  //     {
+  //       "binding": "AUDIT_QUEUE",
+  //       "queue": "anchorage-showcase-single-tenant-audit"
+  //     }
+  //   ],
   //   "consumers": [
   //     {
-  //       "queue": "showcase-audit",
+  //       "queue": "anchorage-showcase-single-tenant-audit",
   //       "max_retries": 10,
-  //       "dead_letter_queue": "showcase-audit-dlq"
+  //       "dead_letter_queue": "anchorage-showcase-single-tenant-audit-dlq"
   //     }
   //   ]
   // },
   "vars": {
+    // Must match the flowsafe_deployment sentinel provisioned in D1.
+    "DEPLOYMENT_TENANT": "showcase",
     "APPROVAL_SLA_SECONDS": "14400",
     "RUN_RETENTION_DAYS": "30",
     // Separation of duties: relax it for `admin` only, so a single operator can
@@ -113,9 +125,9 @@
     // Public-demo tuning (ops-tunable without a code change). The DAILY cap
     // is the spend backstop — per-identity limits are a speed bump against N
     // free accounts, so size this for tolerable spend, not expected traffic.
-    "DEMO_TENANT_RUN_CAP": "20",
+    "DEMO_SESSION_RUN_CAP": "20",
     "DEMO_DAILY_RUN_CAP": "500",
-    "DEMO_TENANT_TTL_HOURS": "24",
+    "DEMO_SESSION_TTL_HOURS": "24",
     "DEMO_JWT_TTL_SECONDS": "3600",
     // The launch OAuth provider is GOOGLE (worker.ts prefers it when both
     // are configured; GitHub remains a config-only fallback). The Google
@@ -130,6 +142,8 @@
     // "SIEM_ENDPOINT": "https://siem.example/services/collector"
   }
   // Secrets (set with `wrangler secret put <name>`):
+  //   DEPLOYMENT_IDENTITY_SECRET — REQUIRED; at least 32 random visible ASCII characters.
+  //     Shared only by this deployment's Worker and Durable Objects.
   //   APPROVAL_ACTOR_TOKENS — operator/admin bearer map. Deliberately NOT a
   //     var here: no credentials are baked into a deployable config, so a
   //     deploy without secrets 401s everywhere (fail closed). Local dev reads

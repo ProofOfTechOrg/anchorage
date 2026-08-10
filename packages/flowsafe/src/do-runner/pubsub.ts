@@ -42,7 +42,7 @@ export type HostPubSub = PubSub;
  *
  * A host opts in with `init(env, { pubsub: createHostPubSub() })`, the same
  * instance-or-absent shape every other InitOptions seam takes (`storage`,
- * `resumeLedger`, `requestContextForRun`).
+ * `requestContextForRun`).
  */
 export function createHostPubSub(): HostPubSub {
   return new EventEmitterPubSub();

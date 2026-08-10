@@ -6,22 +6,26 @@ import {
   createAgentThreadTopology,
 } from '@proofoftech/flowsafe/agent-host';
 import {
-  RUN_START_ROLES,
-  type TenantContext,
-  TenantResolutionError,
-  type TenantResolver,
+  type ActorResolver,
+  encodeExecutionPrincipal,
 } from '@proofoftech/flowsafe/approval-api';
+import {
+  deploymentIdentityHeaders,
+  EXECUTION_PRINCIPAL_HEADER,
+} from '@proofoftech/flowsafe/do-runner';
 import { createObjectiveRouter } from '@proofoftech/flowsafe/goals';
 import {
   createDoRunTopology,
   createFlowsafeWorker,
   createThreadTopology,
+  queueApprovalForSuspension,
   RunRouteError,
-  withSubdomainCrossCheck,
 } from '@proofoftech/flowsafe/host-kit';
 import {
   createScheduleRouter,
+  createScheduleTargetPolicy,
   createScheduleTick,
+  parseScheduleAgentDispatchReceipt,
 } from '@proofoftech/flowsafe/schedules';
 import {
   createSignalProviderHostTopology,
@@ -41,11 +45,12 @@ import {
   githubResourceAllowed,
   PURGE_CRON,
   SWEEP_CRON,
-  SYSTEM_ACTOR_ID,
+  SYSTEM_PRINCIPAL_ID,
   signalAttributeAllowlist,
   TICK_CRON,
 } from './config.js';
 import {
+  BACKGROUND_TASKS_INSTANCE_NAME,
   StarterBackgroundTasks,
   StarterHub,
   StarterRunner,
@@ -53,12 +58,16 @@ import {
   StarterThread,
 } from './durable-objects.js';
 import {
+  contextForRegisteredResources,
+  contextForResourceOwner,
+  systemContext,
+} from './principal-context.js';
+import {
   notificationsStore,
   schedulesStore,
   subscriptionStoreFactory,
   threadStateStore,
 } from './storage.js';
-import { systemTenant, tenantForPrincipal } from './system-tenant.js';
 import { WORKFLOWS } from './workflows.js';
 
 export {
@@ -70,6 +79,10 @@ export {
 };
 
 const github = githubSignalProvider();
+const scheduleTargetPolicy = createScheduleTargetPolicy({
+  workflows: WORKFLOWS,
+  agents: [STARTER_AGENT_META],
+});
 const signalRateLimit = createInMemorySignalRateLimiter({
   limit: 120,
   windowMs: 60_000,
@@ -83,14 +96,6 @@ function json(payload: unknown, status = 200): Response {
   return Response.json(payload, { status });
 }
 
-function decoded(value: string): string | undefined {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return undefined;
-  }
-}
-
 function audit(event: unknown): void {
   console.log(JSON.stringify(event));
 }
@@ -100,8 +105,12 @@ function webhookRouter(env: Env) {
   if (!router) {
     router = createWebhookRouter({
       providers: { github },
-      subscriptions: subscriptionStoreFactory(env.DB).system(),
-      topology: createThreadTopology(env.THREAD),
+      subscriptions: subscriptionStoreFactory(env.DB).store(),
+      topology: createThreadTopology(
+        env.THREAD,
+        env.DEPLOYMENT_IDENTITY_SECRET,
+      ),
+      deploymentTag: env.DEPLOYMENT_TENANT,
       secretForProvider: (providerId) =>
         providerId === 'github' ? env.GITHUB_WEBHOOK_SECRET : undefined,
       audit,
@@ -114,130 +123,83 @@ function webhookRouter(env: Env) {
 async function handleBackgroundRoutes(
   request: Request,
   env: Env,
-  resolve: TenantResolver,
+  resolve: ActorResolver,
 ): Promise<Response | null> {
   const url = new URL(request.url);
   const prefix = '/api/background-tasks';
   if (url.pathname !== prefix && !url.pathname.startsWith(`${prefix}/`)) {
     return null;
   }
-  const tenant = await resolve(request);
-  if (!tenant) return json({ error: 'authentication required' }, 401);
+  const context = await resolve(request);
+  if (!context) return json({ error: 'authentication required' }, 401);
   if (request.method !== 'GET') {
     return json({ error: 'method not allowed' }, 405);
   }
-  const id = env.BACKGROUND_TASKS.idFromName(tenant.tenantId);
+  const id = env.BACKGROUND_TASKS.idFromName(BACKGROUND_TASKS_INSTANCE_NAME);
   const target = new URL(request.url);
   target.pathname = `/background-tasks${url.pathname.slice(prefix.length)}`;
   const headers = new Headers(request.headers);
   headers.delete('authorization');
+  headers.set(
+    EXECUTION_PRINCIPAL_HEADER,
+    encodeExecutionPrincipal(context.principal),
+  );
+  const stampedHeaders = deploymentIdentityHeaders(
+    env.DEPLOYMENT_IDENTITY_SECRET,
+    headers,
+  );
   const forwarded = new Request(target, {
     method: 'GET',
-    headers,
+    headers: stampedHeaders,
     redirect: request.redirect,
   });
   return env.BACKGROUND_TASKS.get(id).fetch(forwarded);
 }
 
-function subscriptionResolver(
-  env: Env,
-  resolve: TenantResolver,
-): TenantResolver {
-  return async (request) => {
-    const tenant = await resolve(request);
-    if (!tenant || request.method !== 'POST') return tenant;
-
-    const segments = new URL(request.url).pathname.split('/').filter(Boolean);
-    if (
-      segments.length !== 4 ||
-      segments[0] !== 'api' ||
-      segments[1] !== 'threads' ||
-      segments[3] !== 'subscriptions'
-    ) {
-      return tenant;
-    }
-    const threadId = decoded(segments[2] ?? '');
-    if (
-      !threadId ||
-      !RUN_START_ROLES.includes(tenant.actor.role) ||
-      !tenant.ownsMemoryId(threadId)
-    ) {
-      return tenant;
-    }
-    const constrainedTenant: TenantContext = {
-      ...tenant,
-      newResourceId: (resourceKey) => {
-        if (resourceKey !== threadId) {
-          throw new RunRouteError(
-            400,
-            'resourceKey must equal the threadId in this starter',
-          );
-        }
-        return tenant.newResourceId(resourceKey);
-      },
-    };
-
-    const body = await request
-      .clone()
-      .json<unknown>()
-      .catch(() => undefined);
-    if (
-      typeof body !== 'object' ||
-      body === null ||
-      Array.isArray(body) ||
-      !('providerId' in body) ||
-      body.providerId !== 'github' ||
-      !('externalResourceId' in body) ||
-      typeof body.externalResourceId !== 'string'
-    ) {
-      return constrainedTenant;
-    }
-    if (!githubResourceAllowed(env, tenant.tenantId, body.externalResourceId)) {
-      audit({
-        type: 'signal-provider.subscription',
-        tenantId: tenant.tenantId,
-        actorId: tenant.actor.id,
-        threadId,
-        action: 'subscribe',
-        outcome: 'rejected',
-        providerId: 'github',
-        externalResourceId: body.externalResourceId,
-        reason: 'external-resource-not-owned',
-        timestamp: new Date().toISOString(),
-      });
-      throw new TenantResolutionError(
-        'the external resource is not provisioned for this tenant',
-      );
-    }
-    return constrainedTenant;
-  };
-}
-
 const worker = createFlowsafeWorker<Env>({
   workflows: WORKFLOWS,
-  systemActorId: SYSTEM_ACTOR_ID,
+  systemPrincipalId: SYSTEM_PRINCIPAL_ID,
   buildVerifier,
   crons: {
     sweep: SWEEP_CRON,
     purge: PURGE_CRON,
     tick: TICK_CRON,
   },
-  wrapResolve: (resolve, env) =>
-    env.TENANT_APEX_DOMAIN
-      ? withSubdomainCrossCheck(resolve, {
-          apexDomain: env.TENANT_APEX_DOMAIN,
-        })
-      : resolve,
   preRoutes: async (request, env, _ctx, kit) => {
     const webhook = await webhookRouter(env)(request);
     if (webhook) return webhook;
 
     const subscriptions = await createSubscriptionRouter({
-      resolve: subscriptionResolver(env, kit.resolve),
+      resolve: kit.resolve,
       subscriptions: subscriptionStoreFactory(env.DB),
+      validateThreadTarget: createAgentThreadTopology(
+        env.THREAD,
+        env.DEPLOYMENT_IDENTITY_SECRET,
+      ).requireBoundThread,
       knownProviders: ['github'],
+      authorizeMutation: ({
+        method,
+        threadId,
+        externalResourceId,
+        resourceKey,
+      }) => {
+        if (method !== 'POST') return;
+        if (resourceKey !== threadId) {
+          throw new RunRouteError(
+            400,
+            'resourceKey must equal the threadId in this starter',
+          );
+        }
+        if (!githubResourceAllowed(env, externalResourceId)) {
+          throw new RunRouteError(
+            403,
+            'the external resource is not provisioned for this deployment',
+          );
+        }
+      },
       reconcilePolling: createSignalProviderHostTopology(
         env.SIGNAL_PROVIDER_HOST,
+        env.DEPLOYMENT_IDENTITY_SECRET,
       ).reconcilePolling,
       audit,
     })(request);
@@ -251,19 +213,38 @@ const worker = createFlowsafeWorker<Env>({
     createAgentRouter({
       agents: [STARTER_AGENT_META],
       resolve,
-      topology: createAgentThreadTopology(env.THREAD),
+      topology: createAgentThreadTopology(
+        env.THREAD,
+        env.DEPLOYMENT_IDENTITY_SECRET,
+      ),
     }),
   buildResumeRun: (fallback, env) =>
     createAgentApprovalResumer({
       fallback,
       agents: [STARTER_AGENT_META],
-      topology: createAgentThreadTopology(env.THREAD),
-      tenantForPrincipal: (principal) => tenantForPrincipal(env, principal),
+      topology: createAgentThreadTopology(
+        env.THREAD,
+        env.DEPLOYMENT_IDENTITY_SECRET,
+      ),
+      contextForPrincipal: (principal, record) => {
+        const target = record.resumeTarget;
+        if (target?.kind !== 'agent-thread') {
+          throw new Error('agent approval has no registered thread target');
+        }
+        return contextForRegisteredResources(env, principal, [
+          { kind: 'thread', resourceId: target.threadId },
+          { kind: 'resource', resourceId: target.resourceId },
+          { kind: 'run', resourceId: record.runId },
+        ]);
+      },
     }),
   buildSignalRouter: (resolve, env) =>
     createSignalRouter({
       resolve,
-      topology: createThreadTopology(env.THREAD),
+      topology: createThreadTopology(
+        env.THREAD,
+        env.DEPLOYMENT_IDENTITY_SECRET,
+      ),
       attributeAllowlist: signalAttributeAllowlist(env),
       rateLimit: signalRateLimit,
       audit,
@@ -272,6 +253,10 @@ const worker = createFlowsafeWorker<Env>({
     createObjectiveRouter({
       resolve,
       store: threadStateStore(env.DB),
+      validateThreadTarget: createAgentThreadTopology(
+        env.THREAD,
+        env.DEPLOYMENT_IDENTITY_SECRET,
+      ).requireBoundThread,
       maxRunsCap: 50,
       audit,
     }),
@@ -279,51 +264,211 @@ const worker = createFlowsafeWorker<Env>({
     createScheduleRouter({
       resolve,
       store: schedulesStore(env.DB),
-      maxSchedulesPerTenant: 100,
+      targetPolicy: scheduleTargetPolicy,
+      validateThreadTarget: createAgentThreadTopology(
+        env.THREAD,
+        env.DEPLOYMENT_IDENTITY_SECRET,
+      ).requireBoundThread,
+      maxSchedules: 100,
       minFireIntervalMs: 60_000,
       audit,
     }),
   scheduleTick: (env) => {
-    const runTopology = createDoRunTopology(env.RUNNER);
-    const threadTopology = createThreadTopology(env.THREAD);
-    const agentTopology = createAgentThreadTopology(env.THREAD);
+    const runTopology = createDoRunTopology(
+      env.RUNNER,
+      env.DEPLOYMENT_IDENTITY_SECRET,
+    );
+    const threadTopology = createThreadTopology(
+      env.THREAD,
+      env.DEPLOYMENT_IDENTITY_SECRET,
+    );
+    const agentTopology = createAgentThreadTopology(
+      env.THREAD,
+      env.DEPLOYMENT_IDENTITY_SECRET,
+    );
     const schedules = createScheduleTick({
       store: schedulesStore(env.DB),
-      start: runTopology.start,
+      targetPolicy: scheduleTargetPolicy,
+      start: async ({
+        workflowId,
+        runId,
+        inputData,
+        scheduleId,
+        dispatchId,
+      }) => {
+        const context = await contextForResourceOwner(
+          env,
+          'schedule',
+          scheduleId,
+          'schedule.fire',
+        );
+        const summary = await runTopology.start({
+          workflowId,
+          runId,
+          inputData,
+          principal: context.principal,
+          scheduleId,
+          dispatchId,
+        });
+        if (summary.status === 'suspended') {
+          try {
+            await queueApprovalForSuspension(
+              context.service(),
+              workflowId,
+              summary,
+              context.principal.id,
+              SYSTEM_PRINCIPAL_ID,
+            );
+          } catch (error) {
+            console.error(
+              JSON.stringify({
+                type: 'scheduled-approval-filing-error',
+                workflowId,
+                runId,
+                error: error instanceof Error ? error.message : String(error),
+              }),
+            );
+          }
+        }
+        return summary;
+      },
+      deploymentTag: env.DEPLOYMENT_TENANT,
       startAgent: async ({
+        scheduleId,
+        dispatchId,
         target,
-        tenantId,
         runId,
         topologyThreadId,
         threaded,
         entryPath,
         requestContext,
         streamRequestContext,
+        providerOptions,
       }) => {
-        const started = await agentTopology.start(systemTenant(env, tenantId), {
+        const context = await contextForResourceOwner(
+          env,
+          'schedule',
+          scheduleId,
+          'schedule.fire',
+        );
+        const started = await agentTopology.start(context, {
           agentId: target.agentId,
           runId,
           prompt: target.prompt,
           entryPath,
+          scheduleId,
+          dispatchId,
           threaded,
           requestContext,
           streamRequestContext,
+          providerOptions,
           ...(threaded
             ? {
-                threadId: topologyThreadId,
+                threadId: target.threadId,
                 resourceId: target.resourceId,
               }
-            : {}),
+            : { topologyThreadId }),
         });
         return { runId: started.runId };
+      },
+      signalAgent: async ({ scheduleId, target, dispatchId, runId }) => {
+        if (!target.threadId || !target.resourceId) {
+          throw new Error('threaded schedule signal requires memory ids');
+        }
+        const context = await contextForResourceOwner(
+          env,
+          'schedule',
+          scheduleId,
+          'schedule.fire',
+        );
+        const response = await threadTopology.send(
+          context,
+          target.threadId,
+          '/signal/schedule',
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              scheduleId,
+              dispatchId,
+              runId,
+            }),
+          },
+        );
+        if (!response.ok) {
+          throw new RunRouteError(
+            response.status,
+            `agent schedule signal failed with status ${response.status}`,
+          );
+        }
+        const payload = (await response.json()) as { receipt?: unknown };
+        const receipt = parseScheduleAgentDispatchReceipt(payload.receipt);
+        if (!receipt)
+          throw new Error('agent schedule returned no valid receipt');
+        return receipt;
+      },
+      status: async (ref) => {
+        const context = await contextForResourceOwner(
+          env,
+          'schedule',
+          ref.scheduleId,
+          'schedule.fire',
+        );
+        if (ref.target === 'workflow') {
+          const summary = await runTopology.dispatchStatus(
+            ref.workflowId,
+            ref.runId,
+          );
+          if (summary?.status === 'suspended') {
+            try {
+              await queueApprovalForSuspension(
+                context.service(),
+                ref.workflowId,
+                summary,
+                context.principal.id,
+                SYSTEM_PRINCIPAL_ID,
+              );
+            } catch (error) {
+              console.error(
+                JSON.stringify({
+                  type: 'scheduled-approval-filing-error',
+                  workflowId: ref.workflowId,
+                  runId: ref.runId,
+                  error: error instanceof Error ? error.message : String(error),
+                }),
+              );
+            }
+          }
+          return summary;
+        }
+        if (ref.mode === 'signal') {
+          const state = await schedulesStore(env.DB).agentScheduleDispatchState(
+            ref.scheduleId,
+            ref.dispatchId,
+          );
+          if (state.state === 'settled') {
+            return {
+              runId: state.receipt.runId,
+              dispatchReceipt: state.receipt,
+            };
+          }
+          if (state.state === 'pending') {
+            throw new Error('agent schedule dispatch remains pending');
+          }
+          return undefined;
+        }
+        return agentTopology.dispatchStatus(context, {
+          agentId: ref.agentId,
+          threadId: ref.threadId,
+          runId: ref.runId,
+        });
       },
       audit,
     });
     const notifications = createNotificationDispatchTick({
       storage: notificationsStore(env.DB),
       topology: threadTopology,
-      resolveTenant: (tenantId) =>
-        systemTenant(env, tenantId, 'notification-dispatch'),
+      resolveContext: () => systemContext(env, 'notification-dispatch'),
       limit: 100,
     });
     return async () => ({

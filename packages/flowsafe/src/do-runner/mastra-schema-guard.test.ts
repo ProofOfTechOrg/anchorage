@@ -3,33 +3,18 @@
 // on, exercised against the REAL @mastra/cloudflare-d1 D1Store over real
 // SQLite (node:sqlite):
 //
-// 1. TABLE INVENTORY — createD1Storage eagerly creates the tables MASTRA_TABLES
-//    names, and INV-1 covers exactly one by itself (mastra_workflow_snapshot,
-//    keyed by run_id). The rest are keyed by ids INV-1 does not salt. The
-//    tenancy decision this pin used to force is MADE for the memory tables and
-//    its chokepoints shipped (docs/agent-memory-tenancy.md): memory-id.ts mints
-//    salted threadId/resourceId values, TenantContext exposes them, and
-//    purgeTenant range-deletes them.
+// 1. TABLE INVENTORY — createD1Storage eagerly creates exactly the tables
+//    MASTRA_TABLES names. A dependency bump that adds or renames one must make
+//    its lifecycle decision explicit here.
 //
 //    The inventory is a STRUCTURE, not a name list (DL-003): each entry states
-//    how purgeTenant reaps that table, so a track ADOPTING a domain appends its
-//    row here and the guard below makes the omissions loud — an adopted table
-//    with no purge coverage fails, and a table Mastra adds that nobody declared
-//    fails. A @mastra/core bump changing the inventory (a new table, a rename)
-//    must fail CI and re-open the tenancy review, never silently ship.
+//    whether the product adopts that table and how its rows expire. A
+//    @mastra/core bump changing the inventory must fail CI and reopen the
+//    persistence review, never silently ship.
 //
-// 2. SCHEMA GUARD — purgeTenant's range DELETEs, the thread TTL, and the
-//    app-owned index depend on Mastra's column names: snake_case `run_id` on the
-//    snapshot table, `id`/`resourceId`/`thread_id` on the memory tables, and
-//    `updatedAt` on mastra_threads (purgeExpiredThreads keys the TTL on it). A
-//    @mastra/core bump renaming any of them must fail here, not in a
-//    cross-tenant purge or a silently-inert retention duty.
-//
-// 3. PURGE-VS-RESUME RACE — purgeTenant deletes SUSPENDED rows; a reviewer
-//    approving at that moment resumes against a vanished row. Pin the
-//    absorbed outcome: the resume FAILS (no snapshot), the gated step does
-//    NOT re-execute, and the resume attempt does not re-create a snapshot
-//    row (re-execution from scratch would replay side effects).
+// 2. SCHEMA GUARD — retention jobs and app-owned indexes depend on Mastra's
+//    column names and encodings. A @mastra/core bump renaming any of them must
+//    fail here instead of silently disabling maintenance.
 
 import type { MastraCompositeStore } from '@mastra/core/storage';
 import { InMemoryStore } from '@mastra/core/storage';
@@ -43,41 +28,18 @@ import {
 } from '../../test-support/sqlite.js';
 import { createScheduleStorageDomains } from '../schedules/storage.js';
 import { createSignalStorageDomains } from '../signals/storage.js';
-import type { SnapshotDatabase, SnapshotStatement } from './d1-storage.js';
 import {
   BACKGROUND_TASK_TTL_PURGE_TABLES,
   createD1Storage,
   NOTIFICATION_TTL_PURGE_TABLES,
-  purgeTenant,
   RUN_TTL_PURGE_TABLES,
   SCHEDULE_TRIGGER_TTL_PURGE_TABLES,
-  TENANT_METADATA_PURGE_TABLES,
-  TENANT_RANGE_PURGE_TABLES,
   THREAD_STATE_TTL_PURGE_TABLES,
   THREAD_TTL_PURGE_TABLES,
 } from './d1-storage.js';
 import { init } from './init.js';
-import { mintResourceId, mintThreadId } from './memory-id.js';
+import { mintThreadId, resourceIdFromKey } from './memory-id.js';
 import type { RunnerRuntime } from './runtime.js';
-
-/** The SnapshotDatabase view over the same sqlite handle (for purgeTenant). */
-function snapshotDb(db: SqliteDatabase): SnapshotDatabase {
-  function statement(sql: string, params: unknown[]): SnapshotStatement {
-    return {
-      bind: (...values: unknown[]) => statement(sql, values),
-      run: async () => {
-        const outcome = db.prepare(sql).run(...params) as {
-          changes?: number | bigint;
-        };
-        return { meta: { changes: Number(outcome?.changes ?? 0) } };
-      },
-      all: async <T>() => ({
-        results: db.prepare(sql).all(...params) as T[],
-      }),
-    };
-  }
-  return { prepare: (sql: string) => statement(sql, []) };
-}
 
 function tableNames(db: SqliteDatabase): string[] {
   return (
@@ -89,12 +51,8 @@ function tableNames(db: SqliteDatabase): string[] {
   ).map((row) => row.name);
 }
 
-// A gated workflow over the given storage; counts post-approval executions.
-function buildGated(storage: MastraCompositeStore): {
-  runtime: RunnerRuntime;
-  gateRuns: () => number;
-} {
-  let gateRuns = 0;
+// A gated workflow over the given storage.
+function buildGated(storage: MastraCompositeStore): RunnerRuntime {
   const { createWorkflow, createStep, runtime } = init({ storage });
   const gate = createStep({
     id: 'gate',
@@ -104,7 +62,6 @@ function buildGated(storage: MastraCompositeStore): {
     resumeSchema: z.object({ go: z.boolean() }),
     execute: async ({ resumeData, suspend }) => {
       if (!resumeData) return suspend({ reason: 'wait' });
-      gateRuns += 1;
       return {};
     },
   });
@@ -115,31 +72,20 @@ function buildGated(storage: MastraCompositeStore): {
   })
     .then(gate)
     .commit();
-  return { runtime, gateRuns: () => gateRuns };
+  return runtime;
 }
 
 /**
- * How purgeTenant reaps a Mastra table AT OFFBOARDING:
- * - 'run-id-range': the snapshot table's own block (INV-1 salted run_id).
- * - 'tenant-range': TENANT_RANGE_PURGE_TABLES (salted thread/resource ids).
- * - 'metadata-tenant': TENANT_METADATA_PURGE_TABLES (Track D schedules — the
- *   tenant is a JSON metadata.tenantId, since ids are slugified not salted, so the
- *   salted range predicate cannot reach them).
- * - 'unadopted': no feature writes it, so no id in it is salted yet. Adopting
- *   one means salting its ids and moving it to 'tenant-range' in the SAME
- *   change (DL-003) — the guard below is what makes that non-optional.
+ * Whether the single-deployment runtime owns rows in a Mastra table. An
+ * unadopted domain carries no product data; adopting it must define retention
+ * in the same change.
  */
-type PurgeCoverage =
-  | 'run-id-range'
-  | 'tenant-range'
-  | 'metadata-tenant'
-  | 'unadopted';
+type StorageOwnership = 'deployment-wide' | 'unadopted';
 
 /**
- * How a table's rows EXPIRE SHORT of offboarding — DL-003's third leg, and the
- * one a track is likeliest to skip: a table can be perfectly tenant-purgeable
- * and still grow forever, which is half the failure DL-003 names ("a
- * tenant-unpurgeable OR never-expiring table").
+ * How a table's rows expire. This is the lifecycle decision a new Mastra table
+ * is likeliest to omit: a table can be adopted successfully and still grow
+ * forever.
  *
  * `none` demands a REASON in the type. That is the whole mechanism: "we decided
  * this table needs no TTL, because X" and "nobody thought about it" are
@@ -172,60 +118,59 @@ type TtlKind =
   | 'schedule-trigger-ttl';
 
 describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
-  // The ONE reason an unadopted table carries — hoisted so the coverage↔reason
+  // The one reason an unadopted table carries — hoisted so the ownership↔reason
   // biconditional below can tie them: an unadopted table has nothing to expire
   // BECAUSE nothing writes it, so it carries exactly this, and the day a track
-  // flips its coverage to 'tenant-range' the tie forces retention off this
+  // becomes deployment-wide the tie forces retention off this
   // boilerplate in the SAME change (the DL-003 "all three legs together" bar).
   const UNADOPTED_NO_RETENTION =
     'unadopted — no feature writes it, so there is nothing to expire yet';
 
   const MASTRA_TABLES: ReadonlyArray<{
     table: string;
-    coverage: PurgeCoverage;
+    coverage: StorageOwnership;
     retention: RetentionStory;
   }> = [
     {
       table: 'mastra_background_tasks',
-      coverage: 'tenant-range',
+      coverage: 'deployment-wide',
       retention: { kind: 'background-task-ttl' },
     },
     {
       table: 'mastra_messages',
-      coverage: 'tenant-range',
+      coverage: 'deployment-wide',
       retention: { kind: 'cascade', with: 'mastra_threads' },
     },
     {
       table: 'mastra_notifications',
-      coverage: 'tenant-range',
+      coverage: 'deployment-wide',
       retention: { kind: 'notification-ttl' },
     },
     {
       table: 'mastra_resources',
-      coverage: 'tenant-range',
+      coverage: 'deployment-wide',
       retention: {
         kind: 'none',
         because:
-          "working memory is the OWNER's, shared across every thread they have, so one thread aging out says nothing about it — and a resource has no idleness signal of its own. Reaped at offboarding by purgeTenant",
+          "working memory is the owner's, shared across every thread they have, so one thread aging out says nothing about it; the resource is deleted explicitly with its owner",
       },
     },
-    // Track D — both metadata-tenant (their tenant is a JSON metadata.tenantId,
-    // since ids are slugified `agent_`/`schedule_`, not tenant-salted). Sorted:
+    // Track D tables. Sorted:
     // 'mastra_schedule_triggers' precedes 'mastra_schedules' under BINARY
     // collation ('_' 0x5F < 's' 0x73, the same order 'mastra_thread_state' <
     // 'mastra_threads' takes), and both precede 'mastra_scorers' ('sch' < 'sco').
     {
       table: 'mastra_schedule_triggers',
-      coverage: 'metadata-tenant',
+      coverage: 'deployment-wide',
       retention: { kind: 'schedule-trigger-ttl' },
     },
     {
       table: 'mastra_schedules',
-      coverage: 'metadata-tenant',
+      coverage: 'deployment-wide',
       retention: {
         kind: 'none',
         because:
-          'a schedule is standing config a tenant creates and deletes explicitly — it has no terminal state to age out; its fire HISTORY expires (mastra_schedule_triggers, schedule-trigger-ttl) but the config row is reaped only at offboarding by purgeTenant',
+          'a schedule is standing configuration deleted explicitly; it has no terminal state to age out, while its fire history expires through schedule-trigger-ttl',
       },
     },
     {
@@ -241,22 +186,22 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     // returns and the toEqual below pins.
     {
       table: 'mastra_thread_state',
-      coverage: 'tenant-range',
+      coverage: 'deployment-wide',
       retention: { kind: 'thread-state-ttl' },
     },
     {
       table: 'mastra_threads',
-      coverage: 'tenant-range',
+      coverage: 'deployment-wide',
       retention: { kind: 'thread-ttl' },
     },
     {
       table: 'mastra_workflow_snapshot',
-      coverage: 'run-id-range',
+      coverage: 'deployment-wide',
       retention: { kind: 'run-ttl' },
     },
   ];
 
-  it('createD1Storage creates EXACTLY the declared tables — an undeclared one is a tenancy decision, not a default', async () => {
+  it('createD1Storage creates exactly the declared deployment inventory', async () => {
     // #given — the real storage adapter over sqlite, WITH the Track C signal
     // domains composed (createD1Storage takes them injected — signals/ imports
     // do-runner, so do-runner cannot import back). @mastra/cloudflare-d1 ships no
@@ -271,7 +216,7 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
         ...createScheduleStorageDomains(binding as never),
       },
     });
-    const { runtime } = buildGated(storage);
+    const runtime = buildGated(storage);
 
     // #when — the workflow run triggers the adapter's six tables; init() then
     // creates the flowsafe-owned domain tables (signals' two + schedules' two —
@@ -280,20 +225,20 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     await storage.init();
 
     // #then — the exact inventory, pinned. A Mastra bump that adds a table (or
-    // a track that enables a domain) fails HERE until someone declares how the
-    // tenant purge covers it.
+    // a track that enables a domain) fails here until someone declares its
+    // ownership and retention.
     expect(tableNames(sqlite)).toEqual(
       MASTRA_TABLES.map((entry) => entry.table),
     );
   });
 
   it('every retention declaration is anchored to a REAL purge target (the exported inventories), not to intent', async () => {
-    // #given — DL-003's third leg: guard + purge + RETENTION land together, or a
-    // track ships a table that is tenant-purgeable and still grows forever. The
+    // #given — guard + retention land together, or a
+    // track ships a table that grows forever. The
     // type forces the DECLARATION; this pins that each declaration corresponds to
     // a purge that really deletes the table, by cross-checking the PRODUCTION
-    // inventories RUN_TTL_PURGE_TABLES / THREAD_TTL_PURGE_TABLES (exported from
-    // d1-storage and consumed here the way TENANT_RANGE_PURGE_TABLES already is) —
+    // inventories RUN_TTL_PURGE_TABLES / THREAD_TTL_PURGE_TABLES exported from
+    // d1-storage —
     // NOT literals copied into this test, which would drift from the SQL silently.
     //
     // A table is "accounted for" by a TTL if it declares that kind OR cascades
@@ -354,7 +299,7 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     }
   });
 
-  it("a 'none' retention carries a real reason, and 'unadopted' coverage is tied to it", async () => {
+  it("a 'none' retention carries a real reason, and unadopted ownership is tied to it", async () => {
     // #given — 'none' is the escape hatch, so it is where an undeclared decision
     // hides. The type demands the `because` KEY but cannot demand CONTENT, so a
     // blank string type-checks while saying nothing. Two guards close that.
@@ -367,10 +312,7 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
       ).toBeGreaterThan(20);
     }
 
-    // #then — 'unadopted' coverage and the unadopted retention reason move
-    // together: neither changes without the other. Flipping coverage to
-    // 'tenant-range' (adopting the table) forces retention off the boilerplate in
-    // the SAME change — DL-003's third leg mechanized rather than trusted.
+    // #then — ownership and the unadopted retention reason move together.
     for (const entry of MASTRA_TABLES) {
       const isUnadopted = entry.coverage === 'unadopted';
       const hasUnadoptedReason =
@@ -378,43 +320,9 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
         entry.retention.because === UNADOPTED_NO_RETENTION;
       expect(
         isUnadopted,
-        `${entry.table}: 'unadopted' coverage and the unadopted retention reason must move together`,
+        `${entry.table}: unadopted ownership and retention reason must move together`,
       ).toBe(hasUnadoptedReason);
     }
-  });
-
-  it('every table declared tenant-range IS in purgeTenant’s table list, and vice versa', async () => {
-    // #given — the DL-003 "same change" bar, mechanized: adopting a domain
-    // means salting its ids AND range-purging them. Declaring the coverage
-    // without wiring the purge would leave a tenant's rows unreachable at
-    // offboarding — a leak the inventory pin above cannot see, because the
-    // table was there all along.
-    const declared = MASTRA_TABLES.filter(
-      (entry) => entry.coverage === 'tenant-range',
-    ).map((entry) => entry.table);
-
-    // #when
-    const wired = TENANT_RANGE_PURGE_TABLES.map((entry) => entry.table);
-
-    // #then — set equality in both directions
-    expect(wired.slice().sort()).toEqual(declared.slice().sort());
-  });
-
-  it('every table declared metadata-tenant IS in purgeTenant’s metadata list, and vice versa', async () => {
-    // #given — the DL-003 "same change" bar for the SECOND offboarding kind:
-    // Track D schedules key on slugified ids, so they are reaped by a JSON
-    // metadata.tenantId filter, not the salted range. Declaring the coverage
-    // without wiring TENANT_METADATA_PURGE_TABLES would strand a tenant's schedule
-    // rows at offboarding — a leak the inventory pin cannot see (the table exists).
-    const declared = MASTRA_TABLES.filter(
-      (entry) => entry.coverage === 'metadata-tenant',
-    ).map((entry) => entry.table);
-
-    // #when
-    const wired = TENANT_METADATA_PURGE_TABLES.map((entry) => entry.table);
-
-    // #then — set equality in both directions
-    expect(wired.slice().sort()).toEqual(declared.slice().sort());
   });
 
   it('the Track D schedule tables keep the columns their purge + tick ride on (metadata + nextFireAt/actualFireAt)', async () => {
@@ -436,10 +344,9 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
         }[]
       ).map((column) => column.name);
 
-    // #then — purgeTenant metadata-filters BOTH over `metadata` (json_extract
-    // '$.tenantId'); listDueSchedules rides (status, nextFireAt) and the trigger
-    // TTL reaps by actualFireAt. These are OUR column names, so this pins US
-    // against a self-inflicted rename that would inert a purge or the tick.
+    // #then — listDueSchedules rides (status, nextFireAt) and the trigger TTL
+    // reaps by actualFireAt. These are our column names, so this pins us
+    // against a self-inflicted rename that would inert maintenance.
     expect(columnsOf('mastra_schedules')).toEqual(
       expect.arrayContaining(['metadata', 'status', 'nextFireAt']),
     );
@@ -462,15 +369,15 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     const storage = createD1Storage({
       binding: d1DatabaseLike(sqlite) as never,
     });
-    const { runtime } = buildGated(storage);
+    const runtime = buildGated(storage);
     await runtime.start('gated', { runId: 'abc_r1', inputData: {} });
     const memory = await storage.getStore('memory');
     if (!memory) throw new Error('D1Store exposes no memory domain');
     const now = new Date();
     await memory.saveThread({
       thread: {
-        id: mintThreadId('abc', () => 'thread-1'),
-        resourceId: mintResourceId('abc', 'user-1'),
+        id: mintThreadId(() => 'thread-1'),
+        resourceId: resourceIdFromKey('user-1'),
         title: 'conversation',
         createdAt: now,
         updatedAt: now,
@@ -490,13 +397,13 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     );
   });
 
-  it("mastra_workflow_snapshot still has the snake_case 'run_id' column purgeTenant's range predicate rides on", async () => {
+  it("mastra_workflow_snapshot still has the snake_case 'run_id' column retention rides on", async () => {
     // #given
     const sqlite = openSqlite();
     const storage = createD1Storage({
       binding: d1DatabaseLike(sqlite) as never,
     });
-    const { runtime } = buildGated(storage);
+    const runtime = buildGated(storage);
     await runtime.start('gated', { runId: 'abc_r1', inputData: {} });
 
     // #when
@@ -506,8 +413,7 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
       }[]
     ).map((column) => column.name);
 
-    // #then — run_id (snake_case) present; a Mastra bump renaming it fails
-    // HERE, not in a cross-tenant purge
+    // #then — run_id (snake_case) present; a Mastra bump renaming it fails here
     expect(columns).toContain('run_id');
     expect(columns).toContain('workflow_name');
   });
@@ -518,7 +424,7 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     const storage = createD1Storage({
       binding: d1DatabaseLike(sqlite) as never,
     });
-    const { runtime } = buildGated(storage);
+    const runtime = buildGated(storage);
     await runtime.start('gated', { runId: 'abc_r1', inputData: {} });
 
     // #when
@@ -528,10 +434,8 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
       }[]
     ).map((column) => column.name);
 
-    // #then — purgeTenant ranges over run_id (snake_case, the originating run's
-    // INV-1 salted id); purgeExpiredBackgroundTasks reaps by status + completedAt.
-    // A @mastra/cloudflare-d1 bump renaming any of them fails HERE, not in a
-    // cross-tenant purge or a silently-inert TTL duty.
+    // #then — purgeExpiredBackgroundTasks reaps by status + completedAt while
+    // run_id associates each task with its originating run.
     expect(columns).toContain('run_id');
     expect(columns).toContain('status');
     expect(columns).toContain('completedAt');
@@ -556,10 +460,8 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
         }[]
       ).map((column) => column.name);
 
-    // #then — purgeTenant ranges both over `thread_id` (the salted memory
-    // threadId); purgeExpiredNotifications reaps by status + updatedAt, and
-    // purgeExpiredThreadState by updatedAt. These are OUR column names, so this
-    // pins US against a self-inflicted rename that would inert a purge.
+    // #then — purgeExpiredNotifications reaps by status + updatedAt and
+    // purgeExpiredThreadState by updatedAt. These are our column names.
     expect(columnsOf('mastra_notifications')).toEqual(
       expect.arrayContaining(['thread_id', 'status', 'updatedAt']),
     );
@@ -568,46 +470,13 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     );
   });
 
-  it('a resume racing purgeTenant FAILS without re-executing the gated step or re-creating the snapshot', async () => {
-    // #given — a suspended run persisted in the real snapshot table
-    const sqlite = openSqlite();
-    const storage = createD1Storage({
-      binding: d1DatabaseLike(sqlite) as never,
-    });
-    const { runtime, gateRuns } = buildGated(storage);
-    const started = await runtime.start('gated', {
-      runId: 'abc_r1',
-      inputData: {},
-    });
-    expect(started.status).toBe('suspended');
-
-    // #when — the tenant is purged (token already expired, per policy), then
-    // a straggler resume lands
-    const purged = await purgeTenant(snapshotDb(sqlite), { tenantId: 'abc' });
-    expect(purged.snapshots).toBe(1);
-    const resume = runtime.resume('gated', 'abc_r1', {
-      step: 'gate',
-      resumeData: { go: true },
-    });
-
-    // #then — absorbed: the resume errors (no snapshot), the gated step never
-    // re-executed, and the resume attempt did not re-create a row (a fresh
-    // snapshot would mean silent re-execution from scratch)
-    await expect(resume).rejects.toThrow();
-    expect(gateRuns()).toBe(0);
-    const remaining = sqlite
-      .prepare('SELECT run_id FROM mastra_workflow_snapshot')
-      .all();
-    expect(remaining).toEqual([]);
-  });
-
-  it('the memory tables still have the columns the tenancy chokepoints ride on', async () => {
+  it('the memory tables retain their addressing and retention columns', async () => {
     // #given
     const sqlite = openSqlite();
     const storage = createD1Storage({
       binding: d1DatabaseLike(sqlite) as never,
     });
-    const { runtime } = buildGated(storage);
+    const runtime = buildGated(storage);
     await runtime.start('gated', { runId: 'abc_r1', inputData: {} });
 
     // #when
@@ -618,8 +487,7 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
         }[]
       ).map((column) => column.name);
 
-    // #then — purgeTenant's memory range predicates and the salted-id
-    // design key on exactly these names; a Mastra rename fails HERE.
+    // #then — memory addressing and retention key on exactly these names.
     // `updatedAt` carries purgeExpiredThreads' TTL: renamed, the thread
     // retention duty would throw on every firing instead of expiring anything.
     expect(columnsOf('mastra_threads')).toEqual(
@@ -633,85 +501,6 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     );
     expect(columnsOf('mastra_resources')).toEqual(
       expect.arrayContaining(['id']),
-    );
-  });
-
-  it('salted memory ids keep two tenants disjoint and purgeTenant reaps exactly one of them', async () => {
-    // #given — the REAL adapter; both tenants key memory by the SAME
-    // business key ('user-1'), the exact collision the salting exists for.
-    // A first run creates the six tables (the eager path production rides);
-    // the node:sqlite harness cannot run the memory domain's lazy DDL.
-    const sqlite = openSqlite();
-    const storage = createD1Storage({
-      binding: d1DatabaseLike(sqlite) as never,
-    });
-    const { runtime } = buildGated(storage);
-    await runtime.start('gated', { runId: 'seed_r0', inputData: {} });
-    const memory = await storage.getStore('memory');
-    if (!memory) throw new Error('D1Store exposes no memory domain');
-    const now = new Date();
-    const seedTenant = async (tenantId: string) => {
-      const threadId = mintThreadId(tenantId, () => 'thread-1');
-      const resourceId = mintResourceId(tenantId, 'user-1');
-      await memory.saveThread({
-        thread: {
-          id: threadId,
-          resourceId,
-          title: `${tenantId} conversation`,
-          createdAt: now,
-          updatedAt: now,
-        },
-      });
-      await memory.saveMessages({
-        messages: [
-          {
-            id: `${tenantId}-m1`,
-            threadId,
-            resourceId,
-            role: 'user',
-            createdAt: now,
-            content: { format: 2, parts: [{ type: 'text', text: 'hello' }] },
-          },
-        ],
-      });
-      await memory.saveResource({
-        resource: {
-          id: resourceId,
-          workingMemory: `${tenantId} working memory`,
-          createdAt: now,
-          updatedAt: now,
-        },
-      });
-      return { threadId, resourceId };
-    };
-    const abc = await seedTenant('abc');
-    const xyz = await seedTenant('xyz');
-    // Digit-suffixed prefix neighbor: '5' (0x35) sorts below '_' (0x5F), so
-    // these rows fall INSIDE the broken range if the lower bound ever loses
-    // its trailing underscore — the exactness pin for the memory sweep.
-    const abc5 = await seedTenant('abc5');
-    // The shared key produced DISJOINT rows — the leak class is closed by
-    // construction, before any purge runs.
-    expect(abc.threadId).not.toBe(xyz.threadId);
-    expect(abc.resourceId).not.toBe(xyz.resourceId);
-
-    // #when — offboard exactly one tenant
-    const purged = await purgeTenant(snapshotDb(sqlite), { tenantId: 'abc' });
-
-    // #then — the counters name what left (exactly abc's one row per
-    // table), and BOTH other tenants' memory survives intact and readable
-    expect(purged.threads).toBe(1);
-    expect(purged.messages).toBe(1);
-    expect(purged.resources).toBe(1);
-    const survivor = await memory.getThreadById({ threadId: xyz.threadId });
-    expect(survivor?.id).toBe(xyz.threadId);
-    const neighbor = await memory.getThreadById({ threadId: abc5.threadId });
-    expect(neighbor?.id).toBe(abc5.threadId);
-    const rows = sqlite
-      .prepare('SELECT thread_id FROM mastra_messages ORDER BY thread_id')
-      .all() as { thread_id: string }[];
-    expect(rows.map((row) => row.thread_id)).toEqual(
-      [abc5.threadId, xyz.threadId].sort(),
     );
   });
 

@@ -17,7 +17,7 @@ tool's own execution path.
 | --- | --- |
 | Mastra | Agents, processors, tools, workflows, request context, suspension, and storage interfaces |
 | breakwater | Guarded agent construction, agent-turn RBAC, content policy, connector manifests and gates, guarded fetch, replay/rate stores, and decision audit |
-| flowsafe | Authenticated tenant context, Durable Object execution, D1 persistence, approval records, grant derivation, long-running agents, retention, and offboarding |
+| flowsafe | Authenticated actor context, physical deployment verification, Durable Object execution, D1 persistence, approval records, grant derivation, long-running agents, retention, and decommissioning |
 
 Several controls are composed across these layers. For example, Mastra pauses a
 tool call, flowsafe records and authorizes the human decision, and breakwater
@@ -55,7 +55,7 @@ It uses an exact per-agent allowlist. There is no role inheritance. A missing,
 malformed, disallowed, or throwing actor lookup fails closed and can be
 audited.
 
-The middleware and guarded handle do not authenticate a request, choose a tenant, authorize an HTTP route, or decide an approval record. Use the authenticated Flowsafe agent host across HTTP and tenant boundaries.
+The middleware and guarded handle do not authenticate a request, choose a physical deployment, authorize an HTTP route, or decide an approval record. Use the authenticated Flowsafe agent host at HTTP and Durable Object boundaries.
 
 The handle is a trusted in-process API. It reduces accidental bypass by hiding raw Mastra execution methods, but it does not isolate hostile code in the same JavaScript process. Same-process code can still inspect objects, patch globals, or import Mastra directly.
 
@@ -103,7 +103,7 @@ The wrapper enforces:
 - a required side-effect-free simulation when dry-run is declared;
 - keyed replay when idempotency is declared;
 - a fixed-window execution budget when a rate limit is declared;
-- optional workflow and tenant isolation evaluators;
+- optional workflow and opaque isolation-scope evaluators;
 - background-execution eligibility.
 
 Tool annotations mirror the manifest for discovery, but annotations are not the
@@ -156,16 +156,14 @@ same-attempt joins do not. A fixed window can admit bursts across a window
 boundary; use another algorithm outside breakwater if you require a smooth
 rate.
 
-### Workflow and tenant scope
+### Workflow and opaque isolation scope
 
-Breakwater remains tenant-agnostic. It consumes opaque host-minted context:
+Breakwater remains organization-agnostic. It consumes opaque host-minted context:
 
 - `breakwater.workflowScope` identifies the current workflow;
 - `breakwater.isolationScope` separates idempotency and rate keys.
 
-`crossWorkflowIsolation()` compares the current workflow to a requested target.
-`tenantIsolation()` refuses calls with no isolation scope. Flowsafe mints both
-values on every start and resume leg.
+`crossWorkflowIsolation()` compares the current workflow to a requested target. `tenantIsolation()` refuses calls with no isolation scope for generic hosts that need a logical partition. Flowsafe mints only the workflow scope. Its physical data plane reserves and strips `breakwater.isolationScope`, leaving connector replay and rate keys deployment-wide.
 
 ### Audit and metrics
 
@@ -174,7 +172,7 @@ optional structured detail. It has an in-memory ring and an optional sink.
 `combineAuditSinks()` fans out events, and `metricsAuditSink()` adapts decisions
 to counters and duration histograms.
 
-Guarded RBAC and policy events use `agent:<agentId>` as their resource. A trusted host can set `breakwater.auditContext` with scalar agent, tenant, run, thread, resource, and entry-path correlation. Breakwater ignores every other property and lets decision-specific policy or channel detail win on collision.
+Guarded RBAC and policy events use `agent:<agentId>` as their resource. A trusted host can set `breakwater.auditContext` with scalar agent, deployment, run, thread, resource, and entry-path correlation. Breakwater's field remains named `tenantId`; Flowsafe populates it only from the verified deployment tag. Breakwater ignores every other property and lets decision-specific policy or channel detail win on collision.
 
 The in-memory ring is not durable. Use the flowsafe queue exporter or another sink for production evidence. Do not place secrets in connector IDs, policy names, idempotency keys, or custom audit detail.
 
@@ -195,7 +193,8 @@ checkout, container, or remote executor. See
 
 | Question | Owner |
 | --- | --- |
-| Is an HTTP caller authenticated and tenant-valid? | Application or flowsafe host |
+| Is an HTTP caller authenticated and actor-valid? | Application or Flowsafe host |
+| Does the Worker match its provisioned D1 deployment? | Flowsafe deployment sentinel |
 | May a role start this workflow? | Flowsafe run router and `WorkflowMeta.allowedRoles` |
 | May a role begin this agent turn? | Breakwater guarded preauthorization and `RBACMiddleware` |
 | May an actor decide this approval? | Flowsafe `ApprovalService` |
@@ -203,7 +202,7 @@ checkout, container, or remote executor. See
 | Does this exact leg have a valid grant? | Breakwater check over a flowsafe-derived context |
 | Which hosts may this connector fetch? | Breakwater declaration policy and guarded runtime fetch |
 | Can a retry replay a completed result? | Breakwater idempotency store |
-| Is durable state separated and later removed by tenant? | Flowsafe runtime, stores, and purge duties |
+| Is durable state physically separated and later decommissioned? | Provisioning control plane and Flowsafe deployment guard |
 
 ## Non-goals
 
@@ -222,8 +221,7 @@ Breakwater is not:
 
 A production deployment must satisfy these conditions:
 
-1. Authenticate callers before minting actor, tenant, workflow, or isolation
-   context.
+1. Verify the physical deployment sentinel, then authenticate callers before minting actor or workflow context.
 2. Construct protected agents through `createGuardedAgent()`.
 3. Wrap side-effecting tools with `createConnector()`.
 4. Keep reserved request-context keys server-only.

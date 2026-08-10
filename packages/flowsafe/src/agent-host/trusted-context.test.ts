@@ -14,7 +14,6 @@ const execution: TrustedAgentExecution = {
   principal: {
     kind: 'human',
     id: 'operator-1',
-    tenantId: 'acme',
     role: 'operator',
   },
   threadId: 'acme_thread',
@@ -73,7 +72,6 @@ describe('trusted agent context boundary', () => {
       },
       'breakwater.auditContext': {
         agentId: 'writer',
-        tenantId: 'acme',
         runId: 'acme_run',
         threadId: 'acme_thread',
         resourceId: 'acme_resource',

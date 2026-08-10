@@ -6,7 +6,7 @@
 // consumer opts into, never the root barrel.
 
 // The delivery seam (into a thread via the topology).
-export { deliverNotification, deliveryTenantContext } from './delivery.js';
+export { deliverNotification } from './delivery.js';
 // The GitHub reference provider (binding-gated showcase connector).
 export {
   buildGithubNotification,
@@ -28,6 +28,7 @@ export {
 export {
   createSignalProviderHostTopology,
   type ReconcileSignalProviderPolling,
+  SIGNAL_PROVIDER_HOST_INSTANCE_NAME,
   type SignalProviderHostNamespaceLike,
   type SignalProviderHostStubLike,
   type SignalProviderHostTopology,
@@ -48,13 +49,13 @@ export {
 export {
   D1SubscriptionStoreFactory,
   InMemorySubscriptionStoreFactory,
+  isValidExternalResourceId,
+  MAX_EXTERNAL_RESOURCE_ID_BYTES,
   SIGNAL_SUBSCRIPTIONS_TABLE,
   type StoredSubscription,
-  SUBSCRIPTION_TENANT_BOUND,
   type SubscribeInput,
+  type SubscriptionStore,
   type SubscriptionStoreFactory,
-  type SystemSubscriptionStore,
-  type TenantBoundSubscriptionStore,
 } from './subscription-d1.js';
 // The webhook ingress + human-only subscription CRUD (CI-M-007-003).
 export {

@@ -54,12 +54,12 @@ const DevActorSwitcher = import.meta.env.DEV
 
 // The showcase shell: hold the acting token + the launched runs at the root,
 // derive both API clients from the token (a new client instance re-triggers
-// the dashboard fetch and re-scopes the run polling), and hand the activity
-// feed's stable `record` down as the narration sink. Identity (id/role/tenant)
+// the dashboard fetch and refreshes run polling), and hand the activity
+// feed's stable `record` down as the narration sink. Identity (id/role)
 // is never derived client-side — the server echoes it per request.
 function Root(): ReactElement {
   const [actorToken, setActorToken] = useState<string | null>(null);
-  // The OAuth callback delivers a per-visitor sandbox token set in the URL
+  // The OAuth callback delivers a per-visitor session token set in the URL
   // fragment; read exactly once (the initializer also scrubs the hash).
   const [demoSession, setDemoSession] = useState<DemoTokenSet | null>(
     readDemoTokensFromHash,
@@ -116,32 +116,20 @@ function Root(): ReactElement {
     setRuns((current) => [entry, ...current]);
   }, []);
 
-  // Clearing runs leaves useRunPolling's internal results map with stale
-  // entries; harmless — RunCards renders from `runs`, and post-reset runs get
-  // fresh runIds (never reused) and poll fresh.
-  const clearRuns = useCallback(() => {
-    setRuns([]);
-  }, []);
-
-  // The reset affordance only renders where the server can honor it: the
-  // OAuth demo sandbox and local dev (tenant 'demo' is the dev plugin's demo
-  // tenant). A static-operator-token session would always 403.
-  const canReset = DevActorSwitcher !== null || demoSession !== null;
-
   const endDemoSession = useCallback(() => {
     setDemoSession(null);
     setActorToken(null);
   }, []);
 
-  // Announce the sandbox once per tenant — the key dedups re-renders and the
-  // refreshed token sets that keep the same tenantId.
+  // Announce the shared organization once per session. The event key dedups
+  // refreshes that keep the same session id.
   useEffect(() => {
     if (!demoSession) return;
     narrate([
       sessionReadyEvent({
         provider: demoSignInProvider ?? 'OAuth',
-        tenantId: demoSession.tenantId,
-        expiresAtMs: Date.parse(demoSession.tenantExpiresAt),
+        sessionId: demoSession.sessionId,
+        expiresAtMs: Date.parse(demoSession.sessionExpiresAt),
       }),
     ]);
   }, [demoSession, demoSignInProvider, narrate]);
@@ -184,8 +172,6 @@ function Root(): ReactElement {
           runClient={runClient}
           runs={runs}
           onStarted={addRun}
-          onRunsCleared={clearRuns}
-          canReset={canReset}
           feed={feed}
           identityControls={identityControls}
           approvalStream={approvalStream}
