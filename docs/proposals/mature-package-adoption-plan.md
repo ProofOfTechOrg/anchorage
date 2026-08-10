@@ -6,6 +6,22 @@ Content type: implementation plan
 
 ## TL;DR
 
+Finish, verify, and merge single-tenant isolation Slice A before starting this plan. Once Slice A is integrated, complete this plan before beginning isolation Slices B through E. No consumers or production deployments currently depend on these contracts, so this is the lowest-cost point to stabilize their protocol, runtime, routing, and tooling foundations.
+
+Completing this plan means resolving every recommendation through its package-selection gate. It does not mean installing every named package. Conditional candidates can remain custom, and rejected candidates can remain rejected when the evidence supports that decision. Implement each approved substitution in its own reviewable pull request.
+
+Use this execution order:
+
+1. Add Cloudflare's Vitest integration and Wrangler test harness so later migrations and isolation slices run against real Worker bindings.
+2. Replace protocol mechanics with jose, resolve GitHub webhook verification, and migrate OAuth/OIDC where the compatibility spikes pass.
+3. Add dependency-cruiser, publint, and Are the Types Wrong so architecture and package boundaries guard subsequent runtime changes.
+4. Replace the showcase development emulator with the Cloudflare Vite plugin after runtime-test parity exists.
+5. Migrate Hono and runtime Zod last, at stable top-level HTTP boundaries, after the preceding guards are active.
+6. Resolve the unified/remark proposal and the zero-dependency root-script policy as the final package decision.
+7. Run the full verification gate, update this plan with every accepted or rejected decision, and re-baseline isolation Slices B through E before resuming them.
+
+This sequence prioritizes a clean foundation over reaching isolation Slice C sooner. The main rework risk is Hono/Zod preceding Slice C's durability-authority decision. Limit that migration to stable HTTP boundaries and keep runner, stream, and domain semantics behind their existing seams. The phase numbers below group related work; they do not define execution order.
+
 The repository hand-rolls several infrastructure concerns that mature packages or first-party Cloudflare tooling can own more safely. Adopt nine substitutions in four isolated phases, subject to a fresh package review and user approval for each phase:
 
 1. Use jose for JWT signing and verification, an Octokit webhook package for GitHub signature verification when its text boundary proves byte-equivalent, and openid-client for standards-level OAuth/OIDC mechanics.
@@ -61,9 +77,11 @@ Do not add an indirect import and rely on another workspace package to provide i
 
 ## Findings and decisions
 
+The priority column ranks risk and maintenance value, not rollout order. Follow the execution order in the TL;DR.
+
 | Priority | Area | Current custom responsibility | Candidate | Plan verdict |
 | --- | --- | --- | --- | --- |
-| 1 | JWT and signed stream tickets | Compact serialization, base64url, HMAC, algorithm selection, claim checks, signing | [jose](https://github.com/panva/jose) | Adopt first, preserving FlowSafe claim validation and verifier seams |
+| 1 | JWT and signed stream tickets | Compact serialization, base64url, HMAC, algorithm selection, claim checks, signing | [jose](https://github.com/panva/jose) | Adopt first within protocol security, preserving FlowSafe claim validation and verifier seams |
 | 2 | Cloudflare runtime tests | D1-shaped SQLite adapters and partial binding doubles | [Cloudflare Vitest integration](https://developers.cloudflare.com/workers/testing/vitest-integration/) and [Wrangler test harness](https://developers.cloudflare.com/workers/testing/test-harness/get-started/) | Adopt for fidelity tests; retain Node tests only when they make no runtime-fidelity claim |
 | 3 | Showcase local runtime | Connect-to-Fetch bridge, in-memory Durable Object facsimiles, forced polling | [Cloudflare Vite plugin](https://developers.cloudflare.com/workers/vite-plugin/) | Adopt and delete the custom development Worker emulator after parity tests |
 | 4 | GitHub webhook signatures | Header parsing, hex decoder, WebCrypto verification | [@octokit/webhooks-methods](https://github.com/octokit/webhooks-methods.js/) | Adopt only if the package's string boundary is byte-equivalent for accepted webhook bodies; otherwise fix the decoder and use Octokit types only |
@@ -520,10 +538,13 @@ Feature and fix pull requests target dev. Refresh origin before each branch deci
 
 Use separate pull requests:
 
-1. Protocol security: jose first, then Octokit verification, then OAuth. These may be separate commits or separate pull requests if review size grows.
-2. Cloudflare fidelity: Workers test projects and harness first, then the showcase Vite plugin. Remove emulators only after parity is proven.
-3. HTTP boundary pilot: migrate one top-level route family, measure diff and package impact, then ask before expanding.
-4. Repository tooling: import rules and package validators can proceed independently; the Markdown parser requires an explicit zero-dependency policy decision.
+1. Cloudflare test foundation: add the Workers test projects and Wrangler harness before changing runtime behavior.
+2. Protocol security: migrate jose first, then resolve Octokit verification and OAuth in separate review units.
+3. Architecture and publication guards: add dependency-cruiser, publint, and Are the Types Wrong before public runtime dependencies change.
+4. Cloudflare development parity: add the showcase Vite plugin and remove emulators only after parity is proven.
+5. HTTP boundary pilot: migrate one stable top-level route family, measure the diff and package impact, then ask before expanding.
+6. Documentation parser: resolve the zero-dependency policy before adding unified and remark.
+7. Isolation handoff: run the full gate and re-baseline Slices B through E against the resulting code.
 
 Each pull request must include:
 
