@@ -54,7 +54,7 @@ appendFileSync(
   JSON.stringify({ args, cwd: process.cwd(), entrypoint: import.meta.url }) + '\\n',
 );
 if (args.includes('--preview') && !args.includes('--remote')) {
-  process.stderr.write('--preview requires --remote\n');
+  process.stderr.write('--preview requires --remote\\n');
   process.exit(4);
 }
 if (process.env.FAKE_WRANGLER_FAILURE === '1') {
