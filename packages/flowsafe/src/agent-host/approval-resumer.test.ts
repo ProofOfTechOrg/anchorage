@@ -3,10 +3,10 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  type ActorContext,
   type ApprovalRecord,
   type ExecutionPrincipal,
   principalActor,
-  type TenantContext,
 } from '../approval-api/index.js';
 import { createAgentApprovalResumer } from './approval-resumer.js';
 import type { AgentThreadTopology } from './thread-topology.js';
@@ -14,14 +14,12 @@ import type { AgentThreadTopology } from './thread-topology.js';
 const principal: ExecutionPrincipal = {
   kind: 'human',
   id: 'operator-1',
-  tenantId: 'acme',
   role: 'operator',
 };
 
 function record(overrides: Partial<ApprovalRecord> = {}): ApprovalRecord {
   return {
     id: 'approval-1',
-    tenantId: 'acme',
     workflowId: 'durable-agentic-loop',
     runId: 'acme_run',
     title: 'Approve',
@@ -41,20 +39,22 @@ function record(overrides: Partial<ApprovalRecord> = {}): ApprovalRecord {
   };
 }
 
-function tenantFor(principal: ExecutionPrincipal): TenantContext {
+function contextFor(principal: ExecutionPrincipal): ActorContext {
   const actor = principalActor(principal);
   return {
     actor,
     principal,
-    tenantId: principal.tenantId,
+    resourceOwner: { kind: principal.kind, id: principal.id },
     service: () => {
       throw new Error('unused');
     },
     newRunId: () => 'acme_new-run',
-    ownsRun: (id) => id.startsWith('acme_'),
     newThreadId: () => 'acme_new-thread',
-    newResourceId: () => 'acme_resource',
-    ownsMemoryId: (id) => id.startsWith('acme_'),
+    resourceIdFromKey: () => 'acme_resource',
+    claimResource: async () => undefined,
+    releaseResource: async () => undefined,
+    resourceOwnerFor: async () => undefined,
+    canAccessResource: async () => true,
     canSelfDecide: () => false,
   };
 }
@@ -86,20 +86,20 @@ const agents = [
 describe('createAgentApprovalResumer', () => {
   it('restores the original principal, not the reviewer', async () => {
     const agentTopology = topology();
-    const tenantForPrincipal = vi.fn(async (actor: ExecutionPrincipal) =>
-      tenantFor(actor),
+    const contextForPrincipal = vi.fn(async (actor: ExecutionPrincipal) =>
+      contextFor(actor),
     );
     const fallback = vi.fn();
     const resume = createAgentApprovalResumer({
       fallback,
       agents,
       topology: agentTopology,
-      tenantForPrincipal,
+      contextForPrincipal,
     });
     await expect(resume(record(), 'approve')).resolves.toMatchObject({
       status: 'success',
     });
-    expect(tenantForPrincipal).toHaveBeenCalledWith(
+    expect(contextForPrincipal).toHaveBeenCalledWith(
       principal,
       expect.anything(),
     );
@@ -120,7 +120,7 @@ describe('createAgentApprovalResumer', () => {
       fallback,
       agents,
       topology: topology(),
-      tenantForPrincipal: async (principal) => tenantFor(principal),
+      contextForPrincipal: async (principal) => contextFor(principal),
     });
     await expect(
       resume(
@@ -140,7 +140,7 @@ describe('createAgentApprovalResumer', () => {
       fallback: vi.fn(),
       agents,
       topology: topology(),
-      tenantForPrincipal: async (principal) => tenantFor(principal),
+      contextForPrincipal: async (principal) => contextFor(principal),
     });
     await expect(
       legacy(
@@ -162,20 +162,20 @@ describe('createAgentApprovalResumer', () => {
         },
       ],
       topology: topology(),
-      tenantForPrincipal: async (principal) => tenantFor(principal),
+      contextForPrincipal: async (principal) => contextFor(principal),
     });
     await expect(restricted(record(), 'approve')).rejects.toThrow(
       'may no longer resume',
     );
   });
 
-  it('rejects a tenant adapter that changes the stored principal', async () => {
+  it('rejects a context adapter that changes the stored principal', async () => {
     const resume = createAgentApprovalResumer({
       fallback: vi.fn(),
       agents,
       topology: topology(),
-      tenantForPrincipal: async () =>
-        tenantFor({ ...principal, id: 'reviewer-1', role: 'reviewer' }),
+      contextForPrincipal: async () =>
+        contextFor({ ...principal, id: 'reviewer-1', role: 'reviewer' }),
     });
     await expect(resume(record(), 'approve')).rejects.toThrow(
       'must preserve the stored agent execution principal exactly',

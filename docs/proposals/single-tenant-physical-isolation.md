@@ -1,6 +1,6 @@
 # Proposal: single-tenant packages with physical tenant isolation
 
-> This document is a proposal. It is not implemented or supported product behavior. It records the analysis, decision, delivery plan, and Cloudflare cost model for moving the packages to a single-tenant runtime contract with physical (per-deployment) tenant isolation. Shipped behavior is documented in [Flowsafe architecture](../flowsafe-architecture.md), [Breakwater architecture](../breakwater-architecture.md), and the [security threat model](../security-threat-model.md). If accepted, this proposal supersedes the pooled multi-tenant posture assumed in parts of the [breakwater improvement roadmap](breakwater-improvement-roadmap.md).
+> Status: accepted. Slice A, tenancy removal and deployment identity, was implemented on 2026-08-10. Slices B through E remain proposals and are not supported product behavior. Shipped Slice A behavior is documented in [Flowsafe architecture](../flowsafe-architecture.md), [Breakwater architecture](../breakwater-architecture.md), and the [security threat model](../security-threat-model.md). This decision supersedes the pooled multi-tenant posture assumed in parts of the [breakwater improvement roadmap](breakwater-improvement-roadmap.md).
 
 The product target is the **Super platform**: a hosted agent cloud where customers author agent projects locally and deploy them onto the platform, which runs them durably with metered capability access. These packages supply the Super platform's execution-security slice — breakwater as the policy-enforcement point, flowsafe as the durable approval-gated runtime. The capability marketplace, provider adapters, MCP/SDK surfaces, build service, developer studio, and the economic plane (payment authorization and settlement) are Super platform components maintained outside this repository.
 
@@ -17,14 +17,14 @@ Adopt **tenant = deployment**:
 5. **Run a two-stage topology.** Pre-launch, the fleet runs on plain Workers ($5/month account) because every deployed artifact is team-authored. From the first externally authored artifact, the execution plane runs on Workers for Platforms untrusted dispatch namespaces. The boundary is a security rule, not a scaling threshold: **no customer-built artifact ever executes on a plain Worker or in a trusted namespace.** Move all deployment maintenance from cron triggers onto Durable Object alarms now, so no per-tenant platform trigger exists in either stage (see "The launch switch").
 6. **Benchmark the durable-run protocol before the control plane hardens.** Flowsafe's Durable Object runner and Cloudflare Workflows are competing durability authorities; the Super platform requires exactly one. It becomes its own delivery slice.
 
-Status: proposed. The decisive inputs are that the packages currently have **no consumers and no production deployments**, so a breaking simplification is free today and only gets more expensive.
+Status: accepted. Slice A is complete. The decisive inputs were that the packages had **no consumers and no production deployments**, so the breaking simplification was cheapest before adoption.
 
 ## Why now
 
-The shipped packages implement full logical multi-tenancy: tenant-branded stores, tenant claims in every authenticated router, tenant-prefixed Durable Object identities, tenant predicates on schedules, and tenant-scoped approval grants. That machinery is correct and tested — and it is also the single largest recurring engineering tax in the codebase:
+At the proposal baseline, the shipped packages implemented full logical multi-tenancy: tenant-branded stores, tenant claims in every authenticated router, tenant-prefixed Durable Object identities, tenant predicates on schedules, and tenant-scoped approval grants. That machinery was correct and tested, and it was also the single largest recurring engineering tax in the codebase:
 
 - Every new flowsafe surface (signals, goals, schedules, notifications, artifacts) must re-implement tenant discipline plus adversarial same-key tests, forever. Each miss is a cross-tenant confidentiality vulnerability.
-- The [security threat model](../security-threat-model.md) itself names the residuals: a host verifier that assigns the wrong tenant defeats every layer below it; the tenant-binding brand is recoverable by reflection in-process; every query on every surface must carry the tenant predicate correctly.
+- The baseline [security threat model](../security-threat-model.md) named the residuals: a host verifier that assigned the wrong tenant defeated every layer below it; the tenant-binding brand was recoverable by reflection in-process; every query on every surface had to carry the tenant predicate correctly.
 - For an AI agent product, cross-tenant memory recall is the catastrophic failure mode. Physical separation makes it structurally impossible instead of predicate-guaranteed.
 
 With zero consumers, the usual counterarguments (breaking a published contract, existing pooled deployments) do not apply.
@@ -50,7 +50,7 @@ With zero consumers, the usual counterarguments (breaking a published contract, 
 
 **Defense in depth against mis-wiring.** Today, if two customers were somehow pointed at one database, tenant predicates would still separate their rows. After removal, a provisioning bug that binds tenant B's Worker to tenant A's database is a full cross-tenant breach. The provisioner becomes the security-critical component. Controls:
 
-- **Deployment-identity sentinel.** Every deployment receives its tenant identifier as an environment binding. A sentinel row in its D1 database (and a check at Durable Object initialization) asserts ownership at startup and fails closed on mismatch. One cheap invariant replaces predicates-everywhere, and it keeps audit tenant tags honest because the tag comes from infrastructure configuration, not from a forgeable request claim.
+- **Deployment identity and caller attestation.** Every deployment receives its tenant identifier as an environment binding and a distinct internal credential. A strict singleton sentinel in D1 asserts database ownership, while Worker-to-Durable-Object requests authenticate the calling deployment before the target reads storage. These invariants fail closed on database and cross-script namespace drift, and they keep audit tags honest because attribution comes from infrastructure configuration rather than a forgeable request claim.
 - **Fleet drift audit.** A control-plane job enumerates user Workers and verifies the tenant-to-database-to-namespace mapping is one-to-one, continuously.
 - Net effect: the isolation trusted computing base shrinks from "every query on every surface forever" to a small, rarely-changing, reviewable provisioning path. Residual confidentiality risk converts into availability/operations work, which is the right direction for a security product.
 
@@ -75,7 +75,7 @@ One boundary against over-rotating: "maximum clean" applies to the data plane. T
 
 A tenant was never one user. The removal targets *tenant* machinery only; every *user*-facing control inside a deployment stays. Verify each anchor before editing (read-before-edit; paths are as of the baseline commit).
 
-Deleted from flowsafe:
+Slice A deleted from Flowsafe:
 
 | Mechanism | Anchor |
 | --- | --- |
@@ -95,10 +95,10 @@ Stays (unchanged or trivially re-keyed):
 - **404-before-role-error resource checks** inside a deployment (user-to-user and run-ownership probing).
 - **Grant binding to workflow + run + suspension + tool-call identity.**
 
-Added:
+Slice A added:
 
-- Deployment identity: environment-configured tenant tag, D1 sentinel-row check at startup, Durable Object initialization check, fail closed on mismatch; audit events carry the tag from configuration.
-- Control-plane reference implementation (provisioning, migration loop, drift audit) — see the delivery plan.
+- Deployment identity: environment-configured tenant tag, strict D1 sentinel check at startup, authenticated Worker-to-Durable-Object calls, and fail-closed mismatch handling; audit events carry the tag from configuration.
+- Deployment-local resource ownership: runs, threads, resources, and schedules remain authorized per human or automated principal, with `404` before role errors.
 
 ## Deployment topology
 
@@ -281,8 +281,8 @@ Conclusions: Durable Object duration and D1 row writes are the meters to enginee
 
 Ordered slices; each is a reviewable unit with its own verification. Quality-gate review lanes apply to every slice.
 
-**Slice A — tenancy removal + deployment identity (do first).**
-Remove the deleted-list mechanisms from flowsafe; re-key stores without tenant components; introduce the deployment-identity binding, sentinel-row startup check, and Durable Object initialization check; rewrite the threat model's tenant sections as a provisioning-boundary section; update the roadmap, operations runbook, deployment reference, and package READMEs; changesets for both packages (breaking for flowsafe's public types, breakwater expected unchanged).
+**Slice A — tenancy removal + deployment identity (implemented 2026-08-10).**
+Removed the deleted-list mechanisms from Flowsafe; re-keyed stores without tenant components; introduced the deployment-identity binding, strict sentinel check, Worker-to-Durable-Object credential, and deployment-local resource-owner registry; rewrote the threat model's tenant sections as a provisioning-boundary section; updated the roadmap, operations runbook, deployment reference, and package READMEs; added a breaking Flowsafe changeset. Breakwater remained unchanged and therefore has no changeset in this slice.
 *Verification:* `pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm docs:check`, `pnpm --filter @proofoftech/flowsafe spike:verify` (spike scenarios rewritten from cross-tenant forgery to sentinel-mismatch fail-closed), pack tests.
 
 **Slice B — maintenance onto Durable Object alarms.** Implement the singleton maintenance Durable Object described above (re-arm-first, one due task per invocation, `ensure-maintenance` bootstrap endpoint, health fields); delete the `scheduled()` handler, `deploy/crons.ts`, and the wrangler `triggers` block; move the audit-queue consumer out of the tenant Worker template so the data plane is queue-producer-only (the portability invariant). Removes the cron-count ceiling and every platform-trigger dependency.
@@ -293,7 +293,7 @@ Remove the deleted-list mechanisms from flowsafe; re-key stores without tenant c
 
 **Slice D — single-tenant secure preset.** The reduced roadmap section 11: one validated `singleTenantConnectorPolicies()`-style builder that requires durable stores, audit posture, and egress policy, and rejects contradictory configuration at construction. The multi-tenant preset item is dropped. (Connector `requiredPermissions`, previously planned here, shipped at the baseline commit — roadmap Phase C step 3 — so the preset can require permission wiring from day one.)
 
-**Slice E — provisioning control plane (two backends, one seam).** A `ProvisioningBackend` interface with both implementations: the wrangler-loop backend for stage one (create tenant: D1 create → migrate → seed sentinel → deploy Worker with generated config and bindings → call `ensure-maintenance`), and the Workers for Platforms Upload-API backend for stage two (same steps against a dispatch namespace, plus the dispatch Worker and outbound Worker). Shared machinery: fleet migration loop with per-tenant schema-version state and canary ordering, drift audit (one-to-one tenant/database/namespace mapping plus maintenance-staleness watchdog), decommission runbook (revoke credentials → delete Worker → export-then-delete database), fleet version-drift report, and the shared audit-queue consumer. The stage-two backend is built and conformance-tested during the pre-launch integration window (see "The launch switch"), then activated at the first external artifact.
+**Slice E — provisioning control plane (two backends, one seam).** A `ProvisioningBackend` interface with both implementations: the wrangler-loop backend for stage one (create tenant: D1 create → seed sentinel → migrate → set the internal Durable Object credential → deploy Worker with generated config and bindings → call `ensure-maintenance`), and the Workers for Platforms Upload-API backend for stage two (same steps against a dispatch namespace, plus the dispatch Worker and outbound Worker). Shared machinery: fleet migration loop with per-tenant schema-version state and canary ordering, drift audit (one-to-one tenant/database/namespace mapping plus maintenance-staleness watchdog), decommission runbook (revoke credentials → delete Worker → export-then-delete database), fleet version-drift report, and the shared audit-queue consumer. The stage-two backend is built and conformance-tested during the pre-launch integration window (see "The launch switch"), then activated at the first external artifact.
 *Verification:* an end-to-end provisioning test against a scratch Cloudflare account: create two tenants, prove sentinel mismatch fails closed, prove maintenance self-arms, prove decommission leaves no orphan resources; throttle the loop within the global API budget (1,200 requests per 5 minutes per account token); the launch-switch conformance checklist on a real namespace.
 
 ## Out of scope — must not change

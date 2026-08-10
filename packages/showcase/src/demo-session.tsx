@@ -2,7 +2,7 @@
 // `/#demo-tokens=<base64url(JSON DemoTokenSet)>` — a FRAGMENT, so the token
 // set never appears in server logs. This module reads it once (clearing the
 // hash), renders the per-role switcher, and silently refreshes the short-TTL
-// JWTs while the sandbox (tenant) is live. No token literal exists here: the
+// JWTs while the demo session is live. No token literal exists here: the
 // production bundle stays credential-free (scripts/assert-clean-app-bundle).
 
 import { HStack } from '@astryxdesign/core/HStack';
@@ -31,8 +31,8 @@ export interface DemoToken {
 }
 
 export interface DemoTokenSet {
-  tenantId: string;
-  tenantExpiresAt: string;
+  sessionId: string;
+  sessionExpiresAt: string;
   tokens: DemoToken[];
 }
 
@@ -110,7 +110,7 @@ export function useDemoSignIn(): DemoSignIn {
   return signIn;
 }
 
-/** Warn this long before the sandbox tenant expires. */
+/** Warn this long before the demo session expires. */
 const EXPIRY_WARNING_MS = 15 * 60 * 1000;
 
 export function DemoActorSwitcher({
@@ -126,7 +126,7 @@ export function DemoActorSwitcher({
   onSelect: (token: string) => void;
   /** A refresh replaced the whole token set. */
   onSession: (session: DemoTokenSet) => void;
-  /** The sandbox (tenant) expired — the caller drops back to sign-in. */
+  /** The demo session expired — the caller drops back to sign-in. */
   onExpired: () => void;
   narrate: (events: readonly NarrationEvent[]) => void;
 }): ReactElement {
@@ -141,7 +141,7 @@ export function DemoActorSwitcher({
     if (bootstrap) onSelect(bootstrap.token);
   }, [bootstrap, onSelect]);
 
-  // Silent refresh while the tenant is live: the mid-demo "step away, come
+  // Silent refresh while the session is live: the mid-demo "step away, come
   // back, switch to reviewer and approve" flow must survive a JWT expiry.
   // session/actorToken are read through refs so a role switch (or the refresh
   // itself replacing the session) does NOT re-arm the interval — resetting
@@ -204,10 +204,10 @@ export function DemoActorSwitcher({
     };
   }, [onSelect, onSession, onExpired, narrate]);
 
-  // One heads-up before the tenant reaches end of life (key-deduped, so the
+  // One heads-up before the session reaches end of life (key-deduped, so the
   // effect re-arming on session refreshes cannot double-warn).
   useEffect(() => {
-    const expiresAtMs = Date.parse(session.tenantExpiresAt);
+    const expiresAtMs = Date.parse(session.sessionExpiresAt);
     if (Number.isNaN(expiresAtMs)) return;
     const delay = expiresAtMs - EXPIRY_WARNING_MS - Date.now();
     if (expiresAtMs <= Date.now()) return;
@@ -220,7 +220,7 @@ export function DemoActorSwitcher({
       Math.max(0, delay),
     );
     return () => clearTimeout(timer);
-  }, [session.tenantExpiresAt, narrate]);
+  }, [session.sessionExpiresAt, narrate]);
 
   const selectedRole =
     session.tokens.find((entry) => entry.token === actorToken)?.role ?? '';
@@ -234,13 +234,13 @@ export function DemoActorSwitcher({
 
   return (
     <HStack gap={2} align="center" wrap="wrap" aria-label="Acting identity">
-      <Tooltip content={GLOSSARY.sandboxTenant}>
-        <Token label={`sandbox ${session.tenantId}`} size="sm" color="cyan" />
+      <Tooltip content={GLOSSARY.sharedOrganization}>
+        <Token label="shared demo org" size="sm" color="cyan" />
       </Tooltip>
       <Tooltip content={GLOSSARY.expiry}>
         <HStack gap={1} align="center">
           <Timestamp
-            value={session.tenantExpiresAt}
+            value={session.sessionExpiresAt}
             format="relative"
             isLive
             size="sm"

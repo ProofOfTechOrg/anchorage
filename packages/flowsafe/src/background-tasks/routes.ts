@@ -1,18 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track B (M-003): the READ-ONLY, tenant-bound HTTP surface over background
-// tasks (DL-014). Background-task rows carry tenant-prefixed run_id / threadId /
-// resourceId (INV-1 + minted memory ids), but core's `listTasks` / `getTask` /
-// `stream` are NOT tenant-bound — exposing the raw manager would be a
-// cross-tenant existence/content oracle. So this router:
-//   - REQUIRES a `runId` or `threadId` filter on list AND stream, and validates
-//     its salted prefix against the authenticated tenant (400 if absent, 404 if
-//     foreign — no oracle);
-//   - loads a task for `getTask` and 404s if its `runId` is not tenant-owned,
-//     whether the task is missing or another tenant's (one response, no oracle);
+// Track B (M-003): the read-only HTTP surface over background tasks (DL-014).
+// Core's `listTasks` / `getTask` / `stream` are not run-bound, so this router:
+//   - requires a path-safe `runId` or `threadId` filter on list and stream;
+//   - loads a task for `getTask` and 404s when missing;
 //   - never returns or accepts the raw BackgroundTaskManager.
-//
-// The hosting DO passes the already-authenticated tenant (its own idFromName
-// identity), exactly as the run/thread DOs recover theirs. Mutating the queue
+// Mutating the queue
 // (dispatch/cancel/resume) is NOT here: v1 keeps background dispatch server-side
 // (an agent's tool call), and a suspended non-gated task's resume, if ever
 // exposed, is a separate role-gated route that mints no capability (P8).
@@ -22,24 +14,24 @@ import type {
   TaskFilter,
 } from '@mastra/core/background-tasks';
 
-import { tenantOwnsSaltedId } from '../do-runner/index.js';
+import { isPathSafeId } from '../do-runner/index.js';
 import { safeDecodeSegment } from '../host-kit/route-path.js';
 
 export interface BackgroundTaskRoutesOptions {
   /** The manager to read through — WRAPPED, never exposed over the wire. */
   manager: BackgroundTaskManager;
+  /** Host-owned authorization for the run/thread scope of every returned row. */
+  authorize(scope: { runId?: string; threadId?: string }): Promise<boolean>;
   /** Route prefix. Default '/background-tasks'. */
   basePath?: string;
 }
 
 /**
- * A router `(request, tenantId) => Response | null`. `null` means the path is
- * not one of ours (the DO falls through). `tenantId` is the DO's own asserted
- * tenant — never read from the request.
+ * A router `(request) => Response | null`. `null` means the path is not one of
+ * ours (the DO falls through).
  */
 export type BackgroundTaskRouter = (
   request: Request,
-  tenantId: string,
 ) => Promise<Response | null>;
 
 function json(payload: unknown, status = 200): Response {
@@ -50,14 +42,11 @@ function json(payload: unknown, status = 200): Response {
 }
 
 /**
- * Resolve the tenant-scoped filter (runId XOR threadId) from the query, or a
- * fail-closed Response. Both ids are salted `${tenantId}_...`, so
- * `tenantOwnsSaltedId` is exact for either. Absent means 400; foreign means
- * 404 (no oracle — a foreign id gets the same answer as a nonexistent one).
+ * Resolve the run/thread filter from the query, or a fail-closed Response.
+ * Absent means 400; malformed means 404.
  */
 function resolveScopedFilter(
   url: URL,
-  tenantId: string,
 ): { filter: TaskFilter; scopeValue: string } | Response {
   const runId = url.searchParams.get('runId') ?? undefined;
   const threadId = url.searchParams.get('threadId') ?? undefined;
@@ -65,13 +54,13 @@ function resolveScopedFilter(
     return json(
       {
         error:
-          'a runId or threadId filter is required (background-task queries are tenant-scoped)',
+          'a runId or threadId filter is required (background-task queries are run-scoped)',
       },
       400,
     );
   }
   const scopeValue = runId ?? (threadId as string);
-  if (!tenantOwnsSaltedId(tenantId, scopeValue)) {
+  if (!isPathSafeId(scopeValue)) {
     return json({ error: 'not found' }, 404);
   }
   return {
@@ -82,7 +71,7 @@ function resolveScopedFilter(
 
 /**
  * The scope-ownership predicate shared by list and stream: a row is in
- * scope iff its runId or threadId equals the validated, tenant-owned scope value
+ * scope iff its runId or threadId equals the validated scope value
  * the request was filtered by. Defense-in-depth OVER core's own filter — a future
  * regression in core's `listTasks`/`stream` scoping cannot leak a foreign or
  * out-of-scope row past this. One predicate so list and stream can never drift.
@@ -100,20 +89,23 @@ export function createBackgroundTaskRoutes(
   const { manager } = options;
   const base = options.basePath ?? '/background-tasks';
 
-  return async (request, tenantId) => {
+  return async (request) => {
     if (request.method !== 'GET') return null;
     const url = new URL(request.url);
     const path = url.pathname;
     if (path !== base && !path.startsWith(`${base}/`)) return null;
 
-    // GET {base}/stream — SSE of lifecycle events for one tenant-owned run/thread.
+    // GET {base}/stream — SSE of lifecycle events for one run/thread.
     if (path === `${base}/stream`) {
-      const resolved = resolveScopedFilter(url, tenantId);
+      const resolved = resolveScopedFilter(url);
       if (resolved instanceof Response) return resolved;
+      if (!(await options.authorize(resolved.filter))) {
+        return json({ error: 'not found' }, 404);
+      }
       return streamResponse(manager, resolved, request.signal);
     }
 
-    // GET {base}/task/:taskId — one task, 404 on missing OR foreign (no oracle).
+    // GET {base}/task/:taskId — one task, 404 when missing.
     if (path.startsWith(`${base}/task/`)) {
       // Malformed percent-encoding in the taskId is not a real task — 404 (the
       // no-oracle response), never a decodeURIComponent throw out of the DO
@@ -122,16 +114,27 @@ export function createBackgroundTaskRoutes(
       if (taskId === undefined || taskId === '' || taskId.includes('/'))
         return json({ error: 'not found' }, 404);
       const task = await manager.getTask(taskId);
-      if (!task || !tenantOwnsSaltedId(tenantId, task.runId)) {
+      if (!task) {
+        return json({ error: 'not found' }, 404);
+      }
+      if (
+        !(await options.authorize({
+          runId: task.runId,
+          ...(task.threadId !== undefined ? { threadId: task.threadId } : {}),
+        }))
+      ) {
         return json({ error: 'not found' }, 404);
       }
       return json({ task });
     }
 
-    // GET {base} — list, filtered to one tenant-owned run/thread.
+    // GET {base} — list, filtered to one run/thread.
     if (path === base) {
-      const resolved = resolveScopedFilter(url, tenantId);
+      const resolved = resolveScopedFilter(url);
       if (resolved instanceof Response) return resolved;
+      if (!(await options.authorize(resolved.filter))) {
+        return json({ error: 'not found' }, 404);
+      }
       const result = await manager.listTasks(resolved.filter);
       // Per-row parity with the stream guard (DL-014): re-check every returned
       // row against the requested scope, so a future regression in core's
@@ -153,8 +156,8 @@ export function createBackgroundTaskRoutes(
  * Response. The stream is passed the validated filter so core scopes both its
  * on-connect snapshot and its live events; a second exact-match guard in the
  * transform drops any chunk whose runId/threadId is not the requested one, so a
- * cross-tenant leak is impossible even if core's filter ever loosened
- * as defense in depth. `abortSignal` is the request's own, so a client
+ * out-of-scope leak is blocked even if core's filter ever loosened. This is
+ * defense in depth. `abortSignal` is the request's own, so a client
  * disconnect closes the upstream subscription.
  */
 function streamResponse(

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it } from 'vitest';
 
-import type { ResumeLedgerStorage } from '../do-runner/index.js';
+import type { DurableKeyValueStorage } from '../do-runner/index.js';
 import {
   AgentRunStateConflictError,
   AgentRunStateError,
@@ -12,7 +12,7 @@ import {
   writeAgentRunRecord,
 } from './agent-run-state.js';
 
-function memoryStorage(): ResumeLedgerStorage & {
+function memoryStorage(): DurableKeyValueStorage & {
   values: Map<string, unknown>;
 } {
   const values = new Map<string, unknown>();
@@ -51,7 +51,6 @@ describe('durable agent thread/run metadata', () => {
       principal: {
         kind: 'human' as const,
         id: 'starter',
-        tenantId: 'acme',
         role: 'operator' as const,
       },
       originEntryPath: 'http.start' as const,
@@ -73,7 +72,36 @@ describe('durable agent thread/run metadata', () => {
     ).resolves.toBeUndefined();
   });
 
-  it('fails closed on malformed persisted state and foreign run principals', async () => {
+  it('snapshots run metadata before awaiting storage', async () => {
+    const storage = memoryStorage();
+    const record = {
+      version: 2 as const,
+      agentId: 'writer',
+      principal: {
+        kind: 'human' as const,
+        id: 'starter',
+        role: 'operator' as const,
+      },
+      originEntryPath: 'http.start' as const,
+    };
+    const get = storage.get;
+    storage.get = async <T>(key: string) => {
+      record.agentId = 'mutated';
+      record.principal.id = 'mutated';
+      return get<T>(key);
+    };
+
+    await writeAgentRunRecord(storage, 'acme_run-1', record);
+
+    await expect(readAgentRunRecord(storage, 'acme_run-1')).resolves.toEqual({
+      version: 2,
+      agentId: 'writer',
+      principal: { kind: 'human', id: 'starter', role: 'operator' },
+      originEntryPath: 'http.start',
+    });
+  });
+
+  it('fails closed on malformed persisted state and malformed run principals', async () => {
     const storage = memoryStorage();
     storage.values.set('flowsafe:agent-thread-binding:v1', {
       version: 2,
@@ -89,8 +117,7 @@ describe('durable agent thread/run metadata', () => {
         agentId: 'writer',
         principal: {
           kind: 'human',
-          id: 'starter',
-          tenantId: 'globex',
+          id: 'bad\nactor',
           role: 'operator',
         },
         originEntryPath: 'http.start',
@@ -103,7 +130,6 @@ describe('durable agent thread/run metadata', () => {
         principal: {
           kind: 'human',
           id: '   ',
-          tenantId: 'acme',
           role: 'operator',
         },
         originEntryPath: 'http.start',
@@ -120,7 +146,7 @@ describe('agent run metadata migration', () => {
     await storage.put('flowsafe:agent-run:v1:acme_run-1', {
       version: 1,
       agentId: 'writer',
-      principal: { id: 'flowsafe-system', role: 'operator', tenantId: 'acme' },
+      principal: { id: 'flowsafe-system', role: 'operator' },
       originEntryPath: 'schedule.fire',
     });
 
@@ -137,7 +163,7 @@ describe('agent run metadata migration', () => {
     await storage.put('flowsafe:agent-run:v1:acme_run-2', {
       version: 2,
       agentId: 'writer',
-      principal: { id: 'starter', role: 'operator', tenantId: 'acme' },
+      principal: { id: 'starter', role: 'operator' },
       originEntryPath: 'http.start',
     });
 
@@ -153,7 +179,7 @@ describe('agent run metadata migration', () => {
     await storage.put('flowsafe:agent-run:v1:acme_run-3', {
       version: 2,
       agentId: 'writer',
-      principal: { kind: 'system', id: 'sched', tenantId: 'acme' },
+      principal: { kind: 'system', id: 'sched' },
       originEntryPath: 'schedule.fire',
     });
 

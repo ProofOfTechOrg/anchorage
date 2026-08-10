@@ -1,6 +1,6 @@
 # Observability and quality
 
-Mastra supplies traces, execution events, evaluation, and its own observability integrations. Anchorage adds decision-oriented evidence around policy, connectors, approvals, tenant boundaries, unattended starts, maintenance, and durable recovery.
+Mastra supplies traces, execution events, evaluation, and its own observability integrations. Anchorage adds decision-oriented evidence around policy, connectors, approvals, deployment boundaries, unattended starts, maintenance, and durable recovery.
 
 Use both. A trace explains what executed; an Anchorage audit event explains what a specific enforcement point allowed, denied, or failed.
 
@@ -62,7 +62,7 @@ This adapter does not create tracing spans or define a backend-specific metrics 
 
 ## Approval metrics
 
-`GET /api/approvals/metrics` returns the authenticated tenant's aggregate:
+`GET /api/approvals/metrics` returns the deployment approval aggregate:
 
 ```typescript
 interface ApprovalMetrics {
@@ -80,7 +80,7 @@ D1 computes this through SQL aggregation rather than loading every record into t
 
 Useful derived service indicators:
 
-- approval backlog by tenant;
+- approval backlog by workflow, age, and priority;
 - breached/open ratio;
 - approval and rejection rate;
 - decision latency percentiles from events or traces;
@@ -100,7 +100,7 @@ Track notification-delivery success separately from approval creation. “Record
 
 ## Live-stream observability
 
-`ApprovalStreamSink` emits mutation frames to the tenant hub. The run Durable Object emits complete `RunSummary` frames.
+`ApprovalStreamSink` emits mutation frames to the deployment hub. The run Durable Object emits complete `RunSummary` frames.
 
 Clients retain polling:
 
@@ -116,7 +116,7 @@ Live delivery is not the source of truth. D1 and run status are.
 
 Opt-in domains have their own structured audit types:
 
-- `signal.ingest`: tenant, actor, thread, channel, outcome, reason, and content bytes;
+- `signal.ingest`: verified deployment tag, actor, thread, channel, outcome, reason, and content bytes;
 - `schedule.route`: authenticated schedule CRUD outcome;
 - `schedule.fire`: claim, skip, start, or failure details;
 - objective mutations;
@@ -132,9 +132,10 @@ Post-auth denials that look like probes are audited. Anonymous rejection is deli
 The composed Worker emits structured configuration and maintenance results for:
 
 - SLA sweep;
+- deployment-sentinel or internal caller-credential refusal;
 - workflow and approval retention;
 - thread, notification, thread-state, trigger, and task retention;
-- deployment-owned purge duties;
+- deployment-owned retention duties;
 - unknown cron expressions;
 - provider alarm reconciliation;
 - Queue export.
@@ -159,9 +160,9 @@ Configure Queue retry and a dead-letter queue. Monitor:
 - retry count;
 - dead-letter arrival;
 - collector parse failures;
-- tenant/event schema drift.
+- deployment/event schema drift.
 
-The consumer co-batches tenants. Enforce tenant-aware access in the SIEM.
+The control-plane consumer can co-batch events from several physical deployments. Preserve the verified deployment tag and enforce organization-aware access in the SIEM.
 
 ## Safe error surfaces
 
@@ -189,7 +190,7 @@ Do not log caught errors again through a generic serializer without reapplying t
 - detected PII/secret category, without matched text;
 - egress declaration and runtime-fetch denial;
 - idempotency reservation, replay, pending, takeover, and store degradation;
-- rate-limit denial by tenant-scoped connector.
+- rate-limit denial by deployment-wide connector budget.
 
 ### Approvals
 

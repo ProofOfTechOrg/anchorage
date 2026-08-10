@@ -16,6 +16,17 @@ Package-specific navigation:
 - [`packages/flowsafe/CLAUDE.md`](packages/flowsafe/CLAUDE.md)
 - [`packages/showcase/CLAUDE.md`](packages/showcase/CLAUDE.md)
 
+## Package-first design check
+
+Before implementing a new feature or substantial utility:
+
+1. Search current package registries and official documentation for mature, maintained packages that already provide the required behavior.
+2. Compare viable packages with custom code on runtime compatibility, API stability, maintenance and security history, license, release age, dependency and bundle cost, and fit with existing abstractions.
+3. Present the viable packages, recommended integration boundary, benefits, risks, and custom-code alternative to the user.
+4. Wait for the user's direction before installing a package or handrolling the functionality.
+
+Reuse an existing dependency or repository utility when it already fits. A small invariant-specific adapter can remain custom, but report the package search and explain why custom code is the narrower choice. Record rejected packages and their rationale in non-trivial implementation plans.
+
 ## Commands
 
 ```bash

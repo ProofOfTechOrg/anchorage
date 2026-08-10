@@ -10,20 +10,20 @@
 //
 // The create route is OFF by default (allowCreate) and, when mounted, cannot
 // author capability: it rejects every TCB_ONLY_CREATE_FIELDS member and
-// force-attributes the request to the authenticated actor. Approval records
-// that carry grants are minted in-process from an observed suspension, never
-// from a request body.
+// force-attributes the request to the authenticated actor. It also requires
+// write access to the named run before touching the approval store. Approval
+// records that carry grants are minted in-process from an observed suspension,
+// never from a request body.
 
+import { isPathSafeId } from '../do-runner/path-safe-id.js';
+import { readBoundedBody } from '../http-body.js';
+import { ActorResolutionError, type ActorResolver } from './actor-context.js';
 import {
   ApprovalAuthzError,
   ApprovalConflictError,
   InvalidApprovalInputError,
   UnknownApprovalError,
 } from './service.js';
-import {
-  TenantResolutionError,
-  type TenantResolver,
-} from './tenant-context.js';
 import {
   APPROVAL_LIST_ORDERS,
   APPROVAL_STATUSES,
@@ -54,6 +54,8 @@ import {
  *   future trusted merge must never inherit client-selected identity.
  * - `requestedBy` is the field decide()'s separation-of-duties check compares
  *   against; spoofing it lets one principal approve their own request.
+ * - `requestedByKind` distinguishes a human requester from automation with
+ *   the same id and is therefore equally trust-sensitive.
  */
 export const TCB_ONLY_CREATE_FIELDS = [
   'connectors',
@@ -65,6 +67,7 @@ export const TCB_ONLY_CREATE_FIELDS = [
   'resumeCount',
   'runScoped',
   'requestedBy',
+  'requestedByKind',
   'resumeTarget',
 ] as const;
 
@@ -93,12 +96,10 @@ export const CLIENT_CREATE_FIELDS = [
 
 export interface ApprovalRouterOptions {
   /**
-   * Authenticates the request and binds the tenant-scoped service.
-   * The router's first line is `resolve(request)`; the store the service
-   * wraps is constructed AFTER authentication, bound to the actor's tenant —
-   * there is no pre-auth service to leak through. undefined yields 401.
+   * Authenticates the request before exposing the service. undefined yields
+   * 401.
    */
-  resolve: TenantResolver;
+  resolve: ActorResolver;
   /** Route prefix. Default: '/api/approvals'. */
   basePath?: string;
   /**
@@ -107,12 +108,15 @@ export interface ApprovalRouterOptions {
    * approval bridge), so the HTTP route is an inert "file a request"
    * affordance at best. When enabled it force-sets `requestedBy` to the
    * authenticated actor and 400s on any TCB_ONLY_CREATE_FIELDS member, so it
-   * can never author capability.
+   * can never author capability. The actor must also have write access to the
+   * named run; missing and foreign runs both yield 404.
    */
   allowCreate?: boolean;
 }
 
 export type ApprovalRouter = (request: Request) => Promise<Response | null>;
+
+class ApprovalPayloadTooLargeError extends Error {}
 
 function json(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
@@ -122,13 +126,15 @@ function json(payload: unknown, status = 200): Response {
 }
 
 function errorResponse(error: unknown): Response {
+  if (error instanceof ApprovalPayloadTooLargeError) {
+    return json({ error: error.message }, 413);
+  }
   if (error instanceof InvalidApprovalInputError) {
     return json({ error: error.message }, 400);
   }
-  if (error instanceof TenantResolutionError) {
-    // An authenticated actor with a malformed tenant claim is a verifier
-    // bug, not a client 4xx it can fix — but it must not become a 500 that
-    // reads as "try again". Forbidden, with the reason in the body.
+  if (error instanceof ActorResolutionError) {
+    // Invalid authenticated claims are a verifier bug, not a client 4xx it
+    // can fix. Fail closed without echoing claim details.
     return json({ error: 'forbidden' }, 403);
   }
   if (error instanceof ApprovalAuthzError) {
@@ -150,9 +156,20 @@ function errorResponse(error: unknown): Response {
 async function readJsonObject(
   request: Request,
 ): Promise<Record<string, unknown>> {
+  const raw = await readBoundedBody(
+    request,
+    1_048_576,
+    'approval body exceeds limit',
+  );
+  if (!raw.ok && raw.reason === 'payload-too-large') {
+    throw new ApprovalPayloadTooLargeError('payload too large');
+  }
+  if (!raw.ok) {
+    throw new InvalidApprovalInputError('request body must be JSON');
+  }
   let body: unknown;
   try {
-    body = await request.json();
+    body = JSON.parse(raw.text);
   } catch {
     throw new InvalidApprovalInputError('request body must be JSON');
   }
@@ -267,10 +284,10 @@ export function createApprovalRouter(
       .filter(Boolean);
 
     try {
-      const tenant = await resolve(request);
-      if (!tenant) return json({ error: 'authentication required' }, 401);
-      const actor = tenant.actor;
-      const service = tenant.service();
+      const context = await resolve(request);
+      if (!context) return json({ error: 'authentication required' }, 401);
+      const actor = context.actor;
+      const service = context.service();
 
       if (request.method === 'GET') {
         if (segments.length === 0) {
@@ -300,9 +317,28 @@ export function createApprovalRouter(
           // in-process bridge (which legitimately attributes the human who
           // advanced the run), so the tightening lives here at the HTTP
           // boundary alone.
-          const input: Record<string, unknown> = { requestedBy: actor.id };
+          const input: Record<string, unknown> = {
+            requestedBy: actor.id,
+            requestedByKind: 'human',
+          };
           for (const field of CLIENT_CREATE_FIELDS) {
             if (field in body) input[field] = body[field];
+          }
+          const runId = input.runId;
+          if (typeof runId !== 'string' || runId.length === 0) {
+            throw new InvalidApprovalInputError('runId is required');
+          }
+          if (!isPathSafeId(runId)) {
+            throw new InvalidApprovalInputError(
+              `runId '${runId}' is not path-safe — approvals bind to server-minted runs (INV-1)`,
+            );
+          }
+          // The optional public filing route may only attach a request to a
+          // run the authenticated principal may advance. Resolve ownership
+          // before touching the approval store: an unregistered id and a
+          // foreign id are the same 404, so this cannot become a run oracle.
+          if (!(await context.canAccessResource('run', runId, 'write'))) {
+            return json({ error: 'run not found' }, 404);
           }
           const { record, created } = await service.create(
             input as unknown as CreateApprovalInput,
@@ -310,10 +346,8 @@ export function createApprovalRouter(
           );
           return json(record, created ? 201 : 200);
         }
-        // NOTE: there is deliberately NO /sla/sweep route. The sweep is an
-        // unfiltered cross-tenant read+write; it lives in the cron-owned
-        // sweepSLA() function over a SystemApprovalStore, unreachable from
-        // request scope by type.
+        // NOTE: there is deliberately no /sla/sweep route. Maintenance calls
+        // sweepSLA() from trusted host code.
         //
         // Batch decide matches BEFORE the generic [id, action] arms — those
         // would otherwise resolve this path as decide('batch') and 404.

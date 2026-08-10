@@ -1,6 +1,6 @@
 # Durable agents
 
-Flowsafe can run Mastra durable agents through the same `RunnerRuntime` that drives workflows. This keeps agent legs inside the run-id, request-context, approval-grant, resume-ledger, audit, and retention boundaries instead of creating a second execution path.
+Flowsafe can run Mastra durable agents through the same `RunnerRuntime` that drives workflows. This keeps agent legs inside the run-id, request-context, approval-grant, snapshot-provenance, audit, and retention boundaries instead of creating a second execution path.
 
 This surface is supported and opt-in: it is tested and covered by package compatibility guarantees, but the host must explicitly wire the required routes, bindings, storage domains, or scheduled duties.
 
@@ -13,15 +13,15 @@ authenticated Worker
   |
   +-- run routes ------------> one runner DO per run
   |
-  +-- thread topology -------> one thread DO per tenant-minted thread
+  +-- thread topology -------> one thread DO per server-minted thread
   |                               |
   |                               +-- runtime-driven durable agent
   |                               +-- message/signal/state/notification routes
   |                               +-- active-run registry and idle wake
   |
-  +-- provider topology -----> one provider host DO per tenant
+  +-- provider topology -----> one singleton provider host DO
   |
-  +-- live routes -----------> one hub DO per tenant
+  +-- live routes -----------> one singleton hub DO
   |
   +-- D1 --------------------> snapshots, memory, inbox, state, schedules,
                                   tasks, subscriptions, approvals
@@ -130,7 +130,7 @@ Mount `createAgentRouter()` through `createFlowsafeWorker({ buildAgentRouter })`
 | `GET /agents/:agentId/runs/:threadId/:runId` | Read authoritative durable status |
 | `GET /agents/:agentId/runs/:threadId/:runId/stream?offset=N` | Observe authenticated newline-delimited JSON events |
 
-Every authenticated role may list agents and inspect same-tenant runs. Starts require both `RUN_START_ROLES` and the agent's effective roles. There is no public agent-resume route.
+Every authenticated role may list agents. Run inspection follows resource ownership: the owning principal, reviewers, viewers, and admins may read a run; another operator or builder receives `404`. Starts require both `RUN_START_ROLES` and the agent's effective roles. There is no public agent-resume route.
 
 The start body accepts only `{"prompt":"..."}`. The router caps the raw UTF-8 body at 16,384 bytes, requires non-whitespace prompt content, preserves that content, and rejects ids, trusted context, overrides, unknown fields, and prototype meta-keys.
 
@@ -165,35 +165,33 @@ const durableAgent = createFlowsafeDurableAgent({
 });
 ```
 
-`createFlowsafeDurableAgent()` registers Mastra's `durable-agentic-loop` workflow on the supplied runtime. Its `stream()`, `generate()`, and `prepare()` entry points require a caller-minted run id. The host must mint `${tenantId}_${uuid}`; flowsafe does not fall back to a tenant-less UUID. `prepare()` remains an initial-execution API and runs the full initial processor chain. `resumeViaRuntime()` uses the dedicated registry rehydration behavior described above.
+`createFlowsafeDurableAgent()` registers Mastra's `durable-agentic-loop` workflow on the supplied runtime. Its `stream()`, `generate()`, and `prepare()` entry points require a host-minted opaque run id. Flowsafe does not fall back to an unowned UUID. `prepare()` remains an initial-execution API and runs the full initial processor chain. `resumeViaRuntime()` uses the dedicated registry rehydration behavior described above.
 
 The runtime's pub/sub identity is reused by default. This lets the durable loop, observer, and active-thread signal delivery share one feed inside the thread Durable Object.
 
 This wrapper does not add the guarded-agent brand or catalog authorization to a raw agent. Use `agent-host` for the supported protected public surface. Do not expose inherited `resume()`, `approveToolCall()`, or `declineToolCall()` methods as client routes.
 
-## Mint and protect memory identities
+## Create and protect memory identities
 
-Mastra memory accepts caller-selected thread and resource ids. A multi-tenant host must replace those business ids at its boundary:
+Mastra memory accepts caller-selected thread and resource ids. A Flowsafe host replaces those identities at its boundary:
 
 ```typescript
-const threadId = tenant.newThreadId();
-const resourceId = tenant.newResourceId(customerKey);
+const threadId = context.newThreadId();
+const resourceId = context.resourceIdFromKey(customerKey);
 ```
 
-The underlying `mintThreadId()`, `mintResourceId()`, `tenantOfMemoryId()`, and `tenantOwnsMemoryId()` helpers are exported from `@proofoftech/flowsafe/do-runner`.
+The exported `mintThreadId()` helper generates a thread id. `resourceIdFromKey()` validates a trusted host business key and returns that key unchanged; it does not generate a resource id.
 
 Host rules:
 
 1. Reject bodies that name `threadId` or `resourceId` with `assertNoClientMemoryIds()`.
-2. Resolve the authenticated `TenantContext`.
-3. Return 404 for a foreign stored id with `requireOwnedMemoryId()`.
+2. Resolve the authenticated `ActorContext`.
+3. Resolve existing resources before role errors when the route's 404 contract requires it.
 4. Address the thread Durable Object through `createThreadTopology()`.
-5. Let the topology stamp `x-flowsafe-tenant` and `x-flowsafe-principal` from the resolved context. The principal is the sole identity channel: the retired `x-flowsafe-actor` and `x-flowsafe-role` headers are stripped on send and forward, and `createTenantResolver` refuses an inbound request that carries either. The Durable Object refuses a request that carries no principal header rather than treating the caller as a human.
-6. Have `ThreadDurableObject` project the actor from the stamped principal and verify the stamped tenant against its own `id.name` prefix.
+5. Let the topology stamp `x-flowsafe-principal` from the resolved context. It strips retired tenant, actor, and role headers on send and forward. `createActorResolver()` refuses an inbound request carrying any server-stamped identity header.
+6. Let `ThreadDurableObject` project the actor from the stamped principal and use its own `id.name` as the authoritative thread id.
 
-The D1 recall-path tests use one database and the same business key for two tenants. They prove isolated `recall`, `listThreads`, and working memory behavior through Mastra's own memory implementation.
-
-See [Agent-memory tenancy](agent-memory-tenancy.md) for the exact invariants and purge behavior.
+See [Agent memory isolation](agent-memory-isolation.md) for the exact identity, retention, and decommissioning rules.
 
 ## Compose D1 storage domains
 
@@ -203,11 +201,11 @@ See [Agent-memory tenancy](agent-memory-tenancy.md) for the exact invariants and
 | --- | --- | --- |
 | Signals, notifications, thread state, goals | `createSignalStorageDomains()` | `mastra_notifications`, `mastra_thread_state` |
 | Schedules | `createScheduleStorageDomains()` | `mastra_schedules`, `mastra_schedule_triggers` |
-| Background tasks | `createBackgroundTaskD1Domains()` | serialized workflow and tenant-scoped task domains |
+| Background tasks | `createBackgroundTaskD1Domains()` | serialized workflow and deployment task domains |
 
 The signals helper is injected into do-runner rather than imported by it, which avoids a package cycle. The schedule store mirrors Mastra's schedule contract because the Cloudflare D1 adapter does not ship that domain. Flowsafe owns both signal tables and the subscription table.
 
-When you adopt a storage domain, wire its offboarding and retention duties in the same change. The package schema guard pins that correspondence internally; your host must still schedule the exported purge.
+When you adopt a storage domain, declare its retention or standing-state lifecycle in the same change. The package schema guard pins that correspondence internally; your host must still schedule each exported retention duty.
 
 ## Host the thread Durable Object
 
@@ -221,11 +219,11 @@ Subclass `ThreadDurableObject`, construct the catalog modules for that instance,
 - requires a runtime-driven agent before an idle wake;
 - mints no approval capability.
 
-The host's idle-start seam must:
+Before production use, the host's idle-start seam must:
 
-1. revalidate tenant ownership;
+1. revalidate the stored thread and agent binding;
 2. consult the unattended-run cap;
-3. mint a fresh tenant-salted run id;
+3. mint a fresh opaque run id;
 4. start the durable agent through `RunnerRuntime`;
 5. persist and report the authoritative run id.
 
@@ -245,7 +243,7 @@ Mount `createSignalRouter()` through `createFlowsafeWorker({ buildSignalRouter }
 | `state` | `POST /api/threads/:threadId/state` | Update durable thread state |
 | `notification` | `POST /api/threads/:threadId/notification` | Deliver a notification |
 
-The Worker applies this order: authentication, coarse role, thread ownership, byte cap, JSON parse, client-memory-id rejection, attribute-key allowlist, tenant rate cap, audit, then topology forwarding.
+The Worker applies this order: authentication, coarse role, thread lookup, byte cap, JSON parse, client-memory-id rejection, attribute-key allowlist, the configured rate-limit seam, audit, then topology forwarding. The starter's limiter is isolate-local example protection; use shared durable state when the limit is contractual across the deployment.
 
 Signals are untrusted model input. Core escapes the XML representation, while the route validates tag/attribute names and caps payload size. Apply breakwater input policy to the receiving agent for domain-specific content controls.
 
@@ -264,7 +262,7 @@ DELETE /api/threads/:threadId/goal
 
 Objectives are standing instructions injected into future turns. The router therefore uses the signal-ingestion trust posture for writes: authenticate, authorize, ownership-check, reject client memory ids, cap size and `maxRuns`, then audit every accepted or post-auth rejected mutation.
 
-The router writes through Mastra's objective helpers into the goal lane of `mastra_thread_state`, so the durable goal step reads the identical shape. Updates are within-tenant last-write-wins rather than a serialized thread lease.
+The router writes through Mastra's objective helpers into the goal lane of `mastra_thread_state`, so the durable goal step reads the identical shape. Updates are deployment-local last-write-wins rather than a serialized thread lease.
 
 ## Add schedules
 
@@ -273,7 +271,7 @@ Create a `D1SchedulesStorage`, expose `createScheduleRouter()`, and run `createS
 The router:
 
 - mints schedule ids server-side;
-- filters reads by tenant metadata;
+- lists deployment schedules under role checks;
 - limits schedule count and fire rate;
 - rejects reserved request-context keys on workflow and agent targets;
 - exposes trigger history as read-only data.
@@ -282,30 +280,41 @@ The tick:
 
 - lists due schedules;
 - claims each fire with a compare-and-swap update that also checks active status;
-- revalidates `metadata.tenantId`;
-- mints a tenant-salted run id;
-- consults the unattended-run cap;
+- attributes the fire from the infrastructure deployment tag;
+- mints an opaque run id;
+- consults the unattended-run cap when the host configures one;
 - starts workflow targets through `RunnerRuntime`;
 - starts agent targets through the injected thread topology callback;
 - isolates each schedule's failure and records the actual joined run id.
 
+Threaded agent schedule delivery is at-least-once across a target-DO crash.
+Every retry carries the same `dispatchId` as the signal id, waits for the
+current target lease, and replays a settled receipt. If the target accepted the
+signal immediately before an isolate loss but had not yet stored that receipt,
+lease takeover can deliver it again. Scheduled instructions and any tools they
+invoke must therefore use `dispatchId` as their idempotency key.
+
+The cap callbacks are optional library seams. An omitted callback means
+uncapped execution; the reference starter labels that posture explicitly and
+requires a shared durable quota before commercial unattended execution.
+
 The shared execution-context boundary strips reserved keys from persisted compatibility paths and rejects them at external HTTP boundaries. Reserved keys include every `breakwater.*` key, `mastra:goal`, run/thread/resource ids, and JavaScript prototype meta-keys.
 
-Runtime workflow and isolation values overwrite sanitized context. The exact-leg connector grant then overwrites any prior grant, including with an empty list, and trusted actor/audit correlation is merged last. A row planted directly in D1 cannot override a grant, principal, workflow scope, isolation scope, run id, thread id, resource id, or goal context.
+Runtime workflow and execution values overwrite sanitized context. The exact-leg connector grant then overwrites any prior grant, including with an empty list, and trusted actor/audit correlation is merged last. The runtime drops provider-supplied isolation scope. A row planted directly in D1 cannot override a grant, principal, workflow scope, run id, thread id, resource id, or goal context.
 
 Schedules are standing configuration and have no TTL. Trigger history has an opt-in retention duty.
 
 ## Add background tasks
 
-`createBackgroundTaskD1Domains()` supplies the serialized workflow adapter and tenant-scoped task storage. Host one `BackgroundTaskHost` per tenant Durable Object and expose its routes with `createBackgroundTaskRoutes()`.
+`createBackgroundTaskD1Domains()` supplies the serialized workflow adapter and deployment task storage. Host one singleton `BackgroundTaskHost` Durable Object and expose its routes with `createBackgroundTaskRoutes()`.
 
 The host manager:
 
-- validates tenant and configuration synchronously;
+- validates deployment configuration synchronously;
 - accepts the runtime's original pub/sub identity;
 - unwinds partially started workers and subscriptions on boot failure;
 - closes enqueue before workers on shutdown;
-- scopes nested Mastra SSE payloads to the owning tenant.
+- scopes nested Mastra server-sent event payloads to the deployment host.
 
 Pass `backgroundTasks` to `createFlowsafeWorker()` to add terminal-task TTL cleanup to the purge cron. The default cleanup windows are package-defined; set explicit values when your data policy differs.
 
@@ -315,28 +324,28 @@ Only connectors whose permission manifest is read-only may opt into model-reques
 
 Provider deliveries arrive as a `service` principal on the `signal.notification` entry path. The target agent must declare that pair in `allowedAutomation`, or delivery is refused.
 
-Core signal providers deliver through an in-process agent registry, which is not durable or tenant-aware enough for this topology. Flowsafe preserves the provider contract while routing delivery through the thread topology.
+Core signal providers deliver through an in-process agent registry, which is not durable enough for this topology. Flowsafe preserves the provider contract while routing delivery through the thread topology.
 
 Wire:
 
-- `D1SubscriptionStoreFactory` for tenant-bound subscriptions;
+- `D1SubscriptionStoreFactory` for deployment subscriptions;
 - `createSubscriptionRouter()` for human-only subscribe and unsubscribe;
 - `createWebhookRouter()` for raw-body verified webhooks;
-- `createSignalProviderHostTopology()` for one provider host Durable Object per tenant;
+- `createSignalProviderHostTopology()` for the singleton provider host Durable Object;
 - `SignalProviderHost` for alarm-driven polling;
 - `deliverNotification()` to send each delivery through the owned thread;
 - a `reconcilePolling` callback so subscription mutations arm or cancel provider polling after the database commit.
 
-Webhook processing verifies the signature before parsing, finds the tenant only through the subscription row, rate-limits by provider and tenant, and bounds forgery audit. A webhook contains no trusted tenant assertion.
+Webhook processing verifies the signature before parsing, looks up the subscription row, rate-limits by provider, and bounds forgery audit. A webhook contains no trusted actor assertion.
 
-Polling reconciliation is post-commit. If the lifecycle callback fails, the route returns a failure that states the mutation was applied; it does not roll back the subscription. A retry reconciles the committed truth.
+Polling reconciliation is post-commit. If the lifecycle callback fails, the route returns the committed mutation, logs the failure, and marks the audit event with `pollingLifecycle: 'failed'`. It does not roll back the subscription. A retry reconciles the committed truth.
 
 The host keeps an earlier alarm rather than postponing it. It deletes the alarm
 when no pollable subscriptions remain. A zero or absent interval means
 manual-only; negative, fractional, non-finite, or unsafe intervals are
 rejected. Choose a production-safe positive cadence for each polling provider.
 
-`githubSignalProvider()` is the reference WebCrypto HMAC implementation. Provide an ownership allowlist that maps each external resource to threads the authenticated tenant owns.
+`githubSignalProvider()` is the reference WebCrypto HMAC implementation. Provide an ownership allowlist that maps each external resource to deployment threads.
 
 ## Run scheduled duties
 
@@ -353,8 +362,8 @@ Keep independent duties in separate failure boundaries. CPU termination is not a
 | Schedule-trigger purge | When trigger history has a TTL |
 | Background-task purge | When background tasks are enabled |
 | Notification dispatch tick | When delayed notifications are enabled |
-| Provider polling alarm | Per tenant when a pollable subscription exists |
+| Provider polling alarm | Singleton host when a pollable subscription exists |
 
 Each duty that reaches an agent carries an automated principal: the schedule tick fires as `system` on `schedule.fire`, the notification dispatch tick as `system` on `notification.dispatch`, and provider delivery as `service` on `signal.notification`. Enabling a duty is not enough — the target agent must declare that kind and entry path in `allowedAutomation`, or the run is refused at the host.
 
-The advanced starter makes these responsibilities visible in one host. The [Deployment reference](deployment-reference.md) lists bindings and configuration, and the [Operations runbook](operations-runbook.md) covers recovery and offboarding.
+The advanced starter makes these responsibilities visible in one host. The [Deployment reference](deployment-reference.md) lists bindings and configuration, and the [Operations runbook](operations-runbook.md) covers recovery and decommissioning.

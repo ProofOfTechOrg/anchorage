@@ -7,34 +7,41 @@
 // routes them — no assets-block edit (DL-015).
 //
 // The Worker is the SOLE ticket-verification authority. The ticket route
-// authenticates through the shared TenantResolver and mints a short-lived HMAC
+// authenticates through the shared ActorResolver and mints a short-lived HMAC
 // ticket; the two WebSocket-upgrade routes verify that ticket HERE and forward
 // the raw upgrade to the addressed Durable Object, which re-binds the connection
-// by its own idFromName identity (INV-1 for a run, id.name===tenantId for the
-// hub). No grant ever crosses this surface — the ticket is ADDRESSING only.
-//
-// Ownership mirrors the run router: a run ticket for a run the tenant does not
-// own gets 404 (not 403), so the route is never an existence oracle for another
-// tenant's runIds.
+// by its own idFromName identity. No grant ever crosses this surface — the
+// ticket is ADDRESSING only.
 
 import {
-  TenantResolutionError,
-  type TenantResolver,
+  ActorResolutionError,
+  type ActorResolver,
 } from '../approval-api/index.js';
-import { tenantOfRunId } from '../do-runner/path-safe-id.js';
+import {
+  isPathSafeId,
+  type RunSummary,
+  stampDeploymentIdentityRequest,
+} from '../do-runner/index.js';
+import { readBoundedBody } from '../http-body.js';
 import type { RunnerNamespaceLike } from './do-run-topology.js';
 import { createHubTopology, type HubNamespaceLike } from './hub-topology.js';
+import { requireResourceAccess } from './resource-access.js';
+import { RunRouteError } from './run-route-error.js';
 import { mintStreamTicket, verifyStreamTicket } from './stream-ticket.js';
 
 export interface StreamRouterOptions {
-  /** The shared authenticate, validate, and tenant-bind resolver used by the ticket route. */
-  resolve: TenantResolver;
+  /** The shared authenticate-and-validate resolver used by the ticket route. */
+  resolve: ActorResolver;
   /** The dedicated stream-ticket signing secret (STREAM_TICKET_SECRET). */
   ticketSecret: string;
-  /** The per-tenant hub namespace the hub channel forwards to. */
+  /** The deployment hub namespace the hub channel forwards to. */
   hub: HubNamespaceLike;
   /** The runner namespace the per-run channel forwards to (idFromName wf:runId). */
   runner: RunnerNamespaceLike;
+  /** Authoritative workflow/run lookup used before minting a run ticket. */
+  runStatus(workflowId: string, runId: string): Promise<RunSummary | undefined>;
+  /** Per-deployment Worker-to-DO credential. */
+  deploymentIdentitySecret: string;
   /**
    * Optional origin for the ws:// URL returned by the ticket route (e.g.
    * `wss://host`). Omitted => a same-origin relative path the browser resolves
@@ -71,8 +78,17 @@ function json(payload: unknown, status = 200): Response {
 }
 
 async function readJson(request: Request): Promise<unknown> {
+  const raw = await readBoundedBody(
+    request,
+    4096,
+    'stream ticket body exceeds limit',
+  );
+  if (!raw.ok && raw.reason === 'payload-too-large') {
+    throw new RunRouteError(413, 'payload too large');
+  }
+  if (!raw.ok) return null;
   try {
-    return await request.json();
+    return raw.text === '' ? null : JSON.parse(raw.text);
   } catch {
     return null;
   }
@@ -85,12 +101,13 @@ function isWebSocketUpgrade(request: Request): boolean {
 const TICKET_TTL_SECONDS = 60;
 
 export function createStreamRouter(options: StreamRouterOptions): StreamRouter {
-  const { resolve, ticketSecret, hub, runner } = options;
+  const { deploymentIdentitySecret, resolve, ticketSecret, hub, runner } =
+    options;
   const base = options.wsBaseUrl ?? '';
 
   async function mintRoute(request: Request): Promise<Response> {
-    const tenant = await resolve(request);
-    if (!tenant) return json({ error: 'authentication required' }, 401);
+    const context = await resolve(request);
+    if (!context) return json({ error: 'authentication required' }, 401);
 
     const body = (await readJson(request)) as {
       channel?: unknown;
@@ -103,38 +120,38 @@ export function createStreamRouter(options: StreamRouterOptions): StreamRouter {
     }
 
     let runId: string | undefined;
+    let workflowId: string | undefined;
     let url: string;
     if (channel === 'run') {
       if (typeof body?.runId !== 'string') {
         return json({ error: 'runId is required for a run ticket' }, 400);
       }
       runId = body.runId;
-      // Ownership, not authorization: a run the tenant does not own is 404, not
-      // 403, so the ticket route is not an existence oracle (mirrors run-router).
-      if (!tenant.ownsRun(runId)) {
+      if (!isPathSafeId(runId)) {
         return json({ error: 'run not found' }, 404);
       }
-      // The run WS path needs the workflowId (the DO is keyed `${wf}:${runId}`);
-      // the client, which drives the run, knows it. When supplied the returned
-      // url is complete; otherwise it carries the runId for the client to
-      // qualify. The ticket claims never carry the workflowId — the WS route
-      // takes it from the path and binds by claims.runId + tenantOfRunId.
-      const workflowId =
-        typeof body.workflowId === 'string' ? body.workflowId : undefined;
-      url =
-        workflowId !== undefined
-          ? `${base}/api/stream/run/${workflowId}/${runId}`
-          : `${base}/api/stream/run/${runId}`;
+      await requireResourceAccess(context, 'run', runId, 'read', 'run');
+      if (
+        typeof body.workflowId !== 'string' ||
+        !isPathSafeId(body.workflowId)
+      ) {
+        return json({ error: 'workflowId is required for a run ticket' }, 400);
+      }
+      workflowId = body.workflowId;
+      if (!(await options.runStatus(workflowId, runId))) {
+        return json({ error: 'run not found' }, 404);
+      }
+      url = `${base}/api/stream/run/${workflowId}/${runId}`;
     } else {
       url = `${base}/api/stream/hub`;
     }
 
     const ticket = await mintStreamTicket({
       secret: ticketSecret,
-      tenantId: tenant.tenantId,
       channel,
+      workflowId,
       runId,
-      actor: tenant.actor,
+      actor: context.actor,
       ttlSeconds: TICKET_TTL_SECONDS,
     });
     return json({
@@ -168,8 +185,7 @@ export function createStreamRouter(options: StreamRouterOptions): StreamRouter {
     forwardUrl.searchParams.set('actorId', claims.actorId);
     forwardUrl.searchParams.set('role', claims.role);
     const forwardRequest = new Request(forwardUrl.toString(), request);
-    return createHubTopology(hub).forwardSubscribe(
-      claims.tenantId,
+    return createHubTopology(hub, deploymentIdentitySecret).forwardSubscribe(
       forwardRequest,
     );
   }
@@ -189,14 +205,14 @@ export function createStreamRouter(options: StreamRouterOptions): StreamRouter {
       secret: ticketSecret,
       token: ticket,
     });
-    // The ticket must be a run ticket for THIS run, and its tenant must be the
-    // one the runId carries (INV-1) — belt over the ownership already baked into
-    // the runId prefix. Any mismatch fails closed.
+    // The ticket must be a run ticket for THIS run. Any mismatch fails closed.
     if (!claims) return json({ error: 'invalid stream ticket' }, 403);
     if (
+      !isPathSafeId(workflowId) ||
+      !isPathSafeId(runId) ||
       claims.channel !== 'run' ||
-      claims.runId !== runId ||
-      claims.tenantId !== tenantOfRunId(runId)
+      claims.workflowId !== workflowId ||
+      claims.runId !== runId
     ) {
       return json({ error: 'invalid stream ticket' }, 403);
     }
@@ -209,7 +225,9 @@ export function createStreamRouter(options: StreamRouterOptions): StreamRouter {
     const stub = runner.get(
       runner.idFromName(`${workflowId}:${runId}`),
     ) as unknown as UpgradeForwardStub;
-    return stub.fetch(forwardRequest);
+    return stub.fetch(
+      stampDeploymentIdentityRequest(forwardRequest, deploymentIdentitySecret),
+    );
   }
 
   return async (request: Request): Promise<Response | null> => {
@@ -244,10 +262,13 @@ export function createStreamRouter(options: StreamRouterOptions): StreamRouter {
       }
       return json({ error: 'not found' }, 404);
     } catch (error) {
-      // A malformed tenant claim is a verifier bug -> 403 (mirrors run-router);
+      // Malformed authenticated claims are a verifier bug -> 403 (mirrors run-router);
       // anything else is an unexpected 500.
-      if (error instanceof TenantResolutionError) {
+      if (error instanceof ActorResolutionError) {
         return json({ error: 'forbidden' }, 403);
+      }
+      if (error instanceof RunRouteError && error.status < 500) {
+        return json({ error: error.message }, error.status);
       }
       return json(
         { error: error instanceof Error ? error.message : String(error) },

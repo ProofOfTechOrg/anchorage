@@ -1,44 +1,68 @@
 // SPDX-License-Identifier: Apache-2.0
 // createSubscriptionRouter — the human-only HTTP subscribe/unsubscribe surface
 // (RA-009: NEVER exposed as model tools; nothing here mints capability, P8). The
-// gate order mirrors createSignalRouter: resolve → role → thread-ownership →
-// memory-id refusal → mutate, every outcome audited.
+// gate order mirrors createSignalRouter: resolve → thread-ownership → role →
+// memory-id refusal → mutate. Committed mutations and probe-like post-auth
+// denials are audited.
 import { describe, expect, it, vi } from 'vitest';
 
-import type { ApprovalRole, TenantContext } from '../approval-api/index.js';
-import { mintResourceId, tenantOwnsMemoryId } from '../do-runner/index.js';
-import { InMemorySubscriptionStoreFactory } from './subscription-d1.js';
+import type { ActorContext, ApprovalRole } from '../approval-api/index.js';
+import { resourceIdFromKey } from '../do-runner/index.js';
+import { RunRouteError } from '../host-kit/index.js';
+import {
+  InMemorySubscriptionStoreFactory,
+  MAX_EXTERNAL_RESOURCE_ID_BYTES,
+} from './subscription-d1.js';
 import {
   createSubscriptionRouter,
   type SignalProviderAuditEvent,
   type SignalProviderAuditSink,
+  type SubscriptionRouterOptions,
 } from './webhook-route.js';
 
-function ctx(tenantId: string, role: ApprovalRole): TenantContext {
+function ctx(role: ApprovalRole): ActorContext {
   return {
-    actor: { id: 'op', role, tenantId },
-    tenantId,
-    newResourceId: (key: string) => mintResourceId(tenantId, key),
-    ownsMemoryId: (id: string) => tenantOwnsMemoryId(tenantId, id),
-  } as unknown as TenantContext;
+    actor: { id: 'op', role },
+    principal: { kind: 'human', id: 'op', role },
+    resourceOwner: { kind: 'human', id: 'op' },
+    service: () => {
+      throw new Error('approval service is not used in subscription tests');
+    },
+    newRunId: () => 'run-1',
+    newThreadId: () => 'thread-1',
+    resourceIdFromKey: resourceIdFromKey,
+    claimResource: async () => undefined,
+    releaseResource: async () => undefined,
+    resourceOwnerFor: async (kind, id) =>
+      (kind === 'thread' && id === 'acme_t1') ||
+      (kind === 'resource' && (id === 'owner' || id === 'user-42'))
+        ? { kind: 'human', id: 'op' }
+        : undefined,
+    canAccessResource: async (kind, id) =>
+      (kind === 'thread' && id === 'acme_t1') ||
+      (kind === 'resource' && (id === 'owner' || id === 'user-42')),
+    canSelfDecide: () => false,
+  };
 }
 
 function setup(
   opts: {
-    resolveTo?: TenantContext | undefined;
+    resolveTo?: ActorContext | undefined;
     role?: ApprovalRole;
     maxBodyBytes?: number;
-    reconcilePolling?: (tenant: TenantContext) => Promise<void>;
+    reconcilePolling?: () => Promise<void>;
     audit?: SignalProviderAuditSink;
+    validateThreadTarget?: SubscriptionRouterOptions['validateThreadTarget'];
   } = {},
 ) {
   const factory = new InMemorySubscriptionStoreFactory();
   const events: SignalProviderAuditEvent[] = [];
   const resolved =
-    'resolveTo' in opts ? opts.resolveTo : ctx('acme', opts.role ?? 'operator');
+    'resolveTo' in opts ? opts.resolveTo : ctx(opts.role ?? 'operator');
   const router = createSubscriptionRouter({
     resolve: async () => resolved,
     subscriptions: factory,
+    validateThreadTarget: opts.validateThreadTarget ?? (async () => undefined),
     knownProviders: ['github'],
     audit:
       opts.audit ??
@@ -118,7 +142,7 @@ describe('createSubscriptionRouter', () => {
     ]);
   });
 
-  it('404s a foreign threadId (no existence oracle) and audits it', async () => {
+  it('404s a path-safe thread owned by another actor before parsing', async () => {
     const { router, events } = setup();
     const res = await router(
       req('POST', 'globex_t1', {
@@ -131,7 +155,7 @@ describe('createSubscriptionRouter', () => {
     expect(events).toEqual([
       expect.objectContaining({
         outcome: 'rejected',
-        reason: 'foreign-thread',
+        reason: 'resource-not-found',
       }),
     ]);
   });
@@ -167,7 +191,27 @@ describe('createSubscriptionRouter', () => {
     expect(res?.status).toBe(400);
   });
 
-  it('subscribes, lists, and unsubscribes — server-minting the resourceId', async () => {
+  it.each([
+    ['ASCII control', 'github:acme\nrepo'],
+    [
+      'oversized UTF-8 value',
+      'é'.repeat(MAX_EXTERNAL_RESOURCE_ID_BYTES / 2 + 1),
+    ],
+  ])('400s an %s external resource id before mutation', async (_label, externalResourceId) => {
+    const { router, factory } = setup();
+    const res = await router(
+      req('POST', 'acme_t1', {
+        providerId: 'github',
+        externalResourceId,
+        resourceKey: 'owner',
+      }),
+    );
+
+    expect(res?.status).toBe(400);
+    expect(await factory.store().listForThread('acme_t1')).toEqual([]);
+  });
+
+  it('subscribes, lists, and unsubscribes with a validated resource key', async () => {
     const { router, events } = setup();
     // #when subscribe
     const sub = await router(
@@ -177,12 +221,12 @@ describe('createSubscriptionRouter', () => {
         resourceKey: 'user-42',
       }),
     );
-    // #then — resourceId minted server-side (tenant-salted), audited
+    // #then — resourceId validated through the server context, audited
     expect(sub?.status).toBe(200);
     const created = (await sub?.json()) as {
       subscription: { resourceId: string };
     };
-    expect(created.subscription.resourceId).toBe('acme_user-42');
+    expect(created.subscription.resourceId).toBe('user-42');
     expect(events.at(-1)).toMatchObject({
       action: 'subscribe',
       outcome: 'accepted',
@@ -206,8 +250,80 @@ describe('createSubscriptionRouter', () => {
     expect(events.at(-1)).toMatchObject({ action: 'unsubscribe' });
   });
 
+  it('lets an admin manage a foreign bound thread without changing its owner', async () => {
+    const admin = ctx('admin');
+    const foreignOwner = { kind: 'human' as const, id: 'alice' };
+    admin.resourceOwnerFor = async (kind, id) =>
+      (kind === 'thread' && id === 'acme_t1') ||
+      (kind === 'resource' && id === 'user-42')
+        ? foreignOwner
+        : undefined;
+    admin.canAccessResource = async () => true;
+    const { router } = setup({ resolveTo: admin });
+
+    const response = await router(
+      req('POST', 'acme_t1', {
+        providerId: 'github',
+        externalResourceId: 'github:acme/repo',
+        resourceKey: 'user-42',
+      }),
+    );
+
+    expect(response?.status).toBe(200);
+  });
+
+  it('refuses an authorized resource that is not the thread binding', async () => {
+    const validateThreadTarget = vi.fn(async () => {
+      throw new RunRouteError(404, 'agent not found');
+    });
+    const { router, factory } = setup({ validateThreadTarget });
+
+    const response = await router(
+      req('POST', 'acme_t1', {
+        providerId: 'github',
+        externalResourceId: 'github:acme/repo',
+        resourceKey: 'user-42',
+      }),
+    );
+
+    expect(response?.status).toBe(404);
+    expect(validateThreadTarget).toHaveBeenCalledWith(expect.anything(), {
+      threadId: 'acme_t1',
+      resourceId: 'user-42',
+    });
+    expect(await factory.store().listForThread('acme_t1')).toEqual([]);
+  });
+
+  it('refuses a thread and resource owned by different principals', async () => {
+    const base = ctx('operator');
+    const resolved: ActorContext = {
+      ...base,
+      resourceOwnerFor: async (kind) =>
+        kind === 'thread'
+          ? { kind: 'human', id: 'op' }
+          : { kind: 'human', id: 'other' },
+    };
+    const validateThreadTarget = vi.fn(async () => undefined);
+    const { router, factory } = setup({
+      resolveTo: resolved,
+      validateThreadTarget,
+    });
+
+    const response = await router(
+      req('POST', 'acme_t1', {
+        providerId: 'github',
+        externalResourceId: 'github:acme/repo',
+        resourceKey: 'owner',
+      }),
+    );
+
+    expect(response?.status).toBe(404);
+    expect(validateThreadTarget).not.toHaveBeenCalled();
+    expect(await factory.store().listForThread('acme_t1')).toEqual([]);
+  });
+
   it('reconciles polling after subscribe and every idempotent unsubscribe', async () => {
-    const reconcilePolling = vi.fn(async (_tenant: TenantContext) => {});
+    const reconcilePolling = vi.fn(async () => {});
     const { router, events } = setup({ reconcilePolling });
 
     const subscribed = await router(
@@ -219,10 +335,7 @@ describe('createSubscriptionRouter', () => {
     );
     expect(subscribed?.status).toBe(200);
     expect(reconcilePolling).toHaveBeenCalledTimes(1);
-    expect(reconcilePolling.mock.calls[0]?.[0]).toMatchObject({
-      tenantId: 'acme',
-      actor: { tenantId: 'acme' },
-    });
+    expect(reconcilePolling.mock.calls[0]).toEqual([]);
     expect(events.at(-1)).toMatchObject({
       action: 'subscribe',
       outcome: 'accepted',
@@ -252,7 +365,7 @@ describe('createSubscriptionRouter', () => {
     });
   });
 
-  it('reports a post-commit reconcile failure as retry-safe 502 while retaining the row', async () => {
+  it('returns the committed mutation when post-commit polling reconciliation fails', async () => {
     const reconcilePolling = vi.fn(async () => {
       throw new Error('private provider-host failure');
     });
@@ -271,15 +384,10 @@ describe('createSubscriptionRouter', () => {
         }),
       );
 
-      expect(response?.status).toBe(502);
+      expect(response?.status).toBe(200);
       const payload = await response?.json();
-      expect(payload).toEqual({
-        error: 'polling lifecycle unavailable',
-        mutationApplied: true,
-      });
-      expect(
-        await factory.forTenant('acme').listForThread('acme_t1'),
-      ).toHaveLength(1);
+      expect(payload).toMatchObject({ subscription: { providerId: 'github' } });
+      expect(await factory.store().listForThread('acme_t1')).toHaveLength(1);
       expect(events).toHaveLength(1);
       expect(events[0]).toMatchObject({
         action: 'subscribe',
@@ -335,9 +443,7 @@ describe('createSubscriptionRouter', () => {
       );
 
       expect(response?.status).toBe(200);
-      expect(
-        await factory.forTenant('acme').listForThread('acme_t1'),
-      ).toHaveLength(1);
+      expect(await factory.store().listForThread('acme_t1')).toHaveLength(1);
       expect(audit).toHaveBeenCalledTimes(1);
       expect(audit.mock.calls[0]?.[0]).toMatchObject({
         action: 'subscribe',
@@ -352,15 +458,16 @@ describe('createSubscriptionRouter', () => {
   it('does not reconcile when the durable row mutation fails', async () => {
     const reconcilePolling = vi.fn(async () => {});
     const router = createSubscriptionRouter({
-      resolve: async () => ctx('acme', 'operator'),
+      resolve: async () => ctx('operator'),
       subscriptions: {
-        forTenant: () => ({
+        store: () => ({
           subscribe: async () => {
             throw new Error('database unavailable');
           },
         }),
       } as never,
       knownProviders: ['github'],
+      validateThreadTarget: async () => undefined,
       reconcilePolling,
     });
 
@@ -418,15 +525,16 @@ describe('createSubscriptionRouter', () => {
       logged.push(String(value));
     });
     const router = createSubscriptionRouter({
-      resolve: async () => ctx('acme', 'operator'),
+      resolve: async () => ctx('operator'),
       subscriptions: {
-        forTenant: () => ({
+        store: () => ({
           listForThread: async () => {
             throw new Error('private database detail');
           },
         }),
       } as never,
       knownProviders: ['github'],
+      validateThreadTarget: async () => undefined,
       audit: (event) => {
         events.push(event);
       },

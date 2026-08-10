@@ -69,7 +69,7 @@ export function approvalFilterKey(filter: ApprovalListFilter): string {
  * no-renderer stance; the one exception is
  * use-approval-dashboard.render.test.ts, which mounts the hook on happy-dom
  * to pin the dependency-identity wiring — see README). metrics() is
- * deliberately called with no filter: it always summarizes the whole tenant
+ * deliberately called with no filter: it always summarizes the whole deployment
  * queue, independent of the queue view's slice.
  */
 export async function fetchDashboardSnapshot(
@@ -377,7 +377,7 @@ export interface UseApprovalDashboardOptions {
   /**
    * Live streaming through an injected StreamTransport and ticket() thunk.
    * Absent means poll-only. When present the hook opens
-   * the tenant's approval stream and live-merges events on top of the interval
+   * the deployment approval stream and live-merges events on top of the interval
    * poll, which keeps running as the periodic reconciler.
    */
   stream?: ApprovalStreamOption;
@@ -431,7 +431,7 @@ export interface ApprovalDashboardState {
   delegate: (to: string) => void;
   refresh: () => Promise<void>;
   /**
-   * Reviewers currently connected to the tenant's live stream (deduped by
+   * Reviewers currently connected to the deployment live stream (deduped by
    * actorId). Empty in poll-only mode.
    */
   presence: PresenceMember[];

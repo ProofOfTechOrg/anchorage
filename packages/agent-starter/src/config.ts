@@ -9,7 +9,7 @@ import {
   type TokenVerifier,
 } from '@proofoftech/flowsafe/host-kit';
 
-export const SYSTEM_ACTOR_ID = 'anchorage-agent-starter';
+export const SYSTEM_PRINCIPAL_ID = 'anchorage-agent-starter';
 export const SWEEP_CRON = '*/5 * * * *';
 export const PURGE_CRON = '17 * * * *';
 export const TICK_CRON = '* * * * *';
@@ -32,7 +32,7 @@ let verifierMemo:
 let githubOwnershipMemo:
   | {
       raw: string;
-      resources: ReadonlyMap<string, readonly string[]>;
+      resources: readonly string[];
     }
   | undefined;
 
@@ -98,39 +98,29 @@ export function csv(value: string | undefined): string[] {
 
 export function githubResourceAllowed(
   env: Env,
-  tenantId: string,
   externalResourceId: string,
 ): boolean {
   const raw = env.GITHUB_RESOURCE_ALLOWLIST;
   if (githubOwnershipMemo?.raw !== raw) {
-    const resources = new Map<string, readonly string[]>();
+    let resources: readonly string[] = [];
     try {
       const parsed = JSON.parse(raw) as unknown;
       if (
-        typeof parsed === 'object' &&
-        parsed !== null &&
-        !Array.isArray(parsed)
+        Array.isArray(parsed) &&
+        parsed.every(
+          (resource) =>
+            typeof resource === 'string' &&
+            /^github:[^/#\s]+\/[^/#\s]+$/.test(resource),
+        )
       ) {
-        for (const [tenant, candidate] of Object.entries(parsed)) {
-          if (
-            Array.isArray(candidate) &&
-            candidate.every(
-              (resource) =>
-                typeof resource === 'string' &&
-                /^github:[^/#\s]+\/[^/#\s]+$/.test(resource),
-            )
-          ) {
-            resources.set(tenant, [...new Set(candidate)]);
-          }
-        }
+        resources = [...new Set(parsed)];
       }
     } catch {
       // Invalid configuration is an empty allowlist, never allow-all.
     }
     githubOwnershipMemo = { raw, resources };
   }
-  const allowed = githubOwnershipMemo.resources.get(tenantId) ?? [];
-  return allowed.some(
+  return githubOwnershipMemo.resources.some(
     (resource) =>
       externalResourceId === resource ||
       externalResourceId.startsWith(`${resource}#`),

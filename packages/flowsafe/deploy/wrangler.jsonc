@@ -1,16 +1,21 @@
 {
   "$schema": "https://unpkg.com/wrangler/config-schema.json",
-  "name": "anchorage-flowsafe",
+  // Replace `replace-me` with the deployment tag before creating any resource.
+  // The Worker name is the Durable Object namespace boundary, so every
+  // organization must use a distinct script name.
+  "name": "anchorage-flowsafe-replace-me",
   "main": "./worker.ts",
-  "compatibility_date": "2025-06-01",
+  "compatibility_date": "2026-07-26",
   "compatibility_flags": ["nodejs_compat"],
+  "secrets": {
+    "required": ["DEPLOYMENT_IDENTITY_SECRET"]
+  },
   // The worker emits structured JSON (audit + maintenance) to Workers Logs.
   "observability": { "enabled": true },
   "durable_objects": {
     "bindings": [
       { "name": "RUNNER", "class_name": "FlowsafeRunner" },
-      // Per-tenant live-stream fan-out hub (one instance per tenant,
-      // idFromName(tenantId)). Streaming activates only once the
+      // Deployment live-stream fan-out singleton. Streaming activates once the
       // STREAM_TICKET_SECRET secret is also set (opt-in).
       { "name": "HUB", "class_name": "FlowsafeHub" }
     ]
@@ -24,9 +29,9 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "anchorage-flowsafe",
-      // `wrangler d1 create anchorage-flowsafe` prints the id — paste it here.
-      // Tables are created lazily by the stores; no migration files needed.
+      "database_name": "anchorage-flowsafe-replace-me",
+      // `wrangler d1 create anchorage-flowsafe-<tag>` prints the id — paste it here.
+      // Provisioning must seed flowsafe_deployment before serving.
       "database_id": "REPLACE-WITH-YOUR-D1-DATABASE-ID"
     }
   ],
@@ -37,21 +42,31 @@
   // crons.ts's SWEEP_CRON / PURGE_CRON; keep the sweep interval >= your SLA
   // granularity.
   "triggers": { "crons": ["*/15 * * * *", "7 * * * *"] },
-  // Optional audit export to a SIEM: `wrangler queues create anchorage-audit`
-  // (and anchorage-audit-dlq), uncomment, then set SIEM_ENDPOINT (var below)
-  // and SIEM_AUTH_HEADER (secret). Without this block, audit events stay on
-  // structured Workers Logs only.
+  // Optional audit export to a SIEM. Replace `replace-me` with the deployment
+  // tag, create both queues, uncomment this block, then set SIEM_ENDPOINT (var
+  // below) and SIEM_AUTH_HEADER (secret). Without this block, audit events stay
+  // on structured Workers Logs only.
+  //   wrangler queues create anchorage-flowsafe-replace-me-audit
+  //   wrangler queues create anchorage-flowsafe-replace-me-audit-dlq
   // "queues": {
-  //   "producers": [{ "binding": "AUDIT_QUEUE", "queue": "anchorage-audit" }],
+  //   "producers": [
+  //     {
+  //       "binding": "AUDIT_QUEUE",
+  //       "queue": "anchorage-flowsafe-replace-me-audit"
+  //     }
+  //   ],
   //   "consumers": [
   //     {
-  //       "queue": "anchorage-audit",
+  //       "queue": "anchorage-flowsafe-replace-me-audit",
   //       "max_retries": 10,
-  //       "dead_letter_queue": "anchorage-audit-dlq"
+  //       "dead_letter_queue": "anchorage-flowsafe-replace-me-audit-dlq"
   //     }
   //   ]
   // },
   "vars": {
+    // Must match the flowsafe_deployment sentinel in this deployment's DB.
+    // Deliberately invalid until provisioning replaces it with a lowercase tag.
+    "DEPLOYMENT_TENANT": "REPLACE_WITH_DEPLOYMENT_TAG",
     "APPROVAL_SLA_SECONDS": "14400",
     "RUN_RETENTION_DAYS": "30",
     "APPROVAL_RETENTION_DAYS": "30"
@@ -60,24 +75,14 @@
     // self-approve; any invalid value falls back to OFF. Leave unset to keep
     // SoD fully on.
     // "APPROVAL_ALLOW_SELF_DECISION": "admin"
-    // Client-per-subdomain deployments: set the apex and every request to
-    // <tenant>.<apex> is denied unless the token's VERIFIED tenant is that
-    // tenant. Defense in depth over the tenant-bound stores (INV-2) — it
-    // closes the confused-deputy UX where a user pastes tenant A's token into
-    // tenant B's branded host. Hosts outside the apex and the reserved
-    // never-allocatable subdomains (app/www/api/docs/admin/status, plus
-    // system/default) skip the check.
-    // "TENANT_APEX_DOMAIN": "example.com"
     // "SIEM_ENDPOINT": "https://siem.example/services/collector"
   }
   // Secrets (set with `wrangler secret put <name>`):
+  //   DEPLOYMENT_IDENTITY_SECRET — REQUIRED; at least 32 random visible ASCII characters.
+  //     Shared only by this deployment's Worker and Durable Objects.
   //   APPROVAL_ACTOR_TOKENS — JSON map of bearer token ->
-  //     { id, role, tenantId }; roles: admin | builder | operator | reviewer |
-  //     viewer; tenantId must match ^[a-z0-9]{3,32}$ (INV-3) and must not be
-  //     'system' (the maintenance actor's audit identity) or the entry is
-  //     dropped and its token 401s. Provision each tenantId through the
-  //     `tenants` registry (provisionTenant) BEFORE issuing its tokens
-  //     (single-tenant hosts: see README "Hosting a single tenant").
+  //     { id, role }; roles: admin | builder | operator | reviewer | viewer.
+  //     Unknown roles or malformed actor ids are dropped and their tokens 401.
   //   SIEM_AUTH_HEADER — sent as the `authorization` header on audit export,
   //     e.g. "Splunk <hec-token>".
   //   STREAM_TICKET_SECRET — OPTIONAL; enables live streaming. A DEDICATED HMAC

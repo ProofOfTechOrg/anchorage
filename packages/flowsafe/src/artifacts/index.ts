@@ -8,13 +8,13 @@
 // speaks the ArtifactBucket subset of Cloudflare's R2Bucket, and
 // InMemoryArtifactBucket implements the same subset for tests and local dev
 // — the store logic is identical either way. Ids reuse the do-runner's
-// PATH_SAFE_ID_PATTERN so anything addressable as a run is addressable as an
+// path-safe id contract so anything addressable as a run is addressable as an
 // artifact scope, and names are validated segment-wise (no '.'/'..', no
 // empty segments) so a name can never escape its run's keyspace.
 
 import type { R2Bucket } from '@cloudflare/workers-types';
 
-import { PATH_SAFE_ID_PATTERN } from '../do-runner/path-safe-id.js';
+import { isPathSafeId } from '../do-runner/path-safe-id.js';
 
 /** Bodies R2's put() accepts; the in-memory bucket normalizes them all. */
 export type ArtifactBody =
@@ -120,20 +120,25 @@ export class InvalidArtifactRefError extends Error {
 // client error instead of an opaque bucket rejection.
 const MAX_KEY_BYTES = 1024;
 
-function assertPathSafeId(value: string, field: string): void {
-  if (!PATH_SAFE_ID_PATTERN.test(value)) {
+function assertPathSafeId(
+  value: unknown,
+  field: string,
+): asserts value is string {
+  if (!isPathSafeId(value)) {
     throw new InvalidArtifactRefError(
       `${field} must be URL-path-safe (letters, digits, '.', '_', '~', '-'; 1-200 chars)`,
     );
   }
 }
 
-function assertArtifactName(name: string): void {
+function assertArtifactName(name: unknown): asserts name is string {
+  if (typeof name !== 'string') {
+    throw new InvalidArtifactRefError(
+      "artifact name must be '/'-joined path-safe segments (letters, digits, '.', '_', '~', '-'; no empty, '.', or '..' segments)",
+    );
+  }
   const segments = name.split('/');
-  if (
-    name.length === 0 ||
-    segments.some((segment) => !PATH_SAFE_ID_PATTERN.test(segment))
-  ) {
+  if (name.length === 0 || segments.some((segment) => !isPathSafeId(segment))) {
     throw new InvalidArtifactRefError(
       "artifact name must be '/'-joined path-safe segments (letters, digits, '.', '_', '~', '-'; no empty, '.', or '..' segments)",
     );
@@ -233,9 +238,8 @@ export class R2ArtifactStore {
   /**
    * Delete every artifact of a run; returns the count. Idempotent (a
    * deleted run lists nothing). The purges call it: pass this store as
-   * `artifactStore` to BOTH purgeExpiredWorkflowRuns (per aged-out run,
-   * with its snapshot row) and purgeTenant (per surviving run at
-   * offboarding) — the snapshot rows are the only enumerable record of a
+   * `artifactStore` to purgeExpiredWorkflowRuns (per aged-out run, with its
+   * snapshot row) — the snapshot rows are the only enumerable record of a
    * run's artifact keys, so an unpaired retention purge strands them.
    */
   async deleteRun(workflowId: string, runId: string): Promise<number> {

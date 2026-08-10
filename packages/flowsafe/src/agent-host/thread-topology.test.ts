@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from 'vitest';
-import type { ApprovalRecord, TenantContext } from '../approval-api/index.js';
+import type { ActorContext, ApprovalRecord } from '../approval-api/index.js';
 import type {
   ThreadNamespaceLike,
   ThreadRequestInit,
 } from '../host-kit/index.js';
 
 import {
-  type AgentThreadTopology,
+  type AgentThreadDispatchTopology,
   createAgentThreadTopology,
 } from './thread-topology.js';
+
+const DEPLOYMENT_IDENTITY_SECRET = 'test-deployment-identity-secret-0001';
 
 interface Hit {
   threadId: string;
@@ -19,7 +21,7 @@ interface Hit {
 }
 
 function harness(): {
-  topology: AgentThreadTopology;
+  topology: AgentThreadDispatchTopology;
   hits: Hit[];
 } {
   const hits: Hit[] = [];
@@ -62,29 +64,33 @@ function harness(): {
       }) as ReturnType<ThreadNamespaceLike<string>['get']>['fetch'],
     }),
   };
-  return { topology: createAgentThreadTopology(namespace), hits };
+  return {
+    topology: createAgentThreadTopology(namespace, DEPLOYMENT_IDENTITY_SECRET),
+    hits,
+  };
 }
 
-function tenant() {
+function context() {
   let runMints = 0;
   let threadMints = 0;
-  const value: TenantContext = {
-    actor: { id: 'operator-1', role: 'operator', tenantId: 'acme' },
+  const value: ActorContext = {
+    actor: { id: 'operator-1', role: 'operator' },
     principal: {
       kind: 'human',
       id: 'operator-1',
-      tenantId: 'acme',
       role: 'operator',
     },
-    tenantId: 'acme',
+    resourceOwner: { kind: 'human', id: 'operator-1' },
     service: () => {
       throw new Error('unused');
     },
     newRunId: () => `acme_run_${++runMints}`,
-    ownsRun: (id) => id.startsWith('acme_'),
     newThreadId: () => `acme_thread_${++threadMints}`,
-    newResourceId: (threadId) => `acme_resource_${threadId}`,
-    ownsMemoryId: (id) => id.startsWith('acme_'),
+    resourceIdFromKey: (threadId) => `acme_resource_${threadId}`,
+    claimResource: async () => undefined,
+    releaseResource: async () => undefined,
+    resourceOwnerFor: async () => undefined,
+    canAccessResource: async () => true,
     canSelfDecide: () => false,
   };
   return {
@@ -95,9 +101,29 @@ function tenant() {
 }
 
 describe('createAgentThreadTopology', () => {
-  it('mints each HTTP start identity exactly once and stamps the principal', async () => {
+  it('validates a standing target through its owning thread DO binding', async () => {
     const { topology, hits } = harness();
-    const scoped = tenant();
+    const scoped = context();
+
+    await topology.requireBoundThread(scoped.value, {
+      agentId: 'writer',
+      threadId: 'acme_thread',
+      resourceId: 'acme_resource_acme_thread',
+    });
+
+    expect(hits).toEqual([
+      expect.objectContaining({
+        threadId: 'acme_thread',
+        url: expect.stringContaining(
+          '/_flowsafe/agent-host/binding?resourceId=acme_resource_acme_thread&agentId=writer',
+        ),
+      }),
+    ]);
+  });
+
+  it('mints each server-owned HTTP start id once and stamps the principal', async () => {
+    const { topology, hits } = harness();
+    const scoped = context();
     const result = await topology.start(scoped.value, {
       agentId: 'writer',
       prompt: 'go',
@@ -107,7 +133,6 @@ describe('createAgentThreadTopology', () => {
     expect(scoped.runMints()).toBe(1);
     expect(scoped.threadMints()).toBe(1);
     expect(hits[0]?.init?.headers).toMatchObject({
-      'x-flowsafe-tenant': 'acme',
       // The principal is the sole identity channel; the DO projects the actor
       // from it rather than trusting a second header.
       'x-flowsafe-principal':
@@ -117,11 +142,13 @@ describe('createAgentThreadTopology', () => {
 
   it('accepts an already server-minted run for schedules without minting twice', async () => {
     const { topology, hits } = harness();
-    const scoped = tenant();
+    const scoped = context();
     const result = await topology.start(scoped.value, {
       agentId: 'writer',
       prompt: 'scheduled',
       entryPath: 'schedule.fire',
+      scheduleId: 'acme_schedule',
+      dispatchId: 'acme_dispatch',
       runId: 'acme_scheduled-run',
       threadId: 'acme_thread_existing',
       resourceId: 'acme_resource_acme_thread_existing',
@@ -151,11 +178,13 @@ describe('createAgentThreadTopology', () => {
 
   it('mints an ephemeral thread for unthreaded schedules and rejects a supplied thread', async () => {
     const { topology } = harness();
-    const scoped = tenant();
+    const scoped = context();
     await topology.start(scoped.value, {
       agentId: 'writer',
       prompt: 'scheduled',
       entryPath: 'schedule.fire',
+      scheduleId: 'acme_schedule',
+      dispatchId: 'acme_dispatch',
       threaded: false,
     });
     expect(scoped.threadMints()).toBe(1);
@@ -164,6 +193,8 @@ describe('createAgentThreadTopology', () => {
         agentId: 'writer',
         prompt: 'scheduled',
         entryPath: 'schedule.fire',
+        scheduleId: 'acme_schedule',
+        dispatchId: 'acme_dispatch',
         threaded: false,
         threadId: 'acme_existing',
       }),
@@ -172,7 +203,7 @@ describe('createAgentThreadTopology', () => {
 
   it('routes status, observation, and approval resume through the owning thread', async () => {
     const { topology, hits } = harness();
-    const scoped = tenant();
+    const scoped = context();
     await topology.status(scoped.value, {
       agentId: 'writer',
       threadId: 'acme_thread',
@@ -187,7 +218,7 @@ describe('createAgentThreadTopology', () => {
     const record = {
       workflowId: 'durable-agentic-loop',
       runId: 'acme_run',
-      tenantId: 'acme',
+      decidedBy: 'reviewer-1',
       stepPath: ['tool'],
       resumeTarget: {
         kind: 'agent-thread',
@@ -206,23 +237,69 @@ describe('createAgentThreadTopology', () => {
     expect(hits[1]?.url).toContain('offset=4');
   });
 
-  it('refuses foreign trusted IDs before addressing a DO', async () => {
+  it('routes path-safe ids after context authorization', async () => {
     const { topology, hits } = harness();
-    const scoped = tenant();
+    const scoped = context();
+    await topology.status(scoped.value, {
+      agentId: 'writer',
+      threadId: 'thread-1',
+      runId: 'run-1',
+    });
+    await topology.status(scoped.value, {
+      agentId: 'writer',
+      threadId: 'thread-2',
+      runId: 'run-2',
+    });
+    expect(hits.map((hit) => hit.threadId)).toEqual(['thread-1', 'thread-2']);
+  });
+
+  it('refuses status before addressing a run the context cannot read', async () => {
+    const { topology, hits } = harness();
+    const scoped = context();
+    scoped.value.canAccessResource = async () => false;
+
     await expect(
       topology.status(scoped.value, {
         agentId: 'writer',
-        threadId: 'globex_thread',
-        runId: 'globex_run',
+        threadId: 'foreign-thread',
+        runId: 'foreign-run',
       }),
     ).rejects.toMatchObject({ status: 404 });
+    expect(hits).toHaveLength(0);
+  });
+
+  it('recovers a dispatched run after its ephemeral thread ownership is released', async () => {
+    const { topology, hits } = harness();
+    const scoped = context();
+    scoped.value.canAccessResource = async (kind) => kind === 'run';
+
     await expect(
-      topology.status(scoped.value, {
+      topology.dispatchStatus(scoped.value, {
         agentId: 'writer',
-        threadId: 'acme_thread',
-        runId: 'globex_run',
+        threadId: 'ephemeral-thread',
+        runId: 'owned-run',
+      }),
+    ).resolves.toMatchObject({ summary: { status: 'success' } });
+    expect(hits).toEqual([
+      expect.objectContaining({
+        threadId: 'ephemeral-thread',
+        url: expect.stringContaining('&dispatch=1'),
+      }),
+    ]);
+  });
+
+  it('refuses dispatch recovery before addressing a run the context does not own', async () => {
+    const { topology, hits } = harness();
+    const scoped = context();
+    scoped.value.canAccessResource = async () => false;
+
+    await expect(
+      topology.dispatchStatus(scoped.value, {
+        agentId: 'writer',
+        threadId: 'foreign-thread',
+        runId: 'foreign-run',
       }),
     ).rejects.toMatchObject({ status: 404 });
-    expect(hits).toEqual([]);
+    expect(hits).toHaveLength(0);
   });
 });

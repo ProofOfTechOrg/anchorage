@@ -3,13 +3,13 @@
 // the payment connector may fire. Capabilities shown: the write-approval grant
 // (requiresApproval — the resumed leg re-derives the grant from APPROVED
 // records; a forged resume reaches the connector with no grant and is denied),
-// tenant isolation on the connector's scope keys, and separation of duties at
-// the queue (the requester cannot release their own wire). The connector is
+// and separation of duties at the queue (the requester cannot release their
+// own wire). The connector is
 // binding-gated like every showcase side effect: no payment rail is wired, so
 // execute records the envelope and returns a simulated confirmation while the
 // grant gate stays fully real.
 
-import { createConnector, tenantIsolation } from '@proofoftech/breakwater';
+import { createConnector } from '@proofoftech/breakwater';
 import type { WorkflowModule } from '@proofoftech/flowsafe/host-kit/module';
 import { z } from 'zod';
 import {
@@ -40,8 +40,8 @@ export const wireTransferModule: WorkflowModule<ShowcaseModuleDeps> = {
   register({ createWorkflow, createStep, audit }) {
     // The gated write. No payment binding exists, so execute is a simulation
     // by construction — but it still runs the real wrapper: the approval
-    // grant, tenant isolation, and audit all fire exactly as they would with
-    // a live rail behind it.
+    // grant and audit both fire exactly as they would with a live rail behind
+    // it.
     const releaseWireConnector = createConnector<
       {
         amount: number;
@@ -65,12 +65,7 @@ export const wireTransferModule: WorkflowModule<ShowcaseModuleDeps> = {
         reference: z.string(),
       }),
       permissions: { sideEffect: 'write', requiresApproval: true },
-      policies: {
-        audit,
-        // Mandatory on this multi-tenant host: a scope-less call denies
-        // instead of collapsing to unsegmented keys (see gtm-outbound).
-        evaluators: [tenantIsolation()],
-      },
+      policies: { audit },
       execute: async ({ amount, currency, beneficiary, reference }) => {
         console.log(
           JSON.stringify({

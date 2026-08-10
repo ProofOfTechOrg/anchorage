@@ -12,7 +12,7 @@ channel or response-time SLA.
 2. Search [existing issues](https://github.com/ProofOfTechOrg/anchorage/issues)
    for the error, feature, or integration.
 3. Reduce the problem to the smallest reproducible example and remove
-   credentials, tenant data, and other secrets.
+   credentials, organization data, and other secrets.
 
 ## Where to ask
 
@@ -27,7 +27,7 @@ channel or response-time SLA.
 
 Include the affected package and version, `@mastra/core` version, Node or
 Workers runtime, deployment topology, relevant configuration, and a minimal
-reproduction. Replace secrets and tenant identifiers before posting logs.
+reproduction. Replace secrets and organization identifiers before posting logs.
 
 Do not report exploitable vulnerabilities in a public issue. Follow
 [`SECURITY.md`](SECURITY.md) and use GitHub's private vulnerability-reporting

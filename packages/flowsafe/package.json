@@ -6,16 +6,28 @@
   },
   "files": [
     "dist",
+    "deployment-identity-protocol.d.mts",
+    "deployment-identity-protocol.mjs",
+    "scripts/seed-deployment-identity.mjs",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
   ],
+  "bin": {
+    "flowsafe-provision": "./scripts/seed-deployment-identity.mjs"
+  },
   "sideEffects": false,
   "engines": {
     "node": ">=22"
   },
   "description": "Approval UX + Cloudflare-native durable execution for AI agent workflows",
   "type": "module",
+  "imports": {
+    "#deployment-identity-protocol": {
+      "types": "./deployment-identity-protocol.d.mts",
+      "default": "./deployment-identity-protocol.mjs"
+    }
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ProofOfTechOrg/anchorage.git",
@@ -50,6 +62,7 @@
     "dev": "tsc --watch",
     "test": "vitest run",
     "test:agent-host-export": "node scripts/agent-host-pack-test.mjs",
+    "test:provisioning-export": "node scripts/provisioning-pack-test.mjs",
     "test:signals-client-export": "node scripts/signals-client-pack-test.mjs",
     "test:watch": "vitest",
     "example:gtm": "vitest run examples/gtm-outbound.e2e.test.ts",
@@ -61,13 +74,15 @@
     "spike:verify:llm": "node scripts/spike-verify-llm.mjs",
     "deploy:cf": "wrangler deploy --config deploy/wrangler.jsonc",
     "deploy:dev": "wrangler dev --config deploy/wrangler.jsonc",
+    "provision:deployment": "node scripts/seed-deployment-identity.mjs",
     "prepublishOnly": "pnpm run build"
   },
   "peerDependencies": {
     "@mastra/core": "^1.50.0",
     "@proofoftech/breakwater": ">=0.9.0 <1.0.0",
     "react": ">=18 <20",
-    "react-dom": ">=18 <20"
+    "react-dom": ">=18 <20",
+    "wrangler": ">=4 <5"
   },
   "peerDependenciesMeta": {
     "@proofoftech/breakwater": {
@@ -77,6 +92,9 @@
       "optional": true
     },
     "react-dom": {
+      "optional": true
+    },
+    "wrangler": {
       "optional": true
     }
   },

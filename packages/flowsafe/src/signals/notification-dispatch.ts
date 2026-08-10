@@ -5,8 +5,8 @@ import type {
   NotificationsStorage,
 } from '@mastra/core/notifications';
 
-import type { TenantContext } from '../approval-api/index.js';
-import { tenantOfMemoryId } from '../do-runner/index.js';
+import type { ActorContext } from '../approval-api/index.js';
+import { isPathSafeId } from '../do-runner/index.js';
 import type { ThreadTopology } from '../host-kit/index.js';
 import { nonnegativeSafeInteger } from '../numeric-config.js';
 
@@ -16,8 +16,8 @@ export const MAX_NOTIFICATION_DISPATCH_IDS = 100;
 export interface NotificationDispatchTickOptions {
   storage: NotificationsStorage;
   topology: ThreadTopology;
-  /** Builds the system-authorized context used only after row tenancy validates. */
-  resolveTenant(tenantId: string): TenantContext;
+  /** Builds the system-authorized context used after row bindings validate. */
+  resolveContext(): ActorContext;
   now?: () => Date;
   /**
    * Max due rows read per pass. Must be a nonnegative safe integer; zero is an
@@ -33,7 +33,6 @@ export interface NotificationDispatchTickResult {
 }
 
 interface DeliveryGroup {
-  tenantId: string;
   threadId: string;
   resourceId: string;
   agentId: string;
@@ -172,6 +171,41 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+const NOTIFICATION_RETRY_BASE_MS = 1_000;
+const NOTIFICATION_RETRY_MAX_MS = 5 * 60_000;
+
+/**
+ * Record one delivery failure and move every currently-due cursor forward.
+ * Without the cursor move, one permanently blocked row can monopolize a
+ * bounded deployment-wide due scan forever.
+ */
+export async function deferNotificationAfterFailure(
+  storage: NotificationsStorage,
+  record: NotificationRecord,
+  now: Date,
+  error: unknown,
+): Promise<void> {
+  const attempts = (record.deliveryAttempts ?? 0) + 1;
+  const delay = Math.min(
+    NOTIFICATION_RETRY_MAX_MS,
+    NOTIFICATION_RETRY_BASE_MS * 2 ** Math.min(attempts - 1, 8),
+  );
+  const retryAt = new Date(now.getTime() + delay);
+  await storage.updateNotification({
+    id: record.id,
+    threadId: record.threadId,
+    deliveryAttempts: attempts,
+    lastDeliveryAttemptAt: now,
+    lastDeliveryError: errorMessage(error),
+    ...(record.deliverAt && record.deliverAt.getTime() <= now.getTime()
+      ? { deliverAt: retryAt }
+      : {}),
+    ...(record.summaryAt && record.summaryAt.getTime() <= now.getTime()
+      ? { summaryAt: retryAt }
+      : {}),
+  });
+}
+
 async function recordFailure(
   storage: NotificationsStorage,
   record: NotificationRecord,
@@ -179,13 +213,7 @@ async function recordFailure(
   error: unknown,
 ): Promise<void> {
   try {
-    await storage.updateNotification({
-      id: record.id,
-      threadId: record.threadId,
-      deliveryAttempts: (record.deliveryAttempts ?? 0) + 1,
-      lastDeliveryAttemptAt: now,
-      lastDeliveryError: errorMessage(error),
-    });
+    await deferNotificationAfterFailure(storage, record, now, error);
   } catch (updateError) {
     console.error(
       JSON.stringify({
@@ -198,9 +226,9 @@ async function recordFailure(
 }
 
 /**
- * Dispatch due rows through tenant-addressed thread DOs. The global due read is
- * a system-only TCB operation; both memory ids independently establish the
- * tenant before any topology address is resolved.
+ * Dispatch due rows through thread DOs. The deployment-wide due read is a
+ * system-only TCB operation; both memory ids are validated before any topology
+ * address is resolved.
  */
 export function createNotificationDispatchTick(
   options: NotificationDispatchTickOptions,
@@ -224,17 +252,17 @@ export function createNotificationDispatchTick(
     const groups = new Map<string, DeliveryGroup>();
 
     for (const record of due) {
-      const threadTenant = tenantOfMemoryId(record.threadId);
-      const resourceTenant = record.resourceId
-        ? tenantOfMemoryId(record.resourceId)
-        : undefined;
-      if (!threadTenant || !resourceTenant || threadTenant !== resourceTenant) {
+      if (
+        !isPathSafeId(record.threadId) ||
+        !record.resourceId ||
+        !isPathSafeId(record.resourceId)
+      ) {
         result.failed += 1;
         await recordFailure(
           options.storage,
           record,
           now,
-          new Error('notification has malformed or mixed-tenant memory ids'),
+          new Error('notification has malformed memory ids'),
         );
         continue;
       }
@@ -250,9 +278,8 @@ export function createNotificationDispatchTick(
       }
       const resourceId = record.resourceId;
       if (!resourceId) continue;
-      const key = `${threadTenant}\0${record.threadId}\0${resourceId}\0${record.agentId}`;
+      const key = `${record.threadId}\0${resourceId}\0${record.agentId}`;
       const group = groups.get(key) ?? {
-        tenantId: threadTenant,
         threadId: record.threadId,
         resourceId,
         agentId: record.agentId,
@@ -269,9 +296,9 @@ export function createNotificationDispatchTick(
       let batchThreadState: 'active' | 'idle' | null = null;
       for (const records of batches) {
         try {
-          const tenant = options.resolveTenant(group.tenantId);
+          const context = options.resolveContext();
           const response = await options.topology.send(
-            tenant,
+            context,
             group.threadId,
             '/signal/notifications/dispatch',
             {

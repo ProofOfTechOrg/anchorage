@@ -7,10 +7,6 @@ import { z } from 'zod';
 import { init } from './init.js';
 import { createHostPubSub } from './pubsub.js';
 import {
-  DurableStorageResumeLedger,
-  type ResumeLedgerStorage,
-} from './resume-ledger.js';
-import {
   InvalidRunRequestError,
   type RequestContextProvider,
   RunAlreadyExistsError,
@@ -128,6 +124,213 @@ describe('RunnerRuntime host pubsub identity', () => {
 });
 
 describe('RunnerRuntime', () => {
+  it('passes initial workflow state through to core execution', async () => {
+    const { createWorkflow, createStep, runtime } = init({
+      storage: new InMemoryStore(),
+    });
+    const stateSchema = z.object({ seed: z.string() });
+    const inspect = createStep({
+      id: 'inspect-state',
+      stateSchema,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ seed: z.string() }),
+      execute: async ({ state }) => ({ seed: state.seed }),
+    });
+    createWorkflow({
+      id: 'stateful',
+      stateSchema,
+      inputSchema: z.object({}),
+      outputSchema: z.object({ seed: z.string() }),
+    })
+      .then(inspect)
+      .commit();
+
+    await expect(
+      runtime.start('stateful', {
+        runId: 'scheduled-state',
+        inputData: {},
+        initialState: { seed: 'from-schedule' },
+      }),
+    ).resolves.toMatchObject({
+      status: 'success',
+      result: { seed: 'from-schedule' },
+    });
+  });
+
+  it('rejects numeric run and start-attempt ids without RegExp coercion', async () => {
+    const { runtime } = buildRuntime(new InMemoryStore());
+
+    await expect(
+      runtime.start('echo', {
+        runId: 123 as unknown as string,
+        inputData: { value: 'x' },
+      }),
+    ).rejects.toBeInstanceOf(InvalidRunRequestError);
+    await expect(
+      runtime.start('echo', {
+        runId: 'run-1',
+        inputData: { value: 'x' },
+        attemptToken: 123 as unknown as string,
+      }),
+    ).rejects.toThrow('attemptToken is malformed');
+  });
+
+  it('accepts a requester id exactly at the principal-id bound', async () => {
+    const { runtime } = buildRuntime(new InMemoryStore());
+    const requestedBy = 'r'.repeat(200);
+
+    await expect(
+      runtime.start('echo', {
+        runId: 'bounded-requester',
+        inputData: { value: 'x' },
+        requestedBy,
+        requestedByKind: 'human',
+      }),
+    ).resolves.toMatchObject({ requestedBy, requestedByKind: 'human' });
+  });
+
+  it.each([
+    ['an overlong requester', 'r'.repeat(201)],
+    ['an all-whitespace requester', ' '.repeat(200)],
+    ['a control-bearing requester', 'reviewer\u000aforged'],
+  ])('rejects %s on start', async (_label, requestedBy) => {
+    const { runtime } = buildRuntime(new InMemoryStore());
+
+    await expect(
+      runtime.start('echo', {
+        runId: 'invalid-requester',
+        inputData: { value: 'x' },
+        requestedBy,
+        requestedByKind: 'human',
+      }),
+    ).rejects.toThrow('requestedBy is malformed');
+  });
+
+  it.each([
+    'human',
+    'service',
+    'agent',
+    'system',
+  ] as const)("accepts the '%s' requester kind", async (requestedByKind) => {
+    const { runtime } = buildRuntime(new InMemoryStore());
+
+    await expect(
+      runtime.start('echo', {
+        runId: `requester-kind-${requestedByKind}`,
+        inputData: { value: 'x' },
+        requestedBy: 'requester',
+        requestedByKind,
+      }),
+    ).resolves.toMatchObject({ requestedByKind });
+  });
+
+  it.each([
+    'operator',
+    '',
+    null,
+    1,
+  ])('rejects an invalid requester kind (%s)', async (requestedByKind) => {
+    const { runtime } = buildRuntime(new InMemoryStore());
+
+    await expect(
+      runtime.start('echo', {
+        runId: 'invalid-requester-kind',
+        inputData: { value: 'x' },
+        requestedBy: 'requester',
+        requestedByKind: requestedByKind as never,
+      }),
+    ).rejects.toThrow('requestedByKind is malformed');
+  });
+
+  it.each([
+    ['requestedBy without requestedByKind', { requestedBy: 'requester' }],
+    ['requestedByKind without requestedBy', { requestedByKind: 'human' }],
+  ])('rejects %s on start', async (_label, requester) => {
+    const { runtime } = buildRuntime(new InMemoryStore());
+
+    await expect(
+      runtime.start('echo', {
+        runId: 'half-attributed-start',
+        inputData: { value: 'x' },
+        ...requester,
+      } as never),
+    ).rejects.toThrow(
+      'requestedBy and requestedByKind must be provided together',
+    );
+  });
+
+  it.each([
+    ['an overlong requester', 'r'.repeat(201)],
+    ['an all-whitespace requester', ' '.repeat(200)],
+    ['a control-bearing requester', 'reviewer\u007fforged'],
+  ])('rejects %s on resume', async (_label, requestedBy) => {
+    const { runtime } = buildRuntime(new InMemoryStore());
+    const started = await runtime.start('demo-approval', {
+      runId: 'invalid-resume-requester',
+      inputData: { topic: 'launch' },
+      requestedBy: 'initiator',
+      requestedByKind: 'human',
+    });
+
+    await expect(
+      runtime.resume('demo-approval', started.runId, {
+        step: 'approval',
+        resumeData: { approvedBy: 'alice' },
+        requestedBy,
+        requestedByKind: 'human',
+      }),
+    ).rejects.toThrow('requestedBy is malformed');
+  });
+
+  it.each([
+    ['requestedBy without requestedByKind', { requestedBy: 'requester' }],
+    ['requestedByKind without requestedBy', { requestedByKind: 'human' }],
+  ])('rejects %s on resume', async (_label, requester) => {
+    const { runtime } = buildRuntime(new InMemoryStore());
+    const started = await runtime.start('demo-approval', {
+      runId: 'half-attributed-resume',
+      inputData: { topic: 'launch' },
+    });
+
+    await expect(
+      runtime.resume('demo-approval', started.runId, {
+        step: 'approval',
+        resumeData: { approvedBy: 'alice' },
+        ...requester,
+      } as never),
+    ).rejects.toThrow(
+      'requestedBy and requestedByKind must be provided together',
+    );
+  });
+
+  it('inherits a complete stored requester pair when a resume supplies neither', async () => {
+    const { runtime } = buildRuntime(new InMemoryStore());
+    const started = await runtime.start('demo-approval', {
+      runId: 'inherited-requester-pair',
+      inputData: { topic: 'launch' },
+      requestedBy: 'initiator',
+      requestedByKind: 'service',
+    });
+
+    await expect(
+      runtime.resume('demo-approval', started.runId, {
+        step: 'approval',
+        resumeData: { approvedBy: 'alice' },
+      }),
+    ).resolves.toMatchObject({
+      requestedBy: 'initiator',
+      requestedByKind: 'service',
+    });
+  });
+
+  it('rejects a numeric recovery token without RegExp coercion', async () => {
+    const { runtime } = buildRuntime(new InMemoryStore());
+
+    await expect(
+      runtime.recoverStartAttempt('echo', 'run-1', 123 as unknown as string),
+    ).rejects.toThrow('attemptToken is malformed');
+  });
+
   it('runs a workflow to suspension and resumes it to success', async () => {
     // #given
     const { runtime } = buildRuntime(new InMemoryStore());
@@ -904,6 +1107,48 @@ describe('RunnerRuntime requestContextForRun', () => {
     return { runtime, seen };
   }
 
+  it('merges stored schedule context below trusted provider and runtime values', async () => {
+    const seen: Record<string, unknown> = {};
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      { requestContextForRun: () => ({ 'test.a': 'provider' }) },
+    );
+    const inspect = createStep({
+      id: 'inspect-scheduled-context',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      execute: async ({ requestContext }) => {
+        seen.a = requestContext.get('test.a');
+        seen.b = requestContext.get('test.b');
+        seen.workflowScope = requestContext.get('breakwater.workflowScope');
+        return {};
+      },
+    });
+    createWorkflow({
+      id: 'scheduled-context',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(inspect)
+      .commit();
+
+    await runtime.start('scheduled-context', {
+      runId: 'scheduled-context-run',
+      inputData: {},
+      storedRequestContext: {
+        'test.a': 'stored',
+        'test.b': 'stored-only',
+        'breakwater.workflowScope': 'forged',
+      },
+    });
+
+    expect(seen).toEqual({
+      a: 'provider',
+      b: 'stored-only',
+      workflowScope: 'scheduled-context',
+    });
+  });
+
   it('consults the provider on every start and resume leg', async () => {
     // #given — a provider that mints a distinct context per consult
     let calls = 0;
@@ -1057,7 +1302,7 @@ describe('RunnerRuntime requestContextForRun', () => {
     expect(seen).toEqual(['scoped-wf']);
   });
 
-  it('mints the isolation scope from a tenant-salted runId, and omits it otherwise', async () => {
+  it('does not synthesize breakwater isolation scope from runId prefixes', async () => {
     // #given — a probe recording both server-minted keys
     const seen: Array<{ scope: unknown; isolation: unknown }> = [];
     const { createWorkflow, createStep, runtime } = init({
@@ -1083,17 +1328,14 @@ describe('RunnerRuntime requestContextForRun', () => {
       .then(probe)
       .commit();
 
-    // #when — one INV-1 tenant-salted run, one plain single-tenant run
+    // #when — differently shaped opaque run ids
     await runtime.start('scoped-wf2', { runId: 'acme_r1', inputData: {} });
     await runtime.start('scoped-wf2', { runId: 'plain-run', inputData: {} });
-    // a prefix that fails INV-3 must NOT mint (e.g. underscore-led)
     await runtime.start('scoped-wf2', { runId: 'AB_r1', inputData: {} });
 
-    // #then — the tenant prefix is server-authoritative (the runId was minted
-    // from the authenticated tenant); non-tenant runs stay scope-less so the
-    // single-tenant OSS keys are untouched
+    // #then — none becomes an implicit isolation key
     expect(seen).toEqual([
-      { scope: 'scoped-wf2', isolation: 'acme' },
+      { scope: 'scoped-wf2', isolation: undefined },
       { scope: 'scoped-wf2', isolation: undefined },
       { scope: 'scoped-wf2', isolation: undefined },
     ]);
@@ -1192,7 +1434,7 @@ describe('RunnerRuntime requestContextForRun', () => {
       'stored',
       'breakwater.workflowScope',
       'runId',
-      'breakwater.isolationScope',
+      'flowsafe.runProvenance',
       'breakwater.connectorExecution',
       'breakwater.connectorGrants',
       'breakwater.principalPermissions',
@@ -1203,7 +1445,6 @@ describe('RunnerRuntime requestContextForRun', () => {
     ]);
     expect(seen[0]?.values).toMatchObject({
       'breakwater.workflowScope': 'ordered-context',
-      'breakwater.isolationScope': 'acme',
       // A trusted provider's projection passes through like the grant key —
       // this is the seam a workflow host uses to authorize its connectors.
       'breakwater.principalPermissions': {
@@ -1249,10 +1490,13 @@ describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
   // resume) the runtime increments resumeCount on EVERY resume, so it holds
   // even for a no-payload re-suspension. gate2x suspends, and re-suspends on a
   // no-payload resume (round 1) or after a payload resume (round 2).
-  function buildReSuspender(onLeg?: (leg: RunLeg) => void): RunnerRuntime {
+  function buildReSuspender(
+    onLeg?: (leg: RunLeg) => void,
+    storage = new InMemoryStore(),
+  ): RunnerRuntime {
     let rounds = 0;
     const { createWorkflow, createStep, runtime } = init(
-      { storage: new InMemoryStore() },
+      { storage },
       onLeg
         ? {
             requestContextForRun: (_workflowId, _runId, leg) => {
@@ -1318,32 +1562,51 @@ describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
     expect(reSuspended.resumedAt?.gate2x).toBeTypeOf('number');
   });
 
-  it('derives the same trusted resume fingerprint for preparation and execution', async () => {
+  it('prepares a host from one isolated copy of the trusted resume context', async () => {
     const legs: RunLeg[] = [];
-    const runtime = buildReSuspender((leg) => legs.push(structuredClone(leg)));
+    const storage = new InMemoryStore();
+    const runtime = buildReSuspender(
+      (leg) => legs.push(structuredClone(leg)),
+      storage,
+    );
     const started = await runtime.start('resuspend', {
       runId: 'acme_resume-context',
       inputData: {},
+      requestedBy: 'operator-1',
+      requestedByKind: 'human',
     });
     legs.length = 0;
 
-    const prepared = await runtime.trustedRequestContextForResume(
-      'resuspend',
-      started.runId,
-      { step: 'gate2x' },
-    );
+    let preparedWorkflowScope: unknown;
+    let preparedIsolationScope: unknown;
     await runtime.resume('resuspend', started.runId, {
       step: 'gate2x',
       resumeData: { go: true },
+      requestedBy: 'reviewer-1',
+      requestedByKind: 'human',
+      prepareExecution: async (context) => {
+        preparedWorkflowScope = context.get('breakwater.workflowScope');
+        preparedIsolationScope = context.get('breakwater.isolationScope');
+        const provenance = context.get('flowsafe.runProvenance') as {
+          requestedBy?: string;
+        };
+        provenance.requestedBy = 'forged';
+        context.clear();
+      },
     });
 
-    expect(prepared.get('breakwater.workflowScope')).toBe('resuspend');
-    expect(prepared.get('breakwater.isolationScope')).toBe('acme');
-    expect(legs).toHaveLength(2);
-    expect(legs[0]).toEqual(legs[1]);
+    expect(preparedWorkflowScope).toBe('resuspend');
+    expect(preparedIsolationScope).toBeUndefined();
+    expect(legs).toHaveLength(1);
     expect(legs[0]).toMatchObject({
       kind: 'resume',
       step: ['gate2x'],
+    });
+    await expect(
+      runtime.status('resuspend', started.runId),
+    ).resolves.toMatchObject({
+      requestedBy: 'reviewer-1',
+      resumeCount: { gate2x: 1 },
     });
   });
 
@@ -1427,8 +1690,8 @@ describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
       resumeData: { go: true },
     });
 
-    // #then — the leg that reattached to the FIRST suspension read the ledger
-    // before any resume, so its resumeCount is undefined
+    // #then — the leg that reattached to the first suspension read snapshot
+    // provenance before any resume, so its resumeCount is undefined
     expect(legs[1]).toMatchObject({
       kind: 'resume',
       step: ['gate2x'],
@@ -1505,22 +1768,20 @@ describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
 
     // #then — gateA carries resumeCount 1 (it was resumed); gateB, never
     // resumed, stays undefined — its own first suspension, not collapsed into
-    // gateA's ordinal by the shared ledger.
+    // gateA's ordinal in snapshot provenance.
     expect(reSuspended.status).toBe('suspended');
     expect(reSuspended.resumeCount?.gateA).toBe(1);
     expect(reSuspended.resumeCount?.gateB).toBeUndefined();
   });
 });
 
-describe('RunnerRuntime resumeCount ledger keying (shared runId across workflows)', () => {
+describe('RunnerRuntime resumeCount snapshot provenance (shared runId across workflows)', () => {
   // Two suspending workflows under DIFFERENT ids on ONE runtime, both driven with
   // the SAME caller runId. Mastra persists them as distinct runs (snapshots key on
-  // `${workflowName}-${runId}`), so the ONLY thing that can conflate them is the
-  // runtime's own resume ledger. wfA completes on its first payload resume
-  // (terminal — triggers the ledger delete); wfB re-suspends once (round 1 ->
-  // round 2), so it holds a live ledger entry across wfA's delete. Both gates share
-  // step id 'gate' on purpose: an identical inner stepKey is what lets one run's
-  // ordinal contaminate the other's leg read if the OUTER key is runId alone.
+  // `${workflowName}-${runId}`). wfA completes on its first payload resume;
+  // wfB re-suspends once, so its snapshot retains count 1 while wfA becomes
+  // terminal. Both gates share step id 'gate' to prove each snapshot owns its
+  // own provenance even when caller run ids and inner step keys match.
   function buildSharedRunIdPair(
     onLeg?: (workflowId: string, leg: RunLeg) => void,
   ): RunnerRuntime {
@@ -1573,13 +1834,13 @@ describe('RunnerRuntime resumeCount ledger keying (shared runId across workflows
     return runtime;
   }
 
-  it("does not wipe a sibling run's resume ledger when a run sharing its runId reaches terminal status", async () => {
+  it("preserves a sibling run's snapshot provenance when a run sharing its runId reaches terminal status", async () => {
     // #given — wfA and wfB both suspended under the SAME runId 'shared'
     const runtime = buildSharedRunIdPair();
     await runtime.start('wfA', { runId: 'shared', inputData: {} });
     await runtime.start('wfB', { runId: 'shared', inputData: {} });
 
-    // #given — wfB resumed once, so its ledger bucket holds gate -> 1
+    // #given — wfB resumed once, so its snapshot provenance holds gate -> 1
     const reSuspendedB = await runtime.resume('wfB', 'shared', {
       step: 'gate',
       resumeData: { go: true },
@@ -1587,17 +1848,14 @@ describe('RunnerRuntime resumeCount ledger keying (shared runId across workflows
     expect(reSuspendedB.suspended).toEqual([['gate']]);
     expect(reSuspendedB.resumeCount?.gate).toBe(1);
 
-    // #when — wfA (same runId) resumed to SUCCESS; a terminal run drops its ledger.
-    // Keyed by runId alone (the bug) this delete('shared') wipes wfB's bucket too.
+    // #when — wfA with the same caller runId resumes to success
     const doneA = await runtime.resume('wfA', 'shared', {
       step: 'gate',
       resumeData: { go: true },
     });
     expect(doneA.status).toBe('success');
 
-    // #then — wfB's still-suspended round-2 leg keeps resumeCount 1. Pre-fix this
-    // projected undefined (wfA's delete erased it), letting a spent first-suspension
-    // approval (resumeCount undefined) re-mint at the grant gate — the leak.
+    // #then — wfB's still-suspended round-2 snapshot keeps resumeCount 1
     const statusB = await runtime.status('wfB', 'shared');
     expect(statusB).toMatchObject({
       status: 'suspended',
@@ -1606,7 +1864,7 @@ describe('RunnerRuntime resumeCount ledger keying (shared runId across workflows
     expect(statusB?.resumeCount?.gate).toBe(1);
   });
 
-  it("reads a run's own ledger bucket on the resume leg, not a sibling run's sharing the runId", async () => {
+  it("reads a run's own snapshot provenance on the resume leg", async () => {
     // #given — a provider recording (workflowId, leg) for every consult
     const legs: Array<{ workflowId: string; leg: RunLeg }> = [];
     const runtime = buildSharedRunIdPair((workflowId, leg) =>
@@ -1615,23 +1873,20 @@ describe('RunnerRuntime resumeCount ledger keying (shared runId across workflows
     await runtime.start('wfA', { runId: 'shared', inputData: {} });
     await runtime.start('wfB', { runId: 'shared', inputData: {} });
 
-    // #given — wfB resumed once, bumping the 'gate' ordinal in wfB's bucket
+    // #given — wfB resumed once, bumping the gate ordinal in wfB's snapshot
     await runtime.resume('wfB', 'shared', {
       step: 'gate',
       resumeData: { go: true },
     });
 
-    // #when — wfA's FIRST resume of its FIRST suspension; the leg fingerprint reads
-    // the ledger BEFORE this resume increments it
+    // #when — wfA's first resume reads its snapshot provenance before incrementing it
     await runtime.resume('wfA', 'shared', {
       step: 'gate',
       resumeData: { go: true },
     });
 
-    // #then — wfA never resumed before, so its own bucket has no 'gate' entry: the
-    // leg's resumeCount is undefined. Keyed by runId alone (the bug) it read wfB's
-    // bucket and saw 1 — a first suspension masquerading as a re-suspension, which
-    // lets a re-suspension approval mint into a first leg.
+    // #then — wfA never resumed before, so its own snapshot has no gate entry
+    // and the leg's resumeCount is undefined
     const wfAResumeLeg = legs.find(
       (e) => e.workflowId === 'wfA' && e.leg.kind === 'resume',
     )?.leg as { resumeCount?: number } | undefined;
@@ -1673,7 +1928,7 @@ describe('RunnerRuntime resumeCount ledger keying (shared runId across workflows
     await runtime.start('wfB', { runId: 'shared', inputData: {} });
 
     // #when — wfA resumed once (ordinal 1), wfB resumed twice (ordinal 2); both
-    // re-suspend each time, so the ledger must ACCUMULATE, not reset to 1
+    // re-suspend each time, so snapshot provenance must accumulate, not reset to 1
     await runtime.resume('wfA', 'shared', {
       step: 'gate',
       resumeData: { go: true },
@@ -1698,56 +1953,19 @@ describe('RunnerRuntime resumeCount ledger keying (shared runId across workflows
   });
 });
 
-describe('RunnerRuntime resume ledger durability (DO eviction)', () => {
-  // In-memory ledger state dies with the isolate on DO eviction/hibernation/
-  // redeploy, while ctx.storage (and D1 snapshots) survive. Pre-seam, a
-  // re-suspension resumed after an eviction read leg.resumeCount undefined
-  // against the approval's captured ordinal — mismatch — and the APPROVED
-  // action silently no-oped. These tests back the ledger with a fake
-  // ctx.storage and rebuild the runtime around it, exactly the eviction
-  // topology.
-  function fakeLedgerStorage(): ResumeLedgerStorage & {
-    keyCount(): number;
-  } {
-    const map = new Map<string, unknown>();
-    return {
-      async get<T>(key: string): Promise<T | undefined> {
-        return map.get(key) as T | undefined;
-      },
-      async put<T>(key: string, value: T): Promise<void> {
-        map.set(key, value);
-      },
-      async delete(key: string): Promise<boolean> {
-        return map.delete(key);
-      },
-      keyCount: () => map.size,
-    };
-  }
-
-  // gate completes on a payload resume and re-suspends on a falsy one; no
-  // resumeSchema so the falsy resume reaches execute (see the tripwire test
-  // above). Behavior is stateless, so a rebuilt runtime acts identically.
+describe('RunnerRuntime snapshot provenance durability', () => {
   function buildDurable(
     storage: InMemoryStore,
-    ledgerStorage: ResumeLedgerStorage,
     onLeg?: (leg: RunLeg) => void,
+    providedContext?: Record<string, unknown>,
   ): RunnerRuntime {
     const { createWorkflow, createStep, runtime } = init(
       { storage },
       {
-        resumeLedger: new DurableStorageResumeLedger(ledgerStorage),
-        ...(onLeg
-          ? {
-              requestContextForRun: (
-                _workflowId: string,
-                _runId: string,
-                leg: RunLeg,
-              ) => {
-                onLeg(leg);
-                return undefined;
-              },
-            }
-          : {}),
+        requestContextForRun: (_workflowId, _runId, leg) => {
+          onLeg?.(leg);
+          return providedContext;
+        },
       },
     );
     const gate = createStep({
@@ -1768,148 +1986,292 @@ describe('RunnerRuntime resume ledger durability (DO eviction)', () => {
     return runtime;
   }
 
-  it('a re-suspension ordinal survives an eviction: the fresh runtime still sees resumeCount 1 on the resuming leg', async () => {
-    // #given — a run re-suspended once (ledger: gate -> 1) under runtime A
+  function buildTerminalRepair(
+    storage: InMemoryStore,
+    requestContextForRun?: RequestContextProvider,
+  ): RunnerRuntime {
+    const { createWorkflow, createStep, runtime } = init(
+      { storage },
+      { requestContextForRun },
+    );
+    const gate = createStep({
+      id: 'gate',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      suspendSchema: z.object({ reason: z.string() }),
+      execute: async ({ resumeData, suspend }) =>
+        resumeData ? {} : suspend({ reason: 'wait' }),
+    });
+    createWorkflow({
+      id: 'terminal-repair',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      options: {
+        shouldPersistSnapshot: ({ workflowStatus }) =>
+          workflowStatus === 'pending' || workflowStatus === 'suspended',
+      },
+    })
+      .then(gate)
+      .commit();
+    return runtime;
+  }
+
+  it('projects requester and resume ordinal after runtime eviction', async () => {
     const storage = new InMemoryStore();
-    const ledgerStorage = fakeLedgerStorage();
-    const before = buildDurable(storage, ledgerStorage);
+    const before = buildDurable(storage);
     const started = await before.start('durable-gate', {
       runId: crypto.randomUUID(),
       inputData: {},
+      requestedBy: 'operator-1',
+      requestedByKind: 'human',
     });
-    expect(started.status).toBe('suspended');
     const reSuspended = await before.resume('durable-gate', started.runId, {
       step: 'gate',
+      requestedBy: 'reviewer-1',
+      requestedByKind: 'human',
     });
-    expect(reSuspended.status).toBe('suspended');
-    expect(reSuspended.resumeCount?.gate).toBe(1);
+    expect(reSuspended).toMatchObject({
+      status: 'suspended',
+      requestedBy: 'reviewer-1',
+      resumeCount: { gate: 1 },
+    });
 
-    // #when — "eviction": a fresh runtime shares only the Mastra storage and
-    // the ctx.storage-backed ledger (fresh in-memory maps), then resumes
     const legs: RunLeg[] = [];
-    const after = buildDurable(storage, ledgerStorage, (leg) => legs.push(leg));
+    const after = buildDurable(storage, (leg) => legs.push(leg));
+    const recovered = await after.status('durable-gate', started.runId);
+    expect(recovered).toMatchObject({
+      status: 'suspended',
+      requestedBy: 'reviewer-1',
+      resumeCount: { gate: 1 },
+    });
     const done = await after.resume('durable-gate', started.runId, {
       step: 'gate',
       resumeData: { go: true },
+      requestedBy: 'reviewer-2',
+      requestedByKind: 'human',
     });
-
-    // #then — the resuming leg carries the persisted ordinal (pre-seam this
-    // was undefined, so an approval bound to resumeCount 1 was denied and the
-    // approved resume no-oped)
-    expect(done.status).toBe('success');
-    const resumeLeg = legs.find((leg) => leg.kind === 'resume') as
-      | { resumeCount?: number }
-      | undefined;
-    expect(resumeLeg).toBeDefined();
-    expect(resumeLeg?.resumeCount).toBe(1);
+    expect(done).toMatchObject({
+      status: 'success',
+      requestedBy: 'reviewer-2',
+    });
+    expect(legs.find((leg) => leg.kind === 'resume')).toMatchObject({
+      resumeCount: 1,
+    });
   });
 
-  it('drops the persisted ledger entry once the run is terminal', async () => {
-    // #given — a run with one re-suspension recorded durably
+  it.each([
+    ['an overlong requester', { requestedBy: 'r'.repeat(201) }],
+    ['an all-whitespace requester', { requestedBy: ' '.repeat(200) }],
+    ['a control-bearing requester', { requestedBy: 'requester\u0000forged' }],
+    ['an invalid requester kind', { requestedByKind: 'operator' }],
+  ])('fails closed on stored run provenance with %s', async (_label, corruption) => {
     const storage = new InMemoryStore();
-    const ledgerStorage = fakeLedgerStorage();
-    const runtime = buildDurable(storage, ledgerStorage);
-    const started = await runtime.start('durable-gate', {
-      runId: crypto.randomUUID(),
-      inputData: {},
-    });
-    await runtime.resume('durable-gate', started.runId, { step: 'gate' });
-    expect(ledgerStorage.keyCount()).toBe(1);
-
-    // #when — the run completes
-    const done = await runtime.resume('durable-gate', started.runId, {
-      step: 'gate',
-      resumeData: { go: true },
-    });
-
-    // #then — terminal status reaps the durable entry (no unbounded growth)
-    expect(done.status).toBe('success');
-    expect(ledgerStorage.keyCount()).toBe(0);
-  });
-
-  it('status() reads the ledger only for SUSPENDED runs, and a resume reads it exactly once', async () => {
-    // #given — a ctx.storage that counts billed get()s
-    const storage = new InMemoryStore();
-    const base = fakeLedgerStorage();
-    let gets = 0;
-    const counting: ResumeLedgerStorage = {
-      async get<T>(key: string): Promise<T | undefined> {
-        gets += 1;
-        return base.get<T>(key);
-      },
-      put: (key, value) => base.put(key, value),
-      delete: (key) => base.delete(key),
-    };
-    const runtime = buildDurable(storage, counting);
-    const started = await runtime.start('durable-gate', {
-      runId: crypto.randomUUID(),
-      inputData: {},
-    });
-
-    // #when — one resume: the fingerprint read is the ONLY ledger get (the
-    // increment rides the prior counts the per-run lock guarantees unchanged)
-    const beforeResume = gets;
-    const done = await runtime.resume('durable-gate', started.runId, {
-      step: 'gate',
-      resumeData: { go: true },
-    });
-    expect(done.status).toBe('success');
-    expect(gets).toBe(beforeResume + 1);
-
-    // #when — the SPA-style poll of the now-terminal run
-    const beforeStatus = gets;
-    const status = await runtime.status('durable-gate', started.runId);
-
-    // #then — no billed get for a projection that would discard it...
-    expect(status?.status).toBe('success');
-    expect(gets).toBe(beforeStatus);
-
-    // ...while a suspended run still projects the ordinal (one read)
-    const suspended = await runtime.start('durable-gate', {
-      runId: crypto.randomUUID(),
-      inputData: {},
-    });
-    const beforeSuspendedStatus = gets;
-    const suspendedStatus = await runtime.status(
-      'durable-gate',
-      suspended.runId,
-    );
-    expect(suspendedStatus?.status).toBe('suspended');
-    expect(gets).toBe(beforeSuspendedStatus + 1);
-  });
-
-  it('projects status() resumeCount from the durable ledger across the rebuild', async () => {
-    // #given — a re-suspended run, then an eviction
-    const storage = new InMemoryStore();
-    const ledgerStorage = fakeLedgerStorage();
-    const before = buildDurable(storage, ledgerStorage);
+    const before = buildDurable(storage);
     const started = await before.start('durable-gate', {
-      runId: crypto.randomUUID(),
+      runId: 'corrupt-requester-provenance',
       inputData: {},
+      requestedBy: 'initiator',
+      requestedByKind: 'human',
     });
-    await before.resume('durable-gate', started.runId, { step: 'gate' });
+    const workflows = await storage.getStore('workflows');
+    if (!workflows) throw new Error('workflows store missing');
+    const snapshot = await workflows.loadWorkflowSnapshot({
+      workflowName: 'durable-gate',
+      runId: started.runId,
+    });
+    if (!snapshot) throw new Error('workflow snapshot missing');
+    const provenance = snapshot.requestContext?.[
+      'flowsafe.runProvenance'
+    ] as Record<string, unknown>;
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'durable-gate',
+      runId: started.runId,
+      snapshot: {
+        ...snapshot,
+        requestContext: {
+          ...snapshot.requestContext,
+          'flowsafe.runProvenance': {
+            ...provenance,
+            ...corruption,
+          },
+        },
+      },
+    });
 
-    // #when — a fresh runtime projects status
-    const after = buildDurable(storage, ledgerStorage);
-    const status = await after.status('durable-gate', started.runId);
-
-    // #then — the ordinal is read back from storage, not from isolate memory
-    expect(status?.status).toBe('suspended');
-    expect(status?.resumeCount?.gate).toBe(1);
+    await expect(
+      buildDurable(storage).status('durable-gate', started.runId),
+    ).rejects.toThrow('stored run provenance is malformed');
   });
 
-  it("stores counts as entry pairs, so a step keyed '__proto__' is counted, not swallowed", async () => {
-    // #given — Record-shaped storage would route a '__proto__' assignment to
-    // the prototype setter and silently lose the count; pairs have no
-    // reserved names
-    const ledger = new DurableStorageResumeLedger(fakeLedgerStorage());
+  it('reads legacy id-only provenance but requires a new complete pair before resume writes', async () => {
+    const storage = new InMemoryStore();
+    const before = buildDurable(storage);
+    const started = await before.start('durable-gate', {
+      runId: 'legacy-requester-provenance',
+      inputData: {},
+      requestedBy: 'legacy-initiator',
+      requestedByKind: 'human',
+    });
+    const workflows = await storage.getStore('workflows');
+    if (!workflows) throw new Error('workflows store missing');
+    const snapshot = await workflows.loadWorkflowSnapshot({
+      workflowName: 'durable-gate',
+      runId: started.runId,
+    });
+    if (!snapshot) throw new Error('workflow snapshot missing');
+    const legacyProvenance = {
+      ...(snapshot.requestContext?.['flowsafe.runProvenance'] as Record<
+        string,
+        unknown
+      >),
+    };
+    delete legacyProvenance.requestedByKind;
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'durable-gate',
+      runId: started.runId,
+      snapshot: {
+        ...snapshot,
+        requestContext: {
+          ...snapshot.requestContext,
+          'flowsafe.runProvenance': legacyProvenance,
+        },
+      },
+    });
 
-    // #when
-    await ledger.increment('wf:run', '__proto__');
-    const counts = await ledger.increment('wf:run', '__proto__');
+    const after = buildDurable(storage);
+    const legacyStatus = await after.status('durable-gate', started.runId);
+    expect(legacyStatus).toMatchObject({ requestedBy: 'legacy-initiator' });
+    expect(legacyStatus?.requestedByKind).toBeUndefined();
+    await expect(
+      after.resume('durable-gate', started.runId, { step: 'gate' }),
+    ).rejects.toThrow(
+      'legacy requestedBy provenance requires an explicit requestedBy and requestedByKind to resume',
+    );
+    expect(
+      (await after.status('durable-gate', started.runId))?.requestedByKind,
+    ).toBeUndefined();
+    await expect(
+      after.resume('durable-gate', started.runId, {
+        step: 'gate',
+        requestedBy: 'reviewer-1',
+        requestedByKind: 'human',
+      }),
+    ).resolves.toMatchObject({
+      status: 'suspended',
+      requestedBy: 'reviewer-1',
+      requestedByKind: 'human',
+    });
+  });
 
-    // #then
-    expect(counts.get('__proto__')).toBe(2);
-    expect((await ledger.counts('wf:run'))?.get('__proto__')).toBe(2);
+  it('reserves snapshot provenance against provider override', async () => {
+    const storage = new InMemoryStore();
+    const runtime = buildDurable(storage, undefined, {
+      'flowsafe.runProvenance': {
+        version: 1,
+        requestedBy: 'forged',
+        attemptToken: 'forged',
+        resumeCounts: [['gate', 99]],
+      },
+    });
+    const started = await runtime.start('durable-gate', {
+      runId: crypto.randomUUID(),
+      inputData: {},
+      requestedBy: 'operator-1',
+      requestedByKind: 'human',
+    });
+
+    expect(started.requestedBy).toBe('operator-1');
+    await expect(
+      runtime.status('durable-gate', started.runId),
+    ).resolves.toMatchObject({ requestedBy: 'operator-1' });
+  });
+
+  it('repairs a terminal-only snapshot with the current resume provenance', async () => {
+    const storage = new InMemoryStore();
+    const requestContextForRun: RequestContextProvider = (
+      _workflowId,
+      _runId,
+      leg,
+    ) =>
+      leg.kind === 'start'
+        ? { 'test.a': 'start-a', 'test.b': 'start-b' }
+        : { 'test.a': 'resume-a' };
+    const before = buildTerminalRepair(storage, requestContextForRun);
+    const started = await before.start('terminal-repair', {
+      runId: 'terminal-provenance',
+      inputData: {},
+      requestedBy: 'operator-1',
+      requestedByKind: 'human',
+    });
+
+    await expect(
+      before.resume('terminal-repair', started.runId, {
+        step: 'gate',
+        resumeData: { approved: true },
+        requestedBy: 'reviewer-1',
+        requestedByKind: 'human',
+      }),
+    ).resolves.toMatchObject({
+      status: 'success',
+      requestedBy: 'reviewer-1',
+    });
+
+    const workflows = await storage.getStore('workflows');
+    const snapshot = await workflows?.loadWorkflowSnapshot({
+      workflowName: 'terminal-repair',
+      runId: started.runId,
+    });
+    expect(snapshot?.requestContext).toMatchObject({
+      'test.a': 'resume-a',
+      'test.b': 'start-b',
+      'flowsafe.runProvenance': expect.objectContaining({
+        requestedBy: 'reviewer-1',
+      }),
+    });
+
+    const after = buildTerminalRepair(storage, requestContextForRun);
+    await expect(
+      after.status('terminal-repair', started.runId),
+    ).resolves.toMatchObject({
+      status: 'success',
+      requestedBy: 'reviewer-1',
+    });
+  });
+
+  it('returns the committed terminal summary when repair acknowledgement is lost', async () => {
+    const storage = new InMemoryStore();
+    const runtime = buildTerminalRepair(storage);
+    const started = await runtime.start('terminal-repair', {
+      runId: 'terminal-lost-ack',
+      inputData: {},
+      requestedBy: 'operator-1',
+      requestedByKind: 'human',
+    });
+    const workflows = await storage.getStore('workflows');
+    if (!workflows) throw new Error('workflows store missing');
+    const persist = workflows.persistWorkflowSnapshot.bind(workflows);
+    let loseAcknowledgement = true;
+    vi.spyOn(workflows, 'persistWorkflowSnapshot').mockImplementation(
+      async (input) => {
+        await persist(input);
+        if (loseAcknowledgement && input.snapshot.status === 'success') {
+          loseAcknowledgement = false;
+          throw new Error('terminal persist acknowledgement lost');
+        }
+      },
+    );
+
+    await expect(
+      runtime.resume('terminal-repair', started.runId, {
+        step: 'gate',
+        resumeData: { approved: true },
+        requestedBy: 'reviewer-1',
+        requestedByKind: 'human',
+      }),
+    ).resolves.toMatchObject({
+      status: 'success',
+      requestedBy: 'reviewer-1',
+    });
+    expect(loseAcknowledgement).toBe(false);
   });
 });

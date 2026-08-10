@@ -29,7 +29,7 @@ body:
     id: topology
     attributes:
       label: Deployment topology
-      description: Include relevant Durable Object, D1, R2, Queue, binding, authentication, and tenant details.
+      description: Include relevant Durable Object, D1, R2, Queue, binding, deployment identity, and authentication details.
   - type: checkboxes
     id: checks
     attributes:
@@ -37,5 +37,5 @@ body:
       options:
         - label: I searched the documentation and existing issues.
           required: true
-        - label: I removed credentials, tenant data, and other secrets.
+        - label: I removed credentials, organization data, and other secrets.
           required: true

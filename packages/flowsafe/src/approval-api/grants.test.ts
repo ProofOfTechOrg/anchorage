@@ -5,13 +5,11 @@ import type { RunLeg, RunnerRuntime } from '../do-runner/index.js';
 import { BREAKWATER_CONNECTOR_GRANTS_KEY } from './contract.js';
 import {
   approvalGrantProvider,
-  approvalGrantProviderFromFactory,
   connectorGrantsForLeg,
   defaultResumeData,
   resumeViaRuntime,
 } from './grants.js';
-import { type ApprovalStore, InMemoryApprovalStore } from './store.js';
-import { InMemoryApprovalStoreFactory } from './tenant-store.js';
+import { InMemoryApprovalStore } from './store.js';
 import { type ApprovalRecord, MAX_APPROVAL_LIST_LIMIT } from './types.js';
 
 let seq = 0;
@@ -22,7 +20,6 @@ function record(overrides: Partial<ApprovalRecord>): ApprovalRecord {
   const connectorCount = overrides.connectors?.length ?? 0;
   return {
     id: `apr-${seq}`,
-    tenantId: 'acme',
     workflowId: 'wf',
     runId: 'run-1',
     title: `approval ${seq}`,
@@ -95,7 +92,6 @@ function suspensionGrant(
         connectorId,
         workflowId: 'wf',
         runId: 'run-1',
-        isolationScope: 'acme',
         suspension,
       }
     : {
@@ -103,7 +99,6 @@ function suspensionGrant(
         connectorId,
         workflowId: 'wf',
         runId: 'run-1',
-        isolationScope: 'acme',
         suspension,
         toolCallId: options.toolCallId,
       };
@@ -112,7 +107,6 @@ function suspensionGrant(
 function runGrant(
   connectorId: string,
   options: {
-    tenantId?: string;
     runId?: string;
   } = {},
 ) {
@@ -121,7 +115,6 @@ function runGrant(
     connectorId,
     workflowId: 'wf',
     runId: options.runId ?? 'run-1',
-    isolationScope: options.tenantId ?? 'acme',
   };
 }
 
@@ -130,7 +123,7 @@ describe('connectorGrantsForLeg', () => {
     // #given — approved for 'gate' during this suspension, approved
     // run-scoped (no stepPath), approved for a DIFFERENT step, and
     // pending/rejected for other steps
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     await store.create(
       record({
         status: 'approved',
@@ -183,7 +176,7 @@ describe('connectorGrantsForLeg', () => {
   it('never falls back to decision chronology for a legacy capability record', async () => {
     // #given — a pre-upgrade record names a connector but has neither the
     // explicit grant scope nor an exact suspension fingerprint
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     await store.create(
       record({
         status: 'approved',
@@ -204,7 +197,7 @@ describe('connectorGrantsForLeg', () => {
 
   it('fails closed for step grants when the suspension time is unknown', async () => {
     // #given
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     await store.create(
       record({
         status: 'approved',
@@ -229,7 +222,7 @@ describe('connectorGrantsForLeg', () => {
 
   it('mints only run-scoped approvals on start legs', async () => {
     // #given
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     await store.create(
       record({
         status: 'approved',
@@ -256,7 +249,7 @@ describe('connectorGrantsForLeg', () => {
     // step nor runScoped is inert on every leg: "absent field => maximal
     // privilege" was the inverted default that let an HTTP-authored record
     // become a standing grant.
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     await store.create(
       record({ status: 'approved', connectors: ['smuggled'] }),
     );
@@ -276,7 +269,7 @@ describe('connectorGrantsForLeg', () => {
   it('denies a runScoped:false record exactly as it denies an absent flag', async () => {
     // #given — the flag is a tri-state on the wire (D1 stores 0/1/NULL); only
     // an explicit true opts in
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     await store.create(
       record({ status: 'approved', runScoped: false, connectors: ['nope'] }),
     );
@@ -293,7 +286,7 @@ describe('connectorGrantsForLeg — exact suspension binding', () => {
     // #given — the record is bound to this suspension; decidedAt even
     // PRECEDES the suspension (impossible under one clock, routine under
     // skewed service/runner clocks) — exact binding does not care
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     await store.create(
       record({
         status: 'approved',
@@ -314,7 +307,7 @@ describe('connectorGrantsForLeg — exact suspension binding', () => {
     // #given — bound to an EARLIER suspension of this step; under the legacy
     // chronology rule the later decidedAt would have minted (the clock-skew
     // leak shape); exact binding closes it
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     await store.create(
       record({
         status: 'approved',
@@ -333,7 +326,7 @@ describe('connectorGrantsForLeg — exact suspension binding', () => {
 
   it('fails closed when the leg has no suspension time, even for a bound record', async () => {
     // #given
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     await store.create(
       record({
         status: 'approved',
@@ -356,7 +349,7 @@ describe('connectorGrantsForLeg — exact suspension binding', () => {
   it('fails closed when a run-scoped record also carries suspension identity', async () => {
     // #given — a malformed standing grant mixes broad run scope with an exact
     // suspension fingerprint
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     await store.create(
       record({
         status: 'approved',
@@ -382,7 +375,7 @@ describe('connectorGrantsForLeg — same-step re-suspension pair binding', () =>
     // pre-fix suspendedAt-only rule this WOULD have minted (the flake); on the
     // superseded resumedAt binding a NO-PAYLOAD re-suspension would also leak
     // (resumedAt undefined on both), which resumeCount closes.
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     await store.create(
       record({
         status: 'approved',
@@ -407,7 +400,7 @@ describe('connectorGrantsForLeg — same-step re-suspension pair binding', () =>
   it('mints a re-suspension approval whose (suspendedAt, resumeCount) pair matches', async () => {
     // #given — the approval is bound to THIS re-suspension: suspendedAt and the
     // resume ordinal captured from the same suspension
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     await store.create(
       record({
         status: 'approved',
@@ -436,7 +429,7 @@ describe('connectorGrantsForLeg — same-step re-suspension pair binding', () =>
     // strictly increments, count 2 never collides with the count-1 leg, so the
     // deterministic truthy→falsy depth-3 leak the old timestamp binding left
     // open is closed.
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     await store.create(
       record({
         status: 'approved',
@@ -459,13 +452,11 @@ describe('connectorGrantsForLeg — same-step re-suspension pair binding', () =>
     ).toEqual([]);
   });
 
-  it('denies a re-suspension approval on a leg whose resumeCount is undefined (reset ledger / first-suspension leg fails closed)', async () => {
+  it('denies a re-suspension approval on a leg whose resumeCount is undefined', async () => {
     // #given — a re-suspension approval (resumeCount 1) at this suspendedAt.
-    // The leg presents resumeCount undefined: either a first-suspension leg, or
-    // a re-suspension leg after a DO restart reset the in-memory ledger. Either
-    // way the record must NOT mint — the "fail-closed, never a leak" guarantee
-    // for the restart-reset residual, at the predicate level.
-    const store = new InMemoryApprovalStore('acme');
+    // The leg presents resumeCount undefined, so it represents a first
+    // suspension or missing provenance. Either way the record must NOT mint.
+    const store = new InMemoryApprovalStore();
     await store.create(
       record({
         status: 'approved',
@@ -487,7 +478,7 @@ describe('connectorGrantsForLeg — same-step re-suspension pair binding', () =>
     // #given — two same-step approvals from consecutive re-suspensions: the
     // spent count-1 approval and the live count-2 approval; the leg is the
     // third suspension (resumeCount 2), all sharing one suspendedAt.
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     await store.create(
       record({
         status: 'approved',
@@ -524,7 +515,7 @@ describe('connectorGrantsForLeg — same-step re-suspension pair binding', () =>
 describe('approvalGrantProvider', () => {
   it('mints the grant key for the resumed suspension only', async () => {
     // #given
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     await store.create(
       record({
         status: 'approved',
@@ -551,7 +542,7 @@ describe('approvalGrantProvider', () => {
 
   it('always returns the key — empty when nothing applies — so each leg overwrites stale grants', async () => {
     // #given — an approval for a different step exists, none for this leg
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     await store.create(
       record({
         status: 'approved',
@@ -619,6 +610,8 @@ describe('resumeViaRuntime', () => {
     expect(resume).toHaveBeenCalledWith('wf', 'run-1', {
       step: ['approval'],
       resumeData: { approved: true, decidedBy: 'ray' },
+      requestedBy: 'ray',
+      requestedByKind: 'human',
     });
   });
 
@@ -630,24 +623,24 @@ describe('resumeViaRuntime', () => {
     // #when
     await resumeViaRuntime(runtime, {
       resumeData: (_record, decision) => ({ approvedBy: `bot:${decision}` }),
-    })(record({ stepPath: ['approval'] }), 'approve');
+    })(record({ stepPath: ['approval'], decidedBy: 'ray' }), 'approve');
 
     // #then
     expect(resume).toHaveBeenCalledWith('wf', 'run-1', {
       step: ['approval'],
       resumeData: { approvedBy: 'bot:approve' },
+      requestedBy: 'ray',
+      requestedByKind: 'human',
     });
   });
 });
 
-describe('grant derivation — tenant hardening (INV-1 + INV-2)', () => {
+describe('grant derivation — exact run binding', () => {
   it('pins the LOAD-BEARING list filter: {workflowId, runId, status} — the runId predicate must never be optimized away', async () => {
-    // #given — a spy store: under INV-1 the salted runId is what keeps the
-    // mint tenant-safe even from a mis-bound store; the tenant binding is
-    // defense in depth. Anyone who drops the runId predicate "because the
-    // store is bound" reopens the leak with a green build.
+    // #given — a spy store: the runId predicate keeps one run's decisions from
+    // minting capabilities for another run in the deployment.
     const listCalls: unknown[] = [];
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const spy: typeof store = Object.create(store, {
       list: {
         value: (filter: unknown) => {
@@ -663,7 +656,7 @@ describe('grant derivation — tenant hardening (INV-1 + INV-2)', () => {
     // #then — one page (the fixture is far under the cap) whose filter carries
     // all three load-bearing predicates; explicit paging adds limit/after but
     // must never drop workflowId/runId/status (the runId predicate is the
-    // tenant-safety guard under INV-1)
+    // exact-run guard)
     expect(listCalls).toHaveLength(1);
     expect(listCalls[0]).toMatchObject({
       workflowId: 'wf',
@@ -675,10 +668,10 @@ describe('grant derivation — tenant hardening (INV-1 + INV-2)', () => {
   it('mints from ALL approved records past the list cap — a run with >MAX approvals still unlocks the newest connector (D3 grant-path paging)', async () => {
     // #given — more approved records for one run than the D3 bare-list cap:
     // MAX run-scoped 'noise' records, then a NEWEST run-scoped record carrying
-    // 'newest-connector'. A single bounded FIFO page (the D3 tenant-store
+    // 'newest-connector'. A single bounded FIFO page (the D3 store
     // default) returns the oldest MAX and DROPS the newest, failing the grant
     // CLOSED. connectorGrantsForLeg must page the complete set instead.
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     for (let index = 0; index < MAX_APPROVAL_LIST_LIMIT; index += 1) {
       await store.create(
         record({ status: 'approved', runScoped: true, connectors: ['noise'] }),
@@ -700,85 +693,5 @@ describe('grant derivation — tenant hardening (INV-1 + INV-2)', () => {
     // #then — the newest record's connector is present (complete paging, not a
     // truncated first page)
     expect(grants).toContainEqual(runGrant('newest-connector'));
-  });
-
-  it('approvalGrantProviderFromFactory binds per leg from the runId prefix and fails closed on a bare runId', async () => {
-    // #given — one shared backend, approvals for two tenants on the same
-    // step of same-named runs
-    const factory = new InMemoryApprovalStoreFactory();
-    const decidedAt = new Date().toISOString();
-    await factory.forTenant('acme').create(
-      record({
-        runId: 'acme_r1',
-        runScoped: true,
-        status: 'approved',
-        connectors: ['acme-conn'],
-        decidedAt,
-      }),
-    );
-    await factory.forTenant('bravo').create(
-      record({
-        id: 'bravo-rec',
-        tenantId: 'bravo',
-        runId: 'bravo_r1',
-        runScoped: true,
-        status: 'approved',
-        connectors: ['bravo-conn'],
-        decidedAt,
-      }),
-    );
-    const provider = approvalGrantProviderFromFactory(factory);
-
-    // #when / #then — each leg mints from ITS tenant's records only
-    expect(await provider('wf', 'acme_r1', { kind: 'start' })).toEqual({
-      [BREAKWATER_CONNECTOR_GRANTS_KEY]: [
-        runGrant('acme-conn', { runId: 'acme_r1' }),
-      ],
-    });
-    expect(await provider('wf', 'bravo_r1', { kind: 'start' })).toEqual({
-      [BREAKWATER_CONNECTOR_GRANTS_KEY]: [
-        runGrant('bravo-conn', {
-          tenantId: 'bravo',
-          runId: 'bravo_r1',
-        }),
-      ],
-    });
-    // a runId with no tenant prefix mints an EMPTY grant list, never a read
-    expect(await provider('wf', 'bare-run', { kind: 'start' })).toEqual({
-      [BREAKWATER_CONNECTOR_GRANTS_KEY]: [],
-    });
-  });
-
-  it('type-level: only a TENANT-BOUND store reaches the grant provider (the brand is nominal)', () => {
-    // Verified as compile-time rejections — an UNUSED @ts-expect-error is
-    // itself an error, so tsc exit 0 proves every negative case fails to
-    // compile.
-    const factory = new InMemoryApprovalStoreFactory();
-    const bound = factory.forTenant('acme');
-    const sys = factory.system();
-
-    // ✓ a bound store compiles
-    approvalGrantProvider(bound);
-    // ✓ a bound store is still a valid ApprovalStore
-    const asApproval: ApprovalStore = bound;
-    void asApproval;
-
-    // @ts-expect-error a SYSTEM (cross-tenant) store cannot reach a request handler
-    approvalGrantProvider(sys);
-
-    const plain: ApprovalStore = new InMemoryApprovalStore('acme');
-    // @ts-expect-error an unbranded ApprovalStore cannot either (the TYPE, not the instance, is what code passes around)
-    approvalGrantProvider(plain);
-
-    // @ts-expect-error a forged object literal cannot produce the brand without importing TENANT_BOUND — a grep-visible TCB bypass
-    approvalGrantProvider({
-      tenantId: 'acme',
-      create: bound.create.bind(bound),
-      get: bound.get.bind(bound),
-      list: bound.list.bind(bound),
-      transition: bound.transition.bind(bound),
-    });
-
-    expect(true).toBe(true);
   });
 });

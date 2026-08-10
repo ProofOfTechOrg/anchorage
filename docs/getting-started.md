@@ -1,6 +1,6 @@
 # Getting started
 
-This guide takes a Mastra application from package installation to one guarded connector and one durable approval. Use breakwater by itself when a request-scoped agent is enough. Add flowsafe when execution must survive restarts, wait for a human, or retain tenant-safe state.
+This guide takes a Mastra application from package installation to one guarded connector and one durable approval. Use breakwater by itself when a request-scoped agent is enough. Add flowsafe when execution must survive restarts, wait for a human, or retain state in a physically isolated deployment.
 
 ## Prerequisites
 
@@ -101,7 +101,6 @@ import {
   type IdempotencyDatabase,
   type RateLimitDatabase,
 } from '@proofoftech/breakwater/connector-sdk';
-import { tenantIsolation } from '@proofoftech/breakwater/policy-engine';
 import { z } from 'zod';
 
 export function createPublisher(
@@ -126,7 +125,6 @@ export function createPublisher(
       rateLimit: '10/hour',
     },
     policies: {
-      evaluators: [tenantIsolation()],
       idempotencyStore: new D1IdempotencyStore(db),
       rateLimitStore: new D1RateLimitStore(db),
     },
@@ -147,7 +145,7 @@ export function createPublisher(
 }
 ```
 
-The structural D1 types accept a Cloudflare `D1Database`; type the example's `db` accordingly in your Worker. Use shared D1 stores when a rate limit or idempotency key must hold across isolates. In-memory stores cover only one isolate.
+The structural D1 types accept a Cloudflare `D1Database`; type the example's `db` accordingly in your Worker. Use shared D1 stores when a rate limit or idempotency key must hold across isolates. In-memory stores cover only one isolate. Flowsafe connector budgets and idempotency are deployment-wide. A different generic host can use Breakwater's opaque isolation scope when it owns another trusted logical partition.
 
 Read [Connector interface](connector-interface.md) before writing production connectors. It explains the required request-context keys, fixed-window behavior, redirect handling, and failure semantics.
 
@@ -155,17 +153,20 @@ Read [Connector interface](connector-interface.md) before writing production con
 
 ```bash
 npm install @proofoftech/flowsafe
+npm install --save-dev wrangler@^4
 ```
 
 Start from [`packages/flowsafe/deploy/`](../packages/flowsafe/deploy/README.md). Copy that directory into your application and preserve its host-kit composition:
 
-1. Create a D1 database and put its id in `wrangler.jsonc`.
-2. Register the runner Durable Object migration. Add the hub Durable Object and `STREAM_TICKET_SECRET` when you want live updates.
-3. Replace the example workflow, but keep `approvalGrantProvider()` in `init()`.
-4. Replace the static bearer verifier with your identity provider. Return an actor with a validated `tenantId`.
-5. Provision every tenant before issuing credentials that name it.
-6. Configure the sweep and purge cron expressions.
-7. Deploy, start a run, approve its queued suspension as a different actor, and inspect the terminal status.
+1. Choose a stable lowercase deployment tag. Replace the checked-in `replace-me` segment in both the Worker `name` and D1 `database_name`, create that uniquely named D1 database, and put its id in `wrangler.jsonc`. The unique Worker name is also the deployment's Durable Object namespace boundary.
+2. Set `DEPLOYMENT_TENANT` to the same tag. The checked-in invalid placeholder must never reach deployment.
+3. Before application migrations, run `npx flowsafe-provision --database <database> --tag <tag> --remote --config wrangler.jsonc` from your application. The CLI is published with Flowsafe and uses the Wrangler 4 installation in your project.
+4. Set a distinct `DEPLOYMENT_IDENTITY_SECRET` with `wrangler secret put`; every Worker-to-Durable-Object request requires it.
+5. Register the runner Durable Object migration. Add the hub Durable Object and `STREAM_TICKET_SECRET` when you want live updates.
+6. Replace the example workflow, but keep `approvalGrantProvider()` in `init()`.
+7. Replace the static bearer verifier with your identity provider. Return a validated actor with `id` and `role`; do not accept a tenant claim.
+8. Configure the sweep and purge cron expressions.
+9. Deploy, start a run, approve its queued suspension as a different actor, and inspect the terminal status.
 
 The baseline template deliberately exposes a raw resume route for generic
 workflow recovery and testing, but raw resume data never carries a connector

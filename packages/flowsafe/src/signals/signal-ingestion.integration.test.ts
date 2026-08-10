@@ -1,37 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Track C (M-004) integration (SHOULD-FIX): one signal ingested through the FULL
 // chain — createSignalRouter (the P6 gate) → real createThreadTopology → real
-// ThreadDurableObject (its tenant-identity assertion) → the production thread
+// ThreadDurableObject (its stamped-principal assertion) → the production thread
 // signal routes → a runtime-driven reserve agent — with NO LLM. The unit suites
 // each mock a seam; this one wires the real seams together so the ingestion
 // boundary has one end-to-end proof, including the idle-wake run cap consulted
-// both allowing and capping, and a foreign-threadId send failing closed at the
-// topology before any DO is addressed.
+// both allowing and capping, plus a foreign path-safe thread refusal.
 
-import type { DurableObjectState } from '@cloudflare/workers-types';
 import type { Agent } from '@mastra/core/agent';
 import { InMemoryStore } from '@mastra/core/storage';
 import { describe, expect, it, vi } from 'vitest';
-import { z } from 'zod';
 
-import { d1DatabaseLike, openSqlite } from '../../test-support/sqlite.js';
 import { RUNTIME_DRIVEN_AGENT } from '../agent-runner/index.js';
-import type { ApprovalActor, TenantContext } from '../approval-api/index.js';
+import type { ActorContext, ApprovalActor } from '../approval-api/index.js';
 import { humanPrincipal } from '../approval-api/index.js';
 import {
-  createD1Storage,
   type InitResult,
   init,
-  mintResourceId,
   mintThreadId,
-  purgeTenant,
-  type SnapshotDatabase,
+  resourceIdFromKey,
   ThreadDurableObject,
   type ThreadScope,
 } from '../do-runner/index.js';
 import {
-  createThreadTopology,
+  createThreadTopology as createThreadTopologyWithSecret,
   type ThreadNamespaceLike,
+  type ThreadTopology,
 } from '../host-kit/index.js';
 import { createSignalRouter } from './router.js';
 import {
@@ -40,6 +34,14 @@ import {
   type StartIdleRun,
 } from './thread-do-routes.js';
 
+const DEPLOYMENT_IDENTITY_SECRET = 'test-deployment-identity-secret-0001';
+
+function createThreadTopology<Id>(
+  namespace: ThreadNamespaceLike<Id>,
+): ThreadTopology {
+  return createThreadTopologyWithSecret(namespace, DEPLOYMENT_IDENTITY_SECRET);
+}
+
 interface TestEnv {
   agent: Agent;
   consultRunCap?: RunCapConsult;
@@ -47,14 +49,23 @@ interface TestEnv {
 }
 
 // A minimal host thread DO: build() its init() wiring, route() the PRODUCTION
-// signal routes over the env's reserve agent + run cap. The base class asserts
-// the request's authenticated tenant against the name's prefix before route()
-// runs, so reaching #routes at all proves that assertion passed.
+// signal routes over the env's reserve agent + run cap. The base class refuses
+// a request without the topology-stamped execution principal before route().
 class TestThread extends ThreadDurableObject<TestEnv> {
+  readonly #threadName: string;
+
+  constructor(threadName: string, env: TestEnv) {
+    super(undefined, env);
+    this.#threadName = threadName;
+  }
+
+  protected override get threadId(): string {
+    return this.#threadName;
+  }
+
   #routes = createThreadSignalRoutes({
     resolveAgent: () => this.env.agent,
-    resolveResourceId: (scope: ThreadScope) =>
-      mintResourceId(scope.tenantId, 'itest'),
+    resolveResourceId: () => resourceIdFromKey('itest'),
     consultRunCap: this.env.consultRunCap,
     startIdleRun: this.env.startIdleRun,
   });
@@ -75,8 +86,8 @@ class TestThread extends ThreadDurableObject<TestEnv> {
 }
 
 // A namespace over in-memory TestThread instances: idFromName(name)=name and
-// get() memoizes one instance per thread name — its DO identity IS its id.name,
-// exactly what the base class reads to assert the tenant.
+// get() memoizes one instance per thread name — its DO identity is its id.name,
+// exactly what the base class uses as the authoritative thread address.
 function threadNamespace(env: TestEnv): ThreadNamespaceLike<string> {
   const instances = new Map<string, TestThread>();
   return {
@@ -84,10 +95,7 @@ function threadNamespace(env: TestEnv): ThreadNamespaceLike<string> {
     get: (name) => {
       let inst = instances.get(name);
       if (!inst) {
-        inst = new TestThread(
-          { id: { name } } as unknown as DurableObjectState,
-          env,
-        );
+        inst = new TestThread(name, env);
         instances.set(name, inst);
       }
       const instance = inst;
@@ -108,20 +116,30 @@ function threadNamespace(env: TestEnv): ThreadNamespaceLike<string> {
   };
 }
 
-const THREAD_ID = mintThreadId('acme', () => 'itest'); // 'acme_itest'
+const THREAD_ID = mintThreadId(() => 'itest');
 
-function tenantCtx(): TenantContext {
+function actorContext(): ActorContext {
   const actor: ApprovalActor = {
     id: 'opal',
     role: 'operator',
-    tenantId: 'acme',
   };
   return {
     actor,
     principal: humanPrincipal(actor),
-    tenantId: 'acme',
-    ownsMemoryId: (id: string) => id === THREAD_ID,
-  } as unknown as TenantContext;
+    resourceOwner: { kind: 'human', id: actor.id },
+    service: () => {
+      throw new Error('approval service is not used in signal tests');
+    },
+    newRunId: () => 'run-1',
+    newThreadId: () => THREAD_ID,
+    resourceIdFromKey: resourceIdFromKey,
+    claimResource: async () => undefined,
+    releaseResource: async () => undefined,
+    resourceOwnerFor: async () => undefined,
+    canAccessResource: async (kind, id) =>
+      kind === 'thread' && id === THREAD_ID,
+    canSelfDecide: () => false,
+  };
 }
 
 // A runtime-driven reserve agent (no LLM): records the ifIdle target sendMessage
@@ -163,86 +181,25 @@ describe('signal ingestion — full chain (router → topology → thread DO →
       threadNamespace({ agent, consultRunCap, startIdleRun }),
     );
     const router = createSignalRouter({
-      resolve: async () => tenantCtx(),
+      resolve: async () => actorContext(),
       topology,
     });
 
     // #when
     const res = await router(wake(THREAD_ID));
 
-    // #then — the wake reached the thread routes THROUGH the DO's identity
-    // assertion (which passes only because the topology stamped the header from
-    // the resolved tenant), the run cap was consulted, and the runtime start
-    // seam got a tenant-salted run id without asking core to mint one.
+    // #then — the wake reached the thread routes through the DO's principal
+    // assertion, the run cap was consulted, and the runtime start seam got a
+    // host-minted run id.
     expect(res?.status).toBe(200);
-    expect(consultRunCap).toHaveBeenCalledWith('acme');
+    expect(consultRunCap).toHaveBeenCalledWith();
     expect(startIdleRun).toHaveBeenCalledWith(
-      expect.objectContaining({ runId: expect.stringMatching(/^acme_/) }),
+      expect.objectContaining({ runId: expect.any(String) }),
     );
     expect(targets).toHaveLength(0);
   });
 
-  it("reaps the real snapshot created by an idle wake during the tenant's offboarding purge", async () => {
-    // #given — a real D1-backed runtime behind the host-owned idle-start seam
-    const sqlite = openSqlite();
-    const binding = d1DatabaseLike(sqlite);
-    const storage = createD1Storage({ binding: binding as never });
-    const { createWorkflow, createStep, runtime } = init({ storage });
-    const complete = createStep({
-      id: 'complete',
-      inputSchema: z.object({}),
-      outputSchema: z.object({}),
-      execute: async () => ({}),
-    });
-    createWorkflow({
-      id: 'idle-wake',
-      inputSchema: z.object({}),
-      outputSchema: z.object({}),
-    })
-      .then(complete)
-      .commit();
-
-    const { agent } = reserveAgent();
-    let startedRunId: string | undefined;
-    const startIdleRun: StartIdleRun = async ({ runId }) => {
-      startedRunId = runId;
-      return runtime.start('idle-wake', { runId, inputData: {} });
-    };
-    const topology = createThreadTopology(
-      threadNamespace({
-        agent,
-        consultRunCap: async () => true,
-        startIdleRun,
-      }),
-    );
-    const router = createSignalRouter({
-      resolve: async () => tenantCtx(),
-      topology,
-    });
-
-    // #when — the production wake path mints the run id and persists its
-    // workflow snapshot through the real Mastra D1 adapter
-    const res = await router(wake(THREAD_ID));
-
-    // #then — INV-1 places that exact row inside purgeTenant's range
-    expect(res?.status).toBe(200);
-    expect(startedRunId).toMatch(/^acme_/);
-    expect(
-      sqlite
-        .prepare('SELECT run_id FROM mastra_workflow_snapshot WHERE run_id = ?')
-        .all(startedRunId),
-    ).toEqual([{ run_id: startedRunId }]);
-
-    const purged = await purgeTenant(binding as SnapshotDatabase, {
-      tenantId: 'acme',
-    });
-    expect(purged.snapshots).toBe(1);
-    expect(
-      sqlite.prepare('SELECT run_id FROM mastra_workflow_snapshot').all(),
-    ).toEqual([]);
-  });
-
-  it('degrades the wake to persist when the tenant is over its run cap', async () => {
+  it('degrades the wake to persist when the deployment is over its run cap', async () => {
     // #given — the cap refuses
     const { agent, targets } = reserveAgent();
     const consultRunCap = vi.fn(async () => false);
@@ -251,7 +208,7 @@ describe('signal ingestion — full chain (router → topology → thread DO →
       threadNamespace({ agent, consultRunCap, startIdleRun }),
     );
     const router = createSignalRouter({
-      resolve: async () => tenantCtx(),
+      resolve: async () => actorContext(),
       topology,
     });
 
@@ -263,27 +220,25 @@ describe('signal ingestion — full chain (router → topology → thread DO →
     expect((await res?.json()) as { capped: boolean }).toMatchObject({
       capped: true,
     });
-    expect(consultRunCap).toHaveBeenCalledWith('acme');
+    expect(consultRunCap).toHaveBeenCalledWith();
     expect(targets[0]?.ifIdle).toEqual({ behavior: 'persist' });
     expect(startIdleRun).not.toHaveBeenCalled();
   });
 
-  it('404s a foreign threadId at the topology — the DO is never addressed', async () => {
-    // #given — a threadId acme does not own
+  it("404s another actor's path-safe thread before waking its DO", async () => {
     const { agent } = reserveAgent();
     const consultRunCap = vi.fn(async () => true);
     const topology = createThreadTopology(
       threadNamespace({ agent, consultRunCap }),
     );
     const router = createSignalRouter({
-      resolve: async () => tenantCtx(),
+      resolve: async () => actorContext(),
       topology,
     });
 
     // #when
     const res = await router(wake('other_t9'));
 
-    // #then — refused at the topology ownership check, before the DO or its routes
     expect(res?.status).toBe(404);
     expect(consultRunCap).not.toHaveBeenCalled();
   });

@@ -38,5 +38,5 @@ body:
   - type: textarea
     id: security
     attributes:
-      label: Security and tenancy impact
-      description: Note changes to trust boundaries, capability minting, tenant isolation, retention, or unattended execution.
+      label: Security and isolation impact
+      description: Note changes to trust boundaries, capability minting, physical deployment isolation, resource authorization, retention, or unattended execution.

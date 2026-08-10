@@ -1,4 +1,4 @@
-// Shared surface for the five showcase workflow modules: the dependency bag the
+// Shared surface for the six showcase workflow modules: the dependency bag the
 // host resolves once and threads into every module, the binding-gated egress
 // seam, and the one non-obvious primitive — withContextKeys — that lets a step
 // inject a per-call context key (dry-run flag, idempotency key) into a connector
@@ -25,7 +25,7 @@ import { z } from 'zod';
 /**
  * The resume payload every showcase gate accepts — matches approval-api's
  * defaultResumeData ({ approved, comment?, decidedBy? }). Declared once here so
- * the five modules share one contract shape instead of hand-copying it; a change
+ * the six modules share one contract shape instead of hand-copying it; a change
  * to defaultResumeData's shape is then reconciled in a single place.
  */
 export const showcaseResumeSchema = z.object({
@@ -83,11 +83,8 @@ export interface ShowcaseDeps {
   /** `init` input: a Cloudflare env (D1 from `DB`) or `{ storage }`. */
   initInput: InitSource;
   /**
-   * The grant-minting seam, built by the HOST from its topology (INV-2):
-   * a DO binds per-instance — approvalGrantProvider(factory.forTenant(
-   * this.tenantId)) — while an in-process host serving every tenant on one
-   * runtime uses approvalGrantProviderFromFactory(factory), which recovers
-   * the tenant from each leg's runId prefix.
+   * The grant-minting seam, built by the host from the deployment-wide
+   * approval store. The provider is consulted on every start and resume leg.
    */
   grantProvider: RequestContextProvider;
   /** Connector audit sink; defaults to a buffering AuditLogger when omitted. */
@@ -128,7 +125,7 @@ export interface ShowcaseModuleDeps {
 /**
  * Clone the run's RequestContext and set per-call keys on the copy. Cloning
  * (not a fresh RequestContext) preserves the runtime-minted grant + workflow
- * scope so the write/egress/isolation gates still see them; NOT mutating the
+ * scope so the write and egress gates still see them; NOT mutating the
  * original scopes the injected key (dry-run flag, idempotency key) to THIS
  * connector call so it can never leak to a later step — a leaked dry-run flag
  * would silently turn a later real side effect into a simulation. Object-spread

@@ -3,9 +3,9 @@
 // DL-002). A thread's agent loop and every signal for that thread both address
 // `idFromName(threadId)`, so the platform serializes them onto ONE isolate — the
 // DO IS the serialization lease Mastra otherwise wants Redis for (DL-002). These
-// routes run AFTER ThreadDurableObject.fetch has already asserted the request's
-// authenticated tenant against the DO name's tenant prefix, so `scope.threadId`
-// and `scope.tenantId` are trusted here; the P6 ingestion gate (allowlist / size
+// routes run AFTER ThreadDurableObject.fetch has already verified the deployment
+// identity and decoded the server-stamped principal, so `scope.threadId` and
+// `scope.principal` are trusted here; the P6 ingestion gate (allowlist / size
 // cap / rate cap / audit) is the Worker-side createSignalRouter's job, the same
 // split createRunRouter (Worker gate) → DurableObjectRunner (execution) uses.
 //
@@ -28,7 +28,9 @@ import type {
   AgentMessageInput,
   AgentSignal,
   AgentSignalAttributes,
+  AgentSignalIfIdleOptions,
   AgentStateSignalInput,
+  SendAgentSignalOptions,
 } from '@mastra/core/agent';
 import {
   createNotificationSignal,
@@ -38,18 +40,30 @@ import {
   type SendNotificationSignalInput,
   summarizeNotifications,
 } from '@mastra/core/notifications';
+import { RequestContext } from '@mastra/core/request-context';
 import {
   type AgentEntryPath,
   isRuntimeDrivenAgent,
 } from '../agent-runner/index.js';
-import type { ExecutionPrincipal } from '../approval-api/index.js';
+import {
+  type ExecutionPrincipal,
+  samePrincipal,
+} from '../approval-api/index.js';
 import {
   DoStatusError,
-  mintSaltedId,
+  isPathSafeId,
   type ThreadScope,
 } from '../do-runner/index.js';
 import { internalErrorResponse } from '../internal-error-response.js';
 import {
+  createScheduleAgentDispatchReceipt,
+  type ScheduleAgentDispatchAction,
+  type ScheduleAgentDispatchReceipt,
+  type ScheduleAgentDispatchState,
+} from '../schedules/schedules-d1.js';
+import type { AgentScheduleTarget } from '../schedules/tick.js';
+import {
+  deferNotificationAfterFailure,
   MAX_NOTIFICATION_DISPATCH_IDS,
   planNotificationDispatch,
 } from './notification-dispatch.js';
@@ -70,13 +84,13 @@ export type ActiveBehavior = (typeof ACTIVE_BEHAVIORS)[number];
 
 /**
  * A run-cap consult for an idle-thread wake: starting a run with nobody
- * watching must charge the same per-tenant + global budget an unattended
+ * watching must charge the same deployment budget an unattended
  * schedule fire does, or a signal storm bills Cloudflare instead of exhausting a
  * quota. Returns false to REFUSE the wake (over cap) — the route then falls back
  * to `persist` (durable, no run) rather than dropping the signal. Absent ⇒ wake
- * is unmetered (single-tenant hosts with no budget).
+ * is unmetered (hosts with no budget).
  */
-export type RunCapConsult = (tenantId: string) => Promise<boolean> | boolean;
+export type RunCapConsult = () => Promise<boolean> | boolean;
 
 export interface StartIdleRunInput {
   agent: Agent;
@@ -90,11 +104,17 @@ export interface StartIdleRunInput {
    * declaring the entry.
    */
   principal: ExecutionPrincipal;
+  /** Infrastructure-verified deployment tag for audit attribution. */
+  deploymentTag?: string;
   entryPath: AgentEntryPath;
-  /** Compatibility alias for principal.id. */
-  requestedBy: string;
+  /** Authoritative source for a schedule.fire wake. */
+  scheduleId?: string;
+  /** Prepared trigger authorizing the scheduled wake's exact run id. */
+  dispatchId?: string;
   message?: AgentMessageInput;
   signal?: AgentSignal;
+  /** Sanitized context applied to a schedule-woken execution. */
+  safeContext?: Record<string, unknown>;
 }
 
 export interface StartIdleRunResult {
@@ -103,22 +123,39 @@ export interface StartIdleRunResult {
   signalId?: string;
 }
 
-/** Host-owned runtime-driven start on the thread DO. */
+/**
+ * Host-owned runtime-driven start on the thread DO. The host resolves the
+ * registered owner of `input.threadId` and passes that owner to the target
+ * agent host, which reserves the thread/resource/run claims before execution.
+ * The automated principal that delivered a signal remains the requester and
+ * does not replace the thread's human or service owner.
+ */
 export type StartIdleRun = (
   input: StartIdleRunInput,
 ) => Promise<StartIdleRunResult>;
+
+/** Durable receipt protocol for target-side threaded schedule dispatch. */
+export interface ScheduleSignalDispatchStore {
+  begin(
+    scheduleId: string,
+    dispatchId: string,
+  ): Promise<ScheduleAgentDispatchState>;
+  settle(
+    scheduleId: string,
+    dispatchId: string,
+    receipt: ScheduleAgentDispatchReceipt,
+  ): Promise<void>;
+}
 
 export interface ThreadSignalRoutesOptions {
   /**
    * The per-thread agent whose public signal methods these routes drive. Built
    * once per DO instance by the host (its model/memory/tools are the host's
-   * concern); these routes only need its identity and pubsub. The scope carries
-   * the asserted tenant so a host can refuse to build an agent for a thread it
-   * does not recognize.
+   * concern); these routes only need its identity and pubsub.
    *
    * MUST be a runtime-driven durable agent for an idle wake. The host-provided
-   * `startIdleRun` seam starts it through RunnerRuntime with a topology-minted,
-   * tenant-salted run id. Without either requirement, wake degrades to durable
+   * `startIdleRun` seam starts it through RunnerRuntime with a host-minted,
+   * path-safe run id. Without either requirement, wake degrades to durable
    * persistence and never escapes onto core's default execution engine. Trusted
    * notification dispatch supplies the persisted agent id; other routes pass
    * `undefined`.
@@ -129,11 +166,11 @@ export interface ThreadSignalRoutesOptions {
     entryPath: AgentEntryPath,
   ) => Agent | Promise<Agent>;
   /**
-   * The thread's tenant-owned memory resourceId — part of core's `(resourceId,
+   * The thread's host-owned memory resourceId — part of core's `(resourceId,
    * threadId)` signal key, so it MUST match whatever the loop registered under
    * or a send never finds the active run. Server-derived (a memory id is
    * TCB-only — never a client field); the host mints it from the authenticated
-   * tenant. Absent ⇒ threadId-only keying (resourceId ''), which is consistent
+   * host. Absent ⇒ threadId-only keying (resourceId ''), which is consistent
    * within this DO but only interoperates with a loop that also omits it — the
    * binding expected by the registered durable run.
    */
@@ -142,17 +179,61 @@ export interface ThreadSignalRoutesOptions {
   consultRunCap?: RunCapConsult;
   /** Runtime-driven start seam. Absent wakes degrade to durable persistence. */
   startIdleRun?: StartIdleRun;
+  /** Storage-backed thread occupancy, including runs surviving DO eviction. */
+  resolveBlockingRun?: (
+    scope: ThreadScope,
+  ) =>
+    | Promise<{ runId: string; principal: ExecutionPrincipal } | undefined>
+    | { runId: string; principal: ExecutionPrincipal }
+    | undefined;
+  /**
+   * Host-shared target-thread critical section. Required with
+   * `resolveBlockingRun`: the occupancy/principal check and signal action must
+   * serialize with public agent start/resume routes.
+   */
+  serializeDispatch?: <T>(
+    scope: ThreadScope,
+    operation: () => Promise<T>,
+  ) => Promise<T>;
+  /** Recover a stable schedule-wake run after its HTTP receipt was lost. */
+  resolveScheduleRunStatus?: (
+    scope: ThreadScope,
+    input: { agentId: string; resourceId: string; runId: string },
+  ) => Promise<{ runId: string; status?: string } | undefined>;
+  /** Resolve the canonical target bound to one prepared schedule fire. */
+  resolveScheduleTarget?: (
+    scope: ThreadScope,
+    input: { scheduleId: string; dispatchId: string; runId: string },
+  ) => Promise<AgentScheduleTarget | undefined>;
+  /** Whether this principal owns the thread and may persist future input. */
+  canPersist?: (scope: ThreadScope) => boolean | Promise<boolean>;
+  /** Whether the registered schedule owner may persist to its fixed target. */
+  canPersistSchedule?: (
+    scope: ThreadScope,
+    input: {
+      scheduleId: string;
+      dispatchId: string;
+      runId: string;
+      agentId: string;
+      threadId: string;
+      resourceId: string;
+    },
+  ) => boolean | Promise<boolean>;
   /** Durable inbox used by the trusted due-notification dispatch route. */
   resolveNotificationsStorage?: (
     scope: ThreadScope,
   ) => NotificationsStorage | Promise<NotificationsStorage>;
+  /** Target-side lease and receipt store for at-least-once schedule fires. */
+  resolveScheduleDispatchStore?: (
+    scope: ThreadScope,
+  ) => ScheduleSignalDispatchStore | Promise<ScheduleSignalDispatchStore>;
 }
 
 /**
  * A thread-DO signal router: `(request, scope) => Response | null`. `null` means
  * the path is not one of ours, so the subclass's `route()` can compose it ahead
  * of its own durable-agent routes. `scope` is the already-asserted
- * ThreadScope (threadId, tenantId, init) the template-method `fetch` hands down.
+ * ThreadScope the template-method `fetch` hands down.
  */
 export type ThreadSignalRouter = (
   request: Request,
@@ -167,6 +248,8 @@ function entryPathForSignalRoute(path: string): AgentEntryPath | undefined {
       return 'signal.queue';
     case '/signal':
       return 'signal.reactive';
+    case '/signal/schedule':
+      return 'schedule.fire';
     case '/signal/state':
       return 'signal.state';
     case '/signal/notification':
@@ -244,8 +327,20 @@ export function createThreadSignalRoutes(
     resolveResourceId,
     consultRunCap,
     startIdleRun,
+    resolveBlockingRun,
+    serializeDispatch,
+    resolveScheduleRunStatus,
+    resolveScheduleTarget,
+    canPersist,
+    canPersistSchedule,
     resolveNotificationsStorage,
+    resolveScheduleDispatchStore,
   } = options;
+  if (resolveBlockingRun && !serializeDispatch) {
+    throw new Error(
+      'signal routes require serializeDispatch with resolveBlockingRun',
+    );
+  }
   let wakeTail: Promise<unknown> = Promise.resolve();
   const serializeWake = <T>(operation: () => Promise<T>): Promise<T> => {
     const next = wakeTail.then(operation, operation);
@@ -256,6 +351,10 @@ export function createThreadSignalRoutes(
     return next;
   };
   let notificationTail: Promise<unknown> = Promise.resolve();
+  const completedScheduleDispatches = new Map<
+    string,
+    ScheduleAgentDispatchReceipt
+  >();
   const serializeNotification = <T>(
     operation: () => Promise<T>,
   ): Promise<T> => {
@@ -267,7 +366,7 @@ export function createThreadSignalRoutes(
     return next;
   };
 
-  return async (request, scope) => {
+  const route: ThreadSignalRouter = async (request, scope) => {
     if (request.method !== 'POST') return null;
     const url = new URL(request.url);
     const path = url.pathname;
@@ -279,12 +378,39 @@ export function createThreadSignalRoutes(
     if (!body) return json({ error: 'a JSON body is required' }, 400);
 
     try {
+      let scheduleTarget: AgentScheduleTarget | undefined;
+      if (path === '/signal/schedule') {
+        if (!resolveScheduleTarget) {
+          return json(
+            { error: 'schedule target resolution is not configured' },
+            503,
+          );
+        }
+        const { scheduleId, dispatchId, runId } = body;
+        if (
+          !isPathSafeId(scheduleId) ||
+          !isPathSafeId(dispatchId) ||
+          !isPathSafeId(runId)
+        ) {
+          return json({ error: 'invalid schedule signal dispatch' }, 400);
+        }
+        scheduleTarget = await resolveScheduleTarget(scope, {
+          scheduleId,
+          dispatchId,
+          runId,
+        });
+        if (!scheduleTarget) {
+          return json({ error: 'schedule dispatch not found' }, 404);
+        }
+      }
       const requestedAgentId =
-        path === '/signal/notifications/dispatch'
-          ? typeof body.agentId === 'string' && body.agentId.trim().length > 0
-            ? body.agentId
-            : undefined
-          : undefined;
+        path === '/signal/schedule'
+          ? scheduleTarget?.agentId
+          : path === '/signal/notifications/dispatch'
+            ? typeof body.agentId === 'string' && body.agentId.trim().length > 0
+              ? body.agentId
+              : undefined
+            : undefined;
       if (
         path === '/signal/notifications/dispatch' &&
         requestedAgentId === undefined
@@ -301,10 +427,7 @@ export function createThreadSignalRoutes(
       // internal and must not escape through the outer DO error response.
       const agent = await resolveAgent(scope, requestedAgentId, entryPath);
       if (requestedAgentId !== undefined && agent.id !== requestedAgentId) {
-        return json(
-          { error: 'notification agent binding does not match' },
-          404,
-        );
+        return json({ error: 'agent binding does not match' }, 404);
       }
       const runtimeDriven = isRuntimeDrivenAgent(agent);
       const pubsub = scope.init.pubsub;
@@ -312,6 +435,21 @@ export function createThreadSignalRoutes(
 
       const resourceId = resolveResourceId?.(scope);
       const threadId = scope.threadId;
+      const deliveredResourceId = url.searchParams.get('resourceId');
+      if (
+        path === '/signal/notification' &&
+        deliveredResourceId !== null &&
+        deliveredResourceId !== resourceId
+      ) {
+        return json(
+          { error: 'notification resource binding does not match' },
+          404,
+        );
+      }
+      const blockingRun = resolveBlockingRun
+        ? () => resolveBlockingRun(scope)
+        : undefined;
+      const persistenceAllowed = canPersist ? await canPersist(scope) : true;
 
       // POST /signal/message — immediate user message (joins the active loop or,
       // idle, wakes/persists per ifIdle).
@@ -322,17 +460,27 @@ export function createThreadSignalRoutes(
           threadId,
           resourceId,
           consultRunCap,
-          scope.tenantId,
+          scope.deploymentTag,
           runtimeDriven,
           scope.principal,
           entryPath,
           startIdleRun,
           serializeWake,
+          blockingRun,
+          persistenceAllowed,
         );
       }
       // POST /signal/queue — deliver on the NEXT turn (never wakes).
       if (path === '/signal/queue') {
-        return await handleQueue(agent, body, threadId, resourceId);
+        return await handleQueue(
+          agent,
+          body,
+          threadId,
+          resourceId,
+          scope.principal,
+          blockingRun,
+          persistenceAllowed,
+        );
       }
       // POST /signal — a system signal (ifActive/ifIdle deliver/persist/discard/wake).
       if (path === '/signal') {
@@ -342,13 +490,46 @@ export function createThreadSignalRoutes(
           threadId,
           resourceId,
           consultRunCap,
-          scope.tenantId,
+          scope.deploymentTag,
           runtimeDriven,
           scope.principal,
           entryPath,
           startIdleRun,
           serializeWake,
+          blockingRun,
+          persistenceAllowed,
         );
+      }
+      if (path === '/signal/schedule') {
+        if (!resolveScheduleDispatchStore) {
+          return json({ error: 'schedule dispatch is not configured' }, 503);
+        }
+        if (!scheduleTarget) {
+          return json({ error: 'schedule dispatch not found' }, 404);
+        }
+        return await handleScheduleSignal({
+          agent,
+          body,
+          target: scheduleTarget,
+          threadId,
+          resourceId,
+          principal: scope.principal,
+          deploymentTag: scope.deploymentTag,
+          runtimeDriven,
+          consultRunCap,
+          startIdleRun,
+          serializeWake,
+          blockingRun,
+          persistenceAllowed,
+          schedulePersistenceAllowed: canPersistSchedule
+            ? (input) => canPersistSchedule(scope, input)
+            : undefined,
+          resolveRunStatus: resolveScheduleRunStatus
+            ? (input) => resolveScheduleRunStatus(scope, input)
+            : undefined,
+          store: await resolveScheduleDispatchStore(scope),
+          completed: completedScheduleDispatches,
+        });
       }
       // POST /signal/state — a durable thread-state lane (snapshot/delta).
       if (path === '/signal/state') {
@@ -367,13 +548,15 @@ export function createThreadSignalRoutes(
             body,
             threadId,
             resourceId,
-            tenantId: scope.tenantId,
+            deploymentTag: scope.deploymentTag,
             principal: scope.principal,
             entryPath,
             runtimeDriven,
             consultRunCap,
             startIdleRun,
             serializeWake,
+            blockingRun,
+            persistenceAllowed,
             storage: await resolveNotificationsStorage(scope),
             agentId: requestedAgentId,
           }),
@@ -405,6 +588,16 @@ export function createThreadSignalRoutes(
       return internalErrorResponse('signals.thread', error, 502);
     }
   };
+  return (request, scope) => {
+    if (request.method !== 'POST') return Promise.resolve(null);
+    const path = new URL(request.url).pathname;
+    if (path !== '/signal' && !path.startsWith('/signal/')) {
+      return Promise.resolve(null);
+    }
+    return serializeDispatch
+      ? serializeDispatch(scope, () => route(request, scope))
+      : route(request, scope);
+  };
 }
 
 async function handleNotificationDispatch(options: {
@@ -412,13 +605,15 @@ async function handleNotificationDispatch(options: {
   body: Record<string, unknown>;
   threadId: string;
   resourceId: string | undefined;
-  tenantId: string;
+  deploymentTag: string | undefined;
   principal: ExecutionPrincipal;
   entryPath: AgentEntryPath;
   runtimeDriven: boolean;
   consultRunCap?: RunCapConsult;
   startIdleRun?: StartIdleRun;
   serializeWake<T>(operation: () => Promise<T>): Promise<T>;
+  blockingRun?: BlockingRunResolver;
+  persistenceAllowed: boolean;
   storage: NotificationsStorage;
   agentId: string;
 }): Promise<Response> {
@@ -439,6 +634,21 @@ async function handleNotificationDispatch(options: {
     return json({ error: 'notification resource binding does not match' }, 404);
   }
   const resourceId = options.resourceId;
+  const durableBlockingRun = await options.blockingRun?.();
+  if (
+    durableBlockingRun &&
+    !samePrincipal(durableBlockingRun.principal, options.principal)
+  ) {
+    return json(
+      {
+        error: 'notification principal does not match the active run',
+        reason: 'principal-mismatch',
+        runId: durableBlockingRun.runId,
+        retry: true,
+      },
+      409,
+    );
+  }
   const now =
     typeof options.body.now === 'string'
       ? new Date(options.body.now)
@@ -496,11 +706,12 @@ async function handleNotificationDispatch(options: {
     requestedBatchThreadState === 'active' ||
     requestedBatchThreadState === 'idle'
       ? requestedBatchThreadState
-      : typeof options.agent.getActiveThreadRunId === 'function' &&
-          options.agent.getActiveThreadRunId({
-            threadId: options.threadId,
-            resourceId,
-          })
+      : durableBlockingRun ||
+          (typeof options.agent.getActiveThreadRunId === 'function' &&
+            options.agent.getActiveThreadRunId({
+              threadId: options.threadId,
+              resourceId,
+            }))
         ? 'active'
         : 'idle';
 
@@ -508,18 +719,12 @@ async function handleNotificationDispatch(options: {
   let failed = 0;
   const updateFailure = async (record: NotificationRecord, error: unknown) => {
     failed += 1;
-    await options.storage.updateNotification({
-      id: record.id,
-      threadId: record.threadId,
-      deliveryAttempts: (record.deliveryAttempts ?? 0) + 1,
-      lastDeliveryAttemptAt: now,
-      lastDeliveryError: error instanceof Error ? error.message : String(error),
-    });
+    await deferNotificationAfterFailure(options.storage, record, now, error);
   };
   const send = async (signal: AgentSignal): Promise<string> => {
     const response = await handleWake({
       agent: options.agent,
-      tenantId: options.tenantId,
+      deploymentTag: options.deploymentTag,
       threadId: options.threadId,
       resourceId,
       principal: options.principal,
@@ -528,6 +733,10 @@ async function handleNotificationDispatch(options: {
       consultRunCap: options.consultRunCap,
       startIdleRun: options.startIdleRun,
       serializeWake: options.serializeWake,
+      blockingRun: durableBlockingRun
+        ? () => durableBlockingRun
+        : options.blockingRun,
+      persistenceAllowed: options.persistenceAllowed,
       signal,
       deliverActive: (runId) =>
         options.agent.sendSignal(signal, {
@@ -545,11 +754,27 @@ async function handleNotificationDispatch(options: {
     });
     if (!response.ok)
       throw new Error(`notification signal returned ${response.status}`);
-    const result = (await response.json()) as { signalId?: string };
+    const result = (await response.json()) as {
+      signalId?: string;
+      decision?: unknown;
+    };
+    const action = recordValue(result.decision)?.action;
+    if (
+      action !== 'wake' &&
+      action !== 'deliver' &&
+      !(action === 'persist' && options.persistenceAllowed)
+    ) {
+      throw new Error(
+        `notification signal was not executed (${String(action ?? 'unknown')})`,
+      );
+    }
     if (!result.signalId) throw new Error('notification signal has no id');
     return result.signalId;
   };
   const persistWithoutWake = async (signal: AgentSignal): Promise<string> => {
+    if (!options.persistenceAllowed) {
+      throw new Error('signal persistence is forbidden for this principal');
+    }
     const result = options.agent.sendSignal(signal, {
       threadId: options.threadId,
       resourceId,
@@ -567,11 +792,13 @@ async function handleNotificationDispatch(options: {
         const signal = createNotificationSummarySignal(
           summarizeNotifications(item.records),
         );
-        const signalId = item.records.every(
+        const lowPriority = item.records.every(
           (record) => record.priority === 'low',
-        )
-          ? await persistWithoutWake(signal)
-          : await send(signal);
+        );
+        const signalId =
+          lowPriority && options.persistenceAllowed
+            ? await persistWithoutWake(signal)
+            : await send(signal);
         for (const record of item.records) {
           await options.storage.updateNotification({
             id: record.id,
@@ -656,7 +883,7 @@ type WakeRefusal = 'not-runtime-driven' | 'no-start-idle-run';
  * next turn rather than dropping or billing):
  *   - the agent must be RUNTIME-DRIVEN (its stream re-enters RunnerRuntime, not
  *     the default engine) — else `wakeRefused:'not-runtime-driven'`;
- *   - the per-tenant run cap must allow it — otherwise `capped:true`.
+ *   - the deployment run cap must allow it — otherwise `capped:true`.
  */
 function requestedIdle(body: Record<string, unknown>): IdleBehavior {
   const requested = body.ifIdle;
@@ -672,9 +899,25 @@ interface WakeDelivery {
   persisted?: Promise<void>;
 }
 
+type BlockingRunResolver = () =>
+  | Promise<{ runId: string; principal: ExecutionPrincipal } | undefined>
+  | { runId: string; principal: ExecutionPrincipal }
+  | undefined;
+
+function principalMismatchResponse(runId: string): Response {
+  return json({
+    decision: {
+      action: 'blocked',
+      reason: 'principal-mismatch',
+      runId,
+    },
+    capped: false,
+  });
+}
+
 async function handleWake(options: {
   agent: Agent;
-  tenantId: string;
+  deploymentTag: string | undefined;
   threadId: string;
   resourceId: string;
   principal: ExecutionPrincipal;
@@ -683,12 +926,19 @@ async function handleWake(options: {
   consultRunCap?: RunCapConsult;
   startIdleRun?: StartIdleRun;
   serializeWake<T>(operation: () => Promise<T>): Promise<T>;
+  blockingRun?: BlockingRunResolver;
+  persistenceAllowed: boolean;
   message?: AgentMessageInput;
   signal?: AgentSignal;
+  runId?: string;
+  scheduleId?: string;
+  dispatchId?: string;
+  safeContext?: Record<string, unknown>;
   deliverActive(runId: string): WakeDelivery;
   persist(): WakeDelivery;
 }): Promise<Response> {
   return options.serializeWake(async () => {
+    const durableBlockingRun = await options.blockingRun?.();
     const activeRunId =
       typeof options.agent.getActiveThreadRunId === 'function'
         ? options.agent.getActiveThreadRunId({
@@ -696,12 +946,42 @@ async function handleWake(options: {
             resourceId: options.resourceId,
           })
         : undefined;
+    if (
+      durableBlockingRun &&
+      !samePrincipal(durableBlockingRun.principal, options.principal)
+    ) {
+      return principalMismatchResponse(durableBlockingRun.runId);
+    }
     if (activeRunId) {
+      if (durableBlockingRun && durableBlockingRun.runId !== activeRunId) {
+        return json({
+          decision: {
+            action: 'blocked',
+            reason: 'thread-blocked',
+            runId: durableBlockingRun.runId,
+          },
+          capped: false,
+        });
+      }
       const delivered = options.deliverActive(activeRunId);
       return json({
         decision: await delivered.accepted,
         capped: false,
         signalId: delivered.signal.id,
+      });
+    }
+
+    if (durableBlockingRun) {
+      return json({
+        decision: {
+          action: 'blocked',
+          reason: 'thread-blocked',
+          runId: durableBlockingRun.runId,
+        },
+        capped: false,
+        ...(options.signal?.id !== undefined
+          ? { signalId: options.signal.id }
+          : {}),
       });
     }
 
@@ -713,9 +993,22 @@ async function handleWake(options: {
         : undefined;
     const capped =
       options.runtimeDriven && options.consultRunCap
-        ? !(await options.consultRunCap(options.tenantId))
+        ? !(await options.consultRunCap())
         : false;
     if (refusal || capped) {
+      if (!options.persistenceAllowed) {
+        return json({
+          decision: {
+            action: 'discard',
+            reason: 'persistence-forbidden',
+          },
+          capped,
+          ...(refusal ? { wakeRefused: refusal } : {}),
+          ...(options.signal?.id !== undefined
+            ? { signalId: options.signal.id }
+            : {}),
+        });
+      }
       const persisted = options.persist();
       const decision = await persisted.accepted;
       if (persisted.persisted) await persisted.persisted;
@@ -727,11 +1020,10 @@ async function handleWake(options: {
       });
     }
 
-    const runId = mintSaltedId(
-      options.tenantId,
-      () => crypto.randomUUID(),
-      'thread signal wake',
-    );
+    const runId = options.runId ?? crypto.randomUUID();
+    if (!isPathSafeId(runId)) {
+      throw new Error('thread signal wake generated a non-path-safe run id');
+    }
     if (!startIdleRun) {
       throw new Error('idle-start gate allowed a missing startIdleRun seam');
     }
@@ -741,10 +1033,21 @@ async function handleWake(options: {
       threadId: options.threadId,
       resourceId: options.resourceId,
       principal: options.principal,
+      ...(options.deploymentTag !== undefined
+        ? { deploymentTag: options.deploymentTag }
+        : {}),
       entryPath: options.entryPath,
-      requestedBy: options.principal.id,
+      ...(options.scheduleId !== undefined
+        ? { scheduleId: options.scheduleId }
+        : {}),
+      ...(options.dispatchId !== undefined
+        ? { dispatchId: options.dispatchId }
+        : {}),
       ...(options.message !== undefined ? { message: options.message } : {}),
       ...(options.signal !== undefined ? { signal: options.signal } : {}),
+      ...(options.safeContext !== undefined
+        ? { safeContext: options.safeContext }
+        : {}),
     });
     const signalId = started.signalId ?? options.signal?.id;
     return json({
@@ -755,18 +1058,307 @@ async function handleWake(options: {
   });
 }
 
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function scheduleReceipt(
+  decision: unknown,
+  signalId: string | undefined,
+): ScheduleAgentDispatchReceipt | undefined {
+  const candidate = recordValue(decision);
+  const action = candidate?.action;
+  if (
+    action !== 'wake' &&
+    action !== 'deliver' &&
+    action !== 'persist' &&
+    action !== 'discard' &&
+    action !== 'blocked'
+  ) {
+    return undefined;
+  }
+  const runId = candidate?.runId;
+  if (
+    (action === 'wake' || action === 'deliver' || action === 'blocked') &&
+    !isPathSafeId(runId)
+  ) {
+    return undefined;
+  }
+  const canonicalAction = action as ScheduleAgentDispatchAction;
+  return createScheduleAgentDispatchReceipt(canonicalAction, {
+    ...(typeof runId === 'string' ? { runId } : {}),
+    ...(signalId !== undefined ? { signalId } : {}),
+  });
+}
+
+async function handleScheduleSignal(options: {
+  agent: Agent;
+  body: Record<string, unknown>;
+  target: AgentScheduleTarget;
+  threadId: string;
+  resourceId: string | undefined;
+  principal: ExecutionPrincipal;
+  deploymentTag: string | undefined;
+  runtimeDriven: boolean;
+  consultRunCap: RunCapConsult | undefined;
+  startIdleRun: StartIdleRun | undefined;
+  serializeWake<T>(operation: () => Promise<T>): Promise<T>;
+  blockingRun?: BlockingRunResolver;
+  persistenceAllowed: boolean;
+  schedulePersistenceAllowed?: (input: {
+    scheduleId: string;
+    dispatchId: string;
+    runId: string;
+    agentId: string;
+    threadId: string;
+    resourceId: string;
+  }) => boolean | Promise<boolean>;
+  resolveRunStatus?: (input: {
+    agentId: string;
+    resourceId: string;
+    runId: string;
+  }) => Promise<{ runId: string; status?: string } | undefined>;
+  store: ScheduleSignalDispatchStore;
+  completed: Map<string, ScheduleAgentDispatchReceipt>;
+}): Promise<Response> {
+  const scheduleId = options.body.scheduleId;
+  const dispatchId = options.body.dispatchId;
+  const runId = options.body.runId;
+  const target = options.target;
+  const requestContext = target.requestContext ?? {};
+  const streamRequestContext =
+    target.ifIdle?.streamOptions?.requestContext ?? {};
+  if (
+    !isPathSafeId(scheduleId) ||
+    !isPathSafeId(dispatchId) ||
+    !isPathSafeId(runId) ||
+    typeof options.resourceId !== 'string' ||
+    target.threadId !== options.threadId ||
+    target.resourceId !== options.resourceId
+  ) {
+    return json({ error: 'invalid schedule signal dispatch' }, 400);
+  }
+  const resourceId = options.resourceId;
+  if (target.tagName !== undefined && !XML_NAME_PATTERN.test(target.tagName)) {
+    return json({ error: 'tagName is not a valid XML name' }, 400);
+  }
+
+  const completed = options.completed.get(dispatchId);
+  if (completed) {
+    await options.store.settle(scheduleId, dispatchId, completed);
+    options.completed.delete(dispatchId);
+    return json({ receipt: completed });
+  }
+  const state = await options.store.begin(scheduleId, dispatchId);
+  if (state.state === 'missing') {
+    return json({ error: 'schedule dispatch not found' }, 404);
+  }
+  if (state.state === 'pending') {
+    return json({ pending: true }, 202);
+  }
+  if (state.state === 'settled') {
+    return json({ receipt: state.receipt });
+  }
+
+  const recoveredRun = await options.resolveRunStatus?.({
+    agentId: target.agentId,
+    resourceId,
+    runId,
+  });
+  if (recoveredRun) {
+    const receipt: ScheduleAgentDispatchReceipt = {
+      action: 'wake',
+      outcome: 'succeeded',
+      runId: recoveredRun.runId,
+      signalId: dispatchId,
+    };
+    options.completed.set(dispatchId, receipt);
+    await options.store.settle(scheduleId, dispatchId, receipt);
+    options.completed.delete(dispatchId);
+    return json({ receipt });
+  }
+
+  const durableBlockingRun = await options.blockingRun?.();
+  if (
+    durableBlockingRun &&
+    !samePrincipal(durableBlockingRun.principal, options.principal)
+  ) {
+    const receipt: ScheduleAgentDispatchReceipt = {
+      action: 'blocked',
+      outcome: 'skipped',
+      runId: durableBlockingRun.runId,
+      signalId: dispatchId,
+    };
+    options.completed.set(dispatchId, receipt);
+    await options.store.settle(scheduleId, dispatchId, receipt);
+    options.completed.delete(dispatchId);
+    return json({ receipt });
+  }
+
+  const baseProviderOptions = target.providerOptions ?? {};
+  const baseMastra = recordValue(baseProviderOptions.mastra) ?? {};
+  const signal: AgentSignal = {
+    id: dispatchId,
+    type: target.signalType ?? 'notification',
+    tagName: target.tagName ?? 'schedule',
+    contents: target.prompt,
+    ...(target.attributes !== undefined
+      ? { attributes: target.attributes }
+      : {}),
+    providerOptions: {
+      ...baseProviderOptions,
+      mastra: {
+        ...baseMastra,
+        schedule: {
+          scheduleId,
+          threadId: options.threadId,
+        },
+      },
+    } as AgentSignal['providerOptions'],
+  };
+  const ifActive = target.ifActive ?? { behavior: 'deliver' as const };
+  const ifIdle = target.ifIdle ?? { behavior: 'wake' as const };
+  const localActiveRunId =
+    typeof options.agent.getActiveThreadRunId === 'function'
+      ? options.agent.getActiveThreadRunId({
+          threadId: options.threadId,
+          resourceId,
+        })
+      : undefined;
+  const persistenceRequested = localActiveRunId
+    ? (ifActive.behavior ?? 'deliver') === 'persist'
+    : (ifIdle.behavior ?? 'wake') === 'persist';
+  const persistenceAllowed =
+    persistenceRequested && options.schedulePersistenceAllowed
+      ? await options.schedulePersistenceAllowed({
+          scheduleId,
+          dispatchId,
+          runId,
+          agentId: target.agentId,
+          threadId: options.threadId,
+          resourceId,
+        })
+      : options.persistenceAllowed;
+  if (persistenceRequested && !persistenceAllowed) {
+    const receipt: ScheduleAgentDispatchReceipt = {
+      action: 'discard',
+      outcome: 'discarded',
+      signalId: dispatchId,
+    };
+    options.completed.set(dispatchId, receipt);
+    await options.store.settle(scheduleId, dispatchId, receipt);
+    options.completed.delete(dispatchId);
+    return json({ receipt });
+  }
+  const idleRequestContext =
+    ifIdle.streamOptions?.requestContext ?? streamRequestContext;
+  const signalIfIdle: AgentSignalIfIdleOptions = {
+    ...(ifIdle.behavior !== undefined ? { behavior: ifIdle.behavior } : {}),
+    ...(ifIdle.attributes !== undefined
+      ? { attributes: ifIdle.attributes }
+      : {}),
+    ...(ifIdle.streamOptions !== undefined
+      ? {
+          streamOptions: {
+            ...ifIdle.streamOptions,
+            requestContext:
+              idleRequestContext === undefined
+                ? undefined
+                : new RequestContext(Object.entries(idleRequestContext)),
+          } as NonNullable<AgentSignalIfIdleOptions['streamOptions']>,
+        }
+      : {}),
+  };
+  const signalTarget: SendAgentSignalOptions = {
+    threadId: options.threadId,
+    resourceId,
+    ifActive,
+    ifIdle: signalIfIdle,
+  };
+
+  let decision: unknown;
+  let signalId: string | undefined;
+  if ((ifIdle.behavior ?? 'wake') === 'wake') {
+    const idleSignal: AgentSignal = {
+      ...signal,
+      ...(ifIdle.attributes !== undefined
+        ? { attributes: { ...signal.attributes, ...ifIdle.attributes } }
+        : {}),
+    };
+    const response = await handleWake({
+      agent: options.agent,
+      deploymentTag: options.deploymentTag,
+      threadId: options.threadId,
+      resourceId,
+      principal: options.principal,
+      entryPath: 'schedule.fire',
+      runtimeDriven: options.runtimeDriven,
+      consultRunCap: options.consultRunCap,
+      startIdleRun: options.startIdleRun,
+      serializeWake: options.serializeWake,
+      blockingRun: durableBlockingRun
+        ? () => durableBlockingRun
+        : options.blockingRun,
+      persistenceAllowed,
+      signal: idleSignal,
+      runId,
+      scheduleId,
+      dispatchId,
+      safeContext: { ...requestContext, ...idleRequestContext },
+      deliverActive: (activeRunId) =>
+        options.agent.sendSignal(signal, {
+          runId: activeRunId,
+          threadId: options.threadId,
+          resourceId,
+          ifActive,
+        }),
+      persist: () =>
+        options.agent.sendSignal(signal, {
+          threadId: options.threadId,
+          resourceId,
+          ifActive,
+          ifIdle: { ...signalIfIdle, behavior: 'persist' },
+        }),
+    });
+    if (!response.ok) return response;
+    const payload = (await response.json()) as Record<string, unknown>;
+    decision = payload.decision;
+    signalId =
+      typeof payload.signalId === 'string' ? payload.signalId : undefined;
+  } else {
+    const sent = options.agent.sendSignal(signal, signalTarget);
+    decision = await sent.accepted;
+    if (recordValue(decision)?.action === 'persist' && sent.persisted) {
+      await sent.persisted;
+    }
+    signalId = sent.signal.id;
+  }
+  const receipt = scheduleReceipt(decision, signalId);
+  if (!receipt) {
+    throw new Error('agent schedule returned an invalid signal decision');
+  }
+  options.completed.set(dispatchId, receipt);
+  await options.store.settle(scheduleId, dispatchId, receipt);
+  options.completed.delete(dispatchId);
+  return json({ receipt });
+}
+
 async function handleMessage(
   agent: Agent,
   body: Record<string, unknown>,
   threadId: string,
   resourceId: string | undefined,
   consultRunCap: RunCapConsult | undefined,
-  tenantId: string,
+  deploymentTag: string | undefined,
   runtimeDriven: boolean,
   principal: ExecutionPrincipal,
   entryPath: AgentEntryPath,
   startIdleRun: StartIdleRun | undefined,
   serializeWake: <T>(operation: () => Promise<T>) => Promise<T>,
+  blockingRun: BlockingRunResolver | undefined,
+  persistenceAllowed: boolean,
 ): Promise<Response> {
   if (!isContents(body.contents)) {
     return json({ error: 'contents (string) is required' }, 400);
@@ -787,10 +1379,17 @@ async function handleMessage(
     );
   }
   const behavior = requestedIdle(body);
+  const durableBlockingRun = await blockingRun?.();
+  if (
+    durableBlockingRun &&
+    !samePrincipal(durableBlockingRun.principal, principal)
+  ) {
+    return principalMismatchResponse(durableBlockingRun.runId);
+  }
   if (behavior === 'wake') {
     return handleWake({
       agent,
-      tenantId,
+      deploymentTag,
       threadId,
       resourceId,
       principal,
@@ -799,6 +1398,8 @@ async function handleMessage(
       consultRunCap,
       startIdleRun,
       serializeWake,
+      blockingRun: durableBlockingRun ? () => durableBlockingRun : blockingRun,
+      persistenceAllowed,
       message,
       deliverActive: (runId) =>
         agent.sendMessage(message, {
@@ -813,6 +1414,12 @@ async function handleMessage(
           resourceId,
           ifIdle: { behavior: 'persist' },
         }),
+    });
+  }
+  if (behavior === 'persist' && !persistenceAllowed) {
+    return json({
+      decision: { action: 'discard', reason: 'persistence-forbidden' },
+      capped: false,
     });
   }
   const result = agent.sendMessage(message, {
@@ -833,6 +1440,9 @@ async function handleQueue(
   body: Record<string, unknown>,
   threadId: string,
   resourceId: string | undefined,
+  principal: ExecutionPrincipal,
+  blockingRun: BlockingRunResolver | undefined,
+  persistenceAllowed: boolean,
 ): Promise<Response> {
   if (!isContents(body.contents)) {
     return json({ error: 'contents (string) is required' }, 400);
@@ -847,6 +1457,18 @@ async function handleQueue(
     contents: body.contents,
     ...(isAttributes(body.attributes) ? { attributes: body.attributes } : {}),
   };
+  const durableBlockingRun = await blockingRun?.();
+  if (
+    durableBlockingRun &&
+    !samePrincipal(durableBlockingRun.principal, principal)
+  ) {
+    return principalMismatchResponse(durableBlockingRun.runId);
+  }
+  if (!persistenceAllowed) {
+    return json({
+      decision: { action: 'discard', reason: 'persistence-forbidden' },
+    });
+  }
   const result = agent.queueMessage(message, { threadId, resourceId });
   const decision = await result.accepted;
   return json({ decision, signalId: result.signal.id });
@@ -858,12 +1480,14 @@ async function handleSignal(
   threadId: string,
   resourceId: string | undefined,
   consultRunCap: RunCapConsult | undefined,
-  tenantId: string,
+  deploymentTag: string | undefined,
   runtimeDriven: boolean,
   principal: ExecutionPrincipal,
   entryPath: AgentEntryPath,
   startIdleRun: StartIdleRun | undefined,
   serializeWake: <T>(operation: () => Promise<T>) => Promise<T>,
+  blockingRun: BlockingRunResolver | undefined,
+  persistenceAllowed: boolean,
 ): Promise<Response> {
   if (!isContents(body.contents)) {
     return json({ error: 'contents (string) is required' }, 400);
@@ -889,11 +1513,22 @@ async function handleSignal(
     (ACTIVE_BEHAVIORS as readonly string[]).includes(body.ifActive)
       ? (body.ifActive as ActiveBehavior)
       : 'deliver';
+  const durableBlockingRun = await blockingRun?.();
+  if (
+    durableBlockingRun &&
+    !samePrincipal(durableBlockingRun.principal, principal)
+  ) {
+    return principalMismatchResponse(durableBlockingRun.runId);
+  }
   if (resourceId === undefined) {
     // Active-only target: no idle branch available without a resourceId.
+    const runId = crypto.randomUUID();
+    if (!isPathSafeId(runId)) {
+      throw new Error('thread signal generated a non-path-safe run id');
+    }
     const result = agent.sendSignal(signal, {
       threadId,
-      runId: `${tenantId}_signal`,
+      runId,
       ifActive: { behavior: activeBehavior },
     });
     const decision = await result.accepted;
@@ -903,7 +1538,7 @@ async function handleSignal(
   if (behavior === 'wake') {
     return handleWake({
       agent,
-      tenantId,
+      deploymentTag,
       threadId,
       resourceId,
       principal,
@@ -912,6 +1547,8 @@ async function handleSignal(
       consultRunCap,
       startIdleRun,
       serializeWake,
+      blockingRun: durableBlockingRun ? () => durableBlockingRun : blockingRun,
+      persistenceAllowed,
       signal,
       deliverActive: (runId) =>
         agent.sendSignal(signal, {
@@ -927,6 +1564,12 @@ async function handleSignal(
           ifActive: { behavior: activeBehavior },
           ifIdle: { behavior: 'persist' },
         }),
+    });
+  }
+  if (behavior === 'persist' && !persistenceAllowed) {
+    return json({
+      decision: { action: 'discard', reason: 'persistence-forbidden' },
+      capped: false,
     });
   }
   const result = agent.sendSignal(signal, {

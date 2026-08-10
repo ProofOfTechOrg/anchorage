@@ -58,7 +58,7 @@ export interface StreamTransport {
 
 // ---- Wire frames ----------------------------------------------------------
 
-/** A reviewer attached to the tenant's hub, mirrored from do-runner/hub-do. */
+/** A reviewer attached to the deployment hub, mirrored from do-runner/hub-do. */
 export interface PresenceMember {
   actorId: string;
   role: string;
@@ -85,7 +85,7 @@ export interface StreamRunSummary {
 }
 
 /**
- * The wire union every Durable Object emits: the per-tenant hub fans out `queue`
+ * The wire union every Durable Object emits: the deployment hub fans out `queue`
  * (an ApprovalStreamEvent) and `presence` (the roster) frames; the per-run
  * runner DO emits `run` (the wholesale authoritative RunSummary) frames.
  */
@@ -96,8 +96,8 @@ export type StreamFrame =
 
 /**
  * Parse a raw text frame to a StreamFrame, or undefined for anything malformed
- * or of an unknown type. This is a same-trust intra-tenant feed (every
- * subscriber is an authenticated reviewer of this tenant), so it validates the
+ * or of an unknown type. This is a same-deployment feed (every subscriber is an
+ * authenticated reviewer), so it validates the
  * discriminant only, not the payload shape.
  */
 export function parseStreamFrame(data: string): StreamFrame | undefined {

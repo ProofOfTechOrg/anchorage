@@ -9,7 +9,7 @@
 //
 //   GET  /workflows                        -> catalog + server-derived actor
 //   POST /runs { workflowId, inputData }   -> starts (runId server-minted as
-//                                             `spike_<uuid>` per INV-1); on
+//                                             an opaque UUID); on
 //                                             suspend, also queues an approval
 //   GET  /runs/:workflowId/:runId          -> widened status projection
 //   POST /runs/:workflowId/:runId/resume   -> raw resume (no grants — the
@@ -20,14 +20,14 @@
 //   GET  /api/stream/run/:wf/:runId?ticket= -> live run-progress WebSocket
 //
 // Live streaming (DL-009/DL-010): STREAM_TICKET_SECRET is set as a LOCAL-ONLY
-// spike var so the stream stage MOUNTS; DemoHub is the per-tenant fan-out hub.
+// spike var so the stream stage MOUNTS; DemoHub is the deployment fan-out hub.
 // The workerd WS proof (suspend/resume/decide fan-out, hibernation persistence,
-// expired/cross-tenant ticket fail-closed) is automated in
+// expired/malformed ticket fail-closed) is automated in
 // scripts/spike-verify.mjs.
 //
 // Auth: bearer tokens over the SAME host-kit seam every deployed host uses
 // (staticTokenVerifier + bearerActorAuthenticator + createRunRouter) — a
-// second unguarded routing path is how INV-1 rots, so even this local spike
+// second unguarded routing path is how server-owned ID policy rots, so this spike
 // mounts the shared run router instead of hand-rolled /runs routing. The
 // SPIKE_ACTORS tokens are LOCAL-ONLY fixtures for wrangler dev; this worker
 // is never deployed.
@@ -54,7 +54,7 @@ import type {
   ExecutionContext,
   ExportedHandler,
 } from '@cloudflare/workers-types';
-import { Agent } from '@mastra/core/agent';
+import { Agent, createMessageSignal, createSignal } from '@mastra/core/agent';
 import type {
   MastraModelConfig,
   OpenAICompatibleConfig,
@@ -78,8 +78,10 @@ import {
 import { ACTOR_CONTEXT_KEY } from '@proofoftech/breakwater/rbac';
 import { z } from 'zod';
 import {
+  type AgentEntryPath,
   type AgentMeta,
   type AgentModule,
+  type AgentThreadStateStorage,
   createAgentApprovalResumer,
   createAgentRouter,
   createAgentThreadTopology,
@@ -88,21 +90,25 @@ import {
 } from '../src/agent-host/index.js';
 import { readAgentThreadBinding } from '../src/agent-runner/index.js';
 import {
+  type ActorContext,
+  type ActorResolver,
   type ApprovalActor,
   type ApprovalDecision,
   type ApprovalRecord,
   ApprovalService,
+  type ApprovalStore,
   type ApprovalStreamSink,
   approvalGrantProvider,
   BREAKWATER_CONNECTOR_GRANTS_KEY,
+  createActorResolver,
   createApprovalRouter,
-  createTenantResolver,
+  createPrincipalActorContext,
   D1ApprovalStoreFactory,
   defaultResumeData,
   type ExecutionPrincipal,
-  principalActor,
-  type TenantBoundApprovalStore,
-  type TenantContext,
+  type ResourceClaim,
+  type ResourceKind,
+  withRegisteredResourceOwner,
 } from '../src/approval-api/index.js';
 
 import {
@@ -114,17 +120,20 @@ import {
   createD1Storage,
   createHostPubSub,
   DurableObjectRunner,
+  doErrorResponse,
+  ensureDeploymentIdentityBindings,
   HubDurableObject,
   type InitResult,
   init,
-  mintResourceId,
-  mintSaltedId,
+  isPathSafeId,
   mintThreadId,
   type RunnerRuntime,
+  resourceIdFromKey,
+  stampDeploymentIdentityRequest,
   ThreadDurableObject,
   type ThreadScope,
-  tenantOwnsMemoryId,
-  tenantOwnsSaltedId,
+  verifyDurableObjectDeploymentIdentity,
+  verifyDurableObjectDeploymentRequest,
 } from '../src/do-runner/index.js';
 import {
   createObjectiveRouter,
@@ -132,23 +141,32 @@ import {
 } from '../src/goals/index.js';
 import {
   bearerActorAuthenticator,
+  createDoRunTopology,
   createHubTopology,
   createRunRouter,
   createStreamRouter,
   createThreadTopology,
   doSummary,
+  RunRouteError,
   staticTokenVerifier,
   type WorkflowMeta,
 } from '../src/host-kit/index.js';
 import {
+  canPersistScheduledAgentSignal,
+  createScheduleStartSource,
+  createScheduleTargetPolicy,
   createScheduleTick,
   D1SchedulesStorage,
+  parseScheduleAgentDispatchReceipt,
+  type ScheduleAgentDispatchReceipt,
+  scheduleWithCreatorRole,
 } from '../src/schedules/index.js';
 import {
   createWebhookRouter,
   createWebhookSignalProvider,
   D1SubscriptionStoreFactory,
   githubSignalProvider,
+  SIGNAL_PROVIDER_HOST_INSTANCE_NAME,
   type SignalProviderAdapter,
   type SignalProviderAuditEvent,
   SignalProviderHost,
@@ -163,12 +181,14 @@ import {
 
 interface Env {
   DB: D1Database;
+  DEPLOYMENT_TENANT: string;
+  DEPLOYMENT_IDENTITY_SECRET: string;
   RUNNER: DurableObjectNamespace;
-  /** Per-tenant live-stream hub DO (idFromName(tenantId)); see DemoHub. */
+  /** Singleton deployment live-stream hub DO; see DemoHub. */
   HUB: DurableObjectNamespace;
   /** Per-thread agent-loop / signal DO (idFromName(threadId)); see DemoThread (Track C). */
   THREAD: DurableObjectNamespace;
-  /** Per-tenant signal-provider host DO (idFromName(tenantId)); see DemoSignalProviderHost (Track E). */
+  /** Singleton deployment signal-provider host DO; see DemoSignalProviderHost (Track E). */
   SIGNAL_PROVIDER_HOST: DurableObjectNamespace;
   BACKGROUND_TASKS: DurableObjectNamespace;
   SPIKE_LLM_MODEL_ID?: string;
@@ -192,6 +212,20 @@ interface Env {
   STREAM_TICKET_SECRET: string;
 }
 
+function fetchDeploymentObject(
+  stub: ReturnType<DurableObjectNamespace['get']>,
+  env: Env,
+  input: string,
+  init?: RequestInit,
+): Promise<Response> {
+  return stub.fetch(
+    stampDeploymentIdentityRequest(
+      new Request(input, init),
+      env.DEPLOYMENT_IDENTITY_SECRET,
+    ),
+  );
+}
+
 /** The connector id an approval grants; the publish step demands it. */
 const PUBLISH_CONNECTOR = 'demo-publisher';
 
@@ -209,9 +243,9 @@ function containsConnectorId(value: unknown, connectorId: string): boolean {
 
 /**
  * Id for bridge-queued approval records. The run router builds the full actor
- * (operator role, the request's resolved tenant) — matching showcase/deploy.
+ * (operator role, the authenticated request) — matching showcase/deploy.
  */
-const SYSTEM_ACTOR_ID = 'demo-worker';
+const SYSTEM_PRINCIPAL_ID = 'demo-worker';
 
 const SPIKE_AGENT_ID = 'spike-guarded-agent';
 const SPIKE_WRITE_CONNECTOR_ID = 'spike_recordWrite';
@@ -257,7 +291,7 @@ function ensureAgentProbeTables(db: D1Database): Promise<void> {
              resource_id TEXT NOT NULL,
              actor_id TEXT NOT NULL,
              actor_role TEXT NOT NULL,
-             tenant_id TEXT NOT NULL,
+             deployment_tag TEXT NOT NULL,
              entry_path TEXT NOT NULL,
              created_at TEXT NOT NULL
            )`,
@@ -274,7 +308,7 @@ function ensureAgentProbeTables(db: D1Database): Promise<void> {
           `CREATE TABLE IF NOT EXISTS spike_agent_input_processor_calls (
              call_id TEXT PRIMARY KEY,
              run_id TEXT NOT NULL,
-             tenant_id TEXT NOT NULL,
+             deployment_tag TEXT NOT NULL,
              message_count INTEGER NOT NULL,
              created_at TEXT NOT NULL
            )`,
@@ -399,11 +433,15 @@ function createSpikeAgentModule(env: Env, audit: AuditLogger): AgentModule {
       }
       await ensureAgentProbeTables(env.DB);
       const createdAt = new Date().toISOString();
+      // Breakwater's generic audit-context field remains named `tenantId`;
+      // Flowsafe fills it only from the verified deployment tag and stores it
+      // under that meaning here.
+      const deploymentTag = correlation.tenantId;
       await env.DB.batch([
         env.DB.prepare(
           `INSERT INTO spike_agent_connector_calls
              (call_id, tool_call_id, run_id, thread_id, resource_id,
-              actor_id, actor_role, tenant_id, entry_path, created_at)
+              actor_id, actor_role, deployment_tag, entry_path, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).bind(
           crypto.randomUUID(),
@@ -413,7 +451,7 @@ function createSpikeAgentModule(env: Env, audit: AuditLogger): AgentModule {
           resourceId,
           actor.id,
           actor.role,
-          correlation.tenantId,
+          deploymentTag,
           correlation.entryPath,
           createdAt,
         ),
@@ -467,15 +505,18 @@ function createSpikeAgentModule(env: Env, audit: AuditLogger): AgentModule {
               );
             }
             await ensureAgentProbeTables(env.DB);
+            // See the connector probe above: this legacy Breakwater field is
+            // the verified deployment tag, not a request tenant selector.
+            const deploymentTag = correlation.tenantId;
             await env.DB.prepare(
               `INSERT INTO spike_agent_input_processor_calls
-                 (call_id, run_id, tenant_id, message_count, created_at)
+                 (call_id, run_id, deployment_tag, message_count, created_at)
                  VALUES (?, ?, ?, ?, ?)`,
             )
               .bind(
                 crypto.randomUUID(),
                 correlation.runId,
-                correlation.tenantId,
+                deploymentTag,
                 args.messages.length,
                 new Date().toISOString(),
               )
@@ -493,7 +534,7 @@ function createSpikeAgentModule(env: Env, audit: AuditLogger): AgentModule {
   };
 }
 
-// LOCAL-ONLY spike identities (wrangler dev; never deployed). One tenant so
+// LOCAL-ONLY spike identities (wrangler dev; never deployed). One deployment so
 // every probe sees the same queue; ids/roles chosen so spike-verify.mjs can
 // exercise RBAC, the grant loop, and separation of duties:
 //   spike-admin    — the ONLY role in RUN_START_ROLES ∩ decide-capable, so it
@@ -502,13 +543,13 @@ function createSpikeAgentModule(env: Env, audit: AuditLogger): AgentModule {
 //   spike-reviewer — decides the happy-path approval
 //   spike-viewer   — read-only listing
 const SPIKE_ACTORS = new Map<string, ApprovalActor>([
-  ['spike-admin', { id: 'ada', role: 'admin', tenantId: 'spike' }],
-  ['spike-operator', { id: 'opal', role: 'operator', tenantId: 'spike' }],
-  ['spike-reviewer', { id: 'ray', role: 'reviewer', tenantId: 'spike' }],
-  ['spike-viewer', { id: 'vic', role: 'viewer', tenantId: 'spike' }],
-  ['other-operator', { id: 'oliver', role: 'operator', tenantId: 'other' }],
-  ['other-reviewer', { id: 'ruth', role: 'reviewer', tenantId: 'other' }],
-  ['other-viewer', { id: 'vera', role: 'viewer', tenantId: 'other' }],
+  ['spike-admin', { id: 'ada', role: 'admin' }],
+  ['spike-operator', { id: 'opal', role: 'operator' }],
+  ['spike-reviewer', { id: 'ray', role: 'reviewer' }],
+  ['spike-viewer', { id: 'vic', role: 'viewer' }],
+  ['other-operator', { id: 'oliver', role: 'operator' }],
+  ['other-reviewer', { id: 'ruth', role: 'reviewer' }],
+  ['other-viewer', { id: 'vera', role: 'viewer' }],
 ]);
 
 const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
@@ -527,6 +568,10 @@ const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
     sampleInput: { topic: 'launch' },
   },
 ];
+const scheduleTargetPolicy = createScheduleTargetPolicy({
+  workflows: [...WORKFLOWS, { id: 'sched-echo' }],
+  agents: [SPIKE_AGENT_META],
+});
 
 // One factory per isolate, not per request: it owns the memoized schema-init
 // promise, so rebuilding it inside fetch() would re-run the whole DDL pass on
@@ -542,10 +587,8 @@ function approvalStoreFactory(db: D1Database): D1ApprovalStoreFactory {
   return factory;
 }
 
-function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
-  // Bound to THIS DO instance's tenant, recovered from its idFromName
-  // identity (INV-1 -> INV-2).
-  const approvals = approvalStoreFactory(env.DB).forTenant(tenantId);
+function defineWorkflows(env: Env): RunnerRuntime {
+  const approvals = approvalStoreFactory(env.DB).store();
   const { createWorkflow, createStep, runtime } = init(env, {
     // The grant-minting seam: on every start/resume the runtime derives the
     // breakwater grant key from APPROVED records in D1 — decisions become
@@ -716,25 +759,30 @@ function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
   // Track D (M-006) D-S2 probe: a workflow the schedule tick fires through the DO.
   // Its ONE step ECHOES what reached the leg, so the spike can assert the
   // stored-context barrier. The FORGED connector id planted in the schedule ROW's
-  // stored requestContext must NOT appear in the leg's grant list: the topology
-  // start carries only inputData (stored context dropped), and the DO's own
+  // stored requestContext must NOT appear in the leg's grant list: the
+  // schedule-source adapter strips reserved fields, and the DO's own
   // approvalGrantProvider mints `breakwater.connectorGrants` from APPROVED
-  // records (an EMPTY [] for this fresh run) which WINS via #requestContextFor's
-  // last-spread — two independent reasons the forged value can never become a
-  // grant. `reservedLeaked` checks the VALUE (does the grant include the forged
+  // records (an EMPTY [] for this fresh run). `reservedLeaked` checks the VALUE
+  // (does the grant include the forged
   // id), NOT mere key presence (the key is legitimately present as []). The
-  // runtime-derived scope keys ARE present (it ran through RunnerRuntime), and the
-  // benign stored key is absent (stored context dropped on the DO path).
+  // runtime-derived workflow scope is present, no isolation scope is fabricated,
+  // and the benign stored key plus initial workflow state reach the leg through
+  // the verified target.
+  const scheduleStateSchema = z.object({
+    fromSchedule: z.boolean().optional(),
+  });
   const schedEcho = createStep({
     id: 'echo',
+    stateSchema: scheduleStateSchema,
     inputSchema: z.object({}),
     outputSchema: z.object({
       reservedLeaked: z.boolean(),
       workflowScopePresent: z.boolean(),
       isolationScopePresent: z.boolean(),
       customPresent: z.boolean(),
+      initialStatePresent: z.boolean(),
     }),
-    execute: async ({ requestContext }) => {
+    execute: async ({ requestContext, state }) => {
       const grants = requestContext.get(BREAKWATER_CONNECTOR_GRANTS_KEY);
       return {
         // Introspection only: actual authorization above uses createConnector.
@@ -744,17 +792,20 @@ function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
         isolationScopePresent:
           requestContext.get('breakwater.isolationScope') !== undefined,
         customPresent: requestContext.get('sched.note') !== undefined,
+        initialStatePresent: state.fromSchedule === true,
       };
     },
   });
   createWorkflow({
     id: 'sched-echo',
+    stateSchema: scheduleStateSchema,
     inputSchema: z.object({}),
     outputSchema: z.object({
       reservedLeaked: z.boolean(),
       workflowScopePresent: z.boolean(),
       isolationScopePresent: z.boolean(),
       customPresent: z.boolean(),
+      initialStatePresent: z.boolean(),
     }),
   })
     .then(schedEcho)
@@ -765,22 +816,34 @@ function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
 
 export class DemoRunner extends DurableObjectRunner<Env> {
   protected build(env: Env): RunnerRuntime {
-    return defineWorkflows(env, this.tenantId);
+    return defineWorkflows(env);
+  }
+
+  protected runOwnership(env: Env) {
+    return approvalStoreFactory(env.DB).resources();
+  }
+
+  protected scheduleSource(env: Env) {
+    return createScheduleStartSource(
+      new D1SchedulesStorage(env.DB as unknown as never),
+    );
   }
 }
 
 /**
- * The per-tenant live-stream hub DO (DL-009). The wrangler `HUB` binding + the
+ * The deployment live-stream hub DO (DL-009). The wrangler `HUB` binding + the
  * append-only `v2` migration resolve this named export; the base class does all
  * the work (fan-out over hibernatable WebSockets + presence), so the body is
- * empty. Addressed idFromName(tenantId), so id.name IS the tenant and the
- * fan-out is tenant-disjoint by construction. The workerd spike
+ * empty. Addressed through the singleton deployment topology. The workerd spike
  * (scripts/spike-verify.mjs) drives this over a real WebSocket to prove
  * fan-out, hibernation persistence, and ticket fail-closed.
  */
 export class DemoHub extends HubDurableObject<Env> {}
 
-/** One execution-capable background-task manager per tenant DO. */
+const BACKGROUND_TASKS_INSTANCE_NAME = 'deployment-background-tasks';
+const BACKGROUND_TASKS_ALARM_MS = 60_000;
+
+/** One execution-capable background-task manager per deployment. */
 export class DemoBackgroundTasks {
   readonly #state: DurableObjectState;
   readonly #env: Env;
@@ -794,15 +857,14 @@ export class DemoBackgroundTasks {
   #boot(): Promise<BackgroundTaskHost> {
     if (!this.#host) {
       this.#host = (async () => {
-        const tenantId = this.#state.id.name;
-        if (!tenantId)
-          throw new Error('background-task DO requires idFromName(tenantId)');
+        await this.#state.storage.setAlarm(
+          Date.now() + BACKGROUND_TASKS_ALARM_MS,
+        );
         const pubsub = createHostPubSub();
         const storage = createD1Storage({
           binding: this.#env.DB as unknown as never,
           domains: createBackgroundTaskD1Domains({
             binding: this.#env.DB as unknown as never,
-            tenantId,
           }),
         });
         await storage.init();
@@ -810,7 +872,7 @@ export class DemoBackgroundTasks {
         const host = new BackgroundTaskHost({
           mastra,
           pubsub,
-          execution: { tenantId },
+          execution: true,
           executors: {
             bgProbe: {
               execute: async (args) => {
@@ -824,15 +886,53 @@ export class DemoBackgroundTasks {
             },
           },
         });
-        await host.boot();
+        try {
+          await host.boot();
+        } catch (error) {
+          try {
+            await host.shutdown();
+          } catch (shutdownError) {
+            console.error(
+              'spike background-task boot rollback failed',
+              shutdownError,
+            );
+          }
+          throw error;
+        }
         return host;
-      })();
+      })().catch((error: unknown) => {
+        this.#host = undefined;
+        throw error;
+      });
     }
     return this.#host;
   }
 
+  async #verifyIdentity(): Promise<void> {
+    await verifyDurableObjectDeploymentIdentity(this.#state, this.#env);
+    this.#assertInstanceName();
+  }
+
+  #assertInstanceName(): void {
+    if (this.#state.id.name !== BACKGROUND_TASKS_INSTANCE_NAME) {
+      throw new Error(
+        `background-task DO must be addressed as '${BACKGROUND_TASKS_INSTANCE_NAME}'`,
+      );
+    }
+  }
+
   async fetch(request: Request): Promise<Response> {
     try {
+      await verifyDurableObjectDeploymentRequest(
+        request,
+        this.#state,
+        this.#env,
+      );
+      if (this.#state.id.name !== BACKGROUND_TASKS_INSTANCE_NAME) {
+        throw new Error(
+          `background-task DO must be addressed as '${BACKGROUND_TASKS_INSTANCE_NAME}'`,
+        );
+      }
       const host = await this.#boot();
       const url = new URL(request.url);
       if (request.method === 'POST' && url.pathname === '/enqueue') {
@@ -840,13 +940,8 @@ export class DemoBackgroundTasks {
           runId?: string;
           delayMs?: number;
         };
-        const tenantId = this.#state.id.name;
-        if (
-          !tenantId ||
-          !body.runId ||
-          !tenantOwnsMemoryId(tenantId, body.runId)
-        ) {
-          return json({ error: 'tenant-owned parent runId required' }, 404);
+        if (!isPathSafeId(body.runId)) {
+          return json({ error: 'path-safe parent runId required' }, 404);
         }
         const queued = await host.manager.enqueue({
           runId: body.runId,
@@ -869,27 +964,27 @@ export class DemoBackgroundTasks {
       }
       return json({ error: 'not found' }, 404);
     } catch (error) {
-      return json(
-        { error: error instanceof Error ? error.message : String(error) },
-        500,
-      );
+      return doErrorResponse(error);
     }
   }
 
   async alarm(): Promise<void> {
+    this.#assertInstanceName();
+    await this.#state.storage.setAlarm(Date.now() + BACKGROUND_TASKS_ALARM_MS);
+    await this.#verifyIdentity();
     await (await this.#boot()).onAlarm();
   }
 }
 
 /**
- * Track C (M-004): the per-thread signal DO (idFromName(threadId), tenant-minted,
- * so id.name carries the tenant). `build()` wires init() with the ONE host pubsub
+ * Track C (M-004): the per-thread signal DO (idFromName(threadId)). `build()`
+ * wires init() with the ONE host pubsub
  * identity (createHostPubSub) — the affinity carrier: core keys its in-process
  * signal registry by the pubsub instance, so a send only drains into an active
  * loop when both share this isolate's ONE pubsub (DL-002). `route()` composes the
  * production Track C signal routes plus a spike-only C-S2 affinity probe. The
- * base class asserts the request's authenticated tenant against the name's prefix
- * BEFORE route() runs, so a forged cross-tenant request never reaches here (C-S4).
+ * base class asserts deployment identity and a trusted execution principal
+ * BEFORE route() runs.
  */
 export class DemoThread extends ThreadDurableObject<Env> {
   #signalAgent?: Agent;
@@ -904,7 +999,7 @@ export class DemoThread extends ThreadDurableObject<Env> {
       domains: createSignalStorageDomains(env.DB as unknown as never),
     });
     this.#storage = storage;
-    const approvals = approvalStoreFactory(env.DB).forTenant(this.tenantId);
+    const approvals = approvalStoreFactory(env.DB).store();
     const audit = new AuditLogger({
       sink: (event) => {
         console.log(JSON.stringify(event));
@@ -917,16 +1012,25 @@ export class DemoThread extends ThreadDurableObject<Env> {
         if (!this.state?.storage) {
           throw new Error('thread Durable Object storage is unavailable');
         }
-        return this.state.storage;
+        return this.state.storage as unknown as AgentThreadStateStorage;
       },
+      resourceAccess: () => approvalStoreFactory(env.DB).resources(),
+      scheduleSource: () =>
+        createScheduleStartSource(
+          new D1SchedulesStorage(env.DB as unknown as never),
+        ),
       approvalService: () => {
         this.#approvalService ??= new ApprovalService({
           store: approvals,
-          stream: (event) => createHubTopology(this.env.HUB).publish(event),
+          stream: (event) =>
+            createHubTopology(
+              this.env.HUB,
+              this.env.DEPLOYMENT_IDENTITY_SECRET,
+            ).publish(event),
         });
         return this.#approvalService;
       },
-      systemActorId: SYSTEM_ACTOR_ID,
+      systemPrincipalId: SYSTEM_PRINCIPAL_ID,
       audit: (event) => audit.record(event),
     });
     this.#agentHost = agentHost;
@@ -941,6 +1045,17 @@ export class DemoThread extends ThreadDurableObject<Env> {
     );
     this.#threadInit = threadInit;
     return threadInit;
+  }
+
+  protected async onAlarm(
+    _env: Env,
+    threadId: string,
+    initResult: InitResult,
+  ): Promise<void> {
+    if (!this.#agentHost) {
+      throw new Error('thread agent host is unavailable');
+    }
+    await this.#agentHost.recoverOwnership(initResult.runtime, threadId);
   }
 
   #host(): ThreadAgentHost {
@@ -996,38 +1111,95 @@ export class DemoThread extends ThreadDurableObject<Env> {
       }
       return this.#getSignalAgent(scope);
     },
-    resolveResourceId: (scope) => mintResourceId(scope.tenantId, 'demo-thread'),
+    resolveResourceId: (scope) => resourceIdFromKey(scope.threadId),
+    resolveBlockingRun: (scope) => this.#host().blockingRun(scope),
+    serializeDispatch: (_scope, operation) =>
+      this.#host().serializeDispatch(operation),
+    resolveScheduleRunStatus: (scope, input) =>
+      this.#host().scheduleDispatchStatus(scope, input),
+    resolveScheduleTarget: async (_scope, input) => {
+      const target = await createScheduleStartSource(
+        new D1SchedulesStorage(this.env.DB as unknown as never),
+      ).resolveScheduleTarget(input.scheduleId, input.dispatchId, input.runId);
+      return target?.type === 'agent' ? target : undefined;
+    },
+    canPersist: async (scope) => {
+      const owner = await approvalStoreFactory(this.env.DB)
+        .resources()
+        .owner('thread', scope.threadId);
+      return (
+        owner?.kind === scope.principal.kind && owner.id === scope.principal.id
+      );
+    },
+    canPersistSchedule: (scope, input) =>
+      canPersistScheduledAgentSignal(
+        createScheduleStartSource(
+          new D1SchedulesStorage(this.env.DB as unknown as never),
+        ),
+        approvalStoreFactory(this.env.DB).resources(),
+        { ...input, threadId: scope.threadId },
+      ),
     resolveNotificationsStorage: async () => {
       const store = await this.#storage?.getStore('notifications');
       if (!store) throw new Error('notifications storage unavailable');
       return store;
     },
+    resolveScheduleDispatchStore: () => {
+      const store = new D1SchedulesStorage(this.env.DB as unknown as never);
+      return {
+        begin: async (scheduleId, dispatchId) => {
+          const key = `flowsafe:schedule-dispatch-receipt:v1:${dispatchId}`;
+          const local =
+            await this.state?.storage.get<ScheduleAgentDispatchReceipt>(key);
+          if (local) {
+            await store.settleAgentScheduleDispatch(
+              scheduleId,
+              dispatchId,
+              local,
+            );
+            await this.state?.storage.delete(key);
+            return { state: 'settled' as const, receipt: local };
+          }
+          return store.beginAgentScheduleDispatch(scheduleId, dispatchId);
+        },
+        settle: async (scheduleId, dispatchId, receipt) => {
+          const key = `flowsafe:schedule-dispatch-receipt:v1:${dispatchId}`;
+          await this.state?.storage.put(key, receipt);
+          await store.settleAgentScheduleDispatch(
+            scheduleId,
+            dispatchId,
+            receipt,
+          );
+          await this.state?.storage.delete(key);
+        },
+      };
+    },
     startIdleRun: async (input) => {
       const scope = {
         threadId: input.threadId,
-        tenantId: this.tenantId,
-        actor: principalActor(input.principal),
+        deploymentTag: this.env.DEPLOYMENT_TENANT,
         principal: input.principal,
-        requestedBy: input.requestedBy,
         init: this.#initResult(),
       };
       const result = await this.#host().start(scope, {
         agentId: input.agent.id,
         threadId: input.threadId,
         runId: input.runId,
-        resourceId:
-          input.resourceId ?? mintResourceId(scope.tenantId, scope.threadId),
+        resourceId: input.resourceId ?? resourceIdFromKey(scope.threadId),
         messages:
           input.message !== undefined
-            ? typeof input.message === 'string'
-              ? input.message
-              : Array.isArray(input.message)
-                ? [{ role: 'user', content: input.message }]
-                : [{ role: 'user', content: input.message.contents }]
+            ? createMessageSignal(input.message)
             : input.signal !== undefined
-              ? [{ role: 'user', content: input.signal.contents }]
+              ? createSignal(input.signal)
               : 'Perform the required write now.',
         entryPath: input.entryPath,
+        ...(input.scheduleId !== undefined
+          ? { scheduleId: input.scheduleId }
+          : {}),
+        ...(input.dispatchId !== undefined
+          ? { dispatchId: input.dispatchId }
+          : {}),
+        safeContext: input.safeContext,
       });
       return { runId: result.runId };
     },
@@ -1060,7 +1232,7 @@ export class DemoThread extends ThreadDurableObject<Env> {
    */
   async #affinityProbe(scope: ThreadScope): Promise<Response> {
     const agent = this.#getSignalAgent(scope);
-    const resourceId = mintResourceId(scope.tenantId, 'affinity-probe');
+    const resourceId = resourceIdFromKey('affinity-probe');
     const target = { threadId: scope.threadId, resourceId };
     const reserve = agent.sendSignal(
       { type: 'user', contents: 'wake' },
@@ -1075,7 +1247,7 @@ export class DemoThread extends ThreadDurableObject<Env> {
     const decision = await deliver.accepted;
     return json({
       threadId: scope.threadId,
-      tenantId: scope.tenantId,
+      deploymentTag: scope.deploymentTag,
       activeRunId,
       decision,
     });
@@ -1132,16 +1304,18 @@ function spikeProviders(): SignalProviderAdapter[] {
 }
 
 /**
- * The per-tenant provider host DO (idFromName(tenantId), Track E). `build()`
- * binds the subscription store to this instance's tenant, the thread topology
- * (delivery), and the spike's providers. The base class drives the alarm poll +
- * the `/poll` probe route.
+ * The singleton deployment provider host DO (Track E). `build()` binds the
+ * deployment subscription store, the thread topology (delivery), and the
+ * spike's providers. The base class drives the alarm poll + `/poll` probe route.
  */
 export class DemoSignalProviderHost extends SignalProviderHost<Env> {
-  protected build(env: Env, tenantId: string): SignalProviderHostWiring {
+  protected build(env: Env): SignalProviderHostWiring {
     return {
-      store: subscriptionFactory(env.DB).forTenant(tenantId),
-      topology: createThreadTopology(env.THREAD),
+      store: subscriptionFactory(env.DB).store(),
+      topology: createThreadTopology(
+        env.THREAD,
+        env.DEPLOYMENT_IDENTITY_SECRET,
+      ),
       providers: spikeProviders(),
     };
   }
@@ -1159,8 +1333,12 @@ function webhookRouter(env: Env): ReturnType<typeof createWebhookRouter> {
   if (!router) {
     router = createWebhookRouter({
       providers: Object.fromEntries(spikeProviders().map((p) => [p.id, p])),
-      subscriptions: subscriptionFactory(env.DB).system(),
-      topology: createThreadTopology(env.THREAD),
+      subscriptions: subscriptionFactory(env.DB).store(),
+      topology: createThreadTopology(
+        env.THREAD,
+        env.DEPLOYMENT_IDENTITY_SECRET,
+      ),
+      deploymentTag: env.DEPLOYMENT_TENANT,
       // Only GitHub is a real webhook provider here; the poll provider signs nothing.
       secretForProvider: (id) =>
         id === 'github' ? env.GITHUB_WEBHOOK_SECRET : undefined,
@@ -1173,25 +1351,23 @@ function webhookRouter(env: Env): ReturnType<typeof createWebhookRouter> {
   return router;
 }
 
-const SIGP_THREAD_ID = mintThreadId('spike', () => 'sigp'); // 'spike_sigp'
-// Matches DemoThread.resolveResourceId (mintResourceId(tenant,'demo-thread')), so
-// delivery keys the inbox on the thread's owner.
-const SIGP_RESOURCE_ID = mintResourceId('spike', 'demo-thread');
-const SIGP_FOREIGN_THREAD_ID = 'other_victim'; // NOT owned by tenant 'spike'
+const SIGP_THREAD_ID = mintThreadId(() => 'sigp');
+// Matches DemoThread.resolveResourceId, so delivery keys the inbox on the
+// bound thread's resource owner.
+const SIGP_RESOURCE_ID = resourceIdFromKey(SIGP_THREAD_ID);
 
-// LOCAL-ONLY Track E probes (tenant 'spike'), driven by spike-verify.mjs:
+// LOCAL-ONLY Track E probes, driven by spike-verify.mjs:
 //  E-S2 (forged): a bad-signature webhook is rejected BEFORE parse + audited.
 //  E-S1 (delivery): subscribe -> signed webhook -> notification lands in the inbox.
 //  E-S3 (rehydration): after a kill+restart, the host DO's /poll rehydrates
 //    subscriptions from D1 and fires poll delivery (the in-memory-lost proof).
-//  cross-tenant: a valid webhook for a TAMPERED row (foreign thread) delivers to none.
 async function handleSignalProviderProbe(
   request: Request,
   env: Env,
 ): Promise<Response | null> {
   const path = new URL(request.url).pathname;
   if (!path.startsWith('/sigp/')) return null;
-  const store = subscriptionFactory(env.DB).forTenant('spike');
+  const store = subscriptionFactory(env.DB).store();
 
   if (request.method === 'POST' && path === '/sigp/subscribe') {
     await store.subscribe({
@@ -1209,18 +1385,6 @@ async function handleSignalProviderProbe(
     return json({ subscribed: true, threadId: SIGP_THREAD_ID });
   }
 
-  if (request.method === 'POST' && path === '/sigp/subscribe-foreign') {
-    // A tampered row: tenant 'spike' but a thread it does not own — the topology
-    // must 404 any delivery to it (cross-tenant fail-closed).
-    await store.subscribe({
-      providerId: 'github',
-      externalResourceId: 'github:cross/repo',
-      threadId: SIGP_FOREIGN_THREAD_ID,
-      resourceId: SIGP_RESOURCE_ID,
-    });
-    return json({ tampered: true });
-  }
-
   if (request.method === 'GET' && path === '/sigp/audit') {
     return json({ events: sigpAudit });
   }
@@ -1230,9 +1394,16 @@ async function handleSignalProviderProbe(
     // dependency on wrangler's alarm timer). A FRESH post-restart host rehydrates
     // its subscriptions from D1 here.
     const stub = env.SIGNAL_PROVIDER_HOST.get(
-      env.SIGNAL_PROVIDER_HOST.idFromName('spike'),
+      env.SIGNAL_PROVIDER_HOST.idFromName(SIGNAL_PROVIDER_HOST_INSTANCE_NAME),
     );
-    const response = await stub.fetch('http://host/poll', { method: 'POST' });
+    const response = await fetchDeploymentObject(
+      stub,
+      env,
+      'http://host/poll',
+      {
+        method: 'POST',
+      },
+    );
     return json({ status: response.status, result: await response.json() });
   }
 
@@ -1260,45 +1431,45 @@ function runStub(
 async function handleLiveAgentRoute(
   request: Request,
   env: Env,
-  resolve: ReturnType<typeof createTenantResolver>,
+  resolve: ActorResolver,
 ): Promise<Response | null> {
   const url = new URL(request.url);
   if (url.pathname !== '/agent/live/effects') return null;
-  const tenant = await resolve(request);
-  if (!tenant) return json({ error: 'unauthorized' }, 401);
+  const context = await resolve(request);
+  if (!context) return json({ error: 'unauthorized' }, 401);
   if (request.method !== 'GET') {
     return json({ error: 'method not allowed' }, 405);
   }
   await ensureAgentProbeTables(env.DB);
   const requestedRunId = url.searchParams.get('runId');
-  if (requestedRunId && !tenant.ownsRun(requestedRunId)) {
+  if (requestedRunId && !isPathSafeId(requestedRunId)) {
     return json({ error: 'run not found' }, 404);
   }
   const statement = requestedRunId
     ? env.DB.prepare(
         `SELECT c.call_id, c.tool_call_id, c.run_id, c.thread_id,
-                  c.resource_id, c.actor_id, c.actor_role, c.tenant_id,
+                  c.resource_id, c.actor_id, c.actor_role, c.deployment_tag,
                   c.entry_path,
                   CASE WHEN EXISTS (
                     SELECT 1 FROM spike_agent_side_effects s
                     WHERE s.tool_call_id = c.tool_call_id
                   ) THEN 1 ELSE 0 END AS recorded
            FROM spike_agent_connector_calls c
-           WHERE c.tenant_id = ? AND c.run_id = ?
+           WHERE c.deployment_tag = ? AND c.run_id = ?
            ORDER BY c.created_at`,
-      ).bind(tenant.tenantId, requestedRunId)
+      ).bind(context.deploymentTag, requestedRunId)
     : env.DB.prepare(
         `SELECT c.call_id, c.tool_call_id, c.run_id, c.thread_id,
-                  c.resource_id, c.actor_id, c.actor_role, c.tenant_id,
+                  c.resource_id, c.actor_id, c.actor_role, c.deployment_tag,
                   c.entry_path,
                   CASE WHEN EXISTS (
                     SELECT 1 FROM spike_agent_side_effects s
                     WHERE s.tool_call_id = c.tool_call_id
                   ) THEN 1 ELSE 0 END AS recorded
            FROM spike_agent_connector_calls c
-           WHERE c.tenant_id = ?
+           WHERE c.deployment_tag = ?
            ORDER BY c.created_at`,
-      ).bind(tenant.tenantId);
+      ).bind(context.deploymentTag);
   const calls = await statement.all<{
     call_id: string;
     tool_call_id: string;
@@ -1307,7 +1478,7 @@ async function handleLiveAgentRoute(
     resource_id: string;
     actor_id: string;
     actor_role: string;
-    tenant_id: string;
+    deployment_tag: string;
     entry_path: string;
     recorded: number;
   }>();
@@ -1315,15 +1486,15 @@ async function handleLiveAgentRoute(
     ? env.DB.prepare(
         `SELECT message_count
            FROM spike_agent_input_processor_calls
-           WHERE tenant_id = ? AND run_id = ?
+           WHERE deployment_tag = ? AND run_id = ?
            ORDER BY created_at`,
-      ).bind(tenant.tenantId, requestedRunId)
+      ).bind(context.deploymentTag, requestedRunId)
     : env.DB.prepare(
         `SELECT message_count
            FROM spike_agent_input_processor_calls
-           WHERE tenant_id = ?
+           WHERE deployment_tag = ?
            ORDER BY created_at`,
-      ).bind(tenant.tenantId);
+      ).bind(context.deploymentTag);
   const inputProcessorCalls = await inputProcessorStatement.all<{
     message_count: number;
   }>();
@@ -1342,47 +1513,59 @@ async function handleLiveAgentRoute(
   });
 }
 
-function tenantContextForPrincipal(
+function actorContextForPrincipal(
   principal: ExecutionPrincipal,
   env: Env,
-): TenantContext {
-  const actor = principalActor(principal);
-  let service: ApprovalService | undefined;
-  return {
-    actor,
+): ActorContext {
+  const factory = approvalStoreFactory(env.DB);
+  return createPrincipalActorContext({
     principal,
-    tenantId: actor.tenantId,
-    service: () => {
-      service ??= new ApprovalService({
-        store: approvalStoreFactory(env.DB).forTenant(actor.tenantId),
-      });
-      return service;
-    },
-    newRunId: () =>
-      mintSaltedId(
-        actor.tenantId,
-        () => crypto.randomUUID(),
-        'tenantContextForActor.newRunId',
-      ),
-    ownsRun: (runId) => tenantOwnsSaltedId(actor.tenantId, runId),
-    newThreadId: () => mintThreadId(actor.tenantId),
-    newResourceId: (resourceKey) => mintResourceId(actor.tenantId, resourceKey),
-    ownsMemoryId: (id) => tenantOwnsMemoryId(actor.tenantId, id),
-    canSelfDecide: () => false,
-  };
+    storeFactory: factory,
+    deploymentTag: env.DEPLOYMENT_TENANT,
+    buildService: (store) => new ApprovalService({ store }),
+  });
+}
+
+async function actorContextForRegisteredOwner(
+  principal: ExecutionPrincipal,
+  env: Env,
+  sourceKind: ResourceKind,
+  sourceId: string,
+): Promise<ActorContext> {
+  return actorContextForRegisteredResources(principal, env, [
+    { kind: sourceKind, resourceId: sourceId },
+  ]);
+}
+
+async function actorContextForRegisteredResources(
+  principal: ExecutionPrincipal,
+  env: Env,
+  claims: readonly ResourceClaim[],
+): Promise<ActorContext> {
+  const context = actorContextForPrincipal(principal, env);
+  const resources = approvalStoreFactory(env.DB).resources();
+  return withRegisteredResourceOwner(context, resources, claims);
 }
 
 // Worker-level approval service: shares the DO's D1 database; decisions
 // resume the run through its DO stub (grants come from the store via the
 // DO-side provider, never from this request).
 function buildApprovalService(
-  store: TenantBoundApprovalStore,
+  store: ApprovalStore,
   env: Env,
   stream: ApprovalStreamSink | undefined,
 ): ApprovalService {
-  const fallback = async (record: ApprovalRecord, decision: ApprovalDecision) =>
-    doSummary(
-      await runStub(env, record.workflowId, record.runId).fetch(
+  const fallback = async (
+    record: ApprovalRecord,
+    decision: ApprovalDecision,
+  ) => {
+    if (!record.decidedBy) {
+      throw new Error('decided approval is missing its reviewer identity');
+    }
+    return doSummary(
+      await fetchDeploymentObject(
+        runStub(env, record.workflowId, record.runId),
+        env,
         `http://do/runs/${record.workflowId}/${record.runId}/resume`,
         {
           method: 'POST',
@@ -1390,22 +1573,37 @@ function buildApprovalService(
           body: JSON.stringify({
             step: record.stepPath,
             resumeData: defaultResumeData(record, decision),
+            requestedBy: record.decidedBy,
+            requestedByKind: 'human',
           }),
         },
       ),
     );
+  };
   const resumeRun = createAgentApprovalResumer({
     fallback,
     agents: [SPIKE_AGENT_META],
-    topology: createAgentThreadTopology(env.THREAD),
-    tenantForPrincipal: (principal) =>
-      tenantContextForPrincipal(principal, env),
+    topology: createAgentThreadTopology(
+      env.THREAD,
+      env.DEPLOYMENT_IDENTITY_SECRET,
+    ),
+    contextForPrincipal: (principal, record) => {
+      const target = record.resumeTarget;
+      if (target?.kind !== 'agent-thread') {
+        throw new Error('agent approval has no registered thread target');
+      }
+      return actorContextForRegisteredResources(principal, env, [
+        { kind: 'thread', resourceId: target.threadId },
+        { kind: 'resource', resourceId: target.resourceId },
+        { kind: 'run', resourceId: record.runId },
+      ]);
+    },
   });
   return new ApprovalService({
     store,
     defaultSlaSeconds: 15 * 60,
-    // Live fan-out: every SUCCESSFUL mutation forwards to the tenant hub, which
-    // fans it out to that tenant's open dashboard sockets. Fire-and-forget; the
+    // Live fan-out: every SUCCESSFUL mutation forwards to the deployment hub,
+    // which fans it out to open dashboard sockets. Fire-and-forget; the
     // caller keeps the publish alive with ctx.waitUntil (see fetch below).
     stream,
     resumeRun,
@@ -1413,12 +1611,12 @@ function buildApprovalService(
 }
 
 // --- Track B (M-003) background-task probes --------------------------------
-// LOCAL-ONLY worker-level probes (spike tenant 'spike'), driven by
+// LOCAL-ONLY worker-level probes, driven by
 // scripts/spike-verify.mjs:
 //  - B-S3: createConnector rejects a smuggled `_background` arg and audits it.
 //  - B-S2: the persistence-only compatibility path recovers a task through
 //    public init() with the stock D1 domains.
-//  - H2: DemoBackgroundTasks composes the serialized and tenant-scoped domains,
+//  - H2: DemoBackgroundTasks composes the serialized deployment domains,
 //    executes a body, and recovers a killed in-flight task after restart.
 const BG_TASK_ID = 'spike_bs2';
 const BG_RUN_ID = 'spike_bg-run';
@@ -1437,20 +1635,27 @@ async function handleBackgroundTaskProbe(
   const path = url.pathname;
 
   const executionStub = () =>
-    env.BACKGROUND_TASKS.get(env.BACKGROUND_TASKS.idFromName('spike'));
+    env.BACKGROUND_TASKS.get(
+      env.BACKGROUND_TASKS.idFromName(BACKGROUND_TASKS_INSTANCE_NAME),
+    );
 
   if (
     request.method === 'POST' &&
     (path === '/bg/execute' || path === '/bg/execute-recover')
   ) {
-    const response = await executionStub().fetch('http://background/enqueue', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        runId: `spike_${crypto.randomUUID()}`,
-        ...(path.endsWith('execute-recover') ? { delayMs: 5000 } : {}),
-      }),
-    });
+    const response = await fetchDeploymentObject(
+      executionStub(),
+      env,
+      'http://background/enqueue',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          runId: crypto.randomUUID(),
+          ...(path.endsWith('execute-recover') ? { delayMs: 5000 } : {}),
+        }),
+      },
+    );
     return new Response(response.body, response);
   }
 
@@ -1458,7 +1663,9 @@ async function handleBackgroundTaskProbe(
     const taskId = encodeURIComponent(
       decodeURIComponent(path.slice('/bg/execution-task/'.length)),
     );
-    const response = await executionStub().fetch(
+    const response = await fetchDeploymentObject(
+      executionStub(),
+      env,
       `http://background/task/${taskId}`,
     );
     return new Response(response.body, response);
@@ -1541,15 +1748,12 @@ async function handleBackgroundTaskProbe(
 }
 
 // --- Track C (M-004) signal probes -----------------------------------------
-// LOCAL-ONLY worker-level probes (spike tenant 'spike'), driven by
+// LOCAL-ONLY worker-level probes, driven by
 // scripts/spike-verify.mjs:
 //  - C-S2 (affinity): a signal into an ACTIVE loop on the thread DO drains
 //    IN-PROCESS. Driven THROUGH createThreadTopology (the sanctioned reach — it
-//    stamps the tenant header the DO authenticates on), so the send lands in the
-//    isolate hosting the (reserved) loop and resolves to action 'deliver'.
-//  - C-S4 (isolation): a cross-tenant foreign-threadId send fails CLOSED at BOTH
-//    barriers — the topology ownership 404 (before the DO is addressed) and the
-//    DO's own header 403 (a direct forged-header fetch).
+//    stamps the trusted principal header), so the send lands in the isolate
+//    hosting the reserved loop and resolves to action 'deliver'.
 async function handleSignalProbe(
   request: Request,
   env: Env,
@@ -1557,69 +1761,47 @@ async function handleSignalProbe(
   const url = new URL(request.url);
   const path = url.pathname;
 
-  // Local probe context; the topology overwrites both trusted headers from it.
-  const ctxFor = (tenantId: string): TenantContext =>
-    ({
-      tenantId,
-      actor: { id: 'signal-probe', role: 'operator', tenantId },
-      principal: {
-        kind: 'human',
-        id: 'signal-probe',
-        tenantId,
-        role: 'operator',
-      },
-      ownsMemoryId: (id: string) => tenantOwnsMemoryId(tenantId, id),
-    }) as unknown as TenantContext;
+  const context = actorContextForPrincipal(
+    { kind: 'human', id: 'signal-probe', role: 'operator' },
+    env,
+  );
 
-  const topology = createThreadTopology(env.THREAD);
+  const topology = createThreadTopology(
+    env.THREAD,
+    env.DEPLOYMENT_IDENTITY_SECRET,
+  );
 
   if (request.method === 'POST' && path === '/sig/affinity') {
-    const threadId = mintThreadId('spike');
-    const response = await topology.send(
-      ctxFor('spike'),
-      threadId,
-      '/probe/affinity',
-      { method: 'POST', body: '{}' },
-    );
+    const threadId = mintThreadId();
+    const response = await topology.send(context, threadId, '/probe/affinity', {
+      method: 'POST',
+      body: '{}',
+    });
     const probe = (await response.json()) as Record<string, unknown>;
     return json({ status: response.status, ...probe });
   }
 
-  if (request.method === 'POST' && path === '/sig/cross-tenant') {
-    const ownerThreadId = mintThreadId('spike');
-    // Barrier 1: tenant 'other' driving 'spike's threadId through the topology is
-    // 404'd (ownership) BEFORE the DO is addressed — no wake, no oracle.
-    let ownershipStatus = 0;
+  if (request.method === 'POST' && path === '/sig/malformed-thread') {
+    let status = 0;
     try {
-      const r = await topology.send(
-        ctxFor('other'),
-        ownerThreadId,
+      const response = await topology.send(
+        context,
+        'bad/thread',
         '/probe/affinity',
         { method: 'POST', body: '{}' },
       );
-      ownershipStatus = r.status;
+      status = response.status;
     } catch (error) {
-      ownershipStatus = (error as { status?: number }).status ?? -1;
+      status = (error as { status?: number }).status ?? -1;
     }
-    // Barrier 2: a DIRECT forged-header fetch (bypassing the topology) is 403'd by
-    // the DO's own #assertTenantIdentity (name tenant 'spike' != header 'other').
-    const stub = env.THREAD.get(env.THREAD.idFromName(ownerThreadId));
-    const forged = await stub.fetch('http://thread/probe/affinity', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-flowsafe-tenant': 'other',
-      },
-      body: '{}',
-    });
-    return json({ ownershipStatus, headerStatus: forged.status });
+    return json({ status });
   }
 
   return null;
 }
 
 // --- Track F (M-005) goal probes -------------------------------------------
-// LOCAL-ONLY worker-level probes (spike tenant 'spike'), driven by
+// LOCAL-ONLY worker-level probes, driven by
 // scripts/spike-verify.mjs:
 //  - F-S1 (read path): an objective SET via the real createObjectiveRouter lands
 //    in mastra_thread_state; the DURABLE goal-step read path (resolveGoalStore
@@ -1627,8 +1809,8 @@ async function handleSignalProbe(
 //  - F-S2 (eviction): the record is in D1, so it survives a dev-server restart —
 //    spike-verify kills+restarts and reads it back (a DO-evicted goal still sees
 //    it, because it lives in D1, not an in-process registry).
-//  - F-S3 (fail-closed): a cross-tenant write to a foreign threadId is 404 +
-//    audited; an over-cap maxRuns is rejected + audited.
+//  - F-S3 (fail-closed): a malformed thread target is 404 + audited; an over-cap
+//    maxRuns is rejected + audited.
 const GOAL_THREAD_ID = 'spike_fsgoal';
 const GOAL_OBJECTIVE = 'ship the launch checklist';
 
@@ -1652,43 +1834,45 @@ async function handleGoalProbe(
   const path = new URL(request.url).pathname;
   if (!path.startsWith('/goal/')) return null;
 
-  // A partial resolver createObjectiveRouter accepts: the probe controls the
-  // tenant + role (the real host uses createTenantResolver).
-  const ctxFor = (
-    tenantId: string,
-    role: ApprovalActor['role'],
-  ): TenantContext =>
-    ({
-      tenantId,
-      actor: { id: 'goal-probe', role, tenantId },
-      principal: { kind: 'human', id: 'goal-probe', tenantId, role },
-      ownsMemoryId: (id: string) => tenantOwnsMemoryId(tenantId, id),
-    }) as unknown as TenantContext;
+  const ctxFor = (role: ApprovalActor['role']): ActorContext =>
+    actorContextForPrincipal({ kind: 'human', id: 'goal-probe', role }, env);
 
   // The SAME D1 domain a durable host wires (createSignalStorageDomains uses it).
   const store = new D1ThreadStateStorage(env.DB as unknown as never);
 
   // Drive the REAL objective router (full P6-lite gate), capturing the audit.
   const driveSet = async (
-    tenantId: string,
     body: Record<string, unknown>,
     maxRunsCap?: number,
+    threadId = GOAL_THREAD_ID,
   ): Promise<{ status: number; record: unknown; audited: string[] }> => {
     const events: ObjectiveAuditEvent[] = [];
+    const context = ctxFor('operator');
+    if (threadId === GOAL_THREAD_ID) {
+      await context.claimResource('thread', threadId);
+    }
     const router = createObjectiveRouter({
-      resolve: async () => ctxFor(tenantId, 'operator'),
+      resolve: async () => context,
       store,
+      validateThreadTarget: async (_context, target) => {
+        if (target.threadId !== GOAL_THREAD_ID) {
+          throw new RunRouteError(404, 'agent not found');
+        }
+      },
       audit: (event) => {
         events.push(event);
       },
       ...(maxRunsCap !== undefined ? { maxRunsCap } : {}),
     });
     const res = await router(
-      new Request(`http://do/api/threads/${GOAL_THREAD_ID}/goal`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
-      }),
+      new Request(
+        `http://do/api/threads/${encodeURIComponent(threadId)}/goal`,
+        {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        },
+      ),
     );
     const record =
       res && res.status === 200
@@ -1702,9 +1886,7 @@ async function handleGoalProbe(
   };
 
   if (request.method === 'POST' && path === '/goal/set') {
-    return json(
-      await driveSet('spike', { objective: GOAL_OBJECTIVE, maxRuns: 5 }),
-    );
+    return json(await driveSet({ objective: GOAL_OBJECTIVE, maxRuns: 5 }));
   }
 
   // The DURABLE goal-step read path over our COMPOSED storage: resolveGoalStore
@@ -1718,33 +1900,33 @@ async function handleGoalProbe(
     });
   }
 
-  // F-S3: tenant 'other' writing spike's threadId -> 404 + audited (no oracle).
-  if (request.method === 'POST' && path === '/goal/cross-tenant') {
-    return json(await driveSet('other', { objective: 'foreign write' }));
+  // F-S3: malformed memory identity -> 404 + audited.
+  if (request.method === 'POST' && path === '/goal/malformed-target') {
+    return json(
+      await driveSet({ objective: 'invalid target' }, undefined, 'bad/thread'),
+    );
   }
 
   // F-S3: a maxRuns above the host cap -> 400 + audited.
   if (request.method === 'POST' && path === '/goal/over-cap') {
-    return json(
-      await driveSet('spike', { objective: 'too big', maxRuns: 999 }, 10),
-    );
+    return json(await driveSet({ objective: 'too big', maxRuns: 999 }, 10));
   }
 
   return null;
 }
 
 // --- Track D (M-006) schedule probes ---------------------------------------
-// LOCAL-ONLY worker-level probes (spike tenant 'spike'), driven by
+// LOCAL-ONLY worker-level probes, driven by
 // scripts/spike-verify.mjs, over the flowsafe-owned D1 schedules domain:
-//  - D-S1 (exactly-once): two CONCURRENT ticks over one due schedule fire EXACTLY
-//    once (the CAS updateScheduleNextFire), one 'published' trigger row, nextFireAt
-//    advanced once — on real workerd + D1.
-//  - D-S2 (barrier + INV-1): a workflow-target schedule fires through the DO's
-//    RunnerRuntime with a fresh INV-1 runId (`spike_<uuid>`); a reserved key
+//  - D-S1 (single claim): two CONCURRENT ticks over one due schedule allow one
+//    CAS claimant, one 'published' trigger row, and one nextFireAt advance on
+//    real workerd + D1. Dispatch crash recovery has separate semantics.
+//  - D-S2 (barrier + opaque IDs): a workflow-target schedule fires through the
+//    DO's RunnerRuntime with a fresh UUID runId; a reserved key
 //    planted directly in the ROW's stored requestContext (a compromised row) is
-//    ABSENT from the executing leg — the DO derives the leg context solely via
-//    #requestContextFor (the topology start carries only inputData), so the DO's
-//    own scope keys ARE present and the stored context is dropped fail-closed.
+//    ABSENT from the executing leg — the verified source strips reserved keys
+//    before the DO layers benign stored context below its runtime-derived scope;
+//    the same verified target supplies core's initial workflow state.
 //  - D-S3: an agent target reaches the same per-thread runtime-driven loop and
 //    approval bridge as an interactive start.
 async function handleScheduleProbe(
@@ -1754,28 +1936,69 @@ async function handleScheduleProbe(
   const path = new URL(request.url).pathname;
   if (!path.startsWith('/sched/')) return null;
   const store = new D1SchedulesStorage(env.DB as unknown as never);
+  const runTopology = createDoRunTopology(
+    env.RUNNER,
+    env.DEPLOYMENT_IDENTITY_SECRET,
+  );
   const now = Date.now();
 
-  if (request.method === 'POST' && path === '/sched/exactly-once') {
+  if (request.method === 'POST' && path === '/sched/concurrent-claim') {
     const id = `schedule_${crypto.randomUUID()}`;
-    await store.createSchedule({
-      id,
-      target: { type: 'workflow', workflowId: 'sched-echo', inputData: {} },
-      cron: '* * * * *',
-      status: 'active',
-      nextFireAt: now - 1000,
-      createdAt: now,
-      updatedAt: now,
-      metadata: { tenantId: 'spike' },
-    });
-    // A recording start seam — D-S1 proves the CAS, not the run itself.
+    const ownerContext = actorContextForPrincipal(
+      { kind: 'human', id: 'schedule-probe-owner', role: 'operator' },
+      env,
+    );
+    await ownerContext.claimResource('schedule', id);
+    await store.createSchedule(
+      scheduleWithCreatorRole(
+        {
+          id,
+          target: { type: 'workflow', workflowId: 'sched-echo', inputData: {} },
+          cron: '* * * * *',
+          status: 'active',
+          nextFireAt: now - 1000,
+          createdAt: now,
+          updatedAt: now,
+        },
+        'operator',
+      ),
+    );
     let fireCount = 0;
     const tick = createScheduleTick({
       store,
-      start: async (_wf, runId) => {
+      targetPolicy: scheduleTargetPolicy,
+      deploymentTag: env.DEPLOYMENT_TENANT,
+      start: async ({
+        scheduleId,
+        dispatchId,
+        workflowId,
+        runId,
+        inputData,
+      }) => {
+        const context = await actorContextForRegisteredOwner(
+          {
+            kind: 'system',
+            id: SYSTEM_PRINCIPAL_ID,
+            purpose: 'scheduled-workflow-execution',
+          },
+          env,
+          'schedule',
+          scheduleId,
+        );
         fireCount += 1;
-        return { runId };
+        return runTopology.start({
+          workflowId,
+          runId,
+          inputData,
+          principal: context.principal,
+          scheduleId,
+          dispatchId,
+        });
       },
+      status: (ref) =>
+        ref.target === 'workflow'
+          ? runTopology.dispatchStatus(ref.workflowId, ref.runId)
+          : Promise.resolve(undefined),
     });
     const [a, b] = await Promise.all([tick(), tick()]);
     const triggers = await store.listTriggers(id);
@@ -1791,54 +2014,87 @@ async function handleScheduleProbe(
 
   if (request.method === 'POST' && path === '/sched/barrier') {
     const id = `schedule_${crypto.randomUUID()}`;
-    await store.createSchedule({
-      id,
-      target: {
-        type: 'workflow',
-        workflowId: 'sched-echo',
-        inputData: {},
-        // A reserved key planted in the ROW (simulating a compromised row that
-        // bypassed the facade's create-time rejection) + a benign one.
-        requestContext: {
-          [BREAKWATER_CONNECTOR_GRANTS_KEY]: [
-            {
-              scope: 'run',
-              connectorId: 'forged-connector',
-              isolationScope: 'spike',
-              workflowId: 'sched-echo',
-              runId: 'spike_forged',
+    const ownerContext = actorContextForPrincipal(
+      { kind: 'human', id: 'schedule-probe-owner', role: 'operator' },
+      env,
+    );
+    await ownerContext.claimResource('schedule', id);
+    await store.createSchedule(
+      scheduleWithCreatorRole(
+        {
+          id,
+          target: {
+            type: 'workflow',
+            workflowId: 'sched-echo',
+            inputData: {},
+            initialState: { fromSchedule: true },
+            // A reserved key planted in the ROW (simulating a compromised row that
+            // bypassed the facade's create-time rejection) + a benign one.
+            requestContext: {
+              [BREAKWATER_CONNECTOR_GRANTS_KEY]: [
+                {
+                  scope: 'run',
+                  connectorId: 'forged-connector',
+                  isolationScope: 'spike',
+                  workflowId: 'sched-echo',
+                  runId: 'spike_forged',
+                },
+              ],
+              'sched.note': 'benign',
             },
-          ],
-          'sched.note': 'benign',
+          },
+          cron: '* * * * *',
+          status: 'active',
+          nextFireAt: now - 1000,
+          createdAt: now,
+          updatedAt: now,
         },
-      },
-      cron: '* * * * *',
-      status: 'active',
-      nextFireAt: now - 1000,
-      createdAt: now,
-      updatedAt: now,
-      metadata: { tenantId: 'spike' },
-    });
+        'operator',
+      ),
+    );
     let firedRunId: string | undefined;
     let firedStatus: string | undefined;
     let firedLeg: unknown;
     const tick = createScheduleTick({
       store,
+      targetPolicy: scheduleTargetPolicy,
+      deploymentTag: env.DEPLOYMENT_TENANT,
       // Fire through the DO topology (the production path) — the tick mints the
-      // INV-1 runId and the DO runs sched-echo, echoing its leg context keys.
-      start: async (workflowId, runId, inputData) => {
-        firedRunId = runId;
-        const summary = await doSummary(
-          await runStub(env, workflowId, runId).fetch('http://do/runs', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ workflowId, runId, inputData }),
-          }),
+      // opaque runId and the DO runs sched-echo, echoing its leg context keys.
+      start: async ({
+        scheduleId,
+        dispatchId,
+        workflowId,
+        runId,
+        inputData,
+      }) => {
+        const context = await actorContextForRegisteredOwner(
+          {
+            kind: 'system',
+            id: SYSTEM_PRINCIPAL_ID,
+            purpose: 'scheduled-workflow-execution',
+          },
+          env,
+          'schedule',
+          scheduleId,
         );
+        firedRunId = runId;
+        const summary = await runTopology.start({
+          workflowId,
+          runId,
+          inputData,
+          principal: context.principal,
+          scheduleId,
+          dispatchId,
+        });
         firedStatus = summary.status;
         firedLeg = summary.result;
         return summary;
       },
+      status: (ref) =>
+        ref.target === 'workflow'
+          ? runTopology.dispatchStatus(ref.workflowId, ref.runId)
+          : Promise.resolve(undefined),
     });
     const result = await tick();
     return json({
@@ -1854,60 +2110,132 @@ async function handleScheduleProbe(
     // entry path SPIKE_AGENT_META never declared must be refused at the host.
     const requestedEntry = new URL(request.url).searchParams.get('entryPath');
     const id = `schedule_${crypto.randomUUID()}`;
-    const threadId = mintThreadId('spike');
-    const resourceId = mintResourceId('spike', threadId);
+    const threadId = mintThreadId();
+    const resourceId = resourceIdFromKey(threadId);
     // A threaded schedule fires only through an EXISTING binding, so bind the
     // thread with a human start first. That is also what makes the probe
     // meaningful: the thread belongs to a person, and the later unattended fire
     // must still arrive as SYSTEM rather than inheriting that person's role.
-    await createAgentThreadTopology(env.THREAD).start(
-      tenantContextForPrincipal(
-        {
-          kind: 'human',
-          id: 'sched-owner',
-          tenantId: 'spike',
-          role: 'operator',
-        },
-        env,
-      ),
+    const ownerContext = actorContextForPrincipal(
       {
-        agentId: SPIKE_AGENT_ID,
-        prompt: 'Bind this thread.',
-        entryPath: 'http.start',
-        threadId,
-        resourceId,
+        kind: 'human',
+        id: 'sched-owner',
+        role: 'operator',
       },
+      env,
     );
-    await store.createSchedule({
-      id,
-      target: {
-        type: 'agent',
-        agentId: SPIKE_AGENT_ID,
-        prompt: 'Use the required write tool exactly once.',
-        threadId,
-        resourceId,
-      },
-      cron: '* * * * *',
-      status: 'active',
-      nextFireAt: now - 1000,
-      createdAt: now,
-      updatedAt: now,
-      metadata: { tenantId: 'spike' },
+    const topology = createAgentThreadTopology(
+      env.THREAD,
+      env.DEPLOYMENT_IDENTITY_SECRET,
+    );
+    await ownerContext.claimResource('thread', threadId);
+    await ownerContext.claimResource('resource', resourceId);
+    const bindingRun = await topology.start(ownerContext, {
+      agentId: SPIKE_AGENT_ID,
+      prompt: 'Bind this thread.',
+      entryPath: 'http.start',
+      threadId,
+      resourceId,
     });
+    if (!bindingRun.approval) {
+      throw new Error('thread binding run did not suspend for approval');
+    }
+    await buildApprovalService(
+      approvalStoreFactory(env.DB).store(),
+      env,
+      undefined,
+    ).decide(
+      bindingRun.approval.id,
+      { decision: 'approve' },
+      { id: 'schedule-probe-reviewer', role: 'reviewer' },
+    );
+    const bindingStatus = await topology.status(ownerContext, {
+      agentId: SPIKE_AGENT_ID,
+      threadId,
+      runId: bindingRun.runId,
+    });
+    if (bindingStatus?.summary.status !== 'success') {
+      throw new Error('thread binding run did not complete after approval');
+    }
+    await ownerContext.claimResource('schedule', id);
+    await store.createSchedule(
+      scheduleWithCreatorRole(
+        {
+          id,
+          target: {
+            type: 'agent',
+            agentId: SPIKE_AGENT_ID,
+            prompt: 'Use the required write tool exactly once.',
+            threadId,
+            resourceId,
+          },
+          cron: '* * * * *',
+          status: 'active',
+          nextFireAt: now - 1000,
+          createdAt: now,
+          updatedAt: now,
+        },
+        'operator',
+      ),
+    );
     // The schedule tick fires as SYSTEM automation, not as a synthetic human
     // operator — the agent it targets must have declared this entry.
     const principal: ExecutionPrincipal = {
       kind: 'system',
-      id: SYSTEM_ACTOR_ID,
-      tenantId: 'spike',
+      id: SYSTEM_PRINCIPAL_ID,
       purpose: 'scheduled-agent-execution',
     };
-    const tenant = tenantContextForPrincipal(principal, env);
-    const topology = createAgentThreadTopology(env.THREAD);
+    const context = await actorContextForRegisteredOwner(
+      principal,
+      env,
+      'schedule',
+      id,
+    );
+    if (requestedEntry && requestedEntry !== 'schedule.fire') {
+      try {
+        await topology.start(context, {
+          agentId: SPIKE_AGENT_ID,
+          prompt: 'This entry path must be refused.',
+          entryPath: requestedEntry as AgentEntryPath,
+          threadId,
+          resourceId,
+        });
+      } catch (error) {
+        if (error instanceof RunRouteError && error.status === 403) {
+          return json({
+            result: {
+              due: 1,
+              fired: 0,
+              skipped: 0,
+              failed: 1,
+              deferred: 0,
+              reconciled: 0,
+              lost: 0,
+            },
+            scheduleId: id,
+            threadId,
+            resourceId,
+            runId: null,
+            runOwner: null,
+            error: 'forbidden',
+          });
+        }
+        throw error;
+      }
+      throw new Error('undeclared automated entry path was admitted');
+    }
+    const signalTopology = createThreadTopology(
+      env.THREAD,
+      env.DEPLOYMENT_IDENTITY_SECRET,
+    );
     const tick = createScheduleTick({
       store,
-      start: async (_workflowId, runId) => ({ runId }),
+      targetPolicy: scheduleTargetPolicy,
+      deploymentTag: env.DEPLOYMENT_TENANT,
+      start: async ({ runId }) => ({ runId }),
       startAgent: async ({
+        scheduleId,
+        dispatchId,
         target,
         runId,
         topologyThreadId,
@@ -1915,33 +2243,103 @@ async function handleScheduleProbe(
         entryPath,
         requestContext,
         streamRequestContext,
+        providerOptions,
       }) => {
-        const started = await topology.start(tenant, {
+        if (scheduleId !== id) throw new Error('schedule identity mismatch');
+        const started = await topology.start(context, {
           agentId: target.agentId,
           runId,
           prompt: target.prompt,
           entryPath: (requestedEntry ?? entryPath) as typeof entryPath,
+          scheduleId,
+          dispatchId,
           threaded,
           requestContext,
           streamRequestContext,
+          providerOptions,
+          ...(!threaded ? { topologyThreadId } : {}),
           ...(threaded
             ? {
-                threadId: topologyThreadId,
+                threadId: target.threadId,
                 resourceId: target.resourceId,
               }
             : {}),
         });
         return { runId: started.runId };
       },
+      signalAgent: async ({ scheduleId, target, dispatchId, runId }) => {
+        if (scheduleId !== id) throw new Error('schedule identity mismatch');
+        if (!target.threadId || !target.resourceId) {
+          throw new Error('threaded schedule signal requires memory ids');
+        }
+        const response = await signalTopology.send(
+          context,
+          target.threadId,
+          '/signal/schedule',
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              scheduleId,
+              dispatchId,
+              runId,
+            }),
+          },
+        );
+        if (!response.ok) {
+          throw new Error(
+            `agent schedule signal failed with status ${response.status}`,
+          );
+        }
+        const payload = (await response.json()) as { receipt?: unknown };
+        const receipt = parseScheduleAgentDispatchReceipt(payload.receipt);
+        if (!receipt)
+          throw new Error('agent schedule returned no valid receipt');
+        return receipt;
+      },
+      status: async (ref) => {
+        if (ref.target === 'workflow') {
+          return runTopology.dispatchStatus(ref.workflowId, ref.runId);
+        }
+        if (ref.mode === 'signal') {
+          const state = await store.agentScheduleDispatchState(
+            ref.scheduleId,
+            ref.dispatchId,
+          );
+          if (state.state === 'settled') {
+            return {
+              ...(state.receipt.runId !== undefined
+                ? { runId: state.receipt.runId }
+                : {}),
+              dispatchReceipt: state.receipt,
+            };
+          }
+          if (state.state === 'pending') {
+            throw new Error('agent schedule dispatch remains pending');
+          }
+          return undefined;
+        }
+        return topology.dispatchStatus(context, {
+          agentId: ref.agentId,
+          threadId: ref.threadId,
+          runId: ref.runId,
+        });
+      },
     });
     const result = await tick();
     const trigger = (await store.listTriggers(id))[0];
+    const runOwner = trigger?.runId
+      ? await approvalStoreFactory(env.DB)
+          .resources()
+          .owner('run', trigger.runId)
+      : undefined;
     return json({
       result,
       scheduleId: id,
       threadId,
       resourceId,
       runId: trigger?.runId ?? null,
+      runOwner: runOwner ?? null,
       error: trigger?.error ?? null,
     });
   }
@@ -1955,12 +2353,20 @@ const handler: ExportedHandler<Env> = {
     env: Env,
     ctx: ExecutionContext,
   ): Promise<Response> {
+    try {
+      await ensureDeploymentIdentityBindings(env);
+    } catch (error) {
+      return doErrorResponse(error);
+    }
     // Fetch-scope live fan-out sink (mirrors createFlowsafeWorker): each
-    // successful approval mutation forwards to the tenant hub, kept alive by
+    // successful approval mutation forwards to the deployment hub, kept alive by
     // ctx.waitUntil so the publish completes AFTER the mutation's response (a
     // fire-and-forget publish would be cancelled). Contained — a failed fan-out
     // logs and never fails the mutation.
-    const hubTopology = createHubTopology(env.HUB);
+    const hubTopology = createHubTopology(
+      env.HUB,
+      env.DEPLOYMENT_IDENTITY_SECRET,
+    );
     const streamSink: ApprovalStreamSink = (event) =>
       ctx.waitUntil(
         hubTopology.publish(event).catch((error: unknown) => {
@@ -1968,14 +2374,19 @@ const handler: ExportedHandler<Env> = {
         }),
       );
 
-    // AUTHENTICATE FIRST, then construct (INV-2): the resolver binds the
-    // approval store to the verified actor's tenant.
-    const resolve = createTenantResolver({
+    // AUTHENTICATE FIRST, then construct the actor-scoped service over the
+    // deployment store.
+    const resolve = createActorResolver({
       authenticate: bearerActorAuthenticator(staticTokenVerifier(SPIKE_ACTORS)),
       storeFactory: approvalStoreFactory(env.DB),
+      deploymentTag: env.DEPLOYMENT_TENANT,
       buildService: (store) => buildApprovalService(store, env, streamSink),
     });
     const routed = request as unknown as Request;
+    const runTopology = createDoRunTopology(
+      env.RUNNER,
+      env.DEPLOYMENT_IDENTITY_SECRET,
+    );
 
     const agentProbeResponse = await handleLiveAgentRoute(routed, env, resolve);
     if (agentProbeResponse) return agentProbeResponse;
@@ -1985,7 +2396,7 @@ const handler: ExportedHandler<Env> = {
     const bgProbe = await handleBackgroundTaskProbe(routed, env);
     if (bgProbe) return bgProbe;
 
-    // Track C probes (C-S2 affinity, C-S4 cross-tenant fail-closed) — local,
+    // Track C probes (C-S2 affinity, malformed-id fail-closed) — local,
     // unauthenticated, ahead of the routers.
     const sigProbe = await handleSignalProbe(routed, env);
     if (sigProbe) return sigProbe;
@@ -1995,12 +2406,12 @@ const handler: ExportedHandler<Env> = {
     const goalProbe = await handleGoalProbe(routed, env);
     if (goalProbe) return goalProbe;
 
-    // Track D probes (D-S1 exactly-once, D-S2 barrier + INV-1) — local,
+    // Track D probes (D-S1 single claim, D-S2 barrier + opaque IDs) — local,
     // unauthenticated, ahead of the routers.
     const schedProbe = await handleScheduleProbe(routed, env);
     if (schedProbe) return schedProbe;
 
-    // Track E probes (E-S2 forged, E-S1 delivery, E-S3 rehydration, cross-tenant)
+    // Track E probes (E-S2 forged, E-S1 delivery, E-S3 rehydration)
     // — local, unauthenticated, ahead of the routers.
     const sigpProbe = await handleSignalProviderProbe(routed, env);
     if (sigpProbe) return sigpProbe;
@@ -2011,62 +2422,44 @@ const handler: ExportedHandler<Env> = {
     if (webhookResponse) return webhookResponse;
 
     // Stream stage BEFORE approvals (same order as the composer). The Worker is
-    // the SOLE ticket authority; the hub/runner DOs re-bind by their own
-    // idFromName identity. Every route is under /api/stream/, so it composes
+    // the SOLE ticket authority; the hub/runner DOs re-bind to their own
+    // address identity. Every route is under /api/stream/, so it composes
     // ahead of the approval router without overlapping it.
     const streamResponse = await createStreamRouter({
       resolve,
       ticketSecret: env.STREAM_TICKET_SECRET,
       hub: env.HUB,
       runner: env.RUNNER,
+      runStatus: runTopology.status,
+      deploymentIdentitySecret: env.DEPLOYMENT_IDENTITY_SECRET,
     })(routed);
     if (streamResponse) return streamResponse;
 
     const agentResponse = await createAgentRouter({
       agents: [SPIKE_AGENT_META],
       resolve,
-      topology: createAgentThreadTopology(env.THREAD),
+      topology: createAgentThreadTopology(
+        env.THREAD,
+        env.DEPLOYMENT_IDENTITY_SECRET,
+      ),
     })(routed);
     if (agentResponse) return agentResponse;
 
     const approvalResponse = await createApprovalRouter({ resolve })(routed);
     if (approvalResponse) return approvalResponse;
 
-    // The shared run surface: server-minted `${tenantId}_${uuid}` runIds,
-    // the 401 -> coarse-role -> per-workflow gate order, ownership checks,
+    // The shared run surface: server-minted opaque runIds and the start route's
+    // 401 -> coarse-role -> per-workflow gate order,
     // and the suspension->approval bridge — all host-kit, zero spike-local
     // routing. Topology (the only host-specific part): every leg goes
     // through the run's DO stub.
     const runResponse = await createRunRouter({
       workflows: WORKFLOWS,
       resolve,
-      systemActorId: SYSTEM_ACTOR_ID,
-      start: async (workflowId, runId, inputData) =>
-        doSummary(
-          await runStub(env, workflowId, runId).fetch('http://do/runs', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ workflowId, runId, inputData }),
-          }),
-        ),
-      status: async (workflowId, runId) => {
-        const response = await runStub(env, workflowId, runId).fetch(
-          `http://do/runs/${workflowId}/${runId}`,
-        );
-        if (response.status === 404) return undefined;
-        return doSummary(response);
-      },
-      resume: async (workflowId, runId, body) =>
-        doSummary(
-          await runStub(env, workflowId, runId).fetch(
-            `http://do/runs/${workflowId}/${runId}/resume`,
-            {
-              method: 'POST',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify(body ?? {}),
-            },
-          ),
-        ),
+      systemPrincipalId: SYSTEM_PRINCIPAL_ID,
+      start: runTopology.start,
+      status: runTopology.status,
+      resume: runTopology.resume,
     })(routed);
     if (runResponse) return runResponse;
 

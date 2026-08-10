@@ -8,9 +8,8 @@
 // tools and the in-loop goal scorer persist to D1 rather than the composite's
 // default InMemoryThreadStateStorage (which is lost on eviction).
 //
-// TENANCY: `thread_id` holds the tenant-salted threadId, so purgeTenant's range
-// is exact over it (TENANT_RANGE_PURGE_TABLES) and the TTL reaps by `updatedAt`
-// (purgeExpiredThreadState) — the encoding, again, ISO-8601 TEXT.
+// `thread_id` holds the host-minted threadId. The TTL reaps by `updatedAt`
+// (purgeExpiredThreadState), encoded as ISO-8601 TEXT.
 
 import { ThreadStateStorage } from '@mastra/core/storage';
 

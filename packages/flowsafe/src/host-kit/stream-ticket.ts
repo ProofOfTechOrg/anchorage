@@ -9,17 +9,17 @@
 // session verifier (verifier.ts hmacSign/base64UrlEncode) but under a DEDICATED
 // STREAM_TICKET_SECRET (DL-019), so a ticket and a session JWT can never be
 // confused under one signing key. A leaked ticket URL is limited to a brief
-// replay on exactly ONE tenant's own channel.
+// replay on exactly ONE deployment channel.
 //
-// The ticket carries ONLY ADDRESSING — tenant, channel, runId, actor, exp —
+// The ticket carries ONLY ADDRESSING — channel, workflowId/runId, actor, exp —
 // never a grant. Connector capability comes solely from the server-derived
 // requestContext grant the runtime mints per leg (approval-api/grants.ts); no
 // capability ever travels on the WebSocket. The Worker is the SOLE verification
-// authority: it verifies the ticket once and routes by ticket.tenantId/runId to
-// idFromName, so the hub/runner DOs re-bind the connection to one tenant/run by
-// their own identity (INV-1 / id.name===tenantId) and hold no secret.
+// authority: it verifies the ticket once and routes by channel/runId to
+// idFromName, so the hub/runner DOs re-bind the connection to the deployment or
+// run by their own identity and hold no secret.
 //
-// Fail-closed: an expired, forged, cross-tenant, cross-channel, or otherwise
+// Fail-closed: an expired, forged, cross-channel, or otherwise
 // malformed ticket verifies to `undefined`, never to a default identity.
 
 import {
@@ -27,15 +27,10 @@ import {
   type ApprovalActor,
   type ApprovalRole,
 } from '../approval-api/index.js';
-import {
-  PATH_SAFE_ID_PATTERN,
-  RESERVED_TENANT_IDS,
-  TENANT_ID_PATTERN,
-  tenantOwnsSaltedId,
-} from '../do-runner/path-safe-id.js';
+import { isPathSafeId } from '../do-runner/path-safe-id.js';
 import { base64UrlEncode, hmacSign } from './verifier.js';
 
-/** The two live channels: the per-tenant hub or a per-run WebSocket. */
+/** The two live channels: the deployment hub or a per-run WebSocket. */
 export type StreamChannel = 'hub' | 'run';
 
 /**
@@ -45,8 +40,8 @@ export type StreamChannel = 'hub' | 'run';
  * more.
  */
 export interface StreamTicketClaims {
-  tenantId: string;
   channel: StreamChannel;
+  workflowId?: string;
   runId?: string;
   actorId: string;
   role: ApprovalRole;
@@ -57,9 +52,9 @@ export interface StreamTicketClaims {
 export interface MintStreamTicketOptions {
   /** The dedicated stream-ticket signing secret (STREAM_TICKET_SECRET). */
   secret: string;
-  /** The authenticated, previously validated tenant to which the ticket is bound. */
-  tenantId: string;
   channel: StreamChannel;
+  /** REQUIRED for the `'run'` channel; omitted for `'hub'`. */
+  workflowId?: string;
   /** REQUIRED for the `'run'` channel; omitted for `'hub'`. */
   runId?: string;
   /** The authenticated actor — only `id` and `role` are carried. */
@@ -88,16 +83,16 @@ const decoder = new TextDecoder();
 export async function mintStreamTicket(
   options: MintStreamTicketOptions,
 ): Promise<string> {
-  const { secret, tenantId, channel, runId, actor } = options;
-  if (channel === 'run' && runId === undefined) {
+  const { secret, channel, workflowId, runId, actor } = options;
+  if (channel === 'run' && (workflowId === undefined || runId === undefined)) {
     throw new Error(
-      "mintStreamTicket: a 'run' channel ticket requires a runId",
+      "mintStreamTicket: a 'run' channel ticket requires workflowId and runId",
     );
   }
   const nowSeconds = Math.floor((options.now ?? Date.now)() / 1000);
   const claims: StreamTicketClaims = {
-    tenantId,
     channel,
+    ...(workflowId !== undefined ? { workflowId } : {}),
     // Omit runId entirely off the run channel so the "present IFF run" verify
     // check is exact (an undefined field serializes away under JSON.stringify).
     ...(runId !== undefined ? { runId } : {}),
@@ -113,10 +108,10 @@ export async function mintStreamTicket(
 /**
  * Verify a stream ticket, returning its claims or `undefined` (fail closed).
  * The signature is recomputed over the presented payload segment and compared
- * CONSTANT-TIME; then every claim is validated: `exp` unexpired, `tenantId`
- * pattern-valid and not reserved, `channel` known, `runId` present if and only if the run
- * channel (and when present PATH_SAFE and tenant-owned), `actorId` non-empty,
- * and `role` a recognized APPROVAL_ROLE. Any failure returns `undefined`.
+ * CONSTANT-TIME; then every claim is validated: `exp` unexpired, `channel`
+ * known, `runId` present if and only if the run channel (and when present
+ * path-safe), `actorId` non-empty, and `role` a recognized APPROVAL_ROLE. Any
+ * failure returns `undefined`.
  */
 export async function verifyStreamTicket(
   options: VerifyStreamTicketOptions,
@@ -146,25 +141,23 @@ export async function verifyStreamTicket(
   if (typeof claims.exp !== 'number' || nowSeconds >= claims.exp) {
     return undefined;
   }
+  if (claims.channel !== 'hub' && claims.channel !== 'run') return undefined;
+
+  // workflowId/runId are present IFF the run channel and path-safe.
+  const hasWorkflowId = claims.workflowId !== undefined;
+  const hasRunId = claims.runId !== undefined;
   if (
-    typeof claims.tenantId !== 'string' ||
-    !TENANT_ID_PATTERN.test(claims.tenantId) ||
-    RESERVED_TENANT_IDS.includes(claims.tenantId)
+    (claims.channel === 'run') !== hasWorkflowId ||
+    (claims.channel === 'run') !== hasRunId
   ) {
     return undefined;
   }
-  if (claims.channel !== 'hub' && claims.channel !== 'run') return undefined;
-
-  // runId present IFF the run channel; when present it must be PATH_SAFE and
-  // owned by the ticket's tenant (so a run ticket can never address another
-  // tenant's run even if the signature were somehow honoured).
-  const hasRunId = claims.runId !== undefined;
-  if ((claims.channel === 'run') !== hasRunId) return undefined;
   if (claims.channel === 'run') {
     if (
+      typeof claims.workflowId !== 'string' ||
+      !isPathSafeId(claims.workflowId) ||
       typeof claims.runId !== 'string' ||
-      !PATH_SAFE_ID_PATTERN.test(claims.runId) ||
-      !tenantOwnsSaltedId(claims.tenantId, claims.runId)
+      !isPathSafeId(claims.runId)
     ) {
       return undefined;
     }
@@ -181,9 +174,10 @@ export async function verifyStreamTicket(
   }
 
   return {
-    tenantId: claims.tenantId,
     channel: claims.channel,
-    ...(claims.channel === 'run' ? { runId: claims.runId } : {}),
+    ...(claims.channel === 'run'
+      ? { workflowId: claims.workflowId, runId: claims.runId }
+      : {}),
     actorId: claims.actorId,
     role: claims.role,
     exp: claims.exp,

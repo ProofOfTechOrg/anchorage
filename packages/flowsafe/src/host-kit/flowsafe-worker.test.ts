@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Unit proof for the composed Worker skeleton: the fetch pipeline order, the
-// hook seams (preRoutes/wrapResolve/wrapStart/wrapResume/notify/extra
-// duties), and the two-cron dispatch with per-duty failure isolation. The
+// hook seams (preRoutes/beforeStart/beforeResume/notify/extra
+// duties), and failure-isolated sweep, purge, and optional schedule-tick dispatch. The
 // HEAVYWEIGHT behavior proof stays the two host e2e suites
 // (deploy/worker.e2e.test.ts and the showcase worker e2e set), which drive
 // the real hosts through this same composer — this file covers the composer's
@@ -15,7 +15,11 @@ import type {
   ApprovalNotificationEvent,
   ApprovalRecord,
 } from '../approval-api/index.js';
-import type { RunSummary } from '../do-runner/index.js';
+import { decodeExecutionPrincipal } from '../approval-api/index.js';
+import {
+  EXECUTION_PRINCIPAL_HEADER,
+  type RunSummary,
+} from '../do-runner/index.js';
 import type { ResumeRunFn } from './approval-bridge.js';
 import {
   createFlowsafeWorker,
@@ -38,26 +42,43 @@ const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
 const SWEEP = '*/15 * * * *';
 const PURGE = '7 * * * *';
 
-const ACTORS = new Map([
-  ['tok-ada', { id: 'ada', role: 'admin', tenantId: 'acme' } as const],
-]);
+const ACTORS = new Map([['tok-ada', { id: 'ada', role: 'admin' } as const]]);
 
 function successSummary(runId: string): RunSummary {
   return { runId, status: 'success', result: { ok: true } };
 }
 
-/** A DO namespace whose stub echoes a success summary for the posted run. */
-function fakeRunner(calls: string[]): FlowsafeWorkerEnv['RUNNER'] {
+/** A DO namespace whose stub echoes a success summary and commits run ownership. */
+function fakeRunner(
+  calls: string[],
+  database: FlowsafeWorkerEnv['DB'],
+): FlowsafeWorkerEnv['RUNNER'] {
   return {
     idFromName: (name: string) => name,
     get: () => ({
-      fetch: async (url: string, init?: { body?: string }) => {
+      fetch: async (
+        url: string,
+        init?: { body?: string; headers?: Record<string, string> },
+      ) => {
         calls.push(url);
         const body = init?.body
-          ? (JSON.parse(init.body) as { runId?: string })
+          ? (JSON.parse(init.body) as {
+              runId?: string;
+            })
           : {};
         const runId =
           body.runId ?? /\/runs\/[^/]+\/([^/]+)/.exec(url)?.[1] ?? 'acme_x';
+        const principal = decodeExecutionPrincipal(
+          init?.headers?.[EXECUTION_PRINCIPAL_HEADER] ?? '',
+        );
+        if (body.runId && principal) {
+          await approvalStoreFactoryFor(database)
+            .resources()
+            .claim('run', body.runId, {
+              kind: principal.kind,
+              id: principal.id,
+            });
+        }
         return {
           ok: true,
           status: 200,
@@ -78,10 +99,29 @@ interface Harness {
 function makeEnv(): Harness {
   const doCalls: string[] = [];
   const pending: Promise<unknown>[] = [];
+  const sqlite = openSqlite();
+  sqlite
+    .prepare(
+      `CREATE TABLE flowsafe_deployment (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        tenant_tag TEXT NOT NULL,
+        provisioned_at TEXT NOT NULL
+      )`,
+    )
+    .run();
+  sqlite
+    .prepare(
+      `INSERT INTO flowsafe_deployment (id, tenant_tag, provisioned_at)
+       VALUES (1, 'acme', '2026-08-10T00:00:00.000Z')`,
+    )
+    .run();
+  const database = d1DatabaseLike(sqlite) as FlowsafeWorkerEnv['DB'];
   return {
     env: {
-      DB: d1DatabaseLike(openSqlite()) as FlowsafeWorkerEnv['DB'],
-      RUNNER: fakeRunner(doCalls),
+      DB: database,
+      DEPLOYMENT_TENANT: 'acme',
+      DEPLOYMENT_IDENTITY_SECRET: 'test-deployment-identity-secret-0001',
+      RUNNER: fakeRunner(doCalls, database),
     },
     ctx: { waitUntil: (promise) => pending.push(promise) },
     flush: async () => {
@@ -96,7 +136,7 @@ function makeWorker(
 ): ReturnType<typeof createFlowsafeWorker<FlowsafeWorkerEnv>> {
   return createFlowsafeWorker<FlowsafeWorkerEnv>({
     workflows: WORKFLOWS,
-    systemActorId: 'composer-system',
+    systemPrincipalId: 'composer-system',
     buildVerifier: () => staticTokenVerifier(ACTORS),
     crons: { sweep: SWEEP, purge: PURGE },
     ...overrides,
@@ -127,6 +167,90 @@ afterEach(() => {
 });
 
 describe('createFlowsafeWorker fetch pipeline', () => {
+  it.each([
+    ['missing DB', (env: FlowsafeWorkerEnv) => ({ ...env, DB: undefined })],
+    [
+      'missing deployment tag',
+      (env: FlowsafeWorkerEnv) => ({ ...env, DEPLOYMENT_TENANT: undefined }),
+    ],
+    [
+      'malformed deployment tag',
+      (env: FlowsafeWorkerEnv) => ({ ...env, DEPLOYMENT_TENANT: 'ACME' }),
+    ],
+    [
+      'missing deployment credential',
+      (env: FlowsafeWorkerEnv) => ({
+        ...env,
+        DEPLOYMENT_IDENTITY_SECRET: undefined,
+      }),
+    ],
+    [
+      'mismatched deployment sentinel',
+      (env: FlowsafeWorkerEnv) => ({ ...env, DEPLOYMENT_TENANT: 'other' }),
+    ],
+  ])('returns 503 before health or routes for a %s', async (_label, mutate) => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    const logs = capturedLogs();
+
+    const response = await worker.fetch(
+      new Request('http://host/healthz'),
+      mutate(env) as FlowsafeWorkerEnv,
+      ctx,
+    );
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: 'deployment unavailable' });
+    expect(
+      logs.errors().some((line) => line.includes('deployment-identity-error')),
+    ).toBe(true);
+  });
+
+  it.each([
+    ['missing sentinel', `CREATE TABLE unrelated (id TEXT PRIMARY KEY)`],
+    [
+      'malformed sentinel schema',
+      `CREATE TABLE flowsafe_deployment (
+        id INTEGER PRIMARY KEY,
+        tenant_tag TEXT NOT NULL,
+        provisioned_at TEXT NOT NULL
+      );
+      INSERT INTO flowsafe_deployment VALUES
+        (1, 'acme', '2026-08-10T00:00:00.000Z')`,
+    ],
+    [
+      'malformed sentinel row',
+      `CREATE TABLE flowsafe_deployment (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        tenant_tag TEXT NOT NULL,
+        provisioned_at TEXT NOT NULL
+      );
+      INSERT INTO flowsafe_deployment VALUES
+        (1, 'ACME', '2026-08-10T00:00:00.000Z')`,
+    ],
+  ])('returns 503 for a database with a %s', async (_label, sql) => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    const sqlite = openSqlite();
+    sqlite.exec(sql);
+    const logs = capturedLogs();
+
+    const response = await worker.fetch(
+      new Request('http://host/healthz'),
+      {
+        ...env,
+        DB: d1DatabaseLike(sqlite) as FlowsafeWorkerEnv['DB'],
+      },
+      ctx,
+    );
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: 'deployment unavailable' });
+    expect(
+      logs.errors().some((line) => line.includes('deployment-identity-error')),
+    ).toBe(true);
+  });
+
   it('serves /healthz unauthenticated and 404s the tail', async () => {
     // #given — a verifier that MUST NOT be consulted for healthz
     const buildVerifier = vi.fn(() => staticTokenVerifier(ACTORS));
@@ -273,36 +397,15 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     expect(buildResumeRun.mock.calls[0]?.[1]).toBe(env);
   });
 
-  it('applies wrapResolve to the resolver both routers use', async () => {
-    // #given
-    const resolved: string[] = [];
-    const worker = makeWorker({
-      wrapResolve: (resolve) => async (request) => {
-        resolved.push(new URL(request.url).pathname);
-        return resolve(request);
-      },
-    });
-    const { env, ctx } = makeEnv();
-
-    // #when
-    await worker.fetch(authed('http://host/api/approvals'), env, ctx);
-    await worker.fetch(authed('http://host/workflows'), env, ctx);
-
-    // #then — the wrapped resolver saw both surfaces
-    expect(resolved).toEqual(['/api/approvals', '/workflows']);
-  });
-
-  it('wrapStart and wrapResume actually wrap the topology thunks', async () => {
+  it('runs the context-aware start and resume policies before the topology thunks', async () => {
     // #given
     const wrapped: string[] = [];
     const worker = makeWorker({
-      wrapStart: (start) => async (workflowId, runId, inputData) => {
-        wrapped.push(`start:${workflowId}`);
-        return start(workflowId, runId, inputData);
+      beforeStart: async (context, _env, workflowId) => {
+        wrapped.push(`start:${workflowId}:${context.actor.id}`);
       },
-      wrapResume: (resume) => async (workflowId, runId, body) => {
-        wrapped.push(`resume:${workflowId}:${runId}`);
-        return resume(workflowId, runId, body);
+      beforeResume: async (context, _env, workflowId, runId) => {
+        wrapped.push(`resume:${workflowId}:${runId}:${context.actor.id}`);
       },
     });
     const { env, ctx, doCalls } = makeEnv();
@@ -319,8 +422,8 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     // #then
     expect(started.status).toBe(200);
     const summary = (await started.json()) as { runId: string };
-    expect(summary.runId.startsWith('acme_')).toBe(true);
-    expect(wrapped).toEqual(['start:wf']);
+    expect(summary.runId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(wrapped).toEqual(['start:wf:ada']);
     expect(doCalls.length).toBeGreaterThan(0);
 
     // #when — a raw resume of the minted run
@@ -334,7 +437,7 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     );
     // #then
     expect(resumed.status).toBe(200);
-    expect(wrapped).toEqual(['start:wf', `resume:wf:${summary.runId}`]);
+    expect(wrapped).toEqual(['start:wf:ada', `resume:wf:${summary.runId}:ada`]);
   });
 
   it('mounts an opt-in buildObjectiveRouter; absent seam is byte-identical (unmounted)', async () => {
@@ -442,6 +545,21 @@ describe('createFlowsafeWorker fetch pipeline', () => {
 });
 
 describe('createFlowsafeWorker scheduled dispatch', () => {
+  it('refuses scheduled work before registering a duty when bindings are missing', async () => {
+    const worker = makeWorker();
+    const { env } = makeEnv();
+    const waitUntil = vi.fn();
+
+    await expect(
+      worker.scheduled(
+        { cron: SWEEP },
+        { ...env, DB: undefined } as unknown as FlowsafeWorkerEnv,
+        { waitUntil },
+      ),
+    ).rejects.toThrow(/no valid DB binding/);
+    expect(waitUntil).not.toHaveBeenCalled();
+  });
+
   function maintenanceLines(lines: string[]): Record<string, unknown>[] {
     return lines
       .map((line) => {
@@ -520,6 +638,7 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     const { env, ctx, flush } = makeEnv();
     const realDb = env.DB;
     const throwingDb = {
+      batch: realDb.batch?.bind(realDb),
       prepare: (query: string) => {
         if (query.includes('mastra_workflow_snapshot')) {
           throw new Error('snapshot table wedged');
@@ -552,7 +671,7 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     expect(lines[0]?.purged).toBeUndefined();
   });
 
-  // The agent-memory thread TTL (docs/agent-memory-tenancy.md item 7) as the
+  // The agent-memory thread TTL (docs/agent-memory-isolation.md#thread-retention) as the
   // purge cron's third duty. Seeds the two memory tables the real
   // @mastra/cloudflare-d1 schema creates (mastra-schema-guard.test.ts pins the
   // column names); a fresh test DB has neither, which is itself the
@@ -729,6 +848,7 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     const { env, ctx, flush } = makeEnv();
     const realDb = env.DB;
     const throwingDb = {
+      batch: realDb.batch?.bind(realDb),
       prepare: (query: string) => {
         if (query.includes('mastra_threads')) {
           throw new Error('threads table wedged');
@@ -776,6 +896,7 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     await seedIdleThread(env);
     const realDb = env.DB;
     const throwingDb = {
+      batch: realDb.batch?.bind(realDb),
       prepare: (query: string) => {
         if (query.includes('mastra_workflow_snapshot')) {
           throw new Error('snapshot table wedged');
@@ -827,7 +948,7 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     // #given — the polarity that separates this var from RUN_RETENTION_DAYS:
     // there, falling back keeps a duty running that runs regardless; here it
     // would INVENT an irreversible delete at a threshold the operator never
-    // named. Never expiring is recoverable; deleting a tenant's conversations
+    // named. Never expiring is recoverable; deleting an organization's conversations
     // because a var was mistyped is not.
     const logs = capturedLogs();
     const worker = makeWorker();
@@ -889,11 +1010,10 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     // #given — an overdue open approval seeded straight into the store
     const logs = capturedLogs();
     const { env, ctx, flush } = makeEnv();
-    const store = approvalStoreFactoryFor(env.DB).forTenant('acme');
+    const store = approvalStoreFactoryFor(env.DB).store();
     const past = new Date(Date.now() - 60_000).toISOString();
     const record: ApprovalRecord = {
       id: 'apr-overdue',
-      tenantId: 'acme',
       workflowId: 'wf',
       runId: 'acme_r1',
       title: 'overdue request',
@@ -925,6 +1045,27 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
       },
     ]);
     expect(logs.lines().length).toBeGreaterThan(0);
+  });
+});
+
+describe('createFlowsafeWorker queue dispatch', () => {
+  it('refuses a queue batch before export when bindings are missing', async () => {
+    const worker = makeWorker();
+    const { env } = makeEnv();
+    const retryAll = vi.fn();
+    const ackAll = vi.fn();
+
+    await expect(
+      worker.queue(
+        { retryAll, ackAll } as never,
+        {
+          ...env,
+          DEPLOYMENT_IDENTITY_SECRET: undefined,
+        } as unknown as FlowsafeWorkerEnv,
+      ),
+    ).rejects.toThrow(/DEPLOYMENT_IDENTITY_SECRET/);
+    expect(retryAll).not.toHaveBeenCalled();
+    expect(ackAll).not.toHaveBeenCalled();
   });
 });
 

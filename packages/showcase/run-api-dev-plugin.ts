@@ -1,13 +1,12 @@
 // Dev-only Vite plugin: the showcase host, in-process. It builds ONE
-// buildShowcaseRuntime (all five workflows) over an InMemoryApprovalStoreFactory
-// (INV-2: request-scoped tenant-bound stores over one shared backend), wired
-// with the host-kit re-queue bridge so decisions actually resume the run (and
-// multi-gate runs re-queue the next gate). It mounts the same two routers the
+// buildShowcaseRuntime (all six workflows) over an InMemoryApprovalStoreFactory
+// for the shared demo organization, wired with the host-kit re-queue bridge so
+// decisions actually resume the run (and
+// multi-gate runs re-queue the next gate). It mounts the same three routers the
 // deployed worker does — createApprovalRouter at /api/approvals and host-kit's
-// createRunRouter at /workflows + /runs — over the same TenantResolver seam and
+// createRunRouter at /workflows + /runs — over the same ActorResolver seam and
 // the same demo tokens the UI offers. Only the topology differs: runs resume
-// in-process instead of through a DO stub (so the grant provider recovers each
-// leg's tenant from the runId prefix — approvalGrantProviderFromFactory). So
+// in-process instead of through a DO stub. So
 // `pnpm dev` is a real working backend with the real RBAC gates: launch a
 // workflow, approve it in the dashboard, watch it run to success. No seeds — the
 // queue fills as you launch.
@@ -16,19 +15,20 @@
 // browser tsconfig's `src` root.
 
 import { InMemoryStore } from '@mastra/core/storage';
+import { AGENT_AUDIT_CONTEXT_KEY } from '@proofoftech/breakwater';
 import type {
+  ApprovalStore,
   SelfDecisionPolicy,
-  TenantBoundApprovalStore,
 } from '@proofoftech/flowsafe/approval-api';
 import {
   ApprovalService,
-  approvalGrantProviderFromFactory,
+  approvalGrantProvider,
+  createActorResolver,
   createApprovalRouter,
-  createTenantResolver,
   InMemoryApprovalStoreFactory,
+  principalOwner,
   resumeViaRuntime,
 } from '@proofoftech/flowsafe/approval-api';
-import { tenantOfRunId } from '@proofoftech/flowsafe/do-runner';
 import {
   bearerActorAuthenticator,
   createHubTopology,
@@ -43,22 +43,23 @@ import {
   staticTokenVerifier,
 } from '@proofoftech/flowsafe/host-kit';
 import type { Connect, Plugin } from 'vite';
-import { DEMO_TENANT_ID, demoActorTokensJson } from './worker/demo-actors.js';
-import { createDemoResetRouter } from './worker/demo-reset.js';
+import { demoActorTokensJson } from './worker/demo-actors.js';
 import { buildShowcaseRuntime, SHOWCASE_MODULES } from './worker/runtime.js';
 
 const APPROVAL_BASE = '/api/approvals';
 const STREAM_BASE = '/api/stream';
 
-/** Id for system-created approval records (tenant is bound per request). */
-const SYSTEM_ACTOR_ID = 'showcase-dev';
+/** Id for system-created approval records. */
+const SYSTEM_PRINCIPAL_ID = 'showcase-dev';
 
 /**
  * Dev-only stream-ticket signing key. Not a secret (this host is unreachable
- * off localhost and mints only dev tenants); it just has to be present so the
+ * off localhost and mints only dev identities); it just has to be present so the
  * stream ticket route mints. The deployed worker uses a real STREAM_TICKET_SECRET.
  */
 const DEV_STREAM_TICKET_SECRET = 'showcase-dev-stream-secret';
+const DEV_DEPLOYMENT_IDENTITY_SECRET =
+  'showcase-dev-deployment-identity-secret';
 
 /**
  * Dev SoD exemption: admin may decide its own requests (so one operator drives
@@ -109,10 +110,8 @@ function json(payload: unknown, status = 200): Response {
 
 /**
  * A process-global in-memory hub mirroring InMemoryApprovalStore's role: a
- * structural HubNamespaceLike whose per-tenant stubs RECORD every published
- * ApprovalStreamEvent, keyed by the tenant `idFromName` addressed (tenant
- * isolation: each tenant's list is disjoint from every other's, exactly like
- * the deployed hub's `id.name === tenantId` binding). `pnpm dev` hosts NO
+ * structural HubNamespaceLike whose deployment stub records every published
+ * ApprovalStreamEvent. `pnpm dev` hosts no
  * WebSocket upgrade — Vite's connect middleware cannot complete a WS handshake
  * and adding a raw ws server is out of scope — so /subscribe answers 426 and
  * the client degrades to polling (DL-019); there is accordingly no subscriber
@@ -126,7 +125,7 @@ export function createInMemoryHub(): {
 } {
   const published = new Map<string, unknown[]>();
 
-  const stubFor = (tenantId: string): HubStubLike => {
+  const stubFor = (instanceName: string): HubStubLike => {
     // One impl over both fetch overloads: the string/init overload carries the
     // /internal/event publish; the raw-Request overload carries a WS upgrade.
     const fetch = (async (
@@ -143,9 +142,9 @@ export function createInMemoryHub(): {
       if (method === 'POST' && url.pathname === '/internal/event') {
         const raw = typeof input === 'string' ? init?.body : await input.text();
         const event = raw ? (JSON.parse(raw) as unknown) : null;
-        const list = published.get(tenantId) ?? [];
+        const list = published.get(instanceName) ?? [];
         list.push(event);
-        published.set(tenantId, list);
+        published.set(instanceName, list);
         return json({ ok: true });
       }
       return json(
@@ -179,27 +178,34 @@ const DEV_RUNNER_NAMESPACE = {
 
 export function runApiDevPlugin(): Plugin {
   const storeFactory = new InMemoryApprovalStoreFactory();
-  // Held by name so the /demo/reset seam below can purge its workflow rows.
-  const storage = new InMemoryStore();
+  const grants = approvalGrantProvider(storeFactory.store());
   const runtime = buildShowcaseRuntime({
-    initInput: { storage },
-    // In-process host: one runtime serves every tenant, so the provider binds
-    // per LEG from the runId's tenant prefix (the DO topology binds
-    // per-instance instead).
-    grantProvider: approvalGrantProviderFromFactory(storeFactory),
+    initInput: { storage: new InMemoryStore() },
+    grantProvider: async (workflowId, runId, leg) => ({
+      ...(await grants(workflowId, runId, leg)),
+      [AGENT_AUDIT_CONTEXT_KEY]: {
+        agentId: workflowId,
+        tenantId: 'showcase-dev',
+        runId,
+        entryPath: leg.kind === 'start' ? 'workflow.start' : 'workflow.resume',
+      },
+    }),
     // Egress/artifact bindings unset => connectors simulate / write in-memory.
   });
-  // The in-memory live-stream hub + the publish topology each tenant-bound
-  // ApprovalService fires on every mutation. The dev SPA mints a ticket and
+  // The in-memory live-stream hub + publish topology fire on every mutation.
+  // The dev SPA mints a ticket and
   // attempts a WebSocket (which degrades to polling here); the publish seam runs
   // regardless, mirroring the deployed composer's HUB fan-out.
   const hub = createInMemoryHub();
-  const hubTopology = createHubTopology(hub.namespace);
-  // Per-tenant service assembly, invoked lazily by the resolver. The service
+  const hubTopology = createHubTopology(
+    hub.namespace,
+    DEV_DEPLOYMENT_IDENTITY_SECRET,
+  );
+  // Service assembly is invoked lazily by the resolver. The service
   // forward-references itself in the resumeRun closure (invoked only on a
   // later decision) — the same const-with-deferred-ref pattern the worker
   // uses. resumeRunWithRequeue resumes in-process and re-queues the next gate.
-  function buildService(store: TenantBoundApprovalStore): ApprovalService {
+  function buildService(store: ApprovalStore): ApprovalService {
     const service: ApprovalService = new ApprovalService({
       store,
       defaultSlaSeconds: 3600,
@@ -213,17 +219,18 @@ export function runApiDevPlugin(): Plugin {
       resumeRun: resumeRunWithRequeue(
         resumeViaRuntime(runtime),
         () => service,
-        SYSTEM_ACTOR_ID,
+        SYSTEM_PRINCIPAL_ID,
       ),
     });
     return service;
   }
-  const resolve = createTenantResolver({
+  const resolve = createActorResolver({
     authenticate,
     storeFactory,
+    deploymentTag: 'showcase-dev',
     buildService,
     // Same SoD policy the service enforces, threaded through the resolver so
-    // the catalog echo's canSelfDecide (tenant.canSelfDecide) matches
+    // the catalog echo's canSelfDecide matches
     // enforcement (admin => true, others => false).
     allowSelfDecision: DEV_SELF_DECISION,
   });
@@ -237,78 +244,45 @@ export function runApiDevPlugin(): Plugin {
   const runRouter = createRunRouter({
     workflows: SHOWCASE_MODULES.map((entry) => entry.meta),
     resolve,
-    systemActorId: SYSTEM_ACTOR_ID,
-    start: (workflowId, runId, inputData) =>
-      runtime.start(workflowId, { runId, inputData }),
+    systemPrincipalId: SYSTEM_PRINCIPAL_ID,
+    start: async ({ workflowId, runId, inputData, principal }) => {
+      const resources = storeFactory.resources();
+      const resourceOwner = principalOwner(principal);
+      if (!(await resources.claim('run', runId, resourceOwner))) {
+        throw new Error(`run '${runId}' is already owned`);
+      }
+      try {
+        return await runtime.start(workflowId, {
+          runId,
+          inputData,
+          requestedBy: principal.id,
+          requestedByKind: principal.kind,
+        });
+      } catch (error) {
+        const persisted = await runtime.status(workflowId, runId);
+        if (persisted) return persisted;
+        await resources.release('run', runId, resourceOwner);
+        throw error;
+      }
+    },
     status: async (workflowId, runId) =>
       (await runtime.status(workflowId, runId)) ?? undefined,
-    resume: (workflowId, runId, body) => {
+    resume: (workflowId, runId, body, requestedBy, requestedByKind) => {
       const { step, resumeData } = (body ?? {}) as {
         step?: string | string[];
         resumeData?: unknown;
       };
-      return runtime.resume(workflowId, runId, { step, resumeData });
+      return runtime.resume(workflowId, runId, {
+        step,
+        resumeData,
+        requestedBy,
+        requestedByKind,
+      });
     },
     // D4: heal a suspended run whose approval never made it into the queue
     // on the next status() poll (see reconcileApprovalsOnStatus).
-    reconcileApprovals: reconcileApprovalsOnStatus(SYSTEM_ACTOR_ID),
+    reconcileApprovals: reconcileApprovalsOnStatus(SYSTEM_PRINCIPAL_ID),
   });
-  // The same reset router the deployed worker mounts, over in-memory seams:
-  // every dev identity shares the 'demo' tenant (no D1 registry exists here,
-  // so the discriminator is the constant), snapshots purge through Mastra's
-  // workflows domain, approvals through the shared-Map factory. The runtime's
-  // in-memory idempotency + artifact state is not cleared — mirrors the
-  // deployed worker's orphaned-DO-state posture (runIds are never reused).
-  const resetRouter = createDemoResetRouter({
-    resolve,
-    isDemoTenant: async (tenantId) => tenantId === DEMO_TENANT_ID,
-    purgeTenantData: async (tenantId) => {
-      let snapshots = 0;
-      const workflows = await storage.getStore('workflows');
-      if (workflows) {
-        // listWorkflowRuns() paginates only when BOTH perPage and page are
-        // given, so this enumerates every run. Ownership goes through the ONE
-        // INV-1 decode (tenantOfRunId) rather than a hand-rolled prefix test —
-        // the same reason D1's purge uses an exact range predicate.
-        const { runs } = await workflows.listWorkflowRuns();
-        for (const run of runs) {
-          if (tenantOfRunId(run.runId) === tenantId) {
-            await workflows.deleteWorkflowRunById({
-              runId: run.runId,
-              workflowName: run.workflowName,
-            });
-            snapshots += 1;
-          }
-        }
-      }
-      return {
-        snapshots,
-        // No showcase workflow writes agent memory; when one does, sweep the
-        // in-memory store's memory domain here (docs/agent-memory-tenancy.md
-        // item 5) instead of leaving the constants.
-        threads: 0,
-        messages: 0,
-        resources: 0,
-        // No showcase workflow dispatches background tasks (Track B); when one
-        // does, sweep the in-memory backgroundTasks domain here.
-        backgroundTasks: 0,
-        // No showcase workflow sends agent signals (Track C); when one does,
-        // sweep the in-memory notifications + thread-state domains here.
-        notifications: 0,
-        threadState: 0,
-        // No showcase workflow registers schedules (Track D); when one does,
-        // sweep the in-memory schedules + schedule-triggers domains here.
-        schedules: 0,
-        scheduleTriggers: 0,
-        approvals: storeFactory.purgeTenant(tenantId),
-        // No showcase workflow registers signal providers (Track E); when one
-        // does, sweep the in-memory subscription store here.
-        subscriptions: 0,
-        artifacts: 0,
-      };
-    },
-  });
-
   // The stream surface (ticket mint + the hub/run WS-upgrade routes). Only the
   // POST /api/stream/ticket route is reachable here — a browser WebSocket
   // upgrade goes through the httpServer 'upgrade' event, not this connect
@@ -320,6 +294,9 @@ export function runApiDevPlugin(): Plugin {
     ticketSecret: DEV_STREAM_TICKET_SECRET,
     hub: hub.namespace,
     runner: DEV_RUNNER_NAMESPACE,
+    runStatus: async (workflowId, runId) =>
+      (await runtime.status(workflowId, runId)) ?? undefined,
+    deploymentIdentitySecret: DEV_DEPLOYMENT_IDENTITY_SECRET,
   });
 
   return {
@@ -336,8 +313,7 @@ export function runApiDevPlugin(): Plugin {
           url.startsWith('/workflows?') ||
           url === '/runs' ||
           url.startsWith('/runs/') ||
-          url.startsWith('/runs?') ||
-          url === '/demo/reset';
+          url.startsWith('/runs?');
         if (!isShowcaseApi) {
           next();
           return;
@@ -345,12 +321,10 @@ export function runApiDevPlugin(): Plugin {
         void (async () => {
           try {
             const request = await nodeToWebRequest(req);
-            // Reset first (exact-path, cheapest check), then the stream surface
-            // (owns only /api/stream/*, null otherwise), then approvals (null
-            // for non-approval paths without touching the body); the run surface
+            // The stream surface owns only /api/stream/*; approvals return null
+            // for other paths without touching the body, and the run surface
             // handles the rest.
             const response =
-              (await resetRouter(request)) ??
               (await streamRouter(request)) ??
               (await approvalRouter(request)) ??
               (await runRouter(request));

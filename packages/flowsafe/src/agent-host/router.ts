@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import {
+  ActorResolutionError,
+  type ActorResolver,
   RUN_START_ROLES,
-  TenantResolutionError,
-  type TenantResolver,
 } from '../approval-api/index.js';
-import { PATH_SAFE_ID_PATTERN } from '../do-runner/index.js';
-import { RunRouteError } from '../host-kit/index.js';
+import { isPathSafeId } from '../do-runner/index.js';
+import { RunRouteError, requireResourceAccess } from '../host-kit/index.js';
+import { readBoundedBody } from '../http-body.js';
 import { createAgentCatalog } from './catalog.js';
 import type { AgentThreadTopology } from './thread-topology.js';
 import type { AgentMeta } from './types.js';
@@ -16,7 +17,7 @@ const MAX_PROMPT_CODE_UNITS = 10_000;
 
 export interface AgentRouterOptions {
   agents: readonly AgentMeta[];
-  resolve: TenantResolver;
+  resolve: ActorResolver;
   topology: AgentThreadTopology;
 }
 
@@ -97,47 +98,20 @@ function match(url: URL): MatchedRoute | undefined {
 async function readStartBody(
   request: Request,
 ): Promise<{ prompt: string } | Response> {
-  const contentLength = request.headers.get('content-length');
-  if (
-    contentLength !== null &&
-    /^\d+$/.test(contentLength) &&
-    Number(contentLength) > MAX_BODY_BYTES
-  ) {
+  const rawBody = await readBoundedBody(
+    request,
+    MAX_BODY_BYTES,
+    'agent start body exceeds limit',
+  );
+  if (!rawBody.ok && rawBody.reason === 'payload-too-large') {
     return json({ error: 'payload too large' }, 413);
   }
-  const reader = request.body?.getReader();
-  const chunks: Uint8Array[] = [];
-  let bytes = 0;
-  if (reader) {
-    for (;;) {
-      const next = await reader.read();
-      if (next.done) break;
-      bytes += next.value.byteLength;
-      if (bytes > MAX_BODY_BYTES) {
-        await reader.cancel('agent start body exceeds limit');
-        return json({ error: 'payload too large' }, 413);
-      }
-      chunks.push(next.value);
-    }
-  }
-  const rawBytes = new Uint8Array(bytes);
-  let cursor = 0;
-  for (const chunk of chunks) {
-    rawBytes.set(chunk, cursor);
-    cursor += chunk.byteLength;
-  }
-  let raw: string;
-  try {
-    raw = new TextDecoder('utf-8', {
-      fatal: true,
-      ignoreBOM: false,
-    }).decode(rawBytes);
-  } catch {
+  if (!rawBody.ok) {
     return json({ error: 'a JSON object body is required' }, 400);
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(rawBody.text);
   } catch {
     return json({ error: 'a JSON object body is required' }, 400);
   }
@@ -190,7 +164,7 @@ function offsetFor(url: URL): number | Response {
 }
 
 function internalError(error: unknown, route: MatchedRoute): Response {
-  if (error instanceof TenantResolutionError) {
+  if (error instanceof ActorResolutionError) {
     return json({ error: 'forbidden' }, 403);
   }
   if (error instanceof RunRouteError) {
@@ -215,8 +189,8 @@ export function createAgentRouter(options: AgentRouterOptions): AgentRouter {
     if (route.kind === 'not-found') return json({ error: 'not found' }, 404);
 
     try {
-      const tenant = await options.resolve(request);
-      if (!tenant) return json({ error: 'authentication required' }, 401);
+      const context = await options.resolve(request);
+      if (!context) return json({ error: 'authentication required' }, 401);
 
       if (route.kind === 'catalog') {
         if (request.method !== route.allow) {
@@ -225,10 +199,9 @@ export function createAgentRouter(options: AgentRouterOptions): AgentRouter {
         return json({
           agents: catalog.agents,
           actor: {
-            id: tenant.actor.id,
-            role: tenant.actor.role,
-            tenantId: tenant.actor.tenantId,
-            canSelfDecide: tenant.canSelfDecide(tenant.actor.role),
+            id: context.actor.id,
+            role: context.actor.role,
+            canSelfDecide: context.canSelfDecide(context.actor.role),
           },
         });
       }
@@ -242,15 +215,15 @@ export function createAgentRouter(options: AgentRouterOptions): AgentRouter {
         }
         const roles = catalog.allowedRoles(route.agentId);
         if (
-          !RUN_START_ROLES.includes(tenant.actor.role) ||
-          !roles?.includes(tenant.actor.role)
+          !RUN_START_ROLES.includes(context.actor.role) ||
+          !roles?.includes(context.actor.role)
         ) {
           return json({ error: 'forbidden' }, 403);
         }
         const body = await readStartBody(request);
         if (body instanceof Response) return body;
         return json(
-          await options.topology.start(tenant, {
+          await options.topology.start(context, {
             agentId: route.agentId,
             prompt: body.prompt,
             entryPath: 'http.start',
@@ -258,16 +231,20 @@ export function createAgentRouter(options: AgentRouterOptions): AgentRouter {
         );
       }
 
-      if (
-        !PATH_SAFE_ID_PATTERN.test(route.threadId) ||
-        !PATH_SAFE_ID_PATTERN.test(route.runId) ||
-        !tenant.ownsMemoryId(route.threadId) ||
-        !tenant.ownsRun(route.runId)
-      ) {
+      if (!isPathSafeId(route.threadId) || !isPathSafeId(route.runId)) {
         return json({ error: 'run not found' }, 404);
       }
 
-      const resolved = await options.topology.status(tenant, route);
+      await requireResourceAccess(
+        context,
+        'thread',
+        route.threadId,
+        'read',
+        'run',
+      );
+      await requireResourceAccess(context, 'run', route.runId, 'read', 'run');
+
+      const resolved = await options.topology.status(context, route);
       if (!resolved) return json({ error: 'run not found' }, 404);
       if (request.method !== route.allow) {
         return json({ error: 'method not allowed' }, 405, route.allow);
@@ -282,7 +259,7 @@ export function createAgentRouter(options: AgentRouterOptions): AgentRouter {
 
       const offset = offsetFor(url);
       if (offset instanceof Response) return offset;
-      return await options.topology.observe(tenant, { ...route, offset });
+      return await options.topology.observe(context, { ...route, offset });
     } catch (error) {
       return internalError(error, route);
     }

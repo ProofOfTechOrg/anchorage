@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // purgeExpiredApprovals — the approvals analog of do-runner's
 // purgeExpiredWorkflowRuns test coverage: terminal-only, the exclusive TTL
-// boundary, LIMIT-batching, and cross-tenant reach (the system view, NOT a
-// tenant-bound store — mirrors store.test.ts's shared dual-backend contract
-// suite). The free function's own clock/cutoff/default-limit math is
+// boundary, LIMIT-batching, and deployment-wide reach. The free function's own
+// clock/cutoff/default-limit math is
 // exercised separately over a spy store.
 
 import { describe, expect, it } from 'vitest';
@@ -14,12 +13,12 @@ import type {
   ApprovalPreparedStatement,
 } from './d1-store.js';
 import { purgeExpiredApprovals } from './retention.js';
-import type { SystemApprovalStore } from './tenant-brand.js';
+import type { ApprovalStore } from './store.js';
 import {
   type ApprovalStoreFactory,
   D1ApprovalStoreFactory,
   InMemoryApprovalStoreFactory,
-} from './tenant-store.js';
+} from './store-factory.js';
 import type { ApprovalRecord } from './types.js';
 
 let seq = 0;
@@ -29,7 +28,6 @@ function makeRecord(overrides: Partial<ApprovalRecord> = {}): ApprovalRecord {
   const at = new Date(1700000000000 + seq * 1000).toISOString();
   return {
     id: `apr-${seq}`,
-    tenantId: 'acme',
     workflowId: 'wf',
     runId: `run-${seq}`,
     title: `approval ${seq}`,
@@ -81,7 +79,7 @@ function describePurgeContract(
       // #given — an old approved and an old rejected record, plus old
       // pending/claimed/escalated records
       const backend = makeBackend();
-      const store = backend.forTenant('acme');
+      const store = backend.store();
       const approved = await store.create(
         makeRecord({ status: 'approved', decidedAt: OLD, updatedAt: OLD }),
       );
@@ -99,7 +97,7 @@ function describePurgeContract(
       );
 
       // #when
-      const purged = await purgeExpiredApprovals(backend.system(), {
+      const purged = await purgeExpiredApprovals(backend.store(), {
         ttlMs: TTL_MS,
         now: () => CUTOFF_NOW,
       });
@@ -117,14 +115,14 @@ function describePurgeContract(
       // #given — approved, no decidedAt (a direct-store write outside
       // service.decide(), which always sets both together)
       const backend = makeBackend();
-      const store = backend.forTenant('acme');
+      const store = backend.store();
       const created = await store.create(
         makeRecord({ status: 'approved', updatedAt: OLD }),
       );
       expect(created.record.decidedAt).toBeUndefined();
 
       // #when
-      const purged = await purgeExpiredApprovals(backend.system(), {
+      const purged = await purgeExpiredApprovals(backend.store(), {
         ttlMs: TTL_MS,
         now: () => CUTOFF_NOW,
       });
@@ -137,7 +135,7 @@ function describePurgeContract(
     it('treats the TTL boundary exclusively: exactly-at-cutoff records survive', async () => {
       // #given — decidedAt lands EXACTLY on the computed cutoff instant
       const backend = makeBackend();
-      const store = backend.forTenant('acme');
+      const store = backend.store();
       const cutoffInstant = new Date(CUTOFF_NOW - TTL_MS).toISOString();
       const created = await store.create(
         makeRecord({
@@ -148,7 +146,7 @@ function describePurgeContract(
       );
 
       // #when
-      const purged = await purgeExpiredApprovals(backend.system(), {
+      const purged = await purgeExpiredApprovals(backend.store(), {
         ttlMs: TTL_MS,
         now: () => CUTOFF_NOW,
       });
@@ -161,7 +159,7 @@ function describePurgeContract(
     it('LIMIT-batches: one firing purges at most `limit` records; the next resumes at the survivors', async () => {
       // #given — three old decided records, batch size 2
       const backend = makeBackend();
-      const store = backend.forTenant('acme');
+      const store = backend.store();
       const created = await Promise.all(
         [0, 1, 2].map(() =>
           store.create(
@@ -172,8 +170,8 @@ function describePurgeContract(
       const options = { ttlMs: TTL_MS, now: () => CUTOFF_NOW, limit: 2 };
 
       // #when — two firings
-      const first = await purgeExpiredApprovals(backend.system(), options);
-      const second = await purgeExpiredApprovals(backend.system(), options);
+      const first = await purgeExpiredApprovals(backend.store(), options);
+      const second = await purgeExpiredApprovals(backend.store(), options);
 
       // #then — the shrinking eligible set is the cursor across firings
       expect(first).toBe(2);
@@ -189,7 +187,7 @@ function describePurgeContract(
 
       // #when / #then
       await expect(
-        purgeExpiredApprovals(backend.system(), {
+        purgeExpiredApprovals(backend.store(), {
           ttlMs: TTL_MS,
           now: () => CUTOFF_NOW,
           limit: -1,
@@ -203,7 +201,7 @@ function describePurgeContract(
 
       // #when / #then
       await expect(
-        purgeExpiredApprovals(backend.system(), {
+        purgeExpiredApprovals(backend.store(), {
           ttlMs: -1,
           now: () => CUTOFF_NOW,
         }),
@@ -218,13 +216,13 @@ function describePurgeContract(
       // guard would wave it through; Infinity is a real env-var product
       // (APPROVAL_RETENTION_DAYS=1e303 overflows the ms multiply)
       await expect(
-        purgeExpiredApprovals(backend.system(), {
+        purgeExpiredApprovals(backend.store(), {
           ttlMs: Number.NaN,
           now: () => CUTOFF_NOW,
         }),
       ).rejects.toThrow(TypeError);
       await expect(
-        purgeExpiredApprovals(backend.system(), {
+        purgeExpiredApprovals(backend.store(), {
           ttlMs: Number.POSITIVE_INFINITY,
           now: () => CUTOFF_NOW,
         }),
@@ -237,14 +235,14 @@ function describePurgeContract(
 
       // #when / #then
       await expect(
-        purgeExpiredApprovals(backend.system(), {
+        purgeExpiredApprovals(backend.store(), {
           ttlMs: TTL_MS,
           now: () => CUTOFF_NOW,
           limit: Number.NaN,
         }),
       ).rejects.toThrow(TypeError);
       await expect(
-        purgeExpiredApprovals(backend.system(), {
+        purgeExpiredApprovals(backend.store(), {
           ttlMs: TTL_MS,
           now: () => CUTOFF_NOW,
           limit: Number.POSITIVE_INFINITY,
@@ -255,13 +253,13 @@ function describePurgeContract(
     it('still treats limit: 0 (no-op) and ttlMs: 0 (purge decided now) as sane', async () => {
       // #given — an old decided record
       const backend = makeBackend();
-      const store = backend.forTenant('acme');
+      const store = backend.store();
       const created = await store.create(
         makeRecord({ status: 'approved', decidedAt: OLD, updatedAt: OLD }),
       );
 
       // #when / #then — limit: 0 purges nothing...
-      const zeroLimit = await purgeExpiredApprovals(backend.system(), {
+      const zeroLimit = await purgeExpiredApprovals(backend.store(), {
         ttlMs: TTL_MS,
         now: () => CUTOFF_NOW,
         limit: 0,
@@ -270,7 +268,7 @@ function describePurgeContract(
       expect(await store.get(created.record.id)).not.toBeNull();
 
       // ...and ttlMs: 0 purges everything decided up to "now"
-      const zeroTtl = await purgeExpiredApprovals(backend.system(), {
+      const zeroTtl = await purgeExpiredApprovals(backend.store(), {
         ttlMs: 0,
         now: () => CUTOFF_NOW,
       });
@@ -278,11 +276,11 @@ function describePurgeContract(
       expect(await store.get(created.record.id)).toBeNull();
     });
 
-    it('reaches ACROSS TENANTS — the system view is not tenant-scoped', async () => {
-      // #given — an old approved record under acme AND under bravo
+    it('purges every eligible record in the deployment-wide store', async () => {
+      // #given — two old approved records reached through two store aliases
       const backend = makeBackend();
-      const storeA = backend.forTenant('acme');
-      const storeB = backend.forTenant('bravo');
+      const storeA = backend.store();
+      const storeB = backend.store();
       const a = await storeA.create(
         makeRecord({
           status: 'approved',
@@ -301,12 +299,12 @@ function describePurgeContract(
       );
 
       // #when — one call
-      const purged = await purgeExpiredApprovals(backend.system(), {
+      const purged = await purgeExpiredApprovals(backend.store(), {
         ttlMs: TTL_MS,
         now: () => CUTOFF_NOW,
       });
 
-      // #then — both tenants' eligible records are gone
+      // #then — both deployment records are gone
       expect(purged).toBe(2);
       expect(await storeA.get(a.record.id)).toBeNull();
       expect(await storeB.get(b.record.id)).toBeNull();
@@ -315,24 +313,35 @@ function describePurgeContract(
 }
 
 describePurgeContract(
-  'InMemoryApprovalStoreFactory.system().purgeExpired',
+  'InMemoryApprovalStoreFactory.store().purgeExpired',
   () => new InMemoryApprovalStoreFactory(),
 );
 
 describePurgeContract(
-  'D1ApprovalStore system().purgeExpired (real SQLite via node:sqlite)',
+  'D1ApprovalStore.store().purgeExpired (real SQLite via node:sqlite)',
   () => new D1ApprovalStoreFactory(d1Like(openSqlite())),
 );
 
 describe('purgeExpiredApprovals (free function)', () => {
-  function fakeSystemStore(): SystemApprovalStore & {
+  function fakeSystemStore(): ApprovalStore & {
     calls: Array<{ cutoffIso: string; limit: number }>;
   } {
     const calls: Array<{ cutoffIso: string; limit: number }> = [];
     return {
       calls,
+      create: async (record) => ({ record, created: true }),
+      get: async () => null,
       list: async () => [],
       transition: async () => null,
+      metrics: async () => ({
+        openCount: 0,
+        slaBreachedCount: 0,
+        escalationCount: 0,
+        decidedCount: 0,
+        approvedCount: 0,
+        rejectedCount: 0,
+        avgResolutionSeconds: null,
+      }),
       purgeExpired: async (cutoffIso, limit) => {
         calls.push({ cutoffIso, limit });
         return 3;

@@ -2,7 +2,7 @@ import type {
   ApprovalRecord,
   DecideResult,
 } from '@flowsafe/approval-api/types';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import {
   actorSwitchedEvent,
   decideEvents,
@@ -10,8 +10,6 @@ import {
   deriveRunEvents,
   interpretRunResult,
   type NarrationRunRef,
-  resetErrorEvent,
-  resetEvent,
   shortId,
   startErrorEvent,
   startEvent,
@@ -20,7 +18,7 @@ import { RunApiError, type RunSummary } from '@/run-client';
 
 const RUN: NarrationRunRef = {
   workflowId: 'product-launch',
-  runId: 'dmabc_11112222-3333-4444-5555-666677778888',
+  runId: '11112222-3333-4444-5555-666677778888',
   title: 'Product Launch',
 };
 
@@ -46,7 +44,6 @@ function suspendedAt(
 function record(overrides: Partial<ApprovalRecord> = {}): ApprovalRecord {
   return {
     id: 'appr-1',
-    tenantId: 'dmabc',
     workflowId: RUN.workflowId,
     runId: RUN.runId,
     stepPath: ['approveLaunch'],
@@ -62,7 +59,7 @@ function record(overrides: Partial<ApprovalRecord> = {}): ApprovalRecord {
 }
 
 describe('shortId', () => {
-  it('takes the first 8 chars of the uuid segment of a tenant-prefixed id', () => {
+  it('takes the first 8 chars of an opaque id', () => {
     expect(shortId(RUN.runId)).toBe('11112222');
   });
   it('falls back to the first 8 chars of a plain id', () => {
@@ -216,8 +213,8 @@ describe('deriveRunEvents', () => {
   });
 
   it('suppresses the short-circuit line when an approval proves a gate ran', () => {
-    // running→success with the resume ledger already dropped at terminal —
-    // only the hint (an approval exists for this run) knows a gate suspended.
+    // running→success with no prior suspension in the terminal summary — only
+    // the approval-history hint proves that a gate suspended.
     const events = deriveRunEvents(
       summary(),
       summary({ status: 'success', result: { outcome: 'simulated' } }),
@@ -405,11 +402,11 @@ describe('startErrorEvent', () => {
   it('maps 429 to a sticky budget toast quoting the server message verbatim', () => {
     const event = startErrorEvent(
       'gtm-outbound',
-      new RunApiError(429, 'demo run budget exhausted for this sandbox'),
+      new RunApiError(429, 'demo run budget exhausted for this session'),
     );
     expect(event.key).toBe('429');
     expect(event.toastSticky).toBe(true);
-    expect(event.detail).toBe('demo run budget exhausted for this sandbox');
+    expect(event.detail).toBe('demo run budget exhausted for this session');
   });
 
   it('maps 403 to a role-gate event keyed by workflow and role', () => {
@@ -430,68 +427,6 @@ describe('startErrorEvent', () => {
     const generic = startErrorEvent('x', new Error('network down'));
     expect(generic.kind).toBe('run.start-failed');
     expect(generic.detail).toBe('network down');
-  });
-});
-
-describe('resetEvent', () => {
-  it('narrates the verified purge counts with singular/plural wording and honest budget copy', () => {
-    // #given / #when
-    const event = resetEvent({ snapshots: 1, approvals: 2, artifacts: 0 });
-
-    // #then — counts verbatim, toasted, and the budget claim stays truthful
-    expect(event.title).toBe(
-      'Sandbox reset: 1 run snapshot and 2 approvals purged',
-    );
-    expect(event.zone).toBe('d1');
-    expect(event.tone).toBe('success');
-    expect(event.observed).toBe(true);
-    expect(event.toast).toBe(true);
-    expect(event.detail).toContain('NOT refilled');
-  });
-
-  it('mints a fresh key per reset so a second wipe never dedups into the first', () => {
-    // #given
-    vi.useFakeTimers();
-    try {
-      vi.setSystemTime(1_752_000_000_000);
-      const first = resetEvent({ snapshots: 0, approvals: 0, artifacts: 0 });
-      vi.setSystemTime(1_752_000_060_000);
-
-      // #when
-      const second = resetEvent({ snapshots: 0, approvals: 0, artifacts: 0 });
-
-      // #then
-      expect(second.key).not.toBe(first.key);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-});
-
-describe('resetErrorEvent', () => {
-  it('maps 403 to the RBAC lesson naming the admin requirement', () => {
-    // #given / #when
-    const event = resetErrorEvent(
-      new RunApiError(403, "forbidden: requires admin (you are 'viewer')"),
-      'viewer',
-    );
-
-    // #then
-    expect(event.key).toBe('reset-denied:viewer');
-    expect(event.kind).toBe('demo.reset-denied');
-    expect(event.tone).toBe('danger');
-    expect(event.detail).toContain('admin');
-    expect(event.detail).toContain("you are 'viewer'");
-  });
-
-  it('maps anything else to a sticky generic failure carrying the message', () => {
-    // #given / #when
-    const event = resetErrorEvent(new Error('D1 unavailable'));
-
-    // #then
-    expect(event.kind).toBe('demo.reset-failed');
-    expect(event.toastSticky).toBe(true);
-    expect(event.detail).toBe('D1 unavailable');
   });
 });
 

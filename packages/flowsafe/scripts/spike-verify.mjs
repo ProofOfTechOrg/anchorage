@@ -5,7 +5,7 @@
 // connector, a real workerd restart, approval by a different reviewer,
 // restoration of the original requester principal, and exactly-once connector
 // execution. Its negative matrix covers forged headers/context, disallowed
-// roles, wrong tenants/agents/bindings, absent raw resume, stale decision replay,
+// roles, wrong agents/bindings, absent raw resume, stale decision replay,
 // and restart-evicted stream replay with authoritative status fallback.
 // The remaining scenarios retain the lower-level workflow, stream, background
 // task, signal, goal, schedule, and webhook compatibility proofs.
@@ -70,9 +70,11 @@ const AUTH = {
 // exactly this key. That lets the ticket probes below (a) prove a VALID forge is
 // ACCEPTED (the positive control that makes the refusals meaningful — a secret
 // mismatch would refuse everything and false-pass), and (b) craft EXPIRED and
-// CROSS-TENANT tickets the worker must refuse at the CLAIM layer, not the
+// malformed tickets the worker must refuse at the CLAIM layer, not the
 // signature. A LOCAL-ONLY spike fixture; never a real secret.
 const STREAM_TICKET_SECRET = 'spike-local-stream-secret-do-not-deploy';
+const DEPLOYMENT_TENANT = 'spike';
+const DEPLOYMENT_IDENTITY_SECRET = 'spike-local-deployment-identity-secret';
 const nowSec = () => Math.floor(Date.now() / 1000);
 
 // Track E (M-007): the github webhook signing secret. MUST equal
@@ -81,6 +83,8 @@ const nowSec = () => Math.floor(Date.now() / 1000);
 // webhook be ACCEPTED (the positive control) and a forged one REJECTED at the
 // signature. A LOCAL-ONLY spike fixture; never a real secret.
 const GITHUB_WEBHOOK_SECRET = 'spike-local-github-secret-do-not-deploy';
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 let currentStep = 'startup';
 let currentServer;
@@ -124,6 +128,10 @@ function startServer(generation, stateDir, logPath) {
       '0',
       '--persist-to',
       stateDir,
+      '--var',
+      `DEPLOYMENT_TENANT:${DEPLOYMENT_TENANT}`,
+      '--var',
+      `DEPLOYMENT_IDENTITY_SECRET:${DEPLOYMENT_IDENTITY_SECRET}`,
       // Sign stream tickets with the SAME key spike-verify forges with, so the
       // ticket fail-closed probes exercise CLAIM rejection, not signature drift.
       '--var',
@@ -154,6 +162,51 @@ function startServer(generation, stateDir, logPath) {
   });
   servers.push(server);
   return server;
+}
+
+function executeLocalD1(stateDir, command) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      WRANGLER,
+      [
+        'd1',
+        'execute',
+        'flowsafe-demo',
+        '--local',
+        '--yes',
+        '--config',
+        CONFIG,
+        '--persist-to',
+        stateDir,
+        '--command',
+        command,
+      ],
+      {
+        cwd: FLOWSAFE,
+        env: { ...process.env, WRANGLER_SEND_METRICS: 'false', NO_COLOR: '1' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+    let output = '';
+    child.stdout.on('data', (chunk) => {
+      output += chunk.toString();
+    });
+    child.stderr.on('data', (chunk) => {
+      output += chunk.toString();
+    });
+    child.once('error', reject);
+    child.once('exit', (code, signal) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(
+        new Error(
+          `wrangler d1 execute failed (${signal ?? `exit ${code}`}): ${output.slice(-2000)}`,
+        ),
+      );
+    });
+  });
 }
 
 const serverLifecycle = createSpikeServerLifecycle({ port: PORT });
@@ -264,7 +317,7 @@ async function postWebhook(providerId, payload, { forge } = {}) {
 // mintStreamTicket: base64url(JSON(claims)) + '.' + HMAC-SHA256 over that
 // payload (base64url). crypto.createHmac(...).digest('base64url') is byte-equal
 // to the worker's WebCrypto hmacSign, so a VALID forge is ACCEPTED (positive
-// control) and EXPIRED / CROSS-TENANT forges exercise the worker's claim
+// control) and EXPIRED / ADDRESS-MISMATCH forges exercise the worker's claim
 // validation, not a signature mismatch.
 function forgeTicket(claims) {
   const payload = Buffer.from(JSON.stringify(claims), 'utf8').toString(
@@ -473,6 +526,13 @@ async function main() {
   tmpDir = mkdtempSync(join(tmpdir(), 'spike-verify-'));
   const stateDir = join(tmpDir, 'state');
 
+  await step('provision deployment identity sentinel', () =>
+    executeLocalD1(
+      stateDir,
+      "CREATE TABLE IF NOT EXISTS flowsafe_deployment (id INTEGER PRIMARY KEY CHECK (id = 1), tenant_tag TEXT NOT NULL, provisioned_at TEXT NOT NULL); INSERT OR IGNORE INTO flowsafe_deployment (id, tenant_tag, provisioned_at) VALUES (1, 'spike', datetime('now'));",
+    ),
+  );
+
   await step('gen-1: server ready', () =>
     launchServer('gen-1', stateDir, join(tmpDir, 'gen1.log')),
   );
@@ -498,7 +558,7 @@ async function main() {
       assert(
         catalog.body.actor?.id === 'vic' &&
           catalog.body.actor?.role === 'viewer' &&
-          catalog.body.actor?.tenantId === 'spike',
+          catalog.body.actor?.tenantId === undefined,
         'catalog echoes the authenticated actor',
         catalog.body.actor,
       );
@@ -615,13 +675,10 @@ async function main() {
         envelope,
       );
       assert(
-        typeof envelope.threadId === 'string' &&
-          envelope.threadId.startsWith('spike_') &&
-          typeof envelope.resourceId === 'string' &&
-          envelope.resourceId.startsWith('spike_') &&
-          typeof envelope.runId === 'string' &&
-          envelope.runId.startsWith('spike_'),
-        'thread/resource/run IDs are server-minted and tenant-owned',
+        UUID_PATTERN.test(envelope.threadId) &&
+          envelope.resourceId === envelope.threadId &&
+          UUID_PATTERN.test(envelope.runId),
+        'thread and run IDs are server-minted; the resource ID is a trusted, validated key',
         envelope,
       );
       assert(
@@ -643,7 +700,7 @@ async function main() {
           envelope.approval.resumeTarget.resourceId === envelope.resourceId &&
           envelope.approval.resumeTarget.principal?.id === 'opal' &&
           envelope.approval.resumeTarget.principal?.role === 'operator' &&
-          envelope.approval.resumeTarget.principal?.tenantId === 'spike',
+          envelope.approval.resumeTarget.principal?.tenantId === undefined,
         'approval target durably carries the original authorized principal and binding',
         envelope.approval,
       );
@@ -697,8 +754,8 @@ async function main() {
       assert(body.status === 'suspended', 'run suspended', body.status);
       assert(typeof body.runId === 'string', 'runId is a string', body.runId);
       assert(
-        body.runId.startsWith('spike_'),
-        'runId carries the tenant prefix (INV-1: server-minted `spike_<uuid>`)',
+        UUID_PATTERN.test(body.runId),
+        'runId is a server-minted opaque UUID',
         body.runId,
       );
       assert(
@@ -787,7 +844,7 @@ async function main() {
           record?.resumeTarget?.agentId === GUARDED_AGENT_ID &&
           record?.resumeTarget?.principal?.id === 'opal' &&
           record?.resumeTarget?.principal?.role === 'operator' &&
-          record?.resumeTarget?.principal?.tenantId === 'spike',
+          record?.resumeTarget?.principal?.tenantId === undefined,
         'D1 approval record survived with its agent binding and principal',
         record,
       );
@@ -805,13 +862,13 @@ async function main() {
         effects.body,
       );
 
-      const foreign = await http('GET', guardedStatusPath(guardedRun), {
+      const peer = await http('GET', guardedStatusPath(guardedRun), {
         headers: AUTH.otherViewer,
       });
       assert(
-        foreign.status === 404,
-        'a foreign tenant receives no run-existence oracle',
-        foreign,
+        peer.status === 200,
+        'another authenticated viewer in the deployment can read the shared run',
+        peer,
       );
       const wrongAgent = await http(
         'GET',
@@ -884,9 +941,9 @@ async function main() {
           call?.resource_id === guardedRun.resourceId &&
           call?.actor_id === 'opal' &&
           call?.actor_role === 'operator' &&
-          call?.tenant_id === 'spike' &&
+          call?.deployment_tag === 'spike' &&
           call?.entry_path === 'approval.resume',
-        'the connector saw the original requester principal, not reviewer ray',
+        'the connector saw the original requester and infrastructure deployment tag',
         call,
       );
 
@@ -1046,7 +1103,7 @@ async function main() {
       // requester (the run router attributes requestedBy from the
       // authenticated actor). ada then trying to decide their own run must
       // hit the separation-of-duties denial — the bridge must NOT attribute
-      // the request to the system actor. admin is the only role that can
+      // the request to the system principal. admin is the only role that can
       // both start (RUN_START_ROLES) and decide, so it is the only identity
       // this probe CAN use under the shared router's coarse gate.
       const started = await http('POST', '/runs', {
@@ -1185,12 +1242,12 @@ async function main() {
   // --- Part B live streaming (M-009): real WebSockets over workerd ----------
   // Each probe below opens an ACTUAL WebSocket against wrangler dev and asserts
   // something that can FAIL (and exit non-zero): a fanned-out event is received,
-  // a cross-tenant socket stays silent, a subscription survives a kill+restart,
-  // and expired/cross-tenant/garbage/cross-channel tickets are refused.
+  // the deployment hub reaches multiple actors, a subscription survives a
+  // kill+restart, and expired/malformed/garbage/cross-channel tickets are refused.
 
   await step(
-    'D fan-out + hub cross-tenant isolation: a decided event reaches the ' +
-      "tenant's socket and never another tenant's",
+    'D deployment fan-out: a decided event reaches two authenticated actors on ' +
+      'the singleton deployment hub',
     async () => {
       // A fresh run -> a pending approval (requestedBy=opal) ray decides below.
       const started = await http('POST', '/runs', {
@@ -1213,20 +1270,16 @@ async function main() {
       // acceptWebSocket registered this socket before the mutation fans out.
       await waitFrame(spike, (frame) => frame?.type === 'presence', 10_000);
 
-      // A forged tenant-'other' hub ticket (valid signature via the shared local
-      // secret) subscribes to tenant OTHER's hub, NEVER spike's.
-      const otherTicket = forgeTicket({
-        tenantId: 'other',
-        channel: 'hub',
-        actorId: 'mallory',
-        role: 'reviewer',
-        exp: nowSec() + 60,
-      });
-      const other = connectWs('/api/stream/hub', otherTicket);
-      await waitOpen(other, 10_000);
+      const peerTicket = await mintTicketApi(
+        'hub',
+        undefined,
+        AUTH.otherViewer,
+      );
+      const peer = connectWs(peerTicket.url, peerTicket.ticket);
+      await waitOpen(peer, 10_000);
+      await waitFrame(peer, (frame) => frame?.type === 'presence', 10_000);
 
-      // Decide the spike approval -> fires a 'decided' stream event (tenant
-      // spike), fanned out over the hub to spike's sockets only.
+      // Decide the approval -> fires a 'decided' event over the deployment hub.
       const decided = await http(
         'POST',
         `/api/approvals/${approvalId}/decide`,
@@ -1242,8 +1295,8 @@ async function main() {
         10_000,
       );
       assert(
-        frame.event.record.tenantId === 'spike',
-        'fanned-out event is tenant spike',
+        frame.event.record.tenantId === undefined,
+        'fanned-out approval records carry no logical tenant field',
         frame.event.record,
       );
       assert(
@@ -1252,19 +1305,20 @@ async function main() {
         frame.event.record,
       );
 
-      // Cross-tenant isolation: give any erroneous leak time to arrive (the
-      // spike frame already proved the event fired), then assert the 'other'
-      // socket saw NO spike queue frame.
-      await sleep(500);
-      const leaked = other.frames.find((f) => f?.type === 'queue');
+      const peerFrame = await waitFrame(
+        peer,
+        (candidate) =>
+          candidate?.type === 'queue' && candidate?.event?.type === 'decided',
+        10_000,
+      );
       assert(
-        leaked === undefined,
-        'LEAK: tenant other received a spike queue event',
-        leaked,
+        peerFrame.event.record.id === approvalId,
+        'the second deployment actor received the same decided event',
+        peerFrame,
       );
 
       spike.close();
-      other.close();
+      peer.close();
     },
   );
 
@@ -1314,8 +1368,8 @@ async function main() {
         10_000,
       );
       assert(
-        frame.event.record.tenantId === 'spike',
-        'post-restart fan-out is tenant spike',
+        frame.event.record.tenantId === undefined,
+        'post-restart fan-out remains deployment-scoped',
         frame.event.record,
       );
       sock.close();
@@ -1323,7 +1377,7 @@ async function main() {
   );
 
   await step(
-    'F ticket fail-closed: a valid forge opens, but expired / cross-tenant / ' +
+    'F ticket fail-closed: a valid forge opens, but expired / malformed-run / ' +
       'garbage / cross-channel tickets are refused',
     async () => {
       const spikeRunId = run.runId; // a real spike-owned runId (from A1)
@@ -1333,7 +1387,6 @@ async function main() {
       // refusals below are CLAIM rejections, not signature drift. If the secret
       // ever drifts, THIS throws and the probe fails loudly.
       const valid = forgeTicket({
-        tenantId: 'spike',
         channel: 'hub',
         actorId: 'vic',
         role: 'viewer',
@@ -1345,7 +1398,6 @@ async function main() {
 
       // Expired hub ticket -> refused (exp in the past).
       const expired = forgeTicket({
-        tenantId: 'spike',
         channel: 'hub',
         actorId: 'vic',
         role: 'viewer',
@@ -1353,19 +1405,17 @@ async function main() {
       });
       await expectWsRefused('/api/stream/hub', expired, 8_000);
 
-      // Cross-tenant RUN ticket: tenant 'other' claiming a SPIKE runId ->
-      // refused (tenantOwnsSaltedId('other', spikeRunId) is false).
-      const crossTenant = forgeTicket({
-        tenantId: 'other',
+      // A validly signed RUN ticket with a malformed run id is refused.
+      const malformedRun = forgeTicket({
         channel: 'run',
-        runId: spikeRunId,
+        runId: 'bad/run',
         actorId: 'mallory',
         role: 'reviewer',
         exp: nowSec() + 60,
       });
       await expectWsRefused(
         `/api/stream/run/demo-approval/${spikeRunId}`,
-        crossTenant,
+        malformedRun,
         8_000,
       );
 
@@ -1374,7 +1424,6 @@ async function main() {
 
       // Cross-channel: a hub ticket presented on the run route -> refused.
       const hubForRun = forgeTicket({
-        tenantId: 'spike',
         channel: 'hub',
         actorId: 'vic',
         role: 'viewer',
@@ -1442,7 +1491,7 @@ async function main() {
   );
 
   await step(
-    'H2 D1 execution: serialized workflow updates complete and a killed task recovers tenant-scoped',
+    'H2 D1 execution: serialized workflow updates complete and a killed task recovers deployment-scoped',
     async () => {
       const pollTask = async (taskId, wanted, timeoutMs = 30_000) => {
         const deadline = Date.now() + timeoutMs;
@@ -1531,23 +1580,13 @@ async function main() {
   );
 
   await step(
-    'J cross-tenant fail-closed (C-S4): a foreign-threadId send is refused at ' +
-      'BOTH the topology ownership 404 and the DO header 403',
+    'J malformed thread fail-closed: the topology refuses an invalid DO address',
     async () => {
-      const { status, body } = await http('POST', '/sig/cross-tenant');
-      assert(status === 200, `sig cross-tenant probe -> ${status}`, body);
-      // Barrier 1: the topology 404s the foreign threadId BEFORE the DO is
-      // addressed — no wake, no existence oracle.
+      const { status, body } = await http('POST', '/sig/malformed-thread');
+      assert(status === 200, `sig malformed-thread probe -> ${status}`, body);
       assert(
-        body.ownershipStatus === 404,
-        'topology ownership 404 (tenant does not own the threadId)',
-        body,
-      );
-      // Barrier 2: a DIRECT forged-header fetch (bypassing the topology) is 403'd
-      // by the DO's own #assertTenantIdentity (name tenant != forged header).
-      assert(
-        body.headerStatus === 403,
-        'DO header assertion 403 (a forged x-flowsafe-tenant cannot pass)',
+        body.status === 404,
+        'the topology returns 404 before addressing a malformed thread id',
         body,
       );
     },
@@ -1610,24 +1649,24 @@ async function main() {
   );
 
   await step(
-    'L goal fail-closed (F-S3): a cross-tenant write is 404 + audited, and an ' +
+    'L goal fail-closed (F-S3): a malformed target is 404 + audited, and an ' +
       'over-cap maxRuns is rejected + audited',
     async () => {
-      const cross = await http('POST', '/goal/cross-tenant');
+      const malformed = await http('POST', '/goal/malformed-target');
       assert(
-        cross.status === 200,
-        `cross-tenant probe -> ${cross.status}`,
-        cross.body,
+        malformed.status === 200,
+        `malformed-target probe -> ${malformed.status}`,
+        malformed.body,
       );
       assert(
-        cross.body.status === 404,
-        'a foreign-threadId objective write is 404 (no existence oracle)',
-        cross.body,
+        malformed.body.status === 404,
+        'an invalid thread target is 404',
+        malformed.body,
       );
       assert(
-        cross.body.audited.includes('rejected:foreign-thread'),
-        'the cross-tenant write was audited',
-        cross.body.audited,
+        malformed.body.audited.includes('rejected:invalid-thread'),
+        'the malformed-target write was audited',
+        malformed.body.audited,
       );
 
       const overCap = await http('POST', '/goal/over-cap');
@@ -1678,25 +1717,29 @@ async function main() {
 
   // --- Track D schedules (M-006) --------------------------------------------
   // WE OWN THE TICK (DL-012): listDueSchedules -> CAS claim -> fire, bypassing
-  // core's pubsub worker loop. The two load-bearing proofs: exactly-once under
-  // concurrent ticks (the CAS), and the stored-context barrier + INV-1 mint on a
-  // real DO fire.
+  // core's pubsub worker loop. The two load-bearing proofs: one CAS claimant
+  // under concurrent ticks, and the stored-context barrier + opaque ID mint on
+  // a real DO fire.
   await step(
-    'N schedule exactly-once (D-S1): two CONCURRENT ticks over one due schedule ' +
-      'fire EXACTLY once (CAS), one trigger row, nextFireAt advanced once',
+    'N schedule single claim (D-S1): two CONCURRENT ticks over one due schedule ' +
+      'allow one CAS claimant, one trigger row, and one nextFireAt advance',
     async () => {
-      const { status, body } = await http('POST', '/sched/exactly-once');
-      assert(status === 200, `sched exactly-once probe -> ${status}`, body);
+      const { status, body } = await http('POST', '/sched/concurrent-claim');
+      assert(status === 200, `sched concurrent-claim probe -> ${status}`, body);
       // One of the two concurrent ticks won the CAS; the other lost — proving the
       // updateScheduleNextFire compare-and-swap serializes the claim on real D1.
       assert(
         body.fires === 1,
-        'exactly ONE fire across two concurrent ticks',
+        'one fire across two concurrent tick pollers',
         body,
       );
       assert(body.lost === 1, 'the OTHER tick lost the CAS claim', body);
-      assert(body.fireCount === 1, 'the start seam ran exactly once', body);
-      assert(body.published === 1, 'exactly one published trigger row', body);
+      assert(body.fireCount === 1, 'the start seam ran for one claimant', body);
+      assert(
+        body.published === 1,
+        'one published trigger row was recorded',
+        body,
+      );
       assert(
         body.advanced === true,
         'nextFireAt advanced once (the fire is consumed, never hot-looped)',
@@ -1711,7 +1754,7 @@ async function main() {
     async () => {
       const { status, body } = await http('POST', '/sched/agent');
       assert(status === 200, `sched agent probe -> ${status}`, body);
-      // The composition this proves: systemTenant mints kind:'system', the
+      // The composition this proves: the system context mints kind:'system', the
       // topology stamps x-flowsafe-principal, the DO rebuilds it as SYSTEM (not
       // as a human), and the agent host admits it because SPIKE_AGENT_META
       // declares system+schedule.fire. Before the principal header was stamped
@@ -1724,8 +1767,13 @@ async function main() {
       );
       assert(body.result?.failed === 0, 'no schedule fire was refused', body);
       assert(
-        typeof body.runId === 'string' && body.runId.startsWith('spike_'),
-        'the fired agent runId is INV-1 (<tenantId>_<uuid>)',
+        UUID_PATTERN.test(body.runId),
+        'the fired agent runId is an opaque UUID',
+        body,
+      );
+      assert(
+        body.runOwner?.kind === 'human' && body.runOwner?.id === 'sched-owner',
+        'the fired run inherits the registered schedule owner',
         body,
       );
     },
@@ -1759,17 +1807,15 @@ async function main() {
   );
 
   await step(
-    'O schedule barrier + INV-1 (D-S2): a workflow schedule fires through ' +
-      'RunnerRuntime with a fresh INV-1 runId and the stored-context barrier holds',
+    'O schedule barrier + opaque IDs (D-S2): a workflow schedule fires through ' +
+      'RunnerRuntime with a fresh UUID, verified context, and initial state',
     async () => {
       const { status, body } = await http('POST', '/sched/barrier');
       assert(status === 200, `sched barrier probe -> ${status}`, body);
       assert(body.fired === 1, 'the workflow target fired', body);
-      // INV-1: the tick minted a tenant-salted `spike_<uuid>` runId, never a bare
-      // crypto.randomUUID.
       assert(
-        typeof body.runId === 'string' && body.runId.startsWith('spike_'),
-        'the fired runId is INV-1 (<tenantId>_<uuid>)',
+        UUID_PATTERN.test(body.runId),
+        'the fired runId is an opaque UUID',
         body,
       );
       assert(
@@ -1778,28 +1824,33 @@ async function main() {
         body,
       );
       // The barrier: the FORGED connector id planted in the schedule ROW's stored
-      // requestContext never becomes a grant on the executing leg — the topology
-      // start carries only inputData (stored context dropped), and the DO's own
-      // approvalGrantProvider mints an EMPTY grant list that wins. (The grant KEY
+      // requestContext never becomes a grant on the executing leg — the verified
+      // schedule source strips reserved keys, and the DO's own approvalGrantProvider
+      // mints an EMPTY grant list that wins. (The grant KEY
       // is legitimately present as []; the forged VALUE is what must not appear.)
       assert(
         body.leg?.reservedLeaked === false,
         'the forged connector planted in the row did NOT become a grant (barrier holds)',
         body.leg,
       );
-      // ...while the DO's OWN scope keys (minted by #requestContextFor) ARE
-      // present — proving the run went through RunnerRuntime, not a forked path.
+      // The DO's OWN workflow scope is present, proving the run went through
+      // RunnerRuntime. Flowsafe no longer fabricates Breakwater's isolationScope;
+      // keeping the negative assertion makes that boundary a regression tripwire.
       assert(
         body.leg?.workflowScopePresent === true &&
-          body.leg?.isolationScopePresent === true,
-        'the runtime-derived scope keys ARE present (ran through RunnerRuntime)',
+          body.leg?.isolationScopePresent === false,
+        'workflow scope is derived and no isolation scope is fabricated',
         body.leg,
       );
-      // and the stored NON-reserved key is dropped on the DO path (the topology
-      // start seam carries only inputData) — strictly more fail-closed.
+      // The stored NON-reserved key is carried from the exact prepared target.
       assert(
-        body.leg?.customPresent === false,
-        'stored non-reserved context is dropped on the DO path (fail-closed)',
+        body.leg?.customPresent === true,
+        'verified non-reserved stored context reaches the scheduled leg',
+        body.leg,
+      );
+      assert(
+        body.leg?.initialStatePresent === true,
+        'verified stored initialState reaches core workflow execution',
         body.leg,
       );
     },
@@ -1808,8 +1859,7 @@ async function main() {
   // --- Track E signal providers (M-007) -------------------------------------
   // Webhooks terminate on the Worker, verified BEFORE parse; delivery routes
   // through the topology into the thread inbox; a poll provider survives DO
-  // eviction by rehydrating its subscriptions from D1; the ROW is the sole
-  // tenant authority (a tampered/foreign row fails closed at the topology).
+  // eviction by rehydrating its deployment subscriptions from D1.
   await step(
     'P forged webhook (E-S2): a bad-signature github webhook is rejected BEFORE ' +
       'parse and audited, with no lookup/delivery/state change',
@@ -1839,10 +1889,7 @@ async function main() {
       );
       // No state change: nothing was delivered (the inbox is still empty here —
       // no subscription has been created yet, and the reject never looked one up).
-      const inbox = await http(
-        'GET',
-        '/sigp/notifications?threadId=spike_sigp',
-      );
+      const inbox = await http('GET', '/sigp/notifications?threadId=sigp');
       assert(
         inbox.body.count === 0,
         'no notification landed from the forgery (no delivery/state change)',
@@ -1877,10 +1924,7 @@ async function main() {
         'the webhook matched the subscription ROW and delivered through the topology',
         delivered.body,
       );
-      const inbox = await http(
-        'GET',
-        '/sigp/notifications?threadId=spike_sigp',
-      );
+      const inbox = await http('GET', '/sigp/notifications?threadId=sigp');
       assert(
         inbox.body.count >= 1 && inbox.body.sources.includes('github'),
         'a github notification landed in mastra_notifications (visible on the read path)',
@@ -1917,10 +1961,7 @@ async function main() {
         'the poll fired a delivery (D1-restored subscription -> thread inbox)',
         poll.body.result,
       );
-      const inbox = await http(
-        'GET',
-        '/sigp/notifications?threadId=spike_sigp',
-      );
+      const inbox = await http('GET', '/sigp/notifications?threadId=sigp');
       assert(
         inbox.body.sources.includes('spike-poller'),
         'the poll notification landed in the thread inbox after the restart',
@@ -1930,33 +1971,22 @@ async function main() {
   );
 
   await step(
-    'S cross-tenant fail-closed: a VALID-signed webhook for a TAMPERED row ' +
-      '(tenant spike, a thread it does not own) delivers to NO thread',
+    'S deployment sentinel mismatch: a freshly started Worker refuses a D1 ' +
+      'provisioned for another deployment',
     async () => {
-      const tamper = await http('POST', '/sigp/subscribe-foreign');
-      assert(
-        tamper.status === 200 && tamper.body.tampered === true,
-        'a tampered row was created (tenant spike, foreign thread)',
-        tamper.body,
+      await killServer(currentServer);
+      await executeLocalD1(
+        stateDir,
+        "UPDATE flowsafe_deployment SET tenant_tag = 'other' WHERE id = 1;",
       );
-      const webhook = await postWebhook('github', {
-        repository: { full_name: 'cross/repo' },
-      });
+      await launchServer('gen-6-mismatch', stateDir, join(tmpDir, 'gen6.log'));
+      const refused = await http('GET', '/agents', { headers: AUTH.viewer });
       assert(
-        webhook.status === 200,
-        `cross webhook -> HTTP ${webhook.status}`,
-        webhook.body,
-      );
-      assert(
-        webhook.body.matched === 1,
-        'the tampered row matched by resource (the row IS the authority)',
-        webhook.body,
-      );
-      // The topology ownership check 404s the foreign threadId — delivered to none.
-      assert(
-        webhook.body.delivered === 0,
-        'delivery to the foreign thread was 404 by the topology (fail closed)',
-        webhook.body,
+        refused.status === 503 &&
+          String(refused.body.error ?? '').includes("configured as 'spike'") &&
+          String(refused.body.error ?? '').includes("belongs to 'other'"),
+        'the Worker fails closed before authentication or routing on sentinel mismatch',
+        refused,
       );
     },
   );
@@ -1980,33 +2010,33 @@ try {
       'evicted stream replay with authoritative status fallback, and restored ' +
       'the original requester when a different reviewer approved. The application ' +
       'input processor and connector each executed exactly once; forged ' +
-      'context/headers, disallowed roles, wrong ' +
-      'tenants/agents/bindings, public raw resume, and stale decision replay all ' +
+      'context/headers, disallowed roles, wrong agents/bindings, public raw ' +
+      'resume, and stale decision replay all ' +
       'failed closed. The lower-level workflow resumed via its exact-leg approval ' +
       'grant, a forged raw resume failed closed, and self-decision was denied. ' +
-      'Live streaming (M-009): a decided event fanned out to the tenant socket, ' +
-      'stayed isolated from another tenant, survived a kill+restart, and ' +
-      'refused expired / cross-tenant / garbage / cross-channel tickets. ' +
+      'Live streaming (M-009): a decided event fanned out through the singleton ' +
+      'deployment hub to multiple actors, survived a kill+restart, and refused ' +
+      'expired / malformed-run / garbage / cross-channel tickets. ' +
       'Track B (M-003): a smuggled _background arg was rejected + audited ' +
       '(B-S3), and a fresh init() recovered a task left running in D1 (B-S2). ' +
-      'The serialized tenant-scoped D1 domains executed a task to completion ' +
+      'The serialized deployment-scoped D1 domains executed a task to completion ' +
       'and recovered a killed in-flight task after restart (H2). ' +
       'Track C (M-004): a send into an ACTIVE thread-DO loop drained IN-PROCESS ' +
       'via the shared-pubsub registry (C-S2, the DL-002 affinity thesis), and a ' +
-      'foreign-threadId send failed closed at BOTH the topology 404 and the DO ' +
-      'header 403 (C-S4). Track F (M-005): an objective set via the route landed ' +
+      'malformed thread address failed closed at the topology. Track F (M-005): ' +
+      'an objective set via the route landed ' +
       'in mastra_thread_state and the durable goal-step read path returned it ' +
-      '(F-S1), survived a kill+restart (F-S2), and a cross-tenant write + over-cap ' +
+      '(F-S1), survived a kill+restart (F-S2), and a malformed target + over-cap ' +
       'maxRuns failed closed and audited (F-S3). Track D (M-006): two concurrent ' +
-      'ticks over one due schedule fired EXACTLY once via the CAS (D-S1), and a ' +
-      'workflow schedule fired through RunnerRuntime with a fresh INV-1 runId ' +
-      'while a reserved key planted in the row stayed ABSENT from the leg (D-S2). ' +
+      'ticks over one due schedule allowed one CAS claimant (D-S1), and a ' +
+      'workflow schedule fired through RunnerRuntime with a fresh opaque runId ' +
+      'while a reserved key stayed absent and verified initial state arrived (D-S2). ' +
       'Track E (M-007): a forged webhook was rejected BEFORE parse and audited ' +
       '(E-S2), a signed webhook matched its subscription row and landed a ' +
       'notification in the thread inbox (E-S1), a poll provider rehydrated its ' +
-      'subscriptions from D1 after a kill+restart and fired delivery (E-S3), and ' +
-      'a valid webhook for a tampered foreign-thread row delivered to NONE ' +
-      '(cross-tenant fail-closed at the topology).',
+      'subscriptions from D1 after a kill+restart and fired delivery (E-S3). ' +
+      'Finally, a fresh Worker refused a D1 sentinel stamped for another ' +
+      'deployment with 503 before authentication or routing.',
   );
 } catch (error) {
   exitCode = 1;

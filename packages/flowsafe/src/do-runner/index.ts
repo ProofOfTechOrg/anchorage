@@ -6,6 +6,7 @@
 
 export type {
   D1DatabaseBinding,
+  DurableKeyValueStorage,
   DurableObjectRunnerState,
   HubDurableObjectState,
   WebSocketLike,
@@ -20,21 +21,14 @@ export type {
   PurgeExpiredThreadStateOptions,
   PurgeExpiredThreadsOptions,
   PurgeExpiredThreadsResult,
-  PurgeTenantOptions,
-  PurgeTenantResult,
+  RunArtifactPurger,
   SnapshotDatabase,
   SnapshotStatement,
-  TenantArtifactPurger,
-  TenantMetadataPurgeCounter,
-  TenantMetadataPurgeTable,
-  TenantRangePurgeCounter,
-  TenantRangePurgeTable,
 } from './d1-storage.js';
 export {
   BACKGROUND_TASK_TTL_PURGE_TABLES,
   createD1Storage,
   d1Changes,
-  ensureSnapshotRunIdIndex,
   NOTIFICATION_TTL_PURGE_TABLES,
   purgeExpiredBackgroundTasks,
   purgeExpiredNotifications,
@@ -42,18 +36,41 @@ export {
   purgeExpiredThreadState,
   purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
-  purgeTenant,
   RUN_TTL_PURGE_TABLES,
   SCHEDULE_TRIGGER_TTL_PURGE_TABLES,
-  TENANT_METADATA_PURGE_TABLES,
-  TENANT_RANGE_PURGE_TABLES,
   THREAD_STATE_TTL_PURGE_TABLES,
   THREAD_TTL_PURGE_TABLES,
 } from './d1-storage.js';
+// Deployment identity (docs/security-threat-model.md, "The provisioning
+// boundary"): the env-tag + D1-sentinel guard every entry surface asserts.
+export type {
+  DeploymentIdentityDatabase,
+  DeploymentIdentityEnv,
+  DeploymentIdentityStatement,
+} from './deployment-identity.js';
+export {
+  assertDeploymentIdentity,
+  assertDeploymentIdentitySecret,
+  DEPLOYMENT_IDENTITY_HEADER,
+  DEPLOYMENT_TAG_PATTERN,
+  DeploymentIdentityError,
+  deploymentIdentityHeaders,
+  ensureDeploymentIdentity,
+  ensureDeploymentIdentityBindings,
+  readDeploymentIdentity,
+  seedDeploymentIdentity,
+  stampDeploymentIdentityRequest,
+  verifyDurableObjectDeploymentIdentity,
+  verifyDurableObjectDeploymentRequest,
+} from './deployment-identity.js';
 // The DO error taxonomy and its extension point: a host DO's own route states a
 // status by extending DoStatusError (see do-error-response.ts).
 export { DoStatusError, doErrorResponse } from './do-error-response.js';
-export { DurableObjectRunner } from './durable-object.js';
+export {
+  DurableObjectRunner,
+  type DurableObjectRunOwner,
+  type DurableObjectRunOwnershipStore,
+} from './durable-object.js';
 export {
   assertNoReservedExecutionContext,
   findReservedExecutionContextKey,
@@ -62,8 +79,9 @@ export {
   ReservedExecutionContextError,
   stripReservedExecutionContext,
 } from './execution-context.js';
+export { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
 export type { HubStreamEvent, PresenceMember } from './hub-do.js';
-export { HubDurableObject } from './hub-do.js';
+export { HUB_INSTANCE_NAME, HubDurableObject } from './hub-do.js';
 export type {
   DORunnerEnv,
   InitOptions,
@@ -71,30 +89,12 @@ export type {
   InitSource,
 } from './init.js';
 export { init } from './init.js';
-// Agent-memory tenancy chokepoint (docs/agent-memory-tenancy.md): the only
-// constructors/decoders for salted threadId/resourceId values.
-export {
-  mintResourceId,
-  mintThreadId,
-  tenantOfMemoryId,
-  tenantOwnsMemoryId,
-} from './memory-id.js';
-export {
-  assertMintableTenantId,
-  mintSaltedId,
-  PATH_SAFE_ID_PATTERN,
-  RESERVED_TENANT_IDS,
-  TENANT_ID_PATTERN,
-  tenantOfRunId,
-  tenantOwnsSaltedId,
-} from './path-safe-id.js';
+// Agent-memory id chokepoint: mint server-owned thread ids and validate trusted
+// host business keys used as resource ids (clients never supply either).
+export { mintThreadId, resourceIdFromKey } from './memory-id.js';
+export { isPathSafeId, PATH_SAFE_ID_PATTERN } from './path-safe-id.js';
 export type { HostPubSub } from './pubsub.js';
 export { createHostPubSub } from './pubsub.js';
-export type { ResumeLedger, ResumeLedgerStorage } from './resume-ledger.js';
-export {
-  DurableStorageResumeLedger,
-  InMemoryResumeLedger,
-} from './resume-ledger.js';
 export type {
   RequestContextProvider,
   ResumeRunOptions,
@@ -111,9 +111,16 @@ export {
   UnknownRunError,
   UnknownWorkflowError,
 } from './runtime.js';
+export type {
+  ResolvedScheduleStart,
+  ScheduleSourceAgentTarget,
+  ScheduleSourceOwner,
+  ScheduleSourceOwnershipStore,
+  ScheduleSourceStore,
+  ScheduleSourceTarget,
+  ScheduleSourceWorkflowTarget,
+  ScheduleStartTarget,
+} from './schedule-source.js';
+export { resolveScheduleStartOwner } from './schedule-source.js';
 export type { ThreadScope } from './thread-do.js';
 export { ThreadDurableObject, ThreadIdentityError } from './thread-do.js';
-export {
-  THREAD_PRINCIPAL_HEADER,
-  THREAD_TENANT_HEADER,
-} from './thread-header.js';

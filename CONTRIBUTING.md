@@ -43,6 +43,8 @@ pnpm docs:check
 pnpm docs:check:test
 pnpm docs:api
 pnpm test:packed-breakwater
+pnpm test:packed-flowsafe-agent-host
+pnpm test:packed-flowsafe-provisioning
 pnpm --filter @proofoftech/flowsafe test:signals-client-export
 pnpm --filter @proofoftech/flowsafe typecheck:react18
 pnpm --filter showcase run react-doctor

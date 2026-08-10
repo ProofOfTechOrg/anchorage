@@ -3,7 +3,7 @@
 // badges, simulated-visibility notes). Copy is bound by the truthfulness
 // rules: never claim a delivery happened (say logged/simulated/skipped),
 // grants are derived server-side (never "sent"), numbers are the verified
-// constants (3s/5s polls, 30 min refresh, ~24h sandbox, 15 min sweep, 4h SLA,
+// constants (3s/5s polls, 30 min refresh, ~24h session, 15 min sweep, 4h SLA,
 // 20/500 run caps, 5/min rate limit).
 
 import type { NarrationZone } from '@/narration';
@@ -21,7 +21,7 @@ export const ZONES: Record<NarrationZone, { label: string; blurb: string }> = {
   worker: {
     label: 'Worker',
     blurb:
-      'Cloudflare Worker: verifies JWTs, resolves your tenant, enforces RBAC and SoD, mints run ids, derives grants, orchestrates resumes, owns the crons.',
+      'Cloudflare Worker: verifies deployment identity and JWTs, enforces RBAC and SoD, mints run ids, derives grants, orchestrates resumes, and owns the crons.',
   },
   do: {
     label: 'Durable Object',
@@ -31,12 +31,12 @@ export const ZONES: Record<NarrationZone, { label: string; blurb: string }> = {
   d1: {
     label: 'D1',
     blurb:
-      'The database: run snapshots, approval records, tenant registry, demo budgets.',
+      'The database: deployment sentinel, run snapshots, approval records, demo sessions, and budgets.',
   },
   cron: {
     label: 'cron',
     blurb:
-      'Scheduled Worker invocations: the SLA sweep every 15 minutes escalates overdue approvals; purge crons reap expired sandboxes and old snapshots.',
+      'Scheduled Worker invocations: the SLA sweep every 15 minutes escalates overdue approvals; retention removes old records and expired session metadata.',
   },
 };
 
@@ -53,19 +53,17 @@ export const GLOSSARY = {
     'Runtime-owned resume counter per step: absent on a first suspension, 1 after the first resume. The collision-free tie-breaker for grants.',
   sod: 'Whoever advanced a run into a gate cannot decide that request: the server answers 403. This demo relaxes the rule for admin only (so one operator can clear both product-launch gates alone); reviewer stays bound. Each role is a distinct actor id, so switching works.',
   runId:
-    'Minted server-side as {tenantId}_{uuid}; a client-sent runId is rejected (400). The prefix makes snapshots, DOs, and grants tenant-disjoint by construction.',
-  tenantIsolation:
-    "Every id, store, and budget is scoped to your tenant. Another tenant's run answers 404 rather than 403, so the API is not an existence oracle.",
-  sandboxTenant:
-    "Your ephemeral tenant: 'dm' + 18 hex chars, invisible to other visitors. Everything in it is purged after expiry; nothing you do here persists.",
+    'An opaque UUID minted server-side; a client-sent runId is rejected (400). The deployment boundary lives in infrastructure, not in the identifier.',
+  isolationScope:
+    "Breakwater's explicit multi-scope policy uses an opaque isolation key and fails closed when it is absent. The control room exercises that policy directly; these single-organization server workflows rely on the physical deployment boundary instead.",
+  sharedOrganization:
+    'Every signed-in visitor joins one shared demo organization. Runs and approvals are intentionally visible across sessions so role switching and collaborative review remain demonstrable.',
   expiry:
-    "The tenant's end of life (~24 h from first sign-in). A cron reaper purges its runs, approvals, and budget rows after a grace window.",
+    'The demo session ends about 24 hours after first sign-in. Its tokens and run budget expire; shared run and approval records follow normal retention.',
   actorEcho:
     "Your identity renders from the server's authenticated echo on API responses. The browser holds tokens but never decides who you are.",
   runCaps:
-    'Demo budget: 20 runs per sandbox lifetime and 500 across all visitors per UTC day. Exceeding either returns 429.',
-  reset:
-    "Deletes ALL of your sandbox's runs and approval records server-side (admin role required). You stay signed in; the run budget is NOT refilled.",
+    'Demo budget: 20 run mutations per session and 500 across all visitors per UTC day. Exceeding either returns 429.',
   simulated:
     "The connector's real code path runs (grant check, audit, idempotency, limits), but no binding is configured, so the external call is skipped and its envelope logged.",
   dryRun:
@@ -73,11 +71,11 @@ export const GLOSSARY = {
   idempotency:
     'Every write carries an idempotency key. A retry with the same key returns the recorded result (replayed: true) instead of executing again.',
   rateLimit:
-    'Per-tenant call budget on a connector: crm-assign allows 5/min. Your sandbox exhausting it cannot throttle any other visitor.',
+    'Deployment-scoped connector budget: crm-assign allows 5/min across the shared demo organization.',
   egressAllowlist:
     'The only host a connector may call (crm.example.com, deploy.example.com). Any other destination is refused before a request leaves.',
   fourGates:
-    'Order on every connector call: egress allowlist → write-approval grant → idempotent replay → rate limit. All four are scoped to your tenant.',
+    'Connector controls run in a fixed order: configured policy evaluators and egress checks → write-approval grant → idempotent replay → rate limit.',
   crossWorkflowIsolation:
     "The grant-access connector refuses a request naming another workflow's scope. It fails closed even with a valid approval.",
   destructiveClass:
@@ -85,7 +83,7 @@ export const GLOSSARY = {
   polling:
     'When live streaming is enabled, run and queue updates arrive over a WebSocket: the 3s run poll then only serves as a fallback (paused while its socket stays healthy), while the 5s queue/metrics poll keeps reconciling any drift. Without streaming, these polls are the sole source. The activity feed narrates these observations in your browser.',
   artifactStore:
-    'Real writes to an in-memory bucket standing in for R2. Keys look like production (workflowId/runId/name); contents vanish with the sandbox.',
+    'Real writes to an in-memory bucket standing in for R2. Keys look like production (workflowId/runId/name); contents vanish when the runtime is replaced.',
 } as const;
 
 export type GlossaryKey = keyof typeof GLOSSARY;

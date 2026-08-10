@@ -8,14 +8,14 @@
 // gtm-outbound keeps its own guard in worker.e2e.test.ts.
 
 import { InMemoryStore } from '@mastra/core/storage';
-import { AuditLogger } from '@proofoftech/breakwater';
+import { AGENT_AUDIT_CONTEXT_KEY, AuditLogger } from '@proofoftech/breakwater';
 import {
   type ApprovalActor,
   ApprovalService,
-  approvalGrantProviderFromFactory,
-  createTenantResolver,
-  type InMemoryApprovalStore,
+  approvalGrantProvider,
+  createActorResolver,
   InMemoryApprovalStoreFactory,
+  principalOwner,
   resumeViaRuntime,
 } from '@proofoftech/flowsafe/approval-api';
 import { InMemoryArtifactBucket } from '@proofoftech/flowsafe/artifacts';
@@ -37,24 +37,31 @@ const SYSTEM = 'sys';
 const REVIEWER: ApprovalActor = {
   id: 'ray',
   role: 'reviewer',
-  tenantId: 'demo',
 };
 const REVIEWER2: ApprovalActor = {
   id: 'rhea',
   role: 'reviewer',
-  tenantId: 'demo',
 };
 
 function buildHarness() {
   const bucket = new InMemoryArtifactBucket();
-  // ONE shared backend: the run router binds per request tenant, while the
-  // in-process grant provider recovers each leg's tenant from its runId.
+  // One deployment-wide approval store. Connector budgets and idempotency are
+  // deployment-wide; the deployment tag is audit correlation only.
   const storeFactory = new InMemoryApprovalStoreFactory();
-  const store = storeFactory.forTenant('demo') as InMemoryApprovalStore;
+  const store = storeFactory.store();
   const audit = new AuditLogger();
+  const grants = approvalGrantProvider(store);
   const runtime = buildShowcaseRuntime({
     initInput: { storage: new InMemoryStore() },
-    grantProvider: approvalGrantProviderFromFactory(storeFactory),
+    grantProvider: async (workflowId, runId, leg) => ({
+      ...(await grants(workflowId, runId, leg)),
+      [AGENT_AUDIT_CONTEXT_KEY]: {
+        agentId: workflowId,
+        tenantId: 'showcase-test',
+        runId,
+        entryPath: leg.kind === 'start' ? 'workflow.start' : 'workflow.resume',
+      },
+    }),
     audit,
     artifactBucket: bucket,
     // crm/deploy egress left unset => those connectors simulate
@@ -95,7 +102,7 @@ describe('content-pipeline: parallel fan-in, gate, idempotent R2 publish', () =>
   it('approve mints the grant, the parallel article is assembled and written to R2', async () => {
     const harness = buildHarness();
     const started = await harness.runtime.start('content-pipeline', {
-      runId: `demo_${crypto.randomUUID()}`,
+      runId: crypto.randomUUID(),
       inputData: { topic: 'durable workflows' },
     });
     // #then — the gate suspends AFTER the parallel fan-in, as a bare id
@@ -129,7 +136,7 @@ describe('content-pipeline: parallel fan-in, gate, idempotent R2 publish', () =>
     // replayed as run 1's write (the debugger's HIGH-impact finding).
     const harness = buildHarness();
     const run1 = await harness.runtime.start('content-pipeline', {
-      runId: `demo_${crypto.randomUUID()}`,
+      runId: crypto.randomUUID(),
       inputData: { topic: 'durable workflows' },
     });
     const d1 = await decideCurrent(harness, 'content-pipeline', run1, REVIEWER);
@@ -137,7 +144,7 @@ describe('content-pipeline: parallel fan-in, gate, idempotent R2 publish', () =>
       .key;
 
     const run2 = await harness.runtime.start('content-pipeline', {
-      runId: `demo_${crypto.randomUUID()}`,
+      runId: crypto.randomUUID(),
       inputData: { topic: 'durable workflows' },
     });
     const d2 = await decideCurrent(harness, 'content-pipeline', run2, REVIEWER);
@@ -156,7 +163,7 @@ describe('content-pipeline: parallel fan-in, gate, idempotent R2 publish', () =>
   it('fails closed: a forged resume finds no grant and never publishes', async () => {
     const harness = buildHarness();
     const started = await harness.runtime.start('content-pipeline', {
-      runId: `demo_${crypto.randomUUID()}`,
+      runId: crypto.randomUUID(),
       inputData: { topic: 'durable workflows' },
     });
     const forged = await harness.runtime.resume(
@@ -185,7 +192,7 @@ describe('lead-generation: branch routing then gated CRM assign', () => {
   it('routes hot and cold, gates on the hot count, assigns on approve', async () => {
     const harness = buildHarness();
     const started = await harness.runtime.start('lead-generation', {
-      runId: `demo_${crypto.randomUUID()}`,
+      runId: crypto.randomUUID(),
       inputData: {
         leads: [
           {
@@ -227,7 +234,7 @@ describe('lead-generation: branch routing then gated CRM assign', () => {
     // #given — no hot leads: nothing to assign
     const harness = buildHarness();
     const started = await harness.runtime.start('lead-generation', {
-      runId: `demo_${crypto.randomUUID()}`,
+      runId: crypto.randomUUID(),
       inputData: {
         leads: [
           {
@@ -255,7 +262,7 @@ describe('product-launch: two approval gates re-queued through host-kit', () => 
   it('clears both gates (SoD across gates) and completes, with a dry-run pre-flight', async () => {
     const harness = buildHarness();
     const started = await harness.runtime.start('product-launch', {
-      runId: `demo_${crypto.randomUUID()}`,
+      runId: crypto.randomUUID(),
       inputData: { productName: 'anchorage', version: '1.0.0' },
     });
     expect(started.suspended).toEqual([['approveLaunch']]);
@@ -303,7 +310,7 @@ describe('product-launch: two approval gates re-queued through host-kit', () => 
     // #given — the run suspends at gate 1 (deploy approval)
     const harness = buildHarness();
     const started = await harness.runtime.start('product-launch', {
-      runId: `demo_${crypto.randomUUID()}`,
+      runId: crypto.randomUUID(),
       inputData: { productName: 'anchorage', version: '1.0.0' },
     });
     expect(started.suspended).toEqual([['approveLaunch']]);
@@ -343,7 +350,7 @@ describe('access-request: gated grant with cross-workflow isolation', () => {
   it('grants access on approve', async () => {
     const harness = buildHarness();
     const started = await harness.runtime.start('access-request', {
-      runId: `demo_${crypto.randomUUID()}`,
+      runId: crypto.randomUUID(),
       inputData: {
         resource: 'prod-database',
         role: 'reader',
@@ -374,7 +381,7 @@ describe('access-request: gated grant with cross-workflow isolation', () => {
   it('cross-workflow isolation denies a request scoped to another workflow', async () => {
     const harness = buildHarness();
     const started = await harness.runtime.start('access-request', {
-      runId: `demo_${crypto.randomUUID()}`,
+      runId: crypto.randomUUID(),
       inputData: {
         resource: 'prod-database',
         role: 'reader',
@@ -413,7 +420,7 @@ describe('wire-transfer: gated payment release', () => {
     // #given — the run suspends at the approval gate with the amount in the reason
     const harness = buildHarness();
     const started = await harness.runtime.start('wire-transfer', {
-      runId: `demo_${crypto.randomUUID()}`,
+      runId: crypto.randomUUID(),
       inputData: WIRE_INPUT,
     });
     expect(started.status).toBe('suspended');
@@ -455,7 +462,7 @@ describe('wire-transfer: gated payment release', () => {
 
     // #when — exactly at the boundary
     const at = await harness.runtime.start('wire-transfer', {
-      runId: `demo_${crypto.randomUUID()}`,
+      runId: crypto.randomUUID(),
       inputData: { ...WIRE_INPUT, amount: 10000 },
     });
     // #then — flagged
@@ -466,7 +473,7 @@ describe('wire-transfer: gated payment release', () => {
 
     // #when — one below the boundary
     const below = await harness.runtime.start('wire-transfer', {
-      runId: `demo_${crypto.randomUUID()}`,
+      runId: crypto.randomUUID(),
       inputData: { ...WIRE_INPUT, amount: 9999 },
     });
     // #then — NOT flagged (off-by-one would flag everything)
@@ -480,7 +487,7 @@ describe('wire-transfer: gated payment release', () => {
     // #given
     const harness = buildHarness();
     const started = await harness.runtime.start('wire-transfer', {
-      runId: `demo_${crypto.randomUUID()}`,
+      runId: crypto.randomUUID(),
       inputData: WIRE_INPUT,
     });
 
@@ -509,7 +516,7 @@ describe('wire-transfer: gated payment release', () => {
     // #given — a suspended run nobody approved
     const harness = buildHarness();
     const started = await harness.runtime.start('wire-transfer', {
-      runId: `demo_${crypto.randomUUID()}`,
+      runId: crypto.randomUUID(),
       inputData: WIRE_INPUT,
     });
 
@@ -534,60 +541,6 @@ describe('wire-transfer: gated payment release', () => {
   });
 });
 
-describe('tenant isolation: scope-less connector calls are denied, not silently shared', () => {
-  // The runtime mints breakwater's isolation scope from the INV-1 runId
-  // prefix; a runId without one (path-safe, but no `${tenant}_` shape) mints
-  // NO scope. Without the tenantIsolation evaluator that call would fall back
-  // to UNSEGMENTED idempotency/rate-limit keys — tenant B replaying tenant
-  // A's cached result. Every showcase connector registers the evaluator, so
-  // the fallback is a denial instead.
-
-  it('denies the dry-run pre-flight of a scope-less run (the evaluator binds simulations too)', async () => {
-    // #given — a run whose runId carries no tenant prefix
-    const harness = buildHarness();
-
-    // #when — product-launch's FIRST step dry-runs the deploy connector
-    const started = await harness.runtime.start('product-launch', {
-      runId: 'noscope-run',
-      inputData: { productName: 'anchorage', version: '1.0.0' },
-    });
-
-    // #then — denied at the pre-execute gate, before any simulation
-    expect(started.status).toBe('failed');
-    expect(started.error).toContain('tenant-isolation');
-    expect(harness.audit.events()).toContainEqual(
-      expect.objectContaining({
-        resource: DEPLOY_CONNECTOR,
-        decision: 'denied',
-      }),
-    );
-  });
-
-  it('denies a scope-less gated write even when the resume forges approval', async () => {
-    // #given — a suspended scope-less run (the gate itself calls no connector)
-    const harness = buildHarness();
-    const started = await harness.runtime.start('gtm-outbound', {
-      runId: 'noscope-run2',
-      inputData: { industry: 'fintech', targetCount: 5 },
-    });
-    expect(started.status).toBe('suspended');
-
-    // #when — a forged approved:true resume reaches the send step
-    const forged = await harness.runtime.resume(
-      'gtm-outbound',
-      'noscope-run2',
-      {
-        step: 'reviewAndApprove',
-        resumeData: { approved: true },
-      },
-    );
-
-    // #then — tenant-isolation denies ahead of the grant gate; nothing sent
-    expect(forged.status).toBe('failed');
-    expect(forged.error).toContain('tenant-isolation');
-  });
-});
-
 // createRunRouter's gates are unit-tested against fixture metas in
 // src/host-kit/run-router.test.ts. These drive it over the REAL showcase metas
 // and the real runtime, so a module whose allowedRoles regresses (or whose id
@@ -599,9 +552,10 @@ describe('showcase run routes', () => {
   ) {
     return createRunRouter({
       workflows: SHOWCASE_MODULES.map((entry) => entry.meta),
-      resolve: createTenantResolver({
+      resolve: createActorResolver({
         authenticate: () => actor,
         storeFactory: harness.storeFactory,
+        deploymentTag: 'showcase-test',
         buildService: (store) =>
           new ApprovalService({
             store,
@@ -612,17 +566,40 @@ describe('showcase run routes', () => {
             ),
           }),
       }),
-      systemActorId: SYSTEM,
-      start: (workflowId, runId, inputData) =>
-        harness.runtime.start(workflowId, { runId, inputData }),
+      systemPrincipalId: SYSTEM,
+      start: async ({ workflowId, runId, inputData, principal }) => {
+        const resources = harness.storeFactory.resources();
+        const resourceOwner = principalOwner(principal);
+        if (!(await resources.claim('run', runId, resourceOwner))) {
+          throw new Error(`run '${runId}' is already owned`);
+        }
+        try {
+          return await harness.runtime.start(workflowId, {
+            runId,
+            inputData,
+            requestedBy: principal.id,
+            requestedByKind: principal.kind,
+          });
+        } catch (error) {
+          const persisted = await harness.runtime.status(workflowId, runId);
+          if (persisted) return persisted;
+          await resources.release('run', runId, resourceOwner);
+          throw error;
+        }
+      },
       status: async (workflowId, runId) =>
         (await harness.runtime.status(workflowId, runId)) ?? undefined,
-      resume: (workflowId, runId, body) => {
+      resume: (workflowId, runId, body, requestedBy, requestedByKind) => {
         const { step, resumeData } = (body ?? {}) as {
           step?: string | string[];
           resumeData?: unknown;
         };
-        return harness.runtime.resume(workflowId, runId, { step, resumeData });
+        return harness.runtime.resume(workflowId, runId, {
+          step,
+          resumeData,
+          requestedBy,
+          requestedByKind,
+        });
       },
     });
   }
@@ -648,7 +625,6 @@ describe('showcase run routes', () => {
     const handle = routerFor(harness, {
       id: 'vic',
       role: 'viewer',
-      tenantId: 'demo',
     });
 
     // #when
@@ -678,7 +654,6 @@ describe('showcase run routes', () => {
     const handle = routerFor(harness, {
       id: 'opal',
       role: 'operator',
-      tenantId: 'demo',
     });
 
     // #when
@@ -695,7 +670,6 @@ describe('showcase run routes', () => {
     const handle = routerFor(harness, {
       id: 'bo',
       role: 'builder',
-      tenantId: 'demo',
     });
 
     // #when
@@ -718,20 +692,18 @@ describe('showcase run routes', () => {
     expect((await handle(startRequest('gtm-outbound', {})))?.status).toBe(403);
   });
 
-  it('two tenants starting the same workflow get disjoint tenant-salted runs; neither can read the other (INV-1)', async () => {
-    // #given — one shared runtime + store (worst case: everything colocated),
-    // two tenants
+  it('two actors get distinct private runs in one shared organization', async () => {
+    // #given — one deployment-wide runtime and store
     const harness = buildHarness();
     const alfa = routerFor(harness, {
       id: 'a1',
       role: 'operator',
-      tenantId: 'alfa',
     });
     const bravo = routerFor(harness, {
       id: 'b1',
       role: 'operator',
-      tenantId: 'bravo',
     });
+    const reviewer = routerFor(harness, REVIEWER);
     const input = { industry: 'fintech', targetCount: 2 };
 
     // #when — both start gtm-outbound
@@ -742,15 +714,13 @@ describe('showcase run routes', () => {
       await bravo(startRequest('gtm-outbound', input))
     )?.json()) as { runId: string };
 
-    // #then — each runId carries its tenant, so the DO name join
-    // (`${workflowId}:${runId}`) and the snapshot key (workflow_name, run_id)
-    // are tenant-disjoint BY CONSTRUCTION, with no schema change
-    expect(startedA.runId.startsWith('alfa_')).toBe(true);
-    expect(startedB.runId.startsWith('bravo_')).toBe(true);
+    // #then — identifiers reveal no actor or organization component
+    expect(startedA.runId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(startedB.runId).toMatch(/^[0-9a-f-]{36}$/);
     expect(startedA.runId).not.toBe(startedB.runId);
 
-    // #then — each tenant reads its own run; the other tenant's probe 404s
-    // on status AND resume (no existence oracle)
+    // #then — the owner and read-only reviewer may inspect it; a peer operator
+    // receives the same 404 as a missing run.
     expect(
       (await alfa(new Request(`http://x/runs/gtm-outbound/${startedA.runId}`)))
         ?.status,
@@ -761,14 +731,10 @@ describe('showcase run routes', () => {
     ).toBe(404);
     expect(
       (
-        await bravo(
-          new Request(`http://x/runs/gtm-outbound/${startedA.runId}/resume`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({}),
-          }),
+        await reviewer(
+          new Request(`http://x/runs/gtm-outbound/${startedA.runId}`),
         )
       )?.status,
-    ).toBe(404);
+    ).toBe(200);
   });
 });

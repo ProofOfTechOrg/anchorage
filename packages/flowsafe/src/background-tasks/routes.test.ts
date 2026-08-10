@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// The tenant-bound read routes (DL-014): list/stream REQUIRE a runId/threadId
-// filter and validate its salted prefix; getTask 404s a missing OR foreign task
-// with no oracle; a foreign filter is refused; the raw manager is never exposed.
+// Deployment read routes: list/stream require a runId/threadId filter, enforce
+// exact row scope, and never expose the raw manager.
 
 import type {
   BackgroundTask,
@@ -11,11 +10,25 @@ import type {
 import { BackgroundTaskManager } from '@mastra/core/background-tasks';
 import { Mastra } from '@mastra/core/mastra';
 import { InMemoryStore } from '@mastra/core/storage';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { createHostPubSub } from '../do-runner/index.js';
 import { backgroundTasksStore } from './d1-storage.js';
-import { createBackgroundTaskRoutes } from './routes.js';
+import {
+  type BackgroundTaskRoutesOptions,
+  createBackgroundTaskRoutes as createBackgroundTaskRoutesBase,
+} from './routes.js';
+
+function createBackgroundTaskRoutes(
+  options: Omit<BackgroundTaskRoutesOptions, 'authorize'> & {
+    authorize?: BackgroundTaskRoutesOptions['authorize'];
+  },
+) {
+  return createBackgroundTaskRoutesBase({
+    ...options,
+    authorize: options.authorize ?? (async () => true),
+  });
+}
 
 // A minimal stand-in for BackgroundTaskManager exposing only what the routes
 // read. The routes wrap this — they must never return it over the wire.
@@ -52,8 +65,6 @@ function task(overrides: Partial<BackgroundTask>): BackgroundTask {
   } as BackgroundTask;
 }
 
-const TENANT = 'abc';
-
 function get(path: string): Request {
   return new Request(`http://do${path}`);
 }
@@ -61,11 +72,10 @@ function get(path: string): Request {
 describe('createBackgroundTaskRoutes', () => {
   it('returns null for a non-matching path or a non-GET method', async () => {
     const routes = createBackgroundTaskRoutes({ manager: stubManager([]) });
-    expect(await routes(get('/other'), TENANT)).toBeNull();
+    expect(await routes(get('/other'))).toBeNull();
     expect(
       await routes(
         new Request('http://do/background-tasks', { method: 'POST' }),
-        TENANT,
       ),
     ).toBeNull();
   });
@@ -73,24 +83,29 @@ describe('createBackgroundTaskRoutes', () => {
   describe('list', () => {
     it('400s when no runId/threadId filter is supplied', async () => {
       const routes = createBackgroundTaskRoutes({ manager: stubManager([]) });
-      const res = await routes(get('/background-tasks'), TENANT);
+      const res = await routes(get('/background-tasks'));
       expect(res?.status).toBe(400);
     });
 
-    it('404s a filter naming another tenant (no oracle)', async () => {
-      const routes = createBackgroundTaskRoutes({ manager: stubManager([]) });
-      const res = await routes(get('/background-tasks?runId=xyz_r1'), TENANT);
+    it('404s a path-safe run filter the host does not authorize', async () => {
+      const listTasks = vi.fn(async () => ({ tasks: [], total: 0 }));
+      const routes = createBackgroundTaskRoutes({
+        manager: { listTasks } as unknown as BackgroundTaskManagerType,
+        authorize: async () => false,
+      });
+      const res = await routes(get('/background-tasks?runId=xyz_r1'));
       expect(res?.status).toBe(404);
+      expect(listTasks).not.toHaveBeenCalled();
     });
 
-    it('lists the tasks for a tenant-owned runId', async () => {
+    it('lists tasks for the exact runId', async () => {
       const routes = createBackgroundTaskRoutes({
         manager: stubManager([
           task({ id: 't1', runId: 'abc_r1' }),
           task({ id: 't2', runId: 'abc_r2' }),
         ]),
       });
-      const res = await routes(get('/background-tasks?runId=abc_r1'), TENANT);
+      const res = await routes(get('/background-tasks?runId=abc_r1'));
       expect(res?.status).toBe(200);
       const body = (await res?.json()) as {
         tasks: BackgroundTask[];
@@ -100,20 +115,17 @@ describe('createBackgroundTaskRoutes', () => {
       expect(body.tasks[0]?.id).toBe('t1');
     });
 
-    it('lists by a tenant-owned threadId', async () => {
+    it('lists by an exact threadId', async () => {
       const routes = createBackgroundTaskRoutes({
         manager: stubManager([task({ id: 't1', threadId: 'abc_thread' })]),
       });
-      const res = await routes(
-        get('/background-tasks?threadId=abc_thread'),
-        TENANT,
-      );
+      const res = await routes(get('/background-tasks?threadId=abc_thread'));
       expect(res?.status).toBe(200);
     });
 
     it('drops a row a regressed core filter leaks that is not the requested scope (per-row parity with the stream guard, DL-014)', async () => {
       // #given — a manager whose listTasks IGNORES the filter (a future core
-      // filter regression) and returns a foreign row alongside the owned one
+      // filter regression) and returns a mismatched row alongside the requested one
       const leaky = {
         listTasks: async () => ({
           tasks: [
@@ -124,8 +136,8 @@ describe('createBackgroundTaskRoutes', () => {
         }),
       } as unknown as BackgroundTaskManager;
       const routes = createBackgroundTaskRoutes({ manager: leaky });
-      // #when — listing a tenant-owned run
-      const res = await routes(get('/background-tasks?runId=abc_r1'), TENANT);
+      // #when — listing one run
+      const res = await routes(get('/background-tasks?runId=abc_r1'));
       // #then — only the in-scope row survives, and total reflects the owned count
       expect(res?.status).toBe(200);
       const body = (await res?.json()) as {
@@ -140,74 +152,78 @@ describe('createBackgroundTaskRoutes', () => {
   describe('getTask', () => {
     it('404s a missing task', async () => {
       const routes = createBackgroundTaskRoutes({ manager: stubManager([]) });
-      const res = await routes(get('/background-tasks/task/nope'), TENANT);
+      const res = await routes(get('/background-tasks/task/nope'));
       expect(res?.status).toBe(404);
     });
 
-    it("404s another tenant's task with the SAME response as a missing one (no oracle)", async () => {
-      const routes = createBackgroundTaskRoutes({
-        manager: stubManager([task({ id: 'foreign', runId: 'xyz_r1' })]),
-      });
-      const foreign = await routes(
-        get('/background-tasks/task/foreign'),
-        TENANT,
-      );
-      const missing = await routes(get('/background-tasks/task/nope'), TENANT);
-      expect(foreign?.status).toBe(404);
-      expect(missing?.status).toBe(404);
-      expect(await foreign?.text()).toBe(await missing?.text());
-    });
-
-    it('returns a tenant-owned task', async () => {
+    it('returns a deployment task', async () => {
       const routes = createBackgroundTaskRoutes({
         manager: stubManager([task({ id: 'mine', runId: 'abc_r9' })]),
       });
-      const res = await routes(get('/background-tasks/task/mine'), TENANT);
+      const res = await routes(get('/background-tasks/task/mine'));
       expect(res?.status).toBe(200);
       const body = (await res?.json()) as { task: BackgroundTask };
       expect(body.task.id).toBe('mine');
+    });
+
+    it('404s an existing task whose run or thread is not authorized', async () => {
+      const routes = createBackgroundTaskRoutes({
+        manager: stubManager([
+          task({ id: 'foreign', runId: 'other-run', threadId: 'other-thread' }),
+        ]),
+        authorize: async () => false,
+      });
+      const res = await routes(get('/background-tasks/task/foreign'));
+      expect(res?.status).toBe(404);
     });
 
     it('404s a malformed percent-encoded taskId (no decodeURIComponent throw)', async () => {
       // A lone '%' would make bare decodeURIComponent throw a URIError out of
       // the DO handler; safeDecodeSegment routes it to the no-oracle 404 instead.
       const routes = createBackgroundTaskRoutes({ manager: stubManager([]) });
-      const res = await routes(get('/background-tasks/task/%'), TENANT);
+      const res = await routes(get('/background-tasks/task/%'));
       expect(res?.status).toBe(404);
     });
 
     it('404s a taskId containing a path separator (never splits into a subpath)', async () => {
       const routes = createBackgroundTaskRoutes({ manager: stubManager([]) });
-      const res = await routes(get('/background-tasks/task/a%2Fb'), TENANT);
+      const res = await routes(get('/background-tasks/task/a%2Fb'));
       expect(res?.status).toBe(404);
     });
   });
 
   describe('stream (SSE)', () => {
-    it('400s without a filter and 404s a foreign filter', async () => {
+    it('400s without a filter and 404s a malformed filter', async () => {
       const routes = createBackgroundTaskRoutes({ manager: stubManager([]) });
+      expect((await routes(get('/background-tasks/stream')))?.status).toBe(400);
       expect(
-        (await routes(get('/background-tasks/stream'), TENANT))?.status,
-      ).toBe(400);
-      expect(
-        (await routes(get('/background-tasks/stream?runId=xyz_r1'), TENANT))
-          ?.status,
+        (await routes(get('/background-tasks/stream?runId=bad%2Fid')))?.status,
       ).toBe(404);
     });
 
-    it('opens an event-stream for a tenant-owned runId', async () => {
+    it('opens an event-stream for a path-safe runId', async () => {
       const routes = createBackgroundTaskRoutes({ manager: stubManager([]) });
-      const res = await routes(
-        get('/background-tasks/stream?runId=abc_r1'),
-        TENANT,
-      );
+      const res = await routes(get('/background-tasks/stream?runId=abc_r1'));
       expect(res?.status).toBe(200);
       expect(res?.headers.get('content-type')).toBe('text/event-stream');
       await res?.body?.cancel();
     });
 
+    it('404s an unauthorized stream before subscribing to the manager', async () => {
+      const stream = vi.fn();
+      const routes = createBackgroundTaskRoutes({
+        manager: { stream } as unknown as BackgroundTaskManagerType,
+        authorize: async () => false,
+      });
+      const res = await routes(
+        get('/background-tasks/stream?runId=foreign-run'),
+      );
+      expect(res?.status).toBe(404);
+      expect(stream).not.toHaveBeenCalled();
+    });
+
     it('the transform DROPS a chunk whose runId is not the requested scope (belt over core, DL-014)', async () => {
-      // #given — a manager stream emitting an owned chunk and a foreign one
+      // #given — a manager stream emitting an in-scope chunk and a mismatched one
       const manager = {
         stream: () =>
           new ReadableStream<Record<string, unknown>>({
@@ -226,10 +242,7 @@ describe('createBackgroundTaskRoutes', () => {
       } as unknown as BackgroundTaskManagerType;
       const routes = createBackgroundTaskRoutes({ manager });
       // #when — the SSE body is drained
-      const res = await routes(
-        get('/background-tasks/stream?runId=abc_r1'),
-        TENANT,
-      );
+      const res = await routes(get('/background-tasks/stream?runId=abc_r1'));
       const text = await new Response(res?.body).text();
       // #then — only the in-scope chunk reaches the wire; the foreign one is gone
       expect(text).toContain('abc_r1');
@@ -261,10 +274,7 @@ describe('createBackgroundTaskRoutes', () => {
           }),
       } as unknown as BackgroundTaskManagerType;
       const routes = createBackgroundTaskRoutes({ manager });
-      const res = await routes(
-        get('/background-tasks/stream?runId=abc_r1'),
-        TENANT,
-      );
+      const res = await routes(get('/background-tasks/stream?runId=abc_r1'));
 
       expect(await new Response(res?.body).text()).toBe('');
     });
@@ -282,10 +292,7 @@ describe('createBackgroundTaskRoutes', () => {
       const routes = createBackgroundTaskRoutes({ manager });
 
       try {
-        const res = await routes(
-          get('/background-tasks/stream?runId=abc_r1'),
-          TENANT,
-        );
+        const res = await routes(get('/background-tasks/stream?runId=abc_r1'));
         const reader = res?.body?.getReader();
         const first = await reader?.read();
         await reader?.cancel();

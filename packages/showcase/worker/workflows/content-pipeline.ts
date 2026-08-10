@@ -1,4 +1,4 @@
-// Module 2/5 — Content Pipeline: research → THREE parallel section writers
+// Module 2/6 — Content Pipeline: research → THREE parallel section writers
 // (.parallel fan-out/fan-in) → approval gate → publish to R2. Capabilities
 // shown: parallel step execution with a post-fan-in gate, a real R2ArtifactStore
 // write (offline-real via InMemoryArtifactBucket), and idempotent publish keyed
@@ -7,7 +7,6 @@
 import {
   createConnector,
   IDEMPOTENCY_KEY_CONTEXT_KEY,
-  tenantIsolation,
 } from '@proofoftech/breakwater';
 import type { WorkflowModule } from '@proofoftech/flowsafe/host-kit/module';
 import { z } from 'zod';
@@ -70,12 +69,9 @@ export const contentPipelineModule: WorkflowModule<ShowcaseModuleDeps> = {
         requiresApproval: true,
         idempotencyKey: true,
       },
-      // tenantIsolation: scope-less calls deny instead of collapsing to
-      // unsegmented keys — mandatory on a multi-tenant host (see gtm-outbound).
       policies: {
         audit,
         idempotencyStore: deps.idempotency,
-        evaluators: [tenantIsolation()],
       },
       execute: async ({ workflowId, runId, name, article }) => {
         const record = await deps.artifactStore.put(

@@ -75,21 +75,10 @@ export const RUN_START_ROLES: readonly ApprovalRole[] = [
  */
 export const DECIDER_ROLES: readonly ApprovalRole[] = ['reviewer', 'admin'];
 
-/**
- * The acting principal — breakwater's Actor shape plus the platform's tenant
- * dimension. breakwater stays tenant-agnostic (it is a standalone library);
- * flowsafe is the multi-tenant host, so ITS actor carries the tenant. The
- * e2e mirror tripwire pins "breakwater's Actor fields + tenantId".
- *
- * `tenantId` crosses an authentication boundary (bearer map or JWT claims):
- * every verifier must validate it against TENANT_ID_PATTERN in
- * do-runner/path-safe-id.ts before constructing an ApprovalActor — the type
- * says `string`, but the type system has no authority over a decoded token.
- */
+/** The authenticated human actor, mirrored from breakwater's Actor shape. */
 export interface ApprovalActor {
-  id: string;
-  role: ApprovalRole;
-  tenantId: string;
+  readonly id: string;
+  readonly role: ApprovalRole;
 }
 
 /**
@@ -154,9 +143,9 @@ export type ApprovalNotificationSink = (
 ) => void | Promise<void>;
 
 /**
- * A live-stream moment worth fanning out to every open dashboard of the
- * tenant: a request was created, claimed, decided, delegated, superseded, or
- * escalated. Distinct from ApprovalNotificationEvent (deliberately only
+ * A live-stream moment worth fanning out to every open dashboard in the
+ * deployment: a request was created, claimed, decided, delegated, superseded,
+ * or escalated. Distinct from ApprovalNotificationEvent (deliberately only
  * 'created' | 'escalated', the reviewer-facing transport): a live queue also
  * needs claimed/decided/delegated/superseded so a dashboard can upsert-by-id
  * without a refetch. `record` is the POST-transition record.
@@ -173,8 +162,8 @@ export interface ApprovalStreamEvent {
 }
 
 /**
- * The live fan-out seam (a per-tenant hub Durable Object relays each event to
- * that tenant's open dashboard sockets — flowsafe ships NO transport).
+ * The live fan-out seam (the deployment hub Durable Object relays each event
+ * to open dashboard sockets — flowsafe ships NO transport).
  * Fire-and-forget with the same availability-over-delivery policy as
  * ApprovalNotificationSink: a sink that throws or rejects never fails the
  * approval mutation that fired it — the failure is recorded to the AUDIT sink
@@ -184,9 +173,9 @@ export interface ApprovalStreamEvent {
  *
  * TRUST: unlike ApprovalNotificationSink — which addresses lower-trust channels
  * (email, chat) and so a transport must project or redact the record — this is
- * a SAME-TRUST intra-tenant feed: every subscriber is already an authenticated
- * reviewer of THIS tenant, so it carries the FULL ApprovalRecord unredacted. It
- * is an ADDRESSING feed, never a capability — no grant ever travels on it.
+ * a SAME-TRUST in-deployment feed: every subscriber is already an
+ * authenticated reviewer, so it carries the FULL ApprovalRecord unredacted.
+ * It is an ADDRESSING feed, never a capability — no grant ever travels on it.
  */
 export type ApprovalStreamSink = (
   event: ApprovalStreamEvent,

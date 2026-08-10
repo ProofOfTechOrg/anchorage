@@ -13,7 +13,6 @@ import {
 } from '@mastra/core/storage';
 
 import type { D1DatabaseBinding } from './cf-types.js';
-import { TENANT_ID_PATTERN } from './path-safe-id.js';
 
 export interface D1StorageOptions {
   /** D1 binding from the Worker/DO environment. */
@@ -79,6 +78,8 @@ const TERMINAL_STATUSES = [
  */
 export interface SnapshotDatabase {
   prepare(query: string): SnapshotStatement;
+  /** D1 transactional batch, required when owner lifecycle cleanup is wired. */
+  batch?(statements: SnapshotStatement[]): Promise<unknown[]>;
 }
 
 export interface SnapshotStatement {
@@ -88,7 +89,7 @@ export interface SnapshotStatement {
 }
 
 /** Structural: R2ArtifactStore.deleteRun, without importing the artifacts module. */
-export interface TenantArtifactPurger {
+export interface RunArtifactPurger {
   deleteRun(workflowId: string, runId: string): Promise<number>;
 }
 
@@ -99,16 +100,23 @@ export interface PurgeExpiredRunsOptions {
   tablePrefix?: string;
   /**
    * When set, each purged run's R2 artifacts are deleted WITH its snapshot
-   * row. Hosts that store artifacts must pass the same store purgeTenant
-   * gets: the snapshot row is the only enumerable record of a run's
-   * artifact keys (R2 keys lead with workflowId — there is no run-level
-   * listing without it), so a retention purge without this pairing strands
-   * the run's artifacts beyond even purgeTenant's reach.
+   * row. Hosts that store artifacts must wire this: the snapshot row is the
+   * only enumerable record of a run's artifact keys (R2 keys lead with
+   * workflowId — there is no run-level listing without it), so a retention
+   * purge without this pairing strands the run's artifacts until the
+   * deployment itself is decommissioned.
    */
-  artifactStore?: TenantArtifactPurger;
+  artifactStore?: RunArtifactPurger;
+  /**
+   * Deployment-local resource-owner table. When supplied, each snapshot delete
+   * and its run-owner release commit in the same D1 transaction. The composed
+   * Flowsafe Worker always supplies this; lower-level callers without the
+   * resource registry omit it.
+   */
+  resourceOwnerTable?: string;
   /**
    * Runs processed per call. Artifact-paired path: default 100 — the cron's
-   * subrequest-budget guard, same batching as the demo-tenant reaper. Each
+   * subrequest-budget guard, same batching as any batched reaper. Each
    * run costs ~2+N subrequests (R2 list, per-artifact deletes, its row's
    * DELETE), so an UNBOUNDED first backlog would blow the Workers
    * per-invocation cap mid-pass and log an error every firing until it
@@ -125,12 +133,9 @@ export interface PurgeExpiredRunsOptions {
 /**
  * The tables `purgeExpiredWorkflowRuns` deletes from under the run TTL — the
  * production anchor the schema guard cross-checks every `run-ttl` retention
- * declaration against, the retention counterpart of
- * TENANT_RANGE_PURGE_TABLES for the offboarding leg. One table, because the run
- * TTL rides a `run_id` range paired with artifact deletion and an app-owned
- * index (its own block below), not the tenant-range map. The guard reads THIS,
- * not a literal copied into the test, so a purge that changes what it targets
- * and a guard that still blesses the old set cannot drift apart silently.
+ * declaration against. The guard reads THIS, not a literal copied into the
+ * test, so a purge that changes what it targets and a guard that still
+ * blesses the old set cannot drift apart silently.
  */
 export const RUN_TTL_PURGE_TABLES: readonly string[] = [
   'mastra_workflow_snapshot',
@@ -170,6 +175,19 @@ export async function purgeExpiredWorkflowRuns(
                WHEN json_valid(snapshot)
                  THEN json_extract(snapshot, '$.status')
              END IN (${placeholders})`;
+  const resourceOwnerTable = options.resourceOwnerTable;
+  if (
+    resourceOwnerTable !== undefined &&
+    !/^[A-Za-z_][A-Za-z0-9_]*$/.test(resourceOwnerTable)
+  ) {
+    throw new Error('resourceOwnerTable must be a safe SQL identifier');
+  }
+  const batch = resourceOwnerTable ? db.batch?.bind(db) : undefined;
+  if (resourceOwnerTable && !batch) {
+    throw new Error(
+      'purgeExpiredWorkflowRuns requires database.batch() for atomic owner cleanup',
+    );
+  }
 
   if (options.artifactStore) {
     // Artifact-paired path, run by run: artifacts BEFORE the row, because
@@ -191,7 +209,8 @@ export async function purgeExpiredWorkflowRuns(
         .bind(cutoff, ...TERMINAL_STATUSES, options.limit ?? 100)
         .all<{ workflow_name: string; run_id: string }>());
     } catch (error) {
-      if (!isMissingTable(error)) throw error;
+      if (!isMissingTable(error, `${prefix}mastra_workflow_snapshot`))
+        throw error;
       return 0;
     }
     let deleted = 0;
@@ -200,7 +219,7 @@ export async function purgeExpiredWorkflowRuns(
       try {
         await options.artifactStore.deleteRun(row.workflow_name, row.run_id);
       } catch (error) {
-        // Isolate per run, same as the demo-tenant reaper: aborting the
+        // Isolate per run: aborting the
         // loop would re-hit this run at the same scan position every firing
         // and stall every eligible row behind it forever. Its row survives
         // as its own retry cursor; the aggregate throw below keeps the
@@ -215,15 +234,30 @@ export async function purgeExpiredWorkflowRuns(
       }
       // Re-checking eligibility keys the delete to the row the SELECT saw;
       // terminal is absorbing, so this is belt-and-braces, not a race fix.
-      deleted += d1Changes(
-        await db
-          .prepare(
-            `DELETE FROM ${prefix}mastra_workflow_snapshot
-             WHERE workflow_name = ? AND run_id = ? AND ${eligible}`,
-          )
-          .bind(row.workflow_name, row.run_id, cutoff, ...TERMINAL_STATUSES)
-          .run(),
-      );
+      const deleteSnapshot = db
+        .prepare(
+          `DELETE FROM ${prefix}mastra_workflow_snapshot
+           WHERE workflow_name = ? AND run_id = ? AND ${eligible}`,
+        )
+        .bind(row.workflow_name, row.run_id, cutoff, ...TERMINAL_STATUSES);
+      if (resourceOwnerTable && batch) {
+        const [result] = await batch([
+          deleteSnapshot,
+          db
+            .prepare(
+              `DELETE FROM ${resourceOwnerTable}
+               WHERE resource_kind = 'run' AND resource_id = ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM ${prefix}mastra_workflow_snapshot
+                   WHERE run_id = ?
+                 )`,
+            )
+            .bind(row.run_id, row.run_id),
+        ]);
+        deleted += d1Changes(result);
+      } else {
+        deleted += d1Changes(await deleteSnapshot.run());
+      }
     }
     if (failures.length > 0) {
       throw new Error(
@@ -243,6 +277,45 @@ export async function purgeExpiredWorkflowRuns(
   // unenforced, the exact wedge the cron split exists to avoid. The
   // shrinking eligible set is the cursor: a backlog drains across firings.
   try {
+    if (resourceOwnerTable && batch) {
+      // D1 accepts at most 100 bound parameters per statement. Keep the exact
+      // rowid + owner-id transaction below under that limit even when a caller
+      // requests a larger generic purge batch.
+      const limit = Math.min(options.limit ?? 1000, 90);
+      const selected = await db
+        .prepare(
+          `SELECT rowid, run_id
+           FROM ${prefix}mastra_workflow_snapshot
+           WHERE ${eligible}
+           LIMIT ?`,
+        )
+        .bind(cutoff, ...TERMINAL_STATUSES, limit)
+        .all<{ rowid: number; run_id: string }>();
+      if (selected.results.length === 0) return 0;
+      const rowIds = selected.results.map((row) => row.rowid);
+      const runIds = [...new Set(selected.results.map((row) => row.run_id))];
+      const rowPlaceholders = rowIds.map(() => '?').join(', ');
+      const runPlaceholders = runIds.map(() => '?').join(', ');
+      const [result] = await batch([
+        db
+          .prepare(
+            `DELETE FROM ${prefix}mastra_workflow_snapshot
+             WHERE rowid IN (${rowPlaceholders}) AND ${eligible}`,
+          )
+          .bind(...rowIds, cutoff, ...TERMINAL_STATUSES),
+        db
+          .prepare(
+            `DELETE FROM ${resourceOwnerTable}
+             WHERE resource_kind = 'run'
+               AND resource_id IN (${runPlaceholders})
+               AND resource_id NOT IN (
+                 SELECT run_id FROM ${prefix}mastra_workflow_snapshot
+               )`,
+          )
+          .bind(...runIds),
+      ]);
+      return d1Changes(result);
+    }
     return d1Changes(
       await db
         .prepare(
@@ -257,7 +330,8 @@ export async function purgeExpiredWorkflowRuns(
         .run(),
     );
   } catch (error) {
-    if (!isMissingTable(error)) throw error;
+    if (!isMissingTable(error, `${prefix}mastra_workflow_snapshot`))
+      throw error;
     return 0;
   }
 }
@@ -314,7 +388,7 @@ export const THREAD_TTL_PURGE_TABLES: readonly string[] = [
 ];
 
 /**
- * Thread-level retention (docs/agent-memory-tenancy.md item 7): deletes agent
+ * Thread-level retention (docs/agent-memory-isolation.md#thread-retention): deletes agent
  * memory threads whose `updatedAt` is older than the TTL, each with its
  * messages. The terminal-status shape `purgeExpiredWorkflowRuns` uses does not
  * transfer — threads are not per-run and have no status, so there is nothing to
@@ -326,7 +400,7 @@ export const THREAD_TTL_PURGE_TABLES: readonly string[] = [
  * so there is no per-message IDLENESS signal — a message's lifetime is its
  * thread's, and its rows are reachable only through it. Deleting a thread first
  * would strand its messages beyond every later firing of this purge (only
- * purgeTenant, at offboarding, still ranges over their salted `thread_id`).
+ * decommissioning the deployment's database would still reap them).
  *
  * EVERY statement re-checks the CURRENT row rather than trusting the SELECT's id
  * list, and that is load-bearing here in a way it is not for
@@ -361,13 +435,12 @@ export const THREAD_TTL_PURGE_TABLES: readonly string[] = [
  * milliseconds away. (2) A message inserted AFTER its thread's row is already
  * gone is orphaned by the writer, not by this purge; D1 offers no cross-statement
  * transaction through this seam to close it. An orphan is unreachable by recall
- * (nothing lists a thread that does not exist), stays tenant-salted on its
- * `thread_id`, and is reaped by purgeTenant at offboarding — a hygiene cost, not
- * a leak.
+ * (nothing lists a thread that does not exist) and vanishes with the
+ * deployment's database at decommission — a hygiene cost, not a leak.
  *
  * `mastra_resources` (working memory) is deliberately untouched: a resource is
  * the OWNER's, shared across every thread they have, so one thread aging out
- * says nothing about it. It is reaped at offboarding (purgeTenant).
+ * says nothing about it. It lives until the deployment is decommissioned.
  *
  * Missing tables read as zero (a deployment with no agent memory never created
  * them). Scheduling stays with the caller — see createFlowsafeWorker's
@@ -536,7 +609,7 @@ export async function purgeExpiredBackgroundTasks(
 
   try {
     // Internal evented-engine snapshots use the UNSALTED task id. Consume that
-    // association before deleting the task rows that make tenant/retention
+    // association before deleting the task rows that make retention
     // ownership discoverable.
     try {
       await db
@@ -693,9 +766,9 @@ export interface PurgeExpiredThreadStateOptions {
  * on `updatedAt` for the same reason `purgeExpiredThreads` does — thread state
  * has no terminal status, so time-since-last-write is the only "done" signal.
  * ISO-8601 TEXT encoding; missing table reads as zero; scheduling stays with the
- * caller. Independent of the thread TTL (an orphan row is reaped here or at
- * offboarding by purgeTenant), so it self-bounds without touching the delicate
- * messages-before-threads ordering of purgeExpiredThreads.
+ * caller. Independent of the thread TTL (an orphan row is reaped here or when
+ * the deployment is decommissioned), so it self-bounds without touching the
+ * delicate messages-before-threads ordering of purgeExpiredThreads.
  */
 export async function purgeExpiredThreadState(
   db: SnapshotDatabase,
@@ -723,7 +796,8 @@ export async function purgeExpiredThreadState(
  * declaration against. It is the schedule-trigger counterpart to
  * THREAD_STATE_TTL_PURGE_TABLES.
  * Only the trigger HISTORY expires; the schedule rows themselves are standing
- * config (retention 'none', reaped at offboarding by purgeTenant).
+ * config (retention 'none' — they live until deleted over the schedule
+ * surface or the deployment is decommissioned).
  */
 export const SCHEDULE_TRIGGER_TTL_PURGE_TABLES: readonly string[] = [
   'mastra_schedule_triggers',
@@ -743,7 +817,7 @@ export interface PurgeExpiredScheduleTriggersOptions {
 }
 
 /**
- * Schedule-trigger TTL cleanup: deletes trigger-history
+ * Schedule-trigger TTL cleanup: deletes terminal trigger-history
  * rows from `mastra_schedule_triggers` once their `actualFireAt` is older than the
  * TTL, at the storage layer so a cron reaps them without a live tick — the same
  * posture as the other purges (raw D1 binding, failure-isolated as a cron duty).
@@ -753,8 +827,9 @@ export interface PurgeExpiredScheduleTriggersOptions {
  * columns the other domains use), so the comparison is a NUMERIC `<` against a
  * numeric cutoff — a correct timestamp comparison over integers. A missing table
  * reads as zero (schedules may never have fired). Scheduling stays with the
- * caller. Deleting trigger history never touches a live schedule (its own row is
- * in `mastra_schedules`), so there is no ordering constraint.
+ * caller. Deferred rows are live dispatch/reconciliation state and are never
+ * TTL-purged; their eventual settlement also finalizes any pending schedule
+ * deletion.
  */
 export async function purgeExpiredScheduleTriggers(
   db: SnapshotDatabase,
@@ -767,7 +842,8 @@ export async function purgeExpiredScheduleTriggers(
     return d1Changes(
       await db
         .prepare(
-          `DELETE FROM ${prefix}mastra_schedule_triggers WHERE actualFireAt < ?`,
+          `DELETE FROM ${prefix}mastra_schedule_triggers
+           WHERE actualFireAt < ? AND outcome <> 'deferred'`,
         )
         .bind(cutoff)
         .run(),
@@ -776,480 +852,6 @@ export async function purgeExpiredScheduleTriggers(
     if (!isMissingTable(error)) throw error;
     return 0;
   }
-}
-
-// One CREATE INDEX per (database, prefix) per isolate: purgeTenant runs this,
-// and the demo reaper invokes purgeTenant in a LIMIT-batched loop — without
-// the memo that is one DDL round-trip to the D1 primary per tenant per cron
-// firing (24 no-ops out of 25), plus one on every expired-sandbox re-auth.
-// Same clear-on-failure promise memo as D1ApprovalStoreFactory's
-// #schemaReady: only SUCCESS memoizes, so a missing snapshot table (this call
-// doubles as purgeTenant's table probe) or a transient error retries on the
-// next call instead of pinning the database to a dead promise.
-const snapshotIndexReady = new WeakMap<
-  SnapshotDatabase,
-  Map<string, Promise<void>>
->();
-
-/**
- * Additive, app-owned index for the tenant range predicate. It couples us to
- * Mastra's snapshot column name (`run_id`, snake_case — its timestamps are
- * camelCase) — the schema-guard test pins that name so a @mastra/core bump
- * that renames it fails CI, not a purge.
- */
-export async function ensureSnapshotRunIdIndex(
-  db: SnapshotDatabase,
-  tablePrefix = '',
-): Promise<void> {
-  let prefixes = snapshotIndexReady.get(db);
-  if (!prefixes) {
-    prefixes = new Map();
-    snapshotIndexReady.set(db, prefixes);
-  }
-  const memo = prefixes;
-  let ready = memo.get(tablePrefix);
-  if (!ready) {
-    ready = Promise.resolve(
-      db
-        .prepare(
-          `CREATE INDEX IF NOT EXISTS idx_${tablePrefix}snapshot_run_id
-           ON ${tablePrefix}mastra_workflow_snapshot (run_id)`,
-        )
-        .run(),
-    ).then(
-      () => undefined,
-      (error: unknown) => {
-        memo.delete(tablePrefix);
-        throw error;
-      },
-    );
-    memo.set(tablePrefix, ready);
-  }
-  await ready;
-}
-
-export interface PurgeTenantOptions {
-  /** Must satisfy the tenant-ID pattern `^[a-z0-9]{3,32}$`; see the range note below. */
-  tenantId: string;
-  /** Must match createD1Storage's tablePrefix. */
-  tablePrefix?: string;
-  /**
-   * The tenant's R2 artifacts are deleted per surviving run BEFORE the
-   * snapshot rows go (deleteRun needs the run list — snapshot rows are the
-   * only enumerable record of a run's artifact keys). That is also why the
-   * SAME store must ride purgeExpiredWorkflowRuns' `artifactStore`:
-   * retention deletes rows this offboarding can then no longer see, so an
-   * unpaired retention purge strands those runs' artifacts.
-   */
-  artifactStore?: TenantArtifactPurger;
-}
-
-export interface PurgeTenantResult {
-  snapshots: number;
-  /** Agent-memory rows (docs/agent-memory-tenancy.md): salted thread ids. */
-  threads: number;
-  /** Agent-memory rows: deleted by their salted thread_id. */
-  messages: number;
-  /** Agent-memory rows: salted resource ids (working memory). */
-  resources: number;
-  /** Background-task rows, ranged over their tenant-salted `run_id`. */
-  backgroundTasks: number;
-  /** Agent-inbox rows, ranged over their tenant-salted `thread_id`. */
-  notifications: number;
-  /** Thread-state rows (state lanes + goals), ranged over `thread_id`. */
-  threadState: number;
-  /** Schedule rows, metadata-filtered on their `metadata.tenantId`. */
-  schedules: number;
-  /** Schedule-trigger rows, metadata-filtered on their `metadata.tenantId`. */
-  scheduleTriggers: number;
-  approvals: number;
-  /** Signal-subscription rows, filtered by the `tenant_id` column. */
-  subscriptions: number;
-  artifacts: number;
-}
-
-/**
- * The `PurgeTenantResult` field a range-purged table reports into. A feature
- * adopting a new `mastra_*` domain (notifications, thread-state, background
- * tasks, schedules) adds its counter HERE, its row to
- * TENANT_RANGE_PURGE_TABLES, and its field to PurgeTenantResult — all in the
- * same change. The union is what makes that mechanical rather than
- * remembered: a counter with no result field fails the pin below, and a result
- * field with no counter fails the `memory` initializer in purgeTenant.
- */
-export type TenantRangePurgeCounter =
-  | 'threads'
-  | 'messages'
-  | 'resources'
-  | 'backgroundTasks'
-  | 'notifications'
-  | 'threadState';
-
-/** One table purgeTenant reaps by the tenant-exact `[tid_, tid\x60)` range predicate. */
-export interface TenantRangePurgeTable {
-  /** The PurgeTenantResult field this table's deleted-row count lands in. */
-  counter: TenantRangePurgeCounter;
-  /** Unprefixed table name; purgeTenant applies the host's tablePrefix. */
-  table: string;
-  /**
-   * The tenant-salted column the range rides. Thread-keyed tables use their
-   * `thread_id` (a minted `${tenantId}_${uuid}`); row-keyed tables use their own
-   * salted `id`. Any column whose values are salted ids works — that is the
-   * whole reason the ids are salted at mint (docs/agent-memory-tenancy.md).
-   */
-  column: string;
-}
-
-/**
- * The tenant-range purge inventory, extensible by construction: each
- * later feature appends its adopted table here instead of editing purgeTenant's
- * body, so adoption is one additive row plus the counter/result pair the types
- * force alongside it. Ordering is not load-bearing (the deletes run
- * concurrently; see purgeTenant).
- *
- * `mastra_workflow_snapshot` is deliberately absent: it rides the same range but
- * over `run_id`, paired with artifact deletion and an app-owned index, so it
- * keeps its own block. `mastra_background_tasks` rides the range over
- * its own `run_id` — the originating run's tenant-salted id, always present on a
- * task row — without artifacts or an app index, so it lives here. Tables no
- * feature writes yet (`mastra_scorers`) are absent because nothing salts their
- * ids yet — the schema-guard's inventory pin is what forces that decision when a
- * feature adopts one.
- */
-export const TENANT_RANGE_PURGE_TABLES: readonly TenantRangePurgeTable[] = [
-  { counter: 'messages', table: 'mastra_messages', column: 'thread_id' },
-  { counter: 'threads', table: 'mastra_threads', column: 'id' },
-  { counter: 'resources', table: 'mastra_resources', column: 'id' },
-  {
-    counter: 'backgroundTasks',
-    table: 'mastra_background_tasks',
-    column: 'run_id',
-  },
-  // Track C — both thread-keyed: their `thread_id` holds the salted memory
-  // threadId (`${tenantId}_${uuid}`), so the same exact range applies.
-  {
-    counter: 'notifications',
-    table: 'mastra_notifications',
-    column: 'thread_id',
-  },
-  {
-    counter: 'threadState',
-    table: 'mastra_thread_state',
-    column: 'thread_id',
-  },
-];
-
-// Compile-time DL-003 pin: every counter must be a PurgeTenantResult field, so
-// a track cannot adopt a table whose reaped rows are counted nowhere (an
-// offboarding that silently under-reports is how "we purged them" becomes
-// unfalsifiable). The reverse direction is enforced by purgeTenant's `memory`
-// initializer, which must name every counter in the union.
-type AssertTrue<T extends true> = T;
-type _EveryPurgeCounterIsReported = AssertTrue<
-  TenantRangePurgeCounter extends keyof PurgeTenantResult ? true : false
->;
-
-/**
- * The `PurgeTenantResult` field a metadata-filtered table reports into. Schedule
- * schedule rows key on slugified ids (`agent_<slug>`/`schedule_<slug>`), NOT
- * tenant-salted ids, so the `[tid_, tid\x60)` range predicate cannot reach them —
- * the tenant lives in `metadata.tenantId`. This is the second
- * offboarding kind alongside the range counter: a feature adopting a metadata-keyed
- * domain adds its counter HERE, its row to TENANT_METADATA_PURGE_TABLES, and its
- * PurgeTenantResult field in the same change, pinned the same way.
- */
-export type TenantMetadataPurgeCounter = 'schedules' | 'scheduleTriggers';
-
-/** One table purgeTenant reaps by `json_extract(metadata, '$.tenantId') = ?`. */
-export interface TenantMetadataPurgeTable {
-  /** The PurgeTenantResult field this table's deleted-row count lands in. */
-  counter: TenantMetadataPurgeCounter;
-  /** Unprefixed table name; purgeTenant applies the host's tablePrefix. */
-  table: string;
-}
-
-/**
- * The metadata-filtered purge inventory — the offboarding coverage for
- * tables whose tenant is a JSON `metadata.tenantId` (stamped by the schedules
- * facade at create + the tick on every trigger), not a salted id column. Both
- * schedule tables are here: schedule rows and their trigger history. The DELETE is
- * `WHERE json_extract(metadata, '$.tenantId') = ?` (the same SQLite json_extract
- * the run-snapshot purge already uses on `snapshot`), so a NULL/absent metadata
- * never matches — every row our facade/tick writes carries it, so this reaps them
- * all. Ordering is not load-bearing (deletes run concurrently; see purgeTenant).
- */
-export const TENANT_METADATA_PURGE_TABLES: readonly TenantMetadataPurgeTable[] =
-  [
-    { counter: 'schedules', table: 'mastra_schedules' },
-    { counter: 'scheduleTriggers', table: 'mastra_schedule_triggers' },
-  ];
-
-// Compile-time DL-003 pin (the metadata analog of the range pin above): every
-// metadata counter must be a PurgeTenantResult field, so a table whose reaped
-// rows are counted nowhere cannot be adopted.
-type _EveryMetadataCounterIsReported = AssertTrue<
-  TenantMetadataPurgeCounter extends keyof PurgeTenantResult ? true : false
->;
-
-/**
- * Complete tenant offboarding: reaps EVERY tenant-keyed store — snapshot
- * rows of ANY status (a tenant's suspended-and-abandoned runs are never
- * eligible for the terminal-only retention purge at any age), the tenant's
- * agent-memory rows (threads/messages/resources — salted per
- * docs/agent-memory-tenancy.md, so the same range predicate is exact), the
- * tenant's approval records (titles, summaries, payloads, decider
- * identities), and its R2 artifacts.
- *
- * The snapshot predicate is a range over the tenant-salted runId:
- * `run_id >= '<tid>_' AND run_id < '<tid>' || CHAR(0x60)`. tenantId is
- * revalidated against the tenant-ID pattern here — not for injection safety (every query is
- * parameter-bound) but for RANGE-EXACTNESS: the predicate selects exactly one
- * tenant only because the charset excludes every character in [0x5F, 0x60]
- * ('_' is 0x5F; its successor 0x60, backtick, closes the range under BINARY
- * collation). 'abc' can never sweep 'abcdefg'.
- *
- * PURGE POLICY (the race): this deletes SUSPENDED rows, and a reviewer
- * approving at that moment would resume against a vanishing row (absorbed:
- * the runtime's pre-check throws before any step re-executes — pinned by the
- * purge-race regression test). Only purge tenants whose tokens have already
- * expired, so no live caller can be mid-resume by construction — or purge at
- * the tenant's own explicit request (the showcase's self-service /demo/reset).
- * That caller, uniquely, can race ITSELF: a run started between the artifact
- * SELECT and the snapshot DELETE is reaped by the DELETE (which re-reads the
- * range) with its artifacts unenumerated, and the three statements are not one
- * transaction — an R2 delete can never join a SQL one — so a mid-purge failure
- * leaves it partially applied. Both are pinned in d1-storage.test.ts. Neither
- * can escape the requester's own tenant: the range predicate is exact.
- */
-export async function purgeTenant(
-  db: SnapshotDatabase,
-  options: PurgeTenantOptions,
-): Promise<PurgeTenantResult> {
-  const { tenantId } = options;
-  if (typeof tenantId !== 'string' || !TENANT_ID_PATTERN.test(tenantId)) {
-    throw new Error(
-      `purgeTenant: tenantId '${tenantId}' violates INV-3 (^[a-z0-9]{3,32}$) — refusing (the range predicate is only exact over that charset)`,
-    );
-  }
-  const prefix = options.tablePrefix ?? '';
-  const lower = `${tenantId}_`;
-  const upper = `${tenantId}\x60`;
-  let backgroundTaskIds: string[] = [];
-  try {
-    const { results } = await db
-      .prepare(
-        `SELECT id FROM ${prefix}mastra_background_tasks
-         WHERE run_id >= ? AND run_id < ?`,
-      )
-      .bind(lower, upper)
-      .all<{ id: string }>();
-    backgroundTaskIds = results.map((row) => row.id);
-  } catch (error) {
-    if (!isMissingTable(error)) throw error;
-  }
-  // The snapshot table exists only once Mastra lazily creates it for the
-  // first persisted run. A tenant that never started one — routine for an
-  // expired demo sandbox — has zero snapshots and artifacts, and its
-  // approvals below MUST still be reaped: throwing here would wedge every
-  // offboarding (the purge cron AND the demo re-auth's inline purge) until
-  // some unrelated run initializes the schema.
-  let hasSnapshotTable = true;
-  try {
-    await ensureSnapshotRunIdIndex(db, prefix);
-  } catch (error) {
-    if (!isMissingTable(error)) throw error;
-    hasSnapshotTable = false;
-  }
-
-  let artifacts = 0;
-  let snapshots = 0;
-  if (hasSnapshotTable) {
-    // 1. Artifacts first — deleteRun needs the run list the snapshot DELETE
-    // would destroy.
-    if (options.artifactStore) {
-      const { results } = await db
-        .prepare(
-          `SELECT workflow_name, run_id FROM ${prefix}mastra_workflow_snapshot
-           WHERE run_id >= ? AND run_id < ?`,
-        )
-        .bind(lower, upper)
-        .all<{ workflow_name: string; run_id: string }>();
-      const artifactRows = [...results];
-      for (const ids of chunked(backgroundTaskIds, D1_BIND_CHUNK)) {
-        if (ids.length === 0) continue;
-        const associated = await db
-          .prepare(
-            `SELECT workflow_name, run_id
-             FROM ${prefix}mastra_workflow_snapshot
-             WHERE workflow_name = '__background-task'
-               AND run_id IN (${ids.map(() => '?').join(', ')})`,
-          )
-          .bind(...ids)
-          .all<{ workflow_name: string; run_id: string }>();
-        artifactRows.push(...associated.results);
-      }
-      const seen = new Set<string>();
-      for (const row of artifactRows) {
-        const key = `${row.workflow_name}\0${row.run_id}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        artifacts += await options.artifactStore.deleteRun(
-          row.workflow_name,
-          row.run_id,
-        );
-      }
-    }
-
-    // 2. Snapshots — ANY status.
-    snapshots = d1Changes(
-      await db
-        .prepare(
-          `DELETE FROM ${prefix}mastra_workflow_snapshot
-           WHERE run_id >= ? AND run_id < ?`,
-        )
-        .bind(lower, upper)
-        .run(),
-    );
-    for (const ids of chunked(backgroundTaskIds, D1_BIND_CHUNK)) {
-      if (ids.length === 0) continue;
-      snapshots += d1Changes(
-        await db
-          .prepare(
-            `DELETE FROM ${prefix}mastra_workflow_snapshot
-             WHERE workflow_name = '__background-task'
-               AND run_id IN (${ids.map(() => '?').join(', ')})`,
-          )
-          .bind(...ids)
-          .run(),
-      );
-    }
-  }
-
-  // 3. Every tenant-range table (TENANT_RANGE_PURGE_TABLES — today the
-  // agent-memory rows) — the SAME exact range, over the salted ids the
-  // memory-id chokepoint mints (threads/resources by id, messages by their
-  // NOT-NULL thread_id; message ids themselves are unsalted by design). The
-  // DELETEs run concurrently via Promise.all — child-before-parent order is
-  // non-load-bearing (messages range on their own thread_id column, Mastra
-  // declares no FK, every table independently re-sweepable after a mid-purge
-  // failure in any order), the memory[counter] writes hit distinct keys so
-  // there is no shared-state race, each statement keeps its own missing-table
-  // tolerance, and a first non-missing-table error still rejects. A missing
-  // table reads as empty — the tables exist wherever createD1Storage ran
-  // (eager creation), but crafted test databases and non-D1Store hosts may
-  // not have them.
-  const memory: Record<TenantRangePurgeCounter, number> = {
-    threads: 0,
-    messages: 0,
-    resources: 0,
-    backgroundTasks: 0,
-    notifications: 0,
-    threadState: 0,
-  };
-  await Promise.all(
-    TENANT_RANGE_PURGE_TABLES.filter(
-      ({ counter }) => counter !== 'backgroundTasks',
-    ).map(async ({ counter, table, column }) => {
-      try {
-        memory[counter] = d1Changes(
-          await db
-            .prepare(
-              `DELETE FROM ${prefix}${table} WHERE ${column} >= ? AND ${column} < ?`,
-            )
-            .bind(lower, upper)
-            .run(),
-        );
-      } catch (error) {
-        if (!isMissingTable(error)) throw error;
-      }
-    }),
-  );
-  // The task row is the only durable association between its salted parent run
-  // and the unsalted __background-task snapshot. Delete it only after the
-  // associated snapshots/artifacts above have been consumed.
-  try {
-    memory.backgroundTasks = d1Changes(
-      await db
-        .prepare(
-          `DELETE FROM ${prefix}mastra_background_tasks
-           WHERE run_id >= ? AND run_id < ?`,
-        )
-        .bind(lower, upper)
-        .run(),
-    );
-  } catch (error) {
-    if (!isMissingTable(error)) throw error;
-  }
-
-  // 3b. Metadata-filtered tables (Track D schedules + triggers): their tenant is
-  // a JSON metadata.tenantId, not a salted id, so they cannot ride the range
-  // above. Same posture — concurrent deletes, per-table missing-table tolerance,
-  // a first real error still rejects. json_extract on a NULL metadata yields NULL
-  // and matches nothing (a row our facade/tick never wrote).
-  const metadataCounts: Record<TenantMetadataPurgeCounter, number> = {
-    schedules: 0,
-    scheduleTriggers: 0,
-  };
-  await Promise.all(
-    TENANT_METADATA_PURGE_TABLES.map(async ({ counter, table }) => {
-      try {
-        metadataCounts[counter] = d1Changes(
-          await db
-            .prepare(
-              `DELETE FROM ${prefix}${table} WHERE json_extract(metadata, '$.tenantId') = ?`,
-            )
-            .bind(tenantId)
-            .run(),
-        );
-      } catch (error) {
-        if (!isMissingTable(error)) throw error;
-      }
-    }),
-  );
-
-  // 4. Approvals — by the tenant_id column. Hosts without the approval queue
-  // have no such table; a missing table is the only tolerated failure.
-  let approvals = 0;
-  try {
-    approvals = d1Changes(
-      await db
-        .prepare('DELETE FROM flowsafe_approvals WHERE tenant_id = ?')
-        .bind(tenantId)
-        .run(),
-    );
-  } catch (error) {
-    if (!isMissingTable(error)) throw error;
-  }
-
-  // 5. Signal subscriptions (Track E) — the same flowsafe-owned tenant_id-column
-  // delete as approvals (NOT a mastra_* table, so not in the ranged/metadata
-  // inventories above; retention is 'none' — standing config reaped only here).
-  // The table name is the literal signal-providers/subscription-d1.ts owns
-  // (SIGNAL_SUBSCRIPTIONS_TABLE); a do-runner import of signals/signal-providers
-  // would cycle, so it is hardcoded like flowsafe_approvals. Missing table (a
-  // host with no signal providers) is the only tolerated failure.
-  let subscriptions = 0;
-  try {
-    subscriptions = d1Changes(
-      await db
-        .prepare(
-          'DELETE FROM flowsafe_signal_subscriptions WHERE tenant_id = ?',
-        )
-        .bind(tenantId)
-        .run(),
-    );
-  } catch (error) {
-    if (!isMissingTable(error)) throw error;
-  }
-
-  return {
-    snapshots,
-    ...memory,
-    ...metadataCounts,
-    approvals,
-    subscriptions,
-    artifacts,
-  };
 }
 
 /** Rows affected by a D1 write, read from its `{ meta: { changes } }` envelope. */
@@ -1271,6 +873,8 @@ function errorMessageOf(error: unknown): string {
  * structural SnapshotDatabase seam carries no error codes (D1 wraps the
  * SQLite text but preserves it).
  */
-function isMissingTable(error: unknown): boolean {
-  return /no such table/i.test(errorMessageOf(error));
+function isMissingTable(error: unknown, expectedTable?: string): boolean {
+  const message = errorMessageOf(error);
+  if (!/no such table/i.test(message)) return false;
+  return expectedTable === undefined || message.includes(expectedTable);
 }

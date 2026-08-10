@@ -40,7 +40,7 @@ function harness(actor = { id: 'op-1', role: 'operator' }): Harness {
   return {
     ctx: {
       actor,
-      tenantId: 'demo',
+      isolationScope: 'showcase',
       emitText: (text) => {
         texts.push(text);
       },

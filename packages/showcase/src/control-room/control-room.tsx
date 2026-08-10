@@ -343,7 +343,7 @@ function WireScenarioPanel({
         </Text>
         <Banner
           status="info"
-          title="This starts a real durable run and consumes one of your sandbox's 20 runs."
+          title="This starts a real durable run and consumes one of your session's 20 run mutations."
         />
       </VStack>
 
@@ -481,7 +481,7 @@ export function ControlRoom({
   // Wire run state lives HERE, not in WireScenarioPanel: the panel unmounts on
   // every scenario-card switch, so panel-local state would reset to 'idle' while
   // a real run stays suspended server-side — and a re-click would fire a SECOND
-  // real run against the 20-run sandbox cap. Hoisting keeps the suspended state
+  // real run against the 20-mutation session cap. Hoisting keeps the suspended state
   // (and its "approve", not "start", button) alive across card switches.
   const [wireState, setWireState] = useState<WireState>('idle');
   const [wireApprovalId, setWireApprovalId] = useState<string | null>(null);
@@ -569,7 +569,7 @@ export function ControlRoom({
     scenario
       .run({
         actor: { id: actor.id, role: actor.role },
-        tenantId: actor.tenantId ?? 'demo',
+        isolationScope: 'showcase',
         emitText: (text) => {
           if (live()) setAgentText((prev) => prev + text);
         },

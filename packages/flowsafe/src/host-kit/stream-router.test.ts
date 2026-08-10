@@ -7,7 +7,7 @@
 // routing is observable without workerd.
 //
 // The hub FAN-OUT wiring (buildHostApprovalService forwards each mutation to
-// idFromName(record.tenantId); the cron path collects the publish into
+// idFromName(HUB_INSTANCE_NAME); the scheduled path collects the publish into
 // pendingSends and awaits it) is proven in the final describe. It belongs to
 // host-approval-service.ts but is exercised here because that module's own test
 // file is outside this milestone's edit scope — the wiring it proves (M-006
@@ -17,14 +17,15 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { d1DatabaseLike, openSqlite } from '../../test-support/sqlite.js';
 import {
+  type ActorResolver,
   type ApprovalActor,
   type ApprovalRecord,
   ApprovalService,
   type ApprovalStreamEvent,
-  createTenantResolver,
+  createActorResolver,
   InMemoryApprovalStoreFactory,
-  type TenantResolver,
 } from '../approval-api/index.js';
+import { HUB_INSTANCE_NAME } from '../do-runner/index.js';
 import type { RunnerNamespaceLike } from './do-run-topology.js';
 import {
   createFlowsafeWorker,
@@ -42,10 +43,10 @@ import { staticTokenVerifier } from './verifier.js';
 import type { WorkflowMeta } from './workflow-meta.js';
 
 const SECRET = 'stream-router-secret';
+const DEPLOYMENT_IDENTITY_SECRET = 'test-deployment-identity-secret-0001';
 const REVIEWER: ApprovalActor = {
   id: 'ray',
   role: 'reviewer',
-  tenantId: 'acme',
 };
 const RUN_ID = 'acme_run-1';
 
@@ -113,15 +114,18 @@ function recordingRunner(hits: RunnerHit[]): RunnerNamespaceLike {
 }
 
 /** Header-transported identity, mirroring run-router.test.ts. */
-function makeResolve(): TenantResolver {
+function makeResolve(): ActorResolver {
   const backend = new InMemoryApprovalStoreFactory();
-  return createTenantResolver({
+  void backend.resources().claim('run', RUN_ID, {
+    kind: 'human',
+    id: REVIEWER.id,
+  });
+  return createActorResolver({
     authenticate: (request) => {
       const id = request.headers.get('x-actor-id');
       const role = request.headers.get('x-actor-role');
-      const tenantId = request.headers.get('x-actor-tenant') ?? 'acme';
       return id && role
-        ? { id, role: role as ApprovalActor['role'], tenantId }
+        ? { id, role: role as ApprovalActor['role'] }
         : undefined;
     },
     storeFactory: backend,
@@ -135,6 +139,11 @@ function makeRouter(hub: HubNamespaceLike, runner: RunnerNamespaceLike) {
     ticketSecret: SECRET,
     hub,
     runner,
+    runStatus: async (workflowId, runId) =>
+      workflowId === 'wf' && runId === RUN_ID
+        ? { runId, status: 'suspended' }
+        : undefined,
+    deploymentIdentitySecret: DEPLOYMENT_IDENTITY_SECRET,
   });
 }
 
@@ -144,7 +153,6 @@ function authedPost(body: unknown, actor = REVIEWER): Request {
     headers: {
       'x-actor-id': actor.id,
       'x-actor-role': actor.role,
-      'x-actor-tenant': actor.tenantId,
       'content-type': 'application/json',
     },
     body: JSON.stringify(body),
@@ -180,7 +188,15 @@ describe('createStreamRouter ticket route', () => {
     expect((await router(request))?.status).toBe(401);
   });
 
-  it('mints a ~60s hub ticket that verifies to the authenticated tenant', async () => {
+  it('413s a ticket body before JSON parsing', async () => {
+    const router = makeRouter(recordingHub([]), recordingRunner([]));
+
+    const response = await router(authedPost({ padding: 'x'.repeat(4096) }));
+
+    expect(response?.status).toBe(413);
+  });
+
+  it('mints a ~60s hub ticket that verifies to the deployment hub', async () => {
     // #given
     const router = makeRouter(recordingHub([]), recordingRunner([]));
 
@@ -201,7 +217,6 @@ describe('createStreamRouter ticket route', () => {
       token: body.ticket,
     });
     expect(claims).toMatchObject({
-      tenantId: 'acme',
       channel: 'hub',
       actorId: 'ray',
       role: 'reviewer',
@@ -225,11 +240,15 @@ describe('createStreamRouter ticket route', () => {
       secret: SECRET,
       token: body.ticket,
     });
-    expect(claims).toMatchObject({ channel: 'run', runId: RUN_ID });
+    expect(claims).toMatchObject({
+      channel: 'run',
+      workflowId: 'wf',
+      runId: RUN_ID,
+    });
   });
 
-  it('404s a run the tenant does not own (no existence oracle)', async () => {
-    // #given — acme asks for a bravo-owned run
+  it('404s a path-safe run address the actor cannot access', async () => {
+    // #given — ticket minting is an authorization boundary, not only syntax.
     const router = makeRouter(recordingHub([]), recordingRunner([]));
 
     // #when
@@ -237,7 +256,7 @@ describe('createStreamRouter ticket route', () => {
       authedPost({ channel: 'run', runId: 'bravo_run-9' }),
     );
 
-    // #then — 404, not 403
+    // #then
     expect(response?.status).toBe(404);
   });
 
@@ -248,6 +267,9 @@ describe('createStreamRouter ticket route', () => {
     // #when / #then
     expect((await router(authedPost({ channel: 'bogus' })))?.status).toBe(400);
     expect((await router(authedPost({ channel: 'run' })))?.status).toBe(400);
+    expect(
+      (await router(authedPost({ channel: 'run', runId: RUN_ID })))?.status,
+    ).toBe(400);
   });
 });
 
@@ -255,13 +277,12 @@ describe('createStreamRouter hub WebSocket upgrade', () => {
   async function hubTicket(): Promise<string> {
     return mintStreamTicket({
       secret: SECRET,
-      tenantId: 'acme',
       channel: 'hub',
       actor: REVIEWER,
     });
   }
 
-  it('routes a good ticket to idFromName(tenant) rewritten to /subscribe with presence params', async () => {
+  it('routes a good ticket to the singleton hub rewritten to /subscribe with presence params', async () => {
     // #given
     const hits: HubHit[] = [];
     const router = makeRouter(recordingHub(hits), recordingRunner([]));
@@ -272,7 +293,7 @@ describe('createStreamRouter hub WebSocket upgrade', () => {
 
     // #then — the hub's own 101/200 Response is returned unmodified
     expect(response?.status).toBe(200);
-    expect(hits.map((hit) => hit.idName)).toEqual(['acme']);
+    expect(hits.map((hit) => hit.idName)).toEqual([HUB_INSTANCE_NAME]);
     expect(response?.headers.get('x-path')).toBe('/subscribe');
     expect(response?.headers.get('x-actor-id')).toBe('ray');
     expect(response?.headers.get('x-role')).toBe('reviewer');
@@ -299,8 +320,8 @@ describe('createStreamRouter hub WebSocket upgrade', () => {
     // a RUN ticket presented on the HUB route (cross-channel)
     const runTicket = await mintStreamTicket({
       secret: SECRET,
-      tenantId: 'acme',
       channel: 'run',
+      workflowId: 'wf',
       runId: RUN_ID,
       actor: REVIEWER,
     });
@@ -316,8 +337,8 @@ describe('createStreamRouter run WebSocket upgrade', () => {
   async function runTicket(runId = RUN_ID): Promise<string> {
     return mintStreamTicket({
       secret: SECRET,
-      tenantId: 'acme',
       channel: 'run',
+      workflowId: 'wf',
       runId,
       actor: REVIEWER,
     });
@@ -380,8 +401,26 @@ describe('createFlowsafeWorker stream stage opt-in', () => {
   const TOKENS = new Map([['tok-ray', REVIEWER]]);
 
   function makeEnv(withStreaming: boolean): FlowsafeWorkerEnv {
+    const sqlite = openSqlite();
+    sqlite
+      .prepare(
+        `CREATE TABLE flowsafe_deployment (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          tenant_tag TEXT NOT NULL,
+          provisioned_at TEXT NOT NULL
+        )`,
+      )
+      .run();
+    sqlite
+      .prepare(
+        `INSERT INTO flowsafe_deployment (id, tenant_tag, provisioned_at)
+         VALUES (1, 'acme', '2026-08-10T00:00:00.000Z')`,
+      )
+      .run();
     const env: FlowsafeWorkerEnv = {
-      DB: d1DatabaseLike(openSqlite()) as FlowsafeWorkerEnv['DB'],
+      DB: d1DatabaseLike(sqlite) as FlowsafeWorkerEnv['DB'],
+      DEPLOYMENT_TENANT: 'acme',
+      DEPLOYMENT_IDENTITY_SECRET,
       RUNNER: recordingRunner([]) as FlowsafeWorkerEnv['RUNNER'],
     };
     if (withStreaming) {
@@ -404,7 +443,7 @@ describe('createFlowsafeWorker stream stage opt-in', () => {
 
   const worker = createFlowsafeWorker<FlowsafeWorkerEnv>({
     workflows: WORKFLOWS,
-    systemActorId: 'sys',
+    systemPrincipalId: 'sys',
     buildVerifier: () => staticTokenVerifier(TOKENS),
     crons: { sweep: '*/15 * * * *', purge: '7 * * * *' },
   });
@@ -432,14 +471,49 @@ describe('createFlowsafeWorker stream stage opt-in', () => {
 });
 
 describe('hub fan-out wiring (host-approval-service, tested here — see file header)', () => {
-  it('buildHostApprovalService forwards each mutation to idFromName(record.tenantId)', async () => {
+  it('rejects a non-success hub response without parsing its body', async () => {
+    const topology = createHubTopology(
+      {
+        idFromName: (name: string) => name,
+        get: () => ({
+          fetch: () =>
+            Promise.resolve(
+              new Response('private hub detail', { status: 503 }),
+            ),
+        }),
+      },
+      DEPLOYMENT_IDENTITY_SECRET,
+    );
+
+    await expect(
+      topology.publish({
+        type: 'created',
+        record: {
+          id: 'apr-1',
+          workflowId: 'wf',
+          runId: RUN_ID,
+          title: 'approval',
+          connectors: [],
+          priority: 'normal',
+          status: 'pending',
+          createdAt: new Date(0).toISOString(),
+          updatedAt: new Date(0).toISOString(),
+        },
+      }),
+    ).rejects.toThrow('status 503');
+  });
+
+  it('buildHostApprovalService forwards each mutation to the deployment hub', async () => {
     // #given — a fetch-scope-shaped sink that publishes to a stub hub
     const hits: HubHit[] = [];
-    const hubTopology = createHubTopology(recordingHub(hits));
+    const hubTopology = createHubTopology(
+      recordingHub(hits),
+      DEPLOYMENT_IDENTITY_SECRET,
+    );
     const pending: Promise<unknown>[] = [];
-    const store = new InMemoryApprovalStoreFactory().forTenant('acme');
+    const store = new InMemoryApprovalStoreFactory().store();
     const service = buildHostApprovalService(store, {
-      systemActorId: 'sys',
+      systemPrincipalId: 'sys',
       resumeRun: async (record) => ({ runId: record.runId, status: 'success' }),
       stream: (event) => {
         pending.push(hubTopology.publish(event));
@@ -448,16 +522,22 @@ describe('hub fan-out wiring (host-approval-service, tested here — see file he
 
     // #when — a create mutation fires the stream sink once
     await service.create(
-      { workflowId: 'wf', runId: RUN_ID, title: 't', requestedBy: 'sys' },
-      { id: 'op', role: 'operator', tenantId: 'acme' },
+      {
+        workflowId: 'wf',
+        runId: RUN_ID,
+        title: 't',
+        requestedBy: 'sys',
+        requestedByKind: 'human',
+      },
+      { id: 'op', role: 'operator' },
     );
     await Promise.all(pending);
 
-    // #then — the event reached the tenant's hub by idFromName(record.tenantId)
-    expect(hits.map((hit) => hit.idName)).toEqual(['acme']);
+    // #then — the event reached the deployment singleton
+    expect(hits.map((hit) => hit.idName)).toEqual([HUB_INSTANCE_NAME]);
     const event = hits[0]?.body as ApprovalStreamEvent;
     expect(event.type).toBe('created');
-    expect(event.record.tenantId).toBe('acme');
+    expect(event.record.runId).toBe(RUN_ID);
   });
 
   it('the cron sweep COLLECTS the escalation publish and AWAITS it (no float)', async () => {
@@ -478,13 +558,12 @@ describe('hub fan-out wiring (host-approval-service, tested here — see file he
         },
       }),
     } as unknown as HubNamespaceLike;
-    const hubTopology = createHubTopology(hub);
+    const hubTopology = createHubTopology(hub, DEPLOYMENT_IDENTITY_SECRET);
 
     const factory = new InMemoryApprovalStoreFactory();
     const past = new Date(Date.now() - 60_000).toISOString();
     const record: ApprovalRecord = {
       id: 'apr-overdue',
-      tenantId: 'acme',
       workflowId: 'wf',
       runId: 'acme_r1',
       title: 'overdue',
@@ -495,12 +574,12 @@ describe('hub fan-out wiring (host-approval-service, tested here — see file he
       updatedAt: past,
       slaDeadlineAt: past,
     };
-    await factory.forTenant('acme').create(record);
+    await factory.store().create(record);
 
     // #when — the sweep collects the (blocked) publish into pendingSends
     const order: string[] = [];
     const sweep = runSlaSweepMaintenance({
-      store: factory.system(),
+      store: factory.store(),
       systemPrincipal: maintenancePrincipal('sys'),
       cron: '*/15 * * * *',
       stream: (event) => hubTopology.publish(event),
@@ -509,7 +588,7 @@ describe('hub fan-out wiring (host-approval-service, tested here — see file he
     // drain the store I/O so the sweep reaches its terminal Promise.all(pendingSends)
     await new Promise((resolve) => setTimeout(resolve, 0));
     // the escalation publish was fired (collected) but is still pending on the gate
-    expect(hits).toEqual(['acme']);
+    expect(hits).toEqual([HUB_INSTANCE_NAME]);
     expect(order).toEqual([]);
 
     order.push('publish-released');

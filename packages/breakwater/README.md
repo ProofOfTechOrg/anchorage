@@ -135,7 +135,7 @@ The gate checks `kind` before `role`, and it does **not** consult `allowedRoles`
 
 Flowsafe's agent host declares the matching half with `allowedAutomation`, which names each admitted kind together with the exact entry paths it may arrive on. See [Durable agents](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/durable-agents.md).
 
-The narrow handle prevents accidental use of raw Mastra execution methods. It is not a sandbox against hostile code in the same JavaScript process. Use the authenticated Flowsafe agent host when callers cross an HTTP or tenant boundary.
+The narrow handle prevents accidental use of raw Mastra execution methods. It is not a sandbox against hostile code in the same JavaScript process. Use the authenticated Flowsafe agent host when callers cross an HTTP or principal boundary.
 
 ## Choose agent policies
 
@@ -258,11 +258,11 @@ The connector wrapper reads these keys:
 | `ISOLATION_SCOPE_CONTEXT_KEY` | `breakwater.isolationScope` | Opaque non-empty string | Multi-tenant runtime only |
 | `WORKFLOW_SCOPE_CONTEXT_KEY` | `breakwater.workflowScope` | Current workflow ID | Workflow runtime only |
 
-Approval, permission, and isolation values are capabilities. Never accept them from a request body, model output, tool result, or client-controlled header. Flowsafe derives structured approval grants from approved records, projects the server-resolved principal permissions, and mints the current execution identity, workflow scope, run ID, and tenant scope on each run leg.
+Approval, permission, and isolation values are capabilities. Never accept them from a request body, model output, tool result, or client-controlled header. Flowsafe derives structured approval grants from approved records, projects the server-resolved principal permissions, and mints the current execution identity, workflow scope, and run ID on each run leg. Its physical data plane reserves and drops the isolation scope.
 
 Mastra's native `requireApproval` pauses an agent run, but it does not replace the Breakwater grant. Every execution path checks the structured grant against the runtime-owned identity. Legacy connector ID arrays fail closed.
 
-Durable-agent approvals use `tool-call` scope: connector ID, tenant, workflow, run, exact `(stepPath, suspendedAt, resumeCount)` suspension, and Mastra `toolCallId` must match. Workflow approvals use `suspension` scope because Mastra exposes no reproducible tool-call identity for an arbitrary workflow gate. Trusted standing grants use an explicit `run` scope.
+Durable-agent approvals use `tool-call` scope: connector ID, workflow, run, exact `(stepPath, suspendedAt, resumeCount)` suspension, and Mastra `toolCallId` must match. Workflow approvals use `suspension` scope because Mastra exposes no reproducible tool-call identity for an arbitrary workflow gate. Trusted standing grants use an explicit `run` scope.
 
 The same durable tool-call attempt may retry with the same `toolCallId`. A new model tool call has a new ID and requires approval. Use connector idempotency for side-effect replay protection; the grant is not a one-shot token.
 

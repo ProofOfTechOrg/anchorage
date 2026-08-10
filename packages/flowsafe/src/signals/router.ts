@@ -3,22 +3,22 @@
 //
 // Signals/notifications/messages inject XML-wrapped content INTO the model's
 // context (core's signalToXmlMarkup), so every ingest is an UNTRUSTED input
-// channel into the agent. This Worker-side router is the gate, in the SAME order
-// createRunRouter enforces:
+// channel into the agent. This Worker-side router uses the same resource-first
+// authorization rule as addressed run routes:
 //
-//   1. resolve (authenticate → INV-3 → bind)      -> 401 / 403
-//   2. coarse role (RUN_START_ROLES by default)   -> 403   (reviewer/viewer read-only)
-//   3. thread-prefix ownership (requireOwnedMemoryId) -> 404 (no existence oracle)
+//   1. resolve (authenticate and bind actor context) -> 401 / 403
+//   2. registry-backed thread ownership (requireResourceAccess) -> 404 (no existence oracle)
+//   3. coarse role (RUN_START_ROLES by default)   -> 403   (reviewer/viewer read-only)
 //   4. size cap on the raw body, THEN JSON parse   -> 413 / 400
 //   5. body names NO client memory id (assertNoClientMemoryIds) -> 400
 //   6. attribute-key allowlist                     -> 400
-//   7. per-tenant rate cap                          -> 429
+//   7. deployment rate cap                          -> 429
 //   8. audit (signal.ingest) + forward via the topology
 //
 // Every ingest is AUDITED (signal.ingest), accepted OR rejected — and a rejection
 // is audited at the step that refuses it, INCLUDING the three POST-auth denials
 // that read like an attack on this untrusted channel: the role 403, the
-// cross-tenant thread 404 (a probe for another tenant's threadIds), and the
+// malformed thread 404 and the
 // memory-id 400 (a smuggled TCB-only id). Pre-auth failures (401, or a resolver
 // throw → 403) are NOT audited: the caller is unauthenticated, so auditing there
 // would let an anonymous flood write the log.
@@ -27,9 +27,8 @@
 // runId on the status/resume routes) and is 404'd if foreign BEFORE any DO is
 // addressed — no wake, no oracle. The BODY may never name threadId/resourceId
 // (assertNoClientMemoryIds): a client that picks its own memory id picks whose
-// memory it reads. The forward goes through createThreadTopology, which OVERWRITES
-// the tenant header from the resolved context — a client cannot spoof the header
-// the thread DO authenticates on (the reason mint + verify ship together).
+// memory it reads. The forward goes through createThreadTopology, which
+// overwrites the trusted principal header from the resolved context.
 //
 // XML-injection neutralization is CORE's: signalToXmlMarkup entity-escapes the
 // contents and attribute VALUES and re-validates tag/attribute NAMES — a single
@@ -44,19 +43,20 @@
 // the sole approval decision path; this router never mints capability.
 
 import {
+  type ActorContext,
+  ActorResolutionError,
+  type ActorResolver,
   type ApprovalRole,
   RUN_START_ROLES,
-  type TenantContext,
-  TenantResolutionError,
-  type TenantResolver,
 } from '../approval-api/index.js';
 import {
   assertNoClientMemoryIds,
   RunRouteError,
-  requireOwnedMemoryId,
+  requireResourceAccess,
   type ThreadTopology,
 } from '../host-kit/index.js';
 import { safeDecodeSegment } from '../host-kit/route-path.js';
+import { readBoundedBody } from '../http-body.js';
 import { internalErrorResponse } from '../internal-error-response.js';
 import { nonnegativeSafeInteger } from '../numeric-config.js';
 
@@ -74,7 +74,7 @@ export type SignalChannel = keyof typeof CHANNEL_PATHS;
 /** The structured audit event every ingest emits (accepted OR rejected). */
 export interface SignalIngestAuditEvent {
   type: 'signal.ingest';
-  tenantId: string;
+  deploymentTag?: string;
   actorId: string;
   threadId: string;
   channel: SignalChannel;
@@ -92,23 +92,21 @@ export type SignalAuditSink = (
 ) => void | Promise<void>;
 
 /**
- * The per-tenant rate seam: returns false to REFUSE (over cap). Async so a
- * D1/KV-backed limiter fits. Absent ⇒ unmetered (single-tenant hosts).
+ * The deployment rate seam: returns false to REFUSE (over cap). Async so a
+ * D1/KV-backed limiter fits. Absent means unmetered.
  */
-export type SignalRateLimiter = (
-  tenantId: string,
-) => boolean | Promise<boolean>;
+export type SignalRateLimiter = () => boolean | Promise<boolean>;
 
 export interface SignalRouterOptions {
-  /** Authenticate, validate the tenant ID, and bind it; undefined means 401. */
-  resolve: TenantResolver;
-  /** The sanctioned reach into a thread DO — stamps the tenant header, 404s a foreign threadId. */
+  /** Authenticate and validate the actor; undefined means 401. */
+  resolve: ActorResolver;
+  /** The sanctioned reach into a thread DO — stamps the principal header. */
   topology: ThreadTopology;
   /** Who may signal. Default RUN_START_ROLES (operator/admin) — reviewers/viewers are read-only. */
   roles?: readonly ApprovalRole[];
   /** Every ingest is audited through this (accepted + rejected). Absent ⇒ no audit (wire one). */
   audit?: SignalAuditSink;
-  /** Per-tenant rate cap. Absent ⇒ unmetered. */
+  /** Deployment rate cap. Absent means unmetered. */
   rateLimit?: SignalRateLimiter;
   /**
    * The attribute KEYS a signal body may carry. When set, an attributes object
@@ -173,21 +171,23 @@ export function createSignalRouter(options: SignalRouterOptions): SignalRouter {
     }
 
     // Hoisted ABOVE the try so the outer catch can audit the POST-auth denials
-    // that surface as thrown RunRouteErrors (the cross-tenant 404, the memory-id
-    // 400). `tenant` is undefined until resolve succeeds and the closure no-ops
+    // that surface as thrown RunRouteErrors (the target 404, the memory-id
+    // 400). `context` is undefined until resolve succeeds and the closure no-ops
     // while it is, so a pre-auth throw is never audited. `contentBytes` is filled
     // at the size-cap step (0 for pre-parse rejections).
-    let tenant: TenantContext | undefined;
+    let context: ActorContext | undefined;
     let contentBytes = 0;
     const audit = async (
       outcome: 'accepted' | 'rejected',
       reason?: string,
     ): Promise<void> => {
-      if (!options.audit || !tenant) return;
+      if (!options.audit || !context) return;
       await options.audit({
         type: 'signal.ingest',
-        tenantId: tenant.tenantId,
-        actorId: tenant.actor.id,
+        ...(context.deploymentTag !== undefined
+          ? { deploymentTag: context.deploymentTag }
+          : {}),
+        actorId: context.actor.id,
         threadId,
         channel,
         outcome,
@@ -198,42 +198,50 @@ export function createSignalRouter(options: SignalRouterOptions): SignalRouter {
     };
 
     try {
-      // 1. Resolve (authenticate → INV-3 → bind). TenantResolutionError (a
-      // verifier/claim bug, incl. a forged x-flowsafe-tenant header) → 403 in the
-      // catch, NOT audited (pre-auth).
-      tenant = await resolve(request);
-      if (!tenant) return json({ error: 'authentication required' }, 401);
-      const actor = tenant.actor;
+      // 1. Resolve and authenticate. ActorResolutionError maps to 403 in the
+      // catch and is not audited (pre-auth).
+      context = await resolve(request);
+      if (!context) return json({ error: 'authentication required' }, 401);
+      const actor = context.actor;
 
-      // 2. Coarse role: signalling MUTATES agent context, so reviewers/viewers
-      // are refused before the target thread is even read. Authenticated but
-      // unauthorized, so the rejection IS audited (a real actor, no flood risk).
+      // 2. Resolve ownership before the role gate. A foreign opaque id and a
+      // missing one are the same 404, including for a read-only role.
+      await requireResourceAccess(
+        context,
+        'thread',
+        threadId,
+        'write',
+        'thread',
+      );
+
+      // 3. Coarse role: signalling mutates agent context.
       if (!roles.includes(actor.role)) {
         await audit('rejected', 'forbidden-role');
         return json({ error: 'forbidden' }, 403);
       }
 
-      // 3. Thread-prefix ownership: 404 (never 403) on a foreign threadId, so a
-      // caller learns nothing about another tenant's thread ids. BEFORE the DO
-      // is addressed — no wake, no oracle. requireOwnedMemoryId throws
-      // RunRouteError(404), audited in the catch — a cross-tenant thread probe is
-      // exactly what this untrusted channel must log.
-      requireOwnedMemoryId(tenant, threadId, 'threadId');
-
       // 4. Size cap at the wire: read the body as text, bound it, THEN parse. A
       // 16 KiB signal is generous; an unbounded one is a context-stuffing vector.
-      const rawBody = await request.text();
-      contentBytes = new TextEncoder().encode(rawBody).length;
-      if (contentBytes > maxContentBytes) {
+      const rawBody = await readBoundedBody(
+        request,
+        maxContentBytes,
+        'signal body exceeds limit',
+      );
+      if (!rawBody.ok && rawBody.reason === 'payload-too-large') {
         await audit('rejected', 'payload-too-large');
         return json(
           { error: `signal payload exceeds ${maxContentBytes} bytes` },
           413,
         );
       }
+      if (!rawBody.ok) {
+        await audit('rejected', 'malformed-body');
+        return json({ error: 'a JSON object body is required' }, 400);
+      }
+      contentBytes = rawBody.bytes.byteLength;
       let body: Record<string, unknown>;
       try {
-        const parsed = rawBody === '' ? {} : JSON.parse(rawBody);
+        const parsed = rawBody.text === '' ? {} : JSON.parse(rawBody.text);
         if (
           typeof parsed !== 'object' ||
           parsed === null ||
@@ -272,9 +280,9 @@ export function createSignalRouter(options: SignalRouterOptions): SignalRouter {
         }
       }
 
-      // 7. Per-tenant rate cap.
+      // 7. Deployment rate cap.
       if (options.rateLimit) {
-        const allowed = await options.rateLimit(tenant.tenantId);
+        const allowed = await options.rateLimit();
         if (!allowed) {
           await audit('rejected', 'rate-limited');
           return json({ error: 'rate limit exceeded' }, 429);
@@ -282,29 +290,28 @@ export function createSignalRouter(options: SignalRouterOptions): SignalRouter {
       }
 
       // 8. Audit the accepted ingest, then forward through the topology (which
-      // overwrites the tenant header — a forged one cannot ride along).
+      // overwrites the principal header — a forged one cannot ride along).
       await audit('accepted');
-      return await topology.send(tenant, threadId, CHANNEL_PATHS[channel], {
+      return await topology.send(context, threadId, CHANNEL_PATHS[channel], {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: rawBody === '' ? '{}' : rawBody,
+        body: rawBody.text === '' ? '{}' : rawBody.text,
       });
     } catch (error) {
       if (error instanceof RunRouteError) {
-        // A POST-auth denial: the ownership 404 (foreign thread) or the
-        // memory-id 400 (a smuggled TCB-only id). tenant is set by here, so
+        // A post-auth denial: the target 404 or a smuggled memory-id 400.
         // audit the rejection before mapping the status the router surfaces.
         await audit(
           'rejected',
           error.status === 404
-            ? 'foreign-thread'
+            ? 'invalid-thread'
             : error.status === 400
               ? 'client-memory-id'
               : `route-error-${error.status}`,
         );
         return json({ error: error.message }, error.status);
       }
-      if (error instanceof TenantResolutionError) {
+      if (error instanceof ActorResolutionError) {
         // Pre-auth (the resolver itself threw): unauthenticated, so not audited.
         return json({ error: 'forbidden' }, 403);
       }
@@ -314,7 +321,7 @@ export function createSignalRouter(options: SignalRouterOptions): SignalRouter {
 }
 
 /**
- * A minimal in-memory fixed-window per-tenant rate limiter — the default a
+ * A minimal in-memory fixed-window deployment rate limiter — the default a
  * single-instance host can wire without a store. NOT cross-isolate: a
  * DO-per-run/thread host that needs a shared window uses a D1/KV-backed limiter
  * behind the same `SignalRateLimiter` seam (the store's reach IS the cap's
@@ -326,12 +333,11 @@ export function createInMemorySignalRateLimiter(config: {
   now?: () => number;
 }): SignalRateLimiter {
   const now = config.now ?? Date.now;
-  const windows = new Map<string, { count: number; resetAt: number }>();
-  return (tenantId: string) => {
+  let window: { count: number; resetAt: number } | undefined;
+  return () => {
     const current = now();
-    const window = windows.get(tenantId);
     if (!window || current >= window.resetAt) {
-      windows.set(tenantId, { count: 1, resetAt: current + config.windowMs });
+      window = { count: 1, resetAt: current + config.windowMs };
       return true;
     }
     if (window.count >= config.limit) return false;

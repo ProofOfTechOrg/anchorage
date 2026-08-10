@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Track E (M-007) E-S1 (SHOULD-FIX): one webhook through the FULL delivery chain
 // with NO LLM — createWebhookRouter (verify → row lookup) → real
-// createThreadTopology → real ThreadDurableObject (its tenant assertion) → the
+// createThreadTopology → real ThreadDurableObject (its principal assertion) → the
 // production Track C thread signal routes → a real Agent registered with a Mastra
 // whose D1 storage composes the notifications domain — and the notification LANDS
 // in mastra_notifications, visible on the notifications read path. The unit suites
 // each mock a seam; this wires the real seams so the ingestion boundary has one
 // end-to-end proof of the webhook→inbox landing.
-import type { DurableObjectState } from '@cloudflare/workers-types';
 import { Agent } from '@mastra/core/agent';
 import { Mastra } from '@mastra/core/mastra';
 import { describe, expect, it } from 'vitest';
@@ -17,14 +16,15 @@ import {
   createD1Storage,
   type InitResult,
   init,
-  mintResourceId,
   mintThreadId,
+  resourceIdFromKey,
   ThreadDurableObject,
   type ThreadScope,
 } from '../do-runner/index.js';
 import {
-  createThreadTopology,
+  createThreadTopology as createThreadTopologyWithSecret,
   type ThreadNamespaceLike,
+  type ThreadTopology,
 } from '../host-kit/index.js';
 import {
   createSignalStorageDomains,
@@ -37,6 +37,13 @@ import { createWebhookRouter } from './webhook-route.js';
 
 const encoder = new TextEncoder();
 const SECRET = 'webhook-secret';
+const DEPLOYMENT_IDENTITY_SECRET = 'test-deployment-identity-secret-0001';
+
+function createThreadTopology<Id>(
+  namespace: ThreadNamespaceLike<Id>,
+): ThreadTopology {
+  return createThreadTopologyWithSecret(namespace, DEPLOYMENT_IDENTITY_SECRET);
+}
 
 async function githubSign(secret: string, body: string): Promise<string> {
   const key = await crypto.subtle.importKey(
@@ -73,10 +80,20 @@ describe('webhook ingestion — full chain (router → topology → thread DO �
 
     // A thread DO hosting the production Track C signal routes over that agent.
     class TestThread extends ThreadDurableObject<unknown> {
+      readonly #threadName: string;
+
+      constructor(threadName: string) {
+        super(undefined, {});
+        this.#threadName = threadName;
+      }
+
+      protected override get threadId(): string {
+        return this.#threadName;
+      }
+
       #routes = createThreadSignalRoutes({
         resolveAgent: () => agent,
-        resolveResourceId: (scope: ThreadScope) =>
-          mintResourceId(scope.tenantId, 'owner'),
+        resolveResourceId: () => resourceIdFromKey('owner'),
       });
       protected build(): InitResult {
         return init({ storage });
@@ -97,10 +114,7 @@ describe('webhook ingestion — full chain (router → topology → thread DO �
       get: (name) => {
         let inst = instances.get(name);
         if (!inst) {
-          inst = new TestThread(
-            { id: { name } } as unknown as DurableObjectState,
-            {},
-          );
+          inst = new TestThread(name);
           instances.set(name, inst);
         }
         const instance = inst;
@@ -115,18 +129,18 @@ describe('webhook ingestion — full chain (router → topology → thread DO �
       },
     };
 
-    const threadId = mintThreadId('acme', () => 'e1'); // 'acme_e1'
+    const threadId = mintThreadId(() => 'e1');
     const factory = new D1SubscriptionStoreFactory(d1 as never);
-    await factory.forTenant('acme').subscribe({
+    await factory.store().subscribe({
       providerId: 'github',
       externalResourceId: 'github:acme/repo',
       threadId,
-      resourceId: mintResourceId('acme', 'owner'), // MATCHES the thread DO's resolveResourceId
+      resourceId: resourceIdFromKey('owner'), // matches the thread DO's resolver
     });
 
     const router = createWebhookRouter({
       providers: { github: githubSignalProvider() },
-      subscriptions: factory.system(),
+      subscriptions: factory.store(),
       topology: createThreadTopology(namespace),
       secretForProvider: () => SECRET,
     });

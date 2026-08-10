@@ -16,7 +16,7 @@ import {
   toApprovalActor,
 } from './verifier.js';
 
-const ACTOR: ApprovalActor = { id: 'ray', role: 'reviewer', tenantId: 'acme' };
+const ACTOR: ApprovalActor = { id: 'ray', role: 'reviewer' };
 
 const MINT = {
   secret: 'test-secret-key',
@@ -45,88 +45,47 @@ function encodeSegment(value: unknown): string {
 describe('toApprovalActor', () => {
   it('accepts a complete candidate', () => {
     // #given / #when / #then
-    expect(
-      toApprovalActor({ id: 'a', role: 'admin', tenantId: 'acme' }),
-    ).toEqual({ id: 'a', role: 'admin', tenantId: 'acme' });
+    expect(toApprovalActor({ id: 'a', role: 'admin' })).toEqual({
+      id: 'a',
+      role: 'admin',
+    });
   });
 
   it.each([
-    ['missing tenantId', { id: 'a', role: 'admin' }],
-    ['uppercase tenantId', { id: 'a', role: 'admin', tenantId: 'Acme' }],
-    ['short tenantId', { id: 'a', role: 'admin', tenantId: 'ab' }],
-    ['underscore tenantId', { id: 'a', role: 'admin', tenantId: 'a_b' }],
-    [
-      "reserved identity tenantId ('system')",
-      { id: 'a', role: 'admin', tenantId: 'system' },
-    ],
-    ['unknown role', { id: 'a', role: 'root', tenantId: 'acme' }],
-    ['empty id', { id: '', role: 'admin', tenantId: 'acme' }],
+    ['unknown role', { id: 'a', role: 'root' }],
+    ['empty id', { id: '', role: 'admin' }],
+    ['overlong id', { id: 'a'.repeat(201), role: 'admin' }],
+    ['control-bearing id', { id: 'a\nb', role: 'admin' }],
     ['non-object', 'admin'],
     ['null', null],
   ])('rejects %s', (_label, candidate) => {
     // #when / #then — fail closed, no default actor
     expect(toApprovalActor(candidate)).toBeUndefined();
   });
-
-  it.each([
-    'docs',
-    'api',
-    'default',
-  ])("accepts tenantId '%s' — allocation/routing reservations never bite at authentication", (tenantId) => {
-    // #given a single-tenant host named after an allocation-reserved slug
-    // (no subdomains, so the routing collision cannot occur)
-    // #when / #then — only RESERVED_TENANT_IDS ('system') 401s at the
-    // token layer; re-conflating the two lists would 401 this host
-    expect(toApprovalActor({ id: 'a', role: 'admin', tenantId })).toEqual({
-      id: 'a',
-      role: 'admin',
-      tenantId,
-    });
-  });
 });
 
-describe('parseActorTokens (tenant required)', () => {
-  it('drops entries lacking an INV-3 tenantId; their tokens 401', () => {
-    // #given — one valid entry, one legacy tenant-less entry, one bad tenant
+describe('parseActorTokens', () => {
+  it('keeps valid actors and drops invalid entries', () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const parsed = parseActorTokens(
       JSON.stringify({
-        good: { id: 'a', role: 'admin', tenantId: 'acme' },
-        legacy: { id: 'b', role: 'admin' },
-        bad: { id: 'c', role: 'admin', tenantId: 'NOPE' },
+        good: { id: 'a', role: 'admin' },
+        reviewer: { id: 'b', role: 'reviewer' },
+        bad: { id: 'c', role: 'root' },
       }),
     );
 
-    // #then
-    expect(parsed.size).toBe(1);
+    expect(parsed.size).toBe(2);
     expect(parsed.get('good')).toEqual({
       id: 'a',
       role: 'admin',
-      tenantId: 'acme',
     });
-    expect(parsed.get('legacy')).toBeUndefined();
+    expect(parsed.get('reviewer')).toEqual({ id: 'b', role: 'reviewer' });
     expect(parsed.get('bad')).toBeUndefined();
-  });
-
-  it("drops a 'system' entry (the TCB's own audit identity) and logs config-error", () => {
-    // #given
-    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    try {
-      // #when
-      const parsed = parseActorTokens(
-        JSON.stringify({
-          tok: { id: 'x', role: 'admin', tenantId: 'system' },
-        }),
-      );
-
-      // #then — empty map (the token 401s), and the drop is loud: a silent
-      // drop is how a broken token map hides until every route 401s
-      expect(parsed.size).toBe(0);
-      expect(errorSpy).toHaveBeenCalledWith(
-        expect.stringContaining('config-error'),
-      );
-    } finally {
-      errorSpy.mockRestore();
-    }
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('config-error'),
+    );
+    errorSpy.mockRestore();
   });
 });
 
@@ -138,6 +97,23 @@ describe('staticTokenVerifier', () => {
     // #when / #then
     expect(await verify.verify('tok')).toEqual(ACTOR);
     expect(await verify.verify('other')).toBeUndefined();
+  });
+
+  it('snapshots configured actors instead of retaining mutable map values', async () => {
+    const source: ApprovalActor = { id: 'ray', role: 'reviewer' };
+    const mutableSource = source as {
+      id: string;
+      role: ApprovalActor['role'];
+    };
+    const verify = staticTokenVerifier(new Map([['tok', source]]));
+
+    mutableSource.id = 'mutated';
+    mutableSource.role = 'admin';
+
+    expect(await verify.verify('tok')).toEqual({
+      id: 'ray',
+      role: 'reviewer',
+    });
   });
 });
 
@@ -159,7 +135,6 @@ describe('hmacVerifier', () => {
       aud: MINT.audience,
       sub: 'ray',
       role: 'admin',
-      tenantId: 'acme',
       exp: Math.floor(Date.now() / 1000) + 3600,
     });
 
@@ -177,7 +152,6 @@ describe('hmacVerifier', () => {
       aud: MINT.audience,
       sub: 'ray',
       role: 'admin',
-      tenantId: 'acme',
       exp: Math.floor(Date.now() / 1000) + 3600,
     });
 
@@ -215,7 +189,6 @@ describe('hmacVerifier', () => {
       aud: MINT.audience,
       sub: 'ray',
       role: 'reviewer',
-      tenantId: 'acme',
       exp: nowSeconds + 3600,
     });
     const key = await crypto.subtle.importKey(
@@ -280,30 +253,6 @@ describe('hmacVerifier', () => {
     });
     expect(await wrongIssuer.verify(token)).toBeUndefined();
     expect(await wrongAudience.verify(token)).toBeUndefined();
-  });
-
-  it('rejects a signed token whose tenant claim violates INV-3', async () => {
-    // #given — correctly signed, but the tenant crossed the JWT boundary
-    // malformed; the verifier is the chokepoint that must catch it
-    const token = await mintHmacToken({
-      ...MINT,
-      actor: { ...ACTOR, tenantId: 'Bad_Tenant' },
-    });
-
-    // #when / #then
-    expect(await verifier().verify(token)).toBeUndefined();
-  });
-
-  it("rejects a signed token claiming the reserved identity 'system'", async () => {
-    // #given — correctly signed; the verifier chokepoint must still refuse
-    // the TCB's own audit identity (cron maintenance attribution)
-    const token = await mintHmacToken({
-      ...MINT,
-      actor: { ...ACTOR, tenantId: 'system' },
-    });
-
-    // #when / #then
-    expect(await verifier().verify(token)).toBeUndefined();
   });
 
   it('rejects a signed token with an unknown role', async () => {

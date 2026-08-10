@@ -44,6 +44,7 @@ export {
   IDLE_BEHAVIORS,
   type IdleBehavior,
   type RunCapConsult,
+  type ScheduleSignalDispatchStore,
   type StartIdleRun,
   type StartIdleRunInput,
   type StartIdleRunResult,

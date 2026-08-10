@@ -6,17 +6,17 @@
 // pubsub-driven schedule-worker loop is deliberately not adopted.
 //
 // TARGET KINDS:
-//  - WORKFLOW targets: mint a fresh INV-1 runId `${tenantId}_${uuid}` and fire
+//  - WORKFLOW targets: mint a fresh path-safe runId and fire
 //    through the host's run-start seam (topology.start / RunnerRuntime.start),
 //    so the run inherits INV-1, the per-leg requestContext derivation, and the
-//    resume ledger. This is the fully-owned path.
+//    snapshot provenance. This is the fully-owned path.
 //  - AGENT targets: `startAgent` routes the claimed target through the host's
 //    runtime-driven thread DO. Without that seam, the tick retains the audited
 //    `agent-target-unsupported` skip and never adopts core's worker.
 //
 // CAP (DL-007, P7): every unattended workflow start consults an INJECTABLE
 // run-cap seam (host-agnostic; the showcase's demo caps are one implementation).
-// A capped tenant yields an audited skip and the schedule stays healthy — the
+// A capped deployment yields an audited skip and the schedule stays healthy — the
 // CAS claim already advanced nextFireAt, so a capped fire is CONSUMED, not
 // retried hot (spike D-S4).
 //
@@ -29,23 +29,31 @@
 // there is normally nothing to collide. buildScheduledLegContext keeps the
 // R-004 order (stored FIRST, runtime-derived LAST) as defense-in-depth for a host
 // that applies the stored context, so a reserved key that ever slipped the strip
-// still LOSES to the runtime value. NOTE the flowsafe DO topology's start seam
-// carries only inputData (the frozen /runs route), so on the DO path stored
-// context is DROPPED entirely (strictly more fail-closed); a local-runtime host
-// can apply the tick-provided requestContext.
+// still LOSES to the runtime value. The DO target resolves this sanitized
+// context from the exact prepared trigger snapshot and RunnerRuntime merges it
+// below provider/runtime-derived values; it never trusts a forwarded body copy.
 
 import { ScheduleInputSchema } from '@mastra/core/schedules';
 import { computeNextFireAt } from '@mastra/core/workflows';
+import type { ResourceOwnershipStore } from '../approval-api/index.js';
 import {
-  assertMintableTenantId,
+  isPathSafeId,
   isReservedExecutionContextKey,
-  mintSaltedId,
   RESERVED_EXECUTION_CONTEXT_KEYS,
+  resolveScheduleStartOwner,
   stripReservedExecutionContext,
-  tenantOwnsSaltedId,
 } from '../do-runner/index.js';
 import { nonnegativeSafeInteger } from '../numeric-config.js';
-import type { Schedule, ScheduleTrigger } from './schedules-d1.js';
+import type {
+  Schedule,
+  ScheduleAgentDispatchReceipt,
+  ScheduleFireClaim,
+  ScheduleTrigger,
+} from './schedules-d1.js';
+import {
+  type ScheduleTargetPolicy,
+  scheduleCreatorRole,
+} from './target-policy.js';
 
 /**
  * Compatibility alias for the former schedule-specific inventory. New code
@@ -94,73 +102,185 @@ export function buildScheduledLegContext(
 export interface ScheduleTickStore {
   listDueSchedules(now: number, limit?: number): Promise<Schedule[]>;
   getSchedule(id: string): Promise<Schedule | null>;
-  updateScheduleNextFire(
-    id: string,
-    expectedNextFireAt: number,
-    newNextFireAt: number,
-    lastFireAt: number,
-    lastRunId: string,
-  ): Promise<boolean>;
+  claimScheduleFire(claim: ScheduleFireClaim): Promise<boolean>;
   recordTrigger(trigger: ScheduleTrigger): Promise<void>;
+  /** Merge reconciliation metadata without replacing target-owned dispatch state. */
+  touchDeferredTrigger(
+    id: string,
+    scheduleId: string,
+    error: string | undefined,
+    metadata: Record<string, unknown>,
+  ): Promise<void>;
+  listDeferredTriggers(limit?: number): Promise<ScheduleTrigger[]>;
 }
 
-/**
- * The run-start seam. A host passes `topology.start` (the DO round-trip — a 3-arg
- * function is assignable, and it drops the 4th `requestContext` arg, the
- * documented fail-closed DO-path behavior) or a local `RunnerRuntime.start`
- * wrapper that applies the stored context. Returns anything carrying the started
- * `runId` (RunSummary satisfies it).
+/** Ownership-bearing workflow dispatch input. A schedule-aware host adapter
+ * must resolve `scheduleId` to its registered owner before starting `runId`.
  */
+export interface ScheduleTickStartInput {
+  scheduleId: string;
+  /** Prepared trigger that authorizes this one fire. */
+  dispatchId: string;
+  workflowId: string;
+  runId: string;
+  inputData: unknown;
+  initialState: unknown;
+  requestContext: Record<string, unknown>;
+}
+
+/** The required schedule-aware workflow run-start seam. */
 export type ScheduleTickStart = (
-  workflowId: string,
-  runId: string,
-  inputData: unknown,
-  requestContext?: Record<string, unknown>,
-) => Promise<{ runId: string }>;
+  input: ScheduleTickStartInput,
+) => Promise<{ runId: string; status?: string }>;
 
 export type AgentScheduleTarget = Extract<
   Schedule['target'],
   { type: 'agent' }
 >;
+export type WorkflowScheduleTarget = Extract<
+  Schedule['target'],
+  { type: 'workflow' }
+>;
+export type ScheduleStartSourceTarget =
+  | WorkflowScheduleTarget
+  | AgentScheduleTarget;
 
 export interface ScheduleTickStartAgentInput {
+  /** The schedule whose owner must own all resources minted by this fire. */
+  scheduleId: string;
+  /** Prepared trigger that authorizes this one fire. */
+  dispatchId: string;
   target: AgentScheduleTarget;
-  tenantId: string;
+  /** Infrastructure-verified tag for audit attribution. */
+  deploymentTag?: string;
   runId: string;
-  /** DO address; ephemeral and memoryless when `threaded` is false. */
+  /** Stable target DO address, including for an unthreaded fire. */
   topologyThreadId: string;
   threaded: boolean;
   entryPath: 'schedule.fire';
   requestContext: Record<string, unknown>;
   streamRequestContext: Record<string, unknown>;
+  /** JSON-safe provider options with authoritative schedule correlation. */
+  providerOptions: Record<string, unknown>;
 }
 
 export type ScheduleTickStartAgent = (
   input: ScheduleTickStartAgentInput,
-) => Promise<{ runId: string }>;
+) => Promise<{ runId: string; status?: string }>;
+
+export interface ScheduleTickSignalAgentInput
+  extends ScheduleTickStartAgentInput {
+  threaded: true;
+}
+
+/** Target-thread signal dispatch. Direct starts are reserved for threadless targets. */
+export type ScheduleTickSignalAgent = (
+  input: ScheduleTickSignalAgentInput,
+) => Promise<ScheduleAgentDispatchReceipt>;
 
 /**
- * The injectable per-tenant run cap: return false to refuse an
+ * Authorize durable persistence requested by a schedule while keeping the
+ * executing principal as SYSTEM. The schedule and its fixed thread/resource
+ * must share one committed registered owner.
+ */
+export async function canPersistScheduledAgentSignal(
+  store: ScheduleStartSource,
+  resources: Pick<ResourceOwnershipStore, 'owner'>,
+  input: {
+    scheduleId: string;
+    dispatchId: string;
+    runId: string;
+    agentId: string;
+    threadId: string;
+    resourceId: string;
+  },
+): Promise<boolean> {
+  return (
+    (await resolveScheduleStartOwner(
+      store,
+      resources,
+      input.scheduleId,
+      input.dispatchId,
+      input.runId,
+      {
+        type: 'agent',
+        mode: 'threaded-signal',
+        agentId: input.agentId,
+        threadId: input.threadId,
+        resourceId: input.resourceId,
+      },
+    )) !== undefined
+  );
+}
+
+export type ScheduleTickDispatchRef =
+  | {
+      scheduleId: string;
+      dispatchId: string;
+      target: 'workflow';
+      workflowId: string;
+      runId: string;
+      /** Canonical target snapshot claimed for this exact fire. */
+      workflowTarget: WorkflowScheduleTarget;
+    }
+  | {
+      scheduleId: string;
+      dispatchId: string;
+      target: 'agent';
+      agentId: string;
+      threadId: string;
+      runId: string;
+      mode: 'start';
+      /** Canonical target snapshot claimed for this exact fire. */
+      agentTarget: AgentScheduleTarget;
+    }
+  | {
+      scheduleId: string;
+      dispatchId: string;
+      target: 'agent';
+      agentId: string;
+      threadId: string;
+      runId: string;
+      mode: 'signal';
+      /** Canonical target needed to retry an indeterminate at-least-once dispatch. */
+      agentTarget: AgentScheduleTarget;
+    };
+
+export interface ScheduleTickStatusResult {
+  runId?: string;
+  status?: string;
+  dispatchReceipt?: ScheduleAgentDispatchReceipt;
+}
+
+export type ScheduleTickStatus = (
+  input: ScheduleTickDispatchRef,
+) => Promise<ScheduleTickStatusResult | undefined>;
+
+/**
+ * The injectable deployment run cap: return false to refuse an
  * unattended start (a capped fire is skipped + audited, the schedule stays
  * healthy). Async so a D1/KV-backed cap fits. Absent ⇒ uncapped.
  */
-export type ScheduleTickRunCap = (
-  tenantId: string,
-) => boolean | Promise<boolean>;
+export type ScheduleTickRunCap = () => boolean | Promise<boolean>;
 
 /** Outcome of one due-schedule fire attempt in a tick pass. */
 export type ScheduleFireOutcome =
   | 'published' // a workflow run was dispatched
+  | 'succeeded' // a threaded schedule woke an idle run
+  | 'delivered' // a threaded schedule joined an active run
+  | 'persisted' // a threaded schedule durably queued its signal
+  | 'discarded' // a threaded schedule deliberately dropped its signal
+  | 'deferred' // dispatch may have committed; status reconciliation will decide
   | 'skipped' // agent start unavailable OR run-capped (deliberate non-fire)
-  | 'failed' // invalid tenant OR the start seam threw
+  | 'failed' // invalid stored target OR the start seam threw
   | 'lost'; // the row advanced, paused, or disappeared before the claim
 
 /** The structured audit event a tick emits per fire attempt (accepted OR not). */
 export interface ScheduleTickAuditEvent {
   type: 'schedule.fire';
   scheduleId: string;
-  /** The resolved tenant, or undefined when the row's metadata.tenantId is invalid. */
-  tenantId?: string;
+  /** Infrastructure-verified deployment tag for audit attribution. */
+  deploymentTag?: string;
   target: 'workflow' | 'agent';
   outcome: ScheduleFireOutcome;
   /** The minted runId for a published fire. */
@@ -178,11 +298,19 @@ export type ScheduleTickAuditSink = (
 export interface ScheduleTickOptions {
   /** The schedules store (a D1SchedulesStorage) the tick claims + records over. */
   store: ScheduleTickStore;
-  /** The run-start seam (topology.start / a local runtime start wrapper). */
+  /** The same catalog policy enforced at create/update, rechecked per fire. */
+  targetPolicy: ScheduleTargetPolicy;
+  /** A schedule-aware run-start adapter that preserves registered ownership. */
   start: ScheduleTickStart;
   /** Runtime-driven agent start. Absent preserves the guarded skip. */
   startAgent?: ScheduleTickStartAgent;
-  /** The per-tenant run cap. Absent means uncapped. */
+  /** Thread-targeted agent signal dispatch with a durable target receipt. */
+  signalAgent?: ScheduleTickSignalAgent;
+  /** Authoritative target status used after a lost/failed dispatch response. */
+  status: ScheduleTickStatus;
+  /** Infrastructure-verified deployment tag for audit attribution. */
+  deploymentTag?: string;
+  /** The deployment run cap. Absent means uncapped. */
   runCap?: ScheduleTickRunCap;
   /** Every fire attempt is audited through this (accepted OR skipped/failed). Absent ⇒ no audit. */
   audit?: ScheduleTickAuditSink;
@@ -203,20 +331,22 @@ export interface ScheduleTickResult {
   fired: number;
   /** Deliberate non-fires (agent start unavailable or run-capped). */
   skipped: number;
-  /** Errors (invalid tenant + start threw); the schedule was still advanced. */
+  /** Errors (invalid target + start threw); the schedule was still advanced. */
   failed: number;
+  /** Dispatches whose commit state is still unknown and will be reconciled. */
+  deferred: number;
+  /** Earlier deferred triggers resolved during this pass. */
+  reconciled: number;
   /** CAS claims lost because the row advanced, paused, or disappeared. */
   lost: number;
 }
 
-function isMintableTenant(tenantId: unknown): tenantId is string {
-  if (typeof tenantId !== 'string') return false;
-  try {
-    assertMintableTenantId(tenantId, 'scheduleTick');
-    return true;
-  } catch {
-    return false;
+function mintPathSafeId(label: string): string {
+  const id = crypto.randomUUID();
+  if (!isPathSafeId(id)) {
+    throw new Error(`${label}: generated id must be URL-path-safe`);
   }
+  return id;
 }
 
 function contextObject(
@@ -229,13 +359,31 @@ function contextObject(
   return value as Record<string, unknown>;
 }
 
-function normalizeAndSanitizeAgentTarget(
+function normalizeAndSanitizeWorkflowTarget(
+  stored: WorkflowScheduleTarget,
+): WorkflowScheduleTarget | undefined {
+  if (!isPathSafeId(stored.workflowId)) return undefined;
+  const requestContext = contextObject(stored.requestContext);
+  if (requestContext === null) return undefined;
+  return {
+    type: 'workflow',
+    workflowId: stored.workflowId,
+    ...(stored.inputData !== undefined ? { inputData: stored.inputData } : {}),
+    ...(stored.initialState !== undefined
+      ? { initialState: stored.initialState }
+      : {}),
+    ...(requestContext !== undefined
+      ? { requestContext: stripReservedScheduleContext(requestContext) }
+      : {}),
+  };
+}
+
+export function normalizeAndSanitizeAgentTarget(
   scheduleId: string,
   stored: AgentScheduleTarget,
 ): AgentScheduleTarget | undefined {
   if (
-    typeof stored.agentId !== 'string' ||
-    stored.agentId.length === 0 ||
+    !isPathSafeId(stored.agentId) ||
     typeof stored.prompt !== 'string' ||
     stored.prompt.length === 0 ||
     (stored.name !== undefined && typeof stored.name !== 'string')
@@ -298,6 +446,21 @@ function normalizeAndSanitizeAgentTarget(
     prompt,
     ...runtimeFields
   } = parsed.data;
+  if (
+    (runtimeFields.threadId !== undefined &&
+      !isPathSafeId(runtimeFields.threadId)) ||
+    (runtimeFields.resourceId !== undefined &&
+      !isPathSafeId(runtimeFields.resourceId)) ||
+    (runtimeFields.threadId !== undefined &&
+      runtimeFields.resourceId === undefined) ||
+    (runtimeFields.threadId === undefined &&
+      (runtimeFields.resourceId !== undefined ||
+        runtimeFields.signalType !== undefined ||
+        runtimeFields.ifActive !== undefined ||
+        runtimeFields.ifIdle !== undefined))
+  ) {
+    return undefined;
+  }
   return {
     type: 'agent',
     agentId,
@@ -307,6 +470,176 @@ function normalizeAndSanitizeAgentTarget(
     ...(legacyContext !== undefined
       ? { requestContext: stripReservedScheduleContext(legacyContext) }
       : {}),
+  };
+}
+
+function agentScheduleProviderOptions(
+  scheduleId: string,
+  target: AgentScheduleTarget,
+): Record<string, unknown> {
+  const base = target.providerOptions ?? {};
+  const mastra =
+    typeof base.mastra === 'object' &&
+    base.mastra !== null &&
+    !Array.isArray(base.mastra)
+      ? (base.mastra as Record<string, unknown>)
+      : {};
+  return {
+    ...base,
+    mastra: {
+      ...mastra,
+      schedule: {
+        scheduleId,
+        ...(target.threadId !== undefined ? { threadId: target.threadId } : {}),
+      },
+    },
+  };
+}
+
+function scheduleTickDispatchRef(
+  value: unknown,
+): ScheduleTickDispatchRef | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  const candidate = value as Record<string, unknown>;
+  if (
+    !isPathSafeId(candidate.scheduleId) ||
+    !isPathSafeId(candidate.dispatchId) ||
+    !isPathSafeId(candidate.runId)
+  ) {
+    return undefined;
+  }
+  if (candidate.target === 'workflow' && isPathSafeId(candidate.workflowId)) {
+    const stored = candidate.workflowTarget;
+    if (
+      stored === null ||
+      typeof stored !== 'object' ||
+      Array.isArray(stored) ||
+      (stored as { type?: unknown }).type !== 'workflow'
+    ) {
+      return undefined;
+    }
+    const workflowTarget = normalizeAndSanitizeWorkflowTarget(
+      stored as WorkflowScheduleTarget,
+    );
+    if (!workflowTarget || workflowTarget.workflowId !== candidate.workflowId) {
+      return undefined;
+    }
+    return {
+      scheduleId: candidate.scheduleId,
+      dispatchId: candidate.dispatchId,
+      target: 'workflow',
+      workflowId: candidate.workflowId,
+      runId: candidate.runId,
+      workflowTarget,
+    };
+  }
+  if (
+    candidate.target !== 'agent' ||
+    !isPathSafeId(candidate.agentId) ||
+    !isPathSafeId(candidate.threadId) ||
+    (candidate.mode !== 'start' && candidate.mode !== 'signal')
+  ) {
+    return undefined;
+  }
+  const stored = candidate.agentTarget;
+  if (
+    stored === null ||
+    typeof stored !== 'object' ||
+    Array.isArray(stored) ||
+    (stored as { type?: unknown }).type !== 'agent'
+  ) {
+    return undefined;
+  }
+  const agentTarget = normalizeAndSanitizeAgentTarget(
+    candidate.scheduleId,
+    stored as AgentScheduleTarget,
+  );
+  if (
+    !agentTarget ||
+    agentTarget.agentId !== candidate.agentId ||
+    (candidate.mode === 'start' && agentTarget.threadId !== undefined) ||
+    (candidate.mode === 'signal' && agentTarget.threadId !== candidate.threadId)
+  ) {
+    return undefined;
+  }
+  return {
+    scheduleId: candidate.scheduleId,
+    dispatchId: candidate.dispatchId,
+    target: 'agent',
+    agentId: candidate.agentId,
+    threadId: candidate.threadId,
+    runId: candidate.runId,
+    mode: candidate.mode,
+    agentTarget,
+  };
+}
+
+/** Narrow prepared-trigger read required by target-side schedule dispatch. */
+export interface ScheduleStartSourceStore {
+  getClaimedScheduleDispatch(
+    scheduleId: string,
+    dispatchId: string,
+    runId: string,
+  ): Promise<ScheduleTrigger | null>;
+}
+
+/** Target-side source consumed structurally by run and thread Durable Objects. */
+export interface ScheduleStartSource {
+  resolveScheduleTarget(
+    scheduleId: string,
+    dispatchId: string,
+    runId: string,
+  ): Promise<ScheduleStartSourceTarget | undefined>;
+}
+
+/**
+ * Resolve the canonical target snapshot bound to one atomically claimed fire.
+ * A reusable schedule id alone never authorizes a start.
+ */
+export function createScheduleStartSource(
+  store: ScheduleStartSourceStore,
+): ScheduleStartSource {
+  return {
+    async resolveScheduleTarget(scheduleId, dispatchId, runId) {
+      const trigger = await store.getClaimedScheduleDispatch(
+        scheduleId,
+        dispatchId,
+        runId,
+      );
+      const metadata = trigger?.metadata;
+      if (
+        trigger?.id !== dispatchId ||
+        trigger.scheduleId !== scheduleId ||
+        trigger.runId !== runId ||
+        trigger.outcome !== 'deferred' ||
+        !metadata ||
+        !['prepared', 'executing', 'settled'].includes(
+          String(metadata.dispatchState),
+        )
+      ) {
+        return undefined;
+      }
+      const ref = scheduleTickDispatchRef(metadata.dispatchRef);
+      if (
+        !ref ||
+        ref.scheduleId !== scheduleId ||
+        ref.dispatchId !== dispatchId ||
+        ref.runId !== runId
+      ) {
+        return undefined;
+      }
+      return ref.target === 'workflow'
+        ? ref.workflowTarget
+        : {
+            ...ref.agentTarget,
+            providerOptions: agentScheduleProviderOptions(
+              scheduleId,
+              ref.agentTarget,
+            ),
+          };
+    },
   };
 }
 
@@ -334,8 +667,264 @@ export function createScheduleTick(
     await options.audit({
       type: 'schedule.fire',
       timestamp: new Date().toISOString(),
+      ...(options.deploymentTag !== undefined
+        ? { deploymentTag: options.deploymentTag }
+        : {}),
       ...event,
     });
+  };
+
+  const triggerMetadata = (
+    extra: Record<string, unknown> = {},
+  ): Record<string, unknown> => ({
+    ...(options.deploymentTag !== undefined
+      ? { deploymentTag: options.deploymentTag }
+      : {}),
+    ...extra,
+  });
+
+  const recordResolvedDispatch = async (
+    ref: ScheduleTickDispatchRef,
+    trigger: ScheduleTrigger,
+    summary: ScheduleTickStatusResult | undefined,
+    result: ScheduleTickResult,
+  ): Promise<void> => {
+    const published = summary !== undefined;
+    const receipt = summary?.dispatchReceipt;
+    const outcome = receipt?.outcome ?? (published ? 'published' : 'failed');
+    const resolvedRunId = receipt?.runId ?? summary?.runId ?? ref.runId;
+    const { error: priorError, ...resolvedTrigger } = trigger;
+    if (!published) result.failed += 1;
+    else if (
+      receipt &&
+      (receipt.outcome === 'persisted' ||
+        receipt.outcome === 'discarded' ||
+        receipt.outcome === 'skipped')
+    ) {
+      result.skipped += 1;
+    } else {
+      result.fired += 1;
+    }
+    try {
+      await store.recordTrigger({
+        ...resolvedTrigger,
+        runId: published ? resolvedRunId : ref.runId,
+        outcome,
+        ...(published ? {} : { error: priorError ?? 'start failed' }),
+        metadata: triggerMetadata({
+          ...(trigger.metadata ?? {}),
+          dispatchRef: ref,
+          reason: published ? 'dispatch-reconciled' : 'start-error-confirmed',
+        }),
+      });
+      await audit({
+        scheduleId: ref.scheduleId,
+        target: ref.target,
+        outcome,
+        runId: resolvedRunId,
+        ...(published ? {} : { reason: 'start-error-confirmed' }),
+      });
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          type: 'schedule-tick-bookkeeping-error',
+          scheduleId: ref.scheduleId,
+          runId: ref.runId,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    }
+  };
+
+  const reconcileDeferred = async (
+    result: ScheduleTickResult,
+  ): Promise<void> => {
+    const pending = await store.listDeferredTriggers(limit);
+    for (const trigger of pending) {
+      const ref = scheduleTickDispatchRef(trigger.metadata?.dispatchRef);
+      if (!ref) {
+        result.failed += 1;
+        result.reconciled += 1;
+        await store.recordTrigger({
+          ...trigger,
+          outcome: 'failed',
+          error: 'stored deferred dispatch is malformed',
+          metadata: triggerMetadata({ reason: 'invalid-deferred-dispatch' }),
+        });
+        continue;
+      }
+      try {
+        const summary = await options.status(ref);
+        result.reconciled += 1;
+        await recordResolvedDispatch(ref, trigger, summary, result);
+      } catch (error) {
+        let pendingError = error;
+        if (
+          ref.target === 'agent' &&
+          ref.mode === 'signal' &&
+          options.signalAgent
+        ) {
+          try {
+            const receipt = await options.signalAgent({
+              scheduleId: ref.scheduleId,
+              target: ref.agentTarget,
+              ...(options.deploymentTag !== undefined
+                ? { deploymentTag: options.deploymentTag }
+                : {}),
+              dispatchId: ref.dispatchId,
+              runId: ref.runId,
+              topologyThreadId: ref.threadId,
+              threaded: true,
+              entryPath: 'schedule.fire',
+              requestContext: ref.agentTarget.requestContext ?? {},
+              streamRequestContext:
+                ref.agentTarget.ifIdle?.streamOptions?.requestContext ?? {},
+              providerOptions: agentScheduleProviderOptions(
+                ref.scheduleId,
+                ref.agentTarget,
+              ),
+            });
+            result.reconciled += 1;
+            await recordResolvedDispatch(
+              ref,
+              trigger,
+              {
+                ...(receipt.runId !== undefined
+                  ? { runId: receipt.runId }
+                  : {}),
+                dispatchReceipt: receipt,
+              },
+              result,
+            );
+            continue;
+          } catch (retryError) {
+            pendingError = retryError;
+          }
+        }
+        result.deferred += 1;
+        const priorAttempts = trigger.metadata?.reconcileAttempts;
+        const attempts =
+          typeof priorAttempts === 'number' &&
+          Number.isSafeInteger(priorAttempts) &&
+          priorAttempts >= 0
+            ? priorAttempts
+            : 0;
+        const priorAfter = trigger.metadata?.reconcileAfter;
+        const reconcileAfter = Math.max(
+          now(),
+          typeof priorAfter === 'number' && Number.isSafeInteger(priorAfter)
+            ? priorAfter + 1
+            : trigger.actualFireAt + 1,
+        );
+        try {
+          await store.touchDeferredTrigger(
+            trigger.id ?? '',
+            trigger.scheduleId,
+            trigger.error,
+            triggerMetadata({
+              reconcileAttempts: attempts + 1,
+              reconcileAfter,
+              statusError:
+                pendingError instanceof Error
+                  ? pendingError.message
+                  : String(pendingError),
+            }),
+          );
+        } catch (bookkeepingError) {
+          console.error(
+            JSON.stringify({
+              type: 'schedule-tick-bookkeeping-error',
+              scheduleId: ref.scheduleId,
+              runId: ref.runId,
+              error:
+                bookkeepingError instanceof Error
+                  ? bookkeepingError.message
+                  : String(bookkeepingError),
+            }),
+          );
+        }
+      }
+    }
+  };
+
+  const reconcileStartError = async (
+    ref: ScheduleTickDispatchRef,
+    trigger: ScheduleTrigger,
+    error: unknown,
+    result: ScheduleTickResult,
+  ): Promise<void> => {
+    try {
+      const summary = await options.status(ref);
+      await recordResolvedDispatch(ref, trigger, summary, result);
+    } catch (statusError) {
+      result.deferred += 1;
+      try {
+        await store.touchDeferredTrigger(
+          trigger.id ?? '',
+          trigger.scheduleId,
+          error instanceof Error ? error.message : String(error),
+          triggerMetadata({
+            dispatchRef: ref,
+            reason: 'dispatch-indeterminate',
+            reconcileAttempts: 0,
+            reconcileAfter: trigger.actualFireAt,
+            statusError:
+              statusError instanceof Error
+                ? statusError.message
+                : String(statusError),
+          }),
+        );
+        await audit({
+          scheduleId: ref.scheduleId,
+          target: ref.target,
+          outcome: 'deferred',
+          runId: ref.runId,
+          reason: 'dispatch-indeterminate',
+        });
+      } catch (bookkeepingError) {
+        console.error(
+          JSON.stringify({
+            type: 'schedule-tick-bookkeeping-error',
+            scheduleId: ref.scheduleId,
+            runId: ref.runId,
+            error:
+              bookkeepingError instanceof Error
+                ? bookkeepingError.message
+                : String(bookkeepingError),
+          }),
+        );
+      }
+    }
+  };
+
+  const prepareDispatch = async (
+    ref: ScheduleTickDispatchRef,
+    trigger: ScheduleFireClaim['trigger'],
+    result: ScheduleTickResult,
+  ): Promise<boolean> => {
+    try {
+      await store.recordTrigger({
+        ...trigger,
+        metadata: triggerMetadata({
+          ...(trigger.metadata ?? {}),
+          dispatchRef: ref,
+          dispatchState: 'prepared',
+          reason: 'dispatch-indeterminate',
+        }),
+      });
+      return true;
+    } catch (error) {
+      result.deferred += 1;
+      console.error(
+        JSON.stringify({
+          type: 'schedule-tick-bookkeeping-error',
+          scheduleId: ref.scheduleId,
+          runId: ref.runId,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+      return false;
+    }
   };
 
   const fireOne = async (
@@ -368,33 +957,41 @@ export function createScheduleTick(
       return;
     }
 
-    // 2. Resolve the tenant from metadata (re-validated INV-3 at fire time).
-    const rawTenant = (schedule.metadata as Record<string, unknown> | undefined)
-      ?.tenantId;
-    const tenantId = isMintableTenant(rawTenant) ? rawTenant : undefined;
+    // 2. Mint the provisional runId before the CAS so lastRunId identifies this
+    // claim even when a cap later consumes it without dispatch.
+    const runId = mintPathSafeId('scheduleTick');
 
-    // 3. Provisional runId — only a workflow target with a valid tenant mints one
-    // (the CAS lastRunId). Agent / capped / invalid fires carry no run.
-    const runId =
-      tenantId !== undefined
-        ? mintSaltedId(tenantId, () => crypto.randomUUID(), 'scheduleTick')
-        : undefined;
-
-    // 4. CAS claim — the exactly-once gate (spike D-S1). The LOSER of two
-    // concurrent ticks gets false here and fires nothing / records no trigger.
+    // 3. CAS claim — the single-claim gate (spike D-S1). The LOSER of two
+    // concurrent ticks gets false here and dispatches nothing. This serializes
+    // the claim only; downstream dispatch remains recoverable/at-least-once.
     // The cap is consulted AFTER the claim (DL-007), so `runId` is minted before
     // we know whether the fire will actually dispatch: on a capped fire the row's
     // `lastRunId` records this CLAIM's id though no run started. The trigger row
     // is the authoritative record of what happened (outcome + its own runId,
     // null for a skip); `lastRunId` is a best-effort last-claim marker, not a
     // guarantee the run was dispatched.
-    const claimed = await store.updateScheduleNextFire(
-      schedule.id,
-      schedule.nextFireAt,
+    const claimTrigger: ScheduleFireClaim['trigger'] = {
+      id: mintPathSafeId('scheduleTrigger'),
+      scheduleId: schedule.id,
+      runId,
+      scheduledFireAt: schedule.nextFireAt,
+      actualFireAt: at,
+      outcome: 'deferred',
+      error: 'dispatch has not reached an authoritative target state',
+      metadata: triggerMetadata({
+        reason: 'dispatch-preparing',
+        reconcileAttempts: 0,
+        reconcileAfter: at,
+      }),
+    };
+    const claimed = await store.claimScheduleFire({
+      scheduleId: schedule.id,
+      expectedNextFireAt: schedule.nextFireAt,
       newNextFireAt,
-      at,
-      runId ?? '',
-    );
+      actualFireAt: at,
+      runId,
+      trigger: claimTrigger,
+    });
     if (!claimed) {
       result.lost += 1;
       const current = await store.getSchedule(schedule.id);
@@ -404,17 +1001,8 @@ export function createScheduleTick(
           ? 'paused'
           : 'concurrent-claim';
       const lostReason = `lost: ${reason}`;
-      await store.recordTrigger({
-        scheduleId: schedule.id,
-        runId: null,
-        scheduledFireAt: schedule.nextFireAt,
-        actualFireAt: at,
-        outcome: 'skipped',
-        metadata: { ...(tenantId ? { tenantId } : {}), reason: lostReason },
-      });
       await audit({
         scheduleId: schedule.id,
-        ...(tenantId ? { tenantId } : {}),
         target: targetType,
         outcome: 'lost',
         reason: lostReason,
@@ -422,52 +1010,39 @@ export function createScheduleTick(
       return;
     }
 
-    // 5. We OWN this fire — nextFireAt is already advanced (consumed, never
+    // 4. We own this fire — nextFireAt is already advanced (consumed, never
     // hot-looped), whatever happens below.
-    const scheduledFireAt = schedule.nextFireAt;
-
-    if (tenantId === undefined) {
-      // Defense-in-depth: the facade always stamps a valid metadata.tenantId, so
-      // this is a tampered/legacy row. Fail closed — no runId can be minted.
+    let targetDecision:
+      | ReturnType<ScheduleTargetPolicy['authorize']>
+      | undefined;
+    try {
+      targetDecision = options.targetPolicy.authorize(
+        schedule.target,
+        scheduleCreatorRole(schedule),
+      );
+    } catch {
+      // A legacy/corrupt row with no creator role is never dispatched.
+    }
+    if (!targetDecision?.allowed) {
+      const reason = targetDecision?.reason ?? 'invalid-creator-role';
       result.failed += 1;
       await store.recordTrigger({
-        scheduleId: schedule.id,
+        ...claimTrigger,
         runId: null,
-        scheduledFireAt,
-        actualFireAt: at,
         outcome: 'failed',
-        metadata: { reason: 'invalid-tenant' },
+        error: reason,
+        metadata: triggerMetadata({ reason }),
       });
       await audit({
         scheduleId: schedule.id,
         target: targetType,
         outcome: 'failed',
-        reason: 'invalid-tenant',
+        reason,
       });
       return;
     }
 
     if (targetType === 'agent') {
-      if (!options.startAgent) {
-        result.skipped += 1;
-        await store.recordTrigger({
-          scheduleId: schedule.id,
-          runId: null,
-          scheduledFireAt,
-          actualFireAt: at,
-          outcome: 'skipped',
-          metadata: { tenantId, reason: 'agent-target-unsupported' },
-        });
-        await audit({
-          scheduleId: schedule.id,
-          tenantId,
-          target: 'agent',
-          outcome: 'skipped',
-          reason: 'agent-target-unsupported',
-        });
-        return;
-      }
-
       const target = normalizeAndSanitizeAgentTarget(
         schedule.id,
         schedule.target,
@@ -475,16 +1050,14 @@ export function createScheduleTick(
       if (!target) {
         result.failed += 1;
         await store.recordTrigger({
-          scheduleId: schedule.id,
+          ...claimTrigger,
           runId: null,
-          scheduledFireAt,
-          actualFireAt: at,
           outcome: 'failed',
-          metadata: { tenantId, reason: 'invalid-agent-target' },
+          error: 'invalid agent target',
+          metadata: triggerMetadata({ reason: 'invalid-agent-target' }),
         });
         await audit({
           scheduleId: schedule.id,
-          tenantId,
           target: 'agent',
           outcome: 'failed',
           reason: 'invalid-agent-target',
@@ -492,27 +1065,23 @@ export function createScheduleTick(
         return;
       }
       if (
-        (target.threadId !== undefined &&
-          !tenantOwnsSaltedId(tenantId, target.threadId)) ||
-        (target.resourceId !== undefined &&
-          !tenantOwnsSaltedId(tenantId, target.resourceId)) ||
+        (target.threadId !== undefined && !isPathSafeId(target.threadId)) ||
+        (target.resourceId !== undefined && !isPathSafeId(target.resourceId)) ||
         (target.threadId !== undefined && target.resourceId === undefined)
       ) {
         result.failed += 1;
         await store.recordTrigger({
-          scheduleId: schedule.id,
+          ...claimTrigger,
           runId: null,
-          scheduledFireAt,
-          actualFireAt: at,
           outcome: 'failed',
-          metadata: { tenantId, reason: 'foreign-memory-id' },
+          error: 'invalid memory id',
+          metadata: triggerMetadata({ reason: 'invalid-memory-id' }),
         });
         await audit({
           scheduleId: schedule.id,
-          tenantId,
           target: 'agent',
           outcome: 'failed',
-          reason: 'foreign-memory-id',
+          reason: 'invalid-memory-id',
         });
         return;
       }
@@ -525,16 +1094,14 @@ export function createScheduleTick(
       ) {
         result.failed += 1;
         await store.recordTrigger({
-          scheduleId: schedule.id,
+          ...claimTrigger,
           runId: null,
-          scheduledFireAt,
-          actualFireAt: at,
           outcome: 'failed',
-          metadata: { tenantId, reason: 'invalid-agent-target' },
+          error: 'invalid agent target',
+          metadata: triggerMetadata({ reason: 'invalid-agent-target' }),
         });
         await audit({
           scheduleId: schedule.id,
-          tenantId,
           target: 'agent',
           outcome: 'failed',
           reason: 'invalid-agent-target',
@@ -542,41 +1109,168 @@ export function createScheduleTick(
         return;
       }
 
-      const allowed = options.runCap ? await options.runCap(tenantId) : true;
-      if (!allowed) {
+      const firedRunId = runId;
+      const threaded = target.threadId !== undefined;
+      const topologyThreadId =
+        target.threadId ?? mintPathSafeId('scheduleThread');
+      const providerOptions = agentScheduleProviderOptions(schedule.id, target);
+
+      if (threaded) {
+        if (!options.signalAgent) {
+          result.skipped += 1;
+          await store.recordTrigger({
+            ...claimTrigger,
+            runId: null,
+            outcome: 'skipped',
+            error: undefined,
+            metadata: triggerMetadata({ reason: 'agent-target-unsupported' }),
+          });
+          await audit({
+            scheduleId: schedule.id,
+            target: 'agent',
+            outcome: 'skipped',
+            reason: 'agent-target-unsupported',
+          });
+          return;
+        }
+        const dispatch: ScheduleTickDispatchRef = {
+          scheduleId: schedule.id,
+          target: 'agent',
+          agentId: target.agentId,
+          threadId: topologyThreadId,
+          runId: firedRunId,
+          mode: 'signal',
+          dispatchId: claimTrigger.id,
+          agentTarget: target,
+        };
+        if (!(await prepareDispatch(dispatch, claimTrigger, result))) return;
+        let receipt: ScheduleAgentDispatchReceipt;
+        try {
+          receipt = await options.signalAgent({
+            scheduleId: schedule.id,
+            target,
+            ...(options.deploymentTag !== undefined
+              ? { deploymentTag: options.deploymentTag }
+              : {}),
+            dispatchId: claimTrigger.id,
+            runId: firedRunId,
+            topologyThreadId,
+            threaded: true,
+            entryPath: 'schedule.fire',
+            requestContext: target.requestContext ?? {},
+            streamRequestContext:
+              target.ifIdle?.streamOptions?.requestContext ?? {},
+            providerOptions,
+          });
+        } catch (error) {
+          await reconcileStartError(
+            dispatch,
+            {
+              ...claimTrigger,
+              error: error instanceof Error ? error.message : String(error),
+              metadata: triggerMetadata({ dispatchRef: dispatch }),
+            },
+            error,
+            result,
+          );
+          return;
+        }
+        if (
+          receipt.outcome === 'persisted' ||
+          receipt.outcome === 'discarded' ||
+          receipt.outcome === 'skipped'
+        ) {
+          result.skipped += 1;
+        } else {
+          result.fired += 1;
+        }
+        try {
+          await store.recordTrigger({
+            ...claimTrigger,
+            runId: receipt.runId ?? null,
+            outcome: receipt.outcome,
+            error: undefined,
+            metadata: triggerMetadata({
+              action: receipt.action,
+              ...(receipt.signalId !== undefined
+                ? { signalId: receipt.signalId }
+                : {}),
+            }),
+          });
+          await audit({
+            scheduleId: schedule.id,
+            target: 'agent',
+            outcome: receipt.outcome,
+            ...(receipt.runId !== undefined ? { runId: receipt.runId } : {}),
+          });
+        } catch (error) {
+          console.error(
+            JSON.stringify({
+              type: 'schedule-tick-bookkeeping-error',
+              scheduleId: schedule.id,
+              runId: receipt.runId ?? firedRunId,
+              error: error instanceof Error ? error.message : String(error),
+            }),
+          );
+        }
+        return;
+      }
+
+      if (!options.startAgent) {
         result.skipped += 1;
         await store.recordTrigger({
-          scheduleId: schedule.id,
+          ...claimTrigger,
           runId: null,
-          scheduledFireAt,
-          actualFireAt: at,
           outcome: 'skipped',
-          metadata: { tenantId, reason: 'run-capped' },
+          error: undefined,
+          metadata: triggerMetadata({ reason: 'agent-target-unsupported' }),
         });
         await audit({
           scheduleId: schedule.id,
-          tenantId,
+          target: 'agent',
+          outcome: 'skipped',
+          reason: 'agent-target-unsupported',
+        });
+        return;
+      }
+      const allowed = options.runCap ? await options.runCap() : true;
+      if (!allowed) {
+        result.skipped += 1;
+        await store.recordTrigger({
+          ...claimTrigger,
+          runId: null,
+          outcome: 'skipped',
+          error: undefined,
+          metadata: triggerMetadata({ reason: 'run-capped' }),
+        });
+        await audit({
+          scheduleId: schedule.id,
           target: 'agent',
           outcome: 'skipped',
           reason: 'run-capped',
         });
         return;
       }
-
-      const firedRunId = runId as string;
-      const threaded = target.threadId !== undefined;
-      const topologyThreadId =
-        target.threadId ??
-        mintSaltedId(
-          tenantId,
-          () => crypto.randomUUID(),
-          'schedule agent thread',
-        );
+      const dispatch: ScheduleTickDispatchRef = {
+        scheduleId: schedule.id,
+        dispatchId: claimTrigger.id,
+        target: 'agent',
+        agentId: target.agentId,
+        threadId: topologyThreadId,
+        runId: firedRunId,
+        mode: 'start',
+        agentTarget: target,
+      };
+      if (!(await prepareDispatch(dispatch, claimTrigger, result))) return;
       let summary: { runId: string };
       try {
         summary = await options.startAgent({
+          scheduleId: schedule.id,
+          dispatchId: claimTrigger.id,
           target,
-          tenantId,
+          ...(options.deploymentTag !== undefined
+            ? { deploymentTag: options.deploymentTag }
+            : {}),
           runId: firedRunId,
           topologyThreadId,
           threaded,
@@ -584,42 +1278,33 @@ export function createScheduleTick(
           requestContext: target.requestContext ?? {},
           streamRequestContext:
             target.ifIdle?.streamOptions?.requestContext ?? {},
+          providerOptions,
         });
       } catch (error) {
-        result.failed += 1;
-        await store.recordTrigger({
-          scheduleId: schedule.id,
-          runId: firedRunId,
-          scheduledFireAt,
-          actualFireAt: at,
-          outcome: 'failed',
-          error: error instanceof Error ? error.message : String(error),
-          metadata: { tenantId },
-        });
-        await audit({
-          scheduleId: schedule.id,
-          tenantId,
-          target: 'agent',
-          outcome: 'failed',
-          runId: firedRunId,
-          reason: 'start-error',
-        });
+        await reconcileStartError(
+          dispatch,
+          {
+            ...claimTrigger,
+            error: error instanceof Error ? error.message : String(error),
+            metadata: triggerMetadata({ dispatchRef: dispatch }),
+          },
+          error,
+          result,
+        );
         return;
       }
       const dispatchedRunId = summary.runId ?? firedRunId;
       result.fired += 1;
       try {
         await store.recordTrigger({
-          scheduleId: schedule.id,
+          ...claimTrigger,
           runId: dispatchedRunId,
-          scheduledFireAt,
-          actualFireAt: at,
           outcome: 'published',
-          metadata: { tenantId },
+          error: undefined,
+          metadata: triggerMetadata(),
         });
         await audit({
           scheduleId: schedule.id,
-          tenantId,
           target: 'agent',
           outcome: 'published',
           runId: dispatchedRunId,
@@ -637,22 +1322,39 @@ export function createScheduleTick(
       return;
     }
 
-    // 6. Workflow target, valid tenant: consult the run cap (DL-007).
-    const allowed = options.runCap ? await options.runCap(tenantId) : true;
+    const target = normalizeAndSanitizeWorkflowTarget(schedule.target);
+    if (!target) {
+      result.failed += 1;
+      await store.recordTrigger({
+        ...claimTrigger,
+        runId: null,
+        outcome: 'failed',
+        error: 'invalid workflow target',
+        metadata: triggerMetadata({ reason: 'invalid-workflow-target' }),
+      });
+      await audit({
+        scheduleId: schedule.id,
+        target: 'workflow',
+        outcome: 'failed',
+        reason: 'invalid-workflow-target',
+      });
+      return;
+    }
+
+    // 5. Workflow target: consult the run cap (DL-007).
+    const allowed = options.runCap ? await options.runCap() : true;
     if (!allowed) {
       // Capped: the schedule stays healthy (already advanced), audited (D-S4).
       result.skipped += 1;
       await store.recordTrigger({
-        scheduleId: schedule.id,
+        ...claimTrigger,
         runId: null,
-        scheduledFireAt,
-        actualFireAt: at,
         outcome: 'skipped',
-        metadata: { tenantId, reason: 'run-capped' },
+        error: undefined,
+        metadata: triggerMetadata({ reason: 'run-capped' }),
       });
       await audit({
         scheduleId: schedule.id,
-        tenantId,
         target: 'workflow',
         outcome: 'skipped',
         reason: 'run-capped',
@@ -661,44 +1363,42 @@ export function createScheduleTick(
     }
 
     // 7. Fire the workflow run (runId is defined by construction here).
-    const firedRunId = runId as string;
-    const target = schedule.target;
-    // Barrier (b): hand the start seam only the NON-reserved stored context.
-    const safeContext = stripReservedScheduleContext(
-      target.type === 'workflow' ? target.requestContext : undefined,
-    );
+    const firedRunId = runId;
+    const dispatch: ScheduleTickDispatchRef = {
+      scheduleId: schedule.id,
+      dispatchId: claimTrigger.id,
+      target: 'workflow',
+      workflowId: target.workflowId,
+      runId: firedRunId,
+      workflowTarget: target,
+    };
+    if (!(await prepareDispatch(dispatch, claimTrigger, result))) return;
     // The try wraps ONLY the start() dispatch. A post-dispatch bookkeeping
     // failure (a transient recordTrigger/audit throw) must NOT be reclassified as
     // a start failure — that would double-count and audit a run that actually ran
     // as `failed`/`start-error`, corrupting the very trail operators rely on.
     let summary: { runId: string };
     try {
-      summary = await start(
-        target.type === 'workflow' ? target.workflowId : '',
-        firedRunId,
-        target.type === 'workflow' ? target.inputData : undefined,
-        safeContext,
-      );
+      summary = await start({
+        scheduleId: schedule.id,
+        dispatchId: claimTrigger.id,
+        workflowId: target.workflowId,
+        runId: firedRunId,
+        inputData: target.inputData,
+        initialState: target.initialState,
+        requestContext: target.requestContext ?? {},
+      });
     } catch (error) {
-      // The dispatch itself threw — no run started.
-      result.failed += 1;
-      await store.recordTrigger({
-        scheduleId: schedule.id,
-        runId: firedRunId,
-        scheduledFireAt,
-        actualFireAt: at,
-        outcome: 'failed',
-        error: error instanceof Error ? error.message : String(error),
-        metadata: { tenantId },
-      });
-      await audit({
-        scheduleId: schedule.id,
-        tenantId,
-        target: 'workflow',
-        outcome: 'failed',
-        runId: firedRunId,
-        reason: 'start-error',
-      });
+      await reconcileStartError(
+        dispatch,
+        {
+          ...claimTrigger,
+          error: error instanceof Error ? error.message : String(error),
+          metadata: triggerMetadata({ dispatchRef: dispatch }),
+        },
+        error,
+        result,
+      );
       return;
     }
     // The run WAS dispatched. Record it as `published` (write-once at dispatch,
@@ -708,16 +1408,14 @@ export function createScheduleTick(
     result.fired += 1;
     try {
       await store.recordTrigger({
-        scheduleId: schedule.id,
+        ...claimTrigger,
         runId: dispatchedRunId,
-        scheduledFireAt,
-        actualFireAt: at,
         outcome: 'published',
-        metadata: { tenantId },
+        error: undefined,
+        metadata: triggerMetadata(),
       });
       await audit({
         scheduleId: schedule.id,
-        tenantId,
         target: 'workflow',
         outcome: 'published',
         runId: dispatchedRunId,
@@ -736,7 +1434,15 @@ export function createScheduleTick(
 
   return async () => {
     if (limit === 0) {
-      return { due: 0, fired: 0, skipped: 0, failed: 0, lost: 0 };
+      return {
+        due: 0,
+        fired: 0,
+        skipped: 0,
+        failed: 0,
+        deferred: 0,
+        reconciled: 0,
+        lost: 0,
+      };
     }
     const at = now();
     const due = await store.listDueSchedules(at, limit);
@@ -745,8 +1451,11 @@ export function createScheduleTick(
       fired: 0,
       skipped: 0,
       failed: 0,
+      deferred: 0,
+      reconciled: 0,
       lost: 0,
     };
+    await reconcileDeferred(result);
     for (const schedule of due) {
       // Per-schedule isolation: one wedged row (an unexpected store/audit throw)
       // must not abort the pass and strand every due schedule behind it.

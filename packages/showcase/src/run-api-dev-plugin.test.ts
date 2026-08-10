@@ -1,7 +1,7 @@
 // Node-testable coverage of the dev host's in-memory live-stream hub
 // (CI-M-008-005) — the ONE genuinely new piece of logic run-api-dev-plugin.ts
 // owns for streaming. Everything else the plugin wires (approvalRouter,
-// runRouter, resetRouter, streamRouter) reuses already-tested flowsafe
+// runRouter and streamRouter) reuses already-tested flowsafe
 // primitives and the SAME composition worker.fetch.e2e.test.ts exercises for
 // the deployed host, so this file targets createInMemoryHub specifically.
 //
@@ -18,41 +18,10 @@ import { describe, expect, it } from 'vitest';
 import { createInMemoryHub } from '../run-api-dev-plugin.js';
 
 describe('createInMemoryHub', () => {
-  it('addresses each tenant to its OWN stub, isolating published events', async () => {
+  it('accumulates deployment events in publish order', async () => {
     // #given
     const hub = createInMemoryHub();
-    const tenantA = hub.namespace.get(hub.namespace.idFromName('demo-a'));
-    const tenantB = hub.namespace.get(hub.namespace.idFromName('demo-b'));
-
-    // #when tenant A's stub receives a published event
-    const response = await tenantA.fetch('http://hub/internal/event', {
-      method: 'POST',
-      body: JSON.stringify({ type: 'created', record: { id: 'apr-1' } }),
-    });
-
-    // #then it is recorded under 'demo-a' only — 'demo-b' stays empty
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true });
-    expect(hub.published.get('demo-a')).toEqual([
-      { type: 'created', record: { id: 'apr-1' } },
-    ]);
-    expect(hub.published.get('demo-b')).toBeUndefined();
-
-    // #then tenant B's own stub records independently
-    await tenantB.fetch('http://hub/internal/event', {
-      method: 'POST',
-      body: JSON.stringify({ type: 'created', record: { id: 'apr-2' } }),
-    });
-    expect(hub.published.get('demo-a')).toHaveLength(1);
-    expect(hub.published.get('demo-b')).toEqual([
-      { type: 'created', record: { id: 'apr-2' } },
-    ]);
-  });
-
-  it('accumulates multiple events for the same tenant in publish order', async () => {
-    // #given
-    const hub = createInMemoryHub();
-    const stub = hub.namespace.get(hub.namespace.idFromName('demo'));
+    const stub = hub.namespace.get(hub.namespace.idFromName('deployment'));
 
     // #when two events publish in sequence
     await stub.fetch('http://hub/internal/event', {
@@ -65,7 +34,7 @@ describe('createInMemoryHub', () => {
     });
 
     // #then both are recorded, in order
-    expect(hub.published.get('demo')).toEqual([
+    expect(hub.published.get('deployment')).toEqual([
       { type: 'created', record: { id: 'first' } },
       { type: 'decided', record: { id: 'second' } },
     ]);
@@ -74,7 +43,7 @@ describe('createInMemoryHub', () => {
   it('answers 426 for anything other than a POST /internal/event (the WS-upgrade path this dev host cannot serve)', async () => {
     // #given
     const hub = createInMemoryHub();
-    const stub = hub.namespace.get(hub.namespace.idFromName('demo'));
+    const stub = hub.namespace.get(hub.namespace.idFromName('deployment'));
 
     // #when / #then a GET /subscribe (what a real WS upgrade would hit)
     const subscribe = await stub.fetch('http://hub/subscribe', {
@@ -87,6 +56,6 @@ describe('createInMemoryHub', () => {
     expect(other.status).toBe(426);
 
     // #then neither call published anything
-    expect(hub.published.get('demo')).toBeUndefined();
+    expect(hub.published.get('deployment')).toBeUndefined();
   });
 });

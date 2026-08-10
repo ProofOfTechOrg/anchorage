@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import {
+  type ActorContext,
   type ApprovalDecision,
   type ApprovalRecord,
   defaultResumeData,
-  type TenantContext,
 } from '../approval-api/index.js';
-import { PATH_SAFE_ID_PATTERN } from '../do-runner/index.js';
+import { isPathSafeId } from '../do-runner/index.js';
 import {
+  type BoundThreadTarget,
+  type BoundThreadTargetValidator,
   createThreadTopology,
+  requireResourceAccess,
   type ThreadNamespaceLike,
   type ThreadTopology,
 } from '../host-kit/index.js';
@@ -26,6 +29,8 @@ export interface AgentThreadStartInput {
   threadId?: string;
   resourceId?: string;
   threaded?: boolean;
+  /** Trusted host-only DO address for an ephemeral unthreaded execution. */
+  topologyThreadId?: string;
   /**
    * Trusted stored context, used by schedule and wake adapters only.
    * The topology strips runtime-owned keys before forwarding it to the host.
@@ -36,6 +41,12 @@ export interface AgentThreadStartInput {
    * Public HTTP starts do not expose either context field.
    */
   streamRequestContext?: Record<string, unknown>;
+  /** Trusted, JSON-safe model provider options from an internal schedule. */
+  providerOptions?: Record<string, unknown>;
+  /** Required provenance for a schedule.fire target. */
+  scheduleId?: string;
+  /** Prepared schedule trigger authorizing this exact run. */
+  dispatchId?: string;
 }
 
 export interface AgentThreadRunRef {
@@ -50,22 +61,40 @@ export interface AgentThreadObserveInput extends AgentThreadRunRef {
 
 export interface AgentThreadTopology {
   start(
-    tenant: TenantContext,
+    context: ActorContext,
     input: AgentThreadStartInput,
   ): Promise<AgentRunEnvelope>;
   status(
-    tenant: TenantContext,
+    context: ActorContext,
     input: AgentThreadRunRef,
   ): Promise<AgentRunEnvelope | undefined>;
   observe(
-    tenant: TenantContext,
+    context: ActorContext,
     input: AgentThreadObserveInput,
   ): Promise<Response>;
   resume(
-    tenant: TenantContext,
+    context: ActorContext,
     record: ApprovalRecord,
     decision: ApprovalDecision,
   ): Promise<AgentRunEnvelope>;
+}
+
+/** Agent topology plus target-side proof for standing memory state. */
+export interface AgentThreadBoundTopology extends AgentThreadTopology {
+  requireBoundThread: BoundThreadTargetValidator;
+}
+
+/**
+ * Host-only dispatch recovery. Unlike public status, the ephemeral thread and
+ * resource may already have been released after a terminal unthreaded run, so
+ * this seam authorizes on the durable run owner before the target host proves
+ * the addressed thread/resource/run correlation from its snapshot.
+ */
+export interface AgentThreadDispatchTopology extends AgentThreadBoundTopology {
+  dispatchStatus(
+    context: ActorContext,
+    input: AgentThreadRunRef,
+  ): Promise<AgentRunEnvelope | undefined>;
 }
 
 async function errorFrom(response: Response): Promise<RunRouteError> {
@@ -84,29 +113,29 @@ async function envelope(response: Response): Promise<AgentRunEnvelope> {
   return (await response.json()) as AgentRunEnvelope;
 }
 
-function ownedThread(tenant: TenantContext, threadId: string): string {
-  if (!PATH_SAFE_ID_PATTERN.test(threadId) || !tenant.ownsMemoryId(threadId)) {
+function validThread(threadId: string): string {
+  if (!isPathSafeId(threadId)) {
     throw new RunRouteError(404, 'run not found');
   }
   return threadId;
 }
 
-function ownedRun(tenant: TenantContext, runId: string): string {
-  if (!PATH_SAFE_ID_PATTERN.test(runId) || !tenant.ownsRun(runId)) {
+function validRun(runId: string): string {
+  if (!isPathSafeId(runId)) {
     throw new RunRouteError(404, 'run not found');
   }
   return runId;
 }
 
 function expectedResource(
-  tenant: TenantContext,
+  context: ActorContext,
   threadId: string,
   supplied?: string,
 ): string {
-  const resourceId = tenant.newResourceId(threadId);
+  const resourceId = context.resourceIdFromKey(threadId);
   if (
     supplied !== undefined &&
-    (supplied !== resourceId || !tenant.ownsMemoryId(supplied))
+    (supplied !== resourceId || !isPathSafeId(supplied))
   ) {
     throw new RunRouteError(404, 'run not found');
   }
@@ -115,11 +144,102 @@ function expectedResource(
 
 export function createAgentThreadTopology<Id>(
   namespace: ThreadNamespaceLike<Id>,
-): AgentThreadTopology {
-  const threads: ThreadTopology = createThreadTopology(namespace);
+  deploymentIdentitySecret: string,
+): AgentThreadDispatchTopology {
+  const threads: ThreadTopology = createThreadTopology(
+    namespace,
+    deploymentIdentitySecret,
+  );
+  const fetchStatus = async (
+    context: ActorContext,
+    input: AgentThreadRunRef,
+    resourceId: string,
+    dispatch: boolean,
+  ): Promise<AgentRunEnvelope | undefined> => {
+    const response = await threads.send(
+      context,
+      input.threadId,
+      `${AGENT_HOST_ROUTE_PREFIX}/runs/${encodeURIComponent(
+        input.agentId,
+      )}/${encodeURIComponent(input.runId)}?resourceId=${encodeURIComponent(
+        resourceId,
+      )}${dispatch ? '&dispatch=1' : ''}`,
+    );
+    if (response.status === 404) return undefined;
+    return envelope(response);
+  };
+  const statusFromHost = async (
+    context: ActorContext,
+    input: AgentThreadRunRef,
+  ): Promise<AgentRunEnvelope | undefined> => {
+    validThread(input.threadId);
+    validRun(input.runId);
+    const resourceId = expectedResource(context, input.threadId);
+    await requireResourceAccess(
+      context,
+      'thread',
+      input.threadId,
+      'read',
+      'run',
+    );
+    await requireResourceAccess(context, 'resource', resourceId, 'read', 'run');
+    await requireResourceAccess(context, 'run', input.runId, 'read', 'run');
+    return fetchStatus(context, input, resourceId, false);
+  };
+  const dispatchStatusFromHost = async (
+    context: ActorContext,
+    input: AgentThreadRunRef,
+  ): Promise<AgentRunEnvelope | undefined> => {
+    validThread(input.threadId);
+    validRun(input.runId);
+    await requireResourceAccess(context, 'run', input.runId, 'read', 'run');
+    const resourceId = expectedResource(context, input.threadId);
+    return fetchStatus(context, input, resourceId, true);
+  };
   return {
-    start: async (tenant, input) => {
+    requireBoundThread: async (context, target: BoundThreadTarget) => {
+      const threadId = validThread(target.threadId);
+      const resourceId = expectedResource(context, threadId, target.resourceId);
+      await requireResourceAccess(
+        context,
+        'thread',
+        threadId,
+        'write',
+        'thread',
+      );
+      await requireResourceAccess(
+        context,
+        'resource',
+        resourceId,
+        'write',
+        'resource',
+      );
+      const response = await threads.send(
+        context,
+        threadId,
+        `${AGENT_HOST_ROUTE_PREFIX}/binding?resourceId=${encodeURIComponent(
+          resourceId,
+        )}${
+          target.agentId === undefined
+            ? ''
+            : `&agentId=${encodeURIComponent(target.agentId)}`
+        }`,
+        { method: 'GET' },
+      );
+      if (!response.ok) throw await errorFrom(response);
+    },
+    start: async (context, input) => {
       const threaded = input.threaded !== false;
+      if (
+        (input.entryPath === 'schedule.fire') !==
+          (input.scheduleId !== undefined) ||
+        (input.entryPath === 'schedule.fire') !==
+          (input.dispatchId !== undefined)
+      ) {
+        throw new RunRouteError(404, 'run not found');
+      }
+      if (input.scheduleId !== undefined) validRun(input.scheduleId);
+      if (input.dispatchId !== undefined) validRun(input.dispatchId);
       if (
         !threaded &&
         (input.threadId !== undefined || input.resourceId !== undefined)
@@ -130,26 +250,43 @@ export function createAgentThreadTopology<Id>(
         );
       }
       const threadId =
-        input.threadId === undefined || !threaded
-          ? tenant.newThreadId()
-          : ownedThread(tenant, input.threadId);
-      const resourceId = expectedResource(tenant, threadId, input.resourceId);
+        !threaded && input.topologyThreadId !== undefined
+          ? validThread(input.topologyThreadId)
+          : input.threadId === undefined || !threaded
+            ? context.newThreadId()
+            : validThread(input.threadId);
+      const resourceId = expectedResource(context, threadId, input.resourceId);
       const runId =
         input.runId === undefined
-          ? tenant.newRunId()
-          : PATH_SAFE_ID_PATTERN.test(input.runId) &&
-              tenant.ownsRun(input.runId)
+          ? context.newRunId()
+          : isPathSafeId(input.runId)
             ? input.runId
             : (() => {
                 throw new RunRouteError(404, 'run not found');
               })();
+      if (input.threadId !== undefined && threaded) {
+        await requireResourceAccess(
+          context,
+          'thread',
+          threadId,
+          'write',
+          'run',
+        );
+        await requireResourceAccess(
+          context,
+          'resource',
+          resourceId,
+          'write',
+          'run',
+        );
+      }
       const safeContext = sanitizeStoredAgentContext({
         ...input.requestContext,
         ...input.streamRequestContext,
       });
       return envelope(
         await threads.send(
-          tenant,
+          context,
           threadId,
           `${AGENT_HOST_ROUTE_PREFIX}/start`,
           {
@@ -164,33 +301,41 @@ export function createAgentThreadTopology<Id>(
               entryPath: input.entryPath,
               threaded,
               safeContext,
+              providerOptions: input.providerOptions,
+              ...(input.scheduleId !== undefined
+                ? { scheduleId: input.scheduleId }
+                : {}),
+              ...(input.dispatchId !== undefined
+                ? { dispatchId: input.dispatchId }
+                : {}),
             }),
           },
         ),
       );
     },
-    status: async (tenant, input) => {
-      ownedThread(tenant, input.threadId);
-      ownedRun(tenant, input.runId);
-      const resourceId = expectedResource(tenant, input.threadId);
-      const response = await threads.send(
-        tenant,
+    status: statusFromHost,
+    dispatchStatus: dispatchStatusFromHost,
+    observe: async (context, input) => {
+      validThread(input.threadId);
+      validRun(input.runId);
+      const resourceId = expectedResource(context, input.threadId);
+      await requireResourceAccess(
+        context,
+        'thread',
         input.threadId,
-        `${AGENT_HOST_ROUTE_PREFIX}/runs/${encodeURIComponent(
-          input.agentId,
-        )}/${encodeURIComponent(input.runId)}?resourceId=${encodeURIComponent(
-          resourceId,
-        )}`,
+        'read',
+        'run',
       );
-      if (response.status === 404) return undefined;
-      return envelope(response);
-    },
-    observe: async (tenant, input) => {
-      ownedThread(tenant, input.threadId);
-      ownedRun(tenant, input.runId);
-      const resourceId = expectedResource(tenant, input.threadId);
+      await requireResourceAccess(
+        context,
+        'resource',
+        resourceId,
+        'read',
+        'run',
+      );
+      await requireResourceAccess(context, 'run', input.runId, 'read', 'run');
       const response = await threads.send(
-        tenant,
+        context,
         input.threadId,
         `${AGENT_HOST_ROUTE_PREFIX}/runs/${encodeURIComponent(
           input.agentId,
@@ -201,17 +346,35 @@ export function createAgentThreadTopology<Id>(
       if (!response.ok) throw await errorFrom(response);
       return response;
     },
-    resume: async (tenant, record, decision) => {
+    resume: async (context, record, decision) => {
       const target = record.resumeTarget;
       if (target?.kind !== 'agent-thread') {
         throw new RunRouteError(409, 'agent approval has no resumable target');
       }
-      ownedThread(tenant, target.threadId);
-      ownedRun(tenant, record.runId);
-      expectedResource(tenant, target.threadId, target.resourceId);
+      validThread(target.threadId);
+      validRun(record.runId);
+      expectedResource(context, target.threadId, target.resourceId);
+      await requireResourceAccess(
+        context,
+        'thread',
+        target.threadId,
+        'write',
+        'run',
+      );
+      await requireResourceAccess(
+        context,
+        'resource',
+        target.resourceId,
+        'write',
+        'run',
+      );
+      await requireResourceAccess(context, 'run', record.runId, 'write', 'run');
+      if (!record.decidedBy) {
+        throw new RunRouteError(409, 'approval has no decision actor');
+      }
       return envelope(
         await threads.send(
-          tenant,
+          context,
           target.threadId,
           `${AGENT_HOST_ROUTE_PREFIX}/resume`,
           {
@@ -225,6 +388,7 @@ export function createAgentThreadTopology<Id>(
               step: record.stepPath,
               resumeData: defaultResumeData(record, decision),
               entryPath: 'approval.resume',
+              requestedBy: record.decidedBy,
             }),
           },
         ),

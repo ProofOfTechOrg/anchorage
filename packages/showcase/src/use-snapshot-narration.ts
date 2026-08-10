@@ -52,8 +52,8 @@ export function useSnapshotNarration(
       if (next.summary) {
         // ACCEPTED DEVIATION from "never derive one poll stream from the
         // other": these hints read the APPROVAL records to refine RUN
-        // narration. The root cause is a server wire gap — the resume ledger
-        // (resumeCount) drops at terminal status and fingerprints cover only
+        // narration. The root cause is a server wire gap — resumeCount and
+        // fingerprints cover only
         // CURRENT suspensions — so the summary alone cannot prove a past
         // gate. The hints only refine labels/suppress false lines; event
         // KEYS stay run-scoped, so dedup is unaffected. Known residual: if
