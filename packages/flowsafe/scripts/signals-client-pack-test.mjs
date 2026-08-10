@@ -11,6 +11,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { assertAttwEsmPackage } from './attw-pack-check.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const temporary = mkdtempSync(join(tmpdir(), 'flowsafe-signals-client-'));
@@ -38,6 +39,15 @@ try {
     throw new Error('pnpm pack returned no archive');
   }
   const archive = join(temporary, packedName);
+  run('pnpm', [
+    '--workspace-root',
+    'exec',
+    'publint',
+    'run',
+    archive,
+    '--strict',
+  ]);
+  assertAttwEsmPackage(archive, root);
   run('tar', ['-xf', archive], temporary);
 
   const consumer = join(temporary, 'consumer');

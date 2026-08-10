@@ -3,8 +3,8 @@
 // showcase reference connector. Webhook-only: GitHub pushes events, so there is
 // no poll seam. Its signature scheme is GitHub's `X-Hub-Signature-256`
 // (`sha256=<hex HMAC-SHA256(secret, rawBody)>`), verified over the RAW request
-// bytes BEFORE any parse and CONSTANT-TIME via `crypto.subtle.verify` (the same
-// WebCrypto primitive host-kit's verifier uses — never a hand-rolled compare).
+// bytes BEFORE any parse and CONSTANT-TIME via `crypto.subtle.verify`, never a
+// hand-rolled comparison.
 //
 // It mints NO capability (P8): a GitHub event is untrusted context that lands in
 // a thread's inbox as a notification, never an approval. The secret is a
@@ -24,19 +24,15 @@ const encoder = new TextEncoder();
 
 /** The GitHub delivery-signature header (lowercased; `Headers.get` is case-insensitive). */
 const SIGNATURE_HEADER = 'x-hub-signature-256';
-const SIGNATURE_PREFIX = 'sha256=';
 /** SHA-256 digest length in bytes — a signature of any other length is malformed. */
 const SHA256_BYTES = 32;
+const SIGNATURE_PATTERN = /^sha256=([0-9a-fA-F]{64})$/;
 
-/** Decode a lowercase/uppercase hex string to bytes, or undefined if malformed. */
-function hexToBytes(hex: string): Uint8Array | undefined {
-  if (hex.length === 0 || hex.length % 2 !== 0) return undefined;
-  const bytes = new Uint8Array(hex.length / 2);
+/** Decode the already-validated 64-character digest. */
+function hexToBytes(hex: string): Uint8Array {
+  const bytes = new Uint8Array(SHA256_BYTES);
   for (let index = 0; index < bytes.length; index += 1) {
-    const byte = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
-    // parseInt tolerates trailing garbage; Number.isNaN catches non-hex.
-    if (Number.isNaN(byte)) return undefined;
-    bytes[index] = byte;
+    bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
   }
   return bytes;
 }
@@ -53,10 +49,9 @@ export async function verifyGithubSignature(
   secret: string,
 ): Promise<boolean> {
   const header = headers.get(SIGNATURE_HEADER);
-  if (header === null || !header.startsWith(SIGNATURE_PREFIX)) return false;
-  const signature = hexToBytes(header.slice(SIGNATURE_PREFIX.length));
-  if (signature === undefined || signature.length !== SHA256_BYTES)
-    return false;
+  const match = header?.match(SIGNATURE_PATTERN);
+  if (!match?.[1]) return false;
+  const signature = hexToBytes(match[1]);
   // Fail closed on an empty secret rather than importing a zero-length HMAC key:
   // Node's WebCrypto THROWS on it, and a runtime that ACCEPTS one would verify
   // against a known (empty) key — a trivial forgery. The webhook route already

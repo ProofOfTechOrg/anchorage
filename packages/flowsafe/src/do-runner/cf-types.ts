@@ -135,8 +135,8 @@ export interface HubDurableObjectState {
 // subsets above, so a host passes env.DB / ctx straight through with no
 // adapter. Type-only (erased at build; neither this import nor the
 // non-exported aliases below reach the emitted .d.ts, so consumers pull no
-// workers-types dependency) — the same technique artifacts/index.ts uses to
-// pin R2Bucket against ArtifactBucket.
+// workers-types dependency). The R2 seam uses the same technique in the
+// version-specific typecheck fixtures under test-support and scripts.
 type AssertTrue<T extends true> = T;
 type _D1DatabaseSatisfiesBinding = AssertTrue<
   D1Database extends D1DatabaseBinding ? true : false

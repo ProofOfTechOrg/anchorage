@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// D1RateLimitStore against REAL SQLite via node:sqlite (D1 is SQLite), so the
-// atomic UPSERT ... RETURNING count is exercised for real, not mocked. The
+// D1RateLimitStore against node:sqlite as a fast SQL facsimile. These are
+// non-fidelity unit tests: the dedicated worker project exercises the atomic
+// UPSERT ... RETURNING count against D1 inside workerd. The
 // openSqlite()/d1Like() fixture is copied from d1-idempotency-store.test.ts
 // on purpose: breakwater must not import across packages for tests.
 
@@ -57,7 +58,7 @@ function d1Like(db: SqliteDatabase): RateLimitDatabase {
 const T0 = Date.parse('2026-07-07T10:00:00.000Z');
 const MINUTE = 60_000;
 
-describe('D1RateLimitStore', () => {
+describe('D1RateLimitStore (Node SQLite facsimile)', () => {
   it('counts calls within one fixed window', async () => {
     // #given
     const store = new D1RateLimitStore(d1Like(openSqlite()));

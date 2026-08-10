@@ -8,7 +8,7 @@ import type { Mastra } from '@mastra/core/mastra';
 import { createEmptyWorkflowSnapshot } from '@mastra/core/storage';
 import { describe, expect, it } from 'vitest';
 
-import { d1DatabaseLike, openSqlite } from '../../test-support/sqlite.js';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import { createD1Storage } from '../do-runner/index.js';
 import {
   backgroundTasksStore,
@@ -37,12 +37,12 @@ describe('backgroundTasksStore — fail-closed accessor', () => {
 
 describe('D1 execution domains', () => {
   it('constructs deployment-wide background-task domains', () => {
-    const binding = d1DatabaseLike(openSqlite()) as never;
+    const binding = sqliteUnitDatabase(openSqlite()) as never;
     expect(() => createBackgroundTaskD1Domains({ binding })).not.toThrow();
   });
 
   it('serializes partial workflow updates and reports concurrent-update support', async () => {
-    const binding = d1DatabaseLike(openSqlite()) as never;
+    const binding = sqliteUnitDatabase(openSqlite()) as never;
     const storage = createD1Storage({
       binding,
       domains: createBackgroundTaskD1Domains({
@@ -90,7 +90,7 @@ describe('D1 execution domains', () => {
   });
 
   it('paginates deployment tasks and cascades internal snapshot deletion', async () => {
-    const binding = d1DatabaseLike(openSqlite()) as never;
+    const binding = sqliteUnitDatabase(openSqlite()) as never;
     const storage = createD1Storage({
       binding,
       domains: createBackgroundTaskD1Domains({

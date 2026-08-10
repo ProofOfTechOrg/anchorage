@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it } from 'vitest';
 
-import { d1DatabaseLike, openSqlite } from '../../test-support/sqlite.js';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   assertDeploymentIdentity,
   assertDeploymentIdentitySecret,
@@ -21,7 +21,7 @@ import {
 const DEPLOYMENT_IDENTITY_SECRET = 'test-deployment-identity-secret-0001';
 
 function sqliteDatabase(): DeploymentIdentityDatabase {
-  return d1DatabaseLike(openSqlite()) as DeploymentIdentityDatabase;
+  return sqliteUnitDatabase(openSqlite()) as DeploymentIdentityDatabase;
 }
 
 function interceptSentinelRead(
@@ -250,6 +250,8 @@ describe('deployment identity provisioning', () => {
 
   it.each([
     '_cf_customer_data',
+    '_cf_METADATA_backup',
+    '_cf_metadata',
     'sqliteX_application',
   ])('does not treat near-system table %s as D1-owned', async (table) => {
     const db = sqliteDatabase();
@@ -259,16 +261,19 @@ describe('deployment identity provisioning', () => {
     );
   });
 
-  it('allows the exact D1-owned _cf_KV table', async () => {
+  it.each([
+    '_cf_KV',
+    '_cf_METADATA',
+  ])('allows the exact D1-owned %s table', async (table) => {
     const db = sqliteDatabase();
-    await db.prepare('CREATE TABLE _cf_KV (key TEXT PRIMARY KEY)').run();
+    await db.prepare(`CREATE TABLE ${table} (key TEXT PRIMARY KEY)`).run();
     await seedDeploymentIdentity(db, 'acme');
     await expect(readDeploymentIdentity(db)).resolves.toBe('acme');
   });
 
   it('refuses an application table created between the initial scan and ownership insert', async () => {
     const sqlite = openSqlite();
-    const base = d1DatabaseLike(sqlite) as DeploymentIdentityDatabase;
+    const base = sqliteUnitDatabase(sqlite) as DeploymentIdentityDatabase;
     let injected = false;
     const racing: DeploymentIdentityDatabase = {
       prepare(query) {

@@ -7,7 +7,7 @@ import {
   readDeploymentIdentity,
   seedDeploymentIdentity,
 } from '../src/do-runner/deployment-identity.js';
-import { d1DatabaseLike, openSqlite } from '../test-support/sqlite.js';
+import { openSqlite, sqliteUnitDatabase } from '../test-support/sqlite.js';
 import {
   parseProvisioningArguments,
   provisionDeploymentIdentity,
@@ -58,6 +58,7 @@ function databaseQuery(initialTables = [], ownerTag = 'acme') {
           (row) =>
             row.name !== 'flowsafe_deployment' &&
             row.name !== '_cf_KV' &&
+            row.name !== '_cf_METADATA' &&
             !row.name.startsWith('sqlite_'),
         );
         if (blocking.length === 0) {
@@ -191,26 +192,26 @@ describe('deployment identity provisioning CLI', () => {
     const sqlite = openSqlite();
     await provisionDeploymentIdentity(OPTIONS, sqliteQuery(sqlite));
 
-    await expect(readDeploymentIdentity(d1DatabaseLike(sqlite))).resolves.toBe(
-      'acme',
-    );
+    await expect(
+      readDeploymentIdentity(sqliteUnitDatabase(sqlite)),
+    ).resolves.toBe('acme');
   });
 
   it('keeps the runtime and packed-CLI adapters on the same protocol schema and idempotency path', async () => {
     const runtimeSqlite = openSqlite();
     const cliSqlite = openSqlite();
-    await seedDeploymentIdentity(d1DatabaseLike(runtimeSqlite), 'acme');
+    await seedDeploymentIdentity(sqliteUnitDatabase(runtimeSqlite), 'acme');
     await provisionDeploymentIdentity(OPTIONS, sqliteQuery(cliSqlite));
 
     expect(sentinelSnapshot(runtimeSqlite)).toEqual(
       sentinelSnapshot(cliSqlite),
     );
     await provisionDeploymentIdentity(OPTIONS, sqliteQuery(runtimeSqlite));
-    await seedDeploymentIdentity(d1DatabaseLike(cliSqlite), 'acme');
-    expect(await readDeploymentIdentity(d1DatabaseLike(runtimeSqlite))).toBe(
-      'acme',
-    );
-    expect(await readDeploymentIdentity(d1DatabaseLike(cliSqlite))).toBe(
+    await seedDeploymentIdentity(sqliteUnitDatabase(cliSqlite), 'acme');
+    expect(
+      await readDeploymentIdentity(sqliteUnitDatabase(runtimeSqlite)),
+    ).toBe('acme');
+    expect(await readDeploymentIdentity(sqliteUnitDatabase(cliSqlite))).toBe(
       'acme',
     );
   });
@@ -234,7 +235,7 @@ describe('deployment identity provisioning CLI', () => {
     cliSqlite.exec(ddl);
 
     const runtimeError = await rejectedError(() =>
-      seedDeploymentIdentity(d1DatabaseLike(runtimeSqlite), 'acme'),
+      seedDeploymentIdentity(sqliteUnitDatabase(runtimeSqlite), 'acme'),
     );
     const cliError = await rejectedError(() =>
       provisionDeploymentIdentity(OPTIONS, sqliteQuery(cliSqlite)),
@@ -266,6 +267,8 @@ describe('deployment identity provisioning CLI', () => {
 
   it.each([
     '_cf_customer_data',
+    '_cf_METADATA_backup',
+    '_cf_metadata',
     'sqliteX_application',
   ])('refuses near-system application table %s', async (name) => {
     const fake = databaseQuery([{ name, sql: 'CREATE' }]);
@@ -274,8 +277,11 @@ describe('deployment identity provisioning CLI', () => {
     ).rejects.toThrow(/provision a fresh database/);
   });
 
-  it('allows the exact D1-owned _cf_KV table', async () => {
-    const fake = databaseQuery([{ name: '_cf_KV', sql: 'CREATE' }]);
+  it.each([
+    '_cf_KV',
+    '_cf_METADATA',
+  ])('allows the exact D1-owned %s table', async (name) => {
+    const fake = databaseQuery([{ name, sql: 'CREATE' }]);
     await provisionDeploymentIdentity(OPTIONS, fake.query);
     expect(fake.mutations).toHaveLength(2);
   });
@@ -296,7 +302,7 @@ describe('deployment identity provisioning CLI', () => {
   it('preserves the scan-to-insert race refusal through both execution adapters', async () => {
     const runtimeSqlite = openSqlite();
     const cliSqlite = openSqlite();
-    const runtimeDb = d1DatabaseLike(runtimeSqlite);
+    const runtimeDb = sqliteUnitDatabase(runtimeSqlite);
     let runtimeRaced = false;
     const racingRuntime = {
       prepare(statement) {
@@ -342,7 +348,7 @@ describe('deployment identity provisioning CLI', () => {
     expect(cliError.message).toMatch(/raced_application/);
     await expect(readDeploymentIdentity(runtimeDb)).resolves.toBeUndefined();
     await expect(
-      readDeploymentIdentity(d1DatabaseLike(cliSqlite)),
+      readDeploymentIdentity(sqliteUnitDatabase(cliSqlite)),
     ).resolves.toBeUndefined();
   });
 

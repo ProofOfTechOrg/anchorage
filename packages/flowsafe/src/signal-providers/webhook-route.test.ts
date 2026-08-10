@@ -96,6 +96,35 @@ function webhookRequest(sig: string, body: unknown): Request {
 }
 
 describe('createWebhookRouter — verify before parse', () => {
+  it('rejects authentic invalid UTF-8 before payload policy runs', async () => {
+    const extractResourceIds = vi.fn(() => []);
+    const router = createWebhookRouter({
+      providers: {
+        test: testProvider({
+          verifyWebhookSignature: () => true,
+          extractResourceIds,
+        }),
+      },
+      subscriptions: new InMemorySubscriptionStoreFactory().store(),
+      topology: createThreadTopology(stubThreads().namespace),
+      secretForProvider: () => 'secret',
+    });
+    const response = await router(
+      new Request('http://host/api/signal-providers/test/webhook', {
+        method: 'POST',
+        body: new Uint8Array([
+          0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xff, 0x22, 0x7d,
+        ]),
+      }),
+    );
+
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      error: 'a JSON body is required',
+    });
+    expect(extractResourceIds).not.toHaveBeenCalled();
+  });
+
   it.each([
     { maxBodyBytes: -1 },
     { maxBodyBytes: 1.5 },

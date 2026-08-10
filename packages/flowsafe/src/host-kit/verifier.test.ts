@@ -4,10 +4,12 @@
 // hmacVerifier is exercised against real crypto.subtle round-trips via
 // mintHmacToken — no mocked signatures.
 
+import { SignJWT } from 'jose';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { ApprovalActor } from '../approval-api/index.js';
 import { parseActorTokens } from './bearer-auth.js';
+import { mintStreamTicket } from './stream-ticket.js';
 import {
   base64UrlEncode,
   hmacVerifier,
@@ -172,6 +174,26 @@ describe('hmacVerifier', () => {
     ).toBeUndefined();
   });
 
+  it.each([
+    ['missing', undefined],
+    ['wrong', 'flowsafe-stream-ticket+jwt'],
+  ])('rejects a %s protected typ', async (_label, typ) => {
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const token = await new SignJWT({ role: ACTOR.role })
+      .setProtectedHeader({
+        alg: 'HS256',
+        kid: MINT.kid,
+        ...(typ ? { typ } : {}),
+      })
+      .setIssuer(MINT.issuer)
+      .setAudience(MINT.audience)
+      .setSubject(ACTOR.id)
+      .setExpirationTime(nowSeconds + MINT.ttlSeconds)
+      .sign(encoder.encode(MINT.secret));
+
+    expect(await verifier().verify(token)).toBeUndefined();
+  });
+
   it('rejects an unknown kid (plain Map lookup, no interpretation)', async () => {
     // #given
     const token = await mintHmacToken({ ...MINT, kid: '../etc/passwd' });
@@ -222,7 +244,7 @@ describe('hmacVerifier', () => {
     expect(await twoKeys.verify(token)).toBeUndefined();
   });
 
-  it('rejects an expired token and one not yet valid', async () => {
+  it('rejects at the exact expiry boundary', async () => {
     // #given — minted at T, 60s ttl
     const t0 = 1_751_000_000_000;
     const token = await mintHmacToken({
@@ -233,7 +255,33 @@ describe('hmacVerifier', () => {
 
     // #when / #then
     expect(await verifier(() => t0 + 30_000).verify(token)).toEqual(ACTOR);
-    expect(await verifier(() => t0 + 61_000).verify(token)).toBeUndefined();
+    expect(await verifier(() => t0 + 60_000).verify(token)).toBeUndefined();
+  });
+
+  it('rejects before nbf and accepts at its exact boundary', async () => {
+    const t0 = 1_751_000_000_000;
+    const nowSeconds = Math.floor(t0 / 1000);
+    const token = await new SignJWT({ role: ACTOR.role })
+      .setProtectedHeader({ alg: 'HS256', typ: 'JWT', kid: MINT.kid })
+      .setIssuer(MINT.issuer)
+      .setAudience(MINT.audience)
+      .setSubject(ACTOR.id)
+      .setNotBefore(nowSeconds + 60)
+      .setExpirationTime(nowSeconds + 120)
+      .sign(encoder.encode(MINT.secret));
+
+    expect(await verifier(() => t0 + 59_000).verify(token)).toBeUndefined();
+    expect(await verifier(() => t0 + 60_000).verify(token)).toEqual(ACTOR);
+  });
+
+  it('rejects a stream ticket even when the signing secret is reused', async () => {
+    const token = await mintStreamTicket({
+      secret: MINT.secret,
+      channel: 'hub',
+      actor: ACTOR,
+    });
+
+    expect(await verifier().verify(token)).toBeUndefined();
   });
 
   it('rejects wrong issuer and wrong audience', async () => {

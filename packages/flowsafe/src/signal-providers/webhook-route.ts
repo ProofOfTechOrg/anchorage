@@ -291,7 +291,11 @@ export function createWebhookRouter(
       // Parse — only now that the payload is proven authentic.
       let payload: unknown;
       try {
-        payload = JSON.parse(new TextDecoder().decode(rawBody));
+        payload = JSON.parse(
+          new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(
+            rawBody,
+          ),
+        );
       } catch {
         await auditWebhook({
           providerId,

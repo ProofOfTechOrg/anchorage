@@ -20,6 +20,10 @@ export const DEPLOYMENT_SENTINEL_COLUMNS = Object.freeze([
 
 const SENTINEL_SQL_PATTERN =
   /^create table (?:if not exists )?flowsafe_deployment\s*\(\s*id integer primary key check\s*\(\s*id\s*=\s*1\s*\)\s*,\s*tenant_tag text not null\s*,\s*provisioned_at text not null\s*\)$/i;
+const D1_OWNED_INTERNAL_TABLES = Object.freeze(['_cf_KV', '_cf_METADATA']);
+const D1_OWNED_TABLE_EXCLUSIONS = D1_OWNED_INTERNAL_TABLES.map(
+  (name) => `           AND name <> '${name}'`,
+).join('\n');
 
 const SCAN_TABLES = Object.freeze({
   mode: 'read',
@@ -74,7 +78,7 @@ export function deploymentIdentityApplicationTables(rows) {
         typeof name === 'string' &&
         name !== DEPLOYMENT_SENTINEL_TABLE &&
         !name.startsWith('sqlite_') &&
-        name !== '_cf_KV',
+        !D1_OWNED_INTERNAL_TABLES.includes(name),
     )
     .sort();
 }
@@ -126,7 +130,7 @@ function conditionalOwnershipInsert(tag, provisionedAt) {
          SELECT 1 FROM sqlite_schema
          WHERE type = 'table'
            AND name <> '${DEPLOYMENT_SENTINEL_TABLE}'
-           AND name <> '_cf_KV'
+${D1_OWNED_TABLE_EXCLUSIONS}
            AND name NOT GLOB 'sqlite_*'
        )`,
     bindings: [tag, provisionedAt],

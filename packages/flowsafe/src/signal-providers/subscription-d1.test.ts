@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it } from 'vitest';
 
-import { d1DatabaseLike, openSqlite } from '../../test-support/sqlite.js';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import type { SignalDatabase } from '../signals/d1-shared.js';
 import {
   D1SubscriptionStoreFactory,
@@ -23,7 +23,7 @@ function counter(): () => string {
 
 function d1Factory(): D1SubscriptionStoreFactory {
   return new D1SubscriptionStoreFactory(
-    d1DatabaseLike(openSqlite()) as SignalDatabase,
+    sqliteUnitDatabase(openSqlite()) as SignalDatabase,
     { uuid: counter() },
   );
 }
@@ -414,7 +414,7 @@ describe('deployment-wide subscription schema', () => {
       )
       .run();
     const store = new D1SubscriptionStoreFactory(
-      d1DatabaseLike(sqlite) as SignalDatabase,
+      sqliteUnitDatabase(sqlite) as SignalDatabase,
     ).store();
 
     await expect(store.listForProvider('github')).rejects.toThrow(
@@ -425,7 +425,7 @@ describe('deployment-wide subscription schema', () => {
   it('uses stable index names for a fresh deployment schema', async () => {
     const sqlite = openSqlite();
     const store = new D1SubscriptionStoreFactory(
-      d1DatabaseLike(sqlite) as SignalDatabase,
+      sqliteUnitDatabase(sqlite) as SignalDatabase,
     ).store();
     await store.listForProvider('github');
 

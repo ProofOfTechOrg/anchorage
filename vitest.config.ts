@@ -5,6 +5,10 @@ import { defineConfig } from 'vitest/config';
 // with unified reporting and cross-package watch.
 export default defineConfig({
   test: {
-    projects: ['packages/*/vitest.config.ts'],
+    projects: [
+      'packages/*/vitest.config.ts',
+      'vitest.*-workers.config.*',
+      'vitest.flowsafe-harness.config.ts',
+    ],
   },
 });

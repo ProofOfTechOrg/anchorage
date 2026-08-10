@@ -13,6 +13,7 @@
 // this module validates the role before an ApprovalActor exists. Fail closed:
 // anything malformed verifies to `undefined` (a 401), never to a default actor.
 
+import { jwtVerify, SignJWT } from 'jose';
 import {
   type ApprovalActor,
   canonicalApprovalActor,
@@ -60,46 +61,7 @@ export interface HmacVerifierOptions {
   now?: () => number;
 }
 
-interface JwtHeader {
-  alg?: unknown;
-  kid?: unknown;
-}
-
-interface JwtClaims {
-  iss?: unknown;
-  aud?: unknown;
-  exp?: unknown;
-  nbf?: unknown;
-  sub?: unknown;
-  role?: unknown;
-}
-
 const encoder = new TextEncoder();
-
-function base64UrlDecodeBytes(segment: string): Uint8Array | undefined {
-  const normalized = segment.replace(/-/g, '+').replace(/_/g, '/');
-  const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
-  try {
-    const binary = atob(padded);
-    const bytes = new Uint8Array(binary.length);
-    for (let index = 0; index < binary.length; index += 1) {
-      bytes[index] = binary.charCodeAt(index);
-    }
-    return bytes;
-  } catch {
-    return undefined;
-  }
-}
-
-function base64UrlDecodeJson(segment: string): unknown {
-  const bytes = base64UrlDecodeBytes(segment);
-  if (!bytes) return undefined;
-  try {
-    return JSON.parse(new TextDecoder().decode(bytes));
-  } catch {
-    return undefined;
-  }
-}
 
 export function base64UrlEncode(bytes: Uint8Array): string {
   let binary = '';
@@ -147,64 +109,46 @@ async function importHmacKey(
  *
  * The algorithm is PINNED: only `alg: "HS256"` verifies — `none` and every
  * negotiated value are rejected before any cryptography runs, so a token
- * cannot choose its own verification scheme. Signature comparison goes
- * through crypto.subtle.verify (constant-time), never a hand-rolled string
- * compare. Claims checked: exp (required), nbf (when present), iss, aud
- * (string or array), then sub/role through toApprovalActor.
+ * cannot choose its own verification scheme. JOSE owns key import and
+ * signature verification; no hand-rolled comparison remains. The protected
+ * typ is pinned to JWT. Claims checked: exp (required),
+ * nbf (when present), iss, aud (string or array), then sub/role through
+ * toApprovalActor.
  */
 export function hmacVerifier(options: HmacVerifierOptions): TokenVerifier {
   const now = options.now ?? Date.now;
   return {
     async verify(token) {
-      const parts = token.split('.');
-      if (parts.length !== 3) return undefined;
-      const [headerPart, claimsPart, signaturePart] = parts as [
-        string,
-        string,
-        string,
-      ];
-
-      const header = base64UrlDecodeJson(headerPart) as JwtHeader | undefined;
-      if (header?.alg !== 'HS256') return undefined;
-
-      let secret: string | undefined;
-      if (typeof header.kid === 'string') {
-        secret = options.keys.get(header.kid);
-      } else if (header.kid === undefined && options.keys.size === 1) {
-        secret = [...options.keys.values()][0];
-      }
-      if (secret === undefined) return undefined;
-
-      const signature = base64UrlDecodeBytes(signaturePart);
-      if (!signature) return undefined;
-      const key = await importHmacKey(secret, 'verify');
-      const valid = await crypto.subtle.verify(
-        'HMAC',
-        key,
-        signature,
-        encoder.encode(`${headerPart}.${claimsPart}`),
-      );
-      if (!valid) return undefined;
-
-      const claims = base64UrlDecodeJson(claimsPart) as JwtClaims | undefined;
-      if (!claims) return undefined;
-      const nowSeconds = now() / 1000;
-      if (typeof claims.exp !== 'number' || nowSeconds >= claims.exp) {
+      try {
+        const { payload } = await jwtVerify(
+          token,
+          async (protectedHeader) => {
+            if (protectedHeader.alg !== 'HS256') {
+              throw new Error('unsupported token algorithm');
+            }
+            const secret =
+              typeof protectedHeader.kid === 'string'
+                ? options.keys.get(protectedHeader.kid)
+                : protectedHeader.kid === undefined && options.keys.size === 1
+                  ? [...options.keys.values()][0]
+                  : undefined;
+            if (secret === undefined) throw new Error('unknown token key');
+            return encoder.encode(secret);
+          },
+          {
+            algorithms: ['HS256'],
+            typ: 'JWT',
+            issuer: options.issuer,
+            audience: options.audience,
+            currentDate: new Date(now()),
+            clockTolerance: 0,
+            requiredClaims: ['exp'],
+          },
+        );
+        return toApprovalActor({ id: payload.sub, role: payload.role });
+      } catch {
         return undefined;
       }
-      if (claims.nbf !== undefined) {
-        if (typeof claims.nbf !== 'number' || nowSeconds < claims.nbf) {
-          return undefined;
-        }
-      }
-      if (claims.iss !== options.issuer) return undefined;
-      const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
-      if (!audiences.includes(options.audience)) return undefined;
-
-      return toApprovalActor({
-        id: claims.sub,
-        role: claims.role,
-      });
     },
   };
 }
@@ -231,22 +175,12 @@ export async function mintHmacToken(
   options: MintHmacTokenOptions,
 ): Promise<string> {
   const nowSeconds = Math.floor((options.now ?? Date.now)() / 1000);
-  const header = { alg: 'HS256', typ: 'JWT', kid: options.kid };
-  const claims = {
-    iss: options.issuer,
-    aud: options.audience,
-    sub: options.actor.id,
-    role: options.actor.role,
-    iat: nowSeconds,
-    exp: nowSeconds + options.ttlSeconds,
-  };
-  const headerPart = base64UrlEncode(encoder.encode(JSON.stringify(header)));
-  const claimsPart = base64UrlEncode(encoder.encode(JSON.stringify(claims)));
-  const key = await importHmacKey(options.secret, 'sign');
-  const signature = await crypto.subtle.sign(
-    'HMAC',
-    key,
-    encoder.encode(`${headerPart}.${claimsPart}`),
-  );
-  return `${headerPart}.${claimsPart}.${base64UrlEncode(new Uint8Array(signature))}`;
+  return new SignJWT({ role: options.actor.role })
+    .setProtectedHeader({ alg: 'HS256', typ: 'JWT', kid: options.kid })
+    .setIssuer(options.issuer)
+    .setAudience(options.audience)
+    .setSubject(options.actor.id)
+    .setIssuedAt(nowSeconds)
+    .setExpirationTime(nowSeconds + options.ttlSeconds)
+    .sign(encoder.encode(options.secret));
 }

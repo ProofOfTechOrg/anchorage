@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // One behavioral contract, two backends: InMemoryApprovalStore and
-// D1ApprovalStore. The D1 store runs against REAL SQLite via node:sqlite
-// (D1 is SQLite), so the CAS SQL — status-guarded UPDATE ... RETURNING —
-// and the partial unique index are exercised for real, not mocked.
-// (workerd-level verification happens in the demo spike, matching the
-// Phase-1 precedent for d1-storage.ts.)
+// D1ApprovalStore. These fast SQL units run against node:sqlite; the Wrangler
+// harness owns D1 runtime, transaction, and concurrent-writer fidelity.
 //
 // The contract runs over factories so both production and in-memory assembly
 // paths exercise their deployment-wide store selection.

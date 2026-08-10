@@ -12,15 +12,20 @@
   "scripts": {
     "build": "pnpm -r build",
     "dev": "pnpm --filter showcase dev",
-    "test": "vitest run",
+    "test": "pnpm run architecture:check && vitest run",
     "test:watch": "vitest",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
-    "typecheck": "pnpm -r typecheck",
+    "typecheck": "pnpm -r typecheck && pnpm run typecheck:harness",
+    "typecheck:harness": "pnpm --filter @proofoftech/flowsafe exec tsc -p ../../tsconfig.harness.json",
     "docs:api": "node scripts/build-api-docs.mjs",
     "docs:check": "node scripts/docs-check.mjs",
     "docs:check:external": "node scripts/docs-check.mjs --external",
     "docs:check:test": "node scripts/docs-check.test.mjs",
+    "architecture:check": "pnpm run architecture:check:rules && pnpm run architecture:controls",
+    "architecture:check:rules": "dependency-cruise packages/flowsafe/src packages/agent-starter/src packages/agent-starter/test packages/agent-starter/scripts --exclude '^packages/flowsafe/src/.*\\.(?:test|stories)\\.(?:ts|tsx)$'",
+    "architecture:check:agent-starter": "dependency-cruise packages/agent-starter/src packages/agent-starter/test packages/agent-starter/scripts",
+    "architecture:controls": "node --test scripts/architecture-positive-controls.test.mjs",
     "test:packed-breakwater": "pnpm --filter @proofoftech/breakwater test:packed-consumer",
     "test:packed-flowsafe-agent-host": "pnpm --filter @proofoftech/flowsafe test:agent-host-export",
     "test:packed-flowsafe-provisioning": "pnpm --filter @proofoftech/flowsafe test:provisioning-export",
@@ -34,16 +39,37 @@
     "prepare": "husky"
   },
   "devDependencies": {
+    "@arethetypeswrong/cli": "0.18.5",
     "@biomejs/biome": "^2.4.11",
     "@changesets/cli": "^2.31.0",
+    "@cloudflare/vitest-pool-workers": "0.20.1",
+    "@cloudflare/workers-types": "5.20260730.1",
+    "@types/node": "22.20.0",
+    "dependency-cruiser": "18.1.1",
+    "github-slugger": "2.0.0",
     "husky": "^9.1.7",
     "lint-staged": "^16.4.0",
+    "mdast-util-to-string": "4.0.0",
+    "publint": "0.3.22",
+    "remark-gfm": "4.0.1",
+    "remark-parse": "11.0.0",
     "typedoc": "^0.28.19",
-    "vitest": "^4.1.8"
+    "unified": "11.0.5",
+    "unist-util-visit": "5.1.0",
+    "vitest": "^4.1.8",
+    "wrangler": "4.118.0"
   },
   "engines": {
     "node": ">=22.22.0",
     "pnpm": ">=10.16.0"
   },
-  "packageManager": "pnpm@10.34.4"
+  "packageManager": "pnpm@10.34.4",
+  "pnpm": {
+    "ignoredBuiltDependencies": [
+      "workerd"
+    ],
+    "overrides": {
+      "undici": "7.29.0"
+    }
+  }
 }

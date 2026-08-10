@@ -13,6 +13,12 @@ import {
   sep,
 } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import GithubSlugger from 'github-slugger';
+import { toString as markdownText } from 'mdast-util-to-string';
+import remarkGfm from 'remark-gfm';
+import remarkParse from 'remark-parse';
+import { unified } from 'unified';
+import { visit } from 'unist-util-visit';
 
 const IGNORED_DIRECTORIES = new Set([
   '.git',
@@ -33,6 +39,7 @@ const REQUIRED_PUBLIC_URLS = [
   'https://www.npmjs.com/package/@proofoftech/flowsafe',
   'https://proofoftechorg.github.io/anchorage/',
 ];
+const MARKDOWN_PARSER = unified().use(remarkParse).use(remarkGfm);
 
 function toPosix(path) {
   return path.split(sep).join('/');
@@ -46,196 +53,133 @@ function lineNumberAt(text, index) {
   return line;
 }
 
-function decodeHtmlEntities(value) {
+function parseMarkdown(markdown) {
+  return MARKDOWN_PARSER.parse(markdown);
+}
+
+function htmlCodePoint(digits, radix) {
+  const codePoint = Number.parseInt(digits, radix);
+  if (
+    codePoint === 0 ||
+    codePoint > 0x10ffff ||
+    (codePoint >= 0xd800 && codePoint <= 0xdfff)
+  ) {
+    return '\uFFFD';
+  }
+  return String.fromCodePoint(codePoint);
+}
+
+function decodeRawHtmlAttribute(value) {
   return value
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&#39;|&apos;/g, "'")
-    .replace(/&#x([0-9a-f]+);/gi, (_, digits) =>
-      String.fromCodePoint(Number.parseInt(digits, 16)),
-    )
-    .replace(/&#([0-9]+);/g, (_, digits) =>
-      String.fromCodePoint(Number.parseInt(digits, 10)),
-    );
+    .replace(/&#x([0-9a-f]+);/gi, (_, digits) => htmlCodePoint(digits, 16))
+    .replace(/&#([0-9]+);/g, (_, digits) => htmlCodePoint(digits, 10));
 }
 
-function headingText(value) {
-  return decodeHtmlEntities(value)
-    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
-    .replace(/\[([^\]]+)\]\[[^\]]*\]/g, '$1')
-    .replace(/<[^>]+>/g, '')
-    .replace(/[`*_~]/g, '')
-    .trim();
-}
+function rawHtmlAttributes(markdown, node, names) {
+  if (node.value.trimStart().startsWith('<!--')) return [];
 
-export function githubSlug(value) {
-  return headingText(value)
-    .toLowerCase()
-    .replace(
-      /[^\p{Letter}\p{Number}\p{Mark}\p{Extended_Pictographic}\s_-]/gu,
-      '',
-    )
-    .replace(/\s/g, '-');
+  const attributes = [];
+  const pattern = /\b([a-z][\w:-]*)\s*=\s*(["'])([\s\S]*?)\2/gi;
+  for (const match of node.value.matchAll(pattern)) {
+    const name = match[1].toLowerCase();
+    if (!names.has(name)) continue;
+    attributes.push({
+      name,
+      value: decodeRawHtmlAttribute(match[3].trim()),
+      line: lineNumberAt(
+        markdown,
+        (node.position?.start.offset ?? 0) + match.index,
+      ),
+    });
+  }
+  return attributes;
 }
 
 export function collectMarkdownAnchors(markdown) {
   const anchors = new Set();
-  const occurrences = new Map();
-  const lines = markdown.split(/\r?\n/);
-  let fence;
-  let previousLine;
+  const slugger = new GithubSlugger();
 
-  const addHeading = (text) => {
-    const base = githubSlug(text);
-    if (!base) return;
-    const occurrence = occurrences.get(base) ?? 0;
-    occurrences.set(base, occurrence + 1);
-    anchors.add(occurrence === 0 ? base : `${base}-${occurrence}`);
-  };
-
-  for (const line of lines) {
-    const fenceMatch = line.match(/^\s{0,3}(`{3,}|~{3,})/);
-    if (fenceMatch) {
-      const delimiter = fenceMatch[1];
-      if (!fence) fence = delimiter;
-      else if (fence[0] === delimiter[0] && delimiter.length >= fence.length) {
-        fence = undefined;
+  visit(parseMarkdown(markdown), (node) => {
+    if (node.type === 'heading') {
+      const slug = slugger.slug(markdownText(node, { includeHtml: false }));
+      if (slug) anchors.add(slug);
+      return;
+    }
+    if (node.type === 'html') {
+      for (const attribute of rawHtmlAttributes(
+        markdown,
+        node,
+        new Set(['id', 'name']),
+      )) {
+        anchors.add(safeDecode(attribute.value));
       }
-      previousLine = undefined;
-      continue;
     }
-    if (fence) continue;
-
-    const atx = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
-    if (atx) {
-      addHeading(atx[1]);
-      previousLine = undefined;
-    } else if (/^\s{0,3}(?:=+|-+)\s*$/.test(line) && previousLine) {
-      addHeading(previousLine);
-      previousLine = undefined;
-    } else {
-      previousLine = line.trim() ? line : undefined;
-    }
-
-    for (const match of line.matchAll(/\b(?:id|name)=["']([^"']+)["']/gi)) {
-      anchors.add(safeDecode(match[1]));
-    }
-  }
+  });
 
   return anchors;
 }
 
-function sanitizedMarkdown(markdown) {
-  const lines = markdown.split(/(?<=\n)/);
-  let fence;
-  let inComment = false;
+function markdownPolicySource(markdown) {
+  const characters = markdown.split('');
+  visit(parseMarkdown(markdown), (node) => {
+    const isComment =
+      node.type === 'html' && node.value.trimStart().startsWith('<!--');
+    if (!['code', 'inlineCode'].includes(node.type) && !isComment) return;
 
-  return lines
-    .map((line) => {
-      const fenceMatch = line.match(/^\s{0,3}(`{3,}|~{3,})/);
-      if (fenceMatch) {
-        const delimiter = fenceMatch[1];
-        if (!fence) fence = delimiter;
-        else if (
-          fence[0] === delimiter[0] &&
-          delimiter.length >= fence.length
-        ) {
-          fence = undefined;
-        }
-        return line.replace(/[^\n]/g, ' ');
-      }
-      if (fence) return line.replace(/[^\n]/g, ' ');
-
-      let sanitized = line;
-      if (inComment) {
-        const end = sanitized.indexOf('-->');
-        if (end === -1) return sanitized.replace(/[^\n]/g, ' ');
-        sanitized = ' '.repeat(end + 3) + sanitized.slice(end + 3);
-        inComment = false;
-      }
-
-      let start = sanitized.indexOf('<!--');
-      while (start !== -1) {
-        const end = sanitized.indexOf('-->', start + 4);
-        if (end === -1) {
-          sanitized =
-            sanitized.slice(0, start) +
-            sanitized.slice(start).replace(/[^\n]/g, ' ');
-          inComment = true;
-          break;
-        }
-        sanitized =
-          sanitized.slice(0, start) +
-          ' '.repeat(end + 3 - start) +
-          sanitized.slice(end + 3);
-        start = sanitized.indexOf('<!--', end + 3);
-      }
-
-      return sanitized.replace(/`+[^`\n]*`+/g, (code) =>
-        ' '.repeat(code.length),
-      );
-    })
-    .join('');
+    const start = node.position?.start.offset;
+    const end = node.position?.end.offset;
+    if (start === undefined || end === undefined) return;
+    for (let index = start; index < end; index += 1) {
+      if (characters[index] !== '\n') characters[index] = ' ';
+    }
+  });
+  return characters.join('');
 }
 
-function cleanLinkTarget(target) {
-  let value = decodeHtmlEntities(target.trim());
-  if (value.startsWith('<') && value.endsWith('>')) {
-    value = value.slice(1, -1);
+function markdownDefinitions(tree) {
+  const definitions = new Map();
+  visit(tree, 'definition', (node) => {
+    definitions.set(node.identifier, node.url);
+  });
+  return definitions;
+}
+
+function referencedTarget(node, definitions) {
+  if (node.type === 'link' || node.type === 'image') return node.url;
+  if (node.type === 'linkReference' || node.type === 'imageReference') {
+    return definitions.get(node.identifier);
   }
-  return value.replace(/\\([\\()])/g, '$1');
+  return undefined;
 }
 
 export function collectMarkdownLinks(markdown) {
-  const sanitized = sanitizedMarkdown(markdown);
+  const tree = parseMarkdown(markdown);
+  const definitions = markdownDefinitions(tree);
   const links = [];
-  const definitions = new Map();
-
-  for (const match of sanitized.matchAll(
-    /^\s{0,3}\[([^\]]+)\]:\s*(<[^>]+>|\S+)/gm,
-  )) {
-    definitions.set(match[1].trim().toLowerCase(), {
-      target: cleanLinkTarget(match[2]),
-      line: lineNumberAt(sanitized, match.index),
-    });
-  }
-
-  for (const match of sanitized.matchAll(
-    /!?\[[^\]]*\]\(\s*(<[^>]+>|(?:\\.|[^)\s])+)(?:\s+["'(][^)\n]*["')])?\s*\)/g,
-  )) {
-    links.push({
-      target: cleanLinkTarget(match[1]),
-      line: lineNumberAt(sanitized, match.index),
-    });
-  }
-
-  for (const match of sanitized.matchAll(/!?\[([^\]]+)\]\[([^\]]*)\]/g)) {
-    const key = (match[2] || match[1]).trim().toLowerCase();
-    const definition = definitions.get(key);
-    if (definition) {
+  visit(tree, (node) => {
+    const target = referencedTarget(node, definitions);
+    if (target !== undefined) {
       links.push({
-        target: definition.target,
-        line: lineNumberAt(sanitized, match.index),
+        target,
+        line: node.position?.start.line ?? 1,
       });
+      return;
     }
-  }
-
-  for (const match of sanitized.matchAll(/<((?:https?:\/\/|mailto:)[^>]+)>/g)) {
-    links.push({
-      target: cleanLinkTarget(match[1]),
-      line: lineNumberAt(sanitized, match.index),
-    });
-  }
-
-  for (const match of sanitized.matchAll(/\b(?:href|src)=["']([^"']+)["']/gi)) {
-    links.push({
-      target: cleanLinkTarget(match[1]),
-      line: lineNumberAt(sanitized, match.index),
-    });
-  }
+    if (node.type === 'html') {
+      for (const attribute of rawHtmlAttributes(
+        markdown,
+        node,
+        new Set(['href', 'src']),
+      )) {
+        links.push({ target: attribute.value, line: attribute.line });
+      }
+    }
+  });
 
   return links;
 }
@@ -555,7 +499,7 @@ function checkPublicContentPolicy(root, markdownFiles) {
       continue;
     }
 
-    const markdown = sanitizedMarkdown(readFileSync(file, 'utf8'));
+    const markdown = markdownPolicySource(readFileSync(file, 'utf8'));
     for (const match of markdown.matchAll(INTERNAL_MILESTONE_PATTERN)) {
       errors.push(
         diagnostic(
@@ -860,7 +804,7 @@ export function collectExternalUrls(markdownFiles) {
     for (const link of collectMarkdownLinks(markdown)) {
       if (isExternal(link.target)) urls.add(link.target);
     }
-    for (const match of sanitizedMarkdown(markdown).matchAll(
+    for (const match of markdownPolicySource(markdown).matchAll(
       /https?:\/\/[^\s<>"'`\])]+/g,
     )) {
       urls.add(match[0].replace(/[),.;:]+$/, ''));

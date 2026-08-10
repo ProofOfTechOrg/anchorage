@@ -5,12 +5,12 @@
 // HEAVYWEIGHT behavior proof stays the two host e2e suites
 // (deploy/worker.e2e.test.ts and the showcase worker e2e set), which drive
 // the real hosts through this same composer — this file covers the composer's
-// own contract over fakes: real SQLite behind the D1 adapter, a stub DO
+// own contract over fakes: node:sqlite behind a narrow SQL unit facade, a stub DO
 // namespace, and a static verifier.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { d1DatabaseLike, openSqlite } from '../../test-support/sqlite.js';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import type {
   ApprovalNotificationEvent,
   ApprovalRecord,
@@ -115,7 +115,7 @@ function makeEnv(): Harness {
        VALUES (1, 'acme', '2026-08-10T00:00:00.000Z')`,
     )
     .run();
-  const database = d1DatabaseLike(sqlite) as FlowsafeWorkerEnv['DB'];
+  const database = sqliteUnitDatabase(sqlite) as FlowsafeWorkerEnv['DB'];
   return {
     env: {
       DB: database,
@@ -239,7 +239,7 @@ describe('createFlowsafeWorker fetch pipeline', () => {
       new Request('http://host/healthz'),
       {
         ...env,
-        DB: d1DatabaseLike(sqlite) as FlowsafeWorkerEnv['DB'],
+        DB: sqliteUnitDatabase(sqlite) as FlowsafeWorkerEnv['DB'],
       },
       ctx,
     );

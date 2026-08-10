@@ -1,7 +1,7 @@
 // Drift guard for the demo identities. They are declared once in
 // demo-actors.ts, but `.dev.vars.example` is a dotenv file wrangler reads — it
 // cannot import the const, so nothing but this test stops the two diverging and
-// leaving `dev:worker` authenticating against tokens the UI never offers.
+// leaving the local Worker authenticating against tokens the UI never offers.
 //
 // Also pins the locally-mirrored DemoRole union against the real ApprovalRole
 // set: an actor whose role is not a known role is dropped by parseActorTokens,

@@ -6,7 +6,6 @@
       // glue are covered by tsc/vitest/biome, and deslop cannot resolve the
       // #worker/* package-imports, so scanning them only produces noise.
       "worker/**",
-      "run-api-dev-plugin.ts",
       "vite.config.ts",
       "vitest.config.ts",
       "scripts/**"

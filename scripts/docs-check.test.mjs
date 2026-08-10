@@ -49,6 +49,25 @@ Setext heading
   );
 });
 
+test('heading anchors use rendered punctuation, entities, and Unicode text', () => {
+  const anchors =
+    collectMarkdownAnchors(`# API: \`create()\` &amp; [résumé](guide.md)
+# API: \`create()\` &amp; [résumé](guide.md)
+## Привет мир 👋
+# Hello <span>world</span>
+`);
+
+  assert.deepEqual(
+    [...anchors],
+    [
+      'api-create--résumé',
+      'api-create--résumé-1',
+      'привет-мир-',
+      'hello-world',
+    ],
+  );
+});
+
 test('link extraction ignores examples in code fences and inline code', () => {
   const links = collectMarkdownLinks(`
 [real](guide.md)
@@ -58,9 +77,49 @@ test('link extraction ignores examples in code fences and inline code', () => {
 \`\`\`
 
 \`[also ignored](missing.md)\`
+
+<!--
+[commented out](missing-from-comment.md)
+-->
 `);
 
   assert.deepEqual(links, [{ target: 'guide.md', line: 2 }]);
+});
+
+test('reference links, images, and quoted raw HTML attributes resolve', () => {
+  const links = collectMarkdownLinks(
+    [
+      '[Guide][guide]',
+      '![Diagram][diagram]',
+      '',
+      '[guide]: <guide&amp;one.md>',
+      '[diagram]: assets/diagram.png',
+      '',
+      "<a href='raw&amp;guide.md'>Raw</a>",
+      '<img src="assets/raw.png">',
+      '<!-- <a href="ignored.md"> -->',
+    ].join('\n'),
+  );
+
+  assert.deepEqual(links, [
+    { target: 'guide&one.md', line: 1 },
+    { target: 'assets/diagram.png', line: 2 },
+    { target: 'raw&guide.md', line: 7 },
+    { target: 'assets/raw.png', line: 8 },
+  ]);
+});
+
+test('malformed Markdown does not create links or headings', () => {
+  assert.deepEqual(collectMarkdownLinks('[broken](missing.md'), []);
+  assert.deepEqual([...collectMarkdownAnchors('#Not a heading')], []);
+  assert.deepEqual(
+    collectMarkdownLinks('<!-- [hidden](missing.md)\nstill commented'),
+    [],
+  );
+  assert.deepEqual(
+    collectMarkdownLinks('<a href="&#x110000;">invalid entity</a>'),
+    [{ target: '\uFFFD', line: 1 }],
+  );
 });
 
 test('shorter fences cannot close longer Markdown code blocks', () => {
@@ -190,6 +249,35 @@ This describes DL-001, INV-3, D4, F4, and P7, and claims 978 tests.
       'internal milestone token is not public documentation: P7',
       'volatile hard-coded count is not allowed: 978 tests',
     ],
+  );
+});
+
+test('public policy ignores code and comments after Unicode text', () => {
+  const root = fixture({
+    'README.md': `# Public guide 👋
+
+\`D4 and 978 tests\`
+
+\`\`\`text
+DL-001 and 42 tests
+\`\`\`
+
+<!-- INV-3 and 7 tests -->
+
+Public F4 remains visible.
+`,
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: markdownFiles(root, ['README.md']),
+    packageChecks: false,
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => error.message),
+    ['internal milestone token is not public documentation: F4'],
   );
 });
 

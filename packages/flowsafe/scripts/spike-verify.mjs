@@ -29,6 +29,7 @@ import { createWriteStream, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { SignJWT } from 'jose';
 import {
   createSpikeServerLifecycle,
   parseSpikePort,
@@ -313,20 +314,13 @@ async function postWebhook(providerId, payload, { forge } = {}) {
 
 // --- Live-stream (WebSocket) probe helpers (M-009) -------------------------
 
-// Forge a stream ticket with the SAME primitives as the worker's
-// mintStreamTicket: base64url(JSON(claims)) + '.' + HMAC-SHA256 over that
-// payload (base64url). crypto.createHmac(...).digest('base64url') is byte-equal
-// to the worker's WebCrypto hmacSign, so a VALID forge is ACCEPTED (positive
-// control) and EXPIRED / ADDRESS-MISMATCH forges exercise the worker's claim
-// validation, not a signature mismatch.
+// Forge arbitrary claims with the same standard JWT envelope as
+// mintStreamTicket. A valid forge proves the shared fixture secret matches the
+// Worker; expired and address-mismatched forges then exercise claim rejection.
 function forgeTicket(claims) {
-  const payload = Buffer.from(JSON.stringify(claims), 'utf8').toString(
-    'base64url',
-  );
-  const signature = createHmac('sha256', STREAM_TICKET_SECRET)
-    .update(payload)
-    .digest('base64url');
-  return `${payload}.${signature}`;
+  return new SignJWT({ ...claims, aud: 'flowsafe-stream' })
+    .setProtectedHeader({ alg: 'HS256', typ: 'flowsafe-stream-ticket+jwt' })
+    .sign(new TextEncoder().encode(STREAM_TICKET_SECRET));
 }
 
 // Mint a ticket the LEGITIMATE way: over the authenticated REST route.
@@ -1386,7 +1380,7 @@ async function main() {
       // exp) OPENS. Proves the shared local secret matches the worker's, so the
       // refusals below are CLAIM rejections, not signature drift. If the secret
       // ever drifts, THIS throws and the probe fails loudly.
-      const valid = forgeTicket({
+      const valid = await forgeTicket({
         channel: 'hub',
         actorId: 'vic',
         role: 'viewer',
@@ -1397,7 +1391,7 @@ async function main() {
       control.close();
 
       // Expired hub ticket -> refused (exp in the past).
-      const expired = forgeTicket({
+      const expired = await forgeTicket({
         channel: 'hub',
         actorId: 'vic',
         role: 'viewer',
@@ -1406,7 +1400,7 @@ async function main() {
       await expectWsRefused('/api/stream/hub', expired, 8_000);
 
       // A validly signed RUN ticket with a malformed run id is refused.
-      const malformedRun = forgeTicket({
+      const malformedRun = await forgeTicket({
         channel: 'run',
         runId: 'bad/run',
         actorId: 'mallory',
@@ -1423,7 +1417,7 @@ async function main() {
       await expectWsRefused('/api/stream/hub', 'forged.signature', 8_000);
 
       // Cross-channel: a hub ticket presented on the run route -> refused.
-      const hubForRun = forgeTicket({
+      const hubForRun = await forgeTicket({
         channel: 'hub',
         actorId: 'vic',
         role: 'viewer',

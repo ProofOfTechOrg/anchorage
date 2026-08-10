@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node", "@cloudflare/workers-types"]
+  },
+  "include": [
+    "packages/breakwater/worker-tests/**/*.ts",
+    "packages/flowsafe/src/cloudflare-fidelity.workerd.test.ts",
+    "packages/flowsafe/test-support/cloudflare-test-worker.ts",
+    "packages/flowsafe/test-support/harness-probe.ts",
+    "scripts/flowsafe-harness.test.ts",
+    "scripts/r2-type-compatibility.ts",
+    "vitest.config.ts",
+    "vitest.breakwater-workers.config.mts",
+    "vitest.flowsafe-harness.config.ts",
+    "vitest.flowsafe-workers.config.ts"
+  ]
+}

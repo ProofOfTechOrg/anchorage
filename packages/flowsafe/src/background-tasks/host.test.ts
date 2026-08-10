@@ -11,7 +11,7 @@ import { InMemoryStore, type MastraCompositeStore } from '@mastra/core/storage';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
-import { d1DatabaseLike, openSqlite } from '../../test-support/sqlite.js';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import { createD1Storage, createHostPubSub, init } from '../do-runner/index.js';
 import {
   backgroundTasksStore,
@@ -42,7 +42,9 @@ function baseTask(overrides: Record<string, unknown>) {
 // eagerly on the first persisted run — the same seed the schema-guard test uses.
 async function seededD1(): Promise<MastraCompositeStore> {
   const sqlite = openSqlite();
-  const storage = createD1Storage({ binding: d1DatabaseLike(sqlite) as never });
+  const storage = createD1Storage({
+    binding: sqliteUnitDatabase(sqlite) as never,
+  });
   const { createWorkflow, createStep, runtime } = init({ storage });
   const step = createStep({
     id: 'noop',
@@ -62,7 +64,7 @@ async function seededD1(): Promise<MastraCompositeStore> {
 }
 
 async function executionHostDependencies() {
-  const binding = d1DatabaseLike(openSqlite()) as never;
+  const binding = sqliteUnitDatabase(openSqlite()) as never;
   const storage = createD1Storage({
     binding,
     domains: createBackgroundTaskD1Domains({ binding }),
@@ -591,7 +593,7 @@ describe('BackgroundTaskHost — on D1 (R-B1: persistence + recovery seam, no bo
 
 describe('BackgroundTaskHost — execution-mode recovery on D1', () => {
   it('subscribes workflow workers before recovery re-dispatches a retryable task', async () => {
-    const binding = d1DatabaseLike(openSqlite()) as never;
+    const binding = sqliteUnitDatabase(openSqlite()) as never;
     const seedStorage = createD1Storage({
       binding,
       domains: createBackgroundTaskD1Domains({

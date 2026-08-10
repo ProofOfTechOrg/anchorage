@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { DeploymentIdentityDatabase } from '../src/do-runner/deployment-identity.js';
 import { DEPLOYMENT_IDENTITY_HEADER } from '../src/do-runner/deployment-identity.js';
-import { d1DatabaseLike, openSqlite } from './sqlite.js';
+import { openSqlite, sqliteUnitDatabase } from './sqlite.js';
 
 export const TEST_DEPLOYMENT_IDENTITY_SECRET =
   'test-deployment-identity-secret-0001';
@@ -20,7 +20,7 @@ export function deploymentIdentityDatabase(
   db.prepare(
     'INSERT INTO flowsafe_deployment (id, tenant_tag, provisioned_at) VALUES (1, ?, ?)',
   ).run(tag, '2026-08-10T00:00:00.000Z');
-  return d1DatabaseLike(db) as DeploymentIdentityDatabase;
+  return sqliteUnitDatabase(db) as DeploymentIdentityDatabase;
 }
 
 export function deploymentIdentityRequest(

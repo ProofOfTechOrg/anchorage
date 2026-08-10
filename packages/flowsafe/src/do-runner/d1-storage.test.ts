@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-// purgeExpiredWorkflowRuns against REAL SQLite via node:sqlite (D1 is
-// SQLite), so the json_extract status filter and the ISO-cutoff comparison
-// run for real. The openSqlite() fixture matches the approval-api store
-// tests; the d1Like adapter here maps run() results to D1's { meta } shape.
+// Fast SQL-unit coverage over node:sqlite: json_extract status filters and
+// ISO-cutoff comparisons execute in SQLite, while the Wrangler harness owns
+// D1 concurrency, transaction, and runtime fidelity.
 
 import { describe, expect, it } from 'vitest';
 
 import {
-  d1DatabaseLike,
   openSqlite,
   type SqliteDatabase,
+  sqliteUnitDatabase,
 } from '../../test-support/sqlite.js';
 import {
   D1ResourceOwnershipStore,
@@ -35,8 +34,9 @@ import {
   type SnapshotStatement,
 } from './d1-storage.js';
 
-// Faithful to D1: run() resolves to a result whose meta.changes carries the
-// affected-row count (node:sqlite reports it as `changes`).
+// Domain-local result-envelope adapter for pure purge SQL units. It maps
+// node:sqlite's affected-row count to the structural SnapshotDatabase seam;
+// the Wrangler harness owns D1 runtime and concurrency fidelity.
 function d1Like(db: SqliteDatabase): SnapshotDatabase {
   function statement(sql: string, params: unknown[]): SnapshotStatement {
     return {
@@ -59,7 +59,7 @@ function lifecycleStores(db: SqliteDatabase): {
   snapshots: SnapshotDatabase;
   resources: D1ResourceOwnershipStore;
 } {
-  const binding = d1DatabaseLike(db);
+  const binding = sqliteUnitDatabase(db);
   return {
     snapshots: binding as SnapshotDatabase,
     resources: new D1ResourceOwnershipStore(
@@ -262,7 +262,7 @@ describe('purgeExpiredWorkflowRuns', () => {
   it('keeps a run owner when the row becomes ineligible between selection and the row-only batch', async () => {
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
-    const binding = d1DatabaseLike(sqlite) as SnapshotDatabase &
+    const binding = sqliteUnitDatabase(sqlite) as SnapshotDatabase &
       ResourceOwnershipDatabase;
     const resources = new D1ResourceOwnershipStore(binding);
     seedRun(sqlite, {
@@ -458,7 +458,7 @@ describe('purgeExpiredWorkflowRuns', () => {
   it('keeps a run owner when the artifact path recheck leaves its snapshot row', async () => {
     const sqlite = openSqlite();
     createSnapshotTable(sqlite);
-    const binding = d1DatabaseLike(sqlite) as SnapshotDatabase &
+    const binding = sqliteUnitDatabase(sqlite) as SnapshotDatabase &
       ResourceOwnershipDatabase;
     const resources = new D1ResourceOwnershipStore(binding);
     seedRun(sqlite, {
@@ -1343,7 +1343,7 @@ describe('purgeExpiredBackgroundTasks', () => {
 });
 
 async function signalDb(sqlite: SqliteDatabase): Promise<SignalDatabase> {
-  const db = d1DatabaseLike(sqlite) as unknown as SignalDatabase;
+  const db = sqliteUnitDatabase(sqlite) as unknown as SignalDatabase;
   await new D1NotificationsStorage(db, '').init();
   await new D1ThreadStateStorage(db, '').init();
   return db;
@@ -1466,7 +1466,7 @@ describe('purgeExpiredScheduleTriggers', () => {
     // the TTL is a NUMERIC comparison (not the ISO-text bet the other purges take).
     const sqlite = openSqlite();
     const store = new D1SchedulesStorage(
-      d1DatabaseLike(sqlite) as unknown as ScheduleDatabase,
+      sqliteUnitDatabase(sqlite) as unknown as ScheduleDatabase,
     );
     await store.createSchedule({
       id: 'schedule_a',
@@ -1525,7 +1525,7 @@ describe('purgeExpiredScheduleTriggers', () => {
   it('retains an old deferred row until it can finalize a pending schedule deletion', async () => {
     const sqlite = openSqlite();
     const store = new D1SchedulesStorage(
-      d1DatabaseLike(sqlite) as unknown as ScheduleDatabase,
+      sqliteUnitDatabase(sqlite) as unknown as ScheduleDatabase,
     );
     await store.createOwnedSchedule(
       scheduleWithCreatorRole(
