@@ -1,6 +1,8 @@
 # Proposal: mature package adoption plan
 
-> Status: proposal. No package substitution in this plan is implemented or supported behavior. Every dependency decision requires the package-first design check in the root CLAUDE.md and explicit user direction before implementation.
+> Status: implemented and verified on 2026-08-10. The user approved executing the full plan after the package-selection records were refreshed. Accepted and rejected packages, exact versions, integration boundaries, measurements, and verification are recorded below.
+>
+> Delivery waiver: on 2026-08-10, after reviewing the accumulated implementation, the user explicitly directed that this execution be delivered as one change. That direction waives the separate-pull-request rollout below for this execution only; it does not remove the repository's default requirement for future package-adoption work.
 
 Content type: implementation plan
 
@@ -56,9 +58,13 @@ The audit classified findings by origin:
 - Baseline code already contained the D1 facsimile, GitHub webhook verifier, Markdown parser, import-graph scanners, package publication checks, and subprocess wrapper.
 - The current changes increased reliance on some baseline utilities, especially the D1 facsimile and HTTP routing patterns, so the implementation plan treats both layers as one architecture.
 
+### Execution baseline
+
+Implementation started from a clean `dev` worktree at `e3d8e01231318697f66a8cd97a17a8d00054ecb9`, equal to refreshed `origin/dev`. That merge commit contains isolation Slice A (PR #53); its required `verify` check passed. Node.js remained v22.22.0 and pnpm remained 10.34.4. The original audit baseline above is retained so the investigation remains reproducible; all edit anchors were re-read against the execution baseline before changes.
+
 ## Package selection gate
 
-No package named below is pre-approved. Before each phase, the implementing agent must present the current package evidence and wait for the user's decision. The review must use current registry metadata and primary documentation rather than this plan's 2026-08-10 snapshot.
+No package was pre-approved by the original proposal. On 2026-08-10 the implementing session refreshed registry metadata, official documentation, release history, provenance, licenses, advisories, dependency trees, and runtime compatibility, then the user explicitly directed it to execute the full plan. The 10,080-minute release-age guard remained enabled and no age, integrity, or lifecycle restriction was bypassed.
 
 For each candidate, record:
 
@@ -90,6 +96,41 @@ The priority column ranks risk and maintenance value, not rollout order. Follow 
 | 7 | Markdown parsing | Fence, comment, link, heading, entity, and GitHub-slug parsing | [unified](https://unifiedjs.com/), [remark-parse](https://unifiedjs.com/explore/package/remark-parse/), and [github-slugger](https://github.com/Flet/github-slugger) | Adopt only if the user approves changing the zero-dependency root-script policy |
 | 8 | Import boundaries | Regex import scanners and a custom TypeScript graph walker | [Biome restricted imports](https://biomejs.dev/linter/rules/no-restricted-imports/) plus [dependency-cruiser](https://github.com/sverweij/dependency-cruiser) | Adopt, retaining positive controls for every architecture rule |
 | 9 | Published package validation | Tar extraction, manifest/export/type checks, temporary consumer setup | [publint](https://publint.dev/docs/) plus [Are the Types Wrong](https://github.com/arethetypeswrong/arethetypeswrong.github.io) | Adopt for standard publication checks; retain repository-specific runtime and security probes |
+
+### Executed package record
+
+Checked 2026-08-10. All selected packages have permissive licenses and cleared the workspace release-age gate.
+
+| Boundary | Decision and exact version | Narrow integration or rejection rationale |
+| --- | --- | --- |
+| JWT and stream tickets | Adopt `jose@6.2.8` | FlowSafe runtime dependency behind `TokenVerifier`; HS256, issuer, audience, `typ`, expiry, and key-selection policy remain explicit. |
+| GitHub signatures | Reject `@octokit/webhooks-methods@6.0.0`; do not add generated webhook types | The browser verifier accepted non-canonical hex and could throw on malformed/empty inputs. Retain raw-byte WebCrypto with an exact `sha256=<64 hex>` grammar and fatal UTF-8 at the JSON boundary. |
+| OAuth/OIDC | Adopt `openid-client@6.8.4`; do not import `oauth4webapi` directly | Keep the `OAuthProvider` seam, GitHub `/user` subject adapter, signed state and cookie binding. The library owns authorization and token protocol plus Google ID-token validation. |
+| Cloudflare tests | Adopt `@cloudflare/vitest-pool-workers@0.20.1`, Wrangler `createTestHarness`, `wrangler@4.118.0`, and `@cloudflare/workers-types@5.20260730.1` where the v5 toolchain is required | Root-scoped pool projects exercise real D1 concurrency and resource ownership; the full FlowSafe and showcase harnesses exercise production Worker graphs, D1, Durable Objects, and WebSockets. FlowSafe and agent-starter retain v4 Workers types because `@mastra/cloudflare-d1@1.1.1` peers on v4. A pnpm override pins the mature patched `undici@7.29.0` across both Miniflare branches. |
+| Showcase development | Adopt `@cloudflare/vite-plugin@1.50.0` | Vite uses the real Wrangler input and emits the Worker/client output used by preview, harness, and deploy. The Connect bridge and in-memory DO/hub emulator were deleted. |
+| HTTP pilot | Adopt `hono@4.12.34` plus existing `zod@4.4.3` only for the qualifying showcase `/auth/*` boundary | `4.12.33` was rejected because applicable advisories are fixed in `4.12.34`. FlowSafe and agent-starter assembly roots were rejected as pilots because adapters would exceed deleted code. |
+| Markdown | Adopt `unified@11.0.5`, `remark-parse@11.0.0`, `remark-gfm@4.0.1`, `unist-util-visit@5.1.0`, `mdast-util-to-string@4.0.0`, and `github-slugger@2.0.0` | Root development-only AST parsing; repository policy stays custom. Raw HTML needs only a narrow quoted-attribute extractor, so no rehype packages were added. |
+| Architecture | Adopt `dependency-cruiser@18.1.1` plus existing Biome restrictions | TypeScript-aware transitive rules, 11 rule controls, and one control-inventory assertion replace three regex/custom walkers. |
+| Publication | Adopt `publint@0.3.22` and `@arethetypeswrong/cli@0.18.5` | Run both on each real tarball; retain browser-clean, runtime, executable, security, and real TypeScript consumer probes. |
+
+Conditional Execa, TanStack Query, and CLI-framework opportunities remain rejected for this execution because their documented adoption conditions were not met.
+
+### Measured execution impact
+
+| Area | Measured result |
+| --- | --- |
+| Removed mechanisms | Nine duplicate mechanisms removed: two manual crypto implementations, the showcase Worker/Durable Object emulator, the Markdown scanner, three import-graph scanners, and two partial package-format validators. |
+| JOSE | Production code is net 101 lines smaller; focused security tests are net 61 lines larger. |
+| Cloudflare Vite | A 9-line plugin adapter replaces 353 emulator implementation lines and 61 emulator-test lines. Client JavaScript and CSS are byte-identical. The combined build adds the previously separate Worker output: 9.13 MB raw and 1.60 MB gzip. |
+| Build cost | The combined Worker-and-client build takes 42.15 seconds and 1,579,012 KiB maximum RSS versus 7.12 seconds and 536,616 KiB for the former client-only build. The comparison is not equivalent work because the old command did not compile the Worker. |
+| Markdown | The AST implementation is net 56 production/tooling lines smaller and adds 82 fixture lines. |
+| Architecture | Three scanners totaling 349 lines are replaced by about 233 operational configuration/glue lines and 90 lines of non-vacuity controls. |
+| D1 fidelity | The shared facade is net 25 lines smaller; `d1DatabaseLike`, `batchTail`, `raw`, `exec`, and `dump` are gone. The remaining package-local SQLite adapters expose only prepared statements and transactional unit-test batches and are explicitly non-fidelity. Real-runtime tests add dedicated pool projects plus fixed-operation Wrangler harnesses rather than another database facade. |
+| Publication | Standard checks were removed from two partial custom validators. Publint and a shared ATTW report validator now cover four real tarball probes while repository-specific runtime/security checks remain. The validator requires clean Node16 ESM and bundler rows and accepts only ATTW 0.18.5's exact Node10 `#deployment-identity-protocol` internal-resolution exception. |
+| Hono pilot | The isolated auth migration is net two production lines smaller and adds 95 behavior/security test lines. |
+| Packages | The lockfile grows by 121 net package keys and 18.21%. The FlowSafe tarball shrinks 0.267%; the Breakwater tarball is byte-identical. |
+
+The platform development stack adds a 127.5 MB workerd binary plus esbuild and Sharp artifacts. Workerd's fallback postinstall is explicitly ignored because the integrity-pinned platform binary is present and directly verified. The remaining audit findings are inherited through existing parent dependency lines; this execution fixed the Miniflare/Undici issue shared by the existing and adopted Cloudflare stacks without forcing incompatible parent-major upgrades.
 
 Three additional packages are conditional rather than recommended now:
 
@@ -278,14 +319,16 @@ Risks and controls:
 
 Done for 2A means no test claims D1, Durable Object, R2, WebSocket, or Worker fidelity through a hand-built object; concurrent storage tests run against real bindings; Node tests remain fast; and all package suites pass in a clean process.
 
+Execution result: the full `d1DatabaseLike` facade, its global `batchTail`, and fake `raw`, `exec`, and `dump` capabilities were deleted from both copies. Node's `openSqlite` remains only behind explicitly non-fidelity prepared-statement unit adapters with transactional unit batches. Separate pool projects cover Breakwater D1 stores and FlowSafe's lightweight deployment/resource ownership code. A root Wrangler harness boots the exact full FlowSafe spike plus a fixed-operation D1 probe Worker and covers approval races, schedule caps/claims/ownership/rollback/deletion, legacy notification migration and coalescing, concurrent Mastra workflow updates, workflow-run retention, and thread/message retention without a generic SQL route. The full Mastra graph remains outside the Vitest pool because that import path triggers a confirmed bundled-workerd crash; `createTestHarness` is the stable real-workerd path for that graph.
+
 ### 2B. Run showcase development through Cloudflare's Vite plugin
 
 Current evidence: [A6](#a6-custom-vite-worker-emulator).
 
 Files in scope:
 
-- [packages/showcase/run-api-dev-plugin.ts](../../packages/showcase/run-api-dev-plugin.ts)
-- [packages/showcase/src/run-api-dev-plugin.test.ts](../../packages/showcase/src/run-api-dev-plugin.test.ts)
+- `packages/showcase/run-api-dev-plugin.ts` (deleted by this execution)
+- `packages/showcase/src/run-api-dev-plugin.test.ts` (deleted by this execution)
 - [packages/showcase/vite.config.ts](../../packages/showcase/vite.config.ts)
 - [packages/showcase/wrangler.jsonc](../../packages/showcase/wrangler.jsonc)
 - showcase development documentation and scripts
@@ -409,9 +452,9 @@ Current evidence: [A10](#a10-custom-import-graph-scanners).
 
 Files in scope:
 
-- [packages/flowsafe/src/agent-host/import-isolation.test.ts](../../packages/flowsafe/src/agent-host/import-isolation.test.ts)
-- [packages/flowsafe/src/host-kit/barrel-isolation.test.ts](../../packages/flowsafe/src/host-kit/barrel-isolation.test.ts)
-- packages/agent-starter/scripts/check-public-imports.mjs
+- `packages/flowsafe/src/agent-host/import-isolation.test.ts` (deleted by this execution)
+- `packages/flowsafe/src/host-kit/barrel-isolation.test.ts` (deleted by this execution)
+- `packages/agent-starter/scripts/check-public-imports.mjs` (deleted by this execution)
 - [biome.json](../../biome.json)
 - a dependency-cruiser configuration in the established root configuration location
 
@@ -521,7 +564,7 @@ Implementing sessions must extend these existing seams instead of replacing them
 
 ## Out of scope
 
-- Do not implement or install any package as part of this documentation change.
+- Do not add product features while executing the package substitutions.
 - Do not rewrite domain stores, SQL concurrency statements, approval transitions, grants, ownership checks, audit events, or schedule semantics.
 - Do not change public route paths, response bodies, status codes, headers, authentication order, authorization order, or outside-family null behavior.
 - Do not combine these phases with new product features.
@@ -532,11 +575,22 @@ Implementing sessions must extend these existing seams instead of replacing them
 - Do not change scripts/CLAUDE.md's zero-dependency rule silently.
 - Do not adopt a release-candidate dependency to satisfy this plan.
 
+### Isolation handoff re-baseline
+
+Slices B through E in [single-tenant physical isolation](single-tenant-physical-isolation.md) were re-read after the substitutions. They remain proposals and keep their order:
+
+- Slice B still owns the maintenance move from cron triggers to Durable Object alarms. This execution preserved the current scheduled handler and trigger semantics.
+- Slice C still owns the durability-authority benchmark. The real Worker/WebSocket/D1 harness adds evidence but does not choose between FlowSafe's runner and Cloudflare Workflows.
+- Slice D still owns the single-tenant secure preset. No preset or domain-policy semantics were introduced here.
+- Slice E still owns the two-backend provisioning control plane. The existing CLI gained stronger package validation and real-D1 provisioning coverage, but no fleet backend, dispatch seam, or decommission workflow was added.
+
 ## Rollout and pull request structure
 
 Feature and fix pull requests target dev. Refresh origin before each branch decision.
 
 Use separate pull requests:
+
+The user explicitly waived this split for the 2026-08-10 execution and directed delivery as one accumulated change. The sequence remains the default for future work and records how the implementation was evaluated.
 
 1. Cloudflare test foundation: add the Workers test projects and Wrangler harness before changing runtime behavior.
 2. Protocol security: migrate jose first, then resolve Octokit verification and OAuth in separate review units.
@@ -649,6 +703,17 @@ pnpm --filter showcase react-doctor
 ~~~
 
 Run the repository's clean-code, architecture, and QA review lanes independently. Fix every substantive finding and rerun that lane. Completion requires all three lanes to return clean.
+
+### Execution verification
+
+The accumulated implementation passed the clean-install gate on Node.js v22.22.0 and pnpm 10.34.4:
+
+- `pnpm install --frozen-lockfile`, `git diff --check`, `pnpm docs:check`, `pnpm docs:api`, `pnpm lint`, `pnpm typecheck`, and `pnpm build` passed.
+- `pnpm test` passed 119 files and 2,599 tests. The expanded production architecture scan covers 167 modules and 606 dependencies; 11 rule controls produce their intended violations, and a twelfth assertion proves the control inventory matches the configured rules.
+- The FlowSafe full-spike restart/fail-closed verification, React 18 type consumer, and six-case full-graph Wrangler/D1 harness passed. The separate FlowSafe and Breakwater Workers pool projects passed two and four real-D1 tests respectively.
+- The showcase Wrangler harness passed three cases covering its real Worker, D1 sentinel, Durable Objects, hub/run WebSocket delivery and reconnection, and deliberate no-stream-secret polling fallback. The OAuth/Hono boundary passed 89 focused cases and emitted no framework types in declarations.
+- The Breakwater packed consumer, FlowSafe agent-host/provisioning/signals consumers, publint, and the supported ATTW resolution lanes passed. ATTW 0.18.5 still reports one known Node10-only internal-resolution error for the package-private deployment protocol import; the shared validator matches that exact exception and rejects it in Node16 ESM or bundler resolution. Showcase React Doctor reported zero errors and zero warnings across 43 files.
+- A bounded `pnpm --filter showcase dev` run served the SPA on `127.0.0.1:4321`; the ignored user-local D1 state had no deployment sentinel, so Worker routes returned the expected fail-closed 503. The isolated seeded harness supplies the healthy route and WebSocket proof without mutating user-local state.
 
 ## Benefits to measure
 
@@ -887,7 +952,7 @@ The adapter also implements prepare, bind, first, run, all, raw, exec, batch, an
 
 ### A6. Custom Vite Worker emulator
 
-File: [packages/showcase/run-api-dev-plugin.ts](../../packages/showcase/run-api-dev-plugin.ts)
+Removed file at the execution baseline: `packages/showcase/run-api-dev-plugin.ts`
 
 Symbol: createInMemoryHub, current documented limitation
 
@@ -1037,9 +1102,9 @@ These functions combine regular expressions and manual scans for fences, comment
 
 Files:
 
-- [packages/flowsafe/src/agent-host/import-isolation.test.ts](../../packages/flowsafe/src/agent-host/import-isolation.test.ts)
-- [packages/flowsafe/src/host-kit/barrel-isolation.test.ts](../../packages/flowsafe/src/host-kit/barrel-isolation.test.ts)
-- packages/agent-starter/scripts/check-public-imports.mjs
+- `packages/flowsafe/src/agent-host/import-isolation.test.ts` (removed)
+- `packages/flowsafe/src/host-kit/barrel-isolation.test.ts` (removed)
+- `packages/agent-starter/scripts/check-public-imports.mjs` (removed)
 
 The two tests parse specifiers with regular expressions and manually resolve JavaScript specifiers to TypeScript, TSX, and index candidates. The agent-starter script separately scans source text. Replace syntax and resolution logic, not the actual layering rules.
 

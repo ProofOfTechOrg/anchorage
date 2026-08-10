@@ -11,7 +11,7 @@ import { Agent } from '@mastra/core/agent';
 import { Mastra } from '@mastra/core/mastra';
 import { describe, expect, it } from 'vitest';
 
-import { d1DatabaseLike, openSqlite } from '../../test-support/sqlite.js';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   createD1Storage,
   type InitResult,
@@ -62,7 +62,7 @@ async function githubSign(secret: string, body: string): Promise<string> {
 describe('webhook ingestion — full chain (router → topology → thread DO → inbox)', () => {
   it('lands a signed webhook in mastra_notifications, keyed to the subscribed thread', async () => {
     // #given — one shared D1 with the composed signal domains
-    const d1 = d1DatabaseLike(openSqlite()) as never;
+    const d1 = sqliteUnitDatabase(openSqlite()) as never;
     const storage = createD1Storage({
       binding: d1,
       domains: createSignalStorageDomains(d1),

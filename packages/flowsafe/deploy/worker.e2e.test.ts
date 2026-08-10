@@ -1,11 +1,12 @@
 // Executable proof for the shipped operator template. deploy/worker.ts was
 // typecheck-only (tsc -p deploy/tsconfig.json); its fetch()/scheduled()/queue()
 // handlers never ran in any test, so a template regression would ship silently.
-// This drives the REAL handler object in-process over the same fakes the rest
-// of the suite trusts: node:sqlite behind a D1-shaped adapter (real Mastra
-// D1Store + real D1ApprovalStore over real SQLite) and a DO namespace whose
+// This drives the handler object in-process over the same fakes the rest of the
+// suite trusts: a node:sqlite SQL unit facade behind the Mastra D1Store +
+// D1ApprovalStore graph, and a DO namespace whose
 // stubs construct real FlowsafeRunner instances (stub state carries the
-// idFromName identity, so the DO identity guard runs for real).
+// idFromName identity, so the DO identity guard code runs in-process). Runtime
+// and binding fidelity is covered by the Wrangler harness.
 //
 // What it pins, end to end over HTTP shapes:
 //   - the auth seam: /healthz open; everything else 401s without a mapped
@@ -57,9 +58,9 @@ import {
   staticTokenVerifier,
 } from '../src/host-kit/index.js';
 import {
-  d1DatabaseLike,
   openSqlite,
   type SqliteDatabase,
+  sqliteUnitDatabase,
 } from '../test-support/sqlite.js';
 import { PURGE_CRON, SWEEP_CRON } from './crons.js';
 import handler, { FlowsafeRunner } from './worker.js';
@@ -135,7 +136,7 @@ function makeEnv(overrides: Partial<Env> = {}): {
        VALUES (1, 'acme', '2026-08-10T00:00:00.000Z')`,
     )
     .run();
-  const d1 = d1DatabaseLike(sqlite);
+  const d1 = sqliteUnitDatabase(sqlite);
   const env = {
     DB: d1 as D1Database,
     DEPLOYMENT_TENANT: 'acme',
@@ -605,7 +606,7 @@ describe('deploy worker fetch(): live stream stage (opt-in)', () => {
       token: 'tok-reviewer',
     });
 
-    // #then — a ~60s addressing ticket (payload.signature), no grant
+    // #then — a ~60s addressing JWT, no grant
     expect(response.status).toBe(200);
     const body = (await response.json()) as {
       url: string;
@@ -613,7 +614,7 @@ describe('deploy worker fetch(): live stream stage (opt-in)', () => {
       expiresAt: number;
     };
     expect(body.url).toBe('/api/stream/hub');
-    expect(body.ticket.split('.')).toHaveLength(2);
+    expect(body.ticket.split('.')).toHaveLength(3);
     expect(body.expiresAt).toBeGreaterThan(Date.now());
   });
 

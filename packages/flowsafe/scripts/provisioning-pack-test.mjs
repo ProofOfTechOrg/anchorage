@@ -14,6 +14,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { assertAttwEsmPackage } from './attw-pack-check.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const temporary = mkdtempSync(join(tmpdir(), 'flowsafe-provisioning-'));
@@ -110,6 +111,16 @@ try {
     name.endsWith('.tgz'),
   );
   if (!packedName) throw new Error('pnpm pack returned no archive');
+  const archive = join(temporary, packedName);
+  run('pnpm', [
+    '--workspace-root',
+    'exec',
+    'publint',
+    'run',
+    archive,
+    '--strict',
+  ]);
+  assertAttwEsmPackage(archive, root);
   const consumerRoot = join(temporary, 'consumer');
   const wranglerRoot = join(consumerRoot, 'fake-wrangler');
   const cloudflareD1Root = join(consumerRoot, 'fake-cloudflare-d1');
@@ -154,6 +165,7 @@ writeFileSync(new URL('./install-script-ran', import.meta.url), 'unexpected');
       pnpm: {
         overrides: {
           '@mastra/cloudflare-d1': 'file:./fake-cloudflare-d1',
+          jose: `file:${realpathSync(join(root, 'node_modules', 'jose'))}`,
         },
       },
     }),

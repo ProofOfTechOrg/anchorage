@@ -15,7 +15,7 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
-import { d1DatabaseLike, openSqlite } from '../../test-support/sqlite.js';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   type ActorResolver,
   type ApprovalActor,
@@ -418,7 +418,7 @@ describe('createFlowsafeWorker stream stage opt-in', () => {
       )
       .run();
     const env: FlowsafeWorkerEnv = {
-      DB: d1DatabaseLike(sqlite) as FlowsafeWorkerEnv['DB'],
+      DB: sqliteUnitDatabase(sqlite) as FlowsafeWorkerEnv['DB'],
       DEPLOYMENT_TENANT: 'acme',
       DEPLOYMENT_IDENTITY_SECRET,
       RUNNER: recordingRunner([]) as FlowsafeWorkerEnv['RUNNER'],

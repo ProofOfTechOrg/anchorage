@@ -1,18 +1,15 @@
+import { cloudflare } from '@cloudflare/vite-plugin';
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vite';
 
-import { runApiDevPlugin } from './run-api-dev-plugin.js';
-
 const src = (path: string) => new URL(path, import.meta.url).pathname;
 
-// Full Vite React app for the Anchorage showcase. Vite bundles the Astryx CSS
-// (imported in src/index.css) and the approval-ui components. In `serve` mode
-// runApiDevPlugin mounts the in-process showcase host — /api/approvals (the
-// dashboard) + /runs + /workflows (the launcher/status panel) — so the app is a
-// real working backend. A production `build` is a pure client bundle that
-// targets the deployed worker on the same origin (or VITE_*_API_URL overrides).
-export default defineConfig(({ command }) => ({
-  plugins: [react(), ...(command === 'serve' ? [runApiDevPlugin()] : [])],
+// Full Vite React app and Cloudflare Worker for the Anchorage showcase. The
+// Cloudflare plugin drives both development and production from wrangler.jsonc,
+// so API requests, bindings, Durable Objects, and WebSockets use the deployed
+// topology while Vite bundles the SPA and approval-ui components.
+export default defineConfig({
+  plugins: [react(), cloudflare()],
   resolve: {
     // Mirrors tsconfig.json paths — @/ (SPA) and @flowsafe/ (deep DOM-free
     // flowsafe source; the SPA bundles the library from source, exactly as it
@@ -24,4 +21,5 @@ export default defineConfig(({ command }) => ({
     ],
   },
   server: { port: 4321 },
-}));
+  preview: { port: 8787 },
+});

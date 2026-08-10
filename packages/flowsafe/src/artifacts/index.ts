@@ -12,8 +12,6 @@
 // artifact scope, and names are validated segment-wise (no '.'/'..', no
 // empty segments) so a name can never escape its run's keyspace.
 
-import type { R2Bucket } from '@cloudflare/workers-types';
-
 import { isPathSafeId } from '../do-runner/path-safe-id.js';
 
 /** Bodies R2's put() accepts; the in-memory bucket normalizes them all. */
@@ -62,17 +60,6 @@ export interface ArtifactBucket {
     cursor?: string;
   }): Promise<ArtifactBucketListResult>;
 }
-
-// Compile-time proof that a real Cloudflare R2Bucket satisfies ArtifactBucket,
-// so a consumer passes `env.MY_BUCKET` straight into R2ArtifactStore with no
-// adapter. Type-only (erased at build; the non-exported alias never reaches the
-// emitted .d.ts, so consumers pull no workers-types dependency) — drift in
-// either type fails the gate here, the way deploy/worker.ts proves the
-// audit-export Queue/MessageBatch subsets by feeding them real bindings.
-type AssertTrue<T extends true> = T;
-type _R2SatisfiesArtifactBucket = AssertTrue<
-  R2Bucket extends ArtifactBucket ? true : false
->;
 
 export interface ArtifactRef {
   workflowId: string;

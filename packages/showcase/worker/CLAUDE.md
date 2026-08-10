@@ -10,5 +10,5 @@
 ```bash
 pnpm --filter showcase test
 pnpm --filter showcase typecheck
-pnpm --filter showcase dev:worker
+pnpm --filter showcase dev
 ```

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Guards over the parts of Mastra's persistence WE do not own but DO depend
-// on, exercised against the REAL @mastra/cloudflare-d1 D1Store over real
-// SQLite (node:sqlite):
+// on, exercised as a fast package-graph SQL unit against
+// @mastra/cloudflare-d1 over node:sqlite. The Wrangler harness owns D1/runtime
+// fidelity:
 //
 // 1. TABLE INVENTORY — createD1Storage eagerly creates exactly the tables
 //    MASTRA_TABLES names. A dependency bump that adds or renames one must make
@@ -22,9 +23,9 @@ import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 
 import {
-  d1DatabaseLike,
   openSqlite,
   type SqliteDatabase,
+  sqliteUnitDatabase,
 } from '../../test-support/sqlite.js';
 import { createScheduleStorageDomains } from '../schedules/storage.js';
 import { createSignalStorageDomains } from '../signals/storage.js';
@@ -117,7 +118,7 @@ type TtlKind =
   | 'thread-state-ttl'
   | 'schedule-trigger-ttl';
 
-describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
+describe('Mastra persistence guards (D1Store SQL over node:sqlite)', () => {
   // The one reason an unadopted table carries — hoisted so the ownership↔reason
   // biconditional below can tie them: an unadopted table has nothing to expire
   // BECAUSE nothing writes it, so it carries exactly this, and the day a track
@@ -208,7 +209,7 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     // notifications/thread-state domain, so those two tables come from the
     // flowsafe-owned D1 domains, not the adapter.
     const sqlite = openSqlite();
-    const binding = d1DatabaseLike(sqlite);
+    const binding = sqliteUnitDatabase(sqlite);
     const storage = createD1Storage({
       binding: binding as never,
       domains: {
@@ -329,7 +330,7 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     // #given — flowsafe-owned tables (the adapter ships neither); compose the
     // schedules domain and init to create them.
     const sqlite = openSqlite();
-    const binding = d1DatabaseLike(sqlite);
+    const binding = sqliteUnitDatabase(sqlite);
     const storage = createD1Storage({
       binding: binding as never,
       domains: createScheduleStorageDomains(binding as never),
@@ -367,7 +368,7 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     // finished runs; this purge has no second predicate.
     const sqlite = openSqlite();
     const storage = createD1Storage({
-      binding: d1DatabaseLike(sqlite) as never,
+      binding: sqliteUnitDatabase(sqlite) as never,
     });
     const runtime = buildGated(storage);
     await runtime.start('gated', { runId: 'abc_r1', inputData: {} });
@@ -401,7 +402,7 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     // #given
     const sqlite = openSqlite();
     const storage = createD1Storage({
-      binding: d1DatabaseLike(sqlite) as never,
+      binding: sqliteUnitDatabase(sqlite) as never,
     });
     const runtime = buildGated(storage);
     await runtime.start('gated', { runId: 'abc_r1', inputData: {} });
@@ -422,7 +423,7 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     // #given — the real adapter creates the table eagerly (Track B adopted it)
     const sqlite = openSqlite();
     const storage = createD1Storage({
-      binding: d1DatabaseLike(sqlite) as never,
+      binding: sqliteUnitDatabase(sqlite) as never,
     });
     const runtime = buildGated(storage);
     await runtime.start('gated', { runId: 'abc_r1', inputData: {} });
@@ -445,7 +446,7 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     // #given — these two tables are flowsafe-owned (the adapter ships neither),
     // so compose the domains and init to create them.
     const sqlite = openSqlite();
-    const binding = d1DatabaseLike(sqlite);
+    const binding = sqliteUnitDatabase(sqlite);
     const storage = createD1Storage({
       binding: binding as never,
       domains: createSignalStorageDomains(binding as never),
@@ -474,7 +475,7 @@ describe('Mastra persistence guards (real D1Store over real SQLite)', () => {
     // #given
     const sqlite = openSqlite();
     const storage = createD1Storage({
-      binding: d1DatabaseLike(sqlite) as never,
+      binding: sqliteUnitDatabase(sqlite) as never,
     });
     const runtime = buildGated(storage);
     await runtime.start('gated', { runId: 'abc_r1', inputData: {} });

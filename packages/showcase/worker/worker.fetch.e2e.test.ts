@@ -1,9 +1,8 @@
 // Drives the showcase worker's EXPORTED fetch() in-process — the route
 // composition itself (healthz, the demo-auth mount, the auth fall-through to
 // the run/approval surface), which the other showcase tests bypass by calling
-// the routers directly. Mirrors deploy/worker.e2e.test.ts's scaffolding:
-// D1-shaped node:sqlite, a throwing DO namespace (these routes never reach a
-// run leg), and the Parameters<typeof fetchHandler> cast for workers types.
+// the routers directly. The prepared-statement SQLite adapter is unit-only;
+// D1/workerd and Durable Object fidelity live in worker.harness.test.ts.
 
 import { D1ApprovalStoreFactory } from '@proofoftech/flowsafe/approval-api';
 import { describe, expect, it, vi } from 'vitest';
@@ -36,10 +35,19 @@ function openSqlite(): SqliteDatabase {
   return new mod.DatabaseSync(':memory:');
 }
 
-// Minimal D1 face over node:sqlite — the same envelope deploy's e2e uses
-// ({ results }, { meta }); enough for any schema-init the routers run.
-function d1DatabaseLike(db: SqliteDatabase): unknown {
+function sqliteUnitDatabase(db: SqliteDatabase): unknown {
+  const runSync = Symbol('runSync');
+
   function statement(sql: string, params: unknown[]): Record<string, unknown> {
+    const execute = () => {
+      const outcome = db.prepare(sql).run(...params) as {
+        changes?: number | bigint;
+      };
+      return {
+        success: true,
+        meta: { changes: Number(outcome?.changes ?? 0) },
+      };
+    };
     return {
       bind: (...values: unknown[]) => statement(sql, values),
       first: async (column?: string) => {
@@ -49,40 +57,38 @@ function d1DatabaseLike(db: SqliteDatabase): unknown {
         if (row === undefined) return null;
         return column !== undefined ? (row[column] ?? null) : row;
       },
-      run: async () => {
-        const outcome = db.prepare(sql).run(...params) as {
-          changes?: number | bigint;
-        };
-        return {
-          success: true,
-          meta: { changes: Number(outcome?.changes ?? 0) },
-        };
-      },
+      run: async () => execute(),
+      [runSync]: execute,
       all: async () => ({
         success: true,
         results: db.prepare(sql).all(...params),
         meta: {},
       }),
-      raw: async () => {
-        const rows = db.prepare(sql).all(...params) as Array<
-          Record<string, unknown>
-        >;
-        return rows.map((row) => Object.values(row));
-      },
     };
   }
   return {
     prepare: (sql: string) => statement(sql, []),
-    exec: async (sql: string) => {
-      db.exec(sql);
-      return { count: 1, duration: 0 };
+    batch: async (
+      statements: Array<{
+        run: () => Promise<unknown>;
+        [runSync]?: () => unknown;
+      }>,
+    ) => {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const results = [];
+        for (const prepared of statements) {
+          results.push(
+            prepared[runSync] ? prepared[runSync]() : await prepared.run(),
+          );
+        }
+        db.exec('COMMIT');
+        return results;
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
     },
-    batch: async (statements: Array<{ run: () => Promise<unknown> }>) => {
-      const results = [];
-      for (const stmt of statements) results.push(await stmt.run());
-      return results;
-    },
-    dump: async () => new ArrayBuffer(0),
   };
 }
 
@@ -112,7 +118,7 @@ function makeEnv(overrides: Partial<Env> = {}): Env {
   const sqlite = openSqlite();
   seedDeployment(sqlite);
   return {
-    DB: d1DatabaseLike(sqlite),
+    DB: sqliteUnitDatabase(sqlite),
     DEPLOYMENT_TENANT: 'showcase',
     DEPLOYMENT_IDENTITY_SECRET: 'test-deployment-identity-secret-0001',
     // None of these routes reaches a run leg; a request that does is a bug.
@@ -430,7 +436,7 @@ describe('showcase worker fetch(): the live-stream stage', () => {
     // #given a seeded pending approval + a stub hub
     const sqlite = openSqlite();
     seedDeployment(sqlite);
-    const db = d1DatabaseLike(sqlite);
+    const db = sqliteUnitDatabase(sqlite);
     const approvals = new D1ApprovalStoreFactory(
       db as ConstructorParameters<typeof D1ApprovalStoreFactory>[0],
     );
@@ -471,7 +477,7 @@ describe('showcase worker fetch(): the live-stream stage', () => {
     // THROWS — a hard transport failure, not merely a non-2xx status
     const sqlite = openSqlite();
     seedDeployment(sqlite);
-    const db = d1DatabaseLike(sqlite);
+    const db = sqliteUnitDatabase(sqlite);
     const approvals = new D1ApprovalStoreFactory(
       db as ConstructorParameters<typeof D1ApprovalStoreFactory>[0],
     );

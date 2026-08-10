@@ -68,6 +68,39 @@
       }
     },
     {
+      "includes": [
+        "packages/agent-starter/src/**",
+        "packages/agent-starter/test/**",
+        "packages/agent-starter/scripts/**"
+      ],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedImports": {
+              "level": "error",
+              "options": {
+                "patterns": [
+                  {
+                    "group": [
+                      "@proofoftech/flowsafe/src/**",
+                      "@proofoftech/flowsafe/dist/**",
+                      "@proofoftech/breakwater/src/**",
+                      "@proofoftech/breakwater/dist/**",
+                      "../../flowsafe/**",
+                      "../../breakwater/**",
+                      "packages/flowsafe/src/**",
+                      "packages/breakwater/src/**"
+                    ],
+                    "message": "Use a documented @proofoftech package export; starter code must not reach sibling source or dist files."
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
       "includes": ["packages/showcase/worker/**"],
       "linter": {
         "rules": {

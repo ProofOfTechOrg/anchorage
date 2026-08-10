@@ -46,6 +46,22 @@ try {
     'pnpm pack must produce exactly one tarball',
   );
   const tarball = join(packedDirectory, tarballs[0]);
+  run('pnpm', [
+    '--workspace-root',
+    'exec',
+    'publint',
+    'run',
+    tarball,
+    '--strict',
+  ]);
+  run('pnpm', [
+    '--workspace-root',
+    'exec',
+    'attw',
+    tarball,
+    '--profile',
+    'esm-only',
+  ]);
   run('tar', ['-xzf', tarball, '-C', extractedDirectory]);
 
   const packedPackageRoot = join(extractedDirectory, 'package');
@@ -55,22 +71,6 @@ try {
   assert.equal(manifest.dependencies?.zod, '^4.4.3');
   assert.equal(manifest.devDependencies?.zod, undefined);
   assert.equal(manifest.peerDependencies?.['@mastra/core'], '^1.50.0');
-  assert.equal(manifest.engines?.node, '>=22');
-  assert.equal(manifest.type, 'module');
-
-  for (const [subpath, target] of Object.entries(manifest.exports)) {
-    if (subpath === './package.json') continue;
-    assert.equal(
-      typeof target,
-      'string',
-      `export ${subpath} must resolve to a single JavaScript file`,
-    );
-    await readFile(join(packedPackageRoot, target), 'utf8');
-    await readFile(
-      join(packedPackageRoot, target.replace(/\.js$/u, '.d.ts')),
-      'utf8',
-    );
-  }
   for (const documentation of [
     'README.md',
     'CONNECTORS.md',

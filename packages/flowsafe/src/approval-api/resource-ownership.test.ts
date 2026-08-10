@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it } from 'vitest';
 
-import { d1DatabaseLike, openSqlite } from '../../test-support/sqlite.js';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   canonicalResourceOwner,
   createResourceOwnershipSchema,
@@ -18,7 +18,7 @@ const OPAL = { kind: 'human', id: 'opal' } as const;
 const EVE = { kind: 'human', id: 'eve' } as const;
 
 function stores(): Array<[string, RecoverableResourceOwnershipStore]> {
-  const db = d1DatabaseLike(openSqlite()) as ResourceOwnershipDatabase;
+  const db = sqliteUnitDatabase(openSqlite()) as ResourceOwnershipDatabase;
   return [
     ['memory', new InMemoryResourceOwnershipStore()],
     ['d1', new D1ResourceOwnershipStore(db)],
@@ -245,7 +245,9 @@ describe.each(stores())('%s resource reservation recovery', (_name, store) => {
 
 describe('D1ResourceOwnershipStore schema gate', () => {
   it('memoizes direct-constructor schema setup across operations', async () => {
-    const backing = d1DatabaseLike(openSqlite()) as ResourceOwnershipDatabase;
+    const backing = sqliteUnitDatabase(
+      openSqlite(),
+    ) as ResourceOwnershipDatabase;
     let schemaWrites = 0;
     const db: ResourceOwnershipDatabase = {
       prepare(query) {
@@ -263,7 +265,7 @@ describe('D1ResourceOwnershipStore schema gate', () => {
   });
 
   it('snapshots owner and claims before awaiting schema readiness', async () => {
-    const db = d1DatabaseLike(openSqlite()) as ResourceOwnershipDatabase;
+    const db = sqliteUnitDatabase(openSqlite()) as ResourceOwnershipDatabase;
     await createResourceOwnershipSchema(db);
     let releaseReady: () => void = () => undefined;
     const ready = new Promise<void>((resolve) => {

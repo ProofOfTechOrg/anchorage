@@ -1,15 +1,7 @@
 {
-  // Node-side pass: the Vite config + dev-server plugin run in Node, not the
-  // browser. This exists so the plugin's usage of the showcase host
-  // (buildShowcaseRuntime + approval-api + host-kit bridge) is type-checked by
-  // the repo gate — otherwise a signature change would rot here silently and
-  // only surface at `pnpm dev` runtime. Since the plugin pulls in the
-  // Cloudflare-native runtime (D1/DO/R2 types in type positions), this pass uses
-  // `@cloudflare/workers-types` (NOT the DOM lib — they collide on Request /
-  // Response globals); the web APIs the plugin calls (Request/Headers/Response/
-  // URL) resolve from workers-types, and the connect / http request/response
-  // types resolve loosely via skipLibCheck. Cross-package source mappings come
-  // from the shared tsconfig.paths.json (matches the vitest aliases).
+  // Node-side pass for the Vite configuration. Worker source is checked by
+  // tsconfig.worker.json; the Cloudflare plugin reads that project and the real
+  // wrangler.jsonc rather than loading Worker internals into the Node process.
   "extends": ["../../tsconfig.base.json", "./tsconfig.paths.json"],
   "compilerOptions": {
     "lib": ["ES2022"],
@@ -17,5 +9,5 @@
     "noEmit": true,
     "rootDir": "../.."
   },
-  "include": ["vite.config.ts", "run-api-dev-plugin.ts"]
+  "include": ["vite.config.ts"]
 }

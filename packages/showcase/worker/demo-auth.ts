@@ -30,10 +30,22 @@ import {
   hmacSign,
   hmacVerifier,
   mintHmacToken,
-  readBoundedBody,
 } from '@proofoftech/flowsafe/host-kit';
+import { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
+import {
+  authorizationCodeGrant,
+  buildAuthorizationUrl,
+  ClientSecretPost,
+  Configuration,
+  customFetch,
+  enableNonRepudiationChecks,
+  type ServerMetadata,
+} from 'openid-client';
+import { z } from 'zod';
 
 const MAX_REFRESH_BODY_BYTES = 16_384;
+const REFRESH_BODY_SCHEMA = z.strictObject({ token: z.string() });
 
 /** Structural D1 subset (same posture as the other stores). */
 export interface DemoDatabase {
@@ -332,7 +344,56 @@ export interface OAuthProvider {
   exchange(input: {
     code: string;
     redirectUri: string;
+    /** Full callback URL lets the protocol client validate every parameter. */
+    callbackUrl?: URL;
+    /** The already signature- and cookie-validated state expectation. */
+    state?: string;
   }): Promise<{ subject: string } | undefined>;
+}
+
+const GITHUB_SERVER: ServerMetadata = {
+  issuer: 'https://github.com',
+  authorization_endpoint: 'https://github.com/login/oauth/authorize',
+  token_endpoint: 'https://github.com/login/oauth/access_token',
+  token_endpoint_auth_methods_supported: ['client_secret_post'],
+};
+
+const GOOGLE_SERVER: ServerMetadata = {
+  issuer: 'https://accounts.google.com',
+  authorization_endpoint: 'https://accounts.google.com/o/oauth2/v2/auth',
+  token_endpoint: 'https://oauth2.googleapis.com/token',
+  jwks_uri: 'https://www.googleapis.com/oauth2/v3/certs',
+  id_token_signing_alg_values_supported: ['RS256'],
+  token_endpoint_auth_methods_supported: ['client_secret_post'],
+};
+
+function providerConfiguration(
+  server: ServerMetadata,
+  options: { clientId: string; clientSecret: string },
+  fetchFn: typeof fetch,
+): Configuration {
+  const config = new Configuration(
+    server,
+    options.clientId,
+    undefined,
+    ClientSecretPost(options.clientSecret),
+  );
+  config[customFetch] = (url, init) =>
+    fetchFn(url, init as unknown as RequestInit);
+  return config;
+}
+
+function callbackUrl(input: {
+  code: string;
+  redirectUri: string;
+  callbackUrl?: URL;
+  state?: string;
+}): URL {
+  if (input.callbackUrl) return new URL(input.callbackUrl);
+  const url = new URL(input.redirectUri);
+  if (input.code) url.searchParams.set('code', input.code);
+  if (input.state) url.searchParams.set('state', input.state);
+  return url;
 }
 
 interface GithubProviderOptions {
@@ -344,50 +405,43 @@ interface GithubProviderOptions {
 
 export function githubProvider(options: GithubProviderOptions): OAuthProvider {
   const fetchFn = options.fetch ?? fetch;
+  const protocolFetch = (async (input, init) => {
+    const headers = new Headers(init?.headers);
+    headers.set('accept', 'application/json');
+    return fetchFn(input, { ...init, headers });
+  }) as typeof fetch;
+  const config = providerConfiguration(GITHUB_SERVER, options, protocolFetch);
   return {
     name: 'github',
     authorizeUrl({ state, redirectUri }) {
-      const url = new URL('https://github.com/login/oauth/authorize');
-      url.searchParams.set('client_id', options.clientId);
-      url.searchParams.set('redirect_uri', redirectUri);
-      url.searchParams.set('state', state);
-      // No scopes: public identity is all the demo needs.
-      return url.toString();
+      return buildAuthorizationUrl(config, {
+        redirect_uri: redirectUri,
+        response_type: 'code',
+        state,
+      }).toString();
     },
-    async exchange({ code, redirectUri }) {
-      const tokenResponse = await fetchFn(
-        'https://github.com/login/oauth/access_token',
-        {
-          method: 'POST',
+    async exchange(input) {
+      try {
+        const tokens = await authorizationCodeGrant(
+          config,
+          callbackUrl(input),
+          { expectedState: input.state },
+        );
+        const userResponse = await fetchFn('https://api.github.com/user', {
           headers: {
-            accept: 'application/json',
-            'content-type': 'application/json',
+            authorization: `Bearer ${tokens.access_token}`,
+            accept: 'application/vnd.github+json',
+            'user-agent': 'anchorage-demo',
           },
-          body: JSON.stringify({
-            client_id: options.clientId,
-            client_secret: options.clientSecret,
-            code,
-            redirect_uri: redirectUri,
-          }),
-        },
-      );
-      if (!tokenResponse.ok) return undefined;
-      const tokenBody = (await tokenResponse.json()) as {
-        access_token?: string;
-      };
-      if (!tokenBody.access_token) return undefined;
-      const userResponse = await fetchFn('https://api.github.com/user', {
-        headers: {
-          authorization: `Bearer ${tokenBody.access_token}`,
-          accept: 'application/vnd.github+json',
-          'user-agent': 'anchorage-demo',
-        },
-      });
-      if (!userResponse.ok) return undefined;
-      const user = (await userResponse.json()) as { id?: number };
-      if (typeof user.id !== 'number') return undefined;
-      // The NUMERIC id is the stable subject — logins are renameable.
-      return { subject: `github:${user.id}` };
+        });
+        if (!userResponse.ok) return undefined;
+        const user = (await userResponse.json()) as { id?: number };
+        if (typeof user.id !== 'number') return undefined;
+        // The NUMERIC id is the stable subject — logins are renameable.
+        return { subject: `github:${user.id}` };
+      } catch {
+        return undefined;
+      }
     },
   };
 }
@@ -401,55 +455,42 @@ interface GoogleProviderOptions {
 
 export function googleProvider(options: GoogleProviderOptions): OAuthProvider {
   const fetchFn = options.fetch ?? fetch;
+  const config = providerConfiguration(GOOGLE_SERVER, options, fetchFn);
+  enableNonRepudiationChecks(config);
   return {
     name: 'google',
     authorizeUrl({ state, redirectUri }) {
-      const url = new URL('https://accounts.google.com/o/oauth2/v2/auth');
-      url.searchParams.set('client_id', options.clientId);
-      url.searchParams.set('redirect_uri', redirectUri);
-      url.searchParams.set('response_type', 'code');
-      // 'openid' alone: the demo needs only a stable subject (`sub`), never
-      // email or profile — the narrowest consent screen Google offers.
-      url.searchParams.set('scope', 'openid');
-      url.searchParams.set('state', state);
-      return url.toString();
+      const nonce = nonceOfState(state);
+      return buildAuthorizationUrl(config, {
+        redirect_uri: redirectUri,
+        response_type: 'code',
+        // `openid` alone is the narrowest consent: the validated ID Token's
+        // stable `sub` is sufficient; no email or profile request is needed.
+        scope: 'openid',
+        state,
+        ...(nonce ? { nonce } : {}),
+      }).toString();
     },
-    async exchange({ code, redirectUri }) {
-      // Google's token endpoint accepts ONLY form encoding — a JSON body is
-      // rejected (unlike GitHub's, which negotiates).
-      const tokenResponse = await fetchFn(
-        'https://oauth2.googleapis.com/token',
-        {
-          method: 'POST',
-          headers: { 'content-type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({
-            grant_type: 'authorization_code',
-            code,
-            client_id: options.clientId,
-            client_secret: options.clientSecret,
-            redirect_uri: redirectUri,
-          }).toString(),
-        },
-      );
-      if (!tokenResponse.ok) return undefined;
-      const tokenBody = (await tokenResponse.json()) as {
-        access_token?: string;
-      };
-      if (!tokenBody.access_token) return undefined;
-      const userResponse = await fetchFn(
-        'https://openidconnect.googleapis.com/v1/userinfo',
-        {
-          headers: { authorization: `Bearer ${tokenBody.access_token}` },
-        },
-      );
-      if (!userResponse.ok) return undefined;
-      const user = (await userResponse.json()) as { sub?: string };
-      if (typeof user.sub !== 'string' || user.sub.length === 0) {
+    async exchange(input) {
+      try {
+        const nonce = input.state ? nonceOfState(input.state) : undefined;
+        const tokens = await authorizationCodeGrant(
+          config,
+          callbackUrl(input),
+          {
+            expectedState: input.state,
+            expectedNonce: nonce,
+            idTokenExpected: true,
+          },
+        );
+        const subject = tokens.claims()?.sub;
+        if (typeof subject !== 'string' || subject.length === 0) {
+          return undefined;
+        }
+        return { subject: `google:${subject}` };
+      } catch {
         return undefined;
       }
-      // `sub` is Google's stable per-account identifier ("unique among all
-      // Google accounts and never reused") — emails are renameable.
-      return { subject: `google:${user.sub}` };
     },
   };
 }
@@ -620,117 +661,115 @@ export function createDemoAuthRouter(
   options: DemoAuthRouterOptions,
 ): (request: Request) => Promise<Response | null> {
   const now = options.now ?? Date.now;
-  return async (request: Request): Promise<Response | null> => {
-    const url = new URL(request.url);
-    if (!url.pathname.startsWith('/auth/')) return null;
-    // Unauthenticated capability probe for the SPA's sign-in button; carries
-    // no secrets and honestly reports the kill switch.
-    if (request.method === 'GET' && url.pathname === '/auth/config') {
-      return json({
-        enabled: !options.disabled,
-        provider: options.provider.name,
-      });
-    }
+  const app = new Hono();
+
+  // Registered before the disabled middleware: this unauthenticated probe
+  // must honestly report the kill switch even while every other route 503s.
+  app.get('/auth/config', () =>
+    json({
+      enabled: !options.disabled,
+      provider: options.provider.name,
+    }),
+  );
+
+  app.use('/auth/*', async (_context, next) => {
     if (options.disabled) {
       return json({ error: 'the demo is temporarily disabled' }, 503);
     }
+    await next();
+  });
+
+  app.get(`/auth/${options.provider.name}`, async (context) => {
+    const url = new URL(context.req.url);
     const redirectUri = `${url.origin}/auth/${options.provider.name}/callback`;
+    const { state, nonce } = await signState(options.secret, now());
+    // SameSite=Lax still sends the cookie on the provider's top-level GET
+    // redirect back to us, while blocking cross-site POST/subresource use.
+    return new Response(null, {
+      status: 302,
+      headers: {
+        location: options.provider.authorizeUrl({ state, redirectUri }),
+        'cache-control': 'no-store',
+        'set-cookie': `${STATE_COOKIE}=${nonce}; HttpOnly; Secure; SameSite=Lax; Path=/auth; Max-Age=600`,
+      },
+    });
+  });
 
+  app.get(`/auth/${options.provider.name}/callback`, async (context) => {
+    const url = new URL(context.req.url);
+    const redirectUri = `${url.origin}/auth/${options.provider.name}/callback`;
+    const state = url.searchParams.get('state') ?? '';
+    const code = url.searchParams.get('code') ?? '';
+    // Signature + expiry, THEN the browser binding: a signed state the
+    // attacker minted carries a nonce this browser never received, so the
+    // login-CSRF walk-the-victim-into-my-session path fails here.
+    const nonce = nonceOfState(state);
     if (
-      request.method === 'GET' &&
-      url.pathname === `/auth/${options.provider.name}`
+      !(await verifyState(options.secret, state, now())) ||
+      nonce === undefined ||
+      cookieValue(context.req.raw, STATE_COOKIE) !== nonce
     ) {
-      const { state, nonce } = await signState(options.secret, now());
-      // SameSite=Lax still sends the cookie on the provider's top-level GET
-      // redirect back to us, while blocking cross-site POST/subresource use.
-      return new Response(null, {
-        status: 302,
-        headers: {
-          location: options.provider.authorizeUrl({ state, redirectUri }),
-          'cache-control': 'no-store',
-          'set-cookie': `${STATE_COOKIE}=${nonce}; HttpOnly; Secure; SameSite=Lax; Path=/auth; Max-Age=600`,
-        },
-      });
+      return json({ error: 'invalid or expired state' }, 403);
     }
-
-    if (
-      request.method === 'GET' &&
-      url.pathname === `/auth/${options.provider.name}/callback`
-    ) {
-      const state = url.searchParams.get('state') ?? '';
-      const code = url.searchParams.get('code') ?? '';
-      // Signature + expiry, THEN the browser binding: a signed state the
-      // attacker minted carries a nonce this browser never received, so the
-      // login-CSRF walk-the-victim-into-my-session path fails here.
-      const nonce = nonceOfState(state);
-      if (
-        !(await verifyState(options.secret, state, now())) ||
-        nonce === undefined ||
-        cookieValue(request, STATE_COOKIE) !== nonce
-      ) {
-        return json({ error: 'invalid or expired state' }, 403);
-      }
-      const identity = await options.provider.exchange({ code, redirectUri });
-      if (!identity) return json({ error: 'sign-in failed' }, 401);
-      const session = await findOrCreateDemoSession(options.db, {
-        provider: options.provider.name,
-        subject: identity.subject,
-        sessionTtlMs: options.sessionTtlMs,
-        now,
+    let identity: { subject: string } | undefined;
+    try {
+      identity = await options.provider.exchange({
+        code,
+        redirectUri,
+        callbackUrl: url,
+        state,
       });
-      const tokenSet = await mintDemoTokenSet({
-        secret: options.secret,
-        session,
-        ttlSeconds: options.jwtTtlSeconds,
-        now,
-      });
-      const fragment = base64UrlEncode(
-        encoder.encode(JSON.stringify(tokenSet)),
-      );
-      return new Response(null, {
-        status: 302,
-        headers: {
-          location: `/#demo-tokens=${fragment}`,
-          'cache-control': 'no-store',
-          // One round-trip per nonce: expire the binding cookie now.
-          'set-cookie': `${STATE_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/auth; Max-Age=0`,
-        },
-      });
+    } catch {
+      // Provider errors are intentionally collapsed into the stable public
+      // envelope below; credentials and upstream details never reach it.
     }
+    if (!identity) return json({ error: 'sign-in failed' }, 401);
+    const session = await findOrCreateDemoSession(options.db, {
+      provider: options.provider.name,
+      subject: identity.subject,
+      sessionTtlMs: options.sessionTtlMs,
+      now,
+    });
+    const tokenSet = await mintDemoTokenSet({
+      secret: options.secret,
+      session,
+      ttlSeconds: options.jwtTtlSeconds,
+      now,
+    });
+    const fragment = base64UrlEncode(encoder.encode(JSON.stringify(tokenSet)));
+    return new Response(null, {
+      status: 302,
+      headers: {
+        location: `/#demo-tokens=${fragment}`,
+        'cache-control': 'no-store',
+        // One round-trip per nonce: expire the binding cookie now.
+        'set-cookie': `${STATE_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/auth; Max-Age=0`,
+      },
+    });
+  });
 
-    if (request.method === 'POST' && url.pathname === '/auth/refresh') {
-      const rawBody = await readBoundedBody(
-        request,
-        MAX_REFRESH_BODY_BYTES,
-        'demo refresh body exceeds limit',
-      );
-      if (!rawBody.ok) {
-        return json(
-          {
-            error:
-              rawBody.reason === 'payload-too-large'
-                ? 'payload too large'
-                : 'a JSON object body is required',
-          },
-          rawBody.reason === 'payload-too-large' ? 413 : 400,
-        );
-      }
-      let body: { token?: string } | undefined;
+  app.post(
+    '/auth/refresh',
+    bodyLimit({
+      maxSize: MAX_REFRESH_BODY_BYTES,
+      onError: () => json({ error: 'payload too large' }, 413),
+    }),
+    async (context) => {
+      let value: unknown;
       try {
-        const parsed: unknown = JSON.parse(rawBody.text);
-        if (
-          parsed !== null &&
-          typeof parsed === 'object' &&
-          !Array.isArray(parsed)
-        ) {
-          body = parsed as { token?: string };
-        }
-      } catch {
-        // The common validation response below covers malformed JSON.
+        const bytes = await context.req.raw.arrayBuffer();
+        const text = new TextDecoder('utf-8', {
+          fatal: true,
+          ignoreBOM: false,
+        }).decode(bytes);
+        value = JSON.parse(text);
+      } catch (error) {
+        return error instanceof SyntaxError
+          ? json({ error: 'token is required' }, 400)
+          : json({ error: 'a JSON object body is required' }, 400);
       }
-      if (typeof body?.token !== 'string') {
-        return json({ error: 'token is required' }, 400);
-      }
+      const parsed = REFRESH_BODY_SCHEMA.safeParse(value);
+      if (!parsed.success) return json({ error: 'token is required' }, 400);
       // Require the presented token to remain valid. The SPA refreshes before
       // expiry; a fully expired token falls back to OAuth sign-in.
       const verify = hmacVerifier({
@@ -739,7 +778,7 @@ export function createDemoAuthRouter(
         audience: DEMO_JWT_AUDIENCE,
         now,
       });
-      const actor = await verify.verify(body.token);
+      const actor = await verify.verify(parsed.data.token);
       if (!actor) return json({ error: 'invalid token' }, 401);
       const sessionId = demoSessionIdOfActor(actor);
       if (!sessionId) return json({ error: 'invalid token' }, 401);
@@ -759,8 +798,18 @@ export function createDemoAuthRouter(
           now,
         }),
       );
-    }
+    },
+  );
 
-    return json({ error: 'not found' }, 404);
+  app.notFound(() => json({ error: 'not found' }, 404));
+
+  return async (request: Request): Promise<Response | null> => {
+    if (!new URL(request.url).pathname.startsWith('/auth/')) return null;
+    if (request.method === 'HEAD') {
+      return options.disabled
+        ? json({ error: 'the demo is temporarily disabled' }, 503)
+        : json({ error: 'not found' }, 404);
+    }
+    return app.fetch(request);
   };
 }

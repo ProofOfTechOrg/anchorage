@@ -14,6 +14,7 @@
 
 # --- Tracked top-level files ---
 !/.gitignore
+!/.dependency-cruiser.cjs
 !/.lintstagedrc.cjs
 !/.node-version
 !/biome.json
@@ -27,8 +28,12 @@
 !/SECURITY.md
 !/SUPPORT.md
 !/tsconfig.base.json
+!/tsconfig.harness.json
 !/typedoc.json
 !/vitest.config.ts
+!/vitest.breakwater-workers.config.mts
+!/vitest.flowsafe-harness.config.ts
+!/vitest.flowsafe-workers.config.ts
 
 # --- Re-ignore build / dependency / runtime artifacts nested inside the
 #     tracked directories above (root-level "/*" does not reach these) ---

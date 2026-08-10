@@ -821,6 +821,8 @@ describe('Mastra Agent execution-entry inventory', () => {
       'disableBackgroundTasks',
       'durable',
       'enableBackgroundTasks',
+      // Pure title-generation prefilter; it cannot initiate agent execution.
+      'filterUiMessagesByThread',
       'formatMessagePartsForTitle',
       'formatMessagesForTitle',
       'formatTools',

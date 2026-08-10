@@ -7,7 +7,7 @@
 
 import { openSqlite, type SqliteDatabase } from '@flowsafe-test/sqlite.js';
 import { hmacVerifier } from '@proofoftech/flowsafe/host-kit';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import {
   consumeRunBudget,
   createDemoAuthRouter,
@@ -21,6 +21,7 @@ import {
   type DemoTokenSet,
   deleteExpiredDemoSessions,
   findOrCreateDemoSession,
+  githubProvider,
   googleProvider,
   mintDemoSessionId,
   mintDemoTokenSet,
@@ -355,16 +356,83 @@ describe('mintDemoTokenSet', () => {
 describe('googleProvider', () => {
   const OPTIONS = { clientId: 'client-1', clientSecret: 'secret-1' };
   const REDIRECT_URI = 'https://demo.test/auth/google/callback';
+  const STATE = '0123456789abcdef01.1786400000000.state-signature';
+  const NONCE = '0123456789abcdef01';
+  let signingKey: CryptoKey;
+  let publicJwk: JsonWebKey;
 
   function jsonResponse(payload: unknown, status = 200): Response {
-    return new Response(JSON.stringify(payload), { status });
+    return new Response(JSON.stringify(payload), {
+      status,
+      headers: { 'content-type': 'application/json' },
+    });
   }
 
-  it('builds a code-flow authorize URL with the minimal openid scope', () => {
+  function base64Url(bytes: Uint8Array): string {
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary)
+      .replace(/=/g, '')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_');
+  }
+
+  async function idToken(
+    overrides: Record<string, unknown> = {},
+  ): Promise<string> {
+    const now = Math.floor(Date.now() / 1000);
+    const encodeJson = (value: unknown) =>
+      base64Url(new TextEncoder().encode(JSON.stringify(value)));
+    const protectedHeader = encodeJson({
+      alg: 'RS256',
+      kid: 'google-test-key',
+      typ: 'JWT',
+    });
+    const claims = encodeJson({
+      iss: 'https://accounts.google.com',
+      aud: OPTIONS.clientId,
+      sub: '1093874',
+      nonce: NONCE,
+      iat: now,
+      exp: now + 300,
+      ...overrides,
+    });
+    const input = `${protectedHeader}.${claims}`;
+    const signature = await crypto.subtle.sign(
+      'RSASSA-PKCS1-v1_5',
+      signingKey,
+      new TextEncoder().encode(input),
+    );
+    return `${input}.${base64Url(new Uint8Array(signature))}`;
+  }
+
+  function callback(parameters: string): URL {
+    return new URL(`${REDIRECT_URI}?${parameters}`);
+  }
+
+  beforeAll(async () => {
+    const pair = (await crypto.subtle.generateKey(
+      {
+        name: 'RSASSA-PKCS1-v1_5',
+        modulusLength: 2048,
+        publicExponent: new Uint8Array([1, 0, 1]),
+        hash: 'SHA-256',
+      },
+      true,
+      ['sign', 'verify'],
+    )) as CryptoKeyPair;
+    signingKey = pair.privateKey;
+    publicJwk = (await crypto.subtle.exportKey(
+      'jwk',
+      pair.publicKey,
+    )) as JsonWebKey;
+  });
+
+  it('builds a code-flow authorize URL with minimal scope and a bound OIDC nonce', () => {
     // #given / #when
     const url = new URL(
       googleProvider(OPTIONS).authorizeUrl({
-        state: 'the-state',
+        state: STATE,
         redirectUri: REDIRECT_URI,
       }),
     );
@@ -378,33 +446,57 @@ describe('googleProvider', () => {
       redirect_uri: REDIRECT_URI,
       response_type: 'code',
       scope: 'openid',
-      state: 'the-state',
+      state: STATE,
+      nonce: NONCE,
     });
   });
 
-  it('exchanges the code FORM-ENCODED, reads the subject from userinfo, and scopes it google:', async () => {
-    // #given — Google's token endpoint rejects JSON bodies; pin the encoding
+  it('validates the Google ID Token and scopes its stable subject google:', async () => {
+    // #given — a real RS256 ID Token and matching JWKS response
     const calls: Array<{ url: string; init?: RequestInit }> = [];
     const fetchFn = (async (input: unknown, init?: RequestInit) => {
       calls.push({ url: String(input), init });
       if (String(input).includes('oauth2.googleapis.com/token')) {
-        return jsonResponse({ access_token: 'at-123' });
+        return jsonResponse({
+          access_token: 'at-123',
+          token_type: 'Bearer',
+          id_token: await idToken(),
+        });
       }
-      return jsonResponse({ sub: '1093874' });
+      if (String(input).includes('googleapis.com/oauth2/v3/certs')) {
+        return jsonResponse({
+          keys: [
+            {
+              ...publicJwk,
+              alg: 'RS256',
+              kid: 'google-test-key',
+              use: 'sig',
+            },
+          ],
+        });
+      }
+      throw new Error(`unexpected fetch: ${String(input)}`);
     }) as typeof fetch;
 
     // #when
     const identity = await googleProvider({
       ...OPTIONS,
       fetch: fetchFn,
-    }).exchange({ code: 'good-code', redirectUri: REDIRECT_URI });
+    }).exchange({
+      code: 'good-code',
+      redirectUri: REDIRECT_URI,
+      callbackUrl: callback(
+        `code=good-code&state=${encodeURIComponent(STATE)}`,
+      ),
+      state: STATE,
+    });
 
     // #then — provider-scoped stable subject
     expect(identity).toEqual({ subject: 'google:1093874' });
-    const [token, userinfo] = calls;
+    const [token, jwks] = calls;
     expect(token?.url).toBe('https://oauth2.googleapis.com/token');
-    expect(new Headers(token?.init?.headers).get('content-type')).toBe(
-      'application/x-www-form-urlencoded',
+    expect(new Headers(token?.init?.headers).get('content-type')).toMatch(
+      /^application\/x-www-form-urlencoded(?:;|$)/,
     );
     expect(
       Object.fromEntries(new URLSearchParams(String(token?.init?.body))),
@@ -415,32 +507,223 @@ describe('googleProvider', () => {
       client_secret: 'secret-1',
       redirect_uri: REDIRECT_URI,
     });
-    expect(userinfo?.url).toBe(
-      'https://openidconnect.googleapis.com/v1/userinfo',
+    expect(jwks?.url).toBe('https://www.googleapis.com/oauth2/v3/certs');
+    expect(
+      calls.some(({ url }) => url.includes('openidconnect.googleapis.com')),
+    ).toBe(false);
+  });
+
+  it.each([
+    [
+      'provider denial',
+      `error=access_denied&state=${encodeURIComponent(STATE)}`,
+    ],
+    ['missing code', `state=${encodeURIComponent(STATE)}`],
+    [
+      'duplicate code parameter',
+      `code=one&code=two&state=${encodeURIComponent(STATE)}`,
+    ],
+    ['wrong returned state', 'code=good-code&state=another-state'],
+  ])('fails closed before token exchange on %s', async (_name, parameters) => {
+    const fetchFn = vi.fn<typeof fetch>();
+
+    const identity = await googleProvider({
+      ...OPTIONS,
+      fetch: fetchFn,
+    }).exchange({
+      code: 'good-code',
+      redirectUri: REDIRECT_URI,
+      callbackUrl: callback(parameters),
+      state: STATE,
+    });
+
+    expect(identity).toBeUndefined();
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      'token endpoint error',
+      async () => jsonResponse({ error: 'invalid_grant' }, 400),
+    ],
+    [
+      'missing ID Token',
+      async () => jsonResponse({ access_token: 'at', token_type: 'Bearer' }),
+    ],
+    [
+      'missing access token',
+      async () =>
+        jsonResponse({ token_type: 'Bearer', id_token: await idToken() }),
+    ],
+    [
+      'invalid ID Token signature',
+      async () => {
+        const token = await idToken();
+        const [header, claims, signature = ''] = token.split('.');
+        const replacement = signature.startsWith('A') ? 'B' : 'A';
+        return jsonResponse({
+          access_token: 'at',
+          token_type: 'Bearer',
+          id_token: `${header}.${claims}.${replacement}${signature.slice(1)}`,
+        });
+      },
+    ],
+    [
+      'wrong ID Token issuer',
+      async () =>
+        jsonResponse({
+          access_token: 'at',
+          token_type: 'Bearer',
+          id_token: await idToken({ iss: 'https://attacker.example' }),
+        }),
+    ],
+    [
+      'wrong ID Token nonce',
+      async () =>
+        jsonResponse({
+          access_token: 'at',
+          token_type: 'Bearer',
+          id_token: await idToken({ nonce: 'wrong-nonce' }),
+        }),
+    ],
+    [
+      'missing ID Token subject',
+      async () =>
+        jsonResponse({
+          access_token: 'at',
+          token_type: 'Bearer',
+          id_token: await idToken({ sub: undefined }),
+        }),
+    ],
+    [
+      'empty ID Token subject',
+      async () =>
+        jsonResponse({
+          access_token: 'at',
+          token_type: 'Bearer',
+          id_token: await idToken({ sub: '' }),
+        }),
+    ],
+  ])('fails closed on %s', async (_name, tokenResponse) => {
+    const fetchFn = (async (input: unknown) => {
+      if (String(input).includes('oauth2.googleapis.com/token')) {
+        return tokenResponse();
+      }
+      return jsonResponse({
+        keys: [
+          {
+            ...publicJwk,
+            alg: 'RS256',
+            kid: 'google-test-key',
+            use: 'sig',
+          },
+        ],
+      });
+    }) as typeof fetch;
+
+    expect(
+      await googleProvider({ ...OPTIONS, fetch: fetchFn }).exchange({
+        code: 'good-code',
+        redirectUri: REDIRECT_URI,
+        callbackUrl: callback(
+          `code=good-code&state=${encodeURIComponent(STATE)}`,
+        ),
+        state: STATE,
+      }),
+    ).toBeUndefined();
+  });
+});
+
+describe('githubProvider', () => {
+  const OPTIONS = { clientId: 'github-client', clientSecret: 'github-secret' };
+  const REDIRECT_URI = 'https://demo.test/auth/github/callback';
+  const STATE = '0123456789abcdef01.1786400000000.state-signature';
+
+  function jsonResponse(payload: unknown, status = 200): Response {
+    return new Response(JSON.stringify(payload), {
+      status,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+
+  it('uses static server metadata for authorization and validated token exchange, then maps /user numeric id', async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const fetchFn = (async (input: unknown, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      if (String(input).includes('/login/oauth/access_token')) {
+        return jsonResponse({
+          access_token: 'github-at',
+          token_type: 'bearer',
+        });
+      }
+      return jsonResponse({ id: 8675309, login: 'renameable' });
+    }) as typeof fetch;
+    const provider = githubProvider({ ...OPTIONS, fetch: fetchFn });
+    const authorize = new URL(
+      provider.authorizeUrl({ state: STATE, redirectUri: REDIRECT_URI }),
     );
-    expect(new Headers(userinfo?.init?.headers).get('authorization')).toBe(
-      'Bearer at-123',
+
+    expect(authorize.origin + authorize.pathname).toBe(
+      'https://github.com/login/oauth/authorize',
+    );
+    expect(Object.fromEntries(authorize.searchParams)).toEqual({
+      client_id: OPTIONS.clientId,
+      redirect_uri: REDIRECT_URI,
+      response_type: 'code',
+      state: STATE,
+    });
+    await expect(
+      provider.exchange({
+        code: 'good-code',
+        redirectUri: REDIRECT_URI,
+        callbackUrl: new URL(
+          `${REDIRECT_URI}?code=good-code&state=${encodeURIComponent(STATE)}`,
+        ),
+        state: STATE,
+      }),
+    ).resolves.toEqual({ subject: 'github:8675309' });
+
+    const [token, profile] = calls;
+    expect(token?.url).toBe('https://github.com/login/oauth/access_token');
+    expect(new Headers(token?.init?.headers).get('accept')).toBe(
+      'application/json',
+    );
+    expect(
+      Object.fromEntries(new URLSearchParams(String(token?.init?.body))),
+    ).toMatchObject({
+      grant_type: 'authorization_code',
+      code: 'good-code',
+      client_id: OPTIONS.clientId,
+      client_secret: OPTIONS.clientSecret,
+      redirect_uri: REDIRECT_URI,
+    });
+    expect(profile?.url).toBe('https://api.github.com/user');
+    expect(new Headers(profile?.init?.headers).get('authorization')).toBe(
+      'Bearer github-at',
     );
   });
 
   it.each([
-    ['token endpoint error', [jsonResponse({}, 400)]],
-    ['missing access_token', [jsonResponse({})]],
     [
-      'userinfo error',
-      [jsonResponse({ access_token: 'at' }), jsonResponse({}, 401)],
+      'token endpoint error',
+      [jsonResponse({ error: 'bad_verification_code' }, 400)],
+    ],
+    ['missing access token', [jsonResponse({ token_type: 'bearer' })]],
+    [
+      'profile endpoint error',
+      [
+        jsonResponse({ access_token: 'at', token_type: 'bearer' }),
+        jsonResponse({}, 401),
+      ],
     ],
     [
-      'missing sub',
-      [jsonResponse({ access_token: 'at' }), jsonResponse({ name: 'x' })],
+      'malformed profile',
+      [
+        jsonResponse({ access_token: 'at', token_type: 'bearer' }),
+        jsonResponse({ id: 'not-numeric' }),
+      ],
     ],
-    [
-      'empty sub',
-      [jsonResponse({ access_token: 'at' }), jsonResponse({ sub: '' })],
-    ],
-  ])('fails closed (undefined identity) on %s', async (_name, responses) => {
-    // #given — each step that goes wrong must yield "sign-in failed", never
-    // a half-identity
+  ])('fails closed on %s', async (_name, responses) => {
     const queue = [...responses];
     const fetchFn = (async () => {
       const next = queue.shift();
@@ -448,11 +731,14 @@ describe('googleProvider', () => {
       return next;
     }) as unknown as typeof fetch;
 
-    // #when / #then
     expect(
-      await googleProvider({ ...OPTIONS, fetch: fetchFn }).exchange({
+      await githubProvider({ ...OPTIONS, fetch: fetchFn }).exchange({
         code: 'good-code',
         redirectUri: REDIRECT_URI,
+        callbackUrl: new URL(
+          `${REDIRECT_URI}?code=good-code&state=${encodeURIComponent(STATE)}`,
+        ),
+        state: STATE,
       }),
     ).toBeUndefined();
   });
@@ -474,12 +760,14 @@ describe('createDemoAuthRouter (fake provider round-trip)', () => {
       disabled?: boolean;
       now?: () => number;
       providerName?: string;
+      provider?: OAuthProvider;
     } = {},
   ) {
     const db = demoDb(openSqlite());
     const router = createDemoAuthRouter({
       db,
-      provider: fakeProvider(undefined, options.providerName),
+      provider:
+        options.provider ?? fakeProvider(undefined, options.providerName),
       secret: SECRET,
       jwtTtlSeconds: 3600,
       sessionTtlMs: 24 * HOUR,
@@ -526,6 +814,73 @@ describe('createDemoAuthRouter (fake provider round-trip)', () => {
     // #then — a full four-role set for a freshly minted session
     expect(tokenSet.sessionId).toMatch(/^[0-9a-f]{18}$/);
     expect(tokenSet.tokens).toHaveLength(4);
+  });
+
+  it.each([
+    [
+      'provider denial',
+      (state: string) =>
+        `error=access_denied&state=${encodeURIComponent(state)}`,
+    ],
+    [
+      'duplicate callback code',
+      (state: string) => `code=one&code=two&state=${encodeURIComponent(state)}`,
+    ],
+  ])('maps %s to the stable sign-in failure envelope', async (_name, query) => {
+    const fetchFn = vi.fn<typeof fetch>();
+    const { router } = makeRouter({
+      provider: githubProvider({
+        clientId: 'github-client',
+        clientSecret: 'github-secret',
+        fetch: fetchFn,
+      }),
+    });
+    const redirect = await router(new Request('https://demo.test/auth/github'));
+    const state =
+      new URL(redirect?.headers.get('location') ?? '').searchParams.get(
+        'state',
+      ) ?? '';
+
+    const response = await router(
+      new Request(`https://demo.test/auth/github/callback?${query(state)}`, {
+        headers: { cookie: stateCookieOf(redirect) },
+      }),
+    );
+
+    expect(response?.status).toBe(401);
+    expect(await response?.json()).toEqual({ error: 'sign-in failed' });
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('collapses thrown provider details without leaking credentials', async () => {
+    const leakedSecret = 'must-not-reach-the-response';
+    const { router } = makeRouter({
+      provider: {
+        name: 'github',
+        authorizeUrl: ({ state }) =>
+          `https://fake.test/authorize?state=${encodeURIComponent(state)}`,
+        exchange: async () => {
+          throw new Error(`upstream rejected ${leakedSecret}`);
+        },
+      },
+    });
+    const redirect = await router(new Request('https://demo.test/auth/github'));
+    const state =
+      new URL(redirect?.headers.get('location') ?? '').searchParams.get(
+        'state',
+      ) ?? '';
+
+    const response = await router(
+      new Request(
+        `https://demo.test/auth/github/callback?code=bad&state=${encodeURIComponent(state)}`,
+        { headers: { cookie: stateCookieOf(redirect) } },
+      ),
+    );
+    const body = await response?.text();
+
+    expect(response?.status).toBe(401);
+    expect(body).toBe('{"error":"sign-in failed"}');
+    expect(body).not.toContain(leakedSecret);
   });
 
   it('403s a forged or replay-expired state', async () => {
@@ -644,6 +999,100 @@ describe('createDemoAuthRouter (fake provider round-trip)', () => {
     expect(await response?.json()).toEqual({ error: 'payload too large' });
   });
 
+  it('returns null only outside the exact /auth/ family precheck', async () => {
+    const { router } = makeRouter();
+
+    await expect(
+      router(new Request('https://demo.test/healthz')),
+    ).resolves.toBeNull();
+    await expect(
+      router(new Request('https://demo.test/auth')),
+    ).resolves.toBeNull();
+    await expect(
+      router(new Request('https://demo.test/authentication')),
+    ).resolves.toBeNull();
+  });
+
+  it.each([
+    ['POST', '/auth/github'],
+    ['POST', '/auth/config'],
+    ['GET', '/auth/refresh'],
+    ['DELETE', '/auth/github/callback'],
+    ['HEAD', '/auth/config'],
+    ['HEAD', '/auth/github'],
+    ['GET', '/auth/config/'],
+    ['GET', '/auth/github/'],
+  ])('keeps unmatched method/path %s %s in the stable 404 envelope', async (method, path) => {
+    const { router } = makeRouter();
+
+    const response = await router(
+      new Request(`https://demo.test${path}`, { method }),
+    );
+
+    expect(response?.status).toBe(404);
+    expect(await response?.json()).toEqual({ error: 'not found' });
+    expect(Object.fromEntries(response?.headers ?? [])).toEqual({
+      'cache-control': 'no-store',
+      'content-type': 'application/json',
+    });
+  });
+
+  it('maps malformed refresh JSON to the existing validation envelope', async () => {
+    const { router } = makeRouter();
+
+    const response = await router(
+      new Request('https://demo.test/auth/refresh', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{"token":',
+      }),
+    );
+
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({ error: 'token is required' });
+  });
+
+  it('rejects invalid UTF-8 before refresh token validation', async () => {
+    const { router } = makeRouter();
+    const prefix = new TextEncoder().encode('{"token":"');
+    const suffix = new TextEncoder().encode('"}');
+    const body = new Uint8Array(prefix.length + 1 + suffix.length);
+    body.set(prefix);
+    body[prefix.length] = 0xff;
+    body.set(suffix, prefix.length + 1);
+
+    const response = await router(
+      new Request('https://demo.test/auth/refresh', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body,
+      }),
+    );
+
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      error: 'a JSON object body is required',
+    });
+  });
+
+  it('rejects extra refresh fields through the strict schema before token verification', async () => {
+    const { router } = makeRouter();
+
+    const response = await router(
+      new Request('https://demo.test/auth/refresh', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          token: 'would-otherwise-be-verified',
+          extra: true,
+        }),
+      }),
+    );
+
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({ error: 'token is required' });
+  });
+
   it('the kill switch 503s every auth route and reports {enabled:false} on /auth/config', async () => {
     // #given
     const { router } = makeRouter({ disabled: true });
@@ -659,6 +1108,25 @@ describe('createDemoAuthRouter (fake provider round-trip)', () => {
     ).toMatchObject({ enabled: false });
     expect(
       (await router(new Request('https://demo.test/auth/github')))?.status,
+    ).toBe(503);
+    expect(
+      (
+        await router(
+          new Request(
+            'https://demo.test/auth/github/callback?state=forged.123.sig',
+          ),
+        )
+      )?.status,
+    ).toBe(503);
+    expect(
+      (
+        await router(
+          new Request('https://demo.test/auth/refresh', {
+            method: 'POST',
+            body: 'x'.repeat(20_000),
+          }),
+        )
+      )?.status,
     ).toBe(503);
   });
 

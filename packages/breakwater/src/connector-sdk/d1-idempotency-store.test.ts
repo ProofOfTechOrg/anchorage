@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// D1IdempotencyStore against REAL SQLite via node:sqlite (D1 is SQLite), so
-// the atomic claim — INSERT ... ON CONFLICT DO NOTHING RETURNING — and the
-// stale-pending takeover CAS are exercised for real, not mocked. The
+// D1IdempotencyStore against node:sqlite as a fast SQL facsimile. These are
+// non-fidelity unit tests: the dedicated worker project exercises the same
+// atomic claim and stale-pending takeover against D1 inside workerd. The
 // openSqlite()/d1Like() fixture is copied from flowsafe's store.test.ts
 // pattern on purpose: breakwater must not import across packages for tests.
 
@@ -57,7 +57,7 @@ function d1Like(db: SqliteDatabase): IdempotencyDatabase {
 
 const T0 = Date.parse('2026-07-07T10:00:00.000Z');
 
-describe('D1IdempotencyStore', () => {
+describe('D1IdempotencyStore (Node SQLite facsimile)', () => {
   it('round-trips reserve -> put -> replay', async () => {
     // #given
     const store = new D1IdempotencyStore(d1Like(openSqlite()), {

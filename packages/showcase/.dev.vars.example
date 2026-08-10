@@ -1,5 +1,5 @@
-# Local secrets for `pnpm --filter showcase dev:worker` (Wrangler reads
-# `packages/showcase/.dev.vars`).
+# Local secrets for `pnpm --filter showcase dev` and `preview` (the Cloudflare
+# Vite plugin reads `packages/showcase/.dev.vars`).
 #
 #   cp packages/showcase/.dev.vars.example packages/showcase/.dev.vars
 #

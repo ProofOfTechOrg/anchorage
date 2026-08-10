@@ -7,7 +7,7 @@
 // because Mastra's own D1 adapter simply does not own these tables.
 //
 // The structural D1 subset (method-syntax, so a real D1Database and the
-// node:sqlite `d1DatabaseLike` test adapter both satisfy it) keeps this module
+// node:sqlite `sqliteUnitDatabase` test adapter both satisfy it) keeps this module
 // free of @cloudflare/workers-types — the same convention the do-runner's
 // SnapshotDatabase and the approval store's ApprovalDatabase take.
 

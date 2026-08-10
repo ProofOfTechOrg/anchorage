@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 
 const html = await readFile(
-  new URL('../dist/index.html', import.meta.url),
+  new URL('../dist/client/index.html', import.meta.url),
   'utf8',
 );
 
@@ -21,7 +21,7 @@ for (const fragment of requiredFragments) {
 }
 
 const robots = await readFile(
-  new URL('../dist/robots.txt', import.meta.url),
+  new URL('../dist/client/robots.txt', import.meta.url),
   'utf8',
 );
 if (
@@ -32,14 +32,16 @@ if (
 }
 
 const sitemap = await readFile(
-  new URL('../dist/sitemap.xml', import.meta.url),
+  new URL('../dist/client/sitemap.xml', import.meta.url),
   'utf8',
 );
 if (!sitemap.includes('<loc>https://anchorage.proofoftech.org/</loc>')) {
   throw new Error('sitemap.xml does not contain the canonical public URL');
 }
 
-const card = await readFile(new URL('../dist/og-card.png', import.meta.url));
+const card = await readFile(
+  new URL('../dist/client/og-card.png', import.meta.url),
+);
 if (
   card.subarray(1, 4).toString('ascii') !== 'PNG' ||
   card.readUInt32BE(16) !== 1200 ||

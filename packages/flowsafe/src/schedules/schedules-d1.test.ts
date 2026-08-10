@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track D (M-006) — the D1 schedules domain against REAL SQLite (node:sqlite),
-// so the CAS UPDATE, the due predicate, and json/metadata round-trips run for
-// real. Mirrors the notifications/thread-state domain tests.
+// Track D (M-006) — fast schedule SQL units over node:sqlite. The Wrangler
+// harness owns real-D1 CAS, concurrency, ownership, and rollback evidence.
 
 import type { Schedule } from '@mastra/core/storage';
 import { describe, expect, it } from 'vitest';
 
-import { d1DatabaseLike, openSqlite } from '../../test-support/sqlite.js';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   D1ResourceOwnershipStore,
   type ResourceOwnershipDatabase,
@@ -24,7 +23,7 @@ function storeOver(): {
 } {
   const sqlite = openSqlite();
   const store = new D1SchedulesStorage(
-    d1DatabaseLike(sqlite) as unknown as ScheduleDatabase,
+    sqliteUnitDatabase(sqlite) as unknown as ScheduleDatabase,
   );
   return { store, sqlite };
 }
@@ -108,7 +107,7 @@ describe('D1SchedulesStorage', () => {
       ownerId TEXT
     )`);
     const store = new D1SchedulesStorage(
-      d1DatabaseLike(sqlite) as ScheduleDatabase,
+      sqliteUnitDatabase(sqlite) as ScheduleDatabase,
     );
 
     await store.init();
@@ -148,7 +147,7 @@ describe('D1SchedulesStorage', () => {
 
   it('atomically creates an owned schedule and persists its creator role', async () => {
     const sqlite = openSqlite();
-    const binding = d1DatabaseLike(sqlite) as ScheduleDatabase &
+    const binding = sqliteUnitDatabase(sqlite) as ScheduleDatabase &
       ResourceOwnershipDatabase;
     const store = new D1SchedulesStorage(binding);
     const resources = new D1ResourceOwnershipStore(binding);
@@ -164,7 +163,7 @@ describe('D1SchedulesStorage', () => {
 
   it('enforces the schedule cap under concurrent creates without orphan owners', async () => {
     const sqlite = openSqlite();
-    const binding = d1DatabaseLike(sqlite) as ScheduleDatabase &
+    const binding = sqliteUnitDatabase(sqlite) as ScheduleDatabase &
       ResourceOwnershipDatabase;
     const store = new D1SchedulesStorage(binding);
     const resources = new D1ResourceOwnershipStore(binding);
@@ -193,7 +192,7 @@ describe('D1SchedulesStorage', () => {
 
   it('does not adopt an existing unowned schedule when the cap rejects the insert', async () => {
     const sqlite = openSqlite();
-    const binding = d1DatabaseLike(sqlite) as ScheduleDatabase &
+    const binding = sqliteUnitDatabase(sqlite) as ScheduleDatabase &
       ResourceOwnershipDatabase;
     const store = new D1SchedulesStorage(binding);
     const resources = new D1ResourceOwnershipStore(binding);
@@ -212,7 +211,7 @@ describe('D1SchedulesStorage', () => {
 
   it('rolls back the schedule row when its owner insert fails', async () => {
     const sqlite = openSqlite();
-    const binding = d1DatabaseLike(sqlite) as ScheduleDatabase &
+    const binding = sqliteUnitDatabase(sqlite) as ScheduleDatabase &
       ResourceOwnershipDatabase;
     const store = new D1SchedulesStorage(binding);
     await store.init();
@@ -553,7 +552,7 @@ describe('D1SchedulesStorage', () => {
 
   it('atomically deletes an owned schedule, triggers, and its owner row', async () => {
     const sqlite = openSqlite();
-    const binding = d1DatabaseLike(sqlite) as ScheduleDatabase &
+    const binding = sqliteUnitDatabase(sqlite) as ScheduleDatabase &
       ResourceOwnershipDatabase;
     const store = new D1SchedulesStorage(binding);
     const resources = new D1ResourceOwnershipStore(binding);
@@ -581,7 +580,7 @@ describe('D1SchedulesStorage', () => {
 
   it('a delete that wins before the fire claim leaves no provisional trigger', async () => {
     const sqlite = openSqlite();
-    const binding = d1DatabaseLike(sqlite) as ScheduleDatabase &
+    const binding = sqliteUnitDatabase(sqlite) as ScheduleDatabase &
       ResourceOwnershipDatabase;
     const store = new D1SchedulesStorage(binding);
     const resources = new D1ResourceOwnershipStore(binding);
@@ -619,7 +618,7 @@ describe('D1SchedulesStorage', () => {
     'failed',
   ] as const)('a delete-requested %s dispatch settles and finalizes all schedule state', async (outcome) => {
     const sqlite = openSqlite();
-    const binding = d1DatabaseLike(sqlite) as ScheduleDatabase &
+    const binding = sqliteUnitDatabase(sqlite) as ScheduleDatabase &
       ResourceOwnershipDatabase;
     const store = new D1SchedulesStorage(binding);
     const resources = new D1ResourceOwnershipStore(binding);
@@ -677,7 +676,7 @@ describe('D1SchedulesStorage', () => {
 
   it('dangerouslyClearAll removes every schedule owner with the domain rows', async () => {
     const sqlite = openSqlite();
-    const binding = d1DatabaseLike(sqlite) as ScheduleDatabase &
+    const binding = sqliteUnitDatabase(sqlite) as ScheduleDatabase &
       ResourceOwnershipDatabase;
     const store = new D1SchedulesStorage(binding);
     const resources = new D1ResourceOwnershipStore(binding);
@@ -701,7 +700,7 @@ describe('D1SchedulesStorage', () => {
 
   it('rolls back owned deletion when owner cleanup fails', async () => {
     const sqlite = openSqlite();
-    const binding = d1DatabaseLike(sqlite) as ScheduleDatabase &
+    const binding = sqliteUnitDatabase(sqlite) as ScheduleDatabase &
       ResourceOwnershipDatabase;
     const store = new D1SchedulesStorage(binding);
     const resources = new D1ResourceOwnershipStore(binding);

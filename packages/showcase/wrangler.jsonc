@@ -52,13 +52,12 @@
       "database_id": "00000000-0000-0000-0000-000000000000"
     }
   ],
-  // Single-deploy: serve the built SPA (dist/) at / via Workers Static
+  // Single-deploy: serve the Vite-managed client build at / via Workers Static
   // Assets, and the API on the SAME origin. run_worker_first is load-bearing —
   // without it the SPA fallback would swallow the API routes (they are not files
   // on disk). Everything else (/, deep SPA routes) serves index.html. Build the
-  // SPA first (`pnpm --filter showcase build`) so ./dist exists.
+  // SPA and Worker are built together by the Cloudflare Vite plugin.
   "assets": {
-    "directory": "./dist",
     "not_found_handling": "single-page-application",
     "run_worker_first": [
       "/api/*",
