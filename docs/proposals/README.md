@@ -3,6 +3,7 @@
 Documents in this directory describe uncommitted design ideas. They are not implemented or supported product behavior.
 
 - [Breakwater improvement roadmap](breakwater-improvement-roadmap.md)
+- [Mature package adoption plan](mature-package-adoption-plan.md): proposal
 - [Model gateway policy](model-gateway-policy.md)
 - [Single-tenant packages with physical tenant isolation](single-tenant-physical-isolation.md)
 
