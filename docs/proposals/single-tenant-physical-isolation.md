@@ -6,6 +6,34 @@ The product target is the **Super platform**: a hosted agent cloud where custome
 
 Baseline: branch `dev`, commit `d78e779` ("feat: add connector invocation authorization"), written 2026-08-09. Line numbers and package behavior below are as of this commit and must be re-confirmed before editing. All Cloudflare pricing and limits were verified against the linked Cloudflare docs on 2026-08-09; re-verify before relying on them for a purchase decision.
 
+## Post-adoption execution baseline for Slices B through E
+
+Start the next implementation session after [mature package adoption PR #55](https://github.com/ProofOfTechOrg/anchorage/pull/55) is merged into `dev`. Commit `3276c2a` contains the code baseline for this handoff. This section supersedes the older `d78e779` source baseline for Slices B through E. The older appendix remains historical evidence for Slice A and the original decisions.
+
+The package-adoption work did not change the scope, order, or acceptance criteria of Slices B through E. It changed the implementation and verification foundation:
+
+- **Real Cloudflare tests:** extend `vitest.flowsafe-harness.config.ts` and `scripts/flowsafe-harness.test.ts` for full deployment behavior. Extend `vitest.flowsafe-workers.config.ts` only for lightweight production modules that load reliably in the Workers pool. The full Mastra-backed Worker graph crashes the pool's bundled workerd during module loading; Wrangler `createTestHarness` is the verified path for that graph.
+- **No D1 fidelity facades:** `d1DatabaseLike`, its serialized `batchTail`, and fake `raw`, `exec`, and `dump` capabilities are deleted. Keep SQLite adapters restricted to explicitly non-fidelity unit tests. Run concurrency, rollback, schema, ownership, retention, and deployment-identity claims against real D1.
+- **Provisioning behavior:** fresh D1 databases contain Cloudflare-owned `_cf_KV` and `_cf_METADATA` tables. `deployment-identity-protocol.mjs` excludes only those exact names while rejecting lookalikes and application tables. Slice E must reuse this protocol and its packed CLI instead of reproducing sentinel logic.
+- **Worker type boundary:** root Cloudflare harnesses and showcase use `@cloudflare/workers-types` v5. FlowSafe and agent-starter retain v4 because `@mastra/cloudflare-d1@1.1.1` peers on v4. Keep compatibility proofs in `scripts/r2-type-compatibility.ts` and `packages/flowsafe/test-support/r2-type-compatibility.ts`; do not collapse the two ambient type programs.
+- **Runtime topology:** showcase development and production builds now use Cloudflare's Vite plugin and the real Wrangler binding graph. The custom Worker and Durable Object emulator is gone. WebSocket delivery, reconnection, and no-stream polling fallback are covered by `packages/showcase/worker/worker.harness.test.ts`.
+- **Security protocols:** actor tokens and stream tickets now use `jose`, with separate audiences and protected types. GitHub webhook verification retains raw-byte WebCrypto with an exact signature grammar. OAuth and OpenID Connect mechanics live behind the existing showcase provider seam. Slices B through E must preserve these boundaries rather than reintroducing protocol code.
+- **Architecture and publication gates:** dependency-cruiser scans the complete FlowSafe production graph and has a positive control for every rule. Publint and Are the Types Wrong (ATTW) validate real package archives while repository-specific consumer probes remain. New slice code must pass these gates through the root test and packed-package commands.
+
+Before editing a slice:
+
+1. Run `git fetch --prune origin` and confirm PR #55 is merged into `origin/dev`.
+2. Record the resulting `origin/dev` commit as that slice's base and re-confirm every source anchor below.
+3. Run `pnpm install --frozen-lockfile`, `pnpm typecheck`, and `pnpm test` before changing code.
+4. Use the real-runtime harness named above for every Cloudflare fidelity claim.
+
+Slice-specific handoff:
+
+- **Slice B:** add alarm behavior to the full Wrangler harness. Prove re-arm-first ordering, one due task per invocation, failure isolation, crash recovery, and maintenance health fields through the production Worker graph.
+- **Slice C:** reuse the full spike and real D1 harness for the deterministic failure matrix. Compare one durability authority at a time; do not use the SQLite unit adapters as recovery evidence.
+- **Slice D:** preserve the existing package boundaries and public declaration checks. Hono is currently private to showcase `/auth/*`; FlowSafe has no Hono runtime dependency and the secure preset must not introduce one without a separate deletion-based package decision.
+- **Slice E:** reuse the deployment-identity protocol, seed CLI, D1 ownership stores, full harness, and packed CLI probe. The provisioner must tolerate exact D1-owned internal tables, reject database drift, and preserve the v4/v5 type boundary.
+
 ## Decision summary
 
 Adopt **tenant = deployment**:
