@@ -25,7 +25,7 @@ import {
   TERMINAL_RUN_STATUSES,
 } from '@/run-client';
 
-export type NarrationZone = 'browser' | 'worker' | 'do' | 'd1' | 'cron';
+export type NarrationZone = 'browser' | 'worker' | 'do' | 'd1' | 'alarm';
 export type NarrationTone =
   | 'neutral'
   | 'info'
@@ -63,10 +63,9 @@ export interface NarrationRunRef {
   title: string;
 }
 
-/** `${tenant}_${uuid}` → first 8 uuid chars; anything else → first 8. */
+/** Compact display form for an opaque identifier. */
 export function shortId(id: string): string {
-  const tail = id.includes('_') ? id.slice(id.lastIndexOf('_') + 1) : id;
-  return tail.slice(0, 8);
+  return id.slice(0, 8);
 }
 
 export interface Suspension {
@@ -152,7 +151,7 @@ export function interpretRunResult(result: unknown): ResultInterpretation {
     return {
       flavor: 'real-write',
       replayed,
-      line: `Published to the sandbox artifact store${key}. In production this write goes to R2.`,
+      line: `Published to the demo artifact store${key}. In production this write goes to R2.`,
     };
   }
   if (outcome === 'simulated' || r.released === true) {
@@ -296,7 +295,7 @@ function terminalEvents(
         kind: 'connector.executed',
         title: `Connector ${connectorsHint.join(', ')} executed`,
         detail:
-          'Ran behind 4 tenant-scoped gates: egress allowlist → write-approval grant → idempotent replay → rate limit.',
+          'Ran behind 4 scoped gates: egress allowlist → write-approval grant → idempotent replay → rate limit.',
         tone: 'neutral',
         runId: run.runId,
         observed: false,
@@ -375,9 +374,8 @@ function terminalEvents(
 export interface DeriveRunOptions {
   /**
    * The caller knows a gate DID suspend this run (an approval exists for it).
-   * Needed because the runtime's resume ledger — the resumeCount source — is
-   * dropped at terminal status, so a running→success flip can look
-   * gate-less even when a gate was approved between polls.
+   * Needed because terminal summaries omit prior suspension fingerprints, so a
+   * running→success flip can look gate-less when a gate resolved between polls.
    */
   everSuspendedHint?: boolean;
   /**
@@ -495,7 +493,7 @@ export function deriveApprovalEvents(
           observed: true,
           toast: false,
         },
-        cronMentionEvent(at),
+        alarmMentionEvent(at),
       );
       continue;
     }
@@ -544,7 +542,7 @@ export function deriveApprovalEvents(
         events.push({
           key: `approval:${record.id}:status:escalated`,
           at,
-          zone: 'cron',
+          zone: 'alarm',
           kind: 'approval.escalated',
           title: `Approval ${shortId(record.id)} escalated: SLA breached`,
           detail:
@@ -581,15 +579,15 @@ export function deriveApprovalEvents(
 // ---- one-shot builders -------------------------------------------------------
 
 /** Emitted once per session, anchored to the first approval sighting. */
-function cronMentionEvent(at: number): NarrationEvent {
+function alarmMentionEvent(at: number): NarrationEvent {
   return {
-    key: 'cron:mention',
+    key: 'alarm:mention',
     at,
-    zone: 'worker',
-    kind: 'cron.mention',
+    zone: 'alarm',
+    kind: 'alarm.mention',
     title: 'Background machinery (not client-observable)',
     detail:
-      'An SLA sweep every 15 min escalates overdue approvals; scheduled purges reap expired sandboxes and old snapshots; audit streams to Workers Logs.',
+      'An SLA sweep every 15 min escalates overdue approvals; retention removes expired session metadata and old snapshots; audit streams to Workers Logs.',
     tone: 'neutral',
     observed: false,
     toast: false,
@@ -633,7 +631,7 @@ export function startEvent(
       zone: 'worker',
       kind: 'run.started',
       title: `Run started: ${run.title}`,
-      detail: `The Worker verified the caller and minted runId ${shortId(run.runId)} server-side (tenant-prefixed). The run executes in its own Durable Object.`,
+      detail: `The Worker verified the caller and minted opaque runId ${shortId(run.runId)} server-side. The run executes in its own Durable Object.`,
       tone: 'info',
       runId: run.runId,
       observed: true,
@@ -696,7 +694,7 @@ export function startEvent(
         observed: true,
         toast: false,
       },
-      cronMentionEvent(at),
+      alarmMentionEvent(at),
     );
   }
   if (TERMINAL_RUN_STATUSES.has(response.status)) {
@@ -750,7 +748,7 @@ export function startErrorEvent(
         kind: 'demo.disabled',
         title: 'Demo temporarily disabled',
         detail:
-          'The operator kill switch is on, so even issued tokens are refused. Nothing is wrong with your sandbox; check back later.',
+          'The operator kill switch is on, so even issued tokens are refused. Nothing is wrong with your session; check back later.',
         tone: 'danger',
         observed: true,
         toast: true,
@@ -764,73 +762,6 @@ export function startErrorEvent(
     zone: 'worker',
     kind: 'run.start-failed',
     title: `Could not start ${workflowId}`,
-    detail: message,
-    tone: 'danger',
-    observed: true,
-    toast: true,
-    toastSticky: true,
-  };
-}
-
-/**
- * Narrate a successful sandbox reset. Timestamp-keyed: the feed was cleared
- * the instant before this records, so there is nothing to dedup against, and
- * a SECOND reset minutes later is a genuinely new fact that must not collapse
- * into the first. Counts come verbatim from the server response — the
- * truthfulness rule (verified numbers only) applies to deletes too.
- */
-export function resetEvent(purged: {
-  snapshots: number;
-  approvals: number;
-  artifacts: number;
-}): NarrationEvent {
-  const at = Date.now();
-  const plural = (count: number) => (count === 1 ? '' : 's');
-  return {
-    key: `demo.reset:${at}`,
-    at,
-    zone: 'd1',
-    kind: 'demo.reset',
-    title: `Sandbox reset: ${purged.snapshots} run snapshot${plural(purged.snapshots)} and ${purged.approvals} approval${plural(purged.approvals)} purged`,
-    detail:
-      'A tenant-scoped D1 delete, server-side: the same primitive the expiry reaper uses. You stay signed in, and the run budget is NOT refilled.',
-    tone: 'success',
-    observed: true,
-    toast: true,
-    toastLong: true,
-  };
-}
-
-/** Narrate a refused/failed reset; the 403 is the RBAC lesson working. */
-export function resetErrorEvent(
-  error: unknown,
-  actorRole?: string,
-): NarrationEvent {
-  const at = Date.now();
-  const message = error instanceof Error ? error.message : String(error);
-  if (
-    error instanceof RunApiError &&
-    (error.status === 401 || error.status === 403)
-  ) {
-    return {
-      key: `reset-denied:${actorRole ?? 'unknown'}`,
-      at,
-      zone: 'worker',
-      kind: 'demo.reset-denied',
-      title: 'Reset refused by the server',
-      detail: `${message}. Only the admin identity of a demo sandbox may wipe it: the same server-side RBAC that gates every other mutation.`,
-      tone: 'danger',
-      observed: true,
-      toast: true,
-      toastLong: true,
-    };
-  }
-  return {
-    key: `reset-failed:${at}`,
-    at,
-    zone: 'worker',
-    kind: 'demo.reset-failed',
-    title: 'Sandbox reset failed',
     detail: message,
     tone: 'danger',
     observed: true,
@@ -1040,7 +971,7 @@ export function actorSwitchedEvent(
 
 export function sessionReadyEvent(options: {
   provider: string;
-  tenantId: string;
+  sessionId: string;
   expiresAtMs?: number;
 }): NarrationEvent {
   const at = Date.now();
@@ -1049,12 +980,12 @@ export function sessionReadyEvent(options: {
       ? ` (expires ${new Date(options.expiresAtMs).toLocaleTimeString()})`
       : '';
   return {
-    key: `session:${options.tenantId}`,
+    key: `session:${options.sessionId}`,
     at,
     zone: 'browser',
     kind: 'session.ready',
-    title: `Sandbox ${options.tenantId} ready`,
-    detail: `Signed in via ${options.provider}. Four switchable role tokens held in tab memory only${expires}. Nothing you do here is visible to other visitors.`,
+    title: 'Shared demo organization ready',
+    detail: `Signed in via ${options.provider}. Four switchable role tokens are held in tab memory only${expires}. Runs and approvals are shared with other signed-in visitors.`,
     tone: 'success',
     observed: true,
     toast: true,
@@ -1068,9 +999,9 @@ export function sessionExpiringEvent(minutesLeft: number): NarrationEvent {
     at: Date.now(),
     zone: 'browser',
     kind: 'session.expiring',
-    title: `Sandbox expires in ${minutesLeft} min`,
+    title: `Session expires in ${minutesLeft} min`,
     detail:
-      'Runs, approvals, and tokens will be purged. Finish the walkthrough, or sign in later for a fresh tenant.',
+      'The role tokens will expire. Shared runs and approvals remain under normal retention.',
     tone: 'warning',
     observed: true,
     toast: true,
@@ -1084,9 +1015,9 @@ export function sessionExpiredEvent(): NarrationEvent {
     at: Date.now(),
     zone: 'browser',
     kind: 'session.expired',
-    title: 'Sandbox expired',
+    title: 'Session expired',
     detail:
-      'Tokens are no longer valid and the data is queued for purge. Sign in to mint a new isolated tenant.',
+      'The role tokens are no longer valid. Sign in again to rejoin the shared demo organization.',
     tone: 'danger',
     observed: true,
     toast: true,
@@ -1102,7 +1033,7 @@ export function tokenRefreshedEvent(): NarrationEvent {
     zone: 'browser',
     kind: 'session.token-refreshed',
     title: 'JWTs silently refreshed',
-    detail: 'Tokens rotate every 30 minutes while the sandbox lives (1h TTL).',
+    detail: 'Tokens rotate every 30 minutes while the session lives (1h TTL).',
     tone: 'neutral',
     observed: true,
     toast: false,

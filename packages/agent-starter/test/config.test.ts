@@ -17,22 +17,21 @@ describe('starter configuration', () => {
 
   it('fails GitHub ownership closed and permits only configured resources', () => {
     const configured = {
-      GITHUB_RESOURCE_ALLOWLIST: '{"acme":["github:example/repository"]}',
+      GITHUB_RESOURCE_ALLOWLIST: '["github:example/repository"]',
     } as Env;
 
+    expect(githubResourceAllowed(configured, 'github:example/repository')).toBe(
+      true,
+    );
     expect(
-      githubResourceAllowed(configured, 'acme', 'github:example/repository'),
+      githubResourceAllowed(configured, 'github:example/repository#42'),
     ).toBe(true);
-    expect(
-      githubResourceAllowed(configured, 'acme', 'github:example/repository#42'),
-    ).toBe(true);
-    expect(
-      githubResourceAllowed(configured, 'acme', 'github:other/repository'),
-    ).toBe(false);
+    expect(githubResourceAllowed(configured, 'github:other/repository')).toBe(
+      false,
+    );
     expect(
       githubResourceAllowed(
         { GITHUB_RESOURCE_ALLOWLIST: 'invalid' } as Env,
-        'acme',
         'github:example/repository',
       ),
     ).toBe(false);

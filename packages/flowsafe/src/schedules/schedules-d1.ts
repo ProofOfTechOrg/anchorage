@@ -15,15 +15,9 @@
 // the two separate classes the milestone's Code Intent named (a two-class split
 // would fork what core unifies).
 //
-// TENANCY (DL-013): the schedule rows have NO tenant column — core normalizes ids
-// to slugified `agent_<slug>`/`schedule_<slug>`, so a tenant cannot ride the id.
-// The tenant lives in `metadata.tenantId`, stamped by the facade (router) at
-// create and by the tick on every trigger it records. This domain is
-// tenant-AGNOSTIC (it persists the rows it is handed); tenancy is enforced one
-// layer up (router post-filters `metadata.tenantId`; purgeTenant metadata-filters
-// it — d1-storage.ts TENANT_METADATA_PURGE_TABLES). The scale caveat: core lists
-// schedules with no pagination ("schedule counts are expected to stay small"), so
-// the router's JS post-filter and the purge's json_extract scan are acceptable.
+// Schedule ids are server-minted by the facade. Core lists schedules with no
+// pagination ("schedule counts are expected to stay small"), so the router's
+// deployment count cap bounds this domain.
 //
 // TIMESTAMPS are INTEGER ms-epoch, not the ISO-8601 TEXT the notifications/thread
 // domains use: core types `Schedule.nextFireAt` / `ScheduleTrigger.actualFireAt`
@@ -40,6 +34,14 @@ import {
   type ScheduleTriggerListOptions,
   type ScheduleUpdate,
 } from '@mastra/core/storage';
+import {
+  APPROVAL_ROLES,
+  canonicalResourceOwner,
+  createResourceOwnershipSchema,
+  RESOURCE_OWNERSHIP_TABLE,
+  type ResourceOwner,
+} from '../approval-api/index.js';
+import { isPathSafeId } from '../do-runner/path-safe-id.js';
 
 import {
   d1Changes,
@@ -48,6 +50,7 @@ import {
   type SignalDatabase,
   type SignalStatement,
 } from '../signals/d1-shared.js';
+import type { AuthorizedSchedule } from './target-policy.js';
 
 // The D1 seam + column helpers are Track C's canonical shared leaf
 // (signals/d1-shared.ts, zero imports) — reused here so the two domains cannot
@@ -57,6 +60,96 @@ import {
 export type ScheduleStatement = SignalStatement;
 /** The D1 database subset the schedules domain uses (workers-types-free). */
 export type ScheduleDatabase = SignalDatabase;
+
+export interface ScheduleFireClaim {
+  scheduleId: string;
+  expectedNextFireAt: number;
+  newNextFireAt: number;
+  actualFireAt: number;
+  runId: string;
+  trigger: ScheduleTrigger & { id: string; outcome: 'deferred' };
+}
+
+export type ScheduleAgentDispatchAction =
+  | 'wake'
+  | 'deliver'
+  | 'persist'
+  | 'discard'
+  | 'blocked';
+
+const AGENT_DISPATCH_OUTCOME_BY_ACTION = {
+  wake: 'succeeded',
+  deliver: 'delivered',
+  persist: 'persisted',
+  discard: 'discarded',
+  blocked: 'skipped',
+} as const satisfies Record<
+  ScheduleAgentDispatchAction,
+  Extract<
+    ScheduleTrigger['outcome'],
+    'succeeded' | 'delivered' | 'persisted' | 'discarded' | 'skipped'
+  >
+>;
+
+/** Target-side receipt for a threaded agent schedule signal. */
+export type ScheduleAgentDispatchReceipt = (
+  | { action: 'wake'; outcome: 'succeeded' }
+  | { action: 'deliver'; outcome: 'delivered' }
+  | { action: 'persist'; outcome: 'persisted' }
+  | { action: 'discard'; outcome: 'discarded' }
+  | { action: 'blocked'; outcome: 'skipped' }
+) & {
+  runId?: string;
+  signalId?: string;
+};
+
+export type ScheduleAgentDispatchState =
+  | { state: 'ready' }
+  | { state: 'pending' }
+  | { state: 'missing' }
+  | { state: 'settled'; receipt: ScheduleAgentDispatchReceipt };
+
+export function createScheduleAgentDispatchReceipt<
+  Action extends ScheduleAgentDispatchAction,
+>(
+  action: Action,
+  ids: { runId?: string; signalId?: string } = {},
+): Extract<ScheduleAgentDispatchReceipt, { action: Action }> {
+  return {
+    action,
+    outcome: AGENT_DISPATCH_OUTCOME_BY_ACTION[action],
+    ...ids,
+  } as Extract<ScheduleAgentDispatchReceipt, { action: Action }>;
+}
+
+export function parseScheduleAgentDispatchReceipt(
+  value: unknown,
+): ScheduleAgentDispatchReceipt | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  const candidate = value as Record<string, unknown>;
+  if (
+    typeof candidate.action !== 'string' ||
+    !Object.hasOwn(AGENT_DISPATCH_OUTCOME_BY_ACTION, candidate.action)
+  ) {
+    return undefined;
+  }
+  const action = candidate.action as ScheduleAgentDispatchAction;
+  if (
+    candidate.outcome !== AGENT_DISPATCH_OUTCOME_BY_ACTION[action] ||
+    (candidate.runId !== undefined && !isPathSafeId(candidate.runId)) ||
+    (candidate.signalId !== undefined && !isPathSafeId(candidate.signalId))
+  ) {
+    return undefined;
+  }
+  return createScheduleAgentDispatchReceipt(action, {
+    ...(candidate.runId !== undefined ? { runId: candidate.runId } : {}),
+    ...(candidate.signalId !== undefined
+      ? { signalId: candidate.signalId }
+      : {}),
+  });
+}
 
 /** The raw row shape `mastra_schedules` stores. */
 interface ScheduleRow {
@@ -73,6 +166,8 @@ interface ScheduleRow {
   metadata: string | null;
   ownerType: string | null;
   ownerId: string | null;
+  creatorRole: string | null;
+  deletionRequestedAt: number | null;
 }
 
 /** The raw row shape `mastra_schedule_triggers` stores. */
@@ -91,7 +186,7 @@ interface ScheduleTriggerRow {
 
 function rowToSchedule(row: ScheduleRow): Schedule {
   const target = parseJsonOrUndefined<Schedule['target']>(row.target);
-  return {
+  const schedule: Schedule = {
     id: row.id,
     // Legacy read-shim: base.d.ts mandates every SchedulesStorage run row
     // targets through normalizeScheduleTarget at deserialization so a legacy
@@ -117,6 +212,10 @@ function rowToSchedule(row: ScheduleRow): Schedule {
       : {}),
     ...(row.ownerId !== null ? { ownerId: row.ownerId } : {}),
   };
+  return row.creatorRole !== null &&
+    (APPROVAL_ROLES as readonly string[]).includes(row.creatorRole)
+    ? ({ ...schedule, creatorRole: row.creatorRole } as AuthorizedSchedule)
+    : schedule;
 }
 
 function rowToTrigger(row: ScheduleTriggerRow): ScheduleTrigger {
@@ -128,9 +227,10 @@ function rowToTrigger(row: ScheduleTriggerRow): ScheduleTrigger {
     actualFireAt: row.actualFireAt,
     outcome: row.outcome as ScheduleTrigger['outcome'],
     ...(row.error !== null ? { error: row.error } : {}),
-    ...(row.triggerKind !== null
-      ? { triggerKind: row.triggerKind as ScheduleTrigger['triggerKind'] }
-      : {}),
+    triggerKind:
+      row.triggerKind === null
+        ? 'schedule-fire'
+        : (row.triggerKind as ScheduleTrigger['triggerKind']),
     ...(row.parentTriggerId !== null
       ? { parentTriggerId: row.parentTriggerId }
       : {}),
@@ -187,10 +287,14 @@ export class D1SchedulesStorage extends SchedulesStorage {
                updatedAt INTEGER NOT NULL,
                metadata TEXT,
                ownerType TEXT,
-               ownerId TEXT
+               ownerId TEXT,
+               creatorRole TEXT CHECK (creatorRole IN ('admin', 'builder', 'operator', 'reviewer', 'viewer')),
+               deletionRequestedAt INTEGER
              )`,
           )
           .run()
+          .then(() => this.#ensureScheduleColumns())
+          .then(() => createResourceOwnershipSchema(this.#db))
           .then(() =>
             this.#db
               .prepare(
@@ -237,27 +341,92 @@ export class D1SchedulesStorage extends SchedulesStorage {
     return this.#ready;
   }
 
+  async #ensureScheduleColumns(): Promise<void> {
+    const { results } = await this.#db
+      .prepare(`PRAGMA table_info(${this.#schedules})`)
+      .all<{ name: string }>();
+    const names = new Set(results.map((column) => column.name));
+    if (!names.has('creatorRole')) {
+      await this.#db
+        .prepare(
+          `ALTER TABLE ${this.#schedules}
+           ADD COLUMN creatorRole TEXT
+           CHECK (creatorRole IN ('admin', 'builder', 'operator', 'reviewer', 'viewer'))`,
+        )
+        .run();
+    }
+    if (!names.has('deletionRequestedAt')) {
+      await this.#db
+        .prepare(
+          `ALTER TABLE ${this.#schedules}
+           ADD COLUMN deletionRequestedAt INTEGER`,
+        )
+        .run();
+    }
+  }
+
   async init(): Promise<void> {
     await this.#ensureSchema();
   }
 
   async createSchedule(schedule: Schedule): Promise<Schedule> {
     await this.#ensureSchema();
-    // Throws on a duplicate id (core's contract: "Throws if a row with the same
-    // id already exists"). The facade server-mints ids so a client can never
-    // collide with another tenant's — no existence oracle from this throw.
-    const existing = await this.getSchedule(schedule.id);
-    if (existing) {
-      throw new Error(`schedule ${schedule.id} already exists`);
+    try {
+      await this.#insertSchedule(schedule);
+    } catch (error) {
+      if (String(error).includes('UNIQUE constraint failed')) {
+        throw new Error(`schedule ${schedule.id} already exists`);
+      }
+      throw error;
     }
-    await this.#insertSchedule(schedule);
     return schedule;
+  }
+
+  /**
+   * Flowsafe facade create: schedule row, owner row, and the deployment count
+   * cap share one D1 transaction. The schedules domain and resource registry
+   * must therefore use the same binding.
+   */
+  async createOwnedSchedule(
+    schedule: AuthorizedSchedule,
+    owner: ResourceOwner,
+    maxSchedules: number,
+  ): Promise<Schedule | null> {
+    const safeOwner = canonicalResourceOwner(owner);
+    if (!Number.isSafeInteger(maxSchedules) || maxSchedules < 0) {
+      throw new Error('maxSchedules must be a nonnegative safe integer');
+    }
+    await this.#ensureSchema();
+    const batch = this.#db.batch?.bind(this.#db);
+    if (!batch) {
+      throw new Error(
+        'D1SchedulesStorage requires database.batch() for atomic owned schedule creation',
+      );
+    }
+    const [created] = await batch([
+      this.#insertScheduleStatement(schedule, maxSchedules),
+      this.#db
+        .prepare(
+          `INSERT INTO ${RESOURCE_OWNERSHIP_TABLE}
+             (resource_kind, resource_id, owner_kind, owner_id)
+           SELECT 'schedule', ?, ?, ?
+           WHERE changes() = 1
+             AND EXISTS (SELECT 1 FROM ${this.#schedules} WHERE id = ?)`,
+        )
+        .bind(schedule.id, safeOwner.kind, safeOwner.id, schedule.id),
+    ]);
+    return d1Changes(created as { meta?: { changes?: number } }) === 1
+      ? schedule
+      : null;
   }
 
   async getSchedule(id: string): Promise<Schedule | null> {
     await this.#ensureSchema();
     const row = await this.#db
-      .prepare(`SELECT * FROM ${this.#schedules} WHERE id = ?`)
+      .prepare(
+        `SELECT * FROM ${this.#schedules}
+         WHERE id = ? AND deletionRequestedAt IS NULL`,
+      )
       .bind(id)
       .first<ScheduleRow>();
     return row ? rowToSchedule(row) : null;
@@ -265,7 +434,7 @@ export class D1SchedulesStorage extends SchedulesStorage {
 
   async listSchedules(filter?: ScheduleFilter): Promise<Schedule[]> {
     await this.#ensureSchema();
-    const clauses: string[] = [];
+    const clauses = ['deletionRequestedAt IS NULL'];
     const binds: unknown[] = [];
     if (filter?.status !== undefined) {
       clauses.push('status = ?');
@@ -314,7 +483,8 @@ export class D1SchedulesStorage extends SchedulesStorage {
     const limitClause = limit !== undefined ? ' LIMIT ?' : '';
     const stmt = this.#db.prepare(
       `SELECT * FROM ${this.#schedules}
-       WHERE status = 'active' AND nextFireAt <= ?
+       WHERE status = 'active' AND deletionRequestedAt IS NULL
+         AND nextFireAt <= ?
        ORDER BY nextFireAt ASC${limitClause}`,
     );
     const bound = limit !== undefined ? stmt.bind(now, limit) : stmt.bind(now);
@@ -368,7 +538,10 @@ export class D1SchedulesStorage extends SchedulesStorage {
     }
     binds.push(id);
     await this.#db
-      .prepare(`UPDATE ${this.#schedules} SET ${sets.join(', ')} WHERE id = ?`)
+      .prepare(
+        `UPDATE ${this.#schedules} SET ${sets.join(', ')}
+         WHERE id = ? AND deletionRequestedAt IS NULL`,
+      )
       .bind(...binds)
       .run();
     const updated = await this.getSchedule(id);
@@ -388,8 +561,9 @@ export class D1SchedulesStorage extends SchedulesStorage {
     // the row is still ACTIVE. Two concurrent ticks over one due schedule both
     // read nextFireAt = T; the first UPDATE advances it to T2 (changes = 1 ->
     // true), the second's `nextFireAt = T` no longer matches (changes = 0 ->
-    // false). Exactly-once, proven under two concurrent ticks on real workerd +
-    // D1 (spike D-S1). The `status = 'active'` guard closes the pause race: a
+    // false). This serializes one claim under concurrent ticks on real workerd +
+    // D1 (spike D-S1); it does not claim end-to-end exactly-once dispatch. The
+    // `status = 'active'` guard closes the pause race: a
     // schedule paused AFTER a tick read it as due but BEFORE this claim (status
     // flips, nextFireAt unchanged) fails the CAS here, so a just-paused schedule
     // does not fire one last time.
@@ -397,7 +571,8 @@ export class D1SchedulesStorage extends SchedulesStorage {
       .prepare(
         `UPDATE ${this.#schedules}
          SET nextFireAt = ?, lastFireAt = ?, lastRunId = ?, updatedAt = ?
-         WHERE id = ? AND nextFireAt = ? AND status = 'active'`,
+         WHERE id = ? AND nextFireAt = ? AND status = 'active'
+           AND deletionRequestedAt IS NULL`,
       )
       .bind(
         newNextFireAt,
@@ -411,41 +586,306 @@ export class D1SchedulesStorage extends SchedulesStorage {
     return d1Changes(result) === 1;
   }
 
-  async deleteSchedule(id: string): Promise<void> {
+  /** Atomically claim one due fire and persist its recoverable dispatch row. */
+  async claimScheduleFire(claim: ScheduleFireClaim): Promise<boolean> {
     await this.#ensureSchema();
-    // Delete the schedule and its trigger history (core's contract).
-    await this.#db
-      .prepare(`DELETE FROM ${this.#triggers} WHERE scheduleId = ?`)
-      .bind(id)
+    const batch = this.#db.batch?.bind(this.#db);
+    if (!batch) {
+      throw new Error(
+        'D1SchedulesStorage requires database.batch() for atomic schedule fire claims',
+      );
+    }
+    const { trigger } = claim;
+    const [claimed] = await batch([
+      this.#db
+        .prepare(
+          `UPDATE ${this.#schedules}
+           SET nextFireAt = ?, lastFireAt = ?, lastRunId = ?, updatedAt = ?
+           WHERE id = ? AND nextFireAt = ? AND status = 'active'
+             AND deletionRequestedAt IS NULL`,
+        )
+        .bind(
+          claim.newNextFireAt,
+          claim.actualFireAt,
+          claim.runId,
+          Date.now(),
+          claim.scheduleId,
+          claim.expectedNextFireAt,
+        ),
+      this.#db
+        .prepare(
+          `INSERT INTO ${this.#triggers} (
+             id, scheduleId, runId, scheduledFireAt, actualFireAt, outcome,
+             error, triggerKind, parentTriggerId, metadata
+           )
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+           WHERE changes() = 1`,
+        )
+        .bind(
+          trigger.id,
+          trigger.scheduleId,
+          trigger.runId,
+          trigger.scheduledFireAt,
+          trigger.actualFireAt,
+          trigger.outcome,
+          trigger.error ?? null,
+          trigger.triggerKind ?? 'schedule-fire',
+          trigger.parentTriggerId ?? null,
+          jsonOrNull(trigger.metadata),
+        ),
+    ]);
+    return d1Changes(claimed as { meta?: { changes?: number } }) === 1;
+  }
+
+  /**
+   * Lease one target-side signal attempt. A retry waits while the lease is
+   * live and replays a settled receipt. After an ambiguous crash, lease
+   * takeover repeats the same stable dispatch id: delivery is deliberately
+   * at-least-once because the agent action and D1 receipt cannot be committed
+   * in one transaction.
+   */
+  async beginAgentScheduleDispatch(
+    scheduleId: string,
+    triggerId: string,
+    now = Date.now(),
+    leaseMs = 60_000,
+  ): Promise<ScheduleAgentDispatchState> {
+    await this.#ensureSchema();
+    const claimed = await this.#db
+      .prepare(
+        `UPDATE ${this.#triggers}
+         SET metadata = json_set(
+           COALESCE(metadata, '{}'),
+           '$.dispatchState', 'executing',
+           '$.dispatchLeaseUntil', ?
+         )
+         WHERE id = ? AND scheduleId = ? AND outcome = 'deferred'
+           AND (
+             json_extract(metadata, '$.dispatchState') = 'prepared'
+             OR (
+               json_extract(metadata, '$.dispatchState') = 'executing'
+               AND COALESCE(
+                 json_extract(metadata, '$.dispatchLeaseUntil'), 0
+               ) <= ?
+             )
+           )`,
+      )
+      .bind(now + leaseMs, triggerId, scheduleId, now)
       .run();
-    await this.#db
-      .prepare(`DELETE FROM ${this.#schedules} WHERE id = ?`)
-      .bind(id)
+    if (d1Changes(claimed) === 1) return { state: 'ready' };
+    return this.agentScheduleDispatchState(scheduleId, triggerId);
+  }
+
+  /** Read a threaded schedule signal receipt without changing dispatch state. */
+  async agentScheduleDispatchState(
+    scheduleId: string,
+    triggerId: string,
+  ): Promise<ScheduleAgentDispatchState> {
+    await this.#ensureSchema();
+    const row = await this.#db
+      .prepare(
+        `SELECT metadata FROM ${this.#triggers}
+         WHERE id = ? AND scheduleId = ? AND outcome = 'deferred'`,
+      )
+      .bind(triggerId, scheduleId)
+      .first<{ metadata: string | null }>();
+    if (!row) return { state: 'missing' };
+    const metadata =
+      row.metadata === null
+        ? undefined
+        : parseJsonOrUndefined<Record<string, unknown>>(row.metadata);
+    const receipt = parseScheduleAgentDispatchReceipt(
+      metadata?.dispatchReceipt,
+    );
+    return receipt ? { state: 'settled', receipt } : { state: 'pending' };
+  }
+
+  /** Persist the target decision before the thread DO returns it to the tick. */
+  async settleAgentScheduleDispatch(
+    scheduleId: string,
+    triggerId: string,
+    receipt: ScheduleAgentDispatchReceipt,
+  ): Promise<void> {
+    const canonical = parseScheduleAgentDispatchReceipt(receipt);
+    if (!canonical)
+      throw new TypeError('invalid agent schedule dispatch receipt');
+    await this.#ensureSchema();
+    const settled = await this.#db
+      .prepare(
+        `UPDATE ${this.#triggers}
+         SET metadata = json_set(
+           COALESCE(metadata, '{}'),
+           '$.dispatchState', 'settled',
+           '$.dispatchReceipt', json(?)
+         )
+         WHERE id = ? AND scheduleId = ? AND outcome = 'deferred'
+           AND json_extract(metadata, '$.dispatchState') = 'executing'`,
+      )
+      .bind(JSON.stringify(canonical), triggerId, scheduleId)
       .run();
+    if (d1Changes(settled) === 1) return;
+    const current = await this.agentScheduleDispatchState(
+      scheduleId,
+      triggerId,
+    );
+    if (
+      current.state === 'settled' &&
+      JSON.stringify(current.receipt) === JSON.stringify(canonical)
+    ) {
+      return;
+    }
+    throw new Error('agent schedule dispatch receipt could not be persisted');
+  }
+
+  async deleteSchedule(id: string): Promise<void> {
+    await this.deleteOwnedSchedule(id);
+  }
+
+  /** Delete an authorized facade schedule and its owner in one transaction. */
+  async deleteOwnedSchedule(id: string): Promise<'deleted' | 'pending'> {
+    await this.#ensureSchema();
+    const batch = this.#db.batch?.bind(this.#db);
+    if (!batch) {
+      throw new Error(
+        'D1SchedulesStorage requires database.batch() for atomic owned schedule deletion',
+      );
+    }
+    await batch([
+      this.#db
+        .prepare(
+          `UPDATE ${this.#schedules}
+           SET status = 'paused', updatedAt = ?,
+               deletionRequestedAt = CASE
+                 WHEN EXISTS (
+                   SELECT 1 FROM ${this.#triggers}
+                   WHERE scheduleId = ? AND outcome = 'deferred'
+                 ) THEN COALESCE(deletionRequestedAt, ?)
+                 ELSE NULL
+               END
+           WHERE id = ?`,
+        )
+        .bind(Date.now(), id, Date.now(), id),
+      this.#db
+        .prepare(
+          `DELETE FROM ${this.#triggers}
+           WHERE scheduleId = ?
+             AND NOT EXISTS (
+               SELECT 1 FROM ${this.#schedules}
+               WHERE id = ? AND deletionRequestedAt IS NOT NULL
+             )`,
+        )
+        .bind(id, id),
+      this.#db
+        .prepare(
+          `DELETE FROM ${this.#schedules}
+           WHERE id = ? AND deletionRequestedAt IS NULL`,
+        )
+        .bind(id),
+      this.#db
+        .prepare(
+          `DELETE FROM ${RESOURCE_OWNERSHIP_TABLE}
+           WHERE resource_kind = 'schedule' AND resource_id = ?
+             AND NOT EXISTS (SELECT 1 FROM ${this.#schedules} WHERE id = ?)`,
+        )
+        .bind(id, id),
+    ]);
+    const pending = await this.#db
+      .prepare(
+        `SELECT deletionRequestedAt FROM ${this.#schedules} WHERE id = ?`,
+      )
+      .bind(id)
+      .first<{ deletionRequestedAt: number | null }>();
+    return pending?.deletionRequestedAt != null ? 'pending' : 'deleted';
   }
 
   async recordTrigger(trigger: ScheduleTrigger): Promise<void> {
     await this.#ensureSchema();
+    const batch = this.#db.batch?.bind(this.#db);
+    if (!batch) {
+      throw new Error(
+        'D1SchedulesStorage requires database.batch() for atomic trigger settlement',
+      );
+    }
     const id = trigger.id ?? crypto.randomUUID();
+    await batch([
+      this.#db
+        .prepare(
+          `INSERT OR REPLACE INTO ${this.#triggers} (
+             id, scheduleId, runId, scheduledFireAt, actualFireAt, outcome,
+             error, triggerKind, parentTriggerId, metadata
+           )
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+           WHERE EXISTS (SELECT 1 FROM ${this.#schedules} WHERE id = ?)`,
+        )
+        .bind(
+          id,
+          trigger.scheduleId,
+          trigger.runId,
+          trigger.scheduledFireAt,
+          trigger.actualFireAt,
+          trigger.outcome,
+          trigger.error ?? null,
+          trigger.triggerKind ?? 'schedule-fire',
+          trigger.parentTriggerId ?? null,
+          jsonOrNull(trigger.metadata),
+          trigger.scheduleId,
+        ),
+      this.#db
+        .prepare(
+          `DELETE FROM ${this.#triggers}
+           WHERE scheduleId = ?
+             AND EXISTS (
+               SELECT 1 FROM ${this.#schedules}
+               WHERE id = ? AND deletionRequestedAt IS NOT NULL
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM ${this.#triggers}
+               WHERE scheduleId = ? AND outcome = 'deferred'
+             )`,
+        )
+        .bind(trigger.scheduleId, trigger.scheduleId, trigger.scheduleId),
+      this.#db
+        .prepare(
+          `DELETE FROM ${this.#schedules}
+           WHERE id = ? AND deletionRequestedAt IS NOT NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM ${this.#triggers}
+               WHERE scheduleId = ? AND outcome = 'deferred'
+             )`,
+        )
+        .bind(trigger.scheduleId, trigger.scheduleId),
+      this.#db
+        .prepare(
+          `DELETE FROM ${RESOURCE_OWNERSHIP_TABLE}
+           WHERE resource_kind = 'schedule' AND resource_id = ?
+             AND NOT EXISTS (SELECT 1 FROM ${this.#schedules} WHERE id = ?)`,
+        )
+        .bind(trigger.scheduleId, trigger.scheduleId),
+    ]);
+  }
+
+  /**
+   * Merge tick-owned retry diagnostics into a deferred trigger. Target-side
+   * dispatch state can change between the tick's read and this write, so a
+   * full-row replacement here would erase the current lease or receipt.
+   */
+  async touchDeferredTrigger(
+    id: string,
+    scheduleId: string,
+    error: string | undefined,
+    metadata: Record<string, unknown>,
+  ): Promise<void> {
+    await this.#ensureSchema();
     await this.#db
       .prepare(
-        `INSERT OR REPLACE INTO ${this.#triggers} (
-           id, scheduleId, runId, scheduledFireAt, actualFireAt, outcome,
-           error, triggerKind, parentTriggerId, metadata
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `UPDATE ${this.#triggers}
+         SET error = ?, metadata = json_patch(
+           COALESCE(metadata, '{}'),
+           json(?)
+         )
+         WHERE id = ? AND scheduleId = ? AND outcome = 'deferred'`,
       )
-      .bind(
-        id,
-        trigger.scheduleId,
-        trigger.runId,
-        trigger.scheduledFireAt,
-        trigger.actualFireAt,
-        trigger.outcome,
-        trigger.error ?? null,
-        trigger.triggerKind ?? null,
-        trigger.parentTriggerId ?? null,
-        jsonOrNull(trigger.metadata),
-      )
+      .bind(error ?? null, JSON.stringify(metadata), id, scheduleId)
       .run();
   }
 
@@ -477,37 +917,130 @@ export class D1SchedulesStorage extends SchedulesStorage {
     return results.map(rowToTrigger);
   }
 
-  async dangerouslyClearAll(): Promise<void> {
+  async listDeferredTriggers(limit = 100): Promise<ScheduleTrigger[]> {
     await this.#ensureSchema();
-    await this.#db.prepare(`DELETE FROM ${this.#triggers}`).run();
-    await this.#db.prepare(`DELETE FROM ${this.#schedules}`).run();
+    if (!Number.isSafeInteger(limit) || limit < 0) {
+      throw new Error(
+        'deferred trigger limit must be a nonnegative safe integer',
+      );
+    }
+    const { results } = await this.#db
+      .prepare(
+        `SELECT * FROM ${this.#triggers}
+         WHERE outcome = 'deferred'
+         ORDER BY COALESCE(
+           CAST(json_extract(metadata, '$.reconcileAfter') AS INTEGER),
+           actualFireAt
+         ) ASC, actualFireAt ASC
+         LIMIT ?`,
+      )
+      .bind(limit)
+      .all<ScheduleTriggerRow>();
+    return results.map(rowToTrigger);
   }
 
-  /** INSERT-or-REPLACE the full schedule row (create and update share it). */
-  async #insertSchedule(schedule: Schedule): Promise<void> {
-    await this.#db
+  /**
+   * Read the exact claimed fire a target Durable Object is allowed to execute.
+   * Prepared, executing, and settled are one target-side lease lifecycle; the
+   * deferred trigger remains the authority until the tick settles its outcome.
+   * A schedule id without its atomically claimed trigger and run id is never an
+   * execution capability.
+   */
+  async getClaimedScheduleDispatch(
+    scheduleId: string,
+    dispatchId: string,
+    runId: string,
+  ): Promise<ScheduleTrigger | null> {
+    if (
+      !isPathSafeId(scheduleId) ||
+      !isPathSafeId(dispatchId) ||
+      !isPathSafeId(runId)
+    ) {
+      return null;
+    }
+    await this.#ensureSchema();
+    const row = await this.#db
       .prepare(
-        `INSERT OR REPLACE INTO ${this.#schedules} (
+        `SELECT * FROM ${this.#triggers}
+         WHERE id = ? AND scheduleId = ? AND runId = ?
+           AND outcome = 'deferred'
+           AND COALESCE(triggerKind, 'schedule-fire') = 'schedule-fire'
+           AND json_extract(metadata, '$.dispatchState') IN (
+             'prepared', 'executing', 'settled'
+           )
+           AND EXISTS (
+             SELECT 1 FROM ${this.#schedules} WHERE id = ?
+           )`,
+      )
+      .bind(dispatchId, scheduleId, runId, scheduleId)
+      .first<ScheduleTriggerRow>();
+    return row ? rowToTrigger(row) : null;
+  }
+
+  async dangerouslyClearAll(): Promise<void> {
+    await this.#ensureSchema();
+    const batch = this.#db.batch?.bind(this.#db);
+    if (!batch) {
+      throw new Error(
+        'D1SchedulesStorage requires database.batch() for atomic schedule clearing',
+      );
+    }
+    await batch([
+      this.#db.prepare(`DELETE FROM ${this.#triggers}`),
+      this.#db.prepare(`DELETE FROM ${this.#schedules}`),
+      this.#db.prepare(
+        `DELETE FROM ${RESOURCE_OWNERSHIP_TABLE}
+         WHERE resource_kind = 'schedule'
+           AND resource_id NOT IN (SELECT id FROM ${this.#schedules})`,
+      ),
+    ]);
+  }
+
+  /** Insert a new core schedule row. */
+  async #insertSchedule(schedule: Schedule): Promise<void> {
+    await this.#insertScheduleStatement(schedule).run();
+  }
+
+  #insertScheduleStatement(
+    schedule: Schedule,
+    maxSchedules?: number,
+  ): ScheduleStatement {
+    const columns = `(
            id, target, cron, timezone, status, nextFireAt, lastFireAt,
-           lastRunId, createdAt, updatedAt, metadata, ownerType, ownerId
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           lastRunId, createdAt, updatedAt, metadata, ownerType, ownerId,
+           creatorRole
+         )`;
+    const values = [
+      schedule.id,
+      JSON.stringify(schedule.target),
+      schedule.cron,
+      schedule.timezone ?? null,
+      schedule.status,
+      schedule.nextFireAt,
+      schedule.lastFireAt ?? null,
+      schedule.lastRunId ?? null,
+      schedule.createdAt,
+      schedule.updatedAt,
+      jsonOrNull(schedule.metadata),
+      schedule.ownerType ?? null,
+      schedule.ownerId ?? null,
+      (schedule as Partial<AuthorizedSchedule>).creatorRole ?? null,
+    ];
+    if (maxSchedules === undefined) {
+      return this.#db
+        .prepare(
+          `INSERT INTO ${this.#schedules} ${columns}
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(...values);
+    }
+    return this.#db
+      .prepare(
+        `INSERT INTO ${this.#schedules} ${columns}
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+         WHERE (SELECT COUNT(*) FROM ${this.#schedules}) < ?`,
       )
-      .bind(
-        schedule.id,
-        JSON.stringify(schedule.target),
-        schedule.cron,
-        schedule.timezone ?? null,
-        schedule.status,
-        schedule.nextFireAt,
-        schedule.lastFireAt ?? null,
-        schedule.lastRunId ?? null,
-        schedule.createdAt,
-        schedule.updatedAt,
-        jsonOrNull(schedule.metadata),
-        schedule.ownerType ?? null,
-        schedule.ownerId ?? null,
-      )
-      .run();
+      .bind(...values, maxSchedules);
   }
 }
 

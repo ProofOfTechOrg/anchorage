@@ -159,7 +159,6 @@ function triageRecord(
 ): ApprovalRecord {
   return {
     id,
-    tenantId: 'acme',
     workflowId: 'wf',
     runId: 'acme_r1',
     title: `request ${id}`,

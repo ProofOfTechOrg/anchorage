@@ -1,52 +1,60 @@
 // SPDX-License-Identifier: Apache-2.0
-// Per-tenant hub Durable Object — the fan-out channel for tenant-wide approval
-// stream events (queue inserts, claims, decisions, escalations) and reviewer
-// presence. Run PROGRESS never flows through here (that rides the per-run WS on
-// the runner DO, DL-009); the hub owns the tenant-wide feed with no natural
-// per-run home.
+// Deployment hub Durable Object — the fan-out channel for deployment-wide
+// approval stream events (queue inserts, claims, decisions, escalations) and
+// reviewer presence. Run PROGRESS never flows through here (that rides the
+// per-run WS on the runner DO, DL-009); the hub owns the deployment-wide feed
+// with no natural per-run home.
 //
-// Addressed idFromName(tenantId) by the trusted Worker, so `id.name` IS the
-// bare tenantId — no ':' join and no runId decode, unlike DurableObjectRunner
-// whose name is `${workflowId}:${runId}`. Classic constructor(state,env)+fetch
-// contract — deliberately NOT `extends DurableObject` from 'cloudflare:workers'
-// — so this module and its graph load in node/vitest; the Hibernatable-
-// WebSocket path (acceptWebSocket + the webSocket* handler methods) only runs
-// under workerd, guarded by acceptWebSocket presence, and is proven by the
-// workerd spike (M-009), not node tests. The hub holds NO durable D1/DO state:
-// it is an ephemeral fan-out over the sockets currently attached, and performs
-// NO ticket verification (the Worker is the sole ticket authority and routes by
-// ticket.tenantId to idFromName(tenantId), so id.name === tenantId here by
-// construction).
+// Addressed idFromName(HUB_INSTANCE_NAME) by the trusted Worker — ONE hub per
+// deployment, the singleton the physical-isolation topology implies (one
+// deployment = one organization = one reviewer feed). Classic
+// constructor(state,env)+fetch contract — deliberately NOT `extends
+// DurableObject` from 'cloudflare:workers' — so this module and its graph load
+// in node/vitest; the Hibernatable-WebSocket path (acceptWebSocket + the
+// webSocket* handler methods) only runs under workerd, guarded by
+// acceptWebSocket presence, and is proven by the workerd spike (M-009). The
+// hub holds NO durable D1/DO state: it is an ephemeral fan-out over the
+// sockets currently attached, and performs NO ticket verification (the Worker
+// is the sole ticket authority).
 
 import type { HubDurableObjectState, WebSocketLike } from './cf-types.js';
 import { newWebSocketPair, safeSend } from './cf-types.js';
+import { verifyDurableObjectDeploymentRequest } from './deployment-identity.js';
+import { doErrorResponse } from './do-error-response.js';
+
+/**
+ * The ONE name the trusted Worker addresses the deployment hub by
+ * (`createHubTopology`). A fixed name rather than a per-request value: the hub
+ * asserts its own `id.name` equals it, so an instance reached around the
+ * exported topology (a hand-rolled idFromName with some other name) refuses to
+ * serve instead of fanning events out from an unsanctioned identity.
+ */
+export const HUB_INSTANCE_NAME = 'deployment-hub';
 
 /**
  * Minimal STRUCTURAL shape of the approval stream event this hub fans out.
  *
- * ACYCLIC LAYERING: approval-api already imports FROM do-runner (e.g.
- * TENANT_ID_PATTERN), so do-runner must NOT import ApprovalStreamEvent back
- * from approval-api — that would be a dependency cycle. The hub only reads
- * `event.record.tenantId` (the defense-in-depth tenant assertion) and
- * re-serializes the whole event to subscribers, so this local subset is
- * sufficient. The real ApprovalStreamEvent (approval-api/contract.ts) is
- * bridged onto the hub's POST body by host-kit through `createHubTopology`,
- * which may import both packages.
+ * ACYCLIC LAYERING: approval-api already imports FROM do-runner, so do-runner
+ * must NOT import ApprovalStreamEvent back from approval-api — that would be a
+ * dependency cycle. The hub only re-serializes the whole event to subscribers,
+ * so this local subset is sufficient. The real ApprovalStreamEvent
+ * (approval-api/contract.ts) is bridged onto the hub's POST body by host-kit
+ * through `createHubTopology`, which may import both packages.
  */
 export interface HubStreamEvent {
-  record: { tenantId: string };
+  record: Record<string, unknown>;
   type?: string;
   [key: string]: unknown;
 }
 
-/** A reviewer currently subscribed to a tenant's hub, held in socket attachment. */
+/** A reviewer currently subscribed to the hub, held in socket attachment. */
 export interface PresenceMember {
   actorId: string;
   role: string;
 }
 
 /**
- * Per-tenant hub Durable Object base. Hosts subclass it (ShowcaseHub /
+ * Deployment hub Durable Object base. Hosts subclass it (ShowcaseHub /
  * FlowsafeHub / DemoHub) and bind it under the wrangler HUB namespace; the
  * subclass body is typically empty. Left `abstract` to signal "extend, do not
  * instantiate directly".
@@ -61,34 +69,34 @@ export abstract class HubDurableObject<TEnv = unknown> {
     this.env = env;
   }
 
-  /**
-   * The tenant this hub serves, recovered from the DO's OWN identity. The
-   * trusted Worker addressed this instance via idFromName(tenantId), so
-   * `id.name` IS the bare tenantId (no ':' join, no runId decode). `id.name`
-   * is populated only for idFromName-created ids and is unforgeable at this
-   * boundary.
-   *
-   * THROWS rather than defaulting — a hub that cannot resolve its tenant must
-   * refuse to fan out, never fan one tenant's event to another's sockets.
-   * Mirrors DurableObjectRunner.tenantId's fail-closed posture.
-   */
-  protected get tenantId(): string {
-    const name = this.state?.id?.name;
-    if (!name) {
-      throw new Error(
-        'HubDurableObject.tenantId: the DO has no id.name (not created via idFromName, or running without state) — tenant unresolvable, refusing to fan out',
-      );
-    }
-    return name;
-  }
-
   async fetch(request: Request): Promise<Response> {
     try {
+      // Deployment-identity check before any fan-out: a hub namespace bound to
+      // the wrong deployment refuses rather than leaks its feed. No-op off
+      // workerd (state undefined), memoized after first success.
+      await verifyDurableObjectDeploymentRequest(request, this.state, this.env);
       return await this.#route(request);
     } catch (error) {
-      return json(
-        { error: error instanceof Error ? error.message : String(error) },
-        500,
+      // doErrorResponse keeps the taxonomy consistent with the other DO bases:
+      // a DeploymentIdentityError answers 503, everything unrecognized a 500.
+      return doErrorResponse(error);
+    }
+  }
+
+  /**
+   * Assert this instance IS the deployment hub — its own idFromName identity
+   * equals HUB_INSTANCE_NAME. The trusted Worker only ever addresses that
+   * name (`createHubTopology`), so anything else was reached around the
+   * exported topology. Refuse loudly rather than fan out from an unsanctioned
+   * identity. `id.name` is populated only for idFromName-created ids and is
+   * unforgeable at this boundary.
+   */
+  #assertHubIdentity(): void {
+    const name = this.state?.id?.name;
+    if (this.state === undefined) return;
+    if (name !== HUB_INSTANCE_NAME) {
+      throw new Error(
+        `HubDurableObject: instance name '${name}' is not the deployment hub '${HUB_INSTANCE_NAME}' — refusing to serve (address the hub through createHubTopology)`,
       );
     }
   }
@@ -97,7 +105,7 @@ export abstract class HubDurableObject<TEnv = unknown> {
     const segments = new URL(request.url).pathname.split('/').filter(Boolean);
 
     // (1) POST /internal/event — the trusted host forwards each approval stream
-    // event here (createHubTopology, M-006). Fan it out to this tenant's
+    // event here (createHubTopology, M-006). Fan it out to the deployment's
     // subscribed sockets.
     if (
       request.method === 'POST' &&
@@ -105,25 +113,10 @@ export abstract class HubDurableObject<TEnv = unknown> {
       segments[0] === 'internal' &&
       segments[1] === 'event'
     ) {
+      this.#assertHubIdentity();
       const event = await readJson<HubStreamEvent>(request);
-      if (!event || typeof event.record?.tenantId !== 'string') {
-        return json(
-          { error: 'a stream event with record.tenantId is required' },
-          400,
-        );
-      }
-      // Defense in depth: the Worker already routes by record.tenantId to
-      // idFromName(tenantId), so id.name === the event tenant by construction.
-      // Refuse a mismatch loudly rather than fan one tenant's event to
-      // another's sockets.
-      const tenantId = this.tenantId;
-      if (event.record.tenantId !== tenantId) {
-        return json(
-          {
-            error: `event tenant '${event.record.tenantId}' does not match this hub '${tenantId}'`,
-          },
-          400,
-        );
+      if (!event || typeof event.record !== 'object' || event.record === null) {
+        return json({ error: 'a stream event with a record is required' }, 400);
       }
       const frame = JSON.stringify({ type: 'queue', event });
       for (const ws of this.#sockets()) {
@@ -133,10 +126,10 @@ export abstract class HubDurableObject<TEnv = unknown> {
     }
 
     // (2) GET /subscribe (Upgrade: websocket) — a reviewer dashboard subscribes
-    // to this tenant's live feed. Accept a hibernatable socket, record presence
-    // in its attachment, and broadcast the refreshed roster. The Worker passes
-    // the ticket's actorId/role as query params (it is the sole ticket
-    // authority; the hub trusts its routing and identity, M-006).
+    // to the deployment's live feed. Accept a hibernatable socket, record
+    // presence in its attachment, and broadcast the refreshed roster. The
+    // Worker passes the ticket's actorId/role as query params (it is the sole
+    // ticket authority; the hub trusts its routing and identity, M-006).
     if (
       request.method === 'GET' &&
       segments.length === 1 &&
@@ -157,15 +150,15 @@ export abstract class HubDurableObject<TEnv = unknown> {
           426,
         );
       }
-      // Bind this instance to its tenant before accepting (fail closed if the
-      // hub cannot resolve its identity); the tag lets a future targeted
-      // fan-out address sockets by tenant/role.
-      const tenantId = this.tenantId;
+      // Bind this instance to its singleton identity before accepting (fail
+      // closed on an unsanctioned instance); the role tag lets a future
+      // targeted fan-out address sockets by role.
+      this.#assertHubIdentity();
       const url = new URL(request.url);
       const actorId = url.searchParams.get('actorId') ?? 'anonymous';
       const role = url.searchParams.get('role') ?? 'unknown';
       const { 0: client, 1: server } = newWebSocketPair();
-      state.acceptWebSocket(server, [tenantId, role]);
+      state.acceptWebSocket(server, [HUB_INSTANCE_NAME, role]);
       server.serializeAttachment?.({ actorId, role });
       this.#broadcastPresence();
       return new Response(null, {

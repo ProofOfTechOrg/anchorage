@@ -1,10 +1,6 @@
-// Shared node:sqlite test fixture — ONE home for the openSqlite() probe and
-// the D1-shaped adapter that six suites previously carried as byte-copies
-// (any change to the Mastra D1 shape had to be edited in lockstep across
-// them). Lives OUTSIDE src/ on purpose: tests import it relatively, and the
-// build tsconfig (rootDir src) never compiles it into dist. flowsafe-only:
-// breakwater keeps its own copy by its documented no-cross-package-test-
-// imports rule.
+// Shared node:sqlite test fixture for fast, deterministic SQL unit coverage.
+// It is not D1, workerd, transaction-concurrency, or Worker-runtime evidence.
+// Runtime and concurrency claims live in the Workers pool and Wrangler harness.
 
 export interface SqliteStatement {
   get(...params: unknown[]): unknown;
@@ -36,15 +32,9 @@ export function openSqlite(): SqliteDatabase {
   return new mod.DatabaseSync(':memory:');
 }
 
-/**
- * A full D1Database-shaped adapter over node:sqlite — faithful enough for the
- * REAL @mastra/cloudflare-d1 D1Store and the worker templates to run against
- * (first/run/all/raw/exec/batch/dump, D1's { success, meta } envelopes).
- * Returns unknown: callers cast to the D1Database their seam needs.
- */
-export function d1DatabaseLike(db: SqliteDatabase): unknown {
+/** A narrow prepared-statement facade for SQL unit tests only. */
+export function sqliteUnitDatabase(db: SqliteDatabase): unknown {
   const runSync = Symbol('runSync');
-  let batchTail: Promise<void> = Promise.resolve();
 
   function statement(sql: string, params: unknown[]): Record<string, unknown> {
     const execute = () => {
@@ -72,47 +62,30 @@ export function d1DatabaseLike(db: SqliteDatabase): unknown {
         results: db.prepare(sql).all(...params),
         meta: {},
       }),
-      raw: async () => {
-        const rows = db.prepare(sql).all(...params) as Array<
-          Record<string, unknown>
-        >;
-        return rows.map((row) => Object.values(row));
-      },
     };
   }
   return {
     prepare: (sql: string) => statement(sql, []),
-    exec: async (sql: string) => {
-      db.exec(sql);
-      return { count: 1, duration: 0 };
-    },
-    batch: (
+    batch: async (
       statements: Array<{
         run: () => Promise<unknown>;
         [runSync]?: () => unknown;
       }>,
     ) => {
-      const execute = async () => {
-        db.exec('BEGIN IMMEDIATE');
-        try {
-          const results = [];
-          for (const stmt of statements) {
-            results.push(stmt[runSync] ? stmt[runSync]() : await stmt.run());
-          }
-          db.exec('COMMIT');
-          return results;
-        } catch (error) {
-          db.exec('ROLLBACK');
-          throw error;
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const results = [];
+        for (const prepared of statements) {
+          results.push(
+            prepared[runSync] ? prepared[runSync]() : await prepared.run(),
+          );
         }
-      };
-      const pending = batchTail.then(execute, execute);
-      batchTail = pending.then(
-        () => undefined,
-        () => undefined,
-      );
-      return pending;
+        db.exec('COMMIT');
+        return results;
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
     },
-    dump: async () => new ArrayBuffer(0),
   };
 }

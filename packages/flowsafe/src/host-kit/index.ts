@@ -15,6 +15,10 @@
 // depend on breakwater for their connectors) need to reach for. See module.ts.
 
 export {
+  type BoundedBodyResult,
+  readBoundedBody,
+} from '../http-body.js';
+export {
   queueApprovalForSuspension,
   type ResumeRunFn,
   reconcileApprovalsForSummary,
@@ -25,6 +29,7 @@ export { bearerActorAuthenticator, parseActorTokens } from './bearer-auth.js';
 export { type DoResponseLike, doSummary } from './do-response.js';
 export {
   createDoRunTopology,
+  type DoRunStartInput,
   type DoRunTopology,
   type RunnerNamespaceLike,
   type RunnerStubLike,
@@ -37,8 +42,20 @@ export type {
   FlowsafeWorkerConfig,
   FlowsafeWorkerContext,
   FlowsafeWorkerEnv,
+  MaintenanceDurableObjectConstructor,
+  MaintenanceDurableObjectState,
+  MaintenanceDuty,
+  MaintenanceHealth,
+  MaintenanceNamespaceLike,
+  MaintenanceStorage,
+  MaintenanceStorageTransaction,
+  MaintenanceStubLike,
 } from './flowsafe-worker.js';
-export { createFlowsafeWorker } from './flowsafe-worker.js';
+export {
+  createFlowsafeMaintenanceDurableObject,
+  createFlowsafeWorker,
+  MAINTENANCE_INSTANCE_NAME,
+} from './flowsafe-worker.js';
 // hostAuditSink stays module-internal for the same reason as
 // requestedConnectors below: it is the primitive beneath
 // buildHostApprovalService / runSlaSweepMaintenance, and no host consumes it
@@ -48,6 +65,7 @@ export {
   approvalStoreFactoryFor,
   buildHostApprovalService,
   type HostApprovalServiceOptions,
+  type MaintenanceOutcome,
   maintenancePrincipal,
   reconcileApprovalsOnStatusDetached,
   runApprovalRetentionPurge,
@@ -60,19 +78,61 @@ export {
   type HubStubLike,
   type HubTopology,
 } from './hub-topology.js';
-// The agent-memory host boundary every memory-touching route calls
-// (docs/agent-memory-tenancy.md item 5).
+export type {
+  MaintenanceCapabilityClaims,
+  MaintenanceCapabilityJwk,
+  MaintenanceCapabilityOperation,
+  MintAsymmetricMaintenanceCapabilityOptions,
+  MintMaintenanceCapabilityOptions,
+  VerifyAsymmetricMaintenanceCapabilityOptions,
+  VerifyMaintenanceCapabilityOptions,
+  VerifyMaintenanceReceiptOptions,
+} from './maintenance-capability.js';
+export {
+  MAINTENANCE_RECEIPT_HEADER,
+  mintAsymmetricMaintenanceCapability,
+  mintMaintenanceCapability,
+  mintMaintenanceReceipt,
+  verifyAsymmetricMaintenanceCapability,
+  verifyMaintenanceCapability,
+  verifyMaintenanceReceipt,
+} from './maintenance-capability.js';
+// The agent-memory host boundary every memory-touching route calls.
 export {
   assertNoClientMemoryIds,
-  requireOwnedMemoryId,
+  requireMemoryId,
   TCB_ONLY_MEMORY_FIELDS,
   type TcbOnlyMemoryField,
 } from './memory-boundary.js';
 export type { WorkflowIdSource } from './registration.js';
 export { assertWorkflowsRegistered } from './registration.js';
+export { requireResourceAccess } from './resource-access.js';
 export { RunRouteError } from './run-route-error.js';
-export type { RunRouter, RunRouterOptions } from './run-router.js';
+export type {
+  RunRouter,
+  RunRouterOptions,
+  RunStartInput,
+} from './run-router.js';
 export { createRunRouter } from './run-router.js';
+export type {
+  StateEgressBinding,
+  StateEgressContext,
+  StateEgressEnv,
+} from './state-egress.js';
+export {
+  createStateEgressFetch,
+  STATE_EGRESS_CREDENTIAL_HEADER,
+  STATE_EGRESS_ENVIRONMENT_HEADER,
+  STATE_EGRESS_HEADERS,
+  STATE_EGRESS_POLICY_ID_HEADER,
+  STATE_EGRESS_RESERVED_HEADERS,
+  STATE_EGRESS_RESOURCE_GROUP_HEADER,
+  STATE_EGRESS_ROUTE_HOSTNAME_HEADER,
+  STATE_EGRESS_SCRIPT_HEADER,
+  STATE_EGRESS_TENANT_HEADER,
+  stateEgressCredentialMatches,
+  validateStateEgressEnv,
+} from './state-egress.js';
 export type { StreamRouter, StreamRouterOptions } from './stream-router.js';
 export { createStreamRouter } from './stream-router.js';
 export type {
@@ -82,28 +142,14 @@ export type {
   VerifyStreamTicketOptions,
 } from './stream-ticket.js';
 export { mintStreamTicket, verifyStreamTicket } from './stream-ticket.js';
-export type { SubdomainCrossCheckOptions } from './subdomain-check.js';
-// requestedConnectors and subdomainTenantOf stay module-internal on purpose:
-// they are the primitives beneath queueApprovalForSuspension /
-// withSubdomainCrossCheck, and no host consumes them directly.
-export { withSubdomainCrossCheck } from './subdomain-check.js';
-export type {
-  ProvisionTenantOptions,
-  TenantRegistryDatabase,
-  TenantRegistryStatement,
-} from './tenant-registry.js';
+// The sanctioned way to reach a thread DO: it mints the principal header the
+// ThreadDurableObject verifies, so a route never forwards a client's own.
 export {
-  provisionTenant,
-  RESERVED_FOR_ALLOCATION,
-  RESERVED_TENANT_IDS,
-  TenantCollisionError,
-} from './tenant-registry.js';
-// The sanctioned way to reach a thread DO: it MINTS the tenant header
-// ThreadDurableObject verifies, so a route never forwards a client's own
-// (see thread-topology.ts — mint and verify ship together).
-export {
+  type BoundThreadTarget,
+  type BoundThreadTargetValidator,
   createThreadTopology,
   type ThreadNamespaceLike,
+  type ThreadPrincipalContext,
   type ThreadRequestInit,
   type ThreadStubLike,
   type ThreadTopology,

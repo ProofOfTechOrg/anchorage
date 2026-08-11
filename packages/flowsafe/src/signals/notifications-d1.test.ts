@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // D1NotificationsStorage round-trip / coalescing / listDue / update — mirrors the
-// core InMemoryNotificationsStorage behavior over the real node:sqlite adapter.
+// core InMemoryNotificationsStorage behavior over a node:sqlite SQL unit facade.
 
 import { describe, expect, it } from 'vitest';
 
-import { d1DatabaseLike, openSqlite } from '../../test-support/sqlite.js';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import type { SignalDatabase, SignalStatement } from './d1-shared.js';
 import { D1NotificationsStorage } from './notifications-d1.js';
 
 function store(): D1NotificationsStorage {
-  const db = d1DatabaseLike(openSqlite()) as unknown as SignalDatabase;
+  const db = sqliteUnitDatabase(openSqlite()) as unknown as SignalDatabase;
   return new D1NotificationsStorage(db, '');
 }
 
 function database(): SignalDatabase {
-  return d1DatabaseLike(openSqlite()) as unknown as SignalDatabase;
+  return sqliteUnitDatabase(openSqlite()) as unknown as SignalDatabase;
 }
 
 function sharedStores(): [D1NotificationsStorage, D1NotificationsStorage] {
@@ -724,7 +724,8 @@ describe('D1NotificationsStorage', () => {
     const barrier = coalescableReadBarrier(db);
     const left = new D1NotificationsStorage(barrier.db, '');
     const right = new D1NotificationsStorage(db, '');
-    await Promise.all([left.init(), right.init()]);
+    await left.init();
+    await right.init();
     const oldDeliverAt = new Date('2026-01-01T00:00:00.000Z');
     const oldSummaryAt = new Date('2026-01-01T00:01:00.000Z');
     await right.createNotification({
@@ -791,7 +792,8 @@ describe('D1NotificationsStorage', () => {
     const barrier = coalescableReadBarrier(db);
     const left = new D1NotificationsStorage(barrier.db, '');
     const right = new D1NotificationsStorage(db, '');
-    await Promise.all([left.init(), right.init()]);
+    await left.init();
+    await right.init();
     await right.createNotification({
       id: 'base',
       threadId: 'acme_t1',

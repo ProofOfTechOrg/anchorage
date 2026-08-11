@@ -42,12 +42,10 @@ const OUTREACH_CONNECTOR = 'outreach-sender';
 const OPERATOR: ApprovalActor = {
   id: 'opal',
   role: 'operator',
-  tenantId: 'acme',
 };
 const REVIEWER: ApprovalActor = {
   id: 'ray',
   role: 'reviewer',
-  tenantId: 'acme',
 };
 
 interface Harness {
@@ -58,7 +56,7 @@ interface Harness {
 }
 
 function buildHarness(): Harness {
-  const store = new InMemoryApprovalStore('acme');
+  const store = new InMemoryApprovalStore();
   const audit = new AuditLogger();
   let sends = 0;
 

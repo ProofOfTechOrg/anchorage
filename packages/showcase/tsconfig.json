@@ -1,7 +1,7 @@
 {
   // Browser app pass: DOM lib + JSX + Vite client types. tsc only type-checks
-  // (Vite bundles). The Node-side vite.config.ts + run-api-dev-plugin.ts are
-  // type-checked by tsconfig.node.json; the worker by tsconfig.worker.json.
+  // (Vite bundles). The Node-side vite.config.ts is type-checked by
+  // tsconfig.node.json; the worker by tsconfig.worker.json.
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "jsx": "react-jsx",

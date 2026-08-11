@@ -34,18 +34,46 @@ function headers(map: Record<string, string>): {
 const SECRET = 'top-secret';
 
 describe('verifyGithubSignature', () => {
-  it('accepts a correctly signed body', async () => {
-    // #given
-    const body = encoder.encode('{"repository":{"full_name":"acme/repo"}}');
+  it.each([
+    ['UTF-8 JSON', encoder.encode('{"repository":{"full_name":"acme/repo"}}')],
+    ['non-ASCII text', encoder.encode('{"message":"مرحبا 🌊"}')],
+    ['UTF-8 BOM', new Uint8Array([0xef, 0xbb, 0xbf, 0x7b, 0x7d])],
+    [
+      'invalid UTF-8 bytes',
+      new Uint8Array([0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xff, 0x22, 0x7d]),
+    ],
+    ['empty input', new Uint8Array()],
+  ])('accepts a correctly signed %s body', async (_label, body) => {
     const signature = await githubSign(SECRET, body);
-    // #when / #then
-    expect(
-      await verifyGithubSignature(
+
+    await expect(
+      verifyGithubSignature(
         body,
         headers({ 'x-hub-signature-256': signature }),
         SECRET,
       ),
-    ).toBe(true);
+    ).resolves.toBe(true);
+  });
+
+  it('accepts lowercase and uppercase canonical digest hex', async () => {
+    const body = encoder.encode('{}');
+    const lowercase = await githubSign(SECRET, body);
+    const uppercase = `sha256=${lowercase.slice('sha256='.length).toUpperCase()}`;
+
+    await expect(
+      verifyGithubSignature(
+        body,
+        headers({ 'x-hub-signature-256': lowercase }),
+        SECRET,
+      ),
+    ).resolves.toBe(true);
+    await expect(
+      verifyGithubSignature(
+        body,
+        headers({ 'x-hub-signature-256': uppercase }),
+        SECRET,
+      ),
+    ).resolves.toBe(true);
   });
 
   it('rejects a signature for a DIFFERENT secret (constant-time verify)', async () => {
@@ -120,6 +148,26 @@ describe('verifyGithubSignature', () => {
         '',
       ),
     ).toBe(false);
+  });
+
+  it.each([
+    `sha256=${'0g'.repeat(32)}`,
+    `sha256=${'aZ'.repeat(32)}`,
+    `zsha256=${'00'.repeat(32)}`,
+    `SHA256=${'00'.repeat(32)}`,
+    `sHa256=${'00'.repeat(32)}`,
+    `sha256=${'00'.repeat(32)}z`,
+    `sha256=${'00'.repeat(31)}`,
+    `sha256=${'00'.repeat(33)}`,
+    `sha256= ${'00'.repeat(32)}`,
+  ])('rejects non-canonical signature representation %s', async (signature) => {
+    await expect(
+      verifyGithubSignature(
+        encoder.encode('{}'),
+        headers({ 'x-hub-signature-256': signature }),
+        SECRET,
+      ),
+    ).resolves.toBe(false);
   });
 });
 

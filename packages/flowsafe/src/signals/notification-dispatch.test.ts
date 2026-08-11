@@ -3,22 +3,33 @@
 import { InMemoryNotificationsStorage } from '@mastra/core/notifications';
 import { describe, expect, it, vi } from 'vitest';
 
-import type { TenantContext } from '../approval-api/index.js';
+import type { ActorContext } from '../approval-api/index.js';
 import type { ThreadTopology } from '../host-kit/index.js';
 import { createNotificationDispatchTick } from './notification-dispatch.js';
 
 const NOW = new Date('2026-07-20T12:00:00.000Z');
 
-function tenant(tenantId: string): TenantContext {
+function actorContext(groupId = 'deployment'): ActorContext {
   return {
-    tenantId,
-    actor: { id: 'maintenance', role: 'admin', tenantId },
-    ownsMemoryId: (id: string) => id.startsWith(`${tenantId}_`),
-  } as unknown as TenantContext;
+    actor: { id: 'maintenance', role: 'admin' },
+    principal: { kind: 'human', id: 'maintenance', role: 'admin' },
+    resourceOwner: { kind: 'human', id: 'maintenance' },
+    service: () => {
+      throw new Error('approval service is not used in dispatch tests');
+    },
+    newRunId: () => `${groupId}-run`,
+    newThreadId: () => `${groupId}-thread`,
+    resourceIdFromKey: (key) => key,
+    claimResource: async () => undefined,
+    releaseResource: async () => undefined,
+    resourceOwnerFor: async () => undefined,
+    canAccessResource: async () => true,
+    canSelfDecide: () => false,
+  };
 }
 
 describe('createNotificationDispatchTick', () => {
-  it('rejects malformed and mixed-tenant rows before addressing a thread DO', async () => {
+  it('rejects malformed rows before addressing a thread DO', async () => {
     const storage = new InMemoryNotificationsStorage();
     const valid = await storage.createNotification({
       id: 'valid',
@@ -30,19 +41,19 @@ describe('createNotificationDispatchTick', () => {
       summary: 'valid',
       deliverAt: new Date(NOW.getTime() - 1),
     });
-    const mixed = await storage.createNotification({
-      id: 'mixed',
+    const malformed = await storage.createNotification({
+      id: 'malformed',
       threadId: 'acme_thread',
-      resourceId: 'globex_resource',
+      resourceId: 'bad/resource',
       agentId: 'agent',
       source: 'test',
       kind: 'ready',
-      summary: 'mixed',
+      summary: 'malformed',
       deliverAt: new Date(NOW.getTime() - 1),
     });
     const send = vi.fn(
       async (
-        _tenant: TenantContext,
+        _context: ActorContext,
         _threadId: string,
         _path: string,
         _init: RequestInit,
@@ -51,45 +62,44 @@ describe('createNotificationDispatchTick', () => {
     const tick = createNotificationDispatchTick({
       storage,
       topology: { send } as unknown as ThreadTopology,
-      resolveTenant: tenant,
+      resolveContext: actorContext,
       now: () => NOW,
     });
 
     expect(await tick()).toEqual({ due: 2, delivered: 1, failed: 1 });
     expect(send).toHaveBeenCalledTimes(1);
     expect(send).toHaveBeenCalledWith(
-      expect.objectContaining({ tenantId: 'acme' }),
+      expect.objectContaining({}),
       valid.threadId,
       '/signal/notifications/dispatch',
       expect.any(Object),
     );
     expect(
       await storage.getNotification({
-        threadId: mixed.threadId,
-        id: mixed.id,
+        threadId: malformed.threadId,
+        id: malformed.id,
       }),
     ).toMatchObject({
       deliveryAttempts: 1,
-      lastDeliveryError:
-        'notification has malformed or mixed-tenant memory ids',
+      lastDeliveryError: 'notification has malformed memory ids',
     });
   });
 
-  it('isolates a failed tenant/thread group from its neighbors', async () => {
+  it('isolates a failed thread group from its neighbors', async () => {
     const storage = new InMemoryNotificationsStorage();
-    for (const tenantId of ['acme', 'globex']) {
+    for (const groupId of ['acme', 'globex']) {
       await storage.createNotification({
-        id: tenantId,
-        threadId: `${tenantId}_thread`,
-        resourceId: `${tenantId}_resource`,
+        id: groupId,
+        threadId: `${groupId}_thread`,
+        resourceId: `${groupId}_resource`,
         agentId: 'agent',
         source: 'test',
         kind: 'ready',
-        summary: tenantId,
+        summary: groupId,
         deliverAt: new Date(NOW.getTime() - 1),
       });
     }
-    const send = vi.fn(async (_tenant, threadId: string) =>
+    const send = vi.fn(async (_context, threadId: string) =>
       threadId.startsWith('acme_')
         ? new Response('down', { status: 503 })
         : new Response(JSON.stringify({ delivered: 1, failed: 0 })),
@@ -97,7 +107,7 @@ describe('createNotificationDispatchTick', () => {
     const tick = createNotificationDispatchTick({
       storage,
       topology: { send } as unknown as ThreadTopology,
-      resolveTenant: tenant,
+      resolveContext: actorContext,
       now: () => NOW,
     });
 
@@ -105,7 +115,69 @@ describe('createNotificationDispatchTick', () => {
     expect(send).toHaveBeenCalledTimes(2);
   });
 
-  it('groups the same tenant/thread/resource separately by persisted agent id', async () => {
+  it('backs off a blocked row so a bounded scan reaches later notifications', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const blocked = await storage.createNotification({
+      id: 'blocked',
+      threadId: 'acme_thread',
+      resourceId: 'acme_resource',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'ready',
+      summary: 'blocked',
+      deliverAt: new Date(NOW.getTime() - 2_000),
+    });
+    await storage.createNotification({
+      id: 'later',
+      threadId: 'acme_thread',
+      resourceId: 'acme_resource',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'ready',
+      summary: 'later',
+      deliverAt: new Date(NOW.getTime() - 1_000),
+    });
+    const send = vi
+      .fn(
+        async (
+          _context: ActorContext,
+          _threadId: string,
+          _path: string,
+          _init: RequestInit,
+        ) => new Response('principal mismatch', { status: 409 }),
+      )
+      .mockResolvedValueOnce(
+        new Response('principal mismatch', { status: 409 }),
+      )
+      .mockResolvedValue(
+        new Response(JSON.stringify({ delivered: 1, failed: 0 })),
+      );
+    const tick = createNotificationDispatchTick({
+      storage,
+      topology: { send } as unknown as ThreadTopology,
+      resolveContext: actorContext,
+      now: () => NOW,
+      limit: 1,
+    });
+
+    expect(await tick()).toEqual({ due: 1, delivered: 0, failed: 1 });
+    expect(
+      await storage.getNotification({
+        threadId: blocked.threadId,
+        id: blocked.id,
+      }),
+    ).toMatchObject({
+      deliveryAttempts: 1,
+      deliverAt: new Date(NOW.getTime() + 1_000),
+    });
+    expect(await tick()).toEqual({ due: 1, delivered: 1, failed: 0 });
+    const secondBody = JSON.parse(String(send.mock.calls[1]?.[3]?.body)) as {
+      notificationIds: string[];
+    };
+    expect(secondBody.notificationIds).toEqual(['later']);
+  });
+
+  it('groups the same thread/resource separately by persisted agent id', async () => {
     const storage = new InMemoryNotificationsStorage();
     for (const agentId of ['agent-a', 'agent-b']) {
       await storage.createNotification({
@@ -121,7 +193,7 @@ describe('createNotificationDispatchTick', () => {
     }
     const send = vi.fn(
       async (
-        _tenant: TenantContext,
+        _context: ActorContext,
         _threadId: string,
         _path: string,
         _init: RequestInit,
@@ -130,7 +202,7 @@ describe('createNotificationDispatchTick', () => {
     const tick = createNotificationDispatchTick({
       storage,
       topology: { send } as unknown as ThreadTopology,
-      resolveTenant: tenant,
+      resolveContext: actorContext,
       now: () => NOW,
     });
 
@@ -168,7 +240,7 @@ describe('createNotificationDispatchTick', () => {
     const tick = createNotificationDispatchTick({
       storage,
       topology: { send } as unknown as ThreadTopology,
-      resolveTenant: tenant,
+      resolveContext: actorContext,
       now: () => NOW,
     });
 
@@ -212,7 +284,7 @@ describe('createNotificationDispatchTick', () => {
       deliverAt: new Date(NOW.getTime() - 1_000),
     });
     const bodies: Array<{ notificationIds: string[] }> = [];
-    const send = vi.fn(async (_tenant, _thread, _path, init: RequestInit) => {
+    const send = vi.fn(async (_context, _thread, _path, init: RequestInit) => {
       const body = JSON.parse(String(init.body)) as {
         notificationIds: string[];
       };
@@ -227,7 +299,7 @@ describe('createNotificationDispatchTick', () => {
     const tick = createNotificationDispatchTick({
       storage,
       topology: { send } as unknown as ThreadTopology,
-      resolveTenant: tenant,
+      resolveContext: actorContext,
       now: () => NOW,
       limit: 101,
     });
@@ -271,7 +343,7 @@ describe('createNotificationDispatchTick', () => {
     }
     for (let index = 30; index < 60; index += 1) await createSummary(index);
     const batches: string[][] = [];
-    const send = vi.fn(async (_tenant, _thread, _path, init: RequestInit) => {
+    const send = vi.fn(async (_context, _thread, _path, init: RequestInit) => {
       const body = JSON.parse(String(init.body)) as {
         notificationIds: string[];
       };
@@ -286,7 +358,7 @@ describe('createNotificationDispatchTick', () => {
     const tick = createNotificationDispatchTick({
       storage,
       topology: { send } as unknown as ThreadTopology,
-      resolveTenant: tenant,
+      resolveContext: actorContext,
       now: () => NOW,
       limit: 120,
     });
@@ -314,7 +386,7 @@ describe('createNotificationDispatchTick', () => {
       });
     }
     const batches: string[][] = [];
-    const send = vi.fn(async (_tenant, _thread, _path, init: RequestInit) => {
+    const send = vi.fn(async (_context, _thread, _path, init: RequestInit) => {
       const body = JSON.parse(String(init.body)) as {
         notificationIds: string[];
       };
@@ -329,7 +401,7 @@ describe('createNotificationDispatchTick', () => {
     const tick = createNotificationDispatchTick({
       storage,
       topology: { send } as unknown as ThreadTopology,
-      resolveTenant: tenant,
+      resolveContext: actorContext,
       now: () => NOW,
       limit: 205,
     });
@@ -343,16 +415,16 @@ describe('createNotificationDispatchTick', () => {
 
   it('carries one echoed thread-state snapshot within a group and resets it for the next group', async () => {
     const storage = new InMemoryNotificationsStorage();
-    for (const tenantId of ['acme', 'globex']) {
+    for (const groupId of ['acme', 'globex']) {
       for (let index = 0; index < 101; index += 1) {
         await storage.createNotification({
-          id: `${tenantId}-${index}`,
-          threadId: `${tenantId}_thread`,
-          resourceId: `${tenantId}_resource`,
+          id: `${groupId}-${index}`,
+          threadId: `${groupId}_thread`,
+          resourceId: `${groupId}_resource`,
           agentId: 'agent',
           source: 'test',
           kind: 'ready',
-          summary: `${tenantId} ${index}`,
+          summary: `${groupId} ${index}`,
           deliverAt: new Date(NOW.getTime() - 1),
         });
       }
@@ -363,7 +435,7 @@ describe('createNotificationDispatchTick', () => {
     }> = [];
     const send = vi.fn(
       async (
-        _tenant: TenantContext,
+        _context: ActorContext,
         threadId: string,
         _path: string,
         init: RequestInit,
@@ -385,7 +457,7 @@ describe('createNotificationDispatchTick', () => {
     const tick = createNotificationDispatchTick({
       storage,
       topology: { send } as unknown as ThreadTopology,
-      resolveTenant: tenant,
+      resolveContext: actorContext,
       now: () => NOW,
       limit: 202,
     });
@@ -414,7 +486,7 @@ describe('createNotificationDispatchTick', () => {
       });
     }
     const sizes: number[] = [];
-    const send = vi.fn(async (_tenant, _thread, _path, init: RequestInit) => {
+    const send = vi.fn(async (_context, _thread, _path, init: RequestInit) => {
       const body = JSON.parse(String(init.body)) as {
         notificationIds: string[];
       };
@@ -429,7 +501,7 @@ describe('createNotificationDispatchTick', () => {
     const tick = createNotificationDispatchTick({
       storage,
       topology: { send } as unknown as ThreadTopology,
-      resolveTenant: tenant,
+      resolveContext: actorContext,
       now: () => NOW,
       limit: 205,
     });
@@ -453,7 +525,7 @@ describe('createNotificationDispatchTick', () => {
       });
     }
     let call = 0;
-    const send = vi.fn(async (_tenant, _thread, _path, init: RequestInit) => {
+    const send = vi.fn(async (_context, _thread, _path, init: RequestInit) => {
       call += 1;
       const body = JSON.parse(String(init.body)) as {
         notificationIds: string[];
@@ -469,7 +541,7 @@ describe('createNotificationDispatchTick', () => {
     const tick = createNotificationDispatchTick({
       storage,
       topology: { send } as unknown as ThreadTopology,
-      resolveTenant: tenant,
+      resolveContext: actorContext,
       now: () => NOW,
       limit: 205,
     });
@@ -501,7 +573,7 @@ describe('createNotificationDispatchTick', () => {
         createNotificationDispatchTick({
           storage,
           topology: { send } as unknown as ThreadTopology,
-          resolveTenant: tenant,
+          resolveContext: actorContext,
           limit,
         }),
       ).toThrow(RangeError);
@@ -510,7 +582,7 @@ describe('createNotificationDispatchTick', () => {
     const tick = createNotificationDispatchTick({
       storage,
       topology: { send } as unknown as ThreadTopology,
-      resolveTenant: tenant,
+      resolveContext: actorContext,
       limit: 0,
     });
     await expect(tick()).resolves.toEqual({

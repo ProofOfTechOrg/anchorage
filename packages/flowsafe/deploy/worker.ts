@@ -1,6 +1,6 @@
 // Reference production deployment for the flowsafe DO runner + approval
 // queue. Copy this directory as the starting point for a real Worker: the
-// wiring is production-shaped (bearer-token auth seam, cron-driven SLA sweep
+// wiring is production-shaped (bearer-token auth seam, alarm-driven SLA sweep
 // and retention purge, structured audit logs, multi-gate approval bridging,
 // opt-in live streaming); replace the example workflow with your own and swap
 // bearerActorAuthenticator for your identity provider.
@@ -35,7 +35,7 @@
 //                                            binding AND STREAM_TICKET_SECRET
 //                                            are both present (else poll-only)
 //   GET  /api/stream/hub?ticket=          -> live approval-queue WebSocket
-//                                            (per-tenant hub DO fan-out)
+//                                            (deployment hub DO fan-out)
 //   GET  /api/stream/run/:wf/:runId?ticket= -> live run-progress WebSocket
 //                                            (per-run WS on the runner DO)
 //   GET  /healthz                         -> liveness (unauthenticated)
@@ -50,15 +50,12 @@
 // browser cannot set Authorization on a WebSocket, so a client mints a ~60s
 // HMAC ticket over authenticated REST and presents it in the WS URL query; the
 // Worker is the SOLE ticket authority and the ticket carries ADDRESSING only
-// (tenant/channel/runId/actor/exp), never a grant. Absent the secret, every
+// (channel/runId/actor/exp), never a grant. Absent the secret, every
 // dashboard stays on its poll fallback and nothing else changes.
 //
-// Scheduled (wrangler.jsonc `triggers.crons`): TWO cron expressions,
-// dispatched on controller.cron, so the SLA sweep and the retention purge
-// never share an invocation — a Workers CPU-limit termination kills the
-// isolate and is NOT a catchable JS error, so a slow sweep sharing an
-// invocation would permanently starve the purge (and vice versa) no matter
-// how many try/catches wrap them.
+// The fixed-name maintenance Durable Object gives the SLA sweep and retention
+// purge separate alarm invocations, so an uncatchable CPU termination in one
+// cannot starve the other.
 //
 // Deploy checklist: README.md next to this file.
 
@@ -68,9 +65,7 @@ import type {
   DurableObjectNamespace,
   ExecutionContext,
   ExportedHandler,
-  MessageBatch,
   Queue,
-  ScheduledController,
 } from '@cloudflare/workers-types';
 import type { ToolExecutionContext } from '@mastra/core/tools';
 import { createConnector } from '@proofoftech/breakwater/connector-sdk';
@@ -84,34 +79,37 @@ import {
 import {
   approvalStoreFactoryFor,
   assertWorkflowsRegistered,
+  createFlowsafeMaintenanceDurableObject,
   createFlowsafeWorker,
+  type FlowsafeWorkerConfig,
   parseActorTokens,
   staticTokenVerifier,
   type TokenVerifier,
   type WorkflowMeta,
-  withSubdomainCrossCheck,
 } from '@proofoftech/flowsafe/host-kit';
 import { z } from 'zod';
 
-import { PURGE_CRON, SWEEP_CRON } from './crons.js';
-
 interface Env {
   DB: D1Database;
+  /** Provisioning-stamped tag; must match the sentinel row in DB. */
+  DEPLOYMENT_TENANT: string;
+  /** Secret credential shared only by this deployment's Worker and DOs. */
+  DEPLOYMENT_IDENTITY_SECRET: string;
   RUNNER: DurableObjectNamespace;
+  MAINTENANCE: DurableObjectNamespace;
   /**
-   * Per-tenant live-stream hub Durable Object namespace (DL-009). Declared by
+   * Deployment live-stream hub Durable Object namespace (DL-009). Declared by
    * the `HUB` binding in wrangler.jsonc (see its v2 migration), so it is always
    * present at runtime. createFlowsafeWorker mounts the /api/stream/* stage —
    * ticket mint + the hub/run WebSocket upgrades — ONLY when this binding AND
    * STREAM_TICKET_SECRET are both present; either absent leaves every dashboard
-   * on its poll fallback (DL-019). Addressed idFromName(tenantId), so the DO's
-   * id.name IS the tenant and the fan-out is tenant-disjoint by construction.
+   * on its poll fallback (DL-019). Addressed as one fixed deployment singleton.
    */
   HUB: DurableObjectNamespace;
   /**
    * Secret (`wrangler secret put STREAM_TICKET_SECRET`): the dedicated HMAC key
    * that signs the short-lived (~60s) WebSocket stream tickets (DL-010/DL-019).
-   * A ticket is ADDRESSING only — tenant + channel + runId + actor + exp —
+   * A ticket is ADDRESSING only — channel + runId + actor + exp —
    * never a grant. Keep it DISTINCT from any session-JWT secret so a stream
    * ticket and a session token can never be confused under one key. Absent =>
    * the stream stage stays unmounted (streaming is opt-in; poll-only still
@@ -126,6 +124,7 @@ interface Env {
    * actor mapping stays inside the trusted computing base either way.
    */
   APPROVAL_ACTOR_TOKENS?: string;
+  MAINTENANCE_ADMIN_SECRET?: string;
   /** Default SLA seconds for new approvals (var; default 14400 = 4h). */
   APPROVAL_SLA_SECONDS?: string;
   /**
@@ -135,40 +134,27 @@ interface Env {
    * `admin`. Any invalid value falls back to OFF.
    */
   APPROVAL_ALLOW_SELF_DECISION?: string;
-  /** Cron purges terminal run snapshots older than this (var; default 30; 0 = immediately). */
+  /** Alarm maintenance purges terminal run snapshots older than this (var; default 30; 0 = immediately). */
   RUN_RETENTION_DAYS?: string;
-  /** Cron purges DECIDED (approved/rejected) approval records older than this (var; default 30; 0 = immediately). */
+  /** Alarm maintenance purges DECIDED approvals older than this (var; default 30; 0 = immediately). */
   APPROVAL_RETENTION_DAYS?: string;
   /**
-   * Agent-memory thread TTL in days (var; docs/agent-memory-tenancy.md): the
-   * purge cron deletes threads untouched for longer than this, with their
+   * Agent-memory thread TTL in days (var; docs/agent-memory-isolation.md): the
+   * purge duty deletes threads untouched for longer than this, with their
    * messages. UNSET (the default) => no thread ever expires — a conversation is
    * something a host means to keep, unlike a terminal run snapshot, so this
    * deployment only starts expiring memory when an operator names a number.
    */
   THREAD_RETENTION_DAYS?: string;
   /**
-   * Optional audit export to a SIEM: bind a queue producer (wrangler.jsonc
-   * `queues` block) and audit events flow producer -> queue -> the `queue`
-   * consumer below -> HTTP POST to SIEM_ENDPOINT (auth via the
-   * SIEM_AUTH_HEADER secret, sent as the `authorization` header). Without
-   * the binding, audit stays on structured Workers Logs only.
+   * Optional audit export: this tenant Worker only produces to the shared
+   * queue. The control plane owns consumption and SIEM delivery.
    */
   AUDIT_QUEUE?: Queue;
-  SIEM_ENDPOINT?: string;
-  SIEM_AUTH_HEADER?: string;
-  /**
-   * Client-per-subdomain apex, e.g. 'example.com' (var). When set, a request
-   * to <tenant>.<apex> is denied unless the token's verified tenant IS that
-   * tenant — defense in depth over INV-2, closing the pasted-token
-   * confused-deputy UX (reserved infra subdomains and hosts outside the apex
-   * skip the check). Unset => no cross-check (single-host deployments).
-   */
-  TENANT_APEX_DOMAIN?: string;
 }
 
-/** Id for system-created records; the tenant is bound per request/instance. */
-const SYSTEM_ACTOR_ID = 'flowsafe-worker';
+/** Id for system-created records. */
+const SYSTEM_PRINCIPAL_ID = 'flowsafe-worker';
 
 /** The connector the example publish step demands a grant for. */
 const EXAMPLE_CONNECTOR = 'example-publisher';
@@ -190,11 +176,8 @@ const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
   },
 ];
 
-function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
-  // Bound to THIS DO instance's tenant, recovered from its idFromName
-  // identity (INV-1 -> INV-2): the grant mint can only ever read the runs'
-  // own tenant, even though the runId predicate already scopes it.
-  const approvals = approvalStoreFactoryFor(env.DB).forTenant(tenantId);
+function defineWorkflows(env: Env): RunnerRuntime {
+  const approvals = approvalStoreFactoryFor(env.DB).store();
   const { createWorkflow, createStep, runtime } = init(env, {
     // The grant-minting seam: on every start/resume the runtime derives the
     // breakwater grant key from APPROVED records in D1 — decisions become
@@ -217,13 +200,9 @@ function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
   //    for. Deriving it from run input would let client input choose its own
   //    capability;
   //  - resumeSchema matches approval-api's defaultResumeData contract;
-  //  - real breakwater connectors (createConnector) in a MULTI-TENANT
-  //    deployment must register breakwater's `tenantIsolation()` evaluator in
-  //    their `policies.evaluators`: the runtime mints the isolation scope
-  //    from every INV-1 runId, and the evaluator turns "scope somehow absent"
-  //    from silently-shared idempotency/rate-limit keys into a denial. Wire
-  //    durable stores too (D1IdempotencyStore / D1RateLimitStore) — an
-  //    in-memory budget under DO-per-run routing is a per-RUN budget.
+  //  - wire durable breakwater stores (D1IdempotencyStore /
+  //    D1RateLimitStore) when budgets must survive isolate replacement. An
+  //    in-memory budget under DO-per-run routing is a per-run budget.
   const gate = createStep({
     id: 'gate',
     inputSchema: z.object({ topic: z.string() }),
@@ -307,17 +286,20 @@ function defineWorkflows(env: Env, tenantId: string): RunnerRuntime {
 
 export class FlowsafeRunner extends DurableObjectRunner<Env> {
   protected build(env: Env): RunnerRuntime {
-    return defineWorkflows(env, this.tenantId);
+    return defineWorkflows(env);
+  }
+
+  protected runOwnership(env: Env) {
+    return approvalStoreFactoryFor(env.DB).resources();
   }
 }
 
 /**
- * The per-tenant live-stream hub Durable Object (DL-009). The wrangler `HUB`
+ * The deployment live-stream hub Durable Object (DL-009). The wrangler `HUB`
  * binding + the append-only `v2` migration resolve this named export; the base
  * class does all the work (fan-out over hibernatable WebSockets + a presence
- * roster), so the subclass body is empty. Addressed idFromName(tenantId) by the
- * composer's stream router, so its id.name IS the tenant — the fan-out is
- * tenant-disjoint by construction, and no ticket verification happens here (the
+ * roster), so the subclass body is empty. Addressed under a fixed singleton
+ * name by the composer's stream router; no ticket verification happens here (the
  * Worker is the sole ticket authority). Fan-out activates once
  * STREAM_TICKET_SECRET is set; until then the DO is bound but idle.
  */
@@ -351,39 +333,34 @@ function buildVerifier(env: Env): TokenVerifier {
 }
 
 // The composed Worker: /healthz → /api/approvals → /workflows + /runs → 404,
-// two-cron maintenance (sweep vs purge never share an invocation; the
-// byte-equality contract with wrangler.jsonc lives in crons.ts), and the
-// audit-export queue consumer. This deployment supplies its workflows, its
-// verifier, and the optional client-per-subdomain cross-check. To add run
+// alarm maintenance (sweep and purge never share an invocation). This
+// deployment supplies its workflows and its
+// verifier. To add run
 // artifacts (R2ArtifactStore), set the `artifactStore` field on this config:
 // createFlowsafeWorker pairs artifact deletion INSIDE the retention purge, so
 // each expired run's artifacts are deleted BEFORE its snapshot row (the row is
 // the only enumerable record of the run's artifact keys). An `extraPurgeDuties`
 // hook cannot do this — it runs AFTER the rows are deleted, when the keys are
 // already unenumerable.
-const worker = createFlowsafeWorker<Env>({
+const workerConfig = {
   workflows: WORKFLOWS,
-  systemActorId: SYSTEM_ACTOR_ID,
+  systemPrincipalId: SYSTEM_PRINCIPAL_ID,
   buildVerifier,
-  crons: { sweep: SWEEP_CRON, purge: PURGE_CRON },
-  // Defense in depth over INV-2 (see Env.TENANT_APEX_DOMAIN), only when set.
-  wrapResolve: (resolve, env) =>
-    env.TENANT_APEX_DOMAIN
-      ? withSubdomainCrossCheck(resolve, {
-          apexDomain: env.TENANT_APEX_DOMAIN,
-        })
-      : resolve,
-});
+  maintenance: {
+    sweepIntervalMs: 15 * 60 * 1_000,
+    purgeIntervalMs: 60 * 60 * 1_000,
+  },
+} satisfies FlowsafeWorkerConfig<Env>;
+
+export class FlowsafeMaintenance extends createFlowsafeMaintenanceDurableObject(
+  workerConfig,
+) {}
+
+const worker = createFlowsafeWorker<Env>(workerConfig);
 
 const handler: ExportedHandler<Env> = {
   fetch: (request: CfRequest, env: Env, ctx: ExecutionContext) =>
     worker.fetch(request as unknown as Request, env, ctx),
-  scheduled: (
-    controller: ScheduledController,
-    env: Env,
-    ctx: ExecutionContext,
-  ) => worker.scheduled(controller, env, ctx),
-  queue: (batch: MessageBatch, env: Env) => worker.queue(batch, env),
 };
 
 export default handler;

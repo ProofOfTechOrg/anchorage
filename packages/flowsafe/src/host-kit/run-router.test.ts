@@ -15,7 +15,8 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   type ApprovalActor,
   ApprovalService,
-  createTenantResolver,
+  type ApprovalStore,
+  createActorResolver,
   InMemoryApprovalStoreFactory,
   type SelfDecisionPolicy,
 } from '../approval-api/index.js';
@@ -25,17 +26,17 @@ import {
   type RunSummary,
   UnknownRunError,
 } from '../do-runner/index.js';
+import { reconcileApprovalsOnStatus } from './approval-bridge.js';
 import { RunRouteError } from './run-route-error.js';
 import { createRunRouter, type RunRouterOptions } from './run-router.js';
 import type { WorkflowMeta } from './workflow-meta.js';
 
-const SYSTEM: ApprovalActor = { id: 'sys', role: 'operator', tenantId: 'acme' };
+const SYSTEM: ApprovalActor = { id: 'sys', role: 'operator' };
 
-/** Header-transported test identities; tenant defaults to 'acme' in req(). */
+/** Header-transported test identities. */
 interface ReqActor {
   id: string;
   role: string;
-  tenantId?: string;
 }
 
 const ADMIN: ReqActor = { id: 'ada', role: 'admin' };
@@ -75,31 +76,47 @@ function suspendedSummary(runId: string): RunSummary {
 }
 
 interface HarnessOptions {
-  start?: (
-    workflowId: string,
-    runId: string,
-    inputData: unknown,
-  ) => Promise<RunSummary>;
+  start?: RunRouterOptions['start'];
   status?: (
     workflowId: string,
     runId: string,
   ) => Promise<RunSummary | undefined>;
-  resume?: (
-    workflowId: string,
-    runId: string,
-    body: unknown,
-  ) => Promise<RunSummary>;
+  resume?: RunRouterOptions['resume'];
   reconcileApprovals?: RunRouterOptions['reconcileApprovals'];
   // F9: feeds the resolver's allowSelfDecision now (the run-router no longer
   // owns a selfDecision knob), driving the catalog's canSelfDecide echo.
   selfDecision?: SelfDecisionPolicy;
+  resourceOwner?: ReqActor;
+  approvalCreateFailures?: number;
 }
 
 function makeHarness(options: HarnessOptions = {}) {
   const backend = new InMemoryApprovalStoreFactory();
-  const store = backend.forTenant('acme');
-  // The bridge queues records through the request's TENANT-BOUND service;
-  // exposing acme's service keeps the SoD assertions terse.
+  const resourceOwner = options.resourceOwner ?? OPERATOR;
+  for (const runId of ['r1', 'acme_r1']) {
+    void backend.resources().claim('run', runId, {
+      kind: 'human',
+      id: resourceOwner.id,
+    });
+  }
+  const store = backend.store();
+  let approvalCreateFailures = options.approvalCreateFailures ?? 0;
+  const requestStore = new Proxy(store, {
+    get(target, property, receiver) {
+      if (property === 'create') {
+        return async (...args: Parameters<ApprovalStore['create']>) => {
+          if (approvalCreateFailures > 0) {
+            approvalCreateFailures -= 1;
+            throw new Error('injected approval create failure');
+          }
+          return target.create(...args);
+        };
+      }
+      const value = Reflect.get(target, property, receiver) as unknown;
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  }) as ApprovalStore;
+  // The bridge queues records through the request-scoped deployment service.
   const service = new ApprovalService({ store });
   const started: Array<{
     workflowId: string;
@@ -108,32 +125,35 @@ function makeHarness(options: HarnessOptions = {}) {
   }> = [];
   const resumed: Array<{ workflowId: string; runId: string; body: unknown }> =
     [];
-  const resolve = createTenantResolver({
+  const resolve = createActorResolver({
     authenticate: (request) => {
       const id = request.headers.get('x-actor-id');
       const role = request.headers.get('x-actor-role');
-      const tenantId = request.headers.get('x-actor-tenant') ?? 'acme';
       return id && role
-        ? { id, role: role as ApprovalActor['role'], tenantId }
+        ? { id, role: role as ApprovalActor['role'] }
         : undefined;
     },
     storeFactory: backend,
-    buildService: (boundStore) => new ApprovalService({ store: boundStore }),
+    buildService: () => new ApprovalService({ store: requestStore }),
     newRunId: () => 'generated-run-id',
     // F9: the SoD exemption policy now feeds the resolver, so the catalog echo
-    // reads tenant.canSelfDecide (the run-router no longer takes its own knob).
+    // reads context.canSelfDecide (the run-router no longer takes its own knob).
     allowSelfDecision: options.selfDecision,
   });
   const handle = createRunRouter({
     workflows: WORKFLOWS,
     resolve,
-    systemActorId: SYSTEM.id,
-    start:
-      options.start ??
-      (async (workflowId, runId, inputData) => {
-        started.push({ workflowId, runId, inputData });
-        return { runId, status: 'success', result: { ok: true } };
-      }),
+    systemPrincipalId: SYSTEM.id,
+    start: async (input) => {
+      await backend.resources().claim('run', input.runId, {
+        kind: input.principal.kind,
+        id: input.principal.id,
+      });
+      if (options.start) return options.start(input);
+      const { workflowId, runId, inputData } = input;
+      started.push({ workflowId, runId, inputData });
+      return { runId, status: 'success', result: { ok: true } };
+    },
     status:
       options.status ??
       (async (_workflowId, runId) => ({ runId, status: 'running' })),
@@ -160,9 +180,6 @@ function req(path: string, options: ReqOptions = {}): Request {
   if (actor) {
     headers.set('x-actor-id', actor.id);
     headers.set('x-actor-role', actor.role);
-    if (actor.tenantId !== undefined) {
-      headers.set('x-actor-tenant', actor.tenantId);
-    }
   }
   let body: string | undefined;
   if (options.body !== undefined) {
@@ -239,7 +256,6 @@ describe('createRunRouter — GET /workflows', () => {
       actor: {
         id: 'vic',
         role: 'viewer',
-        tenantId: 'acme',
         canSelfDecide: false,
       },
     });
@@ -310,6 +326,17 @@ describe('createRunRouter — GET /workflows', () => {
 });
 
 describe('createRunRouter — the coarse start-role gate', () => {
+  it('413s a run start body before JSON parsing', async () => {
+    const { handle, started } = makeHarness();
+
+    const response = await handle(
+      req('/runs', { body: 'x'.repeat(1_048_577) }),
+    );
+
+    expect(response?.status).toBe(413);
+    expect(started).toEqual([]);
+  });
+
   it.each([
     ['viewer', VIEWER],
     ['reviewer', REVIEWER],
@@ -327,8 +354,8 @@ describe('createRunRouter — the coarse start-role gate', () => {
     expect(started).toEqual([]);
   });
 
-  it('403s a review-only role POSTing a resume, too', async () => {
-    // #given — the gate is method-keyed, so a new POST route cannot forget it
+  it('404s a review-only role before the resume role gate', async () => {
+    // #given — write ownership is resolved before role authorization
     const { handle, resumed } = makeHarness();
 
     // #when
@@ -340,17 +367,18 @@ describe('createRunRouter — the coarse start-role gate', () => {
     );
 
     // #then
-    expect(response?.status).toBe(403);
+    expect(response?.status).toBe(404);
     expect(resumed).toEqual([]);
   });
 
-  it('lets a review-only role GET a run status', async () => {
+  it('lets a reviewer GET a run status', async () => {
     // #given
     const { handle } = makeHarness();
 
     // #when / #then
     expect(
-      (await handle(req('/runs/open-flow/acme_r1', { actor: VIEWER })))?.status,
+      (await handle(req('/runs/open-flow/acme_r1', { actor: REVIEWER })))
+        ?.status,
     ).toBe(200);
   });
 });
@@ -393,7 +421,7 @@ describe('createRunRouter — per-workflow allowedRoles', () => {
     expect(started).toEqual([
       {
         workflowId: 'restricted-flow',
-        runId: 'acme_generated-run-id',
+        runId: 'generated-run-id',
         inputData: undefined,
       },
     ]);
@@ -422,7 +450,7 @@ describe('createRunRouter — per-workflow allowedRoles', () => {
 
   it('lets an allowed role resume the restricted workflow', async () => {
     // #given
-    const { handle, resumed } = makeHarness();
+    const { handle, resumed } = makeHarness({ resourceOwner: BUILDER });
 
     // #when
     const response = await handle(
@@ -437,31 +465,30 @@ describe('createRunRouter — per-workflow allowedRoles', () => {
     expect(resumed).toHaveLength(1);
   });
 
-  it('keeps restricted-workflow STATUS reads open to read-only roles — reads stay coarse', async () => {
-    // #given — reviewer/viewer inspect runs they may not drive
+  it('keeps restricted-workflow status reads open to reviewers', async () => {
+    // #given — reviewers inspect runs they may not drive
     const { handle } = makeHarness();
 
     // #when / #then
     expect(
-      (await handle(req('/runs/restricted-flow/acme_r1', { actor: VIEWER })))
+      (await handle(req('/runs/restricted-flow/acme_r1', { actor: REVIEWER })))
         ?.status,
     ).toBe(200);
   });
 
-  it("still 404s another tenant's run BEFORE the role check — no oracle for narrowed workflows", async () => {
-    // #given — a beta operator (not in restricted-flow's allowedRoles)
-    // probing an acme runId must see the same 404 an allowed role would
+  it('404s another operator before narrowed workflow roles', async () => {
+    // #given — the id exists but belongs to a different operator
     const { handle } = makeHarness();
 
     // #when
     const response = await handle(
       req('/runs/restricted-flow/acme_r1/resume', {
         body: {},
-        actor: { id: 'eve', role: 'operator', tenantId: 'beta' },
+        actor: { id: 'eve', role: 'operator' },
       }),
     );
 
-    // #then — 404, not the 403 the role check would emit
+    // #then
     expect(response?.status).toBe(404);
   });
 });
@@ -491,8 +518,8 @@ describe('createRunRouter — POST /runs', () => {
     ).toBe(404);
   });
 
-  it('400s a client-pinned runId and mints the tenant-salted id itself (INV-1)', async () => {
-    // #given — the runId IS the tenant carrier; a client may never choose it
+  it('400s a client-pinned runId and mints an opaque id itself (INV-1)', async () => {
+    // #given — a client may never choose the addressing id
     const { handle, started } = makeHarness();
 
     // #when — a pinned runId is rejected, not silently overridden
@@ -505,102 +532,62 @@ describe('createRunRouter — POST /runs', () => {
     expect(await pinned?.json()).toEqual({ error: 'runId is server-assigned' });
     expect(started).toEqual([]);
 
-    // #when — a normal start mints `${tenantId}_${uuid}`
+    // #when — a normal start uses the context's opaque server minter
     await handle(req('/runs', { body: { workflowId: 'open-flow' } }));
 
     // #then
-    expect(started.map((entry) => entry.runId)).toEqual([
-      'acme_generated-run-id',
-    ]);
+    expect(started.map((entry) => entry.runId)).toEqual(['generated-run-id']);
   });
 
-  it("404s another tenant's run on status AND resume — 404, not 403, so the route is no existence oracle", async () => {
-    // #given — tenant beta probing an acme-owned runId; the host thunks must
-    // never even be consulted
+  it('lets another authorized deployment actor inspect and resume a run', async () => {
     let statusCalls = 0;
     let resumeCalls = 0;
+    let resumeRequester: { id: string; kind: string } | undefined;
     const { handle } = makeHarness({
       status: async (_workflowId, runId) => {
         statusCalls += 1;
         return { runId, status: 'running' };
       },
-      resume: async (_workflowId, runId) => {
+      resume: async (
+        _workflowId,
+        runId,
+        _body,
+        requestedBy,
+        requestedByKind,
+      ) => {
         resumeCalls += 1;
+        resumeRequester = { id: requestedBy, kind: requestedByKind };
         return { runId, status: 'success' };
       },
     });
-    const beta = { id: 'eve', role: 'admin', tenantId: 'beta' };
+    const beta = { id: 'eve', role: 'admin' };
 
     // #when / #then
     const status = await handle(
       req('/runs/open-flow/acme_r1', { actor: beta }),
     );
-    expect(status?.status).toBe(404);
-    expect(await status?.json()).toEqual({ error: 'run not found' });
+    expect(status?.status).toBe(200);
     const resume = await handle(
       req('/runs/open-flow/acme_r1/resume', { body: {}, actor: beta }),
     );
-    expect(resume?.status).toBe(404);
-    expect(statusCalls).toBe(0);
-    expect(resumeCalls).toBe(0);
+    expect(resume?.status).toBe(200);
+    expect(statusCalls).toBe(1);
+    expect(resumeCalls).toBe(1);
+    expect(resumeRequester).toEqual({ id: beta.id, kind: 'human' });
   });
 
-  it("403s an actor whose tenant claim violates INV-3 — 'undefined' must never concatenate", async () => {
-    // #given — the tenant crosses an authentication boundary; the router
-    // re-validates before minting or prefix-matching with it
+  it('403s an invalid authenticated role before minting a run id', async () => {
     const { handle, started } = makeHarness();
 
     // #when / #then
-    for (const tenantId of ['ACME', 'a_b', 'ab', '']) {
-      const response = await handle(
-        req('/runs', {
-          body: { workflowId: 'open-flow' },
-          actor: { id: 'eve', role: 'admin', tenantId },
-        }),
-      );
-      expect(response?.status).toBe(403);
-    }
-    expect(started).toEqual([]);
-  });
-
-  it("403s an actor claiming the reserved identity 'system' — a custom verifier must not bind the maintenance identity", async () => {
-    // #given — 'system' is INV-3-valid, so only the resolver's
-    // reserved-identity check can catch a custom TokenVerifier (or hand-built
-    // actor map) that never crossed toApprovalActor
-    const { handle, started } = makeHarness();
-
-    // #when
     const response = await handle(
       req('/runs', {
         body: { workflowId: 'open-flow' },
-        actor: { id: 'eve', role: 'admin', tenantId: 'system' },
+        actor: { id: 'eve', role: 'owner' },
       }),
     );
-
-    // #then — no store bound, no system_* runId minted
     expect(response?.status).toBe(403);
     expect(started).toEqual([]);
-  });
-
-  it("still binds allocation-reserved tenants ('default') post-auth — only identities are refused at the resolver", async () => {
-    // #given — the two-list split must hold at this second enforcement layer
-    // too: refusing 'default' or 'api' here would break the single-tenant
-    // host the allocation reservation exists to protect
-    const { handle, started } = makeHarness();
-
-    // #when
-    const response = await handle(
-      req('/runs', {
-        body: { workflowId: 'open-flow' },
-        actor: { id: 'ray', role: 'admin', tenantId: 'default' },
-      }),
-    );
-
-    // #then — run minted under the 'default' tenant
-    expect(response?.ok).toBe(true);
-    expect(started.map((entry) => entry.runId)).toEqual([
-      'default_generated-run-id',
-    ]);
   });
 
   it('returns the bare summary when the run does not suspend', async () => {
@@ -614,7 +601,7 @@ describe('createRunRouter — POST /runs', () => {
 
     // #then — nothing queued
     expect(await response?.json()).toEqual({
-      runId: 'acme_generated-run-id',
+      runId: 'generated-run-id',
       status: 'success',
       result: { ok: true },
     });
@@ -625,7 +612,11 @@ describe('createRunRouter — POST /runs', () => {
     // #given — the bridge's SoD contract: whoever advanced the run is the
     // requester, so they cannot also decide it
     const { handle, store } = makeHarness({
-      start: async (_workflowId, runId) => suspendedSummary(runId),
+      start: async ({ runId, principal }) => ({
+        ...suspendedSummary(runId),
+        requestedBy: principal.id,
+        requestedByKind: principal.kind,
+      }),
     });
 
     // #when
@@ -643,6 +634,7 @@ describe('createRunRouter — POST /runs', () => {
         suspendedAt: 1717,
         connectors: ['deployer'],
         requestedBy: OPERATOR.id,
+        requestedByKind: 'human',
       },
     });
     expect(await store.list({ status: 'pending' })).toHaveLength(1);
@@ -652,7 +644,7 @@ describe('createRunRouter — POST /runs', () => {
     // #given — an admin (holding both CAN_CREATE and CAN_REVIEW) starts a run
     // that suspends
     const { handle, service, store } = makeHarness({
-      start: async (_workflowId, runId) => suspendedSummary(runId),
+      start: async ({ runId }) => suspendedSummary(runId),
     });
     await handle(
       req('/runs', { body: { workflowId: 'open-flow' }, actor: ADMIN }),
@@ -664,7 +656,49 @@ describe('createRunRouter — POST /runs', () => {
       service.decide(
         queued?.id ?? '',
         { decision: 'approve' },
-        { id: ADMIN.id, role: 'admin', tenantId: 'acme' },
+        { id: ADMIN.id, role: 'admin' },
+      ),
+    ).rejects.toThrow(/cannot decide their own approval/);
+  });
+
+  it('returns a committed suspended run when initial filing fails and heals with its durable requester', async () => {
+    const { handle, service, store } = makeHarness({
+      resourceOwner: ADMIN,
+      approvalCreateFailures: 1,
+      start: async ({ runId, principal }) => ({
+        ...suspendedSummary(runId),
+        requestedBy: principal.id,
+      }),
+      status: async (_workflowId, runId) => ({
+        ...suspendedSummary(runId),
+        requestedBy: ADMIN.id,
+      }),
+      reconcileApprovals: reconcileApprovalsOnStatus(SYSTEM.id),
+    });
+
+    const started = await handle(
+      req('/runs', { body: { workflowId: 'open-flow' }, actor: ADMIN }),
+    );
+
+    expect(started?.status).toBe(200);
+    expect(await started?.json()).toMatchObject({
+      runId: 'generated-run-id',
+      status: 'suspended',
+      requestedBy: ADMIN.id,
+    });
+    expect(await store.list({ status: 'pending' })).toEqual([]);
+
+    const status = await handle(
+      req('/runs/open-flow/generated-run-id', { actor: ADMIN }),
+    );
+    expect(status?.status).toBe(200);
+    const [healed] = await store.list({ status: 'pending' });
+    expect(healed?.requestedBy).toBe(ADMIN.id);
+    await expect(
+      service.decide(
+        healed?.id ?? '',
+        { decision: 'approve' },
+        { id: ADMIN.id, role: 'admin' },
       ),
     ).rejects.toThrow(/cannot decide their own approval/);
   });
@@ -754,7 +788,7 @@ describe('createRunRouter — reconcileApprovals hook (D4 self-healing)', () => 
     const calls: Array<{ workflowId: string; runId: string }> = [];
     const { handle } = makeHarness({
       status: async (_workflowId, runId) => suspendedSummary(runId),
-      reconcileApprovals: async (_tenant, workflowId, summary) => {
+      reconcileApprovals: async (_context, workflowId, summary) => {
         calls.push({ workflowId, runId: summary.runId });
       },
     });

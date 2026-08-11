@@ -1,18 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { DurableObject } from 'cloudflare:workers';
-import type { Agent } from '@mastra/core/agent';
+import type { DurableObjectState } from '@cloudflare/workers-types';
+import {
+  type Agent,
+  createMessageSignal,
+  createSignal,
+} from '@mastra/core/agent';
 import type { MessageListInput } from '@mastra/core/agent/message-list';
 import { Mastra } from '@mastra/core/mastra';
 import { AuditLogger } from '@proofoftech/breakwater';
 import {
+  type AgentThreadStateStorage,
   createThreadAgentHost,
   type ThreadAgentHost,
 } from '@proofoftech/flowsafe/agent-host';
 import {
   ApprovalService,
   approvalGrantProvider,
-  principalActor,
+  decodeExecutionPrincipal,
+  type ExecutionPrincipal,
+  principalMayAccess,
 } from '@proofoftech/flowsafe/approval-api';
 import {
   BackgroundTaskHost,
@@ -22,21 +29,29 @@ import {
 import {
   createD1Storage,
   createHostPubSub,
+  DoStatusError,
   DurableObjectRunner,
+  doErrorResponse,
+  EXECUTION_PRINCIPAL_HEADER,
   HubDurableObject,
   type InitResult,
   init,
-  mintResourceId,
-  RESERVED_TENANT_IDS,
-  TENANT_ID_PATTERN,
+  resourceIdFromKey,
   ThreadDurableObject,
   type ThreadScope,
+  verifyDurableObjectDeploymentIdentity,
+  verifyDurableObjectDeploymentRequest,
 } from '@proofoftech/flowsafe/do-runner';
 import {
   approvalStoreFactoryFor,
   createHubTopology,
   createThreadTopology,
 } from '@proofoftech/flowsafe/host-kit';
+import {
+  canPersistScheduledAgentSignal,
+  createScheduleStartSource,
+  type ScheduleAgentDispatchReceipt,
+} from '@proofoftech/flowsafe/schedules';
 import {
   githubSignalProvider,
   SignalProviderHost,
@@ -48,8 +63,12 @@ import {
 } from '@proofoftech/flowsafe/signals';
 
 import { createStarterAgentModule } from './agent.js';
-import { modelConfig, SYSTEM_ACTOR_ID } from './config.js';
-import { createComposedStorage, subscriptionStoreFactory } from './storage.js';
+import { modelConfig, SYSTEM_PRINCIPAL_ID } from './config.js';
+import {
+  createComposedStorage,
+  schedulesStore,
+  subscriptionStoreFactory,
+} from './storage.js';
 import { defineWorkflows } from './workflows.js';
 
 const github = githubSignalProvider();
@@ -61,31 +80,38 @@ function json(payload: unknown, status = 200): Response {
 
 function idleRunMessages(input: StartIdleRunInput): MessageListInput {
   if (input.message !== undefined) {
-    if (typeof input.message === 'string') return input.message;
-    if (Array.isArray(input.message)) {
-      return [{ role: 'user', content: input.message }];
-    }
-    return [{ role: 'user', content: input.message.contents }];
+    return createMessageSignal(input.message);
   }
   if (input.signal !== undefined) {
-    return [{ role: 'user', content: input.signal.contents }];
+    return createSignal(input.signal);
   }
   return 'Record the requested operation through the approved tool.';
 }
 
 export class StarterRunner extends DurableObjectRunner<Env> {
   protected build(env: Env) {
-    return defineWorkflows(env, this.tenantId);
+    return defineWorkflows(env);
+  }
+
+  protected runOwnership(env: Env) {
+    return approvalStoreFactoryFor(env.DB).resources();
+  }
+
+  protected scheduleSource(env: Env) {
+    return createScheduleStartSource(schedulesStore(env.DB));
   }
 }
 
 export class StarterHub extends HubDurableObject<Env> {}
 
 export class StarterSignalProviderHost extends SignalProviderHost<Env> {
-  protected build(env: Env, tenantId: string): SignalProviderHostWiring {
+  protected build(env: Env): SignalProviderHostWiring {
     return {
-      store: subscriptionStoreFactory(env.DB).forTenant(tenantId),
-      topology: createThreadTopology(env.THREAD),
+      store: subscriptionStoreFactory(env.DB).store(),
+      topology: createThreadTopology(
+        env.THREAD,
+        env.DEPLOYMENT_IDENTITY_SECRET,
+      ),
       providers: [github],
     };
   }
@@ -105,7 +131,7 @@ export class StarterThread extends ThreadDurableObject<Env> {
         console.log(JSON.stringify(event));
       },
     });
-    const approvals = approvalStoreFactoryFor(env.DB).forTenant(this.tenantId);
+    const approvals = approvalStoreFactoryFor(env.DB).store();
     const agentHost = createThreadAgentHost({
       buildModules: () => [
         createStarterAgentModule({
@@ -119,21 +145,26 @@ export class StarterThread extends ThreadDurableObject<Env> {
         if (!this.state?.storage) {
           throw new Error('thread Durable Object storage is unavailable');
         }
-        return this.state.storage;
+        return this.state.storage as unknown as AgentThreadStateStorage;
       },
+      resourceAccess: () => approvalStoreFactoryFor(env.DB).resources(),
+      scheduleSource: () => createScheduleStartSource(schedulesStore(env.DB)),
       approvalService: () => {
         this.#approvalService ??= new ApprovalService({
           store: approvals,
           ...(this.env.STREAM_TICKET_SECRET
             ? {
                 stream: (event) =>
-                  createHubTopology(this.env.HUB).publish(event),
+                  createHubTopology(
+                    this.env.HUB,
+                    this.env.DEPLOYMENT_IDENTITY_SECRET,
+                  ).publish(event),
               }
             : {}),
         });
         return this.#approvalService;
       },
-      systemActorId: SYSTEM_ACTOR_ID,
+      systemPrincipalId: SYSTEM_PRINCIPAL_ID,
       audit: (event) => audit.record(event),
     });
     this.#agentHost = agentHost;
@@ -150,6 +181,17 @@ export class StarterThread extends ThreadDurableObject<Env> {
     return threadInit;
   }
 
+  protected async onAlarm(
+    _env: Env,
+    threadId: string,
+    initResult: InitResult,
+  ): Promise<void> {
+    if (!this.#agentHost) {
+      throw new Error('thread agent host is unavailable');
+    }
+    await this.#agentHost.recoverOwnership(initResult.runtime, threadId);
+  }
+
   #host(): ThreadAgentHost {
     if (!this.#agentHost) {
       throw new Error('thread agent host is not initialized');
@@ -158,7 +200,7 @@ export class StarterThread extends ThreadDurableObject<Env> {
   }
 
   #resourceId(scope: ThreadScope): string {
-    return mintResourceId(scope.tenantId, scope.threadId);
+    return resourceIdFromKey(scope.threadId);
   }
 
   #signalRoutes = createThreadSignalRoutes({
@@ -166,18 +208,71 @@ export class StarterThread extends ThreadDurableObject<Env> {
       (await this.#host().resolveBoundAgent(scope, { agentId, entryPath }))
         .durableAgent as unknown as Agent,
     resolveResourceId: (scope) => this.#resourceId(scope),
+    resolveBlockingRun: (scope) => this.#host().blockingRun(scope),
+    serializeDispatch: (_scope, operation) =>
+      this.#host().serializeDispatch(operation),
+    resolveScheduleRunStatus: (scope, input) =>
+      this.#host().scheduleDispatchStatus(scope, input),
+    resolveScheduleTarget: async (_scope, input) => {
+      const target = await createScheduleStartSource(
+        schedulesStore(this.env.DB),
+      ).resolveScheduleTarget(input.scheduleId, input.dispatchId, input.runId);
+      return target?.type === 'agent' ? target : undefined;
+    },
+    canPersist: async (scope) => {
+      const owner = await approvalStoreFactoryFor(this.env.DB)
+        .resources()
+        .owner('thread', scope.threadId);
+      return (
+        owner?.kind === scope.principal.kind && owner.id === scope.principal.id
+      );
+    },
+    canPersistSchedule: (scope, input) =>
+      canPersistScheduledAgentSignal(
+        createScheduleStartSource(schedulesStore(this.env.DB)),
+        approvalStoreFactoryFor(this.env.DB).resources(),
+        { ...input, threadId: scope.threadId },
+      ),
     resolveNotificationsStorage: async () => {
       const storage = await this.#storage?.getStore('notifications');
       if (!storage) throw new Error('notifications storage is unavailable');
       return storage;
     },
+    resolveScheduleDispatchStore: () => {
+      const store = schedulesStore(this.env.DB);
+      return {
+        begin: async (scheduleId, dispatchId) => {
+          const key = `flowsafe:schedule-dispatch-receipt:v1:${dispatchId}`;
+          const local =
+            await this.state?.storage.get<ScheduleAgentDispatchReceipt>(key);
+          if (local) {
+            await store.settleAgentScheduleDispatch(
+              scheduleId,
+              dispatchId,
+              local,
+            );
+            await this.state?.storage.delete(key);
+            return { state: 'settled' as const, receipt: local };
+          }
+          return store.beginAgentScheduleDispatch(scheduleId, dispatchId);
+        },
+        settle: async (scheduleId, dispatchId, receipt) => {
+          const key = `flowsafe:schedule-dispatch-receipt:v1:${dispatchId}`;
+          await this.state?.storage.put(key, receipt);
+          await store.settleAgentScheduleDispatch(
+            scheduleId,
+            dispatchId,
+            receipt,
+          );
+          await this.state?.storage.delete(key);
+        },
+      };
+    },
     startIdleRun: async (input) => {
       const scope: ThreadScope = {
         threadId: input.threadId,
-        tenantId: input.principal.tenantId,
-        actor: principalActor(input.principal),
+        deploymentTag: this.env.DEPLOYMENT_TENANT,
         principal: input.principal,
-        requestedBy: input.principal.id,
         init: this.#initResult(),
       };
       const result = await this.#host().start(scope, {
@@ -187,6 +282,13 @@ export class StarterThread extends ThreadDurableObject<Env> {
         resourceId: input.resourceId ?? this.#resourceId(scope),
         messages: idleRunMessages(input),
         entryPath: input.entryPath,
+        ...(input.scheduleId !== undefined
+          ? { scheduleId: input.scheduleId }
+          : {}),
+        ...(input.dispatchId !== undefined
+          ? { dispatchId: input.dispatchId }
+          : {}),
+        safeContext: input.safeContext,
       });
       return { runId: result.runId };
     },
@@ -210,21 +312,28 @@ export class StarterThread extends ThreadDurableObject<Env> {
   }
 }
 
-export class StarterBackgroundTasks extends DurableObject<Env> {
+export const BACKGROUND_TASKS_INSTANCE_NAME = 'deployment-background-tasks';
+
+class BackgroundTaskIdentityError extends DoStatusError {
+  readonly status = 403;
+}
+
+export class StarterBackgroundTasks {
+  protected readonly ctx: DurableObjectState;
+  protected readonly env: Env;
   #host?: Promise<BackgroundTaskHost>;
 
-  #tenantId(): string {
-    const name = this.ctx.id.name;
-    if (
-      !name ||
-      !TENANT_ID_PATTERN.test(name) ||
-      RESERVED_TENANT_IDS.includes(name)
-    ) {
-      throw new Error(
-        'background-task hosts must be addressed with a valid, non-reserved tenantId',
+  constructor(ctx: DurableObjectState, env: Env) {
+    this.ctx = ctx;
+    this.env = env;
+  }
+
+  #assertInstanceName(): void {
+    if (this.ctx.id.name !== BACKGROUND_TASKS_INSTANCE_NAME) {
+      throw new BackgroundTaskIdentityError(
+        `background-task host must be addressed as '${BACKGROUND_TASKS_INSTANCE_NAME}'`,
       );
     }
-    return name;
   }
 
   #ensureHost(): Promise<BackgroundTaskHost> {
@@ -236,15 +345,15 @@ export class StarterBackgroundTasks extends DurableObject<Env> {
   }
 
   async #boot(): Promise<BackgroundTaskHost> {
-    const tenantId = this.#tenantId();
+    await this.ctx.storage.setAlarm(Date.now() + BACKGROUND_ALARM_MS);
     const pubsub = createHostPubSub();
     const storage = createD1Storage({
       binding: this.env.DB,
       domains: createBackgroundTaskD1Domains({
         binding: this.env.DB,
-        tenantId,
       }),
     });
+    await storage.init();
     const mastra = new Mastra({ storage, pubsub });
     const host = new BackgroundTaskHost({
       mastra,
@@ -254,7 +363,7 @@ export class StarterBackgroundTasks extends DurableObject<Env> {
           execute: async (args) => ({ args }),
         },
       },
-      execution: { tenantId },
+      execution: true,
       manager: {
         globalConcurrency: 10,
         perAgentConcurrency: 3,
@@ -264,21 +373,73 @@ export class StarterBackgroundTasks extends DurableObject<Env> {
         },
       },
     });
-    await host.boot();
-    await this.ctx.storage.setAlarm(Date.now() + BACKGROUND_ALARM_MS);
+    try {
+      await host.boot();
+    } catch (error) {
+      try {
+        await host.shutdown();
+      } catch (shutdownError) {
+        console.error('background-task boot rollback failed', shutdownError);
+      }
+      throw error;
+    }
     return host;
   }
 
   async fetch(request: Request): Promise<Response> {
     try {
+      await verifyDurableObjectDeploymentRequest(request, this.ctx, this.env);
+      this.#assertInstanceName();
+      const encodedPrincipal = request.headers.get(EXECUTION_PRINCIPAL_HEADER);
+      let principal: ExecutionPrincipal | undefined;
+      try {
+        principal = encodedPrincipal
+          ? decodeExecutionPrincipal(encodedPrincipal)
+          : undefined;
+      } catch {
+        throw new BackgroundTaskIdentityError(
+          'background-task request has no trusted principal',
+        );
+      }
+      if (!principal) {
+        throw new BackgroundTaskIdentityError(
+          'background-task request has no trusted principal',
+        );
+      }
+      const resources = approvalStoreFactoryFor(this.env.DB).resources();
       const host = await this.#ensureHost();
       const route = createBackgroundTaskRoutes({
         manager: host.manager,
+        authorize: async (scope) => {
+          const checks: Promise<boolean>[] = [];
+          if (scope.runId !== undefined) {
+            checks.push(
+              resources
+                .owner('run', scope.runId)
+                .then(
+                  (owner) =>
+                    owner !== undefined &&
+                    principalMayAccess(principal, owner, 'read'),
+                ),
+            );
+          }
+          if (scope.threadId !== undefined) {
+            checks.push(
+              resources
+                .owner('thread', scope.threadId)
+                .then(
+                  (owner) =>
+                    owner !== undefined &&
+                    principalMayAccess(principal, owner, 'read'),
+                ),
+            );
+          }
+          return (
+            checks.length > 0 && (await Promise.all(checks)).every(Boolean)
+          );
+        },
       });
-      return (
-        (await route(request, this.#tenantId())) ??
-        json({ error: 'not found' }, 404)
-      );
+      return (await route(request)) ?? json({ error: 'not found' }, 404);
     } catch (error) {
       console.error(
         JSON.stringify({
@@ -286,15 +447,15 @@ export class StarterBackgroundTasks extends DurableObject<Env> {
           reason: error instanceof Error ? error.message : String(error),
         }),
       );
-      return json({ error: 'background task host unavailable' }, 500);
+      return doErrorResponse(error);
     }
   }
 
   async alarm(): Promise<void> {
-    try {
-      await (await this.#ensureHost()).onAlarm();
-    } finally {
-      await this.ctx.storage.setAlarm(Date.now() + BACKGROUND_ALARM_MS);
-    }
+    this.#assertInstanceName();
+    await this.ctx.storage.setAlarm(Date.now() + BACKGROUND_ALARM_MS);
+    await verifyDurableObjectDeploymentIdentity(this.ctx, this.env);
+    const host = await this.#ensureHost();
+    await host.onAlarm();
   }
 }

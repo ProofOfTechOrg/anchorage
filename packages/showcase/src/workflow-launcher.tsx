@@ -231,7 +231,8 @@ export function WorkflowLauncher({
             />
             <Tooltip content={GLOSSARY.runCaps}>
               <Text size="sm" color="secondary">
-                Demo budget: 20 runs per sandbox, 500/day across all visitors.
+                Demo budget: 20 run mutations per session, 500/day across all
+                visitors.
               </Text>
             </Tooltip>
           </HStack>

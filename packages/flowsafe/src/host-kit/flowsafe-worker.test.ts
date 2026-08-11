@@ -1,28 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
 // Unit proof for the composed Worker skeleton: the fetch pipeline order, the
-// hook seams (preRoutes/wrapResolve/wrapStart/wrapResume/notify/extra
-// duties), and the two-cron dispatch with per-duty failure isolation. The
+// hook seams (preRoutes/beforeStart/beforeResume/notify/extra
+// duties), and failure-isolated sweep, purge, and optional schedule-tick dispatch. The
 // HEAVYWEIGHT behavior proof stays the two host e2e suites
 // (deploy/worker.e2e.test.ts and the showcase worker e2e set), which drive
 // the real hosts through this same composer — this file covers the composer's
-// own contract over fakes: real SQLite behind the D1 adapter, a stub DO
+// own contract over fakes: node:sqlite behind a narrow SQL unit facade, a stub DO
 // namespace, and a static verifier.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { d1DatabaseLike, openSqlite } from '../../test-support/sqlite.js';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import type {
   ApprovalNotificationEvent,
   ApprovalRecord,
 } from '../approval-api/index.js';
-import type { RunSummary } from '../do-runner/index.js';
+import { decodeExecutionPrincipal } from '../approval-api/index.js';
+import {
+  AUDIT_PROXY_INSTANCE_NAME,
+  FlowsafeFleetAuditProxy,
+} from '../audit-export/index.js';
+import {
+  EXECUTION_PRINCIPAL_HEADER,
+  type RunSummary,
+} from '../do-runner/index.js';
 import type { ResumeRunFn } from './approval-bridge.js';
 import {
   createFlowsafeWorker,
   type FlowsafeWorkerConfig,
   type FlowsafeWorkerEnv,
+  MAINTENANCE_INSTANCE_NAME,
 } from './flowsafe-worker.js';
 import { approvalStoreFactoryFor } from './host-approval-service.js';
+import { MAINTENANCE_RECEIPT_HEADER } from './maintenance-capability.js';
 import { staticTokenVerifier } from './verifier.js';
 import type { WorkflowMeta } from './workflow-meta.js';
 
@@ -35,29 +45,43 @@ const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
   },
 ];
 
-const SWEEP = '*/15 * * * *';
-const PURGE = '7 * * * *';
-
-const ACTORS = new Map([
-  ['tok-ada', { id: 'ada', role: 'admin', tenantId: 'acme' } as const],
-]);
+const ACTORS = new Map([['tok-ada', { id: 'ada', role: 'admin' } as const]]);
 
 function successSummary(runId: string): RunSummary {
   return { runId, status: 'success', result: { ok: true } };
 }
 
-/** A DO namespace whose stub echoes a success summary for the posted run. */
-function fakeRunner(calls: string[]): FlowsafeWorkerEnv['RUNNER'] {
+/** A DO namespace whose stub echoes a success summary and commits run ownership. */
+function fakeRunner(
+  calls: string[],
+  database: FlowsafeWorkerEnv['DB'],
+): FlowsafeWorkerEnv['RUNNER'] {
   return {
     idFromName: (name: string) => name,
     get: () => ({
-      fetch: async (url: string, init?: { body?: string }) => {
+      fetch: async (
+        url: string,
+        init?: { body?: string; headers?: Record<string, string> },
+      ) => {
         calls.push(url);
         const body = init?.body
-          ? (JSON.parse(init.body) as { runId?: string })
+          ? (JSON.parse(init.body) as {
+              runId?: string;
+            })
           : {};
         const runId =
           body.runId ?? /\/runs\/[^/]+\/([^/]+)/.exec(url)?.[1] ?? 'acme_x';
+        const principal = decodeExecutionPrincipal(
+          init?.headers?.[EXECUTION_PRINCIPAL_HEADER] ?? '',
+        );
+        if (body.runId && principal) {
+          await approvalStoreFactoryFor(database)
+            .resources()
+            .claim('run', body.runId, {
+              kind: principal.kind,
+              id: principal.id,
+            });
+        }
         return {
           ok: true,
           status: 200,
@@ -78,10 +102,35 @@ interface Harness {
 function makeEnv(): Harness {
   const doCalls: string[] = [];
   const pending: Promise<unknown>[] = [];
+  const sqlite = openSqlite();
+  sqlite
+    .prepare(
+      `CREATE TABLE flowsafe_deployment (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        tenant_tag TEXT NOT NULL,
+        provisioned_at TEXT NOT NULL
+      )`,
+    )
+    .run();
+  sqlite
+    .prepare(
+      `INSERT INTO flowsafe_deployment (id, tenant_tag, provisioned_at)
+       VALUES (1, 'acme', '2026-08-10T00:00:00.000Z')`,
+    )
+    .run();
+  const database = sqliteUnitDatabase(sqlite) as FlowsafeWorkerEnv['DB'];
   return {
     env: {
-      DB: d1DatabaseLike(openSqlite()) as FlowsafeWorkerEnv['DB'],
-      RUNNER: fakeRunner(doCalls),
+      DB: database,
+      DEPLOYMENT_TENANT: 'acme',
+      DEPLOYMENT_IDENTITY_SECRET: 'test-deployment-identity-secret-0001',
+      RUNNER: fakeRunner(doCalls, database),
+      MAINTENANCE: {
+        idFromName: (name: string) => name,
+        get: () => ({
+          fetch: async () => new Response(null, { status: 204 }),
+        }),
+      },
     },
     ctx: { waitUntil: (promise) => pending.push(promise) },
     flush: async () => {
@@ -96,9 +145,12 @@ function makeWorker(
 ): ReturnType<typeof createFlowsafeWorker<FlowsafeWorkerEnv>> {
   return createFlowsafeWorker<FlowsafeWorkerEnv>({
     workflows: WORKFLOWS,
-    systemActorId: 'composer-system',
+    systemPrincipalId: 'composer-system',
     buildVerifier: () => staticTokenVerifier(ACTORS),
-    crons: { sweep: SWEEP, purge: PURGE },
+    maintenance: {
+      sweepIntervalMs: 15 * 60 * 1_000,
+      purgeIntervalMs: 60 * 60 * 1_000,
+    },
     ...overrides,
   });
 }
@@ -127,6 +179,90 @@ afterEach(() => {
 });
 
 describe('createFlowsafeWorker fetch pipeline', () => {
+  it.each([
+    ['missing DB', (env: FlowsafeWorkerEnv) => ({ ...env, DB: undefined })],
+    [
+      'missing deployment tag',
+      (env: FlowsafeWorkerEnv) => ({ ...env, DEPLOYMENT_TENANT: undefined }),
+    ],
+    [
+      'malformed deployment tag',
+      (env: FlowsafeWorkerEnv) => ({ ...env, DEPLOYMENT_TENANT: 'ACME' }),
+    ],
+    [
+      'missing deployment credential',
+      (env: FlowsafeWorkerEnv) => ({
+        ...env,
+        DEPLOYMENT_IDENTITY_SECRET: undefined,
+      }),
+    ],
+    [
+      'mismatched deployment sentinel',
+      (env: FlowsafeWorkerEnv) => ({ ...env, DEPLOYMENT_TENANT: 'other' }),
+    ],
+  ])('returns 503 before health or routes for a %s', async (_label, mutate) => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    const logs = capturedLogs();
+
+    const response = await worker.fetch(
+      new Request('http://host/healthz'),
+      mutate(env) as FlowsafeWorkerEnv,
+      ctx,
+    );
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: 'deployment unavailable' });
+    expect(
+      logs.errors().some((line) => line.includes('deployment-identity-error')),
+    ).toBe(true);
+  });
+
+  it.each([
+    ['missing sentinel', `CREATE TABLE unrelated (id TEXT PRIMARY KEY)`],
+    [
+      'malformed sentinel schema',
+      `CREATE TABLE flowsafe_deployment (
+        id INTEGER PRIMARY KEY,
+        tenant_tag TEXT NOT NULL,
+        provisioned_at TEXT NOT NULL
+      );
+      INSERT INTO flowsafe_deployment VALUES
+        (1, 'acme', '2026-08-10T00:00:00.000Z')`,
+    ],
+    [
+      'malformed sentinel row',
+      `CREATE TABLE flowsafe_deployment (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        tenant_tag TEXT NOT NULL,
+        provisioned_at TEXT NOT NULL
+      );
+      INSERT INTO flowsafe_deployment VALUES
+        (1, 'ACME', '2026-08-10T00:00:00.000Z')`,
+    ],
+  ])('returns 503 for a database with a %s', async (_label, sql) => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    const sqlite = openSqlite();
+    sqlite.exec(sql);
+    const logs = capturedLogs();
+
+    const response = await worker.fetch(
+      new Request('http://host/healthz'),
+      {
+        ...env,
+        DB: sqliteUnitDatabase(sqlite) as FlowsafeWorkerEnv['DB'],
+      },
+      ctx,
+    );
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: 'deployment unavailable' });
+    expect(
+      logs.errors().some((line) => line.includes('deployment-identity-error')),
+    ).toBe(true);
+  });
+
   it('serves /healthz unauthenticated and 404s the tail', async () => {
     // #given — a verifier that MUST NOT be consulted for healthz
     const buildVerifier = vi.fn(() => staticTokenVerifier(ACTORS));
@@ -148,6 +284,224 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     const missing = await worker.fetch(authed('http://host/nope'), env, ctx);
     // #then
     expect(missing.status).toBe(404);
+  });
+
+  it('does not mount trusted audit ingress on an ordinary public Worker', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+
+    const response = await worker.fetch(
+      new Request('http://host/internal/audit', {
+        method: 'POST',
+        body: JSON.stringify({
+          action: 'approval.decide',
+          resource: 'approval:one',
+          decision: 'allowed',
+        }),
+      }),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(404);
+  });
+
+  it('protects maintenance administration with its dedicated secret and fixed singleton address', async () => {
+    const calls: Array<{
+      name: string;
+      url: string;
+      init?: { method?: string; headers?: Record<string, string> };
+    }> = [];
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = 'maintenance-admin-secret-0000000001';
+    env.FLEET_SPEC_DIGEST = 'a'.repeat(64);
+    env.MAINTENANCE = {
+      idFromName: (name: string) => name,
+      get: (name: string) => ({
+        fetch: async (url, init) => {
+          calls.push({ name, url, init });
+          return Response.json({ ok: true });
+        },
+      }),
+    };
+
+    const missing = await worker.fetch(
+      new Request('http://host/admin/ensure-maintenance', { method: 'POST' }),
+      env,
+      ctx,
+    );
+    expect(missing.status).toBe(401);
+
+    const applicationToken = await worker.fetch(
+      new Request('http://host/admin/ensure-maintenance', {
+        method: 'POST',
+        headers: { authorization: 'Bearer tok-ada' },
+      }),
+      env,
+      ctx,
+    );
+    expect(applicationToken.status).toBe(401);
+
+    const ensured = await worker.fetch(
+      new Request('http://host/admin/ensure-maintenance?instance=evil', {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${env.MAINTENANCE_ADMIN_SECRET}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ instance: 'evil', deploymentTag: 'other' }),
+      }),
+      env,
+      ctx,
+    );
+    expect(ensured.status).toBe(200);
+    expect(await ensured.json()).toEqual({
+      ok: true,
+      deploymentSpecDigest: env.FLEET_SPEC_DIGEST,
+    });
+    expect(calls[0]).toMatchObject({
+      name: MAINTENANCE_INSTANCE_NAME,
+      url: 'http://maintenance/ensure',
+      init: { method: 'POST' },
+    });
+    expect(calls[0]?.init?.headers).not.toHaveProperty('authorization');
+    expect(calls[0]?.init?.headers).toHaveProperty(
+      'x-flowsafe-deployment-identity',
+      env.DEPLOYMENT_IDENTITY_SECRET,
+    );
+
+    const status = await worker.fetch(
+      new Request('http://host/admin/maintenance-status', {
+        headers: {
+          authorization: `Bearer ${env.MAINTENANCE_ADMIN_SECRET}`,
+        },
+      }),
+      env,
+      ctx,
+    );
+    expect(status.status).toBe(200);
+    expect(await status.json()).toEqual({
+      ok: true,
+      deploymentSpecDigest: env.FLEET_SPEC_DIGEST,
+    });
+    expect(calls[1]).toMatchObject({
+      name: MAINTENANCE_INSTANCE_NAME,
+      url: 'http://maintenance/status',
+      init: { method: 'GET' },
+    });
+
+    delete env.FLEET_SPEC_DIGEST;
+    const ordinaryHostStatus = await worker.fetch(
+      new Request('http://host/admin/maintenance-status', {
+        headers: {
+          authorization: `Bearer ${env.MAINTENANCE_ADMIN_SECRET}`,
+        },
+      }),
+      env,
+      ctx,
+    );
+    expect(await ordinaryHostStatus.json()).toEqual({ ok: true });
+  });
+
+  it('fails maintenance administration closed when its dedicated secret is unset', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    const logs = capturedLogs();
+
+    const response = await worker.fetch(
+      new Request('http://host/admin/maintenance-status', {
+        headers: { authorization: 'Bearer any-value' },
+      }),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(503);
+    expect(logs.errors().some((line) => line.includes('config-error'))).toBe(
+      true,
+    );
+  });
+
+  it('relays a one-shot fleet capability without holding the signing secret', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.FLEET_MAINTENANCE_CAPABILITIES = 'required';
+    env.FLEET_SPEC_DIGEST = 'a'.repeat(64);
+    const fetch = vi.fn(async () => {
+      const response = Response.json({ alarmAt: 1 });
+      response.headers.set(MAINTENANCE_RECEIPT_HEADER, 'signed-receipt');
+      return response;
+    });
+    env.MAINTENANCE = {
+      idFromName: (name: string) => name,
+      get: () => ({ fetch }),
+    };
+
+    const response = await worker.fetch(
+      new Request('http://host/admin/ensure-maintenance', {
+        method: 'POST',
+        headers: { authorization: 'Bearer one-shot-capability' },
+      }),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get(MAINTENANCE_RECEIPT_HEADER)).toBe(
+      'signed-receipt',
+    );
+    expect(fetch).toHaveBeenCalledWith('http://maintenance/ensure', {
+      method: 'POST',
+      headers: { authorization: 'Bearer one-shot-capability' },
+    });
+    expect(env.MAINTENANCE_ADMIN_SECRET).toBeUndefined();
+  });
+
+  it('refuses to reuse the Worker-to-DO credential for maintenance administration', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = env.DEPLOYMENT_IDENTITY_SECRET;
+    const logs = capturedLogs();
+
+    const response = await worker.fetch(
+      new Request('http://host/admin/ensure-maintenance', {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${env.DEPLOYMENT_IDENTITY_SECRET}`,
+        },
+      }),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(503);
+    expect(
+      logs.errors().some((line) => line.includes('credentials must differ')),
+    ).toBe(true);
+  });
+
+  it('fails authenticated maintenance closed for a malformed fleet digest', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = 'maintenance-admin-secret-0000000001';
+    env.FLEET_SPEC_DIGEST = 'not-a-digest';
+    const logs = capturedLogs();
+
+    const response = await worker.fetch(
+      new Request('http://host/admin/maintenance-status', {
+        headers: {
+          authorization: `Bearer ${env.MAINTENANCE_ADMIN_SECRET}`,
+        },
+      }),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(503);
+    expect(
+      logs.errors().some((line) => line.includes('FLEET_SPEC_DIGEST')),
+    ).toBe(true);
   });
 
   it('401s an unauthenticated API route (the resolver runs before any store exists)', async () => {
@@ -273,36 +627,15 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     expect(buildResumeRun.mock.calls[0]?.[1]).toBe(env);
   });
 
-  it('applies wrapResolve to the resolver both routers use', async () => {
-    // #given
-    const resolved: string[] = [];
-    const worker = makeWorker({
-      wrapResolve: (resolve) => async (request) => {
-        resolved.push(new URL(request.url).pathname);
-        return resolve(request);
-      },
-    });
-    const { env, ctx } = makeEnv();
-
-    // #when
-    await worker.fetch(authed('http://host/api/approvals'), env, ctx);
-    await worker.fetch(authed('http://host/workflows'), env, ctx);
-
-    // #then — the wrapped resolver saw both surfaces
-    expect(resolved).toEqual(['/api/approvals', '/workflows']);
-  });
-
-  it('wrapStart and wrapResume actually wrap the topology thunks', async () => {
+  it('runs the context-aware start and resume policies before the topology thunks', async () => {
     // #given
     const wrapped: string[] = [];
     const worker = makeWorker({
-      wrapStart: (start) => async (workflowId, runId, inputData) => {
-        wrapped.push(`start:${workflowId}`);
-        return start(workflowId, runId, inputData);
+      beforeStart: async (context, _env, workflowId) => {
+        wrapped.push(`start:${workflowId}:${context.actor.id}`);
       },
-      wrapResume: (resume) => async (workflowId, runId, body) => {
-        wrapped.push(`resume:${workflowId}:${runId}`);
-        return resume(workflowId, runId, body);
+      beforeResume: async (context, _env, workflowId, runId) => {
+        wrapped.push(`resume:${workflowId}:${runId}:${context.actor.id}`);
       },
     });
     const { env, ctx, doCalls } = makeEnv();
@@ -319,8 +652,8 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     // #then
     expect(started.status).toBe(200);
     const summary = (await started.json()) as { runId: string };
-    expect(summary.runId.startsWith('acme_')).toBe(true);
-    expect(wrapped).toEqual(['start:wf']);
+    expect(summary.runId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(wrapped).toEqual(['start:wf:ada']);
     expect(doCalls.length).toBeGreaterThan(0);
 
     // #when — a raw resume of the minted run
@@ -334,7 +667,7 @@ describe('createFlowsafeWorker fetch pipeline', () => {
     );
     // #then
     expect(resumed.status).toBe(200);
-    expect(wrapped).toEqual(['start:wf', `resume:wf:${summary.runId}`]);
+    expect(wrapped).toEqual(['start:wf:ada', `resume:wf:${summary.runId}:ada`]);
   });
 
   it('mounts an opt-in buildObjectiveRouter; absent seam is byte-identical (unmounted)', async () => {
@@ -441,7 +774,23 @@ describe('createFlowsafeWorker fetch pipeline', () => {
   });
 });
 
-describe('createFlowsafeWorker scheduled dispatch', () => {
+describe('createFlowsafeWorker maintenance duties', () => {
+  it('refuses maintenance before running a duty when bindings are missing', async () => {
+    const worker = makeWorker();
+    const { env } = makeEnv();
+    capturedLogs();
+
+    await expect(
+      worker.runMaintenanceDuty('sweep', {
+        ...env,
+        DB: undefined,
+      } as unknown as FlowsafeWorkerEnv),
+    ).resolves.toEqual({
+      ok: false,
+      error: expect.stringContaining('no valid DB binding'),
+    });
+  });
+
   function maintenanceLines(lines: string[]): Record<string, unknown>[] {
     return lines
       .map((line) => {
@@ -457,15 +806,14 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
       );
   }
 
-  it('the sweep cron runs ONLY the sweep', async () => {
+  it('the sweep duty runs ONLY the sweep', async () => {
     // #given
     const logs = capturedLogs();
     const worker = makeWorker();
-    const { env, ctx, flush } = makeEnv();
+    const { env } = makeEnv();
 
     // #when
-    await worker.scheduled({ cron: SWEEP }, env, ctx);
-    await flush();
+    await worker.runMaintenanceDuty('sweep', env);
 
     // #then — one maintenance line, the sweep's (escalated, never purged)
     const lines = maintenanceLines(logs.lines());
@@ -474,15 +822,121 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     expect(lines[0]).not.toHaveProperty('purged');
   });
 
-  it('the purge cron runs ONLY the purge duties', async () => {
+  it('routes external maintenance audit through the authenticated proxy adapter', async () => {
+    const candidateWorker = makeWorker();
+    const { env: candidateEnv } = makeEnv();
+    const past = new Date(Date.now() - 60_000).toISOString();
+    await approvalStoreFactoryFor(candidateEnv.DB).store().create({
+      id: 'apr-proxy-audit',
+      workflowId: 'wf',
+      runId: 'acme_proxy',
+      title: 'proxy audit request',
+      connectors: [],
+      priority: 'normal',
+      status: 'pending',
+      createdAt: past,
+      updatedAt: past,
+      slaDeadlineAt: past,
+    });
+    const send = vi.fn(async () => {});
+    const proxy = new FlowsafeFleetAuditProxy(
+      { id: { name: AUDIT_PROXY_INSTANCE_NAME } },
+      {
+        AUDIT_QUEUE: { send },
+        DEPLOYMENT_IDENTITY_SECRET: candidateEnv.DEPLOYMENT_IDENTITY_SECRET,
+        DEPLOYMENT_TENANT: 'acme',
+        FLEET_ENVIRONMENT: 'production',
+        FLEET_DEPLOYMENT_SCRIPT: 'acme-prod',
+      },
+    );
+    candidateEnv.FLEET_AUDIT_PROXY = 'required';
+    candidateEnv.AUDIT_PROXY = {
+      getByName: () => proxy,
+    };
+
+    await expect(
+      candidateWorker.runMaintenanceDuty('sweep', candidateEnv),
+    ).resolves.toMatchObject({ ok: true });
+
+    expect(send).toHaveBeenCalledWith({
+      fleetAttribution: {
+        source: 'external-candidate-via-trusted-proxy',
+        eventTrust: 'untrusted',
+        tenantTag: 'acme',
+        environment: 'production',
+        scriptName: 'acme-prod',
+      },
+      event: expect.objectContaining({
+        action: 'approval.escalate',
+        resource: 'approval:apr-proxy-audit',
+      }),
+    });
+  });
+
+  it('rejects a service-shaped candidate audit binding before calling it', async () => {
+    const worker = makeWorker();
+    const { env } = makeEnv();
+    const fetch = vi.fn(async () => new Response(null, { status: 204 }));
+    env.FLEET_AUDIT_PROXY = 'required';
+    env.AUDIT_PROXY = { fetch } as unknown as FlowsafeWorkerEnv['AUDIT_PROXY'];
+
+    await expect(
+      worker.runMaintenanceDuty('sweep', env),
+    ).resolves.toMatchObject({ ok: false });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('validates trusted state egress topology without calling the service', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    const outboundFetch = vi.fn(async () => new Response(null));
+    env.FLEET_RESOURCE_ROLE = 'platform-state';
+    env.FLEET_ENVIRONMENT = 'production';
+    env.FLEET_RESOURCE_GROUP = '0123456789abcdefabcd';
+    env.OUTBOUND_PROXY = { fetch: outboundFetch };
+    env.OUTBOUND_PROXY_CREDENTIAL = 'outbound-state-credential-0000000001';
+    env.OUTBOUND_TENANT_ID = 'acme';
+    env.OUTBOUND_ENVIRONMENT = 'production';
+    env.OUTBOUND_RESOURCE_GROUP_ID = '0123456789abcdefabcd';
+    env.OUTBOUND_STATE_SCRIPT_NAME =
+      'acme-production-state-0123456789abcdefabcd';
+    env.OUTBOUND_ROUTE_HOSTNAME = 'acme.example.test';
+    env.OUTBOUND_POLICY_ID = '0123456789abcdefabcd';
+
+    const response = await worker.fetch(
+      new Request('http://host/healthz'),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(200);
+    expect(outboundFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects candidate access to trusted state egress before service use', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    const outboundFetch = vi.fn(async () => new Response(null));
+    env.OUTBOUND_PROXY = { fetch: outboundFetch };
+
+    const response = await worker.fetch(
+      new Request('http://host/healthz'),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(500);
+    expect(outboundFetch).not.toHaveBeenCalled();
+  });
+
+  it('the purge duty runs ONLY the purge duties', async () => {
     // #given
     const logs = capturedLogs();
     const worker = makeWorker();
-    const { env, ctx, flush } = makeEnv();
+    const { env } = makeEnv();
 
     // #when
-    await worker.scheduled({ cron: PURGE }, env, ctx);
-    await flush();
+    await worker.runMaintenanceDuty('purge', env);
 
     // #then
     const lines = maintenanceLines(logs.lines());
@@ -491,35 +945,13 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     expect(lines[0]).not.toHaveProperty('escalated');
   });
 
-  it('an unknown cron runs BOTH duties and logs the config-error tripwire', async () => {
-    // #given
-    const logs = capturedLogs();
-    const worker = makeWorker();
-    const { env, ctx, flush } = makeEnv();
-
-    // #when
-    await worker.scheduled({ cron: '* * * * *' }, env, ctx);
-    await flush();
-
-    // #then
-    expect(
-      logs
-        .errors()
-        .some(
-          (line) =>
-            line.includes('config-error') && line.includes('triggers.crons'),
-        ),
-    ).toBe(true);
-    const lines = maintenanceLines(logs.lines());
-    expect(lines).toHaveLength(2);
-  });
-
   it('isolates purge-duty failures: a broken snapshot purge stops neither the approval purge nor extra duties', async () => {
     // #given — DB whose snapshot-table statements THROW (not merely missing)
     const logs = capturedLogs();
-    const { env, ctx, flush } = makeEnv();
+    const { env } = makeEnv();
     const realDb = env.DB;
     const throwingDb = {
+      batch: realDb.batch?.bind(realDb),
       prepare: (query: string) => {
         if (query.includes('mastra_workflow_snapshot')) {
           throw new Error('snapshot table wedged');
@@ -532,8 +964,7 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     });
 
     // #when
-    await worker.scheduled({ cron: PURGE }, { ...env, DB: throwingDb }, ctx);
-    await flush();
+    await worker.runMaintenanceDuty('purge', { ...env, DB: throwingDb });
 
     // #then — the failure is on record and the OTHER duties still folded
     // into the one combined maintenance line
@@ -552,8 +983,8 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     expect(lines[0]?.purged).toBeUndefined();
   });
 
-  // The agent-memory thread TTL (docs/agent-memory-tenancy.md item 7) as the
-  // purge cron's third duty. Seeds the two memory tables the real
+  // The agent-memory thread TTL (docs/agent-memory-isolation.md#thread-retention) as the
+  // purge alarm's third duty. Seeds the two memory tables the real
   // @mastra/cloudflare-d1 schema creates (mastra-schema-guard.test.ts pins the
   // column names); a fresh test DB has neither, which is itself the
   // memory-less-deployment case the first test below rides.
@@ -589,12 +1020,11 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     // memory the day a host enabled agents, so its absence must be inert.
     const logs = capturedLogs();
     const worker = makeWorker();
-    const { env, ctx, flush } = makeEnv();
+    const { env } = makeEnv();
     await seedIdleThread(env);
 
     // #when
-    await worker.scheduled({ cron: PURGE }, env, ctx);
-    await flush();
+    await worker.runMaintenanceDuty('purge', env);
 
     // #then — the duty never ran: nothing in the log, nothing deleted
     const lines = maintenanceLines(logs.lines());
@@ -602,20 +1032,18 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     expect(logs.errors()).toEqual([]);
   });
 
-  it('THREAD_RETENTION_DAYS wires the thread purge into the purge cron, folded into the ONE maintenance line', async () => {
+  it('THREAD_RETENTION_DAYS wires the thread purge into the purge alarm, folded into the ONE maintenance line', async () => {
     // #given — an agent-memory thread idle for 90 days under a 30-day TTL
     const logs = capturedLogs();
     const worker = makeWorker();
-    const { env, ctx, flush } = makeEnv();
+    const { env } = makeEnv();
     await seedIdleThread(env);
 
     // #when
-    await worker.scheduled(
-      { cron: PURGE },
-      { ...env, THREAD_RETENTION_DAYS: '30' },
-      ctx,
-    );
-    await flush();
+    await worker.runMaintenanceDuty('purge', {
+      ...env,
+      THREAD_RETENTION_DAYS: '30',
+    });
 
     // #then — reaped WITH its messages, reported in the combined line
     const lines = maintenanceLines(logs.lines());
@@ -627,7 +1055,7 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     });
   });
 
-  // Track B: the background-task TTL cleanup as the purge cron's opt-in duty.
+  // Track B: the background-task TTL cleanup as the purge alarm's opt-in duty.
   async function seedOldCompletedTask(env: FlowsafeWorkerEnv): Promise<void> {
     await env.DB.prepare(
       `CREATE TABLE mastra_background_tasks (
@@ -646,12 +1074,11 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     // #given — the opt-in posture; background tasks are unconfigured
     const logs = capturedLogs();
     const worker = makeWorker();
-    const { env, ctx, flush } = makeEnv();
+    const { env } = makeEnv();
     await seedOldCompletedTask(env);
 
     // #when
-    await worker.scheduled({ cron: PURGE }, env, ctx);
-    await flush();
+    await worker.runMaintenanceDuty('purge', env);
 
     // #then — the duty never ran, byte-identical to before Track B
     const lines = maintenanceLines(logs.lines());
@@ -659,16 +1086,15 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     expect(logs.errors()).toEqual([]);
   });
 
-  it('config.backgroundTasks wires the background-task TTL cleanup into the purge cron, folded into the ONE line', async () => {
+  it('config.backgroundTasks wires the background-task TTL cleanup into the purge alarm, folded into the ONE line', async () => {
     // #given — a completed task 2h old under the default 1h completed TTL
     const logs = capturedLogs();
     const worker = makeWorker({ backgroundTasks: {} });
-    const { env, ctx, flush } = makeEnv();
+    const { env } = makeEnv();
     await seedOldCompletedTask(env);
 
     // #when
-    await worker.scheduled({ cron: PURGE }, env, ctx);
-    await flush();
+    await worker.runMaintenanceDuty('purge', env);
 
     // #then — reaped, reported in the combined maintenance line
     const lines = maintenanceLines(logs.lines());
@@ -680,16 +1106,15 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     });
   });
 
-  it('the SWEEP cron never runs the background-task purge (the two-cron split holds)', async () => {
+  it('the SWEEP duty never runs the background-task purge', async () => {
     // #given
     const logs = capturedLogs();
     const worker = makeWorker({ backgroundTasks: {} });
-    const { env, ctx, flush } = makeEnv();
+    const { env } = makeEnv();
     await seedOldCompletedTask(env);
 
     // #when
-    await worker.scheduled({ cron: SWEEP }, env, ctx);
-    await flush();
+    await worker.runMaintenanceDuty('sweep', env);
 
     // #then — a CPU-limit kill is uncatchable, so the sweep carries no purge work
     const lines = maintenanceLines(logs.lines());
@@ -699,23 +1124,21 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     ).toBeDefined();
   });
 
-  it('the SWEEP cron never runs the thread purge (the two-cron split holds)', async () => {
+  it('the SWEEP duty never runs the thread purge', async () => {
     // #given
     const logs = capturedLogs();
     const worker = makeWorker();
-    const { env, ctx, flush } = makeEnv();
+    const { env } = makeEnv();
     await seedIdleThread(env);
 
     // #when
-    await worker.scheduled(
-      { cron: SWEEP },
-      { ...env, THREAD_RETENTION_DAYS: '30' },
-      ctx,
-    );
-    await flush();
+    await worker.runMaintenanceDuty('sweep', {
+      ...env,
+      THREAD_RETENTION_DAYS: '30',
+    });
 
     // #then — a CPU-limit kill is uncatchable, so the sweep must not carry
-    // purge work; the idle thread waits for the purge cron
+    // purge work; the idle thread waits for the purge alarm
     const lines = maintenanceLines(logs.lines());
     expect(lines).toHaveLength(1);
     expect(lines[0]).not.toHaveProperty('threadsPurged');
@@ -726,9 +1149,10 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     // Isolating one duty while a sibling shares its failure is a defect class
     // this codebase has already shipped once.
     const logs = capturedLogs();
-    const { env, ctx, flush } = makeEnv();
+    const { env } = makeEnv();
     const realDb = env.DB;
     const throwingDb = {
+      batch: realDb.batch?.bind(realDb),
       prepare: (query: string) => {
         if (query.includes('mastra_threads')) {
           throw new Error('threads table wedged');
@@ -741,12 +1165,11 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     });
 
     // #when
-    await worker.scheduled(
-      { cron: PURGE },
-      { ...env, DB: throwingDb, THREAD_RETENTION_DAYS: '30' },
-      ctx,
-    );
-    await flush();
+    await worker.runMaintenanceDuty('purge', {
+      ...env,
+      DB: throwingDb,
+      THREAD_RETENTION_DAYS: '30',
+    });
 
     // #then — its own error surface, and every sibling duty still folded into
     // the one combined line
@@ -772,10 +1195,11 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
   it('a wedged SNAPSHOT purge does not starve the thread purge (the sibling direction)', async () => {
     // #given
     const logs = capturedLogs();
-    const { env, ctx, flush } = makeEnv();
+    const { env } = makeEnv();
     await seedIdleThread(env);
     const realDb = env.DB;
     const throwingDb = {
+      batch: realDb.batch?.bind(realDb),
       prepare: (query: string) => {
         if (query.includes('mastra_workflow_snapshot')) {
           throw new Error('snapshot table wedged');
@@ -786,12 +1210,11 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     const worker = makeWorker();
 
     // #when
-    await worker.scheduled(
-      { cron: PURGE },
-      { ...env, DB: throwingDb, THREAD_RETENTION_DAYS: '30' },
-      ctx,
-    );
-    await flush();
+    await worker.runMaintenanceDuty('purge', {
+      ...env,
+      DB: throwingDb,
+      THREAD_RETENTION_DAYS: '30',
+    });
 
     // #then — the thread TTL ran anyway
     const lines = maintenanceLines(logs.lines());
@@ -805,16 +1228,14 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     // start irreversibly deleting conversations nobody asked to expire.
     const logs = capturedLogs();
     const worker = makeWorker();
-    const { env, ctx, flush } = makeEnv();
+    const { env } = makeEnv();
     await seedIdleThread(env);
 
     // #when
-    await worker.scheduled(
-      { cron: PURGE },
-      { ...env, THREAD_RETENTION_DAYS: '' },
-      ctx,
-    );
-    await flush();
+    await worker.runMaintenanceDuty('purge', {
+      ...env,
+      THREAD_RETENTION_DAYS: '',
+    });
 
     // #then — inert, exactly as if unset
     expect(maintenanceLines(logs.lines())[0]).not.toHaveProperty(
@@ -827,20 +1248,18 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     // #given — the polarity that separates this var from RUN_RETENTION_DAYS:
     // there, falling back keeps a duty running that runs regardless; here it
     // would INVENT an irreversible delete at a threshold the operator never
-    // named. Never expiring is recoverable; deleting a tenant's conversations
+    // named. Never expiring is recoverable; deleting an organization's conversations
     // because a var was mistyped is not.
     const logs = capturedLogs();
     const worker = makeWorker();
-    const { env, ctx, flush } = makeEnv();
+    const { env } = makeEnv();
     await seedIdleThread(env);
 
     // #when
-    await worker.scheduled(
-      { cron: PURGE },
-      { ...env, THREAD_RETENTION_DAYS: '-5' },
-      ctx,
-    );
-    await flush();
+    await worker.runMaintenanceDuty('purge', {
+      ...env,
+      THREAD_RETENTION_DAYS: '-5',
+    });
 
     // #then — the operator's tripwire fires and NOTHING was deleted
     expect(
@@ -866,11 +1285,10 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
         throw new Error('reaper wedged');
       },
     });
-    const { env, ctx, flush } = makeEnv();
+    const { env } = makeEnv();
 
     // #when
-    await worker.scheduled({ cron: PURGE }, env, ctx);
-    await flush();
+    const outcome = await worker.runMaintenanceDuty('purge', env);
 
     // #then — belt containment: the combined line still lands
     expect(
@@ -883,17 +1301,20 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
         ),
     ).toBe(true);
     expect(maintenanceLines(logs.lines())).toHaveLength(1);
+    expect(outcome).toEqual({
+      ok: false,
+      error: expect.stringContaining('reaper wedged'),
+    });
   });
 
   it('threads config.notify into the sweep (escalations reach the transport)', async () => {
     // #given — an overdue open approval seeded straight into the store
     const logs = capturedLogs();
-    const { env, ctx, flush } = makeEnv();
-    const store = approvalStoreFactoryFor(env.DB).forTenant('acme');
+    const { env } = makeEnv();
+    const store = approvalStoreFactoryFor(env.DB).store();
     const past = new Date(Date.now() - 60_000).toISOString();
     const record: ApprovalRecord = {
       id: 'apr-overdue',
-      tenantId: 'acme',
       workflowId: 'wf',
       runId: 'acme_r1',
       title: 'overdue request',
@@ -911,8 +1332,7 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
     });
 
     // #when
-    await worker.scheduled({ cron: SWEEP }, env, ctx);
-    await flush();
+    await worker.runMaintenanceDuty('sweep', env);
 
     // #then
     expect(notified).toEqual([
@@ -928,11 +1348,9 @@ describe('createFlowsafeWorker scheduled dispatch', () => {
   });
 });
 
-describe('createFlowsafeWorker schedule tick dispatch (Track D)', () => {
-  const TICK = '*/2 * * * *';
-
-  it('the tick cron runs ONLY the schedule tick, not the sweep/purge', async () => {
-    // #given a worker with a tick cron + a scheduleTick builder
+describe('createFlowsafeWorker schedule tick duty (Track D)', () => {
+  it('the tick duty runs ONLY the schedule tick, not the sweep/purge', async () => {
+    // #given a worker with a tick interval + a scheduleTick builder
     const logs = capturedLogs();
     const tickFn = vi.fn(async () => ({
       due: 1,
@@ -942,14 +1360,16 @@ describe('createFlowsafeWorker schedule tick dispatch (Track D)', () => {
       lost: 0,
     }));
     const worker = makeWorker({
-      crons: { sweep: SWEEP, purge: PURGE, tick: TICK },
+      maintenance: {
+        sweepIntervalMs: 15 * 60 * 1_000,
+        purgeIntervalMs: 60 * 60 * 1_000,
+        tickIntervalMs: 2 * 60 * 1_000,
+      },
       scheduleTick: () => tickFn,
     });
-    const { env, ctx, flush } = makeEnv();
+    const { env } = makeEnv();
 
-    // #when the tick cron fires
-    await worker.scheduled({ cron: TICK }, env, ctx);
-    await flush();
+    const outcome = await worker.runMaintenanceDuty('tick', env);
 
     // #then the tick ran once, logged its own line, and NO maintenance ran
     expect(tickFn).toHaveBeenCalledTimes(1);
@@ -968,46 +1388,45 @@ describe('createFlowsafeWorker schedule tick dispatch (Track D)', () => {
     expect(logs.lines().some((l) => l.includes('"type":"maintenance"'))).toBe(
       false,
     );
+    expect(outcome).toEqual({ ok: true, value: undefined });
   });
 
-  it('the tick cron with NO scheduleTick builder logs a config-error, runs nothing else', async () => {
-    // #given the tick cron is set but no builder is wired (a misconfig)
+  it('a tick duty with NO scheduleTick builder logs a config-error, runs nothing else', async () => {
     const logs = capturedLogs();
-    const worker = makeWorker({
-      crons: { sweep: SWEEP, purge: PURGE, tick: TICK },
-    });
-    const { env, ctx, flush } = makeEnv();
+    const worker = makeWorker();
+    const { env } = makeEnv();
 
-    // #when
-    await worker.scheduled({ cron: TICK }, env, ctx);
-    await flush();
+    const outcome = await worker.runMaintenanceDuty('tick', env);
 
-    // #then a config-error naming crons.tick; NO maintenance (the invocation is
+    // #then a config-error naming the tick duty; NO other maintenance (the invocation is
     // the tick's — it does not fall through to sweep/purge)
-    expect(
-      logs
-        .errors()
-        .some((l) => l.includes('config-error') && l.includes('crons.tick')),
-    ).toBe(true);
+    expect(logs.errors().some((l) => l.includes('config-error'))).toBe(true);
     expect(logs.lines().some((l) => l.includes('"type":"maintenance"'))).toBe(
       false,
     );
+    expect(outcome).toEqual({
+      ok: false,
+      error: expect.stringContaining('no scheduleTick builder'),
+    });
   });
 
   it('a throwing tick is CONTAINED (schedule-tick-error), never an unhandled rejection', async () => {
     // #given a tick that throws
     const logs = capturedLogs();
     const worker = makeWorker({
-      crons: { sweep: SWEEP, purge: PURGE, tick: TICK },
+      maintenance: {
+        sweepIntervalMs: 15 * 60 * 1_000,
+        purgeIntervalMs: 60 * 60 * 1_000,
+        tickIntervalMs: 2 * 60 * 1_000,
+      },
       scheduleTick: () => async () => {
         throw new Error('D1 down');
       },
     });
-    const { env, ctx, flush } = makeEnv();
+    const { env } = makeEnv();
 
     // #when
-    await worker.scheduled({ cron: TICK }, env, ctx);
-    await flush();
+    const outcome = await worker.runMaintenanceDuty('tick', env);
 
     // #then the error was contained + logged
     expect(
@@ -1017,19 +1436,27 @@ describe('createFlowsafeWorker schedule tick dispatch (Track D)', () => {
           (l) => l.includes('schedule-tick-error') && l.includes('D1 down'),
         ),
     ).toBe(true);
+    expect(outcome).toEqual({
+      ok: false,
+      error: expect.stringContaining('D1 down'),
+    });
   });
 
-  it('an unconfigured worker (no crons.tick) is byte-identical — the tick branch is unreachable', async () => {
-    // #given a default worker (no tick cron/builder)
+  it('the purge duty never invokes a configured schedule tick', async () => {
     const logs = capturedLogs();
     const tickFn = vi.fn();
-    const worker = makeWorker({ scheduleTick: () => tickFn });
-    const { env, ctx, flush } = makeEnv();
+    const worker = makeWorker({
+      maintenance: {
+        sweepIntervalMs: 15 * 60 * 1_000,
+        purgeIntervalMs: 60 * 60 * 1_000,
+        tickIntervalMs: 2 * 60 * 1_000,
+      },
+      scheduleTick: () => tickFn,
+    });
+    const { env } = makeEnv();
 
-    // #when the purge cron fires (the tick builder is present but crons.tick is
-    // unset, so the tick never runs)
-    await worker.scheduled({ cron: PURGE }, env, ctx);
-    await flush();
+    // #when the purge duty runs while the tick builder is present
+    await worker.runMaintenanceDuty('purge', env);
 
     // #then the tick was never invoked; the purge ran as before
     expect(tickFn).not.toHaveBeenCalled();

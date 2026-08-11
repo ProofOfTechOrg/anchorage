@@ -1,19 +1,13 @@
-// Public-demo identity: OAuth sign-in -> an EPHEMERAL tenant + a set of
-// short-TTL HS256 JWTs (one per demo role, distinct actor ids so
-// separation-of-duties stays demonstrable) -> the same TenantResolver seam
-// every host uses. Nothing here bypasses the platform's invariants: the
-// tenant is provisioned through the tenants registry (insert-or-fail), runIds
-// stay server-minted, and the JWTs verify through the standard hmacVerifier.
+// Public-demo identity: OAuth sign-in -> an expiring session in one shared
+// demo organization -> short-TTL HS256 JWTs for four distinct role actors.
+// The session is authentication and spend-limit metadata, not a physical data
+// boundary. Approval records form one role-visible deployment queue; run access
+// remains scoped to the session principal, reviewers/viewers, and admins.
 //
-// Abuse posture, honestly: UNIQUE(provider, subject) stops one identity
-// holding two live tenants — a speed bump, not a wall (N free accounts mint
-// N tenants). The real backstops REACT to load: the per-tenant run cap and
-// the GLOBAL daily run ceiling (both enforced as single atomic UPDATEs — a
-// SELECT-then-UPDATE is a TOCTOU race a burst of parallel starts walks
-// through), the kill switch (checked in the AUTH middleware, so
-// already-issued JWTs die with it, not just new mints), and billing alerts.
-// Size DEMO_DAILY_RUN_CAP for the spend you can tolerate, not the traffic
-// you expect.
+// UNIQUE(provider, subject) stops one identity holding multiple live sessions.
+// The real backstops react to load: a per-session run cap, the global daily run
+// ceiling, the kill switch, and billing alerts. Both counters use conditional
+// UPDATEs so parallel requests cannot walk through a SELECT-then-UPDATE race.
 //
 // What the run budgets DO bound: run STARTS and raw RESUME attempts — the
 // worker charges both before the DO round-trip, so a garbage-resume loop
@@ -21,7 +15,7 @@
 // that fails resumeSchema still cost a DO fetch + D1 snapshot read). Queue
 // DECISIONS are unmetered by design: each approval record is decidable
 // once, and records only exist because a charged start/resume suspended.
-// What they DON'T bound: status GETs, /auth/refresh, and approval-queue
+// What they do not bound: status GETs, /auth/refresh, and approval-queue
 // reads — cheap per request but unlimited per token; the backstop for
 // raw request-rate abuse is platform-level (Cloudflare WAF rate rules),
 // not this module.
@@ -36,10 +30,22 @@ import {
   hmacSign,
   hmacVerifier,
   mintHmacToken,
-  provisionTenant,
-  TenantCollisionError,
-  type TenantRegistryDatabase,
 } from '@proofoftech/flowsafe/host-kit';
+import { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
+import {
+  authorizationCodeGrant,
+  buildAuthorizationUrl,
+  ClientSecretPost,
+  Configuration,
+  customFetch,
+  enableNonRepudiationChecks,
+  type ServerMetadata,
+} from 'openid-client';
+import { z } from 'zod';
+
+const MAX_REFRESH_BODY_BYTES = 16_384;
+const REFRESH_BODY_SCHEMA = z.strictObject({ token: z.string() });
 
 /** Structural D1 subset (same posture as the other stores). */
 export interface DemoDatabase {
@@ -54,8 +60,8 @@ export interface DemoStatement {
 }
 
 const DEMO_SCHEMA: readonly string[] = [
-  `CREATE TABLE IF NOT EXISTS demo_tenants (
-    tenant_id TEXT PRIMARY KEY,
+  `CREATE TABLE IF NOT EXISTS demo_sessions (
+    session_id TEXT PRIMARY KEY,
     provider TEXT NOT NULL,
     subject TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -75,24 +81,21 @@ export async function ensureDemoSchema(db: DemoDatabase): Promise<void> {
   }
 }
 
-/** The four demo identities minted per visitor — DISTINCT ids so the reviewer
- * separation-of-duties lane stays demonstrable: a reviewer who advanced a run
+/** The four demo roles minted per visitor — distinct actor ids keep the reviewer
+ * separation-of-duties lane demonstrable: a reviewer who advanced a run
  * still gets a 403 on that gate, and switching to another decider clears it.
  * admin is exempted from SoD via APPROVAL_ALLOW_SELF_DECISION (so it can drive
  * product-launch's two gates alone); the distinct ids keep that a deliberate,
  * per-role relaxation rather than a blanket one. */
-export const DEMO_TOKEN_ROLES: ReadonlyArray<{
-  id: string;
-  role: ApprovalRole;
-}> = [
-  { id: 'demo-admin', role: 'admin' },
-  { id: 'demo-operator', role: 'operator' },
-  { id: 'demo-reviewer', role: 'reviewer' },
-  { id: 'demo-viewer', role: 'viewer' },
+export const DEMO_TOKEN_ROLES: readonly ApprovalRole[] = [
+  'admin',
+  'operator',
+  'reviewer',
+  'viewer',
 ];
 
-export interface DemoTenantRow {
-  tenant_id: string;
+export interface DemoSessionRow {
+  session_id: string;
   provider: string;
   subject: string;
   created_at: string;
@@ -100,161 +103,110 @@ export interface DemoTenantRow {
   run_count: number;
 }
 
-/**
- * Whether a tenant is a DEMO sandbox — read from `tenants.kind`, the
- * allocation authority, never guessed from the slug. A prefix heuristic
- * (`startsWith('dm')`) both mis-fires (a commercial slug 'dmart' would be
- * charged against a demo_tenants row that does not exist -> 429 on every run)
- * and fails open the moment the slug scheme changes. Tenants absent from the
- * registry (e.g. operator identities from the static token map, which are
- * never provisioned) are not demo tenants.
- */
-export async function isDemoTenant(
-  db: DemoDatabase,
-  tenantId: string,
-): Promise<boolean> {
-  let row: { kind: string } | null;
-  try {
-    row = await db
-      .prepare('SELECT kind FROM tenants WHERE tenant_id = ?')
-      .bind(tenantId)
-      .first<{ kind: string }>();
-  } catch (error) {
-    // ONLY "the registry was never created" means "no demo tenants exist".
-    // A blanket catch would fail OPEN: a transient read error would make a
-    // real demo tenant look commercial, skipping consumeRunBudget entirely
-    // and bypassing BOTH the per-tenant cap and the global daily ceiling —
-    // the spend backstop this whole path exists to enforce. Everything else
-    // propagates and the run start 500s (fail closed). Same narrowing as
-    // purgeTenant's missing-approvals-table tolerance.
-    if (!/no such table/i.test(errorMessageOf(error))) throw error;
-    row = null;
-  }
-  return row?.kind === 'demo';
-}
-
-function errorMessageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-/** INV-3-valid ephemeral tenant slug: 'dm' + 18 hex chars. */
-export function mintDemoTenantId(): string {
+/** Opaque 72-bit session id. */
+export function mintDemoSessionId(): string {
   const bytes = new Uint8Array(9);
   crypto.getRandomValues(bytes);
   let hex = '';
   for (const byte of bytes) hex += byte.toString(16).padStart(2, '0');
-  return `dm${hex}`;
+  return hex;
 }
 
-export interface DemoTenantOptions {
+export function demoActorId(sessionId: string, role: ApprovalRole): string {
+  return `demo-${sessionId}-${role}`;
+}
+
+export function demoSessionIdOfActor(actor: ApprovalActor): string | undefined {
+  const match = /^demo-([0-9a-f]{18})-(admin|operator|reviewer|viewer)$/.exec(
+    actor.id,
+  );
+  if (!match || match[2] !== actor.role) return undefined;
+  return match[1];
+}
+
+export interface DemoSessionOptions {
   provider: string;
   /** Provider-scoped stable subject, e.g. `github:<numeric id>`. */
   subject: string;
-  /** Tenant lifetime; re-auth after expiry mints a FRESH tenant. */
-  tenantTtlMs: number;
+  /** Session lifetime; re-auth after expiry mints a fresh session. */
+  sessionTtlMs: number;
   now?: () => number;
-  /**
-   * Reaps a replaced tenant's data INLINE (purgeTenant). Without this, a
-   * re-auth that replaces an expired row would orphan the old tenant's data
-   * where the purge cron (which scans demo_tenants) can no longer find it.
-   */
-  purgeTenantData: (tenantId: string) => Promise<unknown>;
 }
 
 /**
- * One live tenant per (provider, subject): a live row is reused (its clock
- * is NOT extended — expiry is from first sign-in); an expired or absent row
- * mints a fresh tenant, purging the expired tenant's data first.
+ * One live session per (provider, subject). Its clock is not extended on
+ * re-authentication; expiry always runs from the first sign-in.
  */
-export async function findOrCreateDemoTenant(
-  db: DemoDatabase & TenantRegistryDatabase,
-  options: DemoTenantOptions,
-): Promise<DemoTenantRow> {
+export async function findOrCreateDemoSession(
+  db: DemoDatabase,
+  options: DemoSessionOptions,
+): Promise<DemoSessionRow> {
   const now = (options.now ?? Date.now)();
   await ensureDemoSchema(db);
   const existing = await db
-    .prepare('SELECT * FROM demo_tenants WHERE provider = ? AND subject = ?')
+    .prepare('SELECT * FROM demo_sessions WHERE provider = ? AND subject = ?')
     .bind(options.provider, options.subject)
-    .first<DemoTenantRow>();
+    .first<DemoSessionRow>();
   if (existing && Date.parse(existing.expires_at) > now) {
     return existing;
   }
   if (existing) {
-    // Expired: reap its data BEFORE the row stops referencing it, then drop
-    // the row so the fresh insert below cannot violate UNIQUE(provider,subject).
-    await options.purgeTenantData(existing.tenant_id);
     await db
-      .prepare('DELETE FROM demo_tenants WHERE tenant_id = ?')
-      .bind(existing.tenant_id)
+      .prepare(
+        'DELETE FROM demo_sessions WHERE session_id = ? AND expires_at <= ?',
+      )
+      .bind(existing.session_id, new Date(now).toISOString())
       .run();
   }
-  // Insert-or-fail into the allocation authority first; a (vanishingly
-  // unlikely) random collision retries once with a fresh slug.
-  let tenantId = mintDemoTenantId();
-  try {
-    await provisionTenant(db, { tenantId, kind: 'demo', now: () => now });
-  } catch (error) {
-    if (!(error instanceof TenantCollisionError)) throw error;
-    tenantId = mintDemoTenantId();
-    await provisionTenant(db, { tenantId, kind: 'demo', now: () => now });
-  }
-  const row: DemoTenantRow = {
-    tenant_id: tenantId,
-    provider: options.provider,
-    subject: options.subject,
-    created_at: new Date(now).toISOString(),
-    expires_at: new Date(now + options.tenantTtlMs).toISOString(),
-    run_count: 0,
-  };
-  // The SELECT..INSERT above is not transactional, so two concurrent first
-  // sign-ins for one identity both reach here. `OR IGNORE` lets the loser
-  // lose quietly against UNIQUE(provider, subject) — it then reads back the
-  // WINNER's row rather than 500ing the visitor. The loser's provisioned slug
-  // stays in `tenants` as an inert tombstone (slugs are never reused; the
-  // registry is append-only by design).
-  const insert = await db
-    .prepare(
-      `INSERT OR IGNORE INTO demo_tenants
-       (tenant_id, provider, subject, created_at, expires_at, run_count)
-       VALUES (?, ?, ?, ?, ?, 0)`,
-    )
-    .bind(
-      row.tenant_id,
-      row.provider,
-      row.subject,
-      row.created_at,
-      row.expires_at,
-    )
-    .run();
-  if (d1Changes(insert) === 0) {
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const row: DemoSessionRow = {
+      session_id: mintDemoSessionId(),
+      provider: options.provider,
+      subject: options.subject,
+      created_at: new Date(now).toISOString(),
+      expires_at: new Date(now + options.sessionTtlMs).toISOString(),
+      run_count: 0,
+    };
+    const insert = await db
+      .prepare(
+        `INSERT OR IGNORE INTO demo_sessions
+         (session_id, provider, subject, created_at, expires_at, run_count)
+         VALUES (?, ?, ?, ?, ?, 0)`,
+      )
+      .bind(
+        row.session_id,
+        row.provider,
+        row.subject,
+        row.created_at,
+        row.expires_at,
+      )
+      .run();
+    if (d1Changes(insert) > 0) return row;
+
     const winner = await db
-      .prepare('SELECT * FROM demo_tenants WHERE provider = ? AND subject = ?')
+      .prepare('SELECT * FROM demo_sessions WHERE provider = ? AND subject = ?')
       .bind(options.provider, options.subject)
-      .first<DemoTenantRow>();
-    if (!winner) {
-      throw new Error(
-        'demo tenant insert lost its race but the winner is unreadable; retry sign-in',
-      );
-    }
-    return winner;
+      .first<DemoSessionRow>();
+    if (winner && Date.parse(winner.expires_at) > now) return winner;
   }
-  return row;
+  throw new Error('could not allocate a demo session; retry sign-in');
 }
 
 /**
  * Machine-readable cause of a budget refusal. `scope` says WHICH budget bit
- * ('tenant' caps one sandbox; 'global' is the platform-wide daily ceiling);
+ * ('session' caps one sign-in; 'global' is the deployment-wide daily ceiling);
  * `reason` says WHY, so consumers branch on it instead of string-matching
  * `message` (whose copy is UX and may change).
  */
 export type DemoRunLimitReason = 'not-provisioned' | 'expired' | 'cap-reached';
 
 export class DemoRunLimitError extends Error {
-  readonly scope: 'tenant' | 'global';
+  readonly scope: 'session' | 'global';
   readonly reason: DemoRunLimitReason;
 
   constructor(
-    scope: 'tenant' | 'global',
+    scope: 'session' | 'global',
     reason: DemoRunLimitReason,
     message: string,
   ) {
@@ -266,10 +218,10 @@ export class DemoRunLimitError extends Error {
 }
 
 export interface RunBudgetOptions {
-  tenantId: string;
-  /** Max runs per demo tenant over its whole lifetime. */
-  tenantRunCap: number;
-  /** Global ceiling across ALL tenants per UTC day — the spend backstop. */
+  sessionId: string;
+  /** Max runs per demo session over its lifetime. */
+  sessionRunCap: number;
+  /** Global ceiling across all sessions per UTC day. */
   dailyRunCap: number;
   now?: () => number;
 }
@@ -277,12 +229,12 @@ export interface RunBudgetOptions {
 /**
  * Consume one run from BOTH budgets, atomically each: a single conditional
  * UPDATE per budget — `meta.changes === 0` means the cap held (or, for the
- * tenant budget, the tenant is missing/expired; the follow-up read is
+ * session budget, the session is missing/expired; the follow-up read is
  * diagnosability only, on the already-failing path). A SELECT-then-UPDATE
  * would be a TOCTOU race a burst of parallel starts walks straight through.
  *
- * Order: the tenant budget first. A consumed tenant slot on a subsequent
- * global-cap failure only UNDER-counts that tenant's remaining budget — fail
+ * Order: the session budget first. A consumed slot on a subsequent global-cap
+ * failure only under-counts that session's remaining budget — fail
  * safe, never fail open.
  */
 export async function consumeRunBudget(
@@ -291,38 +243,38 @@ export async function consumeRunBudget(
 ): Promise<void> {
   const now = (options.now ?? Date.now)();
   const nowIso = new Date(now).toISOString();
-  const tenantUpdate = await db
+  const sessionUpdate = await db
     .prepare(
-      `UPDATE demo_tenants SET run_count = run_count + 1
-       WHERE tenant_id = ? AND run_count < ? AND expires_at > ?`,
+      `UPDATE demo_sessions SET run_count = run_count + 1
+       WHERE session_id = ? AND run_count < ? AND expires_at > ?`,
     )
-    .bind(options.tenantId, options.tenantRunCap, nowIso)
+    .bind(options.sessionId, options.sessionRunCap, nowIso)
     .run();
-  if (d1Changes(tenantUpdate) === 0) {
+  if (d1Changes(sessionUpdate) === 0) {
     const row = await db
       .prepare(
-        'SELECT run_count, expires_at FROM demo_tenants WHERE tenant_id = ?',
+        'SELECT run_count, expires_at FROM demo_sessions WHERE session_id = ?',
       )
-      .bind(options.tenantId)
+      .bind(options.sessionId)
       .first<{ run_count: number; expires_at: string }>();
     if (!row) {
       throw new DemoRunLimitError(
-        'tenant',
+        'session',
         'not-provisioned',
-        'demo tenant not found or not provisioned',
+        'demo session not found',
       );
     }
     if (Date.parse(row.expires_at) <= now) {
       throw new DemoRunLimitError(
-        'tenant',
+        'session',
         'expired',
-        'demo tenant expired; sign in again for a fresh sandbox',
+        'demo session expired; sign in again',
       );
     }
     throw new DemoRunLimitError(
-      'tenant',
+      'session',
       'cap-reached',
-      `demo run limit reached (${options.tenantRunCap} runs per sandbox)`,
+      `demo run limit reached (${options.sessionRunCap} runs per session)`,
     );
   }
   const day = new Date(now).toISOString().slice(0, 10);
@@ -343,78 +295,44 @@ export async function consumeRunBudget(
   }
 }
 
-export interface PurgeDemoTenantsOptions {
-  /** Reaps one tenant's data (purgeTenant over snapshots/approvals/artifacts). */
-  purgeTenantData: (tenantId: string) => Promise<unknown>;
-  /** Expired tenants processed per invocation — the cron's CPU budget guard. */
+export interface DeleteExpiredDemoSessionsOptions {
+  /** Expired sessions processed per invocation — the alarm's CPU budget guard. */
   limit?: number;
   /**
-   * REQUIRED grace after `expires_at` before a tenant is reaped: the JWT
-   * lifetime. `purgeTenant` deletes SUSPENDED rows and its safety argument is
-   * "only purge tenants whose tokens have already expired, so no live caller
-   * can be mid-resume by construction". A refresh at `expires_at - ε` mints a
-   * token good until `≈ expires_at + jwtTtl` (refresh deliberately does not
-   * extend the sandbox), so reaping at `expires_at` would race a genuinely
-   * valid token — the run vanishes under its owner. Waiting out the JWT TTL
-   * restores the precondition.
+   * Grace after `expires_at`, normally the JWT lifetime. This keeps metadata
+   * available while the last token can still reach read-only routes.
    */
   graceMs: number;
   now?: () => number;
 }
 
 /**
- * Reap demo tenants expired for longer than `graceMs`, oldest-expiry first,
- * at most `limit` per call. The "cursor" is the table itself: each reaped
- * tenant's row is deleted, so the next invocation resumes where this one
- * stopped — durable by construction, no separate cursor row to corrupt.
- * Failures are isolated PER TENANT: a failing purge keeps its row (its own
- * retry cursor) while the pass continues — oldest-first ordering would
- * otherwise retry the same wedged tenant first every pass and head-of-line
- * block every later expiry. Failures re-throw AFTER the pass, aggregated,
- * so the cron's error surface still fires. The isolation is bounded by
- * `limit`: a wedged tenant keeps occupying an oldest-first batch slot, so
- * once `limit` many are simultaneously wedged, younger expiries starve
- * until an operator clears them (every pass logs all of them).
+ * Delete expired demo-session metadata, oldest first and bounded per pass.
+ * Run and approval records remain in the shared organization and are handled
+ * by the normal retention duties.
  */
-export async function purgeExpiredDemoTenants(
+export async function deleteExpiredDemoSessions(
   db: DemoDatabase,
-  options: PurgeDemoTenantsOptions,
+  options: DeleteExpiredDemoSessionsOptions,
 ): Promise<string[]> {
   const now = (options.now ?? Date.now)();
   await ensureDemoSchema(db);
   const { results } = await db
     .prepare(
-      `SELECT tenant_id FROM demo_tenants WHERE expires_at <= ?
+      `SELECT session_id FROM demo_sessions WHERE expires_at <= ?
        ORDER BY expires_at ASC LIMIT ?`,
     )
     .bind(new Date(now - options.graceMs).toISOString(), options.limit ?? 25)
-    .all<{ tenant_id: string }>();
-  const purged: string[] = [];
-  const failures: Array<{ tenantId: string; message: string }> = [];
+    .all<{ session_id: string }>();
+  const deleted: string[] = [];
   for (const row of results) {
-    try {
-      await options.purgeTenantData(row.tenant_id);
-    } catch (error) {
-      failures.push({
-        tenantId: row.tenant_id,
-        message: errorMessageOf(error),
-      });
-      continue;
-    }
     await db
-      .prepare('DELETE FROM demo_tenants WHERE tenant_id = ?')
-      .bind(row.tenant_id)
+      .prepare('DELETE FROM demo_sessions WHERE session_id = ?')
+      .bind(row.session_id)
       .run();
-    purged.push(row.tenant_id);
+    deleted.push(row.session_id);
   }
-  if (failures.length > 0) {
-    throw new Error(
-      `purgeExpiredDemoTenants: ${failures.length} of ${results.length} expired tenant purge(s) failed, the rest were reaped (${failures
-        .map((failure) => `${failure.tenantId}: ${failure.message}`)
-        .join('; ')})`,
-    );
-  }
-  return purged;
+  return deleted;
 }
 
 // ---- OAuth (providers behind a seam; Google launches, GitHub falls back) ---
@@ -426,7 +344,56 @@ export interface OAuthProvider {
   exchange(input: {
     code: string;
     redirectUri: string;
+    /** Full callback URL lets the protocol client validate every parameter. */
+    callbackUrl?: URL;
+    /** The already signature- and cookie-validated state expectation. */
+    state?: string;
   }): Promise<{ subject: string } | undefined>;
+}
+
+const GITHUB_SERVER: ServerMetadata = {
+  issuer: 'https://github.com',
+  authorization_endpoint: 'https://github.com/login/oauth/authorize',
+  token_endpoint: 'https://github.com/login/oauth/access_token',
+  token_endpoint_auth_methods_supported: ['client_secret_post'],
+};
+
+const GOOGLE_SERVER: ServerMetadata = {
+  issuer: 'https://accounts.google.com',
+  authorization_endpoint: 'https://accounts.google.com/o/oauth2/v2/auth',
+  token_endpoint: 'https://oauth2.googleapis.com/token',
+  jwks_uri: 'https://www.googleapis.com/oauth2/v3/certs',
+  id_token_signing_alg_values_supported: ['RS256'],
+  token_endpoint_auth_methods_supported: ['client_secret_post'],
+};
+
+function providerConfiguration(
+  server: ServerMetadata,
+  options: { clientId: string; clientSecret: string },
+  fetchFn: typeof fetch,
+): Configuration {
+  const config = new Configuration(
+    server,
+    options.clientId,
+    undefined,
+    ClientSecretPost(options.clientSecret),
+  );
+  config[customFetch] = (url, init) =>
+    fetchFn(url, init as unknown as RequestInit);
+  return config;
+}
+
+function callbackUrl(input: {
+  code: string;
+  redirectUri: string;
+  callbackUrl?: URL;
+  state?: string;
+}): URL {
+  if (input.callbackUrl) return new URL(input.callbackUrl);
+  const url = new URL(input.redirectUri);
+  if (input.code) url.searchParams.set('code', input.code);
+  if (input.state) url.searchParams.set('state', input.state);
+  return url;
 }
 
 interface GithubProviderOptions {
@@ -438,50 +405,43 @@ interface GithubProviderOptions {
 
 export function githubProvider(options: GithubProviderOptions): OAuthProvider {
   const fetchFn = options.fetch ?? fetch;
+  const protocolFetch = (async (input, init) => {
+    const headers = new Headers(init?.headers);
+    headers.set('accept', 'application/json');
+    return fetchFn(input, { ...init, headers });
+  }) as typeof fetch;
+  const config = providerConfiguration(GITHUB_SERVER, options, protocolFetch);
   return {
     name: 'github',
     authorizeUrl({ state, redirectUri }) {
-      const url = new URL('https://github.com/login/oauth/authorize');
-      url.searchParams.set('client_id', options.clientId);
-      url.searchParams.set('redirect_uri', redirectUri);
-      url.searchParams.set('state', state);
-      // No scopes: public identity is all the demo needs.
-      return url.toString();
+      return buildAuthorizationUrl(config, {
+        redirect_uri: redirectUri,
+        response_type: 'code',
+        state,
+      }).toString();
     },
-    async exchange({ code, redirectUri }) {
-      const tokenResponse = await fetchFn(
-        'https://github.com/login/oauth/access_token',
-        {
-          method: 'POST',
+    async exchange(input) {
+      try {
+        const tokens = await authorizationCodeGrant(
+          config,
+          callbackUrl(input),
+          { expectedState: input.state },
+        );
+        const userResponse = await fetchFn('https://api.github.com/user', {
           headers: {
-            accept: 'application/json',
-            'content-type': 'application/json',
+            authorization: `Bearer ${tokens.access_token}`,
+            accept: 'application/vnd.github+json',
+            'user-agent': 'anchorage-demo',
           },
-          body: JSON.stringify({
-            client_id: options.clientId,
-            client_secret: options.clientSecret,
-            code,
-            redirect_uri: redirectUri,
-          }),
-        },
-      );
-      if (!tokenResponse.ok) return undefined;
-      const tokenBody = (await tokenResponse.json()) as {
-        access_token?: string;
-      };
-      if (!tokenBody.access_token) return undefined;
-      const userResponse = await fetchFn('https://api.github.com/user', {
-        headers: {
-          authorization: `Bearer ${tokenBody.access_token}`,
-          accept: 'application/vnd.github+json',
-          'user-agent': 'anchorage-demo',
-        },
-      });
-      if (!userResponse.ok) return undefined;
-      const user = (await userResponse.json()) as { id?: number };
-      if (typeof user.id !== 'number') return undefined;
-      // The NUMERIC id is the stable subject — logins are renameable.
-      return { subject: `github:${user.id}` };
+        });
+        if (!userResponse.ok) return undefined;
+        const user = (await userResponse.json()) as { id?: number };
+        if (typeof user.id !== 'number') return undefined;
+        // The NUMERIC id is the stable subject — logins are renameable.
+        return { subject: `github:${user.id}` };
+      } catch {
+        return undefined;
+      }
     },
   };
 }
@@ -495,55 +455,42 @@ interface GoogleProviderOptions {
 
 export function googleProvider(options: GoogleProviderOptions): OAuthProvider {
   const fetchFn = options.fetch ?? fetch;
+  const config = providerConfiguration(GOOGLE_SERVER, options, fetchFn);
+  enableNonRepudiationChecks(config);
   return {
     name: 'google',
     authorizeUrl({ state, redirectUri }) {
-      const url = new URL('https://accounts.google.com/o/oauth2/v2/auth');
-      url.searchParams.set('client_id', options.clientId);
-      url.searchParams.set('redirect_uri', redirectUri);
-      url.searchParams.set('response_type', 'code');
-      // 'openid' alone: the demo needs only a stable subject (`sub`), never
-      // email or profile — the narrowest consent screen Google offers.
-      url.searchParams.set('scope', 'openid');
-      url.searchParams.set('state', state);
-      return url.toString();
+      const nonce = nonceOfState(state);
+      return buildAuthorizationUrl(config, {
+        redirect_uri: redirectUri,
+        response_type: 'code',
+        // `openid` alone is the narrowest consent: the validated ID Token's
+        // stable `sub` is sufficient; no email or profile request is needed.
+        scope: 'openid',
+        state,
+        ...(nonce ? { nonce } : {}),
+      }).toString();
     },
-    async exchange({ code, redirectUri }) {
-      // Google's token endpoint accepts ONLY form encoding — a JSON body is
-      // rejected (unlike GitHub's, which negotiates).
-      const tokenResponse = await fetchFn(
-        'https://oauth2.googleapis.com/token',
-        {
-          method: 'POST',
-          headers: { 'content-type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({
-            grant_type: 'authorization_code',
-            code,
-            client_id: options.clientId,
-            client_secret: options.clientSecret,
-            redirect_uri: redirectUri,
-          }).toString(),
-        },
-      );
-      if (!tokenResponse.ok) return undefined;
-      const tokenBody = (await tokenResponse.json()) as {
-        access_token?: string;
-      };
-      if (!tokenBody.access_token) return undefined;
-      const userResponse = await fetchFn(
-        'https://openidconnect.googleapis.com/v1/userinfo',
-        {
-          headers: { authorization: `Bearer ${tokenBody.access_token}` },
-        },
-      );
-      if (!userResponse.ok) return undefined;
-      const user = (await userResponse.json()) as { sub?: string };
-      if (typeof user.sub !== 'string' || user.sub.length === 0) {
+    async exchange(input) {
+      try {
+        const nonce = input.state ? nonceOfState(input.state) : undefined;
+        const tokens = await authorizationCodeGrant(
+          config,
+          callbackUrl(input),
+          {
+            expectedState: input.state,
+            expectedNonce: nonce,
+            idTokenExpected: true,
+          },
+        );
+        const subject = tokens.claims()?.sub;
+        if (typeof subject !== 'string' || subject.length === 0) {
+          return undefined;
+        }
+        return { subject: `google:${subject}` };
+      } catch {
         return undefined;
       }
-      // `sub` is Google's stable per-account identifier ("unique among all
-      // Google accounts and never reused") — emails are renameable.
-      return { subject: `google:${user.sub}` };
     },
   };
 }
@@ -559,7 +506,7 @@ export const STATE_COOKIE = 'demo_oauth_state';
  * Sign an OAuth `state` and return it with its nonce. The signature alone is
  * NOT sufficient CSRF protection: an attacker can obtain a valid state from
  * `GET /auth/<provider>` and walk a victim's browser through the callback
- * with the ATTACKER's code, landing the victim in the attacker's sandbox
+ * with the ATTACKER's code, landing the victim in the attacker's demo session
  * (login CSRF). The nonce is therefore also set as an HttpOnly cookie and
  * must match at the callback — one browser, one round-trip.
  */
@@ -568,7 +515,7 @@ export async function signState(
   now: number,
   ttlMs = 10 * 60 * 1000,
 ): Promise<{ state: string; nonce: string }> {
-  const nonce = mintDemoTenantId();
+  const nonce = mintDemoSessionId();
   const payload = `${nonce}.${now + ttlMs}`;
   return {
     state: `${payload}.${await hmacSign(secret, payload)}`,
@@ -628,28 +575,28 @@ export const DEMO_JWT_AUDIENCE = 'anchorage-showcase';
 export const DEMO_JWT_KID = 'demo1';
 
 export interface DemoTokenSet {
-  tenantId: string;
-  /** ISO expiry of the TENANT (tokens refresh silently until then). */
-  tenantExpiresAt: string;
+  sessionId: string;
+  /** ISO expiry of the session; tokens refresh silently until then. */
+  sessionExpiresAt: string;
   tokens: Array<{ id: string; role: ApprovalRole; token: string }>;
 }
 
 export async function mintDemoTokenSet(options: {
   secret: string;
-  tenant: DemoTenantRow;
+  session: DemoSessionRow;
   ttlSeconds: number;
   now?: () => number;
 }): Promise<DemoTokenSet> {
   const tokens = [];
-  for (const entry of DEMO_TOKEN_ROLES) {
+  for (const role of DEMO_TOKEN_ROLES) {
+    const id = demoActorId(options.session.session_id, role);
     const actor: ApprovalActor = {
-      id: entry.id,
-      role: entry.role,
-      tenantId: options.tenant.tenant_id,
+      id,
+      role,
     };
     tokens.push({
-      id: entry.id,
-      role: entry.role,
+      id,
+      role,
       token: await mintHmacToken({
         secret: options.secret,
         kid: DEMO_JWT_KID,
@@ -662,8 +609,8 @@ export async function mintDemoTokenSet(options: {
     });
   }
   return {
-    tenantId: options.tenant.tenant_id,
-    tenantExpiresAt: options.tenant.expires_at,
+    sessionId: options.session.session_id,
+    sessionExpiresAt: options.session.expires_at,
     tokens,
   };
 }
@@ -671,15 +618,14 @@ export async function mintDemoTokenSet(options: {
 // ---- the auth router --------------------------------------------------------
 
 export interface DemoAuthRouterOptions {
-  db: DemoDatabase & TenantRegistryDatabase;
+  db: DemoDatabase;
   provider: OAuthProvider;
   /** The HS256 secret demo JWTs are signed with (also signs OAuth state). */
   secret: string;
   /** JWT lifetime (~1h): short enough to make the kill switch bite fast. */
   jwtTtlSeconds: number;
-  /** Tenant lifetime (~24h): after this, re-auth mints a FRESH sandbox. */
-  tenantTtlMs: number;
-  purgeTenantData: (tenantId: string) => Promise<unknown>;
+  /** Session lifetime (~24h): after this, re-auth mints a fresh session. */
+  sessionTtlMs: number;
   /**
    * Kill switch. Checked here for mint/refresh; the WORKER must also gate
    * its verifier with it so ALREADY-ISSUED JWTs die too.
@@ -703,141 +649,167 @@ function json(payload: unknown, status = 200): Response {
  * <provider> segment is the mounted provider's name — google or github):
  *   GET  /auth/<provider>          -> 302 to the provider (signed state)
  *   GET  /auth/<provider>/callback -> verify state, exchange code, mint the
- *                                   tenant + token set, 302 to /#demo-tokens=
+ *                                   session + token set, 302 to /#demo-tokens=
  *                                   <base64url(JSON DemoTokenSet)> — a
  *                                   FRAGMENT, so tokens never hit server logs
  *   POST /auth/refresh           -> { token } -> fresh token set while the
- *                                   TENANT row is live (the mid-demo
+ *                                   session row is live (the mid-demo
  *                                   reviewer-switch flow must survive a JWT
- *                                   expiry; after tenant expiry: 401,
- *                                   re-auth mints a fresh sandbox)
+ *                                   expiry; after session expiry: 401)
  */
 export function createDemoAuthRouter(
   options: DemoAuthRouterOptions,
 ): (request: Request) => Promise<Response | null> {
   const now = options.now ?? Date.now;
-  return async (request: Request): Promise<Response | null> => {
-    const url = new URL(request.url);
-    if (!url.pathname.startsWith('/auth/')) return null;
-    // Unauthenticated capability probe for the SPA's sign-in button; carries
-    // no secrets and honestly reports the kill switch.
-    if (request.method === 'GET' && url.pathname === '/auth/config') {
-      return json({
-        enabled: !options.disabled,
-        provider: options.provider.name,
-      });
-    }
+  const app = new Hono();
+
+  // Registered before the disabled middleware: this unauthenticated probe
+  // must honestly report the kill switch even while every other route 503s.
+  app.get('/auth/config', () =>
+    json({
+      enabled: !options.disabled,
+      provider: options.provider.name,
+    }),
+  );
+
+  app.use('/auth/*', async (_context, next) => {
     if (options.disabled) {
       return json({ error: 'the demo is temporarily disabled' }, 503);
     }
+    await next();
+  });
+
+  app.get(`/auth/${options.provider.name}`, async (context) => {
+    const url = new URL(context.req.url);
     const redirectUri = `${url.origin}/auth/${options.provider.name}/callback`;
+    const { state, nonce } = await signState(options.secret, now());
+    // SameSite=Lax still sends the cookie on the provider's top-level GET
+    // redirect back to us, while blocking cross-site POST/subresource use.
+    return new Response(null, {
+      status: 302,
+      headers: {
+        location: options.provider.authorizeUrl({ state, redirectUri }),
+        'cache-control': 'no-store',
+        'set-cookie': `${STATE_COOKIE}=${nonce}; HttpOnly; Secure; SameSite=Lax; Path=/auth; Max-Age=600`,
+      },
+    });
+  });
 
+  app.get(`/auth/${options.provider.name}/callback`, async (context) => {
+    const url = new URL(context.req.url);
+    const redirectUri = `${url.origin}/auth/${options.provider.name}/callback`;
+    const state = url.searchParams.get('state') ?? '';
+    const code = url.searchParams.get('code') ?? '';
+    // Signature + expiry, THEN the browser binding: a signed state the
+    // attacker minted carries a nonce this browser never received, so the
+    // login-CSRF walk-the-victim-into-my-session path fails here.
+    const nonce = nonceOfState(state);
     if (
-      request.method === 'GET' &&
-      url.pathname === `/auth/${options.provider.name}`
+      !(await verifyState(options.secret, state, now())) ||
+      nonce === undefined ||
+      cookieValue(context.req.raw, STATE_COOKIE) !== nonce
     ) {
-      const { state, nonce } = await signState(options.secret, now());
-      // SameSite=Lax still sends the cookie on the provider's top-level GET
-      // redirect back to us, while blocking cross-site POST/subresource use.
-      return new Response(null, {
-        status: 302,
-        headers: {
-          location: options.provider.authorizeUrl({ state, redirectUri }),
-          'cache-control': 'no-store',
-          'set-cookie': `${STATE_COOKIE}=${nonce}; HttpOnly; Secure; SameSite=Lax; Path=/auth; Max-Age=600`,
-        },
-      });
+      return json({ error: 'invalid or expired state' }, 403);
     }
-
-    if (
-      request.method === 'GET' &&
-      url.pathname === `/auth/${options.provider.name}/callback`
-    ) {
-      const state = url.searchParams.get('state') ?? '';
-      const code = url.searchParams.get('code') ?? '';
-      // Signature + expiry, THEN the browser binding: a signed state the
-      // attacker minted carries a nonce this browser never received, so the
-      // login-CSRF walk-the-victim-into-my-sandbox path fails here.
-      const nonce = nonceOfState(state);
-      if (
-        !(await verifyState(options.secret, state, now())) ||
-        nonce === undefined ||
-        cookieValue(request, STATE_COOKIE) !== nonce
-      ) {
-        return json({ error: 'invalid or expired state' }, 403);
-      }
-      const identity = await options.provider.exchange({ code, redirectUri });
-      if (!identity) return json({ error: 'sign-in failed' }, 401);
-      const tenant = await findOrCreateDemoTenant(options.db, {
-        provider: options.provider.name,
-        subject: identity.subject,
-        tenantTtlMs: options.tenantTtlMs,
-        now,
-        purgeTenantData: options.purgeTenantData,
+    let identity: { subject: string } | undefined;
+    try {
+      identity = await options.provider.exchange({
+        code,
+        redirectUri,
+        callbackUrl: url,
+        state,
       });
-      const tokenSet = await mintDemoTokenSet({
-        secret: options.secret,
-        tenant,
-        ttlSeconds: options.jwtTtlSeconds,
-        now,
-      });
-      const fragment = base64UrlEncode(
-        encoder.encode(JSON.stringify(tokenSet)),
-      );
-      return new Response(null, {
-        status: 302,
-        headers: {
-          location: `/#demo-tokens=${fragment}`,
-          'cache-control': 'no-store',
-          // One round-trip per nonce: expire the binding cookie now.
-          'set-cookie': `${STATE_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/auth; Max-Age=0`,
-        },
-      });
+    } catch {
+      // Provider errors are intentionally collapsed into the stable public
+      // envelope below; credentials and upstream details never reach it.
     }
+    if (!identity) return json({ error: 'sign-in failed' }, 401);
+    const session = await findOrCreateDemoSession(options.db, {
+      provider: options.provider.name,
+      subject: identity.subject,
+      sessionTtlMs: options.sessionTtlMs,
+      now,
+    });
+    const tokenSet = await mintDemoTokenSet({
+      secret: options.secret,
+      session,
+      ttlSeconds: options.jwtTtlSeconds,
+      now,
+    });
+    const fragment = base64UrlEncode(encoder.encode(JSON.stringify(tokenSet)));
+    return new Response(null, {
+      status: 302,
+      headers: {
+        location: `/#demo-tokens=${fragment}`,
+        'cache-control': 'no-store',
+        // One round-trip per nonce: expire the binding cookie now.
+        'set-cookie': `${STATE_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/auth; Max-Age=0`,
+      },
+    });
+  });
 
-    if (request.method === 'POST' && url.pathname === '/auth/refresh') {
-      const body = (await request.json().catch(() => undefined)) as
-        | { token?: string }
-        | undefined;
-      if (typeof body?.token !== 'string') {
-        return json({ error: 'token is required' }, 400);
+  app.post(
+    '/auth/refresh',
+    bodyLimit({
+      maxSize: MAX_REFRESH_BODY_BYTES,
+      onError: () => json({ error: 'payload too large' }, 413),
+    }),
+    async (context) => {
+      let value: unknown;
+      try {
+        const bytes = await context.req.raw.arrayBuffer();
+        const text = new TextDecoder('utf-8', {
+          fatal: true,
+          ignoreBOM: false,
+        }).decode(bytes);
+        value = JSON.parse(text);
+      } catch (error) {
+        return error instanceof SyntaxError
+          ? json({ error: 'token is required' }, 400)
+          : json({ error: 'a JSON object body is required' }, 400);
       }
-      // Decode WITHOUT full verification of exp: a just-expired JWT may
-      // still refresh while its TENANT is live — but the SIGNATURE and the
-      // tenant claim must verify, so only a holder of a genuinely-issued
-      // token can refresh. Reuse the verifier with a clock pinned to the
-      // token's own iat? Simpler and safe: require the presented token to
-      // still verify (SPA refreshes BEFORE expiry — 'silent refresh'), and
-      // let a fully-expired token fall back to re-auth.
+      const parsed = REFRESH_BODY_SCHEMA.safeParse(value);
+      if (!parsed.success) return json({ error: 'token is required' }, 400);
+      // Require the presented token to remain valid. The SPA refreshes before
+      // expiry; a fully expired token falls back to OAuth sign-in.
       const verify = hmacVerifier({
         keys: new Map([[DEMO_JWT_KID, options.secret]]),
         issuer: DEMO_JWT_ISSUER,
         audience: DEMO_JWT_AUDIENCE,
         now,
       });
-      const actor = await verify.verify(body.token);
+      const actor = await verify.verify(parsed.data.token);
       if (!actor) return json({ error: 'invalid token' }, 401);
+      const sessionId = demoSessionIdOfActor(actor);
+      if (!sessionId) return json({ error: 'invalid token' }, 401);
       await ensureDemoSchema(options.db);
-      const tenant = await options.db
-        .prepare('SELECT * FROM demo_tenants WHERE tenant_id = ?')
-        .bind(actor.tenantId)
-        .first<DemoTenantRow>();
-      if (!tenant || Date.parse(tenant.expires_at) <= now()) {
-        return json(
-          { error: 'sandbox expired; sign in again for a fresh one' },
-          401,
-        );
+      const session = await options.db
+        .prepare('SELECT * FROM demo_sessions WHERE session_id = ?')
+        .bind(sessionId)
+        .first<DemoSessionRow>();
+      if (!session || Date.parse(session.expires_at) <= now()) {
+        return json({ error: 'session expired; sign in again' }, 401);
       }
       return json(
         await mintDemoTokenSet({
           secret: options.secret,
-          tenant,
+          session,
           ttlSeconds: options.jwtTtlSeconds,
           now,
         }),
       );
-    }
+    },
+  );
 
-    return json({ error: 'not found' }, 404);
+  app.notFound(() => json({ error: 'not found' }, 404));
+
+  return async (request: Request): Promise<Response | null> => {
+    if (!new URL(request.url).pathname.startsWith('/auth/')) return null;
+    if (request.method === 'HEAD') {
+      return options.disabled
+        ? json({ error: 'the demo is temporarily disabled' }, 503)
+        : json({ error: 'not found' }, 404);
+    }
+    return app.fetch(request);
   };
 }

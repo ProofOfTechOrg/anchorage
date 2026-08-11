@@ -5,9 +5,9 @@ deterministic guardrail scenarios through breakwater. One React application
 combines the control room, workflow launcher, approval dashboard, run status,
 and actor switcher. One Cloudflare Worker serves both the API and the SPA.
 
-Five workflows are available from the launcher. The sixth, `wire-transfer`, is
-the server-backed control-room scenario that hands a real durable approval into
-the same review queue.
+All six workflows are available from the launcher. `wire-transfer` also appears
+in the control room, where it hands a real durable approval into the same review
+queue.
 
 | # | id | shape | what it showcases |
 |---|----|-------|-------------------|
@@ -18,12 +18,7 @@ the same review queue.
 | 5 | `access-request` | serial + gate, RBAC-scoped | route-level `allowedRoles`, cross-workflow isolation, separation of duties |
 | 6 | `wire-transfer` | control-room agent + gate | prompt-injection defense, durable human approval, exact-suspension grant |
 
-The seven in-browser scenarios exercise real breakwater policies and evaluators:
-PII leakage, secret exfiltration, prompt injection, role enforcement, egress
-allowlists, cross-workflow isolation, and tenant isolation. Their inputs are
-deterministic and require no model key. The adjacent wire-transfer card is the
-eighth control-room card and the only scenario that starts a server-side
-workflow.
+The seven in-browser scenarios exercise real Breakwater policies and evaluators: PII leakage, secret exfiltration, prompt injection, role enforcement, egress allowlists, cross-workflow isolation, and fail-closed opaque isolation scope. Their inputs are deterministic and require no model key. The adjacent wire-transfer card is the eighth control-room card and the only scenario that starts a server-side workflow.
 
 ## Binding-gated: real spine, zero secrets offline
 
@@ -37,13 +32,14 @@ CRM/deploy egress) to go live per connector — no code change.
 
 ## Run it — the full UI (recommended)
 
+Create `.dev.vars` and provision the local deployment sentinel using the commands in the workerd section below, then start the combined Vite and Worker development server:
+
 ```bash
-pnpm -w build   # first run only — the dev plugin loads the worker over flowsafe's dist
-pnpm dev        # Vite on :4321 + the in-process showcase host
+pnpm dev        # Vite on :4321 + the real Cloudflare Worker and bindings
 ```
 
 Open http://localhost:4321. The **ActorSwitcher** picks a demo identity; the
-**LauncherPanel** starts any of the five launcher workflows (edit the sample JSON); the
+**LauncherPanel** starts any of the six workflows (edit the sample JSON); the
 **RunStatusPanel** polls each run to `success`; the **approval dashboard** below
 is where you claim/decide. Try:
 
@@ -63,14 +59,17 @@ is where you claim/decide. Try:
 
 ```bash
 cp packages/showcase/.dev.vars.example packages/showcase/.dev.vars # REQUIRED — demo bearer tokens
-pnpm --filter showcase build        # SPA → ./dist (served as assets)
-pnpm --filter showcase dev:worker   # wrangler dev on :8787 — SPA at / + API same origin
+pnpm --dir packages/flowsafe provision:deployment -- \
+  --database anchorage-showcase-single-tenant \
+  --tag showcase \
+  --local \
+  --config ../showcase/wrangler.jsonc \
+  --persist-to ../showcase/.wrangler/state
+pnpm --filter showcase build        # Worker + SPA → ./dist
+pnpm --filter showcase preview      # built Worker on :8787 — SPA + API same origin
 ```
 
-The `.dev.vars` copy is not optional: `APPROVAL_ACTOR_TOKENS` is a **secret**,
-not a wrangler var, so without it every authenticated route 401s. (`pnpm dev`
-needs no copy — the in-process host reads the tokens from
-`worker/demo-actors.ts`.)
+The `.dev.vars` copy is not optional. It supplies the local-only internal Durable Object credential and `APPROVAL_ACTOR_TOKENS`; without them requests fail closed. The provisioning command seeds the same local state directory that both `pnpm dev` and `preview` open.
 
 Drive the loop with curl:
 
@@ -89,9 +88,14 @@ curl -sX POST localhost:8787/api/approvals/<id>/decide \
 curl -s localhost:8787/runs/content-pipeline/<runId> -H 'authorization: Bearer demo-viewer'
 ```
 
-Fail-closed proof (skip the queue, forge the resume → no grant, connector denied):
+Fail-closed proof: start a second run, copy its `runId`, then skip the queue and
+forge the resume. The connector receives no grant and denies the write:
 
 ```bash
+curl -sX POST localhost:8787/runs \
+  -H 'authorization: Bearer demo-operator' -H 'content-type: application/json' \
+  -d '{"workflowId":"content-pipeline","inputData":{"topic":"forged resume"}}'
+
 curl -sX POST localhost:8787/runs/content-pipeline/<runId>/resume \
   -H 'authorization: Bearer demo-operator' -H 'content-type: application/json' \
   -d '{"step":"reviewContent","resumeData":{"approved":true}}'
@@ -99,7 +103,7 @@ curl -sX POST localhost:8787/runs/content-pipeline/<runId>/resume \
 ```
 
 Local dev tokens (roles): `demo-admin`, `demo-builder`, `demo-operator`,
-`demo-reviewer`, `demo-viewer` — all in the shared tenant `demo`. They live in
+`demo-reviewer`, `demo-viewer`. They all act inside the shared demo organization. They live in
 `worker/demo-actors.ts`, the one source the dev switcher, the `pnpm dev` host,
 and `.dev.vars.example` all derive from (`demo-actors.test.ts` fails if they
 drift). They exist **only in dev**: the production SPA bundle contains no token
@@ -111,86 +115,75 @@ Approval records are minted in-process from an observed suspension, never from a
 request body — a body can carry neither `connectors` (which *is* the grant) nor
 `requestedBy` (which is what separation-of-duties compares).
 
-## The public demo (OAuth sandboxes)
+## The public demo (one shared organization)
 
-Set `DEMO_JWT_SECRET` (secret) plus an OAuth client — `GOOGLE_CLIENT_ID` (var)
-and `GOOGLE_CLIENT_SECRET` (secret), or the GitHub pair — and the showcase
-grows a public sign-in. A provider counts only with its **full id+secret
-pair**: a half-set pair logs a `config-error` and stays unmounted (an id
-alone would advertise a sign-in that dies at the token exchange — and mask a
-working fallback). One provider mounts per deployment; when both pairs are
-configured, **Google wins** (the launch provider). The SPA reads the provider
-name from `/auth/config`, so no client change is needed to switch. Subjects
-are provider-scoped (`google:<sub>` / `github:<id>`), so switching providers
-mints fresh sandboxes rather than colliding identities.
+Set `DEMO_JWT_SECRET` plus one complete OAuth client pair: Google id and secret, or the GitHub pair. A half-configured provider logs a configuration error and stays unmounted. When both complete pairs exist, Google mounts. The SPA reads the selected provider from `/auth/config`.
 
-`GET /auth/<provider>` → OAuth → an **ephemeral tenant** provisioned through the
-`tenants` registry, plus a set of short-TTL HS256 JWTs, one per demo role, all
-bound to that tenant and each carrying a distinct `actor.id` (a shared id would
-trip the self-approval check and no approval could ever complete). The token set
-comes back in the URL **fragment**, so it never reaches a server log, and the
-SPA scrubs it from history on read.
+`GET /auth/<provider>` completes OAuth and creates or replaces an expiring visitor session. It returns four short-TTL HS256 role tokens in the URL fragment, so tokens do not enter server logs and the SPA removes the fragment from browser history. Each role token has a distinct actor id for separation of duties.
 
-Everything a visitor runs and approves is invisible to every other visitor —
-the same three invariants the commercial platform uses, not a demo-specific
-shortcut.
+Every visitor joins the same deployment-wide demo organization. The approval queue is intentionally shared so visitors can observe collaborative review. Run, thread, and resource ownership remains per principal: operators and builders receive `404` for another visitor's resources, while reviewers, viewers, and admins can read existing resources as their roles require. A visitor session controls identity, token expiry, and run allowance only; deleting an expired session does not delete workflow state.
 
-Abuse controls, honestly:
+Abuse controls:
 
-- `UNIQUE(provider, subject)` gives one live sandbox per identity. That stops
-  one account holding two; it does not stop N free accounts.
-- Per-sandbox run cap **and** a global daily run ceiling, each enforced as a
-  single conditional `UPDATE` (a `SELECT`-then-`UPDATE` is a TOCTOU race a
-  burst of parallel starts walks straight through).
-- `DEMO_DISABLED=true` is the kill switch, checked in the **auth middleware**,
-  so already-issued JWTs stop verifying — not just new mints.
-- Sandboxes expire after `DEMO_TENANT_TTL_HOURS`; a cron reaps them with
-  `purgeTenant`, waiting out the JWT lifetime first so it never deletes runs
-  out from under a still-valid token.
-- Visitors can self-reset their sandbox (`POST /demo/reset`, admin token +
-  demo tenant only) — the same `purgeTenant` wipe of runs + approvals, but the
-  run budget is deliberately NOT refilled, so reset can never farm runs past
-  the per-tenant cap.
-- Connectors stay binding-gated: a published demo cannot send an email, write
-  a CRM, or deploy anything.
+- `UNIQUE(provider, subject)` allows one live session per provider identity.
+- A per-session run cap and global daily ceiling each use one conditional D1 update, avoiding a select-then-update race.
+- `DEMO_DISABLED=true` is checked during authentication, so it invalidates already-issued demo JWTs as well as disabling new sign-ins.
+- Sessions expire after `DEMO_SESSION_TTL_HOURS`; retention removes session and budget rows only after their JWTs can no longer verify.
+- There is no public reset route. One visitor must never erase the shared organization's records.
+- Connectors stay binding-gated, so the published demo cannot send email, write a CRM, or deploy anything.
 
 The real backstops react *after* spend. Size `DEMO_DAILY_RUN_CAP` for what you
 can tolerate and set a billing alert.
 
-## Single deploy
+## Blue/green deployment
 
-`wrangler.jsonc` has an `assets` block serving `./dist` at `/`
-(`not_found_handling: single-page-application`), with `run_worker_first` keeping
-the API routes (`/api/*`, `/runs`, `/runs/*`, `/healthz`, `/workflows`,
-`/auth/*`, `/demo/*`) on the Worker — one origin, no build-time API URL. Two cron
-expressions are declared and dispatched on `controller.cron`, so the SLA sweep
-and the purge never share an invocation (a CPU-limit termination kills the
-isolate and cannot be caught, so a slow sweep would starve the purge forever).
+`wrangler.jsonc` has an `assets` block whose client directory is generated by the Vite build (`not_found_handling: single-page-application`). `run_worker_first` keeps `/api/*`, `/admin/*`, `/runs`, `/runs/*`, `/healthz`, `/workflows`, and `/auth/*` on the Worker. The fixed maintenance Durable Object runs the SLA sweep and purge in separate alarm invocations, so a CPU-limit termination in one duty cannot starve the other.
 
-```bash
-pnpm showcase:deploy            # builds, then wrangler deploy
-```
-
-The deploy binds ONE public origin: `anchorage.proofoftech.org` (a Workers
-custom domain; the zone must live on the deploying Cloudflare account) with
-`workers_dev: false`, because the OAuth callback is registered for exactly
-that origin. The SPA publishes indexable metadata, `robots.txt`, a sitemap, and
-a 1200×630 social card for that canonical URL.
+The checked-in configuration is the green, pre-traffic isolation-cutover script:
+`anchorage-showcase-single-tenant` with `workers_dev: true` and no custom-domain
+route. Its distinct script name creates fresh Durable Object namespaces. The
+existing `anchorage-showcase` script, database, namespaces, and route remain the
+blue rollback bundle until cutover.
 
 A fresh deploy **401s on every authenticated route until you set the auth
 secret** — no credentials are baked into `wrangler.jsonc`, so there is no state
 in which the service is reachable with a token an attacker can read off GitHub:
 
 ```bash
-pnpm --filter showcase exec wrangler d1 create anchorage-showcase
+pnpm --filter showcase exec wrangler d1 create anchorage-showcase-single-tenant
 # Paste the returned id into packages/showcase/wrangler.jsonc.
+# Set DEPLOYMENT_TENANT, then seed the new database before application traffic.
+pnpm --dir packages/flowsafe provision:deployment -- \
+  --database anchorage-showcase-single-tenant \
+  --tag showcase \
+  --remote \
+  --config ../showcase/wrangler.jsonc
+pnpm --filter showcase exec wrangler secret put DEPLOYMENT_IDENTITY_SECRET
+pnpm --filter showcase exec wrangler secret put MAINTENANCE_ADMIN_SECRET
 pnpm --filter showcase exec wrangler secret put APPROVAL_ACTOR_TOKENS
-# Then flip connector bindings to go live.
+# Build and deploy only the green script at its workers.dev staging URL.
+pnpm showcase:deploy
+curl -fsS -X POST https://your-worker.example/admin/ensure-maintenance \
+  -H "authorization: Bearer ${maintenance_admin_secret}"
 ```
+
+Treat the cutover and rollback bundle as one resource set:
+
+1. Create the fresh D1 database and paste its id into `wrangler.jsonc`.
+2. Seed the sentinel before any application table, then set the deployment identity and authentication secrets on `anchorage-showcase-single-tenant`.
+3. Deploy the checked-in green configuration. Verify `/healthz`, an authenticated route, and a smoke run at its workers.dev URL. OAuth sign-in is not expected there because the provider callback remains the production origin.
+4. Keep the blue script and its old database binding unchanged. Never run green code against the old pooled database or blue code against the new database.
+5. For cutover, set `workers_dev` to `false`, add `{ "pattern": "anchorage.proofoftech.org", "custom_domain": true }` to `routes`, and deploy the green script. The route move is the traffic switch.
+6. To roll back, restore the route from the retained blue revision and deploy `anchorage-showcase`; do not mix either script with the other bundle's storage.
+7. After the rollback window closes, decommission the blue Worker, database, Durable Object namespaces, and associated secrets as one unit.
+
+The public deployment has one origin, `anchorage.proofoftech.org`, because the
+OAuth callback is registered for exactly that origin. The SPA publishes
+indexable metadata, `robots.txt`, a sitemap, and a 1200×630 social card for it.
 
 > **Do not paste the demo tokens in as that secret.** They are checked into this
 > repository, so seeding them publishes world-known credentials — one of which is
-> `admin`, who can both file and decide approvals. Generate real random tokens
+> `admin`, who can both file and decide approvals. Generate random tokens
 > (or replace the bearer seam with your SSO/JWT verification in
 > `bearerActorAuthenticator`).
 

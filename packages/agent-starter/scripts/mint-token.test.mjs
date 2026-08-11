@@ -6,7 +6,6 @@ import { describe, expect, it } from 'vitest';
 import { mintStarterToken } from './mint-token.mjs';
 
 const OPTIONS = {
-  tenantId: 'acme',
   role: 'operator',
   actorId: 'local-operator',
   secret: 'synthetic-test-secret',
@@ -26,17 +25,12 @@ describe('agent-starter token minting', () => {
     await expect(verifier.verify(token)).resolves.toEqual({
       id: OPTIONS.actorId,
       role: OPTIONS.role,
-      tenantId: OPTIONS.tenantId,
     });
   });
 
-  it.each([
-    ['empty actor id', { actorId: '' }],
-    ['malformed tenant id', { tenantId: 'Bad_Tenant' }],
-    ['reserved tenant id', { tenantId: 'system' }],
-  ])('rejects an actor with %s', async (_label, override) => {
-    await expect(mintStarterToken({ ...OPTIONS, ...override })).rejects.toThrow(
-      'actorId must be non-empty and tenantId must be a valid, non-reserved tenant ID',
+  it('rejects an empty actor id', async () => {
+    await expect(mintStarterToken({ ...OPTIONS, actorId: '' })).rejects.toThrow(
+      'actorId must be non-empty',
     );
   });
 

@@ -130,6 +130,8 @@ export interface AgentRunEnvelope {
 
 export interface TrustedAgentExecution {
   agentId: string;
+  /** Infrastructure-verified deployment tag for audit attribution. */
+  deploymentTag?: string;
   /**
    * WHO is executing. On an approval resume this is the restored original
    * principal, never the reviewer who decided — so a human approval does not

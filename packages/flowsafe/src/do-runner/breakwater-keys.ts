@@ -44,10 +44,12 @@ export const BREAKWATER_PRINCIPAL_PERMISSIONS_KEY =
 export const BREAKWATER_WORKFLOW_SCOPE_KEY = 'breakwater.workflowScope';
 
 /**
- * requestContext key breakwater's tenantIsolation evaluator and connector
- * key-scoping read: the caller's OPAQUE isolation scope. RunnerRuntime mints
- * the runId's tenant prefix here on every leg of a tenant-salted run,
- * so connector idempotency + rate-limit keys segment per tenant. Absent on
- * non-tenant runs — breakwater then preserves its single-tenant keys.
+ * requestContext key breakwater's isolation-scope evaluator and connector
+ * key-scoping read: the caller's OPAQUE isolation scope. flowsafe no longer
+ * mints it (a deployment serves one organization, so connector idempotency
+ * and rate-limit keys are deployment-wide by construction), but the key stays
+ * RESERVED: RunnerRuntime drops it from provider values so nothing can mint a
+ * scope that desyncs from the execution identity, and the shared
+ * execution-context boundary refuses it from external input.
  */
 export const BREAKWATER_ISOLATION_SCOPE_KEY = 'breakwater.isolationScope';

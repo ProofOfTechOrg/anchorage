@@ -33,8 +33,10 @@ describe('DemoActorSwitcher token refresh', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const session: DemoTokenSet = {
-      tenantId: 'tenant-a',
-      tenantExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      sessionId: '001122334455667788',
+      sessionExpiresAt: new Date(
+        Date.now() + 24 * 60 * 60 * 1000,
+      ).toISOString(),
       tokens: [{ id: 'operator-a', role: 'operator', token: 'operator-token' }],
     };
     const onSelect = vi.fn();

@@ -54,7 +54,7 @@ const TOUR_BULLETS: readonly string[] = [
   'Pick a scenario in the control room. A scripted agent runs straight into the real breakwater enforcement path in your browser — no run budget spent. Switch roles to see the decisions change.',
   "Run the wire transfer scenario: it starts a real durable run that suspends at an approval gate, then decide it in the queue right below. Separation of duties is server-enforced: whoever advanced the run into its gate can't decide it (this demo lets admin self-decide).",
   'The approval derives a capability grant bound to that exact suspension, and the run resumes server-side behind four connector gates.',
-  'Want more? Further down, launch the example workflows — product-launch has two gates. Dangerous things are simulated (no live bindings); the machinery is real: grants, RBAC, tenant isolation, durable suspend/resume.',
+  'Want more? Further down, launch the example workflows — product-launch has two gates. Dangerous things are simulated (no live bindings); the machinery is real: grants, RBAC, scoped isolation keys, durable suspend/resume.',
 ];
 
 export function IntroTourDialog({

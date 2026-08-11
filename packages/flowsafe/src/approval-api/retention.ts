@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// Cron-owned approval-queue retention purge (2026-07-11 audit, D3) — the
+// Alarm-owned approval-queue retention purge (2026-07-11 audit, D3) — the
 // approvals analog of do-runner's purgeExpiredWorkflowRuns
 // (do-runner/d1-storage.ts), structured like sweepSLA (service.ts): a free
-// function over the cross-tenant SystemApprovalStore, unreachable from
-// request scope by type, never a service method, never an HTTP route.
+// function over the deployment store, never a service method or HTTP route.
 //
 // TERMINAL-TIMESTAMP CHOICE: a decided (approved/rejected) record's terminal
 // instant is decidedAt — service.ts's decide() always stamps decidedAt and
@@ -35,7 +34,7 @@
 // CURRENT suspension fingerprint, requiring a NEW decision — deliberately:
 // an approval that aged past retention should not silently re-arm the grant
 // it already spent. One separation-of-duties relaxation applies only in this
-// recovery path: the re-filed record's requestedBy is the system actor
+// recovery path: the re-filed record's requestedBy is the system principal
 // rather than a human, so the reviewer who decided the purged record MAY
 // legally decide its replacement — there is no human "who advanced the run
 // to this suspension" left to attribute it to. Operators should still set
@@ -51,7 +50,7 @@
 // superseded record is excluded from grant derivation by its STATUS alone,
 // the same guarantee this purge relies on for a decided-then-purged record.
 
-import type { SystemApprovalStore } from './tenant-brand.js';
+import type { ApprovalStore } from './store.js';
 
 export interface PurgeExpiredApprovalsOptions {
   /**
@@ -60,8 +59,7 @@ export interface PurgeExpiredApprovalsOptions {
    * than this are eligible. Open requests (pending/claimed/escalated) are
    * NEVER purged at any age: an approval still awaiting a decision is not
    * garbage (mirrors purgeExpiredWorkflowRuns' "live runs are never
-   * purged"). An abandoned tenant's still-open approvals are reclaimed only
-   * by purgeTenant() at offboarding.
+   * purged").
    */
   ttlMs: number;
   /** Injectable clock (tests, deterministic TTL math). Default: Date.now. */
@@ -75,16 +73,12 @@ export interface PurgeExpiredApprovalsOptions {
 }
 
 /**
- * Deletes decided approval records past their retention TTL, ACROSS
- * TENANTS. Cron-owned TCB code — deliberately NOT a service method and NOT
- * reachable over HTTP: an unfiltered cross-tenant DELETE behind a role check
- * would be the same IDOR-shaped hole sweepSLA's doc comment describes for an
- * HTTP-reachable sweep. The distinct SystemApprovalStore parameter type
- * makes "cross-tenant deletes happen only inside the TCB" a compile-time
- * property, not a convention. Returns the number of deleted records.
+ * Deletes decided approval records past their retention TTL. Trusted
+ * maintenance code — deliberately not a service method or HTTP route. Returns
+ * the number of deleted records.
  */
 export async function purgeExpiredApprovals(
-  store: SystemApprovalStore,
+  store: ApprovalStore,
   options: PurgeExpiredApprovalsOptions,
 ): Promise<number> {
   // Validated here so BOTH backends inherit it: a negative ttlMs turns the
@@ -92,7 +86,7 @@ export async function purgeExpiredApprovals(
   // old ones, and a negative limit diverges by backend — the in-memory
   // purge's `purged >= limit` guard never fires (no-op), while D1's `LIMIT
   // -1` is unbounded (SQLite treats a negative LIMIT as "no limit"), turning
-  // a batch cap into a cross-tenant unbounded DELETE. limit: 0 (no-op) and
+  // a batch cap into an unbounded DELETE. limit: 0 (no-op) and
   // ttlMs: 0 (purge decided approvals now) stay valid — both are real
   // operator intents (see numberVar's allowZero convention).
   if (!Number.isFinite(options.ttlMs) || options.ttlMs < 0) {

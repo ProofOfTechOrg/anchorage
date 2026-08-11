@@ -1,125 +1,57 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track E (M-007), CI-M-007-002 — the flowsafe-owned D1 subscription store.
-//
-// This is OUR table (`flowsafe_signal_subscriptions`), NOT a `mastra_*` domain:
-// core's SignalProvider keeps subscriptions in an in-memory Map, which is lost on
-// DO eviction and tenant-blind, so flowsafe persists them itself. It mirrors the
-// approval store's INV-2 posture (tenant-store.ts / tenant-brand.ts /
-// d1-store.ts): obtain a store ONLY through the factory, which hands request
-// scope a store BOUND to one tenant at construction (every SELECT/DELETE carries
-// `tenant_id = <ctor field>`) and hands the webhook route the cron/webhook-only
-// `system()` view — a DISTINCT type that cannot flow into request-scoped code.
-//
-// The webhook's `system().listByResource` is the ONE legitimate cross-tenant read
-// (a webhook arrives with no identity — the ROW is the tenant authority, exactly
-// like sweepSLA over SystemApprovalStore). Offboarding is do-runner's `purgeTenant`
-// (a `WHERE tenant_id = ?` delete, the flowsafe_approvals precedent); retention is
-// `none` — a subscription is standing config a tenant means to keep, reaped only
-// at offboarding (like `mastra_schedules`' `none`-with-because), so this table is
-// deliberately absent from the run/thread TTL purges.
+// Deployment-wide signal-provider subscriptions. Physical deployment isolation
+// makes every row belong to the one organization bound to this D1 database.
 
 import type { SignalSubscription } from '@mastra/core/signals';
 
-import { TENANT_ID_PATTERN } from '../do-runner/index.js';
+import { isPathSafeId } from '../do-runner/index.js';
 import {
   d1Changes,
   dateOrUndefined,
   isoOrNull,
-  jsonOrNull,
   parseJsonOrUndefined,
   type SignalDatabase,
 } from '../signals/d1-shared.js';
+import { PROVIDER_ID_PATTERN } from './provider.js';
 
-/** The table this store owns. Kept in sync with do-runner's purgeTenant DELETE. */
 export const SIGNAL_SUBSCRIPTIONS_TABLE = 'flowsafe_signal_subscriptions';
 
-/**
- * A subscription row mapped to core's `SignalSubscription` shape PLUS its owning
- * `tenantId` — the webhook path needs the tenant per row (its rows span tenants);
- * the poll path ignores it (a host DO reads only its own tenant's rows). A
- * superset of `SignalSubscription`, so it flows into `buildNotification` and
- * `pollForDeliveries` unchanged.
- */
-export interface StoredSubscription extends SignalSubscription {
-  readonly tenantId: string;
-}
+/** Maximum UTF-8 size of an opaque provider resource key. */
+export const MAX_EXTERNAL_RESOURCE_ID_BYTES = 1024;
+const textEncoder = new TextEncoder();
 
-/** What a subscribe writes — the memory ids are server-minted (never a client body). */
+export type StoredSubscription = SignalSubscription;
+
 export interface SubscribeInput {
   providerId: string;
+  /** Opaque provider key, bounded to 1024 UTF-8 bytes and free of ASCII controls. */
   externalResourceId: string;
-  /** Tenant-salted threadId (`${tenantId}_${uuid}`) the caller owns (path-checked upstream). */
   threadId: string;
-  /** Tenant-salted resourceId (`${tenantId}_${key}`) — the thread's owner. */
   resourceId: string;
   metadata?: Record<string, unknown>;
 }
 
-/**
- * The tenant-bound subscription store that keeps request scope isolated. Obtain via
- * `SubscriptionStoreFactory.forTenant`; the brand makes an unbound/system store a
- * compile error where one of these is required.
- */
-export interface TenantBoundSubscriptionStore {
-  readonly tenantId: string;
-  readonly [SUBSCRIPTION_TENANT_BOUND]: true;
-  /** Upsert a subscription (idempotent on provider × externalResourceId × thread). */
+export interface SubscriptionStore {
   subscribe(input: SubscribeInput): Promise<StoredSubscription>;
-  /** Remove one subscription; true if a row was deleted. */
   unsubscribe(
     providerId: string,
     externalResourceId: string,
     threadId: string,
   ): Promise<boolean>;
-  /** This tenant's subscriptions for one thread (the subscribe route's read). */
   listForThread(threadId: string): Promise<StoredSubscription[]>;
-  /** This tenant's subscriptions for one provider (the host-DO rehydration query). */
   listForProvider(providerId: string): Promise<StoredSubscription[]>;
-}
-
-/**
- * The cron/webhook-only cross-tenant view. Deliberately NOT a
- * TenantBoundSubscriptionStore (`[SUBSCRIPTION_TENANT_BOUND]?: never`) so it can
- * never reach request-scoped code — the SystemApprovalStore posture.
- */
-export interface SystemSubscriptionStore {
-  readonly [SUBSCRIPTION_TENANT_BOUND]?: never;
-  /**
-   * Every subscription to `(providerId, externalResourceId)` ACROSS tenants —
-   * each carries its own `tenantId`. The webhook's tenant-resolution authority:
-   * a webhook payload NEVER names a tenant; the matched row does.
-   */
   listByResource(
     providerId: string,
     externalResourceId: string,
   ): Promise<StoredSubscription[]>;
 }
 
-/** A unique-symbol brand satisfied only by a tenant-bound store this module builds. */
-export const SUBSCRIPTION_TENANT_BOUND: unique symbol = Symbol(
-  'flowsafe.signalSubscriptionTenantBound',
-);
-
 export interface SubscriptionStoreFactory {
-  /** Bind a store to one tenant. Throws unless tenantId satisfies TENANT_ID_PATTERN. */
-  forTenant(tenantId: string): TenantBoundSubscriptionStore;
-  /** The cron/webhook-only cross-tenant view. Never request-scoped. */
-  system(): SystemSubscriptionStore;
+  store(): SubscriptionStore;
 }
-
-function assertTenantId(tenantId: string): void {
-  if (typeof tenantId !== 'string' || !TENANT_ID_PATTERN.test(tenantId)) {
-    throw new Error(
-      `forTenant: tenantId '${tenantId}' violates INV-3 (^[a-z0-9]{3,32}$)`,
-    );
-  }
-}
-
-// --- D1 -------------------------------------------------------------------
 
 interface SubscriptionRow {
   id: string;
-  tenant_id: string;
   provider_id: string;
   thread_id: string;
   resource_id: string;
@@ -131,7 +63,6 @@ interface SubscriptionRow {
 const SCHEMA_STATEMENTS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS ${SIGNAL_SUBSCRIPTIONS_TABLE} (
     id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
     provider_id TEXT NOT NULL,
     thread_id TEXT NOT NULL,
     resource_id TEXT NOT NULL,
@@ -139,26 +70,30 @@ const SCHEMA_STATEMENTS: readonly string[] = [
     subscribed_at TEXT NOT NULL,
     metadata TEXT
   )`,
-  // One subscription per (tenant, provider, external resource, thread): a
-  // re-subscribe upserts rather than duplicating (the ON CONFLICT target below).
   `CREATE UNIQUE INDEX IF NOT EXISTS ${SIGNAL_SUBSCRIPTIONS_TABLE}_key
-    ON ${SIGNAL_SUBSCRIPTIONS_TABLE} (tenant_id, provider_id, external_resource_id, thread_id)`,
-  // The webhook's cross-tenant lookup rides this: given a provider + external
-  // resource, find every subscribed (tenant, thread).
+    ON ${SIGNAL_SUBSCRIPTIONS_TABLE} (provider_id, external_resource_id, thread_id)`,
   `CREATE INDEX IF NOT EXISTS ${SIGNAL_SUBSCRIPTIONS_TABLE}_resource
     ON ${SIGNAL_SUBSCRIPTIONS_TABLE} (provider_id, external_resource_id)`,
-  // The host-DO rehydration rides this: one tenant's subscriptions for one provider.
-  `CREATE INDEX IF NOT EXISTS ${SIGNAL_SUBSCRIPTIONS_TABLE}_rehydrate
-    ON ${SIGNAL_SUBSCRIPTIONS_TABLE} (tenant_id, provider_id)`,
+  `CREATE INDEX IF NOT EXISTS ${SIGNAL_SUBSCRIPTIONS_TABLE}_provider
+    ON ${SIGNAL_SUBSCRIPTIONS_TABLE} (provider_id)`,
 ];
 
 async function createSubscriptionSchema(db: SignalDatabase): Promise<void> {
+  const existing = await db
+    .prepare(`PRAGMA table_info(${SIGNAL_SUBSCRIPTIONS_TABLE})`)
+    .all<{ name: string }>();
+  if (existing.results.some((column) => column.name === 'tenant_id')) {
+    throw new Error(
+      `${SIGNAL_SUBSCRIPTIONS_TABLE} uses the retired pooled-tenant schema — recreate the database before serving this single-deployment release`,
+    );
+  }
   for (const statement of SCHEMA_STATEMENTS) {
     await db.prepare(statement).run();
   }
 }
 
 function rowToSubscription(row: SubscriptionRow): StoredSubscription {
+  const metadata = parseJsonOrUndefined<unknown>(row.metadata);
   return {
     id: row.id,
     providerId: row.provider_id,
@@ -166,66 +101,196 @@ function rowToSubscription(row: SubscriptionRow): StoredSubscription {
     resourceId: row.resource_id,
     externalResourceId: row.external_resource_id,
     subscribedAt: dateOrUndefined(row.subscribed_at) ?? new Date(0),
-    metadata: parseJsonOrUndefined<Record<string, unknown>>(row.metadata) ?? {},
-    tenantId: row.tenant_id,
+    metadata:
+      metadata !== null &&
+      typeof metadata === 'object' &&
+      !Array.isArray(metadata)
+        ? (metadata as Record<string, unknown>)
+        : {},
   };
 }
 
-class D1TenantBoundSubscriptionStore implements TenantBoundSubscriptionStore {
-  readonly [SUBSCRIPTION_TENANT_BOUND] = true as const;
-  readonly tenantId: string;
+function assertProviderId(
+  value: unknown,
+  operation: string,
+): asserts value is string {
+  if (typeof value !== 'string' || !PROVIDER_ID_PATTERN.test(value)) {
+    throw new Error(`${operation}: providerId is invalid`);
+  }
+}
+
+function assertExternalResourceId(
+  value: unknown,
+  operation: string,
+): asserts value is string {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new Error(`${operation}: externalResourceId is required`);
+  }
+  for (const character of value) {
+    const code = character.charCodeAt(0);
+    if (code <= 0x1f || code === 0x7f) {
+      throw new Error(
+        `${operation}: externalResourceId must not contain ASCII control characters`,
+      );
+    }
+  }
+  if (textEncoder.encode(value).byteLength > MAX_EXTERNAL_RESOURCE_ID_BYTES) {
+    throw new Error(
+      `${operation}: externalResourceId exceeds ${MAX_EXTERNAL_RESOURCE_ID_BYTES} UTF-8 bytes`,
+    );
+  }
+}
+
+/** Whether a value is a non-empty, bounded provider resource key. */
+export function isValidExternalResourceId(value: unknown): value is string {
+  try {
+    assertExternalResourceId(value, 'external resource');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function assertThreadId(
+  value: unknown,
+  operation: string,
+): asserts value is string {
+  if (!isPathSafeId(value)) {
+    throw new Error(`${operation}: threadId is not path-safe`);
+  }
+}
+
+interface CanonicalSubscribeInput {
+  readonly providerId: string;
+  readonly externalResourceId: string;
+  readonly threadId: string;
+  readonly resourceId: string;
+  readonly metadata?: Record<string, unknown>;
+  readonly metadataJson: string | null;
+}
+
+function canonicalMetadata(value: unknown): {
+  metadata: Record<string, unknown>;
+  metadataJson: string;
+} {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('subscribe: metadata must be an object');
+  }
+  let metadataJson: string | undefined;
+  try {
+    metadataJson = JSON.stringify(value);
+  } catch {
+    throw new Error('subscribe: metadata must be JSON-serializable');
+  }
+  if (metadataJson === undefined) {
+    throw new Error('subscribe: metadata must be JSON-serializable');
+  }
+  const metadata = JSON.parse(metadataJson) as unknown;
+  if (
+    metadata === null ||
+    typeof metadata !== 'object' ||
+    Array.isArray(metadata)
+  ) {
+    throw new Error('subscribe: metadata must serialize to an object');
+  }
+  return {
+    metadata: metadata as Record<string, unknown>,
+    metadataJson,
+  };
+}
+
+function canonicalSubscriptionInput(
+  input: SubscribeInput,
+): CanonicalSubscribeInput {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error('subscribe: input must be an object');
+  }
+  let descriptors: PropertyDescriptorMap;
+  try {
+    descriptors = Object.getOwnPropertyDescriptors(input);
+  } catch {
+    throw new Error('subscribe: input properties could not be read');
+  }
+  const field = (name: keyof SubscribeInput): unknown => {
+    const descriptor = descriptors[name];
+    if (descriptor === undefined) return undefined;
+    if (!('value' in descriptor)) {
+      throw new Error(`subscribe: ${name} must be an own data property`);
+    }
+    return descriptor.value;
+  };
+  const providerId = field('providerId');
+  const externalResourceId = field('externalResourceId');
+  const threadId = field('threadId');
+  const resourceId = field('resourceId');
+  const metadataValue = field('metadata');
+
+  assertProviderId(providerId, 'subscribe');
+  assertExternalResourceId(externalResourceId, 'subscribe');
+  assertThreadId(threadId, 'subscribe');
+  if (!isPathSafeId(resourceId)) {
+    throw new Error('subscribe: resourceId is not path-safe');
+  }
+  const canonicalMetadataValue =
+    metadataValue === undefined ? undefined : canonicalMetadata(metadataValue);
+  return Object.freeze({
+    providerId,
+    externalResourceId,
+    threadId,
+    resourceId,
+    ...(canonicalMetadataValue === undefined
+      ? {}
+      : { metadata: canonicalMetadataValue.metadata }),
+    metadataJson: canonicalMetadataValue?.metadataJson ?? null,
+  });
+}
+
+function assertSubscriptionId(id: string): void {
+  if (!isPathSafeId(id)) {
+    throw new Error('subscribe: generated subscription id is not path-safe');
+  }
+}
+
+class D1SubscriptionStore implements SubscriptionStore {
   readonly #db: SignalDatabase;
   readonly #ready: () => Promise<void>;
   readonly #uuid: () => string;
 
   constructor(
     db: SignalDatabase,
-    options: {
-      tenantId: string;
-      ready: () => Promise<void>;
-      uuid: () => string;
-    },
+    options: { ready: () => Promise<void>; uuid: () => string },
   ) {
     this.#db = db;
-    this.tenantId = options.tenantId;
     this.#ready = options.ready;
     this.#uuid = options.uuid;
   }
 
   async subscribe(input: SubscribeInput): Promise<StoredSubscription> {
+    const canonical = canonicalSubscriptionInput(input);
     await this.#ready();
-    // A server-minted salted id — a subscription id is tenant-owned like a runId,
-    // so a purge by the tenant range would ALSO reap it (belt to the tenant_id
-    // delete). Kept on re-subscribe (ON CONFLICT DO UPDATE never touches `id`).
-    const id = `${this.tenantId}_${this.#uuid()}`;
-    const subscribedAt = new Date();
+    const id = this.#uuid();
+    assertSubscriptionId(id);
     const row = await this.#db
       .prepare(
         `INSERT INTO ${SIGNAL_SUBSCRIPTIONS_TABLE}
-           (id, tenant_id, provider_id, thread_id, resource_id, external_resource_id, subscribed_at, metadata)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (tenant_id, provider_id, external_resource_id, thread_id)
+           (id, provider_id, thread_id, resource_id, external_resource_id, subscribed_at, metadata)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (provider_id, external_resource_id, thread_id)
          DO UPDATE SET resource_id = excluded.resource_id,
                        metadata = COALESCE(excluded.metadata, metadata)
          RETURNING *`,
       )
       .bind(
         id,
-        this.tenantId,
-        input.providerId,
-        input.threadId,
-        input.resourceId,
-        input.externalResourceId,
-        isoOrNull(subscribedAt),
-        // OMITTED metadata binds NULL, so the COALESCE above PRESERVES the
-        // existing value on a re-subscribe (an idempotent retry never wipes it);
-        // an explicit `{}` binds '{}' and REPLACES (clears) it.
-        jsonOrNull(input.metadata),
+        canonical.providerId,
+        canonical.threadId,
+        canonical.resourceId,
+        canonical.externalResourceId,
+        isoOrNull(new Date()),
+        canonical.metadataJson,
       )
       .first<SubscriptionRow>();
-    if (row === null) {
-      throw new Error('subscribe: upsert returned no row');
-    }
+    if (row === null) throw new Error('subscribe: upsert returned no row');
     return rowToSubscription(row);
   }
 
@@ -234,191 +299,158 @@ class D1TenantBoundSubscriptionStore implements TenantBoundSubscriptionStore {
     externalResourceId: string,
     threadId: string,
   ): Promise<boolean> {
+    assertProviderId(providerId, 'unsubscribe');
+    assertExternalResourceId(externalResourceId, 'unsubscribe');
+    assertThreadId(threadId, 'unsubscribe');
     await this.#ready();
     const result = await this.#db
       .prepare(
         `DELETE FROM ${SIGNAL_SUBSCRIPTIONS_TABLE}
-         WHERE tenant_id = ? AND provider_id = ? AND external_resource_id = ? AND thread_id = ?`,
+         WHERE provider_id = ? AND external_resource_id = ? AND thread_id = ?`,
       )
-      .bind(this.tenantId, providerId, externalResourceId, threadId)
+      .bind(providerId, externalResourceId, threadId)
       .run();
     return d1Changes(result) > 0;
   }
 
   async listForThread(threadId: string): Promise<StoredSubscription[]> {
+    assertThreadId(threadId, 'listForThread');
     await this.#ready();
     const { results } = await this.#db
       .prepare(
         `SELECT * FROM ${SIGNAL_SUBSCRIPTIONS_TABLE}
-         WHERE tenant_id = ? AND thread_id = ? ORDER BY subscribed_at`,
+         WHERE thread_id = ? ORDER BY subscribed_at`,
       )
-      .bind(this.tenantId, threadId)
+      .bind(threadId)
       .all<SubscriptionRow>();
     return results.map(rowToSubscription);
   }
 
   async listForProvider(providerId: string): Promise<StoredSubscription[]> {
+    assertProviderId(providerId, 'listForProvider');
     await this.#ready();
     const { results } = await this.#db
       .prepare(
         `SELECT * FROM ${SIGNAL_SUBSCRIPTIONS_TABLE}
-         WHERE tenant_id = ? AND provider_id = ? ORDER BY subscribed_at`,
+         WHERE provider_id = ? ORDER BY subscribed_at`,
       )
-      .bind(this.tenantId, providerId)
+      .bind(providerId)
+      .all<SubscriptionRow>();
+    return results.map(rowToSubscription);
+  }
+
+  async listByResource(
+    providerId: string,
+    externalResourceId: string,
+  ): Promise<StoredSubscription[]> {
+    assertProviderId(providerId, 'listByResource');
+    assertExternalResourceId(externalResourceId, 'listByResource');
+    await this.#ready();
+    const { results } = await this.#db
+      .prepare(
+        `SELECT * FROM ${SIGNAL_SUBSCRIPTIONS_TABLE}
+         WHERE provider_id = ? AND external_resource_id = ? ORDER BY subscribed_at`,
+      )
+      .bind(providerId, externalResourceId)
       .all<SubscriptionRow>();
     return results.map(rowToSubscription);
   }
 }
 
 export class D1SubscriptionStoreFactory implements SubscriptionStoreFactory {
-  readonly #db: SignalDatabase;
-  readonly #uuid: () => string;
+  readonly #store: SubscriptionStore;
   #schemaReady?: Promise<void>;
 
   constructor(db: SignalDatabase, options: { uuid?: () => string } = {}) {
-    this.#db = db;
-    this.#uuid = options.uuid ?? (() => crypto.randomUUID());
-  }
-
-  // One memoized DDL pass per factory; a failed attempt clears the memo so the
-  // next call retries rather than pinning everything to a dead promise.
-  #ready = (): Promise<void> => {
-    this.#schemaReady ??= createSubscriptionSchema(this.#db).catch(
-      (error: unknown) => {
-        this.#schemaReady = undefined;
-        throw error;
-      },
-    );
-    return this.#schemaReady;
-  };
-
-  forTenant(tenantId: string): TenantBoundSubscriptionStore {
-    assertTenantId(tenantId);
-    return new D1TenantBoundSubscriptionStore(this.#db, {
-      tenantId,
-      ready: this.#ready,
-      uuid: this.#uuid,
+    const ready = (): Promise<void> => {
+      this.#schemaReady ??= createSubscriptionSchema(db).catch(
+        (error: unknown) => {
+          this.#schemaReady = undefined;
+          throw error;
+        },
+      );
+      return this.#schemaReady;
+    };
+    this.#store = new D1SubscriptionStore(db, {
+      ready,
+      uuid: options.uuid ?? (() => crypto.randomUUID()),
     });
   }
 
-  system(): SystemSubscriptionStore {
-    const db = this.#db;
-    const ready = this.#ready;
-    return {
-      async listByResource(
-        providerId: string,
-        externalResourceId: string,
-      ): Promise<StoredSubscription[]> {
-        await ready();
-        const { results } = await db
-          .prepare(
-            `SELECT * FROM ${SIGNAL_SUBSCRIPTIONS_TABLE}
-             WHERE provider_id = ? AND external_resource_id = ?`,
-          )
-          .bind(providerId, externalResourceId)
-          .all<SubscriptionRow>();
-        return results.map(rowToSubscription);
-      },
-    };
+  store(): SubscriptionStore {
+    return this.#store;
   }
 }
 
-// --- In-memory (dev/test parity) -----------------------------------------
-
-/**
- * In-memory factory over ONE shared Map — the mirror of `D1SubscriptionStoreFactory`
- * for hosts/tests with no D1. Not decoration: two `forTenant` views share the
- * backend, so a cross-tenant test is non-vacuous (the InMemoryApprovalStoreFactory
- * rationale). `purgeTenant` mirrors the D1 offboarding delete for in-memory hosts.
- */
 export class InMemorySubscriptionStoreFactory
   implements SubscriptionStoreFactory
 {
   readonly #rows = new Map<string, StoredSubscription>();
-  readonly #uuid: () => string;
+  readonly #store: SubscriptionStore;
 
   constructor(options: { uuid?: () => string } = {}) {
-    this.#uuid = options.uuid ?? (() => crypto.randomUUID());
-  }
-
-  #keyOf(sub: {
-    tenantId: string;
-    providerId: string;
-    externalResourceId: string;
-    threadId: string;
-  }): string {
-    return `${sub.tenantId} ${sub.providerId} ${sub.externalResourceId} ${sub.threadId}`;
-  }
-
-  forTenant(tenantId: string): TenantBoundSubscriptionStore {
-    assertTenantId(tenantId);
     const rows = this.#rows;
-    const keyOf = this.#keyOf.bind(this);
-    const uuid = this.#uuid;
-    return {
-      [SUBSCRIPTION_TENANT_BOUND]: true,
-      tenantId,
-      async subscribe(input: SubscribeInput): Promise<StoredSubscription> {
-        const key = keyOf({ tenantId, ...input });
+    const uuid = options.uuid ?? (() => crypto.randomUUID());
+    const keyOf = (sub: {
+      providerId: string;
+      externalResourceId: string;
+      threadId: string;
+    }): string =>
+      `${sub.providerId}\0${sub.externalResourceId}\0${sub.threadId}`;
+    this.#store = {
+      async subscribe(input) {
+        const canonical = canonicalSubscriptionInput(input);
+        const key = keyOf(canonical);
         const existing = rows.get(key);
-        const sub: StoredSubscription = {
-          id: existing?.id ?? `${tenantId}_${uuid()}`,
-          providerId: input.providerId,
-          threadId: input.threadId,
-          resourceId: input.resourceId,
-          externalResourceId: input.externalResourceId,
+        const id = existing?.id ?? uuid();
+        assertSubscriptionId(id);
+        const subscription: StoredSubscription = {
+          id,
+          providerId: canonical.providerId,
+          threadId: canonical.threadId,
+          resourceId: canonical.resourceId,
+          externalResourceId: canonical.externalResourceId,
           subscribedAt: existing?.subscribedAt ?? new Date(),
-          // Omitted metadata PRESERVES the existing value (mirrors the D1
-          // COALESCE); an explicit `{}` replaces it.
-          metadata: input.metadata ?? existing?.metadata ?? {},
-          tenantId,
+          metadata: structuredClone(
+            canonical.metadata ?? existing?.metadata ?? {},
+          ),
         };
-        rows.set(key, sub);
-        return structuredClone(sub);
+        rows.set(key, subscription);
+        return structuredClone(subscription);
       },
       async unsubscribe(providerId, externalResourceId, threadId) {
-        return rows.delete(
-          keyOf({ tenantId, providerId, externalResourceId, threadId }),
-        );
+        assertProviderId(providerId, 'unsubscribe');
+        assertExternalResourceId(externalResourceId, 'unsubscribe');
+        assertThreadId(threadId, 'unsubscribe');
+        return rows.delete(keyOf({ providerId, externalResourceId, threadId }));
       },
       async listForThread(threadId) {
+        assertThreadId(threadId, 'listForThread');
         return [...rows.values()]
-          .filter((s) => s.tenantId === tenantId && s.threadId === threadId)
-          .map((s) => structuredClone(s));
+          .filter((subscription) => subscription.threadId === threadId)
+          .map((subscription) => structuredClone(subscription));
       },
       async listForProvider(providerId) {
+        assertProviderId(providerId, 'listForProvider');
         return [...rows.values()]
-          .filter((s) => s.tenantId === tenantId && s.providerId === providerId)
-          .map((s) => structuredClone(s));
+          .filter((subscription) => subscription.providerId === providerId)
+          .map((subscription) => structuredClone(subscription));
       },
-    };
-  }
-
-  system(): SystemSubscriptionStore {
-    const rows = this.#rows;
-    return {
       async listByResource(providerId, externalResourceId) {
+        assertProviderId(providerId, 'listByResource');
+        assertExternalResourceId(externalResourceId, 'listByResource');
         return [...rows.values()]
           .filter(
-            (s) =>
-              s.providerId === providerId &&
-              s.externalResourceId === externalResourceId,
+            (subscription) =>
+              subscription.providerId === providerId &&
+              subscription.externalResourceId === externalResourceId,
           )
-          .map((s) => structuredClone(s));
+          .map((subscription) => structuredClone(subscription));
       },
     };
   }
 
-  /** Delete every subscription stamped with this tenant; returns the count. */
-  purgeTenant(tenantId: string): number {
-    assertTenantId(tenantId);
-    let purged = 0;
-    for (const [key, sub] of this.#rows) {
-      if (sub.tenantId === tenantId) {
-        this.#rows.delete(key);
-        purged += 1;
-      }
-    }
-    return purged;
+  store(): SubscriptionStore {
+    return this.#store;
   }
 }

@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-// The per-tenant hub topology seam (DL-009, DL-016), mirroring do-run-topology.ts.
+// The deployment hub topology seam (DL-009, DL-016), mirroring do-run-topology.ts.
 //
-// A per-tenant hub Durable Object (HubDurableObject, do-runner/hub-do.ts) fans
-// approval stream events out to that tenant's open dashboard sockets. The Worker
+// A singleton hub Durable Object (HubDurableObject, do-runner/hub-do.ts) fans
+// approval stream events out to the deployment's open dashboard sockets. The Worker
 // reaches it two ways: it POSTs each ApprovalStreamEvent to the hub's
 // `/internal/event` route (publish), and it forwards a verified WebSocket
 // upgrade to the hub's `/subscribe` route (forwardSubscribe). Both address the
-// hub by idFromName(tenantId), so the DO's id.name IS the bare tenant and the
-// fan-out is tenant-disjoint by construction.
+// hub by idFromName(HUB_INSTANCE_NAME), so only one sanctioned hub exists per
+// physically isolated deployment.
 //
 // The namespace/stub types are STRUCTURAL subsets (method syntax, so a real
 // DurableObjectNamespace satisfies them under TS method-parameter bivariance),
@@ -16,6 +16,11 @@
 // in-memory HubNamespaceLike behind the same shape.
 
 import type { ApprovalStreamEvent } from '../approval-api/index.js';
+import {
+  deploymentIdentityHeaders,
+  HUB_INSTANCE_NAME,
+  stampDeploymentIdentityRequest,
+} from '../do-runner/index.js';
 
 /**
  * The subset of a DurableObjectStub the hub topology uses. The raw-`Request`
@@ -42,35 +47,41 @@ export interface HubNamespaceLike<Id = unknown> {
 
 export interface HubTopology {
   /**
-   * Forward one approval stream event to its tenant's hub, POSTing it to the
-   * hub's `/internal/event` route. Routed by `event.record.tenantId`, which the
-   * hub re-asserts against its own id.name (defense in depth).
+   * Forward one approval stream event to the deployment hub, POSTing it to the
+   * hub's `/internal/event` route.
    */
   publish(event: ApprovalStreamEvent): Promise<void>;
   /**
-   * Forward an already-verified WebSocket upgrade Request to a tenant's hub. The
+   * Forward an already-verified WebSocket upgrade Request to the deployment hub. The
    * caller (stream-router.ts) has rewritten it to `/subscribe` with the ticket's
-   * actorId/role as query params; this only routes it to idFromName(tenantId).
+   * actorId/role as query params.
    */
-  forwardSubscribe(tenantId: string, request: Request): Promise<Response>;
+  forwardSubscribe(request: Request): Promise<Response>;
 }
 
 export function createHubTopology<Id>(
   namespace: HubNamespaceLike<Id>,
+  deploymentIdentitySecret: string,
 ): HubTopology {
-  // One DO per tenant: id.name === tenantId, so the hub owns exactly one
-  // tenant's feed with no per-run isolation code (DL-009).
-  const stub = (tenantId: string): HubStubLike =>
-    namespace.get(namespace.idFromName(tenantId));
+  const stub = (): HubStubLike =>
+    namespace.get(namespace.idFromName(HUB_INSTANCE_NAME));
 
   return {
     publish: async (event) => {
-      await stub(event.record.tenantId).fetch('http://hub/internal/event', {
+      const response = await stub().fetch('http://hub/internal/event', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: deploymentIdentityHeaders(deploymentIdentitySecret, {
+          'content-type': 'application/json',
+        }),
         body: JSON.stringify(event),
       });
+      if (!response.ok) {
+        throw new Error(`hub publish failed with status ${response.status}`);
+      }
     },
-    forwardSubscribe: (tenantId, request) => stub(tenantId).fetch(request),
+    forwardSubscribe: (request) =>
+      stub().fetch(
+        stampDeploymentIdentityRequest(request, deploymentIdentitySecret),
+      ),
   };
 }

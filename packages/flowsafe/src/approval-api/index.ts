@@ -8,6 +8,18 @@
 // in-memory store for tests/dev).
 
 export type {
+  ActorContext,
+  ActorResolver,
+  CreateActorResolverOptions,
+  CreatePrincipalActorContextOptions,
+} from './actor-context.js';
+export {
+  ActorResolutionError,
+  createActorResolver,
+  createPrincipalActorContext,
+  withRegisteredResourceOwner,
+} from './actor-context.js';
+export type {
   ApprovalActor,
   ApprovalAuditEvent,
   ApprovalAuditSink,
@@ -27,16 +39,14 @@ export {
   DECIDER_ROLES,
   RUN_START_ROLES,
 } from './contract.js';
-// D1ApprovalStore itself is deliberately NOT exported: hosts obtain bound
-// stores through D1ApprovalStoreFactory.forTenant() (INV-2) — a directly
-// constructable store is a bindable-to-nothing footgun.
+// D1ApprovalStore itself is deliberately not exported: hosts obtain the
+// deployment store through D1ApprovalStoreFactory.
 export type {
   ApprovalDatabase,
   ApprovalPreparedStatement,
 } from './d1-store.js';
 export {
   approvalGrantProvider,
-  approvalGrantProviderFromFactory,
   connectorGrantsForLeg,
   defaultResumeData,
   resumeViaRuntime,
@@ -51,8 +61,10 @@ export type {
 export {
   AUTOMATED_PRINCIPAL_KINDS,
   AUTOMATED_PROJECTED_ROLE,
+  assertApprovalActor,
   assertExecutionPrincipal,
   breakwaterActorFor,
+  canonicalApprovalActor,
   decodeExecutionPrincipal,
   EXECUTION_PRINCIPAL_KINDS,
   encodeExecutionPrincipal,
@@ -68,6 +80,29 @@ export {
   // reflection from any vouched principal, and the threat model says so.
   trustAutomationPrincipal,
 } from './principal.js';
+export type {
+  RecoverableResourceOwnershipStore,
+  ResourceAccess,
+  ResourceClaim,
+  ResourceKind,
+  ResourceOwner,
+  ResourceOwnershipDatabase,
+  ResourceOwnershipStatement,
+  ResourceOwnershipStore,
+} from './resource-ownership.js';
+export {
+  canonicalResourceOwner,
+  createResourceOwnershipSchema,
+  D1ResourceOwnershipStore,
+  InMemoryResourceOwnershipStore,
+  principalMayAccess,
+  principalOwner,
+  RESOURCE_KINDS,
+  RESOURCE_OWNERSHIP_TABLE,
+  ResourceOwnershipError,
+  requireCommonResourceOwner,
+  requireResourceOwner,
+} from './resource-ownership.js';
 export type { PurgeExpiredApprovalsOptions } from './retention.js';
 export { purgeExpiredApprovals } from './retention.js';
 export type { ApprovalRouter, ApprovalRouterOptions } from './router.js';
@@ -92,25 +127,11 @@ export {
 } from './service.js';
 export type { ApprovalPatch, ApprovalStore, CreateResult } from './store.js';
 export { InMemoryApprovalStore, stepKeyOf } from './store.js';
-export type {
-  SystemApprovalStore,
-  TenantBoundApprovalStore,
-} from './tenant-brand.js';
-export { TENANT_BOUND } from './tenant-brand.js';
-export type {
-  CreateTenantResolverOptions,
-  TenantContext,
-  TenantResolver,
-} from './tenant-context.js';
-export {
-  createTenantResolver,
-  TenantResolutionError,
-} from './tenant-context.js';
-export type { ApprovalStoreFactory } from './tenant-store.js';
+export type { ApprovalStoreFactory } from './store-factory.js';
 export {
   D1ApprovalStoreFactory,
   InMemoryApprovalStoreFactory,
-} from './tenant-store.js';
+} from './store-factory.js';
 export type {
   ApprovalCursor,
   ApprovalDecision,

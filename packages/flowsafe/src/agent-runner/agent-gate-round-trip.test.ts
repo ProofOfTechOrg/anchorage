@@ -45,9 +45,8 @@ const SYSTEM = 'sys';
 const REVIEWER: ApprovalActor = {
   id: 'rev',
   role: 'reviewer',
-  tenantId: 'acme',
 };
-const STARTER = 'starter'; // the human who advanced the run (requestedBy)
+const STARTER = 'starter'; // the principal that advanced the run
 
 const CONNECTOR_ID = 'blog-publisher';
 const MODEL_USAGE = {
@@ -124,7 +123,7 @@ function buildHarness(
   } = {},
 ) {
   const storage = new InMemoryStore();
-  const store = new InMemoryApprovalStore('acme');
+  const store = new InMemoryApprovalStore();
   const connectorAudit = new AuditLogger();
   let publishes = 0;
 
@@ -149,7 +148,7 @@ function buildHarness(
 
   // Build a runtime over the SHARED storage + approval store + connector. Called
   // once below; the eviction test calls it AGAIN to model a fresh post-eviction
-  // isolate (empty in-process resume ledger, gone Mastra/registry) reattaching to
+  // isolate (gone Mastra/registry) reattaching to
   // the SAME durable snapshot already persisted in `storage`.
   const makeRuntime = () => {
     // The trusted-provider seam: grants from the approval store, plus — when
@@ -440,7 +439,7 @@ describe('agent gate grant round-trip (R-003, both shapes)', () => {
   });
 
   it('self-decision is denied at the bridge (SoD): the requester cannot approve their own gate', async () => {
-    // #given — the human who advanced the run is a reviewer
+    // #given — the approval requester is also the would-be decider
     const h = buildHarness();
     const started = await h.runtime.start('agent-launch', {
       runId: 'acme_run3',
@@ -500,7 +499,7 @@ describe('agent gate grant round-trip (R-003, both shapes)', () => {
     // runtime1 (its (suspendedAt, resumeCount) fingerprint + snapshot persisted
     // to the SHARED durable storage), then the isolate is REPLACED: `evicted` is
     // a fresh RunnerRuntime over the SAME storage + approval store, with an empty
-    // in-process resume ledger and no in-process run registry — exactly what a
+    // no in-process run registry — exactly what a
     // reattaching DO sees after eviction (runtime.resume's "designed
     // fresh-process pattern"). The grant is RE-DERIVED from durable state (the
     // snapshot's suspendedAt read by suspendedAtOf + the APPROVED store record),
@@ -555,7 +554,7 @@ describe('agent gate grant round-trip (R-003, both shapes)', () => {
   it('eviction reconstruction resolves and executes the approved connector from the rehydrated durable-agent registry', async () => {
     globalRunRegistry.clear();
     const storage = new InMemoryStore();
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const connectorAudit = new AuditLogger();
     const makeRuntime = () =>
       init({ storage }, { requestContextForRun: approvalGrantProvider(store) })
@@ -604,11 +603,16 @@ describe('agent gate grant round-trip (R-003, both shapes)', () => {
       maxSteps: 1,
     });
     const runId = 'acme_evict_registry';
-    await beforeEviction.streamUntilPersisted('publish', {
-      runId,
-      requestContext: new RequestContext(),
-      maxSteps: 1,
-    });
+    await beforeEviction.streamUntilPersisted(
+      'publish',
+      {
+        runId,
+        requestContext: new RequestContext(),
+        maxSteps: 1,
+      },
+      'operator-1',
+      'human',
+    );
     const started = await runtime.status(
       DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
       runId,
@@ -643,6 +647,7 @@ describe('agent gate grant round-trip (R-003, both shapes)', () => {
       resumeRun: (record, decision) =>
         reconstructed.resumeViaRuntime({
           runId: record.runId,
+          requestedBy: record.decidedBy ?? 'reviewer-1',
           step: record.stepPath,
           resumeData: defaultResumeData(record, decision),
         }),

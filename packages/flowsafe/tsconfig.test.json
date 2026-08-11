@@ -27,6 +27,7 @@
   "include": [
     "src",
     "examples",
+    "test-support/r2-type-compatibility.ts",
     "deploy/worker.ts",
     "deploy/worker.e2e.test.ts"
   ],
@@ -40,6 +41,7 @@
     "src/approval-ui/filter-bar.test.ts",
     // Imports react-dom/client, which needs DOM types this workers-typed
     // program lacks; the approval-ui UI test pass typechecks it instead.
-    "src/approval-ui/use-approval-dashboard.render.test.ts"
+    "src/approval-ui/use-approval-dashboard.render.test.ts",
+    "src/**/*.workerd.test.ts"
   ]
 }

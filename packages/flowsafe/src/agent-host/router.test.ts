@@ -2,15 +2,15 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import type {
+  ActorContext,
   ApprovalActor,
   ApprovalRole,
-  TenantContext,
 } from '../approval-api/index.js';
 import {
-  createTenantResolver,
+  ActorResolutionError,
+  createActorResolver,
   humanPrincipal,
   InMemoryApprovalStoreFactory,
-  TenantResolutionError,
 } from '../approval-api/index.js';
 import { RunRouteError } from '../host-kit/index.js';
 import { createAgentRouter } from './router.js';
@@ -26,20 +26,26 @@ const agents = [
   },
 ];
 
-function tenant(role: ApprovalRole = 'operator'): TenantContext {
-  const actor: ApprovalActor = { id: `${role}-1`, role, tenantId: 'acme' };
+function context(role: ApprovalRole = 'operator'): ActorContext {
+  const actor: ApprovalActor = { id: `${role}-1`, role };
+  const principal = humanPrincipal(actor);
   return {
     actor,
-    principal: humanPrincipal(actor),
-    tenantId: actor.tenantId,
+    principal,
+    resourceOwner: { kind: principal.kind, id: principal.id },
     service: () => {
       throw new Error('unused');
     },
     newRunId: () => 'acme_run',
-    ownsRun: (id) => id.startsWith('acme_'),
     newThreadId: () => 'acme_thread',
-    newResourceId: () => 'acme_resource',
-    ownsMemoryId: (id) => id.startsWith('acme_'),
+    resourceIdFromKey: () => 'acme_resource',
+    claimResource: async () => undefined,
+    releaseResource: async () => undefined,
+    resourceOwnerFor: async () => undefined,
+    canAccessResource: async (kind, id) =>
+      (kind === 'thread' && id === 'acme_thread') ||
+      (kind === 'run' && id === 'acme_run') ||
+      kind === 'resource',
     canSelfDecide: (candidate) => candidate === 'admin',
   };
 }
@@ -79,7 +85,7 @@ describe('createAgentRouter', () => {
     const host = topology();
     const router = createAgentRouter({
       agents,
-      resolve: async () => tenant('viewer'),
+      resolve: async () => context('viewer'),
       topology: host,
     });
     const response = await router(new Request('https://host/agents'));
@@ -89,7 +95,6 @@ describe('createAgentRouter', () => {
       actor: {
         id: 'viewer-1',
         role: 'viewer',
-        tenantId: 'acme',
         canSelfDecide: false,
       },
     });
@@ -99,7 +104,7 @@ describe('createAgentRouter', () => {
     const host = topology();
     const router = createAgentRouter({
       agents,
-      resolve: async () => tenant('reviewer'),
+      resolve: async () => context('reviewer'),
       topology: host,
     });
     const unknown = await router(
@@ -123,7 +128,7 @@ describe('createAgentRouter', () => {
     const host = topology();
     const router = createAgentRouter({
       agents,
-      resolve: async () => tenant(),
+      resolve: async () => context(),
       topology: host,
     });
     const prompt = '  preserve this whitespace  ';
@@ -134,14 +139,11 @@ describe('createAgentRouter', () => {
       }),
     );
     expect(response?.status).toBe(200);
-    expect(host.start).toHaveBeenCalledWith(
-      expect.objectContaining({ tenantId: 'acme' }),
-      {
-        agentId: 'writer',
-        prompt,
-        entryPath: 'http.start',
-      },
-    );
+    expect(host.start).toHaveBeenCalledWith(expect.objectContaining({}), {
+      agentId: 'writer',
+      prompt,
+      entryPath: 'http.start',
+    });
   });
 
   it.each([
@@ -154,7 +156,7 @@ describe('createAgentRouter', () => {
   ])('rejects invalid start body %#', async (body, status) => {
     const router = createAgentRouter({
       agents,
-      resolve: async () => tenant(),
+      resolve: async () => context(),
       topology: topology(),
     });
     const response = await router(
@@ -178,7 +180,7 @@ describe('createAgentRouter', () => {
     });
     const router = createAgentRouter({
       agents,
-      resolve: async () => tenant(),
+      resolve: async () => context(),
       topology: topology(),
     });
     const response = await router(
@@ -192,11 +194,11 @@ describe('createAgentRouter', () => {
     expect(cancelled).toBe(true);
   });
 
-  it('allows every authenticated role to read same-tenant status and streams', async () => {
+  it('allows every authenticated role to read deployment-local status and streams', async () => {
     const host = topology();
     const router = createAgentRouter({
       agents,
-      resolve: async () => tenant('viewer'),
+      resolve: async () => context('viewer'),
       topology: host,
     });
     const status = await router(
@@ -210,7 +212,7 @@ describe('createAgentRouter', () => {
     );
     expect(stream?.status).toBe(200);
     expect(host.observe).toHaveBeenCalledWith(
-      expect.objectContaining({ tenantId: 'acme' }),
+      expect.objectContaining({}),
       expect.objectContaining({ offset: 7 }),
     );
   });
@@ -223,7 +225,7 @@ describe('createAgentRouter', () => {
   ])('rejects invalid stream offset %s', async (offset) => {
     const router = createAgentRouter({
       agents,
-      resolve: async () => tenant(),
+      resolve: async () => context(),
       topology: topology(),
     });
     const response = await router(
@@ -248,7 +250,7 @@ describe('createAgentRouter', () => {
     host.status.mockImplementation(async () => undefined);
     const router = createAgentRouter({
       agents,
-      resolve: async () => tenant(),
+      resolve: async () => context(),
       topology: host,
     });
 
@@ -269,7 +271,7 @@ describe('createAgentRouter', () => {
     );
     const router = createAgentRouter({
       agents,
-      resolve: async () => tenant(),
+      resolve: async () => context(),
       topology: host,
     });
 
@@ -285,11 +287,11 @@ describe('createAgentRouter', () => {
     });
   });
 
-  it('returns 404 for foreign IDs and any public resume path', async () => {
+  it('404s foreign path-safe IDs and rejects any public resume path', async () => {
     const host = topology();
     const router = createAgentRouter({
       agents,
-      resolve: async () => tenant(),
+      resolve: async () => context(),
       topology: host,
     });
     const foreign = await router(
@@ -306,11 +308,11 @@ describe('createAgentRouter', () => {
     expect(resume?.status).toBe(404);
   });
 
-  it('returns 404 before method errors for foreign and binding-mismatched run IDs', async () => {
+  it('resolves ownership before method and binding errors', async () => {
     const host = topology();
     const router = createAgentRouter({
       agents,
-      resolve: async () => tenant(),
+      resolve: async () => context(),
       topology: host,
     });
     const foreign = await router(
@@ -328,7 +330,7 @@ describe('createAgentRouter', () => {
       }),
     );
     expect(mismatched?.status).toBe(404);
-    expect(host.status).toHaveBeenCalledTimes(1);
+    expect(host.status).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -338,7 +340,7 @@ describe('createAgentRouter', () => {
     const host = topology();
     const router = createAgentRouter({
       agents,
-      resolve: async () => tenant(),
+      resolve: async () => context(),
       topology: host,
     });
 
@@ -352,7 +354,7 @@ describe('createAgentRouter', () => {
   it('returns 405 with Allow for a known route and null outside its prefix', async () => {
     const router = createAgentRouter({
       agents,
-      resolve: async () => tenant(),
+      resolve: async () => context(),
       topology: topology(),
     });
     const response = await router(
@@ -369,7 +371,7 @@ describe('createAgentRouter', () => {
     const malformed = createAgentRouter({
       agents,
       resolve: async () => {
-        throw new TenantResolutionError('private claim details');
+        throw new ActorResolutionError('private claim details');
       },
       topology: topology(),
     });
@@ -392,12 +394,11 @@ describe('createAgentRouter', () => {
   });
 
   it('returns 403 instead of echoing malformed authenticated actor claims', async () => {
-    const resolve = createTenantResolver({
+    const resolve = createActorResolver({
       authenticate: () =>
         ({
           id: '',
           role: 'root',
-          tenantId: 'acme',
         }) as never,
       storeFactory: new InMemoryApprovalStoreFactory(),
       buildService: () => {

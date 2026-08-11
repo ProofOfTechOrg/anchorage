@@ -7,6 +7,7 @@
 
 import { agentGateGrantRequest } from '../agent-runner/approval-shapes.js';
 import {
+  type ActorContext,
   type ApprovalActor,
   type ApprovalAuditSink,
   type ApprovalDecision,
@@ -19,7 +20,6 @@ import {
   principalActor,
   principalAuditFields,
   stepKeyOf,
-  type TenantContext,
   type TrustedAutomationPrincipal,
   trustAutomationPrincipal,
 } from '../approval-api/index.js';
@@ -97,19 +97,17 @@ const RECONCILE_PURPOSE = 'approval-suspension-reconcile';
 /**
  * The platform's own bookkeeping identity for one service. Minted here rather
  * than taken from the caller: every in-repo user files under a system principal
- * with a fixed purpose and the service's own tenant, so requiring hosts to
- * construct and vouch for one only spread `trustAutomationPrincipal` into host
+ * with a fixed purpose, so requiring hosts to construct and vouch for one only
+ * spread `trustAutomationPrincipal` into host
  * code — and into the sample every consumer copies.
  */
 function bookkeepingPrincipal(
-  service: ApprovalService,
-  systemActorId: string,
+  systemPrincipalId: string,
   purpose: string,
 ): TrustedAutomationPrincipal {
   return trustAutomationPrincipal({
     kind: 'system',
-    id: systemActorId,
-    tenantId: service.tenantId,
+    id: systemPrincipalId,
     purpose,
   });
 }
@@ -126,13 +124,13 @@ function bookkeepingPrincipal(
  * THAT suspension exactly (clock-free grant minting), and each suspend
  * payload's `connectors` declares what a decision should mint.
  *
- * `requestedBy` is the HUMAN who advanced the run to this suspension — the actor
- * who started it, or the reviewer whose decision caused a re-suspension at the
- * next gate. It must NOT be the system actor: the library's self-decision
- * separation-of-duties check compares `requestedBy` to the deciding actor, so
- * attributing every request to the system actor would make that check unfireable.
- * `systemActorId` names only the record's creator. The bridge mints its own
- * automated principal from it against the service's tenant binding, so a host
+ * `requestedBy` is the principal who advanced the run to this suspension — the
+ * initiating human or automation, or the reviewer whose decision caused a
+ * re-suspension at the next gate. It must not be invented by reconciliation:
+ * the library's self-decision separation-of-duties check compares it to the
+ * deciding actor.
+ * `systemPrincipalId` names only the record's creator. The bridge mints its own
+ * automated principal from it, so a host
  * never performs the trust assertion for the platform's own bookkeeping.
  */
 export async function queueApprovalForSuspension(
@@ -140,12 +138,11 @@ export async function queueApprovalForSuspension(
   workflowId: string,
   summary: RunSummary,
   requestedBy: string,
-  systemActorId: string,
+  systemPrincipalId: string,
   resumeTarget?: ApprovalResumeTarget,
 ): Promise<ApprovalRecord[]> {
   const systemPrincipal = bookkeepingPrincipal(
-    service,
-    systemActorId,
+    systemPrincipalId,
     RECONCILE_PURPOSE,
   );
   const suspended = summary.suspended ?? [];
@@ -174,6 +171,10 @@ export async function queueApprovalForSuspension(
           connectors: connectors.length > 0 ? connectors : undefined,
           toolCallId: grantIdentity.toolCallId,
           requestedBy,
+          requestedByKind:
+            summary.requestedBy === requestedBy
+              ? (summary.requestedByKind ?? 'human')
+              : 'human',
         },
         systemPrincipal,
         resumeTarget,
@@ -230,7 +231,7 @@ export async function queueApprovalForSuspension(
 export function resumeRunWithRequeue(
   base: ResumeRunFn,
   getService: () => ApprovalService,
-  systemActorId: string,
+  systemPrincipalId: string,
   audit?: ApprovalAuditSink,
 ): ResumeRunFn {
   return async (record, decision) => {
@@ -241,30 +242,23 @@ export function resumeRunWithRequeue(
           'resumeRunWithRequeue: decidedBy unset — refusing to re-queue an approval without a requester',
         );
       }
-      const requestedBy =
-        record.resumeTarget?.kind === 'agent-thread'
-          ? record.resumeTarget.principal.id
-          : record.decidedBy;
+      const requestedBy = summary.requestedBy ?? record.decidedBy;
       // Declared out here, minted INSIDE the try. Vouching validates and can
       // throw on the same inputs the re-queue throws on (a blank or over-long
-      // systemActorId, an empty service tenant), so minting outside any handler
+      // systemPrincipalId), so minting outside any handler
       // would lose the audit event entirely for exactly that class — the event
       // is the only signal that names the suspended step paths. Minting inside
       // and reporting with whatever identity we managed to derive keeps the
       // event unconditional, which is what it was before principals existed.
       let principal: TrustedAutomationPrincipal | undefined;
       try {
-        principal = bookkeepingPrincipal(
-          getService(),
-          systemActorId,
-          RECONCILE_PURPOSE,
-        );
+        principal = bookkeepingPrincipal(systemPrincipalId, RECONCILE_PURPOSE);
         await queueApprovalForSuspension(
           getService(),
           record.workflowId,
           summary,
           requestedBy,
-          systemActorId,
+          systemPrincipalId,
           record.resumeTarget,
         );
       } catch (error) {
@@ -286,7 +280,6 @@ export function resumeRunWithRequeue(
             decision: 'error',
             reason: error instanceof Error ? error.message : String(error),
             detail: {
-              tenantId: record.tenantId,
               workflowId: record.workflowId,
               runId: record.runId,
               suspended: summary.suspended,
@@ -373,27 +366,31 @@ async function listAllApprovals(
  *
  * Delegates the actual filing to queueApprovalForSuspension against a copy of
  * `summary` narrowed to only the healed paths, so a step with a live or
- * in-flight record is never touched. `requestedBy` defaults to the SYSTEM
- * principal because generic workflow reconciliation cannot reliably recover the
- * initiating principal. Agent hosts persist the original requester and pass
- * that id explicitly so separation of duties survives eviction and filing
- * retries.
+ * in-flight record is never touched. Generic runner summaries carry durable
+ * execution provenance. A suspended summary without it cannot be filed: using
+ * the system principal as a fallback would erase an unknown human initiator and
+ * weaken separation of duties. Agent hosts may pass an explicit trusted value.
  */
 export async function reconcileApprovalsForSummary(
   service: ApprovalService,
   workflowId: string,
   summary: RunSummary,
-  systemActorId: string,
+  systemPrincipalId: string,
   resumeTarget?: ApprovalResumeTarget,
-  requestedBy = systemActorId,
+  requestedBy?: string,
 ): Promise<ApprovalRecord[]> {
   const systemPrincipal = bookkeepingPrincipal(
-    service,
-    systemActorId,
+    systemPrincipalId,
     RECONCILE_PURPOSE,
   );
   const suspended = summary.suspended ?? [];
   if (suspended.length === 0) return [];
+  const requester = requestedBy ?? summary.requestedBy;
+  if (!requester) {
+    throw new Error(
+      'reconcileApprovalsForSummary: suspended run has no durable requester provenance',
+    );
+  }
   const existing = await listAllApprovals(
     service,
     { workflowId, runId: summary.runId },
@@ -435,32 +432,30 @@ export async function reconcileApprovalsForSummary(
     service,
     workflowId,
     { ...summary, suspended: toFile },
-    requestedBy,
-    systemActorId,
+    requester,
+    systemPrincipalId,
     resumeTarget,
   );
 }
 
 /**
  * Adapts reconcileApprovalsForSummary to RunRouterOptions.reconcileApprovals's
- * per-request shape: `tenant.service()`/`tenant.tenantId` only exist once a
- * request resolves, so only the systemActorId (a per-deployment constant) can
- * be bound ahead of time — everything else is read from the tenant the router
- * hands in on each call.
+ * per-request shape: `context.service()` only exists once a request resolves,
+ * so only the systemPrincipalId can be bound ahead of time.
  */
 export function reconcileApprovalsOnStatus(
-  systemActorId: string,
+  systemPrincipalId: string,
 ): (
-  tenant: TenantContext,
+  context: ActorContext,
   workflowId: string,
   summary: RunSummary,
 ) => Promise<void> {
-  return async (tenant, workflowId, summary) => {
+  return async (context, workflowId, summary) => {
     await reconcileApprovalsForSummary(
-      tenant.service(),
+      context.service(),
       workflowId,
       summary,
-      systemActorId,
+      systemPrincipalId,
     );
   };
 }

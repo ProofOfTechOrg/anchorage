@@ -77,12 +77,10 @@ function mockAgent(runtimeDriven = true): {
 function scopeWith(pubsub: unknown): ThreadScope {
   return {
     threadId: 'acme_t1',
-    tenantId: 'acme',
-    actor: { id: 'operator', role: 'operator', tenantId: 'acme' },
+    actor: { id: 'operator', role: 'operator' },
     principal: {
       kind: 'human',
       id: 'operator',
-      tenantId: 'acme',
       role: 'operator',
     },
     requestedBy: 'operator',
@@ -96,6 +94,17 @@ function post(path: string, body: unknown): Request {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   });
+}
+
+function scheduleTarget(overrides: Record<string, unknown> = {}) {
+  return {
+    type: 'agent' as const,
+    agentId: 'agent',
+    prompt: 'scheduled instruction',
+    threadId: 'acme_t1',
+    resourceId: 'acme_t1',
+    ...overrides,
+  };
 }
 
 function deferred<T>() {
@@ -136,6 +145,267 @@ describe('createThreadSignalRoutes', () => {
       capped: false,
       signalId: 's',
     });
+  });
+
+  it('retries a schedule signal with one stable id after an ambiguous target crash', async () => {
+    const { agent } = mockAgent();
+    const sendSignal = vi.fn((signal: { id: string }) => ({
+      signal,
+      accepted: Promise.resolve({ action: 'deliver' as const, runId: 'run-1' }),
+    }));
+    (agent as unknown as { sendSignal: typeof sendSignal }).sendSignal =
+      sendSignal;
+    let failFirstReceipt = true;
+    const store = {
+      begin: vi.fn(async () => ({ state: 'ready' as const })),
+      settle: vi.fn(async () => {
+        if (failFirstReceipt) {
+          failFirstReceipt = false;
+          throw new Error('isolate lost before receipt persistence');
+        }
+      }),
+    };
+    const options = {
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_t1',
+      resolveScheduleTarget: async () =>
+        scheduleTarget({ ifIdle: { behavior: 'discard' } }),
+      resolveScheduleDispatchStore: () => store,
+    };
+    const body = {
+      scheduleId: 'schedule_1',
+      agentId: 'agent',
+      prompt: 'scheduled instruction',
+      threadId: 'acme_t1',
+      resourceId: 'acme_t1',
+      dispatchId: 'dispatch_1',
+      runId: 'run_1',
+      ifIdle: { behavior: 'discard' },
+    };
+
+    const firstIsolate = createThreadSignalRoutes(options);
+    const first = await firstIsolate(
+      post('/signal/schedule', body),
+      scopeWith(undefined),
+    );
+    expect(first?.status).toBe(502);
+
+    const replacementIsolate = createThreadSignalRoutes(options);
+    const second = await replacementIsolate(
+      post('/signal/schedule', body),
+      scopeWith(undefined),
+    );
+    expect(second?.status).toBe(200);
+    expect(sendSignal).toHaveBeenCalledTimes(2);
+    expect(sendSignal.mock.calls.map(([signal]) => signal.id)).toEqual([
+      'dispatch_1',
+      'dispatch_1',
+    ]);
+  });
+
+  it('executes the trigger-bound stored target instead of altered body payload', async () => {
+    const { agent } = mockAgent();
+    const sendSignal = vi.fn((signal: { id: string }) => ({
+      signal,
+      accepted: Promise.resolve({ action: 'discard' as const }),
+    }));
+    (agent as unknown as { sendSignal: typeof sendSignal }).sendSignal =
+      sendSignal;
+    const resolveScheduleTarget = vi.fn(async () =>
+      scheduleTarget({
+        prompt: 'stored prompt',
+        signalType: 'notification',
+        tagName: 'stored-tag',
+        attributes: { source: 'stored' },
+        providerOptions: {
+          mastra: { schedule: { scheduleId: 'schedule_1' } },
+        },
+        ifIdle: { behavior: 'discard' },
+      }),
+    );
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_t1',
+      resolveScheduleTarget,
+      resolveScheduleDispatchStore: () => ({
+        begin: async () => ({ state: 'ready' as const }),
+        settle: async () => undefined,
+      }),
+    });
+
+    const response = await routes(
+      post('/signal/schedule', {
+        scheduleId: 'schedule_1',
+        dispatchId: 'dispatch_1',
+        runId: 'run_1',
+        agentId: 'forged-agent',
+        prompt: 'forged prompt',
+        threadId: 'forged-thread',
+        resourceId: 'forged-resource',
+        tagName: 'forged-tag',
+        ifIdle: { behavior: 'wake' },
+        providerOptions: { forged: true },
+      }),
+      scopeWith(undefined),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(resolveScheduleTarget).toHaveBeenCalledWith(
+      expect.objectContaining({ threadId: 'acme_t1' }),
+      {
+        scheduleId: 'schedule_1',
+        dispatchId: 'dispatch_1',
+        runId: 'run_1',
+      },
+    );
+    expect(sendSignal).toHaveBeenCalledWith(
+      expect.objectContaining({
+        contents: 'stored prompt',
+        tagName: 'stored-tag',
+        attributes: { source: 'stored' },
+        providerOptions: expect.objectContaining({
+          mastra: {
+            schedule: {
+              scheduleId: 'schedule_1',
+              threadId: 'acme_t1',
+            },
+          },
+        }),
+      }),
+      expect.objectContaining({
+        threadId: 'acme_t1',
+        resourceId: 'acme_t1',
+        ifIdle: { behavior: 'discard' },
+      }),
+    );
+  });
+
+  it.each([
+    'suspended',
+    'success',
+  ])('reconstructs a lost schedule-wake receipt from the %s stable run', async (status) => {
+    const { agent, calls } = mockAgent();
+    const settle = vi.fn(async () => undefined);
+    const resolveScheduleRunStatus = vi.fn(async () => ({
+      runId: 'run_1',
+      status,
+    }));
+    const startIdleRun = vi.fn();
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_t1',
+      resolveScheduleTarget: async () => scheduleTarget(),
+      resolveScheduleDispatchStore: () => ({
+        begin: async () => ({ state: 'ready' as const }),
+        settle,
+      }),
+      resolveScheduleRunStatus,
+      startIdleRun,
+    });
+
+    const response = await routes(
+      post('/signal/schedule', {
+        scheduleId: 'schedule_1',
+        agentId: 'agent',
+        prompt: 'scheduled instruction',
+        threadId: 'acme_t1',
+        resourceId: 'acme_t1',
+        dispatchId: 'dispatch_1',
+        runId: 'run_1',
+      }),
+      scopeWith(undefined),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toEqual({
+      receipt: {
+        action: 'wake',
+        outcome: 'succeeded',
+        runId: 'run_1',
+        signalId: 'dispatch_1',
+      },
+    });
+    expect(resolveScheduleRunStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ threadId: 'acme_t1' }),
+      {
+        agentId: 'agent',
+        resourceId: 'acme_t1',
+        runId: 'run_1',
+      },
+    );
+    expect(startIdleRun).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+    expect(settle).toHaveBeenCalledOnce();
+  });
+
+  it('persists a system-fired schedule signal under the verified schedule owner', async () => {
+    const { agent, calls } = mockAgent();
+    const sendSignal = vi.fn(
+      (signal: { id: string }, target: AgentCall['target']) => {
+        calls.push({ method: 'sendSignal', target });
+        return {
+          signal,
+          accepted: Promise.resolve({ action: 'persist' as const }),
+        };
+      },
+    );
+    (agent as unknown as { sendSignal: typeof sendSignal }).sendSignal =
+      sendSignal;
+    const settle = vi.fn(async () => undefined);
+    const canPersistSchedule = vi.fn(async () => true);
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_t1',
+      canPersist: () => false,
+      canPersistSchedule,
+      resolveScheduleTarget: async () =>
+        scheduleTarget({ ifIdle: { behavior: 'persist' } }),
+      resolveScheduleDispatchStore: () => ({
+        begin: async () => ({ state: 'ready' as const }),
+        settle,
+      }),
+    });
+    const scope: ThreadScope = {
+      ...scopeWith(undefined),
+      principal: {
+        kind: 'system',
+        id: 'schedule-tick',
+        purpose: 'schedule-fire',
+      },
+    };
+
+    const response = await routes(
+      post('/signal/schedule', {
+        scheduleId: 'schedule_1',
+        agentId: 'agent',
+        prompt: 'scheduled instruction',
+        threadId: 'acme_t1',
+        resourceId: 'acme_t1',
+        dispatchId: 'dispatch_1',
+        runId: 'run_1',
+        ifIdle: { behavior: 'persist' },
+      }),
+      scope,
+    );
+
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toEqual({
+      receipt: {
+        action: 'persist',
+        outcome: 'persisted',
+        signalId: 'dispatch_1',
+      },
+    });
+    expect(canPersistSchedule).toHaveBeenCalledWith(scope, {
+      scheduleId: 'schedule_1',
+      dispatchId: 'dispatch_1',
+      runId: 'run_1',
+      agentId: 'agent',
+      threadId: 'acme_t1',
+      resourceId: 'acme_t1',
+    });
+    expect(calls[0]?.target.ifIdle).toEqual({ behavior: 'persist' });
+    expect(settle).toHaveBeenCalledOnce();
   });
 
   it('routes each channel to the matching agent method', async () => {
@@ -287,7 +557,7 @@ describe('createThreadSignalRoutes', () => {
     expect(calls[0]?.target.ifIdle).toEqual({ behavior: 'persist' });
   });
 
-  it('starts an idle WAKE through the host seam with a tenant-salted run id', async () => {
+  it('starts an idle WAKE through the host seam with a server-minted run id', async () => {
     // #given — the default mock IS runtime-driven; no run cap wired
     const { agent, calls } = mockAgent();
     const startIdleRun = vi.fn(async ({ runId }: { runId: string }) => ({
@@ -332,7 +602,7 @@ describe('createThreadSignalRoutes', () => {
     expect(body).toMatchObject({
       decision: {
         action: 'wake',
-        runId: expect.stringMatching(/^acme_/),
+        runId: expect.stringMatching(/^[0-9a-f-]{36}$/),
       },
     });
     expect(calls).toHaveLength(0);
@@ -390,7 +660,7 @@ describe('createThreadSignalRoutes', () => {
     expect(calls[0]?.target.runId).toBe(activeRunId);
   });
 
-  it('dispatches a due notification through a salted idle wake and marks it delivered', async () => {
+  it('dispatches a due notification through a server-minted idle wake and marks it delivered', async () => {
     const { agent } = mockAgent();
     const storage = new InMemoryNotificationsStorage();
     const record = await storage.createNotification({
@@ -428,7 +698,7 @@ describe('createThreadSignalRoutes', () => {
 
     expect(await response?.json()).toEqual({ delivered: 1, failed: 0 });
     expect(starts).toHaveLength(1);
-    expect(starts[0]).toMatch(/^acme_/);
+    expect(starts[0]).toMatch(/^[0-9a-f-]{36}$/);
     expect(startedSignalId).toBeTruthy();
     expect(
       await storage.getNotification({ threadId: 'acme_t1', id: record.id }),
@@ -1404,6 +1674,13 @@ describe('createThreadSignalRoutes', () => {
           now: new Date('2026-07-20T12:00:00.000Z'),
         })
       ).map((due) => due.id),
+    ).not.toContain(record.id);
+    expect(
+      (
+        await storage.listDueNotifications({
+          now: new Date('2026-07-20T12:00:01.000Z'),
+        })
+      ).map((due) => due.id),
     ).toContain(record.id);
   });
 
@@ -1482,6 +1759,62 @@ describe('createThreadSignalRoutes', () => {
     });
   });
 
+  it('executes a low summary as automation when it may not persist into the owner thread', async () => {
+    const { agent, calls } = mockAgent();
+    const storage = new InMemoryNotificationsStorage();
+    const record = await storage.createNotification({
+      id: 'low-system-summary',
+      threadId: 'acme_t1',
+      resourceId: 'acme_res',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'digest',
+      summary: 'digest',
+      priority: 'low',
+      summaryAt: new Date(0),
+    });
+    const startIdleRun = vi.fn(async ({ runId }) => ({ runId }));
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+      canPersist: () => false,
+      consultRunCap: () => true,
+      startIdleRun,
+    });
+    const scope: ThreadScope = {
+      ...scopeWith(undefined),
+      principal: {
+        kind: 'system',
+        id: 'notification-scheduler',
+        purpose: 'notification-dispatch',
+      },
+    };
+
+    const response = await routes(
+      post('/signal/notifications/dispatch', {
+        notificationIds: [record.id],
+        resourceId: 'acme_res',
+        agentId: 'agent',
+        now: '2026-07-20T12:00:00.000Z',
+      }),
+      scope,
+    );
+
+    expect(await response?.json()).toEqual({ delivered: 1, failed: 0 });
+    expect(startIdleRun).toHaveBeenCalledWith(
+      expect.objectContaining({
+        principal: scope.principal,
+        entryPath: 'notification.dispatch',
+        signal: expect.objectContaining({
+          type: 'notification',
+          tagName: 'notification-summary',
+        }),
+      }),
+    );
+    expect(calls).toHaveLength(0);
+  });
+
   it('retains wake behavior for a high-priority summary', async () => {
     const { agent } = mockAgent();
     const storage = new InMemoryNotificationsStorage();
@@ -1517,7 +1850,7 @@ describe('createThreadSignalRoutes', () => {
     );
 
     expect(await response?.json()).toEqual({ delivered: 1, failed: 0 });
-    expect(consultRunCap).toHaveBeenCalledWith('acme');
+    expect(consultRunCap).toHaveBeenCalledWith();
     expect(startIdleRun).toHaveBeenCalledTimes(1);
     expect(
       await storage.getNotification({
@@ -1664,6 +1997,26 @@ describe('createThreadSignalRoutes', () => {
       error: 'tagName is not a valid XML name',
     });
     expect(calls).toHaveLength(0);
+  });
+
+  it('rejects a provider delivery whose stored resource does not match the thread binding', async () => {
+    const { agent, calls } = mockAgent();
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+
+    const response = await routes(
+      post('/signal/notification?resourceId=other_res', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'changed',
+      }),
+      scopeWith(undefined),
+    );
+
+    expect(response?.status).toBe(404);
+    expect(calls).toEqual([]);
   });
 
   it('accepts a valid XML-name tagName', async () => {

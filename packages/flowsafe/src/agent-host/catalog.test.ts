@@ -162,7 +162,7 @@ describe('agent automation declaration', () => {
         expect(
           catalog.automationAllowed(
             meta.id,
-            { kind, id: 'robot', tenantId: 'acme', purpose: 'p' },
+            { kind, id: 'robot', purpose: 'p' },
             entryPath,
           ),
         ).toBe(false);
@@ -176,7 +176,6 @@ describe('agent automation declaration', () => {
     const system = {
       kind: 'system' as const,
       id: 'sched',
-      tenantId: 'acme',
       purpose: 'scheduled-agent-execution',
     };
 
@@ -192,7 +191,7 @@ describe('agent automation declaration', () => {
     expect(
       catalog.automationAllowed(
         meta.id,
-        { kind: 'service', id: 'svc', tenantId: 'acme', purpose: 'p' },
+        { kind: 'service', id: 'svc', purpose: 'p' },
         'schedule.fire',
       ),
     ).toBe(false);
@@ -210,7 +209,7 @@ describe('agent automation declaration', () => {
     expect(
       catalog.automationAllowed(
         meta.id,
-        { kind: 'human', id: 'op', tenantId: 'acme', role: 'operator' },
+        { kind: 'human', id: 'op', role: 'operator' },
         'schedule.fire',
       ),
     ).toBe(false);

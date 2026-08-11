@@ -41,6 +41,7 @@ import type {
   RunnerRuntime,
   RunSummary,
 } from '../do-runner/runtime.js';
+import { createActorResolver } from './actor-context.js';
 import type { ApprovalActor, ApprovalAuditSink } from './contract.js';
 import {
   APPROVAL_ROLES,
@@ -60,26 +61,25 @@ import {
   AUTOMATED_PRINCIPAL_KINDS,
   AUTOMATED_PROJECTED_ROLE,
   EXECUTION_PRINCIPAL_KINDS,
+  trustAutomationPrincipal,
 } from './principal.js';
+import { InMemoryResourceOwnershipStore } from './resource-ownership.js';
 import { createApprovalRouter } from './router.js';
-import { ApprovalService } from './service.js';
+import { ApprovalService, type ApprovalServiceOptions } from './service.js';
 import { InMemoryApprovalStore } from './store.js';
-import { createTenantResolver } from './tenant-context.js';
 import type { ConnectorApprovalGrant } from './types.js';
 
 const OPERATOR: ApprovalActor = {
   id: 'opal',
   role: 'operator',
-  tenantId: 'acme',
 };
 const REVIEWER: ApprovalActor = {
   id: 'ray',
   role: 'reviewer',
-  tenantId: 'acme',
 };
 // admin holds BOTH CAN_CREATE and CAN_REVIEW — the single principal the
 // create-route capability chain needed.
-const ADMIN: ApprovalActor = { id: 'ada', role: 'admin', tenantId: 'acme' };
+const ADMIN: ApprovalActor = { id: 'ada', role: 'admin' };
 
 // The bridge's capture: the summary's suspension timestamp for a step.
 // Accepts unknown because ResumeOutcome.summary is untyped wire data; the
@@ -139,7 +139,6 @@ describe('breakwater contract tripwires', () => {
       connectorId: 'send-email',
       workflowId: 'workflow-1',
       runId: 'acme_run-1',
-      isolationScope: 'acme',
       suspension: {
         stepPath: ['agent-gate'],
         suspendedAt: 1_000,
@@ -175,22 +174,13 @@ describe('breakwater contract tripwires', () => {
     expect([...APPROVAL_ROLES]).toEqual([...ROLES]);
   });
 
-  it('mirrors breakwater Actor PLUS the platform tenant dimension', () => {
-    // breakwater stays tenant-agnostic; flowsafe is the multi-tenant host.
-    // The relationship is "breakwater's fields + a REQUIRED tenantId":
-    // ApprovalActor must stay assignable to Actor (audit adapters and the
-    // actor context key depend on the structural widening) while a
-    // tenant-less literal must not compile on flowsafe's side.
+  it('mirrors the tenant-agnostic breakwater Actor shape', () => {
     const flowsafeActor: ApprovalActor = {
       id: 'x',
       role: 'admin',
-      tenantId: 'acme',
     };
     const widened: Actor = flowsafeActor;
     expect(widened).toMatchObject({ id: 'x', role: 'admin' });
-    // @ts-expect-error tenantId is required on ApprovalActor — dropping it must not compile
-    const tenantless: ApprovalActor = { id: 'x', role: 'admin' };
-    void tenantless;
   });
 
   it('mirrors breakwater PrincipalKind by value', () => {
@@ -258,7 +248,7 @@ interface Harness {
 }
 
 function buildHarness(): Harness {
-  const store = new InMemoryApprovalStore('acme');
+  const store = new InMemoryApprovalStore();
   const connectorAudit = new AuditLogger();
   let publishes = 0;
 
@@ -499,23 +489,33 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
 
   function routerOver(
     store: InMemoryApprovalStore,
-    options: { allowCreate?: boolean; actor?: ApprovalActor } = {},
+    options: {
+      allowCreate?: boolean;
+      actor?: ApprovalActor;
+      resumeRun?: ApprovalServiceOptions['resumeRun'];
+    } = {},
   ) {
-    const service = new ApprovalService({ store });
+    const service = new ApprovalService({
+      store,
+      ...(options.resumeRun === undefined
+        ? {}
+        : { resumeRun: options.resumeRun }),
+    });
+    const resources = new InMemoryResourceOwnershipStore();
     const handle = createApprovalRouter({
-      resolve: createTenantResolver({
+      resolve: createActorResolver({
         authenticate: () => options.actor ?? ADMIN,
-        storeFactory: { forTenant: () => store },
+        storeFactory: { store: () => store, resources: () => resources },
         buildService: () => service,
       }),
       allowCreate: options.allowCreate,
     });
-    return { service, handle };
+    return { service, handle, resources };
   }
 
   it('barrier 1: the route is off by default, so nothing is written', async () => {
     // #given
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const { handle } = routerOver(store);
 
     // #when — PoC step 1
@@ -528,7 +528,7 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
 
   it('barrier 1: a deliberately mounted route still rejects every capability-bearing field', async () => {
     // #given — the host opted in to the "file a request" affordance
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const { handle } = routerOver(store, { allowCreate: true });
 
     // #when / #then — connectors and scope select authority; stepPath,
@@ -543,6 +543,7 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
       'resumeCount',
       'runScoped',
       'requestedBy',
+      'requestedByKind',
       'resumeTarget',
     ]) {
       const response = await handle(
@@ -558,11 +559,58 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
     expect(await store.list()).toEqual([]);
   });
 
+  it('barrier 1: foreign and missing run ids cannot file a record or reach the resume target', async () => {
+    // #given — the authenticated operator does not own the named run. resumeRun
+    // is the target-DO seam and would expose any approval that slipped through.
+    const store = new InMemoryApprovalStore();
+    const resumeRun = vi.fn().mockResolvedValue({ status: 'success' });
+    const { handle, resources } = routerOver(store, {
+      allowCreate: true,
+      actor: OPERATOR,
+      resumeRun,
+    });
+    await resources.claim('run', 'acme_run-foreign', {
+      kind: 'human',
+      id: 'other',
+    });
+
+    // #when
+    const foreign = await handle(
+      post({
+        workflowId: 'launch',
+        runId: 'acme_run-foreign',
+        title: 'foreign',
+      }),
+    );
+    const missing = await handle(
+      post({
+        workflowId: 'launch',
+        runId: 'acme_run-missing',
+        title: 'missing',
+      }),
+    );
+
+    // #then — existence is indistinguishable and the write/target seams are
+    // untouched.
+    expect(foreign?.status).toBe(404);
+    expect(missing?.status).toBe(404);
+    expect(await foreign?.json()).toEqual({ error: 'run not found' });
+    expect(await missing?.json()).toEqual({ error: 'run not found' });
+    expect(await store.list()).toEqual([]);
+    expect(resumeRun).not.toHaveBeenCalled();
+  });
+
   it('barrier 2: forced self-attribution makes the filer unable to decide their own request', async () => {
     // #given — the route force-sets requestedBy = the authenticated actor, so
     // the spoof that disarmed separation of duties is gone
-    const store = new InMemoryApprovalStore('acme');
-    const { service, handle } = routerOver(store, { allowCreate: true });
+    const store = new InMemoryApprovalStore();
+    const { service, handle, resources } = routerOver(store, {
+      allowCreate: true,
+    });
+    await resources.claim('run', 'acme_run-poc', {
+      kind: 'human',
+      id: ADMIN.id,
+    });
     const created = await handle(
       post({ workflowId: 'launch', runId: 'acme_run-poc', title: 'inert' }),
     );
@@ -581,11 +629,10 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
     // through the router would assert an empty union against an empty list and
     // pass even with the runScoped gate reverted). This is the exact record
     // shape the PoC produced: approved, step-less, capability-bearing.
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const decidedAt = new Date().toISOString();
     await store.create({
       id: crypto.randomUUID(),
-      tenantId: 'acme',
       workflowId: 'launch',
       runId: 'acme_run-poc',
       title: 'standing grant by omission',
@@ -614,11 +661,10 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
   it('barrier 3, other direction: the same record WITH runScoped does mint (the gate is load-bearing)', async () => {
     // #given — identical to the record above but with the explicit opt-in. If
     // this did not mint, the test above would pass for the wrong reason.
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const decidedAt = new Date().toISOString();
     await store.create({
       id: crypto.randomUUID(),
-      tenantId: 'acme',
       workflowId: 'launch',
       runId: 'acme_run-ok',
       title: 'deliberate standing grant',
@@ -643,15 +689,24 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
         connectorId: 'release-deploy',
         workflowId: 'launch',
         runId: 'acme_run-ok',
-        isolationScope: 'acme',
       },
     ]);
   });
 
   it('barrier 3: an APPROVED http-authored record carries no capability to mint', async () => {
-    // #given — a second party (the reviewer) approves the inert HTTP record
-    const store = new InMemoryApprovalStore('acme');
-    const { service, handle } = routerOver(store, { allowCreate: true });
+    // #given — a second party (the reviewer) approves the inert HTTP record.
+    // resumeRun stands in for the target DO boundary: even an approved plain
+    // queue record must not reach it without trusted resumability provenance.
+    const store = new InMemoryApprovalStore();
+    const resumeRun = vi.fn().mockResolvedValue({ status: 'success' });
+    const { service, handle, resources } = routerOver(store, {
+      allowCreate: true,
+      resumeRun,
+    });
+    await resources.claim('run', 'acme_run-poc', {
+      kind: 'human',
+      id: ADMIN.id,
+    });
     const created = await handle(
       post({ workflowId: 'launch', runId: 'acme_run-poc', title: 'inert' }),
     );
@@ -667,12 +722,14 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
     expect(decided.record.connectors).toEqual([]);
     expect(decided.record.runScoped).toBeUndefined();
     expect(decided.record.stepPath).toBeUndefined();
+    expect(decided.resume).toEqual({ attempted: false });
+    expect(resumeRun).not.toHaveBeenCalled();
   });
 
   it('contrast: the intended in-process bridge path still mints on its own leg', async () => {
     // #given — a step-keyed record created by TRUSTED in-process code, bound to
     // the leg's exact suspension. The fix tightens the HTTP boundary only.
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const service = new ApprovalService({ store });
     const suspendedAt = Date.parse('2026-07-09T00:00:00.000Z');
     const { record } = await service.create(
@@ -684,6 +741,7 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
         title: 'Approve launch',
         connectors: ['release-deploy'],
         requestedBy: 'starter',
+        requestedByKind: 'human',
       },
       OPERATOR,
     );
@@ -702,7 +760,6 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
         connectorId: 'release-deploy',
         workflowId: 'launch',
         runId: 'acme_run-ok',
-        isolationScope: 'acme',
         suspension: {
           stepPath: ['approval'],
           suspendedAt,
@@ -931,10 +988,10 @@ describe('approval queue end to end', () => {
     expect(harness.publishes()).toBe(2);
   });
 
-  it('refuses the gate-A approver at gate B even when gate B was reconcile-filed by the system actor', async () => {
+  it('refuses the gate-A approver at gate B even when gate B was reconcile-filed by the system principal', async () => {
     // The reconcile hole: resumeRunWithRequeue attributes gate B to the gate-A
     // decider (so the requestedBy self-check already bars them), but
-    // reconcileApprovalsForSummary files gate B as the SYSTEM actor — which the
+    // reconcileApprovalsForSummary files gate B as the SYSTEM principal — which the
     // requestedBy check never blocks. The cross-gate bar catches it anyway,
     // derived from the run's own APPROVED history.
     const harness = buildHarness();
@@ -965,8 +1022,8 @@ describe('approval queue end to end', () => {
     });
     expect(harness.publishes()).toBe(1);
 
-    // gate B is RECONCILE-filed: attributed to the system actor, not the reviewer
-    const { record: recordB } = await harness.service.create(
+    // gate B is RECONCILE-filed: attributed to the system principal, not the reviewer
+    const { record: recordB } = await harness.service.createAsPrincipal(
       {
         workflowId: 'double-launch',
         runId: started.runId,
@@ -975,12 +1032,17 @@ describe('approval queue end to end', () => {
         title: 'Gate B (reconcile-filed)',
         connectors: ['blog-publisher'],
         requestedBy: 'flowsafe-system',
+        requestedByKind: 'system',
       },
-      OPERATOR,
+      trustAutomationPrincipal({
+        kind: 'system',
+        id: 'flowsafe-system',
+        purpose: 'approval-reconciliation',
+      }),
     );
 
     // #when / #then — REVIEWER (who advanced the run at gate A) is refused gate B,
-    // despite requestedBy being the system actor rather than the reviewer, and
+    // despite requestedBy being the system principal rather than the reviewer, and
     // the second publish never happens
     await expect(
       harness.service.decide(recordB.id, { decision: 'approve' }, REVIEWER),
@@ -1068,7 +1130,6 @@ describe('approval queue end to end', () => {
       const decidedAt = new Date().toISOString();
       await harness.store.create({
         id: crypto.randomUUID(),
-        tenantId: 'acme',
         workflowId: 'relaunch-falsy',
         runId: started.runId,
         stepPath: ['gateFalsy'],
@@ -1146,7 +1207,6 @@ describe('approval queue end to end', () => {
       const decidedAt = new Date().toISOString();
       await harness.store.create({
         id: crypto.randomUUID(),
-        tenantId: 'acme',
         workflowId: 'relaunch-hole2',
         runId: started.runId,
         stepPath: ['gate2xNoSchema'],

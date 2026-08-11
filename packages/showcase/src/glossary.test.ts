@@ -19,9 +19,25 @@ const WORKFLOW_IDS = [
 
 describe('glossary completeness', () => {
   it('describes every narration zone', () => {
-    for (const zone of ['browser', 'worker', 'do', 'd1', 'cron'] as const) {
+    for (const zone of ['browser', 'worker', 'do', 'd1', 'alarm'] as const) {
       expect(ZONES[zone].label.length).toBeGreaterThan(0);
       expect(ZONES[zone].blurb.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('contains no obsolete data-plane scheduled-trigger terminology', () => {
+    const sources = import.meta.glob(
+      [
+        './glossary.ts',
+        './narration.ts',
+        './architecture-legend.tsx',
+        './zone-badge.tsx',
+        '../worker/worker.ts',
+      ],
+      { eager: true, import: 'default', query: '?raw' },
+    ) as Record<string, string>;
+    for (const [source, contents] of Object.entries(sources)) {
+      expect(contents, source).not.toMatch(/\bcron(?:s)?\b/i);
     }
   });
 

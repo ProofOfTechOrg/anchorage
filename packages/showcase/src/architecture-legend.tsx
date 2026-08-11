@@ -22,7 +22,7 @@ const ZONE_ORDER: readonly NarrationZone[] = [
   'worker',
   'do',
   'd1',
-  'cron',
+  'alarm',
 ];
 
 export function WhereThingsRunDialog({
@@ -55,7 +55,7 @@ export function WhereThingsRunDialog({
             <strong>Grants:</strong> {GLOSSARY.grantDerivation}
           </Text>
           <Text size="sm">
-            <strong>Tenant isolation:</strong> {GLOSSARY.tenantIsolation}
+            <strong>Isolation scope:</strong> {GLOSSARY.isolationScope}
           </Text>
           <Text size="sm" color="secondary">
             {GLOSSARY.polling}
@@ -92,7 +92,7 @@ export function WhatsRealHere(): ReactElement {
         <RealityRow
           marker="✔"
           title="REAL"
-          items="the approval queue (D1 records), grant derivation + fail-closed enforcement, RBAC + separation of duties, tenant isolation, durable suspend/resume across restarts, audit logging, idempotency keys, rate limits."
+          items="the approval queue (D1 records), grant derivation + fail-closed enforcement, RBAC + separation of duties, deployment-scoped isolation keys, durable suspend/resume across restarts, audit logging, idempotency keys, rate limits."
         />
         <RealityRow
           marker="◌"

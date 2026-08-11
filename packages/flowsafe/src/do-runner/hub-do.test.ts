@@ -2,8 +2,17 @@
 import type { DurableObjectState } from '@cloudflare/workers-types';
 import { describe, expect, it } from 'vitest';
 
+import {
+  deploymentIdentityDatabase,
+  deploymentIdentityRequest,
+  TEST_DEPLOYMENT_IDENTITY_SECRET,
+} from '../../test-support/deployment-identity.js';
 import type { WebSocketLike } from './cf-types.js';
-import { HubDurableObject, type HubStreamEvent } from './hub-do.js';
+import {
+  HUB_INSTANCE_NAME,
+  HubDurableObject,
+  type HubStreamEvent,
+} from './hub-do.js';
 
 interface SocketSpy {
   send(data: string): void;
@@ -37,11 +46,15 @@ function hubWith(name: string | undefined, sockets: SocketSpy[]): TestHub {
     id: { name },
     getWebSockets: () => sockets,
   } as unknown as DurableObjectState;
-  return new TestHub(state, {});
+  return new TestHub(state, {
+    DEPLOYMENT_TENANT: 'acme',
+    DEPLOYMENT_IDENTITY_SECRET: TEST_DEPLOYMENT_IDENTITY_SECRET,
+    DB: deploymentIdentityDatabase(),
+  });
 }
 
 function postEvent(event: unknown): Request {
-  return new Request('http://hub/internal/event', {
+  return deploymentIdentityRequest('http://hub/internal/event', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(event),
@@ -49,14 +62,36 @@ function postEvent(event: unknown): Request {
 }
 
 describe('HubDurableObject.fetch', () => {
+  it('rejects a cross-deployment caller before fixed-hub fan-out', async () => {
+    const socket = socketSpy();
+    const hub = hubWith(HUB_INSTANCE_NAME, [socket]);
+    const denied = await hub.fetch(
+      deploymentIdentityRequest(
+        'http://hub/internal/event',
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            type: 'decided',
+            record: { id: 'apr-1' },
+          }),
+        },
+        'different-deployment-identity-secret',
+      ),
+    );
+
+    expect(denied.status).toBe(503);
+    expect(socket.sent).toEqual([]);
+  });
+
   it('fans a posted stream event out to every subscribed socket', async () => {
-    // #given — two subscribers on tenant 'acme'
+    // #given — two deployment subscribers
     const a = socketSpy();
     const b = socketSpy();
-    const hub = hubWith('acme', [a, b]);
+    const hub = hubWith(HUB_INSTANCE_NAME, [a, b]);
     const event: HubStreamEvent = {
       type: 'decided',
-      record: { tenantId: 'acme' },
+      record: { id: 'apr-1' },
     };
 
     // #when
@@ -71,21 +106,21 @@ describe('HubDurableObject.fetch', () => {
         event: HubStreamEvent;
       };
       expect(frame.type).toBe('queue');
-      expect(frame.event.record.tenantId).toBe('acme');
+      expect(frame.event.record.id).toBe('apr-1');
     }
   });
 
   it('keeps fanning out when one socket throws on send (per-socket isolation, F2)', async () => {
     // #given — a CLOSING socket (throws on send) ahead of a healthy one, both
-    // on tenant 'acme'. Without per-socket isolation the throw aborts the loop
+    // on the deployment hub. Without per-socket isolation the throw aborts the loop
     // and the healthy subscriber never receives the frame.
     const dead = socketSpy(undefined, true);
     const healthy = socketSpy();
-    const hub = hubWith('acme', [dead, healthy]);
+    const hub = hubWith(HUB_INSTANCE_NAME, [dead, healthy]);
 
     // #when
     const response = await hub.fetch(
-      postEvent({ type: 'decided', record: { tenantId: 'acme' } }),
+      postEvent({ type: 'decided', record: { id: 'apr-1' } }),
     );
 
     // #then — the throw is swallowed, the healthy subscriber still gets the frame
@@ -101,7 +136,7 @@ describe('HubDurableObject.fetch', () => {
     const leaving = socketSpy({ actorId: 'carol', role: 'reviewer' });
     const dead = socketSpy({ actorId: 'dead', role: 'reviewer' }, true);
     const healthy = socketSpy({ actorId: 'erin', role: 'reviewer' });
-    const hub = hubWith('acme', [leaving, dead, healthy]);
+    const hub = hubWith(HUB_INSTANCE_NAME, [leaving, dead, healthy]);
 
     // #when — carol's socket closes
     hub.webSocketClose(leaving as unknown as WebSocketLike, 1000, 'bye');
@@ -120,30 +155,25 @@ describe('HubDurableObject.fetch', () => {
     ]);
   });
 
-  it('refuses a posted event whose record.tenantId does not match id.name (400)', async () => {
-    // #given — a hub bound (by idFromName) to tenant 'acme'
+  it('refuses an event sent to an unsanctioned hub instance', async () => {
     const s = socketSpy();
-    const hub = hubWith('acme', [s]);
+    const hub = hubWith('other-hub', [s]);
 
-    // #when — an event tagged for a DIFFERENT tenant
     const response = await hub.fetch(
-      postEvent({ type: 'decided', record: { tenantId: 'evil' } }),
+      postEvent({ type: 'decided', record: { id: 'apr-1' } }),
     );
 
-    // #then — refused (defense in depth), and nothing fanned out
-    expect(response.status).toBe(400);
+    expect(response.status).toBe(500);
     expect(s.sent).toHaveLength(0);
   });
 
-  it('refuses a posted event with no record.tenantId (400)', async () => {
+  it('refuses a posted event with no record (400)', async () => {
     // #given
     const s = socketSpy();
-    const hub = hubWith('acme', [s]);
+    const hub = hubWith(HUB_INSTANCE_NAME, [s]);
 
     // #when — a malformed event body
-    const response = await hub.fetch(
-      postEvent({ type: 'decided', record: {} }),
-    );
+    const response = await hub.fetch(postEvent({ type: 'decided' }));
 
     // #then
     expect(response.status).toBe(400);
@@ -151,18 +181,16 @@ describe('HubDurableObject.fetch', () => {
   });
 
   it('fails closed (500) and fans nothing out when the hub has no id.name', async () => {
-    // #given — a hub with no identity (not created via idFromName); tenantId
-    // must throw rather than default, or one tenant's event could reach
-    // another's sockets.
+    // #given — a hub with no named identity
     const s = socketSpy();
     const hub = hubWith(undefined, [s]);
 
     // #when — a well-formed event
     const response = await hub.fetch(
-      postEvent({ type: 'decided', record: { tenantId: 'acme' } }),
+      postEvent({ type: 'decided', record: { id: 'apr-1' } }),
     );
 
-    // #then — the tenant assertion throws → 500, nothing sent
+    // #then — the deployment assertion throws → 500, nothing sent
     expect(response.status).toBe(500);
     expect(s.sent).toHaveLength(0);
   });
@@ -170,11 +198,11 @@ describe('HubDurableObject.fetch', () => {
   it('returns a 426 non-WS fallback on /subscribe without the hibernation API', async () => {
     // #given — a node hub (no acceptWebSocket). Subscribing is workerd-only and
     // proven by the spike (M-009); off workerd it must degrade, never 500.
-    const hub = hubWith('acme', []);
+    const hub = hubWith(HUB_INSTANCE_NAME, []);
 
     // #when — a websocket upgrade attempt
     const response = await hub.fetch(
-      new Request('http://hub/subscribe', {
+      deploymentIdentityRequest('http://hub/subscribe', {
         headers: { Upgrade: 'websocket' },
       }),
     );
@@ -187,7 +215,7 @@ describe('HubDurableObject.fetch', () => {
     // #given — two subscribers, each carrying a presence attachment
     const alice = socketSpy({ actorId: 'alice', role: 'reviewer' });
     const bob = socketSpy({ actorId: 'bob', role: 'reviewer' });
-    const hub = hubWith('acme', [alice, bob]);
+    const hub = hubWith(HUB_INSTANCE_NAME, [alice, bob]);
 
     // #when — bob's socket closes (workerd wakes the DO with this handler)
     hub.webSocketClose(bob as unknown as WebSocketLike, 1000, 'bye');

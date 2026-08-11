@@ -1,9 +1,9 @@
-// Module 3/5 — Lead Generation: score leads, route hot/cold via .branch(), then
+// Module 3/6 — Lead Generation: score leads, route hot/cold via .branch(), then
 // assign the hot ones after review. Capabilities shown: conditional branching
 // with a post-fan-in gate, a network-egress-allowlisted + rate-limited CRM write
 // connector (binding-gated; simulated offline).
 
-import { createConnector, tenantIsolation } from '@proofoftech/breakwater';
+import { createConnector } from '@proofoftech/breakwater';
 import type { WorkflowModule } from '@proofoftech/flowsafe/host-kit/module';
 import { z } from 'zod';
 import {
@@ -90,13 +90,10 @@ export const leadGenerationModule: WorkflowModule<ShowcaseModuleDeps> = {
         egress: [CRM_HOST],
         rateLimit: '5/min',
       },
-      // tenantIsolation: scope-less calls deny instead of collapsing to
-      // unsegmented keys — mandatory on a multi-tenant host (see gtm-outbound).
       policies: {
         audit,
         networkEgress: { allowedDomains: [CRM_HOST] },
         rateLimitStore: deps.rateLimit,
-        evaluators: [tenantIsolation()],
       },
       execute: async ({ assignments }) => {
         if (!crm) {

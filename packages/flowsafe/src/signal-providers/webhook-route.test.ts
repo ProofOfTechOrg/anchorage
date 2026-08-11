@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it, vi } from 'vitest';
-
+import { EXECUTION_PRINCIPAL_HEADER } from '../do-runner/index.js';
 import {
-  createThreadTopology,
+  createThreadTopology as createThreadTopologyWithSecret,
   type ThreadNamespaceLike,
+  type ThreadTopology,
 } from '../host-kit/index.js';
 import type { SignalProviderAdapter } from './provider.js';
 import {
@@ -15,20 +16,31 @@ import {
   type SignalProviderAuditEvent,
 } from './webhook-route.js';
 
+const DEPLOYMENT_IDENTITY_SECRET = 'test-deployment-identity-secret-0001';
+
+function createThreadTopology<Id>(
+  namespace: ThreadNamespaceLike<Id>,
+): ThreadTopology {
+  return createThreadTopologyWithSecret(namespace, DEPLOYMENT_IDENTITY_SECRET);
+}
+
 // A stub thread namespace whose real topology delivery either reaches the stub
-// DO (200) or is 404'd by the topology's ownership check BEFORE it. Records what
-// threadId was addressed and the tenant header stamped, so we can prove delivery
+// DO (200) or is rejected by path validation before it. Records what threadId
+// was addressed and the server-stamped principal, so we can prove delivery
 // binds to the ROW, never the payload.
 function stubThreads(): {
   namespace: ThreadNamespaceLike<string>;
   addressed: string[];
-  headers: Array<string | undefined>;
+  paths: string[];
+  principals: Array<string | undefined>;
 } {
   const addressed: string[] = [];
-  const headers: Array<string | undefined> = [];
+  const paths: string[] = [];
+  const principals: Array<string | undefined> = [];
   return {
     addressed,
-    headers,
+    paths,
+    principals,
     namespace: {
       idFromName: (name) => name,
       get: (name) => ({
@@ -37,7 +49,8 @@ function stubThreads(): {
           init?: { headers?: Record<string, string> },
         ) => {
           addressed.push(name);
-          headers.push(init?.headers?.['x-flowsafe-tenant']);
+          paths.push(typeof input === 'string' ? input : input.url);
+          principals.push(init?.headers?.[EXECUTION_PRINCIPAL_HEADER]);
           void input;
           return Promise.resolve(
             new Response(JSON.stringify({ record: {} }), { status: 200 }),
@@ -63,14 +76,14 @@ function testProvider(
 
 async function seed(
   factory: SubscriptionStoreFactory,
-  tenant: string,
+  ownerKey: string,
   threadId: string,
 ): Promise<void> {
-  await factory.forTenant(tenant).subscribe({
+  await factory.store().subscribe({
     providerId: 'test',
     externalResourceId: 'res:1',
     threadId,
-    resourceId: `${tenant}_owner`,
+    resourceId: `${ownerKey}_owner`,
   });
 }
 
@@ -83,6 +96,35 @@ function webhookRequest(sig: string, body: unknown): Request {
 }
 
 describe('createWebhookRouter — verify before parse', () => {
+  it('rejects authentic invalid UTF-8 before payload policy runs', async () => {
+    const extractResourceIds = vi.fn(() => []);
+    const router = createWebhookRouter({
+      providers: {
+        test: testProvider({
+          verifyWebhookSignature: () => true,
+          extractResourceIds,
+        }),
+      },
+      subscriptions: new InMemorySubscriptionStoreFactory().store(),
+      topology: createThreadTopology(stubThreads().namespace),
+      secretForProvider: () => 'secret',
+    });
+    const response = await router(
+      new Request('http://host/api/signal-providers/test/webhook', {
+        method: 'POST',
+        body: new Uint8Array([
+          0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xff, 0x22, 0x7d,
+        ]),
+      }),
+    );
+
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      error: 'a JSON body is required',
+    });
+    expect(extractResourceIds).not.toHaveBeenCalled();
+  });
+
   it.each([
     { maxBodyBytes: -1 },
     { maxBodyBytes: 1.5 },
@@ -96,7 +138,7 @@ describe('createWebhookRouter — verify before parse', () => {
     expect(() =>
       createWebhookRouter({
         providers: { test: testProvider() },
-        subscriptions: factory.system(),
+        subscriptions: factory.store(),
         topology: createThreadTopology(threads.namespace),
         secretForProvider: () => 'secret',
         ...numeric,
@@ -110,7 +152,7 @@ describe('createWebhookRouter — verify before parse', () => {
     const audit = vi.fn();
     const router = createWebhookRouter({
       providers: { test: testProvider() },
-      subscriptions: factory.system(),
+      subscriptions: factory.store(),
       topology: createThreadTopology(threads.namespace),
       secretForProvider: () => 'secret',
       maxBodyBytes: 0,
@@ -126,7 +168,7 @@ describe('createWebhookRouter — verify before parse', () => {
     const noForgeryAudit = vi.fn();
     const forgeryRouter = createWebhookRouter({
       providers: { test: testProvider() },
-      subscriptions: factory.system(),
+      subscriptions: factory.store(),
       topology: createThreadTopology(threads.namespace),
       secretForProvider: () => 'secret',
       maxForgeryAuditsPerWindow: 0,
@@ -140,7 +182,7 @@ describe('createWebhookRouter — verify before parse', () => {
     // #given
     const factory = new InMemorySubscriptionStoreFactory();
     await seed(factory, 'acme', 'acme_t1');
-    const systemStore = factory.system();
+    const systemStore = factory.store();
     const listSpy = vi.spyOn(systemStore, 'listByResource');
     const threads = stubThreads();
     const events: SignalProviderAuditEvent[] = [];
@@ -170,15 +212,15 @@ describe('createWebhookRouter — verify before parse', () => {
     ]);
   });
 
-  it('delivers a valid webhook to the ROW’s tenant/thread — never the payload’s', async () => {
-    // #given — the row is (acme, acme_t1); the payload LIES about tenant/thread
+  it('delivers a valid webhook to the row’s thread — never the payload’s', async () => {
+    // #given — the row names acme_t1; the payload lies about the thread
     const factory = new InMemorySubscriptionStoreFactory();
     await seed(factory, 'acme', 'acme_t1');
     const threads = stubThreads();
     const events: SignalProviderAuditEvent[] = [];
     const router = createWebhookRouter({
       providers: { test: testProvider() },
-      subscriptions: factory.system(),
+      subscriptions: factory.store(),
       topology: createThreadTopology(threads.namespace),
       secretForProvider: () => 'secret',
       audit: (e) => {
@@ -186,19 +228,29 @@ describe('createWebhookRouter — verify before parse', () => {
       },
     });
 
-    // #when — payload claims a foreign tenant/thread; it must be ignored
+    // #when — payload claims another thread; it must be ignored
     const res = await router(
       webhookRequest('good', {
-        tenantId: 'globex',
         threadId: 'globex_evil',
       }),
     );
 
-    // #then — delivered to the ROW's thread, stamped with the ROW's tenant
+    // #then — delivered to the row's thread with a trusted service principal
     expect(res?.status).toBe(200);
     expect(await res?.json()).toEqual({ matched: 1, delivered: 1 });
     expect(threads.addressed).toEqual(['acme_t1']);
-    expect(threads.headers).toEqual(['acme']);
+    expect(threads.paths[0]).toContain(
+      '/signal/notification?resourceId=acme_owner',
+    );
+    expect(
+      threads.principals.map((value) => JSON.parse(value ?? '{}')),
+    ).toEqual([
+      {
+        kind: 'service',
+        id: 'signal-provider-delivery',
+        purpose: 'signal-provider-delivery',
+      },
+    ]);
     expect(events).toEqual([
       expect.objectContaining({
         outcome: 'accepted',
@@ -208,12 +260,38 @@ describe('createWebhookRouter — verify before parse', () => {
     ]);
   });
 
+  it('returns the committed delivery when the accepted audit sink fails', async () => {
+    const factory = new InMemorySubscriptionStoreFactory();
+    await seed(factory, 'acme', 'acme_t1');
+    const threads = stubThreads();
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const router = createWebhookRouter({
+      providers: { test: testProvider() },
+      subscriptions: factory.store(),
+      topology: createThreadTopology(threads.namespace),
+      secretForProvider: () => 'secret',
+      audit: async () => {
+        throw new Error('audit unavailable');
+      },
+    });
+
+    const response = await router(webhookRequest('good', {}));
+
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toEqual({ matched: 1, delivered: 1 });
+    expect(threads.addressed).toEqual(['acme_t1']);
+    expect(logged).toHaveBeenCalledWith(
+      expect.stringContaining('signal-provider.webhook-audit-error'),
+    );
+    logged.mockRestore();
+  });
+
   it('is route-absent (null) when the provider or its secret is not configured', async () => {
     // #given — provider registered but no secret
     const factory = new InMemorySubscriptionStoreFactory();
     const router = createWebhookRouter({
       providers: { test: testProvider() },
-      subscriptions: factory.system(),
+      subscriptions: factory.store(),
       topology: createThreadTopology(stubThreads().namespace),
       secretForProvider: () => undefined,
     });
@@ -233,7 +311,7 @@ describe('createWebhookRouter — verify before parse', () => {
     const events: SignalProviderAuditEvent[] = [];
     const router = createWebhookRouter({
       providers: { test: testProvider() },
-      subscriptions: factory.system(),
+      subscriptions: factory.store(),
       topology: createThreadTopology(stubThreads().namespace),
       secretForProvider: () => 'secret',
       audit: (e) => {
@@ -253,24 +331,24 @@ describe('createWebhookRouter — verify before parse', () => {
     expect(events[0]).toMatchObject({ reason: 'malformed-body' });
   });
 
-  it('skips an over-cap tenant’s deliveries (per provider+tenant rate cap)', async () => {
-    // #given — two tenants matched; the cap refuses acme only
+  it('skips all matched deliveries when the provider deployment cap is exceeded', async () => {
+    // #given — two subscriptions match; the provider cap refuses the ingest
     const factory = new InMemorySubscriptionStoreFactory();
     await seed(factory, 'acme', 'acme_t1');
     await seed(factory, 'globex', 'globex_t1');
     const threads = stubThreads();
     const router = createWebhookRouter({
       providers: { test: testProvider() },
-      subscriptions: factory.system(),
+      subscriptions: factory.store(),
       topology: createThreadTopology(threads.namespace),
       secretForProvider: () => 'secret',
-      rateLimit: (_provider, tenantId) => tenantId !== 'acme',
+      rateLimit: () => false,
     });
     // #when
     const res = await router(webhookRequest('good', {}));
-    // #then — only globex delivered
-    expect(await res?.json()).toEqual({ matched: 2, delivered: 1 });
-    expect(threads.addressed).toEqual(['globex_t1']);
+    // #then — no thread is addressed
+    expect(await res?.json()).toEqual({ matched: 2, delivered: 0 });
+    expect(threads.addressed).toEqual([]);
   });
 
   it('bounds the forgery audit so a flood cannot amplify the log', async () => {
@@ -279,7 +357,7 @@ describe('createWebhookRouter — verify before parse', () => {
     const events: SignalProviderAuditEvent[] = [];
     const router = createWebhookRouter({
       providers: { test: testProvider() },
-      subscriptions: factory.system(),
+      subscriptions: factory.store(),
       topology: createThreadTopology(stubThreads().namespace),
       secretForProvider: () => 'secret',
       audit: (e) => {
@@ -307,7 +385,7 @@ describe('createWebhookRouter — robustness', () => {
       factory,
       run: createWebhookRouter({
         providers: { test: provider },
-        subscriptions: factory.system(),
+        subscriptions: factory.store(),
         topology: createThreadTopology(stubThreads().namespace),
         secretForProvider: () => secret,
       }),
@@ -331,7 +409,7 @@ describe('createWebhookRouter — robustness', () => {
     expect(await router('').run(webhookRequest('good', {}))).toBeNull();
   });
 
-  it('maps a THROWING provider callback to 500, never an unhandled crash', async () => {
+  it('contains a throwing notification builder as a per-delivery failure', async () => {
     // #given — a matched, verified webhook whose buildNotification throws
     const { factory, run } = router('secret', {
       ...testProvider(),
@@ -342,34 +420,67 @@ describe('createWebhookRouter — robustness', () => {
     await seed(factory, 'acme', 'acme_t1');
     // #when
     const res = await run(webhookRequest('good', {}));
-    // #then — caught at the top-level, surfaced as 500 (not an unhandled rejection)
-    expect(res?.status).toBe(500);
+    // #then — acknowledge the authentic webhook without inviting a retry.
+    expect(res?.status).toBe(200);
+    expect(await res?.json()).toEqual({ matched: 1, delivered: 0 });
+  });
+
+  it('does not turn an earlier applied delivery into a retryable failure', async () => {
+    const factory = new InMemorySubscriptionStoreFactory();
+    await seed(factory, 'acme', 'acme_t1');
+    await seed(factory, 'globex', 'globex_t1');
+    const threads = stubThreads();
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const router = createWebhookRouter({
+      providers: {
+        test: testProvider({
+          buildNotification: (_payload, row) => {
+            if (row.threadId === 'globex_t1') throw new Error('provider bug');
+            return { source: 'test', kind: 'k', summary: 's' };
+          },
+        }),
+      },
+      subscriptions: factory.store(),
+      topology: createThreadTopology(threads.namespace),
+      secretForProvider: () => 'secret',
+    });
+
+    try {
+      const response = await router(webhookRequest('good', {}));
+
+      expect(response?.status).toBe(200);
+      expect(await response?.json()).toEqual({ matched: 2, delivered: 1 });
+      expect(threads.addressed).toEqual(['acme_t1']);
+      expect(logged).toHaveBeenCalledWith(
+        expect.stringContaining('signal-provider.webhook-delivery-error'),
+      );
+    } finally {
+      logged.mockRestore();
+    }
   });
 });
 
-describe('createWebhookRouter — cross-tenant fail-closed', () => {
-  it('never delivers to a foreign thread even for a valid signature (tampered row)', async () => {
-    // #given — a row whose tenant is acme but whose threadId belongs to globex
-    // (a tampered/inconsistent row). The topology must 404 it.
+describe('createWebhookRouter — deployment-wide routing', () => {
+  it('delivers to any path-safe thread named by an authoritative row', async () => {
+    // #given — a row names another path-safe thread in the deployment
     const factory = new InMemorySubscriptionStoreFactory();
-    await factory.forTenant('acme').subscribe({
+    await factory.store().subscribe({
       providerId: 'test',
       externalResourceId: 'res:1',
-      threadId: 'globex_victim', // NOT owned by acme
+      threadId: 'globex_victim',
       resourceId: 'acme_owner',
     });
     const threads = stubThreads();
     const router = createWebhookRouter({
       providers: { test: testProvider() },
-      subscriptions: factory.system(),
+      subscriptions: factory.store(),
       topology: createThreadTopology(threads.namespace),
       secretForProvider: () => 'secret',
     });
     // #when — a perfectly valid webhook
     const res = await router(webhookRequest('good', {}));
-    // #then — matched, but the topology ownership check 404'd it: nothing delivered,
-    // the foreign thread DO never addressed (fail closed).
-    expect(await res?.json()).toEqual({ matched: 1, delivered: 0 });
-    expect(threads.addressed).toEqual([]);
+    // #then — the signed payload maps to the authoritative row and is delivered
+    expect(await res?.json()).toEqual({ matched: 1, delivered: 1 });
+    expect(threads.addressed).toEqual(['globex_victim']);
   });
 });

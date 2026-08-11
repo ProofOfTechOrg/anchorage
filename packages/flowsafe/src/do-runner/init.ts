@@ -20,7 +20,6 @@ import {
 import type { D1DatabaseBinding } from './cf-types.js';
 import { createD1Storage } from './d1-storage.js';
 import type { HostPubSub } from './pubsub.js';
-import type { ResumeLedger } from './resume-ledger.js';
 import type { RequestContextProvider } from './runtime.js';
 import { RunnerRuntime } from './runtime.js';
 
@@ -42,12 +41,6 @@ export interface InitOptions {
    * grant-minting seam. See RequestContextProvider in runtime.ts.
    */
   requestContextForRun?: RequestContextProvider;
-  /**
-   * Explicit resume ledger (see RunnerRuntimeOptions.resumeLedger). When
-   * omitted, the runtime defaults to in-memory and the DO shell adopts a
-   * ctx.storage-backed ledger.
-   */
-  resumeLedger?: ResumeLedger;
   /**
    * The host Durable Object's single pubsub identity — `createHostPubSub()` for the
    * default in-process emitter, or any PubSub the host built. init() is where a
@@ -99,8 +92,7 @@ export function init(
   const runtime = new RunnerRuntime({
     storage,
     requestContextForRun: options.requestContextForRun,
-    resumeLedger: options.resumeLedger,
-    // Threaded like the ledger, and for the same reason: every DO subclass
+    // Threaded directly because every DO subclass
     // returns THIS runtime from build(), so a host that configures a pubsub
     // reaches the runtime's createRun sites with no host change (Track A wires
     // those). Handing it only to InitResult would strand it — build() returns a

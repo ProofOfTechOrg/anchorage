@@ -1,14 +1,10 @@
 // Drives the showcase worker's EXPORTED fetch() in-process — the route
 // composition itself (healthz, the demo-auth mount, the auth fall-through to
 // the run/approval surface), which the other showcase tests bypass by calling
-// the routers directly. Mirrors deploy/worker.e2e.test.ts's scaffolding:
-// D1-shaped node:sqlite, a throwing DO namespace (these routes never reach a
-// run leg), and the Parameters<typeof fetchHandler> cast for workers types.
-
-import type { ApprovalRecord } from '@proofoftech/flowsafe/approval-api';
+// the routers directly. The prepared-statement SQLite adapter is unit-only;
+// D1/workerd and Durable Object fidelity live in worker.harness.test.ts.
 
 import { D1ApprovalStoreFactory } from '@proofoftech/flowsafe/approval-api';
-import { provisionTenant } from '@proofoftech/flowsafe/host-kit';
 import { describe, expect, it, vi } from 'vitest';
 import { STATE_COOKIE } from '#worker/demo-auth';
 import handler from '#worker/worker';
@@ -39,10 +35,19 @@ function openSqlite(): SqliteDatabase {
   return new mod.DatabaseSync(':memory:');
 }
 
-// Minimal D1 face over node:sqlite — the same envelope deploy's e2e uses
-// ({ results }, { meta }); enough for any schema-init the routers run.
-function d1DatabaseLike(db: SqliteDatabase): unknown {
+function sqliteUnitDatabase(db: SqliteDatabase): unknown {
+  const runSync = Symbol('runSync');
+
   function statement(sql: string, params: unknown[]): Record<string, unknown> {
+    const execute = () => {
+      const outcome = db.prepare(sql).run(...params) as {
+        changes?: number | bigint;
+      };
+      return {
+        success: true,
+        meta: { changes: Number(outcome?.changes ?? 0) },
+      };
+    };
     return {
       bind: (...values: unknown[]) => statement(sql, values),
       first: async (column?: string) => {
@@ -52,40 +57,38 @@ function d1DatabaseLike(db: SqliteDatabase): unknown {
         if (row === undefined) return null;
         return column !== undefined ? (row[column] ?? null) : row;
       },
-      run: async () => {
-        const outcome = db.prepare(sql).run(...params) as {
-          changes?: number | bigint;
-        };
-        return {
-          success: true,
-          meta: { changes: Number(outcome?.changes ?? 0) },
-        };
-      },
+      run: async () => execute(),
+      [runSync]: execute,
       all: async () => ({
         success: true,
         results: db.prepare(sql).all(...params),
         meta: {},
       }),
-      raw: async () => {
-        const rows = db.prepare(sql).all(...params) as Array<
-          Record<string, unknown>
-        >;
-        return rows.map((row) => Object.values(row));
-      },
     };
   }
   return {
     prepare: (sql: string) => statement(sql, []),
-    exec: async (sql: string) => {
-      db.exec(sql);
-      return { count: 1, duration: 0 };
+    batch: async (
+      statements: Array<{
+        run: () => Promise<unknown>;
+        [runSync]?: () => unknown;
+      }>,
+    ) => {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const results = [];
+        for (const prepared of statements) {
+          results.push(
+            prepared[runSync] ? prepared[runSync]() : await prepared.run(),
+          );
+        }
+        db.exec('COMMIT');
+        return results;
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
     },
-    batch: async (statements: Array<{ run: () => Promise<unknown> }>) => {
-      const results = [];
-      for (const stmt of statements) results.push(await stmt.run());
-      return results;
-    },
-    dump: async () => new ArrayBuffer(0),
   };
 }
 
@@ -99,7 +102,7 @@ const fetchHandler = required(handler.fetch);
 type Env = Parameters<typeof fetchHandler>[1];
 
 const TOKENS = {
-  'tok-reviewer': { id: 'rev-ray', role: 'reviewer', tenantId: 'demo' },
+  'tok-reviewer': { id: 'rev-ray', role: 'reviewer' },
 };
 
 const GOOGLE_PAIR = {
@@ -112,8 +115,12 @@ const GITHUB_PAIR = {
 };
 
 function makeEnv(overrides: Partial<Env> = {}): Env {
+  const sqlite = openSqlite();
+  seedDeployment(sqlite);
   return {
-    DB: d1DatabaseLike(openSqlite()),
+    DB: sqliteUnitDatabase(sqlite),
+    DEPLOYMENT_TENANT: 'showcase',
+    DEPLOYMENT_IDENTITY_SECRET: 'test-deployment-identity-secret-0001',
     // None of these routes reaches a run leg; a request that does is a bug.
     RUNNER: {
       idFromName: (name: string) => ({ name }),
@@ -124,6 +131,18 @@ function makeEnv(overrides: Partial<Env> = {}): Env {
     APPROVAL_ACTOR_TOKENS: JSON.stringify(TOKENS),
     ...overrides,
   } as Env;
+}
+
+function seedDeployment(db: SqliteDatabase): void {
+  db.exec(`
+    CREATE TABLE flowsafe_deployment (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      tenant_tag TEXT NOT NULL,
+      provisioned_at TEXT NOT NULL
+    );
+    INSERT INTO flowsafe_deployment (id, tenant_tag, provisioned_at)
+    VALUES (1, 'showcase', '2026-08-10T00:00:00.000Z');
+  `);
 }
 
 async function call(
@@ -186,7 +205,6 @@ describe('showcase worker fetch(): auth composition', () => {
     expect(body.actor).toEqual({
       id: 'rev-ray',
       role: 'reviewer',
-      tenantId: 'demo',
       canSelfDecide: false,
     });
     expect(body.workflows.map((entry) => entry.id)).toEqual([
@@ -278,175 +296,6 @@ describe('showcase worker fetch(): the demo-auth mount', () => {
   });
 });
 
-describe('showcase worker fetch(): the demo-reset mount', () => {
-  const DEMO_TENANT = 'dmvisitor01';
-  const RESET_TOKENS = {
-    'tok-demo-admin': {
-      id: 'demo-admin',
-      role: 'admin',
-      tenantId: DEMO_TENANT,
-    },
-    'tok-demo-viewer': {
-      id: 'demo-viewer',
-      role: 'viewer',
-      tenantId: DEMO_TENANT,
-    },
-    // Static operator identity: admin of a tenant NEVER provisioned as demo.
-    'tok-ops-admin': { id: 'ops-olive', role: 'admin', tenantId: 'acme' },
-    ...TOKENS,
-  };
-
-  let approvalSeq = 0;
-
-  function approvalRecord(tenantId: string): ApprovalRecord {
-    approvalSeq += 1;
-    const at = new Date(1751000000000 + approvalSeq * 1000).toISOString();
-    return {
-      id: `apr-reset-${approvalSeq}`,
-      tenantId,
-      workflowId: 'gtm-outbound',
-      runId: `${tenantId}_run${approvalSeq}`,
-      title: `approval ${approvalSeq}`,
-      connectors: [],
-      priority: 'normal',
-      status: 'pending',
-      createdAt: at,
-      updatedAt: at,
-    };
-  }
-
-  // One seeded world: a provisioned demo tenant holding a snapshot row and an
-  // approval, plus a foreign tenant's row in each store that must SURVIVE.
-  async function seededEnv(): Promise<{
-    env: Env;
-    sqlite: SqliteDatabase;
-    approvals: D1ApprovalStoreFactory;
-  }> {
-    const sqlite = openSqlite();
-    const db = d1DatabaseLike(sqlite);
-    const env = makeEnv({
-      DB: db,
-      APPROVAL_ACTOR_TOKENS: JSON.stringify(RESET_TOKENS),
-    } as Partial<Env>);
-    await provisionTenant(db as Parameters<typeof provisionTenant>[0], {
-      tenantId: DEMO_TENANT,
-      kind: 'demo',
-    });
-    sqlite.exec(
-      `CREATE TABLE mastra_workflow_snapshot (
-         workflow_name TEXT NOT NULL,
-         run_id TEXT NOT NULL,
-         snapshot TEXT NOT NULL,
-         createdAt TEXT,
-         updatedAt TEXT
-       )`,
-    );
-    const insert = sqlite.prepare(
-      `INSERT INTO mastra_workflow_snapshot
-         (workflow_name, run_id, snapshot) VALUES (?, ?, ?)`,
-    );
-    insert.run('gtm-outbound', `${DEMO_TENANT}_run1`, '{}');
-    insert.run('gtm-outbound', 'acme_run1', '{}');
-    const approvals = new D1ApprovalStoreFactory(
-      db as ConstructorParameters<typeof D1ApprovalStoreFactory>[0],
-    );
-    await approvals.forTenant(DEMO_TENANT).create(approvalRecord(DEMO_TENANT));
-    await approvals.forTenant('acme').create(approvalRecord('acme'));
-    return { env, sqlite, approvals };
-  }
-
-  it("an admin of a demo tenant wipes exactly their own rows — the foreign tenant's survive", async () => {
-    // #given
-    const { env, sqlite, approvals } = await seededEnv();
-    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-
-    // #when
-    const response = await call(env, '/demo/reset', {
-      method: 'POST',
-      token: 'tok-demo-admin',
-    });
-
-    // #then — real counts in the envelope
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({
-      ok: true,
-      tenantId: DEMO_TENANT,
-      purged: {
-        snapshots: 1,
-        threads: 0,
-        messages: 0,
-        resources: 0,
-        backgroundTasks: 0,
-        notifications: 0,
-        threadState: 0,
-        schedules: 0,
-        scheduleTriggers: 0,
-        approvals: 1,
-        subscriptions: 0,
-        artifacts: 0,
-      },
-    });
-    // #then — the demo tenant's stores are empty, the foreign tenant's intact
-    const remaining = sqlite
-      .prepare('SELECT run_id FROM mastra_workflow_snapshot')
-      .all() as Array<{ run_id: string }>;
-    expect(remaining.map((row) => row.run_id)).toEqual(['acme_run1']);
-    expect(await approvals.forTenant(DEMO_TENANT).list()).toEqual([]);
-    expect(await approvals.forTenant('acme').list()).toHaveLength(1);
-    // #then — the structured audit line names the tenant
-    expect(
-      logSpy.mock.calls.some(([line]) =>
-        String(line).includes('"type":"demo-reset"'),
-      ),
-    ).toBe(true);
-    logSpy.mockRestore();
-  });
-
-  it('refuses everyone else: 401 without a token, 403 for a non-admin role, 403 for a non-demo tenant', async () => {
-    // #given
-    const { env, sqlite } = await seededEnv();
-
-    // #when / #then — unauthenticated
-    expect((await call(env, '/demo/reset', { method: 'POST' })).status).toBe(
-      401,
-    );
-    // #then — viewer of the demo tenant (RBAC lesson, not a wipe)
-    expect(
-      (
-        await call(env, '/demo/reset', {
-          method: 'POST',
-          token: 'tok-demo-viewer',
-        })
-      ).status,
-    ).toBe(403);
-    // #then — admin of a tenant that was never provisioned as demo
-    expect(
-      (
-        await call(env, '/demo/reset', {
-          method: 'POST',
-          token: 'tok-ops-admin',
-        })
-      ).status,
-    ).toBe(403);
-    // #then — nothing was purged by any refusal
-    const rows = sqlite
-      .prepare('SELECT run_id FROM mastra_workflow_snapshot')
-      .all() as Array<{ run_id: string }>;
-    expect(rows).toHaveLength(2);
-  });
-
-  it('405s a GET on /demo/reset while the rest of the composition stays intact', async () => {
-    // #given
-    const { env } = await seededEnv();
-
-    // #when / #then
-    expect(
-      (await call(env, '/demo/reset', { token: 'tok-demo-admin' })).status,
-    ).toBe(405);
-    expect((await call(env, '/healthz')).status).toBe(200);
-  });
-});
-
 describe('showcase worker fetch(): the live-stream stage', () => {
   // A structural stub HUB namespace: it records every /internal/event POST the
   // composer's fetch-scope stream sink forwards, so the test can assert the
@@ -520,30 +369,44 @@ describe('showcase worker fetch(): the live-stream stage', () => {
     expect(response.status).toBe(401);
   });
 
-  it('404s a run-channel ticket for a run the tenant does not own (no existence oracle)', async () => {
-    // #given the reviewer belongs to tenant 'demo'
+  it('404s a run-channel ticket with a malformed opaque id', async () => {
+    // #given
     const { env } = streamingEnv();
 
-    // #when they request a run ticket for another tenant's runId
+    // #when the id violates the public path-safe grammar
     const response = await call(env, '/api/stream/ticket', {
       method: 'POST',
       token: 'tok-reviewer',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         channel: 'run',
-        runId: 'acme_00000000-0000-4000-8000-000000000000',
+        runId: 'bad/run',
       }),
     });
 
-    // #then the route is not an existence oracle: 404, not 403
+    // #then malformed and unknown ids share the not-found posture
     expect(response.status).toBe(404);
   });
 
-  it('mints a run-channel ticket for a run the tenant OWNS, returning the complete workflow-qualified url', async () => {
-    // #given the reviewer belongs to tenant 'demo'; ownership is the INV-1
-    // prefix check alone (tenantOwnsSaltedId), so no run needs to be seeded
-    const { env } = streamingEnv();
-    const runId = 'demo_run-stream-success';
+  it('mints a run-channel ticket for a registered opaque run id', async () => {
+    const runId = '00000000-0000-4000-8000-000000000000';
+    const { env } = streamingEnv({
+      RUNNER: {
+        idFromName: (name: string) => ({ name }),
+        get: () => ({
+          fetch: async () =>
+            new Response(JSON.stringify({ runId, status: 'suspended' }), {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            }),
+        }),
+      } as unknown as Env['RUNNER'],
+    });
+    await new D1ApprovalStoreFactory(
+      env.DB as ConstructorParameters<typeof D1ApprovalStoreFactory>[0],
+    )
+      .resources()
+      .claim('run', runId, { kind: 'human', id: 'rev-ray' });
 
     // #when they request a run ticket, supplying the workflowId they hold
     const response = await call(env, '/api/stream/ticket', {
@@ -569,19 +432,19 @@ describe('showcase worker fetch(): the live-stream stage', () => {
     expect(body.ticket.length).toBeGreaterThan(0);
   });
 
-  it('forwards an approval mutation to the tenant HUB stub as a stream event', async () => {
-    // #given a seeded pending approval for the reviewer's tenant + a stub hub
+  it('forwards an approval mutation to the deployment hub as a stream event', async () => {
+    // #given a seeded pending approval + a stub hub
     const sqlite = openSqlite();
-    const db = d1DatabaseLike(sqlite);
+    seedDeployment(sqlite);
+    const db = sqliteUnitDatabase(sqlite);
     const approvals = new D1ApprovalStoreFactory(
       db as ConstructorParameters<typeof D1ApprovalStoreFactory>[0],
     );
     const at = new Date(1_751_000_000_000).toISOString();
-    await approvals.forTenant('demo').create({
+    await approvals.store().create({
       id: 'apr-stream-1',
-      tenantId: 'demo',
       workflowId: 'gtm-outbound',
-      runId: 'demo_stream1',
+      runId: '00000000-0000-4000-8000-000000000001',
       title: 'stream approval',
       connectors: [],
       priority: 'normal',
@@ -603,27 +466,26 @@ describe('showcase worker fetch(): the live-stream stage', () => {
     expect(events).toHaveLength(1);
     const forwarded = events[0] as {
       type: string;
-      record: { id: string; tenantId: string };
+      record: { id: string };
     };
     expect(forwarded.type).toBe('claimed');
     expect(forwarded.record.id).toBe('apr-stream-1');
-    expect(forwarded.record.tenantId).toBe('demo');
   });
 
   it('contains a failing HUB publish: the mutation still succeeds and the failure is only logged (DL-011)', async () => {
     // #given a seeded pending approval, and a HUB stub whose /internal/event
     // THROWS — a hard transport failure, not merely a non-2xx status
     const sqlite = openSqlite();
-    const db = d1DatabaseLike(sqlite);
+    seedDeployment(sqlite);
+    const db = sqliteUnitDatabase(sqlite);
     const approvals = new D1ApprovalStoreFactory(
       db as ConstructorParameters<typeof D1ApprovalStoreFactory>[0],
     );
     const at = new Date(1_751_000_000_000).toISOString();
-    await approvals.forTenant('demo').create({
+    await approvals.store().create({
       id: 'apr-stream-fail',
-      tenantId: 'demo',
       workflowId: 'gtm-outbound',
-      runId: 'demo_stream2',
+      runId: '00000000-0000-4000-8000-000000000002',
       title: 'stream approval (failing hub)',
       connectors: [],
       priority: 'normal',

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// The agent-memory host boundary (docs/agent-memory-tenancy.md item 5) — the
-// memory analogue of createRunRouter's "runId is server-assigned" 400 and its
-// ownership 404, factored out because memory ids reach the boundary through
+// The agent-memory host boundary — the memory analogue of createRunRouter's
+// "runId is server-assigned" 400, factored out because memory ids reach the boundary through
 // MANY routes (Track A's agent runs, Track C's signals, Track D's threaded
 // schedule fires) where a runId reaches exactly one.
 //
@@ -12,14 +11,13 @@
 // every new route. One named, tested guard that every memory-touching route
 // calls is the only version of this that survives contact with the fifth route.
 //
-// It lives in host-kit, not do-runner/memory-id.ts (which owns the mints and the
-// pure ownership predicate), for two reasons: the guard's contract IS its HTTP
+// It lives in host-kit, not do-runner/memory-id.ts (which owns the mints),
+// because the guard's contract IS its HTTP
 // status — RunRouteError carries the 400/404 the doctrine names, so a route
 // gets the posture by calling it rather than by remembering to map an error —
-// and TenantContext lives in approval-api, which already imports do-runner
-// (a do-runner guard taking a TenantContext would invert that layering).
+// and do-runner stays independent of HTTP routing.
 
-import type { TenantContext } from '../approval-api/index.js';
+import { isPathSafeId } from '../do-runner/index.js';
 import { RunRouteError } from './run-route-error.js';
 
 /**
@@ -81,7 +79,7 @@ export function assertNoClientMemoryIds(body: unknown): void {
       if (field in value) {
         throw new RunRouteError(
           400,
-          `${field} is server-assigned (agent-memory ids are minted from the authenticated tenant — see docs/agent-memory-tenancy.md)`,
+          `${field} is server-assigned (agent-memory ids are minted by the host)`,
         );
       }
     }
@@ -90,30 +88,15 @@ export function assertNoClientMemoryIds(body: unknown): void {
 }
 
 /**
- * Assert the authenticated tenant owns a memory id, returning it for use.
- * 404 — never 403 — on a foreign id: the run router's rule, for the same
- * reason. A 403 would confirm that another tenant's threadId EXISTS, turning
- * every read path into an existence oracle over ids a caller can guess (a
- * resourceId is business identity — an email, a user id — so guessing is the
- * expected case, not a stretch).
- *
- * This is the ONLY thing between a foreign threadId and its history — nothing
- * downstream re-checks. Mastra's recall filters by `resourceId` only when the
- * caller passes one (`if (resourceId) query += ' AND resourceId = ?'`), and core
- * ships recall sites that pass a threadId alone, so a foreign thread recalls in
- * FULL past this point (pinned in do-runner/memory-recall-tenancy.test.ts). Call
- * it on EVERY memory read path; there is no second line.
- *
- * `tenant.ownsMemoryId` is exact because the tenant-ID pattern
- * excludes '_' from tenant ids, so 'acme' can never own 'acmecorp_...'
- * (do-runner/path-safe-id.ts).
+ * Validate a host-minted memory id before using it as a URL, D1, or Durable
+ * Object key. Malformed values map to 404 so the route exposes no separate
+ * validation oracle.
  */
-export function requireOwnedMemoryId(
-  tenant: TenantContext,
+export function requireMemoryId(
   id: string,
   label: TcbOnlyMemoryField = 'threadId',
 ): string {
-  if (typeof id !== 'string' || !tenant.ownsMemoryId(id)) {
+  if (!isPathSafeId(id)) {
     throw new RunRouteError(404, `${label} not found`);
   }
   return id;

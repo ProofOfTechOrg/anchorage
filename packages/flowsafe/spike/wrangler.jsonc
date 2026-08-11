@@ -23,7 +23,7 @@
     ]
   },
   // Append-only DO migrations: the v1 runner + v2 hub + v3 thread tags are
-  // frozen; the Track E per-tenant provider host DO ships under its own new v4 tag.
+  // frozen; the Track E deployment provider host DO ships under its own v4 tag.
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["DemoRunner"] },
     { "tag": "v2", "new_sqlite_classes": ["DemoHub"] },
@@ -42,8 +42,10 @@
   // WebSocket stream tickets so the /api/stream/* stage MOUNTS under
   // `pnpm spike`. scripts/spike-verify.mjs re-passes the SAME value via
   // `--var STREAM_TICKET_SECRET:...` so its forged-ticket probes share the key;
-  // keep the two byte-equal (like SWEEP_CRON/PURGE_CRON). Never a real secret.
+  // keep the two byte-equal with the verifier fixture. Never a real secret.
   "vars": {
+    "DEPLOYMENT_TENANT": "spike",
+    "DEPLOYMENT_IDENTITY_SECRET": "spike-local-deployment-identity-secret",
     "STREAM_TICKET_SECRET": "spike-local-stream-secret-do-not-deploy",
     // Track E: the github webhook signing secret. spike-verify.mjs re-passes it
     // via `--var` and signs its webhook probes with it (byte-equal). Never a real

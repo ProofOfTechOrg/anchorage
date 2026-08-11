@@ -7,25 +7,86 @@
 // one. Serialization of start/resume on a single run is enforced by
 // RunnerRuntime's per-run FIFO lock; routing one DO instance per run
 // (idFromName(`${workflowId}:${runId}`)) makes that lock authoritative,
-// since all traffic for a run lands on one instance. `state` is captured
-// for a future alarm-chained engine (setAlarm/alarm) but unused today.
+// since all traffic for a run lands on one instance. The object's alarm is
+// reserved for recovering run-owner claims that outlive an interrupted start.
 
+import {
+  decodeExecutionPrincipal,
+  type ExecutionPrincipal,
+  type ExecutionPrincipalKind,
+  isExecutionPrincipalId,
+  isExecutionPrincipalKind,
+} from '../approval-api/principal.js';
 import type { DurableObjectRunnerState, WebSocketLike } from './cf-types.js';
 import { newWebSocketPair, safeSend } from './cf-types.js';
-import { doErrorResponse } from './do-error-response.js';
-import { tenantOfRunId } from './path-safe-id.js';
-import { DurableStorageResumeLedger } from './resume-ledger.js';
-import type { RunnerRuntime, RunSummary } from './runtime.js';
+import {
+  verifyDurableObjectDeploymentIdentity,
+  verifyDurableObjectDeploymentRequest,
+} from './deployment-identity.js';
+import { DoStatusError, doErrorResponse } from './do-error-response.js';
+import { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
+import { isPathSafeId } from './path-safe-id.js';
+import {
+  InvalidRunRequestError,
+  RunAlreadyExistsError,
+  type RunnerRuntime,
+  type RunSummary,
+} from './runtime.js';
+import {
+  resolveScheduleStartOwner,
+  type ScheduleSourceStore,
+  type ScheduleSourceWorkflowTarget,
+} from './schedule-source.js';
+
+export interface DurableObjectRunOwner {
+  readonly kind: ExecutionPrincipalKind;
+  readonly id: string;
+}
+
+export interface DurableObjectRunOwnershipStore {
+  owner(
+    kind: 'run' | 'schedule' | 'thread' | 'resource',
+    resourceId: string,
+  ): Promise<DurableObjectRunOwner | undefined>;
+  reserveAll(
+    claims: readonly { kind: 'run'; resourceId: string }[],
+    owner: DurableObjectRunOwner,
+    token: string,
+  ): Promise<boolean>;
+  settleReservation(
+    token: string,
+    release: readonly { kind: 'run'; resourceId: string }[],
+  ): Promise<void>;
+}
+
+const RUN_OWNER_RECOVERY_KEY = 'flowsafe:run-owner-recovery:v1';
+const RUN_OWNER_RECOVERY_DELAY_MS = 60_000;
+
+interface RunOwnerRecovery {
+  version: 1;
+  workflowId: string;
+  runId: string;
+  token: string;
+}
 
 interface StartBody {
   workflowId?: string;
   runId?: string;
   inputData?: unknown;
+  initialState?: unknown;
+  scheduleId?: unknown;
+  dispatchId?: unknown;
 }
 
 interface ResumeBody {
   step?: string | string[];
   resumeData?: unknown;
+  requestedBy?: unknown;
+  requestedByKind?: unknown;
+}
+
+class DurableObjectRunIdentityError extends DoStatusError {
+  readonly status = 403;
 }
 
 export abstract class DurableObjectRunner<TEnv = unknown> {
@@ -33,6 +94,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
   /** Absent in Node tests; present under workerd and reserved for alarms. */
   protected readonly state?: DurableObjectRunnerState;
   #runtime?: RunnerRuntime;
+  #operationTail = Promise.resolve();
 
   constructor(state: DurableObjectRunnerState | undefined, env: TEnv) {
     this.state = state;
@@ -42,39 +104,22 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
   /** Define workflows via init() and return its runtime. Called once, lazily. */
   protected abstract build(env: TEnv): RunnerRuntime;
 
-  /**
-   * The tenant this instance serves, recovered from the DO's OWN identity.
-   * The name was set by the trusted Worker via
-   * idFromName(`${workflowId}:${runId}`) and is unforgeable at this boundary
-   * (`id.name` is populated only for idFromName-created ids). Safe to parse:
-   * PATH_SAFE_ID_PATTERN excludes ':' from workflowId, so the first ':' is
-   * the join; the tenant-ID pattern excludes '_' from tenantId, so the first '_' in the runId
-   * is the tenant boundary.
-   *
-   * THROWS rather than defaulting — an unscoped grant store is a cross-tenant
-   * capability mint. Node tests that exercise tenant-bound wiring pass a stub
-   * state `{ id: { name: 'wf:tenant_uuid' } }`; never soften this to a
-   * default for the workerd path.
-   */
-  protected get tenantId(): string {
-    const name = this.state?.id?.name;
-    if (!name) {
-      throw new Error(
-        'DurableObjectRunner.tenantId: the DO has no id.name (not created via idFromName, or running without state) — tenant unresolvable, refusing to scope',
-      );
-    }
-    const runId = name.slice(name.indexOf(':') + 1);
-    const tenantId = tenantOfRunId(runId);
-    if (tenantId === undefined) {
-      throw new Error(
-        `DurableObjectRunner.tenantId: runId '${runId}' carries no INV-3 tenant segment (INV-1 runIds are \`\${tenantId}_\${uuid}\`)`,
-      );
-    }
-    return tenantId;
+  /** The deployment-local ownership registry used for recoverable run starts. */
+  protected abstract runOwnership(env: TEnv): DurableObjectRunOwnershipStore;
+
+  /** Existing schedules domain used only for target-verifiable schedule fires. */
+  protected scheduleSource(_env: TEnv): ScheduleSourceStore | undefined {
+    return undefined;
   }
 
   async fetch(request: Request): Promise<Response> {
     try {
+      // Deployment-identity check BEFORE any routing or storage work: under
+      // workerd this instance refuses to serve until its env tag matches the
+      // database sentinel (fail closed on a mis-provisioned binding); off
+      // workerd (node tests, state undefined) it is a no-op. Memoized after
+      // the first success, so steady-state requests pay nothing.
+      await verifyDurableObjectDeploymentRequest(request, this.state, this.env);
       return await this.#route(request);
     } catch (error) {
       return doErrorResponse(error);
@@ -84,18 +129,6 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
   #ensureRuntime(): RunnerRuntime {
     if (!this.#runtime) {
       this.#runtime = this.build(this.env);
-      // Durable resume ledger: ctx.storage survives eviction, hibernation,
-      // and code deploys; in-memory class state does not. Adopting it HERE —
-      // not via a host-threaded parameter — is what makes the guarantee
-      // un-forgettable: every DO host gets eviction-proof resume ordinals.
-      // Absent under node/vitest (state is undefined), the runtime keeps its
-      // in-memory default.
-      const storage = this.state?.storage;
-      if (storage) {
-        this.#runtime.adoptDefaultResumeLedger(
-          new DurableStorageResumeLedger(storage),
-        );
-      }
     }
     return this.#runtime;
   }
@@ -119,35 +152,339 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     }
   }
 
+  #requestedBy(value: unknown): string {
+    if (!isExecutionPrincipalId(value)) {
+      throw new InvalidRunRequestError('run requester is missing or malformed');
+    }
+    return value;
+  }
+
+  #requestedByKind(value: unknown): DurableObjectRunOwner['kind'] {
+    if (!isExecutionPrincipalKind(value)) {
+      throw new InvalidRunRequestError('run requester kind is malformed');
+    }
+    return value;
+  }
+
+  #startPrincipal(request: Request): ExecutionPrincipal {
+    const encoded = request.headers.get(EXECUTION_PRINCIPAL_HEADER);
+    const principal = encoded ? decodeExecutionPrincipal(encoded) : undefined;
+    if (!principal) {
+      throw new DurableObjectRunIdentityError(
+        'run start carries no valid trusted execution principal',
+      );
+    }
+    return principal;
+  }
+
+  async #startSource(
+    principal: ExecutionPrincipal,
+    workflowId: string,
+    runId: string,
+    scheduleId: unknown,
+    dispatchId: unknown,
+  ): Promise<{
+    owner: DurableObjectRunOwner;
+    target?: ScheduleSourceWorkflowTarget;
+  }> {
+    if (scheduleId === undefined) {
+      if (dispatchId !== undefined) {
+        throw new InvalidRunRequestError(
+          'dispatchId is only valid for a scheduled run',
+        );
+      }
+      return {
+        owner: Object.freeze({ kind: principal.kind, id: principal.id }),
+      };
+    }
+    if (!isPathSafeId(scheduleId) || !isPathSafeId(dispatchId)) {
+      throw new InvalidRunRequestError(
+        'scheduleId and dispatchId are required path-safe identifiers',
+      );
+    }
+    const schedules = this.scheduleSource(this.env);
+    const source = schedules
+      ? await resolveScheduleStartOwner(
+          schedules,
+          this.runOwnership(this.env),
+          scheduleId,
+          dispatchId,
+          runId,
+          { type: 'workflow', workflowId },
+        )
+      : undefined;
+    if (!source) {
+      throw new InvalidRunRequestError(
+        'scheduled run source is missing or does not match the prepared workflow target',
+      );
+    }
+    return source;
+  }
+
+  async #reserveRunOwner(
+    runId: string,
+    owner: DurableObjectRunOwner,
+    token: string,
+  ): Promise<void> {
+    if (
+      !(await this.runOwnership(this.env).reserveAll(
+        [{ kind: 'run', resourceId: runId }],
+        owner,
+        token,
+      ))
+    ) {
+      throw new Error(
+        `run '${runId}' is unavailable or owned by another principal`,
+      );
+    }
+  }
+
+  async #withOperationLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.#operationTail;
+    let release: () => void = () => undefined;
+    this.#operationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  async #armRunOwnerRecovery(recovery: RunOwnerRecovery): Promise<void> {
+    const storage = this.state?.storage;
+    if (!storage) return;
+    if (!storage.setAlarm) {
+      throw new Error('run owner recovery requires Durable Object alarms');
+    }
+    await storage.setAlarm(Date.now() + RUN_OWNER_RECOVERY_DELAY_MS);
+    await storage.put(RUN_OWNER_RECOVERY_KEY, recovery);
+    await storage.setAlarm(Date.now() + RUN_OWNER_RECOVERY_DELAY_MS);
+  }
+
+  async #clearRunOwnerRecovery(): Promise<void> {
+    const storage = this.state?.storage;
+    if (!storage) return;
+    await storage.delete(RUN_OWNER_RECOVERY_KEY);
+    await storage.deleteAlarm?.();
+  }
+
+  async #clearRunOwnerRecoveryBestEffort(): Promise<void> {
+    try {
+      await this.#clearRunOwnerRecovery();
+    } catch (error) {
+      console.error('run owner recovery cleanup failed', error);
+    }
+  }
+
+  async #settleRunOwnerBestEffort(
+    recovery: RunOwnerRecovery,
+    release: boolean,
+  ): Promise<void> {
+    try {
+      await this.runOwnership(this.env).settleReservation(
+        recovery.token,
+        release ? [{ kind: 'run', resourceId: recovery.runId }] : [],
+      );
+      await this.#clearRunOwnerRecoveryBestEffort();
+    } catch (error) {
+      console.error('run owner recovery settlement failed', error);
+      try {
+        await this.#rearmRunOwnerRecovery();
+      } catch (alarmError) {
+        console.error('run owner recovery rearm failed', alarmError);
+      }
+    }
+  }
+
+  async #rearmRunOwnerRecovery(): Promise<void> {
+    const storage = this.state?.storage;
+    if (!storage?.setAlarm) {
+      throw new Error('run owner recovery requires Durable Object alarms');
+    }
+    await storage.setAlarm(Date.now() + RUN_OWNER_RECOVERY_DELAY_MS);
+  }
+
+  async #recoverRunOwner(recovery: RunOwnerRecovery): Promise<void> {
+    const summary = await this.#ensureRuntime().recoverStartAttempt(
+      recovery.workflowId,
+      recovery.runId,
+      recovery.token,
+    );
+    await this.runOwnership(this.env).settleReservation(
+      recovery.token,
+      summary ? [] : [{ kind: 'run', resourceId: recovery.runId }],
+    );
+    await this.#clearRunOwnerRecovery();
+  }
+
+  #runOwnerRecovery(value: unknown): RunOwnerRecovery {
+    if (value === null || typeof value !== 'object') {
+      throw new Error('stored run owner recovery is malformed');
+    }
+    const stored = value as Partial<RunOwnerRecovery>;
+    if (
+      stored.version !== 1 ||
+      !isPathSafeId(stored.workflowId) ||
+      !isPathSafeId(stored.runId) ||
+      !isPathSafeId(stored.token)
+    ) {
+      throw new Error('stored run owner recovery is malformed');
+    }
+    return {
+      version: 1,
+      workflowId: stored.workflowId,
+      runId: stored.runId,
+      token: stored.token,
+    };
+  }
+
+  async #recoverPendingRunOwner(): Promise<void> {
+    const stored = await this.state?.storage?.get<unknown>(
+      RUN_OWNER_RECOVERY_KEY,
+    );
+    if (stored !== undefined) {
+      await this.#recoverRunOwner(this.#runOwnerRecovery(stored));
+    }
+  }
+
+  async alarm(): Promise<void> {
+    await this.#withOperationLock(async () => {
+      await this.#rearmRunOwnerRecovery();
+      try {
+        await verifyDurableObjectDeploymentIdentity(this.state, this.env);
+        const stored = await this.state?.storage?.get<RunOwnerRecovery>(
+          RUN_OWNER_RECOVERY_KEY,
+        );
+        if (!stored) {
+          await this.state?.storage?.deleteAlarm?.();
+          return;
+        }
+        await this.#recoverRunOwner(this.#runOwnerRecovery(stored));
+      } catch (error) {
+        await this.#rearmRunOwnerRecovery();
+        throw error;
+      }
+    });
+  }
+
   async #route(request: Request): Promise<Response> {
     const segments = new URL(request.url).pathname.split('/').filter(Boolean);
     if (segments[0] !== 'runs') return json({ error: 'not found' }, 404);
-    const runtime = this.#ensureRuntime();
     const [, workflowId, runId, action] = segments;
 
     if (request.method === 'POST' && segments.length === 1) {
-      const body = await readJson<StartBody>(request);
-      if (!body || typeof body.workflowId !== 'string') {
-        return json({ error: 'workflowId is required' }, 400);
-      }
-      // The DO never generates a runId (INV-1): the trusted Worker mints the
-      // tenant-salted id and addresses this instance with it. A start without
-      // one is a caller bug, not a request for generation.
-      if (typeof body.runId !== 'string') {
-        return json(
-          { error: 'runId is required (server-minted by the run router)' },
-          400,
+      return this.#withOperationLock(async () => {
+        const principal = this.#startPrincipal(request);
+        const body = await readJson<StartBody>(request);
+        if (!body || typeof body.workflowId !== 'string') {
+          return json({ error: 'workflowId is required' }, 400);
+        }
+        // The DO never generates a runId (INV-1): the trusted Worker mints the
+        // id and addresses this instance with it. A start without one is a
+        // caller bug, not a request for generation.
+        if (typeof body.runId !== 'string') {
+          return json(
+            { error: 'runId is required (server-minted by the run router)' },
+            400,
+          );
+        }
+        const workflowId = body.workflowId;
+        const runId = body.runId;
+        if (!isPathSafeId(workflowId) || !isPathSafeId(runId)) {
+          throw new InvalidRunRequestError(
+            'workflowId and runId must be URL-path-safe identifiers',
+          );
+        }
+        this.#assertRunIdentity(workflowId, runId);
+        const source = await this.#startSource(
+          principal,
+          workflowId,
+          runId,
+          body.scheduleId,
+          body.dispatchId,
         );
-      }
-      this.#assertRunIdentity(body.workflowId, body.runId);
-      const summary = await runtime.start(body.workflowId, {
-        runId: body.runId,
-        inputData: body.inputData,
+        const runtime = this.#ensureRuntime();
+        await this.#recoverPendingRunOwner();
+        const existing = await runtime.status(workflowId, runId);
+        if (existing) {
+          const registered = await this.runOwnership(this.env).owner(
+            'run',
+            runId,
+          );
+          if (
+            !registered ||
+            registered.kind !== source.owner.kind ||
+            registered.id !== source.owner.id
+          ) {
+            throw new Error(
+              `existing run '${runId}' has no matching committed owner`,
+            );
+          }
+          throw new RunAlreadyExistsError(workflowId, runId, existing.status);
+        }
+        const recovery: RunOwnerRecovery = {
+          version: 1,
+          workflowId,
+          runId,
+          token: crypto.randomUUID(),
+        };
+        await this.#armRunOwnerRecovery(recovery);
+        try {
+          await this.#reserveRunOwner(runId, source.owner, recovery.token);
+          let summary: RunSummary;
+          try {
+            summary = await runtime.start(workflowId, {
+              runId,
+              inputData: source.target
+                ? source.target.inputData
+                : body.inputData,
+              initialState: source.target
+                ? source.target.initialState
+                : body.initialState,
+              ...(source.target?.requestContext !== undefined
+                ? { storedRequestContext: source.target.requestContext }
+                : {}),
+              requestedBy: principal.id,
+              requestedByKind: principal.kind,
+              attemptToken: recovery.token,
+            });
+          } catch (error) {
+            let persisted: RunSummary | null | undefined;
+            try {
+              persisted = await runtime.recoverStartAttempt(
+                workflowId,
+                runId,
+                recovery.token,
+              );
+            } catch {
+              await this.#rearmRunOwnerRecovery();
+              throw error;
+            }
+            if (persisted) {
+              await this.#settleRunOwnerBestEffort(recovery, false);
+              return json(persisted);
+            }
+            await this.#settleRunOwnerBestEffort(recovery, true);
+            throw error;
+          }
+          await this.#settleRunOwnerBestEffort(recovery, false);
+          // DL-018: the authoritative RunSummary is the run-progress frame; push it
+          // to any subscribed run-channel socket at this lifecycle boundary.
+          this.#broadcastRunSummary(summary);
+          return json(summary);
+        } catch (error) {
+          const stored = await this.state?.storage?.get<unknown>(
+            RUN_OWNER_RECOVERY_KEY,
+          );
+          if (stored !== undefined) {
+            await this.#rearmRunOwnerRecovery();
+          }
+          throw error;
+        }
       });
-      // DL-018: the authoritative RunSummary is the run-progress frame; push it
-      // to any subscribed run-channel socket at this lifecycle boundary.
-      this.#broadcastRunSummary(summary);
-      return json(summary);
     }
     if (
       request.method === 'GET' &&
@@ -156,8 +493,26 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       runId
     ) {
       this.#assertRunIdentity(workflowId, runId);
+      const runtime = this.#ensureRuntime();
       const summary = await runtime.status(workflowId, runId);
-      return summary ? json(summary) : json({ error: 'run not found' }, 404);
+      if (!summary) return json({ error: 'run not found' }, 404);
+      return json(summary);
+    }
+    if (
+      request.method === 'GET' &&
+      segments.length === 4 &&
+      action === 'dispatch-status' &&
+      workflowId &&
+      runId
+    ) {
+      this.#assertRunIdentity(workflowId, runId);
+      return this.#withOperationLock(async () => {
+        const runtime = this.#ensureRuntime();
+        await this.#recoverPendingRunOwner();
+        const summary = await runtime.status(workflowId, runId);
+        if (!summary) return json({ error: 'run not found' }, 404);
+        return json(summary);
+      });
     }
     if (
       request.method === 'GET' &&
@@ -186,15 +541,15 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       // ticket.runId to idFromName; re-bind to this instance's identity (INV-1)
       // before accepting so a mis-routed upgrade is refused.
       this.#assertRunIdentity(workflowId, runId);
+      const runtime = this.#ensureRuntime();
+      const snapshot = await runtime.status(workflowId, runId);
+      if (!snapshot) return json({ error: 'run not found' }, 404);
       const { 0: client, 1: server } = newWebSocketPair();
       state.acceptWebSocket(server);
       // On-connect snapshot: seed the new subscriber with the current
       // authoritative summary (DL-018) so it need not wait for the next
       // lifecycle transition. Nothing to send if the run is not yet queryable.
-      const snapshot = await runtime.status(workflowId, runId);
-      if (snapshot) {
-        safeSend(server, runFrame(snapshot));
-      }
+      safeSend(server, runFrame(snapshot));
       return new Response(null, {
         status: 101,
         webSocket: client,
@@ -209,13 +564,20 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     ) {
       this.#assertRunIdentity(workflowId, runId);
       const body = (await readJson<ResumeBody>(request)) ?? {};
-      const summary = await runtime.resume(workflowId, runId, {
-        step: body.step,
-        resumeData: body.resumeData,
+      const requestedBy = this.#requestedBy(body.requestedBy);
+      const requestedByKind = this.#requestedByKind(body.requestedByKind);
+      return this.#withOperationLock(async () => {
+        const runtime = this.#ensureRuntime();
+        const summary = await runtime.resume(workflowId, runId, {
+          step: body.step,
+          resumeData: body.resumeData,
+          requestedBy,
+          requestedByKind,
+        });
+        // DL-018: broadcast the post-resume authoritative summary.
+        this.#broadcastRunSummary(summary);
+        return json(summary);
       });
-      // DL-018: broadcast the post-resume authoritative summary.
-      this.#broadcastRunSummary(summary);
-      return json(summary);
     }
     return json({ error: 'not found' }, 404);
   }

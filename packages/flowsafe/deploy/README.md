@@ -1,128 +1,108 @@
 # Deploy Flowsafe on Cloudflare
 
-This reference Worker connects the Flowsafe Durable Object runner and approval
-queue on Cloudflare. It uses one Durable Object per run, Cloudflare D1 for
-snapshots and approvals, bearer-token authentication, and cron triggers for
-service-level agreement (SLA) enforcement and snapshot retention. Copy this
-directory into your project as the starting point for a real deployment. It
-typechecks in-repo against Flowsafe source through the same
-`@proofoftech/flowsafe/*` specifiers you keep when copying.
+This reference Worker connects the Flowsafe Durable Object runner and approval queue on Cloudflare. It uses one Durable Object per run, D1 for snapshots and approvals, bearer-token authentication, and a fixed alarm-driven maintenance singleton. Copy this directory into your project as the baseline for one organization.
 
-The spike sibling (`../spike/`) is the minimal worker this template grew from;
-deploy differences: real auth, cron maintenance, multi-gate approval
-bridging, `/healthz`, and env-tunable SLA/retention.
+Flowsafe's data plane is physically isolated. Each organization needs its own Worker, D1 database, and Durable Object namespaces. Before provisioning, replace every `replace-me` segment in `wrangler.jsonc` with the deployment tag; for example, tag `acme` uses Worker `anchorage-flowsafe-acme` and D1 database `anchorage-flowsafe-acme`. The Worker script name is also the Durable Object namespace boundary. Do not point multiple organizations at this deployment, reuse a script name, or add organization claims to bearer tokens.
 
-## Hosting a single tenant
+The sibling [`../spike/worker.ts`](../spike/worker.ts) is the smaller deterministic workerd proof. This template adds production-shaped authentication, maintenance, multi-gate approval bridging, `/healthz`, optional live streaming, and audit export.
 
-Flowsafe is multi-tenant by construction. You do not turn tenancy off; you
-use exactly one tenant. On this template that costs one field per token-map
-entry. `@proofoftech/breakwater` is unaffected: a breakwater-only consumer
-changes nothing.
+## Establish deployment identity
 
-**Pick a tenant id.** It must match `^[a-z0-9]{3,32}$` — lowercase letters and
-digits only; no underscore, hyphen, or dot. `default` is the conventional
-choice and is permanently reserved against allocation, so it can never collide
-with a client if you later run more than one tenant; your own company name
-(`acme`) is equally fine. The only id you may **not** use is `system` — it is
-the audit identity of the cron maintenance actor, and a token carrying it is
-rejected at parse time (and re-refused by the tenant resolver, whichever
-verifier you plug in).
+Provisioning stamps the same stable tag in two places:
 
-**Put it in the token map.** Every entry in the `APPROVAL_ACTOR_TOKENS` secret
-needs it; an entry without a valid `tenantId` is dropped at parse time (a
-`config-error` line in the logs) and its token 401s:
+- the `DEPLOYMENT_TENANT` variable in `wrangler.jsonc`;
+- the singleton `flowsafe_deployment.tenant_tag` row in D1.
 
-```json
-{"tok-ray":{"id":"ray","role":"reviewer","tenantId":"acme"}}
+The tag must match `^[a-z0-9]{3,32}$`. It is infrastructure attribution, not a request claim. The Worker checks the pair before every fetch and maintenance duty. Missing, malformed, or mismatched identity fails closed; fetch returns `503`.
+
+Production Durable Objects also require a `DEPLOYMENT_IDENTITY_SECRET`. Worker topologies stamp this internal credential on every Worker-to-object request, and each object compares it in constant time before reading storage. This prevents an accidental or hostile cross-script Durable Object binding from reaching another deployment even when that target's environment and D1 sentinel agree. Alarms have no caller request, so they validate the target environment and sentinel only.
+
+Seed a new D1 database before application migrations or traffic:
+
+```bash
+pnpm --dir packages/flowsafe provision:deployment -- \
+  --database anchorage-flowsafe-acme \
+  --tag acme \
+  --remote \
+  --config deploy/wrangler.jsonc
+
+pnpm --dir packages/flowsafe exec wrangler secret put \
+  DEPLOYMENT_IDENTITY_SECRET \
+  --config deploy/wrangler.jsonc
+pnpm --dir packages/flowsafe exec wrangler secret put \
+  MAINTENANCE_ADMIN_SECRET \
+  --config deploy/wrangler.jsonc
 ```
 
-That is the whole configuration. Everything downstream binds itself: the
-tenant resolver binds each request's approval store to the authenticated
-token's tenant, and each run's Durable Object binds its grant store to the
-tenant prefix of its own run id. You never write the tenant id into
-`worker.ts` — the maintenance actor stays `system` on purpose.
+These commands run from the Anchorage repository checkout. Applications that install `@proofoftech/flowsafe` can run the published binary as `pnpm exec flowsafe-provision` or `npx flowsafe-provision`; it uses the application's Wrangler 4 installation.
 
-**What changes that you will notice.** Run ids become `acme_<uuid>`. They are
-minted server-side; `POST /runs` with a `runId` in the body returns `400`. Do
-not parse, pin, or derive anything from a run id — treat it as an opaque
-identifier that happens to carry its tenant.
+Provisioning verifies the exact sentinel schema and singleton row. It is idempotent for the same tag, refuses to re-stamp a database owned by another deployment, and refuses to adopt an unowned database that already contains any application table. Do not expose provisioning as a public route or overwrite a mismatched sentinel. Recreate the resource set instead. Library hosts can call `seedDeploymentIdentity(db, tag)` from an equivalent trusted provisioning process.
 
-**If you route runs yourself.** `createRunRouter` mints the run id for you. If
-you bypass it and call `RunnerRuntime.start` directly, you must still pass
-`` `${tenantId}_${uuid}` `` — `start` requires a `runId` and no longer
-generates one. This matters because a Durable Object recovers its tenant by
-reading the prefix off its own run id: a hand-minted `batch_42` would bind
-that Durable Object's grant store to a phantom tenant `batch`, and approvals
-created under `acme` would never mint a grant. `ApprovalService` prevents this
-state by rejecting approval creation when the run ID does not carry the
-tenant's `acme_` prefix.
-
-**What you can ignore.** The `tenants` registry exists to keep multiple
-tenants unique; with one tenant you may skip it. Skipping is mandatory for
-`default`: it is deliberately not provisionable, which keeps it available for
-single-tenant deployments. A named tenant such as `acme` can be provisioned
-now to keep the upgrade path clean. The subdomain-to-tenant cross-check
-(`TENANT_APEX_DOMAIN`) is for `<client>.example.com` hosts. `hmacVerifier`,
-OAuth sign-in, and the demo sandbox are unnecessary for this template.
-`staticTokenVerifier` over your token map is the whole identity layer.
-`purgeTenant` is for offboarding a client.
-
-**What you must not do.** Do not make `tenantId` optional or give it a
-default. An omissible tenant is the one failure this design exists to prevent:
-on the day you add a second tenant, every tenant-less token silently becomes
-the first one. Typing `"tenantId":"acme"` a few times is the cheaper trade.
+Run and thread ids are server-minted opaque values. Resource ids are validated host-owned business keys; never accept a full resource id from an untrusted request. Do not parse an organization from any id.
 
 ## Deploy the Worker
 
-Run these commands from `packages/flowsafe`. Provision every named tenant from
-a private control-plane Worker before you issue credentials. The
-`provisionTenant()` call creates the registry table and refuses duplicate or
-reserved IDs:
-
-```typescript
-import { provisionTenant } from '@proofoftech/flowsafe/host-kit';
-
-await provisionTenant(env.DB, {
-  tenantId: 'acme',
-  kind: 'commercial',
-});
-```
-
-Single-tenant deployments that use the reserved `default` ID skip this
-provisioning call, as described above.
+Run these commands from `packages/flowsafe`:
 
 ```bash
-# 1. Create the database, then paste the printed ID into deploy/wrangler.jsonc.
-pnpm exec wrangler d1 create anchorage-flowsafe \
+# 1. Replace every `replace-me` segment with `acme`, create the deployment's
+#    uniquely named database, and paste the printed id into wrangler.jsonc.
+pnpm exec wrangler d1 create anchorage-flowsafe-acme \
   --config deploy/wrangler.jsonc
 
-# 2. Provision each tenant before issuing any token that names it.
-#    provisionTenant() is insert-or-fail against the `tenants` registry;
-#    nothing else enforces tenant-id uniqueness, and two clients slugged
-#    `acme` would merge their runs, approvals, budgets, and artifacts.
-#    tenantId must match ^[a-z0-9]{3,32}$ and must not be a reserved slug.
+# 2. Set DEPLOYMENT_TENANT in deploy/wrangler.jsonc, seed the same tag before
+#    application migrations, and set both per-deployment internal credentials.
+pnpm provision:deployment -- \
+  --database anchorage-flowsafe-acme \
+  --tag acme \
+  --remote \
+  --config deploy/wrangler.jsonc
+pnpm exec wrangler secret put DEPLOYMENT_IDENTITY_SECRET \
+  --config deploy/wrangler.jsonc
+pnpm exec wrangler secret put MAINTENANCE_ADMIN_SECRET \
+  --config deploy/wrangler.jsonc
 
-# 3. Mint actor tokens (any random strings) and store the map as a secret:
-#    roles: admin | builder | operator | reviewer | viewer
+# 3. Store a static actor map for the reference verifier. Production hosts
+#    should replace this verifier with JWT, OIDC, or mTLS validation.
 pnpm exec wrangler secret put APPROVAL_ACTOR_TOKENS \
   --config deploy/wrangler.jsonc
-# paste, e.g.: {"tok-ray":{"id":"ray","role":"reviewer","tenantId":"acme"},
-#               "tok-op":{"id":"op","role":"operator","tenantId":"acme"}}
-# A missing, malformed, or reserved tenantId drops that entry; its token 401s.
+# Example: {"tok-ray":{"id":"ray","role":"reviewer"},
+#           "tok-op":{"id":"op","role":"operator"}}
 
-# 4. Optional: enable live WebSocket streams with a dedicated signing secret.
+# 4. Optionally enable live WebSocket streams with a dedicated signing key.
 pnpm exec wrangler secret put STREAM_TICKET_SECRET \
   --config deploy/wrangler.jsonc
 
-# 5. Deploy.
+# 5. Deploy after the sentinel is present, then bootstrap the maintenance alarm.
 pnpm deploy:cf
+curl -fsS -X POST https://your-worker.example/admin/ensure-maintenance \
+  -H "authorization: Bearer ${maintenance_admin_secret}"
+```
 
-# 6. Verify. Copy approval_id and run_id from the start response.
-worker_url=https://your_worker_subdomain.workers.dev
+For local iteration, set `DEPLOYMENT_TENANT` to `acme`, seed the local database, then run `pnpm deploy:dev`:
+
+```bash
+pnpm provision:deployment -- \
+  --database anchorage-flowsafe-acme \
+  --tag acme \
+  --local \
+  --config deploy/wrangler.jsonc \
+  --persist-to .wrangler/state
+pnpm deploy:dev
+```
+
+Wrangler uses local D1 and Durable Object state, so local development does not require a Cloudflare account. Put distinct development-only `DEPLOYMENT_IDENTITY_SECRET` and `MAINTENANCE_ADMIN_SECRET` values of at least 32 visible ASCII characters in `deploy/.dev.vars`.
+
+Do not upgrade a legacy pooled or differently owned script in place. Deploy the new tag-suffixed Worker name with a fresh D1 database and fresh Durable Object namespaces, verify it without public traffic, and then move the route. Reusing the old script name retains its Durable Object namespaces even when D1 is replaced.
+
+Verify the approval path after deployment:
+
+```bash
+worker_url=https://your-worker.example
 operator_token=tok-op
 reviewer_token=tok-ray
-approval_id=replace_with_approval_id
-run_id=replace_with_run_id
+approval_id=replace-with-approval-id
+run_id=replace-with-run-id
 
 curl -fsS "${worker_url}/healthz"
 curl -sS -X POST "${worker_url}/runs" \
@@ -140,207 +120,92 @@ curl -sS "${worker_url}/runs/example-approval/${run_id}" \
   -H "authorization: Bearer ${reviewer_token}"
 ```
 
-For local iteration, run `pnpm deploy:dev`. Wrangler uses local D1 and Durable
-Object state, so this command does not require a Cloudflare account.
+Before production, bind a scratch Worker to a database stamped with a different tag. Confirm `/healthz` and protected routes return `503`, no workflow runs, and the log contains `deployment-identity-error`.
 
 ## Use the HTTP routes
 
-The reference Worker mounts health, workflow, approval, and optional live-stream
-routes. Every non-stream route except `GET /healthz` requires a valid bearer
-token. `POST /api/stream/ticket` also requires a bearer token; the two
-WebSocket routes authenticate with the resulting short-lived ticket.
+Every route except `GET /healthz` requires a valid actor credential. `/healthz` is unauthenticated but still verifies deployment identity. `POST /api/stream/ticket` requires a bearer token; WebSocket routes authenticate the resulting short-lived ticket.
 
 | Method and route | Purpose |
 | --- | --- |
-| `GET /healthz` | Return Worker liveness |
+| `GET /healthz` | Verify deployment identity and return liveness |
 | `GET /workflows` | List registered workflows and the authenticated actor |
-| `POST /runs` | Start a server-ID-assigned run and queue every observed suspension |
+| `POST /runs` | Start a server-id-assigned run and queue each observed suspension |
 | `GET /runs/:workflowId/:runId` | Read run status and reconcile a missing approval record |
-| `POST /runs/:workflowId/:runId/resume` | Resume without adding connector grants; approval-gated connectors still fail closed |
-| `GET /api/approvals` | List and filter the tenant's approval queue |
-| `GET /api/approvals/metrics` | Read tenant-scoped queue metrics |
+| `POST /runs/:workflowId/:runId/resume` | Resume without connector grants; approval-gated connectors still fail closed |
+| `GET /api/approvals` | List and filter the deployment approval queue |
+| `GET /api/approvals/metrics` | Read deployment queue metrics |
 | `GET /api/approvals/:id` | Read one approval |
 | `POST /api/approvals/:id/claim` | Claim a pending or escalated approval |
 | `POST /api/approvals/:id/decide` | Approve or reject one approval and attempt to resume its run |
 | `POST /api/approvals/:id/delegate` | Assign an open approval to another reviewer |
-| `POST /api/approvals/batch/decide` | Apply one decision to at most 100 unique approval IDs |
-| `POST /api/stream/ticket` | Mint a 60-second hub or run stream ticket when streaming is enabled |
-| `GET /api/stream/hub?ticket=stream_ticket` | Open the tenant approval and presence WebSocket |
+| `POST /api/approvals/batch/decide` | Apply one decision to at most 100 unique approval ids |
+| `POST /api/stream/ticket` | Mint a 60-second hub or run-stream ticket when streaming is enabled |
+| `GET /api/stream/hub?ticket=stream_ticket` | Open the deployment approval and presence WebSocket |
 | `GET /api/stream/run/:workflowId/:runId?ticket=stream_ticket` | Open the run-progress WebSocket |
 
-The Worker does not mount `POST /api/approvals`. Approval records come from
-observed workflow suspensions, not request bodies. The `/api/stream/*` routes
-exist only when both the `HUB` binding and `STREAM_TICKET_SECRET` are present.
-
-## Understand scheduled maintenance
-
-`triggers.crons` declares two expressions, and `scheduled()` dispatches on
-`controller.cron` (`SWEEP_CRON` versus `PURGE_CRON` in `crons.ts`) so the two
-maintenance duties never share an invocation. A Workers CPU-limit termination
-kills the isolate and is not a catchable JavaScript error, so a slow sweep
-sharing an invocation could starve the purge. An unrecognized cron expression
-runs both duties sequentially and logs a `config-error`, preserving both duties
-when Wrangler configuration and the constants disagree.
-
-- **SLA sweep**: The standalone `sweepSLA(factory.system(), …)` escalates
-  every open approval past its `slaDeadlineAt`, across all tenants; each
-  escalation lands a structured `sla-escalation` log line and the audit
-  trail (extend `runSlaSweepMaintenance`'s seam to page/Slack from it).
-  It is deliberately **not** a service method and **not** an HTTP route: an
-  unfiltered cross-tenant read *and write* behind a role check would let any
-  sweep-capable actor escalate every tenant's queue. Its parameter type,
-  `SystemApprovalStore`, is unobtainable from a request handler.
-- **Run retention purge**: `purgeExpiredWorkflowRuns()` deletes terminal-status
-  run snapshots older than `RUN_RETENTION_DAYS` in limited batches per firing.
-  The shrinking eligible set acts as the cursor. Suspended and running runs
-  are never purged, so a run abandoned at an approval gate is reclaimed only
-  by `purgeTenant()` at offboarding. Storing run artifacts in R2? Pass your
-  `R2ArtifactStore` as `artifactStore` (here and to `purgeTenant`): the
-  snapshot row is the only record of a run's artifact keys, so an unpaired
-  retention purge strands the purged runs' artifacts.
-- **Thread retention purge**: `purgeExpiredThreads()` deletes agent-memory
-  threads whose `updatedAt` is older than `THREAD_RETENTION_DAYS`, each with
-  its messages (a message has a `createdAt` but no `updatedAt`, so there is no
-  per-message idleness signal — its lifetime is its thread's, and it is
-  reachable only through it). A thread is deleted only when no message points
-  at it, so a send racing the purge can never be orphaned. The purge uses
-  limited batches and the same shrinking-eligible-set cursor. It is unset by
-  default: unlike a terminal run snapshot, a conversation is not finished by
-  definition, so nothing expires until you name a number.
-  Working-memory rows (`mastra_resources`) are never touched here — they
-  belong to the owner across every thread, and go at offboarding.
-- **Approval retention purge**: `purgeExpiredApprovals()` deletes decided
-  (`approved`/`rejected`) approval records whose terminal timestamp
-  (`decidedAt`, or `updatedAt` for a decided record persisted without one)
-  is older than `APPROVAL_RETENTION_DAYS`. It uses limited batches and the same
-  shrinking-eligible-set cursor. Open requests
-  (`pending`/`claimed`/`escalated`) are never purged at any age — an
-  approval still awaiting a decision is not garbage, mirroring
-  `purgeExpiredWorkflowRuns`'s "live runs are never purged". Runs in the
-  same `PURGE_CRON` firing as the snapshot purge, in its own isolated
-  try/catch, so a failure in either never stops the other.
-
-Keep the sweep interval at or below your SLA granularity; the default
-`*/15 * * * *` adds less than 15 minutes of scheduling delay to a 4-hour SLA.
-Keep the Wrangler
-expressions byte-equal to crons.ts's `SWEEP_CRON`/`PURGE_CRON` constants.
+The Worker does not mount `POST /api/approvals`. Approval records come from observed workflow suspensions, not request bodies. The `/api/stream/*` routes exist only when both the `HUB` binding and `STREAM_TICKET_SECRET` are present.
 
 ## Configure the deployment
 
 | Name | Kind | Default | Meaning |
-| ---- | ---- | ------- | ------- |
-| `APPROVAL_ACTOR_TOKENS` | secret | none; protected routes return 401 | JSON map of bearer token → `{ id, role, tenantId }`; entries with a missing or malformed tenant ID, or the reserved `system` ID, are dropped |
-| `TENANT_APEX_DOMAIN` | var | unset (no cross-check) | Client-per-subdomain apex, e.g. `example.com`. A request to `<tenant>.<apex>` is denied unless the token's verified tenant is that tenant. Defense in depth over the tenant-bound stores |
-| `APPROVAL_SLA_SECONDS` | var | `14400` (4 hours) | Default SLA applied to new approvals |
-| `APPROVAL_ALLOW_SELF_DECISION` | var | unset; separation of duties enforced | Exempts decider roles from both requester self-approval and prior-gate reviewer checks. `true` exempts every decider; a comma-separated role list such as `admin` exempts only those roles. Invalid values preserve separation of duties. Permitted requester self-decisions include `detail.selfDecision: true` in audit events |
-| `RUN_RETENTION_DAYS` | var | `30` | Terminal snapshot age before cron purge; `0` makes every terminal run eligible on the next purge |
-| `APPROVAL_RETENTION_DAYS` | var | `30` | Decided approval age before cron purge; `0` makes every decided record eligible on the next purge |
-| `THREAD_RETENTION_DAYS` | var | unset (threads never expire) | Agent-memory thread TTL: idle days before the purge cron deletes a thread and its messages. Unset leaves the duty unwired |
-| `STREAM_TICKET_SECRET` | secret | unset (polling only) | Dedicated HMAC key that enables 60-second WebSocket tickets. Keep it distinct from authentication secrets |
-| `AUDIT_QUEUE` | queue binding | unbound (logs only) | Enables audit export: events flow to the queue consumer |
-| `SIEM_ENDPOINT` | var | none (consumer retries) | HTTP event-collector URL that receives newline-delimited JSON batches |
-| `SIEM_AUTH_HEADER` | secret | none | Sent as the `authorization` header on export POSTs |
+| --- | --- | --- | --- |
+| `DEPLOYMENT_TENANT` | variable | none; requests fail `503` | Required stable tag that must match the D1 sentinel |
+| `DEPLOYMENT_IDENTITY_SECRET` | secret | none; requests fail `503` | Required 32–256 visible ASCII character internal credential shared only by this deployment's Worker and Durable Objects |
+| `MAINTENANCE_ADMIN_SECRET` | secret | none; admin routes return `503` | Required 32–256 visible ASCII control-plane credential for maintenance bootstrap and status |
+| `APPROVAL_ACTOR_TOKENS` | secret | none; protected routes return `401` | JSON map of bearer token to `{ id, role }`. Unknown roles and empty actor ids are dropped |
+| `APPROVAL_SLA_SECONDS` | variable | `14400` | SLA applied to new approvals |
+| `APPROVAL_ALLOW_SELF_DECISION` | variable | unset | Separation of duties remains enabled. `true` exempts all deciders; a comma-separated role list exempts only those roles |
+| `RUN_RETENTION_DAYS` | variable | `30` | Terminal snapshot age before alarm-driven purge; `0` makes every terminal run eligible |
+| `APPROVAL_RETENTION_DAYS` | variable | `30` | Decided approval age before alarm-driven purge |
+| `THREAD_RETENTION_DAYS` | variable | unset | Optional idle thread and message retention duty |
+| `STREAM_TICKET_SECRET` | secret | unset | Dedicated HMAC key for 60-second WebSocket tickets |
+| `AUDIT_QUEUE` | Queue producer binding | unbound | Queues audit events for the shared control-plane consumer |
 
-## The conventions the template encodes
+Keep authentication, stream-ticket, model-provider, connector, webhook, and SIEM secrets distinct.
 
-- **Reuse `@proofoftech/flowsafe/host-kit`**: The whole Worker pipeline is
-  `createFlowsafeWorker()`: the `/healthz` → approvals → runs → 404 fetch order,
-  the authentication seam
-  (`parseActorTokens` + `bearerActorAuthenticator`), the run routes with
-  their role-based access control (RBAC) order (`createRunRouter`), the
-  approval bridge
-  (`queueApprovalForSuspension`, `resumeRunWithRequeue`), the two-cron
-  `scheduled()` dispatch, and the audit-export `queue()` consumer. These are
-  security-critical and tested in the library. `worker.ts` supplies only what
-  is deployment-specific: the workflows, the memoized `buildVerifier`, the
-  cron expressions, and the optional subdomain cross-check (`wrapResolve`).
-  Do not re-derive them.
-- **Authenticate first, then construct**: The routers take a `TenantResolver`,
-  not a bare `authenticate`: it verifies the token, validates the tenant claim,
-  and binds the approval store to that tenant — so there is no pre-auth service
-  for a later refactor to reach for. Swap `staticTokenVerifier` for
-  `hmacVerifier` or your own `TokenVerifier` (JWKS, OIDC); everything else
-  (role checks, separation of duties, self-approval denial, the tenant
-  predicates) stays. With no `APPROVAL_ACTOR_TOKENS` secret the map is empty
-  and every authenticated route 401s — fail closed.
-- **Scope the store factory to the isolate**:
-  `D1ApprovalStoreFactory` owns one memoized schema-init pass; rebuilding it
-  inside `fetch()` re-runs the whole DDL on every request. The template holds
-  it in a module-scoped `WeakMap` keyed by the D1 binding.
-- **Provision tenant IDs**: Provision through the `tenants`
-  registry before issuing tokens, and read a tenant's *kind* from that registry
-  rather than inferring it from its id.
-- **Keep approval creation off the public API**: `createApprovalRouter` mounts
-  `POST /api/approvals` only when passed `allowCreate: true`, and even then a
-  body may not set `connectors` (which *is* the minted grant), `requestedBy`
-  (which separation-of-duties compares), or the fields selecting which leg a
-  grant mints on. Approval records are authored in-process from an observed
-  suspension. Never widen this.
-- **Treat each suspension as an approval request**: Both bridges, start and
-  resume, run through `queueApprovalForSuspension()`, which captures the suspension's
-  `(suspendedAt, resumeCount)` pair so grant minting binds the decision to that
-  exact suspension (clock-free), and reads the suspend payload's `connectors`
-  array so a decision mints exactly the grants the step asked for. That array
-  must be a **server-authored static literal** — deriving it from run input
-  would let client input choose its own capability. Multi-gate workflows
-  re-enter the queue automatically on each re-suspension
-  (`resumeRunWithRequeue`).
-- **Keep workflow metadata aligned with runtime registration**: Each entry in `WORKFLOWS`
-  is served at `GET /workflows` and gates `POST /runs` via its optional
-  `allowedRoles` (a subset of the coarse `RUN_START_ROLES` check that runs
-  first). `defineWorkflows` asserts every listed id was actually committed.
-- **Derive grants on the server**: The Durable Object-side
-  `approvalGrantProvider` derives `breakwater.connectorGrants` from `approved`
-  records on every start or resume. `RunnerRuntime` derives
-  `breakwater.connectorExecution` from the authoritative leg. The public
-  raw-resume route stays grant-free and gated steps fail closed on forged
-  resumes. A forged `resumeData.approved` can cosmetically flip a workflow
-  boolean but grants no connector capability. The side-effecting step
-  re-checks the server-derived structured grant, so treat `resumeData` as
-  untrusted, never as the security boundary.
-- **Preserve separation of duties across gates**: `queueApprovalForSuspension`
-  attributes each auto-queued approval to the human who advanced the run
-  (`requestedBy` = the starting actor, or the reviewer whose decision caused
-  a re-suspension), not the `SYSTEM_ACTOR` bridge — so the library's
-  self-decision check can fire and a start actor cannot approve their own
-  run. Dropping `requestedBy` here silently disables that control.
-- **Emit structured logs and optionally export them**: Audit events, SLA
-  escalations, config errors, and maintenance counts all go to Workers Logs
-  as single-line JSON (for example, `{"type":"audit"}`). Uncomment
-  the `queues` block in wrangler.jsonc and audit events additionally flow
-  producer → queue → the `queue` consumer → an authenticated
-  newline-delimited JSON POST to
-  `SIEM_ENDPOINT` (`@proofoftech/flowsafe/audit-export`); a failed export
-  retries the whole batch into Queues backoff and the dead-letter queue, so
-  no event is acked before the collector confirmed it.
+## Understand alarm-driven maintenance
+
+The fixed `deployment-maintenance` Durable Object stores the next sweep and purge times. Each alarm persists its successor before running one due duty. If both duties are due, the object schedules an immediate follow-up alarm instead of sharing the invocation. A Workers CPU-limit termination cannot break the alarm chain or starve the other duty.
+
+After deployment, authenticate `POST /admin/ensure-maintenance` with `MAINTENANCE_ADMIN_SECRET`. Read `GET /admin/maintenance-status` with the same credential and alert when `alarmAt` is null or the last successful duty is stale.
+
+- `sweepSLA(store, ...)` scans the deployment approval store and escalates open requests past `slaDeadlineAt`. It is maintenance code, not an HTTP service method.
+- `purgeExpiredWorkflowRuns()` deletes terminal snapshots in bounded batches. Suspended and running runs remain at every age.
+- `purgeExpiredApprovals()` deletes approved and rejected records. Pending, claimed, and escalated requests remain.
+- `purgeExpiredThreads()` is optional. It deletes an idle thread with its messages and leaves working-memory resources intact.
+
+Pass the same `R2ArtifactStore` to runtime writes and retention. Snapshot rows are the enumerable record of artifact keys, so artifacts must delete before the corresponding row.
+
+Schedules, subscriptions, resources, and working memory have no TTL. The schedule and subscription routes delete their records explicitly. Resources and permanent thread teardown remain host-owned: remove every authoritative binding and wake source before releasing the corresponding ownership claims. Idle-thread retention deletes memory rows but deliberately keeps those claims. Deployment decommissioning removes whatever remains. Open approvals and live runs are never age-purged and remain until they reach a terminal state or the deployment is decommissioned. There is no in-database organization purge.
+
+## Preserve the host conventions
+
+- Reuse `createFlowsafeWorker()`, `createFlowsafeMaintenanceDurableObject()`, and the host-kit routers. They own deployment verification, route order, actor resolution, role gates, approval bridging, and maintenance dispatch.
+- Replace only the `TokenVerifier` seam for production identity. A verified actor has `id` and `role`; it does not choose deployment identity.
+- Keep `D1ApprovalStoreFactory` scoped to the isolate and call `.store()`. Rebuilding it in every request repeats schema initialization.
+- Keep approval creation off the public API. The suspension bridge supplies server-authored connector ids, requester attribution, exact suspension identity, and resume targets.
+- Treat every suspension as a new approval request. Preserve the `(suspendedAt, resumeCount)` pair and keep connector ids as server-authored static literals.
+- Keep workflow metadata aligned with runtime registration. `assertWorkflowsRegistered()` verifies that the public catalog and committed definitions agree.
+- Derive grants on the server with `approvalGrantProvider()`. Public resume data never confers connector authority.
+- Preserve separation of duties across gates. Attribute queued approvals to the execution principal that advanced the run, not the maintenance principal.
+- Use D1 idempotency and rate-limit stores when budgets must survive isolate replacement. In this single-organization data plane, connector keys and budgets are deployment-wide unless the application deliberately supplies another non-tenant logical scope outside Flowsafe.
+- Emit structured audit and maintenance events. Queue export failures retry and dead-letter without acknowledging unconfirmed events.
 
 ## Test and verify the deployment
 
-The template's correctness rests on four independently-maintained layers:
+Run:
 
-1. **Its own executable test.** `worker.e2e.test.ts` (part of `pnpm -r test`)
-   drives the real exported handler in-process: real Mastra `D1Store` and
-   `D1ApprovalStore` over `node:sqlite` behind a D1-shaped adapter, real
-   `FlowsafeRunner` instances behind a stub Durable Object namespace. It pins
-   the authentication seam, including the reserved-`system` token drop; the
-   full start → auto-queued approval → separation-of-duties denials → reviewer
-   decision → grant-minted publish loop; the fail-closed forged resume; the tenant
-   boundary (client runId 400, cross-tenant 404s), `scheduled()` (SLA
-   escalation + terminal-only retention purge, with the two surfaces isolated
-   from each other's failures), and the `queue()` audit-export consumer.
-2. **Typecheck.** `pnpm --filter @proofoftech/flowsafe typecheck` includes
-   `deploy/tsconfig.json`, so the wiring is type-checked against flowsafe
-   source through the real `@proofoftech/flowsafe/*` specifiers.
-3. **The library test suite.** Every enforcement rule the template relies on
-   — role authorization, compare-and-swap transitions, SLA/escalation, self-decision
-   separation of duties, grant derivation — is covered by the `approval-api`
-   and `do-runner` unit tests. The template only *feeds* those guarantees; it
-   does not reimplement them.
-4. **The `spike:verify` end-to-end proof on workerd.** The sibling `../spike/`
-   worker shares the same library and is driven by
-   `pnpm --filter @proofoftech/flowsafe spike:verify` (also run in CI), which
-   proves suspend → process-kill → restart-on-persisted-state → grant-minted
-   resume on the real Workers runtime — the process-death durability layer 1
-   cannot exercise in-process. A local `pnpm deploy:dev` smoke against
-   workerd (no Cloudflare account) covers the same ground for this template
-   via the `curl` commands in the deploy checklist above.
+```bash
+pnpm --filter @proofoftech/flowsafe lint
+pnpm --filter @proofoftech/flowsafe typecheck
+pnpm --filter @proofoftech/flowsafe test
+pnpm --filter @proofoftech/flowsafe build
+pnpm --filter @proofoftech/flowsafe spike:verify
+```
+
+`worker.e2e.test.ts` exercises the handler with non-fidelity SQLite adapters for route composition. The Wrangler harness covers deployment identity, maintenance bootstrap, durable alarm state, one-duty dispatch, and failure recovery against real D1 and workerd.
+
+`spike:verify` adds the workerd boundary: suspend, kill, restart on persisted state, resume from an approved record, and refuse a mismatched deployment sentinel.
+
+See the repository [deployment reference](../../../docs/deployment-reference.md), [operations runbook](../../../docs/operations-runbook.md), and [security threat model](../../../docs/security-threat-model.md) before exposing traffic.

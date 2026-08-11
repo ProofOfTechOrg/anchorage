@@ -13,8 +13,6 @@
 
 import type { D1Database, DurableObjectState } from '@cloudflare/workers-types';
 
-import type { ResumeLedgerStorage } from './resume-ledger.js';
-
 /**
  * Structural subset of D1Database — the binding init() and createD1Storage
  * forward, opaque, into @mastra/cloudflare-d1's D1Store (see the cast at
@@ -55,6 +53,15 @@ export interface WebSocketPairLike {
   readonly 1: WebSocketLike;
 }
 
+/** Structural key/value and alarm subset shared by the Durable Object hosts. */
+export interface DurableKeyValueStorage {
+  get<T = unknown>(key: string): Promise<T | undefined>;
+  put<T>(key: string, value: T): Promise<void>;
+  delete(key: string): Promise<boolean>;
+  setAlarm?(scheduledTime: number | Date): Promise<void>;
+  deleteAlarm?(): Promise<void>;
+}
+
 /**
  * The `WebSocketPair` runtime global (workerd), typed to the structural
  * WebSocketPairLike. Read off globalThis — NOT imported from 'cloudflare:workers'
@@ -90,9 +97,8 @@ export function safeSend(ws: WebSocketLike, frame: string): void {
 
 /**
  * Structural subset of DurableObjectState — the shape DurableObjectRunner
- * reads from. `id.name` (tenant/run identity recovery off the DO's own
- * tenant-scoped idFromName address) and `storage` (the ctx.storage-backed resume
- * ledger — DurableStorageResumeLedger in resume-ledger.ts) are always touched;
+ * reads from. `id.name` (run-identity recovery off the DO's own idFromName
+ * address) and `storage` (owner-recovery records and alarms) are always touched;
  * the Hibernatable-WebSocket members are OPTIONAL so node/vitest stubs that
  * set only id.name/storage still satisfy the type and the per-run WS stream
  * route can guard on their presence (absent ⇒ the non-WS 426 fallback).
@@ -101,7 +107,7 @@ export interface DurableObjectRunnerState {
   readonly id: {
     readonly name?: string;
   };
-  readonly storage: ResumeLedgerStorage;
+  readonly storage: DurableKeyValueStorage;
   /** Make a server socket hibernatable (workerd-only). */
   acceptWebSocket?(ws: WebSocketLike, tags?: string[]): void;
   /** Every hibernatable socket currently attached, optionally by tag. */
@@ -109,13 +115,13 @@ export interface DurableObjectRunnerState {
 }
 
 /**
- * Structural subset of DurableObjectState the per-tenant hub DO (hub-do.ts)
- * reads: its OWN idFromName identity — `id.name` IS the bare tenantId, with no
- * ':' join and no runId decode, unlike DurableObjectRunner whose name is
- * `${workflowId}:${runId}` — plus the Hibernatable-WebSocket members it fans
- * events out over. The hub holds no D1/DO storage, so `storage` is not
- * required here. Same OPTIONAL-WS, guard-on-presence posture as
- * DurableObjectRunnerState.
+ * Structural subset of DurableObjectState the deployment hub DO (hub-do.ts)
+ * reads: its OWN idFromName identity — `id.name` IS the fixed
+ * HUB_INSTANCE_NAME, with no ':' join and no runId decode, unlike
+ * DurableObjectRunner whose name is `${workflowId}:${runId}` — plus the
+ * Hibernatable-WebSocket members it fans events out over. The hub holds no
+ * D1/DO storage, so `storage` is not required here. Same OPTIONAL-WS,
+ * guard-on-presence posture as DurableObjectRunnerState.
  */
 export interface HubDurableObjectState {
   readonly id: {
@@ -129,8 +135,8 @@ export interface HubDurableObjectState {
 // subsets above, so a host passes env.DB / ctx straight through with no
 // adapter. Type-only (erased at build; neither this import nor the
 // non-exported aliases below reach the emitted .d.ts, so consumers pull no
-// workers-types dependency) — the same technique artifacts/index.ts uses to
-// pin R2Bucket against ArtifactBucket.
+// workers-types dependency). The R2 seam uses the same technique in the
+// version-specific typecheck fixtures under test-support and scripts.
 type AssertTrue<T extends true> = T;
 type _D1DatabaseSatisfiesBinding = AssertTrue<
   D1Database extends D1DatabaseBinding ? true : false

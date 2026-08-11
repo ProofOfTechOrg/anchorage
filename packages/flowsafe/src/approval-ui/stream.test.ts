@@ -29,7 +29,6 @@ import {
 function makeRecord(overrides: Partial<ApprovalRecord> = {}): ApprovalRecord {
   return {
     id: 'apr-1',
-    tenantId: 'acme',
     workflowId: 'wf',
     runId: 'acme_r1',
     title: 'publish',

@@ -6,15 +6,19 @@
 // prove that a validly-SIGNED-but-malformed ticket is still refused (the
 // claim-level validation, not just the signature).
 
+import { CompactSign, SignJWT } from 'jose';
 import { describe, expect, it } from 'vitest';
 
 import type { ApprovalActor } from '../approval-api/index.js';
 import { mintStreamTicket, verifyStreamTicket } from './stream-ticket.js';
-import { base64UrlEncode, hmacSign } from './verifier.js';
+import { mintHmacToken } from './verifier.js';
 
 const SECRET = 'stream-ticket-secret';
-const ACTOR: ApprovalActor = { id: 'ray', role: 'reviewer', tenantId: 'acme' };
+const ACTOR: ApprovalActor = { id: 'ray', role: 'reviewer' };
 const RUN_ID = 'acme_run-1';
+const WORKFLOW_ID = 'workflow-1';
+const AUDIENCE = 'flowsafe-stream';
+const TYPE = 'flowsafe-stream-ticket+jwt';
 
 const encoder = new TextEncoder();
 
@@ -23,15 +27,15 @@ async function forge(
   claims: Record<string, unknown>,
   secret = SECRET,
 ): Promise<string> {
-  const payload = base64UrlEncode(encoder.encode(JSON.stringify(claims)));
-  return `${payload}.${await hmacSign(secret, payload)}`;
+  return new SignJWT({ ...claims, aud: AUDIENCE })
+    .setProtectedHeader({ alg: 'HS256', typ: TYPE })
+    .sign(encoder.encode(secret));
 }
 
 function validClaims(
   overrides: Record<string, unknown> = {},
 ): Record<string, unknown> {
   return {
-    tenantId: 'acme',
     channel: 'hub',
     actorId: 'ray',
     role: 'reviewer',
@@ -45,7 +49,6 @@ describe('mintStreamTicket / verifyStreamTicket round-trip', () => {
     // #given
     const token = await mintStreamTicket({
       secret: SECRET,
-      tenantId: 'acme',
       channel: 'hub',
       actor: ACTOR,
     });
@@ -55,12 +58,12 @@ describe('mintStreamTicket / verifyStreamTicket round-trip', () => {
 
     // #then
     expect(claims).toMatchObject({
-      tenantId: 'acme',
       channel: 'hub',
       actorId: 'ray',
       role: 'reviewer',
     });
     expect(claims?.runId).toBeUndefined();
+    expect(claims?.workflowId).toBeUndefined();
     expect(typeof claims?.exp).toBe('number');
   });
 
@@ -68,8 +71,8 @@ describe('mintStreamTicket / verifyStreamTicket round-trip', () => {
     // #given
     const token = await mintStreamTicket({
       secret: SECRET,
-      tenantId: 'acme',
       channel: 'run',
+      workflowId: WORKFLOW_ID,
       runId: RUN_ID,
       actor: ACTOR,
     });
@@ -78,15 +81,18 @@ describe('mintStreamTicket / verifyStreamTicket round-trip', () => {
     const claims = await verifyStreamTicket({ secret: SECRET, token });
 
     // #then
-    expect(claims).toMatchObject({ channel: 'run', runId: RUN_ID });
+    expect(claims).toMatchObject({
+      channel: 'run',
+      workflowId: WORKFLOW_ID,
+      runId: RUN_ID,
+    });
   });
 
-  it("throws when a 'run' ticket is minted without a runId", async () => {
+  it("throws when a 'run' ticket is minted without its workflow/run address", async () => {
     // #when / #then — a run ticket with no run to address is a programmer error
     await expect(
       mintStreamTicket({
         secret: SECRET,
-        tenantId: 'acme',
         channel: 'run',
         actor: ACTOR,
       }),
@@ -98,7 +104,6 @@ describe('mintStreamTicket / verifyStreamTicket round-trip', () => {
     const t0 = 1_751_000_000_000;
     const token = await mintStreamTicket({
       secret: SECRET,
-      tenantId: 'acme',
       channel: 'hub',
       actor: ACTOR,
       ttlSeconds: 60,
@@ -112,18 +117,47 @@ describe('mintStreamTicket / verifyStreamTicket round-trip', () => {
         token,
         now: () => t0 + 30_000,
       }),
-    ).toMatchObject({ tenantId: 'acme' });
+    ).toMatchObject({ channel: 'hub' });
     expect(
       await verifyStreamTicket({
         secret: SECRET,
         token,
-        now: () => t0 + 61_000,
+        now: () => t0 + 60_000,
       }),
     ).toBeUndefined();
+  });
+
+  it('rejects an actor JWT even when the signing secret is reused', async () => {
+    const token = await mintHmacToken({
+      secret: SECRET,
+      kid: 'stream-key',
+      issuer: 'https://issuer.test',
+      audience: AUDIENCE,
+      actor: ACTOR,
+      ttlSeconds: 60,
+    });
+
+    await expect(
+      verifyStreamTicket({ secret: SECRET, token }),
+    ).resolves.toBeUndefined();
   });
 });
 
 describe('verifyStreamTicket fail-closed', () => {
+  it.each([
+    ['wrong audience', 'other-audience', TYPE],
+    ['wrong type', AUDIENCE, 'JWT'],
+  ])('rejects a token with %s', async (_label, audience, typ) => {
+    const token = await new SignJWT(validClaims())
+      .setProtectedHeader({ alg: 'HS256', typ })
+      .setAudience(audience)
+      .sign(encoder.encode(SECRET));
+
+    await expect(
+      verifyStreamTicket({ secret: SECRET, token }),
+    ).resolves.toBeUndefined();
+  });
+
   it('rejects an expired ticket', async () => {
     // #given — exp already in the past
     const token = await forge(
@@ -142,17 +176,16 @@ describe('verifyStreamTicket fail-closed', () => {
     expect(await verifyStreamTicket({ secret: SECRET, token })).toBeUndefined();
   });
 
-  it('rejects a tampered signature of the SAME length (constant-time content branch)', async () => {
-    // #given — a genuine ticket whose last signature char is flipped in place
+  it('rejects a tampered signature of the SAME length', async () => {
+    // #given — mutate a character that always carries signature bits; the
+    // final base64url character also contains padding bits for a 32-byte MAC.
     const token = await mintStreamTicket({
       secret: SECRET,
-      tenantId: 'acme',
       channel: 'hub',
       actor: ACTOR,
     });
-    const [payload = '', signature = ''] = token.split('.');
-    const flipped =
-      signature.slice(0, -1) + (signature.at(-1) === 'A' ? 'B' : 'A');
+    const [header = '', payload = '', signature = ''] = token.split('.');
+    const flipped = (signature.at(0) === 'A' ? 'B' : 'A') + signature.slice(1);
     expect(flipped).toHaveLength(signature.length);
     expect(flipped).not.toBe(signature);
 
@@ -160,48 +193,45 @@ describe('verifyStreamTicket fail-closed', () => {
     expect(
       await verifyStreamTicket({
         secret: SECRET,
-        token: `${payload}.${flipped}`,
+        token: `${header}.${payload}.${flipped}`,
       }),
     ).toBeUndefined();
   });
 
-  it('rejects a signature of the WRONG length (constant-time length branch)', async () => {
+  it('rejects a signature of the WRONG length', async () => {
     // #given
     const token = await mintStreamTicket({
       secret: SECRET,
-      tenantId: 'acme',
       channel: 'hub',
       actor: ACTOR,
     });
-    const [payload = '', signature = ''] = token.split('.');
+    const [header = '', payload = '', signature = ''] = token.split('.');
 
     // #when / #then — truncating the signature must not verify
     expect(
       await verifyStreamTicket({
         secret: SECRET,
-        token: `${payload}.${signature.slice(0, -1)}`,
+        token: `${header}.${payload}.${signature.slice(0, -1)}`,
       }),
     ).toBeUndefined();
   });
 
   it('rejects a tampered payload (signature no longer matches)', async () => {
-    // #given — a genuine ticket whose payload is swapped for a different tenant
+    // #given — a genuine ticket whose payload is swapped for different claims
     const token = await mintStreamTicket({
       secret: SECRET,
-      tenantId: 'acme',
       channel: 'hub',
       actor: ACTOR,
     });
-    const [, signature = ''] = token.split('.');
-    const forgedPayload = base64UrlEncode(
-      encoder.encode(JSON.stringify(validClaims({ tenantId: 'evil' }))),
-    );
+    const [header = '', , signature = ''] = token.split('.');
+    const forged = await forge(validClaims({ actorId: 'mallory' }));
+    const [, forgedPayload = ''] = forged.split('.');
 
     // #when / #then
     expect(
       await verifyStreamTicket({
         secret: SECRET,
-        token: `${forgedPayload}.${signature}`,
+        token: `${header}.${forgedPayload}.${signature}`,
       }),
     ).toBeUndefined();
   });
@@ -209,8 +239,9 @@ describe('verifyStreamTicket fail-closed', () => {
   it('returns undefined (never throws) on a validly-signed JSON null payload (F5)', async () => {
     // #given — a null payload signed with the real secret. `typeof null` is
     // 'object', so a bare object check would slip it past and throw on claims.exp.
-    const payload = base64UrlEncode(encoder.encode(JSON.stringify(null)));
-    const token = `${payload}.${await hmacSign(SECRET, payload)}`;
+    const token = await new CompactSign(encoder.encode(JSON.stringify(null)))
+      .setProtectedHeader({ alg: 'HS256', typ: TYPE })
+      .sign(encoder.encode(SECRET));
 
     // #when / #then — fail closed to undefined, not a throw
     await expect(
@@ -220,9 +251,6 @@ describe('verifyStreamTicket fail-closed', () => {
 
   it.each([
     ['wrong channel value', validClaims({ channel: 'admin' })],
-    ['non-INV-3 tenantId', validClaims({ tenantId: 'ACME' })],
-    ['underscore tenantId', validClaims({ tenantId: 'a_b' })],
-    ["reserved tenantId ('system')", validClaims({ tenantId: 'system' })],
     ['missing actorId', validClaims({ actorId: undefined })],
     ['empty actorId', validClaims({ actorId: '' })],
     ['missing role', validClaims({ role: undefined })],
@@ -231,10 +259,14 @@ describe('verifyStreamTicket fail-closed', () => {
     ['non-numeric exp', validClaims({ exp: 'soon' })],
     ['runId present on a hub ticket', validClaims({ runId: 'acme_run-1' })],
     [
+      'workflowId present on a hub ticket',
+      validClaims({ workflowId: WORKFLOW_ID }),
+    ],
+    [
       'run ticket missing its runId',
       {
-        tenantId: 'acme',
         channel: 'run',
+        workflowId: WORKFLOW_ID,
         actorId: 'ray',
         role: 'reviewer',
         exp: Math.floor(Date.now() / 1000) + 60,
@@ -242,7 +274,19 @@ describe('verifyStreamTicket fail-closed', () => {
     ],
     [
       'run ticket with a non-PATH_SAFE runId',
-      validClaims({ channel: 'run', runId: 'acme_../etc' }),
+      validClaims({
+        channel: 'run',
+        workflowId: WORKFLOW_ID,
+        runId: 'acme_../etc',
+      }),
+    ],
+    [
+      'run ticket with a non-PATH_SAFE workflowId',
+      validClaims({
+        channel: 'run',
+        workflowId: '../workflow',
+        runId: RUN_ID,
+      }),
     ],
   ])('rejects a validly-signed ticket with a %s', async (_label, claims) => {
     // #given — the signature is genuine; only a claim is malformed
@@ -252,14 +296,22 @@ describe('verifyStreamTicket fail-closed', () => {
     expect(await verifyStreamTicket({ secret: SECRET, token })).toBeUndefined();
   });
 
-  it("rejects a 'run' ticket for another tenant's runId (tenantOwnsSaltedId fails)", async () => {
-    // #given — the ticket's tenant is 'acme', but the runId belongs to 'bravo'
+  it('accepts any path-safe host-minted runId', async () => {
     const token = await forge(
-      validClaims({ channel: 'run', tenantId: 'acme', runId: 'bravo_run-1' }),
+      validClaims({
+        channel: 'run',
+        workflowId: WORKFLOW_ID,
+        runId: 'run_01JTEST',
+      }),
     );
 
-    // #when / #then
-    expect(await verifyStreamTicket({ secret: SECRET, token })).toBeUndefined();
+    await expect(
+      verifyStreamTicket({ secret: SECRET, token }),
+    ).resolves.toMatchObject({
+      channel: 'run',
+      workflowId: WORKFLOW_ID,
+      runId: 'run_01JTEST',
+    });
   });
 
   it('rejects structurally malformed tokens without throwing', async () => {

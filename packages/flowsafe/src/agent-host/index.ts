@@ -31,6 +31,7 @@ export {
   type AgentThreadStateStorage,
   type AutomatedEntryAuthorizer,
   type AutomatedEntryRequest,
+  type BlockingAgentRun,
   type BoundThreadAgent,
   createThreadAgentHost,
   type PrincipalPermissionResolution,
@@ -41,6 +42,8 @@ export {
 } from './thread-host.js';
 export {
   AGENT_HOST_ROUTE_PREFIX,
+  type AgentThreadBoundTopology,
+  type AgentThreadDispatchTopology,
   type AgentThreadObserveInput,
   type AgentThreadRunRef,
   type AgentThreadStartInput,

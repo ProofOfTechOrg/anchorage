@@ -13,5 +13,5 @@
     // flowsafe/breakwater source resolved via the shared paths is admitted.
     "rootDir": "../.."
   },
-  "include": ["worker/**/*.ts"]
+  "include": ["worker/**/*.ts", "test-support/**/*.ts"]
 }

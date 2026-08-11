@@ -1,6 +1,6 @@
 # `scripts/`
 
-Zero-dependency repository documentation and publication checks.
+Repository documentation, architecture, and publication checks. Markdown syntax checks use unified and remark; repository policy remains local.
 
 ## Contents
 

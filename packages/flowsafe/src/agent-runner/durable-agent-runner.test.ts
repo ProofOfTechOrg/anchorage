@@ -56,7 +56,11 @@ import {
 // overrides the summary start() resolves to (e.g. a 'failed' run); `pubsub`
 // exposes an identity for the inheritance test.
 function fakeRuntime(
-  overrides: { pubsub?: unknown; startResult?: unknown } = {},
+  overrides: {
+    pubsub?: unknown;
+    startResult?: unknown;
+    resumeContext?: RequestContext;
+  } = {},
 ) {
   const registered: string[] = [];
   const registerAgent = vi.fn();
@@ -72,12 +76,23 @@ function fakeRuntime(
         suspended: [['gate']],
       },
   );
-  const resume = vi.fn(async (_workflowId: string, runId: string) => ({
+  const resumeExecution = vi.fn(async (runId: string) => ({
     runId,
     status: 'success' as const,
   }));
-  const trustedRequestContextForResume = vi.fn(
-    async () => new RequestContext(),
+  const resume = vi.fn(
+    async (
+      _workflowId: string,
+      runId: string,
+      options?: {
+        prepareExecution?: (context: RequestContext) => Promise<void>;
+      },
+    ) => {
+      await options?.prepareExecution?.(
+        overrides.resumeContext ?? new RequestContext(),
+      );
+      return resumeExecution(runId);
+    },
   );
   const runtime = {
     registerAgent,
@@ -85,7 +100,6 @@ function fakeRuntime(
     workflowIds,
     start,
     resume,
-    trustedRequestContextForResume,
     ...(overrides.pubsub !== undefined ? { pubsub: overrides.pubsub } : {}),
   } as unknown as RunnerRuntime;
   return {
@@ -95,7 +109,7 @@ function fakeRuntime(
     workflowIds,
     start,
     resume,
-    trustedRequestContextForResume,
+    resumeExecution,
   };
 }
 
@@ -216,7 +230,7 @@ function drive(
 
 const INPUT = {
   __workflowKind: 'durable-agent',
-  runId: 'acme_run1',
+  runId: 'run-1',
   agentId: 'writer',
 } as unknown as DurableAgenticWorkflowInput;
 
@@ -271,11 +285,11 @@ describe('FlowsafeDurableAgent.executeWorkflow', () => {
     const { runtime, start } = fakeRuntime();
     const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
     // #when the loop drives a run
-    await drive(agent, 'acme_run1', INPUT);
+    await drive(agent, 'run-1', INPUT);
     // #then it is routed through the runtime chokepoint, not createRun + start
     expect(start).toHaveBeenCalledTimes(1);
     expect(start).toHaveBeenCalledWith(DURABLE_AGENTIC_LOOP_WORKFLOW_ID, {
-      runId: 'acme_run1',
+      runId: 'run-1',
       inputData: INPUT,
     });
   });
@@ -328,13 +342,22 @@ describe('FlowsafeDurableAgent.streamUntilPersisted', () => {
     let settled = false;
 
     const pending = agent
-      .streamUntilPersisted('hello', { runId: 'acme_run1' })
+      .streamUntilPersisted('hello', { runId: 'run-1' }, 'operator-1', 'human')
       .finally(() => {
         settled = true;
       });
     await vi.waitFor(() => expect(agent.stream).toHaveBeenCalledOnce());
-    const execution = drive(agent, 'acme_run1', INPUT);
+    const execution = drive(agent, 'run-1', INPUT);
     await vi.waitFor(() => expect(start).toHaveBeenCalledOnce());
+    expect(start).toHaveBeenCalledWith(
+      DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
+      expect.objectContaining({
+        runId: 'run-1',
+        requestedBy: 'operator-1',
+        requestedByKind: 'human',
+        attemptToken: expect.any(String),
+      }),
+    );
     expect(settled).toBe(false);
 
     releaseStart();
@@ -351,20 +374,47 @@ describe('FlowsafeDurableAgent.streamUntilPersisted', () => {
       output: { id: 'output' },
     } as never);
 
-    const pending = agent.streamUntilPersisted('hello', {
-      runId: 'acme_run1',
-    });
-    const execution = drive(agent, 'acme_run1', INPUT);
+    const pending = agent.streamUntilPersisted(
+      'hello',
+      {
+        runId: 'run-1',
+      },
+      'operator-1',
+      'human',
+    );
+    const execution = drive(agent, 'run-1', INPUT);
 
     await expect(pending).rejects.toThrow('D1 unavailable');
     await expect(execution).rejects.toThrow('D1 unavailable');
   });
+
+  it.each([
+    ['an invalid requester', 'reviewer\u000aforged', 'human'],
+    ['an invalid requester kind', 'reviewer-1', 'operator'],
+  ])('rejects %s before starting the durable stream', async (_label, requestedBy, requestedByKind) => {
+    const { runtime, start } = fakeRuntime();
+    const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
+    const stream = vi.spyOn(agent, 'stream');
+
+    await expect(
+      agent.streamUntilPersisted(
+        'hello',
+        { runId: 'run-1' },
+        requestedBy,
+        requestedByKind as never,
+      ),
+    ).rejects.toBeInstanceOf(InvalidRunRequestError);
+
+    expect(stream).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+  });
 });
 
 // The public entry points a host actually calls. The inherited stream()/generate()
-// take an OPTIONAL runId; without the override, core mints a tenant-less
-// crypto.randomUUID() upstream of executeWorkflow's guard (INV-1 violation). These
-// pin that the boundary override refuses an absent/non-INV-1 runId BEFORE any run.
+// take an OPTIONAL runId; without the override, core mints an unowned
+// crypto.randomUUID() upstream of executeWorkflow's guard (INV-1 violation).
+// These pin that the boundary refuses an absent/non-path-safe runId before any
+// run is registered.
 describe('FlowsafeDurableAgent INV-1 boundary (stream/generate)', () => {
   it('stream() without a runId rejects (no crypto.randomUUID upstream)', async () => {
     // #given
@@ -374,7 +424,7 @@ describe('FlowsafeDurableAgent INV-1 boundary (stream/generate)', () => {
     await expect(agent.stream('Hello!')).rejects.toBeInstanceOf(
       InvalidRunRequestError,
     );
-    // never reached the runtime — no tenant-less run was started
+    // never reached the runtime — no unowned run was started
     expect(start).not.toHaveBeenCalled();
   });
 
@@ -385,6 +435,16 @@ describe('FlowsafeDurableAgent INV-1 boundary (stream/generate)', () => {
     // #when / #then
     await expect(
       agent.stream('Hello!', { runId: 'acme:run1' }),
+    ).rejects.toBeInstanceOf(InvalidRunRequestError);
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it('stream() with a numeric runId rejects without RegExp coercion', async () => {
+    const { runtime, start } = fakeRuntime();
+    const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
+
+    await expect(
+      agent.stream('Hello!', { runId: 123 as unknown as string }),
     ).rejects.toBeInstanceOf(InvalidRunRequestError);
     expect(start).not.toHaveBeenCalled();
   });
@@ -403,7 +463,7 @@ describe('FlowsafeDurableAgent INV-1 boundary (stream/generate)', () => {
 
 // prepare() is the THIRD inherited minting entry point (stream/generate are the
 // other two): it forwards options?.runId into core's prepareForDurableExecution,
-// which mints a tenant-less crypto.randomUUID() AND registers a run under it when
+// which mints an unowned crypto.randomUUID() AND registers a run under it when
 // runId is absent (@mastra/core 1.50.0 agent/durable/index.js:5980 -> :589 ->
 // :5984). PATH_SAFE_ID_PATTERN accepts a bare UUID, so no downstream guard
 // (executeWorkflow's re-guard, RunnerRuntime.start) can catch it — the override
@@ -421,7 +481,7 @@ describe('FlowsafeDurableAgent INV-1 boundary (prepare)', () => {
     const { runtime } = fakeRuntime();
     const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
     const superPrepare = vi.spyOn(DurableAgent.prototype, 'prepare');
-    // #when / #then — the idiomatic bare prepare('...') would mint a tenant-less
+    // #when / #then — the idiomatic bare prepare('...') would mint an unowned
     // UUID upstream; refuse it
     await expect(agent.prepare('Hello!')).rejects.toBeInstanceOf(
       InvalidRunRequestError,
@@ -454,22 +514,22 @@ describe('FlowsafeDurableAgent INV-1 boundary (prepare)', () => {
     expect(superPrepare).not.toHaveBeenCalled();
   });
 
-  it('prepare() with a valid <tenantId>_<uuid> runId delegates to super.prepare', async () => {
+  it('prepare() with a valid host-owned runId delegates to super.prepare', async () => {
     // #given a spied super.prepare so delegation is observable without core's
     // real preparation (model/tool resolution + registry writes)
     const { runtime } = fakeRuntime();
     const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
-    const prepared = { runId: 'acme_run1' } as unknown as Awaited<
+    const prepared = { runId: 'run-1' } as unknown as Awaited<
       ReturnType<DurableAgent['prepare']>
     >;
     const superPrepare = vi
       .spyOn(DurableAgent.prototype, 'prepare')
       .mockResolvedValue(prepared);
     // #when — a caller-minted INV-1 runId
-    const result = await agent.prepare('Hello!', { runId: 'acme_run1' });
+    const result = await agent.prepare('Hello!', { runId: 'run-1' });
     // #then — the guard passed and the call reached super unchanged
     expect(superPrepare).toHaveBeenCalledTimes(1);
-    expect(superPrepare).toHaveBeenCalledWith('Hello!', { runId: 'acme_run1' });
+    expect(superPrepare).toHaveBeenCalledWith('Hello!', { runId: 'run-1' });
     expect(result).toBe(prepared);
   });
 });
@@ -513,8 +573,8 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
       output,
     } as never);
     const options = {
-      runId: 'acme_run1',
-      memory: { thread: 'acme_thread', resource: 'acme_resource' },
+      runId: 'run-1',
+      memory: { thread: 'thread-1', resource: 'resource-1' },
     } as never;
 
     await agent.stream('hello', options);
@@ -540,7 +600,7 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     } as never);
 
     await agent.stream('hello', {
-      runId: 'acme_run1',
+      runId: 'run-1',
       untilIdle,
     } as never);
 
@@ -560,7 +620,7 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     } as never);
 
     await agent.stream('hello', {
-      runId: 'acme_run1',
+      runId: 'run-1',
       untilIdle: false,
     } as never);
 
@@ -570,14 +630,10 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
   it('rehydrates guarded registries without replaying application input processors', async () => {
     const order: string[] = [];
     const pubsub = new EventEmitterPubSub();
-    const { runtime, resume, trustedRequestContextForResume } = fakeRuntime({
-      pubsub,
-    });
-    trustedRequestContextForResume.mockImplementation(async () => {
+    const { runtime, resume } = fakeRuntime({ pubsub });
+    resume.mockImplementation(async (_workflowId, runId, options) => {
       order.push('context');
-      return actorContext();
-    });
-    resume.mockImplementation(async (_workflowId, runId) => {
+      await options?.prepareExecution?.(actorContext());
       order.push('resume');
       return { runId, status: 'success' as const };
     });
@@ -594,45 +650,45 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     });
     const prepare = vi.spyOn(agent, 'prepare');
     await agent.prepare('initial request', {
-      runId: 'acme_run1',
+      runId: 'run-1',
       requestContext: actorContext(),
-      memory: { thread: 'acme_thread', resource: 'acme_resource' },
+      memory: { thread: 'thread-1', resource: 'resource-1' },
     });
     expect(inputInvocation).toHaveBeenCalledTimes(1);
     prepare.mockClear();
     registryFor(agent).clear();
     globalRunRegistry.clear();
     vi.spyOn(agent, 'observe').mockImplementation(async () => {
-      expect(registryFor(agent).has('acme_run1')).toBe(true);
-      expect(globalRunRegistry.has('acme_run1')).toBe(true);
+      expect(registryFor(agent).has('run-1')).toBe(true);
+      expect(globalRunRegistry.has('run-1')).toBe(true);
       order.push('observe');
       return { output: { id: 'rehydrated' } } as never;
     });
 
     const summary = await agent.resumeViaRuntime({
-      runId: 'acme_run1',
+      runId: 'run-1',
+      requestedBy: 'reviewer-1',
       step: ['tool-call'],
       resumeData: { approved: true },
-      memory: { thread: 'acme_thread', resource: 'acme_resource' },
+      memory: { thread: 'thread-1', resource: 'resource-1' },
     });
 
     expect(order).toEqual(['context', 'observe', 'register', 'resume']);
-    expect(trustedRequestContextForResume).toHaveBeenCalledWith(
-      DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
-      'acme_run1',
-      { step: ['tool-call'] },
-    );
     expect(prepare).not.toHaveBeenCalled();
     expect(resume).toHaveBeenCalledWith(
       DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
-      'acme_run1',
-      { resumeData: { approved: true } },
+      'run-1',
+      expect.objectContaining({
+        resumeData: { approved: true },
+        requestedBy: 'reviewer-1',
+        prepareExecution: expect.any(Function),
+      }),
     );
-    expect(summary).toMatchObject({ runId: 'acme_run1', status: 'success' });
+    expect(summary).toMatchObject({ runId: 'run-1', status: 'success' });
     expect(inputInvocation).toHaveBeenCalledTimes(1);
 
-    const instanceEntry = registryFor(agent).get('acme_run1');
-    const globalEntry = globalRunRegistry.get('acme_run1');
+    const instanceEntry = registryFor(agent).get('run-1');
+    const globalEntry = globalRunRegistry.get('run-1');
     expect(instanceEntry?.inputProcessors?.map(({ id }) => id)).toEqual([
       'breakwater-rbac',
       'application-input',
@@ -697,11 +753,11 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     const { runtime } = fakeRuntime();
     const agent = createFlowsafeDurableAgent({ agent: rawAgent, runtime });
     await agent.prepare('initial request', {
-      runId: 'acme_raw_run',
+      runId: 'run-raw',
       requestContext: new RequestContext(),
     });
     expect(processInput).toHaveBeenCalledTimes(1);
-    const initialEntry = registryFor(agent).get('acme_raw_run');
+    const initialEntry = registryFor(agent).get('run-raw');
     const initialInputProcessorIds = initialEntry?.inputProcessors?.map(
       ({ id }) => id,
     );
@@ -714,10 +770,13 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
       output: { id: 'rehydrated' },
     } as never);
 
-    await agent.resumeViaRuntime({ runId: 'acme_raw_run' });
+    await agent.resumeViaRuntime({
+      runId: 'run-raw',
+      requestedBy: 'reviewer-1',
+    });
 
     expect(processInput).toHaveBeenCalledTimes(1);
-    const rehydratedEntry = globalRunRegistry.get('acme_raw_run');
+    const rehydratedEntry = globalRunRegistry.get('run-raw');
     expect(rehydratedEntry?.inputProcessors?.map(({ id }) => id)).toEqual(
       initialInputProcessorIds,
     );
@@ -762,10 +821,10 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     ['missing actor', undefined],
     ['disallowed actor', 'viewer' as const],
   ])('denies registry rehydration for a %s before installation or resume', async (_label, role) => {
-    const { runtime, resume, trustedRequestContextForResume } = fakeRuntime();
-    trustedRequestContextForResume.mockResolvedValue(
-      role === undefined ? new RequestContext() : actorContext(role),
-    );
+    const { runtime, resume, resumeExecution } = fakeRuntime({
+      resumeContext:
+        role === undefined ? new RequestContext() : actorContext(role),
+    });
     const registerRun = vi.fn(async () => undefined);
     const inputInvocation = vi.fn();
     const agent = createFlowsafeDurableAgent({
@@ -779,19 +838,20 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     const observe = vi.spyOn(agent, 'observe');
 
     await expect(
-      agent.resumeViaRuntime({ runId: 'acme_run1' }),
+      agent.resumeViaRuntime({ runId: 'run-1', requestedBy: 'reviewer-1' }),
     ).rejects.toThrow(/^Durable agent registry rehydration denied: /);
 
     expect(inputInvocation).not.toHaveBeenCalled();
-    expect(registryFor(agent).has('acme_run1')).toBe(false);
-    expect(globalRunRegistry.has('acme_run1')).toBe(false);
+    expect(registryFor(agent).has('run-1')).toBe(false);
+    expect(globalRunRegistry.has('run-1')).toBe(false);
     expect(observe).not.toHaveBeenCalled();
     expect(registerRun).not.toHaveBeenCalled();
-    expect(resume).not.toHaveBeenCalled();
+    expect(resume).toHaveBeenCalledOnce();
+    expect(resumeExecution).not.toHaveBeenCalled();
   });
 
   it('publishes a registration failure and rethrows the original object', async () => {
-    const { runtime, resume } = fakeRuntime();
+    const { runtime, resume, resumeExecution } = fakeRuntime();
     const original = new Error('registration failed');
     const agent = createFlowsafeDurableAgent({
       agent: testAgent(),
@@ -814,24 +874,38 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
       )
       .mockResolvedValue(undefined);
 
-    await expect(agent.resumeViaRuntime({ runId: 'acme_run1' })).rejects.toBe(
-      original,
-    );
-    expect(emitError).toHaveBeenCalledWith('acme_run1', original);
-    expect(resume).not.toHaveBeenCalled();
+    await expect(
+      agent.resumeViaRuntime({ runId: 'run-1', requestedBy: 'reviewer-1' }),
+    ).rejects.toBe(original);
+    expect(emitError).toHaveBeenCalledWith('run-1', original);
+    expect(resume).toHaveBeenCalledOnce();
+    expect(resumeExecution).not.toHaveBeenCalled();
   });
 
   it('publishes a resume rejection and preserves it if publication also fails', async () => {
     const { runtime, resume } = fakeRuntime();
     const original = new Error('resume rejected');
-    resume.mockRejectedValue(original);
+    resume.mockImplementation(async (_workflowId, _runId, options) => {
+      await options?.prepareExecution?.(actorContext());
+      throw original;
+    });
+    let registeredOutput: { _waitUntilFinished(): Promise<void> } | undefined;
     const agent = createFlowsafeDurableAgent({
       agent: testAgent(),
       runtime,
-      threadRuntime: { registerRun: vi.fn(async () => undefined) } as never,
+      threadRuntime: {
+        registerRun: vi.fn(async (_agent, output) => {
+          registeredOutput = output as typeof registeredOutput;
+        }),
+      } as never,
     });
     vi.spyOn(agent, 'observe').mockResolvedValue({
-      output: { id: 'rehydrated' },
+      output: {
+        id: 'rehydrated',
+        runId: 'run-1',
+        status: 'running',
+        _waitUntilFinished: () => new Promise<void>(() => undefined),
+      },
     } as never);
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     vi.spyOn(
@@ -841,28 +915,44 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
       'emitError',
     ).mockRejectedValue(new Error('publication failed'));
 
-    await expect(agent.resumeViaRuntime({ runId: 'acme_run1' })).rejects.toBe(
-      original,
-    );
+    await expect(
+      agent.resumeViaRuntime({ runId: 'run-1', requestedBy: 'reviewer-1' }),
+    ).rejects.toBe(original);
     expect(log).toHaveBeenCalledWith(
       expect.stringContaining('durable-agent-resume-error-publication-failed'),
     );
+    await expect(
+      registeredOutput?._waitUntilFinished(),
+    ).resolves.toBeUndefined();
   });
 
   it('publishes a failed resume summary and returns it', async () => {
     const { runtime, resume } = fakeRuntime();
-    resume.mockResolvedValue({
-      runId: 'acme_run1',
-      status: 'failed',
-      error: 'resume failed',
-    } as never);
+    resume.mockImplementation(async (_workflowId, _runId, options) => {
+      await options?.prepareExecution?.(actorContext());
+      return {
+        runId: 'run-1',
+        status: 'failed',
+        error: 'resume failed',
+      } as never;
+    });
+    let registeredOutput: { _waitUntilFinished(): Promise<void> } | undefined;
     const agent = createFlowsafeDurableAgent({
       agent: testAgent(),
       runtime,
-      threadRuntime: { registerRun: vi.fn(async () => undefined) } as never,
+      threadRuntime: {
+        registerRun: vi.fn(async (_agent, output) => {
+          registeredOutput = output as typeof registeredOutput;
+        }),
+      } as never,
     });
     vi.spyOn(agent, 'observe').mockResolvedValue({
-      output: { id: 'rehydrated' },
+      output: {
+        id: 'rehydrated',
+        runId: 'run-1',
+        status: 'failed',
+        _waitUntilFinished: () => new Promise<void>(() => undefined),
+      },
     } as never);
     const emitError = vi
       .spyOn(
@@ -873,10 +963,16 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
       )
       .mockResolvedValue(undefined);
 
-    const summary = await agent.resumeViaRuntime({ runId: 'acme_run1' });
+    const summary = await agent.resumeViaRuntime({
+      runId: 'run-1',
+      requestedBy: 'reviewer-1',
+    });
 
     expect(summary).toMatchObject({ status: 'failed', error: 'resume failed' });
     expect(emitError.mock.calls[0]?.[1]?.message).toBe('resume failed');
+    await expect(
+      registeredOutput?._waitUntilFinished(),
+    ).resolves.toBeUndefined();
   });
 });
 
@@ -884,7 +980,7 @@ describe('FlowsafeDurableAgent.executeWorkflow failed run', () => {
   it('emits an error onto the stream when the run fails', async () => {
     // #given a runtime whose start() resolves to a failed run
     const { runtime } = fakeRuntime({
-      startResult: { runId: 'acme_run1', status: 'failed', error: 'boom' },
+      startResult: { runId: 'run-1', status: 'failed', error: 'boom' },
     });
     const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
     const emitError = vi
@@ -896,9 +992,9 @@ describe('FlowsafeDurableAgent.executeWorkflow failed run', () => {
       )
       .mockResolvedValue(undefined);
     // #when the loop drives it
-    await drive(agent, 'acme_run1', INPUT);
+    await drive(agent, 'run-1', INPUT);
     // #then the failed status is surfaced to observe()/onError via emitError
-    expect(emitError).toHaveBeenCalledWith('acme_run1', expect.any(Error));
+    expect(emitError).toHaveBeenCalledWith('run-1', expect.any(Error));
     expect(emitError.mock.calls[0]?.[1]?.message).toBe('boom');
   });
 });

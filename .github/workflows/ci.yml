@@ -74,6 +74,12 @@ jobs:
       - name: Verify packed flowsafe agent-host surface
         run: pnpm test:packed-flowsafe-agent-host
 
+      # Invoke the installed-bin shape from the packed tarball so symlinked npm
+      # executables, Wrangler peer resolution, and CLI argument handling are
+      # verified as a consumer sees them.
+      - name: Verify packed flowsafe provisioning CLI
+        run: pnpm test:packed-flowsafe-provisioning
+
       # Pack the built package and resolve the public deep import under browser
       # conditions. This catches Node-only transitive imports that source-level
       # tests cannot see.

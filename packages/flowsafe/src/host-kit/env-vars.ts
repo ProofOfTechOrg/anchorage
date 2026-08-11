@@ -50,7 +50,7 @@ export function numberVar(
  * IRREVERSIBLE delete happens at all, so a fallback would not preserve behavior,
  * it would INVENT it — and invent a threshold the caller has already decided it
  * cannot pick on the operator's behalf. Never expiring is recoverable; deleting
- * a tenant's conversations because a var was mistyped is not.
+ * a deployment's conversations because a var was mistyped is not.
  *
  * The empty-string case is not hypothetical: `''` is what an unset CI/CD
  * variable interpolates to and what a blank wrangler `vars` entry produces, and

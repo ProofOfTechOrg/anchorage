@@ -3,22 +3,18 @@
 // to a TokenVerifier (static map or HS256 JWT — verifier.ts), get back an
 // ApprovalActor or undefined.
 //
-// This is trusted-computing-base code: it ASSERTS identity (the service
-// enforces roles from it; the tenant predicates key on actor.tenantId), so a
-// malformed map must fail closed — an unparseable or absent secret yields an
-// empty map and every authenticated route 401s, and an entry without an
-// INV-3-valid tenantId is dropped (its token 401s) rather than admitted
-// tenant-less.
+// This is trusted-computing-base code: it asserts the identity and role that
+// authorization consumes. A malformed map fails closed — an unparseable or
+// absent secret yields an empty map and every authenticated route 401s.
 
 import type { ApprovalActor } from '../approval-api/index.js';
 import { type TokenVerifier, toApprovalActor } from './verifier.js';
 
 /**
  * Parse the `APPROVAL_ACTOR_TOKENS` secret:
- * `{"<token>": {"id","role","tenantId"}}`. Every entry passes the real
- * validator (toApprovalActor) — unknown roles, empty ids, and missing,
- * invalid, or reserved-identity ('system') tenantIds are dropped rather
- * than trusted; there is no `as`-cast at this JSON boundary.
+ * `{"<token>": {"id","role"}}`. Every entry passes the real validator
+ * (`toApprovalActor`) — unknown roles and empty ids are dropped rather than
+ * trusted; there is no `as` cast at this JSON boundary.
  */
 export function parseActorTokens(
   raw: string | undefined,
@@ -49,7 +45,7 @@ export function parseActorTokens(
           type: 'config-error',
           var: 'APPROVAL_ACTOR_TOKENS',
           reason:
-            "entry dropped: needs non-empty id, a known role, and an INV-3 tenantId (^[a-z0-9]{3,32}$, not the reserved identity 'system') — its token will 401",
+            'entry dropped: needs a non-empty id and a known role — its token will 401',
         }),
       );
     }

@@ -1,6 +1,6 @@
 # Deployment reference
 
-Anchorage is a library, not a hosted control plane. You deploy the Worker, Durable Objects, D1 database, optional R2 bucket and Queue, identity verifier, policies, and maintenance schedules.
+Anchorage is a library, not a hosted control plane. Deploy one uniquely named Worker, D1 database, and set of Durable Object namespaces for each organization. The Worker script name is the Durable Object namespace boundary: replace the template's `replace-me` segment with the deployment tag and never reuse that script name for another organization. You also own optional R2 and Queue resources, the identity verifier, policies, maintenance schedules, and the provisioning system that keeps every resource set one-to-one.
 
 Choose one starting point:
 
@@ -17,24 +17,32 @@ Use the Worker runtime with `nodejs_compat`, D1, and SQLite-backed Durable Objec
 
 The checked-in configurations pin a compatibility date that the repository verifies. Review Cloudflare release notes before changing it.
 
+Do not perform a physical-isolation cutover as an in-place update of a pooled Worker. Allocate a new tag-suffixed script name, database, and Durable Object namespaces, deploy without traffic, verify the sentinel and internal credential, then move the route. Replacing only the D1 binding under an old script leaves the old Durable Object namespaces attached.
+
 ## Required baseline bindings
 
 | Binding | Kind | Purpose |
 | --- | --- | --- |
-| `DB` | D1 | Mastra workflow snapshots and flowsafe approval records |
+| `DB` | D1 | Deployment sentinel, Mastra workflow snapshots, and Flowsafe records |
+| `DEPLOYMENT_TENANT` | Variable | Stable provisioning tag that must match the singleton D1 sentinel |
+| `DEPLOYMENT_IDENTITY_SECRET` | Secret | Internal Worker-to-Durable-Object caller credential; 32–256 visible ASCII characters |
 | `RUNNER` | Durable Object namespace | One runner object per workflow run |
+| `MAINTENANCE` | Durable Object namespace | Fixed deployment singleton for sweep, purge, and optional schedule tick |
+| `MAINTENANCE_ADMIN_SECRET` | Secret | Control-plane credential for maintenance bootstrap and status; distinct from deployment identity |
 
-The runner class extends `DurableObjectRunner`. Its identity is derived from `workflowId:runId`, and it refuses requests that disagree with its own `id.name`.
+Provision the sentinel before application migrations or traffic. Install Wrangler 4 in the application, run `npx flowsafe-provision --database <database> --tag <tag> --remote --config wrangler.jsonc`, then set distinct `DEPLOYMENT_IDENTITY_SECRET` and `MAINTENANCE_ADMIN_SECRET` values with `wrangler secret put`. The CLI is published with Flowsafe. It verifies the exact singleton schema, refuses to re-home an owned database, and refuses to adopt an unowned database that already contains application tables.
+
+The Worker compares `DEPLOYMENT_TENANT` with `flowsafe_deployment.tenant_tag`. Worker topologies stamp the internal credential on every Durable Object fetch, and the target compares it in constant time before reading storage. This additional caller check prevents an external or cross-script namespace binding from reaching another deployment's objects. Alarms validate the target environment and sentinel because they have no caller request.
+
+The runner class extends `DurableObjectRunner`. Its identity is derived from `workflowId:runId`, and it refuses requests that disagree with its own `id.name`. Run ids are opaque, path-safe values minted by the host.
 
 ## Optional baseline bindings
 
 | Binding or secret | Kind | Enables |
 | --- | --- | --- |
-| `HUB` | Durable Object namespace | Per-tenant live approval fan-out |
+| `HUB` | Durable Object namespace | Deployment-wide live approval fan-out |
 | `STREAM_TICKET_SECRET` | Secret | HMAC ticket mint and WebSocket routes; requires `HUB` |
-| `AUDIT_QUEUE` | Queue producer/consumer | Durable audit export |
-| `SIEM_ENDPOINT` | Variable | NDJSON collector destination |
-| `SIEM_AUTH_HEADER` | Secret | Collector authorization |
+| `AUDIT_QUEUE` | Queue producer | Durable audit export to the shared control-plane consumer |
 | R2 bucket chosen by the host | R2 | `R2ArtifactStore` and artifact-aware purge |
 
 Streaming remains poll-only unless both `HUB` and `STREAM_TICKET_SECRET` are present. Use a dedicated ticket secret, not an OAuth, session, or model-provider key.
@@ -45,17 +53,14 @@ The advanced starter adds:
 
 | Binding | Kind | Purpose |
 | --- | --- | --- |
-| `THREAD` | Durable Object namespace | One runtime-driven agent host per tenant-minted thread |
-| `SIGNAL_PROVIDER_HOST` | Durable Object namespace | One alarm-driven provider host per tenant |
-| `BACKGROUND_TASKS` | Durable Object namespace | One recoverable background-task manager per tenant |
+| `THREAD` | Durable Object namespace | One runtime-driven agent host per opaque thread id |
+| `SIGNAL_PROVIDER_HOST` | Durable Object namespace | Singleton alarm-driven provider host |
+| `BACKGROUND_TASKS` | Durable Object namespace | Singleton recoverable background-task manager |
 
 Binding names are host choices; these are the names in the advanced starter.
-Schedules, notifications, goals, and background tasks share D1 through
-composed storage domains. No additional database is required, although
-high-volume deployments can choose separate databases if they preserve tenant
-binding and coordinated offboarding.
+Schedules, notifications, goals, and background tasks share D1 through composed storage domains. No additional database is required. If a high-volume deployment splits domains into separate D1 databases, seed and verify the same deployment tag in every database and decommission the complete resource set together.
 
-## Identity and tenant resolution
+## Deployment and actor identity
 
 `createFlowsafeWorker()` takes `buildVerifier(env)`. The baseline uses `parseActorTokens()` and `staticTokenVerifier()` as an inspectable seam. Replace it with verified JWT, OIDC, mTLS, or another mechanism that returns:
 
@@ -63,35 +68,35 @@ binding and coordinated offboarding.
 {
   id: string;
   role: 'admin' | 'builder' | 'operator' | 'reviewer' | 'viewer';
-  tenantId: string;
 }
 ```
 
-The tenant id must match `^[a-z0-9]{3,32}$`. It cannot contain `_`, which is the delimiter used by exact ownership and range-purge operations. `system` is reserved for maintenance attribution. `default` is reserved for a conventional single-tenant host and is not provisionable.
+The authenticated actor identifies a person inside the deployment. Internal `ExecutionPrincipal` values represent either a human actor or an authorized automated principal. Neither chooses the organization or a storage partition. The provisioning tag must match `^[a-z0-9]{3,32}$`; it comes only from `DEPLOYMENT_TENANT` and is used for the sentinel and audit attribution.
 
-Provision a named tenant before issuing credentials for it. `provisionTenant()` is insert-or-fail, which prevents two customers from sharing one slug.
+`ActorContext` records the owner of every server-minted run, thread, and schedule, plus validated host-owned resource keys, in `flowsafe_resource_owners`. Runs fired by a schedule inherit the schedule owner; runs woken by a signal inherit the thread owner instead of the automated delivery principal. Operators and builders can access only resources owned by their principal. Reviewers and viewers can read existing resources, and admins can administer them. Routes resolve resource access before role errors and return `404` when the principal cannot see the resource.
 
 Do not:
 
-- accept `tenantId` from a query, body, model result, signal, or forwarded header;
-- make a token's tenant optional;
-- use client-selected run, thread, resource, subscription, or schedule ids;
-- create a tenant-bound store before authentication;
-- expose a system store from request scope.
+- accept deployment identity from a token, query, body, model result, signal, schedule, or forwarded header;
+- use client-selected run, thread, subscription, or schedule ids, or accept a full resource id from an untrusted request;
+- bind more than one organization's traffic to the same data-plane resource set;
+- expose raw Durable Object namespaces or deployment stores from request scope.
 
-For tenant-specific subdomains, wrap the resolver with `withSubdomainCrossCheck()` as defense in depth. The bound store remains the primary isolation boundary.
+Host routing belongs to the provisioning control plane. It must resolve a hostname to exactly one physical deployment before Flowsafe sees the request.
 
 ## Baseline configuration
 
 | Name | Default | Behavior |
 | --- | --- | --- |
+| `DEPLOYMENT_TENANT` | None | Required provisioning tag. Protected routes return `503` unless it matches the D1 sentinel |
+| `DEPLOYMENT_IDENTITY_SECRET` | None | Required internal credential. Worker-to-Durable-Object requests fail before storage unless it matches |
+| `MAINTENANCE_ADMIN_SECRET` | None | Required control-plane credential. Maintenance admin routes return `503` when absent or malformed |
 | `APPROVAL_ACTOR_TOKENS` | Empty | Static verifier map. Empty means every authenticated route returns 401 |
 | `APPROVAL_SLA_SECONDS` | `14400` | SLA assigned to new approval records |
 | `APPROVAL_ALLOW_SELF_DECISION` | Unset | Separation of duties enabled. Accepts `true` or a comma-separated role list |
 | `RUN_RETENTION_DAYS` | `30` | Age for terminal workflow snapshot purge; `0` means immediate eligibility |
 | `APPROVAL_RETENTION_DAYS` | `30` | Age for approved/rejected approval purge |
 | `THREAD_RETENTION_DAYS` | Unset | Idle thread and message purge. Unset keeps conversations |
-| `TENANT_APEX_DOMAIN` | Unset | Optional subdomain-to-token-tenant cross-check |
 
 Invalid optional retention variables leave the destructive duty disabled and emit configuration audit rather than selecting a fallback TTL.
 
@@ -158,14 +163,13 @@ Other route factories accept a `basePath` when the exact public prefix is host-s
 
 ## Host composition
 
-`createFlowsafeWorker()` owns the common fetch, cron, and queue pipeline. Supply deployment-specific behavior through its typed seams:
+`createFlowsafeWorker()` owns the common fetch and maintenance-duty pipeline. It verifies deployment identity before protected routes or maintenance administration. Supply deployment-specific behavior through its typed seams:
 
-- `workflows` and `systemActorId`
+- `workflows` and `systemPrincipalId`
 - `buildVerifier`
-- `crons`
+- `maintenance` intervals
 - `preRoutes` for deployment-specific routes
-- `wrapResolve` for subdomain or additional identity checks
-- `wrapStart` and `wrapResume` for budgets
+- `beforeStart` and `beforeResume` for budgets or other final mutation policy
 - `buildAgentRouter` for the metadata-only public catalog and run routes
 - `buildResumeRun` to compose approval-only agent resume with generic workflow resume
 - `notify` for reviewer delivery
@@ -179,15 +183,15 @@ Other route factories accept a `basePath` when the exact public prefix is host-s
 
 Use the exported router and topology factories rather than recreating their gate order.
 
-## Scheduled invocations
+## Alarm-driven maintenance
 
-Use separate cron expressions for workloads with independent availability requirements:
+The fixed maintenance Durable Object schedules three independent duties:
 
 1. Approval SLA sweep
 2. Retention purge
 3. Schedule fire tick, when enabled
 
-The composed Worker dispatches by exact cron expression. An unrecognized expression runs safe fallback duties and records a configuration error, but exact matching is the supported configuration.
+Each alarm persists its successor before running exactly one due duty. If several duties are due, the object schedules an immediate follow-up alarm. A termination during one duty cannot starve another duty or break the alarm chain.
 
 Within the purge invocation, each domain is failure-isolated:
 
@@ -200,25 +204,30 @@ Within the purge invocation, each domain is failure-isolated:
 - terminal background tasks;
 - host-owned extra duties.
 
-Provider polling uses Durable Object alarms rather than a global cron. Notification dispatch can run from a schedule tick when delayed notification delivery is enabled.
+Provisioning must authenticate `POST /admin/ensure-maintenance` after deployment. The drift watchdog reads `GET /admin/maintenance-status` and re-arms a missing or stale alarm. Provider polling, background recovery, and notification dispatch also use Durable Object alarms.
 
-## Storage ownership
+## Storage lifecycle
+
+TTL retention, authorized domain deletion, and deployment decommissioning are separate mechanisms. A TTL removes only eligible terminal or idle data. An authorized API operation can delete standing configuration. Decommissioning deletes the physical resource set after traffic and credentials are revoked.
 
 | Domain | Retention rule |
 | --- | --- |
 | Workflow snapshots | Terminal-only TTL; suspended and running rows stay |
 | Approvals | Approved/rejected-only TTL; open rows stay |
 | Threads and messages | Opt-in idle-thread TTL; messages delete with the thread |
-| Resources and working memory | No TTL; delete at tenant offboarding |
+| Resources and working memory | No TTL; explicit host teardown or deployment decommissioning |
 | Notifications | Opt-in terminal-row TTL; pending rows stay |
 | Thread state and goals | Opt-in `updatedAt` TTL |
-| Schedules | No TTL; standing configuration deletes at offboarding |
+| Schedules | No TTL; authorized deletion or deployment decommissioning |
 | Schedule triggers | Opt-in fire-history TTL |
 | Background tasks | Terminal-state TTL |
-| Provider subscriptions | No TTL; standing configuration deletes at offboarding |
-| R2 artifacts | Delete with the owning snapshot purge and tenant offboarding |
+| Provider subscriptions | No TTL; authorized deletion or deployment decommissioning |
+| `flowsafe_resource_owners` | Run retention and schedule deletion release their claims. Thread and resource claims require explicit host teardown or deployment decommissioning |
+| R2 artifacts | Delete with the owning snapshot purge and deployment decommissioning |
 
-Call `purgeTenant()` only after revoking the tenant's credentials and stopping new starts. Pass the same artifact store used for runtime writes.
+Decommission the whole physical resource set after revoking traffic and credentials. There is no in-database organization purge. Pass the same artifact store used for runtime writes to retention so snapshot deletion remains paired with artifact deletion.
+
+Idle-thread retention does not release thread or resource ownership. A thread can still have an agent binding, schedule, subscription, goal, or other standing wake source after its idle memory rows expire. An explicit host teardown must remove every authoritative standing record before it calls `ActorContext.releaseResource()` for the thread and resource claims.
 
 ## Egress and process execution
 
@@ -234,14 +243,16 @@ Before exposing traffic:
 2. Run the starter smoke test against a deterministic model.
 3. Verify no route works without authentication except `/healthz` and
    explicitly configured signature-verified webhook routes.
-4. Verify forged tenant, actor, and role headers return 403.
+4. Verify forged deployment, actor, role, and retired `x-flowsafe-tenant` headers cannot influence trusted context.
 5. Verify a foreign run, thread, agent, or binding mismatch returns 404 without model or connector execution.
 6. Confirm no public agent raw-resume route exists.
 7. Kill the local Worker while an agent run is suspended, restart it, approve as a different reviewer, and confirm the connector runs once as the original requester.
 8. Evict the agent stream cache and confirm the stream returns 409 while status remains available.
-9. Verify every configured cron and provider alarm emits a success or contained failure event.
+9. Verify the maintenance, provider, and background-task alarms emit a success or contained failure event.
 10. Confirm Queue retries and dead-letter handling against a failing SIEM endpoint.
 11. Confirm retention deletes matching artifacts and leaves live rows.
-12. Exercise tenant offboarding in a non-production database.
+12. Exercise deployment decommissioning against a non-production resource set and confirm no Worker, route, D1 database, Durable Object namespace, R2 bucket, Queue binding, or secret remains attached.
+13. Bind a scratch Worker to a database carrying a different sentinel and confirm protected requests fail with `503` before any application record is read.
+14. Bind a scratch Worker namespace to another deployment's Durable Objects and confirm its different internal credential is rejected before object storage is read.
 
 Operational procedures are in [Operations runbook](operations-runbook.md).

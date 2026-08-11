@@ -9,50 +9,44 @@
 // one isolate — so the platform supplies the affinity for free. Thread-affine
 // from day one (DL-020): a threadless agent run mints a throwaway thread id
 // rather than starting per-run and paying a migration when signals land.
-// Workflow runs stay on the per-run DurableObjectRunner; runIds stay INV-1
-// whichever DO hosts them.
+// Workflow runs stay on the per-run DurableObjectRunner; runIds stay
+// server-minted whichever DO hosts them.
 //
-// The name IS the tenant carrier, exactly like a runId: threadIds are minted
-// `${tenantId}_${uuid}` by memory-id.ts, so `id.name` decodes to the owning
-// tenant (docs/agent-memory-tenancy.md). Two assertions, both fail-closed:
-// `tenantId` refuses a name carrying no INV-3 prefix (an unscoped thread is a
-// cross-tenant read), and every request must carry the AUTHENTICATED tenant
-// (THREAD_TENANT_HEADER) matching it.
-//
-// The header is load-bearing, not ceremony: a name-vs-path check alone
-// (DurableObjectRunner's #assertRunIdentity) cannot catch the actual attack —
-// tenant B presenting a valid token for tenant A's threadId routes to A's
-// instance, where name and path agree. Only comparing the name's tenant against
-// the tenant the Worker AUTHENTICATED closes it, which is why this DO refuses
-// to serve any request that fails to state one.
+// Identity at this boundary is the EXECUTION PRINCIPAL: every request must
+// carry the trusted Worker-stamped EXECUTION_PRINCIPAL_HEADER, the sole channel
+// for WHO is executing. A request without one did not come through
+// `createThreadTopology` (the only sanctioned way to reach a thread DO) and is
+// refused — defaulting to a human would let a dropped header turn automation
+// into a person. The deployment-identity check (env tag vs D1 sentinel) runs
+// before any route, so a mis-provisioned namespace refuses rather than serves.
 //
 // Classic constructor(state, env) + fetch contract — deliberately NOT `extends
 // DurableObject` from 'cloudflare:workers' — so this module and its graph load
 // in node/vitest, the same posture as DurableObjectRunner and HubDurableObject.
 
-import type { ApprovalActor } from '../approval-api/contract.js';
 import {
   decodeExecutionPrincipal,
   type ExecutionPrincipal,
-  principalActor,
 } from '../approval-api/principal.js';
 import type { DurableObjectRunnerState } from './cf-types.js';
-import { DoStatusError, doErrorResponse } from './do-error-response.js';
-import type { InitResult } from './init.js';
-import { tenantOfMemoryId } from './memory-id.js';
-import { DurableStorageResumeLedger } from './resume-ledger.js';
 import {
-  THREAD_PRINCIPAL_HEADER,
-  THREAD_TENANT_HEADER,
-} from './thread-header.js';
+  verifyDurableObjectDeploymentIdentity,
+  verifyDurableObjectDeploymentRequest,
+} from './deployment-identity.js';
+import { DoStatusError, doErrorResponse } from './do-error-response.js';
+import { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
+import type { InitResult } from './init.js';
+import { isPathSafeId } from './path-safe-id.js';
+
+const THREAD_ALARM_RECOVERY_DELAY_MS = 60_000;
 
 /**
- * A request refused at the thread DO's identity boundary: the DO's name carries
- * no tenant, or the request's authenticated tenant is not the one the name
- * carries. Surfaced as 403 — this boundary is internal (a DO namespace is not
- * client-reachable and the Worker 404s a foreign threadId before forwarding),
- * so there is no existence oracle to protect here and a distinct status keeps a
- * routing bug from reading as a generic 500.
+ * A request refused at the thread DO's identity boundary: the DO's name is
+ * unresolvable, or the request carries no valid execution principal. Surfaced
+ * as 403 — this boundary is internal (a DO namespace is not client-reachable
+ * and the Worker validates the threadId before forwarding), so there is no
+ * existence oracle to protect here and a distinct status keeps a routing bug
+ * from reading as a generic 500.
  *
  * Extends DoStatusError because that is how a status opts in: this class is what
  * doErrorResponse recognizes, not the shape of its fields.
@@ -70,22 +64,13 @@ export class ThreadIdentityError extends DoStatusError {
 export interface ThreadScope {
   /** This instance's thread — its own idFromName identity, never the request's. */
   readonly threadId: string;
-  /** The tenant the threadId carries, equal to the request's authenticated one. */
-  readonly tenantId: string;
+  /** Verified infrastructure tag for audit attribution (present under workerd). */
+  readonly deploymentTag?: string;
   /**
-   * Complete server-stamped requester identity, in human shape. Kept for the
-   * approval service and every existing thread route; for automated principals
-   * it is the least-privileged projection of `principal`.
-   */
-  readonly actor: ApprovalActor;
-  /**
-   * WHO is executing — the authority the agent host gates on. A human here is
-   * the same identity as `actor`; anything else is automation that must have
-   * been declared by the target agent.
+   * WHO is executing — the authority the agent host gates on. Automated
+   * principals must have been declared by the target agent.
    */
   readonly principal: ExecutionPrincipal;
-  /** Compatibility alias for actor.id. */
-  readonly requestedBy: string;
   /** This DO's storage/runtime/pubsub wiring, built once per instance. */
   readonly init: InitResult;
 }
@@ -95,7 +80,7 @@ export interface ThreadScope {
  * init() wiring) and `route()` (their thread routes), and bind the subclass
  * under a wrangler namespace addressed `idFromName(threadId)`.
  *
- * `route()` runs only AFTER the tenant assertion, so a track adding a route
+ * `route()` runs only AFTER the identity assertion, so a track adding a route
  * cannot forget it — the reason the dispatch is a template method rather than a
  * fetch() each subclass writes.
  */
@@ -118,15 +103,22 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
   protected abstract build(env: TEnv): InitResult;
 
   /**
-   * Serve a request whose tenant has already been asserted against this
-   * instance's identity. Abstract because the skeleton hosts no routes of its
-   * own: the durable-agent host drives the loop through `scope.init.runtime`,
-   * and the signals package mounts signal routes on the same asserted scope.
+   * Serve a request whose identity has already been asserted against this
+   * instance. Abstract because the skeleton hosts no routes of its own: the
+   * durable-agent host drives the loop through `scope.init.runtime`, and the
+   * signals package mounts signal routes on the same asserted scope.
    */
   protected abstract route(
     request: Request,
     scope: ThreadScope,
   ): Promise<Response>;
+
+  /** Optional Durable Object alarm work after deployment identity is verified. */
+  protected async onAlarm(
+    _env: TEnv,
+    _threadId: string,
+    _init: InitResult,
+  ): Promise<void> {}
 
   /**
    * The thread this instance serves, recovered from its OWN idFromName identity
@@ -136,38 +128,30 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
    */
   protected get threadId(): string {
     const name = this.state?.id?.name;
-    if (!name) {
+    if (!isPathSafeId(name)) {
       throw new ThreadIdentityError(
-        'ThreadDurableObject.threadId: the DO has no id.name (not created via idFromName, or running without state) — thread unresolvable, refusing to serve',
+        'ThreadDurableObject.threadId: the DO has no path-safe id.name — thread unresolvable, refusing to serve',
       );
     }
     return name;
   }
 
-  /**
-   * The tenant this instance serves, decoded from its own thread id — the same
-   * salted-prefix decode used for runIds (one decode, tenantOfMemoryId to
-   * tenantOfRunId). Throws on a name carrying no valid tenant prefix: a hand-built or
-   * client-chosen threadId never reaches a tenant-scoped store.
-   */
-  protected get tenantId(): string {
-    const threadId = this.threadId;
-    const tenantId = tenantOfMemoryId(threadId);
-    if (tenantId === undefined) {
-      throw new ThreadIdentityError(
-        `ThreadDurableObject.tenantId: threadId '${threadId}' carries no INV-3 tenant segment (thread ids are minted \`\${tenantId}_\${uuid}\` — see docs/agent-memory-tenancy.md)`,
-      );
-    }
-    return tenantId;
-  }
-
   async fetch(request: Request): Promise<Response> {
     try {
+      // Deployment identity BEFORE request identity: a mis-provisioned
+      // namespace (env tag vs D1 sentinel) refuses every request outright.
+      // No-op off workerd (state undefined), memoized after first success.
+      const deploymentTag = await verifyDurableObjectDeploymentRequest(
+        request,
+        this.state,
+        this.env,
+      );
       // Assert BEFORE building: a refused caller never reaches storage, and the
       // ordering is visible here rather than buried inside the assertion.
-      const identity = this.#assertTenantIdentity(request);
+      const identity = this.#assertIdentity(request);
       return await this.route(request, {
         ...identity,
+        ...(deploymentTag !== undefined ? { deploymentTag } : {}),
         init: this.#ensureInit(),
       });
     } catch (error) {
@@ -180,30 +164,32 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
     }
   }
 
-  /**
-   * The chokepoint: the request's authenticated tenant MUST be the one this
-   * instance's name carries. An absent header fails it too — the trusted Worker
-   * always stamps one, so its absence means the request did not come through
-   * authentication, and defaulting to "trust the name" would forfeit exactly the
-   * cross-tenant case (a valid token for another tenant's threadId) this check
-   * exists for.
-   */
-  #assertTenantIdentity(request: Request): Omit<ThreadScope, 'init'> {
+  async alarm(): Promise<void> {
     const threadId = this.threadId;
-    const tenantId = this.tenantId;
-    const claimed = request.headers.get(THREAD_TENANT_HEADER);
-    if (claimed !== tenantId) {
-      throw new ThreadIdentityError(
-        `thread identity mismatch: instance '${threadId}' belongs to tenant '${tenantId}' but the request authenticates as '${claimed ?? '<none>'}' — refusing`,
+    await this.state?.storage.setAlarm?.(
+      Date.now() + THREAD_ALARM_RECOVERY_DELAY_MS,
+    );
+    try {
+      await verifyDurableObjectDeploymentIdentity(this.state, this.env);
+      await this.onAlarm(this.env, threadId, this.#ensureInit());
+    } catch (error) {
+      await this.state?.storage.setAlarm?.(
+        Date.now() + THREAD_ALARM_RECOVERY_DELAY_MS,
       );
+      throw error;
     }
-    const principal = this.#principalFrom(request, tenantId);
+  }
+
+  /**
+   * The chokepoint: every request must carry the trusted execution principal.
+   * `route()` receives the asserted scope, never the raw request identity.
+   */
+  #assertIdentity(request: Request): Omit<ThreadScope, 'init'> {
+    const threadId = this.threadId;
+    const principal = this.#principalFrom(request);
     return {
       threadId,
-      tenantId,
-      actor: principalActor(principal),
       principal,
-      requestedBy: principal.id,
     };
   }
 
@@ -215,17 +201,17 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
    * DO — so a request without it did not come through the topology. Defaulting
    * to a human here would let a dropped header turn automation into a person.
    *
-   * This is the SOLE identity channel: `scope.actor` is projected from the
-   * principal rather than carried alongside it, so the two can never disagree.
+   * This is the SOLE identity channel: every route consumes `scope.principal`,
+   * so no parallel actor/requester representation can disagree with it.
    */
-  #principalFrom(request: Request, tenantId: string): ExecutionPrincipal {
-    const header = request.headers.get(THREAD_PRINCIPAL_HEADER);
+  #principalFrom(request: Request): ExecutionPrincipal {
+    const header = request.headers.get(EXECUTION_PRINCIPAL_HEADER);
     if (header === null) {
       throw new ThreadIdentityError(
         `thread identity mismatch: request for '${this.threadId}' carries no trusted execution principal`,
       );
     }
-    const principal = decodeExecutionPrincipal(header, tenantId);
+    const principal = decodeExecutionPrincipal(header);
     if (!principal) {
       throw new ThreadIdentityError(
         `thread identity mismatch: request for '${this.threadId}' carries an invalid execution principal`,
@@ -237,18 +223,6 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
   #ensureInit(): InitResult {
     if (!this.#init) {
       this.#init = this.build(this.env);
-      // Durable resume ledger, adopted HERE for the same reason
-      // DurableObjectRunner adopts it rather than taking it as a parameter: an
-      // agent loop suspends and resumes like any other run, and ctx.storage is
-      // what survives eviction/hibernation/deploys where in-memory class state
-      // does not. Absent under node/vitest (state is undefined), where the
-      // runtime keeps its in-memory default.
-      const storage = this.state?.storage;
-      if (storage) {
-        this.#init.runtime.adoptDefaultResumeLedger(
-          new DurableStorageResumeLedger(storage),
-        );
-      }
     }
     return this.#init;
   }

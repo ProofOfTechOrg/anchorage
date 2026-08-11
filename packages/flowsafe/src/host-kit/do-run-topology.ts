@@ -9,10 +9,19 @@
 import type {
   ApprovalDecision,
   ApprovalRecord,
+  ExecutionPrincipalKind,
 } from '../approval-api/index.js';
-import { defaultResumeData } from '../approval-api/index.js';
-import type { RunSummary } from '../do-runner/index.js';
+import {
+  defaultResumeData,
+  encodeExecutionPrincipal,
+} from '../approval-api/index.js';
+import {
+  deploymentIdentityHeaders,
+  EXECUTION_PRINCIPAL_HEADER,
+  type RunSummary,
+} from '../do-runner/index.js';
 import { type DoResponseLike, doSummary } from './do-response.js';
+import type { RunStartInput } from './run-router.js';
 
 /** The subset of a DurableObjectStub the topology uses. */
 export interface RunnerStubLike {
@@ -34,15 +43,22 @@ export interface RunnerNamespaceLike<Id = unknown> {
 
 export interface DoRunTopology {
   /** createRunRouter's `start` thunk. */
-  start(
-    workflowId: string,
-    runId: string,
-    inputData: unknown,
-  ): Promise<RunSummary>;
+  start(input: DoRunStartInput): Promise<RunSummary>;
   /** createRunRouter's `status` thunk (a DO 404 reads as undefined). */
   status(workflowId: string, runId: string): Promise<RunSummary | undefined>;
+  /** Waits behind start/recovery before declaring a dispatch absent. */
+  dispatchStatus(
+    workflowId: string,
+    runId: string,
+  ): Promise<RunSummary | undefined>;
   /** createRunRouter's `resume` thunk. */
-  resume(workflowId: string, runId: string, body: unknown): Promise<RunSummary>;
+  resume(
+    workflowId: string,
+    runId: string,
+    body: unknown,
+    requestedBy: string,
+    requestedByKind: ExecutionPrincipalKind,
+  ): Promise<RunSummary>;
   /**
    * ApprovalServiceOptions.resumeRun base: resume a DECIDED approval's run
    * through its DO stub with the standard resumeData contract. Hand this to
@@ -54,8 +70,16 @@ export interface DoRunTopology {
   ): Promise<RunSummary>;
 }
 
+export type DoRunStartInput = RunStartInput & {
+  /** Prepared trigger paired with scheduleId for a one-shot schedule fire. */
+  dispatchId?: string;
+  /** Ordinary trusted starts may seed core workflow state. */
+  initialState?: unknown;
+};
+
 export function createDoRunTopology<Id>(
   namespace: RunnerNamespaceLike<Id>,
+  deploymentIdentitySecret: string,
 ): DoRunTopology {
   // One DO per (workflowId, runId): the name join is unambiguous because
   // PATH_SAFE_ID_PATTERN excludes ':' from both ids.
@@ -66,41 +90,91 @@ export function createDoRunTopology<Id>(
     workflowId: string,
     runId: string,
     body: unknown,
+    requestedBy: string,
+    requestedByKind: ExecutionPrincipalKind,
   ): Promise<RunSummary> =>
     doSummary(
       await stub(workflowId, runId).fetch(
         `http://do/runs/${workflowId}/${runId}/resume`,
         {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(body),
+          headers: deploymentIdentityHeaders(deploymentIdentitySecret, {
+            'content-type': 'application/json',
+          }),
+          body: JSON.stringify({
+            ...(body && typeof body === 'object' ? body : {}),
+            requestedBy,
+            requestedByKind,
+          }),
         },
       ),
     );
 
   return {
-    start: async (workflowId, runId, inputData) =>
-      doSummary(
+    start: async ({
+      workflowId,
+      runId,
+      inputData,
+      initialState,
+      principal,
+      scheduleId,
+      dispatchId,
+    }) => {
+      if ((scheduleId === undefined) !== (dispatchId === undefined)) {
+        throw new Error(
+          'scheduled run starts require both scheduleId and dispatchId',
+        );
+      }
+      return doSummary(
         await stub(workflowId, runId).fetch('http://do/runs', {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ workflowId, runId, inputData }),
+          headers: deploymentIdentityHeaders(deploymentIdentitySecret, {
+            'content-type': 'application/json',
+            [EXECUTION_PRINCIPAL_HEADER]: encodeExecutionPrincipal(principal),
+          }),
+          body: JSON.stringify({
+            workflowId,
+            runId,
+            ...(scheduleId === undefined
+              ? { inputData, initialState }
+              : { scheduleId, dispatchId }),
+          }),
         }),
-      ),
+      );
+    },
     // The DO answers 404 for a run it has never seen; the router turns the
     // undefined into its own 404 rather than leaking the DO's body.
     status: async (workflowId, runId) => {
       const response = await stub(workflowId, runId).fetch(
         `http://do/runs/${workflowId}/${runId}`,
+        { headers: deploymentIdentityHeaders(deploymentIdentitySecret) },
+      );
+      if (response.status === 404) return undefined;
+      return doSummary(response);
+    },
+    dispatchStatus: async (workflowId, runId) => {
+      const response = await stub(workflowId, runId).fetch(
+        `http://do/runs/${workflowId}/${runId}/dispatch-status`,
+        { headers: deploymentIdentityHeaders(deploymentIdentitySecret) },
       );
       if (response.status === 404) return undefined;
       return doSummary(response);
     },
     resume,
-    resumeRecord: (record, decision) =>
-      resume(record.workflowId, record.runId, {
-        step: record.stepPath,
-        resumeData: defaultResumeData(record, decision),
-      }),
+    resumeRecord: (record, decision) => {
+      if (!record.decidedBy) {
+        throw new Error(`approval '${record.id}' has no decision actor`);
+      }
+      return resume(
+        record.workflowId,
+        record.runId,
+        {
+          step: record.stepPath,
+          resumeData: defaultResumeData(record, decision),
+        },
+        record.decidedBy,
+        'human',
+      );
+    },
   };
 }

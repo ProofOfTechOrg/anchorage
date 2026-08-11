@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it } from 'vitest';
-
+import { createActorResolver } from './actor-context.js';
 import type { ApprovalRole } from './contract.js';
 import {
   CLIENT_CREATE_FIELDS,
@@ -8,33 +8,39 @@ import {
   TCB_ONLY_CREATE_FIELDS,
 } from './router.js';
 import { ApprovalService } from './service.js';
-import { createTenantResolver } from './tenant-context.js';
-import { InMemoryApprovalStoreFactory } from './tenant-store.js';
+import { InMemoryApprovalStoreFactory } from './store-factory.js';
 import type { ApprovalRecord, CreateApprovalInput } from './types.js';
 import { approvalCursor } from './types.js';
 
-// Header-based test authenticator behind the real TenantResolver (production
-// wires sessions/JWTs into the same seam). The x-actor-tenant header defaults
-// to 'acme' so single-tenant fixtures stay terse. allowCreate is opt-in (the
+// Header-based test authenticator behind the real ActorResolver (production
+// wires sessions/JWTs into the same seam). allowCreate is opt-in (the
 // route is off by default), so every fixture that exercises create passes it
 // explicitly — mirroring the posture a host must choose deliberately.
-function makeHandler(options: { allowCreate?: boolean } = {}) {
+function makeHandler(
+  options: { allowCreate?: boolean; enforceOwnership?: boolean } = {},
+) {
   const backend = new InMemoryApprovalStoreFactory();
-  const store = backend.forTenant('acme');
-  const resolve = createTenantResolver({
+  const store = backend.store();
+  const resources = backend.resources();
+  const resolveActor = createActorResolver({
     authenticate: (request) => {
       const id = request.headers.get('x-actor-id');
       const role = request.headers.get('x-actor-role');
-      const tenantId = request.headers.get('x-actor-tenant') ?? 'acme';
-      return id && role
-        ? { id, role: role as ApprovalRole, tenantId }
-        : undefined;
+      return id && role ? { id, role: role as ApprovalRole } : undefined;
     },
     storeFactory: backend,
     buildService: (boundStore) => new ApprovalService({ store: boundStore }),
   });
+  const resolve = async (request: Request) => {
+    const context = await resolveActor(request);
+    if (!context || options.enforceOwnership) return context;
+    // Most cases isolate approval routing and seed arbitrary run ids. The
+    // ownership-boundary case below opts into the resolver's real registry.
+    return { ...context, canAccessResource: async () => true };
+  };
   return {
     store,
+    resources,
     handle: createApprovalRouter({
       resolve,
       allowCreate: options.allowCreate,
@@ -222,6 +228,51 @@ describe('createApprovalRouter', () => {
     expect((await response?.json()) as ApprovalRecord).toMatchObject({
       requestedBy: 'opal',
     });
+  });
+
+  it('creates only for a write-owned run and gives foreign and missing runs the same 404 without writing', async () => {
+    // #given — use the real ownership registry for this boundary test. The
+    // authenticated actor owns one run, another principal owns a second, and
+    // the third id is unregistered.
+    const { handle, resources, store } = makeHandler({
+      allowCreate: true,
+      enforceOwnership: true,
+    });
+    await resources.claim('run', 'acme_run-owned', {
+      kind: 'human',
+      id: 'opal',
+    });
+    await resources.claim('run', 'acme_run-foreign', {
+      kind: 'human',
+      id: 'other',
+    });
+
+    // #when / #then — the owned target succeeds.
+    const owned = await handle(
+      req('/api/approvals', {
+        body: { ...CREATE_BODY, runId: 'acme_run-owned' },
+      }),
+    );
+    expect(owned?.status).toBe(201);
+    expect(await store.list()).toHaveLength(1);
+
+    // #when / #then — neither denial reveals whether the target exists, and
+    // neither reaches ApprovalService.create/the approval store.
+    const foreign = await handle(
+      req('/api/approvals', {
+        body: { ...CREATE_BODY, runId: 'acme_run-foreign' },
+      }),
+    );
+    const missing = await handle(
+      req('/api/approvals', {
+        body: { ...CREATE_BODY, runId: 'acme_run-missing' },
+      }),
+    );
+    expect(foreign?.status).toBe(404);
+    expect(missing?.status).toBe(404);
+    expect(await foreign?.json()).toEqual({ error: 'run not found' });
+    expect(await missing?.json()).toEqual({ error: 'run not found' });
+    expect(await store.list()).toHaveLength(1);
   });
 
   it('never authors capability: an HTTP-created record has no connectors and no run scope', async () => {
@@ -526,7 +577,7 @@ describe('createApprovalRouter', () => {
     expect(await response?.json()).toMatchObject({ claimedBy: 'quinn' });
   });
 
-  it('404s POST /sla/sweep — the sweep is cron-owned TCB code, not an endpoint', async () => {
+  it('404s POST /sla/sweep because the sweep is maintenance-owned TCB code', async () => {
     // #given — the route USED to exist and was an unfiltered cross-tenant
     // read+write behind a role check; it must never come back
     const { handle } = makeHandler();

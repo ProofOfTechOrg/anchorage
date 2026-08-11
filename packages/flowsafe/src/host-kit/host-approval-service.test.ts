@@ -17,9 +17,8 @@ import {
 const OPERATOR: ApprovalActor = {
   id: 'opal',
   role: 'operator',
-  tenantId: 'acme',
 };
-const ADMIN: ApprovalActor = { id: 'ada', role: 'admin', tenantId: 'acme' };
+const ADMIN: ApprovalActor = { id: 'ada', role: 'admin' };
 
 describe('runApprovalRetentionPurge', () => {
   afterEach(() => {
@@ -31,17 +30,20 @@ describe('runApprovalRetentionPurge', () => {
     // but 1e303 * 86_400_000 overflows to Infinity before reaching
     // purgeExpiredApprovals, whose finiteness guard throws
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const store = new InMemoryApprovalStoreFactory().system();
+    const store = new InMemoryApprovalStoreFactory().store();
 
     // #when
-    const purged = await runApprovalRetentionPurge({
+    const outcome = await runApprovalRetentionPurge({
       store,
       retentionDays: '1e303',
-      cron: '7 * * * *',
+      trigger: 'purge',
     });
 
     // #then — contained: resolves undefined, one maintenance-error line
-    expect(purged).toBeUndefined();
+    expect(outcome).toEqual({
+      ok: false,
+      error: expect.stringContaining('TypeError'),
+    });
     const logged = errorSpy.mock.calls
       .map(([line]) => String(line))
       .filter((line) => line.includes('maintenance-error'));
@@ -49,7 +51,7 @@ describe('runApprovalRetentionPurge', () => {
     expect(JSON.parse(logged[0] ?? '{}')).toMatchObject({
       type: 'maintenance-error',
       surface: 'approval-retention-purge',
-      cron: '7 * * * *',
+      trigger: 'purge',
       error: expect.stringContaining('TypeError'),
     });
   });
@@ -57,10 +59,9 @@ describe('runApprovalRetentionPurge', () => {
   it('purges through the real store on a sane retentionDays value', async () => {
     // #given — one decided record older than a 0-day retention window
     const factory = new InMemoryApprovalStoreFactory();
-    const store = factory.forTenant('acme');
+    const store = factory.store();
     await store.create({
       id: 'apr-retention-1',
-      tenantId: 'acme',
       workflowId: 'wf',
       runId: 'acme_run-1',
       title: 'old decided approval',
@@ -73,22 +74,22 @@ describe('runApprovalRetentionPurge', () => {
     });
 
     // #when — APPROVAL_RETENTION_DAYS=0: purge decided approvals now
-    const purged = await runApprovalRetentionPurge({
-      store: factory.system(),
+    const outcome = await runApprovalRetentionPurge({
+      store: factory.store(),
       retentionDays: '0',
-      cron: '7 * * * *',
+      trigger: 'purge',
     });
 
     // #then
-    expect(purged).toBe(1);
+    expect(outcome).toEqual({ ok: true, value: 1 });
   });
 });
 
 describe('buildHostApprovalService allowSelfDecision passthrough', () => {
   function buildService(allowSelfDecision?: SelfDecisionPolicy) {
-    const store = new InMemoryApprovalStoreFactory().forTenant('acme');
+    const store = new InMemoryApprovalStoreFactory().store();
     return buildHostApprovalService(store, {
-      systemActorId: 'flowsafe-system',
+      systemPrincipalId: 'flowsafe-system',
       // A benign resume topology: decide() calls #resume on approve, and a
       // non-'suspended' summary means resumeRunWithRequeue queues nothing.
       resumeRun: async (record) => ({ runId: record.runId, status: 'success' }),
@@ -105,6 +106,7 @@ describe('buildHostApprovalService allowSelfDecision passthrough', () => {
         runId: 'acme_run-1',
         title: 'self-request',
         requestedBy: ADMIN.id,
+        requestedByKind: 'human',
       },
       OPERATOR,
     );

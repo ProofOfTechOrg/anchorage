@@ -1,6 +1,6 @@
 # Approval system
 
-Flowsafe turns a Mastra suspension into a durable, tenant-bound approval request. An approval resumes the run through its owning Durable Object and gives the resumed leg only the connector capabilities stored on that record. A rejection resumes with `approved: false` and no connector grant so the workflow can handle the denial.
+Flowsafe turns a Mastra suspension into a durable approval request inside one physically isolated deployment. An approval resumes the run through its owning Durable Object and gives the resumed leg only the connector capabilities stored on that record. A rejection resumes with `approved: false` and no connector grant so the workflow can handle the denial.
 
 Use this system for human authorization of side effects. Do not use a client-provided boolean, a raw resume body, or a model response as proof of approval.
 
@@ -48,25 +48,23 @@ Only terminal records are eligible for approval retention. An old open request i
 
 `queueApprovalForSuspension()` is the normal creation path. It observes the authoritative run summary and records:
 
-- `tenantId` from the tenant-bound store
 - `workflowId` and server-minted `runId`
 - the suspended `stepPath`
 - `suspendedAt` and the runtime-owned `resumeCount`
-- `requestedBy` from the human who advanced the run
+- `requestedBy` and `requestedByKind` from the execution principal that advanced the run; a human approval resume is attributed to its decider
 - `connectors` from the server-authored suspend payload
 - `grantScope` derived by the service
 - `toolCallId` from a durable-agent approval suspension
 - an optional server-authored durable-agent `resumeTarget`
 
-The HTTP create route is disabled by default. If a host enables it, the router rejects every field that could select a capability, change attribution, or choose a resume target. An HTTP-created request can collect a human decision, but cannot mint a connector grant.
+The HTTP create route is disabled by default. If a host enables it, the router requires write access to the named run and rejects every field that could select a capability, change attribution, or choose a resume target. An HTTP-created request can collect a human decision, but cannot mint a connector grant or resume execution.
 
 Do not derive a workflow suspension's `connectors` array from workflow input, model output, signal attributes, or another client-controlled value. Durable-agent `toolName` and `toolCallId` come from Mastra's persisted approval payload in one of its two supported shapes.
 
 ## Derive grants from stored decisions
 
-`approvalGrantProvider(tenantBoundStore)` reads approved records on every start or resume. A step-bound grant is available only when these values match the leg being resumed:
+`approvalGrantProvider(deploymentStore)` reads approved records on every start or resume. A step-bound grant is available only when these values match the leg being resumed:
 
-- tenant
 - workflow and run
 - step path
 - `suspendedAt`
@@ -107,7 +105,7 @@ The default base path is `/api/approvals`.
 
 | Method and path | Purpose |
 | --- | --- |
-| `GET /api/approvals` | List the tenant's records |
+| `GET /api/approvals` | List deployment records visible to the actor's role |
 | `GET /api/approvals/metrics` | Return queue metrics |
 | `GET /api/approvals/:id` | Read one record |
 | `POST /api/approvals/:id/claim` | Claim an open record |
@@ -120,7 +118,7 @@ List filters include `status`, `workflowId`, `runId`, `claimedBy`, `requestedBy`
 
 `orderBy=created` is FIFO and supports cursor pagination. `orderBy=reviewer` sorts by priority, nearest SLA deadline, then FIFO; it cannot be combined with `after`.
 
-Batch decisions return per-record outcomes. They are not a transaction across the batch, and partial success is expected when ownership, status, or separation-of-duties checks differ.
+Batch decisions return per-record outcomes. They are not a transaction across the batch, and partial success is expected when an id is unknown, record status conflicts, validation fails, or authorization and separation-of-duties checks differ.
 
 ## Concurrency behavior
 
@@ -136,7 +134,7 @@ The service always routes batch work through the same single-record methods. Bat
 
 ## SLA and notifications
 
-`sweepSLA(systemStore, options)` reads across tenants and transitions overdue open requests to `escalated`. It accepts a `SystemApprovalStore`, which a tenant request handler cannot obtain. Run it from a scheduled Worker invocation, never an HTTP route.
+`sweepSLA(store, options)` reads the deployment store and transitions overdue open requests to `escalated`. Run it through the maintenance Durable Object duty, never an HTTP route.
 
 `ApprovalNotificationSink` receives contained callbacks when a record is created or escalated. A transport failure does not undo the approval mutation; flowsafe writes an `approval.notify` audit failure.
 
@@ -157,10 +155,10 @@ React and React DOM are optional peers required only for this subpath. The compo
 
 Live streaming is optional. When the host has both a `HUB` Durable Object binding and `STREAM_TICKET_SECRET`, an authenticated client can mint a short-lived HMAC ticket and open:
 
-- a tenant queue channel at `/api/stream/hub`;
+- a deployment queue channel at `/api/stream/hub`;
 - a run channel at `/api/stream/run/:workflowId/:runId`.
 
-The ticket carries addressing data, not approval authority. The Worker verifies it; each Durable Object rebinds the addressed tenant or run through `idFromName()`. Polling remains the reconciliation path if a socket fails or streaming is absent.
+The ticket carries addressing data, not approval authority. The Worker verifies it. The singleton hub and each run Durable Object rebind the addressed channel through `idFromName()`. Polling remains the reconciliation path if a socket fails or streaming is absent.
 
 ## Resume failure recovery
 
@@ -180,8 +178,8 @@ Do not call public `prepare()` for durable-agent recovery. It is an initial-exec
 ## Retention and audit
 
 - `purgeExpiredApprovals()` deletes only `approved` and `rejected` records past the configured age.
-- `purgeTenant()` removes all of a tenant's approvals during offboarding, including open records.
+- Deployment decommissioning deletes the bound D1 database after credentials and traffic have been revoked.
 - Approval audit events use the same structural sink as Breakwater. Decision and connector-approval events identify `tool-call`, `suspension`, or `run` scope without recording connector inputs.
-- The full `ApprovalRecord` may contain reviewer context. Treat notification and stream sinks as tenant-confidential channels.
+- The full `ApprovalRecord` may contain reviewer context. Treat notification and stream sinks as organization-confidential channels.
 
 See [Deployment reference](deployment-reference.md), [Operations runbook](operations-runbook.md), and [Security threat model](security-threat-model.md) before production.

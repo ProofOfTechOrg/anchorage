@@ -45,7 +45,9 @@ export function deriveTrustedAgentContext(
     [BREAKWATER_ACTOR_KEY]: breakwaterActorFor(principal),
     [AGENT_AUDIT_CONTEXT_KEY]: {
       agentId: execution.agentId,
-      tenantId: principal.tenantId,
+      ...(execution.deploymentTag !== undefined
+        ? { tenantId: execution.deploymentTag }
+        : {}),
       runId: execution.runId,
       threadId: execution.threadId,
       resourceId: execution.resourceId,

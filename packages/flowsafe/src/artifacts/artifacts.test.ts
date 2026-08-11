@@ -33,6 +33,17 @@ describe('R2ArtifactStore key validation', () => {
     );
   });
 
+  it('rejects non-string ids and names without RegExp coercion', async () => {
+    const store = makeStore();
+
+    await expect(
+      store.put({ ...REF, runId: 123 as never }, 'x'),
+    ).rejects.toBeInstanceOf(InvalidArtifactRefError);
+    await expect(
+      store.put({ ...REF, name: 123 as never }, 'x'),
+    ).rejects.toBeInstanceOf(InvalidArtifactRefError);
+  });
+
   it('rejects keys past the R2 1024-byte limit', async () => {
     // #given
     const store = makeStore();
@@ -248,15 +259,12 @@ describe('R2ArtifactStore list/delete', () => {
   });
 });
 
-describe('tenant isolation invariant: NO workflow-level enumeration', () => {
-  // The R2 key is `[prefix/]workflowId/runId/name` — workflowId (a
-  // tenant-SHARED literal like 'product-launch') is the OUTERMOST segment;
-  // the tenant lives inside the runId in the SECOND segment. Isolation
-  // therefore holds only because every read/delete demands the FULL
-  // (workflowId, runId) pair: a "list all artifacts for workflow W" API
-  // would enumerate EVERY tenant's artifacts under W. This suite pins the
-  // absence of that API — if you are adding one, you are opening a
-  // cross-tenant enumeration and must re-key the store tenant-first instead.
+describe('run-scope invariant: NO workflow-level enumeration', () => {
+  // The R2 key is `[prefix/]workflowId/runId/name`. A workflow id is shared by
+  // every run, so every read/delete demands the FULL (workflowId, runId) pair.
+  // A "list all artifacts for workflow W" API would silently widen a
+  // run-scoped surface into deployment-wide enumeration. This suite pins the
+  // narrower contract.
 
   it('every public read/delete surface requires the full (workflowId, runId) pair', () => {
     // #given

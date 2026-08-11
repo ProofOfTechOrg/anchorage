@@ -7,7 +7,6 @@ import {
   createGuardedAgent,
   D1RateLimitStore,
   type RateLimitDatabase,
-  tenantIsolation,
 } from '@proofoftech/breakwater';
 import type { AgentMeta, AgentModule } from '@proofoftech/flowsafe/agent-host';
 import { z } from 'zod';
@@ -18,7 +17,7 @@ export const STARTER_AGENT_META = {
   id: STARTER_AGENT_ID,
   title: 'Anchorage durable agent',
   description:
-    'Records one approval-gated operation in the tenant-isolated starter ledger.',
+    'Records one approval-gated operation in the deployment-local starter ledger.',
   allowedRoles: ['admin', 'operator', 'builder'],
   // Every automated entry this starter actually wires, and nothing else.
   // Naming entry paths rather than just kinds is what stops a scheduler from
@@ -54,7 +53,7 @@ export function createRecordActionConnector(db: Env['DB']) {
   return createConnector({
     id: RECORD_ACTION_CONNECTOR_ID,
     description:
-      'Record one approved action in the tenant-isolated starter ledger',
+      'Record one approved action in the deployment-local starter ledger',
     inputSchema: actionInput,
     outputSchema: actionOutput,
     execute: async ({ action }, context) => {
@@ -105,7 +104,6 @@ export function createRecordActionConnector(db: Env['DB']) {
       writePermissions: {
         requireApproval: [RECORD_ACTION_CONNECTOR_ID],
       },
-      evaluators: [tenantIsolation()],
       rateLimitStore: new D1RateLimitStore(rateLimitDatabase(db)),
     },
   });

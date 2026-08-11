@@ -35,13 +35,11 @@ const SYSTEM = 'sys';
 const SYSTEM_PRINCIPAL = trustAutomationPrincipal({
   kind: 'system',
   id: SYSTEM,
-  tenantId: 'acme',
   purpose: 'test-reconcile',
 });
 const REVIEWER: ApprovalActor = {
   id: 'ray',
   role: 'reviewer',
-  tenantId: 'acme',
 };
 
 describe('requestedConnectors', () => {
@@ -112,6 +110,7 @@ function suspendedSummary(
   connectors: string[],
   suspendedAt: number,
   resumeCount?: number,
+  requestedBy: string | null = 'starter',
 ): RunSummary {
   return {
     runId,
@@ -119,6 +118,7 @@ function suspendedSummary(
     suspended: [[stepId]],
     suspendPayload: { [stepId]: { reason: `gate ${stepId}`, connectors } },
     suspendedAt: { [stepId]: suspendedAt },
+    ...(requestedBy === null ? {} : { requestedBy }),
     ...(resumeCount !== undefined
       ? { resumeCount: { [stepId]: resumeCount } }
       : {}),
@@ -127,7 +127,7 @@ function suspendedSummary(
 
 describe('queueApprovalForSuspension', () => {
   it('persists tool-call scope when an agent payload also carries connectors', async () => {
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const service = new ApprovalService({ store });
     const summary: RunSummary = {
       runId: 'acme_agent-ambiguous',
@@ -162,7 +162,7 @@ describe('queueApprovalForSuspension', () => {
 
   it('captures the suspended step, its (suspendedAt, resumeCount) pair, and connectors', async () => {
     // #given — a run suspended at gate2 on its second suspension
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const service = new ApprovalService({ store });
     const summary = suspendedSummary(
       'acme_run-1',
@@ -207,7 +207,7 @@ describe('queueApprovalForSuspension', () => {
 
   it('files one record PER suspended path when parallel branches suspend together', async () => {
     // #given — a .parallel() run suspended at TWO gates in one summary
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const service = new ApprovalService({ store });
     const summary: RunSummary = {
       runId: 'acme_run-parallel',
@@ -254,7 +254,7 @@ describe('queueApprovalForSuspension', () => {
     // transient D1 hiccup mid-loop). The run is already suspended by now and
     // a POST /runs retry mints a FRESH runId, so abandoning the loop on the
     // first failure would strand gateB with no record and no retry path.
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const originalCreate = store.create.bind(store);
     (store as { create: typeof store.create }).create = async (record) => {
       if (record.stepPath?.[0] === 'gateA') throw new Error('d1 hiccup');
@@ -293,7 +293,7 @@ describe('queueApprovalForSuspension', () => {
 describe('resumeRunWithRequeue', () => {
   it('re-queues the next gate attributed to the decider (SoD across gates)', async () => {
     // #given — a service whose base resume re-suspends the run at a 2nd gate
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const base: ResumeRunFn = async () =>
       suspendedSummary(
         'acme_run-1',
@@ -301,6 +301,7 @@ describe('resumeRunWithRequeue', () => {
         ['deploy-conn'],
         2020,
         1,
+        null,
       );
     // service forward-references itself in the resumeRun closure (invoked only
     // on a later decision); the same const-with-deferred-ref shape worker.ts uses.
@@ -319,6 +320,7 @@ describe('resumeRunWithRequeue', () => {
         title: 'Approve launch',
         connectors: ['deploy-conn'],
         requestedBy: 'starter',
+        requestedByKind: 'human',
       },
       SYSTEM_PRINCIPAL,
       {
@@ -350,7 +352,7 @@ describe('resumeRunWithRequeue', () => {
 
   it('does not re-queue when the resumed run reaches a terminal status', async () => {
     // #given — a base resume that completes the run
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const base: ResumeRunFn = async () => ({
       runId: 'acme_run-2',
       status: 'success',
@@ -369,6 +371,7 @@ describe('resumeRunWithRequeue', () => {
         title: 'Approve',
         connectors: ['outreach-email'],
         requestedBy: 'starter',
+        requestedByKind: 'human',
       },
       SYSTEM_PRINCIPAL,
     );
@@ -381,9 +384,9 @@ describe('resumeRunWithRequeue', () => {
   });
 
   it('keeps the original agent principal across a reviewer-driven re-suspension', async () => {
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const base: ResumeRunFn = async () =>
-      suspendedSummary('acme_run-agent', 'gate2', ['connector'], 2020, 1);
+      suspendedSummary('acme_run-agent', 'gate2', ['connector'], 2020, 1, null);
     const service: ApprovalService = new ApprovalService({
       store,
       resumeRun: resumeRunWithRequeue(base, () => service, SYSTEM),
@@ -397,6 +400,7 @@ describe('resumeRunWithRequeue', () => {
         title: 'Approve agent action',
         connectors: ['connector'],
         requestedBy: 'starter',
+        requestedByKind: 'human',
       },
       SYSTEM_PRINCIPAL,
       {
@@ -407,7 +411,6 @@ describe('resumeRunWithRequeue', () => {
         principal: {
           kind: 'human',
           id: 'starter',
-          tenantId: 'acme',
           role: 'operator',
         },
       },
@@ -419,13 +422,12 @@ describe('resumeRunWithRequeue', () => {
     expect(open).toHaveLength(1);
     expect(open[0]).toMatchObject({
       stepPath: ['gate2'],
-      requestedBy: 'starter',
+      requestedBy: 'ray',
       resumeTarget: {
         kind: 'agent-thread',
         principal: {
           kind: 'human',
           id: 'starter',
-          tenantId: 'acme',
           role: 'operator',
         },
       },
@@ -434,10 +436,10 @@ describe('resumeRunWithRequeue', () => {
 
   it('fails closed: refuses to re-queue a suspension with no decider', async () => {
     // #given — the wrapper invoked directly with a record lacking decidedBy
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const service = new ApprovalService({ store });
     const base: ResumeRunFn = async () =>
-      suspendedSummary('acme_run-3', 'gate2', ['c'], 9);
+      suspendedSummary('acme_run-3', 'gate2', ['c'], 9, undefined, null);
     const wrapped = resumeRunWithRequeue(base, () => service, SYSTEM);
     const record = { workflowId: 'wf', runId: 'acme_run-3' } as ApprovalRecord;
 
@@ -448,16 +450,16 @@ describe('resumeRunWithRequeue', () => {
   });
 
   it('still emits the re-queue event, unattributed, when minting its own principal fails', async () => {
-    // #given — a blank systemActorId: the vouch itself throws, which is the
+    // #given — a blank systemPrincipalId: the vouch itself throws, which is the
     // SAME input class that makes the re-queue throw. The event names the
     // suspended step paths and is the only signal an operator gets, so it must
     // not die of the cause it is reporting. There is no identity to derive, so
     // it is attributed to nobody rather than to a fabricated actor.
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const events: ApprovalAuditEvent[] = [];
     const audit = (event: ApprovalAuditEvent) => events.push(event);
     const base: ResumeRunFn = async () =>
-      suspendedSummary('acme_run-9', 'gate2', ['deploy-conn'], 3030, 1);
+      suspendedSummary('acme_run-9', 'gate2', ['deploy-conn'], 3030, 1, null);
     const service: ApprovalService = new ApprovalService({
       store,
       audit,
@@ -472,6 +474,7 @@ describe('resumeRunWithRequeue', () => {
         title: 'Approve launch',
         connectors: ['deploy-conn'],
         requestedBy: 'starter',
+        requestedByKind: 'human',
       },
       SYSTEM_PRINCIPAL,
     );
@@ -504,7 +507,7 @@ describe('resumeRunWithRequeue', () => {
     // #given — deciding gate1 durably resumes to a re-suspended gate2, but
     // the store rejects gate2's filing (a transient D1 failure) — the base
     // resume has already landed by the time this fires
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const originalCreate = store.create.bind(store);
     (store as { create: typeof store.create }).create = async (record) => {
       if (record.stepPath?.[0] === 'gate2') throw new Error('d1 hiccup');
@@ -513,7 +516,7 @@ describe('resumeRunWithRequeue', () => {
     const events: ApprovalAuditEvent[] = [];
     const audit = (event: ApprovalAuditEvent) => events.push(event);
     const base: ResumeRunFn = async () =>
-      suspendedSummary('acme_run-4', 'gate2', ['deploy-conn'], 3030, 1);
+      suspendedSummary('acme_run-4', 'gate2', ['deploy-conn'], 3030, 1, null);
     const service: ApprovalService = new ApprovalService({
       store,
       audit,
@@ -528,6 +531,7 @@ describe('resumeRunWithRequeue', () => {
         title: 'Approve launch',
         connectors: ['deploy-conn'],
         requestedBy: 'starter',
+        requestedByKind: 'human',
       },
       SYSTEM_PRINCIPAL,
     );
@@ -557,7 +561,7 @@ describe('resumeRunWithRequeue', () => {
       // The event is emitted by automation, so it is attributed to the
       // platform's own bookkeeping principal — a derived least-privileged role
       // and full provenance, never a hand-shaped viewer actor.
-      actor: { id: SYSTEM, role: 'viewer', tenantId: 'acme' },
+      actor: { id: SYSTEM, role: 'viewer' },
       detail: {
         workflowId: 'product-launch',
         runId: 'acme_run-4',
@@ -571,10 +575,28 @@ describe('resumeRunWithRequeue', () => {
 });
 
 describe('reconcileApprovalsForSummary', () => {
+  it('refuses to file a suspension with missing requester provenance', async () => {
+    const store = new InMemoryApprovalStore();
+    const service = new ApprovalService({ store });
+    const summary = suspendedSummary(
+      'acme_run-missing-requester',
+      'gate1',
+      ['deploy-conn'],
+      999,
+      undefined,
+      null,
+    );
+
+    await expect(
+      reconcileApprovalsForSummary(service, 'product-launch', summary, SYSTEM),
+    ).rejects.toThrow('no durable requester provenance');
+    expect(await store.list({})).toEqual([]);
+  });
+
   it('files a fresh approval for a suspended step with no matching record at all', async () => {
     // #given — a run reported suspended, nothing ever queued for it (the D4
     // wedge: the original filing never landed)
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const service = new ApprovalService({ store });
     const summary = suspendedSummary(
       'acme_run-5',
@@ -602,9 +624,9 @@ describe('reconcileApprovalsForSummary', () => {
     expect(await store.list({ status: 'pending' })).toHaveLength(1);
   });
 
-  it('attributes every reconcile-filed record to the SYSTEM actor, not a human', async () => {
+  it('preserves the durable execution requester on every reconciled record', async () => {
     // #given — two gates suspended together, neither ever queued
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const service = new ApprovalService({ store });
     const summary: RunSummary = {
       runId: 'acme_run-parallel-2',
@@ -615,6 +637,8 @@ describe('reconcileApprovalsForSummary', () => {
         gateB: { reason: 'gate B', connectors: ['conn-b'] },
       },
       suspendedAt: { gateA: 111, gateB: 222 },
+      requestedBy: 'schedule-fire',
+      requestedByKind: 'system',
     };
 
     // #when
@@ -625,14 +649,20 @@ describe('reconcileApprovalsForSummary', () => {
       SYSTEM,
     );
 
-    // #then — unlike a human-attributed queueApprovalForSuspension call,
-    // reconcile has no reviewer whose decision caused the suspension
+    // #then — reconciliation never invents the bookkeeping principal as the
+    // execution requester.
     expect(filed).toHaveLength(2);
-    expect(filed.every((record) => record.requestedBy === SYSTEM)).toBe(true);
+    expect(
+      filed.every(
+        (record) =>
+          record.requestedBy === 'schedule-fire' &&
+          record.requestedByKind === 'system',
+      ),
+    ).toBe(true);
   });
 
   it('uses an explicitly recovered agent principal for reconcile attribution', async () => {
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const service = new ApprovalService({ store });
     const summary = suspendedSummary(
       'acme_agent-reconcile',
@@ -654,7 +684,6 @@ describe('reconcileApprovalsForSummary', () => {
         principal: {
           kind: 'human',
           id: 'starter',
-          tenantId: 'acme',
           role: 'operator',
         },
       },
@@ -673,7 +702,7 @@ describe('reconcileApprovalsForSummary', () => {
 
   it('does not file when a PENDING record already matches the current fingerprint', async () => {
     // #given — the normal path already queued gate1's approval
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const service = new ApprovalService({ store });
     const summary = suspendedSummary(
       'acme_run-6',
@@ -706,7 +735,7 @@ describe('reconcileApprovalsForSummary', () => {
     // #given — gate1 was decided, but this summary still reports the run
     // suspended at the exact fingerprint the decision targeted — the window
     // between decide() landing and its resume completing
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const service = new ApprovalService({ store });
     const summary = suspendedSummary(
       'acme_run-7',
@@ -741,7 +770,7 @@ describe('reconcileApprovalsForSummary', () => {
 
   it('files when the only existing record carries a PREVIOUS fingerprint (post-resume re-suspension)', async () => {
     // #given — gate1's first suspension was queued and decided...
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const service = new ApprovalService({ store });
     const firstSuspension = suspendedSummary(
       'acme_run-8',
@@ -782,7 +811,7 @@ describe('reconcileApprovalsForSummary', () => {
       stepPath: ['gate1'],
       suspendedAt: 5000,
       resumeCount: 1,
-      requestedBy: SYSTEM,
+      requestedBy: 'starter',
     });
   });
 
@@ -791,7 +820,7 @@ describe('reconcileApprovalsForSummary', () => {
     // with no fingerprint healing and the same record id returned each time
     // (produced e.g. by the raw grant-free resume route re-suspending the
     // step while the old request still sits open)
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const service = new ApprovalService({ store });
     const staleSuspension = suspendedSummary(
       'acme_run-11',
@@ -850,7 +879,7 @@ describe('reconcileApprovalsForSummary', () => {
 
   it('supersedes a stale OPEN record — terminal, system decidedBy, audited — before filing fresh', async () => {
     // #given — a stale pending record for gate1, and audit wired
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const events: ApprovalAuditEvent[] = [];
     const audit = (event: ApprovalAuditEvent) => events.push(event);
     const service = new ApprovalService({ store, audit });
@@ -887,7 +916,7 @@ describe('reconcileApprovalsForSummary', () => {
     expect(filed).toHaveLength(1);
     expect(filed[0]).toMatchObject({ suspendedAt: 9000, resumeCount: 1 });
 
-    // ...and the stale one is terminal, attributed to the system actor —
+    // ...and the stale one is terminal, attributed to the system principal —
     // never a human decision, never touching the run
     const supersededRecord = await store.get(stale?.id ?? '');
     expect(supersededRecord).toMatchObject({
@@ -914,7 +943,7 @@ describe('reconcileApprovalsForSummary', () => {
     // concurrent decide() between reconcile's list() and its supersede call
     // would produce: by the time supersedeStale's CAS runs, the record has
     // already left the OPEN set, so that CAS naturally loses.
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const service = new ApprovalService({ store });
     const staleSuspension = suspendedSummary(
       'acme_run-9',
@@ -974,7 +1003,7 @@ describe('reconcileApprovalsForSummary', () => {
     // #given — one run suspended at TWO gates, each with a stale open record;
     // gateA's supersede CAS will lose to a concurrent real decision, gateB's
     // will succeed. The back-off must be scoped per step, not per call.
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const service = new ApprovalService({ store });
     const [staleA] = await queueApprovalForSuspension(
       service,
@@ -1017,6 +1046,7 @@ describe('reconcileApprovalsForSummary', () => {
       },
       suspendedAt: { gateA: 7000, gateB: 7100 },
       resumeCount: { gateA: 1, gateB: 1 },
+      requestedBy: 'reviewer-1',
     };
 
     // #when
@@ -1046,7 +1076,7 @@ describe('reconcileApprovalsForSummary', () => {
 
   it('excludes a superseded record from grant derivation even queried at its ORIGINAL fingerprint', async () => {
     // #given — an approval superseded via reconcile...
-    const store = new InMemoryApprovalStore('acme');
+    const store = new InMemoryApprovalStore();
     const service = new ApprovalService({ store });
     const staleSuspension = suspendedSummary(
       'acme_run-12',

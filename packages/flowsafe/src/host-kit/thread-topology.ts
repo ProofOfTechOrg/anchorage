@@ -1,23 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
-// The per-thread DO topology seam — and the MINTER for the tenant header
-// ThreadDurableObject verifies (DL-002). Mint and verify ship together, the same
-// posture stream-ticket.ts takes, because a verifier whose input the caller can
-// write is not a check.
+// The per-thread DO topology seam — and the minter for the execution-principal
+// header ThreadDurableObject verifies (DL-002). Mint and verify ship together,
+// because a verifier whose input the caller can write is not a check.
 //
 // THE TRAP THIS EXISTS TO CLOSE. The house idiom for forwarding into a DO is
-// hub-topology.ts's `forwardSubscribe: (tenantId, request) => stub(tenantId)
-// .fetch(request)` — the CLIENT's Request, headers and all. That is safe for the
-// hub, which trusts the forwarded request for nothing (it re-asserts
-// event.record.tenantId against its own id.name from server-side data). A thread
+// hub-topology.ts's `forwardSubscribe(request) => stub().fetch(request)` — the
+// CLIENT's Request, headers and all. That is safe for the hub, which trusts the
+// forwarded request for nothing. A thread
 // route copying that shape would hand the client the very header the thread DO
-// authenticates on: `x-flowsafe-tenant: <victim>` and the assertion passes. So
-// this module, not the caller, decides the header's value — on EVERY path,
-// including forwarded upgrades, where it OVERWRITES rather than defaults.
+// authenticates on. This module, not the caller, decides the principal header's
+// value on every path, including forwarded upgrades, where it overwrites.
 //
 // Reach a thread DO through here. A route that addresses the namespace itself
-// re-opens the hole, so the namespace-shaped seam is deliberately not re-exported
-// for ad-hoc use: `send`/`forward` are the sanctioned surface, and both refuse a
-// threadId the caller's tenant does not own BEFORE the DO is ever addressed.
+// re-opens the hole, so `send`/`forward` are the sanctioned surface and both
+// validate the threadId before the DO is addressed.
 //
 // Structural namespace/stub types (method syntax, so a real
 // DurableObjectNamespace satisfies them under TS method-parameter bivariance),
@@ -25,15 +21,16 @@
 // RunnerNamespaceLike / HubNamespaceLike.
 
 import {
+  type ActorContext,
   assertExecutionPrincipal,
   encodeExecutionPrincipal,
-  type TenantContext,
 } from '../approval-api/index.js';
 import {
-  THREAD_PRINCIPAL_HEADER,
-  THREAD_TENANT_HEADER,
+  deploymentIdentityHeaders,
+  EXECUTION_PRINCIPAL_HEADER,
+  stampDeploymentIdentityRequest,
 } from '../do-runner/index.js';
-import { requireOwnedMemoryId } from './memory-boundary.js';
+import { requireMemoryId } from './memory-boundary.js';
 
 /**
  * The subset of a DurableObjectStub the thread topology uses. The raw-`Request`
@@ -65,117 +62,116 @@ export interface ThreadRequestInit {
   body?: string;
 }
 
+export type ThreadPrincipalContext = Pick<ActorContext, 'principal'>;
+
+/** A standing-memory target that must resolve to a durable thread binding. */
+export interface BoundThreadTarget {
+  threadId: string;
+  resourceId?: string;
+  agentId?: string;
+}
+
+/** Target-side proof that a thread is durable memory, not an ephemeral run id. */
+export type BoundThreadTargetValidator = (
+  context: ActorContext,
+  target: BoundThreadTarget,
+) => Promise<void>;
+
 export interface ThreadTopology {
   /**
    * Send an authenticated request to a thread DO. `path` is the DO-side route
-   * (e.g. `/messages`). Throws RunRouteError(404) when the tenant does not own
-   * `threadId` — before the DO is addressed, so a foreign thread is never even
-   * woken, and the caller surfaces the 404 its router already maps.
+   * (e.g. `/messages`). Throws RunRouteError(404) when `threadId` is malformed,
+   * before the DO is addressed.
    */
   send(
-    tenant: TenantContext,
+    context: ThreadPrincipalContext,
     threadId: string,
     path: string,
     init?: ThreadRequestInit,
   ): Promise<Response>;
   /**
    * Forward a client Request (e.g. a verified WebSocket upgrade) to a thread DO,
-   * with the tenant header OVERWRITTEN from the authenticated context. Same
-   * ownership 404 as `send`. Use this instead of `stub.fetch(request)`: a
-   * verbatim forward carries the client's own headers, including a forged
-   * `x-flowsafe-tenant`.
+   * with the principal header overwritten from the authenticated context. Same
+   * validation 404 as `send`. Use this instead of `stub.fetch(request)`.
    */
   forward(
-    tenant: TenantContext,
+    context: ThreadPrincipalContext,
     threadId: string,
     request: Request,
   ): Promise<Response>;
 }
 
 /**
- * The identity this hop carries, validated against the tenant it is being sent
- * to. The principal is the ONLY identity on the wire: the DO projects
- * `scope.actor` from it, so a host's separate `TenantContext.actor` can never
+ * The principal is the only identity on the wire; no parallel actor header can
  * disagree with what executes.
- *
- * The tenant check matters because `encodeExecutionPrincipal` deliberately omits
- * `tenantId` and the DO re-binds it from its own authenticated tenant: without
- * this, a context whose principal belongs to another tenant would be silently
- * re-tenanted, and the audit trail would name the wrong tenant's principal with
- * nothing flagging it.
  */
-function stampedPrincipal(tenant: TenantContext) {
+function stampedPrincipal(context: ThreadPrincipalContext) {
   return assertExecutionPrincipal(
-    tenant.principal,
-    tenant.tenantId,
+    context.principal,
     'thread topology principal',
   );
 }
 
 export function createThreadTopology<Id>(
   namespace: ThreadNamespaceLike<Id>,
+  deploymentIdentitySecret: string,
 ): ThreadTopology {
-  // One DO per thread: id.name IS the tenant-minted threadId, so the instance
-  // carries its tenant exactly like a runId carries its own (DL-002).
+  // One DO per thread: id.name is the host-minted threadId (DL-002).
   const stub = (threadId: string): ThreadStubLike =>
     namespace.get(namespace.idFromName(threadId));
 
-  // Ownership FIRST, then address. Both barriers are load-bearing and neither
-  // subsumes the other: this 404 is what stops tenant B reaching tenant A's
-  // thread at all, and the header the DO re-asserts is what stops a routing bug
-  // here from being the only thing between them.
-  const owned = (tenant: TenantContext, threadId: string): string =>
-    requireOwnedMemoryId(tenant, threadId, 'threadId');
+  const addressed = (threadId: string): string =>
+    requireMemoryId(threadId, 'threadId');
 
   // Both surfaces are `async` so the ownership refusal REJECTS rather than
   // throwing synchronously out of a Promise-typed call: a caller writing
   // `topology.send(...).catch(handle)` would never see a sync throw, and the
   // 404 would escape past the very handler meant to map it.
   return {
-    send: async (tenant, threadId, path, init = {}) => {
-      // Merge through Headers so the stamp wins by case-INSENSITIVE name. A
-      // plain-object spread keeps a caller's `X-Flowsafe-Tenant` as a SECOND
-      // property; Headers' fill algorithm then appends both into `globex, acme`,
-      // which the DO reads as claimed !== tenantId — a 403 that looks like an
-      // identity attack (fail-closed, but the wrong error and a false
-      // "spelling cannot win" story). `set` is the primitive `forward` already
-      // relies on; it overwrites at every spelling. The value is the RESOLVED
-      // tenant context (authenticate -> INV-3 -> bind), never a header or body.
+    send: async (context, threadId, path, init = {}) => {
+      // Merge through Headers so the stamp wins by case-insensitive name. A
+      // plain-object spread can preserve duplicate case variants instead.
       const merged = new Headers(init.headers);
-      const principal = stampedPrincipal(tenant);
-      merged.set(THREAD_TENANT_HEADER, tenant.tenantId);
-      merged.set(THREAD_PRINCIPAL_HEADER, encodeExecutionPrincipal(principal));
+      const principal = stampedPrincipal(context);
+      merged.set(
+        EXECUTION_PRINCIPAL_HEADER,
+        encodeExecutionPrincipal(principal),
+      );
       // Retired identity headers: nothing reads them, but a caller's value must
       // not ride into the DO as if the topology had stamped it.
       merged.delete('x-flowsafe-actor');
       merged.delete('x-flowsafe-role');
-      const headers: Record<string, string> = {};
-      merged.forEach((value, key) => {
-        headers[key] = value;
-      });
-      return stub(owned(tenant, threadId)).fetch(`http://thread${path}`, {
+      merged.delete('x-flowsafe-tenant');
+      const headers = deploymentIdentityHeaders(
+        deploymentIdentitySecret,
+        merged,
+      );
+      return stub(addressed(threadId)).fetch(`http://thread${path}`, {
         ...init,
         headers,
       });
     },
-    forward: async (tenant, threadId, request) => {
-      const addressed = owned(tenant, threadId);
+    forward: async (context, threadId, request) => {
+      const threadName = addressed(threadId);
       // A cloned Request has MUTABLE headers where an inbound one does not, so
       // this is what lets the overwrite happen at all — and `set` (not `append`)
       // is what makes a forged client value vanish rather than ride along as a
       // second value the DO might read.
-      const forwarded = new Request(request);
-      const principal = stampedPrincipal(tenant);
-      forwarded.headers.set(THREAD_TENANT_HEADER, tenant.tenantId);
+      const forwarded = stampDeploymentIdentityRequest(
+        request,
+        deploymentIdentitySecret,
+      );
+      const principal = stampedPrincipal(context);
       // Retired identity headers: nothing reads them, but a client's forged
       // value must not ride into the DO as if the topology had stamped it.
       forwarded.headers.delete('x-flowsafe-actor');
       forwarded.headers.delete('x-flowsafe-role');
+      forwarded.headers.delete('x-flowsafe-tenant');
       forwarded.headers.set(
-        THREAD_PRINCIPAL_HEADER,
+        EXECUTION_PRINCIPAL_HEADER,
         encodeExecutionPrincipal(principal),
       );
-      return stub(addressed).fetch(forwarded);
+      return stub(threadName).fetch(forwarded);
     },
   };
 }

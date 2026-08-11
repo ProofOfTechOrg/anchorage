@@ -38,16 +38,16 @@ New host-side and React features remain subpath-only so importing the root does 
 | --- | --- |
 | `@proofoftech/flowsafe/agent-host` | Server-only guarded-agent catalogs, authenticated start/status/NDJSON routes, thread hosting, and approval-only resume |
 | `@proofoftech/flowsafe/agent-runner` | Runtime-driven Mastra durable agents, approval suspend parsing, and restart resume |
-| `@proofoftech/flowsafe/approval-api` | Records, tenant-bound stores, service, router, grant providers, retention, SLA, notifications, and stream events |
-| `@proofoftech/flowsafe/background-tasks` | D1 task domains, tenant task host, routes, and terminal-task purge |
+| `@proofoftech/flowsafe/approval-api` | Records, actor resolver, deployment store, service, router, grant provider, retention, SLA, notifications, and stream events |
+| `@proofoftech/flowsafe/background-tasks` | D1 task domains, deployment task host, routes, and terminal-task purge |
 | `@proofoftech/flowsafe/approval-ui` | React dashboard, client, headless hook, component slots, and live transport |
 | `@proofoftech/flowsafe/artifacts` | R2 artifact store and in-memory bucket |
 | `@proofoftech/flowsafe/audit-export` | Queue producer sink and NDJSON SIEM consumer |
-| `@proofoftech/flowsafe/do-runner` | Runtime, Durable Object classes, D1 storage, identity helpers, pub/sub, resume ledger, purges, and run summaries |
+| `@proofoftech/flowsafe/do-runner` | Runtime, Durable Object classes, D1 storage, deployment sentinel and caller attestation, identity helpers, pub/sub, retention, and run summaries |
 | `@proofoftech/flowsafe/goals` | Objective HTTP router and goal request-context contract |
-| `@proofoftech/flowsafe/host-kit` | Auth seams, tenant resolver, run/thread/hub/provider topologies, routes, approval bridges, tickets, and composed Worker |
+| `@proofoftech/flowsafe/host-kit` | Authenticator and verifier seams, run/thread/hub/provider topologies, routes, approval bridges, tickets, and composed Worker |
 | `@proofoftech/flowsafe/host-kit/module` | Workflow-module interface for import-safe host registration |
-| `@proofoftech/flowsafe/schedules` | D1 schedule domain, tenant router, reserved-context guard, and CAS tick |
+| `@proofoftech/flowsafe/schedules` | D1 schedule domain, deployment router, reserved-context guard, and CAS tick |
 | `@proofoftech/flowsafe/signal-providers` | Provider adapters, host Durable Object, topology, subscriptions, verified webhooks, and GitHub provider |
 | `@proofoftech/flowsafe/signals` | D1 signal domains, thread routes, ingress router, notification dispatch, and client |
 | `@proofoftech/flowsafe/signals/client` | DOM-free `SignalClient` without host-side signal code |
@@ -78,6 +78,7 @@ The agent CLI module can be constructed in another runtime when you inject `Agen
 | `@mastra/core` | Both packages |
 | `@proofoftech/breakwater` | flowsafe `agent-host`, host-kit module types, and grant-protected connector integrations |
 | `react` and `react-dom` | flowsafe approval UI only |
+| `wrangler` `>=4 <5` | flowsafe `flowsafe-provision` CLI only |
 
 Flowsafe does not impose a CSS or design-system dependency. Its default approval views render semantic HTML.
 

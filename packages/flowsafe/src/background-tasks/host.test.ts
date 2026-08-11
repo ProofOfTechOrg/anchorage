@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Track B host wiring + the B-S2 recovery seam (R-002 pin: the PUBLIC async
 // init(pubsub) fires recoverStaleTasks internally — no private method is
-// called). Execution-mode recovery is proven over the serialized, tenant-bound
+// called). Execution-mode recovery is proven over the serialized, deployment-bound
 // D1 domains: workers subscribe before init publishes the recovered dispatch,
 // and a static executor takes the stranded task through to completion.
 
@@ -11,7 +11,7 @@ import { InMemoryStore, type MastraCompositeStore } from '@mastra/core/storage';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
-import { d1DatabaseLike, openSqlite } from '../../test-support/sqlite.js';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import { createD1Storage, createHostPubSub, init } from '../do-runner/index.js';
 import {
   backgroundTasksStore,
@@ -42,7 +42,9 @@ function baseTask(overrides: Record<string, unknown>) {
 // eagerly on the first persisted run — the same seed the schema-guard test uses.
 async function seededD1(): Promise<MastraCompositeStore> {
   const sqlite = openSqlite();
-  const storage = createD1Storage({ binding: d1DatabaseLike(sqlite) as never });
+  const storage = createD1Storage({
+    binding: sqliteUnitDatabase(sqlite) as never,
+  });
   const { createWorkflow, createStep, runtime } = init({ storage });
   const step = createStep({
     id: 'noop',
@@ -61,11 +63,11 @@ async function seededD1(): Promise<MastraCompositeStore> {
   return storage;
 }
 
-async function executionHostDependencies(tenantId = 'acme') {
-  const binding = d1DatabaseLike(openSqlite()) as never;
+async function executionHostDependencies() {
+  const binding = sqliteUnitDatabase(openSqlite()) as never;
   const storage = createD1Storage({
     binding,
-    domains: createBackgroundTaskD1Domains({ binding, tenantId }),
+    domains: createBackgroundTaskD1Domains({ binding }),
   });
   await storage.init();
   const pubsub = createHostPubSub();
@@ -236,7 +238,7 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
     const host = new BackgroundTaskHost({
       mastra,
       pubsub,
-      execution: { tenantId: 'acme' },
+      execution: true,
       executors: {},
     });
     const primary = new Error('partial worker start');
@@ -268,7 +270,7 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
     const host = new BackgroundTaskHost({
       mastra,
       pubsub,
-      execution: { tenantId: 'acme' },
+      execution: true,
       executors: {},
     });
     const primary = new Error('manager init');
@@ -303,7 +305,7 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
     const host = new BackgroundTaskHost({
       mastra,
       pubsub,
-      execution: { tenantId: 'acme' },
+      execution: true,
       executors: {},
     });
     const primary = new Error('manager init');
@@ -351,7 +353,7 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
     const host = new BackgroundTaskHost({
       mastra,
       pubsub,
-      execution: { tenantId: 'acme' },
+      execution: true,
       executors: {},
     });
     vi.spyOn(mastra, 'startWorkers').mockResolvedValue();
@@ -423,7 +425,7 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
     const host = new BackgroundTaskHost({
       mastra,
       pubsub,
-      execution: { tenantId: 'acme' },
+      execution: true,
       executors: {},
     });
     let releaseStart: () => void = () => undefined;
@@ -473,7 +475,7 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
     const host = new BackgroundTaskHost({
       mastra,
       pubsub,
-      execution: { tenantId: 'acme' },
+      execution: true,
       executors: {},
     });
     vi.spyOn(mastra, 'startWorkers').mockResolvedValue();
@@ -500,7 +502,7 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
     const host = new BackgroundTaskHost({
       mastra,
       pubsub,
-      execution: { tenantId: 'acme' },
+      execution: true,
       executors: {},
     });
     vi.spyOn(mastra, 'startWorkers').mockResolvedValue();
@@ -591,12 +593,11 @@ describe('BackgroundTaskHost — on D1 (R-B1: persistence + recovery seam, no bo
 
 describe('BackgroundTaskHost — execution-mode recovery on D1', () => {
   it('subscribes workflow workers before recovery re-dispatches a retryable task', async () => {
-    const binding = d1DatabaseLike(openSqlite()) as never;
+    const binding = sqliteUnitDatabase(openSqlite()) as never;
     const seedStorage = createD1Storage({
       binding,
       domains: createBackgroundTaskD1Domains({
         binding,
-        tenantId: 'acme',
       }),
     });
     await seedStorage.init();
@@ -615,7 +616,6 @@ describe('BackgroundTaskHost — execution-mode recovery on D1', () => {
       binding,
       domains: createBackgroundTaskD1Domains({
         binding,
-        tenantId: 'acme',
       }),
     });
     await storage.init();
@@ -625,7 +625,7 @@ describe('BackgroundTaskHost — execution-mode recovery on D1', () => {
     const host = new BackgroundTaskHost({
       mastra,
       pubsub,
-      execution: { tenantId: 'acme' },
+      execution: true,
       executors: { longResearch: { execute } },
     });
 

@@ -145,7 +145,7 @@ function RunCard({
     0,
   );
   // An approval anywhere in this run's history proves a gate suspended it —
-  // the terminal snapshot alone can't (the resume ledger drops at terminal).
+  // the terminal summary alone cannot expose an earlier suspension.
   const neverSuspended =
     status === 'success' &&
     totalResumes === 0 &&

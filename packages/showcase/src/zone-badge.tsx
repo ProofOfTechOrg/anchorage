@@ -14,7 +14,7 @@ const ZONE_COLOR: Record<NarrationZone, TokenColor> = {
   worker: 'blue',
   do: 'purple',
   d1: 'teal',
-  cron: 'yellow',
+  alarm: 'yellow',
 };
 
 export function ZoneBadge({ zone }: { zone: NarrationZone }): ReactElement {

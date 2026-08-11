@@ -1,70 +1,74 @@
 {
   "$schema": "https://unpkg.com/wrangler/config-schema.json",
-  "name": "anchorage-showcase",
+  // The cutover script name creates fresh Durable Object namespaces and keeps
+  // the pre-cutover anchorage-showcase script addressable for rollback.
+  "name": "anchorage-showcase-single-tenant",
   "main": "./worker/worker.ts",
   // esbuild bundles the worker with these paths, so flowsafe + breakwater
   // bundle from SOURCE — wrangler dev/deploy need no prior dist build.
   "tsconfig": "./tsconfig.worker.json",
-  "compatibility_date": "2025-06-01",
+  "compatibility_date": "2026-07-26",
   "compatibility_flags": ["nodejs_compat"],
+  "secrets": {
+    "required": ["DEPLOYMENT_IDENTITY_SECRET", "MAINTENANCE_ADMIN_SECRET"]
+  },
   // The account hosting the proofoftech.org zone (the custom domain below
   // must live on the same account). Pinned because the deploying identity
   // has access to more than one account.
   "account_id": "056cbaa6f5c3d8ff5584f1aa84bbe050",
-  // The ONLY public origin. The OAuth callback is registered for exactly this
-  // origin (the worker derives redirect_uri from url.origin), so a second
-  // reachable host would half-work: API yes, sign-in no. workers_dev off
-  // keeps the origin single — and the SPA carries a TEMPORARY noindex robots
-  // meta (index.html) until the demo should be indexable. Prerequisite:
-  // proofoftech.org must be a zone on this Cloudflare account.
-  "workers_dev": false,
-  "routes": [{ "pattern": "anchorage.proofoftech.org", "custom_domain": true }],
+  // Staging posture for the physical-isolation cutover: deploy the new script
+  // at its workers.dev URL and verify it before moving the custom-domain route.
+  // At cutover, set this false and add the anchorage.proofoftech.org custom
+  // domain route in the same deploy. The old anchorage-showcase script keeps
+  // its original database and DO namespaces as the rollback bundle.
+  "workers_dev": true,
   // The worker emits structured JSON (audit + maintenance + connector previews)
   // to Workers Logs.
   "observability": { "enabled": true },
-  // RUNNER: one DO per run (workflow execution). HUB: one DO per tenant (live
-  // stream fan-out). Every stream route lives under /api/stream/, which the
-  // /api/* run_worker_first entry below already routes to the Worker, so no
-  // assets edit is needed.
+  // RUNNER: one DO per run (workflow execution). HUB: one deployment singleton
+  // for live stream fan-out. MAINTENANCE: one deployment singleton for
+  // alarm-owned maintenance duties. Every stream route lives under
+  // /api/stream/, which the /api/* run_worker_first entry below already routes
+  // to the Worker, so no assets edit is needed.
   "durable_objects": {
     "bindings": [
       { "name": "RUNNER", "class_name": "ShowcaseRunner" },
-      { "name": "HUB", "class_name": "ShowcaseHub" }
+      { "name": "HUB", "class_name": "ShowcaseHub" },
+      { "name": "MAINTENANCE", "class_name": "ShowcaseMaintenance" }
     ]
   },
-  // DO migrations are append-only: the v1 runner migration is UNCHANGED and the
-  // hub class gets its own v2 tag.
+  // DO migrations are append-only: v1 runner and v2 hub are unchanged;
+  // maintenance has its own v3 tag.
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["ShowcaseRunner"] },
-    { "tag": "v2", "new_sqlite_classes": ["ShowcaseHub"] }
+    { "tag": "v2", "new_sqlite_classes": ["ShowcaseHub"] },
+    { "tag": "v3", "new_sqlite_classes": ["ShowcaseMaintenance"] }
   ],
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "anchorage-showcase",
-      // Local `wrangler dev` creates a local SQLite automatically. Tables are
-      // created lazily by the stores; no migration files needed. This id is
-      // the live anchorage.proofoftech.org database (`wrangler d1 create
-      // anchorage-showcase` on the account above).
-      "database_id": "342fd280-2b62-4ae3-90ea-afb5133a8823"
+      "database_name": "anchorage-showcase-single-tenant",
+      // Intentional non-deployable placeholder. Create and seed a fresh
+      // physical-isolation database before replacing it; never bind this code
+      // to the former pooled showcase database.
+      "database_id": "00000000-0000-0000-0000-000000000000"
     }
   ],
-  // Single-deploy: serve the built SPA (dist/) at / via Workers Static
+  // Single-deploy: serve the Vite-managed client build at / via Workers Static
   // Assets, and the API on the SAME origin. run_worker_first is load-bearing —
   // without it the SPA fallback would swallow the API routes (they are not files
   // on disk). Everything else (/, deep SPA routes) serves index.html. Build the
-  // SPA first (`pnpm --filter showcase build`) so ./dist exists.
+  // SPA and Worker are built together by the Cloudflare Vite plugin.
   "assets": {
-    "directory": "./dist",
     "not_found_handling": "single-page-application",
     "run_worker_first": [
       "/api/*",
+      "/admin/*",
       "/runs",
       "/runs/*",
       "/healthz",
       "/workflows",
-      "/auth/*",
-      "/demo/*"
+      "/auth/*"
     ]
   },
   // The public demo runs REAL isolate CPU per visitor run. Cap it (Workers
@@ -81,26 +85,22 @@
   // Cloudflare Email Service is TRANSACTIONAL — for bulk campaigns swap the
   // connector's execute for a marketing ESP.
   // "send_email": [{ "name": "EMAIL" }],
-  // TWO cron expressions, dispatched on controller.cron (worker.ts
-  // SWEEP_CRON / PURGE_CRON — keep these literals in sync): the SLA sweep and
-  // the purge never share an invocation, because a CPU-limit termination
-  // kills the isolate un-catchably and a slow sweep would otherwise starve
-  // the purge forever.
-  "triggers": { "crons": ["*/15 * * * *", "7 * * * *"] },
-  // Optional audit export to a SIEM: `wrangler queues create showcase-audit`
-  // (and -dlq), uncomment, then set SIEM_ENDPOINT (var) + SIEM_AUTH_HEADER
-  // (secret). Without this block, audit stays on structured Workers Logs only.
+  // Optional audit export to a SIEM. These cutover-specific names keep the
+  // pre-cutover queue addressable for rollback. Create it and uncomment this
+  // producer binding. The shared control-plane consumer owns SIEM delivery.
+  //   wrangler queues create anchorage-showcase-single-tenant-audit
+  //   wrangler queues create anchorage-showcase-single-tenant-audit-dlq
   // "queues": {
-  //   "producers": [{ "binding": "AUDIT_QUEUE", "queue": "showcase-audit" }],
-  //   "consumers": [
+  //   "producers": [
   //     {
-  //       "queue": "showcase-audit",
-  //       "max_retries": 10,
-  //       "dead_letter_queue": "showcase-audit-dlq"
+  //       "binding": "AUDIT_QUEUE",
+  //       "queue": "anchorage-showcase-single-tenant-audit"
   //     }
-  //   ]
+  //   ],
   // },
   "vars": {
+    // Must match the flowsafe_deployment sentinel provisioned in D1.
+    "DEPLOYMENT_TENANT": "showcase",
     "APPROVAL_SLA_SECONDS": "14400",
     "RUN_RETENTION_DAYS": "30",
     // Separation of duties: relax it for `admin` only, so a single operator can
@@ -113,9 +113,9 @@
     // Public-demo tuning (ops-tunable without a code change). The DAILY cap
     // is the spend backstop — per-identity limits are a speed bump against N
     // free accounts, so size this for tolerable spend, not expected traffic.
-    "DEMO_TENANT_RUN_CAP": "20",
+    "DEMO_SESSION_RUN_CAP": "20",
     "DEMO_DAILY_RUN_CAP": "500",
-    "DEMO_TENANT_TTL_HOURS": "24",
+    "DEMO_SESSION_TTL_HOURS": "24",
     "DEMO_JWT_TTL_SECONDS": "3600",
     // The launch OAuth provider is GOOGLE (worker.ts prefers it when both
     // are configured; GitHub remains a config-only fallback). The Google
@@ -127,9 +127,13 @@
     // "GITHUB_CLIENT_ID": "<your GitHub OAuth app client id>",
     // "DEMO_DISABLED": "true",   // kill switch: 503s /auth/* AND stops
     //                            // verifying already-issued demo JWTs
-    // "SIEM_ENDPOINT": "https://siem.example/services/collector"
   }
   // Secrets (set with `wrangler secret put <name>`):
+  //   DEPLOYMENT_IDENTITY_SECRET — REQUIRED; at least 32 random visible ASCII characters.
+  //     Shared only by this deployment's Worker and Durable Objects.
+  //   MAINTENANCE_ADMIN_SECRET — REQUIRED; distinct 32–256 visible ASCII
+  //     credential used only by the fleet control plane to arm and inspect the
+  //     fixed maintenance singleton.
   //   APPROVAL_ACTOR_TOKENS — operator/admin bearer map. Deliberately NOT a
   //     var here: no credentials are baked into a deployable config, so a
   //     deploy without secrets 401s everywhere (fail closed). Local dev reads
@@ -147,5 +151,4 @@
   //     HS256 token sets and the OAuth state. Generate long + random.
   //   GOOGLE_CLIENT_SECRET — pairs with the GOOGLE_CLIENT_ID var.
   //   GITHUB_CLIENT_SECRET — pairs with the GITHUB_CLIENT_ID var (fallback).
-  //   SIEM_AUTH_HEADER — sent as the `authorization` header on audit export.
 }

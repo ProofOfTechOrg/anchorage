@@ -4,12 +4,12 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { d1DatabaseLike, openSqlite } from '../../test-support/sqlite.js';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import type { SignalDatabase } from './d1-shared.js';
 import { D1ThreadStateStorage } from './thread-state-d1.js';
 
 function store(): D1ThreadStateStorage {
-  const db = d1DatabaseLike(openSqlite()) as unknown as SignalDatabase;
+  const db = sqliteUnitDatabase(openSqlite()) as unknown as SignalDatabase;
   return new D1ThreadStateStorage(db, '');
 }
 

@@ -27,15 +27,12 @@
 // and a rejected re-request never falls back to the old approval. Because the
 // ordinal strictly increments, a chain of three+ re-suspensions compares two
 // distinct counts and never collides — closing the depth-3+ residual the
-// prior (suspendedAt, resumedAt) binding deferred. The ledger is in-memory,
-// but a reset across a DO restart can never leak: a same-ms suspendedAt
-// collision (the only case the ordinal guards) requires a synchronous
-// in-memory store with no I/O between the stamps, so same-ms-collision and
-// surviving-a-restart are mutually exclusive — a durable (D1) deployment gives
-// the two suspensions distinct suspendedAt, and the suspendedAt half alone
-// distinguishes them. A reset ledger only yields leg.resumeCount=undefined
-// against a re-suspension record's defined count → deny (fail-closed re-deny),
-// then a fresh decision mints.
+// prior (suspendedAt, resumedAt) binding deferred. The runtime persists the
+// ordinal in the run snapshot's trusted provenance, so a Durable Object
+// restart reads the same count from D1. Missing or malformed provenance never
+// broadens a grant: a re-suspension record's defined count cannot match an
+// undefined leg count, so derivation denies until a fresh decision binds the
+// current suspension.
 // Records created without observing the suspension are legacy capability
 // records and mint nothing.
 //
@@ -61,14 +58,12 @@ import type {
   RunnerRuntime,
   RunSummary,
 } from '../do-runner/index.js';
-import { tenantOfRunId } from '../do-runner/path-safe-id.js';
 import { BREAKWATER_CONNECTOR_GRANTS_KEY } from './contract.js';
 import {
   type ApprovalStore,
   listAllApprovedForRun,
   stepKeyOf,
 } from './store.js';
-import type { TenantBoundApprovalStore } from './tenant-brand.js';
 import type {
   ApprovalDecision,
   ApprovalRecord,
@@ -159,7 +154,6 @@ export async function connectorGrantsForLeg(
           connectorId,
           workflowId,
           runId,
-          isolationScope: record.tenantId,
         });
       }
       continue;
@@ -206,7 +200,6 @@ export async function connectorGrantsForLeg(
               connectorId,
               workflowId,
               runId,
-              isolationScope: record.tenantId,
               suspension,
               toolCallId: record.toolCallId as string,
             }
@@ -215,7 +208,6 @@ export async function connectorGrantsForLeg(
               connectorId,
               workflowId,
               runId,
-              isolationScope: record.tenantId,
               suspension,
             },
       );
@@ -230,44 +222,16 @@ export async function connectorGrantsForLeg(
  * pass as init()'s / RunnerRuntimeOptions' requestContextForRun. Part of the
  * trusted computing base — it writes the breakwater grant key.
  *
- * Takes a TENANT-BOUND store (the brand): a DO builds it as
- * `factory.forTenant(this.tenantId)` from its own identity. A
- * SystemApprovalStore is not assignable here — the type-level assertion in
- * grants.test.ts pins that.
+ * The store is deployment-scoped. Per-run workflowId/runId predicates remain
+ * load-bearing because a deployment contains many runs.
  */
 export function approvalGrantProvider(
-  store: TenantBoundApprovalStore,
+  store: ApprovalStore,
 ): RequestContextProvider {
   return async (workflowId, runId, leg) => {
     const grants = await connectorGrantsForLeg(store, workflowId, runId, leg);
     // Always return the key (even empty) — see the header: overwrite, don't
     // inherit, so stale grants from earlier legs cannot survive the merge.
-    return { [BREAKWATER_CONNECTOR_GRANTS_KEY]: grants };
-  };
-}
-
-/**
- * Factory-backed provider for hosts whose ONE runtime serves every tenant
- * in-process (the dev plugin; DO hosts bind per-instance instead). The
- * tenant is recovered from the leg's tenant-prefixed runId
- * the DO name join uses — and the store is bound per leg. A runId without a
- * valid tenant prefix mints an EMPTY grant list (fail closed), never a
- * cross-tenant read.
- */
-export function approvalGrantProviderFromFactory(factory: {
-  forTenant(tenantId: string): TenantBoundApprovalStore;
-}): RequestContextProvider {
-  return async (workflowId, runId, leg) => {
-    const tenantId = tenantOfRunId(runId);
-    if (tenantId === undefined) {
-      return { [BREAKWATER_CONNECTOR_GRANTS_KEY]: [] };
-    }
-    const grants = await connectorGrantsForLeg(
-      factory.forTenant(tenantId),
-      workflowId,
-      runId,
-      leg,
-    );
     return { [BREAKWATER_CONNECTOR_GRANTS_KEY]: grants };
   };
 }
@@ -303,9 +267,17 @@ export function resumeViaRuntime(
   } = {},
 ): (record: ApprovalRecord, decision: ApprovalDecision) => Promise<RunSummary> {
   const buildResumeData = options.resumeData ?? defaultResumeData;
-  return (record, decision) =>
-    runtime.resume(record.workflowId, record.runId, {
+  return (record, decision) => {
+    if (!record.decidedBy) {
+      return Promise.reject(
+        new Error('decided approval is missing its reviewer identity'),
+      );
+    }
+    return runtime.resume(record.workflowId, record.runId, {
       step: record.stepPath,
       resumeData: buildResumeData(record, decision),
+      requestedBy: record.decidedBy,
+      requestedByKind: 'human',
     });
+  };
 }

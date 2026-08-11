@@ -5,37 +5,31 @@
 // bearer identity cannot ride the upgrade and a long-lived token in the URL
 // would leak through proxy/referrer logs. Instead a client mints a ~60s ticket
 // over the AUTHENTICATED REST surface (stream-router.ts) and presents it in the
-// WS URL query. The ticket is signed with the SAME HS256 primitives as the
-// session verifier (verifier.ts hmacSign/base64UrlEncode) but under a DEDICATED
+// WS URL query. The ticket is a standard HS256 JWT under a DEDICATED
 // STREAM_TICKET_SECRET (DL-019), so a ticket and a session JWT can never be
 // confused under one signing key. A leaked ticket URL is limited to a brief
-// replay on exactly ONE tenant's own channel.
+// replay on exactly ONE deployment channel.
 //
-// The ticket carries ONLY ADDRESSING — tenant, channel, runId, actor, exp —
+// The ticket carries ONLY ADDRESSING — channel, workflowId/runId, actor, exp —
 // never a grant. Connector capability comes solely from the server-derived
 // requestContext grant the runtime mints per leg (approval-api/grants.ts); no
 // capability ever travels on the WebSocket. The Worker is the SOLE verification
-// authority: it verifies the ticket once and routes by ticket.tenantId/runId to
-// idFromName, so the hub/runner DOs re-bind the connection to one tenant/run by
-// their own identity (INV-1 / id.name===tenantId) and hold no secret.
+// authority: it verifies the ticket once and routes by channel/runId to
+// idFromName, so the hub/runner DOs re-bind the connection to the deployment or
+// run by their own identity and hold no secret.
 //
-// Fail-closed: an expired, forged, cross-tenant, cross-channel, or otherwise
+// Fail-closed: an expired, forged, cross-channel, or otherwise
 // malformed ticket verifies to `undefined`, never to a default identity.
 
+import { jwtVerify, SignJWT } from 'jose';
 import {
   APPROVAL_ROLES,
   type ApprovalActor,
   type ApprovalRole,
 } from '../approval-api/index.js';
-import {
-  PATH_SAFE_ID_PATTERN,
-  RESERVED_TENANT_IDS,
-  TENANT_ID_PATTERN,
-  tenantOwnsSaltedId,
-} from '../do-runner/path-safe-id.js';
-import { base64UrlEncode, hmacSign } from './verifier.js';
+import { isPathSafeId } from '../do-runner/path-safe-id.js';
 
-/** The two live channels: the per-tenant hub or a per-run WebSocket. */
+/** The two live channels: the deployment hub or a per-run WebSocket. */
 export type StreamChannel = 'hub' | 'run';
 
 /**
@@ -45,8 +39,8 @@ export type StreamChannel = 'hub' | 'run';
  * more.
  */
 export interface StreamTicketClaims {
-  tenantId: string;
   channel: StreamChannel;
+  workflowId?: string;
   runId?: string;
   actorId: string;
   role: ApprovalRole;
@@ -57,9 +51,9 @@ export interface StreamTicketClaims {
 export interface MintStreamTicketOptions {
   /** The dedicated stream-ticket signing secret (STREAM_TICKET_SECRET). */
   secret: string;
-  /** The authenticated, previously validated tenant to which the ticket is bound. */
-  tenantId: string;
   channel: StreamChannel;
+  /** REQUIRED for the `'run'` channel; omitted for `'hub'`. */
+  workflowId?: string;
   /** REQUIRED for the `'run'` channel; omitted for `'hub'`. */
   runId?: string;
   /** The authenticated actor — only `id` and `role` are carried. */
@@ -78,26 +72,27 @@ export interface VerifyStreamTicketOptions {
 }
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder();
+const STREAM_TICKET_AUDIENCE = 'flowsafe-stream';
+const STREAM_TICKET_TYPE = 'flowsafe-stream-ticket+jwt';
 
 /**
- * Mint a compact `base64url(claims).signature` ticket. For the `'run'` channel
+ * Mint a compact signed JWT ticket. For the `'run'` channel
  * a runId is REQUIRED — a run ticket with no run to address is a programmer
  * error (throws a generic Error; a client never reaches this mint directly).
  */
 export async function mintStreamTicket(
   options: MintStreamTicketOptions,
 ): Promise<string> {
-  const { secret, tenantId, channel, runId, actor } = options;
-  if (channel === 'run' && runId === undefined) {
+  const { secret, channel, workflowId, runId, actor } = options;
+  if (channel === 'run' && (workflowId === undefined || runId === undefined)) {
     throw new Error(
-      "mintStreamTicket: a 'run' channel ticket requires a runId",
+      "mintStreamTicket: a 'run' channel ticket requires workflowId and runId",
     );
   }
   const nowSeconds = Math.floor((options.now ?? Date.now)() / 1000);
   const claims: StreamTicketClaims = {
-    tenantId,
     channel,
+    ...(workflowId !== undefined ? { workflowId } : {}),
     // Omit runId entirely off the run channel so the "present IFF run" verify
     // check is exact (an undefined field serializes away under JSON.stringify).
     ...(runId !== undefined ? { runId } : {}),
@@ -105,66 +100,66 @@ export async function mintStreamTicket(
     role: actor.role,
     exp: nowSeconds + (options.ttlSeconds ?? 60),
   };
-  const payload = base64UrlEncode(encoder.encode(JSON.stringify(claims)));
-  const signature = await hmacSign(secret, payload);
-  return `${payload}.${signature}`;
+  return new SignJWT({
+    channel: claims.channel,
+    ...(claims.workflowId !== undefined
+      ? { workflowId: claims.workflowId }
+      : {}),
+    ...(claims.runId !== undefined ? { runId: claims.runId } : {}),
+    actorId: claims.actorId,
+    role: claims.role,
+    exp: claims.exp,
+  })
+    .setProtectedHeader({ alg: 'HS256', typ: STREAM_TICKET_TYPE })
+    .setAudience(STREAM_TICKET_AUDIENCE)
+    .setExpirationTime(claims.exp)
+    .sign(encoder.encode(secret));
 }
 
 /**
  * Verify a stream ticket, returning its claims or `undefined` (fail closed).
- * The signature is recomputed over the presented payload segment and compared
- * CONSTANT-TIME; then every claim is validated: `exp` unexpired, `tenantId`
- * pattern-valid and not reserved, `channel` known, `runId` present if and only if the run
- * channel (and when present PATH_SAFE and tenant-owned), `actorId` non-empty,
- * and `role` a recognized APPROVAL_ROLE. Any failure returns `undefined`.
+ * JOSE verifies the signature and registered claims; then every domain claim
+ * is validated: `channel`
+ * known, `runId` present if and only if the run channel (and when present
+ * path-safe), `actorId` non-empty, and `role` a recognized APPROVAL_ROLE. Any
+ * failure returns `undefined`.
  */
 export async function verifyStreamTicket(
   options: VerifyStreamTicketOptions,
 ): Promise<StreamTicketClaims | undefined> {
   const { secret, token } = options;
-  const parts = token.split('.');
-  if (parts.length !== 2) return undefined;
-  const [payload, signature] = parts as [string, string];
-
-  // Recompute the HMAC over the presented payload segment and compare in
-  // constant time. hmacSign is the one signer both mint and verify share, so a
-  // tampered payload OR signature yields a different recomputed sig and fails.
-  const expected = await hmacSign(secret, payload);
-  if (!constantTimeEqual(signature, expected)) return undefined;
-
-  const claims = base64UrlDecodeJson(payload) as
-    | Partial<StreamTicketClaims>
-    | undefined;
-  // `typeof null === 'object'`, so a JSON `null` payload would slip past a bare
-  // object check and throw on the first `claims.exp` read — breaking this
-  // function's "malformed → undefined, never throws" contract (F5). Guard it.
-  if (claims === undefined || claims === null || typeof claims !== 'object') {
+  let claims: Partial<StreamTicketClaims>;
+  try {
+    const verified = await jwtVerify(token, encoder.encode(secret), {
+      algorithms: ['HS256'],
+      audience: STREAM_TICKET_AUDIENCE,
+      typ: STREAM_TICKET_TYPE,
+      currentDate: new Date((options.now ?? Date.now)()),
+      clockTolerance: 0,
+      requiredClaims: ['exp'],
+    });
+    claims = verified.payload;
+  } catch {
     return undefined;
   }
+  if (typeof claims.exp !== 'number') return undefined;
+  if (claims.channel !== 'hub' && claims.channel !== 'run') return undefined;
 
-  const nowSeconds = (options.now ?? Date.now)() / 1000;
-  if (typeof claims.exp !== 'number' || nowSeconds >= claims.exp) {
-    return undefined;
-  }
+  // workflowId/runId are present IFF the run channel and path-safe.
+  const hasWorkflowId = claims.workflowId !== undefined;
+  const hasRunId = claims.runId !== undefined;
   if (
-    typeof claims.tenantId !== 'string' ||
-    !TENANT_ID_PATTERN.test(claims.tenantId) ||
-    RESERVED_TENANT_IDS.includes(claims.tenantId)
+    (claims.channel === 'run') !== hasWorkflowId ||
+    (claims.channel === 'run') !== hasRunId
   ) {
     return undefined;
   }
-  if (claims.channel !== 'hub' && claims.channel !== 'run') return undefined;
-
-  // runId present IFF the run channel; when present it must be PATH_SAFE and
-  // owned by the ticket's tenant (so a run ticket can never address another
-  // tenant's run even if the signature were somehow honoured).
-  const hasRunId = claims.runId !== undefined;
-  if ((claims.channel === 'run') !== hasRunId) return undefined;
   if (claims.channel === 'run') {
     if (
+      typeof claims.workflowId !== 'string' ||
+      !isPathSafeId(claims.workflowId) ||
       typeof claims.runId !== 'string' ||
-      !PATH_SAFE_ID_PATTERN.test(claims.runId) ||
-      !tenantOwnsSaltedId(claims.tenantId, claims.runId)
+      !isPathSafeId(claims.runId)
     ) {
       return undefined;
     }
@@ -181,46 +176,12 @@ export async function verifyStreamTicket(
   }
 
   return {
-    tenantId: claims.tenantId,
     channel: claims.channel,
-    ...(claims.channel === 'run' ? { runId: claims.runId } : {}),
+    ...(claims.channel === 'run'
+      ? { workflowId: claims.workflowId, runId: claims.runId }
+      : {}),
     actorId: claims.actorId,
     role: claims.role,
     exp: claims.exp,
   };
-}
-
-/**
- * Constant-time string equality for the recomputed base64url signatures. The
- * length branch leaks nothing: an HMAC-SHA256 base64url signature is a fixed 43
- * chars, so the length is not secret; only the content comparison must be
- * timing-safe, and it is (a full XOR-accumulate over every char).
- */
-function constantTimeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let mismatch = 0;
-  for (let index = 0; index < a.length; index += 1) {
-    mismatch |= a.charCodeAt(index) ^ b.charCodeAt(index);
-  }
-  return mismatch === 0;
-}
-
-/**
- * Compact base64url -> JSON decoder for the claims segment (verifier.ts keeps
- * its own copy module-private; this is the "add a compact one" the ticket needs
- * to read claims). Any malformed input returns `undefined` rather than throwing.
- */
-function base64UrlDecodeJson(segment: string): unknown {
-  const normalized = segment.replace(/-/g, '+').replace(/_/g, '/');
-  const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
-  try {
-    const binary = atob(padded);
-    const bytes = new Uint8Array(binary.length);
-    for (let index = 0; index < binary.length; index += 1) {
-      bytes[index] = binary.charCodeAt(index);
-    }
-    return JSON.parse(decoder.decode(bytes));
-  } catch {
-    return undefined;
-  }
 }

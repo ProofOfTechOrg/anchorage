@@ -2,7 +2,10 @@
 
 interface Env {
   DB: D1Database;
+  DEPLOYMENT_TENANT: string;
+  DEPLOYMENT_IDENTITY_SECRET: string;
   RUNNER: DurableObjectNamespace<import('./worker.js').StarterRunner>;
+  MAINTENANCE: DurableObjectNamespace;
   HUB: DurableObjectNamespace<import('./worker.js').StarterHub>;
   THREAD: DurableObjectNamespace<import('./worker.js').StarterThread>;
   SIGNAL_PROVIDER_HOST: DurableObjectNamespace<
@@ -23,8 +26,8 @@ interface Env {
   SCHEDULE_TRIGGER_RETENTION_DAYS: string;
   SIGNAL_ATTRIBUTE_ALLOWLIST: string;
   GITHUB_RESOURCE_ALLOWLIST: string;
-  TENANT_APEX_DOMAIN: string;
   AUTH_HMAC_SECRET?: string;
+  MAINTENANCE_ADMIN_SECRET?: string;
   STREAM_TICKET_SECRET?: string;
   MODEL_API_KEY?: string;
   MODEL_BASE_URL?: string;

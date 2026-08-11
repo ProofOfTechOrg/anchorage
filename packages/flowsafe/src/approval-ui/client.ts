@@ -175,9 +175,9 @@ export class ApprovalApiClient {
   }
 
   // There is deliberately no sweep() — POST /sla/sweep no longer exists. The
-  // SLA sweep is cron-owned TCB code (approval-api sweepSLA over a
-  // SystemApprovalStore): an HTTP-reachable sweep was an unfiltered
-  // cross-tenant read+write behind a role check.
+  // SLA sweep is alarm-owned TCB code (approval-api sweepSLA over the deployment
+  // store): an HTTP-reachable sweep was a deployment-wide read+write behind a
+  // role check.
 
   async #post(path: string, body?: Record<string, unknown>): Promise<unknown> {
     return this.#request(path, {

@@ -1,7 +1,7 @@
 // Drift guard for the demo identities. They are declared once in
 // demo-actors.ts, but `.dev.vars.example` is a dotenv file wrangler reads — it
 // cannot import the const, so nothing but this test stops the two diverging and
-// leaving `dev:worker` authenticating against tokens the UI never offers.
+// leaving the local Worker authenticating against tokens the UI never offers.
 //
 // Also pins the locally-mirrored DemoRole union against the real ApprovalRole
 // set: an actor whose role is not a known role is dropped by parseActorTokens,
@@ -93,15 +93,12 @@ describe('demo actors', () => {
     // DROPS any entry with an unknown role rather than trusting it
     const parsed = parseActorTokens(demoActorTokensJson());
 
-    // #then — no identity is silently lost, and the tenant rides along
-    // (parseActorTokens DROPS any entry without an INV-3 tenantId, so a demo
-    // actor losing its tenant surfaces here as a size mismatch)
+    // #then — no identity is silently lost
     expect(parsed.size).toBe(DEMO_ACTORS.length);
     for (const actor of DEMO_ACTORS) {
       expect(parsed.get(actor.token)).toEqual({
         id: actor.id,
         role: actor.role,
-        tenantId: actor.tenantId,
       });
     }
   });

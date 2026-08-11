@@ -101,7 +101,7 @@ Declare redirect and regional hosts. Actual redirect hops must also remain withi
 
 When `true`, every real call needs a non-empty key in `breakwater.idempotencyKey`. The wrapper stores the successful result and replays it on another call with the same scoped key.
 
-The application chooses the business key. Flowsafe supplies the trusted tenant isolation scope but does not invent a connector-specific idempotency key.
+The application chooses the business key. Flowsafe does not invent a connector-specific idempotency key or mint an organization isolation scope. Its shared store keys are deployment-wide.
 
 ### `requiresApproval`
 
@@ -240,9 +240,11 @@ Flowsafe's approval provider reads approved D1 records and derives grants for ea
 
 Breakwater supports three explicit scopes:
 
-- `tool-call`: connector, tenant, workflow, run, exact suspension, and Mastra `toolCallId`
-- `suspension`: connector, tenant, workflow, run, and exact suspension
-- `run`: connector, tenant, workflow, and run for a trusted standing grant
+- `tool-call`: connector, workflow, run, exact suspension, and Mastra `toolCallId`
+- `suspension`: connector, workflow, run, and exact suspension
+- `run`: connector, workflow, and run for a trusted standing grant
+
+Each scope can also carry Breakwater's optional opaque `isolationScope` when a trusted non-Flowsafe host defines another logical partition. Flowsafe grants omit it.
 
 Durable-agent approvals use `tool-call` scope because Mastra persists and reproduces `toolCallId` through retry and reconstruction. Workflow gates use `suspension` scope because an arbitrary workflow suspension has no reproducible tool-call identity.
 
@@ -284,9 +286,9 @@ Execution failures release the reservation. A successful side effect followed by
 
 `InMemoryRateLimitStore` is per isolate. In a one-Durable-Object-per-run host, that is effectively per run.
 
-`D1RateLimitStore` shares the window across isolates. Use it for per-tenant or deployment-wide enforcement.
+`D1RateLimitStore` shares the window across isolates. Flowsafe uses it for deployment-wide enforcement.
 
-Both idempotency and rate keys include the isolation scope when present. Add `tenantIsolation()` to every multi-tenant connector so a missing scope becomes a denial rather than silently shared storage.
+Both idempotency and rate keys include the isolation scope when present. A generic host that requires logical partitioning can add `tenantIsolation()` so a missing scope is denied. Do not add it to a Flowsafe connector: the physically isolated runtime intentionally reserves and omits that scope.
 
 ## Workflow isolation
 
@@ -341,7 +343,7 @@ At minimum, test:
 6. dry-run with zero side effects;
 7. idempotent replay and concurrent callers;
 8. rate-limit boundary;
-9. missing tenant scope in a multi-tenant host;
+9. missing opaque isolation scope when a generic host explicitly requires one;
 10. workflow target mismatch where relevant;
 11. audit safety for arbitrary throws;
 12. packed npm consumer behavior.

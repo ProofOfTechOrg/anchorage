@@ -12,6 +12,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { assertAttwEsmPackage } from './attw-pack-check.mjs';
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const repositoryRoot = resolve(packageRoot, '..', '..');
@@ -37,19 +38,29 @@ try {
   run('pnpm', ['pack', '--pack-destination', packed]);
   const archives = readdirSync(packed).filter((name) => name.endsWith('.tgz'));
   assert.equal(archives.length, 1);
-  run('tar', ['-xzf', join(packed, archives[0]), '-C', extracted]);
+  const archive = join(packed, archives[0]);
+  run('pnpm', [
+    '--workspace-root',
+    'exec',
+    'publint',
+    'run',
+    archive,
+    '--strict',
+  ]);
+  assertAttwEsmPackage(archive, packageRoot);
+  run('tar', ['-xzf', archive, '-C', extracted]);
 
   const packageDirectory = join(extracted, 'package');
   const manifest = JSON.parse(
     readFileSync(join(packageDirectory, 'package.json'), 'utf8'),
   );
-  assert.equal(manifest.exports['./agent-host'], './dist/agent-host/index.js');
   // Compared against the SOURCE manifest, not a copy of its value: this script
   // is a CI-only step, so a hardcoded range silently goes stale the moment the
   // peer floor moves and only fails after the change is pushed.
   const sourceManifest = JSON.parse(
     readFileSync(join(packageRoot, 'package.json'), 'utf8'),
   );
+  assert.equal(manifest.dependencies.jose, sourceManifest.dependencies.jose);
   assert.equal(
     manifest.peerDependencies['@proofoftech/breakwater'],
     sourceManifest.peerDependencies['@proofoftech/breakwater'],
@@ -59,9 +70,6 @@ try {
     /^>=\d+\.\d+\.\d+ <1\.0\.0$/,
     'the packed peer range must stay a bounded 0.x floor',
   );
-  readFileSync(join(packageDirectory, 'dist/agent-host/index.js'), 'utf8');
-  readFileSync(join(packageDirectory, 'dist/agent-host/index.d.ts'), 'utf8');
-
   const consumerModules = join(consumer, 'node_modules');
   mkdirSync(join(consumerModules, '@proofoftech'), { recursive: true });
   symlinkSync(
@@ -85,6 +93,11 @@ try {
       'dir',
     );
   }
+  symlinkSync(
+    join(packageRoot, 'node_modules', 'jose'),
+    join(packageModules, 'jose'),
+    'dir',
+  );
 
   writeFileSync(
     join(consumer, 'consumer.ts'),

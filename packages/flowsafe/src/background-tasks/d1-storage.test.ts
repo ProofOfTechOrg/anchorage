@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// D1 execution adapters: serialized workflow updates and tenant-bound task
+// D1 execution adapters: serialized workflow updates and deployment-wide task
 // listing/deletion over the same storage composition seam hosts use.
 
 import { BackgroundTasksStorageD1 } from '@mastra/cloudflare-d1';
@@ -8,7 +8,7 @@ import type { Mastra } from '@mastra/core/mastra';
 import { createEmptyWorkflowSnapshot } from '@mastra/core/storage';
 import { describe, expect, it } from 'vitest';
 
-import { d1DatabaseLike, openSqlite } from '../../test-support/sqlite.js';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import { createD1Storage } from '../do-runner/index.js';
 import {
   backgroundTasksStore,
@@ -36,36 +36,17 @@ describe('backgroundTasksStore — fail-closed accessor', () => {
 });
 
 describe('D1 execution domains', () => {
-  it.each([
-    '',
-    'bad tenant',
-    'bad/tenant',
-    'bad_tenant',
-    'a'.repeat(129),
-  ])('rejects an unmintable tenant synchronously: %j', (tenantId) => {
-    const binding = d1DatabaseLike(openSqlite()) as never;
-    expect(() =>
-      createBackgroundTaskD1Domains({ binding, tenantId }),
-    ).toThrow();
-  });
-
-  it('rejects a non-string tenant at the runtime boundary', () => {
-    const binding = d1DatabaseLike(openSqlite()) as never;
-    expect(() =>
-      createBackgroundTaskD1Domains({
-        binding,
-        tenantId: 123 as unknown as string,
-      }),
-    ).toThrow();
+  it('constructs deployment-wide background-task domains', () => {
+    const binding = sqliteUnitDatabase(openSqlite()) as never;
+    expect(() => createBackgroundTaskD1Domains({ binding })).not.toThrow();
   });
 
   it('serializes partial workflow updates and reports concurrent-update support', async () => {
-    const binding = d1DatabaseLike(openSqlite()) as never;
+    const binding = sqliteUnitDatabase(openSqlite()) as never;
     const storage = createD1Storage({
       binding,
       domains: createBackgroundTaskD1Domains({
         binding,
-        tenantId: 'acme',
       }),
     });
     await storage.init();
@@ -108,13 +89,12 @@ describe('D1 execution domains', () => {
     });
   });
 
-  it('filters by tenant before pagination and cascades internal snapshot deletion', async () => {
-    const binding = d1DatabaseLike(openSqlite()) as never;
+  it('paginates deployment tasks and cascades internal snapshot deletion', async () => {
+    const binding = sqliteUnitDatabase(openSqlite()) as never;
     const storage = createD1Storage({
       binding,
       domains: createBackgroundTaskD1Domains({
         binding,
-        tenantId: 'acme',
       }),
     });
     await storage.init();
@@ -124,12 +104,13 @@ describe('D1 execution domains', () => {
     const task = (
       id: string,
       runId: string,
+      threadId: string,
       resourceId: string,
     ): BackgroundTask => ({
       id,
       runId,
       resourceId,
-      threadId: `${runId.split('_')[0]}_thread`,
+      threadId,
       status: 'pending',
       toolName: 'work',
       toolCallId: `call-${id}`,
@@ -140,33 +121,33 @@ describe('D1 execution domains', () => {
       maxRetries: 0,
       timeoutMs: 1000,
     });
-    await raw.createTask(task('foreign', 'globex_r1', 'globex_owner'));
-    await tasks?.createTask(task('owned-1', 'acme_r1', 'acme_owner'));
-    await tasks?.createTask(task('owned-2', 'acme_r2', 'acme_other'));
-    const snapshot = createEmptyWorkflowSnapshot('owned-1');
+    await raw.createTask(task('task-1', 'run-1', 'thread-1', 'resource-1'));
+    await tasks?.createTask(task('task-2', 'run-2', 'thread-2', 'resource-2'));
+    await tasks?.createTask(task('task-3', 'run-3', 'thread-3', 'resource-3'));
+    const snapshot = createEmptyWorkflowSnapshot('task-2');
     await workflows?.persistWorkflowSnapshot({
       workflowName: '__background-task',
-      runId: 'owned-1',
+      runId: 'task-2',
       snapshot,
     });
 
     const firstPage = await tasks?.listTasks({ page: 0, perPage: 1 });
-    expect(firstPage?.total).toBe(2);
+    expect(firstPage?.total).toBe(3);
     expect(firstPage?.tasks).toHaveLength(1);
     const resourceFiltered = await tasks?.listTasks({
-      resourceId: 'acme_owner',
+      resourceId: 'resource-2',
     });
     expect(resourceFiltered?.tasks.map((entry) => entry.id)).toEqual([
-      'owned-1',
+      'task-2',
     ]);
 
-    await tasks?.deleteTask('foreign');
-    expect(await raw.getTask('foreign')).not.toBeNull();
-    await tasks?.deleteTask('owned-1');
+    await tasks?.deleteTask('task-1');
+    expect(await raw.getTask('task-1')).toBeNull();
+    await tasks?.deleteTask('task-2');
     expect(
       await workflows?.loadWorkflowSnapshot({
         workflowName: '__background-task',
-        runId: 'owned-1',
+        runId: 'task-2',
       }),
     ).toBeNull();
   });

@@ -1,20 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
-// purgeExpiredWorkflowRuns against REAL SQLite via node:sqlite (D1 is
-// SQLite), so the json_extract status filter and the ISO-cutoff comparison
-// run for real. The openSqlite() fixture matches the approval-api store
-// tests; the d1Like adapter here maps run() results to D1's { meta } shape.
+// Fast SQL-unit coverage over node:sqlite: json_extract status filters and
+// ISO-cutoff comparisons execute in SQLite, while the Wrangler harness owns
+// D1 concurrency, transaction, and runtime fidelity.
 
 import { describe, expect, it } from 'vitest';
 
 import {
-  d1DatabaseLike,
   openSqlite,
   type SqliteDatabase,
+  sqliteUnitDatabase,
 } from '../../test-support/sqlite.js';
+import {
+  D1ResourceOwnershipStore,
+  RESOURCE_OWNERSHIP_TABLE,
+  type ResourceOwnershipDatabase,
+} from '../approval-api/resource-ownership.js';
 import {
   D1SchedulesStorage,
   type ScheduleDatabase,
 } from '../schedules/schedules-d1.js';
+import { scheduleWithCreatorRole } from '../schedules/target-policy.js';
 import type { SignalDatabase } from '../signals/d1-shared.js';
 import { D1NotificationsStorage } from '../signals/notifications-d1.js';
 import { D1ThreadStateStorage } from '../signals/thread-state-d1.js';
@@ -25,13 +30,13 @@ import {
   purgeExpiredThreadState,
   purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
-  purgeTenant,
   type SnapshotDatabase,
   type SnapshotStatement,
 } from './d1-storage.js';
 
-// Faithful to D1: run() resolves to a result whose meta.changes carries the
-// affected-row count (node:sqlite reports it as `changes`).
+// Domain-local result-envelope adapter for pure purge SQL units. It maps
+// node:sqlite's affected-row count to the structural SnapshotDatabase seam;
+// the Wrangler harness owns D1 runtime and concurrency fidelity.
 function d1Like(db: SqliteDatabase): SnapshotDatabase {
   function statement(sql: string, params: unknown[]): SnapshotStatement {
     return {
@@ -48,6 +53,19 @@ function d1Like(db: SqliteDatabase): SnapshotDatabase {
     };
   }
   return { prepare: (sql: string) => statement(sql, []) };
+}
+
+function lifecycleStores(db: SqliteDatabase): {
+  snapshots: SnapshotDatabase;
+  resources: D1ResourceOwnershipStore;
+} {
+  const binding = sqliteUnitDatabase(db);
+  return {
+    snapshots: binding as SnapshotDatabase,
+    resources: new D1ResourceOwnershipStore(
+      binding as ResourceOwnershipDatabase,
+    ),
+  };
 }
 
 const NOW = Date.parse('2026-07-07T12:00:00.000Z');
@@ -173,6 +191,117 @@ describe('purgeExpiredWorkflowRuns', () => {
     ).toBe(0);
   });
 
+  it('releases only the owners of snapshot rows the row-only purge deletes', async () => {
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    const { snapshots, resources } = lifecycleStores(sqlite);
+    seedRun(sqlite, {
+      runId: 'stale-run',
+      status: 'success',
+      updatedAt: NOW - 8 * DAY_MS,
+    });
+    seedRun(sqlite, {
+      runId: 'fresh-run',
+      status: 'success',
+      updatedAt: NOW - DAY_MS,
+    });
+    await resources.claim('run', 'stale-run', {
+      kind: 'human',
+      id: 'owner-1',
+    });
+    await resources.claim('run', 'fresh-run', {
+      kind: 'human',
+      id: 'owner-1',
+    });
+
+    expect(
+      await purgeExpiredWorkflowRuns(snapshots, {
+        ttlMs: 7 * DAY_MS,
+        now: () => NOW,
+        resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+      }),
+    ).toBe(1);
+    expect(await resources.owner('run', 'stale-run')).toBeUndefined();
+    expect(await resources.owner('run', 'fresh-run')).toEqual({
+      kind: 'human',
+      id: 'owner-1',
+    });
+  });
+
+  it('rolls back run and owner deletion together when snapshot deletion fails', async () => {
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    const { snapshots, resources } = lifecycleStores(sqlite);
+    seedRun(sqlite, {
+      runId: 'stale-run',
+      status: 'success',
+      updatedAt: NOW - 8 * DAY_MS,
+    });
+    await resources.claim('run', 'stale-run', {
+      kind: 'human',
+      id: 'owner-1',
+    });
+    sqlite.exec(`CREATE TRIGGER reject_snapshot_delete
+      BEFORE DELETE ON mastra_workflow_snapshot
+      BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END`);
+
+    await expect(
+      purgeExpiredWorkflowRuns(snapshots, {
+        ttlMs: 7 * DAY_MS,
+        now: () => NOW,
+        resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+      }),
+    ).rejects.toThrow(/injected delete failure/);
+    expect(remainingRunIds(sqlite)).toEqual(['stale-run']);
+    expect(await resources.owner('run', 'stale-run')).toEqual({
+      kind: 'human',
+      id: 'owner-1',
+    });
+  });
+
+  it('keeps a run owner when the row becomes ineligible between selection and the row-only batch', async () => {
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    const binding = sqliteUnitDatabase(sqlite) as SnapshotDatabase &
+      ResourceOwnershipDatabase;
+    const resources = new D1ResourceOwnershipStore(binding);
+    seedRun(sqlite, {
+      runId: 'revived-run',
+      status: 'success',
+      updatedAt: NOW - 8 * DAY_MS,
+    });
+    await resources.claim('run', 'revived-run', {
+      kind: 'human',
+      id: 'owner-1',
+    });
+    const backingBatch = binding.batch?.bind(binding);
+    if (!backingBatch) throw new Error('test D1 adapter must provide batch');
+    const racing: SnapshotDatabase = {
+      prepare: binding.prepare.bind(binding),
+      batch: async (statements) => {
+        sqlite
+          .prepare(
+            `UPDATE mastra_workflow_snapshot SET updatedAt = ? WHERE run_id = ?`,
+          )
+          .run(new Date(NOW).toISOString(), 'revived-run');
+        return backingBatch(statements);
+      },
+    };
+
+    expect(
+      await purgeExpiredWorkflowRuns(racing, {
+        ttlMs: 7 * DAY_MS,
+        now: () => NOW,
+        resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+      }),
+    ).toBe(0);
+    expect(remainingRunIds(sqlite)).toEqual(['revived-run']);
+    expect(await resources.owner('run', 'revived-run')).toEqual({
+      kind: 'human',
+      id: 'owner-1',
+    });
+  });
+
   it('respects the table prefix', async () => {
     // #given — two tables in one database, only the prefixed one targeted
     const sqlite = openSqlite();
@@ -263,7 +392,7 @@ describe('purgeExpiredWorkflowRuns', () => {
     // CREATE TABLE never happened
     const sqlite = openSqlite();
 
-    // #when / #then — the purge cron must not fail until some unrelated run
+    // #when / #then — maintenance purge must not fail until some unrelated run
     // initializes the schema
     expect(
       await purgeExpiredWorkflowRuns(d1Like(sqlite), {
@@ -320,10 +449,54 @@ describe('purgeExpiredWorkflowRuns', () => {
     });
 
     // #then — exactly the purged run's artifacts went with its row; the
-    // survivors keep theirs (purgeTenant can still enumerate them later)
+    // survivors keep theirs; deployment teardown deletes the bound bucket.
     expect(deleted).toBe(1);
     expect(deletedArtifacts).toEqual(['wf/stale-done']);
     expect(remainingRunIds(sqlite)).toEqual(['fresh-done', 'stale-open']);
+  });
+
+  it('keeps a run owner when the artifact path recheck leaves its snapshot row', async () => {
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    const binding = sqliteUnitDatabase(sqlite) as SnapshotDatabase &
+      ResourceOwnershipDatabase;
+    const resources = new D1ResourceOwnershipStore(binding);
+    seedRun(sqlite, {
+      runId: 'revived-run',
+      status: 'success',
+      updatedAt: NOW - 8 * DAY_MS,
+    });
+    await resources.claim('run', 'revived-run', {
+      kind: 'human',
+      id: 'owner-1',
+    });
+    const backingBatch = binding.batch?.bind(binding);
+    if (!backingBatch) throw new Error('test D1 adapter must provide batch');
+    const racing: SnapshotDatabase = {
+      prepare: binding.prepare.bind(binding),
+      batch: async (statements) => {
+        sqlite
+          .prepare(
+            `UPDATE mastra_workflow_snapshot SET updatedAt = ? WHERE run_id = ?`,
+          )
+          .run(new Date(NOW).toISOString(), 'revived-run');
+        return backingBatch(statements);
+      },
+    };
+
+    expect(
+      await purgeExpiredWorkflowRuns(racing, {
+        ttlMs: 7 * DAY_MS,
+        now: () => NOW,
+        artifactStore: { deleteRun: async () => 1 },
+        resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+      }),
+    ).toBe(0);
+    expect(remainingRunIds(sqlite)).toEqual(['revived-run']);
+    expect(await resources.owner('run', 'revived-run')).toEqual({
+      kind: 'human',
+      id: 'owner-1',
+    });
   });
 
   it('LIMIT-batches the artifact-paired path; the shrinking eligible set is the cursor', async () => {
@@ -381,7 +554,7 @@ describe('purgeExpiredWorkflowRuns', () => {
       },
     };
 
-    // #when / #then — the failure propagates (the cron logs it)...
+    // #when / #then — the failure propagates (the purge duty logs it)...
     await expect(
       purgeExpiredWorkflowRuns(d1Like(sqlite), {
         ttlMs: 7 * DAY_MS,
@@ -415,7 +588,7 @@ describe('purgeExpiredWorkflowRuns', () => {
     const options = { ttlMs: 7 * DAY_MS, now: () => NOW, artifactStore };
 
     // #when / #then — the pass purges the other four, then reports the
-    // failure (naming the run) so the cron's error surface still fires
+    // failure (naming the run) so the purge duty's error surface still fires
     await expect(
       purgeExpiredWorkflowRuns(d1Like(sqlite), options),
     ).rejects.toThrow('wf/r3-bad: permanently broken');
@@ -429,556 +602,6 @@ describe('purgeExpiredWorkflowRuns', () => {
       }),
     ).toBe(1);
     expect(remainingRunIds(sqlite)).toEqual([]);
-  });
-});
-
-describe('purgeTenant (complete offboarding)', () => {
-  function seedApprovalsTable(db: SqliteDatabase): void {
-    db.prepare(
-      `CREATE TABLE flowsafe_approvals (
-        id TEXT PRIMARY KEY,
-        tenant_id TEXT NOT NULL,
-        title TEXT NOT NULL
-      )`,
-    ).run();
-    db.prepare(
-      `INSERT INTO flowsafe_approvals (id, tenant_id, title)
-       VALUES ('a1', 'abc', 'abc approval'),
-              ('b1', 'abcdefg', 'neighbor approval')`,
-    ).run();
-  }
-
-  // Track E: the flowsafe-owned signal-subscription table purgeTenant reaps by
-  // its `tenant_id` column (the flowsafe_approvals leg, not the salted range).
-  function seedSubscriptionsTable(db: SqliteDatabase): void {
-    db.prepare(
-      `CREATE TABLE flowsafe_signal_subscriptions (
-        id TEXT PRIMARY KEY,
-        tenant_id TEXT NOT NULL,
-        provider_id TEXT NOT NULL,
-        thread_id TEXT NOT NULL,
-        resource_id TEXT NOT NULL,
-        external_resource_id TEXT NOT NULL,
-        subscribed_at TEXT NOT NULL,
-        metadata TEXT
-      )`,
-    ).run();
-    db.prepare(
-      `INSERT INTO flowsafe_signal_subscriptions
-         (id, tenant_id, provider_id, thread_id, resource_id, external_resource_id, subscribed_at, metadata)
-       VALUES
-         ('s1', 'abc', 'github', 'abc_t1', 'abc_o', 'github:x', '2026-01-01T00:00:00Z', NULL),
-         ('s2', 'abcdefg', 'github', 'abcdefg_t1', 'abcdefg_o', 'github:y', '2026-01-01T00:00:00Z', NULL)`,
-    ).run();
-  }
-
-  // The three agent-memory tables purgeTenant range-DELETEs in PARALLEL
-  // (Promise.all). Column names mirror the real @mastra/cloudflare-d1 schema
-  // mastra-schema-guard.test.ts pins: messages carry a NOT-NULL salted
-  // `thread_id` (their own `id` is unsalted by design), threads/resources key
-  // on a salted `id`.
-  function createMemoryTables(db: SqliteDatabase): void {
-    db.prepare(
-      `CREATE TABLE mastra_messages (
-        id TEXT PRIMARY KEY,
-        thread_id TEXT NOT NULL,
-        resourceId TEXT
-      )`,
-    ).run();
-    db.prepare(
-      `CREATE TABLE mastra_threads (
-        id TEXT PRIMARY KEY,
-        resourceId TEXT
-      )`,
-    ).run();
-    db.prepare('CREATE TABLE mastra_resources (id TEXT PRIMARY KEY)').run();
-  }
-
-  function seedMessage(db: SqliteDatabase, id: string, threadId: string): void {
-    db.prepare(
-      'INSERT INTO mastra_messages (id, thread_id, resourceId) VALUES (?, ?, NULL)',
-    ).run(id, threadId);
-  }
-
-  function seedThread(db: SqliteDatabase, id: string): void {
-    db.prepare(
-      'INSERT INTO mastra_threads (id, resourceId) VALUES (?, NULL)',
-    ).run(id);
-  }
-
-  function seedResource(db: SqliteDatabase, id: string): void {
-    db.prepare('INSERT INTO mastra_resources (id) VALUES (?)').run(id);
-  }
-
-  function columnValues(
-    db: SqliteDatabase,
-    table: string,
-    column: string,
-  ): string[] {
-    const rows = (
-      db.prepare(
-        `SELECT ${column} AS value FROM ${table} ORDER BY ${column}`,
-      ) as unknown as { all(): Array<{ value: string }> }
-    ).all();
-    return rows.map((row) => row.value);
-  }
-
-  it("reaps all three stores for the tenant and leaves the prefix-NEIGHBOR untouched ('abc' vs 'abcdefg')", async () => {
-    // #given — snapshots of EVERY status for two tenants whose slugs share a
-    // prefix (the range-exactness worst case), plus approvals and artifacts
-    const sqlite = openSqlite();
-    createSnapshotTable(sqlite);
-    seedApprovalsTable(sqlite);
-    seedRun(sqlite, {
-      runId: 'abc_r-terminal',
-      status: 'success',
-      updatedAt: NOW,
-    });
-    seedRun(sqlite, {
-      runId: 'abc_r-suspended',
-      status: 'suspended',
-      updatedAt: NOW,
-    });
-    seedRun(sqlite, {
-      runId: 'abcdefg_r1',
-      status: 'suspended',
-      updatedAt: NOW,
-    });
-    // Digit-suffixed neighbor: '5' (0x35) sorts BELOW '_' (0x5F), so this
-    // row is inside the broken range if the lower bound ever loses its
-    // trailing underscore ('abc' instead of 'abc_') — the letter neighbor
-    // above cannot catch that mutant (excluded by the upper bound alone).
-    seedRun(sqlite, {
-      runId: 'abc5_r1',
-      status: 'suspended',
-      updatedAt: NOW,
-    });
-    const deletedArtifacts: string[] = [];
-    const artifactStore = {
-      deleteRun: async (workflowId: string, runId: string) => {
-        deletedArtifacts.push(`${workflowId}/${runId}`);
-        return 1;
-      },
-    };
-
-    // #when
-    const result = await purgeTenant(d1Like(sqlite), {
-      tenantId: 'abc',
-      artifactStore,
-    });
-
-    // #then — abc's rows (INCLUDING the suspended one the retention purge can
-    // never reap) are gone from all three stores; both neighbors survive
-    expect(result).toEqual({
-      snapshots: 2,
-      threads: 0,
-      messages: 0,
-      resources: 0,
-      backgroundTasks: 0,
-      notifications: 0,
-      threadState: 0,
-      schedules: 0,
-      scheduleTriggers: 0,
-      approvals: 1,
-      subscriptions: 0,
-      artifacts: 2,
-    });
-    expect(remainingRunIds(sqlite)).toEqual(['abc5_r1', 'abcdefg_r1']);
-    expect(deletedArtifacts.sort()).toEqual([
-      'wf/abc_r-suspended',
-      'wf/abc_r-terminal',
-    ]);
-    const approvals = (
-      sqlite.prepare('SELECT tenant_id FROM flowsafe_approvals') as unknown as {
-        all(): Array<{ tenant_id: string }>;
-      }
-    ).all();
-    expect(approvals).toEqual([{ tenant_id: 'abcdefg' }]);
-  });
-
-  it('reaps Track E signal subscriptions by tenant_id and leaves the neighbor tenant intact', async () => {
-    // #given — two tenants' subscriptions in the flowsafe-owned table
-    const sqlite = openSqlite();
-    seedSubscriptionsTable(sqlite);
-
-    // #when
-    const result = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
-
-    // #then — only abc's row reaped (exact tenant_id match); abcdefg survives
-    expect(result.subscriptions).toBe(1);
-    const rows = (
-      sqlite.prepare(
-        'SELECT tenant_id FROM flowsafe_signal_subscriptions',
-      ) as unknown as { all(): Array<{ tenant_id: string }> }
-    ).all();
-    expect(rows).toEqual([{ tenant_id: 'abcdefg' }]);
-  });
-
-  it('a run landing INSIDE the artifact-SELECT → snapshot-DELETE window is still deleted, and its artifacts are NOT enumerated', async () => {
-    // The three statements are not one transaction, and the artifact deletes
-    // are R2 calls no SQL transaction could span. Pin the resulting behavior
-    // rather than pretend it away: the DELETE re-evaluates the range at
-    // execution time, so a run started mid-purge IS reaped — but the SELECT
-    // feeding artifact cleanup already ran, so that run's artifacts are never
-    // enumerated. Only self-service reset (showcase /demo/reset) can reach
-    // this, by racing its OWN tenant's start; the reaper purges expired
-    // tenants, which have no live caller by construction.
-    // #given — one pre-existing run; a second lands between the two statements
-    const sqlite = openSqlite();
-    createSnapshotTable(sqlite);
-    seedApprovalsTable(sqlite);
-    seedRun(sqlite, { runId: 'abc_r1', status: 'suspended', updatedAt: NOW });
-    const real = d1Like(sqlite);
-    let selected = false;
-    const racing: SnapshotDatabase = {
-      prepare: (sql: string) => {
-        const statement = real.prepare(sql);
-        if (!sql.includes('SELECT workflow_name')) return statement;
-        return {
-          ...statement,
-          bind: (...values: unknown[]) => {
-            const bound = statement.bind(...values);
-            return {
-              ...bound,
-              all: async <T>() => {
-                const out = await bound.all<T>();
-                if (!selected) {
-                  selected = true;
-                  // a POST /runs for the same tenant commits right here
-                  seedRun(sqlite, {
-                    runId: 'abc_r2',
-                    status: 'running',
-                    updatedAt: NOW,
-                  });
-                }
-                return out;
-              },
-            };
-          },
-        };
-      },
-    };
-    const deletedArtifacts: string[] = [];
-    const artifactStore = {
-      deleteRun: async (workflowId: string, runId: string) => {
-        deletedArtifacts.push(`${workflowId}/${runId}`);
-        return 1;
-      },
-    };
-
-    // #when
-    const result = await purgeTenant(racing, {
-      tenantId: 'abc',
-      artifactStore,
-    });
-
-    // #then — both rows are gone (the DELETE re-reads the range), but only the
-    // run visible to the SELECT had its artifacts cleaned
-    expect(result.snapshots).toBe(2);
-    expect(remainingRunIds(sqlite)).toEqual([]);
-    expect(deletedArtifacts).toEqual(['wf/abc_r1']);
-  });
-
-  it('a failing approvals DELETE leaves the purge PARTIALLY applied — the snapshots are already gone', async () => {
-    // The three statements are not one transaction, so a throw at the last one
-    // cannot roll the first ones back. A caller that surfaces the rejection
-    // (the /demo/reset route 500s) must therefore treat its local view as
-    // stale, not as "nothing happened". Pinned so nobody reads the sequence as
-    // atomic.
-    // #given — a tenant with a snapshot and an approvals table that throws
-    const sqlite = openSqlite();
-    createSnapshotTable(sqlite);
-    seedApprovalsTable(sqlite);
-    seedRun(sqlite, { runId: 'abc_r1', status: 'suspended', updatedAt: NOW });
-    const real = d1Like(sqlite);
-    const failing: SnapshotDatabase = {
-      prepare: (sql: string) => {
-        const statement = real.prepare(sql);
-        if (!sql.includes('DELETE FROM flowsafe_approvals')) return statement;
-        return {
-          ...statement,
-          bind: () => ({
-            ...statement,
-            run: async () => {
-              throw new Error('D1_ERROR: network');
-            },
-          }),
-        };
-      },
-    };
-
-    // #when / #then — the failure propagates (never silently swallowed)
-    await expect(purgeTenant(failing, { tenantId: 'abc' })).rejects.toThrow(
-      /D1_ERROR/,
-    );
-
-    // #then — the snapshot DELETE already committed: the purge is half-applied
-    expect(remainingRunIds(sqlite)).toEqual([]);
-    const approvals = (
-      sqlite.prepare('SELECT tenant_id FROM flowsafe_approvals') as unknown as {
-        all(): Array<{ tenant_id: string }>;
-      }
-    ).all();
-    expect(approvals).toEqual([{ tenant_id: 'abc' }, { tenant_id: 'abcdefg' }]);
-  });
-
-  it('tolerates a host without the approvals table (snapshot-only deployments)', async () => {
-    // #given — no flowsafe_approvals table at all
-    const sqlite = openSqlite();
-    createSnapshotTable(sqlite);
-    seedRun(sqlite, { runId: 'abc_r1', status: 'running', updatedAt: NOW });
-
-    // #when / #then
-    const result = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
-    expect(result).toEqual({
-      snapshots: 1,
-      threads: 0,
-      messages: 0,
-      resources: 0,
-      backgroundTasks: 0,
-      notifications: 0,
-      threadState: 0,
-      schedules: 0,
-      scheduleTriggers: 0,
-      approvals: 0,
-      subscriptions: 0,
-      artifacts: 0,
-    });
-  });
-
-  it('offboards a tenant that never started a run: a MISSING snapshot table reads as empty and approvals are still reaped', async () => {
-    // #given — Mastra creates the snapshot table lazily with the first
-    // persisted run, and an expired demo sandbox routinely dies without one;
-    // the approvals table exists (the store factory creates it eagerly)
-    const sqlite = openSqlite();
-    seedApprovalsTable(sqlite);
-    const artifactStore = {
-      deleteRun: async () => {
-        throw new Error('must not be called without a snapshot table');
-      },
-    };
-
-    // #when — must not throw before the approval delete (a throw here wedged
-    // BOTH the purge cron and re-auth for the sandbox's identity)
-    const result = await purgeTenant(d1Like(sqlite), {
-      tenantId: 'abc',
-      artifactStore,
-    });
-
-    // #then — the tenant's approval rows are gone; the neighbor survives
-    expect(result).toEqual({
-      snapshots: 0,
-      threads: 0,
-      messages: 0,
-      resources: 0,
-      backgroundTasks: 0,
-      notifications: 0,
-      threadState: 0,
-      schedules: 0,
-      scheduleTriggers: 0,
-      approvals: 1,
-      subscriptions: 0,
-      artifacts: 0,
-    });
-    const approvals = (
-      sqlite.prepare('SELECT tenant_id FROM flowsafe_approvals') as unknown as {
-        all(): Array<{ tenant_id: string }>;
-      }
-    ).all();
-    expect(approvals).toEqual([{ tenant_id: 'abcdefg' }]);
-  });
-
-  it('offboards cleanly when NEITHER table exists yet (fresh deployment)', async () => {
-    // #given — no snapshot table, no approvals table
-    const sqlite = openSqlite();
-
-    // #when / #then
-    expect(await purgeTenant(d1Like(sqlite), { tenantId: 'abc' })).toEqual({
-      snapshots: 0,
-      threads: 0,
-      messages: 0,
-      resources: 0,
-      backgroundTasks: 0,
-      notifications: 0,
-      threadState: 0,
-      schedules: 0,
-      scheduleTriggers: 0,
-      approvals: 0,
-      subscriptions: 0,
-      artifacts: 0,
-    });
-  });
-
-  it('reads missing agent-memory tables as empty (crafted DBs, non-D1Store hosts)', async () => {
-    // #given — a snapshot table but none of the three memory tables
-    const sqlite = openSqlite();
-    createSnapshotTable(sqlite);
-    seedRun(sqlite, { runId: 'abc_r1', status: 'success', updatedAt: NOW });
-
-    // #when
-    const purged = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
-
-    // #then — snapshots reaped; the memory sweep absorbed the missing
-    // tables as zero rows instead of wedging the offboarding
-    expect(purged.snapshots).toBe(1);
-    expect(purged.threads).toBe(0);
-    expect(purged.messages).toBe(0);
-    expect(purged.resources).toBe(0);
-  });
-
-  it('reaps REAL rows from all three memory tables under Promise.all, each range-exact against a prefix neighbor', async () => {
-    // #given — the three memory tables carrying target-tenant rows (salted
-    // ids: threads/resources by a salted `id`, messages by a salted
-    // `thread_id`) beside prefix-neighbor rows that straddle BOTH range bounds
-    // — 'abc5_…' ('5' 0x35 < '_' 0x5F, below the lower bound) and 'abcdefg_…'
-    // ('d' 0x64 > backtick 0x60, above the upper bound). Distinct per-table
-    // counts (messages 3 / threads 2 / resources 1) prove each CONCURRENT
-    // DELETE reports its OWN range's changes, not a shared or clobbered count.
-    const sqlite = openSqlite();
-    createSnapshotTable(sqlite);
-    createMemoryTables(sqlite);
-    for (const id of ['abc-m1', 'abc-m2', 'abc-m3']) {
-      seedMessage(sqlite, id, 'abc_thread-1');
-    }
-    seedMessage(sqlite, 'abc5-m1', 'abc5_thread-9');
-    seedMessage(sqlite, 'abcdefg-m1', 'abcdefg_thread-9');
-    for (const id of ['abc_thread-1', 'abc_thread-2']) {
-      seedThread(sqlite, id);
-    }
-    seedThread(sqlite, 'abc5_thread-9');
-    seedThread(sqlite, 'abcdefg_thread-9');
-    seedResource(sqlite, 'abc_user-1');
-    seedResource(sqlite, 'abc5_user-9');
-    seedResource(sqlite, 'abcdefg_user-9');
-
-    // #given (sanity) — the target rows are really present, so the concurrent
-    // deletes below are non-vacuous (unlike the missing-table pins this
-    // supplements, which take the isMissingTable branch and delete nothing)
-    expect(columnValues(sqlite, 'mastra_messages', 'thread_id').length).toBe(5);
-    expect(columnValues(sqlite, 'mastra_threads', 'id').length).toBe(4);
-    expect(columnValues(sqlite, 'mastra_resources', 'id').length).toBe(3);
-
-    // #when
-    const result = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
-
-    // #then — each concurrent DELETE reaped exactly its tenant's rows
-    expect(result.messages).toBe(3);
-    expect(result.threads).toBe(2);
-    expect(result.resources).toBe(1);
-
-    // #then — both prefix neighbors survive in EVERY table: the parallelized
-    // deletes stayed range-exact and never clobbered a neighbor
-    expect(columnValues(sqlite, 'mastra_messages', 'thread_id')).toEqual([
-      'abc5_thread-9',
-      'abcdefg_thread-9',
-    ]);
-    expect(columnValues(sqlite, 'mastra_threads', 'id')).toEqual([
-      'abc5_thread-9',
-      'abcdefg_thread-9',
-    ]);
-    expect(columnValues(sqlite, 'mastra_resources', 'id')).toEqual([
-      'abc5_user-9',
-      'abcdefg_user-9',
-    ]);
-  });
-
-  it('a genuine (non-missing-table) error in ONE memory DELETE rejects the whole purge — the missing-table tolerance never masks it', async () => {
-    // #given — all three memory tables with real rows (every leg has work to
-    // do), then a genuine D1_ERROR injected into exactly ONE leg's DELETE via
-    // the SAME seam the approvals-failure pin above uses. A D1_ERROR is NOT
-    // 'no such table', so the per-statement isMissingTable catch must RE-THROW
-    // it rather than swallow it — even though it fires inside the Promise.all.
-    const sqlite = openSqlite();
-    createSnapshotTable(sqlite);
-    seedRun(sqlite, { runId: 'abc_r1', status: 'suspended', updatedAt: NOW });
-    createMemoryTables(sqlite);
-    seedMessage(sqlite, 'abc-m1', 'abc_thread-1');
-    seedThread(sqlite, 'abc_thread-1');
-    seedResource(sqlite, 'abc_user-1');
-    const real = d1Like(sqlite);
-    const failing: SnapshotDatabase = {
-      prepare: (sql: string) => {
-        const statement = real.prepare(sql);
-        if (!sql.includes('DELETE FROM mastra_threads')) return statement;
-        return {
-          ...statement,
-          bind: () => ({
-            ...statement,
-            run: async () => {
-              throw new Error('D1_ERROR: network');
-            },
-          }),
-        };
-      },
-    };
-
-    // #when / #then — the first real error propagates out of Promise.all; the
-    // sibling legs' missing-table tolerance does not absorb it
-    await expect(purgeTenant(failing, { tenantId: 'abc' })).rejects.toThrow(
-      /D1_ERROR/,
-    );
-  });
-
-  it.each([
-    'Abc',
-    'a_b',
-    'ab',
-    "abc'; DROP TABLE x; --",
-    '',
-  ])("rejects the non-INV-3 tenantId '%s' BEFORE any interpolation (range-exactness, not injection)", async (tenantId) => {
-    // #given
-    const sqlite = openSqlite();
-    createSnapshotTable(sqlite);
-
-    // #when / #then
-    await expect(purgeTenant(d1Like(sqlite), { tenantId })).rejects.toThrow(
-      /INV-3/,
-    );
-  });
-
-  it.each<[string, unknown]>([
-    ['undefined', undefined],
-    ['null', null],
-    // String(['acme']) === 'acme', so a bare TENANT_ID_PATTERN.test(['acme'])
-    // coerces to a valid slug and would build the range bounds from 'acme',
-    // purging that tenant; the typeof guard refuses it.
-    ['an array coercing to a valid-looking slug', ['acme']],
-  ])('rejects a non-string tenantId (%s) BEFORE building the range bounds (red-first: today the bare .test coerces it)', async (_label, tenantId) => {
-    // #given — purgeTenant is EXPORTED and reached from demo-reset/purge-cron
-    // with a post-resolver tenant.tenantId. RegExp.test would coerce
-    // undefined -> 'undefined' and build the range bounds from that literal,
-    // purging an unintended range; the typeof guard refuses it (DL-002).
-    const sqlite = openSqlite();
-    createSnapshotTable(sqlite);
-
-    // #when / #then
-    await expect(
-      purgeTenant(d1Like(sqlite), {
-        tenantId: tenantId as unknown as string,
-      }),
-    ).rejects.toThrow(/INV-3/);
-  });
-
-  it('respects the table prefix', async () => {
-    // #given
-    const sqlite = openSqlite();
-    createSnapshotTable(sqlite, 'p_');
-    seedRun(sqlite, {
-      runId: 'abc_r1',
-      status: 'suspended',
-      updatedAt: NOW,
-      prefix: 'p_',
-    });
-
-    // #when
-    const result = await purgeTenant(d1Like(sqlite), {
-      tenantId: 'abc',
-      tablePrefix: 'p_',
-    });
-
-    // #then
-    expect(result.snapshots).toBe(1);
-    expect(remainingRunIds(sqlite, 'p_')).toEqual([]);
   });
 });
 
@@ -1091,8 +714,8 @@ describe('purgeExpiredThreads (agent-memory thread TTL)', () => {
 
   it('never touches mastra_resources — working memory is the OWNER’s, not the thread’s', async () => {
     // #given — a resource whose only thread ages out. The owner still exists;
-    // their working memory outlives any one conversation and is reaped only at
-    // offboarding (purgeTenant).
+    // their working memory outlives any one conversation and leaves only when
+    // the deployment is decommissioned.
     const sqlite = openSqlite();
     createThreadTables(sqlite);
     sqlite.prepare('CREATE TABLE mastra_resources (id TEXT PRIMARY KEY)').run();
@@ -1109,6 +732,23 @@ describe('purgeExpiredThreads (agent-memory thread TTL)', () => {
 
     // #then
     expect(idsIn(sqlite, 'mastra_resources', 'id')).toEqual(['abc_user-1']);
+  });
+
+  it('preserves logical thread ownership after expiring its memory rows', async () => {
+    const sqlite = openSqlite();
+    createThreadTables(sqlite);
+    seedThreadAt(sqlite, 'thread-idle', NOW - 40 * DAY_MS, ['message-old']);
+    const { snapshots, resources } = lifecycleStores(sqlite);
+    const owner = { kind: 'human', id: 'opal' } as const;
+    await resources.claim('thread', 'thread-idle', owner);
+
+    const purged = await purgeExpiredThreads(snapshots, {
+      ttlMs: 30 * DAY_MS,
+      now: () => NOW,
+    });
+
+    expect(purged).toEqual({ threads: 1, messages: 1 });
+    expect(await resources.owner('thread', 'thread-idle')).toEqual(owner);
   });
 
   it('LIMIT-batches: one firing takes at most `limit`, the next resumes at the survivors', async () => {
@@ -1182,7 +822,7 @@ describe('purgeExpiredThreads (agent-memory thread TTL)', () => {
   // saveMessages issues its message insert and its `UPDATE mastra_threads SET
   // updatedAt` CONCURRENTLY (Promise.all), so a message arriving mid-purge is
   // exactly the interleaving below. Both tests inject that write through the
-  // .prepare wrapper the purgeTenant race tests already use.
+  // .prepare wrapper used by the retention race tests.
   function resurrectOn(
     sqlite: SqliteDatabase,
     trigger: (sql: string) => boolean,
@@ -1237,8 +877,8 @@ describe('purgeExpiredThreads (agent-memory thread TTL)', () => {
     // #given — the narrower window: the messages DELETE has already committed
     // when the write arrives. Without the thread DELETE's own re-check, the
     // thread row would go on stale membership and leave 'm-during-race'
-    // pointing at a thread that no longer exists — reachable then only by
-    // purgeTenant at offboarding, since nothing lists a vanished thread.
+    // pointing at a thread that no longer exists and cannot be reached through
+    // the ordinary thread index.
     const sqlite = openSqlite();
     createThreadTables(sqlite);
     seedThreadAt(sqlite, 'abc_idle', NOW - 40 * DAY_MS, ['m-old']);
@@ -1396,7 +1036,7 @@ describe('purgeExpiredThreads (agent-memory thread TTL)', () => {
 
   it('reads missing tables as empty, so a memory-less deployment purges unchanged', async () => {
     // #given — a fresh DB: no host has enabled agent memory, so Mastra never
-    // created the tables. The duty must no-op, not wedge the purge cron.
+    // created the tables. The duty must no-op, not wedge maintenance purge.
     const sqlite = openSqlite();
 
     // #when
@@ -1469,7 +1109,7 @@ describe('purgeExpiredThreads (agent-memory thread TTL)', () => {
       },
     };
 
-    // #when / #then — the cron's error surface fires and the thread survives
+    // #when / #then — the purge duty's error surface fires and the thread survives
     await expect(
       purgeExpiredThreads(wedgedDb, { ttlMs: 30 * DAY_MS, now: () => NOW }),
     ).rejects.toThrow('database is locked');
@@ -1513,68 +1153,6 @@ describe('purgeExpiredWorkflowRuns row-only batching', () => {
   });
 });
 
-describe('ensureSnapshotRunIdIndex memoization (via purgeTenant)', () => {
-  function countingDb(inner: SnapshotDatabase): {
-    db: SnapshotDatabase;
-    indexStatements: () => number;
-  } {
-    let count = 0;
-    return {
-      db: {
-        prepare(sql: string) {
-          if (sql.includes('CREATE INDEX')) count += 1;
-          return inner.prepare(sql);
-        },
-      },
-      indexStatements: () => count,
-    };
-  }
-
-  it('runs CREATE INDEX once per database binding — the reaper loop pays no per-tenant DDL', async () => {
-    // #given — a snapshot table and a DDL-counting wrapper over ONE binding
-    const sqlite = openSqlite();
-    createSnapshotTable(sqlite);
-    seedRun(sqlite, { runId: 'aaa111_r1', status: 'success', updatedAt: NOW });
-    const { db, indexStatements } = countingDb(d1Like(sqlite));
-
-    // #when — three offboardings, the cron reaper's loop shape
-    await purgeTenant(db, { tenantId: 'aaa111' });
-    await purgeTenant(db, { tenantId: 'bbb222' });
-    await purgeTenant(db, { tenantId: 'ccc333' });
-
-    // #then — one DDL round-trip, not one per tenant
-    expect(indexStatements()).toBe(1);
-  });
-
-  it('memoizes success only: a missing snapshot table re-probes per call and recovers once the table exists', async () => {
-    // #given — no snapshot table yet (a run-less deployment)
-    const sqlite = openSqlite();
-    const { db, indexStatements } = countingDb(d1Like(sqlite));
-
-    // #when — offboarding tolerates the missing table as empty
-    const first = await purgeTenant(db, { tenantId: 'aaa111' });
-    expect(first.snapshots).toBe(0);
-    expect(indexStatements()).toBe(1);
-
-    // the table appears (a first run persisted); the next offboarding must
-    // probe again rather than trust a memoized failure
-    createSnapshotTable(sqlite);
-    seedRun(sqlite, {
-      runId: 'aaa111_r1',
-      status: 'suspended',
-      updatedAt: NOW,
-    });
-    const second = await purgeTenant(db, { tenantId: 'aaa111' });
-
-    // #then — retried (2 DDL statements total) and the rows were reaped
-    expect(indexStatements()).toBe(2);
-    expect(second.snapshots).toBe(1);
-  });
-});
-
-// mastra_background_tasks per @mastra/cloudflare-d1 DDL: run_id snake_case
-// (the INV-1 salted originating run), status machine, camelCase completedAt as
-// ISO TEXT — exactly the columns Track B's two purges ride on.
 function createBackgroundTasksTable(db: SqliteDatabase, prefix = ''): void {
   db.prepare(
     `CREATE TABLE ${prefix}mastra_background_tasks (
@@ -1764,65 +1342,8 @@ describe('purgeExpiredBackgroundTasks', () => {
   });
 });
 
-describe('purgeTenant background-task coverage (DL-003)', () => {
-  it('reaps unsalted internal snapshots associated through tenant-owned task rows', async () => {
-    const sqlite = openSqlite();
-    createBackgroundTasksTable(sqlite);
-    createSnapshotTable(sqlite);
-    seedTask(sqlite, { id: 'task-a', runId: 'abc_r1', status: 'running' });
-    seedTask(sqlite, { id: 'task-b', runId: 'xyz_r1', status: 'running' });
-    const iso = new Date(NOW).toISOString();
-    for (const id of ['task-a', 'task-b']) {
-      sqlite
-        .prepare(
-          `INSERT INTO mastra_workflow_snapshot
-           (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
-           VALUES ('__background-task', ?, NULL, '{}', ?, ?)`,
-        )
-        .run(id, iso, iso);
-    }
-
-    const result = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
-
-    expect(result.snapshots).toBe(1);
-    expect(result.backgroundTasks).toBe(1);
-    expect(remainingRunIds(sqlite)).toEqual(['task-b']);
-    expect(taskIds(sqlite)).toEqual(['task-b']);
-  });
-
-  it('reaps a tenant’s background-task rows by the run_id range, exactly one tenant', async () => {
-    // #given — abc and its digit-suffixed prefix neighbor abc5 (the range
-    // exactness case), plus another tenant xyz, all keyed by run_id
-    const sqlite = openSqlite();
-    createBackgroundTasksTable(sqlite);
-    seedTask(sqlite, { id: 't-abc', runId: 'abc_r1', status: 'completed' });
-    seedTask(sqlite, { id: 't-abc5', runId: 'abc5_r1', status: 'running' });
-    seedTask(sqlite, { id: 't-xyz', runId: 'xyz_r1', status: 'suspended' });
-
-    // #when — offboard exactly abc
-    const result = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
-
-    // #then — only abc's task goes (running included: offboarding ignores
-    // status); abc5 and xyz survive — the range is exact over run_id
-    expect(result.backgroundTasks).toBe(1);
-    expect(taskIds(sqlite)).toEqual(['t-abc5', 't-xyz']);
-  });
-
-  it('missing background-tasks table offboards cleanly (run-less tenant)', async () => {
-    // #given — a tenant with no background tasks table at all
-    const sqlite = openSqlite();
-
-    // #when / #then — no throw, counter is zero
-    const result = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
-    expect(result.backgroundTasks).toBe(0);
-  });
-});
-
-// --- Track C (M-004) signal-domain retention + offboarding -----------------
-// The two flowsafe-owned tables are created by their D1 domains (the adapter
-// ships neither), then seeded with RAW inserts so the timestamps are precise.
 async function signalDb(sqlite: SqliteDatabase): Promise<SignalDatabase> {
-  const db = d1DatabaseLike(sqlite) as unknown as SignalDatabase;
+  const db = sqliteUnitDatabase(sqlite) as unknown as SignalDatabase;
   await new D1NotificationsStorage(db, '').init();
   await new D1ThreadStateStorage(db, '').init();
   return db;
@@ -1939,121 +1460,13 @@ describe('purgeExpiredThreadState', () => {
   });
 });
 
-describe('purgeTenant — Track C signal tables', () => {
-  it('reaps notifications + thread-state by the salted thread_id range, exactly one tenant', async () => {
-    // #given — two tenants' rows keyed by salted threadIds (same suffix)
-    const sqlite = openSqlite();
-    await signalDb(sqlite);
-    seedNotification(sqlite, {
-      id: 'abc-n1',
-      threadId: 'abc_t1',
-      status: 'pending',
-      updatedAt: NOW,
-    });
-    seedNotification(sqlite, {
-      id: 'xyz-n1',
-      threadId: 'xyz_t1',
-      status: 'pending',
-      updatedAt: NOW,
-    });
-    seedThreadState(sqlite, {
-      threadId: 'abc_t1',
-      type: 'goal',
-      updatedAt: NOW,
-    });
-    seedThreadState(sqlite, {
-      threadId: 'xyz_t1',
-      type: 'goal',
-      updatedAt: NOW,
-    });
-    // A prefix-neighbor ('abc5') that must NOT fall in the 'abc' range.
-    seedNotification(sqlite, {
-      id: 'abc5-n1',
-      threadId: 'abc5_t1',
-      status: 'pending',
-      updatedAt: NOW,
-    });
-
-    // #when — offboard exactly 'abc'
-    const purged = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
-
-    // #then — abc's rows only; the counters name them; xyz + abc5 survive.
-    expect(purged.notifications).toBe(1);
-    expect(purged.threadState).toBe(1);
-    const notifIds = (
-      sqlite
-        .prepare('SELECT id FROM mastra_notifications ORDER BY id')
-        .all() as { id: string }[]
-    ).map((r) => r.id);
-    expect(notifIds).toEqual(['abc5-n1', 'xyz-n1']);
-    const stateThreads = (
-      sqlite.prepare('SELECT thread_id FROM mastra_thread_state').all() as {
-        thread_id: string;
-      }[]
-    ).map((r) => r.thread_id);
-    expect(stateThreads).toEqual(['xyz_t1']);
-  });
-
-  it('purgeTenant reaps a tenant’s schedules + trigger history by metadata.tenantId, sparing others', async () => {
-    // #given — two tenants' schedules + trigger rows in the flowsafe-owned Track
-    // D tables. Their ids are slugified (schedule_<x>), NOT tenant-salted, so the
-    // range predicate cannot reach them — the metadata-filter is what does.
-    const sqlite = openSqlite();
-    const store = new D1SchedulesStorage(
-      d1DatabaseLike(sqlite) as unknown as ScheduleDatabase,
-    );
-    const seed = async (tenantId: string, id: string) => {
-      await store.createSchedule({
-        id,
-        target: { type: 'workflow', workflowId: 'wf' },
-        cron: '* * * * *',
-        status: 'active',
-        nextFireAt: NOW,
-        createdAt: NOW,
-        updatedAt: NOW,
-        metadata: { tenantId },
-      });
-      await store.recordTrigger({
-        scheduleId: id,
-        runId: `${tenantId}_r1`,
-        scheduledFireAt: NOW,
-        actualFireAt: NOW,
-        outcome: 'published',
-        metadata: { tenantId },
-      });
-    };
-    await seed('abc', 'schedule_a');
-    await seed('xyz', 'schedule_x');
-
-    // #when — offboard exactly 'abc'
-    const purged = await purgeTenant(d1Like(sqlite), { tenantId: 'abc' });
-
-    // #then — abc's schedule + its one trigger left; the counters name them; xyz
-    // survives, proving the metadata filter is exact (not a substring match).
-    expect(purged.schedules).toBe(1);
-    expect(purged.scheduleTriggers).toBe(1);
-    const scheduleIds = (
-      sqlite.prepare('SELECT id FROM mastra_schedules').all() as {
-        id: string;
-      }[]
-    ).map((r) => r.id);
-    expect(scheduleIds).toEqual(['schedule_x']);
-    const triggerTenants = (
-      sqlite
-        .prepare(
-          "SELECT json_extract(metadata,'$.tenantId') AS t FROM mastra_schedule_triggers",
-        )
-        .all() as { t: string }[]
-    ).map((r) => r.t);
-    expect(triggerTenants).toEqual(['xyz']);
-  });
-
+describe('purgeExpiredScheduleTriggers', () => {
   it('purgeExpiredScheduleTriggers reaps trigger rows past the actualFireAt TTL, keeping recent ones (numeric compare)', async () => {
     // #given — one old + one recent trigger. actualFireAt is INTEGER ms-epoch, so
     // the TTL is a NUMERIC comparison (not the ISO-text bet the other purges take).
     const sqlite = openSqlite();
     const store = new D1SchedulesStorage(
-      d1DatabaseLike(sqlite) as unknown as ScheduleDatabase,
+      sqliteUnitDatabase(sqlite) as unknown as ScheduleDatabase,
     );
     await store.createSchedule({
       id: 'schedule_a',
@@ -2063,7 +1476,7 @@ describe('purgeTenant — Track C signal tables', () => {
       nextFireAt: NOW,
       createdAt: NOW,
       updatedAt: NOW,
-      metadata: { tenantId: 'abc' },
+      metadata: {},
     });
     await store.recordTrigger({
       id: 'old',
@@ -2072,7 +1485,16 @@ describe('purgeTenant — Track C signal tables', () => {
       scheduledFireAt: NOW - 10 * DAY_MS,
       actualFireAt: NOW - 10 * DAY_MS,
       outcome: 'published',
-      metadata: { tenantId: 'abc' },
+      metadata: {},
+    });
+    await store.recordTrigger({
+      id: 'old-deferred',
+      scheduleId: 'schedule_a',
+      runId: 'abc_pending',
+      scheduledFireAt: NOW - 10 * DAY_MS,
+      actualFireAt: NOW - 10 * DAY_MS,
+      outcome: 'deferred',
+      metadata: { reason: 'dispatch-indeterminate' },
     });
     await store.recordTrigger({
       id: 'recent',
@@ -2081,7 +1503,7 @@ describe('purgeTenant — Track C signal tables', () => {
       scheduledFireAt: NOW - 1000,
       actualFireAt: NOW - 1000,
       outcome: 'published',
-      metadata: { tenantId: 'abc' },
+      metadata: {},
     });
 
     // #when — a 7-day window at NOW
@@ -2097,7 +1519,73 @@ describe('purgeTenant — Track C signal tables', () => {
         id: string;
       }[]
     ).map((r) => r.id);
-    expect(ids).toEqual(['recent']);
+    expect(ids).toEqual(['old-deferred', 'recent']);
+  });
+
+  it('retains an old deferred row until it can finalize a pending schedule deletion', async () => {
+    const sqlite = openSqlite();
+    const store = new D1SchedulesStorage(
+      sqliteUnitDatabase(sqlite) as unknown as ScheduleDatabase,
+    );
+    await store.createOwnedSchedule(
+      scheduleWithCreatorRole(
+        {
+          id: 'schedule_pending_delete',
+          target: { type: 'workflow', workflowId: 'wf' },
+          cron: '* * * * *',
+          status: 'active',
+          nextFireAt: NOW,
+          createdAt: NOW,
+          updatedAt: NOW,
+          metadata: {},
+        },
+        'operator',
+      ),
+      { kind: 'human', id: 'operator-1' },
+      100,
+    );
+    const deferred = {
+      id: 'old-deferred',
+      scheduleId: 'schedule_pending_delete',
+      runId: 'abc_pending',
+      scheduledFireAt: NOW - 10 * DAY_MS,
+      actualFireAt: NOW - 10 * DAY_MS,
+      outcome: 'deferred' as const,
+      metadata: { reason: 'dispatch-indeterminate' },
+    };
+    await store.recordTrigger(deferred);
+    await expect(
+      store.deleteOwnedSchedule('schedule_pending_delete'),
+    ).resolves.toBe('pending');
+
+    await expect(
+      purgeExpiredScheduleTriggers(d1Like(sqlite), {
+        ttlMs: 7 * DAY_MS,
+        now: () => NOW,
+      }),
+    ).resolves.toBe(0);
+    expect(
+      sqlite
+        .prepare('SELECT COUNT(*) AS count FROM mastra_schedule_triggers')
+        .get(),
+    ).toEqual({ count: 1 });
+
+    await store.recordTrigger({
+      ...deferred,
+      outcome: 'failed',
+      error: 'target absent',
+    });
+    expect(
+      sqlite.prepare('SELECT COUNT(*) AS count FROM mastra_schedules').get(),
+    ).toEqual({ count: 0 });
+    expect(
+      sqlite
+        .prepare(
+          `SELECT COUNT(*) AS count FROM ${RESOURCE_OWNERSHIP_TABLE}
+           WHERE resource_kind = 'schedule'`,
+        )
+        .get(),
+    ).toEqual({ count: 0 });
   });
 
   it('purgeExpiredScheduleTriggers reads a missing trigger table as zero', async () => {

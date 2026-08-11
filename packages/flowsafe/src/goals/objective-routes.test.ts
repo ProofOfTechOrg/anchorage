@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // The goal objective HTTP surface (createObjectiveRouter): the P6-lite gate ORDER
-// (401 -> role -> ownership -> size/body/field/cap -> audit -> persist), each
+// (401 -> ownership -> role -> size/body/field/cap -> audit -> persist), each
 // fail-closed, plus the set/get/update/clear round-trip (byte-identical to core's
 // Agent goal methods), the maxRuns host cap, and the GOAL_REQUEST_CONTEXT_KEY
 // no-collision reservation — over mock resolve + store seams.
 
 import { describe, expect, it, vi } from 'vitest';
 
-import type { ApprovalActor, TenantContext } from '../approval-api/index.js';
+import type { ActorContext, ApprovalActor } from '../approval-api/index.js';
 import {
   BREAKWATER_ACTOR_KEY,
   BREAKWATER_CONNECTOR_EXECUTION_KEY,
@@ -15,25 +15,50 @@ import {
   BREAKWATER_ISOLATION_SCOPE_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
 } from '../do-runner/breakwater-keys.js';
+import { RunRouteError } from '../host-kit/index.js';
 import {
-  createObjectiveRouter,
+  createObjectiveRouter as createObjectiveRouterImpl,
   GOAL_REQUEST_CONTEXT_KEY,
   type ObjectiveAuditEvent,
+  type ObjectiveRouterOptions,
   type ObjectiveStore,
 } from './objective-routes.js';
 
 const OWNED_THREAD = 'acme_t1';
 
-function tenantCtx(
+function createObjectiveRouter(
+  options: Omit<ObjectiveRouterOptions, 'validateThreadTarget'> &
+    Partial<Pick<ObjectiveRouterOptions, 'validateThreadTarget'>>,
+) {
+  return createObjectiveRouterImpl({
+    ...options,
+    validateThreadTarget:
+      options.validateThreadTarget ?? (async () => undefined),
+  });
+}
+
+function actorContext(
   role: ApprovalActor['role'],
   ownedThread = OWNED_THREAD,
-): TenantContext {
-  const actor: ApprovalActor = { id: 'opal', role, tenantId: 'acme' };
+): ActorContext {
+  const actor: ApprovalActor = { id: 'opal', role };
   return {
     actor,
-    tenantId: 'acme',
-    ownsMemoryId: (id: string) => id === ownedThread,
-  } as unknown as TenantContext;
+    principal: { kind: 'human', id: actor.id, role },
+    resourceOwner: { kind: 'human', id: actor.id },
+    service: () => {
+      throw new Error('unused');
+    },
+    newRunId: () => 'run-1',
+    newThreadId: () => ownedThread,
+    resourceIdFromKey: (key) => key,
+    claimResource: async () => undefined,
+    releaseResource: async () => undefined,
+    resourceOwnerFor: async () => undefined,
+    canAccessResource: async (kind, id) =>
+      kind === 'thread' && id === ownedThread,
+    canSelfDecide: () => false,
+  };
 }
 
 /** A minimal in-memory ObjectiveStore keyed by (threadId, type). */
@@ -94,7 +119,7 @@ describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
     const { store } = memoryStore();
     expect(() =>
       createObjectiveRouter({
-        resolve: async () => tenantCtx('operator'),
+        resolve: async () => actorContext('operator'),
         store,
         ...numeric,
       }),
@@ -104,7 +129,7 @@ describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
   it('accepts a zero body cap and rejects a non-empty mutation body', async () => {
     const { store } = memoryStore();
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       store,
       maxContentBytes: 0,
     });
@@ -117,7 +142,7 @@ describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
   it('returns null for a non-goal path (composes ahead of others)', async () => {
     const { store } = memoryStore();
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       store,
     });
     expect(await router(new Request('http://host/workflows'))).toBeNull();
@@ -134,7 +159,7 @@ describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
     // out of the handler BEFORE auth; safeDecodeSegment makes it route-absent.
     const { store, raw } = memoryStore();
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       store,
     });
     const res = await router(
@@ -150,7 +175,7 @@ describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
   it('405 for an unsupported method on the goal path', async () => {
     const { store } = memoryStore();
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       store,
     });
     const res = await router(req('POST', OWNED_THREAD, { objective: 'x' }));
@@ -173,11 +198,59 @@ describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
     expect(events).toHaveLength(0);
   });
 
+  it('returns the committed objective when the accepted audit sink fails', async () => {
+    const { store, raw } = memoryStore();
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const router = createObjectiveRouter({
+      resolve: async () => actorContext('operator'),
+      store,
+      audit: async () => {
+        throw new Error('audit unavailable');
+      },
+    });
+
+    const response = await router(
+      req('PUT', OWNED_THREAD, { objective: 'ship it' }),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(raw.size).toBe(1);
+    expect(await response?.json()).toMatchObject({
+      objective: { objective: 'ship it' },
+    });
+    expect(logged).toHaveBeenCalledWith(
+      expect.stringContaining('goal.objective-audit-error'),
+    );
+    logged.mockRestore();
+  });
+
+  it('refuses to attach a standing objective to an unbound ephemeral thread', async () => {
+    const { store, raw } = memoryStore();
+    const validateThreadTarget = vi.fn(async () => {
+      throw new RunRouteError(404, 'agent not found');
+    });
+    const router = createObjectiveRouter({
+      resolve: async () => actorContext('operator'),
+      store,
+      validateThreadTarget,
+    });
+
+    const response = await router(
+      req('PUT', OWNED_THREAD, { objective: 'orphan me' }),
+    );
+
+    expect(response?.status).toBe(404);
+    expect(validateThreadTarget).toHaveBeenCalledWith(expect.anything(), {
+      threadId: OWNED_THREAD,
+    });
+    expect(raw.size).toBe(0);
+  });
+
   it('403 for a read-only role on a WRITE, and audits the rejection', async () => {
     const { store, raw } = memoryStore();
     const events: ObjectiveAuditEvent[] = [];
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('viewer'),
+      resolve: async () => actorContext('viewer'),
       store,
       audit: (e) => {
         events.push(e);
@@ -192,7 +265,6 @@ describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
         operation: 'set',
         outcome: 'rejected',
         reason: 'forbidden-role',
-        tenantId: 'acme',
         actorId: 'opal',
         threadId: OWNED_THREAD,
       }),
@@ -202,7 +274,7 @@ describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
   it('allows a read-only role to READ its own thread (reads are not role-gated)', async () => {
     const { store } = memoryStore();
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('viewer'),
+      resolve: async () => actorContext('viewer'),
       store,
     });
     const res = await router(req('GET', OWNED_THREAD));
@@ -210,11 +282,11 @@ describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
     expect(await res?.json()).toEqual({ objective: null });
   });
 
-  it('404 for a foreign threadId (no existence oracle) and audits the probe', async () => {
+  it('404s and audits a path-safe thread owned by another actor', async () => {
     const { store, raw } = memoryStore();
     const events: ObjectiveAuditEvent[] = [];
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       store,
       audit: (e) => {
         events.push(e);
@@ -226,7 +298,7 @@ describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
     expect(events).toEqual([
       expect.objectContaining({
         outcome: 'rejected',
-        reason: 'foreign-thread',
+        reason: 'invalid-thread',
         threadId: 'other_t9',
       }),
     ]);
@@ -236,7 +308,7 @@ describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
     const { store, raw } = memoryStore();
     const events: ObjectiveAuditEvent[] = [];
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       store,
       audit: (e) => {
         events.push(e);
@@ -260,7 +332,7 @@ describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
     const { store } = memoryStore();
     const events: ObjectiveAuditEvent[] = [];
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       store,
       maxContentBytes: 64,
       audit: (e) => {
@@ -278,7 +350,7 @@ describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
     const { store } = memoryStore();
     const events: ObjectiveAuditEvent[] = [];
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       store,
       audit: (e) => {
         events.push(e);
@@ -297,7 +369,7 @@ describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
   it('400 when objective is missing or blank on set', async () => {
     const { store } = memoryStore();
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       store,
     });
     expect((await router(req('PUT', OWNED_THREAD, {})))?.status).toBe(400);
@@ -312,7 +384,7 @@ describe('createObjectiveRouter — maxRuns host cap (DL-007)', () => {
     const { store, raw } = memoryStore();
     const events: ObjectiveAuditEvent[] = [];
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       store,
       maxRunsCap: 10,
       audit: (e) => {
@@ -330,7 +402,7 @@ describe('createObjectiveRouter — maxRuns host cap (DL-007)', () => {
   it('defaults the cap to the core DEFAULT_GOAL_MAX_RUNS (50)', async () => {
     const { store } = memoryStore();
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       store,
     });
     // 50 is allowed (== core default); 51 is not.
@@ -347,7 +419,7 @@ describe('createObjectiveRouter — maxRuns host cap (DL-007)', () => {
   it('rejects a non-positive-integer maxRuns', async () => {
     const { store } = memoryStore();
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       store,
     });
     expect(
@@ -363,7 +435,7 @@ describe('createObjectiveRouter — maxRuns host cap (DL-007)', () => {
   it('rejects a whitespace-only judgeModelId but keeps prompt whitespace', async () => {
     const { store, raw } = memoryStore();
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       store,
     });
     // judgeModelId is an identifier — blank would persist and only fail later
@@ -390,7 +462,7 @@ describe('createObjectiveRouter — set / get / update / clear round-trip', () =
     const { store } = memoryStore();
     const audit = vi.fn();
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       store,
       audit,
     });
@@ -425,7 +497,7 @@ describe('createObjectiveRouter — set / get / update / clear round-trip', () =
   it('get returns the stored record, then null after clear', async () => {
     const { store } = memoryStore();
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       store,
     });
     await router(req('PUT', OWNED_THREAD, { objective: 'goal one' }));
@@ -450,7 +522,7 @@ describe('createObjectiveRouter — set / get / update / clear round-trip', () =
   it('update merges options, preserves runsUsed/startedAt/id, and bumps updatedAt', async () => {
     const { store } = memoryStore();
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       store,
     });
     const setRes = await router(
@@ -482,7 +554,7 @@ describe('createObjectiveRouter — set / get / update / clear round-trip', () =
   it('update refuses to change the prose (objective is not an update field)', async () => {
     const { store } = memoryStore();
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       store,
     });
     await router(req('PUT', OWNED_THREAD, { objective: 'original' }));
@@ -496,7 +568,7 @@ describe('createObjectiveRouter — set / get / update / clear round-trip', () =
     const { store } = memoryStore();
     const events: ObjectiveAuditEvent[] = [];
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       store,
       audit: (e) => {
         events.push(e);
@@ -511,7 +583,7 @@ describe('createObjectiveRouter — set / get / update / clear round-trip', () =
     const { store } = memoryStore();
     const events: ObjectiveAuditEvent[] = [];
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('viewer'),
+      resolve: async () => actorContext('viewer'),
       store,
       audit: (e) => {
         events.push(e);
@@ -600,7 +672,7 @@ describe('createObjectiveRouter internal errors', () => {
       logged.push(String(value));
     });
     const router = createObjectiveRouter({
-      resolve: async () => tenantCtx('operator'),
+      resolve: async () => actorContext('operator'),
       store: {
         getState: async () => {
           throw new Error('private objective store detail');

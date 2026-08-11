@@ -1,9 +1,14 @@
 {
   "$schema": "https://unpkg.com/wrangler/config-schema.json",
-  "name": "anchorage-agent-starter",
+  // Replace `replace-me` with the deployment tag. A unique script name gives
+  // each organization fresh Durable Object namespaces.
+  "name": "anchorage-agent-starter-replace-me",
   "main": "./src/worker.ts",
   "compatibility_date": "2026-07-26",
   "compatibility_flags": ["nodejs_compat"],
+  "secrets": {
+    "required": ["DEPLOYMENT_IDENTITY_SECRET", "MAINTENANCE_ADMIN_SECRET"]
+  },
   "observability": {
     "enabled": true,
     "logs": {
@@ -14,6 +19,7 @@
   "durable_objects": {
     "bindings": [
       { "name": "RUNNER", "class_name": "StarterRunner" },
+      { "name": "MAINTENANCE", "class_name": "StarterMaintenance" },
       { "name": "HUB", "class_name": "StarterHub" },
       { "name": "THREAD", "class_name": "StarterThread" },
       {
@@ -28,6 +34,10 @@
   },
   "exports": {
     "StarterRunner": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "StarterMaintenance": {
       "type": "durable-object",
       "storage": "sqlite"
     },
@@ -51,14 +61,16 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "anchorage-agent-starter",
+      "database_name": "anchorage-agent-starter-replace-me",
       "database_id": "REPLACE_WITH_D1_DATABASE_ID"
     }
   ],
-  "triggers": {
-    "crons": ["*/5 * * * *", "17 * * * *", "* * * * *"]
-  },
+  // Before deployment, set distinct internal credentials with
+  // `wrangler secret put DEPLOYMENT_IDENTITY_SECRET` and
+  // `wrangler secret put MAINTENANCE_ADMIN_SECRET`.
   "vars": {
+    // Deliberately invalid until provisioning replaces it with a lowercase tag.
+    "DEPLOYMENT_TENANT": "REPLACE_WITH_DEPLOYMENT_TAG",
     "AUTH_JWT_ISSUER": "anchorage-agent-starter",
     "AUTH_JWT_AUDIENCE": "anchorage-agent-starter-api",
     "MODEL_ID": "provider/model",
@@ -70,7 +82,6 @@
     "THREAD_STATE_RETENTION_DAYS": "90",
     "SCHEDULE_TRIGGER_RETENTION_DAYS": "30",
     "SIGNAL_ATTRIBUTE_ALLOWLIST": "source,kind,priority,resource,action",
-    "GITHUB_RESOURCE_ALLOWLIST": "{}",
-    "TENANT_APEX_DOMAIN": ""
+    "GITHUB_RESOURCE_ALLOWLIST": "[]"
   }
 }

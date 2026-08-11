@@ -11,25 +11,90 @@ import type {
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  type ActorContext,
+  ActorResolutionError,
+  type ActorResolver,
   type ApprovalRole,
-  type TenantContext,
-  TenantResolutionError,
-  type TenantResolver,
+  type ResourceOwner,
 } from '../approval-api/index.js';
+import { RunRouteError } from '../host-kit/index.js';
 import {
-  createScheduleRouter,
+  createScheduleRouter as createScheduleRouterImpl,
   type ScheduleFacadeStore,
   type ScheduleRouteAuditEvent,
+  type ScheduleRouterOptions,
 } from './router.js';
+import type { ScheduleTargetPolicy } from './target-policy.js';
+import { createScheduleTargetPolicy } from './target-policy.js';
+
+const TARGET_POLICY = createScheduleTargetPolicy({
+  workflows: [{ id: 'wf' }],
+  agents: [
+    {
+      id: 'a1',
+      allowedAutomation: [{ kind: 'system', entryPaths: ['schedule.fire'] }],
+    },
+  ],
+});
+
+describe('schedule target policy catalog', () => {
+  it.each([
+    ['workflow', { workflows: [{ id: 'wf' }, { id: 'wf' }], agents: [] }],
+    ['agent', { workflows: [], agents: [{ id: 'a1' }, { id: 'a1' }] }],
+  ] as const)('rejects duplicate %s ids', (kind, options) => {
+    expect(() => createScheduleTargetPolicy(options)).toThrow(
+      `duplicate ${kind} target id`,
+    );
+  });
+
+  it.each([
+    ['workflow', { workflows: [{ id: 'wf/unsafe' }], agents: [] }],
+    [
+      'agent',
+      {
+        workflows: [],
+        agents: [{ id: 123 as unknown as string }],
+      },
+    ],
+  ] as const)('rejects non-path-safe %s ids', (kind, options) => {
+    expect(() => createScheduleTargetPolicy(options)).toThrow(
+      `${kind} target id must be path-safe`,
+    );
+  });
+});
+
+function createScheduleRouter(
+  options: Omit<
+    ScheduleRouterOptions,
+    'targetPolicy' | 'validateThreadTarget'
+  > & {
+    targetPolicy?: ScheduleTargetPolicy;
+    validateThreadTarget?: ScheduleRouterOptions['validateThreadTarget'];
+  },
+) {
+  return createScheduleRouterImpl({
+    ...options,
+    targetPolicy: options.targetPolicy ?? TARGET_POLICY,
+    validateThreadTarget:
+      options.validateThreadTarget ?? (async () => undefined),
+  });
+}
 
 /** An in-memory facade store. */
 class MemStore implements ScheduleFacadeStore {
   readonly m = new Map<string, Schedule>();
+  readonly owners = new Map<string, ResourceOwner>();
   readonly triggers: ScheduleTrigger[] = [];
 
-  async createSchedule(schedule: Schedule): Promise<Schedule> {
+  async createOwnedSchedule(
+    schedule: Schedule,
+    owner: ResourceOwner,
+    maxSchedules: number,
+  ): Promise<Schedule | null> {
+    if (this.m.size >= maxSchedules) return null;
     if (this.m.has(schedule.id)) throw new Error('exists');
     this.m.set(schedule.id, schedule);
+    this.owners.set(schedule.id, owner);
     return schedule;
   }
   async getSchedule(id: string): Promise<Schedule | null> {
@@ -45,24 +110,45 @@ class MemStore implements ScheduleFacadeStore {
     this.m.set(id, next);
     return next;
   }
-  async deleteSchedule(id: string): Promise<void> {
+  async deleteOwnedSchedule(id: string): Promise<'deleted' | 'pending'> {
     this.m.delete(id);
+    this.owners.delete(id);
+    return 'deleted';
   }
   async listTriggers(scheduleId: string): Promise<ScheduleTrigger[]> {
     return this.triggers.filter((t) => t.scheduleId === scheduleId);
   }
 }
 
-function ctx(tenantId: string, role: ApprovalRole): TenantContext {
+function ctx(
+  actorLabel: string,
+  role: ApprovalRole,
+  canAccess: ActorContext['canAccessResource'] = async () => true,
+  releaseResource: ActorContext['releaseResource'] = async () => undefined,
+): ActorContext {
   return {
-    tenantId,
-    actor: { id: `${role}-1`, role, tenantId },
-    ownsMemoryId: (id: string) => id.startsWith(`${tenantId}_`),
-  } as unknown as TenantContext;
+    actor: { id: `${role}-${actorLabel}`, role },
+    principal: { kind: 'human', id: `${role}-${actorLabel}`, role },
+    resourceOwner: { kind: 'human', id: `${role}-${actorLabel}` },
+    service: () => {
+      throw new Error('approval service is not used in schedule tests');
+    },
+    newRunId: () => `run-${actorLabel}`,
+    newThreadId: () => `thread-${actorLabel}`,
+    resourceIdFromKey: (key) => key,
+    claimResource: async () => undefined,
+    releaseResource,
+    resourceOwnerFor: async () => ({
+      kind: 'human',
+      id: `${role}-${actorLabel}`,
+    }),
+    canAccessResource: canAccess,
+    canSelfDecide: () => false,
+  };
 }
 
-function resolveAs(tenant: TenantContext | undefined): TenantResolver {
-  return async () => tenant;
+function resolveAs(context: ActorContext | undefined): ActorResolver {
+  return async () => context;
 }
 
 interface Harness {
@@ -76,30 +162,41 @@ interface Harness {
 }
 
 function harness(
-  tenant: TenantContext | undefined,
+  context: ActorContext | undefined,
   overrides: {
-    resolve?: TenantResolver;
-    maxSchedulesPerTenant?: number;
+    resolve?: ActorResolver;
+    maxSchedules?: number;
     minFireIntervalMs?: number;
     maxContentBytes?: number;
+    targetPolicy?: ScheduleTargetPolicy;
+    audit?: ScheduleRouterOptions['audit'];
+    validateThreadTarget?: ScheduleRouterOptions['validateThreadTarget'];
   } = {},
 ): Harness {
   const store = new MemStore();
   const events: ScheduleRouteAuditEvent[] = [];
   const router = createScheduleRouter({
-    resolve: overrides.resolve ?? resolveAs(tenant),
+    resolve: overrides.resolve ?? resolveAs(context),
     store,
-    audit: (e) => {
-      events.push(e);
-    },
-    ...(overrides.maxSchedulesPerTenant !== undefined
-      ? { maxSchedulesPerTenant: overrides.maxSchedulesPerTenant }
+    audit:
+      overrides.audit ??
+      ((e) => {
+        events.push(e);
+      }),
+    ...(overrides.maxSchedules !== undefined
+      ? { maxSchedules: overrides.maxSchedules }
       : {}),
     ...(overrides.minFireIntervalMs !== undefined
       ? { minFireIntervalMs: overrides.minFireIntervalMs }
       : {}),
     ...(overrides.maxContentBytes !== undefined
       ? { maxContentBytes: overrides.maxContentBytes }
+      : {}),
+    ...(overrides.targetPolicy !== undefined
+      ? { targetPolicy: overrides.targetPolicy }
+      : {}),
+    ...(overrides.validateThreadTarget !== undefined
+      ? { validateThreadTarget: overrides.validateThreadTarget }
       : {}),
   });
   const call = async (method: string, path: string, body?: unknown) => {
@@ -160,10 +257,10 @@ describe('createScheduleRouter — gate order', () => {
     expect(events).toEqual([]);
   });
 
-  it('403s a pre-auth resolver throw (TenantResolutionError), not audited', async () => {
+  it('403s a pre-auth resolver throw (ActorResolutionError), not audited', async () => {
     const { call, events } = harness(undefined, {
       resolve: async () => {
-        throw new TenantResolutionError('bad token');
+        throw new ActorResolutionError('bad token');
       },
     });
     const res = await call('POST', '/api/schedules', WORKFLOW_CREATE);
@@ -193,19 +290,38 @@ describe('createScheduleRouter — gate order', () => {
 });
 
 describe('createScheduleRouter — create', () => {
-  it('creates a workflow schedule with a server-minted id + stamped tenant, audited accepted', async () => {
+  it('creates a deployment schedule with a server-minted id, audited accepted', async () => {
     const { call, store, events } = harness(ctx('acme', 'operator'));
     const res = await call('POST', '/api/schedules', WORKFLOW_CREATE);
     expect(res.status).toBe(201);
     const schedule = res.body.schedule as { id: string; workflowId: string };
     expect(schedule.id).toMatch(/^schedule_[0-9a-f]{8}-/);
     expect(schedule.workflowId).toBe('wf');
-    // the persisted row carries the SERVER tenant, never a client value
     const stored = store.m.get(schedule.id);
-    expect((stored?.metadata as { tenantId: string }).tenantId).toBe('acme');
+    expect(stored?.metadata).toBeUndefined();
     expect(events).toContainEqual(
       expect.objectContaining({ operation: 'create', outcome: 'accepted' }),
     );
+  });
+
+  it('returns the committed schedule when the accepted audit sink fails', async () => {
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { call, store } = harness(ctx('acme', 'operator'), {
+      audit: async () => {
+        throw new Error('audit unavailable');
+      },
+    });
+
+    const result = await call('POST', '/api/schedules', WORKFLOW_CREATE);
+
+    expect(result.status).toBe(201);
+    const schedule = result.body.schedule as { id: string };
+    expect(store.m.has(schedule.id)).toBe(true);
+    expect(store.owners.has(schedule.id)).toBe(true);
+    expect(logged).toHaveBeenCalledWith(
+      expect.stringContaining('schedule.route-audit-error'),
+    );
+    logged.mockRestore();
   });
 
   it('creates an agent schedule with the agent_ prefix (CRUD ships; firing is guarded off in the tick)', async () => {
@@ -217,6 +333,110 @@ describe('createScheduleRouter — create', () => {
     });
     expect(res.status).toBe(201);
     expect((res.body.schedule as { id: string }).id).toMatch(/^agent_/);
+  });
+
+  it('rejects an unknown target before creating either domain or owner state', async () => {
+    const { call, store, events } = harness(ctx('acme', 'operator'));
+
+    const res = await call('POST', '/api/schedules', {
+      ...WORKFLOW_CREATE,
+      workflowId: 'missing-workflow',
+    });
+
+    expect(res.status).toBe(404);
+    expect(store.m.size).toBe(0);
+    expect(store.owners.size).toBe(0);
+    expect(events).toContainEqual(
+      expect.objectContaining({ reason: 'unknown-target' }),
+    );
+  });
+
+  it('rejects a creator whose role is forbidden by the workflow catalog', async () => {
+    const policy = createScheduleTargetPolicy({
+      workflows: [{ id: 'wf', allowedRoles: ['admin'] }],
+      agents: [],
+    });
+    const { call, store, events } = harness(ctx('acme', 'operator'), {
+      targetPolicy: policy,
+    });
+
+    const res = await call('POST', '/api/schedules', WORKFLOW_CREATE);
+
+    expect(res.status).toBe(403);
+    expect(store.m.size).toBe(0);
+    expect(store.owners.size).toBe(0);
+    expect(events).toContainEqual(
+      expect.objectContaining({ reason: 'target-role-forbidden' }),
+    );
+  });
+
+  it('rejects an agent that has not allowed schedule automation', async () => {
+    const policy = createScheduleTargetPolicy({
+      workflows: [],
+      agents: [{ id: 'a1' }],
+    });
+    const { call, store, events } = harness(ctx('acme', 'operator'), {
+      targetPolicy: policy,
+    });
+
+    const res = await call('POST', '/api/schedules', {
+      agentId: 'a1',
+      prompt: 'go',
+      cron: '*/5 * * * *',
+    });
+
+    expect(res.status).toBe(403);
+    expect(store.m.size).toBe(0);
+    expect(store.owners.size).toBe(0);
+    expect(events).toContainEqual(
+      expect.objectContaining({ reason: 'automation-forbidden' }),
+    );
+  });
+
+  it('rejects a threaded target owned by a different principal before create', async () => {
+    const context: ActorContext = {
+      ...ctx('admin', 'admin'),
+      resourceOwnerFor: async () => ({ kind: 'human', id: 'other-user' }),
+    };
+    const { call, store } = harness(context);
+
+    const res = await call('POST', '/api/schedules', {
+      agentId: 'a1',
+      prompt: 'go',
+      cron: '*/5 * * * *',
+      threadId: 'thread-foreign',
+      resourceId: 'resource-foreign',
+    });
+
+    expect(res.status).toBe(404);
+    expect(store.m.size).toBe(0);
+    expect(store.owners.size).toBe(0);
+  });
+
+  it('refuses to attach a schedule to an owned but unbound ephemeral thread', async () => {
+    const validateThreadTarget = vi.fn(async () => {
+      throw new RunRouteError(404, 'agent not found');
+    });
+    const { call, store } = harness(ctx('acme', 'operator'), {
+      validateThreadTarget,
+    });
+
+    const response = await call('POST', '/api/schedules', {
+      agentId: 'a1',
+      prompt: 'go',
+      cron: '*/5 * * * *',
+      threadId: 'acme_thread',
+      resourceId: 'acme_resource',
+    });
+
+    expect(response.status).toBe(404);
+    expect(validateThreadTarget).toHaveBeenCalledWith(expect.anything(), {
+      agentId: 'a1',
+      threadId: 'acme_thread',
+      resourceId: 'acme_resource',
+    });
+    expect(store.m.size).toBe(0);
+    expect(store.owners.size).toBe(0);
   });
 
   it('normalizes a valid threaded agent target and strips unsupported nested fields', async () => {
@@ -271,7 +491,7 @@ describe('createScheduleRouter — create', () => {
     expect(res.body.error).toContain(expectedField);
   });
 
-  it('requires both owned memory ids for a threaded agent schedule', async () => {
+  it('requires both path-safe memory ids for a threaded agent schedule', async () => {
     const { call, events } = harness(ctx('acme', 'operator'));
     expect(
       (
@@ -283,16 +503,16 @@ describe('createScheduleRouter — create', () => {
         })
       ).status,
     ).toBe(400);
-    const foreign = await call('POST', '/api/schedules', {
+    const pathSafe = await call('POST', '/api/schedules', {
       agentId: 'a1',
       prompt: 'go',
       cron: '*/5 * * * *',
       threadId: 'acme_thread',
       resourceId: 'other_resource',
     });
-    expect(foreign.status).toBe(404);
+    expect(pathSafe.status).toBe(201);
     expect(events).toContainEqual(
-      expect.objectContaining({ reason: 'foreign-memory-id' }),
+      expect.objectContaining({ operation: 'create', outcome: 'accepted' }),
     );
   });
 
@@ -314,15 +534,15 @@ describe('createScheduleRouter — create', () => {
     expect(metadata.body.error).toMatch(/metadata/);
   });
 
-  it('a client-supplied metadata.tenantId cannot override the server tenant', async () => {
+  it('preserves client metadata without adding a retired tenant stamp', async () => {
     const { call, store } = harness(ctx('acme', 'operator'));
     const res = await call('POST', '/api/schedules', {
       ...WORKFLOW_CREATE,
-      metadata: { tenantId: 'evil', note: 'kept' },
+      metadata: { note: 'kept' },
     });
     const id = (res.body.schedule as { id: string }).id;
     const meta = store.m.get(id)?.metadata as Record<string, unknown>;
-    expect(meta.tenantId).toBe('acme');
+    expect(meta.tenantId).toBeUndefined();
     expect(meta.note).toBe('kept');
   });
 
@@ -396,9 +616,9 @@ describe('createScheduleRouter — create', () => {
     );
   });
 
-  it('400s at the per-tenant COUNT cap (DL-007)', async () => {
+  it('400s at the deployment COUNT cap (DL-007)', async () => {
     const { call, events } = harness(ctx('acme', 'operator'), {
-      maxSchedulesPerTenant: 1,
+      maxSchedules: 1,
     });
     expect((await call('POST', '/api/schedules', WORKFLOW_CREATE)).status).toBe(
       201,
@@ -421,74 +641,67 @@ describe('createScheduleRouter — create', () => {
   });
 });
 
-describe('createScheduleRouter — ownership (no oracle) + reads', () => {
+describe('createScheduleRouter — resource-scoped reads', () => {
   async function seedFor(
-    tenantId: string,
+    actorLabel: string,
   ): Promise<{ store: MemStore; id: string }> {
-    const h = harness(ctx(tenantId, 'operator'));
+    const h = harness(ctx(actorLabel, 'operator'));
     const res = await h.call('POST', '/api/schedules', WORKFLOW_CREATE);
     return { store: h.store, id: (res.body.schedule as { id: string }).id };
   }
 
-  it('404s a foreign schedule the SAME as a missing one (get/patch/delete/pause/resume/triggers)', async () => {
-    // acme owns a schedule; xyz addresses it
+  it('404s another operator before loading a schedule', async () => {
     const { store, id } = await seedFor('acme');
-    const events: ScheduleRouteAuditEvent[] = [];
     const router = createScheduleRouter({
-      resolve: resolveAs(ctx('xyz', 'operator')),
+      resolve: resolveAs(ctx('xyz', 'operator', async () => false)),
       store,
-      audit: (e) => {
-        events.push(e);
-      },
     });
-    const hit = async (method: string, suffix = '') => {
-      const res = await router(
-        new Request(`http://host/api/schedules/${id}${suffix}`, {
-          method,
-          ...(method === 'PATCH'
-            ? {
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ status: 'paused' }),
-              }
-            : {}),
-        }),
-      );
-      return res?.status;
-    };
-    expect(await hit('GET')).toBe(404);
-    expect(await hit('PATCH')).toBe(404);
-    expect(await hit('DELETE')).toBe(404);
-    expect(await hit('POST', '/pause')).toBe(404);
-    expect(await hit('POST', '/resume')).toBe(404);
-    expect(await hit('GET', '/triggers')).toBe(404);
-    // the cross-tenant probe was audited (a foreign PATCH), byte-identical to missing
-    expect(events).toContainEqual(
-      expect.objectContaining({
-        operation: 'update',
-        outcome: 'rejected',
-        reason: 'not-found',
-      }),
+    const response = await router(
+      new Request(`http://host/api/schedules/${id}`),
     );
+    expect(response?.status).toBe(404);
   });
 
-  it('list is tenant-filtered on metadata.tenantId', async () => {
-    // one shared store, two tenants each with a schedule
+  it('allows an explicitly authorized read-only actor to inspect a schedule', async () => {
+    const { store, id } = await seedFor('acme');
+    const router = createScheduleRouter({
+      resolve: resolveAs(ctx('review', 'viewer', async () => true)),
+      store,
+    });
+    const response = await router(
+      new Request(`http://host/api/schedules/${id}`),
+    );
+    expect(response?.status).toBe(200);
+  });
+
+  it('list filters out schedules the actor cannot read', async () => {
     const store = new MemStore();
-    const mk = (tenantId: string) =>
+    const mk = (context: ActorContext) =>
       createScheduleRouter({
-        resolve: resolveAs(ctx(tenantId, 'operator')),
+        resolve: resolveAs(context),
         store,
       });
-    for (const tenantId of ['acme', 'xyz']) {
-      await mk(tenantId)(
+    const ids: string[] = [];
+    for (const actorLabel of ['acme', 'xyz']) {
+      const created = await mk(ctx(actorLabel, 'operator'))(
         new Request('http://host/api/schedules', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify(WORKFLOW_CREATE),
         }),
       );
+      const body = (await created?.json()) as {
+        schedule: { id: string };
+      };
+      ids.push(body.schedule.id);
     }
-    const listed = await mk('acme')(new Request('http://host/api/schedules'));
+    const listed = await mk(
+      ctx(
+        'acme',
+        'operator',
+        async (kind, id) => kind === 'schedule' && id === ids[0],
+      ),
+    )(new Request('http://host/api/schedules'));
     const body = (await listed?.json()) as { schedules: unknown[] };
     expect(body.schedules).toHaveLength(1);
     expect(store.m.size).toBe(2);
@@ -506,8 +719,10 @@ describe('createScheduleRouter — ownership (no oracle) + reads', () => {
 });
 
 describe('createScheduleRouter — mutations', () => {
-  async function seed(): Promise<Harness & { id: string }> {
-    const h = harness(ctx('acme', 'operator'));
+  async function seed(
+    context: ActorContext = ctx('acme', 'operator'),
+  ): Promise<Harness & { id: string }> {
+    const h = harness(context);
     const created = await h.call('POST', '/api/schedules', WORKFLOW_CREATE);
     const id = (created.body.schedule as { id: string }).id;
     h.events.length = 0;
@@ -620,6 +835,33 @@ describe('createScheduleRouter — mutations', () => {
     expect(res.body.error).toMatch(/metadata/);
   });
 
+  it('revalidates a target-changing update against the stored creator role', async () => {
+    let allowed = true;
+    const policy: ScheduleTargetPolicy = {
+      authorize: () =>
+        allowed
+          ? { allowed: true }
+          : {
+              allowed: false,
+              status: 403,
+              reason: 'target-role-forbidden',
+            },
+    };
+    const { call, store } = harness(ctx('acme', 'operator'), {
+      targetPolicy: policy,
+    });
+    const created = await call('POST', '/api/schedules', WORKFLOW_CREATE);
+    const id = (created.body.schedule as { id: string }).id;
+    allowed = false;
+
+    const updated = await call('PATCH', `/api/schedules/${id}`, {
+      inputData: { changed: true },
+    });
+
+    expect(updated.status).toBe(403);
+    expect(store.m.get(id)?.target).toMatchObject({ workflowId: 'wf' });
+  });
+
   it('update 400s a non-string timezone (the create guard, now enforced on update too)', async () => {
     const { call, id } = await seed();
     const res = await call('PATCH', `/api/schedules/${id}`, { timezone: 123 });
@@ -632,9 +874,43 @@ describe('createScheduleRouter — mutations', () => {
     const res = await call('DELETE', `/api/schedules/${id}`);
     expect(res.status).toBe(200);
     expect(store.m.has(id)).toBe(false);
+    expect(store.owners.has(id)).toBe(false);
     expect(events).toContainEqual(
       expect.objectContaining({ operation: 'delete', outcome: 'accepted' }),
     );
+  });
+
+  it('a retry after domain deletion releases the remaining owner claim', async () => {
+    const { call, store, id } = await seed();
+    store.m.delete(id);
+
+    expect((await call('DELETE', `/api/schedules/${id}`)).status).toBe(200);
+    expect(store.owners.has(id)).toBe(false);
+  });
+
+  it('keeps a delete-requested schedule addressable until dispatch settles', async () => {
+    const { call, store, id } = await seed();
+    store.deleteOwnedSchedule = async () => 'pending';
+    store.triggers.push({
+      id: 'trigger-pending',
+      scheduleId: id,
+      runId: 'run-pending',
+      scheduledFireAt: 1,
+      actualFireAt: 1,
+      outcome: 'deferred',
+    });
+
+    const deleted = await call('DELETE', `/api/schedules/${id}`);
+    expect(deleted.status).toBe(202);
+    expect(deleted.body).toEqual({ ok: true, pending: true });
+    const history = await call('GET', `/api/schedules/${id}/triggers`);
+    expect(history.status).toBe(200);
+    expect(history.body.triggers).toEqual([
+      expect.objectContaining({
+        id: 'trigger-pending',
+        outcome: 'deferred',
+      }),
+    ]);
   });
 
   it('triggers returns the read-only history for an owned schedule', async () => {
@@ -654,9 +930,9 @@ describe('createScheduleRouter — mutations', () => {
 
 describe('createScheduleRouter — numeric configuration', () => {
   it.each([
-    [{ maxSchedulesPerTenant: -1 }],
-    [{ maxSchedulesPerTenant: Number.NaN }],
-    [{ maxSchedulesPerTenant: 1.5 }],
+    [{ maxSchedules: -1 }],
+    [{ maxSchedules: Number.NaN }],
+    [{ maxSchedules: 1.5 }],
     [{ maxContentBytes: Number.POSITIVE_INFINITY }],
     [{ maxContentBytes: Number.MAX_SAFE_INTEGER + 1 }],
     [{ minFireIntervalMs: 0 }],
@@ -668,7 +944,7 @@ describe('createScheduleRouter — numeric configuration', () => {
 
   it('supports intentional zero count/body caps', async () => {
     const count = harness(ctx('acme', 'operator'), {
-      maxSchedulesPerTenant: 0,
+      maxSchedules: 0,
     });
     expect(
       (await count.call('POST', '/api/schedules', WORKFLOW_CREATE)).status,

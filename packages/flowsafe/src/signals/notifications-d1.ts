@@ -10,11 +10,9 @@
 // model on its next turn. Distinct from flowsafe's ApprovalNotificationSink,
 // which notifies HUMANS about approvals. Different layers.
 //
-// TENANCY: the `thread_id` column holds the tenant-salted threadId
-// (`${tenantId}_${uuid}`), so purgeTenant's `[tid_, tid\x60)` range is exact
-// over it (registered in TENANT_RANGE_PURGE_TABLES) and the notification TTL
-// reaps terminal rows (purgeExpiredNotifications). Timestamps are ISO-8601 TEXT
-// — the encoding the retention purges and the schema guard ride on.
+// `thread_id` holds the host-minted threadId. The notification TTL reaps
+// terminal rows (purgeExpiredNotifications). Timestamps are ISO-8601 TEXT —
+// the encoding the retention purges and the schema guard ride on.
 
 import {
   type CreateNotificationInput,
@@ -507,14 +505,11 @@ export class D1NotificationsStorage extends NotificationsStorage {
   }
 
   /**
-   * Due pending notifications across ALL threads/tenants, filtered only by the
-   * optional agentId/resourceId — GLOBALLY UNSCOPED by tenant, exactly like
-   * core's InMemory reference (a cron dispatcher's cross-thread sweep). It is a
-   * trusted-computing-base-only read (no client route reaches it), so this is
-   * not a leak here. The trusted dispatcher that drives delivery from this list
-   * must scope each dispatch by the row's tenant-salted
-   * `resourceId` (`${tenantId}_…`) / per-thread `threadId` before it acts, or a
-   * cross-tenant sweep would deliver one tenant's inbox into another's loop.
+   * Due pending notifications across all deployment threads, filtered only by
+   * the optional agentId/resourceId, exactly like core's InMemory reference. It
+   * is a trusted-computing-base-only read (no client route reaches it). The
+   * dispatcher validates each row's thread/resource binding before addressing a
+   * Durable Object.
    */
   async listDueNotifications(
     input: ListDueNotificationsInput,

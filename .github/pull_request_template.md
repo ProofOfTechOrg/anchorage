@@ -19,7 +19,7 @@ List the exact commands and scenarios used to verify the change.
 - [ ] `pnpm docs:check` passes; generated `docs/api/` output is not committed.
 - [ ] A changeset is included for a user-visible published-package change, or
       the PR explains why none is required.
-- [ ] Security, tenant isolation, capability minting, retention, and unattended
+- [ ] Security, deployment isolation, capability minting, retention, and unattended
       execution were reviewed where applicable.
 - [ ] Any AI-assisted code or prose has been reviewed and verified by the
       contributor.
