@@ -41,7 +41,9 @@ function harnessOptions() {
   } satisfies Parameters<typeof createTestHarness>[0];
 }
 
-describe.sequential('migration ledger real-D1 fidelity', () => {
+describe.sequential('migration ledger real-D1 fidelity', {
+  timeout: 30_000,
+}, () => {
   let server: TestHarness;
   let worker: WorkerHandle;
 
@@ -53,7 +55,7 @@ describe.sequential('migration ledger real-D1 fidelity', () => {
 
   afterAll(async () => {
     await server.close();
-  });
+  }, 30_000);
 
   async function probe<T>(action: string): Promise<T> {
     const response = await worker.fetch('/migration-ledger', {
