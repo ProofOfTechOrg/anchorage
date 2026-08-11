@@ -29,6 +29,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "pretypecheck": "pnpm --filter @proofoftech/breakwater --filter @proofoftech/flowsafe build",
     "test:credentialed": "pnpm build && node scripts/credentialed-conformance.mjs",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
