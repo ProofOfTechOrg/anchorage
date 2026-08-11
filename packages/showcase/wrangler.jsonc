@@ -16,12 +16,12 @@
   // must live on the same account). Pinned because the deploying identity
   // has access to more than one account.
   "account_id": "056cbaa6f5c3d8ff5584f1aa84bbe050",
-  // Staging posture for the physical-isolation cutover: deploy the new script
-  // at its workers.dev URL and verify it before moving the custom-domain route.
-  // At cutover, set this false and add the anchorage.proofoftech.org custom
-  // domain route in the same deploy. The old anchorage-showcase script keeps
-  // its original database and DO namespaces as the rollback bundle.
-  "workers_dev": true,
+  // Production posture after the physical-isolation cutover. All public
+  // ingress uses the canonical custom domain; the old anchorage-showcase
+  // script keeps its original database and DO namespaces for rollback.
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "anchorage.proofoftech.org", "custom_domain": true }],
   // The worker emits structured JSON (audit + maintenance + connector previews)
   // to Workers Logs.
   "observability": { "enabled": true },
@@ -48,10 +48,7 @@
     {
       "binding": "DB",
       "database_name": "anchorage-showcase-single-tenant",
-      // Intentional non-deployable placeholder. Create and seed a fresh
-      // physical-isolation database before replacing it; never bind this code
-      // to the former pooled showcase database.
-      "database_id": "00000000-0000-0000-0000-000000000000"
+      "database_id": "e8b62ac5-a155-4cc2-9942-e3da9773ad75"
     }
   ],
   // Single-deploy: serve the Vite-managed client build at / via Workers Static
