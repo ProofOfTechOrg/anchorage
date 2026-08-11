@@ -141,35 +141,47 @@ can tolerate and set a billing alert.
 
 The checked-in configuration is the live green isolation deployment: `anchorage-showcase-single-tenant` with `workers_dev: false`, preview URLs disabled, and `anchorage.proofoftech.org` as its custom domain. Its distinct script name owns dedicated Durable Object namespaces and a dedicated D1 database. The retained `anchorage-showcase` script, database, and namespaces form the blue rollback bundle.
 
-A fresh replacement **401s on every authenticated route until you set the auth secret**. No credentials are baked into `wrangler.jsonc`, so repository access never grants an application credential. Use a new script and database name when preparing the next replacement:
+A fresh replacement **returns `401` from every authenticated route until you set its authentication secrets**. `wrangler.jsonc` contains no credentials, so repository access never grants an application credential. Prepare the next replacement with a separate script, database, and temporary Wrangler configuration:
 
 ```bash
-pnpm --filter showcase exec wrangler d1 create anchorage-showcase-single-tenant
-# Paste the returned id into packages/showcase/wrangler.jsonc.
-# Set DEPLOYMENT_TENANT, then seed the new database before application traffic.
+next_worker=anchorage-showcase-next
+next_database=anchorage-showcase-next
+next_config="$PWD/packages/showcase/wrangler.next.jsonc"
+pnpm exec wrangler d1 create "$next_database" \
+  --config packages/showcase/wrangler.jsonc
+cp packages/showcase/wrangler.jsonc "$next_config"
+```
+
+Edit only `wrangler.next.jsonc` for staging. Set `name` and the D1 database name to the two values above, and paste the new D1 id. Set `workers_dev` to `true`, keep `preview_urls` set to `false`, and set `routes` to an empty array. Do not change the checked-in live configuration or reuse its D1 id.
+
+Seed the new database, set the four application secrets, then deploy the temporary configuration:
+
+```bash
 pnpm --dir packages/flowsafe provision:deployment -- \
-  --database anchorage-showcase-single-tenant \
+  --database "$next_database" \
   --tag showcase \
   --remote \
-  --config ../showcase/wrangler.jsonc
-pnpm --filter showcase exec wrangler secret put DEPLOYMENT_IDENTITY_SECRET
-pnpm --filter showcase exec wrangler secret put MAINTENANCE_ADMIN_SECRET
-pnpm --filter showcase exec wrangler secret put APPROVAL_ACTOR_TOKENS
-# Build and deploy the replacement at its workers.dev staging URL.
-pnpm showcase:deploy
-curl -fsS -X POST https://your-worker.example/admin/ensure-maintenance \
+  --config "$next_config"
+pnpm exec wrangler secret put DEPLOYMENT_IDENTITY_SECRET --config "$next_config"
+pnpm exec wrangler secret put MAINTENANCE_ADMIN_SECRET --config "$next_config"
+pnpm exec wrangler secret put DEMO_JWT_SECRET --config "$next_config"
+pnpm exec wrangler secret put GOOGLE_CLIENT_SECRET --config "$next_config"
+pnpm --filter showcase build
+pnpm exec wrangler deploy --config "$next_config"
+curl -fsS -X POST "https://${next_worker}.gcharang.workers.dev/admin/ensure-maintenance" \
   -H "authorization: Bearer ${maintenance_admin_secret}"
 ```
 
 Treat the cutover and rollback bundle as one resource set:
 
-1. Create the fresh D1 database and paste its id into `wrangler.jsonc`.
-2. Seed the sentinel before any application table, then set the deployment identity and authentication secrets on `anchorage-showcase-single-tenant`.
-3. Deploy the checked-in green configuration. Verify `/healthz`, an authenticated route, and a smoke run at its workers.dev URL. OAuth sign-in is not expected there because the provider callback remains the production origin.
+1. Create the fresh D1 database and put its id only in the temporary configuration.
+2. Seed the sentinel before any application table, then set the deployment identity and authentication secrets on the replacement script.
+3. Deploy the temporary staging configuration. Verify `/healthz`, an authenticated route, maintenance, and a smoke run at its workers.dev URL. OAuth sign-in is unavailable there because the provider callback remains the production origin.
 4. Keep the blue script and its old database binding unchanged. Never run green code against the old pooled database or blue code against the new database.
-5. For cutover, set `workers_dev` and `preview_urls` to `false`, add `{ "pattern": "anchorage.proofoftech.org", "custom_domain": true }` to `routes`, and deploy the green script. The custom-domain route change switches traffic.
-6. To roll back, restore the route from the retained blue revision and deploy `anchorage-showcase`; do not mix either script with the other bundle's storage.
-7. After the rollback window closes, decommission the blue Worker, database, Durable Object namespaces, and associated secrets as one unit.
+5. In the temporary configuration, set `workers_dev` and `preview_urls` to `false`, then add `{ "pattern": "anchorage.proofoftech.org", "custom_domain": true }` to `routes`. Deploy that configuration to move the custom domain to the replacement script.
+6. After production verification, copy the temporary configuration over `wrangler.jsonc`, remove the temporary file, and commit the new source of truth through the release workflow.
+7. To roll back, restore the custom domain from the retained blue revision and deploy the retained blue script. Do not mix either script with the other bundle's storage.
+8. After the rollback window closes, decommission the blue Worker, database, Durable Object namespaces, and associated secrets as one unit.
 
 The public deployment has one origin, `anchorage.proofoftech.org`, because the
 OAuth callback is registered for exactly that origin. The SPA publishes
