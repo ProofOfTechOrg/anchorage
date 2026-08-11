@@ -1,6 +1,6 @@
 # Deploy Flowsafe on Cloudflare
 
-This reference Worker connects the Flowsafe Durable Object runner and approval queue on Cloudflare. It uses one Durable Object per run, D1 for snapshots and approvals, bearer-token authentication, and separate cron triggers for approval SLA enforcement and retention. Copy this directory into your project as the baseline for one organization.
+This reference Worker connects the Flowsafe Durable Object runner and approval queue on Cloudflare. It uses one Durable Object per run, D1 for snapshots and approvals, bearer-token authentication, and a fixed alarm-driven maintenance singleton. Copy this directory into your project as the baseline for one organization.
 
 Flowsafe's data plane is physically isolated. Each organization needs its own Worker, D1 database, and Durable Object namespaces. Before provisioning, replace every `replace-me` segment in `wrangler.jsonc` with the deployment tag; for example, tag `acme` uses Worker `anchorage-flowsafe-acme` and D1 database `anchorage-flowsafe-acme`. The Worker script name is also the Durable Object namespace boundary. Do not point multiple organizations at this deployment, reuse a script name, or add organization claims to bearer tokens.
 
@@ -13,7 +13,7 @@ Provisioning stamps the same stable tag in two places:
 - the `DEPLOYMENT_TENANT` variable in `wrangler.jsonc`;
 - the singleton `flowsafe_deployment.tenant_tag` row in D1.
 
-The tag must match `^[a-z0-9]{3,32}$`. It is infrastructure attribution, not a request claim. The Worker checks the pair before every fetch, scheduled invocation, and Queue batch. Missing, malformed, or mismatched identity fails closed; fetch returns `503`.
+The tag must match `^[a-z0-9]{3,32}$`. It is infrastructure attribution, not a request claim. The Worker checks the pair before every fetch and maintenance duty. Missing, malformed, or mismatched identity fails closed; fetch returns `503`.
 
 Production Durable Objects also require a `DEPLOYMENT_IDENTITY_SECRET`. Worker topologies stamp this internal credential on every Worker-to-object request, and each object compares it in constant time before reading storage. This prevents an accidental or hostile cross-script Durable Object binding from reaching another deployment even when that target's environment and D1 sentinel agree. Alarms have no caller request, so they validate the target environment and sentinel only.
 
@@ -28,6 +28,9 @@ pnpm --dir packages/flowsafe provision:deployment -- \
 
 pnpm --dir packages/flowsafe exec wrangler secret put \
   DEPLOYMENT_IDENTITY_SECRET \
+  --config deploy/wrangler.jsonc
+pnpm --dir packages/flowsafe exec wrangler secret put \
+  MAINTENANCE_ADMIN_SECRET \
   --config deploy/wrangler.jsonc
 ```
 
@@ -48,13 +51,15 @@ pnpm exec wrangler d1 create anchorage-flowsafe-acme \
   --config deploy/wrangler.jsonc
 
 # 2. Set DEPLOYMENT_TENANT in deploy/wrangler.jsonc, seed the same tag before
-#    application migrations, and set the per-deployment internal credential.
+#    application migrations, and set both per-deployment internal credentials.
 pnpm provision:deployment -- \
   --database anchorage-flowsafe-acme \
   --tag acme \
   --remote \
   --config deploy/wrangler.jsonc
 pnpm exec wrangler secret put DEPLOYMENT_IDENTITY_SECRET \
+  --config deploy/wrangler.jsonc
+pnpm exec wrangler secret put MAINTENANCE_ADMIN_SECRET \
   --config deploy/wrangler.jsonc
 
 # 3. Store a static actor map for the reference verifier. Production hosts
@@ -68,8 +73,10 @@ pnpm exec wrangler secret put APPROVAL_ACTOR_TOKENS \
 pnpm exec wrangler secret put STREAM_TICKET_SECRET \
   --config deploy/wrangler.jsonc
 
-# 5. Deploy after the sentinel is present.
+# 5. Deploy after the sentinel is present, then bootstrap the maintenance alarm.
 pnpm deploy:cf
+curl -fsS -X POST https://your-worker.example/admin/ensure-maintenance \
+  -H "authorization: Bearer ${maintenance_admin_secret}"
 ```
 
 For local iteration, set `DEPLOYMENT_TENANT` to `acme`, seed the local database, then run `pnpm deploy:dev`:
@@ -84,7 +91,7 @@ pnpm provision:deployment -- \
 pnpm deploy:dev
 ```
 
-Wrangler uses local D1 and Durable Object state, so local development does not require a Cloudflare account. Put a development-only `DEPLOYMENT_IDENTITY_SECRET` of at least 32 visible ASCII characters in `deploy/.dev.vars`.
+Wrangler uses local D1 and Durable Object state, so local development does not require a Cloudflare account. Put distinct development-only `DEPLOYMENT_IDENTITY_SECRET` and `MAINTENANCE_ADMIN_SECRET` values of at least 32 visible ASCII characters in `deploy/.dev.vars`.
 
 Do not upgrade a legacy pooled or differently owned script in place. Deploy the new tag-suffixed Worker name with a fresh D1 database and fresh Durable Object namespaces, verify it without public traffic, and then move the route. Reusing the old script name retains its Durable Object namespaces even when D1 is replaced.
 
@@ -145,22 +152,23 @@ The Worker does not mount `POST /api/approvals`. Approval records come from obse
 | --- | --- | --- | --- |
 | `DEPLOYMENT_TENANT` | variable | none; requests fail `503` | Required stable tag that must match the D1 sentinel |
 | `DEPLOYMENT_IDENTITY_SECRET` | secret | none; requests fail `503` | Required 32–256 visible ASCII character internal credential shared only by this deployment's Worker and Durable Objects |
+| `MAINTENANCE_ADMIN_SECRET` | secret | none; admin routes return `503` | Required 32–256 visible ASCII control-plane credential for maintenance bootstrap and status |
 | `APPROVAL_ACTOR_TOKENS` | secret | none; protected routes return `401` | JSON map of bearer token to `{ id, role }`. Unknown roles and empty actor ids are dropped |
 | `APPROVAL_SLA_SECONDS` | variable | `14400` | SLA applied to new approvals |
 | `APPROVAL_ALLOW_SELF_DECISION` | variable | unset | Separation of duties remains enabled. `true` exempts all deciders; a comma-separated role list exempts only those roles |
-| `RUN_RETENTION_DAYS` | variable | `30` | Terminal snapshot age before cron purge; `0` makes every terminal run eligible |
-| `APPROVAL_RETENTION_DAYS` | variable | `30` | Decided approval age before cron purge |
+| `RUN_RETENTION_DAYS` | variable | `30` | Terminal snapshot age before alarm-driven purge; `0` makes every terminal run eligible |
+| `APPROVAL_RETENTION_DAYS` | variable | `30` | Decided approval age before alarm-driven purge |
 | `THREAD_RETENTION_DAYS` | variable | unset | Optional idle thread and message retention duty |
 | `STREAM_TICKET_SECRET` | secret | unset | Dedicated HMAC key for 60-second WebSocket tickets |
-| `AUDIT_QUEUE` | Queue binding | unbound | Queues audit events for delivery to `SIEM_ENDPOINT` |
-| `SIEM_ENDPOINT` | variable | none | NDJSON collector destination |
-| `SIEM_AUTH_HEADER` | secret | none | Collector authorization header |
+| `AUDIT_QUEUE` | Queue producer binding | unbound | Queues audit events for the shared control-plane consumer |
 
 Keep authentication, stream-ticket, model-provider, connector, webhook, and SIEM secrets distinct.
 
-## Understand scheduled maintenance
+## Understand alarm-driven maintenance
 
-`triggers.crons` declares two expressions. `scheduled()` dispatches on the exact `SWEEP_CRON` or `PURGE_CRON` value from `crons.ts`, so independent duties never share a normal invocation. A Workers CPU-limit termination is not a catchable JavaScript error; sharing duties could let one permanently starve the other. An unknown expression runs both duties sequentially and logs a configuration error.
+The fixed `deployment-maintenance` Durable Object stores the next sweep and purge times. Each alarm persists its successor before running one due duty. If both duties are due, the object schedules an immediate follow-up alarm instead of sharing the invocation. A Workers CPU-limit termination cannot break the alarm chain or starve the other duty.
+
+After deployment, authenticate `POST /admin/ensure-maintenance` with `MAINTENANCE_ADMIN_SECRET`. Read `GET /admin/maintenance-status` with the same credential and alert when `alarmAt` is null or the last successful duty is stale.
 
 - `sweepSLA(store, ...)` scans the deployment approval store and escalates open requests past `slaDeadlineAt`. It is maintenance code, not an HTTP service method.
 - `purgeExpiredWorkflowRuns()` deletes terminal snapshots in bounded batches. Suspended and running runs remain at every age.
@@ -173,7 +181,7 @@ Schedules, subscriptions, resources, and working memory have no TTL. The schedul
 
 ## Preserve the host conventions
 
-- Reuse `createFlowsafeWorker()` and the host-kit routers. They own deployment verification, route order, actor resolution, role gates, approval bridging, scheduled dispatch, and audit export.
+- Reuse `createFlowsafeWorker()`, `createFlowsafeMaintenanceDurableObject()`, and the host-kit routers. They own deployment verification, route order, actor resolution, role gates, approval bridging, and maintenance dispatch.
 - Replace only the `TokenVerifier` seam for production identity. A verified actor has `id` and `role`; it does not choose deployment identity.
 - Keep `D1ApprovalStoreFactory` scoped to the isolate and call `.store()`. Rebuilding it in every request repeats schema initialization.
 - Keep approval creation off the public API. The suspension bridge supplies server-authored connector ids, requester attribution, exact suspension identity, and resume targets.
@@ -196,7 +204,7 @@ pnpm --filter @proofoftech/flowsafe build
 pnpm --filter @proofoftech/flowsafe spike:verify
 ```
 
-`worker.e2e.test.ts` exercises the real handler with SQLite-backed D1 adapters and Durable Object stubs. It covers the identity sentinel, actor verification, approval creation, separation of duties, server-derived grants, forged resume denial, opaque run ids, maintenance failure isolation, and Queue export.
+`worker.e2e.test.ts` exercises the handler with non-fidelity SQLite adapters for route composition. The Wrangler harness covers deployment identity, maintenance bootstrap, durable alarm state, one-duty dispatch, and failure recovery against real D1 and workerd.
 
 `spike:verify` adds the workerd boundary: suspend, kill, restart on persisted state, resume from an approved record, and refuse a mismatched deployment sentinel.
 

@@ -519,7 +519,7 @@ export function parseApprovalTimeBound(value: string, field: string): number {
  * Eagerly validates BOTH time-bound filters (createdBefore/createdAfter) when
  * present, discarding the parsed instants — the call is purely for
  * parseApprovalTimeBound's throw-on-garbage side effect. Both in-memory list
- * paths (InMemoryApprovalStore.list and the cron-only system view) call this up
+ * paths (InMemoryApprovalStore.list and the maintenance-only system view) call this up
  * front, BEFORE filtering, so a zero-match view rejects an unparseable bound
  * identically to D1's unconditional appendListFilters instead of silently
  * returning [] — single-sourcing the "both backends fail identically" contract

@@ -15,7 +15,11 @@
       "@proofoftech/flowsafe/host-kit": ["../src/host-kit/index.ts"]
     }
   },
-  "include": ["./worker.ts", "../src/**/*.ts"],
+  "include": [
+    "./worker.ts",
+    "../src/**/*.ts",
+    "../test-support/maintenance-alarm-harness-worker.ts"
+  ],
   // approval-ui's barrel/JSX compile only in src/approval-ui/tsconfig.json
   // (DOM lib); this workers-types program must not pull them in.
   "exclude": [

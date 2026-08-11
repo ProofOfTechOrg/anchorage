@@ -38,7 +38,7 @@ Cloudflare Worker
         |
         +--> stream router -----------> one singleton hub DO
         |
-        +--> schedule/task/provider routes and scheduled duties
+        +--> schedule/task/provider routes and alarm duties
 ```
 
 The Worker is the public authentication boundary. It verifies the infrastructure deployment tag against the D1 sentinel before protected work. Worker topologies authenticate internal Durable Object calls, and each target repeats the sentinel check before building storage or serving a route.
@@ -79,7 +79,7 @@ The snapshot remains Mastra's workflow state. Flowsafe does not invent a second 
 
 ## Approval architecture
 
-`D1ApprovalStoreFactory.store()` returns one memoized store for the deployment database. Request routes, runtime grant derivation, and scheduled maintenance share that store.
+`D1ApprovalStoreFactory.store()` returns one memoized store for the deployment database. Request routes, runtime grant derivation, and alarm maintenance duties share that store.
 
 `createActorResolver()` runs authentication first, validates the actor, then constructs the service lazily. Actor claims contain `id` and `role`, not tenant identity.
 
@@ -208,8 +208,9 @@ Idle-thread retention deletes Mastra thread and message rows only. It deliberate
 - agent catalog routing between deployment `preRoutes` and other optional feature routers;
 - actor resolver construction;
 - suspension-to-approval and resume-to-requeue bridges;
-- separate SLA, purge, and optional schedule-tick cron dispatch;
-- Queue consumer.
+- separate SLA, purge, and optional schedule-tick maintenance duties.
+
+`createFlowsafeMaintenanceDurableObject()` runs those duties through the fixed maintenance singleton. Tenant Workers can produce audit Queue messages, but the shared control-plane Worker owns Queue consumption.
 
 Hosts inject identity verification, workflow and agent metadata, optional feature routers, approval-resume composition, budget wrappers, notification transport, artifact store, schedule tick, and deployment-owned purge duties.
 

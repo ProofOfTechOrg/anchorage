@@ -1,0 +1,52 @@
+{
+  "name": "anchorage-fleet-control",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Security-critical fleet provisioning for physically isolated Anchorage deployments",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./workers/dispatch": {
+      "types": "./dist/workers/dispatch.d.ts",
+      "default": "./dist/workers/dispatch.js"
+    },
+    "./workers/outbound": {
+      "types": "./dist/workers/outbound.d.ts",
+      "default": "./dist/workers/outbound.js"
+    },
+    "./workers/audit-consumer": {
+      "types": "./dist/workers/audit-consumer.d.ts",
+      "default": "./dist/workers/audit-consumer.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test:credentialed": "pnpm build && node scripts/credentialed-conformance.mjs",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@proofoftech/flowsafe": "workspace:*",
+    "cloudflare": "7.0.0",
+    "p-queue": "9.3.3"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260730.1",
+    "@types/node": "22.20.0",
+    "typescript": "^5.6",
+    "vitest": "^4.1.8",
+    "wrangler": "4.118.0"
+  },
+  "engines": {
+    "node": ">=22.22.0"
+  },
+  "license": "Apache-2.0"
+}

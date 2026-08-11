@@ -136,7 +136,7 @@ The composed Worker emits structured configuration and maintenance results for:
 - workflow and approval retention;
 - thread, notification, thread-state, trigger, and task retention;
 - deployment-owned retention duties;
-- unknown cron expressions;
+- maintenance bootstrap, alarm status, and duty failures;
 - provider alarm reconciliation;
 - Queue export.
 

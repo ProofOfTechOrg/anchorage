@@ -42,7 +42,7 @@
   // WebSocket stream tickets so the /api/stream/* stage MOUNTS under
   // `pnpm spike`. scripts/spike-verify.mjs re-passes the SAME value via
   // `--var STREAM_TICKET_SECRET:...` so its forged-ticket probes share the key;
-  // keep the two byte-equal (like SWEEP_CRON/PURGE_CRON). Never a real secret.
+  // keep the two byte-equal with the verifier fixture. Never a real secret.
   "vars": {
     "DEPLOYMENT_TENANT": "spike",
     "DEPLOYMENT_IDENTITY_SECRET": "spike-local-deployment-identity-secret",

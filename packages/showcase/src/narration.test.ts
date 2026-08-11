@@ -312,12 +312,12 @@ describe('deriveApprovalEvents', () => {
     expect(deriveApprovalEvents(undefined, [record()])).toEqual([]);
   });
 
-  it('narrates a new record as queued (plus the one-time cron mention)', () => {
+  it('narrates a new record as queued (plus the one-time alarm mention)', () => {
     const events = deriveApprovalEvents(new Map(), [record()]);
     const queued = events.find((e) => e.kind === 'approval.queued');
     expect(queued?.key).toBe('approval:appr-1:status:pending');
     expect(queued?.toast).toBe(false);
-    expect(events.some((e) => e.key === 'cron:mention')).toBe(true);
+    expect(events.find((e) => e.key === 'alarm:mention')?.zone).toBe('alarm');
   });
 
   it('narrates claim, decision, escalation, and delegation flips', () => {
@@ -342,7 +342,7 @@ describe('deriveApprovalEvents', () => {
     const escalated = deriveApprovalEvents(new Map([[before.id, before]]), [
       record({ status: 'escalated' }),
     ]);
-    expect(escalated[0]?.zone).toBe('cron');
+    expect(escalated[0]?.zone).toBe('alarm');
     expect(escalated[0]?.toast).toBe(false);
 
     const wasClaimed = record({

@@ -16,8 +16,10 @@ import {
 import { createObjectiveRouter } from '@proofoftech/flowsafe/goals';
 import {
   createDoRunTopology,
+  createFlowsafeMaintenanceDurableObject,
   createFlowsafeWorker,
   createThreadTopology,
+  type FlowsafeWorkerConfig,
   queueApprovalForSuspension,
   RunRouteError,
 } from '@proofoftech/flowsafe/host-kit';
@@ -43,11 +45,8 @@ import { STARTER_AGENT_META } from './agent.js';
 import {
   buildVerifier,
   githubResourceAllowed,
-  PURGE_CRON,
-  SWEEP_CRON,
   SYSTEM_PRINCIPAL_ID,
   signalAttributeAllowlist,
-  TICK_CRON,
 } from './config.js';
 import {
   BACKGROUND_TASKS_INSTANCE_NAME,
@@ -156,14 +155,14 @@ async function handleBackgroundRoutes(
   return env.BACKGROUND_TASKS.get(id).fetch(forwarded);
 }
 
-const worker = createFlowsafeWorker<Env>({
+const workerConfig = {
   workflows: WORKFLOWS,
   systemPrincipalId: SYSTEM_PRINCIPAL_ID,
   buildVerifier,
-  crons: {
-    sweep: SWEEP_CRON,
-    purge: PURGE_CRON,
-    tick: TICK_CRON,
+  maintenance: {
+    sweepIntervalMs: 5 * 60 * 1_000,
+    purgeIntervalMs: 60 * 60 * 1_000,
+    tickIntervalMs: 60 * 1_000,
   },
   preRoutes: async (request, env, _ctx, kit) => {
     const webhook = await webhookRouter(env)(request);
@@ -480,9 +479,14 @@ const worker = createFlowsafeWorker<Env>({
     completedTtlMs: 60 * 60 * 1_000,
     failedTtlMs: 24 * 60 * 60 * 1_000,
   },
-});
+} satisfies FlowsafeWorkerConfig<Env>;
+
+export class StarterMaintenance extends createFlowsafeMaintenanceDurableObject(
+  workerConfig,
+) {}
+
+const worker = createFlowsafeWorker<Env>(workerConfig);
 
 export default {
   fetch: (request, env, ctx) => worker.fetch(request, env, ctx),
-  scheduled: (controller, env, ctx) => worker.scheduled(controller, env, ctx),
 } satisfies ExportedHandler<Env>;

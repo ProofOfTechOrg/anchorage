@@ -1,0 +1,598 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { createHash, randomBytes } from 'node:crypto';
+import type {
+  ApplicationBindingTopology,
+  ApplicationR2Binding,
+  ApplicationR2Resource,
+  DeploymentApplicationBindings,
+  DeploymentSecrets,
+  DeploymentSpec,
+} from './types.js';
+
+const EMPTY_APPLICATION: DeploymentApplicationBindings = Object.freeze({
+  vars: [],
+  secrets: [],
+  r2Buckets: [],
+});
+
+export const DEPLOYMENT_PLATFORM_VARIABLE_NAMES = Object.freeze([
+  'DEPLOYMENT_TENANT',
+  'FLEET_AUDIT_PROXY',
+  'FLEET_ENVIRONMENT',
+  'FLEET_INGRESS_CONTRACT',
+  'FLEET_MAINTENANCE_CAPABILITIES',
+  'FLEET_SCHEMA_VERSION',
+  'FLEET_SPEC_DIGEST',
+]);
+
+export const LEGACY_BRIDGE_PLATFORM_VARIABLE_NAMES = Object.freeze([
+  'DEPLOYMENT_TENANT',
+  'FLEET_ARTIFACT_DIGEST',
+  'FLEET_AUDIT_PROXY_INGRESS',
+  'FLEET_AUDIT_PROXY_OBJECT_NAME',
+  'FLEET_DEPLOYMENT_SCRIPT',
+  'FLEET_DO_TAG',
+  'FLEET_ENVIRONMENT',
+  'FLEET_MAINTENANCE_CAPABILITIES',
+  'FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY',
+  'FLEET_RESOURCE_GROUP',
+  'FLEET_RESOURCE_ROLE',
+  'FLEET_RUNTIME_CONTRACT',
+  'FLEET_SCHEMA_VERSION',
+  'FLEET_SPEC_DIGEST',
+  'OUTBOUND_ENVIRONMENT',
+  'OUTBOUND_POLICY_ID',
+  'OUTBOUND_RESOURCE_GROUP_ID',
+  'OUTBOUND_ROUTE_HOSTNAME',
+  'OUTBOUND_STATE_SCRIPT_NAME',
+  'OUTBOUND_TENANT_ID',
+]);
+
+function byName<T extends { readonly name: string }>(
+  values: readonly T[],
+): readonly T[] {
+  if (
+    values.some(
+      (value) =>
+        !value ||
+        typeof value !== 'object' ||
+        Array.isArray(value) ||
+        typeof value.name !== 'string',
+    )
+  ) {
+    throw new Error('application binding entries must be named objects');
+  }
+  return [...values]
+    .map((value) => ({ ...value }))
+    .sort((left, right) =>
+      left.name < right.name ? -1 : left.name > right.name ? 1 : 0,
+    );
+}
+
+export function canonicalApplicationBindings(
+  spec: Pick<DeploymentSpec, 'application'>,
+): DeploymentApplicationBindings {
+  const application: unknown = spec.application ?? EMPTY_APPLICATION;
+  if (
+    !application ||
+    typeof application !== 'object' ||
+    Array.isArray(application)
+  ) {
+    throw new Error('application bindings must be an object');
+  }
+  if ('kvNamespaces' in application) {
+    throw new Error(
+      'application KV is unsupported; use an isolated R2 bucket binding',
+    );
+  }
+  const candidate = application as Partial<DeploymentApplicationBindings>;
+  for (const [name, value] of Object.entries({
+    vars: candidate.vars,
+    secrets: candidate.secrets,
+    r2Buckets: candidate.r2Buckets,
+  })) {
+    if (value !== undefined && !Array.isArray(value)) {
+      throw new Error(`application ${name} must be an array`);
+    }
+  }
+  return {
+    vars: byName(candidate.vars ?? []),
+    secrets: byName(candidate.secrets ?? []),
+    r2Buckets: byName(candidate.r2Buckets ?? []).map((binding) => ({
+      ...binding,
+      jurisdiction: binding.jurisdiction ?? 'default',
+    })),
+  };
+}
+
+export function applicationSecretValues(
+  spec: Pick<DeploymentSpec, 'application'>,
+  secrets: DeploymentSecrets,
+): Readonly<Record<string, string>> {
+  const descriptors = canonicalApplicationBindings(spec).secrets;
+  const values = secrets.application ?? {};
+  const actualNames = Object.keys(values).sort();
+  const expectedNames = descriptors.map(({ name }) => name);
+  if (JSON.stringify(actualNames) !== JSON.stringify(expectedNames)) {
+    throw new Error(
+      'application secret values must exactly match the declared secret bindings',
+    );
+  }
+  for (const descriptor of descriptors) {
+    const value = values[descriptor.name];
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new Error(`application secret '${descriptor.name}' is empty`);
+    }
+    if (new TextEncoder().encode(value).byteLength > 5 * 1024) {
+      throw new Error(`application secret '${descriptor.name}' exceeds 5 KB`);
+    }
+    const digest = createHash('sha256').update(value, 'utf8').digest('hex');
+    if (digest !== descriptor.valueSha256) {
+      throw new Error(
+        `application secret '${descriptor.name}' does not match its SHA-256 descriptor`,
+      );
+    }
+  }
+  return values;
+}
+
+export function applicationR2Bindings(
+  spec: Pick<
+    DeploymentSpec,
+    'tenantTag' | 'environment' | 'scriptName' | 'databaseName' | 'application'
+  >,
+  resources?: readonly ApplicationR2Resource[],
+): readonly ApplicationR2Binding[] {
+  const descriptors = canonicalApplicationBindings(spec).r2Buckets;
+  if (resources !== undefined) {
+    const resolved = [...resources]
+      .sort((left, right) =>
+        left.name < right.name ? -1 : left.name > right.name ? 1 : 0,
+      )
+      .map(({ name, bucketName, jurisdiction }) => ({
+        name,
+        bucketName,
+        jurisdiction,
+      }));
+    if (
+      JSON.stringify(
+        resolved.map(({ name, jurisdiction }) => ({ name, jurisdiction })),
+      ) !==
+      JSON.stringify(
+        descriptors.map(({ name, jurisdiction = 'default' }) => ({
+          name,
+          jurisdiction,
+        })),
+      )
+    ) {
+      throw new Error(
+        'application R2 resources do not match the specification',
+      );
+    }
+    return resolved;
+  }
+  if (descriptors.length > 0) {
+    throw new Error('application R2 resources have not been reserved');
+  }
+  return [];
+}
+
+function reservedBucketName(
+  spec: Pick<
+    DeploymentSpec,
+    'tenantTag' | 'environment' | 'scriptName' | 'databaseName'
+  >,
+  bindingName: string,
+  jurisdiction: string,
+  reservationNonce: string,
+): string {
+  const suffix = createHash('sha256')
+    .update(
+      JSON.stringify({
+        tenantTag: spec.tenantTag,
+        environment: spec.environment,
+        scriptName: spec.scriptName,
+        databaseName: spec.databaseName,
+        binding: bindingName,
+        jurisdiction,
+        reservationNonce,
+      }),
+    )
+    .digest('hex')
+    .slice(0, 20);
+  const prefix = spec.scriptName
+    .slice(0, 63 - suffix.length - 1)
+    .replace(/-+$/u, '');
+  return `${prefix}-${suffix}`;
+}
+
+export function reserveApplicationR2Resources(
+  spec: DeploymentSpec,
+): readonly ApplicationR2Resource[] {
+  return canonicalApplicationBindings(spec).r2Buckets.map((binding) => {
+    const jurisdiction = binding.jurisdiction ?? 'default';
+    const reservationNonce = randomBytes(24).toString('base64url');
+    return {
+      name: binding.name,
+      bucketName: reservedBucketName(
+        spec,
+        binding.name,
+        jurisdiction,
+        reservationNonce,
+      ),
+      jurisdiction,
+      state: 'reserved',
+      reservationNonce,
+    };
+  });
+}
+
+export function applicationBindingTopology(
+  spec: DeploymentSpec,
+  r2Buckets: readonly ApplicationR2Resource[],
+): ApplicationBindingTopology {
+  const application = canonicalApplicationBindings(spec);
+  const expected = applicationR2Bindings(spec, r2Buckets);
+  return {
+    vars: application.vars,
+    secrets: application.secrets,
+    r2Buckets: expected,
+  };
+}
+
+export function applicationSecretNames(
+  spec: Pick<DeploymentSpec, 'application'>,
+): readonly string[] {
+  return canonicalApplicationBindings(spec).secrets.map(({ name }) => name);
+}
+
+type ApplicationR2LifecycleBackend = Readonly<{
+  findApplicationR2Bucket?: (
+    resource: ApplicationR2Resource,
+  ) => Promise<import('./types.js').ApplicationR2BucketSnapshot | undefined>;
+  ensureApplicationR2Bucket?: (
+    resource: ApplicationR2Resource,
+    fence: import('./types.js').ExternalMutationFence,
+  ) => Promise<import('./types.js').ApplicationR2BucketSnapshot>;
+  assertApplicationR2Detached?: (
+    resource: ApplicationR2Resource,
+    fence: import('./types.js').ExternalMutationFence,
+  ) => Promise<void>;
+  assertApplicationR2Empty?: (
+    resource: ApplicationR2Resource,
+    fence: import('./types.js').ExternalMutationFence,
+  ) => Promise<void>;
+  deleteApplicationR2Bucket?: (
+    resource: ApplicationR2Resource,
+    fence: import('./types.js').ExternalMutationFence,
+  ) => Promise<void>;
+}>;
+
+function assertLiveR2Identity(
+  resource: ApplicationR2Resource,
+  live: import('./types.js').ApplicationR2BucketSnapshot,
+): void {
+  if (
+    live.name !== resource.name ||
+    live.bucketName !== resource.bucketName ||
+    live.jurisdiction !== resource.jurisdiction ||
+    (resource.creationDate !== undefined &&
+      live.creationDate !== resource.creationDate)
+  ) {
+    throw new Error(
+      `R2 bucket '${resource.bucketName}' changed its persisted creation identity`,
+    );
+  }
+}
+
+export function assertApplicationR2ReservationIdentity(
+  spec: Pick<
+    DeploymentSpec,
+    'tenantTag' | 'environment' | 'scriptName' | 'databaseName'
+  >,
+  resource: ApplicationR2Resource,
+): void {
+  if (
+    resource.bucketName !==
+    reservedBucketName(
+      spec,
+      resource.name,
+      resource.jurisdiction,
+      resource.reservationNonce,
+    )
+  ) {
+    throw new Error(
+      `R2 bucket '${resource.bucketName}' does not match its persisted reservation nonce`,
+    );
+  }
+}
+
+export async function convergeApplicationR2Creation(options: {
+  readonly spec: Pick<
+    DeploymentSpec,
+    'tenantTag' | 'environment' | 'scriptName' | 'databaseName'
+  >;
+  readonly resources: readonly ApplicationR2Resource[];
+  readonly backend: ApplicationR2LifecycleBackend;
+  readonly fence: import('./types.js').ExternalMutationFence;
+  readonly persist: (
+    resources: readonly ApplicationR2Resource[],
+  ) => Promise<void>;
+}): Promise<readonly ApplicationR2Resource[]> {
+  if (options.resources.length === 0) return [];
+  if (!options.backend.findApplicationR2Bucket) {
+    throw new Error('backend cannot inspect application R2 resources');
+  }
+  if (
+    options.resources.some(
+      (resource) =>
+        resource.state !== 'reserved' &&
+        resource.state !== 'create-authorized' &&
+        resource.state !== 'created',
+    )
+  ) {
+    throw new Error('application R2 creation has invalid persisted progress');
+  }
+  let resources = [...options.resources];
+  const persistState = async (
+    index: number,
+    resource: ApplicationR2Resource,
+  ): Promise<void> => {
+    resources = resources.map((current, currentIndex) =>
+      currentIndex === index ? resource : current,
+    );
+    await options.persist(resources);
+  };
+  for (let index = 0; index < resources.length; index += 1) {
+    let resource = resources[index] as ApplicationR2Resource;
+    assertApplicationR2ReservationIdentity(options.spec, resource);
+    if (resource.state === 'reserved') {
+      if (await options.backend.findApplicationR2Bucket(resource)) {
+        throw new Error(
+          `refusing to claim pre-existing R2 bucket '${resource.bucketName}'`,
+        );
+      }
+      resource = { ...resource, state: 'create-authorized' };
+      await persistState(index, resource);
+      await options.fence.assertOwned();
+    }
+    if (resource.state === 'create-authorized') {
+      let live = await options.backend.findApplicationR2Bucket(resource);
+      if (!live) {
+        if (!options.backend.ensureApplicationR2Bucket) {
+          throw new Error('backend cannot create application R2 resources');
+        }
+        await options.fence.assertOwned();
+        try {
+          live = await options.backend.ensureApplicationR2Bucket(
+            resource,
+            options.fence,
+          );
+        } catch (error) {
+          live = await options.backend.findApplicationR2Bucket(resource);
+          if (!live) throw error;
+        }
+      }
+      assertLiveR2Identity(resource, live);
+      resource = {
+        ...resource,
+        state: 'created',
+        creationDate: live.creationDate,
+      };
+      await persistState(index, resource);
+    }
+    const live = await options.backend.findApplicationR2Bucket(resource);
+    if (!live) {
+      throw new Error(
+        `R2 bucket '${resource.bucketName}' is absent after create`,
+      );
+    }
+    assertLiveR2Identity(resource, live);
+  }
+  return resources;
+}
+
+export async function assertApplicationR2EmptyBeforeDecommission(options: {
+  readonly resources: readonly ApplicationR2Resource[];
+  readonly backend: ApplicationR2LifecycleBackend;
+  readonly fence: import('./types.js').ExternalMutationFence;
+}): Promise<void> {
+  if (options.resources.length === 0) return;
+  if (
+    !options.backend.findApplicationR2Bucket ||
+    !options.backend.assertApplicationR2Empty
+  ) {
+    throw new Error('backend cannot preflight application R2 evacuation');
+  }
+  for (const resource of options.resources) {
+    const live = await options.backend.findApplicationR2Bucket(resource);
+    if (resource.state === 'reserved') {
+      if (live) {
+        throw new Error(
+          `refusing to decommission unauthorized R2 bucket '${resource.bucketName}'`,
+        );
+      }
+      continue;
+    }
+    if (resource.state === 'deleted') {
+      if (live) {
+        throw new Error(
+          `deleted R2 bucket '${resource.bucketName}' reappeared before decommission`,
+        );
+      }
+      continue;
+    }
+    if (!live) {
+      throw new Error(
+        `R2 bucket '${resource.bucketName}' is absent before decommission`,
+      );
+    }
+    assertLiveR2Identity(resource, live);
+    await options.fence.assertOwned();
+    await options.backend.assertApplicationR2Empty(resource, options.fence);
+  }
+}
+
+export async function convergeApplicationR2Deletion(options: {
+  readonly resources: readonly ApplicationR2Resource[];
+  readonly backend: ApplicationR2LifecycleBackend;
+  readonly fence: import('./types.js').ExternalMutationFence;
+  readonly persist: (
+    resources: readonly ApplicationR2Resource[],
+  ) => Promise<void>;
+}): Promise<readonly ApplicationR2Resource[]> {
+  if (options.resources.length === 0) return [];
+  const backend = options.backend;
+  if (
+    !backend.findApplicationR2Bucket ||
+    !backend.assertApplicationR2Detached ||
+    !backend.assertApplicationR2Empty ||
+    !backend.deleteApplicationR2Bucket
+  ) {
+    throw new Error('backend cannot safely delete application R2 resources');
+  }
+  let resources = [...options.resources];
+  const persistState = async (
+    index: number,
+    resource: ApplicationR2Resource,
+  ): Promise<void> => {
+    resources = resources.map((current, currentIndex) =>
+      currentIndex === index ? resource : current,
+    );
+    await options.persist(resources);
+  };
+  for (let index = 0; index < resources.length; index += 1) {
+    let resource = resources[index] as ApplicationR2Resource;
+    if (resource.state === 'reserved') {
+      if (await backend.findApplicationR2Bucket(resource)) {
+        throw new Error(
+          `refusing to delete pre-existing R2 bucket '${resource.bucketName}' from an unauthorized reservation`,
+        );
+      }
+      continue;
+    }
+    if (resource.state === 'create-authorized') {
+      const live = await backend.findApplicationR2Bucket(resource);
+      if (!live) {
+        resource = { ...resource, state: 'delete-authorized' };
+        await persistState(index, resource);
+      } else {
+        assertLiveR2Identity(resource, live);
+        resource = {
+          ...resource,
+          state: 'created',
+          creationDate: live.creationDate,
+        };
+        await persistState(index, resource);
+      }
+    }
+    if (resource.state === 'deleted') {
+      if (await backend.findApplicationR2Bucket(resource)) {
+        throw new Error(
+          `R2 bucket '${resource.bucketName}' reappeared after deletion`,
+        );
+      }
+      continue;
+    }
+    if (
+      resource.state === 'created' ||
+      resource.state === 'detach-authorized'
+    ) {
+      const live = await backend.findApplicationR2Bucket(resource);
+      if (!live) {
+        throw new Error(
+          `R2 bucket '${resource.bucketName}' disappeared before delete authorization`,
+        );
+      }
+      assertLiveR2Identity(resource, live);
+      if (resource.state === 'created') {
+        resource = { ...resource, state: 'detach-authorized' };
+        await persistState(index, resource);
+      }
+      await options.fence.assertOwned();
+      await backend.assertApplicationR2Detached(resource, options.fence);
+      resource = { ...resource, state: 'detached' };
+      await persistState(index, resource);
+    }
+    if (
+      resource.state === 'detached' ||
+      resource.state === 'empty-authorized'
+    ) {
+      const live = await backend.findApplicationR2Bucket(resource);
+      if (!live) {
+        throw new Error(
+          `R2 bucket '${resource.bucketName}' disappeared before delete authorization`,
+        );
+      }
+      assertLiveR2Identity(resource, live);
+      if (resource.state === 'detached') {
+        resource = { ...resource, state: 'empty-authorized' };
+        await persistState(index, resource);
+      }
+      await options.fence.assertOwned();
+      await backend.assertApplicationR2Empty(resource, options.fence);
+      resource = { ...resource, state: 'empty' };
+      await persistState(index, resource);
+    }
+    if (resource.state === 'empty' || resource.state === 'delete-authorized') {
+      if (resource.state === 'empty') {
+        resource = { ...resource, state: 'delete-authorized' };
+        await persistState(index, resource);
+        await options.fence.assertOwned();
+      }
+      const live = await backend.findApplicationR2Bucket(resource);
+      if (live) {
+        if (resource.creationDate === undefined) {
+          resource = { ...resource, creationDate: live.creationDate };
+          await persistState(index, resource);
+        }
+        assertLiveR2Identity(resource, live);
+        try {
+          await backend.deleteApplicationR2Bucket(resource, options.fence);
+        } catch (error) {
+          if (await backend.findApplicationR2Bucket(resource)) throw error;
+        }
+      }
+      if (await backend.findApplicationR2Bucket(resource)) {
+        throw new Error(
+          `R2 bucket '${resource.bucketName}' remains after deletion`,
+        );
+      }
+      resource = { ...resource, state: 'deleted' };
+      await persistState(index, resource);
+    }
+  }
+  return resources;
+}
+
+function comparableR2Bindings(
+  bindings: readonly ApplicationR2Binding[],
+): readonly Readonly<{ name: string; bucketName: string }>[] {
+  return bindings
+    .map(({ name, bucketName }) => ({ name, bucketName }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
+export function liveApplicationTopologyMatches(
+  expected: ApplicationBindingTopology | undefined,
+  live: Readonly<{
+    plainTextBindings?: Readonly<Record<string, string>>;
+    r2BucketBindings?: readonly ApplicationR2Binding[];
+  }>,
+  fixedPlatformVariableNames: readonly string[],
+): boolean {
+  const fixedNames = new Set(fixedPlatformVariableNames);
+  const expectedVariables = [...(expected?.vars ?? [])].sort((left, right) =>
+    left.name.localeCompare(right.name),
+  );
+  const liveVariables = Object.entries(live.plainTextBindings ?? {})
+    .filter(([name]) => !fixedNames.has(name))
+    .map(([name, value]) => ({ name, value }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+  return (
+    JSON.stringify(liveVariables) === JSON.stringify(expectedVariables) &&
+    JSON.stringify(comparableR2Bindings(live.r2BucketBindings ?? [])) ===
+      JSON.stringify(comparableR2Bindings(expected?.r2Buckets ?? []))
+  );
+}

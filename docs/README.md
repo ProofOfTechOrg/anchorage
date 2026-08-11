@@ -40,7 +40,8 @@ Start with the task you need to complete. The generated API reference is useful 
 
 | Topic | What it covers |
 | --- | --- |
-| [Deployment reference](deployment-reference.md) | Baseline and advanced host choices, bindings, secrets, routes, and scheduled duties |
+| [Deployment reference](deployment-reference.md) | Baseline and advanced host choices, bindings, secrets, routes, and alarm-driven duties |
+| [Fleet control](fleet-control.md) | Provisioning backends, migrations, drift, decommissioning, and paid namespace conformance |
 | [Operations runbook](operations-runbook.md) | Local validation, production checks, retention, decommissioning, and incident response |
 | [Security threat model](security-threat-model.md) | Assets, trust boundaries, controls, residual risks, and deployment obligations |
 | [Observability and quality](observability-and-quality.md) | Audit, metrics, notifications, SIEM export, and repository gates |

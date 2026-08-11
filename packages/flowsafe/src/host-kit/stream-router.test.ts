@@ -7,7 +7,7 @@
 // routing is observable without workerd.
 //
 // The hub FAN-OUT wiring (buildHostApprovalService forwards each mutation to
-// idFromName(HUB_INSTANCE_NAME); the scheduled path collects the publish into
+// idFromName(HUB_INSTANCE_NAME); the alarm-owned path collects the publish into
 // pendingSends and awaits it) is proven in the final describe. It belongs to
 // host-approval-service.ts but is exercised here because that module's own test
 // file is outside this milestone's edit scope — the wiring it proves (M-006
@@ -422,6 +422,10 @@ describe('createFlowsafeWorker stream stage opt-in', () => {
       DEPLOYMENT_TENANT: 'acme',
       DEPLOYMENT_IDENTITY_SECRET,
       RUNNER: recordingRunner([]) as FlowsafeWorkerEnv['RUNNER'],
+      MAINTENANCE: {
+        idFromName: (name: string) => name,
+        get: () => ({ fetch: async () => new Response(null, { status: 204 }) }),
+      },
     };
     if (withStreaming) {
       env.HUB = recordingHub([]);
@@ -445,7 +449,10 @@ describe('createFlowsafeWorker stream stage opt-in', () => {
     workflows: WORKFLOWS,
     systemPrincipalId: 'sys',
     buildVerifier: () => staticTokenVerifier(TOKENS),
-    crons: { sweep: '*/15 * * * *', purge: '7 * * * *' },
+    maintenance: {
+      sweepIntervalMs: 15 * 60 * 1_000,
+      purgeIntervalMs: 60 * 60 * 1_000,
+    },
   });
   const ctx = { waitUntil: () => {} };
 
@@ -540,7 +547,7 @@ describe('hub fan-out wiring (host-approval-service, tested here — see file he
     expect(event.record.runId).toBe(RUN_ID);
   });
 
-  it('the cron sweep COLLECTS the escalation publish and AWAITS it (no float)', async () => {
+  it('the alarm sweep COLLECTS the escalation publish and AWAITS it (no float)', async () => {
     // #given — a hub whose publish blocks until released, and an overdue record
     vi.spyOn(console, 'log').mockImplementation(() => {});
     const hits: string[] = [];
@@ -581,7 +588,7 @@ describe('hub fan-out wiring (host-approval-service, tested here — see file he
     const sweep = runSlaSweepMaintenance({
       store: factory.store(),
       systemPrincipal: maintenancePrincipal('sys'),
-      cron: '*/15 * * * *',
+      trigger: 'sweep',
       stream: (event) => hubTopology.publish(event),
     }).then(() => order.push('sweep-resolved'));
 

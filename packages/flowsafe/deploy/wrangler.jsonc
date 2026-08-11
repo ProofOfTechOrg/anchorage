@@ -8,7 +8,7 @@
   "compatibility_date": "2026-07-26",
   "compatibility_flags": ["nodejs_compat"],
   "secrets": {
-    "required": ["DEPLOYMENT_IDENTITY_SECRET"]
+    "required": ["DEPLOYMENT_IDENTITY_SECRET", "MAINTENANCE_ADMIN_SECRET"]
   },
   // The worker emits structured JSON (audit + maintenance) to Workers Logs.
   "observability": { "enabled": true },
@@ -17,14 +17,16 @@
       { "name": "RUNNER", "class_name": "FlowsafeRunner" },
       // Deployment live-stream fan-out singleton. Streaming activates once the
       // STREAM_TICKET_SECRET secret is also set (opt-in).
-      { "name": "HUB", "class_name": "FlowsafeHub" }
+      { "name": "HUB", "class_name": "FlowsafeHub" },
+      { "name": "MAINTENANCE", "class_name": "FlowsafeMaintenance" }
     ]
   },
-  // DO migrations are APPEND-ONLY: the v1 runner tag is frozen; the hub class
-  // ships under its own new v2 tag. Never edit v1 or reuse a tag.
+  // DO migrations are APPEND-ONLY: the v1 runner and v2 hub tags are frozen;
+  // maintenance ships under v3. Never edit or reuse an existing tag.
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["FlowsafeRunner"] },
-    { "tag": "v2", "new_sqlite_classes": ["FlowsafeHub"] }
+    { "tag": "v2", "new_sqlite_classes": ["FlowsafeHub"] },
+    { "tag": "v3", "new_sqlite_classes": ["FlowsafeMaintenance"] }
   ],
   "d1_databases": [
     {
@@ -35,17 +37,9 @@
       "database_id": "REPLACE-WITH-YOUR-D1-DATABASE-ID"
     }
   ],
-  // TWO cron expressions, dispatched on controller.cron (worker.ts
-  // scheduled()): the SLA sweep and the retention purge never share an
-  // invocation — a CPU-limit termination is not catchable, so a slow sweep
-  // sharing one would permanently starve the purge. Keep these equal to
-  // crons.ts's SWEEP_CRON / PURGE_CRON; keep the sweep interval >= your SLA
-  // granularity.
-  "triggers": { "crons": ["*/15 * * * *", "7 * * * *"] },
   // Optional audit export to a SIEM. Replace `replace-me` with the deployment
-  // tag, create both queues, uncomment this block, then set SIEM_ENDPOINT (var
-  // below) and SIEM_AUTH_HEADER (secret). Without this block, audit events stay
-  // on structured Workers Logs only.
+  // tag, create the queue, and uncomment this producer binding. The shared
+  // control-plane consumer owns SIEM delivery; tenant Workers never consume.
   //   wrangler queues create anchorage-flowsafe-replace-me-audit
   //   wrangler queues create anchorage-flowsafe-replace-me-audit-dlq
   // "queues": {
@@ -55,13 +49,6 @@
   //       "queue": "anchorage-flowsafe-replace-me-audit"
   //     }
   //   ],
-  //   "consumers": [
-  //     {
-  //       "queue": "anchorage-flowsafe-replace-me-audit",
-  //       "max_retries": 10,
-  //       "dead_letter_queue": "anchorage-flowsafe-replace-me-audit-dlq"
-  //     }
-  //   ]
   // },
   "vars": {
     // Must match the flowsafe_deployment sentinel in this deployment's DB.
@@ -75,7 +62,6 @@
     // self-approve; any invalid value falls back to OFF. Leave unset to keep
     // SoD fully on.
     // "APPROVAL_ALLOW_SELF_DECISION": "admin"
-    // "SIEM_ENDPOINT": "https://siem.example/services/collector"
   }
   // Secrets (set with `wrangler secret put <name>`):
   //   DEPLOYMENT_IDENTITY_SECRET — REQUIRED; at least 32 random visible ASCII characters.
@@ -83,8 +69,8 @@
   //   APPROVAL_ACTOR_TOKENS — JSON map of bearer token ->
   //     { id, role }; roles: admin | builder | operator | reviewer | viewer.
   //     Unknown roles or malformed actor ids are dropped and their tokens 401.
-  //   SIEM_AUTH_HEADER — sent as the `authorization` header on audit export,
-  //     e.g. "Splunk <hec-token>".
+  //   MAINTENANCE_ADMIN_SECRET — REQUIRED by the provisioning control plane;
+  //     distinct from application actor tokens and DEPLOYMENT_IDENTITY_SECRET.
   //   STREAM_TICKET_SECRET — OPTIONAL; enables live streaming. A DEDICATED HMAC
   //     key that signs the ~60s WebSocket stream tickets (DL-010). Keep it
   //     distinct from any session-JWT secret. Absent => the /api/stream/* stage

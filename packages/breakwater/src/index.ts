@@ -82,6 +82,11 @@ export type {
   RateLimitDatabase,
   RateLimitStatement,
   RateLimitStore,
+  SingleTenantAuditPosture,
+  SingleTenantConnectorPolicies,
+  SingleTenantConnectorPoliciesOptions,
+  SingleTenantDurableStores,
+  SingleTenantPermissionPosture,
 } from './connector-sdk/index.js';
 export {
   CONNECTOR_EXECUTION_CONTEXT_KEY,
@@ -97,6 +102,7 @@ export {
   IDEMPOTENCY_KEY_CONTEXT_KEY,
   InMemoryIdempotencyStore,
   InMemoryRateLimitStore,
+  singleTenantConnectorPolicies,
 } from './connector-sdk/index.js';
 export type {
   BackgroundExecutionOptions,

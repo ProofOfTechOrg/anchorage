@@ -117,7 +117,7 @@ never resumes a run.
 - **Approval rows contain no deployment claim.** `CreateApprovalInput`, `ApprovalRecord`, and list filters cannot select an organization. The provisioning boundary chooses the database before request routing.
 - **Uniqueness is deployment-local.** The open-step index covers `(workflow_id, run_id, step_key)`. The captured-suspension index adds `suspended_at` and `resume_count`, so stale reconciliation cannot re-file the same leg.
 - **Legacy pooled schemas fail closed.** Schema initialization refuses a `flowsafe_approvals` table containing `tenant_id`. Provision a fresh per-organization database instead of rebuilding pooled rows in place.
-- **Maintenance uses the same store contract.** `sweepSLA()` scans the deployment queue. It remains a standalone scheduled function rather than a public route.
+- **Maintenance uses the same store contract.** `sweepSLA()` scans the deployment queue. It remains a standalone alarm-invoked operation rather than a public route.
 - **Grant queries require `workflowId` and `runId`.** Run ids are opaque and server-minted. Exact workflow, run, connector, suspension, and tool-call identity bind the grant.
 
 ## Preserve the security guarantees

@@ -21,7 +21,7 @@ export const ZONES: Record<NarrationZone, { label: string; blurb: string }> = {
   worker: {
     label: 'Worker',
     blurb:
-      'Cloudflare Worker: verifies deployment identity and JWTs, enforces RBAC and SoD, mints run ids, derives grants, orchestrates resumes, and owns the crons.',
+      'Cloudflare Worker: verifies deployment identity and JWTs, enforces RBAC and SoD, mints run ids, derives grants, and orchestrates resumes.',
   },
   do: {
     label: 'Durable Object',
@@ -33,10 +33,10 @@ export const ZONES: Record<NarrationZone, { label: string; blurb: string }> = {
     blurb:
       'The database: deployment sentinel, run snapshots, approval records, demo sessions, and budgets.',
   },
-  cron: {
-    label: 'cron',
+  alarm: {
+    label: 'maintenance alarm',
     blurb:
-      'Scheduled Worker invocations: the SLA sweep every 15 minutes escalates overdue approvals; retention removes old records and expired session metadata.',
+      'A fixed deployment Durable Object owns recurring alarms: the SLA sweep escalates overdue approvals; retention removes old records and expired session metadata.',
   },
 };
 

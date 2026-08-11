@@ -13,6 +13,7 @@ export type DeploymentIdentityProtocolExecutor = (
 ) => Promise<readonly DeploymentIdentityProtocolRow[]>;
 
 export const DEPLOYMENT_TAG_PATTERN: RegExp;
+export const DEPLOYMENT_ENVIRONMENT_PATTERN: RegExp;
 export const DEPLOYMENT_SENTINEL_TABLE: 'flowsafe_deployment';
 export const DEPLOYMENT_SENTINEL_DDL: string;
 export const DEPLOYMENT_SENTINEL_COLUMNS: readonly Readonly<{
@@ -23,6 +24,8 @@ export const DEPLOYMENT_SENTINEL_COLUMNS: readonly Readonly<{
 }>[];
 
 export class DeploymentIdentityError extends Error {}
+
+export function isDeploymentEnvironment(value: unknown): value is string;
 
 export function assertValidDeploymentTag(
   tag: unknown,

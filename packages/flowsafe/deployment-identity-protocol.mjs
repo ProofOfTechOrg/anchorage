@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 export const DEPLOYMENT_TAG_PATTERN = /^[a-z0-9]{3,32}$/;
+export const DEPLOYMENT_ENVIRONMENT_PATTERN =
+  /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
 export const DEPLOYMENT_SENTINEL_TABLE = 'flowsafe_deployment';
 export const DEPLOYMENT_SENTINEL_DDL = `CREATE TABLE IF NOT EXISTS ${DEPLOYMENT_SENTINEL_TABLE} (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -56,6 +58,12 @@ export class DeploymentIdentityError extends Error {
     super(message);
     this.name = 'DeploymentIdentityError';
   }
+}
+
+export function isDeploymentEnvironment(value) {
+  return (
+    typeof value === 'string' && DEPLOYMENT_ENVIRONMENT_PATTERN.test(value)
+  );
 }
 
 export function assertValidDeploymentTag(tag, caller) {

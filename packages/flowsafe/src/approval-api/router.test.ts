@@ -577,7 +577,7 @@ describe('createApprovalRouter', () => {
     expect(await response?.json()).toMatchObject({ claimedBy: 'quinn' });
   });
 
-  it('404s POST /sla/sweep — the sweep is cron-owned TCB code, not an endpoint', async () => {
+  it('404s POST /sla/sweep because the sweep is maintenance-owned TCB code', async () => {
     // #given — the route USED to exist and was an unfiltered cross-tenant
     // read+write behind a role check; it must never come back
     const { handle } = makeHandler();

@@ -133,17 +133,21 @@ try {
   CONNECTOR_GRANTS_CONTEXT_KEY,
   createGuardedAgent,
   createCodexConnector,
+  singleTenantConnectorPolicies,
   type AgentCliErrorCode,
   type AgentCliErrorMetadata,
   type ConnectorApprovalGrant,
   type ConnectorExecutionIdentity,
   type GuardedAgentHandle,
+  type SingleTenantConnectorPoliciesOptions,
 } from '@proofoftech/breakwater';
 import { isGuardedAgentHandle } from '@proofoftech/breakwater/agent';
 import {
   connectorManifest,
   createConnector,
+  singleTenantConnectorPolicies as singleTenantConnectorPoliciesFromSubpath,
   type ConnectorApprovalSuspension,
+  type SingleTenantConnectorPolicies,
 } from '@proofoftech/breakwater/connector-sdk';
 import { PolicyEngine } from '@proofoftech/breakwater/policy-engine';
 import {
@@ -165,6 +169,15 @@ const projection: PrincipalPermissions = {
   permissions: [permission],
   policyVersion: 'permissions-v1',
 };
+const presetOptions: SingleTenantConnectorPoliciesOptions = {
+  audit: { mode: 'development', allowUnaudited: true },
+  egress: { allowedDomains: [] },
+  permissions: { principalPermissions: 'not-configured' },
+};
+const preset: SingleTenantConnectorPolicies =
+  singleTenantConnectorPolicies(presetOptions);
+const presetFromSubpath =
+  singleTenantConnectorPoliciesFromSubpath(presetOptions);
 const authorized = createConnector({
   id: 'payments.release',
   description: 'Releases one payment',
@@ -222,6 +235,8 @@ void RBACMiddleware;
 void CODEX_CLI;
 void connectorManifest(tool);
 void connectorManifest(authorized)?.requiredPermissions;
+void preset;
+void presetFromSubpath;
 void isGuardedAgentHandle(guarded);
 void isPermissionIdentifier(permission);
 void isPrincipalPermissions(projection);
@@ -242,6 +257,7 @@ import {
   createConnector,
   createGuardedAgent,
   createCodexConnector,
+  singleTenantConnectorPolicies,
 } from '@proofoftech/breakwater';
 import { isGuardedAgentHandle } from '@proofoftech/breakwater/agent';
 import {
@@ -249,6 +265,7 @@ import {
   CONNECTOR_EXECUTION_CONTEXT_KEY,
   CONNECTOR_GRANTS_CONTEXT_KEY,
   connectorManifest,
+  singleTenantConnectorPolicies as singleTenantConnectorPoliciesFromSubpath,
 } from '@proofoftech/breakwater/connector-sdk';
 import {
   isPermissionIdentifier,
@@ -282,6 +299,34 @@ assert.equal(
   true,
 );
 assert.equal(isPrincipalPermissions(null), false);
+
+const presetOptions = {
+  audit: { mode: 'development', allowUnaudited: true },
+  egress: { allowedDomains: [] },
+  permissions: { principalPermissions: 'not-configured' },
+};
+const preset = singleTenantConnectorPolicies(presetOptions);
+const subpathPreset = singleTenantConnectorPoliciesFromSubpath(presetOptions);
+assert.equal(Object.isFrozen(preset), true);
+assert.equal(Object.isFrozen(subpathPreset), true);
+const presetRead = createConnector({
+  id: 'packed.local-read',
+  description: 'Read local packed-consumer state',
+  execute: async () => ({ ok: true }),
+  permissions: { sideEffect: 'read' },
+  policies: preset,
+});
+assert.deepEqual(
+  await presetRead.execute({}, { requestContext: new RequestContext() }),
+  { ok: true },
+);
+assert.throws(() => createConnector({
+  id: 'packed.egress-drift',
+  description: 'Declare unapproved packed-consumer egress',
+  execute: async () => ({ ok: true }),
+  permissions: { sideEffect: 'read', egress: ['api.example.com'] },
+  policies: preset,
+}), /outside the single-tenant preset organization allowlist/);
 
 const release = createConnector({
   id: 'payments.release',

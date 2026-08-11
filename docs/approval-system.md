@@ -134,7 +134,7 @@ The service always routes batch work through the same single-record methods. Bat
 
 ## SLA and notifications
 
-`sweepSLA(store, options)` reads the deployment store and transitions overdue open requests to `escalated`. Run it from a scheduled Worker invocation, never an HTTP route.
+`sweepSLA(store, options)` reads the deployment store and transitions overdue open requests to `escalated`. Run it through the maintenance Durable Object duty, never an HTTP route.
 
 `ApprovalNotificationSink` receives contained callbacks when a record is created or escalated. A transport failure does not undo the approval mutation; flowsafe writes an `approval.notify` audit failure.
 

@@ -22,7 +22,7 @@ const ZONE_ORDER: readonly NarrationZone[] = [
   'worker',
   'do',
   'd1',
-  'cron',
+  'alarm',
 ];
 
 export function WhereThingsRunDialog({

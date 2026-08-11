@@ -25,7 +25,7 @@ import {
   TERMINAL_RUN_STATUSES,
 } from '@/run-client';
 
-export type NarrationZone = 'browser' | 'worker' | 'do' | 'd1' | 'cron';
+export type NarrationZone = 'browser' | 'worker' | 'do' | 'd1' | 'alarm';
 export type NarrationTone =
   | 'neutral'
   | 'info'
@@ -493,7 +493,7 @@ export function deriveApprovalEvents(
           observed: true,
           toast: false,
         },
-        cronMentionEvent(at),
+        alarmMentionEvent(at),
       );
       continue;
     }
@@ -542,7 +542,7 @@ export function deriveApprovalEvents(
         events.push({
           key: `approval:${record.id}:status:escalated`,
           at,
-          zone: 'cron',
+          zone: 'alarm',
           kind: 'approval.escalated',
           title: `Approval ${shortId(record.id)} escalated: SLA breached`,
           detail:
@@ -579,12 +579,12 @@ export function deriveApprovalEvents(
 // ---- one-shot builders -------------------------------------------------------
 
 /** Emitted once per session, anchored to the first approval sighting. */
-function cronMentionEvent(at: number): NarrationEvent {
+function alarmMentionEvent(at: number): NarrationEvent {
   return {
-    key: 'cron:mention',
+    key: 'alarm:mention',
     at,
-    zone: 'worker',
-    kind: 'cron.mention',
+    zone: 'alarm',
+    kind: 'alarm.mention',
     title: 'Background machinery (not client-observable)',
     detail:
       'An SLA sweep every 15 min escalates overdue approvals; retention removes expired session metadata and old snapshots; audit streams to Workers Logs.',
@@ -694,7 +694,7 @@ export function startEvent(
         observed: true,
         toast: false,
       },
-      cronMentionEvent(at),
+      alarmMentionEvent(at),
     );
   }
   if (TERMINAL_RUN_STATUSES.has(response.status)) {

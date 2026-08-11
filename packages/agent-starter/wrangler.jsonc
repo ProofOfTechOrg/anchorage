@@ -7,7 +7,7 @@
   "compatibility_date": "2026-07-26",
   "compatibility_flags": ["nodejs_compat"],
   "secrets": {
-    "required": ["DEPLOYMENT_IDENTITY_SECRET"]
+    "required": ["DEPLOYMENT_IDENTITY_SECRET", "MAINTENANCE_ADMIN_SECRET"]
   },
   "observability": {
     "enabled": true,
@@ -19,6 +19,7 @@
   "durable_objects": {
     "bindings": [
       { "name": "RUNNER", "class_name": "StarterRunner" },
+      { "name": "MAINTENANCE", "class_name": "StarterMaintenance" },
       { "name": "HUB", "class_name": "StarterHub" },
       { "name": "THREAD", "class_name": "StarterThread" },
       {
@@ -33,6 +34,10 @@
   },
   "exports": {
     "StarterRunner": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "StarterMaintenance": {
       "type": "durable-object",
       "storage": "sqlite"
     },
@@ -60,11 +65,9 @@
       "database_id": "REPLACE_WITH_D1_DATABASE_ID"
     }
   ],
-  "triggers": {
-    "crons": ["*/5 * * * *", "17 * * * *", "* * * * *"]
-  },
-  // Before deployment, set the required internal credential with
-  // `wrangler secret put DEPLOYMENT_IDENTITY_SECRET`.
+  // Before deployment, set distinct internal credentials with
+  // `wrangler secret put DEPLOYMENT_IDENTITY_SECRET` and
+  // `wrangler secret put MAINTENANCE_ADMIN_SECRET`.
   "vars": {
     // Deliberately invalid until provisioning replaces it with a lowercase tag.
     "DEPLOYMENT_TENANT": "REPLACE_WITH_DEPLOYMENT_TAG",

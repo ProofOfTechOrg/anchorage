@@ -113,7 +113,7 @@ export type ApprovalAuditSink = (event: ApprovalAuditEvent) => unknown;
  * A queue moment worth pushing at reviewers: a NEW request entered the queue
  * ('created' — fired only when a record is actually inserted, never on the
  * idempotent re-observation of an already-open step), or an open request
- * breached its SLA ('escalated', fired per record by the cron sweep).
+ * breached its SLA ('escalated', fired per record by the maintenance sweep).
  * Decisions are deliberately not notification events — the decider is looking
  * at the dashboard when they happen.
  */

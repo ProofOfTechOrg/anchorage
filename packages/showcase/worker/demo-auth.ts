@@ -296,7 +296,7 @@ export async function consumeRunBudget(
 }
 
 export interface DeleteExpiredDemoSessionsOptions {
-  /** Expired sessions processed per invocation — the cron's CPU budget guard. */
+  /** Expired sessions processed per invocation — the alarm's CPU budget guard. */
   limit?: number;
   /**
    * Grace after `expires_at`, normally the JWT lifetime. This keeps metadata

@@ -108,8 +108,8 @@ async function seedPending(
 }
 
 /**
- * The cron-owned standalone sweep over the harness's SYSTEM store, sharing
- * the harness clock and audit sink — the shape every host's scheduled()
+ * The maintenance-owned standalone sweep over the harness's SYSTEM store, sharing
+ * the harness clock and audit sink: the shape every host's alarm duty
  * runs. There is deliberately no service.sweepSLA anymore.
  */
 function runSweep(
@@ -822,7 +822,7 @@ describe('ApprovalService.sweepSLA', () => {
     const options: ApprovalServiceOptions = {
       store: harness.store,
       // @ts-expect-error — onEscalation is not an ApprovalService option;
-      // wire SweepSLAOptions.onEscalation (the cron sweep) instead.
+      // wire SweepSLAOptions.onEscalation (the maintenance sweep) instead.
       onEscalation: () => {},
     };
 

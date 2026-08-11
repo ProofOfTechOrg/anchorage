@@ -266,7 +266,7 @@ The router writes through Mastra's objective helpers into the goal lane of `mast
 
 ## Add schedules
 
-Create a `D1SchedulesStorage`, expose `createScheduleRouter()`, and run `createScheduleTick()` from its own cron expression.
+Create a `D1SchedulesStorage`, expose `createScheduleRouter()`, and pass `createScheduleTick()` to the maintenance singleton with a dedicated tick interval.
 
 The router:
 
@@ -316,7 +316,7 @@ The host manager:
 - closes enqueue before workers on shutdown;
 - scopes nested Mastra server-sent event payloads to the deployment host.
 
-Pass `backgroundTasks` to `createFlowsafeWorker()` to add terminal-task TTL cleanup to the purge cron. The default cleanup windows are package-defined; set explicit values when your data policy differs.
+Pass `backgroundTasks` to `createFlowsafeWorker()` to add terminal-task TTL cleanup to the maintenance purge duty. The default cleanup windows are package-defined; set explicit values when your data policy differs.
 
 Only connectors whose permission manifest is read-only may opt into model-requested background execution. Write, destructive, and idempotent connectors stay foreground-only. A read-only connector may separately require approval; its grant check still runs when the background task executes.
 
@@ -347,9 +347,9 @@ rejected. Choose a production-safe positive cadence for each polling provider.
 
 `githubSignalProvider()` is the reference WebCrypto HMAC implementation. Provide an ownership allowlist that maps each external resource to deployment threads.
 
-## Run scheduled duties
+## Run alarm-driven duties
 
-Keep independent duties in separate failure boundaries. CPU termination is not a catchable JavaScript exception.
+Keep independent duties in separate alarm invocations. CPU termination is not a catchable JavaScript exception. The maintenance singleton persists its successor before each duty and schedules an immediate follow-up when another duty is due.
 
 | Duty | When to enable |
 | --- | --- |
