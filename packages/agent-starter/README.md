@@ -39,7 +39,7 @@ No route accepts a grant. No public route exposes raw agent resume.
 
 ## Architecture
 
-The Worker binds five Durable Object classes:
+The Worker binds six Durable Object classes:
 
 | Binding | Identity | Responsibility |
 | --- | --- | --- |
@@ -48,8 +48,9 @@ The Worker binds five Durable Object classes:
 | `HUB` | Fixed deployment singleton | Hibernatable approval fan-out and presence |
 | `SIGNAL_PROVIDER_HOST` | Fixed deployment singleton | D1 subscription rehydration and provider alarm lifecycle |
 | `BACKGROUND_TASKS` | `deployment-background-tasks` singleton | Background manager, recovery, cleanup, and read/SSE facade |
+| `MAINTENANCE` | `deployment-maintenance` singleton | Alarm-owned SLA sweep, retention purge, and schedule or notification ticks |
 
-All five use the deployment's D1 database. `createComposedStorage()` overlays notification, thread-state, and schedule domains on Mastra storage. The background-task Durable Object composes its own task and serialized-workflow domains for the same database.
+All six use the deployment's D1 database. `createComposedStorage()` overlays notification, thread-state, and schedule domains on Mastra storage. The background-task Durable Object composes its own task and serialized-workflow domains for the same database.
 
 `createFlowsafeWorker()` owns deployment verification, health, the guarded agent catalog, stream tickets, signals, goals, schedules, approvals, workflows, SLA sweep, retention, and schedule or notification ticks. `preRoutes` adds provider webhooks, subscriptions, and the background-task facade.
 
@@ -65,6 +66,8 @@ pnpm --dir packages/flowsafe provision:deployment -- \
   --config ../agent-starter/wrangler.jsonc
 pnpm --filter anchorage-agent-starter exec wrangler secret put \
   DEPLOYMENT_IDENTITY_SECRET
+pnpm --filter anchorage-agent-starter exec wrangler secret put \
+  MAINTENANCE_ADMIN_SECRET
 ```
 
 The provisioning command verifies the exact singleton sentinel schema. It is idempotent for the same tag, refuses a database already stamped for another deployment, and refuses an unowned database with application tables. The Worker validates the tag and sentinel. Every Worker-to-object topology also stamps the internal credential, which the target compares before reading storage; this prevents a cross-script binding from reaching another deployment's objects.
@@ -101,12 +104,15 @@ Set `DEPLOYMENT_TENANT`, run the provisioning command above, then configure dist
 ```bash
 cd packages/agent-starter
 pnpm exec wrangler secret put DEPLOYMENT_IDENTITY_SECRET
+pnpm exec wrangler secret put MAINTENANCE_ADMIN_SECRET
 pnpm exec wrangler secret put AUTH_HMAC_SECRET
 pnpm exec wrangler secret put STREAM_TICKET_SECRET
 pnpm exec wrangler secret put MODEL_API_KEY
 pnpm exec wrangler secret put GITHUB_WEBHOOK_SECRET
 pnpm run deploy
 ```
+
+After deployment, authenticate `POST /admin/ensure-maintenance` with `MAINTENANCE_ADMIN_SECRET`. Confirm `GET /admin/maintenance-status` returns a non-null `alarmAt` before routing traffic.
 
 For local work:
 
@@ -276,15 +282,15 @@ The starter caps the deployment at 100 schedules and rejects crons faster than o
 
 Public background routes are read-only. Enqueue, cancel, and resume are server-side operations. Keep approval-carrying writes in the foreground agent topology.
 
-## Scheduled maintenance
+## Alarm-driven maintenance
 
-Keep the cron strings in `wrangler.jsonc` and `src/config.ts` byte-identical:
+The fixed `deployment-maintenance` Durable Object schedules three independent duties:
 
-- `*/5 * * * *`: approval SLA sweep;
-- `17 * * * *`: approval, terminal run, memory, notification, thread-state, schedule-trigger, and background-task retention;
-- `* * * * *`: schedule firing and due-notification dispatch.
+- five-minute approval SLA sweep;
+- hourly approval, terminal run, memory, notification, thread-state, schedule-trigger, and background-task retention;
+- one-minute schedule firing and due-notification dispatch.
 
-The duties use separate invocations so a CPU-limit termination in one cannot starve another. Provider and background-task maintenance use Durable Object alarms.
+The object persists the next alarm before each duty and runs one due duty per invocation. Provider and background-task maintenance use separate Durable Object alarms. Provisioning must authenticate `/admin/ensure-maintenance` after deployment and monitor `/admin/maintenance-status`.
 
 ## Configuration
 
@@ -292,6 +298,7 @@ The duties use separate invocations so a CPU-limit termination in one cannot sta
 | --- | --- | --- |
 | `DEPLOYMENT_TENANT` | variable | Required provisioning tag matching the D1 sentinel |
 | `DEPLOYMENT_IDENTITY_SECRET` | secret | Required internal Worker-to-Durable-Object caller credential |
+| `MAINTENANCE_ADMIN_SECRET` | secret | Required control-plane credential for maintenance bootstrap and status |
 | `AUTH_HMAC_SECRET` | secret | HS256 actor verification; absent means protected routes return `401` |
 | `AUTH_JWT_ISSUER` | variable | Required JWT issuer |
 | `AUTH_JWT_AUDIENCE` | variable | Required JWT audience |

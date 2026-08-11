@@ -61,6 +61,7 @@ import {
 import type { EgressFetchBase, EgressGuardedFetch } from './egress-fetch.js';
 import { EgressDeniedError, egressFetch } from './egress-fetch.js';
 import { newToken } from './new-token.js';
+import { assertSingleTenantConnectorPolicies } from './single-tenant-preset.js';
 
 /** Permission manifest — what the connector declares about itself. */
 export interface PermissionManifest {
@@ -768,7 +769,8 @@ function normalizedRequiredPermissions(
 export function createConnector<TInput = unknown, TOutput = unknown>(
   config: ConnectorConfig<TInput, TOutput>,
 ): Tool<TInput, TOutput> {
-  const { id, policies = {} } = config;
+  const { id } = config;
+  const configuredPolicies = config.policies ?? {};
   // One construction guard closes BOTH id-derived colon-joined store keys —
   // the idempotency scoped key and the rate-limit budget key — since both are
   // built from this single id (details in the thrown message).
@@ -792,6 +794,12 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     (entry) =>
       `connector ${id}: egress entry '${entry}' must be a bare hostname ('api.example.com') or wildcard ('*.example.com')`,
   );
+  const validatedPolicies = assertSingleTenantConnectorPolicies(
+    id,
+    manifest,
+    configuredPolicies,
+  );
+  const policies = validatedPolicies.policies;
   // The runtime egress guard is call-invariant — declared egress and the base
   // fetch are frozen at construction — so build it ONCE. Each call wraps it
   // only to bind that call's requestContext for the denial audit.
@@ -836,7 +844,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       ? { ...rateLimitSpec, store: policies.rateLimitStore }
       : undefined;
 
-  const audit = policies.audit;
+  const auditRecord = validatedPolicies.auditRecord;
   const gates: readonly ToolPolicyEvaluator[] = [
     ...(policies.networkEgress ? [networkEgress(policies.networkEgress)] : []),
     ...(policies.evaluators ?? []),
@@ -857,7 +865,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     extra: { reason?: string; detail?: Record<string, unknown> } = {},
     action = 'connector.execute',
   ): void {
-    audit?.record({
+    auditRecord?.({
       actor: actorFromRequestContext(requestContext) ?? null,
       action,
       resource: id,
@@ -1528,3 +1536,11 @@ export type {
 // Fetch-level egress enforcement (own module; createConnector wires it per
 // call as ConnectorRuntime.fetch, but it also works standalone).
 export { EgressDeniedError, egressFetch } from './egress-fetch.js';
+export type {
+  SingleTenantAuditPosture,
+  SingleTenantConnectorPolicies,
+  SingleTenantConnectorPoliciesOptions,
+  SingleTenantDurableStores,
+  SingleTenantPermissionPosture,
+} from './single-tenant-preset.js';
+export { singleTenantConnectorPolicies } from './single-tenant-preset.js';

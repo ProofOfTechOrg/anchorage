@@ -188,6 +188,11 @@ export class AuditLogger {
     return [...this.#buffer];
   }
 
+  /** Whether this logger exports records beyond its in-memory ring buffer. */
+  hasExternalSink(): boolean {
+    return this.#sink !== undefined;
+  }
+
   /** Remove every buffered event without changing the configured sink. */
   clear(): void {
     this.#buffer = [];

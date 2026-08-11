@@ -362,7 +362,7 @@ describe('Mastra persistence guards (D1Store SQL over node:sqlite)', () => {
     // holds ISO text. This pin exists because the blast radius is unbounded and
     // silent: SQLite orders INTEGER before TEXT ALWAYS, so if a bump ever stored
     // epoch ints, `updatedAt < '<iso text>'` would be true for EVERY row and the
-    // first cron firing would delete every thread and every message — active
+    // first purge-alarm firing would delete every thread and every message — active
     // conversations included, history first. purgeExpiredWorkflowRuns takes the
     // same bet but ANDs a terminal-status predicate, so it can only over-delete
     // finished runs; this purge has no second predicate.

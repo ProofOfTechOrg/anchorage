@@ -10,7 +10,7 @@
   "compatibility_date": "2026-07-26",
   "compatibility_flags": ["nodejs_compat"],
   "secrets": {
-    "required": ["DEPLOYMENT_IDENTITY_SECRET"]
+    "required": ["DEPLOYMENT_IDENTITY_SECRET", "MAINTENANCE_ADMIN_SECRET"]
   },
   // The account hosting the proofoftech.org zone (the custom domain below
   // must live on the same account). Pinned because the deploying identity
@@ -26,21 +26,23 @@
   // to Workers Logs.
   "observability": { "enabled": true },
   // RUNNER: one DO per run (workflow execution). HUB: one deployment singleton
-  // (live
-  // stream fan-out). Every stream route lives under /api/stream/, which the
-  // /api/* run_worker_first entry below already routes to the Worker, so no
-  // assets edit is needed.
+  // for live stream fan-out. MAINTENANCE: one deployment singleton for
+  // alarm-owned maintenance duties. Every stream route lives under
+  // /api/stream/, which the /api/* run_worker_first entry below already routes
+  // to the Worker, so no assets edit is needed.
   "durable_objects": {
     "bindings": [
       { "name": "RUNNER", "class_name": "ShowcaseRunner" },
-      { "name": "HUB", "class_name": "ShowcaseHub" }
+      { "name": "HUB", "class_name": "ShowcaseHub" },
+      { "name": "MAINTENANCE", "class_name": "ShowcaseMaintenance" }
     ]
   },
-  // DO migrations are append-only: the v1 runner migration is UNCHANGED and the
-  // hub class gets its own v2 tag.
+  // DO migrations are append-only: v1 runner and v2 hub are unchanged;
+  // maintenance has its own v3 tag.
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["ShowcaseRunner"] },
-    { "tag": "v2", "new_sqlite_classes": ["ShowcaseHub"] }
+    { "tag": "v2", "new_sqlite_classes": ["ShowcaseHub"] },
+    { "tag": "v3", "new_sqlite_classes": ["ShowcaseMaintenance"] }
   ],
   "d1_databases": [
     {
@@ -61,6 +63,7 @@
     "not_found_handling": "single-page-application",
     "run_worker_first": [
       "/api/*",
+      "/admin/*",
       "/runs",
       "/runs/*",
       "/healthz",
@@ -82,16 +85,9 @@
   // Cloudflare Email Service is TRANSACTIONAL — for bulk campaigns swap the
   // connector's execute for a marketing ESP.
   // "send_email": [{ "name": "EMAIL" }],
-  // TWO cron expressions, dispatched on controller.cron (worker.ts
-  // SWEEP_CRON / PURGE_CRON — keep these literals in sync): the SLA sweep and
-  // the purge never share an invocation, because a CPU-limit termination
-  // kills the isolate un-catchably and a slow sweep would otherwise starve
-  // the purge forever.
-  "triggers": { "crons": ["*/15 * * * *", "7 * * * *"] },
   // Optional audit export to a SIEM. These cutover-specific names keep the
-  // pre-cutover queues addressable for rollback. Create both queues, uncomment
-  // this block, then set SIEM_ENDPOINT (var) and SIEM_AUTH_HEADER (secret).
-  // Without this block, audit stays on structured Workers Logs only.
+  // pre-cutover queue addressable for rollback. Create it and uncomment this
+  // producer binding. The shared control-plane consumer owns SIEM delivery.
   //   wrangler queues create anchorage-showcase-single-tenant-audit
   //   wrangler queues create anchorage-showcase-single-tenant-audit-dlq
   // "queues": {
@@ -101,13 +97,6 @@
   //       "queue": "anchorage-showcase-single-tenant-audit"
   //     }
   //   ],
-  //   "consumers": [
-  //     {
-  //       "queue": "anchorage-showcase-single-tenant-audit",
-  //       "max_retries": 10,
-  //       "dead_letter_queue": "anchorage-showcase-single-tenant-audit-dlq"
-  //     }
-  //   ]
   // },
   "vars": {
     // Must match the flowsafe_deployment sentinel provisioned in D1.
@@ -138,11 +127,13 @@
     // "GITHUB_CLIENT_ID": "<your GitHub OAuth app client id>",
     // "DEMO_DISABLED": "true",   // kill switch: 503s /auth/* AND stops
     //                            // verifying already-issued demo JWTs
-    // "SIEM_ENDPOINT": "https://siem.example/services/collector"
   }
   // Secrets (set with `wrangler secret put <name>`):
   //   DEPLOYMENT_IDENTITY_SECRET — REQUIRED; at least 32 random visible ASCII characters.
   //     Shared only by this deployment's Worker and Durable Objects.
+  //   MAINTENANCE_ADMIN_SECRET — REQUIRED; distinct 32–256 visible ASCII
+  //     credential used only by the fleet control plane to arm and inspect the
+  //     fixed maintenance singleton.
   //   APPROVAL_ACTOR_TOKENS — operator/admin bearer map. Deliberately NOT a
   //     var here: no credentials are baked into a deployable config, so a
   //     deploy without secrets 401s everywhere (fail closed). Local dev reads
@@ -160,5 +151,4 @@
   //     HS256 token sets and the OAuth state. Generate long + random.
   //   GOOGLE_CLIENT_SECRET — pairs with the GOOGLE_CLIENT_ID var.
   //   GITHUB_CLIENT_SECRET — pairs with the GITHUB_CLIENT_ID var (fallback).
-  //   SIEM_AUTH_HEADER — sent as the `authorization` header on audit export.
 }

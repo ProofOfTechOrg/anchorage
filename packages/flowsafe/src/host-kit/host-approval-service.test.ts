@@ -33,14 +33,17 @@ describe('runApprovalRetentionPurge', () => {
     const store = new InMemoryApprovalStoreFactory().store();
 
     // #when
-    const purged = await runApprovalRetentionPurge({
+    const outcome = await runApprovalRetentionPurge({
       store,
       retentionDays: '1e303',
-      cron: '7 * * * *',
+      trigger: 'purge',
     });
 
     // #then — contained: resolves undefined, one maintenance-error line
-    expect(purged).toBeUndefined();
+    expect(outcome).toEqual({
+      ok: false,
+      error: expect.stringContaining('TypeError'),
+    });
     const logged = errorSpy.mock.calls
       .map(([line]) => String(line))
       .filter((line) => line.includes('maintenance-error'));
@@ -48,7 +51,7 @@ describe('runApprovalRetentionPurge', () => {
     expect(JSON.parse(logged[0] ?? '{}')).toMatchObject({
       type: 'maintenance-error',
       surface: 'approval-retention-purge',
-      cron: '7 * * * *',
+      trigger: 'purge',
       error: expect.stringContaining('TypeError'),
     });
   });
@@ -71,14 +74,14 @@ describe('runApprovalRetentionPurge', () => {
     });
 
     // #when — APPROVAL_RETENTION_DAYS=0: purge decided approvals now
-    const purged = await runApprovalRetentionPurge({
+    const outcome = await runApprovalRetentionPurge({
       store: factory.store(),
       retentionDays: '0',
-      cron: '7 * * * *',
+      trigger: 'purge',
     });
 
     // #then
-    expect(purged).toBe(1);
+    expect(outcome).toEqual({ ok: true, value: 1 });
   });
 });
 

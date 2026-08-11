@@ -10,9 +10,6 @@ import {
 } from '@proofoftech/flowsafe/host-kit';
 
 export const SYSTEM_PRINCIPAL_ID = 'anchorage-agent-starter';
-export const SWEEP_CRON = '*/5 * * * *';
-export const PURGE_CRON = '17 * * * *';
-export const TICK_CRON = '* * * * *';
 export const UNCONFIGURED_MODEL_ID = 'provider/model';
 
 const DEFAULT_SIGNAL_ATTRIBUTES = [

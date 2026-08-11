@@ -25,6 +25,9 @@
     "architecture:check": "pnpm run architecture:check:rules && pnpm run architecture:controls",
     "architecture:check:rules": "dependency-cruise packages/flowsafe/src packages/agent-starter/src packages/agent-starter/test packages/agent-starter/scripts --exclude '^packages/flowsafe/src/.*\\.(?:test|stories)\\.(?:ts|tsx)$'",
     "architecture:check:agent-starter": "dependency-cruise packages/agent-starter/src packages/agent-starter/test packages/agent-starter/scripts",
+    "fleet-control:check": "pnpm --filter anchorage-fleet-control test && pnpm --filter anchorage-fleet-control typecheck && pnpm --filter anchorage-fleet-control build",
+    "fleet-control:credentialed": "pnpm --filter anchorage-fleet-control test:credentialed",
+    "durability:benchmark": "pnpm --filter @proofoftech/flowsafe exec node scripts/durability-benchmark.mjs",
     "architecture:controls": "node --test scripts/architecture-positive-controls.test.mjs",
     "test:packed-breakwater": "pnpm --filter @proofoftech/breakwater test:packed-consumer",
     "test:packed-flowsafe-agent-host": "pnpm --filter @proofoftech/flowsafe test:agent-host-export",
@@ -69,6 +72,12 @@
       "workerd"
     ],
     "overrides": {
+      "@hono/node-server": "2.0.10",
+      "@modelcontextprotocol/sdk": "1.30.0",
+      "fast-uri": "3.1.5",
+      "ip-address": "10.3.1",
+      "js-yaml@3": "3.15.1",
+      "nanoid@3": "3.3.17",
       "undici": "7.29.0"
     }
   }

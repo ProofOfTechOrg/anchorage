@@ -175,7 +175,7 @@ export class ApprovalApiClient {
   }
 
   // There is deliberately no sweep() — POST /sla/sweep no longer exists. The
-  // SLA sweep is scheduled TCB code (approval-api sweepSLA over the deployment
+  // SLA sweep is alarm-owned TCB code (approval-api sweepSLA over the deployment
   // store): an HTTP-reachable sweep was a deployment-wide read+write behind a
   // role check.
 

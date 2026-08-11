@@ -322,7 +322,7 @@ export class BackgroundTaskHost {
    * recovers HERE, since the alarm is what woke it — see the recovery seam
    * above), then run the manager's TTL cleanup. The hosting DO re-arms the alarm
    * after this returns. Cleanup is core's own `cleanup()` — the belt to the
-   * storage-layer `purgeExpiredBackgroundTasks` cron braces (that one needs no
+   * storage-layer `purgeExpiredBackgroundTasks` maintenance duty (which needs no
    * live manager); running both is harmless (each only deletes rows past the
    * TTL).
    */

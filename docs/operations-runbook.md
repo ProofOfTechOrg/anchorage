@@ -69,9 +69,9 @@ Before deployment:
 2. Confirm `DEPLOYMENT_TENANT` matches the singleton sentinel in every bound D1 database.
 3. Confirm `DEPLOYMENT_IDENTITY_SECRET` is distinct per deployment and reaches every Worker-to-Durable-Object topology.
 4. Confirm every enabled route has its required namespace or storage domain.
-5. Confirm cron expressions exactly match the Worker constants.
+5. Confirm the `MAINTENANCE` singleton binding and append-only migration exist, then authenticate `POST /admin/ensure-maintenance`.
 6. Confirm the identity verifier fails closed with missing configuration.
-7. Confirm internal-object, stream-ticket, OAuth, model, webhook, connector, and SIEM secrets are distinct.
+7. Confirm internal-object, maintenance-admin, stream-ticket, OAuth, model, webhook, connector, and SIEM secrets are distinct.
 8. Confirm R2 artifact storage is passed to runtime, retention, and the deployment decommission inventory.
 9. Confirm audit Queue dead-letter policy and collector authorization.
 10. Confirm a rollback bundle remains compatible with the deployed database and migration tags.
@@ -100,9 +100,12 @@ pnpm --dir packages/flowsafe provision:deployment -- \
 pnpm --dir packages/flowsafe exec wrangler secret put \
   DEPLOYMENT_IDENTITY_SECRET \
   --config deploy/wrangler.jsonc
+pnpm --dir packages/flowsafe exec wrangler secret put \
+  MAINTENANCE_ADMIN_SECRET \
+  --config deploy/wrangler.jsonc
 ```
 
-Run the provisioning command immediately after D1 creation and before application migrations. It verifies the strict singleton schema, is idempotent for the same tag, refuses to re-stamp a database owned by another deployment, and refuses an unowned database with application tables. Do not expose it as a public route. Generate a distinct 32–256 visible ASCII character internal credential for each deployment.
+Run the provisioning command immediately after D1 creation and before application migrations. It verifies the strict singleton schema, is idempotent for the same tag, refuses to re-stamp a database owned by another deployment, and refuses an unowned database with application tables. Do not expose it as a public route. Generate distinct 32–256 visible ASCII deployment-identity and maintenance-admin credentials for each deployment.
 
 Then:
 
@@ -110,9 +113,10 @@ Then:
 2. Seed the new D1 database, then apply application migrations.
 3. Set `DEPLOYMENT_TENANT` to the seeded tag and bind the internal credential only to that deployment's Worker and Durable Objects.
 4. Record the one-to-one organization-to-resource mapping in the control plane.
-5. Deploy without public traffic and call a protected route. Confirm the sentinel check succeeds before issuing user credentials.
-6. Issue verified credentials that carry only the actor id, role, and any application-specific identity claims.
-7. Start a smoke run and confirm the host returns opaque run and thread ids without an organization prefix.
+5. Deploy without public traffic, authenticate `POST /admin/ensure-maintenance`, and confirm `GET /admin/maintenance-status` has a non-null `alarmAt`.
+6. Call a protected route and confirm the sentinel check succeeds before issuing user credentials.
+7. Issue verified credentials that carry only the actor id, role, and any application-specific identity claims.
+8. Start a smoke run and confirm the host returns opaque run and thread ids without an organization prefix.
 8. In a scratch deployment, bind the Worker to a database with a different sentinel and confirm protected routes return `503` without reading application data.
 9. Bind a scratch Worker namespace to another deployment's Durable Objects and confirm the wrong internal credential is rejected before object storage is read.
 10. Restore the correct bindings and repeat the smoke run.
@@ -133,15 +137,15 @@ Never bind two organizations to one data-plane resource set. Never reuse a tag w
 
 There is no in-database organization purge. Abandoned live runs and approvals disappear only when the physical database is deleted, so revoke traffic before deletion and treat the resource inventory as the completion checklist.
 
-## Scheduled duties
+## Alarm-driven duties
 
-Use separate cron invocations for:
+The maintenance singleton runs separate alarm invocations for:
 
 - approval SLA sweep;
 - retention purge;
 - schedule fire tick, when schedules are enabled.
 
-A Workers CPU-limit termination kills the isolate and bypasses JavaScript `catch`. Separate invocations stop one runaway class from permanently starving another.
+A Workers CPU-limit termination kills the isolate and bypasses JavaScript `catch`. The object persists the next alarm before each duty and runs one duty per invocation, so one runaway class cannot permanently starve another.
 
 The purge invocation contains independent failure boundaries for each configured domain:
 
@@ -212,7 +216,7 @@ At minimum, alert on:
 - approval SLA escalation;
 - approval resume failures;
 - audit sink and Queue retry/dead-letter activity;
-- unknown cron expressions;
+- maintenance bootstrap, stale-alarm recovery, and duty failures;
 - any purge duty failure;
 - provider alarm/reconciliation failure;
 - schedule skip due to run cap or invalid stored data;
@@ -241,7 +245,7 @@ Audit records are security evidence. Queue depth and SIEM ingestion status must 
 | Egress policy allowed an unexpected socket | Connector bypassed runtime fetch | Route the transport through guarded fetch and add infrastructure egress control |
 | Live updates stop but HTTP works | Hub binding, ticket secret/expiry, socket liveness | Let client poll; repair stream configuration without disabling authorization |
 | Subscription changed but polling did not | Reconcile response/audit and provider alarm | Retry `reconcilePolling()` against committed subscriptions |
-| Schedule did not fire | Tick cron, active status, CAS winner, run cap, and stored metadata | Correct configuration or stored row; do not bypass the tick guard |
+| Schedule did not fire | Maintenance alarm status, active status, CAS winner, run cap, and stored metadata | Re-arm maintenance or correct the stored row; do not bypass the tick guard |
 | Purge removed a snapshot but left R2 | Artifact store omitted or delete failed | Restore row/key evidence if available, repair paired purge, scan known prefix |
 | Audit is absent while requests succeed | Sink, Queue, consumer, SIEM | Restore export, preserve local ring/Logs, assess evidence gap |
 | Agent CLI error lacks output | Expected safe diagnostics | Inspect the isolated workspace/vendor logs under appropriate access; do not weaken public error safety |

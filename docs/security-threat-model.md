@@ -11,7 +11,7 @@ Anchorage is designed to preserve these properties:
 1. A connector side effect runs only after all configured tool policies pass.
 2. A human approval grants only the named connector on the exact authorized suspension.
 3. A client, model, signal, workflow input, or raw resume cannot mint a capability.
-4. A deployment cannot serve a D1 database provisioned for another organization, and supported data-plane routes cannot cross a physical deployment boundary.
+4. A deployment cannot serve D1 or R2 resources provisioned for another organization, and supported data-plane routes cannot cross a physical deployment boundary.
 5. Concurrent reviewers and workers do not commit two conflicting transitions.
 6. A restart does not erase the run snapshot or resume fingerprint.
 7. Enforcement errors and audit failures do not expose raw prompts, process output, secrets, or URLs with credential-bearing queries.
@@ -118,9 +118,13 @@ Physical isolation replaces request-level tenant predicates. The following invar
 
 ### One organization per resource set
 
-A data-plane Worker serves one organization. Its D1 database, Durable Object namespaces, R2 bucket, Queue producers, and secrets must not be shared with another organization.
+A data-plane Worker serves one organization. Its D1 database, Durable Object namespaces, fleet-owned application R2 buckets, and secrets must not be shared with another organization. A shared audit queue is allowed only behind trusted infrastructure that derives attribution from static deployment bindings; externally authored code receives neither its producer binding nor reusable control-plane credentials.
 
-The control plane can remain multi-tenant because it provisions and audits the fleet. It must keep a one-to-one mapping from organization to data-plane resources.
+The control plane can remain multi-tenant because it provisions and audits the fleet. It must keep a one-to-one mapping from organization to data-plane resources. It derives physical R2 names and persists permanent ownership claims before binding a bucket. Application code cannot select a provider bucket name or identifier.
+
+Only an application Worker receives application variables, application secrets, or application R2 bindings. Trusted state, shared outbound, dispatcher, and audit Workers receive none. A legacy backend-switch bridge retains the prior plain release's bindings only while it still serves application fetches. The target external candidate receives the target release's bindings, and finalization removes all application bindings from the state-only bridge.
+
+Fleet control rejects application KV bindings. Cloudflare's [1,000-namespace account limit](https://developers.cloudflare.com/kv/platform/limits/) cannot support the 10,000-deployment horizon with one namespace per deployment. A shared application namespace would make logical key partitioning the tenant boundary. The shared `HOSTS` KV namespace remains a control-plane routing index and is not exposed to application code.
 
 ### Deployment sentinel
 
@@ -131,7 +135,9 @@ Provisioning writes the same stable tag to two independent locations:
 
 `seedDeploymentIdentity()` accepts only a fresh database or an already valid sentinel for the same tag. It validates the exact table shape and singleton row, and it refuses to adopt an unowned database with any application table. The insert-or-ignore followed by a read means concurrent provisioning cannot replace an existing owner. Seed before application migrations.
 
-`ensureDeploymentIdentity()` validates the environment-to-D1 pair before protected Worker routes and scheduled work. Worker topologies also attach a deployment-specific `DEPLOYMENT_IDENTITY_SECRET` to every Durable Object fetch. Each production object compares that credential in constant time and validates its own environment-to-D1 pair before building storage or serving a route. This caller attestation closes cross-script namespace binding errors. An alarm has no caller request, so it validates only the target pair.
+`ensureDeploymentIdentity()` validates the environment-to-D1 pair before protected Worker routes and maintenance work. Worker topologies also attach a deployment-specific `DEPLOYMENT_IDENTITY_SECRET` to every Durable Object fetch. Each production object compares that credential in constant time and validates its own environment-to-D1 pair before building storage or serving a route. This caller attestation closes cross-script namespace binding errors. An alarm has no caller request, so it validates only the target pair.
+
+External maintenance is a separate, narrower channel. The candidate may relay a fleet-private Ed25519 capability, but it cannot mint one or read `MAINTENANCE_ADMIN_SECRET`. The global dispatcher verifies the public signature and the bound operation, tenant, environment, physical script, specification digest, expiry, and nonce before it invokes customer code. The trusted maintenance object verifies the same capability against its static tenant and environment, rejects deployment-identity authorization for maintenance routes in this mode, consumes mutation nonces atomically, and signs the exact result with its per-state HMAC secret. Fleet control accepts only that signed result. Status verification is read-only, and maintenance mutation is bounded by a request timeout shorter than the active lease.
 
 A missing binding, invalid sentinel schema, missing or extra owner row, malformed tag, caller-credential mismatch, or tag mismatch fails closed. The Worker returns `503`; Durable Object initialization refuses the request.
 
@@ -147,7 +153,7 @@ Physical isolation does not replace authorization between users in one deploymen
 
 ### Audit attribution is not authority
 
-`deploymentTag` comes only from the verified infrastructure binding. Approval audit sinks record it as `detail.deploymentTag`. Breakwater's agent audit contract retains the field name `tenantId`; Flowsafe populates that field only from the verified deployment tag.
+`deploymentTag` comes only from the verified infrastructure binding. Approval audit sinks record it as `detail.deploymentTag`. Breakwater's agent audit contract retains the field name `tenantId`; Flowsafe populates that field only from the verified deployment tag. Externally authored Workers send audit events through a private trusted-state service. That service authenticates the deployment identity and places the entire untrusted event below a canonical envelope whose tenant, environment, and script attribution comes only from static bindings. The envelope explicitly marks event semantics as untrusted: action, decision, resource, and detail remain candidate claims. Forged top-level or nested attribution never becomes queue attribution.
 
 No route accepts deployment identity from a bearer claim, header, query, body, schedule metadata, signal, model output, or run id.
 
@@ -222,6 +228,8 @@ A host with only one human reviewer must consciously choose availability or sepa
 | PII or secret in model output | Multi-channel detectors, classifier seam, optional hold-back | Encodings and adversarial transformations can evade detection |
 | Open approval or suspended run age-purged | Terminal-only retention | Abandoned live records require operator disposition |
 | R2 artifacts stranded | Artifact deletion paired before snapshot row | A host that omits the artifact store from decommissioning can strand objects |
+| Application Worker binds another deployment's R2 bucket | Fleet-derived names, permanent ownership claims, persisted create authorization, and exact binding inventory | Control-plane compromise remains inside the trusted computing base |
+| Application secret changed outside fleet control | Trusted plaintext input is digest-checked before upload; inventory attests the exact secret-name set | Cloudflare exposes no value digest, so recurring audit cannot detect value-only drift |
 | Deployment decommissioning races new work | Revoke traffic and credentials before deleting the resource set | In-flight work can return errors during the drain |
 | Audit sink outage blocks agent | Sink failure containment and ring buffer | In-memory buffer is not durable and can drop old events |
 | Notification exposes reviewer payload | Host projection obligation | Flowsafe cannot know the trust level of a transport |
@@ -334,7 +342,9 @@ Store deployment secrets in Cloudflare Secrets or an external manager and inject
 - business connectors;
 - SIEM authorization.
 
-Do not persist raw keys in workflow input, suspend payload, approval context, schedule request context, notification body, audit detail, or artifact metadata.
+Application binding descriptors contain a name and the UTF-8 SHA-256 of the intended value. Supply the plaintext map only through the trusted fleet-control invocation seam. Fleet control requires exact descriptor keys, verifies every digest before provider access, and excludes plaintext from durable records, release identity, logs, and errors. A secret rotation changes the specification digest, but provider inventory can verify only the secret name after upload.
+
+Do not persist raw keys in workflow input, suspend payload, approval context, schedule request context, notification body, audit detail, artifact metadata, or fleet state.
 
 An Agent CLI inherits its environment unless an injected executor changes it. Supply an allowlisted environment in the process/container boundary.
 
@@ -350,10 +360,11 @@ Before a public endpoint:
 6. Route connector HTTP through `runtime.fetch` and add infrastructure egress policy.
 7. Keep approval connector lists and durable-agent resume targets server-authored.
 8. Mount only configured optional routers.
-9. Configure retention and a resource-set decommissioning procedure for every adopted domain.
+9. Configure retention and a resource-set decommissioning procedure for every adopted domain. Delete application Workers before R2, prove every bucket is detached and empty, and never auto-purge application objects.
 10. Protect Durable Object namespaces behind the Worker topologies and set a distinct `DEPLOYMENT_IDENTITY_SECRET` for caller attestation.
 11. Project notifications and audit to the receiving channel's trust level.
 12. Isolate Agent CLI workspaces and review their diffs.
 13. Run the deterministic workerd restart, forgery, and deployment-sentinel mismatch proof.
+14. Keep application KV unsupported, bind only fleet-owned application R2 resources, and treat secret inventory as name-only attestation.
 
 Report vulnerabilities through [`SECURITY.md`](../SECURITY.md), not a public issue.

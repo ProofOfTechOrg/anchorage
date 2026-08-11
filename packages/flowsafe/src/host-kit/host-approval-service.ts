@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// The host-side ApprovalService assembly and cron SLA sweep that the
+// The host-side ApprovalService assembly and alarm-owned SLA sweep that the
 // showcase Worker and the deploy template previously carried as byte-copies:
 // the structured-log + optional-Queues audit sink, the system principal, and the
 // SoD-guarded multi-gate
@@ -37,7 +37,7 @@ import {
 import { numberVar } from './env-vars.js';
 
 /**
- * Attribution identity for cron maintenance — audit only. The sweep is TCB
+ * Attribution identity for alarm-owned maintenance — audit only. The sweep is TCB
  * code over the deployment store and never enters through a verifier.
  */
 export function maintenancePrincipal(
@@ -77,10 +77,12 @@ export interface HostAuditSinkOptions {
   queue?: AuditQueue<ApprovalAuditEvent>;
   /**
    * Keeps each queue send alive past the handler — ctx.waitUntil in fetch
-   * scope; a cron runner collects and awaits instead (it already executes
-   * under the handler's waitUntil).
+   * scope; an alarm runner instead collects the sends into its directly
+   * awaited duty.
    */
   keepAlive?: (send: Promise<unknown>) => void;
+  /** Observes a contained queue failure when the caller tracks duty health. */
+  onError?: (error: unknown) => void;
 }
 
 /**
@@ -102,14 +104,15 @@ export function hostAuditSink(
           };
     console.log(JSON.stringify({ type: 'audit', ...attributed }));
     if (queueSink) {
-      const send = queueSink(attributed).catch((error: unknown) =>
+      const send = queueSink(attributed).catch((error: unknown) => {
+        options.onError?.(error);
         console.error(
           JSON.stringify({
             type: 'audit-queue-error',
             reason: String(error),
           }),
-        ),
-      );
+        );
+      });
       options.keepAlive?.(send);
     }
   };
@@ -212,41 +215,44 @@ export interface SlaSweepMaintenanceOptions {
   deploymentTag?: string;
   /** Optional audit export queue. */
   queue?: AuditQueue<ApprovalAuditEvent>;
-  /** The firing cron expression — log correlation only. */
-  cron: string;
+  /** The maintenance duty name, used only for log correlation. */
+  trigger: string;
   /**
    * Notification transport for SLA escalations — threaded to
-   * SweepSLAOptions.notify (the cron runner already executes under the
-   * handler's waitUntil, so transports need no extra keep-alive here).
+   * SweepSLAOptions.notify. The alarm handler awaits the complete maintenance
+   * duty, so transports need no request-scoped keep-alive here.
    */
   notify?: ApprovalNotificationSink;
   /**
    * Live-stream fan-out sink for SLA escalations — the BARE hub-publish thunk
    * `(event) => createHubTopology(env.HUB, env.DEPLOYMENT_IDENTITY_SECRET).publish(event)`, NOT wrapped in a
-   * request-scoped waitUntil. A scheduled() handler runs under its OWN
-   * waitUntil where a nested one is unavailable, so runSlaSweepMaintenance
-   * COLLECTS each publish promise into its pendingSends and awaits it via the
-   * terminal Promise.all — never fire-and-forget (which would be cancelled when
-   * ctx.waitUntil(sweep()) settles) and never a nested waitUntil (which would
-   * throw cross-request I/O). Undefined means no live escalation fan-out.
+   * request-scoped waitUntil. A maintenance alarm directly awaits
+   * runSlaSweepMaintenance, which collects each publish promise into its
+   * pendingSends and awaits the terminal Promise.all. Undefined means no live
+   * escalation fan-out.
    */
   stream?: ApprovalStreamSink;
 }
 
+/** Explicit result for failure-contained maintenance helpers. */
+export type MaintenanceOutcome<T = undefined> =
+  | { readonly ok: true; readonly value: T }
+  | { readonly ok: false; readonly error: string };
+
 /**
- * The cron-owned SLA sweep, verbatim-shared by the hosts: sweepSLA over the
+ * The maintenance-owned SLA sweep, verbatim-shared by the hosts: sweepSLA over the
  * deployment store, audit to logs + optional queue, a structured line per
  * escalation, and containment — a sweep failure logs a maintenance-error and
  * resolves rather than throwing, so a caller running other duties is never
- * starved by this one (the two-cron split covers the uncatchable CPU-limit
- * case). Queue sends are collected and awaited HERE: the whole runner
- * already executes under the handler's ctx.waitUntil, where a nested
- * waitUntil is unavailable.
+ * starved by this one (separate alarm invocations cover the uncatchable CPU-limit
+ * case). Queue sends are collected and awaited here as part of the alarm's
+ * directly awaited maintenance duty.
  */
 export async function runSlaSweepMaintenance(
   options: SlaSweepMaintenanceOptions,
-): Promise<void> {
+): Promise<MaintenanceOutcome> {
   let escalated: number | undefined;
+  const failures: string[] = [];
   const pendingSends: Promise<unknown>[] = [];
   try {
     escalated = (
@@ -256,16 +262,18 @@ export async function runSlaSweepMaintenance(
           deploymentTag: options.deploymentTag,
           queue: options.queue,
           keepAlive: (send) => pendingSends.push(send),
+          onError: (error) => failures.push(`audit-queue: ${String(error)}`),
         }),
         notify: options.notify,
         // Mirror the audit sink's keepAlive idiom: COLLECT each escalation's
         // publish promise into pendingSends so the terminal Promise.all keeps it
-        // alive under the scheduled handler's own waitUntil (DL-020). The inner
-        // .catch keeps a failed fan-out from rejecting the whole Promise.all.
+        // within the directly awaited alarm duty. The inner .catch keeps a
+        // failed fan-out from rejecting the whole Promise.all.
         stream: (event) => {
           pendingSends.push(
-            Promise.resolve(options.stream?.(event)).catch((error: unknown) =>
-              // Log a wedged cron fan-out (matching the fetch path's
+            Promise.resolve(options.stream?.(event)).catch((error: unknown) => {
+              failures.push(`stream-publish: ${String(error)}`);
+              // Log a wedged maintenance fan-out (matching the fetch path's
               // stream-publish-error) instead of swallowing it silently, while
               // still containing it so it can't reject the whole Promise.all.
               console.error(
@@ -274,8 +282,8 @@ export async function runSlaSweepMaintenance(
                   reason:
                     error instanceof Error ? error.message : String(error),
                 }),
-              ),
-            ),
+              );
+            }),
           );
         },
         onEscalation: (record) =>
@@ -294,6 +302,7 @@ export async function runSlaSweepMaintenance(
       })
     ).length;
   } catch (error) {
+    failures.push(String(error));
     console.error(
       JSON.stringify({
         type: 'maintenance-error',
@@ -301,7 +310,7 @@ export async function runSlaSweepMaintenance(
           ? { deploymentTag: options.deploymentTag }
           : {}),
         surface: 'sla-sweep',
-        cron: options.cron,
+        trigger: options.trigger,
         error: String(error),
       }),
     );
@@ -313,10 +322,13 @@ export async function runSlaSweepMaintenance(
       ...(options.deploymentTag !== undefined
         ? { deploymentTag: options.deploymentTag }
         : {}),
-      cron: options.cron,
+      trigger: options.trigger,
       escalated,
     }),
   );
+  return failures.length === 0
+    ? { ok: true, value: undefined }
+    : { ok: false, error: failures.join('; ') };
 }
 
 /**
@@ -351,7 +363,7 @@ export function reconcileApprovalsOnStatusDetached(
   };
 }
 
-/** Options for the cron-owned approval-retention purge. */
+/** Options for the maintenance-owned approval-retention purge. */
 export interface ApprovalRetentionPurgeOptions {
   /** The deployment approval store. */
   store: ApprovalStore;
@@ -362,18 +374,19 @@ export interface ApprovalRetentionPurgeOptions {
    * RUN_RETENTION_DAYS uses.
    */
   retentionDays: string | undefined;
-  /** The firing cron expression — carried into the maintenance-error log line for correlation. */
-  cron: string;
+  /** The maintenance duty name, used only for log correlation. */
+  trigger: string;
 }
 
 /**
- * The cron-owned approval-retention purge, previously hand-copied verbatim
+ * The maintenance-owned approval-retention purge, previously hand-copied verbatim
  * by the hosts (deploy/worker.ts and the showcase worker): purgeExpiredApprovals
  * over the deployment store, the APPROVAL_RETENTION_DAYS var parsing
  * (allowZero: a 0-day retention purges decided approvals immediately, the
  * same convention RUN_RETENTION_DAYS uses), and containment — a purge
- * failure logs a maintenance-error and resolves `undefined` instead of
- * throwing, so it never aborts a caller's other maintenance duties. Unlike
+ * failure logs a maintenance-error and returns an explicit failed outcome
+ * instead of throwing, so it never aborts a caller's other duties or gets
+ * mistaken for a successful purge. Unlike
  * runSlaSweepMaintenance, this does NOT log its own "maintenance" summary
  * line: both hosts fold the returned count into ONE combined purge log
  * alongside their other maintenance duties, so logging it here too would
@@ -381,29 +394,33 @@ export interface ApprovalRetentionPurgeOptions {
  */
 export async function runApprovalRetentionPurge(
   options: ApprovalRetentionPurgeOptions,
-): Promise<number | undefined> {
+): Promise<MaintenanceOutcome<number>> {
   try {
-    return await purgeExpiredApprovals(options.store, {
-      // allowZero: APPROVAL_RETENTION_DAYS=0 means "purge decided approvals
-      // now" — same convention as RUN_RETENTION_DAYS.
-      ttlMs:
-        numberVar(options.retentionDays, 30, 'APPROVAL_RETENTION_DAYS', {
-          allowZero: true,
-        }) *
-        24 *
-        60 *
-        60 *
-        1000,
-    });
+    return {
+      ok: true,
+      value: await purgeExpiredApprovals(options.store, {
+        // allowZero: APPROVAL_RETENTION_DAYS=0 means "purge decided approvals
+        // now" — same convention as RUN_RETENTION_DAYS.
+        ttlMs:
+          numberVar(options.retentionDays, 30, 'APPROVAL_RETENTION_DAYS', {
+            allowZero: true,
+          }) *
+          24 *
+          60 *
+          60 *
+          1000,
+      }),
+    };
   } catch (error) {
+    const failure = String(error);
     console.error(
       JSON.stringify({
         type: 'maintenance-error',
         surface: 'approval-retention-purge',
-        cron: options.cron,
-        error: String(error),
+        trigger: options.trigger,
+        error: failure,
       }),
     );
-    return undefined;
+    return { ok: false, error: failure };
   }
 }

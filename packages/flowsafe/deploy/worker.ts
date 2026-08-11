@@ -1,6 +1,6 @@
 // Reference production deployment for the flowsafe DO runner + approval
 // queue. Copy this directory as the starting point for a real Worker: the
-// wiring is production-shaped (bearer-token auth seam, cron-driven SLA sweep
+// wiring is production-shaped (bearer-token auth seam, alarm-driven SLA sweep
 // and retention purge, structured audit logs, multi-gate approval bridging,
 // opt-in live streaming); replace the example workflow with your own and swap
 // bearerActorAuthenticator for your identity provider.
@@ -53,12 +53,9 @@
 // (channel/runId/actor/exp), never a grant. Absent the secret, every
 // dashboard stays on its poll fallback and nothing else changes.
 //
-// Scheduled (wrangler.jsonc `triggers.crons`): TWO cron expressions,
-// dispatched on controller.cron, so the SLA sweep and the retention purge
-// never share an invocation — a Workers CPU-limit termination kills the
-// isolate and is NOT a catchable JS error, so a slow sweep sharing an
-// invocation would permanently starve the purge (and vice versa) no matter
-// how many try/catches wrap them.
+// The fixed-name maintenance Durable Object gives the SLA sweep and retention
+// purge separate alarm invocations, so an uncatchable CPU termination in one
+// cannot starve the other.
 //
 // Deploy checklist: README.md next to this file.
 
@@ -68,9 +65,7 @@ import type {
   DurableObjectNamespace,
   ExecutionContext,
   ExportedHandler,
-  MessageBatch,
   Queue,
-  ScheduledController,
 } from '@cloudflare/workers-types';
 import type { ToolExecutionContext } from '@mastra/core/tools';
 import { createConnector } from '@proofoftech/breakwater/connector-sdk';
@@ -84,15 +79,15 @@ import {
 import {
   approvalStoreFactoryFor,
   assertWorkflowsRegistered,
+  createFlowsafeMaintenanceDurableObject,
   createFlowsafeWorker,
+  type FlowsafeWorkerConfig,
   parseActorTokens,
   staticTokenVerifier,
   type TokenVerifier,
   type WorkflowMeta,
 } from '@proofoftech/flowsafe/host-kit';
 import { z } from 'zod';
-
-import { PURGE_CRON, SWEEP_CRON } from './crons.js';
 
 interface Env {
   DB: D1Database;
@@ -101,6 +96,7 @@ interface Env {
   /** Secret credential shared only by this deployment's Worker and DOs. */
   DEPLOYMENT_IDENTITY_SECRET: string;
   RUNNER: DurableObjectNamespace;
+  MAINTENANCE: DurableObjectNamespace;
   /**
    * Deployment live-stream hub Durable Object namespace (DL-009). Declared by
    * the `HUB` binding in wrangler.jsonc (see its v2 migration), so it is always
@@ -128,6 +124,7 @@ interface Env {
    * actor mapping stays inside the trusted computing base either way.
    */
   APPROVAL_ACTOR_TOKENS?: string;
+  MAINTENANCE_ADMIN_SECRET?: string;
   /** Default SLA seconds for new approvals (var; default 14400 = 4h). */
   APPROVAL_SLA_SECONDS?: string;
   /**
@@ -137,28 +134,23 @@ interface Env {
    * `admin`. Any invalid value falls back to OFF.
    */
   APPROVAL_ALLOW_SELF_DECISION?: string;
-  /** Cron purges terminal run snapshots older than this (var; default 30; 0 = immediately). */
+  /** Alarm maintenance purges terminal run snapshots older than this (var; default 30; 0 = immediately). */
   RUN_RETENTION_DAYS?: string;
-  /** Cron purges DECIDED (approved/rejected) approval records older than this (var; default 30; 0 = immediately). */
+  /** Alarm maintenance purges DECIDED approvals older than this (var; default 30; 0 = immediately). */
   APPROVAL_RETENTION_DAYS?: string;
   /**
    * Agent-memory thread TTL in days (var; docs/agent-memory-isolation.md): the
-   * purge cron deletes threads untouched for longer than this, with their
+   * purge duty deletes threads untouched for longer than this, with their
    * messages. UNSET (the default) => no thread ever expires — a conversation is
    * something a host means to keep, unlike a terminal run snapshot, so this
    * deployment only starts expiring memory when an operator names a number.
    */
   THREAD_RETENTION_DAYS?: string;
   /**
-   * Optional audit export to a SIEM: bind a queue producer (wrangler.jsonc
-   * `queues` block) and audit events flow producer -> queue -> the `queue`
-   * consumer below -> HTTP POST to SIEM_ENDPOINT (auth via the
-   * SIEM_AUTH_HEADER secret, sent as the `authorization` header). Without
-   * the binding, audit stays on structured Workers Logs only.
+   * Optional audit export: this tenant Worker only produces to the shared
+   * queue. The control plane owns consumption and SIEM delivery.
    */
   AUDIT_QUEUE?: Queue;
-  SIEM_ENDPOINT?: string;
-  SIEM_AUTH_HEADER?: string;
 }
 
 /** Id for system-created records. */
@@ -341,9 +333,8 @@ function buildVerifier(env: Env): TokenVerifier {
 }
 
 // The composed Worker: /healthz → /api/approvals → /workflows + /runs → 404,
-// two-cron maintenance (sweep vs purge never share an invocation; the
-// byte-equality contract with wrangler.jsonc lives in crons.ts), and the
-// audit-export queue consumer. This deployment supplies its workflows, its
+// alarm maintenance (sweep and purge never share an invocation). This
+// deployment supplies its workflows and its
 // verifier. To add run
 // artifacts (R2ArtifactStore), set the `artifactStore` field on this config:
 // createFlowsafeWorker pairs artifact deletion INSIDE the retention purge, so
@@ -351,22 +342,25 @@ function buildVerifier(env: Env): TokenVerifier {
 // the only enumerable record of the run's artifact keys). An `extraPurgeDuties`
 // hook cannot do this — it runs AFTER the rows are deleted, when the keys are
 // already unenumerable.
-const worker = createFlowsafeWorker<Env>({
+const workerConfig = {
   workflows: WORKFLOWS,
   systemPrincipalId: SYSTEM_PRINCIPAL_ID,
   buildVerifier,
-  crons: { sweep: SWEEP_CRON, purge: PURGE_CRON },
-});
+  maintenance: {
+    sweepIntervalMs: 15 * 60 * 1_000,
+    purgeIntervalMs: 60 * 60 * 1_000,
+  },
+} satisfies FlowsafeWorkerConfig<Env>;
+
+export class FlowsafeMaintenance extends createFlowsafeMaintenanceDurableObject(
+  workerConfig,
+) {}
+
+const worker = createFlowsafeWorker<Env>(workerConfig);
 
 const handler: ExportedHandler<Env> = {
   fetch: (request: CfRequest, env: Env, ctx: ExecutionContext) =>
     worker.fetch(request as unknown as Request, env, ctx),
-  scheduled: (
-    controller: ScheduledController,
-    env: Env,
-    ctx: ExecutionContext,
-  ) => worker.scheduled(controller, env, ctx),
-  queue: (batch: MessageBatch, env: Env) => worker.queue(batch, env),
 };
 
 export default handler;

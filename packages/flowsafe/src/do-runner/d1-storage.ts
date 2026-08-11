@@ -115,7 +115,7 @@ export interface PurgeExpiredRunsOptions {
    */
   resourceOwnerTable?: string;
   /**
-   * Runs processed per call. Artifact-paired path: default 100 — the cron's
+   * Runs processed per call. Artifact-paired path: default 100 — the purge duty's
    * subrequest-budget guard, same batching as any batched reaper. Each
    * run costs ~2+N subrequests (R2 list, per-artifact deletes, its row's
    * DELETE), so an UNBOUNDED first backlog would blow the Workers
@@ -149,8 +149,8 @@ export const RUN_TTL_PURGE_TABLES: readonly string[] = [
  * pending/paused) are never touched — expiring a suspended run would kill a
  * pending approval. A missing snapshot table reads as zero purgeable runs
  * (Mastra creates it lazily with the first persisted run). TTL enforcement
- * is a storage-layer property, so it lives here; scheduling (Worker cron /
- * DO alarm) stays with the caller. Returns the number of deleted rows.
+ * is a storage-layer property, so it lives here; alarm scheduling stays with
+ * the caller. Returns the number of deleted rows.
  */
 export async function purgeExpiredWorkflowRuns(
   db: SnapshotDatabase,
@@ -223,7 +223,7 @@ export async function purgeExpiredWorkflowRuns(
         // loop would re-hit this run at the same scan position every firing
         // and stall every eligible row behind it forever. Its row survives
         // as its own retry cursor; the aggregate throw below keeps the
-        // cron's error surface firing. A wedged run does occupy a batch
+        // purge duty's error surface firing. A wedged run does occupy a batch
         // slot until fixed, so isolation holds while wedged runs number
         // fewer than `limit`.
         failures.push({
@@ -274,7 +274,7 @@ export async function purgeExpiredWorkflowRuns(
   // per firing whatever the batch size, hence the larger default). An
   // unbounded DELETE over a huge first backlog can exceed the per-query
   // limits and then fail the same way on EVERY firing — retention silently
-  // unenforced, the exact wedge the cron split exists to avoid. The
+  // unenforced, the exact wedge the one-duty-per-alarm split exists to avoid. The
   // shrinking eligible set is the cursor: a backlog drains across firings.
   try {
     if (resourceOwnerTable && batch) {
@@ -499,7 +499,7 @@ export async function purgeExpiredThreads(
     } catch (error) {
       // A host whose memory domain never initialized has threads but no
       // messages table; anything else is a real failure and must reach the
-      // cron's error surface rather than silently orphan a thread's history.
+      // purge duty's error surface rather than silently orphan a thread's history.
       if (!isMissingTable(error)) throw error;
       hasMessagesTable = false;
       break;
@@ -576,9 +576,9 @@ const BACKGROUND_TASK_FAILED_STATUSES = [
  * Background-task TTL cleanup: deletes terminal task
  * rows from `mastra_background_tasks` once their `completedAt` is older than the
  * TTL, mirroring core `BackgroundTaskManager.cleanup()` at the storage layer so
- * a purge cron can reap them WITHOUT a live manager — the same posture as
+ * a maintenance purge can reap them WITHOUT a live manager: the same posture as
  * purgeExpiredWorkflowRuns/purgeExpiredThreads (raw D1 binding, failure-isolated
- * as a cron duty). Two windows, exactly as core: completed rows expire fast
+ * as a purge duty). Two windows, exactly as core: completed rows expire fast
  * (default 1h), failed/cancelled/timed_out slowly (default 24h) so a failure
  * stays inspectable.
  *
@@ -692,7 +692,7 @@ export interface PurgeExpiredNotificationsOptions {
    * Resolved (delivered/seen/dismissed/archived/discarded) notifications whose
    * `updatedAt` is older than this expire. PENDING rows are never touched — one
    * may be waiting on a future `deliverAt`, and reaping it would drop a signal
-   * the model has not seen. No default: the caller (createFlowsafeWorker's cron)
+   * the model has not seen. No default: the caller (createFlowsafeWorker's purge duty)
    * gates this on an opt-in retention window, since a durable inbox is meant to
    * be readable until the host says otherwise.
    */
@@ -706,8 +706,8 @@ export interface PurgeExpiredNotificationsOptions {
 /**
  * Notification TTL cleanup: deletes terminal agent-inbox
  * rows from `mastra_notifications` once their `updatedAt` is older than the TTL,
- * at the storage layer so a cron reaps them without a live agent — the same
- * posture as the other purges (raw D1 binding, failure-isolated as a cron duty).
+ * at the storage layer so alarm maintenance reaps them without a live agent —
+ * the same posture as the other purges (raw D1 binding, failure-isolated duty).
  * `updatedAt` is ISO-8601 TEXT, so lexicographic `<` is a correct timestamp
  * comparison. A missing table reads as zero (notifications may never have been
  * sent). Scheduling stays with the caller.
@@ -819,8 +819,8 @@ export interface PurgeExpiredScheduleTriggersOptions {
 /**
  * Schedule-trigger TTL cleanup: deletes terminal trigger-history
  * rows from `mastra_schedule_triggers` once their `actualFireAt` is older than the
- * TTL, at the storage layer so a cron reaps them without a live tick — the same
- * posture as the other purges (raw D1 binding, failure-isolated as a cron duty).
+ * TTL, at the storage layer so alarm maintenance reaps them without a live tick —
+ * the same posture as the other purges (raw D1 binding, failure-isolated duty).
  *
  * `actualFireAt` is stored as INTEGER ms-epoch (core types
  * `ScheduleTrigger.actualFireAt` as `number`, unlike the ISO-TEXT timestamp

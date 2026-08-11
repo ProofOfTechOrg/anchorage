@@ -27,8 +27,10 @@ Do not perform a physical-isolation cutover as an in-place update of a pooled Wo
 | `DEPLOYMENT_TENANT` | Variable | Stable provisioning tag that must match the singleton D1 sentinel |
 | `DEPLOYMENT_IDENTITY_SECRET` | Secret | Internal Worker-to-Durable-Object caller credential; 32–256 visible ASCII characters |
 | `RUNNER` | Durable Object namespace | One runner object per workflow run |
+| `MAINTENANCE` | Durable Object namespace | Fixed deployment singleton for sweep, purge, and optional schedule tick |
+| `MAINTENANCE_ADMIN_SECRET` | Secret | Control-plane credential for maintenance bootstrap and status; distinct from deployment identity |
 
-Provision the sentinel before application migrations or traffic. Install Wrangler 4 in the application, run `npx flowsafe-provision --database <database> --tag <tag> --remote --config wrangler.jsonc`, then set `DEPLOYMENT_IDENTITY_SECRET` with `wrangler secret put`. The CLI is published with Flowsafe. It verifies the exact singleton schema, refuses to re-home an owned database, and refuses to adopt an unowned database that already contains application tables.
+Provision the sentinel before application migrations or traffic. Install Wrangler 4 in the application, run `npx flowsafe-provision --database <database> --tag <tag> --remote --config wrangler.jsonc`, then set distinct `DEPLOYMENT_IDENTITY_SECRET` and `MAINTENANCE_ADMIN_SECRET` values with `wrangler secret put`. The CLI is published with Flowsafe. It verifies the exact singleton schema, refuses to re-home an owned database, and refuses to adopt an unowned database that already contains application tables.
 
 The Worker compares `DEPLOYMENT_TENANT` with `flowsafe_deployment.tenant_tag`. Worker topologies stamp the internal credential on every Durable Object fetch, and the target compares it in constant time before reading storage. This additional caller check prevents an external or cross-script namespace binding from reaching another deployment's objects. Alarms validate the target environment and sentinel because they have no caller request.
 
@@ -40,9 +42,7 @@ The runner class extends `DurableObjectRunner`. Its identity is derived from `wo
 | --- | --- | --- |
 | `HUB` | Durable Object namespace | Deployment-wide live approval fan-out |
 | `STREAM_TICKET_SECRET` | Secret | HMAC ticket mint and WebSocket routes; requires `HUB` |
-| `AUDIT_QUEUE` | Queue producer/consumer | Durable audit export |
-| `SIEM_ENDPOINT` | Variable | NDJSON collector destination |
-| `SIEM_AUTH_HEADER` | Secret | Collector authorization |
+| `AUDIT_QUEUE` | Queue producer | Durable audit export to the shared control-plane consumer |
 | R2 bucket chosen by the host | R2 | `R2ArtifactStore` and artifact-aware purge |
 
 Streaming remains poll-only unless both `HUB` and `STREAM_TICKET_SECRET` are present. Use a dedicated ticket secret, not an OAuth, session, or model-provider key.
@@ -90,6 +90,7 @@ Host routing belongs to the provisioning control plane. It must resolve a hostna
 | --- | --- | --- |
 | `DEPLOYMENT_TENANT` | None | Required provisioning tag. Protected routes return `503` unless it matches the D1 sentinel |
 | `DEPLOYMENT_IDENTITY_SECRET` | None | Required internal credential. Worker-to-Durable-Object requests fail before storage unless it matches |
+| `MAINTENANCE_ADMIN_SECRET` | None | Required control-plane credential. Maintenance admin routes return `503` when absent or malformed |
 | `APPROVAL_ACTOR_TOKENS` | Empty | Static verifier map. Empty means every authenticated route returns 401 |
 | `APPROVAL_SLA_SECONDS` | `14400` | SLA assigned to new approval records |
 | `APPROVAL_ALLOW_SELF_DECISION` | Unset | Separation of duties enabled. Accepts `true` or a comma-separated role list |
@@ -162,11 +163,11 @@ Other route factories accept a `basePath` when the exact public prefix is host-s
 
 ## Host composition
 
-`createFlowsafeWorker()` owns the common fetch, cron, and queue pipeline. It verifies deployment identity before protected routes and scheduled work. Supply deployment-specific behavior through its typed seams:
+`createFlowsafeWorker()` owns the common fetch and maintenance-duty pipeline. It verifies deployment identity before protected routes or maintenance administration. Supply deployment-specific behavior through its typed seams:
 
 - `workflows` and `systemPrincipalId`
 - `buildVerifier`
-- `crons`
+- `maintenance` intervals
 - `preRoutes` for deployment-specific routes
 - `beforeStart` and `beforeResume` for budgets or other final mutation policy
 - `buildAgentRouter` for the metadata-only public catalog and run routes
@@ -182,15 +183,15 @@ Other route factories accept a `basePath` when the exact public prefix is host-s
 
 Use the exported router and topology factories rather than recreating their gate order.
 
-## Scheduled invocations
+## Alarm-driven maintenance
 
-Use separate cron expressions for workloads with independent availability requirements:
+The fixed maintenance Durable Object schedules three independent duties:
 
 1. Approval SLA sweep
 2. Retention purge
 3. Schedule fire tick, when enabled
 
-The composed Worker dispatches by exact cron expression. An unrecognized expression runs safe fallback duties and records a configuration error, but exact matching is the supported configuration.
+Each alarm persists its successor before running exactly one due duty. If several duties are due, the object schedules an immediate follow-up alarm. A termination during one duty cannot starve another duty or break the alarm chain.
 
 Within the purge invocation, each domain is failure-isolated:
 
@@ -203,7 +204,7 @@ Within the purge invocation, each domain is failure-isolated:
 - terminal background tasks;
 - host-owned extra duties.
 
-Provider polling uses Durable Object alarms rather than a global cron. Notification dispatch can run from a schedule tick when delayed notification delivery is enabled.
+Provisioning must authenticate `POST /admin/ensure-maintenance` after deployment. The drift watchdog reads `GET /admin/maintenance-status` and re-arms a missing or stale alarm. Provider polling, background recovery, and notification dispatch also use Durable Object alarms.
 
 ## Storage lifecycle
 
@@ -247,7 +248,7 @@ Before exposing traffic:
 6. Confirm no public agent raw-resume route exists.
 7. Kill the local Worker while an agent run is suspended, restart it, approve as a different reviewer, and confirm the connector runs once as the original requester.
 8. Evict the agent stream cache and confirm the stream returns 409 while status remains available.
-9. Verify every configured cron and provider alarm emits a success or contained failure event.
+9. Verify the maintenance, provider, and background-task alarms emit a success or contained failure event.
 10. Confirm Queue retries and dead-letter handling against a failing SIEM endpoint.
 11. Confirm retention deletes matching artifacts and leaves live rows.
 12. Exercise deployment decommissioning against a non-production resource set and confirm no Worker, route, D1 database, Durable Object namespace, R2 bucket, Queue binding, or secret remains attached.

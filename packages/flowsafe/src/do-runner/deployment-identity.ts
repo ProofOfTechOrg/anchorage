@@ -318,7 +318,8 @@ function supportsTimingSafeEqual(
   );
 }
 
-async function sameCredential(
+/** Compare two credentials without an early-exit string comparison. */
+export async function credentialsMatch(
   actual: string,
   expected: string,
 ): Promise<boolean> {
@@ -402,7 +403,7 @@ export async function verifyDurableObjectDeploymentRequest(
     'verifyDurableObjectDeploymentRequest',
   );
   const actual = request.headers.get(DEPLOYMENT_IDENTITY_HEADER);
-  if (actual === null || !(await sameCredential(actual, expected))) {
+  if (actual === null || !(await credentialsMatch(actual, expected))) {
     throw new DeploymentIdentityError(
       "verifyDurableObjectDeploymentRequest: caller does not carry this deployment's internal identity credential",
     );

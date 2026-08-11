@@ -42,8 +42,20 @@ export type {
   FlowsafeWorkerConfig,
   FlowsafeWorkerContext,
   FlowsafeWorkerEnv,
+  MaintenanceDurableObjectConstructor,
+  MaintenanceDurableObjectState,
+  MaintenanceDuty,
+  MaintenanceHealth,
+  MaintenanceNamespaceLike,
+  MaintenanceStorage,
+  MaintenanceStorageTransaction,
+  MaintenanceStubLike,
 } from './flowsafe-worker.js';
-export { createFlowsafeWorker } from './flowsafe-worker.js';
+export {
+  createFlowsafeMaintenanceDurableObject,
+  createFlowsafeWorker,
+  MAINTENANCE_INSTANCE_NAME,
+} from './flowsafe-worker.js';
 // hostAuditSink stays module-internal for the same reason as
 // requestedConnectors below: it is the primitive beneath
 // buildHostApprovalService / runSlaSweepMaintenance, and no host consumes it
@@ -53,6 +65,7 @@ export {
   approvalStoreFactoryFor,
   buildHostApprovalService,
   type HostApprovalServiceOptions,
+  type MaintenanceOutcome,
   maintenancePrincipal,
   reconcileApprovalsOnStatusDetached,
   runApprovalRetentionPurge,
@@ -65,6 +78,25 @@ export {
   type HubStubLike,
   type HubTopology,
 } from './hub-topology.js';
+export type {
+  MaintenanceCapabilityClaims,
+  MaintenanceCapabilityJwk,
+  MaintenanceCapabilityOperation,
+  MintAsymmetricMaintenanceCapabilityOptions,
+  MintMaintenanceCapabilityOptions,
+  VerifyAsymmetricMaintenanceCapabilityOptions,
+  VerifyMaintenanceCapabilityOptions,
+  VerifyMaintenanceReceiptOptions,
+} from './maintenance-capability.js';
+export {
+  MAINTENANCE_RECEIPT_HEADER,
+  mintAsymmetricMaintenanceCapability,
+  mintMaintenanceCapability,
+  mintMaintenanceReceipt,
+  verifyAsymmetricMaintenanceCapability,
+  verifyMaintenanceCapability,
+  verifyMaintenanceReceipt,
+} from './maintenance-capability.js';
 // The agent-memory host boundary every memory-touching route calls.
 export {
   assertNoClientMemoryIds,
@@ -82,6 +114,25 @@ export type {
   RunStartInput,
 } from './run-router.js';
 export { createRunRouter } from './run-router.js';
+export type {
+  StateEgressBinding,
+  StateEgressContext,
+  StateEgressEnv,
+} from './state-egress.js';
+export {
+  createStateEgressFetch,
+  STATE_EGRESS_CREDENTIAL_HEADER,
+  STATE_EGRESS_ENVIRONMENT_HEADER,
+  STATE_EGRESS_HEADERS,
+  STATE_EGRESS_POLICY_ID_HEADER,
+  STATE_EGRESS_RESERVED_HEADERS,
+  STATE_EGRESS_RESOURCE_GROUP_HEADER,
+  STATE_EGRESS_ROUTE_HOSTNAME_HEADER,
+  STATE_EGRESS_SCRIPT_HEADER,
+  STATE_EGRESS_TENANT_HEADER,
+  stateEgressCredentialMatches,
+  validateStateEgressEnv,
+} from './state-egress.js';
 export type { StreamRouter, StreamRouterOptions } from './stream-router.js';
 export { createStreamRouter } from './stream-router.js';
 export type {

@@ -392,7 +392,7 @@ describe('purgeExpiredWorkflowRuns', () => {
     // CREATE TABLE never happened
     const sqlite = openSqlite();
 
-    // #when / #then — the purge cron must not fail until some unrelated run
+    // #when / #then — maintenance purge must not fail until some unrelated run
     // initializes the schema
     expect(
       await purgeExpiredWorkflowRuns(d1Like(sqlite), {
@@ -554,7 +554,7 @@ describe('purgeExpiredWorkflowRuns', () => {
       },
     };
 
-    // #when / #then — the failure propagates (the cron logs it)...
+    // #when / #then — the failure propagates (the purge duty logs it)...
     await expect(
       purgeExpiredWorkflowRuns(d1Like(sqlite), {
         ttlMs: 7 * DAY_MS,
@@ -588,7 +588,7 @@ describe('purgeExpiredWorkflowRuns', () => {
     const options = { ttlMs: 7 * DAY_MS, now: () => NOW, artifactStore };
 
     // #when / #then — the pass purges the other four, then reports the
-    // failure (naming the run) so the cron's error surface still fires
+    // failure (naming the run) so the purge duty's error surface still fires
     await expect(
       purgeExpiredWorkflowRuns(d1Like(sqlite), options),
     ).rejects.toThrow('wf/r3-bad: permanently broken');
@@ -1036,7 +1036,7 @@ describe('purgeExpiredThreads (agent-memory thread TTL)', () => {
 
   it('reads missing tables as empty, so a memory-less deployment purges unchanged', async () => {
     // #given — a fresh DB: no host has enabled agent memory, so Mastra never
-    // created the tables. The duty must no-op, not wedge the purge cron.
+    // created the tables. The duty must no-op, not wedge maintenance purge.
     const sqlite = openSqlite();
 
     // #when
@@ -1109,7 +1109,7 @@ describe('purgeExpiredThreads (agent-memory thread TTL)', () => {
       },
     };
 
-    // #when / #then — the cron's error surface fires and the thread survives
+    // #when / #then — the purge duty's error surface fires and the thread survives
     await expect(
       purgeExpiredThreads(wedgedDb, { ttlMs: 30 * DAY_MS, now: () => NOW }),
     ).rejects.toThrow('database is locked');

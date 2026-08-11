@@ -161,12 +161,12 @@ Start from [`packages/flowsafe/deploy/`](../packages/flowsafe/deploy/README.md).
 1. Choose a stable lowercase deployment tag. Replace the checked-in `replace-me` segment in both the Worker `name` and D1 `database_name`, create that uniquely named D1 database, and put its id in `wrangler.jsonc`. The unique Worker name is also the deployment's Durable Object namespace boundary.
 2. Set `DEPLOYMENT_TENANT` to the same tag. The checked-in invalid placeholder must never reach deployment.
 3. Before application migrations, run `npx flowsafe-provision --database <database> --tag <tag> --remote --config wrangler.jsonc` from your application. The CLI is published with Flowsafe and uses the Wrangler 4 installation in your project.
-4. Set a distinct `DEPLOYMENT_IDENTITY_SECRET` with `wrangler secret put`; every Worker-to-Durable-Object request requires it.
-5. Register the runner Durable Object migration. Add the hub Durable Object and `STREAM_TICKET_SECRET` when you want live updates.
+4. Set distinct `DEPLOYMENT_IDENTITY_SECRET` and `MAINTENANCE_ADMIN_SECRET` values with `wrangler secret put`. Every Worker-to-Durable-Object request requires the first credential. Only the provisioning control plane uses the second.
+5. Register the runner and maintenance Durable Object migrations. Add the hub Durable Object and `STREAM_TICKET_SECRET` when you want live updates.
 6. Replace the example workflow, but keep `approvalGrantProvider()` in `init()`.
 7. Replace the static bearer verifier with your identity provider. Return a validated actor with `id` and `role`; do not accept a tenant claim.
-8. Configure the sweep and purge cron expressions.
-9. Deploy, start a run, approve its queued suspension as a different actor, and inspect the terminal status.
+8. Deploy, then call `POST /admin/ensure-maintenance` with the maintenance credential. Confirm `GET /admin/maintenance-status` returns a non-null `alarmAt`.
+9. Start a run, approve its queued suspension as a different actor, and inspect the terminal status.
 
 The baseline template deliberately exposes a raw resume route for generic
 workflow recovery and testing, but raw resume data never carries a connector
@@ -276,7 +276,7 @@ The default renderer is plain HTML. Inject `ApprovalUIComponents` or use `useApp
 ## Choose the next guide
 
 - [Approval system](approval-system.md) for queue semantics, live streaming, and recovery
-- [Deployment reference](deployment-reference.md) for bindings, secrets, routes, and crons
+- [Deployment reference](deployment-reference.md) for bindings, secrets, routes, and alarm-driven maintenance
 - [Durable agents](durable-agents.md) for threads, memory, signals, goals, schedules, tasks, and providers
 - [Security threat model](security-threat-model.md) before exposing a public endpoint
 - [Operations runbook](operations-runbook.md) before production

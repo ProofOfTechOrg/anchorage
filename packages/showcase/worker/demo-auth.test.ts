@@ -1348,7 +1348,7 @@ describe('session cleanup grace window', () => {
     });
     const jwtTtlMs = 3600 * 1000;
 
-    // #when — the cron runs 10 min after expiry with a 1h grace
+    // #when — the purge duty runs 10 min after expiry with a 1h grace
     const early = await deleteExpiredDemoSessions(db, {
       graceMs: jwtTtlMs,
       now: () => T0,

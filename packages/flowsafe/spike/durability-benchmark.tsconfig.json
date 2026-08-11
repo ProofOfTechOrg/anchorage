@@ -1,0 +1,17 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["@cloudflare/workers-types"],
+    "paths": {
+      "@proofoftech/breakwater": ["../../breakwater/src/index.ts"],
+      "@proofoftech/breakwater/*": ["../../breakwater/src/*/index.ts"]
+    }
+  },
+  "include": ["./durability-benchmark.worker.ts", "../src/**/*.ts"],
+  "exclude": [
+    "../src/**/*.test.ts",
+    "../src/approval-ui/**/*.tsx",
+    "../src/approval-ui/index.ts"
+  ]
+}

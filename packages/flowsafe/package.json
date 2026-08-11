@@ -54,6 +54,10 @@
     "./signal-providers": "./dist/signal-providers/index.js",
     "./signals": "./dist/signals/index.js",
     "./signals/client": "./dist/signals/client.js",
+    "./deployment-identity-protocol": {
+      "types": "./dist/deployment-identity-protocol.d.ts",
+      "default": "./dist/deployment-identity-protocol.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {

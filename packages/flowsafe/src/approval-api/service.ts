@@ -174,7 +174,7 @@ export interface ApprovalServiceOptions {
 
 // Role policy from security-threat-model.md: reviewers decide, operators run
 // the system, admins do both; every authenticated role may read. (The SLA
-// sweep has no role: it is cron-owned TCB code — see sweepSLA below.)
+// sweep has no role: it is maintenance-owned TCB code; see sweepSLA below.)
 // CAN_REVIEW IS the exported DECIDER_ROLES — one source, so the run-router's
 // canSelfDecide echo and this gate can never disagree on who may decide.
 const CAN_REVIEW: readonly ApprovalRole[] = DECIDER_ROLES;
@@ -1228,7 +1228,7 @@ function fireNotification(
 // the AUDIT sink (as `approval.stream`/'error') so the mutation that fired it
 // never fails. Deliberately not awaited: a host that must keep a hub publish
 // alive past the response wraps it in ctx.waitUntil itself (see
-// ApprovalStreamSink); the cron sweep collects it into pendingSends instead.
+// ApprovalStreamSink); the maintenance sweep collects it into pendingSends instead.
 function fireStreamEvent(
   stream: ApprovalStreamSink | undefined,
   event: ApprovalStreamEvent,
@@ -1247,7 +1247,7 @@ function fireStreamEvent(
   }
 }
 
-/** Options for the cron-owned SLA sweep. */
+/** Options for the maintenance-owned SLA sweep. */
 export interface SweepSLAOptions {
   /**
    * Attribution identity for audit events (e.g. the worker's system principal).
@@ -1274,10 +1274,10 @@ export interface SweepSLAOptions {
    * Live-stream fan-out seam — fired once per escalated record, alongside
    * onEscalation and notify. Same containment as ApprovalServiceOptions.stream:
    * a throwing or rejecting sink is audited as `approval.stream`/'error' and
-   * never aborts the sweep. A scheduled handler has no request-scoped
-   * waitUntil, so the cron host collects each publish into its pendingSends and
+   * never aborts the sweep. The alarm handler has no request-scoped waitUntil,
+   * so the maintenance host collects each publish into its pendingSends and
    * awaits it there (see host-kit's runSlaSweepMaintenance) — never
-   * fire-and-forget under `scheduled()`.
+   * fire-and-forget under a maintenance alarm.
    */
   stream?: ApprovalStreamSink;
   /** Injectable clock (tests, deterministic SLA math). */

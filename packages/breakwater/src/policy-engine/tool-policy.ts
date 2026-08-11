@@ -246,6 +246,8 @@ export function crossWorkflowIsolation(
  */
 export const ISOLATION_SCOPE_CONTEXT_KEY = 'breakwater.isolationScope';
 
+const tenantIsolationEvaluators = new WeakSet<object>();
+
 /**
  * Deny any call whose requestContext carries NO isolation scope. Deployments
  * that segment budgets/replay caches by tenant include this in their policy
@@ -259,7 +261,7 @@ export const ISOLATION_SCOPE_CONTEXT_KEY = 'breakwater.isolationScope';
 export function tenantIsolation(
   options: { name?: string } = {},
 ): ToolPolicyEvaluator {
-  return {
+  const evaluator: ToolPolicyEvaluator = {
     name: options.name ?? 'tenant-isolation',
     evaluate(call): PolicyDecision {
       const scope = call.requestContext?.get(ISOLATION_SCOPE_CONTEXT_KEY);
@@ -273,6 +275,15 @@ export function tenantIsolation(
       return { allowed: true };
     },
   };
+  tenantIsolationEvaluators.add(evaluator);
+  return evaluator;
+}
+
+/** @internal Identify the built-in evaluator even when it has a custom name. */
+export function isTenantIsolationEvaluator(
+  evaluator: ToolPolicyEvaluator,
+): boolean {
+  return tenantIsolationEvaluators.has(evaluator);
 }
 
 /**
@@ -314,6 +325,8 @@ export interface BackgroundExecutionOptions {
   name?: string;
 }
 
+const backgroundExecutionEvaluators = new WeakSet<object>();
+
 /**
  * Deny a write-class connector call carrying an LLM `_background` override
  * that asks for background execution. This complements `createConnector`'s
@@ -336,7 +349,7 @@ export function backgroundExecution(
     'destructive',
     'idempotent',
   ];
-  return {
+  const evaluator: ToolPolicyEvaluator = {
     name: options.name ?? 'background-execution',
     evaluate({ sideEffect, input, connectorId }): PolicyDecision {
       if (!writeClass.includes(sideEffect)) return { allowed: true };
@@ -350,6 +363,15 @@ export function backgroundExecution(
       return { allowed: true };
     },
   };
+  backgroundExecutionEvaluators.add(evaluator);
+  return evaluator;
+}
+
+/** @internal Identify the built-in evaluator even when it has a custom name. */
+export function isBackgroundExecutionEvaluator(
+  evaluator: ToolPolicyEvaluator,
+): boolean {
+  return backgroundExecutionEvaluators.has(evaluator);
 }
 
 /** Org-level approval policy for write-class connector calls. */

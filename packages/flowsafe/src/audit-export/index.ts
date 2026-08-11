@@ -9,18 +9,36 @@
 // authenticated HTTP POST (NDJSON — the generic HTTP event-collector shape;
 // `transform` reshapes per SIEM envelope), acking on 2xx and retrying the
 // whole batch otherwise so Queues' backoff/DLQ semantics own reliability.
+
+export type {
+  AuditProxyAttribution,
+  AuditProxyBinding,
+  AuditProxyDurableObjectConstructor,
+  AuditProxyDurableObjectEnv,
+  AuditProxyDurableObjectState,
+  AuditProxyNamespaceLike,
+  AuditProxyServiceBinding,
+  AuditProxyStubLike,
+  InfrastructureAuditEnvelope,
+} from './audit-proxy.js';
+export {
+  AUDIT_PROXY_INSTANCE_NAME,
+  createAuditProxyDurableObject,
+  createAuditProxyDurableObjectBinding,
+  createAuditProxyHandler,
+  createAuditProxyQueue,
+  createAuditProxyServiceBinding,
+  FlowsafeFleetAuditProxy,
+} from './audit-proxy.js';
+
 //
 // All types are structural subsets of @cloudflare/workers-types (Queue,
 // MessageBatch, fetch) so the module tests off-Workers and never forces the
 // types package on consumers.
 
-/**
- * Producer subset of a Cloudflare `Queue<TEvent>` binding (send returns
- * `Promise<QueueSendResponse>` on Workers — anything awaitable works here).
- */
-export interface AuditQueue<TEvent = unknown> {
-  send(message: TEvent): Promise<unknown>;
-}
+import type { AuditQueue } from './queue-types.js';
+
+export type { AuditQueue } from './queue-types.js';
 
 /**
  * Adapt a Queue producer binding onto the audit-sink contracts. Generic so

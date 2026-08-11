@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Track D (M-006), CI-M-006-002 — createScheduleTick. WE OWN THE TICK (DL-012):
-// a cron-triggered scheduled() (or DO alarm) drives listDueSchedules -> CAS
+// a Durable Object alarm drives listDueSchedules -> CAS
 // updateScheduleNextFire claim -> fire, bypassing core's pubsub worker loop
 // entirely (the P1 "one chokepoint, no second execution path" rule). Core's own
 // pubsub-driven schedule-worker loop is deliberately not adopted.
@@ -323,7 +323,7 @@ export interface ScheduleTickOptions {
   now?: () => number;
 }
 
-/** Per-pass tally the tick returns (for the cron's maintenance log line). */
+/** Per-pass tally the tick returns for its maintenance log line. */
 export interface ScheduleTickResult {
   /** Due schedules the pass considered. */
   due: number;
@@ -645,7 +645,7 @@ export function createScheduleStartSource(
 
 /**
  * Build the schedule tick: a `() => Promise<ScheduleTickResult>` a host slots
- * into its cron dispatch as its OWN failure-isolated duty (own try/catch, own
+ * into its alarm dispatch as its OWN failure-isolated duty (own try/catch, own
  * log line — the purge-availability lesson). Each due schedule is processed
  * independently: one bad row (a start throw, a corrupt cron) is contained and the
  * rest still fire.

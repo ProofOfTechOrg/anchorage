@@ -167,7 +167,7 @@ The full path from install to first approval is in [`docs/getting-started.md`](d
 
 ### Long-running agents
 
-The following surfaces are supported and opt-in: they are tested and covered by package compatibility guarantees, but the host must explicitly wire the required routes, bindings, storage domains, or scheduled duties.
+The following surfaces are supported and opt-in: they are tested and covered by package compatibility guarantees, but the host must explicitly wire the required routes, bindings, storage domains, or alarm-driven duties.
 
 - Server-owned guarded-agent catalog with authenticated list, start, status, and NDJSON observation routes
 - Approval-only durable agent resume that restores the original authorized principal

@@ -66,7 +66,7 @@ Copy the [reference deployment](https://github.com/ProofOfTechOrg/anchorage/tree
 - exact suspension-bound breakwater grant derivation;
 - role checks and separation of duties;
 - optional live approval/run WebSockets;
-- cron-owned SLA sweep and retention purge;
+- alarm-owned SLA sweep and retention purge;
 - structured audit and optional Queue-to-SIEM export;
 - a sample gated workflow.
 
@@ -192,7 +192,7 @@ Flowsafe serves one organization per Worker, D1 database, and set of Durable Obj
 
 ### Deployment identity fails closed
 
-Provisioning writes the same stable tag to the `DEPLOYMENT_TENANT` binding and the singleton `flowsafe_deployment` D1 row. The Worker checks the pair before protected routes and scheduled work. Every Worker topology stamps `DEPLOYMENT_IDENTITY_SECRET` on Durable Object requests; the target compares the credential and validates its own tag and sentinel before reading storage.
+Provisioning writes the same stable tag to the `DEPLOYMENT_TENANT` binding and the singleton `flowsafe_deployment` D1 row. The Worker checks the pair before protected routes and maintenance work. Every Worker topology stamps `DEPLOYMENT_IDENTITY_SECRET` on Durable Object requests; the target compares the credential and validates its own tag and sentinel before reading storage.
 
 Seed the sentinel before application migrations or traffic. First-time provisioning refuses any database that already contains application tables. A missing binding, malformed sentinel schema, non-singleton row set, malformed tag, credential mismatch, or tag mismatch returns `503` at the Worker or prevents Durable Object initialization.
 
@@ -206,6 +206,8 @@ npx flowsafe-provision \
   --remote \
   --config wrangler.jsonc
 ```
+
+Fleet control planes can import the same fail-closed sentinel implementation from `@proofoftech/flowsafe/deployment-identity-protocol` instead of duplicating its schema or race handling.
 
 ### Runtime ids are opaque
 
@@ -255,6 +257,8 @@ Workflow and run ids use the runner's path-safe pattern. Artifact names are vali
 ## Audit export
 
 `queueAuditSink(queue)` turns the shared audit contract into Cloudflare Queue messages. `createAuditQueueConsumer()` batches records as NDJSON, posts them to the configured collector, acknowledges the batch on 2xx, and retries otherwise.
+
+For an externally authored fleet release, do not expose that shared Queue binding to the candidate. Bind the candidate to the trusted state Worker as `AUDIT_PROXY` and enable the matching candidate and trusted-ingress fleet markers. The adapter authenticates with the deployment identity; trusted state supplies canonical tenant, environment, and script attribution before enqueueing. The envelope marks the candidate event itself as untrusted, so its action, decision, resource, and detail remain claims rather than infrastructure attestations.
 
 The types are structural and do not require `@cloudflare/workers-types`. A transform seam can map internal events to your SIEM schema.
 
@@ -320,9 +324,9 @@ Complete wiring is in the [durable-agents guide](https://github.com/ProofOfTechO
 
 ## Deployment and operations
 
-The composed `createFlowsafeWorker()` owns the shared route, scheduled, and Queue pipeline. Hosts inject workflows, identity verification, topology-backed optional routers, budget wrappers, notification transport, artifact pairing, schedule tick, and extra purge duties.
+The composed `createFlowsafeWorker()` owns the shared route and maintenance-duty pipeline. Hosts inject workflows, identity verification, topology-backed optional routers, budget wrappers, notification transport, artifact pairing, schedule tick, and extra purge duties.
 
-Use separate cron expressions for approval service-level agreement (SLA) sweep, retention purge, and schedule fire. Provider polling uses the singleton provider host's Durable Object alarm.
+`createFlowsafeMaintenanceDurableObject()` runs approval service-level agreement (SLA) sweep, retention purge, and optional schedule fire as separate alarm invocations. Provider polling and background recovery use their own Durable Object alarms.
 
 Read:
 
@@ -339,6 +343,7 @@ Critical host obligations:
 - deploy one Worker, D1 database, and set of Durable Object namespaces per organization;
 - seed `flowsafe_deployment` before application migrations, configure `DEPLOYMENT_TENANT`, and keep the values identical;
 - set a distinct `DEPLOYMENT_IDENTITY_SECRET` for internal Durable Object calls;
+- set a separate `MAINTENANCE_ADMIN_SECRET`, bootstrap the fixed maintenance singleton after deploy, and monitor its alarm status; for externally authored releases, keep that secret only in trusted state and relay short-lived signed capabilities through the candidate;
 - derive actors and roles from verified credentials;
 - mint run, thread, schedule, and subscription identities server-side, validate host-owned resource keys, and preserve their principal ownership records;
 - keep connector lists and agent resume targets server-authored;

@@ -3,7 +3,7 @@
 //
 // Before this existed the platform had one identity, ApprovalActor, whose only
 // authority vocabulary is a human ApprovalRole. Every automated path therefore
-// fabricated a human: the schedule tick, cron maintenance, signal-provider
+// fabricated a human: the schedule tick, alarm maintenance, signal-provider
 // delivery, and the suspension-reconcile bridge all minted `role: 'operator'`.
 // That loses provenance (nothing records WHY the call exists) and, worse, hands
 // autonomous execution whatever an operator may do.
@@ -125,7 +125,7 @@ export const TRUSTED_AUTOMATION: unique symbol = Symbol(
 
 /**
  * Any non-human principal — the shape a duty needs when it wants provenance but
- * derives no authority from the principal (the cron SLA sweep is the case).
+ * derives no authority from the principal (the alarm-owned SLA sweep is the case).
  * Separate from `TrustedAutomationPrincipal` so the brand is demanded only
  * where it is actually read, which is `ApprovalService`'s two trusted entries.
  */

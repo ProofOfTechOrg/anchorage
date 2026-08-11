@@ -1,5 +1,5 @@
 // Executable proof for the shipped operator template. deploy/worker.ts was
-// typecheck-only (tsc -p deploy/tsconfig.json); its fetch()/scheduled()/queue()
+// typecheck-only (tsc -p deploy/tsconfig.json); its fetch and maintenance-duty
 // handlers never ran in any test, so a template regression would ship silently.
 // This drives the handler object in-process over the same fakes the rest of the
 // suite trusts: a node:sqlite SQL unit facade behind the Mastra D1Store +
@@ -18,11 +18,9 @@
 //   - fail-closed: a forged resume (no approval) is denied at the grant gate
 //   - the template boundary: client runIds 400, viewers cannot start runs,
 //     and authorized actors share the deployment's run/approval surfaces
-//   - scheduled(): the cron escalates an SLA-overdue approval and purges only
+//   - maintenance duties escalate an SLA-overdue approval and purge only
 //     stale TERMINAL snapshots; a broken approval store must not stop the
 //     retention purge (the two surfaces are isolated)
-//   - queue(): no SIEM endpoint -> the batch retries (nothing acked);
-//     configured -> one NDJSON POST with the auth header, then ack
 //   - D4 wedge recovery: a status() poll re-files an approval a suspended
 //     run lost, and deciding the re-filed record resumes the run to
 //     completion
@@ -36,10 +34,8 @@ import type {
   DurableObjectNamespace,
   DurableObjectState,
   ExecutionContext,
-  MessageBatch,
-  ScheduledController,
 } from '@cloudflare/workers-types';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   type ApprovalActor,
@@ -62,7 +58,6 @@ import {
   type SqliteDatabase,
   sqliteUnitDatabase,
 } from '../test-support/sqlite.js';
-import { PURGE_CRON, SWEEP_CRON } from './crons.js';
 import handler, { FlowsafeRunner } from './worker.js';
 
 type Env = Parameters<NonNullable<typeof handler.fetch>>[1];
@@ -72,8 +67,23 @@ function required<T>(handlerFn: T | undefined, name: string): T {
   return handlerFn;
 }
 const fetchHandler = required(handler.fetch, 'fetch');
-const scheduledHandler = required(handler.scheduled, 'scheduled');
-const queueHandler = required(handler.queue, 'queue');
+
+const maintenanceWorker = createFlowsafeWorker<Env>({
+  workflows: [],
+  systemPrincipalId: 'flowsafe-worker',
+  buildVerifier: () => staticTokenVerifier(new Map<string, ApprovalActor>()),
+  maintenance: {
+    sweepIntervalMs: 15 * 60 * 1_000,
+    purgeIntervalMs: 60 * 60 * 1_000,
+  },
+});
+
+async function runMaintenanceDuty(
+  duty: 'sweep' | 'purge',
+  env: Env,
+): Promise<void> {
+  await maintenanceWorker.runMaintenanceDuty(duty, env);
+}
 
 // In-process DO namespace: idFromName carries the name, get() memoizes a REAL
 // FlowsafeRunner per name with a stub state exposing that identity — the same
@@ -142,6 +152,10 @@ function makeEnv(overrides: Partial<Env> = {}): {
     DEPLOYMENT_TENANT: 'acme',
     DEPLOYMENT_IDENTITY_SECRET: 'test-deployment-identity-secret-0001',
     APPROVAL_ACTOR_TOKENS: JSON.stringify(TOKENS),
+    MAINTENANCE: {
+      idFromName: (name: string) => ({ name }),
+      get: () => ({ fetch: async () => new Response(null, { status: 204 }) }),
+    } as unknown as DurableObjectNamespace,
     ...overrides,
   } as Env;
   (env as { RUNNER: DurableObjectNamespace }).RUNNER = fakeRunnerNamespace(
@@ -202,6 +216,13 @@ async function startRun(env: Env, token = 'tok-operator') {
   expect(response.status).toBe(200);
   return (await response.json()) as StartResponse;
 }
+
+describe('deploy worker portability', () => {
+  it('exports no platform-trigger or queue-consumer handlers', () => {
+    expect(handler).not.toHaveProperty('scheduled');
+    expect(handler).not.toHaveProperty('queue');
+  });
+});
 
 describe('deploy worker fetch(): auth seam', () => {
   it('serves /healthz unauthenticated and 401s every other surface without a token', async () => {
@@ -700,7 +721,7 @@ describe('deploy worker fetch(): live stream stage (opt-in)', () => {
 });
 
 // Column set per @mastra/core storage constants for mastra_workflow_snapshot
-// (camelCase timestamps, snapshot serialized as JSON TEXT) — the cron's purge
+// (camelCase timestamps, snapshot serialized as JSON TEXT) — the alarm's purge
 // targets this exact table shape. Drift from the real adapter's DDL is pinned
 // by mastra-schema-guard.test.ts (runs the REAL D1Store and asserts run_id).
 function createSnapshotTable(db: SqliteDatabase): void {
@@ -743,7 +764,7 @@ function remainingRunIds(db: SqliteDatabase): string[] {
 
 const DAY_MS = 86_400_000;
 
-describe('deploy worker scheduled(): cron-owned maintenance', () => {
+describe('deploy worker alarm-owned maintenance duties', () => {
   it('escalates an SLA-overdue approval and purges only stale TERMINAL snapshots', async () => {
     // #given — an overdue pending approval (seeded through the real store,
     // same DB object the worker binds) and three snapshot rows: stale
@@ -783,15 +804,9 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
       updatedAt: Date.now() - 90 * DAY_MS,
     });
 
-    // #when — the SWEEP cron fires alone
+    // #when — the SWEEP duty runs alone
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const sweepCtx = makeCtx();
-    await scheduledHandler(
-      { cron: SWEEP_CRON } as unknown as ScheduledController,
-      env,
-      sweepCtx.ctx,
-    );
-    await sweepCtx.drain();
+    await runMaintenanceDuty('sweep', env);
 
     // #then — the sweep escalated the overdue approval, and the DISPATCH
     // kept the purge out of this invocation (a CPU-limit kill is not
@@ -805,14 +820,8 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
       'acme_stale-open',
     ]);
 
-    // #when — the PURGE cron fires
-    const purgeCtx = makeCtx();
-    await scheduledHandler(
-      { cron: PURGE_CRON } as unknown as ScheduledController,
-      env,
-      purgeCtx.ctx,
-    );
-    await purgeCtx.drain();
+    // #when — the purge maintenance duty runs
+    await runMaintenanceDuty('purge', env);
 
     // #then — the purge reclaimed exactly the stale terminal row under the
     // FALLBACK 30-day TTL (a stale SUSPENDED run is a pending approval, not
@@ -862,20 +871,8 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     // #when — the sweep firing fails; the purge firing still does its duty
-    const sweepCtx = makeCtx();
-    await scheduledHandler(
-      { cron: SWEEP_CRON } as unknown as ScheduledController,
-      env,
-      sweepCtx.ctx,
-    );
-    await sweepCtx.drain();
-    const purgeCtx = makeCtx();
-    await scheduledHandler(
-      { cron: PURGE_CRON } as unknown as ScheduledController,
-      env,
-      purgeCtx.ctx,
-    );
-    await purgeCtx.drain();
+    await runMaintenanceDuty('sweep', env);
+    await runMaintenanceDuty('purge', env);
 
     // #then — the sweep failure was logged, not propagated, and the purge ran
     expect(remainingRunIds(sqlite)).toEqual([]);
@@ -923,20 +920,8 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     // #when — the purge firing fails; the sweep firing still does its duty
-    const purgeCtx = makeCtx();
-    await scheduledHandler(
-      { cron: PURGE_CRON } as unknown as ScheduledController,
-      env,
-      purgeCtx.ctx,
-    );
-    await purgeCtx.drain();
-    const sweepCtx = makeCtx();
-    await scheduledHandler(
-      { cron: SWEEP_CRON } as unknown as ScheduledController,
-      env,
-      sweepCtx.ctx,
-    );
-    await sweepCtx.drain();
+    await runMaintenanceDuty('purge', env);
+    await runMaintenanceDuty('sweep', env);
 
     // #then — the purge failure was logged, not propagated, and the sweep ran
     const swept = await store.get('apr-overdue');
@@ -950,54 +935,7 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
     errorSpy.mockRestore();
   });
 
-  it('an unrecognized cron expression runs BOTH surfaces and logs the misconfig', async () => {
-    // #given — ops edited wrangler.jsonc without updating the constants;
-    // availability of both duties beats purity on a misconfig
-    const { env, sqlite, d1 } = makeEnv();
-    const store = new D1ApprovalStoreFactory(d1 as never).store();
-    const past = new Date(Date.now() - 60_000).toISOString();
-    await store.create({
-      id: 'apr-overdue',
-      workflowId: 'example-approval',
-      runId: 'acme_r1',
-      title: 'overdue approval',
-      connectors: [],
-      priority: 'normal',
-      status: 'pending',
-      createdAt: past,
-      updatedAt: past,
-      slaDeadlineAt: past,
-    });
-    createSnapshotTable(sqlite);
-    seedRun(sqlite, {
-      runId: 'acme_stale-done',
-      status: 'success',
-      updatedAt: Date.now() - 40 * DAY_MS,
-    });
-    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-
-    // #when
-    const { ctx, drain } = makeCtx();
-    await scheduledHandler(
-      { cron: '*/5 * * * *' } as unknown as ScheduledController,
-      env,
-      ctx,
-    );
-    await drain();
-
-    // #then — swept AND purged, with the config-error tripwire on record
-    expect((await store.get('apr-overdue'))?.status).toBe('escalated');
-    expect(remainingRunIds(sqlite)).toEqual([]);
-    expect(
-      errorSpy.mock.calls.some(([line]) => {
-        const text = String(line);
-        return text.includes('config-error') && text.includes('triggers.crons');
-      }),
-    ).toBe(true);
-    errorSpy.mockRestore();
-  });
-
-  it('purges DECIDED approvals past APPROVAL_RETENTION_DAYS on the SAME PURGE_CRON firing as the snapshot purge', async () => {
+  it('purges DECIDED approvals and snapshots in the same purge-duty alarm', async () => {
     // #given — an old decided (approved) approval, a fresh decided
     // (rejected) approval, and an old but still-OPEN approval (never
     // purged at any age). RUN_RETENTION_DAYS is unset (fallback default);
@@ -1044,14 +982,8 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
     });
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    // #when — the PURGE cron fires once
-    const purgeCtx = makeCtx();
-    await scheduledHandler(
-      { cron: PURGE_CRON } as unknown as ScheduledController,
-      env,
-      purgeCtx.ctx,
-    );
-    await purgeCtx.drain();
+    // #when — the PURGE duty runs once
+    await runMaintenanceDuty('purge', env);
 
     // #then — the stale decided record is gone; the fresh decided record
     // and the still-open record (however old) both survive
@@ -1100,14 +1032,8 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
     });
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    // #when — the PURGE cron fires
-    const purgeCtx = makeCtx();
-    await scheduledHandler(
-      { cron: PURGE_CRON } as unknown as ScheduledController,
-      env,
-      purgeCtx.ctx,
-    );
-    await purgeCtx.drain();
+    // #when — the PURGE duty runs
+    await runMaintenanceDuty('purge', env);
 
     // #then — the snapshot purge still ran despite the broken approval
     // store, and the approval-purge failure was logged under its own
@@ -1123,7 +1049,7 @@ describe('deploy worker scheduled(): cron-owned maintenance', () => {
   });
 });
 
-describe('createFlowsafeWorker scheduled(): artifact-paired retention purge (F4)', () => {
+describe('createFlowsafeWorker artifact-paired retention purge (F4)', () => {
   // The deploy template wires no R2, so it sets no artifactStore. This drives
   // createFlowsafeWorker directly with one, proving runPurgeMaintenance threads
   // config.artifactStore into the built-in purge so each expired run's artifacts
@@ -1136,7 +1062,10 @@ describe('createFlowsafeWorker scheduled(): artifact-paired retention purge (F4)
       systemPrincipalId: 'flowsafe-worker',
       buildVerifier: () =>
         staticTokenVerifier(new Map<string, ApprovalActor>()),
-      crons: { sweep: SWEEP_CRON, purge: PURGE_CRON },
+      maintenance: {
+        sweepIntervalMs: 15 * 60 * 1_000,
+        purgeIntervalMs: 60 * 60 * 1_000,
+      },
       artifactStore,
     });
   }
@@ -1168,10 +1097,8 @@ describe('createFlowsafeWorker scheduled(): artifact-paired retention purge (F4)
       }),
     };
 
-    // #when — the PURGE cron fires
-    const { ctx, drain } = makeCtx();
-    await workerWith(artifactStore).scheduled({ cron: PURGE_CRON }, env, ctx);
-    await drain();
+    // #when — the PURGE duty runs
+    await workerWith(artifactStore).runMaintenanceDuty('purge', env);
 
     // #then — the stale run's artifacts were deleted (while its row still
     // existed), then its row was purged; the fresh run is untouched
@@ -1199,101 +1126,9 @@ describe('createFlowsafeWorker scheduled(): artifact-paired retention purge (F4)
     });
 
     // #when
-    const { ctx, drain } = makeCtx();
-    await workerWith(undefined).scheduled({ cron: PURGE_CRON }, env, ctx);
-    await drain();
+    await workerWith(undefined).runMaintenanceDuty('purge', env);
 
     // #then — byte-identical row-only outcome
     expect(remainingRunIds(sqlite)).toEqual(['acme_fresh-done']);
-  });
-});
-
-function fakeBatch(bodies: unknown[]): {
-  batch: MessageBatch;
-  acked: () => boolean;
-  retried: () => boolean;
-} {
-  let ackedAll = false;
-  let retriedAll = false;
-  const batch = {
-    queue: 'flowsafe-audit',
-    messages: bodies.map((body, index) => ({
-      id: `m${index}`,
-      timestamp: new Date(),
-      body,
-      ack: () => {},
-      retry: () => {},
-    })),
-    ackAll: () => {
-      ackedAll = true;
-    },
-    retryAll: () => {
-      retriedAll = true;
-    },
-  } as unknown as MessageBatch;
-  return { batch, acked: () => ackedAll, retried: () => retriedAll };
-}
-
-describe('deploy worker queue(): audit export consumer', () => {
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  it('retries the batch (acking nothing) when SIEM_ENDPOINT is unset', async () => {
-    // #given — the consumer is bound but the export target is not configured
-    const { env } = makeEnv();
-    const fetchSpy = vi.fn();
-    vi.stubGlobal('fetch', fetchSpy);
-    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const { batch, acked, retried } = fakeBatch([{ action: 'x' }]);
-
-    // #when
-    const { ctx } = makeCtx();
-    await queueHandler(batch, env, ctx);
-
-    // #then — nothing acked unconfirmed, nothing sent, misconfig logged
-    expect(retried()).toBe(true);
-    expect(acked()).toBe(false);
-    expect(fetchSpy).not.toHaveBeenCalled();
-    expect(
-      errorSpy.mock.calls.some(([line]) =>
-        String(line).includes('config-error'),
-      ),
-    ).toBe(true);
-    errorSpy.mockRestore();
-  });
-
-  it('ships the batch as one authenticated NDJSON POST and acks on 2xx', async () => {
-    // #given
-    const { env: baseEnv } = makeEnv();
-    const env = {
-      ...(baseEnv as unknown as Record<string, unknown>),
-      SIEM_ENDPOINT: 'https://siem.example/collect',
-      SIEM_AUTH_HEADER: 'Splunk secret-token',
-    } as Env;
-    const fetchSpy = vi.fn(async () => ({ ok: true, status: 200 }));
-    vi.stubGlobal('fetch', fetchSpy);
-    const events = [
-      { action: 'approval.decide', decision: 'allowed' },
-      { action: 'approval.escalate', decision: 'allowed' },
-    ];
-    const { batch, acked, retried } = fakeBatch(events);
-
-    // #when
-    const { ctx } = makeCtx();
-    await queueHandler(batch, env, ctx);
-
-    // #then — one POST, NDJSON body, auth header forwarded, batch acked
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
-    const [url, init] = fetchSpy.mock.calls[0] as unknown as [
-      string,
-      { method: string; headers: Record<string, string>; body: string },
-    ];
-    expect(url).toBe('https://siem.example/collect');
-    expect(init.method).toBe('POST');
-    expect(init.headers.authorization).toBe('Splunk secret-token');
-    expect(init.body).toBe(events.map((e) => JSON.stringify(e)).join('\n'));
-    expect(acked()).toBe(true);
-    expect(retried()).toBe(false);
   });
 });

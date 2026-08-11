@@ -1,0 +1,36 @@
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "flowsafe-durability-authority-benchmark",
+  "main": "./durability-benchmark.worker.ts",
+  "compatibility_date": "2025-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "alias": {
+    "@proofoftech/breakwater/connector-sdk": "../../breakwater/src/connector-sdk/index.ts"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "FLOWSAFE_RUNNER", "class_name": "BenchmarkFlowsafeRunner" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["BenchmarkFlowsafeRunner"] }
+  ],
+  "workflows": [
+    {
+      "binding": "NATIVE_WORKFLOW",
+      "name": "flowsafe-durability-native-comparison",
+      "class_name": "BenchmarkNativeWorkflow"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "flowsafe-durability-benchmark",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "vars": {
+    "DEPLOYMENT_TENANT": "benchmark",
+    "DEPLOYMENT_IDENTITY_SECRET": "benchmark-local-deployment-secret"
+  }
+}

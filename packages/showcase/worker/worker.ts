@@ -3,12 +3,12 @@
 // Six workflows run on the deployed service: the five original design sketches
 // plus wire-transfer, which appears in both the launcher and control room. They
 // run on a real Cloudflare Worker, Durable Object, and D1 database behind the
-// approval queue, bearer auth, and cron maintenance. This file is
+// approval queue, bearer auth, and alarm maintenance. This file is
 // host wiring only: it delegates every workflow to buildShowcaseRuntime(), and
 // auth + the run routes + the approval bridge + the service assembly to
 // src/host-kit (shared with `deploy/worker.ts`). What stays here is this
 // host's topology (the DO namespace handed to createDoRunTopology), the demo
-// budget charge, and cron maintenance.
+// budget charge, and maintenance hooks.
 //
 // Side effects are binding-gated in each connector (see showcase/workflows/):
 // with no binding a connector simulates its side effect (envelope/preview
@@ -54,9 +54,7 @@ import type {
   DurableObjectNamespace,
   ExecutionContext,
   ExportedHandler,
-  MessageBatch,
   Queue,
-  ScheduledController,
 } from '@cloudflare/workers-types';
 import {
   AGENT_AUDIT_CONTEXT_KEY,
@@ -77,7 +75,9 @@ import {
 import {
   approvalStoreFactoryFor,
   boolVar,
+  createFlowsafeMaintenanceDurableObject,
   createFlowsafeWorker,
+  type FlowsafeWorkerConfig,
   hmacVerifier,
   numberVar,
   parseActorTokens,
@@ -111,6 +111,7 @@ interface Env {
   /** Secret credential shared only by this deployment's Worker and DOs. */
   DEPLOYMENT_IDENTITY_SECRET: string;
   RUNNER: DurableObjectNamespace;
+  MAINTENANCE: DurableObjectNamespace;
   /**
    * Deployment live-streaming hub DO (ShowcaseHub). Always bound (wrangler v2
    * migration), so it is required, but streaming only mounts when
@@ -134,6 +135,7 @@ interface Env {
    * actor mapping stays inside the trusted computing base either way.
    */
   APPROVAL_ACTOR_TOKENS?: string;
+  MAINTENANCE_ADMIN_SECRET?: string;
   /**
    * Secret (`wrangler secret put STREAM_TICKET_SECRET`): the dedicated HS256
    * key that signs short-lived WebSocket stream tickets. Present WITH the HUB
@@ -171,19 +173,15 @@ interface Env {
   DEMO_SESSION_TTL_HOURS?: string;
   /** Demo JWT lifetime seconds (var; default 3600 = 1h, silent refresh). */
   DEMO_JWT_TTL_SECONDS?: string;
-  /** Cron purges terminal run snapshots older than this (var; default 30; 0 = immediately). */
+  /** Alarm maintenance purges terminal run snapshots older than this (var; default 30; 0 = immediately). */
   RUN_RETENTION_DAYS?: string;
-  /** Cron purges DECIDED (approved/rejected) approval records older than this (var; default 30; 0 = immediately). */
+  /** Alarm maintenance purges DECIDED approvals older than this (var; default 30; 0 = immediately). */
   APPROVAL_RETENTION_DAYS?: string;
   /**
-   * Optional audit export to a SIEM: bind a queue producer (wrangler.jsonc
-   * `queues` block) and audit events flow producer -> queue -> the `queue`
-   * consumer below -> HTTP POST to SIEM_ENDPOINT (auth via the SIEM_AUTH_HEADER
-   * secret). Without the binding, audit stays on structured Workers Logs only.
+   * Optional audit export: this data-plane Worker only produces to the shared
+   * audit queue. The control plane owns consumption and SIEM delivery.
    */
   AUDIT_QUEUE?: Queue;
-  SIEM_ENDPOINT?: string;
-  SIEM_AUTH_HEADER?: string;
 }
 
 /** Id for system-created records. */
@@ -427,24 +425,14 @@ async function chargeDemoBudget(
 // gates — have a single tested home. This host supplies only its bindings,
 // its demo mounts, and the demo budget charge.
 
-/**
- * Maintenance runs on TWO cron expressions, dispatched on controller.cron so
- * the SLA sweep and the purge NEVER share an invocation: a Workers CPU-limit
- * termination kills the isolate and is NOT a catchable JS error, so a slow
- * sweep sharing an invocation would permanently starve the purge (and vice
- * versa) no matter how many try/catches wrap them. Keep these literals equal
- * to wrangler.jsonc's `triggers.crons`. NOT exported: workerd rejects any
- * entry-module export that is not a handler/class/function, so a bare const
- * here fails the whole Worker at startup.
- */
-const SWEEP_CRON = '*/15 * * * *';
-const PURGE_CRON = '7 * * * *';
-
-const worker = createFlowsafeWorker<Env>({
+const workerConfig = {
   workflows: SHOWCASE_MODULES.map((entry) => entry.meta),
   systemPrincipalId: SYSTEM_PRINCIPAL_ID,
   buildVerifier,
-  crons: { sweep: SWEEP_CRON, purge: PURGE_CRON },
+  maintenance: {
+    sweepIntervalMs: 15 * 60 * 1_000,
+    purgeIntervalMs: 60 * 60 * 1_000,
+  },
   // The public demo sign-in is unauthenticated because it mints identity; the
   // kill switch 503s it. There is no deployment-wide reset route: one visitor
   // must never erase the shared organization's data.
@@ -495,40 +483,28 @@ const worker = createFlowsafeWorker<Env>({
   beforeResume: (context, env) => chargeDemoBudget(env, context),
   // Expired demo sessions are only auth/budget metadata. Shared run and
   // approval records stay under the normal deployment retention duties.
-  extraPurgeDuties: async (env, cron) => {
-    try {
-      const demoSessionsDeleted = await deleteExpiredDemoSessions(env.DB, {
-        // Wait out the final JWT lifetime so session metadata remains
-        // diagnosable until every issued token has expired.
-        graceMs:
-          numberVar(env.DEMO_JWT_TTL_SECONDS, 3600, 'DEMO_JWT_TTL_SECONDS') *
-          1000,
-        limit: 25,
-      });
-      return { demoSessionsDeleted };
-    } catch (error) {
-      console.error(
-        JSON.stringify({
-          type: 'maintenance-error',
-          surface: 'demo-session-cleanup',
-          cron,
-          error: String(error),
-        }),
-      );
-      return {};
-    }
+  extraPurgeDuties: async (env) => {
+    const demoSessionsDeleted = await deleteExpiredDemoSessions(env.DB, {
+      // Wait out the final JWT lifetime so session metadata remains
+      // diagnosable until every issued token has expired.
+      graceMs:
+        numberVar(env.DEMO_JWT_TTL_SECONDS, 3600, 'DEMO_JWT_TTL_SECONDS') *
+        1000,
+      limit: 25,
+    });
+    return { demoSessionsDeleted };
   },
-});
+} satisfies FlowsafeWorkerConfig<Env>;
+
+export class ShowcaseMaintenance extends createFlowsafeMaintenanceDurableObject(
+  workerConfig,
+) {}
+
+const worker = createFlowsafeWorker<Env>(workerConfig);
 
 const handler: ExportedHandler<Env> = {
   fetch: (request: CfRequest, env: Env, ctx: ExecutionContext) =>
     worker.fetch(request as unknown as Request, env, ctx),
-  scheduled: (
-    controller: ScheduledController,
-    env: Env,
-    ctx: ExecutionContext,
-  ) => worker.scheduled(controller, env, ctx),
-  queue: (batch: MessageBatch, env: Env) => worker.queue(batch, env),
 };
 
 export default handler;
