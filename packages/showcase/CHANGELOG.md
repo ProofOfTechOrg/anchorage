@@ -1,5 +1,11 @@
 # showcase
 
+## 0.0.12
+
+### Patch Changes
+
+- ff641f8: Bind the production showcase to its dedicated D1 database and single-tenant Worker, disable alternate public ingress, and retain the former deployment as the rollback bundle.
+
 ## 0.0.11
 
 ### Patch Changes
