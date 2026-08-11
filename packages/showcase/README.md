@@ -200,13 +200,23 @@ curl -fsS -X POST "https://${next_worker}.gcharang.workers.dev/runs" \
 
 Treat the cutover and rollback bundle as one resource set:
 
+Cloudflare Workers Builds triggers belong to a Worker's immutable script tag;
+copying `wrangler.jsonc` does not move them. Use the
+[Workers Builds API](https://developers.cloudflare.com/workers/ci-cd/builds/api-reference/)
+or the Cloudflare dashboard to transfer both connected triggers as part of the
+cutover. Keep the production trigger on `main` with `pnpm -r build` followed by
+`npx wrangler deploy`. Keep the preview trigger on non-`main` branches with the
+same build followed by `npx wrangler versions upload --dry-run`. Both retain
+the existing repository connection, build token, `/packages/showcase` root,
+path filters, and cache setting.
+
 1. Create the fresh D1 database and put its id only in the temporary configuration.
 2. Seed the sentinel before any application table, then set the deployment identity and authentication secrets on the replacement script.
 3. Deploy the temporary staging configuration. Use the generated staging actor for an authenticated route and a smoke run at its workers.dev URL; also verify `/healthz` and maintenance. OAuth sign-in is unavailable there because the provider callback remains the production origin.
 4. Keep the current live `anchorage-showcase-single-tenant` script and its dedicated database and namespaces unchanged as the rollback bundle. Never bind either generation to the other's storage. Do not use the legacy `anchorage-showcase` bundle as the rollback target for this cycle.
 5. In the temporary configuration, set `workers_dev` and `preview_urls` to `false`, then add `{ "pattern": "anchorage.proofoftech.org", "custom_domain": true }` to `routes`. Rebuild with `CLOUDFLARE_VITE_WRANGLER_CONFIG_PATH="$next_config"`, then deploy that configuration to move the custom domain to the replacement script.
-6. After verifying production OAuth and authenticated routes, run `pnpm exec wrangler secret delete APPROVAL_ACTOR_TOKENS --config "$next_config"`. Copy the temporary configuration over `wrangler.jsonc`, remove the temporary file, and commit the new source of truth through the release workflow. The temporary operator credential must not remain on the public deployment.
-7. To roll back, restore the custom domain from the retained revision of the previously live `anchorage-showcase-single-tenant` deployment and redeploy that exact Worker with its own storage. Do not attach the legacy pre-isolation Worker or mix any generation's storage.
+6. After verifying production OAuth and authenticated routes, run `pnpm exec wrangler secret delete APPROVAL_ACTOR_TOKENS --config "$next_config"`. Freeze repository pushes while transferring Workers Builds: snapshot both triggers on the previously live Worker, recreate them on the replacement with the exact settings above, and verify the replacement script tag, repository connection, commands, root, and filters by provider readback. Run a preview branch and require its replacement-Worker check to pass, then remove both triggers from the previously live Worker. Do not leave both production triggers enabled while commits can land. Copy the temporary configuration over `wrangler.jsonc`, remove the temporary file, and commit the new source of truth through the release workflow. Require the resulting `main` build to deploy a new version on the replacement Worker before completing the cutover. The temporary operator credential must not remain on the public deployment.
+7. To roll back, first freeze repository pushes and reverse the Workers Builds transfer: recreate both exact triggers on the retained previously live Worker, verify their immutable target by provider readback, and remove them from the replacement. Restore the custom domain from the retained revision of the previously live `anchorage-showcase-single-tenant` deployment and redeploy that exact Worker with its own storage. Do not make a rollback commit until the trigger target is correct. Do not attach the legacy pre-isolation Worker or mix any generation's storage.
 8. After the rollback window closes, decommission the previously live single-tenant Worker, database, Durable Object namespaces, and associated secrets as one unit. The legacy pre-isolation bundle has a separate retirement decision and must never be rebound into this cycle.
 
 The public deployment has one origin, `anchorage.proofoftech.org`, because the
