@@ -433,6 +433,10 @@ function bridgeSnapshot(value: unknown): BridgeSnapshot {
   ) {
     throw new Error('backend switch state has invalid bridge snapshot');
   }
+  const parsedApplication = applicationTopology(
+    bridge.application,
+    'bridge application topology',
+  );
   return {
     scriptName: bridge.scriptName,
     artifactVersion: bridge.artifactVersion,
@@ -444,14 +448,7 @@ function bridgeSnapshot(value: unknown): BridgeSnapshot {
     ),
     namespaceIds: stringArray(bridge.namespaceIds, 'bridge namespaces'),
     secretNames: stringArray(bridge.secretNames, 'bridge secrets'),
-    ...(applicationTopology(bridge.application, 'bridge application topology')
-      ? {
-          application: applicationTopology(
-            bridge.application,
-            'bridge application topology',
-          ),
-        }
-      : {}),
+    ...(parsedApplication ? { application: parsedApplication } : {}),
     publicRouteAttached: bridge.publicRouteAttached,
     stateOnly: bridge.stateOnly,
   };

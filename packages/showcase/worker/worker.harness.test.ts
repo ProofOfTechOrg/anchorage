@@ -1,4 +1,4 @@
-import { build } from 'vite';
+import { createBuilder } from 'vite';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   createTestHarness,
@@ -176,13 +176,16 @@ async function ticket(
 
 describe.sequential('showcase Wrangler test harness', () => {
   let server: TestHarness;
+  let serverForCleanup: TestHarness | undefined;
   let worker: Worker;
   let baseUrl: URL;
   let completedRun: StartedRun;
 
   beforeAll(async () => {
-    await build({ root: ROOT, logLevel: 'silent' });
+    const builder = await createBuilder({ root: ROOT, logLevel: 'silent' });
+    await builder.buildApp();
     server = createTestHarness(harnessOptions(STREAM_SECRET));
+    serverForCleanup = server;
     ({ url: baseUrl } = await server.listen());
     worker = server.getWorker<HarnessEnv>();
 
@@ -190,10 +193,10 @@ describe.sequential('showcase Wrangler test harness', () => {
       .getWorker('showcase-harness-seeder')
       .fetch('/seed', { method: 'POST' });
     expect(seeded.status).toBe(200);
-  }, 30_000);
+  }, 60_000);
 
   afterAll(async () => {
-    await server.close();
+    await serverForCleanup?.close();
   });
 
   it('loads the real Wrangler config and serves the actual Worker over its D1 deployment boundary', async () => {
