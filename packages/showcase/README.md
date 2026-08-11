@@ -158,6 +158,11 @@ Seed the new database, set the four production secrets and a temporary staging
 actor, then deploy the temporary configuration. Generate the actor token for
 this replacement; never reuse the checked-in demo tokens.
 
+Generate the maintenance administrator credential in the deployment secret
+manager, configure the fleet control plane with that same value, and load it
+into the shell as `maintenance_admin_secret`. The shell variable is only a
+transient copy; it must not be the credential's system of record.
+
 The Cloudflare Vite plugin writes `.wrangler/deploy/config.json`, and Wrangler
 follows that generated redirect even when `--config` names a sibling source
 file. Build from the replacement config before the first secret write, and
@@ -167,13 +172,13 @@ secret, and deploy commands pointed at the replacement Worker.
 ```bash
 CLOUDFLARE_VITE_WRANGLER_CONFIG_PATH="$next_config" \
   pnpm --filter showcase build
+: "${maintenance_admin_secret:?load the fleet maintenance credential from the deployment secret manager}"
 pnpm --dir packages/flowsafe provision:deployment -- \
   --database "$next_database" \
   --tag showcase \
   --remote \
   --config "$next_config"
 pnpm exec wrangler secret put DEPLOYMENT_IDENTITY_SECRET --config "$next_config"
-maintenance_admin_secret=$(openssl rand -hex 32)
 printf '%s\n' "$maintenance_admin_secret" | \
   pnpm exec wrangler secret put MAINTENANCE_ADMIN_SECRET --config "$next_config"
 pnpm exec wrangler secret put DEMO_JWT_SECRET --config "$next_config"
