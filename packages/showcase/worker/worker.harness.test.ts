@@ -7,6 +7,7 @@ import {
 } from 'wrangler';
 
 const DEPLOYMENT_SECRET = 'test-deployment-identity-secret-0001';
+const MAINTENANCE_SECRET = 'test-maintenance-admin-secret-00000001';
 const STREAM_SECRET = 'test-stream-ticket-secret-0000001';
 const TOKENS = {
   'tok-admin': { id: 'ada', role: 'admin' },
@@ -15,7 +16,7 @@ const TOKENS = {
 const DATABASE = {
   binding: 'DB',
   database_name: 'anchorage-showcase-single-tenant',
-  database_id: '00000000-0000-0000-0000-000000000000',
+  database_id: 'e8b62ac5-a155-4cc2-9942-e3da9773ad75',
 };
 const ROOT = new URL('..', import.meta.url).pathname;
 const BUILT_CONFIG = new URL(
@@ -33,6 +34,7 @@ function harnessOptions(streamTicketSecret: string) {
         configPath: BUILT_CONFIG,
         secrets: {
           DEPLOYMENT_IDENTITY_SECRET: DEPLOYMENT_SECRET,
+          MAINTENANCE_ADMIN_SECRET: MAINTENANCE_SECRET,
           APPROVAL_ACTOR_TOKENS: JSON.stringify(TOKENS),
           STREAM_TICKET_SECRET: streamTicketSecret,
           DEMO_JWT_SECRET: '',
