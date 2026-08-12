@@ -1,5 +1,11 @@
 # @proofoftech/flowsafe
 
+## 0.13.1
+
+### Patch Changes
+
+- 352b38c: Enforce the shared D1 table-prefix syntax and length contract in every public signal, schedule, and background-task storage constructor, subclass, and factory. Correct the FlowSafe 0.13.0 release notes so shipped changes are no longer duplicated under `Unreleased`.
+
 ## 0.13.0
 
 ### Minor Changes
