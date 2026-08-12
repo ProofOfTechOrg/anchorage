@@ -33,6 +33,8 @@ const controls = {
     'scripts/architecture-fixtures/starter-imports-private-entrypoint.ts',
   'agent-starter-no-relative-package-reaches':
     'scripts/architecture-fixtures/starter-reaches-flowsafe-source.ts',
+  'fleet-control-is-control-plane-only':
+    'scripts/architecture-fixtures/data-plane-imports-fleet-control.ts',
   'no-new-architecture-cycles': 'scripts/architecture-fixtures/cycle-a.ts',
   'host-kit-reaches-approval-bridge':
     'scripts/architecture-fixtures/host-kit-misses-approval-bridge.ts',

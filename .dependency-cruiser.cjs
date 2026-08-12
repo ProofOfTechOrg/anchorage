@@ -134,6 +134,23 @@ module.exports = {
       },
     },
     {
+      name: 'fleet-control-is-control-plane-only',
+      severity: 'error',
+      comment:
+        'Fleet control holds account credentials, routing ownership, and tenant lifecycle. Publishing it removed the registry barrier, so no other package may reach it, by bare name or by any subpath. Stated as everything-except rather than an allowlist of today packages, and architecture:check:rules cruises packages as ONE root, so a new package or source directory is covered the day it lands. Showcase and the flowsafe deploy template alias imports through bundler config this file does not resolve, so coverage is per-module direct-import rather than transitive.',
+      from: {
+        path: [
+          '^packages/',
+          '^scripts/architecture-fixtures/data-plane-imports-fleet-control\\.ts$',
+        ],
+        pathNot: '^packages/fleet-control/',
+      },
+      to: {
+        path: '^(?:@proofoftech/fleet-control(?:/|$)|packages/fleet-control/)',
+        reachable: true,
+      },
+    },
+    {
       name: 'no-new-architecture-cycles',
       severity: 'error',
       comment:

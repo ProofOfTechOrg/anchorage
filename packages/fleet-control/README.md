@@ -2,9 +2,34 @@
 
 # Operate the isolated deployment fleet
 
-`anchorage-fleet-control` is the repository-private control-plane package for physically isolated deployments. It contains staged Wrangler Versions and Workers for Platforms backends, fenced durable fleet state, resumable provisioning and decommissioning, content-addressed external release promotion and schema-compatible rollback, authoritative bidirectional inventory, durable export sinks, and the shared platform Workers.
+`@proofoftech/fleet-control` is the trusted control-plane package for physically isolated deployments. It contains staged Wrangler Versions and Workers for Platforms backends, fenced durable fleet state, resumable provisioning and decommissioning, content-addressed external release promotion and schema-compatible rollback, authoritative bidirectional inventory, durable export sinks, and the shared platform Workers.
 
-Read [Provision physically isolated deployments](../../docs/fleet-control.md) for the supported lifecycle, security boundary, and credentialed conformance gate.
+Read [Provision physically isolated deployments](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md) for the supported lifecycle, security boundary, and credentialed conformance gate.
+
+Version 0.1.0 is the first published release. Versions 0.0.1 through 0.0.4 in [`CHANGELOG.md`](CHANGELOG.md) are repository-internal history from before the package was published, and were never on the registry.
+
+## Install
+
+Install it only in the one service that owns provisioning. Read [Import it only from a trusted control plane](#import-it-only-from-a-trusted-control-plane) before adding the dependency anywhere else.
+
+```bash
+pnpm add @proofoftech/fleet-control
+```
+
+The package is ESM only and requires Node `>=22.22.0`. It depends on `@proofoftech/flowsafe`, which supplies the deployment identity protocol, the maintenance capability, and the audit export contract that fleet control provisions against.
+
+That dependency is pinned to one exact FlowSafe release, deliberately. If you also depend on FlowSafe directly, pin it to the same release rather than letting a range resolve a second copy: FlowSafe's Durable Object classes are nominal and its maintenance receipt audience is fixed on both the minting and verifying side, so two copies fail closed at the maintenance boundary with no local signal.
+
+## Entry points
+
+| Export | Contents |
+| --- | --- |
+| `@proofoftech/fleet-control` | Provisioning, migration, promotion, rollback, decommission, inventory, fleet state, and the Cloudflare client and rate coordinator. |
+| `@proofoftech/fleet-control/workers/dispatch` | Platform dispatch Worker that routes to a deployment's user script under a verified maintenance capability. |
+| `@proofoftech/fleet-control/workers/outbound` | Shared outbound Worker: the declared-egress proxy and the named `StateEgress` entrypoint. |
+| `@proofoftech/fleet-control/workers/audit-consumer` | Control-plane queue consumer for backend-owned deployment audit events. |
+
+The three Worker exports are deployment artifacts for the platform's own Workers, not helpers to import into an application Worker.
 
 Construct `WorkersForPlatformsBackend` with a dispatch namespace, one named shared outbound Worker, and a state-egress root secret. All three values are mandatory. The constructor rejects an incomplete dispatch-native configuration before it can call a provider.
 
@@ -22,9 +47,9 @@ Run the package checks with:
 pnpm fleet-control:check
 ```
 
-The paid namespace gate uses [`scripts/credentialed-conformance.example.json`](scripts/credentialed-conformance.example.json) as its configuration shape. The configuration must declare `contractVersion: 1`, two trusted state profiles, the audit queue, positive CPU and subrequest limits, and allowed and denied upstream URLs. Structural validation checks the versioned configuration, required environment values, and private-key shape before artifact reads or fleet imports. The runner then builds both deployment specifications and trusted profiles. Production specification, secret, profile, migration, route, date, and canonical JSON Web Key (JWK) validators check both releases before the runner constructs a Cloudflare client or provisioning backend.
+The paid namespace gate uses [`scripts/credentialed-conformance.example.json`](https://github.com/ProofOfTechOrg/anchorage/blob/main/packages/fleet-control/scripts/credentialed-conformance.example.json) as its configuration shape. The configuration must declare `contractVersion: 1`, two trusted state profiles, the audit queue, positive CPU and subrequest limits, and allowed and denied upstream URLs. Structural validation checks the versioned configuration, required environment values, and private-key shape before artifact reads or fleet imports. The runner then builds both deployment specifications and trusted profiles. Production specification, secret, profile, migration, route, date, and canonical JSON Web Key (JWK) validators check both releases before the runner constructs a Cloudflare client or provisioning backend.
 
-Supply separate bundles for the external candidate and both trusted state versions. Each routed candidate must implement the v1 action endpoint at `conformance.httpPath` and the WebSocket endpoint at `conformance.webSocketPath`. The action endpoint accepts JSON with `contractVersion: 1`, an `action`, and the fields listed in [Implement the artifact contract](../../docs/fleet-control.md#implement-the-artifact-contract). Every JSON response repeats the exact version and action. The WebSocket endpoint accepts the same envelope as its first frame and echoes the nonce in its response frame.
+Supply separate bundles for the external candidate and both trusted state versions. Each routed candidate must implement the v1 action endpoint at `conformance.httpPath` and the WebSocket endpoint at `conformance.webSocketPath`. The action endpoint accepts JSON with `contractVersion: 1`, an `action`, and the fields listed in [Implement the artifact contract](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/fleet-control.md#implement-the-artifact-contract). Every JSON response repeats the exact version and action. The WebSocket endpoint accepts the same envelope as its first frame and echoes the nonce in its response frame.
 
 The first trusted state profile owns the original FlowSafe Durable Object classes. The second profile repeats that migration history exactly, appends a migration for `conformance.newDurableObjectBinding`, and exports the new class. Both state artifacts must support `state-marker-put`, `state-marker-get`, `state-new-class`, and the state-egress actions through candidate bindings. External bindings must not select a script, namespace, or egress service.
 
@@ -52,4 +77,12 @@ Workers Routes Write across every zone in the selected account. Fleet control
 discovers that complete account-filtered zone set and rejects partial token
 scope instead of accepting a configured zone list.
 
-The package is private because account credentials, routing ownership, billing policy, and tenant lifecycle belong to the hosted control plane. Do not import it into a data-plane Worker.
+## Import it only from a trusted control plane
+
+Account credentials, routing ownership, billing policy, and tenant lifecycle belong to the hosted control plane. Do not import this package into a data-plane Worker, and do not give a Worker that serves tenant requests a Cloudflare API token that reaches it.
+
+The package is published, so the registry no longer enforces that boundary. Three things do:
+
+- Fleet control is inert without an account-scoped Cloudflare API token. Every backend constructor rejects an incomplete trusted configuration before it can call a provider, so importing the package grants no capability on its own.
+- Inside this repository, the `fleet-control-is-control-plane-only` rule in [`.dependency-cruiser.cjs`](https://github.com/ProofOfTechOrg/anchorage/blob/main/.dependency-cruiser.cjs) fails `pnpm architecture:check` if any other package under `packages/` reaches it.
+- A consuming repository must enforce the same rule against its own tree. Confine the dependency declaration and every import to the one provisioning service, and fail the build when either appears anywhere else. Match subpath specifiers, not just the bare package name: the three `./workers/*` entry points are importable on their own.

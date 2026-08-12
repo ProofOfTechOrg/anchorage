@@ -361,7 +361,7 @@ export function canonicalDurableObjectMigrationHistory(
   });
 }
 
-type ExternalResourceIdentity = Pick<
+export type ExternalResourceIdentity = Pick<
   DeploymentSpec,
   'tenantTag' | 'environment' | 'scriptName' | 'databaseName'
 >;

@@ -246,7 +246,7 @@ function sameJson(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-type ControlWorkerInspection = NonNullable<
+type ProviderControlWorkerInspection = NonNullable<
   Awaited<ReturnType<WorkersForPlatformsApi['inspectControlWorker']>>
 >;
 
@@ -260,9 +260,9 @@ interface BridgeTopologyExpectation {
     dispatchNamespace?: string;
   }>[];
   readonly namespaceIds?: readonly string[];
-  readonly serviceBindings: ControlWorkerInspection['serviceBindings'];
+  readonly serviceBindings: ProviderControlWorkerInspection['serviceBindings'];
   readonly queueProducerBindings: NonNullable<
-    ControlWorkerInspection['queueProducerBindings']
+    ProviderControlWorkerInspection['queueProducerBindings']
   >;
   readonly secretNames: readonly string[];
   readonly fixedVariables: Readonly<Record<string, string>>;
@@ -306,7 +306,7 @@ function legacyBridgeFixedVariables(
 }
 
 function bridgeTopologyMatches(
-  live: ControlWorkerInspection,
+  live: ProviderControlWorkerInspection,
   liveNamespaceIds: readonly string[],
   expected: BridgeTopologyExpectation,
 ): boolean {
@@ -492,7 +492,7 @@ export interface BackendSwitchApi extends WorkersForPlatformsApi {
   }>;
 }
 
-interface SwitchBridgeRemovalAuthority {
+export interface SwitchBridgeRemovalAuthority {
   readonly prior: PlainBackendSnapshot;
   readonly priorSpec: DeploymentSpec;
   readonly bridge?: BridgeSnapshot;

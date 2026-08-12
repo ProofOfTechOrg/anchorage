@@ -37,6 +37,7 @@ const REQUIRED_PUBLIC_URLS = [
   'https://github.com/ProofOfTechOrg/anchorage',
   'https://www.npmjs.com/package/@proofoftech/breakwater',
   'https://www.npmjs.com/package/@proofoftech/flowsafe',
+  'https://www.npmjs.com/package/@proofoftech/fleet-control',
   'https://proofoftechorg.github.io/anchorage/',
 ];
 const MARKDOWN_PARSER = unified().use(remarkParse).use(remarkGfm);

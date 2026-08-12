@@ -1,4 +1,4 @@
-# anchorage-fleet-control
+# @proofoftech/fleet-control
 
 ## 0.0.4
 

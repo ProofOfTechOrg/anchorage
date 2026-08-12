@@ -29,8 +29,12 @@ import type {
   FleetResourceInventory,
   PromotionGuard,
   ProviderBindingIdentity,
+  ScriptInventoryTarget,
 } from './types.js';
-import { parseHostRoutingTarget } from './workers/host-routing.js';
+import {
+  type HostRoutingTarget,
+  parseHostRoutingTarget,
+} from './workers/host-routing.js';
 
 const AUDIT_CONSUMER_SETTINGS = Object.freeze({
   batch_size: 100,
@@ -105,28 +109,6 @@ export interface ControlWorkerInspection {
   readonly previewUrlsEnabled: boolean;
   readonly routeHostnames: readonly string[];
   readonly zoneRoutes: readonly import('./types.js').WorkerZoneRoute[];
-}
-
-interface HostRoutingOwner {
-  readonly scriptName: string;
-  readonly tenantTag: string;
-  readonly environment: string;
-}
-
-interface HostRoutingTarget extends HostRoutingOwner {
-  readonly policyId: string;
-  readonly policyDigest: string;
-  readonly policyHosts: readonly string[];
-  readonly stateEgress?: Readonly<{
-    resourceGroupId: string;
-    stateScriptName: string;
-    credentialDigest: string;
-  }>;
-}
-
-export interface ScriptInventoryTarget extends HostRoutingOwner {
-  readonly databaseId: string;
-  readonly routeHostname: string;
 }
 
 export interface OrdinaryWorkerFootprint {
@@ -1453,7 +1435,7 @@ export class CloudflareProvisioningClient {
           });
           continue;
         }
-        let stateEgress: import('./workers/host-routing.js').HostRoutingTarget['stateEgress'];
+        let stateEgress: HostRoutingTarget['stateEgress'];
         try {
           stateEgress = (await parseHostRoutingTarget(serialized)).stateEgress;
         } catch {
