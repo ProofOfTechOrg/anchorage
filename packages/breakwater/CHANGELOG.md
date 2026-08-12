@@ -1,5 +1,11 @@
 # @proofoftech/breakwater
 
+## 0.11.1
+
+### Patch Changes
+
+- a16ed60: Correct the Breakwater 0.11.0 release notes so shipped changes are no longer duplicated under `Unreleased`.
+
 ## 0.11.0
 
 ### Minor Changes

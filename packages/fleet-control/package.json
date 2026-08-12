@@ -1,6 +1,6 @@
 {
   "name": "anchorage-fleet-control",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "private": true,
   "description": "Security-critical fleet provisioning for physically isolated Anchorage deployments",
   "type": "module",
