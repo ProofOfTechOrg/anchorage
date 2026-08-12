@@ -5,6 +5,7 @@ Anchorage adds enforceable guardrails, durable approvals, and physically isolate
 [![CI](https://github.com/ProofOfTechOrg/anchorage/actions/workflows/ci.yml/badge.svg)](https://github.com/ProofOfTechOrg/anchorage/actions/workflows/ci.yml)
 [![npm: breakwater](https://img.shields.io/npm/v/%40proofoftech%2Fbreakwater?label=breakwater)](https://www.npmjs.com/package/@proofoftech/breakwater)
 [![npm: flowsafe](https://img.shields.io/npm/v/%40proofoftech%2Fflowsafe?label=flowsafe)](https://www.npmjs.com/package/@proofoftech/flowsafe)
+[![npm: fleet-control](https://img.shields.io/npm/v/%40proofoftech%2Ffleet-control?label=fleet-control)](https://www.npmjs.com/package/@proofoftech/fleet-control)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 [Try the live demo](https://anchorage.proofoftech.org/) · [Read the docs](docs/README.md) · [Browse the API reference](https://proofoftechorg.github.io/anchorage/) · [Get support](SUPPORT.md)
@@ -29,8 +30,10 @@ Anchorage is not a model provider, identity provider, hosted SaaS, generic proce
 | --- | --- | --- |
 | [`@proofoftech/breakwater`](packages/breakwater/README.md) | Guardrails around Mastra agents and tools | Guarded agent handles, policy processors, RBAC, audit and metrics, connector SDK, Claude Code and Codex CLI connectors |
 | [`@proofoftech/flowsafe`](packages/flowsafe/README.md) | Durable execution and human approval on Cloudflare | Guarded agent catalog/host, Durable Object runner, approval API and React UI, signals, goals, schedules, background tasks, provider subscriptions, R2 artifacts, SIEM export |
+| [`@proofoftech/fleet-control`](packages/fleet-control/README.md) | Provisioning physically isolated deployments from a trusted control plane, never from a Worker that serves tenant requests | Workers for Platforms and staged Wrangler backends, fenced fleet state, release promotion and rollback, bidirectional inventory, platform dispatch/outbound/audit Workers |
 
-Flowsafe requires Node 22 or later. Breakwater requires Node 22.3 or later for
+Fleet control requires Node 22.22.0 or later and is ESM-only. Flowsafe
+requires Node 22 or later. Breakwater requires Node 22.3 or later for
 its built-in Agent CLI executor. Both packages are ESM-only and declare
 `@mastra/core` `^1.50.0` as their peer range. React 18 or 19 is needed only
 for the optional flowsafe approval UI. The optional `flowsafe-provision` CLI

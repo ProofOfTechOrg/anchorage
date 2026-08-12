@@ -1,9 +1,28 @@
 {
-  "name": "anchorage-fleet-control",
-  "version": "0.0.4",
-  "private": true,
+  "name": "@proofoftech/fleet-control",
+  "version": "0.1.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.22.0"
+  },
   "description": "Security-critical fleet provisioning for physically isolated Anchorage deployments",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ProofOfTechOrg/anchorage.git",
+    "directory": "packages/fleet-control"
+  },
+  "homepage": "https://github.com/ProofOfTechOrg/anchorage/tree/main/packages/fleet-control#readme",
+  "bugs": "https://github.com/ProofOfTechOrg/anchorage/issues",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -22,15 +41,17 @@
     "./workers/audit-consumer": {
       "types": "./dist/workers/audit-consumer.d.ts",
       "default": "./dist/workers/audit-consumer.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
-  "files": [
-    "dist"
-  ],
   "scripts": {
+    "prebuild": "pnpm --filter @proofoftech/breakwater --filter @proofoftech/flowsafe build",
     "build": "tsc -p tsconfig.build.json",
+    "lint": "pnpm -w exec biome check packages/fleet-control",
+    "prepublishOnly": "pnpm run build",
     "pretypecheck": "pnpm --filter @proofoftech/breakwater --filter @proofoftech/flowsafe build",
     "test:credentialed": "pnpm build && node scripts/credentialed-conformance.mjs",
+    "test:packed-consumer": "node scripts/packed-consumer-test.mjs",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
@@ -45,9 +66,6 @@
     "typescript": "^5.6",
     "vitest": "^4.1.8",
     "wrangler": "4.118.0"
-  },
-  "engines": {
-    "node": ">=22.22.0"
   },
   "license": "Apache-2.0"
 }

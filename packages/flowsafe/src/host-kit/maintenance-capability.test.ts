@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { decodeJwt } from 'jose';
 import { describe, expect, it } from 'vitest';
 import {
   type MaintenanceCapabilityJwk,
@@ -158,5 +159,15 @@ describe('maintenance capabilities', () => {
         now: () => NOW,
       }),
     ).resolves.toBeUndefined();
+  });
+
+  // Both sides of the receipt hard-code the audience, so a rename that touched
+  // only one of them, or that rode along with a package rename, would fail
+  // closed at runtime with no local signal. Pin the literal on the wire.
+  it('stamps the maintenance receipt audience on the wire', async () => {
+    const minted = await capability();
+    const receipt = await mintMaintenanceReceipt(SECRET, minted.claims, {});
+
+    expect(decodeJwt(receipt).aud).toBe('flowsafe-maintenance-receipt');
   });
 });

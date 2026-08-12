@@ -39,7 +39,7 @@ function scopingFlags(args) {
  */
 const CHANGESETS_NEW_TAG = /New tag:\s+(@[^/]+\/[^@]+|[^/]+)@([^\s]+)/;
 
-test('publishes Breakwater before the remaining Changesets release', async () => {
+test('publishes Breakwater then Flowsafe before the remaining Changesets release', async () => {
   const calls = [];
   await publishRelease({
     version: (target) => {
@@ -58,7 +58,7 @@ test('publishes Breakwater before the remaining Changesets release', async () =>
 
   assert.deepEqual(
     PUBLISH_PREREQUISITES.map((target) => target.name),
-    ['@proofoftech/breakwater'],
+    ['@proofoftech/breakwater', '@proofoftech/flowsafe'],
   );
   assert.deepEqual(calls, [
     'version:@proofoftech/breakwater',
@@ -66,6 +66,11 @@ test('publishes Breakwater before the remaining Changesets release', async () =>
     'publish:@proofoftech/breakwater',
     'visible:@proofoftech/breakwater',
     'tag:@proofoftech/breakwater',
+    'version:@proofoftech/flowsafe',
+    'lookup:@proofoftech/flowsafe',
+    'publish:@proofoftech/flowsafe',
+    'visible:@proofoftech/flowsafe',
+    'tag:@proofoftech/flowsafe',
     'changesets',
   ]);
 });
@@ -81,7 +86,10 @@ test('an already published prerequisite remains an ordered no-op', async () => {
     publishRemainder: async () => calls.push('changesets'),
   });
 
-  assert.deepEqual(calls, ['tag check', 'changesets']);
+  assert.deepEqual(calls, [
+    ...PUBLISH_PREREQUISITES.map(() => 'tag check'),
+    'changesets',
+  ]);
 });
 
 // Both variants, because the dry-run pre-flight publishes with `dryRun: true`

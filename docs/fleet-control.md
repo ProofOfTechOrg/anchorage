@@ -2,7 +2,7 @@
 
 # Provision physically isolated deployments
 
-Fleet control provisions one D1 database, fleet-owned application R2 buckets, and one isolated Worker resource group per project environment. Platform-authored deployments use one ordinary Worker. Fresh external deployments use two Workers for Platforms user scripts: one stable platform-authored state script and one content-addressed candidate. They consume no ordinary Worker slots per deployment. Use the private `anchorage-fleet-control` package from a trusted control plane, never from tenant request scope.
+Fleet control provisions one D1 database, fleet-owned application R2 buckets, and one isolated Worker resource group per project environment. Platform-authored deployments use one ordinary Worker. Fresh external deployments use two Workers for Platforms user scripts: one stable platform-authored state script and one content-addressed candidate. They consume no ordinary Worker slots per deployment. Use the `@proofoftech/fleet-control` package from a trusted control plane, never from tenant request scope. The package is published, so enforce that boundary in your own build: see [Import it only from a trusted control plane](../packages/fleet-control/README.md#import-it-only-from-a-trusted-control-plane).
 
 ## Choose a provisioning backend
 

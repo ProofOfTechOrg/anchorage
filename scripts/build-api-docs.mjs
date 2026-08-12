@@ -119,7 +119,15 @@ const temporaryDirectory = mkdtempSync(join(tmpdir(), 'anchorage-api-docs-'));
 const revision = gitRevision();
 
 try {
-  run(pnpm, ['--filter', '@proofoftech/breakwater', 'build']);
+  // Flowsafe too: the fleet-control pass typechecks against its dist, and
+  // this script must work on a tree where CI's Build step has not run.
+  run(pnpm, [
+    '--filter',
+    '@proofoftech/breakwater',
+    '--filter',
+    '@proofoftech/flowsafe',
+    'build',
+  ]);
 
   const passes = [
     {
@@ -136,6 +144,11 @@ try {
       options: 'packages/flowsafe/src/approval-ui/typedoc.json',
       json: join(temporaryDirectory, 'approval-ui.json'),
       html: join(temporaryDirectory, 'approval-ui'),
+    },
+    {
+      options: 'packages/fleet-control/typedoc.json',
+      json: join(temporaryDirectory, 'fleet-control.json'),
+      html: join(temporaryDirectory, 'fleet-control'),
     },
   ];
 

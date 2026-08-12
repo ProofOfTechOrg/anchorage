@@ -24,7 +24,7 @@ const MAINTENANCE_OPERATIONS = new Set([
   'maintenance-status',
 ]);
 
-interface DispatchNamespaceLike {
+export interface DispatchNamespaceLike {
   get(
     scriptName: string,
     arguments_?: Record<string, unknown>,

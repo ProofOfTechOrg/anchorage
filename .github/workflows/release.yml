@@ -69,13 +69,16 @@ jobs:
       # ci.yml runs this too, but ci.yml and this workflow start CONCURRENTLY on
       # a push to main and main requires no status check, so a red CI cannot
       # stop a publish. Repeating it here fails in this job, before the publish
-      # step, on this checkout. It is fully offline, so it adds seconds and no
-      # new dependency.
+      # step, on this checkout. It is fully offline and adds no new dependency, but
+      # it runs each prerequisite's prepublishOnly build, so it is not free.
       - name: Verify release publish invocation
         run: pnpm test:release-invocation
 
-      # Publish Breakwater and wait for registry visibility before Changesets
-      # publishes Flowsafe, whose agent-host peer floor requires that release.
+      # Publish Breakwater, then Flowsafe, each waiting for registry
+      # visibility, before Changesets fans out over the remainder. Flowsafe needs
+      # Breakwater for its agent-host peer floor, and fleet-control packs an
+      # exact Flowsafe version, so a concurrent publish could strand it on the
+      # registry depending on a version that never appeared.
       - name: Publish unpublished versions to npm
         uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
         with:

@@ -24,7 +24,7 @@ type PlatformWorkerRole =
   | 'shared-outbound'
   | 'shared-audit';
 
-interface PlatformWorkerInspection {
+export interface PlatformWorkerInspection {
   readonly artifactVersion: string;
   readonly databaseIds: readonly string[];
   readonly durableObjectBindings: readonly Readonly<{ name: string }>[];
