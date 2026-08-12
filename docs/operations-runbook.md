@@ -137,6 +137,24 @@ Never bind two organizations to one data-plane resource set. Never reuse a tag w
 
 There is no in-database organization purge. Abandoned live runs and approvals disappear only when the physical database is deleted, so revoke traffic before deletion and treat the resource inventory as the completion checklist.
 
+### Retire legacy Cloudflare resources
+
+Use this procedure when the original fleet record or supported decommission workflow cannot authorize a legacy resource set. Treat the deletion plan, verifier, runtime, and captured provider evidence as one reviewed authority package.
+
+1. Record the exact account, Worker service and version identities, database and namespace IDs, storage names, ingress, automation, and explicit exclusions. Use immutable provider IDs where the API supports them. For a name-addressed mutation, freeze provider writes and recheck the name-to-ID mapping immediately before the mutation.
+2. Freeze repository pushes, provider edits, Builds triggers, credential changes, and every other writer for the deletion window. Run reviewed tooling from an isolated, hash-pinned runtime instead of a mutable shared checkout or dependency tree.
+3. Export every state domain that retention policy requires. Store exports outside Git, restrict their permissions, record their size and digest, and prove that each export restores before deleting anything.
+4. Capture a complete reverse-dependency and ingress inventory. Include all deployable retained Worker versions, Pages production and preview configurations and deployments, dispatch scripts, service and Durable Object bindings, routes, custom domains, `workers.dev`, preview URLs, cron triggers, Queue consumers, Email Routing rules, tail consumers, Builds triggers, and conventional Workers Sites KV namespaces. Inventory application R2 buckets and every Durable Object namespace and stored object that the deletion can remove.
+5. Fail closed on incomplete, malformed, duplicated, or ambiguous provider response fields. A disabled route, email action, consumer, or build trigger still counts as a reference because an operator can re-enable it.
+6. Review the exact authority package and preflight evidence before mutation. Record independent digests for the authority and evidence, and verify both at every destructive boundary. Regenerating any preflight artifact starts a new review cycle and requires a new approved evidence digest.
+7. Remove all ingress and background execution, then prove their absence. Recheck application-owned R2 buckets after traffic quiesces; stop while any bucket remains attached or nonempty. Evacuate or explicitly purge application data through an application-owned procedure, never a generic automatic purge.
+8. Delete the Worker without bypassing provider dependency checks. If Worker deletion also removes Durable Object or Workers Sites storage, enumerate and export those exact resources first. Treat a timeout or lost response as ambiguous: read back the exact identities before deciding whether to retry.
+9. Prove the Worker and every authorized cascading resource are absent. Repeat the complete reverse-dependency scan before deleting independent storage.
+10. Delete D1 and other independent storage by immutable provider ID. Keep interactive target readback enabled for irreversible commands; do not combine mutable-name resolution with a confirmation bypass.
+11. Revalidate the replacement deployment after each destructive boundary and at completion. Check its exact version, bindings, ingress, automation, health, protected-route behavior, assets, and zero-write sentinel. Retain the export, approved digests, provider evidence, and deletion results according to policy.
+
+Do not commit provider tokens, account-specific resource IDs, captured provider responses, data exports, or one-off deletion tooling. Commit only reusable procedures and invariant-checking code that belongs to the supported control plane. Cloudflare Worker versions preserve code and configuration but not storage state, so retained versions remain part of the reverse-dependency proof. See [Workers versions and deployments](https://developers.cloudflare.com/workers/versions-and-deployments/), [D1 Wrangler commands](https://developers.cloudflare.com/d1/wrangler-commands/), and [Durable Object class exports](https://developers.cloudflare.com/durable-objects/reference/durable-objects-migrations/) for current provider behavior.
+
 ## Alarm-driven duties
 
 The maintenance singleton runs separate alarm invocations for:
