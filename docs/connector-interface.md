@@ -327,11 +327,49 @@ Every call probes its exact v1 key before using v2:
 - Every scoped key and every unscoped business key containing a colon is ambiguous. A pending or completed v1 row fails with `idempotency-key-migration`; Breakwater never guesses which tuple owns it.
 - An absent v1 row can proceed only with `idempotencyKeyMigration: 'legacy-writers-drained'`. This prevents an old writer from creating the legacy row after the new writer inspected it.
 
-To upgrade, stop and drain all old writers that share the store. Inventory
-legacy rows and use business or audit evidence to associate each ambiguous row
-with exactly one tuple. Migrate only proven rows through a controlled operator
-procedure. Leave an unproven row in place so its calls continue to fail closed.
-Safe legacy rows remain a read-only replay fallback.
+To upgrade, stop and drain all old writers that share the store. Set
+`idempotencyKeyMigration: 'legacy-writers-drained'` only after that drain.
+Inventory legacy rows through the connector-bound helper; it derives the private
+v1 key without exposing either storage format:
+
+```typescript
+import {
+  inspectLegacyConnectorIdempotency,
+  migrateLegacyConnectorIdempotency,
+} from '@proofoftech/breakwater/connector-sdk';
+
+const identity = {
+  idempotencyKey: 'invoice:2026-08-12',
+  isolationScope: 'acme',
+};
+const inventory = await inspectLegacyConnectorIdempotency(connector, identity);
+```
+
+Use business or audit evidence to associate each ambiguous row with exactly one
+tuple. When that proof exists, pass the exact inventoried record back to the
+supported D1 migration:
+
+```typescript
+if (inventory.state === 'replay') {
+  const result = await migrateLegacyConnectorIdempotency(connector, {
+    ...identity,
+    expectedRecord: inventory.record,
+  });
+}
+```
+
+The expected record detects a row changed after inventory; it does not itself
+prove tuple ownership. The helper requires an ambiguous identity, the
+drained-writer acknowledgement, and `D1IdempotencyStore` with transactional
+`batch()`. It validates and transforms the legacy output through the connector's
+synchronous output schema, guards the exact source value, writes the validated
+value under v2, and deletes v1 in one D1 transaction. Store keys remain opaque.
+
+Successful states are `migrated` and idempotent `already-migrated`. Expected
+non-mutating outcomes are `source-absent`, `source-pending`, `source-mismatch`,
+`target-conflict`, and `output-invalid`. Pending, changed, invalid, conflicting,
+and unproven rows remain in place so calls continue to fail closed. Safe legacy
+rows remain a read-only replay fallback.
 
 ### In-memory store
 
@@ -349,6 +387,11 @@ upgrades.
 - `pending`: another owner still executes.
 
 A stale pending row can be taken over after `pendingTtlMs`. Token-guarded commit and release stop a stale holder from overwriting or deleting the new lease.
+
+The normal `IdempotencyDatabase` seam remains prepare-only. Supported migration
+additionally requires the exported `IdempotencyBatchDatabase` shape. Its
+`batch()` must provide D1-compatible ordered transaction semantics and roll back
+the whole sequence when a statement fails.
 
 New v2 records contain the exact validated/transformed public output. Replays
 return that value without rerunning a stateful schema. A safe legacy v1 record

@@ -400,8 +400,9 @@ The default runner is Node-only and:
 - selects workspace editing with Claude Code `acceptEdits` or Codex
   `workspace-write`;
 - terminates the child process tree after the configured timeout (a POSIX
-  process group or Windows `taskkill.exe /T /F`), and reports a distinct safe
-  failure if tree termination itself fails;
+  process group or absolute `taskkill.exe /T /F` from a drive-absolute local
+  `%SystemRoot%` or `%WINDIR%`), and reports a distinct safe failure if tree
+  termination itself fails;
 - retains only the tail of stdout and stderr, capped by UTF-8 bytes;
 - returns the CLI stdout as `text` and a prompt-redacted display `command`;
 - exposes static `AgentCliError` messages plus structured, non-secret metadata.
@@ -487,6 +488,7 @@ for compatibility.
 | `ConnectorPolicyError` | Structured policy denial |
 | `CONNECTOR_GRANTS_CONTEXT_KEY`, `CONNECTOR_EXECUTION_CONTEXT_KEY`, `DRY_RUN_CONTEXT_KEY`, `IDEMPOTENCY_KEY_CONTEXT_KEY` | Stable connector request-context keys |
 | `InMemoryIdempotencyStore`, `D1IdempotencyStore` | Development and durable replay stores |
+| `inspectLegacyConnectorIdempotency`, `migrateLegacyConnectorIdempotency` | Inventory and atomically migrate one externally proven ambiguous legacy D1 row without exposing storage keys |
 | `InMemoryRateLimitStore`, `D1RateLimitStore` | Development and durable fixed-window stores |
 | `egressFetch`, `EgressDeniedError` | Standalone fetch guard and its default denial |
 
@@ -500,8 +502,11 @@ Type exports: `PermissionManifest`, `ConnectorConfig`, `ConnectorPolicies`,
 `AtomicIdempotencyStore`,
 `InspectableIdempotencyStore`, `IdempotencyInspection`,
 `IdempotencyRecord`, `IdempotencyReservation`, `RateLimitStore`,
-`D1IdempotencyStoreOptions`, `IdempotencyDatabase`,
-`IdempotencyStatement`, `D1RateLimitStoreOptions`, `RateLimitDatabase`,
+`LegacyConnectorIdempotencyIdentity`,
+`LegacyConnectorIdempotencyMigrationRequest`,
+`LegacyConnectorIdempotencyMigrationResult`, `D1IdempotencyStoreOptions`,
+`IdempotencyDatabase`, `IdempotencyBatchDatabase`,
+`IdempotencyStatement`, `IdempotencyBatchResult`, `D1RateLimitStoreOptions`, `RateLimitDatabase`,
 `RateLimitStatement`, `RateLimitBatchResult`, `EgressDenial`, `EgressFetchOptions`,
 `EgressFetchBase`, `EgressGuardedFetch`, `EgressRequestInit`,
 `EgressResponse`, and `EgressResponseHeaders`.

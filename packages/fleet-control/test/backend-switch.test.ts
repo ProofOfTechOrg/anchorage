@@ -1007,6 +1007,11 @@ describe('backend switch state machine', () => {
         queueProducerBindings: [],
         plainTextBindings: {},
         secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
+        providerBindingIdentities: [
+          { type: 'd1', name: 'DB' },
+          { type: 'durable_object_namespace', name: 'RUNNER' },
+          { type: 'secret_text', name: 'DEPLOYMENT_IDENTITY_SECRET' },
+        ],
         artifactVersion: 'candidate-v1',
         desiredSpecDigest: deploymentSpecDigest(targetSpec),
         schemaVersion: targetSpec.schemaVersion,

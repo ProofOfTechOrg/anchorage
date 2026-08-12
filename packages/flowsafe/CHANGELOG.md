@@ -6,7 +6,7 @@
 
 - Change `FlowsafeWorkerConfig.artifactStore` from a bound purger to an invocation-environment factory. Existing hosts must migrate `artifactStore: store` to `artifactStore: () => store`; R2 hosts use `artifactStore: (env) => new R2ArtifactStore(env.ARTIFACTS)`. R2 deletion still precedes snapshot deletion, while factory or deletion failures keep the enumerable row for retry and remain isolated from sibling duties. Hosts without artifacts remain unchanged.
 
-- Add validated `storageTablePrefix` host configuration and apply it to every prefix-aware built-in purge. It must match the `tablePrefix` used by D1 runtime storage; fixed-schema Flowsafe tables remain unprefixed.
+- Add a shared maximum of 39 characters for `tablePrefix` and `storageTablePrefix`, keeping final Mastra table identifiers within 63 characters. Every exported prefix-aware low-level purge now validates the same contract before preparing D1 statements. The host prefix must match the value used by D1 runtime storage; fixed-schema Flowsafe tables remain unprefixed.
 
 - Pin `@mastra/cloudflare-d1` to 1.1.1 so clean consumers at the supported `@mastra/core` 1.50.0 minimum import and bundle without an override.
 

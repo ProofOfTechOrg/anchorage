@@ -15,6 +15,10 @@ import {
   FLEET_AUDIT_PROXY_CLASS_NAME,
   FLEET_AUDIT_PROXY_STATE_BINDING,
 } from './platform-resources.js';
+import {
+  assertProviderBindingIdentitiesMatchInspection,
+  assertSupportedProviderBindings,
+} from './provider-binding-inventory.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   DatabaseExport,
@@ -24,6 +28,7 @@ import type {
   ExternalMutationFence,
   FleetResourceInventory,
   PromotionGuard,
+  ProviderBindingIdentity,
 } from './types.js';
 import { parseHostRoutingTarget } from './workers/host-routing.js';
 
@@ -95,6 +100,7 @@ export interface ControlWorkerInspection {
   }>[];
   readonly secretNames: readonly string[];
   readonly plainTextBindings: Readonly<Record<string, string>>;
+  readonly providerBindingIdentities: readonly ProviderBindingIdentity[];
   readonly workersDevEnabled: boolean;
   readonly previewUrlsEnabled: boolean;
   readonly routeHostnames: readonly string[];
@@ -1782,6 +1788,21 @@ export class CloudflareProvisioningClient {
               : [],
           )
           .sort();
+        assertSupportedProviderBindings(
+          bindings,
+          new Set([
+            'd1',
+            'durable_object_namespace',
+            'service',
+            'queue',
+            'kv_namespace',
+            'dispatch_namespace',
+            'r2_bucket',
+            'plain_text',
+            'secret_text',
+          ]),
+          `plain Worker '${scriptName}'`,
+        );
         const tenantTag = plainText.get('DEPLOYMENT_TENANT');
         const environment = plainText.get('FLEET_ENVIRONMENT');
         const resourceRole = plainText.get('FLEET_RESOURCE_ROLE');
@@ -2234,6 +2255,21 @@ export class CloudflareProvisioningClient {
               : [],
           )
           .sort();
+        const providerBindingIdentities = assertSupportedProviderBindings(
+          bindings,
+          new Set([
+            'd1',
+            'durable_object_namespace',
+            'service',
+            'queue',
+            'kv_namespace',
+            'dispatch_namespace',
+            'r2_bucket',
+            'plain_text',
+            'secret_text',
+          ]),
+          `control Worker '${scriptName}'`,
+        );
         const routeHostnames: string[] = [];
         for await (const domain of this.#client.workers.domains.list({
           account_id: this.#accountId,
@@ -2255,7 +2291,7 @@ export class CloudflareProvisioningClient {
             });
           }
         }
-        return {
+        const inspection = {
           artifactVersion,
           databaseIds,
           durableObjectBindings,
@@ -2266,11 +2302,17 @@ export class CloudflareProvisioningClient {
           r2BucketBindings,
           secretNames,
           plainTextBindings,
+          providerBindingIdentities,
           workersDevEnabled: subdomain.enabled === true,
           previewUrlsEnabled: subdomain.previews_enabled === true,
           routeHostnames,
           zoneRoutes,
         };
+        assertProviderBindingIdentitiesMatchInspection(
+          inspection,
+          `control Worker '${scriptName}'`,
+        );
+        return inspection;
       } catch (error) {
         if (isNotFound(error)) return undefined;
         throw error;
@@ -3108,6 +3150,7 @@ export class CloudflareProvisioningClient {
         desiredSpecDigest: string;
         durableObjectTag?: string;
         plainTextBindings: Readonly<Record<string, string>>;
+        providerBindingIdentities: readonly ProviderBindingIdentity[];
       }
     | undefined
   > {
@@ -3199,6 +3242,19 @@ export class CloudflareProvisioningClient {
               : [],
           ),
         );
+        const providerBindingIdentities = assertSupportedProviderBindings(
+          bindings,
+          new Set([
+            'd1',
+            'durable_object_namespace',
+            'service',
+            'queue',
+            'r2_bucket',
+            'plain_text',
+            'secret_text',
+          ]),
+          `dispatch Worker '${scriptName}'`,
+        );
         const schemaTag = settings.tags?.find((tag) =>
           tag.startsWith('schema:'),
         );
@@ -3227,7 +3283,7 @@ export class CloudflareProvisioningClient {
             `script '${scriptName}' has incomplete fleet metadata`,
           );
         }
-        return {
+        const inspection = {
           artifactVersion,
           databaseIds,
           durableObjectBindings,
@@ -3236,12 +3292,18 @@ export class CloudflareProvisioningClient {
           r2BucketBindings,
           secretNames,
           plainTextBindings,
+          providerBindingIdentities,
           tenantTag,
           environment,
           schemaVersion,
           desiredSpecDigest,
           ...(durableObjectTag ? { durableObjectTag } : {}),
         };
+        assertProviderBindingIdentitiesMatchInspection(
+          inspection,
+          `dispatch Worker '${scriptName}'`,
+        );
+        return inspection;
       } catch (error) {
         if (
           error &&

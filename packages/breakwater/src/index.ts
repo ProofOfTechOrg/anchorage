@@ -73,6 +73,8 @@ export type {
   EgressRequestInit,
   EgressResponse,
   EgressResponseHeaders,
+  IdempotencyBatchDatabase,
+  IdempotencyBatchResult,
   IdempotencyDatabase,
   IdempotencyInspection,
   IdempotencyRecord,
@@ -80,6 +82,9 @@ export type {
   IdempotencyStatement,
   IdempotencyStore,
   InspectableIdempotencyStore,
+  LegacyConnectorIdempotencyIdentity,
+  LegacyConnectorIdempotencyMigrationRequest,
+  LegacyConnectorIdempotencyMigrationResult,
   PermissionManifest,
   RateLimitBatchResult,
   RateLimitDatabase,
@@ -105,6 +110,8 @@ export {
   IDEMPOTENCY_KEY_CONTEXT_KEY,
   InMemoryIdempotencyStore,
   InMemoryRateLimitStore,
+  inspectLegacyConnectorIdempotency,
+  migrateLegacyConnectorIdempotency,
   singleTenantConnectorPolicies,
 } from './connector-sdk/index.js';
 export type {

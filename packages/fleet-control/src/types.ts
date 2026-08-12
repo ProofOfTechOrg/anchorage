@@ -335,6 +335,11 @@ export interface MaintenanceHealth {
   readonly lastTickError?: string;
 }
 
+export interface ProviderBindingIdentity {
+  readonly type: string;
+  readonly name: string;
+}
+
 export interface LiveDeployment {
   readonly tenantTag: string;
   readonly environment: string;
@@ -352,6 +357,7 @@ export interface LiveDeployment {
   readonly plainTextBindings: Readonly<Record<string, string>>;
   readonly r2BucketBindings?: readonly ApplicationR2Binding[];
   readonly secretNames: readonly string[];
+  readonly providerBindingIdentities: readonly ProviderBindingIdentity[];
   readonly artifactVersion: string;
   readonly desiredSpecDigest: string;
   readonly schemaVersion: number;

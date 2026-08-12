@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { randomUUID } from 'node:crypto';
+import type {
+  D1Database,
+  D1PreparedStatement,
+} from '@cloudflare/workers-types';
 import PQueue from 'p-queue';
-import type { FleetStateDatabase } from './state-store.js';
 
 const RATE_RESERVATION_TABLE = 'anchorage_cloudflare_api_rate_reservations';
 const RATE_RESERVATION_INDEX =
@@ -76,14 +79,20 @@ function wait(delayMs: number, signal?: AbortSignal): Promise<void> {
 export class D1CloudflareApiRateCoordinator
   implements CloudflareApiRateCoordinator
 {
-  readonly #db: FleetStateDatabase;
+  readonly #db: D1Database;
   readonly #quotaScope: string;
   #schemaReady: Promise<void> | undefined;
 
-  constructor(
-    db: FleetStateDatabase,
-    options: D1CloudflareApiRateCoordinatorOptions,
-  ) {
+  constructor(db: D1Database, options: D1CloudflareApiRateCoordinatorOptions) {
+    if (
+      !db ||
+      typeof db.prepare !== 'function' ||
+      typeof db.batch !== 'function'
+    ) {
+      throw new Error(
+        'D1CloudflareApiRateCoordinator requires a direct Workers D1 binding',
+      );
+    }
     this.#db = db;
     this.#quotaScope = validateQuotaScope(options.quotaScope);
   }
@@ -93,38 +102,41 @@ export class D1CloudflareApiRateCoordinator
     for (;;) {
       signal?.throwIfAborted();
       const reservationId = randomUUID();
-      const results = await this.#db.batch([
-        {
-          sql: `DELETE FROM ${RATE_RESERVATION_TABLE}
+      const results = await this.#db.batch<Readonly<Record<string, unknown>>>([
+        this.#statement(
+          `DELETE FROM ${RATE_RESERVATION_TABLE}
             WHERE quota_scope = ?
               AND reserved_at <= ${DB_NOW_MS} - ?`,
-          bindings: [this.#quotaScope, CLOUDFLARE_INTERVAL_MS],
-        },
-        {
-          sql: `INSERT INTO ${RATE_RESERVATION_TABLE} (
+          [this.#quotaScope, CLOUDFLARE_INTERVAL_MS],
+        ),
+        this.#statement(
+          `INSERT INTO ${RATE_RESERVATION_TABLE} (
               quota_scope, reservation_id, reserved_at
             )
             SELECT ?, ?, ${DB_NOW_MS}
             WHERE (SELECT COUNT(*) FROM ${RATE_RESERVATION_TABLE}
               WHERE quota_scope = ?) < ?
             RETURNING reservation_id, reserved_at`,
-          bindings: [
+          [
             this.#quotaScope,
             reservationId,
             this.#quotaScope,
             CLOUDFLARE_INTERVAL_CAP,
           ],
-        },
-        {
-          sql: `SELECT MAX(1, MIN(reserved_at) + ? - ${DB_NOW_MS})
+        ),
+        this.#statement(
+          `SELECT MAX(1, MIN(reserved_at) + ? - ${DB_NOW_MS})
               AS retry_after_ms
             FROM ${RATE_RESERVATION_TABLE}
             WHERE quota_scope = ?`,
-          bindings: [CLOUDFLARE_INTERVAL_MS, this.#quotaScope],
-        },
+          [CLOUDFLARE_INTERVAL_MS, this.#quotaScope],
+        ),
       ]);
-      if (results[1]?.[0]?.reservation_id === reservationId) return;
-      await wait(positiveInteger(results[2]?.[0], 'retry_after_ms'), signal);
+      if (results[1]?.results[0]?.reservation_id === reservationId) return;
+      await wait(
+        positiveInteger(results[2]?.results[0], 'retry_after_ms'),
+        signal,
+      );
     }
   }
 
@@ -140,16 +152,22 @@ export class D1CloudflareApiRateCoordinator
   }
 
   async #createSchema(): Promise<void> {
-    await this.#db.execute(`CREATE TABLE IF NOT EXISTS ${RATE_RESERVATION_TABLE} (
+    await this.#db
+      .prepare(`CREATE TABLE IF NOT EXISTS ${RATE_RESERVATION_TABLE} (
       quota_scope TEXT NOT NULL,
       reservation_id TEXT NOT NULL,
       reserved_at INTEGER NOT NULL,
       PRIMARY KEY (quota_scope, reservation_id)
-    )`);
-    await this.#db.execute(
-      `CREATE INDEX IF NOT EXISTS ${RATE_RESERVATION_INDEX}
-        ON ${RATE_RESERVATION_TABLE} (quota_scope, reserved_at)`,
-    );
+    )`)
+      .run();
+    await this.#db
+      .prepare(`CREATE INDEX IF NOT EXISTS ${RATE_RESERVATION_INDEX}
+        ON ${RATE_RESERVATION_TABLE} (quota_scope, reserved_at)`)
+      .run();
+  }
+
+  #statement(sql: string, bindings: readonly unknown[]): D1PreparedStatement {
+    return this.#db.prepare(sql).bind(...bindings);
   }
 }
 

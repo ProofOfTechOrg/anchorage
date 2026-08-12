@@ -20,7 +20,7 @@ export interface D1StorageOptions {
   binding: D1DatabaseBinding;
   /** Storage instance id. Default: 'flowsafe'. */
   id?: string;
-  /** Safe SQL identifier prefix, or an empty string. */
+  /** Mastra-compatible SQL identifier prefix of at most 39 characters, or empty. */
   tablePrefix?: string;
   /**
    * Additional storage domains composed over the D1Store default, such as
@@ -96,7 +96,7 @@ export interface RunArtifactPurger {
 export interface PurgeExpiredRunsOptions {
   /** workflowOutputTTL: runs untouched for longer than this are eligible. */
   ttlMs: number;
-  /** Must match createD1Storage's tablePrefix. */
+  /** Must satisfy and match createD1Storage's max-39 tablePrefix contract. */
   tablePrefix?: string;
   /**
    * When set, each purged run's R2 artifacts are deleted WITH its snapshot
@@ -156,8 +156,8 @@ export async function purgeExpiredWorkflowRuns(
   db: SnapshotDatabase,
   options: PurgeExpiredRunsOptions,
 ): Promise<number> {
+  const prefix = validateTablePrefix(options.tablePrefix) ?? '';
   const now = options.now ?? Date.now;
-  const prefix = options.tablePrefix ?? '';
   // @mastra/cloudflare-d1 stores updatedAt as ISO-8601 TEXT
   // (persistWorkflowSnapshot serializes via toISOString), so lexicographic
   // < against an ISO cutoff is a correct timestamp comparison.
@@ -339,7 +339,7 @@ export async function purgeExpiredWorkflowRuns(
 export interface PurgeExpiredThreadsOptions {
   /** Threads untouched for longer than this are eligible, with their messages. */
   ttlMs: number;
-  /** Must match createD1Storage's tablePrefix. */
+  /** Must satisfy and match createD1Storage's max-39 tablePrefix contract. */
   tablePrefix?: string;
   /**
    * Threads processed per call. Default 100 — the shrinking eligible set is the
@@ -450,8 +450,8 @@ export async function purgeExpiredThreads(
   db: SnapshotDatabase,
   options: PurgeExpiredThreadsOptions,
 ): Promise<PurgeExpiredThreadsResult> {
+  const prefix = validateTablePrefix(options.tablePrefix) ?? '';
   const now = options.now ?? Date.now;
-  const prefix = options.tablePrefix ?? '';
   // @mastra/cloudflare-d1 stores the memory tables' TIMESTAMP columns as
   // ISO-8601 TEXT (the same serialization the snapshot rows use), so a
   // lexicographic < against an ISO cutoff is a correct timestamp comparison.
@@ -552,7 +552,7 @@ export interface PurgeExpiredBackgroundTasksOptions {
    * failure stays inspectable.
    */
   failedTtlMs?: number;
-  /** Must match createD1Storage's tablePrefix. */
+  /** Must satisfy and match createD1Storage's max-39 tablePrefix contract. */
   tablePrefix?: string;
   /** Clock override for tests. */
   now?: () => number;
@@ -594,8 +594,8 @@ export async function purgeExpiredBackgroundTasks(
   db: SnapshotDatabase,
   options: PurgeExpiredBackgroundTasksOptions = {},
 ): Promise<PurgeExpiredBackgroundTasksResult> {
+  const prefix = validateTablePrefix(options.tablePrefix) ?? '';
   const now = options.now ?? Date.now;
-  const prefix = options.tablePrefix ?? '';
   const table = `${prefix}mastra_background_tasks`;
   const completedCutoff = new Date(
     now() - (options.completedTtlMs ?? 3_600_000),
@@ -697,7 +697,7 @@ export interface PurgeExpiredNotificationsOptions {
    * be readable until the host says otherwise.
    */
   ttlMs: number;
-  /** Must match createD1Storage's tablePrefix. */
+  /** Must satisfy and match createD1Storage's max-39 tablePrefix contract. */
   tablePrefix?: string;
   /** Clock override for tests. */
   now?: () => number;
@@ -716,8 +716,8 @@ export async function purgeExpiredNotifications(
   db: SnapshotDatabase,
   options: PurgeExpiredNotificationsOptions,
 ): Promise<number> {
+  const prefix = validateTablePrefix(options.tablePrefix) ?? '';
   const now = options.now ?? Date.now;
-  const prefix = options.tablePrefix ?? '';
   const cutoff = new Date(now() - options.ttlMs).toISOString();
   const placeholders = NOTIFICATION_TERMINAL_STATUSES.map(() => '?').join(', ');
   try {
@@ -754,7 +754,7 @@ export interface PurgeExpiredThreadStateOptions {
    * kept until the host sets a window).
    */
   ttlMs: number;
-  /** Must match createD1Storage's tablePrefix. */
+  /** Must satisfy and match createD1Storage's max-39 tablePrefix contract. */
   tablePrefix?: string;
   /** Clock override for tests. */
   now?: () => number;
@@ -774,8 +774,8 @@ export async function purgeExpiredThreadState(
   db: SnapshotDatabase,
   options: PurgeExpiredThreadStateOptions,
 ): Promise<number> {
+  const prefix = validateTablePrefix(options.tablePrefix) ?? '';
   const now = options.now ?? Date.now;
-  const prefix = options.tablePrefix ?? '';
   const cutoff = new Date(now() - options.ttlMs).toISOString();
   try {
     return d1Changes(
@@ -810,7 +810,7 @@ export interface PurgeExpiredScheduleTriggersOptions {
    * history is inspectable until the host sets a window.
    */
   ttlMs: number;
-  /** Must match createD1Storage's tablePrefix. */
+  /** Must satisfy and match createD1Storage's max-39 tablePrefix contract. */
   tablePrefix?: string;
   /** Clock override for tests. */
   now?: () => number;
@@ -835,8 +835,8 @@ export async function purgeExpiredScheduleTriggers(
   db: SnapshotDatabase,
   options: PurgeExpiredScheduleTriggersOptions,
 ): Promise<number> {
+  const prefix = validateTablePrefix(options.tablePrefix) ?? '';
   const now = options.now ?? Date.now;
-  const prefix = options.tablePrefix ?? '';
   const cutoff = now() - options.ttlMs;
   try {
     return d1Changes(

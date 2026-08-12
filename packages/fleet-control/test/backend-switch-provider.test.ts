@@ -136,10 +136,65 @@ const trafficAuthority = {
   allowedArtifactVersions: [prior.artifactVersion],
 };
 
+function providerBindingIdentitiesForTest(inspection: {
+  databaseIds: readonly string[];
+  durableObjectBindings: readonly { name: string }[];
+  serviceBindings?: readonly { name: string }[];
+  queueProducerBindings?: readonly { name: string }[];
+  kvNamespaceBindings?: readonly { name: string }[];
+  r2BucketBindings?: readonly { name: string }[];
+  secretNames: readonly string[];
+  plainTextBindings: Readonly<Record<string, string>>;
+}) {
+  return [
+    ...inspection.databaseIds.map(() => ({ type: 'd1', name: 'DB' })),
+    ...inspection.durableObjectBindings.map(({ name }) => ({
+      type: 'durable_object_namespace',
+      name,
+    })),
+    ...(inspection.serviceBindings ?? []).map(({ name }) => ({
+      type: 'service',
+      name,
+    })),
+    ...(inspection.queueProducerBindings ?? []).map(({ name }) => ({
+      type: 'queue',
+      name,
+    })),
+    ...(inspection.kvNamespaceBindings ?? []).map(({ name }) => ({
+      type: 'kv_namespace',
+      name,
+    })),
+    ...(inspection.r2BucketBindings ?? []).map(({ name }) => ({
+      type: 'r2_bucket',
+      name,
+    })),
+    ...inspection.secretNames.map((name) => ({ type: 'secret_text', name })),
+    ...Object.keys(inspection.plainTextBindings).map((name) => ({
+      type: 'plain_text',
+      name,
+    })),
+  ];
+}
+
+function completeProviderBindingInspection<
+  T extends Parameters<typeof providerBindingIdentitiesForTest>[0],
+>(
+  inspection: T,
+): T & {
+  providerBindingIdentities: ReturnType<
+    typeof providerBindingIdentitiesForTest
+  >;
+} {
+  return {
+    ...inspection,
+    providerBindingIdentities: providerBindingIdentitiesForTest(inspection),
+  };
+}
+
 function exactPriorWorker(): NonNullable<
   Awaited<ReturnType<BackendSwitchApi['inspectControlWorker']>>
 > {
-  return {
+  return completeProviderBindingInspection({
     artifactVersion: prior.artifactVersion,
     databaseIds: [prior.databaseId],
     durableObjectBindings: prior.durableObjectBindings,
@@ -156,7 +211,7 @@ function exactPriorWorker(): NonNullable<
     previewUrlsEnabled: true,
     routeHostnames: [targetSpec.routeHostname],
     zoneRoutes: [],
-  };
+  });
 }
 
 function ordinaryFootprint(
@@ -183,8 +238,40 @@ function provider(
     throw new Error('profile must not be read during teardown authorization');
   },
 ): WorkersForPlatformsBackendSwitchProvider {
+  const inspectControlWorker = client.inspectControlWorker;
+  const inspectDispatchWorker = client.inspectDispatchWorker;
   return new WorkersForPlatformsBackendSwitchProvider({
-    client: client as BackendSwitchApi,
+    client: {
+      ...client,
+      ...(inspectControlWorker
+        ? {
+            inspectControlWorker: async (scriptName: string) => {
+              const inspection = await inspectControlWorker(scriptName);
+              return inspection
+                ? {
+                    ...inspection,
+                    providerBindingIdentities:
+                      providerBindingIdentitiesForTest(inspection),
+                  }
+                : undefined;
+            },
+          }
+        : {}),
+      ...(inspectDispatchWorker
+        ? {
+            inspectDispatchWorker: async (scriptName: string) => {
+              const inspection = await inspectDispatchWorker(scriptName);
+              return inspection
+                ? {
+                    ...inspection,
+                    providerBindingIdentities:
+                      providerBindingIdentitiesForTest(inspection),
+                  }
+                : undefined;
+            },
+          }
+        : {}),
+    } as BackendSwitchApi,
     backend: backend as WorkersForPlatformsBackend,
     hostRoutingKvId: 'hosts-kv',
     sharedOutboundWorkerName: 'shared-outbound',
@@ -254,7 +341,7 @@ async function committedPlanOnlyBridge(
       return result;
     },
     uploadControlWorker: async (upload) => {
-      inspection = {
+      inspection = completeProviderBindingInspection({
         artifactVersion: 'provider-committed-v2',
         databaseIds: upload.bindings.flatMap((binding) =>
           binding.type === 'd1' ? [String(binding.database_id)] : [],
@@ -317,11 +404,14 @@ async function committedPlanOnlyBridge(
         previewUrlsEnabled: publicAccessEnabled,
         routeHostnames: [],
         zoneRoutes: [],
-      };
+      });
       return inspection.artifactVersion;
     },
     putControlSecrets: async (_scriptName, secrets) => {
-      inspection = { ...inspection, secretNames: Object.keys(secrets).sort() };
+      inspection = completeProviderBindingInspection({
+        ...inspection,
+        secretNames: Object.keys(secrets).sort(),
+      });
     },
     inspectOrdinaryWorkerFootprint: async () => ({
       scriptPresent: bridgePresent,
@@ -1163,7 +1253,7 @@ describe('backend switch provider teardown authority', () => {
   it('deletes a commit-unknown release only from its exact topology and adopts response-loss absence', async () => {
     let live:
       | Awaited<ReturnType<BackendSwitchApi['inspectDispatchWorker']>>
-      | undefined = {
+      | undefined = completeProviderBindingInspection({
       tenantTag: targetSpec.tenantTag,
       environment: targetSpec.environment,
       artifactVersion: 'provider-v9',
@@ -1184,7 +1274,7 @@ describe('backend switch provider teardown authority', () => {
         FLEET_SCHEMA_VERSION: String(targetSpec.schemaVersion),
         FLEET_SPEC_DIGEST: release.specDigest,
       },
-    };
+    });
     let inventory:
       | Awaited<ReturnType<BackendSwitchApi['getScriptInventory']>>
       | undefined = {
@@ -1234,34 +1324,35 @@ describe('backend switch provider teardown authority', () => {
   it('rejects a commit-unknown release when any live topology edge differs', async () => {
     let revoked = false;
     const subject = provider({
-      inspectDispatchWorker: async () => ({
-        tenantTag: targetSpec.tenantTag,
-        environment: targetSpec.environment,
-        artifactVersion: 'provider-v9',
-        desiredSpecDigest: release.specDigest,
-        schemaVersion: release.releaseSchemaVersion,
-        databaseIds: [prior.databaseId],
-        durableObjectBindings: [
-          {
-            name: 'FOREIGN',
-            className: 'Foreign',
-            namespaceId: 'namespace-foreign',
+      inspectDispatchWorker: async () =>
+        completeProviderBindingInspection({
+          tenantTag: targetSpec.tenantTag,
+          environment: targetSpec.environment,
+          artifactVersion: 'provider-v9',
+          desiredSpecDigest: release.specDigest,
+          schemaVersion: release.releaseSchemaVersion,
+          databaseIds: [prior.databaseId],
+          durableObjectBindings: [
+            {
+              name: 'FOREIGN',
+              className: 'Foreign',
+              namespaceId: 'namespace-foreign',
+            },
+          ],
+          serviceBindings: [],
+          queueProducerBindings: [],
+          r2BucketBindings: [],
+          secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
+          plainTextBindings: {
+            DEPLOYMENT_TENANT: targetSpec.tenantTag,
+            FLEET_AUDIT_PROXY: 'remote-do',
+            FLEET_ENVIRONMENT: targetSpec.environment,
+            FLEET_INGRESS_CONTRACT: 'v1',
+            FLEET_MAINTENANCE_CAPABILITIES: 'v1',
+            FLEET_SCHEMA_VERSION: String(targetSpec.schemaVersion),
+            FLEET_SPEC_DIGEST: release.specDigest,
           },
-        ],
-        serviceBindings: [],
-        queueProducerBindings: [],
-        r2BucketBindings: [],
-        secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
-        plainTextBindings: {
-          DEPLOYMENT_TENANT: targetSpec.tenantTag,
-          FLEET_AUDIT_PROXY: 'remote-do',
-          FLEET_ENVIRONMENT: targetSpec.environment,
-          FLEET_INGRESS_CONTRACT: 'v1',
-          FLEET_MAINTENANCE_CAPABILITIES: 'v1',
-          FLEET_SCHEMA_VERSION: String(targetSpec.schemaVersion),
-          FLEET_SPEC_DIGEST: release.specDigest,
-        },
-      }),
+        }),
       getScriptInventory: async () => ({
         scriptName: release.physicalScriptName,
         tenantTag: targetSpec.tenantTag,
@@ -1355,23 +1446,24 @@ describe('backend switch provider teardown authority', () => {
 
   it('rejects a bridge version outside the persisted artifact variants', async () => {
     const subject = provider({
-      inspectControlWorker: async () => ({
-        artifactVersion: 'foreign-v9',
-        databaseIds: [prior.databaseId],
-        durableObjectBindings: prior.durableObjectBindings,
-        serviceBindings: [],
-        queueProducerBindings: [],
-        kvNamespaceBindings: [],
-        secretNames: prior.secretNames,
-        plainTextBindings: {
-          DEPLOYMENT_TENANT: targetSpec.tenantTag,
-          FLEET_ENVIRONMENT: targetSpec.environment,
-        },
-        workersDevEnabled: false,
-        previewUrlsEnabled: false,
-        routeHostnames: [],
-        zoneRoutes: [],
-      }),
+      inspectControlWorker: async () =>
+        completeProviderBindingInspection({
+          artifactVersion: 'foreign-v9',
+          databaseIds: [prior.databaseId],
+          durableObjectBindings: prior.durableObjectBindings,
+          serviceBindings: [],
+          queueProducerBindings: [],
+          kvNamespaceBindings: [],
+          secretNames: prior.secretNames,
+          plainTextBindings: {
+            DEPLOYMENT_TENANT: targetSpec.tenantTag,
+            FLEET_ENVIRONMENT: targetSpec.environment,
+          },
+          workersDevEnabled: false,
+          previewUrlsEnabled: false,
+          routeHostnames: [],
+          zoneRoutes: [],
+        }),
       listDurableObjectNamespaces: async () => prior.namespaceIds,
     });
 
@@ -1401,24 +1493,25 @@ describe('backend switch provider teardown authority', () => {
     };
     const subject = provider(
       {
-        inspectControlWorker: async () => ({
-          artifactVersion: bridge.artifactVersion,
-          databaseIds: [prior.databaseId],
-          durableObjectBindings: prior.durableObjectBindings,
-          serviceBindings: [],
-          queueProducerBindings: [],
-          kvNamespaceBindings: [],
-          secretNames: prior.secretNames,
-          plainTextBindings: {
-            DEPLOYMENT_TENANT: targetSpec.tenantTag,
-            FLEET_ENVIRONMENT: targetSpec.environment,
-            FLEET_ARTIFACT_DIGEST: '7'.repeat(64),
-          },
-          workersDevEnabled: false,
-          previewUrlsEnabled: false,
-          routeHostnames: [],
-          zoneRoutes: [],
-        }),
+        inspectControlWorker: async () =>
+          completeProviderBindingInspection({
+            artifactVersion: bridge.artifactVersion,
+            databaseIds: [prior.databaseId],
+            durableObjectBindings: prior.durableObjectBindings,
+            serviceBindings: [],
+            queueProducerBindings: [],
+            kvNamespaceBindings: [],
+            secretNames: prior.secretNames,
+            plainTextBindings: {
+              DEPLOYMENT_TENANT: targetSpec.tenantTag,
+              FLEET_ENVIRONMENT: targetSpec.environment,
+              FLEET_ARTIFACT_DIGEST: '7'.repeat(64),
+            },
+            workersDevEnabled: false,
+            previewUrlsEnabled: false,
+            routeHostnames: [],
+            zoneRoutes: [],
+          }),
         listDurableObjectNamespaces: async () => prior.namespaceIds,
         revokeControlSecrets: async () => {
           revoked = true;
@@ -1578,7 +1671,7 @@ describe('backend switch provider response-loss recovery', () => {
     >;
     let currentProfile = profile;
     let namespaces = [...prior.namespaceIds];
-    let live: Inspection = {
+    let live: Inspection = completeProviderBindingInspection({
       artifactVersion: prior.artifactVersion,
       databaseIds: [prior.databaseId],
       durableObjectBindings: prior.durableObjectBindings,
@@ -1595,7 +1688,7 @@ describe('backend switch provider response-loss recovery', () => {
       previewUrlsEnabled: false,
       routeHostnames: [],
       zoneRoutes: [],
-    };
+    });
     const uploads: Parameters<BackendSwitchApi['uploadControlWorker']>[0][] =
       [];
     let loseFinalizedUploadResponse = false;
@@ -1610,7 +1703,7 @@ describe('backend switch provider response-loss recovery', () => {
           } else if (uploads.length === 3) {
             namespaces = [...namespaces, 'namespace-archive'];
           }
-          live = {
+          live = completeProviderBindingInspection({
             artifactVersion: `bridge-v${uploads.length}`,
             databaseIds: upload.bindings.flatMap((binding) =>
               binding.type === 'd1' ? [String(binding.database_id)] : [],
@@ -1654,7 +1747,7 @@ describe('backend switch provider response-loss recovery', () => {
             previewUrlsEnabled: false,
             routeHostnames: [],
             zoneRoutes: [],
-          };
+          });
           if (loseFinalizedUploadResponse) {
             loseFinalizedUploadResponse = false;
             throw new Error('finalized upload response lost after commit');
@@ -1662,7 +1755,10 @@ describe('backend switch provider response-loss recovery', () => {
           return live.artifactVersion;
         },
         putControlSecrets: async (_scriptName, values) => {
-          live = { ...live, secretNames: Object.keys(values).sort() };
+          live = completeProviderBindingInspection({
+            ...live,
+            secretNames: Object.keys(values).sort(),
+          });
         },
         deleteControlSecrets: async () => {},
         listDurableObjectNamespaces: async () => namespaces,
@@ -1877,7 +1973,7 @@ describe('backend switch provider response-loss recovery', () => {
     type Inspection = NonNullable<
       Awaited<ReturnType<BackendSwitchApi['inspectControlWorker']>>
     >;
-    let live: Inspection = {
+    let live: Inspection = completeProviderBindingInspection({
       artifactVersion: prior.artifactVersion,
       databaseIds: [prior.databaseId],
       durableObjectBindings: prior.durableObjectBindings,
@@ -1894,7 +1990,7 @@ describe('backend switch provider response-loss recovery', () => {
       previewUrlsEnabled: false,
       routeHostnames: [],
       zoneRoutes: [],
-    };
+    });
     const uploads: Parameters<BackendSwitchApi['uploadControlWorker']>[0][] =
       [];
     let loseFirstUploadResponse = true;
@@ -1905,7 +2001,7 @@ describe('backend switch provider response-loss recovery', () => {
       uploadControlWorker: async (upload) => {
         uploads.push(upload);
         const bindings = upload.bindings;
-        live = {
+        live = completeProviderBindingInspection({
           artifactVersion: `bridge-v${uploads.length}`,
           databaseIds: bindings.flatMap((binding) =>
             binding.type === 'd1' ? [String(binding.database_id)] : [],
@@ -1949,7 +2045,7 @@ describe('backend switch provider response-loss recovery', () => {
           previewUrlsEnabled: false,
           routeHostnames: [],
           zoneRoutes: [],
-        };
+        });
         if (loseFirstUploadResponse) {
           loseFirstUploadResponse = false;
           throw new Error('upload response lost after commit');
@@ -1957,7 +2053,10 @@ describe('backend switch provider response-loss recovery', () => {
         return live.artifactVersion;
       },
       putControlSecrets: async (_scriptName, secrets) => {
-        live = { ...live, secretNames: Object.keys(secrets).sort() };
+        live = completeProviderBindingInspection({
+          ...live,
+          secretNames: Object.keys(secrets).sort(),
+        });
       },
       listDurableObjectNamespaces: async () => [
         'namespace-runner',

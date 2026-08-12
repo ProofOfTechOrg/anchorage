@@ -1224,6 +1224,7 @@ export default {
   });
 
   it('parses deployment resources and checks authenticated maintenance health', async () => {
+    let extraBindings: readonly Readonly<Record<string, unknown>>[] = [];
     const runner = new FakeRunner(async (arguments_) => {
       if (arguments_[0] === 'deployments') {
         return {
@@ -1264,6 +1265,7 @@ export default {
                 name: 'FLEET_SPEC_DIGEST',
                 text: deploymentSpecDigest(deployment),
               },
+              ...extraBindings,
             ],
           },
         }),
@@ -1303,6 +1305,17 @@ export default {
         FLEET_SPEC_DIGEST: deploymentSpecDigest(deployment),
       },
       secretNames: ['DEPLOYMENT_IDENTITY_SECRET', 'MAINTENANCE_ADMIN_SECRET'],
+      providerBindingIdentities: [
+        { type: 'd1', name: 'DB' },
+        { type: 'durable_object_namespace', name: 'MAINTENANCE' },
+        { type: 'plain_text', name: 'DEPLOYMENT_TENANT' },
+        { type: 'plain_text', name: 'FLEET_ENVIRONMENT' },
+        { type: 'plain_text', name: 'FLEET_SCHEMA_VERSION' },
+        { type: 'plain_text', name: 'FLEET_SPEC_DIGEST' },
+        { type: 'secret_text', name: 'DEPLOYMENT_IDENTITY_SECRET' },
+        { type: 'secret_text', name: 'MAINTENANCE_ADMIN_SECRET' },
+        { type: 'service', name: 'EGRESS_PROXY' },
+      ],
       artifactVersion: 'version-live',
       desiredSpecDigest: deploymentSpecDigest(deployment),
       schemaVersion: 3,
@@ -1328,6 +1341,16 @@ export default {
         headers: { authorization: `Bearer ${secrets.maintenanceAdmin}` },
       },
     );
+    extraBindings = [
+      { type: 'kv_namespace', name: 'OUT_OF_BAND_KV', namespace_id: 'kv-id' },
+    ];
+    await expect(
+      backend(runner, { fetch: request }).inspect(
+        deployment,
+        secrets.maintenanceAdmin,
+      ),
+    ).rejects.toThrow(/unsupported or malformed provider binding/u);
+    expect(request).toHaveBeenCalledTimes(1);
   });
 
   it('fails closed when an expected-empty secret inventory cannot be inspected', async () => {

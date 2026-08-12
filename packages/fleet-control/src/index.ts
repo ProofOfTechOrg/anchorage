@@ -110,6 +110,7 @@ export type {
   PlatformPlaneResourceSet,
   PlatformPlaneStateStore,
   PromotionGuard,
+  ProviderBindingIdentity,
   ProvisioningBackend,
   ProvisioningBackendKind,
   ProvisioningPhase,

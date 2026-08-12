@@ -15,6 +15,7 @@ import {
   FLEET_AUDIT_PROXY_CLASS_NAME,
   FLEET_AUDIT_PROXY_STATE_BINDING,
 } from '../src/platform-resources.js';
+import { providerBindingIdentitiesForInspection } from '../src/provider-binding-inventory.js';
 import {
   assertLiveDeploymentMatches,
   cleanupDeploymentArtifacts,
@@ -44,6 +45,18 @@ const secrets: DeploymentSecrets = {
   deploymentIdentity: 'deployment-identity-secret-value-0001',
   maintenanceAdmin: 'maintenance-admin-secret-value-00001',
 };
+
+function completeLiveDeployment(
+  live: Omit<LiveDeployment, 'providerBindingIdentities'>,
+): LiveDeployment {
+  return {
+    ...live,
+    providerBindingIdentities: providerBindingIdentitiesForInspection({
+      ...live,
+      databaseIds: [live.databaseId],
+    }),
+  };
+}
 
 const MAINTENANCE_PUBLIC_KEY =
   '{"kty":"OKP","crv":"Ed25519","alg":"EdDSA","kid":"fleet-maintenance-v1","x":"Lhp1XFeTJJx8FLOCKpn4nkO-tWuZZxXX8ziw0LEvUZo"}';
@@ -364,7 +377,7 @@ class FakeBackend implements ProvisioningBackend {
       deployment.authoredBy === 'external'
         ? externalReleaseTopology(deployment, platformResources)
         : undefined;
-    this.live = {
+    this.live = completeLiveDeployment({
       tenantTag: 'acme',
       environment: 'production',
       scriptName:
@@ -409,7 +422,7 @@ class FakeBackend implements ProvisioningBackend {
       desiredSpecDigest: deploymentSpecDigest(deployment),
       schemaVersion: 3,
       maintenance,
-    };
+    });
     return {
       artifactVersion: 'artifact-v3',
       created: true,
@@ -434,7 +447,9 @@ class FakeBackend implements ProvisioningBackend {
 
   async inspect(): Promise<LiveDeployment | undefined> {
     this.#event('inspect');
-    return this.live;
+    if (!this.live) return undefined;
+    const { providerBindingIdentities: _inventory, ...live } = this.live;
+    return completeLiveDeployment(live);
   }
 
   async removeTraffic(): Promise<void> {
@@ -608,7 +623,7 @@ describe('fleet provisioning', () => {
       FleetRecord,
       'tenantTag' | 'environment' | 'databaseId' | 'applicationBindings'
     >;
-    const live: LiveDeployment = {
+    const live = completeLiveDeployment({
       tenantTag: deployment.tenantTag,
       environment: deployment.environment,
       scriptName: deployment.scriptName,
@@ -631,7 +646,7 @@ describe('fleet provisioning', () => {
       desiredSpecDigest: digest,
       schemaVersion: deployment.schemaVersion,
       maintenance,
-    };
+    });
 
     expect(() =>
       assertLiveDeploymentMatches(live, record, deployment, digest),
@@ -649,7 +664,7 @@ describe('fleet provisioning', () => {
         deployment,
         digest,
       ),
-    ).toThrow(/does not exactly match/u);
+    ).toThrow(/provider binding|does not exactly match/u);
     expect(() =>
       assertLiveDeploymentMatches(
         {
@@ -660,7 +675,7 @@ describe('fleet provisioning', () => {
         deployment,
         digest,
       ),
-    ).toThrow(/does not exactly match/u);
+    ).toThrow(/provider binding|does not exactly match/u);
     for (const missing of ['plainTextBindings', 'secretNames'] as const) {
       const incomplete = { ...live } as Record<string, unknown>;
       delete incomplete[missing];
@@ -1384,12 +1399,12 @@ describe('fleet provisioning', () => {
         bridge,
       },
     };
-    backend.live = {
+    backend.live = completeLiveDeployment({
       ...backend.live,
       durableObjectBindings: backend.live.durableObjectBindings.map(
         (binding) => ({ ...binding, scriptName: current.scriptName }),
       ),
-    };
+    });
     const plan: BridgeMutationPlan = {
       artifactDigest: bridge.artifactDigest,
       durableObjectMigrations: [],
@@ -1502,7 +1517,7 @@ describe('fleet provisioning', () => {
       phase: 'ready',
       updatedAt: '2026-08-10T00:00:00.000Z',
     };
-    backend.live = {
+    backend.live = completeLiveDeployment({
       tenantTag: activeSpec.tenantTag,
       environment: activeSpec.environment,
       scriptName: activeRelease.physicalScriptName,
@@ -1514,7 +1529,7 @@ describe('fleet provisioning', () => {
       desiredSpecDigest: digest,
       schemaVersion: 1,
       maintenance,
-    };
+    });
     backend.databaseExists = true;
     backend.databaseOwner = activeSpec.tenantTag;
 

@@ -12,6 +12,11 @@
   non-mutating inspection; custom atomic stores without it are rejected.
   Hosts must add the explicit acknowledgement after draining legacy writers;
   this is a deliberate pre-1.0 source and rollout compatibility boundary.
+  Shipped D1 stores now provide connector-bound inspection and atomic migration
+  for externally proven ambiguous rows. Migration revalidates and transforms
+  the inventoried output through the connector schema, guards the exact source
+  and target values, and copies v1 to v2 while deleting v1 in one transaction;
+  storage keys remain private and retries are idempotent.
 
 - Validate D1 pending TTLs and manifest rate-limit counts as positive safe
   integers within their supported ranges. D1 rate increments and expired-row
@@ -33,7 +38,10 @@
 - Terminate an Agent CLI's descendant process tree when its timeout expires.
   POSIX execution uses a dedicated process group and confirms its disappearance
   within a bounded wait; Windows waits for direct argv-based
-  `taskkill.exe /T /F`. Tree-termination failures now have a stable, redacted
+  `taskkill.exe /T /F` from a drive-absolute local `%SystemRoot%` or `%WINDIR%`.
+  The helper path is resolved before CLI launch, so a writable working
+  directory, network share, device path, or `PATH` entry cannot replace it.
+  Tree-termination failures now have a stable, redacted
   error category and metadata instead of reporting timeout while a descendant
   may still run.
 

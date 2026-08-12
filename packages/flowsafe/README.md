@@ -115,7 +115,7 @@ const worker = createFlowsafeWorker({
 });
 ```
 
-The prefix may be empty or must start with an ASCII letter or underscore and continue with ASCII letters, numbers, or underscores. `storageTablePrefix` is not auto-discovered and must match the `tablePrefix` used by `init()` or `createD1Storage()`.
+The prefix may be empty or must start with an ASCII letter or underscore and continue with ASCII letters, numbers, or underscores. It can contain at most 39 characters because Mastra limits final table identifiers to 63 characters and `mastra_workflow_snapshot` uses the remaining 24. All six exported low-level purge functions validate the same contract before preparing D1 statements. `storageTablePrefix` is not auto-discovered and must match the `tablePrefix` used by `init()` or `createD1Storage()`.
 
 ## Approval lifecycle
 

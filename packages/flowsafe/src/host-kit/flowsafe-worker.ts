@@ -353,7 +353,7 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
   artifactStore?: (env: Env) => RunArtifactPurger | undefined;
   /**
    * Prefix for every prefix-aware built-in retention table. Must match the
-   * `tablePrefix` supplied when the deployment creates its D1 storage.
+   * max-39 `tablePrefix` contract used when the deployment creates D1 storage.
    */
   storageTablePrefix?: string;
   /**

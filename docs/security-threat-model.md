@@ -357,14 +357,14 @@ Before a public endpoint:
 3. Configure and version `resolvePrincipalPermissions` before registering an agent or connector with `requiredPermissions`; permission-declaring connectors deny on any path without a trusted projection.
 4. Use D1-backed deployment-wide connector stores across per-run objects.
 5. Treat connector budgets and idempotency as deployment-wide unless the application defines a separate, non-tenant logical isolation scope.
-6. Before enabling v2 idempotency writes, stop and drain all legacy writers sharing the store. Never replay an ambiguous scoped or colon-bearing legacy row without external proof of its exact tuple.
+6. Before enabling v2 idempotency writes, stop and drain all legacy writers sharing the store. Never replay an ambiguous scoped or colon-bearing legacy row without external proof of its exact tuple; migrate proven D1 rows only through the connector-bound atomic helper so output validation, exact-row guards, and v1 deletion share the supported transaction.
 7. Route connector HTTP through `runtime.fetch` and add infrastructure egress policy.
 8. Keep approval connector lists and durable-agent resume targets server-authored.
 9. Mount only configured optional routers.
 10. Configure retention and a resource-set decommissioning procedure for every adopted domain. Delete application Workers before R2, prove every bucket is detached and empty, and never auto-purge application objects.
 11. Protect Durable Object namespaces behind the Worker topologies and set a distinct `DEPLOYMENT_IDENTITY_SECRET` for caller attestation.
 12. Project notifications and audit to the receiving channel's trust level.
-13. Isolate Agent CLI workspaces and review their diffs.
+13. Isolate Agent CLI workspaces and review their diffs. On Windows, preserve a drive-absolute local `SystemRoot` or `WINDIR`; the built-in executor rejects relative, root-relative, UNC, and device paths before launch rather than searching the workspace or `PATH` for taskkill.
 14. Run the deterministic workerd restart, forgery, and deployment-sentinel mismatch proof.
 15. Keep application KV unsupported, bind only fleet-owned application R2 resources, and treat secret inventory as name-only attestation.
 

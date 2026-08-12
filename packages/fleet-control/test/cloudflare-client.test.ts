@@ -1832,6 +1832,7 @@ describe('CloudflareProvisioningClient', () => {
     let previewsEnabled = true;
     let customDomainAttached = true;
     let zoneRouteAttached = true;
+    let extraBindings: readonly Readonly<Record<string, unknown>>[] = [];
     const request = vi.fn(
       async (input: string | URL | Request, init?: RequestInit) => {
         const url = new URL(
@@ -1881,6 +1882,7 @@ describe('CloudflareProvisioningClient', () => {
                   name: 'EGRESS_PROXY',
                   service: 'fleet-egress',
                 },
+                ...extraBindings,
               ],
             },
           });
@@ -2002,11 +2004,23 @@ describe('CloudflareProvisioningClient', () => {
       r2BucketBindings: [],
       secretNames: [],
       plainTextBindings: { DEPLOYMENT_TENANT: 'acme' },
+      providerBindingIdentities: [
+        { type: 'd1', name: 'DB' },
+        { type: 'kv_namespace', name: 'HOSTS' },
+        { type: 'plain_text', name: 'DEPLOYMENT_TENANT' },
+        { type: 'service', name: 'EGRESS_PROXY' },
+      ],
       workersDevEnabled: false,
       previewUrlsEnabled: false,
       routeHostnames: [],
       zoneRoutes: [],
     });
+    extraBindings = [
+      { type: 'hyperdrive', name: 'FUTURE_BINDING', id: 'config-id' },
+    ];
+    await expect(client.inspectControlWorker('fleet-state')).rejects.toThrow(
+      /unsupported or malformed provider binding/u,
+    );
     await fenced(client, () => client.deleteControlWorker('fleet-state'));
     expect(calls).toEqual(
       expect.arrayContaining([
@@ -2027,6 +2041,47 @@ describe('CloudflareProvisioningClient', () => {
           method: 'DELETE',
         }),
       ]),
+    );
+  });
+
+  it('rejects an unconsumed dispatch-provider binding', async () => {
+    const request = vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+      );
+      if (url.pathname.endsWith('/scripts/candidate/settings')) {
+        return envelope({
+          bindings: [
+            { type: 'd1', name: 'DB', database_id: 'db-acme' },
+            { type: 'kv_namespace', name: 'OUT_OF_BAND', namespace_id: 'kv' },
+          ],
+          tags: [
+            'tenant:acme',
+            'environment:production',
+            'schema:1',
+            `spec:${'a'.repeat(64)}`,
+          ],
+        });
+      }
+      if (url.pathname.endsWith('/scripts/candidate')) {
+        return envelope({ script: { etag: 'etag-v1' } });
+      }
+      throw new Error(`unexpected Cloudflare request: ${url.href}`);
+    });
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
+      dispatchNamespace: 'fleet',
+      fetch: request,
+    });
+
+    await expect(client.inspectDispatchWorker('candidate')).rejects.toThrow(
+      /unsupported or malformed provider binding/u,
     );
   });
 

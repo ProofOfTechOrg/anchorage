@@ -31,6 +31,7 @@ import {
   externalReleaseTopology,
 } from './platform-resources.js';
 import { buildPromotionGuard } from './promotion-guard.js';
+import { assertProviderBindingIdentitiesMatchInspection } from './provider-binding-inventory.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   DatabaseExport,
@@ -206,6 +207,19 @@ export function assertLiveDeploymentMatches(
       `deployment '${record.tenantTag}:${record.environment}' live binding inventory is incomplete`,
     );
   }
+  assertProviderBindingIdentitiesMatchInspection(
+    {
+      databaseIds: [live.databaseId],
+      durableObjectBindings: live.durableObjectBindings,
+      serviceBindings: live.serviceBindings,
+      queueProducerBindings: live.queueProducerBindings,
+      r2BucketBindings: live.r2BucketBindings,
+      plainTextBindings: live.plainTextBindings,
+      secretNames: live.secretNames,
+      providerBindingIdentities: live.providerBindingIdentities,
+    },
+    `deployment '${record.tenantTag}:${record.environment}'`,
+  );
   const externalTopology =
     spec.authoredBy === 'external' && record.platformResources
       ? externalReleaseTopology(spec, record.platformResources)

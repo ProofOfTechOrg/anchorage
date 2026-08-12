@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 /// <reference types="@cloudflare/workers-types" />
 
+import { D1CloudflareApiRateCoordinator } from '../../src/cloudflare-rate-coordinator.js';
 import {
   canonicalDeploymentEgressPolicy,
   externalEgressProxyScriptName,
@@ -986,6 +987,48 @@ async function backendSwitchColumnUpgrade(db: D1Database): Promise<unknown> {
   };
 }
 
+async function cloudflareRateCoordination(db: D1Database): Promise<unknown> {
+  await db
+    .prepare('DROP TABLE IF EXISTS anchorage_cloudflare_api_rate_reservations')
+    .run();
+  const quotaScope = 'real-d1-shared-provider-principal';
+  const first = new D1CloudflareApiRateCoordinator(db, { quotaScope });
+  const second = new D1CloudflareApiRateCoordinator(db, { quotaScope });
+  await first.acquire();
+  await db
+    .prepare(
+      'DELETE FROM anchorage_cloudflare_api_rate_reservations WHERE quota_scope = ?',
+    )
+    .bind(quotaScope)
+    .run();
+  await db
+    .prepare(`WITH RECURSIVE sequence(value) AS (
+      SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 1099
+    )
+    INSERT INTO anchorage_cloudflare_api_rate_reservations (
+      quota_scope, reservation_id, reserved_at
+    )
+    SELECT ?, 'seed-' || value, CAST(unixepoch('subsec') * 1000 AS INTEGER)
+    FROM sequence`)
+    .bind(quotaScope)
+    .run();
+  await first.acquire();
+  const controller = new AbortController();
+  const blocked = second.acquire(controller.signal).then(
+    () => false,
+    (error) => error instanceof Error && error.name === 'AbortError',
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  controller.abort();
+  const row = await db
+    .prepare(`SELECT COUNT(*) AS count
+      FROM anchorage_cloudflare_api_rate_reservations
+      WHERE quota_scope = ?`)
+    .bind(quotaScope)
+    .first<{ count: number }>();
+  return { blocked: await blocked, count: Number(row?.count) };
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -1021,6 +1064,8 @@ export default {
           return Response.json(await backendSwitchColumnUpgrade(env.DB));
         case 'lifecycle-errors':
           return Response.json(await lifecycleErrors(env.DB));
+        case 'cloudflare-rate-coordination':
+          return Response.json(await cloudflareRateCoordination(env.DB));
         default:
           return Response.json({ error: 'unknown action' }, { status: 400 });
       }

@@ -5,10 +5,12 @@ import {
   canonicalMaintenanceCapabilityPublicKey,
   trustedArtifactDigest,
 } from './platform-resources.js';
+import { assertProviderBindingIdentitiesMatchInspection } from './provider-binding-inventory.js';
 import type {
   ExternalMutationFence,
   PlatformPlaneLease,
   PlatformPlaneStateStore,
+  ProviderBindingIdentity,
   WorkerModule,
   WorkerZoneRoute,
 } from './types.js';
@@ -25,7 +27,7 @@ type PlatformWorkerRole =
 interface PlatformWorkerInspection {
   readonly artifactVersion: string;
   readonly databaseIds: readonly string[];
-  readonly durableObjectBindings: readonly unknown[];
+  readonly durableObjectBindings: readonly Readonly<{ name: string }>[];
   readonly serviceBindings: readonly Readonly<{
     name: string;
     service: string;
@@ -43,7 +45,10 @@ interface PlatformWorkerInspection {
     namespace: string;
     outbound: unknown;
   }>[];
+  readonly r2BucketBindings?: readonly Readonly<{ name: string }>[];
+  readonly secretNames?: readonly string[];
   readonly plainTextBindings: Readonly<Record<string, string>>;
+  readonly providerBindingIdentities: readonly ProviderBindingIdentity[];
   readonly workersDevEnabled: boolean;
   readonly previewUrlsEnabled: boolean;
   readonly routeHostnames: readonly string[];
@@ -163,6 +168,10 @@ function assertWorkerOwner(options: {
   readonly scriptName: string;
 }): void {
   if (!options.inspection) return;
+  assertProviderBindingIdentitiesMatchInspection(
+    options.inspection,
+    `control Worker '${options.scriptName}'`,
+  );
   const bindings = options.inspection.plainTextBindings;
   if (
     bindings.FLEET_PLATFORM_PLANE_ID !== options.platformPlaneIdentity ||
@@ -232,9 +241,14 @@ function isExactPrivateBootstrap(
   options: {
     readonly platformPlaneIdentity: string;
     readonly role: PlatformWorkerRole;
+    readonly scriptName: string;
   },
 ): inspection is PlatformWorkerInspection {
   if (!inspection) return false;
+  assertProviderBindingIdentitiesMatchInspection(
+    inspection,
+    `control Worker '${options.scriptName}'`,
+  );
   const expectedPlainText = Object.fromEntries(
     privateBootstrapBindings(options).map((binding) => [
       String(binding.name),

@@ -259,7 +259,7 @@ Audit records are security evidence. Queue depth and SIEM ingestion status must 
 | Agent stream returns 409 | In-memory replay cache was evicted or the isolate restarted | Read the authoritative status route; reconnect only for events still present in the configured cache |
 | Connector says approval missing after an approved record | Fingerprint, connector id, workflow, run, and deployment store | Confirm the record matches current step, `suspendedAt`, `resumeCount`, and exact connector id |
 | Connector repeats an external write | Idempotency key, shared store, pending TTL | Fix the business key/store reach/TTL; inspect vendor idempotency evidence |
-| Connector denies `idempotency-key-migration` | Legacy writer versions and the exact legacy row | Stop and drain every old writer sharing the store. Inventory rows, map ambiguous records using external evidence, and acknowledge migration only after the old write path cannot return |
+| Connector denies `idempotency-key-migration` | Legacy writer versions, `inspectLegacyConnectorIdempotency()` outcome, external tuple evidence, and the exact legacy record | Stop and drain every old writer sharing the store. Prove one tuple owns the row, set the drained-writer acknowledgement, and use `migrateLegacyConnectorIdempotency()`; leave pending, changed, invalid, conflicting, or unproven rows fail closed |
 | One workload throttles another | Deployment-wide connector budget | Tune the deployment limit or split workloads into separate deployments when they require independent capacity |
 | Egress policy allowed an unexpected socket | Connector bypassed runtime fetch | Route the transport through guarded fetch and add infrastructure egress control |
 | Live updates stop but HTTP works | Hub binding, ticket secret/expiry, socket liveness | Let client poll; repair stream configuration without disabling authorization |
@@ -268,7 +268,8 @@ Audit records are security evidence. Queue depth and SIEM ingestion status must 
 | Purge removed a snapshot but left R2 | Artifact store omitted or delete failed | Restore row/key evidence if available, repair paired purge, scan known prefix |
 | Audit is absent while requests succeed | Sink, Queue, consumer, SIEM | Restore export, preserve local ring/Logs, assess evidence gap |
 | Agent CLI error lacks output | Expected safe diagnostics | Inspect the isolated workspace/vendor logs under appropriate access; do not weaken public error safety |
-| Agent CLI reports `termination-failed` | Sanitized `terminationMethod`, `systemCode`, and numeric exit metadata; host process inventory | Isolate the workspace and kill remaining descendants through the container or host supervisor before retrying. Repair POSIX signal permission or Windows taskkill availability; do not treat the attempt as a clean timeout |
+| Agent CLI reports `runtime-unavailable` before Windows launch | `SystemRoot`/`WINDIR` presence and whether it is a drive-absolute local path | Restore the trusted Windows system-root environment; UNC, device, root-relative, and relative paths are rejected. Never add the workspace or another writable directory as a taskkill lookup fallback |
+| Agent CLI reports `termination-failed` | Sanitized `terminationMethod`, `systemCode`, and numeric exit metadata; host process inventory | Isolate the workspace and kill remaining descendants through the container or host supervisor before retrying. Repair POSIX signal permission or the absolute Windows system taskkill executable; do not treat the attempt as a clean timeout |
 
 ## Recovery rules
 
@@ -276,7 +277,7 @@ Audit records are security evidence. Queue depth and SIEM ingestion status must 
 - Do not copy an approval grant into a resume request.
 - Do not roll a terminal approval back to open.
 - Do not delete a pending idempotency record while its owner may still run.
-- Do not replay or copy an ambiguous legacy idempotency row until external evidence proves exactly one scoped tuple owns it. Leave unproven rows fail closed.
+- Do not replay or copy an ambiguous legacy idempotency row until external evidence proves exactly one scoped tuple owns it. Use the connector-bound atomic D1 migration for proven rows; leave all others fail closed.
 - Do not change a deployed Durable Object migration tag.
 - Do not overwrite or bypass a deployment sentinel to recover a mis-bound database.
 - Do not expose system stores or raw namespace access as an emergency endpoint.

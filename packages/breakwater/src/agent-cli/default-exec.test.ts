@@ -5,6 +5,7 @@ import {
   type ChildProcessModule,
   createDefaultExec,
   type DefaultExecRuntime,
+  resolveWindowsTaskkillPath,
   type SpawnedProcess,
   type SpawnOptions,
   type TimerRuntime,
@@ -98,6 +99,10 @@ function fakeRuntime(platform: string): FakeRuntime {
     runtime: {
       childProcess,
       platform,
+      taskkillPath:
+        platform === 'win32'
+          ? 'C:\\Windows\\System32\\taskkill.exe'
+          : undefined,
       kill,
       delay,
       timers,
@@ -119,6 +124,19 @@ function fakeRuntime(platform: string): FakeRuntime {
 
 function systemError(code: string): Error & { code: string } {
   return Object.assign(new Error('private operating-system detail'), { code });
+}
+
+function windowsPathModule(): Parameters<typeof resolveWindowsTaskkillPath>[2] {
+  const getBuiltinModule = (
+    globalThis as {
+      process?: { getBuiltinModule?: (id: string) => unknown };
+    }
+  ).process?.getBuiltinModule;
+  const pathModule = getBuiltinModule?.('node:path') as
+    | Parameters<typeof resolveWindowsTaskkillPath>[2]
+    | undefined;
+  if (!pathModule) throw new Error('node:path is unavailable');
+  return pathModule;
 }
 
 describe('default Agent CLI process-tree execution', () => {
@@ -226,7 +244,7 @@ describe('default Agent CLI process-tree execution', () => {
 
     expect(fake.spawn).toHaveBeenNthCalledWith(
       2,
-      'taskkill.exe',
+      'C:\\Windows\\System32\\taskkill.exe',
       ['/pid', '1234', '/T', '/F'],
       { stdio: 'ignore', shell: false, windowsHide: true },
     );
@@ -237,6 +255,73 @@ describe('default Agent CLI process-tree execution', () => {
       timeoutMs: 50,
     });
     expect(settled).toBe(true);
+  });
+
+  it('resolves taskkill from the trusted Windows system root', () => {
+    const pathModule = windowsPathModule();
+
+    expect(
+      resolveWindowsTaskkillPath(
+        'win32',
+        { SystemRoot: 'D:\\Windows' },
+        pathModule,
+      ),
+    ).toBe('D:\\Windows\\System32\\taskkill.exe');
+    expect(
+      resolveWindowsTaskkillPath(
+        'win32',
+        { WINDIR: 'E:\\Windows' },
+        pathModule,
+      ),
+    ).toBe('E:\\Windows\\System32\\taskkill.exe');
+    expect(
+      resolveWindowsTaskkillPath(
+        'win32',
+        { SystemRoot: '', WINDIR: 'F:\\Windows' },
+        pathModule,
+      ),
+    ).toBe('F:\\Windows\\System32\\taskkill.exe');
+    expect(
+      resolveWindowsTaskkillPath('linux', undefined, undefined),
+    ).toBeUndefined();
+  });
+
+  it.each([
+    undefined,
+    '',
+    'Windows',
+    '.\\Windows',
+    '\\Windows',
+    '\\\\server\\share\\Windows',
+    '\\\\?\\C:\\Windows',
+    '\\\\.\\C:\\Windows',
+  ])('rejects an untrusted Windows system root %s', (systemRoot) => {
+    expect(() =>
+      resolveWindowsTaskkillPath(
+        'win32',
+        { SystemRoot: systemRoot },
+        windowsPathModule(),
+      ),
+    ).toThrow(expect.objectContaining({ code: 'runtime-unavailable' }));
+  });
+
+  it.each([
+    'taskkill.exe',
+    '\\System32\\taskkill.exe',
+    '\\\\server\\share\\taskkill.exe',
+    '\\\\?\\C:\\Windows\\System32\\taskkill.exe',
+    '\\\\.\\C:\\Windows\\System32\\taskkill.exe',
+  ])('rejects an untrusted injected taskkill path %s before starting the Agent CLI', async (taskkillPath) => {
+    const fake = fakeRuntime('win32');
+    const runtime = { ...fake.runtime, taskkillPath };
+
+    await expect(
+      createDefaultExec(1024, runtime)('agent-cli.exe', [], {
+        cwd: 'C:\\workspace',
+        timeoutMs: 50,
+      }),
+    ).rejects.toMatchObject({ code: 'runtime-unavailable' });
+    expect(fake.spawn).not.toHaveBeenCalled();
   });
 
   it.each([

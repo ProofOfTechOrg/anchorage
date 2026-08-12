@@ -64,6 +64,15 @@ import {
 } from '../rbac/permission.js';
 import type { EgressFetchBase, EgressGuardedFetch } from './egress-fetch.js';
 import { EgressDeniedError, egressFetch } from './egress-fetch.js';
+import {
+  idempotencyStorageKey,
+  isAmbiguousLegacyIdempotencyIdentity,
+  legacyIdempotencyStorageKey,
+} from './idempotency-key.js';
+import {
+  ATOMIC_LEGACY_IDEMPOTENCY_MIGRATION,
+  isAtomicLegacyIdempotencyMigrator,
+} from './idempotency-migration.js';
 import { newToken } from './new-token.js';
 import { assertSingleTenantConnectorPolicies } from './single-tenant-preset.js';
 
@@ -119,6 +128,31 @@ export interface IdempotencyRecord {
   /** Connector result returned by future calls with the same scoped key. */
   result: unknown;
 }
+
+/** Business identity used to inspect one legacy connector idempotency row. */
+export interface LegacyConnectorIdempotencyIdentity {
+  /** Non-empty business idempotency key supplied by the trusted operator. */
+  idempotencyKey: string;
+  /** Opaque non-empty isolation scope, when the original call was scoped. */
+  isolationScope?: string;
+}
+
+/** Exact inventoried record and identity approved for legacy migration. */
+export interface LegacyConnectorIdempotencyMigrationRequest
+  extends LegacyConnectorIdempotencyIdentity {
+  /** Exact record observed during inventory, before external ownership proof. */
+  expectedRecord: IdempotencyRecord;
+}
+
+/** Outcome of one supported ambiguous-v1 to v2 migration attempt. */
+export type LegacyConnectorIdempotencyMigrationResult =
+  | { state: 'migrated'; record: IdempotencyRecord }
+  | { state: 'already-migrated'; record: IdempotencyRecord }
+  | { state: 'source-absent' }
+  | { state: 'source-pending' }
+  | { state: 'source-mismatch'; record: IdempotencyRecord }
+  | { state: 'target-conflict'; target: IdempotencyInspection }
+  | { state: 'output-invalid'; issues: readonly StandardSchemaIssue[] };
 
 /**
  * Result storage keyed by a private, versioned composite key. Callers must
@@ -227,28 +261,6 @@ function isInspectableStore(
     typeof (store as Partial<InspectableIdempotencyStore>).inspect ===
     'function'
   );
-}
-
-function encodeUtf16(value: string): string {
-  let encoded = '';
-  for (let index = 0; index < value.length; index += 1) {
-    encoded += value.charCodeAt(index).toString(16).padStart(4, '0');
-  }
-  return encoded;
-}
-
-// Version, key kind, and tuple arity are explicit. Each component is encoded
-// as fixed-width UTF-16 code units, whose alphabet cannot contain the `_`
-// separator. The result contains no colon and is therefore disjoint from all
-// v1 `[scope:]connector:key` records, including lone-surrogate JS strings.
-function idempotencyStorageKey(
-  connectorId: string,
-  key: string,
-  isolationScope: string | undefined,
-): string {
-  return isolationScope === undefined
-    ? `bw2_i_u_${encodeUtf16(connectorId)}_${encodeUtf16(key)}`
-    : `bw2_i_s_${encodeUtf16(isolationScope)}_${encodeUtf16(connectorId)}_${encodeUtf16(key)}`;
 }
 
 // Outcome of a keyed attempt, shareable with same-isolate twins before the
@@ -620,11 +632,84 @@ export class ConnectorPolicyError extends Error {
 
 const manifests = new WeakMap<object, PermissionManifest>();
 
+interface ConnectorIdempotencyMigration {
+  inspect(
+    identity: LegacyConnectorIdempotencyIdentity,
+  ): Promise<IdempotencyInspection>;
+  migrate(
+    request: LegacyConnectorIdempotencyMigrationRequest,
+  ): Promise<LegacyConnectorIdempotencyMigrationResult>;
+}
+
+const idempotencyMigrations = new WeakMap<
+  object,
+  ConnectorIdempotencyMigration
+>();
+
 /** Manifest a connector was created with (undefined for plain tools). */
 export function connectorManifest(
   tool: object,
 ): PermissionManifest | undefined {
   return manifests.get(tool);
+}
+
+function assertLegacyMigrationIdentity(
+  identity: LegacyConnectorIdempotencyIdentity,
+): void {
+  if (
+    typeof identity !== 'object' ||
+    identity === null ||
+    typeof identity.idempotencyKey !== 'string' ||
+    identity.idempotencyKey.length === 0 ||
+    (identity.isolationScope !== undefined &&
+      (typeof identity.isolationScope !== 'string' ||
+        identity.isolationScope.length === 0))
+  ) {
+    throw new TypeError(
+      'legacy connector idempotency identity requires a non-empty idempotencyKey and an omitted or non-empty isolationScope',
+    );
+  }
+}
+
+/** Inspect the v1 row for one connector-bound business identity. */
+export function inspectLegacyConnectorIdempotency(
+  connector: object,
+  identity: LegacyConnectorIdempotencyIdentity,
+): Promise<IdempotencyInspection> {
+  assertLegacyMigrationIdentity(identity);
+  const migration = idempotencyMigrations.get(connector);
+  if (!migration) {
+    throw new TypeError(
+      'legacy connector idempotency inspection requires an idempotent connector created by createConnector()',
+    );
+  }
+  return migration.inspect(identity);
+}
+
+/** Atomically move one externally proven ambiguous v1 row to its v2 identity. */
+export function migrateLegacyConnectorIdempotency(
+  connector: object,
+  request: LegacyConnectorIdempotencyMigrationRequest,
+): Promise<LegacyConnectorIdempotencyMigrationResult> {
+  assertLegacyMigrationIdentity(request);
+  if (
+    typeof request !== 'object' ||
+    request === null ||
+    typeof request.expectedRecord !== 'object' ||
+    request.expectedRecord === null ||
+    !('result' in request.expectedRecord)
+  ) {
+    throw new TypeError(
+      'legacy connector idempotency migration requires the exact expectedRecord returned by inventory',
+    );
+  }
+  const migration = idempotencyMigrations.get(connector);
+  if (!migration) {
+    throw new TypeError(
+      'legacy connector idempotency migration requires an idempotent connector created by createConnector()',
+    );
+  }
+  return migration.migrate(request);
 }
 
 function nonEmptyString(value: unknown): value is string {
@@ -1511,13 +1596,14 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
           `breakwater: connector '${id}' uses InMemoryIdempotencyStore under isolation scope '${isolationScope}' — replay protection becomes per-isolate, not per-tenant; use D1IdempotencyStore on DO-per-run hosts.`,
         );
       }
-      const legacyKey =
-        isolationScope === undefined
-          ? `${id}:${key}`
-          : `${isolationScope}:${id}:${key}`;
-      const storageKey = idempotencyStorageKey(id, key, isolationScope);
-      const ambiguousLegacyKey =
-        isolationScope !== undefined || key.includes(':');
+      const identity = {
+        connectorId: id,
+        idempotencyKey: key,
+        isolationScope,
+      };
+      const legacyKey = legacyIdempotencyStorageKey(identity);
+      const storageKey = idempotencyStorageKey(identity);
+      const ambiguousLegacyKey = isAmbiguousLegacyIdempotencyIdentity(identity);
       try {
         return await keyedFlow(requestContext, storageKey, key, async () => {
           let legacy: IdempotencyInspection;
@@ -1806,11 +1892,67 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   }) as unknown as Tool<TInput, TOutput>;
 
   manifests.set(tool, manifest);
+  if (manifest.idempotencyKey && store) {
+    idempotencyMigrations.set(tool, {
+      async inspect(identity) {
+        assertLegacyMigrationIdentity(identity);
+        if (!isInspectableStore(store)) {
+          throw new TypeError(
+            `connector ${id}: legacy idempotency inspection requires an inspectable store`,
+          );
+        }
+        return store.inspect(
+          legacyIdempotencyStorageKey({
+            connectorId: id,
+            ...identity,
+          }),
+        );
+      },
+      async migrate(request) {
+        assertLegacyMigrationIdentity(request);
+        if (
+          !isAmbiguousLegacyIdempotencyIdentity(request) ||
+          policies.idempotencyKeyMigration !== 'legacy-writers-drained'
+        ) {
+          throw new TypeError(
+            `connector ${id}: ambiguous legacy idempotency migration requires a scoped or colon-bearing key and idempotencyKeyMigration 'legacy-writers-drained'`,
+          );
+        }
+        if (!isAtomicLegacyIdempotencyMigrator(store)) {
+          throw new TypeError(
+            `connector ${id}: supported legacy idempotency migration requires D1IdempotencyStore with transactional batch() support`,
+          );
+        }
+        const expectedRecord = { result: request.expectedRecord.result };
+        let targetResult: TOutput;
+        try {
+          targetResult = validateOutput(expectedRecord.result as TOutput);
+        } catch (error) {
+          if (error instanceof OutputValidationFailure) {
+            if (error.kind === 'issues') {
+              return { state: 'output-invalid', issues: error.issues };
+            }
+            throw error.cause;
+          }
+          throw error;
+        }
+        const identity = { connectorId: id, ...request };
+        return store[ATOMIC_LEGACY_IDEMPOTENCY_MIGRATION]({
+          sourceKey: legacyIdempotencyStorageKey(identity),
+          targetKey: idempotencyStorageKey(identity),
+          expectedRecord,
+          targetRecord: { result: targetResult },
+        });
+      },
+    });
+  }
   return tool;
 }
 
 export type {
   D1IdempotencyStoreOptions,
+  IdempotencyBatchDatabase,
+  IdempotencyBatchResult,
   IdempotencyDatabase,
   IdempotencyStatement,
 } from './d1-idempotency-store.js';

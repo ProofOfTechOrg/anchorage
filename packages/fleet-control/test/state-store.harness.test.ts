@@ -265,4 +265,12 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
       });
     }
   });
+
+  it('coordinates separate direct-binding rate coordinators atomically in real D1', async () => {
+    await expect(
+      probe<{ blocked: boolean; count: number }>(
+        'cloudflare-rate-coordination',
+      ),
+    ).resolves.toEqual({ blocked: true, count: 1_100 });
+  });
 });

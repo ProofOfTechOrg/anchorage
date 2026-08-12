@@ -49,7 +49,7 @@ class FakePlatformClient implements PlatformPlaneClient {
     {
       artifactVersion: string;
       databaseIds: string[];
-      durableObjectBindings: unknown[];
+      durableObjectBindings: Array<{ name: string }>;
       serviceBindings: Array<{ name: string; service: string }>;
       queueProducerBindings: Array<{ name: string; queueName: string }>;
       kvNamespaceBindings: Array<{ name: string; namespaceId: string }>;
@@ -58,7 +58,10 @@ class FakePlatformClient implements PlatformPlaneClient {
         namespace: string;
         outbound: unknown;
       }>;
+      r2BucketBindings?: Array<{ name: string }>;
+      secretNames?: string[];
       plainTextBindings: Record<string, string>;
+      providerBindingIdentities?: Array<{ type: string; name: string }>;
       workersDevEnabled: boolean;
       previewUrlsEnabled: boolean;
       routeHostnames: string[];
@@ -142,6 +145,12 @@ class FakePlatformClient implements PlatformPlaneClient {
             ]
           : [],
       ),
+      r2BucketBindings: [],
+      secretNames: [],
+      providerBindingIdentities: spec.bindings.map((binding) => ({
+        type: String(binding.type),
+        name: String(binding.name),
+      })),
       workersDevEnabled: true,
       previewUrlsEnabled: true,
       routeHostnames: [],
@@ -159,7 +168,42 @@ class FakePlatformClient implements PlatformPlaneClient {
   }
 
   async inspectControlWorker(scriptName: string) {
-    return this.inspections.get(scriptName);
+    const inspection = this.inspections.get(scriptName);
+    if (!inspection) return undefined;
+    const secretNames = inspection.secretNames ?? [];
+    return {
+      ...inspection,
+      r2BucketBindings: inspection.r2BucketBindings ?? [],
+      secretNames,
+      providerBindingIdentities: [
+        ...inspection.databaseIds.map(() => ({ type: 'd1', name: 'DB' })),
+        ...inspection.durableObjectBindings.map(({ name }) => ({
+          type: 'durable_object_namespace',
+          name,
+        })),
+        ...inspection.serviceBindings.map(({ name }) => ({
+          type: 'service',
+          name,
+        })),
+        ...inspection.queueProducerBindings.map(({ name }) => ({
+          type: 'queue',
+          name,
+        })),
+        ...inspection.kvNamespaceBindings.map(({ name }) => ({
+          type: 'kv_namespace',
+          name,
+        })),
+        ...inspection.dispatchNamespaceBindings.map(({ name }) => ({
+          type: 'dispatch_namespace',
+          name,
+        })),
+        ...Object.keys(inspection.plainTextBindings).map((name) => ({
+          type: 'plain_text',
+          name,
+        })),
+        ...secretNames.map((name) => ({ type: 'secret_text', name })),
+      ],
+    };
   }
 
   async disableControlWorkerPublicAccess(scriptName: string): Promise<void> {
@@ -181,6 +225,19 @@ class FakePlatformClient implements PlatformPlaneClient {
   ): Promise<void> {
     this.calls.push(`secrets:${scriptName}`);
     this.secretUpdates.push(secrets);
+    const inspection = this.inspections.get(scriptName);
+    if (inspection) {
+      inspection.secretNames = Object.keys(secrets).sort();
+      inspection.providerBindingIdentities = [
+        ...(inspection.providerBindingIdentities ?? []).filter(
+          ({ type }) => type !== 'secret_text',
+        ),
+        ...inspection.secretNames.map((name) => ({
+          type: 'secret_text',
+          name,
+        })),
+      ];
+    }
   }
 
   async ensureQueueConsumer(options: {

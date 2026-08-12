@@ -785,6 +785,12 @@ describe('createFlowsafeWorker maintenance duties', () => {
     expect(() =>
       makeWorker({ storageTablePrefix: 'tenant_01_' }),
     ).not.toThrow();
+    expect(() =>
+      makeWorker({ storageTablePrefix: 'p'.repeat(39) }),
+    ).not.toThrow();
+    expect(() => makeWorker({ storageTablePrefix: 'p'.repeat(40) })).toThrow(
+      'Invalid storageTablePrefix: must be at most 39 characters so prefixed Mastra table names stay within the 63-character identifier limit.',
+    );
   });
 
   it('refuses maintenance before running a duty when bindings are missing', async () => {

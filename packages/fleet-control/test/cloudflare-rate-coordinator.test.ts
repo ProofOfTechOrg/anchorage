@@ -1,13 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import type { D1Database } from '@cloudflare/workers-types';
 import { describe, expect, it, vi } from 'vitest';
 import { CloudflareProvisioningClient } from '../src/cloudflare-client.js';
 import { D1CloudflareApiRateCoordinator } from '../src/cloudflare-rate-coordinator.js';
-import type { FleetStateDatabase } from '../src/state-store.js';
 
 const WINDOW_MS = 5 * 60_000;
 
-class RateDatabase implements FleetStateDatabase {
+class RateStatement {
+  constructor(
+    readonly database: RateDatabase,
+    readonly sql: string,
+    readonly bindings: readonly unknown[] = [],
+  ) {}
+
+  bind(...bindings: readonly unknown[]): RateStatement {
+    return new RateStatement(this.database, this.sql, bindings);
+  }
+
+  async run(): Promise<unknown> {
+    return this.database.run(this);
+  }
+}
+
+class RateDatabase {
   readonly reservations = new Map<
     string,
     Array<{ reservationId: string; reservedAt: number }>
@@ -16,50 +32,56 @@ class RateDatabase implements FleetStateDatabase {
   failSchemaOnce = false;
   schemaAttempts = 0;
 
-  async query(): Promise<readonly Readonly<Record<string, unknown>>[]> {
-    return [];
+  prepare(sql: string): RateStatement {
+    return new RateStatement(this, sql);
   }
 
-  async execute(sql: string): Promise<void> {
-    if (sql.startsWith('CREATE TABLE')) {
+  async run(statement: RateStatement): Promise<unknown> {
+    if (statement.sql.startsWith('CREATE TABLE')) {
       this.schemaAttempts += 1;
       if (this.failSchemaOnce) {
         this.failSchemaOnce = false;
         throw new Error('transient schema failure');
       }
     }
+    return { success: true, results: [], meta: {} };
   }
 
   async batch(
-    statements: readonly Readonly<{
-      sql: string;
-      bindings?: readonly unknown[];
-    }>[],
-  ): Promise<readonly (readonly Readonly<Record<string, unknown>>[])[]> {
-    const scope = String(statements[0]?.bindings?.[0]);
-    const windowMs = Number(statements[0]?.bindings?.[1]);
+    statements: readonly RateStatement[],
+  ): Promise<readonly unknown[]> {
+    const scope = String(statements[0]?.bindings[0]);
+    const windowMs = Number(statements[0]?.bindings[1]);
     const current = (this.reservations.get(scope) ?? []).filter(
       ({ reservedAt }) => reservedAt > this.now - windowMs,
     );
-    const reservationId = String(statements[1]?.bindings?.[1]);
-    const intervalCap = Number(statements[1]?.bindings?.[3]);
+    const reservationId = String(statements[1]?.bindings[1]);
+    const intervalCap = Number(statements[1]?.bindings[3]);
     const inserted = current.length < intervalCap;
     if (inserted) current.push({ reservationId, reservedAt: this.now });
     this.reservations.set(scope, current);
     const earliest = current.at(0)?.reservedAt;
     return [
-      [],
-      inserted
-        ? [{ reservation_id: reservationId, reserved_at: this.now }]
-        : [],
-      [
-        {
-          retry_after_ms:
-            earliest === undefined
-              ? 1
-              : Math.max(1, earliest + windowMs - this.now),
-        },
-      ],
+      { success: true, results: [], meta: {} },
+      {
+        success: true,
+        results: inserted
+          ? [{ reservation_id: reservationId, reserved_at: this.now }]
+          : [],
+        meta: {},
+      },
+      {
+        success: true,
+        results: [
+          {
+            retry_after_ms:
+              earliest === undefined
+                ? 1
+                : Math.max(1, earliest + windowMs - this.now),
+          },
+        ],
+        meta: {},
+      },
     ];
   }
 
@@ -72,6 +94,10 @@ class RateDatabase implements FleetStateDatabase {
       })),
     );
   }
+}
+
+function directBinding(database: RateDatabase): D1Database {
+  return database as unknown as D1Database;
 }
 
 function envelope(result: unknown): Response {
@@ -112,7 +138,7 @@ describe('D1CloudflareApiRateCoordinator', () => {
   it('retries schema initialization after a transient failure on the same instance', async () => {
     const db = new RateDatabase();
     db.failSchemaOnce = true;
-    const coordinator = new D1CloudflareApiRateCoordinator(db, {
+    const coordinator = new D1CloudflareApiRateCoordinator(directBinding(db), {
       quotaScope: 'provider-principal-1',
     });
 
@@ -146,9 +172,12 @@ describe('D1CloudflareApiRateCoordinator', () => {
           accountId: 'account',
           apiToken,
           dispatchNamespace: 'fleet',
-          rateCoordinator: new D1CloudflareApiRateCoordinator(db, {
-            quotaScope: scope,
-          }),
+          rateCoordinator: new D1CloudflareApiRateCoordinator(
+            directBinding(db),
+            {
+              quotaScope: scope,
+            },
+          ),
           fetch: request,
         });
 
@@ -176,10 +205,10 @@ describe('D1CloudflareApiRateCoordinator', () => {
   it('keeps independent nonsecret quota scopes separate', async () => {
     const db = new RateDatabase();
     await Promise.all([
-      new D1CloudflareApiRateCoordinator(db, {
+      new D1CloudflareApiRateCoordinator(directBinding(db), {
         quotaScope: 'provider-principal-1',
       }).acquire(),
-      new D1CloudflareApiRateCoordinator(db, {
+      new D1CloudflareApiRateCoordinator(directBinding(db), {
         quotaScope: 'provider-principal-2',
       }).acquire(),
     ]);
@@ -191,8 +220,26 @@ describe('D1CloudflareApiRateCoordinator', () => {
     const db = new RateDatabase();
     for (const quotaScope of ['', ' leading', 'trailing ', 'line\nbreak']) {
       expect(
-        () => new D1CloudflareApiRateCoordinator(db, { quotaScope }),
+        () =>
+          new D1CloudflareApiRateCoordinator(directBinding(db), {
+            quotaScope,
+          }),
       ).toThrow(/quotaScope/u);
     }
+  });
+
+  it('rejects the fleet-state and REST database adapter shape', () => {
+    expect(
+      () =>
+        new D1CloudflareApiRateCoordinator(
+          {
+            async execute() {},
+            async batch() {
+              return [];
+            },
+          } as unknown as D1Database,
+          { quotaScope: 'provider-principal-1' },
+        ),
+    ).toThrow(/direct Workers D1 binding/u);
   });
 });

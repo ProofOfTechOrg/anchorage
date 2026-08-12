@@ -19,6 +19,7 @@ import { isSha256 } from './deployment-context.js';
 import { WorkerDeploymentError } from './deployment-error.js';
 import { maintenanceUrl, readMaintenanceHealth } from './maintenance-health.js';
 import { applyMigrationsWithLedger } from './migration-ledger.js';
+import { assertSupportedProviderBindings } from './provider-binding-inventory.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   D1Migration,
@@ -1546,6 +1547,43 @@ export class WranglerLoopBackend implements ProvisioningBackend {
         `script '${spec.scriptName}' has no valid schema version`,
       );
     }
+    const versionBindingIdentities = assertSupportedProviderBindings(
+      bindings,
+      new Set([
+        'd1',
+        'durable_object_namespace',
+        'service',
+        'queue',
+        'r2_bucket',
+        'plain_text',
+        'secret_text',
+      ]),
+      `plain Worker '${spec.scriptName}'`,
+    );
+    const secretNames = await this.#routeApi.listOrdinaryWorkerSecretNames(
+      spec.scriptName,
+    );
+    const versionSecretNames = versionBindingIdentities
+      .filter(({ type }) => type === 'secret_text')
+      .map(({ name }) => name)
+      .sort();
+    if (
+      versionSecretNames.length > 0 &&
+      JSON.stringify(versionSecretNames) !==
+        JSON.stringify([...secretNames].sort())
+    ) {
+      throw new Error(
+        `plain Worker '${spec.scriptName}' version and secret inventories disagree`,
+      );
+    }
+    const providerBindingIdentities = [
+      ...versionBindingIdentities.filter(({ type }) => type !== 'secret_text'),
+      ...secretNames.map((name) => ({ type: 'secret_text', name }) as const),
+    ].sort((left, right) =>
+      `${left.type}\u0000${left.name}`.localeCompare(
+        `${right.type}\u0000${right.name}`,
+      ),
+    );
     const maintenance = await readMaintenanceHealth(
       await this.#fetch(maintenanceUrl(spec, '/admin/maintenance-status'), {
         headers: {
@@ -1578,9 +1616,8 @@ export class WranglerLoopBackend implements ProvisioningBackend {
       queueProducerBindings,
       plainTextBindings: Object.fromEntries(plainText),
       ...(r2BucketBindings.length > 0 ? { r2BucketBindings } : {}),
-      secretNames: await this.#routeApi.listOrdinaryWorkerSecretNames(
-        spec.scriptName,
-      ),
+      secretNames,
+      providerBindingIdentities,
       artifactVersion,
       desiredSpecDigest,
       schemaVersion,

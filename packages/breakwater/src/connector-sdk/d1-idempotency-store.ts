@@ -8,6 +8,11 @@
 // platform-agnostic — no @cloudflare/workers-types import — so tests back
 // the interfaces with node:sqlite and Workers pass env.DB directly.
 
+import {
+  ATOMIC_LEGACY_IDEMPOTENCY_MIGRATION,
+  type AtomicLegacyIdempotencyMigrationRequest,
+  type AtomicLegacyIdempotencyMigrationResult,
+} from './idempotency-migration.js';
 import type {
   AtomicIdempotencyStore,
   IdempotencyInspection,
@@ -21,6 +26,20 @@ import { newToken } from './new-token.js';
 export interface IdempotencyDatabase {
   /** Prepare a SQL statement. */
   prepare(query: string): IdempotencyStatement;
+}
+
+/** Result subset returned for one statement in a D1 batch. */
+export interface IdempotencyBatchResult<T = unknown> {
+  /** Rows returned by statements with a RETURNING clause. */
+  results?: T[];
+}
+
+/** D1 subset additionally required for atomic legacy-record migration. */
+export interface IdempotencyBatchDatabase extends IdempotencyDatabase {
+  /** Execute prepared statements atomically and in order. */
+  batch<T = unknown>(
+    statements: IdempotencyStatement[],
+  ): Promise<IdempotencyBatchResult<T>[]>;
 }
 
 /** Prepared-statement subset required by {@link D1IdempotencyStore}. */
@@ -134,6 +153,27 @@ function assertSerializableResult(result: unknown): void {
   // other value must survive D1's JSON round-trip without changing type or
   // structure; otherwise a replay could differ from the first public result.
   if (result !== undefined) assertJsonNative(result);
+}
+
+function serializeRecord(record: IdempotencyRecord): string {
+  const result = record.result;
+  assertSerializableResult(result);
+  return JSON.stringify({ result });
+}
+
+function recordsMatch(
+  left: IdempotencyRecord,
+  right: IdempotencyRecord,
+): boolean {
+  return serializeRecord(left) === serializeRecord(right);
+}
+
+function isBatchDatabase(
+  database: IdempotencyDatabase,
+): database is IdempotencyBatchDatabase {
+  return (
+    typeof (database as Partial<IdempotencyBatchDatabase>).batch === 'function'
+  );
 }
 
 // The `token` column is added by both CREATE (fresh DBs) and a defensive
@@ -251,9 +291,7 @@ export class D1IdempotencyStore
     // members; accepting those would make replay differ from the first public
     // result. A rejected result leaves the reservation pending, and the
     // wrapper reports degraded replay protection without inviting a duplicate.
-    const result = record.result;
-    assertSerializableResult(result);
-    const json = JSON.stringify({ result });
+    const json = serializeRecord(record);
     const nowIso = new Date(this.#now()).toISOString();
     if (token !== undefined) {
       // Owner-scoped finalize (audit D2 CAS): flip to 'done' ONLY if this
@@ -312,6 +350,140 @@ export class D1IdempotencyStore
       .bind(key)
       .first<IdempotencyRow>();
     return row ? parseRecord(row.result) : undefined;
+  }
+
+  /** @internal Connector-bound migration capability. */
+  async [ATOMIC_LEGACY_IDEMPOTENCY_MIGRATION](
+    request: AtomicLegacyIdempotencyMigrationRequest,
+  ): Promise<AtomicLegacyIdempotencyMigrationResult> {
+    await this.#ready();
+    if (!isBatchDatabase(this.#db)) {
+      throw new TypeError(
+        'D1IdempotencyStore legacy migration requires D1-compatible transactional batch() support',
+      );
+    }
+    const expectedRecord = { result: request.expectedRecord.result };
+    const targetRecord = { result: request.targetRecord.result };
+    const targetJson = serializeRecord(targetRecord);
+    const source = await this.#row(request.sourceKey);
+    const target = await this.#row(request.targetKey);
+
+    if (!source) {
+      if (!target) return { state: 'source-absent' };
+      if (
+        target.state === 'done' &&
+        recordsMatch(parseRecord(target.result), targetRecord)
+      ) {
+        return { state: 'already-migrated', record: targetRecord };
+      }
+      return { state: 'target-conflict', target: this.#inspection(target) };
+    }
+    if (source.state !== 'done') return { state: 'source-pending' };
+    const sourceRecord = parseRecord(source.result);
+    if (!recordsMatch(sourceRecord, expectedRecord)) {
+      return { state: 'source-mismatch', record: sourceRecord };
+    }
+    if (
+      target &&
+      (target.state !== 'done' ||
+        !recordsMatch(parseRecord(target.result), targetRecord))
+    ) {
+      return { state: 'target-conflict', target: this.#inspection(target) };
+    }
+
+    const nowIso = new Date(this.#now()).toISOString();
+    const targetGuardJson = target ? target.result : targetJson;
+    const [, deleted] = await this.#db.batch<{ key: string }>([
+      this.#db
+        .prepare(
+          `INSERT INTO ${this.#table} (key, state, result, token, created_at, updated_at)
+           SELECT ?, 'done', ?, NULL, created_at, ?
+           FROM ${this.#table}
+           WHERE key = ? AND state = 'done' AND result IS ?
+           ON CONFLICT(key) DO NOTHING
+           RETURNING key`,
+        )
+        .bind(
+          request.targetKey,
+          targetJson,
+          nowIso,
+          request.sourceKey,
+          source.result,
+        ),
+      this.#db
+        .prepare(
+          `DELETE FROM ${this.#table}
+           WHERE key = ? AND state = 'done' AND result IS ?
+             AND EXISTS (
+               SELECT 1 FROM ${this.#table}
+               WHERE key = ? AND state = 'done' AND result IS ?
+             )
+           RETURNING key`,
+        )
+        .bind(
+          request.sourceKey,
+          source.result,
+          request.targetKey,
+          targetGuardJson,
+        ),
+    ]);
+    if (deleted?.results?.[0]) {
+      return { state: 'migrated', record: targetRecord };
+    }
+
+    const [currentSource, currentTarget] = await Promise.all([
+      this.#row(request.sourceKey),
+      this.#row(request.targetKey),
+    ]);
+    if (!currentSource) {
+      if (
+        currentTarget?.state === 'done' &&
+        recordsMatch(parseRecord(currentTarget.result), targetRecord)
+      ) {
+        return { state: 'already-migrated', record: targetRecord };
+      }
+      return currentTarget
+        ? {
+            state: 'target-conflict',
+            target: this.#inspection(currentTarget),
+          }
+        : { state: 'source-absent' };
+    }
+    if (currentSource.state !== 'done') return { state: 'source-pending' };
+    const currentSourceRecord = parseRecord(currentSource.result);
+    if (!recordsMatch(currentSourceRecord, expectedRecord)) {
+      return { state: 'source-mismatch', record: currentSourceRecord };
+    }
+    if (currentTarget) {
+      if (
+        currentTarget.state === 'done' &&
+        recordsMatch(parseRecord(currentTarget.result), targetRecord)
+      ) {
+        throw new Error(
+          'D1IdempotencyStore: legacy migration left both source and target records present',
+        );
+      }
+      return {
+        state: 'target-conflict',
+        target: this.#inspection(currentTarget),
+      };
+    }
+    throw new Error(
+      'D1IdempotencyStore: legacy migration made no progress despite matching source and target guards',
+    );
+  }
+
+  async #row(key: string): Promise<IdempotencyRow | null> {
+    return this.#db
+      .prepare(`SELECT * FROM ${this.#table} WHERE key = ?`)
+      .bind(key)
+      .first<IdempotencyRow>();
+  }
+
+  #inspection(row: IdempotencyRow): IdempotencyInspection {
+    return row.state === 'done'
+      ? { state: 'replay', record: parseRecord(row.result) }
+      : { state: 'pending' };
   }
 
   // Lazy, memoized schema creation; a failed attempt clears the memo so the

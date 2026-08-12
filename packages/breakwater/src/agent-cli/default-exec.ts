@@ -79,10 +79,18 @@ export interface TimerRuntime {
 export interface DefaultExecRuntime {
   readonly childProcess: ChildProcessModule;
   readonly platform: string;
+  readonly taskkillPath?: string;
   readonly kill: (pid: number, signal: string | number) => unknown;
   readonly delay: (delayMs: number) => Promise<void>;
   readonly timers: TimerRuntime;
   readonly codecs: TextCodecLookups;
+}
+
+interface WindowsPathModule {
+  readonly win32: {
+    isAbsolute(path: string): boolean;
+    join(...paths: string[]): string;
+  };
 }
 
 interface ProcessTreeFailureOptions {
@@ -137,11 +145,44 @@ function globalTextEncoder(): TextEncoderLike {
   }
 }
 
+export function resolveWindowsTaskkillPath(
+  platform: string,
+  environment: Record<string, string | undefined> | undefined,
+  pathModule: WindowsPathModule | undefined,
+): string | undefined {
+  if (platform !== 'win32') return undefined;
+  const systemRoot = [environment?.SystemRoot, environment?.WINDIR].find(
+    (candidate): candidate is string =>
+      isDriveAbsoluteWindowsPath(candidate) &&
+      pathModule?.win32.isAbsolute(candidate) === true,
+  );
+  if (!systemRoot || !pathModule) {
+    throw new DefaultExecFailure({ code: 'runtime-unavailable' });
+  }
+  const taskkillPath = pathModule.win32.join(
+    systemRoot,
+    'System32',
+    'taskkill.exe',
+  );
+  if (
+    !isDriveAbsoluteWindowsPath(taskkillPath) ||
+    !pathModule.win32.isAbsolute(taskkillPath)
+  ) {
+    throw new DefaultExecFailure({ code: 'runtime-unavailable' });
+  }
+  return taskkillPath;
+}
+
+function isDriveAbsoluteWindowsPath(path: string | undefined): path is string {
+  return typeof path === 'string' && /^[A-Za-z]:[\\/]/.test(path);
+}
+
 function defaultRuntime(): DefaultExecRuntime {
   const proc = (
     globalThis as {
       process?: {
         platform?: unknown;
+        env?: Record<string, string | undefined>;
         getBuiltinModule?: (id: string) => unknown;
         kill?: (pid: number, signal: string | number) => unknown;
       };
@@ -158,9 +199,18 @@ function defaultRuntime(): DefaultExecRuntime {
   ) {
     throw new DefaultExecFailure({ code: 'runtime-unavailable' });
   }
+  const pathModule = proc.getBuiltinModule?.('node:path') as
+    | WindowsPathModule
+    | undefined;
+  const taskkillPath = resolveWindowsTaskkillPath(
+    proc.platform,
+    proc.env,
+    pathModule,
+  );
   return {
     childProcess,
     platform: proc.platform,
+    taskkillPath,
     kill: proc.kill.bind(proc),
     delay: (delayMs) =>
       new Promise((resolve) => {
@@ -235,7 +285,7 @@ function waitForTaskkill(
     let taskkill: SpawnedProcess;
     try {
       taskkill = runtime.childProcess.spawn(
-        'taskkill.exe',
+        runtime.taskkillPath as string,
         ['/pid', String(pid), '/T', '/F'],
         {
           stdio: 'ignore',
@@ -317,6 +367,12 @@ export function createDefaultExec(
     let runtime: DefaultExecRuntime;
     try {
       runtime = injectedRuntime ?? defaultRuntime();
+      if (
+        runtime.platform === 'win32' &&
+        !isDriveAbsoluteWindowsPath(runtime.taskkillPath)
+      ) {
+        throw new DefaultExecFailure({ code: 'runtime-unavailable' });
+      }
     } catch (error) {
       return Promise.reject(error);
     }

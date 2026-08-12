@@ -306,6 +306,8 @@ records; pending reservations are not evicted.
 import {
   D1IdempotencyStore,
   D1RateLimitStore,
+  inspectLegacyConnectorIdempotency,
+  migrateLegacyConnectorIdempotency,
 } from '@proofoftech/breakwater/connector-sdk';
 
 const idempotencyStore = new D1IdempotencyStore(env.DB, {
@@ -360,6 +362,32 @@ ambiguous row to exactly one business identity using external evidence. Leave
 an unproven row in place: affected calls continue to fail closed. Without the
 acknowledgement, an absent legacy key cannot execute because an old writer
 could still create it after inspection.
+
+For the shipped D1 store, inventory and migrate through the connector-bound
+helpers instead of constructing storage keys or writing ad hoc SQL:
+
+```typescript
+const identity = {
+  idempotencyKey: 'invoice:2026-08-12',
+  isolationScope: 'acme',
+};
+const inventory = await inspectLegacyConnectorIdempotency(connector, identity);
+
+if (inventory.state === 'replay') {
+  const migrated = await migrateLegacyConnectorIdempotency(connector, {
+    ...identity,
+    expectedRecord: inventory.record,
+  });
+}
+```
+
+The operator must first prove from business or audit evidence that exactly this
+tuple owns the ambiguous row. `expectedRecord` binds the write to the inventoried
+value but cannot prove ownership. The helper validates and transforms the legacy
+result through the connector's output schema, guards the exact source value,
+writes the validated value under v2, and deletes v1 in one D1 transaction. A
+pending, changed, unproven, invalid, or conflicting row remains in place.
+Repeating a completed migration returns `already-migrated`.
 
 Breakwater stores only `{ result }`. It does not compare a retried request body
 with the original input. A gateway that promises mismatch detection must own a
@@ -528,16 +556,21 @@ The default runner:
 - inherits the parent process environment and CLI authentication;
 - runs in the caller-supplied `cwd`;
 - terminates the process tree after `timeoutMs`, default 600,000, using a
-  dedicated POSIX process group or direct `taskkill.exe /T /F` argv on Windows;
+  dedicated POSIX process group or absolute
+  `taskkill.exe /T /F` argv from a drive-absolute local `%SystemRoot%` or
+  `%WINDIR%` on Windows;
 - retains the UTF-8 tail of stdout and stderr, default 1 MiB per stream;
 - supports `maxOutputBytes: 0` for exit-code-only use.
 
 `timeoutMs` must be an integer from 1 through 2,147,483,647.
 
-The timeout result is not returned until Windows taskkill completes or the
-POSIX group is confirmed absent. POSIX waits up to five seconds; `ESRCH` means
-the group is gone. Permission failures, unavailable process IDs, a group that
-remains present after that bounded wait, and Windows taskkill spawn or
+The Windows helper path is resolved before the CLI starts. A missing, relative,
+root-relative, UNC, or device system root fails with `runtime-unavailable`, so a
+writable current directory, network share, device path, or `PATH` cannot replace
+taskkill. The timeout result is not returned until Windows taskkill completes or
+the POSIX group is confirmed absent. POSIX waits up to five seconds; `ESRCH`
+means the group is gone. Permission failures, unavailable process IDs, a group
+that remains present after that bounded wait, and Windows taskkill spawn or
 nonzero-exit failures surface as the stable `termination-failed` category with
 only sanitized system code, numeric exit code, and `process-group` or
 `taskkill` method metadata. No termination path invokes a shell. A process that
