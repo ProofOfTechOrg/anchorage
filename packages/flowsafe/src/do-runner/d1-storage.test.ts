@@ -16,12 +16,19 @@ import {
   type ResourceOwnershipDatabase,
 } from '../approval-api/resource-ownership.js';
 import {
+  createBackgroundTaskD1Domains,
+  DurableObjectBackgroundTasksStorageD1,
+  DurableObjectWorkflowsStorageD1,
+} from '../background-tasks/d1-storage.js';
+import {
   D1SchedulesStorage,
   type ScheduleDatabase,
 } from '../schedules/schedules-d1.js';
+import { createScheduleStorageDomains } from '../schedules/storage.js';
 import { scheduleWithCreatorRole } from '../schedules/target-policy.js';
 import type { SignalDatabase } from '../signals/d1-shared.js';
 import { D1NotificationsStorage } from '../signals/notifications-d1.js';
+import { createSignalStorageDomains } from '../signals/storage.js';
 import { D1ThreadStateStorage } from '../signals/thread-state-d1.js';
 import type { D1DatabaseBinding } from './cf-types.js';
 import {
@@ -132,6 +139,69 @@ const LIVE = ['running', 'suspended', 'waiting', 'pending', 'paused'];
 const MAX_TABLE_PREFIX = 'p'.repeat(39);
 const OVERLONG_TABLE_PREFIX = 'p'.repeat(40);
 
+interface PublicStoragePrefixCase {
+  name: string;
+  construct: (binding: D1DatabaseBinding, tablePrefix: string) => unknown;
+}
+
+const PUBLIC_STORAGE_PREFIX_CASES = [
+  {
+    name: 'D1NotificationsStorage',
+    construct: (binding, tablePrefix) =>
+      new D1NotificationsStorage(
+        binding as unknown as SignalDatabase,
+        tablePrefix,
+      ),
+  },
+  {
+    name: 'D1ThreadStateStorage',
+    construct: (binding, tablePrefix) =>
+      new D1ThreadStateStorage(
+        binding as unknown as SignalDatabase,
+        tablePrefix,
+      ),
+  },
+  {
+    name: 'createSignalStorageDomains',
+    construct: (binding, tablePrefix) =>
+      createSignalStorageDomains(binding, tablePrefix),
+  },
+  {
+    name: 'D1SchedulesStorage',
+    construct: (binding, tablePrefix) =>
+      new D1SchedulesStorage(
+        binding as unknown as ScheduleDatabase,
+        tablePrefix,
+      ),
+  },
+  {
+    name: 'createScheduleStorageDomains',
+    construct: (binding, tablePrefix) =>
+      createScheduleStorageDomains(binding, tablePrefix),
+  },
+  {
+    name: 'createBackgroundTaskD1Domains',
+    construct: (binding, tablePrefix) =>
+      createBackgroundTaskD1Domains({ binding, tablePrefix }),
+  },
+  {
+    name: 'DurableObjectWorkflowsStorageD1',
+    construct: (binding, tablePrefix) =>
+      new DurableObjectWorkflowsStorageD1({
+        binding: binding as never,
+        tablePrefix,
+      }),
+  },
+  {
+    name: 'DurableObjectBackgroundTasksStorageD1',
+    construct: (binding, tablePrefix) =>
+      new DurableObjectBackgroundTasksStorageD1(
+        { binding: binding as never, tablePrefix },
+        new DurableObjectWorkflowsStorageD1({ binding: binding as never }),
+      ),
+  },
+] satisfies PublicStoragePrefixCase[];
+
 interface PublicPurgeCase {
   name: string;
   run: (
@@ -213,6 +283,22 @@ describe('createD1Storage table prefix', () => {
     ).toThrow(
       'Invalid tablePrefix: must be at most 39 characters so prefixed Mastra table names stay within the 63-character identifier limit.',
     );
+  });
+});
+
+describe.each(PUBLIC_STORAGE_PREFIX_CASES)('$name table prefix', ({
+  construct,
+}) => {
+  it('enforces the shared identifier contract at construction', () => {
+    const binding = sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding;
+
+    expect(() => construct(binding, 'tenant-prod_')).toThrow(
+      /Invalid tablePrefix: use an empty prefix or start with a letter or underscore/,
+    );
+    expect(() => construct(binding, OVERLONG_TABLE_PREFIX)).toThrow(
+      /Invalid tablePrefix: must be at most 39 characters/,
+    );
+    expect(() => construct(binding, MAX_TABLE_PREFIX)).not.toThrow();
   });
 });
 
