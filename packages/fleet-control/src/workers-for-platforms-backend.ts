@@ -852,6 +852,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
             ? [{ name: 'AUDIT_QUEUE', queueName: auditQueueName }]
             : [],
         ) ||
+      (live.r2BucketBindings ?? []).length !== 0 ||
       JSON.stringify([...live.secretNames].sort()) !==
         JSON.stringify(
           [

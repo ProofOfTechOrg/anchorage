@@ -45,8 +45,11 @@ interface PlatformWorkerInspection {
     namespace: string;
     outbound: unknown;
   }>[];
-  readonly r2BucketBindings?: readonly Readonly<{ name: string }>[];
-  readonly secretNames?: readonly string[];
+  readonly r2BucketBindings: readonly Readonly<{
+    name: string;
+    bucketName?: string;
+  }>[];
+  readonly secretNames: readonly string[];
   readonly plainTextBindings: Readonly<Record<string, string>>;
   readonly providerBindingIdentities: readonly ProviderBindingIdentity[];
   readonly workersDevEnabled: boolean;
@@ -262,6 +265,8 @@ function isExactPrivateBootstrap(
     inspection.queueProducerBindings.length === 0 &&
     inspection.kvNamespaceBindings.length === 0 &&
     inspection.dispatchNamespaceBindings.length === 0 &&
+    inspection.r2BucketBindings.length === 0 &&
+    inspection.secretNames.length === 0 &&
     canonicalPlainTextBindings(inspection.plainTextBindings) ===
       canonicalPlainTextBindings(expectedPlainText)
   );
@@ -404,6 +409,7 @@ function assertWorkerAttestation(options: {
   readonly artifactDigest: string;
   readonly bindings: readonly Readonly<Record<string, unknown>>[];
   readonly inspection: PlatformWorkerInspection | undefined;
+  readonly expectedSecretNames?: readonly string[];
   readonly platformPlaneIdentity: string;
   readonly privateWorker: boolean;
   readonly role: PlatformWorkerRole;
@@ -476,6 +482,19 @@ function assertWorkerAttestation(options: {
         ]
       : [],
   );
+  const expectedR2Bindings = expectedBindings.flatMap((binding) =>
+    binding.type === 'r2_bucket'
+      ? [
+          {
+            name: String(binding.name),
+            bucketName: String(binding.bucket_name),
+          },
+        ]
+      : [],
+  );
+  const actualR2Bindings = options.inspection.r2BucketBindings.map(
+    ({ name, bucketName }) => ({ name, bucketName: bucketName ?? '' }),
+  );
   if (
     options.inspection.databaseIds.length !== 0 ||
     options.inspection.durableObjectBindings.length !== 0 ||
@@ -488,7 +507,12 @@ function assertWorkerAttestation(options: {
     canonicalBindingSet(options.inspection.kvNamespaceBindings) !==
       canonicalBindingSet(expectedKvBindings) ||
     canonicalBindingSet(options.inspection.dispatchNamespaceBindings) !==
-      canonicalBindingSet(expectedDispatchBindings)
+      canonicalBindingSet(expectedDispatchBindings) ||
+    canonicalBindingSet(actualR2Bindings) !==
+      canonicalBindingSet(expectedR2Bindings) ||
+    (options.expectedSecretNames !== undefined &&
+      JSON.stringify([...options.inspection.secretNames].sort()) !==
+        JSON.stringify([...options.expectedSecretNames].sort()))
   ) {
     throw new Error(
       `control Worker '${options.scriptName}' has drifted role bindings`,
@@ -716,6 +740,7 @@ export async function provisionPlatformPlane(options: {
             privateWorker: false,
             role: 'shared-dispatch' as const,
             scriptName: spec.dispatchWorker.scriptName,
+            expectedSecretNames: [],
           },
           {
             artifactDigest: outboundArtifactDigest,
@@ -724,6 +749,7 @@ export async function provisionPlatformPlane(options: {
             privateWorker: true,
             role: 'shared-outbound' as const,
             scriptName: spec.outboundWorker.scriptName,
+            expectedSecretNames: [],
           },
           {
             artifactDigest: auditArtifactDigest,
@@ -732,6 +758,9 @@ export async function provisionPlatformPlane(options: {
             privateWorker: true,
             role: 'shared-audit' as const,
             scriptName: spec.auditWorker.scriptName,
+            expectedSecretNames: spec.siemAuthHeader
+              ? ['SIEM_AUTH_HEADER']
+              : [],
           },
         ];
         for (const attestation of finalAttestations) {

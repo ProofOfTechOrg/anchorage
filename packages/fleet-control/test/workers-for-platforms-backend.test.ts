@@ -1070,6 +1070,46 @@ describe('WorkersForPlatformsBackend', () => {
     expect(client.controlWorkers.size).toBe(0);
   });
 
+  it('rejects an R2 binding on a namespaced state Worker', async () => {
+    const client = new FakeApi();
+    const backend = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routing',
+      platformProfileFor: () => platformProfile(),
+    });
+    const database = {
+      id: 'db-acme',
+      name: deployment.databaseName,
+      created: true as const,
+    };
+    const initial = await backend.ensurePlatformResources(
+      deployment,
+      database,
+      secrets,
+      undefined,
+      platformConvergenceRecord(backend, deployment, database),
+      fence,
+    );
+    const stateName = initial.resources.stateWorker.scriptName;
+    const stateWorker = client.dispatchWorkers.get(stateName);
+    if (!stateWorker) throw new Error('state Worker was not created');
+    client.dispatchWorkers.set(stateName, {
+      ...stateWorker,
+      r2BucketBindings: [
+        {
+          name: 'FOREIGN_BUCKET',
+          bucketName: 'foreign-bucket',
+          jurisdiction: 'default',
+        },
+      ],
+    });
+
+    await expect(
+      backend.inspectPlatformResources(deployment, database),
+    ).rejects.toThrow(/drifted exact bindings/u);
+  });
+
   it('persists the backend-owned audit queue in the platform target and state snapshot', async () => {
     const client = new FakeApi();
     const audited = {

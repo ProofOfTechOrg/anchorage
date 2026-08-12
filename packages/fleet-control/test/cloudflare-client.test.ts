@@ -997,6 +997,9 @@ describe('CloudflareProvisioningClient', () => {
           },
         ]);
       }
+      if (path.endsWith('/workers/scripts/fleet-plain/secrets')) {
+        return envelope([]);
+      }
       if (path.endsWith('/zones/zone/workers/routes')) {
         return envelope([
           {
@@ -1195,6 +1198,9 @@ describe('CloudflareProvisioningClient', () => {
       if (zoneAuthority) return zoneAuthority;
       if (url.searchParams.has('page')) return envelope([]);
       if (path.endsWith('/workers/domains')) return envelope([]);
+      if (path.endsWith('/workers/scripts/plain-acme/secrets')) {
+        return envelope([]);
+      }
       if (path.endsWith('/workers/scripts')) {
         return envelope([{ id: 'plain-acme', etag: 'content-etag' }]);
       }
@@ -1833,6 +1839,7 @@ describe('CloudflareProvisioningClient', () => {
     let customDomainAttached = true;
     let zoneRouteAttached = true;
     let extraBindings: readonly Readonly<Record<string, unknown>>[] = [];
+    let controlSecretNames: readonly string[] = [];
     const request = vi.fn(
       async (input: string | URL | Request, init?: RequestInit) => {
         const url = new URL(
@@ -1886,6 +1893,9 @@ describe('CloudflareProvisioningClient', () => {
               ],
             },
           });
+        }
+        if (url.pathname.endsWith('/workers/scripts/fleet-state/secrets')) {
+          return envelope(controlSecretNames.map((name) => ({ name })));
         }
         if (url.pathname.endsWith('/workers/scripts/fleet-state/subdomain')) {
           if (method === 'POST') {
@@ -2015,6 +2025,11 @@ describe('CloudflareProvisioningClient', () => {
       routeHostnames: [],
       zoneRoutes: [],
     });
+    controlSecretNames = ['OUT_OF_BAND_SECRET'];
+    await expect(client.inspectControlWorker('fleet-state')).rejects.toThrow(
+      /unsupported or malformed provider binding/u,
+    );
+    controlSecretNames = [];
     extraBindings = [
       { type: 'hyperdrive', name: 'FUTURE_BINDING', id: 'config-id' },
     ];

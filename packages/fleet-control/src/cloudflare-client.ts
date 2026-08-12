@@ -930,26 +930,28 @@ export class CloudflareProvisioningClient {
   async listOrdinaryWorkerSecretNames(
     scriptName: string,
   ): Promise<readonly string[]> {
-    return this.#schedule(async () => {
-      const names: string[] = [];
-      try {
-        for await (const secret of this.#client.workers.scripts.secrets.list(
-          scriptName,
-          { account_id: this.#accountId },
-        )) {
-          if (!secret.name) {
-            throw new Error(
-              `ordinary Worker '${scriptName}' returned a secret without a name`,
-            );
-          }
-          names.push(secret.name);
+    return this.#schedule(() => this.#ordinaryWorkerSecretNames(scriptName));
+  }
+
+  async #ordinaryWorkerSecretNames(scriptName: string): Promise<string[]> {
+    const names: string[] = [];
+    try {
+      for await (const secret of this.#client.workers.scripts.secrets.list(
+        scriptName,
+        { account_id: this.#accountId },
+      )) {
+        if (!secret.name) {
+          throw new Error(
+            `ordinary Worker '${scriptName}' returned a secret without a name`,
+          );
         }
-      } catch (error) {
-        if (isNotFound(error)) return [];
-        throw error;
+        names.push(secret.name);
       }
-      return names.sort();
-    });
+    } catch (error) {
+      if (isNotFound(error)) return [];
+      throw error;
+    }
+    return names.sort();
   }
 
   async #dispatchScripts(
@@ -1700,7 +1702,7 @@ export class CloudflareProvisioningClient {
           activeDeployment,
           `ordinary Worker '${scriptName}'`,
         );
-        const [activeVersion, subdomain] = await Promise.all([
+        const [activeVersion, subdomain, secretNames] = await Promise.all([
           this.#client.workers.scripts.versions.get(artifactVersion, {
             account_id: this.#accountId,
             script_name: scriptName,
@@ -1708,6 +1710,7 @@ export class CloudflareProvisioningClient {
           this.#client.workers.scripts.subdomain.get(scriptName, {
             account_id: this.#accountId,
           }),
+          this.#ordinaryWorkerSecretNames(scriptName),
         ]);
         const bindings = activeVersion.resources.bindings ?? [];
         const databaseIds = bindings.flatMap((binding) =>
@@ -1781,13 +1784,6 @@ export class CloudflareProvisioningClient {
               : [],
           ),
         );
-        const secretNames = bindings
-          .flatMap((binding) =>
-            binding.type === 'secret_text' && binding.name
-              ? [binding.name]
-              : [],
-          )
-          .sort();
         assertSupportedProviderBindings(
           bindings,
           new Set([
@@ -2151,7 +2147,7 @@ export class CloudflareProvisioningClient {
           activeDeployment,
           `control Worker '${scriptName}'`,
         );
-        const [activeVersion, subdomain] = await Promise.all([
+        const [activeVersion, subdomain, secretNames] = await Promise.all([
           this.#client.workers.scripts.versions.get(artifactVersion, {
             account_id: this.#accountId,
             script_name: scriptName,
@@ -2159,6 +2155,7 @@ export class CloudflareProvisioningClient {
           this.#client.workers.scripts.subdomain.get(scriptName, {
             account_id: this.#accountId,
           }),
+          this.#ordinaryWorkerSecretNames(scriptName),
         ]);
         const bindings = activeVersion.resources.bindings ?? [];
         const databaseIds = bindings.flatMap((binding) =>
@@ -2248,13 +2245,6 @@ export class CloudflareProvisioningClient {
               : [],
           ),
         );
-        const secretNames = bindings
-          .flatMap((binding) =>
-            binding.type === 'secret_text' && binding.name
-              ? [binding.name]
-              : [],
-          )
-          .sort();
         const providerBindingIdentities = assertSupportedProviderBindings(
           bindings,
           new Set([

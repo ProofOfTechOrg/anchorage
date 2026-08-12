@@ -74,7 +74,9 @@ function wait(delayMs: number, signal?: AbortSignal): Promise<void> {
 
 /**
  * Coordinates Anchorage-originated Cloudflare API traffic across every replica
- * sharing a fleet-state D1 database and quota scope.
+ * sharing a D1 database and quota scope. The trusted host must pass a direct
+ * Workers D1 binding; JavaScript cannot distinguish one from a structurally
+ * compatible remote adapter at runtime.
  */
 export class D1CloudflareApiRateCoordinator
   implements CloudflareApiRateCoordinator
@@ -90,7 +92,7 @@ export class D1CloudflareApiRateCoordinator
       typeof db.batch !== 'function'
     ) {
       throw new Error(
-        'D1CloudflareApiRateCoordinator requires a direct Workers D1 binding',
+        'D1CloudflareApiRateCoordinator requires the Workers D1Database prepare/batch interface',
       );
     }
     this.#db = db;

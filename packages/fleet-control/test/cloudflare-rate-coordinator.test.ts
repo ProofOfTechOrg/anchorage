@@ -228,7 +228,7 @@ describe('D1CloudflareApiRateCoordinator', () => {
     }
   });
 
-  it('rejects the fleet-state and REST database adapter shape', () => {
+  it('rejects a database adapter without the Workers prepare interface', () => {
     expect(
       () =>
         new D1CloudflareApiRateCoordinator(
@@ -240,6 +240,6 @@ describe('D1CloudflareApiRateCoordinator', () => {
           } as unknown as D1Database,
           { quotaScope: 'provider-principal-1' },
         ),
-    ).toThrow(/direct Workers D1 binding/u);
+    ).toThrow(/Workers D1Database prepare\/batch interface/u);
   });
 });
