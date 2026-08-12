@@ -1,5 +1,12 @@
 # anchorage-fleet-control
 
+## 0.0.3
+
+### Patch Changes
+
+- Updated dependencies [4f0fc9d]
+  - @proofoftech/flowsafe@0.13.0
+
 ## 0.0.2
 
 ### Patch Changes
