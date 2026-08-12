@@ -295,15 +295,21 @@ assert.ok(new WorkersForPlatformsBackend(complete));
 `,
   );
 
-  // --offline keeps resolution inside the pnpm store, matching the sibling
-  // gates. Without it this step fetches newest-matching third-party code from
-  // the registry on every CI run with the workspace's 7-day supply-chain age
-  // gate explicitly disabled, and its result depends on registry availability.
+  // --prefer-offline, NOT --offline. The sibling gates can use --offline
+  // because every dependency of their consumer is a local link: or file:
+  // path, so nothing needs registry metadata. This tarball carries two real
+  // registry dependencies, and CI's pnpm cache restores the store without the
+  // metadata mirror, so --offline fails there with ERR_PNPM_NO_OFFLINE_META
+  // while passing on a developer machine whose mirror is warm.
+  //
+  // Resolution is still pinned: cloudflare and p-queue come from the packed
+  // manifest as exact versions and flowsafe is overridden to the workspace
+  // tree, so nothing floats. The age-gate flag matches the sibling gates.
   run(
     'pnpm',
     [
       'install',
-      '--offline',
+      '--prefer-offline',
       '--ignore-scripts',
       '--config.minimum-release-age=0',
     ],
