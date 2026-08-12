@@ -5,10 +5,22 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
+// Ordered because `changeset publish` fans out with Promise.all: it has no
+// topological ordering and no wait. Breakwater is Flowsafe's peer dependency,
+// which npm never resolves at install, so that edge is only a consumer-facing
+// warning. Flowsafe is different: fleet-control packs an EXACT
+// `@proofoftech/flowsafe` version out of `workspace:*`, a hard dependency npm
+// does resolve. If the two published concurrently and Flowsafe's half failed,
+// fleet-control would sit on the registry permanently depending on a version
+// that does not exist, and npm forbids republishing a version.
 export const PUBLISH_PREREQUISITES = Object.freeze([
   {
     name: '@proofoftech/breakwater',
     directory: 'packages/breakwater',
+  },
+  {
+    name: '@proofoftech/flowsafe',
+    directory: 'packages/flowsafe',
   },
 ]);
 
@@ -111,8 +123,8 @@ async function waitUntilPublished(name, version) {
  * The line `changesets/action` greps out of this command's stdout to decide
  * which tags to push and which GitHub releases to create.
  *
- * This is a string contract, not a log message. Breakwater publishes OUTSIDE
- * `changeset publish`, so nothing else announces its tag — if this format ever
+ * This is a string contract, not a log message. Every prerequisite publishes
+ * OUTSIDE `changeset publish`, so nothing else announces those tags — if this format ever
  * drifts from the action's regex, npm publish still succeeds, the tag never
  * reaches origin, no release is created, and the run exits 0. Silent, unlike
  * every other failure in this file. `publish-ordered.test.mjs` pins it against

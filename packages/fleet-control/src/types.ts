@@ -56,6 +56,20 @@ export interface D1Migration {
 
 export type R2Jurisdiction = 'default' | 'eu' | 'fedramp';
 
+/**
+ * One Worker's identity plus its D1 and routing claims, as the authoritative
+ * bidirectional inventory compares them. Declared here rather than beside
+ * either user, because the provider API interface and the client that
+ * implements it both need it and neither should depend on the other.
+ */
+export interface ScriptInventoryTarget {
+  readonly scriptName: string;
+  readonly tenantTag: string;
+  readonly environment: string;
+  readonly databaseId: string;
+  readonly routeHostname: string;
+}
+
 export interface DeploymentApplicationBindings {
   readonly vars: readonly Readonly<{ name: string; value: string }>[];
   readonly secrets: readonly Readonly<{

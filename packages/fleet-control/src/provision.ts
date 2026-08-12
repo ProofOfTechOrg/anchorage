@@ -549,7 +549,7 @@ export function assertImmutableDeploymentMapping(
   }
 }
 
-interface ProvisionDeploymentOptions {
+export interface ProvisionDeploymentOptions {
   readonly backend: ProvisioningBackend;
   readonly store: FleetStateStore;
   readonly spec: DeploymentSpec;
@@ -1320,7 +1320,7 @@ async function provisionDeploymentUnderLease(
   }
 }
 
-interface CleanupDeploymentArtifactsOptions {
+export interface CleanupDeploymentArtifactsOptions {
   readonly backend: ProvisioningBackend;
   readonly store: FleetStateStore;
   readonly spec: DeploymentSpec;
@@ -1559,7 +1559,7 @@ async function cleanupDeploymentArtifactsUnderLease(
   await lease.delete();
 }
 
-interface DecommissionDeploymentOptions {
+export interface DecommissionDeploymentOptions {
   readonly backend: ProvisioningBackend;
   readonly store: FleetStateStore;
   readonly spec: DeploymentSpec;

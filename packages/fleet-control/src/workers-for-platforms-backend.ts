@@ -57,6 +57,7 @@ import type {
   PromotionGuard,
   ProviderBindingIdentity,
   ProvisioningBackend,
+  ScriptInventoryTarget,
 } from './types.js';
 
 const RELEASE_DIGEST_LENGTH = 48;
@@ -106,14 +107,6 @@ function localBindingKeys(
   return JSON.stringify(
     bindings.map((binding) => `${binding.name}:${binding.className}`).sort(),
   );
-}
-
-interface ScriptInventoryTarget {
-  readonly scriptName: string;
-  readonly tenantTag: string;
-  readonly environment: string;
-  readonly databaseId: string;
-  readonly routeHostname: string;
 }
 
 export interface WorkersForPlatformsApi {

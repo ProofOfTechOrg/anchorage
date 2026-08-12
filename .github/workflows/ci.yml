@@ -68,6 +68,14 @@ jobs:
       - name: Verify packed breakwater surface
         run: pnpm test:packed-breakwater
 
+      # Three of fleet-control's four export entries are Workers entry points
+      # that no in-repo consumer reaches through the package boundary, so Build
+      # proves nothing about its export map. Pack and consume the tarball, and
+      # assert the trusted-configuration constructor still fails closed in the
+      # published artifact.
+      - name: Verify packed fleet-control surface
+        run: pnpm test:packed-fleet-control
+
       # The guarded host is subpath-only and carries an optional Breakwater
       # peer. Compile and import the packed tarball so the export, declarations,
       # peer floor, and runtime graph are checked as a consumer sees them.

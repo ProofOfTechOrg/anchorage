@@ -1,0 +1,19 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": [
+    "src/index.ts",
+    "src/workers/dispatch.ts",
+    "src/workers/outbound.ts",
+    "src/workers/audit-consumer.ts"
+  ],
+  "entryPointStrategy": "resolve",
+  "tsconfig": "tsconfig.json",
+  "name": "@proofoftech/fleet-control",
+  "excludeExternals": true,
+  "excludeInternal": true,
+  "validation": {
+    "notExported": true,
+    "invalidLink": true,
+    "invalidPath": true
+  }
+}

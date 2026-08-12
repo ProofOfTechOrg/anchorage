@@ -14,6 +14,7 @@ Package-specific navigation:
 
 - [`packages/breakwater/CLAUDE.md`](packages/breakwater/CLAUDE.md)
 - [`packages/flowsafe/CLAUDE.md`](packages/flowsafe/CLAUDE.md)
+- [`packages/fleet-control/CLAUDE.md`](packages/fleet-control/CLAUDE.md)
 - [`packages/showcase/CLAUDE.md`](packages/showcase/CLAUDE.md)
 
 ## Package-first design check

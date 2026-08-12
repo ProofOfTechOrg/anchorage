@@ -64,7 +64,19 @@ const CAPABILITY_AUDIENCE = 'flowsafe-maintenance';
 const CAPABILITY_TYPE = 'flowsafe-maintenance-capability+jwt';
 const CAPABILITY_ASYMMETRIC_TYPE =
   'flowsafe-maintenance-asymmetric-capability+jwt';
-const RECEIPT_AUDIENCE = 'anchorage-fleet-control';
+// Named after the protocol, like CAPABILITY_AUDIENCE above, deliberately NOT
+// after the consuming package: the previous value tracked the fleet-control
+// package name, so renaming that package forced a wire break for nothing.
+//
+// Both mintMaintenanceReceipt and verifyMaintenanceReceipt hard-code this, and
+// the issuer runs inside each deployed tenant Worker at whatever Flowsafe that
+// artifact bundled, while the verifier runs at the control plane's version. So
+// a change here fails closed across live deployments with no other signal, and
+// "upgrade both together" is not reachable once a fleet exists. Rotating it
+// later means teaching the verifier an accept-set (jwtVerify takes an array for
+// `audience`), minting the new value, and dropping the old one once the fleet
+// has moved. A test pins the literal on the `aud` claim.
+const RECEIPT_AUDIENCE = 'flowsafe-maintenance-receipt';
 const RECEIPT_TYPE = 'flowsafe-maintenance-receipt+jwt';
 export const MAINTENANCE_RECEIPT_HEADER =
   'x-flowsafe-maintenance-receipt' as const;
