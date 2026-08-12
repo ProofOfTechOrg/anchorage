@@ -42,6 +42,7 @@ import {
   type ResourceOwner,
 } from '../approval-api/index.js';
 import { isPathSafeId } from '../do-runner/path-safe-id.js';
+import { validateTablePrefix } from '../do-runner/table-prefix.js';
 
 import {
   d1Changes,
@@ -257,9 +258,10 @@ export class D1SchedulesStorage extends SchedulesStorage {
 
   constructor(db: ScheduleDatabase, tablePrefix = '') {
     super();
+    const prefix = validateTablePrefix(tablePrefix) ?? '';
     this.#db = db;
-    this.#schedules = `${tablePrefix}mastra_schedules`;
-    this.#triggers = `${tablePrefix}mastra_schedule_triggers`;
+    this.#schedules = `${prefix}mastra_schedules`;
+    this.#triggers = `${prefix}mastra_schedule_triggers`;
   }
 
   /**

@@ -13,6 +13,7 @@
 
 import { ThreadStateStorage } from '@mastra/core/storage';
 
+import { validateTablePrefix } from '../do-runner/table-prefix.js';
 import {
   jsonOrNull,
   parseJsonOrUndefined,
@@ -30,8 +31,9 @@ export class D1ThreadStateStorage extends ThreadStateStorage {
 
   constructor(db: SignalDatabase, tablePrefix = '') {
     super();
+    const prefix = validateTablePrefix(tablePrefix) ?? '';
     this.#db = db;
-    this.#table = `${tablePrefix}mastra_thread_state`;
+    this.#table = `${prefix}mastra_thread_state`;
   }
 
   /** Lazy, memoized, clear-on-failure schema creation — same posture as the approval store. */

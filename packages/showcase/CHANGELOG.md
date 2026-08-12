@@ -4,18 +4,14 @@
 
 ### Patch Changes
 
+- Forward Breakwater's explicit idempotency-key migration boundary through the
+  workflow connectors. Fresh in-memory runtimes acknowledge it automatically;
+  injected durable stores require the host's drained-writer acknowledgement.
+
 - Updated dependencies [4f0fc9d]
 - Updated dependencies [4f0fc9d]
   - @proofoftech/flowsafe@0.13.0
   - @proofoftech/breakwater@0.11.0
-
-## Unreleased
-
-### Patch Changes
-
-- Forward Breakwater's explicit idempotency-key migration boundary through the
-  workflow connectors. Fresh in-memory runtimes acknowledge it automatically;
-  injected durable stores require the host's drained-writer acknowledgement.
 
 ## 0.0.12
 

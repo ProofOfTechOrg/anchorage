@@ -25,6 +25,7 @@ import {
 import type { StepResult, WorkflowRunState } from '@mastra/core/workflows';
 
 import type { D1DatabaseBinding } from '../do-runner/index.js';
+import { validateTablePrefix } from '../do-runner/table-prefix.js';
 
 export type {
   PurgeExpiredBackgroundTasksOptions,
@@ -67,10 +68,22 @@ export const SERIALIZED_WORKFLOWS_D1: unique symbol = Symbol(
   'flowsafe.serializedWorkflowsD1',
 );
 
+function validatedDomainConfig(config: D1DomainConfig): D1DomainConfig {
+  const tablePrefix = validateTablePrefix(config.tablePrefix);
+  return {
+    ...config,
+    ...(tablePrefix !== undefined ? { tablePrefix } : {}),
+  };
+}
+
 /** Serialized D1 workflow updates for one Durable Object owner. */
 export class DurableObjectWorkflowsStorageD1 extends WorkflowsStorageD1 {
   readonly [SERIALIZED_WORKFLOWS_D1] = true as const;
   readonly #tails = new Map<string, Promise<unknown>>();
+
+  constructor(config: D1DomainConfig) {
+    super(validatedDomainConfig(config));
+  }
 
   override supportsConcurrentUpdates(): boolean {
     return true;
@@ -181,7 +194,7 @@ export class DurableObjectBackgroundTasksStorageD1 extends BackgroundTasksStorag
     config: D1DomainConfig,
     workflows: DurableObjectWorkflowsStorageD1,
   ) {
-    super(config);
+    super(validatedDomainConfig(config));
     this.#workflows = workflows;
   }
 
@@ -225,6 +238,7 @@ export class DurableObjectBackgroundTasksStorageD1 extends BackgroundTasksStorag
 
 export interface CreateBackgroundTaskD1DomainsOptions {
   binding: D1DatabaseBinding;
+  /** Must satisfy and match createD1Storage's max-39 tablePrefix contract. */
   tablePrefix?: string;
 }
 
@@ -232,11 +246,10 @@ export interface CreateBackgroundTaskD1DomainsOptions {
 export function createBackgroundTaskD1Domains(
   options: CreateBackgroundTaskD1DomainsOptions,
 ): MastraStorageDomains {
+  const tablePrefix = validateTablePrefix(options.tablePrefix);
   const config: D1DomainConfig = {
     binding: options.binding as unknown as D1Database,
-    ...(options.tablePrefix !== undefined
-      ? { tablePrefix: options.tablePrefix }
-      : {}),
+    ...(tablePrefix !== undefined ? { tablePrefix } : {}),
   };
   const workflows = new DurableObjectWorkflowsStorageD1(config);
   const backgroundTasks = new DurableObjectBackgroundTasksStorageD1(

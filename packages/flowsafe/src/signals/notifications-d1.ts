@@ -24,7 +24,7 @@ import {
   NotificationsStorage,
   type UpdateNotificationInput,
 } from '@mastra/core/notifications';
-
+import { validateTablePrefix } from '../do-runner/table-prefix.js';
 import {
   d1Changes,
   dateOrUndefined,
@@ -146,9 +146,10 @@ export class D1NotificationsStorage extends NotificationsStorage {
 
   constructor(db: SignalDatabase, tablePrefix = '') {
     super();
+    const prefix = validateTablePrefix(tablePrefix) ?? '';
     this.#db = db;
-    this.#table = `${tablePrefix}mastra_notifications`;
-    this.#sequenceTable = `${tablePrefix}flowsafe_notification_sequence`;
+    this.#table = `${prefix}mastra_notifications`;
+    this.#sequenceTable = `${prefix}flowsafe_notification_sequence`;
     this.#ordinalIndex = `idx_${this.#table}_insertion_ordinal`;
     this.#legacyReplaceTrigger = `trg_${this.#table}_preserve_insertion_ordinal`;
     this.#legacyInsertTrigger = `trg_${this.#table}_allocate_insertion_ordinal`;

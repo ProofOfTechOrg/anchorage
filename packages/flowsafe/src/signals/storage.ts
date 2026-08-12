@@ -10,6 +10,7 @@
 import type { MastraStorageDomains } from '@mastra/core/storage';
 
 import type { D1DatabaseBinding } from '../do-runner/index.js';
+import { validateTablePrefix } from '../do-runner/table-prefix.js';
 import type { SignalDatabase } from './d1-shared.js';
 import { D1NotificationsStorage } from './notifications-d1.js';
 import { D1ThreadStateStorage } from './thread-state-d1.js';
@@ -25,11 +26,12 @@ export function createSignalStorageDomains(
   binding: D1DatabaseBinding,
   tablePrefix = '',
 ): MastraStorageDomains {
+  const prefix = validateTablePrefix(tablePrefix) ?? '';
   // The structural SignalDatabase subset (prepare→bind/first/all/run) is exactly
   // what a real D1Database exposes; the cast bridges the workers-types-free seam.
   const db = binding as unknown as SignalDatabase;
   return {
-    notifications: new D1NotificationsStorage(db, tablePrefix),
-    threadState: new D1ThreadStateStorage(db, tablePrefix),
+    notifications: new D1NotificationsStorage(db, prefix),
+    threadState: new D1ThreadStateStorage(db, prefix),
   };
 }
