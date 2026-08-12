@@ -23,6 +23,9 @@ const unusedDatabase = {
   prepare(_query: string): never {
     throw new Error('construction must not access D1');
   },
+  batch(_statements: never[]): never {
+    throw new Error('construction must not access D1');
+  },
 };
 
 function productionOptions(): SingleTenantConnectorPoliciesOptions {
@@ -31,6 +34,7 @@ function productionOptions(): SingleTenantConnectorPoliciesOptions {
       idempotency: new D1IdempotencyStore(unusedDatabase),
       rateLimit: new D1RateLimitStore(unusedDatabase),
     },
+    idempotencyKeyMigration: 'legacy-writers-drained',
     audit: {
       mode: 'production',
       logger: new AuditLogger({ sink: () => {} }),

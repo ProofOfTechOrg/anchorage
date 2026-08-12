@@ -241,6 +241,14 @@ indexable metadata, `robots.txt`, a sitemap, and a 1200×630 social card for it.
 The safety spine (grant gate, approval queue, audit, RBAC, SoD, idempotency,
 egress) is unchanged whether a connector runs live or simulated.
 
+The default in-memory idempotency store is created fresh with the runtime, so
+the showcase acknowledges the v2 key boundary automatically. If a host injects
+a durable `idempotencyStore`, it must also set
+`idempotencyKeyMigration: 'legacy-writers-drained'` only after every older
+Breakwater writer sharing that store has stopped and drained. The injected
+store must implement both atomic reservation and non-mutating legacy
+inspection.
+
 ## Verify
 
 ```bash

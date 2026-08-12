@@ -18,14 +18,22 @@ import type { RateLimitStore } from './index.js';
 export interface RateLimitDatabase {
   /** Prepare a SQL statement. */
   prepare(query: string): RateLimitStatement;
+  /** Execute prepared statements atomically and in order. */
+  batch<T = unknown>(
+    statements: RateLimitStatement[],
+  ): Promise<RateLimitBatchResult<T>[]>;
+}
+
+/** Result subset returned for one statement in a D1 batch. */
+export interface RateLimitBatchResult<T = unknown> {
+  /** Rows returned by statements with a RETURNING clause. */
+  results?: T[];
 }
 
 /** Prepared-statement subset required by {@link D1RateLimitStore}. */
 export interface RateLimitStatement {
   /** Bind positional parameters and return the bound statement. */
   bind(...values: unknown[]): RateLimitStatement;
-  /** Return the first result row, or `null` when no row matched. */
-  first<T = unknown>(): Promise<T | null>;
   /** Execute a statement that does not need to return rows. */
   run(): Promise<unknown>;
 }
@@ -53,19 +61,31 @@ export class D1RateLimitStore implements RateLimitStore {
     // Epoch-aligned bucketing, identical to InMemoryRateLimitStore: every
     // isolate computes the same window boundaries from the caller's clock.
     const windowStart = now - (now % windowMs);
-    // The UPSERT is the atomicity: concurrent increments against one
-    // (key, window) row serialize in the database, and RETURNING hands each
-    // caller its own post-increment count — no read-modify-write race.
-    const row = await this.#db
-      .prepare(
-        `INSERT INTO ${this.#table} (budget_key, window_start, count)
-         VALUES (?, ?, 1)
-         ON CONFLICT(budget_key, window_start) DO UPDATE
-           SET count = count + 1
-         RETURNING count`,
-      )
-      .bind(key, windowStart)
-      .first<{ count: number }>();
+    // D1 batch() is transactional. Keep the increment and rollover cleanup in
+    // one batch so a cleanup failure rolls back the increment instead of
+    // rejecting a connector call after its quota was already consumed.
+    const [incrementResult] = await this.#db.batch<{ count: number }>([
+      this.#db
+        .prepare(
+          `INSERT INTO ${this.#table} (budget_key, window_start, count)
+           VALUES (?, ?, 1)
+           ON CONFLICT(budget_key, window_start) DO UPDATE
+             SET count = count + 1
+           RETURNING count`,
+        )
+        .bind(key, windowStart),
+      this.#db
+        .prepare(
+          `DELETE FROM ${this.#table}
+           WHERE budget_key = ? AND window_start < ?
+             AND EXISTS (
+               SELECT 1 FROM ${this.#table}
+               WHERE budget_key = ? AND window_start = ? AND count = 1
+             )`,
+        )
+        .bind(key, windowStart, key, windowStart),
+    ]);
+    const row = incrementResult?.results?.[0];
     if (!row) {
       // INSERT-or-UPDATE always yields a row; no row means the database
       // misbehaved. Throw (the wrapper records it and fails the call closed)
@@ -73,18 +93,6 @@ export class D1RateLimitStore implements RateLimitStore {
       throw new Error(
         `D1RateLimitStore: increment returned no row for '${key}'`,
       );
-    }
-    if (row.count === 1) {
-      // This call OPENED the window, so reap the key's expired windows now —
-      // one DELETE per rollover per key instead of per call, keeping the
-      // table at ~one live row per budget key.
-      await this.#db
-        .prepare(
-          `DELETE FROM ${this.#table}
-           WHERE budget_key = ? AND window_start < ?`,
-        )
-        .bind(key, windowStart)
-        .run();
     }
     return row.count;
   }

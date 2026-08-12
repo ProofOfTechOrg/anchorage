@@ -16,6 +16,7 @@ import {
   FLEET_AUDIT_PROXY_STATE_BINDING,
 } from '../src/platform-resources.js';
 import {
+  assertLiveDeploymentMatches,
   cleanupDeploymentArtifacts,
   decommissionDeployment,
   ProvisioningError,
@@ -399,6 +400,11 @@ class FakeBackend implements ProvisioningBackend {
               },
             ]
           : []),
+      plainTextBindings: {},
+      secretNames: externalTopology?.secretNames ?? [
+        'DEPLOYMENT_IDENTITY_SECRET',
+        'MAINTENANCE_ADMIN_SECRET',
+      ],
       artifactVersion: 'artifact-v3',
       desiredSpecDigest: deploymentSpecDigest(deployment),
       schemaVersion: 3,
@@ -590,6 +596,85 @@ class R2RollbackBackend extends FakeBackend {
 }
 
 describe('fleet provisioning', () => {
+  it('attests empty application bindings exactly while allowing only system-owned variables', () => {
+    const deployment = spec();
+    const digest = deploymentSpecDigest(deployment);
+    const record = {
+      tenantTag: deployment.tenantTag,
+      environment: deployment.environment,
+      databaseId: 'database-id',
+      applicationBindings: { vars: [], secrets: [], r2Buckets: [] },
+    } satisfies Pick<
+      FleetRecord,
+      'tenantTag' | 'environment' | 'databaseId' | 'applicationBindings'
+    >;
+    const live: LiveDeployment = {
+      tenantTag: deployment.tenantTag,
+      environment: deployment.environment,
+      scriptName: deployment.scriptName,
+      databaseId: record.databaseId,
+      durableObjectBindings: deployment.durableObjectBindings.map(
+        (binding) => ({ ...binding, namespaceId: 'maintenance-namespace' }),
+      ),
+      serviceBindings: [
+        { name: 'EGRESS_PROXY', service: 'fleet-egress-proxy' },
+      ],
+      queueProducerBindings: [],
+      plainTextBindings: {
+        DEPLOYMENT_TENANT: deployment.tenantTag,
+        FLEET_ENVIRONMENT: deployment.environment,
+        FLEET_SCHEMA_VERSION: String(deployment.schemaVersion),
+        FLEET_SPEC_DIGEST: digest,
+      },
+      secretNames: ['DEPLOYMENT_IDENTITY_SECRET', 'MAINTENANCE_ADMIN_SECRET'],
+      artifactVersion: 'artifact-v3',
+      desiredSpecDigest: digest,
+      schemaVersion: deployment.schemaVersion,
+      maintenance,
+    };
+
+    expect(() =>
+      assertLiveDeploymentMatches(live, record, deployment, digest),
+    ).not.toThrow();
+    expect(() =>
+      assertLiveDeploymentMatches(
+        {
+          ...live,
+          plainTextBindings: {
+            ...live.plainTextBindings,
+            OUT_OF_BAND_VARIABLE: 'unexpected',
+          },
+        },
+        record,
+        deployment,
+        digest,
+      ),
+    ).toThrow(/does not exactly match/u);
+    expect(() =>
+      assertLiveDeploymentMatches(
+        {
+          ...live,
+          secretNames: [...live.secretNames, 'OUT_OF_BAND_SECRET'],
+        },
+        record,
+        deployment,
+        digest,
+      ),
+    ).toThrow(/does not exactly match/u);
+    for (const missing of ['plainTextBindings', 'secretNames'] as const) {
+      const incomplete = { ...live } as Record<string, unknown>;
+      delete incomplete[missing];
+      expect(() =>
+        assertLiveDeploymentMatches(
+          incomplete as unknown as LiveDeployment,
+          record,
+          deployment,
+          digest,
+        ),
+      ).toThrow(/live binding inventory is incomplete/u);
+    }
+  });
+
   it('refuses ordinary convergence while a backend switch intent is active', async () => {
     const backend = new FakeBackend();
     const store = new MemoryStore();
@@ -1423,6 +1508,8 @@ describe('fleet provisioning', () => {
       scriptName: activeRelease.physicalScriptName,
       databaseId: store.record.databaseId,
       durableObjectBindings: store.record.durableObjectBindings,
+      plainTextBindings: {},
+      secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
       artifactVersion: store.record.artifactVersion,
       desiredSpecDigest: digest,
       schemaVersion: 1,

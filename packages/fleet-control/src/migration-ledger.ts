@@ -8,12 +8,12 @@ const LEDGER = 'anchorage_fleet_migrations';
 export interface MigrationDatabase {
   query(
     sql: string,
-    bindings?: readonly unknown[],
+    bindings?: readonly string[],
   ): Promise<readonly Readonly<Record<string, unknown>>[]>;
   batch(
     statements: readonly {
       readonly sql: string;
-      readonly bindings?: readonly unknown[];
+      readonly bindings?: readonly string[];
     }[],
   ): Promise<void>;
 }
@@ -99,7 +99,7 @@ export async function applyMigrationsWithLedger(
         {
           sql: `INSERT INTO ${LEDGER} (version, sql_sha256, applied_at) VALUES (?, ?, ?)`,
           bindings: [
-            migration.version,
+            String(migration.version),
             migrationDigest(migration),
             new Date().toISOString(),
           ],

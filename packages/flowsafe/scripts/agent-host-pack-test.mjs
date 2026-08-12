@@ -5,10 +5,11 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
-  symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,17 +29,35 @@ function run(command, args, cwd = packageRoot) {
 
 try {
   const packed = join(temporary, 'packed');
+  const breakwaterPacked = join(temporary, 'breakwater-packed');
   const extracted = join(temporary, 'extracted');
   const consumer = join(temporary, 'consumer');
   mkdirSync(packed);
+  mkdirSync(breakwaterPacked);
   mkdirSync(extracted);
   mkdirSync(consumer);
 
   run('pnpm', ['run', 'build']);
   run('pnpm', ['pack', '--pack-destination', packed]);
+  run(
+    'pnpm',
+    [
+      '--filter',
+      '@proofoftech/breakwater',
+      'pack',
+      '--pack-destination',
+      breakwaterPacked,
+    ],
+    repositoryRoot,
+  );
   const archives = readdirSync(packed).filter((name) => name.endsWith('.tgz'));
   assert.equal(archives.length, 1);
   const archive = join(packed, archives[0]);
+  const breakwaterArchives = readdirSync(breakwaterPacked).filter((name) =>
+    name.endsWith('.tgz'),
+  );
+  assert.equal(breakwaterArchives.length, 1);
+  const breakwaterArchive = join(breakwaterPacked, breakwaterArchives[0]);
   run('pnpm', [
     '--workspace-root',
     'exec',
@@ -60,6 +79,8 @@ try {
   const sourceManifest = JSON.parse(
     readFileSync(join(packageRoot, 'package.json'), 'utf8'),
   );
+  assert.equal(manifest.dependencies['@mastra/cloudflare-d1'], '1.1.1');
+  assert.equal(manifest.peerDependencies['@mastra/core'], '^1.50.0');
   assert.equal(manifest.dependencies.jose, sourceManifest.dependencies.jose);
   assert.equal(
     manifest.peerDependencies['@proofoftech/breakwater'],
@@ -70,34 +91,65 @@ try {
     /^>=\d+\.\d+\.\d+ <1\.0\.0$/,
     'the packed peer range must stay a bounded 0.x floor',
   );
-  const consumerModules = join(consumer, 'node_modules');
-  mkdirSync(join(consumerModules, '@proofoftech'), { recursive: true });
-  symlinkSync(
-    packageDirectory,
-    join(consumerModules, '@proofoftech', 'flowsafe'),
-    'dir',
+  const rootManifest = JSON.parse(
+    readFileSync(join(repositoryRoot, 'package.json'), 'utf8'),
   );
+  writeFileSync(
+    join(consumer, 'package.json'),
+    `${JSON.stringify(
+      {
+        name: 'flowsafe-agent-host-clean-consumer',
+        private: true,
+        type: 'module',
+        packageManager: rootManifest.packageManager,
+        engines: rootManifest.engines,
+        dependencies: {
+          '@mastra/core': '1.50.0',
+          '@proofoftech/breakwater': `file:${breakwaterArchive}`,
+          '@proofoftech/flowsafe': `file:${archive}`,
+        },
+        devDependencies: {
+          typescript: '5.9.3',
+          wrangler: rootManifest.devDependencies.wrangler,
+        },
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  writeFileSync(
+    join(consumer, 'pnpm-workspace.yaml'),
+    'packages:\n  - "."\nminimumReleaseAge: 10080\n',
+  );
+  writeFileSync(
+    join(consumer, '.npmrc'),
+    'ignore-scripts=true\nengine-strict=true\nauto-install-peers=false\n',
+  );
+  run('pnpm', ['install', '--ignore-scripts'], consumer);
 
-  const packageModules = join(packageDirectory, 'node_modules');
-  mkdirSync(join(packageModules, '@proofoftech'), { recursive: true });
-  mkdirSync(join(packageModules, '@mastra'), { recursive: true });
-  symlinkSync(
-    join(repositoryRoot, 'packages', 'breakwater'),
-    join(packageModules, '@proofoftech', 'breakwater'),
-    'dir',
+  const installedFlowsafeRoot = join(
+    consumer,
+    'node_modules',
+    '@proofoftech',
+    'flowsafe',
   );
-  for (const dependency of ['core', 'cloudflare-d1']) {
-    symlinkSync(
-      join(packageRoot, 'node_modules', '@mastra', dependency),
-      join(packageModules, '@mastra', dependency),
-      'dir',
-    );
-  }
-  symlinkSync(
-    join(packageRoot, 'node_modules', 'jose'),
-    join(packageModules, 'jose'),
-    'dir',
+  const requireFromFlowsafe = createRequire(
+    join(realpathSync(installedFlowsafeRoot), 'package.json'),
   );
+  const installedAdapterManifest = JSON.parse(
+    readFileSync(
+      requireFromFlowsafe.resolve('@mastra/cloudflare-d1/package.json'),
+      'utf8',
+    ),
+  );
+  const installedCoreManifest = JSON.parse(
+    readFileSync(
+      join(consumer, 'node_modules', '@mastra', 'core', 'package.json'),
+      'utf8',
+    ),
+  );
+  assert.equal(installedAdapterManifest.version, '1.1.1');
+  assert.equal(installedCoreManifest.version, '1.50.0');
 
   writeFileSync(
     join(consumer, 'consumer.ts'),
@@ -197,17 +249,15 @@ void grant;
       files: ['consumer.ts'],
     }),
   );
-  run(
-    join(packageRoot, 'node_modules', '.bin', 'tsc'),
-    ['-p', 'tsconfig.json'],
-    consumer,
-  );
+  run('pnpm', ['exec', 'tsc', '-p', 'tsconfig.json'], consumer);
   writeFileSync(
     join(consumer, 'runtime.mjs'),
     `import assert from 'node:assert/strict';
 import * as host from '@proofoftech/flowsafe/agent-host';
 import * as flowsafe from '@proofoftech/flowsafe';
 import * as approvals from '@proofoftech/flowsafe/approval-api';
+import { createD1Storage } from '@proofoftech/flowsafe/do-runner';
+assert.equal(typeof createD1Storage, 'function');
 assert.equal(typeof host.createAgentCatalog, 'function');
 assert.equal(typeof host.createAgentRouter, 'function');
 assert.equal(typeof host.createAgentThreadTopology, 'function');
@@ -240,7 +290,41 @@ assert.equal(
 `,
   );
   run(process.execPath, ['runtime.mjs'], consumer);
-  console.log('packed agent-host import passed');
+  writeFileSync(
+    join(consumer, 'worker.mjs'),
+    `import { createD1Storage } from '@proofoftech/flowsafe/do-runner';
+
+export default {
+  fetch() {
+    return new Response(typeof createD1Storage === 'function' ? 'ok' : 'unavailable');
+  },
+};
+`,
+  );
+  writeFileSync(
+    join(consumer, 'wrangler.jsonc'),
+    JSON.stringify({
+      name: 'flowsafe-packed-consumer',
+      main: './worker.mjs',
+      compatibility_date: '2026-08-12',
+      compatibility_flags: ['nodejs_compat'],
+    }),
+  );
+  run(
+    'pnpm',
+    [
+      'exec',
+      'wrangler',
+      'deploy',
+      '--dry-run',
+      '--config',
+      'wrangler.jsonc',
+      '--outdir',
+      'bundle',
+    ],
+    consumer,
+  );
+  console.log('packed agent-host clean core-1.50.0 import and bundle passed');
 } finally {
   rmSync(temporary, { recursive: true, force: true });
 }

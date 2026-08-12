@@ -30,7 +30,8 @@ Anchorage is not a model provider, identity provider, hosted SaaS, generic proce
 | [`@proofoftech/breakwater`](packages/breakwater/README.md) | Guardrails around Mastra agents and tools | Guarded agent handles, policy processors, RBAC, audit and metrics, connector SDK, Claude Code and Codex CLI connectors |
 | [`@proofoftech/flowsafe`](packages/flowsafe/README.md) | Durable execution and human approval on Cloudflare | Guarded agent catalog/host, Durable Object runner, approval API and React UI, signals, goals, schedules, background tasks, provider subscriptions, R2 artifacts, SIEM export |
 
-Both packages are ESM-only, require Node 22 or later, and declare
+Flowsafe requires Node 22 or later. Breakwater requires Node 22.3 or later for
+its built-in Agent CLI executor. Both packages are ESM-only and declare
 `@mastra/core` `^1.50.0` as their peer range. React 18 or 19 is needed only
 for the optional flowsafe approval UI. The optional `flowsafe-provision` CLI
 requires a consumer-installed Wrangler `>=4 <5` peer.
@@ -109,6 +110,7 @@ export const publishRelease = createConnector({
   },
   policies: {
     idempotencyStore: new InMemoryIdempotencyStore(),
+    idempotencyKeyMigration: 'legacy-writers-drained',
     rateLimitStore: new InMemoryRateLimitStore(),
   },
   execute: async ({ releaseId }, _context, runtime) => {
@@ -122,10 +124,13 @@ export const publishRelease = createConnector({
 });
 ```
 
-The in-memory stores make this definition runnable in one process. Use the D1
-stores when replay or rate limits must span Workers or Durable Objects. The
-connector authoring guide explains every permission, required store, and
-accepted limit: [`packages/breakwater/CONNECTORS.md`](packages/breakwater/CONNECTORS.md).
+The in-memory stores make this definition runnable in one process. The
+migration acknowledgement is safe here because the example constructs a fresh
+store that no legacy writer can reach; an upgraded shared store requires the
+documented drain and inventory first. Use the D1 stores when replay or rate
+limits must span Workers or Durable Objects. The connector authoring guide
+explains every permission, required store, and accepted limit:
+[`packages/breakwater/CONNECTORS.md`](packages/breakwater/CONNECTORS.md).
 
 ## Add durable approvals
 

@@ -608,6 +608,9 @@ class FakeApi implements WorkersForPlatformsApi {
             ]
           : []),
       secretNames: this.dispatchSecretNames.get(scriptName) ?? [],
+      plainTextBindings: Object.fromEntries(
+        (application?.vars ?? []).map(({ name, value }) => [name, value]),
+      ),
       r2BucketBindings: application?.r2Buckets ?? [],
       tenantTag: spec.tenantTag,
       environment: spec.environment,
@@ -736,6 +739,7 @@ class FakeApi implements WorkersForPlatformsApi {
         environment: string;
         schemaVersion: number;
         desiredSpecDigest: string;
+        plainTextBindings: Readonly<Record<string, string>>;
       }
     | undefined
   > {
@@ -755,6 +759,7 @@ class FakeApi implements WorkersForPlatformsApi {
       secretNames: this.dispatchSecretNames.get(scriptName) ?? [
         'DEPLOYMENT_IDENTITY_SECRET',
       ],
+      plainTextBindings: {},
       tenantTag: 'acme',
       environment: 'production',
       schemaVersion: 1,
@@ -2639,6 +2644,7 @@ describe('WorkersForPlatformsBackend', () => {
       artifactVersion: 'etag-v1',
       databaseIds: ['db-one', 'db-two'],
       durableObjectBindings: [],
+      plainTextBindings: {},
       secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
       tenantTag: 'acme',
       environment: 'production',
@@ -2848,6 +2854,7 @@ describe('WorkersForPlatformsBackend', () => {
       artifactVersion: 'etag-v1',
       databaseIds: ['db-other'],
       durableObjectBindings: [],
+      plainTextBindings: {},
       secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
       tenantTag: deployment.tenantTag,
       environment: deployment.environment,

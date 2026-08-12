@@ -1005,6 +1005,7 @@ describe('backend switch state machine', () => {
         ),
         serviceBindings: [],
         queueProducerBindings: [],
+        plainTextBindings: {},
         secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
         artifactVersion: 'candidate-v1',
         desiredSpecDigest: deploymentSpecDigest(targetSpec),

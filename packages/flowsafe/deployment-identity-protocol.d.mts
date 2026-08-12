@@ -3,7 +3,7 @@
 export interface DeploymentIdentityProtocolStatement {
   readonly mode: 'read' | 'write';
   readonly sql: string;
-  readonly bindings: readonly unknown[];
+  readonly bindings: readonly string[];
 }
 
 export type DeploymentIdentityProtocolRow = Readonly<Record<string, unknown>>;

@@ -5,13 +5,22 @@
 // openSqlite()/d1Like() fixture is copied from flowsafe's store.test.ts
 // pattern on purpose: breakwater must not import across packages for tests.
 
-import { describe, expect, it } from 'vitest';
+import { RequestContext } from '@mastra/core/request-context';
+import type { ToolExecutionContext } from '@mastra/core/tools';
+import { describe, expect, it, vi } from 'vitest';
 
+import { ISOLATION_SCOPE_CONTEXT_KEY } from '../policy-engine/index.js';
 import {
   D1IdempotencyStore,
   type IdempotencyDatabase,
   type IdempotencyStatement,
 } from './d1-idempotency-store.js';
+import {
+  ConnectorPolicyError,
+  createConnector,
+  IDEMPOTENCY_KEY_CONTEXT_KEY,
+  type IdempotencyRecord,
+} from './index.js';
 
 // --- node:sqlite -> IdempotencyDatabase adapter ----------------------------
 
@@ -57,7 +66,60 @@ function d1Like(db: SqliteDatabase): IdempotencyDatabase {
 
 const T0 = Date.parse('2026-07-07T10:00:00.000Z');
 
+function connectorContext(
+  scope: string,
+  idempotencyKey: string,
+): ToolExecutionContext {
+  const requestContext = new RequestContext();
+  requestContext.set(ISOLATION_SCOPE_CONTEXT_KEY, scope);
+  requestContext.set(IDEMPOTENCY_KEY_CONTEXT_KEY, idempotencyKey);
+  return { requestContext } as unknown as ToolExecutionContext;
+}
+
+async function runConnector(
+  tool: {
+    execute?: (
+      inputData: unknown,
+      context: ToolExecutionContext,
+    ) => Promise<unknown>;
+  },
+  context: ToolExecutionContext,
+): Promise<unknown> {
+  if (!tool.execute) throw new Error('tool has no execute');
+  return tool.execute({}, context);
+}
+
 describe('D1IdempotencyStore (Node SQLite facsimile)', () => {
+  it.each([
+    0,
+    -1,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    1.5,
+    Number.MAX_SAFE_INTEGER,
+    8_640_000_000_000_001,
+  ])('rejects invalid pendingTtlMs %s at construction', (pendingTtlMs) => {
+    expect(
+      () => new D1IdempotencyStore(d1Like(openSqlite()), { pendingTtlMs }),
+    ).toThrow(/positive safe integer no greater than 8640000000000000/);
+  });
+
+  it('accepts the valid default and custom pending TTL boundaries', () => {
+    expect(new D1IdempotencyStore(d1Like(openSqlite())).pendingTtlMs).toBe(
+      900_000,
+    );
+    expect(
+      new D1IdempotencyStore(d1Like(openSqlite()), { pendingTtlMs: 1 })
+        .pendingTtlMs,
+    ).toBe(1);
+    expect(
+      new D1IdempotencyStore(d1Like(openSqlite()), {
+        pendingTtlMs: 8_640_000_000_000_000,
+      }).pendingTtlMs,
+    ).toBe(8_640_000_000_000_000);
+  });
+
   it('round-trips reserve -> put -> replay', async () => {
     // #given
     const store = new D1IdempotencyStore(d1Like(openSqlite()), {
@@ -76,6 +138,51 @@ describe('D1IdempotencyStore (Node SQLite facsimile)', () => {
       record: { result: { ok: true, n: 42 } },
     });
     expect(await store.get('conn:k1')).toEqual({ result: { ok: true, n: 42 } });
+  });
+
+  it('inspects absent, pending, and completed legacy rows without mutation', async () => {
+    const store = new D1IdempotencyStore(d1Like(openSqlite()), {
+      now: () => T0,
+    });
+
+    expect(await store.inspect('pay:missing')).toEqual({ state: 'absent' });
+    const reservation = await store.reserve('pay:pending');
+    expect(await store.inspect('pay:pending')).toEqual({ state: 'pending' });
+    expect(await store.reserve('pay:pending')).toEqual({ state: 'pending' });
+    if (reservation.state !== 'reserved') throw new Error('unreachable');
+    await store.put('pay:done', { result: { source: 'legacy' } });
+    expect(await store.inspect('pay:done')).toEqual({
+      state: 'replay',
+      record: { result: { source: 'legacy' } },
+    });
+  });
+
+  it('keeps the reported scoped tuple collision distinct through the D1 store', async () => {
+    const store = new D1IdempotencyStore(d1Like(openSqlite()), {
+      now: () => T0,
+    });
+    const execute = vi.fn(async () => ({
+      execution: execute.mock.calls.length,
+    }));
+    const connector = createConnector({
+      id: 'pay',
+      description: 'Pay one invoice',
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: {
+        idempotencyStore: store,
+        idempotencyKeyMigration: 'legacy-writers-drained',
+      },
+      execute,
+    });
+    const firstTuple = connectorContext('tenant', 'pay:invoice-1');
+    const secondTuple = connectorContext('tenant:pay', 'invoice-1');
+
+    const first = await runConnector(connector, firstTuple);
+    const second = await runConnector(connector, secondTuple);
+    expect(first).not.toEqual(second);
+    await expect(runConnector(connector, firstTuple)).resolves.toEqual(first);
+    await expect(runConnector(connector, secondTuple)).resolves.toEqual(second);
+    expect(execute).toHaveBeenCalledTimes(2);
   });
 
   it('admits exactly one winner when two stores race a key over one database', async () => {
@@ -225,6 +332,106 @@ describe('D1IdempotencyStore (Node SQLite facsimile)', () => {
       state: 'reserved',
       token: expect.any(String),
     });
+  });
+
+  it.each([
+    ['Date', new Date('2026-08-12T00:00:00.000Z')],
+    ['Map', new Map([['key', 'value']])],
+    [
+      'shared object reference',
+      (() => {
+        const shared = { value: true };
+        return { first: shared, second: shared };
+      })(),
+    ],
+    ['undefined object member', { missing: undefined }],
+    ['undefined array member', [undefined]],
+    ['non-finite number', Number.POSITIVE_INFINITY],
+    ['negative zero', -0],
+    [
+      'null-prototype object',
+      Object.assign(Object.create(null) as Record<string, unknown>, {
+        value: true,
+      }),
+    ],
+    ['symbol member', { [Symbol('hidden')]: true }],
+  ])('rejects %s results that JSON would silently change', async (_name, result) => {
+    // #given
+    const store = new D1IdempotencyStore(d1Like(openSqlite()), {
+      now: () => T0,
+    });
+    const reservation = await store.reserve('conn:changed');
+    if (reservation.state !== 'reserved') throw new Error('expected reserve');
+
+    // #when / #then — no lossy replay record is finalized
+    await expect(
+      store.put('conn:changed', { result }, reservation.token),
+    ).rejects.toThrow('D1 idempotency results must be JSON-native');
+    expect(await store.reserve('conn:changed')).toEqual({ state: 'pending' });
+  });
+
+  it('snapshots a structural record result once before validation and storage', async () => {
+    // #given — a public structural IdempotencyRecord may expose an accessor
+    // whose later reads return a different, lossy value
+    const store = new D1IdempotencyStore(d1Like(openSqlite()), {
+      now: () => T0,
+    });
+    const reservation = await store.reserve('conn:getter');
+    if (reservation.state !== 'reserved') throw new Error('expected reserve');
+    let reads = 0;
+    const record = {
+      get result() {
+        reads += 1;
+        return reads === 1
+          ? { exact: true }
+          : new Date('2026-08-12T00:00:00.000Z');
+      },
+      extra: 'not part of IdempotencyRecord',
+    } as unknown as IdempotencyRecord;
+
+    // #when
+    await store.put('conn:getter', record, reservation.token);
+
+    // #then — validation and serialization use the same captured result;
+    // unrelated structural fields never enter the durable record
+    expect(reads).toBe(1);
+    expect(await store.get('conn:getter')).toEqual({ result: { exact: true } });
+  });
+
+  it('keeps a connector reservation pending when D1 rejects shared references', async () => {
+    // #given — JSON duplicates the aliased object and would change identity on
+    // replay even though the value remains otherwise JSON-shaped
+    const store = new D1IdempotencyStore(d1Like(openSqlite()), {
+      now: () => T0,
+    });
+    const shared = { value: true };
+    const result = { first: shared, second: shared };
+    const execute = vi.fn(async () => result);
+    const tool = createConnector({
+      id: 'pay',
+      description: 'Perform a payment side effect',
+      execute,
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: {
+        idempotencyStore: store,
+        idempotencyKeyMigration: 'legacy-writers-drained',
+      },
+    });
+    const context = connectorContext('tenant', 'shared-reference');
+
+    // #when — the side effect succeeds but its lossy D1 replay record does not
+    // finalize, so an immediate retry remains fail-closed
+    const first = await runConnector(tool, context);
+    const second = await runConnector(tool, context).catch(
+      (error: unknown) => error,
+    );
+
+    // #then
+    expect(first).toBe(result);
+    expect(result.first).toBe(result.second);
+    expect(second).toBeInstanceOf(ConnectorPolicyError);
+    expect((second as ConnectorPolicyError).policy).toBe('idempotency');
+    expect(execute).toHaveBeenCalledTimes(1);
   });
 
   it('respects a custom table name', async () => {

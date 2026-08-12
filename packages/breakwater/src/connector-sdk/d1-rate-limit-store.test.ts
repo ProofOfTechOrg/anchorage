@@ -5,13 +5,16 @@
 // openSqlite()/d1Like() fixture is copied from d1-idempotency-store.test.ts
 // on purpose: breakwater must not import across packages for tests.
 
-import { describe, expect, it } from 'vitest';
+import type { ToolExecutionContext } from '@mastra/core/tools';
+import { describe, expect, it, vi } from 'vitest';
 
+import { AuditLogger } from '../audit/index.js';
 import {
   D1RateLimitStore,
   type RateLimitDatabase,
   type RateLimitStatement,
 } from './d1-rate-limit-store.js';
+import { createConnector } from './index.js';
 
 // --- node:sqlite -> RateLimitDatabase adapter -------------------------------
 
@@ -22,6 +25,7 @@ interface SqliteStatement {
 
 interface SqliteDatabase {
   prepare(sql: string): SqliteStatement;
+  exec(sql: string): void;
 }
 
 // process.getBuiltinModule loads the builtin without import machinery, so
@@ -44,19 +48,57 @@ function openSqlite(): SqliteDatabase {
 }
 
 function d1Like(db: SqliteDatabase): RateLimitDatabase {
+  const prepared = new WeakMap<
+    RateLimitStatement,
+    { sql: string; params: unknown[] }
+  >();
   function statement(sql: string, params: unknown[]): RateLimitStatement {
-    return {
+    const value: RateLimitStatement = {
       bind: (...values: unknown[]) => statement(sql, values),
-      first: async <T>() =>
-        (db.prepare(sql).get(...params) as T | undefined) ?? null,
       run: async () => db.prepare(sql).run(...params),
     };
+    prepared.set(value, { sql, params });
+    return value;
   }
-  return { prepare: (sql: string) => statement(sql, []) };
+  return {
+    prepare: (sql: string) => statement(sql, []),
+    batch: async <T>(statements: RateLimitStatement[]) => {
+      db.exec('BEGIN');
+      try {
+        const results = statements.map((value) => {
+          const entry = prepared.get(value);
+          if (!entry) throw new Error('unknown prepared statement');
+          if (/\bRETURNING\b/i.test(entry.sql)) {
+            const row = db.prepare(entry.sql).get(...entry.params) as
+              | T
+              | undefined;
+            return { results: row === undefined ? [] : [row] };
+          }
+          db.prepare(entry.sql).run(...entry.params);
+          return { results: [] };
+        });
+        db.exec('COMMIT');
+        return results;
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
+    },
+  };
 }
 
 const T0 = Date.parse('2026-07-07T10:00:00.000Z');
 const MINUTE = 60_000;
+
+async function runConnector(tool: {
+  execute?: (
+    inputData: unknown,
+    context: ToolExecutionContext,
+  ) => Promise<unknown>;
+}): Promise<unknown> {
+  if (!tool.execute) throw new Error('tool has no execute');
+  return tool.execute({}, {} as ToolExecutionContext);
+}
 
 describe('D1RateLimitStore (Node SQLite facsimile)', () => {
   it('counts calls within one fixed window', async () => {
@@ -99,6 +141,105 @@ describe('D1RateLimitStore (Node SQLite facsimile)', () => {
       .prepare('SELECT COUNT(*) AS n FROM breakwater_rate_limit')
       .get() as { n: number };
     expect(rows.n).toBe(1);
+  });
+
+  it('rolls back the increment when expired-window cleanup fails', async () => {
+    const sqlite = openSqlite();
+    const store = new D1RateLimitStore(d1Like(sqlite));
+    await store.increment('acme:crm', MINUTE, T0);
+    sqlite.exec(
+      `CREATE TRIGGER fail_rate_cleanup
+       BEFORE DELETE ON breakwater_rate_limit
+       BEGIN
+         SELECT RAISE(ABORT, 'injected cleanup failure');
+       END`,
+    );
+
+    await expect(
+      store.increment('acme:crm', MINUTE, T0 + MINUTE),
+    ).rejects.toThrow('injected cleanup failure');
+    expect(
+      sqlite
+        .prepare(
+          `SELECT window_start, count FROM breakwater_rate_limit
+           WHERE budget_key = ? ORDER BY window_start`,
+        )
+        .get('acme:crm'),
+    ).toEqual({ window_start: T0, count: 1 });
+
+    sqlite.exec('DROP TRIGGER fail_rate_cleanup');
+    expect(await store.increment('acme:crm', MINUTE, T0 + MINUTE)).toBe(1);
+    expect(await store.increment('acme:crm', MINUTE, T0 + MINUTE + 1)).toBe(2);
+  });
+
+  it('rejects without execution or quota spend when cleanup fails, then retries at count one', async () => {
+    vi.useFakeTimers();
+    try {
+      const sqlite = openSqlite();
+      const rateLimitStore = new D1RateLimitStore(d1Like(sqlite));
+      const audit = new AuditLogger();
+      const execute = vi.fn(async () => ({ ok: true }));
+      const tool = createConnector({
+        id: 'crm.create',
+        description: 'Create one CRM record',
+        permissions: { sideEffect: 'write', rateLimit: '1/min' },
+        policies: { audit, rateLimitStore },
+        execute,
+      });
+      await rateLimitStore.increment('crm.create', MINUTE, T0);
+      sqlite.exec(
+        `CREATE TRIGGER fail_connector_rate_cleanup
+         BEFORE DELETE ON breakwater_rate_limit
+         BEGIN
+           SELECT RAISE(ABORT, 'injected cleanup failure');
+         END`,
+      );
+      vi.setSystemTime(T0 + MINUTE);
+
+      await expect(runConnector(tool)).rejects.toThrow(
+        'injected cleanup failure',
+      );
+      expect(execute).not.toHaveBeenCalled();
+      expect(
+        sqlite
+          .prepare(
+            `SELECT window_start, count FROM breakwater_rate_limit
+             WHERE budget_key = ? ORDER BY window_start`,
+          )
+          .get('crm.create'),
+      ).toEqual({ window_start: T0, count: 1 });
+      expect(audit.events()).toMatchObject([
+        {
+          decision: 'error',
+          reason: 'rate-limit store increment failed',
+          detail: { stage: 'rate-limit-store' },
+        },
+      ]);
+
+      sqlite.exec('DROP TRIGGER fail_connector_rate_cleanup');
+      await expect(runConnector(tool)).resolves.toEqual({ ok: true });
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(
+        sqlite
+          .prepare(
+            `SELECT window_start, count FROM breakwater_rate_limit
+             WHERE budget_key = ?`,
+          )
+          .get('crm.create'),
+      ).toEqual({ window_start: T0 + MINUTE, count: 1 });
+
+      await expect(runConnector(tool)).rejects.toMatchObject({
+        policy: 'rate-limit',
+      });
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(audit.events()).toMatchObject([
+        { decision: 'error', detail: { stage: 'rate-limit-store' } },
+        { decision: 'allowed' },
+        { decision: 'denied', detail: { policy: 'rate-limit' } },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('epoch-aligns windows so every caller computes the same boundary', async () => {
@@ -157,6 +298,7 @@ describe('D1RateLimitStore (Node SQLite facsimile)', () => {
         }
         return real.prepare(sql);
       },
+      batch: (statements) => real.batch(statements),
     };
     const store = new D1RateLimitStore(flaky);
 

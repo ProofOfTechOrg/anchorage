@@ -13,13 +13,14 @@ import {
 } from '@mastra/core/storage';
 
 import type { D1DatabaseBinding } from './cf-types.js';
+import { validateTablePrefix } from './table-prefix.js';
 
 export interface D1StorageOptions {
   /** D1 binding from the Worker/DO environment. */
   binding: D1DatabaseBinding;
   /** Storage instance id. Default: 'flowsafe'. */
   id?: string;
-  /** Table name prefix (letters, numbers, underscores). */
+  /** Safe SQL identifier prefix, or an empty string. */
   tablePrefix?: string;
   /**
    * Additional storage domains composed over the D1Store default, such as
@@ -35,6 +36,7 @@ export interface D1StorageOptions {
 export function createD1Storage(
   options: D1StorageOptions,
 ): MastraCompositeStore {
+  const tablePrefix = validateTablePrefix(options.tablePrefix);
   const d1 = new D1Store({
     id: options.id ?? 'flowsafe',
     // @mastra/cloudflare-d1's own D1Store signature wants the real
@@ -42,9 +44,7 @@ export function createD1Storage(
     // exposes instead, so consumers of its shipped types don't need
     // @cloudflare/workers-types installed.
     binding: options.binding as unknown as D1Database,
-    ...(options.tablePrefix !== undefined
-      ? { tablePrefix: options.tablePrefix }
-      : {}),
+    ...(tablePrefix !== undefined ? { tablePrefix } : {}),
   });
   // No extra domains ⇒ return the D1Store itself (it IS a MastraCompositeStore),
   // preserving byte-identical behavior for every host that does not opt into

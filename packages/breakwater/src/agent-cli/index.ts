@@ -29,12 +29,7 @@ import {
   ConnectorPolicyError,
   createConnector,
 } from '../connector-sdk/index.js';
-import type {
-  TextCodecLookups,
-  TextDecoderLike,
-  TextEncoderLike,
-} from './tail-accumulator.js';
-import { tailAccumulator } from './tail-accumulator.js';
+import { createDefaultExec, DefaultExecFailure } from './default-exec.js';
 
 /** Input accepted by an agent CLI connector. */
 export interface AgentCliInput {
@@ -109,10 +104,10 @@ export interface AgentCliConnectorOptions {
   /** Override the binary (absolute path or PATH name). */
   binaryPath?: string;
   /**
-   * Kill the CLI after this long. Default 600000 (10 min — agent tasks run
-   * long). Must be an integer in [1, 2^31-1]: setTimeout treats NaN and
+   * Terminate the CLI process tree after this long. Default 600000 (10 min —
+   * agent tasks run long). Must be an integer in [1, 2^31-1]: setTimeout treats NaN and
    * negatives as 0 and clamps beyond-2^31-1 delays to 1ms — either way an
-   * instant SIGKILL — and a NaN additionally passes the pendingTtlMs guard
+   * instant termination — and a NaN additionally passes the pendingTtlMs guard
    * below vacuously. Construction throws on a malformed value.
    */
   timeoutMs?: number;
@@ -160,6 +155,7 @@ export type AgentCliErrorCode =
   | 'invalid-flags'
   | 'spawn-failed'
   | 'timeout'
+  | 'termination-failed'
   | 'exec-failed'
   | 'invalid-exec-result'
   | 'nonzero-exit'
@@ -174,12 +170,14 @@ export interface AgentCliErrorMetadata {
   connectorId?: string;
   /** Redacted display command. */
   command?: string;
-  /** Nonzero process exit code, when a process completed unsuccessfully. */
+  /** Nonzero CLI or Windows termination-helper exit code, when available. */
   exitCode?: number;
   /** Configured process timeout, when the failure was timeout-related. */
   timeoutMs?: number;
   /** Platform process error code, such as `ENOENT`, when safely available. */
   systemCode?: string;
+  /** Process-tree termination mechanism, when termination itself failed. */
+  terminationMethod?: 'process-group' | 'taskkill';
   /** Whether any standard output was captured. Contents are never included. */
   stdoutCaptured?: boolean;
   /** Whether any standard error was captured. Contents are never included. */
@@ -194,12 +192,14 @@ export class AgentCliError extends Error {
   readonly connectorId?: string;
   /** Redacted display command, when command construction succeeded. */
   readonly command?: string;
-  /** Nonzero process exit code, when available. */
+  /** Nonzero CLI or Windows termination-helper exit code, when available. */
   readonly exitCode?: number;
   /** Configured process timeout, when the failure was timeout-related. */
   readonly timeoutMs?: number;
   /** Platform process error code, such as `ENOENT`, when safely available. */
   readonly systemCode?: string;
+  /** Process-tree termination mechanism, when termination itself failed. */
+  readonly terminationMethod?: 'process-group' | 'taskkill';
   /** Whether any standard output was captured. Contents are never included. */
   readonly stdoutCaptured?: boolean;
   /** Whether any standard error was captured. Contents are never included. */
@@ -214,6 +214,7 @@ export class AgentCliError extends Error {
     this.exitCode = metadata.exitCode;
     this.timeoutMs = metadata.timeoutMs;
     this.systemCode = metadata.systemCode;
+    this.terminationMethod = metadata.terminationMethod;
     this.stdoutCaptured = metadata.stdoutCaptured;
     this.stderrCaptured = metadata.stderrCaptured;
   }
@@ -225,30 +226,8 @@ const REDACTED_PROMPT = '<prompt:redacted>';
 const REDACTED_OPTION_VALUE = '<value:redacted>';
 // setTimeout's delay ceiling (signed 32-bit ms, ~24.8 days): Node clamps
 // anything above it DOWN TO 1ms, so a "generous" timeout would SIGKILL every
-// CLI instantly.
+// CLI tree instantly.
 const MAX_TIMEOUT_MS = 2 ** 31 - 1;
-
-interface DefaultExecFailureOptions {
-  code:
-    | 'runtime-unavailable'
-    | 'codec-unavailable'
-    | 'spawn-failed'
-    | 'timeout';
-  timeoutMs?: number;
-  systemCode?: string;
-}
-
-class DefaultExecFailure {
-  readonly code: DefaultExecFailureOptions['code'];
-  readonly timeoutMs?: number;
-  readonly systemCode?: string;
-
-  constructor(options: DefaultExecFailureOptions) {
-    this.code = options.code;
-    this.timeoutMs = options.timeoutMs;
-    this.systemCode = options.systemCode;
-  }
-}
 
 const AGENT_CLI_ERROR_MESSAGES: Readonly<Record<AgentCliErrorCode, string>> = {
   unknown: 'Agent CLI execution failed.',
@@ -260,20 +239,14 @@ const AGENT_CLI_ERROR_MESSAGES: Readonly<Record<AgentCliErrorCode, string>> = {
   'invalid-flags': 'Agent CLI flag construction returned invalid flags.',
   'spawn-failed': 'Agent CLI process could not be started.',
   timeout: 'Agent CLI process exceeded its execution timeout.',
+  'termination-failed':
+    'Agent CLI process tree could not be terminated after execution was aborted.',
   'exec-failed': 'Agent CLI executor failed.',
   'invalid-exec-result': 'Agent CLI executor returned an invalid result.',
   'nonzero-exit': 'Agent CLI process exited unsuccessfully.',
   'parse-output-failed': 'Agent CLI output parsing failed.',
   'connector-failed': 'Agent CLI connector execution failed.',
 };
-
-function safeSystemCode(error: unknown): string | undefined {
-  if (typeof error !== 'object' || error === null) return undefined;
-  const code = (error as { code?: unknown }).code;
-  return typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,31}$/.test(code)
-    ? code
-    : undefined;
-}
 
 function createAgentCliError(
   code: AgentCliErrorCode,
@@ -292,6 +265,9 @@ function createAgentCliError(
   if (metadata.timeoutMs !== undefined) detail.timeoutMs = metadata.timeoutMs;
   if (metadata.systemCode !== undefined)
     detail.systemCode = metadata.systemCode;
+  if (metadata.terminationMethod !== undefined) {
+    detail.terminationMethod = metadata.terminationMethod;
+  }
   if (metadata.stdoutCaptured !== undefined) {
     detail.stdoutCaptured = metadata.stdoutCaptured;
   }
@@ -306,7 +282,8 @@ function createAgentCliError(
 
 /**
  * Construction-time guard for the numeric safety knobs. Each bounds a
- * runaway CLI (timeoutMs → SIGKILL budget, maxOutputBytes → retained-tail
+ * runaway CLI (timeoutMs → process-tree termination budget,
+ * maxOutputBytes → retained-tail
  * cap), and each silently DISARMS on a malformed value instead of failing:
  * NaN satisfies no comparison (the accumulator evicts nothing and the
  * pendingTtlMs guard passes vacuously), `totalBytes <= Infinity` is always
@@ -347,188 +324,6 @@ const outputSchema = z.object({
   command: z.string(),
   simulated: z.boolean().optional(),
 });
-
-// Structural node:child_process subset — breakwater compiles without node
-// types, and a static `import 'node:child_process'` would break non-Node
-// bundles even though only Node ever calls this path.
-interface SpawnedProcess {
-  stdout: {
-    on(event: 'data', listener: (chunk: unknown) => void): unknown;
-  } | null;
-  stderr: {
-    on(event: 'data', listener: (chunk: unknown) => void): unknown;
-  } | null;
-  on(event: 'error', listener: (error: unknown) => void): unknown;
-  on(event: 'close', listener: (code: number | null) => void): unknown;
-  kill(signal?: string): unknown;
-}
-
-interface ChildProcessModule {
-  spawn(
-    command: string,
-    args: readonly string[],
-    options: { cwd?: string; stdio: readonly [string, string, string] },
-  ): SpawnedProcess;
-}
-
-interface TimerGlobals {
-  setTimeout(handler: () => void, timeoutMs: number): unknown;
-  clearTimeout(handle: unknown): void;
-}
-
-function nodeChildProcess(): ChildProcessModule {
-  const proc = (
-    globalThis as {
-      process?: { getBuiltinModule?: (id: string) => unknown };
-    }
-  ).process;
-  const childProcess = proc?.getBuiltinModule?.('node:child_process') as
-    | ChildProcessModule
-    | undefined;
-  if (!childProcess) {
-    throw new DefaultExecFailure({ code: 'runtime-unavailable' });
-  }
-  return childProcess;
-}
-
-// TextDecoder/TextEncoder looked up off globalThis — like nodeChildProcess()
-// above, structurally typed rather than assumed ambient: both are
-// unconditional Node/Workers/browser globals (no import, no @types/node, no
-// DOM lib needed to typecheck), which is what the default exec's real chunks
-// (always Uint8Array — node:child_process's 'pipe' stdio, no encoding ever
-// set) actually run under.
-function globalTextDecoder(): TextDecoderLike {
-  const Ctor = (globalThis as { TextDecoder?: new () => TextDecoderLike })
-    .TextDecoder;
-  if (!Ctor) {
-    throw new DefaultExecFailure({ code: 'codec-unavailable' });
-  }
-  try {
-    return new Ctor();
-  } catch {
-    throw new DefaultExecFailure({ code: 'codec-unavailable' });
-  }
-}
-
-function globalTextEncoder(): TextEncoderLike {
-  const Ctor = (globalThis as { TextEncoder?: new () => TextEncoderLike })
-    .TextEncoder;
-  if (!Ctor) {
-    throw new DefaultExecFailure({ code: 'codec-unavailable' });
-  }
-  try {
-    return new Ctor();
-  } catch {
-    throw new DefaultExecFailure({ code: 'codec-unavailable' });
-  }
-}
-
-// The bounded tail buffer lives in tail-accumulator.ts (package-internal —
-// the './agent-cli' subpath maps to this module only) so tests can drive
-// chunk-boundary geometry deterministically; the AgentCliError-throwing
-// global lookups above are injected into it here.
-const TEXT_CODEC_LOOKUPS: TextCodecLookups = {
-  encoder: globalTextEncoder,
-  decoder: globalTextDecoder,
-};
-
-function createDefaultExec(maxOutputBytes: number): AgentCliExec {
-  return (command, args, options) => {
-    let childProcess: ChildProcessModule;
-    try {
-      childProcess = nodeChildProcess();
-    } catch (error) {
-      return Promise.reject(error);
-    }
-    const timers = globalThis as unknown as TimerGlobals;
-    return new Promise<AgentCliExecResult>((resolve, reject) => {
-      // No shell: args go straight to execve, so prompt content can't inject.
-      let child: SpawnedProcess;
-      try {
-        child = childProcess.spawn(command, args, {
-          cwd: options.cwd,
-          stdio: ['ignore', 'pipe', 'pipe'],
-        });
-      } catch (error) {
-        reject(
-          new DefaultExecFailure({
-            code: 'spawn-failed',
-            systemCode: safeSystemCode(error),
-          }),
-        );
-        return;
-      }
-      const stdout = tailAccumulator(maxOutputBytes, TEXT_CODEC_LOOKUPS);
-      const stderr = tailAccumulator(maxOutputBytes, TEXT_CODEC_LOOKUPS);
-      let settled = false;
-      const killChild = (): void => {
-        try {
-          child.kill('SIGKILL');
-        } catch {
-          // The process may already be gone. The safe failure below remains
-          // the public result.
-        }
-      };
-      const rejectCodecFailure = (): void => {
-        if (settled) return;
-        settled = true;
-        timers.clearTimeout(timer);
-        killChild();
-        reject(new DefaultExecFailure({ code: 'codec-unavailable' }));
-      };
-      const timer = timers.setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        killChild();
-        reject(
-          new DefaultExecFailure({
-            code: 'timeout',
-            timeoutMs: options.timeoutMs,
-          }),
-        );
-      }, options.timeoutMs);
-      child.stdout?.on('data', (chunk) => {
-        try {
-          stdout.push(chunk);
-        } catch {
-          rejectCodecFailure();
-        }
-      });
-      child.stderr?.on('data', (chunk) => {
-        try {
-          stderr.push(chunk);
-        } catch {
-          rejectCodecFailure();
-        }
-      });
-      child.on('error', (error) => {
-        if (settled) return;
-        settled = true;
-        timers.clearTimeout(timer);
-        reject(
-          new DefaultExecFailure({
-            code: 'spawn-failed',
-            systemCode: safeSystemCode(error),
-          }),
-        );
-      });
-      child.on('close', (code) => {
-        if (settled) return;
-        settled = true;
-        timers.clearTimeout(timer);
-        try {
-          resolve({
-            stdout: stdout.value(),
-            stderr: stderr.value(),
-            exitCode: code ?? -1,
-          });
-        } catch {
-          reject(new DefaultExecFailure({ code: 'codec-unavailable' }));
-        }
-      });
-    });
-  };
-}
 
 function sanitizeValidationError<T>(
   error: ValidationError<T>,
@@ -705,7 +500,9 @@ export function createAgentCliConnector(
           throw createAgentCliError(error.code, connectorId, {
             command,
             timeoutMs: error.timeoutMs,
+            exitCode: error.exitCode,
             systemCode: error.systemCode,
+            terminationMethod: error.terminationMethod,
           });
         }
         throw createAgentCliError('exec-failed', connectorId, { command });

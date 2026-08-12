@@ -175,7 +175,9 @@ After deployment, authenticate `POST /admin/ensure-maintenance` with `MAINTENANC
 - `purgeExpiredApprovals()` deletes approved and rejected records. Pending, claimed, and escalated requests remain.
 - `purgeExpiredThreads()` is optional. It deletes an idle thread with its messages and leaves working-memory resources intact.
 
-Pass the same `R2ArtifactStore` to runtime writes and retention. Snapshot rows are the enumerable record of artifact keys, so artifacts must delete before the corresponding row.
+Build the retention `R2ArtifactStore` from the current invocation binding with `artifactStore: (env) => new R2ArtifactStore(env.ARTIFACTS)`, using the same bucket as runtime writes. Snapshot rows are the enumerable record of artifact keys, so artifacts delete before the corresponding row. Factory or deletion failure keeps the row for retry.
+
+If storage uses `tablePrefix`, configure the identical value as `storageTablePrefix` on `createFlowsafeWorker()`. The host accepts an empty prefix or a safe SQL identifier prefix that starts with an ASCII letter or underscore and continues with ASCII letters, numbers, or underscores. It applies the prefix to workflow-run, thread, background-task, notification, thread-state, and schedule-trigger purges. It does not auto-discover a prefix or apply it to fixed-schema Flowsafe tables.
 
 Schedules, subscriptions, resources, and working memory have no TTL. The schedule and subscription routes delete their records explicitly. Resources and permanent thread teardown remain host-owned: remove every authoritative binding and wake source before releasing the corresponding ownership claims. Idle-thread retention deletes memory rows but deliberately keeps those claims. Deployment decommissioning removes whatever remains. Open approvals and live runs are never age-purged and remain until they reach a terminal state or the deployment is decommissioned. There is no in-database organization purge.
 

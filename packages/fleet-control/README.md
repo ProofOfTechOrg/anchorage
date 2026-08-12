@@ -12,6 +12,10 @@ An ordinary state Worker can exist only as the finalized result of the dedicated
 
 The state-egress credential digest is immutable after a deployment adopts or creates trusted state. Rotating `FLEET_STATE_EGRESS_ROOT_SECRET` for an existing deployment requires a coordinated credential migration that updates trusted state and host routing together. Fleet control attests the derived digest and the exact secret-name inventory, but Cloudflare does not expose secret values for comparison.
 
+Construct `CloudflareProvisioningClient` with a `CloudflareApiRateCoordinator`. Production replicas must use `D1CloudflareApiRateCoordinator` over one shared fleet-state D1 database and an explicit, nonsecret `quotaScope` for the Cloudflare user or account-token quota. Every caller that shares the provider quota must share the scope. The coordinator reserves at most 1,100 Anchorage-originated requests in each rolling five-minute window across replicas. Never derive the scope from, persist, or log the API token. `ProcessLocalCloudflareApiRateCoordinator` is only for local tests and the single-process credentialed runner; it does not coordinate replicas.
+
+Plain-worker inspection always inventories both plain-text variables and secret names, including expected-empty groups. An inspection failure or any undeclared binding fails exact attestation. Wrangler-backed D1 ownership and migrations use Cloudflare's parameterized query and atomic batch APIs under the active mutation fence. SQLite recognizes anonymous `?` and numbered `?NNN` parameters, literals, quoted identifiers, and comments without string replacement. D1 does not support named SQLite parameters.
+
 Run the package checks with:
 
 ```bash

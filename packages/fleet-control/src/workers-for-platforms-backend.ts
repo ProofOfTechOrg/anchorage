@@ -154,13 +154,13 @@ export interface WorkersForPlatformsApi {
   queryDatabase(
     databaseId: string,
     sql: string,
-    bindings?: readonly unknown[],
+    bindings?: readonly string[],
   ): Promise<readonly Readonly<Record<string, unknown>>[]>;
   batchDatabase(
     databaseId: string,
     statements: readonly {
       readonly sql: string;
-      readonly bindings?: readonly unknown[];
+      readonly bindings?: readonly string[];
     }[],
   ): Promise<void>;
   uploadDispatchWorker(
@@ -261,7 +261,7 @@ export interface WorkersForPlatformsApi {
         schemaVersion: number;
         desiredSpecDigest: string;
         durableObjectTag?: string;
-        plainTextBindings?: Readonly<Record<string, string>>;
+        plainTextBindings: Readonly<Record<string, string>>;
       }
     | undefined
   >;

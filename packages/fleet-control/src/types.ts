@@ -349,9 +349,9 @@ export interface LiveDeployment {
     name: string;
     queueName: string;
   }>[];
-  readonly plainTextBindings?: Readonly<Record<string, string>>;
+  readonly plainTextBindings: Readonly<Record<string, string>>;
   readonly r2BucketBindings?: readonly ApplicationR2Binding[];
-  readonly secretNames?: readonly string[];
+  readonly secretNames: readonly string[];
   readonly artifactVersion: string;
   readonly desiredSpecDigest: string;
   readonly schemaVersion: number;
@@ -388,7 +388,7 @@ export interface FleetInventoryDeployment {
   }>[];
   readonly r2BucketBindings?: readonly ApplicationR2Binding[];
   readonly secretNames: readonly string[];
-  readonly plainTextBindings?: Readonly<Record<string, string>>;
+  readonly plainTextBindings: Readonly<Record<string, string>>;
   readonly routeHostnames: readonly string[];
   readonly zoneRoutes?: readonly WorkerZoneRoute[];
   readonly artifactVersion: string;

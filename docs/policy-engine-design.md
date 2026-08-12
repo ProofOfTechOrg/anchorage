@@ -159,16 +159,24 @@ The SDK uses this order:
 input validation
   -> declared egress
   -> custom evaluators
+  -> required permissions against the trusted projection
   -> dry-run selection
   -> approval grant
-  -> idempotency reserve/replay
+  -> legacy idempotency inspection and migration gate
+  -> v2 idempotency reserve/replay
   -> rate-limit increment
   -> execute with guarded fetch
   -> output validation
   -> idempotency commit
 ```
 
-Only real executions consume rate budget. An execution failure releases an owned idempotency reservation so a later attempt can retry.
+Only real executions consume rate budget. D1 commits the increment and
+expired-window cleanup in one transaction, so a cleanup failure cannot consume
+quota for a rejected execution. An execution or rate-limit failure before a
+successful side effect releases an owned idempotency reservation so a later
+attempt can retry. Output-validation failure after execution leaves an atomic
+reservation pending until stale takeover or operator recovery because an
+immediate release could duplicate the completed side effect.
 
 Every allow, denial, and gate failure emits structured audit. Arbitrary thrown values are mapped to static safe audit reasons rather than copied into audit output.
 

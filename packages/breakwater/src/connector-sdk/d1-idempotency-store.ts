@@ -10,8 +10,10 @@
 
 import type {
   AtomicIdempotencyStore,
+  IdempotencyInspection,
   IdempotencyRecord,
   IdempotencyReservation,
+  InspectableIdempotencyStore,
 } from './index.js';
 import { newToken } from './new-token.js';
 
@@ -62,12 +64,76 @@ export interface D1IdempotencyStoreOptions {
 
 const DEFAULT_TABLE = 'breakwater_idempotency';
 const DEFAULT_PENDING_TTL_MS = 900_000;
+const MAX_TIMESTAMP_MS = 8_640_000_000_000_000;
 
 function parseRecord(json: string | null): IdempotencyRecord {
   // put() serializes the whole record, so a stored `undefined` result
   // round-trips as '{}'. A NULL column (defensive) reads the same way.
   if (json === null) return { result: undefined };
   return JSON.parse(json) as IdempotencyRecord;
+}
+
+function assertJsonNative(value: unknown, seen = new Set<object>()): void {
+  if (
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'boolean'
+  ) {
+    return;
+  }
+  if (typeof value === 'number') {
+    if (Number.isFinite(value) && !Object.is(value, -0)) return;
+    throw new TypeError('D1 idempotency results must be JSON-native');
+  }
+  if (typeof value !== 'object') {
+    throw new TypeError('D1 idempotency results must be JSON-native');
+  }
+  if (seen.has(value)) {
+    throw new TypeError('D1 idempotency results must be JSON-native');
+  }
+  seen.add(value);
+  if (Array.isArray(value)) {
+    const names = Object.getOwnPropertyNames(value);
+    if (
+      names.length !== value.length + 1 ||
+      names.some(
+        (name) =>
+          name !== 'length' &&
+          (!/^(?:0|[1-9]\d*)$/.test(name) || Number(name) >= value.length),
+      ) ||
+      Object.getOwnPropertySymbols(value).length > 0
+    ) {
+      throw new TypeError('D1 idempotency results must be JSON-native');
+    }
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) {
+        throw new TypeError('D1 idempotency results must be JSON-native');
+      }
+      assertJsonNative(descriptor.value, seen);
+    }
+    return;
+  }
+  if (Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new TypeError('D1 idempotency results must be JSON-native');
+  }
+  if (Object.getOwnPropertySymbols(value).length > 0) {
+    throw new TypeError('D1 idempotency results must be JSON-native');
+  }
+  for (const name of Object.getOwnPropertyNames(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, name);
+    if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) {
+      throw new TypeError('D1 idempotency results must be JSON-native');
+    }
+    assertJsonNative(descriptor.value, seen);
+  }
+}
+
+function assertSerializableResult(result: unknown): void {
+  // Preserve the established top-level undefined result compatibility. Every
+  // other value must survive D1's JSON round-trip without changing type or
+  // structure; otherwise a replay could differ from the first public result.
+  if (result !== undefined) assertJsonNative(result);
 }
 
 // The `token` column is added by both CREATE (fresh DBs) and a defensive
@@ -77,7 +143,9 @@ function isDuplicateColumn(error: unknown): boolean {
   return error instanceof Error && /duplicate column/i.test(error.message);
 }
 
-export class D1IdempotencyStore implements AtomicIdempotencyStore {
+export class D1IdempotencyStore
+  implements AtomicIdempotencyStore, InspectableIdempotencyStore
+{
   readonly #db: IdempotencyDatabase;
   readonly #table: string;
   /** Stale-pending takeover threshold (ms) — see D1IdempotencyStoreOptions.pendingTtlMs. */
@@ -92,7 +160,29 @@ export class D1IdempotencyStore implements AtomicIdempotencyStore {
     this.#db = db;
     this.#table = options.table ?? DEFAULT_TABLE;
     this.pendingTtlMs = options.pendingTtlMs ?? DEFAULT_PENDING_TTL_MS;
+    if (
+      !Number.isSafeInteger(this.pendingTtlMs) ||
+      this.pendingTtlMs <= 0 ||
+      this.pendingTtlMs > MAX_TIMESTAMP_MS
+    ) {
+      throw new TypeError(
+        `D1IdempotencyStore pendingTtlMs must be a positive safe integer no greater than ${MAX_TIMESTAMP_MS} milliseconds`,
+      );
+    }
     this.#now = options.now ?? Date.now;
+  }
+
+  /** Inspect a key without changing its reservation state. */
+  async inspect(key: string): Promise<IdempotencyInspection> {
+    await this.#ready();
+    const row = await this.#db
+      .prepare(`SELECT * FROM ${this.#table} WHERE key = ?`)
+      .bind(key)
+      .first<IdempotencyRow>();
+    if (!row) return { state: 'absent' };
+    return row.state === 'done'
+      ? { state: 'replay', record: parseRecord(row.result) }
+      : { state: 'pending' };
   }
 
   /** Atomically reserve a key, replay a completed result, or report contention. */
@@ -156,10 +246,14 @@ export class D1IdempotencyStore implements AtomicIdempotencyStore {
     token?: string,
   ): Promise<void> {
     await this.#ready();
-    // Serialize before touching the row: a non-JSON-serializable result
-    // throws here without corrupting state — the same JSON-safe posture as
-    // the flowsafe approval store.
-    const json = JSON.stringify(record);
+    // Validate and serialize before touching the row. JSON.stringify silently
+    // changes Date, Map, non-finite numbers, holes, and undefined object
+    // members; accepting those would make replay differ from the first public
+    // result. A rejected result leaves the reservation pending, and the
+    // wrapper reports degraded replay protection without inviting a duplicate.
+    const result = record.result;
+    assertSerializableResult(result);
+    const json = JSON.stringify({ result });
     const nowIso = new Date(this.#now()).toISOString();
     if (token !== undefined) {
       // Owner-scoped finalize (audit D2 CAS): flip to 'done' ONLY if this

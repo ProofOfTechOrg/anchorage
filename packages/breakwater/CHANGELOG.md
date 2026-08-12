@@ -1,5 +1,42 @@
 # @proofoftech/breakwater
 
+## Unreleased
+
+### Minor Changes
+
+- Replace delimiter-based connector idempotency keys with a disjoint,
+  collision-proof v2 encoding. The upgrade probes legacy rows first: safe
+  unscoped records remain replayable, ambiguous scoped or colon-bearing rows
+  fail closed, and new v2 execution requires the explicit
+  `legacy-writers-drained` acknowledgement. Shipped atomic stores expose
+  non-mutating inspection; custom atomic stores without it are rejected.
+  Hosts must add the explicit acknowledgement after draining legacy writers;
+  this is a deliberate pre-1.0 source and rollout compatibility boundary.
+
+- Validate D1 pending TTLs and manifest rate-limit counts as positive safe
+  integers within their supported ranges. D1 rate increments and expired-row
+  cleanup now share one transaction, so housekeeping failure cannot consume
+  quota for a rejected call. Custom `RateLimitDatabase` adapters must implement
+  D1-compatible transactional `batch()` semantics. Connector output is now
+  validated before an idempotency result is committed; an invalid result stays
+  out of the replay record, and an atomic reservation stays pending instead of
+  allowing an immediate duplicate execution after the side effect may have
+  completed. New v2 records retain the exact validated/transformed public
+  result without rerunning stateful schemas. D1 now rejects non-JSON-native
+  results that its JSON persistence would silently change rather than creating
+  a type-changing replay.
+
+- Attach trusted agent, deployment, run, thread, resource, entry-path, and
+  principal correlation to connector audit decisions. Trusted context now
+  overrides same-named decision detail.
+
+- Terminate an Agent CLI's descendant process tree when its timeout expires.
+  POSIX execution uses a dedicated process group and confirms its disappearance
+  within a bounded wait; Windows waits for direct argv-based
+  `taskkill.exe /T /F`. Tree-termination failures now have a stable, redacted
+  error category and metadata instead of reporting timeout while a descendant
+  may still run.
+
 ## 0.10.0
 
 ### Minor Changes

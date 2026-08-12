@@ -101,7 +101,21 @@ export class AppRunner extends DurableObjectRunner<Env> {
 }
 ```
 
-`init()` creates D1-backed Mastra storage from the conventional `DB` binding unless you inject storage. Workflow definitions use the same `createWorkflow()` and `createStep()` shape as Mastra.
+`init()` creates D1-backed Mastra storage from the conventional `DB` binding unless you inject storage. Workflow definitions use the same `createWorkflow()` and `createStep()` shape as Mastra. Flowsafe pins `@mastra/cloudflare-d1` 1.1.1 so the minimum supported `@mastra/core` 1.50.0 peer can import and bundle without a consumer override.
+
+If the deployment uses a table prefix, pass one shared constant to storage and host maintenance:
+
+```typescript
+const storageTablePrefix = 'agent_';
+
+const { runtime } = init(env, { tablePrefix: storageTablePrefix });
+const worker = createFlowsafeWorker({
+  ...workerConfig,
+  storageTablePrefix,
+});
+```
+
+The prefix may be empty or must start with an ASCII letter or underscore and continue with ASCII letters, numbers, or underscores. `storageTablePrefix` is not auto-discovered and must match the `tablePrefix` used by `init()` or `createD1Storage()`.
 
 ## Approval lifecycle
 
@@ -252,6 +266,17 @@ Schedules, resources, working memory, and provider subscriptions are standing st
 
 Workflow and run ids use the runner's path-safe pattern. Artifact names are validated segment by segment. `deleteRun()` pairs with terminal-run retention. Deployment decommissioning removes the remaining bucket data.
 
+Construct the retention store from the current maintenance invocation's environment. A module-scoped Worker configuration can safely retain the factory, but must not retain an invocation-specific R2 binding:
+
+```typescript
+const worker = createFlowsafeWorker({
+  ...workerConfig,
+  artifactStore: (env) => new R2ArtifactStore(env.ARTIFACTS),
+});
+```
+
+The factory and artifact deletion run inside the snapshot-retention failure boundary. Either failure preserves the snapshot row for retry and does not stop sibling maintenance duties. Omitting the factory or returning `undefined` keeps row-only retention.
+
 `InMemoryArtifactBucket` is available for tests and offline demos.
 
 ## Audit export
@@ -324,7 +349,7 @@ Complete wiring is in the [durable-agents guide](https://github.com/ProofOfTechO
 
 ## Deployment and operations
 
-The composed `createFlowsafeWorker()` owns the shared route and maintenance-duty pipeline. Hosts inject workflows, identity verification, topology-backed optional routers, budget wrappers, notification transport, artifact pairing, schedule tick, and extra purge duties.
+The composed `createFlowsafeWorker()` owns the shared route and maintenance-duty pipeline. Hosts inject workflows, identity verification, topology-backed optional routers, budget wrappers, notification transport, an invocation-scoped artifact-store factory, the storage table prefix, schedule tick, and extra purge duties.
 
 `createFlowsafeMaintenanceDurableObject()` runs approval service-level agreement (SLA) sweep, retention purge, and optional schedule fire as separate alarm invocations. Provider polling and background recovery use their own Durable Object alarms.
 

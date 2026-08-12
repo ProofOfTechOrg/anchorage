@@ -577,7 +577,7 @@ function comparableR2Bindings(
 export function liveApplicationTopologyMatches(
   expected: ApplicationBindingTopology | undefined,
   live: Readonly<{
-    plainTextBindings?: Readonly<Record<string, string>>;
+    plainTextBindings: Readonly<Record<string, string>>;
     r2BucketBindings?: readonly ApplicationR2Binding[];
   }>,
   fixedPlatformVariableNames: readonly string[],
@@ -586,7 +586,7 @@ export function liveApplicationTopologyMatches(
   const expectedVariables = [...(expected?.vars ?? [])].sort((left, right) =>
     left.name.localeCompare(right.name),
   );
-  const liveVariables = Object.entries(live.plainTextBindings ?? {})
+  const liveVariables = Object.entries(live.plainTextBindings)
     .filter(([name]) => !fixedNames.has(name))
     .map(([name, value]) => ({ name, value }))
     .sort((left, right) => left.name.localeCompare(right.name));

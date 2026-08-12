@@ -1,8 +1,52 @@
 // SPDX-License-Identifier: Apache-2.0
+import { RequestContext } from '@mastra/core/request-context';
 import { describe, expect, it } from 'vitest';
 
 import type { AuditEvent, AuditSink, MetricsRecorder } from './index.js';
-import { AuditLogger, combineAuditSinks, metricsAuditSink } from './index.js';
+import {
+  AGENT_AUDIT_CONTEXT_KEY,
+  AuditLogger,
+  agentAuditDetail,
+  combineAuditSinks,
+  metricsAuditSink,
+} from './index.js';
+
+describe('agentAuditDetail', () => {
+  it('keeps trusted correlation authoritative over spoofed boundary detail', () => {
+    const requestContext = new RequestContext();
+    requestContext.set(AGENT_AUDIT_CONTEXT_KEY, {
+      agentId: 'agent-trusted',
+      entryPath: 'approval-resume',
+      runId: 'run-trusted',
+      threadId: 'thread-trusted',
+      resourceId: 'resource-trusted',
+      principalKind: 'human',
+      principalId: 'principal-trusted',
+    });
+
+    expect(
+      agentAuditDetail(requestContext, {
+        sideEffect: 'write',
+        agentId: 'agent-spoofed',
+        entryPath: 'spoofed',
+        runId: 'run-spoofed',
+        threadId: 'thread-spoofed',
+        resourceId: 'resource-spoofed',
+        principalKind: 'system',
+        principalId: 'principal-spoofed',
+      }),
+    ).toEqual({
+      sideEffect: 'write',
+      agentId: 'agent-trusted',
+      entryPath: 'approval-resume',
+      runId: 'run-trusted',
+      threadId: 'thread-trusted',
+      resourceId: 'resource-trusted',
+      principalKind: 'human',
+      principalId: 'principal-trusted',
+    });
+  });
+});
 
 describe('AuditLogger', () => {
   it('caps the buffer at maxBuffered, dropping oldest first', () => {

@@ -23,7 +23,9 @@ import { scheduleWithCreatorRole } from '../schedules/target-policy.js';
 import type { SignalDatabase } from '../signals/d1-shared.js';
 import { D1NotificationsStorage } from '../signals/notifications-d1.js';
 import { D1ThreadStateStorage } from '../signals/thread-state-d1.js';
+import type { D1DatabaseBinding } from './cf-types.js';
 import {
+  createD1Storage,
   purgeExpiredBackgroundTasks,
   purgeExpiredNotifications,
   purgeExpiredScheduleTriggers,
@@ -127,6 +129,28 @@ const TERMINAL = [
   'skipped',
 ];
 const LIVE = ['running', 'suspended', 'waiting', 'pending', 'paused'];
+
+describe('createD1Storage table prefix', () => {
+  it('uses the shared Mastra-compatible identifier rule', () => {
+    const binding = sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding;
+
+    expect(() =>
+      createD1Storage({ binding, tablePrefix: 'tenant-prod_' }),
+    ).toThrow(
+      'Invalid tablePrefix: use an empty prefix or start with a letter or underscore and continue with letters, numbers, or underscores.',
+    );
+    expect(() =>
+      createD1Storage({ binding, tablePrefix: '01_tenant_' }),
+    ).toThrow(/start with a letter or underscore/);
+    expect(() =>
+      createD1Storage({ binding, tablePrefix: 'tenant_01_' }),
+    ).not.toThrow();
+    expect(() =>
+      createD1Storage({ binding, tablePrefix: '_tenant_01_' }),
+    ).not.toThrow();
+    expect(() => createD1Storage({ binding, tablePrefix: '' })).not.toThrow();
+  });
+});
 
 describe('purgeExpiredWorkflowRuns', () => {
   it('deletes only stale TERMINAL runs and returns the count', async () => {

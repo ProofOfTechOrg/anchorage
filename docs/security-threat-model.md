@@ -100,7 +100,7 @@ Provider output and successful connector output are untrusted data even after tr
 
 Claude Code and Codex run as child processes with workspace-edit permissions. Approval authorizes dispatch, not every file or command the child will choose.
 
-The supported adapter avoids a shell, separates prompt from flags, bounds time/output, and sanitizes diagnostics. Operating-system, container, credential, filesystem, and network isolation remain host responsibilities.
+The supported adapter avoids a shell, separates prompt from flags, bounds time/output, and sanitizes diagnostics. A timeout terminates the inherited POSIX process group or the Windows process tree and fails distinctly if termination cannot complete. A descendant that deliberately creates a separate POSIX session can leave that group. Operating-system, container, credential, filesystem, process-count, and network isolation therefore remain host responsibilities.
 
 ### Notifications, live streams, audit, and SIEM
 
@@ -219,7 +219,7 @@ A host with only one human reviewer must consciously choose availability or sepa
 | Vouched principal answers differently on a later read | Accessor properties are refused outright: a getter survives `Object.freeze`, and the trusted entries read a principal several times per call | A caller inside the trusted computing base can still pass a plain object built to its own liking |
 | Webhook names another subscription | Verify raw bytes first; resolve routing from the stored subscription and provider configuration | Provider secret compromise can forge provider events |
 | Provider alarm lost after subscription | Post-commit reconcile callback and retryable mutation-applied response | Hosts that omit reconciliation must arm polling themselves |
-| Duplicate connector side effect | Atomic idempotency lease and shared store | Poor business keys or too-short pending TTL can still duplicate |
+| Duplicate connector side effect | Collision-proof v2 keys, fail-closed legacy inspection, atomic idempotency lease, and shared store | Poor business keys or too-short pending TTL can still duplicate |
 | One workload exhausts the deployment budget | Deployment-wide D1 rate state and host-set limits | Fixed-window boundary burst remains |
 | Connector redirects to attacker host | Manual per-hop guarded fetch | Transport outside runtime fetch is invisible |
 | Credentials forwarded on redirect | Cross-origin credential-header stripping | Connector body may itself contain secrets |
@@ -357,14 +357,15 @@ Before a public endpoint:
 3. Configure and version `resolvePrincipalPermissions` before registering an agent or connector with `requiredPermissions`; permission-declaring connectors deny on any path without a trusted projection.
 4. Use D1-backed deployment-wide connector stores across per-run objects.
 5. Treat connector budgets and idempotency as deployment-wide unless the application defines a separate, non-tenant logical isolation scope.
-6. Route connector HTTP through `runtime.fetch` and add infrastructure egress policy.
-7. Keep approval connector lists and durable-agent resume targets server-authored.
-8. Mount only configured optional routers.
-9. Configure retention and a resource-set decommissioning procedure for every adopted domain. Delete application Workers before R2, prove every bucket is detached and empty, and never auto-purge application objects.
-10. Protect Durable Object namespaces behind the Worker topologies and set a distinct `DEPLOYMENT_IDENTITY_SECRET` for caller attestation.
-11. Project notifications and audit to the receiving channel's trust level.
-12. Isolate Agent CLI workspaces and review their diffs.
-13. Run the deterministic workerd restart, forgery, and deployment-sentinel mismatch proof.
-14. Keep application KV unsupported, bind only fleet-owned application R2 resources, and treat secret inventory as name-only attestation.
+6. Before enabling v2 idempotency writes, stop and drain all legacy writers sharing the store. Never replay an ambiguous scoped or colon-bearing legacy row without external proof of its exact tuple.
+7. Route connector HTTP through `runtime.fetch` and add infrastructure egress policy.
+8. Keep approval connector lists and durable-agent resume targets server-authored.
+9. Mount only configured optional routers.
+10. Configure retention and a resource-set decommissioning procedure for every adopted domain. Delete application Workers before R2, prove every bucket is detached and empty, and never auto-purge application objects.
+11. Protect Durable Object namespaces behind the Worker topologies and set a distinct `DEPLOYMENT_IDENTITY_SECRET` for caller attestation.
+12. Project notifications and audit to the receiving channel's trust level.
+13. Isolate Agent CLI workspaces and review their diffs.
+14. Run the deterministic workerd restart, forgery, and deployment-sentinel mismatch proof.
+15. Keep application KV unsupported, bind only fleet-owned application R2 resources, and treat secret inventory as name-only attestation.
 
 Report vulnerabilities through [`SECURITY.md`](../SECURITY.md), not a public issue.

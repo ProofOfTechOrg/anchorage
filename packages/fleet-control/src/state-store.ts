@@ -147,6 +147,39 @@ const FLEET_ROW_COLUMNS = [
   'updated_at',
 ] as const;
 
+function isDuplicateBackendSwitchColumn(error: unknown): boolean {
+  let current = error;
+  const seen = new Set<Error>();
+  while (current instanceof Error && !seen.has(current)) {
+    seen.add(current);
+    if (
+      /duplicate column name:\s*backend_switch_intent\b/iu.test(current.message)
+    ) {
+      return true;
+    }
+    current = current.cause;
+  }
+  return false;
+}
+
+function assertBackendSwitchColumn(
+  columns: readonly Readonly<Record<string, unknown>>[],
+): void {
+  const column = columns.find(
+    (candidate) => candidate.name === 'backend_switch_intent',
+  );
+  if (
+    !column ||
+    String(column.type).toUpperCase() !== 'TEXT' ||
+    Number(column.notnull) !== 0 ||
+    Number(column.pk) !== 0
+  ) {
+    throw new Error(
+      'fleet state backend_switch_intent column is absent or incompatible',
+    );
+  }
+}
+
 type DeploymentClaim = readonly [
   'worker-script' | 'dispatch-script' | 'r2-bucket',
   string,
@@ -1119,8 +1152,18 @@ export class D1FleetStateStore
   }
 
   async #ensureSchema(): Promise<void> {
-    this.#schemaReady ??= (async () => {
-      await this.#db.execute(`CREATE TABLE IF NOT EXISTS ${TABLE} (
+    const pending = this.#schemaReady ?? this.#initializeSchema();
+    this.#schemaReady = pending;
+    try {
+      await pending;
+    } catch (error) {
+      if (this.#schemaReady === pending) this.#schemaReady = undefined;
+      throw error;
+    }
+  }
+
+  async #initializeSchema(): Promise<void> {
+    await this.#db.execute(`CREATE TABLE IF NOT EXISTS ${TABLE} (
       tenant_tag TEXT NOT NULL,
       environment TEXT NOT NULL,
       backend TEXT NOT NULL CHECK (backend IN ('plain-worker', 'workers-for-platforms')),
@@ -1160,27 +1203,33 @@ export class D1FleetStateStore
       UNIQUE (database_name),
       UNIQUE (route_hostname)
     )`);
-      const fleetColumns = await this.#db.query(`PRAGMA table_info(${TABLE})`);
-      if (
-        !fleetColumns.some((column) => column.name === 'backend_switch_intent')
-      ) {
+    let fleetColumns = await this.#db.query(`PRAGMA table_info(${TABLE})`);
+    if (
+      !fleetColumns.some((column) => column.name === 'backend_switch_intent')
+    ) {
+      try {
         await this.#db.execute(
           `ALTER TABLE ${TABLE} ADD COLUMN backend_switch_intent TEXT`,
         );
+      } catch (error) {
+        if (!isDuplicateBackendSwitchColumn(error)) throw error;
       }
-      await this.#db.execute(`UPDATE ${TABLE}
+      fleetColumns = await this.#db.query(`PRAGMA table_info(${TABLE})`);
+    }
+    assertBackendSwitchColumn(fleetColumns);
+    await this.#db.execute(`UPDATE ${TABLE}
         SET backend_switch_intent = migration_intent,
             migration_intent = NULL
         WHERE backend_switch_intent IS NULL
           AND json_extract(migration_intent, '$.kind') = 'backend-switch'`);
-      await this.#db.execute(`CREATE TABLE IF NOT EXISTS ${LEASE_TABLE} (
+    await this.#db.execute(`CREATE TABLE IF NOT EXISTS ${LEASE_TABLE} (
       tenant_tag TEXT NOT NULL,
       environment TEXT NOT NULL,
       owner_token TEXT NOT NULL,
       expires_at INTEGER NOT NULL,
       PRIMARY KEY (tenant_tag, environment)
       )`);
-      await this.#db.execute(`CREATE TABLE IF NOT EXISTS ${PLATFORM_CLAIM_TABLE} (
+    await this.#db.execute(`CREATE TABLE IF NOT EXISTS ${PLATFORM_CLAIM_TABLE} (
       account_id TEXT NOT NULL,
       resource_type TEXT NOT NULL CHECK (resource_type IN ('dispatch-namespace', 'dispatch-script', 'worker-script', 'kv-namespace', 'r2-bucket', 'queue')),
       resource_name TEXT NOT NULL,
@@ -1189,13 +1238,11 @@ export class D1FleetStateStore
       platform_plane_identity TEXT NOT NULL,
       PRIMARY KEY (account_id, resource_type, resource_name)
     )`);
-      await this.#db.execute(`CREATE TABLE IF NOT EXISTS ${PLATFORM_LEASE_TABLE} (
+    await this.#db.execute(`CREATE TABLE IF NOT EXISTS ${PLATFORM_LEASE_TABLE} (
       resource_set_key TEXT PRIMARY KEY,
       owner_token TEXT NOT NULL,
       expires_at INTEGER NOT NULL
     )`);
-    })();
-    await this.#schemaReady;
   }
 
   async withDeploymentLease<T>(

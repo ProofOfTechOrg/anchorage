@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { RequestContext } from '@mastra/core/request-context';
 import type { ToolExecutionContext } from '@mastra/core/tools';
 import { describe, expect, it, type Mock, vi } from 'vitest';
@@ -114,6 +118,7 @@ function errorSurface(error: unknown): string {
     exitCode: structured.exitCode,
     timeoutMs: structured.timeoutMs,
     systemCode: structured.systemCode,
+    terminationMethod: structured.terminationMethod,
     stdoutCaptured: structured.stdoutCaptured,
     stderrCaptured: structured.stderrCaptured,
   });
@@ -130,6 +135,16 @@ function privateDefinition(
     buildFlags: () => [],
     ...overrides,
   };
+}
+
+function expectProcessAbsent(pid: number): void {
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if ((error as { code?: unknown }).code === 'ESRCH') return;
+    throw error;
+  }
+  throw new Error(`process ${pid} was alive when the timeout settled`);
 }
 
 describe('createClaudeCodeConnector', () => {
@@ -707,8 +722,9 @@ function fakeD1LikeStore(pendingTtlMs: number) {
   return {
     pendingTtlMs,
     get: () => undefined,
+    inspect: () => ({ state: 'absent' as const }),
     put: () => {},
-    reserve: () => ({ state: 'reserved' as const }),
+    reserve: () => ({ state: 'reserved' as const, token: 'test-token' }),
     release: () => {},
   };
 }
@@ -944,8 +960,8 @@ describe('tailAccumulator (cross-chunk UTF-8 boundary)', () => {
 });
 
 // The default runner is normally replaced by an injected `exec`; these tests
-// exercise the real node:child_process path (spawn, timeout SIGKILL, ENOENT
-// wrapping) using this Node process itself as a harmless stand-in binary.
+// exercise the real node:child_process path (spawn, process-tree timeout,
+// ENOENT wrapping) using this Node process itself as a harmless stand-in.
 describe('defaultExec (real node:child_process spawn)', () => {
   // A definition whose "binary" is the running Node and whose flags are an
   // inline script — no injected exec, so defaultExec actually spawns.
@@ -1016,6 +1032,57 @@ describe('defaultExec (real node:child_process spawn)', () => {
     expect(JSON.stringify(audit.events())).not.toContain(PRIVATE_PROMPT);
   });
 
+  it.runIf(process.platform !== 'win32')(
+    'terminates the timed-out child and its long-lived descendant',
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'breakwater-tree-'));
+      const pidFile = join(directory, 'pids.json');
+      const grandchildScript = 'setInterval(() => {}, 30000)';
+      const childScript = [
+        `const { spawn } = process.getBuiltinModule('node:child_process');`,
+        `const { writeFileSync } = process.getBuiltinModule('node:fs');`,
+        `const grandchild = spawn(process.execPath, ['-e', ${JSON.stringify(grandchildScript)}], { stdio: 'ignore' });`,
+        `writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify({ child: process.pid, grandchild: grandchild.pid }));`,
+        `setInterval(() => {}, 30000);`,
+      ].join('');
+      const tool = nodeScriptConnector(childScript, 500);
+      let pids: { child: number; grandchild: number } | undefined;
+
+      try {
+        const failure = await run(tool, { prompt: 'p' }, makeContext()).catch(
+          (error: unknown) => error,
+        );
+        expect(failure).toMatchObject({ code: 'timeout', timeoutMs: 500 });
+
+        pids = JSON.parse(await readFile(pidFile, 'utf8')) as {
+          child: number;
+          grandchild: number;
+        };
+        expect(pids.child).toBeGreaterThan(0);
+        expect(pids.grandchild).toBeGreaterThan(0);
+        for (const pid of [pids.child, pids.grandchild])
+          expectProcessAbsent(pid);
+      } finally {
+        if (!pids) {
+          try {
+            pids = JSON.parse(await readFile(pidFile, 'utf8')) as {
+              child: number;
+              grandchild: number;
+            };
+          } catch {}
+        }
+        if (pids) {
+          for (const pid of [pids.child, pids.grandchild]) {
+            try {
+              process.kill(pid, 'SIGKILL');
+            } catch {}
+          }
+        }
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
   it('wraps a spawn failure (nonexistent binary) as AgentCliError', async () => {
     // #given
     const audit = new AuditLogger();
@@ -1045,6 +1112,53 @@ describe('defaultExec (real node:child_process spawn)', () => {
     });
     expect(errorSurface(failure)).not.toContain(PRIVATE_PROMPT);
     expect(JSON.stringify(audit.events())).not.toContain(PRIVATE_PROMPT);
+  });
+
+  it('exposes only stable process-tree termination failure metadata', async () => {
+    const childProcess = process.getBuiltinModule('node:child_process');
+    const child = {
+      pid: 4242,
+      stdout: null,
+      stderr: null,
+      on: vi.fn(),
+    };
+    const spawn = vi
+      .spyOn(childProcess, 'spawn')
+      .mockReturnValue(child as never);
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+      throw Object.assign(new Error(PRIVATE_PROCESS_OUTPUT), { code: 'EPERM' });
+    });
+    const audit = new AuditLogger();
+    const tool = nodeScriptConnector(
+      'setTimeout(() => {}, 30000)',
+      1,
+      undefined,
+      audit,
+    );
+
+    try {
+      const failure = await run(
+        tool,
+        { prompt: PRIVATE_PROMPT },
+        makeContext(),
+      ).catch((error: unknown) => error);
+
+      expect(failure).toMatchObject({
+        code: 'termination-failed',
+        timeoutMs: 1,
+        systemCode: 'EPERM',
+        terminationMethod: 'process-group',
+      });
+      expect(errorSurface(failure)).not.toContain(PRIVATE_PROMPT);
+      expect(errorSurface(failure)).not.toContain(PRIVATE_PROCESS_OUTPUT);
+      expect(JSON.stringify(audit.events())).not.toContain(PRIVATE_PROMPT);
+      expect(JSON.stringify(audit.events())).not.toContain(
+        PRIVATE_PROCESS_OUTPUT,
+      );
+    } finally {
+      kill.mockRestore();
+      spawn.mockRestore();
+    }
   });
 
   it('surfaces a nonzero child exit without copying stderr into the error', async () => {

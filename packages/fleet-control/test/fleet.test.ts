@@ -2,6 +2,7 @@
 
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
+import { canonicalApplicationBindings } from '../src/application-bindings.js';
 import type {
   BridgeMutationPlan,
   BridgeSnapshot,
@@ -274,6 +275,7 @@ class FleetBackend implements ProvisioningBackend {
       deployment.authoredBy === 'external' && platformResources
         ? externalReleaseTopology(deployment, platformResources)
         : undefined;
+    const application = canonicalApplicationBindings(deployment);
     this.live.set(deployment.tenantTag, {
       tenantTag: deployment.tenantTag,
       environment: deployment.environment,
@@ -307,6 +309,16 @@ class FleetBackend implements ProvisioningBackend {
               },
             ]
           : []),
+      plainTextBindings: Object.fromEntries(
+        application.vars.map(({ name, value }) => [name, value]),
+      ),
+      secretNames: [
+        'DEPLOYMENT_IDENTITY_SECRET',
+        ...(deployment.authoredBy === 'platform'
+          ? ['MAINTENANCE_ADMIN_SECRET']
+          : []),
+        ...application.secrets.map(({ name }) => name),
+      ].sort(),
       artifactVersion: `v${deployment.schemaVersion}`,
       desiredSpecDigest: deploymentSpecDigest(deployment),
       schemaVersion: deployment.schemaVersion,
@@ -595,6 +607,8 @@ function liveFor(
     scriptName: item.scriptName,
     databaseId: item.databaseId,
     durableObjectBindings: item.durableObjectBindings,
+    plainTextBindings: {},
+    secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
     artifactVersion: item.artifactVersion,
     desiredSpecDigest: item.desiredSpecDigest,
     schemaVersion: item.schemaVersion,
@@ -623,6 +637,7 @@ function inventoryFor(records: readonly FleetRecord[]): FleetResourceInventory {
       environment: item.environment,
       databaseIds: [item.databaseId],
       durableObjectBindings: item.durableObjectBindings,
+      plainTextBindings: {},
       secretNames:
         item.backend === 'workers-for-platforms'
           ? ['DEPLOYMENT_IDENTITY_SECRET']
@@ -1110,6 +1125,7 @@ describe('fleet operations', () => {
             environment: acme.environment,
             databaseIds: [acme.databaseId],
             durableObjectBindings: candidate.topology.durableObjectBindings,
+            plainTextBindings: {},
             secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
             routeHostnames:
               candidate.physicalScriptName === scenario.routeScriptName
@@ -1311,6 +1327,7 @@ describe('fleet operations', () => {
             ? ['db-wrong']
             : [acme.databaseId],
         durableObjectBindings: acme.durableObjectBindings,
+        plainTextBindings: {},
         serviceBindings:
           candidate.physicalScriptName === driftedName && drift === 'topology'
             ? [{ name: 'FORGED_PROXY', service: 'attacker-worker' }]
@@ -1472,6 +1489,7 @@ describe('fleet operations', () => {
         environment: migrating.environment,
         databaseIds: [migrating.databaseId],
         durableObjectBindings: migrating.durableObjectBindings,
+        plainTextBindings: {},
         secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
         routeHostnames:
           release === routeRelease ? [migrating.routeHostname] : [],
@@ -1665,6 +1683,7 @@ describe('fleet operations', () => {
           environment: acme.environment,
           databaseIds: [acme.databaseId],
           durableObjectBindings: acme.durableObjectBindings,
+          plainTextBindings: {},
           secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
           routeHostnames: [acme.routeHostname],
           artifactVersion: active.artifactVersion,
@@ -1782,6 +1801,7 @@ describe('fleet operations', () => {
                 environment: current.environment,
                 databaseIds: [current.databaseId],
                 durableObjectBindings: current.durableObjectBindings,
+                plainTextBindings: {},
                 secretNames: [
                   'DEPLOYMENT_IDENTITY_SECRET',
                   'MAINTENANCE_ADMIN_SECRET',
@@ -1941,6 +1961,7 @@ describe('fleet operations', () => {
           environment: current.environment,
           databaseIds: [current.databaseId],
           durableObjectBindings: current.durableObjectBindings,
+          plainTextBindings: {},
           secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
           routeHostnames: [current.routeHostname],
           artifactVersion: current.artifactVersion,

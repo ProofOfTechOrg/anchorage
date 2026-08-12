@@ -48,6 +48,7 @@ import { z } from 'zod';
 interface SlackPosterOptions {
   audit?: AuditLogger;
   idempotencyStore: IdempotencyStore;
+  idempotencyKeyMigration: 'legacy-writers-drained';
   rateLimitStore: RateLimitStore;
   webhookHost?: string;
 }
@@ -77,6 +78,7 @@ export function createSlackPoster(options: SlackPosterOptions) {
     policies: {
       audit: options.audit,
       idempotencyStore: options.idempotencyStore,
+      idempotencyKeyMigration: options.idempotencyKeyMigration,
       rateLimitStore: options.rateLimitStore,
       networkEgress: {
         allowedDomains: ['hooks.slack.com'],
@@ -106,8 +108,8 @@ export function createSlackPoster(options: SlackPosterOptions) {
 
 Keep connector IDs stable and colon-free. Dotted IDs such as
 `slack.post-message` work with approval globs and cannot collide with the
-colon-joined idempotency and rate-limit keys. `createConnector()` rejects an
-ID containing `:`.
+unchanged `[scope:]connector` rate-limit keys. `createConnector()` rejects an
+ID containing `:`. Idempotency uses a separate collision-proof v2 encoding.
 
 ## Understand the execution order
 
@@ -124,12 +126,26 @@ wrapper then applies:
 7. The rate-limit increment for an actual execution.
 8. Your `execute()` function.
 9. Per-request and per-redirect host checks whenever `runtime.fetch()` runs.
-10. Mastra output-schema validation.
+10. Wrapper output-schema validation and transformation before a replay result
+    is committed.
+11. The idempotency result commit for a valid fresh keyed result.
+12. Mastra consumes that captured Standard Schema result without rerunning a
+    stateful validator.
+
+New v2 replay records store that exact validated/transformed public result, so
+a replay does not execute or transform it again. A safe legacy v1 result still
+crosses the schema boundary once because it predates this invariant.
 
 Dry runs pass through the pre-execute evaluators and the
 required-permissions check but skip approval, idempotency, and rate-limit
 consumption. Replays and same-isolate in-flight joins do not consume rate
 budget.
+
+An execution or rate-limit failure before a successful side effect releases an
+owned atomic reservation. If output validation fails after `execute()`
+returns, the result is not committed and the reservation stays pending until
+stale takeover or operator recovery; releasing it immediately could duplicate
+the completed side effect.
 
 Calls that reach the wrapper record the relevant allow, deny, or failure events
 through the configured `AuditLogger`. Secondary events can also report a
@@ -177,6 +193,7 @@ contain `_background`.
 | `writePermissions` | Connector-ID globs that require approval, plus the destructive default | Optional. `permissions.requiresApproval` works without it. |
 | `evaluators` | Additional `ToolPolicyEvaluator` instances | Optional. They run after `networkEgress` and before all execution branches. |
 | `idempotencyStore` | Replay records and atomic reservations | `permissions.idempotencyKey` is true. |
+| `idempotencyKeyMigration` | Acknowledge that legacy writers sharing the store are stopped and drained | A missing legacy record may execute under the v2 key format. |
 | `rateLimitStore` | Atomic fixed-window counters | `permissions.rateLimit` is present. |
 | `audit` | Structured decision sink | Optional but recommended for every production deployment. |
 | `fetch` | Base fetch wrapped by `runtime.fetch` | Optional. Inject vendor mocks in tests or a platform fetch in nonstandard runtimes. |
@@ -304,12 +321,15 @@ const rateLimitStore = new D1RateLimitStore(env.DB, {
 while the original holder is still running can duplicate a write. The default
 is 900,000 ms. The Agent CLI wrapper checks this against its own timeout when
 both idempotency and a store exposing `pendingTtlMs` are configured.
+The constructor accepts only positive safe integers up to
+8,640,000,000,000,000 ms.
 `D1IdempotencyStoreOptions.now` is a clock override for deterministic tests;
 production should use the default clock.
 
-Durable custom stores must implement `AtomicIdempotencyStore`. A durable
-get-then-put implementation can let two isolates miss and execute the same key
-at once.
+Durable custom stores must implement `AtomicIdempotencyStore` and
+`InspectableIdempotencyStore`. The non-mutating `inspect()` call distinguishes
+an absent legacy key from pending work during migration. A durable get-then-put
+implementation can let two isolates miss and execute the same key at once.
 
 Store failure handling is designed around side-effect safety:
 
@@ -319,10 +339,33 @@ Store failure handling is designed around side-effect safety:
 - A reservation release failure is audited and recovered through stale
   takeover.
 
-Scope-aware calls use
-`<isolationScope>:<connectorId>:<idempotencyKey>`. Calls without a scope keep
-the single-tenant `<connectorId>:<idempotencyKey>` shape. Do not manually add a
-tenant prefix and assume that substitutes for the trusted scope.
+`D1IdempotencyStore` accepts JSON-native results plus the established top-level
+`undefined` result. It rejects values that JSON would silently change, such as
+`Date`, `Map`, repeated object references, non-finite numbers, sparse arrays,
+or nested `undefined`, before finalizing the row. The wrapper returns the
+successful public result, audits the failed `put()`, and leaves an atomic
+reservation pending instead of storing a replay with a different type or
+structure.
+
+New idempotency records use an opaque, versioned composite key. Do not construct
+or parse it. The previous `[isolationScope:]connectorId:idempotencyKey` form is
+read only during migration. An unscoped legacy key without a colon remains
+safe to replay. Every scoped legacy key and every unscoped business key that
+contains a colon is ambiguous and fails closed instead of replaying into a
+possibly different identity.
+
+Before setting `idempotencyKeyMigration: 'legacy-writers-drained'`, stop and
+drain every old writer sharing the store. Inventory legacy rows, and map any
+ambiguous row to exactly one business identity using external evidence. Leave
+an unproven row in place: affected calls continue to fail closed. Without the
+acknowledgement, an absent legacy key cannot execute because an old writer
+could still create it after inspection.
+
+Breakwater stores only `{ result }`. It does not compare a retried request body
+with the original input. A gateway that promises mismatch detection must own a
+canonical request representation and store its fingerprint atomically with the
+idempotency result. The same key and fingerprint may replay; the same key with
+a different fingerprint must be rejected by that gateway.
 
 ## Use the right rate-limit store
 
@@ -333,6 +376,15 @@ database.
 Only actual execution consumes budget. Denials, dry runs, stored replays, and
 same-isolate in-flight joins do not increment it. A rate-store failure denies
 execution rather than allowing an unbudgeted call.
+
+Rate-limit counts must be safe integers from 1 through
+`Number.MAX_SAFE_INTEGER`. `D1RateLimitStore` batches the increment and expired
+window cleanup in one D1 transaction. A cleanup failure therefore rejects
+before quota commits, and a retry starts at the correct count.
+
+A custom structural `RateLimitDatabase` adapter must provide D1-compatible
+transactional `batch()` behavior. Sequentially executing its statements without
+rollback does not satisfy the store contract.
 
 The store's reach is the budget's reach. Under one Durable Object per run, an
 in-memory limit is effectively per run. Use D1 or another shared implementation
@@ -475,11 +527,22 @@ The default runner:
 - spawns without a shell;
 - inherits the parent process environment and CLI authentication;
 - runs in the caller-supplied `cwd`;
-- kills the process after `timeoutMs`, default 600,000;
+- terminates the process tree after `timeoutMs`, default 600,000, using a
+  dedicated POSIX process group or direct `taskkill.exe /T /F` argv on Windows;
 - retains the UTF-8 tail of stdout and stderr, default 1 MiB per stream;
 - supports `maxOutputBytes: 0` for exit-code-only use.
 
 `timeoutMs` must be an integer from 1 through 2,147,483,647.
+
+The timeout result is not returned until Windows taskkill completes or the
+POSIX group is confirmed absent. POSIX waits up to five seconds; `ESRCH` means
+the group is gone. Permission failures, unavailable process IDs, a group that
+remains present after that bounded wait, and Windows taskkill spawn or
+nonzero-exit failures surface as the stable `termination-failed` category with
+only sanitized system code, numeric exit code, and `process-group` or
+`taskkill` method metadata. No termination path invokes a shell. A process that
+deliberately leaves its inherited POSIX session is outside this containment
+boundary, so the surrounding container or host process limit remains required.
 `maxOutputBytes` must be a non-negative safe integer. Invalid values fail at
 connector construction, including when an injected `exec` would ignore them.
 
@@ -507,6 +570,8 @@ metadata:
 - `code`, `connectorId`, and the redacted `command`;
 - safe numeric values such as `exitCode` and `timeoutMs`;
 - a validated operating-system `systemCode`;
+- the fixed `process-group` or `taskkill` termination method when termination
+  itself failed;
 - booleans stating whether stdout or stderr contained data.
 
 They do not copy the prompt, captured stdout or stderr, parser exceptions,
@@ -521,6 +586,7 @@ flags-failed
 invalid-flags
 spawn-failed
 timeout
+termination-failed
 exec-failed
 invalid-exec-result
 nonzero-exit
@@ -571,8 +637,8 @@ For an Agent CLI adapter, also pin:
 - the redacted display command;
 - flag-shaped prompt and model inputs;
 - real and dry-run `buildFlags` failures;
-- executor rejection, malformed results, parser failures, timeout, nonzero
-  exit, and spawn failure;
+- executor rejection, malformed results, parser failures, timeout, process-tree
+  termination failure, nonzero exit, and spawn failure;
 - validation errors and legacy cached result sanitization;
 - the default runner's UTF-8 byte cap.
 

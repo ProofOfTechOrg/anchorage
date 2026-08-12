@@ -148,13 +148,23 @@ Breakwater includes in-memory and D1-backed stores.
 
 Idempotency supports completed-result replay, concurrent same-key joining,
 atomic reservation, stale-pending takeover, and lease-bound completion or
-release. The isolation scope participates in durable keys.
+release. The isolation scope participates in a collision-proof, opaque v2
+identity. Safe unscoped v1 rows remain replayable, while ambiguous legacy rows
+fail closed. New execution requires an explicit acknowledgement that old
+writers sharing the store have stopped and drained.
+
+Breakwater stores the execution result only. Canonical request
+representation, request fingerprints, and same-key request-mismatch rejection
+belong to the application gateway.
 
 Rate limiting uses fixed epoch-aligned windows. Only an execution that reaches
 the inner connector consumes budget. Denials, dry runs, completed replays, and
 same-attempt joins do not. A fixed window can admit bursts across a window
 boundary; use another algorithm outside breakwater if you require a smooth
 rate.
+Counts are bounded to safe integers. D1 commits its increment and expired-row
+cleanup atomically, so failed housekeeping cannot spend quota for a rejected
+execution.
 
 ### Workflow and opaque isolation scope
 
@@ -172,7 +182,7 @@ optional structured detail. It has an in-memory ring and an optional sink.
 `combineAuditSinks()` fans out events, and `metricsAuditSink()` adapts decisions
 to counters and duration histograms.
 
-Guarded RBAC and policy events use `agent:<agentId>` as their resource. A trusted host can set `breakwater.auditContext` with scalar agent, deployment, run, thread, resource, and entry-path correlation. Breakwater's field remains named `tenantId`; Flowsafe populates it only from the verified deployment tag. Breakwater ignores every other property and lets decision-specific policy or channel detail win on collision.
+Guarded RBAC, policy, and connector events use trusted `breakwater.auditContext` correlation. A trusted host can set scalar agent, deployment, run, thread, resource, entry-path, and principal fields. Breakwater's deployment field remains named `tenantId`; Flowsafe populates it only from the verified deployment tag. Breakwater ignores every other property, and trusted correlation wins over same-named decision detail.
 
 The in-memory ring is not durable. Use the flowsafe queue exporter or another sink for production evidence. Do not place secrets in connector IDs, policy names, idempotency keys, or custom audit detail.
 

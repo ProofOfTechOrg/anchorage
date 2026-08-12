@@ -173,7 +173,8 @@ Other route factories accept a `basePath` when the exact public prefix is host-s
 - `buildAgentRouter` for the metadata-only public catalog and run routes
 - `buildResumeRun` to compose approval-only agent resume with generic workflow resume
 - `notify` for reviewer delivery
-- `artifactStore` to pair R2 deletion with snapshot retention
+- `artifactStore(env)` to build the R2 purger from the current invocation and pair artifact deletion with snapshot retention
+- `storageTablePrefix` to target the same prefix-aware D1 tables as runtime storage
 - `backgroundTasks` for task cleanup
 - `buildSignalRouter`
 - `buildObjectiveRouter`
@@ -225,7 +226,9 @@ TTL retention, authorized domain deletion, and deployment decommissioning are se
 | `flowsafe_resource_owners` | Run retention and schedule deletion release their claims. Thread and resource claims require explicit host teardown or deployment decommissioning |
 | R2 artifacts | Delete with the owning snapshot purge and deployment decommissioning |
 
-Decommission the whole physical resource set after revoking traffic and credentials. There is no in-database organization purge. Pass the same artifact store used for runtime writes to retention so snapshot deletion remains paired with artifact deletion.
+Decommission the whole physical resource set after revoking traffic and credentials. There is no in-database organization purge. Build the retention artifact store from the current invocation's R2 binding and use the same bucket as runtime writes. Artifact deletion precedes snapshot deletion; a factory or deletion failure preserves the row for retry.
+
+When `init()` or `createD1Storage()` receives `tablePrefix`, pass the same value as `storageTablePrefix` to `createFlowsafeWorker()`. The shared rule accepts an empty prefix or requires an ASCII letter or underscore first, followed by ASCII letters, numbers, or underscores. Maintenance applies it to workflow snapshots, threads/messages, background tasks and their snapshots, notifications, thread state, and schedule-trigger history. Approval, resource-owner, deployment-sentinel, subscription, and other fixed-schema tables remain unprefixed. A valid but mismatched value targets a different table family; Flowsafe does not auto-discover it.
 
 Idle-thread retention does not release thread or resource ownership. A thread can still have an agent binding, schedule, subscription, goal, or other standing wake source after its idle memory rows expire. An explicit host teardown must remove every authoritative standing record before it calls `ActorContext.releaseResource()` for the thread and resource claims.
 
@@ -233,7 +236,7 @@ Idle-thread retention does not release thread or resource ownership. A thread ca
 
 Breakwater's `runtime.fetch` protects only requests sent through that injected fetch. Route compatible SDK transports through it. Enforce socket-level policy with Cloudflare account controls, network architecture, or a separate proxy.
 
-Claude Code and Codex connectors execute on Node, edit the configured workspace, and can run commands allowed by those CLIs. Put them in a dedicated checkout or container, apply filesystem and process boundaries, pass `cwd` from trusted host configuration, and keep human approval enabled. See [Agent CLI connectors](agent-cli-connectors.md).
+Claude Code and Codex connectors execute on Node, edit the configured workspace, and can run commands allowed by those CLIs. The built-in timeout tears down the inherited POSIX process group or Windows process tree, but it is not a process sandbox. Put them in a dedicated checkout or container, apply filesystem and process boundaries, pass `cwd` from trusted host configuration, and keep human approval enabled. See [Agent CLI connectors](agent-cli-connectors.md).
 
 ## Deployment validation
 

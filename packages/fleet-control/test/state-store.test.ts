@@ -24,6 +24,16 @@ class MemoryD1 implements FleetStateDatabase {
     sql: string,
     bindings: readonly unknown[] = [],
   ): Promise<readonly Readonly<Record<string, unknown>>[]> {
+    if (sql.startsWith('PRAGMA table_info(anchorage_fleet_deployments)')) {
+      return [
+        {
+          name: 'backend_switch_intent',
+          type: 'TEXT',
+          notnull: 0,
+          pk: 0,
+        },
+      ];
+    }
     if (sql.startsWith('SELECT *')) return this.row ? [this.row] : [];
     if (sql.startsWith('INSERT INTO anchorage_fleet_leases')) {
       return [{ owner_token: bindings[2], expires_at: 1 }];
@@ -272,6 +282,97 @@ class MemoryD1 implements FleetStateDatabase {
   }
 }
 
+class SchemaD1 implements FleetStateDatabase {
+  column: Readonly<Record<string, unknown>> | undefined = {
+    name: 'backend_switch_intent',
+    type: 'TEXT',
+    notnull: 0,
+    pk: 0,
+  };
+  createAttempts = 0;
+  alterAttempts = 0;
+  failCreateOnce = false;
+  failAlterOnce = false;
+
+  async query(
+    sql: string,
+  ): Promise<readonly Readonly<Record<string, unknown>>[]> {
+    if (sql.startsWith('PRAGMA table_info')) {
+      return this.column ? [this.column] : [];
+    }
+    return [];
+  }
+
+  async execute(sql: string): Promise<void> {
+    if (
+      sql.startsWith('CREATE TABLE IF NOT EXISTS anchorage_fleet_deployments')
+    ) {
+      this.createAttempts += 1;
+      if (this.failCreateOnce) {
+        this.failCreateOnce = false;
+        throw new Error('transient schema failure');
+      }
+    }
+    if (sql.startsWith('ALTER TABLE')) {
+      this.alterAttempts += 1;
+      if (this.failAlterOnce) {
+        this.failAlterOnce = false;
+        throw new Error('genuine migration failure');
+      }
+      this.column = {
+        name: 'backend_switch_intent',
+        type: 'TEXT',
+        notnull: 0,
+        pk: 0,
+      };
+    }
+  }
+
+  async batch(): Promise<
+    readonly (readonly Readonly<Record<string, unknown>>[])[]
+  > {
+    return [];
+  }
+}
+
+class ConcurrentSchemaD1 extends SchemaD1 {
+  readonly #bothInspected: Promise<void>;
+  #releaseInspections!: () => void;
+  #coldInspections = 0;
+
+  constructor() {
+    super();
+    this.column = undefined;
+    this.#bothInspected = new Promise((resolve) => {
+      this.#releaseInspections = resolve;
+    });
+  }
+
+  override async query(
+    sql: string,
+  ): Promise<readonly Readonly<Record<string, unknown>>[]> {
+    if (sql.startsWith('PRAGMA table_info') && this.#coldInspections < 2) {
+      this.#coldInspections += 1;
+      if (this.#coldInspections === 2) this.#releaseInspections();
+      await this.#bothInspected;
+      return [];
+    }
+    return super.query(sql);
+  }
+
+  override async execute(sql: string): Promise<void> {
+    if (sql.startsWith('ALTER TABLE') && this.column !== undefined) {
+      this.alterAttempts += 1;
+      throw new Error('D1 migration failed', {
+        cause: new Error(
+          'duplicate column name: backend_switch_intent: SQLITE_ERROR',
+        ),
+      });
+    }
+    await super.execute(sql);
+  }
+}
+
 function reservedRecord(
   backend: FleetRecord['backend'],
   scriptName = 'tenant-worker',
@@ -308,6 +409,76 @@ function platformSet(workerName: string): PlatformPlaneResourceSet {
 }
 
 describe('D1FleetStateStore release state', () => {
+  it('retries a transient schema bootstrap failure on the same instance', async () => {
+    const db = new SchemaD1();
+    db.failCreateOnce = true;
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+
+    await expect(store.get('acme', 'production')).rejects.toThrow(
+      /transient schema failure/u,
+    );
+    await expect(store.get('acme', 'production')).resolves.toBeUndefined();
+    expect(db.createAttempts).toBe(2);
+  });
+
+  it('accepts only a verified concurrent duplicate-column race', async () => {
+    const db = new ConcurrentSchemaD1();
+    const first = new D1FleetStateStore(db, { accountId: 'account' });
+    const second = new D1FleetStateStore(db, { accountId: 'account' });
+
+    await expect(
+      Promise.all([
+        first.get('acme', 'production'),
+        second.get('other', 'production'),
+      ]),
+    ).resolves.toEqual([undefined, undefined]);
+    expect(db.alterAttempts).toBe(2);
+    expect(db.column).toMatchObject({
+      name: 'backend_switch_intent',
+      type: 'TEXT',
+      notnull: 0,
+      pk: 0,
+    });
+  });
+
+  it('propagates a genuine migration failure and retries it later', async () => {
+    const db = new SchemaD1();
+    db.column = undefined;
+    db.failAlterOnce = true;
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+
+    await expect(store.get('acme', 'production')).rejects.toThrow(
+      /genuine migration failure/u,
+    );
+    await expect(store.get('acme', 'production')).resolves.toBeUndefined();
+    expect(db.alterAttempts).toBe(2);
+  });
+
+  it('verifies current column shape and does not repeat migration work', async () => {
+    const current = new SchemaD1();
+    const currentStore = new D1FleetStateStore(current, {
+      accountId: 'account',
+    });
+    await currentStore.get('acme', 'production');
+    await currentStore.get('other', 'production');
+    expect(current.createAttempts).toBe(1);
+    expect(current.alterAttempts).toBe(0);
+
+    const incompatible = new SchemaD1();
+    incompatible.column = {
+      name: 'backend_switch_intent',
+      type: 'INTEGER',
+      notnull: 1,
+      pk: 0,
+    };
+    await expect(
+      new D1FleetStateStore(incompatible, { accountId: 'account' }).get(
+        'acme',
+        'production',
+      ),
+    ).rejects.toThrow(/absent or incompatible/u);
+  });
+
   it('atomically transitions the deployment claim role with backend ownership', async () => {
     const db = new MemoryD1();
     const store = new D1FleetStateStore(db, { accountId: 'account' });

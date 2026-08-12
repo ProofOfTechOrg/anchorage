@@ -1,5 +1,13 @@
 # showcase
 
+## Unreleased
+
+### Patch Changes
+
+- Forward Breakwater's explicit idempotency-key migration boundary through the
+  workflow connectors. Fresh in-memory runtimes acknowledge it automatically;
+  injected durable stores require the host's drained-writer acknowledgement.
+
 ## 0.0.12
 
 ### Patch Changes
