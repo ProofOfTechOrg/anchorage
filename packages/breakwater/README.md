@@ -243,6 +243,12 @@ tenant scope, and the direct-call background override defense. The
 [connector authoring guide](./CONNECTORS.md) contains the complete manifest,
 storage, invocation, egress, and testing contract.
 
+### Apply the physical-deployment preset
+
+Use `singleTenantConnectorPolicies()` when one physically isolated deployment serves one organization. It requires D1-backed stores for declared idempotency and rate limits, production audit export or an explicit development opt-out, an organization egress allowlist, principal-permission wiring, and the background-execution policy. It rejects `tenantIsolation()`, weakened destructive approval, incomplete manifest policy, and replacement of validated policy members.
+
+Build the preset once and pass the returned frozen policy set to each connector. Read [Connector interface](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/connector-interface.md#apply-the-physical-deployment-preset) for the configuration contract.
+
 ## Set request context at trusted boundaries
 
 The connector wrapper reads these keys:
@@ -447,6 +453,7 @@ for compatibility.
 | Runtime exports | Purpose |
 | --- | --- |
 | `createConnector`, `connectorManifest` | Build an enforced Mastra tool and inspect its immutable manifest |
+| `singleTenantConnectorPolicies` | Build the validated connector-policy baseline for one physically isolated deployment |
 | `ConnectorPolicyError` | Structured policy denial |
 | `CONNECTOR_GRANTS_CONTEXT_KEY`, `CONNECTOR_EXECUTION_CONTEXT_KEY`, `DRY_RUN_CONTEXT_KEY`, `IDEMPOTENCY_KEY_CONTEXT_KEY` | Stable connector request-context keys |
 | `InMemoryIdempotencyStore`, `D1IdempotencyStore` | Development and durable replay stores |
@@ -454,6 +461,9 @@ for compatibility.
 | `egressFetch`, `EgressDeniedError` | Standalone fetch guard and its default denial |
 
 Type exports: `PermissionManifest`, `ConnectorConfig`, `ConnectorPolicies`,
+`SingleTenantConnectorPolicies`, `SingleTenantConnectorPoliciesOptions`,
+`SingleTenantAuditPosture`, `SingleTenantDurableStores`,
+`SingleTenantPermissionPosture`,
 `ConnectorApprovalGrant`, `ConnectorApprovalGrantBase`,
 `ConnectorApprovalSuspension`, `ConnectorExecutionIdentity`,
 `ConnectorRuntime`, `IdempotencyStore`,

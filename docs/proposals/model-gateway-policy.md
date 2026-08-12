@@ -1,10 +1,10 @@
 # Proposal: model gateway policy
 
-> This document is a proposal. It is not implemented or supported product behavior. Shipped policy enforcement is documented in [Policy engine](../policy-engine-design.md) and [Connector interface](../connector-interface.md).
+> Status: partially implemented. `createGuardedAgent()` ships the non-overridable guarded-agent boundary, and `PolicyEngine` ships content inspection. Provider allowlisting, D1 spend budgets, model-endpoint egress policy, guarded structured-output validation, and an Anchorage scoring gate remain design only. Supported behavior is documented in [Breakwater architecture](../breakwater-architecture.md) and [Policy engine](../policy-engine-design.md).
 
 Mastra's `Agent` class handles model routing, provider normalization, and tool calling natively. This document covers the policy layer Anchorage adds on top of `Agent.generate()`.
 
-## Pre-Gate Policies (Before Model Invocation)
+## Planned pre-gate policies
 
 | Policy | Description |
 |---|---|
@@ -12,20 +12,20 @@ Mastra's `Agent` class handles model routing, provider normalization, and tool c
 | Budget check | Per-workflow or per-team spend limits in D1 (extends Mastra's `CostGuardProcessor`, which caps cost per run/resource/thread) |
 | Network egress check | Verify target model endpoint is in allowlist |
 
-## Post-Gate Policies (After Model Response)
+## Planned and partial post-gate policies
 
-| Policy | Description |
-|---|---|
-| Output schema validation | Verify response matches expected schema (Mastra's `StructuredOutputProcessor` covers the base case) |
-| Content moderation | PII, injection, toxicity scanning (delegates to Mastra's built-in `PIIDetector`/`PromptInjectionDetector`/`ModerationProcessor`) |
-| Quality scoring | Execute Mastra eval scorers on output |
+| Policy | Status | Description |
+|---|---|---|
+| Output schema validation | Planned | The guarded handle currently rejects structured-output call options |
+| Content moderation | Partial | `PolicyEngine`, `piiSecrets()`, and `classifierPolicy()` ship; default prompt-injection and toxicity policies do not |
+| Quality scoring | Planned | Mastra construction-time scorers can pass through, but Anchorage adds no scoring policy or post-gate contract |
 
-## Relationship to Mastra Processors
+## Relationship to Mastra processors
 
-The gates are breakwater's Mastra processors -- the RBACMiddleware/PolicyEngine chain from `breakwater-architecture.md`, registered via the agent's `inputProcessors`/`outputProcessors`. Mastra's built-in processors already cover prompt injection, PII redaction, content moderation, token limits, cost ceilings (`CostGuardProcessor`), and schema validation (`StructuredOutputProcessor`) at the agent boundary; the tables above list what Anchorage layers on top.
+The shipped guarded path uses Breakwater's `RBACMiddleware` and `PolicyEngine` as mandatory Mastra processors. `createGuardedAgent()` fixes the model, processors, execution limits, and tool choice at construction, then rejects per-call overrides that could remove those controls.
 
-The gateway itself is a thin wrapper that owns `Agent.generate()` call sites. It exists because `generate()`/`stream()` accept per-call `inputProcessors`/`outputProcessors` options that override the agent's configured defaults -- a caller could strip the gates for a single call. The wrapper strips or merges those overrides so breakwater's processors are always present, and it hosts the call-level policies (provider allowlist, budget lookup) that need request context before the agent runs. Config-attached processors survive direct `agent.generate()` calls; the wrapper defeats override-stripping -- together they close both bypass paths.
+No separate model-gateway export exists. The guarded handle does not implement the planned provider allowlist, budget lookup, model-endpoint check, structured-output validation, or scoring gate.
 
-## Budget Enforcement
+## Planned budget enforcement
 
-Budget state lives in D1 with eventual consistency. Hard limits are checked before invocation; soft limits emit warnings. Budget records include provider, model, prompt hash, token count, and estimated cost.
+The proposed budget state lives in D1 with eventual consistency. Hard limits would run before invocation, while soft limits would emit warnings. The proposed records include provider, model, prompt hash, token count, and estimated cost. No such store or gate currently ships.
