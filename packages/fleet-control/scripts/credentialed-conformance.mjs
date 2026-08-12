@@ -118,6 +118,7 @@ const {
   generateDeploymentSecrets,
   migrateFleet,
   provisionDeployment,
+  ProcessLocalCloudflareApiRateCoordinator,
   rollbackExternalRelease,
   validateDeploymentSecrets,
   validateDeploymentSpec,
@@ -273,6 +274,7 @@ const client = new CloudflareProvisioningClient({
   accountId,
   apiToken,
   dispatchNamespace: config.dispatchNamespace,
+  rateCoordinator: new ProcessLocalCloudflareApiRateCoordinator(),
   exportStore: new FileSystemDatabaseExportStore(config.exportDirectory),
 });
 const backend = new WorkersForPlatformsBackend({

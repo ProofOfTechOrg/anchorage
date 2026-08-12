@@ -35,6 +35,12 @@ export {
   type OrdinaryWorkerFootprint,
   type ScriptInventoryTarget,
 } from './cloudflare-client.js';
+export {
+  type CloudflareApiRateCoordinator,
+  D1CloudflareApiRateCoordinator,
+  type D1CloudflareApiRateCoordinatorOptions,
+  ProcessLocalCloudflareApiRateCoordinator,
+} from './cloudflare-rate-coordinator.js';
 export { FileSystemDatabaseExportStore } from './export-store.js';
 export {
   auditFleetDrift,
@@ -104,6 +110,7 @@ export type {
   PlatformPlaneResourceSet,
   PlatformPlaneStateStore,
   PromotionGuard,
+  ProviderBindingIdentity,
   ProvisioningBackend,
   ProvisioningBackendKind,
   ProvisioningPhase,

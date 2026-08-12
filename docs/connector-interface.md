@@ -7,7 +7,11 @@ Use `createConnector()` instead of `createTool()` for code that can reach a netw
 ## Basic connector
 
 ```typescript
-import { createConnector } from '@proofoftech/breakwater/connector-sdk';
+import {
+  createConnector,
+  InMemoryIdempotencyStore,
+  InMemoryRateLimitStore,
+} from '@proofoftech/breakwater/connector-sdk';
 import { z } from 'zod';
 
 export const createContact = createConnector({
@@ -28,6 +32,11 @@ export const createContact = createConnector({
     idempotencyKey: true,
     dryRun: true,
     rateLimit: '100/min',
+  },
+  policies: {
+    idempotencyStore: new InMemoryIdempotencyStore(),
+    idempotencyKeyMigration: 'legacy-writers-drained',
+    rateLimitStore: new InMemoryRateLimitStore(),
   },
   execute: async (input, _context, runtime) => {
     const response = await runtime.fetch(
@@ -52,6 +61,10 @@ export const createContact = createConnector({
 ```
 
 `execute` and `dryRunExecute` receive `ConnectorRuntime` as their third argument. Its fetch is bound to the manifest's declared hosts.
+
+The in-memory stores make this definition runnable in one process. Use the D1
+stores and the physical-deployment preset when replay or budgets must survive
+another isolate or restart.
 
 ## Permission manifest
 
@@ -102,6 +115,8 @@ Declare redirect and regional hosts. Actual redirect hops must also remain withi
 When `true`, every real call needs a non-empty key in `breakwater.idempotencyKey`. The wrapper stores the successful result and replays it on another call with the same scoped key.
 
 The application chooses the business key. Flowsafe does not invent a connector-specific idempotency key or mint an organization isolation scope. Its shared store keys are deployment-wide.
+
+Breakwater stores only `{ result }`; it does not canonicalize arbitrary input or compare request bodies. A gateway that promises mismatch detection owns the canonical request representation and stores its fingerprint with the result. The same key and fingerprint replays, while the same key with a different fingerprint is rejected at that gateway boundary.
 
 ### `requiresApproval`
 
@@ -163,6 +178,7 @@ interface ConnectorPolicies {
   writePermissions?: WritePermissionsPolicy;
   evaluators?: readonly ToolPolicyEvaluator[];
   idempotencyStore?: IdempotencyStore;
+  idempotencyKeyMigration?: 'legacy-writers-drained';
   rateLimitStore?: RateLimitStore;
   audit?: AuditLogger;
   fetch?: EgressFetchBase;
@@ -170,6 +186,41 @@ interface ConnectorPolicies {
 ```
 
 The connector definition binds these values once. `fetch` is the underlying HTTP implementation wrapped by guarded fetch, and is the normal test seam.
+
+### Apply the physical-deployment preset
+
+Use `singleTenantConnectorPolicies()` when one physically isolated deployment serves one organization. Given a D1-compatible `db` and an `AuditLogger` with an external sink, construct the shared policy set once:
+
+```typescript
+import {
+  D1IdempotencyStore,
+  D1RateLimitStore,
+  singleTenantConnectorPolicies,
+} from '@proofoftech/breakwater/connector-sdk';
+
+const policies = singleTenantConnectorPolicies({
+  durableStores: {
+    idempotency: new D1IdempotencyStore(db),
+    rateLimit: new D1RateLimitStore(db),
+  },
+  idempotencyKeyMigration: 'legacy-writers-drained',
+  audit: { mode: 'production', logger: audit },
+  egress: { allowedDomains: ['api.example.com'] },
+  permissions: { principalPermissions: 'configured' },
+});
+```
+
+Pass `policies` to every connector in the deployment. The preset enforces these construction-time invariants:
+
+- A manifest that declares idempotency or a rate limit has the matching D1-backed store.
+- Production mode has an external audit sink. Only development mode can explicitly opt out of audit.
+- Every declared egress host fits the organization allowlist.
+- A permission-declaring connector runs only when the host declares principal-permission projection wiring.
+- `backgroundExecution()` is installed once, destructive approval cannot be weakened, and `tenantIsolation()` is rejected because connector keys are deployment-wide.
+
+The migration acknowledgement means every legacy connector writer sharing the D1 store has stopped and drained and existing legacy rows have been inventoried. For a new empty deployment, it confirms that no legacy writer exists. Do not set it during a mixed-version rollout.
+
+The returned policy set is frozen. `createConnector()` rejects copied, mutated, or replaced preset members instead of accepting a weakened configuration.
 
 ## Execution order
 
@@ -187,7 +238,7 @@ schema validation
   -> idempotency commit
 ```
 
-A denial throws `ConnectorPolicyError` with connector id, policy name, and reason. Every gate records its decision through the supplied audit logger.
+A denial throws `ConnectorPolicyError` with connector id, policy name, and reason. Every gate records its decision through the supplied audit logger. Connector decisions use `agentAuditDetail()`, so trusted `breakwater.auditContext` correlation overrides same-named decision detail.
 
 An arbitrary execution, store, evaluator, or parser throw is not copied verbatim into audit. Safe built-in errors can register a static reason and bounded metadata.
 
@@ -256,17 +307,76 @@ The dry-run branch is the only approval exemption because its separate implement
 
 ## Idempotency
 
-The effective key is:
+New records use a private versioned key whose tuple components are encoded
+without an ambiguous delimiter. Store keys are opaque; applications must not
+construct or parse them.
+
+The legacy v1 key was:
 
 ```text
 [isolationScope:]connectorId:idempotencyKey
 ```
 
-The connector id cannot contain the internal tuple delimiter. The isolation prefix appears when the trusted host sets `breakwater.isolationScope`.
+The connector ID remains colon-free because rate-budget keys retain their
+`[isolationScope:]connectorId` shape to preserve active windows. The isolation
+prefix appears when the trusted host sets `breakwater.isolationScope`.
+
+Every call probes its exact v1 key before using v2:
+
+- An unscoped key whose business key contains no colon is unambiguous. A completed record replays, and a pending record denies until retry.
+- Every scoped key and every unscoped business key containing a colon is ambiguous. A pending or completed v1 row fails with `idempotency-key-migration`; Breakwater never guesses which tuple owns it.
+- An absent v1 row can proceed only with `idempotencyKeyMigration: 'legacy-writers-drained'`. This prevents an old writer from creating the legacy row after the new writer inspected it.
+
+To upgrade, stop and drain all old writers that share the store. Set
+`idempotencyKeyMigration: 'legacy-writers-drained'` only after that drain.
+Inventory legacy rows through the connector-bound helper; it derives the private
+v1 key without exposing either storage format:
+
+```typescript
+import {
+  inspectLegacyConnectorIdempotency,
+  migrateLegacyConnectorIdempotency,
+} from '@proofoftech/breakwater/connector-sdk';
+
+const identity = {
+  idempotencyKey: 'invoice:2026-08-12',
+  isolationScope: 'acme',
+};
+const inventory = await inspectLegacyConnectorIdempotency(connector, identity);
+```
+
+Use business or audit evidence to associate each ambiguous row with exactly one
+tuple. When that proof exists, pass the exact inventoried record back to the
+supported D1 migration:
+
+```typescript
+if (inventory.state === 'replay') {
+  const result = await migrateLegacyConnectorIdempotency(connector, {
+    ...identity,
+    expectedRecord: inventory.record,
+  });
+}
+```
+
+The expected record detects a row changed after inventory; it does not itself
+prove tuple ownership. The helper requires an ambiguous identity, the
+drained-writer acknowledgement, and `D1IdempotencyStore` with transactional
+`batch()`. It validates and transforms the legacy output through the connector's
+synchronous output schema, guards the exact source value, writes the validated
+value under v2, and deletes v1 in one D1 transaction. Store keys remain opaque.
+
+Successful states are `migrated` and idempotent `already-migrated`. Expected
+non-mutating outcomes are `source-absent`, `source-pending`, `source-mismatch`,
+`target-conflict`, and `output-invalid`. Pending, changed, invalid, conflicting,
+and unproven rows remain in place so calls continue to fail closed. Safe legacy
+rows remain a read-only replay fallback.
 
 ### In-memory store
 
 `InMemoryIdempotencyStore` supports atomic reservation and same-isolate in-flight joining. It is bounded and evictable. It does not protect two Worker isolates or two per-run Durable Objects.
+
+It also exposes non-mutating `inspect()` for migration tests and single-process
+upgrades.
 
 ### D1 store
 
@@ -278,9 +388,38 @@ The connector id cannot contain the internal tuple delimiter. The isolation pref
 
 A stale pending row can be taken over after `pendingTtlMs`. Token-guarded commit and release stop a stale holder from overwriting or deleting the new lease.
 
-Set the TTL above the longest connector or Agent CLI timeout.
+The normal `IdempotencyDatabase` seam remains prepare-only. Supported migration
+additionally requires the exported `IdempotencyBatchDatabase` shape. Its
+`batch()` must provide D1-compatible ordered transaction semantics and roll back
+the whole sequence when a statement fails.
 
-Execution failures release the reservation. A successful side effect followed by a failed result-store write returns the result and audits degraded replay protection; throwing at that point would invite a duplicate retry.
+New v2 records contain the exact validated/transformed public output. Replays
+return that value without rerunning a stateful schema. A safe legacy v1 record
+is validated/transformed once on read because it predates the v2 commit
+invariant.
+
+Set the TTL above the longest connector or Agent CLI timeout. The constructor
+requires a positive safe integer no greater than 8,640,000,000,000,000 ms.
+
+Durable custom stores must implement both `AtomicIdempotencyStore` and
+`InspectableIdempotencyStore`. `inspect()` distinguishes absent, pending, and
+completed legacy rows without reserving or releasing them. An atomic store
+without that capability is rejected at connector construction.
+
+Execution or rate-limit failures before a successful side effect release the
+reservation. If output validation fails after execution, Breakwater does not
+commit the invalid result and leaves an atomic reservation pending until stale
+takeover or operator recovery; releasing it immediately could duplicate the
+completed side effect. A successful side effect followed by a failed
+result-store write returns the result and audits degraded replay protection;
+throwing at that point would likewise invite a duplicate retry.
+
+`D1IdempotencyStore` persists JSON-native results and the established
+top-level `undefined` result. Values that JSON would silently change—such as
+`Date`, `Map`, repeated object references, non-finite numbers, sparse arrays,
+or nested `undefined`—fail the final write before the row changes. The public
+result is returned with a degraded-store audit and the atomic reservation
+remains pending, so D1 never replays a different type or structure.
 
 ## Rate-limit store
 
@@ -288,7 +427,21 @@ Execution failures release the reservation. A successful side effect followed by
 
 `D1RateLimitStore` shares the window across isolates. Flowsafe uses it for deployment-wide enforcement.
 
-Both idempotency and rate keys include the isolation scope when present. A generic host that requires logical partitioning can add `tenantIsolation()` so a missing scope is denied. Do not add it to a Flowsafe connector: the physically isolated runtime intentionally reserves and omits that scope.
+The declared count must be a safe integer from 1 through
+`Number.MAX_SAFE_INTEGER`. D1 executes its post-increment count and guarded
+expired-window cleanup in one transaction. If cleanup fails, the increment
+rolls back and execution remains rejected, so the retry does not inherit
+phantom quota spend.
+
+The exported structural `RateLimitDatabase` seam requires D1-compatible
+transactional `batch()` behavior. A custom adapter must roll back every
+statement when any statement in the batch fails.
+
+Both idempotency and rate identities include the isolation scope when present,
+but their storage encodings differ. A generic host that requires logical
+partitioning can add `tenantIsolation()` so a missing scope is denied. Do not
+add it to a Flowsafe connector: the physically isolated runtime intentionally
+reserves and omits that scope.
 
 ## Workflow isolation
 

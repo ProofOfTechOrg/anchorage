@@ -34,6 +34,7 @@ export function codingConnectors(db: ConnectorDatabase) {
     idempotencyStore: new D1IdempotencyStore(db, {
       pendingTtlMs: 20 * 60 * 1_000,
     }),
+    idempotencyKeyMigration: 'legacy-writers-drained' as const,
     rateLimitStore: new D1RateLimitStore(db),
   };
 
@@ -57,6 +58,12 @@ export function codingConnectors(db: ConnectorDatabase) {
 ```
 
 Both adapters require approval by default. Keep that default for any writable workspace.
+
+Set `idempotencyKeyMigration` only after every older connector writer sharing
+the D1 store has stopped and drained. A new empty deployment can acknowledge
+that no legacy writer exists. See the
+[connector idempotency migration contract](connector-interface.md#idempotency)
+before upgrading a store with existing rows.
 
 ## Call shape
 
@@ -138,7 +145,7 @@ The public diagnostics contract:
 
 - returned `command` redacts the prompt and option values;
 - `AgentCliError` uses a stable code and static message;
-- metadata contains only connector id, redacted command, numeric exit/timeout data, a sanitized system code, and booleans indicating whether stdout or stderr existed;
+- metadata contains only connector id, redacted command, numeric exit/timeout data, a sanitized system code, a fixed process-tree termination method when applicable, and booleans indicating whether stdout or stderr existed;
 - stdout is returned only as the successful functional `text`;
 - stderr and failed stdout are never copied into errors or audit;
 - validation failures, connector-policy failures, idempotent replays, custom flag builders, and output parsers cross the same sanitizing boundary;
@@ -167,17 +174,19 @@ try {
 }
 ```
 
-Codes distinguish unavailable runtime or codec, definition/flag failure, spawn failure, timeout, malformed execution result, non-zero exit, parser failure, and a contained outer execution failure. Consult the generated API reference for the exact union in the installed version.
+Codes distinguish unavailable runtime or codec, definition/flag failure, spawn failure, timeout, process-tree termination failure, malformed execution result, non-zero exit, parser failure, and a contained outer execution failure. Consult the generated API reference for the exact union in the installed version.
 
 The one-argument `new AgentCliError(message)` constructor remains compatible for consumers that created their own error, but errors emitted by shipped connectors use the structured metadata.
 
 ## Timeouts and output limits
 
-`timeoutMs` defaults to 10 minutes and must be a safe integer from 1 through the JavaScript timer ceiling. The built-in runner sends `SIGKILL` after it expires.
+`timeoutMs` defaults to 10 minutes and must be a safe integer from 1 through the JavaScript timer ceiling. On POSIX, the built-in runner starts the CLI as a new process-group and session leader, sends `SIGKILL` to the negative group id, and waits up to five seconds for that group to disappear. On Windows, it resolves `taskkill.exe` under a drive-absolute local `SystemRoot` or `WINDIR` before starting the CLI, then invokes that absolute path with `['/pid', pid, '/T', '/F']`, `shell: false`, and a hidden window. It rejects relative, root-relative, Universal Naming Convention (UNC), and device paths. This prevents a writable current directory, network share, device path, or `PATH` entry from replacing the timeout helper. It waits for taskkill to complete before returning the timeout.
+
+An already-absent POSIX group (`ESRCH`) is a successful termination. A Windows runtime with no absolute system root fails with `runtime-unavailable` before the CLI starts. Permission failure, unavailable process id, a group that remains present after the bounded wait, taskkill spawn failure, or taskkill non-zero exit reports `termination-failed` with only the sanitized system code, numeric exit code, timeout, and termination method. No path invokes a shell. A process that deliberately creates a different POSIX session escapes the inherited group, so retain the host/container process boundary and teardown policy.
 
 `maxOutputBytes` defaults to 1 MiB per stream. The runner retains the UTF-8 tail, cuts only at a code-point boundary, and marks truncation. A zero cap retains no process output.
 
-When durable idempotency is enabled, `D1IdempotencyStore.pendingTtlMs` must exceed `timeoutMs`. Otherwise a second isolate could take over a still-running process and start it again.
+When durable idempotency is enabled, `D1IdempotencyStore.pendingTtlMs` must exceed `timeoutMs`. Otherwise a second isolate could take over a still-running process and start it again. The store constructor also requires a positive safe-integer TTL within the JavaScript timestamp range.
 
 The connector rejects malformed numeric values at construction, including `NaN`, infinities, negatives, unsafe integers, and fractions.
 
@@ -204,7 +213,7 @@ Inject it to:
 
 - run the CLI inside a container or remote build worker;
 - apply a process allowlist;
-- enforce an independent timeout and resource quota;
+- enforce an independent timeout, process-tree teardown, and resource quota;
 - supply a test double;
 - construct the connector outside Node.
 

@@ -36,6 +36,7 @@ import {
   trustedArtifactDigest,
   validateExternalPlatformProfile,
 } from './platform-resources.js';
+import { assertProviderBindingIdentitiesMatchInspection } from './provider-binding-inventory.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   D1Migration,
@@ -54,6 +55,7 @@ import type {
   LiveDeployment,
   MaintenanceHealth,
   PromotionGuard,
+  ProviderBindingIdentity,
   ProvisioningBackend,
 } from './types.js';
 
@@ -154,13 +156,13 @@ export interface WorkersForPlatformsApi {
   queryDatabase(
     databaseId: string,
     sql: string,
-    bindings?: readonly unknown[],
+    bindings?: readonly string[],
   ): Promise<readonly Readonly<Record<string, unknown>>[]>;
   batchDatabase(
     databaseId: string,
     statements: readonly {
       readonly sql: string;
-      readonly bindings?: readonly unknown[];
+      readonly bindings?: readonly string[];
     }[],
   ): Promise<void>;
   uploadDispatchWorker(
@@ -220,6 +222,7 @@ export interface WorkersForPlatformsApi {
         }>[];
         secretNames: readonly string[];
         plainTextBindings: Readonly<Record<string, string>>;
+        providerBindingIdentities: readonly ProviderBindingIdentity[];
         workersDevEnabled: boolean;
         previewUrlsEnabled: boolean;
         routeHostnames: readonly string[];
@@ -261,7 +264,8 @@ export interface WorkersForPlatformsApi {
         schemaVersion: number;
         desiredSpecDigest: string;
         durableObjectTag?: string;
-        plainTextBindings?: Readonly<Record<string, string>>;
+        plainTextBindings: Readonly<Record<string, string>>;
+        providerBindingIdentities: readonly ProviderBindingIdentity[];
       }
     | undefined
   >;
@@ -416,6 +420,28 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     operation: () => Promise<T>,
   ): Promise<T> {
     return this.#client.withMutationFence(fence, operation);
+  }
+
+  async #inspectDispatchWorker(scriptName: string) {
+    const inspection = await this.#client.inspectDispatchWorker(scriptName);
+    if (inspection) {
+      assertProviderBindingIdentitiesMatchInspection(
+        inspection,
+        `dispatch Worker '${scriptName}'`,
+      );
+    }
+    return inspection;
+  }
+
+  async #inspectControlWorker(scriptName: string) {
+    const inspection = await this.#client.inspectControlWorker(scriptName);
+    if (inspection) {
+      assertProviderBindingIdentitiesMatchInspection(
+        inspection,
+        `control Worker '${scriptName}'`,
+      );
+    }
+    return inspection;
   }
 
   #deploymentAuditQueueName(spec: DeploymentSpec): string | undefined {
@@ -764,7 +790,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     const config = this.#namespacedState;
     const stateSpec = externalStateDeploymentSpec(spec, profile);
     const scriptName = externalStateScriptName(spec);
-    const live = await this.#client.inspectDispatchWorker(scriptName);
+    const live = await this.#inspectDispatchWorker(scriptName);
     if (!live) return undefined;
     const auditQueueName = target.auditQueueName;
     const expectedBindings = [
@@ -826,6 +852,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
             ? [{ name: 'AUDIT_QUEUE', queueName: auditQueueName }]
             : [],
         ) ||
+      (live.r2BucketBindings ?? []).length !== 0 ||
       JSON.stringify([...live.secretNames].sort()) !==
         JSON.stringify(
           [
@@ -888,7 +915,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
       );
     }
     const scriptName = externalStateScriptName(spec);
-    const existing = await this.#client.inspectDispatchWorker(scriptName);
+    const existing = await this.#inspectDispatchWorker(scriptName);
     if (existing) {
       if (
         existing.tenantTag !== spec.tenantTag ||
@@ -1128,8 +1155,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
           'ordinary state credentials require the dedicated backend-switch lifecycle',
         );
       }
-      const namespacedLive =
-        await this.#client.inspectDispatchWorker(stateName);
+      const namespacedLive = await this.#inspectDispatchWorker(stateName);
       if (!namespacedLive) return;
       const persistedState = resources?.stateWorker;
       const persistedTarget = record.platformTarget;
@@ -1248,7 +1274,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
         databaseId: database.id,
         routeHostname: spec.routeHostname,
       });
-      if (await this.#client.inspectDispatchWorker(stateName)) {
+      if (await this.#inspectDispatchWorker(stateName)) {
         throw new Error(
           `namespaced state Worker '${stateName}' remains after deletion`,
         );
@@ -1280,8 +1306,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     return this.#withMutationFence(fence, async () => {
       const physicalScriptName = this.releaseScriptName(spec);
       this.#deploymentAuditQueueName(spec);
-      const existing =
-        await this.#client.inspectDispatchWorker(physicalScriptName);
+      const existing = await this.#inspectDispatchWorker(physicalScriptName);
       const targetDigest = deploymentSpecDigest(spec);
       if (
         spec.authoredBy === 'external' &&
@@ -1443,8 +1468,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
               : {}),
           });
         }
-        const attested =
-          await this.#client.inspectDispatchWorker(physicalScriptName);
+        const attested = await this.#inspectDispatchWorker(physicalScriptName);
         if (
           !attested ||
           attested.artifactVersion !== deployed.artifactVersion ||
@@ -1527,7 +1551,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
         let scriptAbsent = false;
         try {
           await this.#client.deleteDispatchWorker(physicalScriptName);
-          if (await this.#client.inspectDispatchWorker(physicalScriptName)) {
+          if (await this.#inspectDispatchWorker(physicalScriptName)) {
             throw new Error(
               `dispatch release '${physicalScriptName}' remains after cleanup`,
             );
@@ -1602,7 +1626,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
       throw new Error('WfP promotion requires a persisted artifact version');
     }
     const physicalScriptName = this.releaseScriptName(spec);
-    const live = await this.#client.inspectDispatchWorker(physicalScriptName);
+    const live = await this.#inspectDispatchWorker(physicalScriptName);
     if (!live || live.artifactVersion !== expectedArtifactVersion) {
       throw new Error(
         `immutable release '${physicalScriptName}' does not match persisted artifact version '${expectedArtifactVersion}'`,
@@ -1663,7 +1687,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     if (!expectedArtifactVersion) {
       throw new Error('WfP maintenance requires a persisted artifact version');
     }
-    const live = await this.#client.inspectDispatchWorker(physicalScriptName);
+    const live = await this.#inspectDispatchWorker(physicalScriptName);
     if (!live || live.artifactVersion !== expectedArtifactVersion) {
       throw new Error(
         `immutable release '${physicalScriptName}' does not match persisted artifact version '${expectedArtifactVersion}'`,
@@ -1719,7 +1743,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     expectedArtifactVersion?: string,
   ): Promise<LiveDeployment | undefined> {
     const physicalScriptName = this.releaseScriptName(spec);
-    const live = await this.#client.inspectDispatchWorker(physicalScriptName);
+    const live = await this.#inspectDispatchWorker(physicalScriptName);
     if (!live) return undefined;
     if (
       expectedArtifactVersion &&
@@ -1797,6 +1821,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
       plainTextBindings: live.plainTextBindings,
       r2BucketBindings: live.r2BucketBindings ?? [],
       secretNames: live.secretNames,
+      providerBindingIdentities: live.providerBindingIdentities,
       artifactVersion: live.artifactVersion,
       desiredSpecDigest: live.desiredSpecDigest,
       schemaVersion: live.schemaVersion,
@@ -1911,9 +1936,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     release: ExternalReleaseSnapshot,
     database: DatabaseReference,
   ): Promise<void> {
-    const live = await this.#client.inspectDispatchWorker(
-      release.physicalScriptName,
-    );
+    const live = await this.#inspectDispatchWorker(release.physicalScriptName);
     if (!live) return;
     if (
       live.tenantTag !== spec.tenantTag ||
@@ -1952,9 +1975,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     for (const release of releases) {
       try {
         await this.#client.deleteDispatchWorker(release.physicalScriptName);
-        if (
-          await this.#client.inspectDispatchWorker(release.physicalScriptName)
-        ) {
+        if (await this.#inspectDispatchWorker(release.physicalScriptName)) {
           throw new Error(
             `dispatch release '${release.physicalScriptName}' remains after deletion`,
           );
@@ -1998,9 +2019,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
       await this.#assertReleaseOwner(spec, release, database);
       await this.#client.revokeDispatchSecrets(release.physicalScriptName);
       await this.#client.deleteDispatchWorker(release.physicalScriptName);
-      if (
-        await this.#client.inspectDispatchWorker(release.physicalScriptName)
-      ) {
+      if (await this.#inspectDispatchWorker(release.physicalScriptName)) {
         throw new Error(
           `retained release '${release.physicalScriptName}' remains after deletion`,
         );
@@ -2084,9 +2103,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
         ) === index,
     );
     for (const release of releases) {
-      if (
-        await this.#client.inspectDispatchWorker(release.physicalScriptName)
-      ) {
+      if (await this.#inspectDispatchWorker(release.physicalScriptName)) {
         throw new Error(
           `dispatch release '${release.physicalScriptName}' remains before D1 deletion`,
         );
@@ -2105,7 +2122,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     const stateName = externalStateScriptName(spec);
     const proxyName = externalEgressProxyScriptName(spec);
     for (const scriptName of [stateName, proxyName]) {
-      if (await this.#client.inspectControlWorker(scriptName)) {
+      if (await this.#inspectControlWorker(scriptName)) {
         throw new Error(
           `trusted platform Worker '${scriptName}' remains before D1 deletion`,
         );

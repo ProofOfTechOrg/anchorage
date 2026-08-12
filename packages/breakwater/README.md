@@ -37,7 +37,7 @@ schedule work, or run durable agent loops on Cloudflare.
 
 ## Install it
 
-breakwater is ESM-only, requires Node.js 22 or newer (engine range `>=22`),
+breakwater is ESM-only, requires Node.js 22.3 or newer (engine range `>=22.3.0`),
 and supports `@mastra/core` in its declared `^1.50.0` peer range.
 
 ```bash
@@ -243,6 +243,12 @@ tenant scope, and the direct-call background override defense. The
 [connector authoring guide](./CONNECTORS.md) contains the complete manifest,
 storage, invocation, egress, and testing contract.
 
+### Apply the physical-deployment preset
+
+Use `singleTenantConnectorPolicies()` when one physically isolated deployment serves one organization. It requires D1-backed stores for declared idempotency and rate limits, production audit export or an explicit development opt-out, an organization egress allowlist, principal-permission wiring, and the background-execution policy. Set its `idempotencyKeyMigration` acknowledgement only after legacy connector writers sharing the D1 store are stopped and drained. The preset rejects `tenantIsolation()`, weakened destructive approval, incomplete manifest policy, and replacement of validated policy members.
+
+Build the preset once and pass the returned frozen policy set to each connector. Read [Connector interface](https://github.com/ProofOfTechOrg/anchorage/blob/main/docs/connector-interface.md#apply-the-physical-deployment-preset) for the configuration contract.
+
 ## Set request context at trusted boundaries
 
 The connector wrapper reads these keys:
@@ -287,11 +293,34 @@ hold across runs.
 
 Set `D1IdempotencyStore.pendingTtlMs` above the longest possible execution.
 The default is 900,000 ms. Agent CLI connectors reject a configured pending
-TTL that is not greater than their execution timeout.
+TTL that is not greater than their execution timeout. The store accepts only a
+positive safe integer up to 8,640,000,000,000,000 ms.
+
+New idempotency records use an opaque collision-proof v2 key. Before allowing
+new v2 records, set `idempotencyKeyMigration: 'legacy-writers-drained'` only
+after every old writer sharing the store has stopped and drained. Safe
+unscoped legacy records remain replayable. Scoped legacy records and unscoped
+business keys containing `:` are ambiguous and fail closed until an operator
+maps them to one proven identity. Atomic custom stores must implement
+non-mutating `inspect()` so pending legacy work cannot look absent.
+
+`D1IdempotencyStore` persists JSON-native connector results (plus a top-level
+`undefined`). It rejects values such as `Date`, `Map`, non-finite numbers,
+sparse arrays, or nested `undefined` that JSON would silently change; the
+wrapper then uses its existing degraded-final-write behavior rather than
+creating a type-changing replay record.
+
+Breakwater stores only the connector result. It does not hash arbitrary input
+or reject a changed body under the same key. Applications that promise request
+mismatch detection must canonicalize the request and store a fingerprint with
+the result at their gateway boundary.
 
 A fixed window can admit traffic on both sides of a boundary, approaching
 twice the nominal count in a short interval. Use another `RateLimitStore`
 implementation if you require token-bucket or GCRA semantics.
+Counts must be safe integers from 1 through `Number.MAX_SAFE_INTEGER`.
+`D1RateLimitStore` commits its increment and rollover cleanup in one D1 batch,
+so cleanup failure cannot consume quota for a rejected call.
 
 ## Record audit and metrics
 
@@ -329,6 +358,11 @@ Generic connector exceptions are rethrown to the caller, but their arbitrary
 messages are not copied into connector audit events. Audit reasons remain
 static unless breakwater created a private, safe error summary.
 
+Connector audit events also use trusted `breakwater.auditContext` correlation.
+Host-derived agent, deployment (`tenantId`), run, thread, resource, entry-path,
+and principal fields override same-named decision detail. Unknown and
+non-scalar context fields remain excluded.
+
 For durable Cloudflare Queues to SIEM export, use the flowsafe
 [`audit-export`](https://github.com/ProofOfTechOrg/anchorage/tree/main/packages/flowsafe/src/audit-export)
 subpath.
@@ -365,14 +399,17 @@ The default runner is Node-only and:
 - appends `--` and the real prompt as the final positional argument;
 - selects workspace editing with Claude Code `acceptEdits` or Codex
   `workspace-write`;
-- kills the child after the configured timeout;
+- terminates the child process tree after the configured timeout (a POSIX
+  process group or absolute `taskkill.exe /T /F` from a drive-absolute local
+  `%SystemRoot%` or `%WINDIR%`), and reports a distinct safe failure if tree
+  termination itself fails;
 - retains only the tail of stdout and stderr, capped by UTF-8 bytes;
 - returns the CLI stdout as `text` and a prompt-redacted display `command`;
 - exposes static `AgentCliError` messages plus structured, non-secret metadata.
 
 The default timeout is 600,000 ms and the default retained output is 1 MiB per
 stream. An injected `exec` implementation is responsible for its own sandbox,
-timeout, and output limits.
+process-tree termination, timeout, and output limits.
 
 The returned `text` is functional agent output and may contain sensitive data.
 The `command` redacts the prompt and `--flag=value` option values. Validation
@@ -447,21 +484,30 @@ for compatibility.
 | Runtime exports | Purpose |
 | --- | --- |
 | `createConnector`, `connectorManifest` | Build an enforced Mastra tool and inspect its immutable manifest |
+| `singleTenantConnectorPolicies` | Build the validated connector-policy baseline for one physically isolated deployment |
 | `ConnectorPolicyError` | Structured policy denial |
 | `CONNECTOR_GRANTS_CONTEXT_KEY`, `CONNECTOR_EXECUTION_CONTEXT_KEY`, `DRY_RUN_CONTEXT_KEY`, `IDEMPOTENCY_KEY_CONTEXT_KEY` | Stable connector request-context keys |
 | `InMemoryIdempotencyStore`, `D1IdempotencyStore` | Development and durable replay stores |
+| `inspectLegacyConnectorIdempotency`, `migrateLegacyConnectorIdempotency` | Inventory and atomically migrate one externally proven ambiguous legacy D1 row without exposing storage keys |
 | `InMemoryRateLimitStore`, `D1RateLimitStore` | Development and durable fixed-window stores |
 | `egressFetch`, `EgressDeniedError` | Standalone fetch guard and its default denial |
 
 Type exports: `PermissionManifest`, `ConnectorConfig`, `ConnectorPolicies`,
+`SingleTenantConnectorPolicies`, `SingleTenantConnectorPoliciesOptions`,
+`SingleTenantAuditPosture`, `SingleTenantDurableStores`,
+`SingleTenantPermissionPosture`,
 `ConnectorApprovalGrant`, `ConnectorApprovalGrantBase`,
 `ConnectorApprovalSuspension`, `ConnectorExecutionIdentity`,
 `ConnectorRuntime`, `IdempotencyStore`,
 `AtomicIdempotencyStore`,
+`InspectableIdempotencyStore`, `IdempotencyInspection`,
 `IdempotencyRecord`, `IdempotencyReservation`, `RateLimitStore`,
-`D1IdempotencyStoreOptions`, `IdempotencyDatabase`,
-`IdempotencyStatement`, `D1RateLimitStoreOptions`, `RateLimitDatabase`,
-`RateLimitStatement`, `EgressDenial`, `EgressFetchOptions`,
+`LegacyConnectorIdempotencyIdentity`,
+`LegacyConnectorIdempotencyMigrationRequest`,
+`LegacyConnectorIdempotencyMigrationResult`, `D1IdempotencyStoreOptions`,
+`IdempotencyDatabase`, `IdempotencyBatchDatabase`,
+`IdempotencyStatement`, `IdempotencyBatchResult`, `D1RateLimitStoreOptions`, `RateLimitDatabase`,
+`RateLimitStatement`, `RateLimitBatchResult`, `EgressDenial`, `EgressFetchOptions`,
 `EgressFetchBase`, `EgressGuardedFetch`, `EgressRequestInit`,
 `EgressResponse`, and `EgressResponseHeaders`.
 

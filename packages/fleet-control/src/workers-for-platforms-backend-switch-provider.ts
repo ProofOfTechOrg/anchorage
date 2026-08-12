@@ -33,6 +33,7 @@ import {
   trustedArtifactDigest,
   validateExternalPlatformProfile,
 } from './platform-resources.js';
+import { assertProviderBindingIdentitiesMatchInspection } from './provider-binding-inventory.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   ApplicationBindingTopology,
@@ -535,6 +536,28 @@ export class WorkersForPlatformsBackendSwitchProvider
     this.#drainCandidate = options.drainCandidate;
   }
 
+  async #inspectControlWorker(scriptName: string) {
+    const inspection = await this.#client.inspectControlWorker(scriptName);
+    if (inspection) {
+      assertProviderBindingIdentitiesMatchInspection(
+        inspection,
+        `control Worker '${scriptName}'`,
+      );
+    }
+    return inspection;
+  }
+
+  async #inspectDispatchWorker(scriptName: string) {
+    const inspection = await this.#client.inspectDispatchWorker(scriptName);
+    if (inspection) {
+      assertProviderBindingIdentitiesMatchInspection(
+        inspection,
+        `dispatch Worker '${scriptName}'`,
+      );
+    }
+    return inspection;
+  }
+
   #profile(spec: DeploymentSpec): ExternalPlatformProfile {
     const profile = this.#platformProfileFor(spec);
     validateExternalPlatformProfile(spec, profile);
@@ -758,7 +781,7 @@ export class WorkersForPlatformsBackendSwitchProvider
     },
     bridge: BridgeSnapshot,
   ): Promise<void> {
-    const live = await this.#client.inspectControlWorker(bridge.scriptName);
+    const live = await this.#inspectControlWorker(bridge.scriptName);
     const resources = input.currentRecord.platformResources;
     const namespaces = await this.#client.listDurableObjectNamespaces(
       bridge.scriptName,
@@ -1178,7 +1201,7 @@ export class WorkersForPlatformsBackendSwitchProvider
     durableObjectMigrations?: readonly DurableObjectMigration[],
     specDigest = deploymentSpecDigest(spec),
   ): Promise<BridgeSnapshot> {
-    const live = await this.#client.inspectControlWorker(spec.scriptName);
+    const live = await this.#inspectControlWorker(spec.scriptName);
     if (!live) throw new Error(`bridge '${spec.scriptName}' is absent`);
     const profile = this.#profile(spec);
     const durableObjectTag = (
@@ -1240,7 +1263,7 @@ export class WorkersForPlatformsBackendSwitchProvider
     await fence.assertOwned();
     const [database, live, domains] = await Promise.all([
       this.#client.findDatabase(priorSpec.databaseName),
-      this.#client.inspectControlWorker(priorSpec.scriptName),
+      this.#inspectControlWorker(priorSpec.scriptName),
       this.#client.listCustomDomains(),
     ]);
     if (
@@ -1346,9 +1369,7 @@ export class WorkersForPlatformsBackendSwitchProvider
     }
     const migrations = input.plan.durableObjectMigrations;
     const durableObjectTag = input.plan.targetDurableObjectTag;
-    const liveBefore = await this.#client.inspectControlWorker(
-      input.prior.scriptName,
-    );
+    const liveBefore = await this.#inspectControlWorker(input.prior.scriptName);
     if (!liveBefore) throw new Error('backend switch prior Worker disappeared');
     let liveDurableObjectTag: string | undefined;
     if (liveBefore.artifactVersion === input.prior.artifactVersion) {
@@ -1432,9 +1453,7 @@ export class WorkersForPlatformsBackendSwitchProvider
     if (!sameJson(expectedPlan, input.plan)) {
       throw new Error('backend switch bridge plan differs from durable intent');
     }
-    const live = await this.#client.inspectControlWorker(
-      input.prior.scriptName,
-    );
+    const live = await this.#inspectControlWorker(input.prior.scriptName);
     if (!live || live.artifactVersion === input.prior.artifactVersion) {
       return undefined;
     }
@@ -1693,9 +1712,7 @@ export class WorkersForPlatformsBackendSwitchProvider
     await this.#client.withMutationFence(input.fence, () =>
       this.#client.disableControlWorkerPublicAccess(input.bridge.scriptName),
     );
-    const live = await this.#client.inspectControlWorker(
-      input.bridge.scriptName,
-    );
+    const live = await this.#inspectControlWorker(input.bridge.scriptName);
     if (
       !live ||
       live.workersDevEnabled ||
@@ -1903,9 +1920,7 @@ export class WorkersForPlatformsBackendSwitchProvider
         ...applicationSecretValues(input.priorSpec, input.secrets),
       });
     });
-    const live = await this.#client.inspectControlWorker(
-      input.prior.scriptName,
-    );
+    const live = await this.#inspectControlWorker(input.prior.scriptName);
     const namespaces = await this.#client.listDurableObjectNamespaces(
       input.prior.scriptName,
     );
@@ -2211,7 +2226,7 @@ export class WorkersForPlatformsBackendSwitchProvider
   }): Promise<void> {
     const release = input.release;
     const candidateName = release.physicalScriptName;
-    const live = await this.#client.inspectDispatchWorker(candidateName);
+    const live = await this.#inspectDispatchWorker(candidateName);
     const inventory = await this.#client.getScriptInventory(
       this.#hostRoutingKvId,
       candidateName,
@@ -2271,7 +2286,7 @@ export class WorkersForPlatformsBackendSwitchProvider
       }),
     );
     if (
-      (await this.#client.inspectDispatchWorker(candidateName)) ||
+      (await this.#inspectDispatchWorker(candidateName)) ||
       (await this.#client.getScriptInventory(
         this.#hostRoutingKvId,
         candidateName,
@@ -2421,9 +2436,7 @@ export class WorkersForPlatformsBackendSwitchProvider
     if (!this.#canonicalRemovalPlanMatches(input)) {
       throw new Error('backend switch bridge plan differs from durable intent');
     }
-    const live = await this.#client.inspectControlWorker(
-      input.prior.scriptName,
-    );
+    const live = await this.#inspectControlWorker(input.prior.scriptName);
     if (!live) return undefined;
 
     const liveNamespaceIds =
@@ -2606,7 +2619,7 @@ export class WorkersForPlatformsBackendSwitchProvider
         await this.#client.deleteControlWorker(input.prior.scriptName);
       });
     }
-    if (await this.#client.inspectControlWorker(input.prior.scriptName)) {
+    if (await this.#inspectControlWorker(input.prior.scriptName)) {
       throw new Error('backend-switch bridge remains after decommission');
     }
     for (const namespaceId of authoritativeNamespaceIds) {

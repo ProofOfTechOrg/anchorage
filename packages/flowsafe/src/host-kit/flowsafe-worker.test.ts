@@ -775,6 +775,24 @@ describe('createFlowsafeWorker fetch pipeline', () => {
 });
 
 describe('createFlowsafeWorker maintenance duties', () => {
+  it('validates the storage table prefix when the host is constructed', () => {
+    expect(() => makeWorker({ storageTablePrefix: 'tenant-prod_' })).toThrow(
+      'Invalid storageTablePrefix: use an empty prefix or start with a letter or underscore and continue with letters, numbers, or underscores.',
+    );
+    expect(() => makeWorker({ storageTablePrefix: '01_tenant_' })).toThrow(
+      /start with a letter or underscore/,
+    );
+    expect(() =>
+      makeWorker({ storageTablePrefix: 'tenant_01_' }),
+    ).not.toThrow();
+    expect(() =>
+      makeWorker({ storageTablePrefix: 'p'.repeat(39) }),
+    ).not.toThrow();
+    expect(() => makeWorker({ storageTablePrefix: 'p'.repeat(40) })).toThrow(
+      'Invalid storageTablePrefix: must be at most 39 characters so prefixed Mastra table names stay within the 63-character identifier limit.',
+    );
+  });
+
   it('refuses maintenance before running a duty when bindings are missing', async () => {
     const worker = makeWorker();
     const { env } = makeEnv();
@@ -1345,6 +1363,213 @@ describe('createFlowsafeWorker maintenance duties', () => {
       },
     ]);
     expect(logs.lines().length).toBeGreaterThan(0);
+  });
+});
+
+describe('createFlowsafeWorker storage table prefix', () => {
+  const PREFIX = 'tenant_';
+  const OLD_ISO = new Date(Date.now() - 90 * 86_400_000).toISOString();
+
+  async function seedMaintenanceDomains(
+    env: FlowsafeWorkerEnv,
+    prefix: string,
+    suffix: string,
+  ): Promise<void> {
+    await env.DB.prepare(
+      `CREATE TABLE ${prefix}mastra_workflow_snapshot (
+        workflow_name TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        resourceId TEXT,
+        snapshot TEXT NOT NULL,
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `INSERT INTO ${prefix}mastra_workflow_snapshot
+       (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
+       VALUES (?, ?, NULL, ?, ?, ?)`,
+    )
+      .bind(
+        'wf',
+        `run-${suffix}`,
+        JSON.stringify({ status: 'success' }),
+        OLD_ISO,
+        OLD_ISO,
+      )
+      .run();
+    await env.DB.prepare(
+      `CREATE TABLE ${prefix}mastra_threads (
+        id TEXT PRIMARY KEY,
+        updatedAt TEXT NOT NULL
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `CREATE TABLE ${prefix}mastra_messages (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        createdAt TEXT NOT NULL
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `INSERT INTO ${prefix}mastra_threads (id, updatedAt) VALUES (?, ?)`,
+    )
+      .bind(`thread-${suffix}`, OLD_ISO)
+      .run();
+    await env.DB.prepare(
+      `INSERT INTO ${prefix}mastra_messages (id, thread_id, createdAt)
+       VALUES (?, ?, ?)`,
+    )
+      .bind(`message-${suffix}`, `thread-${suffix}`, OLD_ISO)
+      .run();
+    await env.DB.prepare(
+      `CREATE TABLE ${prefix}mastra_background_tasks (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        completedAt TEXT,
+        createdAt TEXT NOT NULL
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `INSERT INTO ${prefix}mastra_background_tasks
+       (id, run_id, status, completedAt, createdAt)
+       VALUES (?, ?, 'completed', ?, ?)`,
+    )
+      .bind(`task-${suffix}`, `task-run-${suffix}`, OLD_ISO, OLD_ISO)
+      .run();
+    await env.DB.prepare(
+      `CREATE TABLE ${prefix}mastra_notifications (
+        id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `INSERT INTO ${prefix}mastra_notifications (id, status, updatedAt)
+       VALUES (?, 'delivered', ?)`,
+    )
+      .bind(`notification-${suffix}`, OLD_ISO)
+      .run();
+    await env.DB.prepare(
+      `CREATE TABLE ${prefix}mastra_thread_state (
+        id TEXT PRIMARY KEY,
+        updatedAt TEXT NOT NULL
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `INSERT INTO ${prefix}mastra_thread_state (id, updatedAt) VALUES (?, ?)`,
+    )
+      .bind(`state-${suffix}`, OLD_ISO)
+      .run();
+    await env.DB.prepare(
+      `CREATE TABLE ${prefix}mastra_schedule_triggers (
+        id TEXT PRIMARY KEY,
+        actualFireAt INTEGER NOT NULL,
+        outcome TEXT NOT NULL
+      )`,
+    ).run();
+    await env.DB.prepare(
+      `INSERT INTO ${prefix}mastra_schedule_triggers
+       (id, actualFireAt, outcome) VALUES (?, ?, 'success')`,
+    )
+      .bind(`trigger-${suffix}`, Date.now() - 90 * 86_400_000)
+      .run();
+  }
+
+  async function ids(
+    env: FlowsafeWorkerEnv,
+    table: string,
+    idColumn = 'id',
+  ): Promise<string[]> {
+    const { results } = await env.DB.prepare(
+      `SELECT ${idColumn} AS id FROM ${table} ORDER BY ${idColumn}`,
+    ).all<{ id: string }>();
+    return results.map((row) => row.id);
+  }
+
+  async function runEveryPurge(
+    env: FlowsafeWorkerEnv,
+    storageTablePrefix?: string,
+  ): Promise<void> {
+    const worker = makeWorker({
+      storageTablePrefix,
+      backgroundTasks: {},
+    });
+    await worker.runMaintenanceDuty('purge', {
+      ...env,
+      THREAD_RETENTION_DAYS: '30',
+      NOTIFICATION_RETENTION_DAYS: '30',
+      THREAD_STATE_RETENTION_DAYS: '30',
+      SCHEDULE_TRIGGER_RETENTION_DAYS: '30',
+    });
+  }
+
+  async function expectDomains(
+    env: FlowsafeWorkerEnv,
+    prefix: string,
+    suffix: string,
+  ): Promise<void> {
+    expect(
+      await ids(env, `${prefix}mastra_workflow_snapshot`, 'run_id'),
+    ).toEqual([`run-${suffix}`]);
+    expect(await ids(env, `${prefix}mastra_threads`)).toEqual([
+      `thread-${suffix}`,
+    ]);
+    expect(await ids(env, `${prefix}mastra_messages`)).toEqual([
+      `message-${suffix}`,
+    ]);
+    expect(await ids(env, `${prefix}mastra_background_tasks`)).toEqual([
+      `task-${suffix}`,
+    ]);
+    expect(await ids(env, `${prefix}mastra_notifications`)).toEqual([
+      `notification-${suffix}`,
+    ]);
+    expect(await ids(env, `${prefix}mastra_thread_state`)).toEqual([
+      `state-${suffix}`,
+    ]);
+    expect(await ids(env, `${prefix}mastra_schedule_triggers`)).toEqual([
+      `trigger-${suffix}`,
+    ]);
+  }
+
+  async function expectDomainsEmpty(
+    env: FlowsafeWorkerEnv,
+    prefix: string,
+  ): Promise<void> {
+    expect(
+      await ids(env, `${prefix}mastra_workflow_snapshot`, 'run_id'),
+    ).toEqual([]);
+    expect(await ids(env, `${prefix}mastra_threads`)).toEqual([]);
+    expect(await ids(env, `${prefix}mastra_messages`)).toEqual([]);
+    expect(await ids(env, `${prefix}mastra_background_tasks`)).toEqual([]);
+    expect(await ids(env, `${prefix}mastra_notifications`)).toEqual([]);
+    expect(await ids(env, `${prefix}mastra_thread_state`)).toEqual([]);
+    expect(await ids(env, `${prefix}mastra_schedule_triggers`)).toEqual([]);
+  }
+
+  it('targets all six prefix-aware maintenance domains and leaves unprefixed twins untouched', async () => {
+    capturedLogs();
+    const { env } = makeEnv();
+    await seedMaintenanceDomains(env, '', 'plain');
+    await seedMaintenanceDomains(env, PREFIX, 'prefixed');
+
+    await runEveryPurge(env, PREFIX);
+
+    await expectDomains(env, '', 'plain');
+    await expectDomainsEmpty(env, PREFIX);
+  });
+
+  it('keeps the existing unprefixed behavior by default', async () => {
+    capturedLogs();
+    const { env } = makeEnv();
+    await seedMaintenanceDomains(env, '', 'plain');
+    await seedMaintenanceDomains(env, PREFIX, 'prefixed');
+
+    await runEveryPurge(env);
+
+    await expectDomainsEmpty(env, '');
+    await expectDomains(env, PREFIX, 'prefixed');
   });
 });
 

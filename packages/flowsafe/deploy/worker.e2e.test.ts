@@ -1050,14 +1050,17 @@ describe('deploy worker alarm-owned maintenance duties', () => {
 });
 
 describe('createFlowsafeWorker artifact-paired retention purge (F4)', () => {
-  // The deploy template wires no R2, so it sets no artifactStore. This drives
-  // createFlowsafeWorker directly with one, proving runPurgeMaintenance threads
-  // config.artifactStore into the built-in purge so each expired run's artifacts
-  // are deleted BEFORE its snapshot row (the row is the only enumerable record
-  // of the run's artifact keys).
+  // The deploy template wires no R2, so it sets no artifactStore factory. This
+  // drives createFlowsafeWorker directly with one, proving each maintenance
+  // invocation resolves its own binding and deletes artifacts BEFORE the row.
 
-  function workerWith(artifactStore: RunArtifactPurger | undefined) {
-    return createFlowsafeWorker<Env>({
+  function workerWith<WorkerEnv extends Env = Env>(
+    artifactStore:
+      | ((env: WorkerEnv) => RunArtifactPurger | undefined)
+      | undefined,
+    extraPurgeDuties?: (env: WorkerEnv) => Promise<Record<string, unknown>>,
+  ) {
+    return createFlowsafeWorker<WorkerEnv>({
       workflows: [],
       systemPrincipalId: 'flowsafe-worker',
       buildVerifier: () =>
@@ -1067,6 +1070,7 @@ describe('createFlowsafeWorker artifact-paired retention purge (F4)', () => {
         purgeIntervalMs: 60 * 60 * 1_000,
       },
       artifactStore,
+      extraPurgeDuties,
     });
   }
 
@@ -1098,7 +1102,7 @@ describe('createFlowsafeWorker artifact-paired retention purge (F4)', () => {
     };
 
     // #when — the PURGE duty runs
-    await workerWith(artifactStore).runMaintenanceDuty('purge', env);
+    await workerWith(() => artifactStore).runMaintenanceDuty('purge', env);
 
     // #then — the stale run's artifacts were deleted (while its row still
     // existed), then its row was purged; the fresh run is untouched
@@ -1108,6 +1112,78 @@ describe('createFlowsafeWorker artifact-paired retention purge (F4)', () => {
       'acme_stale-done',
     );
     expect(remainingRunIds(sqlite)).toEqual(['acme_fresh-done']);
+  });
+
+  it('resolves the artifact store from each maintenance invocation environment', async () => {
+    const first = makeEnv();
+    const second = makeEnv();
+    for (const { sqlite } of [first, second]) {
+      createSnapshotTable(sqlite);
+    }
+    seedRun(first.sqlite, {
+      runId: 'first-stale',
+      status: 'success',
+      updatedAt: Date.now() - 40 * DAY_MS,
+    });
+    seedRun(second.sqlite, {
+      runId: 'second-stale',
+      status: 'success',
+      updatedAt: Date.now() - 40 * DAY_MS,
+    });
+    const firstStore: RunArtifactPurger = { deleteRun: vi.fn(async () => 1) };
+    const secondStore: RunArtifactPurger = { deleteRun: vi.fn(async () => 1) };
+    type ArtifactEnv = Env & { ARTIFACTS: RunArtifactPurger };
+    const firstEnv: ArtifactEnv = { ...first.env, ARTIFACTS: firstStore };
+    const secondEnv: ArtifactEnv = { ...second.env, ARTIFACTS: secondStore };
+    const artifactStore = vi.fn(
+      (currentEnv: ArtifactEnv) => currentEnv.ARTIFACTS,
+    );
+    const worker = workerWith<ArtifactEnv>(artifactStore);
+
+    await worker.runMaintenanceDuty('purge', firstEnv);
+    await worker.runMaintenanceDuty('purge', secondEnv);
+
+    expect(artifactStore).toHaveBeenNthCalledWith(1, firstEnv);
+    expect(artifactStore).toHaveBeenNthCalledWith(2, secondEnv);
+    expect(firstStore.deleteRun).toHaveBeenCalledWith('wf', 'first-stale');
+    expect(firstStore.deleteRun).not.toHaveBeenCalledWith('wf', 'second-stale');
+    expect(secondStore.deleteRun).toHaveBeenCalledWith('wf', 'second-stale');
+    expect(secondStore.deleteRun).not.toHaveBeenCalledWith('wf', 'first-stale');
+  });
+
+  it.each([
+    [
+      'factory',
+      () => {
+        throw new Error('artifact factory unavailable');
+      },
+    ],
+    [
+      'deletion',
+      () => ({
+        deleteRun: async () => {
+          throw new Error('artifact deletion unavailable');
+        },
+      }),
+    ],
+  ])('%s failure preserves the snapshot row and does not starve sibling duties', async (_failure, artifactStore) => {
+    const { env, sqlite } = makeEnv();
+    createSnapshotTable(sqlite);
+    seedRun(sqlite, {
+      runId: 'acme_stale-done',
+      status: 'success',
+      updatedAt: Date.now() - 40 * DAY_MS,
+    });
+    const extraPurgeDuty = vi.fn(async () => ({ extraDuty: 'ran' }));
+
+    const outcome = await workerWith(
+      artifactStore,
+      extraPurgeDuty,
+    ).runMaintenanceDuty('purge', env);
+
+    expect(outcome).toMatchObject({ ok: false });
+    expect(remainingRunIds(sqlite)).toEqual(['acme_stale-done']);
+    expect(extraPurgeDuty).toHaveBeenCalledOnce();
   });
 
   it('without artifactStore the purge is unchanged — same rows deleted, no artifact store touched', async () => {
@@ -1130,5 +1206,19 @@ describe('createFlowsafeWorker artifact-paired retention purge (F4)', () => {
 
     // #then — byte-identical row-only outcome
     expect(remainingRunIds(sqlite)).toEqual(['acme_fresh-done']);
+  });
+
+  it('supports an artifactStore factory that returns undefined', async () => {
+    const { env, sqlite } = makeEnv();
+    createSnapshotTable(sqlite);
+    seedRun(sqlite, {
+      runId: 'acme_stale-done',
+      status: 'success',
+      updatedAt: Date.now() - 40 * DAY_MS,
+    });
+
+    await workerWith(() => undefined).runMaintenanceDuty('purge', env);
+
+    expect(remainingRunIds(sqlite)).toEqual([]);
   });
 });

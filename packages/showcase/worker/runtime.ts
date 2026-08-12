@@ -58,6 +58,7 @@ const DEFAULT_FROM_NAME = 'Anchorage Showcase';
  */
 export function buildShowcaseRuntime(deps: ShowcaseDeps): RunnerRuntime {
   const audit = deps.audit ?? new AuditLogger();
+  const idempotency = deps.idempotencyStore ?? new InMemoryIdempotencyStore();
 
   const moduleDeps: ShowcaseModuleDeps = {
     email: deps.email,
@@ -69,7 +70,11 @@ export function buildShowcaseRuntime(deps: ShowcaseDeps): RunnerRuntime {
     // Shared across the modules: the connector SDK scopes idempotency + rate
     // budgets by connector id (and each module keys idempotency by runId too),
     // so sharing is safe as long as connector ids are globally unique — they are.
-    idempotency: deps.idempotencyStore ?? new InMemoryIdempotencyStore(),
+    idempotency,
+    idempotencyKeyMigration:
+      deps.idempotencyStore === undefined
+        ? 'legacy-writers-drained'
+        : deps.idempotencyKeyMigration,
     rateLimit: deps.rateLimitStore ?? new InMemoryRateLimitStore(),
     crm: deps.crm,
     deploy: deps.deploy,

@@ -6,6 +6,7 @@ import {
   type DurableDatabaseExportStore,
   dispatchMigrations,
 } from '../src/cloudflare-client.js';
+import { ProcessLocalCloudflareApiRateCoordinator } from '../src/cloudflare-rate-coordinator.js';
 import { canonicalDeploymentEgressPolicy } from '../src/platform-resources.js';
 import type {
   DeploymentSpec,
@@ -104,6 +105,12 @@ function fenced<T>(
   );
 }
 
+function testRateCoordinator(
+  intervalCap?: number,
+): ProcessLocalCloudflareApiRateCoordinator {
+  return new ProcessLocalCloudflareApiRateCoordinator(intervalCap);
+}
+
 function errorChain(error: unknown): string {
   const messages: string[] = [];
   let current = error;
@@ -120,6 +127,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: async (input, init) => {
         const url = new URL(
@@ -189,6 +197,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: async (input, init) => {
         const url = new URL(
@@ -279,6 +288,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: request,
     });
@@ -298,6 +308,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: async (input, init) => {
         if (init?.body instanceof FormData) uploaded = true;
@@ -335,6 +346,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: async (input, init) => {
         const url = new URL(
@@ -392,6 +404,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: async (input, init) => {
         const url = new URL(
@@ -454,6 +467,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: async (input, init) => {
         const url = new URL(
@@ -499,6 +513,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: async (input, init) => {
         const url = new URL(
@@ -534,6 +549,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: async (input) => {
         const url = new URL(
@@ -564,8 +580,8 @@ describe('CloudflareProvisioningClient', () => {
       const client = new CloudflareProvisioningClient({
         accountId: 'account',
         apiToken: 'token',
+        rateCoordinator: testRateCoordinator(1),
         dispatchNamespace: 'fleet',
-        intervalCap: 1,
         concurrency: 2,
         fetch: request,
       });
@@ -621,8 +637,8 @@ describe('CloudflareProvisioningClient', () => {
       const client = new CloudflareProvisioningClient({
         accountId: 'account',
         apiToken: 'token',
+        rateCoordinator: testRateCoordinator(1),
         dispatchNamespace: 'fleet',
-        intervalCap: 1,
         concurrency: 2,
         fetch: request,
       });
@@ -704,6 +720,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: request,
       exportStore,
@@ -755,6 +772,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: request,
       exportStore,
@@ -792,6 +810,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: request,
     });
@@ -978,6 +997,9 @@ describe('CloudflareProvisioningClient', () => {
           },
         ]);
       }
+      if (path.endsWith('/workers/scripts/fleet-plain/secrets')) {
+        return envelope([]);
+      }
       if (path.endsWith('/zones/zone/workers/routes')) {
         return envelope([
           {
@@ -1060,6 +1082,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: request,
     });
@@ -1175,6 +1198,9 @@ describe('CloudflareProvisioningClient', () => {
       if (zoneAuthority) return zoneAuthority;
       if (url.searchParams.has('page')) return envelope([]);
       if (path.endsWith('/workers/domains')) return envelope([]);
+      if (path.endsWith('/workers/scripts/plain-acme/secrets')) {
+        return envelope([]);
+      }
       if (path.endsWith('/workers/scripts')) {
         return envelope([{ id: 'plain-acme', etag: 'content-etag' }]);
       }
@@ -1238,6 +1264,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'not-created',
       fetch: request,
     });
@@ -1312,6 +1339,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'not-created',
       fetch: request,
     });
@@ -1388,6 +1416,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: request,
     });
@@ -1525,6 +1554,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       concurrency: 1,
       fetch: request,
@@ -1589,6 +1619,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: request,
     });
@@ -1705,6 +1736,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: request,
     });
@@ -1781,6 +1813,7 @@ describe('CloudflareProvisioningClient', () => {
       const client = new CloudflareProvisioningClient({
         accountId: 'account',
         apiToken: 'token',
+        rateCoordinator: testRateCoordinator(),
         dispatchNamespace: 'fleet',
         fetch: request,
       });
@@ -1805,6 +1838,8 @@ describe('CloudflareProvisioningClient', () => {
     let previewsEnabled = true;
     let customDomainAttached = true;
     let zoneRouteAttached = true;
+    let extraBindings: readonly Readonly<Record<string, unknown>>[] = [];
+    let controlSecretNames: readonly string[] = [];
     const request = vi.fn(
       async (input: string | URL | Request, init?: RequestInit) => {
         const url = new URL(
@@ -1854,9 +1889,13 @@ describe('CloudflareProvisioningClient', () => {
                   name: 'EGRESS_PROXY',
                   service: 'fleet-egress',
                 },
+                ...extraBindings,
               ],
             },
           });
+        }
+        if (url.pathname.endsWith('/workers/scripts/fleet-state/secrets')) {
+          return envelope(controlSecretNames.map((name) => ({ name })));
         }
         if (url.pathname.endsWith('/workers/scripts/fleet-state/subdomain')) {
           if (method === 'POST') {
@@ -1934,6 +1973,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: request,
     });
@@ -1974,11 +2014,28 @@ describe('CloudflareProvisioningClient', () => {
       r2BucketBindings: [],
       secretNames: [],
       plainTextBindings: { DEPLOYMENT_TENANT: 'acme' },
+      providerBindingIdentities: [
+        { type: 'd1', name: 'DB' },
+        { type: 'kv_namespace', name: 'HOSTS' },
+        { type: 'plain_text', name: 'DEPLOYMENT_TENANT' },
+        { type: 'service', name: 'EGRESS_PROXY' },
+      ],
       workersDevEnabled: false,
       previewUrlsEnabled: false,
       routeHostnames: [],
       zoneRoutes: [],
     });
+    controlSecretNames = ['OUT_OF_BAND_SECRET'];
+    await expect(client.inspectControlWorker('fleet-state')).rejects.toThrow(
+      /unsupported or malformed provider binding/u,
+    );
+    controlSecretNames = [];
+    extraBindings = [
+      { type: 'hyperdrive', name: 'FUTURE_BINDING', id: 'config-id' },
+    ];
+    await expect(client.inspectControlWorker('fleet-state')).rejects.toThrow(
+      /unsupported or malformed provider binding/u,
+    );
     await fenced(client, () => client.deleteControlWorker('fleet-state'));
     expect(calls).toEqual(
       expect.arrayContaining([
@@ -2002,11 +2059,53 @@ describe('CloudflareProvisioningClient', () => {
     );
   });
 
+  it('rejects an unconsumed dispatch-provider binding', async () => {
+    const request = vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+      );
+      if (url.pathname.endsWith('/scripts/candidate/settings')) {
+        return envelope({
+          bindings: [
+            { type: 'd1', name: 'DB', database_id: 'db-acme' },
+            { type: 'kv_namespace', name: 'OUT_OF_BAND', namespace_id: 'kv' },
+          ],
+          tags: [
+            'tenant:acme',
+            'environment:production',
+            'schema:1',
+            `spec:${'a'.repeat(64)}`,
+          ],
+        });
+      }
+      if (url.pathname.endsWith('/scripts/candidate')) {
+        return envelope({ script: { etag: 'etag-v1' } });
+      }
+      throw new Error(`unexpected Cloudflare request: ${url.href}`);
+    });
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
+      dispatchNamespace: 'fleet',
+      fetch: request,
+    });
+
+    await expect(client.inspectDispatchWorker('candidate')).rejects.toThrow(
+      /unsupported or malformed provider binding/u,
+    );
+  });
+
   it('stops cleanup when the mutation fence is lost between provider writes', async () => {
     const providerMutations: string[] = [];
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       requestTimeoutMs: 100,
       fetch: async (input, init) => {
@@ -2070,6 +2169,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       requestTimeoutMs: 100,
       fetch: async (_input, init) => {
@@ -2106,6 +2206,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: async (input) => {
         const url = new URL(
@@ -2195,6 +2296,7 @@ describe('CloudflareProvisioningClient', () => {
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: async (input) => {
         const url = new URL(
@@ -2304,6 +2406,7 @@ describe('CloudflareProvisioningClient', () => {
     const malformedScriptClient = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: async (input) => {
         const url = new URL(
@@ -2326,6 +2429,7 @@ describe('CloudflareProvisioningClient', () => {
     const malformedDeploymentClient = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: async (input) => {
         const url = new URL(
@@ -2351,6 +2455,7 @@ describe('CloudflareProvisioningClient', () => {
     const malformedNamespaceClient = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: async (input) => {
         const url = new URL(
@@ -2372,11 +2477,90 @@ describe('CloudflareProvisioningClient', () => {
     ).rejects.toThrow(/unidentified namespace/);
   });
 
+  it('forwards anonymous and numbered D1 parameters without rewriting SQL text', async () => {
+    const bodies: unknown[] = [];
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
+      dispatchNamespace: 'fleet',
+      fetch: async (input, init) => {
+        const url = new URL(
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url,
+        );
+        if (url.pathname.endsWith('/d1/database/database-id/query')) {
+          bodies.push(JSON.parse(String(init?.body)));
+          return envelope([{ success: true, results: [] }]);
+        }
+        throw new Error(`unexpected request ${url.pathname}`);
+      },
+    });
+    const mixedSql = `SELECT ? AS anonymous, ?2 AS numbered, '?' AS literal
+      -- comment ?3
+      /* block ?4 */`;
+
+    await fenced(client, () =>
+      client.queryDatabase('database-id', mixedSql, ['7', 'value']),
+    );
+    await fenced(client, () =>
+      client.batchDatabase('database-id', [
+        { sql: 'SELECT ?1 AS first, ?2 AS second', bindings: ['1', ''] },
+      ]),
+    );
+
+    expect(bodies).toEqual([
+      { sql: mixedSql, params: ['7', 'value'] },
+      {
+        batch: [
+          {
+            sql: 'SELECT ?1 AS first, ?2 AS second',
+            params: ['1', ''],
+          },
+        ],
+      },
+    ]);
+  });
+
+  it('rejects non-string REST D1 parameters instead of changing their SQL types', async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
+      dispatchNamespace: 'fleet',
+      fetch,
+    });
+
+    await expect(
+      fenced(client, () =>
+        client.queryDatabase('database-id', 'SELECT ?', [
+          null,
+        ] as unknown as string[]),
+      ),
+    ).rejects.toThrow('D1 query bindings must be strings');
+    await expect(
+      fenced(client, () =>
+        client.batchDatabase('database-id', [
+          {
+            sql: 'SELECT ?',
+            bindings: [true] as unknown as string[],
+          },
+        ]),
+      ),
+    ).rejects.toThrow('D1 batch bindings must be strings');
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it('exposes a fenced custom-domain adapter for the plain Worker backend', async () => {
     const mutations: string[] = [];
     const client = new CloudflareProvisioningClient({
       accountId: 'account',
       apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
       dispatchNamespace: 'fleet',
       fetch: async (input, init) => {
         const url = new URL(

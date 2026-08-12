@@ -74,6 +74,7 @@ export const productLaunchModule: WorkflowModule<ShowcaseModuleDeps> = {
         audit,
         networkEgress: { allowedDomains: [DEPLOY_HOST] },
         idempotencyStore: deps.idempotency,
+        idempotencyKeyMigration: deps.idempotencyKeyMigration,
       },
       dryRunExecute: async ({ productName }) => ({
         ok: true,

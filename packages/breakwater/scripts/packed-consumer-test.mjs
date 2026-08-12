@@ -133,18 +133,24 @@ try {
   CONNECTOR_GRANTS_CONTEXT_KEY,
   createGuardedAgent,
   createCodexConnector,
+  inspectLegacyConnectorIdempotency,
+  migrateLegacyConnectorIdempotency,
   singleTenantConnectorPolicies,
   type AgentCliErrorCode,
   type AgentCliErrorMetadata,
   type ConnectorApprovalGrant,
   type ConnectorExecutionIdentity,
   type GuardedAgentHandle,
+  type LegacyConnectorIdempotencyMigrationRequest,
+  type LegacyConnectorIdempotencyMigrationResult,
   type SingleTenantConnectorPoliciesOptions,
 } from '@proofoftech/breakwater';
 import { isGuardedAgentHandle } from '@proofoftech/breakwater/agent';
 import {
   connectorManifest,
   createConnector,
+  inspectLegacyConnectorIdempotency as inspectLegacyConnectorIdempotencyFromSubpath,
+  migrateLegacyConnectorIdempotency as migrateLegacyConnectorIdempotencyFromSubpath,
   singleTenantConnectorPolicies as singleTenantConnectorPoliciesFromSubpath,
   type ConnectorApprovalSuspension,
   type SingleTenantConnectorPolicies,
@@ -208,6 +214,12 @@ const execution: ConnectorExecutionIdentity = {
   isolationScope: grant.isolationScope,
   suspension,
 };
+const migrationRequest: LegacyConnectorIdempotencyMigrationRequest = {
+  idempotencyKey: 'invoice:1',
+  isolationScope: 'tenant',
+  expectedRecord: { result: { status: 'legacy' } },
+};
+const migrationResult = null as LegacyConnectorIdempotencyMigrationResult | null;
 const guarded: GuardedAgentHandle = createGuardedAgent({
   id: 'packed-agent',
   name: 'Packed agent',
@@ -235,6 +247,12 @@ void RBACMiddleware;
 void CODEX_CLI;
 void connectorManifest(tool);
 void connectorManifest(authorized)?.requiredPermissions;
+void inspectLegacyConnectorIdempotency;
+void inspectLegacyConnectorIdempotencyFromSubpath;
+void migrateLegacyConnectorIdempotency;
+void migrateLegacyConnectorIdempotencyFromSubpath;
+void migrationRequest;
+void migrationResult;
 void preset;
 void presetFromSubpath;
 void isGuardedAgentHandle(guarded);

@@ -31,6 +31,7 @@ import {
   externalReleaseTopology,
 } from './platform-resources.js';
 import { buildPromotionGuard } from './promotion-guard.js';
+import { assertProviderBindingIdentitiesMatchInspection } from './provider-binding-inventory.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   DatabaseExport,
@@ -201,6 +202,24 @@ export function assertLiveDeploymentMatches(
     | import('./types.js').ApplicationBindingTopology
     | undefined = record.applicationBindings,
 ): void {
+  if (live.plainTextBindings === undefined || live.secretNames === undefined) {
+    throw new Error(
+      `deployment '${record.tenantTag}:${record.environment}' live binding inventory is incomplete`,
+    );
+  }
+  assertProviderBindingIdentitiesMatchInspection(
+    {
+      databaseIds: [live.databaseId],
+      durableObjectBindings: live.durableObjectBindings,
+      serviceBindings: live.serviceBindings,
+      queueProducerBindings: live.queueProducerBindings,
+      r2BucketBindings: live.r2BucketBindings,
+      plainTextBindings: live.plainTextBindings,
+      secretNames: live.secretNames,
+      providerBindingIdentities: live.providerBindingIdentities,
+    },
+    `deployment '${record.tenantTag}:${record.environment}'`,
+  );
   const externalTopology =
     spec.authoredBy === 'external' && record.platformResources
       ? externalReleaseTopology(spec, record.platformResources)
@@ -267,10 +286,8 @@ export function assertLiveDeploymentMatches(
       live,
       DEPLOYMENT_PLATFORM_VARIABLE_NAMES,
     ) ||
-    (application !== undefined &&
-      live.secretNames !== undefined &&
-      JSON.stringify([...live.secretNames].sort()) !==
-        JSON.stringify(expectedSecretNames))
+    JSON.stringify([...live.secretNames].sort()) !==
+      JSON.stringify(expectedSecretNames)
   ) {
     throw new Error(
       `deployment '${record.tenantTag}:${record.environment}' live state does not exactly match the desired specification`,

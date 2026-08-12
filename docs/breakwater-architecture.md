@@ -165,6 +165,13 @@ An idempotency record can be:
 
 `AtomicIdempotencyStore` uses lease tokens for release and stale takeover. `D1IdempotencyStore` uses an insert claim and compare-and-swap updates across isolates. Set its pending TTL longer than the maximum connector execution.
 
+The connector derives opaque v2 idempotency keys from tagged, encoded tuple
+components. Before using v2 it inspects the exact legacy key. Safe unscoped
+records replay, ambiguous scoped or colon-bearing records deny, and an absent
+legacy row requires the host's explicit drained-writer acknowledgement.
+`InspectableIdempotencyStore` makes pending legacy state visible without a
+mutating reserve/release probe.
+
 Rate limits use fixed windows. A burst across adjacent windows can approach twice the nominal count, and clock skew can amplify this across isolates. Use `D1RateLimitStore` when the budget must be shared across per-run Durable Objects.
 
 Only actual executions consume the budget. Denials, dry-runs, stored replays, and joined in-flight twins do not.
@@ -183,7 +190,7 @@ Flowsafe mints the workflow value on every run leg. It reserves and strips `brea
 
 Every gate writes an `AuditEvent` with timestamp, actor, action, resource, decision, optional reason, and structured detail.
 
-Guarded agents use `agent:<agentId>` as the RBAC and policy resource. A trusted host may set `breakwater.auditContext` with `agentId`, `tenantId`, `runId`, `threadId`, `resourceId`, and `entryPath`. Breakwater copies only these scalar fields into agent audit detail. Flowsafe maps its verified deployment tag to the legacy `tenantId` audit field; request claims cannot set it. Breakwater does not copy prompts, tool inputs, URLs, secrets, or model output.
+Guarded agents use `agent:<agentId>` as the RBAC and policy resource. A trusted host may set `breakwater.auditContext` with `agentId`, `tenantId`, `runId`, `threadId`, `resourceId`, `entryPath`, and principal correlation. Breakwater copies only these scalar fields into agent, policy, and connector audit detail. Trusted context wins over same-named boundary detail. Flowsafe maps its verified deployment tag to the legacy `tenantId` audit field; request claims cannot set it. Breakwater does not copy prompts, tool inputs, URLs, secrets, or model output.
 
 `AuditLogger` keeps a bounded in-memory ring and invokes its sink without making export availability part of the agent path. Supply `onSinkError` to surface failures.
 

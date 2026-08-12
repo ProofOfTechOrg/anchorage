@@ -4,7 +4,9 @@ This guide takes a Mastra application from package installation to one guarded c
 
 ## Prerequisites
 
-- Node.js 22 or later
+- Node.js 22.3 or later for Breakwater's built-in Agent CLI executor; the
+  complete repository and private fleet-control package require Node.js 22.22.0
+  or later
 - An ESM TypeScript project using `moduleResolution: "NodeNext"`, `"Node16"`, or `"Bundler"`
 - `@mastra/core` in the `^1.50.0` peer range
 - A Cloudflare account, D1 database, and Durable Objects only when deploying flowsafe
@@ -126,6 +128,7 @@ export function createPublisher(
     },
     policies: {
       idempotencyStore: new D1IdempotencyStore(db),
+      idempotencyKeyMigration: 'legacy-writers-drained',
       rateLimitStore: new D1RateLimitStore(db),
     },
     execute: async ({ releaseId, notes }, _context, runtime) => {
@@ -145,7 +148,7 @@ export function createPublisher(
 }
 ```
 
-The structural D1 types accept a Cloudflare `D1Database`; type the example's `db` accordingly in your Worker. Use shared D1 stores when a rate limit or idempotency key must hold across isolates. In-memory stores cover only one isolate. Flowsafe connector budgets and idempotency are deployment-wide. A different generic host can use Breakwater's opaque isolation scope when it owns another trusted logical partition.
+The structural D1 types accept a Cloudflare `D1Database`; type the example's `db` accordingly in your Worker. The migration acknowledgement is valid for this new empty deployment only. Before setting it on an upgraded shared store, stop and drain every legacy writer, inventory through `inspectLegacyConnectorIdempotency()`, prove each ambiguous row's tuple from business or audit evidence, and move proven rows with `migrateLegacyConnectorIdempotency()`, as described in [Connector interface](connector-interface.md#idempotency). The migration helper requires D1-compatible transactional `batch()` semantics. Use shared D1 stores when a rate limit or idempotency key must hold across isolates. In-memory stores cover only one isolate. Flowsafe connector budgets and idempotency are deployment-wide. A different generic host can use Breakwater's opaque isolation scope when it owns another trusted logical partition.
 
 Read [Connector interface](connector-interface.md) before writing production connectors. It explains the required request-context keys, fixed-window behavior, redirect handling, and failure semantics.
 

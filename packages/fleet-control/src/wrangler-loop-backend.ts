@@ -19,6 +19,7 @@ import { isSha256 } from './deployment-context.js';
 import { WorkerDeploymentError } from './deployment-error.js';
 import { maintenanceUrl, readMaintenanceHealth } from './maintenance-health.js';
 import { applyMigrationsWithLedger } from './migration-ledger.js';
+import { assertSupportedProviderBindings } from './provider-binding-inventory.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   D1Migration,
@@ -64,6 +65,22 @@ export interface PlainWorkerCustomDomain {
 }
 
 export interface PlainWorkerRouteApi {
+  withMutationFence<T>(
+    fence: ExternalMutationFence,
+    operation: () => Promise<T>,
+  ): Promise<T>;
+  queryDatabase(
+    databaseId: string,
+    sql: string,
+    bindings?: readonly string[],
+  ): Promise<readonly Readonly<Record<string, unknown>>[]>;
+  batchDatabase(
+    databaseId: string,
+    statements: readonly {
+      readonly sql: string;
+      readonly bindings?: readonly string[];
+    }[],
+  ): Promise<void>;
   listWorkerDatabaseAttachments(databaseId: string): Promise<
     readonly Readonly<{
       scriptName: string;
@@ -150,6 +167,16 @@ function isWranglerNotFound(error: unknown): boolean {
   );
 }
 
+function restD1Bindings(
+  bindings: readonly unknown[],
+  operation: string,
+): readonly string[] {
+  if (bindings.some((binding) => typeof binding !== 'string')) {
+    throw new Error(`${operation} D1 bindings must be strings`);
+  }
+  return bindings as readonly string[];
+}
+
 function versionId(value: unknown): string | undefined {
   const id = field(value, 'id') ?? field(value, 'version_id');
   return typeof id === 'string' ? id : undefined;
@@ -159,26 +186,6 @@ function versionTag(value: unknown): string | undefined {
   const annotations = field(value, 'annotations');
   const tag = field(annotations, 'workers/tag') ?? field(value, 'tag');
   return typeof tag === 'string' ? tag : undefined;
-}
-
-function sqlLiteral(value: unknown): string {
-  if (value === null) return 'NULL';
-  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
-  if (typeof value === 'boolean') return value ? '1' : '0';
-  if (typeof value === 'string') return `'${value.replaceAll("'", "''")}'`;
-  throw new Error('Wrangler D1 bindings must be scalar values');
-}
-
-function bindSql(sql: string, bindings: readonly unknown[]): string {
-  let index = 0;
-  const bound = sql.replaceAll('?', () => {
-    if (index >= bindings.length) {
-      throw new Error('not enough SQL bindings');
-    }
-    return sqlLiteral(bindings[index++]);
-  });
-  if (index !== bindings.length) throw new Error('too many SQL bindings');
-  return bound;
 }
 
 export function plainWorkerIngressModule(spec: DeploymentSpec): Readonly<{
@@ -431,28 +438,13 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     fence: ExternalMutationFence,
     bindings: readonly unknown[] = [],
   ): Promise<readonly Readonly<Record<string, unknown>>[]> {
-    const result = await this.#runMutation(fence, [
-      'd1',
-      'execute',
-      database.id,
-      '--remote',
-      '--json',
-      '--command',
-      bindSql(sql, bindings),
-    ]);
-    const pages = asArray(parseJson(result.stdout, 'd1 execute'));
-    const rows: Readonly<Record<string, unknown>>[] = [];
-    for (const page of pages) {
-      const pageRows = field(page, 'results');
-      if (Array.isArray(pageRows)) {
-        for (const row of pageRows) {
-          if (row && typeof row === 'object') {
-            rows.push(row as Readonly<Record<string, unknown>>);
-          }
-        }
-      }
-    }
-    return rows;
+    return this.#routeApi.withMutationFence(fence, () =>
+      this.#routeApi.queryDatabase(
+        database.id,
+        sql,
+        restD1Bindings(bindings, 'plain Worker'),
+      ),
+    );
   }
 
   async seedDeploymentIdentity(
@@ -485,14 +477,19 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     await applyMigrationsWithLedger(
       {
         query: (sql, bindings) => this.#query(database, sql, fence, bindings),
-        batch: async (statements) => {
-          const sql = statements
-            .map((statement) =>
-              bindSql(statement.sql, statement.bindings ?? []),
-            )
-            .join(';\n');
-          await this.#query(database, sql, fence);
-        },
+        batch: (statements) =>
+          this.#routeApi.withMutationFence(fence, () =>
+            this.#routeApi.batchDatabase(
+              database.id,
+              statements.map((statement) => ({
+                sql: statement.sql,
+                bindings: restD1Bindings(
+                  statement.bindings ?? [],
+                  'plain Worker batch',
+                ),
+              })),
+            ),
+          ),
       },
       migrations,
     );
@@ -1550,6 +1547,43 @@ export class WranglerLoopBackend implements ProvisioningBackend {
         `script '${spec.scriptName}' has no valid schema version`,
       );
     }
+    const versionBindingIdentities = assertSupportedProviderBindings(
+      bindings,
+      new Set([
+        'd1',
+        'durable_object_namespace',
+        'service',
+        'queue',
+        'r2_bucket',
+        'plain_text',
+        'secret_text',
+      ]),
+      `plain Worker '${spec.scriptName}'`,
+    );
+    const secretNames = await this.#routeApi.listOrdinaryWorkerSecretNames(
+      spec.scriptName,
+    );
+    const versionSecretNames = versionBindingIdentities
+      .filter(({ type }) => type === 'secret_text')
+      .map(({ name }) => name)
+      .sort();
+    if (
+      versionSecretNames.length > 0 &&
+      JSON.stringify(versionSecretNames) !==
+        JSON.stringify([...secretNames].sort())
+    ) {
+      throw new Error(
+        `plain Worker '${spec.scriptName}' version and secret inventories disagree`,
+      );
+    }
+    const providerBindingIdentities = [
+      ...versionBindingIdentities.filter(({ type }) => type !== 'secret_text'),
+      ...secretNames.map((name) => ({ type: 'secret_text', name }) as const),
+    ].sort((left, right) =>
+      `${left.type}\u0000${left.name}`.localeCompare(
+        `${right.type}\u0000${right.name}`,
+      ),
+    );
     const maintenance = await readMaintenanceHealth(
       await this.#fetch(maintenanceUrl(spec, '/admin/maintenance-status'), {
         headers: {
@@ -1580,17 +1614,10 @@ export class WranglerLoopBackend implements ProvisioningBackend {
       durableObjectBindings,
       serviceBindings,
       queueProducerBindings,
-      ...(canonicalApplicationBindings(spec).vars.length > 0
-        ? { plainTextBindings: Object.fromEntries(plainText) }
-        : {}),
+      plainTextBindings: Object.fromEntries(plainText),
       ...(r2BucketBindings.length > 0 ? { r2BucketBindings } : {}),
-      ...(canonicalApplicationBindings(spec).secrets.length > 0
-        ? {
-            secretNames: await this.#routeApi.listOrdinaryWorkerSecretNames(
-              spec.scriptName,
-            ),
-          }
-        : {}),
+      secretNames,
+      providerBindingIdentities,
       artifactVersion,
       desiredSpecDigest,
       schemaVersion,

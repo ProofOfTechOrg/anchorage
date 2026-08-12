@@ -1,6 +1,6 @@
 {
   "name": "showcase",
-  "version": "0.0.12",
+  "version": "0.0.13",
   "private": true,
   "description": "Anchorage showcase — six runnable workflows and seven guardrail scenarios behind one React frontend",
   "type": "module",

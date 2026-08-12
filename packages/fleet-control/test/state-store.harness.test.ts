@@ -84,13 +84,15 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
   it('renews from D1 time and keeps a heartbeat lease alive past its original expiry', async () => {
     const result = await probe<{
       explicit: { before: number; after: number };
+      heartbeatObserved: boolean;
       contenderRejected: boolean;
     }>('renewal');
 
     expect(result.explicit.before).toBeGreaterThan(14 * 60_000);
     expect(result.explicit.after).toBeGreaterThan(14 * 60_000);
+    expect(result.heartbeatObserved).toBe(true);
     expect(result.contenderRejected).toBe(true);
-  }, 15_000);
+  }, 30_000);
 
   it('allows DB-expired takeover and fences every stale state mutation', async () => {
     const result = await probe<{
@@ -173,9 +175,11 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
 
   it('keeps the platform lease alive with a DB-time heartbeat', async () => {
     await expect(
-      probe<{ contenderRejected: boolean }>('platform-renewal'),
-    ).resolves.toEqual({ contenderRejected: true });
-  }, 15_000);
+      probe<{ heartbeatObserved: boolean; contenderRejected: boolean }>(
+        'platform-renewal',
+      ),
+    ).resolves.toEqual({ heartbeatObserved: true, contenderRejected: true });
+  }, 30_000);
 
   it('mutually excludes ordinary Worker claims in both durable claim directions', async () => {
     const result = await probe<{
@@ -260,5 +264,13 @@ describe.sequential('D1FleetStateStore Wrangler harness', {
         ],
       });
     }
+  });
+
+  it('coordinates separate direct-binding rate coordinators atomically in real D1', async () => {
+    await expect(
+      probe<{ blocked: boolean; count: number }>(
+        'cloudflare-rate-coordination',
+      ),
+    ).resolves.toEqual({ blocked: true, count: 1_100 });
   });
 });

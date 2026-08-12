@@ -135,6 +135,23 @@ class FakeRouteApi implements PlainWorkerRouteApi {
   ]);
   secretRevocationNoop = false;
   secretListReads = 0;
+  secretListError: Error | undefined;
+  readonly databaseQueries: Array<{
+    readonly databaseId: string;
+    readonly sql: string;
+    readonly bindings: readonly unknown[];
+  }> = [];
+  readonly databaseBatches: Array<{
+    readonly databaseId: string;
+    readonly statements: readonly {
+      readonly sql: string;
+      readonly bindings?: readonly unknown[];
+    }[];
+  }> = [];
+  queryHandler: (
+    sql: string,
+    bindings: readonly unknown[],
+  ) => Promise<readonly Readonly<Record<string, unknown>>[]> = async () => [];
   workersDevEnabled = false;
   previewUrlsEnabled = false;
   zoneRoutes: Array<{
@@ -146,6 +163,36 @@ class FakeRouteApi implements PlainWorkerRouteApi {
 
   constructor(domains: readonly PlainWorkerCustomDomain[] = []) {
     this.domains = [...domains];
+  }
+
+  async withMutationFence<T>(
+    fence: ExternalMutationFence,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    await fence.assertOwned();
+    return operation();
+  }
+
+  async queryDatabase(
+    databaseId: string,
+    sql: string,
+    bindings: readonly unknown[] = [],
+  ): Promise<readonly Readonly<Record<string, unknown>>[]> {
+    this.databaseQueries.push({ databaseId, sql, bindings: [...bindings] });
+    return this.queryHandler(sql, bindings);
+  }
+
+  async batchDatabase(
+    databaseId: string,
+    statements: readonly {
+      readonly sql: string;
+      readonly bindings?: readonly unknown[];
+    }[],
+  ): Promise<void> {
+    this.databaseBatches.push({ databaseId, statements });
+    for (const statement of statements) {
+      await this.queryHandler(statement.sql, statement.bindings ?? []);
+    }
   }
 
   async listCustomDomains(): Promise<readonly PlainWorkerCustomDomain[]> {
@@ -171,6 +218,7 @@ class FakeRouteApi implements PlainWorkerRouteApi {
 
   async listOrdinaryWorkerSecretNames(): Promise<readonly string[]> {
     this.secretListReads += 1;
+    if (this.secretListError) throw this.secretListError;
     if (this.secretListReads > 1 && !this.secretRevocationNoop) {
       this.secretNames.clear();
     }
@@ -209,6 +257,22 @@ class FakeRouteApi implements PlainWorkerRouteApi {
   }
 }
 
+function databaseRouteMethods(): Pick<
+  PlainWorkerRouteApi,
+  'withMutationFence' | 'queryDatabase' | 'batchDatabase'
+> {
+  return {
+    async withMutationFence(fence, operation) {
+      await fence.assertOwned();
+      return operation();
+    },
+    async queryDatabase() {
+      return [];
+    },
+    async batchDatabase() {},
+  };
+}
+
 function notFound(resource = 'resource'): Error {
   return new Error(`wrangler exited 1: ${resource} not found`);
 }
@@ -218,6 +282,16 @@ function operation(call: RunnerCall): string {
     return call.arguments.slice(0, 3).join(' ');
   }
   return call.arguments.slice(0, 2).join(' ');
+}
+
+function errorChain(error: unknown): string {
+  const messages: string[] = [];
+  let current = error;
+  while (current instanceof Error) {
+    messages.push(current.message);
+    current = current.cause;
+  }
+  return messages.join(' | ');
 }
 
 function backend(
@@ -1003,6 +1077,7 @@ export default {
     });
     let reads = 0;
     const routeApi: PlainWorkerRouteApi = {
+      ...databaseRouteMethods(),
       async listWorkerDatabaseAttachments() {
         return [];
       },
@@ -1149,6 +1224,7 @@ export default {
   });
 
   it('parses deployment resources and checks authenticated maintenance health', async () => {
+    let extraBindings: readonly Readonly<Record<string, unknown>>[] = [];
     const runner = new FakeRunner(async (arguments_) => {
       if (arguments_[0] === 'deployments') {
         return {
@@ -1189,6 +1265,7 @@ export default {
                 name: 'FLEET_SPEC_DIGEST',
                 text: deploymentSpecDigest(deployment),
               },
+              ...extraBindings,
             ],
           },
         }),
@@ -1221,6 +1298,24 @@ export default {
         },
       ],
       queueProducerBindings: [],
+      plainTextBindings: {
+        DEPLOYMENT_TENANT: deployment.tenantTag,
+        FLEET_ENVIRONMENT: deployment.environment,
+        FLEET_SCHEMA_VERSION: String(deployment.schemaVersion),
+        FLEET_SPEC_DIGEST: deploymentSpecDigest(deployment),
+      },
+      secretNames: ['DEPLOYMENT_IDENTITY_SECRET', 'MAINTENANCE_ADMIN_SECRET'],
+      providerBindingIdentities: [
+        { type: 'd1', name: 'DB' },
+        { type: 'durable_object_namespace', name: 'MAINTENANCE' },
+        { type: 'plain_text', name: 'DEPLOYMENT_TENANT' },
+        { type: 'plain_text', name: 'FLEET_ENVIRONMENT' },
+        { type: 'plain_text', name: 'FLEET_SCHEMA_VERSION' },
+        { type: 'plain_text', name: 'FLEET_SPEC_DIGEST' },
+        { type: 'secret_text', name: 'DEPLOYMENT_IDENTITY_SECRET' },
+        { type: 'secret_text', name: 'MAINTENANCE_ADMIN_SECRET' },
+        { type: 'service', name: 'EGRESS_PROXY' },
+      ],
       artifactVersion: 'version-live',
       desiredSpecDigest: deploymentSpecDigest(deployment),
       schemaVersion: 3,
@@ -1246,6 +1341,29 @@ export default {
         headers: { authorization: `Bearer ${secrets.maintenanceAdmin}` },
       },
     );
+    extraBindings = [
+      { type: 'kv_namespace', name: 'OUT_OF_BAND_KV', namespace_id: 'kv-id' },
+    ];
+    await expect(
+      backend(runner, { fetch: request }).inspect(
+        deployment,
+        secrets.maintenanceAdmin,
+      ),
+    ).rejects.toThrow(/unsupported or malformed provider binding/u);
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails closed when an expected-empty secret inventory cannot be inspected', async () => {
+    const routeApi = new FakeRouteApi();
+    routeApi.secretListError = new Error('secret inventory unavailable');
+
+    await expect(
+      backend(ownedWorkerRunner(), {
+        routeApi,
+        fetch: async () => maintenanceResponse(),
+      }).inspect(deployment, secrets.maintenanceAdmin),
+    ).rejects.toThrow(/secret inventory unavailable/u);
+    expect(routeApi.secretListReads).toBe(1);
   });
 
   it.each([
@@ -1497,7 +1615,7 @@ export default {
     expect(runner.calls.map(operation)).toContain('versions upload');
   });
 
-  it('reads and seeds database ownership through remote Wrangler SQL', async () => {
+  it('reads and seeds database ownership through fenced provider-native SQL', async () => {
     const sentinelDdl = `CREATE TABLE IF NOT EXISTS flowsafe_deployment (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   tenant_tag TEXT NOT NULL,
@@ -1505,15 +1623,18 @@ export default {
 )`;
     let sentinelExists = false;
     let owner: string | undefined;
-    const runner = new FakeRunner(async (arguments_) => {
-      const commandIndex = arguments_.indexOf('--command');
-      const sql = arguments_[commandIndex + 1] ?? '';
+    const runner = new FakeRunner();
+    const routeApi = new FakeRouteApi();
+    routeApi.queryHandler = async (sql, bindings) => {
       let results: readonly Readonly<Record<string, unknown>>[] = [];
       if (sql.includes("sqlite_schema WHERE type = 'table' ORDER BY name")) {
         results = sentinelExists
           ? [{ name: 'flowsafe_deployment', sql: sentinelDdl }]
           : [];
-      } else if (sql.includes("name = 'flowsafe_deployment'")) {
+      } else if (
+        sql.includes('name = ?') &&
+        bindings[0] === 'flowsafe_deployment'
+      ) {
         results = sentinelExists ? [{ sql: sentinelDdl }] : [];
       } else if (sql.startsWith('PRAGMA table_info')) {
         results = [
@@ -1526,11 +1647,11 @@ export default {
       } else if (sql.startsWith('CREATE TABLE')) {
         sentinelExists = true;
       } else if (sql.startsWith('INSERT OR IGNORE')) {
-        owner = 'acme';
+        owner = String(bindings[0]);
       }
-      return { stdout: JSON.stringify([{ results }]), stderr: '' };
-    });
-    const subject = backend(runner);
+      return results;
+    };
+    const subject = backend(runner, { routeApi });
 
     await expect(
       subject.readDeploymentIdentity(database, mutationFence),
@@ -1539,15 +1660,84 @@ export default {
     await expect(
       subject.readDeploymentIdentity(database, mutationFence),
     ).resolves.toBe('acme');
+    expect(runner.calls).toEqual([]);
+    expect(routeApi.databaseQueries.length).toBeGreaterThan(0);
     expect(
-      runner.calls.every(
-        (call) =>
-          call.arguments[0] === 'd1' &&
-          call.arguments[1] === 'execute' &&
-          call.arguments.includes('--remote') &&
-          call.arguments.includes('--json'),
+      routeApi.databaseQueries.every(
+        (query) => query.databaseId === database.id,
       ),
     ).toBe(true);
+  });
+
+  it('forwards SQLite literals, identifiers, comments, and numbered parameters unchanged', async () => {
+    const routeApi = new FakeRouteApi();
+    const statement = `CREATE TABLE "literal?" (
+      \`backtick?\` TEXT DEFAULT 'it''s ?',
+      [bracket?] TEXT
+    );
+    -- line-comment ?
+    /* block-comment ? */`;
+    let applied = false;
+    routeApi.queryHandler = async (sql) => {
+      if (sql.startsWith('SELECT version')) {
+        return applied
+          ? [
+              {
+                version: 1,
+                sql_sha256:
+                  routeApi.databaseBatches[0]?.statements[1]?.bindings?.[1],
+              },
+            ]
+          : [];
+      }
+      return [];
+    };
+    const batchDatabase = routeApi.batchDatabase.bind(routeApi);
+    routeApi.batchDatabase = async (databaseId, statements) => {
+      await batchDatabase(databaseId, statements);
+      applied = true;
+    };
+
+    await expect(
+      backend(new FakeRunner(), { routeApi }).applyMigrations(
+        database,
+        [{ version: 1, sql: statement }],
+        mutationFence,
+      ),
+    ).resolves.toBeUndefined();
+    expect(routeApi.databaseBatches).toHaveLength(1);
+    expect(routeApi.databaseBatches[0]?.statements[0]).toEqual({
+      sql: statement,
+      bindings: [],
+    });
+    expect(routeApi.databaseBatches[0]?.statements[1]).toMatchObject({
+      sql: expect.stringContaining('VALUES (?, ?, ?)'),
+      bindings: ['1', expect.any(String), expect.any(String)],
+    });
+  });
+
+  it('propagates provider placeholder-arity and unsupported-name failures', async () => {
+    for (const [sql, message] of [
+      ['SELECT ?', 'not enough SQL bindings'],
+      ['SELECT 1', 'too many SQL bindings'],
+      ['SELECT :named', 'named SQLite parameters are unsupported'],
+    ] as const) {
+      const routeApi = new FakeRouteApi();
+      routeApi.batchDatabase = async () => {
+        throw new Error(message);
+      };
+      let failure: unknown;
+      try {
+        await backend(new FakeRunner(), { routeApi }).applyMigrations(
+          database,
+          [{ version: 1, sql }],
+          mutationFence,
+        );
+      } catch (error) {
+        failure = error;
+      }
+      expect(errorChain(failure)).toContain(message);
+    }
   });
 
   it('creates a database after core authorization', async () => {
@@ -1592,11 +1782,7 @@ export default {
       name: deployment.databaseName,
       created: true,
     });
-    expect(runner.calls.map(operation)).toEqual([
-      'd1 create',
-      'd1 list',
-      'd1 execute',
-    ]);
+    expect(runner.calls.map(operation)).toEqual(['d1 create', 'd1 list']);
   });
 
   it('rejects an authorized D1 create race that resolves to another owner', async () => {
@@ -1939,6 +2125,7 @@ export default {
     ).rejects.toThrow(/remains after delete/);
 
     const stickyRoute: PlainWorkerRouteApi = {
+      ...databaseRouteMethods(),
       async listWorkerDatabaseAttachments() {
         return [];
       },

@@ -10,6 +10,7 @@ import type { ToolExecutionContext } from '@mastra/core/tools';
 import type {
   AtomicIdempotencyStore,
   AuditLogger,
+  InspectableIdempotencyStore,
   RateLimitStore,
 } from '@proofoftech/breakwater';
 import type {
@@ -96,7 +97,13 @@ export interface ShowcaseDeps {
   // content-pipeline (default: InMemoryArtifactBucket, offline-real)
   artifactBucket?: ArtifactBucket;
   // content-pipeline + product-launch (default: InMemoryIdempotencyStore)
-  idempotencyStore?: AtomicIdempotencyStore;
+  idempotencyStore?: AtomicIdempotencyStore & InspectableIdempotencyStore;
+  /**
+   * Set only after every legacy Breakwater writer sharing an injected store
+   * has stopped and drained. A fresh default in-memory store is acknowledged
+   * automatically because no older writer can reach it.
+   */
+  idempotencyKeyMigration?: 'legacy-writers-drained';
   // lead-generation (default: InMemoryRateLimitStore)
   rateLimitStore?: RateLimitStore;
   // lead-generation CRM assign egress; absent => simulated
@@ -116,7 +123,8 @@ export interface ShowcaseModuleDeps {
   fromAddress: string;
   fromName: string;
   artifactStore: R2ArtifactStore;
-  idempotency: AtomicIdempotencyStore;
+  idempotency: AtomicIdempotencyStore & InspectableIdempotencyStore;
+  idempotencyKeyMigration?: 'legacy-writers-drained';
   rateLimit: RateLimitStore;
   crm?: EgressBinding;
   deploy?: EgressBinding;

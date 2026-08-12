@@ -137,6 +137,24 @@ Never bind two organizations to one data-plane resource set. Never reuse a tag w
 
 There is no in-database organization purge. Abandoned live runs and approvals disappear only when the physical database is deleted, so revoke traffic before deletion and treat the resource inventory as the completion checklist.
 
+### Retire legacy Cloudflare resources
+
+Use this procedure when the original fleet record or supported decommission workflow cannot authorize a legacy resource set. Treat the deletion plan, verifier, runtime, and captured provider evidence as one reviewed authority package.
+
+1. Record the exact account, Worker service and version identities, database and namespace IDs, storage names, ingress, automation, and explicit exclusions. Use immutable provider IDs where the API supports them. For a name-addressed mutation, freeze provider writes and recheck the name-to-ID mapping immediately before the mutation.
+2. Freeze repository pushes, provider edits, Builds triggers, credential changes, and every other writer for the deletion window. Run reviewed tooling from an isolated, hash-pinned runtime instead of a mutable shared checkout or dependency tree.
+3. Export every state domain that retention policy requires. Store exports outside Git, restrict their permissions, record their size and digest, and prove that each export restores before deleting anything.
+4. Capture a complete reverse-dependency and ingress inventory. Include all deployable retained Worker versions, Pages production and preview configurations and deployments, dispatch scripts, service and Durable Object bindings, routes, custom domains, `workers.dev`, preview URLs, cron triggers, Queue consumers, Email Routing rules, tail consumers, Builds triggers, and conventional Workers Sites KV namespaces. Inventory application R2 buckets and every Durable Object namespace and stored object that the deletion can remove.
+5. Fail closed on incomplete, malformed, duplicated, or ambiguous provider response fields. A disabled route, email action, consumer, or build trigger still counts as a reference because an operator can re-enable it.
+6. Review the exact authority package and preflight evidence before mutation. Record independent digests for the authority and evidence, and verify both at every destructive boundary. Regenerating any preflight artifact starts a new review cycle and requires a new approved evidence digest.
+7. Remove all ingress and background execution, then prove their absence. Recheck application-owned R2 buckets after traffic quiesces; stop while any bucket remains attached or nonempty. Evacuate or explicitly purge application data through an application-owned procedure, never a generic automatic purge.
+8. Delete the Worker without bypassing provider dependency checks. If Worker deletion also removes Durable Object or Workers Sites storage, enumerate and export those exact resources first. Treat a timeout or lost response as ambiguous: read back the exact identities before deciding whether to retry.
+9. Prove the Worker and every authorized cascading resource are absent. Repeat the complete reverse-dependency scan before deleting independent storage.
+10. Delete D1 and other independent storage by immutable provider ID. Keep interactive target readback enabled for irreversible commands; do not combine mutable-name resolution with a confirmation bypass.
+11. Revalidate the replacement deployment after each destructive boundary and at completion. Check its exact version, bindings, ingress, automation, health, protected-route behavior, assets, and zero-write sentinel. Retain the export, approved digests, provider evidence, and deletion results according to policy.
+
+Do not commit provider tokens, account-specific resource IDs, captured provider responses, data exports, or one-off deletion tooling. Commit only reusable procedures and invariant-checking code that belongs to the supported control plane. Cloudflare Worker versions preserve code and configuration but not storage state, so retained versions remain part of the reverse-dependency proof. See [Workers versions and deployments](https://developers.cloudflare.com/workers/versions-and-deployments/), [D1 Wrangler commands](https://developers.cloudflare.com/d1/wrangler-commands/), and [Durable Object class exports](https://developers.cloudflare.com/durable-objects/reference/durable-objects-migrations/) for current provider behavior.
+
 ## Alarm-driven duties
 
 The maintenance singleton runs separate alarm invocations for:
@@ -223,7 +241,7 @@ At minimum, alert on:
 - foreign run/thread probes;
 - repeated signal or webhook rate-limit denial;
 - idempotency store degradation after a successful side effect;
-- Agent CLI timeout, spawn failure, or non-zero exit;
+- Agent CLI timeout, process-tree termination failure, spawn failure, or non-zero exit;
 - demo global run budget near exhaustion.
 
 Audit records are security evidence. Queue depth and SIEM ingestion status must be monitored separately from application health because sink failure is intentionally contained.
@@ -241,6 +259,7 @@ Audit records are security evidence. Queue depth and SIEM ingestion status must 
 | Agent stream returns 409 | In-memory replay cache was evicted or the isolate restarted | Read the authoritative status route; reconnect only for events still present in the configured cache |
 | Connector says approval missing after an approved record | Fingerprint, connector id, workflow, run, and deployment store | Confirm the record matches current step, `suspendedAt`, `resumeCount`, and exact connector id |
 | Connector repeats an external write | Idempotency key, shared store, pending TTL | Fix the business key/store reach/TTL; inspect vendor idempotency evidence |
+| Connector denies `idempotency-key-migration` | Legacy writer versions, `inspectLegacyConnectorIdempotency()` outcome, external tuple evidence, and the exact legacy record | Stop and drain every old writer sharing the store. Prove one tuple owns the row, set the drained-writer acknowledgement, and use `migrateLegacyConnectorIdempotency()`; leave pending, changed, invalid, conflicting, or unproven rows fail closed |
 | One workload throttles another | Deployment-wide connector budget | Tune the deployment limit or split workloads into separate deployments when they require independent capacity |
 | Egress policy allowed an unexpected socket | Connector bypassed runtime fetch | Route the transport through guarded fetch and add infrastructure egress control |
 | Live updates stop but HTTP works | Hub binding, ticket secret/expiry, socket liveness | Let client poll; repair stream configuration without disabling authorization |
@@ -249,6 +268,8 @@ Audit records are security evidence. Queue depth and SIEM ingestion status must 
 | Purge removed a snapshot but left R2 | Artifact store omitted or delete failed | Restore row/key evidence if available, repair paired purge, scan known prefix |
 | Audit is absent while requests succeed | Sink, Queue, consumer, SIEM | Restore export, preserve local ring/Logs, assess evidence gap |
 | Agent CLI error lacks output | Expected safe diagnostics | Inspect the isolated workspace/vendor logs under appropriate access; do not weaken public error safety |
+| Agent CLI reports `runtime-unavailable` before Windows launch | `SystemRoot`/`WINDIR` presence and whether it is a drive-absolute local path | Restore the trusted Windows system-root environment; UNC, device, root-relative, and relative paths are rejected. Never add the workspace or another writable directory as a taskkill lookup fallback |
+| Agent CLI reports `termination-failed` | Sanitized `terminationMethod`, `systemCode`, and numeric exit metadata; host process inventory | Isolate the workspace and kill remaining descendants through the container or host supervisor before retrying. Repair POSIX signal permission or the absolute Windows system taskkill executable; do not treat the attempt as a clean timeout |
 
 ## Recovery rules
 
@@ -256,6 +277,7 @@ Audit records are security evidence. Queue depth and SIEM ingestion status must 
 - Do not copy an approval grant into a resume request.
 - Do not roll a terminal approval back to open.
 - Do not delete a pending idempotency record while its owner may still run.
+- Do not replay or copy an ambiguous legacy idempotency row until external evidence proves exactly one scoped tuple owns it. Use the connector-bound atomic D1 migration for proven rows; leave all others fail closed.
 - Do not change a deployed Durable Object migration tag.
 - Do not overwrite or bypass a deployment sentinel to recover a mis-bound database.
 - Do not expose system stores or raw namespace access as an emergency endpoint.

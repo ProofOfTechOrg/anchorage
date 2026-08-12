@@ -336,12 +336,13 @@ function buildVerifier(env: Env): TokenVerifier {
 // alarm maintenance (sweep and purge never share an invocation). This
 // deployment supplies its workflows and its
 // verifier. To add run
-// artifacts (R2ArtifactStore), set the `artifactStore` field on this config:
-// createFlowsafeWorker pairs artifact deletion INSIDE the retention purge, so
-// each expired run's artifacts are deleted BEFORE its snapshot row (the row is
-// the only enumerable record of the run's artifact keys). An `extraPurgeDuties`
-// hook cannot do this — it runs AFTER the rows are deleted, when the keys are
-// already unenumerable.
+// artifacts (R2ArtifactStore), set `artifactStore` to a factory such as
+// `(env) => new R2ArtifactStore(env.ARTIFACTS)`. The factory receives the
+// current maintenance invocation's bindings. createFlowsafeWorker pairs
+// artifact deletion INSIDE retention, before the snapshot row. An
+// `extraPurgeDuties` hook runs after those rows and cannot safely do this.
+// If init() builds storage with a tablePrefix, set the identical value as
+// `storageTablePrefix` here so every built-in purge reaches the same tables.
 const workerConfig = {
   workflows: WORKFLOWS,
   systemPrincipalId: SYSTEM_PRINCIPAL_ID,

@@ -804,6 +804,8 @@ describe('Mastra Agent execution-entry inventory', () => {
       '__registerMastra',
       '__registerPrimitives',
       '__resetToOriginalModel',
+      // Declarative schedule metadata accessors; neither starts a scheduled run.
+      '__setDeclaredSchedules',
       '__setMemory',
       '__setPubSub',
       '__setTools',
@@ -832,6 +834,7 @@ describe('Mastra Agent execution-entry inventory', () => {
       'getConfiguredProcessorIds',
       'getConfiguredProcessorWorkflows',
       'getConfiguredToolHooks',
+      'getDeclaredSchedules',
       'getDefaultGenerateOptionsLegacy',
       'getDefaultNetworkOptions',
       'getDefaultOptions',
@@ -901,6 +904,8 @@ describe('Mastra Agent execution-entry inventory', () => {
       'resolveInputProcessors',
       'resolveModelConfig',
       'resolveModelSelection',
+      // May call the policy decider, but cannot send a signal or start execution.
+      'resolveNotificationDeliveryDecision',
       'resolveOverrideScorerReferences',
       'resolveProcessorById',
       'resolveSkills',

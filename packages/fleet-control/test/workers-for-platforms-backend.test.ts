@@ -440,54 +440,58 @@ class FakeApi implements WorkersForPlatformsApi {
       ),
     );
     const artifactVersion = `version:${spec.scriptName}:${this.uploadedControlSpecs.length}`;
-    this.controlWorkers.set(spec.scriptName, {
-      artifactVersion,
-      databaseIds: spec.bindings.flatMap((binding) =>
-        binding.type === 'd1' ? [String(binding.database_id)] : [],
-      ),
-      durableObjectBindings: spec.bindings.flatMap((binding) =>
-        binding.type === 'durable_object_namespace'
-          ? [
-              {
-                name: String(binding.name),
-                className: String(binding.class_name),
-                namespaceId: `namespace:${String(binding.class_name)}`,
-              },
-            ]
-          : [],
-      ),
-      serviceBindings: spec.bindings.flatMap((binding) =>
-        binding.type === 'service'
-          ? [{ name: String(binding.name), service: String(binding.service) }]
-          : [],
-      ),
-      queueProducerBindings: spec.bindings.flatMap((binding) =>
-        binding.type === 'queue'
-          ? [
-              {
-                name: String(binding.name),
-                queueName: String(binding.queue_name),
-              },
-            ]
-          : [],
-      ),
-      secretNames: this.controlWorkers.get(spec.scriptName)?.secretNames ?? [],
-      kvNamespaceBindings: spec.bindings.flatMap((binding) =>
-        binding.type === 'kv_namespace'
-          ? [
-              {
-                name: String(binding.name),
-                namespaceId: String(binding.namespace_id),
-              },
-            ]
-          : [],
-      ),
-      plainTextBindings,
-      workersDevEnabled: true,
-      previewUrlsEnabled: true,
-      routeHostnames: [],
-      zoneRoutes: [],
-    });
+    this.controlWorkers.set(
+      spec.scriptName,
+      completeProviderBindingInspection({
+        artifactVersion,
+        databaseIds: spec.bindings.flatMap((binding) =>
+          binding.type === 'd1' ? [String(binding.database_id)] : [],
+        ),
+        durableObjectBindings: spec.bindings.flatMap((binding) =>
+          binding.type === 'durable_object_namespace'
+            ? [
+                {
+                  name: String(binding.name),
+                  className: String(binding.class_name),
+                  namespaceId: `namespace:${String(binding.class_name)}`,
+                },
+              ]
+            : [],
+        ),
+        serviceBindings: spec.bindings.flatMap((binding) =>
+          binding.type === 'service'
+            ? [{ name: String(binding.name), service: String(binding.service) }]
+            : [],
+        ),
+        queueProducerBindings: spec.bindings.flatMap((binding) =>
+          binding.type === 'queue'
+            ? [
+                {
+                  name: String(binding.name),
+                  queueName: String(binding.queue_name),
+                },
+              ]
+            : [],
+        ),
+        secretNames:
+          this.controlWorkers.get(spec.scriptName)?.secretNames ?? [],
+        kvNamespaceBindings: spec.bindings.flatMap((binding) =>
+          binding.type === 'kv_namespace'
+            ? [
+                {
+                  name: String(binding.name),
+                  namespaceId: String(binding.namespace_id),
+                },
+              ]
+            : [],
+        ),
+        plainTextBindings,
+        workersDevEnabled: true,
+        previewUrlsEnabled: true,
+        routeHostnames: [],
+        zoneRoutes: [],
+      }),
+    );
     const namespaceIds =
       this.namespaceIdsByScript.get(spec.scriptName) ?? new Set<string>();
     for (const binding of spec.bindings) {
@@ -520,7 +524,14 @@ class FakeApi implements WorkersForPlatformsApi {
   }
 
   async inspectControlWorker(scriptName: string) {
-    return this.controlWorkers.get(scriptName);
+    const inspection = this.controlWorkers.get(scriptName);
+    return inspection
+      ? {
+          ...inspection,
+          providerBindingIdentities:
+            providerBindingIdentitiesForTest(inspection),
+        }
+      : undefined;
   }
 
   async revokeControlSecrets(): Promise<void> {
@@ -583,37 +594,43 @@ class FakeApi implements WorkersForPlatformsApi {
       spec.authoredBy === 'external'
         ? externalReleaseTopology(spec, resources)
         : undefined;
-    this.dispatchWorkers.set(scriptName, {
-      artifactVersion: this.dispatchArtifactVersion,
-      databaseIds: [database.id],
-      durableObjectBindings:
-        externalTopology?.durableObjectBindings ??
-        spec.durableObjectBindings.map((binding) => ({
-          ...binding,
-          namespaceId: `namespace:${binding.className}`,
-        })),
-      serviceBindings:
-        externalTopology?.serviceBindings ??
-        (spec.egressProxyService
-          ? [{ name: 'EGRESS_PROXY', service: spec.egressProxyService }]
-          : []),
-      queueProducerBindings:
-        externalTopology?.queueProducerBindings ??
-        (spec.queueProducer
-          ? [
-              {
-                name: spec.queueProducer.binding,
-                queueName: spec.queueProducer.queueName,
-              },
-            ]
-          : []),
-      secretNames: this.dispatchSecretNames.get(scriptName) ?? [],
-      r2BucketBindings: application?.r2Buckets ?? [],
-      tenantTag: spec.tenantTag,
-      environment: spec.environment,
-      schemaVersion: spec.schemaVersion,
-      desiredSpecDigest: this.desiredSpecDigest,
-    });
+    this.dispatchWorkers.set(
+      scriptName,
+      completeProviderBindingInspection({
+        artifactVersion: this.dispatchArtifactVersion,
+        databaseIds: [database.id],
+        durableObjectBindings:
+          externalTopology?.durableObjectBindings ??
+          spec.durableObjectBindings.map((binding) => ({
+            ...binding,
+            namespaceId: `namespace:${binding.className}`,
+          })),
+        serviceBindings:
+          externalTopology?.serviceBindings ??
+          (spec.egressProxyService
+            ? [{ name: 'EGRESS_PROXY', service: spec.egressProxyService }]
+            : []),
+        queueProducerBindings:
+          externalTopology?.queueProducerBindings ??
+          (spec.queueProducer
+            ? [
+                {
+                  name: spec.queueProducer.binding,
+                  queueName: spec.queueProducer.queueName,
+                },
+              ]
+            : []),
+        secretNames: this.dispatchSecretNames.get(scriptName) ?? [],
+        plainTextBindings: Object.fromEntries(
+          (application?.vars ?? []).map(({ name, value }) => [name, value]),
+        ),
+        r2BucketBindings: application?.r2Buckets ?? [],
+        tenantTag: spec.tenantTag,
+        environment: spec.environment,
+        schemaVersion: spec.schemaVersion,
+        desiredSpecDigest: this.desiredSpecDigest,
+      }),
+    );
     return { artifactVersion: this.dispatchArtifactVersion };
   }
 
@@ -641,50 +658,53 @@ class FakeApi implements WorkersForPlatformsApi {
     }));
     const artifactVersion = `state-etag-${this.dispatchWorkers.size + 1}`;
     this.calls.push(`upload-namespaced:${scriptName}`);
-    this.dispatchWorkers.set(scriptName, {
-      artifactVersion,
-      databaseIds: [options.database.id],
-      durableObjectBindings,
-      serviceBindings: [
-        {
-          name: 'OUTBOUND_PROXY',
-          service: options.sharedOutboundWorkerName,
-          entrypoint: 'StateEgress',
+    this.dispatchWorkers.set(
+      scriptName,
+      completeProviderBindingInspection({
+        artifactVersion,
+        databaseIds: [options.database.id],
+        durableObjectBindings,
+        serviceBindings: [
+          {
+            name: 'OUTBOUND_PROXY',
+            service: options.sharedOutboundWorkerName,
+            entrypoint: 'StateEgress',
+          },
+        ],
+        queueProducerBindings: options.auditQueueName
+          ? [{ name: 'AUDIT_QUEUE', queueName: options.auditQueueName }]
+          : [],
+        secretNames: this.dispatchSecretNames.get(scriptName) ?? [],
+        tenantTag: options.spec.tenantTag,
+        environment: options.spec.environment,
+        schemaVersion: options.spec.schemaVersion,
+        desiredSpecDigest: deploymentSpecDigest(options.spec),
+        durableObjectTag: options.spec.durableObjectMigrations.at(-1)?.tag,
+        plainTextBindings: {
+          DEPLOYMENT_TENANT: options.spec.tenantTag,
+          FLEET_ENVIRONMENT: options.spec.environment,
+          FLEET_SCHEMA_VERSION: String(options.spec.schemaVersion),
+          FLEET_SPEC_DIGEST: deploymentSpecDigest(options.spec),
+          FLEET_RESOURCE_GROUP: resourceGroupId,
+          FLEET_RESOURCE_ROLE: 'platform-state',
+          FLEET_DEPLOYMENT_SCRIPT: options.spec.scriptName,
+          FLEET_MAINTENANCE_CAPABILITIES: 'required',
+          FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY:
+            options.maintenanceCapabilityPublicKey,
+          FLEET_ARTIFACT_DIGEST: options.artifactDigest,
+          FLEET_RUNTIME_CONTRACT: '1',
+          OUTBOUND_TENANT_ID: options.spec.tenantTag,
+          OUTBOUND_ENVIRONMENT: options.spec.environment,
+          OUTBOUND_RESOURCE_GROUP_ID: resourceGroupId,
+          OUTBOUND_STATE_SCRIPT_NAME: scriptName,
+          OUTBOUND_ROUTE_HOSTNAME: options.spec.routeHostname.toLowerCase(),
+          OUTBOUND_POLICY_ID: resourceGroupId,
+          ...(options.auditQueueName
+            ? { FLEET_AUDIT_PROXY_INGRESS: 'required' }
+            : {}),
         },
-      ],
-      queueProducerBindings: options.auditQueueName
-        ? [{ name: 'AUDIT_QUEUE', queueName: options.auditQueueName }]
-        : [],
-      secretNames: this.dispatchSecretNames.get(scriptName) ?? [],
-      tenantTag: options.spec.tenantTag,
-      environment: options.spec.environment,
-      schemaVersion: options.spec.schemaVersion,
-      desiredSpecDigest: deploymentSpecDigest(options.spec),
-      durableObjectTag: options.spec.durableObjectMigrations.at(-1)?.tag,
-      plainTextBindings: {
-        DEPLOYMENT_TENANT: options.spec.tenantTag,
-        FLEET_ENVIRONMENT: options.spec.environment,
-        FLEET_SCHEMA_VERSION: String(options.spec.schemaVersion),
-        FLEET_SPEC_DIGEST: deploymentSpecDigest(options.spec),
-        FLEET_RESOURCE_GROUP: resourceGroupId,
-        FLEET_RESOURCE_ROLE: 'platform-state',
-        FLEET_DEPLOYMENT_SCRIPT: options.spec.scriptName,
-        FLEET_MAINTENANCE_CAPABILITIES: 'required',
-        FLEET_MAINTENANCE_CAPABILITY_PUBLIC_KEY:
-          options.maintenanceCapabilityPublicKey,
-        FLEET_ARTIFACT_DIGEST: options.artifactDigest,
-        FLEET_RUNTIME_CONTRACT: '1',
-        OUTBOUND_TENANT_ID: options.spec.tenantTag,
-        OUTBOUND_ENVIRONMENT: options.spec.environment,
-        OUTBOUND_RESOURCE_GROUP_ID: resourceGroupId,
-        OUTBOUND_STATE_SCRIPT_NAME: scriptName,
-        OUTBOUND_ROUTE_HOSTNAME: options.spec.routeHostname.toLowerCase(),
-        OUTBOUND_POLICY_ID: resourceGroupId,
-        ...(options.auditQueueName
-          ? { FLEET_AUDIT_PROXY_INGRESS: 'required' }
-          : {}),
-      },
-    });
+      }),
+    );
     this.namespaceIdsByScript.set(
       scriptName,
       new Set([
@@ -736,17 +756,24 @@ class FakeApi implements WorkersForPlatformsApi {
         environment: string;
         schemaVersion: number;
         desiredSpecDigest: string;
+        plainTextBindings: Readonly<Record<string, string>>;
+        providerBindingIdentities: readonly { type: string; name: string }[];
       }
     | undefined
   > {
     this.inspectedScriptNames.push(scriptName);
     const stateWorker = this.dispatchWorkers.get(scriptName);
-    if (stateWorker) return stateWorker;
+    if (stateWorker)
+      return {
+        ...stateWorker,
+        providerBindingIdentities:
+          providerBindingIdentitiesForTest(stateWorker),
+      };
     if (!this.exists || this.deletedScriptNames.includes(scriptName)) {
       return undefined;
     }
     if (scriptName === externalStateScriptName(deployment)) return undefined;
-    return {
+    const inspection = {
       artifactVersion:
         this.releaseArtifactVersions.get(scriptName) ??
         this.dispatchArtifactVersion,
@@ -755,11 +782,16 @@ class FakeApi implements WorkersForPlatformsApi {
       secretNames: this.dispatchSecretNames.get(scriptName) ?? [
         'DEPLOYMENT_IDENTITY_SECRET',
       ],
+      plainTextBindings: {},
       tenantTag: 'acme',
       environment: 'production',
       schemaVersion: 1,
       desiredSpecDigest:
         this.releaseDigests.get(scriptName) ?? this.desiredSpecDigest,
+    };
+    return {
+      ...inspection,
+      providerBindingIdentities: providerBindingIdentitiesForTest(inspection),
     };
   }
 
@@ -1038,6 +1070,46 @@ describe('WorkersForPlatformsBackend', () => {
     expect(client.controlWorkers.size).toBe(0);
   });
 
+  it('rejects an R2 binding on a namespaced state Worker', async () => {
+    const client = new FakeApi();
+    const backend = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client,
+      hostRoutingKvId: 'host-routing',
+      platformProfileFor: () => platformProfile(),
+    });
+    const database = {
+      id: 'db-acme',
+      name: deployment.databaseName,
+      created: true as const,
+    };
+    const initial = await backend.ensurePlatformResources(
+      deployment,
+      database,
+      secrets,
+      undefined,
+      platformConvergenceRecord(backend, deployment, database),
+      fence,
+    );
+    const stateName = initial.resources.stateWorker.scriptName;
+    const stateWorker = client.dispatchWorkers.get(stateName);
+    if (!stateWorker) throw new Error('state Worker was not created');
+    client.dispatchWorkers.set(stateName, {
+      ...stateWorker,
+      r2BucketBindings: [
+        {
+          name: 'FOREIGN_BUCKET',
+          bucketName: 'foreign-bucket',
+          jurisdiction: 'default',
+        },
+      ],
+    });
+
+    await expect(
+      backend.inspectPlatformResources(deployment, database),
+    ).rejects.toThrow(/drifted exact bindings/u);
+  });
+
   it('persists the backend-owned audit queue in the platform target and state snapshot', async () => {
     const client = new FakeApi();
     const audited = {
@@ -1199,7 +1271,7 @@ describe('WorkersForPlatformsBackend', () => {
         secrets,
         clock: () => 2_000,
       }),
-    ).rejects.toThrow(/live state does not exactly match/);
+    ).rejects.toThrow(/provider binding|live state does not exactly match/u);
   });
 
   it('rejects a persisted maintenance verifier change before provider mutation', async () => {
@@ -1306,22 +1378,25 @@ describe('WorkersForPlatformsBackend', () => {
   ])('rejects a namespaced state collision with another $label', async (owner) => {
     const client = new FakeApi();
     const stateName = externalStateScriptName(deployment);
-    client.dispatchWorkers.set(stateName, {
-      artifactVersion: 'foreign',
-      databaseIds: [owner.id],
-      durableObjectBindings: [],
-      serviceBindings: [],
-      queueProducerBindings: [],
-      secretNames: [],
-      tenantTag: owner.tenantTag,
-      environment: owner.environment,
-      schemaVersion: deployment.schemaVersion,
-      desiredSpecDigest: deploymentSpecDigest(deployment),
-      plainTextBindings: {
-        FLEET_RESOURCE_ROLE: 'platform-state',
-        FLEET_RESOURCE_GROUP: externalPlatformResourceGroupId(deployment),
-      },
-    });
+    client.dispatchWorkers.set(
+      stateName,
+      completeProviderBindingInspection({
+        artifactVersion: 'foreign',
+        databaseIds: [owner.id],
+        durableObjectBindings: [],
+        serviceBindings: [],
+        queueProducerBindings: [],
+        secretNames: [],
+        tenantTag: owner.tenantTag,
+        environment: owner.environment,
+        schemaVersion: deployment.schemaVersion,
+        desiredSpecDigest: deploymentSpecDigest(deployment),
+        plainTextBindings: {
+          FLEET_RESOURCE_ROLE: 'platform-state',
+          FLEET_RESOURCE_GROUP: externalPlatformResourceGroupId(deployment),
+        },
+      }),
+    );
     const backend = new WorkersForPlatformsBackend({
       namespacedState: NAMESPACED_STATE,
       client,
@@ -2639,11 +2714,16 @@ describe('WorkersForPlatformsBackend', () => {
       artifactVersion: 'etag-v1',
       databaseIds: ['db-one', 'db-two'],
       durableObjectBindings: [],
+      plainTextBindings: {},
       secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
       tenantTag: 'acme',
       environment: 'production',
       schemaVersion: 1,
       desiredSpecDigest: 'a'.repeat(64),
+      providerBindingIdentities: [
+        { type: 'd1', name: 'DB' },
+        { type: 'secret_text', name: 'DEPLOYMENT_IDENTITY_SECRET' },
+      ],
     });
     const backend = new WorkersForPlatformsBackend({
       namespacedState: NAMESPACED_STATE,
@@ -2653,7 +2733,32 @@ describe('WorkersForPlatformsBackend', () => {
     });
     await expect(
       backend.inspect(deployment, secrets.maintenanceAdmin),
-    ).rejects.toThrow(/exactly one D1 binding/);
+    ).rejects.toThrow(/provider binding|exactly one D1 binding/u);
+  });
+
+  it('rejects a custom dispatch inspection that omits complete provider bindings', async () => {
+    const api = new FakeApi();
+    api.inspectDispatchWorker = (async () => ({
+      artifactVersion: 'etag-v1',
+      databaseIds: ['db-acme'],
+      durableObjectBindings: [],
+      plainTextBindings: {},
+      secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
+      tenantTag: 'acme',
+      environment: 'production',
+      schemaVersion: 1,
+      desiredSpecDigest: 'a'.repeat(64),
+    })) as unknown as WorkersForPlatformsApi['inspectDispatchWorker'];
+    const backend = new WorkersForPlatformsBackend({
+      namespacedState: NAMESPACED_STATE,
+      client: api,
+      fetch: vi.fn(async () => healthResponse()),
+      hostRoutingKvId: 'host-routes',
+    });
+
+    await expect(
+      backend.inspect(deployment, secrets.maintenanceAdmin),
+    ).rejects.toThrow(/binding inventory is incomplete/u);
   });
 
   it('refuses cross-owner route promotion and removes active plus retained releases', async () => {
@@ -2848,12 +2953,17 @@ describe('WorkersForPlatformsBackend', () => {
       artifactVersion: 'etag-v1',
       databaseIds: ['db-other'],
       durableObjectBindings: [],
+      plainTextBindings: {},
       secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
       tenantTag: deployment.tenantTag,
       environment: deployment.environment,
       schemaVersion: deployment.schemaVersion,
       desiredSpecDigest:
         api.releaseDigests.get(scriptName) ?? deploymentSpecDigest(deployment),
+      providerBindingIdentities: [
+        { type: 'd1', name: 'DB' },
+        { type: 'secret_text', name: 'DEPLOYMENT_IDENTITY_SECRET' },
+      ],
     });
     const backend = new WorkersForPlatformsBackend({
       namespacedState: NAMESPACED_STATE,
@@ -2998,3 +3108,56 @@ describe('WorkersForPlatformsBackend', () => {
     ).resolves.toBeUndefined();
   });
 });
+function providerBindingIdentitiesForTest(inspection: {
+  databaseIds: readonly string[];
+  durableObjectBindings: readonly { name: string }[];
+  serviceBindings?: readonly { name: string }[];
+  queueProducerBindings?: readonly { name: string }[];
+  kvNamespaceBindings?: readonly { name: string }[];
+  dispatchNamespaceBindings?: readonly { name: string }[];
+  r2BucketBindings?: readonly { name: string }[];
+  secretNames: readonly string[];
+  plainTextBindings: Readonly<Record<string, string>>;
+}) {
+  return [
+    ...inspection.databaseIds.map(() => ({ type: 'd1', name: 'DB' })),
+    ...inspection.durableObjectBindings.map(({ name }) => ({
+      type: 'durable_object_namespace',
+      name,
+    })),
+    ...(inspection.serviceBindings ?? []).map(({ name }) => ({
+      type: 'service',
+      name,
+    })),
+    ...(inspection.queueProducerBindings ?? []).map(({ name }) => ({
+      type: 'queue',
+      name,
+    })),
+    ...(inspection.kvNamespaceBindings ?? []).map(({ name }) => ({
+      type: 'kv_namespace',
+      name,
+    })),
+    ...(inspection.dispatchNamespaceBindings ?? []).map(({ name }) => ({
+      type: 'dispatch_namespace',
+      name,
+    })),
+    ...(inspection.r2BucketBindings ?? []).map(({ name }) => ({
+      type: 'r2_bucket',
+      name,
+    })),
+    ...inspection.secretNames.map((name) => ({ type: 'secret_text', name })),
+    ...Object.keys(inspection.plainTextBindings).map((name) => ({
+      type: 'plain_text',
+      name,
+    })),
+  ];
+}
+
+function completeProviderBindingInspection<
+  T extends Parameters<typeof providerBindingIdentitiesForTest>[0],
+>(inspection: T) {
+  return {
+    ...inspection,
+    providerBindingIdentities: providerBindingIdentitiesForTest(inspection),
+  };
+}

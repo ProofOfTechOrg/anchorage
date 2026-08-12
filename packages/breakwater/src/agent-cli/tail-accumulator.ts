@@ -12,8 +12,8 @@ export interface TextEncoderLike {
   encode(input: string): Uint8Array;
 }
 
-// The global lookups are injected (index.ts wraps them in AgentCliError
-// guards); tests pass the bare globals.
+// The global lookups are injected (default-exec.ts wraps them in safe runtime
+// failures); tests pass the bare globals.
 export interface TextCodecLookups {
   encoder(): TextEncoderLike;
   decoder(): TextDecoderLike;

@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 import { resolveBackgroundConfig } from '@mastra/core/background-tasks';
 import { RequestContext } from '@mastra/core/request-context';
+import type { PublicSchema } from '@mastra/core/schema';
 import type { ToolExecutionContext } from '@mastra/core/tools';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
-import { AuditLogger } from '../audit/index.js';
+import { AGENT_AUDIT_CONTEXT_KEY, AuditLogger } from '../audit/index.js';
+import { registerSafeAuditError } from '../audit/safe-error.js';
 import {
   crossWorkflowIsolation,
   ISOLATION_SCOPE_CONTEXT_KEY,
@@ -21,9 +23,10 @@ import {
   type AtomicIdempotencyStore,
   CONNECTOR_EXECUTION_CONTEXT_KEY,
   CONNECTOR_GRANTS_CONTEXT_KEY,
+  type ConnectorConfig,
   ConnectorPolicyError,
   connectorManifest,
-  createConnector,
+  createConnector as createConnectorBase,
   DRY_RUN_CONTEXT_KEY,
   IDEMPOTENCY_KEY_CONTEXT_KEY,
   type IdempotencyRecord,
@@ -33,6 +36,64 @@ import {
   InMemoryRateLimitStore,
 } from './index.js';
 
+// Most tests exercise post-migration behavior. Migration-boundary tests call
+// createConnectorBase directly so absence of the explicit acknowledgement and
+// atomic inspect() capability remain visible.
+function createConnector<TInput = unknown, TOutput = unknown>(
+  config: ConnectorConfig<TInput, TOutput>,
+) {
+  const policies = config.policies;
+  const store = policies?.idempotencyStore;
+  const inspectableStore =
+    store &&
+    'reserve' in store &&
+    typeof store.reserve === 'function' &&
+    !('inspect' in store)
+      ? { ...store, inspect: () => ({ state: 'absent' as const }) }
+      : store;
+  return createConnectorBase({
+    ...config,
+    ...(policies === undefined
+      ? {}
+      : {
+          policies: {
+            ...policies,
+            ...(inspectableStore === undefined
+              ? {}
+              : { idempotencyStore: inspectableStore }),
+            ...(store === undefined
+              ? {}
+              : {
+                  idempotencyKeyMigration:
+                    policies.idempotencyKeyMigration ??
+                    ('legacy-writers-drained' as const),
+                }),
+          },
+        }),
+  });
+}
+
+function standardStringSchema(
+  validate: (
+    value: unknown,
+  ) =>
+    | { value: string }
+    | { issues: readonly { message: string }[] }
+    | Promise<{ value: string } | { issues: readonly { message: string }[] }>,
+): PublicSchema<string> {
+  return {
+    '~standard': {
+      version: 1,
+      vendor: 'breakwater-test',
+      validate,
+      jsonSchema: {
+        input: () => ({ type: 'string' }),
+        output: () => ({ type: 'string' }),
+      },
+    },
+  };
+}
+
 function makeContext(
   options: {
     actor?: Actor;
@@ -41,6 +102,7 @@ function makeContext(
     agent?: boolean;
     dryRun?: boolean;
     principalPermissions?: unknown;
+    auditContext?: unknown;
   } = {},
 ): ToolExecutionContext {
   const requestContext = new RequestContext();
@@ -50,6 +112,9 @@ function makeContext(
       PRINCIPAL_PERMISSIONS_CONTEXT_KEY,
       options.principalPermissions,
     );
+  }
+  if (options.auditContext !== undefined) {
+    requestContext.set(AGENT_AUDIT_CONTEXT_KEY, options.auditContext);
   }
   if (options.approved) {
     requestContext.set(WORKFLOW_SCOPE_CONTEXT_KEY, 'workflow-1');
@@ -191,14 +256,14 @@ function makeToolCallGrantContext(
 
 // Structural on purpose: connectors infer different TOutput per test, and
 // Tool<...> instantiations don't cross-assign cleanly.
-async function run(
+async function run<TInput>(
   tool: {
     execute?: (
-      inputData: unknown,
+      inputData: TInput,
       context: ToolExecutionContext,
     ) => Promise<unknown>;
   },
-  input: unknown,
+  input: TInput,
   context: ToolExecutionContext = makeContext(),
 ): Promise<unknown> {
   if (!tool.execute) throw new Error('tool has no execute');
@@ -234,10 +299,9 @@ function makeConnector(
 }
 
 describe('connector id validation', () => {
-  it("rejects an id containing ':' at construction, naming both id-derived store keys", () => {
-    // #given / #when — a colon in id would be joined UNESCAPED into both the
-    // idempotency scoped key and the rate-limit budget key, colliding two
-    // distinct tuples onto one key on a shared store.
+  it("rejects an id containing ':' because the unchanged rate-budget tuple needs a colon-free final component", () => {
+    // #given / #when — active rate-limit windows retain the legacy
+    // `[scope:]connector` key across the idempotency-only migration.
     let error: unknown;
     try {
       makeConnector({ id: 'tenant:createContact' });
@@ -245,11 +309,10 @@ describe('connector id validation', () => {
       error = caught;
     }
 
-    // #then — one construction guard closes BOTH colon-joined key sites
+    // #then
     expect(error).toBeInstanceOf(TypeError);
     const message = (error as TypeError).message;
     expect(message).toContain('tenant:createContact');
-    expect(message).toContain('idempotency');
     expect(message).toContain('rate-limit');
   });
 
@@ -1384,6 +1447,76 @@ describe('idempotency', () => {
     expect(execute).toHaveBeenCalledTimes(1);
   });
 
+  it('does not commit invalid output to a non-atomic replay store', async () => {
+    // #given — a same-isolate custom store and a connector that violates its
+    // declared output contract
+    const entries = new Map<string, IdempotencyRecord>();
+    const store: IdempotencyStore = {
+      get: (key) => entries.get(key),
+      put: vi.fn((key, record) => {
+        entries.set(key, record);
+      }),
+    };
+    const execute = vi.fn(
+      async () => ({ ok: 'not-a-boolean' }) as unknown as { ok: boolean },
+    );
+    const tool = createConnector({
+      id: 'salesforce.createContact',
+      description: 'Create a Salesforce contact',
+      inputSchema: z.object({ email: z.string() }),
+      outputSchema: z.object({ ok: z.boolean() }),
+      execute,
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { idempotencyStore: store },
+    });
+    const context = makeContext({ idempotencyKey: 'invalid-output' });
+
+    // #when — the same key is retried after output validation fails
+    if (!tool.execute) throw new Error('tool has no execute');
+    const first = await tool.execute(input, context);
+    const second = await tool.execute(input, context);
+
+    // #then — neither invalid result was made replayable
+    expect(first).toMatchObject({ error: true });
+    expect(second).toMatchObject({ error: true });
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(store.put).not.toHaveBeenCalled();
+    expect(entries).toEqual(new Map());
+  });
+
+  it('does not commit a throwing validator result to a non-atomic store', async () => {
+    // #given — non-atomic stores have no durable pending state, but must not
+    // make a result replayable when validation itself rejects
+    const store: IdempotencyStore = {
+      get: () => undefined,
+      put: vi.fn(),
+    };
+    const execute = vi.fn(async () => 'completed');
+    const tool = createConnector({
+      id: 'salesforce.createContact',
+      description: 'Create a Salesforce contact',
+      inputSchema: z.object({ email: z.string() }),
+      outputSchema: standardStringSchema(() => {
+        throw new Error('private validator failure');
+      }),
+      execute,
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { idempotencyStore: store },
+    });
+    const context = makeContext({ idempotencyKey: 'throwing-validator' });
+
+    // #when / #then — each call reports validation failure and none commits;
+    // a non-atomic store cannot retain a cross-call pending reservation
+    await expect(run(tool, input, context)).rejects.toThrow(
+      'private validator failure',
+    );
+    await expect(run(tool, input, context)).rejects.toThrow(
+      'private validator failure',
+    );
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(store.put).not.toHaveBeenCalled();
+  });
+
   it('deduplicates concurrent calls sharing a key', async () => {
     // #given
     let release!: () => void;
@@ -1417,13 +1550,15 @@ describe('idempotency', () => {
   // where a twin lands while the leader's round-trip is still parked.
   function deferredGetStore() {
     let settleGet!: (record: IdempotencyRecord | undefined) => void;
+    let first = true;
     const store = {
-      get: vi.fn(
-        () =>
-          new Promise<IdempotencyRecord | undefined>((resolve) => {
-            settleGet = resolve;
-          }),
-      ),
+      get: vi.fn(() => {
+        if (!first) return undefined;
+        first = false;
+        return new Promise<IdempotencyRecord | undefined>((resolve) => {
+          settleGet = resolve;
+        });
+      }),
       put: vi.fn(),
     } satisfies IdempotencyStore;
     return {
@@ -1620,7 +1755,7 @@ describe('idempotency', () => {
     expect(audit.events()).toMatchObject([
       {
         decision: 'error',
-        reason: 'idempotency store get failed',
+        reason: 'idempotency store inspect failed',
         detail: { stage: 'idempotency-store' },
       },
     ]);
@@ -1695,6 +1830,149 @@ describe('idempotency', () => {
   });
 });
 
+describe('idempotency composite-key migration', () => {
+  function migrationContext(
+    key: string,
+    isolationScope?: string,
+  ): ToolExecutionContext {
+    const context = makeContext({ idempotencyKey: key });
+    if (isolationScope !== undefined) {
+      context.requestContext?.set(ISOLATION_SCOPE_CONTEXT_KEY, isolationScope);
+    }
+    return context;
+  }
+
+  function migrationConnector(
+    store: IdempotencyStore,
+    options: { acknowledged?: boolean; execute?: () => Promise<unknown> } = {},
+  ) {
+    const execute = vi.fn(options.execute ?? (async () => ({ ok: true })));
+    const tool = createConnectorBase({
+      id: 'pay',
+      description: 'Pay an invoice',
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: {
+        idempotencyStore: store,
+        ...(options.acknowledged
+          ? { idempotencyKeyMigration: 'legacy-writers-drained' as const }
+          : {}),
+      },
+      execute,
+    });
+    return { tool, execute };
+  }
+
+  it('keeps the reported legacy collision distinct under v2', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const store = new InMemoryIdempotencyStore();
+      const { tool, execute } = migrationConnector(store, {
+        acknowledged: true,
+      });
+
+      await run(tool, {}, migrationContext('pay:invoice-1', 'tenant'));
+      await run(tool, {}, migrationContext('invoice-1', 'tenant:pay'));
+      await run(tool, {}, migrationContext('pay:invoice-1', 'tenant'));
+      await run(tool, {}, migrationContext('invoice-1', 'tenant:pay'));
+
+      expect(execute).toHaveBeenCalledTimes(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('encodes opaque Unicode, NUL, lone-surrogate, and colon components without delimiters reappearing', async () => {
+    const entries = new Map<string, IdempotencyRecord>();
+    const put = vi.fn((key: string, record: IdempotencyRecord) => {
+      entries.set(key, record);
+    });
+    const store: IdempotencyStore = {
+      get: (key) => entries.get(key),
+      put,
+    };
+    const { tool } = migrationConnector(store, { acknowledged: true });
+
+    await run(tool, {}, migrationContext('键:\0\udc00', '租户:\0\ud800'));
+
+    const storedKey = put.mock.calls[0]?.[0];
+    expect(storedKey).toMatch(/^bw2_i_s_[0-9a-f]*_[0-9a-f]+_[0-9a-f]+$/);
+    expect(storedKey).not.toContain(':');
+  });
+
+  it('replays a provably safe unscoped legacy key without rollout acknowledgement', async () => {
+    const store = new InMemoryIdempotencyStore();
+    store.put('pay:invoice-1', { result: { source: 'legacy' } });
+    const { tool, execute } = migrationConnector(store);
+
+    await expect(run(tool, {}, migrationContext('invoice-1'))).resolves.toEqual(
+      { source: 'legacy' },
+    );
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('denies a safe pending legacy key without mutating its reservation', async () => {
+    const store = new InMemoryIdempotencyStore();
+    const reservation = store.reserve('pay:invoice-1');
+    const { tool, execute } = migrationConnector(store);
+
+    await expect(
+      run(tool, {}, migrationContext('invoice-1')),
+    ).rejects.toMatchObject({ policy: 'idempotency' });
+    expect(store.inspect('pay:invoice-1')).toEqual({ state: 'pending' });
+    expect(reservation.state).toBe('reserved');
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('fails closed on an ambiguous completed legacy row even after writers are drained', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const store = new InMemoryIdempotencyStore();
+      store.put('tenant:pay:pay:invoice-1', {
+        result: { source: 'ambiguous' },
+      });
+      const { tool, execute } = migrationConnector(store, {
+        acknowledged: true,
+      });
+
+      for (const context of [
+        migrationContext('pay:invoice-1', 'tenant'),
+        migrationContext('invoice-1', 'tenant:pay'),
+      ]) {
+        await expect(run(tool, {}, context)).rejects.toMatchObject({
+          policy: 'idempotency-key-migration',
+        });
+      }
+      expect(execute).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('requires the drained-writer acknowledgement before an absent legacy key can execute', async () => {
+    const { tool, execute } = migrationConnector(
+      new InMemoryIdempotencyStore(),
+    );
+
+    await expect(
+      run(tool, {}, migrationContext('invoice-1')),
+    ).rejects.toMatchObject({ policy: 'idempotency-key-migration' });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('rejects an atomic custom store that cannot inspect legacy pending state', () => {
+    const store: AtomicIdempotencyStore = {
+      get: () => undefined,
+      put: () => {},
+      reserve: () => ({ state: 'reserved', token: 'token' }),
+      release: () => {},
+    };
+
+    expect(() => migrationConnector(store, { acknowledged: true })).toThrow(
+      /must implement inspect\(\)/,
+    );
+  });
+});
+
 describe('atomic idempotency (reserve path)', () => {
   function spyAtomicStore() {
     const base = new InMemoryIdempotencyStore();
@@ -1716,7 +1994,9 @@ describe('atomic idempotency (reserve path)', () => {
     // #when
     await run(tool, input, makeContext({ idempotencyKey: 'k1' }));
     // #then
-    expect(store.reserve).toHaveBeenCalledWith('salesforce.createContact:k1');
+    expect(store.reserve).toHaveBeenCalledWith(
+      expect.stringMatching(/^bw2_i_u_[0-9a-f]+_[0-9a-f]+$/),
+    );
     expect(store.put).toHaveBeenCalledTimes(1);
     expect(store.get).not.toHaveBeenCalled();
     expect(execute).toHaveBeenCalledTimes(1);
@@ -1804,13 +2084,240 @@ describe('atomic idempotency (reserve path)', () => {
       run(tool, input, makeContext({ idempotencyKey: 'k1' })),
     ).rejects.toThrow('salesforce 500');
     expect(store.release).toHaveBeenCalledWith(
-      'salesforce.createContact:k1',
+      expect.stringMatching(/^bw2_i_u_[0-9a-f]+_[0-9a-f]+$/),
       expect.any(String),
     );
     expect(
       await run(tool, input, makeContext({ idempotencyKey: 'k1' })),
     ).toEqual({ ok: true });
     expect(execute).toHaveBeenCalledTimes(2);
+  });
+
+  it('validates output before finalizing and keeps an invalid result pending', async () => {
+    // #given — the connector returns a value outside its declared schema
+    const audit = new AuditLogger();
+    const store = spyAtomicStore();
+    const execute = vi.fn(
+      async () => ({ ok: 'not-a-boolean' }) as unknown as { ok: boolean },
+    );
+    const tool = createConnector({
+      id: 'salesforce.createContact',
+      description: 'Create a Salesforce contact',
+      inputSchema: z.object({ email: z.string() }),
+      outputSchema: z.object({ ok: z.boolean() }),
+      execute,
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { audit, idempotencyStore: store },
+    });
+    const context = makeContext({ idempotencyKey: 'invalid-output' });
+
+    // #when — the same key is retried after output validation fails
+    if (!tool.execute) throw new Error('tool has no execute');
+    const first = await tool.execute(input, context);
+    const second = await tool
+      .execute(input, context)
+      .catch((error: unknown) => error);
+
+    // #then — no invalid value is committed, and the pending row blocks an
+    // immediate duplicate execution after the side effect may have happened
+    expect(first).toMatchObject({ error: true });
+    expect(second).toBeInstanceOf(ConnectorPolicyError);
+    expect((second as ConnectorPolicyError).policy).toBe('idempotency');
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(store.put).not.toHaveBeenCalled();
+    expect(store.release).not.toHaveBeenCalled();
+    expect(audit.events()).toMatchObject([
+      {
+        decision: 'error',
+        reason: 'connector output validation failed',
+        detail: {
+          stage: 'output-validation',
+          idempotencyKey: 'invalid-output',
+        },
+      },
+      {
+        decision: 'denied',
+        detail: { policy: 'idempotency' },
+      },
+    ]);
+  });
+
+  it('keeps the reservation pending when the output validator throws', async () => {
+    // #given — validation runs after the connector may have completed its
+    // side effect, and a Standard Schema validator may reject or throw
+    const audit = new AuditLogger();
+    const store = spyAtomicStore();
+    const execute = vi.fn(async () => 'completed');
+    let validations = 0;
+    const outputSchema = standardStringSchema((value) => {
+      validations += 1;
+      if (validations === 1) throw new Error('private validator failure');
+      return { value: String(value) };
+    });
+    const tool = createConnector({
+      id: 'salesforce.createContact',
+      description: 'Create a Salesforce contact',
+      inputSchema: z.object({ email: z.string() }),
+      outputSchema,
+      execute,
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { audit, idempotencyStore: store },
+    });
+    const context = makeContext({ idempotencyKey: 'throwing-validator' });
+
+    // #when — the public Mastra boundary propagates the validator failure,
+    // then an immediate retry observes the retained pending reservation
+    await expect(run(tool, input, context)).rejects.toThrow(
+      'private validator failure',
+    );
+    const second = await run(tool, input, context).catch(
+      (error: unknown) => error,
+    );
+
+    // #then — the completed side effect is not immediately duplicated
+    expect(second).toBeInstanceOf(ConnectorPolicyError);
+    expect((second as ConnectorPolicyError).policy).toBe('idempotency');
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(validations).toBe(1);
+    expect(store.put).not.toHaveBeenCalled();
+    expect(store.release).not.toHaveBeenCalled();
+    expect(audit.events()).toMatchObject([
+      {
+        decision: 'error',
+        reason: 'connector output validation failed',
+        detail: {
+          stage: 'output-validation',
+          idempotencyKey: 'throwing-validator',
+        },
+      },
+      {
+        decision: 'denied',
+        detail: { policy: 'idempotency' },
+      },
+    ]);
+  });
+
+  it('does not let a transient validation issue become a public success', async () => {
+    // #given — the original validator reports issues once, then would succeed
+    // if Mastra invoked it again after Breakwater retained the reservation
+    const store = spyAtomicStore();
+    const execute = vi.fn(async () => 'completed');
+    let validations = 0;
+    const outputSchema = standardStringSchema((value) => {
+      validations += 1;
+      return validations === 1
+        ? { issues: [{ message: 'transient issue' }] }
+        : { value: String(value) };
+    });
+    const tool = createConnector({
+      id: 'salesforce.createContact',
+      description: 'Create a Salesforce contact',
+      inputSchema: z.object({ email: z.string() }),
+      outputSchema,
+      execute,
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { idempotencyStore: store },
+    });
+    const context = makeContext({ idempotencyKey: 'issue-once' });
+
+    // #when / #then — Mastra consumes Breakwater's captured issues without
+    // rerunning the stateful validator, and the retry stays fail-closed
+    const first = await run(tool, input, context);
+    const second = await run(tool, input, context).catch(
+      (error: unknown) => error,
+    );
+    expect(first).toMatchObject({
+      error: true,
+      validationErrors: { errors: ['transient issue'] },
+    });
+    expect(second).toBeInstanceOf(ConnectorPolicyError);
+    expect((second as ConnectorPolicyError).policy).toBe('idempotency');
+    expect(validations).toBe(1);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(store.put).not.toHaveBeenCalled();
+    expect(store.release).not.toHaveBeenCalled();
+  });
+
+  it('replays the exact captured transformed result without rerunning the schema', async () => {
+    // #given — a stateful transform makes a second schema invocation visible
+    const store = spyAtomicStore();
+    const execute = vi.fn(async () => 'raw');
+    let validations = 0;
+    const outputSchema = standardStringSchema((value) => {
+      validations += 1;
+      return { value: `${String(value)}-${validations}` };
+    });
+    const tool = createConnector({
+      id: 'salesforce.createContact',
+      description: 'Create a Salesforce contact',
+      inputSchema: z.object({ email: z.string() }),
+      outputSchema,
+      execute,
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { idempotencyStore: store },
+    });
+    const context = makeContext({ idempotencyKey: 'transformed-replay' });
+
+    // #when / #then — v2 stores the public result, not the raw connector
+    // value; replay neither executes nor transforms it a second time
+    expect(await run(tool, input, context)).toBe('raw-1');
+    expect(await run(tool, input, context)).toBe('raw-1');
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(validations).toBe(1);
+    expect(store.put).toHaveBeenCalledWith(
+      expect.any(String),
+      { result: 'raw-1' },
+      expect.any(String),
+    );
+  });
+
+  it('keeps the reservation pending for an async output validator', async () => {
+    // #given — Mastra 1.50 rejects async output schemas at its public boundary
+    const audit = new AuditLogger();
+    const store = spyAtomicStore();
+    const execute = vi.fn(async () => 'completed');
+    const validate = vi.fn(async (value: unknown) => ({
+      value: String(value),
+    }));
+    const tool = createConnector({
+      id: 'salesforce.createContact',
+      description: 'Create a Salesforce contact',
+      inputSchema: z.object({ email: z.string() }),
+      outputSchema: standardStringSchema(validate),
+      execute,
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { audit, idempotencyStore: store },
+    });
+    const context = makeContext({ idempotencyKey: 'async-validator' });
+
+    // #when / #then — validation mirrors that sync-only boundary before
+    // any result is committed; the retained pending row blocks duplication
+    await expect(run(tool, input, context)).rejects.toThrow(
+      'Your schema is async, which is not supported',
+    );
+    const second = await run(tool, input, context).catch(
+      (error: unknown) => error,
+    );
+    expect(second).toBeInstanceOf(ConnectorPolicyError);
+    expect((second as ConnectorPolicyError).policy).toBe('idempotency');
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(validate).toHaveBeenCalledTimes(1);
+    expect(store.put).not.toHaveBeenCalled();
+    expect(store.release).not.toHaveBeenCalled();
+    expect(audit.events()).toMatchObject([
+      {
+        decision: 'error',
+        reason: 'connector output validation failed',
+        detail: {
+          stage: 'output-validation',
+          idempotencyKey: 'async-validator',
+        },
+      },
+      {
+        decision: 'denied',
+        detail: { policy: 'idempotency' },
+      },
+    ]);
   });
 
   it('releases the reservation on a rate-limit denial', async () => {
@@ -1839,7 +2346,7 @@ describe('atomic idempotency (reserve path)', () => {
     // #then — the denial released k2: no budget consumed, key retryable
     expect((failure as ConnectorPolicyError).policy).toBe('rate-limit');
     expect(store.release).toHaveBeenCalledWith(
-      'salesforce.createContact:k2',
+      expect.stringMatching(/^bw2_i_u_[0-9a-f]+_[0-9a-f]+$/),
       expect.any(String),
     );
     expect(execute).toHaveBeenCalledTimes(1);
@@ -1928,7 +2435,7 @@ describe('atomic idempotency (reserve path)', () => {
     ).rejects.toThrow('counter backend down');
     expect(execute).not.toHaveBeenCalled();
     expect(store.release).toHaveBeenCalledWith(
-      'salesforce.createContact:k1',
+      expect.stringMatching(/^bw2_i_u_[0-9a-f]+_[0-9a-f]+$/),
       expect.any(String),
     );
     // #then — exactly ONE audit record, attributed to the rate-limit store;
@@ -2399,6 +2906,30 @@ describe('rate limit', () => {
     ).toThrow(TypeError);
   });
 
+  it.each([
+    '9007199254740992/min',
+    `${'9'.repeat(400)}/min`,
+  ])("rejects storage-unsafe rate-limit count '%s'", (rateLimit) => {
+    expect(() =>
+      makeConnector({
+        permissions: { sideEffect: 'write', rateLimit },
+        policies: { rateLimitStore: new InMemoryRateLimitStore() },
+      }),
+    ).toThrow(/safe-integer count from 1 through 9007199254740991/);
+  });
+
+  it.each([
+    '1/min',
+    '9007199254740991/min',
+  ])("accepts supported rate-limit boundary '%s'", (rateLimit) => {
+    expect(() =>
+      makeConnector({
+        permissions: { sideEffect: 'write', rateLimit },
+        policies: { rateLimitStore: new InMemoryRateLimitStore() },
+      }),
+    ).not.toThrow();
+  });
+
   it('allows the budget then denies the call over it', async () => {
     // #given
     const audit = new AuditLogger();
@@ -2640,6 +3171,42 @@ describe('Mastra integration edges', () => {
     expect(execute).not.toHaveBeenCalled();
     expect(audit.events()).toEqual([]);
   });
+
+  it('does not compound schema transformations across wrapper and Mastra', async () => {
+    // #given — Breakwater validates and transforms before idempotency commit,
+    // then Mastra consumes the captured Standard Schema result
+    const execute = vi.fn(async () => 'raw');
+    const tool = createConnector({
+      id: 'report.read',
+      description: 'Read a report',
+      outputSchema: z.string().transform((value) => `${value}!`),
+      execute,
+      permissions: { sideEffect: 'read' },
+    });
+
+    // #when / #then — the wrapper checks the raw value but does not feed the
+    // transformed value back through Mastra for a second transformation
+    expect(await run(tool, {})).toBe('raw!');
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves direct validation through the public output-schema surface', async () => {
+    // #given — composition and inspection code may validate through the
+    // public Tool.outputSchema without invoking the connector
+    const outputSchema = z.string().transform((value) => `${value}!`);
+    const tool = createConnector({
+      id: 'report.read',
+      description: 'Read a report',
+      outputSchema,
+      execute: async () => 'raw',
+      permissions: { sideEffect: 'read' },
+    });
+
+    // #when / #then — ordinary values still delegate to the host schema;
+    // the private carrier optimization applies only to wrapper execution
+    const validation = await tool.outputSchema?.['~standard'].validate('raw');
+    expect(validation).toEqual({ value: 'raw!' });
+  });
 });
 
 describe('audit attribution', () => {
@@ -2686,6 +3253,103 @@ describe('audit attribution', () => {
       },
     ]);
     expect(JSON.stringify(audit.events())).not.toContain(sentinel);
+  });
+
+  it('correlates allowed, denied, replay, store-error, and execution-error records from trusted context', async () => {
+    const audit = new AuditLogger();
+    const auditContext = {
+      agentId: 'agent-trusted',
+      tenantId: 'tenant-trusted',
+      runId: 'run-trusted',
+      threadId: 'thread-trusted',
+      resourceId: 'resource-trusted',
+      entryPath: 'http-start',
+      principalKind: 'service',
+      principalId: 'principal-trusted',
+    };
+    const correlated = (idempotencyKey?: string) =>
+      makeContext({ auditContext, idempotencyKey });
+
+    await run(makeConnector({ policies: { audit } }).tool, input, correlated());
+
+    const denied = makeConnector({
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { audit, idempotencyStore: new InMemoryIdempotencyStore() },
+    }).tool;
+    await run(denied, input, correlated()).catch(() => {});
+
+    const replay = makeConnector({
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: { audit, idempotencyStore: new InMemoryIdempotencyStore() },
+    }).tool;
+    await run(replay, input, correlated('replay-key'));
+    await run(replay, input, correlated('replay-key'));
+
+    const storeError = makeConnector({
+      permissions: { sideEffect: 'write', idempotencyKey: true },
+      policies: {
+        audit,
+        idempotencyStore: {
+          get: () => {
+            throw new Error('private store failure');
+          },
+          put: () => {},
+        },
+      },
+    }).tool;
+    await run(storeError, input, correlated('store-key')).catch(() => {});
+
+    const spoofedExecutionError = registerSafeAuditError(
+      new Error('private execution failure'),
+      {
+        reason: 'registered connector failure',
+        detail: {
+          tenantId: 'tenant-spoofed',
+          runId: 'run-spoofed',
+          resourceId: 'resource-spoofed',
+          principalId: 'principal-spoofed',
+        },
+      },
+    );
+    const executionError = makeConnector({
+      execute: async () => {
+        throw spoofedExecutionError;
+      },
+      policies: { audit },
+    }).tool;
+    await run(executionError, input, correlated()).catch(() => {});
+
+    expect(audit.events()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ decision: 'allowed' }),
+        expect.objectContaining({ decision: 'denied' }),
+        expect.objectContaining({
+          decision: 'allowed',
+          detail: expect.objectContaining({ replayed: true }),
+        }),
+        expect.objectContaining({
+          decision: 'error',
+          detail: expect.objectContaining({ stage: 'idempotency-store' }),
+        }),
+        expect.objectContaining({
+          decision: 'error',
+          detail: expect.objectContaining({ stage: 'execute' }),
+        }),
+      ]),
+    );
+    for (const event of audit.events()) {
+      expect(event.detail).toMatchObject(auditContext);
+    }
+    expect(audit.events().at(-1)).toMatchObject({
+      decision: 'error',
+      reason: 'registered connector failure',
+      detail: {
+        tenantId: 'tenant-trusted',
+        runId: 'run-trusted',
+        resourceId: 'resource-trusted',
+        principalId: 'principal-trusted',
+      },
+    });
   });
 });
 

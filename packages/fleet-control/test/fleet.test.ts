@@ -2,6 +2,7 @@
 
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
+import { canonicalApplicationBindings } from '../src/application-bindings.js';
 import type {
   BridgeMutationPlan,
   BridgeSnapshot,
@@ -23,6 +24,7 @@ import {
   FLEET_AUDIT_PROXY_CLASS_NAME,
   FLEET_AUDIT_PROXY_STATE_BINDING,
 } from '../src/platform-resources.js';
+import { providerBindingIdentitiesForInspection } from '../src/provider-binding-inventory.js';
 import { provisionDeployment } from '../src/provision.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
 import type {
@@ -42,6 +44,18 @@ import { externalReleaseScriptName } from '../src/workers-for-platforms-backend.
 
 const MAINTENANCE_PUBLIC_KEY =
   '{"kty":"OKP","crv":"Ed25519","alg":"EdDSA","kid":"fleet-maintenance-v1","x":"Lhp1XFeTJJx8FLOCKpn4nkO-tWuZZxXX8ziw0LEvUZo"}';
+
+function completeLiveDeployment(
+  live: Omit<LiveDeployment, 'providerBindingIdentities'>,
+): LiveDeployment {
+  return {
+    ...live,
+    providerBindingIdentities: providerBindingIdentitiesForInspection({
+      ...live,
+      databaseIds: [live.databaseId],
+    }),
+  };
+}
 const ROTATED_MAINTENANCE_PUBLIC_KEY =
   '{"kty":"OKP","crv":"Ed25519","alg":"EdDSA","kid":"fleet-maintenance-v2","x":"Lhp1XFeTJJx8FLOCKpn4nkO-tWuZZxXX8ziw0LEvUZo"}';
 
@@ -274,44 +288,58 @@ class FleetBackend implements ProvisioningBackend {
       deployment.authoredBy === 'external' && platformResources
         ? externalReleaseTopology(deployment, platformResources)
         : undefined;
-    this.live.set(deployment.tenantTag, {
-      tenantTag: deployment.tenantTag,
-      environment: deployment.environment,
-      scriptName: deployment.scriptName,
-      databaseId: database.id,
-      durableObjectBindings:
-        externalTopology?.durableObjectBindings ??
-        deployment.durableObjectBindings.map((binding) => ({
-          ...binding,
-          namespaceId: `${deployment.scriptName}-${binding.name}`,
-        })),
-      serviceBindings:
-        externalTopology?.serviceBindings ??
-        (deployment.authoredBy === 'external'
-          ? []
-          : deployment.egressProxyService
+    const application = canonicalApplicationBindings(deployment);
+    this.live.set(
+      deployment.tenantTag,
+      completeLiveDeployment({
+        tenantTag: deployment.tenantTag,
+        environment: deployment.environment,
+        scriptName: deployment.scriptName,
+        databaseId: database.id,
+        durableObjectBindings:
+          externalTopology?.durableObjectBindings ??
+          deployment.durableObjectBindings.map((binding) => ({
+            ...binding,
+            namespaceId: `${deployment.scriptName}-${binding.name}`,
+          })),
+        serviceBindings:
+          externalTopology?.serviceBindings ??
+          (deployment.authoredBy === 'external'
+            ? []
+            : deployment.egressProxyService
+              ? [
+                  {
+                    name: 'EGRESS_PROXY',
+                    service: deployment.egressProxyService,
+                  },
+                ]
+              : []),
+        queueProducerBindings:
+          externalTopology?.queueProducerBindings ??
+          (deployment.authoredBy === 'platform' && deployment.queueProducer
             ? [
                 {
-                  name: 'EGRESS_PROXY',
-                  service: deployment.egressProxyService,
+                  name: deployment.queueProducer.binding,
+                  queueName: deployment.queueProducer.queueName,
                 },
               ]
             : []),
-      queueProducerBindings:
-        externalTopology?.queueProducerBindings ??
-        (deployment.authoredBy === 'platform' && deployment.queueProducer
-          ? [
-              {
-                name: deployment.queueProducer.binding,
-                queueName: deployment.queueProducer.queueName,
-              },
-            ]
-          : []),
-      artifactVersion: `v${deployment.schemaVersion}`,
-      desiredSpecDigest: deploymentSpecDigest(deployment),
-      schemaVersion: deployment.schemaVersion,
-      maintenance: healthy,
-    });
+        plainTextBindings: Object.fromEntries(
+          application.vars.map(({ name, value }) => [name, value]),
+        ),
+        secretNames: [
+          'DEPLOYMENT_IDENTITY_SECRET',
+          ...(deployment.authoredBy === 'platform'
+            ? ['MAINTENANCE_ADMIN_SECRET']
+            : []),
+          ...application.secrets.map(({ name }) => name),
+        ].sort(),
+        artifactVersion: `v${deployment.schemaVersion}`,
+        desiredSpecDigest: deploymentSpecDigest(deployment),
+        schemaVersion: deployment.schemaVersion,
+        maintenance: healthy,
+      }),
+    );
     return { artifactVersion: `v${deployment.schemaVersion}`, created: false };
   }
 
@@ -339,7 +367,10 @@ class FleetBackend implements ProvisioningBackend {
     if (this.inspectFailureTenant === deployment.tenantTag) {
       throw new Error('inspect failed');
     }
-    return this.live.get(deployment.tenantTag);
+    const inspected = this.live.get(deployment.tenantTag);
+    if (!inspected) return undefined;
+    const { providerBindingIdentities: _inventory, ...live } = inspected;
+    return completeLiveDeployment(live);
   }
 
   async revokeCredentials(): Promise<void> {
@@ -488,25 +519,28 @@ class ImmutableFleetBackend extends FleetBackend {
     this.calls.push(`deploy:${deployment.tenantTag}:${physicalScriptName}`);
     const existing = this.releases.get(physicalScriptName);
     if (!existing) {
-      this.releases.set(physicalScriptName, {
-        tenantTag: deployment.tenantTag,
-        environment: deployment.environment,
-        scriptName: physicalScriptName,
-        databaseId: this.invalidateCandidate ? 'wrong-database' : database.id,
-        durableObjectBindings: [],
-        artifactVersion: `etag:${physicalScriptName}`,
-        desiredSpecDigest: deploymentSpecDigest(deployment),
-        schemaVersion: deployment.schemaVersion,
-        plainTextBindings: Object.fromEntries(
-          (application?.vars ?? []).map(({ name, value }) => [name, value]),
-        ),
-        r2BucketBindings: application?.r2Buckets ?? [],
-        secretNames: [
-          'DEPLOYMENT_IDENTITY_SECRET',
-          ...(application?.secrets ?? []).map(({ name }) => name),
-        ].sort(),
-        maintenance: healthy,
-      });
+      this.releases.set(
+        physicalScriptName,
+        completeLiveDeployment({
+          tenantTag: deployment.tenantTag,
+          environment: deployment.environment,
+          scriptName: physicalScriptName,
+          databaseId: this.invalidateCandidate ? 'wrong-database' : database.id,
+          durableObjectBindings: [],
+          artifactVersion: `etag:${physicalScriptName}`,
+          desiredSpecDigest: deploymentSpecDigest(deployment),
+          schemaVersion: deployment.schemaVersion,
+          plainTextBindings: Object.fromEntries(
+            (application?.vars ?? []).map(({ name, value }) => [name, value]),
+          ),
+          r2BucketBindings: application?.r2Buckets ?? [],
+          secretNames: [
+            'DEPLOYMENT_IDENTITY_SECRET',
+            ...(application?.secrets ?? []).map(({ name }) => name),
+          ].sort(),
+          maintenance: healthy,
+        }),
+      );
     }
     return {
       artifactVersion: `etag:${physicalScriptName}`,
@@ -519,7 +553,10 @@ class ImmutableFleetBackend extends FleetBackend {
     deployment: DeploymentSpec,
   ): Promise<LiveDeployment | undefined> {
     this.calls.push(`inspect:${deployment.tenantTag}`);
-    return this.releases.get(this.releaseScriptName(deployment));
+    const inspected = this.releases.get(this.releaseScriptName(deployment));
+    if (!inspected) return undefined;
+    const { providerBindingIdentities: _inventory, ...live } = inspected;
+    return completeLiveDeployment(live);
   }
 
   override async promoteWorker(
@@ -589,18 +626,20 @@ function liveFor(
   item: FleetRecord,
   overrides: Partial<LiveDeployment> = {},
 ): LiveDeployment {
-  return {
+  return completeLiveDeployment({
     tenantTag: item.tenantTag,
     environment: item.environment,
     scriptName: item.scriptName,
     databaseId: item.databaseId,
     durableObjectBindings: item.durableObjectBindings,
+    plainTextBindings: {},
+    secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
     artifactVersion: item.artifactVersion,
     desiredSpecDigest: item.desiredSpecDigest,
     schemaVersion: item.schemaVersion,
     maintenance: healthy,
     ...overrides,
-  };
+  });
 }
 
 function inventoryFor(records: readonly FleetRecord[]): FleetResourceInventory {
@@ -623,6 +662,7 @@ function inventoryFor(records: readonly FleetRecord[]): FleetResourceInventory {
       environment: item.environment,
       databaseIds: [item.databaseId],
       durableObjectBindings: item.durableObjectBindings,
+      plainTextBindings: {},
       secretNames:
         item.backend === 'workers-for-platforms'
           ? ['DEPLOYMENT_IDENTITY_SECRET']
@@ -1110,6 +1150,7 @@ describe('fleet operations', () => {
             environment: acme.environment,
             databaseIds: [acme.databaseId],
             durableObjectBindings: candidate.topology.durableObjectBindings,
+            plainTextBindings: {},
             secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
             routeHostnames:
               candidate.physicalScriptName === scenario.routeScriptName
@@ -1311,6 +1352,7 @@ describe('fleet operations', () => {
             ? ['db-wrong']
             : [acme.databaseId],
         durableObjectBindings: acme.durableObjectBindings,
+        plainTextBindings: {},
         serviceBindings:
           candidate.physicalScriptName === driftedName && drift === 'topology'
             ? [{ name: 'FORGED_PROXY', service: 'attacker-worker' }]
@@ -1472,6 +1514,7 @@ describe('fleet operations', () => {
         environment: migrating.environment,
         databaseIds: [migrating.databaseId],
         durableObjectBindings: migrating.durableObjectBindings,
+        plainTextBindings: {},
         secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
         routeHostnames:
           release === routeRelease ? [migrating.routeHostname] : [],
@@ -1665,6 +1708,7 @@ describe('fleet operations', () => {
           environment: acme.environment,
           databaseIds: [acme.databaseId],
           durableObjectBindings: acme.durableObjectBindings,
+          plainTextBindings: {},
           secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
           routeHostnames: [acme.routeHostname],
           artifactVersion: active.artifactVersion,
@@ -1782,6 +1826,7 @@ describe('fleet operations', () => {
                 environment: current.environment,
                 databaseIds: [current.databaseId],
                 durableObjectBindings: current.durableObjectBindings,
+                plainTextBindings: {},
                 secretNames: [
                   'DEPLOYMENT_IDENTITY_SECRET',
                   'MAINTENANCE_ADMIN_SECRET',
@@ -1941,6 +1986,7 @@ describe('fleet operations', () => {
           environment: current.environment,
           databaseIds: [current.databaseId],
           durableObjectBindings: current.durableObjectBindings,
+          plainTextBindings: {},
           secretNames: ['DEPLOYMENT_IDENTITY_SECRET'],
           routeHostnames: [current.routeHostname],
           artifactVersion: current.artifactVersion,

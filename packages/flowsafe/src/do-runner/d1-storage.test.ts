@@ -23,7 +23,9 @@ import { scheduleWithCreatorRole } from '../schedules/target-policy.js';
 import type { SignalDatabase } from '../signals/d1-shared.js';
 import { D1NotificationsStorage } from '../signals/notifications-d1.js';
 import { D1ThreadStateStorage } from '../signals/thread-state-d1.js';
+import type { D1DatabaseBinding } from './cf-types.js';
 import {
+  createD1Storage,
   purgeExpiredBackgroundTasks,
   purgeExpiredNotifications,
   purgeExpiredScheduleTriggers,
@@ -127,6 +129,146 @@ const TERMINAL = [
   'skipped',
 ];
 const LIVE = ['running', 'suspended', 'waiting', 'pending', 'paused'];
+const MAX_TABLE_PREFIX = 'p'.repeat(39);
+const OVERLONG_TABLE_PREFIX = 'p'.repeat(40);
+
+interface PublicPurgeCase {
+  name: string;
+  run: (
+    db: SnapshotDatabase,
+    tablePrefix: string,
+    now: () => number,
+  ) => Promise<unknown>;
+}
+
+const PUBLIC_PURGE_CASES = [
+  {
+    name: 'purgeExpiredWorkflowRuns',
+    run: (db, tablePrefix, now) =>
+      purgeExpiredWorkflowRuns(db, { ttlMs: DAY_MS, tablePrefix, now }),
+  },
+  {
+    name: 'purgeExpiredThreads',
+    run: (db, tablePrefix, now) =>
+      purgeExpiredThreads(db, { ttlMs: DAY_MS, tablePrefix, now }),
+  },
+  {
+    name: 'purgeExpiredBackgroundTasks',
+    run: (db, tablePrefix, now) =>
+      purgeExpiredBackgroundTasks(db, { tablePrefix, now }),
+  },
+  {
+    name: 'purgeExpiredNotifications',
+    run: (db, tablePrefix, now) =>
+      purgeExpiredNotifications(db, { ttlMs: DAY_MS, tablePrefix, now }),
+  },
+  {
+    name: 'purgeExpiredThreadState',
+    run: (db, tablePrefix, now) =>
+      purgeExpiredThreadState(db, { ttlMs: DAY_MS, tablePrefix, now }),
+  },
+  {
+    name: 'purgeExpiredScheduleTriggers',
+    run: (db, tablePrefix, now) =>
+      purgeExpiredScheduleTriggers(db, { ttlMs: DAY_MS, tablePrefix, now }),
+  },
+] satisfies PublicPurgeCase[];
+
+describe('createD1Storage table prefix', () => {
+  it('uses the shared Mastra-compatible identifier rule', () => {
+    const binding = sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding;
+
+    expect(() =>
+      createD1Storage({ binding, tablePrefix: 'tenant-prod_' }),
+    ).toThrow(
+      'Invalid tablePrefix: use an empty prefix or start with a letter or underscore and continue with letters, numbers, or underscores.',
+    );
+    expect(() =>
+      createD1Storage({ binding, tablePrefix: '01_tenant_' }),
+    ).toThrow(/start with a letter or underscore/);
+    expect(() =>
+      createD1Storage({ binding, tablePrefix: 'tenant_01_' }),
+    ).not.toThrow();
+    expect(() =>
+      createD1Storage({ binding, tablePrefix: '_tenant_01_' }),
+    ).not.toThrow();
+    expect(() => createD1Storage({ binding, tablePrefix: '' })).not.toThrow();
+  });
+
+  it('initializes the real adapter at the maximum compatible length', async () => {
+    const binding = sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding;
+    const storage = createD1Storage({
+      binding,
+      tablePrefix: MAX_TABLE_PREFIX,
+    });
+
+    await expect(storage.init()).resolves.toBeUndefined();
+  });
+
+  it('rejects prefixes that make a Mastra table name exceed 63 characters', () => {
+    const binding = sqliteUnitDatabase(openSqlite()) as D1DatabaseBinding;
+
+    expect(() =>
+      createD1Storage({ binding, tablePrefix: OVERLONG_TABLE_PREFIX }),
+    ).toThrow(
+      'Invalid tablePrefix: must be at most 39 characters so prefixed Mastra table names stay within the 63-character identifier limit.',
+    );
+  });
+});
+
+describe('public purge table-prefix validation', () => {
+  it.each(
+    PUBLIC_PURGE_CASES,
+  )('$name rejects malformed prefixes before clock or D1 access', async ({
+    run,
+  }) => {
+    let prepareCalls = 0;
+    let nowCalls = 0;
+    const db: SnapshotDatabase = {
+      prepare: () => {
+        prepareCalls += 1;
+        throw new Error('prepare must not run');
+      },
+    };
+
+    await expect(
+      run(db, 'tenant-prod_', () => {
+        nowCalls += 1;
+        return NOW;
+      }),
+    ).rejects.toThrow(
+      'Invalid tablePrefix: use an empty prefix or start with a letter or underscore and continue with letters, numbers, or underscores.',
+    );
+    expect(nowCalls).toBe(0);
+    expect(prepareCalls).toBe(0);
+  });
+
+  it.each(
+    PUBLIC_PURGE_CASES,
+  )('$name rejects overlong prefixes before clock or D1 access', async ({
+    run,
+  }) => {
+    let prepareCalls = 0;
+    let nowCalls = 0;
+    const db: SnapshotDatabase = {
+      prepare: () => {
+        prepareCalls += 1;
+        throw new Error('prepare must not run');
+      },
+    };
+
+    await expect(
+      run(db, OVERLONG_TABLE_PREFIX, () => {
+        nowCalls += 1;
+        return NOW;
+      }),
+    ).rejects.toThrow(
+      'Invalid tablePrefix: must be at most 39 characters so prefixed Mastra table names stay within the 63-character identifier limit.',
+    );
+    expect(nowCalls).toBe(0);
+    expect(prepareCalls).toBe(0);
+  });
+});
 
 describe('purgeExpiredWorkflowRuns', () => {
   it('deletes only stale TERMINAL runs and returns the count', async () => {

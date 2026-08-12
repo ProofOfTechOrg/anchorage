@@ -218,6 +218,10 @@ The runner does not provide an administrative “reset to last good state” API
 - aggregates per-run failures after the pass;
 - treats a not-yet-created snapshot table as empty.
 
+The composed Worker resolves its optional artifact purger from the current maintenance invocation's environment inside this failure boundary. A factory or deletion failure keeps the enumerable snapshot row and does not stop approval or other domain purges.
+
+When runtime storage uses `tablePrefix`, configure the same `storageTablePrefix` on `createFlowsafeWorker()`. It threads that validated prefix through every prefix-aware built-in purge. Direct callers of any exported low-level purge receive the same fail-fast validation before D1 preparation. Fixed-schema Flowsafe tables remain unprefixed.
+
 Running and suspended rows are never age-purged.
 
 Decommissioning deletes the bound storage after credentials and traffic are revoked. There is no in-database tenant purge in the single-organization data plane.

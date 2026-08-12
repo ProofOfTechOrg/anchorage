@@ -8,6 +8,11 @@ import { describe, expect, it } from 'vitest';
 
 import { D1IdempotencyStore } from '../src/connector-sdk/d1-idempotency-store.js';
 import { D1RateLimitStore } from '../src/connector-sdk/d1-rate-limit-store.js';
+import {
+  idempotencyStorageKey,
+  legacyIdempotencyStorageKey,
+} from '../src/connector-sdk/idempotency-key.js';
+import { ATOMIC_LEGACY_IDEMPOTENCY_MIGRATION } from '../src/connector-sdk/idempotency-migration.js';
 
 const T0 = Date.parse('2026-08-10T10:00:00.000Z');
 const MINUTE = 60_000;
@@ -117,6 +122,95 @@ describe('D1IdempotencyStore in workerd', () => {
       winner.reservation.token,
     );
     expect(await owner.get(key)).toEqual({ result: 'winner' });
+  });
+
+  it('atomically moves one ambiguous legacy row and makes retry idempotent', async () => {
+    const table = 'breakwater_idem_workerd_migration';
+    const store = new D1IdempotencyStore(env.DB, {
+      table,
+      now: () => T0,
+    });
+    const identity = {
+      connectorId: 'pay',
+      idempotencyKey: 'invoice:1',
+      isolationScope: 'tenant',
+    };
+    await store.put(legacyIdempotencyStorageKey(identity), {
+      result: { status: 'legacy' },
+    });
+    const request = {
+      sourceKey: legacyIdempotencyStorageKey(identity),
+      targetKey: idempotencyStorageKey(identity),
+      expectedRecord: { result: { status: 'legacy' } },
+      targetRecord: { result: { status: 'legacy' } },
+    };
+
+    await expect(
+      store[ATOMIC_LEGACY_IDEMPOTENCY_MIGRATION](request),
+    ).resolves.toEqual({
+      state: 'migrated',
+      record: { result: { status: 'legacy' } },
+    });
+    await expect(
+      store[ATOMIC_LEGACY_IDEMPOTENCY_MIGRATION](request),
+    ).resolves.toEqual({
+      state: 'already-migrated',
+      record: { result: { status: 'legacy' } },
+    });
+    const { results } = await env.DB.prepare(
+      `SELECT key, state FROM ${table} ORDER BY key`,
+    ).all<{ key: string; state: string }>();
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      key: expect.stringMatching(/^bw2_i_s_/),
+      state: 'done',
+    });
+  });
+
+  it('lets only one colliding tuple consume an ambiguous legacy row', async () => {
+    const table = 'breakwater_idem_workerd_migration_collision';
+    const store = new D1IdempotencyStore(env.DB, {
+      table,
+      now: () => T0,
+    });
+    const firstIdentity = {
+      connectorId: 'pay',
+      idempotencyKey: 'pay:invoice-1',
+      isolationScope: 'tenant',
+    };
+    const secondIdentity = {
+      connectorId: 'pay',
+      idempotencyKey: 'invoice-1',
+      isolationScope: 'tenant:pay',
+    };
+    await store.put(legacyIdempotencyStorageKey(firstIdentity), {
+      result: { source: 'legacy' },
+    });
+    const expectedRecord = { result: { source: 'legacy' } };
+
+    const outcomes = await Promise.all([
+      store[ATOMIC_LEGACY_IDEMPOTENCY_MIGRATION]({
+        sourceKey: legacyIdempotencyStorageKey(firstIdentity),
+        targetKey: idempotencyStorageKey(firstIdentity),
+        expectedRecord,
+        targetRecord: expectedRecord,
+      }),
+      store[ATOMIC_LEGACY_IDEMPOTENCY_MIGRATION]({
+        sourceKey: legacyIdempotencyStorageKey(secondIdentity),
+        targetKey: idempotencyStorageKey(secondIdentity),
+        expectedRecord,
+        targetRecord: expectedRecord,
+      }),
+    ]);
+
+    expect(outcomes.map(({ state }) => state).sort()).toEqual([
+      'migrated',
+      'source-absent',
+    ]);
+    const row = await env.DB.prepare(
+      `SELECT count(*) AS count FROM ${table} WHERE key LIKE 'bw2_i_s_%'`,
+    ).first<{ count: number }>();
+    expect(row).toEqual({ count: 1 });
   });
 });
 

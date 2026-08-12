@@ -30,10 +30,14 @@
 // docs/connector-interface.md).
 
 import type { RequestContext } from '@mastra/core/request-context';
-import type { PublicSchema } from '@mastra/core/schema';
+import {
+  type PublicSchema,
+  type StandardSchemaIssue,
+  toStandardSchema,
+} from '@mastra/core/schema';
 import type { Tool, ToolExecutionContext } from '@mastra/core/tools';
 import { createTool } from '@mastra/core/tools';
-import type { AuditLogger } from '../audit/index.js';
+import { type AuditLogger, agentAuditDetail } from '../audit/index.js';
 import { safeAuditErrorSummary } from '../audit/safe-error.js';
 import type {
   NetworkEgressOptions,
@@ -60,6 +64,15 @@ import {
 } from '../rbac/permission.js';
 import type { EgressFetchBase, EgressGuardedFetch } from './egress-fetch.js';
 import { EgressDeniedError, egressFetch } from './egress-fetch.js';
+import {
+  idempotencyStorageKey,
+  isAmbiguousLegacyIdempotencyIdentity,
+  legacyIdempotencyStorageKey,
+} from './idempotency-key.js';
+import {
+  ATOMIC_LEGACY_IDEMPOTENCY_MIGRATION,
+  isAtomicLegacyIdempotencyMigrator,
+} from './idempotency-migration.js';
 import { newToken } from './new-token.js';
 import { assertSingleTenantConnectorPolicies } from './single-tenant-preset.js';
 
@@ -116,9 +129,35 @@ export interface IdempotencyRecord {
   result: unknown;
 }
 
+/** Business identity used to inspect one legacy connector idempotency row. */
+export interface LegacyConnectorIdempotencyIdentity {
+  /** Non-empty business idempotency key supplied by the trusted operator. */
+  idempotencyKey: string;
+  /** Opaque non-empty isolation scope, when the original call was scoped. */
+  isolationScope?: string;
+}
+
+/** Exact inventoried record and identity approved for legacy migration. */
+export interface LegacyConnectorIdempotencyMigrationRequest
+  extends LegacyConnectorIdempotencyIdentity {
+  /** Exact record observed during inventory, before external ownership proof. */
+  expectedRecord: IdempotencyRecord;
+}
+
+/** Outcome of one supported ambiguous-v1 to v2 migration attempt. */
+export type LegacyConnectorIdempotencyMigrationResult =
+  | { state: 'migrated'; record: IdempotencyRecord }
+  | { state: 'already-migrated'; record: IdempotencyRecord }
+  | { state: 'source-absent' }
+  | { state: 'source-pending' }
+  | { state: 'source-mismatch'; record: IdempotencyRecord }
+  | { state: 'target-conflict'; target: IdempotencyInspection }
+  | { state: 'output-invalid'; issues: readonly StandardSchemaIssue[] };
+
 /**
- * Result storage keyed by `${connectorId}:${key}`. The record wrapper
- * distinguishes a stored undefined result from a miss.
+ * Result storage keyed by a private, versioned composite key. Callers must
+ * treat keys as opaque. The record wrapper distinguishes a stored undefined
+ * result from a miss.
  *
  * get/put plus the wrapper's in-flight dedup close same-isolate races only.
  * Durable implementations (D1/KV) must implement AtomicIdempotencyStore —
@@ -189,12 +228,38 @@ export interface AtomicIdempotencyStore extends IdempotencyStore {
   release(key: string, token?: string): void | Promise<void>;
 }
 
+/** Non-mutating state returned by an inspectable idempotency store. */
+export type IdempotencyInspection =
+  | { state: 'absent' }
+  | { state: 'pending' }
+  | { state: 'replay'; record: IdempotencyRecord };
+
+/**
+ * Idempotency store that can distinguish an absent key from a pending claim
+ * without reserving it. Atomic stores need this capability during the v1-to-v2
+ * composite-key transition so legacy pending work cannot be mistaken for a
+ * miss and executed again.
+ */
+export interface InspectableIdempotencyStore extends IdempotencyStore {
+  /** Inspect a key without reserving, finalizing, or releasing it. */
+  inspect(key: string): IdempotencyInspection | Promise<IdempotencyInspection>;
+}
+
 function isAtomicStore(
   store: IdempotencyStore,
 ): store is AtomicIdempotencyStore {
   return (
     typeof (store as Partial<AtomicIdempotencyStore>).reserve === 'function' &&
     typeof (store as Partial<AtomicIdempotencyStore>).release === 'function'
+  );
+}
+
+function isInspectableStore(
+  store: IdempotencyStore,
+): store is InspectableIdempotencyStore {
+  return (
+    typeof (store as Partial<InspectableIdempotencyStore>).inspect ===
+    'function'
   );
 }
 
@@ -220,14 +285,50 @@ function sharedOutcome<T>(): {
 // What a keyed probe resolved to: a replayed stored result, or a fresh
 // attempt for the caller (and any joined twins) to adopt.
 type KeyedOutcome<T> =
-  | { kind: 'replay'; result: T }
+  | { kind: 'replay'; result: T; validated: boolean }
   | { kind: 'attempt'; attempt: Promise<T> };
+
+class OutputValidationFailure {
+  constructor(
+    readonly kind: 'issues' | 'exception',
+    readonly cause: unknown = undefined,
+    readonly issues: readonly StandardSchemaIssue[] = [],
+  ) {}
+}
+
+const PREVALIDATED_OUTPUT = Symbol('breakwater.prevalidated-output');
+
+type PrevalidatedOutput<T> = {
+  [PREVALIDATED_OUTPUT]:
+    | { value: T; issues?: undefined }
+    | { issues: readonly StandardSchemaIssue[] };
+};
+
+function prevalidatedValue<T>(value: T): PrevalidatedOutput<T> {
+  return { [PREVALIDATED_OUTPUT]: { value } };
+}
+
+function prevalidatedIssues<T>(
+  issues: readonly StandardSchemaIssue[],
+): PrevalidatedOutput<T> {
+  return { [PREVALIDATED_OUTPUT]: { issues } };
+}
+
+function isPrevalidatedOutput<T>(
+  value: unknown,
+): value is PrevalidatedOutput<T> {
+  return (
+    typeof value === 'object' && value !== null && PREVALIDATED_OUTPUT in value
+  );
+}
 
 /**
  * Dev/test store. Per-isolate and evictable — production replay protection
  * needs a durable store (D1IdempotencyStore).
  */
-export class InMemoryIdempotencyStore implements AtomicIdempotencyStore {
+export class InMemoryIdempotencyStore
+  implements AtomicIdempotencyStore, InspectableIdempotencyStore
+{
   readonly #maxEntries: number;
   #entries = new Map<string, IdempotencyRecord>();
   // Reservations live outside the LRU: a pending key is never evictable. Value
@@ -241,6 +342,14 @@ export class InMemoryIdempotencyStore implements AtomicIdempotencyStore {
   /** Return a completed in-memory record, or `undefined` on a miss. */
   get(key: string): IdempotencyRecord | undefined {
     return this.#entries.get(key);
+  }
+
+  /** Inspect a key without changing its reservation or LRU state. */
+  inspect(key: string): IdempotencyInspection {
+    const record = this.#entries.get(key);
+    if (record) return { state: 'replay', record };
+    if (this.#pending.has(key)) return { state: 'pending' };
+    return { state: 'absent' };
   }
 
   /** Atomically reserve a key within this JavaScript isolate. */
@@ -336,6 +445,13 @@ export interface ConnectorPolicies {
   evaluators?: readonly ToolPolicyEvaluator[];
   /** Store used when the manifest requires an idempotency key. */
   idempotencyStore?: IdempotencyStore;
+  /**
+   * Explicit v2 composite-key rollout acknowledgement. Set only after every
+   * legacy writer sharing the store has been stopped and drained and legacy
+   * rows have been inventoried. Without it, an absent legacy key fails closed
+   * instead of racing an old writer that could still create a v1 record.
+   */
+  idempotencyKeyMigration?: 'legacy-writers-drained';
   /** Required when the manifest declares `rateLimit`. */
   rateLimitStore?: RateLimitStore;
   /** Optional audit logger for connector decisions and failures. */
@@ -368,13 +484,19 @@ export interface ConnectorRuntime {
 
 /** Definition compiled by `createConnector()` into an enforced Mastra tool. */
 export interface ConnectorConfig<TInput = unknown, TOutput = unknown> {
-  /** Stable, colon-free connector identifier. */
+  /**
+   * Stable, colon-free connector identifier. The colon restriction keeps the
+   * unchanged `[scope:]connector` rate-budget key injective.
+   */
   id: string;
   /** Description presented to the model and tool consumers. */
   description: string;
   /** Optional schema that Mastra validates before connector policies run. */
   inputSchema?: PublicSchema<TInput>;
-  /** Optional schema that Mastra validates after execution. */
+  /**
+   * Optional schema Breakwater validates/transforms before replay commit;
+   * Mastra consumes the captured Standard Schema result without rerunning it.
+   */
   outputSchema?: PublicSchema<TOutput>;
   /** Execute the connector after every configured gate has allowed the call. */
   execute: (
@@ -510,11 +632,84 @@ export class ConnectorPolicyError extends Error {
 
 const manifests = new WeakMap<object, PermissionManifest>();
 
+interface ConnectorIdempotencyMigration {
+  inspect(
+    identity: LegacyConnectorIdempotencyIdentity,
+  ): Promise<IdempotencyInspection>;
+  migrate(
+    request: LegacyConnectorIdempotencyMigrationRequest,
+  ): Promise<LegacyConnectorIdempotencyMigrationResult>;
+}
+
+const idempotencyMigrations = new WeakMap<
+  object,
+  ConnectorIdempotencyMigration
+>();
+
 /** Manifest a connector was created with (undefined for plain tools). */
 export function connectorManifest(
   tool: object,
 ): PermissionManifest | undefined {
   return manifests.get(tool);
+}
+
+function assertLegacyMigrationIdentity(
+  identity: LegacyConnectorIdempotencyIdentity,
+): void {
+  if (
+    typeof identity !== 'object' ||
+    identity === null ||
+    typeof identity.idempotencyKey !== 'string' ||
+    identity.idempotencyKey.length === 0 ||
+    (identity.isolationScope !== undefined &&
+      (typeof identity.isolationScope !== 'string' ||
+        identity.isolationScope.length === 0))
+  ) {
+    throw new TypeError(
+      'legacy connector idempotency identity requires a non-empty idempotencyKey and an omitted or non-empty isolationScope',
+    );
+  }
+}
+
+/** Inspect the v1 row for one connector-bound business identity. */
+export function inspectLegacyConnectorIdempotency(
+  connector: object,
+  identity: LegacyConnectorIdempotencyIdentity,
+): Promise<IdempotencyInspection> {
+  assertLegacyMigrationIdentity(identity);
+  const migration = idempotencyMigrations.get(connector);
+  if (!migration) {
+    throw new TypeError(
+      'legacy connector idempotency inspection requires an idempotent connector created by createConnector()',
+    );
+  }
+  return migration.inspect(identity);
+}
+
+/** Atomically move one externally proven ambiguous v1 row to its v2 identity. */
+export function migrateLegacyConnectorIdempotency(
+  connector: object,
+  request: LegacyConnectorIdempotencyMigrationRequest,
+): Promise<LegacyConnectorIdempotencyMigrationResult> {
+  assertLegacyMigrationIdentity(request);
+  if (
+    typeof request !== 'object' ||
+    request === null ||
+    typeof request.expectedRecord !== 'object' ||
+    request.expectedRecord === null ||
+    !('result' in request.expectedRecord)
+  ) {
+    throw new TypeError(
+      'legacy connector idempotency migration requires the exact expectedRecord returned by inventory',
+    );
+  }
+  const migration = idempotencyMigrations.get(connector);
+  if (!migration) {
+    throw new TypeError(
+      'legacy connector idempotency migration requires an idempotent connector created by createConnector()',
+    );
+  }
+  return migration.migrate(request);
 }
 
 function nonEmptyString(value: unknown): value is string {
@@ -712,9 +907,9 @@ function parseRateLimit(
   const match = RATE_LIMIT_PATTERN.exec(expr);
   const limit = match ? Number(match[1]) : 0;
   const windowMs = match?.[2] ? RATE_LIMIT_WINDOW_MS[match[2]] : undefined;
-  if (limit < 1 || windowMs === undefined) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || windowMs === undefined) {
     throw new TypeError(
-      `connector ${connectorId}: rate limit '${expr}' must be '<count>/<unit>' with count >= 1 and unit s|sec|second|m|min|minute|h|hour|d|day`,
+      `connector ${connectorId}: rate limit '${expr}' must be '<count>/<unit>' with a safe-integer count from 1 through ${Number.MAX_SAFE_INTEGER} and unit s|sec|second|m|min|minute|h|hour|d|day`,
     );
   }
   return { limit, windowMs };
@@ -771,12 +966,12 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
 ): Tool<TInput, TOutput> {
   const { id } = config;
   const configuredPolicies = config.policies ?? {};
-  // One construction guard closes BOTH id-derived colon-joined store keys —
-  // the idempotency scoped key and the rate-limit budget key — since both are
-  // built from this single id (details in the thrown message).
+  // The rate-budget key retains the v1 `[scope:]connector` format so active
+  // windows are not reset during the idempotency-key migration. A colon-free
+  // final connector component keeps that tuple injective.
   if (typeof id === 'string' && id.includes(':')) {
     throw new TypeError(
-      `connector id '${id}' must not contain a colon: id is joined UNESCAPED with ':' into BOTH id-derived store keys (the idempotency scoped key '<id>:<key>' / '<isolationScope>:<id>:<key>', and the rate-limit budget key '<scope>:<id>'), so a colon in id can collide two distinct tuples onto one key on a shared store. Use a colon-free id (camelCase or dot-delimited).`,
+      `connector id '${id}' must not contain a colon: the rate-limit budget key remains '<scope>:<id>', so a colon in id can collide two distinct tuples on a shared store. Use a colon-free id (camelCase or dot-delimited).`,
     );
   }
   const requiredPermissions = normalizedRequiredPermissions(
@@ -806,9 +1001,21 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   const baseEgressGuard = egressFetch(manifest.egress ?? [], {
     fetch: policies.fetch,
   });
+  const outputValidator =
+    config.outputSchema === undefined
+      ? undefined
+      : toStandardSchema(config.outputSchema);
   if (manifest.idempotencyKey && !policies.idempotencyStore) {
     throw new TypeError(
       `connector ${id}: permissions.idempotencyKey requires policies.idempotencyStore (InMemoryIdempotencyStore works for dev/tests)`,
+    );
+  }
+  if (
+    policies.idempotencyKeyMigration !== undefined &&
+    policies.idempotencyKeyMigration !== 'legacy-writers-drained'
+  ) {
+    throw new TypeError(
+      `connector ${id}: policies.idempotencyKeyMigration must be 'legacy-writers-drained' when provided`,
     );
   }
   if (manifest.dryRun && !config.dryRunExecute) {
@@ -855,6 +1062,16 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     policies.writePermissions,
   );
   const store = policies.idempotencyStore;
+  if (
+    manifest.idempotencyKey &&
+    store &&
+    isAtomicStore(store) &&
+    !isInspectableStore(store)
+  ) {
+    throw new TypeError(
+      `connector ${id}: an atomic idempotency store must implement inspect() during the v2 key migration so legacy pending work cannot be mistaken for a miss`,
+    );
+  }
   // Concurrent calls sharing a key await the same attempt instead of both
   // executing on a store miss.
   const inflight = new Map<string, Promise<TOutput>>();
@@ -871,7 +1088,10 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       resource: id,
       decision,
       reason: extra.reason,
-      detail: { sideEffect: manifest.sideEffect, ...extra.detail },
+      detail: agentAuditDetail(requestContext, {
+        sideEffect: manifest.sideEffect,
+        ...extra.detail,
+      }),
     });
   }
 
@@ -933,6 +1153,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     error: unknown,
     detail: Record<string, unknown> = {},
   ): void {
+    if (error instanceof OutputValidationFailure) return;
     // This connector's own policy denials (e.g. the rate-limit gate inside
     // a keyed attempt) were already audited by deny(); a second 'execute
     // threw' record would misattribute them to the connector's code. A
@@ -953,6 +1174,46 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       reason: safe?.reason ?? 'connector execution failed',
       detail: { stage: 'execute', ...safe?.detail, ...detail },
     });
+  }
+
+  function recordOutputValidationError(
+    requestContext: RequestContext | undefined,
+    detail: Record<string, unknown> = {},
+  ): void {
+    record(requestContext, 'error', {
+      reason: 'connector output validation failed',
+      detail: { stage: 'output-validation', ...detail },
+    });
+  }
+
+  function validateOutput(result: TOutput): TOutput {
+    if (outputValidator === undefined) return result;
+    try {
+      const validation = outputValidator['~standard'].validate(result);
+      if (validation instanceof Promise) {
+        // Mastra 1.50's public Tool boundary is synchronous-only. Accepting
+        // and committing an async validation here would let Mastra reject the
+        // public call after the replay record had already been finalized.
+        validation.catch(() => {});
+        throw new OutputValidationFailure(
+          'exception',
+          new Error(
+            'Your schema is async, which is not supported. Please use a sync schema.',
+          ),
+        );
+      }
+      if (validation.issues !== undefined) {
+        throw new OutputValidationFailure(
+          'issues',
+          undefined,
+          validation.issues,
+        );
+      }
+      return validation.value;
+    } catch (error) {
+      if (error instanceof OutputValidationFailure) throw error;
+      throw new OutputValidationFailure('exception', error);
+    }
   }
 
   // Budget counts ACTUAL executions: denied calls, cached replays, and
@@ -1008,7 +1269,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
 
   function recordStoreError(
     requestContext: RequestContext | undefined,
-    op: 'get' | 'put' | 'reserve' | 'release',
+    op: 'get' | 'inspect' | 'put' | 'reserve' | 'release',
     _error: unknown,
     key: string,
   ): void {
@@ -1064,8 +1325,14 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     try {
       const outcome = await probe();
       if (outcome.kind === 'replay') {
-        settle.resolve(outcome.result);
-        return finishAllowed(requestContext, outcome.result, {
+        // v2 records contain the exact validated/transformed public result.
+        // Safe legacy v1 records predate that invariant and must cross the
+        // schema boundary once before they are returned.
+        const result = outcome.validated
+          ? outcome.result
+          : validateOutput(outcome.result);
+        settle.resolve(result);
+        return finishAllowed(requestContext, result, {
           replayed: true,
           idempotencyKey: key,
         });
@@ -1096,7 +1363,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   async function gatedExecute(
     inputData: unknown,
     context: ToolExecutionContext,
-  ): Promise<TOutput> {
+  ): Promise<TOutput | PrevalidatedOutput<TOutput>> {
     const requestContext = context?.requestContext;
     const typedInput = inputData as TInput;
 
@@ -1246,12 +1513,16 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
         deny(requestContext, 'dry-run', 'connector does not support dry-run');
       }
       try {
-        return finishAllowed(
-          requestContext,
-          await simulate(typedInput, context, runtime),
-          { dryRun: true },
-        );
+        const result = await simulate(typedInput, context, runtime);
+        return finishAllowed(requestContext, validateOutput(result), {
+          dryRun: true,
+        });
       } catch (error) {
+        if (error instanceof OutputValidationFailure) {
+          recordOutputValidationError(requestContext, { dryRun: true });
+          if (error.kind === 'exception') throw error.cause;
+          return prevalidatedIssues<TOutput>(error.issues);
+        }
         recordExecuteError(requestContext, error, { dryRun: true });
         throw error;
       }
@@ -1325,147 +1596,235 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
           `breakwater: connector '${id}' uses InMemoryIdempotencyStore under isolation scope '${isolationScope}' — replay protection becomes per-isolate, not per-tenant; use D1IdempotencyStore on DO-per-run hosts.`,
         );
       }
-      const scoped =
-        isolationScope === undefined
-          ? `${id}:${key}`
-          : `${isolationScope}:${id}:${key}`;
-      if (isAtomicStore(store)) {
-        return keyedFlow(requestContext, scoped, key, async () => {
-          // Atomic claim — exactly one isolate wins a key.
-          let reservation: IdempotencyReservation;
+      const identity = {
+        connectorId: id,
+        idempotencyKey: key,
+        isolationScope,
+      };
+      const legacyKey = legacyIdempotencyStorageKey(identity);
+      const storageKey = idempotencyStorageKey(identity);
+      const ambiguousLegacyKey = isAmbiguousLegacyIdempotencyIdentity(identity);
+      try {
+        return await keyedFlow(requestContext, storageKey, key, async () => {
+          let legacy: IdempotencyInspection;
           try {
-            reservation = await store.reserve(scoped);
+            if (isInspectableStore(store)) {
+              legacy = await store.inspect(legacyKey);
+            } else {
+              const record = await store.get(legacyKey);
+              legacy = record
+                ? { state: 'replay', record }
+                : { state: 'absent' };
+            }
           } catch (error) {
-            // Fail closed: nothing has executed yet, so failing the call is
-            // safe and preserves replay protection for the retry. Marked
-            // audited: joined twins rethrow it via joinInflight, and
-            // recordExecuteError must not re-record it as 'execute threw'.
-            recordStoreError(requestContext, 'reserve', error, key);
+            recordStoreError(requestContext, 'inspect', error, key);
             throw markAudited(error);
           }
-          if (reservation.state === 'replay') {
-            return {
-              kind: 'replay',
-              result: reservation.record.result as TOutput,
-            };
-          }
-          if (reservation.state === 'pending') {
-            // Always cross-isolate (a same-isolate twin joins keyedFlow's
-            // placeholder and never probes reserve): a promise cannot be
-            // shared across isolates, so deny honestly — the retry replays
-            // the winner's stored result.
+          if (legacy.state !== 'absent') {
+            if (ambiguousLegacyKey) {
+              deny(
+                requestContext,
+                'idempotency-key-migration',
+                'an ambiguous legacy idempotency record exists for this tuple; map it externally to exactly one v2 identity before retrying',
+              );
+            }
+            if (legacy.state === 'replay') {
+              return {
+                kind: 'replay',
+                result: legacy.record.result as TOutput,
+                validated: false,
+              };
+            }
             deny(
               requestContext,
               'idempotency',
-              'another execution for this key is in progress; retry to replay its result',
+              'a legacy execution for this key is in progress; retry to replay its result',
             );
           }
-          if (reservation.tookOver) {
-            // D2: a dedicated signal, separate from this call's own outcome
-            // record below — the previous holder may only have been slow,
-            // not dead, if pendingTtlMs was set too low relative to the real
-            // execute duration (agent-cli's definition-time guard checks
-            // this; other connectors must size the store's TTL themselves).
-            record(requestContext, 'allowed', {
-              reason:
-                'stale-pending idempotency reservation taken over; the previous holder may still be executing',
-              detail: { idempotencyKey: key, tookOver: true },
-            });
+          if (policies.idempotencyKeyMigration !== 'legacy-writers-drained') {
+            deny(
+              requestContext,
+              'idempotency-key-migration',
+              `the legacy key is absent but v2 execution is disabled until policies.idempotencyKeyMigration acknowledges that every legacy writer sharing this store has been stopped and drained`,
+            );
           }
-          // The reservation lease — put()/release() CAS on it so this holder
-          // can only finalize or drop the row it still owns (audit D2).
-          // Captured as a const OUTSIDE the attempt closure: narrowing on the
-          // `let reservation` does not persist into the closure body.
-          const { token } = reservation;
-          // Reserved: consume the rate budget, execute, then put()
-          // finalizes the record. Any throw before put releases the
-          // reservation — failures are never cached, the key stays
-          // retryable. The consume stays INSIDE the attempt so denied
-          // calls, replays, and joins never spend budget; single-audit of
-          // rate failures is handled by deny()/auditedErrors.
-          // Accepted ordering quirk (audit D5, deliberate): reserve() runs
-          // BEFORE the rate-limit check, so a concurrent cross-isolate call
-          // for this same key that arrives while THIS attempt is later
-          // denied by the rate limit (and its reservation released) sees
-          // 'pending' and is denied 'idempotency' rather than 'rate-limit' —
-          // a transient misattribution in the audit reason, self-correcting
-          // on retry, with no duplicated side effect. Not fixed.
-          const attempt = (async () => {
+
+          if (isAtomicStore(store)) {
+            // Atomic claim — exactly one isolate wins a key.
+            let reservation: IdempotencyReservation;
             try {
-              await consumeRateLimit(requestContext);
-              const result = await config.execute(typedInput, context, runtime);
-              try {
-                await store.put(scoped, { result }, token);
-              } catch (error) {
-                // The side effect already succeeded; failing the call now
-                // would invite a retry that re-executes it — the exact
-                // duplication this store exists to prevent. Deliver the
-                // result and surface the degraded replay protection in the
-                // audit log. The reservation is deliberately NOT released: a
-                // pending row blocks duplicates until the stale-pending TTL,
-                // safer than inviting an immediate re-execute.
-                recordStoreError(requestContext, 'put', error, key);
-              }
-              return result;
+              reservation = await store.reserve(storageKey);
             } catch (error) {
-              try {
-                await store.release(scoped, token);
-              } catch (releaseError) {
-                // Best effort: an unreleased reservation is recovered by the
-                // store's stale-pending takeover.
-                recordStoreError(requestContext, 'release', releaseError, key);
-              }
-              throw error;
+              // Fail closed: nothing has executed yet, so failing the call is
+              // safe and preserves replay protection for the retry. Marked
+              // audited: joined twins rethrow it via joinInflight, and
+              // recordExecuteError must not re-record it as 'execute threw'.
+              recordStoreError(requestContext, 'reserve', error, key);
+              throw markAudited(error);
             }
+            if (reservation.state === 'replay') {
+              return {
+                kind: 'replay',
+                result: reservation.record.result as TOutput,
+                validated: true,
+              };
+            }
+            if (reservation.state === 'pending') {
+              // Always cross-isolate (a same-isolate twin joins keyedFlow's
+              // placeholder and never probes reserve): a promise cannot be
+              // shared across isolates, so deny honestly — the retry replays
+              // the winner's stored result.
+              deny(
+                requestContext,
+                'idempotency',
+                'another execution for this key is in progress; retry to replay its result',
+              );
+            }
+            if (reservation.tookOver) {
+              // D2: a dedicated signal, separate from this call's own outcome
+              // record below — the previous holder may only have been slow,
+              // not dead, if pendingTtlMs was set too low relative to the real
+              // execute duration (agent-cli's definition-time guard checks
+              // this; other connectors must size the store's TTL themselves).
+              record(requestContext, 'allowed', {
+                reason:
+                  'stale-pending idempotency reservation taken over; the previous holder may still be executing',
+                detail: { idempotencyKey: key, tookOver: true },
+              });
+            }
+            // The reservation lease — put()/release() CAS on it so this holder
+            // can only finalize or drop the row it still owns (audit D2).
+            // Captured as a const OUTSIDE the attempt closure: narrowing on the
+            // `let reservation` does not persist into the closure body.
+            const { token } = reservation;
+            // Reserved: consume the rate budget, execute, validate, then
+            // put() finalizes the record. A failure before execute completes
+            // releases the reservation. Any validation-stage failure keeps
+            // it pending because the side effect may already have happened.
+            // The consume stays INSIDE the attempt so denied calls, replays,
+            // and joins never spend budget; single-audit of rate failures is
+            // handled by deny()/auditedErrors.
+            // Accepted ordering quirk (audit D5, deliberate): reserve() runs
+            // BEFORE the rate-limit check, so a concurrent cross-isolate call
+            // for this same key that arrives while THIS attempt is later
+            // denied by the rate limit (and its reservation released) sees
+            // 'pending' and is denied 'idempotency' rather than 'rate-limit' —
+            // a transient misattribution in the audit reason, self-correcting
+            // on retry, with no duplicated side effect. Not fixed.
+            const attempt = (async () => {
+              try {
+                await consumeRateLimit(requestContext);
+                const result = await config.execute(
+                  typedInput,
+                  context,
+                  runtime,
+                );
+                const validatedResult = validateOutput(result);
+                try {
+                  await store.put(
+                    storageKey,
+                    { result: validatedResult },
+                    token,
+                  );
+                } catch (error) {
+                  // The side effect already succeeded; failing the call now
+                  // would invite a retry that re-executes it — the exact
+                  // duplication this store exists to prevent. Deliver the
+                  // result and surface the degraded replay protection in the
+                  // audit log. The reservation is deliberately NOT released: a
+                  // pending row blocks duplicates until the stale-pending TTL,
+                  // safer than inviting an immediate re-execute.
+                  recordStoreError(requestContext, 'put', error, key);
+                }
+                return validatedResult;
+              } catch (error) {
+                // Every output-validator failure is normalized to this type,
+                // including a validator that rejects or throws. Validation
+                // happens after the connector may already have completed its
+                // side effect, so keep the reservation pending instead of
+                // making an immediate retry duplicate it. This matches the
+                // fail-safe posture for a failed final put.
+                if (!(error instanceof OutputValidationFailure)) {
+                  try {
+                    await store.release(storageKey, token);
+                  } catch (releaseError) {
+                    // Best effort: an unreleased reservation is recovered by
+                    // the store's stale-pending takeover.
+                    recordStoreError(
+                      requestContext,
+                      'release',
+                      releaseError,
+                      key,
+                    );
+                  }
+                }
+                throw error;
+              }
+            })();
+            return { kind: 'attempt', attempt };
+          }
+          // Non-atomic get/put store: same-isolate protection only (join → get
+          // → attempt). Durable cross-isolate stores implement the atomic and
+          // inspectable shapes above.
+          let cached: IdempotencyRecord | undefined;
+          try {
+            cached = await store.get(storageKey);
+          } catch (error) {
+            // Fail closed: nothing has executed yet, so failing the call is
+            // safe and preserves replay protection for the retry. Marked
+            // audited so joined twins do not re-record it (see reserve probe).
+            recordStoreError(requestContext, 'get', error, key);
+            throw markAudited(error);
+          }
+          if (cached) {
+            return {
+              kind: 'replay',
+              result: cached.result as TOutput,
+              validated: true,
+            };
+          }
+          const attempt = (async () => {
+            // Consume inside the attempt — see the reserve-probe note above.
+            await consumeRateLimit(requestContext);
+            const result = await config.execute(typedInput, context, runtime);
+            const validatedResult = validateOutput(result);
+            // Only successful results are replayable — a thrown execute must
+            // stay retryable under the same key.
+            try {
+              await store.put(storageKey, { result: validatedResult });
+            } catch (error) {
+              // The side effect already succeeded; failing the call now would
+              // invite a retry that re-executes it — the exact duplication this
+              // store exists to prevent. Deliver the result and surface the
+              // degraded replay protection in the audit log.
+              recordStoreError(requestContext, 'put', error, key);
+            }
+            return validatedResult;
           })();
           return { kind: 'attempt', attempt };
         });
+      } catch (error) {
+        if (error instanceof OutputValidationFailure) {
+          recordOutputValidationError(requestContext, {
+            idempotencyKey: key,
+          });
+          if (error.kind === 'exception') throw error.cause;
+          return prevalidatedIssues<TOutput>(error.issues);
+        }
+        throw error;
       }
-      // Legacy get/put store: same-isolate protection only (join → get →
-      // attempt). Durable cross-isolate stores implement
-      // AtomicIdempotencyStore and take the reserve path above.
-      return keyedFlow(requestContext, scoped, key, async () => {
-        let cached: IdempotencyRecord | undefined;
-        try {
-          cached = await store.get(scoped);
-        } catch (error) {
-          // Fail closed: nothing has executed yet, so failing the call is
-          // safe and preserves replay protection for the retry. Marked
-          // audited so joined twins do not re-record it (see reserve probe).
-          recordStoreError(requestContext, 'get', error, key);
-          throw markAudited(error);
-        }
-        if (cached) {
-          return { kind: 'replay', result: cached.result as TOutput };
-        }
-        const attempt = (async () => {
-          // Consume inside the attempt — see the reserve-probe note above.
-          await consumeRateLimit(requestContext);
-          const result = await config.execute(typedInput, context, runtime);
-          // Only successful results are replayable — a thrown execute must
-          // stay retryable under the same key.
-          try {
-            await store.put(scoped, { result });
-          } catch (error) {
-            // The side effect already succeeded; failing the call now would
-            // invite a retry that re-executes it — the exact duplication this
-            // store exists to prevent. Deliver the result and surface the
-            // degraded replay protection in the audit log.
-            recordStoreError(requestContext, 'put', error, key);
-          }
-          return result;
-        })();
-        return { kind: 'attempt', attempt };
-      });
     }
 
     await consumeRateLimit(requestContext);
     try {
-      return finishAllowed(
-        requestContext,
-        await config.execute(typedInput, context, runtime),
-      );
+      const result = await config.execute(typedInput, context, runtime);
+      return finishAllowed(requestContext, validateOutput(result));
     } catch (error) {
+      if (error instanceof OutputValidationFailure) {
+        recordOutputValidationError(requestContext);
+        if (error.kind === 'exception') throw error.cause;
+        return prevalidatedIssues<TOutput>(error.issues);
+      }
       recordExecuteError(requestContext, error);
       throw error;
     }
@@ -1474,11 +1833,28 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   // createTool's generics key off concrete schema types; abstracting over
   // PublicSchema<TInput> degrades its inference, so pin the honest public
   // shape explicitly.
+  const toolOutputSchema =
+    outputValidator === undefined
+      ? undefined
+      : {
+          '~standard': {
+            version: 1 as const,
+            vendor: 'breakwater',
+            jsonSchema: outputValidator['~standard'].jsonSchema,
+            validate(value: unknown) {
+              if (isPrevalidatedOutput<TOutput>(value)) {
+                return value[PREVALIDATED_OUTPUT];
+              }
+              return outputValidator['~standard'].validate(value);
+            },
+          },
+        };
+
   const tool = createTool({
     id,
     description: config.description,
     inputSchema: config.inputSchema,
-    outputSchema: config.outputSchema,
+    outputSchema: toolOutputSchema,
     // Compiled as a per-call predicate: Mastra resolves approval BEFORE
     // execute, so a static `true` would pause an agent's dry-run request
     // that the wrapper's dry-run branch never lets reach a side effect
@@ -1503,15 +1879,80 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
         openWorldHint: (manifest.egress?.length ?? 0) > 0,
       },
     },
-    execute: gatedExecute,
+    execute: (async (
+      inputData: unknown,
+      executionContext: ToolExecutionContext,
+    ) => {
+      const result = await gatedExecute(inputData, executionContext);
+      if (outputValidator === undefined) return result;
+      return isPrevalidatedOutput<TOutput>(result)
+        ? result
+        : prevalidatedValue(result);
+    }) as never,
   }) as unknown as Tool<TInput, TOutput>;
 
   manifests.set(tool, manifest);
+  if (manifest.idempotencyKey && store) {
+    idempotencyMigrations.set(tool, {
+      async inspect(identity) {
+        assertLegacyMigrationIdentity(identity);
+        if (!isInspectableStore(store)) {
+          throw new TypeError(
+            `connector ${id}: legacy idempotency inspection requires an inspectable store`,
+          );
+        }
+        return store.inspect(
+          legacyIdempotencyStorageKey({
+            connectorId: id,
+            ...identity,
+          }),
+        );
+      },
+      async migrate(request) {
+        assertLegacyMigrationIdentity(request);
+        if (
+          !isAmbiguousLegacyIdempotencyIdentity(request) ||
+          policies.idempotencyKeyMigration !== 'legacy-writers-drained'
+        ) {
+          throw new TypeError(
+            `connector ${id}: ambiguous legacy idempotency migration requires a scoped or colon-bearing key and idempotencyKeyMigration 'legacy-writers-drained'`,
+          );
+        }
+        if (!isAtomicLegacyIdempotencyMigrator(store)) {
+          throw new TypeError(
+            `connector ${id}: supported legacy idempotency migration requires D1IdempotencyStore with transactional batch() support`,
+          );
+        }
+        const expectedRecord = { result: request.expectedRecord.result };
+        let targetResult: TOutput;
+        try {
+          targetResult = validateOutput(expectedRecord.result as TOutput);
+        } catch (error) {
+          if (error instanceof OutputValidationFailure) {
+            if (error.kind === 'issues') {
+              return { state: 'output-invalid', issues: error.issues };
+            }
+            throw error.cause;
+          }
+          throw error;
+        }
+        const identity = { connectorId: id, ...request };
+        return store[ATOMIC_LEGACY_IDEMPOTENCY_MIGRATION]({
+          sourceKey: legacyIdempotencyStorageKey(identity),
+          targetKey: idempotencyStorageKey(identity),
+          expectedRecord,
+          targetRecord: { result: targetResult },
+        });
+      },
+    });
+  }
   return tool;
 }
 
 export type {
   D1IdempotencyStoreOptions,
+  IdempotencyBatchDatabase,
+  IdempotencyBatchResult,
   IdempotencyDatabase,
   IdempotencyStatement,
 } from './d1-idempotency-store.js';
@@ -1520,6 +1961,7 @@ export type {
 export { D1IdempotencyStore } from './d1-idempotency-store.js';
 export type {
   D1RateLimitStoreOptions,
+  RateLimitBatchResult,
   RateLimitDatabase,
   RateLimitStatement,
 } from './d1-rate-limit-store.js';

@@ -99,8 +99,8 @@ export function agentAuditContextFromRequestContext(
 /**
  * Merge trusted correlation with boundary-specific detail.
  *
- * Boundary fields win if names collide so a policy or channel decision cannot
- * be relabeled by request context.
+ * Trusted correlation wins if names collide so boundary-provided detail cannot
+ * spoof the host-derived run, thread, resource, deployment, or principal.
  *
  * @internal
  */
@@ -110,7 +110,7 @@ export function agentAuditDetail(
 ): Record<string, unknown> | undefined {
   const correlation = agentAuditContextFromRequestContext(requestContext);
   if (!correlation) return detail;
-  return { ...correlation, ...detail };
+  return { ...detail, ...correlation };
 }
 
 /** Structured record emitted by a breakwater enforcement boundary. */

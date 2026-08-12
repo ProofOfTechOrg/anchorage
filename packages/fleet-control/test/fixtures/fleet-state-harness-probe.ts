@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 /// <reference types="@cloudflare/workers-types" />
 
+import { D1CloudflareApiRateCoordinator } from '../../src/cloudflare-rate-coordinator.js';
 import {
   canonicalDeploymentEgressPolicy,
   externalEgressProxyScriptName,
@@ -51,6 +52,58 @@ function database(db: D1Database): FleetStateDatabase {
           result.results as readonly Readonly<Record<string, unknown>>[],
       );
     },
+  };
+}
+
+function controlledLeaseClock(
+  db: D1Database,
+  leaseTable: string,
+): Readonly<{
+  database: FleetStateDatabase;
+  advance(ms: number): void;
+  allowHeartbeat(): void;
+  now(): number;
+  heartbeat: Promise<void>;
+}> {
+  const delegate = database(db);
+  let now = 1_000_000;
+  let allowHeartbeat: (() => void) | undefined;
+  const heartbeatAllowed = new Promise<void>((resolve) => {
+    allowHeartbeat = resolve;
+  });
+  let heartbeatObserved: (() => void) | undefined;
+  const heartbeat = new Promise<void>((resolve) => {
+    heartbeatObserved = resolve;
+  });
+  const atControlledTime = (sql: string) =>
+    sql.replaceAll(DB_NOW_MS, String(now));
+  return {
+    database: {
+      async query(sql, bindings = []) {
+        const isHeartbeat = sql.startsWith(`UPDATE ${leaseTable}\n`);
+        if (isHeartbeat) await heartbeatAllowed;
+        const rows = await delegate.query(atControlledTime(sql), bindings);
+        if (isHeartbeat) heartbeatObserved?.();
+        return rows;
+      },
+      execute: (sql, bindings = []) =>
+        delegate.execute(atControlledTime(sql), bindings),
+      batch: (statements) =>
+        delegate.batch(
+          statements.map((statement) => ({
+            ...statement,
+            sql: atControlledTime(statement.sql),
+          })),
+        ),
+    },
+    advance(ms) {
+      now += ms;
+    },
+    allowHeartbeat() {
+      allowHeartbeat?.();
+    },
+    now: () => now,
+    heartbeat,
   };
 }
 
@@ -177,25 +230,40 @@ async function renewal(db: D1Database): Promise<unknown> {
     },
   );
 
-  const heartbeatStore = new D1FleetStateStore(database(db), {
+  const clock = controlledLeaseClock(db, LEASE_TABLE);
+  const heartbeatStore = new D1FleetStateStore(clock.database, {
     accountId: 'account-primary',
     leaseTtlMs: 2_500,
-    leaseRenewalIntervalMs: 750,
+    leaseRenewalIntervalMs: 1,
   });
   let contenderRejected = false;
   await heartbeatStore.withDeploymentLease('heart', 'production', async () => {
-    await new Promise((resolve) => setTimeout(resolve, 3_200));
+    const originalExpiry = await clock.database.query(
+      `SELECT expires_at FROM ${LEASE_TABLE}
+       WHERE tenant_tag = 'heart' AND environment = 'production'`,
+    );
+    const originalExpiresAt = Number(originalExpiry[0]?.expires_at);
+    if (!Number.isFinite(originalExpiresAt)) {
+      throw new Error('deployment lease did not expose its original expiry');
+    }
+    clock.advance(2_000);
+    clock.allowHeartbeat();
+    await clock.heartbeat;
+    clock.advance(600);
     try {
-      await new D1FleetStateStore(database(db), {
+      await new D1FleetStateStore(clock.database, {
         accountId: 'account-primary',
         leaseTtlMs: 2_500,
-        leaseRenewalIntervalMs: 750,
+        leaseRenewalIntervalMs: 1,
       }).withDeploymentLease('heart', 'production', async () => {});
     } catch {
       contenderRejected = true;
     }
+    if (clock.now() <= originalExpiresAt) {
+      throw new Error('controlled D1 time did not pass the original expiry');
+    }
   });
-  return { explicit, contenderRejected };
+  return { explicit, heartbeatObserved: true, contenderRejected };
 }
 
 async function takeoverAndFence(db: D1Database): Promise<unknown> {
@@ -559,22 +627,33 @@ async function platformTakeoverAndFence(db: D1Database): Promise<unknown> {
 
 async function platformRenewal(db: D1Database): Promise<unknown> {
   await readyStore(db);
-  const heartbeatStore = new D1FleetStateStore(database(db), {
+  const clock = controlledLeaseClock(db, PLATFORM_LEASE_TABLE);
+  const heartbeatStore = new D1FleetStateStore(clock.database, {
     accountId: 'account-primary',
     leaseTtlMs: 2_500,
-    leaseRenewalIntervalMs: 750,
+    leaseRenewalIntervalMs: 1,
   });
   let contenderRejected = false;
   await heartbeatStore.withPlatformPlaneLease(
     platformSet,
     'anchorage:primary',
     async () => {
-      await new Promise((resolve) => setTimeout(resolve, 3_200));
+      const originalExpiry = await clock.database.query(
+        `SELECT expires_at FROM ${PLATFORM_LEASE_TABLE}`,
+      );
+      const originalExpiresAt = Number(originalExpiry[0]?.expires_at);
+      if (!Number.isFinite(originalExpiresAt)) {
+        throw new Error('platform lease did not expose its original expiry');
+      }
+      clock.advance(2_000);
+      clock.allowHeartbeat();
+      await clock.heartbeat;
+      clock.advance(600);
       try {
-        await new D1FleetStateStore(database(db), {
+        await new D1FleetStateStore(clock.database, {
           accountId: 'account-primary',
           leaseTtlMs: 2_500,
-          leaseRenewalIntervalMs: 750,
+          leaseRenewalIntervalMs: 1,
         }).withPlatformPlaneLease(
           platformSet,
           'anchorage:primary',
@@ -583,9 +662,12 @@ async function platformRenewal(db: D1Database): Promise<unknown> {
       } catch {
         contenderRejected = true;
       }
+      if (clock.now() <= originalExpiresAt) {
+        throw new Error('controlled D1 time did not pass the original expiry');
+      }
     },
   );
-  return { contenderRejected };
+  return { heartbeatObserved: true, contenderRejected };
 }
 
 async function crossPlaneClaimExclusion(db: D1Database): Promise<unknown> {
@@ -905,6 +987,48 @@ async function backendSwitchColumnUpgrade(db: D1Database): Promise<unknown> {
   };
 }
 
+async function cloudflareRateCoordination(db: D1Database): Promise<unknown> {
+  await db
+    .prepare('DROP TABLE IF EXISTS anchorage_cloudflare_api_rate_reservations')
+    .run();
+  const quotaScope = 'real-d1-shared-provider-principal';
+  const first = new D1CloudflareApiRateCoordinator(db, { quotaScope });
+  const second = new D1CloudflareApiRateCoordinator(db, { quotaScope });
+  await first.acquire();
+  await db
+    .prepare(
+      'DELETE FROM anchorage_cloudflare_api_rate_reservations WHERE quota_scope = ?',
+    )
+    .bind(quotaScope)
+    .run();
+  await db
+    .prepare(`WITH RECURSIVE sequence(value) AS (
+      SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 1099
+    )
+    INSERT INTO anchorage_cloudflare_api_rate_reservations (
+      quota_scope, reservation_id, reserved_at
+    )
+    SELECT ?, 'seed-' || value, CAST(unixepoch('subsec') * 1000 AS INTEGER)
+    FROM sequence`)
+    .bind(quotaScope)
+    .run();
+  await first.acquire();
+  const controller = new AbortController();
+  const blocked = second.acquire(controller.signal).then(
+    () => false,
+    (error) => error instanceof Error && error.name === 'AbortError',
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  controller.abort();
+  const row = await db
+    .prepare(`SELECT COUNT(*) AS count
+      FROM anchorage_cloudflare_api_rate_reservations
+      WHERE quota_scope = ?`)
+    .bind(quotaScope)
+    .first<{ count: number }>();
+  return { blocked: await blocked, count: Number(row?.count) };
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -940,6 +1064,8 @@ export default {
           return Response.json(await backendSwitchColumnUpgrade(env.DB));
         case 'lifecycle-errors':
           return Response.json(await lifecycleErrors(env.DB));
+        case 'cloudflare-rate-coordination':
+          return Response.json(await cloudflareRateCoordination(env.DB));
         default:
           return Response.json({ error: 'unknown action' }, { status: 400 });
       }

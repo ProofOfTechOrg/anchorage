@@ -72,6 +72,7 @@ export const contentPipelineModule: WorkflowModule<ShowcaseModuleDeps> = {
       policies: {
         audit,
         idempotencyStore: deps.idempotency,
+        idempotencyKeyMigration: deps.idempotencyKeyMigration,
       },
       execute: async ({ workflowId, runId, name, article }) => {
         const record = await deps.artifactStore.put(

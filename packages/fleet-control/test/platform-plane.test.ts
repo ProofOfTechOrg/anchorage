@@ -49,7 +49,7 @@ class FakePlatformClient implements PlatformPlaneClient {
     {
       artifactVersion: string;
       databaseIds: string[];
-      durableObjectBindings: unknown[];
+      durableObjectBindings: Array<{ name: string }>;
       serviceBindings: Array<{ name: string; service: string }>;
       queueProducerBindings: Array<{ name: string; queueName: string }>;
       kvNamespaceBindings: Array<{ name: string; namespaceId: string }>;
@@ -58,6 +58,8 @@ class FakePlatformClient implements PlatformPlaneClient {
         namespace: string;
         outbound: unknown;
       }>;
+      r2BucketBindings?: Array<{ name: string }>;
+      secretNames?: string[];
       plainTextBindings: Record<string, string>;
       workersDevEnabled: boolean;
       previewUrlsEnabled: boolean;
@@ -142,6 +144,8 @@ class FakePlatformClient implements PlatformPlaneClient {
             ]
           : [],
       ),
+      r2BucketBindings: [],
+      secretNames: [],
       workersDevEnabled: true,
       previewUrlsEnabled: true,
       routeHostnames: [],
@@ -159,7 +163,46 @@ class FakePlatformClient implements PlatformPlaneClient {
   }
 
   async inspectControlWorker(scriptName: string) {
-    return this.inspections.get(scriptName);
+    const inspection = this.inspections.get(scriptName);
+    if (!inspection) return undefined;
+    const secretNames = inspection.secretNames ?? [];
+    return {
+      ...inspection,
+      r2BucketBindings: inspection.r2BucketBindings ?? [],
+      secretNames,
+      providerBindingIdentities: [
+        ...inspection.databaseIds.map(() => ({ type: 'd1', name: 'DB' })),
+        ...inspection.durableObjectBindings.map(({ name }) => ({
+          type: 'durable_object_namespace',
+          name,
+        })),
+        ...inspection.serviceBindings.map(({ name }) => ({
+          type: 'service',
+          name,
+        })),
+        ...inspection.queueProducerBindings.map(({ name }) => ({
+          type: 'queue',
+          name,
+        })),
+        ...inspection.kvNamespaceBindings.map(({ name }) => ({
+          type: 'kv_namespace',
+          name,
+        })),
+        ...inspection.dispatchNamespaceBindings.map(({ name }) => ({
+          type: 'dispatch_namespace',
+          name,
+        })),
+        ...(inspection.r2BucketBindings ?? []).map(({ name }) => ({
+          type: 'r2_bucket',
+          name,
+        })),
+        ...Object.keys(inspection.plainTextBindings).map((name) => ({
+          type: 'plain_text',
+          name,
+        })),
+        ...secretNames.map((name) => ({ type: 'secret_text', name })),
+      ],
+    };
   }
 
   async disableControlWorkerPublicAccess(scriptName: string): Promise<void> {
@@ -181,6 +224,10 @@ class FakePlatformClient implements PlatformPlaneClient {
   ): Promise<void> {
     this.calls.push(`secrets:${scriptName}`);
     this.secretUpdates.push(secrets);
+    const inspection = this.inspections.get(scriptName);
+    if (inspection) {
+      inspection.secretNames = Object.keys(secrets).sort();
+    }
   }
 
   async ensureQueueConsumer(options: {
@@ -606,6 +653,49 @@ describe('platform plane provisioning', () => {
     );
   });
 
+  it.each([
+    {
+      label: 'R2 binding',
+      r2BucketBindings: [{ name: 'FOREIGN_BUCKET' }],
+      secretNames: [] as string[],
+    },
+    {
+      label: 'secret',
+      r2BucketBindings: [] as Array<{ name: string }>,
+      secretNames: ['FOREIGN_SECRET'],
+    },
+  ])('rejects a private bootstrap with an extra $label', async (extra) => {
+    const client = new FakePlatformClient();
+    client.inspections.set('fleet-outbound', {
+      artifactVersion: 'bootstrap-version',
+      databaseIds: [],
+      durableObjectBindings: [],
+      serviceBindings: [],
+      queueProducerBindings: [],
+      kvNamespaceBindings: [],
+      dispatchNamespaceBindings: [],
+      r2BucketBindings: extra.r2BucketBindings,
+      secretNames: extra.secretNames,
+      plainTextBindings: {
+        FLEET_PLATFORM_PLANE_ID: 'anchorage:primary',
+        FLEET_RESOURCE_ROLE: 'shared-outbound',
+        FLEET_PRIVATE_BOOTSTRAP: 'deny-all-v1',
+      },
+      workersDevEnabled: true,
+      previewUrlsEnabled: true,
+      routeHostnames: [],
+      zoneRoutes: [],
+    });
+
+    await expect(
+      provisionPlatformPlane({
+        client,
+        store: new FakePlatformStore(),
+        spec: platformSpec(),
+      }),
+    ).rejects.toThrow(/bootstrap drifted/u);
+  });
+
   it('rejects a provider response that drops or retains role bindings', async () => {
     class BindingDriftClient extends FakePlatformClient {
       override async uploadControlWorker(spec: {
@@ -695,5 +785,31 @@ describe('platform plane provisioning', () => {
         spec: platformSpec(),
       }),
     ).rejects.toThrow(/drifted role bindings/);
+  });
+
+  it.each([
+    { label: 'R2 binding', type: 'r2' as const },
+    { label: 'secret', type: 'secret' as const },
+  ])('rejects an extra $label during final attestation', async ({ type }) => {
+    class LatePrivilegedBindingClient extends FakePlatformClient {
+      override async assertUntrustedDispatchNamespace(): Promise<void> {
+        await super.assertUntrustedDispatchNamespace();
+        const inspection = this.inspections.get('fleet-audit');
+        if (!inspection) return;
+        if (type === 'r2') {
+          inspection.r2BucketBindings = [{ name: 'FOREIGN_BUCKET' }];
+        } else {
+          inspection.secretNames = ['FOREIGN_SECRET'];
+        }
+      }
+    }
+
+    await expect(
+      provisionPlatformPlane({
+        client: new LatePrivilegedBindingClient(),
+        store: new FakePlatformStore(),
+        spec: platformSpec(),
+      }),
+    ).rejects.toThrow(/drifted role bindings/u);
   });
 });

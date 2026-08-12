@@ -2013,6 +2013,14 @@ async function handleScheduleProbe(
   }
 
   if (request.method === 'POST' && path === '/sched/barrier') {
+    // Earlier probes intentionally leave recurring schedules in the shared D1
+    // store. If this stage crosses a cron-minute boundary, one can become due
+    // again and make this target-specific assertion observe two legitimate
+    // fires. Pause prior probes while preserving their trigger evidence so the
+    // barrier result measures only the schedule created below.
+    for (const existing of await store.listSchedules({ status: 'active' })) {
+      await store.updateSchedule(existing.id, { status: 'paused' });
+    }
     const id = `schedule_${crypto.randomUUID()}`;
     const ownerContext = actorContextForPrincipal(
       { kind: 'human', id: 'schedule-probe-owner', role: 'operator' },

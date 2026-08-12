@@ -54,6 +54,7 @@ import {
   verifyDurableObjectDeploymentIdentity,
   verifyDurableObjectDeploymentRequest,
 } from '../do-runner/index.js';
+import { validateTablePrefix } from '../do-runner/table-prefix.js';
 import type { ResumeRunFn } from './approval-bridge.js';
 import { bearerActorAuthenticator } from './bearer-auth.js';
 import {
@@ -341,17 +342,20 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
    */
   notify?: (env: Env) => ApprovalNotificationSink | undefined;
   /**
-   * When set, the retention purge (runPurgeMaintenance -> the built-in
-   * purgeExpiredWorkflowRuns) deletes each expired run's R2 artifacts WITH its
-   * snapshot row. The snapshot row is the only enumerable record of a run's
-   * artifact keys (R2 keys lead with workflowId — there is no run-level listing
-   * without it), so a retention purge without this pairing strands the run's
-   * artifacts until deployment teardown. Pass the same RunArtifactPurger
-   * (an R2ArtifactStore); undefined keeps the byte-identical
-   * row-only purge. NOT via extraPurgeDuties — that hook runs AFTER the rows are
-   * deleted, when the keys are already unenumerable.
+   * Builds the artifact purger from the current invocation's environment.
+   * When set, the retention purge deletes each expired run's R2 artifacts WITH
+   * its snapshot row. The snapshot row is the only enumerable record of a run's
+   * artifact keys, so a retention purge without this pairing strands artifacts
+   * until deployment teardown. Return the same R2-backed store used for runtime
+   * writes, or undefined for row-only purge. NOT via extraPurgeDuties: that hook
+   * runs after the rows are deleted, when the keys are already unenumerable.
    */
-  artifactStore?: RunArtifactPurger;
+  artifactStore?: (env: Env) => RunArtifactPurger | undefined;
+  /**
+   * Prefix for every prefix-aware built-in retention table. Must match the
+   * max-39 `tablePrefix` contract used when the deployment creates D1 storage.
+   */
+  storageTablePrefix?: string;
   /**
    * Opt-in background-task TTL cleanup. When present, the purge duty
    * reaps terminal `mastra_background_tasks` rows past the TTL as its OWN
@@ -649,6 +653,10 @@ async function maintenanceAdminResponse<Env extends FlowsafeWorkerEnv>(
 export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
   config: FlowsafeWorkerConfig<Env>,
 ): FlowsafeWorker<Env> {
+  const storageTablePrefix = validateTablePrefix(
+    config.storageTablePrefix,
+    'storageTablePrefix',
+  );
   // Authenticate before constructing request-scoped services.
   const buildResolve = (
     env: Env,
@@ -737,6 +745,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
     };
     let purged: number | undefined;
     try {
+      const artifactStore = config.artifactStore?.(env);
       // The resource registry is lazy like Mastra's snapshot table. Retention
       // may be the first resource-aware operation in a fresh deployment, so
       // initialize it before asking the atomic purge to reference it.
@@ -754,7 +763,8 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         // Pairs each expired run's R2 artifacts with its snapshot-row deletion
         // (artifacts BEFORE the row — the row is the only record of their keys).
         // Undefined on hosts that wire no R2, so the purge stays byte-identical.
-        artifactStore: config.artifactStore,
+        artifactStore,
+        tablePrefix: storageTablePrefix,
         // Snapshot + owner release share one D1 transaction, so retention
         // cannot leave unbounded run-ownership tombstones or expose a live row
         // without its authorization record.
@@ -796,6 +806,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       try {
         const purgedThreads = await purgeExpiredThreads(env.DB, {
           ttlMs: threadRetentionDays * 24 * 60 * 60 * 1000,
+          tablePrefix: storageTablePrefix,
         });
         threadsPurged = purgedThreads.threads;
         threadMessagesPurged = purgedThreads.messages;
@@ -812,6 +823,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         backgroundTasksPurged = await purgeExpiredBackgroundTasks(env.DB, {
           completedTtlMs: config.backgroundTasks.completedTtlMs,
           failedTtlMs: config.backgroundTasks.failedTtlMs,
+          tablePrefix: storageTablePrefix,
         });
       } catch (error) {
         recordFailure('background-task-purge', error);
@@ -829,6 +841,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       try {
         notificationsPurged = await purgeExpiredNotifications(env.DB, {
           ttlMs: notificationRetentionDays * 24 * 60 * 60 * 1000,
+          tablePrefix: storageTablePrefix,
         });
       } catch (error) {
         recordFailure('notification-purge', error);
@@ -845,6 +858,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       try {
         threadStatePurged = await purgeExpiredThreadState(env.DB, {
           ttlMs: threadStateRetentionDays * 24 * 60 * 60 * 1000,
+          tablePrefix: storageTablePrefix,
         });
       } catch (error) {
         recordFailure('thread-state-purge', error);
@@ -863,6 +877,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       try {
         scheduleTriggersPurged = await purgeExpiredScheduleTriggers(env.DB, {
           ttlMs: scheduleTriggerRetentionDays * 24 * 60 * 60 * 1000,
+          tablePrefix: storageTablePrefix,
         });
       } catch (error) {
         recordFailure('schedule-trigger-purge', error);

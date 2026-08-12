@@ -6,6 +6,7 @@ import Cloudflare from 'cloudflare';
 import { toFile } from 'cloudflare/uploads';
 import PQueue from 'p-queue';
 import { canonicalApplicationBindings } from './application-bindings.js';
+import type { CloudflareApiRateCoordinator } from './cloudflare-rate-coordinator.js';
 import {
   canonicalDeploymentEgressPolicy,
   externalPlatformResourceGroupId,
@@ -14,6 +15,10 @@ import {
   FLEET_AUDIT_PROXY_CLASS_NAME,
   FLEET_AUDIT_PROXY_STATE_BINDING,
 } from './platform-resources.js';
+import {
+  assertProviderBindingIdentitiesMatchInspection,
+  assertSupportedProviderBindings,
+} from './provider-binding-inventory.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   DatabaseExport,
@@ -23,23 +28,23 @@ import type {
   ExternalMutationFence,
   FleetResourceInventory,
   PromotionGuard,
+  ProviderBindingIdentity,
 } from './types.js';
 import { parseHostRoutingTarget } from './workers/host-routing.js';
 
-const DEFAULT_INTERVAL_CAP = 1_100;
-const CLOUDFLARE_INTERVAL_MS = 5 * 60_000;
 const AUDIT_CONSUMER_SETTINGS = Object.freeze({
   batch_size: 100,
   max_concurrency: 4,
   max_retries: 5,
   max_wait_time_ms: 5_000,
 });
+const SDK_TRANSPORT_TIMEOUT_MS = 2_147_483_647;
 
 export interface CloudflareClientOptions {
   readonly accountId: string;
   readonly apiToken: string;
   readonly dispatchNamespace: string;
-  readonly intervalCap?: number;
+  readonly rateCoordinator: CloudflareApiRateCoordinator;
   readonly concurrency?: number;
   readonly requestTimeoutMs?: number;
   readonly fetch?: typeof fetch;
@@ -95,6 +100,7 @@ export interface ControlWorkerInspection {
   }>[];
   readonly secretNames: readonly string[];
   readonly plainTextBindings: Readonly<Record<string, string>>;
+  readonly providerBindingIdentities: readonly ProviderBindingIdentity[];
   readonly workersDevEnabled: boolean;
   readonly previewUrlsEnabled: boolean;
   readonly routeHostnames: readonly string[];
@@ -297,6 +303,16 @@ function isNotFound(error: unknown): boolean {
   );
 }
 
+function d1RestParameters(
+  bindings: readonly string[],
+  operation: string,
+): string[] {
+  if (bindings.some((binding) => typeof binding !== 'string')) {
+    throw new Error(`${operation} bindings must be strings`);
+  }
+  return [...bindings];
+}
+
 function queueConsumerMatches(
   consumer: Readonly<{
     type?: string;
@@ -390,6 +406,7 @@ export class CloudflareProvisioningClient {
   readonly #client: CloudflareSdk;
   readonly #operationQueue: PQueue;
   readonly #requestQueue: PQueue;
+  readonly #rateCoordinator: CloudflareApiRateCoordinator;
   readonly #exportStore: DurableDatabaseExportStore | undefined;
   readonly #fetch: typeof fetch;
   readonly #mutationFence = new AsyncLocalStorage<ExternalMutationFence>();
@@ -401,13 +418,8 @@ export class CloudflareProvisioningClient {
         'accountId, apiToken, and dispatchNamespace are required',
       );
     }
-    const intervalCap = options.intervalCap ?? DEFAULT_INTERVAL_CAP;
-    if (
-      !Number.isInteger(intervalCap) ||
-      intervalCap < 1 ||
-      intervalCap > 1_200
-    ) {
-      throw new Error('intervalCap must be an integer from 1 through 1200');
+    if (!options.rateCoordinator) {
+      throw new Error('rateCoordinator is required');
     }
     this.#accountId = options.accountId;
     this.#apiToken = options.apiToken;
@@ -417,12 +429,8 @@ export class CloudflareProvisioningClient {
       throw new Error('concurrency must be a positive integer');
     }
     this.#operationQueue = new PQueue({ concurrency });
-    this.#requestQueue = new PQueue({
-      concurrency,
-      interval: CLOUDFLARE_INTERVAL_MS,
-      intervalCap,
-      strict: true,
-    });
+    this.#requestQueue = new PQueue({ concurrency });
+    this.#rateCoordinator = options.rateCoordinator;
     this.#exportStore = options.exportStore;
     this.#fetch = options.fetch ?? fetch;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? 60_000;
@@ -433,11 +441,32 @@ export class CloudflareProvisioningClient {
       throw new Error('requestTimeoutMs must be a positive integer');
     }
     const rateLimitedFetch: typeof fetch = async (input, init) => {
-      const method = (
-        init?.method ?? (input instanceof Request ? input.method : 'GET')
-      ).toUpperCase();
-      const fence = this.#mutationFence.getStore();
-      const response = await this.#requestQueue.add(async () => {
+      return this.#request(input, init);
+    };
+    this.#client = new Cloudflare({
+      apiToken: options.apiToken,
+      fetch: rateLimitedFetch,
+      maxRetries: 2,
+      // The SDK timeout starts before its custom transport. Apply the real
+      // timeout after shared quota acquisition so replica coordination cannot
+      // consume the network request's lease-bounded execution budget.
+      timeout: SDK_TRANSPORT_TIMEOUT_MS,
+    });
+  }
+
+  async #request(
+    input: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<Response> {
+    const method = (
+      init?.method ?? (input instanceof Request ? input.method : 'GET')
+    ).toUpperCase();
+    const fence = this.#mutationFence.getStore();
+    const signal =
+      init?.signal ?? (input instanceof Request ? input.signal : undefined);
+    const response = await this.#requestQueue.add(
+      async () => {
+        await this.#rateCoordinator.acquire(signal);
         if (method !== 'GET' && method !== 'HEAD') {
           if (!fence) {
             throw new Error(
@@ -446,18 +475,20 @@ export class CloudflareProvisioningClient {
           }
           await fence.assertOwned();
         }
-        return this.#fetch(input, init);
-      });
-      if (!response)
-        throw new Error('Cloudflare request queue returned no response');
-      return response;
-    };
-    this.#client = new Cloudflare({
-      apiToken: options.apiToken,
-      fetch: rateLimitedFetch,
-      maxRetries: 2,
-      timeout: this.#requestTimeoutMs,
-    });
+        const timeoutSignal = AbortSignal.timeout(this.#requestTimeoutMs);
+        return this.#fetch(input, {
+          ...init,
+          signal: signal
+            ? AbortSignal.any([signal, timeoutSignal])
+            : timeoutSignal,
+        });
+      },
+      { signal },
+    );
+    if (!response) {
+      throw new Error('Cloudflare request queue returned no response');
+    }
+    return response;
   }
 
   async #schedule<T>(operation: () => Promise<T>): Promise<T> {
@@ -899,26 +930,28 @@ export class CloudflareProvisioningClient {
   async listOrdinaryWorkerSecretNames(
     scriptName: string,
   ): Promise<readonly string[]> {
-    return this.#schedule(async () => {
-      const names: string[] = [];
-      try {
-        for await (const secret of this.#client.workers.scripts.secrets.list(
-          scriptName,
-          { account_id: this.#accountId },
-        )) {
-          if (!secret.name) {
-            throw new Error(
-              `ordinary Worker '${scriptName}' returned a secret without a name`,
-            );
-          }
-          names.push(secret.name);
+    return this.#schedule(() => this.#ordinaryWorkerSecretNames(scriptName));
+  }
+
+  async #ordinaryWorkerSecretNames(scriptName: string): Promise<string[]> {
+    const names: string[] = [];
+    try {
+      for await (const secret of this.#client.workers.scripts.secrets.list(
+        scriptName,
+        { account_id: this.#accountId },
+      )) {
+        if (!secret.name) {
+          throw new Error(
+            `ordinary Worker '${scriptName}' returned a secret without a name`,
+          );
         }
-      } catch (error) {
-        if (isNotFound(error)) return [];
-        throw error;
+        names.push(secret.name);
       }
-      return names.sort();
-    });
+    } catch (error) {
+      if (isNotFound(error)) return [];
+      throw error;
+    }
+    return names.sort();
   }
 
   async #dispatchScripts(
@@ -936,14 +969,9 @@ export class CloudflareProvisioningClient {
       if (cursor) url.searchParams.set('cursor', cursor);
       let response: Response | undefined;
       for (let attempt = 0; attempt < 3; attempt += 1) {
-        response = await this.#requestQueue.add(() =>
-          this.#fetch(url, {
-            headers: { authorization: `Bearer ${this.#apiToken}` },
-          }),
-        );
-        if (!response) {
-          throw new Error('Cloudflare request queue returned no response');
-        }
+        response = await this.#request(url, {
+          headers: { authorization: `Bearer ${this.#apiToken}` },
+        });
         if (response.status !== 429 && response.status < 500) break;
       }
       if (!response?.ok) {
@@ -1674,7 +1702,7 @@ export class CloudflareProvisioningClient {
           activeDeployment,
           `ordinary Worker '${scriptName}'`,
         );
-        const [activeVersion, subdomain] = await Promise.all([
+        const [activeVersion, subdomain, secretNames] = await Promise.all([
           this.#client.workers.scripts.versions.get(artifactVersion, {
             account_id: this.#accountId,
             script_name: scriptName,
@@ -1682,6 +1710,7 @@ export class CloudflareProvisioningClient {
           this.#client.workers.scripts.subdomain.get(scriptName, {
             account_id: this.#accountId,
           }),
+          this.#ordinaryWorkerSecretNames(scriptName),
         ]);
         const bindings = activeVersion.resources.bindings ?? [];
         const databaseIds = bindings.flatMap((binding) =>
@@ -1755,13 +1784,21 @@ export class CloudflareProvisioningClient {
               : [],
           ),
         );
-        const secretNames = bindings
-          .flatMap((binding) =>
-            binding.type === 'secret_text' && binding.name
-              ? [binding.name]
-              : [],
-          )
-          .sort();
+        assertSupportedProviderBindings(
+          bindings,
+          new Set([
+            'd1',
+            'durable_object_namespace',
+            'service',
+            'queue',
+            'kv_namespace',
+            'dispatch_namespace',
+            'r2_bucket',
+            'plain_text',
+            'secret_text',
+          ]),
+          `plain Worker '${scriptName}'`,
+        );
         const tenantTag = plainText.get('DEPLOYMENT_TENANT');
         const environment = plainText.get('FLEET_ENVIRONMENT');
         const resourceRole = plainText.get('FLEET_RESOURCE_ROLE');
@@ -2110,7 +2147,7 @@ export class CloudflareProvisioningClient {
           activeDeployment,
           `control Worker '${scriptName}'`,
         );
-        const [activeVersion, subdomain] = await Promise.all([
+        const [activeVersion, subdomain, secretNames] = await Promise.all([
           this.#client.workers.scripts.versions.get(artifactVersion, {
             account_id: this.#accountId,
             script_name: scriptName,
@@ -2118,6 +2155,7 @@ export class CloudflareProvisioningClient {
           this.#client.workers.scripts.subdomain.get(scriptName, {
             account_id: this.#accountId,
           }),
+          this.#ordinaryWorkerSecretNames(scriptName),
         ]);
         const bindings = activeVersion.resources.bindings ?? [];
         const databaseIds = bindings.flatMap((binding) =>
@@ -2207,13 +2245,21 @@ export class CloudflareProvisioningClient {
               : [],
           ),
         );
-        const secretNames = bindings
-          .flatMap((binding) =>
-            binding.type === 'secret_text' && binding.name
-              ? [binding.name]
-              : [],
-          )
-          .sort();
+        const providerBindingIdentities = assertSupportedProviderBindings(
+          bindings,
+          new Set([
+            'd1',
+            'durable_object_namespace',
+            'service',
+            'queue',
+            'kv_namespace',
+            'dispatch_namespace',
+            'r2_bucket',
+            'plain_text',
+            'secret_text',
+          ]),
+          `control Worker '${scriptName}'`,
+        );
         const routeHostnames: string[] = [];
         for await (const domain of this.#client.workers.domains.list({
           account_id: this.#accountId,
@@ -2235,7 +2281,7 @@ export class CloudflareProvisioningClient {
             });
           }
         }
-        return {
+        const inspection = {
           artifactVersion,
           databaseIds,
           durableObjectBindings,
@@ -2246,11 +2292,17 @@ export class CloudflareProvisioningClient {
           r2BucketBindings,
           secretNames,
           plainTextBindings,
+          providerBindingIdentities,
           workersDevEnabled: subdomain.enabled === true,
           previewUrlsEnabled: subdomain.previews_enabled === true,
           routeHostnames,
           zoneRoutes,
         };
+        assertProviderBindingIdentitiesMatchInspection(
+          inspection,
+          `control Worker '${scriptName}'`,
+        );
+        return inspection;
       } catch (error) {
         if (isNotFound(error)) return undefined;
         throw error;
@@ -2604,16 +2656,9 @@ export class CloudflareProvisioningClient {
   async queryDatabase(
     databaseId: string,
     sql: string,
-    bindings: readonly unknown[] = [],
+    bindings: readonly string[] = [],
   ): Promise<readonly Readonly<Record<string, unknown>>[]> {
-    const params = bindings.map((binding) => {
-      if (binding === null) return 'null';
-      if (typeof binding === 'string') return binding;
-      if (typeof binding === 'number' || typeof binding === 'boolean') {
-        return String(binding);
-      }
-      throw new Error('D1 query bindings must be scalar values');
-    });
+    const params = d1RestParameters(bindings, 'D1 query');
     return this.#schedule(async () => {
       const rows: Readonly<Record<string, unknown>>[] = [];
       for await (const result of this.#client.d1.database.query(databaseId, {
@@ -2638,22 +2683,12 @@ export class CloudflareProvisioningClient {
     databaseId: string,
     statements: readonly {
       readonly sql: string;
-      readonly bindings?: readonly unknown[];
+      readonly bindings?: readonly string[];
     }[],
   ): Promise<void> {
     const batch = statements.map((statement) => ({
       sql: statement.sql,
-      params: (statement.bindings ?? []).map((binding) => {
-        if (binding === null) return 'null';
-        if (
-          typeof binding === 'string' ||
-          typeof binding === 'number' ||
-          typeof binding === 'boolean'
-        ) {
-          return String(binding);
-        }
-        throw new Error('D1 batch bindings must be scalar values');
-      }),
+      params: d1RestParameters(statement.bindings ?? [], 'D1 batch'),
     }));
     await this.#schedule(async () => {
       for await (const result of this.#client.d1.database.query(databaseId, {
@@ -3105,6 +3140,7 @@ export class CloudflareProvisioningClient {
         desiredSpecDigest: string;
         durableObjectTag?: string;
         plainTextBindings: Readonly<Record<string, string>>;
+        providerBindingIdentities: readonly ProviderBindingIdentity[];
       }
     | undefined
   > {
@@ -3196,6 +3232,19 @@ export class CloudflareProvisioningClient {
               : [],
           ),
         );
+        const providerBindingIdentities = assertSupportedProviderBindings(
+          bindings,
+          new Set([
+            'd1',
+            'durable_object_namespace',
+            'service',
+            'queue',
+            'r2_bucket',
+            'plain_text',
+            'secret_text',
+          ]),
+          `dispatch Worker '${scriptName}'`,
+        );
         const schemaTag = settings.tags?.find((tag) =>
           tag.startsWith('schema:'),
         );
@@ -3224,7 +3273,7 @@ export class CloudflareProvisioningClient {
             `script '${scriptName}' has incomplete fleet metadata`,
           );
         }
-        return {
+        const inspection = {
           artifactVersion,
           databaseIds,
           durableObjectBindings,
@@ -3233,12 +3282,18 @@ export class CloudflareProvisioningClient {
           r2BucketBindings,
           secretNames,
           plainTextBindings,
+          providerBindingIdentities,
           tenantTag,
           environment,
           schemaVersion,
           desiredSpecDigest,
           ...(durableObjectTag ? { durableObjectTag } : {}),
         };
+        assertProviderBindingIdentitiesMatchInspection(
+          inspection,
+          `dispatch Worker '${scriptName}'`,
+        );
+        return inspection;
       } catch (error) {
         if (
           error &&
@@ -3340,7 +3395,9 @@ export class CloudflareProvisioningClient {
         if (signedUrl.protocol !== 'https:') {
           throw new Error('D1 export returned a non-HTTPS download URL');
         }
-        const download = await this.#fetch(signedUrl, { redirect: 'error' });
+        const download = await this.#request(signedUrl, {
+          redirect: 'error',
+        });
         if (!download.ok || !download.body) {
           throw new Error(
             `D1 export download failed with HTTP ${download.status}`,

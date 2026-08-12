@@ -21,6 +21,7 @@ import type { EgressFetchBase } from './egress-fetch.js';
 import type {
   AtomicIdempotencyStore,
   ConnectorPolicies,
+  InspectableIdempotencyStore,
   PermissionManifest,
   RateLimitStore,
 } from './index.js';
@@ -31,6 +32,7 @@ const d1GetMethod = D1IdempotencyStore.prototype.get;
 const d1PutMethod = D1IdempotencyStore.prototype.put;
 const d1ReserveMethod = D1IdempotencyStore.prototype.reserve;
 const d1ReleaseMethod = D1IdempotencyStore.prototype.release;
+const d1InspectMethod = D1IdempotencyStore.prototype.inspect;
 const d1IncrementMethod = D1RateLimitStore.prototype.increment;
 
 /** Durable stores available to the single-deployment connector preset. */
@@ -66,6 +68,11 @@ export interface SingleTenantPermissionPosture {
 export interface SingleTenantConnectorPoliciesOptions {
   /** D1 stores used when a connector manifest enables the matching control. */
   durableStores?: SingleTenantDurableStores;
+  /**
+   * Set only after legacy connector writers sharing the D1 store are stopped
+   * and drained and existing v1 rows have been inventoried.
+   */
+  idempotencyKeyMigration?: 'legacy-writers-drained';
   /** Production audit logger or the explicit development-only opt-out. */
   audit: SingleTenantAuditPosture;
   /** Organization allowlist applied to every connector declaration. */
@@ -133,6 +140,7 @@ const optionsSchema = z.strictObject({
       rateLimit: z.instanceof(D1RateLimitStore).optional(),
     })
     .optional(),
+  idempotencyKeyMigration: z.literal('legacy-writers-drained').optional(),
   audit: z.discriminatedUnion('mode', [
     z.strictObject({
       mode: z.literal('production'),
@@ -200,13 +208,15 @@ function snapshotEvaluator(
 
 function snapshotIdempotencyStore(
   store: D1IdempotencyStore,
-): AtomicIdempotencyStore & { readonly pendingTtlMs: number } {
+): AtomicIdempotencyStore &
+  InspectableIdempotencyStore & { readonly pendingTtlMs: number } {
   return Object.freeze({
     pendingTtlMs: store.pendingTtlMs,
     get: Object.freeze(d1GetMethod.bind(store)),
     put: Object.freeze(d1PutMethod.bind(store)),
     reserve: Object.freeze(d1ReserveMethod.bind(store)),
     release: Object.freeze(d1ReleaseMethod.bind(store)),
+    inspect: Object.freeze(d1InspectMethod.bind(store)),
   });
 }
 
@@ -301,6 +311,9 @@ export function singleTenantConnectorPolicies(
     ...(writePermissions === undefined ? {} : { writePermissions }),
     evaluators,
     ...(idempotencyStore === undefined ? {} : { idempotencyStore }),
+    ...(parsed.idempotencyKeyMigration === undefined
+      ? {}
+      : { idempotencyKeyMigration: parsed.idempotencyKeyMigration }),
     ...(rateLimitStore === undefined ? {} : { rateLimitStore }),
     ...(audit === undefined ? {} : { audit }),
     ...(parsed.fetch === undefined ? {} : { fetch: parsed.fetch }),
@@ -343,6 +356,7 @@ export function assertSingleTenantConnectorPolicies(
   const currentWritePermissions = policies.writePermissions;
   const currentEvaluators = policies.evaluators;
   const currentIdempotencyStore = policies.idempotencyStore;
+  const currentIdempotencyKeyMigration = policies.idempotencyKeyMigration;
   const currentRateLimitStore = policies.rateLimitStore;
   const currentAudit = policies.audit;
   const currentFetch = policies.fetch;
@@ -352,6 +366,12 @@ export function assertSingleTenantConnectorPolicies(
     'networkEgress',
     currentNetworkEgress,
     baseline.networkEgress,
+  );
+  assertUnchangedSurface(
+    connectorId,
+    'idempotencyKeyMigration',
+    currentIdempotencyKeyMigration,
+    baseline.idempotencyKeyMigration,
   );
   assertUnchangedSurface(
     connectorId,
