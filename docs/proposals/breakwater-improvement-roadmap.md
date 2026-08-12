@@ -1,6 +1,6 @@
 # Proposal: breakwater improvement roadmap
 
-> This document records roadmap decisions and remaining uncommitted work. Phase A, Phase B steps 1 through 3, Phase C steps 1 through 3, and the physical-deployment Slice A are shipped. The [single-tenant physical-isolation decision](single-tenant-physical-isolation.md) supersedes pooled-host assumptions in the historical analysis below. Supported behavior is documented in [Breakwater architecture](../breakwater-architecture.md), [Durable agents](../durable-agents.md), [Policy engine](../policy-engine-design.md), and [Connector interface](../connector-interface.md).
+> This document records roadmap decisions and remaining uncommitted work. Phase A, Phase B steps 1 through 3, Phase C steps 1 through 3, Phase D step 1, and physical-deployment Slices A through E are shipped. The [single-tenant physical-isolation decision](single-tenant-physical-isolation.md) supersedes pooled-host assumptions in the historical analysis below. Supported behavior is documented in [Breakwater architecture](../breakwater-architecture.md), [Durable agents](../durable-agents.md), [Policy engine](../policy-engine-design.md), and [Connector interface](../connector-interface.md).
 
 This document turns the limitations and ownership boundaries described in
 [`breakwater-purpose-and-boundaries.md`](../breakwater-purpose-and-boundaries.md)
@@ -34,7 +34,7 @@ testable, and appropriately placed.
 | **Shipped** | Public documentation aligned with guarded agent hosting | The architecture, durable-agent, deployment, threat-model, operations, starter, and API guides define the supported boundary |
 | **Shipped** | Agent permission authorization without role inheritance | Flowsafe resolves trusted principals through a versioned host policy and enforces all required permissions |
 | **Shipped** | Optional connector invocation permissions | `PermissionManifest.requiredPermissions` is enforced against the trusted principal-permissions projection before dry-run and approval — authorization and approval answer different questions |
-| **P1** | Publish a secure single-deployment policy preset | Durable stores, audit, egress, and permission wiring are otherwise easy to omit |
+| **Shipped** | Secure single-deployment policy preset | `singleTenantConnectorPolicies()` validates durable stores, audit, egress, permission wiring, background policy, and deployment-wide isolation posture |
 | **P1** | Add manifest-conformance tooling and stronger egress posture | Runtime safety depends on honest manifests and use of `runtime.fetch` |
 | **P1** | Close known agent-output enforcement gaps | Structured output and override seams must not silently weaken mandatory policy |
 | **P1** | Introduce stable decision codes and richer audit correlation | Reason strings are not a durable API for alerts, metrics, or incident response |
@@ -422,31 +422,22 @@ Requirements:
 - Re-check on retry when the underlying authorization may have changed, or
   document the snapshot semantics.
 
-### 11. Publish Secure Policy Presets
+### 11. Publish Secure Policy Presets (shipped)
 
-#### Current risk
+#### Shipped implementation
 
-Several important controls remain optional because Breakwater is a reusable processor and connector package. A physical Flowsafe deployment can still omit durable idempotency, a rate-limit store, audit export, permission resolution, or an organization egress policy.
+`singleTenantConnectorPolicies()` builds a frozen connector-policy set for one physically isolated deployment. `createConnector()` revalidates the preset against each manifest and refuses policy replacement or removal after construction.
 
-#### Improvement
+The preset requires:
 
-Publish validated presets or builders:
-
-```ts
-singleTenantConnectorPolicies({ durableStores, audit, egress, permissions, ... })
-```
-
-The preset should require:
-
-- Durable idempotency and rate-limit stores where configured.
+- D1-backed idempotency and rate-limit stores when a manifest declares the matching control.
 - Audit sink configuration or an explicit development-only opt-out.
 - Network-egress policy for connectors that declare hosts.
 - Permission-resolution wiring for permission-declaring connectors.
 - Background-execution policy.
 - No `tenantIsolation()` evaluator or Flowsafe-provided isolation scope, because connector keys are deployment-wide.
 
-Construction should reject contradictory or incomplete configurations before
-the first call.
+Construction rejects contradictory or incomplete configurations before the first call. See [Connector interface](../connector-interface.md#apply-the-physical-deployment-preset) for the supported contract.
 
 ### 12. Improve Manifest Honesty and Egress Assurance
 
@@ -730,7 +721,7 @@ The shipped host deliberately omits a public raw-resume route. It accepts struct
 
 ### Phase D: Connector assurance
 
-1. Publish secure policy presets.
+1. ~~Publish secure policy presets.~~ Shipped as `singleTenantConnectorPolicies()`.
 2. Add connector conformance tests and global-fetch linting.
 3. Generate the manifest/policy coverage report.
 4. Close structured-output policy coverage.

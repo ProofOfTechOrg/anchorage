@@ -577,7 +577,7 @@ Implementing sessions must extend these existing seams instead of replacing them
 
 ### Isolation handoff re-baseline
 
-Slices B through E in [single-tenant physical isolation](single-tenant-physical-isolation.md) were re-read after the substitutions. They remain proposals and keep their order:
+This section records the handoff at package-adoption completion. Slices B through E in [single-tenant physical isolation](single-tenant-physical-isolation.md) remained proposals at that point and kept their order. All four slices subsequently shipped.
 
 - Slice B still owns the maintenance move from cron triggers to Durable Object alarms. This execution preserved the current scheduled handler and trigger semantics.
 - Slice C still owns the durability-authority benchmark. The real Worker/WebSocket/D1 harness adds evidence but does not choose between FlowSafe's runner and Cloudflare Workflows.

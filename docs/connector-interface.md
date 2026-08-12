@@ -171,6 +171,38 @@ interface ConnectorPolicies {
 
 The connector definition binds these values once. `fetch` is the underlying HTTP implementation wrapped by guarded fetch, and is the normal test seam.
 
+### Apply the physical-deployment preset
+
+Use `singleTenantConnectorPolicies()` when one physically isolated deployment serves one organization. Given a D1-compatible `db` and an `AuditLogger` with an external sink, construct the shared policy set once:
+
+```typescript
+import {
+  D1IdempotencyStore,
+  D1RateLimitStore,
+  singleTenantConnectorPolicies,
+} from '@proofoftech/breakwater/connector-sdk';
+
+const policies = singleTenantConnectorPolicies({
+  durableStores: {
+    idempotency: new D1IdempotencyStore(db),
+    rateLimit: new D1RateLimitStore(db),
+  },
+  audit: { mode: 'production', logger: audit },
+  egress: { allowedDomains: ['api.example.com'] },
+  permissions: { principalPermissions: 'configured' },
+});
+```
+
+Pass `policies` to every connector in the deployment. The preset enforces these construction-time invariants:
+
+- A manifest that declares idempotency or a rate limit has the matching D1-backed store.
+- Production mode has an external audit sink. Only development mode can explicitly opt out of audit.
+- Every declared egress host fits the organization allowlist.
+- A permission-declaring connector runs only when the host declares principal-permission projection wiring.
+- `backgroundExecution()` is installed once, destructive approval cannot be weakened, and `tenantIsolation()` is rejected because connector keys are deployment-wide.
+
+The returned policy set is frozen. `createConnector()` rejects copied, mutated, or replaced preset members instead of accepting a weakened configuration.
+
 ## Execution order
 
 ```text
