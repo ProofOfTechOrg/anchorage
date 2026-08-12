@@ -1,7 +1,7 @@
 {
   "name": "anchorage-fleet-control",
   "version": "0.0.4",
-  "private": true,
+  "private": false,
   "description": "Security-critical fleet provisioning for physically isolated Anchorage deployments",
   "type": "module",
   "main": "./dist/index.js",
@@ -49,5 +49,8 @@
   "engines": {
     "node": ">=22.22.0"
   },
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  }
 }
