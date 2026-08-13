@@ -1,5 +1,31 @@
 # @proofoftech/flowsafe
 
+## 0.15.0
+
+### Minor Changes
+
+- 34e8ae0: Require host-provided Wrangler `>=4.118 <5` without installing it as a Flowsafe peer. Hosts that use `flowsafe-provision` must now install a compatible Wrangler version directly.
+
+  Fleet Control now supports an explicit Wrangler command, creates D1 databases through Wrangler 4's current output contract, and revokes plain-Worker credentials through the Workers API without creating untracked Worker versions.
+
+  Custom `PlainWorkerRouteApi` implementations must add `deleteControlSecrets(scriptName, secretNames, fence)`. Implement it with the Workers script-secret DELETE API, treat an HTTP 404 as already deleted, and retain a final authoritative secret-list check.
+
+### Patch Changes
+
+- 2c097d8: Stop treating an RPC binding as the deployment database.
+
+  `isDatabaseBinding` accepted any binding whose `prepare` was a function. A
+  service binding with a named `entrypoint`, and a Durable Object stub, are
+  proxies that answer every property with a callable, so the deployment-sentinel
+  scan adopted them as databases and the request failed with `The RPC receiver
+does not implement the method "prepare"`.
+
+  Any Worker holding both a `DB` binding and an RPC binding was affected. Fleet
+  control's trusted state scripts are exactly that shape — `DB` beside
+  `OUTBOUND_PROXY` bound to the shared outbound Worker's `StateEgress`
+  entrypoint — so they failed on the first Durable Object request they served.
+  Fetcher-shaped bindings are now excluded; `D1Database` has no `fetch`.
+
 ## 0.14.0
 
 ### Minor Changes
