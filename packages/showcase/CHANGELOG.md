@@ -1,5 +1,13 @@
 # showcase
 
+## 0.0.16
+
+### Patch Changes
+
+- Updated dependencies [2c097d8]
+- Updated dependencies [34e8ae0]
+  - @proofoftech/flowsafe@0.15.0
+
 ## 0.0.15
 
 ### Patch Changes
