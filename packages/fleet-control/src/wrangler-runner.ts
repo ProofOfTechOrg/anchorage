@@ -16,6 +16,8 @@ export interface CommandRunner {
   ): Promise<CommandResult>;
 }
 
+const DEFAULT_WRANGLER_COMMAND = ['pnpm', 'exec', 'wrangler'] as const;
+
 export function assertWranglerCommandPlatform(platform: NodeJS.Platform): void {
   if (platform === 'win32') {
     throw new Error(
@@ -26,11 +28,13 @@ export function assertWranglerCommandPlatform(platform: NodeJS.Platform): void {
 
 export class WranglerCommandRunner implements CommandRunner {
   readonly #environment: NodeJS.ProcessEnv;
+  readonly #wranglerCommand: readonly [string, ...string[]];
   readonly maxDurationMs: number;
 
   constructor(options: {
     readonly apiToken: string;
     readonly accountId: string;
+    readonly wranglerCommand?: readonly string[];
     /** Must remain below the fleet lease TTL so a command cannot outlive ownership. */
     readonly timeoutMs?: number;
   }) {
@@ -43,6 +47,9 @@ export class WranglerCommandRunner implements CommandRunner {
       CLOUDFLARE_ACCOUNT_ID: options.accountId,
       CLOUDFLARE_API_TOKEN: options.apiToken,
     };
+    this.#wranglerCommand = validateWranglerCommand(
+      options.wranglerCommand ?? DEFAULT_WRANGLER_COMMAND,
+    );
     this.maxDurationMs = options.timeoutMs ?? 5 * 60_000;
     if (!Number.isSafeInteger(this.maxDurationMs) || this.maxDurationMs < 1) {
       throw new Error('Wrangler timeoutMs must be a positive integer');
@@ -54,7 +61,8 @@ export class WranglerCommandRunner implements CommandRunner {
     options: { readonly input?: string; readonly cwd?: string } = {},
   ): Promise<CommandResult> {
     return new Promise((resolve, reject) => {
-      const child = spawn('pnpm', ['exec', 'wrangler', ...arguments_], {
+      const [executable, ...fixedArguments] = this.#wranglerCommand;
+      const child = spawn(executable, [...fixedArguments, ...arguments_], {
         cwd: options.cwd,
         detached: true,
         env: this.#environment,
@@ -100,6 +108,24 @@ export class WranglerCommandRunner implements CommandRunner {
       child.stdin.end(options.input);
     });
   }
+}
+
+function validateWranglerCommand(
+  command: unknown,
+): readonly [string, ...string[]] {
+  if (!Array.isArray(command) || command.length === 0) {
+    throw new Error(
+      'wranglerCommand must contain an executable and only non-empty string arguments',
+    );
+  }
+  for (const argument of command) {
+    if (typeof argument !== 'string' || argument.length === 0) {
+      throw new Error(
+        'wranglerCommand must contain an executable and only non-empty string arguments',
+      );
+    }
+  }
+  return command.slice() as [string, ...string[]];
 }
 
 function terminateProcessTree(child: ChildProcess): void {

@@ -15,7 +15,10 @@ import {
   validateConformanceConfig,
 } from './credentialed-conformance-config.mjs';
 import {
+  assertCredentialedVersionIdsUnchanged,
   cleanupCredentialedDeployment,
+  credentialedPlainWorkerDurableObjectBindings,
+  credentialedWranglerVersionIds,
   loadCredentialedConformanceArtifacts,
   runCredentialedConformance,
   validateOperationalConformance,
@@ -124,12 +127,17 @@ const {
   validateDeploymentSpec,
   validateExternalPlatformProfile,
   WorkersForPlatformsBackend,
+  WranglerCommandRunner,
+  WranglerLoopBackend,
 } = await import('../dist/index.js');
+const { default: Cloudflare } = await import('cloudflare');
 const { DEPLOYMENT_PLATFORM_VARIABLE_NAMES, liveApplicationTopologyMatches } =
   await import('../dist/application-bindings.js');
-const { externalStateDeploymentSpec } = await import(
-  '../dist/platform-resources.js'
-);
+const {
+  externalStateDeploymentSpec,
+  FLEET_AUDIT_PROXY_CLASS_NAME,
+  FLEET_AUDIT_PROXY_STATE_BINDING,
+} = await import('../dist/platform-resources.js');
 const suffix = Date.now().toString(36);
 const mutationLeaseTtlMs = 15 * 60_000;
 
@@ -270,13 +278,18 @@ validateOperationalConformance({
   canonicalMaintenanceCapabilityPublicKey,
 });
 
+const rateCoordinator = new ProcessLocalCloudflareApiRateCoordinator();
+const exportStore = new FileSystemDatabaseExportStore(config.exportDirectory);
 const client = new CloudflareProvisioningClient({
   accountId,
   apiToken,
   dispatchNamespace: config.dispatchNamespace,
-  rateCoordinator: new ProcessLocalCloudflareApiRateCoordinator(),
-  exportStore: new FileSystemDatabaseExportStore(config.exportDirectory),
+  rateCoordinator,
+  exportStore,
 });
+// This narrow read client sits outside the client's coordinated fetch path.
+// One explicit acquire therefore covers exactly one SDK request, with no retry.
+const cloudflare = new Cloudflare({ apiToken, maxRetries: 0 });
 const backend = new WorkersForPlatformsBackend({
   client,
   hostRoutingKvId: config.hostRoutingKvId,
@@ -291,6 +304,109 @@ const backend = new WorkersForPlatformsBackend({
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+async function listPlainWorkerVersionIds(runner, scriptName) {
+  const result = await runner.run([
+    'versions',
+    'list',
+    '--name',
+    scriptName,
+    '--json',
+  ]);
+  return credentialedWranglerVersionIds(result.stdout);
+}
+
+function trackedPlainWorkerRouteApi(routeApi, tracking) {
+  return new Proxy(routeApi, {
+    get(target, property) {
+      if (property === 'deleteControlSecrets') {
+        return async (...arguments_) => {
+          tracking.controlSecretDeletionStarted = true;
+          return target.deleteControlSecrets(...arguments_);
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
+function trackedPlainWorkerBackend(backend, runner, tracking) {
+  return new Proxy(backend, {
+    get(target, property) {
+      if (property === 'revokeCredentials') {
+        return async (...arguments_) => {
+          const [spec] = arguments_;
+          const before = await listPlainWorkerVersionIds(
+            runner,
+            spec.scriptName,
+          );
+          tracking.beforeRevocation = before;
+          await target.revokeCredentials(...arguments_);
+          tracking.revocationCompleted = true;
+          const after = await listPlainWorkerVersionIds(
+            runner,
+            spec.scriptName,
+          );
+          tracking.afterRevocation = after;
+          assertCredentialedVersionIdsUnchanged(
+            before,
+            after,
+            'during credential revocation',
+          );
+        };
+      }
+      if (property === 'deleteWorker') {
+        return async (...arguments_) => {
+          const [spec] = arguments_;
+          assert(
+            tracking.revocationCompleted && tracking.afterRevocation,
+            'plain Worker deletion began without a completed tracked credential revocation',
+          );
+          const beforeDelete = await listPlainWorkerVersionIds(
+            runner,
+            spec.scriptName,
+          );
+          tracking.beforeWorkerDeletion = beforeDelete;
+          assertCredentialedVersionIdsUnchanged(
+            tracking.afterRevocation,
+            beforeDelete,
+            'after credential revocation and before Worker deletion',
+          );
+          tracking.workerDeletionStarted = true;
+          const result = await target.deleteWorker(...arguments_);
+          tracking.workerDeletionCompleted = true;
+          return result;
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
+function assertPlainWorkerVersionTracking(tracking) {
+  assert(
+    tracking.controlSecretDeletionStarted &&
+      tracking.revocationCompleted &&
+      tracking.workerDeletionStarted &&
+      tracking.workerDeletionCompleted &&
+      tracking.beforeRevocation?.length > 0 &&
+      tracking.afterRevocation?.length > 0 &&
+      tracking.beforeWorkerDeletion?.length > 0,
+    'plain Worker version-churn proof did not observe revocation and deletion with a nonempty version set',
+  );
+  assertCredentialedVersionIdsUnchanged(
+    tracking.beforeRevocation,
+    tracking.afterRevocation,
+    'during credential revocation',
+  );
+  assertCredentialedVersionIdsUnchanged(
+    tracking.afterRevocation,
+    tracking.beforeWorkerDeletion,
+    'after credential revocation and before Worker deletion',
+  );
 }
 
 async function eventually(operation, attempts = 20) {
@@ -1064,6 +1180,190 @@ async function assertSecretPreservingStateUpload(deployment, record) {
   );
 }
 
+async function accountWorkersDevSubdomain() {
+  await rateCoordinator.acquire();
+  const result = await cloudflare.workers.subdomains.get({
+    account_id: accountId,
+  });
+  assert(
+    typeof result.subdomain === 'string' &&
+      /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(result.subdomain),
+    'Cloudflare account returned an invalid Workers subdomain',
+  );
+  return result.subdomain;
+}
+
+function plainWorkerDeploymentSpec(workersDevSubdomain) {
+  const tenantTag = config.tenantTags[0];
+  const scriptName = `conformance-plain-${tenantTag}-${suffix}`;
+  const stateProfile = stateProfiles[0];
+  return {
+    tenantTag,
+    environment: config.environment ?? 'conformance',
+    scriptName,
+    databaseName: scriptName,
+    compatibilityDate: stateProfile.stateWorker.compatibilityDate,
+    compatibilityFlags: stateProfile.stateWorker.compatibilityFlags,
+    mainModule: stateProfile.stateWorker.mainModule,
+    modules: stateProfile.stateWorker.modules,
+    authoredBy: 'platform',
+    schemaVersion: config.schemaVersion,
+    migrations: config.migrations,
+    durableObjectMigrations: stateProfile.stateDurableObjectMigrations,
+    durableObjectBindings: credentialedPlainWorkerDurableObjectBindings(
+      config.durableObjectBindings,
+      stateProfile.stateDurableObjectMigrations,
+      {
+        name: FLEET_AUDIT_PROXY_STATE_BINDING,
+        className: FLEET_AUDIT_PROXY_CLASS_NAME,
+      },
+    ),
+    maintenanceBaseUrl: `https://${scriptName}.${workersDevSubdomain}.workers.dev`,
+    routeHostname: config.routeHostnames[tenantTag],
+    cpuLimitMs: config.cpuLimitMs,
+    subrequestLimit: config.subrequestLimit,
+  };
+}
+
+async function deleteAttestedPlainWorkerAfterCredentialMutation(
+  deployment,
+  spec,
+  plainBackend,
+) {
+  await deployment.store.withDeploymentLease(
+    spec.tenantTag,
+    spec.environment,
+    async (fence) => {
+      const record = await deployment.store.get(
+        spec.tenantTag,
+        spec.environment,
+      );
+      assert(
+        record &&
+          record.backend === 'plain-worker' &&
+          record.tenantTag === spec.tenantTag &&
+          record.environment === spec.environment &&
+          record.scriptName === spec.scriptName &&
+          record.databaseName === spec.databaseName &&
+          typeof record.databaseId === 'string' &&
+          record.databaseId.length > 0 &&
+          record.desiredSpecDigest === deploymentSpecDigest(spec),
+        `credentialed cleanup refuses to delete unowned plain Worker '${spec.scriptName}'`,
+      );
+      await plainBackend.deleteWorker(
+        spec,
+        undefined,
+        {
+          id: record.databaseId,
+          name: record.databaseName,
+          created: false,
+        },
+        undefined,
+        fence,
+      );
+    },
+  );
+}
+
+async function provePlainWorkerSecretRevocationNoVersionChurn() {
+  const spec = plainWorkerDeploymentSpec(await accountWorkersDevSubdomain());
+  const secrets = generateDeploymentSecrets();
+  validateDeploymentSpec(spec);
+  validateDeploymentSecrets(spec, secrets);
+
+  const deployment = {
+    initialSpec: spec,
+    nextSpec: spec,
+    currentSpec: spec,
+    secrets,
+    store: new MemoryStore(),
+  };
+  const tracking = {
+    controlSecretDeletionStarted: false,
+    revocationCompleted: false,
+    workerDeletionStarted: false,
+    workerDeletionCompleted: false,
+  };
+  const runner = new WranglerCommandRunner({ apiToken, accountId });
+  const plainBackend = new WranglerLoopBackend({
+    runner,
+    routeApi: trackedPlainWorkerRouteApi(client, tracking),
+    exportDirectory: config.exportDirectory,
+    exportStore,
+  });
+  const trackedBackend = trackedPlainWorkerBackend(
+    plainBackend,
+    runner,
+    tracking,
+  );
+
+  let conformanceError;
+  try {
+    const provisioned = await provisionDeployment({
+      backend: trackedBackend,
+      store: deployment.store,
+      spec,
+      secrets,
+    });
+    assert(
+      provisioned.record.phase === 'ready',
+      'plain Worker did not reach ready before decommission',
+    );
+    const decommissioned = await decommissionDeployment({
+      backend: trackedBackend,
+      store: deployment.store,
+      spec,
+    });
+    assert(
+      decommissioned.record.phase === 'decommissioned',
+      'plain Worker did not reach its terminal decommissioned phase',
+    );
+    assertPlainWorkerVersionTracking(tracking);
+  } catch (error) {
+    conformanceError = error;
+  }
+
+  const cleanupErrors = [];
+  if (
+    conformanceError !== undefined &&
+    tracking.controlSecretDeletionStarted &&
+    !tracking.workerDeletionCompleted
+  ) {
+    try {
+      await deleteAttestedPlainWorkerAfterCredentialMutation(
+        deployment,
+        spec,
+        plainBackend,
+      );
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  try {
+    await cleanupCredentialedDeployment(deployment, {
+      backend: plainBackend,
+      deploymentSpecDigest,
+      decommissionDeployment,
+      cleanupDeploymentArtifacts,
+    });
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  if (conformanceError !== undefined && cleanupErrors.length > 0) {
+    throw new AggregateError(
+      [conformanceError, ...cleanupErrors],
+      'plain Worker version-churn conformance and cleanup failed',
+    );
+  }
+  if (conformanceError !== undefined) throw conformanceError;
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(
+      cleanupErrors,
+      'plain Worker version-churn cleanup failed',
+    );
+  }
+}
+
 async function provisionV1(deployment) {
   deployment.v1Result = await provisionDeployment({
     backend,
@@ -1335,6 +1635,7 @@ const result = await runCredentialedConformance(
     rollback,
     proveNonemptyDecommission,
     decommission,
+    provePlainWorkerSecretRevocationNoVersionChurn,
     assertZeroResiduals,
     cleanup,
   },

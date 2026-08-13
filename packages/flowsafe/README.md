@@ -28,7 +28,7 @@ Compatibility:
 - `@mastra/core` in the declared `^1.50.0` peer range
 - `react` and `react-dom` `>=18 <20` (React 18 or 19) for the optional approval UI
 - `@proofoftech/breakwater` `>=0.9.0 <1.0.0` when used
-- `wrangler` `>=4 <5` for the optional `flowsafe-provision` CLI
+- host-provided Wrangler `>=4.118 <5` for the optional `flowsafe-provision` CLI
 
 ## Choose an export
 
@@ -210,10 +210,10 @@ Provisioning writes the same stable tag to the `DEPLOYMENT_TENANT` binding and t
 
 Seed the sentinel before application migrations or traffic. First-time provisioning refuses any database that already contains application tables. A missing binding, malformed sentinel schema, non-singleton row set, malformed tag, credential mismatch, or tag mismatch returns `503` at the Worker or prevents Durable Object initialization.
 
-The package ships the `flowsafe-provision` CLI. It resolves Wrangler 4 from the application instead of downloading a CLI at runtime:
+The package ships the `flowsafe-provision` CLI. Wrangler is not a package peer. The CLI resolves a host-provided Wrangler `>=4.118 <5` from the application instead of downloading it at runtime:
 
 ```bash
-npm install --save-dev wrangler@^4
+npm install --save-dev "wrangler@>=4.118 <5"
 npx flowsafe-provision \
   --database <database> \
   --tag <tag> \

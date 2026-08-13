@@ -121,6 +121,11 @@ class FakeRouteApi implements PlainWorkerRouteApi {
         readonly service: string;
       }
     | { readonly operation: 'detach'; readonly domainId: string }
+    | {
+        readonly operation: 'delete-secret';
+        readonly scriptName: string;
+        readonly secretName: string;
+      }
   > = [];
   listCalls = 0;
   scriptPresent = false;
@@ -219,10 +224,17 @@ class FakeRouteApi implements PlainWorkerRouteApi {
   async listOrdinaryWorkerSecretNames(): Promise<readonly string[]> {
     this.secretListReads += 1;
     if (this.secretListError) throw this.secretListError;
-    if (this.secretListReads > 1 && !this.secretRevocationNoop) {
-      this.secretNames.clear();
-    }
     return [...this.secretNames].sort();
+  }
+
+  async deleteControlSecrets(
+    scriptName: string,
+    secretNames: readonly string[],
+  ): Promise<void> {
+    for (const secretName of [...new Set(secretNames)].sort()) {
+      this.calls.push({ operation: 'delete-secret', scriptName, secretName });
+      if (!this.secretRevocationNoop) this.secretNames.delete(secretName);
+    }
   }
 
   async listWorkerDatabaseAttachments(): Promise<
@@ -1084,6 +1096,7 @@ export default {
       async listOrdinaryWorkerSecretNames() {
         return [];
       },
+      async deleteControlSecrets() {},
       async listCustomDomains() {
         reads += 1;
         return reads === 1
@@ -1743,9 +1756,11 @@ export default {
   it('creates a database after core authorization', async () => {
     const missingRunner = new FakeRunner(async (arguments_) => ({
       stdout:
-        arguments_[1] === 'create'
-          ? JSON.stringify({ result: { uuid: 'database-created' } })
-          : '[]',
+        arguments_[1] === 'list'
+          ? JSON.stringify([
+              { uuid: 'database-created', name: deployment.databaseName },
+            ])
+          : '',
       stderr: '',
     }));
     await expect(
@@ -1755,7 +1770,16 @@ export default {
       name: deployment.databaseName,
       created: true,
     });
-    expect(missingRunner.calls.map(operation)).toEqual(['d1 create']);
+    expect(missingRunner.calls.map(operation)).toEqual([
+      'd1 create',
+      'd1 list',
+    ]);
+    expect(missingRunner.calls[0]?.arguments).toEqual([
+      'd1',
+      'create',
+      deployment.databaseName,
+    ]);
+    expect(missingRunner.calls[1]?.arguments).toEqual(['d1', 'list', '--json']);
   });
 
   it('recovers a D1 create committed before Wrangler lost its response', async () => {
@@ -2044,6 +2068,31 @@ export default {
     ).toBe(false);
   });
 
+  it('revokes credentials through the REST route API without spawning Wrangler secret commands', async () => {
+    const routeApi = new FakeRouteApi();
+    const runner = ownedWorkerRunner();
+
+    await expect(
+      revokeDeploymentCredentials(backend(runner, { routeApi })),
+    ).resolves.toBeUndefined();
+
+    expect(routeApi.calls).toEqual([
+      {
+        operation: 'delete-secret',
+        scriptName: deployment.scriptName,
+        secretName: 'DEPLOYMENT_IDENTITY_SECRET',
+      },
+      {
+        operation: 'delete-secret',
+        scriptName: deployment.scriptName,
+        secretName: 'MAINTENANCE_ADMIN_SECRET',
+      },
+    ]);
+    expect(runner.calls.some((call) => call.arguments[0] === 'secret')).toBe(
+      false,
+    );
+  });
+
   it('refuses to advance credential revocation when the provider leaves any ordinary Worker secret', async () => {
     const routeApi = new FakeRouteApi();
     routeApi.secretRevocationNoop = true;
@@ -2054,6 +2103,9 @@ export default {
     ).rejects.toThrow(/failed exact secret revocation/);
     expect(
       runner.calls.filter((call) => call.arguments[0] === 'secret'),
+    ).toHaveLength(0);
+    expect(
+      routeApi.calls.filter((call) => call.operation === 'delete-secret'),
     ).toHaveLength(2);
   });
 
@@ -2132,6 +2184,7 @@ export default {
       async listOrdinaryWorkerSecretNames() {
         return [];
       },
+      async deleteControlSecrets() {},
       async listCustomDomains() {
         return [
           {

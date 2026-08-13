@@ -156,14 +156,14 @@ Read [Connector interface](connector-interface.md) before writing production con
 
 ```bash
 npm install @proofoftech/flowsafe
-npm install --save-dev wrangler@^4
+npm install --save-dev "wrangler@>=4.118 <5"
 ```
 
 Start from [`packages/flowsafe/deploy/`](../packages/flowsafe/deploy/README.md). Copy that directory into your application and preserve its host-kit composition:
 
 1. Choose a stable lowercase deployment tag. Replace the checked-in `replace-me` segment in both the Worker `name` and D1 `database_name`, create that uniquely named D1 database, and put its id in `wrangler.jsonc`. The unique Worker name is also the deployment's Durable Object namespace boundary.
 2. Set `DEPLOYMENT_TENANT` to the same tag. The checked-in invalid placeholder must never reach deployment.
-3. Before application migrations, run `npx flowsafe-provision --database <database> --tag <tag> --remote --config wrangler.jsonc` from your application. The CLI is published with Flowsafe and uses the Wrangler 4 installation in your project.
+3. Before application migrations, run `npx flowsafe-provision --database <database> --tag <tag> --remote --config wrangler.jsonc` from your application. The CLI is published with Flowsafe and uses the host-provided Wrangler `>=4.118 <5` installation in your project. Wrangler is not installed as a Flowsafe peer.
 4. Set distinct `DEPLOYMENT_IDENTITY_SECRET` and `MAINTENANCE_ADMIN_SECRET` values with `wrangler secret put`. Every Worker-to-Durable-Object request requires the first credential. Only the provisioning control plane uses the second.
 5. Register the runner and maintenance Durable Object migrations. Add the hub Durable Object and `STREAM_TICKET_SECRET` when you want live updates.
 6. Replace the example workflow, but keep `approvalGrantProvider()` in `init()`.

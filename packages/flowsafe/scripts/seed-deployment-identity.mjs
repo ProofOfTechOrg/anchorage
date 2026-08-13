@@ -85,7 +85,7 @@ function wranglerEntrypoint() {
     packagePath = consumerRequire.resolve('wrangler/package.json');
   } catch (cause) {
     throw new Error(
-      'flowsafe-provision requires Wrangler 4 installed in the current project',
+      'flowsafe-provision requires Wrangler >=4.118 <5 installed in the current project',
       { cause },
     );
   }
@@ -100,9 +100,17 @@ function wranglerEntrypoint() {
     );
   }
   const version = manifest.version;
-  if (typeof version !== 'string' || !/^4\./.test(version)) {
+  const parsedVersion =
+    typeof version === 'string'
+      ? /^(\d+)\.(\d+)\.(\d+)$/.exec(version)
+      : undefined;
+  if (
+    !parsedVersion ||
+    Number(parsedVersion[1]) !== 4 ||
+    Number(parsedVersion[2]) < 118
+  ) {
     throw new Error(
-      `flowsafe-provision requires Wrangler major 4; found ${typeof version === 'string' ? version : 'an invalid version'}`,
+      `flowsafe-provision requires Wrangler >=4.118 <5; found ${typeof version === 'string' ? version : 'an invalid version'}`,
     );
   }
   const relativeBin =
