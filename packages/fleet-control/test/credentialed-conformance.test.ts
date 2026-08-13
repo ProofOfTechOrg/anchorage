@@ -10,13 +10,18 @@ import {
 } from '../scripts/credentialed-conformance-config.mjs';
 import type { CredentialedConformanceDependencies } from '../scripts/credentialed-conformance-runtime.mjs';
 import {
+  assertCredentialedVersionIdsUnchanged,
   cleanupCredentialedDeployment,
+  credentialedPlainWorkerDurableObjectBindings,
+  credentialedWranglerVersionIds,
   loadCredentialedConformanceArtifacts,
   runCredentialedConformance,
   validateOperationalConformance,
 } from '../scripts/credentialed-conformance-runtime.mjs';
 import {
   canonicalMaintenanceCapabilityPublicKey,
+  FLEET_AUDIT_PROXY_CLASS_NAME,
+  FLEET_AUDIT_PROXY_STATE_BINDING,
   validateExternalPlatformProfile,
 } from '../src/platform-resources.js';
 import type {
@@ -28,6 +33,7 @@ import {
   validateDeploymentSecrets,
   validateDeploymentSpec,
 } from '../src/validation.js';
+import { plainWorkerIngressModule } from '../src/wrangler-loop-backend.js';
 
 const REQUIRED_ENVIRONMENT_VARIABLES = [
   'FLEET_CONFORMANCE_CONFIG',
@@ -503,6 +509,106 @@ describe('credentialed conformance command', () => {
     expect(() => runOperationalValidation(operationalFixture())).not.toThrow();
   });
 
+  it('compares nonempty exact Wrangler version-ID sets across secret revocation', () => {
+    expect(
+      credentialedWranglerVersionIds(
+        JSON.stringify({
+          result: [{ id: 'version-b' }, { version_id: 'version-a' }],
+        }),
+      ),
+    ).toEqual(['version-a', 'version-b']);
+    expect(() =>
+      assertCredentialedVersionIdsUnchanged(
+        ['version-b', 'version-a'],
+        ['version-a', 'version-b'],
+        'during credential revocation',
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertCredentialedVersionIdsUnchanged(
+        ['version-a'],
+        ['version-a', 'version-b'],
+        'during credential revocation',
+      ),
+    ).toThrow(/version IDs changed during credential revocation/u);
+    for (const output of [
+      JSON.stringify([]),
+      JSON.stringify([{ id: 'version-a' }, { id: 'version-a' }]),
+      JSON.stringify([{ id: '' }]),
+    ]) {
+      expect(() => credentialedWranglerVersionIds(output)).toThrow();
+    }
+  });
+
+  it('exports every live trusted-state migration class from the plain Worker entrypoint', () => {
+    const durableObjectMigrations = [
+      {
+        tag: 'v1',
+        newSqliteClasses: ['Maintenance', 'FlowsafeFleetAuditProxy'],
+      },
+    ];
+    const durableObjectBindings = credentialedPlainWorkerDurableObjectBindings(
+      [{ name: 'MAINTENANCE', className: 'Maintenance' }],
+      durableObjectMigrations,
+      {
+        name: FLEET_AUDIT_PROXY_STATE_BINDING,
+        className: FLEET_AUDIT_PROXY_CLASS_NAME,
+      },
+    );
+    const spec: DeploymentSpec = {
+      tenantTag: 'tenanta',
+      environment: 'conformance',
+      scriptName: 'plain-conformance',
+      databaseName: 'plain-conformance',
+      compatibilityDate: '2026-08-11',
+      mainModule: 'state.js',
+      modules: [{ name: 'state.js', content: 'export default {}' }],
+      authoredBy: 'platform',
+      schemaVersion: 1,
+      migrations: [],
+      durableObjectMigrations,
+      durableObjectBindings,
+      maintenanceBaseUrl: 'https://plain-conformance.workers.dev',
+      routeHostname: 'plain-conformance.example.test',
+    };
+
+    expect(durableObjectBindings).toEqual([
+      { name: 'MAINTENANCE', className: 'Maintenance' },
+      {
+        name: 'FLEET_AUDIT_PROXY_OBJECT',
+        className: 'FlowsafeFleetAuditProxy',
+      },
+    ]);
+    expect(plainWorkerIngressModule(spec).content).toContain(
+      'export { FlowsafeFleetAuditProxy, Maintenance } from "./state.js";',
+    );
+    expect(() =>
+      credentialedPlainWorkerDurableObjectBindings(
+        [],
+        [
+          {
+            tag: 'v1',
+            newSqliteClasses: ['UnknownStateClass'],
+          },
+        ],
+        {
+          name: FLEET_AUDIT_PROXY_STATE_BINDING,
+          className: FLEET_AUDIT_PROXY_CLASS_NAME,
+        },
+      ),
+    ).toThrow(/missing \[UnknownStateClass\]/u);
+  });
+
+  it('pins live-only plain-lane request and recovery invariants', () => {
+    const source = readFileSync(scriptPath, 'utf8');
+    expect(source).toContain(
+      'const cloudflare = new Cloudflare({ apiToken, maxRetries: 0 });',
+    );
+    expect(source).toMatch(
+      /deployment\.store\.withDeploymentLease\(\s*spec\.tenantTag,\s*spec\.environment,\s*async \(fence\)/u,
+    );
+  });
+
   it('runs every mandatory probe in release order and returns only asserted truth', async () => {
     const deployments = [{ id: 'a' }, { id: 'b' }];
     const calls: string[] = [];
@@ -524,6 +630,9 @@ describe('credentialed conformance command', () => {
         rollback: operation('rollback'),
         proveNonemptyDecommission: operation('nonempty-refusal'),
         decommission: operation('decommission'),
+        provePlainWorkerSecretRevocationNoVersionChurn: operation(
+          'plain-worker-no-version-churn',
+        ),
         assertZeroResiduals: operation('zero-residuals'),
         cleanup: operation('cleanup'),
       },
@@ -546,11 +655,13 @@ describe('credentialed conformance command', () => {
       'nonempty-refusal:a',
       'decommission:a',
       'decommission:b',
+      'plain-worker-no-version-churn',
       'zero-residuals',
       'cleanup:a',
       'cleanup:b',
     ]);
     expect(Object.values(result).every((value) => value === true)).toBe(true);
+    expect(result.plainWorkerSecretRevocationNoVersionChurn).toBe(true);
   });
 
   it('cannot return success after a mandatory failure and still cleans both deployments', async () => {
@@ -574,6 +685,7 @@ describe('credentialed conformance command', () => {
           rollback: success,
           proveNonemptyDecommission: success,
           decommission: success,
+          provePlainWorkerSecretRevocationNoVersionChurn: success,
           assertZeroResiduals: success,
           cleanup: async (deployment: { id: string }) => {
             calls.push(`cleanup:${deployment.id}`);
@@ -584,7 +696,10 @@ describe('credentialed conformance command', () => {
     expect(calls).toEqual(['migrate:a', 'cleanup:a', 'cleanup:b']);
   });
 
-  it('rejects a skipped mandatory operation before running any probe', async () => {
+  it.each([
+    'completeFlowSafe',
+    'provePlainWorkerSecretRevocationNoVersionChurn',
+  ] as const)('rejects a skipped mandatory %s operation before running any probe', async (missingOperation) => {
     const calls: string[] = [];
     const dependencies = Object.fromEntries(
       [
@@ -598,11 +713,12 @@ describe('credentialed conformance command', () => {
         'rollback',
         'proveNonemptyDecommission',
         'decommission',
+        'provePlainWorkerSecretRevocationNoVersionChurn',
         'assertZeroResiduals',
         'cleanup',
       ].map((name) => [name, async () => calls.push(name)]),
     );
-    delete dependencies.completeFlowSafe;
+    delete dependencies[missingOperation];
     await expect(
       runCredentialedConformance(
         { deployments: [{ id: 'a' }, { id: 'b' }] },
@@ -610,7 +726,7 @@ describe('credentialed conformance command', () => {
           id: string;
         }>,
       ),
-    ).rejects.toThrow(/requires completeFlowSafe/);
+    ).rejects.toThrow(new RegExp(`requires ${missingOperation}`, 'u'));
     expect(calls).toEqual([]);
   });
 

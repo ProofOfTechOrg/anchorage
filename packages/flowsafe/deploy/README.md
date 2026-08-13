@@ -34,7 +34,7 @@ pnpm --dir packages/flowsafe exec wrangler secret put \
   --config deploy/wrangler.jsonc
 ```
 
-These commands run from the Anchorage repository checkout. Applications that install `@proofoftech/flowsafe` can run the published binary as `pnpm exec flowsafe-provision` or `npx flowsafe-provision`; it uses the application's Wrangler 4 installation.
+These commands run from the Anchorage repository checkout. Applications that install `@proofoftech/flowsafe` can run the published binary as `pnpm exec flowsafe-provision` or `npx flowsafe-provision`; it uses the application's host-provided Wrangler `>=4.118 <5` installation.
 
 Provisioning verifies the exact sentinel schema and singleton row. It is idempotent for the same tag, refuses to re-stamp a database owned by another deployment, and refuses to adopt an unowned database that already contains any application table. Do not expose provisioning as a public route or overwrite a mismatched sentinel. Recreate the resource set instead. Library hosts can call `seedDeploymentIdentity(db, tag)` from an equivalent trusted provisioning process.
 

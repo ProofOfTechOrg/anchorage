@@ -3,8 +3,30 @@
 import type {
   DeploymentSecrets,
   DeploymentSpec,
+  DurableObjectMigration,
   ExternalPlatformProfile,
 } from '../src/types.js';
+
+interface CredentialedDurableObjectBinding {
+  readonly name: string;
+  readonly className: string;
+}
+
+export function credentialedWranglerVersionIds(
+  stdout: string,
+): readonly string[];
+
+export function assertCredentialedVersionIdsUnchanged(
+  before: readonly string[],
+  after: readonly string[],
+  boundary: string,
+): void;
+
+export function credentialedPlainWorkerDurableObjectBindings(
+  configuredBindings: readonly CredentialedDurableObjectBinding[],
+  migrations: readonly DurableObjectMigration[],
+  auditProxyBinding: CredentialedDurableObjectBinding,
+): readonly CredentialedDurableObjectBinding[];
 
 export interface OperationalConformancePlan {
   readonly initialSpec: DeploymentSpec;
@@ -118,6 +140,7 @@ export interface CredentialedConformanceDependencies<T> {
   readonly rollback: (deployment: T) => unknown;
   readonly proveNonemptyDecommission: (deployment: T) => unknown;
   readonly decommission: (deployment: T) => unknown;
+  readonly provePlainWorkerSecretRevocationNoVersionChurn: () => unknown;
   readonly assertZeroResiduals: () => unknown;
   readonly cleanup: (deployment: T) => unknown;
 }

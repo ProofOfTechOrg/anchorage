@@ -20,6 +20,18 @@ The package is ESM only and requires Node `>=22.22.0`. It depends on `@proofofte
 
 That dependency is pinned to one exact FlowSafe release, deliberately. If you also depend on FlowSafe directly, pin it to the same release rather than letting a range resolve a second copy: FlowSafe's Durable Object classes are nominal and its maintenance receipt audience is fixed on both the minting and verifying side, so two copies fail closed at the maintenance boundary with no local signal.
 
+Hosts that use `WranglerLoopBackend` must provide Wrangler `>=4.118 <5`. `WranglerCommandRunner` defaults to `['pnpm', 'exec', 'wrangler']`. Pass `wranglerCommand` to select an explicit executable or wrapper and any fixed arguments:
+
+```typescript
+const runner = new WranglerCommandRunner({
+  apiToken,
+  accountId,
+  wranglerCommand: ['/opt/cloudflare/wrangler'],
+});
+```
+
+Fleet Control does not install a runtime Wrangler dependency. Keep the selected command under the trusted host's control.
+
 ## Entry points
 
 | Export | Contents |
@@ -54,6 +66,8 @@ Supply separate bundles for the external candidate and both trusted state versio
 The first trusted state profile owns the original FlowSafe Durable Object classes. The second profile repeats that migration history exactly, appends a migration for `conformance.newDurableObjectBinding`, and exports the new class. Both state artifacts must support `state-marker-put`, `state-marker-get`, `state-new-class`, and the state-egress actions through candidate bindings. External bindings must not select a script, namespace, or egress service.
 
 The gate provisions two scratch deployments and validates the complete external resource group. It performs application variable and secret HMAC challenges, R2 write/read/delete/absence checks, audit ingress, HTTP and state-egress allow/deny probes, a WebSocket nonce echo, CPU limit and recovery checks, and a FlowSafe approval suspended across the v1 to v2 release update. It also proves that a nonempty R2 bucket blocks decommission before traffic or credentials change. Only the candidate can delete that fixture before the successful retry.
+
+After both namespace deployments reach terminal decommission, the gate reuses the first released route for one platform-authored plain Worker driven by `WranglerCommandRunner` and `WranglerLoopBackend`. The host must provide Wrangler `>=4.118 <5`. The gate records a nonempty exact version-ID set before credential revocation, proves the set is unchanged after revocation and immediately before Worker deletion, and then requires terminal cleanup. If the assertion fails after the owned Worker's control-secret mutation begins, failure cleanup uses the backend's live identity and footprint attestation to delete that exact uniquely named Worker before resuming normal artifact cleanup, so the regression cannot wedge the scratch account.
 
 Set `FLEET_CONFORMANCE_CONFIG`, `CLOUDFLARE_API_TOKEN`,
 `CLOUDFLARE_ACCOUNT_ID`, and the fleet-private Ed25519 signing JWK in
