@@ -6,8 +6,11 @@
   "type": "module",
   "scripts": {
     "build": "wrangler deploy --dry-run --outdir dist",
+    "build:conformance": "node scripts/build-conformance.mjs",
     "check": "pnpm run test && pnpm run typecheck",
     "check:imports": "pnpm -w run architecture:check:agent-starter",
+    "conformance:config": "node scripts/emit-conformance-config.mjs",
+    "conformance:verify": "node scripts/build-conformance.mjs && node scripts/conformance-verify.mjs",
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
     "test": "pnpm run check:imports && vitest run",

@@ -4,19 +4,19 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  createSpikeServerLifecycle,
-  parseSpikePort,
-} from './spike-server-lifecycle.mjs';
+  createWorkerdServerLifecycle,
+  parsePort,
+} from '../../../scripts/workerd-server-lifecycle.mjs';
 
 const FLOWSAFE = dirname(dirname(fileURLToPath(import.meta.url)));
 const WRANGLER = join(FLOWSAFE, 'node_modules/.bin/wrangler');
 const CONFIG = join(FLOWSAFE, 'spike/durability-benchmark.wrangler.jsonc');
-const PORT = parseSpikePort(
+const PORT = parsePort(
   process.env.DURABILITY_BENCHMARK_PORT ?? 8801,
   'DURABILITY_BENCHMARK_PORT',
 );
 const BASE = `http://127.0.0.1:${PORT}`;
-const lifecycle = createSpikeServerLifecycle({ port: PORT });
+const lifecycle = createWorkerdServerLifecycle({ port: PORT });
 const servers = [];
 let currentServer;
 let tempDirectory;

@@ -1,0 +1,79 @@
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  // Build-only configuration. The trusted state artifact is never deployed with
+  // wrangler: fleet control uploads the bundle into the dispatch namespace and
+  // supplies every binding itself (packages/fleet-control/src/cloudflare-client.ts,
+  // uploadNamespacedStateWorker). The bindings below exist so `wrangler
+  // deploy --dry-run` can resolve the module graph and so the local harness has
+  // something to run.
+  "name": "anchorage-conformance-state",
+  "main": "../src/conformance/state-v1.ts",
+  "compatibility_date": "2026-07-08",
+  "compatibility_flags": ["nodejs_compat"],
+  "upload_source_maps": false,
+  "durable_objects": {
+    "bindings": [
+      { "name": "MAINTENANCE", "class_name": "Maintenance" },
+      { "name": "RUNNER", "class_name": "ConformanceRunner" },
+      { "name": "CONFORMANCE_STATE", "class_name": "ConformanceState" },
+      {
+        "name": "FLEET_AUDIT_PROXY_OBJECT",
+        "class_name": "FlowsafeFleetAuditProxy"
+      }
+    ]
+  },
+  // The tag and class list must equal stateProfiles[0] in the operator config;
+  // scripts/conformance-config-check.test.mjs is what keeps them equal.
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "Maintenance",
+        "ConformanceRunner",
+        "ConformanceState",
+        "FlowsafeFleetAuditProxy"
+      ]
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "anchorage-conformance",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  // The backend-owned audit queue. Only the trusted state script holds the
+  // producer; an external candidate reaches it through the audit proxy object.
+  "queues": {
+    "producers": [
+      { "binding": "AUDIT_QUEUE", "queue": "anchorage-conformance-audit" }
+    ]
+  },
+  // Local harness wiring: fleet control supplies this binding in production
+  // (uploadNamespacedStateWorker), pointing at the one shared outbound Worker.
+  "services": [
+    {
+      "binding": "OUTBOUND_PROXY",
+      "service": "anchorage-conformance-outbound",
+      "entrypoint": "StateEgress"
+    }
+  ],
+  "vars": {
+    // LOCAL HARNESS FIXTURES. These are wrangler `vars` rather than secrets
+    // because this configuration is never deployed: fleet control installs the
+    // real values as secret_text on upload. Never real credentials.
+    "DEPLOYMENT_IDENTITY_SECRET": "conformance-local-deployment-identity-secret",
+    "MAINTENANCE_ADMIN_SECRET": "conformance-local-maintenance-admin-secret-00",
+    "OUTBOUND_PROXY_CREDENTIAL": "conformance-local-outbound-proxy-credential",
+    "DEPLOYMENT_TENANT": "tenanta",
+    "FLEET_ENVIRONMENT": "conformance",
+    "FLEET_DEPLOYMENT_SCRIPT": "conformance-tenanta-local",
+    "FLEET_RESOURCE_ROLE": "platform-state",
+    "OUTBOUND_TENANT_ID": "tenanta",
+    "OUTBOUND_ENVIRONMENT": "conformance",
+    "OUTBOUND_RESOURCE_GROUP_ID": "0123456789abcdef0123",
+    "OUTBOUND_STATE_SCRIPT_NAME": "anchorage-conformance-state",
+    "OUTBOUND_ROUTE_HOSTNAME": "tenanta.replace-me.example",
+    "OUTBOUND_POLICY_ID": "0123456789abcdef0123"
+  }
+}

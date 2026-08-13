@@ -117,6 +117,20 @@ jobs:
       - name: Spike verify (workerd suspend/resume)
         run: pnpm --filter @proofoftech/flowsafe spike:verify
 
+      # The Workers for Platforms artifact contract. The paid gate
+      # (pnpm fleet-control:credentialed) needs a scratch account with a
+      # subscription, so these two steps are what stands between a contract
+      # change and finding out on a billed run: the first proves the shipped
+      # operator configuration still satisfies fleet control's own validators
+      # and matches the harness wrangler configs, the second builds all three
+      # artifacts and drives every locally-provable action on real workerd,
+      # including one approval suspended across the v1-to-v2 release update.
+      - name: Verify the conformance operator configuration
+        run: pnpm test:conformance-config
+
+      - name: Conformance artifacts verify (workerd)
+        run: pnpm conformance:verify
+
   # Mastra compat matrix: the libraries pin behavioral contracts to
   # @mastra/core internals (resume-context merge-over semantics, snapshot
   # shape, the reprocess-part key, the six-table inventory). The peer range

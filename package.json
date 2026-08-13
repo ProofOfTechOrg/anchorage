@@ -34,12 +34,14 @@
     "test:packed-flowsafe-agent-host": "pnpm --filter @proofoftech/flowsafe test:agent-host-export",
     "test:packed-flowsafe-provisioning": "pnpm --filter @proofoftech/flowsafe test:provisioning-export",
     "test:release-order": "node --test scripts/publish-ordered.test.mjs",
+    "test:conformance-config": "pnpm --filter @proofoftech/fleet-control build && node --test scripts/conformance-config-check.test.mjs",
     "test:release-invocation": "node scripts/publish-invocation-check.mjs",
     "release:publish": "node scripts/publish-ordered.mjs",
     "react-doctor": "pnpm --filter showcase react-doctor",
     "react-doctor:diff": "pnpm --filter showcase react-doctor:diff",
     "showcase:deploy": "pnpm --filter showcase deploy:cf",
     "spike:verify": "pnpm --filter @proofoftech/flowsafe spike:verify",
+    "conformance:verify": "pnpm --filter anchorage-agent-starter conformance:verify",
     "prepare": "husky"
   },
   "devDependencies": {

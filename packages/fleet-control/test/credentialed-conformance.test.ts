@@ -97,10 +97,10 @@ function operationalFixture(): {
   maintenanceCapabilityPrivateKey: typeof maintenancePrivateKey;
 } {
   const spec: DeploymentSpec = {
-    tenantTag: 'tenant-a',
+    tenantTag: 'tenanta',
     environment: 'conformance',
-    scriptName: 'tenant-a-conformance',
-    databaseName: 'tenant-a-conformance',
+    scriptName: 'tenanta-conformance',
+    databaseName: 'tenanta-conformance',
     compatibilityDate: '2026-08-11',
     mainModule: 'worker.js',
     modules: [{ name: 'worker.js', content: 'export default {}' }],
@@ -109,8 +109,8 @@ function operationalFixture(): {
     migrations: [{ version: 1, sql: 'CREATE TABLE proof (id TEXT)' }],
     durableObjectMigrations: [],
     durableObjectBindings: [],
-    maintenanceBaseUrl: 'https://tenant-a.example.test',
-    routeHostname: 'tenant-a.example.test',
+    maintenanceBaseUrl: 'https://tenanta.example.test',
+    routeHostname: 'tenanta.example.test',
   };
   const profile: ExternalPlatformProfile = {
     runtimeContractVersion: 1,
@@ -139,8 +139,8 @@ function operationalFixture(): {
         secrets,
       },
       {
-        initialSpec: { ...spec, tenantTag: 'tenant-b' },
-        nextSpec: { ...spec, tenantTag: 'tenant-b' },
+        initialSpec: { ...spec, tenantTag: 'tenantb' },
+        nextSpec: { ...spec, tenantTag: 'tenantb' },
         initialProfile: { ...profile },
         nextProfile: { ...profile },
         secrets: { ...secrets },
@@ -180,6 +180,43 @@ describe('credentialed conformance command', () => {
     );
   });
 
+  // The structural validator never looks at tenant-tag SHAPE, so a config can
+  // pass stage one and still be rejected by validateDeploymentSpec in stage two,
+  // after the operator has provisioned a scratch account. The example is what
+  // docs/fleet-control.md tells them to start from, so it has to survive both.
+  it('ships an example whose tenant tags survive production spec validation', () => {
+    const tenantTags = (validConfig.tenantTags as string[]).map(
+      (tenantTag) => ({
+        tenantTag,
+        environment: validConfig.environment as string,
+        scriptName: `conformance-${tenantTag}-abc123`,
+        databaseName: `conformance-${tenantTag}-abc123`,
+        compatibilityDate: validConfig.compatibilityDate as string,
+        mainModule: validConfig.mainModule as string,
+        modules: [
+          {
+            name: validConfig.mainModule as string,
+            content: 'export default {}',
+          },
+        ],
+        authoredBy: 'external' as const,
+        schemaVersion: validConfig.schemaVersion as number,
+        migrations: [],
+        durableObjectMigrations: [],
+        durableObjectBindings: [],
+        maintenanceBaseUrl: (
+          validConfig.maintenanceBaseUrls as Record<string, string>
+        )[tenantTag] as string,
+        routeHostname: (validConfig.routeHostnames as Record<string, string>)[
+          tenantTag
+        ] as string,
+      }),
+    );
+    for (const spec of tenantTags) {
+      expect(() => validateDeploymentSpec(spec)).not.toThrow();
+    }
+  });
+
   it.each([
     'contractVersion',
     'tenantTags',
@@ -196,10 +233,10 @@ describe('credentialed conformance command', () => {
     'migrations',
     'cpuLimitMs',
     'subrequestLimit',
-    'maintenanceBaseUrls.tenant-a',
-    'maintenanceBaseUrls.tenant-b',
-    'routeHostnames.tenant-a',
-    'routeHostnames.tenant-b',
+    'maintenanceBaseUrls.tenanta',
+    'maintenanceBaseUrls.tenantb',
+    'routeHostnames.tenanta',
+    'routeHostnames.tenantb',
     'durableObjectBindings',
     'durableObjectBindings.0.name',
     'durableObjectBindings.0.className',
@@ -457,6 +494,13 @@ describe('credentialed conformance command', () => {
       providerConstructions += 1;
     }).toThrow();
     expect(providerConstructions).toBe(0);
+  });
+
+  // Positive control for the case above: an unmutated fixture must PASS. Without
+  // it a fixture that is itself invalid makes every mutation "reject" for the
+  // wrong reason and the negative suite proves nothing.
+  it('accepts an unmutated operational fixture', () => {
+    expect(() => runOperationalValidation(operationalFixture())).not.toThrow();
   });
 
   it('runs every mandatory probe in release order and returns only asserted truth', async () => {

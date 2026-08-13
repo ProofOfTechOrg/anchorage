@@ -445,6 +445,50 @@ describe('deployment identity runtime guard', () => {
     ).resolves.toBeUndefined();
   });
 
+  it('never adopts an RPC binding as a deployment database', async () => {
+    const db = sqliteDatabase();
+    await seedDeploymentIdentity(db, 'acme');
+    // A service binding with a named entrypoint, and a Durable Object stub, are
+    // proxies that answer EVERY property with a callable. A `prepare`-only test
+    // adopts them, and the sentinel scan then dies with "The RPC receiver does
+    // not implement the method". Fleet trusted state carries exactly this pair.
+    const rpcBinding = new Proxy(
+      {},
+      {
+        get: (_target, property) =>
+          typeof property === 'symbol'
+            ? undefined
+            : () => {
+                throw new Error(
+                  `The RPC receiver does not implement the method "${String(property)}".`,
+                );
+              },
+      },
+    );
+    const env = {
+      DB: db,
+      OUTBOUND_PROXY: rpcBinding,
+      DEPLOYMENT_TENANT: 'acme',
+      DEPLOYMENT_IDENTITY_SECRET,
+    };
+
+    await expect(
+      ensureDeploymentIdentityBindings(env),
+    ).resolves.toBeUndefined();
+    await expect(
+      verifyDurableObjectDeploymentIdentity({ id: { name: 'instance' } }, env),
+    ).resolves.toBe('acme');
+
+    // The positive control: a real second D1 binding is still scanned, so the
+    // exclusion above cannot be over-broad.
+    const secondary = sqliteDatabase();
+    await seedDeploymentIdentity(secondary, 'other');
+    const withSecondDatabase = { ...env, SCHEDULES_DB: secondary };
+    await expect(
+      ensureDeploymentIdentityBindings(withSecondDatabase),
+    ).rejects.toThrow(/belongs to 'other'/);
+  });
+
   it('rejects a Worker request from a differently credentialed deployment', async () => {
     const db = sqliteDatabase();
     await seedDeploymentIdentity(db, 'acme');
