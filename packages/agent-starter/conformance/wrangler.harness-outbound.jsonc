@@ -1,0 +1,16 @@
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  // LOCAL HARNESS ONLY. `scripts/conformance-verify.mjs` runs this beside the
+  // candidate and the trusted state so `createStateEgressFetch` has a
+  // `StateEgress` entrypoint to reach. Never uploaded by the gate.
+  "name": "anchorage-conformance-outbound",
+  "main": "../src/conformance/harness/outbound.ts",
+  "compatibility_date": "2026-07-08",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    // `localhost` and `127.0.0.1` both reach the harness upstream, so one
+    // allowlisted and one absent gives a real hostname policy locally.
+    "ALLOWED_HOSTS": "localhost",
+    "DENIED_STATUS": "403"
+  }
+}

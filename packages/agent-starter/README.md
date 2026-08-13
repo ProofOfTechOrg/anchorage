@@ -355,6 +355,63 @@ pnpm --filter anchorage-agent-starter build
 
 The tests include token verification, a deterministic model smoke, an approval-denial/no-D1-side-effect assertion, and the public-import boundary. For a live proof, run the start, stop, restart, decide, and status sequence above with real model configuration.
 
+## Submit it as a Workers for Platforms artifact
+
+The same code has a second role. `packages/fleet-control` provisions physically isolated deployments through Workers for Platforms, and an externally authored agent reaches customers only as a **candidate** script running beside a platform-owned **trusted state** script. `src/conformance/` builds that pair out of this starter, so "passes the conformance gate" and "is a legal submission" describe one artifact rather than two.
+
+Read [`../../docs/fleet-control.md`](../../docs/fleet-control.md) under "Implement the artifact contract" for the contract itself; it is versioned and it is the authority.
+
+### The two roles
+
+| Role | Built from | Owns Durable Object classes | Receives |
+| --- | --- | --- | --- |
+| External candidate | `src/conformance/candidate.ts` | No — every binding resolves to the trusted state script | Application variables, application secrets, application R2, D1, and remote Durable Object bindings |
+| Trusted state | `src/conformance/state-v1.ts` and `state-v2.ts` | Yes, locally | The outbound proxy service binding, the audit queue producer, and the maintenance secret |
+
+The split is the lesson: an approval must survive its candidate being replaced. The gate starts a FlowSafe run on release one, uploads release two, and only then approves, so anything durable held in candidate isolate memory loses the run. Every durable action here is a Durable Object call into trusted state.
+
+### Build and verify the artifacts
+
+```bash
+pnpm --filter anchorage-agent-starter build:conformance
+pnpm --filter anchorage-agent-starter conformance:verify
+pnpm test:conformance-config
+```
+
+`build:conformance` emits `dist/conformance/{candidate,trusted-state-v1,trusted-state-v2}.mjs` and refuses a bundle that is not one self-contained module, whose exported class set differs from its migrations, or that stops parsing when the gate appends its release-two comment. `conformance:verify` runs it first, so both are one command in CI.
+
+`conformance:verify` runs all three under real workerd and drives the contract in the gate's order, including the release update with one approval suspended across it. Four things it cannot prove — platform CPU termination, platform-layer egress denial, namespace and secret retention across a same-name upload, and decommission refusal on a non-empty bucket — are printed at the end of every run.
+
+`test:conformance-config` validates `conformance/anchorage-starter.conformance.json` with fleet control's own validators — both the structural pass and the production deployment-spec pass — and checks the harness wrangler configurations against the same contract. All three commands run in CI.
+
+### Run the paid gate
+
+Not yet run: it needs a scratch Cloudflare account with a Workers for Platforms subscription. When one exists:
+
+1. `pnpm --filter anchorage-agent-starter build:conformance`.
+2. Copy `conformance/anchorage-starter.conformance.json` and replace the account-specific values, all of which ship as placeholders:
+   - `hostRoutingKvId`
+   - `routeHostnames.tenanta` and `routeHostnames.tenantb`
+   - `maintenanceBaseUrls.tenanta` and `maintenanceBaseUrls.tenantb`
+   - `platformProfile.maintenanceCapabilityPublicKey`
+3. Point `conformance.allowedUpstreamUrl` at an origin that really answers 2xx, set `platformProfile.organizationEgressHosts` to exactly that hostname, and point `deniedUpstreamUrl` at a hostname absent from that list. The placeholder `.example` hosts do not resolve, the gate requires an actual upstream status from both, and stage-one validation rejects a configuration whose allowed hostname is not in `organizationEgressHosts`.
+4. Export `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `FLEET_CONFORMANCE_CONFIG`, `FLEET_MAINTENANCE_CAPABILITY_PRIVATE_JWK`, `FLEET_STATE_EGRESS_ROOT_SECRET`, and `FLEET_CONFORMANCE_APPLICATION_SECRET`. Bundle paths in the configuration resolve from `packages/fleet-control`, which is the runner's working directory.
+5. `pnpm fleet-control:credentialed > proof.json`. The proof goes to standard output; retain it with the release evidence.
+
+Regenerate the configuration with `pnpm --filter anchorage-agent-starter conformance:config` after any change to `src/conformance/contract.json`; that file is the only place binding names, paths, and class names are written.
+
+### Delete it
+
+No non-test module outside `src/conformance/` imports any of it, so the standalone agent host keeps building and deploying unchanged once these are gone:
+
+- `src/conformance/` and `conformance/`
+- `test/conformance-routes.test.ts`, `test/conformance-websocket.test.ts`, `test/conformance-replay.test.ts`
+- `scripts/build-conformance.mjs`, `scripts/emit-conformance-config.mjs`, `scripts/conformance-verify.mjs`
+- the `build:conformance`, `conformance:config`, and `conformance:verify` scripts in this package's `package.json`
+- at the repository root: `scripts/conformance-config-check.test.mjs`, the `test:conformance-config` and `conformance:verify` scripts in `package.json`, and their two CI steps
+
+`scripts/workerd-server-lifecycle.mjs` at the repository root stays: the FlowSafe workerd spike uses it too.
+
 ## Agent host composition
 
 The starter uses only `@proofoftech/flowsafe/agent-host`. The Worker router receives `STARTER_AGENT_META`; each `StarterThread` constructs the complete module from instance-scoped model, storage, runtime, pub/sub, connector, and database objects.

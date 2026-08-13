@@ -1,0 +1,57 @@
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  // Build-only configuration. Fleet control uploads this bundle into the
+  // untrusted dispatch namespace and supplies every binding itself
+  // (packages/fleet-control/src/cloudflare-client.ts, uploadDispatchWorker).
+  // The bindings below exist so `wrangler deploy --dry-run` resolves the module
+  // graph and so the local harness has something to run.
+  "name": "anchorage-conformance-candidate",
+  "main": "../src/conformance/candidate.ts",
+  "compatibility_date": "2026-07-08",
+  "compatibility_flags": ["nodejs_compat"],
+  // The gate appends a trailing line comment to these exact bytes to
+  // manufacture release two, so the bundle must stay a single self-contained
+  // module with nothing after it that matters.
+  "upload_source_maps": false,
+  // Every entry names a class in the trusted state script: an external
+  // candidate may not own a Durable Object class.
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CONFORMANCE_STATE",
+        "class_name": "ConformanceState",
+        "script_name": "anchorage-conformance-state"
+      },
+      {
+        "name": "AUDIT_PROXY",
+        "class_name": "FlowsafeFleetAuditProxy",
+        "script_name": "anchorage-conformance-state"
+      }
+    ]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "anchorage-conformance",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "APPLICATION_FILES",
+      "bucket_name": "anchorage-conformance-files"
+    }
+  ],
+  "vars": {
+    // LOCAL HARNESS FIXTURES. These are wrangler `vars` rather than secrets
+    // because this configuration is never deployed: fleet control installs the
+    // real values as secret_text on upload. Never real credentials.
+    // Must stay byte-equal to the trusted state configs: the candidate signs
+    // its Durable Object calls with this and the state verifies with its own.
+    "DEPLOYMENT_IDENTITY_SECRET": "conformance-local-deployment-identity-secret",
+    "APPLICATION_CONFORMANCE_SECRET": "conformance-local-application-secret",
+    "DEPLOYMENT_TENANT": "tenanta",
+    "FLEET_ENVIRONMENT": "conformance",
+    "APPLICATION_MODE": "conformance"
+  }
+}

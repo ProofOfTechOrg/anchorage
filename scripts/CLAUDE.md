@@ -12,3 +12,12 @@ Repository documentation, architecture, and publication checks. Markdown syntax 
 - `publish-ordered.test.mjs` — `node:test` fixtures for publish ordering, the
   publish argv and cwd shape, and the tag line `changesets/action` greps for.
 - `publish-invocation-check.mjs` — dry-runs the real publish command per package.
+- `conformance-config-check.test.mjs` — `node:test` checks that agent-starter's
+  Workers for Platforms operator configuration and harness wrangler configs
+  satisfy fleet control's own validators. Lives here because
+  `.dependency-cruiser.cjs` forbids anything under `packages/` from importing
+  fleet control.
+- `workerd-server-lifecycle.mjs` — the one `wrangler dev` start/stop protocol
+  shared by the FlowSafe spike and the conformance harness.
+- `workerd-server-lifecycle.test.mjs` — its vitest suite, run through the root
+  `vitest.workerd-lifecycle.config.ts` project.

@@ -3,20 +3,21 @@
   "tenantTags": ["tenanta", "tenantb"],
   "environment": "conformance",
   "dispatchNamespace": "anchorage-conformance",
-  "hostRoutingKvId": "replace-with-scratch-kv-namespace-id",
+  "hostRoutingKvId": "REPLACE_WITH_SCRATCH_KV_NAMESPACE_ID",
   "sharedOutboundWorkerName": "anchorage-conformance-outbound",
   "auditQueueName": "anchorage-conformance-audit",
   "maintenanceBaseUrls": {
-    "tenanta": "https://control-a.example.test",
-    "tenantb": "https://control-b.example.test"
+    "tenanta": "https://control-tenanta.replace-me.example",
+    "tenantb": "https://control-tenantb.replace-me.example"
   },
   "routeHostnames": {
-    "tenanta": "tenanta.example.test",
-    "tenantb": "tenantb.example.test"
+    "tenanta": "tenanta.replace-me.example",
+    "tenantb": "tenantb.replace-me.example"
   },
-  "workerBundle": "./artifacts/external-candidate.mjs",
+  "workerBundle": "../agent-starter/dist/conformance/candidate.mjs",
   "mainModule": "worker.js",
-  "compatibilityDate": "2026-08-11",
+  "compatibilityDate": "2026-07-08",
+  "compatibilityFlags": ["nodejs_compat"],
   "schemaVersion": 0,
   "migrations": [],
   "cpuLimitMs": 50,
@@ -25,19 +26,37 @@
     {
       "name": "MAINTENANCE",
       "className": "Maintenance"
+    },
+    {
+      "name": "RUNNER",
+      "className": "ConformanceRunner"
+    },
+    {
+      "name": "CONFORMANCE_STATE",
+      "className": "ConformanceState"
     }
   ],
   "application": {
-    "vars": [{ "name": "APPLICATION_MODE", "value": "conformance" }],
+    "vars": [
+      {
+        "name": "APPLICATION_MODE",
+        "value": "conformance"
+      }
+    ],
     "secrets": [],
-    "r2Buckets": [{ "name": "APPLICATION_FILES", "jurisdiction": "default" }]
+    "r2Buckets": [
+      {
+        "name": "APPLICATION_FILES",
+        "jurisdiction": "default"
+      }
+    ]
   },
   "applicationSecretBinding": "APPLICATION_CONFORMANCE_SECRET",
   "conformance": {
     "httpPath": "/.well-known/anchorage/conformance/v1/actions",
     "webSocketPath": "/.well-known/anchorage/conformance/v1/websocket",
-    "allowedUpstreamUrl": "https://allowed-upstream.example.test/probe",
-    "deniedUpstreamUrl": "https://denied-upstream.example.test/probe",
+    "allowedUpstreamUrl": "https://allowed-upstream.replace-me.example/probe",
+    "deniedUpstreamUrl": "https://denied-upstream.replace-me.example/probe",
     "deniedUpstreamStatus": 403,
     "cpuOverLimitStatus": 500,
     "applicationVariableName": "APPLICATION_MODE",
@@ -55,28 +74,40 @@
       {
         "name": "v1",
         "stateWorker": {
-          "bundle": "./artifacts/trusted-state-v1.mjs",
+          "bundle": "../agent-starter/dist/conformance/trusted-state-v1.mjs",
           "mainModule": "state.js",
-          "compatibilityDate": "2026-08-11"
+          "compatibilityDate": "2026-07-08",
+          "compatibilityFlags": ["nodejs_compat"]
         },
         "stateDurableObjectMigrations": [
           {
             "tag": "v1",
-            "newSqliteClasses": ["Maintenance", "FlowsafeFleetAuditProxy"]
+            "newSqliteClasses": [
+              "Maintenance",
+              "ConformanceRunner",
+              "ConformanceState",
+              "FlowsafeFleetAuditProxy"
+            ]
           }
         ]
       },
       {
         "name": "v2",
         "stateWorker": {
-          "bundle": "./artifacts/trusted-state-v2.mjs",
+          "bundle": "../agent-starter/dist/conformance/trusted-state-v2.mjs",
           "mainModule": "state.js",
-          "compatibilityDate": "2026-08-11"
+          "compatibilityDate": "2026-07-08",
+          "compatibilityFlags": ["nodejs_compat"]
         },
         "stateDurableObjectMigrations": [
           {
             "tag": "v1",
-            "newSqliteClasses": ["Maintenance", "FlowsafeFleetAuditProxy"]
+            "newSqliteClasses": [
+              "Maintenance",
+              "ConformanceRunner",
+              "ConformanceState",
+              "FlowsafeFleetAuditProxy"
+            ]
           },
           {
             "tag": "v2",
@@ -85,7 +116,7 @@
         ]
       }
     ],
-    "organizationEgressHosts": ["allowed-upstream.example.test"]
+    "organizationEgressHosts": ["allowed-upstream.replace-me.example"]
   },
   "exportDirectory": "/tmp/anchorage-conformance-exports"
 }
