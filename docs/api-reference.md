@@ -75,16 +75,17 @@ The agent CLI module can be constructed in another runtime when you inject `Agen
 
 | Peer | Required by |
 | --- | --- |
-| `@mastra/core` | Both packages |
+| `@mastra/core` | breakwater and flowsafe |
 | `@proofoftech/breakwater` | flowsafe `agent-host`, host-kit module types, and grant-protected connector integrations |
 | `react` and `react-dom` | flowsafe approval UI only |
-| `wrangler` `>=4 <5` | flowsafe `flowsafe-provision` CLI only |
 
 Flowsafe does not impose a CSS or design-system dependency. Its default approval views render semantic HTML.
 
+Wrangler is a host tool, not a peer dependency. Hosts that run `flowsafe-provision` or Fleet Control's Wrangler backend must provide Wrangler `>=4.118 <5`.
+
 ## Compatibility policy
 
-Both packages are pre-1.0. Public exported types, documented behavior, and package subpaths are the compatibility surface. Changesets describe each release. A breaking change can occur in a minor version before 1.0 and will be called out in the changelog.
+All three public packages are pre-1.0. Public exported types, documented behavior, and package subpaths are the compatibility surface. Changesets describe each release. A breaking change can occur in a minor version before 1.0 and will be called out in the changelog.
 
 The repository runs a non-blocking canary against the newest Mastra 1.x. The declared peer range, not a passing canary, defines supported compatibility.
 

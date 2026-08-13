@@ -19,6 +19,7 @@ const REQUIRED_OPERATIONS = Object.freeze([
   'rollback',
   'proveNonemptyDecommission',
   'decommission',
+  'provePlainWorkerSecretRevocationNoVersionChurn',
   'assertZeroResiduals',
   'cleanup',
 ]);
@@ -48,6 +49,95 @@ const DECOMMISSIONABLE_PHASES = new Set([
   'database-exported',
   'database-deleting',
 ]);
+
+function canonicalVersionIds(ids, boundary) {
+  if (
+    !Array.isArray(ids) ||
+    ids.length === 0 ||
+    ids.some((id) => typeof id !== 'string' || id.length === 0)
+  ) {
+    throw new Error(`${boundary} has no complete Worker version IDs`);
+  }
+  if (new Set(ids).size !== ids.length) {
+    throw new Error(`${boundary} has duplicate Worker version IDs`);
+  }
+  return Object.freeze([...ids].sort());
+}
+
+export function credentialedWranglerVersionIds(stdout) {
+  let parsed;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (cause) {
+    throw new Error('wrangler versions list returned invalid JSON', { cause });
+  }
+  const versions = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray(parsed?.result)
+      ? parsed.result
+      : parsed?.result
+        ? [parsed.result]
+        : [];
+  return canonicalVersionIds(
+    versions.map((version) => version?.id ?? version?.version_id),
+    'wrangler versions list',
+  );
+}
+
+export function assertCredentialedVersionIdsUnchanged(before, after, boundary) {
+  const expected = canonicalVersionIds(before, `${boundary} before set`);
+  const actual = canonicalVersionIds(after, `${boundary} after set`);
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(
+      `plain Worker version IDs changed ${boundary}: expected [${expected.join(', ')}], received [${actual.join(', ')}]`,
+    );
+  }
+}
+
+export function credentialedPlainWorkerDurableObjectBindings(
+  configuredBindings,
+  migrations,
+  auditProxyBinding,
+) {
+  const liveClasses = new Set();
+  for (const migration of migrations) {
+    for (const className of [
+      ...(migration.newSqliteClasses ?? []),
+      ...(migration.newClasses ?? []),
+    ]) {
+      liveClasses.add(className);
+    }
+    for (const className of migration.deletedClasses ?? []) {
+      liveClasses.delete(className);
+    }
+    for (const rename of migration.renamedClasses ?? []) {
+      liveClasses.delete(rename.from);
+      liveClasses.add(rename.to);
+    }
+  }
+  const bindings = configuredBindings.map((binding) => ({ ...binding }));
+  if (
+    liveClasses.has(auditProxyBinding.className) &&
+    !bindings.some(
+      (binding) => binding.className === auditProxyBinding.className,
+    )
+  ) {
+    bindings.push({ ...auditProxyBinding });
+  }
+  const boundClasses = new Set(bindings.map((binding) => binding.className));
+  const missingClasses = [...liveClasses]
+    .filter((className) => !boundClasses.has(className))
+    .sort();
+  const unprovisionedClasses = [...boundClasses]
+    .filter((className) => !liveClasses.has(className))
+    .sort();
+  if (missingClasses.length > 0 || unprovisionedClasses.length > 0) {
+    throw new Error(
+      `plain Worker Durable Object bindings do not match live migration classes: missing [${missingClasses.join(', ')}], unprovisioned [${unprovisionedClasses.join(', ')}]`,
+    );
+  }
+  return Object.freeze(bindings.map((binding) => Object.freeze(binding)));
+}
 
 export function preflightMaintenanceCapabilityKeyPair(options) {
   let privateKey;
@@ -251,6 +341,7 @@ export async function runCredentialedConformance(config, dependencies) {
     for (const deployment of config.deployments) {
       await dependencies.decommission(deployment);
     }
+    await dependencies.provePlainWorkerSecretRevocationNoVersionChurn();
     await dependencies.assertZeroResiduals();
   } catch (error) {
     conformanceError = error;
@@ -293,6 +384,7 @@ export async function runCredentialedConformance(config, dependencies) {
     webSocketNonceEchoed: true,
     cpuLimitAndRecoveryProbed: true,
     flowSafeApprovalRoundTripProbed: true,
+    plainWorkerSecretRevocationNoVersionChurn: true,
     zeroOrphans: true,
   });
 }

@@ -1,13 +1,16 @@
 {
   "name": "anchorage-agent-starter",
-  "version": "0.0.9",
+  "version": "0.0.10",
   "private": true,
   "description": "Production-shaped Cloudflare Workers starter for durable, approval-gated Anchorage agents",
   "type": "module",
   "scripts": {
     "build": "wrangler deploy --dry-run --outdir dist",
+    "build:conformance": "node scripts/build-conformance.mjs",
     "check": "pnpm run test && pnpm run typecheck",
     "check:imports": "pnpm -w run architecture:check:agent-starter",
+    "conformance:config": "node scripts/emit-conformance-config.mjs",
+    "conformance:verify": "node scripts/build-conformance.mjs && node scripts/conformance-verify.mjs",
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
     "test": "pnpm run check:imports && vitest run",

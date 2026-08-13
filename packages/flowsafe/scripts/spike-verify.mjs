@@ -31,14 +31,14 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SignJWT } from 'jose';
 import {
-  createSpikeServerLifecycle,
-  parseSpikePort,
-} from './spike-server-lifecycle.mjs';
+  createWorkerdServerLifecycle,
+  parsePort,
+} from '../../../scripts/workerd-server-lifecycle.mjs';
 
 const FLOWSAFE = dirname(dirname(fileURLToPath(import.meta.url)));
 const WRANGLER = join(FLOWSAFE, 'node_modules/.bin/wrangler');
 const CONFIG = join(FLOWSAFE, 'spike/wrangler.jsonc');
-const PORT = parseSpikePort(
+const PORT = parsePort(
   process.env.SPIKE_VERIFY_PORT ?? 8799,
   'SPIKE_VERIFY_PORT',
 );
@@ -210,7 +210,7 @@ function executeLocalD1(stateDir, command) {
   });
 }
 
-const serverLifecycle = createSpikeServerLifecycle({ port: PORT });
+const serverLifecycle = createWorkerdServerLifecycle({ port: PORT });
 const portState = () => serverLifecycle.portState();
 
 async function launchServer(generation, stateDir, logPath) {

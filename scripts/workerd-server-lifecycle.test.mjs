@@ -1,10 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
-  createSpikeServerLifecycle,
-  parseLlmSpikeConfig,
-  parseSpikePort,
-} from './spike-server-lifecycle.mjs';
+  createWorkerdServerLifecycle,
+  parsePort,
+} from './workerd-server-lifecycle.mjs';
 
 function operations(overrides = {}) {
   let now = 0;
@@ -35,17 +34,17 @@ function server(overrides = {}) {
   };
 }
 
-describe('spike server lifecycle', () => {
+describe('workerd server lifecycle', () => {
   it('rejects invalid ports', () => {
     for (const value of [0, 65_536, 1.5, Number.NaN, 'abc']) {
-      expect(() => parseSpikePort(value)).toThrow(RangeError);
+      expect(() => parsePort(value)).toThrow(RangeError);
     }
-    expect(parseSpikePort('8799')).toBe(8799);
+    expect(parsePort('8799')).toBe(8799);
   });
 
   it('refuses an occupied port before spawning', async () => {
     const launch = vi.fn(() => server());
-    const lifecycle = createSpikeServerLifecycle({
+    const lifecycle = createWorkerdServerLifecycle({
       port: 8799,
       operations: operations({ portState: async () => 'listening' }),
     });
@@ -54,7 +53,7 @@ describe('spike server lifecycle', () => {
   });
 
   it('fails when the child exits before readiness', async () => {
-    const lifecycle = createSpikeServerLifecycle({
+    const lifecycle = createWorkerdServerLifecycle({
       port: 8799,
       operations: operations({ probeHttp: async () => {} }),
     });
@@ -65,7 +64,7 @@ describe('spike server lifecycle', () => {
 
   it('snapshots descendants before kill and clears only after refusal', async () => {
     const calls = [];
-    const lifecycle = createSpikeServerLifecycle({
+    const lifecycle = createWorkerdServerLifecycle({
       port: 8799,
       operations: operations({
         descendantsOf: (pid) => {
@@ -84,7 +83,7 @@ describe('spike server lifecycle', () => {
 
   it('fails a surviving listener and retains the active server', async () => {
     const killPort = vi.fn();
-    const lifecycle = createSpikeServerLifecycle({
+    const lifecycle = createWorkerdServerLifecycle({
       port: 8799,
       operations: operations({
         portState: async () => 'listening',
@@ -98,7 +97,7 @@ describe('spike server lifecycle', () => {
   });
 
   it('preserves shutdown failure over cleanup failure', async () => {
-    const lifecycle = createSpikeServerLifecycle({
+    const lifecycle = createWorkerdServerLifecycle({
       port: 8799,
       operations: operations({
         portState: async () => 'listening',
@@ -110,43 +109,5 @@ describe('spike server lifecycle', () => {
         throw new Error('cleanup failed');
       }),
     ).rejects.toThrow('still listening');
-  });
-});
-
-describe('LLM spike configuration', () => {
-  it('accepts provider/model, a nonblank key, and HTTP(S) base URLs', () => {
-    expect(
-      parseLlmSpikeConfig({
-        SPIKE_LLM_MODEL_ID: 'openai/gpt-5',
-        SPIKE_LLM_API_KEY: 'secret',
-        SPIKE_LLM_BASE_URL: 'https://example.com/v1',
-      }),
-    ).toEqual({
-      modelId: 'openai/gpt-5',
-      apiKey: 'secret',
-      baseUrl: 'https://example.com/v1',
-    });
-  });
-
-  it('rejects malformed models, blank keys, and non-HTTP base URLs', () => {
-    expect(() =>
-      parseLlmSpikeConfig({
-        SPIKE_LLM_MODEL_ID: 'missing-provider',
-        SPIKE_LLM_API_KEY: 'secret',
-      }),
-    ).toThrow('provider/model');
-    expect(() =>
-      parseLlmSpikeConfig({
-        SPIKE_LLM_MODEL_ID: 'openai/gpt-5',
-        SPIKE_LLM_API_KEY: '   ',
-      }),
-    ).toThrow('non-empty');
-    expect(() =>
-      parseLlmSpikeConfig({
-        SPIKE_LLM_MODEL_ID: 'openai/gpt-5',
-        SPIKE_LLM_API_KEY: 'secret',
-        SPIKE_LLM_BASE_URL: 'file:///tmp/model',
-      }),
-    ).toThrow('HTTP(S)');
   });
 });

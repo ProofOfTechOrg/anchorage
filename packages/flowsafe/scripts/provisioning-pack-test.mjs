@@ -130,7 +130,7 @@ try {
     join(wranglerRoot, 'package.json'),
     JSON.stringify({
       name: 'wrangler',
-      version: '4.107.0',
+      version: '4.118.0',
       type: 'module',
       bin: { wrangler: './bin/wrangler.mjs' },
     }),
@@ -217,6 +217,12 @@ writeFileSync(new URL('./install-script-ran', import.meta.url), 'unexpected');
   const manifest = JSON.parse(
     readFileSync(join(packageRoot, 'package.json'), 'utf8'),
   );
+  if (
+    manifest.peerDependencies?.wrangler !== undefined ||
+    manifest.peerDependenciesMeta?.wrangler !== undefined
+  ) {
+    throw new Error('packed flowsafe package leaks Wrangler as a peer');
+  }
   const relativeBin = manifest.bin?.['flowsafe-provision'];
   if (relativeBin !== './scripts/seed-deployment-identity.mjs') {
     throw new Error('packed package does not expose flowsafe-provision');
@@ -425,7 +431,7 @@ writeFileSync(new URL('./install-script-ran', import.meta.url), 'unexpected');
   if (
     wrongMajor.status !== 1 ||
     !wrongMajor.stderr.includes(
-      'flowsafe-provision requires Wrangler major 4; found 5.0.0',
+      'flowsafe-provision requires Wrangler >=4.118 <5; found 5.0.0',
     )
   ) {
     throw new Error(
@@ -438,7 +444,32 @@ writeFileSync(new URL('./install-script-ran', import.meta.url), 'unexpected');
     wranglerManifestPath,
     JSON.stringify({
       name: 'wrangler',
-      version: '4.107.0',
+      version: '4.117.1',
+      type: 'module',
+      bin: { wrangler: './bin/wrangler.mjs' },
+    }),
+  );
+  const belowMinimum = invokeProvision(consumerRoot, validArgs, {
+    FAKE_WRANGLER_LOG: logPath,
+    FAKE_WRANGLER_STATE: statePath,
+  });
+  if (
+    belowMinimum.status !== 1 ||
+    !belowMinimum.stderr.includes(
+      'flowsafe-provision requires Wrangler >=4.118 <5; found 4.117.1',
+    )
+  ) {
+    throw new Error(
+      `packed provisioning CLI accepted Wrangler below the supported minimum (status=${belowMinimum.status})\n${belowMinimum.stdout}\n${belowMinimum.stderr}`,
+      { cause: belowMinimum.error },
+    );
+  }
+
+  writeFileSync(
+    wranglerManifestPath,
+    JSON.stringify({
+      name: 'wrangler',
+      version: '4.118.0',
       type: 'module',
       bin: { wrangler: './bin/wrangler.mjs' },
     }),

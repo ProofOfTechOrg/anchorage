@@ -103,11 +103,24 @@ export function assertDeploymentIdentitySecret(
 }
 
 function isDatabaseBinding(db: unknown): db is DeploymentIdentityDatabase {
-  return !(
-    (typeof db !== 'object' && typeof db !== 'function') ||
-    db === null ||
-    typeof (db as { prepare?: unknown }).prepare !== 'function'
-  );
+  if ((typeof db !== 'object' && typeof db !== 'function') || db === null) {
+    return false;
+  }
+  const candidate = db as { prepare?: unknown; fetch?: unknown };
+  // An RPC binding — a service binding with a named `entrypoint`, or a Durable
+  // Object stub — is a proxy that answers EVERY property with a callable, so a
+  // bare `typeof binding.prepare === 'function'` test says yes to all of them.
+  // The sentinel pass then calls prepare() on the proxy and the request dies
+  // with "The RPC receiver does not implement the method \"prepare\"".
+  //
+  // Discriminate on `fetch`: every Fetcher-shaped binding has one and
+  // D1Database has none, so this excludes the whole RPC family without naming
+  // any of them. Fleet trusted state is exactly this combination — a `DB`
+  // binding beside `OUTBOUND_PROXY` bound to the shared outbound Worker's
+  // `StateEgress` entrypoint — so without this the deployment sentinel fails
+  // on the first request every such Worker serves.
+  if (typeof candidate.fetch === 'function') return false;
+  return typeof candidate.prepare === 'function';
 }
 
 function databaseBinding(

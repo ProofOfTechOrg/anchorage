@@ -9,6 +9,7 @@ export default defineConfig({
       'packages/*/vitest.config.ts',
       'vitest.*-workers.config.*',
       'vitest.flowsafe-harness.config.ts',
+      'vitest.workerd-lifecycle.config.ts',
     ],
   },
 });

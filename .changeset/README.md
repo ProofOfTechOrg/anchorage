@@ -1,8 +1,8 @@
 # Changesets
 
 Version and changelog management for the publishable packages
-(`@proofoftech/breakwater`, `@proofoftech/flowsafe`; `showcase` is private and
-never publishes).
+(`@proofoftech/breakwater`, `@proofoftech/flowsafe`, and
+`@proofoftech/fleet-control`; `showcase` is private and never publishes).
 
 Every PR that changes published behavior adds a changeset:
 

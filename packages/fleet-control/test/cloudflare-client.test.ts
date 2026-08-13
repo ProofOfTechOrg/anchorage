@@ -573,6 +573,61 @@ describe('CloudflareProvisioningClient', () => {
     expect(listReads).toBe(2);
   });
 
+  it('deletes ordinary Worker secrets through the REST API and accepts an already-missing secret', async () => {
+    const requests: Array<{ readonly method: string; readonly path: string }> =
+      [];
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
+      dispatchNamespace: 'fleet',
+      fetch: async (input, init) => {
+        const url = new URL(
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url,
+        );
+        requests.push({ method: init?.method ?? 'GET', path: url.pathname });
+        if (url.pathname.endsWith('/secrets/ALREADY_GONE')) {
+          return Response.json(
+            {
+              success: false,
+              errors: [{ code: 10090, message: 'secret not found' }],
+              messages: [],
+              result: null,
+            },
+            { status: 404 },
+          );
+        }
+        return envelope({});
+      },
+    });
+
+    await expect(
+      client.deleteControlSecrets(
+        'plain worker',
+        ['PRESENT_SECRET', 'ALREADY_GONE', 'PRESENT_SECRET'],
+        {
+          mutationLeaseTtlMs: 15 * 60_000,
+          assertOwned: async () => {},
+        },
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(requests).toEqual([
+      {
+        method: 'DELETE',
+        path: '/client/v4/accounts/account/workers/scripts/plain%20worker/secrets/ALREADY_GONE',
+      },
+      {
+        method: 'DELETE',
+        path: '/client/v4/accounts/account/workers/scripts/plain%20worker/secrets/PRESENT_SECRET',
+      },
+    ]);
+  });
+
   it('applies the request cap to each SDK HTTP request', async () => {
     vi.useFakeTimers();
     try {

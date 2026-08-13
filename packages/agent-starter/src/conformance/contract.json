@@ -1,0 +1,41 @@
+{
+  "contractVersion": 1,
+  "httpPath": "/.well-known/anchorage/conformance/v1/actions",
+  "webSocketPath": "/.well-known/anchorage/conformance/v1/websocket",
+  "candidateMainModule": "worker.js",
+  "stateMainModule": "state.js",
+  "compatibilityDate": "2026-07-08",
+  "compatibilityFlags": ["nodejs_compat"],
+  "cpuLimitMs": 50,
+  "subrequestLimit": 20,
+  "schemaVersion": 0,
+  "applicationVariableName": "APPLICATION_MODE",
+  "applicationVariableValue": "conformance",
+  "applicationSecretBinding": "APPLICATION_CONFORMANCE_SECRET",
+  "applicationR2Binding": "APPLICATION_FILES",
+  "auditProxyClassName": "FlowsafeFleetAuditProxy",
+  "durableObjectBindings": [
+    {
+      "name": "MAINTENANCE",
+      "className": "Maintenance"
+    },
+    {
+      "name": "RUNNER",
+      "className": "ConformanceRunner"
+    },
+    {
+      "name": "CONFORMANCE_STATE",
+      "className": "ConformanceState"
+    }
+  ],
+  "newDurableObjectBinding": {
+    "name": "CONFORMANCE_V2",
+    "className": "ConformanceV2"
+  },
+  "stateMigrationTags": {
+    "v1": "v1",
+    "v2": "v2"
+  },
+  "stateInstanceName": "deployment-conformance-state",
+  "v2InstanceName": "deployment-conformance-v2"
+}

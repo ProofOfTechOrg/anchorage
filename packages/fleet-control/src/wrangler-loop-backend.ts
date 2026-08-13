@@ -120,6 +120,11 @@ export interface PlainWorkerRouteApi {
   }>;
   listDurableObjectNamespaces(scriptName: string): Promise<readonly string[]>;
   listOrdinaryWorkerSecretNames(scriptName: string): Promise<readonly string[]>;
+  deleteControlSecrets(
+    scriptName: string,
+    secretNames: readonly string[],
+    fence: ExternalMutationFence,
+  ): Promise<void>;
   attachCustomDomain(
     target: {
       readonly hostname: string;
@@ -403,14 +408,8 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     fence: ExternalMutationFence,
   ): Promise<DatabaseReference> {
     await this.#assertMutationFence(fence);
-    let created: CommandResult;
     try {
-      created = await this.#runner.run([
-        'd1',
-        'create',
-        spec.databaseName,
-        '--json',
-      ]);
+      await this.#runner.run(['d1', 'create', spec.databaseName]);
     } catch (cause) {
       const recovered = await this.findDatabase(spec);
       if (recovered) {
@@ -425,11 +424,13 @@ export class WranglerLoopBackend implements ProvisioningBackend {
       }
       throw cause;
     }
-    const body = parseJson(created.stdout, 'd1 create');
-    const result = field(body, 'result') ?? body;
-    const id = field(result, 'uuid');
-    if (typeof id !== 'string') throw new Error('D1 create result has no uuid');
-    return { id, name: spec.databaseName, created: true };
+    const resolved = await this.findDatabase(spec);
+    if (!resolved) {
+      throw new Error(
+        `D1 database '${spec.databaseName}' is absent after successful creation`,
+      );
+    }
+    return { ...resolved, created: true };
   }
 
   async #query(
@@ -1644,19 +1645,11 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     const secretNames = await this.#routeApi.listOrdinaryWorkerSecretNames(
       spec.scriptName,
     );
-    for (const name of secretNames) {
-      try {
-        await this.#runMutation(fence, [
-          'secret',
-          'delete',
-          name,
-          '--name',
-          spec.scriptName,
-        ]);
-      } catch (error) {
-        if (!isWranglerNotFound(error)) throw error;
-      }
-    }
+    await this.#routeApi.deleteControlSecrets(
+      spec.scriptName,
+      secretNames,
+      fence,
+    );
     const remaining = await this.#routeApi.listOrdinaryWorkerSecretNames(
       spec.scriptName,
     );

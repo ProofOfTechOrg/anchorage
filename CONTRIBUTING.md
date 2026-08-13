@@ -79,7 +79,8 @@ Versioning and publishing run through [changesets](.changeset/README.md), with
 version bumps happening ON `dev` (bump-on-dev). Feature and fix PRs target the
 `dev` integration branch and include a changeset (`pnpm exec changeset` — pick
 the packages, a semver bump, and write the CHANGELOG entry) when they change
-published behavior of `@proofoftech/breakwater` or `@proofoftech/flowsafe`. As
+published behavior of `@proofoftech/breakwater`, `@proofoftech/flowsafe`, or
+`@proofoftech/fleet-control`. As
 changesets accumulate, the version workflow (`.github/workflows/version.yml`)
 maintains a standing **"Version Packages" PR against `dev`** with the pending
 bumps + CHANGELOG entries. Releasing is two merges: merge that PR into `dev`,

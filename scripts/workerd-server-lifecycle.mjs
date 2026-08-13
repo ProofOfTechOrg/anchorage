@@ -1,44 +1,29 @@
+// SPDX-License-Identifier: Apache-2.0
+// The one workerd dev-server lifecycle every local harness in this repository
+// uses. It lives at the repository root, not inside a package, because its two
+// consumers are harnesses in DIFFERENT packages and
+// .dependency-cruiser.cjs's `agent-starter-no-relative-package-reaches` rule
+// forbids one of them from reaching into the other.
+//
+// Kill protocol: killing wrangler alone orphans its workerd child, which keeps
+// serving the port and fakes persistence across a restart. So capture
+// descendant PIDs BEFORE the kill (orphans reparent to init afterwards),
+// SIGKILL the whole process group, poll the PIDs dead, and PROVE the port
+// refuses before restarting; port-scoped `fuser -k <port>/tcp` is the last
+// resort. Every syscall is injectable through `operations`, which is what lets
+// workerd-server-lifecycle.test.mjs drive the protocol without real processes.
 import { spawnSync } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
 import net from 'node:net';
 
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-export function parseSpikePort(value, name = 'port') {
+export function parsePort(value, name = 'port') {
   const port = Number(value);
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
     throw new RangeError(`${name} must be an integer in 1..65535`);
   }
   return port;
-}
-
-export function parseLlmSpikeConfig(env) {
-  const modelId =
-    env.SPIKE_LLM_MODEL_ID ??
-    (env.DEEPSEEK_MODEL ? `deepseek/${env.DEEPSEEK_MODEL}` : undefined);
-  if (typeof modelId !== 'string' || !/^[^\s/]+\/[^\s]+$/.test(modelId)) {
-    throw new Error('SPIKE_LLM_MODEL_ID must be a non-empty provider/model');
-  }
-  const apiKey = env.SPIKE_LLM_API_KEY ?? env.DEEPSEEK_API_KEY;
-  if (typeof apiKey !== 'string' || apiKey.trim().length === 0) {
-    throw new Error('SPIKE_LLM_API_KEY must be non-empty');
-  }
-  let baseUrl;
-  if (env.SPIKE_LLM_BASE_URL !== undefined) {
-    try {
-      baseUrl = new URL(env.SPIKE_LLM_BASE_URL);
-    } catch {
-      throw new Error('SPIKE_LLM_BASE_URL must be a valid HTTP(S) URL');
-    }
-    if (baseUrl.protocol !== 'http:' && baseUrl.protocol !== 'https:') {
-      throw new Error('SPIKE_LLM_BASE_URL must be a valid HTTP(S) URL');
-    }
-  }
-  return {
-    modelId,
-    apiKey,
-    ...(baseUrl ? { baseUrl: baseUrl.toString() } : {}),
-  };
 }
 
 function defaultPortState(port) {
@@ -110,8 +95,8 @@ async function defaultProbeHttp(url) {
   await fetch(url, { signal: AbortSignal.timeout(2000) });
 }
 
-export function createSpikeServerLifecycle(options) {
-  const port = parseSpikePort(options.port);
+export function createWorkerdServerLifecycle(options) {
+  const port = parsePort(options.port);
   const ops = {
     sleep: options.operations?.sleep ?? defaultSleep,
     now: options.operations?.now ?? Date.now,
@@ -213,7 +198,7 @@ export function createSpikeServerLifecycle(options) {
     },
     async start(generation, launch, deadlineMs = 90_000) {
       if (activeServer !== undefined) {
-        throw new Error('cannot start while another spike server is active');
+        throw new Error('cannot start while another workerd server is active');
       }
       const server = launch();
       server.generation ??= generation;

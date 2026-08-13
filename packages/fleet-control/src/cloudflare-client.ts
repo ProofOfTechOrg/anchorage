@@ -2107,10 +2107,14 @@ export class CloudflareProvisioningClient {
   ): Promise<void> {
     await this.withMutationFence(fence, async () => {
       for (const name of [...new Set(secretNames)].sort()) {
-        await this.#client.workers.scripts.secrets.delete(name, {
-          account_id: this.#accountId,
-          script_name: scriptName,
-        });
+        try {
+          await this.#client.workers.scripts.secrets.delete(name, {
+            account_id: this.#accountId,
+            script_name: scriptName,
+          });
+        } catch (error) {
+          if (!isNotFound(error)) throw error;
+        }
       }
     });
   }

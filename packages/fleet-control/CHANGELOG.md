@@ -1,5 +1,21 @@
 # @proofoftech/fleet-control
 
+## 0.2.0
+
+### Minor Changes
+
+- 34e8ae0: Require host-provided Wrangler `>=4.118 <5` without installing it as a Flowsafe peer. Hosts that use `flowsafe-provision` must now install a compatible Wrangler version directly.
+
+  Fleet Control now supports an explicit Wrangler command, creates D1 databases through Wrangler 4's current output contract, and revokes plain-Worker credentials through the Workers API without creating untracked Worker versions.
+
+  Custom `PlainWorkerRouteApi` implementations must add `deleteControlSecrets(scriptName, secretNames, fence)`. Implement it with the Workers script-secret DELETE API, treat an HTTP 404 as already deleted, and retain a final authoritative secret-list check.
+
+### Patch Changes
+
+- Updated dependencies [2c097d8]
+- Updated dependencies [34e8ae0]
+  - @proofoftech/flowsafe@0.15.0
+
 ## 0.1.0
 
 ### Minor Changes

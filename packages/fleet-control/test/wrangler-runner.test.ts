@@ -32,6 +32,70 @@ describe('WranglerCommandRunner', () => {
     ).toThrow('Wrangler timeoutMs must be a positive integer');
   });
 
+  it('validates the Wrangler command executable and fixed arguments', () => {
+    expect(
+      () =>
+        new WranglerCommandRunner({
+          apiToken: 'token',
+          accountId: 'account',
+          wranglerCommand: [],
+        }),
+    ).toThrow(/wranglerCommand must contain an executable/);
+    expect(
+      () =>
+        new WranglerCommandRunner({
+          apiToken: 'token',
+          accountId: 'account',
+          wranglerCommand: ['wrangler', ''],
+        }),
+    ).toThrow(/only non-empty string arguments/);
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    'runs a defensively copied custom executable with fixed arguments and Cloudflare credentials',
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'wrangler-runner-'));
+      const commandPath = join(directory, 'custom-wrangler');
+      try {
+        await writeFile(
+          commandPath,
+          `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({
+  arguments: process.argv.slice(2),
+  accountId: process.env.CLOUDFLARE_ACCOUNT_ID,
+  apiToken: process.env.CLOUDFLARE_API_TOKEN,
+}));
+`,
+        );
+        await chmod(commandPath, 0o755);
+        const wranglerCommand = [commandPath, '--fixed', 'fixed-value'];
+        const runner = new WranglerCommandRunner({
+          apiToken: 'test-token',
+          accountId: 'test-account',
+          wranglerCommand,
+        });
+        wranglerCommand[0] = join(directory, 'mutated-command');
+        wranglerCommand[2] = 'mutated-value';
+
+        const result = await runner.run(['deploy', '--name', 'test-worker']);
+
+        expect(JSON.parse(result.stdout)).toEqual({
+          arguments: [
+            '--fixed',
+            'fixed-value',
+            'deploy',
+            '--name',
+            'test-worker',
+          ],
+          accountId: 'test-account',
+          apiToken: 'test-token',
+        });
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
   it('rejects win32 where descendant termination cannot be proven', () => {
     expect(() => assertWranglerCommandPlatform('win32')).toThrow(
       /does not support win32/,

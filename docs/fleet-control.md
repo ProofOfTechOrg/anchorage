@@ -10,10 +10,12 @@ Both backends implement the same ordered `ProvisioningBackend` contract:
 
 | Backend | Accepted artifacts | Deployment mechanism |
 | --- | --- | --- |
-| `WranglerLoopBackend` | Platform-authored only | Wrangler 4 commands and generated configuration |
+| `WranglerLoopBackend` | Platform-authored only | Host-provided Wrangler `>=4.118 <5` commands and generated configuration |
 | `WorkersForPlatformsBackend` | Platform-authored catalogs and external project releases | Cloudflare Upload API in an untrusted dispatch namespace |
 
 `WorkersForPlatformsBackend` requires its untrusted dispatch namespace, named shared outbound Worker, and state-egress root secret at construction. It rejects an incomplete configuration before provider access. Normal provisioning always places trusted per-deployment state in that dispatch namespace. Ordinary state scripts exist only as already-persisted bridges managed by the dedicated backend-switch lifecycle.
+
+`WranglerCommandRunner` defaults to `['pnpm', 'exec', 'wrangler']`. Pass its `wranglerCommand` option when the host must select an explicit Wrangler executable or wrapper and fixed arguments. Fleet Control does not install Wrangler for the host.
 
 The plain backend rejects external artifacts before creating a resource. Switch to Workers for Platforms before you run the first customer-authored artifact. Set `routeHostname` to the customer-facing custom domain. For plain Workers, set `maintenanceBaseUrl` to the distinct Workers control origin; for Workers for Platforms, set it to the control-plane dispatcher origin. Fleet state reserves the route before any Worker can publish it.
 
@@ -193,7 +195,7 @@ Workers for Platforms outbound handlers do not cover Durable Object network call
 
 The paid gate verifies the provider behavior that local tests cannot reproduce. Treat a passing run as a mandatory release condition for changes to Workers for Platforms provisioning, bindings, limits, migrations, routing, or FlowSafe runtime integration.
 
-Build one external candidate and two trusted state artifacts. Start from [`credentialed-conformance.example.json`](../packages/fleet-control/scripts/credentialed-conformance.example.json). Keep `contractVersion` and `platformProfile.runtimeContractVersion` at `1`. Configure exactly two tenant tags, the backend-owned audit queue, positive CPU and subrequest limits, one application variable, one application secret binding, at least one application R2 bucket, and allowed and denied upstream URLs. Do not put credentials or secret plaintext in the file.
+Build one external candidate and two trusted state artifacts. [`packages/agent-starter`](../packages/agent-starter/README.md#submit-it-as-a-workers-for-platforms-artifact) builds all three and ships a ready operator configuration; use it unless you are authoring a different artifact. Otherwise start from [`credentialed-conformance.example.json`](../packages/fleet-control/scripts/credentialed-conformance.example.json). Keep `contractVersion` and `platformProfile.runtimeContractVersion` at `1`. Configure exactly two tenant tags, the backend-owned audit queue, positive CPU and subrequest limits, one application variable, one application secret binding, at least one application R2 bucket, and allowed and denied upstream URLs. Do not put credentials or secret plaintext in the file.
 
 The runner validates in two stages. Structural validation checks the versioned configuration, required environment values, and private-key shape before it reads artifacts or imports fleet code. After it constructs both releases and both trusted profiles, the production specification, secret, external-profile, migration, route, date, and canonical JWK validators run before Cloudflare client or backend construction. Either stage fails closed without a provider request.
 
@@ -246,6 +248,10 @@ pnpm fleet-control:credentialed
 The gate creates two deployments with distinct application R2 buckets, rejects a cross-tenant D1 sentinel restamp, and checks each candidate's exact D1, application variable, application secret name, and fleet-owned R2 topology. It performs a same-name trusted-state upload with `keep_bindings`, proves that the original maintenance secret still signs a valid receipt, and immediately repairs the durable artifact-version snapshot through normal lifecycle convergence.
 
 Before final teardown, the candidate leaves one randomized R2 fixture present. Decommission must reject it before phase advance, route removal, credential revocation, or Worker deletion. The candidate then deletes the fixture, proves provider absence through `r2-absent`, and retries. The gate re-hashes each retained export against its recorded SHA-256 and byte count, then requires zero registered scripts, namespace scripts, D1 databases, Durable Object namespaces, R2 buckets, or host routes under the test prefixes. Run it only in a scratch account with a Workers for Platforms subscription.
+
+After both Workers for Platforms deployments decommission, the runner derives the account's Workers subdomain. It reuses the first released route for a platform-authored plain Worker. This lane uses the configured v1 trusted-state artifact, `WranglerCommandRunner`, `WranglerLoopBackend`, `CloudflareProvisioningClient`, and the same `FileSystemDatabaseExportStore`. It adds no configuration fields. Provide Wrangler `>=4.118 <5` in the host environment.
+
+A backend wrapper records the nonempty exact `wrangler versions list --json` version-ID set at three points: immediately before control-secret revocation, after revocation, and immediately before Worker deletion. All three sets must be identical. If the proof fails after control-secret deletion begins, the runner uses the backend's live identity and footprint attestation to remove that exact uniquely suffixed Worker before normal database and state cleanup. This fallback prevents the regression from trapping cleanup behind persisted-version drift.
 
 ## Preserve the control-plane boundary
 
