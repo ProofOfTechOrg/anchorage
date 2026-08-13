@@ -597,6 +597,12 @@ describe('credentialed conformance command', () => {
     expect(source).toMatch(
       /deployment\.store\.withDeploymentLease\(\s*spec\.tenantTag,\s*spec\.environment,\s*async \(fence\)/u,
     );
+    expect(source).toContain(
+      'await client.getDatabase(decommissioned.databaseExport.databaseId)',
+    );
+    expect(source).toMatch(
+      /plain Worker database '\$\{decommissioned\.databaseExport\.databaseId\}' remains after terminal decommission/u,
+    );
   });
 
   it('runs every mandatory probe in release order and returns only asserted truth', async () => {

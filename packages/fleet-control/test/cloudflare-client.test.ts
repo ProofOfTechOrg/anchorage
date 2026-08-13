@@ -628,6 +628,80 @@ describe('CloudflareProvisioningClient', () => {
     ]);
   });
 
+  it('deletes D1 by database id through the REST API and accepts an already-missing database', async () => {
+    const requests: Array<{ readonly method: string; readonly path: string }> =
+      [];
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
+      dispatchNamespace: 'fleet',
+      fetch: async (input, init) => {
+        const url = new URL(
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url,
+        );
+        requests.push({ method: init?.method ?? 'GET', path: url.pathname });
+        if (url.pathname.endsWith('/database/already-gone')) {
+          return Response.json(
+            {
+              success: false,
+              errors: [{ code: 7404, message: 'database not found' }],
+              messages: [],
+              result: null,
+            },
+            { status: 404 },
+          );
+        }
+        return envelope(null);
+      },
+    });
+
+    await expect(
+      fenced(client, () => client.deleteDatabase('database-id')),
+    ).resolves.toBeUndefined();
+    await expect(
+      fenced(client, () => client.deleteDatabase('already-gone')),
+    ).resolves.toBeUndefined();
+
+    expect(requests).toEqual([
+      {
+        method: 'DELETE',
+        path: '/client/v4/accounts/account/d1/database/database-id',
+      },
+      {
+        method: 'DELETE',
+        path: '/client/v4/accounts/account/d1/database/already-gone',
+      },
+    ]);
+  });
+
+  it('propagates a non-404 D1 REST deletion failure', async () => {
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
+      dispatchNamespace: 'fleet',
+      fetch: async () =>
+        Response.json(
+          {
+            success: false,
+            errors: [{ code: 10000, message: 'D1 write denied' }],
+            messages: [],
+            result: null,
+          },
+          { status: 403 },
+        ),
+    });
+
+    await expect(
+      fenced(client, () => client.deleteDatabase('database-id')),
+    ).rejects.toThrow();
+  });
+
   it('applies the request cap to each SDK HTTP request', async () => {
     vi.useFakeTimers();
     try {

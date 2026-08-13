@@ -134,6 +134,7 @@ class FakeRouteApi implements PlainWorkerRouteApi {
         readonly scriptName: string;
         readonly secretName: string;
       }
+    | { readonly operation: 'delete-database'; readonly databaseId: string }
   > = [];
   listCalls = 0;
   scriptPresent = false;
@@ -150,6 +151,7 @@ class FakeRouteApi implements PlainWorkerRouteApi {
   afterDeleteControlSecret: ((secretName: string) => void) | undefined;
   secretListReads = 0;
   secretListError: Error | undefined;
+  databasePresent = true;
   readonly databaseQueries: Array<{
     readonly databaseId: string;
     readonly sql: string;
@@ -208,6 +210,19 @@ class FakeRouteApi implements PlainWorkerRouteApi {
     for (const statement of statements) {
       await this.queryHandler(statement.sql, statement.bindings ?? []);
     }
+  }
+
+  async getDatabase(
+    databaseId: string,
+  ): Promise<DatabaseReference | undefined> {
+    return this.databasePresent && databaseId === database.id
+      ? { ...database, created: false }
+      : undefined;
+  }
+
+  async deleteDatabase(databaseId: string): Promise<void> {
+    this.calls.push({ operation: 'delete-database', databaseId });
+    this.databasePresent = false;
   }
 
   async listCustomDomains(): Promise<readonly PlainWorkerCustomDomain[]> {
@@ -283,7 +298,11 @@ class FakeRouteApi implements PlainWorkerRouteApi {
 
 function databaseRouteMethods(): Pick<
   PlainWorkerRouteApi,
-  'withMutationFence' | 'queryDatabase' | 'batchDatabase'
+  | 'withMutationFence'
+  | 'queryDatabase'
+  | 'batchDatabase'
+  | 'getDatabase'
+  | 'deleteDatabase'
 > {
   return {
     async withMutationFence(fence, operation) {
@@ -294,6 +313,10 @@ function databaseRouteMethods(): Pick<
       return [];
     },
     async batchDatabase() {},
+    async getDatabase() {
+      return undefined;
+    },
+    async deleteDatabase() {},
   };
 }
 
@@ -2000,30 +2023,17 @@ export default {
     expect(fence.assertOwned).not.toHaveBeenCalled();
   });
 
-  it('reads a database by immutable id and treats a missing id as absent', async () => {
-    const present = new FakeRunner(async () => ({
-      stdout: JSON.stringify({
-        result: { uuid: database.id, name: database.name },
-      }),
-      stderr: '',
-    }));
-    await expect(backend(present).getDatabase(database.id)).resolves.toEqual({
+  it('reads a database by immutable id through the REST route API and treats a missing id as absent', async () => {
+    const runner = new FakeRunner();
+    const routeApi = new FakeRouteApi();
+    const subject = backend(runner, { routeApi });
+    await expect(subject.getDatabase(database.id)).resolves.toEqual({
       ...database,
       created: false,
     });
-    expect(present.calls[0]?.arguments).toEqual([
-      'd1',
-      'info',
-      database.id,
-      '--json',
-    ]);
-
-    const missing = new FakeRunner(async () => {
-      throw notFound('database');
-    });
-    await expect(
-      backend(missing).getDatabase('missing-database'),
-    ).resolves.toBeUndefined();
+    routeApi.databasePresent = false;
+    await expect(subject.getDatabase(database.id)).resolves.toBeUndefined();
+    expect(runner.calls).toEqual([]);
   });
 
   it('returns undefined when the inspected Worker is missing', async () => {
@@ -2157,7 +2167,7 @@ export default {
     }
   });
 
-  it('treats already-missing credentials, Workers, and databases as deleted', async () => {
+  it('treats already-missing credentials and Workers as deleted', async () => {
     const runner = new FakeRunner(async () => {
       throw notFound();
     });
@@ -2175,8 +2185,61 @@ export default {
       'versions list',
       'deployments status',
       'versions list',
-      'd1 delete',
     ]);
+    expect(routeApi.calls).toContainEqual({
+      operation: 'delete-database',
+      databaseId: database.id,
+    });
+  });
+
+  it('deletes D1 by immutable id through the fenced REST route API without spawning Wrangler', async () => {
+    const runner = new FakeRunner();
+    const routeApi = new FakeRouteApi();
+    const fence: ExternalMutationFence = {
+      mutationLeaseTtlMs: mutationFence.mutationLeaseTtlMs,
+      assertOwned: vi.fn(async () => {}),
+    };
+
+    await expect(
+      backend(runner, { routeApi }).deleteDatabase(database, fence),
+    ).resolves.toBeUndefined();
+
+    expect(routeApi.calls).toEqual([
+      { operation: 'delete-database', databaseId: database.id },
+    ]);
+    expect(routeApi.databasePresent).toBe(false);
+    expect(fence.assertOwned).toHaveBeenCalledTimes(1);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it('rejects a REST deletion that does not make the immutable D1 id absent', async () => {
+    const runner = new FakeRunner();
+    const routeApi = new FakeRouteApi();
+    routeApi.deleteDatabase = async (databaseId: string) => {
+      routeApi.calls.push({ operation: 'delete-database', databaseId });
+    };
+
+    await expect(
+      backend(runner, { routeApi }).deleteDatabase(database, mutationFence),
+    ).rejects.toThrow(`database '${database.id}' remains after deletion`);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it('fails closed when the REST route API cannot delete D1', async () => {
+    const runner = new FakeRunner();
+    const fakeRouteApi = new FakeRouteApi();
+    const routeApi = new Proxy(fakeRouteApi, {
+      get(target, property) {
+        if (property === 'deleteDatabase') return undefined;
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+
+    await expect(
+      backend(runner, { routeApi }).deleteDatabase(database, mutationFence),
+    ).rejects.toThrow(/does not support exact-ID D1 database deletion/u);
+    expect(runner.calls).toEqual([]);
   });
 
   it('attests exact Worker ownership while removing traffic before credential revocation', async () => {

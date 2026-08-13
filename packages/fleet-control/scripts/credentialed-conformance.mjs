@@ -1287,6 +1287,10 @@ async function provePlainWorkerSecretVersionChurnTeardown() {
       decommissioned.record.phase === 'decommissioned',
       'plain Worker did not reach its terminal decommissioned phase',
     );
+    assert(
+      !(await client.getDatabase(decommissioned.databaseExport.databaseId)),
+      `plain Worker database '${decommissioned.databaseExport.databaseId}' remains after terminal decommission`,
+    );
     assertPlainWorkerVersionTracking(tracking);
   } catch (error) {
     conformanceError = error;

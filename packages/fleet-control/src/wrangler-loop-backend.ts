@@ -81,6 +81,8 @@ export interface PlainWorkerRouteApi {
       readonly bindings?: readonly string[];
     }[],
   ): Promise<void>;
+  getDatabase?(databaseId: string): Promise<DatabaseReference | undefined>;
+  deleteDatabase?(databaseId: string): Promise<void>;
   listWorkerDatabaseAttachments(databaseId: string): Promise<
     readonly Readonly<{
       scriptName: string;
@@ -386,6 +388,10 @@ export class WranglerLoopBackend implements ProvisioningBackend {
   async getDatabase(
     databaseId: string,
   ): Promise<DatabaseReference | undefined> {
+    const getDatabase = this.#routeApi.getDatabase;
+    if (getDatabase) {
+      return getDatabase.call(this.#routeApi, databaseId);
+    }
     let result: CommandResult;
     try {
       result = await this.#runner.run(['d1', 'info', databaseId, '--json']);
@@ -2062,15 +2068,18 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     database: DatabaseReference,
     fence: ExternalMutationFence,
   ): Promise<void> {
-    try {
-      await this.#runMutation(fence, [
-        'd1',
-        'delete',
-        database.id,
-        '--skip-confirmation',
-      ]);
-    } catch (error) {
-      if (!isWranglerNotFound(error)) throw error;
+    const getDatabase = this.#routeApi.getDatabase;
+    const deleteDatabase = this.#routeApi.deleteDatabase;
+    if (!getDatabase || !deleteDatabase) {
+      throw new Error(
+        'plain Worker route API does not support exact-ID D1 database deletion',
+      );
     }
+    await this.#routeApi.withMutationFence(fence, async () => {
+      await deleteDatabase.call(this.#routeApi, database.id);
+      if (await getDatabase.call(this.#routeApi, database.id)) {
+        throw new Error(`database '${database.id}' remains after deletion`);
+      }
+    });
   }
 }
