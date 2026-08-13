@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // The one workerd dev-server lifecycle every local harness in this repository
-// uses. It lives at the repository root, not inside a package, because its two
-// consumers are harnesses in DIFFERENT packages and
+// uses. It lives at the repository root, not inside a package, because its
+// consumers include harnesses in DIFFERENT packages and
 // .dependency-cruiser.cjs's `agent-starter-no-relative-package-reaches` rule
 // forbids one of them from reaching into the other.
 //
@@ -17,6 +17,40 @@ import { readdirSync, readFileSync } from 'node:fs';
 import net from 'node:net';
 
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// Miniflare's outer proxy synthesizes this raw 500 when its user-Worker channel
+// drops. Requiring its core stack prevents an application 500 with similar text
+// from becoming retryable.
+const NETWORK_CONNECTION_LOST = 'Error: Network connection lost.';
+const MINIFLARE_CORE_ENTRY_FRAME =
+  /^ {4}at async Object\.fetch \(file:\/\/\/.*[\\/]miniflare[\\/]dist[\\/]src[\\/]workers[\\/]core[\\/]entry\.worker\.js:\d+:\d+\)$/;
+
+class RecoveryDeadlineError extends Error {}
+
+export class WorkerdNetworkConnectionLostError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'WorkerdNetworkConnectionLostError';
+  }
+}
+
+export function workerdNetworkConnectionLostResponseError(
+  status,
+  body,
+  requestLabel,
+) {
+  const lines = typeof body === 'string' ? body.trimEnd().split(/\r?\n/) : [];
+  if (
+    status !== 500 ||
+    lines.length !== 2 ||
+    lines[0] !== NETWORK_CONNECTION_LOST ||
+    !MINIFLARE_CORE_ENTRY_FRAME.test(lines[1])
+  ) {
+    return undefined;
+  }
+  return new WorkerdNetworkConnectionLostError(
+    `${requestLabel} -> ${status} non-JSON: ${body.slice(0, 300)}`,
+  );
+}
 
 export function parsePort(value, name = 'port') {
   const port = Number(value);
@@ -92,7 +126,8 @@ function defaultKillPort(port) {
 }
 
 async function defaultProbeHttp(url) {
-  await fetch(url, { signal: AbortSignal.timeout(2000) });
+  const response = await fetch(url, { signal: AbortSignal.timeout(2000) });
+  await response.arrayBuffer();
 }
 
 export function createWorkerdServerLifecycle(options) {
@@ -105,6 +140,8 @@ export function createWorkerdServerLifecycle(options) {
     alive: options.operations?.alive ?? defaultAlive,
     killGroup: options.operations?.killGroup ?? defaultKillGroup,
     killPort: options.operations?.killPort ?? (() => defaultKillPort(port)),
+    setTimer: options.operations?.setTimer ?? setTimeout,
+    clearTimer: options.operations?.clearTimer ?? clearTimeout,
     probeHttp:
       options.operations?.probeHttp ??
       (() => defaultProbeHttp(`http://127.0.0.1:${port}/`)),
@@ -153,6 +190,69 @@ export function createWorkerdServerLifecycle(options) {
       }
     }
     throw new Error(`${server.generation} not ready within ${deadlineMs}ms`);
+  };
+
+  const retryNetworkConnectionLost = async (server, operation, deadlineMs) => {
+    const deadline = ops.now() + deadlineMs;
+    let lastError;
+    const assertAlive = () => {
+      const { child, spawnError } = server;
+      if (spawnError) {
+        throw new Error(`${server.generation} failed to spawn: ${spawnError}`);
+      }
+      if (child.exitCode !== null || child.signalCode !== null) {
+        throw new Error(
+          `${server.generation} exited while recovering network connection ` +
+            `(code ${child.exitCode}, signal ${child.signalCode})`,
+        );
+      }
+    };
+    const attempt = async () => {
+      const remainingMs = deadline - ops.now();
+      if (remainingMs <= 0) throw new RecoveryDeadlineError();
+      const controller = new AbortController();
+      let timer;
+      const timeout = new Promise((_, reject) => {
+        timer = ops.setTimer(() => {
+          controller.abort();
+          reject(new RecoveryDeadlineError());
+        }, remainingMs);
+      });
+      try {
+        const result = await Promise.race([
+          operation({ signal: controller.signal }),
+          timeout,
+        ]);
+        if (ops.now() >= deadline) throw new RecoveryDeadlineError();
+        return result;
+      } finally {
+        ops.clearTimer(timer);
+      }
+    };
+
+    while (ops.now() < deadline) {
+      assertAlive();
+      try {
+        const result = await attempt();
+        assertAlive();
+        return result;
+      } catch (error) {
+        assertAlive();
+        if (error instanceof RecoveryDeadlineError) break;
+        if (!(error instanceof WorkerdNetworkConnectionLostError)) {
+          throw error;
+        }
+        lastError = error;
+      }
+      const remainingMs = deadline - ops.now();
+      if (remainingMs <= 0) break;
+      await ops.sleep(Math.min(250, remainingMs));
+    }
+    assertAlive();
+    throw new Error(
+      `${server.generation} network connection did not recover within ${deadlineMs}ms`,
+      { cause: lastError },
+    );
   };
 
   const stopServer = async (server) => {
@@ -205,6 +305,38 @@ export function createWorkerdServerLifecycle(options) {
       activeServer = server;
       await waitReady(server, deadlineMs);
       return server;
+    },
+    async retryNetworkConnectionLost(operation, deadlineMs = 5000) {
+      if (activeServer === undefined) {
+        throw new Error('cannot recover without an active workerd server');
+      }
+      // Callers opt in only operations whose response can be replayed safely.
+      return retryNetworkConnectionLost(activeServer, operation, deadlineMs);
+    },
+    async requestJson(
+      request,
+      { requestLabel, replaySafe = false, deadlineMs = 5000 },
+    ) {
+      const send = async ({ signal } = {}) => {
+        const response = await request(signal);
+        const responseText = await response.text();
+        const transient = workerdNetworkConnectionLostResponseError(
+          response.status,
+          responseText,
+          requestLabel,
+        );
+        if (transient) throw transient;
+        try {
+          return { status: response.status, body: JSON.parse(responseText) };
+        } catch {
+          throw new Error(
+            `${requestLabel} -> ${response.status} non-JSON: ${responseText.slice(0, 300)}`,
+          );
+        }
+      };
+      return replaySafe
+        ? this.retryNetworkConnectionLost(send, deadlineMs)
+        : send();
     },
     async stop() {
       if (activeServer === undefined) return;

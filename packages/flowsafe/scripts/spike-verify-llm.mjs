@@ -60,26 +60,26 @@ function workerdDiagnostics() {
 }
 
 async function request(method, path, options = {}) {
-  const response = await fetch(`${BASE}${path}`, {
-    method,
-    headers: {
-      ...(options.body === undefined
-        ? {}
-        : { 'content-type': 'application/json' }),
-      ...(options.headers ?? {}),
+  return serverLifecycle.requestJson(
+    (recoverySignal) =>
+      fetch(`${BASE}${path}`, {
+        method,
+        headers: {
+          ...(options.body === undefined
+            ? {}
+            : { 'content-type': 'application/json' }),
+          ...(options.headers ?? {}),
+        },
+        ...(options.body === undefined
+          ? {}
+          : { body: JSON.stringify(options.body) }),
+        ...(recoverySignal === undefined ? {} : { signal: recoverySignal }),
+      }),
+    {
+      requestLabel: `${method} ${path}`,
+      replaySafe: method === 'GET',
     },
-    ...(options.body === undefined
-      ? {}
-      : { body: JSON.stringify(options.body) }),
-  });
-  const text = await response.text();
-  let body;
-  try {
-    body = text ? JSON.parse(text) : undefined;
-  } catch {
-    body = text;
-  }
-  return { status: response.status, body };
+  );
 }
 
 function start() {
@@ -133,6 +133,7 @@ async function waitSuspended(ids) {
       { headers: AUTH.operator },
     );
     lastStatus = status;
+    assert(status.status === 200, 'agent status failed', status);
     if (status.body?.summary?.status === 'suspended') return status.body;
     if (status.body?.summary?.status === 'failed')
       throw new Error(`agent failed: ${JSON.stringify(status.body)}`);
