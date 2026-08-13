@@ -188,6 +188,46 @@ describe('workerd server lifecycle', () => {
     expect(operationSignal.aborted).toBe(true);
   });
 
+  it('reports the recovery deadline when an aborted operation rejects', async () => {
+    let timerCount = 0;
+    const transient = new WorkerdNetworkConnectionLostError('transient');
+    const lifecycle = createWorkerdServerLifecycle({
+      port: 8799,
+      operations: operations({
+        setTimer: (callback) => {
+          timerCount += 1;
+          if (timerCount === 2) callback();
+          return timerCount;
+        },
+        clearTimer: vi.fn(),
+      }),
+    });
+    await lifecycle.start('recovering', () => server());
+    const operation = vi.fn().mockRejectedValueOnce(transient);
+    operation.mockImplementationOnce(({ signal }) => {
+      if (signal.aborted) return Promise.reject(new DOMException('aborted'));
+      return new Promise((_, reject) => {
+        signal.addEventListener(
+          'abort',
+          () => reject(new DOMException('aborted')),
+          { once: true },
+        );
+      });
+    });
+
+    let failure;
+    try {
+      await lifecycle.retryNetworkConnectionLost(operation, 500);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({
+      message: 'test network connection did not recover within 500ms',
+      cause: transient,
+    });
+    expect(operation).toHaveBeenCalledTimes(2);
+  });
+
   it('retries an exact transient response for a replay-safe JSON request', async () => {
     const ops = operations();
     const lifecycle = createWorkerdServerLifecycle({

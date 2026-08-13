@@ -212,17 +212,24 @@ export function createWorkerdServerLifecycle(options) {
       if (remainingMs <= 0) throw new RecoveryDeadlineError();
       const controller = new AbortController();
       let timer;
+      let deadlineError;
       const timeout = new Promise((_, reject) => {
         timer = ops.setTimer(() => {
-          controller.abort();
-          reject(new RecoveryDeadlineError());
+          deadlineError = new RecoveryDeadlineError();
+          reject(deadlineError);
+          controller.abort(deadlineError);
         }, remainingMs);
       });
       try {
-        const result = await Promise.race([
-          operation({ signal: controller.signal }),
-          timeout,
-        ]);
+        let result;
+        try {
+          result = await Promise.race([
+            operation({ signal: controller.signal }),
+            timeout,
+          ]);
+        } catch (error) {
+          throw deadlineError ?? error;
+        }
         if (ops.now() >= deadline) throw new RecoveryDeadlineError();
         return result;
       } finally {
