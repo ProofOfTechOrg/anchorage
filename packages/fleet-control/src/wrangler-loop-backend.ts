@@ -880,6 +880,140 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     return status.versions[0]?.id;
   }
 
+  async #attestTeardownWorkerOwnership(
+    spec: DeploymentSpec,
+    databaseId: string,
+    retainedReleases: readonly ExternalReleaseSnapshot[] | undefined,
+    activeRelease: ExternalReleaseSnapshot | undefined,
+  ): Promise<string | undefined> {
+    const releases = [activeRelease, ...(retainedReleases ?? [])].filter(
+      (release): release is ExternalReleaseSnapshot => release !== undefined,
+    );
+    const allowed = releases.filter(
+      (release) => release.physicalScriptName === spec.scriptName,
+    );
+    if (releases.length > 0 && allowed.length === 0) {
+      throw new Error(
+        `refusing to mutate Worker '${spec.scriptName}' without a matching persisted release`,
+      );
+    }
+    const [status, versions, footprint, namespaceIds] = await Promise.all([
+      this.#deploymentStatus(spec),
+      this.#listVersions(spec),
+      this.#routeApi.inspectOrdinaryWorkerFootprint(spec.scriptName),
+      this.#routeApi.listDurableObjectNamespaces(spec.scriptName),
+    ]);
+    const listed = versions ?? [];
+    if (!status && listed.length === 0) {
+      if (
+        footprint.scriptPresent ||
+        footprint.customDomains.length > 0 ||
+        footprint.zoneRoutes.length > 0 ||
+        namespaceIds.length > 0
+      ) {
+        throw new Error(
+          `refusing to mutate Worker '${spec.scriptName}' with an inconsistent script footprint`,
+        );
+      }
+      return undefined;
+    }
+    if (!status || !footprint.scriptPresent || listed.length === 0) {
+      throw new Error(
+        `refusing to mutate Worker '${spec.scriptName}' without consistent live deployment, version, and provider footprints`,
+      );
+    }
+    const validInventory = listed.map((version) => {
+      const id = versionId(version);
+      if (!id) {
+        throw new Error(
+          `refusing to mutate Worker '${spec.scriptName}' with an invalid version inventory`,
+        );
+      }
+      return { id, tag: versionTag(version) };
+    });
+    const listedIds = validInventory.map(({ id }) => id);
+    if (new Set(listedIds).size !== listedIds.length) {
+      throw new Error(
+        `refusing to mutate Worker '${spec.scriptName}' with a duplicate version inventory`,
+      );
+    }
+    type ReleaseIdentity = Readonly<{
+      specDigest: string;
+      releaseSchemaVersion: number;
+    }>;
+    const desiredIdentity: ReleaseIdentity = {
+      specDigest: deploymentSpecDigest(spec),
+      releaseSchemaVersion: spec.schemaVersion,
+    };
+    const viewedVersions = new Map<string, unknown>();
+    const view = async (id: string): Promise<unknown> => {
+      const cached = viewedVersions.get(id);
+      if (cached !== undefined) return cached;
+      const version = await this.#viewVersion(spec, id);
+      viewedVersions.set(id, version);
+      return version;
+    };
+    const assertIdentity = (
+      version: unknown,
+      expectedReleases: readonly ReleaseIdentity[],
+    ): void => {
+      const plainText = this.#plainTextBindings(version);
+      const databaseIds = this.#databaseIds(version);
+      const release = expectedReleases.find(
+        (candidate) =>
+          candidate.specDigest === plainText.get('FLEET_SPEC_DIGEST') &&
+          String(candidate.releaseSchemaVersion) ===
+            plainText.get('FLEET_SCHEMA_VERSION'),
+      );
+      if (
+        !release ||
+        databaseIds.length !== 1 ||
+        databaseIds[0] !== databaseId ||
+        plainText.get('DEPLOYMENT_TENANT') !== spec.tenantTag ||
+        plainText.get('FLEET_ENVIRONMENT') !== spec.environment ||
+        plainText.get('FLEET_INGRESS_CONTRACT') !== PLAIN_INGRESS_CONTRACT
+      ) {
+        throw new Error(
+          `refusing to mutate Worker '${spec.scriptName}' with drifted live teardown ownership`,
+        );
+      }
+    };
+    let anchorId: string | undefined;
+    if (allowed.length > 0) {
+      for (const release of allowed) {
+        let anchor: unknown;
+        try {
+          anchor = await view(release.artifactVersion);
+        } catch (error) {
+          if (isWranglerNotFound(error)) continue;
+          throw error;
+        }
+        assertIdentity(anchor, [release]);
+        anchorId = release.artifactVersion;
+        break;
+      }
+    } else {
+      const taggedAnchor = validInventory.find(
+        ({ tag }) => tag === desiredIdentity.specDigest,
+      );
+      if (taggedAnchor) {
+        assertIdentity(await view(taggedAnchor.id), [desiredIdentity]);
+        anchorId = taggedAnchor.id;
+      }
+    }
+    if (!anchorId) {
+      throw new Error(
+        `refusing to mutate Worker '${spec.scriptName}' without a trusted artifact version anchor`,
+      );
+    }
+    const expectedReleases: readonly ReleaseIdentity[] =
+      allowed.length > 0 ? allowed : [desiredIdentity];
+    for (const deployed of status.versions) {
+      assertIdentity(await view(deployed.id), expectedReleases);
+    }
+    return status.versions[0]?.id;
+  }
+
   async assertDatabaseDetached(
     spec: DeploymentSpec,
     record: FleetRecord,
@@ -1294,21 +1428,51 @@ export class WranglerLoopBackend implements ProvisioningBackend {
           });
         }
         const cleanupErrors: unknown[] = [];
+        const cleanupRelease: ExternalReleaseSnapshot | undefined = candidateId
+          ? {
+              physicalScriptName: spec.scriptName,
+              specDigest: digest,
+              artifactVersion: candidateId,
+              releaseSchemaVersion: spec.schemaVersion,
+            }
+          : undefined;
+        let trafficRemoved = false;
         try {
-          await this.revokeCredentials(
+          await this.removeTraffic(
             spec,
             undefined,
-            undefined,
+            cleanupRelease,
             database,
             fence,
           );
+          await this.assertTrafficRemoved(spec);
+          trafficRemoved = true;
         } catch (cleanupError) {
           cleanupErrors.push(cleanupError);
         }
-        try {
-          await this.deleteWorker(spec, undefined, database, undefined, fence);
-        } catch (cleanupError) {
-          cleanupErrors.push(cleanupError);
+        if (trafficRemoved) {
+          try {
+            await this.revokeCredentials(
+              spec,
+              undefined,
+              cleanupRelease,
+              database,
+              fence,
+            );
+          } catch (cleanupError) {
+            cleanupErrors.push(cleanupError);
+          }
+          try {
+            await this.deleteWorker(
+              spec,
+              undefined,
+              database,
+              cleanupRelease,
+              fence,
+            );
+          } catch (cleanupError) {
+            cleanupErrors.push(cleanupError);
+          }
         }
         if (cleanupErrors.length > 0) {
           throw new WorkerDeploymentError({
@@ -1633,23 +1797,40 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     database: DatabaseReference,
     fence: ExternalMutationFence,
   ): Promise<void> {
-    if (
-      !(await this.#attestPersistedWorkerOwnership(
+    const secretNames = [
+      ...new Set(
+        await this.#routeApi.listOrdinaryWorkerSecretNames(spec.scriptName),
+      ),
+    ].sort();
+    if (secretNames.length === 0) {
+      await this.#attestTeardownWorkerOwnership(
         spec,
         database.id,
         retainedReleases,
         activeRelease,
-      ))
-    )
-      return;
-    const secretNames = await this.#routeApi.listOrdinaryWorkerSecretNames(
-      spec.scriptName,
-    );
-    await this.#routeApi.deleteControlSecrets(
-      spec.scriptName,
-      secretNames,
-      fence,
-    );
+      );
+    }
+    // Each secret deletion can publish a version, so re-attest before the next
+    // irreversible mutation instead of treating the inventory as a batch.
+    for (const secretName of secretNames) {
+      if (
+        !(await this.#attestTeardownWorkerOwnership(
+          spec,
+          database.id,
+          retainedReleases,
+          activeRelease,
+        ))
+      ) {
+        throw new Error(
+          `ordinary Worker '${spec.scriptName}' has secrets without an attestable Worker owner`,
+        );
+      }
+      await this.#routeApi.deleteControlSecrets(
+        spec.scriptName,
+        [secretName],
+        fence,
+      );
+    }
     const remaining = await this.#routeApi.listOrdinaryWorkerSecretNames(
       spec.scriptName,
     );
@@ -1719,34 +1900,33 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     activeRelease: ExternalReleaseSnapshot | undefined,
     fence: ExternalMutationFence,
   ): Promise<void> {
-    const worker = await this.#attestPersistedWorkerOwnership(
-      spec,
-      database.id,
-      retainedReleases,
-      activeRelease,
-    );
     const [initialFootprint, initialNamespaceIds] = await Promise.all([
       this.#routeApi.inspectOrdinaryWorkerFootprint(spec.scriptName),
       this.#routeApi.listDurableObjectNamespaces(spec.scriptName),
     ]);
     await this.assertTrafficRemoved(spec);
-    if (!worker) {
+    if (!initialFootprint.scriptPresent) {
       if (
-        initialFootprint.scriptPresent ||
         initialFootprint.customDomains.length > 0 ||
         initialFootprint.zoneRoutes.length > 0 ||
         initialNamespaceIds.length > 0
       ) {
         throw new Error(
-          `refusing to delete an ordinary Worker footprint without an attestable Worker owner`,
+          `ordinary Worker '${spec.scriptName}' has a script-absent footprint with residual routes, domains, or Durable Object namespaces`,
+        );
+      }
+      const [status, versions] = await Promise.all([
+        this.#deploymentStatus(spec),
+        this.#listVersions(spec),
+      ]);
+      if (status || (versions && versions.length > 0)) {
+        throw new Error(
+          `ordinary Worker '${spec.scriptName}' remains after its footprint reported absence`,
         );
       }
       return;
     }
-    if (
-      !initialFootprint.scriptPresent ||
-      initialFootprint.zoneRoutes.length > 0
-    ) {
+    if (initialFootprint.zoneRoutes.length > 0) {
       throw new Error(
         `refusing to delete Worker '${spec.scriptName}' with an inconsistent script or zone-route footprint`,
       );
@@ -1761,15 +1941,20 @@ export class WranglerLoopBackend implements ProvisioningBackend {
         `refusing to delete Worker '${spec.scriptName}' with unexpected custom domains`,
       );
     }
+    // Secret mutations can create new version IDs, so this live check validates
+    // the persisted anchor and deployed identity without repeating artifact-set membership.
     if (
-      !(await this.#attestPersistedWorkerOwnership(
+      !(await this.#attestTeardownWorkerOwnership(
         spec,
         database.id,
         retainedReleases,
         activeRelease,
       ))
-    )
-      return;
+    ) {
+      throw new Error(
+        `ordinary Worker '${spec.scriptName}' disappeared before deletion`,
+      );
+    }
     try {
       await this.#runMutation(fence, [
         'delete',

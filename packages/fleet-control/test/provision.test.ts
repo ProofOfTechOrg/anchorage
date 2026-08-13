@@ -452,7 +452,13 @@ class FakeBackend implements ProvisioningBackend {
     return completeLiveDeployment(live);
   }
 
-  async removeTraffic(): Promise<void> {
+  async removeTraffic(
+    _deployment?: DeploymentSpec,
+    retainedReleases: readonly ExternalReleaseSnapshot[] = [],
+    activeRelease?: ExternalReleaseSnapshot,
+  ): Promise<void> {
+    this.retainedReleases = retainedReleases;
+    this.activeRelease = activeRelease;
     this.removeTrafficCalls += 1;
     this.trafficRemoved = true;
     if (this.failRemoveTrafficResponseOnce) {
@@ -963,6 +969,27 @@ describe('fleet provisioning', () => {
       expect(backend.events).toContain('revoke');
       expect(backend.events).toContain('delete-worker');
     }
+  });
+
+  it('passes the persisted plain-Worker release through post-deploy rollback', async () => {
+    const backend = new FakeBackend('plain-worker');
+    backend.failAt = 'maintenance';
+    const store = new MemoryStore();
+    const deployment = spec();
+
+    await expect(
+      provisionDeployment({ backend, store, spec: deployment, secrets }),
+    ).rejects.toBeInstanceOf(ProvisioningError);
+
+    expect(backend.activeRelease).toEqual({
+      physicalScriptName: deployment.scriptName,
+      specDigest: deploymentSpecDigest(deployment),
+      artifactVersion: 'artifact-v3',
+      releaseSchemaVersion: deployment.schemaVersion,
+      application: { vars: [], secrets: [], r2Buckets: [] },
+    });
+    expect(backend.events).toContain('revoke');
+    expect(backend.events).toContain('delete-worker');
   });
 
   it('resumes per-bucket R2 rollback without rewinding completed deletion progress', async () => {

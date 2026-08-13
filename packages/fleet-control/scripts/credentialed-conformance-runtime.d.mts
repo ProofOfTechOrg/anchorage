@@ -16,12 +16,6 @@ export function credentialedWranglerVersionIds(
   stdout: string,
 ): readonly string[];
 
-export function assertCredentialedVersionIdsUnchanged(
-  before: readonly string[],
-  after: readonly string[],
-  boundary: string,
-): void;
-
 export function credentialedPlainWorkerDurableObjectBindings(
   configuredBindings: readonly CredentialedDurableObjectBinding[],
   migrations: readonly DurableObjectMigration[],
@@ -140,7 +134,7 @@ export interface CredentialedConformanceDependencies<T> {
   readonly rollback: (deployment: T) => unknown;
   readonly proveNonemptyDecommission: (deployment: T) => unknown;
   readonly decommission: (deployment: T) => unknown;
-  readonly provePlainWorkerSecretRevocationNoVersionChurn: () => unknown;
+  readonly provePlainWorkerSecretVersionChurnTeardown: () => unknown;
   readonly assertZeroResiduals: () => unknown;
   readonly cleanup: (deployment: T) => unknown;
 }

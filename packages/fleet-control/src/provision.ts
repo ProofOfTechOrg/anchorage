@@ -371,9 +371,21 @@ async function rollbackProvisioning(
       errors.push(new Error('created Worker has no persisted database'));
       return { errors, ...(latestRecord ? { record: latestRecord } : {}) };
     }
+    const rollbackRetainedReleases = record
+      ? retainedExternalReleases(record)
+      : undefined;
+    const rollbackActiveRelease = record
+      ? activeExternalRelease(record)
+      : undefined;
     let trafficRemoved = false;
     try {
-      await backend.removeTraffic(spec, undefined, undefined, database, lease);
+      await backend.removeTraffic(
+        spec,
+        rollbackRetainedReleases,
+        rollbackActiveRelease,
+        database,
+        lease,
+      );
       await backend.assertTrafficRemoved(spec);
       await assertApplicationR2EmptyBeforeDecommission({
         resources: record?.applicationResources ?? [],
@@ -388,12 +400,18 @@ async function rollbackProvisioning(
       try {
         await backend.revokeCredentials(
           spec,
-          undefined,
-          undefined,
+          rollbackRetainedReleases,
+          rollbackActiveRelease,
           database,
           lease,
         );
-        await backend.deleteWorker(spec, undefined, database, undefined, lease);
+        await backend.deleteWorker(
+          spec,
+          rollbackRetainedReleases,
+          database,
+          rollbackActiveRelease,
+          lease,
+        );
         workerDeleted = true;
       } catch (error) {
         errors.push(error);

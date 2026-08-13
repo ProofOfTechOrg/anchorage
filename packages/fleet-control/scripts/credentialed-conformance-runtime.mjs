@@ -19,7 +19,7 @@ const REQUIRED_OPERATIONS = Object.freeze([
   'rollback',
   'proveNonemptyDecommission',
   'decommission',
-  'provePlainWorkerSecretRevocationNoVersionChurn',
+  'provePlainWorkerSecretVersionChurnTeardown',
   'assertZeroResiduals',
   'cleanup',
 ]);
@@ -82,16 +82,6 @@ export function credentialedWranglerVersionIds(stdout) {
     versions.map((version) => version?.id ?? version?.version_id),
     'wrangler versions list',
   );
-}
-
-export function assertCredentialedVersionIdsUnchanged(before, after, boundary) {
-  const expected = canonicalVersionIds(before, `${boundary} before set`);
-  const actual = canonicalVersionIds(after, `${boundary} after set`);
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-    throw new Error(
-      `plain Worker version IDs changed ${boundary}: expected [${expected.join(', ')}], received [${actual.join(', ')}]`,
-    );
-  }
 }
 
 export function credentialedPlainWorkerDurableObjectBindings(
@@ -341,7 +331,7 @@ export async function runCredentialedConformance(config, dependencies) {
     for (const deployment of config.deployments) {
       await dependencies.decommission(deployment);
     }
-    await dependencies.provePlainWorkerSecretRevocationNoVersionChurn();
+    await dependencies.provePlainWorkerSecretVersionChurnTeardown();
     await dependencies.assertZeroResiduals();
   } catch (error) {
     conformanceError = error;
@@ -384,7 +374,7 @@ export async function runCredentialedConformance(config, dependencies) {
     webSocketNonceEchoed: true,
     cpuLimitAndRecoveryProbed: true,
     flowSafeApprovalRoundTripProbed: true,
-    plainWorkerSecretRevocationNoVersionChurn: true,
+    plainWorkerSecretVersionChurnTeardown: true,
     zeroOrphans: true,
   });
 }
