@@ -15,7 +15,6 @@ import {
   validateConformanceConfig,
 } from './credentialed-conformance-config.mjs';
 import {
-  assertCredentialedVersionIdsUnchanged,
   cleanupCredentialedDeployment,
   credentialedPlainWorkerDurableObjectBindings,
   credentialedWranglerVersionIds,
@@ -338,42 +337,20 @@ function trackedPlainWorkerBackend(backend, runner, tracking) {
       if (property === 'revokeCredentials') {
         return async (...arguments_) => {
           const [spec] = arguments_;
-          const before = await listPlainWorkerVersionIds(
-            runner,
-            spec.scriptName,
-          );
-          tracking.beforeRevocation = before;
+          await listPlainWorkerVersionIds(runner, spec.scriptName);
           await target.revokeCredentials(...arguments_);
           tracking.revocationCompleted = true;
-          const after = await listPlainWorkerVersionIds(
-            runner,
-            spec.scriptName,
-          );
-          tracking.afterRevocation = after;
-          assertCredentialedVersionIdsUnchanged(
-            before,
-            after,
-            'during credential revocation',
-          );
+          await listPlainWorkerVersionIds(runner, spec.scriptName);
         };
       }
       if (property === 'deleteWorker') {
         return async (...arguments_) => {
           const [spec] = arguments_;
           assert(
-            tracking.revocationCompleted && tracking.afterRevocation,
+            tracking.revocationCompleted,
             'plain Worker deletion began without a completed tracked credential revocation',
           );
-          const beforeDelete = await listPlainWorkerVersionIds(
-            runner,
-            spec.scriptName,
-          );
-          tracking.beforeWorkerDeletion = beforeDelete;
-          assertCredentialedVersionIdsUnchanged(
-            tracking.afterRevocation,
-            beforeDelete,
-            'after credential revocation and before Worker deletion',
-          );
+          await listPlainWorkerVersionIds(runner, spec.scriptName);
           tracking.workerDeletionStarted = true;
           const result = await target.deleteWorker(...arguments_);
           tracking.workerDeletionCompleted = true;
@@ -391,21 +368,8 @@ function assertPlainWorkerVersionTracking(tracking) {
     tracking.controlSecretDeletionStarted &&
       tracking.revocationCompleted &&
       tracking.workerDeletionStarted &&
-      tracking.workerDeletionCompleted &&
-      tracking.beforeRevocation?.length > 0 &&
-      tracking.afterRevocation?.length > 0 &&
-      tracking.beforeWorkerDeletion?.length > 0,
+      tracking.workerDeletionCompleted,
     'plain Worker version-churn proof did not observe revocation and deletion with a nonempty version set',
-  );
-  assertCredentialedVersionIdsUnchanged(
-    tracking.beforeRevocation,
-    tracking.afterRevocation,
-    'during credential revocation',
-  );
-  assertCredentialedVersionIdsUnchanged(
-    tracking.afterRevocation,
-    tracking.beforeWorkerDeletion,
-    'after credential revocation and before Worker deletion',
   );
 }
 
@@ -1258,14 +1222,19 @@ async function deleteAttestedPlainWorkerAfterCredentialMutation(
           name: record.databaseName,
           created: false,
         },
-        undefined,
+        {
+          physicalScriptName: record.scriptName,
+          specDigest: record.desiredSpecDigest,
+          artifactVersion: record.artifactVersion,
+          releaseSchemaVersion: record.schemaVersion,
+        },
         fence,
       );
     },
   );
 }
 
-async function provePlainWorkerSecretRevocationNoVersionChurn() {
+async function provePlainWorkerSecretVersionChurnTeardown() {
   const spec = plainWorkerDeploymentSpec(await accountWorkersDevSubdomain());
   const secrets = generateDeploymentSecrets();
   validateDeploymentSpec(spec);
@@ -1635,7 +1604,7 @@ const result = await runCredentialedConformance(
     rollback,
     proveNonemptyDecommission,
     decommission,
-    provePlainWorkerSecretRevocationNoVersionChurn,
+    provePlainWorkerSecretVersionChurnTeardown,
     assertZeroResiduals,
     cleanup,
   },

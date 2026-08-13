@@ -14,6 +14,7 @@ import type {
   DeploymentSecrets,
   DeploymentSpec,
   ExternalMutationFence,
+  ExternalReleaseSnapshot,
   FleetRecord,
 } from '../src/types.js';
 import {
@@ -74,6 +75,13 @@ const fleetRecord: FleetRecord = {
   routeHostname: deployment.routeHostname,
   phase: 'worker-deleted',
   updatedAt: '2026-08-11T00:00:00.000Z',
+};
+
+const activeRelease: ExternalReleaseSnapshot = {
+  physicalScriptName: deployment.scriptName,
+  specDigest: deploymentSpecDigest(deployment),
+  artifactVersion: 'version-owned',
+  releaseSchemaVersion: deployment.schemaVersion,
 };
 
 const mutationFence: ExternalMutationFence = {
@@ -139,6 +147,7 @@ class FakeRouteApi implements PlainWorkerRouteApi {
     'MAINTENANCE_ADMIN_SECRET',
   ]);
   secretRevocationNoop = false;
+  afterDeleteControlSecret: ((secretName: string) => void) | undefined;
   secretListReads = 0;
   secretListError: Error | undefined;
   readonly databaseQueries: Array<{
@@ -164,6 +173,7 @@ class FakeRouteApi implements PlainWorkerRouteApi {
     readonly routeId: string;
     readonly pattern: string;
   }> = [];
+  beforeListCustomDomains: (() => void) | undefined;
   domains: PlainWorkerCustomDomain[];
 
   constructor(domains: readonly PlainWorkerCustomDomain[] = []) {
@@ -201,6 +211,7 @@ class FakeRouteApi implements PlainWorkerRouteApi {
   }
 
   async listCustomDomains(): Promise<readonly PlainWorkerCustomDomain[]> {
+    this.beforeListCustomDomains?.();
     this.listCalls += 1;
     return [...this.domains];
   }
@@ -234,6 +245,7 @@ class FakeRouteApi implements PlainWorkerRouteApi {
     for (const secretName of [...new Set(secretNames)].sort()) {
       this.calls.push({ operation: 'delete-secret', scriptName, secretName });
       if (!this.secretRevocationNoop) this.secretNames.delete(secretName);
+      this.afterDeleteControlSecret?.(secretName);
     }
   }
 
@@ -1184,6 +1196,8 @@ export default {
   });
 
   it('reports and cleans up a failed first deployment as a typed absent resource', async () => {
+    const routeApi = new FakeRouteApi();
+    routeApi.secretNames.clear();
     const runner = new FakeRunner(async (arguments_) => {
       const command = arguments_.slice(0, 2).join(' ');
       if (command === 'deployments status' || command === 'versions list') {
@@ -1193,7 +1207,7 @@ export default {
       return { stdout: '', stderr: '' };
     });
 
-    const result = backend(runner).deployWorker(
+    const result = backend(runner, { routeApi }).deployWorker(
       deployment,
       database,
       secrets,
@@ -1206,6 +1220,126 @@ export default {
       resourceState: 'absent',
     });
     expect(runner.calls.map(operation)).not.toContain('delete --name');
+  });
+
+  it('does not revoke credentials when failed-deployment cleanup cannot attest ownership before mutation', async () => {
+    let deploymentAttempted = false;
+    const routeApi = new FakeRouteApi();
+    const runner = new FakeRunner(async (arguments_) => {
+      const command = arguments_.slice(0, 2).join(' ');
+      if (command === 'deployments status') {
+        if (!deploymentAttempted) throw notFound('Worker');
+        return {
+          stdout: JSON.stringify({
+            versions: [{ version_id: 'version-unresolved', percentage: 100 }],
+          }),
+          stderr: '',
+        };
+      }
+      if (command === 'versions list') {
+        if (!deploymentAttempted) throw notFound('Worker');
+        return { stdout: JSON.stringify([]), stderr: '' };
+      }
+      if (arguments_[0] === 'deploy') {
+        deploymentAttempted = true;
+        routeApi.scriptPresent = true;
+        throw new Error('connection closed before upload outcome');
+      }
+      return { stdout: '', stderr: '' };
+    });
+
+    await expect(
+      backend(runner, { routeApi }).deployWorker(
+        deployment,
+        database,
+        secrets,
+        undefined,
+        mutationFence,
+      ),
+    ).rejects.toMatchObject({
+      createdByAttempt: true,
+      resourceState: 'unknown',
+    });
+    expect(
+      routeApi.calls.some((call) => call.operation === 'delete-secret'),
+    ).toBe(false);
+    expect(runner.calls.map(operation)).not.toContain('delete --name');
+  });
+
+  it('cleans a failed first deployment after secret versions leave Wrangler list output', async () => {
+    const digest = deploymentSpecDigest(deployment);
+    const routeApi = new FakeRouteApi();
+    routeApi.secretNames.clear();
+    for (let index = 1; index <= 12; index += 1) {
+      routeApi.secretNames.add(`SECRET_${String(index).padStart(2, '0')}`);
+    }
+    let workerExists = false;
+    let initialStatusFailed = false;
+    let deployedVersionId = 'version-new';
+    let listedVersionIds: string[] = [];
+    const runner = new FakeRunner(async (arguments_) => {
+      const command = arguments_.slice(0, 2).join(' ');
+      if (command === 'deployments status') {
+        if (!workerExists) throw notFound('Worker');
+        if (!initialStatusFailed) {
+          initialStatusFailed = true;
+          throw new Error('deployment status interrupted');
+        }
+        return {
+          stdout: JSON.stringify({
+            versions: [{ version_id: deployedVersionId, percentage: 100 }],
+          }),
+          stderr: '',
+        };
+      }
+      if (command === 'versions list') {
+        if (!workerExists) throw notFound('Worker');
+        return {
+          stdout: JSON.stringify(
+            listedVersionIds.slice(-10).map((id) => listedVersion(id, digest)),
+          ),
+          stderr: '',
+        };
+      }
+      if (command === 'versions view') {
+        return { stdout: JSON.stringify(viewedVersion(digest)), stderr: '' };
+      }
+      if (arguments_[0] === 'deploy') {
+        workerExists = true;
+        routeApi.scriptPresent = true;
+        routeApi.workersDevEnabled = true;
+        listedVersionIds = ['version-new'];
+      }
+      if (arguments_[0] === 'delete') {
+        workerExists = false;
+        routeApi.scriptPresent = false;
+      }
+      return { stdout: '', stderr: '' };
+    });
+    let secretVersion = 1;
+    routeApi.afterDeleteControlSecret = () => {
+      secretVersion += 1;
+      deployedVersionId = `version-secret-delete-${secretVersion}`;
+      listedVersionIds = [...listedVersionIds, deployedVersionId];
+    };
+
+    await expect(
+      backend(runner, { routeApi }).deployWorker(
+        deployment,
+        database,
+        secrets,
+        undefined,
+        mutationFence,
+      ),
+    ).rejects.toMatchObject({
+      createdByAttempt: true,
+      resourceState: 'absent',
+    });
+    expect(listedVersionIds.slice(-10)).not.toContain('version-new');
+    expect(
+      routeApi.calls.filter((call) => call.operation === 'delete-secret'),
+    ).toHaveLength(12);
+    expect(runner.calls.map(operation)).toContain('delete --name');
   });
 
   it.each([
@@ -2027,7 +2161,9 @@ export default {
     const runner = new FakeRunner(async () => {
       throw notFound();
     });
-    const subject = backend(runner);
+    const routeApi = new FakeRouteApi();
+    routeApi.secretNames.clear();
+    const subject = backend(runner, { routeApi });
 
     await expect(revokeDeploymentCredentials(subject)).resolves.toBeUndefined();
     await expect(deleteDeploymentWorker(subject)).resolves.toBeUndefined();
@@ -2043,33 +2179,28 @@ export default {
     ]);
   });
 
-  it('attests exact Worker ownership before revoking credentials', async () => {
+  it('attests exact Worker ownership while removing traffic before credential revocation', async () => {
     const drifted = viewedVersion(deploymentSpecDigest(deployment), {
       ...database,
       id: 'foreign-database',
     });
     const runner = ownedWorkerRunner({ version: drifted });
 
-    await expect(revokeDeploymentCredentials(backend(runner))).rejects.toThrow(
+    await expect(removeDeploymentTraffic(backend(runner))).rejects.toThrow(
       /drifted tenant, environment, specification, or D1/,
-    );
-    expect(runner.calls.some((call) => call.arguments[0] === 'secret')).toBe(
-      false,
     );
 
     const mismatchedDigest = ownedWorkerRunner({
       version: viewedVersion('b'.repeat(64)),
     });
     await expect(
-      revokeDeploymentCredentials(backend(mismatchedDigest)),
+      removeDeploymentTraffic(backend(mismatchedDigest)),
     ).rejects.toThrow(/mismatched fleet specification digest/);
-    expect(
-      mismatchedDigest.calls.some((call) => call.arguments[0] === 'secret'),
-    ).toBe(false);
   });
 
   it('revokes credentials through the REST route API without spawning Wrangler secret commands', async () => {
     const routeApi = new FakeRouteApi();
+    routeApi.scriptPresent = true;
     const runner = ownedWorkerRunner();
 
     await expect(
@@ -2093,8 +2224,326 @@ export default {
     );
   });
 
+  it('deletes an attested Worker after secret versions push its persisted anchor out of Wrangler list output', async () => {
+    const digest = deploymentSpecDigest(deployment);
+    const routeApi = new FakeRouteApi([
+      {
+        id: 'owned-domain',
+        hostname: deployment.routeHostname,
+        service: deployment.scriptName,
+      },
+    ]);
+    routeApi.scriptPresent = true;
+    routeApi.workersDevEnabled = true;
+    routeApi.previewUrlsEnabled = true;
+    routeApi.secretNames.clear();
+    for (let index = 1; index <= 12; index += 1) {
+      routeApi.secretNames.add(`SECRET_${String(index).padStart(2, '0')}`);
+    }
+    let workerExists = true;
+    let deployedVersionIds = ['version-owned'];
+    let listedVersionIds = ['version-owned'];
+    const runner = new FakeRunner(async (arguments_) => {
+      const command = arguments_.slice(0, 2).join(' ');
+      if (command === 'deployments status') {
+        if (!workerExists) throw notFound('Worker');
+        return {
+          stdout: JSON.stringify({
+            versions: deployedVersionIds.map((version_id) => ({
+              version_id,
+              percentage: version_id === deployedVersionIds.at(-1) ? 100 : 0,
+            })),
+          }),
+          stderr: '',
+        };
+      }
+      if (command === 'versions list') {
+        if (!workerExists) throw notFound('Worker');
+        return {
+          stdout: JSON.stringify(
+            listedVersionIds.slice(-10).map((id) => listedVersion(id, digest)),
+          ),
+          stderr: '',
+        };
+      }
+      if (command === 'versions view') {
+        return { stdout: JSON.stringify(viewedVersion(digest)), stderr: '' };
+      }
+      if (arguments_[0] === 'delete') {
+        workerExists = false;
+        routeApi.scriptPresent = false;
+      }
+      return { stdout: '', stderr: '' };
+    });
+    let secretVersion = 1;
+    routeApi.afterDeleteControlSecret = () => {
+      secretVersion += 1;
+      const id = `version-secret-delete-${secretVersion}`;
+      deployedVersionIds = [id];
+      listedVersionIds = [...listedVersionIds, id];
+    };
+    const subject = backend(runner, { routeApi });
+
+    await subject.removeTraffic(
+      deployment,
+      undefined,
+      activeRelease,
+      database,
+      mutationFence,
+    );
+    const callsBeforeRevocation = runner.calls.length;
+    await subject.revokeCredentials(
+      deployment,
+      undefined,
+      activeRelease,
+      database,
+      mutationFence,
+    );
+    expect(runner.calls.length).toBeGreaterThan(callsBeforeRevocation);
+
+    expect(deployedVersionIds).toEqual(['version-secret-delete-13']);
+    expect(listedVersionIds).toHaveLength(13);
+    expect(listedVersionIds.slice(-10)).not.toContain('version-owned');
+    await expect(
+      subject.deleteWorker(
+        deployment,
+        undefined,
+        database,
+        activeRelease,
+        mutationFence,
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(
+      runner.calls.filter(
+        (call) =>
+          call.arguments.slice(0, 3).join(' ') ===
+          'versions view version-owned',
+      ).length,
+    ).toBeGreaterThan(1);
+    expect(
+      routeApi.calls.filter((call) => call.operation === 'delete-secret'),
+    ).toHaveLength(12);
+    expect(runner.calls.map(operation)).toContain('delete --name');
+  });
+
+  it('accepts an exact deployed anchor excluded by newer undeployed list entries', async () => {
+    const digest = deploymentSpecDigest(deployment);
+    const routeApi = new FakeRouteApi();
+    routeApi.scriptPresent = true;
+    const runner = new FakeRunner(async (arguments_) => {
+      const command = arguments_.slice(0, 2).join(' ');
+      if (command === 'deployments status') {
+        return {
+          stdout: JSON.stringify({
+            versions: [{ version_id: 'version-owned', percentage: 100 }],
+          }),
+          stderr: '',
+        };
+      }
+      if (command === 'versions list') {
+        return {
+          stdout: JSON.stringify(
+            Array.from({ length: 10 }, (_, index) =>
+              listedVersion(`version-newer-${index}`, digest),
+            ),
+          ),
+          stderr: '',
+        };
+      }
+      if (command === 'versions view') {
+        return { stdout: JSON.stringify(viewedVersion(digest)), stderr: '' };
+      }
+      return { stdout: '', stderr: '' };
+    });
+
+    await expect(
+      backend(runner, { routeApi }).revokeCredentials(
+        deployment,
+        undefined,
+        activeRelease,
+        database,
+        mutationFence,
+      ),
+    ).resolves.toBeUndefined();
+    expect(
+      routeApi.calls.filter((call) => call.operation === 'delete-secret'),
+    ).toHaveLength(2);
+  });
+
+  it('refuses secret revocation when the Worker is replaced after the pre-mutation gate', async () => {
+    const digest = deploymentSpecDigest(deployment);
+    const routeApi = new FakeRouteApi([
+      {
+        id: 'owned-domain',
+        hostname: deployment.routeHostname,
+        service: deployment.scriptName,
+      },
+    ]);
+    routeApi.scriptPresent = true;
+    routeApi.workersDevEnabled = true;
+    let deployedVersionId = 'version-owned';
+    let currentVersion = viewedVersion(digest);
+    const runner = new FakeRunner(async (arguments_) => {
+      const command = arguments_.slice(0, 2).join(' ');
+      if (command === 'deployments status') {
+        return {
+          stdout: JSON.stringify({
+            versions: [{ version_id: deployedVersionId, percentage: 100 }],
+          }),
+          stderr: '',
+        };
+      }
+      if (command === 'versions list') {
+        return {
+          stdout: JSON.stringify([
+            listedVersion('version-owned', digest),
+            ...(deployedVersionId === 'version-owned'
+              ? []
+              : [listedVersion(deployedVersionId, digest)]),
+          ]),
+          stderr: '',
+        };
+      }
+      if (command === 'versions view') {
+        return { stdout: JSON.stringify(currentVersion), stderr: '' };
+      }
+      return { stdout: '', stderr: '' };
+    });
+    const subject = backend(runner, { routeApi });
+
+    await subject.removeTraffic(
+      deployment,
+      undefined,
+      activeRelease,
+      database,
+      mutationFence,
+    );
+    deployedVersionId = 'version-foreign';
+    currentVersion = viewedVersion(digest, {
+      ...database,
+      id: 'foreign-database',
+    });
+
+    await expect(
+      subject.revokeCredentials(
+        deployment,
+        undefined,
+        activeRelease,
+        database,
+        mutationFence,
+      ),
+    ).rejects.toThrow(/drifted live teardown ownership/u);
+    expect(
+      routeApi.calls.some((call) => call.operation === 'delete-secret'),
+    ).toBe(false);
+  });
+
+  it('refuses deletion when a credentials-revoked Worker is replaced immediately before live attestation', async () => {
+    const digest = deploymentSpecDigest(deployment);
+    const routeApi = new FakeRouteApi();
+    routeApi.scriptPresent = true;
+    let deployedVersionId = 'version-owned';
+    let currentVersion = viewedVersion(digest);
+    routeApi.beforeListCustomDomains = () => {
+      deployedVersionId = 'version-foreign';
+      currentVersion = viewedVersion(digest, {
+        ...database,
+        id: 'foreign-database',
+      });
+      routeApi.beforeListCustomDomains = undefined;
+    };
+    const runner = new FakeRunner(async (arguments_) => {
+      const command = arguments_.slice(0, 2).join(' ');
+      if (command === 'deployments status') {
+        return {
+          stdout: JSON.stringify({
+            versions: [{ version_id: deployedVersionId, percentage: 100 }],
+          }),
+          stderr: '',
+        };
+      }
+      if (command === 'versions list') {
+        return {
+          stdout: JSON.stringify([
+            listedVersion('version-owned', digest),
+            listedVersion(deployedVersionId, digest),
+          ]),
+          stderr: '',
+        };
+      }
+      if (command === 'versions view') {
+        return { stdout: JSON.stringify(currentVersion), stderr: '' };
+      }
+      return { stdout: '', stderr: '' };
+    });
+
+    await expect(
+      backend(runner, { routeApi }).deleteWorker(
+        deployment,
+        undefined,
+        database,
+        activeRelease,
+        mutationFence,
+      ),
+    ).rejects.toThrow(/drifted live teardown ownership/u);
+    expect(runner.calls.map(operation)).not.toContain('delete --name');
+  });
+
+  it('refuses a same-name recreated Worker even when it copies the persisted identity bindings', async () => {
+    const digest = deploymentSpecDigest(deployment);
+    const routeApi = new FakeRouteApi();
+    routeApi.scriptPresent = true;
+    const runner = new FakeRunner(async (arguments_) => {
+      const command = arguments_.slice(0, 2).join(' ');
+      if (command === 'deployments status') {
+        return {
+          stdout: JSON.stringify({
+            versions: [{ version_id: 'version-recreated', percentage: 100 }],
+          }),
+          stderr: '',
+        };
+      }
+      if (command === 'versions list') {
+        return {
+          stdout: JSON.stringify([listedVersion('version-recreated', digest)]),
+          stderr: '',
+        };
+      }
+      if (command === 'versions view') {
+        if (arguments_[2] === 'version-owned') throw notFound('version');
+        return { stdout: JSON.stringify(viewedVersion(digest)), stderr: '' };
+      }
+      return { stdout: '', stderr: '' };
+    });
+
+    await expect(
+      backend(runner, { routeApi }).revokeCredentials(
+        deployment,
+        undefined,
+        activeRelease,
+        database,
+        mutationFence,
+      ),
+    ).rejects.toThrow(/trusted artifact version anchor/u);
+    expect(
+      routeApi.calls.some((call) => call.operation === 'delete-secret'),
+    ).toBe(false);
+  });
+
+  it('verifies Worker absence when the provider footprint reports no script', async () => {
+    const routeApi = new FakeRouteApi();
+    const runner = ownedWorkerRunner();
+
+    await expect(
+      deleteDeploymentWorker(backend(runner, { routeApi })),
+    ).rejects.toThrow(/remains after its footprint reported absence/u);
+    expect(runner.calls.map(operation)).not.toContain('delete --name');
+  });
+
   it('refuses to advance credential revocation when the provider leaves any ordinary Worker secret', async () => {
     const routeApi = new FakeRouteApi();
+    routeApi.scriptPresent = true;
     routeApi.secretRevocationNoop = true;
     const runner = ownedWorkerRunner();
 
