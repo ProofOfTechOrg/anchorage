@@ -18,6 +18,6 @@ Repository documentation, architecture, and publication checks. Markdown syntax 
   `.dependency-cruiser.cjs` forbids anything under `packages/` from importing
   fleet control.
 - `workerd-server-lifecycle.mjs` — the one `wrangler dev` start/stop protocol
-  shared by the FlowSafe spike and the conformance harness.
+  shared by the FlowSafe workerd harnesses and the conformance harness.
 - `workerd-server-lifecycle.test.mjs` — its vitest suite, run through the root
   `vitest.workerd-lifecycle.config.ts` project.

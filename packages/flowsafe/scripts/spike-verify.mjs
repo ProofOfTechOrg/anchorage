@@ -231,23 +231,22 @@ async function killServer(server) {
 }
 
 async function http(method, path, { body, headers } = {}) {
-  const response = await fetch(`${BASE}${path}`, {
-    method,
-    headers: {
-      ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-      ...headers,
+  return serverLifecycle.requestJson(
+    (recoverySignal) =>
+      fetch(`${BASE}${path}`, {
+        method,
+        headers: {
+          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+          ...headers,
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: recoverySignal ?? AbortSignal.timeout(30_000),
+      }),
+    {
+      requestLabel: `${method} ${path}`,
+      replaySafe: method === 'GET',
     },
-    body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(30_000),
-  });
-  const text = await response.text();
-  try {
-    return { status: response.status, body: JSON.parse(text) };
-  } catch {
-    throw new Error(
-      `${method} ${path} -> ${response.status} non-JSON: ${text.slice(0, 300)}`,
-    );
-  }
+  );
 }
 
 async function httpRaw(method, path, rawBody, headers = {}) {
@@ -781,11 +780,21 @@ async function main() {
     await killServer(currentServer);
   });
 
-  await step('A2 restart: gen-2 on the same persisted state', async () => {
+  await step('A2 restart: gen-2 restored state ready', async () => {
     await launchServer('gen-2', stateDir, join(tmpDir, 'gen2.log'));
     assert(
       !/address already in use/i.test(currentServer.chunks.join('')),
       'gen-2 log must not contain "address already in use" (orphan trap)',
+    );
+    const recovered = await http('GET', guardedStatusPath(guardedRun), {
+      headers: AUTH.viewer,
+    });
+    assert(
+      recovered.status === 200 &&
+        recovered.body.summary?.status === 'suspended' &&
+        recovered.body.approval?.id === guardedRun.approvalId,
+      'gen-2 restored the authoritative guarded status path',
+      recovered,
     );
   });
 

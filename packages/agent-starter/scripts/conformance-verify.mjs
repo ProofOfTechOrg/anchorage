@@ -64,6 +64,20 @@ const ALLOWED_UPSTREAM = `http://localhost:${UPSTREAM_PORT}/probe`;
 const DENIED_UPSTREAM = `http://127.0.0.1:${UPSTREAM_PORT}/probe`;
 const DENIED_STATUS = 403;
 const CONTRACT_VERSION = CONTRACT.contractVersion;
+// The contract encodes every action as POST. Only these operations are reads,
+// so only these are safe to replay when Miniflare loses the response channel.
+const REPLAY_SAFE_ACTIONS = new Set([
+  'application-bindings',
+  'connector-egress-allowed',
+  'connector-egress-denied',
+  'cpu-control',
+  'flowsafe-status',
+  'r2-absent',
+  'r2-read',
+  'state-egress-allowed',
+  'state-egress-denied',
+  'state-marker-get',
+]);
 
 /**
  * LOCAL HARNESS FIXTURES, and they must equal what the wrangler configurations
@@ -110,20 +124,27 @@ async function step(label, run) {
 }
 
 async function action(name, input = {}, expectedStatus = 200) {
-  const response = await fetch(ACTIONS_URL, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      contractVersion: CONTRACT_VERSION,
-      action: name,
-      ...input,
-    }),
-    redirect: 'manual',
-  });
-  const body = await response.json();
+  const { status, body } = await lifecycle.requestJson(
+    (recoverySignal) =>
+      fetch(ACTIONS_URL, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          contractVersion: CONTRACT_VERSION,
+          action: name,
+          ...input,
+        }),
+        redirect: 'manual',
+        ...(recoverySignal === undefined ? {} : { signal: recoverySignal }),
+      }),
+    {
+      requestLabel: `conformance ${name}`,
+      replaySafe: REPLAY_SAFE_ACTIONS.has(name),
+    },
+  );
   assert(
-    response.status === expectedStatus,
-    `${name} returned ${response.status}, expected ${expectedStatus}`,
+    status === expectedStatus,
+    `${name} returned ${status}, expected ${expectedStatus}`,
     body,
   );
   assert(

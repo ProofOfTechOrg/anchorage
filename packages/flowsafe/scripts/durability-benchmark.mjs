@@ -138,23 +138,22 @@ async function kill() {
 }
 
 async function http(method, path, body) {
-  const response = await fetch(`${BASE}${path}`, {
-    method,
-    headers:
-      body === undefined ? undefined : { 'content-type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(30_000),
-  });
-  const text = await response.text();
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw new Error(
-      `${method} ${path} returned non-JSON ${response.status}: ${text}`,
-    );
-  }
-  return { status: response.status, body: parsed };
+  return lifecycle.requestJson(
+    (recoverySignal) =>
+      fetch(`${BASE}${path}`, {
+        method,
+        headers:
+          body === undefined
+            ? undefined
+            : { 'content-type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: recoverySignal ?? AbortSignal.timeout(30_000),
+      }),
+    {
+      requestLabel: `${method} ${path}`,
+      replaySafe: method === 'GET',
+    },
+  );
 }
 
 const get = (path) => http('GET', path);
@@ -165,6 +164,7 @@ async function waitFor(path, predicate, label, timeoutMs = 15_000) {
   let latest;
   while (Date.now() < deadline) {
     latest = await get(path);
+    assert(latest.status === 200, `${label} status read failed`, latest);
     if (predicate(latest)) return latest;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
