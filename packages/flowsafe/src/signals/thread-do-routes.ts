@@ -52,6 +52,7 @@ import {
 import {
   DoStatusError,
   isPathSafeId,
+  type RunStatus,
   type ThreadScope,
 } from '../do-runner/index.js';
 import { internalErrorResponse } from '../internal-error-response.js';
@@ -120,6 +121,8 @@ export interface StartIdleRunInput {
 export interface StartIdleRunResult {
   /** Authoritative run id; may differ when the start joined an active run. */
   runId: string;
+  /** Authoritative start status; canceled lifecycle terminals become discard receipts. */
+  status?: RunStatus;
   signalId?: string;
 }
 
@@ -1049,6 +1052,16 @@ async function handleWake(options: {
         ? { safeContext: options.safeContext }
         : {}),
     });
+    if (
+      started.status === 'canceled' ||
+      started.status === 'cancelled' ||
+      started.status === 'timed_out'
+    ) {
+      return json({
+        decision: { action: 'discard', runId: started.runId },
+        capped: false,
+      });
+    }
     const signalId = started.signalId ?? options.signal?.id;
     return json({
       decision: { action: 'wake', runId: started.runId },

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import {
-  createAgentApprovalResumer,
   createAgentRouter,
   createAgentThreadTopology,
 } from '@proofoftech/flowsafe/agent-host';
@@ -57,8 +56,8 @@ import {
   StarterThread,
 } from './durable-objects.js';
 import {
-  contextForRegisteredResources,
   contextForResourceOwner,
+  starterRunnerLifecycleConfig,
   systemContext,
 } from './principal-context.js';
 import {
@@ -156,8 +155,8 @@ async function handleBackgroundRoutes(
 }
 
 const workerConfig = {
+  ...starterRunnerLifecycleConfig,
   workflows: WORKFLOWS,
-  systemPrincipalId: SYSTEM_PRINCIPAL_ID,
   buildVerifier,
   maintenance: {
     sweepIntervalMs: 5 * 60 * 1_000,
@@ -216,26 +215,6 @@ const workerConfig = {
         env.THREAD,
         env.DEPLOYMENT_IDENTITY_SECRET,
       ),
-    }),
-  buildResumeRun: (fallback, env) =>
-    createAgentApprovalResumer({
-      fallback,
-      agents: [STARTER_AGENT_META],
-      topology: createAgentThreadTopology(
-        env.THREAD,
-        env.DEPLOYMENT_IDENTITY_SECRET,
-      ),
-      contextForPrincipal: (principal, record) => {
-        const target = record.resumeTarget;
-        if (target?.kind !== 'agent-thread') {
-          throw new Error('agent approval has no registered thread target');
-        }
-        return contextForRegisteredResources(env, principal, [
-          { kind: 'thread', resourceId: target.threadId },
-          { kind: 'resource', resourceId: target.resourceId },
-          { kind: 'run', resourceId: record.runId },
-        ]);
-      },
     }),
   buildSignalRouter: (resolve, env) =>
     createSignalRouter({

@@ -53,7 +53,10 @@ import {
   type ThreadScope,
 } from '../do-runner/index.js';
 import { mastraRegistryEntries } from '../do-runner/mastra-registry.js';
-import { reconcileApprovalsForSummary } from '../host-kit/index.js';
+import {
+  abandonApprovalsForRun,
+  reconcileApprovalsForSummary,
+} from '../host-kit/index.js';
 import { createAgentModuleCatalog } from './catalog.js';
 import { AGENT_HOST_ROUTE_PREFIX } from './thread-topology.js';
 import {
@@ -133,6 +136,12 @@ export interface ThreadAgentHostOptions {
   resourceAccess: () => RecoverableResourceOwnershipStore;
   /** Existing schedules domain used to verify schedule.fire target provenance. */
   scheduleSource?: () => ScheduleSourceStore;
+  /** Authoritatively discard an executing or same-run settled dispatch. */
+  discardScheduleDispatch?: (
+    scheduleId: string,
+    dispatchId: string,
+    runId: string,
+  ) => Promise<void>;
   approvalService: (scope: AgentThreadInstanceScope) => ApprovalService;
   systemPrincipalId?: string;
   audit?: ApprovalAuditSink;
@@ -152,6 +161,11 @@ export interface ThreadAgentStartInput {
   scheduleId?: string;
   /** Prepared trigger authorizing this exact schedule fire and run id. */
   dispatchId?: string;
+  /**
+   * Trusted signal-dispatch marker set only after beginAgentScheduleDispatch
+   * returned the executing lease. Direct scheduled starts leave it absent.
+   */
+  scheduleDispatchLease?: 'executing';
   /**
    * Non-reserved context accepted from trusted internal topology calls only.
    * It is never part of the public agent-start request contract.
@@ -255,6 +269,8 @@ const TERMINAL_RUN_STATUSES: readonly RunSummary['status'][] = [
   'canceled',
   'bailed',
   'skipped',
+  'cancelled',
+  'timed_out',
 ];
 
 const AGENT_OWNER_RECOVERY_PREFIX = 'flowsafe:agent-owner-recovery:v1:';
@@ -816,35 +832,49 @@ export function createThreadAgentHost(
   const releaseEphemeralOwnerClaims = async (
     recovery: AgentOwnerRecovery,
   ): Promise<void> => {
+    const ownership = options.resourceAccess();
+    const release = async (
+      kind: 'resource' | 'thread',
+      resourceId: string,
+    ): Promise<void> => {
+      if (await ownership.release(kind, resourceId, recovery.owner)) return;
+      if (await ownership.owner(kind, resourceId)) {
+        throw new Error(
+          `${kind} '${resourceId}' ownership could not be released`,
+        );
+      }
+    };
     await Promise.all([
-      options
-        .resourceAccess()
-        .release('resource', recovery.resourceId, recovery.owner),
-      options
-        .resourceAccess()
-        .release('thread', recovery.threadId, recovery.owner),
+      release('resource', recovery.resourceId),
+      release('thread', recovery.threadId),
     ]);
   };
+
+  const finalizeOwnerRecovery = (
+    recovery: AgentOwnerRecovery,
+    summary: RunSummary,
+  ): Promise<void> =>
+    withRecoveryLock(async () => {
+      const storage = options.stateStorage();
+      await options.resourceAccess().settleReservation(recovery.token, []);
+      if (!recovery.threaded && !isTerminalRunStatus(summary.status)) {
+        await ensureOwnerRecoveryAlarm(storage);
+        return;
+      }
+      if (!recovery.threaded) {
+        await releaseEphemeralOwnerClaims(recovery);
+      }
+      const key = ownerRecoveryKey(recovery.runId);
+      const current = await storage.get<AgentOwnerRecovery>(key);
+      if (current?.token === recovery.token) await storage.delete(key);
+    });
 
   const finalizeOwnerRecoveryBestEffort = async (
     recovery: AgentOwnerRecovery,
     summary: RunSummary,
   ): Promise<void> => {
     try {
-      await withRecoveryLock(async () => {
-        const storage = options.stateStorage();
-        await options.resourceAccess().settleReservation(recovery.token, []);
-        if (!recovery.threaded && !isTerminalRunStatus(summary.status)) {
-          await ensureOwnerRecoveryAlarm(storage);
-          return;
-        }
-        if (!recovery.threaded) {
-          await releaseEphemeralOwnerClaims(recovery);
-        }
-        const key = ownerRecoveryKey(recovery.runId);
-        const current = await storage.get<AgentOwnerRecovery>(key);
-        if (current?.token === recovery.token) await storage.delete(key);
-      });
+      await finalizeOwnerRecovery(recovery, summary);
     } catch (error) {
       console.error('agent owner recovery cleanup failed', error);
       try {
@@ -855,6 +885,42 @@ export function createThreadAgentHost(
         console.error('agent owner recovery rearm failed', alarmError);
       }
     }
+  };
+
+  const validateOwnerRecovery = (
+    threadId: string,
+    key: string,
+    stored: AgentOwnerRecovery,
+  ): void => {
+    if (
+      stored?.version !== 1 ||
+      stored.threadId !== threadId ||
+      !isPathSafeId(stored.agentId) ||
+      !isPathSafeId(stored.resourceId) ||
+      !isPathSafeId(stored.runId) ||
+      !isPathSafeId(stored.token) ||
+      ownerRecoveryKey(stored.runId) !== key ||
+      typeof stored.threaded !== 'boolean' ||
+      typeof stored.bindingPreexisting !== 'boolean'
+    ) {
+      throw new Error('stored agent owner recovery is malformed');
+    }
+    resourceOwner(stored.owner);
+  };
+
+  const finalizeTerminalAgentState = async (
+    threadId: string,
+    runId: string,
+    summary: RunSummary,
+  ): Promise<void> => {
+    const storage = options.stateStorage();
+    const key = ownerRecoveryKey(runId);
+    const recovery = await storage.get<AgentOwnerRecovery>(key);
+    if (recovery) {
+      validateOwnerRecovery(threadId, key, recovery);
+      await finalizeOwnerRecovery(recovery, summary);
+    }
+    await deleteAgentRunRecord(storage, runId);
   };
 
   const withExecution = async <T>(
@@ -1123,20 +1189,7 @@ export function createThreadAgentHost(
   ): Promise<'cleared' | 'pending'> =>
     withBindingLock(() =>
       withRecoveryLock(async () => {
-        if (
-          stored?.version !== 1 ||
-          stored.threadId !== threadId ||
-          !isPathSafeId(stored.agentId) ||
-          !isPathSafeId(stored.resourceId) ||
-          !isPathSafeId(stored.runId) ||
-          !isPathSafeId(stored.token) ||
-          ownerRecoveryKey(stored.runId) !== key ||
-          typeof stored.threaded !== 'boolean' ||
-          typeof stored.bindingPreexisting !== 'boolean'
-        ) {
-          throw new Error('stored agent owner recovery is malformed');
-        }
-        resourceOwner(stored.owner);
+        validateOwnerRecovery(threadId, key, stored);
         const storage = options.stateStorage();
         const currentRecovery = await storage.get<AgentOwnerRecovery>(key);
         if (currentRecovery?.token !== stored.token) return 'pending';
@@ -1437,28 +1490,37 @@ export function createThreadAgentHost(
           return recovery;
         });
         try {
+          const streamOptions = {
+            runId: ref.runId,
+            requestContext: createTrustedAgentRequestContext(execution),
+            ...(input.threaded !== false
+              ? {
+                  memory: {
+                    thread: scope.threadId,
+                    resource: ref.resourceId,
+                  },
+                }
+              : {}),
+            maxSteps: module.agent.maxSteps,
+            disableBackgroundTasks: true,
+            ...(resolvedProviderOptions !== undefined
+              ? { providerOptions: providerOptions(resolvedProviderOptions) }
+              : {}),
+          };
+          const scheduleDispatch =
+            source.target &&
+            input.scheduleId &&
+            input.dispatchId &&
+            input.scheduleDispatchLease === 'executing'
+              ? { scheduleId: input.scheduleId, dispatchId: input.dispatchId }
+              : undefined;
           await durable.streamUntilPersisted(
             messages,
-            {
-              runId: ref.runId,
-              requestContext: createTrustedAgentRequestContext(execution),
-              ...(input.threaded !== false
-                ? {
-                    memory: {
-                      thread: scope.threadId,
-                      resource: ref.resourceId,
-                    },
-                  }
-                : {}),
-              maxSteps: module.agent.maxSteps,
-              disableBackgroundTasks: true,
-              ...(resolvedProviderOptions !== undefined
-                ? { providerOptions: providerOptions(resolvedProviderOptions) }
-                : {}),
-            },
+            streamOptions,
             scope.principal.id,
             scope.principal.kind,
             recovery.token,
+            ...(scheduleDispatch ? ([scheduleDispatch] as const) : []),
           );
           const summary = await scope.init.runtime.status(
             DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
@@ -1544,8 +1606,50 @@ export function createThreadAgentHost(
         durableAgent,
       };
     },
-    route: (request, scope) =>
-      withDispatchLock(async () => {
+    route: async (request, scope) => {
+      let preflightedTermination = false;
+      const preflightUrl = new URL(request.url);
+      const preflightSuffix = preflightUrl.pathname.startsWith(
+        AGENT_HOST_ROUTE_PREFIX,
+      )
+        ? preflightUrl.pathname.slice(AGENT_HOST_ROUTE_PREFIX.length)
+        : '';
+      const preflightSegments = preflightSuffix.split('/').filter(Boolean);
+      if (
+        request.method === 'POST' &&
+        preflightSegments.length === 4 &&
+        preflightSegments[0] === 'runs' &&
+        preflightSegments[3] === 'terminate'
+      ) {
+        const agentId = decode(preflightSegments[1]);
+        const runId = decode(preflightSegments[2]);
+        const resourceId = preflightUrl.searchParams.get('resourceId');
+        if (!agentId || !runId || !resourceId) {
+          throw new AgentHostRequestError(404, 'run not found');
+        }
+        const ref = runRef(scope, {
+          agentId,
+          threadId: scope.threadId,
+          resourceId,
+          runId,
+        });
+        const storedRun = await readRun(ref.runId);
+        if (storedRun && storedRun.agentId !== ref.agentId) {
+          throw new AgentHostRequestError(404, 'run not found');
+        }
+        await snapshotExecutionFor(scope, ref);
+        const owner = await options.resourceAccess().owner('run', ref.runId);
+        if (preflightUrl.searchParams.get('replay') !== '1') {
+          await scope.init.runtime.cancelActiveExecution(
+            DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
+            ref.runId,
+            'cancelled',
+            [scope.principal, owner ?? scope.principal],
+          );
+          preflightedTermination = true;
+        }
+      }
+      return withDispatchLock(async () => {
         const url = new URL(request.url);
         if (!url.pathname.startsWith(AGENT_HOST_ROUTE_PREFIX)) return null;
 
@@ -1735,6 +1839,102 @@ export function createThreadAgentHost(
 
         if (
           segments.length === 4 &&
+          segments[3] === 'terminate' &&
+          request.method === 'POST'
+        ) {
+          const runtime = scope.init.runtime;
+          const replayOnly = url.searchParams.get('replay') === '1';
+          const storedRun = await readRun(ref.runId);
+          if (storedRun && storedRun.agentId !== ref.agentId) {
+            throw new AgentHostRequestError(404, 'run not found');
+          }
+          await snapshotExecutionFor(scope, ref);
+          const preflightOwner = await options
+            .resourceAccess()
+            .owner('run', ref.runId);
+          if (!replayOnly && !preflightedTermination) {
+            await runtime.cancelActiveExecution(
+              DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
+              ref.runId,
+              'cancelled',
+              [scope.principal, preflightOwner ?? scope.principal],
+            );
+          }
+          const owner = await options.resourceAccess().owner('run', ref.runId);
+          if (replayOnly) {
+            const existing = await runtime.status(
+              DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
+              ref.runId,
+            );
+            if (
+              existing?.status !== 'cancelled' &&
+              existing?.status !== 'timed_out'
+            ) {
+              throw new AgentHostRequestError(404, 'run not found');
+            }
+          }
+          const transition = await runtime.terminateAsPrincipal(
+            DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
+            ref.runId,
+            scope.principal,
+            owner ?? scope.principal,
+          );
+          let summary = transition.summary;
+          if (!transition.cleanup.cleanupCompleted) {
+            await abandonApprovalsForRun(
+              options.approvalService(scope),
+              DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
+              ref.runId,
+              transition.cleanup.status,
+              options.systemPrincipalId ?? 'flowsafe-system',
+            );
+            const dispatch = transition.cleanup.scheduleDispatch;
+            if (dispatch) {
+              if (!options.discardScheduleDispatch) {
+                throw new Error(
+                  'scheduled agent termination requires a dispatch-discard hook',
+                );
+              }
+              await options.discardScheduleDispatch(
+                dispatch.scheduleId,
+                dispatch.dispatchId,
+                ref.runId,
+              );
+            }
+            const released = await options
+              .resourceAccess()
+              .release('run', ref.runId, owner ?? scope.principal);
+            if (!released) {
+              const current = await options
+                .resourceAccess()
+                .owner('run', ref.runId);
+              if (current) {
+                throw new Error(
+                  `run '${ref.runId}' ownership could not be released`,
+                );
+              }
+            }
+          }
+          await finalizeTerminalAgentState(scope.threadId, ref.runId, summary);
+          if (!transition.cleanup.cleanupCompleted) {
+            summary = await runtime.completeTerminalCleanup(
+              DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
+              ref.runId,
+              transition.cleanup.revision,
+            );
+          }
+          return json(
+            await envelopeFor(
+              scope,
+              ref,
+              storedRun?.principal ?? scope.principal,
+              summary,
+            ),
+          );
+        }
+
+        if (
+          segments.length === 4 &&
           segments[3] === 'stream' &&
           request.method === 'GET'
         ) {
@@ -1786,11 +1986,13 @@ export function createThreadAgentHost(
 
         const known =
           segments.length === 3 ||
-          (segments.length === 4 && segments[3] === 'stream');
+          (segments.length === 4 &&
+            (segments[3] === 'stream' || segments[3] === 'terminate'));
         return known
           ? json({ error: 'method not allowed' }, 405)
           : json({ error: 'not found' }, 404);
-      }),
+      });
+    },
   };
   return host;
 }

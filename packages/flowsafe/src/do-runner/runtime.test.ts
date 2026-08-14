@@ -1049,6 +1049,909 @@ describe('RunnerRuntime.status projection', () => {
   });
 });
 
+describe('RunnerRuntime run lifecycle', () => {
+  const principal = { kind: 'human' as const, id: 'operator-1' };
+
+  function heldRuntime(
+    options: {
+      suspendFirst?: boolean;
+      storage?: InMemoryStore;
+      cancelFailures?: number;
+      cancelNoop?: boolean;
+    } = {},
+  ): {
+    runtime: RunnerRuntime;
+    entered: Promise<void>;
+    release: () => void;
+    completed: () => boolean;
+  } {
+    let enter!: () => void;
+    let release!: () => void;
+    let completed = false;
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { createWorkflow, createStep, runtime } = init({
+      storage: options.storage ?? new InMemoryStore(),
+    });
+    const step = createStep({
+      id: 'held',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ ok: z.boolean() }),
+      suspendSchema: z.object({ reason: z.string() }),
+      execute: async ({ resumeData, suspend, abortSignal }) => {
+        if (options.suspendFirst && !resumeData) {
+          return suspend({ reason: 'resume to enter held work' });
+        }
+        enter();
+        await Promise.race([
+          held,
+          new Promise<never>((_resolve, reject) => {
+            abortSignal.addEventListener(
+              'abort',
+              () => reject(new Error('held work aborted')),
+              { once: true },
+            );
+          }),
+        ]);
+        completed = true;
+        return { ok: true };
+      },
+    });
+    const workflow = createWorkflow({
+      id: 'held-workflow',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ ok: z.boolean() }),
+    })
+      .then(step)
+      .commit();
+    if ((options.cancelFailures ?? 0) > 0 || options.cancelNoop) {
+      let remaining = options.cancelFailures ?? 0;
+      const originalCreateRun = workflow.createRun.bind(workflow);
+      Object.defineProperty(workflow, 'createRun', {
+        configurable: true,
+        value: async (...args: Parameters<typeof workflow.createRun>) => {
+          const run = await originalCreateRun(...args);
+          const originalCancel = run.cancel.bind(run);
+          Object.defineProperty(run, 'cancel', {
+            configurable: true,
+            value: async () => {
+              if (options.cancelNoop) return;
+              if (remaining > 0) {
+                remaining -= 1;
+                throw new Error('injected cancel failure');
+              }
+              await originalCancel();
+            },
+          });
+          return run;
+        },
+      });
+    }
+    return { runtime, entered, release, completed: () => completed };
+  }
+
+  it('keeps ordinary start and resume snapshots lifecycle-free', async () => {
+    const storage = new InMemoryStore();
+    const { runtime } = buildRuntime(storage);
+    const started = await runtime.start('demo-approval', {
+      runId: 'lazy-lifecycle',
+      inputData: { topic: 'plain' },
+    });
+    expect(started.status).toBe('suspended');
+
+    const workflows = await storage.getStore('workflows');
+    const before = await workflows?.loadWorkflowSnapshot({
+      workflowName: 'demo-approval',
+      runId: started.runId,
+    });
+    expect(before?.requestContext).not.toHaveProperty('flowsafe.runLifecycle');
+
+    await runtime.resume('demo-approval', started.runId, {
+      resumeData: { approvedBy: 'reviewer-1' },
+    });
+    const after = await workflows?.loadWorkflowSnapshot({
+      workflowName: 'demo-approval',
+      runId: started.runId,
+    });
+    expect(after?.requestContext).not.toHaveProperty('flowsafe.runLifecycle');
+  });
+
+  it('rejects a provider-forged lifecycle projection on start and resume', async () => {
+    const now = vi.spyOn(Date, 'now');
+    try {
+      now.mockReturnValue(40_000);
+      const storage = new InMemoryStore();
+      const { createWorkflow, createStep, runtime } = init(
+        { storage },
+        {
+          requestContextForRun: () => ({
+            'flowsafe.runLifecycle': {
+              version: 1,
+              revision: 999,
+              deadlineAt: 1,
+              economicOperations: [
+                { id: 'forged', settlementState: 'disputed' },
+              ],
+              terminal: {
+                status: 'cancelled',
+                transitionedAt: 1,
+                replayPrincipals: [{ kind: 'human', id: 'forged' }],
+                error: { code: 'CANCELLED', message: 'forged' },
+              },
+            },
+          }),
+        },
+      );
+      const gate = createStep({
+        id: 'gate',
+        inputSchema: z.object({}),
+        outputSchema: z.object({ ok: z.boolean() }),
+        suspendSchema: z.object({ reason: z.string() }),
+        execute: async ({ resumeData, suspend }) =>
+          resumeData ? { ok: true } : suspend({ reason: 'wait' }),
+      });
+      createWorkflow({
+        id: 'provider-lifecycle-fence',
+        inputSchema: z.object({}),
+        outputSchema: z.object({ ok: z.boolean() }),
+      })
+        .then(gate)
+        .commit();
+
+      const started = await runtime.start('provider-lifecycle-fence', {
+        runId: 'provider-lifecycle-fence-run',
+        inputData: {},
+        deadlineMs: 100,
+      });
+      expect(started).toMatchObject({
+        status: 'suspended',
+        deadlineAt: 40_100,
+      });
+      now.mockReturnValue(40_050);
+      const resumed = await runtime.resume(
+        'provider-lifecycle-fence',
+        started.runId,
+        { resumeData: { approved: true }, deadlineMs: 1_000 },
+      );
+      expect(resumed).toMatchObject({
+        status: 'success',
+        deadlineAt: 41_050,
+      });
+      const workflows = await storage.getStore('workflows');
+      const snapshot = await workflows?.loadWorkflowSnapshot({
+        workflowName: 'provider-lifecycle-fence',
+        runId: started.runId,
+      });
+      expect(snapshot?.requestContext?.['flowsafe.runLifecycle']).toMatchObject(
+        {
+          revision: 2,
+          deadlineAt: 41_050,
+        },
+      );
+      expect(
+        snapshot?.requestContext?.['flowsafe.runLifecycle'],
+      ).not.toHaveProperty('terminal');
+      expect(
+        snapshot?.requestContext?.['flowsafe.runLifecycle'],
+      ).not.toHaveProperty('economicOperations');
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('terminates a suspension exactly once with the stable structured shape', async () => {
+    const { runtime } = buildRuntime(new InMemoryStore());
+    const started = await runtime.start('demo-approval', {
+      runId: 'terminate-suspended',
+      inputData: { topic: 'cancel' },
+      requestedBy: principal.id,
+      requestedByKind: principal.kind,
+      deadlineMs: 60_000,
+    });
+
+    const first = await runtime.terminateAsPrincipal(
+      'demo-approval',
+      started.runId,
+      principal,
+      principal,
+    );
+    const second = await runtime.terminateAsPrincipal(
+      'demo-approval',
+      started.runId,
+      principal,
+      principal,
+    );
+
+    expect(first.transitioned).toBe(true);
+    expect(second.transitioned).toBe(false);
+    expect(second.summary).toEqual(first.summary);
+    expect(first.summary).toMatchObject({
+      runId: 'terminate-suspended',
+      status: 'cancelled',
+      requestedBy: principal.id,
+      requestedByKind: principal.kind,
+      deadlineAt: expect.any(Number),
+      errorEnvelope: { code: 'CANCELLED', message: 'run was cancelled' },
+    });
+    expect(first.summary).not.toHaveProperty('error');
+  });
+
+  it('refuses a persisted disputed settlement before cancellation', async () => {
+    const { runtime } = buildRuntime(new InMemoryStore());
+    const started = await runtime.start('demo-approval', {
+      runId: 'disputed-run',
+      inputData: { topic: 'held' },
+      economicOperations: [{ id: 'charge-1', settlementState: 'disputed' }],
+    });
+
+    await expect(
+      runtime.cancelActiveExecution(
+        'demo-approval',
+        started.runId,
+        'cancelled',
+        [principal],
+      ),
+    ).rejects.toMatchObject({
+      reason: {
+        code: 'DISPUTED_SETTLEMENT',
+        message:
+          'run termination is blocked while an economic operation is disputed',
+      },
+    });
+    await expect(
+      runtime.terminateAsPrincipal(
+        'demo-approval',
+        started.runId,
+        principal,
+        principal,
+      ),
+    ).rejects.toMatchObject({
+      reason: { code: 'DISPUTED_SETTLEMENT' },
+    });
+    await expect(
+      runtime.status('demo-approval', started.runId),
+    ).resolves.toMatchObject({ status: 'suspended' });
+  });
+
+  it('aborts a live running step before persisting the cancelled terminal', async () => {
+    const { runtime, entered, completed } = heldRuntime();
+    const starting = runtime.start('held-workflow', {
+      runId: 'held-cancel',
+      inputData: {},
+      requestedBy: principal.id,
+      requestedByKind: principal.kind,
+    });
+    await entered;
+
+    await expect(
+      runtime.cancelActiveExecution(
+        'held-workflow',
+        'held-cancel',
+        'cancelled',
+        [principal],
+      ),
+    ).resolves.toBe(true);
+    await expect(starting).resolves.toMatchObject({ status: 'canceled' });
+    await expect(
+      runtime.terminateAsPrincipal(
+        'held-workflow',
+        'held-cancel',
+        principal,
+        principal,
+      ),
+    ).resolves.toMatchObject({
+      transitioned: true,
+      summary: { status: 'cancelled', errorEnvelope: { code: 'CANCELLED' } },
+    });
+    expect(completed()).toBe(false);
+    await expect(
+      runtime.status('held-workflow', 'held-cancel'),
+    ).resolves.toMatchObject({ status: 'cancelled' });
+  });
+
+  it('retries a live abort when the durable intent survived a transient cancel failure', async () => {
+    const { runtime, entered, completed } = heldRuntime({
+      cancelFailures: 1,
+    });
+    const starting = runtime.start('held-workflow', {
+      runId: 'held-cancel-retry',
+      inputData: {},
+    });
+    await entered;
+
+    await expect(
+      runtime.cancelActiveExecution(
+        'held-workflow',
+        'held-cancel-retry',
+        'cancelled',
+        [principal],
+      ),
+    ).rejects.toThrow('injected cancel failure');
+    await expect(
+      runtime.cancelActiveExecution(
+        'held-workflow',
+        'held-cancel-retry',
+        'cancelled',
+        [principal],
+      ),
+    ).resolves.toBe(true);
+    await expect(starting).resolves.toMatchObject({ status: 'canceled' });
+    await expect(
+      runtime.terminateAsPrincipal(
+        'held-workflow',
+        'held-cancel-retry',
+        principal,
+        principal,
+      ),
+    ).resolves.toMatchObject({
+      summary: { status: 'cancelled' },
+      transitioned: true,
+    });
+    expect(completed()).toBe(false);
+  });
+
+  it('does not abort a live running step initialized with a disputed settlement', async () => {
+    const { runtime, entered, release, completed } = heldRuntime();
+    const starting = runtime.start('held-workflow', {
+      runId: 'held-disputed',
+      inputData: {},
+      economicOperations: [{ id: 'charge-live', settlementState: 'disputed' }],
+    });
+    await entered;
+
+    await expect(
+      runtime.cancelActiveExecution(
+        'held-workflow',
+        'held-disputed',
+        'cancelled',
+        [principal],
+      ),
+    ).rejects.toMatchObject({
+      reason: { code: 'DISPUTED_SETTLEMENT' },
+    });
+    release();
+    await expect(starting).resolves.toMatchObject({ status: 'success' });
+    expect(completed()).toBe(true);
+  });
+
+  it('extends a persisted deadline on resume and times out only once', async () => {
+    const now = vi.spyOn(Date, 'now');
+    now.mockReturnValue(10_000);
+    const { runtime } = buildRuntime(new InMemoryStore());
+    const started = await runtime.start('demo-approval', {
+      runId: 'deadline-resume',
+      inputData: { topic: 'deadline' },
+      deadlineMs: 100,
+    });
+    expect(started.deadlineAt).toBe(10_100);
+
+    now.mockReturnValue(10_050);
+    const resumed = await runtime.resume('demo-approval', started.runId, {
+      resumeData: { approvedBy: 'reviewer-1' },
+      deadlineMs: 1_000,
+    });
+    expect(resumed.deadlineAt).toBe(11_050);
+
+    const timeoutRun = await runtime.start('demo-approval', {
+      runId: 'deadline-once',
+      inputData: { topic: 'timeout' },
+      deadlineMs: 0,
+    });
+    const first = await runtime.timeOut(
+      'demo-approval',
+      timeoutRun.runId,
+      { expectedRevision: 1, expectedDeadlineAt: 10_050 },
+      10_050,
+    );
+    const second = await runtime.timeOut(
+      'demo-approval',
+      timeoutRun.runId,
+      { expectedRevision: 1, expectedDeadlineAt: 10_050 },
+      10_051,
+    );
+    expect(first.transitioned).toBe(true);
+    expect(second.transitioned).toBe(false);
+    expect(second.summary).toEqual(first.summary);
+    expect(first.summary).toMatchObject({
+      status: 'timed_out',
+      errorEnvelope: { code: 'TIMED_OUT', message: 'run deadline expired' },
+    });
+    now.mockRestore();
+  });
+
+  it('rejects a stale deadline CAS while an extended resume leg is active', async () => {
+    const now = vi.spyOn(Date, 'now');
+    try {
+      now.mockReturnValue(20_000);
+      const { runtime, entered, release, completed } = heldRuntime({
+        suspendFirst: true,
+      });
+      const started = await runtime.start('held-workflow', {
+        runId: 'held-resume-extension',
+        inputData: {},
+        deadlineMs: 100,
+      });
+      expect(started).toMatchObject({
+        status: 'suspended',
+        deadlineAt: 20_100,
+      });
+
+      now.mockReturnValue(20_050);
+      const resuming = runtime.resume(
+        'held-workflow',
+        'held-resume-extension',
+        { resumeData: { approved: true }, deadlineMs: 1_000 },
+      );
+      await entered;
+      await expect(
+        runtime.cancelActiveExecution(
+          'held-workflow',
+          'held-resume-extension',
+          'timed_out',
+          [principal],
+          { expectedRevision: 1, expectedDeadlineAt: 20_100 },
+          20_100,
+        ),
+      ).resolves.toBe(false);
+
+      release();
+      await expect(resuming).resolves.toMatchObject({
+        status: 'success',
+        deadlineAt: 21_050,
+      });
+      expect(completed()).toBe(true);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('preserves an active resume extension and cancellation intent through fresh-runtime recovery', async () => {
+    const now = vi.spyOn(Date, 'now');
+    try {
+      const storage = new InMemoryStore();
+      now.mockReturnValue(30_000);
+      const { runtime, entered } = heldRuntime({
+        suspendFirst: true,
+        storage,
+      });
+      await runtime.start('held-workflow', {
+        runId: 'held-resume-cancel-recovery',
+        inputData: {},
+        deadlineMs: 100,
+      });
+
+      now.mockReturnValue(30_050);
+      const resuming = runtime.resume(
+        'held-workflow',
+        'held-resume-cancel-recovery',
+        {
+          resumeData: { approved: true },
+          deadlineMs: 1_000,
+          economicOperations: [
+            { id: 'charge-resume', settlementState: 'settled' },
+          ],
+        },
+      );
+      await entered;
+      await expect(
+        runtime.cancelActiveExecution(
+          'held-workflow',
+          'held-resume-cancel-recovery',
+          'cancelled',
+          [principal],
+        ),
+      ).resolves.toBe(true);
+      await expect(resuming).resolves.toMatchObject({ status: 'canceled' });
+
+      const workflows = await storage.getStore('workflows');
+      const precursor = await workflows?.loadWorkflowSnapshot({
+        workflowName: 'held-workflow',
+        runId: 'held-resume-cancel-recovery',
+      });
+      expect(
+        precursor?.requestContext?.['flowsafe.runLifecycle'],
+      ).toMatchObject({
+        revision: 3,
+        deadlineAt: 31_050,
+        economicOperations: [
+          { id: 'charge-resume', settlementState: 'settled' },
+        ],
+        transitionIntent: { status: 'cancelled' },
+      });
+
+      const fresh = heldRuntime({ suspendFirst: true, storage }).runtime;
+      await expect(
+        fresh.terminateAsPrincipal(
+          'held-workflow',
+          'held-resume-cancel-recovery',
+          principal,
+          principal,
+        ),
+      ).resolves.toMatchObject({
+        transitioned: true,
+        summary: {
+          status: 'cancelled',
+          deadlineAt: 31_050,
+          errorEnvelope: { code: 'CANCELLED' },
+        },
+      });
+      const terminal = await workflows?.loadWorkflowSnapshot({
+        workflowName: 'held-workflow',
+        runId: 'held-resume-cancel-recovery',
+      });
+      expect(terminal?.requestContext?.['flowsafe.runLifecycle']).toMatchObject(
+        {
+          economicOperations: [
+            { id: 'charge-resume', settlementState: 'settled' },
+          ],
+          terminal: { status: 'cancelled' },
+        },
+      );
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('fences a resume that is still preparing when termination begins', async () => {
+    const storage = new InMemoryStore();
+    const { runtime, completed } = heldRuntime({
+      suspendFirst: true,
+      storage,
+    });
+    await runtime.start('held-workflow', {
+      runId: 'resume-preparation-terminate',
+      inputData: {},
+      deadlineMs: 100,
+    });
+    let preparationEntered!: () => void;
+    let releasePreparation!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      preparationEntered = resolve;
+    });
+    const preparation = new Promise<void>((resolve) => {
+      releasePreparation = resolve;
+    });
+
+    const resuming = runtime.resume(
+      'held-workflow',
+      'resume-preparation-terminate',
+      {
+        resumeData: { approved: true },
+        deadlineMs: 1_000,
+        prepareExecution: async () => {
+          preparationEntered();
+          await preparation;
+        },
+      },
+    );
+    await entered;
+
+    await expect(
+      runtime.cancelActiveExecution(
+        'held-workflow',
+        'resume-preparation-terminate',
+        'cancelled',
+        [principal],
+      ),
+    ).resolves.toBe(false);
+    releasePreparation();
+    await expect(resuming).rejects.toMatchObject({
+      name: 'RunTerminalConflictError',
+    });
+    await expect(
+      runtime.terminateAsPrincipal(
+        'held-workflow',
+        'resume-preparation-terminate',
+        principal,
+        principal,
+      ),
+    ).resolves.toMatchObject({
+      transitioned: true,
+      summary: {
+        status: 'cancelled',
+        deadlineAt: expect.any(Number),
+      },
+    });
+    expect(completed()).toBe(false);
+  });
+
+  it('re-drives a persisted core-canceled precursor after runtime eviction', async () => {
+    const storage = new InMemoryStore();
+    const before = buildRuntime(storage).runtime;
+    await before.start('demo-approval', {
+      runId: 'canceled-wedge',
+      inputData: { topic: 'wedge' },
+      deadlineMs: 1_000,
+    });
+    const workflows = await storage.getStore('workflows');
+    const snapshot = await workflows?.loadWorkflowSnapshot({
+      workflowName: 'demo-approval',
+      runId: 'canceled-wedge',
+    });
+    if (!workflows || !snapshot) throw new Error('snapshot missing');
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'demo-approval',
+      runId: 'canceled-wedge',
+      snapshot: {
+        ...snapshot,
+        status: 'canceled',
+        requestContext: {
+          ...snapshot.requestContext,
+          'flowsafe.runLifecycle': {
+            version: 1,
+            revision: 2,
+            deadlineAt: snapshot.requestContext?.['flowsafe.runLifecycle']
+              ? (
+                  snapshot.requestContext['flowsafe.runLifecycle'] as {
+                    deadlineAt: number;
+                  }
+                ).deadlineAt
+              : 0,
+            transitionIntent: {
+              status: 'cancelled',
+              requestedAt: Date.now(),
+              replayPrincipals: [principal],
+            },
+          },
+        },
+      },
+    });
+
+    const after = buildRuntime(storage).runtime;
+    await expect(
+      after.terminateAsPrincipal(
+        'demo-approval',
+        'canceled-wedge',
+        principal,
+        principal,
+      ),
+    ).resolves.toMatchObject({
+      transitioned: true,
+      summary: {
+        status: 'cancelled',
+        errorEnvelope: { code: 'CANCELLED' },
+      },
+    });
+  });
+
+  it('re-drives a persisted cancellation intent after core writes late success', async () => {
+    const storage = new InMemoryStore();
+    const before = buildRuntime(storage).runtime;
+    await before.start('demo-approval', {
+      runId: 'success-after-cancel-intent',
+      inputData: { topic: 'late-success' },
+      deadlineMs: 1_000,
+    });
+    const workflows = await storage.getStore('workflows');
+    const snapshot = await workflows?.loadWorkflowSnapshot({
+      workflowName: 'demo-approval',
+      runId: 'success-after-cancel-intent',
+    });
+    if (!workflows || !snapshot) throw new Error('snapshot missing');
+    const lifecycle = snapshot.requestContext?.[
+      'flowsafe.runLifecycle'
+    ] as Record<string, unknown>;
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'demo-approval',
+      runId: 'success-after-cancel-intent',
+      snapshot: {
+        ...snapshot,
+        status: 'success',
+        result: { late: true },
+        requestContext: {
+          ...snapshot.requestContext,
+          'flowsafe.runLifecycle': {
+            ...lifecycle,
+            revision: 2,
+            transitionIntent: {
+              status: 'cancelled',
+              requestedAt: Date.now(),
+              replayPrincipals: [principal],
+            },
+          },
+        },
+      },
+    });
+
+    const after = buildRuntime(storage).runtime;
+    await expect(
+      after.terminateAsPrincipal(
+        'demo-approval',
+        'success-after-cancel-intent',
+        principal,
+        principal,
+      ),
+    ).resolves.toMatchObject({
+      transitioned: true,
+      summary: {
+        status: 'cancelled',
+        errorEnvelope: { code: 'CANCELLED' },
+      },
+    });
+    await expect(
+      after.status('demo-approval', 'success-after-cancel-intent'),
+    ).resolves.toMatchObject({
+      status: 'cancelled',
+      errorEnvelope: { code: 'CANCELLED' },
+    });
+  });
+
+  it('repairs an intent dropped by one stale late-success snapshot write', async () => {
+    const storage = new InMemoryStore();
+    const workflows = await storage.getStore('workflows');
+    if (!workflows) throw new Error('workflows storage missing');
+    const originalPersist = workflows.persistWorkflowSnapshot.bind(workflows);
+    let droppedIntent = false;
+    Object.defineProperty(workflows, 'persistWorkflowSnapshot', {
+      configurable: true,
+      value: async (
+        input: Parameters<typeof workflows.persistWorkflowSnapshot>[0],
+      ) => {
+        const lifecycle = input.snapshot.requestContext?.[
+          'flowsafe.runLifecycle'
+        ] as Record<string, unknown> | undefined;
+        if (
+          !droppedIntent &&
+          input.snapshot.status === 'success' &&
+          lifecycle?.transitionIntent
+        ) {
+          droppedIntent = true;
+          const { transitionIntent: _intent, ...staleLifecycle } = lifecycle;
+          return originalPersist({
+            ...input,
+            snapshot: {
+              ...input.snapshot,
+              requestContext: {
+                ...input.snapshot.requestContext,
+                'flowsafe.runLifecycle': staleLifecycle,
+              },
+            },
+          });
+        }
+        return originalPersist(input);
+      },
+    });
+    const { runtime, entered, release } = heldRuntime({
+      storage,
+      cancelNoop: true,
+    });
+    const starting = runtime.start('held-workflow', {
+      runId: 'stale-success-intent-repair',
+      inputData: {},
+    });
+    await entered;
+    await expect(
+      runtime.cancelActiveExecution(
+        'held-workflow',
+        'stale-success-intent-repair',
+        'cancelled',
+        [principal],
+      ),
+    ).resolves.toBe(true);
+    release();
+    await expect(starting).resolves.toMatchObject({ status: 'success' });
+    expect(droppedIntent).toBe(true);
+
+    const repaired = await workflows.loadWorkflowSnapshot({
+      workflowName: 'held-workflow',
+      runId: 'stale-success-intent-repair',
+    });
+    expect(repaired?.requestContext?.['flowsafe.runLifecycle']).toMatchObject({
+      transitionIntent: { status: 'cancelled' },
+    });
+
+    const fresh = heldRuntime({ storage }).runtime;
+    await expect(
+      fresh.terminateAsPrincipal(
+        'held-workflow',
+        'stale-success-intent-repair',
+        principal,
+        principal,
+      ),
+    ).resolves.toMatchObject({
+      transitioned: true,
+      summary: { status: 'cancelled' },
+    });
+  });
+
+  it('serializes terminal reconciliation with a concurrent cancellation preflight', async () => {
+    const storage = new InMemoryStore();
+    const { createWorkflow, createStep, runtime } = init({ storage });
+    const step = createStep({
+      id: 'finish',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ ok: z.boolean() }),
+      execute: async () => ({ ok: true }),
+    });
+    const workflow = createWorkflow({
+      id: 'reconcile-lock',
+      inputSchema: z.object({}),
+      outputSchema: z.object({ ok: z.boolean() }),
+      options: {
+        shouldPersistSnapshot: ({ workflowStatus }) =>
+          workflowStatus === 'pending',
+      },
+    })
+      .then(step)
+      .commit();
+    let coreReturned = false;
+    const originalCreateRun = workflow.createRun.bind(workflow);
+    Object.defineProperty(workflow, 'createRun', {
+      configurable: true,
+      value: async (...args: Parameters<typeof workflow.createRun>) => {
+        const run = await originalCreateRun(...args);
+        const originalStart = run.start.bind(run);
+        Object.defineProperty(run, 'start', {
+          configurable: true,
+          value: async (...startArgs: Parameters<typeof run.start>) => {
+            const result = await originalStart(...startArgs);
+            coreReturned = true;
+            return result;
+          },
+        });
+        return run;
+      },
+    });
+    const workflows = await storage.getStore('workflows');
+    if (!workflows) throw new Error('workflows storage missing');
+    const originalLoad = workflows.loadWorkflowSnapshot.bind(workflows);
+    let reconciliationLoaded!: () => void;
+    let releaseReconciliation!: () => void;
+    const loaded = new Promise<void>((resolve) => {
+      reconciliationLoaded = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      releaseReconciliation = resolve;
+    });
+    let blocked = false;
+    vi.spyOn(workflows, 'loadWorkflowSnapshot').mockImplementation(
+      async (input) => {
+        const snapshot = await originalLoad(input);
+        if (
+          coreReturned &&
+          !blocked &&
+          input.workflowName === 'reconcile-lock' &&
+          input.runId === 'reconcile-race'
+        ) {
+          blocked = true;
+          reconciliationLoaded();
+          await held;
+        }
+        return snapshot;
+      },
+    );
+
+    const starting = runtime.start('reconcile-lock', {
+      runId: 'reconcile-race',
+      inputData: {},
+    });
+    await loaded;
+    let cancellationSettled = false;
+    const cancellation = runtime
+      .cancelActiveExecution('reconcile-lock', 'reconcile-race', 'cancelled', [
+        principal,
+      ])
+      .finally(() => {
+        cancellationSettled = true;
+      });
+    await Promise.resolve();
+    expect(cancellationSettled).toBe(false);
+
+    releaseReconciliation();
+    await expect(starting).resolves.toMatchObject({ status: 'success' });
+    await expect(cancellation).rejects.toMatchObject({
+      name: 'RunTerminalConflictError',
+    });
+    await expect(
+      runtime.status('reconcile-lock', 'reconcile-race'),
+    ).resolves.toMatchObject({ status: 'success' });
+  });
+});
+
 describe('RunnerRuntime requestContextForRun', () => {
   interface Observation {
     leg: 'start' | 'resume';

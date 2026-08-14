@@ -21,9 +21,9 @@ export interface WorkflowMeta {
   /** A ready-to-run inputData example a launcher can prefill. */
   sampleInput: unknown;
   /**
-   * Roles permitted to ADVANCE this workflow at the HTTP routes — start AND
-   * resume (any mutating method; a role that may not start a workflow may
-   * not drive its suspended runs to completion either). Reads stay coarse:
+   * Roles permitted to mutate this workflow at the HTTP routes — start,
+   * resume, and terminate. A role that may not start a workflow may not drive
+   * or terminate its runs either. Reads stay coarse:
    * reviewer/viewer inspect runs they cannot drive. Omitted => only the
    * host's coarse start-role check applies. This is a route-level gate; the
    * approval queue's own role policy governs decisions, and in-step RBAC (if

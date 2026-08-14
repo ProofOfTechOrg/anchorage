@@ -13,6 +13,7 @@ import {
 } from '@mastra/core/storage';
 
 import type { D1DatabaseBinding } from './cf-types.js';
+import { isPathSafeId } from './path-safe-id.js';
 import { validateTablePrefix } from './table-prefix.js';
 
 export interface D1StorageOptions {
@@ -60,9 +61,9 @@ export function createD1Storage(
   });
 }
 
-// Terminal statuses per WorkflowRunStatus (@mastra/core workflows/types).
-// Deleting a live run (running/suspended/waiting/pending/paused) would kill
-// a pending approval, so only these are ever purged.
+// Mastra workflow terminals plus FlowSafe's lifecycle-owned terminals.
+// Deleting a live run (running/suspended/waiting/pending/paused) would kill a
+// pending approval, so only these are ever purged.
 const TERMINAL_STATUSES = [
   'success',
   'failed',
@@ -70,7 +71,202 @@ const TERMINAL_STATUSES = [
   'canceled',
   'bailed',
   'skipped',
+  'cancelled',
+  'timed_out',
 ] as const;
+
+const DEADLINE_LIVE_STATUSES = [
+  'running',
+  'waiting',
+  'pending',
+  'paused',
+  'waiting_callback',
+  'waiting_signal',
+  'retry_wait',
+  'suspended',
+] as const;
+
+export interface RunDeadlineCandidate {
+  workflowId: string;
+  runId: string;
+  revision: number;
+  deadlineAt: number;
+}
+
+/** Persistent scan position used to rotate bounded deadline passes. */
+export interface RunDeadlineCursor {
+  workflowId: string;
+  runId: string;
+  deadlineAt: number;
+}
+
+export interface SweepExpiredRunDeadlinesOptions {
+  /** Bounded rows per duty pass. Default 100. */
+  limit?: number;
+  /** Must satisfy createD1Storage's max-39 tablePrefix contract. */
+  tablePrefix?: string;
+  now?: () => number;
+  /** Last selected row from the prior pass. */
+  cursor?: RunDeadlineCursor;
+  /** Persists progress after every selected row, including failed rows. */
+  advanceCursor?(cursor: RunDeadlineCursor): Promise<void>;
+  /** Routes the CAS through the run's owner Durable Object. */
+  transition(candidate: RunDeadlineCandidate, now: number): Promise<void>;
+}
+
+/**
+ * Read-only deadline enumeration. Every mutation is delegated to the owner DO;
+ * timed-out rows whose terminal cleanup is incomplete remain resumable cursors.
+ */
+export async function sweepExpiredRunDeadlines(
+  db: SnapshotDatabase,
+  options: SweepExpiredRunDeadlinesOptions,
+): Promise<number> {
+  const prefix = validateTablePrefix(options.tablePrefix) ?? '';
+  const now = (options.now ?? Date.now)();
+  const limit = options.limit ?? 100;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+    throw new Error('deadline sweep limit must be an integer from 1 to 1000');
+  }
+  if (options.cursor !== undefined && options.advanceCursor === undefined) {
+    throw new Error('deadline sweep cursor requires advanceCursor');
+  }
+  const cursor = options.cursor;
+  if (
+    cursor &&
+    (!Number.isFinite(cursor.deadlineAt) ||
+      typeof cursor.workflowId !== 'string' ||
+      typeof cursor.runId !== 'string')
+  ) {
+    throw new Error('deadline sweep cursor is malformed');
+  }
+  const livePlaceholders = DEADLINE_LIVE_STATUSES.map(() => '?').join(', ');
+  const cursorOrder = cursor
+    ? `CASE WHEN (
+         deadline_at > ?
+         OR (deadline_at = ? AND workflow_name > ?)
+         OR (deadline_at = ? AND workflow_name = ? AND run_id > ?)
+       ) THEN 0 ELSE 1 END,`
+    : '';
+  const cursorBindings = cursor
+    ? [
+        cursor.deadlineAt,
+        cursor.deadlineAt,
+        cursor.workflowId,
+        cursor.deadlineAt,
+        cursor.workflowId,
+        cursor.runId,
+      ]
+    : [];
+  let rows: Array<{
+    workflow_name: string;
+    run_id: string;
+    revision: number;
+    deadline_at: number;
+  }>;
+  try {
+    ({ results: rows } = await db
+      .prepare(
+        `WITH deadline_candidates AS (
+         SELECT workflow_name, run_id,
+                CASE
+                  WHEN json_extract(snapshot, '$.requestContext."flowsafe.runLifecycle".transitionIntent.status') = 'timed_out'
+                  THEN json_extract(snapshot, '$.requestContext."flowsafe.runLifecycle".transitionIntent.expectedRevision')
+                  ELSE json_extract(snapshot, '$.requestContext."flowsafe.runLifecycle".revision')
+                END AS revision,
+                json_extract(snapshot, '$.requestContext."flowsafe.runLifecycle".deadlineAt') AS deadline_at
+         FROM ${prefix}mastra_workflow_snapshot
+         WHERE CASE WHEN json_valid(snapshot) THEN
+           (
+             json_extract(snapshot, '$.requestContext."flowsafe.runLifecycle".deadlineAt') <= ?
+             AND NOT EXISTS (
+               SELECT 1
+               FROM json_each(
+                 snapshot,
+                 '$.requestContext."flowsafe.runLifecycle".economicOperations'
+               ) AS operation
+               WHERE json_extract(operation.value, '$.settlementState') = 'disputed'
+             )
+             AND (
+               json_extract(snapshot, '$.status') IN (${livePlaceholders})
+               OR (
+                 json_extract(snapshot, '$.status') = 'timed_out'
+                 AND json_extract(snapshot, '$.requestContext."flowsafe.runLifecycle".terminal.cleanupCompletedAt') IS NULL
+               )
+               OR (
+                 json_extract(snapshot, '$.requestContext."flowsafe.runLifecycle".transitionIntent.status') = 'timed_out'
+                 AND json_extract(snapshot, '$.requestContext."flowsafe.runLifecycle".terminal') IS NULL
+               )
+             )
+           ) ELSE 0 END
+         )
+         SELECT workflow_name, run_id, revision, deadline_at
+         FROM deadline_candidates
+         ORDER BY ${cursorOrder} deadline_at, workflow_name, run_id
+         LIMIT ?`,
+      )
+      .bind(now, ...DEADLINE_LIVE_STATUSES, ...cursorBindings, limit)
+      .all<{
+        workflow_name: string;
+        run_id: string;
+        revision: number;
+        deadline_at: number;
+      }>());
+  } catch (error) {
+    if (!isMissingTable(error, `${prefix}mastra_workflow_snapshot`))
+      throw error;
+    return 0;
+  }
+  const failures: string[] = [];
+  let processed = 0;
+  for (const row of rows) {
+    const rowCursor = {
+      workflowId: row.workflow_name,
+      runId: row.run_id,
+      deadlineAt: row.deadline_at,
+    };
+    const malformed =
+      !isPathSafeId(row.workflow_name) ||
+      !isPathSafeId(row.run_id) ||
+      !Number.isSafeInteger(row.revision) ||
+      row.revision < 1 ||
+      !Number.isSafeInteger(row.deadline_at) ||
+      row.deadline_at < 0;
+    if (malformed) {
+      failures.push(`${row.workflow_name}/${row.run_id}: malformed deadline`);
+    } else {
+      try {
+        await options.transition(
+          {
+            workflowId: row.workflow_name,
+            runId: row.run_id,
+            revision: row.revision,
+            deadlineAt: row.deadline_at,
+          },
+          now,
+        );
+        processed += 1;
+      } catch (error) {
+        failures.push(
+          `${row.workflow_name}/${row.run_id}: ${errorMessageOf(error)}`,
+        );
+      }
+    }
+    try {
+      await options.advanceCursor?.(rowCursor);
+    } catch (error) {
+      failures.push(
+        `${row.workflow_name}/${row.run_id}: cursor ${errorMessageOf(error)}`,
+      );
+    }
+  }
+  if (failures.length > 0) {
+    throw new Error(
+      `sweepExpiredRunDeadlines: ${failures.length} of ${rows.length} run(s) failed (${failures.join('; ')})`,
+    );
+  }
+  return processed;
+}
 
 /**
  * Minimal structural D1 surface the purge uses — same posture as the
@@ -143,7 +339,8 @@ export const RUN_TTL_PURGE_TABLES: readonly string[] = [
 
 /**
  * Data-retention purge: deletes TERMINAL runs (success/failed/tripwire/
- * canceled/bailed/skipped) whose updatedAt is older than the TTL from
+ * canceled/bailed/skipped and cleanup-complete cancelled/timed_out) whose
+ * updatedAt is older than the TTL from
  * mastra_workflow_snapshot — and, when `artifactStore` is wired, each purged
  * run's R2 artifacts with its row. Live runs (running/suspended/waiting/
  * pending/paused) are never touched — expiring a suspended run would kill a
@@ -171,10 +368,18 @@ export async function purgeExpiredWorkflowRuns(
   // rows yield NULL and survive (fail safe: never delete what can't be
   // proven terminal).
   const eligible = `updatedAt < ?
-         AND CASE
-               WHEN json_valid(snapshot)
-                 THEN json_extract(snapshot, '$.status')
-             END IN (${placeholders})`;
+         AND CASE WHEN json_valid(snapshot) THEN
+           (
+             json_extract(snapshot, '$.status') IN (${placeholders})
+             AND (
+               json_extract(snapshot, '$.status') NOT IN ('cancelled', 'timed_out')
+               OR json_extract(
+                 snapshot,
+                 '$.requestContext."flowsafe.runLifecycle".terminal.cleanupCompletedAt'
+               ) IS NOT NULL
+             )
+           )
+         ELSE 0 END`;
   const resourceOwnerTable = options.resourceOwnerTable;
   if (
     resourceOwnerTable !== undefined &&

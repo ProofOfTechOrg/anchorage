@@ -176,6 +176,7 @@ try {
   WranglerLoopBackend,
   auditFleetDrift,
   decommissionDeployment,
+  forceDecommissionDeployment,
   deploymentSpecDigest,
   deriveStateEgressCredential,
   provisionDeployment,
@@ -212,6 +213,7 @@ void StateEgress;
 void auditFleetDrift;
 void createEgressProxyFetch;
 void decommissionDeployment;
+void forceDecommissionDeployment;
 void deploymentSpecDigest;
 void deriveStateEgressCredential;
 void provisionDeployment;

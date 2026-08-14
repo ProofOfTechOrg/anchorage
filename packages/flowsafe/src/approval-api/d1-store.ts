@@ -14,6 +14,7 @@ import {
 import {
   type ApprovalPatch,
   type ApprovalStore,
+  type ApprovalTransitionOptions,
   type CreateResult,
   stepKeyOf,
 } from './store.js';
@@ -434,12 +435,41 @@ function isUniqueViolation(error: unknown): boolean {
   );
 }
 
+function isMissingTable(error: unknown, table: string): boolean {
+  return (
+    error instanceof Error &&
+    new RegExp(`no such table:\\s*(?:main\\.)?${table}(?:\\b|:)`, 'i').test(
+      error.message,
+    )
+  );
+}
+
+function runTerminalFence(
+  table: string,
+  workflowIdExpression: string,
+  runIdExpression: string,
+): string {
+  return `NOT EXISTS (
+    SELECT 1 FROM ${table} AS run
+    WHERE run.workflow_name = ${workflowIdExpression}
+      AND run.run_id = ${runIdExpression}
+      AND CASE WHEN json_valid(run.snapshot) THEN
+        (
+          json_extract(run.snapshot, '$.requestContext."flowsafe.runLifecycle".transitionIntent') IS NOT NULL
+          OR json_extract(run.snapshot, '$.requestContext."flowsafe.runLifecycle".terminal') IS NOT NULL
+        )
+      ELSE 1 END
+  )`;
+}
+
 export interface D1ApprovalStoreOptions {
   /**
    * Shared schema gate: the factory memoizes one schema-init promise per
    * isolate. Default: this instance memoizes its own.
    */
   ready?: () => Promise<void>;
+  /** Existing Mastra snapshot table used to fence human decisions. */
+  workflowSnapshotTable?: string;
 }
 
 /**
@@ -509,11 +539,19 @@ export async function createApprovalSchema(
 export class D1ApprovalStore implements ApprovalStore {
   readonly #db: ApprovalDatabase;
   readonly #sharedReady?: () => Promise<void>;
+  readonly #workflowSnapshotTable?: string;
   #schemaReady?: Promise<void>;
 
   constructor(db: ApprovalDatabase, options: D1ApprovalStoreOptions = {}) {
     this.#db = db;
     this.#sharedReady = options.ready;
+    if (
+      options.workflowSnapshotTable !== undefined &&
+      !/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(options.workflowSnapshotTable)
+    ) {
+      throw new Error('workflowSnapshotTable must be a safe SQL identifier');
+    }
+    this.#workflowSnapshotTable = options.workflowSnapshotTable;
   }
 
   async create(record: ApprovalRecord): Promise<CreateResult> {
@@ -523,8 +561,44 @@ export class D1ApprovalStore implements ApprovalStore {
     // point), never orphan a row behind a thrown create.
     const snapshot = structuredClone(record);
     const stepKey = stepKeyOf(snapshot.stepPath);
-    const insert = (): Promise<unknown> =>
-      this.#db
+    const values = [
+      snapshot.id,
+      snapshot.workflowId,
+      snapshot.runId,
+      stepKey,
+      snapshot.stepPath ? JSON.stringify(snapshot.stepPath) : null,
+      snapshot.suspendedAt ?? null,
+      snapshot.resumedAt ?? null,
+      snapshot.resumeCount ?? null,
+      snapshot.runScoped === undefined ? null : snapshot.runScoped ? 1 : 0,
+      snapshot.title,
+      snapshot.summary ?? null,
+      snapshot.resumeTarget === undefined
+        ? null
+        : JSON.stringify(snapshot.resumeTarget),
+      snapshot.payload === undefined ? null : JSON.stringify(snapshot.payload),
+      JSON.stringify(snapshot.connectors),
+      snapshot.grantScope ?? null,
+      snapshot.toolCallId ?? null,
+      snapshot.priority,
+      snapshot.status,
+      snapshot.requestedBy ?? null,
+      snapshot.requestedByKind ?? null,
+      snapshot.claimedBy ?? null,
+      snapshot.decidedBy ?? null,
+      snapshot.decision ?? null,
+      snapshot.comment ?? null,
+      snapshot.delegatedTo ?? null,
+      snapshot.createdAt,
+      snapshot.updatedAt,
+      snapshot.claimedAt ?? null,
+      snapshot.decidedAt ?? null,
+      snapshot.escalatedAt ?? null,
+      snapshot.slaDeadlineAt ?? null,
+    ];
+    const insert = async (): Promise<unknown> => {
+      const fenced = this.#workflowSnapshotTable !== undefined;
+      const statement = this.#db
         .prepare(
           `INSERT INTO ${TABLE} (
             id, workflow_id, run_id, step_key, step_path,
@@ -533,46 +607,48 @@ export class D1ApprovalStore implements ApprovalStore {
             priority, status, requested_by, requested_by_kind, claimed_by,
             decided_by, decision, comment, delegated_to, created_at, updated_at,
             claimed_at, decided_at, escalated_at, sla_deadline_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ) ${
+            fenced
+              ? `SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                 WHERE ${runTerminalFence(this.#workflowSnapshotTable as string, '?', '?')}`
+              : 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+          }`,
         )
         .bind(
-          snapshot.id,
-          snapshot.workflowId,
-          snapshot.runId,
-          stepKey,
-          snapshot.stepPath ? JSON.stringify(snapshot.stepPath) : null,
-          snapshot.suspendedAt ?? null,
-          snapshot.resumedAt ?? null,
-          snapshot.resumeCount ?? null,
-          snapshot.runScoped === undefined ? null : snapshot.runScoped ? 1 : 0,
-          snapshot.title,
-          snapshot.summary ?? null,
-          snapshot.resumeTarget === undefined
-            ? null
-            : JSON.stringify(snapshot.resumeTarget),
-          snapshot.payload === undefined
-            ? null
-            : JSON.stringify(snapshot.payload),
-          JSON.stringify(snapshot.connectors),
-          snapshot.grantScope ?? null,
-          snapshot.toolCallId ?? null,
-          snapshot.priority,
-          snapshot.status,
-          snapshot.requestedBy ?? null,
-          snapshot.requestedByKind ?? null,
-          snapshot.claimedBy ?? null,
-          snapshot.decidedBy ?? null,
-          snapshot.decision ?? null,
-          snapshot.comment ?? null,
-          snapshot.delegatedTo ?? null,
-          snapshot.createdAt,
-          snapshot.updatedAt,
-          snapshot.claimedAt ?? null,
-          snapshot.decidedAt ?? null,
-          snapshot.escalatedAt ?? null,
-          snapshot.slaDeadlineAt ?? null,
-        )
-        .run();
+          ...values,
+          ...(fenced ? [snapshot.workflowId, snapshot.runId] : []),
+        );
+      let outcome: unknown;
+      try {
+        outcome = await statement.run();
+      } catch (error) {
+        if (
+          !this.#workflowSnapshotTable ||
+          !isMissingTable(error, this.#workflowSnapshotTable)
+        ) {
+          throw error;
+        }
+        outcome = await this.#db
+          .prepare(
+            `INSERT INTO ${TABLE} (
+              id, workflow_id, run_id, step_key, step_path,
+              suspended_at, resumed_at, resume_count, run_scoped, title, summary,
+              resume_target, payload, connectors, grant_scope, tool_call_id,
+              priority, status, requested_by, requested_by_kind, claimed_by,
+              decided_by, decision, comment, delegated_to, created_at, updated_at,
+              claimed_at, decided_at, escalated_at, sla_deadline_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .bind(...values)
+          .run();
+      }
+      if (d1Changes(outcome) === 0) {
+        throw new Error(
+          `approval creation refused: run '${snapshot.runId}' is terminating or terminal`,
+        );
+      }
+      return outcome;
+    };
 
     // A UNIQUE collision can now be either the all-status exact fingerprint or
     // the open-step index. Resolve the exact fingerprint FIRST: a decision may
@@ -653,18 +729,42 @@ export class D1ApprovalStore implements ApprovalStore {
     id: string,
     from: readonly ApprovalStatus[],
     patch: ApprovalPatch,
+    options: ApprovalTransitionOptions = {},
   ): Promise<ApprovalRecord | null> {
     if (from.length === 0) return null;
     await this.#ready();
     const { sets, values } = buildPatchSets(patch);
-    const row = await this.#db
-      .prepare(
-        `UPDATE ${TABLE} SET ${sets.join(', ')}
-         WHERE id = ? AND status IN (${from.map(() => '?').join(', ')})
-         RETURNING *`,
-      )
-      .bind(...values, id, ...from)
-      .first<ApprovalRow>();
+    const decisionFence =
+      options.requireRunDecidable && this.#workflowSnapshotTable
+        ? `
+           AND ${runTerminalFence(
+             this.#workflowSnapshotTable,
+             `${TABLE}.workflow_id`,
+             `${TABLE}.run_id`,
+           )}`
+        : '';
+    const transition = (fence: string) =>
+      this.#db
+        .prepare(
+          `UPDATE ${TABLE} SET ${sets.join(', ')}
+           WHERE id = ? AND status IN (${from.map(() => '?').join(', ')})${fence}
+           RETURNING *`,
+        )
+        .bind(...values, id, ...from)
+        .first<ApprovalRow>();
+    let row: ApprovalRow | null;
+    try {
+      row = await transition(decisionFence);
+    } catch (error) {
+      if (
+        !decisionFence ||
+        !this.#workflowSnapshotTable ||
+        !isMissingTable(error, this.#workflowSnapshotTable)
+      ) {
+        throw error;
+      }
+      row = await transition('');
+    }
     return row ? rowToRecord(row) : null;
   }
 

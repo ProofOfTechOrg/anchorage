@@ -164,6 +164,15 @@ import type {
   ConnectorApprovalSuspension,
 } from '@proofoftech/flowsafe/approval-api';
 import {
+  sweepExpiredRunDeadlines,
+  type DurableObjectRunLifecycleHooks,
+  type RunTerminalErrorEnvelope,
+} from '@proofoftech/flowsafe/do-runner';
+import {
+  createFlowsafeRunnerLifecycle,
+  createRunRouter,
+} from '@proofoftech/flowsafe/host-kit';
+import {
   createAgentCatalog,
   createAgentRouter,
   createAgentThreadTopology,
@@ -219,6 +228,11 @@ const grant: ConnectorApprovalGrant = {
   suspension,
   toolCallId: 'call-1',
 };
+const terminalError: RunTerminalErrorEnvelope = {
+  code: 'CANCELLED',
+  message: 'run was cancelled',
+};
+const lifecycleHooks = null as DurableObjectRunLifecycleHooks | null;
 void BREAKWATER_CONNECTOR_EXECUTION_KEY;
 void BREAKWATER_CONNECTOR_GRANTS_KEY;
 void connectorGrantsForLeg;
@@ -233,6 +247,11 @@ void authorizeAutomatedEntry;
 void resolvePrincipalPermissions;
 void envelope;
 void grant;
+void terminalError;
+void lifecycleHooks;
+void sweepExpiredRunDeadlines;
+void createFlowsafeRunnerLifecycle;
+void createRunRouter;
 `,
   );
   writeFileSync(
@@ -256,8 +275,18 @@ void grant;
 import * as host from '@proofoftech/flowsafe/agent-host';
 import * as flowsafe from '@proofoftech/flowsafe';
 import * as approvals from '@proofoftech/flowsafe/approval-api';
-import { createD1Storage } from '@proofoftech/flowsafe/do-runner';
+import {
+  createD1Storage,
+  sweepExpiredRunDeadlines,
+} from '@proofoftech/flowsafe/do-runner';
+import {
+  createFlowsafeRunnerLifecycle,
+  createRunRouter,
+} from '@proofoftech/flowsafe/host-kit';
 assert.equal(typeof createD1Storage, 'function');
+assert.equal(typeof sweepExpiredRunDeadlines, 'function');
+assert.equal(typeof createFlowsafeRunnerLifecycle, 'function');
+assert.equal(typeof createRunRouter, 'function');
 assert.equal(typeof host.createAgentCatalog, 'function');
 assert.equal(typeof host.createAgentRouter, 'function');
 assert.equal(typeof host.createAgentThreadTopology, 'function');

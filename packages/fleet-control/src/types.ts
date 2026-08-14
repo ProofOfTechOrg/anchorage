@@ -507,6 +507,25 @@ export interface FleetStateStore {
   list(): Promise<readonly FleetRecord[]>;
 }
 
+export type ForceDecommissionStep =
+  | 'remove-traffic'
+  | 'revoke-credentials'
+  | 'delete-database';
+
+export interface DecommissionAuditEvent {
+  readonly action: 'deployment-decommissioned';
+  readonly tenantTag: string;
+  readonly environment: string;
+  readonly backend: ProvisioningBackendKind;
+  readonly scriptName: string;
+  readonly databaseId: string;
+  readonly forced: boolean;
+}
+
+export type DecommissionAuditSink = (
+  event: DecommissionAuditEvent,
+) => void | Promise<void>;
+
 export interface PlatformPlaneResourceSet {
   readonly accountId: string;
   readonly dispatchNamespace: string;
@@ -679,6 +698,11 @@ export interface ProvisioningBackend {
   ): Promise<DatabaseExport>;
   deleteDatabase(
     database: DatabaseReference,
+    fence: ExternalMutationFence,
+  ): Promise<void>;
+  forceDecommissionStep?(
+    record: FleetRecord,
+    step: ForceDecommissionStep,
     fence: ExternalMutationFence,
   ): Promise<void>;
 }

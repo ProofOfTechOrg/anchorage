@@ -93,6 +93,8 @@ export const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
   'failed',
   'tripwire',
   'canceled',
+  'cancelled',
+  'timed_out',
   'bailed',
   'skipped',
 ]);

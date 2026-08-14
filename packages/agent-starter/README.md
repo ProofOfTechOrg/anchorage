@@ -48,7 +48,7 @@ The Worker binds six Durable Object classes:
 | `HUB` | Fixed deployment singleton | Hibernatable approval fan-out and presence |
 | `SIGNAL_PROVIDER_HOST` | Fixed deployment singleton | D1 subscription rehydration and provider alarm lifecycle |
 | `BACKGROUND_TASKS` | `deployment-background-tasks` singleton | Background manager, recovery, cleanup, and read/SSE facade |
-| `MAINTENANCE` | `deployment-maintenance` singleton | Alarm-owned SLA sweep, retention purge, and schedule or notification ticks |
+| `MAINTENANCE` | `deployment-maintenance` singleton | Alarm-owned deadline expiry, SLA sweep, retention purge, and schedule or notification ticks |
 
 All six use the deployment's D1 database. `createComposedStorage()` overlays notification, thread-state, and schedule domains on Mastra storage. The background-task Durable Object composes its own task and serialized-workflow domains for the same database.
 
@@ -200,11 +200,13 @@ Every route except `/healthz`, a correctly signed provider webhook, and WebSocke
 | `GET /agents` | Agent metadata and authenticated actor |
 | `POST /agents/:agentId/runs` | Mint ids and start the guarded durable agent |
 | `GET /agents/:agentId/runs/:threadId/:runId` | Durable agent status |
+| `POST /agents/:agentId/runs/:threadId/:runId/terminate` | Cancel a durable agent run |
 | `GET /agents/:agentId/runs/:threadId/:runId/stream?offset=N` | Authenticated NDJSON observation |
 | `GET /workflows` | Generic workflow catalog |
 | `POST /runs` | Start a generic workflow with a server-minted id |
 | `GET /runs/:workflowId/:runId` | Generic workflow status |
 | `POST /runs/:workflowId/:runId/resume` | Grant-free generic workflow resume |
+| `POST /runs/:workflowId/:runId/terminate` | Cancel a generic workflow run |
 | `GET /api/approvals` | Filtered deployment approval queue |
 | `GET /api/approvals/metrics` | Deployment queue metrics |
 | `GET /api/approvals/:id` | Approval detail |
@@ -284,8 +286,9 @@ Public background routes are read-only. Enqueue, cancel, and resume are server-s
 
 ## Alarm-driven maintenance
 
-The fixed `deployment-maintenance` Durable Object schedules three independent duties:
+The fixed `deployment-maintenance` Durable Object schedules four independent duties:
 
+- run deadline expiry;
 - five-minute approval SLA sweep;
 - hourly approval, terminal run, memory, notification, thread-state, schedule-trigger, and background-task retention;
 - one-minute schedule firing and due-notification dispatch.

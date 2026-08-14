@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Unit proof for the composed Worker skeleton: the fetch pipeline order, the
 // hook seams (preRoutes/beforeStart/beforeResume/notify/extra
-// duties), and failure-isolated sweep, purge, and optional schedule-tick dispatch. The
-// HEAVYWEIGHT behavior proof stays the two host e2e suites
+// duties), and failure-isolated deadline, sweep, purge, and optional schedule
+// tick dispatch. The HEAVYWEIGHT behavior proof stays the two host e2e suites
 // (deploy/worker.e2e.test.ts and the showcase worker e2e set), which drive
 // the real hosts through this same composer — this file covers the composer's
 // own contract over fakes: node:sqlite behind a narrow SQL unit facade, a stub DO
@@ -22,6 +22,7 @@ import {
 } from '../audit-export/index.js';
 import {
   EXECUTION_PRINCIPAL_HEADER,
+  type RunDeadlineCursor,
   type RunSummary,
 } from '../do-runner/index.js';
 import type { ResumeRunFn } from './approval-bridge.js';
@@ -30,6 +31,7 @@ import {
   type FlowsafeWorkerConfig,
   type FlowsafeWorkerEnv,
   MAINTENANCE_INSTANCE_NAME,
+  type MaintenanceHealth,
 } from './flowsafe-worker.js';
 import { approvalStoreFactoryFor } from './host-approval-service.js';
 import { MAINTENANCE_RECEIPT_HEADER } from './maintenance-capability.js';
@@ -50,6 +52,16 @@ const ACTORS = new Map([['tok-ada', { id: 'ada', role: 'admin' } as const]]);
 function successSummary(runId: string): RunSummary {
   return { runId, status: 'success', result: { ok: true } };
 }
+
+describe('MaintenanceHealth compatibility', () => {
+  it('keeps the additive deadline projection optional for existing consumers', () => {
+    const legacyHealth: MaintenanceHealth = {
+      nextSweepAt: 1,
+      nextPurgeAt: 2,
+    };
+    expect(legacyHealth.nextDeadlineAt).toBeUndefined();
+  });
+});
 
 /** A DO namespace whose stub echoes a success summary and commits run ownership. */
 function fakeRunner(
@@ -840,6 +852,81 @@ describe('createFlowsafeWorker maintenance duties', () => {
     expect(lines[0]).not.toHaveProperty('purged');
   });
 
+  it('the deadline duty routes each expired CAS through its owner runner and remains failure-isolated', async () => {
+    const logs = capturedLogs();
+    const worker = makeWorker({
+      maintenance: {
+        deadlineIntervalMs: 60_000,
+        deadlineLimit: 1,
+        sweepIntervalMs: 15 * 60 * 1_000,
+        purgeIntervalMs: 60 * 60 * 1_000,
+      },
+    });
+    const { env, doCalls } = makeEnv();
+    const db = env.DB;
+    if (!db) throw new Error('test DB missing');
+    await db
+      .prepare(
+        `CREATE TABLE mastra_workflow_snapshot (
+          workflow_name TEXT NOT NULL,
+          run_id TEXT NOT NULL,
+          resourceId TEXT,
+          snapshot TEXT NOT NULL,
+          createdAt TEXT NOT NULL,
+          updatedAt TEXT NOT NULL
+        )`,
+      )
+      .run();
+    const deadlineAt = Date.now() - 1;
+    const iso = new Date(deadlineAt).toISOString();
+    await db
+      .prepare(
+        `INSERT INTO mastra_workflow_snapshot
+         (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
+         VALUES (?, ?, NULL, ?, ?, ?)`,
+      )
+      .bind(
+        'wf',
+        'expired-run',
+        JSON.stringify({
+          status: 'suspended',
+          requestContext: {
+            'flowsafe.runLifecycle': {
+              version: 1,
+              revision: 4,
+              deadlineAt,
+            },
+          },
+        }),
+        iso,
+        iso,
+      )
+      .run();
+
+    let cursor: RunDeadlineCursor | undefined;
+    await expect(
+      worker.runMaintenanceDuty('deadline', env, {
+        advanceDeadlineCursor: async (next) => {
+          cursor = next;
+        },
+      }),
+    ).resolves.toEqual({ ok: true, value: undefined });
+    expect(doCalls).toEqual(['http://do/runs/wf/expired-run/deadline']);
+    expect(cursor).toEqual({
+      workflowId: 'wf',
+      runId: 'expired-run',
+      deadlineAt,
+    });
+    expect(
+      logs.lines().map((line) => JSON.parse(line) as Record<string, unknown>),
+    ).toContainEqual({
+      type: 'deadline-sweep',
+      trigger: 'deadline',
+      processed: 1,
+    });
+    expect(maintenanceLines(logs.lines())).toEqual([]);
+  });
+
   it('routes external maintenance audit through the authenticated proxy adapter', async () => {
     const candidateWorker = makeWorker();
     const { env: candidateEnv } = makeEnv();
@@ -1574,7 +1661,7 @@ describe('createFlowsafeWorker storage table prefix', () => {
 });
 
 describe('createFlowsafeWorker schedule tick duty (Track D)', () => {
-  it('the tick duty runs ONLY the schedule tick, not the sweep/purge', async () => {
+  it('the tick duty runs only the schedule tick', async () => {
     // #given a worker with a tick interval + a scheduleTick builder
     const logs = capturedLogs();
     const tickFn = vi.fn(async () => ({
@@ -1623,8 +1710,7 @@ describe('createFlowsafeWorker schedule tick duty (Track D)', () => {
 
     const outcome = await worker.runMaintenanceDuty('tick', env);
 
-    // #then a config-error naming the tick duty; NO other maintenance (the invocation is
-    // the tick's — it does not fall through to sweep/purge)
+    // #then a config-error naming the tick duty; no other maintenance runs
     expect(logs.errors().some((l) => l.includes('config-error'))).toBe(true);
     expect(logs.lines().some((l) => l.includes('"type":"maintenance"'))).toBe(
       false,

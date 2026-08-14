@@ -4,9 +4,9 @@
 // classic contract needs no workers-only runtime import, so this module and
 // everything under it load in node/vitest. Run state lives in D1, not DO
 // storage — that is what lets a run started before a restart resume after
-// one. Serialization of start/resume on a single run is enforced by
-// RunnerRuntime's per-run FIFO lock; routing one DO instance per run
-// (idFromName(`${workflowId}:${runId}`)) makes that lock authoritative,
+// one. Serialization of execution and lifecycle mutations on a single run is
+// enforced by RunnerRuntime's per-run FIFO locks; routing one DO instance per run
+// (idFromName(`${workflowId}:${runId}`)) makes those locks authoritative,
 // since all traffic for a run lands on one instance. The object's alarm is
 // reserved for recovering run-owner claims that outlive an interrupted start.
 
@@ -29,8 +29,11 @@ import { isPathSafeId } from './path-safe-id.js';
 import {
   InvalidRunRequestError,
   RunAlreadyExistsError,
+  type RunLifecycleCas,
+  type RunLifecycleTransitionResult,
   type RunnerRuntime,
   type RunSummary,
+  UnknownRunError,
 } from './runtime.js';
 import {
   resolveScheduleStartOwner,
@@ -57,6 +60,24 @@ export interface DurableObjectRunOwnershipStore {
     token: string,
     release: readonly { kind: 'run'; resourceId: string }[],
   ): Promise<void>;
+  release?(
+    kind: 'run',
+    resourceId: string,
+    owner: DurableObjectRunOwner,
+  ): Promise<boolean>;
+}
+
+export interface DurableObjectRunLifecycleHooks {
+  abandonApprovals(
+    workflowId: string,
+    runId: string,
+    status: 'cancelled' | 'timed_out',
+  ): Promise<void>;
+  discardScheduleDispatch?(
+    scheduleId: string,
+    dispatchId: string,
+    runId: string,
+  ): Promise<void>;
 }
 
 const RUN_OWNER_RECOVERY_KEY = 'flowsafe:run-owner-recovery:v1';
@@ -76,6 +97,7 @@ interface StartBody {
   initialState?: unknown;
   scheduleId?: unknown;
   dispatchId?: unknown;
+  deadlineMs?: unknown;
 }
 
 interface ResumeBody {
@@ -83,6 +105,12 @@ interface ResumeBody {
   resumeData?: unknown;
   requestedBy?: unknown;
   requestedByKind?: unknown;
+  deadlineMs?: unknown;
+}
+
+interface DeadlineBody {
+  expectedRevision?: unknown;
+  expectedDeadlineAt?: unknown;
 }
 
 class DurableObjectRunIdentityError extends DoStatusError {
@@ -109,6 +137,13 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
 
   /** Existing schedules domain used only for target-verifiable schedule fires. */
   protected scheduleSource(_env: TEnv): ScheduleSourceStore | undefined {
+    return undefined;
+  }
+
+  /** Required when the host exposes terminate or deadline lifecycle routes. */
+  protected runLifecycle(
+    _env: TEnv,
+  ): DurableObjectRunLifecycleHooks | undefined {
     return undefined;
   }
 
@@ -175,6 +210,49 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       );
     }
     return principal;
+  }
+
+  async #finalizeTerminal(
+    runtime: RunnerRuntime,
+    workflowId: string,
+    runId: string,
+    owner: DurableObjectRunOwner,
+    result: RunLifecycleTransitionResult,
+  ): Promise<RunSummary> {
+    if (result.cleanup.cleanupCompleted) return result.summary;
+    const hooks = this.runLifecycle(this.env);
+    if (!hooks) {
+      throw new Error('run termination requires lifecycle cleanup hooks');
+    }
+    await hooks.abandonApprovals(workflowId, runId, result.cleanup.status);
+    if (result.cleanup.scheduleDispatch) {
+      if (!hooks?.discardScheduleDispatch) {
+        throw new Error(
+          'scheduled run termination requires a dispatch-settlement hook',
+        );
+      }
+      await hooks.discardScheduleDispatch(
+        result.cleanup.scheduleDispatch.scheduleId,
+        result.cleanup.scheduleDispatch.dispatchId,
+        runId,
+      );
+    }
+    const ownership = this.runOwnership(this.env);
+    if (!ownership.release) {
+      throw new Error('run termination requires ownership release support');
+    }
+    const released = await ownership.release('run', runId, owner);
+    if (!released) {
+      const current = await ownership.owner('run', runId);
+      if (current) {
+        throw new Error(`run '${runId}' ownership could not be released`);
+      }
+    }
+    return runtime.completeTerminalCleanup(
+      workflowId,
+      runId,
+      result.cleanup.revision,
+    );
   }
 
   async #startSource(
@@ -450,6 +528,9 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
               requestedBy: principal.id,
               requestedByKind: principal.kind,
               attemptToken: recovery.token,
+              ...(body.deadlineMs === undefined
+                ? {}
+                : { deadlineMs: body.deadlineMs as number }),
             });
           } catch (error) {
             let persisted: RunSummary | null | undefined;
@@ -573,8 +654,116 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           resumeData: body.resumeData,
           requestedBy,
           requestedByKind,
+          ...(body.deadlineMs === undefined
+            ? {}
+            : { deadlineMs: body.deadlineMs as number }),
         });
         // DL-018: broadcast the post-resume authoritative summary.
+        this.#broadcastRunSummary(summary);
+        return json(summary);
+      });
+    }
+    if (
+      request.method === 'POST' &&
+      segments.length === 4 &&
+      (action === 'terminate' || action === 'terminate-replay') &&
+      workflowId &&
+      runId
+    ) {
+      this.#assertRunIdentity(workflowId, runId);
+      const principal = this.#startPrincipal(request);
+      const runtime = this.#ensureRuntime();
+      const preflightOwner = await this.runOwnership(this.env).owner(
+        'run',
+        runId,
+      );
+      if (action === 'terminate') {
+        await runtime.cancelActiveExecution(workflowId, runId, 'cancelled', [
+          principal,
+          preflightOwner ?? principal,
+        ]);
+      }
+      return this.#withOperationLock(async () => {
+        const owner = await this.runOwnership(this.env).owner('run', runId);
+        if (action === 'terminate-replay') {
+          const summary = await runtime.status(workflowId, runId);
+          if (
+            summary?.status !== 'cancelled' &&
+            summary?.status !== 'timed_out'
+          ) {
+            throw new UnknownRunError(workflowId, runId);
+          }
+        }
+        const result = await runtime.terminateAsPrincipal(
+          workflowId,
+          runId,
+          principal,
+          owner ?? principal,
+        );
+        const summary = await this.#finalizeTerminal(
+          runtime,
+          workflowId,
+          runId,
+          owner ?? principal,
+          result,
+        );
+        this.#broadcastRunSummary(summary);
+        return json(summary);
+      });
+    }
+    if (
+      request.method === 'POST' &&
+      segments.length === 4 &&
+      action === 'deadline' &&
+      workflowId &&
+      runId
+    ) {
+      this.#assertRunIdentity(workflowId, runId);
+      const principal = this.#startPrincipal(request);
+      const body = (await readJson<DeadlineBody>(request)) ?? {};
+      const cas: RunLifecycleCas = {
+        expectedRevision: body.expectedRevision as number,
+        ...(body.expectedDeadlineAt === undefined
+          ? {}
+          : { expectedDeadlineAt: body.expectedDeadlineAt as number }),
+      };
+      const runtime = this.#ensureRuntime();
+      const preflightOwner = await this.runOwnership(this.env).owner(
+        'run',
+        runId,
+      );
+      await runtime.cancelActiveExecution(
+        workflowId,
+        runId,
+        'timed_out',
+        [principal, preflightOwner ?? principal],
+        cas,
+      );
+      return this.#withOperationLock(async () => {
+        const owner = await this.runOwnership(this.env).owner('run', runId);
+        if (!owner) {
+          const summary = await runtime.status(workflowId, runId);
+          if (summary?.status !== 'timed_out') {
+            throw new UnknownRunError(workflowId, runId);
+          }
+        }
+        const result = await runtime.timeOutAsPrincipal(
+          workflowId,
+          runId,
+          cas,
+          principal,
+          owner ?? principal,
+        );
+        if (!result.casMatched || result.cleanup.cleanupCompleted) {
+          return json(result.summary);
+        }
+        const summary = await this.#finalizeTerminal(
+          runtime,
+          workflowId,
+          runId,
+          owner ?? principal,
+          result,
+        );
         this.#broadcastRunSummary(summary);
         return json(summary);
       });
@@ -584,8 +773,8 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
 
   /**
    * Fan the authoritative RunSummary out to every subscribed run-channel
-   * socket at each lifecycle boundary — after start()/resume() — plus
-   * the on-connect snapshot). No-op when the DO exposes no getWebSockets
+   * socket after start, resume, terminate, or deadline expiry, plus the
+   * on-connect snapshot. No-op when the DO exposes no getWebSockets
    * (node/vitest, or any host without the Hibernatable-WebSocket API), so the
    * HTTP surface is unchanged off workerd.
    */

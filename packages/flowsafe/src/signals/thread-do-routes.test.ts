@@ -338,6 +338,43 @@ describe('createThreadSignalRoutes', () => {
     expect(settle).toHaveBeenCalledOnce();
   });
 
+  it('settles the canonical discard receipt when termination cancels a schedule wake', async () => {
+    const { agent, calls } = mockAgent();
+    const settle = vi.fn(async () => undefined);
+    const startIdleRun = vi.fn(async () => ({
+      runId: 'run_1',
+      status: 'canceled' as const,
+    }));
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_t1',
+      resolveScheduleTarget: async () => scheduleTarget(),
+      resolveScheduleDispatchStore: () => ({
+        begin: async () => ({ state: 'ready' as const }),
+        settle,
+      }),
+      startIdleRun,
+    });
+
+    const response = await routes(
+      post('/signal/schedule', {
+        scheduleId: 'schedule_1',
+        dispatchId: 'dispatch_1',
+        runId: 'run_1',
+      }),
+      scopeWith(undefined),
+    );
+
+    const receipt = {
+      action: 'discard',
+      outcome: 'discarded',
+      runId: 'run_1',
+    } as const;
+    expect(await response?.json()).toEqual({ receipt });
+    expect(settle).toHaveBeenCalledWith('schedule_1', 'dispatch_1', receipt);
+    expect(calls).toHaveLength(0);
+  });
+
   it('persists a system-fired schedule signal under the verified schedule owner', async () => {
     const { agent, calls } = mockAgent();
     const sendSignal = vi.fn(

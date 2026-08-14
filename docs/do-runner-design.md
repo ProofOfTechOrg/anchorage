@@ -98,6 +98,17 @@ Resume:
 
 No JavaScript promise remains alive while a reviewer waits. The persisted suspension is the wait.
 
+Terminate:
+
+1. The Worker checks run ownership and sends the trusted principal to the owner object.
+2. The object reads persisted lifecycle state and refuses a disputed settlement before it cancels active work.
+3. A live Mastra run receives cancellation only after the object persists a terminal intent.
+4. The runtime replaces Mastra's matching `canceled` precursor with `cancelled` and a `CANCELLED` envelope.
+5. Cleanup abandons open approvals, settles an executing agent-schedule receipt as discarded, and releases run ownership.
+6. The runtime records cleanup completion after the preceding steps succeed.
+
+A repeated request reads the terminal snapshot and returns the same summary. After ownership release, the public router delegates replay authorization to the owner object. The object accepts only a principal recorded by the original transition.
+
 ## Durable state
 
 ### D1 snapshot
@@ -114,7 +125,7 @@ Flowsafe does not maintain a parallel custom workflow state object.
 
 ### Snapshot provenance
 
-Flowsafe stores trusted run provenance under a reserved request-context key in the same authoritative snapshot as the workflow state. It records the initiating actor, a per-leg attempt token, and a monotonic ordinal per run and step:
+Flowsafe stores trusted run provenance under reserved request-context keys in the same authoritative snapshot as the workflow state. Provenance records the initiating actor, a per-leg attempt token, and a monotonic ordinal per run and step:
 
 - absent on the first suspension;
 - `1` after the first resume;
@@ -123,6 +134,10 @@ Flowsafe stores trusted run provenance under a reserved request-context key in t
 
 Approvals bind `suspendedAt` with this ordinal. Because workflow state and provenance commit together, recovery can distinguish a committed resume from a pre-snapshot failure without a parallel counter in Durable Object storage.
 
+The optional `flowsafe.runLifecycle` record stores deadlines, trusted economic-settlement projections, agent-schedule dispatch references, terminal intents, terminal reasons, replay principals, and cleanup completion. Ordinary runs omit this record. Start or resume adds it only when the trusted caller supplies lifecycle data.
+
+Economic settlement projections enter through internal `StartRunOptions.economicOperations` or `ResumeRunOptions.economicOperations`. The host fixes them at the execution-leg boundary before the leg becomes cancellable. Public HTTP bodies cannot supply them. The runtime exposes no dynamic mid-leg mutation because an external snapshot update could race Mastra's own snapshot writes and lose a disputed marker.
+
 The runner uses a short-lived Durable Object alarm only to reconcile an interrupted run-owner reservation. Alarms do not drive workflow execution; starts and approval resumes arrive by request.
 
 ## Run summary
@@ -130,13 +145,18 @@ The runner uses a short-lived Durable Object alarm only to reconcile an interrup
 `RunSummary` is the public projection:
 
 ```typescript
-import type { ExecutionPrincipalKind } from '@proofoftech/flowsafe/approval-api';
+import type { ExecutionPrincipalKind, RunStatus } from '@proofoftech/flowsafe';
 
 interface RunSummary {
   runId: string;
-  status: WorkflowRunStatus;
+  status: RunStatus;
   result?: unknown;
   error?: string;
+  errorEnvelope?: {
+    code: 'CANCELLED' | 'TIMED_OUT';
+    message: string;
+  };
+  deadlineAt?: number;
   suspended?: string[][];
   suspendPayload?: unknown;
   suspendedAt?: Record<string, number>;
@@ -149,9 +169,9 @@ interface RunSummary {
 }
 ```
 
-The runtime maps serialized error objects to a useful error string. `resumedAt` is informational because Mastra does not stamp it for every resume shape. Grant binding uses `resumeCount`. `requestedByKind` is paired with `requestedBy`; it is absent only on legacy snapshots written before principal kinds were persisted.
+The runtime maps serialized errors from existing failed runs to `error`. Flowsafe-owned `cancelled` and `timed_out` summaries use `errorEnvelope` without changing that failed-run shape. `resumedAt` is informational because Mastra does not stamp it for every resume shape. Grant binding uses `resumeCount`. `requestedByKind` is paired with `requestedBy`; it is absent only on legacy snapshots written before principal kinds were persisted.
 
-Run WebSockets send the entire authoritative summary at start, resume, and connection. Consumers can replace their cached summary rather than reconstructing state from deltas.
+Run WebSockets send the entire authoritative summary at start, resume, terminate, deadline expiry, and connection. Consumers can replace their cached summary rather than reconstructing state from deltas.
 
 ## HTTP surface inside the object
 
@@ -160,13 +180,21 @@ The base object accepts:
 ```text
 POST /runs
 GET  /runs/:workflowId/:runId
+GET  /runs/:workflowId/:runId/dispatch-status
 GET  /runs/:workflowId/:runId/stream
 POST /runs/:workflowId/:runId/resume
+POST /runs/:workflowId/:runId/terminate
+POST /runs/:workflowId/:runId/terminate-replay
+POST /runs/:workflowId/:runId/deadline
 ```
 
 The public Worker normally exposes its own authenticated route facade and forwards to these internal routes. A stream request requires a WebSocket upgrade and workerd's hibernatable socket API; otherwise it returns 426 and the client polls status.
 
 The raw resume surface carries no approval grant. A protected connector still requires a matching stored decision.
+
+Start and resume bodies accept an optional nonnegative `deadlineMs`. Resume replaces the previous deadline relative to the accepted leg. The maintenance scanner reads expired candidates in bounded passes, then sends each revision-and-deadline compare-and-swap to the run's owner object. It never writes snapshots directly from maintenance.
+
+The maintenance Durable Object persists a rotating tuple cursor after every selected row, including failures, so a permanently failing earliest row cannot starve later deadlines. Rows in `timed_out` with incomplete cleanup and any matching timeout intent remain eligible after an interrupted pass.
 
 ## Request context
 
@@ -222,7 +250,7 @@ The composed Worker resolves its optional artifact purger from the current maint
 
 When runtime storage uses `tablePrefix`, configure the same `storageTablePrefix` on `createFlowsafeWorker()`. It threads that validated prefix through every prefix-aware built-in purge. Direct callers of any exported low-level purge receive the same fail-fast validation before D1 preparation. Fixed-schema Flowsafe tables remain unprefixed.
 
-Running and suspended rows are never age-purged.
+Running and suspended rows are never age-purged. Retention treats `cancelled` and `timed_out` as terminal after lifecycle cleanup releases ownership.
 
 Decommissioning deletes the bound storage after credentials and traffic are revoked. There is no in-database tenant purge in the single-organization data plane.
 

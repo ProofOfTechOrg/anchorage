@@ -128,6 +128,7 @@ Mount `createAgentRouter()` through `createFlowsafeWorker({ buildAgentRouter })`
 | `GET /agents` | List the registered metadata and authenticated actor |
 | `POST /agents/:agentId/runs` | Mint ids and start a guarded durable run |
 | `GET /agents/:agentId/runs/:threadId/:runId` | Read authoritative durable status |
+| `POST /agents/:agentId/runs/:threadId/:runId/terminate` | Cancel a durable agent run |
 | `GET /agents/:agentId/runs/:threadId/:runId/stream?offset=N` | Observe authenticated newline-delimited JSON events |
 
 Every authenticated role may list agents. Run inspection follows resource ownership: the owning principal, reviewers, viewers, and admins may read a run; another operator or builder receives `404`. Starts require both `RUN_START_ROLES` and the agent's effective roles. There is no public agent-resume route.

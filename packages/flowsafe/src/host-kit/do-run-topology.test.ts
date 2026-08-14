@@ -4,6 +4,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { EXECUTION_PRINCIPAL_HEADER } from '../do-runner/index.js';
 import {
   createDoRunTopology,
+  type DoRunLifecycleTopology,
+  type DoRunTopology,
   type RunnerNamespaceLike,
 } from './do-run-topology.js';
 
@@ -42,6 +44,22 @@ function harness() {
 }
 
 describe('createDoRunTopology', () => {
+  it('keeps the legacy topology structurally compatible while returning lifecycle methods', () => {
+    const summary = { runId: 'run-1', status: 'running' as const };
+    const legacy: DoRunTopology = {
+      start: async () => summary,
+      status: async () => summary,
+      dispatchStatus: async () => summary,
+      resume: async () => summary,
+      resumeRecord: async () => summary,
+    };
+    const lifecycle: DoRunLifecycleTopology = harness().topology;
+
+    expect(legacy).not.toHaveProperty('terminate');
+    expect(lifecycle.terminate).toBeTypeOf('function');
+    expect(lifecycle.timeOut).toBeTypeOf('function');
+  });
+
   it('carries the full execution principal and ordinary start payload', async () => {
     const { topology, requests } = harness();
 

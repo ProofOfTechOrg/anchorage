@@ -216,6 +216,10 @@ export class FlowsafeDurableAgent<
   readonly #startRequesters = new Map<string, string>();
   readonly #startRequesterKinds = new Map<string, ExecutionPrincipalKind>();
   readonly #startAttemptTokens = new Map<string, string>();
+  readonly #startScheduleDispatches = new Map<
+    string,
+    { scheduleId: string; dispatchId: string }
+  >();
 
   constructor(options: FlowsafeDurableAgentOptions<TAgentId, TTools, TOutput>) {
     super({
@@ -310,6 +314,7 @@ export class FlowsafeDurableAgent<
     requestedBy: string,
     requestedByKind: ExecutionPrincipalKind,
     attemptToken = crypto.randomUUID(),
+    scheduleDispatch?: { scheduleId: string; dispatchId: string },
   ): Promise<
     Awaited<ReturnType<DurableAgent<TAgentId, TTools, TOutput>['stream']>>
   > {
@@ -337,6 +342,9 @@ export class FlowsafeDurableAgent<
     this.#startRequesters.set(runId, requestedBy);
     this.#startRequesterKinds.set(runId, requestedByKind);
     this.#startAttemptTokens.set(runId, attemptToken);
+    if (scheduleDispatch) {
+      this.#startScheduleDispatches.set(runId, scheduleDispatch);
+    }
     const onError = options.onError;
     try {
       const result = await this.stream(messages, {
@@ -357,6 +365,7 @@ export class FlowsafeDurableAgent<
       this.#startRequesters.delete(runId);
       this.#startRequesterKinds.delete(runId);
       this.#startAttemptTokens.delete(runId);
+      this.#startScheduleDispatches.delete(runId);
     }
   }
 
@@ -605,10 +614,12 @@ export class FlowsafeDurableAgent<
       const requestedBy = this.#startRequesters.get(runId);
       const requestedByKind = this.#startRequesterKinds.get(runId);
       const attemptToken = this.#startAttemptTokens.get(runId);
+      const scheduleDispatch = this.#startScheduleDispatches.get(runId);
       const startOptions = {
         runId,
         inputData: workflowInput,
         ...(attemptToken === undefined ? {} : { attemptToken }),
+        ...(scheduleDispatch === undefined ? {} : { scheduleDispatch }),
       };
       if (requestedBy === undefined || requestedByKind === undefined) {
         if (requestedBy !== undefined || requestedByKind !== undefined) {

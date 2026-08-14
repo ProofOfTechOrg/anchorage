@@ -220,6 +220,7 @@ GET  /workflows
 POST /runs
 GET  /runs/:workflowId/:runId
 POST /runs/:workflowId/:runId/resume
+POST /runs/:workflowId/:runId/terminate
 GET  /api/approvals
 POST /api/approvals/:id/claim
 POST /api/approvals/:id/decide

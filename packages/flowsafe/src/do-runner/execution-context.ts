@@ -8,6 +8,7 @@ import {
   BREAKWATER_PRINCIPAL_PERMISSIONS_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
 } from './breakwater-keys.js';
+import { RUN_LIFECYCLE_CONTEXT_KEY } from './run-lifecycle.js';
 
 const BREAKWATER_KEY_PREFIX = 'breakwater.';
 const GOAL_REQUEST_CONTEXT_KEY = 'mastra:goal';
@@ -27,6 +28,7 @@ export const RESERVED_EXECUTION_CONTEXT_KEYS: readonly string[] = [
   BREAKWATER_ISOLATION_SCOPE_KEY,
   GOAL_REQUEST_CONTEXT_KEY,
   RUN_PROVENANCE_CONTEXT_KEY,
+  RUN_LIFECYCLE_CONTEXT_KEY,
   'runId',
   'threadId',
   'resourceId',

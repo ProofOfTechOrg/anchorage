@@ -6,8 +6,8 @@ import {
   type FlowsafeWorkerConfig,
 } from '@proofoftech/flowsafe/host-kit';
 
-import { CONFORMANCE_SYSTEM_PRINCIPAL_ID } from './contract.js';
 import type { ConformanceStateEnv } from './env.js';
+import { conformanceRunnerLifecycleConfig } from './state-durable-objects.js';
 import { CONFORMANCE_WORKFLOWS } from './workflow.js';
 
 export { FlowsafeFleetAuditProxy } from '@proofoftech/flowsafe/audit-export';
@@ -29,8 +29,8 @@ export {
  * receipt, which `FLEET_MAINTENANCE_CAPABILITIES: 'required'` turns on.
  */
 const stateWorkerConfig = {
+  ...conformanceRunnerLifecycleConfig,
   workflows: CONFORMANCE_WORKFLOWS,
-  systemPrincipalId: CONFORMANCE_SYSTEM_PRINCIPAL_ID,
   // No token verifier: nothing authenticates to this Worker as a user. Every
   // request either carries the fleet maintenance capability, which the
   // maintenance route verifies on its own, or is denied.

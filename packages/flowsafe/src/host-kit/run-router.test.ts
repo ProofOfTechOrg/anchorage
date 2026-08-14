@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Unit coverage for the run surface every host mounts: the authorization ORDER
 // (401 -> coarse RUN_START_ROLES -> per-workflow allowedRoles), the catalog, the
-// start/status/resume routes and their error mapping, the suspension bridge's
+// start/status/resume/terminate routes and their error mapping, the suspension bridge's
 // attribution (the starting actor becomes requestedBy, so they cannot decide
 // their own run), and the D4 reconcileApprovals self-healing hook on status
 // reads.
@@ -22,8 +22,10 @@ import {
 } from '../approval-api/index.js';
 import {
   InvalidRunRequestError,
+  RunLifecycleBlockedError,
   RunNotSuspendedError,
   type RunSummary,
+  RunTerminalConflictError,
   UnknownRunError,
 } from '../do-runner/index.js';
 import { reconcileApprovalsOnStatus } from './approval-bridge.js';
@@ -82,6 +84,7 @@ interface HarnessOptions {
     runId: string,
   ) => Promise<RunSummary | undefined>;
   resume?: RunRouterOptions['resume'];
+  terminate?: NonNullable<RunRouterOptions['terminate']>;
   reconcileApprovals?: RunRouterOptions['reconcileApprovals'];
   // F9: feeds the resolver's allowSelfDecision now (the run-router no longer
   // owns a selfDecision knob), driving the catalog's canSelfDecide echo.
@@ -163,9 +166,17 @@ function makeHarness(options: HarnessOptions = {}) {
         resumed.push({ workflowId, runId, body });
         return { runId, status: 'success' };
       }),
+    ...(options.terminate ? { terminate: options.terminate } : {}),
     reconcileApprovals: options.reconcileApprovals,
   });
-  return { store, service, handle, started, resumed };
+  return {
+    store,
+    service,
+    resources: backend.resources(),
+    handle,
+    started,
+    resumed,
+  };
 }
 
 interface ReqOptions {
@@ -701,6 +712,118 @@ describe('createRunRouter — POST /runs', () => {
         { id: ADMIN.id, role: 'admin' },
       ),
     ).rejects.toThrow(/cannot decide their own approval/);
+  });
+});
+
+describe('createRunRouter — POST terminate', () => {
+  it('maps a direct lifecycle dispute to a structured 409 response', async () => {
+    const { handle } = makeHarness({
+      terminate: async () => {
+        throw new RunLifecycleBlockedError({
+          code: 'DISPUTED_SETTLEMENT',
+          message:
+            'run termination is blocked while an economic operation is disputed',
+        });
+      },
+    });
+
+    const response = await handle(
+      req('/runs/open-flow/acme_r1/terminate', { method: 'POST' }),
+    );
+
+    expect(response?.status).toBe(409);
+    await expect(response?.json()).resolves.toEqual({
+      error:
+        'run termination is blocked while an economic operation is disputed',
+      reason: {
+        code: 'DISPUTED_SETTLEMENT',
+        message:
+          'run termination is blocked while an economic operation is disputed',
+      },
+    });
+  });
+
+  it('maps a direct terminal conflict to 409', async () => {
+    const { handle } = makeHarness({
+      terminate: async () => {
+        throw new RunTerminalConflictError('open-flow', 'acme_r1', 'success');
+      },
+    });
+
+    const response = await handle(
+      req('/runs/open-flow/acme_r1/terminate', { method: 'POST' }),
+    );
+
+    expect(response?.status).toBe(409);
+    await expect(response?.json()).resolves.toEqual({
+      error:
+        "run 'acme_r1' of workflow 'open-flow' is already terminal with status 'success'",
+    });
+  });
+
+  it('uses owner-DO replay authorization only after ownership is gone and keeps unrelated callers opaque', async () => {
+    const terminate = vi.fn(
+      async (
+        _workflowId: string,
+        runId: string,
+        principal: { id: string },
+        _replayOnly: boolean,
+      ): Promise<RunSummary> => {
+        if (principal.id !== OPERATOR.id) {
+          throw new UnknownRunError('open-flow', runId);
+        }
+        return {
+          runId,
+          status: 'cancelled',
+          errorEnvelope: { code: 'CANCELLED', message: 'run was cancelled' },
+        };
+      },
+    );
+    const { handle, resources } = makeHarness({ terminate });
+
+    const owned = await handle(
+      req('/runs/open-flow/acme_r1/terminate', { method: 'POST' }),
+    );
+    expect(owned?.status).toBe(200);
+    expect(terminate).toHaveBeenLastCalledWith(
+      'open-flow',
+      'acme_r1',
+      expect.objectContaining({ kind: 'human', id: OPERATOR.id }),
+      false,
+    );
+
+    await expect(
+      resources.release('run', 'acme_r1', {
+        kind: 'human',
+        id: OPERATOR.id,
+      }),
+    ).resolves.toBe(true);
+    const replay = await handle(
+      req('/runs/open-flow/acme_r1/terminate', { method: 'POST' }),
+    );
+    expect(replay?.status).toBe(200);
+    expect(await replay?.json()).toEqual({
+      runId: 'acme_r1',
+      status: 'cancelled',
+      errorEnvelope: { code: 'CANCELLED', message: 'run was cancelled' },
+    });
+    expect(terminate).toHaveBeenLastCalledWith(
+      'open-flow',
+      'acme_r1',
+      expect.objectContaining({ kind: 'human', id: OPERATOR.id }),
+      true,
+    );
+
+    const unrelated = await handle(
+      req('/runs/open-flow/acme_r1/terminate', {
+        method: 'POST',
+        actor: { id: 'eve', role: 'operator' },
+      }),
+    );
+    expect(unrelated?.status).toBe(404);
+    expect(await unrelated?.json()).toEqual({
+      error: "no run 'acme_r1' found for workflow 'open-flow'",
+    });
   });
 });
 

@@ -29,7 +29,11 @@ export async function doSummary(response: DoResponseLike): Promise<RunSummary> {
       typeof (payload as { error?: unknown }).error === 'string'
         ? (payload as { error: string }).error
         : `run request failed with status ${response.status}`;
-    throw new RunRouteError(response.status, message);
+    const reason =
+      payload !== null && typeof payload === 'object'
+        ? (payload as { reason?: unknown }).reason
+        : undefined;
+    throw new RunRouteError(response.status, message, reason);
   }
   return payload as RunSummary;
 }

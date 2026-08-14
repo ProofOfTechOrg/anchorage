@@ -29,6 +29,7 @@ import {
   trustAutomationPrincipal,
 } from '../approval-api/index.js';
 import { type AuditQueue, queueAuditSink } from '../audit-export/index.js';
+import { validateTablePrefix } from '../do-runner/table-prefix.js';
 import {
   type ResumeRunFn,
   reconcileApprovalsOnStatus,
@@ -56,16 +57,26 @@ export function maintenancePrincipal(
 // Keyed by the D1 binding, which is stable for an isolate's lifetime.
 const approvalFactories = new WeakMap<
   ApprovalDatabase,
-  D1ApprovalStoreFactory
+  Map<string, D1ApprovalStoreFactory>
 >();
 
 export function approvalStoreFactoryFor(
   db: ApprovalDatabase,
+  storageTablePrefix?: string,
 ): D1ApprovalStoreFactory {
-  let factory = approvalFactories.get(db);
+  const prefix =
+    validateTablePrefix(storageTablePrefix, 'storageTablePrefix') ?? '';
+  let factories = approvalFactories.get(db);
+  if (!factories) {
+    factories = new Map();
+    approvalFactories.set(db, factories);
+  }
+  let factory = factories.get(prefix);
   if (!factory) {
-    factory = new D1ApprovalStoreFactory(db);
-    approvalFactories.set(db, factory);
+    factory = new D1ApprovalStoreFactory(db, {
+      workflowSnapshotTable: `${prefix}mastra_workflow_snapshot`,
+    });
+    factories.set(prefix, factory);
   }
   return factory;
 }

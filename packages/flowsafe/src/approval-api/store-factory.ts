@@ -21,15 +21,25 @@ export interface ApprovalStoreFactory {
   resources(): ResourceOwnershipStore;
 }
 
+export interface D1ApprovalStoreFactoryOptions {
+  /** Existing Mastra snapshot table used to atomically fence human decisions. */
+  workflowSnapshotTable?: string;
+}
+
 export class D1ApprovalStoreFactory implements ApprovalStoreFactory {
   readonly #db: ApprovalDatabase;
+  readonly #options: D1ApprovalStoreFactoryOptions;
   #schemaReady?: Promise<void>;
   #resourceSchemaReady?: Promise<void>;
   #store?: ApprovalStore;
   #resources?: RecoverableResourceOwnershipStore;
 
-  constructor(db: ApprovalDatabase) {
+  constructor(
+    db: ApprovalDatabase,
+    options: D1ApprovalStoreFactoryOptions = {},
+  ) {
     this.#db = db;
+    this.#options = options;
   }
 
   #ready = (): Promise<void> => {
@@ -43,7 +53,10 @@ export class D1ApprovalStoreFactory implements ApprovalStoreFactory {
   };
 
   store(): ApprovalStore {
-    this.#store ??= new D1ApprovalStore(this.#db, { ready: this.#ready });
+    this.#store ??= new D1ApprovalStore(this.#db, {
+      ready: this.#ready,
+      ...this.#options,
+    });
     return this.#store;
   }
 
