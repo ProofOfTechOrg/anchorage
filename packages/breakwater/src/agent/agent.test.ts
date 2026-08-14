@@ -869,6 +869,7 @@ describe('Mastra Agent execution-entry inventory', () => {
       'hasOwnWorkspace',
       'isModelFallbacks',
       'listActiveRuns',
+      'listActiveThreadRuns',
       'listAgents',
       'listAgentTools',
       'listAssignedTools',
