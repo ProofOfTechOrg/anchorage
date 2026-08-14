@@ -1,10 +1,23 @@
 # @proofoftech/fleet-control
 
+## 0.3.1
+
+### Patch Changes
+
+- Updated dependencies [296207f]
+  - @proofoftech/flowsafe@0.16.1
+
 ## 0.3.0
 
 ### Minor Changes
 
 - 1f6a13a: Add a fenced, replay-safe `forceDecommissionDeployment()` escape hatch for ordinary deployments whose retained specification inputs are unavailable.
+
+  The operation always runs under `withDeploymentLease()` and persists the normal teardown phases. It removes control secrets, disables and verifies public ingress, detaches the custom domain, and deletes the exact persisted D1 database ID after asserting its fleet-owned name. Provider `404` responses converge as already absent, so retries resume after any completed mutation. Success deletes the fleet ledger row and emits the normal audit surface with `forced: true`.
+
+  Force decommission never fetches an artifact, rebuilds a specification digest, or enters the `FLEET_SPEC_DIGEST` or version-ownership attestation path. It does not delete the ordinary Worker script, application R2 buckets, or control-plane retention data. After success, the host remains responsible for deleting its separate retention row and revoking its gateway key.
+
+  The built-in `WranglerLoopBackend` implements the required spec-free route-API operations. Custom ordinary-Worker backends must implement `forceDecommissionStep()` with equivalent fenced checks. Workers for Platforms deployments fail closed because their dispatch and trusted-resource topology cannot use the ordinary-Worker route API. A `database-create-authorized` record also fails closed because its durable row cannot prove the exact database ID after a lost create response.
 
 ### Patch Changes
 

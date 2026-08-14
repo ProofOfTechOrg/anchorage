@@ -201,12 +201,12 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     return value;
   }
 
-  #startPrincipal(request: Request): ExecutionPrincipal {
+  #trustedExecutionPrincipal(request: Request): ExecutionPrincipal {
     const encoded = request.headers.get(EXECUTION_PRINCIPAL_HEADER);
     const principal = encoded ? decodeExecutionPrincipal(encoded) : undefined;
     if (!principal) {
       throw new DurableObjectRunIdentityError(
-        'run start carries no valid trusted execution principal',
+        'run request carries no valid trusted execution principal',
       );
     }
     return principal;
@@ -455,7 +455,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
 
     if (request.method === 'POST' && segments.length === 1) {
       return this.#withOperationLock(async () => {
-        const principal = this.#startPrincipal(request);
+        const principal = this.#trustedExecutionPrincipal(request);
         const body = await readJson<StartBody>(request);
         if (!body || typeof body.workflowId !== 'string') {
           return json({ error: 'workflowId is required' }, 400);
@@ -671,7 +671,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       runId
     ) {
       this.#assertRunIdentity(workflowId, runId);
-      const principal = this.#startPrincipal(request);
+      const principal = this.#trustedExecutionPrincipal(request);
       const runtime = this.#ensureRuntime();
       const preflightOwner = await this.runOwnership(this.env).owner(
         'run',
@@ -719,7 +719,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       runId
     ) {
       this.#assertRunIdentity(workflowId, runId);
-      const principal = this.#startPrincipal(request);
+      const principal = this.#trustedExecutionPrincipal(request);
       const body = (await readJson<DeadlineBody>(request)) ?? {};
       const cas: RunLifecycleCas = {
         expectedRevision: body.expectedRevision as number,

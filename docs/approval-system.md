@@ -95,7 +95,9 @@ Roles are enforced server-side:
 
 - `reviewer` and `admin` can perform review operations according to the service rules.
 - Other roles may list or inspect only where the host's configured policy permits it.
-- Per-workflow start and resume authorization belongs to the run router, not the approval record.
+- Per-workflow start, resume, and terminate authorization belongs to the run router, not the approval record.
+
+Termination and deadline expiration never decide or resume an approval. They atomically fence new decisions against the terminal intent, then abandon every open record through system-attributed stale supersession. SLA escalation remains independent and never cancels a run.
 
 Authentication and actor-to-role mapping remain host responsibilities.
 

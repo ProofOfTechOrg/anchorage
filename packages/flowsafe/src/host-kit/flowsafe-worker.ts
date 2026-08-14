@@ -16,6 +16,8 @@ import type {
   ApprovalAuditEvent,
   ApprovalDatabase,
   ApprovalNotificationSink,
+  ApprovalService,
+  ApprovalStore,
   ApprovalStreamSink,
   SelfDecisionPolicy,
 } from '../approval-api/index.js';
@@ -453,6 +455,39 @@ export interface FlowsafeRunnerLifecycleOptions {
   discardScheduleDispatch?: DurableObjectRunLifecycleHooks['discardScheduleDispatch'];
 }
 
+interface ConfiguredApprovalServiceOptions {
+  store: ApprovalStore;
+  waitUntil?: (promise: Promise<unknown>) => void;
+  notify?: ApprovalNotificationSink;
+  allowSelfDecision: SelfDecisionPolicy;
+  stream?: ApprovalStreamSink;
+}
+
+function buildConfiguredApprovalService<Env extends FlowsafeWorkerEnv>(
+  config: FlowsafeRunnerLifecycleConfig<Env>,
+  env: Env,
+  topology: Pick<DoRunTopology, 'resumeRecord'>,
+  options: ConfiguredApprovalServiceOptions,
+): ApprovalService {
+  return buildHostApprovalService(options.store, {
+    deploymentTag: env.DEPLOYMENT_TENANT,
+    systemPrincipalId: config.systemPrincipalId,
+    defaultSlaSeconds: numberVar(
+      env.APPROVAL_SLA_SECONDS,
+      4 * 60 * 60,
+      'APPROVAL_SLA_SECONDS',
+    ),
+    resumeRun: config.buildResumeRun
+      ? config.buildResumeRun(topology.resumeRecord, env)
+      : topology.resumeRecord,
+    queue: auditQueueFor(env),
+    waitUntil: options.waitUntil,
+    notify: options.notify,
+    allowSelfDecision: options.allowSelfDecision,
+    stream: options.stream,
+  });
+}
+
 /**
  * Builds the Runner DO's terminal-cleanup hooks from the same approval-service
  * configuration as createFlowsafeWorker. Hosts supply only the optional DO
@@ -479,32 +514,19 @@ export function createFlowsafeRunnerLifecycle<Env extends FlowsafeWorkerEnv>(
   const hubTopology = env.HUB
     ? createHubTopology(env.HUB, env.DEPLOYMENT_IDENTITY_SECRET)
     : undefined;
-  const service = buildHostApprovalService(
-    approvalStoreFactoryFor(env.DB, storageTablePrefix).store(),
-    {
-      deploymentTag: env.DEPLOYMENT_TENANT,
-      systemPrincipalId: config.systemPrincipalId,
-      defaultSlaSeconds: numberVar(
-        env.APPROVAL_SLA_SECONDS,
-        4 * 60 * 60,
-        'APPROVAL_SLA_SECONDS',
-      ),
-      resumeRun: config.buildResumeRun
-        ? config.buildResumeRun(topology.resumeRecord, env)
-        : topology.resumeRecord,
-      queue: auditQueueFor(env),
-      waitUntil: options.waitUntil,
-      notify: config.notify?.(env),
-      allowSelfDecision,
-      stream: hubTopology
-        ? (event) => {
-            const send = hubTopology.publish(event);
-            options.waitUntil?.(send);
-            return send;
-          }
-        : undefined,
-    },
-  );
+  const service = buildConfiguredApprovalService(config, env, topology, {
+    store: approvalStoreFactoryFor(env.DB, storageTablePrefix).store(),
+    waitUntil: options.waitUntil,
+    notify: config.notify?.(env),
+    allowSelfDecision,
+    stream: hubTopology
+      ? (event) => {
+          const send = hubTopology.publish(event);
+          options.waitUntil?.(send);
+          return send;
+        }
+      : undefined,
+  });
   return {
     abandonApprovals: (workflowId, runId, status) =>
       abandonApprovalsForRun(
@@ -761,30 +783,15 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       storeFactory: approvalStoreFactoryFor(env.DB, storageTablePrefix),
       deploymentTag: env.DEPLOYMENT_TENANT,
       buildService: (store) =>
-        buildHostApprovalService(store, {
-          deploymentTag: env.DEPLOYMENT_TENANT,
-          systemPrincipalId: config.systemPrincipalId,
-          defaultSlaSeconds: numberVar(
-            env.APPROVAL_SLA_SECONDS,
-            4 * 60 * 60,
-            'APPROVAL_SLA_SECONDS',
-          ),
-          // The one topology-specific piece: decisions resume the run
-          // through its DO stub.
-          resumeRun: config.buildResumeRun
-            ? config.buildResumeRun(topology.resumeRecord, env)
-            : topology.resumeRecord,
-          queue: auditQueueFor(env),
+        buildConfiguredApprovalService(config, env, topology, {
+          store,
           waitUntil,
           notify,
-          // Fetch-scope hub fan-out: every request-path mutation reaches the
-          // deployment hub, kept alive by ctx.waitUntil (DL-020). Undefined when no
-          // HUB is bound, so a non-streaming host is byte-identical to before.
           stream,
           allowSelfDecision: selfDecision,
         }),
       // The resolver's canSelfDecide display hint reads the SAME policy the
-      // service enforces (passed to buildHostApprovalService above), so the
+      // service enforces (passed to the shared service builder above), so the
       // /workflows echo can never contradict decide().
       allowSelfDecision: selfDecision,
     });
