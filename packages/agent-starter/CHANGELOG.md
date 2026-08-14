@@ -1,5 +1,12 @@
 # anchorage-agent-starter
 
+## 0.0.12
+
+### Patch Changes
+
+- Updated dependencies [296207f]
+  - @proofoftech/flowsafe@0.16.1
+
 ## 0.0.11
 
 ### Patch Changes
