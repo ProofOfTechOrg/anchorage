@@ -55,7 +55,7 @@ export type StreamRouter = (request: Request) => Promise<Response | null>;
 /**
  * A DO stub that forwards a raw WS-upgrade Request and returns the 101 Response
  * unmodified. The runner's structural RunnerStubLike (do-run-topology.ts) models
- * only the JSON `fetch(url, init)` overload used for start/status/resume; the
+ * only the JSON `fetch(url, init)` overload used for run lifecycle routes; the
  * REAL DurableObjectStub also forwards a raw `Request` -> `Response`, which the
  * WebSocket upgrade needs. This narrow local shape names exactly that overload
  * so the forward is typed without widening the shared RunnerStubLike seam. The

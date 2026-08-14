@@ -6,6 +6,14 @@
 
 - 1f6a13a: Add idempotent run termination and deadline maintenance to the Durable Object host kit.
 
+  `createRunRouter()` now exposes authenticated workflow termination, and the agent host exposes the equivalent agent-run route. Cancellation is legal from every nonterminal wait, retry, suspension, and running state. It persists a structured `CANCELLED` envelope before cleanup, abandons open approvals without minting or resuming, discards an executing agent-schedule receipt, and releases ownership only after the terminal snapshot commits. Retries and Durable Object eviction re-drive the same persisted intent. A disputed economic settlement returns a structured `409` before active work is interrupted.
+
+  Starts and resumes accept `deadlineMs`. `RunSummary` reports the resulting deadline, and the maintenance Durable Object runs a bounded, cursor-resumable deadline duty. Each overdue run uses an owner-Durable-Object compare-and-swap transition to `timed_out` with a `TIMED_OUT` envelope. Deadline expiry abandons open approvals, while the existing SLA sweep remains escalation-only. Maintenance health now reports deadline scheduling and completion timestamps.
+
+  Hosts composed with `createFlowsafeWorker()` receive the workflow route and deadline duty. Hosts that expose lifecycle termination through a custom `DurableObjectRunner` must override `runLifecycle()` with approval-abandonment hooks and implement `release()` on their `runOwnership()` store. Agent hosts with begun schedule-dispatch leases must also provide the exact-run discard hook. Ordinary starts and resumes remain lifecycle-metadata-free unless they use a deadline or another trusted lifecycle projection.
+
+  The release adds no required D1 table and keeps the existing deployment-identity header, trusted execution-principal header, separation-of-duties policy, snapshot authority, and 39-character storage-prefix limit.
+
 ## 0.15.0
 
 ### Minor Changes
