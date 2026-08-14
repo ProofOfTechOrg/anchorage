@@ -32,6 +32,7 @@ import type {
   ExternalPlatformResources,
   ExternalReleaseSnapshot,
   FleetRecord,
+  ForceDecommissionStep,
   LiveDeployment,
   MaintenanceHealth,
   PromotionGuard,
@@ -1845,6 +1846,105 @@ export class WranglerLoopBackend implements ProvisioningBackend {
         `ordinary Worker '${spec.scriptName}' failed exact secret revocation`,
       );
     }
+  }
+
+  async forceDecommissionStep(
+    record: FleetRecord,
+    step: ForceDecommissionStep,
+    fence: ExternalMutationFence,
+  ): Promise<void> {
+    if (record.backend !== this.kind) {
+      throw new Error(
+        `plain Worker backend cannot force-decommission '${record.backend}' resources`,
+      );
+    }
+    if (step === 'remove-traffic') {
+      const domains = await this.#routeApi.listCustomDomains();
+      for (const domain of domains.filter(
+        ({ service }) => service === record.scriptName,
+      )) {
+        await this.#routeApi.detachCustomDomain(domain.id, fence);
+      }
+      const initial = await this.#routeApi.inspectOrdinaryWorkerFootprint(
+        record.scriptName,
+      );
+      if (initial.scriptPresent) {
+        await this.#routeApi.disableOrdinaryWorkerPublicAccess(
+          record.scriptName,
+          fence,
+        );
+      }
+      const [footprint, remainingDomains] = await Promise.all([
+        this.#routeApi.inspectOrdinaryWorkerFootprint(record.scriptName),
+        this.#routeApi.listCustomDomains(),
+      ]);
+      if (
+        footprint.customDomains.length > 0 ||
+        footprint.zoneRoutes.length > 0 ||
+        footprint.workersDevEnabled === true ||
+        footprint.previewUrlsEnabled === true ||
+        remainingDomains.some(({ service }) => service === record.scriptName)
+      ) {
+        throw new Error(
+          `ordinary Worker '${record.scriptName}' retains public ingress after force decommission`,
+        );
+      }
+      return;
+    }
+    if (step === 'revoke-credentials') {
+      const secretNames = [
+        ...new Set(
+          await this.#routeApi.listOrdinaryWorkerSecretNames(record.scriptName),
+        ),
+      ].sort();
+      for (const secretName of secretNames) {
+        await this.#routeApi.deleteControlSecrets(
+          record.scriptName,
+          [secretName],
+          fence,
+        );
+      }
+      const remaining = await this.#routeApi.listOrdinaryWorkerSecretNames(
+        record.scriptName,
+      );
+      if (remaining.length > 0) {
+        throw new Error(
+          `ordinary Worker '${record.scriptName}' failed exact secret revocation during force decommission`,
+        );
+      }
+      return;
+    }
+    if (step !== 'delete-database') {
+      throw new Error(`unsupported force-decommission step '${step}'`);
+    }
+    const getDatabase = this.#routeApi.getDatabase;
+    const deleteDatabase = this.#routeApi.deleteDatabase;
+    if (!getDatabase || !deleteDatabase) {
+      throw new Error(
+        'plain Worker route API does not support exact-ID D1 database deletion',
+      );
+    }
+    await this.#routeApi.withMutationFence(fence, async () => {
+      const database = await getDatabase.call(
+        this.#routeApi,
+        record.databaseId,
+      );
+      if (!database) return;
+      if (
+        database.id !== record.databaseId ||
+        database.name !== record.databaseName
+      ) {
+        throw new Error(
+          `persisted database '${record.databaseId}' resolved with unexpected identity '${database.id}:${database.name}' during force decommission`,
+        );
+      }
+      await deleteDatabase.call(this.#routeApi, database.id);
+      if (await getDatabase.call(this.#routeApi, record.databaseId)) {
+        throw new Error(
+          `database '${record.databaseId}' remains after force decommission`,
+        );
+      }
+    });
   }
 
   async removeTraffic(

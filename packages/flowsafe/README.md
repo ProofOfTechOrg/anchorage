@@ -61,12 +61,12 @@ Copy the [reference deployment](https://github.com/ProofOfTechOrg/anchorage/tree
 - D1-backed Mastra snapshots and approvals;
 - bearer-authentication seam and actor resolver;
 - strict D1 deployment sentinel plus authenticated Worker-to-Durable-Object calls;
-- workflow catalog, start, status, and resume routes;
+- workflow catalog, start, status, resume, and idempotent termination routes;
 - suspension-to-approval bridge;
 - exact suspension-bound breakwater grant derivation;
 - role checks and separation of duties;
 - optional live approval/run WebSockets;
-- alarm-owned SLA sweep and retention purge;
+- alarm-owned deadline, SLA, and retention duties;
 - structured audit and optional Queue-to-SIEM export;
 - a sample gated workflow.
 
@@ -133,6 +133,40 @@ When a workflow or durable agent suspends:
 Durable-agent records produce `tool-call` scope. Workflow gates produce exact `suspension` scope. Trusted `runScoped` records produce explicit `run` scope. Grants never travel in public request bodies. A raw or forged resume finds no stored capability and fails at the Breakwater connector gate.
 
 The same durable tool call may retry with its persisted `toolCallId`; a new model tool call requires approval. Legacy records without explicit scope and legacy connector ID arrays fail closed.
+
+## Terminate runs and enforce deadlines
+
+The composed host mounts `POST /runs/:workflowId/:runId/terminate`. It transitions `running`, waiting, retry, and suspended runs to `cancelled`. The summary contains this exact structured reason:
+
+```json
+{
+  "status": "cancelled",
+  "errorEnvelope": {
+    "code": "CANCELLED",
+    "message": "run was cancelled"
+  }
+}
+```
+
+Termination is idempotent. A retry by the same trusted principal returns the persisted terminal summary after ownership cleanup. An unrelated principal receives the same opaque `404` as any inaccessible run. A disputed economic settlement returns `409` with `reason.code` set to `DISPUTED_SETTLEMENT` before the runtime cancels active work.
+
+Economic settlement projections are trusted internal `StartRunOptions.economicOperations` and `ResumeRunOptions.economicOperations` inputs. The host fixes the projection at an execution-leg boundary before that leg becomes cancellable. Public start and resume bodies cannot set it, and Flowsafe does not expose a dynamic mid-leg update API.
+
+The terminal snapshot commits before lifecycle cleanup. Cleanup abandons open approvals, discards an executing agent-schedule receipt, releases run ownership, and then records completion. A crash between those steps reuses the terminal snapshot as its retry anchor. Hosts that compose the run route must override `DurableObjectRunner.runLifecycle()`; use `createFlowsafeRunnerLifecycle()` so approval cleanup uses the same approval service and separation-of-duties configuration as the Worker.
+
+`POST /runs` and the resume body accept an optional nonnegative `deadlineMs`. Resume replaces the prior deadline relative to the accepted resume leg. `RunSummary.deadlineAt` exposes the persisted epoch-millisecond deadline. The independent deadline maintenance duty sends a compare-and-swap request to the owner Durable Object and transitions each expired run once:
+
+```json
+{
+  "status": "timed_out",
+  "errorEnvelope": {
+    "code": "TIMED_OUT",
+    "message": "run deadline expired"
+  }
+}
+```
+
+Monitor `nextDeadlineAt`, `lastDeadlineAt`, `lastDeadlineAttemptAt`, and `lastDeadlineError` on the maintenance health projection. The sweep is bounded by `maintenance.deadlineLimit`, which defaults to 100.
 
 ### REST surface
 
@@ -351,7 +385,7 @@ Complete wiring is in the [durable-agents guide](https://github.com/ProofOfTechO
 
 The composed `createFlowsafeWorker()` owns the shared route and maintenance-duty pipeline. Hosts inject workflows, identity verification, topology-backed optional routers, budget wrappers, notification transport, an invocation-scoped artifact-store factory, the storage table prefix, schedule tick, and extra purge duties.
 
-`createFlowsafeMaintenanceDurableObject()` runs approval service-level agreement (SLA) sweep, retention purge, and optional schedule fire as separate alarm invocations. Provider polling and background recovery use their own Durable Object alarms.
+`createFlowsafeMaintenanceDurableObject()` runs deadline expiry, approval service-level agreement (SLA) sweep, retention purge, and optional schedule fire as separate alarm invocations. Provider polling and background recovery use their own Durable Object alarms.
 
 Read:
 

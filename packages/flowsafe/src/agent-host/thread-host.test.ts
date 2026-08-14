@@ -3,6 +3,7 @@
 import type { MastraCompositeStore } from '@mastra/core/storage';
 import type { GuardedAgentHandle } from '@proofoftech/breakwater/agent';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   type ApprovalAuditEvent,
   type ApprovalRecord,
@@ -14,11 +15,16 @@ import {
 import type {
   InitResult,
   RequestContextProvider,
+  RunnerRuntime,
   RunSummary,
   ScheduleSourceStore,
   ThreadScope,
 } from '../do-runner/index.js';
 import { resourceIdFromKey } from '../do-runner/index.js';
+import {
+  D1SchedulesStorage,
+  type ScheduleDatabase,
+} from '../schedules/schedules-d1.js';
 import {
   type AgentThreadInstanceScope,
   type AgentThreadStateStorage,
@@ -110,7 +116,7 @@ interface Harness {
   >;
   stateStorage: AgentThreadStateStorage;
   alarmAt(): number | Date | undefined;
-  setSummary(summary: RunSummary | null): void;
+  setSummary(summary: RunSummary | null, visible?: boolean): void;
   setSnapshot(values?: {
     agentId?: string;
     threadId?: string;
@@ -143,6 +149,12 @@ function harness(
     resolvePrincipalPermissions?: PrincipalPermissionResolver;
     approvalService?: ApprovalService;
     resourceAccess?: RecoverableResourceOwnershipStore;
+    runtime?: Partial<RunnerRuntime>;
+    discardScheduleDispatch?: (
+      scheduleId: string,
+      dispatchId: string,
+      runId: string,
+    ) => Promise<void>;
   } = {},
 ): Harness {
   const state = new Map<string, unknown>();
@@ -224,7 +236,8 @@ function harness(
       if (!statusVisible && !started) return null;
       return summary ? { ...summary, runId } : null;
     }),
-  };
+    ...options.runtime,
+  } as unknown as RunnerRuntime;
   const scope = {
     threadId: 'acme_thread',
     principal: options.principal ?? {
@@ -287,6 +300,9 @@ function harness(
     stateStorage: () => stateStorage,
     resourceAccess: () => resourceAccess,
     scheduleSource: () => scheduleSource,
+    ...(options.discardScheduleDispatch
+      ? { discardScheduleDispatch: options.discardScheduleDispatch }
+      : {}),
     approvalService: (instanceScope) => {
       approvalScopes.push(instanceScope);
       if (options.approvalService) return options.approvalService;
@@ -313,9 +329,9 @@ function harness(
     schedules,
     stateStorage,
     alarmAt: () => alarm,
-    setSummary: (value) => {
+    setSummary: (value, visible = true) => {
       summary = value;
-      statusVisible = true;
+      statusVisible = visible;
     },
     setSnapshot,
   };
@@ -324,6 +340,58 @@ function harness(
 const HUMAN_OWNER = { kind: 'human' as const, id: 'operator-1' };
 const SCHEDULE_ID = 'acme_schedule';
 const DISPATCH_ID = 'acme_dispatch';
+const SCHEDULE_NOW = Date.parse('2026-08-14T00:00:00.000Z');
+
+async function executingAgentSchedule(): Promise<D1SchedulesStorage> {
+  const sqlite = openSqlite();
+  const schedules = new D1SchedulesStorage(
+    sqliteUnitDatabase(sqlite) as ScheduleDatabase,
+  );
+  await schedules.createSchedule({
+    id: SCHEDULE_ID,
+    target: {
+      type: 'agent',
+      agentId: 'writer',
+      prompt: 'scheduled',
+      threadId: 'acme_thread',
+      resourceId: RESOURCE_ID,
+    },
+    cron: '* * * * *',
+    status: 'active',
+    nextFireAt: SCHEDULE_NOW,
+    createdAt: SCHEDULE_NOW,
+    updatedAt: SCHEDULE_NOW,
+    metadata: {},
+  });
+  await schedules.recordTrigger({
+    id: DISPATCH_ID,
+    scheduleId: SCHEDULE_ID,
+    runId: 'acme_run',
+    scheduledFireAt: SCHEDULE_NOW,
+    actualFireAt: SCHEDULE_NOW,
+    outcome: 'deferred',
+    metadata: {
+      dispatchState: 'prepared',
+      dispatchRef: {
+        scheduleId: SCHEDULE_ID,
+        dispatchId: DISPATCH_ID,
+        runId: 'acme_run',
+        target: 'agent',
+        mode: 'start',
+        agentId: 'writer',
+      },
+    },
+  });
+  await expect(
+    schedules.beginAgentScheduleDispatch(
+      SCHEDULE_ID,
+      DISPATCH_ID,
+      SCHEDULE_NOW,
+      60_000,
+    ),
+  ).resolves.toEqual({ state: 'ready' });
+  return schedules;
+}
 
 async function seedThreadOwner(
   fixture: Pick<Harness, 'resources'>,
@@ -764,6 +832,362 @@ describe('createThreadAgentHost owner recovery', () => {
 });
 
 describe('createThreadAgentHost', () => {
+  it('discards the live executing agent-schedule lease during terminal cleanup so a later tick cannot redispatch', async () => {
+    const schedules = await executingAgentSchedule();
+    const summary: RunSummary = {
+      runId: 'acme_run',
+      status: 'cancelled',
+      errorEnvelope: { code: 'CANCELLED', message: 'run was cancelled' },
+    };
+    const cancelActiveExecution = vi.fn(async () => true);
+    const terminateAsPrincipal = vi.fn(async () => ({
+      summary,
+      transitioned: true,
+      casMatched: true,
+      cleanup: {
+        revision: 2,
+        status: 'cancelled' as const,
+        cleanupCompleted: false,
+        scheduleDispatch: {
+          scheduleId: SCHEDULE_ID,
+          dispatchId: DISPATCH_ID,
+        },
+      },
+    }));
+    const completeTerminalCleanup = vi.fn(async () => summary);
+    const fixture = harness(['writer'], {
+      runtime: {
+        cancelActiveExecution,
+        terminateAsPrincipal,
+        completeTerminalCleanup,
+      },
+      discardScheduleDispatch: (scheduleId, dispatchId, runId) =>
+        schedules.discardAgentScheduleDispatch(scheduleId, dispatchId, runId),
+    });
+    fixture.state.set(TEST_RUN_RECORD_KEY, {
+      version: 2,
+      agentId: 'writer',
+      principal: fixture.scope.principal,
+      originEntryPath: 'schedule.fire',
+    });
+    await fixture.resources.claim('run', 'acme_run', HUMAN_OWNER);
+
+    const response = await fixture.host.route(
+      new Request(
+        `https://thread/_flowsafe/agent-host/runs/writer/acme_run/terminate?resourceId=${RESOURCE_ID}`,
+        { method: 'POST' },
+      ),
+      fixture.scope,
+    );
+
+    expect(response?.status).toBe(200);
+    expect(cancelActiveExecution).toHaveBeenCalledOnce();
+    expect(terminateAsPrincipal).toHaveBeenCalledOnce();
+    expect(completeTerminalCleanup).toHaveBeenCalledWith(
+      'durable-agentic-loop',
+      'acme_run',
+      2,
+    );
+    await expect(
+      fixture.resources.owner('run', 'acme_run'),
+    ).resolves.toBeUndefined();
+    await expect(
+      schedules.beginAgentScheduleDispatch(
+        SCHEDULE_ID,
+        DISPATCH_ID,
+        SCHEDULE_NOW + 1,
+        60_000,
+      ),
+    ).resolves.toEqual({
+      state: 'settled',
+      receipt: {
+        action: 'discard',
+        outcome: 'discarded',
+        runId: 'acme_run',
+      },
+    });
+  });
+
+  it('finishes cleanup when tick bookkeeping finalized the exact run first', async () => {
+    const schedules = await executingAgentSchedule();
+    await schedules.settleAgentScheduleDispatch(SCHEDULE_ID, DISPATCH_ID, {
+      action: 'wake',
+      outcome: 'succeeded',
+      runId: 'acme_run',
+      signalId: DISPATCH_ID,
+    });
+    await schedules.recordTrigger({
+      id: DISPATCH_ID,
+      scheduleId: SCHEDULE_ID,
+      runId: 'acme_run',
+      scheduledFireAt: SCHEDULE_NOW,
+      actualFireAt: SCHEDULE_NOW,
+      outcome: 'succeeded',
+      metadata: { action: 'wake', signalId: DISPATCH_ID },
+    });
+    const summary: RunSummary = {
+      runId: 'acme_run',
+      status: 'cancelled',
+      errorEnvelope: { code: 'CANCELLED', message: 'run was cancelled' },
+    };
+    const completeTerminalCleanup = vi.fn(async () => summary);
+    const discardScheduleDispatch = vi.fn(
+      (scheduleId: string, dispatchId: string, runId: string) =>
+        schedules.discardAgentScheduleDispatch(scheduleId, dispatchId, runId),
+    );
+    const fixture = harness(['writer'], {
+      runtime: {
+        cancelActiveExecution: vi.fn(async () => false),
+        terminateAsPrincipal: vi.fn(async () => ({
+          summary,
+          transitioned: true,
+          casMatched: true,
+          cleanup: {
+            revision: 2,
+            status: 'cancelled' as const,
+            cleanupCompleted: false,
+            scheduleDispatch: {
+              scheduleId: SCHEDULE_ID,
+              dispatchId: DISPATCH_ID,
+            },
+          },
+        })),
+        completeTerminalCleanup,
+      },
+      discardScheduleDispatch,
+    });
+    fixture.state.set(TEST_RUN_RECORD_KEY, {
+      version: 2,
+      agentId: 'writer',
+      principal: fixture.scope.principal,
+      originEntryPath: 'schedule.fire',
+    });
+    await fixture.resources.claim('run', 'acme_run', HUMAN_OWNER);
+
+    const response = await fixture.host.route(
+      new Request(
+        `https://thread/_flowsafe/agent-host/runs/writer/acme_run/terminate?resourceId=${RESOURCE_ID}`,
+        { method: 'POST' },
+      ),
+      fixture.scope,
+    );
+
+    expect(response?.status).toBe(200);
+    expect(discardScheduleDispatch).toHaveBeenCalledWith(
+      SCHEDULE_ID,
+      DISPATCH_ID,
+      'acme_run',
+    );
+    expect(completeTerminalCleanup).toHaveBeenCalledWith(
+      'durable-agentic-loop',
+      'acme_run',
+      2,
+    );
+    await expect(
+      fixture.resources.owner('run', 'acme_run'),
+    ).resolves.toBeUndefined();
+    await expect(schedules.listTriggers(SCHEDULE_ID)).resolves.toEqual([
+      expect.objectContaining({
+        id: DISPATCH_ID,
+        runId: 'acme_run',
+        outcome: 'succeeded',
+      }),
+    ]);
+  });
+
+  it('re-drives cleanup after the terminal marker commits but its response is lost', async () => {
+    const summary: RunSummary = {
+      runId: 'acme_run',
+      status: 'cancelled',
+      errorEnvelope: { code: 'CANCELLED', message: 'run was cancelled' },
+    };
+    let cleanupCompleted = false;
+    const completeTerminalCleanup = vi.fn(async () => {
+      cleanupCompleted = true;
+      throw new Error('cleanup marker response lost');
+    });
+    const terminateAsPrincipal = vi.fn(async () => ({
+      summary,
+      transitioned: !cleanupCompleted,
+      casMatched: true,
+      cleanup: {
+        revision: 2,
+        status: 'cancelled' as const,
+        cleanupCompleted,
+      },
+    }));
+    const fixture = harness(['writer'], {
+      runtime: {
+        cancelActiveExecution: vi.fn(async () => false),
+        terminateAsPrincipal,
+        completeTerminalCleanup,
+      },
+    });
+    fixture.setSummary(summary);
+    fixture.state.set(TEST_RUN_RECORD_KEY, {
+      version: 2,
+      agentId: 'writer',
+      principal: fixture.scope.principal,
+      originEntryPath: 'http.start',
+    });
+    await fixture.resources.claim('run', 'acme_run', HUMAN_OWNER);
+    const terminateUrl =
+      `https://thread/_flowsafe/agent-host/runs/writer/acme_run/terminate` +
+      `?resourceId=${RESOURCE_ID}`;
+
+    await expect(
+      fixture.host.route(
+        new Request(terminateUrl, { method: 'POST' }),
+        fixture.scope,
+      ),
+    ).rejects.toThrow('cleanup marker response lost');
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+    await expect(
+      fixture.resources.owner('run', 'acme_run'),
+    ).resolves.toBeUndefined();
+
+    fixture.state.set(TEST_RUN_RECORD_KEY, {
+      version: 2,
+      agentId: 'writer',
+      principal: fixture.scope.principal,
+      originEntryPath: 'http.start',
+    });
+    const replay = await fixture.host.route(
+      new Request(`${terminateUrl}&replay=1`, { method: 'POST' }),
+      fixture.scope,
+    );
+
+    expect(replay?.status).toBe(200);
+    expect(terminateAsPrincipal).toHaveBeenCalledTimes(2);
+    expect(completeTerminalCleanup).toHaveBeenCalledOnce();
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+  });
+
+  it('rejects a malformed terminal recovery journal before journal-driven ownership mutations', async () => {
+    const summary: RunSummary = {
+      runId: 'acme_run',
+      status: 'cancelled',
+      errorEnvelope: { code: 'CANCELLED', message: 'run was cancelled' },
+    };
+    const resourceAccess = new InMemoryResourceOwnershipStore();
+    const settleReservation = vi.spyOn(resourceAccess, 'settleReservation');
+    const release = vi.spyOn(resourceAccess, 'release');
+    const completeTerminalCleanup = vi.fn(async () => summary);
+    const fixture = harness(['writer'], {
+      resourceAccess,
+      runtime: {
+        cancelActiveExecution: vi.fn(async () => false),
+        terminateAsPrincipal: vi.fn(async () => ({
+          summary,
+          transitioned: true,
+          casMatched: true,
+          cleanup: {
+            revision: 2,
+            status: 'cancelled' as const,
+            cleanupCompleted: false,
+          },
+        })),
+        completeTerminalCleanup,
+      },
+    });
+    seedRecoveryState(
+      fixture.state,
+      'acme_run',
+      ownerRecovery('acme_run', { token: 'invalid/token', threaded: false }),
+      false,
+    );
+    await resourceAccess.claim('thread', 'acme_thread', HUMAN_OWNER);
+    await resourceAccess.claim('resource', RESOURCE_ID, HUMAN_OWNER);
+    await resourceAccess.claim('run', 'acme_run', HUMAN_OWNER);
+
+    await expect(
+      fixture.host.route(
+        new Request(
+          `https://thread/_flowsafe/agent-host/runs/writer/acme_run/terminate?resourceId=${RESOURCE_ID}`,
+          { method: 'POST' },
+        ),
+        fixture.scope,
+      ),
+    ).rejects.toThrow('stored agent owner recovery is malformed');
+
+    expect(settleReservation).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledWith('run', 'acme_run', HUMAN_OWNER);
+    await expect(
+      resourceAccess.owner('thread', 'acme_thread'),
+    ).resolves.toEqual(HUMAN_OWNER);
+    await expect(
+      resourceAccess.owner('resource', RESOURCE_ID),
+    ).resolves.toEqual(HUMAN_OWNER);
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(true);
+    expect(completeTerminalCleanup).not.toHaveBeenCalled();
+  });
+
+  it('cancels a live execution before waiting for the schedule dispatch lock', async () => {
+    const summary: RunSummary = {
+      runId: 'acme_run',
+      status: 'cancelled',
+      errorEnvelope: { code: 'CANCELLED', message: 'run was cancelled' },
+    };
+    let dispatchEntered!: () => void;
+    let finishDispatch!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      dispatchEntered = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      finishDispatch = resolve;
+    });
+    const cancelActiveExecution = vi.fn(async () => {
+      finishDispatch();
+      return true;
+    });
+    const fixture = harness(['writer'], {
+      runtime: {
+        cancelActiveExecution,
+        terminateAsPrincipal: vi.fn(async () => ({
+          summary,
+          transitioned: true,
+          casMatched: true,
+          cleanup: {
+            revision: 2,
+            status: 'cancelled' as const,
+            cleanupCompleted: false,
+          },
+        })),
+        completeTerminalCleanup: vi.fn(async () => summary),
+      },
+    });
+    fixture.setSummary({ runId: 'acme_run', status: 'running' });
+    fixture.state.set(TEST_RUN_RECORD_KEY, {
+      version: 2,
+      agentId: 'writer',
+      principal: fixture.scope.principal,
+      originEntryPath: 'schedule.fire',
+    });
+    await fixture.resources.claim('run', 'acme_run', HUMAN_OWNER);
+    const dispatching = fixture.host.serializeDispatch(async () => {
+      dispatchEntered();
+      await held;
+    });
+    await entered;
+
+    const response = await fixture.host.route(
+      new Request(
+        `https://thread/_flowsafe/agent-host/runs/writer/acme_run/terminate?resourceId=${RESOURCE_ID}`,
+        { method: 'POST' },
+      ),
+      fixture.scope,
+    );
+
+    expect(response?.status).toBe(200);
+    expect(cancelActiveExecution).toHaveBeenCalled();
+    await expect(dispatching).resolves.toBeUndefined();
+    await expect(
+      fixture.resources.owner('run', 'acme_run'),
+    ).resolves.toBeUndefined();
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
+  });
+
   it.each([
     '__proto__',
     'constructor',
@@ -1166,6 +1590,75 @@ describe('createThreadAgentHost', () => {
       'human',
       expect.any(String),
     );
+  });
+
+  it('terminates a direct scheduled start without settling an unbegun agent-dispatch lease', async () => {
+    const summary: RunSummary = {
+      runId: 'acme_run',
+      status: 'cancelled',
+      errorEnvelope: { code: 'CANCELLED', message: 'run was cancelled' },
+    };
+    const discardScheduleDispatch = vi.fn(async () => undefined);
+    const fixture = harness(['writer'], {
+      runtime: {
+        cancelActiveExecution: vi.fn(async () => false),
+        terminateAsPrincipal: vi.fn(async () => ({
+          summary,
+          transitioned: true,
+          casMatched: true,
+          cleanup: {
+            revision: 2,
+            status: 'cancelled' as const,
+            cleanupCompleted: false,
+          },
+        })),
+        completeTerminalCleanup: vi.fn(async () => summary),
+      },
+      discardScheduleDispatch,
+    });
+    await seedThreadlessSchedule(fixture);
+    fixture.setSummary({ runId: 'acme_run', status: 'suspended' }, false);
+    await fixture.host.start(fixture.scope, {
+      agentId: 'writer',
+      threadId: 'acme_thread',
+      resourceId: RESOURCE_ID,
+      runId: 'acme_run',
+      prompt: 'scheduled',
+      entryPath: 'schedule.fire',
+      threaded: false,
+      scheduleId: SCHEDULE_ID,
+      dispatchId: DISPATCH_ID,
+    });
+    await expect(
+      fixture.resources.owner('thread', 'acme_thread'),
+    ).resolves.toEqual(HUMAN_OWNER);
+    await expect(
+      fixture.resources.owner('resource', RESOURCE_ID),
+    ).resolves.toEqual(HUMAN_OWNER);
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(true);
+
+    const response = await fixture.host.route(
+      new Request(
+        `https://thread/_flowsafe/agent-host/runs/writer/acme_run/terminate?resourceId=${RESOURCE_ID}`,
+        { method: 'POST' },
+      ),
+      fixture.scope,
+    );
+
+    expect(response?.status).toBe(200);
+    expect(mocked.stream.mock.calls.at(-1)).toHaveLength(5);
+    expect(discardScheduleDispatch).not.toHaveBeenCalled();
+    await expect(
+      fixture.resources.owner('run', 'acme_run'),
+    ).resolves.toBeUndefined();
+    await expect(
+      fixture.resources.owner('thread', 'acme_thread'),
+    ).resolves.toBeUndefined();
+    await expect(
+      fixture.resources.owner('resource', RESOURCE_ID),
+    ).resolves.toBeUndefined();
+    expect(fixture.state.has(TEST_OWNER_RECOVERY_KEY)).toBe(false);
+    expect(fixture.state.has(TEST_RUN_RECORD_KEY)).toBe(false);
   });
 
   it('executes stored schedule prompt, context, and provider options instead of body payload', async () => {

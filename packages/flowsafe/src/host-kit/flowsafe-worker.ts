@@ -2,8 +2,8 @@
 // createFlowsafeWorker — the whole production-Worker skeleton the deploy
 // template and the showcase host previously carried as near-byte copies:
 // the /healthz → routers → 404 fetch pipeline over one actor resolver, the
-// alarm-driven maintenance (sweep, purge, and an optional schedule tick never
-// share an invocation). Hosts stay thin shells: they supply their workflows,
+// alarm-driven maintenance (deadline, sweep, purge, and optional schedule tick
+// never share an invocation). Hosts stay thin shells: they supply workflows,
 // their identity seam (buildVerifier), and their deployment-specific hooks —
 // preRoutes (extra unauthenticated/authenticated mounts), beforeStart/
 // beforeResume (e.g. a budget charge), notify (reviewer-facing transport), and
@@ -25,6 +25,7 @@ import {
   createApprovalRouter,
   createResourceOwnershipSchema,
   RESOURCE_OWNERSHIP_TABLE,
+  trustAutomationPrincipal,
 } from '../approval-api/index.js';
 import {
   type AuditProxyNamespaceLike,
@@ -34,10 +35,12 @@ import {
   type InfrastructureAuditEnvelope,
 } from '../audit-export/index.js';
 import { credentialsMatch } from '../do-runner/deployment-identity.js';
+import type { DurableObjectRunLifecycleHooks } from '../do-runner/durable-object.js';
 import type {
   DeploymentIdentityDatabase,
   PurgeExpiredBackgroundTasksResult,
   RunArtifactPurger,
+  RunDeadlineCursor,
   SnapshotDatabase,
 } from '../do-runner/index.js';
 import {
@@ -51,11 +54,12 @@ import {
   purgeExpiredThreadState,
   purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
+  sweepExpiredRunDeadlines,
   verifyDurableObjectDeploymentIdentity,
   verifyDurableObjectDeploymentRequest,
 } from '../do-runner/index.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
-import type { ResumeRunFn } from './approval-bridge.js';
+import { abandonApprovalsForRun, type ResumeRunFn } from './approval-bridge.js';
 import { bearerActorAuthenticator } from './bearer-auth.js';
 import {
   createDoRunTopology,
@@ -117,19 +121,29 @@ export interface MaintenanceNamespaceLike<Id = unknown> {
 }
 
 export interface MaintenanceHealth {
+  nextDeadlineAt?: number;
   nextSweepAt: number;
   nextPurgeAt: number;
   nextTickAt?: number;
   lastSweepAt?: number;
   lastPurgeAt?: number;
   lastTickAt?: number;
+  lastDeadlineAt?: number;
   lastSweepAttemptAt?: number;
   lastPurgeAttemptAt?: number;
   lastTickAttemptAt?: number;
+  lastDeadlineAttemptAt?: number;
   lastSweepError?: string;
   lastPurgeError?: string;
   lastTickError?: string;
+  lastDeadlineError?: string;
 }
+
+type InitializedMaintenanceHealth = MaintenanceHealth & {
+  nextDeadlineAt: number;
+  nextSweepAt: number;
+  nextPurgeAt: number;
+};
 
 export interface MaintenanceStorage {
   get<T = unknown>(key: string): Promise<T | undefined>;
@@ -277,15 +291,25 @@ export interface BackgroundTasksCleanupConfig {
 /** Structurally typed to keep host-kit independent of the agent-host subpath. */
 export type AgentRouter = (request: Request) => Promise<Response | null>;
 
-export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
-  /** The catalog createRunRouter serves and gates (hosts pass their metas). */
-  workflows: ReadonlyArray<WorkflowMeta>;
+export interface FlowsafeRunnerLifecycleConfig<Env extends FlowsafeWorkerEnv> {
   /**
    * System-principal id for bridge bookkeeping and alarm maintenance
    * attribution. Requester kind is persisted separately, so ids may overlap
    * across principal kinds.
    */
   systemPrincipalId: string;
+  /** Compose approval-driven resume handling, including agent-thread targets. */
+  buildResumeRun?: (fallback: ResumeRunFn, env: Env) => ResumeRunFn;
+  /** Reviewer-facing notification transport used by the same service. */
+  notify?: (env: Env) => ApprovalNotificationSink | undefined;
+  /** Prefix used by the runner's existing Mastra snapshot table. */
+  storageTablePrefix?: string;
+}
+
+export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv>
+  extends FlowsafeRunnerLifecycleConfig<Env> {
+  /** The catalog createRunRouter serves and gates (hosts pass their metas). */
+  workflows: ReadonlyArray<WorkflowMeta>;
   /**
    * The identity seam: env -> TokenVerifier. Called once per fetch, so hosts
    * keep their own per-isolate memoization —
@@ -302,6 +326,10 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
     sweepIntervalMs: number;
     purgeIntervalMs: number;
     tickIntervalMs?: number;
+    /** Deadline duty cadence. Defaults to sweepIntervalMs. */
+    deadlineIntervalMs?: number;
+    /** Maximum runs per deadline pass. Default 100. */
+    deadlineLimit?: number;
   };
   /**
    * Deployment-specific routes tried AFTER /healthz and BEFORE the approval
@@ -331,17 +359,6 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
     body: unknown,
   ) => Promise<void>;
   /**
-   * Compose approval-driven resume handling. Agent hosts use this to handle
-   * agent-thread targets and delegate generic workflow targets to fallback.
-   */
-  buildResumeRun?: (fallback: ResumeRunFn, env: Env) => ResumeRunFn;
-  /**
-   * Reviewer-facing notification transport (ApprovalNotificationSink) for
-   * created records and SLA escalations. Built per invocation from env
-   * (transports usually need secrets); undefined = no notifications.
-   */
-  notify?: (env: Env) => ApprovalNotificationSink | undefined;
-  /**
    * Builds the artifact purger from the current invocation's environment.
    * When set, the retention purge deletes each expired run's R2 artifacts WITH
    * its snapshot row. The snapshot row is the only enumerable record of a run's
@@ -351,11 +368,6 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
    * runs after the rows are deleted, when the keys are already unenumerable.
    */
   artifactStore?: (env: Env) => RunArtifactPurger | undefined;
-  /**
-   * Prefix for every prefix-aware built-in retention table. Must match the
-   * max-39 `tablePrefix` contract used when the deployment creates D1 storage.
-   */
-  storageTablePrefix?: string;
   /**
    * Opt-in background-task TTL cleanup. When present, the purge duty
    * reaps terminal `mastra_background_tasks` rows past the TTL as its OWN
@@ -434,6 +446,78 @@ export interface FlowsafeWorkerConfig<Env extends FlowsafeWorkerEnv> {
    * contains it, logs a maintenance-error, and emits the combined log.
    */
   extraPurgeDuties?: (env: Env) => Promise<Record<string, unknown>>;
+}
+
+export interface FlowsafeRunnerLifecycleOptions {
+  waitUntil?: (promise: Promise<unknown>) => void;
+  discardScheduleDispatch?: DurableObjectRunLifecycleHooks['discardScheduleDispatch'];
+}
+
+/**
+ * Builds the Runner DO's terminal-cleanup hooks from the same approval-service
+ * configuration as createFlowsafeWorker. Hosts supply only the optional DO
+ * keepalive and their receipt-protocol-specific dispatch settler.
+ */
+export function createFlowsafeRunnerLifecycle<Env extends FlowsafeWorkerEnv>(
+  config: FlowsafeRunnerLifecycleConfig<Env>,
+  env: Env,
+  options: FlowsafeRunnerLifecycleOptions = {},
+): DurableObjectRunLifecycleHooks {
+  const storageTablePrefix = validateTablePrefix(
+    config.storageTablePrefix,
+    'storageTablePrefix',
+  );
+  const topology = createDoRunTopology(
+    env.RUNNER,
+    env.DEPLOYMENT_IDENTITY_SECRET,
+  );
+  const allowSelfDecision = selfDecisionPolicyVar(
+    env.APPROVAL_ALLOW_SELF_DECISION,
+    'APPROVAL_ALLOW_SELF_DECISION',
+    APPROVAL_ROLES,
+  ) as SelfDecisionPolicy;
+  const hubTopology = env.HUB
+    ? createHubTopology(env.HUB, env.DEPLOYMENT_IDENTITY_SECRET)
+    : undefined;
+  const service = buildHostApprovalService(
+    approvalStoreFactoryFor(env.DB, storageTablePrefix).store(),
+    {
+      deploymentTag: env.DEPLOYMENT_TENANT,
+      systemPrincipalId: config.systemPrincipalId,
+      defaultSlaSeconds: numberVar(
+        env.APPROVAL_SLA_SECONDS,
+        4 * 60 * 60,
+        'APPROVAL_SLA_SECONDS',
+      ),
+      resumeRun: config.buildResumeRun
+        ? config.buildResumeRun(topology.resumeRecord, env)
+        : topology.resumeRecord,
+      queue: auditQueueFor(env),
+      waitUntil: options.waitUntil,
+      notify: config.notify?.(env),
+      allowSelfDecision,
+      stream: hubTopology
+        ? (event) => {
+            const send = hubTopology.publish(event);
+            options.waitUntil?.(send);
+            return send;
+          }
+        : undefined,
+    },
+  );
+  return {
+    abandonApprovals: (workflowId, runId, status) =>
+      abandonApprovalsForRun(
+        service,
+        workflowId,
+        runId,
+        status,
+        config.systemPrincipalId,
+      ).then(() => undefined),
+    ...(options.discardScheduleDispatch
+      ? { discardScheduleDispatch: options.discardScheduleDispatch }
+      : {}),
+  };
 }
 
 function auditQueueFor<Env extends FlowsafeWorkerEnv>(
@@ -522,7 +606,12 @@ async function validateFleetChannelTopology<Env extends FlowsafeWorkerEnv>(
   }
 }
 
-export type MaintenanceDuty = 'sweep' | 'purge' | 'tick';
+export type MaintenanceDuty = 'deadline' | 'sweep' | 'purge' | 'tick';
+
+export interface MaintenanceDutyContext {
+  deadlineCursor?: RunDeadlineCursor;
+  advanceDeadlineCursor?(cursor: RunDeadlineCursor): Promise<void>;
+}
 
 /** The Worker handler plus the maintenance duty seam consumed by its DO. */
 export interface FlowsafeWorker<Env extends FlowsafeWorkerEnv> {
@@ -534,6 +623,7 @@ export interface FlowsafeWorker<Env extends FlowsafeWorkerEnv> {
   runMaintenanceDuty(
     duty: MaintenanceDuty,
     env: Env,
+    context?: MaintenanceDutyContext,
   ): Promise<MaintenanceOutcome>;
 }
 
@@ -668,7 +758,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
   ): ActorResolver => {
     const base = createActorResolver({
       authenticate: bearerActorAuthenticator(config.buildVerifier(env)),
-      storeFactory: approvalStoreFactoryFor(env.DB),
+      storeFactory: approvalStoreFactoryFor(env.DB, storageTablePrefix),
       deploymentTag: env.DEPLOYMENT_TENANT,
       buildService: (store) =>
         buildHostApprovalService(store, {
@@ -777,7 +867,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
     // the snapshot purge above: a failure in any one purge duty must never
     // stop the others.
     const approvalPurge = await runApprovalRetentionPurge({
-      store: approvalStoreFactoryFor(env.DB).store(),
+      store: approvalStoreFactoryFor(env.DB, storageTablePrefix).store(),
       retentionDays: env.APPROVAL_RETENTION_DAYS,
       trigger,
     });
@@ -913,8 +1003,8 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
   }
 
   // Track D schedule tick — its OWN failure-isolated duty (own try/catch, own log
-  // line). A wedged fire pass must cost the
-  // sweep + purge nothing, and vice versa (the same failure-isolation rationale).
+  // line). A wedged fire pass must cost the other duties nothing, and vice
+  // versa (the same failure-isolation rationale).
   async function runScheduleTickDuty(
     env: Env,
     trigger: string,
@@ -922,7 +1012,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
     const tick = config.scheduleTick?.(env);
     if (!tick) {
       // The tick duty ran but no scheduleTick builder is wired — a misconfig.
-      // Do NOT fall through to sweep/purge (this invocation is the tick's).
+      // Do not fall through to another duty; this invocation is the tick's.
       console.error(
         JSON.stringify({
           type: 'config-error',
@@ -945,6 +1035,61 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       console.error(
         JSON.stringify({
           type: 'schedule-tick-error',
+          trigger,
+          error: failure,
+        }),
+      );
+      return { ok: false, error: failure };
+    }
+  }
+
+  async function runDeadlineDuty(
+    env: Env,
+    trigger: string,
+    context?: MaintenanceDutyContext,
+  ): Promise<MaintenanceOutcome> {
+    const topology = createDoRunTopology(
+      env.RUNNER,
+      env.DEPLOYMENT_IDENTITY_SECRET,
+    );
+    const principal = trustAutomationPrincipal({
+      kind: 'system',
+      id: config.systemPrincipalId,
+      purpose: 'run-deadline-maintenance',
+    });
+    try {
+      const processed = await sweepExpiredRunDeadlines(env.DB, {
+        tablePrefix: storageTablePrefix,
+        limit: config.maintenance.deadlineLimit,
+        ...(context?.advanceDeadlineCursor
+          ? {
+              ...(context.deadlineCursor
+                ? { cursor: context.deadlineCursor }
+                : {}),
+              advanceCursor: context.advanceDeadlineCursor,
+            }
+          : {}),
+        transition: async (candidate) => {
+          await topology.timeOut(
+            candidate.workflowId,
+            candidate.runId,
+            {
+              expectedRevision: candidate.revision,
+              expectedDeadlineAt: candidate.deadlineAt,
+            },
+            principal,
+          );
+        },
+      });
+      console.log(
+        JSON.stringify({ type: 'deadline-sweep', trigger, processed }),
+      );
+      return { ok: true, value: undefined };
+    } catch (error) {
+      const failure = String(error);
+      console.error(
+        JSON.stringify({
+          type: 'deadline-sweep-error',
           trigger,
           error: failure,
         }),
@@ -1080,6 +1225,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           start: topology.start,
           status: topology.status,
           resume: topology.resume,
+          terminate: topology.terminate,
           beforeStart: beforeStart
             ? (context, workflowId, inputData) =>
                 beforeStart(context, env, workflowId, inputData)
@@ -1122,17 +1268,20 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       }
     },
 
-    async runMaintenanceDuty(duty, env) {
+    async runMaintenanceDuty(duty, env, context) {
       try {
         await ensureDeploymentIdentityBindings(env);
         await validateFleetChannelTopology(env);
+        if (duty === 'deadline') {
+          return await runDeadlineDuty(env, duty, context);
+        }
         if (duty === 'sweep') {
           const hub = env.HUB;
           const hubTopology = hub
             ? createHubTopology(hub, env.DEPLOYMENT_IDENTITY_SECRET)
             : undefined;
           return await runSlaSweepMaintenance({
-            store: approvalStoreFactoryFor(env.DB).store(),
+            store: approvalStoreFactoryFor(env.DB, storageTablePrefix).store(),
             systemPrincipal: maintenancePrincipal(config.systemPrincipalId),
             deploymentTag: env.DEPLOYMENT_TENANT,
             queue: auditQueueFor(env),
@@ -1165,7 +1314,9 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
 
 const MAINTENANCE_HEALTH_KEY = 'flowsafe:maintenance-health:v1';
 const MAINTENANCE_NONCES_KEY = 'flowsafe:maintenance-nonces:v1';
-const DUTY_ORDER = ['sweep', 'purge', 'tick'] as const;
+const MAINTENANCE_DEADLINE_CURSOR_KEY =
+  'flowsafe:maintenance-deadline-cursor:v1';
+const DUTY_ORDER = ['deadline', 'sweep', 'purge', 'tick'] as const;
 
 export type MaintenanceDurableObjectConstructor<Env extends FlowsafeWorkerEnv> =
   new (
@@ -1181,6 +1332,9 @@ export function createFlowsafeMaintenanceDurableObject<
   Env extends FlowsafeWorkerEnv,
 >(config: FlowsafeWorkerConfig<Env>): MaintenanceDurableObjectConstructor<Env> {
   const intervals: Record<MaintenanceDuty, number | undefined> = {
+    deadline:
+      config.maintenance.deadlineIntervalMs ??
+      config.maintenance.sweepIntervalMs,
     sweep: config.maintenance.sweepIntervalMs,
     purge: config.maintenance.purgeIntervalMs,
     tick: config.maintenance.tickIntervalMs,
@@ -1220,11 +1374,12 @@ export function createFlowsafeMaintenanceDurableObject<
       }
     }
 
-    async #health(now: number): Promise<MaintenanceHealth> {
+    async #health(now: number): Promise<InitializedMaintenanceHealth> {
       const stored = await this.#state.storage.get<MaintenanceHealth>(
         MAINTENANCE_HEALTH_KEY,
       );
-      const health: MaintenanceHealth = {
+      const health: InitializedMaintenanceHealth = {
+        nextDeadlineAt: validTime(stored?.nextDeadlineAt) ?? now,
         nextSweepAt: validTime(stored?.nextSweepAt) ?? now,
         nextPurgeAt: validTime(stored?.nextPurgeAt) ?? now,
       };
@@ -1244,7 +1399,7 @@ export function createFlowsafeMaintenanceDurableObject<
     }
 
     async #persistAndArm(
-      health: MaintenanceHealth,
+      health: InitializedMaintenanceHealth,
       alarmAt: number,
     ): Promise<void> {
       await this.#state.storage.transaction(async (transaction) => {
@@ -1479,7 +1634,20 @@ export function createFlowsafeMaintenanceDurableObject<
         hasDueDuty(health, intervals, now) ? now : followUpAt,
       );
 
-      const outcome = await worker.runMaintenanceDuty(duty, this.#env);
+      let context: MaintenanceDutyContext | undefined;
+      if (duty === 'deadline') {
+        const deadlineCursor = await this.#state.storage.get<RunDeadlineCursor>(
+          MAINTENANCE_DEADLINE_CURSOR_KEY,
+        );
+        context = {
+          ...(deadlineCursor ? { deadlineCursor } : {}),
+          advanceDeadlineCursor: (cursor) =>
+            this.#state.storage.transaction(async (transaction) => {
+              await transaction.put(MAINTENANCE_DEADLINE_CURSOR_KEY, cursor);
+            }),
+        };
+      }
+      const outcome = await worker.runMaintenanceDuty(duty, this.#env, context);
       await this.#recordOutcome(duty, Date.now(), outcome);
     }
   };
@@ -1495,6 +1663,7 @@ function nextAt(
   health: MaintenanceHealth | undefined,
   duty: MaintenanceDuty,
 ): number | undefined {
+  if (duty === 'deadline') return health?.nextDeadlineAt;
   if (duty === 'sweep') return health?.nextSweepAt;
   if (duty === 'purge') return health?.nextPurgeAt;
   return health?.nextTickAt;
@@ -1504,6 +1673,7 @@ function lastAt(
   health: MaintenanceHealth | undefined,
   duty: MaintenanceDuty,
 ): number | undefined {
+  if (duty === 'deadline') return health?.lastDeadlineAt;
   if (duty === 'sweep') return health?.lastSweepAt;
   if (duty === 'purge') return health?.lastPurgeAt;
   return health?.lastTickAt;
@@ -1513,6 +1683,7 @@ function lastAttemptAt(
   health: MaintenanceHealth | undefined,
   duty: MaintenanceDuty,
 ): number | undefined {
+  if (duty === 'deadline') return health?.lastDeadlineAttemptAt;
   if (duty === 'sweep') return health?.lastSweepAttemptAt;
   if (duty === 'purge') return health?.lastPurgeAttemptAt;
   return health?.lastTickAttemptAt;
@@ -1523,11 +1694,13 @@ function lastError(
   duty: MaintenanceDuty,
 ): string | undefined {
   const value =
-    duty === 'sweep'
-      ? health?.lastSweepError
-      : duty === 'purge'
-        ? health?.lastPurgeError
-        : health?.lastTickError;
+    duty === 'deadline'
+      ? health?.lastDeadlineError
+      : duty === 'sweep'
+        ? health?.lastSweepError
+        : duty === 'purge'
+          ? health?.lastPurgeError
+          : health?.lastTickError;
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
@@ -1536,7 +1709,8 @@ function setNextAt(
   duty: MaintenanceDuty,
   value: number,
 ): void {
-  if (duty === 'sweep') health.nextSweepAt = value;
+  if (duty === 'deadline') health.nextDeadlineAt = value;
+  else if (duty === 'sweep') health.nextSweepAt = value;
   else if (duty === 'purge') health.nextPurgeAt = value;
   else health.nextTickAt = value;
 }
@@ -1546,7 +1720,8 @@ function setLastAt(
   duty: MaintenanceDuty,
   value: number,
 ): void {
-  if (duty === 'sweep') health.lastSweepAt = value;
+  if (duty === 'deadline') health.lastDeadlineAt = value;
+  else if (duty === 'sweep') health.lastSweepAt = value;
   else if (duty === 'purge') health.lastPurgeAt = value;
   else health.lastTickAt = value;
 }
@@ -1556,7 +1731,8 @@ function setLastAttemptAt(
   duty: MaintenanceDuty,
   value: number,
 ): void {
-  if (duty === 'sweep') health.lastSweepAttemptAt = value;
+  if (duty === 'deadline') health.lastDeadlineAttemptAt = value;
+  else if (duty === 'sweep') health.lastSweepAttemptAt = value;
   else if (duty === 'purge') health.lastPurgeAttemptAt = value;
   else health.lastTickAttemptAt = value;
 }
@@ -1567,7 +1743,8 @@ function setLastError(
   value: string,
 ): void {
   const bounded = value.slice(0, 1_024);
-  if (duty === 'sweep') health.lastSweepError = bounded;
+  if (duty === 'deadline') health.lastDeadlineError = bounded;
+  else if (duty === 'sweep') health.lastSweepError = bounded;
   else if (duty === 'purge') health.lastPurgeError = bounded;
   else health.lastTickError = bounded;
 }
@@ -1576,7 +1753,8 @@ function clearLastError(
   health: MaintenanceHealth,
   duty: MaintenanceDuty,
 ): void {
-  if (duty === 'sweep') delete health.lastSweepError;
+  if (duty === 'deadline') delete health.lastDeadlineError;
+  else if (duty === 'sweep') delete health.lastSweepError;
   else if (duty === 'purge') delete health.lastPurgeError;
   else delete health.lastTickError;
 }

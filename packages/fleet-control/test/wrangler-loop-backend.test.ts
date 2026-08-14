@@ -2212,6 +2212,148 @@ export default {
     expect(runner.calls).toEqual([]);
   });
 
+  it('force-tears down ordinary ingress, secrets, and exact-id D1 without a specification or artifact read', async () => {
+    const runner = new FakeRunner(() => {
+      throw new Error('force decommission must not spawn Wrangler');
+    });
+    const routeApi = new FakeRouteApi([
+      {
+        id: 'domain-acme',
+        hostname: deployment.routeHostname,
+        service: deployment.scriptName,
+      },
+    ]);
+    routeApi.scriptPresent = true;
+    routeApi.workersDevEnabled = true;
+    routeApi.previewUrlsEnabled = true;
+    const subject = backend(runner, { routeApi });
+
+    await subject.forceDecommissionStep(
+      fleetRecord,
+      'remove-traffic',
+      mutationFence,
+    );
+    await subject.forceDecommissionStep(
+      fleetRecord,
+      'revoke-credentials',
+      mutationFence,
+    );
+    await subject.forceDecommissionStep(
+      fleetRecord,
+      'delete-database',
+      mutationFence,
+    );
+
+    expect(routeApi.calls).toEqual([
+      { operation: 'detach', domainId: 'domain-acme' },
+      {
+        operation: 'delete-secret',
+        scriptName: deployment.scriptName,
+        secretName: 'DEPLOYMENT_IDENTITY_SECRET',
+      },
+      {
+        operation: 'delete-secret',
+        scriptName: deployment.scriptName,
+        secretName: 'MAINTENANCE_ADMIN_SECRET',
+      },
+      { operation: 'delete-database', databaseId: database.id },
+    ]);
+    expect(routeApi.workersDevEnabled).toBe(false);
+    expect(routeApi.previewUrlsEnabled).toBe(false);
+    expect(routeApi.secretNames.size).toBe(0);
+    expect(routeApi.databasePresent).toBe(false);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it('refuses force deletion when the exact D1 id resolves to another fleet name', async () => {
+    const runner = new FakeRunner();
+    const routeApi = new FakeRouteApi();
+    routeApi.getDatabase = async () => ({
+      id: database.id,
+      name: 'foreign-database',
+      created: false,
+    });
+
+    await expect(
+      backend(runner, { routeApi }).forceDecommissionStep(
+        fleetRecord,
+        'delete-database',
+        mutationFence,
+      ),
+    ).rejects.toThrow(/resolved with unexpected identity/);
+    expect(routeApi.calls).toEqual([]);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it('replays force D1 deletion as success after the exact id is absent', async () => {
+    const runner = new FakeRunner();
+    const routeApi = new FakeRouteApi();
+    const subject = backend(runner, { routeApi });
+
+    await subject.forceDecommissionStep(
+      fleetRecord,
+      'delete-database',
+      mutationFence,
+    );
+    await expect(
+      subject.forceDecommissionStep(
+        fleetRecord,
+        'delete-database',
+        mutationFence,
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(routeApi.calls).toEqual([
+      { operation: 'delete-database', databaseId: database.id },
+    ]);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it.each([
+    'getDatabase',
+    'deleteDatabase',
+  ] as const)('fails force D1 deletion without route API %s and never falls back to Wrangler', async (missingCapability) => {
+    const runner = new FakeRunner(() => {
+      throw new Error('force D1 deletion must not spawn Wrangler');
+    });
+    const fakeRouteApi = new FakeRouteApi();
+    const routeApi = new Proxy(fakeRouteApi, {
+      get(target, property) {
+        if (property === missingCapability) return undefined;
+        const value = Reflect.get(target, property, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+
+    await expect(
+      backend(runner, { routeApi }).forceDecommissionStep(
+        fleetRecord,
+        'delete-database',
+        mutationFence,
+      ),
+    ).rejects.toThrow(/does not support exact-ID D1 database deletion/u);
+    expect(routeApi.calls).toEqual([]);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it('fails force decommission closed when ordinary ingress remains enabled', async () => {
+    const runner = new FakeRunner();
+    const routeApi = new FakeRouteApi();
+    routeApi.scriptPresent = true;
+    routeApi.zoneRoutes = [
+      { zoneId: 'zone-acme', routeId: 'route-acme', pattern: 'acme.test/*' },
+    ];
+
+    await expect(
+      backend(runner, { routeApi }).forceDecommissionStep(
+        fleetRecord,
+        'remove-traffic',
+        mutationFence,
+      ),
+    ).rejects.toThrow(/retains public ingress/);
+    expect(runner.calls).toEqual([]);
+  });
+
   it('rejects a REST deletion that does not make the immutable D1 id absent', async () => {
     const runner = new FakeRunner();
     const routeApi = new FakeRouteApi();

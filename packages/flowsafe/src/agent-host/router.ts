@@ -40,6 +40,13 @@ type MatchedRoute =
       threadId: string;
       runId: string;
     }
+  | {
+      kind: 'terminate';
+      allow: 'POST';
+      agentId: string;
+      threadId: string;
+      runId: string;
+    }
   | { kind: 'not-found' };
 
 function json(payload: unknown, status = 200, allow?: string): Response {
@@ -86,6 +93,15 @@ function match(url: URL): MatchedRoute | undefined {
       return {
         kind: 'stream',
         allow: 'GET',
+        agentId,
+        threadId,
+        runId,
+      };
+    }
+    if (segments.length === 6 && segments[5] === 'terminate') {
+      return {
+        kind: 'terminate',
+        allow: 'POST',
         agentId,
         threadId,
         runId,
@@ -168,7 +184,15 @@ function internalError(error: unknown, route: MatchedRoute): Response {
     return json({ error: 'forbidden' }, 403);
   }
   if (error instanceof RunRouteError) {
-    if (error.status < 500) return json({ error: error.message }, error.status);
+    if (error.status < 500) {
+      return json(
+        {
+          error: error.message,
+          ...(error.reason === undefined ? {} : { reason: error.reason }),
+        },
+        error.status,
+      );
+    }
   }
   console.error(
     JSON.stringify({
@@ -233,6 +257,51 @@ export function createAgentRouter(options: AgentRouterOptions): AgentRouter {
 
       if (!isPathSafeId(route.threadId) || !isPathSafeId(route.runId)) {
         return json({ error: 'run not found' }, 404);
+      }
+
+      if (route.kind === 'terminate') {
+        if (request.method !== route.allow) {
+          return json({ error: 'method not allowed' }, 405, route.allow);
+        }
+        if (url.search !== '') {
+          return json({ error: 'query fields are not allowed' }, 400);
+        }
+        if (!options.topology.terminate) {
+          return json({ error: 'not found' }, 404);
+        }
+        if (
+          !RUN_START_ROLES.includes(context.actor.role) ||
+          !catalog.allowedRoles(route.agentId)?.includes(context.actor.role)
+        ) {
+          return json({ error: 'forbidden' }, 403);
+        }
+        let replayOnly = false;
+        try {
+          await requireResourceAccess(
+            context,
+            'run',
+            route.runId,
+            'write',
+            'run',
+          );
+        } catch (error) {
+          if (!(error instanceof RunRouteError) || error.status !== 404) {
+            throw error;
+          }
+          replayOnly = true;
+        }
+        if (!replayOnly) {
+          await requireResourceAccess(
+            context,
+            'thread',
+            route.threadId,
+            'read',
+            'run',
+          );
+        }
+        return json(
+          await options.topology.terminate(context, route, replayOnly),
+        );
       }
 
       await requireResourceAccess(

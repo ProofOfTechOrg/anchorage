@@ -9,8 +9,10 @@
 // AUTHORIZATION order:
 //
 //   start:   authenticate -> coarse role -> workflow role -> host policy
-//   resume:  authenticate -> catalog -> ownership -> coarse role -> workflow
-//            role -> host policy
+//   resume:    authenticate -> catalog -> ownership -> coarse role -> workflow
+//              role -> host policy
+//   terminate: authenticate -> catalog -> ownership -> coarse role -> workflow
+//              role
 //
 // and the suspension bridge: a start that suspends queues its approval
 // attributed to the STARTING actor, so that actor cannot later decide their own
@@ -33,8 +35,10 @@ import {
 import {
   InvalidRunRequestError,
   RunAlreadyExistsError,
+  RunLifecycleBlockedError,
   RunNotSuspendedError,
   type RunSummary,
+  RunTerminalConflictError,
   UnknownRunError,
   UnknownWorkflowError,
 } from '../do-runner/index.js';
@@ -79,6 +83,13 @@ export interface RunRouterOptions {
     body: unknown,
     requestedBy: string,
     requestedByKind: ExecutionPrincipalKind,
+  ) => Promise<RunSummary>;
+  /** Optional for compatibility; when supplied, mounts POST .../terminate. */
+  terminate?: (
+    workflowId: string,
+    runId: string,
+    principal: ExecutionPrincipal,
+    replayOnly: boolean,
   ) => Promise<RunSummary>;
   /** Host policy that must pass immediately before a validated run start. */
   beforeStart?: (
@@ -129,6 +140,8 @@ export interface RunStartInput {
   principal: ExecutionPrincipal;
   /** Present only for a target-verifiable schedule fire. */
   scheduleId?: string;
+  /** Relative deadline measured from the accepted start. */
+  deadlineMs?: number;
 }
 
 export type RunRouter = (request: Request) => Promise<Response | null>;
@@ -137,6 +150,7 @@ interface StartBody {
   workflowId?: string;
   runId?: string;
   inputData?: unknown;
+  deadlineMs?: unknown;
 }
 
 // no-store is defense in depth: this is an authenticated API served from the
@@ -154,7 +168,13 @@ function json(payload: unknown, status = 200): Response {
 
 function errorResponse(error: unknown): Response {
   if (error instanceof RunRouteError) {
-    return json({ error: error.message }, error.status);
+    return json(
+      {
+        error: error.message,
+        ...(error.reason === undefined ? {} : { reason: error.reason }),
+      },
+      error.status,
+    );
   }
   if (error instanceof ActorResolutionError) {
     // Authenticated but malformed claims are a verifier bug, surfaced as
@@ -169,9 +189,13 @@ function errorResponse(error: unknown): Response {
   }
   if (
     error instanceof RunNotSuspendedError ||
-    error instanceof RunAlreadyExistsError
+    error instanceof RunAlreadyExistsError ||
+    error instanceof RunTerminalConflictError
   ) {
     return json({ error: error.message }, 409);
+  }
+  if (error instanceof RunLifecycleBlockedError) {
+    return json({ error: error.message, reason: error.reason }, 409);
   }
   if (error instanceof InvalidRunRequestError) {
     return json({ error: error.message }, 400);
@@ -280,6 +304,9 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
           runId: ownedRunId,
           inputData: body.inputData,
           principal: context.principal,
+          ...(body.deadlineMs === undefined
+            ? {}
+            : { deadlineMs: body.deadlineMs as number }),
         });
         if (summary.status !== 'suspended') return json(summary);
         let approvals: ApprovalRecord[] = [];
@@ -307,23 +334,43 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
         return json({ ...summary, approval: approvals[0], approvals });
       }
 
-      // Status and resume both validate the workflow against the catalog: the
-      // start route already did, and a passthrough that did not would answer
-      // for workflow ids this host never registered.
+      // Status, resume, and terminate validate the workflow against the
+      // catalog: the start route already did, and a passthrough that did not
+      // would answer for workflow ids this host never registered.
       if (workflowId && runId && !metaFor(workflowId)) {
         return json({ error: `unknown workflow '${workflowId}'` }, 404);
       }
 
       // Ownership is resolved before role gates or runner access. A missing id
       // and a resource owned by another principal are the same 404.
+      const isTerminate =
+        request.method === 'POST' &&
+        segments.length === 4 &&
+        action === 'terminate' &&
+        options.terminate !== undefined;
+      let replayOnly = false;
       if (workflowId && runId && segments.length >= 3) {
-        await requireResourceAccess(
-          context,
-          'run',
-          runId,
-          request.method === 'GET' ? 'read' : 'write',
-          'run',
-        );
+        try {
+          await requireResourceAccess(
+            context,
+            'run',
+            runId,
+            request.method === 'GET' ? 'read' : 'write',
+            'run',
+          );
+        } catch (error) {
+          if (
+            !isTerminate ||
+            !(error instanceof RunRouteError) ||
+            error.status !== 404
+          ) {
+            throw error;
+          }
+          // Ownership is deliberately gone after terminal cleanup. Only the
+          // owner DO may authorize this replay against persisted exact
+          // principals; every other case remains the same opaque 404.
+          replayOnly = true;
+        }
       }
 
       if (request.method === 'POST' && !RUN_START_ROLES.includes(actor.role)) {
@@ -369,6 +416,17 @@ export function createRunRouter(options: RunRouterOptions): RunRouter {
           }
         }
         return json(summary);
+      }
+
+      if (isTerminate && workflowId && runId && options.terminate) {
+        return json(
+          await options.terminate(
+            workflowId,
+            runId,
+            context.principal,
+            replayOnly,
+          ),
+        );
       }
 
       if (

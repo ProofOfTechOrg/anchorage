@@ -2324,6 +2324,58 @@ describe('CloudflareProvisioningClient', () => {
     ]);
   });
 
+  it('accepts already-absent ordinary ingress during fenced force teardown', async () => {
+    const requests: Array<{ method: string; path: string }> = [];
+    const client = new CloudflareProvisioningClient({
+      accountId: 'account',
+      apiToken: 'token',
+      rateCoordinator: testRateCoordinator(),
+      dispatchNamespace: 'fleet',
+      requestTimeoutMs: 100,
+      fetch: async (input, init) => {
+        const url = new URL(
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url,
+        );
+        requests.push({ method: init?.method ?? 'GET', path: url.pathname });
+        return Response.json(
+          {
+            success: false,
+            errors: [{ code: 10090, message: 'resource not found' }],
+            messages: [],
+            result: null,
+          },
+          { status: 404 },
+        );
+      },
+    });
+    const fence = {
+      mutationLeaseTtlMs: 60_000,
+      assertOwned: async () => {},
+    };
+
+    await expect(
+      client.disableOrdinaryWorkerPublicAccess('already-gone', fence),
+    ).resolves.toBeUndefined();
+    await expect(
+      client.detachCustomDomain('already-gone', fence),
+    ).resolves.toBeUndefined();
+
+    expect(requests).toEqual([
+      {
+        method: 'POST',
+        path: '/client/v4/accounts/account/workers/scripts/already-gone/subdomain',
+      },
+      {
+        method: 'DELETE',
+        path: '/client/v4/accounts/account/workers/domains/already-gone',
+      },
+    ]);
+  });
+
   it('reads exact script ownership and account-wide ordinary Worker footprint', async () => {
     const registration = {
       scriptName: 'fleet-state',

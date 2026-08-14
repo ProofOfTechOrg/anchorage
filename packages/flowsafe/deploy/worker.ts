@@ -80,6 +80,7 @@ import {
   approvalStoreFactoryFor,
   assertWorkflowsRegistered,
   createFlowsafeMaintenanceDurableObject,
+  createFlowsafeRunnerLifecycle,
   createFlowsafeWorker,
   type FlowsafeWorkerConfig,
   parseActorTokens,
@@ -292,6 +293,10 @@ export class FlowsafeRunner extends DurableObjectRunner<Env> {
   protected runOwnership(env: Env) {
     return approvalStoreFactoryFor(env.DB).resources();
   }
+
+  protected runLifecycle(env: Env) {
+    return createFlowsafeRunnerLifecycle(workerConfig, env);
+  }
 }
 
 /**
@@ -333,7 +338,7 @@ function buildVerifier(env: Env): TokenVerifier {
 }
 
 // The composed Worker: /healthz → /api/approvals → /workflows + /runs → 404,
-// alarm maintenance (sweep and purge never share an invocation). This
+// alarm maintenance (deadline, sweep, and purge never share an invocation). This
 // deployment supplies its workflows and its
 // verifier. To add run
 // artifacts (R2ArtifactStore), set `artifactStore` to a factory such as

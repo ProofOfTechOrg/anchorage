@@ -125,9 +125,17 @@ export {
   sweepSLA,
   UnknownApprovalError,
 } from './service.js';
-export type { ApprovalPatch, ApprovalStore, CreateResult } from './store.js';
+export type {
+  ApprovalPatch,
+  ApprovalStore,
+  ApprovalTransitionOptions,
+  CreateResult,
+} from './store.js';
 export { InMemoryApprovalStore, stepKeyOf } from './store.js';
-export type { ApprovalStoreFactory } from './store-factory.js';
+export type {
+  ApprovalStoreFactory,
+  D1ApprovalStoreFactoryOptions,
+} from './store-factory.js';
 export {
   D1ApprovalStoreFactory,
   InMemoryApprovalStoreFactory,

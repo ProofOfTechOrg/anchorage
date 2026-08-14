@@ -104,6 +104,7 @@ export function safeSend(ws: WebSocketLike, frame: string): void {
  * route can guard on their presence (absent ⇒ the non-WS 426 fallback).
  */
 export interface DurableObjectRunnerState {
+  waitUntil?(promise: Promise<unknown>): void;
   readonly id: {
     readonly name?: string;
   };

@@ -2386,15 +2386,28 @@ export class CloudflareProvisioningClient {
   ): Promise<void> {
     await this.withMutationFence(fence, () =>
       this.#schedule(async () => {
-        await this.#client.workers.scripts.subdomain.create(scriptName, {
-          account_id: this.#accountId,
-          enabled: false,
-          previews_enabled: false,
-        });
-        const subdomain = await this.#client.workers.scripts.subdomain.get(
-          scriptName,
-          { account_id: this.#accountId },
-        );
+        try {
+          await this.#client.workers.scripts.subdomain.create(scriptName, {
+            account_id: this.#accountId,
+            enabled: false,
+            previews_enabled: false,
+          });
+        } catch (error) {
+          if (!isNotFound(error)) throw error;
+          return;
+        }
+        const subdomain = await (async () => {
+          try {
+            return await this.#client.workers.scripts.subdomain.get(
+              scriptName,
+              { account_id: this.#accountId },
+            );
+          } catch (error) {
+            if (!isNotFound(error)) throw error;
+            return undefined;
+          }
+        })();
+        if (!subdomain) return;
         if (subdomain.enabled === true || subdomain.previews_enabled === true) {
           throw new Error(
             `ordinary Worker '${scriptName}' retains public subdomain ingress`,

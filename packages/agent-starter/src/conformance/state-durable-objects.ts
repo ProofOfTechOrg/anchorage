@@ -7,6 +7,7 @@ import {
   type ApprovalService,
 } from '@proofoftech/flowsafe/approval-api';
 import {
+  type DurableObjectRunLifecycleHooks,
   DurableObjectRunner,
   doErrorResponse,
   verifyDurableObjectDeploymentRequest,
@@ -15,7 +16,9 @@ import {
   approvalStoreFactoryFor,
   buildHostApprovalService,
   createDoRunTopology,
+  createFlowsafeRunnerLifecycle,
   createStateEgressFetch,
+  type FlowsafeRunnerLifecycleConfig,
   queueApprovalForSuspension,
   RunRouteError,
 } from '@proofoftech/flowsafe/host-kit';
@@ -50,6 +53,9 @@ const runKey = (runId: string) => `conformance:run:${runId}`;
  */
 const REQUESTER = { id: 'conformance-requester', role: 'operator' } as const;
 const DECIDER = { id: 'conformance-approver', role: 'admin' } as const;
+export const conformanceRunnerLifecycleConfig = {
+  systemPrincipalId: CONFORMANCE_SYSTEM_PRINCIPAL_ID,
+} satisfies FlowsafeRunnerLifecycleConfig<ConformanceStateEnv>;
 
 export class ConformanceRunner extends DurableObjectRunner<ConformanceStateEnv> {
   protected build(env: ConformanceStateEnv) {
@@ -58,6 +64,16 @@ export class ConformanceRunner extends DurableObjectRunner<ConformanceStateEnv> 
 
   protected runOwnership(env: ConformanceStateEnv) {
     return approvalStoreFactoryFor(env.DB).resources();
+  }
+
+  protected runLifecycle(
+    env: ConformanceStateEnv,
+  ): DurableObjectRunLifecycleHooks {
+    return createFlowsafeRunnerLifecycle(
+      conformanceRunnerLifecycleConfig,
+      env,
+      { waitUntil: this.state?.waitUntil?.bind(this.state) },
+    );
   }
 }
 

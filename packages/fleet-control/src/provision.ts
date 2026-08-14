@@ -36,6 +36,7 @@ import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   DatabaseExport,
   DatabaseReference,
+  DecommissionAuditSink,
   DecommissionResult,
   DeploymentSecrets,
   DeploymentSpec,
@@ -1582,6 +1583,7 @@ export interface DecommissionDeploymentOptions {
   readonly store: FleetStateStore;
   readonly spec: DeploymentSpec;
   readonly clock?: () => number;
+  readonly audit?: DecommissionAuditSink;
   readonly backendSwitch?: Readonly<{
     provider: BackendSwitchProvider;
     priorSpec: DeploymentSpec;
@@ -1618,12 +1620,155 @@ export async function decommissionDeployment(
     if (!record || !intent.databaseExport) {
       throw new Error('backend switch decommission did not commit its export');
     }
-    return { record, databaseExport: intent.databaseExport };
+    const result = { record, databaseExport: intent.databaseExport };
+    await emitDecommissionAudit(options.audit, result.record, false);
+    return result;
   }
-  return options.store.withDeploymentLease(
+  const result = await options.store.withDeploymentLease(
     options.spec.tenantTag,
     options.spec.environment,
     (lease) => decommissionDeploymentUnderLease(options, lease),
+  );
+  await emitDecommissionAudit(options.audit, result.record, false);
+  return result;
+}
+
+function emitDecommissionAudit(
+  audit: DecommissionAuditSink | undefined,
+  record: FleetRecord,
+  forced: boolean,
+): Promise<void> {
+  return Promise.resolve(
+    audit?.({
+      action: 'deployment-decommissioned',
+      tenantTag: record.tenantTag,
+      environment: record.environment,
+      backend: record.backend,
+      scriptName: record.scriptName,
+      databaseId: record.databaseId,
+      forced,
+    }),
+  );
+}
+
+export interface ForceDecommissionDeploymentOptions {
+  readonly backend: ProvisioningBackend;
+  readonly store: FleetStateStore;
+  readonly tenantTag: string;
+  readonly environment: string;
+  readonly options?: Readonly<{
+    readonly audit?: DecommissionAuditSink;
+    readonly clock?: () => number;
+  }>;
+}
+
+export async function forceDecommissionDeployment(
+  input: ForceDecommissionDeploymentOptions,
+): Promise<void> {
+  await input.store.withDeploymentLease(
+    input.tenantTag,
+    input.environment,
+    async (lease) => {
+      const current = await input.store.get(input.tenantTag, input.environment);
+      if (!current) return;
+      if (current.backend !== input.backend.kind) {
+        throw new Error(
+          'force-decommission backend does not own this deployment',
+        );
+      }
+      if (current.phase === 'decommissioned') {
+        await emitDecommissionAudit(input.options?.audit, current, true);
+        await lease.delete();
+        return;
+      }
+      if (current.phase === 'database-reserved') {
+        await emitDecommissionAudit(input.options?.audit, current, true);
+        await lease.delete();
+        return;
+      }
+      if (current.phase === 'database-create-authorized') {
+        throw new Error(
+          `cannot force-decommission '${current.tenantTag}:${current.environment}' while exact D1 creation outcome is unresolved`,
+        );
+      }
+      const forceStep = input.backend.forceDecommissionStep;
+      if (!forceStep) {
+        throw new Error(
+          `backend '${input.backend.kind}' does not support spec-free force decommission`,
+        );
+      }
+      assertBackendSwitchInactive(current);
+      const clock = input.options?.clock ?? Date.now;
+      let record = current;
+
+      if (
+        record.phase !== 'decommissioning' &&
+        record.phase !== 'traffic-removed' &&
+        record.phase !== 'credentials-revoked' &&
+        record.phase !== 'worker-deleted' &&
+        record.phase !== 'platform-credentials-revoked' &&
+        record.phase !== 'platform-resources-deleted' &&
+        record.phase !== 'application-resources-deleting' &&
+        record.phase !== 'application-resources-deleted' &&
+        record.phase !== 'database-exported' &&
+        record.phase !== 'database-deleting'
+      ) {
+        record = {
+          ...record,
+          phase: 'decommissioning',
+          updatedAt: nowIso(clock),
+        };
+        await lease.put(record);
+      }
+
+      if (
+        record.phase === 'decommissioning' ||
+        record.phase === 'traffic-removed'
+      ) {
+        await forceStep.call(input.backend, record, 'remove-traffic', lease);
+        if (record.phase === 'decommissioning') {
+          record = {
+            ...record,
+            phase: 'traffic-removed',
+            updatedAt: nowIso(clock),
+          };
+          await lease.put(record);
+        }
+      }
+
+      if (record.phase === 'traffic-removed') {
+        await forceStep.call(
+          input.backend,
+          record,
+          'revoke-credentials',
+          lease,
+        );
+        record = {
+          ...record,
+          phase: 'credentials-revoked',
+          updatedAt: nowIso(clock),
+        };
+        await lease.put(record);
+      }
+
+      if (record.phase !== 'database-deleting') {
+        record = {
+          ...record,
+          phase: 'database-deleting',
+          updatedAt: nowIso(clock),
+        };
+        await lease.put(record);
+      }
+      await forceStep.call(input.backend, record, 'delete-database', lease);
+      record = {
+        ...record,
+        phase: 'decommissioned',
+        updatedAt: nowIso(clock),
+      };
+      await lease.put(record);
+      await emitDecommissionAudit(input.options?.audit, record, true);
+      await lease.delete();
+    },
   );
 }
 

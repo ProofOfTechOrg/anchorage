@@ -1,5 +1,11 @@
 # @proofoftech/flowsafe
 
+## 0.16.0
+
+### Minor Changes
+
+- 1f6a13a: Add idempotent run termination and deadline maintenance to the Durable Object host kit.
+
 ## 0.15.0
 
 ### Minor Changes

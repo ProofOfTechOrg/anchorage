@@ -9,12 +9,14 @@
 
 import { describe, expect, it } from 'vitest';
 
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   type ApprovalActor,
   type ApprovalAuditEvent,
   type ApprovalRecord,
   ApprovalService,
   connectorGrantsForLeg,
+  D1ApprovalStoreFactory,
   InMemoryApprovalStore,
   trustAutomationPrincipal,
 } from '../approval-api/index.js';
@@ -23,6 +25,7 @@ import type { RunSummary } from '../do-runner/index.js';
 // primitive beneath queueApprovalForSuspension, tested here directly.
 import { requestedConnectors } from './approval-bridge.js';
 import {
+  abandonApprovalsForRun,
   queueApprovalForSuspension,
   type ResumeRunFn,
   reconcileApprovalsForSummary,
@@ -41,6 +44,296 @@ const REVIEWER: ApprovalActor = {
   id: 'ray',
   role: 'reviewer',
 };
+
+describe('abandonApprovalsForRun', () => {
+  it('closes open approvals as stable system bookkeeping and a later decision cannot resume', async () => {
+    const store = new InMemoryApprovalStore();
+    const resumeRun = async () => {
+      throw new Error('abandoned approval must never resume');
+    };
+    const events: ApprovalAuditEvent[] = [];
+    const service = new ApprovalService({
+      store,
+      resumeRun,
+      audit: (event) => events.push(event),
+    });
+    const [approval] = await queueApprovalForSuspension(
+      service,
+      'product-launch',
+      suspendedSummary('run-abandoned', 'gate', ['deploy'], 1234),
+      'starter',
+      SYSTEM,
+    );
+    if (!approval) throw new Error('approval missing');
+
+    await expect(
+      abandonApprovalsForRun(
+        service,
+        'product-launch',
+        'run-abandoned',
+        'cancelled',
+        SYSTEM,
+      ),
+    ).resolves.toMatchObject([
+      {
+        id: approval.id,
+        status: 'rejected',
+        decision: 'reject',
+        decidedBy: SYSTEM,
+        comment: 'abandoned: run cancelled',
+      },
+    ]);
+    await expect(
+      service.decide(
+        approval.id,
+        { decision: 'approve' },
+        { id: 'reviewer-2', role: 'reviewer' },
+      ),
+    ).rejects.toThrow(/cannot decide.*status 'rejected'/i);
+    await expect(
+      abandonApprovalsForRun(
+        service,
+        'product-launch',
+        'run-abandoned',
+        'cancelled',
+        SYSTEM,
+      ),
+    ).resolves.toEqual([]);
+    expect(
+      events.filter((event) => event.action === 'approval.supersede'),
+    ).toHaveLength(1);
+  });
+
+  it('makes a decision that interleaves after terminal intent lose its atomic D1 CAS', async () => {
+    const sqlite = openSqlite();
+    sqlite
+      .prepare(
+        `CREATE TABLE mastra_workflow_snapshot (
+        workflow_name TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        snapshot TEXT NOT NULL
+      )`,
+      )
+      .run();
+    const store = new D1ApprovalStoreFactory(
+      sqliteUnitDatabase(sqlite) as never,
+      { workflowSnapshotTable: 'mastra_workflow_snapshot' },
+    ).store();
+    let transitionEntered!: () => void;
+    let releaseTransition!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      transitionEntered = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      releaseTransition = resolve;
+    });
+    const originalTransition = store.transition.bind(store);
+    (store as { transition: typeof store.transition }).transition = async (
+      ...args
+    ) => {
+      if (args[3]?.requireRunDecidable) {
+        transitionEntered();
+        await blocked;
+      }
+      return originalTransition(...args);
+    };
+    const service = new ApprovalService({
+      store,
+      resumeRun: async () => {
+        throw new Error('a fenced decision must never resume');
+      },
+    });
+    const [approval] = await queueApprovalForSuspension(
+      service,
+      'product-launch',
+      suspendedSummary('run-racing-terminate', 'gate', ['deploy'], 1234),
+      'starter',
+      SYSTEM,
+    );
+    if (!approval) throw new Error('approval missing');
+
+    const deciding = service.decide(
+      approval.id,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+    await entered;
+    sqlite
+      .prepare(
+        `INSERT INTO mastra_workflow_snapshot (workflow_name, run_id, snapshot)
+       VALUES (?, ?, ?)`,
+      )
+      .run(
+        'product-launch',
+        'run-racing-terminate',
+        JSON.stringify({
+          status: 'suspended',
+          requestContext: {
+            'flowsafe.runLifecycle': {
+              version: 1,
+              revision: 2,
+              transitionIntent: {
+                status: 'cancelled',
+                requestedAt: 1,
+                replayPrincipals: [{ kind: 'human', id: 'starter' }],
+              },
+            },
+          },
+        }),
+      );
+    releaseTransition();
+
+    await expect(deciding).rejects.toMatchObject({
+      name: 'ApprovalConflictError',
+    });
+    await expect(store.get(approval.id)).resolves.toMatchObject({
+      status: 'pending',
+    });
+    await abandonApprovalsForRun(
+      service,
+      'product-launch',
+      'run-racing-terminate',
+      'cancelled',
+      SYSTEM,
+    );
+    await expect(store.get(approval.id)).resolves.toMatchObject({
+      status: 'rejected',
+      decision: 'reject',
+      comment: 'abandoned: run cancelled',
+    });
+  });
+
+  it('fails a human decision closed when its matching run snapshot is malformed', async () => {
+    const sqlite = openSqlite();
+    sqlite
+      .prepare(
+        `CREATE TABLE mastra_workflow_snapshot (
+        workflow_name TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        snapshot TEXT NOT NULL
+      )`,
+      )
+      .run();
+    const store = new D1ApprovalStoreFactory(
+      sqliteUnitDatabase(sqlite) as never,
+      { workflowSnapshotTable: 'mastra_workflow_snapshot' },
+    ).store();
+    const service = new ApprovalService({ store });
+    const [approval] = await queueApprovalForSuspension(
+      service,
+      'product-launch',
+      suspendedSummary('run-malformed-fence', 'gate', ['deploy'], 1234),
+      'starter',
+      SYSTEM,
+    );
+    if (!approval) throw new Error('approval missing');
+    sqlite
+      .prepare(
+        `INSERT INTO mastra_workflow_snapshot (workflow_name, run_id, snapshot)
+       VALUES (?, ?, ?)`,
+      )
+      .run('product-launch', 'run-malformed-fence', '{');
+
+    await expect(
+      service.decide(approval.id, { decision: 'approve' }, REVIEWER),
+    ).rejects.toMatchObject({ name: 'ApprovalConflictError' });
+    await expect(store.get(approval.id)).resolves.toMatchObject({
+      status: 'pending',
+    });
+  });
+
+  it('preserves plain approval decisions before the lazy workflow snapshot table exists', async () => {
+    const sqlite = openSqlite();
+    const store = new D1ApprovalStoreFactory(
+      sqliteUnitDatabase(sqlite) as never,
+      { workflowSnapshotTable: 'mastra_workflow_snapshot' },
+    ).store();
+    const service = new ApprovalService({ store });
+    const { record } = await service.createAsPrincipal(
+      {
+        workflowId: 'plain-queue',
+        runId: 'plain-record',
+        title: 'Plain decision',
+        requestedBy: 'starter',
+        requestedByKind: 'human',
+      },
+      SYSTEM_PRINCIPAL,
+    );
+
+    await expect(
+      service.decide(record.id, { decision: 'approve' }, REVIEWER),
+    ).resolves.toMatchObject({ record: { status: 'approved' } });
+  });
+
+  it('refuses an approval create whose atomic insert interleaves after terminal intent', async () => {
+    const sqlite = openSqlite();
+    sqlite
+      .prepare(
+        `CREATE TABLE mastra_workflow_snapshot (
+        workflow_name TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        snapshot TEXT NOT NULL
+      )`,
+      )
+      .run();
+    const store = new D1ApprovalStoreFactory(
+      sqliteUnitDatabase(sqlite) as never,
+      { workflowSnapshotTable: 'mastra_workflow_snapshot' },
+    ).store();
+    let createEntered!: () => void;
+    let releaseCreate!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      createEntered = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    const originalCreate = store.create.bind(store);
+    (store as { create: typeof store.create }).create = async (record) => {
+      createEntered();
+      await blocked;
+      return originalCreate(record);
+    };
+    const service = new ApprovalService({ store });
+    const filing = queueApprovalForSuspension(
+      service,
+      'product-launch',
+      suspendedSummary('run-create-race', 'gate', ['deploy'], 1234),
+      'starter',
+      SYSTEM,
+    );
+    await entered;
+    sqlite
+      .prepare(
+        `INSERT INTO mastra_workflow_snapshot (workflow_name, run_id, snapshot)
+       VALUES (?, ?, ?)`,
+      )
+      .run(
+        'product-launch',
+        'run-create-race',
+        JSON.stringify({
+          status: 'suspended',
+          requestContext: {
+            'flowsafe.runLifecycle': {
+              version: 1,
+              revision: 2,
+              transitionIntent: {
+                status: 'cancelled',
+                requestedAt: 1,
+                replayPrincipals: [{ kind: 'human', id: 'starter' }],
+              },
+            },
+          },
+        }),
+      );
+    releaseCreate();
+
+    await expect(filing).rejects.toThrow(/terminating or terminal/);
+    await expect(
+      store.list({ workflowId: 'product-launch', runId: 'run-create-race' }),
+    ).resolves.toEqual([]);
+  });
+});
 
 describe('requestedConnectors', () => {
   it.each([

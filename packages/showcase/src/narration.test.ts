@@ -235,6 +235,19 @@ describe('deriveRunEvents', () => {
     expect(done?.detail).toContain('boom');
   });
 
+  it.each([
+    'cancelled',
+    'timed_out',
+  ])('narrates a %s transition as terminal', (status) => {
+    const events = deriveRunEvents(summary(), summary({ status }), RUN);
+    const done = events.find((event) => event.key === `done:${RUN.runId}`);
+    expect(done).toMatchObject({
+      kind: 'run.failed',
+      title: `Run ${status}: ${RUN.title}`,
+      toastSticky: true,
+    });
+  });
+
   it('is key-idempotent: deriving the same transition twice yields identical keys', () => {
     const prev = suspendedAt('approveLaunch');
     const next = summary({

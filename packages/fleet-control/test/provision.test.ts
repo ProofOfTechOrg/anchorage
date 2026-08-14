@@ -20,6 +20,7 @@ import {
   assertLiveDeploymentMatches,
   cleanupDeploymentArtifacts,
   decommissionDeployment,
+  forceDecommissionDeployment,
   ProvisioningError,
   provisionDeployment,
 } from '../src/provision.js';
@@ -34,6 +35,7 @@ import type {
   FleetRecord,
   FleetStateLease,
   FleetStateStore,
+  ForceDecommissionStep,
   LiveDeployment,
   MaintenanceHealth,
   ProvisioningBackend,
@@ -89,6 +91,7 @@ function spec(overrides: Partial<DeploymentSpec> = {}): DeploymentSpec {
 class MemoryStore implements FleetStateStore {
   record: FleetRecord | undefined;
   leased = false;
+  leaseCalls = 0;
   readonly phases: string[] = [];
   failPutPhase: string | undefined;
 
@@ -97,6 +100,7 @@ class MemoryStore implements FleetStateStore {
     environment: string,
     operation: (lease: FleetStateLease) => Promise<T>,
   ): Promise<T> {
+    this.leaseCalls += 1;
     if (this.leased) throw new Error('deployment is already being modified');
     this.leased = true;
     try {
@@ -210,6 +214,10 @@ class FakeBackend implements ProvisioningBackend {
   removeTrafficCalls = 0;
   assertTrafficRemovedCalls = 0;
   failRemoveTrafficResponseOnce = false;
+  readonly forceSteps: ForceDecommissionStep[] = [];
+  forceFailOnceAt: ForceDecommissionStep | undefined;
+  forceStepGate: Promise<void> | undefined;
+  forceStepStarted: (() => void) | undefined;
 
   constructor(kind: ProvisioningBackendKind = 'workers-for-platforms') {
     this.kind = kind;
@@ -529,6 +537,20 @@ class FakeBackend implements ProvisioningBackend {
   async deleteDatabase(): Promise<void> {
     this.#event('delete-database');
     this.databaseExists = false;
+  }
+
+  async forceDecommissionStep(
+    _record: FleetRecord,
+    step: ForceDecommissionStep,
+  ): Promise<void> {
+    this.forceSteps.push(step);
+    this.forceStepStarted?.();
+    await this.forceStepGate;
+    if (this.forceFailOnceAt === step) {
+      this.forceFailOnceAt = undefined;
+      throw new Error(`failed force step ${step}`);
+    }
+    if (step === 'delete-database') this.databaseExists = false;
   }
 }
 
@@ -2084,6 +2106,318 @@ describe('fleet provisioning', () => {
     ).rejects.toThrow(/unexpected database 'replacement-database-id'/);
     expect(store.record?.phase).toBe('application-resources-deleted');
     expect(backend.events).not.toContain('delete-database');
+  });
+
+  it('force-decommissions a deployment without a specification and removes its ledger row', async () => {
+    const backend = new FakeBackend('plain-worker');
+    const store = new MemoryStore();
+    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    backend.events.length = 0;
+    const auditEvents: unknown[] = [];
+
+    await expect(
+      forceDecommissionDeployment({
+        backend,
+        store,
+        tenantTag: 'acme',
+        environment: 'production',
+        options: {
+          audit: (event) => {
+            auditEvents.push(event);
+          },
+        },
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(backend.forceSteps).toEqual([
+      'remove-traffic',
+      'revoke-credentials',
+      'delete-database',
+    ]);
+    expect(backend.events).toEqual([]);
+    expect(store.record).toBeUndefined();
+    await expect(store.get()).resolves.toBeUndefined();
+    expect(auditEvents).toEqual([
+      expect.objectContaining({
+        action: 'deployment-decommissioned',
+        tenantTag: 'acme',
+        environment: 'production',
+        forced: true,
+      }),
+    ]);
+  });
+
+  it('clears a pre-authorization database reservation without provider mutation', async () => {
+    const backend = new FakeBackend('plain-worker');
+    const store = new MemoryStore();
+    backend.findDatabase = async () => {
+      throw new Error('D1 lookup unavailable before create authorization');
+    };
+    await expect(
+      provisionDeployment({ backend, store, spec: spec(), secrets }),
+    ).rejects.toBeInstanceOf(ProvisioningError);
+    expect(store.record?.phase).toBe('database-reserved');
+    backend.events.length = 0;
+
+    await expect(
+      forceDecommissionDeployment({
+        backend,
+        store,
+        tenantTag: 'acme',
+        environment: 'production',
+      }),
+    ).resolves.toBeUndefined();
+    expect(backend.events).toEqual([]);
+    expect(backend.forceSteps).toEqual([]);
+    expect(store.record).toBeUndefined();
+  });
+
+  it('retains an unresolved create authorization after D1 creation loses its response', async () => {
+    const backend = new FakeBackend('plain-worker');
+    const store = new MemoryStore();
+    backend.failAt = 'database';
+    await expect(
+      provisionDeployment({ backend, store, spec: spec(), secrets }),
+    ).rejects.toBeInstanceOf(ProvisioningError);
+    expect(store.record).toMatchObject({
+      phase: 'database-create-authorized',
+      databaseId: expect.stringMatching(/^reserved-/u),
+    });
+    expect(backend.databaseExists).toBe(true);
+    backend.failAt = undefined;
+    backend.events.length = 0;
+
+    await expect(
+      forceDecommissionDeployment({
+        backend,
+        store,
+        tenantTag: 'acme',
+        environment: 'production',
+      }),
+    ).rejects.toThrow(/exact D1 creation outcome is unresolved/);
+    expect(store.record).toMatchObject({
+      phase: 'database-create-authorized',
+      databaseId: expect.stringMatching(/^reserved-/u),
+    });
+    expect(backend.databaseExists).toBe(true);
+    expect(backend.events).toEqual([]);
+    expect(backend.forceSteps).toEqual([]);
+  });
+
+  it('leases absent and terminal deployments before no-op success', async () => {
+    const backend = new FakeBackend();
+    const absentStore = new MemoryStore();
+
+    await expect(
+      forceDecommissionDeployment({
+        backend,
+        store: absentStore,
+        tenantTag: 'absent',
+        environment: 'production',
+      }),
+    ).resolves.toBeUndefined();
+    expect(absentStore.leaseCalls).toBe(1);
+    expect(backend.forceSteps).toEqual([]);
+
+    const terminalStore = new MemoryStore();
+    await provisionDeployment({
+      backend,
+      store: terminalStore,
+      spec: spec(),
+      secrets,
+    });
+    await decommissionDeployment({
+      backend,
+      store: terminalStore,
+      spec: spec(),
+    });
+    Object.defineProperty(backend, 'forceDecommissionStep', {
+      value: undefined,
+    });
+    const priorLeaseCalls = terminalStore.leaseCalls;
+
+    await expect(
+      forceDecommissionDeployment({
+        backend,
+        store: terminalStore,
+        tenantTag: 'acme',
+        environment: 'production',
+      }),
+    ).resolves.toBeUndefined();
+    expect(terminalStore.leaseCalls).toBe(priorLeaseCalls + 1);
+    expect(terminalStore.record).toBeUndefined();
+    expect(backend.forceSteps).toEqual([]);
+  });
+
+  it('uses one audit event shape for normal and forced decommission', async () => {
+    const normalBackend = new FakeBackend();
+    const normalStore = new MemoryStore();
+    await provisionDeployment({
+      backend: normalBackend,
+      store: normalStore,
+      spec: spec(),
+      secrets,
+    });
+    const forceBackend = new FakeBackend('plain-worker');
+    const forceStore = new MemoryStore();
+    await provisionDeployment({
+      backend: forceBackend,
+      store: forceStore,
+      spec: spec(),
+      secrets,
+    });
+    const auditEvents: Array<Record<string, unknown>> = [];
+
+    await decommissionDeployment({
+      backend: normalBackend,
+      store: normalStore,
+      spec: spec(),
+      audit: (event) => {
+        auditEvents.push(event as unknown as Record<string, unknown>);
+      },
+    });
+    await forceDecommissionDeployment({
+      backend: forceBackend,
+      store: forceStore,
+      tenantTag: 'acme',
+      environment: 'production',
+      options: {
+        audit: (event) => {
+          auditEvents.push(event as unknown as Record<string, unknown>);
+        },
+      },
+    });
+
+    expect(auditEvents).toHaveLength(2);
+    expect(Object.keys(auditEvents[0] ?? {}).sort()).toEqual(
+      Object.keys(auditEvents[1] ?? {}).sort(),
+    );
+    expect(auditEvents.map(({ forced }) => forced)).toEqual([false, true]);
+  });
+
+  it('re-enters a force decommission wedged after traffic removal', async () => {
+    const backend = new FakeBackend('plain-worker');
+    const store = new MemoryStore();
+    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    backend.forceFailOnceAt = 'revoke-credentials';
+
+    await expect(
+      forceDecommissionDeployment({
+        backend,
+        store,
+        tenantTag: 'acme',
+        environment: 'production',
+      }),
+    ).rejects.toThrow(/failed force step revoke-credentials/);
+    expect(store.record?.phase).toBe('traffic-removed');
+
+    await expect(
+      forceDecommissionDeployment({
+        backend,
+        store,
+        tenantTag: 'acme',
+        environment: 'production',
+      }),
+    ).resolves.toBeUndefined();
+    expect(backend.forceSteps).toEqual([
+      'remove-traffic',
+      'revoke-credentials',
+      'remove-traffic',
+      'revoke-credentials',
+      'delete-database',
+    ]);
+    expect(store.record).toBeUndefined();
+  });
+
+  it('converges after D1 deletion succeeds but the terminal state write fails', async () => {
+    const backend = new FakeBackend('plain-worker');
+    const store = new MemoryStore();
+    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    store.failPutPhase = 'decommissioned';
+
+    await expect(
+      forceDecommissionDeployment({
+        backend,
+        store,
+        tenantTag: 'acme',
+        environment: 'production',
+      }),
+    ).rejects.toThrow(/failed state write at decommissioned/);
+    expect(store.record?.phase).toBe('database-deleting');
+    expect(backend.databaseExists).toBe(false);
+
+    await expect(
+      forceDecommissionDeployment({
+        backend,
+        store,
+        tenantTag: 'acme',
+        environment: 'production',
+      }),
+    ).resolves.toBeUndefined();
+    expect(
+      backend.forceSteps.filter((step) => step === 'delete-database'),
+    ).toHaveLength(2);
+    expect(store.record).toBeUndefined();
+  });
+
+  it('serializes force decommission against concurrent provisioning', async () => {
+    const backend = new FakeBackend('plain-worker');
+    const store = new MemoryStore();
+    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    let releaseStep: (() => void) | undefined;
+    let stepStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      stepStarted = resolve;
+    });
+    backend.forceStepStarted = () => stepStarted?.();
+    backend.forceStepGate = new Promise<void>((resolve) => {
+      releaseStep = resolve;
+    });
+
+    const force = forceDecommissionDeployment({
+      backend,
+      store,
+      tenantTag: 'acme',
+      environment: 'production',
+    });
+    await started;
+    await expect(
+      provisionDeployment({ backend, store, spec: spec(), secrets }),
+    ).rejects.toThrow(/already being modified/);
+    releaseStep?.();
+    await expect(force).resolves.toBeUndefined();
+  });
+
+  it('retries a completed force teardown when audit delivery fails', async () => {
+    const backend = new FakeBackend('plain-worker');
+    const store = new MemoryStore();
+    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    let auditAttempts = 0;
+    const input = {
+      backend,
+      store,
+      tenantTag: 'acme',
+      environment: 'production',
+      options: {
+        audit: () => {
+          auditAttempts += 1;
+          if (auditAttempts === 1) throw new Error('audit unavailable');
+        },
+      },
+    } as const;
+
+    await expect(forceDecommissionDeployment(input)).rejects.toThrow(
+      /audit unavailable/,
+    );
+    expect(store.record?.phase).toBe('decommissioned');
+    await expect(forceDecommissionDeployment(input)).resolves.toBeUndefined();
+    expect(backend.forceSteps).toEqual([
+      'remove-traffic',
+      'revoke-credentials',
+      'delete-database',
+    ]);
+    expect(store.record).toBeUndefined();
+    expect(auditAttempts).toBe(2);
   });
 
   it('rejects a concurrent lifecycle operation for the same deployment', async () => {

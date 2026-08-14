@@ -8,6 +8,7 @@ import {
   deploymentIdentityRequest,
   TEST_DEPLOYMENT_IDENTITY_SECRET,
 } from '../../test-support/deployment-identity.js';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   ApprovalService,
   type ExecutionPrincipal,
@@ -16,9 +17,18 @@ import {
   InMemoryResourceOwnershipStore,
 } from '../approval-api/index.js';
 import { reconcileApprovalsForSummary } from '../host-kit/approval-bridge.js';
+import {
+  createDoRunTopology,
+  type RunnerNamespaceLike,
+} from '../host-kit/do-run-topology.js';
 import type { DurableKeyValueStorage } from './cf-types.js';
+import {
+  type SnapshotDatabase,
+  sweepExpiredRunDeadlines,
+} from './d1-storage.js';
 import type { DeploymentIdentityEnv } from './deployment-identity.js';
 import {
+  type DurableObjectRunLifecycleHooks,
   DurableObjectRunner,
   type DurableObjectRunOwner,
   type DurableObjectRunOwnershipStore,
@@ -33,6 +43,7 @@ interface TestEnv extends DeploymentIdentityEnv {
   runtime?: RunnerRuntime;
   owners: DurableObjectRunOwnershipStore;
   schedules?: ScheduleSourceStore;
+  lifecycle?: DurableObjectRunLifecycleHooks;
 }
 
 interface OwnerHooks {
@@ -43,6 +54,7 @@ interface OwnerHooks {
   ): Promise<boolean>;
   settle(token: string, runId: string, release: boolean): Promise<void>;
   owner?: (runId: string) => Promise<DurableObjectRunOwner | undefined>;
+  release?: (runId: string, owner: DurableObjectRunOwner) => Promise<boolean>;
 }
 
 function makeProductionEnv(
@@ -71,6 +83,10 @@ function makeProductionEnv(
           await registry.settleReservation(token, release);
           attempts.delete(token);
         },
+        release: async (_kind, resourceId, owner) => {
+          if (hooks.release) return hooks.release(resourceId, owner);
+          return registry.release('run', resourceId, owner);
+        },
       }
     : registry;
   return {
@@ -82,6 +98,29 @@ function makeProductionEnv(
   };
 }
 
+function gatedRuntime(storage: InMemoryStore): RunnerRuntime {
+  const { createWorkflow, createStep, runtime } = init({ storage });
+  const gate = createStep({
+    id: 'gate',
+    inputSchema: z.object({ topic: z.string() }),
+    outputSchema: z.object({ topic: z.string(), approvedBy: z.string() }),
+    suspendSchema: z.object({ reason: z.string() }),
+    resumeSchema: z.object({ approvedBy: z.string() }),
+    execute: async ({ inputData, resumeData, suspend }) => {
+      if (!resumeData) return suspend({ reason: 'awaiting approval' });
+      return { topic: inputData.topic, approvedBy: resumeData.approvedBy };
+    },
+  });
+  createWorkflow({
+    id: 'gated',
+    inputSchema: z.object({ topic: z.string() }),
+    outputSchema: z.object({ topic: z.string(), approvedBy: z.string() }),
+  })
+    .then(gate)
+    .commit();
+  return runtime;
+}
+
 class TestRunner extends DurableObjectRunner<TestEnv> {
   protected runOwnership(env: TestEnv): DurableObjectRunOwnershipStore {
     return env.owners;
@@ -91,30 +130,13 @@ class TestRunner extends DurableObjectRunner<TestEnv> {
     return env.schedules;
   }
 
+  protected runLifecycle(env: TestEnv) {
+    return env.lifecycle ?? { abandonApprovals: async () => undefined };
+  }
+
   protected build(env: TestEnv): RunnerRuntime {
     if (env.runtime) return env.runtime;
-    const { createWorkflow, createStep, runtime } = init({
-      storage: env.storage,
-    });
-    const gate = createStep({
-      id: 'gate',
-      inputSchema: z.object({ topic: z.string() }),
-      outputSchema: z.object({ topic: z.string(), approvedBy: z.string() }),
-      suspendSchema: z.object({ reason: z.string() }),
-      resumeSchema: z.object({ approvedBy: z.string() }),
-      execute: async ({ inputData, resumeData, suspend }) => {
-        if (!resumeData) return suspend({ reason: 'awaiting approval' });
-        return { topic: inputData.topic, approvedBy: resumeData.approvedBy };
-      },
-    });
-    createWorkflow({
-      id: 'gated',
-      inputSchema: z.object({ topic: z.string() }),
-      outputSchema: z.object({ topic: z.string(), approvedBy: z.string() }),
-    })
-      .then(gate)
-      .commit();
-    return runtime;
+    return gatedRuntime(env.storage);
   }
 }
 
@@ -149,7 +171,12 @@ function post(
   const headers: Record<string, string> = {
     'content-type': 'application/json',
   };
-  if (path === '/runs') {
+  if (
+    path === '/runs' ||
+    path.endsWith('/terminate') ||
+    path.endsWith('/terminate-replay') ||
+    path.endsWith('/deadline')
+  ) {
     headers[EXECUTION_PRINCIPAL_HEADER] = encodeExecutionPrincipal(principal);
   }
   return deploymentIdentityRequest(`http://do${path}`, {
@@ -1423,6 +1450,346 @@ describe('DurableObjectRunner.fetch', () => {
     expect(((await resumeResponse.json()) as RunSummary).status).toBe(
       'success',
     );
+  });
+
+  it('persists cancellation before cleanup and authorizes only the original principal on replay', async () => {
+    const storage = new InMemoryStore();
+    const abandonApprovals = vi.fn(async () => undefined);
+    const env = makeProductionEnv(storage);
+    env.lifecycle = { abandonApprovals };
+    const ownership = env.owners;
+    const originalRelease = ownership.release?.bind(ownership);
+    if (!originalRelease) throw new Error('release hook missing');
+    const release = vi
+      .spyOn(ownership, 'release')
+      .mockImplementation(async (kind, runId, owner) => {
+        const snapshot = await (
+          await storage.getStore('workflows')
+        )?.loadWorkflowSnapshot({ workflowName: 'gated', runId });
+        expect(snapshot?.status).toBe('cancelled');
+        return originalRelease(kind, runId, owner);
+      });
+    const runner = new TestRunner(undefined, env);
+    await runner.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'terminate-route',
+        inputData: { topic: 'cancel' },
+      }),
+    );
+
+    const first = await runner.fetch(
+      post('/runs/gated/terminate-route/terminate', {}),
+    );
+    expect(first.status).toBe(200);
+    const firstSummary = (await first.json()) as RunSummary;
+    expect(firstSummary).toEqual({
+      runId: 'terminate-route',
+      status: 'cancelled',
+      requestedBy: 'owner-1',
+      requestedByKind: 'human',
+      createdAt: expect.any(String),
+      updatedAt: expect.any(String),
+      errorEnvelope: { code: 'CANCELLED', message: 'run was cancelled' },
+    });
+    expect(release).toHaveBeenCalledOnce();
+    await expect(
+      env.owners.owner('run', 'terminate-route'),
+    ).resolves.toBeUndefined();
+
+    const replay = await runner.fetch(
+      post('/runs/gated/terminate-route/terminate-replay', {}),
+    );
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toEqual(firstSummary);
+    expect(release).toHaveBeenCalledOnce();
+    expect(abandonApprovals).toHaveBeenCalledOnce();
+
+    const stranger = await runner.fetch(
+      post(
+        '/runs/gated/terminate-route/terminate-replay',
+        {},
+        {
+          kind: 'human',
+          id: 'stranger',
+          role: 'operator',
+        },
+      ),
+    );
+    expect(stranger.status).toBe(404);
+  });
+
+  it('returns a structured 409 and retains ownership for a persisted disputed settlement', async () => {
+    const storage = new InMemoryStore();
+    const env = makeProductionEnv(storage);
+    const runner = new TestRunner(undefined, env);
+    await runner.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'disputed-route',
+        inputData: { topic: 'held' },
+      }),
+    );
+    const workflows = await storage.getStore('workflows');
+    const snapshot = await workflows?.loadWorkflowSnapshot({
+      workflowName: 'gated',
+      runId: 'disputed-route',
+    });
+    if (!workflows || !snapshot) throw new Error('snapshot missing');
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'gated',
+      runId: 'disputed-route',
+      snapshot: {
+        ...snapshot,
+        requestContext: {
+          ...snapshot.requestContext,
+          'flowsafe.runLifecycle': {
+            version: 1,
+            revision: 1,
+            economicOperations: [
+              { id: 'charge-1', settlementState: 'disputed' },
+            ],
+          },
+        },
+      },
+    });
+
+    const response = await runner.fetch(
+      post('/runs/gated/disputed-route/terminate', {}),
+    );
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      error:
+        'run termination is blocked while an economic operation is disputed',
+      reason: {
+        code: 'DISPUTED_SETTLEMENT',
+        message:
+          'run termination is blocked while an economic operation is disputed',
+      },
+    });
+    await expect(env.owners.owner('run', 'disputed-route')).resolves.toEqual({
+      kind: 'human',
+      id: 'owner-1',
+    });
+  });
+
+  it('re-drives deadline cleanup after a crash between ownership release and cleanup completion', async () => {
+    const storage = new InMemoryStore();
+    const runtime = gatedRuntime(storage);
+    const complete = runtime.completeTerminalCleanup.bind(runtime);
+    let wedge = true;
+    const env = makeProductionEnv(storage);
+    env.runtime = new Proxy(runtime, {
+      get(target, property, receiver) {
+        if (property === 'completeTerminalCleanup') {
+          return async (
+            ...args: Parameters<RunnerRuntime['completeTerminalCleanup']>
+          ) => {
+            if (wedge) {
+              wedge = false;
+              throw new Error('cleanup completion wedged');
+            }
+            return complete(...args);
+          };
+        }
+        const value = Reflect.get(target, property, receiver) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    env.lifecycle = { abandonApprovals: async () => undefined };
+    const runner = new TestRunner(undefined, env);
+    const start = await runner.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'deadline-cleanup-wedge',
+        inputData: { topic: 'expired' },
+        deadlineMs: 0,
+      }),
+    );
+    expect(start.status).toBe(200);
+    const workflows = await storage.getStore('workflows');
+    const before = await workflows?.loadWorkflowSnapshot({
+      workflowName: 'gated',
+      runId: 'deadline-cleanup-wedge',
+    });
+    const lifecycle = before?.requestContext?.['flowsafe.runLifecycle'] as
+      | { revision: number; deadlineAt: number }
+      | undefined;
+    if (!lifecycle) throw new Error('deadline lifecycle missing');
+    const requestBody = {
+      expectedRevision: lifecycle.revision,
+      expectedDeadlineAt: lifecycle.deadlineAt,
+    };
+
+    const interrupted = await runner.fetch(
+      post('/runs/gated/deadline-cleanup-wedge/deadline', requestBody, {
+        kind: 'system',
+        id: 'maintenance',
+        purpose: 'run-deadline-maintenance',
+      }),
+    );
+    expect(interrupted.status).toBe(500);
+    await expect(
+      env.owners.owner('run', 'deadline-cleanup-wedge'),
+    ).resolves.toBeUndefined();
+
+    const resumed = await runner.fetch(
+      post('/runs/gated/deadline-cleanup-wedge/deadline', requestBody, {
+        kind: 'system',
+        id: 'maintenance',
+        purpose: 'run-deadline-maintenance',
+      }),
+    );
+    expect(resumed.status).toBe(200);
+    expect(await resumed.json()).toMatchObject({
+      status: 'timed_out',
+      errorEnvelope: { code: 'TIMED_OUT' },
+    });
+    const after = await workflows?.loadWorkflowSnapshot({
+      workflowName: 'gated',
+      runId: 'deadline-cleanup-wedge',
+    });
+    expect(
+      (
+        after?.requestContext?.['flowsafe.runLifecycle'] as {
+          terminal?: { cleanupCompletedAt?: number };
+        }
+      )?.terminal?.cleanupCompletedAt,
+    ).toEqual(expect.any(Number));
+  });
+
+  it('replays a post-intent core-canceled deadline from the scanner through a fresh owner object', async () => {
+    const storage = new InMemoryStore();
+    const env = makeProductionEnv(storage);
+    const original = new TestRunner(undefined, env);
+    const started = await original.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'deadline-intent-eviction',
+        inputData: { topic: 'expired' },
+        deadlineMs: 0,
+      }),
+    );
+    expect(started.status).toBe(200);
+    const workflows = await storage.getStore('workflows');
+    const snapshot = await workflows?.loadWorkflowSnapshot({
+      workflowName: 'gated',
+      runId: 'deadline-intent-eviction',
+    });
+    const lifecycle = snapshot?.requestContext?.['flowsafe.runLifecycle'] as
+      | { revision: number; deadlineAt: number }
+      | undefined;
+    if (!workflows || !snapshot || !lifecycle) {
+      throw new Error('deadline snapshot missing');
+    }
+    const precursor = {
+      ...snapshot,
+      status: 'canceled' as const,
+      requestContext: {
+        ...snapshot.requestContext,
+        'flowsafe.runLifecycle': {
+          ...lifecycle,
+          revision: lifecycle.revision + 1,
+          transitionIntent: {
+            status: 'timed_out' as const,
+            requestedAt: Date.now(),
+            replayPrincipals: [{ kind: 'system' as const, id: 'maintenance' }],
+            expectedRevision: lifecycle.revision,
+            expectedDeadlineAt: lifecycle.deadlineAt,
+          },
+        },
+      },
+    };
+    await workflows.persistWorkflowSnapshot({
+      workflowName: 'gated',
+      runId: 'deadline-intent-eviction',
+      snapshot: precursor,
+    });
+
+    const sqlite = openSqlite();
+    sqlite
+      .prepare(
+        `CREATE TABLE mastra_workflow_snapshot (
+        workflow_name TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        resourceId TEXT,
+        snapshot TEXT NOT NULL,
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      )`,
+      )
+      .run();
+    const iso = new Date().toISOString();
+    sqlite
+      .prepare(
+        `INSERT INTO mastra_workflow_snapshot
+       (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
+       VALUES (?, ?, NULL, ?, ?, ?)`,
+      )
+      .run(
+        'gated',
+        'deadline-intent-eviction',
+        JSON.stringify(precursor),
+        iso,
+        iso,
+      );
+
+    env.runtime = gatedRuntime(storage);
+    const evicted = new TestRunner(undefined, env);
+    const namespace: RunnerNamespaceLike<string> = {
+      idFromName: (name) => name,
+      get: () => ({
+        fetch: (url, init) =>
+          evicted.fetch(new Request(url, init as RequestInit)),
+      }),
+    };
+    const topology = createDoRunTopology(
+      namespace,
+      TEST_DEPLOYMENT_IDENTITY_SECRET,
+    );
+    let emittedRevision: number | undefined;
+    await expect(
+      sweepExpiredRunDeadlines(sqliteUnitDatabase(sqlite) as SnapshotDatabase, {
+        now: () => Date.now(),
+        transition: async (candidate) => {
+          emittedRevision = candidate.revision;
+          await topology.timeOut(
+            candidate.workflowId,
+            candidate.runId,
+            {
+              expectedRevision: candidate.revision,
+              expectedDeadlineAt: candidate.deadlineAt,
+            },
+            {
+              kind: 'system',
+              id: 'maintenance',
+              purpose: 'run-deadline-maintenance',
+            },
+          );
+        },
+      }),
+    ).resolves.toBe(1);
+    expect(emittedRevision).toBe(lifecycle.revision);
+    await expect(
+      env.runtime.status('gated', 'deadline-intent-eviction'),
+    ).resolves.toMatchObject({
+      status: 'timed_out',
+      errorEnvelope: { code: 'TIMED_OUT' },
+    });
+    await expect(
+      env.owners.owner('run', 'deadline-intent-eviction'),
+    ).resolves.toBeUndefined();
+    const terminal = await workflows.loadWorkflowSnapshot({
+      workflowName: 'gated',
+      runId: 'deadline-intent-eviction',
+    });
+    expect(
+      (
+        terminal?.requestContext?.['flowsafe.runLifecycle'] as {
+          terminal?: { cleanupCompletedAt?: number };
+        }
+      ).terminal?.cleanupCompletedAt,
+    ).toEqual(expect.any(Number));
   });
 
   it('returns a 426 non-WS fallback on the stream route when the runtime has no hibernation API', async () => {

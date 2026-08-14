@@ -27,7 +27,7 @@ Do not perform a physical-isolation cutover as an in-place update of a pooled Wo
 | `DEPLOYMENT_TENANT` | Variable | Stable provisioning tag that must match the singleton D1 sentinel |
 | `DEPLOYMENT_IDENTITY_SECRET` | Secret | Internal Worker-to-Durable-Object caller credential; 32–256 visible ASCII characters |
 | `RUNNER` | Durable Object namespace | One runner object per workflow run |
-| `MAINTENANCE` | Durable Object namespace | Fixed deployment singleton for sweep, purge, and optional schedule tick |
+| `MAINTENANCE` | Durable Object namespace | Fixed deployment singleton for deadline expiry, SLA sweep, retention purge, and optional schedule tick |
 | `MAINTENANCE_ADMIN_SECRET` | Secret | Control-plane credential for maintenance bootstrap and status; distinct from deployment identity |
 
 Provision the sentinel before application migrations or traffic. Install host-provided Wrangler `>=4.118 <5` in the application, run `npx flowsafe-provision --database <database> --tag <tag> --remote --config wrangler.jsonc`, then set distinct `DEPLOYMENT_IDENTITY_SECRET` and `MAINTENANCE_ADMIN_SECRET` values with `wrangler secret put`. Wrangler is not installed as a Flowsafe peer. The CLI is published with Flowsafe. It verifies the exact singleton schema, refuses to re-home an owned database, and refuses to adopt an unowned database that already contains application tables.
@@ -121,6 +121,7 @@ GET  /workflows
 POST /runs
 GET  /runs/:workflowId/:runId
 POST /runs/:workflowId/:runId/resume
+POST /runs/:workflowId/:runId/terminate
 GET  /api/approvals
 GET  /api/approvals/metrics
 GET  /api/approvals/:id
@@ -142,6 +143,7 @@ GET    /agents
 POST   /agents/:agentId/runs
 GET    /agents/:agentId/runs/:threadId/:runId
 GET    /agents/:agentId/runs/:threadId/:runId/stream?offset=N
+POST   /agents/:agentId/runs/:threadId/:runId/terminate
 POST   /api/threads/:threadId/message
 POST   /api/threads/:threadId/queue
 POST   /api/threads/:threadId/signal
@@ -186,11 +188,12 @@ Use the exported router and topology factories rather than recreating their gate
 
 ## Alarm-driven maintenance
 
-The fixed maintenance Durable Object schedules three independent duties:
+The fixed maintenance Durable Object schedules four independent duties:
 
-1. Approval SLA sweep
-2. Retention purge
-3. Schedule fire tick, when enabled
+1. Run deadline expiry
+2. Approval SLA sweep
+3. Retention purge
+4. Schedule fire tick, when enabled
 
 Each alarm persists its successor before running exactly one due duty. If several duties are due, the object schedules an immediate follow-up alarm. A termination during one duty cannot starve another duty or break the alarm chain.
 

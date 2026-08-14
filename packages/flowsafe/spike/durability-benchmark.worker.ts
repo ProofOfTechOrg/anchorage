@@ -27,6 +27,7 @@ import {
   type RunnerRuntime,
 } from '../src/do-runner/index.js';
 import {
+  abandonApprovalsForRun,
   createDoRunTopology,
   doSummary,
   queueApprovalForSuspension,
@@ -96,7 +97,9 @@ function ensureBenchmarkSchema(db: D1Database): Promise<void> {
 function approvalFactory(db: D1Database): D1ApprovalStoreFactory {
   let factory = approvalFactories.get(db);
   if (!factory) {
-    factory = new D1ApprovalStoreFactory(db);
+    factory = new D1ApprovalStoreFactory(db, {
+      workflowSnapshotTable: 'mastra_workflow_snapshot',
+    });
     approvalFactories.set(db, factory);
   }
   return factory;
@@ -275,6 +278,26 @@ export class BenchmarkFlowsafeRunner extends DurableObjectRunner<Env> {
 
   protected runOwnership(env: Env) {
     return approvalFactory(env.DB).resources();
+  }
+
+  protected runLifecycle(env: Env) {
+    const service = new ApprovalService({
+      store: approvalFactory(env.DB).store(),
+    });
+    return {
+      abandonApprovals: (
+        workflowId: string,
+        runId: string,
+        status: 'cancelled' | 'timed_out',
+      ) =>
+        abandonApprovalsForRun(
+          service,
+          workflowId,
+          runId,
+          status,
+          SYSTEM_PRINCIPAL_ID,
+        ).then(() => undefined),
+    };
   }
 }
 

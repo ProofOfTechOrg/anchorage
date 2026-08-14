@@ -504,6 +504,122 @@ describe('D1SchedulesStorage', () => {
     ).resolves.toBeNull();
   });
 
+  it('force-discards a same-run wake receipt and refuses unrelated receipts', async () => {
+    const { store } = storeOver();
+    await store.createSchedule(workflowSchedule());
+    await store.recordTrigger({
+      id: 'dispatch-force',
+      scheduleId: 'schedule_a',
+      runId: 'run-force',
+      scheduledFireAt: NOW,
+      actualFireAt: NOW,
+      outcome: 'deferred',
+      metadata: {
+        dispatchState: 'prepared',
+        dispatchRef: {
+          scheduleId: 'schedule_a',
+          dispatchId: 'dispatch-force',
+          runId: 'run-force',
+          target: 'agent',
+          mode: 'start',
+          agentId: 'writer',
+        },
+      },
+    });
+    await store.beginAgentScheduleDispatch('schedule_a', 'dispatch-force', NOW);
+    await store.settleAgentScheduleDispatch('schedule_a', 'dispatch-force', {
+      action: 'wake',
+      outcome: 'succeeded',
+      runId: 'run-force',
+      signalId: 'dispatch-force',
+    });
+
+    await expect(
+      store.discardAgentScheduleDispatch(
+        'schedule_a',
+        'dispatch-force',
+        'run-force',
+      ),
+    ).resolves.toBeUndefined();
+    await expect(
+      store.discardAgentScheduleDispatch(
+        'schedule_a',
+        'dispatch-force',
+        'run-force',
+      ),
+    ).resolves.toBeUndefined();
+    await expect(
+      store.agentScheduleDispatchState('schedule_a', 'dispatch-force'),
+    ).resolves.toEqual({
+      state: 'settled',
+      receipt: {
+        action: 'discard',
+        outcome: 'discarded',
+        runId: 'run-force',
+      },
+    });
+    await expect(
+      store.discardAgentScheduleDispatch(
+        'schedule_a',
+        'dispatch-force',
+        'another-run',
+      ),
+    ).rejects.toThrow('belongs to another schedule or run');
+  });
+
+  it('treats exact-run final bookkeeping or a missing trigger as converged', async () => {
+    const { store } = storeOver();
+    await store.createSchedule(workflowSchedule());
+    const trigger = {
+      id: 'dispatch-final-first',
+      scheduleId: 'schedule_a',
+      runId: 'run-final-first',
+      scheduledFireAt: NOW,
+      actualFireAt: NOW,
+      outcome: 'succeeded' as const,
+      metadata: { action: 'wake' },
+    };
+    await store.recordTrigger(trigger);
+
+    await expect(
+      store.discardAgentScheduleDispatch(
+        trigger.scheduleId,
+        trigger.id,
+        trigger.runId,
+      ),
+    ).resolves.toBeUndefined();
+    await expect(
+      store.discardAgentScheduleDispatch(
+        trigger.scheduleId,
+        'already-retained-away',
+        trigger.runId,
+      ),
+    ).resolves.toBeUndefined();
+
+    await store.recordTrigger({ ...trigger, runId: 'another-run' });
+    await expect(
+      store.discardAgentScheduleDispatch(
+        trigger.scheduleId,
+        trigger.id,
+        trigger.runId,
+      ),
+    ).rejects.toThrow('belongs to another schedule or run');
+
+    await store.createSchedule(workflowSchedule({ id: 'schedule_b' }));
+    await store.recordTrigger({
+      ...trigger,
+      scheduleId: 'schedule_b',
+      runId: trigger.runId,
+    });
+    await expect(
+      store.discardAgentScheduleDispatch(
+        trigger.scheduleId,
+        trigger.id,
+        trigger.runId,
+      ),
+    ).rejects.toThrow('belongs to another schedule or run');
+  });
+
   it('orders deferred dispatches by their durable reconciliation cursor', async () => {
     const { store } = storeOver();
     await store.createSchedule(workflowSchedule());

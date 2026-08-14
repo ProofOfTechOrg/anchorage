@@ -7,7 +7,7 @@
 import { D1ApprovalStoreFactory } from '@proofoftech/flowsafe/approval-api';
 import { describe, expect, it, vi } from 'vitest';
 import { STATE_COOKIE } from '#worker/demo-auth';
-import handler from '#worker/worker';
+import handler, { ShowcaseRunner } from '#worker/worker';
 
 interface SqliteStatement {
   get(...params: unknown[]): unknown;
@@ -101,6 +101,12 @@ const fetchHandler = required(handler.fetch);
 
 type Env = Parameters<typeof fetchHandler>[1];
 
+class TestShowcaseRunner extends ShowcaseRunner {
+  lifecycle(env: Env) {
+    return this.runLifecycle(env);
+  }
+}
+
 const TOKENS = {
   'tok-reviewer': { id: 'rev-ray', role: 'reviewer' },
 };
@@ -173,6 +179,48 @@ async function call(
 }
 
 describe('showcase worker fetch(): auth composition', () => {
+  it('abandons run approvals once and accepts a cleanup replay', async () => {
+    const sqlite = openSqlite();
+    seedDeployment(sqlite);
+    const db = sqliteUnitDatabase(sqlite);
+    const approvals = new D1ApprovalStoreFactory(
+      db as ConstructorParameters<typeof D1ApprovalStoreFactory>[0],
+    );
+    const at = new Date(1_751_000_000_000).toISOString();
+    await approvals.store().create({
+      id: 'apr-terminate-1',
+      workflowId: 'gtm-outbound',
+      runId: 'run-terminate-1',
+      title: 'terminate approval',
+      connectors: [],
+      priority: 'normal',
+      status: 'pending',
+      requestedBy: 'demo-operator',
+      createdAt: at,
+      updatedAt: at,
+    });
+    const env = makeEnv({ DB: db } as Partial<Env>);
+    const hooks = new TestShowcaseRunner(undefined, env).lifecycle(env);
+
+    await hooks.abandonApprovals(
+      'gtm-outbound',
+      'run-terminate-1',
+      'cancelled',
+    );
+    const abandoned = await approvals.store().get('apr-terminate-1');
+    expect(abandoned).toMatchObject({
+      status: 'rejected',
+      decision: 'reject',
+      decidedBy: 'flowsafe-worker',
+      comment: 'abandoned: run cancelled',
+    });
+
+    await expect(
+      hooks.abandonApprovals('gtm-outbound', 'run-terminate-1', 'cancelled'),
+    ).resolves.toBeUndefined();
+    expect(await approvals.store().get('apr-terminate-1')).toEqual(abandoned);
+  });
+
   it('serves /healthz unauthenticated and 401s the authenticated surfaces without a token', async () => {
     // #given
     const env = makeEnv();

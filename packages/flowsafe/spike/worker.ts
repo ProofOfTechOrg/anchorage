@@ -140,6 +140,7 @@ import {
   type ObjectiveAuditEvent,
 } from '../src/goals/index.js';
 import {
+  abandonApprovalsForRun,
   bearerActorAuthenticator,
   createDoRunTopology,
   createHubTopology,
@@ -581,7 +582,9 @@ const approvalFactories = new WeakMap<D1Database, D1ApprovalStoreFactory>();
 function approvalStoreFactory(db: D1Database): D1ApprovalStoreFactory {
   let factory = approvalFactories.get(db);
   if (!factory) {
-    factory = new D1ApprovalStoreFactory(db);
+    factory = new D1ApprovalStoreFactory(db, {
+      workflowSnapshotTable: 'mastra_workflow_snapshot',
+    });
     approvalFactories.set(db, factory);
   }
   return factory;
@@ -828,6 +831,26 @@ export class DemoRunner extends DurableObjectRunner<Env> {
       new D1SchedulesStorage(env.DB as unknown as never),
     );
   }
+
+  protected runLifecycle(env: Env) {
+    const service = new ApprovalService({
+      store: approvalStoreFactory(env.DB).store(),
+    });
+    return {
+      abandonApprovals: (
+        workflowId: string,
+        runId: string,
+        status: 'cancelled' | 'timed_out',
+      ) =>
+        abandonApprovalsForRun(
+          service,
+          workflowId,
+          runId,
+          status,
+          SYSTEM_PRINCIPAL_ID,
+        ).then(() => undefined),
+    };
+  }
 }
 
 /**
@@ -1019,6 +1042,10 @@ export class DemoThread extends ThreadDurableObject<Env> {
         createScheduleStartSource(
           new D1SchedulesStorage(env.DB as unknown as never),
         ),
+      discardScheduleDispatch: (scheduleId, dispatchId, runId) =>
+        new D1SchedulesStorage(
+          env.DB as unknown as never,
+        ).discardAgentScheduleDispatch(scheduleId, dispatchId, runId),
       approvalService: () => {
         this.#approvalService ??= new ApprovalService({
           store: approvals,
@@ -1199,9 +1226,12 @@ export class DemoThread extends ThreadDurableObject<Env> {
         ...(input.dispatchId !== undefined
           ? { dispatchId: input.dispatchId }
           : {}),
+        ...(input.scheduleId !== undefined && input.dispatchId !== undefined
+          ? { scheduleDispatchLease: 'executing' as const }
+          : {}),
         safeContext: input.safeContext,
       });
-      return { runId: result.runId };
+      return { runId: result.runId, status: result.summary.status };
     },
   });
 
@@ -2468,6 +2498,7 @@ const handler: ExportedHandler<Env> = {
       start: runTopology.start,
       status: runTopology.status,
       resume: runTopology.resume,
+      terminate: runTopology.terminate,
     })(routed);
     if (runResponse) return runResponse;
 

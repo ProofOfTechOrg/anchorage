@@ -67,6 +67,7 @@ import {
   approvalGrantProvider,
 } from '@proofoftech/flowsafe/approval-api';
 import {
+  type DurableObjectRunLifecycleHooks,
   DurableObjectRunner,
   HubDurableObject,
   type RequestContextProvider,
@@ -76,7 +77,9 @@ import {
   approvalStoreFactoryFor,
   boolVar,
   createFlowsafeMaintenanceDurableObject,
+  createFlowsafeRunnerLifecycle,
   createFlowsafeWorker,
+  type FlowsafeRunnerLifecycleConfig,
   type FlowsafeWorkerConfig,
   hmacVerifier,
   numberVar,
@@ -186,6 +189,9 @@ interface Env {
 
 /** Id for system-created records. */
 const SYSTEM_PRINCIPAL_ID = 'flowsafe-worker';
+const runnerLifecycleConfig = {
+  systemPrincipalId: SYSTEM_PRINCIPAL_ID,
+} satisfies FlowsafeRunnerLifecycleConfig<Env>;
 
 // One durable rate-limit store per isolate: it memoizes its own schema DDL,
 // and each DO instance building a fresh store would re-issue CREATE TABLE
@@ -247,6 +253,12 @@ export class ShowcaseRunner extends DurableObjectRunner<Env> {
 
   protected runOwnership(env: Env) {
     return approvalStoreFactoryFor(env.DB).resources();
+  }
+
+  protected runLifecycle(env: Env): DurableObjectRunLifecycleHooks {
+    return createFlowsafeRunnerLifecycle(runnerLifecycleConfig, env, {
+      waitUntil: this.state?.waitUntil?.bind(this.state),
+    });
   }
 }
 
@@ -426,8 +438,8 @@ async function chargeDemoBudget(
 // its demo mounts, and the demo budget charge.
 
 const workerConfig = {
+  ...runnerLifecycleConfig,
   workflows: SHOWCASE_MODULES.map((entry) => entry.meta),
-  systemPrincipalId: SYSTEM_PRINCIPAL_ID,
   buildVerifier,
   maintenance: {
     sweepIntervalMs: 15 * 60 * 1_000,
