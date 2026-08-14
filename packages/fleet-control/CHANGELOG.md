@@ -1,5 +1,16 @@
 # @proofoftech/fleet-control
 
+## 0.3.0
+
+### Minor Changes
+
+- 1f6a13a: Add a fenced, replay-safe `forceDecommissionDeployment()` escape hatch for ordinary deployments whose retained specification inputs are unavailable.
+
+### Patch Changes
+
+- Updated dependencies [1f6a13a]
+  - @proofoftech/flowsafe@0.16.0
+
 ## 0.2.2
 
 ### Patch Changes
