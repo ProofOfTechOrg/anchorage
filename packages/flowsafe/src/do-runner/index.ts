@@ -22,8 +22,11 @@ export type {
   PurgeExpiredThreadsOptions,
   PurgeExpiredThreadsResult,
   RunArtifactPurger,
+  RunDeadlineCandidate,
+  RunDeadlineCursor,
   SnapshotDatabase,
   SnapshotStatement,
+  SweepExpiredRunDeadlinesOptions,
 } from './d1-storage.js';
 export {
   BACKGROUND_TASK_TTL_PURGE_TABLES,
@@ -38,6 +41,7 @@ export {
   purgeExpiredWorkflowRuns,
   RUN_TTL_PURGE_TABLES,
   SCHEDULE_TRIGGER_TTL_PURGE_TABLES,
+  sweepExpiredRunDeadlines,
   THREAD_STATE_TTL_PURGE_TABLES,
   THREAD_TTL_PURGE_TABLES,
 } from './d1-storage.js';
@@ -67,6 +71,7 @@ export {
 // status by extending DoStatusError (see do-error-response.ts).
 export { DoStatusError, doErrorResponse } from './do-error-response.js';
 export {
+  type DurableObjectRunLifecycleHooks,
   DurableObjectRunner,
   type DurableObjectRunOwner,
   type DurableObjectRunOwnershipStore,
@@ -96,18 +101,31 @@ export { isPathSafeId, PATH_SAFE_ID_PATTERN } from './path-safe-id.js';
 export type { HostPubSub } from './pubsub.js';
 export { createHostPubSub } from './pubsub.js';
 export type {
+  RunEconomicOperation,
+  RunLifecyclePrincipal,
+  RunScheduleDispatch,
+  RunTerminalErrorEnvelope,
+  RunTerminalStatus,
+} from './run-lifecycle.js';
+export type {
   RequestContextProvider,
   ResumeRunOptions,
   RunLeg,
+  RunLifecycleBlockedReason,
+  RunLifecycleCas,
+  RunLifecycleTransitionResult,
   RunnerRuntimeOptions,
+  RunStatus,
   RunSummary,
   StartRunOptions,
 } from './runtime.js';
 export {
   InvalidRunRequestError,
   RunAlreadyExistsError,
+  RunLifecycleBlockedError,
   RunNotSuspendedError,
   RunnerRuntime,
+  RunTerminalConflictError,
   UnknownRunError,
   UnknownWorkflowError,
 } from './runtime.js';

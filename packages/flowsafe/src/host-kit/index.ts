@@ -19,6 +19,7 @@ export {
   readBoundedBody,
 } from '../http-body.js';
 export {
+  abandonApprovalsForRun,
   queueApprovalForSuspension,
   type ResumeRunFn,
   reconcileApprovalsForSummary,
@@ -29,6 +30,7 @@ export { bearerActorAuthenticator, parseActorTokens } from './bearer-auth.js';
 export { type DoResponseLike, doSummary } from './do-response.js';
 export {
   createDoRunTopology,
+  type DoRunLifecycleTopology,
   type DoRunStartInput,
   type DoRunTopology,
   type RunnerNamespaceLike,
@@ -38,6 +40,8 @@ export { boolVar, type NumberVarOptions, numberVar } from './env-vars.js';
 export type {
   AgentRouter,
   BackgroundTasksCleanupConfig,
+  FlowsafeRunnerLifecycleConfig,
+  FlowsafeRunnerLifecycleOptions,
   FlowsafeWorker,
   FlowsafeWorkerConfig,
   FlowsafeWorkerContext,
@@ -45,6 +49,7 @@ export type {
   MaintenanceDurableObjectConstructor,
   MaintenanceDurableObjectState,
   MaintenanceDuty,
+  MaintenanceDutyContext,
   MaintenanceHealth,
   MaintenanceNamespaceLike,
   MaintenanceStorage,
@@ -53,6 +58,7 @@ export type {
 } from './flowsafe-worker.js';
 export {
   createFlowsafeMaintenanceDurableObject,
+  createFlowsafeRunnerLifecycle,
   createFlowsafeWorker,
   MAINTENANCE_INSTANCE_NAME,
 } from './flowsafe-worker.js';

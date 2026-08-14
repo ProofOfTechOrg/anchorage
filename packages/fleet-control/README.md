@@ -53,6 +53,14 @@ Construct `CloudflareProvisioningClient` with a `CloudflareApiRateCoordinator`. 
 
 Plain-worker, dispatch-worker, backend-switch, and control-worker inspection consumes every provider binding entry before exact attestation. Unknown types, malformed entries, duplicate names, unrepresented bindings, and missing complete inventories fail closed, including expected-empty groups. Secret names come from the authoritative secret-list API when ordinary version resources omit them. Wrangler-backed D1 ownership, migrations, exact-ID lookup, and deletion use Cloudflare's direct APIs. Every mutation runs under the active mutation fence. D1 deletion treats only provider 404 as absence and confirms that the immutable ID is absent without spawning `wrangler d1 delete`. A custom `PlainWorkerRouteApi` must provide `getDatabase` and `deleteDatabase` before destructive D1 teardown; Fleet Control fails closed when either capability is absent. SQLite recognizes anonymous `?` and numbered `?NNN` parameters, literals, quoted identifiers, and comments without string replacement. D1 does not support named SQLite parameters.
 
+Use `forceDecommissionDeployment()` only when the host has lost the retained credentials or artifact required to rebuild a `DeploymentSpec`. The operation accepts the durable tenant and environment key instead of a specification. It runs under the deployment lease, removes every ordinary custom domain for the persisted script, disables and verifies public ingress, deletes the script’s current secrets, and deletes D1 by its persisted immutable ID after matching the persisted database name. It then removes the fleet ledger row.
+
+Provider 404 responses converge as already absent, so retry the same call after an interrupted teardown. A `database-reserved` row has not authorized provider creation and can be removed without a provider call. A `database-create-authorized` row has an unresolved creation outcome and only a synthetic ID, so force decommission fails closed and retains that row for spec-aware recovery.
+
+Pass `options.audit` to receive a `DecommissionAuditEvent`. Normal decommission emits `forced: false`; force decommission emits the same event with `forced: true`. Fleet Control emits the force event before it deletes the ledger row. If the sink fails, the terminal record remains and the next call retries audit delivery without repeating provider mutations.
+
+The function never reads an artifact, computes a specification digest, deletes host-retained control-plane secrets, or deletes application R2 buckets. `WranglerLoopBackend` requires `PlainWorkerRouteApi.getDatabase` and `deleteDatabase`; it never falls back to Wrangler for force deletion. Other backends fail closed unless they implement the narrow `forceDecommissionStep` contract for equivalent provider primitives.
+
 Run the package checks with:
 
 ```bash

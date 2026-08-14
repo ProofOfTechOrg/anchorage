@@ -6,7 +6,7 @@
 // approval-ui package documents (use-approval-dashboard.render.test.ts).
 
 import { describe, expect, it, vi } from 'vitest';
-import type { RunSummary } from '@/run-client';
+import { type RunSummary, TERMINAL_RUN_STATUSES } from '@/run-client';
 import {
   allRunsSettled,
   mergeRunResults,
@@ -109,6 +109,13 @@ describe('mergeRunResults', () => {
 });
 
 describe('allRunsSettled', () => {
+  it.each([
+    'cancelled',
+    'timed_out',
+  ])('treats %s as terminal for poll and stream observations', (status) => {
+    expect(TERMINAL_RUN_STATUSES.has(status)).toBe(true);
+  });
+
   it('is false when nothing has settled or been abandoned', () => {
     const runs = [run('a')];
     expect(allRunsSettled(runs, new Map(), new Map())).toBe(false);

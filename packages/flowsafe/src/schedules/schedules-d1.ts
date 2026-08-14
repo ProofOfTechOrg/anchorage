@@ -739,6 +739,81 @@ export class D1SchedulesStorage extends SchedulesStorage {
     throw new Error('agent schedule dispatch receipt could not be persisted');
   }
 
+  /**
+   * Make terminal-run discard authoritative for the exact leased run.
+   * A schedule signal may have observed a suspension and settled a wake just
+   * before terminal cleanup acquired the target-thread FIFO. That same-run
+   * receipt is safe to replace; unrelated or non-execution receipts fail
+   * closed.
+   */
+  async discardAgentScheduleDispatch(
+    scheduleId: string,
+    triggerId: string,
+    runId: string,
+  ): Promise<void> {
+    if (!isPathSafeId(runId)) {
+      throw new TypeError('invalid agent schedule dispatch run id');
+    }
+    const canonical = createScheduleAgentDispatchReceipt('discard', { runId });
+    await this.#ensureSchema();
+    const discarded = await this.#db
+      .prepare(
+        `UPDATE ${this.#triggers}
+         SET metadata = json_set(
+           COALESCE(metadata, '{}'),
+           '$.dispatchState', 'settled',
+           '$.dispatchReceipt', json(?)
+         )
+         WHERE id = ? AND scheduleId = ? AND outcome = 'deferred'
+           AND json_extract(metadata, '$.dispatchRef.runId') = ?
+           AND (
+             json_extract(metadata, '$.dispatchState') = 'executing'
+             OR (
+               json_extract(metadata, '$.dispatchState') = 'settled'
+               AND json_extract(metadata, '$.dispatchReceipt.runId') = ?
+               AND json_extract(metadata, '$.dispatchReceipt.action')
+                 IN ('wake', 'deliver', 'discard')
+             )
+           )`,
+      )
+      .bind(JSON.stringify(canonical), triggerId, scheduleId, runId, runId)
+      .run();
+    if (d1Changes(discarded) === 1) return;
+    const row = await this.#db
+      .prepare(
+        `SELECT scheduleId, runId, outcome, metadata FROM ${this.#triggers}
+         WHERE id = ?`,
+      )
+      .bind(triggerId)
+      .first<{
+        scheduleId: string;
+        runId: string | null;
+        outcome: ScheduleTrigger['outcome'];
+        metadata: string | null;
+      }>();
+    // The tick's final bookkeeping is absorbing: once the exact run's row is
+    // non-deferred, no later pass can begin or redispatch it. A deleted row is
+    // equally converged (schedule/trigger retention already removed the work).
+    if (!row) return;
+    if (row.scheduleId !== scheduleId || row.runId !== runId) {
+      throw new Error(
+        'agent schedule dispatch belongs to another schedule or run',
+      );
+    }
+    if (row.outcome !== 'deferred') return;
+    const metadata =
+      row.metadata === null
+        ? undefined
+        : parseJsonOrUndefined<Record<string, unknown>>(row.metadata);
+    const receipt = parseScheduleAgentDispatchReceipt(
+      metadata?.dispatchReceipt,
+    );
+    if (receipt && JSON.stringify(receipt) === JSON.stringify(canonical)) {
+      return;
+    }
+    throw new Error('agent schedule dispatch could not be force-discarded');
+  }
+
   async deleteSchedule(id: string): Promise<void> {
     await this.deleteOwnedSchedule(id);
   }

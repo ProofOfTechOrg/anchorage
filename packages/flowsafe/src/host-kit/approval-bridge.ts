@@ -93,6 +93,7 @@ function requestedGrantIdentity(stepPayload: unknown): {
  * failure are the same duty, so they must not drift into different provenances.
  */
 const RECONCILE_PURPOSE = 'approval-suspension-reconcile';
+const ABANDON_PURPOSE = 'run-lifecycle-abandonment';
 
 /**
  * The platform's own bookkeeping identity for one service. Minted here rather
@@ -328,6 +329,39 @@ async function listAllApprovals(
     after = approvalCursor(last);
   }
   return all;
+}
+
+/**
+ * Idempotently closes every open approval for a terminal run. This is
+ * lifecycle bookkeeping, not a reviewer decision: it uses the service's
+ * rejected CAS path, never calls resume, and an abandoned record can never
+ * participate in grant minting.
+ */
+export async function abandonApprovalsForRun(
+  service: ApprovalService,
+  workflowId: string,
+  runId: string,
+  terminalStatus: 'cancelled' | 'timed_out',
+  systemPrincipalId: string,
+): Promise<ApprovalRecord[]> {
+  const principal = bookkeepingPrincipal(systemPrincipalId, ABANDON_PURPOSE);
+  const records = await listAllApprovals(
+    service,
+    { workflowId, runId },
+    principalActor(principal),
+  );
+  const abandoned: ApprovalRecord[] = [];
+  const reason = `abandoned: run ${terminalStatus}`;
+  for (const record of records) {
+    if (!OPEN_STATUSES.includes(record.status)) continue;
+    const updated = await service.supersedeStaleAsPrincipal(
+      record.id,
+      principal,
+      reason,
+    );
+    if (updated) abandoned.push(updated);
+  }
+  return abandoned;
 }
 
 /**

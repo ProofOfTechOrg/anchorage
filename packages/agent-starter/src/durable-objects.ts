@@ -13,6 +13,7 @@ import {
   type AgentThreadStateStorage,
   createThreadAgentHost,
   type ThreadAgentHost,
+  type ThreadAgentStartInput,
 } from '@proofoftech/flowsafe/agent-host';
 import {
   ApprovalService,
@@ -30,6 +31,7 @@ import {
   createD1Storage,
   createHostPubSub,
   DoStatusError,
+  type DurableObjectRunLifecycleHooks,
   DurableObjectRunner,
   doErrorResponse,
   EXECUTION_PRINCIPAL_HEADER,
@@ -44,6 +46,7 @@ import {
 } from '@proofoftech/flowsafe/do-runner';
 import {
   approvalStoreFactoryFor,
+  createFlowsafeRunnerLifecycle,
   createHubTopology,
   createThreadTopology,
 } from '@proofoftech/flowsafe/host-kit';
@@ -64,6 +67,7 @@ import {
 
 import { createStarterAgentModule } from './agent.js';
 import { modelConfig, SYSTEM_PRINCIPAL_ID } from './config.js';
+import { starterRunnerLifecycleConfig } from './principal-context.js';
 import {
   createComposedStorage,
   schedulesStore,
@@ -88,6 +92,35 @@ function idleRunMessages(input: StartIdleRunInput): MessageListInput {
   return 'Record the requested operation through the approved tool.';
 }
 
+export function discardStarterScheduleDispatch(
+  env: Env,
+  scheduleId: string,
+  dispatchId: string,
+  runId: string,
+): Promise<void> {
+  return schedulesStore(env.DB).discardAgentScheduleDispatch(
+    scheduleId,
+    dispatchId,
+    runId,
+  );
+}
+
+export function idleRunScheduleDispatch(input: {
+  scheduleId?: string;
+  dispatchId?: string;
+}): Pick<
+  ThreadAgentStartInput,
+  'scheduleId' | 'dispatchId' | 'scheduleDispatchLease'
+> {
+  return {
+    ...(input.scheduleId !== undefined ? { scheduleId: input.scheduleId } : {}),
+    ...(input.dispatchId !== undefined ? { dispatchId: input.dispatchId } : {}),
+    ...(input.scheduleId !== undefined && input.dispatchId !== undefined
+      ? { scheduleDispatchLease: 'executing' as const }
+      : {}),
+  };
+}
+
 export class StarterRunner extends DurableObjectRunner<Env> {
   protected build(env: Env) {
     return defineWorkflows(env);
@@ -99,6 +132,12 @@ export class StarterRunner extends DurableObjectRunner<Env> {
 
   protected scheduleSource(env: Env) {
     return createScheduleStartSource(schedulesStore(env.DB));
+  }
+
+  protected runLifecycle(env: Env): DurableObjectRunLifecycleHooks {
+    return createFlowsafeRunnerLifecycle(starterRunnerLifecycleConfig, env, {
+      waitUntil: this.state?.waitUntil?.bind(this.state),
+    });
   }
 }
 
@@ -149,6 +188,8 @@ export class StarterThread extends ThreadDurableObject<Env> {
       },
       resourceAccess: () => approvalStoreFactoryFor(env.DB).resources(),
       scheduleSource: () => createScheduleStartSource(schedulesStore(env.DB)),
+      discardScheduleDispatch: (scheduleId, dispatchId, runId) =>
+        discardStarterScheduleDispatch(env, scheduleId, dispatchId, runId),
       approvalService: () => {
         this.#approvalService ??= new ApprovalService({
           store: approvals,
@@ -282,15 +323,10 @@ export class StarterThread extends ThreadDurableObject<Env> {
         resourceId: input.resourceId ?? this.#resourceId(scope),
         messages: idleRunMessages(input),
         entryPath: input.entryPath,
-        ...(input.scheduleId !== undefined
-          ? { scheduleId: input.scheduleId }
-          : {}),
-        ...(input.dispatchId !== undefined
-          ? { dispatchId: input.dispatchId }
-          : {}),
+        ...idleRunScheduleDispatch(input),
         safeContext: input.safeContext,
       });
-      return { runId: result.runId };
+      return { runId: result.runId, status: result.summary.status };
     },
   });
 

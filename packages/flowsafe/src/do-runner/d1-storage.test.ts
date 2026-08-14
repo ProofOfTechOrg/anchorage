@@ -39,8 +39,10 @@ import {
   purgeExpiredThreadState,
   purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
+  type RunDeadlineCursor,
   type SnapshotDatabase,
   type SnapshotStatement,
+  sweepExpiredRunDeadlines,
 } from './d1-storage.js';
 
 // Domain-local result-envelope adapter for pure purge SQL units. It maps
@@ -101,6 +103,7 @@ function seedRun(
     runId: string;
     status: string;
     updatedAt: number;
+    cleanupCompletedAt?: number;
     prefix?: string;
   },
 ): void {
@@ -112,7 +115,98 @@ function seedRun(
   ).run(
     'wf',
     options.runId,
-    JSON.stringify({ status: options.status, runId: options.runId }),
+    JSON.stringify({
+      status: options.status,
+      runId: options.runId,
+      ...(options.cleanupCompletedAt === undefined
+        ? {}
+        : {
+            requestContext: {
+              'flowsafe.runLifecycle': {
+                version: 1,
+                revision: 2,
+                terminal: {
+                  status: options.status,
+                  error: {
+                    code:
+                      options.status === 'cancelled'
+                        ? 'CANCELLED'
+                        : 'TIMED_OUT',
+                    message: 'terminal',
+                  },
+                  transitionedAt: options.cleanupCompletedAt - 1,
+                  replayPrincipals: [{ kind: 'system', id: 'maintenance' }],
+                  cleanupCompletedAt: options.cleanupCompletedAt,
+                },
+              },
+            },
+          }),
+    }),
+    iso,
+    iso,
+  );
+}
+
+function seedDeadlineRun(
+  db: SqliteDatabase,
+  options: {
+    runId: string;
+    status: string;
+    revision: number;
+    deadlineAt: number;
+    transitionIntent?: 'timed_out';
+    transitionExpectedRevision?: number;
+    economicOperations?: Array<{ id: string; settlementState: string }>;
+    cleanupCompletedAt?: number;
+    prefix?: string;
+  },
+): void {
+  const iso = new Date(NOW).toISOString();
+  const lifecycle = {
+    version: 1,
+    revision: options.revision,
+    deadlineAt: options.deadlineAt,
+    ...(options.economicOperations === undefined
+      ? {}
+      : { economicOperations: options.economicOperations }),
+    ...(options.transitionIntent
+      ? {
+          transitionIntent: {
+            status: options.transitionIntent,
+            requestedAt: NOW,
+            replayPrincipals: [{ kind: 'system', id: 'maintenance' }],
+            expectedRevision:
+              options.transitionExpectedRevision ?? options.revision,
+            expectedDeadlineAt: options.deadlineAt,
+          },
+        }
+      : {}),
+    ...(options.status === 'timed_out'
+      ? {
+          terminal: {
+            status: 'timed_out',
+            error: { code: 'TIMED_OUT', message: 'run deadline expired' },
+            transitionedAt: NOW,
+            replayPrincipals: [{ kind: 'system', id: 'maintenance' }],
+            ...(options.cleanupCompletedAt !== undefined
+              ? { cleanupCompletedAt: options.cleanupCompletedAt }
+              : {}),
+          },
+        }
+      : {}),
+  };
+  db.prepare(
+    `INSERT INTO ${options.prefix ?? ''}mastra_workflow_snapshot
+     (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
+     VALUES (?, ?, NULL, ?, ?, ?)`,
+  ).run(
+    'wf',
+    options.runId,
+    JSON.stringify({
+      status: options.status,
+      runId: options.runId,
+      requestContext: { 'flowsafe.runLifecycle': lifecycle },
+    }),
     iso,
     iso,
   );
@@ -134,6 +228,8 @@ const TERMINAL = [
   'canceled',
   'bailed',
   'skipped',
+  'cancelled',
+  'timed_out',
 ];
 const LIVE = ['running', 'suspended', 'waiting', 'pending', 'paused'];
 const MAX_TABLE_PREFIX = 'p'.repeat(39);
@@ -243,6 +339,251 @@ const PUBLIC_PURGE_CASES = [
       purgeExpiredScheduleTriggers(db, { ttlMs: DAY_MS, tablePrefix, now }),
   },
 ] satisfies PublicPurgeCase[];
+
+describe('sweepExpiredRunDeadlines', () => {
+  it('bounds a pass, isolates failures, and re-drives the failed row', async () => {
+    const db = openSqlite();
+    createSnapshotTable(db);
+    seedDeadlineRun(db, {
+      runId: 'first',
+      status: 'suspended',
+      revision: 1,
+      deadlineAt: NOW - 2,
+    });
+    seedDeadlineRun(db, {
+      runId: 'second',
+      status: 'retry_wait',
+      revision: 3,
+      deadlineAt: NOW - 1,
+    });
+    seedDeadlineRun(db, {
+      runId: 'future',
+      status: 'running',
+      revision: 1,
+      deadlineAt: NOW + 1,
+    });
+    const attempts: string[] = [];
+    let wedge = true;
+
+    await expect(
+      sweepExpiredRunDeadlines(d1Like(db), {
+        limit: 2,
+        now: () => NOW,
+        transition: async (candidate) => {
+          attempts.push(candidate.runId);
+          if (candidate.runId === 'first' && wedge) throw new Error('wedged');
+        },
+      }),
+    ).rejects.toThrow(/first: wedged/);
+    expect(attempts).toEqual(['first', 'second']);
+
+    wedge = false;
+    attempts.length = 0;
+    await expect(
+      sweepExpiredRunDeadlines(d1Like(db), {
+        limit: 1,
+        now: () => NOW,
+        transition: async (candidate) => {
+          attempts.push(candidate.runId);
+        },
+      }),
+    ).resolves.toBe(1);
+    expect(attempts).toEqual(['first']);
+  });
+
+  it('advances the persistent cursor past a permanently failing head row', async () => {
+    const db = openSqlite();
+    createSnapshotTable(db);
+    seedDeadlineRun(db, {
+      runId: 'poison',
+      status: 'suspended',
+      revision: 1,
+      deadlineAt: NOW - 2,
+    });
+    seedDeadlineRun(db, {
+      runId: 'eligible',
+      status: 'suspended',
+      revision: 1,
+      deadlineAt: NOW - 1,
+    });
+    let cursor: RunDeadlineCursor | undefined;
+    const attempts: string[] = [];
+    const advanceCursor = async (next: NonNullable<typeof cursor>) => {
+      cursor = next;
+    };
+
+    await expect(
+      sweepExpiredRunDeadlines(d1Like(db), {
+        limit: 1,
+        now: () => NOW,
+        advanceCursor,
+        transition: async (candidate) => {
+          attempts.push(candidate.runId);
+          throw new Error('permanent failure');
+        },
+      }),
+    ).rejects.toThrow(/poison: permanent failure/);
+    expect(cursor).toEqual({
+      workflowId: 'wf',
+      runId: 'poison',
+      deadlineAt: NOW - 2,
+    });
+
+    await expect(
+      sweepExpiredRunDeadlines(d1Like(db), {
+        limit: 1,
+        now: () => NOW,
+        cursor,
+        advanceCursor,
+        transition: async (candidate) => {
+          attempts.push(candidate.runId);
+        },
+      }),
+    ).resolves.toBe(1);
+    expect(attempts).toEqual(['poison', 'eligible']);
+  });
+
+  it('re-enumerates timeout crash precursors and terminal cleanup only until complete', async () => {
+    const db = openSqlite();
+    createSnapshotTable(db, 'tenant_');
+    seedDeadlineRun(db, {
+      prefix: 'tenant_',
+      runId: 'core-canceled',
+      status: 'canceled',
+      revision: 2,
+      deadlineAt: NOW - 3,
+      transitionIntent: 'timed_out',
+      transitionExpectedRevision: 1,
+    });
+    seedDeadlineRun(db, {
+      prefix: 'tenant_',
+      runId: 'cleanup-incomplete',
+      status: 'timed_out',
+      revision: 2,
+      deadlineAt: NOW - 2,
+    });
+    seedDeadlineRun(db, {
+      prefix: 'tenant_',
+      runId: 'cleanup-complete',
+      status: 'timed_out',
+      revision: 3,
+      deadlineAt: NOW - 1,
+      cleanupCompletedAt: NOW,
+    });
+    const seen: string[] = [];
+
+    await expect(
+      sweepExpiredRunDeadlines(d1Like(db), {
+        tablePrefix: 'tenant_',
+        now: () => NOW,
+        transition: async (candidate) => {
+          seen.push(candidate.runId);
+          if (candidate.runId === 'core-canceled') {
+            expect(candidate.revision).toBe(1);
+          }
+        },
+      }),
+    ).resolves.toBe(2);
+    expect(seen).toEqual(['core-canceled', 'cleanup-incomplete']);
+  });
+
+  it.each([
+    'success',
+    'failed',
+  ] as const)('re-enumerates a timeout intent after a late core %s precursor', async (status) => {
+    const db = openSqlite();
+    createSnapshotTable(db, 'tenant_');
+    seedDeadlineRun(db, {
+      prefix: 'tenant_',
+      runId: `late-${status}`,
+      status,
+      revision: 5,
+      deadlineAt: NOW - 1,
+      transitionIntent: 'timed_out',
+      transitionExpectedRevision: 4,
+    });
+    const candidates: Array<{ runId: string; revision: number }> = [];
+
+    await expect(
+      sweepExpiredRunDeadlines(d1Like(db), {
+        tablePrefix: 'tenant_',
+        now: () => NOW,
+        transition: async (candidate) => {
+          candidates.push({
+            runId: candidate.runId,
+            revision: candidate.revision,
+          });
+        },
+      }),
+    ).resolves.toBe(1);
+    expect(candidates).toEqual([{ runId: `late-${status}`, revision: 4 }]);
+  });
+
+  it('does not let disputed rows consume the bounded pass ahead of eligible deadlines', async () => {
+    const db = openSqlite();
+    createSnapshotTable(db);
+    for (const [runId, deadlineAt] of [
+      ['disputed-first', NOW - 3],
+      ['disputed-second', NOW - 2],
+    ] as const) {
+      seedDeadlineRun(db, {
+        runId,
+        status: 'suspended',
+        revision: 1,
+        deadlineAt,
+        economicOperations: [
+          { id: `charge-${runId}`, settlementState: 'disputed' },
+        ],
+      });
+    }
+    seedDeadlineRun(db, {
+      runId: 'eligible',
+      status: 'suspended',
+      revision: 1,
+      deadlineAt: NOW - 1,
+    });
+    const seen: string[] = [];
+
+    await expect(
+      sweepExpiredRunDeadlines(d1Like(db), {
+        limit: 2,
+        now: () => NOW,
+        transition: async (candidate) => {
+          seen.push(candidate.runId);
+        },
+      }),
+    ).resolves.toBe(1);
+    expect(seen).toEqual(['eligible']);
+  });
+
+  it('enforces the bounded limit and existing 39-character prefix contract', async () => {
+    const db = openSqlite();
+    createSnapshotTable(db, MAX_TABLE_PREFIX);
+    seedDeadlineRun(db, {
+      prefix: MAX_TABLE_PREFIX,
+      runId: 'bounded',
+      status: 'waiting_signal',
+      revision: 1,
+      deadlineAt: NOW,
+    });
+
+    await expect(
+      sweepExpiredRunDeadlines(d1Like(db), {
+        tablePrefix: MAX_TABLE_PREFIX,
+        limit: 1,
+        now: () => NOW,
+        transition: async () => undefined,
+      }),
+    ).resolves.toBe(1);
+    await expect(
+      sweepExpiredRunDeadlines(d1Like(db), {
+        tablePrefix: OVERLONG_TABLE_PREFIX,
+        now: () => NOW,
+        transition: async () => undefined,
+      }),
+    ).rejects.toThrow(/at most 39 characters/);
+  });
+});
 
 describe('createD1Storage table prefix', () => {
   it('uses the shared Mastra-compatible identifier rule', () => {
@@ -367,6 +708,9 @@ describe('purgeExpiredWorkflowRuns', () => {
         runId: `stale-${status}`,
         status,
         updatedAt: NOW - 8 * DAY_MS,
+        ...(status === 'cancelled' || status === 'timed_out'
+          ? { cleanupCompletedAt: NOW - 8 * DAY_MS }
+          : {}),
       });
       seedRun(sqlite, {
         runId: `fresh-${status}`,
@@ -398,6 +742,33 @@ describe('purgeExpiredWorkflowRuns', () => {
         ...LIVE.map((status) => `stale-${status}`),
       ].sort(),
     );
+  });
+
+  it.each([
+    'cancelled',
+    'timed_out',
+  ] as const)('retains incomplete %s lifecycle rows and purges only cleanup-complete rows', async (status) => {
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    seedRun(sqlite, {
+      runId: `${status}-incomplete`,
+      status,
+      updatedAt: NOW - 8 * DAY_MS,
+    });
+    seedRun(sqlite, {
+      runId: `${status}-complete`,
+      status,
+      updatedAt: NOW - 8 * DAY_MS,
+      cleanupCompletedAt: NOW - 8 * DAY_MS,
+    });
+
+    await expect(
+      purgeExpiredWorkflowRuns(d1Like(sqlite), {
+        ttlMs: 7 * DAY_MS,
+        now: () => NOW,
+      }),
+    ).resolves.toBe(1);
+    expect(remainingRunIds(sqlite)).toEqual([`${status}-incomplete`]);
   });
 
   it('returns 0 when nothing qualifies', async () => {

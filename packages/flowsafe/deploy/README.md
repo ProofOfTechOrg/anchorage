@@ -133,6 +133,7 @@ Every route except `GET /healthz` requires a valid actor credential. `/healthz` 
 | `POST /runs` | Start a server-id-assigned run and queue each observed suspension |
 | `GET /runs/:workflowId/:runId` | Read run status and reconcile a missing approval record |
 | `POST /runs/:workflowId/:runId/resume` | Resume without connector grants; approval-gated connectors still fail closed |
+| `POST /runs/:workflowId/:runId/terminate` | Idempotently cancel a live run and abandon its open approvals |
 | `GET /api/approvals` | List and filter the deployment approval queue |
 | `GET /api/approvals/metrics` | Read deployment queue metrics |
 | `GET /api/approvals/:id` | Read one approval |
@@ -166,11 +167,12 @@ Keep authentication, stream-ticket, model-provider, connector, webhook, and SIEM
 
 ## Understand alarm-driven maintenance
 
-The fixed `deployment-maintenance` Durable Object stores the next sweep and purge times. Each alarm persists its successor before running one due duty. If both duties are due, the object schedules an immediate follow-up alarm instead of sharing the invocation. A Workers CPU-limit termination cannot break the alarm chain or starve the other duty.
+The fixed `deployment-maintenance` Durable Object stores the next deadline, SLA sweep, and purge times. Each alarm persists its successor before running one due duty. If several duties are due, the object schedules an immediate follow-up alarm instead of sharing the invocation. A Workers CPU-limit termination cannot break the alarm chain or starve another duty.
 
 After deployment, authenticate `POST /admin/ensure-maintenance` with `MAINTENANCE_ADMIN_SECRET`. Read `GET /admin/maintenance-status` with the same credential and alert when `alarmAt` is null or the last successful duty is stale.
 
 - `sweepSLA(store, ...)` scans the deployment approval store and escalates open requests past `slaDeadlineAt`. It is maintenance code, not an HTTP service method.
+- `sweepExpiredRunDeadlines()` enumerates a bounded set of expired runs and routes each compare-and-swap transition through its owner Durable Object.
 - `purgeExpiredWorkflowRuns()` deletes terminal snapshots in bounded batches. Suspended and running runs remain at every age.
 - `purgeExpiredApprovals()` deletes approved and rejected records. Pending, claimed, and escalated requests remain.
 - `purgeExpiredThreads()` is optional. It deletes an idle thread with its messages and leaves working-memory resources intact.

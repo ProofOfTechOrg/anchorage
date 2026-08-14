@@ -538,6 +538,7 @@ export class ApprovalService {
     const updated = await this.#transitionOrExplain(id, 'decide', authorized, {
       from: OPEN_STATUSES,
       patch,
+      requireRunDecidable: true,
     });
     // Annotate a PERMITTED self-decision from the post-transition record (no
     // extra read): an exercised SoD exemption must leave an audit trail. Fires
@@ -832,9 +833,15 @@ export class ApprovalService {
     id: string,
     action: string,
     actor: ApprovalActor,
-    args: { from: readonly ApprovalStatus[]; patch: ApprovalPatch },
+    args: {
+      from: readonly ApprovalStatus[];
+      patch: ApprovalPatch;
+      requireRunDecidable?: boolean;
+    },
   ): Promise<ApprovalRecord> {
-    const updated = await this.#store.transition(id, args.from, args.patch);
+    const updated = await this.#store.transition(id, args.from, args.patch, {
+      ...(args.requireRunDecidable ? { requireRunDecidable: true } : {}),
+    });
     if (updated) return updated;
     const current = await this.#store.get(id);
     if (!current) {

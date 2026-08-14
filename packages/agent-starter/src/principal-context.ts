@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import {
+  createAgentApprovalResumer,
+  createAgentThreadTopology,
+} from '@proofoftech/flowsafe/agent-host';
+import {
   type ActorContext,
   ApprovalService,
   createPrincipalActorContext,
@@ -9,9 +13,37 @@ import {
   type ResourceKind,
   withRegisteredResourceOwner,
 } from '@proofoftech/flowsafe/approval-api';
-import { approvalStoreFactoryFor } from '@proofoftech/flowsafe/host-kit';
+import {
+  approvalStoreFactoryFor,
+  type FlowsafeRunnerLifecycleConfig,
+} from '@proofoftech/flowsafe/host-kit';
 
+import { STARTER_AGENT_META } from './agent.js';
 import { SYSTEM_PRINCIPAL_ID } from './config.js';
+
+export const starterRunnerLifecycleConfig = {
+  systemPrincipalId: SYSTEM_PRINCIPAL_ID,
+  buildResumeRun: (fallback, env) =>
+    createAgentApprovalResumer({
+      fallback,
+      agents: [STARTER_AGENT_META],
+      topology: createAgentThreadTopology(
+        env.THREAD,
+        env.DEPLOYMENT_IDENTITY_SECRET,
+      ),
+      contextForPrincipal: (principal, record) => {
+        const target = record.resumeTarget;
+        if (target?.kind !== 'agent-thread') {
+          throw new Error('agent approval has no registered thread target');
+        }
+        return contextForRegisteredResources(env, principal, [
+          { kind: 'thread', resourceId: target.threadId },
+          { kind: 'resource', resourceId: target.resourceId },
+          { kind: 'run', resourceId: record.runId },
+        ]);
+      },
+    }),
+} satisfies FlowsafeRunnerLifecycleConfig<Env>;
 
 /**
  * The unattended scheduler identity. It is SYSTEM automation, not a synthetic

@@ -54,6 +54,19 @@ function harness(): {
         if (url.includes('/stream?')) {
           return new Response('{"offset":1,"event":{}}\n');
         }
+        if (url.includes('/disputed_run/terminate?')) {
+          return Response.json(
+            {
+              error: 'run termination is blocked',
+              reason: {
+                code: 'DISPUTED_SETTLEMENT',
+                message:
+                  'run termination is blocked while an economic operation is disputed',
+              },
+            },
+            { status: 409 },
+          );
+        }
         return Response.json({
           agentId: 'writer',
           threadId,
@@ -301,5 +314,53 @@ describe('createAgentThreadTopology', () => {
       }),
     ).rejects.toMatchObject({ status: 404 });
     expect(hits).toHaveLength(0);
+  });
+
+  it('replays a terminal run after ephemeral ownership is released', async () => {
+    const { topology, hits } = harness();
+    const scoped = context();
+    scoped.value.canAccessResource = async () => false;
+    const terminate = topology.terminate;
+    if (!terminate) throw new Error('terminate topology is unavailable');
+
+    await expect(
+      terminate(
+        scoped.value,
+        {
+          agentId: 'writer',
+          threadId: 'ephemeral-thread',
+          runId: 'acme_run',
+        },
+        true,
+      ),
+    ).resolves.toMatchObject({ summary: { status: 'success' } });
+    expect(hits).toEqual([
+      expect.objectContaining({
+        threadId: 'ephemeral-thread',
+        url: expect.stringContaining('&replay=1'),
+      }),
+    ]);
+  });
+
+  it('preserves the structured disputed-settlement reason from the Thread DO', async () => {
+    const { topology } = harness();
+    const scoped = context();
+    const terminate = topology.terminate;
+    if (!terminate) throw new Error('terminate topology is unavailable');
+
+    await expect(
+      terminate(scoped.value, {
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        runId: 'disputed_run',
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      reason: {
+        code: 'DISPUTED_SETTLEMENT',
+        message:
+          'run termination is blocked while an economic operation is disputed',
+      },
+    });
   });
 });

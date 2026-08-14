@@ -131,6 +131,7 @@ function harness(
     throwPurge?: boolean;
     withTick?: boolean;
     throwTick?: boolean;
+    deadlineLimit?: number;
   } = {},
 ) {
   const env = environment();
@@ -142,6 +143,9 @@ function harness(
     maintenance: {
       sweepIntervalMs: 15 * 60 * 1_000,
       purgeIntervalMs: 60 * 60 * 1_000,
+      ...(options.deadlineLimit
+        ? { deadlineLimit: options.deadlineLimit }
+        : {}),
       ...(options.withTick ? { tickIntervalMs: 60 * 1_000 } : {}),
     },
     ...(options.throwSweep
@@ -327,6 +331,7 @@ describe('alarm-driven deployment maintenance', () => {
       internalRequest('/ensure', 'POST'),
     );
     expect(ensured).toMatchObject({
+      nextDeadlineAt: NOW,
       nextSweepAt: NOW,
       nextPurgeAt: NOW,
       nextTickAt: NOW,
@@ -335,6 +340,14 @@ describe('alarm-driven deployment maintenance', () => {
 
     await instance.alarm();
     let status = await healthOf(instance, internalRequest('/status', 'GET'));
+    expect(status.lastDeadlineAt).toBe(NOW);
+    expect(status.lastSweepAt).toBeUndefined();
+    expect(status.lastPurgeAt).toBeUndefined();
+    expect(status.lastTickAt).toBeUndefined();
+    expect(status.alarmAt).toBe(NOW);
+
+    await instance.alarm();
+    status = await healthOf(instance, internalRequest('/status', 'GET'));
     expect(status.lastSweepAt).toBe(NOW);
     expect(status.lastPurgeAt).toBeUndefined();
     expect(status.lastTickAt).toBeUndefined();
@@ -357,6 +370,87 @@ describe('alarm-driven deployment maintenance', () => {
     ]);
   });
 
+  it('persists deadline scan progress so a poison head row cannot starve the next run', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { env, instance, storage, internalRequest } = harness({
+      deadlineLimit: 1,
+    });
+    const db = env.DB;
+    await db
+      .prepare(
+        `CREATE TABLE mastra_workflow_snapshot (
+          workflow_name TEXT NOT NULL,
+          run_id TEXT NOT NULL,
+          resourceId TEXT,
+          snapshot TEXT NOT NULL,
+          createdAt TEXT NOT NULL,
+          updatedAt TEXT NOT NULL
+        )`,
+      )
+      .run();
+    for (const [runId, deadlineAt] of [
+      ['poison', NOW - 2],
+      ['eligible', NOW - 1],
+    ] as const) {
+      const iso = new Date(deadlineAt).toISOString();
+      await db
+        .prepare(
+          `INSERT INTO mastra_workflow_snapshot
+           (workflow_name, run_id, resourceId, snapshot, createdAt, updatedAt)
+           VALUES (?, ?, NULL, ?, ?, ?)`,
+        )
+        .bind(
+          'wf',
+          runId,
+          JSON.stringify({
+            status: 'suspended',
+            requestContext: {
+              'flowsafe.runLifecycle': {
+                version: 1,
+                revision: 1,
+                deadlineAt,
+              },
+            },
+          }),
+          iso,
+          iso,
+        )
+        .run();
+    }
+    const calls: string[] = [];
+    env.RUNNER = {
+      idFromName: (name: string) => name,
+      get: (id: unknown) => ({
+        fetch: async () => {
+          const runId = String(id).split(':').at(-1) as string;
+          calls.push(runId);
+          return runId === 'poison'
+            ? Response.json({ error: 'permanent failure' }, { status: 500 })
+            : Response.json({ runId, status: 'timed_out' });
+        },
+      }),
+    };
+
+    await instance.fetch(internalRequest('/ensure', 'POST'));
+    await instance.alarm();
+    await instance.alarm();
+    await instance.alarm();
+    vi.setSystemTime(NOW + 15 * 60 * 1_000);
+    await instance.alarm();
+
+    expect(calls).toEqual(['poison', 'eligible']);
+    expect(
+      await storage.get('flowsafe:maintenance-deadline-cursor:v1'),
+    ).toEqual({
+      workflowId: 'wf',
+      runId: 'eligible',
+      deadlineAt: NOW - 1,
+    });
+  });
+
   it('keeps the chain armed when an invocation crashes after its duty', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
@@ -373,8 +467,8 @@ describe('alarm-driven deployment maintenance', () => {
 
     await instance.alarm();
     const status = await healthOf(instance, internalRequest('/status', 'GET'));
-    expect(status.lastPurgeAt).toBe(NOW);
-    expect(status.alarmAt).toBeGreaterThan(NOW);
+    expect(status.lastSweepAt).toBe(NOW);
+    expect(status.alarmAt).toBe(NOW);
   });
 
   it('records a failed sweep attempt without advancing its last-success timestamp', async () => {
@@ -387,6 +481,7 @@ describe('alarm-driven deployment maintenance', () => {
     });
     await instance.fetch(internalRequest('/ensure', 'POST'));
 
+    await instance.alarm();
     await instance.alarm();
     expect(storage.alarmAt).toBe(NOW);
 
@@ -411,6 +506,7 @@ describe('alarm-driven deployment maintenance', () => {
 
     await instance.alarm();
     await instance.alarm();
+    await instance.alarm();
 
     const status = await healthOf(instance, internalRequest('/status', 'GET'));
     expect(status.lastSweepAt).toBe(NOW);
@@ -430,6 +526,7 @@ describe('alarm-driven deployment maintenance', () => {
     });
     await instance.fetch(internalRequest('/ensure', 'POST'));
 
+    await instance.alarm();
     await instance.alarm();
     await instance.alarm();
     await instance.alarm();

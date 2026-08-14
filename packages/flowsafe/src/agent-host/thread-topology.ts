@@ -72,6 +72,11 @@ export interface AgentThreadTopology {
     context: ActorContext,
     input: AgentThreadObserveInput,
   ): Promise<Response>;
+  terminate?(
+    context: ActorContext,
+    input: AgentThreadRunRef,
+    replayOnly?: boolean,
+  ): Promise<AgentRunEnvelope>;
   resume(
     context: ActorContext,
     record: ApprovalRecord,
@@ -99,13 +104,18 @@ export interface AgentThreadDispatchTopology extends AgentThreadBoundTopology {
 
 async function errorFrom(response: Response): Promise<RunRouteError> {
   let message = `agent request failed with status ${response.status}`;
+  let reason: unknown;
   try {
-    const payload = (await response.json()) as { error?: unknown };
+    const payload = (await response.json()) as {
+      error?: unknown;
+      reason?: unknown;
+    };
     if (typeof payload?.error === 'string') message = payload.error;
+    reason = payload?.reason;
   } catch {
     // Keep the status-only fallback.
   }
-  return new RunRouteError(response.status, message);
+  return new RunRouteError(response.status, message, reason);
 }
 
 async function envelope(response: Response): Promise<AgentRunEnvelope> {
@@ -345,6 +355,38 @@ export function createAgentThreadTopology<Id>(
       );
       if (!response.ok) throw await errorFrom(response);
       return response;
+    },
+    terminate: async (context, input, replayOnly = false) => {
+      validThread(input.threadId);
+      validRun(input.runId);
+      const resourceId = expectedResource(context, input.threadId);
+      if (!replayOnly) {
+        await requireResourceAccess(
+          context,
+          'thread',
+          input.threadId,
+          'write',
+          'run',
+        );
+        await requireResourceAccess(
+          context,
+          'resource',
+          resourceId,
+          'write',
+          'run',
+        );
+      }
+      const response = await threads.send(
+        context,
+        input.threadId,
+        `${AGENT_HOST_ROUTE_PREFIX}/runs/${encodeURIComponent(
+          input.agentId,
+        )}/${encodeURIComponent(input.runId)}/terminate?resourceId=${encodeURIComponent(
+          resourceId,
+        )}${replayOnly ? '&replay=1' : ''}`,
+        { method: 'POST' },
+      );
+      return envelope(response);
     },
     resume: async (context, record, decision) => {
       const target = record.resumeTarget;

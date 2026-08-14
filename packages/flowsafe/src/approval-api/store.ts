@@ -56,6 +56,11 @@ export interface ApprovalPatch {
   escalatedAt?: string;
 }
 
+export interface ApprovalTransitionOptions {
+  /** Human decisions must lose their CAS once the run has a terminal fence. */
+  requireRunDecidable?: boolean;
+}
+
 export interface ApprovalStore {
   /**
    * Insert — unless an OPEN request (pending | claimed | escalated) already
@@ -88,6 +93,7 @@ export interface ApprovalStore {
     id: string,
     from: readonly ApprovalStatus[],
     patch: ApprovalPatch,
+    options?: ApprovalTransitionOptions,
   ): Promise<ApprovalRecord | null>;
   /**
    * Aggregate queue metrics — field semantics on ApprovalMetrics (types.ts),
@@ -377,6 +383,7 @@ export class InMemoryApprovalStore implements ApprovalStore {
     id: string,
     from: readonly ApprovalStatus[],
     patch: ApprovalPatch,
+    _options?: ApprovalTransitionOptions,
   ): Promise<ApprovalRecord | null> {
     const current = this.#records.get(id);
     if (!current || !from.includes(current.status)) return null;

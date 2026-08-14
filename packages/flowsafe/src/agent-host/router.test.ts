@@ -72,6 +72,9 @@ function topology() {
           },
         }),
     ),
+    terminate: vi.fn<NonNullable<AgentThreadTopology['terminate']>>(async () =>
+      envelope(),
+    ),
     resume: vi.fn(async () => envelope()),
   } satisfies AgentThreadTopology;
 }
@@ -215,6 +218,106 @@ describe('createAgentRouter', () => {
       expect.objectContaining({}),
       expect.objectContaining({ offset: 7 }),
     );
+  });
+
+  it('delegates owner-release replay authorization to the topology', async () => {
+    const host = topology();
+    const owned = context();
+    const replay = {
+      ...owned,
+      canAccessResource: vi.fn(async () => false),
+    } satisfies ActorContext;
+    let actor = owned;
+    const router = createAgentRouter({
+      agents,
+      resolve: async () => actor,
+      topology: host,
+    });
+    const request = () =>
+      new Request(
+        'https://host/agents/writer/runs/acme_thread/acme_run/terminate',
+        { method: 'POST' },
+      );
+
+    const first = await router(request());
+    expect(first?.status).toBe(200);
+    expect(host.terminate).toHaveBeenLastCalledWith(
+      owned,
+      expect.objectContaining({
+        agentId: 'writer',
+        threadId: 'acme_thread',
+        runId: 'acme_run',
+      }),
+      false,
+    );
+
+    actor = replay;
+    const retried = await router(request());
+    expect(retried?.status).toBe(200);
+    expect(host.terminate).toHaveBeenLastCalledWith(
+      replay,
+      expect.objectContaining({ runId: 'acme_run' }),
+      true,
+    );
+  });
+
+  it('preserves a structured disputed-settlement reason from the agent topology', async () => {
+    const host = topology();
+    host.terminate.mockRejectedValueOnce(
+      new RunRouteError(409, 'run termination is blocked', {
+        code: 'DISPUTED_SETTLEMENT',
+        message:
+          'run termination is blocked while an economic operation is disputed',
+      }),
+    );
+    const router = createAgentRouter({
+      agents,
+      resolve: async () => context(),
+      topology: host,
+    });
+
+    const response = await router(
+      new Request(
+        'https://host/agents/writer/runs/acme_thread/acme_run/terminate',
+        { method: 'POST' },
+      ),
+    );
+
+    expect(response?.status).toBe(409);
+    await expect(response?.json()).resolves.toEqual({
+      error: 'run termination is blocked',
+      reason: {
+        code: 'DISPUTED_SETTLEMENT',
+        message:
+          'run termination is blocked while an economic operation is disputed',
+      },
+    });
+  });
+
+  it('rejects invalid termination methods and query fields without invoking the topology', async () => {
+    const host = topology();
+    const router = createAgentRouter({
+      agents,
+      resolve: async () => context(),
+      topology: host,
+    });
+
+    const wrongMethod = await router(
+      new Request(
+        'https://host/agents/writer/runs/acme_thread/acme_run/terminate',
+      ),
+    );
+    expect(wrongMethod?.status).toBe(405);
+    expect(wrongMethod?.headers.get('allow')).toBe('POST');
+
+    const query = await router(
+      new Request(
+        'https://host/agents/writer/runs/acme_thread/acme_run/terminate?forged=1',
+        { method: 'POST' },
+      ),
+    );
+    expect(query?.status).toBe(400);
+    expect(host.terminate).not.toHaveBeenCalled();
   });
 
   it.each([

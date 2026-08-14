@@ -6,17 +6,19 @@
 // half of this contract: doSummary reads these statuses back off a stub, so a
 // status that collapses here collapses all the way to the caller).
 //
-// The taxonomy IS the contract — a 404 for an unknown run, a 409 for a run that
-// is not suspended or already exists, a 400 for a malformed request — so a DO
-// that maps its runtime errors to a blanket 500 does not merely log worse: it
-// turns "you asked for a run that does not exist" into "I am broken", and the
-// router's RunRouteError passthrough has nothing to pass through.
+// The taxonomy IS the contract: a 404 for an unknown run, a 409 for a state or
+// lifecycle conflict, and a 400 for a malformed request. A DO that maps its
+// runtime errors to a blanket 500 does not merely log worse: it turns "you
+// asked for a run that does not exist" into "I am broken", and the router's
+// RunRouteError passthrough has nothing to pass through.
 
 import { DeploymentIdentityError } from './deployment-identity.js';
 import {
   InvalidRunRequestError,
   RunAlreadyExistsError,
+  RunLifecycleBlockedError,
   RunNotSuspendedError,
+  RunTerminalConflictError,
   UnknownRunError,
   UnknownWorkflowError,
 } from './runtime.js';
@@ -58,7 +60,9 @@ function statusOf(error: unknown): number | undefined {
   }
   if (
     error instanceof RunNotSuspendedError ||
-    error instanceof RunAlreadyExistsError
+    error instanceof RunAlreadyExistsError ||
+    error instanceof RunTerminalConflictError ||
+    error instanceof RunLifecycleBlockedError
   ) {
     return 409;
   }
@@ -85,8 +89,16 @@ function statusOf(error: unknown): number | undefined {
  */
 export function doErrorResponse(error: unknown): Response {
   const message = error instanceof Error ? error.message : String(error);
-  return new Response(JSON.stringify({ error: message }), {
-    status: statusOf(error) ?? 500,
-    headers: { 'content-type': 'application/json' },
-  });
+  return new Response(
+    JSON.stringify({
+      error: message,
+      ...(error instanceof RunLifecycleBlockedError
+        ? { reason: error.reason }
+        : {}),
+    }),
+    {
+      status: statusOf(error) ?? 500,
+      headers: { 'content-type': 'application/json' },
+    },
+  );
 }
