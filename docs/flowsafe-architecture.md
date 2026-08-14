@@ -58,7 +58,7 @@ See [API reference map](api-reference.md) for exact import paths.
 
 ## Runner and storage
 
-`init(env, options)` creates a `RunnerRuntime` and import-swapped `createWorkflow`/`createStep` factories. Definitions retain Mastra's builder shape; start and resume go through the runtime.
+`init(env, options)` creates a `RunnerRuntime` and import-swapped `createWorkflow`/`createStep` factories. Definitions retain Mastra's builder shape. Start, resume, cancellation, and deadline expiration go through the runtime.
 
 The runtime:
 
@@ -66,10 +66,12 @@ The runtime:
 - requires a caller-minted run id;
 - derives workflow scope and connector execution identity;
 - obtains per-leg request context before `createRun()`;
-- serializes start and resume per run;
+- serializes execution and lifecycle mutations per run;
 - persists snapshots through the D1 Mastra store;
 - publishes authoritative `RunSummary` values at lifecycle boundaries;
 - persists requester identity, attempt tokens, and monotonic resume ordinals in the authoritative workflow snapshot.
+
+Cancellation and deadline expiration persist an exact terminal intent before interrupting active work. Terminal cleanup then abandons open approvals, discards a live agent-schedule receipt, releases run ownership, and marks cleanup complete. Retries resume that ordering from the persisted lifecycle state.
 
 `DurableObjectRunner` binds one object to `workflowId:runId`. Every request must name the same values as the object's `id.name`.
 

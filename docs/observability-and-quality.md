@@ -203,7 +203,7 @@ Do not log caught errors again through a generic serializer without reapplying t
 
 ### Durable execution
 
-- start/resume/status latency and errors;
+- start, resume, status, terminate, and deadline-sweep latency and errors;
 - runs by current status and age;
 - suspended runs by workflow and gate age;
 - restart recovery;

@@ -274,9 +274,29 @@ describe('DurableObjectRunner.fetch', () => {
     );
 
     expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({
+      error: 'run request carries no valid trusted execution principal',
+    });
     expect(reserve).not.toHaveBeenCalled();
     expect(runtime.status).not.toHaveBeenCalled();
     expect(runtime.start).not.toHaveBeenCalled();
+  });
+
+  it('uses a lifecycle-neutral missing-principal diagnostic on terminal routes', async () => {
+    const runner = new TestRunner(undefined, makeProductionEnv());
+    for (const path of [
+      '/runs/gated/run-missing-principal/terminate',
+      '/runs/gated/run-missing-principal/deadline',
+    ]) {
+      const response = await runner.fetch(
+        deploymentIdentityRequest(`http://do${path}`, { method: 'POST' }),
+      );
+
+      expect(response.status).toBe(403);
+      await expect(response.json()).resolves.toEqual({
+        error: 'run request carries no valid trusted execution principal',
+      });
+    }
   });
 
   it('rejects a new resume leg without requester kind before runtime work', async () => {
