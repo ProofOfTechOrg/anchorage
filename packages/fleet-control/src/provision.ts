@@ -1677,7 +1677,6 @@ export async function forceDecommissionDeployment(
         );
       }
       if (current.phase === 'decommissioned') {
-        await emitDecommissionAudit(input.options?.audit, current, true);
         await lease.delete();
         return;
       }

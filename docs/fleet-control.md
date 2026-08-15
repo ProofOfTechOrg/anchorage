@@ -185,7 +185,7 @@ await forceDecommissionDeployment({
 });
 ```
 
-The function always acquires `store.withDeploymentLease()` before it reads the ledger. An absent deployment succeeds without a provider mutation. A terminal `decommissioned` record also succeeds and removes the retained ledger row.
+The function always acquires `store.withDeploymentLease()` before it reads the ledger. An absent deployment succeeds without a provider mutation. A terminal `decommissioned` record also succeeds, removes the retained ledger row, and emits no audit event.
 
 A concurrent provision or decommission receives the same lease-acquisition error as `decommissionDeployment()`. A `database-reserved` row has not authorized provider creation, so force decommission removes that reservation without a provider call.
 
@@ -199,7 +199,7 @@ The force path uses persisted resource identities only. It never fetches an arti
 
 Each provider mutation receives the active lease fence. `WranglerLoopBackend` requires route API implementations of both `getDatabase` and `deleteDatabase` before the first D1 lookup. The exact-ID lookup, deletion, and confirmation all run within that route fence; force deletion never falls back to Wrangler. The ledger persists `decommissioning`, `traffic-removed`, `credentials-revoked`, and `database-deleting`, so an interrupted call repeats the incomplete idempotent stage.
 
-Provider 404 responses mean the resource is already absent. After D1 is absent, the function persists `decommissioned`, emits `DecommissionAuditEvent` with `forced: true`, and calls `lease.delete()`. If audit delivery fails, the terminal row remains and a retry emits the event again before deleting the row. Normal decommission uses the same optional event with `forced: false`.
+Provider 404 responses mean the resource is already absent. After D1 is absent, the function persists `decommissioned`, emits `DecommissionAuditEvent` with `forced: true`, and calls `lease.delete()`. If initial audit delivery fails, the terminal row remains. A retry deletes it without repeating provider mutations or redelivering the event. Normal decommission uses the same optional event with `forced: false`.
 
 Force decommission does not delete the ordinary Worker script, application R2 buckets, or control-plane retention data. It removes the deployment’s ingress, live Worker secrets, database, and fleet ownership record. After the call returns, the host deletes its separate retention row and revokes its gateway key. Workers for Platforms fails closed unless its backend implements equivalent spec-free primitives; its dispatch route and trusted-resource topology cannot use the ordinary Worker route API contract.
 

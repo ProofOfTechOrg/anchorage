@@ -2226,10 +2226,14 @@ describe('fleet provisioning', () => {
       spec: spec(),
       secrets,
     });
+    const auditFlags: boolean[] = [];
     await decommissionDeployment({
       backend,
       store: terminalStore,
       spec: spec(),
+      audit: (event) => {
+        auditFlags.push(event.forced);
+      },
     });
     Object.defineProperty(backend, 'forceDecommissionStep', {
       value: undefined,
@@ -2242,11 +2246,17 @@ describe('fleet provisioning', () => {
         store: terminalStore,
         tenantTag: 'acme',
         environment: 'production',
+        options: {
+          audit: (event) => {
+            auditFlags.push(event.forced);
+          },
+        },
       }),
     ).resolves.toBeUndefined();
     expect(terminalStore.leaseCalls).toBe(priorLeaseCalls + 1);
     expect(terminalStore.record).toBeUndefined();
     expect(backend.forceSteps).toEqual([]);
+    expect(auditFlags).toEqual([false]);
   });
 
   it('uses one audit event shape for normal and forced decommission', async () => {
@@ -2388,7 +2398,7 @@ describe('fleet provisioning', () => {
     await expect(force).resolves.toBeUndefined();
   });
 
-  it('retries a completed force teardown when audit delivery fails', async () => {
+  it('silently removes a completed force teardown after audit delivery fails', async () => {
     const backend = new FakeBackend('plain-worker');
     const store = new MemoryStore();
     await provisionDeployment({ backend, store, spec: spec(), secrets });
@@ -2417,7 +2427,7 @@ describe('fleet provisioning', () => {
       'delete-database',
     ]);
     expect(store.record).toBeUndefined();
-    expect(auditAttempts).toBe(2);
+    expect(auditAttempts).toBe(1);
   });
 
   it('rejects a concurrent lifecycle operation for the same deployment', async () => {
