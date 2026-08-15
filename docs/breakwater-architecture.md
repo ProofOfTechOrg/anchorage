@@ -98,7 +98,7 @@ output: model/tools -> app output -> policy output
 
 The durable resume line describes which `processInput` hook runs during rehydration. Before installing the registries, Flowsafe restores the complete input and LLM-request processor lists for later loop hooks. It also restores the same tools, memory, model, application output processors, and mandatory policy output processor as initial preparation. An RBAC denial stops rehydration before registry installation or resumed tool execution.
 
-The call allowlist contains `requestContext`, `runId`, `memory`, and `abortSignal`. Unknown own properties fail even when their value is `undefined`. Construction fixes `maxSteps` and `toolChoice`, enables policy hold-back, and disables background continuations.
+The call allowlist contains `requestContext`, `runId`, `memory`, and `abortSignal`. Calls are copied into frozen allowlisted snapshots, and unknown own properties fail even when their value is `undefined`. Construction fixes `maxSteps` and `toolChoice`, enables policy hold-back, and disables background continuations.
 
 Application input processors may implement only `processInput`. Application output processors must implement both stream and final-result enforcement. Processor workflows and the reserved IDs `breakwater-rbac` and `breakwater-policy-engine` fail construction.
 
@@ -112,7 +112,9 @@ Application input processors may implement only `processInput`. Application outp
 - structured-object stream snapshots;
 - custom synchronous or asynchronous policy evaluators.
 
-Structured-object values are available on Mastra's streaming path. Under the supported Mastra version, non-streaming `generate()` exposes structured output through answer text rather than a separate result object. A policy scoped only to `object` therefore has no non-streaming result coverage; the engine requires an audit sink for that configuration and records the limitation.
+Under the supported Mastra version, structured objects parsed by `generate()` and the chunks core's `StructuredOutputProcessor` emits never pass through the agent's output processors. Mastra also copies a parsed value into messages and may send it to persistence and observability hooks before `generate()` returns. A post-generation wrapper gate is therefore not a containment boundary. The guarded agent rejects structured output before execution and rejects object-only policies at construction. A standalone `PolicyEngine` validates processor-visible object chunks as JSON, evaluates their canonical snapshots, forwards the same canonical clones, and aborts at the result boundary when an object-only policy saw no such chunk.
+
+The guarded handle also carries a versioned host protocol. Flowsafe checks that protocol before durable wrapping and rejects guarded structured output on every durable entry point, preserving the narrow handle's refusal even though Mastra's durable runner invokes the raw agent through processor lists.
 
 ## Streaming behavior
 

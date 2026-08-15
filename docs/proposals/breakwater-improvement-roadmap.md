@@ -36,7 +36,7 @@ testable, and appropriately placed.
 | **Shipped** | Optional connector invocation permissions | `PermissionManifest.requiredPermissions` is enforced against the trusted principal-permissions projection before dry-run and approval — authorization and approval answer different questions |
 | **Shipped** | Secure single-deployment policy preset | `singleTenantConnectorPolicies()` validates durable stores, audit, egress, permission wiring, background policy, and deployment-wide isolation posture |
 | **P1** | Add manifest-conformance tooling and stronger egress posture | Runtime safety depends on honest manifests and use of `runtime.fetch` |
-| **P1** | Close known agent-output enforcement gaps | Structured output and override seams must not silently weaken mandatory policy |
+| **Shipped** | Fail closed on known agent-output enforcement gaps | The guarded handle rejects structured output; processor-visible object chunks are canonicalized and missing required coverage aborts |
 | **P1** | Introduce stable decision codes and richer audit correlation | Reason strings are not a durable API for alerts, metrics, or incident response |
 | **P2** | Add policy bundles, versioning, and drift reporting | Useful once several agents/connectors share centrally managed policy |
 | **P2** | Add stricter rate-limit algorithms and operational maintenance | Fixed windows and durable stores need production-scale alternatives and cleanup |
@@ -461,26 +461,23 @@ Infrastructure must still supply process/container/network controls for raw
 sockets, DNS/IP restrictions, and compromised dependencies. Do not market
 `runtime.fetch` as a complete sandbox.
 
-### 13. Close Agent Output Coverage Gaps
+### 13. Fail Closed on Agent Output Coverage Gaps (shipped)
 
-Known processor/API limitations must remain loud:
+#### Shipped implementation
 
-- Under the pinned Mastra surface, non-streaming structured output does not
+Under the pinned core, parsed `generate()` objects and `StructuredOutputProcessor` chunks bypass output processors. Mastra also copies the parsed value into messages and may send it to memory, tracing, scorers, and logs before `generate()` returns. A post-generation wrapper gate is therefore too late. `createGuardedAgent()` rejects `structuredOutput` on both public methods before model execution and rejects object-only policies at construction. Guarded structured output remains planned until a verified pre-persistence seam exists.
+
+The versioned host protocol lets Flowsafe preserve that refusal even though Mastra's durable runner uses the branded raw agent and processor lists instead of the narrow handle. Flowsafe rejects structured output on its guarded durable stream, generate, and prepare entry points.
+
+For processor-visible object chunks, `PolicyEngine` rejects non-JSON values, evaluates the canonical serialization, and forwards the same canonical clone. An object-only standalone policy requires an audit sink and aborts at the result boundary when no object chunk reached the processor. Hold-back cost is measured by opt-in evidence tests (`BREAKWATER_PERF=1`): a bounded string-pattern window holds only the pattern-bound trailing window regardless of stream size, while any RegExp policy buffers the whole stream; numbers are recorded in [Policy engine](../policy-engine-design.md).
+
+Historical limitations that motivated this section:
+
+- Under the pinned Mastra surface, non-streaming structured output did not
   expose a parsed object to the output-result processor.
-- Object-only policy therefore has weaker non-streaming coverage.
+- Object-only policy therefore had no enforceable guarded non-streaming path.
 - The stream hold-back implementation depends on a Mastra reprocessing state
-  key guarded by compatibility tests.
-
-Improvements:
-
-- Gate the final parsed object in the guarded-agent wrapper when Mastra returns
-  it outside the processor result.
-- Refuse configurations whose chosen invocation mode cannot expose a required
-  channel.
-- Keep an upgrade tripwire around Mastra's processor and stream semantics.
-- Add leak tests proving no forbidden prefix is emitted before a late detector
-  fires.
-- Measure hold-back memory and latency under large streams.
+  key guarded by compatibility tests (still true; unchanged).
 
 ### 14. Add Stable Decision Codes and Safe Error Surfaces
 
@@ -724,7 +721,7 @@ The shipped host deliberately omits a public raw-resume route. It accepts struct
 1. ~~Publish secure policy presets.~~ Shipped as `singleTenantConnectorPolicies()`.
 2. Add connector conformance tests and global-fetch linting.
 3. Generate the manifest/policy coverage report.
-4. Close structured-output policy coverage.
+4. Close structured-output policy coverage. Shipped fail-closed refusal; gated support still requires a pre-persistence seam (see §13).
 5. Add stable decision codes.
 
 ### Phase E: Operations and scale

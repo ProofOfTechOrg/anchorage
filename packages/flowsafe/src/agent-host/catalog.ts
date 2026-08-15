@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { isGuardedAgentHandle } from '@proofoftech/breakwater/agent';
-
+import { breakwaterGuardedAgentHostProtocol } from '../agent-runner/durable-agent-runner.js';
 import { AGENT_ENTRY_PATHS } from '../agent-runner/index.js';
 import {
   type ApprovalRole,
@@ -220,6 +220,11 @@ export function validateAgentModule(module: AgentModule): AgentModule {
   const meta = validateAgentMeta(module.meta);
   if (!isGuardedAgentHandle(module.agent)) {
     fail(`agent '${meta.id}' must be created by createGuardedAgent`);
+  }
+  if (breakwaterGuardedAgentHostProtocol(module.agent) === undefined) {
+    fail(
+      `agent '${meta.id}' was built by a @proofoftech/breakwater without the durable-host protocol; >=0.12.0 is required`,
+    );
   }
   if (module.agent.id !== meta.id) {
     fail(

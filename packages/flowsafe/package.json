@@ -82,8 +82,8 @@
     "prepublishOnly": "pnpm run build"
   },
   "peerDependencies": {
-    "@mastra/core": "^1.50.0",
-    "@proofoftech/breakwater": ">=0.9.0 <1.0.0",
+    "@mastra/core": "1.50.0",
+    "@proofoftech/breakwater": ">=0.12.0 <1.0.0",
     "react": ">=18 <20",
     "react-dom": ">=18 <20"
   },

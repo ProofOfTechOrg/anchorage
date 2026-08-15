@@ -5,6 +5,10 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ApprovalRole } from '../approval-api/index.js';
 import { type AgentMeta, isPermissionIdentifier } from './types.js';
 
+const GUARDED_AGENT_HOST_PROTOCOL = Symbol.for(
+  '@proofoftech/breakwater/guarded-agent-host/v1',
+);
+
 vi.mock('@proofoftech/breakwater/agent', () => ({
   isGuardedAgentHandle: (value: unknown) =>
     typeof value === 'object' &&
@@ -22,6 +26,10 @@ function handle(
 ): GuardedAgentHandle {
   return {
     guarded: true,
+    [GUARDED_AGENT_HOST_PROTOCOL]: {
+      version: 1,
+      supportsDurableStructuredOutput: false,
+    },
     id,
     allowedRoles,
     allowedPrincipalKinds,
@@ -97,6 +105,31 @@ describe('agent catalog', () => {
         },
       ]),
     ).toThrow('metadata roles must exactly match guarded agent roles');
+  });
+
+  it('rejects a guarded handle without the durable-host protocol', () => {
+    const legacy = { ...handle() } as Record<PropertyKey, unknown>;
+    delete legacy[GUARDED_AGENT_HOST_PROTOCOL];
+
+    expect(() =>
+      createAgentModuleCatalog([
+        { meta, agent: legacy as unknown as GuardedAgentHandle },
+      ]),
+    ).toThrow(/without the durable-host protocol.*>=0\.12\.0/);
+  });
+
+  it('rejects an incompatible durable-host protocol', () => {
+    const incompatible = handle() as unknown as Record<PropertyKey, unknown>;
+    incompatible[GUARDED_AGENT_HOST_PROTOCOL] = {
+      version: 1,
+      supportsDurableStructuredOutput: true,
+    };
+
+    expect(() =>
+      createAgentModuleCatalog([
+        { meta, agent: incompatible as unknown as GuardedAgentHandle },
+      ]),
+    ).toThrow(/malformed Breakwater guarded-agent host protocol/);
   });
 });
 

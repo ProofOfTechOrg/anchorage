@@ -34,8 +34,8 @@ Anchorage is not a model provider, identity provider, hosted SaaS, generic proce
 
 Fleet control requires Node 22.22.0 or later. Flowsafe requires Node 22 or
 later. Breakwater requires Node 22.3 or later for its built-in Agent CLI
-executor. All three packages are ESM-only. Breakwater and Flowsafe declare
-`@mastra/core` `^1.50.0` as their peer range. React 18 or 19 is needed only for
+executor. All three packages are ESM-only. Breakwater and Flowsafe require
+`@mastra/core` `1.50.0`. React 18 or 19 is needed only for
 the optional Flowsafe approval UI. Hosts that run `flowsafe-provision` or the
 Fleet Control Wrangler backend must provide Wrangler `>=4.118 <5`; Wrangler is
 not a Flowsafe peer dependency.
@@ -43,7 +43,7 @@ not a Flowsafe peer dependency.
 ## Start with breakwater
 
 ```bash
-npm install @mastra/core@^1.50.0 @proofoftech/breakwater
+npm install @mastra/core@1.50.0 @proofoftech/breakwater
 ```
 
 Create a guarded agent and pass the authenticated actor through Mastra's `RequestContext`:
@@ -139,7 +139,7 @@ explains every permission, required store, and accepted limit:
 ## Add durable approvals
 
 ```bash
-npm install @mastra/core@^1.50.0 @proofoftech/breakwater @proofoftech/flowsafe
+npm install @mastra/core@1.50.0 @proofoftech/breakwater @proofoftech/flowsafe
 ```
 
 Start from the copy-ready baseline Worker in [`packages/flowsafe/deploy/`](packages/flowsafe/deploy/README.md). It wires one Durable Object per run, D1 snapshots and approvals, authenticated run routes, server-derived connector grants, live-streaming opt-in, SLA sweep, retention, audit export, and a sample gated workflow.

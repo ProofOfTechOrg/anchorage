@@ -38,6 +38,7 @@ import {
   type Role,
 } from '@proofoftech/breakwater';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 
 import {
   InvalidRunRequestError,
@@ -122,6 +123,20 @@ function testAgent(id = 'writer'): Agent {
     // runtime, not the LLM, so the agent only has to construct.
     model: 'openai/gpt-4o-mini',
   });
+}
+
+function guardedTestAgent(): Agent {
+  return createGuardedAgent({
+    id: 'writer',
+    name: 'Writer',
+    instructions: 'Answer the request.',
+    model: 'openai/gpt-4o-mini',
+    allowedRoles: ['operator'],
+    policies: [],
+    audit: new AuditLogger(),
+    maxSteps: 2,
+    toolChoice: 'auto',
+  }) as unknown as Agent;
 }
 
 function actorContext(role: Role = 'operator'): RequestContext {
@@ -235,6 +250,10 @@ const INPUT = {
 } as unknown as DurableAgenticWorkflowInput;
 
 describe('createFlowsafeDurableAgent', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('registers the raw agent and durable-agentic-loop workflow on the runtime', () => {
     // #given a runtime with nothing registered
     const { runtime, register, registerAgent } = fakeRuntime();
@@ -276,6 +295,138 @@ describe('createFlowsafeDurableAgent', () => {
     expect(isRuntimeDrivenAgent(testAgent())).toBe(false);
     expect(isRuntimeDrivenAgent({})).toBe(false);
     expect(isRuntimeDrivenAgent(undefined)).toBe(false);
+  });
+
+  it('rejects structured durable methods for a guarded agent before core dispatch', async () => {
+    const { runtime } = fakeRuntime();
+    const durable = createFlowsafeDurableAgent({
+      agent: guardedTestAgent(),
+      runtime,
+    });
+    const schema = z.object({ answer: z.string() });
+    const superStream = vi.spyOn(DurableAgent.prototype, 'stream');
+    const superGenerate = vi.spyOn(DurableAgent.prototype, 'generate');
+    const superPrepare = vi.spyOn(DurableAgent.prototype, 'prepare');
+
+    await expect(
+      durable.stream('hello', {
+        runId: 'run-1',
+        structuredOutput: { schema },
+      } as never),
+    ).rejects.toThrow(/structuredOutput is not supported.*guarded agent/is);
+    await expect(
+      durable.generate('hello', {
+        runId: 'run-1',
+        structuredOutput: { schema },
+      } as never),
+    ).rejects.toThrow(/structuredOutput is not supported.*guarded agent/is);
+    await expect(
+      durable.prepare('hello', {
+        runId: 'run-1',
+        structuredOutput: { schema },
+      } as never),
+    ).rejects.toThrow(/structuredOutput is not supported.*guarded agent/is);
+    expect(superStream).not.toHaveBeenCalled();
+    expect(superGenerate).not.toHaveBeenCalled();
+    expect(superPrepare).not.toHaveBeenCalled();
+
+    await expect(
+      durable.generate('hello', {
+        runId: 'run-1',
+        structuredOutput: undefined,
+      } as never),
+    ).rejects.toThrow(/structuredOutput is not supported.*guarded agent/is);
+    expect(superGenerate).not.toHaveBeenCalled();
+  });
+
+  it('snapshots durable call options before delegating to core', async () => {
+    const { runtime } = fakeRuntime();
+    const durable = createFlowsafeDurableAgent({
+      agent: guardedTestAgent(),
+      runtime,
+    });
+    const superStream = vi
+      .spyOn(DurableAgent.prototype, 'stream')
+      .mockResolvedValue({ output: {} } as never);
+    const superGenerate = vi
+      .spyOn(DurableAgent.prototype, 'generate')
+      .mockResolvedValue({} as never);
+    const superPrepare = vi
+      .spyOn(DurableAgent.prototype, 'prepare')
+      .mockResolvedValue({} as never);
+
+    for (const [method, coreMethod] of [
+      ['stream', superStream],
+      ['generate', superGenerate],
+      ['prepare', superPrepare],
+    ] as const) {
+      const options: Record<string, unknown> = { runId: 'run-1' };
+      const pending = (
+        durable[method] as unknown as (
+          messages: string,
+          options: Record<string, unknown>,
+        ) => Promise<unknown>
+      )('hello', options);
+      options.runId = 'mutated-run';
+      options.structuredOutput = { schema: z.object({ answer: z.string() }) };
+
+      await expect(pending).resolves.toBeDefined();
+      const forwarded = coreMethod.mock.calls.at(-1)?.[1] as
+        | Record<string, unknown>
+        | undefined;
+      expect(forwarded).toEqual({ runId: 'run-1' });
+      expect(forwarded).not.toBe(options);
+      expect(Object.isFrozen(forwarded)).toBe(true);
+    }
+  });
+
+  it.each([
+    'stream',
+    'generate',
+    'prepare',
+  ] as const)('rejects accessor-backed %s options without invoking the accessor', async (method) => {
+    const { runtime } = fakeRuntime();
+    const durable = createFlowsafeDurableAgent({
+      agent: guardedTestAgent(),
+      runtime,
+    });
+    const structuredOutput = vi.fn(() => undefined);
+    const options = { runId: 'run-1' } as Record<string, unknown>;
+    Object.defineProperty(options, 'structuredOutput', {
+      enumerable: true,
+      get: structuredOutput,
+    });
+
+    await expect(
+      (
+        durable[method] as unknown as (
+          messages: string,
+          options: Record<string, unknown>,
+        ) => Promise<unknown>
+      )('hello', options),
+    ).rejects.toThrow(/structuredOutput.*data property/);
+    expect(structuredOutput).not.toHaveBeenCalled();
+  });
+
+  it('rejects an accessor-backed runId without reading it or delegating', async () => {
+    const { runtime } = fakeRuntime();
+    const durable = createFlowsafeDurableAgent({
+      agent: guardedTestAgent(),
+      runtime,
+    });
+    const superGenerate = vi.spyOn(DurableAgent.prototype, 'generate');
+    const runId = vi.fn(() => 'run-1');
+    const options: Record<string, unknown> = {};
+    Object.defineProperty(options, 'runId', {
+      enumerable: true,
+      get: runId,
+    });
+
+    await expect(durable.generate('hello', options as never)).rejects.toThrow(
+      /runId.*data property/,
+    );
+    expect(runId).not.toHaveBeenCalled();
+    expect(superGenerate).not.toHaveBeenCalled();
   });
 });
 
@@ -322,6 +473,57 @@ describe('FlowsafeDurableAgent.executeWorkflow', () => {
 });
 
 describe('FlowsafeDurableAgent.streamUntilPersisted', () => {
+  it('snapshots call options before installing persistence state', async () => {
+    const { runtime } = fakeRuntime();
+    const agent = createFlowsafeDurableAgent({
+      agent: guardedTestAgent(),
+      runtime,
+    });
+    const failure = new Error('stream unavailable');
+    const stream = vi.spyOn(agent, 'stream').mockRejectedValue(failure);
+    const options: Record<string, unknown> = { runId: 'run-1' };
+
+    const pending = agent.streamUntilPersisted(
+      'hello',
+      options as never,
+      'operator-1',
+      'human',
+    );
+    options.runId = 'mutated-run';
+    options.structuredOutput = { schema: z.object({ answer: z.string() }) };
+
+    await expect(pending).rejects.toBe(failure);
+    expect(stream).toHaveBeenCalledOnce();
+    expect(stream.mock.calls[0]?.[1]).toMatchObject({ runId: 'run-1' });
+    expect(stream.mock.calls[0]?.[1]).not.toHaveProperty('structuredOutput');
+  });
+
+  it('rejects accessor-backed call options before installing persistence state', async () => {
+    const { runtime } = fakeRuntime();
+    const agent = createFlowsafeDurableAgent({
+      agent: guardedTestAgent(),
+      runtime,
+    });
+    const stream = vi.spyOn(agent, 'stream');
+    const structuredOutput = vi.fn(() => undefined);
+    const options = { runId: 'run-1' } as Record<string, unknown>;
+    Object.defineProperty(options, 'structuredOutput', {
+      enumerable: true,
+      get: structuredOutput,
+    });
+
+    await expect(
+      agent.streamUntilPersisted(
+        'hello',
+        options as never,
+        'operator-1',
+        'human',
+      ),
+    ).rejects.toThrow(/structuredOutput.*data property/);
+    expect(structuredOutput).not.toHaveBeenCalled();
+    expect(stream).not.toHaveBeenCalled();
+  });
+
   it('does not resolve until the runtime has persisted the first summary', async () => {
     const { runtime, start } = fakeRuntime();
     let releaseStart!: () => void;

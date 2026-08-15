@@ -664,7 +664,7 @@ describe('piiSecrets', () => {
       // #when — the clean partial passes...
       await expect(
         engine.processOutputStream(makeStreamArgs([clean], state)),
-      ).resolves.toBe(clean);
+      ).resolves.toStrictEqual(clean);
 
       // #then — the REPLACEMENT snapshot (not a delta) is fully rescanned
       await expect(
@@ -776,8 +776,8 @@ describe('classifierPolicy', () => {
             evaluateEveryChars: 10_000,
           }),
         ],
-        // The D1 guard: an object-only policy needs a sink to carry the
-        // one-time non-streaming-result coverage warning.
+        // The D1 guard: an object-only policy needs a sink to record a
+        // fail-closed result-phase coverage error when no object is observed.
         audit: new AuditLogger(),
       });
       const state: Record<string, unknown> = {};

@@ -26,7 +26,13 @@ interface PolicyEvaluator {
 
 Each decision is either `{ allowed: true }` or `{ allowed: false, reason }`. An evaluator exception is a policy-engine failure, is audited as an error, and fails the request closed.
 
-Policies run in array order. The first denial aborts the phase.
+Policies run in array order. The engine snapshots the list and each evaluator's
+name, phase/channel selectors, hold-back hint, and evaluator reference at
+construction. Class-based evaluators keep their original receiver, so private
+fields and helper methods continue to work. Later replacement of the evaluator
+method or mutation of caller-owned selector arrays does not change enforcement;
+mutable state owned by the evaluator instance or its closures remains the
+application's responsibility. The first denial aborts the phase.
 
 ## Phases and channels
 
@@ -36,11 +42,11 @@ Input processing joins textual message parts and evaluates them under the `answe
 | --- | --- |
 | `answer` | Client-visible answer text |
 | `reasoning` | Reasoning stream deltas |
-| `object` | JSON-stringified structured-output snapshots |
+| `object` | Canonical JSON structured-output snapshots |
 
 A policy defaults to both phases and the `answer` channel. Set `phases` and `channels` when a policy applies more narrowly.
 
-Mastra exposes structured objects to the processor on the streaming path. Under the supported core version, the non-streaming output result has no separate object field. JSON carried in answer text is still inspected by policies that include `answer`; an object-only policy has no final `generate()` coverage.
+Under the supported core version, the engine sees the `object` channel only for object chunks that flow through the processor chain (model-native streaming). It requires those values to be JSON data, evaluates the canonical serialization, and forwards the same canonical clone. A `generate()` result's parsed object and core's `StructuredOutputProcessor` chunks never pass through the chain, and Mastra may expose the parsed value before `generate()` returns. `createGuardedAgent` therefore rejects structured output and rejects object-only policies at construction. JSON carried in answer text is still inspected by policies that include `answer`. A standalone engine with an object-only policy requires an audit sink and aborts at the result boundary unless a processor-visible object chunk provided coverage.
 
 ## Built-in content policies
 
@@ -104,6 +110,8 @@ Properties:
 - A finite pattern policy can provide its maximum match span minus one.
 - A classifier that must see the full output should opt into `holdBackChars: Infinity`, accepting full buffering.
 - Hold-back changes delta boundaries. Consumers must treat text deltas as chunks, not semantic tokens.
+
+Measured cost (2026-08-15, Node 22.22.0, `@mastra/core` 1.50.0; opt-in evidence tests in `packages/breakwater/src/policy-engine/policy-engine.test.ts`, run with `BREAKWATER_PERF=1`): a 4 MB stream in 2 KB deltas against string-pattern policies processes at roughly 1 MB/s including per-chunk harness overhead, with peak held text of 17 characters — the pattern-bound window, not the stream length. Any RegExp policy forces the unbounded window: a 1 MB stream keeps all of it pending and releases nothing until the channel ends. Prefer string patterns, overriding `holdBackChars` when the match bound is known, for large-stream leak prevention.
 
 ## Tool policy
 

@@ -30,7 +30,7 @@ write.
 
 `createGuardedAgent()` is the supported in-process boundary for protected agent execution. It accepts construction-time agent configuration instead of an existing raw `Agent`, then returns a narrow handle with unstructured `generate()` and `stream()` methods.
 
-The factory fixes the step budget and tool choice, requires an audit logger, forces streaming policy hold-back, and disables agent background continuations. A call must include trusted `requestContext`; the only other accepted keys are `runId`, `memory`, and `abortSignal`. Unknown keys fail even when their value is `undefined`.
+The factory fixes the step budget and tool choice, requires an audit logger, forces streaming policy hold-back, and disables agent background continuations. A call must include trusted `requestContext`; the only other accepted top-level keys are `runId`, `memory`, and `abortSignal`. Unknown keys, including `structuredOutput`, fail even when their value is `undefined`.
 
 The direct path authorizes before application processors run. Durable preparation lists the same gates in this order:
 

@@ -88,6 +88,75 @@ import {
  */
 export const DURABLE_AGENTIC_LOOP_WORKFLOW_ID = 'durable-agentic-loop';
 
+const BREAKWATER_GUARDED_AGENT_HOST_PROTOCOL = Symbol.for(
+  '@proofoftech/breakwater/guarded-agent-host/v1',
+);
+
+interface BreakwaterGuardedAgentHostProtocol {
+  readonly version: 1;
+  readonly supportsDurableStructuredOutput: false;
+}
+
+function snapshotDurableCallOptions<T extends object>(options: T): T;
+function snapshotDurableCallOptions(options: undefined): undefined;
+function snapshotDurableCallOptions<T extends object>(
+  options: T | undefined,
+): T | undefined;
+function snapshotDurableCallOptions<T extends object>(
+  options: T | undefined,
+): T | undefined {
+  if (options === undefined) return undefined;
+  if (
+    options === null ||
+    typeof options !== 'object' ||
+    Array.isArray(options)
+  ) {
+    throw new TypeError('FlowsafeDurableAgent: call options must be an object');
+  }
+  const snapshot: Record<PropertyKey, unknown> = {};
+  for (const key of Reflect.ownKeys(options)) {
+    const descriptor = Object.getOwnPropertyDescriptor(options, key);
+    if (!descriptor) continue;
+    if (descriptor.get || descriptor.set) {
+      throw new TypeError(
+        `FlowsafeDurableAgent: call option '${String(key)}' must be a data property`,
+      );
+    }
+    Object.defineProperty(snapshot, key, {
+      configurable: false,
+      enumerable: descriptor.enumerable,
+      value: descriptor.value,
+      writable: false,
+    });
+  }
+  return Object.freeze(snapshot) as T;
+}
+
+/** @internal Shared with the guarded agent catalog's compatibility check. */
+export function breakwaterGuardedAgentHostProtocol(
+  agent: unknown,
+): BreakwaterGuardedAgentHostProtocol | undefined {
+  if ((typeof agent !== 'object' && typeof agent !== 'function') || !agent) {
+    return undefined;
+  }
+  const protocol = (agent as Record<symbol, unknown>)[
+    BREAKWATER_GUARDED_AGENT_HOST_PROTOCOL
+  ];
+  if (protocol === undefined) return undefined;
+  if (
+    !protocol ||
+    typeof protocol !== 'object' ||
+    (protocol as { version?: unknown }).version !== 1 ||
+    (protocol as { supportsDurableStructuredOutput?: unknown })
+      .supportsDurableStructuredOutput !== false
+  ) {
+    throw new TypeError(
+      'FlowsafeDurableAgent: malformed Breakwater guarded-agent host protocol',
+    );
+  }
+  return protocol as BreakwaterGuardedAgentHostProtocol;
+}
+
 function bindThreadCompletion<T extends object>(
   output: T,
   completion: Promise<void>,
@@ -205,6 +274,7 @@ export class FlowsafeDurableAgent<
   readonly [RUNTIME_DRIVEN_AGENT] = true;
   readonly #runtime: RunnerRuntime;
   readonly #wrappedAgent: Agent<TAgentId, TTools, TOutput>;
+  readonly #isBreakwaterGuardedAgent: boolean;
   readonly #threadRuntime?: Mastra['agentThreadStreamRuntime'];
   readonly #persistenceWaiters = new Map<
     string,
@@ -222,6 +292,7 @@ export class FlowsafeDurableAgent<
   >();
 
   constructor(options: FlowsafeDurableAgentOptions<TAgentId, TTools, TOutput>) {
+    const guardedProtocol = breakwaterGuardedAgentHostProtocol(options.agent);
     super({
       agent: options.agent,
       id: options.id,
@@ -238,6 +309,7 @@ export class FlowsafeDurableAgent<
     });
     this.#runtime = options.runtime;
     this.#wrappedAgent = options.agent;
+    this.#isBreakwaterGuardedAgent = guardedProtocol !== undefined;
     this.#threadRuntime = options.threadRuntime;
   }
 
@@ -264,6 +336,19 @@ export class FlowsafeDurableAgent<
     }
   }
 
+  #assertGuardedStructuredOutput(options: unknown): void {
+    if (
+      this.#isBreakwaterGuardedAgent &&
+      options !== null &&
+      typeof options === 'object' &&
+      Object.hasOwn(options, 'structuredOutput')
+    ) {
+      throw new TypeError(
+        'FlowsafeDurableAgent: structuredOutput is not supported for a Breakwater guarded agent because Mastra durable execution bypasses the narrow guarded handle',
+      );
+    }
+  }
+
   /**
    * Enforce a caller-minted run ID before the inherited durable
    * `stream()` runs: without this the
@@ -278,15 +363,17 @@ export class FlowsafeDurableAgent<
   ): Promise<
     Awaited<ReturnType<DurableAgent<TAgentId, TTools, TOutput>['stream']>>
   > {
-    this.#assertCallerRunId(options?.runId);
-    const result = await super.stream(messages, options);
-    if (!options?.untilIdle) {
+    const callOptions = snapshotDurableCallOptions(options);
+    this.#assertCallerRunId(callOptions?.runId);
+    this.#assertGuardedStructuredOutput(callOptions);
+    const result = await super.stream(messages, callOptions);
+    if (!callOptions?.untilIdle) {
       await this.#threadRuntime?.registerRun(
         this as unknown as Parameters<
           Mastra['agentThreadStreamRuntime']['registerRun']
         >[0],
         result.output,
-        (options ?? {}) as Parameters<
+        (callOptions ?? {}) as Parameters<
           Mastra['agentThreadStreamRuntime']['registerRun']
         >[2],
         this.pubsub,
@@ -318,14 +405,16 @@ export class FlowsafeDurableAgent<
   ): Promise<
     Awaited<ReturnType<DurableAgent<TAgentId, TTools, TOutput>['stream']>>
   > {
-    this.#assertCallerRunId(options.runId);
+    const callOptions = snapshotDurableCallOptions(options);
+    this.#assertCallerRunId(callOptions?.runId);
+    this.#assertGuardedStructuredOutput(callOptions);
     if (!isExecutionPrincipalId(requestedBy)) {
       throw new InvalidRunRequestError('requestedBy is malformed');
     }
     if (!isExecutionPrincipalKind(requestedByKind)) {
       throw new InvalidRunRequestError('requestedByKind is malformed');
     }
-    const runId = options.runId;
+    const runId = callOptions.runId;
     if (this.#persistenceWaiters.has(runId)) {
       throw new InvalidRunRequestError(
         `run '${runId}' already has a pending durable start`,
@@ -345,10 +434,10 @@ export class FlowsafeDurableAgent<
     if (scheduleDispatch) {
       this.#startScheduleDispatches.set(runId, scheduleDispatch);
     }
-    const onError = options.onError;
+    const onError = callOptions.onError;
     try {
       const result = await this.stream(messages, {
-        ...options,
+        ...callOptions,
         onError: async (data) => {
           reject(
             data.error instanceof Error
@@ -385,8 +474,10 @@ export class FlowsafeDurableAgent<
   ): Promise<
     Awaited<ReturnType<DurableAgent<TAgentId, TTools, TOutput>['generate']>>
   > {
-    this.#assertCallerRunId(options?.runId);
-    return super.generate(messages, options);
+    const callOptions = snapshotDurableCallOptions(options);
+    this.#assertCallerRunId(callOptions?.runId);
+    this.#assertGuardedStructuredOutput(callOptions);
+    return super.generate(messages, callOptions);
   }
 
   /**
@@ -406,8 +497,10 @@ export class FlowsafeDurableAgent<
   ): Promise<
     Awaited<ReturnType<DurableAgent<TAgentId, TTools, TOutput>['prepare']>>
   > {
-    this.#assertCallerRunId(options?.runId);
-    return super.prepare(messages, options);
+    const callOptions = snapshotDurableCallOptions(options);
+    this.#assertCallerRunId(callOptions?.runId);
+    this.#assertGuardedStructuredOutput(callOptions);
+    return super.prepare(messages, callOptions);
   }
 
   async #rehydrateRegistry(options: {

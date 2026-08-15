@@ -47,7 +47,7 @@
     "prepublishOnly": "pnpm run build"
   },
   "peerDependencies": {
-    "@mastra/core": "^1.50.0"
+    "@mastra/core": "1.50.0"
   },
   "dependencies": {
     "zod": "^4.4.3"
