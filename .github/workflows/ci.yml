@@ -133,10 +133,10 @@ jobs:
 
   # Mastra compat matrix: the libraries pin behavioral contracts to
   # @mastra/core internals (resume-context merge-over semantics, snapshot
-  # shape, the reprocess-part key, the six-table inventory). The peer range
-  # (^1.50.0) admits any 1.x, so run the library suites against the newest
-  # published 1.x -- drift becomes a CI signal here instead of a consumer's
-  # runtime surprise. The tripwire tests (runtime.test.ts merge pin,
+  # shape, the reprocess-part key, the six-table inventory). The supported
+  # peer is exactly 1.50.0; run the library suites against the newest
+  # published 1.x as a signal for a deliberate future compatibility update.
+  # The tripwire tests (runtime.test.ts merge pin,
   # ProcessorRunner reprocess-key probe, mastra-schema-guard) are the teeth.
   mastra-compat:
     runs-on: ubuntu-latest

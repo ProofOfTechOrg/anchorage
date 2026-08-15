@@ -41,6 +41,9 @@ const mocked = vi.hoisted(() => ({
   getHistory: vi.fn(),
 }));
 const RESOURCE_ID = resourceIdFromKey('acme_thread');
+const GUARDED_AGENT_HOST_PROTOCOL = Symbol.for(
+  '@proofoftech/breakwater/guarded-agent-host/v1',
+);
 
 vi.mock('@proofoftech/breakwater/agent', () => ({
   isGuardedAgentHandle: (value: unknown) =>
@@ -132,6 +135,10 @@ function guarded(
 ): GuardedAgentHandle {
   return {
     guarded: true,
+    [GUARDED_AGENT_HOST_PROTOCOL]: {
+      version: 1,
+      supportsDurableStructuredOutput: false,
+    },
     id,
     allowedRoles: ['operator'],
     allowedPrincipalKinds: ['human', ...automationKinds],

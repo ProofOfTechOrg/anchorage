@@ -70,7 +70,7 @@ try {
   );
   assert.equal(manifest.dependencies?.zod, '^4.4.3');
   assert.equal(manifest.devDependencies?.zod, undefined);
-  assert.equal(manifest.peerDependencies?.['@mastra/core'], '^1.50.0');
+  assert.equal(manifest.peerDependencies?.['@mastra/core'], '1.50.0');
   for (const documentation of [
     'README.md',
     'CONNECTORS.md',
@@ -133,6 +133,7 @@ try {
   CONNECTOR_GRANTS_CONTEXT_KEY,
   createGuardedAgent,
   createCodexConnector,
+  GUARDED_AGENT_HOST_PROTOCOL,
   inspectLegacyConnectorIdempotency,
   migrateLegacyConnectorIdempotency,
   singleTenantConnectorPolicies,
@@ -140,11 +141,14 @@ try {
   type AgentCliErrorMetadata,
   type ConnectorApprovalGrant,
   type ConnectorExecutionIdentity,
+  type GuardedAgentCallOptions,
   type GuardedAgentHandle,
+  type GuardedAgentHostProtocol,
   type LegacyConnectorIdempotencyMigrationRequest,
   type LegacyConnectorIdempotencyMigrationResult,
   type SingleTenantConnectorPoliciesOptions,
 } from '@proofoftech/breakwater';
+import type { RequestContext } from '@mastra/core/request-context';
 import { isGuardedAgentHandle } from '@proofoftech/breakwater/agent';
 import {
   connectorManifest,
@@ -231,6 +235,18 @@ const guarded: GuardedAgentHandle = createGuardedAgent({
   maxSteps: 1,
   toolChoice: 'none',
 });
+const guardedProtocol: GuardedAgentHostProtocol =
+  guarded[GUARDED_AGENT_HOST_PROTOCOL];
+function checkGuardedCallOptions(
+  handle: GuardedAgentHandle,
+  options: GuardedAgentCallOptions,
+  requestContext: RequestContext,
+): void {
+  void handle.generate('hello', options);
+  void handle.stream('hello', options);
+  // @ts-expect-error structured output is intentionally unavailable.
+  void handle.generate('hello', { requestContext, structuredOutput: {} });
+}
 const tool = createCodexConnector({ exec: async () => ({
   stdout: 'ok',
   stderr: '',
@@ -256,6 +272,8 @@ void migrationResult;
 void preset;
 void presetFromSubpath;
 void isGuardedAgentHandle(guarded);
+void guardedProtocol;
+void checkGuardedCallOptions;
 void isPermissionIdentifier(permission);
 void isPrincipalPermissions(projection);
 void metadata;

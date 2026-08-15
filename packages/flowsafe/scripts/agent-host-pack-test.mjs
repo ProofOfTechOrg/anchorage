@@ -80,7 +80,7 @@ try {
     readFileSync(join(packageRoot, 'package.json'), 'utf8'),
   );
   assert.equal(manifest.dependencies['@mastra/cloudflare-d1'], '1.1.1');
-  assert.equal(manifest.peerDependencies['@mastra/core'], '^1.50.0');
+  assert.equal(manifest.peerDependencies['@mastra/core'], '1.50.0');
   assert.equal(manifest.dependencies.jose, sourceManifest.dependencies.jose);
   assert.equal(
     manifest.peerDependencies['@proofoftech/breakwater'],

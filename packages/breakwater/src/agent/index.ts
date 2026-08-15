@@ -39,6 +39,17 @@ const GUARDED_CALL_OPTION_KEYS = new Set([
   'abortSignal',
 ]);
 
+/** Well-known inter-package key for guarded host compatibility metadata. */
+export const GUARDED_AGENT_HOST_PROTOCOL = Symbol.for(
+  '@proofoftech/breakwater/guarded-agent-host/v1',
+);
+
+/** Runtime metadata consumed by hosts that cannot call the narrow handle. */
+export interface GuardedAgentHostProtocol {
+  readonly version: 1;
+  readonly supportsDurableStructuredOutput: false;
+}
+
 const UNSAFE_CONSTRUCTION_KEYS = new Set([
   'agent',
   'inputProcessors',
@@ -220,6 +231,8 @@ export interface GuardedAgentHandle {
   readonly allowedPrincipalKinds: readonly PrincipalKind[];
   /** Fixed maximum execution steps. */
   readonly maxSteps: number;
+  /** Host compatibility metadata; not an alternate execution surface. */
+  readonly [GUARDED_AGENT_HOST_PROTOCOL]: GuardedAgentHostProtocol;
 
   /** Generate one unstructured result through all mandatory gates. */
   generate(
@@ -409,7 +422,8 @@ function guardedCallOptions(options: unknown): GuardedAgentCallOptions {
         `GuardedAgent: call option '${String(key)}' is not allowed`,
       );
     }
-    if (Object.getOwnPropertyDescriptor(options, key)?.get) {
+    const descriptor = Object.getOwnPropertyDescriptor(options, key);
+    if (descriptor?.get || descriptor?.set) {
       throw new TypeError(
         `GuardedAgent: call option '${key}' must be a data property`,
       );
@@ -424,7 +438,14 @@ function guardedCallOptions(options: unknown): GuardedAgentCallOptions {
   if (candidate.runId !== undefined && typeof candidate.runId !== 'string') {
     throw new TypeError('GuardedAgent: runId must be a string');
   }
-  return candidate as GuardedAgentCallOptions;
+  return Object.freeze({
+    requestContext: candidate.requestContext,
+    ...(candidate.runId !== undefined ? { runId: candidate.runId } : {}),
+    ...(candidate.memory !== undefined ? { memory: candidate.memory } : {}),
+    ...(candidate.abortSignal !== undefined
+      ? { abortSignal: candidate.abortSignal }
+      : {}),
+  });
 }
 
 function directAuthorizationError(reason: string): never {
@@ -439,6 +460,7 @@ class GuardedAgent<
   readonly allowedRoles: readonly Role[];
   readonly allowedPrincipalKinds: readonly PrincipalKind[];
   readonly maxSteps: number;
+  readonly [GUARDED_AGENT_HOST_PROTOCOL]: GuardedAgentHostProtocol;
   readonly #audit: AuditLogger;
   readonly #applicationInputProcessors: readonly GuardedInputProcessor[];
   readonly #applicationOutputProcessors: readonly GuardedOutputProcessor[];
@@ -489,6 +511,11 @@ class GuardedAgent<
       holdBack: true,
       resource: `agent:${options.id}`,
     });
+    if (policy.objectOnlyPolicyNames.length > 0) {
+      throw new TypeError(
+        `createGuardedAgent: object-only polic${policy.objectOnlyPolicyNames.length === 1 ? 'y' : 'ies'} [${policy.objectOnlyPolicyNames.join(', ')}] cannot be enforced because guarded structured output is unavailable under tested @mastra/core 1.50.0; include 'answer' in each affected policy's channels`,
+      );
+    }
     const rbac = new RBACMiddleware({
       allowedRoles,
       allowedPrincipalKinds,
@@ -512,6 +539,10 @@ class GuardedAgent<
     this.allowedRoles = allowedRoles;
     this.allowedPrincipalKinds = allowedPrincipalKinds;
     this.maxSteps = maxSteps;
+    this[GUARDED_AGENT_HOST_PROTOCOL] = Object.freeze({
+      version: 1,
+      supportsDurableStructuredOutput: false,
+    });
     this.#audit = audit;
     this.#applicationInputProcessors = applicationInputProcessors;
     this.#applicationOutputProcessors = applicationOutputProcessors;

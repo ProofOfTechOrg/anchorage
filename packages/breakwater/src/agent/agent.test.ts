@@ -15,6 +15,8 @@ import { denyPatterns, type PolicyEvaluator } from '../policy-engine/index.js';
 import { ACTOR_CONTEXT_KEY, type PrincipalKind } from '../rbac/index.js';
 import {
   createGuardedAgent,
+  GUARDED_AGENT_HOST_PROTOCOL,
+  type GuardedAgentCallOptions,
   type GuardedAgentConfig,
   type GuardedAgentHandle,
   type GuardedInputProcessor,
@@ -27,6 +29,22 @@ const usage = {
   outputTokens: 1,
   totalTokens: 2,
 };
+
+class PrivateFieldPolicy implements PolicyEvaluator {
+  readonly name = 'private-field-policy';
+  readonly phases = ['output'] as const;
+  readonly #blocked: string;
+
+  constructor(blocked: string) {
+    this.#blocked = blocked;
+  }
+
+  evaluate({ text }: Parameters<PolicyEvaluator['evaluate']>[0]) {
+    return text.includes(this.#blocked)
+      ? { allowed: false as const, reason: 'matched private field' }
+      : { allowed: true as const };
+  }
+}
 
 function testModel(
   text = 'model answer',
@@ -222,6 +240,48 @@ describe('createGuardedAgent direct execution', () => {
       'application-output-result',
       'policy-output-result',
     ]);
+  });
+
+  it('keeps guarded policy enforcement independent of caller mutations', async () => {
+    const phases: Array<'input' | 'output'> = ['output'];
+    const channels: Array<'answer' | 'object'> = ['answer'];
+    const policy = denyPatterns(['blocked'], { phases, channels });
+    const policies = [policy];
+    const agent = guarded({
+      model: testModel('blocked output'),
+      policies,
+    });
+
+    policies.length = 0;
+    phases[0] = 'input';
+    channels[0] = 'object';
+    policy.name = 'mutated';
+    policy.evaluate = () => ({ allowed: true });
+
+    const result = await agent.generate('hello', {
+      requestContext: actorContext(),
+    });
+
+    expect(result.finishReason).toBe('other');
+    expect(result.tripwire?.reason).toMatch(/deny-patterns/);
+  });
+
+  it('preserves a class policy receiver through guarded execution', async () => {
+    const policy = new PrivateFieldPolicy('blocked');
+    const agent = guarded({
+      model: testModel('blocked output'),
+      policies: [policy],
+    });
+    policy.evaluate = () => ({ allowed: true });
+
+    const result = await agent.generate('hello', {
+      requestContext: actorContext(),
+    });
+
+    expect(result.finishReason).toBe('other');
+    expect(result.tripwire?.reason).toMatch(
+      /private-field-policy: matched private field/,
+    );
   });
 
   it('withholds denied streamed output before it reaches the consumer', async () => {
@@ -938,14 +998,52 @@ describe('Mastra Agent execution-entry inventory', () => {
   });
 });
 
+describe('createGuardedAgent structured output boundary', () => {
+  it.each([
+    'generate',
+    'stream',
+  ] as const)('refuses structuredOutput on %s before model execution', async (method) => {
+    const modelCall = vi.fn();
+    const agent = guarded({ model: testModel('unreachable', modelCall) });
+    const options = {
+      requestContext: actorContext(),
+      structuredOutput: { schema: {} },
+    };
+
+    await expect(
+      (
+        agent[method] as (
+          messages: string,
+          callOptions: unknown,
+        ) => Promise<unknown>
+      )('hello', options),
+    ).rejects.toThrowError(/structuredOutput.*not allowed/);
+    expect(modelCall).not.toHaveBeenCalled();
+  });
+
+  it('rejects object-only policies at construction', () => {
+    expect(() =>
+      guarded({
+        policies: [denyPatterns(['blocked'], { channels: ['object'] })],
+      }),
+    ).toThrowError(/object-only policy.*cannot be enforced/is);
+  });
+});
+
 function compileTimeSurface(
   handle: GuardedAgentHandle,
   requestContext: RequestContext,
 ): void {
   if (Date.now() < 0) {
     void handle.generate('hello', { requestContext });
+    const options: GuardedAgentCallOptions = { requestContext };
+    void handle.generate('hello', options);
+    void handle.stream('hello', options);
     // @ts-expect-error Structured output is intentionally unavailable.
     void handle.generate('hello', { requestContext, structuredOutput: {} });
+    // @ts-expect-error Structured output is intentionally unavailable.
+    void handle.stream('hello', { requestContext, structuredOutput: {} });
+    void handle[GUARDED_AGENT_HOST_PROTOCOL].supportsDurableStructuredOutput;
     // @ts-expect-error Raw resume is intentionally unavailable.
     void handle.resumeStream({}, { requestContext });
     // @ts-expect-error Standalone durable resume is intentionally unavailable.

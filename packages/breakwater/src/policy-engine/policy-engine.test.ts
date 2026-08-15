@@ -25,6 +25,22 @@ import {
 
 class Tripwire extends Error {}
 
+class PrivateFieldPolicy implements PolicyEvaluator {
+  readonly name = 'private-field-policy';
+  readonly phases = ['output'] as const;
+  readonly #blocked: string;
+
+  constructor(blocked: string) {
+    this.#blocked = blocked;
+  }
+
+  evaluate({ text }: Parameters<PolicyEvaluator['evaluate']>[0]) {
+    return text.includes(this.#blocked)
+      ? { allowed: false as const, reason: 'matched private field' }
+      : { allowed: true as const };
+  }
+}
+
 let messageSeq = 0;
 
 function makeMessage(
@@ -396,8 +412,8 @@ describe('PolicyEngine constructor validation (K2)', () => {
   });
 
   it('rejects an object-only policy constructed without an audit sink (D1)', () => {
-    // #given — channels include 'object' but not 'answer': zero result-phase
-    // coverage AND no sink to carry the one-time warning, so the gap is silent
+    // #given — channels include 'object' but not 'answer', and no sink can
+    // record the fail-closed coverage error if an invocation exposes no object
     const policy: PolicyEvaluator = {
       name: 'object-only',
       channels: ['object'],
@@ -411,7 +427,7 @@ describe('PolicyEngine constructor validation (K2)', () => {
   });
 
   it('allows an object-only policy when an audit sink is provided (D1)', () => {
-    // #given — the same policy, now with a sink to carry the one-time warning
+    // #given — the same policy, now with a sink for coverage errors
     const audit = new AuditLogger();
     const policy: PolicyEvaluator = {
       name: 'object-only',
@@ -422,10 +438,48 @@ describe('PolicyEngine constructor validation (K2)', () => {
     // #when / #then
     expect(() => new PolicyEngine({ policies: [policy], audit })).not.toThrow();
   });
+
+  it('snapshots the policy list and decision-driving policy fields', async () => {
+    const phases: Array<'input' | 'output'> = ['output'];
+    const channels: Array<'answer' | 'object'> = ['answer'];
+    const policy = denyPatterns(['blocked'], { phases, channels });
+    const policies = [policy];
+    const engine = new PolicyEngine({ policies });
+
+    policies.length = 0;
+    phases[0] = 'input';
+    channels[0] = 'object';
+    policy.name = 'mutated';
+    policy.evaluate = () => ({ allowed: true });
+
+    await expect(
+      engine.processOutputResult(makeOutputArgs('blocked')),
+    ).rejects.toThrowError(/deny-patterns: matched blocked pattern/);
+  });
+
+  it('snapshots hold-back hints before caller mutation', async () => {
+    const policy = denyPatterns(['blocked'], { phases: ['output'] });
+    const engine = new PolicyEngine({ policies: [policy], holdBack: true });
+    policy.holdBackChars = 0;
+
+    await expect(
+      engine.processOutputStream(makeStreamArgs([textDelta('clean')], {})),
+    ).resolves.toBeNull();
+  });
+
+  it('preserves a class evaluator receiver while capturing its method', async () => {
+    const policy = new PrivateFieldPolicy('blocked');
+    const engine = new PolicyEngine({ policies: [policy] });
+    policy.evaluate = () => ({ allowed: true });
+
+    await expect(
+      engine.processOutputResult(makeOutputArgs('blocked')),
+    ).rejects.toThrowError(/private-field-policy: matched private field/);
+  });
 });
 
 describe('PolicyEngine object-channel result-phase fence (D1)', () => {
-  it('warns once per engine instance when a policy is scoped to object without answer', async () => {
+  it('fails closed when a policy requires an object the invocation never exposes', async () => {
     // #given — zero result-phase coverage: OutputResult has no object field,
     // and this policy never sees the answer channel either
     const audit = new AuditLogger();
@@ -434,22 +488,15 @@ describe('PolicyEngine object-channel result-phase fence (D1)', () => {
       audit,
     });
 
-    // #when — two result-phase calls
-    await engine.processOutputResult(makeOutputArgs('clean'));
-    await engine.processOutputResult(makeOutputArgs('clean'));
+    // #when / #then — the result gate aborts instead of logging and allowing
+    await expect(
+      engine.processOutputResult(makeOutputArgs('clean')),
+    ).rejects.toThrowError(/require the 'object' output channel/);
 
-    // #then — exactly one warning, not one per call. #recordAllowed also
-    // writes 'agent.output.policy' events (decision: 'allowed') on every
-    // call, so the fence warning is distinguished by decision: 'error'.
-    const warnings = audit
-      .events()
-      .filter(
-        (event) =>
-          event.action === 'agent.output.policy' && event.decision === 'error',
-      );
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toMatchObject({
+    expect(audit.events()).toHaveLength(1);
+    expect(audit.events()[0]).toMatchObject({
       decision: 'error',
+      reason: 'required object output channel was not observable',
       detail: { policies: ['deny-patterns'] },
     });
   });
@@ -499,6 +546,41 @@ describe('PolicyEngine object-channel result-phase fence (D1)', () => {
             event.decision === 'error',
         ),
     ).toBe(false);
+  });
+
+  it('accepts a result after the processor actually evaluated an object chunk', async () => {
+    const audit = new AuditLogger();
+    const engine = new PolicyEngine({
+      policies: [denyPatterns(['x'], { channels: ['object'] })],
+      audit,
+    });
+    const state: Record<string, unknown> = {};
+    const part = objectResult({ answer: 'clean' });
+
+    await engine.processOutputStream(makeStreamArgs([part], state));
+    const resultArgs = makeOutputArgs('clean');
+    resultArgs.state = state;
+
+    await expect(engine.processOutputResult(resultArgs)).resolves.toEqual(
+      resultArgs.messages,
+    );
+    expect(audit.events().some((event) => event.decision === 'error')).toBe(
+      false,
+    );
+  });
+
+  it('exposes a frozen list of object-only policies', () => {
+    const engine = new PolicyEngine({
+      policies: [
+        denyPatterns(['x'], { channels: ['object'] }),
+        denyPatterns(['y'], { channels: ['answer', 'object'] }),
+        maxTextLength(10),
+      ],
+      audit: new AuditLogger(),
+    });
+
+    expect(engine.objectOnlyPolicyNames).toEqual(['deny-patterns']);
+    expect(Object.isFrozen(engine.objectOnlyPolicyNames)).toBe(true);
   });
 });
 
@@ -602,6 +684,23 @@ describe('PolicyEngine.processOutputStream', () => {
 
     // #then — no audit noise during streaming
     expect(audit.events()).toHaveLength(0);
+  });
+
+  it('bounds terminal audit metadata by policies and channels, not chunk count', async () => {
+    const engine = new PolicyEngine({
+      policies: [denyPatterns(['blocked'], { phases: ['output'] })],
+    });
+    const state: Record<string, unknown> = {};
+
+    for (let index = 0; index < 100; index += 1) {
+      const part = textDelta('clean');
+      await engine.processOutputStream(makeStreamArgs([part], state));
+    }
+
+    expect(state['breakwater.streamEvaluatedPolicies']).toEqual({
+      names: ['deny-patterns'],
+      channels: ['answer'],
+    });
   });
 
   it('fails closed on an evaluator crash mid-stream: aborts, not rethrows', async () => {
@@ -731,6 +830,45 @@ describe('PolicyEngine output channels — streaming', () => {
     ).rejects.toThrowError(/deny-patterns: matched blocked pattern/);
   });
 
+  it('forwards the same canonical object snapshot that policy inspected', async () => {
+    const engine = new PolicyEngine({ policies: [] });
+    const transformed = Object.defineProperty({ answer: 'ok' }, 'secret', {
+      value: 'hidden',
+      enumerable: false,
+    });
+    const part = objectResult(transformed);
+
+    const result = await engine.processOutputStream(makeStreamArgs([part]));
+
+    expect(result).toMatchObject({
+      type: 'object-result',
+      object: { answer: 'ok' },
+    });
+    expect((result as { object?: unknown }).object).not.toBe(transformed);
+    expect((result as { object?: unknown }).object).not.toHaveProperty(
+      'secret',
+    );
+  });
+
+  it('aborts before forwarding a structured chunk that is not JSON data', async () => {
+    const audit = new AuditLogger();
+    const engine = new PolicyEngine({ policies: [], audit });
+    const part = objectResult({
+      answer: 'ok',
+      toJSON: () => ({ answer: 'ok' }),
+    });
+
+    await expect(
+      engine.processOutputStream(makeStreamArgs([part])),
+    ).rejects.toThrowError(/structured object is not JSON data/);
+    expect(audit.events()).toHaveLength(1);
+    expect(audit.events()[0]).toMatchObject({
+      decision: 'error',
+      reason: 'structured object is not JSON data',
+      detail: { channel: 'object' },
+    });
+  });
+
   it('evaluates object snapshots as replacements, not concatenations', async () => {
     // #given — a cap that the CONCATENATION of the two snapshots would
     // exceed but the latest snapshot alone does not (partials are growing
@@ -747,10 +885,10 @@ describe('PolicyEngine output channels — streaming', () => {
     // #then — both pass because the second REPLACES the first
     await expect(
       engine.processOutputStream(makeStreamArgs([partial], state)),
-    ).resolves.toBe(partial);
+    ).resolves.toStrictEqual(partial);
     await expect(
       engine.processOutputStream(makeStreamArgs([partial, final], state)),
-    ).resolves.toBe(final);
+    ).resolves.toStrictEqual(final);
   });
 
   it('keeps channel caps independent: long reasoning does not trip an answer cap', async () => {
@@ -1032,7 +1170,7 @@ describe('PolicyEngine hold-back buffering', () => {
     ).resolves.toBeNull();
     await expect(
       engine.processOutputStream(makeStreamArgs([partial, final], state)),
-    ).resolves.toBe(final);
+    ).resolves.toStrictEqual(final);
   });
 
   it('drops pending text when the stream errors instead of emitting after the failure', async () => {
@@ -1475,4 +1613,106 @@ describe('extractMessageText', () => {
       'legacy content\nsecond',
     );
   });
+});
+
+// Opt-in perf evidence for hold-back cost (roadmap §13: "measure hold-back
+// memory and latency under large streams"). Skipped unless
+// BREAKWATER_PERF=1 so CI never carries timing variance; run with:
+//   BREAKWATER_PERF=1 pnpm --filter @proofoftech/breakwater exec vitest run src/policy-engine/policy-engine.test.ts -t 'hold-back cost'
+describe('PolicyEngine hold-back cost (opt-in perf evidence)', () => {
+  const textOf = (chunk: ChunkType | null | undefined): string => {
+    const text = (chunk as { payload?: { text?: unknown } } | null | undefined)
+      ?.payload?.text;
+    return typeof text === 'string' ? text : '';
+  };
+
+  it.skipIf(!process.env.BREAKWATER_PERF)(
+    'measures latency and peak buffering on a 4 MB stream',
+    async () => {
+      // #given — a bounded string-pattern window (18-char pattern → 17-char
+      // hold window) and 4 MB of clean text in 2 KB deltas
+      const TOTAL_CHARS = 4 * 1024 * 1024;
+      const CHUNK = 'x'.repeat(2048);
+      const engine = new PolicyEngine({
+        policies: [
+          denyPatterns(['needle-not-present'], { phases: ['output'] }),
+        ],
+        holdBack: true,
+      });
+      const state: Record<string, unknown> = {};
+      let emitted = 0;
+      let peakPending = 0;
+      const pendingOf = () => {
+        const hold = state['breakwater.holdBack'] as
+          | { answer?: { pending: string } }
+          | undefined;
+        return hold?.answer?.pending.length ?? 0;
+      };
+
+      // #when
+      const started = performance.now();
+      for (let sent = 0; sent < TOTAL_CHARS; sent += CHUNK.length) {
+        const part = await engine.processOutputStream(
+          makeStreamArgs([textDelta(CHUNK)], state),
+        );
+        emitted += textOf(part).length;
+        peakPending = Math.max(peakPending, pendingOf());
+      }
+      const elapsedMs = performance.now() - started;
+
+      // #then — bounded window held (pattern-bound string window + one
+      // in-flight chunk), everything eventually released in aggregate, and
+      // throughput stays far above interactive stream rates. Bounds are
+      // generous regression fences, not benchmarks; the reported numbers are
+      // recorded in docs/policy-engine-design.md.
+      expect(peakPending).toBeLessThanOrEqual(
+        'needle-not-present'.length - 1 + CHUNK.length,
+      );
+      const hold = state['breakwater.holdBack'] as {
+        answer?: { pending: string };
+      };
+      expect(emitted + (hold.answer?.pending.length ?? 0)).toBe(TOTAL_CHARS);
+      expect(elapsedMs).toBeLessThan(10_000);
+      console.log(
+        `hold-back perf: ${TOTAL_CHARS / 1024 / 1024} MB in ${Math.round(elapsedMs)} ms — ${Math.round(TOTAL_CHARS / 1024 / (elapsedMs / 1000))} KB/s, peak pending ${peakPending} chars`,
+      );
+    },
+  );
+
+  it.skipIf(!process.env.BREAKWATER_PERF)(
+    'measures the RegExp (Infinity-window) buffer-all trade-off on the same stream',
+    async () => {
+      // #given — any RegExp forces an unbounded hold window: the entire
+      // stream stays pending until finish. This MEASURES that documented
+      // trade-off rather than asserting a bound that cannot hold.
+      const TOTAL_CHARS = 1024 * 1024;
+      const CHUNK = 'y'.repeat(2048);
+      const engine = new PolicyEngine({
+        policies: [denyPatterns([/z-\d+/], { phases: ['output'] })],
+        holdBack: true,
+      });
+      const state: Record<string, unknown> = {};
+      let emitted = 0;
+      let peakPending = 0;
+      const pendingOf = () => {
+        const hold = state['breakwater.holdBack'] as
+          | { answer?: { pending: string } }
+          | undefined;
+        return hold?.answer?.pending.length ?? 0;
+      };
+
+      // #when
+      for (let sent = 0; sent < TOTAL_CHARS; sent += CHUNK.length) {
+        const part = await engine.processOutputStream(
+          makeStreamArgs([textDelta(CHUNK)], state),
+        );
+        emitted += textOf(part).length;
+        peakPending = Math.max(peakPending, pendingOf());
+      }
+
+      // #then — nothing released mid-stream, everything buffered
+      expect(emitted).toBe(0);
+      expect(peakPending).toBe(TOTAL_CHARS);
+    },
+  );
 });

@@ -6,8 +6,10 @@
 //
 // Output is gated in two places so agent.stream() cannot leak forbidden text:
 // processOutputStream gates each streamed chunk against the output accumulated
-// so far, and processOutputResult is the authoritative final gate (and the only
-// one for non-streaming agent.generate()).
+// so far, and processOutputResult is the authoritative final processor gate
+// (and the only one for non-streaming agent.generate()). Structured objects
+// that Mastra returns outside the processor chain are not covered; the guarded
+// agent therefore rejects structured output.
 //
 // Output is gated per CHANNEL — 'answer' (client-visible text), 'reasoning'
 // (the model's reasoning trace), 'object' (structured-output snapshots) —
@@ -28,6 +30,7 @@ import type {
 } from '@mastra/core/processors';
 import type { RequestContext } from '@mastra/core/request-context';
 import type { ChunkType } from '@mastra/core/stream';
+import { type JSONType, z } from 'zod';
 
 import { type AuditLogger, agentAuditDetail } from '../audit/index.js';
 import { type Actor, actorFromRequestContext } from '../rbac/index.js';
@@ -40,13 +43,16 @@ export type PolicyPhase = 'input' | 'output';
  * Which output surface the gated text belongs to. 'answer' is the
  * client-visible answer text (and the channel input gating always runs
  * under); 'reasoning' is the model's reasoning trace; 'object' is structured
- * output, gated as the JSON-stringified latest snapshot.
+ * output, gated as the canonical JSON latest snapshot.
  *
- * Under `@mastra/core` 1.50, the `object` channel is available only during
- * streaming because the final output result has no structured-object field.
- * Direct structured output is also emitted as answer text, so policies that
- * include `answer` still inspect it. An object-only policy requires an audit
- * sink so the engine can report the non-streaming coverage gap.
+ * Under `@mastra/core` 1.50, the engine sees the `object` channel only for
+ * object chunks that flow through the processor chain (model-native
+ * streaming). A `generate()` result's parsed object and core's
+ * `StructuredOutputProcessor` chunks never pass through the chain.
+ * `createGuardedAgent` rejects structured output because a wrapper gate would
+ * run only after Mastra had exposed the parsed value. An object-only policy
+ * still requires an audit sink so a standalone engine records a fail-closed
+ * result-phase coverage error.
  */
 export type OutputChannel = 'answer' | 'reasoning' | 'object';
 
@@ -135,6 +141,42 @@ const CHANNELS_STATE_KEY = 'breakwater.channels';
 // collide across instances (two denyPatterns both named 'deny-patterns');
 // indexes cannot.
 const POLICY_STATE_KEY = 'breakwater.policyState';
+const OBJECT_CHANNEL_EVALUATED_STATE_KEY = 'breakwater.objectChannelEvaluated';
+const STREAM_EVALUATED_POLICIES_STATE_KEY =
+  'breakwater.streamEvaluatedPolicies';
+const JSON_VALUE_SCHEMA = z.json();
+
+interface CanonicalJsonValue {
+  value: JSONType;
+  snapshot: string;
+}
+
+interface StreamEvaluatedPolicies {
+  names: string[];
+  channels: OutputChannel[];
+}
+
+function streamEvaluatedPoliciesOf(
+  state: Record<string, unknown>,
+): StreamEvaluatedPolicies {
+  let evaluated = state[STREAM_EVALUATED_POLICIES_STATE_KEY] as
+    | StreamEvaluatedPolicies
+    | undefined;
+  if (!evaluated) {
+    evaluated = { names: [], channels: [] };
+    state[STREAM_EVALUATED_POLICIES_STATE_KEY] = evaluated;
+  }
+  return evaluated;
+}
+
+function canonicalJsonValue(value: unknown): CanonicalJsonValue {
+  const parsed = JSON_VALUE_SCHEMA.parse(value);
+  const snapshot = JSON.stringify(parsed);
+  return {
+    value: JSON.parse(snapshot) as JSONType,
+    snapshot,
+  };
+}
 
 interface ChannelTexts {
   answer: string;
@@ -238,9 +280,32 @@ function holdBackWindowFor(
   return window;
 }
 
+function snapshotPolicies(
+  policies: readonly PolicyEvaluator[],
+): readonly PolicyEvaluator[] {
+  return Object.freeze(
+    policies.map((policy) => {
+      const name = policy.name;
+      const phases = policy.phases;
+      const channels = policy.channels;
+      const holdBackChars = policy.holdBackChars;
+      const evaluate = policy.evaluate.bind(policy);
+      return Object.freeze({
+        name,
+        ...(phases !== undefined ? { phases: Object.freeze([...phases]) } : {}),
+        ...(channels !== undefined
+          ? { channels: Object.freeze([...channels]) }
+          : {}),
+        ...(holdBackChars !== undefined ? { holdBackChars } : {}),
+        evaluate,
+      });
+    }),
+  );
+}
+
 /** Configuration for `PolicyEngine`. */
 export interface PolicyEngineOptions {
-  /** Policies evaluated in array order. */
+  /** Policies snapshotted at construction and evaluated in array order. */
   policies: readonly PolicyEvaluator[];
   /** Optional audit logger for policy decisions and evaluator failures. */
   audit?: AuditLogger;
@@ -274,9 +339,9 @@ export interface PolicyEngineOptions {
  *
  * Under `@mastra/core` 1.50, a final output result has no structured-object
  * field. The constructor therefore requires an audit sink when a policy
- * selects `object` without `answer`. The first final-result call then emits
- * one coverage warning for that engine instance. Policies that include
- * `answer` inspect the JSON text emitted by direct structured output.
+ * selects `object` without `answer`. A final-result call fails closed unless
+ * this engine actually evaluated an object chunk. Policies that include
+ * `answer` inspect JSON carried as answer text.
  *
  * The constructor also rejects an explicit input policy whose channels
  * exclude `answer`, because input evaluation has no other channel.
@@ -290,10 +355,10 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
   readonly #holdBack: boolean;
   readonly #holdBackWindow: Record<HoldableChannel, number>;
   readonly #objectOnlyPolicyNames: readonly string[];
-  #objectChannelFenceWarned = false;
 
   constructor(options: PolicyEngineOptions) {
-    for (const policy of options.policies) {
+    const policies = snapshotPolicies(options.policies);
+    for (const policy of policies) {
       if (
         policy.phases?.includes('input') &&
         policy.channels !== undefined &&
@@ -304,32 +369,31 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
         );
       }
     }
-    this.#policies = options.policies;
+    this.#policies = policies;
     this.#audit = options.audit;
     this.#resource = options.resource ?? this.id;
     this.#holdBack = options.holdBack ?? false;
     this.#holdBackWindow = {
-      answer: holdBackWindowFor(options.policies, 'answer'),
-      reasoning: holdBackWindowFor(options.policies, 'reasoning'),
+      answer: holdBackWindowFor(policies, 'answer'),
+      reasoning: holdBackWindowFor(policies, 'reasoning'),
     };
-    this.#objectOnlyPolicyNames = options.policies
-      .filter(
-        (policy) =>
-          policy.channels?.includes('object') &&
-          !policy.channels.includes('answer'),
-      )
-      .map((policy) => policy.name);
-    // D1 fence (construction time): an object-only policy has zero
-    // result-phase coverage under @mastra/core 1.50.0, and the runtime
-    // warning it would otherwise get rides the OPTIONAL audit sink — with no
-    // sink the gap is entirely silent. Reject the combination rather than
-    // ship an unenforceable policy that can never surface. Reuses the
-    // object-only set computed above.
+    this.#objectOnlyPolicyNames = Object.freeze(
+      policies
+        .filter(
+          (policy) =>
+            policy.channels?.includes('object') &&
+            !policy.channels.includes('answer'),
+        )
+        .map((policy) => policy.name),
+    );
+    // D1 fence (construction time): an object-only policy needs an audit sink
+    // to record a fail-closed coverage error when processors expose no object.
+    // Reuses the object-only set computed above.
     if (this.#objectOnlyPolicyNames.length > 0 && options.audit === undefined) {
       const names = this.#objectOnlyPolicyNames.join(', ');
       const plural = this.#objectOnlyPolicyNames.length === 1 ? 'y' : 'ies';
       throw new TypeError(
-        `PolicyEngine: polic${plural} [${names}] scoped to the 'object' channel without 'answer' cannot be enforced on non-streaming generate() results under @mastra/core 1.50.0 (OutputResult carries no structured-object field) and would silently no-op without an audit sink to carry the one-time warning — provide options.audit, or include 'answer' in channels.`,
+        `PolicyEngine: polic${plural} [${names}] scoped to the 'object' channel without 'answer' require an audit sink for fail-closed coverage errors when no object reaches the processor — provide options.audit, or include 'answer' in channels.`,
       );
     }
   }
@@ -354,11 +418,12 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
   async processOutputResult(
     args: ProcessOutputResultArgs,
   ): Promise<MastraDBMessage[]> {
-    this.#warnObjectChannelGapOnce(args.requestContext);
+    this.#assertObjectChannelCoverage(args);
     // result.text is the authoritative generation output (non-optional in
     // core); messages also carry earlier conversation turns the output
-    // policies should not re-gate. This is the final gate for both
-    // agent.generate() and, after the stream drains, agent.stream().
+    // policies should not re-gate. This is the final processor gate for
+    // answer and reasoning on both agent.generate() and, after the stream
+    // drains, agent.stream().
     const actor = actorFromRequestContext(args.requestContext) ?? null;
     const evaluated = await this.#evaluate(
       {
@@ -371,38 +436,53 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
       actor,
       args.abort,
     );
+    const evaluatedChannels: OutputChannel[] =
+      evaluated.length > 0 ? ['answer'] : [];
     // Reasoning is gated from the per-step aggregates. OutputResult carries
-    // no structured-object field, so the object channel is gated in-stream
-    // only ('object'/'object-result' chunks); structured output transported
-    // as JSON answer text is covered by the answer pass above.
+    // no structured-object field, so this processor gates the object channel
+    // only when 'object'/'object-result' chunks reach processOutputStream.
+    // JSON carried as answer text is covered by the answer pass above.
     const reasoningText = args.result.steps
       .map((step) => step.reasoningText)
       .filter((text): text is string => typeof text === 'string' && text !== '')
       .join('\n');
     if (reasoningText !== '') {
-      evaluated.push(
-        ...(await this.#evaluate(
-          {
-            phase: 'output',
-            channel: 'reasoning',
-            messages: args.messages,
-            text: reasoningText,
-            requestContext: args.requestContext,
-          },
-          actor,
-          args.abort,
-        )),
+      const reasoningEvaluated = await this.#evaluate(
+        {
+          phase: 'output',
+          channel: 'reasoning',
+          messages: args.messages,
+          text: reasoningText,
+          requestContext: args.requestContext,
+        },
+        actor,
+        args.abort,
       );
+      evaluated.push(...reasoningEvaluated);
+      if (reasoningEvaluated.length > 0) {
+        evaluatedChannels.push('reasoning');
+      }
     }
-    // ONE terminal allowed record per result — channel passes aggregated,
-    // deduplicated — not one record per channel.
+    const streamedEvaluated = args.state[STREAM_EVALUATED_POLICIES_STATE_KEY] as
+      | StreamEvaluatedPolicies
+      | undefined;
+    if (streamedEvaluated) {
+      evaluated.push(...streamedEvaluated.names);
+      evaluatedChannels.push(...streamedEvaluated.channels);
+    }
     this.#recordAllowed(
       'output',
       actor,
       [...new Set(evaluated)],
       args.requestContext,
+      [...new Set(evaluatedChannels)],
     );
     return args.messages;
+  }
+
+  /** Names of policies scoped to `object` without `answer` (never result-covered by the engine alone). */
+  get objectOnlyPolicyNames(): readonly string[] {
+    return this.#objectOnlyPolicyNames;
   }
 
   // agent.stream() emits chunks to the client before processOutputResult
@@ -428,6 +508,7 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
     const texts = channelTextsOf(args.state);
     let channel: OutputChannel;
     let delta: DeltaChunk | undefined;
+    let forwardedPart = part;
     if (part.type === 'text-delta') {
       // The typeof guard stops a malformed chunk (payload.text not a string)
       // from coercing e.g. "undefined" into the tracked text.
@@ -445,9 +526,28 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
       // (ChunkType, stream/types.d.ts): replace, never concatenate. The
       // stringify lib type lies — it returns undefined for undefined input
       // (a malformed chunk), which must not corrupt the tracked text.
-      const snapshot: string | undefined = JSON.stringify(part.object);
-      texts.object = snapshot ?? '';
+      let canonical: CanonicalJsonValue;
+      try {
+        canonical = canonicalJsonValue(part.object);
+      } catch {
+        this.#audit?.record({
+          actor: actorFromRequestContext(args.requestContext) ?? null,
+          action: 'agent.output.policy',
+          resource: this.#resource,
+          decision: 'error',
+          reason: 'structured object is not JSON data',
+          detail: agentAuditDetail(args.requestContext, {
+            channel: 'object',
+          }),
+        });
+        args.abort('structured object is not JSON data');
+      }
+      texts.object = canonical.snapshot;
       channel = 'object';
+      forwardedPart = {
+        ...part,
+        object: canonical.value,
+      } as unknown as ChunkType;
     } else {
       return this.#holdBack ? this.#forwardUngated(args) : part;
     }
@@ -457,7 +557,7 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
     // abortOnError=true: Mastra's stream driver emits the chunk on a raw throw
     // and only suppresses it on a TripWire (abort), so an evaluator crash here
     // must abort, not rethrow.
-    await this.#evaluate(
+    const evaluated = await this.#evaluate(
       {
         phase: 'output',
         channel,
@@ -470,14 +570,28 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
       true,
       args.state,
     );
-    if (!this.#holdBack) return part;
+    if (evaluated.length > 0) {
+      const streamedEvaluated = streamEvaluatedPoliciesOf(args.state);
+      for (const name of evaluated) {
+        if (!streamedEvaluated.names.includes(name)) {
+          streamedEvaluated.names.push(name);
+        }
+      }
+      if (!streamedEvaluated.channels.includes(channel)) {
+        streamedEvaluated.channels.push(channel);
+      }
+    }
+    if (channel === 'object') {
+      args.state[OBJECT_CHANNEL_EVALUATED_STATE_KEY] = true;
+    }
+    if (!this.#holdBack) return forwardedPart;
     if (delta && (channel === 'answer' || channel === 'reasoning')) {
       return this.#releaseHeld(args, channel, delta);
     }
     // Intermediate 'object' snapshots are suppressed under hold-back
     // (evaluated, never emitted); the final object-result is emitted once it
     // passes. Trade-off: consumers get only the final object.
-    return part.type === 'object-result' ? part : null;
+    return part.type === 'object-result' ? forwardedPart : null;
   }
 
   // Hold-back release for a just-evaluated delta. The full accumulated
@@ -639,33 +753,28 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
     return evaluated;
   }
 
-  // D1 fence (see the class doc + OutputChannel's coverage caveat): a policy
-  // scoped to 'object' without 'answer' has zero coverage at the result
-  // phase under @mastra/core 1.50.0 — warn once per engine instance instead
-  // of silently doing nothing on every processOutputResult call. The
-  // constructor now REJECTS this configuration when no audit sink is present
-  // (D1), so #audit is guaranteed to exist whenever there is an object-only
-  // policy to warn about; the optional-chain remains only as defense in depth.
-  #warnObjectChannelGapOnce(requestContext?: RequestContext): void {
+  #assertObjectChannelCoverage(args: ProcessOutputResultArgs): void {
     if (
-      this.#objectChannelFenceWarned ||
-      this.#objectOnlyPolicyNames.length === 0
+      this.#objectOnlyPolicyNames.length === 0 ||
+      args.state[OBJECT_CHANNEL_EVALUATED_STATE_KEY] === true
     ) {
       return;
     }
-    this.#objectChannelFenceWarned = true;
     const names = this.#objectOnlyPolicyNames.join(', ');
     const plural = this.#objectOnlyPolicyNames.length === 1 ? 'y' : 'ies';
     this.#audit?.record({
-      actor: null,
+      actor: actorFromRequestContext(args.requestContext) ?? null,
       action: 'agent.output.policy',
       resource: this.#resource,
       decision: 'error',
-      reason: `polic${plural} [${names}] scoped to the 'object' channel without 'answer' cannot be enforced on non-streaming generate() results under @mastra/core 1.50.0 (OutputResult carries no structured-object field) — gate via agent.stream() or include 'answer' in channels`,
-      detail: agentAuditDetail(requestContext, {
+      reason: 'required object output channel was not observable',
+      detail: agentAuditDetail(args.requestContext, {
         policies: [...this.#objectOnlyPolicyNames],
       }),
     });
+    args.abort(
+      `PolicyEngine: polic${plural} [${names}] require the 'object' output channel, but this invocation exposed no object to the processor`,
+    );
   }
 
   #recordAllowed(
@@ -673,13 +782,17 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
     actor: Actor | null,
     evaluated: string[],
     requestContext?: RequestContext,
+    channels?: readonly OutputChannel[],
   ): void {
     this.#audit?.record({
       actor,
       action: `agent.${phase}.policy`,
       resource: this.#resource,
       decision: 'allowed',
-      detail: agentAuditDetail(requestContext, { evaluated }),
+      detail: agentAuditDetail(requestContext, {
+        evaluated,
+        ...(channels !== undefined ? { channels } : {}),
+      }),
     });
   }
 }
@@ -690,7 +803,8 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
  * channels by default (answer, reasoning, object) — leak prevention is its
  * purpose, and a secret is no less leaked through a reasoning trace; narrow
  * with `options.channels` when a channel must stay ungated. The 'object'
- * channel is enforced in-stream only (see OutputChannel's coverage caveat).
+ * channel is enforced only for object chunks that reach this processor; see
+ * {@link OutputChannel} for the guarded structured-output limitation.
  *
  * Substring matching is plain toLowerCase — no Unicode folding or
  * normalization — so alternate spellings evade it (e.g. 'strasse' does not

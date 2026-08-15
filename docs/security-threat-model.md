@@ -240,9 +240,9 @@ A host with only one human reviewer must consciously choose availability or sepa
 
 ## Guarded agent boundary
 
-`createGuardedAgent()` fixes RBAC, policy, execution limits, tool choice, and application processor ordering at construction. Its public handle exposes only unstructured `generate()` and `stream()` calls with a mandatory `RequestContext`.
+`createGuardedAgent()` fixes RBAC, policy, execution limits, tool choice, and application processor ordering at construction. Its public handle exposes only unstructured `generate()` and `stream()`, both with a mandatory `RequestContext`. It rejects structured output because Mastra exposes parsed values to messages and persistence before a wrapper could inspect them.
 
-The handle rejects unknown call options even when a key is present with `undefined`. It disables background continuations, forces policy hold-back, and keeps the raw Mastra agent package-private. Flowsafe validates an unforgeable package-local brand before accepting a catalog module.
+The handle rejects unknown call options even when a key is present with `undefined`, and the factory rejects object-only policies that no supported invocation can cover. Policy selectors and evaluator callables are captured at construction so later caller mutation cannot change channel coverage or replace the evaluator; mutable state internal to an evaluator remains trusted application state. The handle disables background continuations, forces policy hold-back, and keeps the raw Mastra agent package-private. Flowsafe validates an unforgeable package-local brand and a versioned host protocol before accepting a catalog module. Its lower-level durable methods snapshot data-property options before validation and delegation, reject accessors, and reject guarded structured output before Mastra can bypass the narrow handle.
 
 This boundary protects trusted application code from accidental or unsupported invocation paths. It is not a sandbox against hostile code running in the same process; such code can import Mastra, construct another agent, access host credentials, or bypass the supported HTTP topology.
 

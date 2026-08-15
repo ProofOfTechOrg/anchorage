@@ -38,10 +38,10 @@ schedule work, or run durable agent loops on Cloudflare.
 ## Install it
 
 breakwater is ESM-only, requires Node.js 22.3 or newer (engine range `>=22.3.0`),
-and supports `@mastra/core` in its declared `^1.50.0` peer range.
+and requires `@mastra/core` `1.50.0`.
 
 ```bash
-npm install @proofoftech/breakwater @mastra/core
+npm install @proofoftech/breakwater @mastra/core@1.50.0
 ```
 
 Connector authors who define Zod schemas should also declare Zod directly:
@@ -113,7 +113,9 @@ const result = await agent.generate('Summarize the account.', {
 });
 ```
 
-The handle exposes only unstructured `generate()` and `stream()`. Each call requires `requestContext` and may accept only `runId`, `memory`, and `abortSignal`. The factory fixes `maxSteps` and `toolChoice`, forces streaming policy hold-back, disables background continuations, and rejects processor or model overrides.
+The handle exposes only unstructured `generate()` and `stream()`. Each call requires `requestContext` and may accept only `runId`, `memory`, and `abortSignal`. The factory fixes `maxSteps` and `toolChoice`, forces streaming policy hold-back, disables background continuations, and rejects processor, model, and structured-output overrides.
+
+Under the pinned Mastra version, parsed structured output bypasses the output-processor chain and reaches messages, persistence, and observability hooks before a wrapper could inspect it. Both guarded methods therefore reject `structuredOutput` before model execution. The factory also rejects object-only policies because no supported guarded invocation can expose their required channel. Structured-output support requires a future pre-persistence gate, not a post-generation wrapper.
 
 `allowedRoles` is an exact allowlist with no role hierarchy. Application input processors may implement only `processInput`. Application output processors must implement both `processOutputStream` and `processOutputResult`.
 
@@ -140,11 +142,15 @@ The narrow handle prevents accidental use of raw Mastra execution methods. It is
 ## Choose agent policies
 
 `PolicyEngine` accepts any `PolicyEvaluator`. Policies can select the
-`input` or `output` phase and the output channels they inspect:
+`input` or `output` phase and the output channels they inspect. Construction
+snapshots the policy list, selector arrays, names, hold-back hints, and
+evaluator callable so later replacement cannot change enforcement. Class-based
+evaluators retain their original receiver. Evaluator-owned instance or closure
+state remains application-owned and is not deep-cloned:
 
 - `answer` is client-visible text and is also the only input channel.
 - `reasoning` is the model reasoning trace.
-- `object` is the latest JSON-stringified structured-output snapshot.
+- `object` is the latest canonical JSON structured-output snapshot.
 
 The included policies are:
 
@@ -181,12 +187,13 @@ secret detectors provide bounded windows. A regular expression in
 text released at the end of an earlier segment cannot be withdrawn if a match
 completes in a later segment.
 
-Under `@mastra/core` 1.50, the `object` channel is available on
-`agent.stream()` but not as a distinct field in the final non-streaming
-`generate()` result. JSON carried as answer text is still inspected by
-answer-inclusive policies. An object-only policy therefore requires an audit
-sink, and the engine emits a one-time coverage warning on the non-streaming
-path.
+Under `@mastra/core` 1.50.0, only object chunks that traverse the processor
+chain reach a standalone engine. The engine validates those chunks as JSON,
+evaluates the canonical snapshot, and forwards the same canonical clone.
+Parsed `generate()` results and core's structured-output processor chunks
+bypass that chain. If an object-only policy sees no processor-visible object
+chunk, the engine requires an audit sink and aborts at the result boundary.
+JSON carried as answer text is still inspected by answer-inclusive policies.
 
 ## Enforce tool permissions
 

@@ -16,12 +16,14 @@ export type {
   GuardedAgentCallOptions,
   GuardedAgentConfig,
   GuardedAgentHandle,
+  GuardedAgentHostProtocol,
   GuardedInputProcessor,
   GuardedOutputProcessor,
   GuardedToolChoice,
 } from './agent/index.js';
 export {
   createGuardedAgent,
+  GUARDED_AGENT_HOST_PROTOCOL,
   isGuardedAgentHandle,
 } from './agent/index.js';
 export type {

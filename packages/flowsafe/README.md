@@ -9,7 +9,7 @@ Flowsafe runs Mastra workflows and agents through Cloudflare Durable Objects, st
 ## Install
 
 ```bash
-npm install @mastra/core@^1.50.0 @proofoftech/flowsafe
+npm install @mastra/core@1.50.0 @proofoftech/flowsafe
 ```
 
 Install `@proofoftech/breakwater` when resumed steps call approval-protected connectors:
@@ -25,9 +25,9 @@ Compatibility:
 - Node.js 22 or later (engine range `>=22`)
 - ESM only
 - TypeScript `moduleResolution: "NodeNext"`, `"Node16"`, or `"Bundler"`
-- `@mastra/core` in the declared `^1.50.0` peer range
+- `@mastra/core` `1.50.0`
 - `react` and `react-dom` `>=18 <20` (React 18 or 19) for the optional approval UI
-- `@proofoftech/breakwater` `>=0.9.0 <1.0.0` when used
+- `@proofoftech/breakwater` `>=0.12.0 <1.0.0` when used
 - host-provided Wrangler `>=4.118 <5` for the optional `flowsafe-provision` CLI
 
 ## Choose an export
@@ -345,11 +345,11 @@ A configured resolver runs on every authorized entry, and its resolution is proj
 
 Permission authorization audit detail records `requiredPermissions` and `permissionPolicyVersion`; it does not record effective permissions or identity-provider groups.
 
-`createThreadAgentHost()` validates Breakwater's guarded-handle brand before it registers the agent with Mastra. It persists the thread/agent binding and original run principal, so eviction recovery and approval resume cannot switch agents or actors.
+`createThreadAgentHost()` validates Breakwater's guarded-handle brand and versioned host protocol before it registers the agent with Mastra. It persists the thread/agent binding and original run principal, so eviction recovery and approval resume cannot switch agents or actors.
 
 Agent resume is approval-only. `createAgentApprovalResumer()` rejects legacy agent targets without the original principal, then rechecks that principal against the current catalog. A human must still satisfy the selected agent's `allowedRoles`. An automated principal's kind must still appear in `allowedAutomation`; `approval.resume` is implied for a declared kind. The thread host then enforces any `requiredPermissions` through the current resolver policy. The resumer delegates non-agent workflow records to the existing resume function.
 
-`createFlowsafeDurableAgent()` remains the lower-level compatibility API. It routes Mastra's durable-agent workflow through `RunnerRuntime`, but it does not guard an arbitrary raw agent. Use `agent-host` when an HTTP surface must enforce catalog and Breakwater invariants.
+`createFlowsafeDurableAgent()` remains the lower-level compatibility API. It routes Mastra's durable-agent workflow through `RunnerRuntime`, but it does not guard an arbitrary raw agent. Each durable entry snapshots data-property call options before validating or delegating and rejects accessor-backed options. When passed a Breakwater guarded agent, it rejects structured output on stream, generate, and prepare because Mastra's durable runner bypasses the narrow handle. Use `agent-host` when an HTTP surface must enforce catalog and Breakwater invariants.
 
 Agent event replay lasts only as long as the configured Mastra cache. The default in-memory cache does not survive process restart. A 409 stream response means the client must read the authoritative status route.
 

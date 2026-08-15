@@ -8,7 +8,7 @@ This guide takes a Mastra application from package installation to one guarded c
   complete repository and private fleet-control package require Node.js 22.22.0
   or later
 - An ESM TypeScript project using `moduleResolution: "NodeNext"`, `"Node16"`, or `"Bundler"`
-- `@mastra/core` in the `^1.50.0` peer range
+- `@mastra/core` `1.50.0`
 - A Cloudflare account, D1 database, and Durable Objects only when deploying flowsafe
 
 React is not required by flowsafe unless you import `@proofoftech/flowsafe/approval-ui`.
@@ -16,7 +16,7 @@ React is not required by flowsafe unless you import `@proofoftech/flowsafe/appro
 ## Install breakwater
 
 ```bash
-npm install @mastra/core@^1.50.0 @proofoftech/breakwater
+npm install @mastra/core@1.50.0 @proofoftech/breakwater
 ```
 
 ### Add agent-boundary policy
@@ -66,7 +66,7 @@ export const agent = createGuardedAgent({
 });
 ```
 
-`createGuardedAgent()` forces policy hold-back, disables background continuations, and rejects per-call processor, tool, model, callback, hook, structured-output, and execution-limit overrides. Application input processors can enforce only initial input. Application output processors must enforce both streamed and final results.
+`createGuardedAgent()` forces policy hold-back, disables background continuations, and rejects per-call processor, tool, model, callback, hook, structured-output, and execution-limit overrides. Under the supported Mastra version, parsed structured output reaches messages and persistence before a wrapper gate could inspect it, so guarded structured output remains unavailable. Object-only policies are rejected at construction. Application input processors can enforce only initial input. Application output processors must enforce both streamed and final results.
 
 The narrow handle prevents accidental bypass through Mastra's larger `Agent` API. It is a trusted in-process API, not a sandbox against hostile code running with the same imports and credentials.
 
