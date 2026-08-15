@@ -1,5 +1,13 @@
 # @proofoftech/fleet-control
 
+## 0.3.2
+
+### Patch Changes
+
+- 8028605: Delete an already-decommissioned fleet ledger row without emitting a duplicate decommission event mislabeled as forced.
+- Updated dependencies [37175fa]
+  - @proofoftech/flowsafe@0.17.0
+
 ## 0.3.1
 
 ### Patch Changes
