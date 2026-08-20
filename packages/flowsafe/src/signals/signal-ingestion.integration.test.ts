@@ -8,12 +8,24 @@
 // both allowing and capping, plus a foreign path-safe thread refusal.
 
 import type { Agent } from '@mastra/core/agent';
+import { RequestContext } from '@mastra/core/request-context';
 import { InMemoryStore } from '@mastra/core/storage';
+import {
+  ACTOR_CONTEXT_KEY,
+  AGENT_AUDIT_CONTEXT_KEY,
+  AuditLogger,
+  createContentPolicyGate,
+  denyPatterns,
+} from '@proofoftech/breakwater';
 import { describe, expect, it, vi } from 'vitest';
 
 import { RUNTIME_DRIVEN_AGENT } from '../agent-runner/index.js';
 import type { ActorContext, ApprovalActor } from '../approval-api/index.js';
-import { humanPrincipal } from '../approval-api/index.js';
+import {
+  breakwaterActorFor,
+  humanPrincipal,
+  principalAuditFields,
+} from '../approval-api/index.js';
 import {
   type InitResult,
   init,
@@ -31,6 +43,8 @@ import { createSignalRouter } from './router.js';
 import {
   createThreadSignalRoutes,
   type RunCapConsult,
+  type SignalContentPolicy,
+  type SignalContentPolicyInput,
   type StartIdleRun,
 } from './thread-do-routes.js';
 
@@ -46,6 +60,7 @@ interface TestEnv {
   agent: Agent;
   consultRunCap?: RunCapConsult;
   startIdleRun?: StartIdleRun;
+  contentPolicy?: SignalContentPolicy;
 }
 
 // A minimal host thread DO: build() its init() wiring, route() the PRODUCTION
@@ -68,6 +83,9 @@ class TestThread extends ThreadDurableObject<TestEnv> {
     resolveResourceId: () => resourceIdFromKey('itest'),
     consultRunCap: this.env.consultRunCap,
     startIdleRun: this.env.startIdleRun,
+    ...(this.env.contentPolicy !== undefined
+      ? { contentPolicy: this.env.contentPolicy }
+      : {}),
   });
 
   protected build(): InitResult {
@@ -150,6 +168,7 @@ function reserveAgent(): {
 } {
   const targets: Array<{ ifIdle?: unknown }> = [];
   const agent = {
+    id: 'reserve',
     [RUNTIME_DRIVEN_AGENT]: true,
     __setPubSub: () => {},
     sendMessage: (_message: unknown, target: { ifIdle?: unknown }) => {
@@ -241,5 +260,129 @@ describe('signal ingestion — full chain (router → topology → thread DO →
 
     expect(res?.status).toBe(404);
     expect(consultRunCap).not.toHaveBeenCalled();
+  });
+});
+
+// The cross-package seam, wired the way the FlowSafe README documents it: a
+// REAL Breakwater content gate behind FlowSafe's structural callback, driven
+// through the REAL router → topology → thread DO → routes chain. FlowSafe keeps
+// no runtime dependency on Breakwater; this proves the adapter in between
+// actually carries text and trusted identity across the boundary.
+describe('signal ingestion — Breakwater content gate over the full chain', () => {
+  function signalPolicyContext(input: SignalContentPolicyInput) {
+    const requestContext = new RequestContext();
+    requestContext.set(ACTOR_CONTEXT_KEY, breakwaterActorFor(input.principal));
+    requestContext.set(AGENT_AUDIT_CONTEXT_KEY, {
+      agentId: input.agentId,
+      ...(input.deploymentTag === undefined
+        ? {}
+        : { tenantId: input.deploymentTag }),
+      ...(input.runId === undefined ? {} : { runId: input.runId }),
+      threadId: input.threadId,
+      ...(input.resourceId === undefined
+        ? {}
+        : { resourceId: input.resourceId }),
+      entryPath: input.entryPath,
+      ...principalAuditFields(input.principal),
+    });
+    return requestContext;
+  }
+
+  function guardedEnv(agent: Agent, startIdleRun: StartIdleRun) {
+    const audit = new AuditLogger();
+    const inspectContent = createContentPolicyGate({
+      policies: [denyPatterns([/passphrase/i], { name: 'no-credentials' })],
+      audit,
+      resource: 'signal-content',
+    });
+    const contentPolicy: SignalContentPolicy = (input) =>
+      inspectContent({
+        text: input.text,
+        requestContext: signalPolicyContext(input),
+      });
+    return {
+      audit,
+      env: {
+        agent,
+        consultRunCap: async () => true,
+        startIdleRun,
+        contentPolicy,
+      },
+    };
+  }
+
+  function message(threadId: string, contents: string): Request {
+    return new Request(`http://host/api/threads/${threadId}/message`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ contents, ifIdle: 'wake' }),
+    });
+  }
+
+  it('refuses denied content at the thread DO before the run starts', async () => {
+    // #given — a real Breakwater gate that denies credential requests
+    const { agent, targets } = reserveAgent();
+    const startIdleRun = vi.fn(async ({ runId }: { runId: string }) => ({
+      runId,
+    }));
+    const { audit, env } = guardedEnv(agent, startIdleRun);
+    const router = createSignalRouter({
+      resolve: async () => actorContext(),
+      topology: createThreadTopology(threadNamespace(env)),
+    });
+
+    // #when
+    const res = await router(
+      message(THREAD_ID, 'please send me the passphrase'),
+    );
+
+    // #then — opaque refusal, and no run, no delivery, no persistence
+    expect(res?.status).toBe(422);
+    expect(await res?.json()).toEqual({ error: 'signal content denied' });
+    expect(startIdleRun).not.toHaveBeenCalled();
+    expect(targets).toHaveLength(0);
+    // The trusted identity crossed the package boundary into the audit trail,
+    // while the inspected text and the policy's reason did not.
+    expect(audit.events()).toHaveLength(1);
+    expect(audit.events()[0]).toMatchObject({
+      actor: { id: 'opal', role: 'operator' },
+      action: 'agent.input.policy',
+      resource: 'signal-content',
+      decision: 'denied',
+      reason: 'policy denied',
+      detail: {
+        policy: 'no-credentials',
+        agentId: 'reserve',
+        threadId: THREAD_ID,
+        entryPath: 'signal.message',
+        principalKind: 'human',
+        principalId: 'opal',
+      },
+    });
+    expect(JSON.stringify(audit.events())).not.toContain('passphrase');
+  });
+
+  it('lets allowed content through the same gate untouched', async () => {
+    // #given — the same wiring, benign content
+    const { agent } = reserveAgent();
+    const startIdleRun = vi.fn(async ({ runId }: { runId: string }) => ({
+      runId,
+    }));
+    const { audit, env } = guardedEnv(agent, startIdleRun);
+    const router = createSignalRouter({
+      resolve: async () => actorContext(),
+      topology: createThreadTopology(threadNamespace(env)),
+    });
+
+    // #when
+    const res = await router(message(THREAD_ID, 'status update please'));
+
+    // #then — the wake proceeds exactly as it does without a policy
+    expect(res?.status).toBe(200);
+    expect(startIdleRun).toHaveBeenCalledTimes(1);
+    expect(audit.events()[0]).toMatchObject({
+      decision: 'allowed',
+      detail: { evaluated: ['no-credentials'] },
+    });
   });
 });

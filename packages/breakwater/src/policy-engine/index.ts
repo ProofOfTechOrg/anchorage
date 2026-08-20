@@ -64,7 +64,9 @@ export interface PolicyContext {
   channel: OutputChannel;
   /**
    * The gated messages. Empty during streaming output — processOutputStream
-   * exposes no discrete messages; the shipped evaluators read only `text`.
+   * exposes no discrete messages — and empty at a standalone
+   * `createContentPolicyGate` boundary, which has only the rendered text. The
+   * shipped evaluators read only `text`.
    */
   messages: MastraDBMessage[];
   /**
@@ -301,6 +303,205 @@ function snapshotPolicies(
       });
     }),
   );
+}
+
+/**
+ * The one reason string an evaluator failure ever surfaces. Static because
+ * exception text may carry the inspected payload; shared so the audit record
+ * and the streaming abort reason cannot drift apart.
+ */
+const POLICY_EVALUATION_FAILED = 'policy evaluation failed';
+
+type OrderedPolicyEvaluation =
+  | { outcome: 'allowed'; evaluated: string[] }
+  | { outcome: 'denied'; reason: string }
+  | { outcome: 'error'; error: unknown };
+
+interface OrderedPolicyEvaluationOptions {
+  policies: readonly PolicyEvaluator[];
+  context: PolicyContext;
+  actor: Actor | null;
+  audit?: AuditLogger;
+  resource: string;
+  streamAccumulator?: Record<string, unknown>;
+}
+
+/**
+ * The terminal allow record. Shared with `createContentPolicyGate` so the two
+ * boundaries emit ONE audit vocabulary — the deny and error records already
+ * come from `evaluatePoliciesInOrder`.
+ */
+function recordAllowedPolicyDecision(options: {
+  audit?: AuditLogger;
+  phase: PolicyPhase;
+  actor: Actor | null;
+  resource: string;
+  evaluated: readonly string[];
+  requestContext?: RequestContext;
+  channels?: readonly OutputChannel[];
+}): void {
+  options.audit?.record({
+    actor: options.actor,
+    action: `agent.${options.phase}.policy`,
+    resource: options.resource,
+    decision: 'allowed',
+    detail: agentAuditDetail(options.requestContext, {
+      evaluated: options.evaluated,
+      ...(options.channels !== undefined ? { channels: options.channels } : {}),
+    }),
+  });
+}
+
+async function evaluatePoliciesInOrder(
+  options: OrderedPolicyEvaluationOptions,
+): Promise<OrderedPolicyEvaluation> {
+  const { policies, context, actor, audit, resource, streamAccumulator } =
+    options;
+  const { phase, channel } = context;
+  const evaluated: string[] = [];
+  for (const [index, policy] of policies.entries()) {
+    if (policy.phases && !policy.phases.includes(phase)) continue;
+    if (!(policy.channels ?? DEFAULT_CHANNELS).includes(channel)) continue;
+    evaluated.push(policy.name);
+    let decision: PolicyDecision;
+    try {
+      decision = await policy.evaluate(
+        streamAccumulator
+          ? {
+              ...context,
+              streamState: policyStreamStateOf(streamAccumulator, index),
+            }
+          : context,
+      );
+    } catch (error) {
+      // An evaluator crash is worse than a denial; it must not leave less
+      // audit evidence than one. Opaque exception text may contain the
+      // inspected payload, so the audit and every caller-visible failure
+      // signal stay static — the thrown value goes back to the caller, never
+      // into the record.
+      audit?.record({
+        actor,
+        action: `agent.${phase}.policy`,
+        resource,
+        decision: 'error',
+        reason: POLICY_EVALUATION_FAILED,
+        detail: agentAuditDetail(context.requestContext, {
+          policy: policy.name,
+          channel,
+        }),
+      });
+      return { outcome: 'error', error };
+    }
+    if (!decision.allowed) {
+      audit?.record({
+        actor,
+        action: `agent.${phase}.policy`,
+        resource,
+        decision: 'denied',
+        reason: 'policy denied',
+        detail: agentAuditDetail(context.requestContext, {
+          policy: policy.name,
+          channel,
+        }),
+      });
+      return {
+        outcome: 'denied',
+        reason: `${policy.name}: ${decision.reason}`,
+      };
+    }
+  }
+  return { outcome: 'allowed', evaluated };
+}
+
+/** Result of evaluating text at a standalone content-policy boundary. */
+export type ContentPolicyGateResult =
+  | { allowed: true }
+  | { allowed: false; outcome: 'denied' | 'error' };
+
+/** Text and trusted Mastra context evaluated by a standalone content gate. */
+export interface ContentPolicyGateInput {
+  /** Canonical text that the downstream model would observe. */
+  text: string;
+  /** Trusted request context associated with the content. */
+  requestContext?: RequestContext;
+}
+
+/** Configuration for {@link createContentPolicyGate}. */
+export interface ContentPolicyGateOptions {
+  /** Policies snapshotted at construction and evaluated in array order. */
+  policies: readonly PolicyEvaluator[];
+  /** Optional audit logger for policy decisions and evaluator failures. */
+  audit?: AuditLogger;
+  /** Audit resource. Defaults to `breakwater-content-policy-gate`. */
+  resource?: string;
+}
+
+/** Standalone input-content policy boundary. */
+export type ContentPolicyGate = (
+  input: ContentPolicyGateInput,
+) => Promise<ContentPolicyGateResult>;
+
+/**
+ * Create an input-content gate for model-visible text outside a Mastra
+ * processor call. Denials and evaluator failures return opaque outcomes;
+ * policy names, reasons, inspected text, and thrown values remain internal.
+ *
+ * Every policy must be able to run here: this gate only ever evaluates the
+ * input phase on the answer channel, so a policy selecting anything else is
+ * a silent hole at a security boundary rather than a harmless no-op, and is
+ * rejected at construction.
+ */
+export function createContentPolicyGate(
+  options: ContentPolicyGateOptions,
+): ContentPolicyGate {
+  const policies = snapshotPolicies(options.policies);
+  for (const policy of policies) {
+    const selector =
+      policy.phases && !policy.phases.includes('input')
+        ? `phases ${JSON.stringify(policy.phases)}`
+        : !(policy.channels ?? DEFAULT_CHANNELS).includes('answer')
+          ? `channels ${JSON.stringify(policy.channels)}`
+          : undefined;
+    if (selector !== undefined) {
+      throw new TypeError(
+        `createContentPolicyGate: policy '${policy.name}' declares ${selector} — this gate only evaluates the 'input' phase on the 'answer' channel, so the policy would never run. Widen its selectors or register it on a PolicyEngine instead.`,
+      );
+    }
+  }
+  const audit = options.audit;
+  const resource = options.resource ?? 'breakwater-content-policy-gate';
+
+  return async ({ text, requestContext }) => {
+    const actor = actorFromRequestContext(requestContext) ?? null;
+    const result = await evaluatePoliciesInOrder({
+      policies,
+      context: {
+        phase: 'input',
+        channel: 'answer',
+        messages: [],
+        text,
+        requestContext,
+      },
+      actor,
+      audit,
+      resource,
+    });
+    if (result.outcome === 'denied') {
+      return { allowed: false, outcome: 'denied' };
+    }
+    if (result.outcome === 'error') {
+      return { allowed: false, outcome: 'error' };
+    }
+    recordAllowedPolicyDecision({
+      audit,
+      phase: 'input',
+      actor,
+      resource,
+      evaluated: result.evaluated,
+      requestContext,
+    });
+    return { allowed: true };
+  };
 }
 
 /** Configuration for `PolicyEngine`. */
@@ -699,58 +900,22 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
     abortOnError = false,
     streamAccumulator?: Record<string, unknown>,
   ): Promise<string[]> {
-    const { phase, channel } = context;
-    const evaluated: string[] = [];
-    for (const [index, policy] of this.#policies.entries()) {
-      if (policy.phases && !policy.phases.includes(phase)) continue;
-      if (!(policy.channels ?? DEFAULT_CHANNELS).includes(channel)) continue;
-      evaluated.push(policy.name);
-      let decision: PolicyDecision;
-      try {
-        decision = await policy.evaluate(
-          streamAccumulator
-            ? {
-                ...context,
-                streamState: policyStreamStateOf(streamAccumulator, index),
-              }
-            : context,
-        );
-      } catch (error) {
-        // An evaluator crash is worse than a denial; it must not leave less
-        // audit evidence than one. Opaque exception text may contain the
-        // inspected payload, so the audit and streaming tripwire stay static.
-        const reason = 'policy evaluation failed';
-        this.#audit?.record({
-          actor,
-          action: `agent.${phase}.policy`,
-          resource: this.#resource,
-          decision: 'error',
-          reason,
-          detail: agentAuditDetail(context.requestContext, {
-            policy: policy.name,
-            channel,
-          }),
-        });
-        if (abortOnError) abort(reason);
-        throw error;
-      }
-      if (!decision.allowed) {
-        const reason = `${policy.name}: ${decision.reason}`;
-        this.#audit?.record({
-          actor,
-          action: `agent.${phase}.policy`,
-          resource: this.#resource,
-          decision: 'denied',
-          reason: 'policy denied',
-          detail: agentAuditDetail(context.requestContext, {
-            policy: policy.name,
-            channel,
-          }),
-        });
-        abort(reason);
-      }
+    const result = await evaluatePoliciesInOrder({
+      policies: this.#policies,
+      context,
+      actor,
+      audit: this.#audit,
+      resource: this.#resource,
+      streamAccumulator,
+    });
+    if (result.outcome === 'denied') {
+      abort(result.reason);
     }
-    return evaluated;
+    if (result.outcome === 'error') {
+      if (abortOnError) abort(POLICY_EVALUATION_FAILED);
+      throw result.error;
+    }
+    return result.evaluated;
   }
 
   #assertObjectChannelCoverage(args: ProcessOutputResultArgs): void {
@@ -784,15 +949,14 @@ export class PolicyEngine implements Processor<'breakwater-policy-engine'> {
     requestContext?: RequestContext,
     channels?: readonly OutputChannel[],
   ): void {
-    this.#audit?.record({
+    recordAllowedPolicyDecision({
+      audit: this.#audit,
+      phase,
       actor,
-      action: `agent.${phase}.policy`,
       resource: this.#resource,
-      decision: 'allowed',
-      detail: agentAuditDetail(requestContext, {
-        evaluated,
-        ...(channels !== undefined ? { channels } : {}),
-      }),
+      evaluated,
+      requestContext,
+      channels,
     });
   }
 }

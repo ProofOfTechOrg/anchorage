@@ -155,6 +155,17 @@ state remains application-owned and is not deep-cloned:
 - `reasoning` is the model reasoning trace.
 - `object` is the latest canonical JSON structured-output snapshot.
 
+Use `createContentPolicyGate()` when trusted host code must apply the same
+ordered input-policy contract before content enters a framework-owned path that
+does not traverse Mastra's input processors. The gate accepts the exact text
+the downstream model will see plus an optional trusted `RequestContext`. It
+returns only allowed, denied, or evaluator-error state; policy names, reasons,
+content, and thrown values remain confined to the configured audit sink. Every
+registered policy must be able to run on the input `answer` channel — one that
+could never be evaluated here is rejected at construction, not skipped. That
+includes `maxTextLength`, which defaults to the output phase: pass
+`maxTextLength(n, { phases: ['input'] })` to use it at this boundary.
+
 The included policies are:
 
 | Policy | Default coverage | Purpose |
@@ -475,6 +486,7 @@ The root entry point re-exports the supported APIs from every subpath.
 | Runtime exports | Purpose |
 | --- | --- |
 | `PolicyEngine` | Mastra input, stream-output, and final-output processor |
+| `createContentPolicyGate` | Opaque, reusable input-policy gate for trusted host boundaries |
 | `denyPatterns`, `maxTextLength`, `piiSecrets`, `classifierPolicy` | Included agent-boundary evaluators |
 | `PII_SECRETS_DETECTOR_IDS` | Stable detector ID list |
 | `extractMessageText` | Extract policy text from Mastra messages |
@@ -484,7 +496,9 @@ The root entry point re-exports the supported APIs from every subpath.
 | `ISOLATION_SCOPE_CONTEXT_KEY`, `WORKFLOW_SCOPE_CONTEXT_KEY`, `LLM_BACKGROUND_OVERRIDE_KEY` | Stable scope and override keys |
 
 Type exports: `PolicyEngineOptions`, `PolicyEvaluator`, `PolicyContext`,
-`PolicyDecision`, `PolicyPhase`, `OutputChannel`, `PiiSecretsOptions`,
+`PolicyDecision`, `ContentPolicyGate`, `ContentPolicyGateInput`,
+`ContentPolicyGateOptions`, `ContentPolicyGateResult`, `PolicyPhase`,
+`OutputChannel`, `PiiSecretsOptions`,
 `PiiSecretsDetectorId`, `ClassifierPolicyOptions`, `ToolPolicyEvaluator`,
 `ToolCallContext`, `SideEffect`, `NetworkEgressOptions`,
 `CrossWorkflowIsolationOptions`, `BackgroundExecutionOptions`, and

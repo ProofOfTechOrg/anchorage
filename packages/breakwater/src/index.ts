@@ -123,6 +123,10 @@ export {
 export type {
   BackgroundExecutionOptions,
   ClassifierPolicyOptions,
+  ContentPolicyGate,
+  ContentPolicyGateInput,
+  ContentPolicyGateOptions,
+  ContentPolicyGateResult,
   CrossWorkflowIsolationOptions,
   NetworkEgressOptions,
   OutputChannel,
@@ -142,6 +146,7 @@ export {
   approvalRequired,
   backgroundExecution,
   classifierPolicy,
+  createContentPolicyGate,
   crossWorkflowIsolation,
   denyPatterns,
   egressDomainAllowed,

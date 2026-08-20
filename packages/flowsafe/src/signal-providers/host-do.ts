@@ -11,7 +11,11 @@ import {
 } from '../do-runner/index.js';
 import type { ThreadTopology } from '../host-kit/index.js';
 import { positiveSafeInteger } from '../numeric-config.js';
-import { deliverNotification } from './delivery.js';
+import {
+  classifyDeliveryError,
+  classifyDeliveryResponse,
+  deliverNotification,
+} from './delivery.js';
 import { SIGNAL_PROVIDER_HOST_INSTANCE_NAME } from './host-topology.js';
 import type { SignalProviderAdapter } from './provider.js';
 import type { SubscriptionStore } from './subscription-d1.js';
@@ -50,6 +54,17 @@ export interface SignalProviderHostWiring {
 export interface PollResult {
   providersPolled: number;
   delivered: number;
+  /** Deliveries the thread Durable Object refused on content. Omitted when zero. */
+  denied?: number;
+  /** Deliveries a defect made undeliverable — an adapter or stored-row bug. Omitted when zero. */
+  failed?: number;
+  /**
+   * Deliveries this deployment could not decide. Omitted when zero. Recovery is
+   * the provider's: a poll adapter re-reports state it has not seen accepted,
+   * so the next poll re-delivers. An adapter that advances its own cursor on
+   * every returned delivery drops these.
+   */
+  deferred?: number;
 }
 
 function json(payload: unknown, status = 200): Response {
@@ -140,6 +155,9 @@ export abstract class SignalProviderHost<TEnv = unknown> {
     const { store, topology, providers } = this.#ensureWiring();
     let providersPolled = 0;
     let delivered = 0;
+    let denied = 0;
+    let failed = 0;
+    let deferred = 0;
     for (const provider of providers) {
       if (!provider.pollForDeliveries) continue;
       providersPolled += 1;
@@ -150,30 +168,48 @@ export abstract class SignalProviderHost<TEnv = unknown> {
         );
         const deliveries = await provider.pollForDeliveries(subscriptions);
         for (const delivery of deliveries) {
+          const subscription = authorized.get(delivery.subscription.id);
+          if (!subscription) {
+            // A provider handing back a row this host never authorized is a
+            // defect in the adapter, not a transient condition; polling again
+            // would return it again.
+            failed += 1;
+            console.error(
+              JSON.stringify({
+                type: 'signal-provider.delivery-error',
+                providerId: provider.id,
+                reason: `provider '${provider.id}' returned an unbound subscription`,
+              }),
+            );
+            continue;
+          }
           try {
-            const subscription = authorized.get(delivery.subscription.id);
-            if (!subscription) {
-              throw new Error(
-                `provider '${provider.id}' returned an unbound subscription`,
-              );
-            }
             const response = await deliverNotification(
               topology,
               subscription,
               delivery.notification,
             );
-            if (response.ok) {
+            const outcome = classifyDeliveryResponse(response.status);
+            if (outcome === 'delivered') {
               delivered += 1;
-            } else {
-              console.error(
-                JSON.stringify({
-                  type: 'signal-provider.delivery-rejected',
-                  providerId: provider.id,
-                  status: response.status,
-                }),
-              );
+              continue;
             }
+            if (outcome === 'denied') denied += 1;
+            else if (outcome === 'failed') failed += 1;
+            else deferred += 1;
+            console.error(
+              JSON.stringify({
+                type: 'signal-provider.delivery-rejected',
+                providerId: provider.id,
+                status: response.status,
+                terminal: outcome !== 'deferred',
+              }),
+            );
           } catch (error) {
+            const outcome = classifyDeliveryError(error);
+            if (outcome === 'denied') denied += 1;
+            else if (outcome === 'failed') failed += 1;
+            else deferred += 1;
             console.error(
               JSON.stringify({
                 type: 'signal-provider.delivery-error',
@@ -193,7 +229,13 @@ export abstract class SignalProviderHost<TEnv = unknown> {
         );
       }
     }
-    return { providersPolled, delivered };
+    return {
+      providersPolled,
+      delivered,
+      ...(denied > 0 ? { denied } : {}),
+      ...(failed > 0 ? { failed } : {}),
+      ...(deferred > 0 ? { deferred } : {}),
+    };
   }
 
   async #arm(): Promise<void> {

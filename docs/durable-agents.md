@@ -246,7 +246,7 @@ Mount `createSignalRouter()` through `createFlowsafeWorker({ buildSignalRouter }
 
 The Worker applies this order: authentication, coarse role, thread lookup, byte cap, JSON parse, client-memory-id rejection, attribute-key allowlist, the configured rate-limit seam, audit, then topology forwarding. The starter's limiter is isolate-local example protection; use shared durable state when the limit is contractual across the deployment.
 
-Signals are untrusted model input. Core escapes the XML representation, while the route validates tag/attribute names and caps payload size. Apply breakwater input policy to the receiving agent for domain-specific content controls.
+Signals are untrusted model input. Core escapes the XML representation, while the route validates tag and attribute names and caps payload size. A receiving agent's ordinary `processInput` policy is not a complete signal boundary: Mastra can drain queued signals after the initiating input processor has run. Configure `createThreadSignalRoutes({ contentPolicy })` to inspect Mastra's canonical escaped XML inside the Thread Durable Object before delivery, persistence, wake, or run start. The same boundary covers direct routes, providers, schedules, and notification dispatch.
 
 `SignalClient` is DOM-free and is also exported from `@proofoftech/flowsafe/signals/client`.
 

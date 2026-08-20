@@ -112,6 +112,12 @@ Application input processors may implement only `processInput`. Application outp
 - structured-object stream snapshots;
 - custom synchronous or asynchronous policy evaluators.
 
+`createContentPolicyGate()` exposes the same ordered input-policy decision as
+an opaque host callback for content paths that do not traverse Mastra's input
+processors. The host supplies the exact model-visible text and trusted request
+context, then must stop before model, persistence, wake, or run-start side
+effects on denial or evaluator failure.
+
 Under the supported Mastra version, structured objects parsed by `generate()` and the chunks core's `StructuredOutputProcessor` emits never pass through the agent's output processors. Mastra also copies a parsed value into messages and may send it to persistence and observability hooks before `generate()` returns. A post-generation wrapper gate is therefore not a containment boundary. The guarded agent rejects structured output before execution and rejects object-only policies at construction. A standalone `PolicyEngine` validates processor-visible object chunks as JSON, evaluates their canonical snapshots, forwards the same canonical clones, and aborts at the result boundary when an object-only policy saw no such chunk.
 
 The guarded handle also carries a versioned host protocol. Flowsafe checks that protocol before durable wrapping and rejects guarded structured output on every durable entry point, preserving the narrow handle's refusal even though Mastra's durable runner invokes the raw agent through processor lists.

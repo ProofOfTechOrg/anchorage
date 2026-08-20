@@ -33,6 +33,12 @@ import type {
   SendAgentSignalOptions,
 } from '@mastra/core/agent';
 import {
+  createMessageSignal,
+  createSignal,
+  resolveDeliveryAttributes,
+  signalToXmlMarkup,
+} from '@mastra/core/agent';
+import {
   createNotificationSignal,
   createNotificationSummarySignal,
   type NotificationRecord,
@@ -150,6 +156,25 @@ export interface ScheduleSignalDispatchStore {
   ): Promise<void>;
 }
 
+export interface SignalContentPolicyInput {
+  text: string;
+  agentId: string;
+  threadId: string;
+  resourceId?: string;
+  runId?: string;
+  deploymentTag?: string;
+  entryPath: AgentEntryPath;
+  principal: ExecutionPrincipal;
+}
+
+export type SignalContentPolicyResult =
+  | { allowed: true }
+  | { allowed: false; outcome: 'denied' | 'error' };
+
+export type SignalContentPolicy = (
+  input: SignalContentPolicyInput,
+) => SignalContentPolicyResult | Promise<SignalContentPolicyResult>;
+
 export interface ThreadSignalRoutesOptions {
   /**
    * The per-thread agent whose public signal methods these routes drive. Built
@@ -230,6 +255,12 @@ export interface ThreadSignalRoutesOptions {
   resolveScheduleDispatchStore?: (
     scope: ThreadScope,
   ) => ScheduleSignalDispatchStore | Promise<ScheduleSignalDispatchStore>;
+  /**
+   * Optional model-visible content gate. FlowSafe supplies only trusted route
+   * identity plus Mastra's canonical escaped XML; the callback must return the
+   * opaque structural result and is never given a request body or storage row.
+   */
+  contentPolicy?: SignalContentPolicy;
 }
 
 /**
@@ -299,7 +330,8 @@ function isContents(value: unknown): value is string {
  * (and attribute names) inside `signalToXmlMarkup` — MIRRORED here, not
  * deep-imported: `XML_NAME_PATTERN` / `assertXmlName` are not on core's exports
  * map. Validating the caller-supplied `tagName` at INGEST turns an invalid one
- * into a 400 at the route rather than a
+ * into a 400 at the route, and an invalid attribute name into a dropped
+ * attributes object (`isAttributes`), rather than a
  * throw at render time inside the agent turn. Kept byte-identical to core
  * (chunk `signalToXmlMarkup`: `/^[A-Za-z_][A-Za-z0-9_.-]*$/`); the render test
  * pins core's own neutralization of contents/attribute values so this
@@ -307,19 +339,98 @@ function isContents(value: unknown): value is string {
  */
 const XML_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
 
-/** Attributes must be a flat record of primitives (core `AgentSignalAttributes`). */
+/**
+ * Attributes must be a flat record of primitives (core `AgentSignalAttributes`)
+ * whose rendered KEYS are XML names. Core's `signalAttributesToXml` drops
+ * null/undefined entries and then asserts the name of every remaining key, so
+ * an unrenderable key would otherwise throw at render time — inside the agent
+ * turn, or here at the content gate — long after the route accepted it. A
+ * malformed attributes object is dropped whole, exactly as a malformed
+ * attribute VALUE already is.
+ */
 function isAttributes(value: unknown): value is AgentSignalAttributes {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     return false;
   }
-  return Object.values(value).every(
-    (v) =>
+  return Object.entries(value).every(
+    ([key, v]) =>
       v === null ||
       v === undefined ||
-      typeof v === 'string' ||
-      typeof v === 'number' ||
-      typeof v === 'boolean',
+      (XML_NAME_PATTERN.test(key) &&
+        (typeof v === 'string' ||
+          typeof v === 'number' ||
+          typeof v === 'boolean')),
   );
+}
+
+/**
+ * Whether already-typed attributes can be rendered — the key half of the
+ * `isAttributes` rule, for server-owned records that arrive typed and so need
+ * no value check. Absent attributes render fine.
+ */
+function renderableAttributes(
+  attributes: AgentSignalAttributes | undefined,
+): boolean {
+  if (attributes === undefined) return true;
+  return Object.entries(attributes).every(
+    ([key, value]) =>
+      value === null || value === undefined || XML_NAME_PATTERN.test(key),
+  );
+}
+
+type SignalContentInspection = 'allowed' | 'denied' | 'error';
+type RenderableSignal = Pick<
+  AgentSignal,
+  'type' | 'tagName' | 'attributes' | 'contents'
+>;
+type InspectSignalContent = (
+  signal: RenderableSignal,
+  runId?: string,
+) => Promise<SignalContentInspection>;
+
+async function inspectSignalContent(
+  policy: SignalContentPolicy,
+  input: Omit<SignalContentPolicyInput, 'text' | 'runId'>,
+  signal: RenderableSignal,
+  runId?: string,
+): Promise<SignalContentInspection> {
+  if (typeof signal.contents !== 'string') return 'error';
+  let text: string;
+  try {
+    text = signalToXmlMarkup({
+      type: signal.type,
+      tagName: signal.tagName,
+      attributes: signal.attributes,
+      contents: signal.contents,
+    });
+  } catch {
+    return 'error';
+  }
+  try {
+    const result = await policy({
+      ...input,
+      text,
+      ...(runId !== undefined ? { runId } : {}),
+    });
+    if (result?.allowed === true) return 'allowed';
+    if (
+      result?.allowed === false &&
+      (result.outcome === 'denied' || result.outcome === 'error')
+    ) {
+      return result.outcome;
+    }
+  } catch {
+    return 'error';
+  }
+  return 'error';
+}
+
+function signalContentPolicyResponse(
+  inspection: Exclude<SignalContentInspection, 'allowed'>,
+): Response {
+  return inspection === 'denied'
+    ? json({ error: 'signal content denied' }, 422)
+    : json({ error: 'signal content policy unavailable' }, 503);
 }
 
 export function createThreadSignalRoutes(
@@ -338,6 +449,7 @@ export function createThreadSignalRoutes(
     canPersistSchedule,
     resolveNotificationsStorage,
     resolveScheduleDispatchStore,
+    contentPolicy,
   } = options;
   if (resolveBlockingRun && !serializeDispatch) {
     throw new Error(
@@ -453,6 +565,24 @@ export function createThreadSignalRoutes(
         ? () => resolveBlockingRun(scope)
         : undefined;
       const persistenceAllowed = canPersist ? await canPersist(scope) : true;
+      const inspectContent: InspectSignalContent | undefined = contentPolicy
+        ? (signal, runId) =>
+            inspectSignalContent(
+              contentPolicy,
+              {
+                agentId: agent.id,
+                threadId,
+                ...(resourceId !== undefined ? { resourceId } : {}),
+                ...(scope.deploymentTag !== undefined
+                  ? { deploymentTag: scope.deploymentTag }
+                  : {}),
+                entryPath,
+                principal: scope.principal,
+              },
+              signal,
+              runId,
+            )
+        : undefined;
 
       // POST /signal/message — immediate user message (joins the active loop or,
       // idle, wakes/persists per ifIdle).
@@ -471,6 +601,7 @@ export function createThreadSignalRoutes(
           serializeWake,
           blockingRun,
           persistenceAllowed,
+          inspectContent,
         );
       }
       // POST /signal/queue — deliver on the NEXT turn (never wakes).
@@ -483,6 +614,7 @@ export function createThreadSignalRoutes(
           scope.principal,
           blockingRun,
           persistenceAllowed,
+          inspectContent,
         );
       }
       // POST /signal — a system signal (ifActive/ifIdle deliver/persist/discard/wake).
@@ -501,6 +633,7 @@ export function createThreadSignalRoutes(
           serializeWake,
           blockingRun,
           persistenceAllowed,
+          inspectContent,
         );
       }
       if (path === '/signal/schedule') {
@@ -532,11 +665,18 @@ export function createThreadSignalRoutes(
             : undefined,
           store: await resolveScheduleDispatchStore(scope),
           completed: completedScheduleDispatches,
+          inspectContent,
         });
       }
       // POST /signal/state — a durable thread-state lane (snapshot/delta).
       if (path === '/signal/state') {
-        return await handleState(agent, body, threadId, resourceId);
+        return await handleState(
+          agent,
+          body,
+          threadId,
+          resourceId,
+          inspectContent,
+        );
       }
       if (requestedAgentId !== undefined) {
         if (!resolveNotificationsStorage) {
@@ -562,13 +702,14 @@ export function createThreadSignalRoutes(
             persistenceAllowed,
             storage: await resolveNotificationsStorage(scope),
             agentId: requestedAgentId,
+            inspectContent,
           }),
         );
       }
       // POST /signal/notification — the durable AGENT inbox (mastra_notifications).
       if (path === '/signal/notification') {
         return await serializeNotification(() =>
-          handleNotification(agent, body, threadId, resourceId),
+          handleNotification(agent, body, threadId, resourceId, inspectContent),
         );
       }
       return json({ error: 'not found' }, 404);
@@ -619,6 +760,7 @@ async function handleNotificationDispatch(options: {
   persistenceAllowed: boolean;
   storage: NotificationsStorage;
   agentId: string;
+  inspectContent?: InspectSignalContent;
 }): Promise<Response> {
   const ids = options.body.notificationIds;
   if (
@@ -720,9 +862,42 @@ async function handleNotificationDispatch(options: {
 
   let delivered = 0;
   let failed = 0;
+  let discarded = 0;
+  // Records whose terminal discard is already durable. A later throw in the
+  // same group funnels the group into `updateFailure`; without this, an
+  // already-discarded record would be counted twice and have its
+  // content-policy reason overwritten by an unrelated storage error.
+  const settledDiscards = new Set<string>();
   const updateFailure = async (record: NotificationRecord, error: unknown) => {
+    if (settledDiscards.has(record.id)) return;
     failed += 1;
     await deferNotificationAfterFailure(options.storage, record, now, error);
+  };
+  const discardAfterDenial = async (record: NotificationRecord) => {
+    await options.storage.updateNotification({
+      id: record.id,
+      threadId: record.threadId,
+      status: 'discarded',
+      deliveryReason: 'content-policy-denied',
+      lastDeliveryAttemptAt: now,
+    });
+    settledDiscards.add(record.id);
+    discarded += 1;
+  };
+  const inspect = async (
+    signal: AgentSignal,
+  ): Promise<SignalContentInspection> => {
+    if (!options.inspectContent) return 'allowed';
+    return options.inspectContent(
+      signal,
+      durableBlockingRun?.runId ??
+        (typeof options.agent.getActiveThreadRunId === 'function'
+          ? options.agent.getActiveThreadRunId({
+              threadId: options.threadId,
+              resourceId,
+            })
+          : undefined),
+    );
   };
   const send = async (signal: AgentSignal): Promise<string> => {
     const response = await handleWake({
@@ -791,10 +966,28 @@ async function handleNotificationDispatch(options: {
 
   for (const item of planNotificationDispatch(records, now)) {
     if (item.type === 'summary') {
+      // Everything from rendering onward stays inside this try: a storage
+      // failure in the discard/failure bookkeeping below must be contained to
+      // this group, exactly as the individual branch contains its own, rather
+      // than escaping and abandoning the rest of the plan.
       try {
         const signal = createNotificationSummarySignal(
           summarizeNotifications(item.records),
         );
+        const inspection = await inspect(signal);
+        if (inspection === 'denied') {
+          for (const record of item.records) await discardAfterDenial(record);
+          continue;
+        }
+        if (inspection === 'error') {
+          for (const record of item.records) {
+            await updateFailure(
+              record,
+              new Error('signal content policy failed'),
+            );
+          }
+          continue;
+        }
         const lowPriority = item.records.every(
           (record) => record.priority === 'low',
         );
@@ -849,13 +1042,21 @@ async function handleNotificationDispatch(options: {
         skipped += 1;
         continue;
       }
-      const signalId = await send(
-        createNotificationSignal({
-          ...record,
-          status: 'delivered',
-          deliveredAt: now,
-        }),
-      );
+      const signal = createNotificationSignal({
+        ...record,
+        status: 'delivered',
+        deliveredAt: now,
+      });
+      const inspection = await inspect(signal);
+      if (inspection === 'denied') {
+        await discardAfterDenial(record);
+        continue;
+      }
+      if (inspection === 'error') {
+        await updateFailure(record, new Error('signal content policy failed'));
+        continue;
+      }
+      const signalId = await send(signal);
       await options.storage.updateNotification({
         id: record.id,
         threadId: record.threadId,
@@ -872,6 +1073,7 @@ async function handleNotificationDispatch(options: {
   return json({
     delivered,
     failed,
+    ...(discarded > 0 ? { discarded } : {}),
     ...(skipped > 0 ? { skipped } : {}),
     ...(carriesBatchThreadState ? { batchThreadState } : {}),
   });
@@ -1135,6 +1337,7 @@ async function handleScheduleSignal(options: {
   }) => Promise<{ runId: string; status?: string } | undefined>;
   store: ScheduleSignalDispatchStore;
   completed: Map<string, ScheduleAgentDispatchReceipt>;
+  inspectContent?: InspectSignalContent;
 }): Promise<Response> {
   const scheduleId = options.body.scheduleId;
   const dispatchId = options.body.dispatchId;
@@ -1154,9 +1357,20 @@ async function handleScheduleSignal(options: {
     return json({ error: 'invalid schedule signal dispatch' }, 400);
   }
   const resourceId = options.resourceId;
-  if (target.tagName !== undefined && !XML_NAME_PATTERN.test(target.tagName)) {
-    return json({ error: 'tagName is not a valid XML name' }, 400);
-  }
+
+  // Every terminal "this fire will not be delivered" outcome settles the same
+  // canonical receipt, so a replay of the dispatch returns it instead of
+  // re-deciding. Settling is what lets the schedule advance; leaving the lease
+  // unsettled is reserved for outcomes a later tick could still resolve.
+  const settleDiscard = async (): Promise<Response> => {
+    const receipt = createScheduleAgentDispatchReceipt('discard', {
+      signalId: dispatchId,
+    });
+    options.completed.set(dispatchId, receipt);
+    await options.store.settle(scheduleId, dispatchId, receipt);
+    options.completed.delete(dispatchId);
+    return json({ receipt });
+  };
 
   const completed = options.completed.get(dispatchId);
   if (completed) {
@@ -1210,12 +1424,38 @@ async function handleScheduleSignal(options: {
     return json({ receipt });
   }
 
+  // A stored target that cannot be rendered as XML can never be delivered: core
+  // asserts the tag name and every surviving attribute name inside
+  // signalToXmlMarkup, and a schedule's attributes never pass through
+  // `isAttributes` (core types them as a bare string record). Returning an error
+  // would leave the lease unsettled and hand the same permanently broken target
+  // to every later tick, so settle it terminally and let the schedule advance.
+  const effectiveTagName = target.tagName ?? 'schedule';
+  if (
+    !XML_NAME_PATTERN.test(effectiveTagName) ||
+    !renderableAttributes(target.attributes) ||
+    !renderableAttributes(target.ifActive?.attributes) ||
+    !renderableAttributes(target.ifIdle?.attributes)
+  ) {
+    // The operator has to be able to find the broken schedule; the offending
+    // name itself stays out of the log.
+    console.error(
+      JSON.stringify({
+        type: 'schedule-target-unrenderable',
+        scheduleId,
+        dispatchId,
+        agentId: target.agentId,
+      }),
+    );
+    return await settleDiscard();
+  }
+
   const baseProviderOptions = target.providerOptions ?? {};
   const baseMastra = recordValue(baseProviderOptions.mastra) ?? {};
   const signal: AgentSignal = {
     id: dispatchId,
     type: target.signalType ?? 'notification',
-    tagName: target.tagName ?? 'schedule',
+    tagName: effectiveTagName,
     contents: target.prompt,
     ...(target.attributes !== undefined
       ? { attributes: target.attributes }
@@ -1255,15 +1495,43 @@ async function handleScheduleSignal(options: {
         })
       : options.persistenceAllowed;
   if (persistenceRequested && !persistenceAllowed) {
-    const receipt: ScheduleAgentDispatchReceipt = {
-      action: 'discard',
-      outcome: 'discarded',
-      signalId: dispatchId,
-    };
-    options.completed.set(dispatchId, receipt);
-    await options.store.settle(scheduleId, dispatchId, receipt);
-    options.completed.delete(dispatchId);
-    return json({ receipt });
+    return await settleDiscard();
+  }
+  if (options.inspectContent) {
+    // Mastra chooses the active or idle branch after an async boundary, so both
+    // renderings are inspected. `resolveDeliveryAttributes` returns the SAME
+    // object when a branch declares no attributes — the default — so the common
+    // case is one inspection, not two identical ones (a host policy backed by a
+    // classifier would otherwise pay twice per fire and audit twice).
+    const createdSignal = createSignal(signal);
+    const activeSignal = resolveDeliveryAttributes(
+      createdSignal,
+      ifActive.attributes,
+    );
+    const idleSignal = resolveDeliveryAttributes(
+      createdSignal,
+      ifIdle.attributes,
+    );
+    const executingRunId = localActiveRunId ?? durableBlockingRun?.runId;
+    const [activeInspection, idleInspection] =
+      activeSignal === idleSignal
+        ? [
+            await options.inspectContent(activeSignal, executingRunId ?? runId),
+            undefined,
+          ]
+        : await Promise.all([
+            options.inspectContent(activeSignal, executingRunId),
+            options.inspectContent(idleSignal, runId),
+          ]);
+    // Denial wins over an evaluator failure on the other branch: only one branch
+    // ever delivers, but which one is not known here, so refusing terminally is
+    // the fail-closed answer.
+    if (activeInspection === 'denied' || idleInspection === 'denied') {
+      return await settleDiscard();
+    }
+    if (activeInspection === 'error' || idleInspection === 'error') {
+      return signalContentPolicyResponse('error');
+    }
   }
   const idleRequestContext =
     ifIdle.streamOptions?.requestContext ?? streamRequestContext;
@@ -1358,6 +1626,18 @@ async function handleScheduleSignal(options: {
   return json({ receipt });
 }
 
+async function contentPolicyRefusal(
+  inspectContent: InspectSignalContent | undefined,
+  signal: RenderableSignal,
+  runId?: string,
+): Promise<Response | undefined> {
+  if (!inspectContent) return undefined;
+  const inspection = await inspectContent(signal, runId);
+  return inspection === 'allowed'
+    ? undefined
+    : signalContentPolicyResponse(inspection);
+}
+
 async function handleMessage(
   agent: Agent,
   body: Record<string, unknown>,
@@ -1372,6 +1652,7 @@ async function handleMessage(
   serializeWake: <T>(operation: () => Promise<T>) => Promise<T>,
   blockingRun: BlockingRunResolver | undefined,
   persistenceAllowed: boolean,
+  inspectContent: InspectSignalContent | undefined,
 ): Promise<Response> {
   if (!isContents(body.contents)) {
     return json({ error: 'contents (string) is required' }, 400);
@@ -1399,6 +1680,12 @@ async function handleMessage(
   ) {
     return principalMismatchResponse(durableBlockingRun.runId);
   }
+  const policyRefusal = await contentPolicyRefusal(
+    inspectContent,
+    createMessageSignal(message),
+    durableBlockingRun?.runId,
+  );
+  if (policyRefusal) return policyRefusal;
   if (behavior === 'wake') {
     return handleWake({
       agent,
@@ -1456,6 +1743,7 @@ async function handleQueue(
   principal: ExecutionPrincipal,
   blockingRun: BlockingRunResolver | undefined,
   persistenceAllowed: boolean,
+  inspectContent: InspectSignalContent | undefined,
 ): Promise<Response> {
   if (!isContents(body.contents)) {
     return json({ error: 'contents (string) is required' }, 400);
@@ -1482,6 +1770,12 @@ async function handleQueue(
       decision: { action: 'discard', reason: 'persistence-forbidden' },
     });
   }
+  const policyRefusal = await contentPolicyRefusal(
+    inspectContent,
+    createMessageSignal(message),
+    durableBlockingRun?.runId,
+  );
+  if (policyRefusal) return policyRefusal;
   const result = agent.queueMessage(message, { threadId, resourceId });
   const decision = await result.accepted;
   return json({ decision, signalId: result.signal.id });
@@ -1501,6 +1795,7 @@ async function handleSignal(
   serializeWake: <T>(operation: () => Promise<T>) => Promise<T>,
   blockingRun: BlockingRunResolver | undefined,
   persistenceAllowed: boolean,
+  inspectContent: InspectSignalContent | undefined,
 ): Promise<Response> {
   if (!isContents(body.contents)) {
     return json({ error: 'contents (string) is required' }, 400);
@@ -1533,6 +1828,12 @@ async function handleSignal(
   ) {
     return principalMismatchResponse(durableBlockingRun.runId);
   }
+  const policyRefusal = await contentPolicyRefusal(
+    inspectContent,
+    createSignal(signal),
+    durableBlockingRun?.runId,
+  );
+  if (policyRefusal) return policyRefusal;
   if (resourceId === undefined) {
     // Active-only target: no idle branch available without a resourceId.
     const runId = crypto.randomUUID();
@@ -1604,6 +1905,7 @@ async function handleState(
   body: Record<string, unknown>,
   threadId: string,
   resourceId: string | undefined,
+  inspectContent: InspectSignalContent | undefined,
 ): Promise<Response> {
   if (typeof body.id !== 'string' || typeof body.cacheKey !== 'string') {
     return json(
@@ -1629,6 +1931,22 @@ async function handleState(
     ...(mode === 'snapshot' ? { value: body.value } : { delta: body.delta }),
     ...(isAttributes(body.attributes) ? { attributes: body.attributes } : {}),
   };
+  // Core's createStateSignalInput strips id/cacheKey/mode/value/delta out of the
+  // signal it renders (they ride in metadata, which signalToXmlMarkup never
+  // emits) and defaults tagName to 'state'. Mirror exactly that, so the gate
+  // inspects the markup the model will see and nothing else.
+  const policyRefusal = await contentPolicyRefusal(
+    inspectContent,
+    createSignal({
+      type: 'state',
+      tagName: 'state',
+      contents: state.contents,
+      ...(state.attributes !== undefined
+        ? { attributes: state.attributes }
+        : {}),
+    }),
+  );
+  if (policyRefusal) return policyRefusal;
   const result = await agent.sendStateSignal(state, { threadId, resourceId });
   // A snapshot whose cacheKey value is unchanged is de-duped (skipped) — no run
   // touched, no signal minted. Surface that distinctly rather than pretend a
@@ -1645,6 +1963,7 @@ async function handleNotification(
   body: Record<string, unknown>,
   threadId: string,
   resourceId: string | undefined,
+  inspectContent: InspectSignalContent | undefined,
 ): Promise<Response> {
   if (
     typeof body.source !== 'string' ||
@@ -1685,6 +2004,48 @@ async function handleNotification(
       { error: 'this thread has no resourceId wired; notifications need one' },
       409,
     );
+  }
+  // This gate is AUTHORITATIVE, not a preview: core's default delivery decision
+  // delivers an urgent notification — and an idle-thread high/medium one —
+  // straight out of sendNotificationSignal, waking a run, so those records never
+  // reach the dispatcher's second gate. Storage owns the id, the timestamps and
+  // any coalescing, so the exact row cannot be rendered here; inspect a
+  // prospective record carrying every untrusted model-visible field instead.
+  if (inspectContent) {
+    const prospectiveRecord: NotificationRecord = {
+      id: 'prospective',
+      threadId,
+      resourceId,
+      agentId: agent.id,
+      source: notification.source,
+      kind: notification.kind,
+      summary: notification.summary,
+      priority: notification.priority ?? 'medium',
+      status: 'pending',
+      coalescedCount: 1,
+      ...(notification.attributes !== undefined
+        ? { attributes: notification.attributes }
+        : {}),
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+    };
+    // Core picks between two renderings after an async boundary this route does
+    // not control, so inspect both — the same reason the schedule route inspects
+    // both delivery branches. The individual signal renders `status="delivered"`
+    // because that is the status core stamps on it when it sends; the summary
+    // renders from the row as stored, which is why it keeps `status:'pending'`.
+    for (const candidate of [
+      createNotificationSignal({ ...prospectiveRecord, status: 'delivered' }),
+      createNotificationSummarySignal(
+        summarizeNotifications([prospectiveRecord]),
+      ),
+    ]) {
+      const policyRefusal = await contentPolicyRefusal(
+        inspectContent,
+        candidate,
+      );
+      if (policyRefusal) return policyRefusal;
+    }
   }
   const result = await agent.sendNotificationSignal(notification, {
     threadId,

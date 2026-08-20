@@ -190,7 +190,8 @@ describe('SignalProviderHost.poll', () => {
     const result = await host.poll();
 
     // #then — the throwing delivery is isolated and the next one still lands.
-    expect(result).toEqual({ providersPolled: 1, delivered: 1 });
+    // An unclassifiable throw counts as deferred: it may well be an outage.
+    expect(result).toEqual({ providersPolled: 1, delivered: 1, deferred: 1 });
     expect(addressed).toEqual(['delivery-fails', 'delivery-ok']);
   });
 });

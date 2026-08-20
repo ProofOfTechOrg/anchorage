@@ -72,6 +72,10 @@ import {
   createConnector,
   invokeConnector,
 } from '@proofoftech/breakwater/connector-sdk';
+import {
+  createContentPolicyGate,
+  denyPatterns,
+} from '@proofoftech/breakwater/policy-engine';
 import { ACTOR_CONTEXT_KEY } from '@proofoftech/breakwater/rbac';
 import { z } from 'zod';
 import {
@@ -97,12 +101,14 @@ import {
   type ApprovalStreamSink,
   approvalGrantProvider,
   BREAKWATER_CONNECTOR_GRANTS_KEY,
+  breakwaterActorFor,
   createActorResolver,
   createApprovalRouter,
   createPrincipalActorContext,
   D1ApprovalStoreFactory,
   defaultResumeData,
   type ExecutionPrincipal,
+  principalAuditFields,
   type ResourceClaim,
   type ResourceKind,
   withRegisteredResourceOwner,
@@ -178,6 +184,7 @@ import {
   createThreadSignalRoutes,
   D1NotificationsStorage,
   D1ThreadStateStorage,
+  type SignalContentPolicyInput,
 } from '../src/signals/index.js';
 
 interface Env {
@@ -263,6 +270,39 @@ const SPIKE_AGENT_META = {
     { kind: 'service', entryPaths: ['signal.notification'] },
   ],
 } as const satisfies AgentMeta;
+
+// The signal content policy, wired the way the FlowSafe README documents it: a
+// REAL Breakwater gate behind FlowSafe's structural callback. The marker keeps
+// the boundary deterministic — every other spike signal renders clean and flows
+// unchanged, so this proves the gate under real workerd without gating the rest
+// of the run.
+const SPIKE_DENIED_CONTENT = 'spike-denied-content';
+
+const inspectSpikeSignalContent = createContentPolicyGate({
+  policies: [
+    denyPatterns([SPIKE_DENIED_CONTENT], { name: 'spike-signal-content' }),
+  ],
+  resource: 'spike-signal-content',
+});
+
+function spikeSignalPolicyContext(
+  input: SignalContentPolicyInput,
+): RequestContext {
+  const requestContext = new RequestContext();
+  requestContext.set(ACTOR_CONTEXT_KEY, breakwaterActorFor(input.principal));
+  requestContext.set(AGENT_AUDIT_CONTEXT_KEY, {
+    agentId: input.agentId,
+    ...(input.deploymentTag === undefined
+      ? {}
+      : { tenantId: input.deploymentTag }),
+    ...(input.runId === undefined ? {} : { runId: input.runId }),
+    threadId: input.threadId,
+    ...(input.resourceId === undefined ? {} : { resourceId: input.resourceId }),
+    entryPath: input.entryPath,
+    ...principalAuditFields(input.principal),
+  });
+  return requestContext;
+}
 
 const modelUsage = {
   inputTokens: 1,
@@ -1241,6 +1281,11 @@ export class DemoThread extends ThreadDurableObject<Env> {
   }
 
   #signalRoutes = createThreadSignalRoutes({
+    contentPolicy: (input) =>
+      inspectSpikeSignalContent({
+        text: input.text,
+        requestContext: spikeSignalPolicyContext(input),
+      }),
     resolveAgent: async (scope, agentId, entryPath) => {
       if (!this.state?.storage) {
         throw new Error('thread Durable Object storage is unavailable');
@@ -1928,6 +1973,28 @@ async function handleSignalProbe(
     });
     const probe = (await response.json()) as Record<string, unknown>;
     return json({ status: response.status, ...probe });
+  }
+
+  // C-S6 (content policy): the SAME thread-DO boundary every signal lane
+  // converges on refuses denied model-visible text and lets clean text through,
+  // under real workerd with a real Breakwater gate.
+  if (request.method === 'POST' && path === '/sig/content-policy') {
+    const threadId = mintThreadId();
+    const send = async (contents: string) => {
+      const response = await topology.send(
+        context,
+        threadId,
+        '/signal/message',
+        {
+          method: 'POST',
+          body: JSON.stringify({ contents, ifIdle: 'persist' }),
+        },
+      );
+      return { status: response.status, body: await response.text() };
+    };
+    const denied = await send(`please ${SPIKE_DENIED_CONTENT} now`);
+    const allowed = await send('an ordinary operator message');
+    return json({ denied, allowed });
   }
 
   if (request.method === 'POST' && path === '/sig/malformed-thread') {

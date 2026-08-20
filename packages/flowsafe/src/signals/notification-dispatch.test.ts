@@ -85,6 +85,72 @@ describe('createNotificationDispatchTick', () => {
     });
   });
 
+  it('surfaces terminal content-policy discards separately from failures', async () => {
+    // #given — two thread groups, one whose DO discarded both of its rows
+    const storage = new InMemoryNotificationsStorage();
+    for (const groupId of ['acme', 'globex']) {
+      await storage.createNotification({
+        id: groupId,
+        threadId: `${groupId}_thread`,
+        resourceId: `${groupId}_resource`,
+        agentId: 'agent',
+        source: 'test',
+        kind: 'ready',
+        summary: groupId,
+        deliverAt: new Date(NOW.getTime() - 1),
+      });
+    }
+    const send = vi.fn(async (_context, threadId: string) =>
+      threadId.startsWith('acme_')
+        ? new Response(
+            JSON.stringify({ delivered: 0, failed: 0, discarded: 2 }),
+          )
+        : new Response(JSON.stringify({ delivered: 1, failed: 0 })),
+    );
+    const tick = createNotificationDispatchTick({
+      storage,
+      topology: { send } as unknown as ThreadTopology,
+      resolveContext: actorContext,
+      now: () => NOW,
+    });
+
+    // #when / #then — a discard is neither a delivery nor a retryable failure
+    expect(await tick()).toEqual({
+      due: 2,
+      delivered: 1,
+      failed: 0,
+      discarded: 2,
+    });
+  });
+
+  it('omits the discard counter when no route discarded anything', async () => {
+    // #given — the pre-existing wire shape, which callers assert exactly
+    const storage = new InMemoryNotificationsStorage();
+    await storage.createNotification({
+      id: 'acme',
+      threadId: 'acme_thread',
+      resourceId: 'acme_resource',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'ready',
+      summary: 'acme',
+      deliverAt: new Date(NOW.getTime() - 1),
+    });
+    const send = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ delivered: 1, failed: 0, discarded: 0 })),
+    );
+    const tick = createNotificationDispatchTick({
+      storage,
+      topology: { send } as unknown as ThreadTopology,
+      resolveContext: actorContext,
+      now: () => NOW,
+    });
+
+    // #when / #then
+    expect(await tick()).toEqual({ due: 1, delivered: 1, failed: 0 });
+  });
+
   it('isolates a failed thread group from its neighbors', async () => {
     const storage = new InMemoryNotificationsStorage();
     for (const groupId of ['acme', 'globex']) {

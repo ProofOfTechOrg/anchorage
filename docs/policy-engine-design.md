@@ -34,6 +34,30 @@ method or mutation of caller-owned selector arrays does not change enforcement;
 mutable state owned by the evaluator instance or its closures remains the
 application's responsibility. The first denial aborts the phase.
 
+### Host content gate
+
+`createContentPolicyGate()` reuses the same snapshotted, declaration-ordered
+evaluation contract for a host boundary that already has the exact
+model-visible text. It evaluates an input-phase `answer` context and accepts an
+optional trusted `RequestContext`. A policy this gate could never evaluate —
+one whose declared phases exclude `input`, or whose declared channels exclude
+`answer` — is rejected at construction rather than silently skipped, because a
+policy that never runs is a hole at a security boundary. Of the included
+policies only `maxTextLength` is affected: it declares the output phase by
+default and needs an explicit `phases: ['input']` here.
+
+The result is deliberately opaque: `{ allowed: true }`,
+`{ allowed: false, outcome: 'denied' }`, or
+`{ allowed: false, outcome: 'error' }`. Policy names, denial reasons, inspected
+text, and evaluator exceptions are not returned. The configured audit sink
+retains the same static allow, denial, and error event vocabulary as
+`PolicyEngine`.
+
+This is a narrow adapter for framework paths that do not re-enter Mastra's
+input processor chain. The host remains responsible for supplying the exact
+downstream representation and for acting on denial before any model-visible
+side effect.
+
 ## Phases and channels
 
 Input processing joins textual message parts and evaluates them under the `answer` channel. Output processing maintains independent accumulated text for:
@@ -210,6 +234,7 @@ See [Deployment reference](deployment-reference.md) and [Operations runbook](ope
 | Requirement | Correct boundary |
 | --- | --- |
 | Deny a prompt before the model | Input processor |
+| Deny framework-owned input that bypasses processors | Host content gate over the exact model-visible representation |
 | Inspect answer/reasoning/object output | Output processor |
 | Require a grant on every tool invocation path | Connector wrapper |
 | Require a permission on every tool invocation path | Connector wrapper (`requiredPermissions` against the trusted projection) |

@@ -1639,6 +1639,37 @@ async function main() {
   );
 
   await step(
+    'I2 content policy (C-S6): the thread DO refuses denied model-visible ' +
+      'text and passes clean text through the same gate',
+    async () => {
+      const { status, body } = await http('POST', '/sig/content-policy');
+      assert(status === 200, `sig content-policy probe -> ${status}`, body);
+      // Denied: a 422 whose body names neither the policy nor the content.
+      assert(
+        body.denied?.status === 422,
+        'denied signal content -> 422 at the thread DO',
+        body.denied,
+      );
+      assert(
+        body.denied?.body === '{"error":"signal content denied"}',
+        'the refusal is the static, opaque denial body',
+        body.denied,
+      );
+      assert(
+        !String(body.denied?.body ?? '').includes('spike-denied-content'),
+        'the refusal does not echo the inspected content',
+        body.denied,
+      );
+      // Allowed: the same gate leaves an ordinary signal alone.
+      assert(
+        body.allowed?.status === 200,
+        'clean signal content still delivers through the same routes',
+        body.allowed,
+      );
+    },
+  );
+
+  await step(
     'J malformed thread fail-closed: the topology refuses an invalid DO address',
     async () => {
       const { status, body } = await http('POST', '/sig/malformed-thread');

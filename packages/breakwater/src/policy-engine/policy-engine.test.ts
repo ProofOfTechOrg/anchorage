@@ -13,14 +13,17 @@ import { RequestContext } from '@mastra/core/request-context';
 import { ChunkFrom, type ChunkType } from '@mastra/core/stream';
 import { describe, expect, it } from 'vitest';
 
-import { AuditLogger } from '../audit/index.js';
+import { AGENT_AUDIT_CONTEXT_KEY, AuditLogger } from '../audit/index.js';
 import { ACTOR_CONTEXT_KEY, type Actor } from '../rbac/index.js';
 import {
+  createContentPolicyGate,
   denyPatterns,
   extractMessageText,
   maxTextLength,
+  type OutputChannel,
   PolicyEngine,
   type PolicyEvaluator,
+  type PolicyPhase,
 } from './index.js';
 
 class Tripwire extends Error {}
@@ -28,6 +31,23 @@ class Tripwire extends Error {}
 class PrivateFieldPolicy implements PolicyEvaluator {
   readonly name = 'private-field-policy';
   readonly phases = ['output'] as const;
+  readonly #blocked: string;
+
+  constructor(blocked: string) {
+    this.#blocked = blocked;
+  }
+
+  evaluate({ text }: Parameters<PolicyEvaluator['evaluate']>[0]) {
+    return text.includes(this.#blocked)
+      ? { allowed: false as const, reason: 'matched private field' }
+      : { allowed: true as const };
+  }
+}
+
+class MutableInputPolicy implements PolicyEvaluator {
+  name = 'snapshotted-input';
+  phases: PolicyPhase[] = ['input'];
+  channels: OutputChannel[] = ['answer'];
   readonly #blocked: string;
 
   constructor(blocked: string) {
@@ -312,19 +332,18 @@ describe('PolicyEngine', () => {
   it('records an error audit event and rethrows when an evaluator throws', async () => {
     // #given
     const audit = new AuditLogger();
+    const failure = new Error('evaluator internal failure');
     const crashing: PolicyEvaluator = {
       name: 'crashy',
       evaluate: () => {
-        throw new Error('evaluator internal failure');
+        throw failure;
       },
     };
     const engine = new PolicyEngine({ policies: [crashing], audit });
 
     // #when / #then — the crash propagates (fail closed) AND leaves an audit
     // record; an internal error must not leave less evidence than a denial.
-    await expect(engine.processInput(makeInputArgs('x'))).rejects.toThrowError(
-      'evaluator internal failure',
-    );
+    await expect(engine.processInput(makeInputArgs('x'))).rejects.toBe(failure);
     expect(audit.events()).toHaveLength(1);
     expect(audit.events()[0]).toMatchObject({
       decision: 'error',
@@ -352,6 +371,256 @@ describe('PolicyEngine', () => {
       'boom',
     );
     expect(audit.events()[0]).toMatchObject({ decision: 'error' });
+  });
+});
+
+describe('createContentPolicyGate', () => {
+  it('evaluates the exact input context and records the existing allowed audit vocabulary', async () => {
+    const actor: Actor = { id: 'signal-sender', role: 'operator' };
+    const requestContext = new RequestContext();
+    requestContext.set(ACTOR_CONTEXT_KEY, actor);
+    requestContext.set(AGENT_AUDIT_CONTEXT_KEY, {
+      agentId: 'support-agent',
+      threadId: 'thread-7',
+      entryPath: 'signal.message',
+    });
+    const audit = new AuditLogger();
+    let observed: Parameters<PolicyEvaluator['evaluate']>[0] | undefined;
+    const gate = createContentPolicyGate({
+      policies: [
+        {
+          name: 'observe-context',
+          evaluate: async (context) => {
+            observed = context;
+            return { allowed: true };
+          },
+        },
+      ],
+      audit,
+      resource: 'signal-content',
+    });
+
+    await expect(
+      gate({ text: '<message>hello</message>', requestContext }),
+    ).resolves.toEqual({ allowed: true });
+
+    expect(Object.keys(observed ?? {}).sort()).toEqual([
+      'channel',
+      'messages',
+      'phase',
+      'requestContext',
+      'text',
+    ]);
+    expect(observed).toMatchObject({
+      phase: 'input',
+      channel: 'answer',
+      messages: [],
+      text: '<message>hello</message>',
+    });
+    expect(observed?.requestContext).toBe(requestContext);
+    expect(audit.events()).toHaveLength(1);
+    expect(audit.events()[0]).toMatchObject({
+      actor,
+      action: 'agent.input.policy',
+      resource: 'signal-content',
+      decision: 'allowed',
+      detail: {
+        evaluated: ['observe-context'],
+        agentId: 'support-agent',
+        threadId: 'thread-7',
+        entryPath: 'signal.message',
+      },
+    });
+  });
+
+  it('evaluates applicable policies in declaration order and stops on an opaque denial', async () => {
+    const secret = 'sk_live_signal-content';
+    const calls: string[] = [];
+    const audit = new AuditLogger();
+    const gate = createContentPolicyGate({
+      policies: [
+        {
+          name: 'first',
+          evaluate: async () => {
+            calls.push('first');
+            return { allowed: true };
+          },
+        },
+        {
+          name: 'blocker',
+          evaluate: ({ text }) => {
+            calls.push('blocker');
+            return {
+              allowed: false,
+              reason: `blocked content ${text}`,
+            };
+          },
+        },
+        {
+          name: 'never-called',
+          evaluate: () => {
+            calls.push('never-called');
+            return { allowed: true };
+          },
+        },
+      ],
+      audit,
+    });
+
+    const result = await gate({ text: secret });
+
+    expect(calls).toEqual(['first', 'blocker']);
+    expect(result).toEqual({ allowed: false, outcome: 'denied' });
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(audit.events()).toHaveLength(1);
+    expect(audit.events()[0]).toMatchObject({
+      action: 'agent.input.policy',
+      resource: 'breakwater-content-policy-gate',
+      decision: 'denied',
+      reason: 'policy denied',
+      detail: { policy: 'blocker', channel: 'answer' },
+    });
+    expect(JSON.stringify(audit.events())).not.toContain(secret);
+  });
+
+  it('maps an evaluator rejection to an opaque error and does not continue', async () => {
+    const secret = 'provider-secret-in-exception';
+    const failure = new Error(secret);
+    const calls: string[] = [];
+    const audit = new AuditLogger();
+    const gate = createContentPolicyGate({
+      policies: [
+        {
+          name: 'crashing-policy',
+          evaluate: async () => {
+            calls.push('crashing-policy');
+            throw failure;
+          },
+        },
+        {
+          name: 'never-called',
+          evaluate: () => {
+            calls.push('never-called');
+            return { allowed: true };
+          },
+        },
+      ],
+      audit,
+    });
+
+    const result = await gate({ text: 'model-visible text' });
+
+    expect(calls).toEqual(['crashing-policy']);
+    expect(result).toEqual({ allowed: false, outcome: 'error' });
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(audit.events()).toHaveLength(1);
+    expect(audit.events()[0]).toMatchObject({
+      action: 'agent.input.policy',
+      decision: 'error',
+      reason: 'policy evaluation failed',
+      detail: { policy: 'crashing-policy', channel: 'answer' },
+    });
+    expect(JSON.stringify(audit.events())).not.toContain(secret);
+  });
+
+  it('evaluates every registered policy, including phase- and channel-agnostic ones', async () => {
+    const calls: string[] = [];
+    const audit = new AuditLogger();
+    const gate = createContentPolicyGate({
+      policies: [
+        {
+          name: 'agnostic',
+          evaluate: () => {
+            calls.push('agnostic');
+            return { allowed: true };
+          },
+        },
+        {
+          name: 'input-any-channel',
+          phases: ['input'],
+          evaluate: () => {
+            calls.push('input-any-channel');
+            return { allowed: true };
+          },
+        },
+        {
+          name: 'input-answer',
+          phases: ['input'],
+          channels: ['answer'],
+          evaluate: () => {
+            calls.push('input-answer');
+            return { allowed: true };
+          },
+        },
+      ],
+      audit,
+    });
+
+    await expect(gate({ text: 'hello' })).resolves.toEqual({ allowed: true });
+    expect(calls).toEqual(['agnostic', 'input-any-channel', 'input-answer']);
+    expect(audit.events()[0]?.detail).toEqual({
+      evaluated: ['agnostic', 'input-any-channel', 'input-answer'],
+    });
+  });
+
+  // A policy this gate could never evaluate is a silent hole, not a harmless
+  // no-op: the host wired it expecting inspection. Every unreachable selector
+  // shape fails at construction rather than allowing everything at runtime.
+  it.each([
+    {
+      case: 'output-only phases',
+      policy: {
+        name: 'output-only',
+        phases: ['output'],
+        evaluate: () => ({ allowed: true }),
+      } satisfies PolicyEvaluator,
+    },
+    {
+      case: 'non-answer channels',
+      policy: {
+        name: 'reasoning-only',
+        channels: ['reasoning'],
+        evaluate: () => ({ allowed: true }),
+      } satisfies PolicyEvaluator,
+    },
+    {
+      case: 'input phases with non-answer channels',
+      policy: {
+        name: 'input-reasoning-only',
+        phases: ['input'],
+        channels: ['reasoning'],
+        evaluate: () => ({ allowed: true }),
+      } satisfies PolicyEvaluator,
+    },
+  ])('rejects a policy that could never run here ($case)', ({ policy }) => {
+    expect(() => createContentPolicyGate({ policies: [policy] })).toThrow(
+      new RegExp(`${policy.name}.*would never run`, 'is'),
+    );
+  });
+
+  it('snapshots policy declarations and preserves a class evaluator receiver', async () => {
+    const phases: PolicyPhase[] = ['input'];
+    const channels: OutputChannel[] = ['answer'];
+    const policy = new MutableInputPolicy('blocked');
+    policy.phases = phases;
+    policy.channels = channels;
+    const policies = [policy];
+    const audit = new AuditLogger();
+    const gate = createContentPolicyGate({ policies, audit });
+
+    policies.length = 0;
+    phases[0] = 'output';
+    channels[0] = 'reasoning';
+    policy.name = 'mutated';
+    policy.evaluate = () => ({ allowed: true });
+
+    await expect(gate({ text: 'blocked' })).resolves.toEqual({
+      allowed: false,
+      outcome: 'denied',
+    });
+    expect(audit.events()[0]?.detail).toMatchObject({
+      policy: 'snapshotted-input',
+    });
   });
 });
 
