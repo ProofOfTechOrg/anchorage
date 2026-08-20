@@ -17,9 +17,12 @@
 // request claim.
 
 import {
+  assertDeploymentIdentitySecret,
   assertValidDeploymentTag,
+  DEPLOYMENT_IDENTITY_HEADER,
   DEPLOYMENT_TAG_PATTERN,
   DeploymentIdentityError,
+  deploymentIdentityHeaders,
   type DeploymentIdentityProtocolExecutor,
   provisionDeploymentIdentityProtocol,
   readDeploymentIdentityProtocol,
@@ -43,16 +46,11 @@ export { DEPLOYMENT_TAG_PATTERN };
  */
 export { DeploymentIdentityError };
 
-/**
- * Internal Worker-to-Durable-Object credential header. Topology helpers always
- * overwrite it; public request resolvers reject it. The value is a deployment
- * secret, not the public deployment tag, so a cross-script namespace binding
- * cannot authenticate as the target deployment.
- */
-export const DEPLOYMENT_IDENTITY_HEADER = 'x-flowsafe-deployment-identity';
-
-const MIN_DEPLOYMENT_CREDENTIAL_LENGTH = 32;
-const MAX_DEPLOYMENT_CREDENTIAL_LENGTH = 256;
+export {
+  assertDeploymentIdentitySecret,
+  DEPLOYMENT_IDENTITY_HEADER,
+  deploymentIdentityHeaders,
+};
 
 /**
  * Minimal structural D1 surface the sentinel check uses — same posture as
@@ -84,22 +82,6 @@ export interface DeploymentIdentityEnv {
 
 function assertValidTag(tag: unknown, caller: string): asserts tag is string {
   assertValidDeploymentTag(tag, caller);
-}
-
-export function assertDeploymentIdentitySecret(
-  secret: unknown,
-  caller = 'deployment identity',
-): asserts secret is string {
-  if (
-    typeof secret !== 'string' ||
-    secret.length < MIN_DEPLOYMENT_CREDENTIAL_LENGTH ||
-    secret.length > MAX_DEPLOYMENT_CREDENTIAL_LENGTH ||
-    !/^[\x21-\x7e]+$/.test(secret)
-  ) {
-    throw new DeploymentIdentityError(
-      `${caller}: DEPLOYMENT_IDENTITY_SECRET must contain ${MIN_DEPLOYMENT_CREDENTIAL_LENGTH}-${MAX_DEPLOYMENT_CREDENTIAL_LENGTH} visible ASCII characters`,
-    );
-  }
 }
 
 function isDatabaseBinding(db: unknown): db is DeploymentIdentityDatabase {
@@ -287,21 +269,6 @@ export function ensureDeploymentIdentityBindings(
   return Promise.all(
     databases.map((db) => ensureDeploymentIdentity(db, expectedTag)),
   ).then(() => undefined);
-}
-
-/** Stamp the internal credential onto an ordinary topology request. */
-export function deploymentIdentityHeaders(
-  secret: string,
-  initial?: HeadersInit,
-): Record<string, string> {
-  assertDeploymentIdentitySecret(secret, 'deploymentIdentityHeaders');
-  const merged = new Headers(initial);
-  merged.set(DEPLOYMENT_IDENTITY_HEADER, secret);
-  const headers: Record<string, string> = {};
-  merged.forEach((value, key) => {
-    headers[key] = value;
-  });
-  return headers;
 }
 
 /** Clone a raw upgrade/forward request and overwrite the internal credential. */

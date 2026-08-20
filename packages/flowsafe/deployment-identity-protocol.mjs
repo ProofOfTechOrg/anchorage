@@ -4,6 +4,12 @@ export const DEPLOYMENT_TAG_PATTERN = /^[a-z0-9]{3,32}$/;
 export const DEPLOYMENT_ENVIRONMENT_PATTERN =
   /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
 export const DEPLOYMENT_SENTINEL_TABLE = 'flowsafe_deployment';
+/**
+ * Internal Worker-to-Durable-Object credential header. Topology helpers always
+ * overwrite it, and public request resolvers reject it. The value is a
+ * deployment secret rather than the public deployment tag.
+ */
+export const DEPLOYMENT_IDENTITY_HEADER = 'x-flowsafe-deployment-identity';
 export const DEPLOYMENT_SENTINEL_DDL = `CREATE TABLE IF NOT EXISTS ${DEPLOYMENT_SENTINEL_TABLE} (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   tenant_tag TEXT NOT NULL,
@@ -23,6 +29,8 @@ export const DEPLOYMENT_SENTINEL_COLUMNS = Object.freeze([
 const SENTINEL_SQL_PATTERN =
   /^create table (?:if not exists )?flowsafe_deployment\s*\(\s*id integer primary key check\s*\(\s*id\s*=\s*1\s*\)\s*,\s*tenant_tag text not null\s*,\s*provisioned_at text not null\s*\)$/i;
 const D1_OWNED_INTERNAL_TABLES = Object.freeze(['_cf_KV', '_cf_METADATA']);
+const MIN_DEPLOYMENT_CREDENTIAL_LENGTH = 32;
+const MAX_DEPLOYMENT_CREDENTIAL_LENGTH = 256;
 const D1_OWNED_TABLE_EXCLUSIONS = D1_OWNED_INTERNAL_TABLES.map(
   (name) => `           AND name <> '${name}'`,
 ).join('\n');
@@ -58,6 +66,30 @@ export class DeploymentIdentityError extends Error {
     super(message);
     this.name = 'DeploymentIdentityError';
   }
+}
+
+export function assertDeploymentIdentitySecret(
+  secret,
+  caller = 'deployment identity',
+) {
+  if (
+    typeof secret !== 'string' ||
+    secret.length < MIN_DEPLOYMENT_CREDENTIAL_LENGTH ||
+    secret.length > MAX_DEPLOYMENT_CREDENTIAL_LENGTH ||
+    !/^[\x21-\x7e]+$/.test(secret)
+  ) {
+    throw new DeploymentIdentityError(
+      `${caller}: DEPLOYMENT_IDENTITY_SECRET must contain ${MIN_DEPLOYMENT_CREDENTIAL_LENGTH}-${MAX_DEPLOYMENT_CREDENTIAL_LENGTH} visible ASCII characters`,
+    );
+  }
+}
+
+/** Stamp the internal credential onto an ordinary topology request. */
+export function deploymentIdentityHeaders(secret, initial) {
+  assertDeploymentIdentitySecret(secret, 'deploymentIdentityHeaders');
+  const merged = new Headers(initial);
+  merged.set(DEPLOYMENT_IDENTITY_HEADER, secret);
+  return Object.fromEntries(merged.entries());
 }
 
 export function isDeploymentEnvironment(value) {

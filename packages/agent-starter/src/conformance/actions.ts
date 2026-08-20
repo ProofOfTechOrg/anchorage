@@ -6,7 +6,7 @@ import {
   createAuditProxyDurableObjectBinding,
   createAuditProxyQueue,
 } from '@proofoftech/flowsafe/audit-export';
-import { deploymentIdentityHeaders } from '@proofoftech/flowsafe/do-runner';
+import { deploymentIdentityHeaders } from '@proofoftech/flowsafe/deployment-identity-protocol';
 import { z } from 'zod';
 
 import {
