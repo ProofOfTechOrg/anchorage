@@ -37,7 +37,7 @@ schedule work, or run durable agent loops on Cloudflare.
 
 ## Install it
 
-breakwater is ESM-only, requires Node.js 22.3 or newer (engine range `>=22.3.0`),
+breakwater is ESM-only, requires Node.js 22.13.0 or newer (engine range `>=22.13.0`),
 and requires `@mastra/core` `1.50.0`.
 
 ```bash

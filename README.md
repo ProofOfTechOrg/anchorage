@@ -32,13 +32,7 @@ Anchorage is not a model provider, identity provider, hosted SaaS, generic proce
 | [`@proofoftech/flowsafe`](packages/flowsafe/README.md) | Durable execution and human approval on Cloudflare | Guarded agent catalog/host, Durable Object runner, approval API and React UI, signals, goals, schedules, background tasks, provider subscriptions, R2 artifacts, SIEM export |
 | [`@proofoftech/fleet-control`](packages/fleet-control/README.md) | Provisioning physically isolated deployments from a trusted control plane, never from a Worker that serves tenant requests | Workers for Platforms and staged Wrangler backends, fenced fleet state, release promotion and rollback, bidirectional inventory, platform dispatch/outbound/audit Workers |
 
-Fleet control requires Node 22.22.0 or later. Flowsafe requires Node 22 or
-later. Breakwater requires Node 22.3 or later for its built-in Agent CLI
-executor. All three packages are ESM-only. Breakwater and Flowsafe require
-`@mastra/core` `1.50.0`. React 18 or 19 is needed only for
-the optional Flowsafe approval UI. Hosts that run `flowsafe-provision` or the
-Fleet Control Wrangler backend must provide Wrangler `>=4.118 <5`; Wrangler is
-not a Flowsafe peer dependency.
+Breakwater and Flowsafe require Node 22.13.0 or later because their required `@mastra/core` `1.50.0` peer has that runtime floor. Fleet Control requires Node 22.22.0 or later. All three packages are ESM-only. React 18 or 19 is needed only for the optional Flowsafe approval UI. Hosts that run `flowsafe-provision` or the Fleet Control Wrangler backend must provide Wrangler `>=4.118 <5`; Wrangler is not a Flowsafe peer dependency.
 
 ## Start with breakwater
 

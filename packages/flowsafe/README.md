@@ -22,7 +22,7 @@ Install React and React DOM only when you import `@proofoftech/flowsafe/approval
 
 Compatibility:
 
-- Node.js 22 or later (engine range `>=22`)
+- Node.js 22.13.0 or later (engine range `>=22.13.0`)
 - ESM only
 - TypeScript `moduleResolution: "NodeNext"`, `"Node16"`, or `"Bundler"`
 - `@mastra/core` `1.50.0`

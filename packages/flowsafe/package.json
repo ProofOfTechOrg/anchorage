@@ -18,7 +18,7 @@
   },
   "sideEffects": false,
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13.0"
   },
   "description": "Approval UX + Cloudflare-native durable execution for AI agent workflows",
   "type": "module",
