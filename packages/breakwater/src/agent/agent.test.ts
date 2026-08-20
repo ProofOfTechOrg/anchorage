@@ -861,6 +861,7 @@ describe('Mastra Agent execution-entry inventory', () => {
       '__getStaticAgents',
       '__hasSubAgentsConfigured',
       '__listLLMRequestProcessors',
+      '__markStoredVersionApplied',
       '__registerMastra',
       '__registerPrimitives',
       '__resetToOriginalModel',
