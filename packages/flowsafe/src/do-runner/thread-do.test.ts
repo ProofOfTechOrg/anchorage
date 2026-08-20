@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { DurableObjectState } from '@cloudflare/workers-types';
 import { InMemoryStore } from '@mastra/core/storage';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   deploymentIdentityDatabase,
@@ -11,6 +11,7 @@ import {
 import { encodeExecutionPrincipal } from '../approval-api/index.js';
 import { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
 import { type InitResult, init } from './init.js';
+import { RunStateUnreadableError } from './runtime.js';
 import { ThreadDurableObject, type ThreadScope } from './thread-do.js';
 
 class TestThread extends ThreadDurableObject {
@@ -144,6 +145,39 @@ describe('ThreadDurableObject identity boundary', () => {
 
     expect(events[0]).toBe('setAlarm');
     expect(events.filter((event) => event === 'setAlarm')).toHaveLength(2);
+  });
+
+  it('keeps the wake and classifies an alarm whose authoritative read did not succeed', async () => {
+    // #given — the owner-recovery duty this alarm drives refuses to conclude
+    // anything from a read that did not reach storage, and raises it here.
+    const events: string[] = [];
+    const thread = threadWith('thread-1', {
+      events,
+      alarmError: new RunStateUnreadableError(
+        'durable-agentic-loop',
+        'acme_run',
+      ),
+    });
+    const logged: string[] = [];
+    const log = vi
+      .spyOn(console, 'error')
+      .mockImplementation((...args: unknown[]) => {
+        logged.push(String(args[0]));
+      });
+
+    // #when
+    try {
+      await expect(thread.alarm()).resolves.toBeUndefined();
+    } finally {
+      log.mockRestore();
+    }
+
+    // #then — never a rethrow: workerd retries a thrown alarm() up to six
+    // times, which would answer the storage incident that caused it with a
+    // retry storm. The successor is armed and the failure is named once — for
+    // this alarm, not for whichever subclass duty raised it.
+    expect(events.filter((event) => event === 'setAlarm')).toHaveLength(2);
+    expect(logged).toEqual(['thread alarm could not read authoritative state']);
   });
 
   it('rejects a cross-deployment caller before building named-thread state', async () => {

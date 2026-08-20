@@ -126,9 +126,12 @@ import {
   type InitResult,
   init,
   isPathSafeId,
+  isSuspensionTimeoutResumeData,
   mintThreadId,
   type RunnerRuntime,
   resourceIdFromKey,
+  SUSPENSION_DEADLINE_PAYLOAD_KEY,
+  SUSPENSION_TIMEOUT_RESUME_KEY,
   stampDeploymentIdentityRequest,
   ThreadDurableObject,
   type ThreadScope,
@@ -568,6 +571,13 @@ const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
       'agent tool-call approval gate (R-003 suspend shape) -> grant-gated publish (Track A)',
     sampleInput: { topic: 'launch' },
   },
+  {
+    id: 'demo-deadline',
+    title: 'Demo suspension deadline',
+    description:
+      'one step that suspends with a per-suspension deadline, so the run resumes itself when the awaited signal never arrives',
+    sampleInput: { topic: 'launch', deadlineMs: 10_000 },
+  },
 ];
 const scheduleTargetPolicy = createScheduleTargetPolicy({
   workflows: [...WORKFLOWS, { id: 'sched-echo' }],
@@ -814,10 +824,120 @@ function defineWorkflows(env: Env): RunnerRuntime {
     .then(schedEcho)
     .commit();
 
+  // Per-suspension deadline probe (T1-T3): a step arms its own durable wake by
+  // putting SUSPENSION_DEADLINE_PAYLOAD_KEY in the payload it hands Mastra's
+  // suspend(); the run's OWN Durable Object derives a fenced entry from the
+  // authoritative summary, persists it in DO storage, and arms its single alarm
+  // for it. When the wake fires it resumes THIS step with the reserved timeout
+  // envelope under the system principal. The step therefore records WHICH kind
+  // of resume reached it, through the exported guard rather than a string
+  // literal, so spike-verify can assert the ENVELOPE arrived — not merely that
+  // the run advanced.
+  //
+  // It declares NEITHER a suspendSchema (which would have to declare the
+  // reserved key, or Mastra's parse substitution strips it) NOR a resumeSchema
+  // (which would have to accept the timeout envelope, or the resume is
+  // refused) — the simplest correct arming shape. `deadlineMs` rides the run
+  // input so ONE workflow drives both sides of the fence: a short deadline that
+  // must fire itself, and a longer one whose real signal must settle the entry
+  // first.
+  const deadlineInputSchema = z.object({
+    topic: z.string(),
+    deadlineMs: z.number().int(),
+  });
+  const deadlineOutputSchema = z.object({
+    topic: z.string(),
+    resumedBy: z.enum(['timeout', 'signal']),
+    timeoutStep: z.string().optional(),
+    deadlineAt: z.number().optional(),
+    expiredAt: z.number().optional(),
+  });
+  const deadlineWait = createStep({
+    id: 'wait-signal',
+    inputSchema: deadlineInputSchema,
+    outputSchema: deadlineOutputSchema,
+    execute: async ({ inputData, resumeData, suspend }) => {
+      if (!resumeData) {
+        return suspend({
+          [SUSPENSION_DEADLINE_PAYLOAD_KEY]: inputData.deadlineMs,
+          awaiting: 'external launch signal',
+        });
+      }
+      if (isSuspensionTimeoutResumeData(resumeData)) {
+        const timeout = resumeData[SUSPENSION_TIMEOUT_RESUME_KEY];
+        return {
+          topic: inputData.topic,
+          resumedBy: 'timeout' as const,
+          timeoutStep: timeout.step,
+          deadlineAt: timeout.deadlineAt,
+          expiredAt: timeout.expiredAt,
+        };
+      }
+      return { topic: inputData.topic, resumedBy: 'signal' as const };
+    },
+  });
+  createWorkflow({
+    id: 'demo-deadline',
+    inputSchema: deadlineInputSchema,
+    outputSchema: deadlineOutputSchema,
+  })
+    .then(deadlineWait)
+    .commit();
+
   return runtime;
 }
 
+/**
+ * DO storage key holding one run's armed suspension deadlines. Deliberately NOT
+ * on the package's public surface — it is the alarm's own bookkeeping — so the
+ * spike mirrors the constant to introspect it.
+ *
+ * The trade, stated plainly: a duplicated literal can drift from the module's
+ * own, and exporting the key to stop that would put a Durable Object's private
+ * wake state on the public surface for every consumer, where reading it proves
+ * nothing and writing it corrupts the alarm. Drift is also the cheaper failure:
+ * this key is read in ONE place, the route below, and spike-verify's T2
+ * assertion then observes no armed record where it requires one and fails
+ * loudly. Silent success is not reachable.
+ */
+const SPIKE_SUSPENSION_DEADLINE_STORAGE_KEY = 'flowsafe:suspension-deadline:v1';
+
+/** The run-DO route the T1-T3 probes read that armed state through. */
+const SPIKE_SUSPENSION_DEADLINE_PATH = '/spike/suspension-deadline';
+
 export class DemoRunner extends DurableObjectRunner<Env> {
+  /**
+   * Spike-only introspection of the state the suspension-deadline duty owns:
+   * the armed record in THIS object's storage and the single alarm both DO
+   * duties share. Nothing on the run surface exposes either (correctly — a
+   * client has no business reading an object's wake schedule), so spike-verify
+   * would otherwise have to infer "armed" from the resume that follows it. The
+   * runner's own routes all live under /runs, so a /spike/ path cannot collide
+   * with one, and deployment identity is verified exactly as the inherited
+   * fetch does.
+   */
+  async fetch(request: Request): Promise<Response> {
+    if (new URL(request.url).pathname !== SPIKE_SUSPENSION_DEADLINE_PATH) {
+      return super.fetch(request);
+    }
+    try {
+      await verifyDurableObjectDeploymentRequest(request, this.state, this.env);
+      const storage = this.state?.storage;
+      // getAlarm is not part of the structural storage subset do-runner
+      // declares (it never reads the alarm back); workerd always provides it.
+      const alarms = storage as unknown as
+        | { getAlarm(): Promise<number | null> }
+        | undefined;
+      return json({
+        alarmAt: (await alarms?.getAlarm()) ?? null,
+        record:
+          (await storage?.get(SPIKE_SUSPENSION_DEADLINE_STORAGE_KEY)) ?? null,
+      });
+    } catch (error) {
+      return doErrorResponse(error);
+    }
+  }
+
   protected build(env: Env): RunnerRuntime {
     return defineWorkflows(env);
   }
@@ -2385,6 +2505,36 @@ async function handleScheduleProbe(
   return null;
 }
 
+// --- Suspension deadline probe (T1-T3) -------------------------------------
+// LOCAL-ONLY worker-level probe reading the wake state a run's OWN DO holds for
+// its suspension deadlines: the persisted fenced entry and the single alarm the
+// object's two duties share. spike-verify asserts a suspension ARMS one before
+// the process is killed, and that a run resumed by a real signal keeps none —
+// neither is observable on the run surface, and both are exactly what the
+// hand-written DurableObjectState stub in the unit tests cannot prove.
+async function handleSuspensionDeadlineProbe(
+  request: Request,
+  env: Env,
+): Promise<Response | null> {
+  const url = new URL(request.url);
+  if (request.method !== 'GET' || url.pathname !== '/deadline/armed') {
+    return null;
+  }
+  const workflowId = url.searchParams.get('workflowId');
+  const runId = url.searchParams.get('runId');
+  if (!isPathSafeId(workflowId) || !isPathSafeId(runId)) {
+    return json({ error: 'path-safe workflowId and runId required' }, 404);
+  }
+  // The SAME address the run topology uses (idFromName(`${workflowId}:${runId}`)),
+  // so this reads the storage of the very object that serves the run.
+  const response = await fetchDeploymentObject(
+    runStub(env, workflowId, runId),
+    env,
+    `http://do${SPIKE_SUSPENSION_DEADLINE_PATH}`,
+  );
+  return json({ status: response.status, armed: await response.json() });
+}
+
 const handler: ExportedHandler<Env> = {
   async fetch(
     request: CfRequest,
@@ -2453,6 +2603,11 @@ const handler: ExportedHandler<Env> = {
     // — local, unauthenticated, ahead of the routers.
     const sigpProbe = await handleSignalProviderProbe(routed, env);
     if (sigpProbe) return sigpProbe;
+
+    // Suspension deadline probe (T1-T3 armed-wake introspection) — local,
+    // unauthenticated, ahead of the routers.
+    const deadlineProbe = await handleSuspensionDeadlineProbe(routed, env);
+    if (deadlineProbe) return deadlineProbe;
 
     // Track E webhook ingress: the github webhook route TERMINATES on the Worker,
     // signature-authed (not bearer), route-absent when its secret is unset.

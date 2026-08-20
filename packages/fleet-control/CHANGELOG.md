@@ -1,5 +1,12 @@
 # @proofoftech/fleet-control
 
+## 0.3.3
+
+### Patch Changes
+
+- Updated dependencies [e7fb658]
+  - @proofoftech/flowsafe@0.18.0
+
 ## 0.3.2
 
 ### Patch Changes

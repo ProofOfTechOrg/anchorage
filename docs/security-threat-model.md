@@ -71,7 +71,7 @@ Trusted merges apply sanitized external or stored context first, then workflow, 
 
 The Worker chooses the object name through `idFromName()`. Each object reasserts the addressed identity:
 
-- runner object: `workflowId:runId`;
+- runner object: `workflowId:runId` — and the runner object also derives `workflowId:runId` from that same `id.name` on any alarm wake that does not resume, in preference to its own stored record, which is consulted only when the object carries no name; the name is therefore a trusted input to its wake, not only an assertion target;
 - thread object: server-minted `threadId` and internal principal header;
 - hub object: fixed deployment singleton name;
 - provider host object: fixed deployment singleton name.

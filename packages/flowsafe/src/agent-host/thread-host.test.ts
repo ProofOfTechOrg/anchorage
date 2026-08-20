@@ -20,7 +20,12 @@ import type {
   ScheduleSourceStore,
   ThreadScope,
 } from '../do-runner/index.js';
-import { resourceIdFromKey } from '../do-runner/index.js';
+import {
+  doErrorResponse,
+  RunStateUnreadableError,
+  resourceIdFromKey,
+  SUSPENSION_TIMEOUT_RESUME_KEY,
+} from '../do-runner/index.js';
 import {
   D1SchedulesStorage,
   type ScheduleDatabase,
@@ -680,6 +685,49 @@ describe('createThreadAgentHost owner recovery', () => {
     expect(await resources.owner('resource', RESOURCE_ID)).toEqual(owner);
     expect(await resources.owner('run', 'acme_run')).toEqual(owner);
     expect(alarmAt()).toBeUndefined();
+  });
+
+  it('retains every recovery record and rearms when the authoritative read does not succeed', async () => {
+    const { host, scope, state, resources, resourceAccess, alarmAt } = harness(
+      ['writer'],
+      {
+        // The runner-side guard reaches here: recoverStartAttempt refuses a
+        // read that did not reach storage rather than reporting the fabricated
+        // 'pending' shell it would otherwise see.
+        runtime: {
+          recoverStartAttempt: vi.fn(async () => {
+            throw new RunStateUnreadableError(
+              'durable-agentic-loop',
+              'acme_run',
+            );
+          }),
+        },
+      },
+    );
+    const settle = vi.spyOn(resourceAccess, 'settleReservation');
+    seedRecoveryState(state, 'acme_run', ownerRecovery('acme_run'));
+    await resources.reserveAll(
+      [
+        { kind: 'thread', resourceId: 'acme_thread' },
+        { kind: 'resource', resourceId: RESOURCE_ID },
+        { kind: 'run', resourceId: 'acme_run' },
+      ],
+      { kind: 'human', id: 'operator-1' },
+      'token-acme_run',
+    );
+
+    await expect(
+      host.recoverOwnership(scope.init.runtime, scope.threadId),
+    ).rejects.toBeInstanceOf(RunStateUnreadableError);
+
+    // #then — fail closed: an unreadable read is not evidence the attempt was
+    // abandoned, so nothing is deleted, nothing is settled, and the journal
+    // stays armed for a wake that can read.
+    expect(state.has(TEST_OWNER_RECOVERY_KEY)).toBe(true);
+    expect(state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    expect(state.has(THREAD_BINDING_KEY)).toBe(true);
+    expect(settle).not.toHaveBeenCalled();
+    expect(alarmAt()).toBeDefined();
   });
 
   it('keeps an unthreaded nonterminal journal armed, then releases ephemeral claims at terminal state', async () => {
@@ -1574,6 +1622,52 @@ describe('createThreadAgentHost', () => {
     expect(state.has('flowsafe:agent-run:v1:acme_run')).toBe(false);
   });
 
+  it('keeps run metadata and names the failure when a failed start cannot read authoritative state', async () => {
+    // #given — the same failed start, with the read that would tell an
+    // interrupted start apart from a failed one refusing to answer from state
+    // it could not reach.
+    const { host, scope, state, alarmAt } = harness(['writer'], {
+      runtime: {
+        recoverStartAttempt: vi.fn(async () => {
+          throw new RunStateUnreadableError('durable-agentic-loop', 'acme_run');
+        }),
+      },
+    });
+    mocked.stream.mockRejectedValue(new Error('model unavailable'));
+    const logged: string[] = [];
+    const log = vi
+      .spyOn(console, 'error')
+      .mockImplementation((...args: unknown[]) => {
+        logged.push(String(args[0]));
+      });
+
+    // #when
+    try {
+      await expect(
+        host.start(scope, {
+          agentId: 'writer',
+          threadId: 'acme_thread',
+          resourceId: RESOURCE_ID,
+          runId: 'acme_run',
+          prompt: 'go',
+          entryPath: 'http.start',
+        }),
+        // #then — the caller still sees the ORIGINAL start failure: the read
+        // concluded nothing, so it cannot reclassify one.
+      ).rejects.toThrow('model unavailable');
+    } finally {
+      log.mockRestore();
+    }
+
+    // #then — and the failure is named rather than swallowed, because it is
+    // the reason the metadata above survives and a wake is left to retry it.
+    expect(logged).toContain(
+      'interrupted start could not read authoritative state',
+    );
+    expect(state.has('flowsafe:agent-run:v1:acme_run')).toBe(true);
+    expect(alarmAt()).toBeDefined();
+  });
+
   it('does not create a reusable binding for an unthreaded ephemeral run', async () => {
     const fixture = harness();
     const { host, scope, state } = fixture;
@@ -2222,6 +2316,57 @@ describe('createThreadAgentHost', () => {
     });
   });
 
+  it('fails dispatch status closed when the pending recovery cannot read authoritative state', async () => {
+    // #given — a dispatch-status read whose pending owner recovery runs first,
+    // with the read that would settle it refusing to answer from state it
+    // could not reach.
+    const { host, scope, state, resources, resourceAccess } = harness(
+      ['writer'],
+      {
+        runtime: {
+          recoverStartAttempt: vi.fn(async () => {
+            throw new RunStateUnreadableError(
+              'durable-agentic-loop',
+              'acme_run',
+            );
+          }),
+        },
+      },
+    );
+    const settle = vi.spyOn(resourceAccess, 'settleReservation');
+    seedRecoveryState(state, 'acme_run', ownerRecovery('acme_run'));
+    await resources.reserveAll(
+      [
+        { kind: 'thread', resourceId: 'acme_thread' },
+        { kind: 'resource', resourceId: RESOURCE_ID },
+        { kind: 'run', resourceId: 'acme_run' },
+      ],
+      { kind: 'human', id: 'operator-1' },
+      'token-acme_run',
+    );
+
+    // #when
+    const raised = await host
+      .route(
+        new Request(
+          `https://thread/_flowsafe/agent-host/runs/writer/acme_run?resourceId=${RESOURCE_ID}&dispatch=1`,
+        ),
+        scope,
+      )
+      .catch((error: unknown) => error);
+
+    // #then — the route escapes to the Durable Object shell, which answers the
+    // retryable 503 this release documents rather than a 200 assembled from a
+    // read that never happened. The recovery stays owed: journal, run record
+    // and reservation all survive for a wake that can read.
+    expect(raised).toBeInstanceOf(RunStateUnreadableError);
+    expect(doErrorResponse(raised).status).toBe(503);
+    expect(settle).not.toHaveBeenCalled();
+    expect(state.has(TEST_OWNER_RECOVERY_KEY)).toBe(true);
+    expect(state.has(TEST_RUN_RECORD_KEY)).toBe(true);
+    expect(await resources.owner('run', 'acme_run')).toBeUndefined();
+  });
+
   it('rejects a snapshot whose thread correlation does not match the addressed DO', async () => {
     const { host, scope, setSnapshot } = harness();
     await host.start(scope, {
@@ -2381,6 +2526,43 @@ describe('createThreadAgentHost', () => {
         fixture.scope,
       ),
     ).rejects.toMatchObject({ status: 400 });
+    expect(mocked.resumeViaRuntime).not.toHaveBeenCalled();
+  });
+
+  it('refuses an approval resume that forges the suspension-timeout envelope', async () => {
+    const fixture = harness();
+    seedSuspendedApprovalRun(fixture);
+
+    await expect(
+      fixture.host.route(
+        new Request('https://thread/_flowsafe/agent-host/resume', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            agentId: 'writer',
+            threadId: 'acme_thread',
+            resourceId: RESOURCE_ID,
+            runId: 'acme_run',
+            entryPath: 'approval.resume',
+            requestedBy: 'reviewer-1',
+            resumeData: {
+              [SUSPENSION_TIMEOUT_RESUME_KEY]: {
+                step: 'tool',
+                deadlineAt: 1,
+                expiredAt: 2,
+              },
+            },
+          }),
+        }),
+        fixture.scope,
+      ),
+      // #then — this route forwards client resume data verbatim as a human
+      // requester, so without the guard a caller could drive a step's timeout
+      // branch. Only a run object's alarm mints that envelope.
+    ).rejects.toMatchObject({
+      status: 400,
+      message: expect.stringContaining(SUSPENSION_TIMEOUT_RESUME_KEY),
+    });
     expect(mocked.resumeViaRuntime).not.toHaveBeenCalled();
   });
 

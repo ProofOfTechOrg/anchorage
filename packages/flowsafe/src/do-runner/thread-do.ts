@@ -37,6 +37,7 @@ import { DoStatusError, doErrorResponse } from './do-error-response.js';
 import { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
 import type { InitResult } from './init.js';
 import { isPathSafeId } from './path-safe-id.js';
+import { RunStateUnreadableError } from './runtime.js';
 
 const THREAD_ALARM_RECOVERY_DELAY_MS = 60_000;
 
@@ -113,7 +114,11 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
     scope: ThreadScope,
   ): Promise<Response>;
 
-  /** Optional Durable Object alarm work after deployment identity is verified. */
+  /**
+   * Optional Durable Object alarm work after deployment identity is verified.
+   * Every failure re-arms the wake; a `RunStateUnreadableError` is then
+   * classified and swallowed (see `alarm()`), anything else propagates.
+   */
   protected async onAlarm(
     _env: TEnv,
     _threadId: string,
@@ -176,6 +181,24 @@ export abstract class ThreadDurableObject<TEnv = unknown> {
       await this.state?.storage.setAlarm?.(
         Date.now() + THREAD_ALARM_RECOVERY_DELAY_MS,
       );
+      // A read that did not reach storage is never rethrown out of an alarm:
+      // workerd retries a thrown alarm() up to six times, which would answer
+      // the storage incident that caused it with a retry storm — the same
+      // refusal the run object's alarm() makes for this class. The wake is
+      // already re-armed above, and the duty stays owed: the host concluded
+      // nothing from the failed read, so its journal survives for a wake that
+      // can read. Every other failure keeps the re-arm and the rethrow.
+      //
+      // Named for THIS alarm and not for any one subclass's duty: `onAlarm` is
+      // the extension point, and this base class cannot know whose read failed
+      // — only that its own wake could not conclude anything. Deliberately
+      // distinct from the run object's 'run owner recovery could not read
+      // authoritative state', so an operator grepping the log can tell the two
+      // objects apart.
+      if (error instanceof RunStateUnreadableError) {
+        console.error('thread alarm could not read authoritative state', error);
+        return;
+      }
       throw error;
     }
   }

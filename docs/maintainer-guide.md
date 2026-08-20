@@ -91,6 +91,10 @@ CI tests the declared supported peer version as part of the normal gate. A separ
 
 Treat a red canary as a release investigation even though it does not block a merge. Update the declared peer range only after tests, workerd proofs, package tarball probes, and migration notes pass.
 
+Per-suspension deadlines couple to one undocumented Mastra behavior: a step arms a deadline through a reserved key in the payload it hands `suspend()`, which only reaches flowsafe because Mastra substitutes the schema-parsed suspend payload into the run summary (verified in the declared minimum peer, 1.50.0). A change there — a different substitution, a different key for a nested suspension, or resume-data validation moving — silently disarms every deadline. Tripwire tests in `packages/flowsafe/src/do-runner/runtime.test.ts` pin the observed behavior: the reserved key surviving a schema that declares it, being stripped by a strict schema that does not, surviving a loose schema, and a nested suspension being refused rather than armed. Check them on every Mastra upgrade and treat a failure as a behavior change to document, never as a test to relax.
+
+Rolling this release back is not symmetric: 0.17.x has no deadline reader, so the first alarm a downgraded run object takes deletes the alarm and orphans every armed record. Re-upgrading heals only runs that later receive another lifecycle boundary — which excludes exactly the runs a suspension deadline exists for, since a suspended run waiting on a signal has no boundary but its own wake. Prefer rolling forward; if a downgrade is unavoidable, treat every deadline armed before it as lost.
+
 ## Public documentation
 
 `pnpm docs:check` validates local links and anchors, package export coverage, TypeDoc entry coverage, npm-safe package links, orphaned public pages, stale internal markers, and manifest-backed Node engine and peer-dependency claims. `pnpm docs:api` builds all supported API surfaces, including the React UI in its own TypeScript program.
