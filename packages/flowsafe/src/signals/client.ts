@@ -10,18 +10,12 @@
 // every call crosses the P6 ingestion gate (auth → role → registry-backed thread
 // ownership → allowlist/size/rate → audit) before it reaches a thread DO.
 //
-// SUBSCRIBE / hub bridge (DL-016 — CORRECTED): a thread's live chunks are a
-// per-END-USER stream (one conversation's tokens), NOT deployment-wide fan-out.
-// Forwarding subscribeToThread chunks onto the deployment hub and filtering
-// client-side by threadId would put one end-user's thread bytes on every
-// connected operator's socket (and waste fan-out). Phase-2 live subscribe must
-// therefore be scoped server-side per
-// thread / per resourceId: a thread-addressed channel (a per-thread WS on the
-// thread DO, or a hub subscription filtered by threadId before emit), never
-// client-side filtering of a deployment firehose. It is
-// deferred to phase 2 and shares Track A's real-loop boundary (a loop must be
-// producing chunks to forward). Nothing here mints capability — sendToolApproval
-// is not an approval surface (P8).
+// SignalClient remains send-only. Supported live agent output uses the
+// authenticated agent-host route for one exact thread and run. The router
+// authorizes both resources before its topology addresses the thread DO, so no
+// deployment hub or browser-side filtering sees another principal's chunks.
+// A future generic signal subscription must preserve that server-side scope.
+// Nothing here mints capability: sendToolApproval is not an approval surface.
 
 export interface SignalResponseLike {
   ok: boolean;

@@ -281,6 +281,22 @@ describe('createAgentThreadTopology', () => {
     expect(hits).toHaveLength(0);
   });
 
+  it('refuses observation before addressing a stream the context cannot read', async () => {
+    const { topology, hits } = harness();
+    const scoped = context();
+    scoped.value.canAccessResource = async () => false;
+
+    await expect(
+      topology.observe(scoped.value, {
+        agentId: 'writer',
+        threadId: 'foreign-thread',
+        runId: 'foreign-run',
+        offset: 0,
+      }),
+    ).rejects.toMatchObject({ status: 404 });
+    expect(hits).toHaveLength(0);
+  });
+
   it('recovers a dispatched run after its ephemeral thread ownership is released', async () => {
     const { topology, hits } = harness();
     const scoped = context();
