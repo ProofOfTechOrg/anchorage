@@ -2,9 +2,10 @@
 import { resolveBackgroundConfig } from '@mastra/core/background-tasks';
 import { RequestContext } from '@mastra/core/request-context';
 import type { PublicSchema } from '@mastra/core/schema';
-import type { ToolExecutionContext } from '@mastra/core/tools';
+import { createTool, type ToolExecutionContext } from '@mastra/core/tools';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
+import { z as z3 } from 'zod/v3';
 
 import { AGENT_AUDIT_CONTEXT_KEY, AuditLogger } from '../audit/index.js';
 import { registerSafeAuditError } from '../audit/safe-error.js';
@@ -23,8 +24,11 @@ import {
   type AtomicIdempotencyStore,
   CONNECTOR_EXECUTION_CONTEXT_KEY,
   CONNECTOR_GRANTS_CONTEXT_KEY,
+  type Connector,
   type ConnectorConfig,
+  type ConnectorInvocationOptions,
   ConnectorPolicyError,
+  ConnectorValidationError,
   connectorManifest,
   createConnector as createConnectorBase,
   DRY_RUN_CONTEXT_KEY,
@@ -34,6 +38,7 @@ import {
   type IdempotencyStore,
   InMemoryIdempotencyStore,
   InMemoryRateLimitStore,
+  invokeConnector,
 } from './index.js';
 
 // Most tests exercise post-migration behavior. Migration-boundary tests call
@@ -283,6 +288,21 @@ function bareRun(
 const input = { email: 'ada@example.com' };
 const PRIVATE_BACKEND_SENTINEL = 'private-backend-sentinel-4a78e093';
 
+function exposedErrorText(error: unknown): string {
+  if (typeof error !== 'object' || error === null) return String(error);
+  return Reflect.ownKeys(error)
+    .map((key) => {
+      const value = Object.getOwnPropertyDescriptor(error, key)?.value;
+      if (typeof value === 'string') return value;
+      try {
+        return JSON.stringify(value);
+      } catch {
+        return String(value);
+      }
+    })
+    .join('\n');
+}
+
 function makeConnector(
   overrides: Partial<Parameters<typeof createConnector>[0]> = {},
 ) {
@@ -424,6 +444,784 @@ describe('createConnector classification', () => {
         },
       }),
     ).toThrow(TypeError);
+  });
+});
+
+describe('invokeConnector', () => {
+  it('forwards the supported direct-call context without exposing its private carrier', async () => {
+    const requestContext = new RequestContext();
+    const abortController = new AbortController();
+    const observe = {
+      async span<T>(_name: string, fn: () => T | Promise<T>): Promise<T> {
+        return fn();
+      },
+      log: vi.fn(),
+    } satisfies ToolExecutionContext['observe'];
+    const received = vi.fn();
+    const tool = createConnector<{ value: string }, { value: string }>({
+      id: 'direct.context',
+      description: 'Inspect the supported direct invocation context',
+      execute: async (value, context) => {
+        received(context);
+        expect(Object.getOwnPropertySymbols(context)).toEqual([]);
+        return value;
+      },
+      permissions: { sideEffect: 'read' },
+    });
+
+    await expect(
+      invokeConnector(
+        tool,
+        { value: 'ok' },
+        {
+          requestContext,
+          abortSignal: abortController.signal,
+          observe,
+        },
+      ),
+    ).resolves.toEqual({ value: 'ok' });
+    expect(received).toHaveBeenCalledWith(
+      expect.objectContaining({
+        requestContext,
+        abortSignal: abortController.signal,
+        observe,
+      }),
+    );
+  });
+
+  it('supplies Mastra no-op observation when the host omits an observer', async () => {
+    const tool = createConnector<{ value: string }, { value: string }>({
+      id: 'direct.default-observe',
+      description: 'Use the default direct invocation observer',
+      execute: async (inputData, context) => {
+        context.observe.log('info', 'default observer');
+        return context.observe.span('default span', () => inputData);
+      },
+      permissions: { sideEffect: 'read' },
+    });
+
+    await expect(invokeConnector(tool, { value: 'observed' })).resolves.toEqual(
+      { value: 'observed' },
+    );
+  });
+
+  it('does not expose its private carrier to dry-run execution', async () => {
+    const requestContext = new RequestContext();
+    requestContext.set(DRY_RUN_CONTEXT_KEY, true);
+    const dryRunExecute = vi.fn(async (_input, context) => {
+      expect(Object.getOwnPropertySymbols(context)).toEqual([]);
+      return { simulated: true };
+    });
+    const tool = createConnector<unknown, { simulated: boolean }>({
+      id: 'direct.dry-run',
+      description: 'Inspect a direct dry-run context',
+      execute: async () => ({ simulated: false }),
+      dryRunExecute,
+      permissions: { sideEffect: 'write', dryRun: true },
+    });
+
+    await expect(
+      invokeConnector(tool, {}, { requestContext }),
+    ).resolves.toEqual({ simulated: true });
+    expect(dryRunExecute).toHaveBeenCalledTimes(1);
+  });
+
+  it('matches an exact direct tool-call grant without fabricating an agent context', async () => {
+    const execute = vi.fn(async (_input, context: ToolExecutionContext) => {
+      expect(context.agent).toBeUndefined();
+      expect(Object.getOwnPropertySymbols(context)).toEqual([]);
+      return { ok: true };
+    });
+    const tool = createConnector<{ value: string }, { ok: boolean }>({
+      id: 'direct.approved',
+      description: 'Exercise a direct tool-call grant',
+      execute,
+      permissions: { sideEffect: 'write', requiresApproval: true },
+    });
+    const requestContext = makeToolCallGrantContext({
+      connectorId: 'direct.approved',
+    }).requestContext;
+
+    await expect(
+      invokeConnector(
+        tool,
+        { value: 'ok' },
+        { requestContext, toolCallId: 'call-1' },
+      ),
+    ).resolves.toEqual({ ok: true });
+    await expect(
+      invokeConnector(
+        tool,
+        { value: 'wrong-id' },
+        { requestContext, toolCallId: 'call-2' },
+      ),
+    ).rejects.toMatchObject({
+      policy: 'write-permissions',
+    });
+    await expect(
+      invokeConnector(tool, { value: 'omitted-id' }, { requestContext }),
+    ).rejects.toMatchObject({
+      policy: 'write-permissions',
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('supports suspension and run grants without a tool-call identity', async () => {
+    const tool = createConnector<unknown, { ok: boolean }>({
+      id: 'direct.broader-grant',
+      description: 'Exercise broader direct grant scopes',
+      execute: async () => ({ ok: true }),
+      permissions: { sideEffect: 'write', requiresApproval: true },
+    });
+    const suspensionContext = makeContext({
+      approved: ['direct.broader-grant'],
+    }).requestContext;
+
+    await expect(
+      invokeConnector(tool, {}, { requestContext: suspensionContext }),
+    ).resolves.toEqual({ ok: true });
+
+    const runContext = new RequestContext();
+    runContext.set(WORKFLOW_SCOPE_CONTEXT_KEY, 'workflow-1');
+    runContext.set('runId', 'run-1');
+    runContext.set(CONNECTOR_EXECUTION_CONTEXT_KEY, {
+      kind: 'start',
+      workflowId: 'workflow-1',
+      runId: 'run-1',
+    });
+    runContext.set(CONNECTOR_GRANTS_CONTEXT_KEY, [
+      {
+        scope: 'run',
+        connectorId: 'direct.broader-grant',
+        workflowId: 'workflow-1',
+        runId: 'run-1',
+      },
+    ]);
+    await expect(
+      invokeConnector(tool, {}, { requestContext: runContext }),
+    ).resolves.toEqual({ ok: true });
+  });
+
+  it('isolates concurrent tool-call identities on a shared RequestContext', async () => {
+    const tool = createConnector<{ call: string }, { call: string }>({
+      id: 'direct.concurrent-grants',
+      description: 'Exercise concurrent direct grant identity',
+      execute: async ({ call }) => {
+        await Promise.resolve();
+        return { call };
+      },
+      permissions: { sideEffect: 'write', requiresApproval: true },
+    });
+    const requestContext = makeToolCallGrantContext({
+      connectorId: 'direct.concurrent-grants',
+      grants: ['call-a', 'call-b'].map((toolCallId) => ({
+        scope: 'tool-call',
+        connectorId: 'direct.concurrent-grants',
+        workflowId: 'workflow-1',
+        runId: 'tenant_run-1',
+        isolationScope: 'tenant',
+        suspension: {
+          stepPath: ['gate'],
+          suspendedAt: 1_000,
+          resumeCount: 2,
+        },
+        toolCallId,
+      })),
+    }).requestContext;
+
+    await expect(
+      Promise.all([
+        invokeConnector(
+          tool,
+          { call: 'a' },
+          { requestContext, toolCallId: 'call-a' },
+        ),
+        invokeConnector(
+          tool,
+          { call: 'b' },
+          { requestContext, toolCallId: 'call-b' },
+        ),
+      ]),
+    ).resolves.toEqual([{ call: 'a' }, { call: 'b' }]);
+  });
+
+  it('rejects a malformed direct tool-call identity before execution', async () => {
+    const { tool, execute } = makeConnector({
+      permissions: { sideEffect: 'read' },
+    });
+
+    await expect(
+      invokeConnector(tool, input, { toolCallId: '' }),
+    ).rejects.toThrow(TypeError);
+    await expect(
+      invokeConnector(tool, input, {
+        toolCallId: 42,
+      } as unknown as ConnectorInvocationOptions),
+    ).rejects.toThrow(TypeError);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('redacts input validation issues and validator exceptions', async () => {
+    const issueSecret = 'private-input-issue-12ec2a';
+    const issueTool = createConnector<
+      { secret: string },
+      { accepted: boolean }
+    >({
+      id: 'direct.input-issue',
+      description: 'Reject a private input value',
+      inputSchema: z.object({
+        secret: z.string().refine(() => false, {
+          message: `rejected ${issueSecret}`,
+        }),
+      }),
+      execute: async () => ({ accepted: true }),
+      permissions: { sideEffect: 'read' },
+    });
+
+    const issue = await invokeConnector(issueTool, {
+      secret: issueSecret,
+    }).catch((error: unknown) => error);
+    expect(issue).toMatchObject({
+      name: 'ConnectorValidationError',
+      message: 'connector invocation failed validation',
+      connector: 'direct.input-issue',
+      phase: 'input',
+    });
+    expect(issue).toBeInstanceOf(ConnectorValidationError);
+    expect(exposedErrorText(issue)).not.toContain(issueSecret);
+    expect('cause' in (issue as object)).toBe(false);
+
+    const exceptionSecret = 'private-input-exception-b779b3';
+    const exceptionTool = createConnector<string, string>({
+      id: 'direct.input-exception',
+      description: 'Throw from input validation',
+      inputSchema: standardStringSchema(() => {
+        throw new Error(exceptionSecret);
+      }),
+      execute: async (value) => value,
+      permissions: { sideEffect: 'read' },
+    });
+    const exception = await invokeConnector(
+      exceptionTool,
+      exceptionSecret,
+    ).catch((error: unknown) => error);
+    expect(exception).toMatchObject({
+      message: 'connector invocation failed validation',
+      connector: 'direct.input-exception',
+      phase: 'input',
+    });
+    expect(exposedErrorText(exception)).not.toContain(exceptionSecret);
+    expect('cause' in (exception as object)).toBe(false);
+  });
+
+  it('contains a rejecting async input validator without an unhandled rejection', async () => {
+    const validatorSecret = 'private-async-input-validator-62ad7e';
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const tool = createConnector<string, string>({
+        id: 'direct.async-input-validator',
+        description: 'Contain a rejecting async input validator',
+        inputSchema: standardStringSchema(async () => {
+          throw new Error(validatorSecret);
+        }),
+        execute: async (value) => value,
+        permissions: { sideEffect: 'read' },
+      });
+
+      const failure = await invokeConnector(tool, validatorSecret).catch(
+        (error: unknown) => error,
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(failure).toMatchObject({
+        name: 'ConnectorValidationError',
+        message: 'connector invocation failed validation',
+        connector: 'direct.async-input-validator',
+        phase: 'input',
+      });
+      expect(exposedErrorText(failure)).not.toContain(validatorSecret);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
+  it('preserves non-enumerable Standard Schema properties', async () => {
+    const standard = Object.defineProperties(
+      {},
+      {
+        version: { value: 1 },
+        vendor: { value: 'breakwater-non-enumerable-test' },
+        validate: {
+          value: (value: unknown) =>
+            typeof value === 'string'
+              ? { value }
+              : { issues: [{ message: 'expected string' }] },
+        },
+        jsonSchema: {
+          value: {
+            input: () => ({ type: 'string' }),
+            output: () => ({ type: 'string' }),
+          },
+        },
+      },
+    );
+    const schema = Object.defineProperty({}, '~standard', {
+      configurable: true,
+      value: standard,
+    }) as PublicSchema<string>;
+    const execute = vi.fn(async (value: string) => value);
+    const tool = createConnector<string, string>({
+      id: 'direct.non-enumerable-standard-schema',
+      description: 'Preserve non-enumerable Standard Schema properties',
+      inputSchema: schema,
+      execute,
+      permissions: { sideEffect: 'read' },
+    });
+
+    await expect(
+      invokeConnector(tool, 42 as unknown as string),
+    ).rejects.toMatchObject({
+      connector: 'direct.non-enumerable-standard-schema',
+      phase: 'input',
+    });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('redacts output validation issues and exceptions without changing raw execute', async () => {
+    const issueSecret = 'private-output-issue-3afc14';
+    const issueTool = createConnector<unknown, { secret: string }>({
+      id: 'direct.output-issue',
+      description: 'Reject a private output value',
+      outputSchema: z.object({
+        secret: z.string().refine(() => false, {
+          message: `rejected ${issueSecret}`,
+        }),
+      }),
+      execute: async () => ({ secret: issueSecret }),
+      permissions: { sideEffect: 'read' },
+    });
+    const issue = await invokeConnector(issueTool, {}).catch(
+      (error: unknown) => error,
+    );
+    expect(issue).toMatchObject({
+      message: 'connector invocation failed validation',
+      connector: 'direct.output-issue',
+      phase: 'output',
+    });
+    expect(exposedErrorText(issue)).not.toContain(issueSecret);
+    expect('cause' in (issue as object)).toBe(false);
+
+    const exceptionSecret = 'private-output-exception-ff4a45';
+    const exceptionTool = createConnector<unknown, string>({
+      id: 'direct.output-exception',
+      description: 'Throw from output validation',
+      outputSchema: standardStringSchema(() => {
+        throw new Error(exceptionSecret);
+      }),
+      execute: async () => exceptionSecret,
+      permissions: { sideEffect: 'read' },
+    });
+    await expect(run(exceptionTool, {})).rejects.toThrow(exceptionSecret);
+    const exception = await invokeConnector(exceptionTool, {}).catch(
+      (error: unknown) => error,
+    );
+    expect(exception).toMatchObject({
+      message: 'connector invocation failed validation',
+      connector: 'direct.output-exception',
+      phase: 'output',
+    });
+    expect(exposedErrorText(exception)).not.toContain(exceptionSecret);
+    expect('cause' in (exception as object)).toBe(false);
+  });
+
+  it('pins a retained backing output validator at construction', async () => {
+    const outputSecret = 'private-retained-output-validator-eae2c1';
+    const outputSchema = standardStringSchema(() => ({
+      issues: [{ message: `rejected ${outputSecret}` }],
+    }));
+    const execute = vi.fn(async () => outputSecret);
+    const tool = createConnector<unknown, string>({
+      id: 'direct.retained-output-validator',
+      description: 'Pin a retained backing output validator',
+      outputSchema,
+      execute,
+      permissions: { sideEffect: 'read' },
+    });
+    (
+      outputSchema as {
+        '~standard': { validate: (value: unknown) => { value: string } };
+      }
+    )['~standard'].validate = () => ({ value: outputSecret });
+
+    const failure = await invokeConnector(tool, {}).catch(
+      (error: unknown) => error,
+    );
+    expect(failure).toMatchObject({
+      name: 'ConnectorValidationError',
+      message: 'connector invocation failed validation',
+      connector: 'direct.retained-output-validator',
+      phase: 'output',
+    });
+    expect(exposedErrorText(failure)).not.toContain(outputSecret);
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns legitimate validation-shaped application output unchanged', async () => {
+    const output = {
+      error: true as const,
+      message: 'business result',
+      validationErrors: { errors: ['application-owned'], fields: {} },
+    };
+    const tool = createConnector<unknown, typeof output>({
+      id: 'direct.validation-shaped-output',
+      description:
+        'Return an application result shaped like a validation error',
+      outputSchema: z.custom<typeof output>(() => true),
+      execute: async () => output,
+      permissions: { sideEffect: 'read' },
+    });
+
+    await expect(invokeConnector(tool, {})).resolves.toBe(output);
+  });
+
+  it('does not inspect validation-like properties on successful application output', async () => {
+    const readError = vi.fn(() => {
+      throw new Error('application getter must not run');
+    });
+    const output = Object.defineProperty(
+      { value: 'application-owned' },
+      'error',
+      { enumerable: true, get: readError },
+    );
+    const tool = createConnector<unknown, typeof output>({
+      id: 'direct.application-accessor-output',
+      description: 'Return output with an application-owned error accessor',
+      execute: async () => output,
+      permissions: { sideEffect: 'read' },
+    });
+
+    await expect(invokeConnector(tool, {})).resolves.toBe(output);
+    expect(readError).not.toHaveBeenCalled();
+  });
+
+  it('applies input and output schema transformations exactly once', async () => {
+    const inputTransform = vi.fn((value: string) => `${value}:input`);
+    const outputTransform = vi.fn((value: string) => `${value}:output`);
+    const execute = vi.fn(async ({ value }: { value: string }) => value);
+    const tool = createConnector<{ value: string }, string>({
+      id: 'direct.transform-once',
+      description: 'Transform direct input and output once',
+      inputSchema: z.object({ value: z.string().transform(inputTransform) }),
+      outputSchema: z.string().transform(outputTransform),
+      execute,
+      permissions: { sideEffect: 'read' },
+    });
+
+    await expect(invokeConnector(tool, { value: 'raw' })).resolves.toBe(
+      'raw:input:output',
+    );
+    expect(inputTransform).toHaveBeenCalledTimes(1);
+    expect(outputTransform).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledWith(
+      { value: 'raw:input' },
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
+  it('preserves a Zod v3 input schema and applies its transform once', async () => {
+    const transform = vi.fn((value: string) => `${value}:zod-v3`);
+    const execute = vi.fn(async ({ value }: { value: string }) => value);
+    const tool = createConnector<{ value: string }, string>({
+      id: 'direct.zod-v3-input',
+      description: 'Preserve a non-configurable Zod v3 schema boundary',
+      inputSchema: z3.object({ value: z3.string().transform(transform) }),
+      execute,
+      permissions: { sideEffect: 'read' },
+    });
+
+    await expect(invokeConnector(tool, { value: 'raw' })).resolves.toBe(
+      'raw:zod-v3',
+    );
+    expect(transform).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledWith(
+      { value: 'raw:zod-v3' },
+      expect.any(Object),
+      expect.any(Object),
+    );
+  });
+
+  it('preserves schema methods that use private fields', async () => {
+    class PrivateFieldSchema {
+      readonly #prefix = 'private';
+      readonly '~standard' = {
+        version: 1 as const,
+        vendor: 'breakwater-private-field-test',
+        validate: (value: unknown) => ({ value: String(value) }),
+        jsonSchema: {
+          input: () => ({ type: 'string' }),
+          output: () => ({ type: 'string' }),
+        },
+      };
+
+      parse(value: string): string {
+        return `${this.#prefix}:${value}`;
+      }
+    }
+    const schema = new PrivateFieldSchema() as PublicSchema<string> & {
+      parse(value: string): string;
+    };
+    const tool = createConnector<string, string>({
+      id: 'direct.private-field-schema',
+      description: 'Preserve private-field schema methods',
+      inputSchema: schema,
+      execute: async (value) => value,
+      permissions: { sideEffect: 'read' },
+    });
+
+    expect((tool.inputSchema as typeof schema).parse('value')).toBe(
+      'private:value',
+    );
+    await expect(invokeConnector(tool, 'value')).resolves.toBe('value');
+  });
+
+  it('forwards Standard Schema validation options on input and raw output', async () => {
+    const inputValidate = vi.fn((value: unknown, _options?: unknown) => ({
+      value: String(value),
+    }));
+    const outputValidate = vi.fn((value: unknown, _options?: unknown) => ({
+      value: String(value),
+    }));
+    const tool = createConnector<string, string>({
+      id: 'direct.schema-validation-options',
+      description: 'Preserve Standard Schema validation options',
+      inputSchema: standardStringSchema(inputValidate),
+      outputSchema: standardStringSchema(outputValidate),
+      execute: async (value) => value,
+      permissions: { sideEffect: 'read' },
+    });
+    const options = { libraryOptions: { mode: 'strict' } };
+    const inputSchema = tool.inputSchema as unknown as {
+      '~standard': {
+        validate(value: unknown, options?: unknown): unknown;
+      };
+    };
+    const outputSchema = tool.outputSchema as unknown as {
+      '~standard': {
+        validate(value: unknown, options?: unknown): unknown;
+      };
+    };
+
+    inputSchema['~standard'].validate('input', options);
+    outputSchema['~standard'].validate('output', options);
+
+    expect(inputValidate).toHaveBeenCalledWith('input', options);
+    expect(outputValidate).toHaveBeenCalledWith('output', options);
+  });
+
+  it('rejects plain tools and modified connector execution surfaces', async () => {
+    const plain = createTool({
+      id: 'plain-tool',
+      description: 'Not a Breakwater connector',
+      execute: async () => ({ ok: true }),
+    });
+    await expect(
+      invokeConnector(
+        plain as unknown as Connector<unknown, { ok: boolean }>,
+        {},
+      ),
+    ).rejects.toThrow(
+      'invokeConnector requires a connector created by createConnector()',
+    );
+    const original = createConnector<unknown, { ok: boolean }>({
+      id: 'direct.original',
+      description: 'Original connector for a copied lookalike',
+      execute: async () => ({ ok: true }),
+      permissions: { sideEffect: 'read' },
+    });
+    const copied = { ...original } as Connector<unknown, { ok: boolean }>;
+    await expect(invokeConnector(copied, {})).rejects.toThrow(
+      'invokeConnector requires a connector created by createConnector()',
+    );
+
+    const mutations = [
+      (tool: Connector<{ value: string }, { ok: boolean }>) => {
+        tool.id = 'modified-id';
+      },
+      (tool: Connector<{ value: string }, { ok: boolean }>) => {
+        tool.execute = async () => ({ ok: false });
+      },
+      (tool: Connector<{ value: string }, { ok: boolean }>) => {
+        tool.inputSchema = undefined;
+      },
+      (tool: Connector<{ value: string }, { ok: boolean }>) => {
+        tool.outputSchema = undefined;
+      },
+    ];
+    for (const mutate of mutations) {
+      const execute = vi.fn(async () => ({ ok: true }));
+      const tool = createConnector<{ value: string }, { ok: boolean }>({
+        id: 'direct.immutable-boundary',
+        description: 'Pin the direct invocation boundary',
+        inputSchema: z.object({ value: z.string() }),
+        outputSchema: z.object({ ok: z.boolean() }),
+        execute,
+        permissions: { sideEffect: 'read' },
+      });
+      mutate(tool);
+      await expect(invokeConnector(tool, { value: 'ok' })).rejects.toThrow(
+        'invokeConnector refuses a connector whose execution boundary was modified after construction',
+      );
+      expect(execute).not.toHaveBeenCalled();
+    }
+  });
+
+  it('rejects in-place mutation of Standard Schema validators', async () => {
+    const mutateValidator = (
+      schema: unknown,
+      validate: (value: unknown) => { value: unknown },
+    ) => {
+      const standard = (
+        schema as {
+          '~standard': { validate: (value: unknown) => { value: unknown } };
+        }
+      )['~standard'];
+      standard.validate = validate;
+    };
+
+    const inputExecute = vi.fn(async () => ({ ok: true }));
+    const inputTool = createConnector<{ value: string }, { ok: boolean }>({
+      id: 'direct.mutated-input-validator',
+      description: 'Reject an in-place input validator mutation',
+      inputSchema: z.object({ value: z.string() }),
+      execute: inputExecute,
+      permissions: { sideEffect: 'read' },
+    });
+    mutateValidator(inputTool.inputSchema, () => ({
+      value: { value: 'bypassed' },
+    }));
+    await expect(
+      invokeConnector(inputTool, { value: 'untrusted' }),
+    ).rejects.toThrow(
+      'invokeConnector refuses a connector whose execution boundary was modified after construction',
+    );
+    expect(inputExecute).not.toHaveBeenCalled();
+
+    const outputExecute = vi.fn(async () => ({ ok: true }));
+    const outputTool = createConnector<unknown, { ok: boolean }>({
+      id: 'direct.mutated-output-validator',
+      description: 'Reject an in-place output validator mutation',
+      outputSchema: z.object({ ok: z.boolean() }),
+      execute: outputExecute,
+      permissions: { sideEffect: 'read' },
+    });
+    mutateValidator(outputTool.outputSchema, () => ({
+      value: { ok: false },
+    }));
+    await expect(invokeConnector(outputTool, {})).rejects.toThrow(
+      'invokeConnector refuses a connector whose execution boundary was modified after construction',
+    );
+    expect(outputExecute).not.toHaveBeenCalled();
+  });
+
+  it('rejects in-place mutation of a callable Standard Schema validator', async () => {
+    const schema = Object.assign(() => undefined, {
+      '~standard': {
+        version: 1 as const,
+        vendor: 'breakwater-callable-test',
+        validate: (value: unknown) => ({ value: String(value) }),
+        jsonSchema: {
+          input: () => ({ type: 'string' }),
+          output: () => ({ type: 'string' }),
+        },
+      },
+    }) as unknown as PublicSchema<string>;
+    const execute = vi.fn(async (value: string) => value);
+    const tool = createConnector<string, string>({
+      id: 'direct.mutated-callable-validator',
+      description: 'Reject a callable schema validator mutation',
+      inputSchema: schema,
+      execute,
+      permissions: { sideEffect: 'read' },
+    });
+    (
+      tool.inputSchema as unknown as {
+        '~standard': { validate: (value: unknown) => { value: unknown } };
+      }
+    )['~standard'].validate = () => ({ value: 'bypassed' });
+
+    await expect(invokeConnector(tool, 'untrusted')).rejects.toThrow(
+      'invokeConnector refuses a connector whose execution boundary was modified after construction',
+    );
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('contains throwing accessors on a modified execution boundary', async () => {
+    const accessorSecret = 'private-execute-accessor-6d59ef';
+    const execute = vi.fn(async () => ({ ok: true }));
+    const tool = createConnector<unknown, { ok: boolean }>({
+      id: 'direct.throwing-execute-accessor',
+      description: 'Contain an execute accessor installed after construction',
+      execute,
+      permissions: { sideEffect: 'read' },
+    });
+    Object.defineProperty(tool, 'execute', {
+      configurable: true,
+      get() {
+        throw new Error(accessorSecret);
+      },
+    });
+
+    const failure = await invokeConnector(tool, {}).catch(
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(TypeError);
+    expect(failure).toMatchObject({
+      message:
+        'invokeConnector refuses a connector whose execution boundary was modified after construction',
+    });
+    expect(exposedErrorText(failure)).not.toContain(accessorSecret);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('rethrows connector policy and application errors unchanged', async () => {
+    const policyError = new ConnectorPolicyError(
+      'direct.policy-error',
+      'custom-policy',
+      'application-owned denial',
+    );
+    const policyTool = createConnector<unknown, unknown>({
+      id: 'direct.policy-error',
+      description: 'Throw an application-owned connector policy error',
+      execute: async () => ({}),
+      permissions: { sideEffect: 'read' },
+      policies: {
+        evaluators: [
+          {
+            name: 'custom-policy',
+            evaluate: async () => {
+              throw policyError;
+            },
+          },
+        ],
+      },
+    });
+    await expect(invokeConnector(policyTool, {})).rejects.toBe(policyError);
+
+    const applicationError = new Error('application-owned failure');
+    const applicationTool = createConnector<unknown, unknown>({
+      id: 'direct.application-error',
+      description: 'Throw an application error',
+      execute: async () => {
+        throw applicationError;
+      },
+      permissions: { sideEffect: 'read' },
+    });
+    await expect(invokeConnector(applicationTool, {})).rejects.toBe(
+      applicationError,
+    );
   });
 });
 

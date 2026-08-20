@@ -83,7 +83,7 @@ function topology() {
   return {
     start: vi.fn(async () => envelope()),
     status: vi.fn<AgentThreadTopology['status']>(async () => envelope()),
-    observe: vi.fn(
+    observe: vi.fn<AgentThreadTopology['observe']>(
       async () =>
         new Response('{"offset":1,"event":{}}\n', {
           headers: {

@@ -224,11 +224,11 @@ resume would receive.
 
 ```typescript
 import { RequestContext } from '@mastra/core/request-context';
-import type { ToolExecutionContext } from '@mastra/core/tools';
 import {
   CONNECTOR_EXECUTION_CONTEXT_KEY,
   CONNECTOR_GRANTS_CONTEXT_KEY,
   IDEMPOTENCY_KEY_CONTEXT_KEY,
+  invokeConnector,
 } from '@proofoftech/breakwater/connector-sdk';
 import { WORKFLOW_SCOPE_CONTEXT_KEY } from '@proofoftech/breakwater/policy-engine';
 import { PRINCIPAL_PERMISSIONS_CONTEXT_KEY } from '@proofoftech/breakwater/rbac';
@@ -261,16 +261,30 @@ requestContext.set(PRINCIPAL_PERMISSIONS_CONTEXT_KEY, {
 });
 requestContext.set(IDEMPOTENCY_KEY_CONTEXT_KEY, 'incident-481:notice');
 
-const result = await slackPoster.execute?.(
+const result = await invokeConnector(
+  slackPoster,
   {
     webhookPath: '/services/...',
     text: 'Incident 481 is being investigated.',
   },
-  { requestContext } as ToolExecutionContext,
+  { requestContext },
 );
 ```
 
+`invokeConnector()` accepts only an unmodified connector returned by `createConnector()`. It calls the connector's public Mastra execution boundary, so input and output schemas and every Breakwater gate still run. It creates the required observation context and forwards an optional `RequestContext`, abort signal, observer, and trusted tool-call ID.
+
 This example shows the values a trusted runtime must produce. Application routes must not construct them from client data. Do not accept `CONNECTOR_GRANTS_CONTEXT_KEY`, `CONNECTOR_EXECUTION_CONTEXT_KEY`, `PRINCIPAL_PERMISSIONS_CONTEXT_KEY`, `ISOLATION_SCOPE_CONTEXT_KEY`, `runId`, or `WORKFLOW_SCOPE_CONTEXT_KEY` from clients. A multi-tenant host should also register `tenantIsolation()` so a missing scope becomes a denial instead of a shared cache or budget.
+
+For a `tool-call` grant, pass the exact runtime-owned identity separately:
+
+```typescript
+await invokeConnector(connector, input, {
+  requestContext,
+  toolCallId: trustedToolCallId,
+});
+```
+
+Do not store this value in `RequestContext` or build a partial Mastra agent context. Concurrent calls can share a `RequestContext` while carrying different tool-call identities. A validation failure throws `ConnectorValidationError` with only the connector ID and the safe phase, `input` or `output`. It never exposes Mastra's message, schema issue text, invalid value, or cause.
 
 To request simulation:
 

@@ -56,7 +56,10 @@ The package supports the root import and six focused subpaths:
 import { PolicyEngine } from '@proofoftech/breakwater';
 import { createGuardedAgent } from '@proofoftech/breakwater/agent';
 import { AuditLogger } from '@proofoftech/breakwater/audit';
-import { createConnector } from '@proofoftech/breakwater/connector-sdk';
+import {
+  createConnector,
+  invokeConnector,
+} from '@proofoftech/breakwater/connector-sdk';
 import { RBACMiddleware } from '@proofoftech/breakwater/rbac';
 import { createCodexConnector } from '@proofoftech/breakwater/agent-cli';
 import { denyPatterns } from '@proofoftech/breakwater/policy-engine';
@@ -201,7 +204,10 @@ Create tools through `createConnector()` when policy must hold on agent,
 workflow, nested, and direct calls.
 
 ```typescript
-import { createConnector } from '@proofoftech/breakwater/connector-sdk';
+import {
+  createConnector,
+  invokeConnector,
+} from '@proofoftech/breakwater/connector-sdk';
 import { z } from 'zod';
 
 const accountLookup = createConnector({
@@ -225,6 +231,16 @@ const accountLookup = createConnector({
   },
 });
 ```
+
+Call the connector outside an agent loop through the supported direct boundary:
+
+```typescript
+const account = await invokeConnector(accountLookup, {
+  accountId: 'account_123',
+});
+```
+
+Pass a trusted `RequestContext` when the connector uses grants, identity, dry-run, idempotency, or isolation keys. `invokeConnector()` preserves Mastra schema validation and every Breakwater gate. It rejects plain tools and connectors whose ID, execution function, or schema surface changed after construction. Validation failures throw a redacted `ConnectorValidationError` with the connector ID and `input` or `output` phase.
 
 The permission manifest is enforced:
 
@@ -384,19 +400,21 @@ import { RequestContext } from '@mastra/core/request-context';
 import {
   createCodexConnector,
   DRY_RUN_CONTEXT_KEY,
+  invokeConnector,
 } from '@proofoftech/breakwater';
 
 const codex = createCodexConnector();
 const requestContext = new RequestContext();
 requestContext.set(DRY_RUN_CONTEXT_KEY, true);
 
-const preview = await codex.execute?.(
+const preview = await invokeConnector(
+  codex,
   {
     prompt: 'Add unit tests.',
     cwd: '/srv/workspace',
     model: 'your-model-id',
   },
-  { requestContext } as ToolExecutionContext,
+  { requestContext },
 );
 ```
 
@@ -490,16 +508,17 @@ for compatibility.
 
 | Runtime exports | Purpose |
 | --- | --- |
-| `createConnector`, `connectorManifest` | Build an enforced Mastra tool and inspect its immutable manifest |
+| `createConnector`, `connectorManifest` | Build an enforced Mastra connector and inspect its immutable manifest |
+| `invokeConnector` | Invoke an unmodified connector from trusted host or workflow code without fabricating a Mastra tool context |
 | `singleTenantConnectorPolicies` | Build the validated connector-policy baseline for one physically isolated deployment |
-| `ConnectorPolicyError` | Structured policy denial |
+| `ConnectorPolicyError`, `ConnectorValidationError` | Structured policy denial and redacted direct-invocation validation failure |
 | `CONNECTOR_GRANTS_CONTEXT_KEY`, `CONNECTOR_EXECUTION_CONTEXT_KEY`, `DRY_RUN_CONTEXT_KEY`, `IDEMPOTENCY_KEY_CONTEXT_KEY` | Stable connector request-context keys |
 | `InMemoryIdempotencyStore`, `D1IdempotencyStore` | Development and durable replay stores |
 | `inspectLegacyConnectorIdempotency`, `migrateLegacyConnectorIdempotency` | Inventory and atomically migrate one externally proven ambiguous legacy D1 row without exposing storage keys |
 | `InMemoryRateLimitStore`, `D1RateLimitStore` | Development and durable fixed-window stores |
 | `egressFetch`, `EgressDeniedError` | Standalone fetch guard and its default denial |
 
-Type exports: `PermissionManifest`, `ConnectorConfig`, `ConnectorPolicies`,
+Type exports: `Connector`, `ConnectorInvocationOptions`, `PermissionManifest`, `ConnectorConfig`, `ConnectorPolicies`,
 `SingleTenantConnectorPolicies`, `SingleTenantConnectorPoliciesOptions`,
 `SingleTenantAuditPosture`, `SingleTenantDurableStores`,
 `SingleTenantPermissionPosture`,

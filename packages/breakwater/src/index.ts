@@ -59,11 +59,13 @@ export {
 } from './audit/index.js';
 export type {
   AtomicIdempotencyStore,
+  Connector,
   ConnectorApprovalGrant,
   ConnectorApprovalGrantBase,
   ConnectorApprovalSuspension,
   ConnectorConfig,
   ConnectorExecutionIdentity,
+  ConnectorInvocationOptions,
   ConnectorPolicies,
   ConnectorRuntime,
   D1IdempotencyStoreOptions,
@@ -102,6 +104,7 @@ export {
   CONNECTOR_EXECUTION_CONTEXT_KEY,
   CONNECTOR_GRANTS_CONTEXT_KEY,
   ConnectorPolicyError,
+  ConnectorValidationError,
   connectorManifest,
   createConnector,
   D1IdempotencyStore,
@@ -113,6 +116,7 @@ export {
   InMemoryIdempotencyStore,
   InMemoryRateLimitStore,
   inspectLegacyConnectorIdempotency,
+  invokeConnector,
   migrateLegacyConnectorIdempotency,
   singleTenantConnectorPolicies,
 } from './connector-sdk/index.js';

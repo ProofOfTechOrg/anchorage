@@ -16,6 +16,7 @@ import {
   DRY_RUN_CONTEXT_KEY,
   IDEMPOTENCY_KEY_CONTEXT_KEY,
   InMemoryIdempotencyStore,
+  invokeConnector,
 } from '../connector-sdk/index.js';
 import { WORKFLOW_SCOPE_CONTEXT_KEY } from '../policy-engine/index.js';
 import {
@@ -223,6 +224,24 @@ describe('createCodexConnector', () => {
     expect(output.command).toBe(
       'codex exec --sandbox=<value:redacted> --model=<value:redacted> -- <prompt:redacted>',
     );
+  });
+
+  it('supports the public direct-invocation boundary after sanitizing decoration', async () => {
+    const exec = mockExec({ stdout: 'direct invocation ok' });
+    const tool = createCodexConnector({ exec });
+    const requestContext = GRANTED('agent-cli.codex').requestContext;
+
+    await expect(
+      invokeConnector(
+        tool,
+        { prompt: 'run through invokeConnector' },
+        { requestContext },
+      ),
+    ).resolves.toMatchObject({
+      text: 'direct invocation ok',
+      exitCode: 0,
+    });
+    expect(exec).toHaveBeenCalledTimes(1);
   });
 });
 

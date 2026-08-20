@@ -145,16 +145,19 @@ try {
   AuditLogger,
   CONNECTOR_EXECUTION_CONTEXT_KEY,
   CONNECTOR_GRANTS_CONTEXT_KEY,
+  ConnectorValidationError,
   createGuardedAgent,
   createCodexConnector,
   GUARDED_AGENT_HOST_PROTOCOL,
   inspectLegacyConnectorIdempotency,
+  invokeConnector,
   migrateLegacyConnectorIdempotency,
   singleTenantConnectorPolicies,
   type AgentCliErrorCode,
   type AgentCliErrorMetadata,
   type ConnectorApprovalGrant,
   type ConnectorExecutionIdentity,
+  type ConnectorInvocationOptions,
   type GuardedAgentCallOptions,
   type GuardedAgentHandle,
   type GuardedAgentHostProtocol,
@@ -166,8 +169,10 @@ import type { RequestContext } from '@mastra/core/request-context';
 import { isGuardedAgentHandle } from '@proofoftech/breakwater/agent';
 import {
   connectorManifest,
+  ConnectorValidationError as ConnectorValidationErrorFromSubpath,
   createConnector,
   inspectLegacyConnectorIdempotency as inspectLegacyConnectorIdempotencyFromSubpath,
+  invokeConnector as invokeConnectorFromSubpath,
   migrateLegacyConnectorIdempotency as migrateLegacyConnectorIdempotencyFromSubpath,
   singleTenantConnectorPolicies as singleTenantConnectorPoliciesFromSubpath,
   type ConnectorApprovalSuspension,
@@ -232,6 +237,7 @@ const execution: ConnectorExecutionIdentity = {
   isolationScope: grant.isolationScope,
   suspension,
 };
+const invocationOptions: ConnectorInvocationOptions = {};
 const migrationRequest: LegacyConnectorIdempotencyMigrationRequest = {
   idempotencyKey: 'invoice:1',
   isolationScope: 'tenant',
@@ -277,8 +283,12 @@ void RBACMiddleware;
 void CODEX_CLI;
 void connectorManifest(tool);
 void connectorManifest(authorized)?.requiredPermissions;
+void ConnectorValidationError;
+void ConnectorValidationErrorFromSubpath;
 void inspectLegacyConnectorIdempotency;
 void inspectLegacyConnectorIdempotencyFromSubpath;
+void invokeConnector(authorized, {}, invocationOptions);
+void invokeConnectorFromSubpath(authorized, {}, invocationOptions);
 void migrateLegacyConnectorIdempotency;
 void migrateLegacyConnectorIdempotencyFromSubpath;
 void migrationRequest;
@@ -304,9 +314,11 @@ import {
   AgentCliError,
   AuditLogger,
   ConnectorPolicyError,
+  ConnectorValidationError,
   createConnector,
   createGuardedAgent,
   createCodexConnector,
+  invokeConnector,
   singleTenantConnectorPolicies,
 } from '@proofoftech/breakwater';
 import { isGuardedAgentHandle } from '@proofoftech/breakwater/agent';
@@ -315,6 +327,7 @@ import {
   CONNECTOR_EXECUTION_CONTEXT_KEY,
   CONNECTOR_GRANTS_CONTEXT_KEY,
   connectorManifest,
+  invokeConnector as invokeConnectorFromSubpath,
   singleTenantConnectorPolicies as singleTenantConnectorPoliciesFromSubpath,
 } from '@proofoftech/breakwater/connector-sdk';
 import {
@@ -367,7 +380,9 @@ const presetRead = createConnector({
   policies: preset,
 });
 assert.deepEqual(
-  await presetRead.execute({}, { requestContext: new RequestContext() }),
+  await invokeConnectorFromSubpath(presetRead, {}, {
+    requestContext: new RequestContext(),
+  }),
   { ok: true },
 );
 assert.throws(() => createConnector({
@@ -387,7 +402,7 @@ const release = createConnector({
     requiredPermissions: ['payments.release'],
   },
 });
-const unauthorized = await release.execute({}, {
+const unauthorized = await invokeConnector(release, {}, {
   requestContext: new RequestContext(),
 }).catch((error) => error);
 assert.equal(unauthorized instanceof ConnectorPolicyError, true);
@@ -398,7 +413,7 @@ authorizedContext.set(PRINCIPAL_PERMISSIONS_CONTEXT_KEY, {
   policyVersion: 'permissions-v1',
 });
 assert.deepEqual(
-  await release.execute({}, { requestContext: authorizedContext }),
+  await invokeConnector(release, {}, { requestContext: authorizedContext }),
   { released: true },
 );
 
@@ -435,7 +450,7 @@ const tool = createCodexConnector({
   },
 });
 const context = { requestContext: new RequestContext() };
-const output = await tool.execute({ prompt }, context);
+const output = await invokeConnector(tool, { prompt }, context);
 
 assert.deepEqual(calls, [{
   command: 'codex',
@@ -459,7 +474,7 @@ assert.equal(JSON.stringify(output).includes(prompt), false);
 assert.equal(JSON.stringify(audit.events()).includes(prompt), false);
 
 context.requestContext.set(DRY_RUN_CONTEXT_KEY, true);
-const simulation = await tool.execute({ prompt }, context);
+const simulation = await invokeConnector(tool, { prompt }, context);
 assert.equal(
   simulation.command,
   'codex exec --sandbox=<value:redacted> -- <prompt:redacted>',
@@ -477,7 +492,7 @@ const failing = createCodexConnector({
     exitCode: 7,
   }),
 });
-const failure = await failing.execute({ prompt }, {
+const failure = await invokeConnector(failing, { prompt }, {
   requestContext: new RequestContext(),
 }).catch((error) => error);
 assert.equal(failure instanceof AgentCliError, true);
@@ -496,11 +511,12 @@ assert.equal(
   false,
 );
 
-const invalid = await tool.execute({ prompt, cwd: 42 }, {
+const invalid = await invokeConnector(tool, { prompt, cwd: 42 }, {
   requestContext: new RequestContext(),
-});
-assert.equal(invalid.error, true);
-assert.equal(invalid.message, 'Agent CLI input or output validation failed.');
+}).catch((error) => error);
+assert.equal(invalid instanceof ConnectorValidationError, true);
+assert.equal(invalid.phase, 'input');
+assert.equal(invalid.message, 'connector invocation failed validation');
 assert.equal(JSON.stringify(invalid).includes(prompt), false);
 `,
   );

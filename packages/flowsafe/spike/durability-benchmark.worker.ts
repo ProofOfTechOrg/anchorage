@@ -11,8 +11,10 @@ import type {
   ExportedHandler,
   Workflow,
 } from '@cloudflare/workers-types';
-import type { ToolExecutionContext } from '@mastra/core/tools';
-import { createConnector } from '@proofoftech/breakwater/connector-sdk';
+import {
+  createConnector,
+  invokeConnector,
+} from '@proofoftech/breakwater/connector-sdk';
 import { z } from 'zod';
 import {
   ApprovalService,
@@ -237,12 +239,12 @@ function defineFlowsafeWorkflow(env: Env): RunnerRuntime {
           grantReconstructed: false,
         };
       }
-      if (!publisher.execute) throw new Error('publisher has no execute');
       const grants = requestContext.get('breakwater.connectorGrants');
-      const output = (await publisher.execute(
+      const output = await invokeConnector(
+        publisher,
         { deliveryId: inputData.deliveryId, topic: inputData.topic, runId },
-        { requestContext } as unknown as ToolExecutionContext,
-      )) as { effectCount: number };
+        { requestContext },
+      );
       return {
         deliveryId: inputData.deliveryId,
         topic: inputData.topic,

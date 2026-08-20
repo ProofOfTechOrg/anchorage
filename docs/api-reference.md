@@ -13,7 +13,7 @@ Use public package exports only. Paths under `src/` and generated `dist/` files 
 | `@proofoftech/breakwater/policy-engine` | `PolicyEngine`, content inspection, output channels, hold-back, and tool evaluators |
 | `@proofoftech/breakwater/rbac` | Actor roles, request-context lookup, `RBACMiddleware`, and the permission identifier/projection contract |
 | `@proofoftech/breakwater/audit` | `AuditLogger`, metrics adapter, sink fan-out, and audit types |
-| `@proofoftech/breakwater/connector-sdk` | `createConnector`, manifests, context keys, guarded fetch, D1/in-memory idempotency and rate-limit stores |
+| `@proofoftech/breakwater/connector-sdk` | `createConnector`, `invokeConnector`, redacted validation errors, manifests, context keys, guarded fetch, D1/in-memory idempotency and rate-limit stores |
 | `@proofoftech/breakwater/agent-cli` | Generic, Claude Code, and Codex CLI connectors plus injected execution types |
 
 The root barrel re-exports every supported breakwater module. Prefer the

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { D1Database } from '@cloudflare/workers-types';
-import type { ToolExecutionContext } from '@mastra/core/tools';
-import { createConnector } from '@proofoftech/breakwater';
+import { createConnector, invokeConnector } from '@proofoftech/breakwater';
 import { approvalGrantProvider } from '@proofoftech/flowsafe/approval-api';
 import { init, type RunnerRuntime } from '@proofoftech/flowsafe/do-runner';
 import {
@@ -137,15 +136,11 @@ export function defineConformanceWorkflows(
       if (!inputData.approved) {
         return { effectNonce: inputData.effectNonce, recorded: false };
       }
-      if (!recorder.execute) throw new Error('effect recorder has no execute');
-      // Only Mastra constructs a real ToolExecutionContext; the connector reads
-      // only requestContext, which is where the derived grant arrives. The cast
-      // is how every in-repo caller invokes a connector from a workflow step;
-      // DEFERRED item 36 is the breakwater helper that should own it.
-      return (await recorder.execute(
+      return invokeConnector(
+        recorder,
         { effectNonce: inputData.effectNonce, runId },
-        { requestContext } as unknown as ToolExecutionContext,
-      )) as { effectNonce: string; recorded: boolean };
+        { requestContext },
+      );
     },
   });
 

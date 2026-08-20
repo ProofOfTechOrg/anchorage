@@ -21,8 +21,11 @@ import { globalRunRegistry } from '@mastra/core/agent/durable';
 import type { MastraModelConfig } from '@mastra/core/llm';
 import { RequestContext } from '@mastra/core/request-context';
 import { InMemoryStore } from '@mastra/core/storage';
-import type { ToolExecutionContext } from '@mastra/core/tools';
-import { AuditLogger, createConnector } from '@proofoftech/breakwater';
+import {
+  AuditLogger,
+  createConnector,
+  invokeConnector,
+} from '@proofoftech/breakwater';
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import type { ApprovalActor } from '../approval-api/contract.js';
@@ -218,11 +221,11 @@ function buildHarness(
         // A rejected gate resumes the run but skips the side effect — no grant is
         // needed or minted (the run completes cleanly, nothing published).
         if (!inputData.approved) return { published: false };
-        if (!publisher.execute) throw new Error('connector has no execute');
-        return (await publisher.execute({ topic: inputData.topic }, {
-          requestContext,
-          agent: { toolCallId: 'call-1' },
-        } as unknown as ToolExecutionContext)) as { published: boolean };
+        return invokeConnector(
+          publisher,
+          { topic: inputData.topic },
+          { requestContext, toolCallId: 'call-1' },
+        );
       },
     });
 

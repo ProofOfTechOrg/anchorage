@@ -61,11 +61,7 @@ import type {
 } from '@mastra/core/llm';
 import { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
-import {
-  readObjective,
-  resolveGoalStore,
-  type ToolExecutionContext,
-} from '@mastra/core/tools';
+import { readObjective, resolveGoalStore } from '@mastra/core/tools';
 import { createGuardedAgent } from '@proofoftech/breakwater/agent';
 import {
   AGENT_AUDIT_CONTEXT_KEY,
@@ -74,6 +70,7 @@ import {
 import {
   ConnectorPolicyError,
   createConnector,
+  invokeConnector,
 } from '@proofoftech/breakwater/connector-sdk';
 import { ACTOR_CONTEXT_KEY } from '@proofoftech/breakwater/rbac';
 import { z } from 'zod';
@@ -681,10 +678,11 @@ function defineWorkflows(env: Env): RunnerRuntime {
       if (!inputData.approved) {
         return { topic: inputData.topic, published: false };
       }
-      if (!publisher.execute) throw new Error('publisher has no execute');
-      const result = (await publisher.execute({ topic: inputData.topic }, {
-        requestContext,
-      } as unknown as ToolExecutionContext)) as { published: boolean };
+      const result = await invokeConnector(
+        publisher,
+        { topic: inputData.topic },
+        { requestContext },
+      );
       return {
         topic: inputData.topic,
         published: result.published,
@@ -751,11 +749,11 @@ function defineWorkflows(env: Env): RunnerRuntime {
       if (!inputData.approved) {
         return { topic: inputData.topic, published: false };
       }
-      if (!publisher.execute) throw new Error('publisher has no execute');
-      const result = (await publisher.execute({ topic: inputData.topic }, {
-        requestContext,
-        agent: { toolCallId: 'call-1' },
-      } as unknown as ToolExecutionContext)) as { published: boolean };
+      const result = await invokeConnector(
+        publisher,
+        { topic: inputData.topic },
+        { requestContext, toolCallId: 'call-1' },
+      );
       return { topic: inputData.topic, published: result.published };
     },
   });
@@ -1834,7 +1832,8 @@ async function handleBackgroundTaskProbe(
     let denied = false;
     let policy = '';
     try {
-      await (writer.execute as (i: unknown, c: unknown) => Promise<unknown>)(
+      await invokeConnector(
+        writer,
         { topic: 'x', _background: { enabled: true } },
         { requestContext: new RequestContext() },
       );

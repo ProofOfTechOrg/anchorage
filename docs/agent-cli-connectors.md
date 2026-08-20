@@ -159,9 +159,12 @@ Catch `AgentCliError` and branch on its exported `code` rather than parsing `mes
 
 ```typescript
 import { AgentCliError } from '@proofoftech/breakwater/agent-cli';
+import { invokeConnector } from '@proofoftech/breakwater/connector-sdk';
 
 try {
-  const result = await connector.execute(input, context);
+  const result = await invokeConnector(connector, input, {
+    requestContext,
+  });
   return result;
 } catch (error) {
   if (error instanceof AgentCliError) {

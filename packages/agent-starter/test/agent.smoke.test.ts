@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { RequestContext } from '@mastra/core/request-context';
-import type { ToolExecutionContext } from '@mastra/core/tools';
 import {
   ACTOR_CONTEXT_KEY,
   AuditLogger,
   ConnectorPolicyError,
+  invokeConnector,
 } from '@proofoftech/breakwater';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -71,22 +71,11 @@ describe('advanced starter agent', () => {
     const { db, prepare } = sideEffectTrap();
     const connector = createRecordActionConnector(db);
     const requestContext = new RequestContext();
-    const context = {
-      requestContext,
-      agent: {
-        agentId: 'anchorage-agent',
-        toolCallId: 'call-smoke',
-        threadId: 'thread-smoke',
-        resourceId: 'resource-smoke',
-        messages: [],
-        suspend: async () => undefined,
-      },
-    } as unknown as ToolExecutionContext;
-    if (!connector.execute) throw new Error('connector has no execute method');
-
-    const failure = await connector
-      .execute({ action: 'must remain unrecorded' }, context)
-      .catch((error: unknown) => error);
+    const failure = await invokeConnector(
+      connector,
+      { action: 'must remain unrecorded' },
+      { requestContext, toolCallId: 'call-smoke' },
+    ).catch((error: unknown) => error);
 
     expect(failure).toBeInstanceOf(ConnectorPolicyError);
     expect((failure as ConnectorPolicyError).policy).toBe('write-permissions');

@@ -16,8 +16,11 @@
 // Also runs under `pnpm --filter @proofoftech/flowsafe test` as a regression guard.
 
 import { InMemoryStore } from '@mastra/core/storage';
-import type { ToolExecutionContext } from '@mastra/core/tools';
-import { AuditLogger, createConnector } from '@proofoftech/breakwater';
+import {
+  AuditLogger,
+  createConnector,
+  invokeConnector,
+} from '@proofoftech/breakwater';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 
@@ -156,13 +159,11 @@ function buildHarness(): Harness {
     outputSchema: z.object({ sent: z.boolean(), count: z.number() }),
     execute: async ({ inputData, requestContext }) => {
       if (!inputData.approved) return { sent: false, count: 0 };
-      if (!outreachSender.execute) throw new Error('connector has no execute');
-      const { sent } = (await outreachSender.execute(
+      const { sent } = await invokeConnector(
+        outreachSender,
         { count: inputData.drafts.length },
-        {
-          requestContext,
-        } as unknown as ToolExecutionContext,
-      )) as { sent: boolean };
+        { requestContext },
+      );
       return { sent, count: inputData.drafts.length };
     },
   });

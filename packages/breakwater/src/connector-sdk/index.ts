@@ -29,14 +29,15 @@
 // The manifest carries only fields the wrapper enforces (see
 // docs/connector-interface.md).
 
-import type { RequestContext } from '@mastra/core/request-context';
+import { RequestContext } from '@mastra/core/request-context';
 import {
   type PublicSchema,
   type StandardSchemaIssue,
+  type StandardSchemaWithJSON,
   toStandardSchema,
 } from '@mastra/core/schema';
 import type { Tool, ToolExecutionContext } from '@mastra/core/tools';
-import { createTool } from '@mastra/core/tools';
+import { createTool, isValidationError, noopObserve } from '@mastra/core/tools';
 import { type AuditLogger, agentAuditDetail } from '../audit/index.js';
 import { safeAuditErrorSummary } from '../audit/safe-error.js';
 import type {
@@ -73,6 +74,11 @@ import {
   ATOMIC_LEGACY_IDEMPOTENCY_MIGRATION,
   isAtomicLegacyIdempotencyMigrator,
 } from './idempotency-migration.js';
+import {
+  connectorInvocationBoundary,
+  isConnectorInvocationBoundaryCurrent,
+  registerConnectorInvocation,
+} from './invocation-registry.js';
 import { newToken } from './new-token.js';
 import { assertSingleTenantConnectorPolicies } from './single-tenant-preset.js';
 
@@ -322,6 +328,70 @@ function isPrevalidatedOutput<T>(
   );
 }
 
+function pinInputValidationBoundary<T>(
+  schema: PublicSchema<T>,
+): StandardSchemaWithJSON<T> {
+  const standardized = toStandardSchema(schema);
+  const standard = standardized['~standard'];
+  const validate = standard.validate;
+  // Capture the validator with its original receiver so a caller retaining the
+  // configured schema cannot replace enforcement later. The facade preserves
+  // schema-library behavior without violating a non-configurable `~standard`;
+  // mutations to its exposed contract remain visible to the registry snapshot.
+  const pinnedStandard: typeof standard = {
+    version: standard.version,
+    vendor: standard.vendor,
+    jsonSchema: standard.jsonSchema,
+    types: standard.types,
+    validate(...args: Parameters<typeof validate>) {
+      const validation = Reflect.apply(validate, standard, args);
+      if (validation instanceof Promise) {
+        // Mastra 1.50 rejects async tool-input schemas synchronously after the
+        // validator has already returned its promise. Mark a later rejection
+        // handled without awaiting it or changing Mastra's one-call contract.
+        void validation.catch(() => undefined);
+      }
+      return validation;
+    },
+  };
+  const facadeTarget =
+    typeof standardized === 'function'
+      ? function (this: unknown, ...args: unknown[]) {
+          return Reflect.apply(standardized, this, args);
+        }
+      : Object.create(Reflect.getPrototypeOf(standardized));
+  Object.setPrototypeOf(facadeTarget, Reflect.getPrototypeOf(standardized));
+  Object.defineProperty(facadeTarget, '~standard', {
+    configurable: false,
+    enumerable: true,
+    value: pinnedStandard,
+    writable: false,
+  });
+  type SchemaMethod = (...args: never[]) => unknown;
+  const boundMethods = new WeakMap<SchemaMethod, SchemaMethod>();
+  return new Proxy(facadeTarget, {
+    get(target, property) {
+      const fixed = Reflect.getOwnPropertyDescriptor(target, property);
+      if (fixed && !fixed.configurable && 'value' in fixed && !fixed.writable) {
+        return fixed.value;
+      }
+      const value = Reflect.get(standardized, property, standardized);
+      if (typeof value !== 'function') return value;
+      const method = value as SchemaMethod;
+      const existing = boundMethods.get(method);
+      if (existing) return existing;
+      const bound = method.bind(standardized) as SchemaMethod;
+      boundMethods.set(method, bound);
+      return bound;
+    },
+    has(target, property) {
+      return (
+        Reflect.has(target, property) || Reflect.has(standardized, property)
+      );
+    },
+  }) as StandardSchemaWithJSON<T>;
+}
+
 /**
  * Dev/test store. Per-isolate and evictable — production replay protection
  * needs a durable store (D1IdempotencyStore).
@@ -522,6 +592,26 @@ export interface ConnectorConfig<TInput = unknown, TOutput = unknown> {
   policies?: ConnectorPolicies;
 }
 
+/** Breakwater connector with the execution function guaranteed at construction. */
+export type Connector<TInput = unknown, TOutput = unknown> = Tool<
+  TInput,
+  TOutput
+> & {
+  execute: NonNullable<Tool<TInput, TOutput>['execute']>;
+};
+
+/** Trusted host context accepted by {@link invokeConnector}. */
+export interface ConnectorInvocationOptions {
+  /** Request context carrying trusted policy, identity, and grant values. */
+  requestContext?: RequestContext;
+  /** Abort signal forwarded to the connector execution context. */
+  abortSignal?: AbortSignal;
+  /** Mastra observability helper, or the public no-op helper when omitted. */
+  observe?: ToolExecutionContext['observe'];
+  /** Exact Mastra tool-call identity used to match a tool-call approval grant. */
+  toolCallId?: string;
+}
+
 /** Exact suspension identity shared by a resume leg and its grants. */
 export interface ConnectorApprovalSuspension {
   /** Suspended workflow step path. */
@@ -630,7 +720,33 @@ export class ConnectorPolicyError extends Error {
   }
 }
 
+/** Redacted input or output validation failure from a direct connector call. */
+export class ConnectorValidationError extends Error {
+  /** Connector whose public Mastra boundary rejected the value. */
+  readonly connector: string;
+  /** Side of the public connector boundary that rejected the value. */
+  readonly phase: 'input' | 'output';
+
+  constructor(connector: string, phase: 'input' | 'output') {
+    super('connector invocation failed validation');
+    this.name = 'ConnectorValidationError';
+    this.connector = connector;
+    this.phase = phase;
+  }
+}
+
 const manifests = new WeakMap<object, PermissionManifest>();
+const DIRECT_INVOCATION_STATE = Symbol('breakwater.direct-invocation-state');
+
+interface DirectInvocationState {
+  entered: boolean;
+  validationPhase?: 'output';
+  toolCallId?: string;
+}
+
+type DirectInvocationContext = ToolExecutionContext & {
+  [DIRECT_INVOCATION_STATE]?: DirectInvocationState;
+};
 
 interface ConnectorIdempotencyMigration {
   inspect(
@@ -791,6 +907,7 @@ function sameSuspension(
 function grantForExecution(
   context: ToolExecutionContext,
   connectorId: string,
+  toolCallId: string | undefined,
 ): ConnectorApprovalGrant | undefined {
   const requestContext = context.requestContext;
   if (requestContext?.get(LEGACY_CONNECTOR_GRANTS_CONTEXT_KEY) !== undefined) {
@@ -836,11 +953,18 @@ function grantForExecution(
     ) {
       return false;
     }
-    return (
-      grant.scope === 'suspension' ||
-      grant.toolCallId === context.agent?.toolCallId
-    );
+    return grant.scope === 'suspension' || grant.toolCallId === toolCallId;
   });
+}
+
+function consumeDirectInvocation(
+  context: ToolExecutionContext,
+): DirectInvocationState | undefined {
+  const directContext = context as DirectInvocationContext;
+  const state = directContext[DIRECT_INVOCATION_STATE];
+  delete directContext[DIRECT_INVOCATION_STATE];
+  if (state) state.entered = true;
+  return state;
 }
 
 // The `_background` model-override field (core LLMBackgroundOverride) smuggled
@@ -963,7 +1087,7 @@ function normalizedRequiredPermissions(
  */
 export function createConnector<TInput = unknown, TOutput = unknown>(
   config: ConnectorConfig<TInput, TOutput>,
-): Tool<TInput, TOutput> {
+): Connector<TInput, TOutput> {
   const { id } = config;
   const configuredPolicies = config.policies ?? {};
   // The rate-budget key retains the v1 `[scope:]connector` format so active
@@ -1001,10 +1125,18 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   const baseEgressGuard = egressFetch(manifest.egress ?? [], {
     fetch: policies.fetch,
   });
+  const toolInputSchema =
+    config.inputSchema === undefined
+      ? undefined
+      : pinInputValidationBoundary(config.inputSchema);
   const outputValidator =
     config.outputSchema === undefined
       ? undefined
       : toStandardSchema(config.outputSchema);
+  // Keep the backing validator and receiver fixed just like the input facade;
+  // the outer Mastra schema remains separately fingerprinted for direct calls.
+  const outputStandard = outputValidator?.['~standard'];
+  const outputValidate = outputStandard?.validate;
   if (manifest.idempotencyKey && !policies.idempotencyStore) {
     throw new TypeError(
       `connector ${id}: permissions.idempotencyKey requires policies.idempotencyStore (InMemoryIdempotencyStore works for dev/tests)`,
@@ -1187,9 +1319,13 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   }
 
   function validateOutput(result: TOutput): TOutput {
-    if (outputValidator === undefined) return result;
+    if (outputStandard === undefined || outputValidate === undefined) {
+      return result;
+    }
     try {
-      const validation = outputValidator['~standard'].validate(result);
+      const validation = Reflect.apply(outputValidate, outputStandard, [
+        result,
+      ]);
       if (validation instanceof Promise) {
         // Mastra 1.50's public Tool boundary is synchronous-only. Accepting
         // and committing an async validation here would let Mastra reject the
@@ -1366,6 +1502,9 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   ): Promise<TOutput | PrevalidatedOutput<TOutput>> {
     const requestContext = context?.requestContext;
     const typedInput = inputData as TInput;
+    const directInvocation = consumeDirectInvocation(context);
+    const toolCallId =
+      context.agent?.toolCallId ?? directInvocation?.toolCallId;
 
     // _background model-override defense (DL-005), FIRST — before the gates,
     // the dry-run branch, and any execute. A `_background` field in the args
@@ -1520,6 +1659,9 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       } catch (error) {
         if (error instanceof OutputValidationFailure) {
           recordOutputValidationError(requestContext, { dryRun: true });
+          if (directInvocation) {
+            directInvocation.validationPhase = 'output';
+          }
           if (error.kind === 'exception') throw error.cause;
           return prevalidatedIssues<TOutput>(error.issues);
         }
@@ -1538,7 +1680,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     // must mint the grant into the requestContext the resumed call runs
     // under (the Phase 3 approval API's job).
     if (needsApproval) {
-      const grant = grantForExecution(context, id);
+      const grant = grantForExecution(context, id, toolCallId);
       if (!grant) {
         deny(
           requestContext,
@@ -1808,6 +1950,9 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
           recordOutputValidationError(requestContext, {
             idempotencyKey: key,
           });
+          if (directInvocation) {
+            directInvocation.validationPhase = 'output';
+          }
           if (error.kind === 'exception') throw error.cause;
           return prevalidatedIssues<TOutput>(error.issues);
         }
@@ -1822,6 +1967,9 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     } catch (error) {
       if (error instanceof OutputValidationFailure) {
         recordOutputValidationError(requestContext);
+        if (directInvocation) {
+          directInvocation.validationPhase = 'output';
+        }
         if (error.kind === 'exception') throw error.cause;
         return prevalidatedIssues<TOutput>(error.issues);
       }
@@ -1834,18 +1982,19 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   // PublicSchema<TInput> degrades its inference, so pin the honest public
   // shape explicitly.
   const toolOutputSchema =
-    outputValidator === undefined
+    outputStandard === undefined || outputValidate === undefined
       ? undefined
       : {
           '~standard': {
             version: 1 as const,
             vendor: 'breakwater',
-            jsonSchema: outputValidator['~standard'].jsonSchema,
-            validate(value: unknown) {
+            jsonSchema: outputStandard.jsonSchema,
+            validate(...args: Parameters<NonNullable<typeof outputValidate>>) {
+              const [value] = args;
               if (isPrevalidatedOutput<TOutput>(value)) {
                 return value[PREVALIDATED_OUTPUT];
               }
-              return outputValidator['~standard'].validate(value);
+              return Reflect.apply(outputValidate, outputStandard, args);
             },
           },
         };
@@ -1853,7 +2002,7 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
   const tool = createTool({
     id,
     description: config.description,
-    inputSchema: config.inputSchema,
+    inputSchema: toolInputSchema,
     outputSchema: toolOutputSchema,
     // Compiled as a per-call predicate: Mastra resolves approval BEFORE
     // execute, so a static `true` would pause an agent's dry-run request
@@ -1891,9 +2040,17 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
     }) as never,
   }) as unknown as Tool<TInput, TOutput>;
 
-  manifests.set(tool, manifest);
+  if (typeof tool.execute !== 'function') {
+    throw new TypeError(
+      `connector ${id}: Mastra did not create the required execution boundary`,
+    );
+  }
+  const connector = tool as Connector<TInput, TOutput>;
+
+  manifests.set(connector, manifest);
+  registerConnectorInvocation(connector);
   if (manifest.idempotencyKey && store) {
-    idempotencyMigrations.set(tool, {
+    idempotencyMigrations.set(connector, {
       async inspect(identity) {
         assertLegacyMigrationIdentity(identity);
         if (!isInspectableStore(store)) {
@@ -1946,7 +2103,81 @@ export function createConnector<TInput = unknown, TOutput = unknown>(
       },
     });
   }
-  return tool;
+  return connector;
+}
+
+/**
+ * Invoke a Breakwater connector outside a Mastra agent loop while retaining
+ * Mastra schema validation and every compiled Breakwater gate.
+ */
+export async function invokeConnector<TInput, TOutput>(
+  connector: Connector<TInput, TOutput>,
+  input: TInput,
+  options: ConnectorInvocationOptions = {},
+): Promise<TOutput> {
+  if (
+    (typeof connector !== 'object' && typeof connector !== 'function') ||
+    connector === null ||
+    !manifests.has(connector)
+  ) {
+    throw new TypeError(
+      'invokeConnector requires a connector created by createConnector()',
+    );
+  }
+  const invocation = connectorInvocationBoundary(connector);
+  if (
+    !invocation ||
+    !isConnectorInvocationBoundaryCurrent(connector, invocation)
+  ) {
+    throw new TypeError(
+      'invokeConnector refuses a connector whose execution boundary was modified after construction',
+    );
+  }
+  if (options.toolCallId !== undefined && !nonEmptyString(options.toolCallId)) {
+    throw new TypeError(
+      'invokeConnector toolCallId must be a non-empty string when provided',
+    );
+  }
+
+  const state: DirectInvocationState = {
+    entered: false,
+    ...(options.toolCallId === undefined
+      ? {}
+      : { toolCallId: options.toolCallId }),
+  };
+  const context: DirectInvocationContext = {
+    requestContext: options.requestContext ?? new RequestContext(),
+    abortSignal: options.abortSignal,
+    observe: options.observe ?? noopObserve,
+    [DIRECT_INVOCATION_STATE]: state,
+  };
+  let result: Awaited<ReturnType<typeof invocation.execute>>;
+  try {
+    result = await Reflect.apply(invocation.execute, connector, [
+      input,
+      context,
+    ]);
+  } catch (error) {
+    if (state.validationPhase === 'output') {
+      throw new ConnectorValidationError(invocation.id, 'output');
+    }
+    if (!state.entered) {
+      throw new ConnectorValidationError(invocation.id, 'input');
+    }
+    throw error;
+  }
+  if (state.validationPhase === 'output') {
+    throw new ConnectorValidationError(invocation.id, 'output');
+  }
+  if (!state.entered && isValidationError(result)) {
+    throw new ConnectorValidationError(invocation.id, 'input');
+  }
+  if (!state.entered) {
+    throw new TypeError(
+      'invokeConnector could not verify the connector enforcement boundary',
+    );
+  }
+  return result as TOutput;
 }
 
 export type {
