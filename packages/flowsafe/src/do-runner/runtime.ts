@@ -92,6 +92,27 @@ export class RunNotSuspendedError extends Error {
   }
 }
 
+/**
+ * An authoritative run-state read did not succeed, so nothing that read
+ * returned is evidence about the run. One cause is Mastra answering from its
+ * in-memory fallback instead of from storage — what comes back then describes
+ * the Run object this isolate happens to hold rather than what is persisted —
+ * and the run object's alarm raises it for any other failed read too, carrying
+ * the underlying fault as `cause`. Distinct from UnknownRunError: the run may
+ * well exist and be suspended — nothing about it could be READ. The message
+ * therefore names no cause: it is minted where the read failed, not where the
+ * reason is known.
+ */
+export class RunStateUnreadableError extends Error {
+  constructor(workflowId: string, runId: string, options?: ErrorOptions) {
+    super(
+      `run '${runId}' of workflow '${workflowId}' state is not readable`,
+      options,
+    );
+    this.name = 'RunStateUnreadableError';
+  }
+}
+
 export class RunAlreadyExistsError extends Error {
   constructor(workflowId: string, runId: string, status: RunStatus) {
     super(
@@ -1606,10 +1627,51 @@ export class RunnerRuntime {
     });
   }
 
+  /**
+   * The PROJECTION read: the best answer available about a run, which is what
+   * an HTTP status route, a broadcast frame or an existence check wants.
+   *
+   * It can answer from Mastra's in-memory fallback, so a caller about to
+   * conclude something IRREVERSIBLE from what it reads — deleting wake state,
+   * spending an abandonment budget, resuming a run, deleting a row — must use
+   * {@link RunnerRuntime.authoritativeStatus} instead, which refuses a read
+   * that did not reach storage.
+   */
   async status(workflowId: string, runId: string): Promise<RunSummary | null> {
     const workflow = this.#getWorkflow(workflowId);
     const state = await this.#workflowState(workflow, runId);
     if (!state) return null;
+    return this.#summaryFromState(runId, state);
+  }
+
+  /**
+   * status() for a caller about to CONCLUDE something irreversible from what it
+   * reads — delete a wake record, spend an abandonment budget, resume a run.
+   *
+   * Mastra answers a state read from an in-memory Run whenever storage is
+   * unavailable or the row lookup comes back empty while this isolate still
+   * holds the run, and that fallback reports the Run object's own status
+   * ('pending' until something updates it) with no suspended paths and no
+   * requestContext at all. Projecting it is indistinguishable from evidence
+   * about the run. Mastra stamps `isFromInMemory` on it at its single
+   * construction site and the persisted branch builds its result field by
+   * field without ever copying the marker, so this throws on exactly the reads
+   * that did not reach storage. `null` still means the read SUCCEEDED and
+   * found nothing.
+   *
+   * status() stays the projection read, unchanged for every existing caller:
+   * a summary is still the best answer an HTTP status route can give.
+   */
+  async authoritativeStatus(
+    workflowId: string,
+    runId: string,
+  ): Promise<RunSummary | null> {
+    const workflow = this.#getWorkflow(workflowId);
+    const state = await this.#workflowState(workflow, runId);
+    if (!state) return null;
+    if (state.isFromInMemory === true) {
+      throw new RunStateUnreadableError(workflowId, runId);
+    }
     return this.#summaryFromState(runId, state);
   }
 
@@ -1631,6 +1693,18 @@ export class RunnerRuntime {
     return this.#withRunLock(workflowId, runId, async () => {
       const state = await this.#workflowState(workflow, runId);
       if (!state) return null;
+      // A read that did not reach storage cannot settle an interrupted start.
+      // The in-memory fallback carries no requestContext, so the token below
+      // can never match, and the 'pending' status it reports for a run that
+      // has not been resumed falls straight into the delete branch — which
+      // would destroy a live row and its snapshot behind a lagging read. The
+      // throw defers only a no-op: under the marker either the row exists, and
+      // deleting it destroys live state, or it does not, and the delete does
+      // nothing. A genuinely abandoned shell on an isolate that holds no Run
+      // carries no marker and converges here exactly as before.
+      if (state.isFromInMemory === true) {
+        throw new RunStateUnreadableError(workflowId, runId);
+      }
       const provenance = runProvenance(state);
       if (provenance?.startToken === attemptToken) {
         return summarizeState(

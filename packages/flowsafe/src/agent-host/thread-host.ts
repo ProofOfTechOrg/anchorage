@@ -50,6 +50,7 @@ import {
   resourceIdFromKey,
   type ScheduleSourceAgentTarget,
   type ScheduleSourceStore,
+  SUSPENSION_TIMEOUT_RESUME_KEY,
   type ThreadScope,
 } from '../do-runner/index.js';
 import { mastraRegistryEntries } from '../do-runner/mastra-registry.js';
@@ -351,6 +352,29 @@ function resourceOwner(value: unknown): ResourceOwner {
 function requestedBy(value: unknown): string {
   if (!isExecutionPrincipalId(value)) {
     throw new AgentHostRequestError(400, 'requestedBy is malformed');
+  }
+  return value;
+}
+
+/**
+ * The reserved suspension-timeout envelope is minted by a run object's alarm and
+ * by nothing else. Agent runs never arm a suspension deadline, so a forged
+ * envelope here could only mislead a step — but this route forwards client
+ * resume data verbatim under `requestedByKind: 'human'`, and the guarantee the
+ * feature sells is that no caller can present itself to a step as an expired
+ * deadline. The KEY is refused, exactly as the workflow resume route refuses it,
+ * so a step that reads the key directly cannot be fooled either.
+ */
+function resumeData(value: unknown): unknown {
+  if (
+    value !== null &&
+    typeof value === 'object' &&
+    SUSPENSION_TIMEOUT_RESUME_KEY in value
+  ) {
+    throw new AgentHostRequestError(
+      400,
+      `resume data must not carry the reserved '${SUSPENSION_TIMEOUT_RESUME_KEY}' key`,
+    );
   }
   return value;
 }
@@ -1546,8 +1570,17 @@ export function createThreadAgentHost(
               ref.runId,
               recovery.token,
             );
-          } catch {
-            // Unknown authoritative state: retain metadata and fail closed.
+          } catch (recoverError) {
+            // Unknown authoritative state: retain metadata and fail closed —
+            // and logged, never swallowed silently, because this read is the
+            // only thing that could tell an interrupted start apart from a
+            // failed one, and its own failure is why the journal is left
+            // armed for a wake that can read. The caller still sees the
+            // ORIGINAL start error.
+            console.error(
+              'interrupted start could not read authoritative state',
+              recoverError,
+            );
           }
           if (
             summary === null ||
@@ -1747,6 +1780,10 @@ export function createThreadAgentHost(
           const durable = current.agents.get(module.meta.id);
           if (!durable) throw new Error('guarded agent was not registered');
           const requesterId = requestedBy(body.requestedBy);
+          const resumeFields =
+            'resumeData' in body
+              ? { resumeData: resumeData(body.resumeData) }
+              : {};
           const step =
             typeof body.step === 'string' ||
             (Array.isArray(body.step) &&
@@ -1772,7 +1809,7 @@ export function createThreadAgentHost(
               runId: ref.runId,
               requestedBy: requesterId,
               ...(step !== undefined ? { step } : {}),
-              ...('resumeData' in body ? { resumeData: body.resumeData } : {}),
+              ...resumeFields,
               ...(snapshotExecution.threaded
                 ? {
                     memory: {

@@ -79,6 +79,8 @@ The runtime does not mint `breakwater.isolationScope`. One deployment serves one
 
 The snapshot remains Mastra's workflow state. Flowsafe does not invent a second workflow-state document inside Durable Object storage.
 
+The one exception is wake scheduling. A suspended step can arm a per-suspension deadline through a reserved key in the payload it passes Mastra's `suspend()`; the run's object derives that deadline from the authoritative summary, keeps it in its own storage, and multiplexes it with run-owner recovery onto its single alarm. When a deadline expires the object resumes the run itself under a reserved system principal, with an envelope the step distinguishes from a real signal, after re-checking that the run is still suspended at the same step and suspension. That record and the arithmetic over it stay inside the run's object: only the holder of the alarm can act on them, so they are not part of the package surface. See [Durable Object runner design](do-runner-design.md) for the arming contract, the `suspendSchema` and `resumeSchema` caveats, the top-level-step-only limitation, and the failure modes.
+
 ## Approval architecture
 
 `D1ApprovalStoreFactory.store()` returns one memoized store for the deployment database. Request routes, runtime grant derivation, and alarm maintenance duties share that store.

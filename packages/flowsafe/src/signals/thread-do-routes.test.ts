@@ -11,7 +11,11 @@ import {
 import { describe, expect, it, vi } from 'vitest';
 
 import { RUNTIME_DRIVEN_AGENT } from '../agent-runner/index.js';
-import { DoStatusError, type ThreadScope } from '../do-runner/index.js';
+import {
+  DoStatusError,
+  RunStateUnreadableError,
+  type ThreadScope,
+} from '../do-runner/index.js';
 import { createThreadSignalRoutes } from './thread-do-routes.js';
 
 interface AgentCall {
@@ -336,6 +340,60 @@ describe('createThreadSignalRoutes', () => {
     expect(startIdleRun).not.toHaveBeenCalled();
     expect(calls).toHaveLength(0);
     expect(settle).toHaveBeenCalledOnce();
+  });
+
+  it('fails the schedule wake closed when the run status read did not reach storage', async () => {
+    // #given — the receipt is reconstructed through agent-host owner recovery,
+    // and that recovery now refuses to conclude anything from a read it could
+    // not make.
+    const { agent, calls } = mockAgent();
+    const settle = vi.fn(async () => undefined);
+    const startIdleRun = vi.fn();
+    const resolveScheduleRunStatus = vi.fn(async () => {
+      throw new RunStateUnreadableError('durable-agentic-loop', 'run_1');
+    });
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_t1',
+      resolveScheduleTarget: async () => scheduleTarget(),
+      resolveScheduleDispatchStore: () => ({
+        begin: async () => ({ state: 'ready' as const }),
+        settle,
+      }),
+      resolveScheduleRunStatus,
+      startIdleRun,
+    });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // #when
+    let response: Response | null;
+    try {
+      response = await routes(
+        post('/signal/schedule', {
+          scheduleId: 'schedule_1',
+          agentId: 'agent',
+          prompt: 'scheduled instruction',
+          threadId: 'acme_t1',
+          resourceId: 'acme_t1',
+          dispatchId: 'dispatch_1',
+          runId: 'run_1',
+        }),
+        scopeWith(undefined),
+      );
+    } finally {
+      log.mockRestore();
+    }
+
+    // #then — this router's own taxonomy, not the Durable Object shell's: it
+    // maps only DoStatusError 403/404/409 and sends everything else to a 502,
+    // so an unreadable read reads as an upstream fault here rather than as the
+    // 503 the run object answers with. No receipt is settled from it, and no
+    // run is started behind it.
+    expect(response?.status).toBe(502);
+    expect(await response?.json()).toEqual({ error: 'internal error' });
+    expect(settle).not.toHaveBeenCalled();
+    expect(startIdleRun).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
   });
 
   it('settles the canonical discard receipt when termination cancels a schedule wake', async () => {

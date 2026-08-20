@@ -18,6 +18,7 @@ import {
   RunAlreadyExistsError,
   RunLifecycleBlockedError,
   RunNotSuspendedError,
+  RunStateUnreadableError,
   RunTerminalConflictError,
   UnknownRunError,
   UnknownWorkflowError,
@@ -52,6 +53,13 @@ function statusOf(error: unknown): number | undefined {
   // problem, not the caller's — 503 so monitors separate a wiring fault from
   // a code fault. Fail closed: nothing below this line runs for one.
   if (error instanceof DeploymentIdentityError) return 503;
+  // An authoritative read that did not reach storage: the same shape of answer
+  // as the misprovisioning above — the caller asked for nothing wrong, the
+  // condition is the operator's, and it clears on its own — so it is retryable
+  // rather than a 500 that reads as a code fault. A 404 or a 200 with a
+  // fabricated summary would be worse than either: both invite the caller to
+  // conclude something from a read that never happened.
+  if (error instanceof RunStateUnreadableError) return 503;
   if (
     error instanceof UnknownWorkflowError ||
     error instanceof UnknownRunError

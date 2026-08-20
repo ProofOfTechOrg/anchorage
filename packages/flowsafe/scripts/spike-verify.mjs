@@ -8,7 +8,10 @@
 // roles, wrong agents/bindings, absent raw resume, stale decision replay,
 // and restart-evicted stream replay with authoritative status fallback.
 // The remaining scenarios retain the lower-level workflow, stream, background
-// task, signal, goal, schedule, and webhook compatibility proofs.
+// task, signal, goal, schedule, and webhook compatibility proofs, plus the
+// per-suspension deadline scenario: a run arms its own Durable Object alarm
+// inside its Mastra suspend payload, the process is killed, and the restarted
+// object resumes the run ITSELF with the reserved timeout envelope.
 //
 // Auth rides the worker's host-kit seam: every request presents one of the
 // LOCAL-ONLY spike bearer tokens (spike/worker.ts SPIKE_ACTORS). The C probe
@@ -54,6 +57,21 @@ const AGENT_RUN_BODY = {
   workflowId: 'demo-agent-gate',
   inputData: { topic: 'launch' },
 };
+// Suspension deadlines (T1-T3): the run's own DO alarm resumes a suspension
+// whose awaited signal never arrives. `deadlineMs` rides the run input so ONE
+// spike workflow drives both sides of the fence. The TIMEOUT deadline has to
+// outlive every step between arming and the kill — a wake that fired while the
+// process was still alive would prove nothing about surviving process death —
+// and still elapse inside the kill+restart window, so it adds no wall clock of
+// its own; hence 10s rather than the module's 1s floor. The SIGNAL deadline
+// only has to outlive its own immediate resume, which settles the entry.
+const DEADLINE_WORKFLOW_ID = 'demo-deadline';
+const DEADLINE_STEP = 'wait-signal';
+// The reserved arming key, as it appears on the wire (do-runner exports it to
+// TypeScript authors as SUSPENSION_DEADLINE_PAYLOAD_KEY).
+const DEADLINE_PAYLOAD_KEY = 'flowsafe.deadlineMs';
+const TIMEOUT_DEADLINE_MS = 10_000;
+const SIGNAL_DEADLINE_MS = 30_000;
 const GUARDED_AGENT_ID = 'spike-guarded-agent';
 const GUARDED_AGENT_START_PATH = `/agents/${GUARDED_AGENT_ID}/runs`;
 const AUTH = {
@@ -271,6 +289,44 @@ async function httpRaw(method, path, rawBody, headers = {}) {
 
 function guardedStatusPath(run) {
   return `/agents/${GUARDED_AGENT_ID}/runs/${encodeURIComponent(run.threadId)}/${encodeURIComponent(run.runId)}`;
+}
+
+// --- Suspension deadline (T1-T3) helpers -----------------------------------
+
+// Read the wake state the run's OWN Durable Object holds: the persisted fenced
+// entry plus the single alarm its two duties share (spike/worker.ts
+// handleSuspensionDeadlineProbe). Nothing on the run surface exposes either.
+async function armedDeadline(runId) {
+  const { status, body } = await http(
+    'GET',
+    `/deadline/armed?workflowId=${DEADLINE_WORKFLOW_ID}&runId=${encodeURIComponent(runId)}`,
+  );
+  assert(status === 200, `armed-deadline probe -> ${status}`, body);
+  assert(
+    body.status === 200,
+    `run DO armed-deadline route -> ${body.status}`,
+    body,
+  );
+  return body.armed;
+}
+
+// A wake settles its consumed entry AFTER the resume it just ran, so a status
+// that already reads 'success' can precede that write by a few milliseconds.
+// Poll for the settled state instead of racing the tail of the wake, and return
+// the last observation either way so a real failure still reports what it saw.
+async function settledDeadline(runId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let armed;
+  while (Date.now() < deadline) {
+    armed = await armedDeadline(runId);
+    if (armed.record === null && armed.alarmAt === null) return armed;
+    await sleep(250);
+  }
+  return armed;
+}
+
+function deadlineRunPath(runId) {
+  return `/runs/${DEADLINE_WORKFLOW_ID}/${encodeURIComponent(runId)}`;
 }
 
 // --- Track E (M-007) webhook probe helpers ---------------------------------
@@ -1973,6 +2029,237 @@ async function main() {
     },
   );
 
+  // --- Suspension deadlines (T1-T3): the run resumes ITSELF -----------------
+  // The one mechanism the unit tests can only assert against a hand-written
+  // DurableObjectState stub: a step suspends with a deadline inside its own
+  // Mastra suspend payload, the run's OWN Durable Object persists a fenced
+  // entry and arms its single alarm for it, the process DIES, and the restarted
+  // object wakes itself and resumes the run with the reserved timeout envelope
+  // under the system principal — with no client ever calling resume.
+  const signalRun = await step(
+    'T1 signal fence: a real signal before the deadline resumes the run as its ' +
+      'human requester and settles the armed entry',
+    async () => {
+      const started = await http('POST', '/runs', {
+        headers: AUTH.operator,
+        body: {
+          workflowId: DEADLINE_WORKFLOW_ID,
+          inputData: { topic: 'launch', deadlineMs: SIGNAL_DEADLINE_MS },
+        },
+      });
+      assert(
+        started.status === 200 && started.body.status === 'suspended',
+        'signal-fence run suspended at its timed step',
+        { status: started.status, body: started.body },
+      );
+      assert(
+        JSON.stringify(started.body.suspended?.[0]) ===
+          JSON.stringify([DEADLINE_STEP]),
+        `suspended[0] is ['${DEADLINE_STEP}']`,
+        started.body.suspended,
+      );
+      const resumed = await http(
+        'POST',
+        `${deadlineRunPath(started.body.runId)}/resume`,
+        {
+          headers: AUTH.operator,
+          body: {
+            step: started.body.suspended[0],
+            resumeData: { signal: 'launch' },
+          },
+        },
+      );
+      assert(
+        resumed.status === 200 && resumed.body.status === 'success',
+        'the signalled run resumed to success',
+        resumed.body,
+      );
+      // The step branched on the exported guard, so this is the negative half
+      // of the SAME contract T3 proves: a real signal must not look like a
+      // timeout to the step that receives it.
+      assert(
+        resumed.body.result?.resumedBy === 'signal' &&
+          resumed.body.result?.timeoutStep === undefined,
+        'the step saw a real signal, not a timeout envelope',
+        resumed.body.result,
+      );
+      assert(
+        resumed.body.requestedBy === 'opal' &&
+          resumed.body.requestedByKind === 'human',
+        'provenance names the human whose signal advanced the run',
+        resumed.body,
+      );
+      // The fence path: the resume settles the armed entry, so there is nothing
+      // left for a later wake to resume a run that has already moved on.
+      const armed = await armedDeadline(started.body.runId);
+      assert(
+        armed.record === null && armed.alarmAt === null,
+        'the signalled run keeps no armed deadline and no alarm',
+        armed,
+      );
+      return { runId: started.body.runId };
+    },
+  );
+
+  const deadlineRun = await step(
+    'T2 deadline arm: a suspension carrying the reserved deadline key arms the ' +
+      "run's own DO alarm with a fenced entry",
+    async () => {
+      const started = await http('POST', '/runs', {
+        headers: AUTH.operator,
+        body: {
+          workflowId: DEADLINE_WORKFLOW_ID,
+          inputData: { topic: 'launch', deadlineMs: TIMEOUT_DEADLINE_MS },
+        },
+      });
+      assert(
+        started.status === 200 && started.body.status === 'suspended',
+        'timed run suspended at its timed step',
+        { status: started.status, body: started.body },
+      );
+      // The arming value travels inside MASTRA's suspend payload (the step
+      // declares no suspendSchema, so nothing strips the reserved key), and the
+      // DO derives its record from this authoritative summary.
+      assert(
+        started.body.suspendPayload?.[DEADLINE_STEP]?.[DEADLINE_PAYLOAD_KEY] ===
+          TIMEOUT_DEADLINE_MS,
+        'the reserved deadline key survived into the authoritative summary',
+        started.body.suspendPayload,
+      );
+      const suspendedAt = started.body.suspendedAt?.[DEADLINE_STEP];
+      assert(
+        Number.isSafeInteger(suspendedAt),
+        'the summary carries the suspendedAt fence the entry is armed against',
+        started.body.suspendedAt,
+      );
+
+      const armed = await armedDeadline(started.body.runId);
+      const entry = armed.record?.entries?.[0];
+      assert(
+        armed.record?.workflowId === DEADLINE_WORKFLOW_ID &&
+          armed.record?.runId === started.body.runId &&
+          armed.record?.entries?.length === 1 &&
+          entry?.step === DEADLINE_STEP &&
+          entry?.deadlineAt === suspendedAt + TIMEOUT_DEADLINE_MS &&
+          entry?.suspendedAt === suspendedAt &&
+          entry?.resumeCount === 0 &&
+          entry?.attempts === undefined,
+        'the run DO persisted ONE entry, fenced to this suspension and due at ' +
+          'suspendedAt + deadlineMs (never now + deadlineMs)',
+        armed,
+      );
+      // ONE alarm serves both DO duties, so this also proves the suspension due
+      // time WON the min() — it is not the 60s run-owner recovery wake.
+      assert(
+        typeof armed.alarmAt === 'number' &&
+          armed.alarmAt <= entry.deadlineAt + 5_000,
+        'the object armed its single alarm for the suspension deadline',
+        armed,
+      );
+      return { runId: started.body.runId, deadlineAt: entry.deadlineAt };
+    },
+  );
+
+  await step(
+    'T3 deadline wake: the armed alarm survives a workerd kill+restart and the ' +
+      'run resumes ITSELF with the timeout envelope under the system principal',
+    async () => {
+      // Still suspended on THIS process, so the wake has not fired yet:
+      // whatever resumes this run has to come from the restarted object.
+      const before = await http('GET', deadlineRunPath(deadlineRun.runId), {
+        headers: AUTH.viewer,
+      });
+      assert(
+        before.status === 200 && before.body.status === 'suspended',
+        'the timed run is still suspended when its process is killed',
+        before.body,
+      );
+
+      // Captured BEFORE the kill and asserted against the envelope below: the
+      // pre-kill read above proves the run had not resumed YET, but the wake
+      // could still fire in the gap between that read and the kill. Only an
+      // expiry stamped at or after the kill proves the RESTARTED process's
+      // timer did the work rather than the original one's.
+      const killedAt = Date.now();
+      await killServer(currentServer);
+      // The deadline elapses with NOTHING running: no isolate, no timer, no
+      // client. Only the persisted entry and the object's own alarm survive.
+      await launchServer(
+        'deadline-alarm',
+        stateDir,
+        join(tmpDir, 'deadline-alarm.log'),
+      );
+      assert(
+        !/address already in use/i.test(currentServer.chunks.join('')),
+        'deadline-alarm log must not contain "address already in use" (orphan trap)',
+      );
+
+      const pollDeadlineRun = async (timeoutMs) => {
+        const deadline = Date.now() + timeoutMs;
+        let seen;
+        while (Date.now() < deadline) {
+          seen = await http('GET', deadlineRunPath(deadlineRun.runId), {
+            headers: AUTH.viewer,
+          });
+          if (seen.body.status === 'success') return seen;
+          // 'running' is the resume the wake is executing right now; only a
+          // terminal status other than success means the wake went wrong.
+          if (['failed', 'cancelled', 'timed_out'].includes(seen.body.status)) {
+            throw new Error(
+              `timed run terminated without succeeding: ${JSON.stringify(seen.body)}`,
+            );
+          }
+          await sleep(250);
+        }
+        throw new Error(
+          `the suspension deadline never resumed the run: ${JSON.stringify(seen?.body)}`,
+        );
+      };
+      const resumed = await pollDeadlineRun(60_000);
+      assert(
+        resumed.body.result?.resumedBy === 'timeout' &&
+          resumed.body.result?.timeoutStep === DEADLINE_STEP &&
+          resumed.body.result?.deadlineAt === deadlineRun.deadlineAt &&
+          resumed.body.result?.expiredAt >= deadlineRun.deadlineAt &&
+          resumed.body.result?.expiredAt >= killedAt &&
+          deadlineRun.deadlineAt > killedAt &&
+          resumed.body.requestedBy === 'flowsafe-suspension-deadline' &&
+          resumed.body.requestedByKind === 'system',
+        'the alarm armed before the kill fired on the RESTARTED process and ' +
+          'resumed the run itself: the step saw the reserved timeout envelope ' +
+          '(isSuspensionTimeoutResumeData) for its own step and deadline, under ' +
+          'the system principal, with no client calling resume, the deadline ' +
+          'was still in the future when the process died, and the wake acted ' +
+          'after the kill rather than in the gap before it',
+        { killedAt, body: resumed.body },
+      );
+      // The consumed entry is settled, so the wake cannot repeat: one resume
+      // per expired deadline, and no alarm left behind for a finished run.
+      const armed = await settledDeadline(deadlineRun.runId, 10_000);
+      assert(
+        armed.record === null && armed.alarmAt === null,
+        'the consumed entry was settled and the shared alarm cleared',
+        armed,
+      );
+      // The T1 run is untouched across the same restart: its entry was settled
+      // by the real signal, so no timeout resume can reach it — the run still
+      // reads as the human signal advanced it, and its step ran once.
+      const signalled = await http('GET', deadlineRunPath(signalRun.runId), {
+        headers: AUTH.viewer,
+      });
+      assert(
+        signalled.status === 200 &&
+          signalled.body.status === 'success' &&
+          signalled.body.result?.resumedBy === 'signal' &&
+          signalled.body.requestedBy === 'opal' &&
+          signalled.body.requestedByKind === 'human',
+        'the signalled run kept its human resume across the restart (the fence ' +
+          'held: no timeout resume reached it)',
+        signalled.body,
+      );
+    },
+  );
+
   await step(
     'S deployment sentinel mismatch: a freshly started Worker refuses a D1 ' +
       'provisioned for another deployment',
@@ -2038,8 +2325,13 @@ try {
       '(E-S2), a signed webhook matched its subscription row and landed a ' +
       'notification in the thread inbox (E-S1), a poll provider rehydrated its ' +
       'subscriptions from D1 after a kill+restart and fired delivery (E-S3). ' +
-      'Finally, a fresh Worker refused a D1 sentinel stamped for another ' +
-      'deployment with 503 before authentication or routing.',
+      'Per-suspension deadlines (T1-T3): a real signal resumed its run as the ' +
+      'human requester and settled the armed entry, a suspension carrying the ' +
+      "reserved deadline key armed the run DO's own fenced wake, and after a " +
+      'kill+restart that wake fired on the restarted object and resumed the run ' +
+      'ITSELF with the timeout envelope under the system principal — no client ' +
+      'called resume. Finally, a fresh Worker refused a D1 sentinel stamped for ' +
+      'another deployment with 503 before authentication or routing.',
   );
 } catch (error) {
   exitCode = 1;
