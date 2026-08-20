@@ -38,13 +38,14 @@
   },
   "scripts": {
     "build": "tsc",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "dev": "tsc --watch",
     "test": "vitest run",
     "test:packed-consumer": "node scripts/packed-consumer-test.mjs",
     "test:watch": "vitest",
     "lint": "pnpm -w exec biome check packages/breakwater",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
-    "prepublishOnly": "pnpm run build"
+    "prepack": "pnpm run clean && pnpm run build"
   },
   "peerDependencies": {
     "@mastra/core": "1.50.0"

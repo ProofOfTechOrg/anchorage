@@ -61,7 +61,7 @@ jobs:
       - name: Install (frozen lockfile)
         run: pnpm install --frozen-lockfile
 
-      # prepublishOnly builds each package again at publish time; this build
+      # prepack cleans and builds each package again at publish time; this build
       # front-loads failures so a broken build never reaches the registry.
       - name: Build
         run: pnpm build
@@ -70,7 +70,7 @@ jobs:
       # a push to main and main requires no status check, so a red CI cannot
       # stop a publish. Repeating it here fails in this job, before the publish
       # step, on this checkout. It is fully offline and adds no new dependency, but
-      # it runs each prerequisite's prepublishOnly build, so it is not free.
+      # it runs each prerequisite's prepack build, so it is not free.
       - name: Verify release publish invocation
         run: pnpm test:release-invocation
 

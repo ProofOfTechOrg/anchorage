@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -37,6 +38,13 @@ try {
   mkdirSync(extracted);
   mkdirSync(consumer);
 
+  const staleBuildArtifact = join(
+    packageRoot,
+    'dist',
+    'stale-package-probe.js',
+  );
+  mkdirSync(dirname(staleBuildArtifact), { recursive: true });
+  writeFileSync(staleBuildArtifact, 'throw new Error("stale build output");\n');
   run('pnpm', ['run', 'build']);
   run('pnpm', ['pack', '--pack-destination', packed]);
   run(
@@ -70,6 +78,10 @@ try {
   run('tar', ['-xzf', archive, '-C', extracted]);
 
   const packageDirectory = join(extracted, 'package');
+  assert.equal(
+    existsSync(join(packageDirectory, 'dist', 'stale-package-probe.js')),
+    false,
+  );
   const manifest = JSON.parse(
     readFileSync(join(packageDirectory, 'package.json'), 'utf8'),
   );

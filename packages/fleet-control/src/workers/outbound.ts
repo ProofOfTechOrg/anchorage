@@ -11,7 +11,7 @@ import {
   isDeploymentScriptName,
   isDeploymentTenantTag,
 } from '../deployment-context.js';
-import { parseHostRoutingTarget } from './host-routing.js';
+import { parseHostRoutingTarget } from '../host-routing.js';
 
 export interface FleetOutboundEnv {
   readonly scriptName: string;

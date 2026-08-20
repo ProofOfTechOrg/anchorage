@@ -7,7 +7,7 @@
 // argv-forwarding defect this exists to catch, which reached main unexercised
 // and published nothing.
 //
-// COVERAGE, precisely: `--dry-run` runs prepublishOnly, packs the tarball, and
+// COVERAGE, precisely: `--dry-run` runs prepack, packs the tarball, and
 // parses the full argv through `npm publish`, then stops. It makes no registry
 // request at all — verified by pointing npm at an unroutable registry, which
 // still exits 0 immediately. That is what makes it safe to run on every build

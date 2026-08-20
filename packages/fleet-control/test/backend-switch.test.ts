@@ -194,7 +194,7 @@ class MemorySwitchStore implements FleetStateStore {
 class FakeSwitchProvider implements BackendSwitchProvider {
   readonly calls: string[] = [];
   readonly removedRouteTargets: Array<
-    readonly import('../src/workers/host-routing.js').HostRoutingTarget[]
+    readonly import('../src/host-routing.js').HostRoutingTarget[]
   > = [];
   failBridgeResponseOnce = false;
   failR2DeleteResponseOnce = false;
@@ -1222,7 +1222,7 @@ describe('backend switch state machine', () => {
       targetSpec,
     });
     const describe = (
-      value: import('../src/workers/host-routing.js').HostRoutingTarget,
+      value: import('../src/host-routing.js').HostRoutingTarget,
     ) => `${value.scriptName}:${value.policyHosts.join(',')}`;
     const expectedRouteSet = [...expectedRoutes].sort();
 

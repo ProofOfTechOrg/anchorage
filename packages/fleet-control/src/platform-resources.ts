@@ -6,6 +6,7 @@ import {
   applicationSecretNames,
 } from './application-bindings.js';
 import { canonicalEgressHosts, isSha256 } from './deployment-context.js';
+import type { HostRoutingTarget } from './host-routing.js';
 import type {
   DeploymentEgressPolicy,
   DeploymentSpec,
@@ -19,7 +20,6 @@ import type {
   ProvisioningBackend,
   TrustedWorkerArtifact,
 } from './types.js';
-import type { HostRoutingTarget } from './workers/host-routing.js';
 
 export const FLEET_AUDIT_PROXY_BINDING = 'AUDIT_PROXY';
 export const FLEET_AUDIT_PROXY_STATE_BINDING = 'FLEET_AUDIT_PROXY_OBJECT';

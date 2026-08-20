@@ -8,6 +8,10 @@ import PQueue from 'p-queue';
 import { canonicalApplicationBindings } from './application-bindings.js';
 import type { CloudflareApiRateCoordinator } from './cloudflare-rate-coordinator.js';
 import {
+  type HostRoutingTarget,
+  parseHostRoutingTarget,
+} from './host-routing.js';
+import {
   canonicalDeploymentEgressPolicy,
   externalPlatformResourceGroupId,
   externalStateScriptName,
@@ -31,10 +35,6 @@ import type {
   ProviderBindingIdentity,
   ScriptInventoryTarget,
 } from './types.js';
-import {
-  type HostRoutingTarget,
-  parseHostRoutingTarget,
-} from './workers/host-routing.js';
 
 const AUDIT_CONSUMER_SETTINGS = Object.freeze({
   batch_size: 100,

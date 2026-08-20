@@ -63,6 +63,7 @@
   "scripts": {
     "prebuild": "pnpm --filter @proofoftech/breakwater build",
     "build": "tsc && tsc -p src/approval-ui/tsconfig.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "dev": "tsc --watch",
     "test": "vitest run",
     "test:agent-host-export": "node scripts/agent-host-pack-test.mjs",
@@ -79,7 +80,7 @@
     "deploy:cf": "wrangler deploy --config deploy/wrangler.jsonc",
     "deploy:dev": "wrangler dev --config deploy/wrangler.jsonc",
     "provision:deployment": "node scripts/seed-deployment-identity.mjs",
-    "prepublishOnly": "pnpm run build"
+    "prepack": "pnpm run clean && pnpm run build"
   },
   "peerDependencies": {
     "@mastra/core": "1.50.0",
