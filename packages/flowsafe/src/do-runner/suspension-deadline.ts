@@ -57,8 +57,9 @@ export const MAX_SUSPENSION_DEADLINE_ATTEMPTS = 5;
 /**
  * Mastra's marker for a suspension that happened inside a NESTED workflow: the
  * persisted payload carries the inner step path under `__workflow_meta.path`.
- * Verified in Mastra 1.50.0; `runtime.test.ts` pins it, because a rename would
- * otherwise silently re-open the arming of unfenceable nested suspensions.
+ * Verified against the declared Mastra peer; `runtime.test.ts` pins it, because
+ * a rename would otherwise silently re-open the arming of unfenceable nested
+ * suspensions. Re-check it on every Mastra upgrade.
  */
 export const MASTRA_WORKFLOW_META_KEY = '__workflow_meta';
 

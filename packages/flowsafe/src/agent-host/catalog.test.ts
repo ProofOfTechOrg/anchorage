@@ -115,7 +115,9 @@ describe('agent catalog', () => {
       createAgentModuleCatalog([
         { meta, agent: legacy as unknown as GuardedAgentHandle },
       ]),
-    ).toThrow(/without the durable-host protocol.*>=0\.12\.0/);
+    ).toThrow(
+      /without the durable-host protocol \(added in 0\.12\.0\); install a release inside the declared peer range/,
+    );
   });
 
   it('rejects an incompatible durable-host protocol', () => {

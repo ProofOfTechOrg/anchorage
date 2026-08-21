@@ -38,10 +38,10 @@ schedule work, or run durable agent loops on Cloudflare.
 ## Install it
 
 breakwater is ESM-only, requires Node.js 22.13.0 or newer (engine range `>=22.13.0`),
-and requires `@mastra/core` `1.50.0`.
+and requires `@mastra/core` `1.53.0`.
 
 ```bash
-npm install @proofoftech/breakwater @mastra/core@1.50.0
+npm install @proofoftech/breakwater @mastra/core@1.53.0
 ```
 
 Connector authors who define Zod schemas should also declare Zod directly:
@@ -201,13 +201,14 @@ secret detectors provide bounded windows. A regular expression in
 text released at the end of an earlier segment cannot be withdrawn if a match
 completes in a later segment.
 
-Under `@mastra/core` 1.50.0, only object chunks that traverse the processor
-chain reach a standalone engine. The engine validates those chunks as JSON,
-evaluates the canonical snapshot, and forwards the same canonical clone.
-Parsed `generate()` results and core's structured-output processor chunks
-bypass that chain. If an object-only policy sees no processor-visible object
-chunk, the engine requires an audit sink and aborts at the result boundary.
-JSON carried as answer text is still inspected by answer-inclusive policies.
+Under the supported `@mastra/core` peer, only object chunks that traverse
+the processor chain reach a standalone engine. The engine validates those
+chunks as JSON, evaluates the canonical snapshot, and forwards the same
+canonical clone. Parsed `generate()` results and core's structured-output
+processor chunks bypass that chain. If an object-only policy sees no
+processor-visible object chunk, the engine requires an audit sink and aborts
+at the result boundary. JSON carried as answer text is still inspected by
+answer-inclusive policies.
 
 ## Enforce tool permissions
 

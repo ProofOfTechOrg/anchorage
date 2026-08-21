@@ -82,9 +82,24 @@ try {
   const manifest = JSON.parse(
     await readFile(join(packedPackageRoot, 'package.json'), 'utf8'),
   );
-  assert.equal(manifest.dependencies?.zod, '^4.4.3');
+  // Compared against the SOURCE manifest, not a copy of its value: this script
+  // is a CI-only step, so a hardcoded range silently goes stale the moment the
+  // peer floor moves and only fails after the change is pushed. The regex
+  // beside the peer equality is not redundant with it: equality catches a
+  // pack-time REWRITE of the value, while the regex enforces the exact-pin
+  // POLICY, which two equal-but-both-wrong values would satisfy.
+  const sourceManifest = JSON.parse(
+    await readFile(join(packageRoot, 'package.json'), 'utf8'),
+  );
+  const corePeer = sourceManifest.peerDependencies['@mastra/core'];
+  assert.equal(manifest.dependencies?.zod, sourceManifest.dependencies.zod);
   assert.equal(manifest.devDependencies?.zod, undefined);
-  assert.equal(manifest.peerDependencies?.['@mastra/core'], '1.50.0');
+  assert.equal(manifest.peerDependencies?.['@mastra/core'], corePeer);
+  assert.match(
+    manifest.peerDependencies?.['@mastra/core'],
+    /^\d+\.\d+\.\d+$/,
+    'the packed @mastra/core peer must stay an exact version',
+  );
   for (const documentation of [
     'README.md',
     'CONNECTORS.md',

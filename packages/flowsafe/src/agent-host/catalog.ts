@@ -223,7 +223,7 @@ export function validateAgentModule(module: AgentModule): AgentModule {
   }
   if (breakwaterGuardedAgentHostProtocol(module.agent) === undefined) {
     fail(
-      `agent '${meta.id}' was built by a @proofoftech/breakwater without the durable-host protocol; >=0.12.0 is required`,
+      `agent '${meta.id}' was built by a @proofoftech/breakwater release without the durable-host protocol (added in 0.12.0); install a release inside the declared peer range`,
     );
   }
   if (module.agent.id !== meta.id) {

@@ -19,10 +19,6 @@ minimumReleaseAgeExclude:
   # Forced by wrangler → miniflare → sharp; already lockfile-pinned — the gate
   # only re-fires because any lockfile update re-resolves the whole graph.
   - "@emnapi/runtime"
-  # Forced by @mastra/core's own pinned dep ranges (its tree ships in lockstep):
-  - "chat"
-  - "p-map"
-  - "picomatch"
   # react-doctor (run via `pnpm dlx github:gcharang/react-doctor#<sha>`, never a
   # dependency) depends on deslop-js with a floating range; every fresh
   # deslop-js publish would otherwise trip the 7-day buffer inside the dlx

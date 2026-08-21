@@ -134,10 +134,14 @@ jobs:
   # Mastra compat matrix: the libraries pin behavioral contracts to
   # @mastra/core internals (resume-context merge-over semantics, snapshot
   # shape, the reprocess-part key, the six-table inventory). The supported
-  # peer is exactly 1.50.0; run the library suites against the newest
+  # peer is exactly 1.53.0; run the library suites against the newest
   # published 1.x as a signal for a deliberate future compatibility update.
-  # The tripwire tests (runtime.test.ts merge pin,
-  # ProcessorRunner reprocess-key probe, mastra-schema-guard) are the teeth.
+  # The tripwire tests are the teeth: the runtime.test.ts merge pin, the
+  # ProcessorRunner reprocess-key probe, mastra-schema-guard, the
+  # durable-agent-surface inventory, and breakwater's own agent.test.ts
+  # Agent.prototype inventory (whose forwardClassified allowlist is asserted
+  # against THIS job's newer core, not just the pin). See the maintainer
+  # guide's Mastra compatibility section for why bundling needs its own step.
   mastra-compat:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -186,6 +190,23 @@ jobs:
 
       - name: Typecheck libraries against newest core
         run: pnpm --filter @proofoftech/breakwater typecheck && pnpm --filter @proofoftech/flowsafe typecheck
+
+      # Bundles the flowsafe spike Worker so this job can see a published-dist
+      # bundling regression that typecheck and test structurally cannot — today
+      # mastra-ai/mastra#20638, which the newest core is EXPECTED to trip.
+      # Step-level continue-on-error, not just the job's: a red step would
+      # otherwise skip the tripwire suites below.
+      - name: Bundle the flowsafe spike Worker against newest core
+        id: bundle
+        continue-on-error: true
+        run: pnpm --filter @proofoftech/flowsafe spike:bundle-check
+
+      # Step-level continue-on-error hides the bundle result from the job status
+      # by design; surface it on the run summary so a flip (upstream fix, or a
+      # new regression) is visible without opening the log.
+      - name: Report bundling outcome
+        run: |
+          echo "spike bundle against newest core: ${{ steps.bundle.outcome }}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Test libraries against newest core
         run: pnpm --filter @proofoftech/breakwater test && pnpm --filter @proofoftech/flowsafe test

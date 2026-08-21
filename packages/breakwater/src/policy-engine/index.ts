@@ -45,9 +45,9 @@ export type PolicyPhase = 'input' | 'output';
  * under); 'reasoning' is the model's reasoning trace; 'object' is structured
  * output, gated as the canonical JSON latest snapshot.
  *
- * Under `@mastra/core` 1.50, the engine sees the `object` channel only for
- * object chunks that flow through the processor chain (model-native
- * streaming). A `generate()` result's parsed object and core's
+ * Under the supported `@mastra/core` peer, the engine sees the `object`
+ * channel only for object chunks that flow through the processor chain
+ * (model-native streaming). A `generate()` result's parsed object and core's
  * `StructuredOutputProcessor` chunks never pass through the chain.
  * `createGuardedAgent` rejects structured output because a wrapper gate would
  * run only after Mastra had exposed the parsed value. An object-only policy
@@ -538,11 +538,11 @@ export interface PolicyEngineOptions {
  * Mastra Processor implementing input/output policy gating — see the module
  * comment for the phase/channel model.
  *
- * Under `@mastra/core` 1.50, a final output result has no structured-object
- * field. The constructor therefore requires an audit sink when a policy
- * selects `object` without `answer`. A final-result call fails closed unless
- * this engine actually evaluated an object chunk. Policies that include
- * `answer` inspect JSON carried as answer text.
+ * Under the supported `@mastra/core` peer, a final output result has no
+ * structured-object field. The constructor therefore requires an audit sink
+ * when a policy selects `object` without `answer`. A final-result call fails
+ * closed unless this engine actually evaluated an object chunk. Policies that
+ * include `answer` inspect JSON carried as answer text.
  *
  * The constructor also rejects an explicit input policy whose channels
  * exclude `answer`, because input evaluation has no other channel.

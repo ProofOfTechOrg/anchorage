@@ -75,6 +75,7 @@
     "typecheck": "tsc -p tsconfig.test.json && tsc -p src/approval-ui/tsconfig.json --noEmit && tsc -p src/approval-ui/tsconfig.test.json && tsc -p spike/tsconfig.json && tsc -p deploy/tsconfig.json",
     "typecheck:react18": "tsc -p scripts/react18-probe/tsconfig.json",
     "spike": "wrangler dev --config spike/wrangler.jsonc",
+    "spike:bundle-check": "pnpm --filter @proofoftech/breakwater build && wrangler deploy --dry-run --outdir .wrangler/bundle-check -c spike/wrangler.jsonc",
     "spike:verify": "node scripts/spike-verify.mjs",
     "spike:verify:llm": "node scripts/spike-verify-llm.mjs",
     "deploy:cf": "wrangler deploy --config deploy/wrangler.jsonc",
@@ -83,8 +84,8 @@
     "prepack": "pnpm run clean && pnpm run build"
   },
   "peerDependencies": {
-    "@mastra/core": "1.50.0",
-    "@proofoftech/breakwater": ">=0.12.0 <1.0.0",
+    "@mastra/core": "1.53.0",
+    "@proofoftech/breakwater": ">=0.13.0 <1.0.0",
     "react": ">=18 <20",
     "react-dom": ">=18 <20"
   },
@@ -101,7 +102,7 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.2025",
-    "@mastra/core": "^1.50.0",
+    "@mastra/core": "1.53.0",
     "@proofoftech/breakwater": "workspace:*",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
