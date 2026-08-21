@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { EXECUTION_PRINCIPAL_HEADER } from '../do-runner/index.js';
 import {
   createThreadTopology as createThreadTopologyWithSecret,
+  RunRouteError,
   type ThreadNamespaceLike,
   type ThreadTopology,
 } from '../host-kit/index.js';
@@ -17,6 +18,32 @@ import {
 } from './webhook-route.js';
 
 const DEPLOYMENT_IDENTITY_SECRET = 'test-deployment-identity-secret-0001';
+
+/**
+ * The parsed JSON log line of one event type — and THE only one of that type.
+ *
+ * Reading `terminal` off this entry is what binds the verdict to the event: two
+ * independent `stringContaining` asserts, one for the type and one for
+ * `"terminal":false`, both pass when a different line happens to carry the flag.
+ * Requiring exactly one match is what makes "binds to the event" literally true
+ * rather than merely likely — several lanes here emit the same type, so a test
+ * that logged two of them would otherwise assert against whichever came first.
+ */
+function loggedEvent(
+  logged: { mock: { calls: readonly unknown[][] } },
+  type: string,
+): Record<string, unknown> {
+  const entries = logged.mock.calls.map(
+    ([line]) => JSON.parse(String(line)) as Record<string, unknown>,
+  );
+  const seen = entries.map((entry) => String(entry.type));
+  const matches = entries.filter((entry) => entry.type === type);
+  expect(
+    matches.length,
+    `expected exactly one ${type} log line, saw [${seen.join(', ')}] — with more than one, reading a field off "the" entry asserts against whichever came first`,
+  ).toBe(1);
+  return matches[0] as Record<string, unknown>;
+}
 
 function createThreadTopology<Id>(
   namespace: ThreadNamespaceLike<Id>,
@@ -94,6 +121,28 @@ function stubThreadsWith(status: number): {
               { status },
             ),
           );
+        },
+      }),
+    },
+  };
+}
+
+// Like stubThreadsWith, but the delivery THROWS instead of answering — the
+// lane that has only a thrown value to classify, never a status.
+function stubThreadsThatThrow(error: unknown): {
+  namespace: ThreadNamespaceLike<string>;
+  addressed: string[];
+} {
+  const addressed: string[] = [];
+  return {
+    addressed,
+    namespace: {
+      idFromName: (name) => name,
+      get: (name) => ({
+        fetch: (input: Request | string) => {
+          addressed.push(name);
+          void input;
+          return Promise.reject(error);
         },
       }),
     },
@@ -495,9 +544,10 @@ describe('createWebhookRouter — robustness', () => {
         delivered: 0,
         denied: 1,
       });
-      expect(logged).toHaveBeenCalledWith(
-        expect.stringContaining('"terminal":true'),
-      );
+      expect(
+        loggedEvent(logged, 'signal-provider.webhook-delivery-rejected')
+          .terminal,
+      ).toBe(true);
     } finally {
       logged.mockRestore();
     }
@@ -528,9 +578,10 @@ describe('createWebhookRouter — robustness', () => {
         delivered: 0,
         deferred: 1,
       });
-      expect(logged).toHaveBeenCalledWith(
-        expect.stringContaining('"terminal":false'),
-      );
+      expect(
+        loggedEvent(logged, 'signal-provider.webhook-delivery-rejected')
+          .terminal,
+      ).toBe(false);
     } finally {
       logged.mockRestore();
     }
@@ -625,9 +676,77 @@ describe('createWebhookRouter — robustness', () => {
         failed: 1,
       });
       expect(threads.addressed).toEqual(['acme_t1']);
-      expect(logged).toHaveBeenCalledWith(
-        expect.stringContaining('signal-provider.webhook-delivery-error'),
-      );
+      // A code defect is permanent: nothing about redelivering these bytes
+      // could make the provider build them successfully.
+      expect(
+        loggedEvent(logged, 'signal-provider.webhook-delivery-error').terminal,
+      ).toBe(true);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  // The same two directions again, but for a delivery that THROWS rather than
+  // answering — the lane whose log line carried no verdict at all.
+  it('marks an undecided delivery throw as non-terminal', async () => {
+    // #given — the delivery itself fails, e.g. the thread DO is unreachable
+    const factory = new InMemorySubscriptionStoreFactory();
+    await seed(factory, 'acme', 'acme_t1');
+    const threads = stubThreadsThatThrow(new Error('socket hang up'));
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const run = createWebhookRouter({
+      providers: { test: testProvider() },
+      subscriptions: factory.store(),
+      topology: createThreadTopology(threads.namespace),
+      secretForProvider: () => 'secret',
+    });
+
+    try {
+      // #when
+      const res = await run(webhookRequest('good', {}));
+
+      // #then — a 5xx, and the log says the event may yet land
+      expect(res?.status).toBe(503);
+      expect(await res?.json()).toEqual({
+        matched: 1,
+        delivered: 0,
+        deferred: 1,
+      });
+      expect(
+        loggedEvent(logged, 'signal-provider.webhook-delivery-error').terminal,
+      ).toBe(false);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it('marks a routed content refusal thrown at delivery as terminal', async () => {
+    // #given — the topology throws the refusal instead of returning it
+    const factory = new InMemorySubscriptionStoreFactory();
+    await seed(factory, 'acme', 'acme_t1');
+    const threads = stubThreadsThatThrow(new RunRouteError(422, 'denied'));
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const run = createWebhookRouter({
+      providers: { test: testProvider() },
+      subscriptions: factory.store(),
+      topology: createThreadTopology(threads.namespace),
+      secretForProvider: () => 'secret',
+    });
+
+    try {
+      // #when
+      const res = await run(webhookRequest('good', {}));
+
+      // #then — 2xx, and the log distinguishes this throw from the one above
+      expect(res?.status).toBe(200);
+      expect(await res?.json()).toEqual({
+        matched: 1,
+        delivered: 0,
+        denied: 1,
+      });
+      expect(
+        loggedEvent(logged, 'signal-provider.webhook-delivery-error').terminal,
+      ).toBe(true);
     } finally {
       logged.mockRestore();
     }

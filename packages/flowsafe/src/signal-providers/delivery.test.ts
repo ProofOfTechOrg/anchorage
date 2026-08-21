@@ -8,7 +8,12 @@
 import { describe, expect, it } from 'vitest';
 
 import { RunRouteError } from '../host-kit/run-route-error.js';
-import { classifyDeliveryError, classifyDeliveryResponse } from './delivery.js';
+import {
+  classifyDeliveryError,
+  classifyDeliveryResponse,
+  type DeliveryOutcome,
+  isTerminalDelivery,
+} from './delivery.js';
 
 describe('classifyDeliveryResponse', () => {
   it.each([
@@ -80,5 +85,25 @@ describe('classifyDeliveryError', () => {
     expect(classifyDeliveryError(new RunRouteError(200, 'thrown anyway'))).toBe(
       'deferred',
     );
+  });
+});
+
+describe('isTerminalDelivery', () => {
+  // Exhaustive by construction: `satisfies Record<DeliveryOutcome, boolean>`
+  // makes a fifth outcome a COMPILE error here, so a new outcome cannot ship
+  // with its terminality unasserted — and silently redeliverable or silently
+  // dropped.
+  const terminality = {
+    delivered: true,
+    denied: true,
+    failed: true,
+    deferred: false,
+  } satisfies Record<DeliveryOutcome, boolean>;
+
+  it.each(
+    Object.entries(terminality),
+  )('calls %s terminal: %s', (outcome, terminal) => {
+    // #then
+    expect(isTerminalDelivery(outcome as DeliveryOutcome)).toBe(terminal);
   });
 });

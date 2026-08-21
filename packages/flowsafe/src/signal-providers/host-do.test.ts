@@ -25,9 +25,42 @@ import {
   type SubscriptionStoreFactory,
 } from './subscription-d1.js';
 
+/**
+ * The parsed JSON log line of one event type — and THE only one of that type.
+ *
+ * Reading `terminal` off this entry is what binds the verdict to the event: two
+ * independent `stringContaining` asserts, one for the type and one for
+ * `"terminal":false`, both pass when a different line happens to carry the flag.
+ * Requiring exactly one match is what makes "binds to the event" literally true
+ * rather than merely likely — several lanes here emit the same type, so a test
+ * that logged two of them would otherwise assert against whichever came first.
+ */
+function loggedEvent(
+  logged: { mock: { calls: readonly unknown[][] } },
+  type: string,
+): Record<string, unknown> {
+  const entries = logged.mock.calls.map(
+    ([line]) => JSON.parse(String(line)) as Record<string, unknown>,
+  );
+  const seen = entries.map((entry) => String(entry.type));
+  const matches = entries.filter((entry) => entry.type === type);
+  expect(
+    matches.length,
+    `expected exactly one ${type} log line, saw [${seen.join(', ')}] — with more than one, reading a field off "the" entry asserts against whichever came first`,
+  ).toBe(1);
+  return matches[0] as Record<string, unknown>;
+}
+
+/**
+ * A thread topology whose route answers every delivery with `status`. A status
+ * the DO chose deliberately is a different lane from `failingThreadId`, which
+ * makes that one route THROW — the first is classified from the response, the
+ * second from the error.
+ */
 function stubTopology(
   addressed: string[],
   failingThreadId?: string,
+  status = 200,
 ): ThreadTopology {
   const namespace: ThreadNamespaceLike<string> = {
     idFromName: (name) => name,
@@ -38,7 +71,7 @@ function stubTopology(
         if (name === failingThreadId) {
           return Promise.reject(new Error('thread delivery failed'));
         }
-        return Promise.resolve(new Response('{}', { status: 200 }));
+        return Promise.resolve(new Response('{}', { status }));
       },
     }),
   };
@@ -185,14 +218,117 @@ describe('SignalProviderHost.poll', () => {
       topology: stubTopology(addressed, 'delivery-fails'),
       providers: [mix],
     });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    // #when
-    const result = await host.poll();
+    try {
+      // #when
+      const result = await host.poll();
 
-    // #then — the throwing delivery is isolated and the next one still lands.
-    // An unclassifiable throw counts as deferred: it may well be an outage.
-    expect(result).toEqual({ providersPolled: 1, delivered: 1, deferred: 1 });
-    expect(addressed).toEqual(['delivery-fails', 'delivery-ok']);
+      // #then — the throwing delivery is isolated and the next one still lands.
+      // An unclassifiable throw counts as deferred: it may well be an outage,
+      // and the log line has to say so or an operator cannot tell this from a
+      // drop.
+      expect(result).toEqual({ providersPolled: 1, delivered: 1, deferred: 1 });
+      expect(addressed).toEqual(['delivery-fails', 'delivery-ok']);
+      expect(
+        loggedEvent(logged, 'signal-provider.delivery-error').terminal,
+      ).toBe(false);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  // The thread route refuses a poll delivery two different ways, and the log
+  // line has to tell them apart: the poll host has no reply to shape, so
+  // `terminal` is the only signal an operator gets about whether the next poll
+  // could land the same event.
+  it.each([
+    // Redelivering the identical notification could only be denied again.
+    {
+      case: 'a content denial',
+      status: 422,
+      providerId: 'denier',
+      tally: { providersPolled: 1, delivered: 0, denied: 1 },
+      terminal: true,
+    },
+    // The deployment could not decide, e.g. a policy evaluator down, so the
+    // verdict can still change and the next poll is worth something.
+    {
+      case: 'a deployment outage',
+      status: 503,
+      providerId: 'deferrer',
+      tally: { providersPolled: 1, delivered: 0, deferred: 1 },
+      terminal: false,
+    },
+  ])('records $case as terminal=$terminal (the DO answered $status)', async ({
+    status,
+    providerId,
+    tally,
+    terminal,
+  }) => {
+    // #given — a bound delivery the thread DO answers with that status
+    const factory = new InMemorySubscriptionStoreFactory();
+    await seed(factory, 'acme', providerId, 'acme_t1');
+    const addressed: string[] = [];
+    const host = new TestHost(state(SIGNAL_PROVIDER_HOST_INSTANCE_NAME), {
+      factory,
+      topology: stubTopology(addressed, undefined, status),
+      providers: [pollProvider(providerId)],
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      // #when
+      const result = await host.poll();
+
+      // #then — counted in its own bucket, and the logged verdict says
+      // whether redelivering could change the outcome
+      expect(result).toEqual(tally);
+      expect(addressed).toEqual(['acme_t1']);
+      expect(
+        loggedEvent(logged, 'signal-provider.delivery-rejected').terminal,
+      ).toBe(terminal);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it('drops a delivery bound to a row this host never authorized', async () => {
+    // #given — the adapter hands back a subscription id the store never issued
+    const factory = new InMemorySubscriptionStoreFactory();
+    const row = await seed(factory, 'acme', 'rogue', 'acme_t1');
+    const rogue: SignalProviderAdapter = {
+      id: 'rogue',
+      buildNotification: () => ({ source: 'rogue', kind: 'k', summary: 's' }),
+      pollForDeliveries: async (): Promise<ProviderDelivery[]> => [
+        {
+          subscription: { ...row, id: 'never-issued' },
+          notification: { source: 'rogue', kind: 'k', summary: 's' },
+        },
+      ],
+    };
+    const addressed: string[] = [];
+    const host = new TestHost(state(SIGNAL_PROVIDER_HOST_INSTANCE_NAME), {
+      factory,
+      topology: stubTopology(addressed),
+      providers: [rogue],
+    });
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      // #when
+      const result = await host.poll();
+
+      // #then — no thread was addressed, and the log says polling again could
+      // only return the same adapter defect
+      expect(result).toEqual({ providersPolled: 1, delivered: 0, failed: 1 });
+      expect(addressed).toEqual([]);
+      expect(
+        loggedEvent(logged, 'signal-provider.delivery-error').terminal,
+      ).toBe(true);
+    } finally {
+      logged.mockRestore();
+    }
   });
 });
 

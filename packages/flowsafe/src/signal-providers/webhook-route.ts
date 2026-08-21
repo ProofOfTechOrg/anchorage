@@ -56,6 +56,7 @@ import {
   classifyDeliveryError,
   classifyDeliveryResponse,
   deliverNotification,
+  isTerminalDelivery,
 } from './delivery.js';
 import type { ReconcileSignalProviderPolling } from './host-topology.js';
 import { PROVIDER_ID_PATTERN, type SignalProviderAdapter } from './provider.js';
@@ -390,6 +391,7 @@ export function createWebhookRouter(
             JSON.stringify({
               type: 'signal-provider.webhook-delivery-error',
               providerId,
+              terminal: true,
               reason: error instanceof Error ? error.message : String(error),
             }),
           );
@@ -415,7 +417,7 @@ export function createWebhookRouter(
               type: 'signal-provider.webhook-delivery-rejected',
               providerId,
               status: response.status,
-              terminal: outcome !== 'deferred',
+              terminal: isTerminalDelivery(outcome),
             }),
           );
         } catch (error) {
@@ -427,6 +429,7 @@ export function createWebhookRouter(
             JSON.stringify({
               type: 'signal-provider.webhook-delivery-error',
               providerId,
+              terminal: isTerminalDelivery(outcome),
               reason: error instanceof Error ? error.message : String(error),
             }),
           );

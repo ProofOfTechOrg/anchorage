@@ -15,6 +15,7 @@ import {
   classifyDeliveryError,
   classifyDeliveryResponse,
   deliverNotification,
+  isTerminalDelivery,
 } from './delivery.js';
 import { SIGNAL_PROVIDER_HOST_INSTANCE_NAME } from './host-topology.js';
 import type { SignalProviderAdapter } from './provider.js';
@@ -178,6 +179,7 @@ export abstract class SignalProviderHost<TEnv = unknown> {
               JSON.stringify({
                 type: 'signal-provider.delivery-error',
                 providerId: provider.id,
+                terminal: true,
                 reason: `provider '${provider.id}' returned an unbound subscription`,
               }),
             );
@@ -202,7 +204,7 @@ export abstract class SignalProviderHost<TEnv = unknown> {
                 type: 'signal-provider.delivery-rejected',
                 providerId: provider.id,
                 status: response.status,
-                terminal: outcome !== 'deferred',
+                terminal: isTerminalDelivery(outcome),
               }),
             );
           } catch (error) {
@@ -214,6 +216,7 @@ export abstract class SignalProviderHost<TEnv = unknown> {
               JSON.stringify({
                 type: 'signal-provider.delivery-error',
                 providerId: provider.id,
+                terminal: isTerminalDelivery(outcome),
                 reason: error instanceof Error ? error.message : String(error),
               }),
             );

@@ -81,3 +81,14 @@ export function classifyDeliveryError(error: unknown): DeliveryOutcome {
   }
   return 'deferred';
 }
+
+/**
+ * Whether an outcome can still change on redelivery — `deferred` is the only
+ * one that can. That is all `terminal` on a log line claims; it is not a
+ * prediction that the sender will stop retrying, because a terminal row is
+ * re-sent along with its batch whenever a sibling row defers and the webhook
+ * route answers 5xx.
+ */
+export function isTerminalDelivery(outcome: DeliveryOutcome): boolean {
+  return outcome !== 'deferred';
+}
