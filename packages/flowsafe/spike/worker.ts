@@ -2145,20 +2145,45 @@ async function handleGoalProbe(
 //    the same verified target supplies core's initial workflow state.
 //  - D-S3: an agent target reaches the same per-thread runtime-driven loop and
 //    approval bridge as an interactive start.
+
+// Every schedule probe leaves its recurring row active so its trigger evidence
+// survives. If a later stage crosses a cron-minute boundary that row falls due
+// again, and the next probe's tick legitimately claims it — which is how O2
+// observed `due:2, fired:2`. Pausing predecessors at the probe ENTRY (rather
+// than inside one route, where it depended on step order) keeps each probe's
+// counters scoped to the schedule it creates, and preserves the earlier rows'
+// trigger history.
+async function pausePriorProbeSchedules(
+  store: D1SchedulesStorage,
+): Promise<void> {
+  for (const existing of await store.listSchedules({ status: 'active' })) {
+    await store.updateSchedule(existing.id, { status: 'paused' });
+  }
+}
+
+const SCHED_PROBE_ROUTES = new Set([
+  '/sched/concurrent-claim',
+  '/sched/barrier',
+  '/sched/agent',
+]);
+
 async function handleScheduleProbe(
   request: Request,
   env: Env,
 ): Promise<Response | null> {
   const path = new URL(request.url).pathname;
-  if (!path.startsWith('/sched/')) return null;
+  // Decide the route BEFORE any side effect: an unmatched /sched/* path must
+  // not build the store or pause the probe's schedules on its way to a 404.
+  if (request.method !== 'POST' || !SCHED_PROBE_ROUTES.has(path)) return null;
   const store = new D1SchedulesStorage(env.DB as unknown as never);
   const runTopology = createDoRunTopology(
     env.RUNNER,
     env.DEPLOYMENT_IDENTITY_SECRET,
   );
   const now = Date.now();
+  await pausePriorProbeSchedules(store);
 
-  if (request.method === 'POST' && path === '/sched/concurrent-claim') {
+  if (path === '/sched/concurrent-claim') {
     const id = `schedule_${crypto.randomUUID()}`;
     const ownerContext = actorContextForPrincipal(
       { kind: 'human', id: 'schedule-probe-owner', role: 'operator' },
@@ -2228,15 +2253,7 @@ async function handleScheduleProbe(
     });
   }
 
-  if (request.method === 'POST' && path === '/sched/barrier') {
-    // Earlier probes intentionally leave recurring schedules in the shared D1
-    // store. If this stage crosses a cron-minute boundary, one can become due
-    // again and make this target-specific assertion observe two legitimate
-    // fires. Pause prior probes while preserving their trigger evidence so the
-    // barrier result measures only the schedule created below.
-    for (const existing of await store.listSchedules({ status: 'active' })) {
-      await store.updateSchedule(existing.id, { status: 'paused' });
-    }
+  if (path === '/sched/barrier') {
     const id = `schedule_${crypto.randomUUID()}`;
     const ownerContext = actorContextForPrincipal(
       { kind: 'human', id: 'schedule-probe-owner', role: 'operator' },
@@ -2329,7 +2346,7 @@ async function handleScheduleProbe(
     });
   }
 
-  if (request.method === 'POST' && path === '/sched/agent') {
+  if (path === '/sched/agent') {
     // `?entryPath=` drives the NEGATIVE half: the same SYSTEM principal on an
     // entry path SPIKE_AGENT_META never declared must be refused at the host.
     const requestedEntry = new URL(request.url).searchParams.get('entryPath');
@@ -2452,11 +2469,24 @@ async function handleScheduleProbe(
       env.THREAD,
       env.DEPLOYMENT_IDENTITY_SECRET,
     );
+    // A box, not a `let`: TypeScript's control-flow analysis cannot see an
+    // assignment made inside a closure, so a `let` narrows to `null` at every
+    // read below and types the response branch dead. Behavior is identical.
+    const dispatched: { runId: string | null } = { runId: null };
     const tick = createScheduleTick({
       store,
       targetPolicy: scheduleTargetPolicy,
       deploymentTag: env.DEPLOYMENT_TENANT,
-      start: async ({ runId }) => ({ runId }),
+      // Tripwire, the same shape as the scheduleId guards below: this probe
+      // creates only an agent-target schedule, so a workflow fire means the
+      // entry-level isolation broke. It is a tripwire, not the guarantee — the
+      // tick classifies a start throw as `failed` only when the status seam
+      // answers 404 for the unknown run; if that hop throws instead it counts
+      // `deferred`. The due/trigger assertions in spike-verify are what
+      // actually scope the result.
+      start: async () => {
+        throw new Error('agent probe: no workflow schedule may be due');
+      },
       startAgent: async ({
         scheduleId,
         dispatchId,
@@ -2470,6 +2500,12 @@ async function handleScheduleProbe(
         providerOptions,
       }) => {
         if (scheduleId !== id) throw new Error('schedule identity mismatch');
+        // Record the id the TICK minted, from this seam's own parameter and
+        // BEFORE the topology hop — the same way signalAgent does. Reading it
+        // back off the hop's RESULT would make the two sources below one
+        // source, and the spike-verify assertion that ties the persisted
+        // trigger row to the dispatched run would compare a value to itself.
+        dispatched.runId = runId;
         const started = await topology.start(context, {
           agentId: target.agentId,
           runId,
@@ -2493,6 +2529,7 @@ async function handleScheduleProbe(
       },
       signalAgent: async ({ scheduleId, target, dispatchId, runId }) => {
         if (scheduleId !== id) throw new Error('schedule identity mismatch');
+        dispatched.runId = runId;
         if (!target.threadId || !target.resourceId) {
           throw new Error('threaded schedule signal requires memory ids');
         }
@@ -2551,20 +2588,31 @@ async function handleScheduleProbe(
       },
     });
     const result = await tick();
-    const trigger = (await store.listTriggers(id))[0];
-    const runOwner = trigger?.runId
+    // Two INDEPENDENT sources, deliberately: `runId`/`runOwner` come from the
+    // in-memory dispatch seam (the id this handler watched the tick mint and
+    // deliver to the thread DO), while `triggers` comes from the D1 trigger
+    // rows the tick wrote. spike-verify asserting they name the same run is
+    // what ties the persisted row to the run that was actually dispatched —
+    // reading both from the trigger row would only compare a value to itself.
+    const triggers = await store.listTriggers(id);
+    const trigger = triggers[0];
+    const runOwner = dispatched.runId
       ? await approvalStoreFactory(env.DB)
           .resources()
-          .owner('run', trigger.runId)
+          .owner('run', dispatched.runId)
       : undefined;
     return json({
       result,
       scheduleId: id,
       threadId,
       resourceId,
-      runId: trigger?.runId ?? null,
+      runId: dispatched.runId,
       runOwner: runOwner ?? null,
       error: trigger?.error ?? null,
+      triggers: triggers.map((row) => ({
+        outcome: row.outcome,
+        runId: row.runId,
+      })),
     });
   }
 

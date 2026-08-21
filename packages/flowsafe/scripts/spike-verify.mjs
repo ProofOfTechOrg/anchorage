@@ -1857,6 +1857,26 @@ async function main() {
       );
       assert(body.result?.failed === 0, 'no schedule fire was refused', body);
       assert(
+        body.result?.due === 1,
+        "only the probe's own schedule was due in its window (isolation holds)",
+        body,
+      );
+      assert(
+        Array.isArray(body.triggers) && body.triggers.length === 1,
+        "exactly one trigger row exists for the probe's own schedule",
+        body,
+      );
+      assert(
+        body.triggers?.[0]?.runId === body.runId,
+        'the persisted trigger row names the run the seam dispatched',
+        body,
+      );
+      assert(
+        body.triggers?.[0]?.outcome === 'succeeded',
+        "the probe's fire settled as succeeded (threaded agent lane receipt)",
+        body,
+      );
+      assert(
         UUID_PATTERN.test(body.runId),
         'the fired agent runId is an opaque UUID',
         body,
