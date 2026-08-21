@@ -1044,9 +1044,10 @@ describe('Mastra Agent execution-entry inventory', () => {
       ) as { peerDependencies: Record<string, string> }
     ).peerDependencies['@mastra/core'];
 
-    // The comparison above only means "the pinned run" while the peer is an
+    // The comparison below only means "the pinned run" while the peer is an
     // EXACT version. Against a range, a pinned install would compare unequal,
-    // take the canary branch, and tell the maintainer to delete six live names.
+    // take the canary branch, and tell the maintainer to delete names that are
+    // still live.
     expect(
       declaredPeer,
       'the forwardClassified self-expiry keys on @mastra/core being an exact peer pin; widen the peer and this check must be redesigned',

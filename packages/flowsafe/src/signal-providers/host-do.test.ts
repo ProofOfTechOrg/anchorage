@@ -238,6 +238,8 @@ describe('SignalProviderHost.poll', () => {
     }
   });
 
+  const providerId = 'provider';
+
   // The thread route refuses a poll delivery two different ways, and the log
   // line has to tell them apart: the poll host has no reply to shape, so
   // `terminal` is the only signal an operator gets about whether the next poll
@@ -245,22 +247,22 @@ describe('SignalProviderHost.poll', () => {
   it.each([
     // Redelivering the identical notification could only be denied again.
     {
-      case: 'a content denial',
+      scenario: 'a content denial',
       status: 422,
-      providerId: 'denier',
+      providerId,
       tally: { providersPolled: 1, delivered: 0, denied: 1 },
       terminal: true,
     },
     // The deployment could not decide, e.g. a policy evaluator down, so the
     // verdict can still change and the next poll is worth something.
     {
-      case: 'a deployment outage',
+      scenario: 'a deployment outage',
       status: 503,
-      providerId: 'deferrer',
+      providerId,
       tally: { providersPolled: 1, delivered: 0, deferred: 1 },
       terminal: false,
     },
-  ])('records $case as terminal=$terminal (the DO answered $status)', async ({
+  ])('records $scenario as terminal=$terminal (the DO answered $status)', async ({
     status,
     providerId,
     tally,

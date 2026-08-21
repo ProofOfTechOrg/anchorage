@@ -70,8 +70,8 @@ const guardedByDelegation = ['streamUntilIdle'] as const;
  * reason table rather than restated here — so a new blocked entry cannot be
  * added on one side only. The four grounds (re-drive below executeWorkflow,
  * unscoped run discovery, retention-owned snapshot deletion, and a second
- * execution surface entirely or a mint below the caller) are documented on
- * BLOCKED_RUN_ENTRIES.
+ * execution surface outside RunnerRuntime, or a mint below the caller) are
+ * documented on BLOCKED_RUN_ENTRIES.
  */
 const blockedEntries = Object.keys(BLOCKED_RUN_ENTRIES) as ReadonlyArray<
   keyof typeof BLOCKED_RUN_ENTRIES
@@ -946,9 +946,9 @@ describe('FlowsafeDurableAgent blocked recovery entry points', () => {
    * `toHaveBeenCalled()`, never a count: the network family resolves as soon as
    * it has a stream object, before its loop settles, so the figure at assertion
    * time is whatever that run happened to reach. The base fails these calls for
-   * its own reasons (the stub model rejects, and there is no persisted run) —
-   * swallowed, because the claim is only that storage was reached BEFORE they
-   * did.
+   * its own reasons (the unreachable model rejects, and there is no persisted
+   * run) — swallowed, because the claim is only that storage was reached BEFORE
+   * they did.
    *
    * generateLegacy/streamLegacy are excluded: they are vacuous by construction,
    * for the reason registeredAgent() records.

@@ -97,12 +97,12 @@
 //       call it.
 //
 // Agent-level surface (offsets in chunk-3S5BFAEP.js at 1.53.0 unless another
-// chunk is named). The base `Agent` carries 82 own members DurableAgent does
-// not shadow. Every one of them has been read and dispositioned into exactly
-// one of the three buckets below, and durable-agent-surface.test.ts pins that
-// partition by name the same way it pins the 87-member durable one — so the
-// invariant holds over the WHOLE inherited surface, not just the durable half,
-// and stays holding on a bump.
+// chunk or file is named). The base `Agent` carries 82 own members
+// DurableAgent does not shadow. Every one of them has been read and
+// dispositioned into exactly one of the three buckets below, and
+// durable-agent-surface.test.ts pins that partition by name the same way it
+// pins the 87-member durable one — so the invariant holds over the WHOLE
+// inherited surface, not just the durable half, and stays holding on a bump.
 //
 //   BLOCKED outright, because each is its own execution path:
 //     - listSuspendedRuns() (:49532), the one direct data-returning discovery
@@ -150,51 +150,51 @@
 //   it; sendToolApproval is blocked because no route needs it. The difference
 //   is NECESSITY, not who mints — and who mints is a residual, recorded here:
 //
-//     All offsets below are chunk-P4Y2BJL7.js unless another chunk or file is
-//     named — NOT the chunk-3S5BFAEP.js default this section header sets.
+//     All offsets in this paragraph are chunk-P4Y2BJL7.js unless another
+//     chunk or file is named — NOT the chunk-3S5BFAEP.js default this section
+//     header sets.
 //
 //     Only sendMessage/sendSignal wake through the host's own startIdleRun
 //     seam (signals/thread-do-routes.ts:1235), where the host mints the id
-//     (signals/thread-do-routes.ts:1228) and reserves ownership before calling
-//     streamUntilPersisted
-//     (agent-host/thread-host.ts:1541). Core still starts runs of its own
-//     through the guarded stream(): on an IDLE thread queueMessage forces a
-//     wake (:7192-7196), while sendStateSignal (:7235) and the DELIVER branch
-//     of sendNotificationSignal (chunk-3S5BFAEP.js:49765-49770, which forwards
-//     the target unmodified) fall to sendSignal's default ifIdle behavior of
-//     'wake' (:7255); that branch's sibling SUMMARY path
-//     (chunk-3S5BFAEP.js:49716-49721) sets
-//     the behavior explicitly instead, persist for high priority and wake
+//     (signals/thread-do-routes.ts:1228) and reserves ownership before
+//     calling streamUntilPersisted (agent-host/thread-host.ts:1541). Core
+//     still starts runs of its own through the guarded stream(): on an IDLE
+//     thread queueMessage forces a wake (:7192-7196), while sendStateSignal
+//     (:7235) and the DELIVER branch of sendNotificationSignal
+//     (chunk-3S5BFAEP.js:49765-49770, which forwards the target unmodified)
+//     fall to sendSignal's default ifIdle behavior of 'wake' (:7255); that
+//     branch's sibling SUMMARY path (chunk-3S5BFAEP.js:49716-49721) sets the
+//     behavior explicitly instead, persist for high priority and wake
 //     otherwise. Either way the wake mints `runId = randomUUID()` (:7362),
-//     overwriting any caller id, and then calls
-//     `agent.stream(signal, { untilIdle: true, runId })` (:7441). So do the
-//     completion drains after ANY of the five: #drainPendingSignals replays a
-//     leftover active-delivery signal under a fresh randomUUID() with the
-//     PREVIOUS run's stream options (:6641, :6665), and
-//     #drainPendingIdleSignals replays a queued message under the id minted
-//     when it was queued (:7180, :6808). #assertCallerRunId is path-safety
-//     only, so it cannot tell those ids from host-minted ones — the host's own
-//     wake uses crypto.randomUUID() too. Such runs carry no requestedBy (no
+//     overwriting any caller id, and then calls `agent.stream(signal, {
+//     untilIdle: true, runId })` (:7441). So do the completion drains after
+//     ANY of the five: #drainPendingSignals replays a leftover
+//     active-delivery signal under a fresh randomUUID() with the PREVIOUS
+//     run's stream options (:6641, :6665), and #drainPendingIdleSignals
+//     replays a queued message under the id minted when it was queued (:7180,
+//     :6808). #assertCallerRunId is path-safety only, so it cannot tell those
+//     ids from host-minted ones — the host's own wake uses
+//     crypto.randomUUID() too. Such runs carry no requestedBy (no
 //     #startRequesters entry, so executeWorkflow starts without one), no
-//     ownership reservation, no agent-run record (thread-host.ts:1493-1513
-//     never runs) and no trusted engine-leg context (requestContextForRun,
-//     thread-host.ts:1276-1286, misses on the runId). With an EMPTY request
-//     context — the idle wake — breakwater's RBAC input processor aborts on
-//     the missing actor, prepareForDurableExecution catches the TripWire
-//     (chunk-XMEACVLS.js:535-548), and the first llm step returns
+//     ownership reservation, no agent-run record
+//     (agent-host/thread-host.ts:1493-1513 never runs) and no trusted
+//     engine-leg context (requestContextForRun,
+//     agent-host/thread-host.ts:1276-1286, misses on the runId). With an EMPTY
+//     request context — the idle wake — breakwater's RBAC input processor
+//     aborts on the missing actor, prepareForDurableExecution catches the
+//     TripWire (chunk-XMEACVLS.js:535-548), and the first llm step returns
 //     reason:'tripwire' (chunk-XMEACVLS.js:2026-2060): a run row, no model
-//     call. With the
-//     PREVIOUS run's request context — a completion drain — RBAC passes, the
-//     model IS called, and tools see no actor, permissions or grants. Either
-//     way the run is unobservable and unresumable through the host routes.
-//     Pre-existing rather than introduced by this bump: all five core
-//     functions are byte-identical at 1.50.0. Tracked as a residual alongside
-//     getLegacyHandler() and Mastra.restartAllActiveWorkflowRuns(); the
-//     reachable routes are thread-do-routes.ts /signal/queue, /signal/state
-//     and /signal/notification. RUNTIME_DRIVEN_AGENT does not cover it: its
-//     brand gates the host's own startIdleRun wake
-//     (signals/thread-do-routes.ts:1194-1197), which those
-//     three routes never reach.
+//     call. With the PREVIOUS run's request context — a completion drain —
+//     RBAC passes, the model IS called, and tools see no actor, permissions or
+//     grants. Either way the run is unobservable and unresumable through the
+//     host routes. Pre-existing rather than introduced by this bump: all five
+//     core functions are byte-identical at 1.50.0. Tracked as a residual
+//     alongside getLegacyHandler() and Mastra.restartAllActiveWorkflowRuns();
+//     the reachable routes are signals/thread-do-routes.ts /signal/queue,
+//     /signal/state and /signal/notification. RUNTIME_DRIVEN_AGENT does not
+//     cover it: its brand gates the host's own startIdleRun wake
+//     (signals/thread-do-routes.ts:1194-1197), which those three routes never
+//     reach.
 //
 //   LEFT INHERITED as non-execution, on a read of each: the base delegators
 //   resume/recover/listActiveRuns/recoverActiveRuns/prepare (:50497 onward) are
