@@ -228,6 +228,7 @@ A host with only one human reviewer must consciously choose availability or sepa
 | Prompt becomes CLI flag | Wrapper-owned `--` and `--flag=value` | Vendor semantics can change; packed consumer tests pin current definitions |
 | Prompt/output leaks in error or audit | Static errors, redacted command, bounded metadata, safe audit registry | Successful functional text remains sensitive and caller-owned |
 | PII or secret in model output | Multi-channel detectors, classifier seam, optional hold-back | Encodings and adversarial transformations can evade detection |
+| Untrusted signal bypasses the initiating input processor | Optional Thread Durable Object content policy over Mastra's canonical XML before delivery; providers, schedules, and notification dispatch converge there | A host that omits the optional policy accepts structurally valid signal content; application policy quality remains host-owned |
 | Open approval or suspended run age-purged | Terminal-only retention | Abandoned live records require operator disposition |
 | R2 artifacts stranded | Artifact deletion paired before snapshot row | A host that omits the artifact store from decommissioning can strand objects |
 | Application Worker binds another deployment's R2 bucket | Fleet-derived names, permanent ownership claims, persisted create authorization, and exact binding inventory | Control-plane compromise remains inside the trusted computing base |

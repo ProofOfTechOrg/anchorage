@@ -50,6 +50,25 @@ function context(role: ApprovalRole = 'operator'): ActorContext {
   };
 }
 
+function resourceContext(
+  actorId: string,
+  threadId: string,
+  runId: string,
+): ActorContext {
+  const scoped = context();
+  const actor: ApprovalActor = { id: actorId, role: 'operator' };
+  const principal = humanPrincipal(actor);
+  return {
+    ...scoped,
+    actor,
+    principal,
+    resourceOwner: { kind: principal.kind, id: principal.id },
+    canAccessResource: async (kind, id) =>
+      (kind === 'thread' && id === threadId) ||
+      (kind === 'run' && id === runId),
+  };
+}
+
 function envelope(): AgentRunEnvelope {
   return {
     agentId: 'writer',
@@ -64,7 +83,7 @@ function topology() {
   return {
     start: vi.fn(async () => envelope()),
     status: vi.fn<AgentThreadTopology['status']>(async () => envelope()),
-    observe: vi.fn(
+    observe: vi.fn<AgentThreadTopology['observe']>(
       async () =>
         new Response('{"offset":1,"event":{}}\n', {
           headers: {
@@ -217,6 +236,123 @@ describe('createAgentRouter', () => {
     expect(host.observe).toHaveBeenCalledWith(
       expect.objectContaining({}),
       expect.objectContaining({ offset: 7 }),
+    );
+  });
+
+  it('attaches only to the requesting operator stream without a foreign-resource oracle', async () => {
+    const host = topology();
+    const alice = resourceContext('alice', 'alice_thread', 'alice_run');
+    const bob = resourceContext('bob', 'bob_thread', 'bob_run');
+    host.status.mockImplementation(async (_, input) => ({
+      agentId: input.agentId,
+      threadId: input.threadId,
+      resourceId: `${input.threadId}_resource`,
+      runId: input.runId,
+      summary: { runId: input.runId, status: 'running' },
+    }));
+    host.observe.mockImplementation(
+      async (scoped, input) =>
+        new Response(
+          `${JSON.stringify({
+            offset: input.offset + 1,
+            event: {
+              actorId: scoped.actor.id,
+              threadId: input.threadId,
+              runId: input.runId,
+            },
+          })}\n`,
+          {
+            headers: {
+              'content-type': 'application/x-ndjson; charset=utf-8',
+            },
+          },
+        ),
+    );
+    const router = createAgentRouter({
+      agents,
+      resolve: async (request) =>
+        request.headers.get('authorization') === 'Bearer alice' ? alice : bob,
+      topology: host,
+    });
+    const stream = (actor: 'alice' | 'bob', threadId: string, runId: string) =>
+      router(
+        new Request(
+          `https://host/agents/writer/runs/${threadId}/${runId}/stream`,
+          { headers: { authorization: `Bearer ${actor}` } },
+        ),
+      );
+
+    const [aliceOwn, bobOwn, ...foreign] = await Promise.all([
+      stream('alice', 'alice_thread', 'alice_run'),
+      stream('bob', 'bob_thread', 'bob_run'),
+      stream('alice', 'bob_thread', 'bob_run'),
+      stream('bob', 'alice_thread', 'alice_run'),
+      stream('alice', 'alice_thread', 'bob_run'),
+      stream('alice', 'bob_thread', 'alice_run'),
+      stream('bob', 'bob_thread', 'alice_run'),
+      stream('bob', 'alice_thread', 'bob_run'),
+    ]);
+
+    expect([aliceOwn?.status, bobOwn?.status]).toEqual([200, 200]);
+    await expect(aliceOwn?.json()).resolves.toEqual({
+      offset: 1,
+      event: {
+        actorId: 'alice',
+        threadId: 'alice_thread',
+        runId: 'alice_run',
+      },
+    });
+    await expect(bobOwn?.json()).resolves.toEqual({
+      offset: 1,
+      event: {
+        actorId: 'bob',
+        threadId: 'bob_thread',
+        runId: 'bob_run',
+      },
+    });
+    expect(foreign.map((response) => response?.status)).toEqual(
+      Array.from({ length: 6 }, () => 404),
+    );
+    await Promise.all(
+      foreign.map(async (response) =>
+        expect(await response?.json()).toEqual({ error: 'run not found' }),
+      ),
+    );
+    expect(host.status).toHaveBeenCalledTimes(2);
+    expect(host.status).toHaveBeenCalledWith(
+      alice,
+      expect.objectContaining({
+        agentId: 'writer',
+        threadId: 'alice_thread',
+        runId: 'alice_run',
+      }),
+    );
+    expect(host.status).toHaveBeenCalledWith(
+      bob,
+      expect.objectContaining({
+        agentId: 'writer',
+        threadId: 'bob_thread',
+        runId: 'bob_run',
+      }),
+    );
+    expect(host.observe).toHaveBeenCalledTimes(2);
+    expect(host.observe).toHaveBeenCalledWith(
+      alice,
+      expect.objectContaining({
+        agentId: 'writer',
+        threadId: 'alice_thread',
+        runId: 'alice_run',
+        offset: 0,
+      }),
+    );
+    expect(host.observe).toHaveBeenCalledWith(
+      bob,
+      expect.objectContaining({
+        agentId: 'writer',
+        threadId: 'bob_thread',
+        runId: 'bob_run',
+        offset: 0,
+      }),
     );
   });
 

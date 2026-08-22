@@ -1,6 +1,6 @@
 {
   "name": "@proofoftech/fleet-control",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "publishConfig": {
     "access": "public"
   },
@@ -47,8 +47,9 @@
   "scripts": {
     "prebuild": "pnpm --filter @proofoftech/breakwater --filter @proofoftech/flowsafe build",
     "build": "tsc -p tsconfig.build.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "lint": "pnpm -w exec biome check packages/fleet-control",
-    "prepublishOnly": "pnpm run build",
+    "prepack": "pnpm run clean && pnpm run build",
     "pretypecheck": "pnpm --filter @proofoftech/breakwater --filter @proofoftech/flowsafe build",
     "test:credentialed": "pnpm build && node scripts/credentialed-conformance.mjs",
     "test:packed-consumer": "node scripts/packed-consumer-test.mjs",

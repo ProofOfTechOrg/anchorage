@@ -30,6 +30,8 @@ export interface NotificationDispatchTickResult {
   due: number;
   delivered: number;
   failed: number;
+  /** Terminal content-policy denials. Omitted when zero for wire compatibility. */
+  discarded?: number;
 }
 
 interface DeliveryGroup {
@@ -321,10 +323,14 @@ export function createNotificationDispatchTick(
           const body = (await response.json()) as {
             delivered?: number;
             failed?: number;
+            discarded?: number;
             batchThreadState?: unknown;
           };
           result.delivered += body.delivered ?? 0;
           result.failed += body.failed ?? 0;
+          if (body.discarded && body.discarded > 0) {
+            result.discarded = (result.discarded ?? 0) + body.discarded;
+          }
           if (
             batchThreadState === null &&
             (body.batchThreadState === 'active' ||

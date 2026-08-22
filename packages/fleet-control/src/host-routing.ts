@@ -7,7 +7,7 @@ import {
   isDeploymentScriptName,
   isDeploymentTenantTag,
   isSha256,
-} from '../deployment-context.js';
+} from './deployment-context.js';
 
 export interface HostRoutingTarget {
   readonly scriptName: string;

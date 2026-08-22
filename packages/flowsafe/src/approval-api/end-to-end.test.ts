@@ -13,7 +13,6 @@
 //    path where a resume that bypasses decide() finds no grant.
 
 import { InMemoryStore } from '@mastra/core/storage';
-import type { ToolExecutionContext } from '@mastra/core/tools';
 import {
   ACTOR_CONTEXT_KEY,
   type Actor,
@@ -23,6 +22,7 @@ import {
   CONNECTOR_GRANTS_CONTEXT_KEY,
   createConnector,
   ISOLATION_SCOPE_CONTEXT_KEY,
+  invokeConnector,
   PRINCIPAL_KINDS,
   PRINCIPAL_PERMISSIONS_CONTEXT_KEY,
   ROLES,
@@ -302,11 +302,11 @@ function buildHarness(): Harness {
     outputSchema: z.object({ published: z.boolean() }),
     execute: async ({ inputData, requestContext }) => {
       if (!inputData.approved) return { published: false };
-      if (!publisher.execute) throw new Error('connector has no execute');
-      const result = await publisher.execute({ topic: inputData.topic }, {
-        requestContext,
-      } as unknown as ToolExecutionContext);
-      return result as { published: boolean };
+      return invokeConnector(
+        publisher,
+        { topic: inputData.topic },
+        { requestContext },
+      );
     },
   });
 
@@ -345,10 +345,11 @@ function buildHarness(): Harness {
       inputSchema: z.object({ topic: z.string() }),
       outputSchema: z.object({ topic: z.string() }),
       execute: async ({ inputData, requestContext }) => {
-        if (!publisher.execute) throw new Error('connector has no execute');
-        await publisher.execute({ topic: inputData.topic }, {
-          requestContext,
-        } as unknown as ToolExecutionContext);
+        await invokeConnector(
+          publisher,
+          { topic: inputData.topic },
+          { requestContext },
+        );
         return { topic: inputData.topic };
       },
     });

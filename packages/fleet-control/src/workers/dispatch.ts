@@ -12,7 +12,7 @@ import {
 import {
   type HostRoutingTarget,
   parseHostRoutingTarget,
-} from './host-routing.js';
+} from '../host-routing.js';
 
 const MAINTENANCE_PATH_PREFIX = [
   '.well-known',

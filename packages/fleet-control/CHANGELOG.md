@@ -1,5 +1,19 @@
 # @proofoftech/fleet-control
 
+## 0.3.4
+
+### Patch Changes
+
+- 66c19f1: Clean generated output at the packaging boundary so deleted source modules cannot remain in published tarballs.
+- Updated dependencies [80a801c]
+- Updated dependencies [fa0d11d]
+- Updated dependencies [0447466]
+- Updated dependencies [da6a0aa]
+- Updated dependencies [8f4daae]
+- Updated dependencies [66c19f1]
+- Updated dependencies [5cbe01d]
+  - @proofoftech/flowsafe@0.19.0
+
 ## 0.3.3
 
 ### Patch Changes

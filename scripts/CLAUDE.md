@@ -8,10 +8,12 @@ Repository documentation, architecture, and publication checks. Markdown syntax 
 - `docs-check.mjs` — validates local docs, public exports, TypeDoc coverage,
   and external links.
 - `docs-check.test.mjs` — `node:test` fixtures for the documentation checker.
-- `publish-ordered.mjs` — publishes Breakwater before the Changesets remainder.
+- `github-yaml-check.mjs` — validates every YAML file under `.github`.
+- `github-yaml-check.test.mjs` — `node:test` fixtures for the GitHub YAML checker.
+- `publish-ordered.mjs` — publishes Breakwater before the Changesets remainder and gates release on prerequisite peer floors.
 - `publish-ordered.test.mjs` — `node:test` fixtures for publish ordering, the
   publish argv and cwd shape, and the tag line `changesets/action` greps for.
-- `publish-invocation-check.mjs` — dry-runs the real publish command per package.
+- `publish-invocation-check.mjs` — dry-runs the real publish command per package and validates peer-floor grammar in CI and the release pre-flight.
 - `conformance-config-check.test.mjs` — `node:test` checks that agent-starter's
   Workers for Platforms operator configuration and harness wrangler configs
   satisfy fleet control's own validators. Lives here because

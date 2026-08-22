@@ -13,22 +13,19 @@
 // connector works anywhere; calling one without an `exec` override outside
 // Node throws AgentCliError. The `exec` seam is also the test surface.
 
-import {
-  isValidationError,
-  type Tool,
-  type ValidationError,
-} from '@mastra/core/tools';
+import { isValidationError, type ValidationError } from '@mastra/core/tools';
 import { z } from 'zod';
 
 import {
   registerSafeAuditError,
   safeAuditErrorSummary,
 } from '../audit/safe-error.js';
-import type { ConnectorPolicies } from '../connector-sdk/index.js';
+import type { Connector, ConnectorPolicies } from '../connector-sdk/index.js';
 import {
   ConnectorPolicyError,
   createConnector,
 } from '../connector-sdk/index.js';
+import { replaceConnectorInvocation } from '../connector-sdk/invocation-registry.js';
 import { createDefaultExec, DefaultExecFailure } from './default-exec.js';
 
 /** Input accepted by an agent CLI connector. */
@@ -386,7 +383,7 @@ function redactDisplayFlag(flag: string): string {
 export function createAgentCliConnector(
   definition: AgentCliDefinition,
   options: AgentCliConnectorOptions = {},
-): Tool<AgentCliInput, AgentCliOutput> {
+): Connector<AgentCliInput, AgentCliOutput> {
   const connectorId = options.id ?? definition.id;
   if (options.timeoutMs !== undefined) {
     assertIntegerOption(
@@ -563,9 +560,6 @@ export function createAgentCliConnector(
   });
 
   const execute = connector.execute;
-  if (!execute) {
-    throw createAgentCliError('connector-failed', connectorId);
-  }
   connector.execute = async (input, context) => {
     try {
       const result = await execute.call(connector, input, context);
@@ -596,6 +590,7 @@ export function createAgentCliConnector(
       throw createAgentCliError('connector-failed', connectorId);
     }
   };
+  replaceConnectorInvocation(connector, execute);
   return connector;
 }
 
@@ -660,7 +655,7 @@ export const CODEX_CLI: AgentCliDefinition = {
  */
 export function createClaudeCodeConnector(
   options?: AgentCliConnectorOptions,
-): Tool<AgentCliInput, AgentCliOutput> {
+): Connector<AgentCliInput, AgentCliOutput> {
   return createAgentCliConnector(CLAUDE_CODE_CLI, options);
 }
 
@@ -669,6 +664,6 @@ export function createClaudeCodeConnector(
  */
 export function createCodexConnector(
   options?: AgentCliConnectorOptions,
-): Tool<AgentCliInput, AgentCliOutput> {
+): Connector<AgentCliInput, AgentCliOutput> {
   return createAgentCliConnector(CODEX_CLI, options);
 }

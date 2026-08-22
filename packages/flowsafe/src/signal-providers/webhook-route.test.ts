@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { EXECUTION_PRINCIPAL_HEADER } from '../do-runner/index.js';
 import {
   createThreadTopology as createThreadTopologyWithSecret,
+  RunRouteError,
   type ThreadNamespaceLike,
   type ThreadTopology,
 } from '../host-kit/index.js';
@@ -17,6 +18,32 @@ import {
 } from './webhook-route.js';
 
 const DEPLOYMENT_IDENTITY_SECRET = 'test-deployment-identity-secret-0001';
+
+/**
+ * The parsed JSON log line of one event type — and THE only one of that type.
+ *
+ * Reading `terminal` off this entry is what binds the verdict to the event: two
+ * independent `stringContaining` asserts, one for the type and one for
+ * `"terminal":false`, both pass when a different line happens to carry the flag.
+ * Requiring exactly one match is what makes "binds to the event" literally true
+ * rather than merely likely — several lanes here emit the same type, so a test
+ * that logged two of them would otherwise assert against whichever came first.
+ */
+function loggedEvent(
+  logged: { mock: { calls: readonly unknown[][] } },
+  type: string,
+): Record<string, unknown> {
+  const entries = logged.mock.calls.map(
+    ([line]) => JSON.parse(String(line)) as Record<string, unknown>,
+  );
+  const seen = entries.map((entry) => String(entry.type));
+  const matches = entries.filter((entry) => entry.type === type);
+  expect(
+    matches.length,
+    `expected exactly one ${type} log line, saw [${seen.join(', ')}] — with more than one, reading a field off "the" entry asserts against whichever came first`,
+  ).toBe(1);
+  return matches[0] as Record<string, unknown>;
+}
 
 function createThreadTopology<Id>(
   namespace: ThreadNamespaceLike<Id>,
@@ -55,6 +82,67 @@ function stubThreads(): {
           return Promise.resolve(
             new Response(JSON.stringify({ record: {} }), { status: 200 }),
           );
+        },
+      }),
+    },
+  };
+}
+
+// Like stubThreads, but every delivery answers with a chosen status and the
+// posted bodies are captured — so a test can drive the thread route's terminal
+// (422) and transient (5xx) refusals, or inspect what an accepted delivery
+// actually carried.
+function stubThreadsWith(status: number): {
+  namespace: ThreadNamespaceLike<string>;
+  addressed: string[];
+  bodies: Array<Record<string, unknown>>;
+} {
+  const addressed: string[] = [];
+  const bodies: Array<Record<string, unknown>> = [];
+  return {
+    addressed,
+    bodies,
+    namespace: {
+      idFromName: (name) => name,
+      get: (name) => ({
+        fetch: (input: Request | string, init?: { body?: string }) => {
+          addressed.push(name);
+          void input;
+          bodies.push(
+            JSON.parse(init?.body ?? '{}') as Record<string, unknown>,
+          );
+          return Promise.resolve(
+            new Response(
+              JSON.stringify(
+                status >= 200 && status < 300
+                  ? { record: {} }
+                  : { error: 'refused' },
+              ),
+              { status },
+            ),
+          );
+        },
+      }),
+    },
+  };
+}
+
+// Like stubThreadsWith, but the delivery THROWS instead of answering — the
+// lane that has only a thrown value to classify, never a status.
+function stubThreadsThatThrow(error: unknown): {
+  namespace: ThreadNamespaceLike<string>;
+  addressed: string[];
+} {
+  const addressed: string[] = [];
+  return {
+    addressed,
+    namespace: {
+      idFromName: (name) => name,
+      get: (name) => ({
+        fetch: (input: Request | string) => {
+          addressed.push(name);
+          void input;
+          return Promise.reject(error);
         },
       }),
     },
@@ -420,9 +508,142 @@ describe('createWebhookRouter — robustness', () => {
     await seed(factory, 'acme', 'acme_t1');
     // #when
     const res = await run(webhookRequest('good', {}));
-    // #then — acknowledge the authentic webhook without inviting a retry.
+    // #then — acknowledge the authentic webhook without inviting a retry: a
+    // provider bug is deterministic, so redelivering it only repeats it.
     expect(res?.status).toBe(200);
-    expect(await res?.json()).toEqual({ matched: 1, delivered: 0 });
+    expect(await res?.json()).toEqual({
+      matched: 1,
+      delivered: 0,
+      failed: 1,
+    });
+  });
+
+  // The thread route answers a refusal two different ways, and only one of
+  // them may make the whole webhook retryable.
+  it('acknowledges a content denial without inviting a redelivery', async () => {
+    // #given — the thread DO refuses this content terminally (422)
+    const factory = new InMemorySubscriptionStoreFactory();
+    await seed(factory, 'acme', 'acme_t1');
+    const threads = stubThreadsWith(422);
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const run = createWebhookRouter({
+      providers: { test: testProvider() },
+      subscriptions: factory.store(),
+      topology: createThreadTopology(threads.namespace),
+      secretForProvider: () => 'secret',
+    });
+
+    try {
+      // #when
+      const res = await run(webhookRequest('good', {}));
+
+      // #then — 2xx: redelivering the identical bytes would be denied again
+      expect(res?.status).toBe(200);
+      expect(await res?.json()).toEqual({
+        matched: 1,
+        delivered: 0,
+        denied: 1,
+      });
+      expect(
+        loggedEvent(logged, 'signal-provider.webhook-delivery-rejected')
+          .terminal,
+      ).toBe(true);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it('asks the sender to redeliver when the deployment could not decide', async () => {
+    // #given — the thread DO is unavailable (503), e.g. a policy evaluator down
+    const factory = new InMemorySubscriptionStoreFactory();
+    await seed(factory, 'acme', 'acme_t1');
+    const threads = stubThreadsWith(503);
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const run = createWebhookRouter({
+      providers: { test: testProvider() },
+      subscriptions: factory.store(),
+      topology: createThreadTopology(threads.namespace),
+      secretForProvider: () => 'secret',
+    });
+
+    try {
+      // #when
+      const res = await run(webhookRequest('good', {}));
+
+      // #then — a 5xx, so the provider's own at-least-once retry recovers the
+      // event instead of it being silently dropped
+      expect(res?.status).toBe(503);
+      expect(await res?.json()).toEqual({
+        matched: 1,
+        delivered: 0,
+        deferred: 1,
+      });
+      expect(
+        loggedEvent(logged, 'signal-provider.webhook-delivery-rejected')
+          .terminal,
+      ).toBe(false);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it('gives each matched row its own dedupe key and keeps a provider-supplied one', async () => {
+    // #given — one event matching two rows, and a provider that names its own
+    // key for the second
+    const factory = new InMemorySubscriptionStoreFactory();
+    await factory.store().subscribe({
+      providerId: 'test',
+      externalResourceId: 'res:1',
+      threadId: 'acme_t1',
+      resourceId: 'acme_owner',
+    });
+    await factory.store().subscribe({
+      providerId: 'test',
+      externalResourceId: 'res:2',
+      threadId: 'acme_t1',
+      resourceId: 'acme_owner',
+    });
+    await factory.store().subscribe({
+      providerId: 'test',
+      externalResourceId: 'res:3',
+      threadId: 'acme_t1',
+      resourceId: 'acme_owner',
+    });
+    const threads = stubThreadsWith(200);
+    const run = createWebhookRouter({
+      providers: {
+        test: testProvider({
+          extractResourceIds: () => ['res:1', 'res:2', 'res:3'],
+          buildNotification: (_payload, row) => ({
+            source: 'test',
+            kind: 'k',
+            summary: row.externalResourceId,
+            ...(row.externalResourceId === 'res:2'
+              ? { dedupeKey: 'provider-owned' }
+              : {}),
+          }),
+        }),
+      },
+      subscriptions: factory.store(),
+      topology: createThreadTopology(threads.namespace),
+      secretForProvider: () => 'secret',
+    });
+
+    // #when — the same event delivered twice, as an at-least-once sender would
+    await run(webhookRequest('good', {}));
+    await run(webhookRequest('good', {}));
+
+    // #then — rows 1 and 3 both take a DERIVED key, and they differ: a key
+    // built from the event alone would collapse these two into one
+    // notification, because coalescing matches on thread + resource.
+    const keys = threads.bodies.map((body) => body.dedupeKey);
+    expect(keys[0]).not.toBe(keys[2]);
+    expect(new Set(keys.slice(0, 3)).size).toBe(3);
+    // ...the provider's own key is never overwritten...
+    expect(keys[1]).toBe('provider-owned');
+    // ...and a redelivery of the same event reuses the same keys, so it
+    // coalesces into the still-pending row instead of duplicating it.
+    expect(keys.slice(3)).toEqual(keys.slice(0, 3));
   });
 
   it('does not turn an earlier applied delivery into a retryable failure', async () => {
@@ -449,11 +670,83 @@ describe('createWebhookRouter — robustness', () => {
       const response = await router(webhookRequest('good', {}));
 
       expect(response?.status).toBe(200);
-      expect(await response?.json()).toEqual({ matched: 2, delivered: 1 });
+      expect(await response?.json()).toEqual({
+        matched: 2,
+        delivered: 1,
+        failed: 1,
+      });
       expect(threads.addressed).toEqual(['acme_t1']);
-      expect(logged).toHaveBeenCalledWith(
-        expect.stringContaining('signal-provider.webhook-delivery-error'),
-      );
+      // A code defect is permanent: nothing about redelivering these bytes
+      // could make the provider build them successfully.
+      expect(
+        loggedEvent(logged, 'signal-provider.webhook-delivery-error').terminal,
+      ).toBe(true);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  // The same two directions again, but for a delivery that THROWS rather than
+  // answering — the lane whose log line carried no verdict at all.
+  it('marks an undecided delivery throw as non-terminal', async () => {
+    // #given — the delivery itself fails, e.g. the thread DO is unreachable
+    const factory = new InMemorySubscriptionStoreFactory();
+    await seed(factory, 'acme', 'acme_t1');
+    const threads = stubThreadsThatThrow(new Error('socket hang up'));
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const run = createWebhookRouter({
+      providers: { test: testProvider() },
+      subscriptions: factory.store(),
+      topology: createThreadTopology(threads.namespace),
+      secretForProvider: () => 'secret',
+    });
+
+    try {
+      // #when
+      const res = await run(webhookRequest('good', {}));
+
+      // #then — a 5xx, and the log says the event may yet land
+      expect(res?.status).toBe(503);
+      expect(await res?.json()).toEqual({
+        matched: 1,
+        delivered: 0,
+        deferred: 1,
+      });
+      expect(
+        loggedEvent(logged, 'signal-provider.webhook-delivery-error').terminal,
+      ).toBe(false);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it('marks a routed content refusal thrown at delivery as terminal', async () => {
+    // #given — the topology throws the refusal instead of returning it
+    const factory = new InMemorySubscriptionStoreFactory();
+    await seed(factory, 'acme', 'acme_t1');
+    const threads = stubThreadsThatThrow(new RunRouteError(422, 'denied'));
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const run = createWebhookRouter({
+      providers: { test: testProvider() },
+      subscriptions: factory.store(),
+      topology: createThreadTopology(threads.namespace),
+      secretForProvider: () => 'secret',
+    });
+
+    try {
+      // #when
+      const res = await run(webhookRequest('good', {}));
+
+      // #then — 2xx, and the log distinguishes this throw from the one above
+      expect(res?.status).toBe(200);
+      expect(await res?.json()).toEqual({
+        matched: 1,
+        delivered: 0,
+        denied: 1,
+      });
+      expect(
+        loggedEvent(logged, 'signal-provider.webhook-delivery-error').terminal,
+      ).toBe(true);
     } finally {
       logged.mockRestore();
     }

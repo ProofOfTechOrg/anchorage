@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import type { ToolExecutionContext } from '@mastra/core/tools';
-import { createConnector } from '@proofoftech/breakwater';
+import { createConnector, invokeConnector } from '@proofoftech/breakwater';
 import {
   createAuditProxyDurableObjectBinding,
   createAuditProxyQueue,
 } from '@proofoftech/flowsafe/audit-export';
-import { deploymentIdentityHeaders } from '@proofoftech/flowsafe/do-runner';
+import { deploymentIdentityHeaders } from '@proofoftech/flowsafe/deployment-identity-protocol';
 import { z } from 'zod';
 
 import {
@@ -158,15 +157,7 @@ async function connectorEgress(
   url: string,
 ): Promise<Response> {
   const probe = createEgressProbeConnector(new URL(url).hostname);
-  if (!probe.execute) throw new Error('egress probe has no execute');
-  // Only Mastra constructs a real ToolExecutionContext, and this connector's
-  // execute reads nothing from it — the egress guard comes from the manifest.
-  // The cast is how every in-repo caller invokes a connector outside an agent
-  // loop; DEFERRED item 36 is the breakwater helper that should own it.
-  const { upstreamStatus } = (await probe.execute(
-    { url },
-    {} as unknown as ToolExecutionContext,
-  )) as { upstreamStatus: number };
+  const { upstreamStatus } = await invokeConnector(probe, { url });
   return contractResponse(
     action,
     action === 'connector-egress-allowed'

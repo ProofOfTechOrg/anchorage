@@ -160,6 +160,7 @@ See [Durable agents](durable-agents.md).
 These are supported opt-in host domains.
 
 - Signals deliver messages, queues, named signals, state, and notifications through the owned thread Durable Object.
+- An optional structural signal-content policy checks Mastra's canonical XML at that common Durable Object boundary. Denial is terminal for schedules and notifications; evaluator failure stays recoverable on every lane, including the provider lanes, where an undecided webhook is answered with 503 so the sender redelivers under a per-subscription dedupe key.
 - Goals store Mastra-compatible objectives in the thread-state domain.
 - Schedules store workflow or agent targets, claim due fires with CAS, and start them through the correct runtime topology.
 - Background tasks persist serialized workflow/task state and execute through one deployment manager Durable Object.

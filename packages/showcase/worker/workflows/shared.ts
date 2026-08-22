@@ -6,12 +6,13 @@
 // relies on.
 
 import { RequestContext } from '@mastra/core/request-context';
-import type { ToolExecutionContext } from '@mastra/core/tools';
-import type {
-  AtomicIdempotencyStore,
-  AuditLogger,
-  InspectableIdempotencyStore,
-  RateLimitStore,
+import {
+  type AtomicIdempotencyStore,
+  type AuditLogger,
+  type Connector,
+  type InspectableIdempotencyStore,
+  invokeConnector,
+  type RateLimitStore,
 } from '@proofoftech/breakwater';
 import type {
   ArtifactBucket,
@@ -159,15 +160,6 @@ function contextWith(
 }
 
 /**
- * A createConnector() result narrowed to the one method a step invokes. The
- * Tool's `execute` returns `Promise<void | ValidationError | Out>`, so this stays
- * loose (`Promise<unknown>`) and callConnector casts the validated result.
- */
-export interface ConnectorLike<In> {
-  execute?: (input: In, context: ToolExecutionContext) => Promise<unknown>;
-}
-
-/**
  * Invoke a connector from a workflow step: forward the runtime-supplied
  * requestContext (carrying the minted grant) and, optionally, inject per-call
  * context keys (dry-run, idempotency) onto a non-mutating clone. Never sets the
@@ -175,17 +167,14 @@ export interface ConnectorLike<In> {
  * forged resume reaches here with no grant and the wrapper throws (fail closed).
  */
 export async function callConnector<In, Out>(
-  connector: ConnectorLike<In>,
+  connector: Connector<In, Out>,
   input: In,
-  requestContext: unknown,
+  requestContext: RequestContext,
   extraKeys?: Record<string, unknown>,
 ): Promise<Out> {
-  if (!connector.execute) throw new Error('connector has no execute');
   const context =
     extraKeys !== undefined
       ? contextWith(requestContext, extraKeys)
       : requestContext;
-  return (await connector.execute(input, {
-    requestContext: context,
-  } as unknown as ToolExecutionContext)) as Out;
+  return invokeConnector(connector, input, { requestContext: context });
 }

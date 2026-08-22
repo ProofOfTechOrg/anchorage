@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -37,6 +38,13 @@ try {
   mkdirSync(extracted);
   mkdirSync(consumer);
 
+  const staleBuildArtifact = join(
+    packageRoot,
+    'dist',
+    'stale-package-probe.js',
+  );
+  mkdirSync(dirname(staleBuildArtifact), { recursive: true });
+  writeFileSync(staleBuildArtifact, 'throw new Error("stale build output");\n');
   run('pnpm', ['run', 'build']);
   run('pnpm', ['pack', '--pack-destination', packed]);
   run(
@@ -70,17 +78,48 @@ try {
   run('tar', ['-xzf', archive, '-C', extracted]);
 
   const packageDirectory = join(extracted, 'package');
+  assert.equal(
+    existsSync(join(packageDirectory, 'dist', 'stale-package-probe.js')),
+    false,
+  );
   const manifest = JSON.parse(
     readFileSync(join(packageDirectory, 'package.json'), 'utf8'),
   );
   // Compared against the SOURCE manifest, not a copy of its value: this script
   // is a CI-only step, so a hardcoded range silently goes stale the moment the
-  // peer floor moves and only fails after the change is pushed.
+  // peer floor moves and only fails after the change is pushed. The regex
+  // beside each equality is not redundant with it: equality catches a pack-time
+  // REWRITE of the value, while the regex enforces the exact-pin POLICY, which
+  // two equal-but-both-wrong values would satisfy.
   const sourceManifest = JSON.parse(
     readFileSync(join(packageRoot, 'package.json'), 'utf8'),
   );
-  assert.equal(manifest.dependencies['@mastra/cloudflare-d1'], '1.1.1');
-  assert.equal(manifest.peerDependencies['@mastra/core'], '1.50.0');
+  const corePeer = sourceManifest.peerDependencies['@mastra/core'];
+  const d1Pin = sourceManifest.dependencies['@mastra/cloudflare-d1'];
+  assert.equal(manifest.dependencies['@mastra/cloudflare-d1'], d1Pin);
+  assert.match(
+    manifest.dependencies['@mastra/cloudflare-d1'],
+    /^\d+\.\d+\.\d+$/,
+    'the packed @mastra/cloudflare-d1 dep must stay an exact version',
+  );
+  assert.equal(manifest.peerDependencies['@mastra/core'], corePeer);
+  assert.match(
+    manifest.peerDependencies['@mastra/core'],
+    /^\d+\.\d+\.\d+$/,
+    'the packed @mastra/core peer must stay an exact version',
+  );
+  const siblingManifest = JSON.parse(
+    readFileSync(
+      join(repositoryRoot, 'packages', 'breakwater', 'package.json'),
+      'utf8',
+    ),
+  );
+  // Both libraries run in one host, so a split Mastra pin is unsupported.
+  assert.equal(
+    corePeer,
+    siblingManifest.peerDependencies['@mastra/core'],
+    'breakwater and flowsafe must pin the same @mastra/core peer',
+  );
   assert.equal(manifest.dependencies.jose, sourceManifest.dependencies.jose);
   assert.equal(
     manifest.peerDependencies['@proofoftech/breakwater'],
@@ -104,7 +143,7 @@ try {
         packageManager: rootManifest.packageManager,
         engines: rootManifest.engines,
         dependencies: {
-          '@mastra/core': '1.50.0',
+          '@mastra/core': corePeer,
           '@proofoftech/breakwater': `file:${breakwaterArchive}`,
           '@proofoftech/flowsafe': `file:${archive}`,
         },
@@ -148,8 +187,8 @@ try {
       'utf8',
     ),
   );
-  assert.equal(installedAdapterManifest.version, '1.1.1');
-  assert.equal(installedCoreManifest.version, '1.50.0');
+  assert.equal(installedAdapterManifest.version, d1Pin);
+  assert.equal(installedCoreManifest.version, corePeer);
 
   writeFileSync(
     join(consumer, 'consumer.ts'),
@@ -353,7 +392,9 @@ export default {
     ],
     consumer,
   );
-  console.log('packed agent-host clean core-1.50.0 import and bundle passed');
+  console.log(
+    `packed agent-host clean core-${corePeer} import and bundle passed`,
+  );
 } finally {
   rmSync(temporary, { recursive: true, force: true });
 }

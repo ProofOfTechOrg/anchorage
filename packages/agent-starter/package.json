@@ -1,6 +1,6 @@
 {
   "name": "anchorage-agent-starter",
-  "version": "0.0.14",
+  "version": "0.0.15",
   "private": true,
   "description": "Production-shaped Cloudflare Workers starter for durable, approval-gated Anchorage agents",
   "type": "module",
@@ -19,7 +19,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@mastra/core": "^1.50.0",
+    "@mastra/core": "1.53.0",
     "@proofoftech/breakwater": "workspace:*",
     "@proofoftech/flowsafe": "workspace:*",
     "zod": "^4.4.3"
@@ -31,7 +31,7 @@
     "wrangler": "^4.107.0"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13.0"
   },
   "license": "Apache-2.0"
 }

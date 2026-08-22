@@ -513,7 +513,7 @@ class GuardedAgent<
     });
     if (policy.objectOnlyPolicyNames.length > 0) {
       throw new TypeError(
-        `createGuardedAgent: object-only polic${policy.objectOnlyPolicyNames.length === 1 ? 'y' : 'ies'} [${policy.objectOnlyPolicyNames.join(', ')}] cannot be enforced because guarded structured output is unavailable under tested @mastra/core 1.50.0; include 'answer' in each affected policy's channels`,
+        `createGuardedAgent: object-only polic${policy.objectOnlyPolicyNames.length === 1 ? 'y' : 'ies'} [${policy.objectOnlyPolicyNames.join(', ')}] cannot be enforced because guarded structured output is unavailable under the tested @mastra/core peer; include 'answer' in each affected policy's channels`,
       );
     }
     const rbac = new RBACMiddleware({

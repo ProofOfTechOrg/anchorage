@@ -634,6 +634,70 @@ function checkManifestClaims(root, manifests) {
   return errors;
 }
 
+/**
+ * Walk packages itself because loadPackageManifests intentionally skips private
+ * packages for four other checks, while this agreement includes the private
+ * showcase and agent-starter manifests. The signature therefore takes root
+ * alone rather than a prefiltered manifest map.
+ */
+function checkMastraCoreAgreement(root) {
+  const errors = [];
+  const packagesRoot = resolve(root, 'packages');
+  if (!existsSync(packagesRoot)) return errors;
+
+  let expected;
+  for (const entry of readdirSync(packagesRoot, {
+    withFileTypes: true,
+  }).sort((left, right) => left.name.localeCompare(right.name))) {
+    if (!entry.isDirectory()) continue;
+    const manifestPath = join(packagesRoot, entry.name, 'package.json');
+    if (!existsSync(manifestPath)) continue;
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    const peer = manifest.peerDependencies?.['@mastra/core'];
+    const dev = manifest.devDependencies?.['@mastra/core'];
+
+    const parityFailed = typeof peer === 'string' && dev !== peer;
+    if (parityFailed) {
+      errors.push(
+        diagnostic(
+          root,
+          manifestPath,
+          1,
+          `devDependency @mastra/core ${dev ?? 'missing'} does not equal peer ${peer}`,
+        ),
+      );
+    }
+
+    const declarations = [
+      peer,
+      parityFailed ? undefined : dev,
+      manifest.dependencies?.['@mastra/core'],
+    ].filter((value) => typeof value === 'string');
+    for (const declaration of declarations) {
+      if (expected === undefined) {
+        expected = {
+          value: declaration,
+          file: toPosix(relative(root, manifestPath)),
+        };
+        continue;
+      }
+      if (declaration !== expected.value) {
+        errors.push(
+          diagnostic(
+            root,
+            manifestPath,
+            1,
+            `@mastra/core ${declaration} differs from ${expected.value} in ${expected.file}`,
+          ),
+        );
+        break;
+      }
+    }
+  }
+
+  return errors;
+}
+
 function sourcePathForExport(packageRoot, exportedValue) {
   const targets = exportedStrings(exportedValue);
   const target =
@@ -783,6 +847,7 @@ export function checkRepository({
     ...checkCanonicalUrls(root),
     ...(packageChecks ? checkReadmeExportCoverage(root, manifests) : []),
     ...(packageChecks ? checkManifestClaims(root, manifests) : []),
+    ...(packageChecks ? checkMastraCoreAgreement(root) : []),
     ...(packageChecks ? checkTypeDocCoverage(root, manifests) : []),
     ...(orphanChecks ? checkOrphanedGuides(root, markdownFiles) : []),
   ];

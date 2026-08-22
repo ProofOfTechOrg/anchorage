@@ -53,6 +53,7 @@ export {
   migrateFleet,
   rollbackExternalRelease,
 } from './fleet.js';
+export type { HostRoutingTarget } from './host-routing.js';
 export {
   type PlatformPlaneClient,
   type PlatformPlaneResult,
@@ -144,7 +145,6 @@ export {
   validateDeploymentSecrets,
   validateDeploymentSpec,
 } from './validation.js';
-export type { HostRoutingTarget } from './workers/host-routing.js';
 export {
   deriveStateEgressCredential,
   externalReleaseScriptName,

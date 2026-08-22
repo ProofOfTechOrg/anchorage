@@ -48,6 +48,16 @@ try {
   await mkdir(extractedDirectory);
   await mkdir(consumerDirectory);
 
+  const staleBuildArtifact = join(
+    packageRoot,
+    'dist',
+    'stale-package-probe.js',
+  );
+  await mkdir(dirname(staleBuildArtifact), { recursive: true });
+  await writeFile(
+    staleBuildArtifact,
+    'throw new Error("stale build output");\n',
+  );
   run('pnpm', ['run', 'build']);
   run('pnpm', ['pack', '--pack-destination', packedDirectory]);
 
@@ -79,6 +89,10 @@ try {
   run('tar', ['-xzf', tarball, '-C', extractedDirectory]);
 
   const packedPackageRoot = join(extractedDirectory, 'package');
+  await assert.rejects(
+    readFile(join(packedPackageRoot, 'dist', 'stale-package-probe.js')),
+    { code: 'ENOENT' },
+  );
   const manifest = JSON.parse(
     await readFile(join(packedPackageRoot, 'package.json'), 'utf8'),
   );

@@ -11,6 +11,7 @@ import {
   isDeploymentTenantTag,
   isSha256,
 } from './deployment-context.js';
+import type { HostRoutingTarget } from './host-routing.js';
 import { d1MigrationHistoryDigest } from './migration-ledger.js';
 import {
   assertExternalPlatformTargetCompatibility,
@@ -38,7 +39,6 @@ import type {
   FleetStateLease,
   FleetStateStore,
 } from './types.js';
-import type { HostRoutingTarget } from './workers/host-routing.js';
 
 export const BACKEND_SWITCH_SUBPHASES = [
   'planned',

@@ -36,8 +36,9 @@
 // render test (thread-do-routes.test.ts), which fails flowsafe CI if core stops
 // escaping. The ROUTE adds its own line but does NOT re-escape the contents: the
 // thread routes validate `tagName` as an XML name at ingest, and this gate
-// allowlists attribute KEYS and size-caps the payload. A full content-level input
-// policy engine is deferred (design it once, after the surfaces exist).
+// allowlists attribute KEYS and size-caps the payload. Optional content policy
+// runs later at the common thread-DO boundary over core's canonical escaped XML,
+// where provider, schedule, notification, and direct delivery all converge.
 //
 // sendToolApproval is deliberately NOT an ingress here (P8): the dashboard stays
 // the sole approval decision path; this router never mints capability.

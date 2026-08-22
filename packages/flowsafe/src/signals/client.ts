@@ -10,18 +10,12 @@
 // every call crosses the P6 ingestion gate (auth → role → registry-backed thread
 // ownership → allowlist/size/rate → audit) before it reaches a thread DO.
 //
-// SUBSCRIBE / hub bridge (DL-016 — CORRECTED): a thread's live chunks are a
-// per-END-USER stream (one conversation's tokens), NOT deployment-wide fan-out.
-// Forwarding subscribeToThread chunks onto the deployment hub and filtering
-// client-side by threadId would put one end-user's thread bytes on every
-// connected operator's socket (and waste fan-out). Phase-2 live subscribe must
-// therefore be scoped server-side per
-// thread / per resourceId: a thread-addressed channel (a per-thread WS on the
-// thread DO, or a hub subscription filtered by threadId before emit), never
-// client-side filtering of a deployment firehose. It is
-// deferred to phase 2 and shares Track A's real-loop boundary (a loop must be
-// producing chunks to forward). Nothing here mints capability — sendToolApproval
-// is not an approval surface (P8).
+// SignalClient remains send-only. Supported live agent output uses the
+// authenticated agent-host route for one exact thread and run. The router
+// authorizes both resources before its topology addresses the thread DO, so no
+// deployment hub or browser-side filtering sees another principal's chunks.
+// A future generic signal subscription must preserve that server-side scope.
+// Nothing here mints capability: sendToolApproval is not an approval surface.
 
 export interface SignalResponseLike {
   ok: boolean;
@@ -116,12 +110,15 @@ export class SignalClient {
     this.#headers = { ...options.headers };
   }
 
-  /** An immediate user message — joins the active loop, or (idle) wakes/persists. */
+  /**
+   * An immediate user message — joins the active loop, or (idle) wakes or
+   * persists; a persist no agent memory can hold answers `memory-unavailable`.
+   */
   async sendMessage(threadId: string, body: SendMessageBody): Promise<unknown> {
     return this.#post(threadId, 'message', body);
   }
 
-  /** A message delivered on the NEXT turn (never wakes an idle thread). */
+  /** A message persisted for the next host-started turn. */
   async queueMessage(
     threadId: string,
     body: SendMessageBody,
@@ -129,12 +126,20 @@ export class SignalClient {
     return this.#post(threadId, 'queue', body);
   }
 
-  /** A system signal (ifActive/ifIdle deliver/persist/discard/wake). */
+  /**
+   * A system signal (ifActive/ifIdle deliver/persist/discard/wake); a persist
+   * no agent memory can hold answers `memory-unavailable`.
+   */
   async sendSignal(threadId: string, body: SendSignalBody): Promise<unknown> {
     return this.#post(threadId, 'signal', body);
   }
 
-  /** A durable thread-state lane (snapshot/delta, cacheKey dedupe). */
+  /**
+   * A durable thread-state lane (snapshot/delta, cacheKey dedupe). Owner gates
+   * can return `principal-mismatch` or `persistence-forbidden`, missing memory
+   * returns `memory-unavailable`, and an unbranded agent marks successful
+   * non-skipped responses as `degraded: 'not-runtime-driven'`.
+   */
   async sendStateSignal(
     threadId: string,
     body: SendStateBody,
@@ -142,7 +147,10 @@ export class SignalClient {
     return this.#post(threadId, 'state', body);
   }
 
-  /** A durable AGENT inbox notification (surfaces on the next turn). */
+  /**
+   * A durable AGENT inbox notification. Owners best-effort persist it for the
+   * next host-started turn; non-owners record it for the host dispatch tick.
+   */
   async sendNotificationSignal(
     threadId: string,
     body: SendNotificationBody,

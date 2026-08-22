@@ -20,6 +20,8 @@ import type {
 } from './backend-switch.js';
 import { finalizedBridgeForRecord } from './backend-switch.js';
 import { workerMigrations } from './cloudflare-client.js';
+import type { HostRoutingTarget } from './host-routing.js';
+import { parseHostRoutingTarget } from './host-routing.js';
 import { d1MigrationHistoryDigest } from './migration-ledger.js';
 import {
   canonicalDeploymentEgressPolicy,
@@ -49,8 +51,6 @@ import type {
   TrustedWorkerArtifact,
   WorkerZoneRoute,
 } from './types.js';
-import type { HostRoutingTarget } from './workers/host-routing.js';
-import { parseHostRoutingTarget } from './workers/host-routing.js';
 import {
   deriveStateEgressCredential,
   type WorkersForPlatformsApi,

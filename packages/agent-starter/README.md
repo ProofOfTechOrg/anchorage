@@ -78,7 +78,7 @@ Do not expose provisioning as a public route. Do not share or reuse this resourc
 
 Requirements:
 
-- Node.js 22 or newer;
+- Node.js 22.13.0 or newer;
 - pnpm;
 - a Cloudflare account with Workers, Durable Objects, and D1;
 - a Mastra model provider for live runs.

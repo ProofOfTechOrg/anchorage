@@ -4,11 +4,9 @@ This guide takes a Mastra application from package installation to one guarded c
 
 ## Prerequisites
 
-- Node.js 22.3 or later for Breakwater's built-in Agent CLI executor; the
-  complete repository and private fleet-control package require Node.js 22.22.0
-  or later
+- Node.js 22.13.0 or later for Breakwater and Flowsafe; the complete repository and private Fleet Control package require Node.js 22.22.0 or later
 - An ESM TypeScript project using `moduleResolution: "NodeNext"`, `"Node16"`, or `"Bundler"`
-- `@mastra/core` `1.50.0`
+- `@mastra/core` `1.53.0`
 - A Cloudflare account, D1 database, and Durable Objects only when deploying flowsafe
 
 React is not required by flowsafe unless you import `@proofoftech/flowsafe/approval-ui`.
@@ -16,7 +14,7 @@ React is not required by flowsafe unless you import `@proofoftech/flowsafe/appro
 ## Install breakwater
 
 ```bash
-npm install @mastra/core@1.50.0 @proofoftech/breakwater
+npm install @mastra/core@1.53.0 @proofoftech/breakwater
 ```
 
 ### Add agent-boundary policy

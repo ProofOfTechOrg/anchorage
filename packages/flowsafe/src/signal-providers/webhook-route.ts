@@ -52,7 +52,12 @@ import {
   nonnegativeSafeInteger,
   positiveSafeInteger,
 } from '../numeric-config.js';
-import { deliverNotification } from './delivery.js';
+import {
+  classifyDeliveryError,
+  classifyDeliveryResponse,
+  deliverNotification,
+  isTerminalDelivery,
+} from './delivery.js';
 import type { ReconcileSignalProviderPolling } from './host-topology.js';
 import { PROVIDER_ID_PATTERN, type SignalProviderAdapter } from './provider.js';
 import type {
@@ -78,6 +83,12 @@ export interface WebhookAuditEvent {
   matched?: number;
   /** Rows actually delivered (accepted path). */
   delivered?: number;
+  /** Rows the thread Durable Object refused on content (accepted path). */
+  denied?: number;
+  /** Rows a defect made undeliverable — a provider or stored-row bug (accepted path). */
+  failed?: number;
+  /** Rows the deployment could not decide, awaiting redelivery (accepted path). */
+  deferred?: number;
   /** Raw body size in bytes the size cap measured. */
   contentBytes: number;
   timestamp: string;
@@ -148,6 +159,39 @@ export interface WebhookRouterOptions {
 }
 
 export type WebhookRouter = (request: Request) => Promise<Response | null>;
+
+/**
+ * A digest of the raw bytes the signature already covered — the stable half of
+ * a per-delivery dedupe key, computed once per webhook.
+ */
+async function webhookEventDigest(rawBody: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', rawBody);
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('')
+    .slice(0, 32);
+}
+
+/**
+ * A stable identity for ONE event delivered to ONE subscription, so a
+ * redelivery — ours, by answering a retryable failure with a 5xx, or the
+ * provider's own at-least-once retry — coalesces into the still-pending row
+ * instead of showing the agent the same event twice. It needs no provider
+ * cooperation; a provider that supplies its own `dedupeKey` keeps it.
+ *
+ * The SUBSCRIPTION id is part of the key, not just the event: two subscriptions
+ * for different external resources may legitimately name the same thread and
+ * resource, and coalescing matches on (thread, source, kind, agent, resource,
+ * dedupeKey). A key derived from the event alone would collapse those two
+ * intended notifications into one.
+ */
+function webhookDeliveryDedupeKey(
+  providerId: string,
+  subscriptionId: string,
+  eventDigest: string,
+): string {
+  return `${providerId}:${subscriptionId}:${eventDigest}`;
+}
 
 function json(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
@@ -320,41 +364,72 @@ export function createWebhookRouter(
         matched.length === 0 || !rateLimit
           ? true
           : await Promise.resolve(rateLimit(providerId));
+      // Each matched row ends in exactly one of three states, because only one
+      // of them may make the whole webhook retryable:
+      //   delivered — landed in the thread inbox;
+      //   terminal  — a content denial or a provider/address defect, where
+      //               redelivering the identical bytes can only repeat it;
+      //   deferred  — the deployment could not decide (policy evaluator down,
+      //               storage down, the Durable Object failing), which MUST NOT
+      //               be silently dropped.
       let delivered = 0;
+      let denied = 0;
+      let failed = 0;
+      let deferred = 0;
+      const eventDigest = await webhookEventDigest(rawBody);
       for (const row of matched) {
         if (!deliveryAllowed) continue;
-        // buildNotification from the AUTHENTIC payload + the row; deliver through
-        // the topology, which rejects a malformed thread address before
-        // resolution. Catch notification construction and delivery together so
-        // a provider bug on one row cannot turn earlier applied deliveries into
-        // a retryable whole-webhook failure.
+        // buildNotification runs in its own try: a provider bug is a permanent
+        // defect in code, not a transient condition, so it must not turn
+        // earlier applied deliveries into a retryable whole-webhook failure.
+        let built: SendNotificationSignalInput;
         try {
-          const notification: SendNotificationSignalInput =
-            provider.buildNotification(payload, row);
-          const response = await deliverNotification(
-            topology,
-            row,
-            notification,
-          );
-          if (response.ok) {
-            delivered += 1;
-          } else {
-            // A matched, authentic delivery the thread DO REJECTED for content (a
-            // 5xx/4xx from the thread DO): log
-            // it so it is not silently folded into delivered < matched with no trail.
-            console.error(
-              JSON.stringify({
-                type: 'signal-provider.webhook-delivery-rejected',
-                providerId,
-                status: response.status,
-              }),
-            );
-          }
+          built = provider.buildNotification(payload, row);
         } catch (error) {
+          failed += 1;
           console.error(
             JSON.stringify({
               type: 'signal-provider.webhook-delivery-error',
               providerId,
+              terminal: true,
+              reason: error instanceof Error ? error.message : String(error),
+            }),
+          );
+          continue;
+        }
+        try {
+          const response = await deliverNotification(topology, row, {
+            ...built,
+            dedupeKey:
+              built.dedupeKey ??
+              webhookDeliveryDedupeKey(providerId, row.id, eventDigest),
+          });
+          const outcome = classifyDeliveryResponse(response.status);
+          if (outcome === 'delivered') {
+            delivered += 1;
+            continue;
+          }
+          if (outcome === 'denied') denied += 1;
+          else if (outcome === 'failed') failed += 1;
+          else deferred += 1;
+          console.error(
+            JSON.stringify({
+              type: 'signal-provider.webhook-delivery-rejected',
+              providerId,
+              status: response.status,
+              terminal: isTerminalDelivery(outcome),
+            }),
+          );
+        } catch (error) {
+          const outcome = classifyDeliveryError(error);
+          if (outcome === 'denied') denied += 1;
+          else if (outcome === 'failed') failed += 1;
+          else deferred += 1;
+          console.error(
+            JSON.stringify({
+              type: 'signal-provider.webhook-delivery-error',
+              providerId,
+              terminal: isTerminalDelivery(outcome),
               reason: error instanceof Error ? error.message : String(error),
             }),
           );
@@ -367,7 +442,14 @@ export function createWebhookRouter(
           outcome: 'accepted',
           matched: matched.length,
           delivered,
-          ...(!deliveryAllowed ? { reason: 'rate-limited' } : {}),
+          ...(denied > 0 ? { denied } : {}),
+          ...(failed > 0 ? { failed } : {}),
+          ...(deferred > 0 ? { deferred } : {}),
+          ...(!deliveryAllowed
+            ? { reason: 'rate-limited' }
+            : deferred > 0
+              ? { reason: 'delivery-deferred' }
+              : {}),
           contentBytes: rawBody.length,
         });
       } catch (error) {
@@ -379,7 +461,25 @@ export function createWebhookRouter(
           }),
         );
       }
-      return json({ matched: matched.length, delivered });
+      // A deferred row answers the sender with a 5xx so its own at-least-once
+      // redelivery is what recovers the notification; this deployment has
+      // nowhere durable to park an unvetted provider payload, and losing an
+      // authentic event is worse than seeing it twice. The per-delivery dedupe
+      // key collapses a redelivery into any row from this attempt that is still
+      // PENDING; a row core already delivered (urgent, or high/medium into an
+      // idle thread) no longer coalesces, so the agent can see that one twice.
+      // Webhook delivery is at-least-once either way — the provider retries on
+      // its own schedule regardless of what this route returns.
+      return json(
+        {
+          matched: matched.length,
+          delivered,
+          ...(denied > 0 ? { denied } : {}),
+          ...(failed > 0 ? { failed } : {}),
+          ...(deferred > 0 ? { deferred } : {}),
+        },
+        deferred > 0 ? 503 : 200,
+      );
     } catch (error) {
       console.error(
         JSON.stringify({

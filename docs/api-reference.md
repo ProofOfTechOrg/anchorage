@@ -10,10 +10,10 @@ Use public package exports only. Paths under `src/` and generated `dist/` files 
 | --- | --- |
 | `@proofoftech/breakwater` | Convenience barrel for guarded agents, policy engine, RBAC, audit, connector SDK, and agent CLI adapters |
 | `@proofoftech/breakwater/agent` | `createGuardedAgent`, its narrow invocation handle, validated application processor contracts, and guarded-handle validation |
-| `@proofoftech/breakwater/policy-engine` | `PolicyEngine`, content inspection, output channels, hold-back, and tool evaluators |
+| `@proofoftech/breakwater/policy-engine` | `PolicyEngine`, reusable opaque content gate, content inspection, output channels, hold-back, and tool evaluators |
 | `@proofoftech/breakwater/rbac` | Actor roles, request-context lookup, `RBACMiddleware`, and the permission identifier/projection contract |
 | `@proofoftech/breakwater/audit` | `AuditLogger`, metrics adapter, sink fan-out, and audit types |
-| `@proofoftech/breakwater/connector-sdk` | `createConnector`, manifests, context keys, guarded fetch, D1/in-memory idempotency and rate-limit stores |
+| `@proofoftech/breakwater/connector-sdk` | `createConnector`, `invokeConnector`, redacted validation errors, manifests, context keys, guarded fetch, D1/in-memory idempotency and rate-limit stores |
 | `@proofoftech/breakwater/agent-cli` | Generic, Claude Code, and Codex CLI connectors plus injected execution types |
 
 The root barrel re-exports every supported breakwater module. Prefer the
@@ -49,7 +49,7 @@ New host-side and React features remain subpath-only so importing the root does 
 | `@proofoftech/flowsafe/host-kit/module` | Workflow-module interface for import-safe host registration |
 | `@proofoftech/flowsafe/schedules` | D1 schedule domain, deployment router, reserved-context guard, and CAS tick |
 | `@proofoftech/flowsafe/signal-providers` | Provider adapters, host Durable Object, topology, subscriptions, verified webhooks, and GitHub provider |
-| `@proofoftech/flowsafe/signals` | D1 signal domains, thread routes, ingress router, notification dispatch, and client |
+| `@proofoftech/flowsafe/signals` | D1 signal domains, thread routes, canonical content-policy seam, ingress router, notification dispatch, and client |
 | `@proofoftech/flowsafe/signals/client` | DOM-free `SignalClient` without host-side signal code |
 
 ## Browser and server boundaries

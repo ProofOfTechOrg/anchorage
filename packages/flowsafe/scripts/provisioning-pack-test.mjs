@@ -159,6 +159,9 @@ writeFileSync(new URL('./install-script-ran', import.meta.url), 'unexpected');
       engines: { node: '>=22.22.0', pnpm: '>=10.16.0' },
       scripts: { postinstall: 'node postinstall.mjs' },
       dependencies: {
+        '@mastra/core': `link:${realpathSync(
+          join(root, 'node_modules', '@mastra', 'core'),
+        )}`,
         '@proofoftech/flowsafe': `file:../${packedName}`,
         wrangler: 'file:./fake-wrangler',
       },
@@ -207,6 +210,71 @@ writeFileSync(new URL('./install-script-ran', import.meta.url), 'unexpected');
     throw new Error('packed consumer install executed a lifecycle script');
   }
 
+  writeFileSync(
+    join(consumerRoot, 'protocol-runtime.mjs'),
+    `import assert from 'node:assert/strict';
+import {
+  DEPLOYMENT_IDENTITY_HEADER,
+  deploymentIdentityHeaders,
+} from '@proofoftech/flowsafe/deployment-identity-protocol';
+
+const secret = 'x'.repeat(32);
+assert.deepEqual(
+  deploymentIdentityHeaders(secret, {
+    'content-type': 'application/json',
+    'X-Flowsafe-Deployment-Identity': 'forged',
+  }),
+  {
+    'content-type': 'application/json',
+    [DEPLOYMENT_IDENTITY_HEADER]: secret,
+  },
+);
+`,
+  );
+  writeFileSync(
+    join(consumerRoot, 'protocol-consumer.ts'),
+    `import {
+  DEPLOYMENT_IDENTITY_HEADER,
+  deploymentIdentityHeaders,
+} from '@proofoftech/flowsafe/deployment-identity-protocol';
+import {
+  DEPLOYMENT_IDENTITY_HEADER as LEGACY_DEPLOYMENT_IDENTITY_HEADER,
+  deploymentIdentityHeaders as legacyDeploymentIdentityHeaders,
+} from '@proofoftech/flowsafe/do-runner';
+
+const secret = 'x'.repeat(32);
+const headers: Record<string, string> = deploymentIdentityHeaders(secret);
+const legacyHeaders: Record<string, string> =
+  legacyDeploymentIdentityHeaders(secret);
+const header: typeof DEPLOYMENT_IDENTITY_HEADER =
+  LEGACY_DEPLOYMENT_IDENTITY_HEADER;
+void headers;
+void legacyHeaders;
+void header;
+`,
+  );
+  writeFileSync(
+    join(consumerRoot, 'tsconfig.json'),
+    JSON.stringify({
+      compilerOptions: {
+        target: 'ES2022',
+        module: 'NodeNext',
+        moduleResolution: 'NodeNext',
+        strict: true,
+        noEmit: true,
+        skipLibCheck: true,
+        types: [],
+      },
+      include: ['protocol-consumer.ts'],
+    }),
+  );
+  run(process.execPath, ['protocol-runtime.mjs'], consumerRoot);
+  run(
+    join(root, 'node_modules', '.bin', 'tsc'),
+    ['-p', 'tsconfig.json'],
+    consumerRoot,
+  );
+
   const packageRoot = join(
     consumerRoot,
     'node_modules',
@@ -246,7 +314,9 @@ writeFileSync(new URL('./install-script-ran', import.meta.url), 'unexpected');
   );
   if (
     !protocolSource.includes('provisionDeploymentIdentityProtocol') ||
-    !protocolDeclaration.includes('DeploymentIdentityProtocolExecutor')
+    !protocolSource.includes('deploymentIdentityHeaders') ||
+    !protocolDeclaration.includes('DeploymentIdentityProtocolExecutor') ||
+    !protocolDeclaration.includes('deploymentIdentityHeaders')
   ) {
     throw new Error(
       'packed package is missing the deployment identity protocol implementation or declaration',
@@ -260,6 +330,27 @@ writeFileSync(new URL('./install-script-ran', import.meta.url), 'unexpected');
   if (runtimeIdentity.DEPLOYMENT_TAG_PATTERN.source !== '^[a-z0-9]{3,32}$') {
     throw new Error(
       'packed runtime could not resolve the shared deployment identity protocol',
+    );
+  }
+  const protocolIdentity = await import(
+    pathToFileURL(join(packageRoot, 'dist', 'deployment-identity-protocol.js'))
+      .href
+  );
+  const deploymentSecret = 'x'.repeat(32);
+  const identityHeaders = protocolIdentity.deploymentIdentityHeaders(
+    deploymentSecret,
+    {
+      'content-type': 'application/json',
+      [protocolIdentity.DEPLOYMENT_IDENTITY_HEADER]: 'forged',
+    },
+  );
+  if (
+    identityHeaders['content-type'] !== 'application/json' ||
+    identityHeaders[protocolIdentity.DEPLOYMENT_IDENTITY_HEADER] !==
+      deploymentSecret
+  ) {
+    throw new Error(
+      'packed deployment identity protocol did not stamp the internal credential',
     );
   }
 

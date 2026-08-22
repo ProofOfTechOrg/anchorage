@@ -10,6 +10,7 @@ import {
   type DeploymentIdentityDatabase,
   DeploymentIdentityError,
   type DeploymentIdentityStatement,
+  deploymentIdentityHeaders,
   ensureDeploymentIdentity,
   ensureDeploymentIdentityBindings,
   readDeploymentIdentity,
@@ -88,6 +89,35 @@ describe('deployment identity provisioning', () => {
     expect(() => assertDeploymentIdentitySecret(secret)).toThrow(
       /visible ASCII/,
     );
+  });
+
+  it('overwrites every HeadersInit form without mutating the input', () => {
+    const inputs: HeadersInit[] = [
+      {
+        'Content-Type': 'application/json',
+        'X-Flowsafe-Deployment-Identity': 'forged',
+      },
+      [
+        ['Content-Type', 'application/json'],
+        ['X-FLOWSAFE-DEPLOYMENT-IDENTITY', 'forged'],
+      ],
+      new Headers({
+        'content-type': 'application/json',
+        'x-flowsafe-deployment-identity': 'forged',
+      }),
+    ];
+
+    for (const initial of inputs) {
+      expect(
+        deploymentIdentityHeaders(DEPLOYMENT_IDENTITY_SECRET, initial),
+      ).toEqual({
+        'content-type': 'application/json',
+        [DEPLOYMENT_IDENTITY_HEADER]: DEPLOYMENT_IDENTITY_SECRET,
+      });
+      expect(new Headers(initial).get(DEPLOYMENT_IDENTITY_HEADER)).toBe(
+        'forged',
+      );
+    }
   });
 
   it('seeds once, tolerates concurrent retries, and refuses re-homing', async () => {

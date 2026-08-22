@@ -67,8 +67,10 @@ import type {
   ExportedHandler,
   Queue,
 } from '@cloudflare/workers-types';
-import type { ToolExecutionContext } from '@mastra/core/tools';
-import { createConnector } from '@proofoftech/breakwater/connector-sdk';
+import {
+  createConnector,
+  invokeConnector,
+} from '@proofoftech/breakwater/connector-sdk';
 import { approvalGrantProvider } from '@proofoftech/flowsafe/approval-api';
 import {
   DurableObjectRunner,
@@ -252,10 +254,11 @@ function defineWorkflows(env: Env): RunnerRuntime {
       if (!inputData.approved) {
         return { topic: inputData.topic, published: false };
       }
-      if (!publisher.execute) throw new Error('publisher has no execute');
-      const result = (await publisher.execute({ topic: inputData.topic }, {
-        requestContext,
-      } as unknown as ToolExecutionContext)) as { published: boolean };
+      const result = await invokeConnector(
+        publisher,
+        { topic: inputData.topic },
+        { requestContext },
+      );
       return {
         topic: inputData.topic,
         published: result.published,

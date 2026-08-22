@@ -66,6 +66,24 @@ The in-memory stores make this definition runnable in one process. Use the D1
 stores and the physical-deployment preset when replay or budgets must survive
 another isolate or restart.
 
+## Invoke a connector directly
+
+Use `invokeConnector()` from trusted host or workflow code. It supplies Mastra's required execution context without asking you to cast a partial object:
+
+```typescript
+import { invokeConnector } from '@proofoftech/breakwater/connector-sdk';
+
+const contact = await invokeConnector(createContact, input, {
+  requestContext,
+  abortSignal,
+  toolCallId: trustedToolCallId,
+});
+```
+
+Omit `toolCallId` for suspension and run grants. For a tool-call grant, pass the exact runtime-owned ID. Never derive it from client input or store it in a shared `RequestContext`.
+
+The helper accepts only an unmodified `Connector` created by `createConnector()`. It calls the public Mastra execution wrapper, so schema validation and every Breakwater gate remain active. Input or output validation throws `ConnectorValidationError`. The error exposes only `connector` and `phase`; it omits Mastra's raw message, schema issue text, invalid value, and cause.
+
 ## Permission manifest
 
 ```typescript

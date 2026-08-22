@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+
 import { Agent } from '@mastra/core/agent';
 import type { MastraModelConfig } from '@mastra/core/llm';
 import type {
@@ -861,6 +864,7 @@ describe('Mastra Agent execution-entry inventory', () => {
       '__getStaticAgents',
       '__hasSubAgentsConfigured',
       '__listLLMRequestProcessors',
+      '__markStoredVersionApplied',
       '__registerMastra',
       '__registerPrimitives',
       '__resetToOriginalModel',
@@ -934,7 +938,6 @@ describe('Mastra Agent execution-entry inventory', () => {
       'listAgentTools',
       'listAssignedTools',
       'listBrowserTools',
-      'listChannelTools',
       'listClientTools',
       'listConfiguredInputProcessors',
       'listConfiguredOutputProcessors',
@@ -984,6 +987,19 @@ describe('Mastra Agent execution-entry inventory', () => {
       'wrapToolsWithHooks',
       'wrapToolWithHooks',
     ];
+    // Classified above but NOT on Agent.prototype at the pinned 1.53.0, yet
+    // present on newest 1.x. Listed on purpose: the mastra-compat canary job
+    // bumps core to newest 1.x and runs this suite, and these keep it fully
+    // classified there. Drop a name once the pin catches up to it; a name on
+    // NEITHER version is dead and belongs in no list at all.
+    const forwardClassified = [
+      '__markStoredVersionApplied',
+      '__setDeclaredSchedules',
+      'filterUiMessagesByThread',
+      'getDeclaredSchedules',
+      'listActiveThreadRuns',
+      'resolveNotificationDeliveryDecision',
+    ];
     const classified = [
       ...wrapped,
       ...intentionallyUnavailable,
@@ -991,10 +1007,63 @@ describe('Mastra Agent execution-entry inventory', () => {
     ];
 
     expect(new Set(classified).size).toBe(classified.length);
-    const unclassified = Object.getOwnPropertyNames(Agent.prototype).filter(
+    const own = Object.getOwnPropertyNames(Agent.prototype);
+    const unclassified = own.filter(
       (property) => !classified.includes(property),
     );
     expect(unclassified).toEqual([]);
+
+    // No stale entry either: a classified name the installed core no longer
+    // exposes is either forward-classified or dead.
+    const stale = classified.filter(
+      (property) =>
+        !own.includes(property) && !forwardClassified.includes(property),
+    );
+    expect(stale).toEqual([]);
+
+    // And the allowlist cannot drift away from the lists it excuses.
+    expect(
+      forwardClassified.filter((name) => !classified.includes(name)),
+      'every forwardClassified name must also appear in one of the three lists above — it excuses a name from the stale check, it does not classify it',
+    ).toEqual([]);
+
+    // forwardClassified must expire, or it becomes the listChannelTools trap
+    // again: a permanent exemption that hides both a caught-up pin and a name
+    // dead at BOTH versions. Which direction bites depends on which core is
+    // installed, so key on that. On the PINNED run every forward name must
+    // still be absent (present means the pin caught up — drop it); on the
+    // canary run against newest 1.x every one must be present (absent there
+    // too means it exists in neither version and is simply dead).
+    const require_ = createRequire(import.meta.url);
+    const installedCore = (
+      require_('@mastra/core/package.json') as { version: string }
+    ).version;
+    const declaredPeer = (
+      JSON.parse(
+        readFileSync(new URL('../../package.json', import.meta.url), 'utf8'),
+      ) as { peerDependencies: Record<string, string> }
+    ).peerDependencies['@mastra/core'];
+
+    // The comparison below only means "the pinned run" while the peer is an
+    // EXACT version. Against a range, a pinned install would compare unequal,
+    // take the canary branch, and tell the maintainer to delete names that are
+    // still live.
+    expect(
+      declaredPeer,
+      'the forwardClassified self-expiry keys on @mastra/core being an exact peer pin; widen the peer and this check must be redesigned',
+    ).toMatch(/^\d+\.\d+\.\d+$/);
+
+    if (installedCore === declaredPeer) {
+      expect(
+        forwardClassified.filter((name) => own.includes(name)),
+        `the pin caught up to these on @mastra/core ${installedCore} — drop them from forwardClassified so the stale check covers them again`,
+      ).toEqual([]);
+    } else {
+      expect(
+        forwardClassified.filter((name) => !own.includes(name)),
+        `these are absent on @mastra/core ${installedCore} as well as the pinned ${declaredPeer} — they exist in neither version, so delete them from the lists entirely`,
+      ).toEqual([]);
+    }
   });
 });
 

@@ -94,6 +94,14 @@ export interface SignalProviderAdapter {
    * Check external state for a batch of REHYDRATED subscriptions (the host DO
    * passes the D1 rows, not core's in-memory registry) and return the deliveries.
    * The host routes each through the topology. Absent ⇒ webhook-only.
+   *
+   * Delivery is at-least-once and the host does not queue: a delivery the
+   * deployment could not decide is counted `deferred` and dropped unless this
+   * adapter re-reports it on a later poll. Advance whatever cursor drives this
+   * method only for deliveries you have seen accepted, and set a stable
+   * `dedupeKey` on the notification so a re-report coalesces into the pending
+   * row instead of showing the agent the same event twice. The webhook lane
+   * derives that key from the signed bytes; a poll adapter owns its own.
    */
   pollForDeliveries?(
     subscriptions: SignalSubscription[],

@@ -9,7 +9,7 @@ Flowsafe runs Mastra workflows and agents through Cloudflare Durable Objects, st
 ## Install
 
 ```bash
-npm install @mastra/core@1.50.0 @proofoftech/flowsafe
+npm install @mastra/core@1.53.0 @proofoftech/flowsafe
 ```
 
 Install `@proofoftech/breakwater` when resumed steps call approval-protected connectors:
@@ -22,12 +22,12 @@ Install React and React DOM only when you import `@proofoftech/flowsafe/approval
 
 Compatibility:
 
-- Node.js 22 or later (engine range `>=22`)
+- Node.js 22.13.0 or later (engine range `>=22.13.0`)
 - ESM only
 - TypeScript `moduleResolution: "NodeNext"`, `"Node16"`, or `"Bundler"`
-- `@mastra/core` `1.50.0`
+- `@mastra/core` `1.53.0`
 - `react` and `react-dom` `>=18 <20` (React 18 or 19) for the optional approval UI
-- `@proofoftech/breakwater` `>=0.12.0 <1.0.0` when used
+- `@proofoftech/breakwater` `>=0.13.0 <1.0.0` when used
 - host-provided Wrangler `>=4.118 <5` for the optional `flowsafe-provision` CLI
 
 ## Choose an export
@@ -101,7 +101,7 @@ export class AppRunner extends DurableObjectRunner<Env> {
 }
 ```
 
-`init()` creates D1-backed Mastra storage from the conventional `DB` binding unless you inject storage. Workflow definitions use the same `createWorkflow()` and `createStep()` shape as Mastra. Flowsafe pins `@mastra/cloudflare-d1` 1.1.1 so the minimum supported `@mastra/core` 1.50.0 peer can import and bundle without a consumer override.
+`init()` creates D1-backed Mastra storage from the conventional `DB` binding unless you inject storage. Workflow definitions use the same `createWorkflow()` and `createStep()` shape as Mastra. Flowsafe pins `@mastra/cloudflare-d1` 1.1.1 because the shipped D1 storage is written against that release's domain surface: it subclasses the adapter's background-tasks domain to apply the `TaskFilter.resourceId` predicate the adapter declares but omits from its SQL builder, and hand-writes the schedules, notifications, and thread-state domains the adapter does not ship at all. The pin also holds the adapter on its `@cloudflare/workers-types` v4 peer, which is the major Flowsafe and Agent Starter still build against.
 
 If the deployment uses a table prefix, pass one shared constant to storage and host maintenance:
 
@@ -396,6 +396,65 @@ Agent event replay lasts only as long as the configured Mastra cache. The defaul
 ### Signals and notifications
 
 `createThreadSignalRoutes()` hosts message, queue, signal, state, and notification delivery in the thread Durable Object. `createSignalRouter()` is the Worker trust boundary: authenticate, authorize, ownership-check, cap, parse, reject memory ids, allowlist attributes, rate-limit, audit, then forward.
+
+The thread routes reject a signal whose `tagName` is not an XML name, and drop an attributes object carrying a value Mastra cannot render or a key that is not an XML name. Both are what core would otherwise throw on while rendering the signal inside the agent turn.
+
+Configure `ThreadSignalRoutesOptions.contentPolicy` when signal content needs a domain policy before it becomes model input. The Thread Durable Object invokes this structural callback for direct ingestion, provider delivery, schedule fires, and notification dispatch. Its `text` is Mastra's canonical escaped XML representation. A denial stops direct delivery with 422, settles a scheduled fire as discarded, or terminally discards the affected notification.
+
+A policy failure is opaque, and each lane recovers the way it already recovers from any other failure: direct delivery returns 503, schedule state is left unsettled so the lease expires and a later tick retries, and notification dispatch uses its existing backoff. A webhook whose matched deliveries the deployment could not decide is answered with 503 so the provider's own at-least-once redelivery recovers it; each delivery carries a dedupe key derived from the signed bytes and the subscription, so a redelivery coalesces into a still-pending row rather than duplicating it. A content denial is terminal and answers 2xx, because redelivering the identical bytes would only be denied again. Poll deliveries report the same three outcomes and depend on the adapter re-reporting state it has not seen accepted. Give a network-backed policy its own timeout and failure budget inside the callback; FlowSafe imposes neither.
+
+Adapt Breakwater without adding a FlowSafe runtime dependency on it:
+
+```typescript
+import { RequestContext } from '@mastra/core/request-context';
+import {
+  ACTOR_CONTEXT_KEY,
+  AGENT_AUDIT_CONTEXT_KEY,
+  createContentPolicyGate,
+} from '@proofoftech/breakwater';
+import {
+  breakwaterActorFor,
+  principalAuditFields,
+} from '@proofoftech/flowsafe/approval-api';
+import {
+  createThreadSignalRoutes,
+  type SignalContentPolicyInput,
+} from '@proofoftech/flowsafe/signals';
+
+const inspectContent = createContentPolicyGate({ policies });
+
+function signalPolicyContext(input: SignalContentPolicyInput): RequestContext {
+  const requestContext = new RequestContext();
+  requestContext.set(ACTOR_CONTEXT_KEY, breakwaterActorFor(input.principal));
+  requestContext.set(AGENT_AUDIT_CONTEXT_KEY, {
+    agentId: input.agentId,
+    ...(input.deploymentTag === undefined
+      ? {}
+      : { tenantId: input.deploymentTag }),
+    ...(input.runId === undefined ? {} : { runId: input.runId }),
+    threadId: input.threadId,
+    ...(input.resourceId === undefined
+      ? {}
+      : { resourceId: input.resourceId }),
+    entryPath: input.entryPath,
+    ...principalAuditFields(input.principal),
+  });
+  return requestContext;
+}
+
+const signalRoutes = createThreadSignalRoutes({
+  // Existing server-owned resolvers and dispatch seams.
+  contentPolicy: (input) =>
+    inspectContent({
+      text: input.text,
+      requestContext: signalPolicyContext(input),
+    }),
+});
+```
+
+Build the request context only from the callback input. FlowSafe derives those fields from the asserted Thread Durable Object scope and server-owned metadata; never merge HTTP body context or caller-supplied identity into it.
+
+Notification ingestion is checked before persistence, and that check is authoritative rather than advisory: Mastra's default delivery decision sends an urgent notification — and an idle-thread high or medium one — straight out of `sendNotificationSignal`, so those records never reach the dispatcher. Storage owns the id, the timestamps and any coalescing, so ingestion inspects a canonical prospective notification carrying every untrusted model-visible field, in both renderings Mastra can choose between: the individual signal and the single-record summary. Dispatch then checks the exact persisted individual or summary signal for every record that was deferred or batched to the tick.
 
 `D1NotificationsStorage` and `D1ThreadStateStorage` mirror Mastra's in-memory domains on D1. `SignalClient` is available from the browser-safe `signals/client` export.
 

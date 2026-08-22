@@ -37,11 +37,11 @@ schedule work, or run durable agent loops on Cloudflare.
 
 ## Install it
 
-breakwater is ESM-only, requires Node.js 22.3 or newer (engine range `>=22.3.0`),
-and requires `@mastra/core` `1.50.0`.
+breakwater is ESM-only, requires Node.js 22.13.0 or newer (engine range `>=22.13.0`),
+and requires `@mastra/core` `1.53.0`.
 
 ```bash
-npm install @proofoftech/breakwater @mastra/core@1.50.0
+npm install @proofoftech/breakwater @mastra/core@1.53.0
 ```
 
 Connector authors who define Zod schemas should also declare Zod directly:
@@ -56,7 +56,10 @@ The package supports the root import and six focused subpaths:
 import { PolicyEngine } from '@proofoftech/breakwater';
 import { createGuardedAgent } from '@proofoftech/breakwater/agent';
 import { AuditLogger } from '@proofoftech/breakwater/audit';
-import { createConnector } from '@proofoftech/breakwater/connector-sdk';
+import {
+  createConnector,
+  invokeConnector,
+} from '@proofoftech/breakwater/connector-sdk';
 import { RBACMiddleware } from '@proofoftech/breakwater/rbac';
 import { createCodexConnector } from '@proofoftech/breakwater/agent-cli';
 import { denyPatterns } from '@proofoftech/breakwater/policy-engine';
@@ -152,6 +155,17 @@ state remains application-owned and is not deep-cloned:
 - `reasoning` is the model reasoning trace.
 - `object` is the latest canonical JSON structured-output snapshot.
 
+Use `createContentPolicyGate()` when trusted host code must apply the same
+ordered input-policy contract before content enters a framework-owned path that
+does not traverse Mastra's input processors. The gate accepts the exact text
+the downstream model will see plus an optional trusted `RequestContext`. It
+returns only allowed, denied, or evaluator-error state; policy names, reasons,
+content, and thrown values remain confined to the configured audit sink. Every
+registered policy must be able to run on the input `answer` channel — one that
+could never be evaluated here is rejected at construction, not skipped. That
+includes `maxTextLength`, which defaults to the output phase: pass
+`maxTextLength(n, { phases: ['input'] })` to use it at this boundary.
+
 The included policies are:
 
 | Policy | Default coverage | Purpose |
@@ -187,13 +201,14 @@ secret detectors provide bounded windows. A regular expression in
 text released at the end of an earlier segment cannot be withdrawn if a match
 completes in a later segment.
 
-Under `@mastra/core` 1.50.0, only object chunks that traverse the processor
-chain reach a standalone engine. The engine validates those chunks as JSON,
-evaluates the canonical snapshot, and forwards the same canonical clone.
-Parsed `generate()` results and core's structured-output processor chunks
-bypass that chain. If an object-only policy sees no processor-visible object
-chunk, the engine requires an audit sink and aborts at the result boundary.
-JSON carried as answer text is still inspected by answer-inclusive policies.
+Under the supported `@mastra/core` peer, only object chunks that traverse
+the processor chain reach a standalone engine. The engine validates those
+chunks as JSON, evaluates the canonical snapshot, and forwards the same
+canonical clone. Parsed `generate()` results and core's structured-output
+processor chunks bypass that chain. If an object-only policy sees no
+processor-visible object chunk, the engine requires an audit sink and aborts
+at the result boundary. JSON carried as answer text is still inspected by
+answer-inclusive policies.
 
 ## Enforce tool permissions
 
@@ -201,7 +216,10 @@ Create tools through `createConnector()` when policy must hold on agent,
 workflow, nested, and direct calls.
 
 ```typescript
-import { createConnector } from '@proofoftech/breakwater/connector-sdk';
+import {
+  createConnector,
+  invokeConnector,
+} from '@proofoftech/breakwater/connector-sdk';
 import { z } from 'zod';
 
 const accountLookup = createConnector({
@@ -225,6 +243,16 @@ const accountLookup = createConnector({
   },
 });
 ```
+
+Call the connector outside an agent loop through the supported direct boundary:
+
+```typescript
+const account = await invokeConnector(accountLookup, {
+  accountId: 'account_123',
+});
+```
+
+Pass a trusted `RequestContext` when the connector uses grants, identity, dry-run, idempotency, or isolation keys. `invokeConnector()` preserves Mastra schema validation and every Breakwater gate. It rejects plain tools and connectors whose ID, execution function, or schema surface changed after construction. Validation failures throw a redacted `ConnectorValidationError` with the connector ID and `input` or `output` phase.
 
 The permission manifest is enforced:
 
@@ -384,19 +412,21 @@ import { RequestContext } from '@mastra/core/request-context';
 import {
   createCodexConnector,
   DRY_RUN_CONTEXT_KEY,
+  invokeConnector,
 } from '@proofoftech/breakwater';
 
 const codex = createCodexConnector();
 const requestContext = new RequestContext();
 requestContext.set(DRY_RUN_CONTEXT_KEY, true);
 
-const preview = await codex.execute?.(
+const preview = await invokeConnector(
+  codex,
   {
     prompt: 'Add unit tests.',
     cwd: '/srv/workspace',
     model: 'your-model-id',
   },
-  { requestContext } as ToolExecutionContext,
+  { requestContext },
 );
 ```
 
@@ -457,6 +487,7 @@ The root entry point re-exports the supported APIs from every subpath.
 | Runtime exports | Purpose |
 | --- | --- |
 | `PolicyEngine` | Mastra input, stream-output, and final-output processor |
+| `createContentPolicyGate` | Opaque, reusable input-policy gate for trusted host boundaries |
 | `denyPatterns`, `maxTextLength`, `piiSecrets`, `classifierPolicy` | Included agent-boundary evaluators |
 | `PII_SECRETS_DETECTOR_IDS` | Stable detector ID list |
 | `extractMessageText` | Extract policy text from Mastra messages |
@@ -466,7 +497,9 @@ The root entry point re-exports the supported APIs from every subpath.
 | `ISOLATION_SCOPE_CONTEXT_KEY`, `WORKFLOW_SCOPE_CONTEXT_KEY`, `LLM_BACKGROUND_OVERRIDE_KEY` | Stable scope and override keys |
 
 Type exports: `PolicyEngineOptions`, `PolicyEvaluator`, `PolicyContext`,
-`PolicyDecision`, `PolicyPhase`, `OutputChannel`, `PiiSecretsOptions`,
+`PolicyDecision`, `ContentPolicyGate`, `ContentPolicyGateInput`,
+`ContentPolicyGateOptions`, `ContentPolicyGateResult`, `PolicyPhase`,
+`OutputChannel`, `PiiSecretsOptions`,
 `PiiSecretsDetectorId`, `ClassifierPolicyOptions`, `ToolPolicyEvaluator`,
 `ToolCallContext`, `SideEffect`, `NetworkEgressOptions`,
 `CrossWorkflowIsolationOptions`, `BackgroundExecutionOptions`, and
@@ -490,16 +523,17 @@ for compatibility.
 
 | Runtime exports | Purpose |
 | --- | --- |
-| `createConnector`, `connectorManifest` | Build an enforced Mastra tool and inspect its immutable manifest |
+| `createConnector`, `connectorManifest` | Build an enforced Mastra connector and inspect its immutable manifest |
+| `invokeConnector` | Invoke an unmodified connector from trusted host or workflow code without fabricating a Mastra tool context |
 | `singleTenantConnectorPolicies` | Build the validated connector-policy baseline for one physically isolated deployment |
-| `ConnectorPolicyError` | Structured policy denial |
+| `ConnectorPolicyError`, `ConnectorValidationError` | Structured policy denial and redacted direct-invocation validation failure |
 | `CONNECTOR_GRANTS_CONTEXT_KEY`, `CONNECTOR_EXECUTION_CONTEXT_KEY`, `DRY_RUN_CONTEXT_KEY`, `IDEMPOTENCY_KEY_CONTEXT_KEY` | Stable connector request-context keys |
 | `InMemoryIdempotencyStore`, `D1IdempotencyStore` | Development and durable replay stores |
 | `inspectLegacyConnectorIdempotency`, `migrateLegacyConnectorIdempotency` | Inventory and atomically migrate one externally proven ambiguous legacy D1 row without exposing storage keys |
 | `InMemoryRateLimitStore`, `D1RateLimitStore` | Development and durable fixed-window stores |
 | `egressFetch`, `EgressDeniedError` | Standalone fetch guard and its default denial |
 
-Type exports: `PermissionManifest`, `ConnectorConfig`, `ConnectorPolicies`,
+Type exports: `Connector`, `ConnectorInvocationOptions`, `PermissionManifest`, `ConnectorConfig`, `ConnectorPolicies`,
 `SingleTenantConnectorPolicies`, `SingleTenantConnectorPoliciesOptions`,
 `SingleTenantAuditPosture`, `SingleTenantDurableStores`,
 `SingleTenantPermissionPosture`,

@@ -31,6 +31,15 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # The repo's verification gate, in order.
+
+      # Every .github YAML file, not just this one: only ci.yml triggers on a PR,
+      # and issue templates have no trigger at all.
+      - name: Check .github YAML syntax
+        run: pnpm github:check
+
+      - name: Test the .github YAML checker
+        run: pnpm github:check:test
+
       - name: Lint
         run: pnpm lint
 
@@ -134,10 +143,14 @@ jobs:
   # Mastra compat matrix: the libraries pin behavioral contracts to
   # @mastra/core internals (resume-context merge-over semantics, snapshot
   # shape, the reprocess-part key, the six-table inventory). The supported
-  # peer is exactly 1.50.0; run the library suites against the newest
+  # peer is exactly 1.53.0; run the library suites against the newest
   # published 1.x as a signal for a deliberate future compatibility update.
-  # The tripwire tests (runtime.test.ts merge pin,
-  # ProcessorRunner reprocess-key probe, mastra-schema-guard) are the teeth.
+  # The tripwire tests are the teeth: the runtime.test.ts merge pin, the
+  # ProcessorRunner reprocess-key probe, mastra-schema-guard, the
+  # durable-agent-surface inventory, and breakwater's own agent.test.ts
+  # Agent.prototype inventory (whose forwardClassified allowlist is asserted
+  # against THIS job's newer core, not just the pin). See the maintainer
+  # guide's Mastra compatibility section for why bundling needs its own step.
   mastra-compat:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -168,24 +181,50 @@ jobs:
       # ERR_PNPM_NO_MATURE_MATCHING_VERSION. Scoped to this one resolution;
       # every real install keeps the workspace gate.
       - name: Bump @mastra/core to newest 1.x
+        id: mastra_versions
         run: |
-          pnpm -r update --config.minimum-release-age=0 "@mastra/core@^1" "@mastra/cloudflare-d1@^1"
+          CORE_VERSION=$(npm view '@mastra/core@^1' version --json | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(Array.isArray(d)?d.at(-1):d)')
+          D1_VERSION=$(npm view '@mastra/cloudflare-d1@^1' version --json | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(Array.isArray(d)?d.at(-1):d)')
+          echo "core=$CORE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "d1=$D1_VERSION" >> "$GITHUB_OUTPUT"
+          pnpm -r update --config.minimum-release-age=0 "@mastra/core@$CORE_VERSION" "@mastra/cloudflare-d1@$D1_VERSION"
           pnpm --filter @proofoftech/breakwater list @mastra/core
           pnpm --filter @proofoftech/flowsafe list @mastra/core @mastra/cloudflare-d1
 
-      # The bump must PROVABLY land on the registry's newest 1.x (the update
-      # step turns the release-age gate off precisely so it can), otherwise
-      # this job silently re-tests the pinned version and a green run means
-      # nothing.
-      - name: Assert the installed core IS the newest 1.x
+      # The bump must PROVABLY install both registry versions captured above;
+      # otherwise this job can silently re-test a pinned version and a green
+      # run means nothing.
+      - name: Assert the newest 1.x packages are installed
+        env:
+          EXPECTED_CORE: ${{ steps.mastra_versions.outputs.core }}
+          EXPECTED_D1: ${{ steps.mastra_versions.outputs.d1 }}
         run: |
-          EXPECTED=$(npm view '@mastra/core@^1' version --json | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(Array.isArray(d)?d.at(-1):d)')
-          INSTALLED=$(pnpm --filter @proofoftech/breakwater exec node -p 'require("@mastra/core/package.json").version')
-          echo "expected=$EXPECTED installed=$INSTALLED"
-          test "$EXPECTED" = "$INSTALLED"
+          INSTALLED_CORE=$(pnpm --filter @proofoftech/breakwater exec node -p 'require("@mastra/core/package.json").version')
+          INSTALLED_D1=$(pnpm --filter @proofoftech/flowsafe exec node -p 'require("@mastra/cloudflare-d1/package.json").version')
+          echo "core: expected=$EXPECTED_CORE installed=$INSTALLED_CORE"
+          echo "d1: expected=$EXPECTED_D1 installed=$INSTALLED_D1"
+          test "$EXPECTED_CORE" = "$INSTALLED_CORE"
+          test "$EXPECTED_D1" = "$INSTALLED_D1"
 
       - name: Typecheck libraries against newest core
         run: pnpm --filter @proofoftech/breakwater typecheck && pnpm --filter @proofoftech/flowsafe typecheck
+
+      # Bundles the flowsafe spike Worker so this job can see a published-dist
+      # bundling regression that typecheck and test structurally cannot — today
+      # mastra-ai/mastra#20638, which the newest core is EXPECTED to trip.
+      # Step-level continue-on-error, not just the job's: a red step would
+      # otherwise skip the tripwire suites below.
+      - name: Bundle the flowsafe spike Worker against newest core
+        id: bundle
+        continue-on-error: true
+        run: pnpm --filter @proofoftech/flowsafe spike:bundle-check
+
+      # Step-level continue-on-error hides the bundle result from the job status
+      # by design; surface it on the run summary so a flip (upstream fix, or a
+      # new regression) is visible without opening the log.
+      - name: Report bundling outcome
+        run: |
+          echo "spike bundle against newest core: ${{ steps.bundle.outcome }}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Test libraries against newest core
         run: pnpm --filter @proofoftech/breakwater test && pnpm --filter @proofoftech/flowsafe test
