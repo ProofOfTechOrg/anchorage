@@ -181,21 +181,30 @@ jobs:
       # ERR_PNPM_NO_MATURE_MATCHING_VERSION. Scoped to this one resolution;
       # every real install keeps the workspace gate.
       - name: Bump @mastra/core to newest 1.x
+        id: mastra_versions
         run: |
-          pnpm -r update --config.minimum-release-age=0 "@mastra/core@^1" "@mastra/cloudflare-d1@^1"
+          CORE_VERSION=$(npm view '@mastra/core@^1' version --json | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(Array.isArray(d)?d.at(-1):d)')
+          D1_VERSION=$(npm view '@mastra/cloudflare-d1@^1' version --json | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(Array.isArray(d)?d.at(-1):d)')
+          echo "core=$CORE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "d1=$D1_VERSION" >> "$GITHUB_OUTPUT"
+          pnpm -r update --config.minimum-release-age=0 "@mastra/core@$CORE_VERSION" "@mastra/cloudflare-d1@$D1_VERSION"
           pnpm --filter @proofoftech/breakwater list @mastra/core
           pnpm --filter @proofoftech/flowsafe list @mastra/core @mastra/cloudflare-d1
 
-      # The bump must PROVABLY land on the registry's newest 1.x (the update
-      # step turns the release-age gate off precisely so it can), otherwise
-      # this job silently re-tests the pinned version and a green run means
-      # nothing.
-      - name: Assert the installed core IS the newest 1.x
+      # The bump must PROVABLY install both registry versions captured above;
+      # otherwise this job can silently re-test a pinned version and a green
+      # run means nothing.
+      - name: Assert the newest 1.x packages are installed
+        env:
+          EXPECTED_CORE: ${{ steps.mastra_versions.outputs.core }}
+          EXPECTED_D1: ${{ steps.mastra_versions.outputs.d1 }}
         run: |
-          EXPECTED=$(npm view '@mastra/core@^1' version --json | node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(Array.isArray(d)?d.at(-1):d)')
-          INSTALLED=$(pnpm --filter @proofoftech/breakwater exec node -p 'require("@mastra/core/package.json").version')
-          echo "expected=$EXPECTED installed=$INSTALLED"
-          test "$EXPECTED" = "$INSTALLED"
+          INSTALLED_CORE=$(pnpm --filter @proofoftech/breakwater exec node -p 'require("@mastra/core/package.json").version')
+          INSTALLED_D1=$(pnpm --filter @proofoftech/flowsafe exec node -p 'require("@mastra/cloudflare-d1/package.json").version')
+          echo "core: expected=$EXPECTED_CORE installed=$INSTALLED_CORE"
+          echo "d1: expected=$EXPECTED_D1 installed=$INSTALLED_D1"
+          test "$EXPECTED_CORE" = "$INSTALLED_CORE"
+          test "$EXPECTED_D1" = "$INSTALLED_D1"
 
       - name: Typecheck libraries against newest core
         run: pnpm --filter @proofoftech/breakwater typecheck && pnpm --filter @proofoftech/flowsafe typecheck
