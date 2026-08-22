@@ -356,6 +356,8 @@ test('package READMEs state manifest-backed engine and peer ranges', () => {
         '@mastra/core': '^1.50.0',
         react: '>=18 <20',
       },
+      // The parity rule reads this while the README-claim fixture stays valid.
+      devDependencies: { '@mastra/core': '^1.50.0' },
     }),
     'packages/breakwater/README.md': `# Breakwater
 
@@ -380,6 +382,166 @@ react >=18 <20
       'README does not state manifest peer range @mastra/core ^1.50.0',
     ],
   );
+});
+
+test('a library core peer and devDependency must match', () => {
+  const root = fixture({
+    'packages/breakwater/package.json': JSON.stringify({
+      name: '@proofoftech/breakwater',
+      peerDependencies: { '@mastra/core': '1.53.0' },
+      devDependencies: { '@mastra/core': '1.52.0' },
+    }),
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: [],
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => error.message),
+    ['devDependency @mastra/core 1.52.0 does not equal peer 1.53.0'],
+  );
+});
+
+test('a library core peer requires a matching devDependency', () => {
+  const root = fixture({
+    'packages/breakwater/package.json': JSON.stringify({
+      name: '@proofoftech/breakwater',
+      peerDependencies: { '@mastra/core': '1.53.0' },
+    }),
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: [],
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => error.message),
+    ['devDependency @mastra/core missing does not equal peer 1.53.0'],
+  );
+});
+
+test('a private package participates in core version agreement', () => {
+  const root = fixture({
+    'packages/breakwater/package.json': JSON.stringify({
+      name: '@proofoftech/breakwater',
+      peerDependencies: { '@mastra/core': '1.53.0' },
+      devDependencies: { '@mastra/core': '1.53.0' },
+    }),
+    'packages/showcase/package.json': JSON.stringify({
+      name: 'showcase',
+      private: true,
+      devDependencies: { '@mastra/core': '1.52.0' },
+    }),
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: [],
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => error.message),
+    [
+      '@mastra/core 1.52.0 differs from 1.53.0 in packages/breakwater/package.json',
+    ],
+  );
+});
+
+test('a private package dependency participates in core version agreement', () => {
+  const root = fixture({
+    'packages/breakwater/package.json': JSON.stringify({
+      name: '@proofoftech/breakwater',
+      peerDependencies: { '@mastra/core': '1.53.0' },
+      devDependencies: { '@mastra/core': '1.53.0' },
+    }),
+    'packages/showcase/package.json': JSON.stringify({
+      name: 'showcase',
+      private: true,
+      dependencies: { '@mastra/core': '1.52.0' },
+    }),
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: [],
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(
+    result.errors.map((error) => error.message),
+    [
+      '@mastra/core 1.52.0 differs from 1.53.0 in packages/breakwater/package.json',
+    ],
+  );
+});
+
+test('an agreeing private package dependency passes core agreement', () => {
+  const root = fixture({
+    'packages/breakwater/package.json': JSON.stringify({
+      name: '@proofoftech/breakwater',
+      peerDependencies: { '@mastra/core': '1.53.0' },
+      devDependencies: { '@mastra/core': '1.53.0' },
+    }),
+    'packages/agent-starter/package.json': JSON.stringify({
+      name: 'anchorage-agent-starter',
+      private: true,
+      dependencies: { '@mastra/core': '1.53.0' },
+    }),
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: [],
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(result.errors, []);
+});
+
+test('matching core declarations pass agreement and parity', () => {
+  const root = fixture({
+    'packages/breakwater/package.json': JSON.stringify({
+      name: '@proofoftech/breakwater',
+      peerDependencies: { '@mastra/core': '1.53.0' },
+      devDependencies: { '@mastra/core': '1.53.0' },
+    }),
+    'packages/showcase/package.json': JSON.stringify({
+      name: 'showcase',
+      private: true,
+      devDependencies: { '@mastra/core': '1.53.0' },
+    }),
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: [],
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(result.errors, []);
+});
+
+test('a package without a core edge is ignored', () => {
+  const root = fixture({
+    'packages/fleet-control/package.json': JSON.stringify({
+      name: '@proofoftech/fleet-control',
+      dependencies: { zod: '4.3.6' },
+    }),
+  });
+
+  const result = checkRepository({
+    root,
+    markdownFiles: [],
+    orphanChecks: false,
+  });
+
+  assert.deepEqual(result.errors, []);
 });
 
 test('external URL collection does not join nested badge destinations', () => {

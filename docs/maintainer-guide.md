@@ -16,31 +16,44 @@ corepack enable
 pnpm install --frozen-lockfile
 ```
 
-The workspace requires Node 22.22.0 or later and pnpm 10.16 or later. `packageManager` pins the expected pnpm version. `pnpm-workspace.yaml` applies a seven-day minimum package release age with documented exceptions for lockstep or tool-imposed dependencies.
+The workspace requires Node 22.22.0 or later and pnpm 10.16 or later. `packageManager` pins the expected pnpm version. `pnpm-workspace.yaml` applies a seven-day minimum package release age with documented exceptions for lockstep or tool-imposed dependencies. Versioned overrides for `js-yaml@3`, `js-yaml@4`, and `nanoid@3` pin each legacy line forward until a maintainer bumps it by hand.
 
 ## Verification
 
-Run the full merge gate:
+The commands below mirror the CI `verify` job after dependency installation, in order:
 
 ```bash
-pnpm docs:check
-pnpm docs:api
+pnpm github:check
+pnpm github:check:test
 pnpm lint
 pnpm typecheck
 pnpm test
 pnpm build
+pnpm docs:check
+pnpm docs:check:test
+pnpm docs:api
+pnpm test:release-order
+pnpm test:release-invocation
 pnpm test:packed-breakwater
+pnpm test:packed-fleet-control
 pnpm test:packed-flowsafe-agent-host
 pnpm test:packed-flowsafe-provisioning
 pnpm --filter @proofoftech/flowsafe test:signals-client-export
 pnpm --filter @proofoftech/flowsafe typecheck:react18
-pnpm --filter @proofoftech/flowsafe example:gtm
+pnpm --filter showcase run react-doctor
 pnpm --filter @proofoftech/flowsafe spike:verify
+pnpm test:conformance-config
+pnpm conformance:verify
+```
+
+Additional local checks:
+
+```bash
+pnpm --filter @proofoftech/flowsafe example:gtm
 pnpm --filter anchorage-agent-starter test
 pnpm --filter anchorage-agent-starter typecheck
 pnpm --filter showcase test
 pnpm --filter showcase build
-pnpm --filter showcase react-doctor
 ```
 
 The React Doctor wrapper pins an audited commit, blocks on warnings, and
@@ -53,7 +66,7 @@ unpinned `pnpm dlx` command or treat an incomplete report as a passing scan.
 
 - Root `pnpm lint` runs one Biome pass.
 - Root `pnpm test` runs one Vitest workspace.
-- Pre-commit runs lint-staged on staged files only.
+- Pre-commit runs Biome on staged files and checks the complete `.github` YAML directory through lint-staged when a `.github/**/*.{yml,yaml}` file is staged.
 - Pre-push runs react-doctor against changed React files.
 - Showcase source uses its configured absolute aliases rather than relative cross-directory imports.
 - Generated `dist/`, Wrangler state, TypeDoc output, and test artifacts are not hand-edited.
@@ -101,7 +114,7 @@ Rolling this release back is not symmetric: 0.17.x has no deadline reader, so th
 
 ## Public documentation
 
-`pnpm docs:check` validates local links and anchors, package export coverage, TypeDoc entry coverage, npm-safe package links, orphaned public pages, stale internal markers, and manifest-backed Node engine and peer-dependency claims. `pnpm docs:api` builds all supported API surfaces, including the React UI in its own TypeScript program.
+`pnpm docs:check` validates local links and anchors, package export coverage, TypeDoc entry coverage, npm-safe package links, orphaned public pages, stale internal markers, manifest-backed Node engine and peer-dependency claims, and one `@mastra/core` value across the `packages/*` manifests' `peerDependencies`, `devDependencies`, and `dependencies`, including private packages, with peer/devDependency parity for libraries. `pnpm docs:api` builds all supported API surfaces, including the React UI in its own TypeScript program.
 
 Do not place implementation plans or agent instructions in the public navigation. Uncommitted designs belong under `docs/proposals/` with an explicit proposal banner.
 

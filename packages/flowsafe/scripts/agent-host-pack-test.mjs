@@ -108,6 +108,18 @@ try {
     /^\d+\.\d+\.\d+$/,
     'the packed @mastra/core peer must stay an exact version',
   );
+  const siblingManifest = JSON.parse(
+    readFileSync(
+      join(repositoryRoot, 'packages', 'breakwater', 'package.json'),
+      'utf8',
+    ),
+  );
+  // Both libraries run in one host, so a split Mastra pin is unsupported.
+  assert.equal(
+    corePeer,
+    siblingManifest.peerDependencies['@mastra/core'],
+    'breakwater and flowsafe must pin the same @mastra/core peer',
+  );
   assert.equal(manifest.dependencies.jose, sourceManifest.dependencies.jose);
   assert.equal(
     manifest.peerDependencies['@proofoftech/breakwater'],

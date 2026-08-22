@@ -4,6 +4,8 @@ import test from 'node:test';
 import {
   newTagAnnouncement,
   PUBLISH_PREREQUISITES,
+  peerFloorGrammarViolations,
+  prerequisitePeerFloorViolations,
   publishInvocation,
   publishRelease,
 } from './publish-ordered.mjs';
@@ -39,9 +41,27 @@ function scopingFlags(args) {
  */
 const CHANGESETS_NEW_TAG = /New tag:\s+(@[^/]+\/[^@]+|[^/]+)@([^\s]+)/;
 
+function peerFloorFixture({
+  breakwaterVersion = '0.13.0',
+  flowsafeRange = '>=0.13.0 <1.0.0',
+} = {}) {
+  return new Map([
+    ['@proofoftech/breakwater', { version: breakwaterVersion }],
+    [
+      '@proofoftech/flowsafe',
+      {
+        peerDependencies: {
+          '@proofoftech/breakwater': flowsafeRange,
+        },
+      },
+    ],
+  ]);
+}
+
 test('publishes Breakwater then Flowsafe before the remaining Changesets release', async () => {
   const calls = [];
   await publishRelease({
+    peerFloors: async () => calls.push('peer-floors'),
     version: (target) => {
       calls.push(`version:${target.name}`);
       return '0.6.0';
@@ -61,6 +81,7 @@ test('publishes Breakwater then Flowsafe before the remaining Changesets release
     ['@proofoftech/breakwater', '@proofoftech/flowsafe'],
   );
   assert.deepEqual(calls, [
+    'peer-floors',
     'version:@proofoftech/breakwater',
     'lookup:@proofoftech/breakwater',
     'publish:@proofoftech/breakwater',
@@ -78,6 +99,7 @@ test('publishes Breakwater then Flowsafe before the remaining Changesets release
 test('an already published prerequisite remains an ordered no-op', async () => {
   const calls = [];
   await publishRelease({
+    peerFloors: async () => calls.push('peer-floors'),
     version: () => '0.6.0',
     published: async () => true,
     publish: async () => calls.push('unexpected publish'),
@@ -87,10 +109,100 @@ test('an already published prerequisite remains an ordered no-op', async () => {
   });
 
   assert.deepEqual(calls, [
+    'peer-floors',
     ...PUBLISH_PREREQUISITES.map(() => 'tag check'),
     'changesets',
   ]);
 });
+
+test('a satisfied prerequisite peer floor passes', () => {
+  assert.deepEqual(prerequisitePeerFloorViolations(peerFloorFixture()), []);
+});
+
+test('an unsatisfied peer floor names both packages', () => {
+  const violations = prerequisitePeerFloorViolations(
+    peerFloorFixture({ breakwaterVersion: '0.12.0' }),
+  );
+
+  assert.equal(violations.length, 1);
+  assert.match(violations[0], /@proofoftech\/breakwater/);
+  assert.match(violations[0], /@proofoftech\/flowsafe/);
+});
+
+test('caret peer ranges fail closed as unsupported grammar', () => {
+  const violations = peerFloorGrammarViolations(
+    peerFloorFixture({ flowsafeRange: '^0.13.0' }),
+  );
+
+  assert.equal(violations.length, 1);
+  assert.equal(violations[0].ownerName, '@proofoftech/flowsafe');
+  assert.match(violations[0].message, /bounded exact floor/);
+});
+
+test('non-exact prerequisite versions fail grammar validation', () => {
+  const violations = peerFloorGrammarViolations(
+    peerFloorFixture({ breakwaterVersion: '0.13.0-beta.1' }),
+  );
+
+  assert.equal(violations.length, 1);
+  assert.equal(violations[0].ownerName, '@proofoftech/breakwater');
+  assert.match(violations[0].message, /version must be exact/);
+});
+
+test('a bounded 1.x peer floor passes grammar validation', () => {
+  assert.deepEqual(
+    peerFloorGrammarViolations(
+      peerFloorFixture({
+        breakwaterVersion: '1.2.0',
+        flowsafeRange: '>=1.2.0 <2.0.0',
+      }),
+    ),
+    [],
+  );
+});
+
+test('a peer ceiling that does not match its floor major fails', () => {
+  const violations = peerFloorGrammarViolations(
+    peerFloorFixture({ flowsafeRange: '>=0.5.0 <2.0.0' }),
+  );
+
+  assert.equal(violations.length, 1);
+  assert.equal(violations[0].ownerName, '@proofoftech/flowsafe');
+  assert.match(violations[0].message, /ceiling/);
+});
+
+test('a peer ceiling grammar failure is not duplicated as containment', () => {
+  const violations = prerequisitePeerFloorViolations(
+    peerFloorFixture({
+      breakwaterVersion: '0.4.0',
+      flowsafeRange: '>=0.5.0 <2.0.0',
+    }),
+  );
+
+  assert.deepEqual(violations, [
+    '@proofoftech/flowsafe peer @proofoftech/breakwater ceiling 2.0.0 does not match floor >=0.5.0 <2.0.0',
+  ]);
+});
+
+test('grammar-only validation accepts an unsatisfied floor', () => {
+  assert.deepEqual(
+    peerFloorGrammarViolations(
+      peerFloorFixture({ breakwaterVersion: '0.12.0' }),
+    ),
+    [],
+  );
+});
+
+for (const breakwaterVersion of ['1.0.0', '1.2.3']) {
+  test(`a prerequisite version ${breakwaterVersion} at or above the ceiling fails containment`, () => {
+    const manifests = peerFloorFixture({ breakwaterVersion });
+
+    assert.deepEqual(peerFloorGrammarViolations(manifests), []);
+    const violations = prerequisitePeerFloorViolations(manifests);
+    assert.equal(violations.length, 1);
+    assert.match(violations[0], /does not include/);
+  });
+}
 
 // Both variants, because the dry-run pre-flight publishes with `dryRun: true`
 // and a leak reachable only on the real path would never be spawned in CI.

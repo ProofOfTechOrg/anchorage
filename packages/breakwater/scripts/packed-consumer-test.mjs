@@ -14,6 +14,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const workspaceRoot = resolve(packageRoot, '..', '..');
 const temporaryRoot = await mkdtemp(
   join(tmpdir(), 'breakwater-packed-consumer-'),
 );
@@ -99,6 +100,18 @@ try {
     manifest.peerDependencies?.['@mastra/core'],
     /^\d+\.\d+\.\d+$/,
     'the packed @mastra/core peer must stay an exact version',
+  );
+  const siblingManifest = JSON.parse(
+    await readFile(
+      join(workspaceRoot, 'packages', 'flowsafe', 'package.json'),
+      'utf8',
+    ),
+  );
+  // Both libraries run in one host, so a split Mastra pin is unsupported.
+  assert.equal(
+    corePeer,
+    siblingManifest.peerDependencies['@mastra/core'],
+    'breakwater and flowsafe must pin the same @mastra/core peer',
   );
   for (const documentation of [
     'README.md',

@@ -31,6 +31,15 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # The repo's verification gate, in order.
+
+      # Every .github YAML file, not just this one: only ci.yml triggers on a PR,
+      # and issue templates have no trigger at all.
+      - name: Check .github YAML syntax
+        run: pnpm github:check
+
+      - name: Test the .github YAML checker
+        run: pnpm github:check:test
+
       - name: Lint
         run: pnpm lint
 

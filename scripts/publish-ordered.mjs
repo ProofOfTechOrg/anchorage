@@ -24,6 +24,9 @@ export const PUBLISH_PREREQUISITES = Object.freeze([
   },
 ]);
 
+const PEER_FLOOR_PATTERN = /^>=(\d+)\.(\d+)\.(\d+) <(\d+)\.0\.0$/;
+const EXACT_VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
+
 // `error` is carried because a spawn that never launches (missing binary,
 // unreadable cwd) reports status AND signal as null, so a caller inspecting
 // only those two reports a signal kill that never happened and drops the real
@@ -51,11 +54,104 @@ export function failureReason(result) {
   return `exit ${result.status}`;
 }
 
-function packageVersion(directory) {
-  const manifest = JSON.parse(
-    readFileSync(join(ROOT, directory, 'package.json'), 'utf8'),
+export function prerequisiteManifests() {
+  return new Map(
+    PUBLISH_PREREQUISITES.map(({ name, directory }) => [
+      name,
+      JSON.parse(readFileSync(join(ROOT, directory, 'package.json'), 'utf8')),
+    ]),
   );
-  return manifest.version;
+}
+
+export function* prerequisitePeerEdges(manifests) {
+  for (const [packageName, manifest] of manifests) {
+    for (const [peerName, range] of Object.entries(
+      manifest.peerDependencies ?? {},
+    )) {
+      if (peerName === packageName || !manifests.has(peerName)) continue;
+      yield {
+        packageName,
+        peerName,
+        range,
+        match:
+          typeof range === 'string' ? PEER_FLOOR_PATTERN.exec(range) : null,
+        peerVersion: manifests.get(peerName).version,
+      };
+    }
+  }
+}
+
+function edgeGrammarViolations(edge) {
+  const violations = [];
+  if (!edge.match) {
+    violations.push({
+      ownerName: edge.packageName,
+      message: `${edge.packageName} peer ${edge.peerName} must use a bounded exact floor, got ${String(edge.range)}`,
+    });
+  } else {
+    const floorMajor = Number(edge.match[1]);
+    const ceilingMajor = Number(edge.match[4]);
+    const expectedCeiling = floorMajor === 0 ? 1 : floorMajor + 1;
+    if (ceilingMajor !== expectedCeiling) {
+      violations.push({
+        ownerName: edge.packageName,
+        message: `${edge.packageName} peer ${edge.peerName} ceiling ${ceilingMajor}.0.0 does not match floor ${edge.range}`,
+      });
+    }
+  }
+  if (
+    typeof edge.peerVersion !== 'string' ||
+    !EXACT_VERSION_PATTERN.test(edge.peerVersion)
+  ) {
+    violations.push({
+      ownerName: edge.peerName,
+      message: `${edge.peerName} version must be exact for ${edge.packageName}'s peer floor, got ${String(edge.peerVersion)}`,
+    });
+  }
+  return violations;
+}
+
+export function peerFloorGrammarViolations(manifests) {
+  return [...prerequisitePeerEdges(manifests)].flatMap(edgeGrammarViolations);
+}
+
+/**
+ * Numeric comparison is sufficient after the pinned grammar check and avoids
+ * adding a semver package for one release invariant. Flowsafe's packed 0.x peer
+ * regex must be revisited with this grammar when Breakwater reaches 1.0.
+ */
+function compareVersions(left, right) {
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return left[index] - right[index];
+  }
+  return 0;
+}
+
+/**
+ * Release-only version gate, wired through publishRelease after the Version
+ * Packages PR. Between a floor raise and that PR, the source tree legitimately
+ * fails it: Flowsafe requires Breakwater >=0.13.0 while the pending changeset
+ * `.changeset/silver-hounds-listen.md` still leaves Breakwater at 0.12.0.
+ */
+export function prerequisitePeerFloorViolations(manifests) {
+  const violations = peerFloorGrammarViolations(manifests).map(
+    ({ message }) => message,
+  );
+  for (const edge of prerequisitePeerEdges(manifests)) {
+    if (edgeGrammarViolations(edge).length > 0) continue;
+    const floor = edge.match.slice(1, 4).map(Number);
+    const ceiling = [Number(edge.match[4]), 0, 0];
+    const version = edge.peerVersion.split('.').map(Number);
+    if (
+      compareVersions(version, floor) < 0 ||
+      compareVersions(version, ceiling) >= 0
+    ) {
+      violations.push(
+        `${edge.packageName} peer floor ${edge.range} does not include ${edge.peerName}@${edge.peerVersion}`,
+      );
+    }
+  }
+  return violations;
 }
 
 function published(name, version) {
@@ -150,6 +246,7 @@ function ensureTag(name, version) {
 }
 
 export async function publishRelease(hooks) {
+  await hooks.peerFloors();
   for (const target of PUBLISH_PREREQUISITES) {
     const version = hooks.version(target);
     if (!(await hooks.published(target, version))) {
@@ -162,8 +259,13 @@ export async function publishRelease(hooks) {
 }
 
 async function main() {
+  const manifests = prerequisiteManifests();
   await publishRelease({
-    version: (target) => packageVersion(target.directory),
+    peerFloors: () => {
+      const violations = prerequisitePeerFloorViolations(manifests);
+      if (violations.length > 0) throw new Error(violations.join('\n'));
+    },
+    version: (target) => manifests.get(target.name).version,
     published: (target, version) => published(target.name, version),
     publish: publishPackage,
     waitUntilPublished: (target, version) =>

@@ -33,8 +33,14 @@ Every PR must pass the verification gate below; CI
 ```bash
 git clone https://github.com/ProofOfTechOrg/anchorage.git
 cd anchorage
-pnpm install
-# The full verification gate (what CI runs):
+```
+
+The verification list below mirrors the CI `verify` job in order:
+
+```bash
+pnpm install --frozen-lockfile
+pnpm github:check
+pnpm github:check:test
 pnpm lint
 pnpm typecheck
 pnpm test
@@ -42,21 +48,27 @@ pnpm build
 pnpm docs:check
 pnpm docs:check:test
 pnpm docs:api
+pnpm test:release-order
+pnpm test:release-invocation
 pnpm test:packed-breakwater
+pnpm test:packed-fleet-control
 pnpm test:packed-flowsafe-agent-host
 pnpm test:packed-flowsafe-provisioning
 pnpm --filter @proofoftech/flowsafe test:signals-client-export
 pnpm --filter @proofoftech/flowsafe typecheck:react18
 pnpm --filter showcase run react-doctor
 pnpm --filter @proofoftech/flowsafe spike:verify
+pnpm test:conformance-config
+pnpm conformance:verify
 ```
 
 Lint is one Biome pass at the root, and `pnpm test` is one root vitest run
 covering every package. Git hooks (husky) back the gate up:
-pre-commit runs Biome on staged files (lint-staged); pre-push runs
-react-doctor on the branch's changed files (`pnpm react-doctor:diff`; bypass
-with `git push --no-verify`). CI also runs a non-blocking compatibility probe
-against the newest `@mastra/core` 1.x release.
+pre-commit runs Biome on staged files and checks the complete `.github` YAML
+directory when a `.github/**/*.{yml,yaml}` file is staged (lint-staged);
+pre-push runs react-doctor on the branch's changed files
+(`pnpm react-doctor:diff`; bypass with `git push --no-verify`). CI also runs a
+non-blocking compatibility probe against the newest `@mastra/core` 1.x release.
 
 The showcase app uses mandatory absolute imports — `@/*` for `src`,
 `#worker/*` for worker modules, `@flowsafe/*` for deep flowsafe source
@@ -64,9 +76,13 @@ imports — enforced by Biome.
 
 `pnpm docs:check` validates local links, Markdown anchors, documentation
 reachability, package README export coverage, published-package links, and
-TypeDoc entry-point coverage. `pnpm docs:api` builds the generated API site in
-`docs/api/`; that directory is ignored and must not be committed. The scheduled
-external-link workflow runs `pnpm docs:check:external`.
+TypeDoc entry-point coverage. It also requires one `@mastra/core` value across
+the `packages/*` manifests' `peerDependencies`, `devDependencies`, and
+`dependencies`, including private packages, plus peer/devDependency parity for
+libraries.
+`pnpm docs:api` builds the generated API site in `docs/api/`; that directory is
+ignored and must not be committed. The scheduled external-link workflow runs
+`pnpm docs:check:external`.
 
 Add or update tests for behavioral changes. Update the relevant package README
 and authored guides when public behavior, setup, configuration, or exports
