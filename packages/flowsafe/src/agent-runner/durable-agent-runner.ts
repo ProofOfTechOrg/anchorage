@@ -141,60 +141,38 @@
 //   LEFT INHERITED as funnellers, because virtual dispatch already lands them
 //   on an override: resumeStreamUntilIdle() (:49954 -> agent.resumeStream) and
 //   sendStreamResume() (:50212 -> this.resumeStream) reach the BLOCKED
-//   resumeStream; and the five signal senders sendMessage() (:49609),
-//   queueMessage() (:49620), sendStateSignal() (:49631),
-//   sendNotificationSignal() (:49639) and sendSignal() (:49820) reach
-//   agentThreadStreamRuntime, whose idle-start path calls `agent.stream(...)`
-//   — the GUARDED override. Those five stay inherited because FlowSafe's
-//   thread Durable Object USES them and blocking one would take a route with
-//   it; sendToolApproval is blocked because no route needs it. The difference
-//   is NECESSITY, not who mints — and who mints is a residual, recorded here:
+//   resumeStream. The five signal senders stay inherited because every outcome
+//   they can produce lands on this runner's terminal path; queueMessage has no
+//   remaining thread-route caller but keeps the same containment property.
 //
-//     All offsets in this paragraph are chunk-P4Y2BJL7.js unless another
-//     chunk or file is named — NOT the chunk-3S5BFAEP.js default this section
-//     header sets.
+//     FlowSafe's queue and state routes, plus persist outcomes from wake routes,
+//     require agent memory and answer `memory-unavailable` without it. Owner
+//     notifications follow core's policy and treat their memory write as
+//     best-effort because the inbox row is already durable. Non-owner
+//     notifications are record-only until the trusted dispatcher delivers them.
+//     Direct sender calls can still reach core's minting sites: the idle wake
+//     (:7441), continuation (:6720), completion drain (:6665), and queued-id
+//     drain (:6808), all in chunk-P4Y2BJL7.js.
+//     executeWorkflow therefore treats a missing #startRequesters entry as a
+//     terminal refusal: it preserves the serialized input when memory permits,
+//     except route deliveries marked persistence-forbidden in non-rendered
+//     signal metadata, publishes ERROR, and never calls RunnerRuntime.
 //
-//     Only sendMessage/sendSignal wake through the host's own startIdleRun
-//     seam (signals/thread-do-routes.ts:1235), where the host mints the id
-//     (signals/thread-do-routes.ts:1228) and reserves ownership before
-//     calling streamUntilPersisted (agent-host/thread-host.ts:1541). Core
-//     still starts runs of its own through the guarded stream(): on an IDLE
-//     thread queueMessage forces a wake (:7192-7196), while sendStateSignal
-//     (:7235) and the DELIVER branch of sendNotificationSignal
-//     (chunk-3S5BFAEP.js:49765-49770, which forwards the target unmodified)
-//     fall to sendSignal's default ifIdle behavior of 'wake' (:7255); that
-//     branch's sibling SUMMARY path (chunk-3S5BFAEP.js:49716-49721) sets the
-//     behavior explicitly instead, persist for high priority and wake
-//     otherwise. Either way the wake mints `runId = randomUUID()` (:7362),
-//     overwriting any caller id, and then calls `agent.stream(signal, {
-//     untilIdle: true, runId })` (:7441). So do the completion drains after
-//     ANY of the five: #drainPendingSignals replays a leftover
-//     active-delivery signal under a fresh randomUUID() with the PREVIOUS
-//     run's stream options (:6641, :6665), and #drainPendingIdleSignals
-//     replays a queued message under the id minted when it was queued (:7180,
-//     :6808). #assertCallerRunId is path-safety only, so it cannot tell those
-//     ids from host-minted ones — the host's own wake uses
-//     crypto.randomUUID() too. Such runs carry no requestedBy (no
-//     #startRequesters entry, so executeWorkflow starts without one), no
-//     ownership reservation, no agent-run record
-//     (agent-host/thread-host.ts:1493-1513 never runs) and no trusted
-//     engine-leg context (requestContextForRun,
-//     agent-host/thread-host.ts:1276-1286, misses on the runId). With an EMPTY
-//     request context — the idle wake — breakwater's RBAC input processor
-//     aborts on the missing actor, prepareForDurableExecution catches the
-//     TripWire (chunk-XMEACVLS.js:535-548), and the first llm step returns
-//     reason:'tripwire' (chunk-XMEACVLS.js:2026-2060): a run row, no model
-//     call. With the PREVIOUS run's request context — a completion drain —
-//     RBAC passes, the model IS called, and tools see no actor, permissions or
-//     grants. Either way the run is unobservable and unresumable through the
-//     host routes. Pre-existing rather than introduced by this bump: all five
-//     core functions are byte-identical at 1.50.0. Tracked as a residual
-//     alongside getLegacyHandler() and Mastra.restartAllActiveWorkflowRuns();
-//     the reachable routes are signals/thread-do-routes.ts /signal/queue,
-//     /signal/state and /signal/notification. RUNTIME_DRIVEN_AGENT does not
-//     cover it: its brand gates the host's own startIdleRun wake
-//     (signals/thread-do-routes.ts:1194-1197), which those three routes never
-//     reach.
+//     Core registers thread state only when stream options carry a memory
+//     thread (chunk-P4Y2BJL7.js:6557-6594). For those runs its completion
+//     watcher consumes the failed output, removes the run maps, publishes
+//     run-completed, and releases or transfers the lease (:6596-6624).
+//     getThreadState heals a non-blocking record (:6235-6246), but neither it
+//     nor getActiveThreadRunId heals a record-less active id. This is why the
+//     refusal is terminal instead of synchronous: the idle-wake site is
+//     wrapped (:7440-7462), while #drainPendingSignals' call at :6665 has no
+//     failure cleanup. Upstream note: #drainPendingSignals needs failure
+//     cleanup before a synchronous refusal would be safe there. Upstream note:
+//     DurableAgent does not forward the wrapped Agent's `notifications`
+//     configuration, so the wrapper cannot inject a delivery policy.
+//     If both runner publication attempts and core's own fire-and-forget attempt
+//     fail, the terminal output never closes and the thread remains active until
+//     eviction or a new host start.
 //
 //   LEFT INHERITED as non-execution, on a read of each: the base delegators
 //   resume/recover/listActiveRuns/recoverActiveRuns/prepare (:50497 onward) are
@@ -209,9 +187,7 @@
 //   generateTitleFromUserMessage() (:46296) call `llm.stream`/`llm.__text` with
 //   no tools, no run id and no run state.
 //
-// Two further residuals, both outside this class's reach rather than
-// overlooked. A third, the only one INSIDE this class's reach, is recorded
-// above under the five signal senders.
+// Two residuals remain outside this class's reach rather than overlooked.
 // Mastra.restartAllActiveWorkflowRuns() is Mastra-level, not an agent member —
 // nothing here calls it, and it would hit core's processor-rebuild fallback if
 // a host did. getLegacyHandler() (:45595) is TS-private but runtime-public and
@@ -250,10 +226,13 @@
 // complete runtime processor lists after invoking only reserved RBAC during
 // empty-message preparation, then drives runtime.resume().
 
-import type {
-  Agent,
-  AgentExecutionOptions,
-  ToolsInput,
+import {
+  type Agent,
+  type AgentExecutionOptions,
+  isMastraSignalMessage,
+  MessageList,
+  mastraDBMessageToSignal,
+  type ToolsInput,
 } from '@mastra/core/agent';
 import {
   DurableAgent,
@@ -285,6 +264,17 @@ import {
  * the registered id without a magic string.
  */
 export const DURABLE_AGENTIC_LOOP_WORKFLOW_ID = 'durable-agentic-loop';
+
+const UNOWNED_INPUT_PERSIST_TIMEOUT_MS = 5_000;
+const UNREGISTERED_RUN_REFUSAL_PREFIX =
+  'Flowsafe durable-agent runner refused unregistered run: ';
+
+/**
+ * @internal Metadata key that prevents a route delivery from being terminally
+ * persisted. Deliberately deep-imported by `signals/thread-do-routes.ts` and
+ * kept off `./index.js`.
+ */
+export const FLOWSAFE_PERSISTENCE_FORBIDDEN = 'flowsafe.persistence-forbidden';
 
 const BREAKWATER_GUARDED_AGENT_HOST_PROTOCOL = Symbol.for(
   '@proofoftech/breakwater/guarded-agent-host/v1',
@@ -481,22 +471,18 @@ function bindThreadCompletion<T extends object>(
 }
 
 /**
- * Brand marking an agent as RUNTIME-DRIVEN: its inherited signal wake
- * (`agent.stream` under `ifIdle:'wake'`) re-enters the host-owned-run-ID guard in
- * {@link FlowsafeDurableAgent.executeWorkflow}, which drives
- * `runtime.start('durable-agentic-loop', …)` rather than the base
- * `createRun + run.start` on the default engine. The thread Durable Object
- * requires this brand before honoring an idle wake through its OWN start seam
- * — the message, signal, schedule, and notification-dispatch routes: a plain
- * core `Agent` (or a STOCK `DurableAgent`, whose `stream()` mints an unowned
- * UUID and whose `executeWorkflow` runs on the default engine) would start a
- * run OUTSIDE RunnerRuntime — an unsafe second execution path that is unscoped
- * and grant-underivable. It gates that seam only, and is not a claim that
- * nothing else starts a run: the queue, state, and notification routes reach
- * an idle-start inside Mastra, as do Mastra's completion drains. See the
- * residual paragraph in this module's header comment for what those runs lack.
- * Structural (a `unique symbol`-keyed truthy field) so a test double can opt in
- * without constructing a real durable agent.
+ * Brand marking an agent as runtime-driven. The thread Durable Object requires
+ * it before its message, signal, schedule, or notification-dispatch wake seam
+ * may start a run. Queue and state persist rather than wake on idle. Non-owner
+ * notifications are recorded for the trusted dispatcher and never send a
+ * signal directly. An unbranded agent reports
+ * `degraded: 'not-runtime-driven'` on state and owner-notification responses
+ * that reach the sender, regardless of thread state. Skipped state and
+ * `memory-unavailable` responses return earlier and carry no marker.
+ *
+ * Direct core sender calls that mint a run still reach the durable runner,
+ * which fails them terminally without executing. Structural so a test double
+ * can opt in without constructing a real durable agent.
  */
 export const RUNTIME_DRIVEN_AGENT: unique symbol = Symbol(
   'flowsafe.runtimeDrivenAgent',
@@ -591,6 +577,8 @@ export class FlowsafeDurableAgent<
     string,
     { scheduleId: string; dispatchId: string }
   >();
+  // The host's exact options object receives one private, single-use re-entry ticket.
+  readonly #hostStreamTickets = new WeakSet<object>();
 
   constructor(options: FlowsafeDurableAgentOptions<TAgentId, TTools, TOutput>) {
     const guardedProtocol = breakwaterGuardedAgentHostProtocol(options.agent);
@@ -638,6 +626,30 @@ export class FlowsafeDurableAgent<
     }
   }
 
+  /**
+   * Refuse every run id that is still registered on any start or core seam.
+   * `#startRequesters` alone is insufficient because `streamUntilPersisted()`
+   * removes it after the first summary while a suspended stream stays live.
+   * The internal registry has no TTL, so it also covers long suspensions after
+   * the global registry's ten-minute TTL expires.
+   * The one exemption is the host's own first start: `streamUntilPersisted()`
+   * stamps its exact options object with a single-use ticket that `stream()`
+   * consumes. A private `WeakSet`, a locally constructed object, and first-use
+   * consumption make that exemption unavailable to callers.
+   */
+  #assertRunIdNotLive(runId: string): void {
+    if (
+      this.#startRequesters.has(runId) ||
+      this.#persistenceWaiters.has(runId) ||
+      globalRunRegistry.has(runId) ||
+      this.runRegistryInternal.has(runId)
+    ) {
+      throw new InvalidRunRequestError(
+        'run id is live in the run registry — a registered run cannot be re-entered',
+      );
+    }
+  }
+
   #assertGuardedStructuredOutput(options: unknown): void {
     if (
       this.#isBreakwaterGuardedAgent &&
@@ -665,8 +677,12 @@ export class FlowsafeDurableAgent<
   ): Promise<
     Awaited<ReturnType<DurableAgent<TAgentId, TTools, TOutput>['stream']>>
   > {
+    const hostStreamTicket =
+      options !== undefined && this.#hostStreamTickets.has(options);
+    if (hostStreamTicket) this.#hostStreamTickets.delete(options);
     const callOptions = snapshotDurableCallOptions(options);
     this.#assertCallerRunId(callOptions?.runId);
+    if (!hostStreamTicket) this.#assertRunIdNotLive(callOptions.runId);
     this.#assertGuardedStructuredOutput(callOptions);
     const result = await super.stream(messages, callOptions);
     if (!callOptions?.untilIdle) {
@@ -692,6 +708,8 @@ export class FlowsafeDurableAgent<
    * workflow starts asynchronously. Agent hosts need an authoritative summary
    * before answering a start request, but must keep the stream subscription
    * and replay cache intact for later HTTP observation.
+   * It stamps the locally constructed stream options with the private,
+   * single-use host ticket that permits only this first call through `stream()`.
    *
    * @internal
    */
@@ -710,6 +728,11 @@ export class FlowsafeDurableAgent<
     const callOptions = snapshotDurableCallOptions(options);
     this.#assertCallerRunId(callOptions?.runId);
     this.#assertGuardedStructuredOutput(callOptions);
+    if (callOptions.untilIdle) {
+      throw new InvalidRunRequestError(
+        'streamUntilPersisted does not support untilIdle',
+      );
+    }
     if (!isExecutionPrincipalId(requestedBy)) {
       throw new InvalidRunRequestError('requestedBy is malformed');
     }
@@ -717,11 +740,7 @@ export class FlowsafeDurableAgent<
       throw new InvalidRunRequestError('requestedByKind is malformed');
     }
     const runId = callOptions.runId;
-    if (this.#persistenceWaiters.has(runId)) {
-      throw new InvalidRunRequestError(
-        `run '${runId}' already has a pending durable start`,
-      );
-    }
+    this.#assertRunIdNotLive(runId);
     let resolve!: () => void;
     let reject!: (error: unknown) => void;
     const persisted = new Promise<void>((resolvePromise, rejectPromise) => {
@@ -738,7 +757,7 @@ export class FlowsafeDurableAgent<
     }
     const onError = callOptions.onError;
     try {
-      const result = await this.stream(messages, {
+      const hostCallOptions: typeof callOptions = {
         ...callOptions,
         onError: async (data) => {
           reject(
@@ -748,7 +767,9 @@ export class FlowsafeDurableAgent<
           );
           await onError?.(data);
         },
-      });
+      };
+      this.#hostStreamTickets.add(hostCallOptions);
+      const result = await this.stream(messages, hostCallOptions);
       await persisted;
       return result;
     } finally {
@@ -778,8 +799,25 @@ export class FlowsafeDurableAgent<
   > {
     const callOptions = snapshotDurableCallOptions(options);
     this.#assertCallerRunId(callOptions?.runId);
+    this.#assertRunIdNotLive(callOptions.runId);
     this.#assertGuardedStructuredOutput(callOptions);
-    return super.generate(messages, callOptions);
+    try {
+      return await super.generate(messages, callOptions);
+    } catch (error) {
+      // Core reconstructs an ERROR chunk with `new Error(message)` plus `name`,
+      // which loses the InvalidRunRequestError prototype before generate sees it.
+      if (
+        error instanceof Error &&
+        error.name === 'InvalidRunRequestError' &&
+        error.message.startsWith(UNREGISTERED_RUN_REFUSAL_PREFIX) &&
+        !(error instanceof InvalidRunRequestError)
+      ) {
+        const wrapped = new InvalidRunRequestError(error.message);
+        Object.defineProperty(wrapped, 'cause', { value: error });
+        throw wrapped;
+      }
+      throw error;
+    }
   }
 
   /**
@@ -792,8 +830,10 @@ export class FlowsafeDurableAgent<
    * (agent/durable/index.js:5984 — all three are 1.50.0-vintage offsets, since
    * that file is a re-export shim from 1.53.0) — so a later
    * `resume(runId)`/`executeWorkflow` sees a bare UUID `PATH_SAFE_ID_PATTERN`
-   * already accepts, past every downstream guard. Enforce the caller-minted ID here, while
-   * "absent" is still visible.
+   * already accepts, past every downstream guard. Enforce the caller-minted ID
+   * here, while "absent" is still visible. A prepared id remains live until core
+   * cleans up the run, so later `stream()`, `generate()`, `prepare()`, and
+   * `streamUntilPersisted()` calls carrying that id are refused.
    */
   override async prepare(
     messages: Parameters<DurableAgent<TAgentId, TTools, TOutput>['prepare']>[0],
@@ -803,6 +843,7 @@ export class FlowsafeDurableAgent<
   > {
     const callOptions = snapshotDurableCallOptions(options);
     this.#assertCallerRunId(callOptions?.runId);
+    this.#assertRunIdNotLive(callOptions.runId);
     this.#assertGuardedStructuredOutput(callOptions);
     return super.prepare(messages, callOptions);
   }
@@ -1261,25 +1302,6 @@ export class FlowsafeDurableAgent<
     this.#assertCallerRunId(options.runId);
     let rehydrated = false;
     let finishThreadRegistration: (() => void) | undefined;
-    const emitTerminalError = async (error: unknown): Promise<void> => {
-      try {
-        await this.emitError(
-          options.runId,
-          error instanceof Error ? error : new Error(String(error)),
-        );
-      } catch (publicationError) {
-        console.error(
-          JSON.stringify({
-            type: 'durable-agent-resume-error-publication-failed',
-            runId: options.runId,
-            error:
-              publicationError instanceof Error
-                ? publicationError.message
-                : String(publicationError),
-          }),
-        );
-      }
-    };
     try {
       const summary = await this.#runtime.resume(
         this.getWorkflow().id,
@@ -1323,20 +1345,110 @@ export class FlowsafeDurableAgent<
         },
       );
       if (summary.status === 'failed') {
-        await emitTerminalError(
+        await this.#publishTerminalError(
+          options.runId,
           new Error(summary.error ?? 'Durable agent workflow resume failed'),
         );
+        this.runRegistryInternal.cleanup(options.runId);
+        globalRunRegistry.delete(options.runId);
       }
       return summary;
     } catch (error) {
       if (rehydrated) {
-        await emitTerminalError(error);
+        await this.#publishTerminalError(options.runId, error);
         this.runRegistryInternal.cleanup(options.runId);
         globalRunRegistry.delete(options.runId);
       }
       throw error;
     } finally {
       finishThreadRegistration?.();
+    }
+  }
+
+  /**
+   * Publish one terminal ERROR attempt without throwing. The unregistered-run
+   * terminal path retries once and throws its refusal only after registry
+   * cleanup; resume publishes best-effort and preserves its summary or original
+   * error. Both call sites publish before cleanup because `emitError()` closes
+   * spans through the live global registry entry.
+   */
+  async #publishTerminalError(runId: string, error: unknown): Promise<boolean> {
+    const terminalError =
+      error instanceof Error ? error : new Error(String(error));
+    try {
+      await this.emitError(runId, terminalError);
+      return true;
+    } catch {
+      console.error(
+        JSON.stringify({
+          type: 'durable-agent-terminal-error-publication-failed',
+          runId,
+        }),
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Preserve unowned input before terminal refusal. A bounded best-effort write
+   * prevents hung memory from blocking the ERROR that heals thread state.
+   */
+  async #persistUnownedInput(
+    runId: string,
+    workflowInput: DurableAgenticWorkflowInput,
+  ): Promise<void> {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        (async () => {
+          const state = workflowInput.state;
+          const threadId = state?.threadId;
+          if (!threadId || state?.threadExists !== true) return;
+          // Explicit read-only memory forbids preserving denied input.
+          if (state.memoryConfig?.readOnly === true) return;
+          const memory = await this.getMemory({
+            requestContext: globalRunRegistry.get(runId)?.requestContext,
+          });
+          if (!memory) return;
+          const list = new MessageList({
+            threadId,
+            resourceId: state.resourceId,
+          }).deserialize(workflowInput.messageListState);
+          const inputIds = list.makeMessageSourceChecker().input;
+          const messages = list.get.all
+            .db()
+            .filter((message) => inputIds.has(message.id))
+            // Honor markPersistenceForbidden's route-to-runner metadata contract.
+            .filter(
+              (message) =>
+                !isMastraSignalMessage(message) ||
+                mastraDBMessageToSignal(message).metadata?.[
+                  FLOWSAFE_PERSISTENCE_FORBIDDEN
+                ] !== true,
+            );
+          if (messages.length) await memory.saveMessages({ messages });
+        })(),
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `unowned input persistence timed out after ${UNOWNED_INPUT_PERSIST_TIMEOUT_MS} ms`,
+                ),
+              ),
+            UNOWNED_INPUT_PERSIST_TIMEOUT_MS,
+          );
+        }),
+      ]);
+    } catch {
+      console.error(
+        JSON.stringify({
+          type: 'durable-agent-unowned-input-persistence-failed',
+          runId,
+        }),
+      );
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
     }
   }
 
@@ -1376,17 +1488,32 @@ export class FlowsafeDurableAgent<
             'requestedBy and requestedByKind must be provided together',
           );
         }
-        summary = await this.#runtime.start(
-          this.getWorkflow().id,
-          startOptions,
+        // No #startRequesters entry means the host start seam never registered
+        // this id, so core minted it below our boundary. Such a run has no
+        // ownership record or trusted engine-leg context. Preserve its input
+        // when allowed, then close the stream so core can clean up its maps and
+        // release the lease transferred to this id.
+        await this.#persistUnownedInput(runId, workflowInput);
+        const refusal = new InvalidRunRequestError(
+          `${UNREGISTERED_RUN_REFUSAL_PREFIX}run '${runId}' was not registered by the host start seam — the durable-agent runner never executes a run it does not own`,
         );
-      } else {
-        summary = await this.#runtime.start(this.getWorkflow().id, {
-          ...startOptions,
-          requestedBy,
-          requestedByKind,
-        });
+        let published = false;
+        try {
+          published =
+            (await this.#publishTerminalError(runId, refusal)) ||
+            (await this.#publishTerminalError(runId, refusal));
+        } finally {
+          this.runRegistryInternal.cleanup(runId);
+          globalRunRegistry.delete(runId);
+        }
+        if (!published) throw refusal;
+        return;
       }
+      summary = await this.#runtime.start(this.getWorkflow().id, {
+        ...startOptions,
+        requestedBy,
+        requestedByKind,
+      });
       waiter?.resolve();
     } catch (error) {
       waiter?.reject(error);

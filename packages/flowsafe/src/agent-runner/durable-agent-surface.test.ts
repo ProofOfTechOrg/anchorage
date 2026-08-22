@@ -47,8 +47,9 @@ import * as barrel from './index.js';
 
 /**
  * Own overrides that keep the loop on RunnerRuntime: each REQUIRES a
- * caller-minted, path-safe runId (INV-1) and drives
- * `runtime.start('durable-agentic-loop', ...)` rather than `createRun + start`.
+ * caller-minted, path-safe runId. Host-seam starts drive
+ * `runtime.start('durable-agentic-loop', ...)`; a direct generate without that
+ * registration rejects after the runner terminally closes its output.
  */
 const guardedByRunner = [
   'executeWorkflow',
@@ -59,9 +60,8 @@ const guardedByRunner = [
 
 /**
  * Reaches a guarded entry through `this.` rather than its own override, so
- * virtual dispatch applies the guard: `streamUntilIdle()` drives
- * `agent.stream()`. Not an own property of FlowsafeDurableAgent.prototype —
- * adding one would be a second copy of the same rule.
+ * virtual dispatch applies the terminal guard: `streamUntilIdle()` drives
+ * `agent.stream()`. Not an own property of FlowsafeDurableAgent.prototype.
  */
 const guardedByDelegation = ['streamUntilIdle'] as const;
 
@@ -242,14 +242,11 @@ const agentSurface = Object.getOwnPropertyNames(Agent.prototype).filter(
  * be somewhere for the two to drift apart.
  *
  * `resumeStreamUntilIdle` and `sendStreamResume` land on the BLOCKED
- * `resumeStream()`. The five signal senders land on the GUARDED `stream()` and
- * stay inherited because FlowSafe's thread Durable Object uses them, whereas
- * `sendToolApproval` is blocked because no route needs it. The guard is not
- * what makes leaving them inherited safe: core mints the run id itself on an
- * idle-thread `queueMessage`, `sendStateSignal` or `sendNotificationSignal`,
- * and on its completion drains, so the guard sees a bare UUID it cannot tell
- * from a host-minted one. A recorded residual — see durable-agent-runner.ts's
- * module comment for the mechanism and the blast radius.
+ * `resumeStream()`. The five signal senders stay inherited because every run
+ * outcome they can produce lands on the runner's terminal path, not because all
+ * five still have route callers. Any run core mints through them reaches a
+ * terminal output without entering RunnerRuntime; see the runner module comment
+ * for the cleanup mechanism.
  */
 const delegatingToGuard = [
   'queueMessage',
@@ -839,14 +836,18 @@ describe('FlowsafeDurableAgent prototype surface inventory', () => {
     ).toEqual(expected);
   });
 
-  it('keeps the reason table off the public subpath', () => {
-    // #then BLOCKED_RUN_ENTRIES is internal: exporting it from the barrel would
-    // put a reason table consumers could branch on into the package's semver
-    // surface, and every string in it would become a breaking change to edit.
+  it('keeps internal protocol constants off the public subpath', () => {
+    // #then BLOCKED_RUN_ENTRIES is a reason table and
+    // FLOWSAFE_PERSISTENCE_FORBIDDEN is a wire-format metadata key; exporting
+    // either from the barrel would put it into the package's semver surface.
     expect(
       barrel,
       'BLOCKED_RUN_ENTRIES is re-exported from ./index.js — it must stay off the @proofoftech/flowsafe/agent-runner subpath',
     ).not.toHaveProperty('BLOCKED_RUN_ENTRIES');
+    expect(
+      barrel,
+      'FLOWSAFE_PERSISTENCE_FORBIDDEN is re-exported from ./index.js — it must stay off the @proofoftech/flowsafe/agent-runner subpath',
+    ).not.toHaveProperty('FLOWSAFE_PERSISTENCE_FORBIDDEN');
   });
 
   it('leaves the delegating entry points inherited', () => {

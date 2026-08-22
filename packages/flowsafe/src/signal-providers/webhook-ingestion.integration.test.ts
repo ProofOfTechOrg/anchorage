@@ -9,6 +9,7 @@
 // end-to-end proof of the webhook→inbox landing.
 import { Agent } from '@mastra/core/agent';
 import { Mastra } from '@mastra/core/mastra';
+import { MockMemory } from '@mastra/core/memory';
 import { describe, expect, it } from 'vitest';
 
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
@@ -63,7 +64,10 @@ async function githubSign(secret: string, body: string): Promise<string> {
 
 // Wire the production chain over one in-memory D1, optionally behind the
 // structural content policy the thread routes accept.
-async function wireWebhookChain(contentPolicy?: SignalContentPolicy) {
+async function wireWebhookChain(
+  contentPolicy?: SignalContentPolicy,
+  options: { recordOnly?: boolean } = {},
+) {
   // #given — one shared D1 with the composed signal domains
   const d1 = sqliteUnitDatabase(openSqlite()) as never;
   const storage = createD1Storage({
@@ -77,9 +81,11 @@ async function wireWebhookChain(contentPolicy?: SignalContentPolicy) {
     name: 'sig-agent',
     instructions: 'webhook delivery target',
     model: 'openai/gpt-4o-mini', // never invoked — no LLM in this proof
+    memory: new MockMemory(),
   });
   const mastra = new Mastra({ storage, agents: { 'sig-agent': bareAgent } });
   const agent = mastra.getAgent('sig-agent');
+  const notifications = new D1NotificationsStorage(d1);
 
   // A thread DO hosting the production Track C signal routes over that agent.
   class TestThread extends ThreadDurableObject<unknown> {
@@ -97,6 +103,12 @@ async function wireWebhookChain(contentPolicy?: SignalContentPolicy) {
     #routes = createThreadSignalRoutes({
       resolveAgent: () => agent,
       resolveResourceId: () => resourceIdFromKey('owner'),
+      ...(options.recordOnly
+        ? {
+            canPersist: () => false,
+            resolveNotificationsStorage: () => notifications,
+          }
+        : {}),
       ...(contentPolicy !== undefined ? { contentPolicy } : {}),
     });
     protected build(): InitResult {
@@ -149,7 +161,7 @@ async function wireWebhookChain(contentPolicy?: SignalContentPolicy) {
     secretForProvider: () => SECRET,
   });
 
-  return { router, threadId, notifications: new D1NotificationsStorage(d1) };
+  return { router, threadId, notifications };
 }
 
 /** A correctly signed GitHub webhook for the subscribed repo. */
@@ -184,6 +196,26 @@ describe('webhook ingestion — full chain (router → topology → thread DO �
       threadId,
       source: 'github',
       summary: expect.stringContaining('github:acme/repo'),
+    });
+  });
+
+  it('records a non-owner webhook for the host notification-dispatch tick', async () => {
+    const { router, threadId, notifications } = await wireWebhookChain(
+      undefined,
+      { recordOnly: true },
+    );
+
+    const res = await router(await signedWebhook());
+
+    expect(res?.status).toBe(200);
+    expect(await res?.json()).toEqual({ matched: 1, delivered: 1 });
+    const inbox = await notifications.listNotifications({ threadId });
+    expect(inbox).toHaveLength(1);
+    expect(inbox[0]).toMatchObject({
+      threadId,
+      source: 'github',
+      status: 'pending',
+      deliverAt: expect.any(Date),
     });
   });
 

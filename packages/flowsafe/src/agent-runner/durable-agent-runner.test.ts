@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-// CI-M-002-001: FlowsafeDurableAgent drives the durable-agentic-loop through
-// RunnerRuntime. These pin the three load-bearing properties without a live
-// LLM (executeWorkflow never invokes the model — it only drives runtime.start):
-//   - the loop is driven via runtime.start('durable-agentic-loop', { runId, inputData })
-//   - runId is REQUIRED with INV-1 posture — NO crypto.randomUUID fallback
-//   - the raw agent and loop workflow are registered on the runtime; workflow
-//     registration is idempotent because the loop id is shared
+// FlowsafeDurableAgent pins the host-seam requester passed to runtime.start;
+// terminal refusal for an unregistered run; bounded, best-effort input
+// preservation plus its missing-thread and read-only-memory branches; live-id
+// refusal; and generate() rewrapping the core-reconstructed terminal refusal.
 //
-// The engine-leg-context -> tool -> grant round-trip (S1/S2) is proven end to
-// end against the REAL runtime + connector + grant provider in
+// The engine-leg-context-to-tool grant round-trip is proven end to end against
+// the real runtime, connector, and grant provider in
 // agent-gate-round-trip.test.ts.
+// The suspended-run live-id window is pinned in
+// thread-do-routes.real-agent.test.ts by
+// "rejects re-entry after the host waiter settles while the run registry stays
+// live".
 
 import { Agent } from '@mastra/core/agent';
 import {
@@ -24,6 +25,7 @@ import {
   MessageList,
 } from '@mastra/core/agent/message-list';
 import { EventEmitterPubSub } from '@mastra/core/events';
+import { MockMemory } from '@mastra/core/memory';
 import {
   type OutputResult,
   type Processor,
@@ -431,18 +433,179 @@ describe('createFlowsafeDurableAgent', () => {
 });
 
 describe('FlowsafeDurableAgent.executeWorkflow', () => {
-  it("drives runtime.start('durable-agentic-loop', { runId, inputData })", async () => {
-    // #given
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('terminally fails and persists input when the host seam did not register the run', async () => {
+    // #given a real prepared input whose thread already exists
     const { runtime, start } = fakeRuntime();
-    const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
-    // #when the loop drives a run
-    await drive(agent, 'run-1', INPUT);
-    // #then it is routed through the runtime chokepoint, not createRun + start
-    expect(start).toHaveBeenCalledTimes(1);
-    expect(start).toHaveBeenCalledWith(DURABLE_AGENTIC_LOOP_WORKFLOW_ID, {
-      runId: 'run-1',
-      inputData: INPUT,
+    const memory = new MockMemory();
+    await memory.saveThread({
+      thread: {
+        id: 'thread-1',
+        resourceId: 'resource-1',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        metadata: {},
+      },
     });
+    const rawAgent = new Agent({
+      id: 'writer',
+      name: 'writer',
+      instructions: 'You are a test agent.',
+      model: 'openai/gpt-4o-mini',
+      memory,
+    });
+    const agent = createFlowsafeDurableAgent({ agent: rawAgent, runtime });
+    const prepared = await agent.prepare('denied input', {
+      runId: 'run-1',
+      memory: { thread: 'thread-1', resource: 'resource-1' },
+    });
+    const saveMessages = vi.spyOn(memory, 'saveMessages');
+    const emitError = vi
+      .spyOn(
+        agent as unknown as {
+          emitError: (id: string, error: Error) => Promise<void>;
+        },
+        'emitError',
+      )
+      .mockResolvedValue(undefined);
+
+    // #when core drives the prepared run without the host start seam
+    await drive(agent, 'run-1', prepared.workflowInput);
+
+    // #then it closes terminally without creating a runtime run
+    expect(start).not.toHaveBeenCalled();
+    expect(emitError).toHaveBeenCalledWith(
+      'run-1',
+      expect.any(InvalidRunRequestError),
+    );
+    expect(saveMessages).toHaveBeenCalledOnce();
+    expect(saveMessages.mock.calls[0]?.[0].messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ role: 'user', threadId: 'thread-1' }),
+      ]),
+    );
+    expect(registryFor(agent).has('run-1')).toBe(false);
+    expect(globalRunRegistry.has('run-1')).toBe(false);
+  });
+
+  it.each([
+    ['a missing thread', { threadExists: false }],
+    [
+      'read-only memory',
+      { threadExists: true, memoryConfig: { readOnly: true } },
+    ],
+  ])('does not preserve unowned input under %s', async (_label, state) => {
+    const { runtime } = fakeRuntime();
+    const memory = new MockMemory();
+    const agent = createFlowsafeDurableAgent({
+      agent: new Agent({
+        id: 'writer',
+        name: 'writer',
+        instructions: 'You are a test agent.',
+        model: 'openai/gpt-4o-mini',
+        memory,
+      }),
+      runtime,
+    });
+    const prepared = await agent.prepare('denied input', { runId: 'run-1' });
+    const saveMessages = vi.spyOn(memory, 'saveMessages');
+    vi.spyOn(
+      agent as unknown as {
+        emitError: (id: string, error: Error) => Promise<void>;
+      },
+      'emitError',
+    ).mockResolvedValue(undefined);
+
+    await drive(agent, 'run-1', {
+      ...prepared.workflowInput,
+      state: {
+        ...prepared.workflowInput.state,
+        threadId: 'thread-1',
+        resourceId: 'resource-1',
+        ...state,
+      },
+    });
+
+    expect(saveMessages).not.toHaveBeenCalled();
+  });
+
+  it('publishes the terminal error when unowned input persistence times out', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const { runtime } = fakeRuntime();
+      const memory = new MockMemory();
+      await memory.saveThread({
+        thread: {
+          id: 'thread-1',
+          resourceId: 'resource-1',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          metadata: {},
+        },
+      });
+      const agent = createFlowsafeDurableAgent({
+        agent: new Agent({
+          id: 'writer',
+          name: 'writer',
+          instructions: 'You are a test agent.',
+          model: 'openai/gpt-4o-mini',
+          memory,
+        }),
+        runtime,
+      });
+      const prepared = await agent.prepare('denied input', {
+        runId: 'run-1',
+        memory: { thread: 'thread-1', resource: 'resource-1' },
+      });
+      vi.spyOn(memory, 'saveMessages').mockImplementation(
+        () => new Promise(() => undefined),
+      );
+      const emitError = vi
+        .spyOn(
+          agent as unknown as {
+            emitError: (id: string, error: Error) => Promise<void>;
+          },
+          'emitError',
+        )
+        .mockResolvedValue(undefined);
+      const execution = drive(agent, 'run-1', prepared.workflowInput);
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      await execution;
+
+      expect(emitError).toHaveBeenCalledWith(
+        'run-1',
+        expect.any(InvalidRunRequestError),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('retries terminal publication once before handing failure back to core', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { runtime } = fakeRuntime();
+    const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
+    const prepared = await agent.prepare('denied input', { runId: 'run-1' });
+    const emitError = vi
+      .spyOn(
+        agent as unknown as {
+          emitError: (id: string, error: Error) => Promise<void>;
+        },
+        'emitError',
+      )
+      .mockRejectedValue(new Error('publication failed'));
+
+    await expect(
+      drive(agent, 'run-1', prepared.workflowInput),
+    ).rejects.toBeInstanceOf(InvalidRunRequestError);
+    expect(emitError).toHaveBeenCalledTimes(2);
+    expect(registryFor(agent).has('run-1')).toBe(false);
+    expect(globalRunRegistry.has('run-1')).toBe(false);
   });
 
   it('rejects an absent runId (INV-1: no crypto.randomUUID fallback)', async () => {
@@ -473,6 +636,28 @@ describe('FlowsafeDurableAgent.executeWorkflow', () => {
 });
 
 describe('FlowsafeDurableAgent.streamUntilPersisted', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('refuses untilIdle before registering a host start', async () => {
+    const { runtime, start } = fakeRuntime();
+    const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
+    const stream = vi.spyOn(agent, 'stream');
+
+    await expect(
+      agent.streamUntilPersisted(
+        'hello',
+        { runId: 'run-1', untilIdle: true },
+        'operator-1',
+        'human',
+      ),
+    ).rejects.toBeInstanceOf(InvalidRunRequestError);
+
+    expect(stream).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+  });
+
   it('snapshots call options before installing persistence state', async () => {
     const { runtime } = fakeRuntime();
     const agent = createFlowsafeDurableAgent({
@@ -568,6 +753,37 @@ describe('FlowsafeDurableAgent.streamUntilPersisted', () => {
     await execution;
   });
 
+  it('rejects direct stream and generate collisions while a host start is registered', async () => {
+    const { runtime, start } = fakeRuntime();
+    const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
+    const streamResult = { output: { id: 'output' } };
+    const superStream = vi
+      .spyOn(DurableAgent.prototype, 'stream')
+      .mockResolvedValue(streamResult as never);
+    const superGenerate = vi.spyOn(DurableAgent.prototype, 'generate');
+    let settled = false;
+    const pending = agent
+      .streamUntilPersisted('first', { runId: 'run-1' }, 'operator-1', 'human')
+      .finally(() => {
+        settled = true;
+      });
+    await vi.waitFor(() => expect(superStream).toHaveBeenCalledOnce());
+
+    await expect(agent.stream('second', { runId: 'run-1' })).rejects.toThrow(
+      'run id is live in the run registry — a registered run cannot be re-entered',
+    );
+    await expect(agent.generate('second', { runId: 'run-1' })).rejects.toThrow(
+      'run id is live in the run registry — a registered run cannot be re-entered',
+    );
+    expect(superStream).toHaveBeenCalledOnce();
+    expect(superGenerate).not.toHaveBeenCalled();
+    expect(settled).toBe(false);
+
+    await drive(agent, 'run-1', INPUT);
+    await expect(pending).resolves.toBe(streamResult);
+    expect(start).toHaveBeenCalledOnce();
+  });
+
   it('rejects when durable persistence fails', async () => {
     const { runtime, start } = fakeRuntime();
     start.mockRejectedValue(new Error('D1 unavailable'));
@@ -618,6 +834,39 @@ describe('FlowsafeDurableAgent.streamUntilPersisted', () => {
 // These pin that the boundary refuses an absent/non-path-safe runId before any
 // run is registered.
 describe('FlowsafeDurableAgent INV-1 boundary (stream/generate)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('does not re-badge an unrelated error that only copied the refusal name', async () => {
+    const { runtime } = fakeRuntime();
+    const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
+    const original = new Error('unrelated core failure');
+    original.name = 'InvalidRunRequestError';
+    vi.spyOn(DurableAgent.prototype, 'generate').mockRejectedValue(original);
+
+    await expect(agent.generate('Hello!', { runId: 'run-1' })).rejects.toBe(
+      original,
+    );
+  });
+
+  it('restores the refusal prototype and preserves the rebuilt error as cause', async () => {
+    const { runtime } = fakeRuntime();
+    const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
+    const rebuilt = new Error(
+      "Flowsafe durable-agent runner refused unregistered run: run 'run-1' was not registered by the host start seam",
+    );
+    rebuilt.name = 'InvalidRunRequestError';
+    vi.spyOn(DurableAgent.prototype, 'generate').mockRejectedValue(rebuilt);
+
+    const rejection = await agent
+      .generate('Hello!', { runId: 'run-1' })
+      .catch((error: unknown) => error);
+
+    expect(rejection).toBeInstanceOf(InvalidRunRequestError);
+    expect((rejection as Error & { cause?: unknown }).cause).toBe(rebuilt);
+  });
+
   it('stream() without a runId rejects (no crypto.randomUUID upstream)', async () => {
     // #given
     const { runtime, start } = fakeRuntime();
@@ -1084,7 +1333,56 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
     expect(resumeExecution).not.toHaveBeenCalled();
   });
 
-  it('publishes a resume rejection and preserves it if publication also fails', async () => {
+  it('keeps the live registry available while real resume error publication runs', async () => {
+    const { runtime, resume } = fakeRuntime();
+    resume.mockImplementation(async (_workflowId, _runId, options) => {
+      await options?.prepareExecution?.(actorContext());
+      return {
+        runId: 'run-1',
+        status: 'failed',
+        error: 'resume failed',
+      } as never;
+    });
+    const prototype = DurableAgent.prototype as unknown as {
+      emitError(runId: string, error: Error): Promise<void>;
+    };
+    const realEmitError = prototype.emitError;
+    const registryWasLive: boolean[] = [];
+    vi.spyOn(prototype, 'emitError').mockImplementation(function (
+      this: DurableAgent,
+      runId,
+      error,
+    ) {
+      registryWasLive.push(globalRunRegistry.has(runId));
+      return realEmitError.call(this, runId, error);
+    });
+    const agent = createFlowsafeDurableAgent({
+      agent: testAgent(),
+      runtime,
+      threadRuntime: { registerRun: vi.fn(async () => undefined) } as never,
+    });
+    vi.spyOn(agent, 'observe').mockResolvedValue({
+      output: {
+        id: 'rehydrated',
+        runId: 'run-1',
+        status: 'failed',
+        _waitUntilFinished: () => new Promise<void>(() => undefined),
+      },
+    } as never);
+
+    const summary = await agent.resumeViaRuntime({
+      runId: 'run-1',
+      requestedBy: 'reviewer-1',
+    });
+
+    expect(summary.status).toBe('failed');
+    expect(registryWasLive).toEqual([true]);
+    expect(registryFor(agent).has('run-1')).toBe(false);
+    expect(globalRunRegistry.has('run-1')).toBe(false);
+  });
+
+  it('cleans up and rethrows the original resume error when publication fails', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const { runtime, resume } = fakeRuntime();
     const original = new Error('resume rejected');
     resume.mockImplementation(async (_workflowId, _runId, options) => {
@@ -1109,26 +1407,29 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
         _waitUntilFinished: () => new Promise<void>(() => undefined),
       },
     } as never);
-    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
-    vi.spyOn(
-      agent as unknown as {
-        emitError: (id: string, error: Error) => Promise<void>;
-      },
-      'emitError',
-    ).mockRejectedValue(new Error('publication failed'));
+    const emitError = vi
+      .spyOn(
+        agent as unknown as {
+          emitError: (id: string, error: Error) => Promise<void>;
+        },
+        'emitError',
+      )
+      .mockRejectedValue(new Error('publication failed'));
 
     await expect(
       agent.resumeViaRuntime({ runId: 'run-1', requestedBy: 'reviewer-1' }),
     ).rejects.toBe(original);
-    expect(log).toHaveBeenCalledWith(
-      expect.stringContaining('durable-agent-resume-error-publication-failed'),
-    );
+    expect(emitError).toHaveBeenCalledOnce();
+    expect(emitError).toHaveBeenCalledWith('run-1', original);
+    expect(registryFor(agent).has('run-1')).toBe(false);
+    expect(globalRunRegistry.has('run-1')).toBe(false);
     await expect(
       registeredOutput?._waitUntilFinished(),
     ).resolves.toBeUndefined();
   });
 
   it('publishes a failed resume summary and returns it', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const { runtime, resume } = fakeRuntime();
     resume.mockImplementation(async (_workflowId, _runId, options) => {
       await options?.prepareExecution?.(actorContext());
@@ -1163,7 +1464,7 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
         },
         'emitError',
       )
-      .mockResolvedValue(undefined);
+      .mockRejectedValue(new Error('publication failed'));
 
     const summary = await agent.resumeViaRuntime({
       runId: 'run-1',
@@ -1172,6 +1473,8 @@ describe('FlowsafeDurableAgent thread runtime registration and rehydration', () 
 
     expect(summary).toMatchObject({ status: 'failed', error: 'resume failed' });
     expect(emitError.mock.calls[0]?.[1]?.message).toBe('resume failed');
+    expect(registryFor(agent).has('run-1')).toBe(false);
+    expect(globalRunRegistry.has('run-1')).toBe(false);
     await expect(
       registeredOutput?._waitUntilFinished(),
     ).resolves.toBeUndefined();
@@ -1185,6 +1488,8 @@ describe('FlowsafeDurableAgent.executeWorkflow failed run', () => {
       startResult: { runId: 'run-1', status: 'failed', error: 'boom' },
     });
     const agent = createFlowsafeDurableAgent({ agent: testAgent(), runtime });
+    const streamResult = { output: { id: 'output' } };
+    vi.spyOn(agent, 'stream').mockResolvedValue(streamResult as never);
     const emitError = vi
       .spyOn(
         agent as unknown as {
@@ -1193,8 +1498,14 @@ describe('FlowsafeDurableAgent.executeWorkflow failed run', () => {
         'emitError',
       )
       .mockResolvedValue(undefined);
-    // #when the loop drives it
-    await drive(agent, 'run-1', INPUT);
+    const pending = agent.streamUntilPersisted(
+      'hello',
+      { runId: 'run-1' },
+      'operator-1',
+      'human',
+    );
+    // #when the host-registered loop drives it
+    await Promise.all([drive(agent, 'run-1', INPUT), pending]);
     // #then the failed status is surfaced to observe()/onError via emitError
     expect(emitError).toHaveBeenCalledWith('run-1', expect.any(Error));
     expect(emitError.mock.calls[0]?.[1]?.message).toBe('boom');

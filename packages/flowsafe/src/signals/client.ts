@@ -110,12 +110,15 @@ export class SignalClient {
     this.#headers = { ...options.headers };
   }
 
-  /** An immediate user message — joins the active loop, or (idle) wakes/persists. */
+  /**
+   * An immediate user message — joins the active loop, or (idle) wakes or
+   * persists; a persist no agent memory can hold answers `memory-unavailable`.
+   */
   async sendMessage(threadId: string, body: SendMessageBody): Promise<unknown> {
     return this.#post(threadId, 'message', body);
   }
 
-  /** A message delivered on the NEXT turn (never wakes an idle thread). */
+  /** A message persisted for the next host-started turn. */
   async queueMessage(
     threadId: string,
     body: SendMessageBody,
@@ -123,12 +126,20 @@ export class SignalClient {
     return this.#post(threadId, 'queue', body);
   }
 
-  /** A system signal (ifActive/ifIdle deliver/persist/discard/wake). */
+  /**
+   * A system signal (ifActive/ifIdle deliver/persist/discard/wake); a persist
+   * no agent memory can hold answers `memory-unavailable`.
+   */
   async sendSignal(threadId: string, body: SendSignalBody): Promise<unknown> {
     return this.#post(threadId, 'signal', body);
   }
 
-  /** A durable thread-state lane (snapshot/delta, cacheKey dedupe). */
+  /**
+   * A durable thread-state lane (snapshot/delta, cacheKey dedupe). Owner gates
+   * can return `principal-mismatch` or `persistence-forbidden`, missing memory
+   * returns `memory-unavailable`, and an unbranded agent marks successful
+   * non-skipped responses as `degraded: 'not-runtime-driven'`.
+   */
   async sendStateSignal(
     threadId: string,
     body: SendStateBody,
@@ -136,7 +147,10 @@ export class SignalClient {
     return this.#post(threadId, 'state', body);
   }
 
-  /** A durable AGENT inbox notification (surfaces on the next turn). */
+  /**
+   * A durable AGENT inbox notification. Owners best-effort persist it for the
+   * next host-started turn; non-owners record it for the host dispatch tick.
+   */
   async sendNotificationSignal(
     threadId: string,
     body: SendNotificationBody,

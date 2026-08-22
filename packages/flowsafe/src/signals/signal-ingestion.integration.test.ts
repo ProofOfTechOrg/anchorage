@@ -171,6 +171,7 @@ function reserveAgent(): {
     id: 'reserve',
     [RUNTIME_DRIVEN_AGENT]: true,
     __setPubSub: () => {},
+    getMemory: () => ({ saveMessages: vi.fn() }),
     sendMessage: (_message: unknown, target: { ifIdle?: unknown }) => {
       targets.push(target);
       return {

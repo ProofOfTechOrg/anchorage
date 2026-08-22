@@ -17,7 +17,7 @@ import {
   summarizeNotifications,
 } from '@mastra/core/notifications';
 import { describe, expect, it, vi } from 'vitest';
-
+import { FLOWSAFE_PERSISTENCE_FORBIDDEN } from '../agent-runner/durable-agent-runner.js';
 import { RUNTIME_DRIVEN_AGENT } from '../agent-runner/index.js';
 import {
   DoStatusError,
@@ -42,16 +42,27 @@ interface AgentCall {
   };
 }
 
-function mockAgent(runtimeDriven = true): {
+function mockAgent(
+  options: { runtimeDriven?: boolean; memory?: unknown } = {},
+): {
   agent: Agent;
   calls: AgentCall[];
   pubsub: () => unknown;
 } {
   const calls: AgentCall[] = [];
   let stampedPubsub: unknown;
-  const result = (id: string) => ({
+  const runtimeDriven = options.runtimeDriven ?? true;
+  const memory = Object.hasOwn(options, 'memory')
+    ? options.memory
+    : { saveMessages: vi.fn() };
+  const result = (id: string, action: 'deliver' | 'persist' = 'deliver') => ({
     signal: { id },
-    accepted: Promise.resolve({ action: 'deliver' as const, runId: 'run-1' }),
+    accepted: Promise.resolve(
+      action === 'persist'
+        ? ({ action: 'persist' } as const)
+        : ({ action: 'deliver', runId: 'run-1' } as const),
+    ),
+    ...(action === 'persist' ? { persisted: Promise.resolve() } : {}),
   });
   const agent = {
     id: 'agent',
@@ -61,13 +72,17 @@ function mockAgent(runtimeDriven = true): {
     __setPubSub: (p: unknown) => {
       stampedPubsub = p;
     },
+    getMemory: () => memory,
     sendMessage: (_m: unknown, target: AgentCall['target']) => {
       calls.push({ method: 'sendMessage', target });
-      return result('m');
-    },
-    queueMessage: (_m: unknown, target: AgentCall['target']) => {
-      calls.push({ method: 'queueMessage', target });
-      return result('q');
+      const action =
+        (target.ifActive as { behavior?: unknown } | undefined)?.behavior ===
+          'persist' &&
+        (target.ifIdle as { behavior?: unknown } | undefined)?.behavior ===
+          'persist'
+          ? 'persist'
+          : 'deliver';
+      return result('m', action);
     },
     sendSignal: (_s: unknown, target: AgentCall['target']) => {
       calls.push({ method: 'sendSignal', target });
@@ -82,9 +97,13 @@ function mockAgent(runtimeDriven = true): {
       target: AgentCall['target'],
     ) => {
       calls.push({ method: 'sendNotificationSignal', target });
+      const behavior =
+        (target.ifIdle as { behavior?: 'persist' | 'discard' } | undefined)
+          ?.behavior ?? 'persist';
       return {
         record: { id: 'n', threadId: target.threadId, status: 'pending' },
         decision: { action: 'persist' },
+        accepted: Promise.resolve({ action: behavior }),
       };
     },
   } as unknown as Agent;
@@ -516,6 +535,81 @@ describe('createThreadSignalRoutes', () => {
     expect(settle).toHaveBeenCalledOnce();
   });
 
+  it('settles a memory-less persisted schedule fire as a canonical discard', async () => {
+    const { agent, calls } = mockAgent({ memory: undefined });
+    const persisted = deferred<void>();
+    const sendSignal = vi.fn(
+      (signal: { id: string }, target: AgentCall['target']) => {
+        calls.push({ method: 'sendSignal', target });
+        return {
+          signal,
+          accepted: Promise.resolve({ action: 'persist' as const }),
+          persisted: persisted.promise,
+        };
+      },
+    );
+    (agent as unknown as { sendSignal: typeof sendSignal }).sendSignal =
+      sendSignal;
+    const begin = vi.fn(async () => ({ state: 'ready' as const }));
+    const settle = vi.fn(async () => undefined);
+    const body = {
+      scheduleId: 'schedule_1',
+      dispatchId: 'dispatch_1',
+      runId: 'run_1',
+    };
+    let routes!: ReturnType<typeof createThreadSignalRoutes>;
+    let replayPayload: unknown;
+    settle.mockImplementationOnce(async () => {
+      const replay = await routes(
+        post('/signal/schedule', body),
+        scopeWith(undefined),
+      );
+      replayPayload = await replay?.json();
+    });
+    routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_t1',
+      canPersist: () => false,
+      canPersistSchedule: () => true,
+      resolveScheduleTarget: async () =>
+        scheduleTarget({ ifIdle: { behavior: 'persist' } }),
+      resolveScheduleDispatchStore: () => ({ begin, settle }),
+    });
+
+    const pending = routes(
+      post('/signal/schedule', body),
+      scopeWith(undefined),
+    );
+    await vi.waitFor(() => expect(sendSignal).toHaveBeenCalledOnce());
+    expect(settle).not.toHaveBeenCalled();
+    persisted.resolve();
+    const response = await pending;
+
+    const receipt = {
+      action: 'discard',
+      outcome: 'discarded',
+      signalId: 'dispatch_1',
+    } as const;
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toEqual({ receipt });
+    expect(replayPayload).toEqual({ receipt });
+    expect(begin).toHaveBeenCalledOnce();
+    expect(sendSignal).toHaveBeenCalledOnce();
+    expect(settle).toHaveBeenNthCalledWith(
+      1,
+      'schedule_1',
+      'dispatch_1',
+      receipt,
+    );
+    expect(settle).toHaveBeenNthCalledWith(
+      2,
+      'schedule_1',
+      'dispatch_1',
+      receipt,
+    );
+    expect(calls[0]?.target.ifIdle).toEqual({ behavior: 'persist' });
+  });
+
   it('routes each channel to the matching agent method', async () => {
     const { agent, calls } = mockAgent();
     const routes = createThreadSignalRoutes({
@@ -541,11 +635,673 @@ describe('createThreadSignalRoutes', () => {
     );
     expect(calls.map((c) => c.method)).toEqual([
       'sendMessage',
-      'queueMessage',
+      'sendMessage',
       'sendSignal',
       'sendStateSignal',
       'sendNotificationSignal',
     ]);
+    expect(calls[1]?.target).toMatchObject({
+      ifActive: { behavior: 'persist' },
+      ifIdle: { behavior: 'persist' },
+    });
+  });
+
+  it('applies queue owner gates to state before sending', async () => {
+    const mismatch = mockAgent();
+    const mismatchRoutes = createThreadSignalRoutes({
+      resolveAgent: () => mismatch.agent,
+      resolveResourceId: () => 'acme_res',
+      resolveBlockingRun: () => ({
+        runId: 'run-other',
+        principal: { kind: 'human', id: 'other', role: 'operator' },
+      }),
+      serializeDispatch: async (_scope, operation) => operation(),
+    });
+    const mismatchResponse = await mismatchRoutes(
+      post('/signal/state', { id: 'g', cacheKey: 'k', contents: 'a' }),
+      scopeWith(undefined),
+    );
+    expect(await mismatchResponse?.json()).toMatchObject({
+      decision: {
+        action: 'blocked',
+        reason: 'principal-mismatch',
+        runId: 'run-other',
+      },
+    });
+    expect(mismatch.calls).toHaveLength(0);
+
+    const forbidden = mockAgent();
+    const forbiddenRoutes = createThreadSignalRoutes({
+      resolveAgent: () => forbidden.agent,
+      resolveResourceId: () => 'acme_res',
+      canPersist: () => false,
+    });
+    const forbiddenResponse = await forbiddenRoutes(
+      post('/signal/state', { id: 'g', cacheKey: 'k', contents: 'a' }),
+      scopeWith(undefined),
+    );
+    expect(await forbiddenResponse?.json()).toEqual({
+      decision: { action: 'discard', reason: 'persistence-forbidden' },
+    });
+    expect(forbidden.calls).toHaveLength(0);
+  });
+
+  it('records non-owner notifications for the trusted dispatcher', async () => {
+    const { agent, calls } = mockAgent({ memory: undefined });
+    const storage = new InMemoryNotificationsStorage();
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      canPersist: () => false,
+      resolveNotificationsStorage: () => storage,
+    });
+
+    const response = await routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'changed',
+      }),
+      scopeWith(undefined),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(calls).toHaveLength(0);
+    expect(await response?.json()).toMatchObject({
+      delivery: { action: 'deferred', reason: 'dispatcher' },
+      record: {
+        threadId: 'acme_t1',
+        resourceId: 'acme_res',
+        agentId: 'agent',
+        status: 'pending',
+        deliverAt: expect.any(String),
+      },
+    });
+  });
+
+  it('fails non-owner notification recording when inbox storage is absent', async () => {
+    const { agent, calls } = mockAgent();
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      canPersist: () => false,
+    });
+
+    const response = await routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'changed',
+      }),
+      scopeWith(undefined),
+    );
+
+    expect(response?.status).toBe(409);
+    expect(await response?.json()).toEqual({
+      error: 'notifications storage unavailable',
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('keeps a low-priority summarize decision under record without delivery', async () => {
+    const { agent } = mockAgent();
+    const sendNotificationSignal = vi.fn(async () => ({
+      record: { id: 'low', threadId: 'acme_t1', status: 'pending' },
+      decision: { action: 'summarize' as const },
+    }));
+    (
+      agent as unknown as {
+        sendNotificationSignal: typeof sendNotificationSignal;
+      }
+    ).sendNotificationSignal = sendNotificationSignal;
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+
+    const response = await routes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'changed',
+        priority: 'low',
+      }),
+      scopeWith(undefined),
+    );
+    const payload = (await response?.json()) as Record<string, unknown>;
+
+    expect(payload).toEqual({
+      record: {
+        record: { id: 'low', threadId: 'acme_t1', status: 'pending' },
+        decision: { action: 'summarize' },
+      },
+    });
+    expect(payload).not.toHaveProperty('delivery');
+  });
+
+  it.each([
+    ['/signal/queue', { contents: 'a' }],
+    ['/signal/state', { id: 'g', cacheKey: 'k', contents: 'a' }],
+  ])('answers memory-unavailable for a memory-less %s persist', async (path, body) => {
+    const { agent, calls } = mockAgent({ memory: undefined });
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+
+    const response = await routes(post(path, body), scopeWith(undefined));
+
+    expect(await response?.json()).toEqual({
+      decision: { action: 'discard', reason: 'memory-unavailable' },
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('runs the content gate before the memory prerequisite', async () => {
+    const { agent, calls } = mockAgent({ memory: undefined });
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      contentPolicy: () => ({ allowed: false, outcome: 'denied' }),
+    });
+
+    const response = await routes(
+      post('/signal/queue', { contents: 'denied' }),
+      scopeWith(undefined),
+    );
+
+    expect(response?.status).toBe(422);
+    expect(await response?.json()).toEqual({ error: 'signal content denied' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('resolves throwing memory lazily and fails closed only at persist gates', async () => {
+    const throwingMemoryAgent = () => {
+      const mocked = mockAgent();
+      const getMemory = vi.fn(() => {
+        throw new Error('private memory failure');
+      });
+      (mocked.agent as unknown as { getMemory: typeof getMemory }).getMemory =
+        getMemory;
+      return { ...mocked, getMemory };
+    };
+
+    const denied = throwingMemoryAgent();
+    const deniedRoutes = createThreadSignalRoutes({
+      resolveAgent: () => denied.agent,
+      resolveResourceId: () => 'acme_res',
+      contentPolicy: () => ({ allowed: false, outcome: 'denied' }),
+    });
+    const deniedResponse = await deniedRoutes(
+      post('/signal/queue', { contents: 'denied' }),
+      scopeWith(undefined),
+    );
+    expect(deniedResponse?.status).toBe(422);
+    expect(denied.getMemory).not.toHaveBeenCalled();
+
+    const waking = throwingMemoryAgent();
+    const startIdleRun = vi.fn(async ({ runId }) => ({ runId }));
+    const wakingRoutes = createThreadSignalRoutes({
+      resolveAgent: () => waking.agent,
+      resolveResourceId: () => 'acme_res',
+      startIdleRun,
+    });
+    await wakingRoutes(
+      post('/signal/message', { contents: 'wake', ifIdle: 'wake' }),
+      scopeWith(undefined),
+    );
+    expect(startIdleRun).toHaveBeenCalledOnce();
+    expect(waking.getMemory).not.toHaveBeenCalled();
+
+    const notifying = throwingMemoryAgent();
+    const notifyingRoutes = createThreadSignalRoutes({
+      resolveAgent: () => notifying.agent,
+      resolveResourceId: () => 'acme_res',
+    });
+    const notificationResponse = await notifyingRoutes(
+      post('/signal/notification', {
+        source: 'provider',
+        kind: 'changed',
+        summary: 'changed',
+      }),
+      scopeWith(undefined),
+    );
+    expect(notificationResponse?.status).toBe(200);
+    expect(await notificationResponse?.json()).toMatchObject({
+      record: { record: { id: 'n' } },
+    });
+    expect(notifying.getMemory).not.toHaveBeenCalled();
+
+    const persisting = throwingMemoryAgent();
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const persistingRoutes = createThreadSignalRoutes({
+        resolveAgent: () => persisting.agent,
+        resolveResourceId: () => 'acme_res',
+      });
+      const queueResponse = await persistingRoutes(
+        post('/signal/queue', { contents: 'persist' }),
+        scopeWith(undefined),
+      );
+      expect(await queueResponse?.json()).toEqual({
+        decision: { action: 'discard', reason: 'memory-unavailable' },
+      });
+      expect(persisting.getMemory).toHaveBeenCalledOnce();
+      expect(log).toHaveBeenCalledWith(
+        JSON.stringify({
+          type: 'signal-memory-resolution-failed',
+          threadId: 'acme_t1',
+        }),
+      );
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('starts a memory-less runtime-driven wake without a persistence gate', async () => {
+    const { agent } = mockAgent({ memory: undefined });
+    const startIdleRun = vi.fn(async ({ runId }) => ({ runId }));
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      startIdleRun,
+    });
+
+    const response = await routes(
+      post('/signal/message', { contents: 'wake', ifIdle: 'wake' }),
+      scopeWith(undefined),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(startIdleRun).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['/signal/message', 'sendMessage', 'message'],
+    ['/signal', 'sendSignal', 'signal'],
+  ] as const)('delivers a default memory-less %s request to an active run', async (path, method, signalId) => {
+    const { agent, calls } = mockAgent({ memory: undefined });
+    (
+      agent as unknown as { getActiveThreadRunId: () => string }
+    ).getActiveThreadRunId = () => 'active-run';
+    const sender = vi.fn((_input, target: AgentCall['target']) => {
+      calls.push({ method, target });
+      return {
+        signal: { id: signalId },
+        accepted: Promise.resolve({
+          action: 'deliver' as const,
+          runId: 'active-run',
+        }),
+      };
+    });
+    (agent as unknown as Record<typeof method, typeof sender>)[method] = sender;
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+
+    const response = await routes(
+      post(path, { contents: 'deliver active' }),
+      scopeWith(undefined),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toEqual({
+      decision: { action: 'deliver', runId: 'active-run' },
+      capped: false,
+      signalId,
+    });
+    expect(sender).toHaveBeenCalledOnce();
+    expect(calls[0]?.target.ifIdle).toEqual({ behavior: 'discard' });
+  });
+
+  it.each([
+    ['/signal/message', 'sendMessage'],
+    ['/signal', 'sendSignal'],
+  ] as const)('answers memory-unavailable when a default memory-less %s request is discarded idle', async (path, method) => {
+    const { agent, calls } = mockAgent({ memory: undefined });
+    const sender = vi.fn((_input, target: AgentCall['target']) => {
+      calls.push({ method, target });
+      return {
+        signal: { id: 'signal' },
+        accepted: Promise.resolve({ action: 'discard' as const }),
+      };
+    });
+    (agent as unknown as Record<typeof method, typeof sender>)[method] = sender;
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+
+    const response = await routes(
+      post(path, { contents: 'discard idle' }),
+      scopeWith(undefined),
+    );
+
+    expect(await response?.json()).toEqual({
+      decision: { action: 'discard', reason: 'memory-unavailable' },
+    });
+    expect(sender).toHaveBeenCalledOnce();
+    expect(calls[0]?.target.ifIdle).toEqual({ behavior: 'discard' });
+  });
+
+  it.each([
+    ['/signal/message', 'sendMessage', 'message'],
+    ['/signal', 'sendSignal', 'signal'],
+  ] as const)('returns a caller-requested memory-less %s discard unchanged', async (path, method, signalId) => {
+    const { agent, calls } = mockAgent({ memory: undefined });
+    const sender = vi.fn((_input, target: AgentCall['target']) => {
+      calls.push({ method, target });
+      return {
+        signal: { id: signalId },
+        accepted: Promise.resolve({ action: 'discard' as const }),
+      };
+    });
+    (agent as unknown as Record<typeof method, typeof sender>)[method] = sender;
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+
+    const response = await routes(
+      post(path, { contents: 'discard idle', ifIdle: 'discard' }),
+      scopeWith(undefined),
+    );
+
+    expect(await response?.json()).toEqual({
+      decision: { action: 'discard' },
+      capped: false,
+      signalId,
+    });
+    expect(sender).toHaveBeenCalledOnce();
+    expect(calls[0]?.target.ifIdle).toEqual({ behavior: 'discard' });
+  });
+
+  it.each([
+    [
+      'returns a caller-requested active discard without memory',
+      false,
+      'discard',
+      'discard',
+      {
+        decision: { action: 'discard' },
+        capped: false,
+        signalId: 'signal',
+      },
+    ],
+    [
+      'answers memory-unavailable for an active persist without memory',
+      false,
+      'persist',
+      'persist',
+      {
+        decision: { action: 'discard', reason: 'memory-unavailable' },
+      },
+    ],
+    [
+      'returns an active persist with memory',
+      true,
+      'persist',
+      'persist',
+      {
+        decision: { action: 'persist' },
+        capped: false,
+        signalId: 'signal',
+      },
+    ],
+  ] as const)('%s', async (_name, memoryAvailable, ifActive, action, expected) => {
+    const { agent, calls } = mockAgent(
+      memoryAvailable ? {} : { memory: undefined },
+    );
+    (
+      agent as unknown as { getActiveThreadRunId: () => string }
+    ).getActiveThreadRunId = () => 'active-run';
+    const sendSignal = vi.fn((_signal, target: AgentCall['target']) => {
+      calls.push({ method: 'sendSignal', target });
+      return {
+        signal: { id: 'signal' },
+        accepted: Promise.resolve({ action }),
+        ...(action === 'persist' ? { persisted: Promise.resolve() } : {}),
+      };
+    });
+    (agent as unknown as { sendSignal: typeof sendSignal }).sendSignal =
+      sendSignal;
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+
+    const response = await routes(
+      post('/signal', { contents: 'active outcome', ifActive }),
+      scopeWith(undefined),
+    );
+
+    expect(await response?.json()).toEqual(expected);
+    expect(sendSignal).toHaveBeenCalledOnce();
+    expect(calls[0]?.target.ifActive).toEqual({ behavior: ifActive });
+  });
+
+  it('normalizes a memory-less active fall-through discard', async () => {
+    const { agent, calls } = mockAgent({ memory: undefined });
+    (
+      agent as unknown as { getActiveThreadRunId: () => string }
+    ).getActiveThreadRunId = () => 'stale-run';
+    const sendMessage = vi.fn((_message, target: AgentCall['target']) => {
+      calls.push({ method: 'sendMessage', target });
+      return {
+        signal: { id: 'message' },
+        accepted: Promise.resolve({ action: 'discard' as const }),
+      };
+    });
+    (agent as unknown as { sendMessage: typeof sendMessage }).sendMessage =
+      sendMessage;
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+
+    const response = await routes(
+      post('/signal/message', { contents: 'wake', ifIdle: 'wake' }),
+      scopeWith(undefined),
+    );
+
+    expect(calls[0]?.target.ifIdle).toEqual({ behavior: 'discard' });
+    expect(await response?.json()).toEqual({
+      decision: { action: 'discard', reason: 'memory-unavailable' },
+    });
+  });
+
+  it('normalizes a non-owner active fall-through discard as persistence-forbidden', async () => {
+    const { agent, calls } = mockAgent();
+    (
+      agent as unknown as { getActiveThreadRunId: () => string }
+    ).getActiveThreadRunId = () => 'stale-run';
+    const sendMessage = vi.fn((_message, target: AgentCall['target']) => {
+      calls.push({ method: 'sendMessage', target });
+      return {
+        signal: { id: 'message' },
+        accepted: Promise.resolve({ action: 'discard' as const }),
+      };
+    });
+    (agent as unknown as { sendMessage: typeof sendMessage }).sendMessage =
+      sendMessage;
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      canPersist: () => false,
+    });
+
+    const response = await routes(
+      post('/signal/message', { contents: 'wake', ifIdle: 'wake' }),
+      scopeWith(undefined),
+    );
+
+    expect(calls[0]?.target.ifIdle).toEqual({ behavior: 'discard' });
+    expect(await response?.json()).toEqual({
+      decision: { action: 'discard', reason: 'persistence-forbidden' },
+      capped: false,
+    });
+  });
+
+  it.each([
+    ['non-owner', false, 'discard', 'persistence-forbidden'],
+    ['owner', true, 'persist', undefined],
+  ] as const)('gates an active %s ifActive persist request', async (_name, persistenceAllowed, forwardedBehavior, refusalReason) => {
+    const { agent, calls } = mockAgent();
+    (
+      agent as unknown as { getActiveThreadRunId: () => string }
+    ).getActiveThreadRunId = () => 'active-run';
+    const signals: Array<{ metadata?: Record<string, unknown> }> = [];
+    const sendSignal = vi.fn(
+      (
+        signal: { metadata?: Record<string, unknown> },
+        target: AgentCall['target'],
+      ) => {
+        signals.push(signal);
+        calls.push({ method: 'sendSignal', target });
+        return {
+          signal: { id: 'signal' },
+          accepted: Promise.resolve({ action: forwardedBehavior }),
+          ...(forwardedBehavior === 'persist'
+            ? { persisted: Promise.resolve() }
+            : {}),
+        };
+      },
+    );
+    (agent as unknown as { sendSignal: typeof sendSignal }).sendSignal =
+      sendSignal;
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      canPersist: () => persistenceAllowed,
+    });
+
+    const response = await routes(
+      post('/signal', {
+        contents: 'active persist',
+        ifActive: 'persist',
+        ifIdle: 'wake',
+      }),
+      scopeWith(undefined),
+    );
+    const payload = (await response?.json()) as {
+      decision: { action: string; reason?: string };
+    };
+
+    expect(calls[0]?.target.ifActive).toEqual({
+      behavior: forwardedBehavior,
+    });
+    expect(payload.decision).toMatchObject({
+      action: forwardedBehavior,
+      ...(refusalReason ? { reason: refusalReason } : {}),
+    });
+    expect(signals[0]?.metadata?.[FLOWSAFE_PERSISTENCE_FORBIDDEN]).toBe(
+      persistenceAllowed ? undefined : true,
+    );
+  });
+
+  it.each([
+    [
+      'idle',
+      undefined,
+      {
+        decision: { action: 'discard' },
+        capped: false,
+        signalId: 'signal',
+      },
+    ],
+    [
+      'active',
+      'active-run',
+      {
+        decision: { action: 'discard', reason: 'persistence-forbidden' },
+        capped: false,
+      },
+    ],
+  ] as const)('reports a non-owner ifActive persist discard precisely on an %s thread', async (_label, activeRunId, expected) => {
+    const { agent } = mockAgent();
+    (
+      agent as unknown as {
+        getActiveThreadRunId: () => string | undefined;
+      }
+    ).getActiveThreadRunId = () => activeRunId;
+    const sendSignal = vi.fn(() => ({
+      signal: { id: 'signal' },
+      accepted: Promise.resolve({ action: 'discard' as const }),
+    }));
+    (agent as unknown as { sendSignal: typeof sendSignal }).sendSignal =
+      sendSignal;
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      canPersist: () => false,
+    });
+
+    const response = await routes(
+      post('/signal', {
+        contents: 'discard precisely',
+        ifActive: 'persist',
+        ifIdle: 'discard',
+      }),
+      scopeWith(undefined),
+    );
+
+    expect(await response?.json()).toEqual(expected);
+  });
+
+  it('starts a memory-less schedule wake', async () => {
+    const { agent } = mockAgent({ memory: undefined });
+    const startIdleRun = vi.fn(async ({ runId }) => ({ runId }));
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveScheduleTarget: async () =>
+        scheduleTarget({
+          resourceId: 'acme_res',
+          ifIdle: { behavior: 'wake' },
+        }),
+      resolveScheduleDispatchStore: () => ({
+        begin: async () => ({ state: 'ready' as const }),
+        settle: async () => undefined,
+      }),
+      startIdleRun,
+    });
+
+    const response = await routes(
+      post('/signal/schedule', {
+        scheduleId: 'schedule-1',
+        dispatchId: 'dispatch-1',
+        runId: 'run-1',
+      }),
+      scopeWith(undefined),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(startIdleRun).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['/signal/state', { id: 'g', cacheKey: 'k', contents: 'a' }],
+    [
+      '/signal/notification',
+      { source: 'provider', kind: 'changed', summary: 'changed' },
+    ],
+  ])('marks unbranded %s delivery degraded and persists in both states', async (path, body) => {
+    const { agent, calls } = mockAgent({ runtimeDriven: false });
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+
+    const response = await routes(post(path, body), scopeWith(undefined));
+
+    expect(await response?.json()).toMatchObject({
+      degraded: 'not-runtime-driven',
+    });
+    expect(calls[0]?.target).toMatchObject({
+      ifActive: { behavior: 'persist' },
+      ifIdle: { behavior: 'persist' },
+    });
   });
 
   it('consults the run cap for an idle WAKE and degrades to persist when over cap (DL-007)', async () => {
@@ -646,7 +1402,7 @@ describe('createThreadSignalRoutes', () => {
   it('refuses an idle WAKE on a NON-runtime-driven agent (fail-closed to persist)', async () => {
     // #given — a plain agent (no RUNTIME_DRIVEN_AGENT brand): its stream would run
     // the loop OFF RunnerRuntime, so a wake must not start a run through it.
-    const { agent, calls } = mockAgent(false);
+    const { agent, calls } = mockAgent({ runtimeDriven: false });
     const routes = createThreadSignalRoutes({
       resolveAgent: () => agent,
       resolveResourceId: () => 'acme_res',
@@ -766,6 +1522,94 @@ describe('createThreadSignalRoutes', () => {
     );
     expect(calls).toHaveLength(1);
     expect(calls[0]?.target.runId).toBe(activeRunId);
+    expect(calls[0]?.target.ifIdle).toEqual({ behavior: 'persist' });
+  });
+
+  it('keeps reactive active-delivery fall-throughs on the persist path', async () => {
+    const { agent, calls } = mockAgent();
+    (
+      agent as unknown as { getActiveThreadRunId: () => string }
+    ).getActiveThreadRunId = () => 'active-run';
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+
+    await routes(
+      post('/signal', { contents: 'hi', ifIdle: 'wake' }),
+      scopeWith(undefined),
+    );
+
+    expect(calls[0]?.target).toMatchObject({
+      runId: 'active-run',
+      ifIdle: { behavior: 'persist' },
+    });
+  });
+
+  it('keeps schedule active-delivery fall-throughs on the persist path', async () => {
+    const { agent, calls } = mockAgent();
+    (
+      agent as unknown as { getActiveThreadRunId: () => string }
+    ).getActiveThreadRunId = () => 'active-run';
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveScheduleTarget: async () =>
+        scheduleTarget({
+          resourceId: 'acme_res',
+          ifIdle: { behavior: 'wake' },
+        }),
+      resolveScheduleDispatchStore: () => ({
+        begin: async () => ({ state: 'ready' as const }),
+        settle: async () => undefined,
+      }),
+    });
+
+    await routes(
+      post('/signal/schedule', {
+        scheduleId: 'schedule-1',
+        dispatchId: 'dispatch-1',
+        runId: 'run-1',
+      }),
+      scopeWith(undefined),
+    );
+
+    expect(calls[0]?.target).toMatchObject({
+      runId: 'active-run',
+      ifIdle: { behavior: 'persist' },
+    });
+  });
+
+  it('waits for active-delivery fall-through persistence before responding', async () => {
+    const { agent } = mockAgent();
+    (
+      agent as unknown as { getActiveThreadRunId: () => string }
+    ).getActiveThreadRunId = () => 'active-run';
+    const persistence = deferred<void>();
+    const sendMessage = vi.fn(() => ({
+      signal: { id: 'message' },
+      accepted: Promise.resolve({ action: 'persist' as const }),
+      persisted: persistence.promise,
+    }));
+    (agent as unknown as { sendMessage: typeof sendMessage }).sendMessage =
+      sendMessage;
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+    let settled = false;
+    const response = routes(
+      post('/signal/message', { contents: 'hi', ifIdle: 'wake' }),
+      scopeWith(undefined),
+    ).then((value) => {
+      settled = true;
+      return value;
+    });
+    await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledOnce());
+    expect(settled).toBe(false);
+
+    persistence.resolve();
+    await expect(response).resolves.toMatchObject({ status: 200 });
   });
 
   it('dispatches a due notification through a server-minted idle wake and marks it delivered', async () => {
@@ -814,6 +1658,53 @@ describe('createThreadSignalRoutes', () => {
       status: 'delivered',
       deliveredSignalId: startedSignalId,
     });
+  });
+
+  it('counts a non-owner stale-id fall-through as failed without persistence', async () => {
+    const { agent, calls } = mockAgent();
+    (
+      agent as unknown as { getActiveThreadRunId: () => string }
+    ).getActiveThreadRunId = () => 'stale-run';
+    const sendSignal = vi.fn((_signal, target: AgentCall['target']) => {
+      calls.push({ method: 'sendSignal', target });
+      return {
+        signal: { id: 'stale-signal' },
+        accepted: Promise.resolve({ action: 'discard' as const }),
+      };
+    });
+    (agent as unknown as { sendSignal: typeof sendSignal }).sendSignal =
+      sendSignal;
+    const storage = new InMemoryNotificationsStorage();
+    const record = await storage.createNotification({
+      id: 'stale-delivery',
+      threadId: 'acme_t1',
+      resourceId: 'acme_res',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'ready',
+      summary: 'ready',
+      deliverAt: new Date(0),
+    });
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+      canPersist: () => false,
+    });
+
+    const response = await routes(
+      post('/signal/notifications/dispatch', {
+        notificationIds: [record.id],
+        resourceId: 'acme_res',
+        agentId: 'agent',
+        now: '2026-07-20T12:00:00.000Z',
+      }),
+      scopeWith(undefined),
+    );
+
+    expect(await response?.json()).toEqual({ delivered: 0, failed: 1 });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.target.ifIdle).toEqual({ behavior: 'discard' });
   });
 
   it('deduplicates notification ids in first-seen order', async () => {
@@ -1657,7 +2548,10 @@ describe('createThreadSignalRoutes', () => {
     expect(await response?.json()).toEqual({ delivered: 1, failed: 0 });
     expect(calls.at(-1)).toMatchObject({
       method: 'sendSignal',
-      target: { runId: 'acme_active-run' },
+      target: {
+        runId: 'acme_active-run',
+        ifIdle: { behavior: 'persist' },
+      },
     });
   });
 
@@ -1865,6 +2759,51 @@ describe('createThreadSignalRoutes', () => {
       summaryAt: undefined,
       summarySignalId: 'low-summary-signal',
     });
+  });
+
+  it('fails an all-low summary when the agent has no memory', async () => {
+    const { agent, calls } = mockAgent({ memory: undefined });
+    const storage = new InMemoryNotificationsStorage();
+    const record = await storage.createNotification({
+      id: 'low-summary-no-memory',
+      threadId: 'acme_t1',
+      resourceId: 'acme_res',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'digest',
+      summary: 'digest',
+      priority: 'low',
+      summaryAt: new Date(0),
+    });
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      resolveNotificationsStorage: () => storage,
+    });
+
+    const response = await routes(
+      post('/signal/notifications/dispatch', {
+        notificationIds: [record.id],
+        resourceId: 'acme_res',
+        agentId: 'agent',
+        now: '2026-07-20T12:00:00.000Z',
+      }),
+      scopeWith(undefined),
+    );
+
+    expect(await response?.json()).toEqual({ delivered: 0, failed: 1 });
+    expect(calls).toHaveLength(0);
+    const failed = await storage.getNotification({
+      threadId: record.threadId,
+      id: record.id,
+    });
+    expect(failed).toMatchObject({
+      status: 'pending',
+      deliveryAttempts: 1,
+      lastDeliveryError: 'signal persistence requires agent memory',
+    });
+    expect(failed?.deliveredSignalId).toBeUndefined();
+    expect(failed?.summarySignalId).toBeUndefined();
   });
 
   it('executes a low summary as automation when it may not persist into the owner thread', async () => {
@@ -2085,6 +3024,42 @@ describe('createThreadSignalRoutes', () => {
     await expect(responsePromise).resolves.toMatchObject({ status: 200 });
   });
 
+  it('waits for state-signal persistence before responding', async () => {
+    const { agent } = mockAgent();
+    const persistence = deferred<void>();
+    const sendStateSignal = vi.fn(async () => ({
+      signal: { id: 'state' },
+      accepted: Promise.resolve({ action: 'persist' as const }),
+      persisted: persistence.promise,
+      skipped: false as const,
+    }));
+    (
+      agent as unknown as { sendStateSignal: typeof sendStateSignal }
+    ).sendStateSignal = sendStateSignal;
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+
+    let settled = false;
+    const responsePromise = routes(
+      post('/signal/state', {
+        id: 'state',
+        cacheKey: 'state-key',
+        contents: 'ready',
+      }),
+      scopeWith(undefined),
+    ).then((response) => {
+      settled = true;
+      return response;
+    });
+    await vi.waitFor(() => expect(sendStateSignal).toHaveBeenCalledOnce());
+    expect(settled).toBe(false);
+
+    persistence.resolve();
+    await expect(responsePromise).resolves.toMatchObject({ status: 200 });
+  });
+
   it('400s a signal whose tagName is not a valid XML name (C-S5 route-level defense)', async () => {
     // #given
     const { agent, calls } = mockAgent();
@@ -2141,11 +3116,11 @@ describe('createThreadSignalRoutes', () => {
     expect(calls[0]?.method).toBe('sendSignal');
   });
 
-  it('surfaces skipped:true from a de-duped state signal', async () => {
-    // #given — an agent whose sendStateSignal reports an unchanged snapshot
+  it('keeps an unbranded de-duped state response free of degradation metadata', async () => {
+    // #given — an unbranded agent reports an unchanged snapshot
     const agent = {
-      [RUNTIME_DRIVEN_AGENT]: true,
       __setPubSub: () => {},
+      getMemory: () => ({ saveMessages: vi.fn() }),
       sendStateSignal: async () => ({
         skipped: true as const,
         reason: 'unchanged',
@@ -2162,7 +3137,7 @@ describe('createThreadSignalRoutes', () => {
       scopeWith(undefined),
     );
 
-    // #then — the route reports the de-dupe distinctly (no run touched)
+    // #then — the de-dupe carries no degraded marker because no send occurred
     expect(res?.status).toBe(200);
     expect(await res?.json()).toEqual({ skipped: true, reason: 'unchanged' });
   });
