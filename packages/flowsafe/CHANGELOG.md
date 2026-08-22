@@ -1,5 +1,94 @@
 # @proofoftech/flowsafe
 
+## 0.19.0
+
+### Minor Changes
+
+- fa0d11d: Add an optional content-policy boundary for agent signals. Breakwater exposes `createContentPolicyGate()`, a reusable opaque input-policy gate for host code outside Mastra's processor chain, and FlowSafe's thread signal routes accept a structural `contentPolicy` callback that inspects Mastra's canonical escaped XML before delivery, persistence, wake, or run start — covering direct ingestion, providers, schedules, and notification dispatch. Denial is terminal and evaluator failure stays recoverable on every lane; neither exposes policy names, reasons, content, or causes.
+
+  Signal attributes whose keys are not XML names are now dropped when a signal is ingested, and a schedule whose stored target cannot be rendered settles a terminal discard receipt instead of failing every later tick with the same broken target.
+
+  Provider deliveries now distinguish a terminal refusal from one the deployment could not decide: an undecided webhook is answered with 503 so the sender redelivers, and every delivery carries a dedupe key derived from the signed bytes and the subscription so a redelivery coalesces into a still-pending notification instead of duplicating it. Webhook and poll results report `denied`, `failed`, and `deferred` counts.
+
+- 0447466: Signal delivery through a Flowsafe durable agent no longer starts an unowned
+  run below the host seam; an unbranded agent on an active thread keeps core's own
+  behavior as a degraded configuration.
+
+  This changes the public signal contract:
+
+  - `/signal/queue` persists in both active and idle states. Success now returns
+    `decision.action: 'persist'` without a `runId`; active-thread auto-drain is
+    removed, so the message surfaces on the next host-started turn.
+  - `/signal/state` now applies the queue route's owner gates and can return
+    `principal-mismatch` or `persistence-forbidden`.
+  - `/signal/notification` creates the notification record for every accepted
+    provider delivery. Owners receive core's `{ record, decision, ... }` result
+    under the top-level `record` field, with the signal-routing decision exposed
+    separately as `delivery` when core returns one. Non-owners receive a flat
+    `NotificationRecord` under `record` plus
+    `delivery: { action: 'deferred', reason: 'dispatcher' }`; they never send a
+    signal directly. Low-priority owner notifications use summarize-later and
+    have no immediate `delivery`.
+  - Unbranded agents return `degraded: 'not-runtime-driven'` from successful,
+    non-skipped state and owner-notification responses, regardless of thread state.
+    Skipped state and an early `memory-unavailable` state response carry no marker.
+  - `/signal/message`, `/signal`, `/signal/schedule`, and
+    `/signal/notifications/dispatch` now persist on a stale-active-id fall-through
+    instead of waking. A forbidden fallback returns `persistence-forbidden`; a
+    memory-less fallback returns `memory-unavailable`. The notification dispatch
+    lane counts either discard as failed and performs no persisted write. A
+    non-owner `/signal` request for `ifActive: 'persist'` degrades to `discard`
+    for active delivery: when the thread was active, the response is
+    `persistence-forbidden` without a `signalId` because the gate refused and
+    nothing was delivered; when the thread was idle, the caller's own `ifIdle`
+    outcome is returned unchanged with `signalId`. Owners still forward
+    `persist`. Non-owner active deliveries carry non-rendered metadata so a
+    completion drain cannot preserve a leftover through the terminal path.
+  - Persist outcomes return a `memory-unavailable` discard decision when the
+    resolved agent has no memory, after the content gate. A default or
+    `ifIdle: 'persist'` message or signal is delivered into an active run without
+    memory; an active persist that no memory could write answers
+    `memory-unavailable`. A persist-behavior `/signal/schedule` fire instead
+    settles a canonical `discard` receipt with `outcome: 'discarded'` and no
+    reason, where it previously settled `persisted`.
+    Owner `/signal/notification` is the other exception: its model-visible memory
+    write is best-effort because the inbox record is already durable. The shipped
+    starter host does not configure agent memory, so its other persist outcomes
+    return `memory-unavailable` until the host adds memory configuration.
+  - Non-owner `/signal/notification` ingestion now requires notification storage
+    and returns `409` without it. Those rows bypass the agent's delivery policy and
+    readiness hook; the host must run `createNotificationDispatchTick()` to
+    deliver them. The starter runs it every 60 seconds, giving up to one tick of
+    latency. A host without the tick records but never delivers them; the spike
+    has no tick and its provider probes assert only the inbox row.
+  - The durable-agent runner terminally fails every run that was not registered
+    through `streamUntilPersisted()`. Direct `stream()` resolves to a failed
+    output; direct `generate()` rejects. `stream()`, `generate()`, `prepare()`, and
+    `streamUntilPersisted()` synchronously refuse a live id, and `prepare(X)`
+    keeps `X` live until cleanup. `streamUntilPersisted()` also refuses
+    `untilIdle`. If the runner's two terminal-publication attempts and core's own
+    fire-and-forget attempt all fail, the output never closes and the thread stays
+    active until eviction or a new host start.
+  - The public `signals/router.ts` state and notification channels carry these new
+    response shapes.
+
+  Migrate run starts to the host routes or `streamUntilPersisted()`. Treat queue
+  success as `{ action: 'persist' }` without a `runId`, and read queued messages on
+  the next host-started turn.
+
+- 8f4daae: Require `@mastra/core` 1.53.0 exactly (previously 1.50.0). The peer is exact, so every consumer must move to 1.53.0 as well; this is breaking for consumers pinned to 1.50.0. 1.53.0 is the newest release whose published output still bundles for Cloudflare Workers and Vite: 1.54.0 through 1.60.0 inline Node-only dynamic imports (`execa`, `@ast-grep/napi`) that fail to bundle (mastra-ai/mastra#20638). `@mastra/cloudflare-d1` stays at 1.1.1. FlowSafe's `@proofoftech/breakwater` peer floor rises to `>=0.13.0` in step, that being the first Breakwater release built against the same core.
+
+  FlowSafe's durable agent runner now refuses every inherited entry point that can drive execution outside `RunnerRuntime`, mint a run id below the caller, or hand back runs the caller does not own: the run-recovery entry points 1.53.0 adds to `DurableAgent` (`recover`, `recoverActiveRuns`, `listActiveRuns`); the resume family (`resume`, `resumeStream`, `resumeGenerate`, `approveToolCall`, `declineToolCall`, `approveToolCallGenerate`, `declineToolCallGenerate`), which since 1.53.0 rehydrate from snapshot storage on a run-registry miss; the agent-level discovery member `listSuspendedRuns`; the network family (`network`, `resumeNetwork`, `approveNetworkToolCall`, `declineNetworkToolCall`), which drives the multi-agent loop's own workflow on the default engine; the AI SDK v4 legacy pair (`generateLegacy`, `streamLegacy`), which runs the agent's tools while skipping the authorization check every supported entry point calls; and `sendToolApproval`, whose continuation branch starts a run under a generated run id rather than resuming. `deleteRunSnapshots` is refused on a separate ground: the snapshot rows it deletes belong to deployment-scoped retention rather than to any caller. Nineteen entry points in all. That leaves `resumeViaRuntime` as the only resume path and the guarded `stream`/`generate`/`prepare` as the only execution entry points. Surface tripwires now classify every `DurableAgent` prototype member and every inherited `Agent` member, so a future peer bump surfaces new entry points on either.
+
+  This is a behavior change for any consumer that called those methods on a FlowSafe durable agent: they now throw instead of executing. Their TYPE signatures narrow too — the overridden members return `Promise<never>`, and the generic overloads several of them carried (`network`, `generateLegacy`, `streamLegacy`, `sendToolApproval`) collapse to a single refusing signature, so a call that no longer type-checks is the intended signal rather than a regression. Nothing in the supported agent-host surface reaches them — route clients through the agent-host run routes.
+
+### Patch Changes
+
+- 80a801c: Signal-provider delivery-error log events now carry the same `terminal` flag as their delivery-rejected siblings, so a dropped-forever throw is distinguishable from a deferred one without re-deriving the classification.
+- da6a0aa: Export deployment identity headers from the protocol leaf so external candidates do not import the Durable Object runner barrel.
+- 66c19f1: Clean generated output at the packaging boundary so deleted source modules cannot remain in published tarballs.
+- 5cbe01d: Align the package and documented Node.js runtime floor with the required `@mastra/core` peer dependency.
+
 ## 0.18.0
 
 ### Minor Changes

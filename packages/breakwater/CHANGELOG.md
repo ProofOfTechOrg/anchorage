@@ -1,5 +1,27 @@
 # @proofoftech/breakwater
 
+## 0.13.0
+
+### Minor Changes
+
+- b85a872: Add a supported connector invocation boundary for trusted hosts and workflows. Direct calls now preserve Mastra validation and Breakwater grants without fabricated tool contexts, and validation failures expose no rejected values or schema messages.
+- fa0d11d: Add an optional content-policy boundary for agent signals. Breakwater exposes `createContentPolicyGate()`, a reusable opaque input-policy gate for host code outside Mastra's processor chain, and FlowSafe's thread signal routes accept a structural `contentPolicy` callback that inspects Mastra's canonical escaped XML before delivery, persistence, wake, or run start — covering direct ingestion, providers, schedules, and notification dispatch. Denial is terminal and evaluator failure stays recoverable on every lane; neither exposes policy names, reasons, content, or causes.
+
+  Signal attributes whose keys are not XML names are now dropped when a signal is ingested, and a schedule whose stored target cannot be rendered settles a terminal discard receipt instead of failing every later tick with the same broken target.
+
+  Provider deliveries now distinguish a terminal refusal from one the deployment could not decide: an undecided webhook is answered with 503 so the sender redelivers, and every delivery carries a dedupe key derived from the signed bytes and the subscription so a redelivery coalesces into a still-pending notification instead of duplicating it. Webhook and poll results report `denied`, `failed`, and `deferred` counts.
+
+- 8f4daae: Require `@mastra/core` 1.53.0 exactly (previously 1.50.0). The peer is exact, so every consumer must move to 1.53.0 as well; this is breaking for consumers pinned to 1.50.0. 1.53.0 is the newest release whose published output still bundles for Cloudflare Workers and Vite: 1.54.0 through 1.60.0 inline Node-only dynamic imports (`execa`, `@ast-grep/napi`) that fail to bundle (mastra-ai/mastra#20638). `@mastra/cloudflare-d1` stays at 1.1.1. FlowSafe's `@proofoftech/breakwater` peer floor rises to `>=0.13.0` in step, that being the first Breakwater release built against the same core.
+
+  FlowSafe's durable agent runner now refuses every inherited entry point that can drive execution outside `RunnerRuntime`, mint a run id below the caller, or hand back runs the caller does not own: the run-recovery entry points 1.53.0 adds to `DurableAgent` (`recover`, `recoverActiveRuns`, `listActiveRuns`); the resume family (`resume`, `resumeStream`, `resumeGenerate`, `approveToolCall`, `declineToolCall`, `approveToolCallGenerate`, `declineToolCallGenerate`), which since 1.53.0 rehydrate from snapshot storage on a run-registry miss; the agent-level discovery member `listSuspendedRuns`; the network family (`network`, `resumeNetwork`, `approveNetworkToolCall`, `declineNetworkToolCall`), which drives the multi-agent loop's own workflow on the default engine; the AI SDK v4 legacy pair (`generateLegacy`, `streamLegacy`), which runs the agent's tools while skipping the authorization check every supported entry point calls; and `sendToolApproval`, whose continuation branch starts a run under a generated run id rather than resuming. `deleteRunSnapshots` is refused on a separate ground: the snapshot rows it deletes belong to deployment-scoped retention rather than to any caller. Nineteen entry points in all. That leaves `resumeViaRuntime` as the only resume path and the guarded `stream`/`generate`/`prepare` as the only execution entry points. Surface tripwires now classify every `DurableAgent` prototype member and every inherited `Agent` member, so a future peer bump surfaces new entry points on either.
+
+  This is a behavior change for any consumer that called those methods on a FlowSafe durable agent: they now throw instead of executing. Their TYPE signatures narrow too — the overridden members return `Promise<never>`, and the generic overloads several of them carried (`network`, `generateLegacy`, `streamLegacy`, `sendToolApproval`) collapse to a single refusing signature, so a call that no longer type-checks is the intended signal rather than a regression. Nothing in the supported agent-host surface reaches them — route clients through the agent-host run routes.
+
+### Patch Changes
+
+- 66c19f1: Clean generated output at the packaging boundary so deleted source modules cannot remain in published tarballs.
+- 5cbe01d: Align the package and documented Node.js runtime floor with the required `@mastra/core` peer dependency.
+
 ## 0.12.0
 
 ### Minor Changes
