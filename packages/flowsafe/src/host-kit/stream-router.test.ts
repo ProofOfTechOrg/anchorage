@@ -136,7 +136,10 @@ function makeResolve(): ActorResolver {
         : undefined;
     },
     storeFactory: backend,
-    buildService: (store) => new ApprovalService({ store }),
+    // In-memory store, no database to fence against: the opt-out is written down
+    // rather than defaulted — see ExecutionFenceWiring.
+    buildService: (store) =>
+      new ApprovalService({ store, executionFence: 'none' }),
   });
 }
 

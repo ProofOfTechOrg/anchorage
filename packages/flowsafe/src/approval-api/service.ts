@@ -11,7 +11,8 @@
 import {
   admitsExistingRun,
   ExecutionFencedError,
-  type ExecutionFenceStore,
+  type ExecutionFenceWiring,
+  readExecutionFence,
 } from '../do-runner/execution-fence.js';
 import { isPathSafeId } from '../do-runner/path-safe-id.js';
 import type {
@@ -174,16 +175,23 @@ export interface ApprovalServiceOptions {
    */
   allowSelfDecision?: SelfDecisionPolicy;
   /**
-   * The deployment execution fence, consulted before a DECISION commits.
+   * The deployment execution fence, consulted before a DECISION commits, or
+   * `'none'` for a service with no database to fence against.
    *
    * DECIDE is gated wherever resume is, because decide() COMMITS and THEN
    * resumes (see #resume): a lock that only stopped the resume would leave the
    * approval durably decided on a deployment that can never act on it, and the
    * deployment taking over would inherit a decision with no resume behind it.
    * Reads, claims, and delegation stay open in every state — they move no run.
-   * Absent ⇒ unfenced.
+   *
+   * REQUIRED, and `'none'` has to be WRITTEN. This service is the last leaf of
+   * the wiring to admit an omission, and it is the leaf where an omission costs
+   * the most: an unfenced service looks identical to a fenced one until the day
+   * an operator locks the deployment, and then it records decisions the
+   * deployment can never act on. Naming the opt-out turns that into a decision
+   * someone made rather than one they missed. See ExecutionFenceWiring.
    */
-  executionFence?: ExecutionFenceStore;
+  executionFence: ExecutionFenceWiring;
   /** Injectable clock (tests, deterministic SLA math). */
   now?: () => Date;
 }
@@ -211,7 +219,7 @@ export class ApprovalService {
     decision: ApprovalDecision,
   ) => Promise<unknown>;
   readonly #allowSelfDecision?: SelfDecisionPolicy;
-  readonly #executionFence?: ExecutionFenceStore;
+  readonly #executionFence: ExecutionFenceWiring;
   readonly #now: () => Date;
 
   constructor(options: ApprovalServiceOptions) {
@@ -453,10 +461,14 @@ export class ApprovalService {
    * an approval id says nothing about which run it gates until the record is
    * loaded. That read happens only in proof-only — an operational state that
    * lasts minutes — so the steady-state cost stays exactly one fence read.
+   *
+   * The wiring is resolved through `readExecutionFence` rather than by testing
+   * the field here: a written `'none'` and a store both arrive at this one
+   * definition of what "no fence" does, so the opt-out cannot be a ternary this
+   * gate gets subtly wrong.
    */
   async #assertDecidable(id: string): Promise<void> {
-    if (!this.#executionFence) return;
-    const reading = await this.#executionFence.read();
+    const reading = await readExecutionFence(this.#executionFence);
     if (reading.state === 'open' || reading.state === 'draining') return;
     const runId =
       reading.state === 'proof-only'

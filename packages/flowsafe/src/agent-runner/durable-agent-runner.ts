@@ -573,6 +573,14 @@ export class FlowsafeDurableAgent<
   readonly #startRequesters = new Map<string, string>();
   readonly #startRequesterKinds = new Map<string, ExecutionPrincipalKind>();
   readonly #startAttemptTokens = new Map<string, string>();
+  /**
+   * runId -> the reservation key the thread topology took for this start, so
+   * `executeWorkflow` can hand it to `RunnerRuntime.start` for the execution
+   * fence's proof-only match. Same lifetime and same cleanup as the attempt
+   * token beside it: registered by `streamUntilPersisted`, dropped in its
+   * `finally`, so nothing outlives the start it belongs to.
+   */
+  readonly #startIdempotencyKeys = new Map<string, string>();
   readonly #startScheduleDispatches = new Map<
     string,
     { scheduleId: string; dispatchId: string }
@@ -722,6 +730,21 @@ export class FlowsafeDurableAgent<
     requestedByKind: ExecutionPrincipalKind,
     attemptToken = crypto.randomUUID(),
     scheduleDispatch?: { scheduleId: string; dispatchId: string },
+    /**
+     * The idempotency key the thread topology already RESERVED for this run.
+     *
+     * It travels down here for one job: the execution fence's proof-only state
+     * admits exactly the start whose key matches its nominated proof key, and
+     * `RunnerRuntime.start` is where that comparison happens. It buys no
+     * exactly-once property at this layer — the reservation above already did —
+     * so nothing here validates it beyond passing it on, and a run started
+     * without one behaves exactly as before.
+     *
+     * Parked per-runId beside the attempt token rather than threaded through
+     * core, because core owns the call between `stream()` and
+     * `executeWorkflow()` and carries no field this could ride in.
+     */
+    idempotencyKey?: string,
   ): Promise<
     Awaited<ReturnType<DurableAgent<TAgentId, TTools, TOutput>['stream']>>
   > {
@@ -755,6 +778,9 @@ export class FlowsafeDurableAgent<
     if (scheduleDispatch) {
       this.#startScheduleDispatches.set(runId, scheduleDispatch);
     }
+    if (idempotencyKey !== undefined) {
+      this.#startIdempotencyKeys.set(runId, idempotencyKey);
+    }
     const onError = callOptions.onError;
     try {
       const hostCallOptions: typeof callOptions = {
@@ -778,6 +804,7 @@ export class FlowsafeDurableAgent<
       this.#startRequesterKinds.delete(runId);
       this.#startAttemptTokens.delete(runId);
       this.#startScheduleDispatches.delete(runId);
+      this.#startIdempotencyKeys.delete(runId);
     }
   }
 
@@ -1476,11 +1503,13 @@ export class FlowsafeDurableAgent<
       const requestedByKind = this.#startRequesterKinds.get(runId);
       const attemptToken = this.#startAttemptTokens.get(runId);
       const scheduleDispatch = this.#startScheduleDispatches.get(runId);
+      const idempotencyKey = this.#startIdempotencyKeys.get(runId);
       const startOptions = {
         runId,
         inputData: workflowInput,
         ...(attemptToken === undefined ? {} : { attemptToken }),
         ...(scheduleDispatch === undefined ? {} : { scheduleDispatch }),
+        ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
       };
       if (requestedBy === undefined || requestedByKind === undefined) {
         if (requestedBy !== undefined || requestedByKind !== undefined) {

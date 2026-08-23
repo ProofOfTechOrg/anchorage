@@ -48,6 +48,7 @@ export {
   type AgentThreadRunRef,
   type AgentThreadStartInput,
   type AgentThreadTopology,
+  type AgentThreadTopologyOptions,
   createAgentThreadTopology,
 } from './thread-topology.js';
 export {

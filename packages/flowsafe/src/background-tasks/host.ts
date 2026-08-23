@@ -227,8 +227,14 @@ function validateManagerConfig(
  * collide with a tool's own suspend payload, and read back by
  * #resumeFenceSuspendedTasks — which is what makes the parking reversible
  * rather than a quieter kind of loss.
+ *
+ * PUBLISHED (via `./index.js`) because it is the only way a host can tell a
+ * fence-parked row from a tool-suspended one: `listTasks({ status:
+ * 'suspended' })` returns both, and the marker lives in the suspend payload
+ * where no filter can express it. A census that hard-coded the string would
+ * silently stop matching the day this key is renamed.
  */
-const EXECUTION_FENCE_SUSPEND_KEY = 'flowsafe.executionFenced';
+export const EXECUTION_FENCE_SUSPEND_KEY = 'flowsafe.executionFenced';
 
 /**
  * Was this row parked by the backstop, rather than suspended by its own tool?
@@ -279,11 +285,22 @@ const MAX_FENCE_RESUMES_PER_ALARM = 250;
  * once newer tool-suspends sit ahead of it in the scan order. Bounding the
  * scans rather than only the resumes is what keeps a pathological mix — many
  * thousands of tool-suspended rows and one stale parked cohort behind them —
- * from turning a single wake into an unbounded read loop. A sweep that hits
- * this bound has made progress or proved there was none; the next wake
- * continues from the top.
+ * from turning a single wake into an unbounded read loop.
+ *
+ * A wake that hits this bound WITHOUT resuming anything has proved only that
+ * the first `MAX_FENCE_RESUME_SCANS * FENCE_RESUME_SCAN_PAGE` rows carry no
+ * marker, so it records where it stopped (`#sweepScanFloor`) and the next wake
+ * continues from there. Restarting every wake at page 0 instead would re-read
+ * the same prefix forever, and a cohort parked behind that many newer
+ * tool-suspends would never be reached at all.
+ *
+ * Exported alongside FENCE_RESUME_SCAN_PAGE for the same narrow reason
+ * MAX_FENCE_RESUMES_PER_PASS is: the test that proves a cohort past one wake's
+ * scan bound is still reached has to build a set that large, and a size
+ * hard-coded there would drift from these. Both stay off `./index.js` — they
+ * are tuning, not contract.
  */
-const MAX_FENCE_RESUME_SCANS = 20;
+export const MAX_FENCE_RESUME_SCANS = 20;
 
 /**
  * How many `suspended` rows one pass READS to find that many.
@@ -296,25 +313,65 @@ const MAX_FENCE_RESUME_SCANS = 20;
  * than it acts costs one query and buys headroom for that mix, while still
  * bounding what a boot pulls out of D1.
  */
-const FENCE_RESUME_SCAN_PAGE = 100;
+export const FENCE_RESUME_SCAN_PAGE = 100;
+
+/**
+ * A registration failure this host CHOSE, from wiring it can re-check without
+ * touching storage: the domains a host passed are the wrong ones.
+ *
+ * The distinction is what lets `boot()` memoize one kind of failure and retry
+ * the other. A configuration fault is deterministic — the next boot re-reads
+ * the same host wiring and fails identically — so caching it costs nothing and
+ * keeps the error stable. Everything else reaching #doRegister comes from a
+ * storage read (`getStorage()`, `getStore(...)`), and a transient D1 fault
+ * there must not lock this instance's read routes out until eviction.
+ *
+ * The split is deliberately conservative in one direction: a deterministic
+ * fault raised from INSIDE a storage read (a Mastra configured with no storage
+ * at all) is retried like a transient one, because from here the two are the
+ * same call. That costs one repeated read per boot and nothing else, whereas
+ * mistaking a transient fault for a permanent one costs the isolate's routes.
+ *
+ * Not exported: a caller cannot act on the difference, only this class can.
+ */
+class BackgroundTasksConfigurationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BackgroundTasksConfigurationError';
+  }
+}
 
 /**
  * Raw-manager access for THIS PACKAGE'S TESTS, and nothing else.
  *
- * A symbol rather than a name, and deliberately absent from `./index.js`, so it
- * is unreachable through the published `@proofoftech/flowsafe/background-tasks`
- * subpath — the only export map entry this directory has. It exists because the
- * host's lifecycle contract IS its interleaving with core's manager (init
- * before shutdown before stopWorkers, the enqueue guard flipping before the
- * first await), and there is no way to observe that ordering from outside
- * without a handle on the manager those calls land on.
+ * A side table rather than a property ON the host, because a property is
+ * reachable whatever it is keyed by: an own symbol key is enumerable through
+ * `Object.getOwnPropertySymbols(host)[0]`, so "unreachable from the published
+ * package" was true of the NAME and false of the manager. Nothing outside this
+ * module can produce this WeakMap, so the accessor below — absent from
+ * `./index.js`, the only export map entry this directory has — is the only way
+ * in, and the claim is now literally true.
+ *
+ * It exists because the host's lifecycle contract IS its interleaving with
+ * core's manager (init before shutdown before stopWorkers, the enqueue guard
+ * flipping before the first await), and there is no way to observe that
+ * ordering from outside without a handle on the manager those calls land on.
  *
  * Production code must not use it: everything a host legitimately does goes
- * through `enqueue` (fence-gated) or the three reads below.
+ * through `enqueue` (fence-gated) or the three reads on the host itself.
  */
-export const BACKGROUND_TASK_MANAGER_TEST_ACCESS: unique symbol = Symbol(
-  'flowsafe.backgroundTaskManager.testAccess',
-);
+const hostManagers = new WeakMap<BackgroundTaskHost, BackgroundTaskManager>();
+
+/** @see hostManagers — tests only, and never re-exported. */
+export function backgroundTaskManagerForTests(
+  host: BackgroundTaskHost,
+): BackgroundTaskManager {
+  const manager = hostManagers.get(host);
+  if (!manager) {
+    throw new Error('background-tasks: host has no manager registered');
+  }
+  return manager;
+}
 
 /**
  * A BackgroundTaskManager bound to a hosting DO's Mastra + pubsub, with the
@@ -332,8 +389,6 @@ export const BACKGROUND_TASK_MANAGER_TEST_ACCESS: unique symbol = Symbol(
  */
 export class BackgroundTaskHost {
   readonly #manager: BackgroundTaskManager;
-  /** @see BACKGROUND_TASK_MANAGER_TEST_ACCESS — tests only. */
-  readonly [BACKGROUND_TASK_MANAGER_TEST_ACCESS]: BackgroundTaskManager;
   readonly #mastra: Mastra;
   readonly #pubsub: HostPubSub;
   readonly #executors: Record<string, ToolExecutor>;
@@ -363,6 +418,19 @@ export class BackgroundTaskHost {
    */
   #bootAttempt?: Promise<void>;
   #bootAttemptSettled = false;
+  /**
+   * Where the NEXT sweep starts paging — the sweep's only state that outlives
+   * one invocation.
+   *
+   * Zero means "from the newest suspension", which is right whenever the last
+   * wake resumed something or reached the end of the set. It is non-zero only
+   * after a wake spent its whole scan budget finding no markers: that wake
+   * examined a prefix and proved it marker-free, so the next one continues
+   * past it instead of re-reading it. Instance state rather than storage
+   * because it is an optimisation, not a fact: an evicted DO simply starts
+   * from the top again, which is correct, only slower.
+   */
+  #sweepScanFloor = 0;
   #managerNeedsShutdown = false;
   #workersNeedStop = false;
   #shutdownRequested = false;
@@ -379,7 +447,7 @@ export class BackgroundTaskHost {
       enabled: true,
       ...options.manager,
     });
-    this[BACKGROUND_TASK_MANAGER_TEST_ACCESS] = this.#manager;
+    hostManagers.set(this, this.#manager);
     // Must precede init(): the manager reads its Mastra for storage, the
     // internal background-task workflow registration, and id generation.
     this.#manager.__registerMastra(options.mastra);
@@ -400,6 +468,13 @@ export class BackgroundTaskHost {
    * a closed fence. A refused attempt is deliberately not memoized, so the next
    * `boot()` from a request or an alarm starts dispatching once the fence
    * reopens, with no operator action.
+   *
+   * A registration that FAILED is memoized only when it can only fail again:
+   * the same non-memoized-refusal reasoning #ensureDispatching applies to the
+   * fence. A transient storage fault on the first request into a fresh isolate
+   * would otherwise be the permanent answer for the life of that isolate — the
+   * read routes hang off this memo, so the host would keep 500ing a queue it
+   * can now reach, until an eviction nobody can schedule.
    */
   boot(): Promise<void> {
     if (this.#shutdownRequested) {
@@ -407,7 +482,23 @@ export class BackgroundTaskHost {
         new Error('background-tasks: host is shutting down'),
       );
     }
-    this.#booted ??= this.#doRegister();
+    if (!this.#booted) {
+      const registration: Promise<void> = this.#doRegister().catch(
+        (error: unknown) => {
+          // Identity-checked before clearing, the idiom `#ensureDispatching`
+          // and `shutdown()` use: a later registration must never be cleared
+          // by an earlier one's settlement.
+          if (
+            !(error instanceof BackgroundTasksConfigurationError) &&
+            this.#booted === registration
+          ) {
+            this.#booted = undefined;
+          }
+          throw error;
+        },
+      );
+      this.#booted = registration;
+    }
     const registered = this.#booted;
     // Recorded before this method returns, so a `shutdown()` on the very next
     // statement already has the whole attempt to wait on.
@@ -434,7 +525,7 @@ export class BackgroundTaskHost {
           SERIALIZED_WORKFLOWS_D1
         ] !== true
       ) {
-        throw new Error(
+        throw new BackgroundTasksConfigurationError(
           'background-tasks: execution requires DurableObjectWorkflowsStorageD1',
         );
       }
@@ -444,7 +535,7 @@ export class BackgroundTaskHost {
           DURABLE_OBJECT_BACKGROUND_TASKS_D1
         ] !== true
       ) {
-        throw new Error(
+        throw new BackgroundTasksConfigurationError(
           'background-tasks: execution requires DurableObjectBackgroundTasksStorageD1',
         );
       }
@@ -509,6 +600,13 @@ export class BackgroundTaskHost {
 
   async #attemptDispatching(): Promise<void> {
     const fence = await readExecutionFence(this.#executionFence);
+    // The fence read is an await, and `boot()`'s shutdown guard ran before it.
+    // A `shutdown()` that arrived in between has already decided this instance
+    // is going away; subscribing and claiming for the duration of an in-flight
+    // teardown would hand work to a manager that is about to stop — and
+    // `#doShutdown` waits on this very attempt, so it would wait for the claim
+    // it is trying to prevent.
+    if (this.#shutdownRequested) return;
     if (!admitsDrainableExecution(fence)) {
       console.warn(
         JSON.stringify({
@@ -600,6 +698,22 @@ export class BackgroundTaskHost {
    * then skip rows. `#resumedIds` makes that restart cheap and terminating —
    * each pass strictly grows it.
    *
+   * And the paging SURVIVES the wake, because within one wake it is bounded
+   * (MAX_FENCE_RESUME_SCANS). A cohort sitting behind more newer tool-suspends
+   * than one wake can page through would otherwise be stranded outright: every
+   * wake would re-read the same marker-free prefix and stop in the same place.
+   * So a wake that spends its whole scan budget finding nothing leaves
+   * `#sweepScanFloor` where it stopped and the next one resumes there, while
+   * any wake that resumes something — or reaches the end of the set — puts it
+   * back to zero, since both mean the prefix is worth re-reading. A floor left
+   * past the end of a shrunken set reads a short page and resets itself.
+   *
+   * The cost of that is bounded and the right way round: while the floor is
+   * deep, a cohort parked FRESH at the top waits the few wakes it takes to page
+   * to the end of the set (which resets the floor), instead of the old shape's
+   * "waits forever". Delaying the reachable cohort by a wake or two is the
+   * cheaper error than stranding the unreachable one permanently.
+   *
    * `perPage`/`orderBy` are ADAPTER-DEPENDENT: honoured by
    * @mastra/cloudflare-d1's SQL builder and by this package's D1 domain, but an
    * adapter that ignores them returns the whole list — which is why the loop
@@ -615,7 +729,14 @@ export class BackgroundTaskHost {
     // wasted publishes at best, and core throws outright once the row HAS
     // moved, which would abort the whole invocation.
     const resumedIds = new Set<string>();
-    let page = 0;
+    let page = this.#sweepScanFloor;
+    // The floor the NEXT wake starts from. Any wake that resumed something has
+    // changed the set it was paging, so its prefix is worth re-reading and the
+    // floor goes back to zero whatever this is called with.
+    const finish = (nextFloor: number): number => {
+      this.#sweepScanFloor = resumedIds.size > 0 ? 0 : nextFloor;
+      return resumedIds.size;
+    };
     for (let scan = 0; scan < MAX_FENCE_RESUME_SCANS; scan += 1) {
       let tasks: readonly BackgroundTask[];
       try {
@@ -628,11 +749,13 @@ export class BackgroundTaskHost {
         }));
       } catch (error) {
         this.#logFenceResumeFailure(error);
-        return resumedIds.size;
+        // This page proved nothing, so the next wake retries it rather than
+        // stepping over rows it never read.
+        return finish(page);
       }
       let resumedThisScan = 0;
       for (const task of tasks) {
-        if (resumedIds.size >= budget) return resumedIds.size;
+        if (resumedIds.size >= budget) return finish(0);
         if (resumedIds.has(task.id) || !isFenceParked(task)) continue;
         try {
           await this.#manager.resume(task.id);
@@ -642,7 +765,7 @@ export class BackgroundTaskHost {
           // parked and the next wake retries once slots free — and it keeps a
           // saturated deployment from burning the scan budget on refusals.
           this.#logFenceResumeFailure(error);
-          return resumedIds.size;
+          return finish(page);
         }
         resumedIds.add(task.id);
         resumedThisScan += 1;
@@ -654,10 +777,12 @@ export class BackgroundTaskHost {
       // Nothing here to resume. A SHORT page is the end of the set, so there is
       // nothing deeper and this sweep has drained. A full one means the markers
       // may simply be further down.
-      if (tasks.length < FENCE_RESUME_SCAN_PAGE) return resumedIds.size;
+      if (tasks.length < FENCE_RESUME_SCAN_PAGE) return finish(0);
       page += 1;
     }
-    return resumedIds.size;
+    // Out of scans with nothing found: `page` is the first row range this wake
+    // never read, and the next one starts there.
+    return finish(page);
   }
 
   #logFenceResumeFailure(error: unknown): void {
@@ -783,6 +908,11 @@ export class BackgroundTaskHost {
    */
   async onAlarm(): Promise<void> {
     await this.boot();
+    // Teardown wins over the duty. A `shutdown()` that arrived while boot() was
+    // in flight got past its guard, so without this the alarm would sweep
+    // mid-teardown — publishing resumes onto a manager that is stopping — and
+    // then call cleanup() on a manager that has already shut down.
+    if (this.#shutdownRequested) return;
     // The convergence lane. boot() has resolved, so a set `#dispatching` means
     // init actually landed and resume() has a subscriber to publish to. Nothing
     // is waiting behind an alarm, so this lane carries the larger budget and is

@@ -136,6 +136,36 @@ export async function readExecutionFence(
 }
 
 /**
+ * One fence store per DATABASE — not per request, and not per call site.
+ *
+ * The store holds no state of its own (a read is never memoized — see the
+ * module header), so this is about IDENTITY rather than caching: the admin
+ * route that MOVES the fence, the approval service that OBEYS it, the schedule
+ * tick that must not claim a fire behind it, and the runner's runtime all have
+ * to be looking at the same database. Keyed on the BINDING rather than on an
+ * env object, because a host mutates one env across requests and because the
+ * fence belongs to the database, not to the request that happens to reach it.
+ * WeakMap, so a test harness cycling bindings never leaks.
+ *
+ * Lives here rather than once per host because every composer needed the same
+ * three lines, and four copies of a memo are four chances for one of them to
+ * key on the wrong thing — an env-keyed copy hands two databases the same
+ * fence. A host whose call sites pass `env` keeps a one-line wrapper of its
+ * own; the memo itself is this one.
+ */
+const executionFenceStores = new WeakMap<object, ExecutionFenceStore>();
+
+export function executionFenceFor(
+  db: ExecutionFenceDatabase,
+): ExecutionFenceStore {
+  const existing = executionFenceStores.get(db);
+  if (existing) return existing;
+  const store = new ExecutionFenceStore(db);
+  executionFenceStores.set(db, store);
+  return store;
+}
+
+/**
  * Minimal structural D1 surface, the same posture as SnapshotDatabase and
  * ApprovalDatabase: tests back it with node:sqlite, Workers pass env.DB.
  *
@@ -270,24 +300,78 @@ export function executionFenceReadingPayload(reading: ExecutionFenceReading): {
   };
 }
 
+/**
+ * A fence refusal that CROSSED a Durable Object boundary and was rebuilt on the
+ * far side.
+ *
+ * The run object throws ExecutionFencedError, `doErrorResponse` renders it, and
+ * `doSummary` reconstructs it as a `RunRouteError` carrying the same status,
+ * message and structured reason — but not the same class. This structural arm
+ * is what lets a Worker-side caller treat that reconstruction as the refusal it
+ * is, with the same three fields every render site already reads.
+ */
+export interface WireExecutionFenceRefusal {
+  readonly message: string;
+  readonly status: number;
+  readonly reason: { readonly code: string };
+}
+
 /** Every fence-authored refusal — the family a fenced surface catches as one. */
 export type ExecutionFenceRefusal =
   | ExecutionFencedError
-  | ExecutionFenceUnreadableError;
+  | ExecutionFenceUnreadableError
+  | WireExecutionFenceRefusal;
+
+/** The two reason codes a fence refusal publishes, whatever carried it. */
+const FENCE_REFUSAL_CODES: ReadonlySet<string> = new Set([
+  'EXECUTION_FENCED',
+  'EXECUTION_FENCE_UNREADABLE',
+]);
 
 /**
  * Whether an error is the fence refusing (or failing to answer). The two are
  * one class for every CALLER that must degrade closed — an alarm swallowing
  * both, a tick skipping its pass — because a state it could not read and a
  * state that forbids the work lead to the same action.
+ *
+ * The CODE counts as well as the class, because a refusal that crossed a
+ * Durable Object boundary is no longer an instance of anything: the run object
+ * threw ExecutionFencedError, `doErrorResponse` rendered it, and `doSummary`
+ * rebuilt it on the Worker side as a `RunRouteError` carrying the same status
+ * and the same structured reason. That rebuilt error IS the fence refusing —
+ * the callers most in need of recognizing one (a run router deciding whether to
+ * give a reservation's claim back, a tick deciding whether to skip a pass) are
+ * exactly the ones sitting on the far side of that boundary, and an
+ * instanceof-only test would answer "no" for every one of them.
+ *
+ * The two codes are matched by name rather than by any structural sniff: only
+ * refusals this package authors publish them, and both are declared as literals
+ * on the classes above, so a code arriving over the wire came from one of them.
  */
 export function isExecutionFenceRefusal(
   error: unknown,
 ): error is ExecutionFenceRefusal {
-  return (
+  if (
     error instanceof ExecutionFencedError ||
     error instanceof ExecutionFenceUnreadableError
-  );
+  ) {
+    return true;
+  }
+  if (error === null || typeof error !== 'object') return false;
+  const { message, status, reason } = error as {
+    message?: unknown;
+    status?: unknown;
+    reason?: unknown;
+  };
+  // All three fields are checked, not just the code: this predicate NARROWS,
+  // and every render site immediately reads message/status/reason off what it
+  // narrowed. Asserting a shape on the strength of one field would hand them a
+  // `status` of undefined, and `new Response(body, { status: undefined })`
+  // fails inside the very catch block whose job is to never throw.
+  if (typeof message !== 'string' || !Number.isInteger(status)) return false;
+  if (reason === null || typeof reason !== 'object') return false;
+  const { code } = reason as { code?: unknown };
+  return typeof code === 'string' && FENCE_REFUSAL_CODES.has(code);
 }
 
 function isExecutionFenceState(value: unknown): value is ExecutionFenceState {
@@ -445,23 +529,36 @@ const MAX_FENCE_ERROR_CAUSE_DEPTH = 8;
  * top message there would classify a pre-0.20 database as unreadable instead of
  * open — a PERMANENT 503 on every gated path of a deployment that upgraded
  * correctly, which is the one failure this rule exists to prevent.
+ *
+ * Only the ROOT of that chain is matched, never a link part-way down. Those are
+ * different claims: if the innermost fault IS the missing table then the
+ * database is pre-0.20 and `open` is the truth however many wrappers sit on
+ * top, but a missing-table link whose own cause is something else describes a
+ * fault that merely MENTIONS this table on its way past — a failed migration,
+ * an adapter retry that reports the last thing it saw — and concluding "there
+ * is no fence" from that is the one answer that must never be wrong. So the
+ * walk descends first and tests once.
+ *
+ * A chain that does not terminate within the bound (a cycle, or one deeper than
+ * MAX_FENCE_ERROR_CAUSE_DEPTH) has no reachable root, so it degrades closed for
+ * the same reason: no root was observed, and an unobserved root is not evidence
+ * of an absent table.
  */
 function isMissingFenceTable(error: unknown): boolean {
   const seen = new Set<unknown>();
   let current: unknown = error;
   for (let depth = 0; depth < MAX_FENCE_ERROR_CAUSE_DEPTH; depth += 1) {
-    if (current === undefined || current === null || seen.has(current)) break;
     seen.add(current);
+    const cause = current instanceof Error ? current.cause : undefined;
+    if (cause !== undefined && cause !== null && !seen.has(cause)) {
+      current = cause;
+      continue;
+    }
     const message =
       current instanceof Error ? current.message : String(current);
-    if (
-      /no such table/i.test(message) &&
-      message.includes(EXECUTION_FENCE_TABLE)
-    ) {
-      return true;
-    }
-    if (!(current instanceof Error)) break;
-    current = current.cause;
+    return (
+      /no such table/i.test(message) && message.includes(EXECUTION_FENCE_TABLE)
+    );
   }
   return false;
 }

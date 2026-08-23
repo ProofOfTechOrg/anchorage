@@ -53,6 +53,21 @@ export interface DoRunTopology {
     workflowId: string,
     runId: string,
   ): Promise<RunSummary | undefined>;
+  /**
+   * Is a start for this run executing in its Durable Object right now?
+   *
+   * createRunRouter's liveness probe, and the reason an idempotent replay can
+   * tell "still working" from "died holding the claim" without a timer. The run
+   * object is the only place that can answer: it is addressed by
+   * `idFromName(workflowId:runId)`, so there is exactly one instance that could
+   * be running this run, and if that instance says no then nothing is.
+   *
+   * An unreachable object reads as NOT live. That is the fail-closed direction
+   * here — it produces the refusal that asks a human to investigate, whereas a
+   * default of "live" would answer a permanently broken run with a permanently
+   * retryable 503.
+   */
+  startLiveness(workflowId: string, runId: string): Promise<boolean>;
   /** createRunRouter's `resume` thunk. */
   resume(
     workflowId: string,
@@ -94,6 +109,11 @@ export type DoRunStartInput = RunStartInput & {
   /** Ordinary trusted starts may seed core workflow state. */
   initialState?: unknown;
 };
+
+/** The run object's answer to the liveness probe. */
+interface StartLivenessBody {
+  live?: unknown;
+}
 
 export function createDoRunTopology<Id>(
   namespace: RunnerNamespaceLike<Id>,
@@ -138,6 +158,7 @@ export function createDoRunTopology<Id>(
       scheduleId,
       dispatchId,
       deadlineMs,
+      idempotencyKey,
     }) => {
       if ((scheduleId === undefined) !== (dispatchId === undefined)) {
         throw new Error(
@@ -154,12 +175,34 @@ export function createDoRunTopology<Id>(
           body: JSON.stringify({
             workflowId,
             runId,
+            // The key travels on THIS channel and no other: the request
+            // carries the deployment-identity header, which a tenant request
+            // bearing one is refused for, so the DO can treat what arrives
+            // here as the router's own reserved key.
+            ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
             ...(scheduleId === undefined
               ? { inputData, initialState, deadlineMs }
               : { scheduleId, dispatchId, deadlineMs }),
           }),
         }),
       );
+    },
+    startLiveness: async (workflowId, runId) => {
+      // Only an explicit `true` from the run's own object counts as live.
+      // Everything else — a non-200, an unparseable body, a field of the wrong
+      // shape — is "this did not tell me the run is running", which is not the
+      // same as "it is", and treating it as such would turn a broken probe into
+      // an indefinitely retryable PENDING for a run nobody is executing.
+      const response = await stub(workflowId, runId).fetch(
+        `http://do/runs/${workflowId}/${runId}/start-liveness`,
+        { headers: deploymentIdentityHeaders(deploymentIdentitySecret) },
+      );
+      if (response.status !== 200) return false;
+      try {
+        return ((await response.json()) as StartLivenessBody).live === true;
+      } catch {
+        return false;
+      }
     },
     // The DO answers 404 for a run it has never seen; the router turns the
     // undefined into its own 404 rather than leaking the DO's body.

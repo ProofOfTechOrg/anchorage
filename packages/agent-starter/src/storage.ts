@@ -2,7 +2,10 @@
 
 import {
   createD1Storage,
-  ExecutionFenceStore,
+  type ExecutionFenceStore,
+  executionFenceFor,
+  type StartIdempotencyStore,
+  startIdempotencyFor,
 } from '@proofoftech/flowsafe/do-runner';
 import {
   createScheduleStorageDomains,
@@ -27,7 +30,6 @@ const subscriptionFactories = new WeakMap<
 const notificationStores = new WeakMap<Env['DB'], D1NotificationsStorage>();
 const threadStateStores = new WeakMap<Env['DB'], D1ThreadStateStorage>();
 const scheduleStores = new WeakMap<Env['DB'], D1SchedulesStorage>();
-const executionFences = new WeakMap<Env['DB'], ExecutionFenceStore>();
 
 function signalDatabase(db: Env['DB']): SignalDatabase {
   return db as unknown as SignalDatabase;
@@ -92,15 +94,27 @@ export function schedulesStore(db: Env['DB']): D1SchedulesStorage {
  * building one: the schedule tick that must not claim a due fire, the routers
  * that refuse to author new work, the background-task host, the provider
  * poller, and the approval services that decide-then-resume all have to be
- * gating the SAME database as the runtime they sit in front of. Keyed on the
- * binding, like every other store in this file, because the fence belongs to
- * the database rather than to the request that reached it.
+ * gating the SAME database as the runtime they sit in front of.
+ *
+ * The memo is the package's own `executionFenceFor` rather than a fifth copy
+ * beside the four above — it is keyed on the binding for exactly the reason the
+ * rest of this file is, and sharing it means this host and the flowsafe
+ * internals a route reaches through hand back the same store for one database.
+ * The local name stays because it is what every call site in this host reads.
  */
 export function executionFence(db: Env['DB']): ExecutionFenceStore {
-  let store = executionFences.get(db);
-  if (!store) {
-    store = new ExecutionFenceStore(db);
-    executionFences.set(db, store);
-  }
-  return store;
+  return executionFenceFor(db);
+}
+
+/**
+ * The deployment's start reservations, one store per D1 binding.
+ *
+ * Same rule, same reason, as the fence above: the run router and every agent
+ * topology in this host RESERVE against a key, and the runtimes inside the run
+ * and thread objects SETTLE those same rows when a run ends. Two stores over
+ * two bindings would be two tables answering the same key, and the settle would
+ * land nowhere.
+ */
+export function startIdempotency(db: Env['DB']): StartIdempotencyStore {
+  return startIdempotencyFor(db);
 }

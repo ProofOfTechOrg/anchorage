@@ -188,6 +188,9 @@ function buildHarness(): Harness {
 
   const service = new ApprovalService({
     store,
+    // In-memory store, no database to fence against: the opt-out is written down
+    // rather than defaulted — see ExecutionFenceWiring.
+    executionFence: 'none',
     resumeRun: resumeViaRuntime(runtime),
   });
   return { runtime, service, sends: () => sends, audit };

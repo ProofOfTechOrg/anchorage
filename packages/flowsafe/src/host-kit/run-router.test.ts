@@ -12,6 +12,7 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   type ApprovalActor,
   ApprovalService,
@@ -21,11 +22,15 @@ import {
   type SelfDecisionPolicy,
 } from '../approval-api/index.js';
 import {
+  ExecutionFencedError,
+  type ExecutionFenceWiring,
   InvalidRunRequestError,
   RunLifecycleBlockedError,
   RunNotSuspendedError,
   type RunSummary,
   RunTerminalConflictError,
+  type StartIdempotencyDatabase,
+  StartIdempotencyStore,
   UnknownRunError,
 } from '../do-runner/index.js';
 import { reconcileApprovalsOnStatus } from './approval-bridge.js';
@@ -91,6 +96,12 @@ interface HarnessOptions {
   selfDecision?: SelfDecisionPolicy;
   resourceOwner?: ReqActor;
   approvalCreateFailures?: number;
+  /**
+   * How this harness honours `idempotencyKey`. Defaults to the typed opt-out,
+   * which is what every pre-F3 case in this file wants: unkeyed starts are
+   * unaffected by the wiring, and a keyed start on an unwired host must refuse.
+   */
+  startIdempotency?: RunRouterOptions['startIdempotency'];
 }
 
 function makeHarness(options: HarnessOptions = {}) {
@@ -120,7 +131,9 @@ function makeHarness(options: HarnessOptions = {}) {
     },
   }) as ApprovalStore;
   // The bridge queues records through the request-scoped deployment service.
-  const service = new ApprovalService({ store });
+  // In-memory store, no database to fence against: the opt-out is written down
+  // rather than defaulted — see ExecutionFenceWiring.
+  const service = new ApprovalService({ store, executionFence: 'none' });
   const started: Array<{
     workflowId: string;
     runId: string;
@@ -137,7 +150,8 @@ function makeHarness(options: HarnessOptions = {}) {
         : undefined;
     },
     storeFactory: backend,
-    buildService: () => new ApprovalService({ store: requestStore }),
+    buildService: () =>
+      new ApprovalService({ store: requestStore, executionFence: 'none' }),
     newRunId: () => 'generated-run-id',
     // F9: the SoD exemption policy now feeds the resolver, so the catalog echo
     // reads context.canSelfDecide (the run-router no longer takes its own knob).
@@ -147,6 +161,7 @@ function makeHarness(options: HarnessOptions = {}) {
     workflows: WORKFLOWS,
     resolve,
     systemPrincipalId: SYSTEM.id,
+    startIdempotency: options.startIdempotency ?? 'none',
     start: async (input) => {
       await backend.resources().claim('run', input.runId, {
         kind: input.principal.kind,
@@ -1046,5 +1061,452 @@ describe('createRunRouter — error mapping', () => {
     // #then
     expect(response?.status).toBe(500);
     expect(await response?.json()).toEqual({ error: 'd1 exploded' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F3 — owner-bound idempotent start, on the workflow surface.
+//
+// Every case below is about a PAID first step: the assertions count
+// EXECUTIONS, not responses, because a router that answers correctly while
+// starting a second run has failed at exactly the thing the key was bought for.
+// ---------------------------------------------------------------------------
+
+/** A run router whose reservations live in a real table over node:sqlite. */
+function keyedHarness(
+  options: HarnessOptions & {
+    live?: (workflowId: string, runId: string) => Promise<boolean>;
+    fence?: ExecutionFenceWiring;
+    now?: () => number;
+  } = {},
+) {
+  const sqlite = openSqlite();
+  const store = new StartIdempotencyStore(
+    sqliteUnitDatabase(sqlite) as StartIdempotencyDatabase,
+    options.now ? { now: options.now } : {},
+  );
+  const persisted = new Map<string, RunSummary>();
+  const executions: string[] = [];
+  // The stand-in for a run object's in-flight set: what a liveness probe
+  // actually answers from. Populated for the whole of a start, so a sibling
+  // request that arrives mid-execution sees the truth a DO would report.
+  const inFlight = new Set<string>();
+  let runSeq = 0;
+  const harness = makeHarness({
+    ...options,
+    startIdempotency: {
+      store,
+      live: options.live ?? (async (_workflowId, runId) => inFlight.has(runId)),
+      fence: options.fence ?? 'none',
+    },
+    start:
+      options.start ??
+      (async ({ runId, workflowId }) => {
+        inFlight.add(runId);
+        try {
+          // The stand-in for the paid first step. The awaited tick is what lets
+          // a parallel sibling actually interleave here.
+          await Promise.resolve();
+          executions.push(runId);
+          const summary: RunSummary = {
+            runId,
+            status: 'success',
+            result: { ok: true, workflowId },
+          };
+          persisted.set(runId, summary);
+          return summary;
+        } finally {
+          inFlight.delete(runId);
+        }
+      }),
+    status:
+      options.status ?? (async (_workflowId, runId) => persisted.get(runId)),
+  });
+  return {
+    ...harness,
+    store,
+    persisted,
+    executions,
+    /** Distinct ids per mint, so a converged retry is visible as convergence. */
+    nextRunId: () => {
+      runSeq += 1;
+      return `mint_${runSeq}`;
+    },
+  };
+}
+
+describe('createRunRouter — idempotent start (F3)', () => {
+  it('refuses a key on a host that wired no reservation store', async () => {
+    // #given the typed opt-out — the default in this file
+    const { handle } = makeHarness();
+
+    // #when
+    const response = await handle(
+      req('/runs', {
+        body: { workflowId: 'open-flow', idempotencyKey: 'key-1' },
+      }),
+    );
+
+    // #then 503 with a code, never a silent unkeyed start: ignoring the key
+    // would answer an exactly-once request with at-least-once behaviour.
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toMatchObject({
+      reason: { code: 'IDEMPOTENT_START_UNSUPPORTED' },
+    });
+  });
+
+  it('keeps refusing a caller-supplied runId even alongside a key', async () => {
+    // #given — the key is the one identifier a client may choose; the runId
+    // names a slot in every store this deployment has and stays server-minted.
+    const { handle } = keyedHarness();
+
+    // #when
+    const response = await handle(
+      req('/runs', {
+        body: {
+          workflowId: 'open-flow',
+          runId: 'chosen',
+          idempotencyKey: 'key-1',
+        },
+      }),
+    );
+
+    // #then the pinned 400 is untouched by F3
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toEqual({
+      error: 'runId is server-assigned',
+    });
+  });
+
+  it('starts once and replays the SAME run for a retry, with no second execution', async () => {
+    // #given a host whose first step is expensive
+    const { handle, executions } = keyedHarness();
+
+    // #when the response to the first call is lost and the client retries
+    const first = await handle(
+      req('/runs', {
+        body: { workflowId: 'open-flow', idempotencyKey: 'key-1' },
+      }),
+    );
+    const retry = await handle(
+      req('/runs', {
+        body: { workflowId: 'open-flow', idempotencyKey: 'key-1' },
+      }),
+    );
+
+    // #then one execution, and both answers describe that one run
+    expect(executions).toHaveLength(1);
+    const firstBody = (await first?.json()) as RunSummary;
+    const retryBody = (await retry?.json()) as RunSummary;
+    expect(retry?.status).toBe(200);
+    expect(retryBody.runId).toBe(firstBody.runId);
+    expect(retryBody).toEqual(firstBody);
+  });
+
+  it('starts ONE run for two same-key requests issued in parallel', async () => {
+    // #given the cross-isolate race a kill-and-retry harness cannot fake: two
+    // in-flight first calls against one database, neither having seen the other
+    const { handle, executions } = keyedHarness();
+
+    // #when
+    const [a, b] = await Promise.all([
+      handle(
+        req('/runs', {
+          body: { workflowId: 'open-flow', idempotencyKey: 'key-1' },
+        }),
+      ),
+      handle(
+        req('/runs', {
+          body: { workflowId: 'open-flow', idempotencyKey: 'key-1' },
+        }),
+      ),
+    ]);
+
+    // #then exactly one execution. That is the invariant; the loser's exact
+    // answer is not, and all three of its possible answers are honest:
+    //   200 the winner already persisted, so the loser replays it
+    //   503 the winner is executing, so the loser is told PENDING
+    //   409 the loser probed inside the CLAIM-TO-DISPATCH WINDOW — the moment
+    //       between the winning CAS landing and the winner's start request
+    //       reaching the object that would report it live. Nothing is running
+    //       yet from any observer's point of view, so UNRESOLVABLE is what the
+    //       probe can honestly say. It is a false alarm, not a lost run: the
+    //       claim still stands, the winner still executes, and the caller's
+    //       next retry replays the persisted summary.
+    // What must never appear is a second entry in `executions`.
+    expect(executions).toHaveLength(1);
+    for (const response of [a, b]) {
+      expect([200, 409, 503]).toContain(response?.status);
+    }
+  });
+
+  it('refuses the same key pointed at a different workflow', async () => {
+    // #given a key already spent on open-flow by an actor who may start both
+    const { handle, executions } = keyedHarness();
+    await handle(
+      req('/runs', {
+        body: { workflowId: 'open-flow', idempotencyKey: 'key-1' },
+        actor: ADMIN,
+      }),
+    );
+
+    // #when the SAME principal reuses it for another workflow — the same
+    // principal, so this is a target mismatch and not an ownership one
+    const response = await handle(
+      req('/runs', {
+        body: { workflowId: 'restricted-flow', idempotencyKey: 'key-1' },
+        actor: ADMIN,
+      }),
+    );
+
+    // #then 409 naming what the key holds, and no second execution
+    expect(response?.status).toBe(409);
+    expect(await response?.json()).toMatchObject({
+      reason: {
+        code: 'IDEMPOTENT_START_TARGET_MISMATCH',
+        targetId: 'open-flow',
+      },
+    });
+    expect(executions).toHaveLength(1);
+  });
+
+  it('refuses a key another principal reserved, with 403 and nothing else', async () => {
+    // #given
+    const { handle } = keyedHarness();
+    await handle(
+      req('/runs', {
+        body: { workflowId: 'open-flow', idempotencyKey: 'key-1' },
+      }),
+    );
+
+    // #when a different principal sends the same key
+    const response = await handle(
+      req('/runs', {
+        body: { workflowId: 'open-flow', idempotencyKey: 'key-1' },
+        actor: ADMIN,
+      }),
+    );
+
+    // #then
+    expect(response?.status).toBe(403);
+    expect(await response?.json()).toMatchObject({
+      reason: { code: 'IDEMPOTENT_START_OWNER_MISMATCH' },
+    });
+  });
+
+  it('answers 503 PENDING while the reserved run is still executing', async () => {
+    // #given a claimed reservation whose run has persisted nothing and whose
+    // host reports it live
+    const { handle, store } = keyedHarness({ live: async () => true });
+    await store.reserve({
+      key: 'key-1',
+      owner: { kind: 'human', id: OPERATOR.id },
+      targetKind: 'workflow',
+      targetId: 'open-flow',
+      mintRunId: () => 'inflight_run',
+    });
+    await store.claim('key-1', 'inflight_run');
+
+    // #when
+    const response = await handle(
+      req('/runs', {
+        body: { workflowId: 'open-flow', idempotencyKey: 'key-1' },
+      }),
+    );
+
+    // #then retryable, and it names the run and when the claim was taken
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toMatchObject({
+      reason: { code: 'IDEMPOTENT_START_PENDING', runId: 'inflight_run' },
+    });
+  });
+
+  it('answers 409 UNRESOLVABLE when the claim is held but nothing is running', async () => {
+    // #given the crash window: claim taken, nothing persisted, host gone
+    const { handle, store, executions } = keyedHarness({
+      live: async () => false,
+    });
+    await store.reserve({
+      key: 'key-1',
+      owner: { kind: 'human', id: OPERATOR.id },
+      targetKind: 'workflow',
+      targetId: 'open-flow',
+      mintRunId: () => 'orphan_run',
+    });
+    await store.claim('key-1', 'orphan_run');
+
+    // #when
+    const response = await handle(
+      req('/runs', {
+        body: { workflowId: 'open-flow', idempotencyKey: 'key-1' },
+      }),
+    );
+
+    // #then refused, never re-executed: whether the first step already took
+    // effect is unknowable, so a human decides.
+    expect(response?.status).toBe(409);
+    expect(await response?.json()).toMatchObject({
+      reason: { code: 'IDEMPOTENT_START_UNRESOLVABLE', runId: 'orphan_run' },
+    });
+    expect(executions).toEqual([]);
+  });
+
+  it('answers 409 ALREADY_SETTLED for a key whose run completed and aged out', async () => {
+    // #given a settled reservation with no surviving snapshot
+    const { handle, store, executions } = keyedHarness();
+    await store.reserve({
+      key: 'key-1',
+      owner: { kind: 'human', id: OPERATOR.id },
+      targetKind: 'workflow',
+      targetId: 'open-flow',
+      mintRunId: () => 'settled_run',
+    });
+    await store.claim('key-1', 'settled_run');
+    await store.settleRun('settled_run');
+
+    // #when
+    const response = await handle(
+      req('/runs', {
+        body: { workflowId: 'open-flow', idempotencyKey: 'key-1' },
+      }),
+    );
+
+    // #then the work is done even though its outcome is gone
+    expect(response?.status).toBe(409);
+    expect(await response?.json()).toMatchObject({
+      reason: { code: 'IDEMPOTENT_START_ALREADY_SETTLED' },
+    });
+    expect(executions).toEqual([]);
+  });
+
+  it('re-claims a reservation whose first caller died before claiming, keeping its run id', async () => {
+    // #given a bare reservation — nothing has executed under it
+    const { handle, store, executions } = keyedHarness();
+    await store.reserve({
+      key: 'key-1',
+      owner: { kind: 'human', id: OPERATOR.id },
+      targetKind: 'workflow',
+      targetId: 'open-flow',
+      mintRunId: () => 'reserved_run',
+    });
+
+    // #when
+    const response = await handle(
+      req('/runs', {
+        body: { workflowId: 'open-flow', idempotencyKey: 'key-1' },
+      }),
+    );
+
+    // #then it proceeds under the RESERVED id rather than minting a new one
+    expect(response?.status).toBe(200);
+    expect(executions).toEqual(['reserved_run']);
+    expect((await response?.json()) as RunSummary).toMatchObject({
+      runId: 'reserved_run',
+    });
+  });
+
+  it('gives the claim back when the execution fence refuses, and converges on retry after it reopens', async () => {
+    // #given a deployment whose fence closes between the claim and the start
+    let fenced = true;
+    const executions: string[] = [];
+    const { handle, store } = keyedHarness({
+      start: async ({ runId }) => {
+        if (fenced) {
+          throw new ExecutionFencedError('migration-locked', 'run start');
+        }
+        executions.push(runId);
+        return { runId, status: 'success' };
+      },
+    });
+
+    // #when the fenced start is refused, the operator reopens, and the client
+    // retries with the same key
+    const refused = await handle(
+      req('/runs', {
+        body: { workflowId: 'open-flow', idempotencyKey: 'key-1' },
+      }),
+    );
+    const reservedRunId = (await store.read('key-1'))?.runId;
+    fenced = false;
+    const retry = await handle(
+      req('/runs', {
+        body: { workflowId: 'open-flow', idempotencyKey: 'key-1' },
+      }),
+    );
+
+    // #then the fence's own refusal reached the caller, the claim went back,
+    // and the retry ran the SAME run — a fence transition mid-start must not
+    // manufacture an unresolvable reservation, nor a second run.
+    expect(refused?.status).toBe(503);
+    expect(await refused?.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCED' },
+    });
+    expect(retry?.status).toBe(200);
+    expect(executions).toEqual([reservedRunId]);
+  });
+
+  it('keeps the claim when a start fails for any other reason', async () => {
+    // #given a start that failed somewhere it may already have executed
+    const { handle, store } = keyedHarness({
+      start: async () => {
+        throw new Error('step exploded');
+      },
+    });
+
+    // #when
+    await handle(
+      req('/runs', {
+        body: { workflowId: 'open-flow', idempotencyKey: 'key-1' },
+      }),
+    );
+
+    // #then the claim is held, so the next retry is refused rather than handed
+    // a fresh run
+    expect((await store.read('key-1'))?.state).toBe('started');
+  });
+
+  it('files an approval once, and reconciles rather than re-files on the replay', async () => {
+    // #given a run that suspends on its first (and only) start
+    const reconciled: string[] = [];
+    const persistedSuspensions = new Set<string>();
+    const { handle, store, service } = keyedHarness({
+      start: async ({ runId }) => {
+        persistedSuspensions.add(runId);
+        return suspendedSummary(runId);
+      },
+      status: async (_workflowId, runId) =>
+        persistedSuspensions.has(runId) ? suspendedSummary(runId) : undefined,
+      reconcileApprovals: async (_context, _workflowId, summary) => {
+        reconciled.push(summary.runId);
+      },
+    });
+
+    // #when the first start files an approval and the retry replays
+    const first = await handle(
+      req('/runs', {
+        body: { workflowId: 'open-flow', idempotencyKey: 'key-1' },
+      }),
+    );
+    const retry = await handle(
+      req('/runs', {
+        body: { workflowId: 'open-flow', idempotencyKey: 'key-1' },
+      }),
+    );
+    const reservedRunId = (await store.read('key-1'))?.runId as string;
+
+    // #then exactly ONE approval record exists. Re-running the start's
+    // unconditional filing on the replay would create a second record for the
+    // same gate on every retry — the exact duplication the key was bought to
+    // prevent — so the replay takes the deduplicating reconcile instead.
+    expect((await first?.json()) as { approvals?: unknown[] }).toMatchObject({
+      approvals: [expect.objectContaining({ runId: reservedRunId })],
+    });
+    expect(retry?.status).toBe(200);
+    expect(reconciled).toEqual([reservedRunId]);
+    const listed = await service.list(
+      { workflowId: 'open-flow', runId: reservedRunId },
+      SYSTEM,
+    );
+    expect(listed).toHaveLength(1);
   });
 });

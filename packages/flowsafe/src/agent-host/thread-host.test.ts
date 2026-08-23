@@ -1690,6 +1690,10 @@ describe('createThreadAgentHost', () => {
       'operator-1',
       'human',
       expect.any(String),
+      // The schedule dispatch and the reserved idempotency key: passed
+      // positionally on every start, and undefined on one that has neither.
+      undefined,
+      undefined,
     );
   });
 
@@ -1747,7 +1751,9 @@ describe('createThreadAgentHost', () => {
     );
 
     expect(response?.status).toBe(200);
-    expect(mocked.stream.mock.calls.at(-1)).toHaveLength(5);
+    // Five host arguments plus the two trailing optionals (schedule dispatch,
+    // reserved idempotency key), both undefined for this start.
+    expect(mocked.stream.mock.calls.at(-1)).toHaveLength(7);
     expect(discardScheduleDispatch).not.toHaveBeenCalled();
     await expect(
       fixture.resources.owner('run', 'acme_run'),
@@ -1996,6 +2002,8 @@ describe('createThreadAgentHost', () => {
       'webhook-dispatcher',
       'service',
       expect.any(String),
+      undefined,
+      undefined,
     );
     await expect(
       fixture.resources.owner('run', 'acme_service_run'),
@@ -2227,6 +2235,8 @@ describe('createThreadAgentHost', () => {
       'signal-dispatcher',
       'system',
       expect.any(String),
+      undefined,
+      undefined,
     );
     await expect(
       fixture.resources.owner('run', 'acme_signal_wake'),

@@ -160,6 +160,16 @@ interface StartBody {
   scheduleId?: unknown;
   dispatchId?: unknown;
   deadlineMs?: unknown;
+  /**
+   * The start's idempotency key, arriving on the INTERNAL Worker-to-DO channel
+   * only. Every request that reaches this route carries the deployment-identity
+   * header (a tenant request bearing one is refused before routing), so a key
+   * here is one the trusted run router reserved — which is what lets the
+   * proof-only fence match it. It is deliberately not an open request-context
+   * key and never a field of the public POST /runs body.
+   * @internal
+   */
+  idempotencyKey?: unknown;
 }
 
 interface ResumeBody {
@@ -209,11 +219,23 @@ function hasDatabaseBinding(env: unknown): boolean {
  */
 function assertFencedRuntime(runtime: RunnerRuntime, env: unknown): void {
   if (!(runtime instanceof RunnerRuntime)) return;
-  if (runtime.executionFence !== undefined) return;
   if (!hasDatabaseBinding(env)) return;
-  throw new Error(
-    'DurableObjectRunner: build() returned a runtime with no execution fence while this deployment carries a DB binding — wire it through init({ DB }) (which builds one) or pass an ExecutionFenceStore, so a migration-locked deployment cannot execute',
-  );
+  if (runtime.executionFence === undefined) {
+    throw new Error(
+      'DurableObjectRunner: build() returned a runtime with no execution fence while this deployment carries a DB binding — wire it through init({ DB }) (which builds one) or pass an ExecutionFenceStore, so a migration-locked deployment cannot execute',
+    );
+  }
+  // The same guard, for the same failure. A hand-built runtime with no
+  // reservation store still EXECUTES idempotent starts — the router reserves
+  // and claims above it — but never marks their reservations spent, so every
+  // key this deployment ever honoured stays in the drain inventory and never
+  // becomes purgeable. That is invisible until the day someone tries to prove
+  // the deployment empty, which is the day it matters most.
+  if (runtime.startIdempotency === undefined) {
+    throw new Error(
+      'DurableObjectRunner: build() returned a runtime with no start-reservation store while this deployment carries a DB binding — wire it through init({ DB }) (which builds one), so an idempotent start can be marked settled when its run ends',
+    );
+  }
 }
 
 export abstract class DurableObjectRunner<TEnv = unknown> {
@@ -224,6 +246,16 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
   #operationTail = Promise.resolve();
   /** `step\0reason` of every suspension deadline this object has reported. */
   #reportedSuspensionRejections = new Set<string>();
+  /**
+   * `workflowId:runId` of every start this object is currently executing — the
+   * liveness half of the idempotent-start replay decision.
+   *
+   * A SET rather than a stored key, because liveness is not durable state: the
+   * question is "is code running for this run right now", and the honest answer
+   * after an eviction is no. Anything written to storage would survive the
+   * isolate that wrote it and keep saying yes.
+   */
+  readonly #startsInFlight = new Set<string>();
 
   constructor(state: DurableObjectRunnerState | undefined, env: TEnv) {
     this.state = state;
@@ -298,6 +330,48 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         `DO identity mismatch: instance is '${name}' but the request names '${workflowId}:${runId}' — refusing (INV-1)`,
       );
     }
+  }
+
+  /**
+   * The same `workflowId:runId` join the DO name and the runtime's own run key
+   * use — composed here so the in-flight set cannot be keyed by runId alone,
+   * which would make two workflows' runs of the same id one another's liveness.
+   */
+  #inFlightKey(workflowId: string, runId: string): string {
+    return `${workflowId}:${runId}`;
+  }
+
+  /**
+   * Is a start for this run executing in THIS object right now?
+   *
+   * Two sources, ORed, because they cover different halves of the window: the
+   * route's own set covers from the recovery journal to the response (including
+   * the gap before core persists anything), and the runtime's `#activeRuns`
+   * covers a run driven through this isolate's runtime by any other path — an
+   * in-process host, a resume, an agent loop sharing the runtime. Neither alone
+   * is the whole window, and a false negative here is the expensive direction:
+   * it turns a live run into an UNRESOLVABLE refusal.
+   */
+  #isStartLive(workflowId: string, runId: string): boolean {
+    if (this.#startsInFlight.has(this.#inFlightKey(workflowId, runId))) {
+      return true;
+    }
+    return this.#ensureRuntime().isRunActive(workflowId, runId);
+  }
+
+  /**
+   * Validate an internal-channel idempotency key. Absent stays absent; anything
+   * present must be path-safe, because the same string is compared against the
+   * fence's proof key and stored as a reservation's primary key.
+   */
+  #startIdempotencyKey(value: unknown): string | undefined {
+    if (value === undefined || value === null) return undefined;
+    if (!isPathSafeId(value)) {
+      throw new InvalidRunRequestError(
+        'idempotencyKey must be a URL-path-safe identifier',
+      );
+    }
+    return value;
   }
 
   #requestedBy(value: unknown): string {
@@ -1413,6 +1487,11 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           );
         }
         this.#assertRunIdentity(workflowId, runId);
+        // The key rides the internal channel and nothing else. Validated here
+        // rather than trusted because this body is JSON: an unvalidated value
+        // would reach the fence's proof-only comparison and the runtime's
+        // reservation as whatever the parser produced.
+        const idempotencyKey = this.#startIdempotencyKey(body.idempotencyKey);
         // The fence BEFORE any of this object's own reads or writes: the
         // schedule-source lookup below, the recovery pass, the journal at
         // #armRunOwnerRecovery, and the owner reservation all touch storage,
@@ -1420,11 +1499,16 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         // half-claimed on its way to saying no. The runtime's own check inside
         // start() stays the backstop for every other caller.
         //
-        // No idempotency key reaches this route: a proof-only start arrives
-        // through a trusted host seam and never through a DO request body, so
-        // a fenced deployment refuses every start that arrives here.
+        // The KEY is what admits a proof-only start: in that state the fence
+        // nominates exactly one key, and a start carrying it is the proof run.
+        // This check reads the fence but does NOT bind the proof to the run —
+        // `recordProofRun` belongs to the runtime's own assert, which is the
+        // last gate before execution and the only one every caller passes.
+        // Binding here as well would let a start that this route later refused
+        // (an existing run, a schedule-source mismatch) consume the deployment's
+        // one proof slot.
         const startFence = await this.#readExecutionFence();
-        if (!admitsRunStart(startFence)) {
+        if (!admitsRunStart(startFence, idempotencyKey)) {
           throw new ExecutionFencedError(startFence.state, 'run start');
         }
         const source = await this.#startSource(
@@ -1465,6 +1549,16 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           token: crypto.randomUUID(),
         };
         await this.#armRunOwnerRecovery(recovery);
+        // From here to the finally below, this object IS the run's execution:
+        // everything past the journal either persists a snapshot or leaves the
+        // recovery pass to settle it. That window is exactly what a replaying
+        // start's liveness probe is asking about, and it is tracked in memory
+        // on purpose — an evicted isolate loses the entry, which is the true
+        // answer for a run that is no longer executing anywhere. Registered
+        // BEFORE the reservation and the runtime's own #activeRuns entry so the
+        // gap between the claim and core's first persisted snapshot — the one
+        // window where nothing else can see the run — is covered too.
+        this.#startsInFlight.add(this.#inFlightKey(workflowId, runId));
         try {
           await this.#reserveRunOwner(runId, source.owner, recovery.token);
           let summary: RunSummary;
@@ -1483,6 +1577,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
               requestedBy: principal.id,
               requestedByKind: principal.kind,
               attemptToken: recovery.token,
+              ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
               ...(body.deadlineMs === undefined
                 ? {}
                 : { deadlineMs: body.deadlineMs as number }),
@@ -1548,8 +1643,28 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
             await this.#rearmRunOwnerRecovery();
           }
           throw error;
+        } finally {
+          // Whatever happened, this object is no longer starting the run. The
+          // delete must be unconditional: an entry left behind would answer
+          // every later probe "live" for the lifetime of the isolate, turning a
+          // crashed start's honest UNRESOLVABLE into an endless PENDING.
+          this.#startsInFlight.delete(this.#inFlightKey(workflowId, runId));
         }
       });
+    }
+    // The liveness probe, answered OUTSIDE #withOperationLock on purpose: the
+    // start it is asking about holds that lock for the whole first leg, so a
+    // probe that queued behind it would block for exactly as long as the run it
+    // was trying to describe — and time out reporting nothing.
+    if (
+      request.method === 'GET' &&
+      segments.length === 4 &&
+      action === 'start-liveness' &&
+      workflowId &&
+      runId
+    ) {
+      this.#assertRunIdentity(workflowId, runId);
+      return json({ live: this.#isStartLive(workflowId, runId) });
     }
     if (
       request.method === 'GET' &&

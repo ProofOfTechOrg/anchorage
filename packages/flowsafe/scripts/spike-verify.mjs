@@ -346,9 +346,9 @@ async function readFence() {
   return body;
 }
 
-async function moveFence(expected, next) {
+async function moveFence(expected, next, proofKey) {
   const { status, body } = await http('POST', FENCE_ADMIN_PATH, {
-    body: { expected, next },
+    body: { expected, next, ...(proofKey === undefined ? {} : { proofKey }) },
   });
   assert(
     status === 200 && body.state === next,
@@ -356,6 +356,16 @@ async function moveFence(expected, next) {
     { status, body },
   );
   return body;
+}
+
+// A keyed start, as a trusted client actually sends one: the key rides the
+// PUBLIC body (it names a request, unlike the runId, which stays server-minted
+// and is still refused with a 400 here).
+async function startWithKey(idempotencyKey, headers = AUTH.operator) {
+  return http('POST', '/runs', {
+    body: { ...RUN_BODY, idempotencyKey },
+    headers,
+  });
 }
 
 // Every fence refusal is 503 (operator-transient, retryable) carrying
@@ -2581,6 +2591,153 @@ async function main() {
     },
   );
 
+  // --- Idempotent start (F3): exactly-once, on real workerd -----------------
+  // Unit tests can prove the reservation's compare-and-set over node:sqlite.
+  // What they cannot prove is that a reservation written by one PROCESS still
+  // converges a retry in the next one, that two genuinely concurrent requests
+  // reach one run through real D1 rather than a synchronous test double, and
+  // that the fence's proof-only state admits exactly the start carrying its
+  // nominated key once the whole router chain is in the way.
+
+  const idempotentRun = await step(
+    'FI1 idempotent start: a retry after a workerd kill+restart returns the ' +
+      'SAME run, and starts no second one',
+    async () => {
+      const first = await startWithKey('spike-key-1');
+      assert(
+        first.status === 200 && first.body.status === 'suspended',
+        'the first keyed start must run normally',
+        first,
+      );
+
+      // Process death between the response and the retry — the case a client
+      // cannot tell from a lost response.
+      await killServer(currentServer);
+      await launchServer(
+        'idempotent-restart',
+        stateDir,
+        join(tmpDir, 'idempotent-restart.log'),
+      );
+
+      const retry = await startWithKey('spike-key-1');
+      assert(
+        retry.status === 200 && retry.body.runId === first.body.runId,
+        'the retry must replay the first run, not start a second',
+        { first: first.body, retry: retry.body },
+      );
+      // Run ids are server-minted per start and a run id can only be started
+      // once (INV-1 + RunAlreadyExistsError), so one run id across two requests
+      // IS one execution. Nothing in the restarted process had ever seen this
+      // key: the only thing that carried it across process death is the D1 row.
+      return { runId: first.body.runId, approvalId: first.body.approval?.id };
+    },
+  );
+
+  await step(
+    'FI2 concurrent same-key starts: two in-flight requests produce ONE run',
+    async () => {
+      // The cross-isolate race a kill-and-retry harness cannot fake: neither
+      // request has seen the other, and only the reservation's CAS is between
+      // them. On the agent surface this is the ONLY thing between them, because
+      // two same-key starts naming different threads are two different Durable
+      // Objects with no shared lock at all.
+      const [a, b] = await Promise.all([
+        startWithKey('spike-key-2'),
+        startWithKey('spike-key-2'),
+      ]);
+      const runIds = new Set(
+        [a, b]
+          .filter((response) => response.status === 200)
+          .map((response) => response.body.runId),
+      );
+      assert(
+        runIds.size === 1,
+        'two concurrent same-key starts must resolve to exactly one run',
+        {
+          a: { status: a.status, body: a.body },
+          b: { status: b.status, body: b.body },
+        },
+      );
+      // The loser is allowed to replay (200), to be told the winner is still
+      // working (503 IDEMPOTENT_START_PENDING), or — inside the window between
+      // the winning claim and its dispatch — to be told UNRESOLVABLE (409).
+      // What it may never be is a second run.
+      for (const response of [a, b]) {
+        assert(
+          [200, 409, 503].includes(response.status),
+          'a concurrent same-key start answered outside the taxonomy',
+          response,
+        );
+      }
+    },
+  );
+
+  await step(
+    'FI3 proof-only: the nominated key is admitted, every other start is ' +
+      'refused, and the proof binds to exactly one run',
+    async () => {
+      await moveFence('open', 'proof-only', 'spike-proof-key');
+      const nominated = await readFence();
+      assert(
+        nominated.state === 'proof-only' &&
+          nominated.proofKey === 'spike-proof-key' &&
+          nominated.proofRunId === undefined,
+        'entering proof-only nominates a key and binds no run yet',
+        nominated,
+      );
+
+      // A start with no key at all: refused, exactly as under the lock.
+      const unkeyed = await http('POST', '/runs', {
+        body: RUN_BODY,
+        headers: AUTH.operator,
+      });
+      assertFenced('an unkeyed start under proof-only', unkeyed, 'proof-only');
+
+      // A start carrying a DIFFERENT key: also refused. The key is not a
+      // password, it is a nomination — only the operator's own key matches.
+      const wrongKey = await startWithKey('spike-wrong-key');
+      assertFenced(
+        'a start carrying the wrong key under proof-only',
+        wrongKey,
+        'proof-only',
+      );
+
+      // The nominated start runs, and binds the proof.
+      const proof = await startWithKey('spike-proof-key');
+      assert(
+        proof.status === 200 && proof.body.status === 'suspended',
+        'the nominated proof start must be admitted',
+        proof,
+      );
+      const bound = await readFence();
+      assert(
+        bound.proofRunId === proof.body.runId,
+        'the admitted proof start binds the fence to its run',
+        { bound, proof: proof.body },
+      );
+
+      // Reopening restores ordinary minting, and clears the proof binding so
+      // the next proof cannot inherit this one's run.
+      await moveFence('proof-only', 'open');
+      const reopened = await readFence();
+      assert(
+        reopened.state === 'open' &&
+          reopened.proofKey === undefined &&
+          reopened.proofRunId === undefined,
+        'reopening clears the proof nomination and its binding',
+        reopened,
+      );
+      const afterReopen = await startWithKey('spike-key-3');
+      assert(
+        afterReopen.status === 200 &&
+          afterReopen.body.runId !== proof.body.runId &&
+          afterReopen.body.runId !== idempotentRun.runId,
+        'the reopened deployment mints fresh runs again',
+        afterReopen,
+      );
+    },
+  );
+
   await step(
     'S deployment sentinel mismatch: a freshly started Worker refuses a D1 ' +
       'provisioned for another deployment',
@@ -2658,6 +2815,12 @@ try {
       'decisions (leaving the refused decision uncommitted), that lock survived ' +
       'a workerd kill+restart and still refused to mint, and reopening it ' +
       'restored minting and completed the approval the lock had refused. ' +
+      'Owner-bound idempotent start (F3): a keyed start retried after a ' +
+      'workerd kill+restart replayed the SAME run rather than starting a ' +
+      'second, two genuinely concurrent same-key starts resolved to ONE ' +
+      'run, and under proof-only exactly the start carrying the nominated ' +
+      'key was admitted and bound the fence to its run while unkeyed and ' +
+      'wrong-keyed starts were refused. ' +
       'Finally, a fresh Worker refused a D1 sentinel stamped for ' +
       'another deployment with 503 before authentication or routing.',
   );

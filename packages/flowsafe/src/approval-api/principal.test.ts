@@ -41,6 +41,9 @@ function harness(): { service: ApprovalService; events: ApprovalAuditEvent[] } {
   return {
     service: new ApprovalService({
       store: backend.store(),
+      // In-memory store, no database to fence against: the opt-out is written down
+      // rather than defaulted — see ExecutionFenceWiring.
+      executionFence: 'none',
       audit: (event) => events.push(event),
     }),
     events,
@@ -501,6 +504,7 @@ describe('automated provenance reaches subordinate audit events', () => {
     const events: ApprovalAuditEvent[] = [];
     const service = new ApprovalService({
       store: backend.store(),
+      executionFence: 'none',
       audit: (event) => events.push(event),
       notify: () => {
         throw new Error('sink down');
@@ -536,6 +540,7 @@ describe('automated provenance reaches subordinate audit events', () => {
     const events: ApprovalAuditEvent[] = [];
     const service = new ApprovalService({
       store: backend.store(),
+      executionFence: 'none',
       audit: (event) => events.push(event),
       stream: () => {
         throw new Error('hub down');

@@ -454,6 +454,9 @@ function buildHarness(): Harness {
 
   const service = new ApprovalService({
     store,
+    // In-memory store, no database to fence against: the opt-out is written down
+    // rather than defaulted — see ExecutionFenceWiring.
+    executionFence: 'none',
     resumeRun: resumeViaRuntime(runtime),
   });
 
@@ -501,6 +504,7 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
   ) {
     const service = new ApprovalService({
       store,
+      executionFence: 'none',
       ...(options.resumeRun === undefined
         ? {}
         : { resumeRun: options.resumeRun }),
@@ -734,7 +738,7 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
     // #given — a step-keyed record created by TRUSTED in-process code, bound to
     // the leg's exact suspension. The fix tightens the HTTP boundary only.
     const store = new InMemoryApprovalStore();
-    const service = new ApprovalService({ store });
+    const service = new ApprovalService({ store, executionFence: 'none' });
     const suspendedAt = Date.parse('2026-07-09T00:00:00.000Z');
     const { record } = await service.create(
       {

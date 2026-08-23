@@ -26,9 +26,11 @@ import {
   createBackgroundTaskD1Domains,
 } from './d1-storage.js';
 import {
-  BACKGROUND_TASK_MANAGER_TEST_ACCESS,
   BackgroundTaskHost,
   type BackgroundTaskHostOptions,
+  backgroundTaskManagerForTests,
+  FENCE_RESUME_SCAN_PAGE,
+  MAX_FENCE_RESUME_SCANS,
   MAX_FENCE_RESUMES_PER_PASS,
 } from './host.js';
 
@@ -178,9 +180,7 @@ describe('BackgroundTaskHost — wiring', () => {
     // `#gated`), which is the seam that stops a locked deployment executing a
     // task body — including one a recovery re-drive resolved by name.
     const registered =
-      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS].getStaticExecutor(
-        'longResearch',
-      );
+      backgroundTaskManagerForTests(host).getStaticExecutor('longResearch');
     expect(registered).toBeDefined();
     await expect(registered?.execute({ topic: 'ai' })).resolves.toEqual({
       done: true,
@@ -298,9 +298,9 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
     vi.spyOn(mastra, 'stopWorkers').mockImplementation(async () => {
       calls.push('stop-workers');
     });
-    const init = vi.spyOn(host[BACKGROUND_TASK_MANAGER_TEST_ACCESS], 'init');
+    const init = vi.spyOn(backgroundTaskManagerForTests(host), 'init');
     const managerShutdown = vi.spyOn(
-      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      backgroundTaskManagerForTests(host),
       'shutdown',
     );
 
@@ -329,15 +329,14 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
     vi.spyOn(mastra, 'startWorkers').mockImplementation(async () => {
       calls.push('start-workers');
     });
+    vi.spyOn(backgroundTaskManagerForTests(host), 'init').mockImplementation(
+      async () => {
+        calls.push('manager-init');
+        throw primary;
+      },
+    );
     vi.spyOn(
-      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
-      'init',
-    ).mockImplementation(async () => {
-      calls.push('manager-init');
-      throw primary;
-    });
-    vi.spyOn(
-      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      backgroundTaskManagerForTests(host),
       'shutdown',
     ).mockImplementation(async () => {
       calls.push('manager-shutdown');
@@ -372,15 +371,14 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
     vi.spyOn(mastra, 'startWorkers').mockImplementation(async () => {
       calls.push('start-workers');
     });
+    vi.spyOn(backgroundTaskManagerForTests(host), 'init').mockImplementation(
+      async () => {
+        calls.push('manager-init');
+        throw primary;
+      },
+    );
     vi.spyOn(
-      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
-      'init',
-    ).mockImplementation(async () => {
-      calls.push('manager-init');
-      throw primary;
-    });
-    vi.spyOn(
-      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      backgroundTaskManagerForTests(host),
       'shutdown',
     ).mockImplementation(async () => {
       calls.push('manager-shutdown');
@@ -420,14 +418,11 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
       executors: {},
     });
     vi.spyOn(mastra, 'startWorkers').mockResolvedValue();
-    vi.spyOn(
-      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
-      'init',
-    ).mockResolvedValue();
+    vi.spyOn(backgroundTaskManagerForTests(host), 'init').mockResolvedValue();
     await host.boot();
     const calls: string[] = [];
     vi.spyOn(
-      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      backgroundTaskManagerForTests(host),
       'shutdown',
     ).mockImplementation(async () => {
       calls.push('manager-shutdown');
@@ -476,6 +471,64 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
     );
   });
 
+  it('retries a registration that failed on a transient storage fault', async () => {
+    // #given — a host whose first registration cannot reach storage. The read
+    // routes hang off this memo, so caching that answer would keep the whole
+    // host answering for a queue it can already reach again, until an eviction
+    // nobody can schedule.
+    const storage = new InMemoryStore();
+    const mastra = new Mastra({ storage });
+    const executor: ToolExecutor = { execute: async () => ({ done: true }) };
+    let reads = 0;
+    vi.spyOn(mastra, 'getStorage').mockImplementation(() => {
+      reads += 1;
+      if (reads === 1) throw new Error('D1_ERROR: storage unavailable');
+      return storage as never;
+    });
+    const host = newBackgroundTaskHost({
+      mastra,
+      pubsub: createHostPubSub(),
+      executors: { longResearch: executor },
+    });
+
+    // #when — the first boot fails on that read.
+    await expect(host.boot()).rejects.toThrow(/storage unavailable/);
+
+    // #then — the next boot registers for real rather than replaying the
+    // rejection: the executors a recovered task resolves by name are there.
+    await expect(host.boot()).resolves.toBeUndefined();
+    expect(
+      backgroundTaskManagerForTests(host).getStaticExecutor('longResearch'),
+    ).toBeDefined();
+  });
+
+  it('keeps a deterministic configuration failure memoized', async () => {
+    // #given — execution mode over a store that is not the serialized D1
+    // workflows domain. Nothing about that answer can change without a new
+    // host, so re-validating it on every boot would only re-read storage to
+    // reach the same refusal.
+    const storage = new InMemoryStore();
+    const mastra = new Mastra({ storage });
+    const host = newBackgroundTaskHost({
+      mastra,
+      pubsub: createHostPubSub(),
+      execution: true,
+      executors: {},
+    });
+    await expect(host.boot()).rejects.toThrow(
+      /requires DurableObjectWorkflowsStorageD1/,
+    );
+
+    // #when — a second boot, watched from here so only the RETRY's reads count.
+    const getStorage = vi.spyOn(mastra, 'getStorage');
+    await expect(host.boot()).rejects.toThrow(
+      /requires DurableObjectWorkflowsStorageD1/,
+    );
+
+    // #then — the same refusal, served from the memo without touching storage.
+    expect(getStorage).not.toHaveBeenCalled();
+  });
+
   it('treats shutdown as terminal even when boot was never started', async () => {
     const host = newBackgroundTaskHost({
       mastra: new Mastra({ storage: new InMemoryStore() }),
@@ -511,14 +564,13 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
       signalStart();
       await startReleased;
     });
+    vi.spyOn(backgroundTaskManagerForTests(host), 'init').mockImplementation(
+      async () => {
+        calls.push('manager-init');
+      },
+    );
     vi.spyOn(
-      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
-      'init',
-    ).mockImplementation(async () => {
-      calls.push('manager-init');
-    });
-    vi.spyOn(
-      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      backgroundTaskManagerForTests(host),
       'shutdown',
     ).mockImplementation(async () => {
       calls.push('manager-shutdown');
@@ -527,10 +579,12 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
       calls.push('stop-workers');
     });
 
-    // #when
+    // #when — the shutdown arrives once boot is already PAST admission and
+    // inside startWorkers. (A shutdown that lands before admission is the
+    // separate fence-read race below, where boot starts nothing at all.)
     const boot = host.boot();
-    const shutdown = host.shutdown();
     await startEntered;
+    const shutdown = host.shutdown();
     expect(calls).toEqual(['start-workers']);
     releaseStart();
     await Promise.all([boot, shutdown]);
@@ -554,15 +608,12 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
       executors: {},
     });
     vi.spyOn(mastra, 'startWorkers').mockResolvedValue();
-    vi.spyOn(
-      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
-      'init',
-    ).mockResolvedValue();
+    vi.spyOn(backgroundTaskManagerForTests(host), 'init').mockResolvedValue();
     await host.boot();
     const primary = new Error('manager shutdown');
     const calls: string[] = [];
     vi.spyOn(
-      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      backgroundTaskManagerForTests(host),
       'shutdown',
     ).mockImplementation(async () => {
       calls.push('manager-shutdown');
@@ -587,17 +638,13 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
       executors: {},
     });
     vi.spyOn(mastra, 'startWorkers').mockResolvedValue();
-    vi.spyOn(
-      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
-      'init',
-    ).mockResolvedValue();
+    vi.spyOn(backgroundTaskManagerForTests(host), 'init').mockResolvedValue();
     await host.boot();
     const primary = new Error('manager shutdown');
     const workerCleanup = new Error('worker shutdown');
-    vi.spyOn(
-      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
-      'shutdown',
-    ).mockRejectedValue(primary);
+    vi.spyOn(backgroundTaskManagerForTests(host), 'shutdown').mockRejectedValue(
+      primary,
+    );
     vi.spyOn(mastra, 'stopWorkers').mockRejectedValue(workerCleanup);
 
     // #when
@@ -759,11 +806,13 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
     });
   }
 
-  it('tears down a boot that shutdown raced during the fence read', async () => {
+  it('starts nothing when shutdown arrives during the fence read', async () => {
     // #given — the window the fence read opens: `boot()` is suspended reading
-    // the fence, so it has not admitted dispatching yet and has started
-    // nothing. Teardown must still wait for it, or `shutdown()` returns having
-    // stopped nothing and the workers boot goes on to start outlive it.
+    // the fence, so it is past `boot()`'s own shutdown guard but has not
+    // admitted dispatching yet. Subscribing and claiming from here would hand
+    // work to a manager that is already being torn down — and `#doShutdown`
+    // waits on this very attempt, so it would be waiting for the claim it is
+    // trying to prevent.
     const { mastra, pubsub } = await executionHostDependencies();
     let releaseFence: () => void = () => undefined;
     const fenceRead = new Promise<void>((resolve) => {
@@ -787,14 +836,13 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
     vi.spyOn(mastra, 'startWorkers').mockImplementation(async () => {
       calls.push('start-workers');
     });
+    vi.spyOn(backgroundTaskManagerForTests(host), 'init').mockImplementation(
+      async () => {
+        calls.push('manager-init');
+      },
+    );
     vi.spyOn(
-      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
-      'init',
-    ).mockImplementation(async () => {
-      calls.push('manager-init');
-    });
-    vi.spyOn(
-      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      backgroundTaskManagerForTests(host),
       'shutdown',
     ).mockImplementation(async () => {
       calls.push('manager-shutdown');
@@ -810,13 +858,44 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
     releaseFence();
     await Promise.all([boot, shutdown]);
 
-    // #then — everything boot started is stopped again, in teardown order.
-    expect(calls).toEqual([
-      'start-workers',
-      'manager-init',
-      'manager-shutdown',
-      'stop-workers',
-    ]);
+    // #then — the boot re-checks after the read and bails: nothing was started,
+    // so there is nothing to stop and nothing left running behind the teardown.
+    expect(calls).toEqual([]);
+  });
+
+  it('abandons the alarm duty when shutdown arrives during its boot', async () => {
+    // #given — the alarm's own boot, held inside the fence read. `onAlarm`
+    // sweeps and then runs core's TTL cleanup, and both would land on a manager
+    // that is already being torn down.
+    const { mastra, pubsub } = await executionHostDependencies();
+    let releaseFence: () => void = () => undefined;
+    const fenceRead = new Promise<void>((resolve) => {
+      releaseFence = resolve;
+    });
+    const open = await fenceAt('open');
+    const host = newBackgroundTaskHost({
+      mastra,
+      pubsub,
+      executors: {},
+      executionFence: {
+        read: async () => {
+          await fenceRead;
+          return open.read();
+        },
+      } as unknown as ExecutionFenceStore,
+    });
+    const cleanup = vi
+      .spyOn(backgroundTaskManagerForTests(host), 'cleanup')
+      .mockResolvedValue(undefined as never);
+
+    // #when — teardown is requested while the alarm's boot is still reading.
+    const alarm = host.onAlarm();
+    const shutdown = host.shutdown();
+    releaseFence();
+    await Promise.all([alarm, shutdown]);
+
+    // #then — the duty is dropped rather than run against a shut-down manager.
+    expect(cleanup).not.toHaveBeenCalled();
   });
 
   it('starts the dispatcher ONCE when two boots race the fence read', async () => {
@@ -847,7 +926,7 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
       .spyOn(mastra, 'startWorkers')
       .mockImplementation(async () => undefined);
     const init = vi
-      .spyOn(host[BACKGROUND_TASK_MANAGER_TEST_ACCESS], 'init')
+      .spyOn(backgroundTaskManagerForTests(host), 'init')
       .mockImplementation(async () => undefined);
 
     // #when — both boots pass the `#dispatching` guard before either read ends.
@@ -905,7 +984,7 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
       executionFence: await fenceAt('open'),
     });
     const resume = vi
-      .spyOn(host[BACKGROUND_TASK_MANAGER_TEST_ACCESS], 'resume')
+      .spyOn(backgroundTaskManagerForTests(host), 'resume')
       .mockImplementation(async (taskId: string) => {
         await store.updateTask(taskId, { status: 'running' });
         return (await store.getTask(taskId)) as never;
@@ -983,6 +1062,93 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
       );
       expect((await stillSuspended()).sort()).toEqual(
         newer.map((task) => task.id).sort(),
+      );
+    } finally {
+      await host.shutdown();
+    }
+  });
+
+  it("reaches a cohort past one wake's scan bound on the NEXT alarm", async () => {
+    // #given — the stranding case paging alone cannot fix: a parked cohort
+    // sitting behind more newer tool-suspends than one wake can page through
+    // (MAX_FENCE_RESUME_SCANS * FENCE_RESUME_SCAN_PAGE rows). Every wake used
+    // to restart at page 0, so every wake re-read the same marker-free prefix
+    // and stopped in the same place — the cohort was unreachable forever.
+    //
+    // The set is served through a stubbed `listTasks` rather than seeded into
+    // D1: the point under test is which PAGES successive wakes ask for, and
+    // materializing thousands of rows to observe that would only make the test
+    // slower to lie in the same way.
+    const beyondOneWake = MAX_FENCE_RESUME_SCANS * FENCE_RESUME_SCAN_PAGE;
+    const remaining = [
+      ...Array.from({ length: beyondOneWake }, (_, index) =>
+        baseTask({
+          id: `tool-${String(index).padStart(4, '0')}`,
+          status: 'suspended',
+          suspendedAt: new Date(1_900_000_000_000 + index),
+          suspendPayload: { awaiting: 'webhook' },
+        }),
+      ),
+      ...Array.from({ length: 3 }, (_, index) =>
+        baseTask({
+          id: `parked-${index}`,
+          status: 'suspended',
+          suspendedAt: new Date(1_700_000_000_000 + index),
+          suspendPayload: {
+            'flowsafe.executionFenced': { state: 'migration-locked' },
+          },
+        }),
+      ),
+    ];
+    const host = newBackgroundTaskHost({
+      mastra: new Mastra({ storage: new InMemoryStore() }),
+      pubsub: createHostPubSub(),
+      executors: {},
+      executionFence: await fenceAt('open'),
+    });
+    const manager = backgroundTaskManagerForTests(host);
+    const pagesRead: number[] = [];
+    vi.spyOn(manager, 'listTasks').mockImplementation(async (filter) => {
+      const page = filter?.page ?? 0;
+      pagesRead.push(page);
+      const from = page * FENCE_RESUME_SCAN_PAGE;
+      return {
+        tasks: remaining.slice(from, from + FENCE_RESUME_SCAN_PAGE),
+      } as never;
+    });
+    const resume = vi
+      .spyOn(manager, 'resume')
+      .mockImplementation(async (taskId: string) => {
+        // What core's handler does to the row: it leaves the suspended set.
+        remaining.splice(
+          remaining.findIndex((task) => task.id === taskId),
+          1,
+        );
+        return undefined as never;
+      });
+
+    try {
+      // #when — the first wake spends its whole scan budget finding nothing.
+      await host.boot();
+
+      // #then — it reached the bound without a single resume, and stopped one
+      // page short of the cohort.
+      expect(resume).not.toHaveBeenCalled();
+      expect(pagesRead).toEqual(
+        Array.from({ length: MAX_FENCE_RESUME_SCANS }, (_, page) => page),
+      );
+
+      // #when — the next alarm fires. Nothing changed on the deployment; the
+      // only thing carried across is where the last wake stopped reading.
+      pagesRead.length = 0;
+      await host.onAlarm();
+
+      // #then — it CONTINUES there rather than restarting, and the cohort that
+      // was unreachable is drained.
+      expect(pagesRead[0]).toBe(MAX_FENCE_RESUME_SCANS);
+      expect(resume).toHaveBeenCalledTimes(3);
+      expect(resume.mock.calls.map((call) => call[0] as string).sort()).toEqual(
+        ['parked-0', 'parked-1', 'parked-2'],
       );
     } finally {
       await host.shutdown();
@@ -1107,13 +1273,12 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
       executionFence: await fenceAt('open'),
     });
     const resumed: string[] = [];
-    vi.spyOn(
-      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
-      'resume',
-    ).mockImplementation(async (taskId: string) => {
-      resumed.push(taskId);
-      return undefined as never;
-    });
+    vi.spyOn(backgroundTaskManagerForTests(host), 'resume').mockImplementation(
+      async (taskId: string) => {
+        resumed.push(taskId);
+        return undefined as never;
+      },
+    );
 
     // #when
     try {
@@ -1179,9 +1344,7 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
     const host = hostWith(executionFence, { execute: ran });
     await host.boot();
     const registered =
-      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS].getStaticExecutor(
-        'longResearch',
-      );
+      backgroundTaskManagerForTests(host).getStaticExecutor('longResearch');
     const suspend = vi.fn(async (_data?: unknown) => undefined);
 
     // #when
@@ -1208,7 +1371,7 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
 
     // #then
     await expect(
-      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS]
+      backgroundTaskManagerForTests(host)
         .getStaticExecutor('longResearch')
         ?.execute({}),
     ).rejects.toBeInstanceOf(ExecutionFencedError);

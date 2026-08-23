@@ -39,6 +39,7 @@ export {
   purgeExpiredThreadState,
   purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
+  RUN_TTL_FLOWSAFE_PURGE_TABLES,
   RUN_TTL_PURGE_TABLES,
   SCHEDULE_TRIGGER_TTL_PURGE_TABLES,
   sweepExpiredRunDeadlines,
@@ -106,6 +107,11 @@ export type {
   ExecutionFenceStoreOptions,
   ExecutionFenceTransition,
   ExecutionFenceWiring,
+  // One arm of ExecutionFenceRefusal, published because that union is: a
+  // consumer that catches a fence refusal on the far side of a Durable Object
+  // boundary is handed THIS shape, and a union arm it cannot name is a surface
+  // it cannot write a handler's type against.
+  WireExecutionFenceRefusal,
 } from './execution-fence.js';
 export {
   admitsDrainableExecution,
@@ -117,6 +123,8 @@ export {
   ExecutionFenceStore,
   ExecutionFenceUnreadableError,
   executionFencedResponse,
+  // The one memo every host composes its fence through — see executionFenceFor.
+  executionFenceFor,
   executionFenceReadingPayload,
   FenceTransitionConflictError,
   InvalidExecutionFenceRequestError,
@@ -184,6 +192,54 @@ export type {
   ScheduleStartTarget,
 } from './schedule-source.js';
 export { resolveScheduleStartOwner } from './schedule-source.js';
+// Owner-bound idempotent start (docs/do-runner-design.md): the reservation that
+// makes a retried start converge onto the run it already made instead of paying
+// for a second one, and the five-code taxonomy that says which of those it did.
+//
+// START_IDEMPOTENCY_DDL and the two index statements are exported for the drain
+// inventory and for a host that owns its own migrations; the table NAME rides
+// with them because — unlike the fence's — this table is created by the store
+// itself, so there is only ever one definition of it to import.
+export type {
+  IdempotentStartDecision,
+  IdempotentStartSurface,
+  StartIdempotencyDatabase,
+  StartIdempotencyStatement,
+  StartIdempotencyStoreOptions,
+  StartIdempotencyWiring,
+  StartReservation,
+  StartReservationOutcome,
+  StartReservationOwner,
+  StartReservationRefusal,
+  StartReservationRequest,
+  StartReservationState,
+  StartTargetKind,
+} from './start-idempotency.js';
+export {
+  beginIdempotentStart,
+  IdempotentStartAlreadySettledError,
+  IdempotentStartPendingError,
+  IdempotentStartUnresolvableError,
+  InvalidStartIdempotencyRequestError,
+  isStartReservationRefusal,
+  requireStartIdempotency,
+  rollbackFencedStart,
+  START_IDEMPOTENCY_DDL,
+  START_IDEMPOTENCY_RUN_INDEX_DDL,
+  START_IDEMPOTENCY_STATE_INDEX_DDL,
+  START_IDEMPOTENCY_TABLE,
+  START_RESERVATION_STATES,
+  START_TARGET_KINDS,
+  StartIdempotencyStore,
+  StartIdempotencyUnsupportedError,
+  StartReservationOwnerMismatchError,
+  StartReservationTargetMismatchError,
+  StartReservationUnreadableError,
+  // The one memo every host composes its reservation store through — same
+  // reasoning as executionFenceFor: two stores over two bindings are two tables
+  // answering the same key.
+  startIdempotencyFor,
+} from './start-idempotency.js';
 // Per-suspension deadlines: the reserved suspend-payload key that arms one, the
 // timeout envelope a resumed step branches on, and the bounds each is validated
 // against (docs/do-runner-design.md, "Per-suspension deadlines"). The stored

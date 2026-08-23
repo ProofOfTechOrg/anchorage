@@ -50,6 +50,7 @@ describe('createDoRunTopology', () => {
       start: async () => summary,
       status: async () => summary,
       dispatchStatus: async () => summary,
+      startLiveness: async () => false,
       resume: async () => summary,
       resumeRecord: async () => summary,
     };

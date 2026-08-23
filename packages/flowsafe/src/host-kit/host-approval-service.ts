@@ -222,13 +222,12 @@ export function buildHostApprovalService(
     notify: options.notify,
     stream: options.stream,
     allowSelfDecision: options.allowSelfDecision,
-    // The opt-out is resolved HERE rather than pushed down: ApprovalService is
-    // constructed by hosts that never see a database at all (a thread DO's
-    // in-isolate service), so its own option stays plainly optional while this
-    // composer — which every fenced host goes through — is the layer that has
-    // to be told.
-    executionFence:
-      options.executionFence === 'none' ? undefined : options.executionFence,
+    // Forwarded as written, opt-out included: ApprovalService now requires the
+    // same wiring this composer does, so there is nothing left to resolve here
+    // — and resolving `'none'` to `undefined` on the way down would have
+    // erased, one layer above the gate, the distinction between a host that
+    // named the opt-out and one that never held a fence at all.
+    executionFence: options.executionFence,
     resumeRun: resumeRunWithRequeue(
       options.resumeRun,
       () => service,

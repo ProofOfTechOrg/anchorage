@@ -48,6 +48,8 @@ import {
   type RunSummary,
 } from './runtime.js';
 import type { ScheduleSourceStore } from './schedule-source.js';
+import type { StartIdempotencyDatabase } from './start-idempotency.js';
+import { StartIdempotencyStore } from './start-idempotency.js';
 import {
   isSuspensionTimeoutResumeData,
   MAX_SUSPENSION_DEADLINE_ATTEMPTS,
@@ -160,13 +162,26 @@ function newTestExecutionFence(): ExecutionFenceStore {
   );
 }
 
+/**
+ * A start-reservation store over its own throwaway database, for the same
+ * reason as the fence above: DurableObjectRunner refuses to serve from a
+ * runtime that has none while a DB binding is bound, and every runner in this
+ * file carries one. No key is ever used against it, so the table is never even
+ * created and every runner behaves exactly as it did before reservations.
+ */
+function newTestStartIdempotency(): StartIdempotencyStore {
+  return new StartIdempotencyStore(
+    sqliteUnitDatabase(openSqlite()) as StartIdempotencyDatabase,
+  );
+}
+
 function gatedRuntime(
   storage: InMemoryStore,
   executionFence: ExecutionFenceStore = newTestExecutionFence(),
 ): RunnerRuntime {
   const { createWorkflow, createStep, runtime } = init(
     { storage },
-    { executionFence },
+    { executionFence, startIdempotency: newTestStartIdempotency() },
   );
   const gate = createStep({
     id: 'gate',
@@ -1135,7 +1150,9 @@ describe('DurableObjectRunner.fetch', () => {
 
     const approvalStore = new InMemoryApprovalStore();
     const filed = await reconcileApprovalsForSummary(
-      new ApprovalService({ store: approvalStore }),
+      // In-memory store, no database to fence against: the opt-out is written down
+      // rather than defaulted — see ExecutionFenceWiring.
+      new ApprovalService({ store: approvalStore, executionFence: 'none' }),
       'gated',
       summary,
       'approval-reconciler',
@@ -1493,7 +1510,10 @@ describe('DurableObjectRunner.fetch', () => {
       protected build(env: TestEnv): RunnerRuntime {
         const { createWorkflow, createStep, runtime } = init(
           { storage: env.storage },
-          { executionFence: env.fence ?? newTestExecutionFence() },
+          {
+            executionFence: env.fence ?? newTestExecutionFence(),
+            startIdempotency: newTestStartIdempotency(),
+          },
         );
         const gate = createStep({
           id: 'gate',
@@ -2046,7 +2066,7 @@ function timedRuntime(
 ): RunnerRuntime {
   const { createWorkflow, createStep, runtime } = init(
     { storage },
-    { executionFence },
+    { executionFence, startIdempotency: newTestStartIdempotency() },
   );
   const timedStep = (id: string, execute: TimedStepExecute) =>
     createStep({
@@ -2157,7 +2177,10 @@ function collidingRuntime(storage: InMemoryStore): {
   const settled: string[] = [];
   const { createWorkflow, createStep, runtime } = init(
     { storage },
-    { executionFence: newTestExecutionFence() },
+    {
+      executionFence: newTestExecutionFence(),
+      startIdempotency: newTestStartIdempotency(),
+    },
   );
   const suspending = (id: string, label: string) =>
     createStep({
@@ -2204,7 +2227,10 @@ function foreachRuntime(
   const timedOut: number[] = [];
   const { createWorkflow, createStep, runtime } = init(
     { storage },
-    { executionFence: newTestExecutionFence() },
+    {
+      executionFence: newTestExecutionFence(),
+      startIdempotency: newTestStartIdempotency(),
+    },
   );
   const gate = createStep({
     id: 'gate',
@@ -5548,5 +5574,238 @@ describe('DurableObjectRunner and the deployment execution fence', () => {
       post('/runs', { workflowId: 'gated', runId: 'rpc-db' }),
     );
     expect(response.status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F3 — what the run object contributes to an idempotent start: it carries the
+// key on the internal channel, and it answers the liveness probe that separates
+// a run still working from a claim nobody is holding.
+// ---------------------------------------------------------------------------
+
+describe('DurableObjectRunner — idempotent start plumbing', () => {
+  it('answers the liveness probe false for a run it is not executing', async () => {
+    // #given a run object with nothing in flight
+    const runner = makeRunner();
+
+    // #when
+    const response = await runner.fetch(
+      deploymentIdentityRequest('http://do/runs/gated/run-idle/start-liveness'),
+    );
+
+    // #then. `false` is the fail-closed direction here: it produces the
+    // refusal that asks a human to investigate, where a default of `true`
+    // would answer a permanently dead run with a permanently retryable 503.
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ live: false });
+  });
+
+  it('answers the liveness probe true WHILE the start is executing, without queuing behind it', async () => {
+    // #given a workflow whose first step blocks until the probe has answered.
+    // This is the whole point of the route: the start holds the operation lock
+    // for its entire first leg, so a probe that took that lock would block for
+    // exactly as long as the run it was trying to describe.
+    const storage = new InMemoryStore();
+    const { createWorkflow, createStep, runtime } = init(
+      { storage },
+      {
+        executionFence: newTestExecutionFence(),
+        startIdempotency: newTestStartIdempotency(),
+      },
+    );
+    let probed!: (value: unknown) => void;
+    const probeAnswered = new Promise((resolve) => {
+      probed = resolve;
+    });
+    let running!: (value: unknown) => void;
+    const stepRunning = new Promise((resolve) => {
+      running = resolve;
+    });
+    const blocking = createStep({
+      id: 'blocking',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      execute: async () => {
+        running(undefined);
+        await probeAnswered;
+        return {};
+      },
+    });
+    createWorkflow({
+      id: 'gated',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(blocking)
+      .commit();
+    const env = { ...makeProductionEnv(storage), runtime };
+    const runner = new TestRunner(undefined, env);
+
+    // #when the start is in flight and a probe arrives
+    const started = runner.fetch(
+      post('/runs', { workflowId: 'gated', runId: 'run-live', inputData: {} }),
+    );
+    await stepRunning;
+    const probe = await runner.fetch(
+      deploymentIdentityRequest('http://do/runs/gated/run-live/start-liveness'),
+    );
+    probed(undefined);
+    await started;
+
+    // #then the probe answered — promptly, and truthfully
+    expect(await probe.json()).toEqual({ live: true });
+
+    // #and once the start is done, so is the liveness
+    const after = await runner.fetch(
+      deploymentIdentityRequest('http://do/runs/gated/run-live/start-liveness'),
+    );
+    expect(await after.json()).toEqual({ live: false });
+  });
+
+  it('refuses an idempotency key that is not path-safe', async () => {
+    // #given — the same string is compared against the fence's proof key and
+    // stored as a reservation's primary key, so an unvalidated one reaches both
+    const runner = makeRunner();
+
+    // #when
+    const response = await runner.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'run-bad-key',
+        inputData: { topic: 't' },
+        idempotencyKey: 'key/../escape',
+      }),
+    );
+
+    // #then
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: expect.stringContaining('idempotencyKey'),
+    });
+  });
+
+  it('admits exactly the proof-only start that carries the nominated key, end to end', async () => {
+    // #given a deployment fenced into proof-only, addressed through the route
+    // a trusted Worker actually uses
+    const storage = new InMemoryStore();
+    const env = makeProductionEnv(storage);
+    const fence = env.fence as ExecutionFenceStore;
+    await fence.seed('migration-locked');
+    await fence.transition({
+      expected: 'migration-locked',
+      next: 'proof-only',
+      proofKey: 'proof-key-1',
+    });
+    const runner = new TestRunner(undefined, env);
+
+    // #then a start with NO key is refused at the route, before this object
+    // writes anything of its own
+    const unkeyed = await runner.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'run-unkeyed',
+        inputData: { topic: 't' },
+      }),
+    );
+    expect(unkeyed.status).toBe(503);
+    expect(await unkeyed.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCED', state: 'proof-only' },
+    });
+
+    // #and a start carrying the WRONG key is refused the same way
+    const guessed = await runner.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'run-guessed',
+        inputData: { topic: 't' },
+        idempotencyKey: 'guessed-key',
+      }),
+    );
+    expect(guessed.status).toBe(503);
+
+    // #and the nominated start is admitted AND binds the proof run
+    const admitted = await runner.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'run-proof',
+        inputData: { topic: 't' },
+        idempotencyKey: 'proof-key-1',
+      }),
+    );
+    expect(admitted.status).toBe(200);
+    await expect(fence.read()).resolves.toEqual({
+      state: 'proof-only',
+      proofKey: 'proof-key-1',
+      proofRunId: 'run-proof',
+    });
+
+    // #and a SECOND start under the same key is refused: the proof is one run,
+    // and recordProofRun's CAS is what says so.
+    const second = await runner.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'run-proof-2',
+        inputData: { topic: 't' },
+        idempotencyKey: 'proof-key-1',
+      }),
+    );
+    expect(second.status).toBe(503);
+  });
+
+  it('refuses an admitted start whose fence MOVED before the write-back landed', async () => {
+    // #given a fence that reads proof-only and then, between the admitting
+    // read and the write-back, has been transitioned away — the 0-row case
+    // recordProofRun's CAS exists for
+    const storage = new InMemoryStore();
+    const env = makeProductionEnv(storage);
+    const fence = env.fence as ExecutionFenceStore;
+    await fence.seed('migration-locked');
+    await fence.transition({
+      expected: 'migration-locked',
+      next: 'proof-only',
+      proofKey: 'proof-key-1',
+    });
+    let moved = false;
+    const moving = new Proxy(fence, {
+      get(target, property, receiver) {
+        if (property === 'read') {
+          return async () => {
+            const reading = await target.read();
+            // The operator moves the fence ONCE, right after the read that
+            // admitted the start. Every later read sees the moved fence, which
+            // is exactly what an admitted-then-moved start observes.
+            if (!moved) {
+              moved = true;
+              await target.transition({
+                expected: 'proof-only',
+                next: 'migration-locked',
+              });
+            }
+            return reading;
+          };
+        }
+        const value = Reflect.get(target, property, receiver) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const runner = new TestRunner(undefined, {
+      ...env,
+      fence: moving as ExecutionFenceStore,
+    });
+
+    // #when
+    const response = await runner.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'run-proof',
+        inputData: { topic: 't' },
+        idempotencyKey: 'proof-key-1',
+      }),
+    );
+
+    // #then refused, and nothing ran: the deployment is no longer the one this
+    // start read, so its admission is void.
+    expect(response.status).toBe(503);
+    await expect(fence.read()).resolves.toEqual({ state: 'migration-locked' });
   });
 });

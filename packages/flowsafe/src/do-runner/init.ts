@@ -27,6 +27,12 @@ import { ExecutionFenceStore } from './execution-fence.js';
 import type { HostPubSub } from './pubsub.js';
 import type { RequestContextProvider } from './runtime.js';
 import { RunnerRuntime } from './runtime.js';
+import type {
+  StartIdempotencyDatabase,
+  StartIdempotencyStore,
+  StartIdempotencyWiring,
+} from './start-idempotency.js';
+import { startIdempotencyFor } from './start-idempotency.js';
 
 /** Workers env shape init() understands directly. */
 export interface DORunnerEnv {
@@ -75,6 +81,50 @@ export interface InitOptions {
    * be required is.
    */
   executionFence?: ExecutionFenceStore;
+  /**
+   * The deployment's start reservations, for a `{ storage }` source only.
+   *
+   * A `{ DB }` source ignores this and always gets the store built from its own
+   * binding — the reservation table must live in the database the runs live in,
+   * and init is the one place that holds both.
+   *
+   * OPTIONAL rather than required, unlike `executionFence`, because absence
+   * here is not a policy a host can get wrong in silence: a runtime with no
+   * reservation store cannot settle reservations, and
+   * `DurableObjectRunner.build` REFUSES to serve from one whenever a DB binding
+   * is present. So the only runtimes that reach production without it are the
+   * ones with no database to reserve against, and the guard — not this option —
+   * is what makes that true.
+   */
+  startIdempotency?: StartIdempotencyWiring;
+}
+
+/**
+ * The reservation store this runtime settles against.
+ *
+ * A `{ DB }` source gets one built from its own binding, with no option and no
+ * opt-out — the reservation table must live in the database the runs live in,
+ * and init is the one place that holds both, so there is no third answer for a
+ * host to get wrong. A `{ storage }` source has no binding to derive one from,
+ * so it gets whatever it was handed and `undefined` otherwise.
+ *
+ * `startIdempotencyFor` is the per-binding memo, so the store the runtime
+ * settles against and the store the run router reserved into are the same
+ * object whenever both were built from the same `env.DB`.
+ */
+function startIdempotencyForSource(
+  source: InitSource,
+  configured: StartIdempotencyWiring | undefined,
+): StartIdempotencyStore | undefined {
+  if ('storage' in source) {
+    return configured === undefined || configured === 'none'
+      ? undefined
+      : configured;
+  }
+  // The same boundary widening createD1Storage makes on this identical value:
+  // D1DatabaseBinding types `prepare` as returning `unknown` so the shared env
+  // shape needs no statement type.
+  return startIdempotencyFor(source.DB as unknown as StartIdempotencyDatabase);
 }
 
 /**
@@ -104,6 +154,13 @@ export interface InitResult {
    * it sits in front of. Thread-DO signal routes read it off `scope.init`.
    */
   executionFence?: ExecutionFenceStore;
+  /**
+   * The deployment's start reservations, or undefined for a `{ storage }` host
+   * with no database to reserve against. THE accessor for it, for the same
+   * reason as `executionFence`: a surface that built its own store could be
+   * reserving into a different database than the runtime that settles.
+   */
+  startIdempotency?: StartIdempotencyStore;
 }
 
 export function init(source: DORunnerEnv, options?: InitOptions): InitResult;
@@ -165,6 +222,10 @@ export function init(
           )
         : configured;
   }
+  const startIdempotency = startIdempotencyForSource(
+    source,
+    options.startIdempotency,
+  );
   const runtime = new RunnerRuntime({
     storage,
     requestContextForRun: options.requestContextForRun,
@@ -178,6 +239,10 @@ export function init(
     // rather than a per-call one: the runtime IS the closure guarantee, so it
     // must not be possible to reach start()/resume() with the fence left off.
     executionFence,
+    // Same construction-time reasoning: the runtime is the one layer that sees
+    // every terminal transition, so it must not be possible to build one that
+    // executes runs but cannot mark their reservations spent.
+    startIdempotency,
   });
 
   // Cast preserves core's generic call-site inference (6 type params); the
@@ -196,5 +261,6 @@ export function init(
     runtime,
     pubsub: options.pubsub,
     executionFence,
+    startIdempotency,
   };
 }

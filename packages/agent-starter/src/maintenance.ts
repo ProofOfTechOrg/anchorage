@@ -31,6 +31,7 @@ import {
   executionFence,
   notificationsStore,
   schedulesStore,
+  startIdempotency,
 } from './storage.js';
 import { WORKFLOWS } from './workflows.js';
 
@@ -47,6 +48,10 @@ export const scheduleTargetPolicy = createScheduleTargetPolicy({
  * notification's delivery attempts.
  */
 export function starterMaintenanceTick(env: Env): () => Promise<unknown> {
+  // ONE store, named once: the file header's claim that both passes gate the
+  // same fence as the runtime is a claim about identity, and two calls make a
+  // reader check the memo to believe it.
+  const fence = executionFence(env.DB);
   const runTopology = createDoRunTopology(
     env.RUNNER,
     env.DEPLOYMENT_IDENTITY_SECRET,
@@ -58,11 +63,15 @@ export function starterMaintenanceTick(env: Env): () => Promise<unknown> {
   const agentTopology = createAgentThreadTopology(
     env.THREAD,
     env.DEPLOYMENT_IDENTITY_SECRET,
+    {
+      startIdempotency: startIdempotency(env.DB),
+      executionFence: executionFence(env.DB),
+    },
   );
   const schedules = createScheduleTick({
     store: schedulesStore(env.DB),
     targetPolicy: scheduleTargetPolicy,
-    executionFence: executionFence(env.DB),
+    executionFence: fence,
     start: async ({ workflowId, runId, inputData, scheduleId, dispatchId }) => {
       const context = await contextForResourceOwner(
         env,
@@ -237,7 +246,7 @@ export function starterMaintenanceTick(env: Env): () => Promise<unknown> {
     topology: threadTopology,
     resolveContext: () => systemContext(env, 'notification-dispatch'),
     limit: 100,
-    executionFence: executionFence(env.DB),
+    executionFence: fence,
   });
   return async () => ({
     schedules: await schedules(),

@@ -10,7 +10,7 @@ import {
   type DurableObjectRunLifecycleHooks,
   DurableObjectRunner,
   doErrorResponse,
-  ExecutionFenceStore,
+  executionFenceFor,
   verifyDurableObjectDeploymentRequest,
 } from '@proofoftech/flowsafe/do-runner';
 import {
@@ -47,24 +47,6 @@ import { countEffects, defineConformanceWorkflows } from './workflow.js';
 
 const MARKER_KEY = 'conformance:state-marker:v1';
 const runKey = (runId: string) => `conformance:run:${runId}`;
-
-/**
- * One execution-fence store per D1 binding, kept local to the conformance
- * artifacts so they stay deletable in one step (README, "Delete it"). Same
- * database as the runs it gates: `decide()` commits before it resumes, so a
- * conformance state script on a locked deployment must refuse rather than
- * record a decision with nothing behind it.
- */
-const executionFences = new WeakMap<object, ExecutionFenceStore>();
-
-function executionFenceFor(env: ConformanceStateEnv): ExecutionFenceStore {
-  const binding = env.DB as unknown as object;
-  const existing = executionFences.get(binding);
-  if (existing) return existing;
-  const store = new ExecutionFenceStore(env.DB);
-  executionFences.set(binding, store);
-  return store;
-}
 
 /**
  * Two identities on purpose: `ApprovalService.decide` enforces separation of
@@ -225,7 +207,11 @@ export class ConformanceState {
         deploymentTag: this.#env.DEPLOYMENT_TENANT,
         resumeRun: (record, decision) =>
           this.#topology().resumeRecord(record, decision),
-        executionFence: executionFenceFor(this.#env),
+        // The package's per-binding memo, so this artifact gates the SAME
+        // database as the runs it decides on: `decide()` commits before it
+        // resumes, and a conformance state script on a locked deployment must
+        // refuse rather than record a decision with nothing behind it.
+        executionFence: executionFenceFor(this.#env.DB),
       },
     );
   }

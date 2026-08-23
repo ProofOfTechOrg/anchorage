@@ -11,6 +11,7 @@ import {
   sqliteUnitDatabase,
 } from '../../test-support/sqlite.js';
 import {
+  createResourceOwnershipSchema,
   D1ResourceOwnershipStore,
   RESOURCE_OWNERSHIP_TABLE,
   type ResourceOwnershipDatabase,
@@ -39,11 +40,16 @@ import {
   purgeExpiredThreadState,
   purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
+  RUN_TTL_FLOWSAFE_PURGE_TABLES,
   type RunDeadlineCursor,
   type SnapshotDatabase,
   type SnapshotStatement,
   sweepExpiredRunDeadlines,
 } from './d1-storage.js';
+import {
+  START_IDEMPOTENCY_DDL,
+  START_IDEMPOTENCY_TABLE,
+} from './start-idempotency.js';
 
 // Domain-local result-envelope adapter for pure purge SQL units. It maps
 // node:sqlite's affected-row count to the structural SnapshotDatabase seam;
@@ -2195,5 +2201,363 @@ describe('purgeExpiredScheduleTriggers', () => {
     expect(
       await purgeExpiredScheduleTriggers(d1Like(sqlite), { ttlMs: DAY_MS }),
     ).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F3 — start-reservation retention.
+//
+// The reservation is what makes a spent idempotency key answerable, so its
+// retention has one hard rule and one soft one:
+//
+//   HARD  a reservation must NEVER be deleted while the run it names is still
+//         readable. Break it and the very next retry of that key mints a fresh
+//         run beside the live one — the exact double-execution the key was
+//         bought to prevent.
+//   SOFT  a reservation must eventually be deleted, or the one table this
+//         deployment cannot drain grows forever.
+// ---------------------------------------------------------------------------
+
+function createReservationTable(db: SqliteDatabase): void {
+  db.prepare(START_IDEMPOTENCY_DDL).run();
+}
+
+function seedReservation(
+  db: SqliteDatabase,
+  options: {
+    key: string;
+    runId: string;
+    state: 'reserved' | 'started' | 'terminal';
+    updatedAt: number;
+  },
+): void {
+  db.prepare(
+    `INSERT INTO ${START_IDEMPOTENCY_TABLE}
+       (key, owner_kind, owner_id, target_kind, target_id, run_id, thread_id,
+        state, created_at, updated_at)
+     VALUES (?, 'human', 'operator-1', 'workflow', 'wf', ?, NULL, ?, ?, ?)`,
+  ).run(
+    options.key,
+    options.runId,
+    options.state,
+    options.updatedAt,
+    options.updatedAt,
+  );
+}
+
+function reservationRows(
+  db: SqliteDatabase,
+): Array<{ key: string; run_id: string; state: string; updated_at: number }> {
+  return (
+    db.prepare(
+      `SELECT key, run_id, state, updated_at FROM ${START_IDEMPOTENCY_TABLE}
+       ORDER BY key`,
+    ) as unknown as {
+      all(): Array<{
+        key: string;
+        run_id: string;
+        state: string;
+        updated_at: number;
+      }>;
+    }
+  ).all();
+}
+
+describe('purgeExpiredWorkflowRuns — start reservations', () => {
+  it('deletes a spent reservation in the SAME batch as its run’s snapshot', async () => {
+    // #given a completed run past both horizons, with its key already settled
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    createReservationTable(sqlite);
+    await createResourceOwnershipSchema(sqliteUnitDatabase(sqlite) as never);
+    seedRun(sqlite, {
+      runId: 'run-old',
+      status: 'success',
+      updatedAt: NOW - 8 * DAY_MS,
+    });
+    seedReservation(sqlite, {
+      key: 'key-old',
+      runId: 'run-old',
+      state: 'terminal',
+      updatedAt: NOW - 8 * DAY_MS,
+    });
+
+    // #when
+    await purgeExpiredWorkflowRuns(sqliteUnitDatabase(sqlite) as never, {
+      ttlMs: 7 * DAY_MS,
+      resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+      startIdempotencyTable: START_IDEMPOTENCY_TABLE,
+      now: () => NOW,
+    });
+
+    // #then both are gone, and gone together
+    expect(remainingRunIds(sqlite)).toEqual([]);
+    expect(reservationRows(sqlite)).toEqual([]);
+  });
+
+  it('KEEPS a reservation whose horizon has not elapsed, so a late retry is told ALREADY_SETTLED', async () => {
+    // #given a run at the run-TTL boundary but a key-validity horizon twice as
+    // long — the configuration a host uses when its callers retry for longer
+    // than it keeps run summaries
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    createReservationTable(sqlite);
+    await createResourceOwnershipSchema(sqliteUnitDatabase(sqlite) as never);
+    seedRun(sqlite, {
+      runId: 'run-old',
+      status: 'success',
+      updatedAt: NOW - 8 * DAY_MS,
+    });
+    seedReservation(sqlite, {
+      key: 'key-old',
+      runId: 'run-old',
+      state: 'terminal',
+      updatedAt: NOW - 8 * DAY_MS,
+    });
+
+    // #when
+    await purgeExpiredWorkflowRuns(sqliteUnitDatabase(sqlite) as never, {
+      ttlMs: 7 * DAY_MS,
+      startIdempotencyTtlMs: 30 * DAY_MS,
+      resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+      startIdempotencyTable: START_IDEMPOTENCY_TABLE,
+      now: () => NOW,
+    });
+
+    // #then the snapshot is reclaimed and the reservation OUTLIVES it. That
+    // ordering is the whole point: a retry after this pass hits
+    // ALREADY_SETTLED instead of looking like a brand-new key.
+    expect(remainingRunIds(sqlite)).toEqual([]);
+    expect(reservationRows(sqlite)).toEqual([
+      expect.objectContaining({ key: 'key-old', state: 'terminal' }),
+    ]);
+  });
+
+  it('floors the reservation horizon at the run TTL, whatever a caller asks for', async () => {
+    // #given a caller asking for a horizon SHORTER than run retention — a
+    // configuration in which a reservation would be reaped while its run is
+    // still readable, and the next retry of that key would start a second run
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    createReservationTable(sqlite);
+    seedRun(sqlite, {
+      runId: 'run-live',
+      status: 'success',
+      updatedAt: NOW - 1 * DAY_MS,
+    });
+    seedReservation(sqlite, {
+      key: 'key-live',
+      runId: 'run-live',
+      state: 'terminal',
+      updatedAt: NOW - 1 * DAY_MS,
+    });
+
+    // #when
+    await purgeExpiredWorkflowRuns(sqliteUnitDatabase(sqlite) as never, {
+      ttlMs: 7 * DAY_MS,
+      startIdempotencyTtlMs: 1,
+      startIdempotencyTable: START_IDEMPOTENCY_TABLE,
+      now: () => NOW,
+    });
+
+    // #then the run is not eligible, and neither is its reservation: the floor
+    // makes the dangerous configuration unreachable rather than merely unwise.
+    expect(remainingRunIds(sqlite)).toEqual(['run-live']);
+    expect(reservationRows(sqlite)).toHaveLength(1);
+  });
+
+  it('marks a reservation the terminal reconcile missed, instead of stranding it', async () => {
+    // #given a run that completed and was purged, but whose reservation is
+    // still 'started' — the shape a crash between the terminal persist and
+    // settleRun leaves behind
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    createReservationTable(sqlite);
+    seedRun(sqlite, {
+      runId: 'run-old',
+      status: 'success',
+      updatedAt: NOW - 8 * DAY_MS,
+    });
+    seedReservation(sqlite, {
+      key: 'key-stranded',
+      runId: 'run-old',
+      state: 'started',
+      updatedAt: NOW - 8 * DAY_MS,
+    });
+
+    // #when
+    await purgeExpiredWorkflowRuns(sqliteUnitDatabase(sqlite) as never, {
+      ttlMs: 7 * DAY_MS,
+      startIdempotencyTable: START_IDEMPOTENCY_TABLE,
+      now: () => NOW,
+    });
+
+    // #then it is terminal, its horizon re-stamped from THIS moment, and it
+    // survives this pass — so it is both purgeable later and out of the drain
+    // inventory now.
+    expect(reservationRows(sqlite)).toEqual([
+      {
+        key: 'key-stranded',
+        run_id: 'run-old',
+        state: 'terminal',
+        updated_at: NOW,
+      },
+    ]);
+  });
+
+  it('reaps a reservation ORPHANED by an earlier pass, once past its horizon', async () => {
+    // #given a reservation whose run's snapshot was purged long ago. The
+    // batch pairing can never see it again — its run is not in any eligible
+    // set — so without a sweep of its own this row would live forever.
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    createReservationTable(sqlite);
+    seedReservation(sqlite, {
+      key: 'key-orphan',
+      runId: 'run-long-gone',
+      state: 'terminal',
+      updatedAt: NOW - 40 * DAY_MS,
+    });
+    seedReservation(sqlite, {
+      key: 'key-young-orphan',
+      runId: 'run-also-gone',
+      state: 'terminal',
+      updatedAt: NOW - 1 * DAY_MS,
+    });
+
+    // #when
+    await purgeExpiredWorkflowRuns(sqliteUnitDatabase(sqlite) as never, {
+      ttlMs: 7 * DAY_MS,
+      startIdempotencyTable: START_IDEMPOTENCY_TABLE,
+      now: () => NOW,
+    });
+
+    // #then only the one past its horizon
+    expect(reservationRows(sqlite).map((row) => row.key)).toEqual([
+      'key-young-orphan',
+    ]);
+  });
+
+  it('never reaps an orphan candidate whose run is still readable', async () => {
+    // #given a reservation older than every horizon whose run STILL EXISTS —
+    // a live suspended run, which retention never touches
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    createReservationTable(sqlite);
+    seedRun(sqlite, {
+      runId: 'run-suspended',
+      status: 'suspended',
+      updatedAt: NOW - 90 * DAY_MS,
+    });
+    seedReservation(sqlite, {
+      key: 'key-suspended',
+      runId: 'run-suspended',
+      state: 'terminal',
+      updatedAt: NOW - 90 * DAY_MS,
+    });
+
+    // #when
+    await purgeExpiredWorkflowRuns(sqliteUnitDatabase(sqlite) as never, {
+      ttlMs: 7 * DAY_MS,
+      startIdempotencyTable: START_IDEMPOTENCY_TABLE,
+      now: () => NOW,
+    });
+
+    // #then it survives. `NOT EXISTS (snapshot)` is not an optimization — it
+    // is what makes the HARD rule structural rather than a consequence of
+    // whatever a host configured the horizon to be.
+    expect(reservationRows(sqlite)).toHaveLength(1);
+  });
+
+  it('still purges runs on a deployment where no key has ever been used', async () => {
+    // #given the reservation table wired but never created — its DDL is lazy,
+    // so a deployment on which nobody used a key has none. A batch naming a
+    // missing table fails as ONE TRANSACTION, which would take run retention
+    // down with it.
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    await createResourceOwnershipSchema(sqliteUnitDatabase(sqlite) as never);
+    seedRun(sqlite, {
+      runId: 'run-old',
+      status: 'success',
+      updatedAt: NOW - 8 * DAY_MS,
+    });
+
+    // #when
+    const deleted = await purgeExpiredWorkflowRuns(
+      sqliteUnitDatabase(sqlite) as never,
+      {
+        ttlMs: 7 * DAY_MS,
+        resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+        startIdempotencyTable: START_IDEMPOTENCY_TABLE,
+        now: () => NOW,
+      },
+    );
+
+    // #then retention is enforced anyway: an absent table holds no reservation
+    // to reap, which is not a reason to stop reclaiming runs.
+    expect(deleted).toBe(1);
+    expect(remainingRunIds(sqlite)).toEqual([]);
+  });
+
+  it('pairs reservations on the artifact path too', async () => {
+    // #given the per-run path a host with R2 artifacts takes — a different
+    // batch, and therefore a second place the pairing could have been missed
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    createReservationTable(sqlite);
+    seedRun(sqlite, {
+      runId: 'run-old',
+      status: 'success',
+      updatedAt: NOW - 8 * DAY_MS,
+    });
+    seedReservation(sqlite, {
+      key: 'key-old',
+      runId: 'run-old',
+      state: 'terminal',
+      updatedAt: NOW - 8 * DAY_MS,
+    });
+
+    // #when
+    await purgeExpiredWorkflowRuns(sqliteUnitDatabase(sqlite) as never, {
+      ttlMs: 7 * DAY_MS,
+      artifactStore: { deleteRun: async () => 0 },
+      startIdempotencyTable: START_IDEMPOTENCY_TABLE,
+      now: () => NOW,
+    });
+
+    // #then
+    expect(remainingRunIds(sqlite)).toEqual([]);
+    expect(reservationRows(sqlite)).toEqual([]);
+  });
+
+  it('refuses a reservation table name that is not a safe SQL identifier', async () => {
+    // #given — the name is interpolated into every statement above
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+
+    // #when / #then
+    await expect(
+      purgeExpiredWorkflowRuns(sqliteUnitDatabase(sqlite) as never, {
+        ttlMs: DAY_MS,
+        startIdempotencyTable: 'reservations; DROP TABLE x',
+      }),
+    ).rejects.toThrow(/safe SQL identifier/);
+  });
+});
+
+describe('RUN_TTL_FLOWSAFE_PURGE_TABLES', () => {
+  it('names the production constants, not literals, so a rename fails here', () => {
+    // #given — the flowsafe-owned half of what run retention deletes from.
+    // It is separate from RUN_TTL_PURGE_TABLES because the schema guard's
+    // biconditional is over the `mastra_%` inventory: folding ours in would
+    // make that guard assert an equality it cannot mean.
+    //
+    // #then each entry is the EXPORTED name its purge statement interpolates.
+    // A rename of either table changes both sides at once, so this cannot drift
+    // the way a copied literal would.
+    expect([...RUN_TTL_FLOWSAFE_PURGE_TABLES].sort()).toEqual(
+      [RESOURCE_OWNERSHIP_TABLE, START_IDEMPOTENCY_TABLE].sort(),
+    );
   });
 });

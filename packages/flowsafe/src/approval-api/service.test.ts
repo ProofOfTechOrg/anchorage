@@ -74,6 +74,9 @@ function makeHarness(options: Partial<ApprovalServiceOptions> = {}): Harness {
   let nowMs = T0;
   const service = new ApprovalService({
     store,
+    // In-memory store, no database to fence against: the opt-out is written down
+    // rather than defaulted — see ExecutionFenceWiring.
+    executionFence: 'none',
     audit: (event) => events.push(event),
     now: () => new Date(nowMs),
     ...options,
@@ -765,6 +768,7 @@ describe('ApprovalService.decide', () => {
     const events: ApprovalAuditEvent[] = [];
     const service = new ApprovalService({
       store,
+      executionFence: 'none',
       audit: (event) => events.push(event),
       now: harness.now,
     });
@@ -997,6 +1001,7 @@ describe('ApprovalService.sweepSLA', () => {
     await seedPending(harness, { slaSeconds: 60 });
     const bravoService = new ApprovalService({
       store: harness.backend.store(),
+      executionFence: 'none',
       now: harness.now,
     });
     await bravoService.create(

@@ -52,6 +52,7 @@ import { starterRunnerLifecycleConfig } from './principal-context.js';
 import {
   executionFence,
   schedulesStore,
+  startIdempotency,
   subscriptionStoreFactory,
   threadStateStore,
 } from './storage.js';
@@ -155,6 +156,10 @@ const workerConfig = {
       validateThreadTarget: createAgentThreadTopology(
         env.THREAD,
         env.DEPLOYMENT_IDENTITY_SECRET,
+        {
+          startIdempotency: startIdempotency(env.DB),
+          executionFence: executionFence(env.DB),
+        },
       ).requireBoundThread,
       knownProviders: ['github'],
       authorizeMutation: ({
@@ -196,6 +201,10 @@ const workerConfig = {
       topology: createAgentThreadTopology(
         env.THREAD,
         env.DEPLOYMENT_IDENTITY_SECRET,
+        {
+          startIdempotency: startIdempotency(env.DB),
+          executionFence: executionFence(env.DB),
+        },
       ),
     }),
   buildSignalRouter: (resolve, env) =>
@@ -216,6 +225,10 @@ const workerConfig = {
       validateThreadTarget: createAgentThreadTopology(
         env.THREAD,
         env.DEPLOYMENT_IDENTITY_SECRET,
+        {
+          startIdempotency: startIdempotency(env.DB),
+          executionFence: executionFence(env.DB),
+        },
       ).requireBoundThread,
       maxRunsCap: 50,
       audit,
@@ -229,6 +242,10 @@ const workerConfig = {
       validateThreadTarget: createAgentThreadTopology(
         env.THREAD,
         env.DEPLOYMENT_IDENTITY_SECRET,
+        {
+          startIdempotency: startIdempotency(env.DB),
+          executionFence: executionFence(env.DB),
+        },
       ).requireBoundThread,
       maxSchedules: 100,
       minFireIntervalMs: 60_000,

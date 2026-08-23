@@ -40,10 +40,12 @@ import { credentialsMatch } from '../do-runner/deployment-identity.js';
 import type { DurableObjectRunLifecycleHooks } from '../do-runner/durable-object.js';
 import type {
   DeploymentIdentityDatabase,
+  ExecutionFenceStore,
   PurgeExpiredBackgroundTasksResult,
   RunArtifactPurger,
   RunDeadlineCursor,
   SnapshotDatabase,
+  StartIdempotencyStore,
 } from '../do-runner/index.js';
 import {
   assertExecutionFenceState,
@@ -51,8 +53,8 @@ import {
   DeploymentIdentityError,
   DoStatusError,
   deploymentIdentityHeaders,
-  ExecutionFenceStore,
   ensureDeploymentIdentityBindings,
+  executionFenceFor,
   executionFenceReadingPayload,
   purgeExpiredBackgroundTasks,
   purgeExpiredNotifications,
@@ -60,6 +62,8 @@ import {
   purgeExpiredThreadState,
   purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
+  START_IDEMPOTENCY_TABLE,
+  startIdempotencyFor,
   sweepExpiredRunDeadlines,
   verifyDurableObjectDeploymentIdentity,
   verifyDurableObjectDeploymentRequest,
@@ -226,6 +230,17 @@ export interface FlowsafeWorkerEnv {
   APPROVAL_ALLOW_SELF_DECISION?: string;
   /** Maintenance purges terminal run snapshots older than this (default 30 days). */
   RUN_RETENTION_DAYS?: string;
+  /**
+   * How long a spent idempotency key stays answerable after its run settled —
+   * the key-validity horizon (var; defaults to RUN_RETENTION_DAYS, and is
+   * floored at it).
+   *
+   * Set this ABOVE run retention when callers may retry a start later than this
+   * deployment keeps run summaries: until the horizon elapses such a retry is
+   * told ALREADY_SETTLED, and after it the same key reads as brand new and
+   * starts a second run.
+   */
+  START_IDEMPOTENCY_RETENTION_DAYS?: string;
   /** Maintenance purges DECIDED approval records older than this (default 30 days). */
   APPROVAL_RETENTION_DAYS?: string;
   /**
@@ -532,7 +547,7 @@ export function createFlowsafeRunnerLifecycle<Env extends FlowsafeWorkerEnv>(
     : undefined;
   const service = buildConfiguredApprovalService(config, env, topology, {
     store: approvalStoreFactoryFor(env.DB, storageTablePrefix).store(),
-    executionFence: executionFenceFor(env),
+    executionFence: executionFenceForEnv(env),
     waitUntil: options.waitUntil,
     notify: config.notify?.(env),
     allowSelfDecision,
@@ -678,14 +693,30 @@ const FLEET_SPEC_DIGEST_PATTERN = /^[a-f0-9]{64}$/;
 
 /**
  * What the shared admin gate decided. A union rather than `Response | null`
- * because an authorized answer carries something a caller needs: the
- * credential the request presented, which the maintenance route forwards to
- * its Durable Object on the delegating path below. Recovering it by re-reading
- * the header would either re-duplicate the Bearer extraction this gate exists
- * to own, or need an unreachable `undefined` branch to satisfy the types.
+ * because an authorized answer carries two things a caller needs: the
+ * credential the request presented, which the maintenance route forwards to its
+ * Durable Object on the delegating path below, and WHETHER this was that
+ * delegating path. Recovering the credential by re-reading the header would
+ * either re-duplicate the Bearer extraction this gate exists to own, or need an
+ * unreachable `undefined` branch to satisfy the types.
+ *
+ * `delegated` is reported rather than re-derived for the stronger reason: the
+ * rule that makes `MAINTENANCE_ADMIN_SECRET === undefined` mean "delegating" is
+ * enforced HERE — an absent secret refuses outright unless the caller asked to
+ * delegate — so a route re-testing the env var is restating a decision it
+ * cannot see, and would keep answering `true` if this gate's policy ever
+ * changed. One decision, reported once.
  */
 type AdminCredentialDecision =
-  | { readonly authorized: true; readonly credential: string }
+  | {
+      readonly authorized: true;
+      readonly credential: string;
+      /**
+       * The credential is a downstream-verified capability token relayed by
+       * this Worker, not a match against MAINTENANCE_ADMIN_SECRET.
+       */
+      readonly delegated: boolean;
+    }
   | { readonly authorized: false; readonly response: Response };
 
 /**
@@ -766,7 +797,7 @@ async function authorizeAdminCredential<Env extends FlowsafeWorkerEnv>(
   ) {
     return unauthenticated();
   }
-  return { authorized: true, credential };
+  return { authorized: true, credential, delegated: delegating };
 }
 
 /** The Bearer credential a request presents, if it presents a well-formed one. */
@@ -790,7 +821,6 @@ async function maintenanceAdminResponse<Env extends FlowsafeWorkerEnv>(
   if (request.method !== expectedMethod) {
     return json({ error: 'method not allowed' }, 405);
   }
-  const expected = env.MAINTENANCE_ADMIN_SECRET;
   const gate = await authorizeAdminCredential(request, env, {
     surface: 'maintenance administration',
     // An unconfigured secret is survivable HERE and only here: a fleet that
@@ -818,13 +848,19 @@ async function maintenanceAdminResponse<Env extends FlowsafeWorkerEnv>(
     `http://maintenance/${operation}`,
     {
       method: expectedMethod,
-      headers:
-        expected === undefined
-          ? { authorization: `Bearer ${gate.credential}` }
-          : deploymentIdentityHeaders(env.DEPLOYMENT_IDENTITY_SECRET),
+      // The gate's own verdict, not a second reading of the env var it decided
+      // on: a delegated request carries a capability the maintenance DO
+      // verifies, so this Worker relays the credential unchanged; anything else
+      // was authenticated HERE and travels on the deployment identity.
+      headers: gate.delegated
+        ? { authorization: `Bearer ${gate.credential}` }
+        : deploymentIdentityHeaders(env.DEPLOYMENT_IDENTITY_SECRET),
     },
   );
-  if (expected === undefined) return response;
+  // Nothing to enrich on the delegated path: the digest check below belongs to
+  // the deployment this Worker authenticated for, and a relayed response is the
+  // maintenance DO's own answer.
+  if (gate.delegated) return response;
   if (!response.ok || deploymentSpecDigest === undefined) return response;
   const payload: unknown = await response.json();
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
@@ -837,28 +873,28 @@ async function maintenanceAdminResponse<Env extends FlowsafeWorkerEnv>(
 }
 
 /**
- * One fence store per DATABASE — not per request, and not per call site.
- *
- * The store holds no state of its own (a read is never memoized —
- * execution-fence.ts), so this is about IDENTITY rather than caching: the admin
- * route that MOVES the fence, the approval service that OBEYS it, and the
- * runner DO's runtime must all be looking at the same database. Keyed on the
- * binding rather than on `env` because a host mutates one env object across
- * requests, and because the fence belongs to the database, not to the request
- * that happens to reach it. WeakMap so a test harness cycling bindings never
- * leaks.
+ * This composer's env-shaped view of the ONE per-database fence memo
+ * (do-runner/execution-fence.ts). Every call site here holds an `env` rather
+ * than a binding, so the unwrapping happens once instead of at each of them;
+ * the identity guarantee — admin route, approval service, and runner runtime
+ * all on the same store for the same database — belongs to the shared memo.
  */
-const executionFenceStores = new WeakMap<object, ExecutionFenceStore>();
-
-function executionFenceFor<Env extends FlowsafeWorkerEnv>(
+function executionFenceForEnv<Env extends FlowsafeWorkerEnv>(
   env: Env,
 ): ExecutionFenceStore {
-  const binding = env.DB as unknown as object;
-  const existing = executionFenceStores.get(binding);
-  if (existing) return existing;
-  const store = new ExecutionFenceStore(env.DB);
-  executionFenceStores.set(binding, store);
-  return store;
+  return executionFenceFor(env.DB);
+}
+
+/**
+ * The same env-shaped view of the ONE per-database start-reservation memo
+ * (do-runner/start-idempotency.ts), for the same reason: the run router
+ * reserves here, and the runtime inside the run object settles there, and both
+ * must be the store built from THIS env's binding.
+ */
+function startIdempotencyForEnv<Env extends FlowsafeWorkerEnv>(
+  env: Env,
+): StartIdempotencyStore {
+  return startIdempotencyFor(env.DB);
 }
 
 const EXECUTION_FENCE_ADMIN_PATH = '/admin/execution-fence';
@@ -900,7 +936,7 @@ async function executionFenceAdminResponse<Env extends FlowsafeWorkerEnv>(
     delegateWhenUnconfigured: false,
   });
   if (!gate.authorized) return gate.response;
-  const fence = executionFenceFor(env);
+  const fence = executionFenceForEnv(env);
   try {
     if (request.method === 'GET') {
       return json(executionFenceReadingPayload(await fence.read()));
@@ -983,7 +1019,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       buildService: (store) =>
         buildConfiguredApprovalService(config, env, topology, {
           store,
-          executionFence: executionFenceFor(env),
+          executionFence: executionFenceForEnv(env),
           waitUntil,
           notify,
           stream,
@@ -1065,6 +1101,28 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         // cannot leave unbounded run-ownership tombstones or expose a live row
         // without its authorization record.
         resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+        // Start reservations join the same transaction, for the same reason:
+        // an idempotency key must never be reaped while the run it names is
+        // still readable, or the next retry of that key would start a second
+        // run beside the live one. The horizon defaults to run retention —
+        // START_IDEMPOTENCY_RETENTION_DAYS is what a host sets when its callers
+        // retry for longer than it keeps run summaries.
+        startIdempotencyTable: START_IDEMPOTENCY_TABLE,
+        ...(env.START_IDEMPOTENCY_RETENTION_DAYS === undefined
+          ? {}
+          : {
+              startIdempotencyTtlMs:
+                numberVar(
+                  env.START_IDEMPOTENCY_RETENTION_DAYS,
+                  30,
+                  'START_IDEMPOTENCY_RETENTION_DAYS',
+                  { allowZero: true },
+                ) *
+                24 *
+                60 *
+                60 *
+                1000,
+            }),
       });
     } catch (error) {
       recordFailure('retention-purge', error);
@@ -1439,6 +1497,16 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           status: topology.status,
           resume: topology.resume,
           terminate: topology.terminate,
+          // Both halves come from this env's own bindings: the store from the
+          // per-database memo (so the runtime inside the run object settles the
+          // very rows this router reserved), and the probe from the same DO
+          // topology every other run operation travels through (so "is it
+          // live?" is asked of the one object that could be running it).
+          startIdempotency: {
+            store: startIdempotencyForEnv(env),
+            live: topology.startLiveness,
+            fence: executionFenceForEnv(env),
+          },
           beforeStart: beforeStart
             ? (context, workflowId, inputData) =>
                 beforeStart(context, env, workflowId, inputData)

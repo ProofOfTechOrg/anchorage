@@ -302,10 +302,11 @@ describe('ExecutionFenceStore', () => {
 
   it('reads a pre-0.20 database as open when the adapter wraps the SQLite error', async () => {
     // #given — an adapter that reports its own message and carries the driver's
-    // text on `cause`. This is the shape that makes the difference load-bearing:
-    // matching only the TOP message would classify a correctly upgraded 0.19
-    // database as unreadable, and every gated path on it would answer 503
-    // permanently — the exact opposite of the upgrade rule.
+    // text on `cause`, with the missing table at the ROOT of the chain. This is
+    // the shape that makes the difference load-bearing: matching only the TOP
+    // message would classify a correctly upgraded 0.19 database as unreadable,
+    // and every gated path on it would answer 503 permanently — the exact
+    // opposite of the upgrade rule.
     const wrapped = new Error('D1_ERROR: query failed', {
       cause: new Error(
         `SqliteError: no such table: ${EXECUTION_FENCE_TABLE}`,
@@ -355,6 +356,39 @@ describe('ExecutionFenceStore', () => {
     await expect(fence.read()).rejects.toBeInstanceOf(
       ExecutionFenceUnreadableError,
     );
+  });
+
+  it('degrades closed when the missing table is mid-chain and the ROOT is a real fault', async () => {
+    // #given — a chain that MENTIONS the fence table on its way past, but whose
+    // innermost fault is something else: a failed migration that dropped the
+    // table and then hit a real storage error underneath it. Matching any link
+    // would read this as "there is no fence table, so the deployment is open" —
+    // which is the one conclusion that must never be reached from a fault. Only
+    // the root says what actually happened.
+    const wrapped = new Error('D1_ERROR: query failed', {
+      cause: new Error(`no such table: ${EXECUTION_FENCE_TABLE}`, {
+        cause: new Error('D1_ERROR: database is locked'),
+      }),
+    });
+    const fence = new ExecutionFenceStore({
+      prepare: () => ({
+        bind: () => ({
+          run: () => Promise.reject(wrapped),
+          all: () => Promise.reject(wrapped),
+        }),
+        run: () => Promise.reject(wrapped),
+        all: () => Promise.reject(wrapped),
+      }),
+    } as unknown as ExecutionFenceDatabase);
+
+    // #then — unreadable, not open. `recordProofRun` agrees, for the same
+    // reason: nothing about a locked database says the fence is absent.
+    await expect(fence.read()).rejects.toBeInstanceOf(
+      ExecutionFenceUnreadableError,
+    );
+    await expect(
+      fence.recordProofRun('proof-1', 'acme_r1'),
+    ).rejects.toBeInstanceOf(ExecutionFenceUnreadableError);
   });
 
   it('terminates on a cyclic cause chain rather than degrading into a hang', async () => {

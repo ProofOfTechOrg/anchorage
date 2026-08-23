@@ -248,6 +248,9 @@ function buildHarness(
   const runtime = makeRuntime();
   const service = new ApprovalService({
     store,
+    // In-memory store, no database to fence against: the opt-out is written down
+    // rather than defaulted — see ExecutionFenceWiring.
+    executionFence: 'none',
     resumeRun: resumeViaRuntime(runtime),
   });
 
@@ -526,6 +529,7 @@ describe('agent gate grant round-trip (R-003, both shapes)', () => {
     const evicted = h.makeRuntime();
     const service = new ApprovalService({
       store: h.store,
+      executionFence: 'none',
       resumeRun: resumeViaRuntime(evicted),
     });
     const [record] = await queueApprovalForSuspension(
@@ -653,6 +657,7 @@ describe('agent gate grant round-trip (R-003, both shapes)', () => {
     } as never);
     const service = new ApprovalService({
       store,
+      executionFence: 'none',
       resumeRun: (record, decision) =>
         reconstructed.resumeViaRuntime({
           runId: record.runId,

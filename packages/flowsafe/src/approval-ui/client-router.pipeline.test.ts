@@ -64,7 +64,10 @@ describe('approval pipeline (client → router → service → store)', () => {
         return id && role ? { id, role: role as ApprovalRole } : undefined;
       },
       storeFactory: backend,
-      buildService: (boundStore) => new ApprovalService({ store: boundStore }),
+      // In-memory store, no database to fence against: the opt-out is written down
+      // rather than defaulted — see ExecutionFenceWiring.
+      buildService: (boundStore) =>
+        new ApprovalService({ store: boundStore, executionFence: 'none' }),
     });
     const handle = createApprovalRouter({ resolve });
 
