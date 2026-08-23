@@ -53,6 +53,7 @@ import {
   deploymentIdentityHeaders,
   ExecutionFenceStore,
   ensureDeploymentIdentityBindings,
+  executionFenceReadingPayload,
   purgeExpiredBackgroundTasks,
   purgeExpiredNotifications,
   purgeExpiredScheduleTriggers,
@@ -675,6 +676,104 @@ function json(payload: unknown, status = 200): Response {
 const MAINTENANCE_ADMIN_SECRET_PATTERN = /^[\x21-\x7e]{32,256}$/;
 const FLEET_SPEC_DIGEST_PATTERN = /^[a-f0-9]{64}$/;
 
+/**
+ * What the shared admin gate decided. A union rather than `Response | null`
+ * because an authorized answer carries something a caller needs: the
+ * credential the request presented, which the maintenance route forwards to
+ * its Durable Object on the delegating path below. Recovering it by re-reading
+ * the header would either re-duplicate the Bearer extraction this gate exists
+ * to own, or need an unreachable `undefined` branch to satisfy the types.
+ */
+type AdminCredentialDecision =
+  | { readonly authorized: true; readonly credential: string }
+  | { readonly authorized: false; readonly response: Response };
+
+/**
+ * The credential preamble EVERY /admin surface runs before it does anything.
+ *
+ * One function rather than a copy per route because this is the trust boundary
+ * itself (docs/security-threat-model.md, "The provisioning boundary"): it
+ * proves MAINTENANCE_ADMIN_SECRET is configured, proves it is DISTINCT from the
+ * deployment identity secret (sharing them would let a Worker-to-DO credential
+ * move the fence, and vice versa), and constant-time compares the request's
+ * Bearer token against it. A second copy is a second place for one of those
+ * three to be dropped in a hurry, and the inventory route lands here next.
+ *
+ * The surfaces differ in exactly ONE thing, which is why it is a parameter
+ * rather than a fork: what an ABSENT secret means. `/admin/execution-fence`
+ * always refuses — the fence is the control that stops a deployment executing,
+ * so an unauthenticated caller must never reach it. The maintenance routes
+ * delegate instead when the fleet requires capability tokens, because there the
+ * Durable Object verifies a signed capability and this Worker is only a relay;
+ * the longer credential cap applies to that path alone, since a capability
+ * token is not a shared secret.
+ */
+async function authorizeAdminCredential<Env extends FlowsafeWorkerEnv>(
+  request: Request,
+  env: Env,
+  options: {
+    /** Names the surface in the config-error log and the 503 body. */
+    readonly surface: string;
+    /**
+     * Whether an absent MAINTENANCE_ADMIN_SECRET delegates authentication
+     * downstream rather than refusing. The caller folds its own policy into
+     * this boolean so the gate stays about credentials only.
+     */
+    readonly delegateWhenUnconfigured: boolean;
+  },
+): Promise<AdminCredentialDecision> {
+  const { surface } = options;
+  const unavailable = (reason: string): AdminCredentialDecision => {
+    console.error(
+      JSON.stringify({
+        type: 'config-error',
+        var: 'MAINTENANCE_ADMIN_SECRET',
+        reason,
+      }),
+    );
+    return {
+      authorized: false,
+      response: json({ error: `${surface} unavailable` }, 503),
+    };
+  };
+  const unauthenticated = (): AdminCredentialDecision => ({
+    authorized: false,
+    response: json({ error: 'authentication required' }, 401),
+  });
+  const expected = env.MAINTENANCE_ADMIN_SECRET;
+  const delegating = expected === undefined && options.delegateWhenUnconfigured;
+  if (!delegating) {
+    if (
+      expected === undefined ||
+      !MAINTENANCE_ADMIN_SECRET_PATTERN.test(expected)
+    ) {
+      return unavailable(`${surface} is not configured`);
+    }
+    if (await credentialsMatch(expected, env.DEPLOYMENT_IDENTITY_SECRET)) {
+      return unavailable(
+        'maintenance and deployment identity credentials must differ',
+      );
+    }
+  }
+  const credential = bearerCredential(request);
+  const maximumCredentialLength = delegating ? 2_048 : 256;
+  if (!credential || credential.length > maximumCredentialLength) {
+    return unauthenticated();
+  }
+  if (
+    expected !== undefined &&
+    !(await credentialsMatch(credential, expected))
+  ) {
+    return unauthenticated();
+  }
+  return { authorized: true, credential };
+}
+
+/** The Bearer credential a request presents, if it presents a well-formed one. */
+function bearerCredential(request: Request): string | undefined {
+  return request.headers.get('authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];
+}
+
 async function maintenanceAdminResponse<Env extends FlowsafeWorkerEnv>(
   request: Request,
   env: Env,
@@ -692,55 +791,14 @@ async function maintenanceAdminResponse<Env extends FlowsafeWorkerEnv>(
     return json({ error: 'method not allowed' }, 405);
   }
   const expected = env.MAINTENANCE_ADMIN_SECRET;
-  if (
-    expected === undefined &&
-    env.FLEET_MAINTENANCE_CAPABILITIES !== 'required'
-  ) {
-    console.error(
-      JSON.stringify({
-        type: 'config-error',
-        var: 'MAINTENANCE_ADMIN_SECRET',
-        reason: 'maintenance administration is not configured',
-      }),
-    );
-    return json({ error: 'maintenance administration unavailable' }, 503);
-  }
-  if (
-    expected !== undefined &&
-    !MAINTENANCE_ADMIN_SECRET_PATTERN.test(expected)
-  ) {
-    console.error(
-      JSON.stringify({
-        type: 'config-error',
-        var: 'MAINTENANCE_ADMIN_SECRET',
-        reason: 'maintenance administration is not configured',
-      }),
-    );
-    return json({ error: 'maintenance administration unavailable' }, 503);
-  }
-  if (
-    expected !== undefined &&
-    (await credentialsMatch(expected, env.DEPLOYMENT_IDENTITY_SECRET))
-  ) {
-    console.error(
-      JSON.stringify({
-        type: 'config-error',
-        var: 'MAINTENANCE_ADMIN_SECRET',
-        reason: 'maintenance and deployment identity credentials must differ',
-      }),
-    );
-    return json({ error: 'maintenance administration unavailable' }, 503);
-  }
-  const actual = request.headers
-    .get('authorization')
-    ?.match(/^Bearer\s+(.+)$/i)?.[1];
-  const maximumCredentialLength = expected === undefined ? 2_048 : 256;
-  if (!actual || actual.length > maximumCredentialLength) {
-    return json({ error: 'authentication required' }, 401);
-  }
-  if (expected !== undefined && !(await credentialsMatch(actual, expected))) {
-    return json({ error: 'authentication required' }, 401);
-  }
+  const gate = await authorizeAdminCredential(request, env, {
+    surface: 'maintenance administration',
+    // An unconfigured secret is survivable HERE and only here: a fleet that
+    // requires capability tokens authenticates at the maintenance DO, which
+    // verifies a signed capability this Worker only relays.
+    delegateWhenUnconfigured: env.FLEET_MAINTENANCE_CAPABILITIES === 'required',
+  });
+  if (!gate.authorized) return gate.response;
   const deploymentSpecDigest = env.FLEET_SPEC_DIGEST;
   if (
     deploymentSpecDigest !== undefined &&
@@ -762,7 +820,7 @@ async function maintenanceAdminResponse<Env extends FlowsafeWorkerEnv>(
       method: expectedMethod,
       headers:
         expected === undefined
-          ? { authorization: `Bearer ${actual}` }
+          ? { authorization: `Bearer ${gate.credential}` }
           : deploymentIdentityHeaders(env.DEPLOYMENT_IDENTITY_SECRET),
     },
   );
@@ -807,11 +865,11 @@ const EXECUTION_FENCE_ADMIN_PATH = '/admin/execution-fence';
 const EXECUTION_FENCE_ADMIN_MAX_BODY_BYTES = 4_096;
 
 /**
- * The deployment execution fence's control-plane surface, on the same
- * credential and the same constant-time comparison as
- * `maintenanceAdminResponse` — it is the same trust boundary (the provisioning
- * TCB, docs/security-threat-model.md) and splitting the credential would only
- * add a second secret an operator can get wrong.
+ * The deployment execution fence's control-plane surface, behind the SAME gate
+ * `maintenanceAdminResponse` uses (`authorizeAdminCredential`) — it is the same
+ * trust boundary (the provisioning TCB, docs/security-threat-model.md), and
+ * splitting the credential would only add a second secret an operator can get
+ * wrong.
  *
  * `GET` reports the state; `POST` moves it, compare-and-set on `expected`.
  * Transition POLICY is the HOST's: this package enforces only the state
@@ -834,54 +892,18 @@ async function executionFenceAdminResponse<Env extends FlowsafeWorkerEnv>(
   if (request.method !== 'GET' && request.method !== 'POST') {
     return json({ error: 'method not allowed' }, 405);
   }
-  const expected = env.MAINTENANCE_ADMIN_SECRET;
-  // Unconfigured is 503, never open: the fence is the control that stops a
-  // deployment executing, so an unauthenticated caller must never move it.
-  if (
-    expected === undefined ||
-    !MAINTENANCE_ADMIN_SECRET_PATTERN.test(expected)
-  ) {
-    console.error(
-      JSON.stringify({
-        type: 'config-error',
-        var: 'MAINTENANCE_ADMIN_SECRET',
-        reason: 'execution fence administration is not configured',
-      }),
-    );
-    return json({ error: 'execution fence administration unavailable' }, 503);
-  }
-  if (await credentialsMatch(expected, env.DEPLOYMENT_IDENTITY_SECRET)) {
-    console.error(
-      JSON.stringify({
-        type: 'config-error',
-        var: 'MAINTENANCE_ADMIN_SECRET',
-        reason: 'maintenance and deployment identity credentials must differ',
-      }),
-    );
-    return json({ error: 'execution fence administration unavailable' }, 503);
-  }
-  const actual = request.headers
-    .get('authorization')
-    ?.match(/^Bearer\s+(.+)$/i)?.[1];
-  if (!actual || actual.length > 256) {
-    return json({ error: 'authentication required' }, 401);
-  }
-  if (!(await credentialsMatch(actual, expected))) {
-    return json({ error: 'authentication required' }, 401);
-  }
+  const gate = await authorizeAdminCredential(request, env, {
+    surface: 'execution fence administration',
+    // Unconfigured is 503, never open: the fence is the control that stops a
+    // deployment executing, so an unauthenticated caller must never move it.
+    // There is no capability-token relay behind this route to delegate to.
+    delegateWhenUnconfigured: false,
+  });
+  if (!gate.authorized) return gate.response;
   const fence = executionFenceFor(env);
   try {
     if (request.method === 'GET') {
-      const reading = await fence.read();
-      return json({
-        state: reading.state,
-        ...(reading.proofKey === undefined
-          ? {}
-          : { proofKey: reading.proofKey }),
-        ...(reading.proofRunId === undefined
-          ? {}
-          : { proofRunId: reading.proofRunId }),
-      });
+      return json(executionFenceReadingPayload(await fence.read()));
     }
     const raw = await readBoundedBody(
       request,
@@ -915,9 +937,7 @@ async function executionFenceAdminResponse<Env extends FlowsafeWorkerEnv>(
     const reading = await fence.transition({
       expected: assertExecutionFenceState(body.expected, 'expected'),
       next: assertExecutionFenceState(body.next, 'next'),
-      ...(body.proofKey === undefined
-        ? {}
-        : { proofKey: body.proofKey as string }),
+      ...(body.proofKey === undefined ? {} : { proofKey: body.proofKey }),
     });
     return json({ state: reading.state });
   } catch (error) {

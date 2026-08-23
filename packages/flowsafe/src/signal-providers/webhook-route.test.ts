@@ -19,11 +19,27 @@ import {
   type SubscriptionStoreFactory,
 } from './subscription-d1.js';
 import {
-  createWebhookRouter,
+  createWebhookRouter as createWebhookRouterImpl,
   type SignalProviderAuditEvent,
+  type WebhookRouterOptions,
 } from './webhook-route.js';
 
 const DEPLOYMENT_IDENTITY_SECRET = 'test-deployment-identity-secret-0001';
+
+/**
+ * The router under test with the fence defaulted to the honest wiring for these
+ * cases: the subscription store is in-memory, so there is no database to fence.
+ * The fence cases at the bottom of this file pass a real store.
+ */
+function createWebhookRouter(
+  options: Omit<WebhookRouterOptions, 'executionFence'> &
+    Partial<Pick<WebhookRouterOptions, 'executionFence'>>,
+) {
+  return createWebhookRouterImpl({
+    ...options,
+    executionFence: options.executionFence ?? 'none',
+  });
+}
 
 /**
  * The parsed JSON log line of one event type — and THE only one of that type.

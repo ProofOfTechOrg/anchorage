@@ -5496,7 +5496,7 @@ describe('DurableObjectRunner and the deployment execution fence', () => {
     });
   });
 
-  it('refuses to serve from a fence-less runtime while a database is bound', () => {
+  it('refuses to serve from a fence-less runtime while a database is bound', async () => {
     // #given — a host that built a RunnerRuntime by hand inside build() and
     // forgot the fence, on a deployment that HAS a database.
     const env = makeProductionEnv();
@@ -5508,11 +5508,45 @@ describe('DurableObjectRunner and the deployment execution fence', () => {
 
     // #then — refused at the first request rather than silently executing
     // straight through a migration lock. Every other surface would report the
-    // fence as wired, so nothing else would catch this.
-    return expect(
-      runner
-        .fetch(post('/runs', { workflowId: 'gated', runId: 'no-fence' }))
-        .then((response) => response.status),
-    ).resolves.toBe(500);
+    // fence as wired, so nothing else would catch this. The MESSAGE is pinned
+    // too: a bare 500 could be any fault, and this test would still pass while
+    // the guard it exists for had stopped firing.
+    const response = await runner.fetch(
+      post('/runs', { workflowId: 'gated', runId: 'no-fence' }),
+    );
+    expect(response.status).toBe(500);
+    expect(await response.json()).toMatchObject({
+      error: expect.stringContaining(
+        'returned a runtime with no execution fence',
+      ),
+    });
+  });
+
+  it('serves from a fence-less runtime when DB is an RPC binding, not a database', async () => {
+    // #given — the OTHER direction of the same discrimination, and the one that
+    // fails loudly for every host if it is wrong. `DB` here is a service
+    // binding with a named entrypoint (fleet trusted state binds exactly this
+    // beside its D1), which is an RPC proxy: it answers EVERY property with a
+    // callable, so a bare `prepare` test says yes to it. There is no database
+    // to fence against, so a fence-less runtime is correct — insisting on a
+    // fence would refuse the first request every such Worker ever serves.
+    const env = makeProductionEnv();
+    env.DB = new Proxy(
+      {},
+      { get: () => () => undefined },
+    ) as unknown as typeof env.DB;
+    env.runtime = init(
+      { storage: env.storage },
+      { executionFence: 'none' },
+    ).runtime;
+    const runner = new TestRunner(undefined, env);
+
+    // #then — past the guard. 404 is this bare runtime answering for a workflow
+    // it was never given; what matters is that it ANSWERED, where the D1-shaped
+    // binding above produced the guard's 500.
+    const response = await runner.fetch(
+      post('/runs', { workflowId: 'gated', runId: 'rpc-db' }),
+    );
+    expect(response.status).toBe(404);
   });
 });

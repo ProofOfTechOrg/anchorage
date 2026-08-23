@@ -11,9 +11,27 @@ import {
   ExecutionFenceStore,
 } from '../do-runner/index.js';
 import type { ThreadTopology } from '../host-kit/index.js';
-import { createNotificationDispatchTick } from './notification-dispatch.js';
+import {
+  createNotificationDispatchTick as createNotificationDispatchTickImpl,
+  type NotificationDispatchTickOptions,
+} from './notification-dispatch.js';
 
 const NOW = new Date('2026-07-20T12:00:00.000Z');
+
+/**
+ * The tick under test with the fence defaulted to the honest wiring for these
+ * cases: the notifications storage is in-memory, so there is no database to
+ * fence. The fence cases at the bottom of this file pass a real store.
+ */
+function createNotificationDispatchTick(
+  options: Omit<NotificationDispatchTickOptions, 'executionFence'> &
+    Partial<Pick<NotificationDispatchTickOptions, 'executionFence'>>,
+) {
+  return createNotificationDispatchTickImpl({
+    ...options,
+    executionFence: options.executionFence ?? 'none',
+  });
+}
 
 function actorContext(groupId = 'deployment'): ActorContext {
   return {

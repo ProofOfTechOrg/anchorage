@@ -205,9 +205,9 @@ function harness(
     ...(overrides.validateThreadTarget !== undefined
       ? { validateThreadTarget: overrides.validateThreadTarget }
       : {}),
-    ...(overrides.executionFence !== undefined
-      ? { executionFence: overrides.executionFence }
-      : {}),
+    // 'none' is the honest wiring for MemStore — no database, nothing to fence.
+    // The fence cases below pass a real store.
+    executionFence: overrides.executionFence ?? 'none',
   });
   const call = async (method: string, path: string, body?: unknown) => {
     const res = await router(
@@ -240,6 +240,7 @@ describe('createScheduleRouter — gate order', () => {
     const router = createScheduleRouter({
       resolve: resolveAs(ctx('acme', 'operator')),
       store: new MemStore(),
+      executionFence: 'none',
     });
     expect(await router(new Request('http://host/api/other'))).toBeNull();
     // sanity: our own base IS handled
@@ -253,6 +254,7 @@ describe('createScheduleRouter — gate order', () => {
     const router = createScheduleRouter({
       resolve: resolveAs(ctx('acme', 'operator')),
       store: new MemStore(),
+      executionFence: 'none',
     });
     const res = await router(
       new Request('http://host/api/schedules/%', { method: 'GET' }),
@@ -665,6 +667,7 @@ describe('createScheduleRouter — resource-scoped reads', () => {
     const router = createScheduleRouter({
       resolve: resolveAs(ctx('xyz', 'operator', async () => false)),
       store,
+      executionFence: 'none',
     });
     const response = await router(
       new Request(`http://host/api/schedules/${id}`),
@@ -677,6 +680,7 @@ describe('createScheduleRouter — resource-scoped reads', () => {
     const router = createScheduleRouter({
       resolve: resolveAs(ctx('review', 'viewer', async () => true)),
       store,
+      executionFence: 'none',
     });
     const response = await router(
       new Request(`http://host/api/schedules/${id}`),
@@ -690,6 +694,7 @@ describe('createScheduleRouter — resource-scoped reads', () => {
       createScheduleRouter({
         resolve: resolveAs(context),
         store,
+        executionFence: 'none',
       });
     const ids: string[] = [];
     for (const actorLabel of ['acme', 'xyz']) {
@@ -980,6 +985,7 @@ describe('createScheduleRouter internal errors', () => {
     const router = createScheduleRouter({
       resolve: resolveAs(ctx('acme', 'operator')),
       store,
+      executionFence: 'none',
     });
 
     try {
@@ -995,6 +1001,27 @@ describe('createScheduleRouter internal errors', () => {
 });
 
 describe('createScheduleRouter and the deployment execution fence', () => {
+  it('will not compile without explicit fence wiring', () => {
+    // A TYPE-level pin on the forcing function, and the representative for the
+    // whole required-`executionFence` sweep: the compile error is what stops a
+    // host wiring the runtime's fence and forgetting a router's, which is the
+    // partially-fenced deployment the option exists to prevent.
+    //
+    // An unused suppression directive is itself an error in this package's
+    // tsconfig, so `tsc` exiting 0 is what proves the negative. (The directive
+    // below must be the only one in this comment block — a prose line that
+    // BEGINS with the directive text is parsed as one.)
+    const build = (): unknown =>
+      // @ts-expect-error a schedule router must state its fence wiring
+      createScheduleRouterImpl({
+        resolve: resolveAs(ctx('acme', 'operator')),
+        store: new MemStore(),
+        targetPolicy: TARGET_POLICY,
+        validateThreadTarget: async () => undefined,
+      });
+    expect(build).toBeTypeOf('function');
+  });
+
   async function drainingFence(): Promise<ExecutionFenceStore> {
     const fence = new ExecutionFenceStore(
       sqliteUnitDatabase(openSqlite()) as ExecutionFenceDatabase,

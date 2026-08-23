@@ -25,7 +25,28 @@ import {
   backgroundTasksStore,
   createBackgroundTaskD1Domains,
 } from './d1-storage.js';
-import { BackgroundTaskHost } from './host.js';
+import {
+  BACKGROUND_TASK_MANAGER_TEST_ACCESS,
+  BackgroundTaskHost,
+  type BackgroundTaskHostOptions,
+  MAX_FENCE_RESUMES_PER_PASS,
+} from './host.js';
+
+/**
+ * The host under test with the fence defaulted. `'none'` is the honest wiring
+ * for the InMemoryStore / unit-sqlite hosts these cases build — the fence cases
+ * at the bottom of this file pass a real store, and pass it through this same
+ * helper, so an explicit fence always wins.
+ */
+function newBackgroundTaskHost(
+  options: Omit<BackgroundTaskHostOptions, 'executionFence'> &
+    Partial<Pick<BackgroundTaskHostOptions, 'executionFence'>>,
+): BackgroundTaskHost {
+  return new BackgroundTaskHost({
+    ...options,
+    executionFence: options.executionFence ?? 'none',
+  });
+}
 
 function baseTask(overrides: Record<string, unknown>) {
   const now = new Date();
@@ -101,37 +122,35 @@ describe('BackgroundTaskHost — wiring', () => {
     { cleanup: { failedTtlMs: Number.NaN } },
     { cleanup: { cleanupIntervalMs: 0 } },
   ])('rejects invalid manager configuration synchronously: %o', (manager) => {
-    expect(
-      () =>
-        new BackgroundTaskHost({
-          mastra: new Mastra({ storage: new InMemoryStore() }),
-          pubsub: createHostPubSub(),
-          executors: {},
-          manager,
-        }),
+    expect(() =>
+      newBackgroundTaskHost({
+        mastra: new Mastra({ storage: new InMemoryStore() }),
+        pubsub: createHostPubSub(),
+        executors: {},
+        manager,
+      }),
     ).toThrow(RangeError);
   });
 
   it('accepts deliberate zero concurrency, retry, TTL, and throttle values', () => {
-    expect(
-      () =>
-        new BackgroundTaskHost({
-          mastra: new Mastra({ storage: new InMemoryStore() }),
-          pubsub: createHostPubSub(),
-          executors: {},
-          manager: {
-            globalConcurrency: 0,
-            perAgentConcurrency: 0,
-            progressThrottleMs: 0,
-            defaultRetries: {
-              maxRetries: 0,
-              retryDelayMs: 0,
-              maxRetryDelayMs: 0,
-              backoffMultiplier: 0,
-            },
-            cleanup: { completedTtlMs: 0, failedTtlMs: 0 },
+    expect(() =>
+      newBackgroundTaskHost({
+        mastra: new Mastra({ storage: new InMemoryStore() }),
+        pubsub: createHostPubSub(),
+        executors: {},
+        manager: {
+          globalConcurrency: 0,
+          perAgentConcurrency: 0,
+          progressThrottleMs: 0,
+          defaultRetries: {
+            maxRetries: 0,
+            retryDelayMs: 0,
+            maxRetryDelayMs: 0,
+            backoffMultiplier: 0,
           },
-        }),
+          cleanup: { completedTtlMs: 0, failedTtlMs: 0 },
+        },
+      }),
     ).not.toThrow();
   });
 
@@ -144,7 +163,7 @@ describe('BackgroundTaskHost — wiring', () => {
         return { done: true };
       },
     };
-    const host = new BackgroundTaskHost({
+    const host = newBackgroundTaskHost({
       mastra: new Mastra({ storage: new InMemoryStore() }),
       pubsub: createHostPubSub(),
       executors: { longResearch: executor },
@@ -158,7 +177,10 @@ describe('BackgroundTaskHost — wiring', () => {
     // asserted: what is registered is the fence-gated wrapper (host.ts
     // `#gated`), which is the seam that stops a locked deployment executing a
     // task body — including one a recovery re-drive resolved by name.
-    const registered = host.manager.getStaticExecutor('longResearch');
+    const registered =
+      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS].getStaticExecutor(
+        'longResearch',
+      );
     expect(registered).toBeDefined();
     await expect(registered?.execute({ topic: 'ai' })).resolves.toEqual({
       done: true,
@@ -168,7 +190,7 @@ describe('BackgroundTaskHost — wiring', () => {
 
   it('boot() is idempotent — a second call resolves without re-init', async () => {
     // #given
-    const host = new BackgroundTaskHost({
+    const host = newBackgroundTaskHost({
       mastra: new Mastra({ storage: new InMemoryStore() }),
       pubsub: createHostPubSub(),
       executors: {},
@@ -186,7 +208,7 @@ describe('BackgroundTaskHost — wiring', () => {
     const mastra = new Mastra({ storage });
     const store = await backgroundTasksStore(mastra);
     await store.createTask(baseTask({ id: 'stranded', maxRetries: 0 }));
-    const host = new BackgroundTaskHost({
+    const host = newBackgroundTaskHost({
       mastra,
       pubsub: createHostPubSub(),
       executors: {},
@@ -211,7 +233,7 @@ describe('BackgroundTaskHost — wiring', () => {
     const mastra = new Mastra({ storage });
     const store = await backgroundTasksStore(mastra);
     await store.createTask(baseTask({ id: 'retryable', maxRetries: 3 }));
-    const host = new BackgroundTaskHost({
+    const host = newBackgroundTaskHost({
       mastra,
       pubsub: createHostPubSub(),
       executors: {},
@@ -242,7 +264,7 @@ describe('BackgroundTaskHost — wiring', () => {
         createdAt: old,
       }),
     );
-    const host = new BackgroundTaskHost({
+    const host = newBackgroundTaskHost({
       mastra,
       pubsub: createHostPubSub(),
       executors: {},
@@ -261,7 +283,7 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
   it('unwinds a partially failed worker start without initializing or shutting down the manager', async () => {
     // #given
     const { mastra, pubsub } = await executionHostDependencies();
-    const host = new BackgroundTaskHost({
+    const host = newBackgroundTaskHost({
       mastra,
       pubsub,
       execution: true,
@@ -276,8 +298,11 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
     vi.spyOn(mastra, 'stopWorkers').mockImplementation(async () => {
       calls.push('stop-workers');
     });
-    const init = vi.spyOn(host.manager, 'init');
-    const managerShutdown = vi.spyOn(host.manager, 'shutdown');
+    const init = vi.spyOn(host[BACKGROUND_TASK_MANAGER_TEST_ACCESS], 'init');
+    const managerShutdown = vi.spyOn(
+      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      'shutdown',
+    );
 
     // #when / #then
     await expect(host.boot()).rejects.toBe(primary);
@@ -293,7 +318,7 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
   it('unwinds a failed manager init in reverse order and preserves the primary error', async () => {
     // #given
     const { mastra, pubsub } = await executionHostDependencies();
-    const host = new BackgroundTaskHost({
+    const host = newBackgroundTaskHost({
       mastra,
       pubsub,
       execution: true,
@@ -304,11 +329,17 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
     vi.spyOn(mastra, 'startWorkers').mockImplementation(async () => {
       calls.push('start-workers');
     });
-    vi.spyOn(host.manager, 'init').mockImplementation(async () => {
+    vi.spyOn(
+      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      'init',
+    ).mockImplementation(async () => {
       calls.push('manager-init');
       throw primary;
     });
-    vi.spyOn(host.manager, 'shutdown').mockImplementation(async () => {
+    vi.spyOn(
+      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      'shutdown',
+    ).mockImplementation(async () => {
       calls.push('manager-shutdown');
     });
     vi.spyOn(mastra, 'stopWorkers').mockImplementation(async () => {
@@ -328,7 +359,7 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
   it('aggregates boot cleanup failures after the primary error in cleanup order', async () => {
     // #given
     const { mastra, pubsub } = await executionHostDependencies();
-    const host = new BackgroundTaskHost({
+    const host = newBackgroundTaskHost({
       mastra,
       pubsub,
       execution: true,
@@ -341,11 +372,17 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
     vi.spyOn(mastra, 'startWorkers').mockImplementation(async () => {
       calls.push('start-workers');
     });
-    vi.spyOn(host.manager, 'init').mockImplementation(async () => {
+    vi.spyOn(
+      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      'init',
+    ).mockImplementation(async () => {
       calls.push('manager-init');
       throw primary;
     });
-    vi.spyOn(host.manager, 'shutdown').mockImplementation(async () => {
+    vi.spyOn(
+      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      'shutdown',
+    ).mockImplementation(async () => {
       calls.push('manager-shutdown');
       throw managerCleanup;
     });
@@ -376,17 +413,23 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
   it('shuts the manager down before stopping workers', async () => {
     // #given
     const { mastra, pubsub } = await executionHostDependencies();
-    const host = new BackgroundTaskHost({
+    const host = newBackgroundTaskHost({
       mastra,
       pubsub,
       execution: true,
       executors: {},
     });
     vi.spyOn(mastra, 'startWorkers').mockResolvedValue();
-    vi.spyOn(host.manager, 'init').mockResolvedValue();
+    vi.spyOn(
+      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      'init',
+    ).mockResolvedValue();
     await host.boot();
     const calls: string[] = [];
-    vi.spyOn(host.manager, 'shutdown').mockImplementation(async () => {
+    vi.spyOn(
+      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      'shutdown',
+    ).mockImplementation(async () => {
       calls.push('manager-shutdown');
     });
     vi.spyOn(mastra, 'stopWorkers').mockImplementation(async () => {
@@ -404,7 +447,7 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
     // #given
     const storage = new InMemoryStore();
     const pubsub = createHostPubSub();
-    const host = new BackgroundTaskHost({
+    const host = newBackgroundTaskHost({
       mastra: new Mastra({ storage, pubsub }),
       pubsub,
       executors: {},
@@ -413,7 +456,7 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
 
     // #when — do not await shutdown before racing a new enqueue against it.
     const shutdown = host.shutdown();
-    const enqueue = host.manager.enqueue({
+    const enqueue = host.enqueue({
       runId: 'acme_r1',
       toolName: 'late',
       toolCallId: 'call-late',
@@ -434,7 +477,7 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
   });
 
   it('treats shutdown as terminal even when boot was never started', async () => {
-    const host = new BackgroundTaskHost({
+    const host = newBackgroundTaskHost({
       mastra: new Mastra({ storage: new InMemoryStore() }),
       pubsub: createHostPubSub(),
       executors: {},
@@ -448,7 +491,7 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
   it('waits for an in-flight boot before tearing its initialized components down', async () => {
     // #given
     const { mastra, pubsub } = await executionHostDependencies();
-    const host = new BackgroundTaskHost({
+    const host = newBackgroundTaskHost({
       mastra,
       pubsub,
       execution: true,
@@ -468,10 +511,16 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
       signalStart();
       await startReleased;
     });
-    vi.spyOn(host.manager, 'init').mockImplementation(async () => {
+    vi.spyOn(
+      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      'init',
+    ).mockImplementation(async () => {
       calls.push('manager-init');
     });
-    vi.spyOn(host.manager, 'shutdown').mockImplementation(async () => {
+    vi.spyOn(
+      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      'shutdown',
+    ).mockImplementation(async () => {
       calls.push('manager-shutdown');
     });
     vi.spyOn(mastra, 'stopWorkers').mockImplementation(async () => {
@@ -498,18 +547,24 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
   it('still stops workers and preserves a lone manager shutdown failure', async () => {
     // #given
     const { mastra, pubsub } = await executionHostDependencies();
-    const host = new BackgroundTaskHost({
+    const host = newBackgroundTaskHost({
       mastra,
       pubsub,
       execution: true,
       executors: {},
     });
     vi.spyOn(mastra, 'startWorkers').mockResolvedValue();
-    vi.spyOn(host.manager, 'init').mockResolvedValue();
+    vi.spyOn(
+      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      'init',
+    ).mockResolvedValue();
     await host.boot();
     const primary = new Error('manager shutdown');
     const calls: string[] = [];
-    vi.spyOn(host.manager, 'shutdown').mockImplementation(async () => {
+    vi.spyOn(
+      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      'shutdown',
+    ).mockImplementation(async () => {
       calls.push('manager-shutdown');
       throw primary;
     });
@@ -525,18 +580,24 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
   it('aggregates manager and worker shutdown failures in operation order', async () => {
     // #given
     const { mastra, pubsub } = await executionHostDependencies();
-    const host = new BackgroundTaskHost({
+    const host = newBackgroundTaskHost({
       mastra,
       pubsub,
       execution: true,
       executors: {},
     });
     vi.spyOn(mastra, 'startWorkers').mockResolvedValue();
-    vi.spyOn(host.manager, 'init').mockResolvedValue();
+    vi.spyOn(
+      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      'init',
+    ).mockResolvedValue();
     await host.boot();
     const primary = new Error('manager shutdown');
     const workerCleanup = new Error('worker shutdown');
-    vi.spyOn(host.manager, 'shutdown').mockRejectedValue(primary);
+    vi.spyOn(
+      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      'shutdown',
+    ).mockRejectedValue(primary);
     vi.spyOn(mastra, 'stopWorkers').mockRejectedValue(workerCleanup);
 
     // #when
@@ -562,7 +623,7 @@ describe('BackgroundTaskHost — on D1 (R-B1: persistence + recovery seam, no bo
   it('warns once at boot that dispatched bodies cannot execute on a non-concurrent store', async () => {
     // #given
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const host = new BackgroundTaskHost({
+    const host = newBackgroundTaskHost({
       mastra: new Mastra({ storage }),
       pubsub: createHostPubSub(),
       executors: {},
@@ -584,7 +645,7 @@ describe('BackgroundTaskHost — on D1 (R-B1: persistence + recovery seam, no bo
     const mastra = new Mastra({ storage });
     const store = await backgroundTasksStore(mastra);
     await store.createTask(baseTask({ id: 'stranded', maxRetries: 0 }));
-    const host = new BackgroundTaskHost({
+    const host = newBackgroundTaskHost({
       mastra,
       pubsub: createHostPubSub(),
       executors: {},
@@ -648,7 +709,7 @@ describe('BackgroundTaskHost — execution-mode recovery on D1', () => {
     const pubsub = createHostPubSub();
     const mastra = new Mastra({ storage, pubsub });
     const execute = vi.fn(async () => ({ recovered: true }));
-    const host = new BackgroundTaskHost({
+    const host = newBackgroundTaskHost({
       mastra,
       pubsub,
       execution: true,
@@ -662,9 +723,9 @@ describe('BackgroundTaskHost — execution-mode recovery on D1', () => {
       booted = true;
       await vi.waitFor(
         async () => {
-          expect(
-            (await host.manager.getTask('retryable-execution'))?.status,
-          ).toBe('completed');
+          expect((await host.getTask('retryable-execution'))?.status).toBe(
+            'completed',
+          );
         },
         { timeout: 5_000, interval: 10 },
       );
@@ -690,13 +751,243 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
     executionFence: ExecutionFenceStore,
     executor: ToolExecutor,
   ): BackgroundTaskHost {
-    return new BackgroundTaskHost({
+    return newBackgroundTaskHost({
       mastra: new Mastra({ storage: new InMemoryStore() }),
       pubsub: createHostPubSub(),
       executors: { longResearch: executor },
       executionFence,
     });
   }
+
+  it('tears down a boot that shutdown raced during the fence read', async () => {
+    // #given — the window the fence read opens: `boot()` is suspended reading
+    // the fence, so it has not admitted dispatching yet and has started
+    // nothing. Teardown must still wait for it, or `shutdown()` returns having
+    // stopped nothing and the workers boot goes on to start outlive it.
+    const { mastra, pubsub } = await executionHostDependencies();
+    let releaseFence: () => void = () => undefined;
+    const fenceRead = new Promise<void>((resolve) => {
+      releaseFence = resolve;
+    });
+    const open = await fenceAt('open');
+    const slowFence = {
+      read: async () => {
+        await fenceRead;
+        return open.read();
+      },
+    } as unknown as ExecutionFenceStore;
+    const host = newBackgroundTaskHost({
+      mastra,
+      pubsub,
+      execution: true,
+      executors: {},
+      executionFence: slowFence,
+    });
+    const calls: string[] = [];
+    vi.spyOn(mastra, 'startWorkers').mockImplementation(async () => {
+      calls.push('start-workers');
+    });
+    vi.spyOn(
+      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      'init',
+    ).mockImplementation(async () => {
+      calls.push('manager-init');
+    });
+    vi.spyOn(
+      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      'shutdown',
+    ).mockImplementation(async () => {
+      calls.push('manager-shutdown');
+    });
+    vi.spyOn(mastra, 'stopWorkers').mockImplementation(async () => {
+      calls.push('stop-workers');
+    });
+
+    // #when — shutdown arrives while the fence read is still outstanding.
+    const boot = host.boot();
+    const shutdown = host.shutdown();
+    expect(calls).toEqual([]);
+    releaseFence();
+    await Promise.all([boot, shutdown]);
+
+    // #then — everything boot started is stopped again, in teardown order.
+    expect(calls).toEqual([
+      'start-workers',
+      'manager-init',
+      'manager-shutdown',
+      'stop-workers',
+    ]);
+  });
+
+  it('starts the dispatcher ONCE when two boots race the fence read', async () => {
+    // #given — the request path and onAlarm() call boot() independently, so
+    // two attempts genuinely interleave. Both are held inside the fence read,
+    // which is the window `#dispatching` cannot cover: it is assigned only once
+    // that read RESUMES.
+    const { mastra, pubsub } = await executionHostDependencies();
+    let releaseFence: () => void = () => undefined;
+    const fenceRead = new Promise<void>((resolve) => {
+      releaseFence = resolve;
+    });
+    const open = await fenceAt('open');
+    const slowFence = {
+      read: async () => {
+        await fenceRead;
+        return open.read();
+      },
+    } as unknown as ExecutionFenceStore;
+    const host = newBackgroundTaskHost({
+      mastra,
+      pubsub,
+      execution: true,
+      executors: {},
+      executionFence: slowFence,
+    });
+    const startWorkers = vi
+      .spyOn(mastra, 'startWorkers')
+      .mockImplementation(async () => undefined);
+    const init = vi
+      .spyOn(host[BACKGROUND_TASK_MANAGER_TEST_ACCESS], 'init')
+      .mockImplementation(async () => undefined);
+
+    // #when — both boots pass the `#dispatching` guard before either read ends.
+    const first = host.boot();
+    const second = host.boot();
+    releaseFence();
+    await Promise.all([first, second]);
+
+    // #then — ONE dispatcher. A second manager.init subscribes handleDispatch a
+    // second time, and every dispatch is then handled twice: double claim,
+    // double body execution — with `#managerNeedsShutdown`/`#workersNeedStop`
+    // being booleans, teardown would stop only one of the two.
+    expect(init).toHaveBeenCalledTimes(1);
+    expect(startWorkers).toHaveBeenCalledTimes(1);
+
+    // #and — a later boot still rides the settled memo rather than re-starting.
+    await host.boot();
+    expect(init).toHaveBeenCalledTimes(1);
+    expect(startWorkers).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * Seed `count` suspended rows and make `resume()` do what core's handler
+   * does to the row — leave the suspended set — so a sweep that re-reads it
+   * sees the truth rather than a stub that never moves.
+   */
+  async function parkedHost(
+    tasks: ReadonlyArray<{ id: string; suspendedAt: Date; parked: boolean }>,
+  ) {
+    const binding = sqliteUnitDatabase(openSqlite()) as never;
+    const storage = createD1Storage({
+      binding,
+      domains: createBackgroundTaskD1Domains({ binding }),
+    });
+    await storage.init();
+    const pubsub = createHostPubSub();
+    const mastra = new Mastra({ storage, pubsub });
+    const store = await backgroundTasksStore(mastra);
+    for (const task of tasks) {
+      await store.createTask(
+        baseTask({
+          id: task.id,
+          status: 'suspended',
+          suspendedAt: task.suspendedAt,
+          suspendPayload: task.parked
+            ? { 'flowsafe.executionFenced': { state: 'migration-locked' } }
+            : { awaiting: 'webhook' },
+        }),
+      );
+    }
+    const host = newBackgroundTaskHost({
+      mastra,
+      pubsub,
+      executors: {},
+      executionFence: await fenceAt('open'),
+    });
+    const resume = vi
+      .spyOn(host[BACKGROUND_TASK_MANAGER_TEST_ACCESS], 'resume')
+      .mockImplementation(async (taskId: string) => {
+        await store.updateTask(taskId, { status: 'running' });
+        return (await store.getTask(taskId)) as never;
+      });
+    const stillSuspended = async () =>
+      (await store.listTasks({ status: 'suspended' })).tasks.map((t) => t.id);
+    return { host, resume, stillSuspended };
+  }
+
+  it('drains a parked cohort larger than the boot budget, without eviction', async () => {
+    // #given — 30 tasks parked by the backstop, more than one boot budget.
+    const parked = Array.from({ length: 30 }, (_, index) => ({
+      id: `parked-${String(index).padStart(2, '0')}`,
+      suspendedAt: new Date(1_800_000_000_000 + index * 1_000),
+      parked: true,
+    }));
+    const { host, resume, stillSuspended } = await parkedHost(parked);
+
+    try {
+      // #when — the boot after reopening.
+      await host.boot();
+
+      // #then — exactly one boot budget. The rest are NOT dropped: still
+      // suspended, still marked, still inspectable.
+      expect(resume).toHaveBeenCalledTimes(MAX_FENCE_RESUMES_PER_PASS);
+      expect(await stillSuspended()).toHaveLength(
+        30 - MAX_FENCE_RESUMES_PER_PASS,
+      );
+
+      // #when — the alarm the host already arms for cleanup fires. THIS is the
+      // lane convergence rides: nothing waits behind it, so it carries the
+      // larger budget and keeps scanning until a scan resumes nothing.
+      await host.onAlarm();
+
+      // #then — drained. No eviction, no operator action, no fresh instance:
+      // the earlier shape swept only from #startDispatching, so every later
+      // boot returned the settled memo and these five stayed parked forever.
+      expect(resume).toHaveBeenCalledTimes(30);
+      expect(await stillSuspended()).toEqual([]);
+    } finally {
+      await host.shutdown();
+    }
+  });
+
+  it('reaches a stale parked cohort sitting behind a full page of newer suspensions', async () => {
+    // #given — the cross-cycle case: five rows parked by an EARLIER lock, then
+    // more than a full scan page of newer tool-suspends (a tool awaiting a
+    // webhook is suspended on purpose and must stay that way). Scanning newest
+    // first, page 0 is all tool-suspends, so an unpaged sweep would never see
+    // the old cohort again.
+    const stale = Array.from({ length: 5 }, (_, index) => ({
+      id: `stale-${index}`,
+      suspendedAt: new Date(1_700_000_000_000 + index * 1_000),
+      parked: true,
+    }));
+    const newer = Array.from({ length: 120 }, (_, index) => ({
+      id: `tool-${String(index).padStart(3, '0')}`,
+      suspendedAt: new Date(1_900_000_000_000 + index * 1_000),
+      parked: false,
+    }));
+    const { host, resume, stillSuspended } = await parkedHost([
+      ...stale,
+      ...newer,
+    ]);
+
+    try {
+      // #when
+      await host.boot();
+
+      // #then — every stale row reached, and not one tool-suspended row
+      // touched.
+      expect(resume).toHaveBeenCalledTimes(5);
+      expect(resume.mock.calls.map((call) => call[0] as string).sort()).toEqual(
+        stale.map((task) => task.id),
+      );
+      expect((await stillSuspended()).sort()).toEqual(
+        newer.map((task) => task.id).sort(),
+      );
+    } finally {
+      await host.shutdown();
+    }
+  });
 
   it('claims nothing while locked, then completes the queued work after reopen', async () => {
     // #given — a real execution-mode host on D1 with work already queued: one
@@ -719,7 +1010,7 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
     const pubsub = createHostPubSub();
     const executionFence = await fenceAt('migration-locked');
     const execute = vi.fn(async () => ({ ran: true }));
-    const host = new BackgroundTaskHost({
+    const host = newBackgroundTaskHost({
       mastra: new Mastra({ storage, pubsub }),
       pubsub,
       execution: true,
@@ -736,14 +1027,14 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
 
       // #then — NOTHING was claimed. The pending row is still pending, so it
       // is still visible to a nonterminal census and still owned by the queue.
-      expect(await host.manager.getTask('queued')).toMatchObject({
+      expect(await host.getTask('queued')).toMatchObject({
         status: 'pending',
       });
       // #and — the stranded row was NOT settled. This is the destructive path:
       // recoverStaleTasks marks every stranded maxRetries-0 row 'failed'
       // outright, before any executor is consulted, so an executor-level gate
       // could never have prevented it.
-      expect(await host.manager.getTask('stranded')).toMatchObject({
+      expect(await host.getTask('stranded')).toMatchObject({
         status: 'running',
       });
       expect(execute).not.toHaveBeenCalled();
@@ -759,9 +1050,7 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
       // #then — the queued work runs, exactly once.
       await vi.waitFor(
         async () => {
-          expect((await host.manager.getTask('queued'))?.status).toBe(
-            'completed',
-          );
+          expect((await host.getTask('queued'))?.status).toBe('completed');
         },
         { timeout: 5_000, interval: 10 },
       );
@@ -769,6 +1058,76 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
     } finally {
       await host.shutdown();
     }
+  });
+
+  it('re-drives parked tasks in BOUNDED passes, newest first', async () => {
+    // #given — a long lock parked more tasks than one boot should re-drive. The
+    // sweep runs on the boot path every request and every alarm waits behind,
+    // so an unbounded serial resume would stall the first request after a
+    // reopen by the whole queue length.
+    const PER_PASS = 25;
+    const binding = sqliteUnitDatabase(openSqlite()) as never;
+    const domains = () => createBackgroundTaskD1Domains({ binding });
+    const seedStorage = createD1Storage({ binding, domains: domains() });
+    await seedStorage.init();
+    const seedStore = await backgroundTasksStore(
+      new Mastra({ storage: seedStorage }),
+    );
+    const parked = PER_PASS + 5;
+    for (let index = 0; index < parked; index += 1) {
+      await seedStore.createTask(
+        baseTask({
+          id: `parked-${String(index).padStart(2, '0')}`,
+          status: 'suspended',
+          suspendedAt: new Date(1_000 + index),
+          suspendPayload: {
+            'flowsafe.executionFenced': { state: 'migration-locked' },
+          },
+        }),
+      );
+    }
+    // #and — one task its own TOOL suspended. It carries no fence marker, so it
+    // must survive every pass untouched.
+    await seedStore.createTask(
+      baseTask({
+        id: 'tool-suspended',
+        status: 'suspended',
+        suspendedAt: new Date(9_999),
+        suspendPayload: { awaitingWebhook: true },
+      }),
+    );
+
+    const storage = createD1Storage({ binding, domains: domains() });
+    await storage.init();
+    const pubsub = createHostPubSub();
+    const host = newBackgroundTaskHost({
+      mastra: new Mastra({ storage, pubsub }),
+      pubsub,
+      executors: { longResearch: { execute: async () => ({ ran: true }) } },
+      executionFence: await fenceAt('open'),
+    });
+    const resumed: string[] = [];
+    vi.spyOn(
+      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS],
+      'resume',
+    ).mockImplementation(async (taskId: string) => {
+      resumed.push(taskId);
+      return undefined as never;
+    });
+
+    // #when
+    try {
+      await host.boot();
+    } finally {
+      await host.shutdown();
+    }
+
+    // #then — exactly one pass' worth, and the NEWEST suspensions, which is the
+    // cohort a fence just parked. The remainder stays suspended and marked for
+    // the next boot or alarm to take.
+    expect(resumed).toHaveLength(PER_PASS);
+    expect(resumed).not.toContain('tool-suspended');
+    expect(resumed[0]).toBe(`parked-${String(parked - 1).padStart(2, '0')}`);
   });
 
   it('dispatches normally while draining', async () => {
@@ -788,7 +1147,7 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
     const storage = createD1Storage({ binding, domains: domains() });
     await storage.init();
     const pubsub = createHostPubSub();
-    const host = new BackgroundTaskHost({
+    const host = newBackgroundTaskHost({
       mastra: new Mastra({ storage, pubsub }),
       pubsub,
       execution: true,
@@ -801,9 +1160,7 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
       await host.boot();
       await vi.waitFor(
         async () => {
-          expect((await host.manager.getTask('draining'))?.status).toBe(
-            'completed',
-          );
+          expect((await host.getTask('draining'))?.status).toBe('completed');
         },
         { timeout: 5_000, interval: 10 },
       );
@@ -821,7 +1178,10 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
     const ran = vi.fn(async () => ({ done: true }));
     const host = hostWith(executionFence, { execute: ran });
     await host.boot();
-    const registered = host.manager.getStaticExecutor('longResearch');
+    const registered =
+      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS].getStaticExecutor(
+        'longResearch',
+      );
     const suspend = vi.fn(async (_data?: unknown) => undefined);
 
     // #when
@@ -848,7 +1208,9 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
 
     // #then
     await expect(
-      host.manager.getStaticExecutor('longResearch')?.execute({}),
+      host[BACKGROUND_TASK_MANAGER_TEST_ACCESS]
+        .getStaticExecutor('longResearch')
+        ?.execute({}),
     ).rejects.toBeInstanceOf(ExecutionFencedError);
   });
 
@@ -862,7 +1224,7 @@ describe('BackgroundTaskHost and the deployment execution fence', () => {
 
     // #then
     await expect(host.boot()).resolves.toBeUndefined();
-    await expect(host.manager.listTasks({ runId: 'abc_r1' })).resolves.toEqual({
+    await expect(host.listTasks({ runId: 'abc_r1' })).resolves.toEqual({
       tasks: [],
       total: 0,
     });

@@ -20,6 +20,7 @@ import {
 
 import { STARTER_AGENT_META } from './agent.js';
 import { SYSTEM_PRINCIPAL_ID } from './config.js';
+import { executionFence } from './storage.js';
 
 export const starterRunnerLifecycleConfig = {
   systemPrincipalId: SYSTEM_PRINCIPAL_ID,
@@ -70,7 +71,14 @@ export function contextForPrincipal(
     principal,
     storeFactory: factory,
     deploymentTag: env.DEPLOYMENT_TENANT,
-    buildService: (store) => new ApprovalService({ store }),
+    buildService: (store) =>
+      new ApprovalService({
+        // Same database, same fence as every other surface here: this service
+        // files and decides approvals for scheduled and system-driven runs, and
+        // decide() COMMITS before it resumes.
+        store,
+        executionFence: executionFence(env.DB),
+      }),
   });
 }
 

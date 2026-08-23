@@ -63,8 +63,8 @@ import {
   executionFencedResponse,
   isExecutionFenceRefusal,
   isPathSafeId,
-  OPEN_EXECUTION_FENCE,
   type RunStatus,
+  readExecutionFence,
   type ThreadScope,
 } from '../do-runner/index.js';
 import { internalErrorResponse } from '../internal-error-response.js';
@@ -550,9 +550,9 @@ export function createThreadSignalRoutes(
       //
       // A read that fails throws ExecutionFenceUnreadableError, which the
       // catch below answers as a 503 — degrade closed, never a silent open.
-      const executionFence = scope.init.executionFence
-        ? await scope.init.executionFence.read()
-        : OPEN_EXECUTION_FENCE;
+      const executionFence = await readExecutionFence(
+        scope.init.executionFence,
+      );
       if (executionFence.state === 'migration-locked') {
         return executionFencedResponse(executionFence.state, entryPath);
       }
@@ -1449,6 +1449,16 @@ async function handleWake(options: {
         ? !(await options.consultRunCap())
         : false;
     if (refusal || capped) {
+      // The one place a drain can lose a signal, and it is the CALLER'S choice,
+      // not the fence's. `execution-draining` degrades a wake into a persist so
+      // nothing is lost while a deployment finishes its work — but a caller who
+      // said persistence is forbidden has already declared it does not want its
+      // signal parked, and honouring the fence by parking it anyway would
+      // override an authorization decision with an operational one. So it is
+      // discarded, deliberately, and the response SAYS SO: `wakeRefused:
+      // 'execution-draining'` alongside `action: 'discard'` tells the caller
+      // exactly which condition dropped it, so a sender that would rather wait
+      // out the migration can retry instead of assuming delivery.
       if (!options.persistenceAllowed) {
         return persistenceForbiddenResponse({
           capped,

@@ -52,13 +52,13 @@ import type {
   ExternalPlatformTargetDescription,
   ExternalReleaseSnapshot,
   FleetRecord,
-  InitialExecutionFenceState,
   LiveDeployment,
   MaintenanceHealth,
   PromotionGuard,
   ProviderBindingIdentity,
   ProvisioningBackend,
   ScriptInventoryTarget,
+  SeedDeploymentIdentityOptions,
 } from './types.js';
 
 const RELEASE_DIGEST_LENGTH = 48;
@@ -488,7 +488,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     database: DatabaseReference,
     tenantTag: string,
     fence: ExternalMutationFence,
-    initialExecutionFenceState: InitialExecutionFenceState,
+    options: SeedDeploymentIdentityOptions,
   ): Promise<void> {
     await this.#withMutationFence(fence, () =>
       provisionDeploymentIdentityProtocol(
@@ -501,7 +501,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
         tenantTag,
         {
           caller: 'WorkersForPlatformsBackend.seedDeploymentIdentity',
-          initialExecutionFenceState,
+          initialExecutionFenceState: options.initialExecutionFenceState,
         },
       ),
     );

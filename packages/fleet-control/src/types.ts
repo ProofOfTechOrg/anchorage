@@ -569,6 +569,12 @@ export interface PlatformPlaneStateStore {
   ): Promise<T>;
 }
 
+/** The provisioning context `seedDeploymentIdentity` carries past the fence. */
+export interface SeedDeploymentIdentityOptions {
+  /** The execution-fence state this deployment is born in. Required. */
+  readonly initialExecutionFenceState: InitialExecutionFenceState;
+}
+
 export interface ProvisioningBackend {
   readonly kind: ProvisioningBackendKind;
   readonly immutableExternalArtifacts?: true;
@@ -583,17 +589,24 @@ export interface ProvisioningBackend {
    * Stamp the database's ownership sentinel and seed its initial execution
    * fence row.
    *
-   * `initialExecutionFenceState` is a REQUIRED parameter rather than backend
+   * `initialExecutionFenceState` is a REQUIRED option rather than backend
    * configuration because it is a per-provisioning decision: the same control
    * plane brings ordinary deployments up open and migration targets up locked.
    * It carries no default anywhere on this path — a migration target that came
    * up open would be executing exactly when it must not.
+   *
+   * It rides an OPTIONS object rather than a fourth positional because this
+   * method is implemented by every backend and faked by every test that builds
+   * one: the next piece of provisioning context to reach the seeding protocol
+   * would otherwise mean a fifth positional and the same fan-out again, and
+   * positional four and five of a five-argument call are exactly where a
+   * transposed argument compiles and provisions the wrong thing.
    */
   seedDeploymentIdentity(
     database: DatabaseReference,
     tenantTag: string,
     fence: ExternalMutationFence,
-    initialExecutionFenceState: InitialExecutionFenceState,
+    options: SeedDeploymentIdentityOptions,
   ): Promise<void>;
   readDeploymentIdentity(
     database: DatabaseReference,

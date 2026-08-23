@@ -33,11 +33,11 @@ import type {
   ExternalReleaseSnapshot,
   FleetRecord,
   ForceDecommissionStep,
-  InitialExecutionFenceState,
   LiveDeployment,
   MaintenanceHealth,
   PromotionGuard,
   ProvisioningBackend,
+  SeedDeploymentIdentityOptions,
   WorkerZoneRoute,
 } from './types.js';
 import { targetDurableObjectTag } from './validation.js';
@@ -460,7 +460,7 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     database: DatabaseReference,
     tenantTag: string,
     fence: ExternalMutationFence,
-    initialExecutionFenceState: InitialExecutionFenceState,
+    options: SeedDeploymentIdentityOptions,
   ): Promise<void> {
     await provisionDeploymentIdentityProtocol(
       (statement) =>
@@ -468,7 +468,7 @@ export class WranglerLoopBackend implements ProvisioningBackend {
       tenantTag,
       {
         caller: 'WranglerLoopBackend.seedDeploymentIdentity',
-        initialExecutionFenceState,
+        initialExecutionFenceState: options.initialExecutionFenceState,
       },
     );
   }

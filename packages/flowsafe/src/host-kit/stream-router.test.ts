@@ -25,7 +25,13 @@ import {
   createActorResolver,
   InMemoryApprovalStoreFactory,
 } from '../approval-api/index.js';
-import { HUB_INSTANCE_NAME } from '../do-runner/index.js';
+import {
+  doErrorResponse,
+  type ExecutionFenceDatabase,
+  ExecutionFenceStore,
+  HUB_INSTANCE_NAME,
+} from '../do-runner/index.js';
+import { doSummary } from './do-response.js';
 import type { RunnerNamespaceLike } from './do-run-topology.js';
 import {
   createFlowsafeWorker,
@@ -526,6 +532,8 @@ describe('hub fan-out wiring (host-approval-service, tested here — see file he
       stream: (event) => {
         pending.push(hubTopology.publish(event));
       },
+      // In-memory approval store — no database, nothing to fence.
+      executionFence: 'none',
     });
 
     // #when — a create mutation fires the stream sink once
@@ -646,6 +654,46 @@ describe('createStreamRouter run-route passthrough', () => {
         "deployment execution is fenced ('migration-locked'): run resume is refused",
       reason: { code: 'EXECUTION_FENCED', state: 'migration-locked' },
     });
+  });
+
+  it('passes an UNREADABLE fence through without the storage error behind it', async () => {
+    // #given — the real chain: a fence store over a faulting database, the
+    // refusal it raises, the DO's error mapping, and the reader that turns a DO
+    // response back into a RunRouteError. The passthrough forwards a 5xx
+    // message verbatim, so the only thing keeping the storage fault off the
+    // wire is that the refusal never carries it in `message`.
+    const secret = 'D1_ERROR: connect ECONNREFUSED 10.0.7.4:5432 db=acme-prod';
+    const fence = new ExecutionFenceStore({
+      prepare: () => ({
+        bind: () => ({
+          run: () => Promise.reject(new Error(secret)),
+          all: () => Promise.reject(new Error(secret)),
+        }),
+        run: () => Promise.reject(new Error(secret)),
+        all: () => Promise.reject(new Error(secret)),
+      }),
+    } as unknown as ExecutionFenceDatabase);
+    const refusal = await fence.read().catch((error: unknown) => error);
+    const routeError = await doSummary(doErrorResponse(refusal)).catch(
+      (error: unknown) => error,
+    );
+    const router = routerWith(() => Promise.reject(routeError));
+
+    // #when
+    const response = await router(
+      authedPost({ channel: 'run', runId: RUN_ID, workflowId: 'wf' }),
+    );
+
+    // #then
+    expect(response?.status).toBe(503);
+    const body = await response?.text();
+    expect(JSON.parse(body ?? '')).toEqual({
+      error: 'execution fence state is not readable',
+      reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
+    });
+    expect(body).not.toContain('ECONNREFUSED');
+    expect(body).not.toContain('acme-prod');
+    expect(body).not.toContain('10.0.7.4');
   });
 
   it('still collapses a 5xx with NO structured reason', async () => {

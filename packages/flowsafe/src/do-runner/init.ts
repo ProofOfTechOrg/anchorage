@@ -19,7 +19,10 @@ import {
 
 import type { D1DatabaseBinding } from './cf-types.js';
 import { createD1Storage } from './d1-storage.js';
-import type { ExecutionFenceDatabase } from './execution-fence.js';
+import type {
+  ExecutionFenceDatabase,
+  ExecutionFenceWiring,
+} from './execution-fence.js';
 import { ExecutionFenceStore } from './execution-fence.js';
 import type { HostPubSub } from './pubsub.js';
 import type { RequestContextProvider } from './runtime.js';
@@ -32,19 +35,6 @@ export interface DORunnerEnv {
 
 /** Explicit storage takes precedence over a DB binding when both are present. */
 export type InitSource = { storage: MastraCompositeStore } | DORunnerEnv;
-
-/**
- * Fence wiring for a `{ storage }` source: a store, or the typed opt-out.
- *
- * REQUIRED, and deliberately not optional-defaulting-to-none. The fence's job
- * is to stop a deployment executing while its state moves; a host that forgot
- * to wire it would get a runtime that silently executes through a migration,
- * which is the one failure this whole mechanism exists to prevent. A `{ DB }`
- * source needs no such option — init already holds the database the fence
- * lives in, so it builds one — and `'none'` remains available for the callers
- * that genuinely have no database to fence against (in-memory tests, adapters).
- */
-export type ExecutionFenceWiring = ExecutionFenceStore | 'none';
 
 export interface InitOptions {
   /** Storage instance id when init builds the D1 store. Default: 'flowsafe'. */
@@ -81,7 +71,8 @@ export interface InitOptions {
    * of, which is the fail-closed-by-construction half of the contract.
    *
    * REQUIRED, and widened to include the opt-out, for a `{ storage }` source —
-   * see ExecutionFenceWiring.
+   * see ExecutionFenceWiring, which spells out why every fence option that CAN
+   * be required is.
    */
   executionFence?: ExecutionFenceStore;
 }

@@ -35,7 +35,6 @@ import {
   DurableObjectRunner,
   doErrorResponse,
   EXECUTION_PRINCIPAL_HEADER,
-  ExecutionFenceStore,
   HubDurableObject,
   type InitResult,
   init,
@@ -71,6 +70,7 @@ import { modelConfig, SYSTEM_PRINCIPAL_ID } from './config.js';
 import { starterRunnerLifecycleConfig } from './principal-context.js';
 import {
   createComposedStorage,
+  executionFence,
   schedulesStore,
   subscriptionStoreFactory,
 } from './storage.js';
@@ -153,6 +153,7 @@ export class StarterSignalProviderHost extends SignalProviderHost<Env> {
         env.DEPLOYMENT_IDENTITY_SECRET,
       ),
       providers: [github],
+      executionFence: executionFence(env.DB),
     };
   }
 }
@@ -194,6 +195,10 @@ export class StarterThread extends ThreadDurableObject<Env> {
       approvalService: () => {
         this.#approvalService ??= new ApprovalService({
           store: approvals,
+          // decide() COMMITS and only then resumes, so the fence belongs at
+          // the service: a decision recorded against a locked deployment
+          // would be durable with nothing behind it.
+          executionFence: executionFence(env.DB),
           ...(this.env.STREAM_TICKET_SECRET
             ? {
                 stream: (event) =>
@@ -220,7 +225,7 @@ export class StarterThread extends ThreadDurableObject<Env> {
         // The composed store hides the binding init would have fenced from, so
         // this thread DO names it: the deployment execution fence must live in
         // the SAME database as the state it fences.
-        executionFence: new ExecutionFenceStore(env.DB),
+        executionFence: executionFence(env.DB),
       },
     );
     this.#threadInit = threadInit;
@@ -405,6 +410,7 @@ export class StarterBackgroundTasks {
         },
       },
       execution: true,
+      executionFence: executionFence(this.env.DB),
       manager: {
         globalConcurrency: 10,
         perAgentConcurrency: 3,
@@ -450,7 +456,10 @@ export class StarterBackgroundTasks {
       const resources = approvalStoreFactoryFor(this.env.DB).resources();
       const host = await this.#ensureHost();
       const route = createBackgroundTaskRoutes({
-        manager: host.manager,
+        // The HOST, not its manager: the manager also carries enqueue and the
+        // executor registry, and a route must not be one property access
+        // away from putting an unfenced task body on this deployment.
+        manager: host,
         authorize: async (scope) => {
           const checks: Promise<boolean>[] = [];
           if (scope.runId !== undefined) {

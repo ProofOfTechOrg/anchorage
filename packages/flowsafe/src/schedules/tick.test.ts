@@ -37,14 +37,25 @@ const TARGET_POLICY = createScheduleTargetPolicy({
   ],
 });
 
+/**
+ * The tick under test with the shared options defaulted.
+ * `executionFence: 'none'` is the honest wiring for the in-memory FakeStore —
+ * there is no database to fence — and the fence cases at the bottom of this
+ * file pass a real store, so nothing here weakens their gate.
+ */
 function createScheduleTick(
-  options: Omit<ScheduleTickOptions, 'targetPolicy' | 'status'> & {
+  options: Omit<
+    ScheduleTickOptions,
+    'targetPolicy' | 'status' | 'executionFence'
+  > & {
     status?: ScheduleTickOptions['status'];
+    executionFence?: ScheduleTickOptions['executionFence'];
   },
 ) {
   return createScheduleTickImpl({
     status: async () => undefined,
     ...options,
+    executionFence: options.executionFence ?? 'none',
     targetPolicy: TARGET_POLICY,
   });
 }
@@ -377,6 +388,7 @@ describe('createScheduleTick', () => {
       start,
       status: async () => undefined,
       targetPolicy,
+      executionFence: 'none',
       now: () => NOW,
     })();
 
@@ -1166,13 +1178,17 @@ describe('createScheduleTick and the deployment execution fence', () => {
     );
   }
 
-  it('leaves a due fire UNCLAIMED on a fenced pass, then fires it after reopen', async () => {
-    // #given — a due schedule on a deployment that just started draining.
+  it.each([
+    'draining',
+    'migration-locked',
+  ] as const)('leaves a due schedule ROW untouched on a %s pass, then fires it exactly once after reopen', async (state) => {
+    // #given — a due schedule on a deployment the operator has just fenced.
     const store = new FakeStore();
     store.seed(workflowSchedule());
+    const before = { ...(store.schedules.get('schedule_a') as Schedule) };
     const start = vi.fn(async ({ runId }: { runId: string }) => ({ runId }));
     const executionFence = fence();
-    await executionFence.seed('draining');
+    await executionFence.seed(state);
     const tick = createScheduleTick({
       store,
       start,
@@ -1184,8 +1200,10 @@ describe('createScheduleTick and the deployment execution fence', () => {
     const fenced = await tick();
 
     // #then — the pass did nothing at all. Claiming a fire it will not run
-    // would CONSUME it (the claim advances nextFireAt), so the fire would be
-    // lost rather than deferred.
+    // would CONSUME it (the claim advances nextFireAt) and the fenced runtime
+    // would then refuse the start, so the fire would be LOST rather than
+    // deferred. An idle-looking RESULT is not evidence of that: the tally
+    // below is what the pass reported, and the row is what it did.
     expect(fenced).toEqual({
       due: 0,
       fired: 0,
@@ -1197,16 +1215,22 @@ describe('createScheduleTick and the deployment execution fence', () => {
     });
     expect(start).not.toHaveBeenCalled();
     expect(store.triggers).toEqual([]);
-    expect(store.schedules.get('schedule_a')?.nextFireAt).toBe(NOW - 1000);
+    // The whole row, not just nextFireAt: status, lastFireAt, and lastRunId
+    // are the other fields a claim writes, and a claim that advanced any of
+    // them has consumed the fire whatever the tally said.
+    expect(store.schedules.get('schedule_a')).toEqual(before);
 
-    // #when — the migration finishes and the fence reopens.
-    await executionFence.transition({ expected: 'draining', next: 'open' });
+    // #when — the migration finishes and the operator reopens the fence.
+    await executionFence.transition({ expected: state, next: 'open' });
     const reopened = await tick();
 
     // #then — the SAME fire runs, exactly once: neither lost nor duplicated.
     expect(reopened.due).toBe(1);
     expect(reopened.fired).toBe(1);
     expect(start).toHaveBeenCalledTimes(1);
+    // #and — only NOW is the fire consumed: the row advanced past this due
+    // time, so a third pass would not run it again.
+    expect(store.schedules.get('schedule_a')?.nextFireAt).toBeGreaterThan(NOW);
   });
 
   it('skips the pass rather than claiming when the fence cannot be read', async () => {

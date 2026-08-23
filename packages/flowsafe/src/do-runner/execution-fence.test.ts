@@ -8,14 +8,20 @@ import {
   type SqliteDatabase,
   sqliteUnitDatabase,
 } from '../../test-support/sqlite.js';
+// The raw table name and the state list come from the PROVISIONING PROTOCOL,
+// which is their single home — `./execution-fence.js` deliberately does not
+// re-export them (see its header), so a test that pinned them off the runtime
+// module would be pinning a second copy.
+import {
+  EXECUTION_FENCE_STATES,
+  EXECUTION_FENCE_TABLE,
+} from '../deployment-identity-protocol.js';
 import { doErrorResponse } from './do-error-response.js';
 import {
   admitsDrainableExecution,
   admitsExistingRun,
   admitsRunStart,
   admitsWorkAuthoring,
-  EXECUTION_FENCE_STATES,
-  EXECUTION_FENCE_TABLE,
   type ExecutionFenceDatabase,
   ExecutionFencedError,
   type ExecutionFenceReading,
@@ -289,6 +295,85 @@ describe('ExecutionFenceStore', () => {
 
     // #then — never 'open'. Answering "I do not understand this fence" with
     // "there is no fence" is the one answer that must never be wrong.
+    await expect(fence.read()).rejects.toBeInstanceOf(
+      ExecutionFenceUnreadableError,
+    );
+  });
+
+  it('reads a pre-0.20 database as open when the adapter wraps the SQLite error', async () => {
+    // #given — an adapter that reports its own message and carries the driver's
+    // text on `cause`. This is the shape that makes the difference load-bearing:
+    // matching only the TOP message would classify a correctly upgraded 0.19
+    // database as unreadable, and every gated path on it would answer 503
+    // permanently — the exact opposite of the upgrade rule.
+    const wrapped = new Error('D1_ERROR: query failed', {
+      cause: new Error(
+        `SqliteError: no such table: ${EXECUTION_FENCE_TABLE}`,
+        // Two links deep, because an adapter over a driver over SQLite is the
+        // normal number of wrappers, not the pathological one.
+        { cause: new Error(`no such table: ${EXECUTION_FENCE_TABLE}`) },
+      ),
+    });
+    const fence = new ExecutionFenceStore({
+      prepare: () => ({
+        bind: () => ({
+          run: () => Promise.reject(wrapped),
+          all: () => Promise.reject(wrapped),
+        }),
+        run: () => Promise.reject(wrapped),
+        all: () => Promise.reject(wrapped),
+      }),
+    } as unknown as ExecutionFenceDatabase);
+
+    // #then — open, and `recordProofRun` reaches the same conclusion: a
+    // database with no fence table cannot be in proof-only.
+    await expect(fence.read()).resolves.toEqual({ state: 'open' });
+    await expect(fence.recordProofRun('proof-1', 'acme_r1')).resolves.toBe(
+      false,
+    );
+  });
+
+  it('still degrades closed when a wrapped cause is a genuine fault', async () => {
+    // #given — the same wrapping shape, but the buried error is a real storage
+    // fault. Walking the chain must not turn every wrapped error into an open
+    // fence: only the missing TABLE reads as open.
+    const wrapped = new Error('D1_ERROR: query failed', {
+      cause: new Error('no such table: mastra_workflow_snapshot'),
+    });
+    const fence = new ExecutionFenceStore({
+      prepare: () => ({
+        bind: () => ({
+          run: () => Promise.reject(wrapped),
+          all: () => Promise.reject(wrapped),
+        }),
+        run: () => Promise.reject(wrapped),
+        all: () => Promise.reject(wrapped),
+      }),
+    } as unknown as ExecutionFenceDatabase);
+
+    // #then
+    await expect(fence.read()).rejects.toBeInstanceOf(
+      ExecutionFenceUnreadableError,
+    );
+  });
+
+  it('terminates on a cyclic cause chain rather than degrading into a hang', async () => {
+    // #given — an error whose cause is itself. The walk runs on the fence read
+    // that fronts every gated request, so it is bounded and cycle-aware.
+    const cyclic = new Error('D1_ERROR: query failed');
+    (cyclic as { cause?: unknown }).cause = cyclic;
+    const fence = new ExecutionFenceStore({
+      prepare: () => ({
+        bind: () => ({
+          run: () => Promise.reject(cyclic),
+          all: () => Promise.reject(cyclic),
+        }),
+        run: () => Promise.reject(cyclic),
+        all: () => Promise.reject(cyclic),
+      }),
+    } as unknown as ExecutionFenceDatabase);
+
+    // #then — a decided answer, not a hang.
     await expect(fence.read()).rejects.toBeInstanceOf(
       ExecutionFenceUnreadableError,
     );

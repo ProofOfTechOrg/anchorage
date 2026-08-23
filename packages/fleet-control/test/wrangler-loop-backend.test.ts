@@ -1843,12 +1843,9 @@ export default {
     await expect(
       subject.readDeploymentIdentity(database, mutationFence),
     ).resolves.toBeUndefined();
-    await subject.seedDeploymentIdentity(
-      database,
-      'acme',
-      mutationFence,
-      'migration-locked',
-    );
+    await subject.seedDeploymentIdentity(database, 'acme', mutationFence, {
+      initialExecutionFenceState: 'migration-locked',
+    });
     await expect(
       subject.readDeploymentIdentity(database, mutationFence),
     ).resolves.toBe('acme');

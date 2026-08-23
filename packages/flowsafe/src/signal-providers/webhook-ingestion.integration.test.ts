@@ -159,6 +159,11 @@ async function wireWebhookChain(
     subscriptions: factory.store(),
     topology: createThreadTopology(namespace),
     secretForProvider: () => SECRET,
+    // Unfenced, matching the thread DO this harness drives into (its init is
+    // `executionFence: 'none'` above): the subject here is ingestion through to
+    // an owned thread, and the fence's own behavior is pinned in
+    // webhook-route.test.ts against a real store.
+    executionFence: 'none',
   });
 
   return { router, threadId, notifications };

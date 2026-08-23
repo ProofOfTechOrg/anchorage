@@ -29,7 +29,7 @@ import {
   trustAutomationPrincipal,
 } from '../approval-api/index.js';
 import { type AuditQueue, queueAuditSink } from '../audit-export/index.js';
-import type { ExecutionFenceStore } from '../do-runner/execution-fence.js';
+import type { ExecutionFenceWiring } from '../do-runner/execution-fence.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
 import {
   type ResumeRunFn,
@@ -176,21 +176,23 @@ export interface HostApprovalServiceOptions {
   stream?: ApprovalStreamSink;
   /**
    * The deployment execution fence (do-runner/execution-fence.ts), forwarded to
-   * ApprovalServiceOptions.executionFence.
+   * ApprovalServiceOptions.executionFence, or `'none'` for a service with no
+   * database behind it.
    *
-   * REQUIRED IN PRACTICE for any host whose runs live behind a fence, and
-   * `createFlowsafeWorker` always supplies it. It is optional only because this
-   * function receives an ApprovalStore rather than a database, so it cannot
-   * build the store itself the way `init({ DB })` can — a host assembling its
-   * own service must name the fence, exactly as it names its resume topology.
+   * REQUIRED, and the `'none'` branch is genuinely dangerous rather than merely
+   * unusual: `'none'` makes decide() unfenced, and decide COMMITS the decision
+   * and only then resumes. A migration-locked deployment would durably record a
+   * decision — with its audit trail and its notification — whose resume then
+   * 503s, and the deployment taking over inherits a decided approval with
+   * nothing behind it. Write it only for a service that has no database to
+   * fence against at all.
    *
-   * Omitting it makes decide() unfenced, which is not merely "no gate": decide
-   * COMMITS the decision and only then resumes, so a migration-locked
-   * deployment would durably record a decision (with its audit trail and
-   * notification) whose resume then 503s, and the deployment taking over
-   * inherits a decided approval with nothing behind it.
+   * This function receives an ApprovalStore rather than a database, so it
+   * cannot build the store itself the way `init({ DB })` can — which is exactly
+   * why the option is required rather than optional: the host is the only place
+   * the wiring can happen, so the type has to make it name one.
    */
-  executionFence?: ExecutionFenceStore;
+  executionFence: ExecutionFenceWiring;
 }
 
 /**
@@ -220,7 +222,13 @@ export function buildHostApprovalService(
     notify: options.notify,
     stream: options.stream,
     allowSelfDecision: options.allowSelfDecision,
-    executionFence: options.executionFence,
+    // The opt-out is resolved HERE rather than pushed down: ApprovalService is
+    // constructed by hosts that never see a database at all (a thread DO's
+    // in-isolate service), so its own option stays plainly optional while this
+    // composer — which every fenced host goes through — is the layer that has
+    // to be told.
+    executionFence:
+      options.executionFence === 'none' ? undefined : options.executionFence,
     resumeRun: resumeRunWithRequeue(
       options.resumeRun,
       () => service,

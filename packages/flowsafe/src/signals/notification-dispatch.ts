@@ -8,8 +8,9 @@ import type {
 import type { ActorContext } from '../approval-api/index.js';
 import {
   admitsDrainableExecution,
-  type ExecutionFenceStore,
+  type ExecutionFenceWiring,
   isPathSafeId,
+  readExecutionFence,
 } from '../do-runner/index.js';
 import type { ThreadTopology } from '../host-kit/index.js';
 import { nonnegativeSafeInteger } from '../numeric-config.js';
@@ -29,13 +30,17 @@ export interface NotificationDispatchTickOptions {
    */
   limit?: number;
   /**
-   * The deployment execution fence, read ONCE per pass. A drain still
-   * dispatches — the thread routes degrade a wake to a persist there, so the
-   * inbox drains without minting — while migration-locked and proof-only skip
-   * the pass entirely: a due row stays due, so the deployment that takes over
-   * dispatches it. Absent ⇒ unfenced.
+   * The deployment execution fence, read ONCE per pass, or `'none'` for a tick
+   * with no database behind it. A drain still dispatches — the thread routes
+   * degrade a wake to a persist there, so the inbox drains without minting —
+   * while migration-locked and proof-only skip the pass entirely: a due row
+   * stays due, so the deployment that takes over dispatches it.
+   *
+   * REQUIRED: an unfenced tick keeps delivering into thread DOs a locked
+   * deployment is refusing, which burns the notification's delivery attempts on
+   * a deployment that cannot act on it. See ExecutionFenceWiring.
    */
-  executionFence?: ExecutionFenceStore;
+  executionFence: ExecutionFenceWiring;
 }
 
 export interface NotificationDispatchTickResult {
@@ -257,23 +262,23 @@ export function createNotificationDispatchTick(
     // maintenance alarm, so a fence that cannot be READ degrades closed by
     // skipping the pass and logging: throwing would fail the duty, and
     // proceeding would dispatch on a deployment whose state is unknown.
-    if (options.executionFence) {
-      let admitted: boolean;
-      try {
-        admitted = admitsDrainableExecution(
-          await options.executionFence.read(),
-        );
-      } catch (error) {
-        console.error(
-          JSON.stringify({
-            type: 'notification-dispatch-fence-error',
-            error: errorMessage(error),
-          }),
-        );
-        return { due: 0, delivered: 0, failed: 0 };
-      }
-      if (!admitted) return { due: 0, delivered: 0, failed: 0 };
+    let admitted: boolean;
+    try {
+      admitted = admitsDrainableExecution(
+        await readExecutionFence(options.executionFence),
+      );
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          type: 'notification-dispatch-fence-error',
+          // `reason`, matching schedule-tick-fence-error: the two alarm lanes
+          // degrade closed identically, so an operator greps one field.
+          reason: errorMessage(error),
+        }),
+      );
+      return { due: 0, delivered: 0, failed: 0 };
     }
+    if (!admitted) return { due: 0, delivered: 0, failed: 0 };
     const now = options.now?.() ?? new Date();
     const due = await options.storage.listDueNotifications({
       now,

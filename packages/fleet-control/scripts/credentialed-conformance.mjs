@@ -1410,7 +1410,7 @@ async function assertTenantIsolation() {
         firstDatabase,
         deployments[1].initialSpec.tenantTag,
         fence,
-        'open',
+        { initialExecutionFenceState: 'open' },
       );
     } catch (error) {
       mismatchRejected = /already belongs|refusing to re-stamp/.test(

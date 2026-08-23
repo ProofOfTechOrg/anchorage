@@ -1893,7 +1893,9 @@ export async function migrateFleet(options: {
           database,
           stored.tenantTag,
           lease,
-          'open',
+          {
+            initialExecutionFenceState: 'open',
+          },
         );
         const pendingMigrations = spec.migrations.filter(
           (candidate) => candidate.version > migrationRecord.schemaVersion,

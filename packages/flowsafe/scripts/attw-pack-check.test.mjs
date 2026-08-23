@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { assertAttwEsmReport } from './attw-pack-check.mjs';
+import {
+  assertAttwEsmReport,
+  PROTOCOL_IMPORTING_DECLARATIONS,
+} from './attw-pack-check.mjs';
 
 function report(problems) {
   return {
@@ -72,5 +75,23 @@ describe('assertAttwEsmReport', () => {
     expect(() =>
       assertAttwEsmReport(report([{ kind: 'FalseESM' }]), 0),
     ).toThrow(/unexpected ATTW problem/);
+  });
+
+  it('rejects a pinned declaration that no longer raises the accepted error', () => {
+    // #given — the protocol-importing list is an ACCEPT list, so a stale entry
+    // silently widens what the check tolerates: the day a module stops
+    // importing the protocol, its entry keeps admitting a future error at the
+    // same path. Only one of the two declarations reports.
+    expect(() =>
+      assertAttwEsmReport(report([internalResolutionError()]), 1),
+    ).toThrow(/no longer raise a node10 internal-resolution error/);
+  });
+
+  it('keeps the accepted declaration list free of duplicates', () => {
+    // #given — a repeat would make the exhaustion check above unfalsifiable for
+    // that file: one problem would satisfy both copies.
+    expect(new Set(PROTOCOL_IMPORTING_DECLARATIONS).size).toBe(
+      PROTOCOL_IMPORTING_DECLARATIONS.length,
+    );
   });
 });

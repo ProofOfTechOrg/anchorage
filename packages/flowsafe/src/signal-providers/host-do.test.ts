@@ -129,7 +129,10 @@ class TestHost extends SignalProviderHost<TestEnv> {
       store: env.factory.store(),
       topology: env.topology,
       providers: env.providers,
-      ...(env.executionFence ? { executionFence: env.executionFence } : {}),
+      // 'none' where a case has no fence: the subscription store is backed by
+      // an in-memory factory, so there is no database to fence. The fence cases
+      // supply a real store.
+      executionFence: env.executionFence ?? 'none',
     };
   }
 }

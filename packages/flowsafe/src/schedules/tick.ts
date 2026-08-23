@@ -38,10 +38,11 @@ import { computeNextFireAt } from '@mastra/core/workflows';
 import type { ResourceOwnershipStore } from '../approval-api/index.js';
 import {
   admitsWorkAuthoring,
-  type ExecutionFenceStore,
+  type ExecutionFenceWiring,
   isPathSafeId,
   isReservedExecutionContextKey,
   RESERVED_EXECUTION_CONTEXT_KEYS,
+  readExecutionFence,
   resolveScheduleStartOwner,
   stripReservedExecutionContext,
 } from '../do-runner/index.js';
@@ -318,11 +319,16 @@ export interface ScheduleTickOptions {
   audit?: ScheduleTickAuditSink;
   /**
    * The deployment execution fence, read ONCE per pass and BEFORE any CAS
-   * claim. A fenced pass does nothing at all: claiming a fire it will not run
-   * would consume it — the claim advances `nextFireAt` — and that fire would
-   * then be lost rather than deferred. Absent ⇒ unfenced.
+   * claim, or `'none'` for a tick with no database behind it.
+   *
+   * REQUIRED, and this is the option the requirement exists for: a fenced pass
+   * must do nothing at all, because claiming a fire it will not run CONSUMES it
+   * — the claim advances `nextFireAt` — and the fenced runtime then refuses the
+   * start, so the fire is lost rather than deferred. A host that wires the
+   * runtime's fence but forgets this one gets exactly that, and nothing reports
+   * it. See ExecutionFenceWiring.
    */
-  executionFence?: ExecutionFenceStore;
+  executionFence: ExecutionFenceWiring;
   /**
    * Max due schedules processed per tick pass. Must be a nonnegative safe
    * integer; zero is an intentional no-op. Default 100.
@@ -1462,21 +1468,21 @@ export function createScheduleTick(
     // path, so it degrades closed by DOING NOTHING and logging: throwing would
     // fail the maintenance duty, and proceeding would claim fires on a
     // deployment whose state is unknown.
-    if (options.executionFence) {
-      let admitted: boolean;
-      try {
-        admitted = admitsWorkAuthoring(await options.executionFence.read());
-      } catch (error) {
-        console.error(
-          JSON.stringify({
-            type: 'schedule-tick-fence-error',
-            reason: error instanceof Error ? error.message : String(error),
-          }),
-        );
-        return idlePass();
-      }
-      if (!admitted) return idlePass();
+    let admitted: boolean;
+    try {
+      admitted = admitsWorkAuthoring(
+        await readExecutionFence(options.executionFence),
+      );
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          type: 'schedule-tick-fence-error',
+          reason: error instanceof Error ? error.message : String(error),
+        }),
+      );
+      return idlePass();
     }
+    if (!admitted) return idlePass();
     const at = now();
     const due = await store.listDueSchedules(at, limit);
     const result: ScheduleTickResult = {

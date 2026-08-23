@@ -23,6 +23,7 @@ export {
 export type { BackgroundTaskHostOptions } from './host.js';
 export { BackgroundTaskHost } from './host.js';
 export type {
+  BackgroundTaskReads,
   BackgroundTaskRouter,
   BackgroundTaskRoutesOptions,
 } from './routes.js';

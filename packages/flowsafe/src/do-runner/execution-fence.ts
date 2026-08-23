@@ -62,26 +62,41 @@ function changesOf(result: unknown): number {
 }
 
 /**
- * The fence states, ordered from most to least permissive; the table the single
- * row lives in (flowsafe-owned, outside the `mastra_%` guard); and that row's
- * fixed primary key — the fence is a property of the DEPLOYMENT, and a
- * deployment is one database, so there is exactly one row and its key is a
- * constant. A CHECK constraint keeps a second one from ever being inserted,
- * which is what makes every CAS below total rather than "the CAS, on whichever
- * row you meant".
+ * The state vocabulary, the table, that table's fixed row key, and the DDL
+ * built from all three are IMPORTED, never declared here — and they are not
+ * re-exported from this module either.
  *
- * All three, and the DDL built from them, come from the provisioning protocol
- * module rather than being declared here: PROVISIONING creates this table
+ * Imported because PROVISIONING creates this table
  * (deployment-identity-protocol.mjs), and `CREATE TABLE IF NOT EXISTS` would
  * silently accept a differently-shaped table it had already made — so a second
  * copy of the schema would not fail loudly, it would quietly drop the CHECK
- * constraints. That module is also the only file both sides can share: it ships
- * at the package root for the provisioning CLI and fleet-control, neither of
- * which can import this package's TypeScript.
+ * constraints that make every CAS below total rather than "the CAS, on
+ * whichever row you meant". That module is also the only file both sides can
+ * share: it ships at the package root for the provisioning CLI and
+ * fleet-control, neither of which can import this package's TypeScript.
+ *
+ * Not re-exported because a raw constant with two homes is a constant two
+ * consumers can disagree about. `@proofoftech/flowsafe/deployment-identity-protocol`
+ * is the one place to import the table name or the state list from; what this
+ * module publishes is the TYPED surface built on them — the state type, the
+ * store, the refusals, and the admission predicates.
  */
-export { EXECUTION_FENCE_STATES, EXECUTION_FENCE_TABLE };
-
 export type ExecutionFenceState = (typeof EXECUTION_FENCE_STATES)[number];
+
+/**
+ * How a surface is wired to the fence: a store, or the typed opt-out.
+ *
+ * Written as a union with no `undefined` so every option type carrying it can
+ * be REQUIRED. That is the whole forcing function: a fence option a host may
+ * omit is one a host will omit, and a partially wired deployment is worse than
+ * an unwired one — an unfenced schedule tick claims a due fire through the CAS
+ * (which advances `nextFireAt`) and the fenced runtime then refuses the start,
+ * so the fire is consumed and never runs. Making the caller WRITE `'none'`
+ * turns that split brain into a decision someone made rather than one they
+ * missed, and `'none'` stays honest for the callers that genuinely have no
+ * database to fence against (in-memory tests, adapters).
+ */
+export type ExecutionFenceWiring = ExecutionFenceStore | 'none';
 
 /** What one fence read observed. `proofKey`/`proofRunId` exist only in proof-only. */
 export interface ExecutionFenceReading {
@@ -96,6 +111,29 @@ export interface ExecutionFenceReading {
 export const OPEN_EXECUTION_FENCE: ExecutionFenceReading = Object.freeze({
   state: 'open',
 });
+
+/**
+ * Read the fence a surface was wired with, resolving the typed opt-out.
+ *
+ * ONE function rather than a `fence ? await fence.read() : OPEN` at every gate,
+ * because those are the places a mistake is invisible: an unfenced surface and
+ * an open one behave identically until the day an operator closes the fence, so
+ * a call site that got the ternary subtly wrong would pass every test written
+ * against an open deployment. Every gate resolving absence through here means
+ * there is exactly one definition of what "no fence" does.
+ *
+ * `undefined` is admitted alongside `'none'` for the surfaces whose fence
+ * arrives through an object the caller may not have populated (an
+ * `InitResult.executionFence` on an unfenced host); it reads as open for the
+ * same reason `'none'` does, and never as a silent default a host can reach by
+ * forgetting — the option types that feed this are required.
+ */
+export async function readExecutionFence(
+  fence: ExecutionFenceWiring | undefined,
+): Promise<ExecutionFenceReading> {
+  if (fence === undefined || fence === 'none') return OPEN_EXECUTION_FENCE;
+  return fence.read();
+}
 
 /**
  * Minimal structural D1 surface, the same posture as SnapshotDatabase and
@@ -205,6 +243,31 @@ export function executionFencedResponse(
       },
     },
   );
+}
+
+/**
+ * A fence reading as the JSON body a control-plane read answers with.
+ *
+ * Beside `executionFencedResponse` and for the same reason: the published
+ * `GET /admin/execution-fence` route and the spike's local control probe both
+ * project a reading into this exact shape, and a projection written twice is
+ * one an operator's tooling can watch drift. Absent fields are OMITTED rather
+ * than sent as null — `proofKey`/`proofRunId` exist only in proof-only, and a
+ * null would invite a caller to read "no proof run yet" out of a state that has
+ * no proof at all.
+ */
+export function executionFenceReadingPayload(reading: ExecutionFenceReading): {
+  state: ExecutionFenceState;
+  proofKey?: string;
+  proofRunId?: string;
+} {
+  return {
+    state: reading.state,
+    ...(reading.proofKey === undefined ? {} : { proofKey: reading.proofKey }),
+    ...(reading.proofRunId === undefined
+      ? {}
+      : { proofRunId: reading.proofRunId }),
+  };
 }
 
 /** Every fence-authored refusal — the family a fenced surface catches as one. */
@@ -364,16 +427,43 @@ function readingFromRow(row: ExecutionFenceRow): ExecutionFenceReading {
 }
 
 /**
+ * How far down an error's `cause` chain the missing-table test looks. Bounded
+ * because a chain can be cyclic or adversarially deep, and this runs on the
+ * fence read that fronts every gated request.
+ */
+const MAX_FENCE_ERROR_CAUSE_DEPTH = 8;
+
+/**
  * SQLite/D1's "no such table". Same message match, and the same reasoning, as
  * d1-storage's purge helpers: the structural database seam carries no error
  * codes, and a table that was never created is not a fault — for this store it
  * is a pre-0.20 database, which reads as `open`.
+ *
+ * The CAUSE chain is walked, not just the top message, because the seam is
+ * structural: an adapter is free to wrap the driver's error in one of its own
+ * ("D1 query failed") and carry the SQLite text on `cause`. Reading only the
+ * top message there would classify a pre-0.20 database as unreadable instead of
+ * open — a PERMANENT 503 on every gated path of a deployment that upgraded
+ * correctly, which is the one failure this rule exists to prevent.
  */
 function isMissingFenceTable(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return (
-    /no such table/i.test(message) && message.includes(EXECUTION_FENCE_TABLE)
-  );
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  for (let depth = 0; depth < MAX_FENCE_ERROR_CAUSE_DEPTH; depth += 1) {
+    if (current === undefined || current === null || seen.has(current)) break;
+    seen.add(current);
+    const message =
+      current instanceof Error ? current.message : String(current);
+    if (
+      /no such table/i.test(message) &&
+      message.includes(EXECUTION_FENCE_TABLE)
+    ) {
+      return true;
+    }
+    if (!(current instanceof Error)) break;
+    current = current.cause;
+  }
+  return false;
 }
 
 export interface ExecutionFenceStoreOptions {
@@ -386,8 +476,18 @@ export interface ExecutionFenceTransition {
   expected: ExecutionFenceState;
   /** The state to move to. */
   next: ExecutionFenceState;
-  /** Required when `next` is 'proof-only'; rejected otherwise. */
-  proofKey?: string;
+  /**
+   * Required when `next` is 'proof-only'; rejected otherwise.
+   *
+   * `unknown` rather than `string` because every caller is a control-plane
+   * route holding a parsed JSON body, and `#proofKeyFor` already validates it
+   * against PATH_SAFE_ID_PATTERN and throws InvalidExecutionFenceRequestError
+   * on anything else. Typing it `string` bought nothing and cost something: it
+   * made every route write `body.proofKey as string`, an assertion that is
+   * false exactly when the caller sent the wrong thing, so the one input this
+   * field exists to police arrived pre-blessed at the type level.
+   */
+  proofKey?: unknown;
 }
 
 /**

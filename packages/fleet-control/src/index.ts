@@ -137,6 +137,7 @@ export {
   type ProvisioningResult,
   type R2Jurisdiction,
   type ScriptInventoryTarget,
+  type SeedDeploymentIdentityOptions,
   type TrustedWorkerArtifact,
   type WorkerModule,
   type WorkerZoneRoute,

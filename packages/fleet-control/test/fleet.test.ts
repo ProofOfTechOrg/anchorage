@@ -35,12 +35,12 @@ import type {
   FleetResourceInventory,
   FleetStateLease,
   FleetStateStore,
-  InitialExecutionFenceState,
   LiveDeployment,
   MaintenanceHealth,
   PromotionGuard,
   ProvisioningBackend,
   ProvisioningBackendKind,
+  SeedDeploymentIdentityOptions,
 } from '../src/types.js';
 import { externalReleaseScriptName } from '../src/workers-for-platforms-backend.js';
 
@@ -189,15 +189,17 @@ class FleetBackend implements ProvisioningBackend {
   }
 
   // Declares the fence state so it appears in the call log. A fake that simply
-  // omitted the parameter would still satisfy the interface, and an unthreaded
-  // fence state would be invisible to every assertion below.
+  // omitted the options argument would still satisfy the interface, and an
+  // unthreaded fence state would be invisible to every assertion below.
   async seedDeploymentIdentity(
     _database: DatabaseReference,
     tenantTag: string,
     _fence: ExternalMutationFence,
-    initialExecutionFenceState: InitialExecutionFenceState,
+    options: SeedDeploymentIdentityOptions,
   ): Promise<void> {
-    this.calls.push(`identity:${tenantTag}:${initialExecutionFenceState}`);
+    this.calls.push(
+      `identity:${tenantTag}:${options.initialExecutionFenceState}`,
+    );
   }
 
   async readDeploymentIdentity(

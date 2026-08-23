@@ -89,6 +89,14 @@ export {
 // The deployment execution fence (docs/do-runner-design.md): the operational
 // control that stops a deployment minting work while its state is migrated,
 // plus the four admission predicates the semantics matrix is written as.
+//
+// The RAW constants behind it — EXECUTION_FENCE_TABLE, EXECUTION_FENCE_STATES,
+// EXECUTION_FENCE_ROW_ID, EXECUTION_FENCE_DDL — are deliberately absent: they
+// are the provisioning protocol's, shipped on
+// `@proofoftech/flowsafe/deployment-identity-protocol` where the provisioning
+// CLI and fleet-control can reach them too. Publishing them twice would let a
+// consumer pin the table name from one subpath and the DDL from the other and
+// never learn they had drifted.
 export type {
   ExecutionFenceDatabase,
   ExecutionFenceReading,
@@ -97,6 +105,7 @@ export type {
   ExecutionFenceStatement,
   ExecutionFenceStoreOptions,
   ExecutionFenceTransition,
+  ExecutionFenceWiring,
 } from './execution-fence.js';
 export {
   admitsDrainableExecution,
@@ -104,23 +113,24 @@ export {
   admitsRunStart,
   admitsWorkAuthoring,
   assertExecutionFenceState,
-  EXECUTION_FENCE_STATES,
-  EXECUTION_FENCE_TABLE,
   ExecutionFencedError,
   ExecutionFenceStore,
   ExecutionFenceUnreadableError,
   executionFencedResponse,
+  executionFenceReadingPayload,
   FenceTransitionConflictError,
   InvalidExecutionFenceRequestError,
   isExecutionFenceRefusal,
-  OPEN_EXECUTION_FENCE,
+  // OPEN_EXECUTION_FENCE is deliberately NOT exported: `readExecutionFence`
+  // is the only supported way to resolve an absent fence, so no consumer can
+  // hand-roll a ternary that gets the open case subtly wrong.
+  readExecutionFence,
 } from './execution-fence.js';
 export { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
 export type { HubStreamEvent, PresenceMember } from './hub-do.js';
 export { HUB_INSTANCE_NAME, HubDurableObject } from './hub-do.js';
 export type {
   DORunnerEnv,
-  ExecutionFenceWiring,
   InitOptions,
   InitResult,
   InitSource,

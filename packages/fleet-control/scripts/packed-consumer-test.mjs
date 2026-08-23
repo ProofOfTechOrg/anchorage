@@ -199,6 +199,7 @@ try {
   type DeploymentEgressPolicy,
   type FleetStateDatabase,
   type InitialExecutionFenceState,
+  type SeedDeploymentIdentityOptions,
   type WorkersForPlatformsApi,
 } from '@proofoftech/fleet-control';
 import type { FleetDispatchEnv } from '@proofoftech/fleet-control/workers/dispatch';
@@ -221,6 +222,12 @@ declare const coordinator: CloudflareApiRateCoordinator;
 // import its type cannot type its own provisioning wrapper.
 declare const initialExecutionFenceState: InitialExecutionFenceState;
 const lockedAtBirth: InitialExecutionFenceState = 'migration-locked';
+// The options object seedDeploymentIdentity takes. A consumer implementing its
+// own ProvisioningBackend has to name this type to declare that method, and it
+// is where future provisioning context lands without another positional.
+const seedOptions: SeedDeploymentIdentityOptions = {
+  initialExecutionFenceState: lockedAtBirth,
+};
 
 void CloudflareProvisioningClient;
 void D1CloudflareApiRateCoordinator;
@@ -247,6 +254,7 @@ void policy;
 void coordinator;
 void initialExecutionFenceState;
 void lockedAtBirth;
+void seedOptions;
 `,
   );
   await writeFile(

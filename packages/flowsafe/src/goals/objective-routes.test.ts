@@ -33,12 +33,24 @@ import {
 
 const OWNED_THREAD = 'acme_t1';
 
+/**
+ * The router under test with the two options every case would otherwise repeat
+ * defaulted. `executionFence: 'none'` is the honest wiring for the in-memory
+ * ObjectiveStore these cases use — there is no database to fence — and the
+ * fence cases below pass a real store, so nothing here weakens their gate.
+ */
 function createObjectiveRouter(
-  options: Omit<ObjectiveRouterOptions, 'validateThreadTarget'> &
-    Partial<Pick<ObjectiveRouterOptions, 'validateThreadTarget'>>,
+  options: Omit<
+    ObjectiveRouterOptions,
+    'validateThreadTarget' | 'executionFence'
+  > &
+    Partial<
+      Pick<ObjectiveRouterOptions, 'validateThreadTarget' | 'executionFence'>
+    >,
 ) {
   return createObjectiveRouterImpl({
     ...options,
+    executionFence: options.executionFence ?? 'none',
     validateThreadTarget:
       options.validateThreadTarget ?? (async () => undefined),
   });
@@ -750,7 +762,7 @@ describe('createObjectiveRouter and the deployment execution fence', () => {
     expect(raw.size).toBe(0);
   });
 
-  it('refuses every objective MUTATION once draining, and writes nothing', async () => {
+  it('refuses every objective-ARMING mutation once draining, and writes nothing', async () => {
     // #given — a standing objective is authored work: it is what the agent loop
     // re-reads to decide it should run again.
     const { store, raw } = memoryStore();
@@ -768,7 +780,6 @@ describe('createObjectiveRouter and the deployment execution fence', () => {
     for (const request of [
       req('PUT', OWNED_THREAD, { objective: 'ship it' }),
       req('PATCH', OWNED_THREAD, { status: 'paused' }),
-      req('DELETE', OWNED_THREAD),
     ]) {
       const res = await router(request);
       expect(res?.status).toBe(503);
@@ -779,7 +790,45 @@ describe('createObjectiveRouter and the deployment execution fence', () => {
     expect(raw.size).toBe(0);
     expect(
       events.filter((event) => event.reason === 'execution-fenced'),
-    ).toHaveLength(3);
+    ).toHaveLength(2);
+  });
+
+  it('keeps CLEAR open in every state, because clearing removes future work', async () => {
+    // #given — an objective already authored, on a deployment locked down for a
+    // migration. `clear` is the exemption schedule pause/delete get: it takes
+    // standing work AWAY, which is the direction a drain is going, and refusing
+    // it would leave an operator unable to quiet an agent they are migrating.
+    const { store, raw } = memoryStore();
+    const events: ObjectiveAuditEvent[] = [];
+    const open = createObjectiveRouter({
+      resolve: async () => actorContext('operator'),
+      store,
+      executionFence: await fenceAt('open'),
+    });
+    expect(
+      (await open(req('PUT', OWNED_THREAD, { objective: 'ship it' })))?.status,
+    ).toBe(200);
+    expect(raw.size).toBe(1);
+
+    // #when — the same store behind a migration-locked fence.
+    const locked = createObjectiveRouter({
+      resolve: async () => actorContext('operator'),
+      store,
+      audit: (event) => {
+        events.push(event);
+      },
+      executionFence: await fenceAt('migration-locked'),
+    });
+    const res = await locked(req('DELETE', OWNED_THREAD));
+
+    // #then — accepted, committed, and audited as a committed mutation rather
+    // than a fenced refusal.
+    expect(res?.status).toBe(200);
+    expect(await res?.json()).toEqual({ ok: true });
+    expect(raw.size).toBe(0);
+    expect(
+      events.filter((event) => event.reason === 'execution-fenced'),
+    ).toHaveLength(0);
   });
 
   it('keeps the objective READ open while locked', async () => {

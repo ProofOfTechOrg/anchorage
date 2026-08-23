@@ -1809,9 +1809,13 @@ describe('createFlowsafeWorker approval decisions under the execution fence', ()
     const store = approvalStoreFactoryFor(env.DB).store();
     const { record } = await store.create(pendingRecord('acme_run-fenced'));
 
-    // #and — the control plane locks the deployment through its own route, so
-    // the store the admin route moves and the store decide() reads are proven
-    // to be the same one.
+    // #and — the control plane locks the deployment through its own route,
+    // rather than by reaching for a store this test built. What that pins is
+    // AGREEMENT over the one D1 binding: the route's write and the read
+    // decide() makes land on the same database, so a worker that fenced its
+    // approval path against some other fence would fail here. It does not pin
+    // store IDENTITY — two stores over one binding would agree too — and the
+    // WeakMap that makes them one instance is pinned separately below.
     env.MAINTENANCE_ADMIN_SECRET = 'maintenance-admin-secret-0000000001';
     const locked = await worker.fetch(
       new Request('http://host/admin/execution-fence', {
@@ -1860,6 +1864,60 @@ describe('createFlowsafeWorker approval decisions under the execution fence', ()
     // updatedAt moved, so no audit trail and no reviewer notification fired
     // either — decide() never reached its transition.
     expect(stored).toEqual(record);
+  });
+
+  it('lets the approval lifecycle observe the NEXT read after each admin move', async () => {
+    // #given — the store-sharing invariant, in the only form that is observable
+    // from outside: the admin route and the approval service must consult one
+    // fence, per request, in both directions. A service that cached its reading
+    // at composition time, or that was handed a different store, passes the
+    // lock-then-refuse case above and fails here — it would keep refusing after
+    // the operator reopened, stranding every decision on the deployment the
+    // migration just finished with.
+    const worker = makeWorker({
+      buildResumeRun: () => async () => successSummary('acme_run-reopened'),
+    });
+    const { env, ctx } = makeEnv();
+    const store = approvalStoreFactoryFor(env.DB).store();
+    const { record } = await store.create(pendingRecord('acme_run-reopened'));
+    env.MAINTENANCE_ADMIN_SECRET = 'maintenance-admin-secret-0000000001';
+    const move = (body: unknown) =>
+      worker.fetch(
+        new Request('http://host/admin/execution-fence', {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${env.MAINTENANCE_ADMIN_SECRET}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify(body),
+        }),
+        env,
+        ctx,
+      );
+    const decide = () =>
+      worker.fetch(
+        authed(`http://host/api/approvals/${record.id}/decide`, {
+          method: 'POST',
+          body: JSON.stringify({ decision: 'approve' }),
+        }),
+        env,
+        ctx,
+      );
+
+    // #when / #then — locked, and the very next decide sees it.
+    expect(
+      (await move({ expected: 'open', next: 'migration-locked' })).status,
+    ).toBe(200);
+    expect((await decide()).status).toBe(503);
+
+    // #when / #then — reopened, and the very next decide sees THAT.
+    expect(
+      (await move({ expected: 'migration-locked', next: 'open' })).status,
+    ).toBe(200);
+    expect((await decide()).status).toBe(200);
+    await expect(store.get(record.id)).resolves.toMatchObject({
+      status: 'approved',
+    });
   });
 
   it('still decides while draining', async () => {

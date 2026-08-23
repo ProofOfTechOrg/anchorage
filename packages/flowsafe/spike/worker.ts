@@ -127,6 +127,7 @@ import {
   doErrorResponse,
   ExecutionFenceStore,
   ensureDeploymentIdentityBindings,
+  executionFenceReadingPayload,
   HubDurableObject,
   type InitResult,
   init,
@@ -220,6 +221,26 @@ interface Env {
    * exercise it.
    */
   STREAM_TICKET_SECRET: string;
+}
+
+/**
+ * ONE execution-fence store per D1 binding, for every surface in this worker.
+ *
+ * The spike composes its routers, ticks, and Durable Objects by hand rather
+ * than through createFlowsafeWorker, so nothing else would keep the admin probe
+ * that MOVES the fence, the schedule ticks that read it before claiming, and
+ * the runtimes that obey it pointed at the same database. Keyed on the binding
+ * for the same reason host-kit's own composer is: the fence belongs to the
+ * database, not to the request that reached it.
+ */
+const spikeExecutionFences = new WeakMap<D1Database, ExecutionFenceStore>();
+
+function executionFenceFor(env: Env): ExecutionFenceStore {
+  const existing = spikeExecutionFences.get(env.DB);
+  if (existing) return existing;
+  const store = new ExecutionFenceStore(env.DB as unknown as never);
+  spikeExecutionFences.set(env.DB, store);
+  return store;
 }
 
 function fetchDeploymentObject(
@@ -1056,6 +1077,7 @@ export class DemoBackgroundTasks {
           mastra,
           pubsub,
           execution: true,
+          executionFence: executionFenceFor(this.#env),
           executors: {
             bgProbe: {
               execute: async (args) => {
@@ -1126,7 +1148,7 @@ export class DemoBackgroundTasks {
         if (!isPathSafeId(body.runId)) {
           return json({ error: 'path-safe parent runId required' }, 404);
         }
-        const queued = await host.manager.enqueue({
+        const queued = await host.enqueue({
           runId: body.runId,
           toolName: 'bgProbe',
           toolCallId: `call-${crypto.randomUUID()}`,
@@ -1140,7 +1162,7 @@ export class DemoBackgroundTasks {
         return json({ taskId: queued.task.id, status: queued.task.status });
       }
       if (request.method === 'GET' && url.pathname.startsWith('/task/')) {
-        const task = await host.manager.getTask(
+        const task = await host.getTask(
           decodeURIComponent(url.pathname.slice('/task/'.length)),
         );
         return task ? json(task) : json({ error: 'not found' }, 404);
@@ -1231,7 +1253,7 @@ export class DemoThread extends ThreadDurableObject<Env> {
         // The composite store hides the binding init would have fenced from,
         // so this thread DO names it: the fence must live in the SAME database
         // as the state it fences.
-        executionFence: new ExecutionFenceStore(env.DB as unknown as never),
+        executionFence: executionFenceFor(env),
       },
     );
     this.#threadInit = threadInit;
@@ -1516,6 +1538,7 @@ export class DemoSignalProviderHost extends SignalProviderHost<Env> {
         env.DEPLOYMENT_IDENTITY_SECRET,
       ),
       providers: spikeProviders(),
+      executionFence: executionFenceFor(env),
     };
   }
 }
@@ -1544,6 +1567,7 @@ function webhookRouter(env: Env): ReturnType<typeof createWebhookRouter> {
       audit: (event) => {
         sigpAudit.push(event);
       },
+      executionFence: executionFenceFor(env),
     });
     webhookRouters.set(env.DB, router);
   }
@@ -1810,7 +1834,7 @@ function buildApprovalService(
     // service — before the CAS — not left to the run DO's own resume gate. A
     // decision that committed against a locked deployment would be durable with
     // nothing behind it. Same database as the runs it gates.
-    executionFence: new ExecutionFenceStore(env.DB as unknown as never),
+    executionFence: executionFenceFor(env),
   });
 }
 
@@ -1937,6 +1961,7 @@ async function handleBackgroundTaskProbe(
       mastra: bgMastra(env),
       pubsub: createHostPubSub(),
       executors: {},
+      executionFence: executionFenceFor(env),
     });
     await host.boot();
     return json({ recovered: true });
@@ -2089,6 +2114,7 @@ async function handleGoalProbe(
       audit: (event) => {
         events.push(event);
       },
+      executionFence: executionFenceFor(env),
       ...(maxRunsCap !== undefined ? { maxRunsCap } : {}),
     });
     const res = await router(
@@ -2220,6 +2246,7 @@ async function handleScheduleProbe(
       store,
       targetPolicy: scheduleTargetPolicy,
       deploymentTag: env.DEPLOYMENT_TENANT,
+      executionFence: executionFenceFor(env),
       start: async ({
         scheduleId,
         dispatchId,
@@ -2311,6 +2338,7 @@ async function handleScheduleProbe(
       store,
       targetPolicy: scheduleTargetPolicy,
       deploymentTag: env.DEPLOYMENT_TENANT,
+      executionFence: executionFenceFor(env),
       // Fire through the DO topology (the production path) — the tick mints the
       // opaque runId and the DO runs sched-echo, echoing its leg context keys.
       start: async ({
@@ -2488,6 +2516,7 @@ async function handleScheduleProbe(
       store,
       targetPolicy: scheduleTargetPolicy,
       deploymentTag: env.DEPLOYMENT_TENANT,
+      executionFence: executionFenceFor(env),
       // Tripwire, the same shape as the scheduleId guards below: this probe
       // creates only an agent-target schedule, so a workflow fire means the
       // entry-level isolation broke. It is a tripwire, not the guarantee — the
@@ -2679,19 +2708,10 @@ async function handleExecutionFenceProbe(
 ): Promise<Response | null> {
   const url = new URL(request.url);
   if (url.pathname !== '/admin/execution-fence') return null;
-  const fence = new ExecutionFenceStore(env.DB as unknown as never);
+  const fence = executionFenceFor(env);
   try {
     if (request.method === 'GET') {
-      const reading = await fence.read();
-      return json({
-        state: reading.state,
-        ...(reading.proofKey === undefined
-          ? {}
-          : { proofKey: reading.proofKey }),
-        ...(reading.proofRunId === undefined
-          ? {}
-          : { proofRunId: reading.proofRunId }),
-      });
+      return json(executionFenceReadingPayload(await fence.read()));
     }
     if (request.method !== 'POST') {
       return json({ error: 'method not allowed' }, 405);
@@ -2704,9 +2724,7 @@ async function handleExecutionFenceProbe(
     const reading = await fence.transition({
       expected: assertExecutionFenceState(body.expected, 'expected'),
       next: assertExecutionFenceState(body.next, 'next'),
-      ...(body.proofKey === undefined
-        ? {}
-        : { proofKey: body.proofKey as string }),
+      ...(body.proofKey === undefined ? {} : { proofKey: body.proofKey }),
     });
     return json({ state: reading.state });
   } catch (error) {

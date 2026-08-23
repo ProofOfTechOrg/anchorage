@@ -45,10 +45,13 @@
 // snapshot before deleting the task row.
 
 import {
+  type BackgroundTask,
   BackgroundTaskManager,
   type BackgroundTaskManagerConfig,
   type EnqueueResult,
   type TaskContext,
+  type TaskFilter,
+  type TaskListResult,
   type TaskPayload,
   type ToolExecutor,
 } from '@mastra/core/background-tasks';
@@ -57,9 +60,9 @@ import type { Mastra } from '@mastra/core/mastra';
 import {
   admitsDrainableExecution,
   ExecutionFencedError,
-  type ExecutionFenceStore,
+  type ExecutionFenceWiring,
   type HostPubSub,
-  OPEN_EXECUTION_FENCE,
+  readExecutionFence,
 } from '../do-runner/index.js';
 import {
   finiteNonnegativeNumber,
@@ -114,22 +117,28 @@ export interface BackgroundTaskHostOptions {
    */
   execution?: boolean;
   /**
-   * The deployment execution fence. Task bodies are an execution family that
-   * runs BELOW RunnerRuntime, so the runtime's start/resume gate does not see
-   * them; this is where they are gated instead.
+   * The deployment execution fence, or `'none'` for a host with no database
+   * behind it. Task bodies are an execution family that runs BELOW
+   * RunnerRuntime, so the runtime's start/resume gate does not see them; this
+   * is where they are gated instead.
    *
    * The gate is at the DISPATCHER, read once per boot pass: behind a closed
    * fence this instance never subscribes and never runs stale-task recovery,
    * so nothing is claimed — queued rows stay pending and stranded rows stay
    * stranded (#ensureDispatching explains why anything later than that is too
    * late). The executor wrapper remains as a fail-closed backstop for the
-   * in-flight race, and parks rather than fails. Absent ⇒ unfenced.
+   * in-flight race, and parks rather than fails.
+   *
+   * REQUIRED: this is the ONLY gate task bodies pass, so an unfenced host runs
+   * them straight through a migration lock — and it looks wired, because every
+   * other surface of the same deployment reports the fence. See
+   * ExecutionFenceWiring.
    *
    * `draining` still dispatches and still accepts enqueues: that queue is the
    * work a drain exists to finish, and refusing an enqueue would fail the very
    * runs that are draining.
    */
-  executionFence?: ExecutionFenceStore;
+  executionFence: ExecutionFenceWiring;
 }
 
 function validateManagerConfig(
@@ -222,25 +231,138 @@ function validateManagerConfig(
 const EXECUTION_FENCE_SUSPEND_KEY = 'flowsafe.executionFenced';
 
 /**
+ * Was this row parked by the backstop, rather than suspended by its own tool?
+ * The distinction is the whole safety of the sweep: a task awaiting a webhook
+ * is suspended on purpose and must stay that way.
+ */
+function isFenceParked(task: BackgroundTask): boolean {
+  const payload = task.suspendPayload;
+  return (
+    typeof payload === 'object' &&
+    payload !== null &&
+    EXECUTION_FENCE_SUSPEND_KEY in payload
+  );
+}
+
+/**
+ * How many fence-parked tasks ONE BOOT re-drives.
+ *
+ * Sized as a boot-path budget rather than a queue-drain rate: each resume is a
+ * publish onto the topic the manager just subscribed to, and the boot this
+ * blocks is what every request on the deployment is waiting behind. The
+ * remainder is not dropped — it stays `suspended`, marked, and inspectable
+ * through the read routes — and the ALARM lane below is what drains it, so a
+ * deployment reopening with a large parked queue starts moving on its first
+ * request without that request paying for the whole queue.
+ *
+ * Exported for the test that pins the boot/alarm budget boundary, and kept off
+ * `./index.js` — the only export map entry this directory has — so it stays
+ * package-internal rather than becoming a number a consumer can depend on.
+ */
+export const MAX_FENCE_RESUMES_PER_PASS = 25;
+
+/**
+ * How many one ALARM re-drives — the lane convergence actually rides on.
+ *
+ * Ten boot-budgets, because an alarm is a background duty and nothing is
+ * waiting behind it, unlike a boot. This is what makes the sweep terminate
+ * rather than merely make progress: the alarm recurs (the host arms it for
+ * `cleanup()` already), each wake drains up to this many, and the invocation
+ * itself keeps scanning until a scan finds nothing left to resume.
+ */
+const MAX_FENCE_RESUMES_PER_ALARM = 250;
+
+/**
+ * The hard bound on how many LIST queries one sweep invocation may issue.
+ *
+ * The sweep pages, and paging is what keeps an old parked cohort reachable
+ * once newer tool-suspends sit ahead of it in the scan order. Bounding the
+ * scans rather than only the resumes is what keeps a pathological mix — many
+ * thousands of tool-suspended rows and one stale parked cohort behind them —
+ * from turning a single wake into an unbounded read loop. A sweep that hits
+ * this bound has made progress or proved there was none; the next wake
+ * continues from the top.
+ */
+const MAX_FENCE_RESUME_SCANS = 20;
+
+/**
+ * How many `suspended` rows one pass READS to find that many.
+ *
+ * Larger than the resume budget on purpose. The fence marker lives in the
+ * suspend PAYLOAD, which no filter can express, so the pass has to read rows
+ * and sort them itself — and a page sized exactly to the resume budget would
+ * let a handful of tool-suspended tasks (awaiting a webhook, say) crowd the
+ * parked ones out of every pass and stall recovery indefinitely. Reading wider
+ * than it acts costs one query and buys headroom for that mix, while still
+ * bounding what a boot pulls out of D1.
+ */
+const FENCE_RESUME_SCAN_PAGE = 100;
+
+/**
+ * Raw-manager access for THIS PACKAGE'S TESTS, and nothing else.
+ *
+ * A symbol rather than a name, and deliberately absent from `./index.js`, so it
+ * is unreachable through the published `@proofoftech/flowsafe/background-tasks`
+ * subpath — the only export map entry this directory has. It exists because the
+ * host's lifecycle contract IS its interleaving with core's manager (init
+ * before shutdown before stopWorkers, the enqueue guard flipping before the
+ * first await), and there is no way to observe that ordering from outside
+ * without a handle on the manager those calls land on.
+ *
+ * Production code must not use it: everything a host legitimately does goes
+ * through `enqueue` (fence-gated) or the three reads below.
+ */
+export const BACKGROUND_TASK_MANAGER_TEST_ACCESS: unique symbol = Symbol(
+  'flowsafe.backgroundTaskManager.testAccess',
+);
+
+/**
  * A BackgroundTaskManager bound to a hosting DO's Mastra + pubsub, with the
  * boot/alarm lifecycle that makes DO eviction survivable. The hosting DO owns
  * alarm arming (it needs `ctx.storage.setAlarm`); this class owns the manager
- * wiring, the recovery-firing `boot()`, and the alarm `cleanup()` duty. The raw
- * manager is reachable as `.manager` for the read-only routes to wrap — never
- * expose it directly over HTTP.
+ * wiring, the recovery-firing `boot()`, and the alarm `cleanup()` duty.
+ *
+ * The manager itself is PRIVATE. It carries `enqueue`, `registerTaskContext`,
+ * `registerStaticExecutor`, `resume`, and `restart` — every one of which puts a
+ * task body on this deployment WITHOUT passing the fence, because the gate that
+ * stops a locked deployment executing is the `#gated` wrapper this host puts
+ * around an executor on the way in. A caller holding the manager could enqueue
+ * an unwrapped executor and defeat both. What this class forwards instead is
+ * the fence-gated `enqueue` and the three READS the host route adapter serves.
  */
 export class BackgroundTaskHost {
-  readonly manager: BackgroundTaskManager;
+  readonly #manager: BackgroundTaskManager;
+  /** @see BACKGROUND_TASK_MANAGER_TEST_ACCESS — tests only. */
+  readonly [BACKGROUND_TASK_MANAGER_TEST_ACCESS]: BackgroundTaskManager;
   readonly #mastra: Mastra;
   readonly #pubsub: HostPubSub;
   readonly #executors: Record<string, ToolExecutor>;
   readonly #execution: boolean;
-  readonly #executionFence?: ExecutionFenceStore;
+  readonly #executionFence: ExecutionFenceWiring;
   #booted?: Promise<void>;
-  #bootSettled = false;
   /** Phase B (workers + init), memoized only once it has actually run. */
   #dispatching?: Promise<void>;
-  #dispatchSettled = false;
+  /**
+   * The in-flight phase-B ATTEMPT, including the fence read that precedes
+   * admission — recorded synchronously by #ensureDispatching and cleared when
+   * it settles. `#dispatching` cannot serve this purpose: it is unset for the
+   * whole duration of the fence read, which is exactly the window two
+   * concurrent boots interleave in.
+   */
+  #dispatchAttempt?: Promise<void>;
+  /**
+   * The whole in-flight `boot()` — registration, the fence read, and phase B if
+   * the fence admitted it — recorded SYNCHRONOUSLY by `boot()`.
+   *
+   * Distinct from `#dispatching`, which is the memo of an ADMITTED phase and so
+   * is still unset while the fence read is in flight. Teardown waits on THIS:
+   * `shutdown()` called on a boot that has not reached admission yet would
+   * otherwise find nothing to wait for, return having stopped nothing, and
+   * leave behind the workers and the subscribed manager that boot went on to
+   * start.
+   */
+  #bootAttempt?: Promise<void>;
+  #bootAttemptSettled = false;
   #managerNeedsShutdown = false;
   #workersNeedStop = false;
   #shutdownRequested = false;
@@ -253,13 +375,14 @@ export class BackgroundTaskHost {
     this.#executors = options.executors;
     this.#execution = options.execution ?? false;
     this.#executionFence = options.executionFence;
-    this.manager = new BackgroundTaskManager({
+    this.#manager = new BackgroundTaskManager({
       enabled: true,
       ...options.manager,
     });
+    this[BACKGROUND_TASK_MANAGER_TEST_ACCESS] = this.#manager;
     // Must precede init(): the manager reads its Mastra for storage, the
     // internal background-task workflow registration, and id generation.
-    this.manager.__registerMastra(options.mastra);
+    this.#manager.__registerMastra(options.mastra);
   }
 
   /**
@@ -284,13 +407,18 @@ export class BackgroundTaskHost {
         new Error('background-tasks: host is shutting down'),
       );
     }
-    if (!this.#booted) {
-      this.#booted = this.#doRegister().finally(() => {
-        this.#bootSettled = true;
-      });
-    }
+    this.#booted ??= this.#doRegister();
     const registered = this.#booted;
-    return registered.then(() => this.#ensureDispatching());
+    // Recorded before this method returns, so a `shutdown()` on the very next
+    // statement already has the whole attempt to wait on.
+    this.#bootAttemptSettled = false;
+    const attempt = registered
+      .then(() => this.#ensureDispatching())
+      .finally(() => {
+        this.#bootAttemptSettled = true;
+      });
+    this.#bootAttempt = attempt;
+    return attempt;
   }
 
   async #doRegister(): Promise<void> {
@@ -324,7 +452,7 @@ export class BackgroundTaskHost {
       await this.#warnIfBodiesCannotExecute();
     }
     for (const [toolName, executor] of Object.entries(this.#executors)) {
-      this.manager.registerStaticExecutor(toolName, this.#gated(executor));
+      this.#manager.registerStaticExecutor(toolName, this.#gated(executor));
     }
   }
 
@@ -349,11 +477,38 @@ export class BackgroundTaskHost {
    * `draining` still dispatches: the queue is exactly the work a drain exists
    * to finish.
    */
-  async #ensureDispatching(): Promise<void> {
+  #ensureDispatching(): Promise<void> {
     if (this.#dispatching) return this.#dispatching;
-    const fence = this.#executionFence
-      ? await this.#executionFence.read()
-      : OPEN_EXECUTION_FENCE;
+    // DELIBERATELY NOT `async`, and the memo below is assigned before this
+    // method's first await can exist.
+    //
+    // `#dispatching` alone cannot collapse concurrent callers, because it is
+    // set only once the fence read RESUMES: two boots that both reach the
+    // guard above before either read completes would both go on to assign it,
+    // and both would run #startDispatching — `startWorkers()` twice and
+    // `manager.init(pubsub)` twice, which subscribes handleDispatch TWICE, so
+    // every dispatch is handled twice: double claim, double body execution.
+    // `#managerNeedsShutdown`/`#workersNeedStop` are booleans, so teardown
+    // would then stop one of the two. That is not hypothetical here: the
+    // request path and `onAlarm()` call `boot()` independently (a host's own
+    // memo collapses only the request path), so the two genuinely interleave.
+    //
+    // Recorded SYNCHRONOUSLY instead — the same shape `boot()` uses for
+    // `#bootAttempt`, for the same reason — and cleared when it settles, so a
+    // refusal still retries on the next boot.
+    const inFlight = this.#dispatchAttempt;
+    if (inFlight) return inFlight;
+    const attempt: Promise<void> = this.#attemptDispatching().finally(() => {
+      // Identity-checked before clearing, the idiom `shutdown()` uses below: a
+      // later attempt must never be cleared by an earlier one's settlement.
+      if (this.#dispatchAttempt === attempt) this.#dispatchAttempt = undefined;
+    });
+    this.#dispatchAttempt = attempt;
+    return attempt;
+  }
+
+  async #attemptDispatching(): Promise<void> {
+    const fence = await readExecutionFence(this.#executionFence);
     if (!admitsDrainableExecution(fence)) {
       console.warn(
         JSON.stringify({
@@ -365,17 +520,12 @@ export class BackgroundTaskHost {
       );
       return;
     }
-    this.#dispatchSettled = false;
-    this.#dispatching = this.#startDispatching()
-      .catch((error: unknown) => {
-        // Not memoized on failure, for the same reason a refusal is not: the
-        // next boot must be able to try again.
-        this.#dispatching = undefined;
-        throw error;
-      })
-      .finally(() => {
-        this.#dispatchSettled = true;
-      });
+    this.#dispatching ??= this.#startDispatching().catch((error: unknown) => {
+      // Not memoized on failure, for the same reason a refusal is not: the
+      // next boot must be able to try again.
+      this.#dispatching = undefined;
+      throw error;
+    });
     return this.#dispatching;
   }
 
@@ -386,12 +536,12 @@ export class BackgroundTaskHost {
         await this.#mastra.startWorkers();
       }
       this.#managerNeedsShutdown = true;
-      await this.manager.init(this.#pubsub);
+      await this.#manager.init(this.#pubsub);
     } catch (primary) {
       const cleanupErrors: unknown[] = [];
       if (this.#managerNeedsShutdown) {
         try {
-          await this.manager.shutdown();
+          await this.#manager.shutdown();
           this.#managerNeedsShutdown = false;
         } catch (error) {
           cleanupErrors.push(error);
@@ -413,7 +563,10 @@ export class BackgroundTaskHost {
       );
     }
     // AFTER init, because resume() publishes onto the topic init subscribes.
-    await this.#resumeFenceSuspendedTasks();
+    // The BOOT budget: enough to start moving, small enough that the request
+    // that triggered this boot does not wait for the whole parked queue.
+    // onAlarm() is where the rest drains.
+    await this.#resumeFenceSuspendedTasks(MAX_FENCE_RESUMES_PER_PASS);
   }
 
   /**
@@ -424,32 +577,99 @@ export class BackgroundTaskHost {
    * from destruction would be saved into a state nothing ever leaves. Scoped by
    * the backstop's own marker: a task suspended by its TOOL (awaiting a
    * webhook, say) is a different thing entirely and must stay suspended.
+   *
+   * BUDGETED, not one-shot. It runs on two lanes with two budgets: `boot()`
+   * spends MAX_FENCE_RESUMES_PER_PASS so the first request after a reopen is
+   * not stalled behind the whole parked queue, and `onAlarm()` spends
+   * MAX_FENCE_RESUMES_PER_ALARM on a lane nothing is waiting behind. The alarm
+   * lane is what makes this CONVERGE: one invocation keeps scanning until a
+   * scan resumes nothing, and the alarm recurs, so a queue larger than one
+   * alarm's budget still drains over the next few wakes with no eviction and no
+   * operator action. (An earlier shape swept only from #startDispatching, which
+   * runs once — every later boot returned the settled memo and never swept
+   * again, so anything past the first cap stayed parked indefinitely.)
+   *
+   * PAGES, because the scan order alone cannot reach a stale cohort. Newest
+   * suspensions first is right for the common case — the parked cohort is the
+   * one that just parked — but leftovers from an earlier lock carry an OLD
+   * `suspendedAt`, so after a lock/reopen/lock cycle plus a page-worth of newer
+   * tool-suspends, page 0 would never contain them again. So: a page that
+   * resumed nothing and came back FULL means the markers are deeper, and the
+   * sweep advances; a page that resumed something restarts at the top, because
+   * resuming removes rows from the set being paged and any fixed offset would
+   * then skip rows. `#resumedIds` makes that restart cheap and terminating —
+   * each pass strictly grows it.
+   *
+   * `perPage`/`orderBy` are ADAPTER-DEPENDENT: honoured by
+   * @mastra/cloudflare-d1's SQL builder and by this package's D1 domain, but an
+   * adapter that ignores them returns the whole list — which is why the loop
+   * counts its own resumes rather than trusting the page size to bound them.
+   *
+   * Answers how many it resumed, so the caller can log a lane that is making
+   * progress distinctly from one that has drained.
    */
-  async #resumeFenceSuspendedTasks(): Promise<void> {
-    try {
-      const { tasks } = await this.manager.listTasks({ status: 'suspended' });
-      for (const task of tasks) {
-        const payload = task.suspendPayload;
-        if (
-          typeof payload !== 'object' ||
-          payload === null ||
-          !(EXECUTION_FENCE_SUSPEND_KEY in payload)
-        ) {
-          continue;
-        }
-        await this.manager.resume(task.id);
+  async #resumeFenceSuspendedTasks(budget: number): Promise<number> {
+    // Resuming is asynchronous at the storage layer (resume() publishes; the
+    // handler is what writes 'running'), so a row can still read `suspended` on
+    // the next scan. Without this the sweep could re-resume the same rows —
+    // wasted publishes at best, and core throws outright once the row HAS
+    // moved, which would abort the whole invocation.
+    const resumedIds = new Set<string>();
+    let page = 0;
+    for (let scan = 0; scan < MAX_FENCE_RESUME_SCANS; scan += 1) {
+      let tasks: readonly BackgroundTask[];
+      try {
+        ({ tasks } = await this.#manager.listTasks({
+          status: 'suspended',
+          orderBy: 'suspendedAt',
+          orderDirection: 'desc',
+          page,
+          perPage: FENCE_RESUME_SCAN_PAGE,
+        }));
+      } catch (error) {
+        this.#logFenceResumeFailure(error);
+        return resumedIds.size;
       }
-    } catch (error) {
-      // Best effort: a failure here leaves the rows suspended and inspectable,
-      // which is where they already were. Never fails the boot that was about
-      // to start serving.
-      console.error(
-        JSON.stringify({
-          type: 'background-tasks.fence-resume-error',
-          reason: error instanceof Error ? error.message : String(error),
-        }),
-      );
+      let resumedThisScan = 0;
+      for (const task of tasks) {
+        if (resumedIds.size >= budget) return resumedIds.size;
+        if (resumedIds.has(task.id) || !isFenceParked(task)) continue;
+        try {
+          await this.#manager.resume(task.id);
+        } catch (error) {
+          // Expected at capacity: core refuses a resume that would exceed the
+          // concurrency limit. Stopping is the honest response — the rows stay
+          // parked and the next wake retries once slots free — and it keeps a
+          // saturated deployment from burning the scan budget on refusals.
+          this.#logFenceResumeFailure(error);
+          return resumedIds.size;
+        }
+        resumedIds.add(task.id);
+        resumedThisScan += 1;
+      }
+      if (resumedThisScan > 0) {
+        page = 0;
+        continue;
+      }
+      // Nothing here to resume. A SHORT page is the end of the set, so there is
+      // nothing deeper and this sweep has drained. A full one means the markers
+      // may simply be further down.
+      if (tasks.length < FENCE_RESUME_SCAN_PAGE) return resumedIds.size;
+      page += 1;
     }
+    return resumedIds.size;
+  }
+
+  #logFenceResumeFailure(error: unknown): void {
+    // Best effort: a failure here leaves the rows suspended and inspectable,
+    // which is where they already were. Never fails the boot that was about to
+    // start serving, nor the alarm duty that follows.
+    console.error(
+      JSON.stringify({
+        type: 'background-tasks.fence-resume-error',
+        reason: error instanceof Error ? error.message : String(error),
+      }),
+    );
   }
 
   /**
@@ -473,9 +693,7 @@ export class BackgroundTaskHost {
   #gated(executor: ToolExecutor): ToolExecutor {
     return {
       execute: async (args, executeOptions) => {
-        const fence = this.#executionFence
-          ? await this.#executionFence.read()
-          : OPEN_EXECUTION_FENCE;
+        const fence = await readExecutionFence(this.#executionFence);
         if (!admitsDrainableExecution(fence)) {
           const suspend = executeOptions?.suspend;
           if (!suspend) {
@@ -507,18 +725,39 @@ export class BackgroundTaskHost {
     payload: TaskPayload,
     context?: TaskContext,
   ): Promise<EnqueueResult> {
-    const fence = this.#executionFence
-      ? await this.#executionFence.read()
-      : OPEN_EXECUTION_FENCE;
+    const fence = await readExecutionFence(this.#executionFence);
     if (!admitsDrainableExecution(fence)) {
       throw new ExecutionFencedError(fence.state, 'background task enqueue');
     }
-    return this.manager.enqueue(
+    return this.#manager.enqueue(
       payload,
       context
         ? { ...context, executor: this.#gated(context.executor) }
         : undefined,
     );
+  }
+
+  // The read surface, and only the read surface. These three are what
+  // `createBackgroundTaskRoutes` serves and what a host inspecting its own
+  // queue needs; they claim nothing, so they stay open in every fence state
+  // (the semantics matrix keeps reads answering through a lock — an operator
+  // proving a deployment is drained has to be able to look).
+
+  /** One task by id, or null. */
+  getTask(taskId: string): Promise<BackgroundTask | null> {
+    return this.#manager.getTask(taskId);
+  }
+
+  /** Tasks matching a filter. The route adapter re-checks scope per row. */
+  listTasks(filter?: TaskFilter): Promise<TaskListResult> {
+    return this.#manager.listTasks(filter);
+  }
+
+  /** Lifecycle-event stream, for the route adapter's SSE response. */
+  stream(
+    options?: Parameters<BackgroundTaskManager['stream']>[0],
+  ): ReadableStream<Record<string, unknown>> {
+    return this.#manager.stream(options);
   }
 
   async #warnIfBodiesCannotExecute(): Promise<void> {
@@ -544,7 +783,18 @@ export class BackgroundTaskHost {
    */
   async onAlarm(): Promise<void> {
     await this.boot();
-    await this.manager.cleanup();
+    // The convergence lane. boot() has resolved, so a set `#dispatching` means
+    // init actually landed and resume() has a subscriber to publish to. Nothing
+    // is waiting behind an alarm, so this lane carries the larger budget and is
+    // what drains a parked queue the boot budget only dented — including on the
+    // very wake that admitted dispatching, since the alarm recurs regardless.
+    //
+    // Convergence therefore rides the same alarm the host already arms for the
+    // cleanup below; a host that arms none gets neither duty.
+    if (this.#dispatching) {
+      await this.#resumeFenceSuspendedTasks(MAX_FENCE_RESUMES_PER_ALARM);
+    }
+    await this.#manager.cleanup();
   }
 
   /**
@@ -553,30 +803,29 @@ export class BackgroundTaskHost {
    * teardown is still attempted if manager teardown fails.
    */
   async #doShutdown(): Promise<void> {
-    if (this.#booted && !this.#bootSettled) {
+    // ONE wait, on the whole boot attempt: registration, the fence read, and
+    // phase B all hang off it, so nothing a racing boot is about to start can
+    // slip past this point and outlive the shutdown. Waiting on `#dispatching`
+    // instead would miss exactly the window the fence read opens — it is unset
+    // until admission, so a shutdown that arrived during the read would stop
+    // nothing and return.
+    //
+    // Awaited ONLY while still in flight: manager.shutdown() below flips its
+    // enqueue guard before its first await, and that guarantee survives only if
+    // nothing suspends this function before it is invoked.
+    if (this.#bootAttempt && !this.#bootAttemptSettled) {
       try {
-        await this.#booted;
+        await this.#bootAttempt;
       } catch {
-        // #doRegister only validates and registers; nothing to unwind.
-      }
-    }
-    // Awaited ONLY while still in flight — the same shape, and the same
-    // reason, as the registration guard above: manager.shutdown() flips its
-    // enqueue guard before its first await, and that guarantee survives only
-    // if nothing suspends this function before it is invoked.
-    if (this.#dispatching && !this.#dispatchSettled) {
-      try {
-        await this.#dispatching;
-      } catch {
-        // #startDispatching already unwound every component it managed to
-        // stop. Any component whose cleanup failed remains flagged for the
-        // retry below.
+        // #doRegister only validates and registers, and #startDispatching
+        // already unwound every component it managed to stop. Any component
+        // whose cleanup failed remains flagged for the retry below.
       }
     }
     const errors: unknown[] = [];
     if (this.#managerNeedsShutdown) {
       try {
-        await this.manager.shutdown();
+        await this.#manager.shutdown();
         this.#managerNeedsShutdown = false;
       } catch (error) {
         errors.push(error);

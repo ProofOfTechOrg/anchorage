@@ -12,7 +12,12 @@ import {
   humanPrincipal,
   InMemoryApprovalStoreFactory,
 } from '../approval-api/index.js';
-import { RunRouteError } from '../host-kit/index.js';
+import {
+  doErrorResponse,
+  type ExecutionFenceDatabase,
+  ExecutionFenceStore,
+} from '../do-runner/index.js';
+import { doSummary, RunRouteError } from '../host-kit/index.js';
 import { createAgentRouter } from './router.js';
 import type { AgentThreadTopology } from './thread-topology.js';
 import type { AgentRunEnvelope } from './types.js';
@@ -534,6 +539,59 @@ describe('createAgentRouter', () => {
         "deployment execution is fenced ('migration-locked'): run start is refused",
       reason: { code: 'EXECUTION_FENCED', state: 'migration-locked' },
     });
+  });
+
+  it('passes an UNREADABLE fence through without the storage error behind it', async () => {
+    // #given — the whole real chain, not a hand-built error: a fence store over
+    // a database that faults with a message an operator would not want on the
+    // wire, the refusal that store raises, the DO's own error mapping, and the
+    // reader the topology uses to turn a DO response back into a RunRouteError.
+    const secret = 'D1_ERROR: connect ECONNREFUSED 10.0.7.4:5432 db=acme-prod';
+    const fence = new ExecutionFenceStore({
+      prepare: () => ({
+        bind: () => ({
+          run: () => Promise.reject(new Error(secret)),
+          all: () => Promise.reject(new Error(secret)),
+        }),
+        run: () => Promise.reject(new Error(secret)),
+        all: () => Promise.reject(new Error(secret)),
+      }),
+    } as unknown as ExecutionFenceDatabase);
+    const refusal = await fence.read().catch((error: unknown) => error);
+    const routeError = await doSummary(doErrorResponse(refusal)).catch(
+      (error: unknown) => error,
+    );
+    const host = topology();
+    host.start.mockRejectedValueOnce(routeError);
+    const router = createAgentRouter({
+      agents,
+      resolve: async () => context(),
+      topology: host,
+    });
+
+    // #when
+    const response = await router(
+      new Request('https://host/agents/writer/runs', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ prompt: 'go' }),
+      }),
+    );
+
+    // #then — retryable and machine-readable, and the body is EXACTLY the two
+    // fields the taxonomy defines. The message-leak hazard is the passthrough
+    // itself: it forwards the DO's message verbatim at 5xx, so a refusal whose
+    // message carried the storage fault would put it in front of every agent
+    // caller.
+    expect(response?.status).toBe(503);
+    const body = await response?.text();
+    expect(JSON.parse(body ?? '')).toEqual({
+      error: 'execution fence state is not readable',
+      reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
+    });
+    expect(body).not.toContain('ECONNREFUSED');
+    expect(body).not.toContain('acme-prod');
+    expect(body).not.toContain('10.0.7.4');
   });
 
   it('still collapses a 5xx with NO structured reason into a generic 500', async () => {

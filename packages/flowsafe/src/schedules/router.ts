@@ -66,10 +66,10 @@ import {
 } from '../approval-api/index.js';
 import {
   admitsWorkAuthoring,
-  type ExecutionFenceStore,
+  type ExecutionFenceWiring,
   executionFencedResponse,
   isExecutionFenceRefusal,
-  OPEN_EXECUTION_FENCE,
+  readExecutionFence,
 } from '../do-runner/index.js';
 import {
   type BoundThreadTargetValidator,
@@ -176,17 +176,19 @@ export interface ScheduleRouterOptions {
    */
   maxContentBytes?: number;
   /**
-   * The deployment execution fence. Absent ⇒ this router is unfenced.
+   * The deployment execution fence, or `'none'` for a router with no database
+   * behind it. REQUIRED: a router receives a store facade and a resolver, not a
+   * database, so it cannot build one for itself the way `init({ DB })` can —
+   * which leaves the host as the only place the wiring can happen, and an
+   * option a host may omit is one a host will omit. See ExecutionFenceWiring
+   * for the split-brain this closes (an unfenced surface next to a fenced
+   * runtime consumes work it then cannot run).
    *
-   * Optional here and REQUIRED at `init()` on purpose: the runtime is the
-   * closure guarantee (every mint funnels through it, and the schedule TICK
-   * reads the fence before it claims a fire), so this gate is the same refusal
-   * made earlier — an operator draining a deployment sees a schedule create
-   * refused at the API instead of accepted and then never fired. A router
-   * receives a store facade and a resolver, not a database, so it cannot build
-   * one for itself the way init can.
+   * The gate itself is the runtime's refusal made earlier: an operator draining
+   * a deployment sees a schedule create refused at the API instead of accepted
+   * and then never fired.
    */
-  executionFence?: ExecutionFenceStore;
+  executionFence: ExecutionFenceWiring;
   /** Route prefix. Default '/api/schedules'. */
   basePath?: string;
 }
@@ -814,9 +816,7 @@ export function createScheduleRouter(
       // remove work, which is the direction a drain is going, and reads stay
       // open in every state.
       if (FENCE_GATED_SCHEDULE_OPERATIONS.has(operation)) {
-        const reading = executionFence
-          ? await executionFence.read()
-          : OPEN_EXECUTION_FENCE;
+        const reading = await readExecutionFence(executionFence);
         if (!admitsWorkAuthoring(reading)) {
           await audit('rejected', 'execution-fenced');
           return executionFencedResponse(

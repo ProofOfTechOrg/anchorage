@@ -42,6 +42,7 @@ import type {
   MaintenanceHealth,
   ProvisioningBackend,
   ProvisioningBackendKind,
+  SeedDeploymentIdentityOptions,
 } from '../src/types.js';
 import { externalReleaseScriptName } from '../src/workers-for-platforms-backend.js';
 
@@ -279,16 +280,16 @@ class FakeBackend implements ProvisioningBackend {
   }
 
   // The fence state is DECLARED here, not dropped: a fake that omits the
-  // parameter still satisfies the interface (TypeScript accepts a
+  // options argument still satisfies the interface (TypeScript accepts a
   // fewer-argument function in a more-argument slot), so a silently unthreaded
   // fence state would leave every one of these tests green.
   async seedDeploymentIdentity(
     _database: DatabaseReference,
     tenantTag: string,
     _fence: ExternalMutationFence,
-    initialExecutionFenceState: InitialExecutionFenceState,
+    options: SeedDeploymentIdentityOptions,
   ): Promise<void> {
-    this.seededFenceStates.push(initialExecutionFenceState);
+    this.seededFenceStates.push(options.initialExecutionFenceState);
     this.#event('identity');
     this.databaseOwner = tenantTag;
   }
@@ -827,6 +828,34 @@ describe('fleet provisioning', () => {
 
     expect(result.record.phase).toBe('ready');
     expect(backend.seededFenceStates).toEqual(['migration-locked']);
+  });
+
+  it('rejects an illegal birth fence state before creating ANY resource', async () => {
+    // #given — the protocol validates this too, but only when the seeding
+    // statements are built, which is after `database-created`. Refusing at the
+    // entry is what keeps a typo from costing a Worker and a D1 database first
+    // and leaving a half-provisioned deployment behind. 'draining' and
+    // 'proof-only' are real fence states but not coherent BIRTH states: they
+    // are transitions out of something that already exists.
+    for (const illegal of ['draining', 'proof-only', 'open ', '', undefined]) {
+      const backend = new FakeBackend();
+      const store = new MemoryStore();
+      await expect(
+        provisionDeployment({
+          initialExecutionFenceState:
+            illegal as unknown as InitialExecutionFenceState,
+          backend,
+          store,
+          spec: spec(),
+          secrets,
+          clock: () => 1_000,
+        }),
+      ).rejects.toThrow(/initialExecutionFenceState must be one of/);
+      // #then — no lease taken, no provider call made, nothing persisted.
+      expect(store.leaseCalls).toBe(0);
+      expect(backend.events).toEqual([]);
+      expect(store.record).toBeUndefined();
+    }
   });
 
   it('carries the requested fence state on a failed provisioning pass', async () => {

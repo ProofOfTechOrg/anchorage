@@ -76,10 +76,10 @@ import {
 } from '../approval-api/index.js';
 import {
   admitsWorkAuthoring,
-  type ExecutionFenceStore,
+  type ExecutionFenceWiring,
   executionFencedResponse,
   isExecutionFenceRefusal,
-  OPEN_EXECUTION_FENCE,
+  readExecutionFence,
 } from '../do-runner/index.js';
 import {
   assertNoClientMemoryIds,
@@ -188,14 +188,15 @@ export interface ObjectiveRouterOptions {
    */
   maxContentBytes?: number;
   /**
-   * The deployment execution fence. A standing objective is authored work — it
-   * is what the agent loop re-reads to decide it should run again — so SET,
-   * UPDATE, and CLEAR are refused past `open` while GET stays available in
-   * every state. Absent ⇒ this router is unfenced; see
-   * ScheduleRouterOptions.executionFence for why a router's is optional while
-   * init()'s is required.
+   * The deployment execution fence, or `'none'` for a router with no database
+   * behind it. A standing objective is authored work — it is what the agent
+   * loop re-reads to decide it should run again — so SET, UPDATE, and CLEAR are
+   * refused past `open` while GET stays available in every state.
+   *
+   * REQUIRED: this router receives a store facade, not a database, so the host
+   * is the only place the wiring can happen. See ExecutionFenceWiring.
    */
-  executionFence?: ExecutionFenceStore;
+  executionFence: ExecutionFenceWiring;
   /** Route prefix. Default '/api/threads' (goals mount at `/:threadId/goal`). */
   basePath?: string;
 }
@@ -495,11 +496,12 @@ export function createObjectiveRouter(
       }
 
       // 3b. The execution fence, after the role gate so a refusal is auditable
-      // and tells an unauthorized caller nothing. Reads pass in every state.
-      if (isMutation) {
-        const reading = executionFence
-          ? await executionFence.read()
-          : OPEN_EXECUTION_FENCE;
+      // and tells an unauthorized caller nothing. Reads pass in every state,
+      // and so does `clear`: it REMOVES a standing instruction rather than
+      // arming one, which is the direction a drain is going — the same reason
+      // schedule pause/delete are exempt (FENCE_GATED_SCHEDULE_OPERATIONS).
+      if (isMutation && operation !== 'clear') {
+        const reading = await readExecutionFence(executionFence);
         if (!admitsWorkAuthoring(reading)) {
           await audit('rejected', 'execution-fenced');
           return executionFencedResponse(

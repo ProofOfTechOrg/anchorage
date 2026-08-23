@@ -92,7 +92,20 @@ function assertValidTag(tag: unknown, caller: string): asserts tag is string {
   assertValidDeploymentTag(tag, caller);
 }
 
-function isDatabaseBinding(db: unknown): db is DeploymentIdentityDatabase {
+/**
+ * Whether a binding is a D1 database rather than something else bound under the
+ * same name.
+ *
+ * Exported for this package's own modules and deliberately NOT re-exported from
+ * `./index.js` — the same posture `safeDecodeSegment` has. It is internal
+ * plumbing two files must agree on (durable-object.ts asks the same question of
+ * `env.DB` before it insists on a fence), not a contract a consumer should be
+ * able to pin; barrel-exporting it would inflate the semver surface of a
+ * predicate that exists to describe Cloudflare's binding shapes.
+ */
+export function isDatabaseBinding(
+  db: unknown,
+): db is DeploymentIdentityDatabase {
   if ((typeof db !== 'object' && typeof db !== 'function') || db === null) {
     return false;
   }

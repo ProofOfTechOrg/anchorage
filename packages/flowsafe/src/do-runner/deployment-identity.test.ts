@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it } from 'vitest';
 
-import { DEPLOYMENT_SENTINEL_DDL } from '#deployment-identity-protocol';
+import {
+  DEPLOYMENT_SENTINEL_DDL,
+  EXECUTION_FENCE_ROW_ID,
+  EXECUTION_FENCE_TABLE,
+} from '#deployment-identity-protocol';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   assertDeploymentIdentity,
@@ -168,7 +172,7 @@ describe('deployment identity provisioning', () => {
             // fence table inside its exclusion list, so a substring test would
             // count it twice.
             if (
-              query.startsWith('INSERT OR IGNORE INTO flowsafe_execution_fence')
+              query.startsWith(`INSERT OR IGNORE INTO ${EXECUTION_FENCE_TABLE}`)
             ) {
               fenceBindings.push(values);
             } else if (
@@ -202,24 +206,24 @@ describe('deployment identity provisioning', () => {
     // The fence row rides the same bound-parameter boundary — the caller's
     // chosen state reaches D1 as a binding, never interpolated into SQL.
     const fenceInsert = preparedQueries.find((query) =>
-      query.startsWith('INSERT OR IGNORE INTO flowsafe_execution_fence'),
+      query.startsWith(`INSERT OR IGNORE INTO ${EXECUTION_FENCE_TABLE}`),
     );
     expect(fenceInsert).toContain('VALUES (?, ?, NULL, NULL, ?)');
     expect(fenceInsert).not.toContain("'migration-locked'");
     expect(fenceBindings).toHaveLength(1);
-    expect(fenceBindings[0]?.[0]).toBe('deployment');
+    expect(fenceBindings[0]?.[0]).toBe(EXECUTION_FENCE_ROW_ID);
     expect(fenceBindings[0]?.[1]).toBe('migration-locked');
     expect(fenceBindings[0]?.[2]).toMatch(/^\d+$/);
 
     // ... and lands as the state that was asked for, on the single fixed row.
     const fenceRows = await base
       .prepare(
-        'SELECT id, state, proof_key, proof_run_id FROM flowsafe_execution_fence',
+        `SELECT id, state, proof_key, proof_run_id FROM ${EXECUTION_FENCE_TABLE}`,
       )
       .all();
     expect(fenceRows.results).toEqual([
       {
-        id: 'deployment',
+        id: EXECUTION_FENCE_ROW_ID,
         state: 'migration-locked',
         proof_key: null,
         proof_run_id: null,
@@ -236,7 +240,7 @@ describe('deployment identity provisioning', () => {
     await seedDeploymentIdentity(db, 'acme', 'open');
 
     const rows = await db
-      .prepare('SELECT state FROM flowsafe_execution_fence')
+      .prepare(`SELECT state FROM ${EXECUTION_FENCE_TABLE}`)
       .all<{ state: string }>();
     expect(rows.results).toEqual([{ state: 'migration-locked' }]);
   });
@@ -256,7 +260,7 @@ describe('deployment identity provisioning', () => {
     await seedDeploymentIdentity(db, 'acme', 'migration-locked');
 
     const rows = await db
-      .prepare('SELECT state FROM flowsafe_execution_fence')
+      .prepare(`SELECT state FROM ${EXECUTION_FENCE_TABLE}`)
       .all<{ state: string }>();
     expect(rows.results).toEqual([{ state: 'migration-locked' }]);
   });

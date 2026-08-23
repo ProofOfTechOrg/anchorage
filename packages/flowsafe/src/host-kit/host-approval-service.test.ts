@@ -94,6 +94,8 @@ describe('buildHostApprovalService allowSelfDecision passthrough', () => {
       // non-'suspended' summary means resumeRunWithRequeue queues nothing.
       resumeRun: async (record) => ({ runId: record.runId, status: 'success' }),
       allowSelfDecision,
+      // In-memory approval store — no database, nothing to fence.
+      executionFence: 'none',
     });
   }
 

@@ -40,10 +40,10 @@ import {
 } from '../approval-api/index.js';
 import {
   admitsDrainableExecution,
-  type ExecutionFenceStore,
+  type ExecutionFenceWiring,
   executionFencedResponse,
   isExecutionFenceRefusal,
-  OPEN_EXECUTION_FENCE,
+  readExecutionFence,
 } from '../do-runner/index.js';
 import {
   assertNoClientMemoryIds,
@@ -164,14 +164,18 @@ export interface WebhookRouterOptions {
   /** Epoch-ms clock for the forgery window, injectable for tests. Default Date.now. */
   now?: () => number;
   /**
-   * The deployment execution fence, consulted AFTER signature verification.
-   * A locked deployment answers 503 so the provider redelivers rather than
-   * treating the event as accepted; putting the check before the verify would
-   * turn the fence into a free oracle for unauthenticated callers, and would
-   * spend the forgery-audit budget on requests the fence refused anyway.
-   * Absent ⇒ unfenced.
+   * The deployment execution fence, consulted AFTER signature verification, or
+   * `'none'` for a router with no database behind it. A locked deployment
+   * answers 503 so the provider redelivers rather than treating the event as
+   * accepted; putting the check before the verify would turn the fence into a
+   * free oracle for unauthenticated callers, and would spend the forgery-audit
+   * budget on requests the fence refused anyway.
+   *
+   * REQUIRED: an unfenced webhook route accepts a delivery a locked deployment
+   * cannot forward, and a provider that saw a 2xx does not redeliver — the
+   * event is then lost at the migration boundary. See ExecutionFenceWiring.
    */
-  executionFence?: ExecutionFenceStore;
+  executionFence: ExecutionFenceWiring;
 }
 
 export type WebhookRouter = (request: Request) => Promise<Response | null>;
@@ -354,9 +358,7 @@ export function createWebhookRouter(
       // on, so the event survives the migration in the PROVIDER's queue rather
       // than being half-landed in this database. Draining still delivers —
       // the thread routes degrade a wake to a persist there.
-      const fenceReading = options.executionFence
-        ? await options.executionFence.read()
-        : OPEN_EXECUTION_FENCE;
+      const fenceReading = await readExecutionFence(options.executionFence);
       if (!admitsDrainableExecution(fenceReading)) {
         await auditWebhook({
           providerId,

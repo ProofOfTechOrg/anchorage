@@ -8,9 +8,9 @@ import {
   DoStatusError,
   doErrorResponse,
   ExecutionFencedError,
-  type ExecutionFenceStore,
+  type ExecutionFenceWiring,
   isExecutionFenceRefusal,
-  OPEN_EXECUTION_FENCE,
+  readExecutionFence,
   verifyDurableObjectDeploymentIdentity,
   verifyDurableObjectDeploymentRequest,
 } from '../do-runner/index.js';
@@ -56,12 +56,16 @@ export interface SignalProviderHostWiring {
   topology: ThreadTopology;
   providers: readonly SignalProviderAdapter[];
   /**
-   * The deployment execution fence. A locked (or proof-only) deployment polls
-   * nothing: a poll adapter re-reports state it has not seen accepted, so a
-   * refused pass costs a redelivery rather than a lost notification. Absent ⇒
-   * unfenced.
+   * The deployment execution fence, or `'none'` for a host with no database
+   * behind it. A locked (or proof-only) deployment polls nothing: a poll
+   * adapter re-reports state it has not seen accepted, so a refused pass costs
+   * a redelivery rather than a lost notification.
+   *
+   * REQUIRED: `build()` is host code, and a host that returns wiring without a
+   * fence gets a poller that keeps delivering into a locked deployment. See
+   * ExecutionFenceWiring.
    */
-  executionFence?: ExecutionFenceStore;
+  executionFence: ExecutionFenceWiring;
 }
 
 export interface PollResult {
@@ -187,9 +191,7 @@ export abstract class SignalProviderHost<TEnv = unknown> {
     // than returning an empty result: the request path (POST /poll) must
     // answer 503 so the caller can tell a fenced deployment from an idle one,
     // and alarm() catches this exact family above.
-    const fence = executionFence
-      ? await executionFence.read()
-      : OPEN_EXECUTION_FENCE;
+    const fence = await readExecutionFence(executionFence);
     if (!admitsDrainableExecution(fence)) {
       throw new ExecutionFencedError(fence.state, 'signal provider poll');
     }

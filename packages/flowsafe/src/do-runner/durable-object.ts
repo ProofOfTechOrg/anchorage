@@ -22,6 +22,7 @@ import {
 import type { DurableObjectRunnerState, WebSocketLike } from './cf-types.js';
 import { newWebSocketPair, safeSend } from './cf-types.js';
 import {
+  isDatabaseBinding,
   verifyDurableObjectDeploymentIdentity,
   verifyDurableObjectDeploymentRequest,
 } from './deployment-identity.js';
@@ -32,7 +33,7 @@ import {
   ExecutionFencedError,
   type ExecutionFenceReading,
   isExecutionFenceRefusal,
-  OPEN_EXECUTION_FENCE,
+  readExecutionFence,
 } from './execution-fence.js';
 import { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
 import { isPathSafeId } from './path-safe-id.js';
@@ -179,21 +180,18 @@ class DurableObjectRunIdentityError extends DoStatusError {
 }
 
 /**
- * Does this env carry a database to fence against? The same discrimination
- * deployment-identity makes on the same binding: an RPC binding (a service
- * binding with a named entrypoint, a Durable Object stub) is a proxy that
- * answers EVERY property with a callable, so a bare `prepare` test says yes to
- * all of them — `fetch` is what separates the Fetcher-shaped family from a
- * D1Database, which has none.
+ * Does this env carry a database to fence against?
+ *
+ * `isDatabaseBinding` is deployment-identity's, imported rather than restated:
+ * it is the SAME question about the SAME binding (an RPC binding — a service
+ * binding with a named entrypoint, a Durable Object stub — is a proxy that
+ * answers every property with a callable, so `fetch` is what separates that
+ * family from a D1Database). Two copies would be two places for that
+ * discrimination to be revised, and a deployment where they disagreed would
+ * pass the identity check and skip the fence assert, or the reverse.
  */
 function hasDatabaseBinding(env: unknown): boolean {
-  const db = (env as { DB?: unknown } | null | undefined)?.DB;
-  if ((typeof db !== 'object' && typeof db !== 'function') || db === null) {
-    return false;
-  }
-  const candidate = db as { prepare?: unknown; fetch?: unknown };
-  if (typeof candidate.fetch === 'function') return false;
-  return typeof candidate.prepare === 'function';
+  return isDatabaseBinding((env as { DB?: unknown } | null | undefined)?.DB);
 }
 
 /**
@@ -280,8 +278,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
    * never be gating two different databases.
    */
   async #readExecutionFence(): Promise<ExecutionFenceReading> {
-    const fence = this.#ensureRuntime().executionFence;
-    return fence ? await fence.read() : OPEN_EXECUTION_FENCE;
+    return readExecutionFence(this.#ensureRuntime().executionFence);
   }
 
   // INV-1 enforcement at the DO boundary: this instance was addressed as
@@ -1217,10 +1214,6 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       await this.#resumeDueSuspensionDeadline(runtime, stored, entry, now);
       return true;
     } catch (error) {
-      // Classified FIRST, or every degraded wake would also log the generic
-      // failure below. A read that did not succeed converges nothing and
-      // charges nothing: it keeps the watchdog cadence until it heals, and the
-      // entry it was working on carries the clock that bounds that.
       // The deployment is fenced (or its fence could not be read). Classified
       // with the same THREE outcomes as an unreadable read — uncharged,
       // unconverged, watchdog cadence — because a wake refused by an
@@ -1243,6 +1236,10 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         );
         return false;
       }
+      // Classified FIRST, or every degraded wake would also log the generic
+      // failure below. A read that did not succeed converges nothing and
+      // charges nothing: it keeps the watchdog cadence until it heals, and the
+      // entry it was working on carries the clock that bounds that.
       if (error instanceof RunStateUnreadableError) {
         console.error(
           'suspension deadline wake could not read authoritative state',

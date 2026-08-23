@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { assertInitialExecutionFenceState } from '@proofoftech/flowsafe/deployment-identity-protocol';
+
 import {
   applicationBindingTopology,
   applicationR2Bindings,
@@ -596,9 +598,23 @@ export interface ProvisionDeploymentOptions {
   readonly clock?: () => number;
 }
 
-export function provisionDeployment(
+// `async` so the entry validation below REJECTS rather than throwing
+// synchronously: every caller and every test treats this as a promise-returning
+// function, and a synchronous throw would escape an unguarded `.catch()`.
+export async function provisionDeployment(
   options: ProvisionDeploymentOptions,
 ): Promise<ProvisioningResult> {
+  // Validated HERE, before the lease and before a single provider call. The
+  // protocol validates it too, but only when the seeding statements are built —
+  // which is after `database-created`, so a garbage value would have created a
+  // Worker and a D1 database first and then failed, leaving a half-provisioned
+  // deployment for an operator to reconcile over a typo. Nothing about this
+  // value depends on anything the lease reads, so the cheapest place to refuse
+  // it is the entry.
+  assertInitialExecutionFenceState(
+    options.initialExecutionFenceState,
+    'provisionDeployment',
+  );
   return options.store.withDeploymentLease(
     options.spec.tenantTag,
     options.spec.environment,
@@ -860,12 +876,9 @@ async function provisionDeploymentUnderLease(
 
     if (record.phase === 'database-created') {
       await lease.assertOwned();
-      await backend.seedDeploymentIdentity(
-        database,
-        spec.tenantTag,
-        lease,
-        options.initialExecutionFenceState,
-      );
+      await backend.seedDeploymentIdentity(database, spec.tenantTag, lease, {
+        initialExecutionFenceState: options.initialExecutionFenceState,
+      });
       databaseOwnershipProven = true;
       record = {
         ...record,
@@ -1458,7 +1471,7 @@ async function cleanupDeploymentArtifactsUnderLease(
       reservedDatabase,
       record.tenantTag,
       lease,
-      'migration-locked',
+      { initialExecutionFenceState: 'migration-locked' },
     );
     const seededOwner = await backend.readDeploymentIdentity(
       reservedDatabase,
