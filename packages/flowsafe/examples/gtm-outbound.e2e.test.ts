@@ -82,7 +82,10 @@ function buildHarness(): Harness {
   // mints requestContext from approved records on every start/resume.
   const { createWorkflow, createStep, runtime } = init(
     { storage: new InMemoryStore() },
-    { requestContextForRun: approvalGrantProvider(store) },
+    {
+      requestContextForRun: approvalGrantProvider(store),
+      executionFence: 'none',
+    },
   );
 
   const researchAccounts = createStep({

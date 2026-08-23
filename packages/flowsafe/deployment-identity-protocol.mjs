@@ -26,12 +26,82 @@ export const DEPLOYMENT_SENTINEL_COLUMNS = Object.freeze([
   }),
 ]);
 
+// --- Deployment execution fence (F1) ---------------------------------------
+//
+// The fence table and its single row are created BY THIS PROTOCOL, so every
+// database provisioned from 0.20 on is born carrying an EXPLICIT fence state
+// instead of leaning on the absent-row-reads-open upgrade rule.
+//
+// The vocabulary and the DDL live HERE rather than beside the store that reads
+// them (src/do-runner/execution-fence.ts, which imports them from this module)
+// for one reason: this file is the only place both sides can share. It ships at
+// the package root and is loaded by the provisioning CLI, by fleet-control's
+// backends, and by the runtime — none of which can import the package's
+// TypeScript sources. And the two MUST be one string: the store's own
+// `CREATE TABLE IF NOT EXISTS` silently accepts a differently-shaped table this
+// protocol created, so a drifted copy would not fail, it would quietly drop the
+// CHECK constraints that make the store's compare-and-sets total.
+
+/** The table the single fence row lives in — flowsafe-owned, outside `mastra_%`. */
+export const EXECUTION_FENCE_TABLE = 'flowsafe_execution_fence';
+
+/**
+ * The fence row's fixed primary key. The fence is a property of the DEPLOYMENT
+ * and a deployment is one database, so there is exactly one row and its key is
+ * a constant.
+ */
+export const EXECUTION_FENCE_ROW_ID = 'deployment';
+
+/** Every fence state, ordered from most to least permissive. */
+export const EXECUTION_FENCE_STATES = Object.freeze([
+  'open',
+  'draining',
+  'migration-locked',
+  'proof-only',
+]);
+
+/**
+ * The states a deployment may be BORN in. `draining` and `proof-only` are
+ * transitions out of a state that already exists — draining finishes work a
+ * fresh database has none of, and proof-only nominates a run nothing has yet
+ * started — so neither is a coherent initial condition.
+ */
+export const INITIAL_EXECUTION_FENCE_STATES = Object.freeze([
+  'open',
+  'migration-locked',
+]);
+
+export const EXECUTION_FENCE_DDL = `CREATE TABLE IF NOT EXISTS ${EXECUTION_FENCE_TABLE} (
+    id TEXT PRIMARY KEY CHECK (id = '${EXECUTION_FENCE_ROW_ID}'),
+    state TEXT NOT NULL CHECK (state IN (${EXECUTION_FENCE_STATES.map((state) => `'${state}'`).join(', ')})),
+    proof_key TEXT,
+    proof_run_id TEXT,
+    updated_at INTEGER NOT NULL
+  )`;
+
 const SENTINEL_SQL_PATTERN =
   /^create table (?:if not exists )?flowsafe_deployment\s*\(\s*id integer primary key check\s*\(\s*id\s*=\s*1\s*\)\s*,\s*tenant_tag text not null\s*,\s*provisioned_at text not null\s*\)$/i;
 const D1_OWNED_INTERNAL_TABLES = Object.freeze(['_cf_KV', '_cf_METADATA']);
+/**
+ * Tables whose presence does NOT make a database "unowned application state":
+ * D1's own internal tables plus every table this protocol creates itself.
+ *
+ * The fence table belongs here because it can legitimately exist BEFORE the
+ * ownership row does — a previous provisioning attempt that died between the
+ * fence DDL and the sentinel insert leaves exactly that residue, and the
+ * runtime store also materializes the table on its first control-plane
+ * transition. Without the exclusion the next provisioning pass would read its
+ * own leftovers as somebody else's application data and refuse the database
+ * forever (`unownedDatabaseError`), and the conditional ownership insert below
+ * would never fire.
+ */
+const NON_APPLICATION_TABLES = Object.freeze([
+  ...D1_OWNED_INTERNAL_TABLES,
+  EXECUTION_FENCE_TABLE,
+]);
 const MIN_DEPLOYMENT_CREDENTIAL_LENGTH = 32;
 const MAX_DEPLOYMENT_CREDENTIAL_LENGTH = 256;
-const D1_OWNED_TABLE_EXCLUSIONS = D1_OWNED_INTERNAL_TABLES.map(
+const NON_APPLICATION_TABLE_EXCLUSIONS = NON_APPLICATION_TABLES.map(
   (name) => `           AND name <> '${name}'`,
 ).join('\n');
 
@@ -58,6 +128,11 @@ const READ_SENTINEL_OWNER = Object.freeze({
 const CREATE_SENTINEL = Object.freeze({
   mode: 'write',
   sql: DEPLOYMENT_SENTINEL_DDL,
+  bindings: Object.freeze([]),
+});
+const CREATE_EXECUTION_FENCE = Object.freeze({
+  mode: 'write',
+  sql: EXECUTION_FENCE_DDL,
   bindings: Object.freeze([]),
 });
 
@@ -106,6 +181,28 @@ export function assertValidDeploymentTag(tag, caller) {
   }
 }
 
+/**
+ * Validate the fence state a deployment is to be born in.
+ *
+ * Loud on anything else, and with NO default anywhere above it: the failure
+ * this closes is a migration host forgetting to ask for 'migration-locked' and
+ * silently getting an executing deployment, which is exactly the condition a
+ * migration exists to prevent. Making the argument required turns that into an
+ * obligation the caller cannot skip, while still letting a host that wants an
+ * open deployment say so.
+ */
+export function assertInitialExecutionFenceState(state, caller) {
+  if (
+    typeof state !== 'string' ||
+    !INITIAL_EXECUTION_FENCE_STATES.includes(state)
+  ) {
+    throw new DeploymentIdentityError(
+      `${caller}: initialExecutionFenceState must be one of ${INITIAL_EXECUTION_FENCE_STATES.join(', ')} (got '${String(state)}') — it has no default on purpose`,
+    );
+  }
+  return state;
+}
+
 export function normalizeDeploymentSentinelSql(sql) {
   return sql.replace(/\s+/g, ' ').trim();
 }
@@ -118,7 +215,7 @@ export function deploymentIdentityApplicationTables(rows) {
         typeof name === 'string' &&
         name !== DEPLOYMENT_SENTINEL_TABLE &&
         !name.startsWith('sqlite_') &&
-        !D1_OWNED_INTERNAL_TABLES.includes(name),
+        !NON_APPLICATION_TABLES.includes(name),
     )
     .sort();
 }
@@ -170,11 +267,46 @@ function conditionalOwnershipInsert(tag, provisionedAt) {
          SELECT 1 FROM sqlite_schema
          WHERE type = 'table'
            AND name <> '${DEPLOYMENT_SENTINEL_TABLE}'
-${D1_OWNED_TABLE_EXCLUSIONS}
+${NON_APPLICATION_TABLE_EXCLUSIONS}
            AND name NOT GLOB 'sqlite_*'
        )`,
     bindings: [tag, provisionedAt],
   };
+}
+
+function seedExecutionFenceRow(state, seededAt) {
+  return {
+    mode: 'write',
+    sql: `INSERT OR IGNORE INTO ${EXECUTION_FENCE_TABLE}
+       (id, state, proof_key, proof_run_id, updated_at)
+     VALUES (?, ?, NULL, NULL, ?)`,
+    // INSERT OR IGNORE, never an upsert: seeding runs on every provisioning
+    // pass, and a re-provision of a LIVE deployment must not silently reopen a
+    // fence an operator closed.
+    //
+    // `updated_at` is an INTEGER column bound as TEXT because D1's REST query
+    // API takes every parameter as a string (fleet-control's
+    // d1RestParameters rejects anything else). SQLite's INTEGER affinity
+    // converts a well-formed integer literal on write, so the column still
+    // holds a number.
+    bindings: [EXECUTION_FENCE_ROW_ID, state, String(seededAt)],
+  };
+}
+
+/**
+ * Write the deployment's initial fence row, if it has none.
+ *
+ * Two statements rather than one request: every executor this protocol is
+ * driven through — the runtime's `db.prepare()`, the CLI's
+ * `wrangler d1 execute --command`, and both fleet-control backends' REST
+ * `/query` with bound parameters — carries exactly ONE statement per call, so
+ * there is no seam here through which a batch could be sent. The DDL therefore
+ * runs first and the row second; a crash between them leaves an empty fence
+ * table, which reads as `open` and is healed by the next invocation.
+ */
+async function seedExecutionFence(execute, state, seededAt) {
+  await execute(CREATE_EXECUTION_FENCE);
+  await execute(seedExecutionFenceRow(state, seededAt));
 }
 
 async function scanTables(execute) {
@@ -214,9 +346,24 @@ function differentOwnerError(caller, stored, tag) {
 export async function provisionDeploymentIdentityProtocol(
   execute,
   tag,
-  { caller = 'seedDeploymentIdentity', provisionedAt } = {},
+  {
+    caller = 'seedDeploymentIdentity',
+    provisionedAt,
+    now = Date.now,
+    initialExecutionFenceState,
+  } = {},
 ) {
   assertValidDeploymentTag(tag, caller);
+  // Validated BEFORE the first statement: a caller that omitted the fence state
+  // must learn so without having stamped ownership onto a database first.
+  const fenceState = assertInitialExecutionFenceState(
+    initialExecutionFenceState,
+    caller,
+  );
+  // One instant for both rows. The sentinel stores it as ISO TEXT and the fence
+  // as epoch-milliseconds INTEGER because that is what each column already is;
+  // an explicit `provisionedAt` still wins for the sentinel, as before.
+  const seededAt = now();
   const tables = await scanTables(execute);
   const applicationTables = deploymentIdentityApplicationTables(tables);
   const sentinelExists = tables.some(
@@ -227,6 +374,13 @@ export async function provisionDeploymentIdentityProtocol(
     if (storedBeforeCreate !== tag) {
       throw differentOwnerError(caller, storedBeforeCreate, tag);
     }
+    // The already-owned early return still seeds the fence. A previous pass
+    // that died between the ownership insert and the fence row left a
+    // deployment with an owner and NO explicit fence — permanently implicit-open
+    // residue, on the one deployment a migration most needs to be able to lock.
+    // Seeding here is what heals it, and INSERT-if-absent is what makes
+    // repeating it safe on a deployment whose fence has since been moved.
+    await seedExecutionFence(execute, fenceState, seededAt);
     return;
   }
   if (applicationTables.length > 0) {
@@ -239,11 +393,15 @@ export async function provisionDeploymentIdentityProtocol(
     if (storedAfterCreate !== tag) {
       throw differentOwnerError(caller, storedAfterCreate, tag);
     }
+    await seedExecutionFence(execute, fenceState, seededAt);
     return;
   }
 
   await execute(
-    conditionalOwnershipInsert(tag, provisionedAt ?? new Date().toISOString()),
+    conditionalOwnershipInsert(
+      tag,
+      provisionedAt ?? new Date(seededAt).toISOString(),
+    ),
   );
   const seeded = await readDeploymentIdentityProtocol(execute);
   if (seeded === undefined) {
@@ -260,4 +418,10 @@ export async function provisionDeploymentIdentityProtocol(
   if (seeded !== tag) {
     throw differentOwnerError(caller, seeded, tag);
   }
+  // Last, never first: the fence DDL is the one statement that could add a
+  // table to an as-yet-unowned database, and running it only after ownership is
+  // PROVEN keeps it out of the window where `unownedDatabaseError` and the
+  // conditional ownership insert are still deciding whether this database is
+  // ours to write to at all.
+  await seedExecutionFence(execute, fenceState, seededAt);
 }

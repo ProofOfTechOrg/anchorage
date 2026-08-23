@@ -12,7 +12,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
-import { createD1Storage, createHostPubSub, init } from '../do-runner/index.js';
+import {
+  createD1Storage,
+  createHostPubSub,
+  type ExecutionFenceDatabase,
+  ExecutionFencedError,
+  type ExecutionFenceState,
+  ExecutionFenceStore,
+  init,
+} from '../do-runner/index.js';
 import {
   backgroundTasksStore,
   createBackgroundTaskD1Domains,
@@ -45,7 +53,10 @@ async function seededD1(): Promise<MastraCompositeStore> {
   const storage = createD1Storage({
     binding: sqliteUnitDatabase(sqlite) as never,
   });
-  const { createWorkflow, createStep, runtime } = init({ storage });
+  const { createWorkflow, createStep, runtime } = init(
+    { storage },
+    { executionFence: 'none' },
+  );
   const step = createStep({
     id: 'noop',
     inputSchema: z.object({}),
@@ -126,7 +137,13 @@ describe('BackgroundTaskHost — wiring', () => {
 
   it('boot() re-registers the static executors (survives DO eviction, DL-015)', async () => {
     // #given
-    const executor: ToolExecutor = { execute: async () => ({ done: true }) };
+    const executed: unknown[] = [];
+    const executor: ToolExecutor = {
+      execute: async (args) => {
+        executed.push(args);
+        return { done: true };
+      },
+    };
     const host = new BackgroundTaskHost({
       mastra: new Mastra({ storage: new InMemoryStore() }),
       pubsub: createHostPubSub(),
@@ -136,8 +153,17 @@ describe('BackgroundTaskHost — wiring', () => {
     // #when
     await host.boot();
 
-    // #then — resolvable by name (the path a recovered task's step takes)
-    expect(host.manager.getStaticExecutor('longResearch')).toBe(executor);
+    // #then — resolvable by name (the path a recovered task's step takes), and
+    // it DELEGATES to the registered executor. Identity is deliberately not
+    // asserted: what is registered is the fence-gated wrapper (host.ts
+    // `#gated`), which is the seam that stops a locked deployment executing a
+    // task body — including one a recovery re-drive resolved by name.
+    const registered = host.manager.getStaticExecutor('longResearch');
+    expect(registered).toBeDefined();
+    await expect(registered?.execute({ topic: 'ai' })).resolves.toEqual({
+      done: true,
+    });
+    expect(executed).toEqual([{ topic: 'ai' }]);
   });
 
   it('boot() is idempotent — a second call resolves without re-init', async () => {
@@ -646,5 +672,234 @@ describe('BackgroundTaskHost — execution-mode recovery on D1', () => {
     } finally {
       if (booted) await host.shutdown();
     }
+  });
+});
+
+describe('BackgroundTaskHost and the deployment execution fence', () => {
+  async function fenceAt(
+    state: ExecutionFenceState,
+  ): Promise<ExecutionFenceStore> {
+    const fence = new ExecutionFenceStore(
+      sqliteUnitDatabase(openSqlite()) as ExecutionFenceDatabase,
+    );
+    await fence.seed(state);
+    return fence;
+  }
+
+  function hostWith(
+    executionFence: ExecutionFenceStore,
+    executor: ToolExecutor,
+  ): BackgroundTaskHost {
+    return new BackgroundTaskHost({
+      mastra: new Mastra({ storage: new InMemoryStore() }),
+      pubsub: createHostPubSub(),
+      executors: { longResearch: executor },
+      executionFence,
+    });
+  }
+
+  it('claims nothing while locked, then completes the queued work after reopen', async () => {
+    // #given — a real execution-mode host on D1 with work already queued: one
+    // PENDING row waiting for a dispatcher, and one row a previous instance
+    // left stranded in 'running' with the DEFAULT maxRetries of 0.
+    const binding = sqliteUnitDatabase(openSqlite()) as never;
+    const domains = () => createBackgroundTaskD1Domains({ binding });
+    const seedStorage = createD1Storage({ binding, domains: domains() });
+    await seedStorage.init();
+    const seedStore = await backgroundTasksStore(
+      new Mastra({ storage: seedStorage }),
+    );
+    await seedStore.createTask(
+      baseTask({ id: 'queued', status: 'pending', startedAt: undefined }),
+    );
+    await seedStore.createTask(baseTask({ id: 'stranded', status: 'running' }));
+
+    const storage = createD1Storage({ binding, domains: domains() });
+    await storage.init();
+    const pubsub = createHostPubSub();
+    const executionFence = await fenceAt('migration-locked');
+    const execute = vi.fn(async () => ({ ran: true }));
+    const host = new BackgroundTaskHost({
+      mastra: new Mastra({ storage, pubsub }),
+      pubsub,
+      execution: true,
+      executors: { longResearch: { execute } },
+      executionFence,
+    });
+
+    try {
+      // #when — the fenced boot (a request, or the DO alarm that woke it).
+      await host.boot();
+      // Nothing is asynchronous about "did not happen", so give the dispatch
+      // topic a real chance to deliver before concluding it did not.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // #then — NOTHING was claimed. The pending row is still pending, so it
+      // is still visible to a nonterminal census and still owned by the queue.
+      expect(await host.manager.getTask('queued')).toMatchObject({
+        status: 'pending',
+      });
+      // #and — the stranded row was NOT settled. This is the destructive path:
+      // recoverStaleTasks marks every stranded maxRetries-0 row 'failed'
+      // outright, before any executor is consulted, so an executor-level gate
+      // could never have prevented it.
+      expect(await host.manager.getTask('stranded')).toMatchObject({
+        status: 'running',
+      });
+      expect(execute).not.toHaveBeenCalled();
+
+      // #when — the migration finishes and the operator reopens the fence. No
+      // operator action beyond that: the next boot is a request or an alarm.
+      await executionFence.transition({
+        expected: 'migration-locked',
+        next: 'open',
+      });
+      await host.boot();
+
+      // #then — the queued work runs, exactly once.
+      await vi.waitFor(
+        async () => {
+          expect((await host.manager.getTask('queued'))?.status).toBe(
+            'completed',
+          );
+        },
+        { timeout: 5_000, interval: 10 },
+      );
+      expect(execute).toHaveBeenCalledTimes(1);
+    } finally {
+      await host.shutdown();
+    }
+  });
+
+  it('dispatches normally while draining', async () => {
+    // #given — the queue IS the work a drain exists to finish, so a drain must
+    // keep dispatching or it can never complete.
+    const binding = sqliteUnitDatabase(openSqlite()) as never;
+    const domains = () => createBackgroundTaskD1Domains({ binding });
+    const seedStorage = createD1Storage({ binding, domains: domains() });
+    await seedStorage.init();
+    const seedStore = await backgroundTasksStore(
+      new Mastra({ storage: seedStorage }),
+    );
+    await seedStore.createTask(
+      baseTask({ id: 'draining', status: 'pending', startedAt: undefined }),
+    );
+
+    const storage = createD1Storage({ binding, domains: domains() });
+    await storage.init();
+    const pubsub = createHostPubSub();
+    const host = new BackgroundTaskHost({
+      mastra: new Mastra({ storage, pubsub }),
+      pubsub,
+      execution: true,
+      executors: { longResearch: { execute: async () => ({ ran: true }) } },
+      executionFence: await fenceAt('draining'),
+    });
+
+    // #then
+    try {
+      await host.boot();
+      await vi.waitFor(
+        async () => {
+          expect((await host.manager.getTask('draining'))?.status).toBe(
+            'completed',
+          );
+        },
+        { timeout: 5_000, interval: 10 },
+      );
+    } finally {
+      await host.shutdown();
+    }
+  });
+
+  it('parks rather than fails when the backstop catches an in-flight dispatch', async () => {
+    // #given — the narrow race the wrapper exists for: a subscriber started
+    // while the fence was open reaches a task body after it closed. Core has
+    // already written status:'running' by then, so the only question is how the
+    // body EXITS.
+    const executionFence = await fenceAt('migration-locked');
+    const ran = vi.fn(async () => ({ done: true }));
+    const host = hostWith(executionFence, { execute: ran });
+    await host.boot();
+    const registered = host.manager.getStaticExecutor('longResearch');
+    const suspend = vi.fn(async (_data?: unknown) => undefined);
+
+    // #when
+    await expect(registered?.execute({}, { suspend })).resolves.toBeUndefined();
+
+    // #then — SUSPENDED, not failed. A throw becomes outcome:'retry', and core
+    // retries only while retryCount < maxRetries — the default is 0, so the
+    // first throw would settle the row 'failed' and the work would be gone.
+    expect(ran).not.toHaveBeenCalled();
+    expect(suspend).toHaveBeenCalledTimes(1);
+    expect(suspend).toHaveBeenCalledWith({
+      'flowsafe.executionFenced': { state: 'migration-locked' },
+    });
+  });
+
+  it('refuses loudly when core supplies no suspend to park with', async () => {
+    // #given — `suspend` is optional on core's ToolExecutor contract. With no
+    // way to park, refusing beats running a task body on a deployment whose
+    // state is being copied.
+    const host = hostWith(await fenceAt('migration-locked'), {
+      execute: async () => ({ done: true }),
+    });
+    await host.boot();
+
+    // #then
+    await expect(
+      host.manager.getStaticExecutor('longResearch')?.execute({}),
+    ).rejects.toBeInstanceOf(ExecutionFencedError);
+  });
+
+  it('boots and serves read routes while locked', async () => {
+    // #given — boot() is deliberately NOT fence-gated: `#booted` memoizes it,
+    // so a refusal there would be cached for the life of the isolate and would
+    // take down the read routes every host serves after booting.
+    const host = hostWith(await fenceAt('migration-locked'), {
+      execute: async () => ({ done: true }),
+    });
+
+    // #then
+    await expect(host.boot()).resolves.toBeUndefined();
+    await expect(host.manager.listTasks({ runId: 'abc_r1' })).resolves.toEqual({
+      tasks: [],
+      total: 0,
+    });
+  });
+
+  it('accepts an enqueue while draining and refuses one once locked', async () => {
+    // #given — refusing an enqueue during a drain would fail exactly the runs
+    // that are draining, because the caller is a tool call inside one.
+    const executionFence = await fenceAt('draining');
+    const host = hostWith(executionFence, {
+      execute: async () => ({ done: true }),
+    });
+    await host.boot();
+    const payload = {
+      toolName: 'longResearch',
+      toolCallId: 'call-1',
+      args: {},
+      agentId: 'agent-1',
+      runId: 'abc_r1',
+    };
+
+    // #then
+    await expect(
+      host.enqueue(payload, { executor: { execute: async () => ({}) } }),
+    ).resolves.toMatchObject({
+      task: expect.objectContaining({ id: expect.any(String) }),
+    });
+
+    // #when — locked
+    await executionFence.transition({
+      expected: 'draining',
+      next: 'migration-locked',
+    });
+
+    // #then — a row written now is work the migration would have to carry.
+    await expect(
+      host.enqueue(payload, { executor: { execute: async () => ({}) } }),
+    ).rejects.toBeInstanceOf(ExecutionFencedError);
   });
 });

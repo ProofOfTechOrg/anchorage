@@ -267,7 +267,10 @@ function buildHarness(): Harness {
 
   const { createWorkflow, createStep, runtime } = init(
     { storage: new InMemoryStore() },
-    { requestContextForRun: approvalGrantProvider(store) },
+    {
+      requestContextForRun: approvalGrantProvider(store),
+      executionFence: 'none',
+    },
   );
 
   const research = createStep({

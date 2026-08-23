@@ -57,8 +57,13 @@ import {
   samePrincipal,
 } from '../approval-api/index.js';
 import {
+  admitsExistingRun,
   DoStatusError,
+  type ExecutionFenceReading,
+  executionFencedResponse,
+  isExecutionFenceRefusal,
   isPathSafeId,
+  OPEN_EXECUTION_FENCE,
   type RunStatus,
   type ThreadScope,
 } from '../do-runner/index.js';
@@ -537,6 +542,20 @@ export function createThreadSignalRoutes(
     if (!body) return json({ error: 'a JSON body is required' }, 400);
 
     try {
+      // The execution fence, read ONCE for this request and before any store
+      // lookup. `migration-locked` refuses every signal route outright — the
+      // persist lanes included, because their thread-state write is part of
+      // what the migration is copying. `proof-only` is decided further down,
+      // once the thread's active run is knowable.
+      //
+      // A read that fails throws ExecutionFenceUnreadableError, which the
+      // catch below answers as a 503 — degrade closed, never a silent open.
+      const executionFence = scope.init.executionFence
+        ? await scope.init.executionFence.read()
+        : OPEN_EXECUTION_FENCE;
+      if (executionFence.state === 'migration-locked') {
+        return executionFencedResponse(executionFence.state, entryPath);
+      }
       let scheduleTarget: AgentScheduleTarget | undefined;
       if (path === '/signal/schedule') {
         if (!resolveScheduleTarget) {
@@ -594,6 +613,22 @@ export function createThreadSignalRoutes(
 
       const resourceId = resolveResourceId?.(scope);
       const threadId = scope.threadId;
+      // proof-only admits work on ONE run, so the gate lives here — the first
+      // point where the run a signal would reach is knowable, and the only one
+      // every route passes through. Deciding it inside handleWake would leave
+      // the lanes that never reach it (the persist routes, and a default
+      // non-wake delivery) ungated; handleWake keeps its own check for the
+      // wake path it owns.
+      if (executionFence.state === 'proof-only') {
+        const activeRunId = activeThreadRunIdOf(
+          agent,
+          threadId,
+          resourceId ?? '',
+        );
+        if (!admitsExistingRun(executionFence, activeRunId)) {
+          return executionFencedResponse(executionFence.state, entryPath);
+        }
+      }
       let memoryResolution: Promise<boolean> | undefined;
       const memoryAvailable: MemoryAvailable = () => {
         memoryResolution ??= (async () => {
@@ -668,6 +703,7 @@ export function createThreadSignalRoutes(
             persistenceAllowed,
             memoryAvailable,
             inspectContent,
+            executionFence,
           },
         );
       }
@@ -701,6 +737,7 @@ export function createThreadSignalRoutes(
             persistenceAllowed,
             memoryAvailable,
             inspectContent,
+            executionFence,
           },
         );
       }
@@ -714,6 +751,7 @@ export function createThreadSignalRoutes(
         return await handleScheduleSignal({
           agent,
           body,
+          executionFence,
           target: scheduleTarget,
           threadId,
           resourceId,
@@ -759,6 +797,7 @@ export function createThreadSignalRoutes(
           handleNotificationDispatch({
             agent,
             body,
+            executionFence,
             threadId,
             resourceId,
             deploymentTag: scope.deploymentTag,
@@ -794,6 +833,16 @@ export function createThreadSignalRoutes(
       }
       return json({ error: 'not found' }, 404);
     } catch (error) {
+      // The fence refusing, or failing to answer. Surfaced with its own 503 and
+      // reason rather than the 502 below: a caller must be able to tell "this
+      // deployment is deliberately not executing" (retry after the migration)
+      // from "the model or a route is broken".
+      if (isExecutionFenceRefusal(error)) {
+        return json(
+          { error: error.message, reason: error.reason },
+          error.status,
+        );
+      }
       if (
         error instanceof DoStatusError &&
         (error.status === 403 || error.status === 404 || error.status === 409)
@@ -842,6 +891,8 @@ async function handleNotificationDispatch(options: {
   storage: NotificationsStorage;
   agentId: string;
   inspectContent?: InspectSignalContent;
+  /** The ONE fence reading this request took — see handleWake. */
+  executionFence: ExecutionFenceReading;
 }): Promise<Response> {
   const ids = options.body.notificationIds;
   if (
@@ -986,6 +1037,7 @@ async function handleNotificationDispatch(options: {
       consultRunCap: options.consultRunCap,
       startIdleRun: options.startIdleRun,
       serializeWake: options.serializeWake,
+      executionFence: options.executionFence,
       blockingRun: durableBlockingRun
         ? () => durableBlockingRun
         : options.blockingRun,
@@ -1170,8 +1222,17 @@ async function handleNotificationDispatch(options: {
  * Why a requested wake was refused. It degrades to a durable persist only when
  * the principal may persist and the agent has memory; otherwise the route
  * answers `persistence-forbidden` or `memory-unavailable`.
+ *
+ * `execution-draining` is the fence's (do-runner/execution-fence.ts): a
+ * draining deployment must mint no new run, and a signal is the one input a
+ * drain cannot answer by refusing — the sender has nowhere to put it and the
+ * migration would lose it. Degrading to the SAME persist branch the other two
+ * refusals use keeps it durable for the deployment that takes over.
  */
-type WakeRefusal = 'not-runtime-driven' | 'no-start-idle-run';
+type WakeRefusal =
+  | 'not-runtime-driven'
+  | 'no-start-idle-run'
+  | 'execution-draining';
 /** Marker returned when an unbranded route cannot guarantee runtime execution. */
 type RouteDegradation = 'not-runtime-driven';
 
@@ -1289,10 +1350,18 @@ async function handleWake(options: {
    * the caller's, which core's bare discard result cannot distinguish.
    */
   activeDiscardAllowed?: boolean;
+  /**
+   * The ONE fence reading this request took (never re-read per branch). The
+   * route resolves it before dispatch; this function is where it is applied,
+   * because only here is the run a delivery would land on known — which is
+   * exactly what proof-only admits by.
+   */
+  executionFence: ExecutionFenceReading;
   deliverActive(runId: string, memoryAvailable: boolean): WakeDelivery;
   persist(): WakeDelivery;
 }): Promise<Response> {
   return options.serializeWake(async () => {
+    const fence = options.executionFence;
     const durableBlockingRun = await options.blockingRun?.();
     const activeRunId = activeThreadRunIdOf(
       options.agent,
@@ -1304,6 +1373,13 @@ async function handleWake(options: {
       !samePrincipal(durableBlockingRun.principal, options.principal)
     ) {
       return principalMismatchResponse(durableBlockingRun.runId);
+    }
+    // Delivery into a run that ALREADY exists survives a drain — the run is
+    // what the drain is waiting for — and in proof-only it is admitted only
+    // for the nominated run. The check sits after the principal gate so a
+    // fenced deployment leaks nothing a permitted caller could not see.
+    if (activeRunId && !admitsExistingRun(fence, activeRunId)) {
+      return executionFencedResponse(fence.state, 'signal delivery');
     }
     if (activeRunId) {
       if (durableBlockingRun && durableBlockingRun.runId !== activeRunId) {
@@ -1350,12 +1426,24 @@ async function handleWake(options: {
       });
     }
 
+    // An idle thread has no run to deliver into, so from here on the only way
+    // to serve the signal is to MINT one. `migration-locked` and `proof-only`
+    // forbid that outright and have no lossless alternative to offer (the
+    // proof run is a specific run, not this thread's next one), so they refuse
+    // and the caller retries after the migration. `draining` degrades to the
+    // persist branch below instead — see WakeRefusal.
+    if (fence.state === 'migration-locked' || fence.state === 'proof-only') {
+      return executionFencedResponse(fence.state, 'signal wake');
+    }
     const startIdleRun = options.startIdleRun;
-    const refusal: WakeRefusal | undefined = !options.runtimeDriven
-      ? 'not-runtime-driven'
-      : !startIdleRun
-        ? 'no-start-idle-run'
-        : undefined;
+    const refusal: WakeRefusal | undefined =
+      fence.state === 'draining'
+        ? 'execution-draining'
+        : !options.runtimeDriven
+          ? 'not-runtime-driven'
+          : !startIdleRun
+            ? 'no-start-idle-run'
+            : undefined;
     const capped =
       options.runtimeDriven && options.consultRunCap
         ? !(await options.consultRunCap())
@@ -1497,6 +1585,8 @@ async function handleScheduleSignal(options: {
   store: ScheduleSignalDispatchStore;
   completed: Map<string, ScheduleAgentDispatchReceipt>;
   inspectContent?: InspectSignalContent;
+  /** The ONE fence reading this request took — see handleWake. */
+  executionFence: ExecutionFenceReading;
 }): Promise<Response> {
   const scheduleId = options.body.scheduleId;
   const dispatchId = options.body.dispatchId;
@@ -1744,6 +1834,7 @@ async function handleScheduleSignal(options: {
       consultRunCap: options.consultRunCap,
       startIdleRun: options.startIdleRun,
       serializeWake: options.serializeWake,
+      executionFence: options.executionFence,
       blockingRun: durableBlockingRun
         ? () => durableBlockingRun
         : options.blockingRun,
@@ -1833,6 +1924,8 @@ async function handleMessage(
     persistenceAllowed: boolean;
     memoryAvailable: MemoryAvailable;
     inspectContent: InspectSignalContent | undefined;
+    /** The ONE fence reading this request took — see handleWake. */
+    executionFence: ExecutionFenceReading;
   },
 ): Promise<Response> {
   if (!isContents(body.contents)) {
@@ -1882,6 +1975,7 @@ async function handleMessage(
       consultRunCap,
       startIdleRun,
       serializeWake,
+      executionFence: options.executionFence,
       blockingRun: durableBlockingRun
         ? () => durableBlockingRun
         : options.blockingRun,
@@ -2007,6 +2101,8 @@ async function handleSignal(
     persistenceAllowed: boolean;
     memoryAvailable: MemoryAvailable;
     inspectContent: InspectSignalContent | undefined;
+    /** The ONE fence reading this request took — see handleWake. */
+    executionFence: ExecutionFenceReading;
   },
 ): Promise<Response> {
   if (!isContents(body.contents)) {
@@ -2081,6 +2177,7 @@ async function handleSignal(
       consultRunCap,
       startIdleRun,
       serializeWake,
+      executionFence: options.executionFence,
       blockingRun: durableBlockingRun
         ? () => durableBlockingRun
         : options.blockingRun,

@@ -69,6 +69,7 @@ import {
 import {
   type DurableObjectRunLifecycleHooks,
   DurableObjectRunner,
+  ExecutionFenceStore,
   HubDurableObject,
   type RequestContextProvider,
   type RunnerRuntime,
@@ -225,6 +226,7 @@ function grantProviderFor(env: Env): RequestContextProvider {
 function defineWorkflows(env: Env): RunnerRuntime {
   return buildShowcaseRuntime({
     initInput: env,
+    executionFence: new ExecutionFenceStore(env.DB),
     // Grants are per run. The deployment tag is infrastructure-provided and
     // reaches Breakwater only as trusted audit correlation; connector rate and
     // idempotency keys are deployment-wide by physical isolation.

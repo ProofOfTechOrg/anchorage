@@ -161,6 +161,7 @@ function buildHarness(
     const { createWorkflow, createStep, runtime } = init(
       { storage },
       {
+        executionFence: 'none',
         requestContextForRun: async (id, runId, leg) => ({
           ...(await grantProvider(id, runId, leg)),
           ...(options.principalPermissions !== undefined
@@ -560,8 +561,13 @@ describe('agent gate grant round-trip (R-003, both shapes)', () => {
     const store = new InMemoryApprovalStore();
     const connectorAudit = new AuditLogger();
     const makeRuntime = () =>
-      init({ storage }, { requestContextForRun: approvalGrantProvider(store) })
-        .runtime;
+      init(
+        { storage },
+        {
+          requestContextForRun: approvalGrantProvider(store),
+          executionFence: 'none',
+        },
+      ).runtime;
     const modelCalls = vi.fn();
     let initialPublishes = 0;
     let rehydratedPublishes = 0;

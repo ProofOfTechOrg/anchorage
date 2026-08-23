@@ -8,6 +8,11 @@
 // (grants.ts) derives requestContext grants from approved records at
 // start/resume. Nothing here ever reads capability data from client input.
 
+import {
+  admitsExistingRun,
+  ExecutionFencedError,
+  type ExecutionFenceStore,
+} from '../do-runner/execution-fence.js';
 import { isPathSafeId } from '../do-runner/path-safe-id.js';
 import type {
   ApprovalActor,
@@ -168,6 +173,17 @@ export interface ApprovalServiceOptions {
    * audited with `detail.selfDecision: true`.
    */
   allowSelfDecision?: SelfDecisionPolicy;
+  /**
+   * The deployment execution fence, consulted before a DECISION commits.
+   *
+   * DECIDE is gated wherever resume is, because decide() COMMITS and THEN
+   * resumes (see #resume): a lock that only stopped the resume would leave the
+   * approval durably decided on a deployment that can never act on it, and the
+   * deployment taking over would inherit a decision with no resume behind it.
+   * Reads, claims, and delegation stay open in every state — they move no run.
+   * Absent ⇒ unfenced.
+   */
+  executionFence?: ExecutionFenceStore;
   /** Injectable clock (tests, deterministic SLA math). */
   now?: () => Date;
 }
@@ -195,6 +211,7 @@ export class ApprovalService {
     decision: ApprovalDecision,
   ) => Promise<unknown>;
   readonly #allowSelfDecision?: SelfDecisionPolicy;
+  readonly #executionFence?: ExecutionFenceStore;
   readonly #now: () => Date;
 
   constructor(options: ApprovalServiceOptions) {
@@ -205,6 +222,7 @@ export class ApprovalService {
     this.#defaultSlaSeconds = options.defaultSlaSeconds;
     this.#resumeRun = options.resumeRun;
     this.#allowSelfDecision = options.allowSelfDecision;
+    this.#executionFence = options.executionFence;
     this.#now = options.now ?? (() => new Date());
   }
 
@@ -424,6 +442,31 @@ export class ApprovalService {
     return updated;
   }
 
+  /**
+   * The execution fence, for the one approval operation that moves a run.
+   *
+   * Placed BEFORE the CAS commit, not around the resume: decide() writes the
+   * decision and then resumes, so a check any later would leave the approval
+   * durably decided with nothing behind it.
+   *
+   * `proof-only` costs one extra read, because the proof is a specific RUN and
+   * an approval id says nothing about which run it gates until the record is
+   * loaded. That read happens only in proof-only — an operational state that
+   * lasts minutes — so the steady-state cost stays exactly one fence read.
+   */
+  async #assertDecidable(id: string): Promise<void> {
+    if (!this.#executionFence) return;
+    const reading = await this.#executionFence.read();
+    if (reading.state === 'open' || reading.state === 'draining') return;
+    const runId =
+      reading.state === 'proof-only'
+        ? (await this.#store.get(id))?.runId
+        : undefined;
+    if (!admitsExistingRun(reading, runId)) {
+      throw new ExecutionFencedError(reading.state, 'approval decision');
+    }
+  }
+
   async decide(
     id: string,
     input: { decision: ApprovalDecision; comment?: string },
@@ -436,6 +479,7 @@ export class ApprovalService {
       `approval:${id}`,
     );
     this.#assertDecisionInput(input);
+    await this.#assertDecidable(id);
     // Role-scoped SoD: an exempt decider (allowSelfDecision: true, or a role
     // named in { roles }) skips the pre-read entirely; everyone else keeps
     // today's read-then-CAS self-request denial.

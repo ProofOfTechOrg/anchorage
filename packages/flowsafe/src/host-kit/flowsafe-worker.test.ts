@@ -1776,3 +1776,321 @@ describe('createFlowsafeWorker schedule tick duty (Track D)', () => {
     );
   });
 });
+
+describe('createFlowsafeWorker approval decisions under the execution fence', () => {
+  // The store's create() takes a complete record. Requested by someone OTHER
+  // than the decider, so separation of duties is never what refuses a decide
+  // in these tests. `stepPath` makes it suspension-bound, i.e. a record whose
+  // decision genuinely drives a resume.
+  function pendingRecord(runId: string): ApprovalRecord {
+    const now = new Date('2026-08-01T00:00:00.000Z').toISOString();
+    return {
+      id: `approval-${runId}`,
+      workflowId: 'demo-approval',
+      runId,
+      stepPath: ['approval'],
+      title: 'publish launch post',
+      connectors: [],
+      priority: 'normal',
+      status: 'pending',
+      requestedBy: 'opal',
+      requestedByKind: 'human',
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
+
+  it('refuses a decide with 503 and commits NOTHING while migration-locked', async () => {
+    // #given — a worker composed exactly as a published host composes it, and a
+    // pending approval requested by someone OTHER than the decider (so
+    // separation of duties is not what refuses this).
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    const store = approvalStoreFactoryFor(env.DB).store();
+    const { record } = await store.create(pendingRecord('acme_run-fenced'));
+
+    // #and — the control plane locks the deployment through its own route, so
+    // the store the admin route moves and the store decide() reads are proven
+    // to be the same one.
+    env.MAINTENANCE_ADMIN_SECRET = 'maintenance-admin-secret-0000000001';
+    const locked = await worker.fetch(
+      new Request('http://host/admin/execution-fence', {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${env.MAINTENANCE_ADMIN_SECRET}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ expected: 'open', next: 'migration-locked' }),
+      }),
+      env,
+      ctx,
+    );
+    expect(locked.status).toBe(200);
+
+    // #when
+    const response = await worker.fetch(
+      authed(`http://host/api/approvals/${record.id}/decide`, {
+        method: 'POST',
+        body: JSON.stringify({ decision: 'approve' }),
+      }),
+      env,
+      ctx,
+    );
+
+    // #then — the taxonomy's retryable refusal, not a 500 and not a silent
+    // success. This is the case that made #assertDecidable dead code: the
+    // composer built the service without a fence, so every published host
+    // decided straight through a migration lock.
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCED', state: 'migration-locked' },
+    });
+
+    // #then — and NOTHING committed. decide() writes the decision and only
+    // then resumes, so a gate any later than the pre-commit check would leave
+    // this record durably 'approved' with a resume that 503s behind it, and
+    // the deployment taking over would inherit a decision with nothing behind
+    // it.
+    const stored = await store.get(record.id);
+    expect(stored).toMatchObject({ status: 'pending' });
+    expect(stored).not.toHaveProperty('decidedBy');
+    expect(stored).not.toHaveProperty('decision');
+    expect(stored).not.toHaveProperty('decidedAt');
+    // The whole row is byte-identical to the one that was seeded: not even
+    // updatedAt moved, so no audit trail and no reviewer notification fired
+    // either — decide() never reached its transition.
+    expect(stored).toEqual(record);
+  });
+
+  it('still decides while draining', async () => {
+    // #given — a drain finishes outstanding work, and a suspended run is
+    // waiting for exactly this decision.
+    const worker = makeWorker({
+      buildResumeRun: () => async () => successSummary('acme_run-draining'),
+    });
+    const { env, ctx } = makeEnv();
+    const store = approvalStoreFactoryFor(env.DB).store();
+    const { record } = await store.create(pendingRecord('acme_run-draining'));
+    env.MAINTENANCE_ADMIN_SECRET = 'maintenance-admin-secret-0000000001';
+    await worker.fetch(
+      new Request('http://host/admin/execution-fence', {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${env.MAINTENANCE_ADMIN_SECRET}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ expected: 'open', next: 'draining' }),
+      }),
+      env,
+      ctx,
+    );
+
+    // #when / #then
+    const response = await worker.fetch(
+      authed(`http://host/api/approvals/${record.id}/decide`, {
+        method: 'POST',
+        body: JSON.stringify({ decision: 'approve' }),
+      }),
+      env,
+      ctx,
+    );
+    expect(response.status).toBe(200);
+    await expect(store.get(record.id)).resolves.toMatchObject({
+      status: 'approved',
+    });
+  });
+});
+
+describe('createFlowsafeWorker execution-fence administration', () => {
+  const ADMIN_SECRET = 'maintenance-admin-secret-0000000001';
+
+  function fenceRequest(init: {
+    method: 'GET' | 'POST';
+    body?: unknown;
+    token?: string | null;
+  }): Request {
+    const token = init.token === undefined ? ADMIN_SECRET : init.token;
+    return new Request('http://host/admin/execution-fence', {
+      method: init.method,
+      headers: {
+        ...(token === null ? {} : { authorization: `Bearer ${token}` }),
+        ...(init.body === undefined
+          ? {}
+          : { 'content-type': 'application/json' }),
+      },
+      ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+    });
+  }
+
+  it('reads and moves the fence for an authenticated control plane', async () => {
+    // #given
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+
+    // #then — a 0.19-era database reads as open with no row at all.
+    const initial = await worker.fetch(
+      fenceRequest({ method: 'GET' }),
+      env,
+      ctx,
+    );
+    expect(initial.status).toBe(200);
+    expect(await initial.json()).toEqual({ state: 'open' });
+
+    // #when — the control plane drains, then locks.
+    const drained = await worker.fetch(
+      fenceRequest({
+        method: 'POST',
+        body: { expected: 'open', next: 'draining' },
+      }),
+      env,
+      ctx,
+    );
+    expect(drained.status).toBe(200);
+    expect(await drained.json()).toEqual({ state: 'draining' });
+
+    // #then — a STALE expectation is a 409 carrying the current state, so the
+    // loser of a control-plane race can re-plan without a second round trip.
+    const stale = await worker.fetch(
+      fenceRequest({
+        method: 'POST',
+        body: { expected: 'open', next: 'migration-locked' },
+      }),
+      env,
+      ctx,
+    );
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({
+      reason: { code: 'FENCE_CAS_CONFLICT', state: 'draining' },
+    });
+
+    // #then — entering proof-only names its key, and the read reports it.
+    await worker.fetch(
+      fenceRequest({
+        method: 'POST',
+        body: { expected: 'draining', next: 'migration-locked' },
+      }),
+      env,
+      ctx,
+    );
+    const proof = await worker.fetch(
+      fenceRequest({
+        method: 'POST',
+        body: {
+          expected: 'migration-locked',
+          next: 'proof-only',
+          proofKey: 'proof-1',
+        },
+      }),
+      env,
+      ctx,
+    );
+    expect(proof.status).toBe(200);
+    const observed = await worker.fetch(
+      fenceRequest({ method: 'GET' }),
+      env,
+      ctx,
+    );
+    expect(await observed.json()).toEqual({
+      state: 'proof-only',
+      proofKey: 'proof-1',
+    });
+  });
+
+  it('rejects an unknown state name as a client error', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+
+    const response = await worker.fetch(
+      fenceRequest({
+        method: 'POST',
+        body: { expected: 'open', next: 'quiesced' },
+      }),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(400);
+  });
+
+  it("refuses 'proof-only' with no proof key", async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+
+    const response = await worker.fetch(
+      fenceRequest({
+        method: 'POST',
+        body: { expected: 'open', next: 'proof-only' },
+      }),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(400);
+  });
+
+  it('401s a missing or wrong credential, and never leaks the state', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+
+    for (const token of [null, 'tok-ada']) {
+      const response = await worker.fetch(
+        fenceRequest({ method: 'GET', token }),
+        env,
+        ctx,
+      );
+      expect(response.status).toBe(401);
+      expect(await response.json()).toEqual({
+        error: 'authentication required',
+      });
+    }
+  });
+
+  it('503s when the control-plane credential is unconfigured', async () => {
+    // #given — the fence is the control that stops a deployment executing, so
+    // an unauthenticated caller must never be able to move it.
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    expect(env.MAINTENANCE_ADMIN_SECRET).toBeUndefined();
+
+    // #then
+    const response = await worker.fetch(
+      fenceRequest({ method: 'GET', token: null }),
+      env,
+      ctx,
+    );
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({
+      error: 'execution fence administration unavailable',
+    });
+  });
+
+  it('503s when the control-plane credential equals the deployment identity secret', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = env.DEPLOYMENT_IDENTITY_SECRET;
+
+    const response = await worker.fetch(
+      fenceRequest({ method: 'GET' }),
+      env,
+      ctx,
+    );
+    expect(response.status).toBe(503);
+  });
+
+  it('405s a method the fence surface does not serve', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+
+    const response = await worker.fetch(
+      new Request('http://host/admin/execution-fence', { method: 'DELETE' }),
+      env,
+      ctx,
+    );
+    expect(response.status).toBe(405);
+  });
+});

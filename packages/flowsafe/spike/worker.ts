@@ -120,10 +120,12 @@ import {
   createBackgroundTaskD1Domains,
 } from '../src/background-tasks/index.js';
 import {
+  assertExecutionFenceState,
   createD1Storage,
   createHostPubSub,
   DurableObjectRunner,
   doErrorResponse,
+  ExecutionFenceStore,
   ensureDeploymentIdentityBindings,
   HubDurableObject,
   type InitResult,
@@ -1226,6 +1228,10 @@ export class DemoThread extends ThreadDurableObject<Env> {
         requestContextForRun: agentHost.requestContextForRun(
           approvalGrantProvider(approvals),
         ),
+        // The composite store hides the binding init would have fenced from,
+        // so this thread DO names it: the fence must live in the SAME database
+        // as the state it fences.
+        executionFence: new ExecutionFenceStore(env.DB as unknown as never),
       },
     );
     this.#threadInit = threadInit;
@@ -1800,6 +1806,11 @@ function buildApprovalService(
     // caller keeps the publish alive with ctx.waitUntil (see fetch below).
     stream,
     resumeRun,
+    // DECIDE commits and then resumes, so the fence has to be consulted at the
+    // service — before the CAS — not left to the run DO's own resume gate. A
+    // decision that committed against a locked deployment would be durable with
+    // nothing behind it. Same database as the runs it gates.
+    executionFence: new ExecutionFenceStore(env.DB as unknown as never),
   });
 }
 
@@ -2649,6 +2660,60 @@ async function handleSuspensionDeadlineProbe(
   return json({ status: response.status, armed: await response.json() });
 }
 
+// --- Execution fence control probe (F1) ------------------------------------
+// LOCAL-ONLY worker-level fence control channel, in the same shape the
+// published admin route serves (`GET`/`POST /admin/execution-fence`, CAS on
+// `expected`).
+//
+// It is spike-local rather than the host-kit route because this worker composes
+// its routers by hand and never calls createFlowsafeWorker, so it configures no
+// MAINTENANCE_ADMIN_SECRET and mounts no /admin surface at all. What the spike
+// exists to prove is the part unit tests cannot: that the fence state is
+// DURABLE across process death and that the enforcement points refuse real HTTP
+// requests on real workerd. Both go through the same ExecutionFenceStore the
+// published route drives; only the authentication in front of it differs, and
+// that is covered by flowsafe-worker.test.ts.
+async function handleExecutionFenceProbe(
+  request: Request,
+  env: Env,
+): Promise<Response | null> {
+  const url = new URL(request.url);
+  if (url.pathname !== '/admin/execution-fence') return null;
+  const fence = new ExecutionFenceStore(env.DB as unknown as never);
+  try {
+    if (request.method === 'GET') {
+      const reading = await fence.read();
+      return json({
+        state: reading.state,
+        ...(reading.proofKey === undefined
+          ? {}
+          : { proofKey: reading.proofKey }),
+        ...(reading.proofRunId === undefined
+          ? {}
+          : { proofRunId: reading.proofRunId }),
+      });
+    }
+    if (request.method !== 'POST') {
+      return json({ error: 'method not allowed' }, 405);
+    }
+    const body = (await request.json()) as {
+      expected?: unknown;
+      next?: unknown;
+      proofKey?: unknown;
+    };
+    const reading = await fence.transition({
+      expected: assertExecutionFenceState(body.expected, 'expected'),
+      next: assertExecutionFenceState(body.next, 'next'),
+      ...(body.proofKey === undefined
+        ? {}
+        : { proofKey: body.proofKey as string }),
+    });
+    return json({ state: reading.state });
+  } catch (error) {
+    return doErrorResponse(error);
+  }
+}
+
 const handler: ExportedHandler<Env> = {
   async fetch(
     request: CfRequest,
@@ -2689,6 +2754,11 @@ const handler: ExportedHandler<Env> = {
       env.RUNNER,
       env.DEPLOYMENT_IDENTITY_SECRET,
     );
+
+    // The fence control channel, ahead of every router: an operator has to be
+    // able to move the fence on a deployment the fence is already refusing.
+    const fenceProbe = await handleExecutionFenceProbe(routed, env);
+    if (fenceProbe) return fenceProbe;
 
     const agentProbeResponse = await handleLiveAgentRoute(routed, env, resolve);
     if (agentProbeResponse) return agentProbeResponse;

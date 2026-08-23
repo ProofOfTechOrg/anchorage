@@ -34,6 +34,11 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SignJWT } from 'jose';
 import {
+  EXECUTION_FENCE_DDL,
+  EXECUTION_FENCE_ROW_ID,
+  EXECUTION_FENCE_TABLE,
+} from '#deployment-identity-protocol';
+import {
   createWorkerdServerLifecycle,
   parsePort,
 } from '../../../scripts/workerd-server-lifecycle.mjs';
@@ -329,6 +334,66 @@ function deadlineRunPath(runId) {
   return `/runs/${DEADLINE_WORKFLOW_ID}/${encodeURIComponent(runId)}`;
 }
 
+// --- Execution fence (F1) helpers ------------------------------------------
+// The fence control channel and the two assertions every fence probe makes:
+// the exact refusal CODE (not merely "some 5xx"), and the state it names.
+
+const FENCE_ADMIN_PATH = '/admin/execution-fence';
+
+async function readFence() {
+  const { status, body } = await http('GET', FENCE_ADMIN_PATH);
+  assert(status === 200, `GET ${FENCE_ADMIN_PATH} -> ${status}`, body);
+  return body;
+}
+
+async function moveFence(expected, next) {
+  const { status, body } = await http('POST', FENCE_ADMIN_PATH, {
+    body: { expected, next },
+  });
+  assert(
+    status === 200 && body.state === next,
+    `fence CAS ${expected} -> ${next} failed`,
+    { status, body },
+  );
+  return body;
+}
+
+// Every fence refusal is 503 (operator-transient, retryable) carrying
+// reason.code EXECUTION_FENCED and the state that refused. Asserting the code
+// and the state — rather than the status alone — is what separates "the fence
+// refused" from "something else broke with a 5xx".
+function assertFenced(label, response, state) {
+  assert(
+    response.status === 503 &&
+      response.body?.reason?.code === 'EXECUTION_FENCED' &&
+      response.body?.reason?.state === state,
+    `${label} must be refused 503 EXECUTION_FENCED in '${state}'`,
+    response,
+  );
+}
+
+async function startFencedRun(headers = AUTH.operator) {
+  const { status, body } = await http('POST', '/runs', {
+    body: RUN_BODY,
+    headers,
+  });
+  assert(
+    status === 200 && body.status === 'suspended',
+    `fence-probe run did not suspend -> ${status}`,
+    body,
+  );
+  assert(
+    typeof body.approval?.id === 'string',
+    'fence-probe approval id',
+    body,
+  );
+  return {
+    runId: body.runId,
+    approvalId: body.approval.id,
+    step: body.suspended?.[0],
+  };
+}
+
 // --- Track E (M-007) webhook probe helpers ---------------------------------
 
 // GitHub's X-Hub-Signature-256 = 'sha256=' + hex HMAC-SHA256(secret, rawBody).
@@ -575,10 +640,21 @@ async function main() {
   tmpDir = mkdtempSync(join(tmpdir(), 'spike-verify-'));
   const stateDir = join(tmpDir, 'state');
 
-  await step('provision deployment identity sentinel', () =>
+  // Provisioning, as the protocol performs it: the ownership sentinel AND an
+  // EXPLICIT execution fence row. The fence DDL is the protocol's own constant
+  // (the same string do-runner/execution-fence.ts issues), so this database is
+  // shaped exactly like one flowsafe-provision would have produced — a
+  // hand-copied schema here would let the store's CREATE TABLE IF NOT EXISTS
+  // silently accept a table with no CHECK constraints. 'open' because every
+  // scenario before the fence probes needs an executing deployment.
+  await step('provision deployment identity sentinel and execution fence', () =>
     executeLocalD1(
       stateDir,
-      "CREATE TABLE IF NOT EXISTS flowsafe_deployment (id INTEGER PRIMARY KEY CHECK (id = 1), tenant_tag TEXT NOT NULL, provisioned_at TEXT NOT NULL); INSERT OR IGNORE INTO flowsafe_deployment (id, tenant_tag, provisioned_at) VALUES (1, 'spike', datetime('now'));",
+      'CREATE TABLE IF NOT EXISTS flowsafe_deployment (id INTEGER PRIMARY KEY CHECK (id = 1), tenant_tag TEXT NOT NULL, provisioned_at TEXT NOT NULL); ' +
+        "INSERT OR IGNORE INTO flowsafe_deployment (id, tenant_tag, provisioned_at) VALUES (1, 'spike', datetime('now')); " +
+        `${EXECUTION_FENCE_DDL}; ` +
+        `INSERT OR IGNORE INTO ${EXECUTION_FENCE_TABLE} (id, state, proof_key, proof_run_id, updated_at) ` +
+        `VALUES ('${EXECUTION_FENCE_ROW_ID}', 'open', NULL, NULL, ${Date.now()});`,
     ),
   );
 
@@ -2311,6 +2387,200 @@ async function main() {
     },
   );
 
+  // --- Execution fence (F1): the migration control, on real workerd ---------
+  // Unit tests can prove the store's compare-and-set. What they cannot prove is
+  // that a fence written by one process still refuses work in the NEXT one, and
+  // that the refusal reaches an HTTP client as the taxonomy's own code rather
+  // than a generic 500 somewhere in the router chain. That is this scenario.
+
+  const fenceRuns = await step(
+    'FE0 fence baseline: the provisioned deployment is open and minting work',
+    async () => {
+      const initial = await readFence();
+      assert(
+        initial.state === 'open' &&
+          initial.proofKey === undefined &&
+          initial.proofRunId === undefined,
+        'provisioning seeded an explicit open fence with no proof binding',
+        initial,
+      );
+      // Two suspended runs minted while OPEN. One is drained through the
+      // fence's draining state, the other is left for the lock to refuse —
+      // both have to exist before the first transition, because a fenced
+      // deployment mints nothing.
+      const draining = await startFencedRun();
+      const locked = await startFencedRun();
+      assert(
+        draining.runId !== locked.runId,
+        'fence probes need two distinct runs',
+        { draining, locked },
+      );
+      return { draining, locked };
+    },
+  );
+
+  await step(
+    'FE1 draining: new starts are refused EXECUTION_FENCED while an existing ' +
+      "run's approval still resumes it to completion",
+    async () => {
+      await moveFence('open', 'draining');
+
+      const refusedStart = await http('POST', '/runs', {
+        body: RUN_BODY,
+        headers: AUTH.operator,
+      });
+      assertFenced('a run start under draining', refusedStart, 'draining');
+
+      // The whole point of draining: outstanding work must still be able to
+      // finish, or the drain can never complete. A different actor decides
+      // (separation of duties), and the resume runs the workflow to success.
+      const decided = await http(
+        'POST',
+        `/api/approvals/${fenceRuns.draining.approvalId}/decide`,
+        { headers: AUTH.reviewer, body: { decision: 'approve' } },
+      );
+      assert(
+        decided.status === 200 &&
+          decided.body.resume?.summary?.status === 'success',
+        'a draining deployment must still resume an already-suspended run',
+        decided,
+      );
+    },
+  );
+
+  await step(
+    'FE2 migration-locked: resume, approval decide, and start are all refused, ' +
+      'and the refused decision is not committed',
+    async () => {
+      await moveFence('draining', 'migration-locked');
+
+      const refusedStart = await http('POST', '/runs', {
+        body: RUN_BODY,
+        headers: AUTH.operator,
+      });
+      assertFenced(
+        'a run start under migration-locked',
+        refusedStart,
+        'migration-locked',
+      );
+
+      const refusedDecide = await http(
+        'POST',
+        `/api/approvals/${fenceRuns.locked.approvalId}/decide`,
+        { headers: AUTH.reviewer, body: { decision: 'approve' } },
+      );
+      assertFenced(
+        'an approval decision under migration-locked',
+        refusedDecide,
+        'migration-locked',
+      );
+
+      // The gate sits BEFORE the decision's compare-and-set: a decision that
+      // committed here would be durably recorded on a deployment that can never
+      // act on it, and the deployment taking over would inherit a decided
+      // approval with no resume behind it.
+      const stillPending = await http(
+        'GET',
+        `/api/approvals/${fenceRuns.locked.approvalId}`,
+        { headers: AUTH.viewer },
+      );
+      assert(
+        stillPending.status === 200 &&
+          stillPending.body.status === 'pending' &&
+          stillPending.body.decidedBy === undefined,
+        'the refused decision left the approval untouched',
+        stillPending,
+      );
+
+      // The run DO's own resume gate, reached directly rather than through the
+      // approval service — the fence has to hold on both paths.
+      const refusedResume = await http(
+        'POST',
+        `/runs/${RUN_BODY.workflowId}/${encodeURIComponent(fenceRuns.locked.runId)}/resume`,
+        {
+          headers: AUTH.operator,
+          body: {
+            step: fenceRuns.locked.step,
+            resumeData: { approved: true },
+          },
+        },
+      );
+      assertFenced(
+        'a raw resume under migration-locked',
+        refusedResume,
+        'migration-locked',
+      );
+    },
+  );
+
+  await step(
+    'FE3 fence persistence: the lock survives a workerd kill+restart and the ' +
+      'restarted process still refuses to mint work',
+    async () => {
+      await killServer(currentServer);
+      await launchServer(
+        'fence-restart',
+        stateDir,
+        join(tmpDir, 'fence-restart.log'),
+      );
+      assert(
+        !/address already in use/i.test(currentServer.chunks.join('')),
+        'fence-restart log must not contain "address already in use" (orphan trap)',
+      );
+
+      // Nothing in the new process has ever seen a fence transition: the only
+      // thing that carried the lock across process death is the D1 row.
+      const restored = await readFence();
+      assert(
+        restored.state === 'migration-locked',
+        'the fence state survived process death',
+        restored,
+      );
+      const refusedStart = await http('POST', '/runs', {
+        body: RUN_BODY,
+        headers: AUTH.operator,
+      });
+      assertFenced(
+        'a run start on the restarted locked deployment',
+        refusedStart,
+        'migration-locked',
+      );
+    },
+  );
+
+  await step(
+    'FE4 reopen: migration-locked -> open restores minting, and the approval ' +
+      'the lock refused now completes its run',
+    async () => {
+      await moveFence('migration-locked', 'open');
+      assert(
+        (await readFence()).state === 'open',
+        'the reopened fence reads back as open',
+      );
+
+      const started = await startFencedRun();
+      assert(
+        started.runId !== fenceRuns.locked.runId,
+        'the reopened deployment minted a fresh run',
+        started,
+      );
+
+      // Nothing was lost under the lock: the approval that was refused is still
+      // pending and still resumes its run.
+      const decided = await http(
+        'POST',
+        `/api/approvals/${fenceRuns.locked.approvalId}/decide`,
+        { headers: AUTH.reviewer, body: { decision: 'approve' } },
+      );
+      assert(
+        decided.status === 200 &&
+          decided.body.resume?.summary?.status === 'success',
+        'the approval refused under the lock completes once the fence reopens',
+        decided,
+      );
+    },
+  );
+
   await step(
     'S deployment sentinel mismatch: a freshly started Worker refuses a D1 ' +
       'provisioned for another deployment',
@@ -2381,7 +2651,14 @@ try {
       "reserved deadline key armed the run DO's own fenced wake, and after a " +
       'kill+restart that wake fired on the restarted object and resumed the run ' +
       'ITSELF with the timeout envelope under the system principal — no client ' +
-      'called resume. Finally, a fresh Worker refused a D1 sentinel stamped for ' +
+      'called resume. The deployment execution fence (F1): provisioning seeded ' +
+      'an explicit open fence, draining refused new starts with 503 ' +
+      'EXECUTION_FENCED while still resuming an outstanding approval to ' +
+      'success, migration-locked refused starts, raw resumes AND approval ' +
+      'decisions (leaving the refused decision uncommitted), that lock survived ' +
+      'a workerd kill+restart and still refused to mint, and reopening it ' +
+      'restored minting and completed the approval the lock had refused. ' +
+      'Finally, a fresh Worker refused a D1 sentinel stamped for ' +
       'another deployment with 503 before authentication or routing.',
   );
 } catch (error) {

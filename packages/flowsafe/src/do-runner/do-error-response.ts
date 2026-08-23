@@ -13,6 +13,8 @@
 // RunRouteError passthrough has nothing to pass through.
 
 import { DeploymentIdentityError } from './deployment-identity.js';
+import type { DoRefusalReason } from './do-status-error.js';
+import { DoStatusError } from './do-status-error.js';
 import {
   InvalidRunRequestError,
   RunAlreadyExistsError,
@@ -24,29 +26,11 @@ import {
   UnknownWorkflowError,
 } from './runtime.js';
 
-/**
- * The base for a DO's OWN refusal — the taxonomy's extension point, for the
- * statuses the runtime errors above do not cover. A shell declares one
- * (ThreadIdentityError's 403) and so does a host route:
- *
- * ```ts
- * class UnknownSignalError extends DoStatusError {
- *   readonly status = 404;
- * }
- * ```
- *
- * A CLASS, so opting in is `instanceof` — deliberate and nominal, the posture
- * AuditLogger takes. The structural alternative (any thrown
- * value with a numeric `status`) cannot tell a refusal this DO authored from the
- * arbitrary values its routes throw: an upstream client's `{status: 429}` would
- * become this API's 429, and `{status: 0}` — routine on HTTP-client error
- * objects — would make `new Response` raise inside the very catch whose job is
- * to never throw. Everything unrecognized stays a 500.
- */
-export abstract class DoStatusError extends Error {
-  /** The response status. 4xx/5xx only — see doErrorResponse. */
-  abstract readonly status: number;
-}
+// Re-exported under the name every shell already imports; the class itself
+// lives on a leaf so a refusal module can extend it without closing an import
+// cycle through this mapper (see do-status-error.ts).
+export type { DoRefusalReason };
+export { DoStatusError };
 
 function statusOf(error: unknown): number | undefined {
   // Mis-provisioned deployment (env tag vs D1 sentinel): the operator's
@@ -92,17 +76,30 @@ function statusOf(error: unknown): number | undefined {
 }
 
 /**
+ * The structured reason a refusal publishes, or undefined. Two channels, one
+ * renderer: RunLifecycleBlockedError predates DoStatusError and is a plain
+ * Error, while every refusal authored since carries its reason on the
+ * taxonomy's own base (ExecutionFencedError's EXECUTION_FENCED among them).
+ * Anything else has no reason to publish — an unclassified fault must not
+ * grow a machine-readable code it never defined.
+ */
+function reasonOf(error: unknown): unknown {
+  if (error instanceof RunLifecycleBlockedError) return error.reason;
+  if (error instanceof DoStatusError) return error.reason;
+  return undefined;
+}
+
+/**
  * Map a thrown error to the DO's HTTP response. Anything unrecognized is a 500
  * with its message — the honest answer for a fault this layer did not classify.
  */
 export function doErrorResponse(error: unknown): Response {
   const message = error instanceof Error ? error.message : String(error);
+  const reason = reasonOf(error);
   return new Response(
     JSON.stringify({
       error: message,
-      ...(error instanceof RunLifecycleBlockedError
-        ? { reason: error.reason }
-        : {}),
+      ...(reason === undefined ? {} : { reason }),
     }),
     {
       status: statusOf(error) ?? 500,

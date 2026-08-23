@@ -1,5 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import type { InitialExecutionFenceState } from '@proofoftech/flowsafe/deployment-identity-protocol';
+
+/**
+ * The execution-fence state a freshly provisioned deployment is born in —
+ * 'open' or 'migration-locked'.
+ *
+ * Re-exported so a control plane names the choice in its own types without
+ * reaching into flowsafe's protocol subpath. Deliberately NOT part of
+ * `DeploymentSpec`: see `provisionDeployment`'s option for why.
+ */
+export type { InitialExecutionFenceState };
+
 export type ProvisioningBackendKind = 'plain-worker' | 'workers-for-platforms';
 
 export interface WorkerModule {
@@ -567,10 +579,21 @@ export interface ProvisioningBackend {
     spec: DeploymentSpec,
     fence: ExternalMutationFence,
   ): Promise<DatabaseReference>;
+  /**
+   * Stamp the database's ownership sentinel and seed its initial execution
+   * fence row.
+   *
+   * `initialExecutionFenceState` is a REQUIRED parameter rather than backend
+   * configuration because it is a per-provisioning decision: the same control
+   * plane brings ordinary deployments up open and migration targets up locked.
+   * It carries no default anywhere on this path — a migration target that came
+   * up open would be executing exactly when it must not.
+   */
   seedDeploymentIdentity(
     database: DatabaseReference,
     tenantTag: string,
     fence: ExternalMutationFence,
+    initialExecutionFenceState: InitialExecutionFenceState,
   ): Promise<void>;
   readDeploymentIdentity(
     database: DatabaseReference,

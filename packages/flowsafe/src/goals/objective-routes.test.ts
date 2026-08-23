@@ -7,6 +7,8 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+
 import type { ActorContext, ApprovalActor } from '../approval-api/index.js';
 import {
   BREAKWATER_ACTOR_KEY,
@@ -15,6 +17,11 @@ import {
   BREAKWATER_ISOLATION_SCOPE_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
 } from '../do-runner/breakwater-keys.js';
+import {
+  type ExecutionFenceDatabase,
+  type ExecutionFenceState,
+  ExecutionFenceStore,
+} from '../do-runner/index.js';
 import { RunRouteError } from '../host-kit/index.js';
 import {
   createObjectiveRouter as createObjectiveRouterImpl,
@@ -691,5 +698,102 @@ describe('createObjectiveRouter internal errors', () => {
     } finally {
       log.mockRestore();
     }
+  });
+});
+
+describe('createObjectiveRouter and the deployment execution fence', () => {
+  async function fenceAt(
+    state: ExecutionFenceState,
+  ): Promise<ExecutionFenceStore> {
+    const fence = new ExecutionFenceStore(
+      sqliteUnitDatabase(openSqlite()) as ExecutionFenceDatabase,
+    );
+    await fence.seed(state);
+    return fence;
+  }
+
+  function unreadableFence(): ExecutionFenceStore {
+    // Storage that faults on every query — NOT the "no such table" a pre-0.20
+    // database answers with, which legitimately reads as open.
+    return new ExecutionFenceStore({
+      prepare: () => ({
+        bind: () => ({
+          bind: () => {
+            throw new Error('unreachable');
+          },
+          run: () => Promise.reject(new Error('D1_ERROR: network')),
+          all: () => Promise.reject(new Error('D1_ERROR: network')),
+        }),
+        run: () => Promise.reject(new Error('D1_ERROR: network')),
+        all: () => Promise.reject(new Error('D1_ERROR: network')),
+      }),
+    } as unknown as ExecutionFenceDatabase);
+  }
+
+  it('degrades a mutation closed with 503 when the fence cannot be read', async () => {
+    // #given
+    const { store, raw } = memoryStore();
+    const router = createObjectiveRouter({
+      resolve: async () => actorContext('operator'),
+      store,
+      executionFence: unreadableFence(),
+    });
+
+    // #then
+    const res = await router(
+      req('PUT', OWNED_THREAD, { objective: 'ship it' }),
+    );
+    expect(res?.status).toBe(503);
+    expect(await res?.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
+    });
+    expect(raw.size).toBe(0);
+  });
+
+  it('refuses every objective MUTATION once draining, and writes nothing', async () => {
+    // #given — a standing objective is authored work: it is what the agent loop
+    // re-reads to decide it should run again.
+    const { store, raw } = memoryStore();
+    const events: ObjectiveAuditEvent[] = [];
+    const router = createObjectiveRouter({
+      resolve: async () => actorContext('operator'),
+      store,
+      audit: (event) => {
+        events.push(event);
+      },
+      executionFence: await fenceAt('draining'),
+    });
+
+    // #when / #then
+    for (const request of [
+      req('PUT', OWNED_THREAD, { objective: 'ship it' }),
+      req('PATCH', OWNED_THREAD, { status: 'paused' }),
+      req('DELETE', OWNED_THREAD),
+    ]) {
+      const res = await router(request);
+      expect(res?.status).toBe(503);
+      expect(await res?.json()).toMatchObject({
+        reason: { code: 'EXECUTION_FENCED', state: 'draining' },
+      });
+    }
+    expect(raw.size).toBe(0);
+    expect(
+      events.filter((event) => event.reason === 'execution-fenced'),
+    ).toHaveLength(3);
+  });
+
+  it('keeps the objective READ open while locked', async () => {
+    // #given — a read moves nothing, and an operator proving a drain needs it.
+    const { store } = memoryStore();
+    const router = createObjectiveRouter({
+      resolve: async () => actorContext('operator'),
+      store,
+      executionFence: await fenceAt('migration-locked'),
+    });
+
+    // #then
+    const res = await router(req('GET', OWNED_THREAD));
+    expect(res?.status).toBe(200);
+    expect(await res?.json()).toEqual({ objective: null });
   });
 });

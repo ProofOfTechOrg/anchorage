@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it } from 'vitest';
 
+import { DEPLOYMENT_SENTINEL_DDL } from '#deployment-identity-protocol';
 import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import {
   assertDeploymentIdentity,
@@ -13,6 +14,7 @@ import {
   deploymentIdentityHeaders,
   ensureDeploymentIdentity,
   ensureDeploymentIdentityBindings,
+  type InitialExecutionFenceState,
   readDeploymentIdentity,
   seedDeploymentIdentity,
   verifyDurableObjectDeploymentIdentity,
@@ -125,11 +127,11 @@ describe('deployment identity provisioning', () => {
 
     expect(await readDeploymentIdentity(db)).toBeUndefined();
     await Promise.all([
-      seedDeploymentIdentity(db, 'acme'),
-      seedDeploymentIdentity(db, 'acme'),
+      seedDeploymentIdentity(db, 'acme', 'open'),
+      seedDeploymentIdentity(db, 'acme', 'open'),
     ]);
     expect(await readDeploymentIdentity(db)).toBe('acme');
-    await expect(seedDeploymentIdentity(db, 'globex')).rejects.toThrow(
+    await expect(seedDeploymentIdentity(db, 'globex', 'open')).rejects.toThrow(
       /already belongs to deployment 'acme'/,
     );
     expect(await readDeploymentIdentity(db)).toBe('acme');
@@ -146,7 +148,7 @@ describe('deployment identity provisioning', () => {
       .run();
 
     expect(await readDeploymentIdentity(db)).toBeUndefined();
-    await seedDeploymentIdentity(db, 'acme');
+    await seedDeploymentIdentity(db, 'acme', 'open');
     expect(await readDeploymentIdentity(db)).toBe('acme');
   });
 
@@ -154,6 +156,7 @@ describe('deployment identity provisioning', () => {
     const base = sqliteDatabase();
     const preparedQueries: string[] = [];
     const insertBindings: unknown[][] = [];
+    const fenceBindings: unknown[][] = [];
     const db: DeploymentIdentityDatabase = {
       prepare(query) {
         preparedQueries.push(query);
@@ -161,7 +164,16 @@ describe('deployment identity provisioning', () => {
         let bound = prepared;
         const statement: DeploymentIdentityStatement = {
           bind(...values) {
-            if (query.startsWith('INSERT OR IGNORE')) {
+            // Dispatch on the INSERT TARGET: the ownership insert names the
+            // fence table inside its exclusion list, so a substring test would
+            // count it twice.
+            if (
+              query.startsWith('INSERT OR IGNORE INTO flowsafe_execution_fence')
+            ) {
+              fenceBindings.push(values);
+            } else if (
+              query.startsWith('INSERT OR IGNORE INTO flowsafe_deployment')
+            ) {
               insertBindings.push(values);
             }
             bound = prepared.bind(...values);
@@ -174,10 +186,10 @@ describe('deployment identity provisioning', () => {
       },
     };
 
-    await seedDeploymentIdentity(db, 'acme');
+    await seedDeploymentIdentity(db, 'acme', 'migration-locked');
 
     const insert = preparedQueries.find((query) =>
-      query.startsWith('INSERT OR IGNORE'),
+      query.startsWith('INSERT OR IGNORE INTO flowsafe_deployment'),
     );
     expect(insert).toContain('SELECT 1, ?, ?');
     expect(insert).not.toContain("'acme'");
@@ -186,14 +198,90 @@ describe('deployment identity provisioning', () => {
     expect(insertBindings[0]?.[1]).toMatch(
       /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
     );
+
+    // The fence row rides the same bound-parameter boundary — the caller's
+    // chosen state reaches D1 as a binding, never interpolated into SQL.
+    const fenceInsert = preparedQueries.find((query) =>
+      query.startsWith('INSERT OR IGNORE INTO flowsafe_execution_fence'),
+    );
+    expect(fenceInsert).toContain('VALUES (?, ?, NULL, NULL, ?)');
+    expect(fenceInsert).not.toContain("'migration-locked'");
+    expect(fenceBindings).toHaveLength(1);
+    expect(fenceBindings[0]?.[0]).toBe('deployment');
+    expect(fenceBindings[0]?.[1]).toBe('migration-locked');
+    expect(fenceBindings[0]?.[2]).toMatch(/^\d+$/);
+
+    // ... and lands as the state that was asked for, on the single fixed row.
+    const fenceRows = await base
+      .prepare(
+        'SELECT id, state, proof_key, proof_run_id FROM flowsafe_execution_fence',
+      )
+      .all();
+    expect(fenceRows.results).toEqual([
+      {
+        id: 'deployment',
+        state: 'migration-locked',
+        proof_key: null,
+        proof_run_id: null,
+      },
+    ]);
+  });
+
+  it('never reopens a fence an operator closed when provisioning re-runs', async () => {
+    const db = sqliteDatabase();
+    await seedDeploymentIdentity(db, 'acme', 'migration-locked');
+
+    // A re-provision asking for 'open' must leave the closed fence alone: the
+    // row is INSERT-if-absent, not an upsert.
+    await seedDeploymentIdentity(db, 'acme', 'open');
+
+    const rows = await db
+      .prepare('SELECT state FROM flowsafe_execution_fence')
+      .all<{ state: string }>();
+    expect(rows.results).toEqual([{ state: 'migration-locked' }]);
+  });
+
+  it('heals a fence row an interrupted provisioning pass never wrote', async () => {
+    const db = sqliteDatabase();
+    // Ownership stamped, fence absent: the residue of a crash between the two
+    // writes, which the already-owned early return has to repair.
+    await db.prepare(DEPLOYMENT_SENTINEL_DDL).run();
+    await db
+      .prepare(
+        'INSERT INTO flowsafe_deployment (id, tenant_tag, provisioned_at) VALUES (1, ?, ?)',
+      )
+      .bind('acme', new Date(0).toISOString())
+      .run();
+
+    await seedDeploymentIdentity(db, 'acme', 'migration-locked');
+
+    const rows = await db
+      .prepare('SELECT state FROM flowsafe_execution_fence')
+      .all<{ state: string }>();
+    expect(rows.results).toEqual([{ state: 'migration-locked' }]);
+  });
+
+  it('refuses a fence state that is not a legal birth state', async () => {
+    const db = sqliteDatabase();
+    for (const state of ['draining', 'proof-only', 'open ', '']) {
+      await expect(
+        seedDeploymentIdentity(
+          db,
+          'acme',
+          state as unknown as InitialExecutionFenceState,
+        ),
+      ).rejects.toThrow(/must be one of open, migration-locked/);
+    }
+    // Nothing was stamped: the state is validated before the first statement.
+    expect(await readDeploymentIdentity(db)).toBeUndefined();
   });
 
   it('refuses malformed provisioning input and malformed sentinel content', async () => {
     const db = sqliteDatabase();
-    await expect(seedDeploymentIdentity(db, 'ACME')).rejects.toBeInstanceOf(
-      DeploymentIdentityError,
-    );
-    await seedDeploymentIdentity(db, 'acme');
+    await expect(
+      seedDeploymentIdentity(db, 'ACME', 'open'),
+    ).rejects.toBeInstanceOf(DeploymentIdentityError);
+    await seedDeploymentIdentity(db, 'acme', 'open');
     await db
       .prepare('UPDATE flowsafe_deployment SET tenant_tag = ? WHERE id = 1')
       .bind('ACME')
@@ -204,7 +292,7 @@ describe('deployment identity provisioning', () => {
     await expect(assertDeploymentIdentity(db, 'acme')).rejects.toThrow(
       /tenant_tag is malformed/,
     );
-    await expect(seedDeploymentIdentity(db, 'acme')).rejects.toThrow(
+    await expect(seedDeploymentIdentity(db, 'acme', 'open')).rejects.toThrow(
       /tenant_tag is malformed/,
     );
   });
@@ -273,7 +361,7 @@ describe('deployment identity provisioning', () => {
   ])('refuses to adopt an unowned database containing %s', async (table) => {
     const db = sqliteDatabase();
     await db.prepare(`CREATE TABLE ${table} (id TEXT PRIMARY KEY)`).run();
-    await expect(seedDeploymentIdentity(db, 'acme')).rejects.toThrow(
+    await expect(seedDeploymentIdentity(db, 'acme', 'open')).rejects.toThrow(
       /unowned database already contains application tables/,
     );
   });
@@ -286,7 +374,7 @@ describe('deployment identity provisioning', () => {
   ])('does not treat near-system table %s as D1-owned', async (table) => {
     const db = sqliteDatabase();
     await db.prepare(`CREATE TABLE ${table} (id TEXT PRIMARY KEY)`).run();
-    await expect(seedDeploymentIdentity(db, 'acme')).rejects.toThrow(
+    await expect(seedDeploymentIdentity(db, 'acme', 'open')).rejects.toThrow(
       /unowned database already contains application tables/,
     );
   });
@@ -297,7 +385,7 @@ describe('deployment identity provisioning', () => {
   ])('allows the exact D1-owned %s table', async (table) => {
     const db = sqliteDatabase();
     await db.prepare(`CREATE TABLE ${table} (key TEXT PRIMARY KEY)`).run();
-    await seedDeploymentIdentity(db, 'acme');
+    await seedDeploymentIdentity(db, 'acme', 'open');
     await expect(readDeploymentIdentity(db)).resolves.toBe('acme');
   });
 
@@ -332,9 +420,9 @@ describe('deployment identity provisioning', () => {
       },
     };
 
-    await expect(seedDeploymentIdentity(racing, 'acme')).rejects.toThrow(
-      /raced_application/,
-    );
+    await expect(
+      seedDeploymentIdentity(racing, 'acme', 'open'),
+    ).rejects.toThrow(/raced_application/);
     await expect(readDeploymentIdentity(base)).resolves.toBeUndefined();
   });
 });
@@ -342,7 +430,7 @@ describe('deployment identity provisioning', () => {
 describe('deployment identity runtime guard', () => {
   it('accepts a matching sentinel and fails closed on missing or mismatched identity', async () => {
     const matching = sqliteDatabase();
-    await seedDeploymentIdentity(matching, 'acme');
+    await seedDeploymentIdentity(matching, 'acme', 'open');
     await expect(assertDeploymentIdentity(matching, 'acme')).resolves.toBe(
       undefined,
     );
@@ -360,7 +448,7 @@ describe('deployment identity runtime guard', () => {
     let reads = 0;
     let failures = 2;
     const seeded = sqliteDatabase();
-    await seedDeploymentIdentity(seeded, 'acme');
+    await seedDeploymentIdentity(seeded, 'acme', 'open');
     const db = interceptSentinelRead(seeded, () => {
       reads += 1;
       if (failures > 0) {
@@ -396,7 +484,7 @@ describe('deployment identity runtime guard', () => {
 
   it('requires matching bindings in production DOs and skips node-only instances', async () => {
     const db = sqliteDatabase();
-    await seedDeploymentIdentity(db, 'acme');
+    await seedDeploymentIdentity(db, 'acme', 'open');
     const state = { id: { name: 'instance' } };
 
     await expect(
@@ -423,7 +511,7 @@ describe('deployment identity runtime guard', () => {
 
   it('validates all Worker bindings before touching routes', async () => {
     const db = sqliteDatabase();
-    await seedDeploymentIdentity(db, 'acme');
+    await seedDeploymentIdentity(db, 'acme', 'open');
     await expect(
       ensureDeploymentIdentityBindings({
         DB: db,
@@ -448,8 +536,8 @@ describe('deployment identity runtime guard', () => {
   it('verifies every D1-shaped binding at Worker and Durable Object entry', async () => {
     const primary = sqliteDatabase();
     const secondary = sqliteDatabase();
-    await seedDeploymentIdentity(primary, 'acme');
-    await seedDeploymentIdentity(secondary, 'other');
+    await seedDeploymentIdentity(primary, 'acme', 'open');
+    await seedDeploymentIdentity(secondary, 'other', 'open');
     const env = {
       DB: primary,
       SCHEDULES_DB: secondary,
@@ -465,7 +553,7 @@ describe('deployment identity runtime guard', () => {
     ).rejects.toThrow(/belongs to 'other'/);
 
     const matchingSecondary = sqliteDatabase();
-    await seedDeploymentIdentity(matchingSecondary, 'acme');
+    await seedDeploymentIdentity(matchingSecondary, 'acme', 'open');
     const matchingEnv = {
       ...env,
       SCHEDULES_DB: matchingSecondary,
@@ -477,7 +565,7 @@ describe('deployment identity runtime guard', () => {
 
   it('never adopts an RPC binding as a deployment database', async () => {
     const db = sqliteDatabase();
-    await seedDeploymentIdentity(db, 'acme');
+    await seedDeploymentIdentity(db, 'acme', 'open');
     // A service binding with a named entrypoint, and a Durable Object stub, are
     // proxies that answer EVERY property with a callable. A `prepare`-only test
     // adopts them, and the sentinel scan then dies with "The RPC receiver does
@@ -512,7 +600,7 @@ describe('deployment identity runtime guard', () => {
     // The positive control: a real second D1 binding is still scanned, so the
     // exclusion above cannot be over-broad.
     const secondary = sqliteDatabase();
-    await seedDeploymentIdentity(secondary, 'other');
+    await seedDeploymentIdentity(secondary, 'other', 'open');
     const withSecondDatabase = { ...env, SCHEDULES_DB: secondary };
     await expect(
       ensureDeploymentIdentityBindings(withSecondDatabase),
@@ -521,7 +609,7 @@ describe('deployment identity runtime guard', () => {
 
   it('rejects a Worker request from a differently credentialed deployment', async () => {
     const db = sqliteDatabase();
-    await seedDeploymentIdentity(db, 'acme');
+    await seedDeploymentIdentity(db, 'acme', 'open');
     const state = { id: { name: 'instance' } };
     const env = {
       DB: db,
@@ -557,7 +645,7 @@ describe('deployment identity runtime guard', () => {
 
   it('rejects the caller credential before reading any D1 sentinel', async () => {
     const seeded = sqliteDatabase();
-    await seedDeploymentIdentity(seeded, 'acme');
+    await seedDeploymentIdentity(seeded, 'acme', 'open');
     let sentinelReads = 0;
     const db = interceptSentinelRead(seeded, () => {
       sentinelReads += 1;
@@ -585,7 +673,7 @@ describe('deployment identity runtime guard', () => {
 
   it('rejects a malformed configured credential before reading D1', async () => {
     const seeded = sqliteDatabase();
-    await seedDeploymentIdentity(seeded, 'acme');
+    await seedDeploymentIdentity(seeded, 'acme', 'open');
     let sentinelReads = 0;
     const db = interceptSentinelRead(seeded, () => {
       sentinelReads += 1;

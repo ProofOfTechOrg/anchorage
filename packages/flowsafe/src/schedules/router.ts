@@ -65,6 +65,13 @@ import {
   RUN_START_ROLES,
 } from '../approval-api/index.js';
 import {
+  admitsWorkAuthoring,
+  type ExecutionFenceStore,
+  executionFencedResponse,
+  isExecutionFenceRefusal,
+  OPEN_EXECUTION_FENCE,
+} from '../do-runner/index.js';
+import {
   type BoundThreadTargetValidator,
   RunRouteError,
   requireMemoryId,
@@ -168,6 +175,18 @@ export interface ScheduleRouterOptions {
    * zero denies every non-empty body. Default 16384 (16 KiB).
    */
   maxContentBytes?: number;
+  /**
+   * The deployment execution fence. Absent ⇒ this router is unfenced.
+   *
+   * Optional here and REQUIRED at `init()` on purpose: the runtime is the
+   * closure guarantee (every mint funnels through it, and the schedule TICK
+   * reads the fence before it claims a fire), so this gate is the same refusal
+   * made earlier — an operator draining a deployment sees a schedule create
+   * refused at the API instead of accepted and then never fired. A router
+   * receives a store facade and a resolver, not a database, so it cannot build
+   * one for itself the way init can.
+   */
+  executionFence?: ExecutionFenceStore;
   /** Route prefix. Default '/api/schedules'. */
   basePath?: string;
 }
@@ -675,10 +694,21 @@ function buildCreateRow(
   };
 }
 
+/**
+ * The operations the execution fence blocks past `open`: every one of them
+ * ARMS a future fire. `pause` and `delete` are deliberately absent — they take
+ * work away, which is what a drain wants — and so are the three reads.
+ */
+const FENCE_GATED_SCHEDULE_OPERATIONS = new Set<ScheduleOperation>([
+  'create',
+  'update',
+  'resume',
+]);
+
 export function createScheduleRouter(
   options: ScheduleRouterOptions,
 ): ScheduleRouter {
-  const { resolve, store, targetPolicy } = options;
+  const { executionFence, resolve, store, targetPolicy } = options;
   const roles = options.roles ?? RUN_START_ROLES;
   const maxSchedules = nonnegativeSafeInteger(
     options.maxSchedules ?? 100,
@@ -776,6 +806,24 @@ export function createScheduleRouter(
       if (operation === 'create' && !roles.includes(context.actor.role)) {
         await audit('rejected', 'forbidden-role');
         return json({ error: 'forbidden' }, 403);
+      }
+
+      // The execution fence, after authentication so a refusal is auditable
+      // and tells an anonymous caller nothing about the deployment's state.
+      // Only the operations that ARM future fires are gated: pause and delete
+      // remove work, which is the direction a drain is going, and reads stay
+      // open in every state.
+      if (FENCE_GATED_SCHEDULE_OPERATIONS.has(operation)) {
+        const reading = executionFence
+          ? await executionFence.read()
+          : OPEN_EXECUTION_FENCE;
+        if (!admitsWorkAuthoring(reading)) {
+          await audit('rejected', 'execution-fenced');
+          return executionFencedResponse(
+            reading.state,
+            `schedule ${operation}`,
+          );
+        }
       }
 
       // LIST returns only schedules this principal may read. Reviewer/admin
@@ -985,6 +1033,17 @@ export function createScheduleRouter(
       await auditCommittedMutation();
       return json({ schedule: toView(updated) });
     } catch (error) {
+      // A fence that could not be READ is not evidence the deployment is open,
+      // so it degrades closed with its own retryable 503 rather than the
+      // generic 500 below — an operator must be able to tell a deployment
+      // that is being migrated from one that is broken.
+      if (isExecutionFenceRefusal(error)) {
+        await audit('rejected', 'execution-fence-unreadable');
+        return json(
+          { error: error.message, reason: error.reason },
+          error.status,
+        );
+      }
       if (error instanceof RunRouteError) {
         await audit(
           'rejected',

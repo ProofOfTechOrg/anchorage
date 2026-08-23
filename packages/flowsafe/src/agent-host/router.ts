@@ -6,7 +6,11 @@ import {
   RUN_START_ROLES,
 } from '../approval-api/index.js';
 import { isPathSafeId } from '../do-runner/index.js';
-import { RunRouteError, requireResourceAccess } from '../host-kit/index.js';
+import {
+  RunRouteError,
+  requireResourceAccess,
+  runRouteReason,
+} from '../host-kit/index.js';
 import { readBoundedBody } from '../http-body.js';
 import { createAgentCatalog } from './catalog.js';
 import type { AgentThreadTopology } from './thread-topology.js';
@@ -184,7 +188,11 @@ function internalError(error: unknown, route: MatchedRoute): Response {
     return json({ error: 'forbidden' }, 403);
   }
   if (error instanceof RunRouteError) {
-    if (error.status < 500) {
+    // A structured reason is the DO saying what it refused and why, in a code
+    // it means to publish — so it passes through at ANY status, 5xx included.
+    // Without this a 503 EXECUTION_FENCED became a bare 500 here and the
+    // caller could not tell a fenced deployment from a broken one.
+    if (error.status < 500 || runRouteReason(error) !== undefined) {
       return json(
         {
           error: error.message,

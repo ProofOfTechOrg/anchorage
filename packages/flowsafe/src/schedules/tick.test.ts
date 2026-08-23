@@ -5,6 +5,11 @@
 
 import type { Schedule, ScheduleTrigger } from '@mastra/core/storage';
 import { describe, expect, it, vi } from 'vitest';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+import {
+  type ExecutionFenceDatabase,
+  ExecutionFenceStore,
+} from '../do-runner/index.js';
 import type { ScheduleFireClaim } from './schedules-d1.js';
 import { createScheduleTargetPolicy } from './target-policy.js';
 import {
@@ -1151,5 +1156,98 @@ describe('the P4 reserved-key barrier helpers', () => {
       'breakwater.workflowScope': 'runtime',
       collide: 'runtime',
     });
+  });
+});
+
+describe('createScheduleTick and the deployment execution fence', () => {
+  function fence(): ExecutionFenceStore {
+    return new ExecutionFenceStore(
+      sqliteUnitDatabase(openSqlite()) as ExecutionFenceDatabase,
+    );
+  }
+
+  it('leaves a due fire UNCLAIMED on a fenced pass, then fires it after reopen', async () => {
+    // #given — a due schedule on a deployment that just started draining.
+    const store = new FakeStore();
+    store.seed(workflowSchedule());
+    const start = vi.fn(async ({ runId }: { runId: string }) => ({ runId }));
+    const executionFence = fence();
+    await executionFence.seed('draining');
+    const tick = createScheduleTick({
+      store,
+      start,
+      executionFence,
+      now: () => NOW,
+    });
+
+    // #when
+    const fenced = await tick();
+
+    // #then — the pass did nothing at all. Claiming a fire it will not run
+    // would CONSUME it (the claim advances nextFireAt), so the fire would be
+    // lost rather than deferred.
+    expect(fenced).toEqual({
+      due: 0,
+      fired: 0,
+      skipped: 0,
+      failed: 0,
+      deferred: 0,
+      reconciled: 0,
+      lost: 0,
+    });
+    expect(start).not.toHaveBeenCalled();
+    expect(store.triggers).toEqual([]);
+    expect(store.schedules.get('schedule_a')?.nextFireAt).toBe(NOW - 1000);
+
+    // #when — the migration finishes and the fence reopens.
+    await executionFence.transition({ expected: 'draining', next: 'open' });
+    const reopened = await tick();
+
+    // #then — the SAME fire runs, exactly once: neither lost nor duplicated.
+    expect(reopened.due).toBe(1);
+    expect(reopened.fired).toBe(1);
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips the pass rather than claiming when the fence cannot be read', async () => {
+    // #given — a fence whose storage is down. This runs on a maintenance
+    // alarm, so degrading closed means doing NOTHING, not throwing: a throw
+    // would fail the duty, and proceeding would claim fires on a deployment
+    // whose state is unknown.
+    const store = new FakeStore();
+    store.seed(workflowSchedule());
+    const start = vi.fn(async ({ runId }: { runId: string }) => ({ runId }));
+    const unreadable = new ExecutionFenceStore({
+      prepare: () => ({
+        bind: () => ({
+          bind: () => {
+            throw new Error('unreachable');
+          },
+          run: () => Promise.reject(new Error('D1_ERROR: network')),
+          all: () => Promise.reject(new Error('D1_ERROR: network')),
+        }),
+        run: () => Promise.reject(new Error('D1_ERROR: network')),
+        all: () => Promise.reject(new Error('D1_ERROR: network')),
+      }),
+    } as unknown as ExecutionFenceDatabase);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    // #when
+    let result: Awaited<ReturnType<ReturnType<typeof createScheduleTick>>>;
+    try {
+      result = await createScheduleTick({
+        store,
+        start,
+        executionFence: unreadable,
+        now: () => NOW,
+      })();
+    } finally {
+      log.mockRestore();
+    }
+
+    // #then
+    expect(result.due).toBe(0);
+    expect(start).not.toHaveBeenCalled();
+    expect(store.schedules.get('schedule_a')?.nextFireAt).toBe(NOW - 1000);
   });
 });

@@ -1213,6 +1213,7 @@ describe('WorkersForPlatformsBackend', () => {
         }),
     });
     const result = await provisionDeployment({
+      initialExecutionFenceState: 'open',
       backend,
       store: new MemoryFleetStore(),
       spec: audited,
@@ -1245,6 +1246,7 @@ describe('WorkersForPlatformsBackend', () => {
       });
       await expect(
         provisionDeployment({
+          initialExecutionFenceState: 'open',
           backend,
           store: new MemoryFleetStore(result.record),
           spec: audited,
@@ -1265,6 +1267,7 @@ describe('WorkersForPlatformsBackend', () => {
     });
     await expect(
       provisionDeployment({
+        initialExecutionFenceState: 'open',
         backend,
         store: new MemoryFleetStore(result.record),
         spec: audited,

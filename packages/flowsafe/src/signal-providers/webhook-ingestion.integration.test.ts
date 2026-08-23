@@ -112,7 +112,7 @@ async function wireWebhookChain(
       ...(contentPolicy !== undefined ? { contentPolicy } : {}),
     });
     protected build(): InitResult {
-      return init({ storage });
+      return init({ storage }, { executionFence: 'none' });
     }
     protected async route(
       request: Request,

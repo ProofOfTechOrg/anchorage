@@ -71,16 +71,53 @@ export function assertAttwEsmReport(report, status, stderr = '') {
   const internal = analysis.problems.filter(
     (problem) => problem.kind === 'InternalResolutionError',
   );
-  assert.ok(internal.length <= 1, 'unexpected ATTW internal-resolution errors');
-  if (internal[0]) {
-    assert.equal(internal[0].resolutionOption, 'node10');
-    assert.equal(internal[0].moduleSpecifier, '#deployment-identity-protocol');
-    assert.match(
-      internal[0].fileName,
-      /\/dist\/do-runner\/deployment-identity\.d\.ts$/,
+  // Node 10 resolution predates subpath `imports`, so every declaration that
+  // imports `#deployment-identity-protocol` raises one internal-resolution
+  // error under that option. The package publishes esm-only and node10 is
+  // already an ignored profile (see IGNORED_PROFILE_PROBLEMS), so these are
+  // accepted — but pinned three ways, because an internal import that genuinely
+  // does not resolve (a broken relative path in the emitted types) is exactly
+  // what this check exists to catch, and it would carry a different specifier.
+  //
+  // The file list is deliberate, not a count. Adding a module that imports the
+  // protocol means adding it here — a decision, since each one is another
+  // declaration a Node 10 consumer cannot resolve.
+  const PROTOCOL_IMPORTING_DECLARATIONS = [
+    '/dist/do-runner/deployment-identity.d.ts',
+    '/dist/do-runner/execution-fence.d.ts',
+  ];
+  for (const problem of internal) {
+    const detail = JSON.stringify({
+      fileName: problem.fileName,
+      moduleSpecifier: problem.moduleSpecifier,
+      resolutionOption: problem.resolutionOption,
+    });
+    assert.equal(
+      problem.resolutionOption,
+      'node10',
+      `unexpected ATTW internal-resolution error: ${detail}`,
+    );
+    assert.equal(
+      problem.moduleSpecifier,
+      '#deployment-identity-protocol',
+      `unexpected ATTW internal-resolution error: ${detail}`,
+    );
+    assert.ok(
+      PROTOCOL_IMPORTING_DECLARATIONS.some((suffix) =>
+        problem.fileName.endsWith(suffix),
+      ),
+      `unexpected ATTW internal-resolution error: ${detail}`,
     );
   }
-  assert.equal(status, internal.length, `ATTW exited ${status}\n${stderr}`);
+  // ATTW exits non-zero when it reports anything the profile does not ignore.
+  // Under esm-only the accepted node10 entries above are the only such
+  // problems, so a non-zero exit must be explained by them and a zero exit must
+  // mean there were none.
+  assert.equal(
+    status === 0,
+    internal.length === 0,
+    `ATTW exited ${status}\n${stderr}`,
+  );
 
   for (const problem of analysis.problems) {
     if (problem.kind === 'InternalResolutionError') continue;

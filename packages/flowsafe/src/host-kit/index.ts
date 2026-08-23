@@ -113,7 +113,7 @@ export {
 export type { WorkflowIdSource } from './registration.js';
 export { assertWorkflowsRegistered } from './registration.js';
 export { requireResourceAccess } from './resource-access.js';
-export { RunRouteError } from './run-route-error.js';
+export { RunRouteError, runRouteReason } from './run-route-error.js';
 export type {
   RunRouter,
   RunRouterOptions,

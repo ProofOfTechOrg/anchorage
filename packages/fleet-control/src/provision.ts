@@ -44,6 +44,7 @@ import type {
   FleetRecord,
   FleetStateLease,
   FleetStateStore,
+  InitialExecutionFenceState,
   MaintenanceHealth,
   ProvisioningBackend,
   ProvisioningPhase,
@@ -573,6 +574,24 @@ export interface ProvisionDeploymentOptions {
   readonly store: FleetStateStore;
   readonly spec: DeploymentSpec;
   readonly secrets: DeploymentSecrets;
+  /**
+   * The execution-fence state this deployment is born in. REQUIRED; no default.
+   *
+   * It lives on the OPTIONS and deliberately not on `DeploymentSpec`. The spec
+   * is the digested canonical description of a deployment
+   * (`deploymentSpecDigest`), and every stored record, drift audit, and
+   * migration decision compares against that digest — adding a field to it
+   * would change the digest of every deployment already in the fleet and
+   * present as fleet-wide drift, scheduling migrations for artifacts nobody
+   * touched.
+   *
+   * It is also provisioning-time-only by nature: after the first pass the fence
+   * is live operational state an operator moves through
+   * `POST /admin/execution-fence`, so `migrateFleet`, `rollbackExternalRelease`
+   * and `decommissionDeployment` neither take it nor need it — re-seeding is
+   * INSERT-if-absent and can only ever repair a missing row.
+   */
+  readonly initialExecutionFenceState: InitialExecutionFenceState;
   readonly finalizedStateProvider?: FinalizedOrdinaryStateProvider;
   readonly clock?: () => number;
 }
@@ -841,7 +860,12 @@ async function provisionDeploymentUnderLease(
 
     if (record.phase === 'database-created') {
       await lease.assertOwned();
-      await backend.seedDeploymentIdentity(database, spec.tenantTag, lease);
+      await backend.seedDeploymentIdentity(
+        database,
+        spec.tenantTag,
+        lease,
+        options.initialExecutionFenceState,
+      );
       databaseOwnershipProven = true;
       record = {
         ...record,
@@ -1424,10 +1448,17 @@ async function cleanupDeploymentArtifactsUnderLease(
       );
     }
     await lease.assertOwned();
+    // A freshness PROOF, not a provisioning: this database is stamped only so
+    // the read-back below can show it was empty, and it is deleted three lines
+    // later. The fence state is therefore hard-coded rather than taken from the
+    // caller — cleanup has no provisioning options to take it from — and it is
+    // 'migration-locked' because a database that survives a failed delete must
+    // never come back as one that executes.
     await backend.seedDeploymentIdentity(
       reservedDatabase,
       record.tenantTag,
       lease,
+      'migration-locked',
     );
     const seededOwner = await backend.readDeploymentIdentity(
       reservedDatabase,

@@ -1792,15 +1792,22 @@ export default {
   provisioned_at TEXT NOT NULL
 )`;
     let sentinelExists = false;
+    let fenceExists = false;
     let owner: string | undefined;
+    let fenceBindings: readonly unknown[] | undefined;
     const runner = new FakeRunner();
     const routeApi = new FakeRouteApi();
     routeApi.queryHandler = async (sql, bindings) => {
       let results: readonly Readonly<Record<string, unknown>>[] = [];
       if (sql.includes("sqlite_schema WHERE type = 'table' ORDER BY name")) {
-        results = sentinelExists
-          ? [{ name: 'flowsafe_deployment', sql: sentinelDdl }]
-          : [];
+        results = [
+          ...(sentinelExists
+            ? [{ name: 'flowsafe_deployment', sql: sentinelDdl }]
+            : []),
+          ...(fenceExists
+            ? [{ name: 'flowsafe_execution_fence', sql: 'CREATE' }]
+            : []),
+        ];
       } else if (
         sql.includes('name = ?') &&
         bindings[0] === 'flowsafe_deployment'
@@ -1814,6 +1821,16 @@ export default {
         ];
       } else if (sql.startsWith('SELECT id, tenant_tag')) {
         results = owner ? [{ id: 1, tenant_tag: owner }] : [];
+      } else if (
+        // Matched on the TARGET table, ahead of the generic arms: the ownership
+        // insert names the fence table inside its exclusion list.
+        sql.startsWith('CREATE TABLE IF NOT EXISTS flowsafe_execution_fence')
+      ) {
+        fenceExists = true;
+      } else if (
+        sql.startsWith('INSERT OR IGNORE INTO flowsafe_execution_fence')
+      ) {
+        fenceBindings = bindings;
       } else if (sql.startsWith('CREATE TABLE')) {
         sentinelExists = true;
       } else if (sql.startsWith('INSERT OR IGNORE')) {
@@ -1826,7 +1843,12 @@ export default {
     await expect(
       subject.readDeploymentIdentity(database, mutationFence),
     ).resolves.toBeUndefined();
-    await subject.seedDeploymentIdentity(database, 'acme', mutationFence);
+    await subject.seedDeploymentIdentity(
+      database,
+      'acme',
+      mutationFence,
+      'migration-locked',
+    );
     await expect(
       subject.readDeploymentIdentity(database, mutationFence),
     ).resolves.toBe('acme');
@@ -1837,6 +1859,16 @@ export default {
         (query) => query.databaseId === database.id,
       ),
     ).toBe(true);
+    // The fence rides the same fenced provider-native path, and every binding
+    // reaches it as a STRING — the plain-Worker adapter rejects anything else
+    // (restD1Bindings), which is why the seeded timestamp is bound as text and
+    // left to SQLite's INTEGER affinity.
+    expect(fenceExists).toBe(true);
+    expect(fenceBindings).toEqual([
+      'deployment',
+      'migration-locked',
+      expect.stringMatching(/^\d+$/),
+    ]);
   });
 
   it('forwards SQLite literals, identifiers, comments, and numbered parameters unchanged', async () => {

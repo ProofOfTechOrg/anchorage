@@ -35,6 +35,7 @@ import {
   DurableObjectRunner,
   doErrorResponse,
   EXECUTION_PRINCIPAL_HEADER,
+  ExecutionFenceStore,
   HubDurableObject,
   type InitResult,
   init,
@@ -216,6 +217,10 @@ export class StarterThread extends ThreadDurableObject<Env> {
         requestContextForRun: agentHost.requestContextForRun(
           approvalGrantProvider(approvals),
         ),
+        // The composed store hides the binding init would have fenced from, so
+        // this thread DO names it: the deployment execution fence must live in
+        // the SAME database as the state it fences.
+        executionFence: new ExecutionFenceStore(env.DB),
       },
     );
     this.#threadInit = threadInit;

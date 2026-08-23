@@ -500,6 +500,68 @@ describe('createAgentRouter', () => {
     expect(host.observe).not.toHaveBeenCalled();
   });
 
+  it('passes a 5xx refusal through with its status and reason intact', async () => {
+    // #given — the run DO refusing because the deployment is fenced. This is a
+    // 5xx, which this router used to collapse into a bare 500 — turning "retry
+    // after the migration" into "I am broken" for every agent caller.
+    const host = topology();
+    host.start.mockRejectedValueOnce(
+      new RunRouteError(
+        503,
+        "deployment execution is fenced ('migration-locked'): run start is refused",
+        { code: 'EXECUTION_FENCED', state: 'migration-locked' },
+      ),
+    );
+    const router = createAgentRouter({
+      agents,
+      resolve: async () => context(),
+      topology: host,
+    });
+
+    // #when
+    const response = await router(
+      new Request('https://host/agents/writer/runs', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ prompt: 'go' }),
+      }),
+    );
+
+    // #then
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toEqual({
+      error:
+        "deployment execution is fenced ('migration-locked'): run start is refused",
+      reason: { code: 'EXECUTION_FENCED', state: 'migration-locked' },
+    });
+  });
+
+  it('still collapses a 5xx with NO structured reason into a generic 500', async () => {
+    // #given — the passthrough is narrow on purpose: only a code the DO
+    // deliberately published survives a 5xx; an unclassified fault must not
+    // start leaking its message to callers.
+    const host = topology();
+    host.start.mockRejectedValueOnce(
+      new RunRouteError(502, 'upstream exploded with connection details'),
+    );
+    const router = createAgentRouter({
+      agents,
+      resolve: async () => context(),
+      topology: host,
+    });
+
+    // #then
+    const response = await router(
+      new Request('https://host/agents/writer/runs', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ prompt: 'go' }),
+      }),
+    );
+    expect(response?.status).toBe(500);
+    expect(await response?.json()).toEqual({ error: 'internal server error' });
+  });
+
   it('maps an asynchronously rejected observation to its route status', async () => {
     const host = topology();
     host.observe.mockRejectedValue(

@@ -39,6 +39,13 @@ import {
   RUN_START_ROLES,
 } from '../approval-api/index.js';
 import {
+  admitsDrainableExecution,
+  type ExecutionFenceStore,
+  executionFencedResponse,
+  isExecutionFenceRefusal,
+  OPEN_EXECUTION_FENCE,
+} from '../do-runner/index.js';
+import {
   assertNoClientMemoryIds,
   type BoundThreadTargetValidator,
   RunRouteError,
@@ -156,6 +163,15 @@ export interface WebhookRouterOptions {
   forgeryAuditWindowMs?: number;
   /** Epoch-ms clock for the forgery window, injectable for tests. Default Date.now. */
   now?: () => number;
+  /**
+   * The deployment execution fence, consulted AFTER signature verification.
+   * A locked deployment answers 503 so the provider redelivers rather than
+   * treating the event as accepted; putting the check before the verify would
+   * turn the fence into a free oracle for unauthenticated callers, and would
+   * spend the forgery-audit budget on requests the fence refused anyway.
+   * Absent ⇒ unfenced.
+   */
+  executionFence?: ExecutionFenceStore;
 }
 
 export type WebhookRouter = (request: Request) => Promise<Response | null>;
@@ -332,6 +348,25 @@ export function createWebhookRouter(
         return json({ error: 'invalid signature' }, 401);
       }
 
+      // The execution fence, once per webhook and only for a payload already
+      // proven authentic. A locked (or proof-only) deployment must not ingest
+      // a delivery it cannot forward: 503 is the status every provider retries
+      // on, so the event survives the migration in the PROVIDER's queue rather
+      // than being half-landed in this database. Draining still delivers —
+      // the thread routes degrade a wake to a persist there.
+      const fenceReading = options.executionFence
+        ? await options.executionFence.read()
+        : OPEN_EXECUTION_FENCE;
+      if (!admitsDrainableExecution(fenceReading)) {
+        await auditWebhook({
+          providerId,
+          outcome: 'rejected',
+          reason: 'execution-fenced',
+          contentBytes: rawBody.length,
+        });
+        return executionFencedResponse(fenceReading.state, 'webhook delivery');
+      }
+
       // Parse — only now that the payload is proven authentic.
       let payload: unknown;
       try {
@@ -481,6 +516,15 @@ export function createWebhookRouter(
         deferred > 0 ? 503 : 200,
       );
     } catch (error) {
+      // A fence that could not be READ is not evidence the deployment is open.
+      // 503 rather than the 500 below so the provider's own at-least-once
+      // redelivery is what recovers the event, exactly as for a refusal.
+      if (isExecutionFenceRefusal(error)) {
+        return json(
+          { error: error.message, reason: error.reason },
+          error.status,
+        );
+      }
       console.error(
         JSON.stringify({
           type: 'signal-provider.webhook-error',

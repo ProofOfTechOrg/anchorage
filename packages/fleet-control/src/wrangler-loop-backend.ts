@@ -33,6 +33,7 @@ import type {
   ExternalReleaseSnapshot,
   FleetRecord,
   ForceDecommissionStep,
+  InitialExecutionFenceState,
   LiveDeployment,
   MaintenanceHealth,
   PromotionGuard,
@@ -459,12 +460,16 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     database: DatabaseReference,
     tenantTag: string,
     fence: ExternalMutationFence,
+    initialExecutionFenceState: InitialExecutionFenceState,
   ): Promise<void> {
     await provisionDeploymentIdentityProtocol(
       (statement) =>
         this.#query(database, statement.sql, fence, statement.bindings),
       tenantTag,
-      { caller: 'WranglerLoopBackend.seedDeploymentIdentity' },
+      {
+        caller: 'WranglerLoopBackend.seedDeploymentIdentity',
+        initialExecutionFenceState,
+      },
     );
   }
 

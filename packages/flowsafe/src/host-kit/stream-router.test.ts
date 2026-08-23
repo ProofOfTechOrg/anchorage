@@ -37,6 +37,7 @@ import {
   runSlaSweepMaintenance,
 } from './host-approval-service.js';
 import { createHubTopology, type HubNamespaceLike } from './hub-topology.js';
+import { RunRouteError } from './run-route-error.js';
 import { createStreamRouter } from './stream-router.js';
 import { mintStreamTicket, verifyStreamTicket } from './stream-ticket.js';
 import { staticTokenVerifier } from './verifier.js';
@@ -604,5 +605,64 @@ describe('hub fan-out wiring (host-approval-service, tested here — see file he
 
     // #then — the sweep resolved ONLY AFTER the publish: it awaited, never floated
     expect(order).toEqual(['publish-released', 'sweep-resolved']);
+  });
+});
+
+describe('createStreamRouter run-route passthrough', () => {
+  function routerWith(runStatus: () => Promise<never>) {
+    return createStreamRouter({
+      resolve: makeResolve(),
+      ticketSecret: SECRET,
+      hub: recordingHub([]),
+      runner: recordingRunner([]),
+      runStatus,
+      deploymentIdentitySecret: DEPLOYMENT_IDENTITY_SECRET,
+    });
+  }
+
+  it('passes a 5xx refusal through with its status and reason intact', async () => {
+    // #given — a run-status read refused because the deployment is fenced.
+    // This router used to collapse every 5xx into a bare 500, so a stream
+    // caller could not tell a migration from a broken deployment.
+    const router = routerWith(() =>
+      Promise.reject(
+        new RunRouteError(
+          503,
+          "deployment execution is fenced ('migration-locked'): run resume is refused",
+          { code: 'EXECUTION_FENCED', state: 'migration-locked' },
+        ),
+      ),
+    );
+
+    // #when
+    const response = await router(
+      authedPost({ channel: 'run', runId: RUN_ID, workflowId: 'wf' }),
+    );
+
+    // #then
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toEqual({
+      error:
+        "deployment execution is fenced ('migration-locked'): run resume is refused",
+      reason: { code: 'EXECUTION_FENCED', state: 'migration-locked' },
+    });
+  });
+
+  it('still collapses a 5xx with NO structured reason', async () => {
+    // #given — the passthrough is narrow on purpose (see run-route-error.ts).
+    const router = routerWith(() =>
+      Promise.reject(
+        new RunRouteError(502, 'upstream exploded with connection details'),
+      ),
+    );
+
+    // #then
+    const response = await router(
+      authedPost({ channel: 'run', runId: RUN_ID, workflowId: 'wf' }),
+    );
+    expect(response?.status).toBe(500);
+    expect(await response?.json()).toEqual({
+      error: 'upstream exploded with connection details',
+    });
   });
 });

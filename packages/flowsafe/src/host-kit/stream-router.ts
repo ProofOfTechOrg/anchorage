@@ -26,7 +26,7 @@ import { readBoundedBody } from '../http-body.js';
 import type { RunnerNamespaceLike } from './do-run-topology.js';
 import { createHubTopology, type HubNamespaceLike } from './hub-topology.js';
 import { requireResourceAccess } from './resource-access.js';
-import { RunRouteError } from './run-route-error.js';
+import { RunRouteError, runRouteReason } from './run-route-error.js';
 import { mintStreamTicket, verifyStreamTicket } from './stream-ticket.js';
 
 export interface StreamRouterOptions {
@@ -267,8 +267,21 @@ export function createStreamRouter(options: StreamRouterOptions): StreamRouter {
       if (error instanceof ActorResolutionError) {
         return json({ error: 'forbidden' }, 403);
       }
-      if (error instanceof RunRouteError && error.status < 500) {
-        return json({ error: error.message }, error.status);
+      if (error instanceof RunRouteError) {
+        // A structured reason is the DO's own published refusal code, so it
+        // passes through at ANY status — 5xx included, which this branch used
+        // to collapse into the bare 500 below. That collapse turned a 503
+        // EXECUTION_FENCED into "I am broken" for every stream caller.
+        const reason = runRouteReason(error);
+        if (error.status < 500 || reason !== undefined) {
+          return json(
+            {
+              error: error.message,
+              ...(reason === undefined ? {} : { reason }),
+            },
+            error.status,
+          );
+        }
       }
       return json(
         { error: error instanceof Error ? error.message : String(error) },

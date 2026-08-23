@@ -19,6 +19,8 @@ import {
 
 import type { D1DatabaseBinding } from './cf-types.js';
 import { createD1Storage } from './d1-storage.js';
+import type { ExecutionFenceDatabase } from './execution-fence.js';
+import { ExecutionFenceStore } from './execution-fence.js';
 import type { HostPubSub } from './pubsub.js';
 import type { RequestContextProvider } from './runtime.js';
 import { RunnerRuntime } from './runtime.js';
@@ -30,6 +32,19 @@ export interface DORunnerEnv {
 
 /** Explicit storage takes precedence over a DB binding when both are present. */
 export type InitSource = { storage: MastraCompositeStore } | DORunnerEnv;
+
+/**
+ * Fence wiring for a `{ storage }` source: a store, or the typed opt-out.
+ *
+ * REQUIRED, and deliberately not optional-defaulting-to-none. The fence's job
+ * is to stop a deployment executing while its state moves; a host that forgot
+ * to wire it would get a runtime that silently executes through a migration,
+ * which is the one failure this whole mechanism exists to prevent. A `{ DB }`
+ * source needs no such option — init already holds the database the fence
+ * lives in, so it builds one — and `'none'` remains available for the callers
+ * that genuinely have no database to fence against (in-memory tests, adapters).
+ */
+export type ExecutionFenceWiring = ExecutionFenceStore | 'none';
 
 export interface InitOptions {
   /** Storage instance id when init builds the D1 store. Default: 'flowsafe'. */
@@ -54,7 +69,32 @@ export interface InitOptions {
    * stays the fallback).
    */
   pubsub?: HostPubSub;
+  /**
+   * The deployment execution fence (do-runner/execution-fence.ts).
+   *
+   * OPTIONAL only for a `{ DB }` source, where init builds one from that same
+   * binding — the fence must live in the database it fences, and init is the
+   * one place that holds both. Passing a store here overrides the auto-build
+   * (a host sharing one instance across its Durable Objects). There is
+   * deliberately NO `'none'` on this branch: a host that hands init a database
+   * cannot end up with a fence-less runtime, whatever it forgets or opts out
+   * of, which is the fail-closed-by-construction half of the contract.
+   *
+   * REQUIRED, and widened to include the opt-out, for a `{ storage }` source —
+   * see ExecutionFenceWiring.
+   */
+  executionFence?: ExecutionFenceStore;
 }
+
+/**
+ * InitOptions for a `{ storage }` source: the fence wiring is mandatory, and
+ * widened to admit the opt-out. Written as an intersection rather than an
+ * `extends`, because a subtype may not WIDEN an inherited property's type —
+ * and the widening is the point: `'none'` exists only on this branch.
+ */
+export type StorageInitOptions = Omit<InitOptions, 'executionFence'> & {
+  executionFence: ExecutionFenceWiring;
+};
 
 export interface InitResult {
   createWorkflow: typeof coreCreateWorkflow;
@@ -66,13 +106,40 @@ export interface InitResult {
    * which is what keeps it single per DO.
    */
   pubsub?: HostPubSub;
+  /**
+   * The deployment execution fence, or undefined for an explicitly unfenced
+   * host. THE accessor for it, for the same reason as `pubsub`: a route that
+   * built its own store could be gating a different database than the runtime
+   * it sits in front of. Thread-DO signal routes read it off `scope.init`.
+   */
+  executionFence?: ExecutionFenceStore;
 }
 
+export function init(source: DORunnerEnv, options?: InitOptions): InitResult;
+export function init(
+  source: { storage: MastraCompositeStore },
+  options: StorageInitOptions,
+): InitResult;
+/**
+ * A source whose shape is only known at runtime (a host that accepts either).
+ * The wiring is REQUIRED here for the same reason it is on the `{ storage }`
+ * branch: the compiler cannot tell which branch this call will take, so it
+ * cannot know whether init would have built a fence. `'none'` still applies
+ * only to a `{ storage }` source — a `{ DB }` one is fenced regardless, so
+ * choosing the opt-out cannot leave a database-backed runtime unfenced.
+ */
 export function init(
   source: InitSource,
-  options: InitOptions = {},
+  options: StorageInitOptions,
+): InitResult;
+export function init(
+  source: InitSource,
+  options: Omit<InitOptions, 'executionFence'> & {
+    executionFence?: ExecutionFenceWiring;
+  } = {},
 ): InitResult {
   let storage: MastraCompositeStore;
+  let executionFence: ExecutionFenceStore | undefined;
   if ('storage' in source) {
     if (options.id !== undefined || options.tablePrefix !== undefined) {
       // Silently ignoring these would mask a misconfiguration: they only
@@ -82,12 +149,30 @@ export function init(
       );
     }
     storage = source.storage;
+    executionFence =
+      options.executionFence === 'none' ? undefined : options.executionFence;
   } else {
     storage = createD1Storage({
       binding: source.DB,
       id: options.id,
       tablePrefix: options.tablePrefix,
     });
+    // Fail-closed by construction: a host that hands init a database gets a
+    // fenced runtime whether or not it remembered to ask for one, and the
+    // option's type on this branch admits no opt-out. The cast is the same
+    // boundary widening createD1Storage makes on the identical value
+    // (d1-storage.ts) — D1DatabaseBinding deliberately types `prepare` as
+    // returning `unknown` so the shared env shape needs no statement type.
+    // The overload for this source types `executionFence` as a store, so the
+    // opt-out cannot be written here; the narrowing is what makes that visible
+    // to the implementation signature, which sees both branches' options.
+    const configured = options.executionFence;
+    executionFence =
+      configured === undefined || configured === 'none'
+        ? new ExecutionFenceStore(
+            source.DB as unknown as ExecutionFenceDatabase,
+          )
+        : configured;
   }
   const runtime = new RunnerRuntime({
     storage,
@@ -98,6 +183,10 @@ export function init(
     // those). Handing it only to InitResult would strand it — build() returns a
     // RunnerRuntime, not an InitResult, so the run-DO path would drop it.
     pubsub: options.pubsub,
+    // Same reasoning, and the reason the fence is a construction-time argument
+    // rather than a per-call one: the runtime IS the closure guarantee, so it
+    // must not be possible to reach start()/resume() with the fence left off.
+    executionFence,
   });
 
   // Cast preserves core's generic call-site inference (6 type params); the
@@ -115,5 +204,6 @@ export function init(
     createStep,
     runtime,
     pubsub: options.pubsub,
+    executionFence,
   };
 }

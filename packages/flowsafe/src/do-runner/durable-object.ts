@@ -26,6 +26,14 @@ import {
   verifyDurableObjectDeploymentRequest,
 } from './deployment-identity.js';
 import { DoStatusError, doErrorResponse } from './do-error-response.js';
+import {
+  admitsExistingRun,
+  admitsRunStart,
+  ExecutionFencedError,
+  type ExecutionFenceReading,
+  isExecutionFenceRefusal,
+  OPEN_EXECUTION_FENCE,
+} from './execution-fence.js';
 import { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
 import { isPathSafeId } from './path-safe-id.js';
 import {
@@ -33,7 +41,7 @@ import {
   RunAlreadyExistsError,
   type RunLifecycleCas,
   type RunLifecycleTransitionResult,
-  type RunnerRuntime,
+  RunnerRuntime,
   RunStateUnreadableError,
   type RunSummary,
   UnknownRunError,
@@ -170,6 +178,46 @@ class DurableObjectRunIdentityError extends DoStatusError {
   readonly status = 403;
 }
 
+/**
+ * Does this env carry a database to fence against? The same discrimination
+ * deployment-identity makes on the same binding: an RPC binding (a service
+ * binding with a named entrypoint, a Durable Object stub) is a proxy that
+ * answers EVERY property with a callable, so a bare `prepare` test says yes to
+ * all of them — `fetch` is what separates the Fetcher-shaped family from a
+ * D1Database, which has none.
+ */
+function hasDatabaseBinding(env: unknown): boolean {
+  const db = (env as { DB?: unknown } | null | undefined)?.DB;
+  if ((typeof db !== 'object' && typeof db !== 'function') || db === null) {
+    return false;
+  }
+  const candidate = db as { prepare?: unknown; fetch?: unknown };
+  if (typeof candidate.fetch === 'function') return false;
+  return typeof candidate.prepare === 'function';
+}
+
+/**
+ * A run object bound to a real database must never serve from a fence-less
+ * runtime. `init()` makes that true for every host that hands it the binding —
+ * its `{ DB }` branch has no opt-out — so what is left for this assert is the
+ * host that builds a RunnerRuntime by hand inside `build()` and forgets: that
+ * deployment would then execute straight through a migration lock, silently,
+ * and the fence would look wired because every OTHER surface reports it.
+ *
+ * Scoped to runtimes THIS PACKAGE built. A test double cast to the type is not
+ * a RunnerRuntime and carries no fence by construction; asserting on it would
+ * indict every stub for a property it was never meant to have, and would say
+ * nothing about the production wiring this guard exists for.
+ */
+function assertFencedRuntime(runtime: RunnerRuntime, env: unknown): void {
+  if (!(runtime instanceof RunnerRuntime)) return;
+  if (runtime.executionFence !== undefined) return;
+  if (!hasDatabaseBinding(env)) return;
+  throw new Error(
+    'DurableObjectRunner: build() returned a runtime with no execution fence while this deployment carries a DB binding — wire it through init({ DB }) (which builds one) or pass an ExecutionFenceStore, so a migration-locked deployment cannot execute',
+  );
+}
+
 export abstract class DurableObjectRunner<TEnv = unknown> {
   protected readonly env: TEnv;
   /** Absent in Node tests; present under workerd for storage and the alarm. */
@@ -218,9 +266,22 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
 
   #ensureRuntime(): RunnerRuntime {
     if (!this.#runtime) {
-      this.#runtime = this.build(this.env);
+      const runtime = this.build(this.env);
+      assertFencedRuntime(runtime, this.env);
+      this.#runtime = runtime;
     }
     return this.#runtime;
+  }
+
+  /**
+   * This object's execution fence, or the open reading when the host built an
+   * unfenced runtime. Taken from the RUNTIME rather than constructed here, so
+   * the routes below and the start/resume backstop inside the runtime can
+   * never be gating two different databases.
+   */
+  async #readExecutionFence(): Promise<ExecutionFenceReading> {
+    const fence = this.#ensureRuntime().executionFence;
+    return fence ? await fence.read() : OPEN_EXECUTION_FENCE;
   }
 
   // INV-1 enforcement at the DO boundary: this instance was addressed as
@@ -1160,6 +1221,28 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       // failure below. A read that did not succeed converges nothing and
       // charges nothing: it keeps the watchdog cadence until it heals, and the
       // entry it was working on carries the clock that bounds that.
+      // The deployment is fenced (or its fence could not be read). Classified
+      // with the same THREE outcomes as an unreadable read — uncharged,
+      // unconverged, watchdog cadence — because a wake refused by an
+      // operational control is no evidence about the entry it was working on.
+      // Charging it would spend the abandonment budget in about sixteen
+      // minutes of lock and tombstone a live deadline; converging would arm
+      // from a still-due entry no ledger backed off, which lands on the
+      // one-second floor and spins.
+      //
+      // What it deliberately does NOT do is stamp `unreadableSince`. That
+      // clock exists to bound a run whose state became PERMANENTLY unreadable,
+      // and abandons its entries after a day; a fence is a deliberate,
+      // operator-visible, bounded state, and answering a long migration by
+      // discarding every deadline due inside it would be the same fault the
+      // no-charge rule above exists to prevent, one order of magnitude later.
+      if (isExecutionFenceRefusal(error)) {
+        console.error(
+          'suspension deadline wake refused by the deployment execution fence',
+          error,
+        );
+        return false;
+      }
       if (error instanceof RunStateUnreadableError) {
         console.error(
           'suspension deadline wake could not read authoritative state',
@@ -1333,6 +1416,20 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           );
         }
         this.#assertRunIdentity(workflowId, runId);
+        // The fence BEFORE any of this object's own reads or writes: the
+        // schedule-source lookup below, the recovery pass, the journal at
+        // #armRunOwnerRecovery, and the owner reservation all touch storage,
+        // and a deployment that is refusing to execute must not leave a run
+        // half-claimed on its way to saying no. The runtime's own check inside
+        // start() stays the backstop for every other caller.
+        //
+        // No idempotency key reaches this route: a proof-only start arrives
+        // through a trusted host seam and never through a DO request body, so
+        // a fenced deployment refuses every start that arrives here.
+        const startFence = await this.#readExecutionFence();
+        if (!admitsRunStart(startFence)) {
+          throw new ExecutionFencedError(startFence.state, 'run start');
+        }
         const source = await this.#startSource(
           principal,
           workflowId,
@@ -1540,6 +1637,14 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       const resumeData = this.#resumeData(body.resumeData);
       return this.#withOperationLock(async () => {
         const runtime = this.#ensureRuntime();
+        // Refused here as well as inside resume(), so a fenced deployment
+        // answers before it takes the per-run lock. A drain still admits
+        // resumes — the suspended runs it is draining are waiting for exactly
+        // these — and proof-only admits its one nominated run.
+        const resumeFence = await this.#readExecutionFence();
+        if (!admitsExistingRun(resumeFence, runId)) {
+          throw new ExecutionFencedError(resumeFence.state, 'run resume');
+        }
         const summary = await runtime.resume(workflowId, runId, {
           step: body.step,
           resumeData,

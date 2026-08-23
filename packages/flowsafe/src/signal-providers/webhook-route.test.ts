@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it, vi } from 'vitest';
-import { EXECUTION_PRINCIPAL_HEADER } from '../do-runner/index.js';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+import {
+  EXECUTION_PRINCIPAL_HEADER,
+  type ExecutionFenceDatabase,
+  type ExecutionFenceState,
+  ExecutionFenceStore,
+} from '../do-runner/index.js';
 import {
   createThreadTopology as createThreadTopologyWithSecret,
   RunRouteError,
@@ -775,5 +781,148 @@ describe('createWebhookRouter — deployment-wide routing', () => {
     // #then — the signed payload maps to the authoritative row and is delivered
     expect(await res?.json()).toEqual({ matched: 1, delivered: 1 });
     expect(threads.addressed).toEqual(['globex_victim']);
+  });
+});
+
+describe('createWebhookRouter and the deployment execution fence', () => {
+  async function fenceAt(
+    state: ExecutionFenceState,
+  ): Promise<ExecutionFenceStore> {
+    const fence = new ExecutionFenceStore(
+      sqliteUnitDatabase(openSqlite()) as ExecutionFenceDatabase,
+    );
+    await fence.seed(state);
+    return fence;
+  }
+
+  function unreadableFence(): ExecutionFenceStore {
+    // Storage that faults on every query — NOT the "no such table" a pre-0.20
+    // database answers with, which legitimately reads as open.
+    return new ExecutionFenceStore({
+      prepare: () => ({
+        bind: () => ({
+          bind: () => {
+            throw new Error('unreachable');
+          },
+          run: () => Promise.reject(new Error('D1_ERROR: network')),
+          all: () => Promise.reject(new Error('D1_ERROR: network')),
+        }),
+        run: () => Promise.reject(new Error('D1_ERROR: network')),
+        all: () => Promise.reject(new Error('D1_ERROR: network')),
+      }),
+    } as unknown as ExecutionFenceDatabase);
+  }
+
+  it('degrades closed with 503 when the fence cannot be read', async () => {
+    // #given
+    const threads = stubThreads();
+    const router = createWebhookRouter({
+      providers: {
+        test: testProvider({
+          verifyWebhookSignature: () => true,
+          extractResourceIds: () => ['ext-1'],
+        }),
+      },
+      subscriptions: new InMemorySubscriptionStoreFactory().store(),
+      topology: createThreadTopology(threads.namespace),
+      secretForProvider: () => 'secret',
+      executionFence: unreadableFence(),
+    });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    // #then — 503 so the provider's own at-least-once redelivery recovers the
+    // event, exactly as for a refusal.
+    try {
+      const response = await router(webhookRequest('good', { id: 'evt-1' }));
+      expect(response?.status).toBe(503);
+      expect(await response?.json()).toMatchObject({
+        reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
+      });
+    } finally {
+      log.mockRestore();
+    }
+    expect(threads.addressed).toEqual([]);
+  });
+
+  it('refuses an authentic delivery with 503 once locked, so the provider redelivers', async () => {
+    // #given — a locked deployment and a webhook whose signature is genuine.
+    const threads = stubThreads();
+    const extractResourceIds = vi.fn(() => ['ext-1']);
+    const audit = vi.fn();
+    const router = createWebhookRouter({
+      providers: {
+        test: testProvider({
+          verifyWebhookSignature: () => true,
+          extractResourceIds,
+        }),
+      },
+      subscriptions: new InMemorySubscriptionStoreFactory().store(),
+      topology: createThreadTopology(threads.namespace),
+      secretForProvider: () => 'secret',
+      audit,
+      executionFence: await fenceAt('migration-locked'),
+    });
+
+    // #when
+    const response = await router(webhookRequest('good', { id: 'evt-1' }));
+
+    // #then — 503 is the status every provider retries on, so the event
+    // survives the migration in the PROVIDER's queue rather than half-landing
+    // in a database that is being copied.
+    expect(response?.status).toBe(503);
+    expect(await response?.json()).toEqual({
+      error: expect.stringContaining("fenced ('migration-locked')"),
+      reason: { code: 'EXECUTION_FENCED', state: 'migration-locked' },
+    });
+    // #and — the fence runs AFTER the signature check, so it is no oracle for
+    // an unauthenticated caller and nothing was parsed or delivered.
+    expect(extractResourceIds).not.toHaveBeenCalled();
+    expect(threads.addressed).toEqual([]);
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: 'rejected',
+        reason: 'execution-fenced',
+      }),
+    );
+  });
+
+  it('still rejects a FORGED signature with 401 while locked', async () => {
+    // #given — the verify stays first, so a forgery never learns the fence
+    // state and never spends the delivery path.
+    const router = createWebhookRouter({
+      providers: {
+        test: testProvider({ verifyWebhookSignature: () => false }),
+      },
+      subscriptions: new InMemorySubscriptionStoreFactory().store(),
+      topology: createThreadTopology(stubThreads().namespace),
+      secretForProvider: () => 'secret',
+      executionFence: await fenceAt('migration-locked'),
+    });
+
+    // #then
+    const response = await router(webhookRequest('bad', { id: 'evt-1' }));
+    expect(response?.status).toBe(401);
+  });
+
+  it('keeps delivering while draining', async () => {
+    // #given — draining still delivers: the thread routes degrade a wake to a
+    // persist there, so the inbox drains without minting.
+    const threads = stubThreads();
+    const router = createWebhookRouter({
+      providers: {
+        test: testProvider({
+          verifyWebhookSignature: () => true,
+          extractResourceIds: () => [],
+        }),
+      },
+      subscriptions: new InMemorySubscriptionStoreFactory().store(),
+      topology: createThreadTopology(threads.namespace),
+      secretForProvider: () => 'secret',
+      executionFence: await fenceAt('draining'),
+    });
+
+    // #then
+    const response = await router(webhookRequest('good', { id: 'evt-1' }));
+    expect(response?.status).toBe(200);
   });
 });

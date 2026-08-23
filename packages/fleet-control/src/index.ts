@@ -120,6 +120,7 @@ export {
   type FleetStateLease,
   type FleetStateStore,
   type ForceDecommissionStep,
+  type InitialExecutionFenceState,
   type LiveDeployment,
   type MaintenanceHealth,
   type PlatformPlaneLease,

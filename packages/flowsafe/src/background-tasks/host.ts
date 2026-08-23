@@ -21,6 +21,14 @@
 // the seam is `registerStaticExecutor` + `startWorkers()` + `init(pubsub)`, all
 // public.
 //
+// THE FENCE SPLITS THAT SEAM IN TWO (F1). `registerStaticExecutor` claims
+// nothing and always runs; `startWorkers()` + `init(pubsub)` are what make this
+// instance a dispatcher, and behind a closed deployment execution fence they
+// are held back entirely — init's recovery would otherwise fail every stranded
+// row outright and re-claim every pending one. The held-back phase is retried
+// on every later boot (request or alarm), so reopening the fence is all it
+// takes to resume. See #ensureDispatching.
+//
 // v1 policy (DL-005/P8): connectors are foreground-only, so approval-carrying
 // tools never enter this suspend/resume topology. Background suspend/resume
 // stays available for NON-gated tools (e.g. a long research tool awaiting an
@@ -39,11 +47,20 @@
 import {
   BackgroundTaskManager,
   type BackgroundTaskManagerConfig,
+  type EnqueueResult,
+  type TaskContext,
+  type TaskPayload,
   type ToolExecutor,
 } from '@mastra/core/background-tasks';
 import type { Mastra } from '@mastra/core/mastra';
 
-import type { HostPubSub } from '../do-runner/index.js';
+import {
+  admitsDrainableExecution,
+  ExecutionFencedError,
+  type ExecutionFenceStore,
+  type HostPubSub,
+  OPEN_EXECUTION_FENCE,
+} from '../do-runner/index.js';
 import {
   finiteNonnegativeNumber,
   nonnegativeSafeInteger,
@@ -96,6 +113,23 @@ export interface BackgroundTaskHostOptions {
    * the persistence/recovery-only behavior.
    */
   execution?: boolean;
+  /**
+   * The deployment execution fence. Task bodies are an execution family that
+   * runs BELOW RunnerRuntime, so the runtime's start/resume gate does not see
+   * them; this is where they are gated instead.
+   *
+   * The gate is at the DISPATCHER, read once per boot pass: behind a closed
+   * fence this instance never subscribes and never runs stale-task recovery,
+   * so nothing is claimed — queued rows stay pending and stranded rows stay
+   * stranded (#ensureDispatching explains why anything later than that is too
+   * late). The executor wrapper remains as a fail-closed backstop for the
+   * in-flight race, and parks rather than fails. Absent ⇒ unfenced.
+   *
+   * `draining` still dispatches and still accepts enqueues: that queue is the
+   * work a drain exists to finish, and refusing an enqueue would fail the very
+   * runs that are draining.
+   */
+  executionFence?: ExecutionFenceStore;
 }
 
 function validateManagerConfig(
@@ -179,6 +213,15 @@ function validateManagerConfig(
 }
 
 /**
+ * The suspend-payload key the executor backstop stamps on a task it parked
+ * because the deployment was fenced mid-dispatch. Namespaced so it cannot
+ * collide with a tool's own suspend payload, and read back by
+ * #resumeFenceSuspendedTasks — which is what makes the parking reversible
+ * rather than a quieter kind of loss.
+ */
+const EXECUTION_FENCE_SUSPEND_KEY = 'flowsafe.executionFenced';
+
+/**
  * A BackgroundTaskManager bound to a hosting DO's Mastra + pubsub, with the
  * boot/alarm lifecycle that makes DO eviction survivable. The hosting DO owns
  * alarm arming (it needs `ctx.storage.setAlarm`); this class owns the manager
@@ -192,8 +235,12 @@ export class BackgroundTaskHost {
   readonly #pubsub: HostPubSub;
   readonly #executors: Record<string, ToolExecutor>;
   readonly #execution: boolean;
+  readonly #executionFence?: ExecutionFenceStore;
   #booted?: Promise<void>;
   #bootSettled = false;
+  /** Phase B (workers + init), memoized only once it has actually run. */
+  #dispatching?: Promise<void>;
+  #dispatchSettled = false;
   #managerNeedsShutdown = false;
   #workersNeedStop = false;
   #shutdownRequested = false;
@@ -205,6 +252,7 @@ export class BackgroundTaskHost {
     this.#pubsub = options.pubsub;
     this.#executors = options.executors;
     this.#execution = options.execution ?? false;
+    this.#executionFence = options.executionFence;
     this.manager = new BackgroundTaskManager({
       enabled: true,
       ...options.manager,
@@ -215,14 +263,20 @@ export class BackgroundTaskHost {
   }
 
   /**
-   * Durable-Object boot wiring. Fail fast if the backgroundTasks storage domain is
-   * missing, re-register the static executors, start execution-mode workflow
-   * workers, THEN call `init(pubsub)` — whose internal `recoverStaleTasks()`
-   * re-drives any task the evicted instance left mid-flight. Executors and the
-   * workflow subscriber both go in BEFORE recovery publishes work. A failed
-   * startup unwinds attempted components in reverse order. Memoized per
-   * instance: `init` is itself idempotent (initPromise), and `boot()` from both
-   * `fetch()` and `alarm()` must not double-register.
+   * Durable-Object boot wiring, in two phases with different lifetimes.
+   *
+   * REGISTRATION (memoized for the life of the instance): validate the storage
+   * domains and re-register the static executors. Nothing here subscribes,
+   * claims, or recovers, so it is safe in every fence state — and it must be,
+   * because every host boots before routing and the read routes hang off this
+   * memo.
+   *
+   * DISPATCHING (fence-gated, re-attempted on every boot until it is admitted):
+   * `startWorkers()` plus `manager.init(pubsub)`. Those two are what make this
+   * instance CLAIM work — see #ensureDispatching for why they cannot run behind
+   * a closed fence. A refused attempt is deliberately not memoized, so the next
+   * `boot()` from a request or an alarm starts dispatching once the fence
+   * reopens, with no operator action.
    */
   boot(): Promise<void> {
     if (this.#shutdownRequested) {
@@ -231,14 +285,15 @@ export class BackgroundTaskHost {
       );
     }
     if (!this.#booted) {
-      this.#booted = this.#doBoot().finally(() => {
+      this.#booted = this.#doRegister().finally(() => {
         this.#bootSettled = true;
       });
     }
-    return this.#booted;
+    const registered = this.#booted;
+    return registered.then(() => this.#ensureDispatching());
   }
 
-  async #doBoot(): Promise<void> {
+  async #doRegister(): Promise<void> {
     // Fail-fast with a clear message before any dispatch could surface core's
     // terser error deep in a lifecycle callback.
     const tasks = await backgroundTasksStore(this.#mastra);
@@ -269,8 +324,62 @@ export class BackgroundTaskHost {
       await this.#warnIfBodiesCannotExecute();
     }
     for (const [toolName, executor] of Object.entries(this.#executors)) {
-      this.manager.registerStaticExecutor(toolName, executor);
+      this.manager.registerStaticExecutor(toolName, this.#gated(executor));
     }
+  }
+
+  /**
+   * THE gate that matters: whether this instance becomes a DISPATCHER at all.
+   *
+   * `manager.init(pubsub)` is the only thing that subscribes `handleDispatch`,
+   * and `handleDispatch` is what writes `status: 'running'` — the CLAIM. It
+   * also runs `recoverStaleTasks()`, which on @mastra/core 1.53.0 does two
+   * destructive things behind a closed fence:
+   *
+   *   1. every stranded `running` row with `maxRetries === 0` (the DEFAULT) is
+   *      marked `failed` outright, before any executor is consulted; and
+   *   2. every `pending` row is re-dispatched, i.e. claimed.
+   *
+   * Neither is reachable from inside an executor, which is why the gate lives
+   * here and not there. Skipping init leaves pending rows pending and stranded
+   * rows stranded — untouched, uncharged, and still visible to any nonterminal
+   * census — and the published dispatch event simply has no subscriber. One
+   * fence read per boot PASS, never memoized on refusal.
+   *
+   * `draining` still dispatches: the queue is exactly the work a drain exists
+   * to finish.
+   */
+  async #ensureDispatching(): Promise<void> {
+    if (this.#dispatching) return this.#dispatching;
+    const fence = this.#executionFence
+      ? await this.#executionFence.read()
+      : OPEN_EXECUTION_FENCE;
+    if (!admitsDrainableExecution(fence)) {
+      console.warn(
+        JSON.stringify({
+          type: 'background-tasks.dispatch-fenced',
+          state: fence.state,
+          reason:
+            'workers and stale-task recovery are held back; queued tasks stay pending until the fence reopens',
+        }),
+      );
+      return;
+    }
+    this.#dispatchSettled = false;
+    this.#dispatching = this.#startDispatching()
+      .catch((error: unknown) => {
+        // Not memoized on failure, for the same reason a refusal is not: the
+        // next boot must be able to try again.
+        this.#dispatching = undefined;
+        throw error;
+      })
+      .finally(() => {
+        this.#dispatchSettled = true;
+      });
+    return this.#dispatching;
+  }
+
+  async #startDispatching(): Promise<void> {
     try {
       if (this.#execution) {
         this.#workersNeedStop = true;
@@ -303,6 +412,113 @@ export class BackgroundTaskHost {
         { cause: primary },
       );
     }
+    // AFTER init, because resume() publishes onto the topic init subscribes.
+    await this.#resumeFenceSuspendedTasks();
+  }
+
+  /**
+   * Re-drive the tasks the executor backstop parked, once dispatching resumes.
+   *
+   * `recoverStaleTasks()` re-drives `running` and `pending` rows and knows
+   * nothing about `suspended` ones, so without this a task the backstop saved
+   * from destruction would be saved into a state nothing ever leaves. Scoped by
+   * the backstop's own marker: a task suspended by its TOOL (awaiting a
+   * webhook, say) is a different thing entirely and must stay suspended.
+   */
+  async #resumeFenceSuspendedTasks(): Promise<void> {
+    try {
+      const { tasks } = await this.manager.listTasks({ status: 'suspended' });
+      for (const task of tasks) {
+        const payload = task.suspendPayload;
+        if (
+          typeof payload !== 'object' ||
+          payload === null ||
+          !(EXECUTION_FENCE_SUSPEND_KEY in payload)
+        ) {
+          continue;
+        }
+        await this.manager.resume(task.id);
+      }
+    } catch (error) {
+      // Best effort: a failure here leaves the rows suspended and inspectable,
+      // which is where they already were. Never fails the boot that was about
+      // to start serving.
+      console.error(
+        JSON.stringify({
+          type: 'background-tasks.fence-resume-error',
+          reason: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    }
+  }
+
+  /**
+   * The fail-closed BACKSTOP, not the gate. #ensureDispatching stops this
+   * instance claiming work behind a closed fence; this only covers the narrow
+   * race where a subscriber started while the fence was open consumes a
+   * dispatch event published just before it closed. By then core has ALREADY
+   * written `status: 'running'`, so the claim cannot be undone from here — only
+   * exited well.
+   *
+   * SUSPEND, never throw. A thrown executor becomes `outcome: 'retry'`, and
+   * core retries only while `retryCount < maxRetries` — the default maxRetries
+   * is 0, so the very first throw settles the row `failed`: work destroyed, and
+   * silently absent from any nonterminal census. `suspend()` instead persists
+   * `status: 'suspended'` with a payload naming the fence, which is nonterminal,
+   * inspectable, and re-driven by #resumeFenceSuspendedTasks after reopen.
+   * Throwing survives only as the last resort for a core that supplied no
+   * `suspend` (it is optional on the interface): refusing loudly beats running
+   * a task body on a deployment whose state is being copied.
+   */
+  #gated(executor: ToolExecutor): ToolExecutor {
+    return {
+      execute: async (args, executeOptions) => {
+        const fence = this.#executionFence
+          ? await this.#executionFence.read()
+          : OPEN_EXECUTION_FENCE;
+        if (!admitsDrainableExecution(fence)) {
+          const suspend = executeOptions?.suspend;
+          if (!suspend) {
+            throw new ExecutionFencedError(fence.state, 'background task');
+          }
+          await suspend({
+            [EXECUTION_FENCE_SUSPEND_KEY]: { state: fence.state },
+          });
+          // Discarded on the suspend path — see core's ToolExecutor contract.
+          return undefined;
+        }
+        return executor.execute(args, executeOptions);
+      },
+    };
+  }
+
+  /**
+   * Enqueue a background task through the fence.
+   *
+   * A drain deliberately still ACCEPTS enqueues: the caller is an agent's tool
+   * call inside a run the drain is trying to finish, and refusing would fail
+   * exactly the runs that are draining. Locked and proof-only refuse, because
+   * a row written then is work the migration would have to carry.
+   *
+   * The per-task executor is wrapped with the same gate as the static ones, so
+   * a task enqueued while open cannot execute its body after a transition.
+   */
+  async enqueue(
+    payload: TaskPayload,
+    context?: TaskContext,
+  ): Promise<EnqueueResult> {
+    const fence = this.#executionFence
+      ? await this.#executionFence.read()
+      : OPEN_EXECUTION_FENCE;
+    if (!admitsDrainableExecution(fence)) {
+      throw new ExecutionFencedError(fence.state, 'background task enqueue');
+    }
+    return this.manager.enqueue(
+      payload,
+      context
+        ? { ...context, executor: this.#gated(context.executor) }
+        : undefined,
+    );
   }
 
   async #warnIfBodiesCannotExecute(): Promise<void> {
@@ -341,8 +557,20 @@ export class BackgroundTaskHost {
       try {
         await this.#booted;
       } catch {
-        // #doBoot already unwound every component it managed to stop. Any
-        // component whose cleanup failed remains flagged for the retry below.
+        // #doRegister only validates and registers; nothing to unwind.
+      }
+    }
+    // Awaited ONLY while still in flight — the same shape, and the same
+    // reason, as the registration guard above: manager.shutdown() flips its
+    // enqueue guard before its first await, and that guarantee survives only
+    // if nothing suspends this function before it is invoked.
+    if (this.#dispatching && !this.#dispatchSettled) {
+      try {
+        await this.#dispatching;
+      } catch {
+        // #startDispatching already unwound every component it managed to
+        // stop. Any component whose cleanup failed remains flagged for the
+        // retry below.
       }
     }
     const errors: unknown[] = [];

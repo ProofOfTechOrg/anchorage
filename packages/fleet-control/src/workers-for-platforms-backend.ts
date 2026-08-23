@@ -52,6 +52,7 @@ import type {
   ExternalPlatformTargetDescription,
   ExternalReleaseSnapshot,
   FleetRecord,
+  InitialExecutionFenceState,
   LiveDeployment,
   MaintenanceHealth,
   PromotionGuard,
@@ -487,6 +488,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     database: DatabaseReference,
     tenantTag: string,
     fence: ExternalMutationFence,
+    initialExecutionFenceState: InitialExecutionFenceState,
   ): Promise<void> {
     await this.#withMutationFence(fence, () =>
       provisionDeploymentIdentityProtocol(
@@ -497,7 +499,10 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
             statement.bindings,
           ),
         tenantTag,
-        { caller: 'WorkersForPlatformsBackend.seedDeploymentIdentity' },
+        {
+          caller: 'WorkersForPlatformsBackend.seedDeploymentIdentity',
+          initialExecutionFenceState,
+        },
       ),
     );
   }

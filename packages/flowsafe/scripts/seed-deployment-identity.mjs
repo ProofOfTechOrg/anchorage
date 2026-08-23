@@ -9,13 +9,14 @@ import { fileURLToPath } from 'node:url';
 
 import {
   DEPLOYMENT_TAG_PATTERN,
+  INITIAL_EXECUTION_FENCE_STATES,
   provisionDeploymentIdentityProtocol,
 } from '#deployment-identity-protocol';
 
 function usage(message) {
   const suffix = message ? `\n${message}` : '';
   return new Error(
-    `Usage: flowsafe-provision --database <name-or-binding> --tag <tag> (--remote | --local | --preview) [--config <path>] [--persist-to <path>]${suffix}`,
+    `Usage: flowsafe-provision --database <name-or-binding> --tag <tag> --initial-fence-state <${INITIAL_EXECUTION_FENCE_STATES.join('|')}> (--remote | --local | --preview) [--config <path>] [--persist-to <path>]${suffix}`,
   );
 }
 
@@ -23,6 +24,7 @@ export function parseProvisioningArguments(argv) {
   const valueOptions = new Set([
     '--database',
     '--tag',
+    '--initial-fence-state',
     '--config',
     '--persist-to',
   ]);
@@ -48,9 +50,18 @@ export function parseProvisioningArguments(argv) {
   }
   const database = values.get('--database');
   const tag = values.get('--tag');
-  if (!database || !tag || !target) throw usage();
+  // No default, deliberately: an operator provisioning a deployment that is
+  // about to receive a migration must state that it starts locked, and one who
+  // says nothing must be told rather than handed an executing deployment.
+  const initialFenceState = values.get('--initial-fence-state');
+  if (!database || !tag || !target || !initialFenceState) throw usage();
   if (!DEPLOYMENT_TAG_PATTERN.test(tag)) {
     throw usage(`tag '${tag}' must match ${DEPLOYMENT_TAG_PATTERN}`);
+  }
+  if (!INITIAL_EXECUTION_FENCE_STATES.includes(initialFenceState)) {
+    throw usage(
+      `--initial-fence-state '${initialFenceState}' must be one of ${INITIAL_EXECUTION_FENCE_STATES.join(', ')}`,
+    );
   }
   const persistTo = values.get('--persist-to');
   if (persistTo && target !== '--local') {
@@ -60,6 +71,7 @@ export function parseProvisioningArguments(argv) {
     database,
     tag,
     target,
+    initialFenceState,
     ...(values.has('--config') ? { config: values.get('--config') } : {}),
     ...(persistTo ? { persistTo } : {}),
   };
@@ -235,15 +247,21 @@ export async function provisionDeploymentIdentity(options, execute) {
   await provisionDeploymentIdentityProtocol(
     (statement) => query(renderProtocolStatement(statement)),
     options.tag,
-    { caller: 'flowsafe-provision' },
+    {
+      caller: 'flowsafe-provision',
+      initialExecutionFenceState: options.initialFenceState,
+    },
   );
 }
 
 async function main() {
   const options = parseProvisioningArguments(process.argv.slice(2));
   await provisionDeploymentIdentity(options);
+  // The fence line names the state that was REQUESTED, not one that was
+  // necessarily written: seeding is INSERT-if-absent, so a database whose fence
+  // an operator already moved keeps the state it has.
   process.stdout.write(
-    `Deployment identity '${options.tag}' verified in ${options.database} (${options.target.slice(2)}).\n`,
+    `Deployment identity '${options.tag}' verified in ${options.database} (${options.target.slice(2)}), initial execution fence state '${options.initialFenceState}'.\n`,
   );
 }
 

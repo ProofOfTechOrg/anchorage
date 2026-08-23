@@ -54,7 +54,10 @@ function tableNames(db: SqliteDatabase): string[] {
 
 // A gated workflow over the given storage.
 function buildGated(storage: MastraCompositeStore): RunnerRuntime {
-  const { createWorkflow, createStep, runtime } = init({ storage });
+  const { createWorkflow, createStep, runtime } = init(
+    { storage },
+    { executionFence: 'none' },
+  );
   const gate = createStep({
     id: 'gate',
     inputSchema: z.object({}),

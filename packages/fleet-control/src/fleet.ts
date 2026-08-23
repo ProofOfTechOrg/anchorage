@@ -1876,7 +1876,25 @@ export async function migrateFleet(options: {
           return migrated;
         }
         await lease.assertOwned();
-        await backend.seedDeploymentIdentity(database, stored.tenantTag, lease);
+        // Re-stamping a database this deployment already owns: the ownership
+        // sentinel short-circuits, and the only thing that can still happen is
+        // the fence row being CREATED where none exists.
+        //
+        // 'open' is hard-coded, and migrateFleet takes no fence option, for one
+        // reason: the deployment being migrated is `ready` or `migrating` — it
+        // is EXECUTING right now. A pre-0.20 database has no fence row and
+        // therefore reads as open; materializing that row must record what the
+        // deployment already IS, not impose something new. Seeding
+        // 'migration-locked' here would silently stop a live deployment in the
+        // middle of its own migration. Closing a fence is an operator action
+        // through POST /admin/execution-fence, never a side effect of a
+        // schema pass.
+        await backend.seedDeploymentIdentity(
+          database,
+          stored.tenantTag,
+          lease,
+          'open',
+        );
         const pendingMigrations = spec.migrations.filter(
           (candidate) => candidate.version > migrationRecord.schemaVersion,
         );

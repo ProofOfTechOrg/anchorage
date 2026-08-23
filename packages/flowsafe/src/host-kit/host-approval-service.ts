@@ -29,6 +29,7 @@ import {
   trustAutomationPrincipal,
 } from '../approval-api/index.js';
 import { type AuditQueue, queueAuditSink } from '../audit-export/index.js';
+import type { ExecutionFenceStore } from '../do-runner/execution-fence.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
 import {
   type ResumeRunFn,
@@ -173,6 +174,23 @@ export interface HostApprovalServiceOptions {
    * at fetch scope. Undefined means no live fan-out (a poll-only host).
    */
   stream?: ApprovalStreamSink;
+  /**
+   * The deployment execution fence (do-runner/execution-fence.ts), forwarded to
+   * ApprovalServiceOptions.executionFence.
+   *
+   * REQUIRED IN PRACTICE for any host whose runs live behind a fence, and
+   * `createFlowsafeWorker` always supplies it. It is optional only because this
+   * function receives an ApprovalStore rather than a database, so it cannot
+   * build the store itself the way `init({ DB })` can — a host assembling its
+   * own service must name the fence, exactly as it names its resume topology.
+   *
+   * Omitting it makes decide() unfenced, which is not merely "no gate": decide
+   * COMMITS the decision and only then resumes, so a migration-locked
+   * deployment would durably record a decision (with its audit trail and
+   * notification) whose resume then 503s, and the deployment taking over
+   * inherits a decided approval with nothing behind it.
+   */
+  executionFence?: ExecutionFenceStore;
 }
 
 /**
@@ -202,6 +220,7 @@ export function buildHostApprovalService(
     notify: options.notify,
     stream: options.stream,
     allowSelfDecision: options.allowSelfDecision,
+    executionFence: options.executionFence,
     resumeRun: resumeRunWithRequeue(
       options.resumeRun,
       () => service,

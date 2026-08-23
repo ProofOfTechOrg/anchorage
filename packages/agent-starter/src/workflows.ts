@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { approvalGrantProvider } from '@proofoftech/flowsafe/approval-api';
-import { init, type RunnerRuntime } from '@proofoftech/flowsafe/do-runner';
+import {
+  ExecutionFenceStore,
+  init,
+  type RunnerRuntime,
+} from '@proofoftech/flowsafe/do-runner';
 import {
   approvalStoreFactoryFor,
   assertWorkflowsRegistered,
@@ -28,6 +32,10 @@ export function defineWorkflows(env: Env): RunnerRuntime {
       requestContextForRun: approvalGrantProvider(
         approvalStoreFactoryFor(env.DB).store(),
       ),
+      // The composed store hides the binding init would have fenced from, so
+      // the run object names it: the deployment execution fence must live in
+      // the SAME database as the state it fences.
+      executionFence: new ExecutionFenceStore(env.DB),
     },
   );
   const schema = z.object({ message: z.string().min(1).max(5_000) });

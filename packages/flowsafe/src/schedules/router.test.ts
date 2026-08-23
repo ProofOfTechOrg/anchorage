@@ -10,6 +10,8 @@ import type {
 } from '@mastra/core/storage';
 import { describe, expect, it, vi } from 'vitest';
 
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+
 import {
   type ActorContext,
   ActorResolutionError,
@@ -17,6 +19,10 @@ import {
   type ApprovalRole,
   type ResourceOwner,
 } from '../approval-api/index.js';
+import {
+  type ExecutionFenceDatabase,
+  ExecutionFenceStore,
+} from '../do-runner/index.js';
 import { RunRouteError } from '../host-kit/index.js';
 import {
   createScheduleRouter as createScheduleRouterImpl,
@@ -171,6 +177,7 @@ function harness(
     targetPolicy?: ScheduleTargetPolicy;
     audit?: ScheduleRouterOptions['audit'];
     validateThreadTarget?: ScheduleRouterOptions['validateThreadTarget'];
+    executionFence?: ScheduleRouterOptions['executionFence'];
   } = {},
 ): Harness {
   const store = new MemStore();
@@ -197,6 +204,9 @@ function harness(
       : {}),
     ...(overrides.validateThreadTarget !== undefined
       ? { validateThreadTarget: overrides.validateThreadTarget }
+      : {}),
+    ...(overrides.executionFence !== undefined
+      ? { executionFence: overrides.executionFence }
       : {}),
   });
   const call = async (method: string, path: string, body?: unknown) => {
@@ -981,5 +991,110 @@ describe('createScheduleRouter internal errors', () => {
     } finally {
       log.mockRestore();
     }
+  });
+});
+
+describe('createScheduleRouter and the deployment execution fence', () => {
+  async function drainingFence(): Promise<ExecutionFenceStore> {
+    const fence = new ExecutionFenceStore(
+      sqliteUnitDatabase(openSqlite()) as ExecutionFenceDatabase,
+    );
+    await fence.seed('draining');
+    return fence;
+  }
+
+  function unreadableFence(): ExecutionFenceStore {
+    // Storage that faults on every query — NOT the "no such table" a pre-0.20
+    // database answers with, which legitimately reads as open.
+    return new ExecutionFenceStore({
+      prepare: () => ({
+        bind: () => ({
+          bind: () => {
+            throw new Error('unreachable');
+          },
+          run: () => Promise.reject(new Error('D1_ERROR: network')),
+          all: () => Promise.reject(new Error('D1_ERROR: network')),
+        }),
+        run: () => Promise.reject(new Error('D1_ERROR: network')),
+        all: () => Promise.reject(new Error('D1_ERROR: network')),
+      }),
+    } as unknown as ExecutionFenceDatabase);
+  }
+
+  it('degrades a mutation closed with 503 when the fence cannot be read', async () => {
+    // #given
+    const { store, call } = harness(ctx('acme', 'operator'), {
+      executionFence: unreadableFence(),
+    });
+
+    // #then — never the generic 500: an operator must be able to tell a
+    // deployment being migrated from a broken one, and the write did not land.
+    const res = await call('POST', '/api/schedules', WORKFLOW_CREATE);
+    expect(res.status).toBe(503);
+    expect(res.body.reason).toEqual({ code: 'EXECUTION_FENCE_UNREADABLE' });
+    expect(store.m.size).toBe(0);
+  });
+
+  it('refuses create, update, and resume once the deployment is draining', async () => {
+    // #given
+    const executionFence = await drainingFence();
+    const { store, events, call } = harness(ctx('acme', 'operator'), {
+      executionFence,
+    });
+    store.m.set('s1', {
+      id: 's1',
+      target: { type: 'workflow', workflowId: 'wf', inputData: {} },
+      cron: '*/5 * * * *',
+      status: 'paused',
+      nextFireAt: 0,
+      createdAt: 0,
+      updatedAt: 0,
+      metadata: {},
+    } as Schedule);
+
+    // #when / #then — every operation that ARMS a future fire is refused with
+    // the taxonomy's retryable status and code.
+    for (const [method, path, body] of [
+      ['POST', '/api/schedules', WORKFLOW_CREATE],
+      ['PATCH', '/api/schedules/s1', { cron: '*/10 * * * *' }],
+      ['POST', '/api/schedules/s1/resume', undefined],
+    ] as const) {
+      const res = await call(method, path, body);
+      expect(res.status).toBe(503);
+      expect(res.body.reason).toEqual({
+        code: 'EXECUTION_FENCED',
+        state: 'draining',
+      });
+    }
+    expect(store.m.size).toBe(1);
+    expect(
+      events.filter((event) => event.reason === 'execution-fenced'),
+    ).toHaveLength(3);
+  });
+
+  it('keeps pause, delete, and every read available while draining', async () => {
+    // #given — pause and delete TAKE WORK AWAY, which is the direction a drain
+    // is going, and a read moves nothing.
+    const executionFence = await drainingFence();
+    const { store, call } = harness(ctx('acme', 'operator'), {
+      executionFence,
+    });
+    store.m.set('s1', {
+      id: 's1',
+      target: { type: 'workflow', workflowId: 'wf', inputData: {} },
+      cron: '*/5 * * * *',
+      status: 'active',
+      nextFireAt: 0,
+      createdAt: 0,
+      updatedAt: 0,
+      metadata: {},
+    } as Schedule);
+
+    // #then
+    expect((await call('GET', '/api/schedules')).status).toBe(200);
+    expect((await call('GET', '/api/schedules/s1')).status).toBe(200);
+    expect((await call('POST', '/api/schedules/s1/pause')).status).toBe(200);
+    expect((await call('DELETE', '/api/schedules/s1')).status).toBe(200);
+    expect(store.m.size).toBe(0);
   });
 });

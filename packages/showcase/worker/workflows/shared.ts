@@ -19,6 +19,7 @@ import type {
   R2ArtifactStore,
 } from '@proofoftech/flowsafe/artifacts';
 import type {
+  ExecutionFenceWiring,
   InitSource,
   RequestContextProvider,
 } from '@proofoftech/flowsafe/do-runner';
@@ -84,6 +85,13 @@ export interface EgressBinding {
 export interface ShowcaseDeps {
   /** `init` input: a Cloudflare env (D1 from `DB`) or `{ storage }`. */
   initInput: InitSource;
+  /**
+   * The deployment execution fence for `initInput`. Required because the shape
+   * of `initInput` is only known at runtime, so nothing here can tell whether
+   * init would build one: a D1-backed host passes a store over the SAME
+   * binding, and an in-memory test host passes `'none'`.
+   */
+  executionFence: ExecutionFenceWiring;
   /**
    * The grant-minting seam, built by the host from the deployment-wide
    * approval store. The provider is consulted on every start and resume leg.

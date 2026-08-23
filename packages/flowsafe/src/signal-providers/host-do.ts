@@ -4,8 +4,13 @@
 import type { DurableObjectState } from '@cloudflare/workers-types';
 
 import {
+  admitsDrainableExecution,
   DoStatusError,
   doErrorResponse,
+  ExecutionFencedError,
+  type ExecutionFenceStore,
+  isExecutionFenceRefusal,
+  OPEN_EXECUTION_FENCE,
   verifyDurableObjectDeploymentIdentity,
   verifyDurableObjectDeploymentRequest,
 } from '../do-runner/index.js';
@@ -50,6 +55,13 @@ export interface SignalProviderHostWiring {
   store: SubscriptionStore;
   topology: ThreadTopology;
   providers: readonly SignalProviderAdapter[];
+  /**
+   * The deployment execution fence. A locked (or proof-only) deployment polls
+   * nothing: a poll adapter re-reports state it has not seen accepted, so a
+   * refused pass costs a redelivery rather than a lost notification. Absent ⇒
+   * unfenced.
+   */
+  executionFence?: ExecutionFenceStore;
 }
 
 export interface PollResult {
@@ -146,14 +158,41 @@ export abstract class SignalProviderHost<TEnv = unknown> {
     await this.#withArmLock(async () => {
       const prearmedAt = await this.#prearmUnlocked();
       await this.#verifyIdentity();
-      await this.poll();
+      try {
+        await this.poll();
+      } catch (error) {
+        // The fence refusing (or failing to answer) is not an alarm failure:
+        // workerd retries a thrown alarm() up to six times, which would answer
+        // a deliberate operational state with a wake storm. The prearm above
+        // IS the re-arm, so the next wake polls again once the fence reopens —
+        // and #armUnlocked is deliberately skipped, because its subscription
+        // read would recompute a cadence from a pass that never ran.
+        if (!isExecutionFenceRefusal(error)) throw error;
+        console.error(
+          JSON.stringify({
+            type: 'signal-provider.poll-fenced',
+            reason: error.message,
+          }),
+        );
+        return;
+      }
       await this.#armUnlocked(prearmedAt);
     });
   }
 
   async poll(): Promise<PollResult> {
     await this.#verifyIdentity();
-    const { store, topology, providers } = this.#ensureWiring();
+    const { store, topology, providers, executionFence } = this.#ensureWiring();
+    // ONE fence read per PASS, before any provider is polled. Throwing rather
+    // than returning an empty result: the request path (POST /poll) must
+    // answer 503 so the caller can tell a fenced deployment from an idle one,
+    // and alarm() catches this exact family above.
+    const fence = executionFence
+      ? await executionFence.read()
+      : OPEN_EXECUTION_FENCE;
+    if (!admitsDrainableExecution(fence)) {
+      throw new ExecutionFencedError(fence.state, 'signal provider poll');
+    }
     let providersPolled = 0;
     let delivered = 0;
     let denied = 0;

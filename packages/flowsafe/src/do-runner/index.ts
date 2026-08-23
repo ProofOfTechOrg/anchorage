@@ -51,6 +51,7 @@ export type {
   DeploymentIdentityDatabase,
   DeploymentIdentityEnv,
   DeploymentIdentityStatement,
+  InitialExecutionFenceState,
 } from './deployment-identity.js';
 export {
   assertDeploymentIdentity,
@@ -69,6 +70,7 @@ export {
 } from './deployment-identity.js';
 // The DO error taxonomy and its extension point: a host DO's own route states a
 // status by extending DoStatusError (see do-error-response.ts).
+export type { DoRefusalReason } from './do-error-response.js';
 export { DoStatusError, doErrorResponse } from './do-error-response.js';
 export {
   type DurableObjectRunLifecycleHooks,
@@ -84,14 +86,45 @@ export {
   ReservedExecutionContextError,
   stripReservedExecutionContext,
 } from './execution-context.js';
+// The deployment execution fence (docs/do-runner-design.md): the operational
+// control that stops a deployment minting work while its state is migrated,
+// plus the four admission predicates the semantics matrix is written as.
+export type {
+  ExecutionFenceDatabase,
+  ExecutionFenceReading,
+  ExecutionFenceRefusal,
+  ExecutionFenceState,
+  ExecutionFenceStatement,
+  ExecutionFenceStoreOptions,
+  ExecutionFenceTransition,
+} from './execution-fence.js';
+export {
+  admitsDrainableExecution,
+  admitsExistingRun,
+  admitsRunStart,
+  admitsWorkAuthoring,
+  assertExecutionFenceState,
+  EXECUTION_FENCE_STATES,
+  EXECUTION_FENCE_TABLE,
+  ExecutionFencedError,
+  ExecutionFenceStore,
+  ExecutionFenceUnreadableError,
+  executionFencedResponse,
+  FenceTransitionConflictError,
+  InvalidExecutionFenceRequestError,
+  isExecutionFenceRefusal,
+  OPEN_EXECUTION_FENCE,
+} from './execution-fence.js';
 export { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
 export type { HubStreamEvent, PresenceMember } from './hub-do.js';
 export { HUB_INSTANCE_NAME, HubDurableObject } from './hub-do.js';
 export type {
   DORunnerEnv,
+  ExecutionFenceWiring,
   InitOptions,
   InitResult,
   InitSource,
+  StorageInitOptions,
 } from './init.js';
 export { init } from './init.js';
 // Agent-memory id chokepoint: mint server-owned thread ids and validate trusted

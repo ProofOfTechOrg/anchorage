@@ -198,6 +198,7 @@ try {
   type CloudflareApiRateCoordinator,
   type DeploymentEgressPolicy,
   type FleetStateDatabase,
+  type InitialExecutionFenceState,
   type WorkersForPlatformsApi,
 } from '@proofoftech/fleet-control';
 import type { FleetDispatchEnv } from '@proofoftech/fleet-control/workers/dispatch';
@@ -215,6 +216,11 @@ declare const database: FleetStateDatabase;
 declare const api: WorkersForPlatformsApi;
 declare const policy: DeploymentEgressPolicy;
 declare const coordinator: CloudflareApiRateCoordinator;
+// The provisioning-time fence state a control plane has to choose. Named here
+// because it is a REQUIRED provisionDeployment option: a consumer that cannot
+// import its type cannot type its own provisioning wrapper.
+declare const initialExecutionFenceState: InitialExecutionFenceState;
+const lockedAtBirth: InitialExecutionFenceState = 'migration-locked';
 
 void CloudflareProvisioningClient;
 void D1CloudflareApiRateCoordinator;
@@ -239,6 +245,8 @@ void database;
 void api;
 void policy;
 void coordinator;
+void initialExecutionFenceState;
+void lockedAtBirth;
 `,
   );
   await writeFile(

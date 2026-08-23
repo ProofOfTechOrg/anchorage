@@ -27,22 +27,22 @@ describe('FlowSafe Cloudflare fidelity', () => {
     expect(await readDeploymentIdentity(db())).toBeUndefined();
 
     await Promise.all([
-      seedDeploymentIdentity(db(), 'acme'),
-      seedDeploymentIdentity(db(), 'acme'),
+      seedDeploymentIdentity(db(), 'acme', 'open'),
+      seedDeploymentIdentity(db(), 'acme', 'open'),
     ]);
 
     await expect(assertDeploymentIdentity(db(), 'acme')).resolves.toBe(
       undefined,
     );
-    await expect(seedDeploymentIdentity(db(), 'globex')).rejects.toThrow(
-      /already belongs to deployment 'acme'/,
-    );
+    await expect(
+      seedDeploymentIdentity(db(), 'globex', 'open'),
+    ).rejects.toThrow(/already belongs to deployment 'acme'/);
     expect(await readDeploymentIdentity(db())).toBe('acme');
   });
 
   it('isolates D1 per test and resolves concurrent resource claims to one owner', async () => {
     expect(await readDeploymentIdentity(db())).toBeUndefined();
-    await seedDeploymentIdentity(db(), 'acme');
+    await seedDeploymentIdentity(db(), 'acme', 'open');
 
     const store = new D1ResourceOwnershipStore(db());
     const contenders: readonly ResourceOwner[] = [

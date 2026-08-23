@@ -37,6 +37,8 @@ import { ScheduleInputSchema } from '@mastra/core/schedules';
 import { computeNextFireAt } from '@mastra/core/workflows';
 import type { ResourceOwnershipStore } from '../approval-api/index.js';
 import {
+  admitsWorkAuthoring,
+  type ExecutionFenceStore,
   isPathSafeId,
   isReservedExecutionContextKey,
   RESERVED_EXECUTION_CONTEXT_KEYS,
@@ -314,6 +316,13 @@ export interface ScheduleTickOptions {
   runCap?: ScheduleTickRunCap;
   /** Every fire attempt is audited through this (accepted OR skipped/failed). Absent ⇒ no audit. */
   audit?: ScheduleTickAuditSink;
+  /**
+   * The deployment execution fence, read ONCE per pass and BEFORE any CAS
+   * claim. A fenced pass does nothing at all: claiming a fire it will not run
+   * would consume it — the claim advances `nextFireAt` — and that fire would
+   * then be lost rather than deferred. Absent ⇒ unfenced.
+   */
+  executionFence?: ExecutionFenceStore;
   /**
    * Max due schedules processed per tick pass. Must be a nonnegative safe
    * integer; zero is an intentional no-op. Default 100.
@@ -1432,17 +1441,41 @@ export function createScheduleTick(
     }
   };
 
+  const idlePass = (): ScheduleTickResult => ({
+    due: 0,
+    fired: 0,
+    skipped: 0,
+    failed: 0,
+    deferred: 0,
+    reconciled: 0,
+    lost: 0,
+  });
+
   return async () => {
-    if (limit === 0) {
-      return {
-        due: 0,
-        fired: 0,
-        skipped: 0,
-        failed: 0,
-        deferred: 0,
-        reconciled: 0,
-        lost: 0,
-      };
+    if (limit === 0) return idlePass();
+    // ONE fence read per pass, before the due list and before any claim.
+    // Nothing at all runs on a fenced pass — not the deferred reconciliation
+    // either, since its agent-signal retry can dispatch. Every due fire stays
+    // due, so it fires when the fence reopens: neither lost nor duplicated.
+    //
+    // A fence that cannot be read skips the pass too. This is a cron/alarm
+    // path, so it degrades closed by DOING NOTHING and logging: throwing would
+    // fail the maintenance duty, and proceeding would claim fires on a
+    // deployment whose state is unknown.
+    if (options.executionFence) {
+      let admitted: boolean;
+      try {
+        admitted = admitsWorkAuthoring(await options.executionFence.read());
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            type: 'schedule-tick-fence-error',
+            reason: error instanceof Error ? error.message : String(error),
+          }),
+        );
+        return idlePass();
+      }
+      if (!admitted) return idlePass();
     }
     const at = now();
     const due = await store.listDueSchedules(at, limit);

@@ -75,6 +75,13 @@ import {
   RUN_START_ROLES,
 } from '../approval-api/index.js';
 import {
+  admitsWorkAuthoring,
+  type ExecutionFenceStore,
+  executionFencedResponse,
+  isExecutionFenceRefusal,
+  OPEN_EXECUTION_FENCE,
+} from '../do-runner/index.js';
+import {
   assertNoClientMemoryIds,
   type BoundThreadTargetValidator,
   RunRouteError,
@@ -180,6 +187,15 @@ export interface ObjectiveRouterOptions {
    * zero denies every non-empty body. Default 16384.
    */
   maxContentBytes?: number;
+  /**
+   * The deployment execution fence. A standing objective is authored work — it
+   * is what the agent loop re-reads to decide it should run again — so SET,
+   * UPDATE, and CLEAR are refused past `open` while GET stays available in
+   * every state. Absent ⇒ this router is unfenced; see
+   * ScheduleRouterOptions.executionFence for why a router's is optional while
+   * init()'s is required.
+   */
+  executionFence?: ExecutionFenceStore;
   /** Route prefix. Default '/api/threads' (goals mount at `/:threadId/goal`). */
   basePath?: string;
 }
@@ -383,7 +399,7 @@ function buildUpdateRecord(
 export function createObjectiveRouter(
   options: ObjectiveRouterOptions,
 ): ObjectiveRouter {
-  const { resolve, store } = options;
+  const { executionFence, resolve, store } = options;
   const roles = options.roles ?? RUN_START_ROLES;
   const maxRunsCap = positiveSafeInteger(
     options.maxRunsCap ?? DEFAULT_GOAL_MAX_RUNS,
@@ -478,6 +494,21 @@ export function createObjectiveRouter(
         return json({ error: 'forbidden' }, 403);
       }
 
+      // 3b. The execution fence, after the role gate so a refusal is auditable
+      // and tells an unauthorized caller nothing. Reads pass in every state.
+      if (isMutation) {
+        const reading = executionFence
+          ? await executionFence.read()
+          : OPEN_EXECUTION_FENCE;
+        if (!admitsWorkAuthoring(reading)) {
+          await audit('rejected', 'execution-fenced');
+          return executionFencedResponse(
+            reading.state,
+            `objective ${operation}`,
+          );
+        }
+      }
+
       // 4. GET / CLEAR carry no validated body.
       if (operation === 'get') {
         const record = await readObjective(store, threadId);
@@ -558,6 +589,17 @@ export function createObjectiveRouter(
       await auditCommittedMutation();
       return json({ objective: built.value });
     } catch (error) {
+      // A fence that could not be READ is not evidence the deployment is open,
+      // so it degrades closed with its own retryable 503 rather than the
+      // generic 500 below — an operator must be able to tell a deployment
+      // that is being migrated from one that is broken.
+      if (isExecutionFenceRefusal(error)) {
+        await audit('rejected', 'execution-fence-unreadable');
+        return json(
+          { error: error.message, reason: error.reason },
+          error.status,
+        );
+      }
       if (error instanceof RunRouteError) {
         // A post-auth denial: the target 404 or a smuggled memory-id 400.
         await audit(

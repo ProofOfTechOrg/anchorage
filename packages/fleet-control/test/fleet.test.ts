@@ -30,10 +30,12 @@ import { deploymentSpecDigest } from '../src/spec-digest.js';
 import type {
   DatabaseReference,
   DeploymentSpec,
+  ExternalMutationFence,
   FleetRecord,
   FleetResourceInventory,
   FleetStateLease,
   FleetStateStore,
+  InitialExecutionFenceState,
   LiveDeployment,
   MaintenanceHealth,
   PromotionGuard,
@@ -186,11 +188,16 @@ class FleetBackend implements ProvisioningBackend {
     throw new Error('unused');
   }
 
+  // Declares the fence state so it appears in the call log. A fake that simply
+  // omitted the parameter would still satisfy the interface, and an unthreaded
+  // fence state would be invisible to every assertion below.
   async seedDeploymentIdentity(
     _database: DatabaseReference,
     tenantTag: string,
+    _fence: ExternalMutationFence,
+    initialExecutionFenceState: InitialExecutionFenceState,
   ): Promise<void> {
-    this.calls.push(`identity:${tenantTag}`);
+    this.calls.push(`identity:${tenantTag}:${initialExecutionFenceState}`);
   }
 
   async readDeploymentIdentity(
@@ -3164,6 +3171,7 @@ describe('fleet operations', () => {
 
     await expect(
       provisionDeployment({
+        initialExecutionFenceState: 'open',
         backend,
         store,
         spec: initialSpec,
@@ -3580,6 +3588,13 @@ describe('fleet operations', () => {
     expect(migrationIndex).toBeGreaterThanOrEqual(0);
     expect(stateIndex).toBeGreaterThan(migrationIndex);
     expect(deployIndex).toBeGreaterThan(stateIndex);
+    // A migration re-stamps a database this deployment already owns, and asks
+    // for 'open' — the state a live, executing deployment already has. Seeding
+    // 'migration-locked' here would stop a running deployment mid-migration,
+    // which is why migrateFleet takes no fence option at all.
+    expect(
+      backend.calls.filter((call) => call.startsWith('identity:')),
+    ).toEqual(['identity:acme:open']);
   });
 
   it('returns a stable sorted version report', () => {

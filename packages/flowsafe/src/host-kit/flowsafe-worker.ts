@@ -46,9 +46,12 @@ import type {
   SnapshotDatabase,
 } from '../do-runner/index.js';
 import {
+  assertExecutionFenceState,
   DEPLOYMENT_IDENTITY_HEADER,
   DeploymentIdentityError,
+  DoStatusError,
   deploymentIdentityHeaders,
+  ExecutionFenceStore,
   ensureDeploymentIdentityBindings,
   purgeExpiredBackgroundTasks,
   purgeExpiredNotifications,
@@ -61,6 +64,7 @@ import {
   verifyDurableObjectDeploymentRequest,
 } from '../do-runner/index.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
+import { readBoundedBody } from '../http-body.js';
 import { abandonApprovalsForRun, type ResumeRunFn } from './approval-bridge.js';
 import { bearerActorAuthenticator } from './bearer-auth.js';
 import {
@@ -461,6 +465,16 @@ interface ConfiguredApprovalServiceOptions {
   notify?: ApprovalNotificationSink;
   allowSelfDecision: SelfDecisionPolicy;
   stream?: ApprovalStreamSink;
+  /**
+   * REQUIRED, unlike its optional counterpart on HostApprovalServiceOptions:
+   * this interface is internal to the composer, both of its call sites are in
+   * this file, and every service the composer builds sits on a database whose
+   * fence it can name. Making it required is what keeps a third call site from
+   * being added later that silently builds an unfenced service — which would
+   * let a decision commit durably on a migration-locked deployment and then
+   * fail to resume.
+   */
+  executionFence: ExecutionFenceStore;
 }
 
 function buildConfiguredApprovalService<Env extends FlowsafeWorkerEnv>(
@@ -485,6 +499,7 @@ function buildConfiguredApprovalService<Env extends FlowsafeWorkerEnv>(
     notify: options.notify,
     allowSelfDecision: options.allowSelfDecision,
     stream: options.stream,
+    executionFence: options.executionFence,
   });
 }
 
@@ -516,6 +531,7 @@ export function createFlowsafeRunnerLifecycle<Env extends FlowsafeWorkerEnv>(
     : undefined;
   const service = buildConfiguredApprovalService(config, env, topology, {
     store: approvalStoreFactoryFor(env.DB, storageTablePrefix).store(),
+    executionFence: executionFenceFor(env),
     waitUntil: options.waitUntil,
     notify: config.notify?.(env),
     allowSelfDecision,
@@ -762,6 +778,168 @@ async function maintenanceAdminResponse<Env extends FlowsafeWorkerEnv>(
   });
 }
 
+/**
+ * One fence store per DATABASE — not per request, and not per call site.
+ *
+ * The store holds no state of its own (a read is never memoized —
+ * execution-fence.ts), so this is about IDENTITY rather than caching: the admin
+ * route that MOVES the fence, the approval service that OBEYS it, and the
+ * runner DO's runtime must all be looking at the same database. Keyed on the
+ * binding rather than on `env` because a host mutates one env object across
+ * requests, and because the fence belongs to the database, not to the request
+ * that happens to reach it. WeakMap so a test harness cycling bindings never
+ * leaks.
+ */
+const executionFenceStores = new WeakMap<object, ExecutionFenceStore>();
+
+function executionFenceFor<Env extends FlowsafeWorkerEnv>(
+  env: Env,
+): ExecutionFenceStore {
+  const binding = env.DB as unknown as object;
+  const existing = executionFenceStores.get(binding);
+  if (existing) return existing;
+  const store = new ExecutionFenceStore(env.DB);
+  executionFenceStores.set(binding, store);
+  return store;
+}
+
+const EXECUTION_FENCE_ADMIN_PATH = '/admin/execution-fence';
+const EXECUTION_FENCE_ADMIN_MAX_BODY_BYTES = 4_096;
+
+/**
+ * The deployment execution fence's control-plane surface, on the same
+ * credential and the same constant-time comparison as
+ * `maintenanceAdminResponse` — it is the same trust boundary (the provisioning
+ * TCB, docs/security-threat-model.md) and splitting the credential would only
+ * add a second secret an operator can get wrong.
+ *
+ * `GET` reports the state; `POST` moves it, compare-and-set on `expected`.
+ * Transition POLICY is the HOST's: this package enforces only the state
+ * vocabulary, the CAS, and the rule that entering 'proof-only' names a proof
+ * key. Which sequence of states a migration walks is the control plane's
+ * business, and hard-coding it here would freeze an operational procedure into
+ * a published package.
+ *
+ * Answers on a mis-provisioned deployment are NOT reachable: the identity gate
+ * 503s before this dispatch. Accepted — an operator whose bindings are wrong
+ * has a bigger problem than the fence, and relaxing the identity gate to serve
+ * this route would put an unverified database behind a control-plane write.
+ */
+async function executionFenceAdminResponse<Env extends FlowsafeWorkerEnv>(
+  request: Request,
+  env: Env,
+): Promise<Response | null> {
+  const url = new URL(request.url);
+  if (url.pathname !== EXECUTION_FENCE_ADMIN_PATH) return null;
+  if (request.method !== 'GET' && request.method !== 'POST') {
+    return json({ error: 'method not allowed' }, 405);
+  }
+  const expected = env.MAINTENANCE_ADMIN_SECRET;
+  // Unconfigured is 503, never open: the fence is the control that stops a
+  // deployment executing, so an unauthenticated caller must never move it.
+  if (
+    expected === undefined ||
+    !MAINTENANCE_ADMIN_SECRET_PATTERN.test(expected)
+  ) {
+    console.error(
+      JSON.stringify({
+        type: 'config-error',
+        var: 'MAINTENANCE_ADMIN_SECRET',
+        reason: 'execution fence administration is not configured',
+      }),
+    );
+    return json({ error: 'execution fence administration unavailable' }, 503);
+  }
+  if (await credentialsMatch(expected, env.DEPLOYMENT_IDENTITY_SECRET)) {
+    console.error(
+      JSON.stringify({
+        type: 'config-error',
+        var: 'MAINTENANCE_ADMIN_SECRET',
+        reason: 'maintenance and deployment identity credentials must differ',
+      }),
+    );
+    return json({ error: 'execution fence administration unavailable' }, 503);
+  }
+  const actual = request.headers
+    .get('authorization')
+    ?.match(/^Bearer\s+(.+)$/i)?.[1];
+  if (!actual || actual.length > 256) {
+    return json({ error: 'authentication required' }, 401);
+  }
+  if (!(await credentialsMatch(actual, expected))) {
+    return json({ error: 'authentication required' }, 401);
+  }
+  const fence = executionFenceFor(env);
+  try {
+    if (request.method === 'GET') {
+      const reading = await fence.read();
+      return json({
+        state: reading.state,
+        ...(reading.proofKey === undefined
+          ? {}
+          : { proofKey: reading.proofKey }),
+        ...(reading.proofRunId === undefined
+          ? {}
+          : { proofRunId: reading.proofRunId }),
+      });
+    }
+    const raw = await readBoundedBody(
+      request,
+      EXECUTION_FENCE_ADMIN_MAX_BODY_BYTES,
+      'execution fence body exceeds limit',
+    );
+    if (!raw.ok) {
+      return json(
+        { error: 'a JSON object body is required' },
+        raw.reason === 'payload-too-large' ? 413 : 400,
+      );
+    }
+    let parsed: unknown;
+    try {
+      parsed = raw.text === '' ? undefined : JSON.parse(raw.text);
+    } catch {
+      parsed = undefined;
+    }
+    if (
+      parsed === null ||
+      typeof parsed !== 'object' ||
+      Array.isArray(parsed)
+    ) {
+      return json({ error: 'a JSON object body is required' }, 400);
+    }
+    const body = parsed as {
+      expected?: unknown;
+      next?: unknown;
+      proofKey?: unknown;
+    };
+    const reading = await fence.transition({
+      expected: assertExecutionFenceState(body.expected, 'expected'),
+      next: assertExecutionFenceState(body.next, 'next'),
+      ...(body.proofKey === undefined
+        ? {}
+        : { proofKey: body.proofKey as string }),
+    });
+    return json({ state: reading.state });
+  } catch (error) {
+    if (error instanceof DoStatusError) {
+      return json(
+        {
+          error: error.message,
+          ...(error.reason === undefined ? {} : { reason: error.reason }),
+        },
+        error.status,
+      );
+    }
+    console.error(
+      JSON.stringify({
+        type: 'execution-fence-admin-error',
+        reason: error instanceof Error ? error.message : String(error),
+      }),
+    );
+    return json({ error: 'execution fence administration failed' }, 500);
+  }
+}
+
 export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
   config: FlowsafeWorkerConfig<Env>,
 ): FlowsafeWorker<Env> {
@@ -785,6 +963,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       buildService: (store) =>
         buildConfiguredApprovalService(config, env, topology, {
           store,
+          executionFence: executionFenceFor(env),
           waitUntil,
           notify,
           stream,
@@ -1118,6 +1297,13 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
 
         const maintenanceAdmin = await maintenanceAdminResponse(request, env);
         if (maintenanceAdmin) return maintenanceAdmin;
+
+        // The execution fence's control plane, beside the maintenance admin
+        // routes and ahead of every tenant router: it must answer while the
+        // deployment is refusing tenant traffic, which is the whole state it
+        // exists to report and clear.
+        const fenceAdmin = await executionFenceAdminResponse(request, env);
+        if (fenceAdmin) return fenceAdmin;
 
         const waitUntil = (promise: Promise<unknown>): void =>
           ctx.waitUntil(promise);

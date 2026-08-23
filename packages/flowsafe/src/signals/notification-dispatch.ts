@@ -6,7 +6,11 @@ import type {
 } from '@mastra/core/notifications';
 
 import type { ActorContext } from '../approval-api/index.js';
-import { isPathSafeId } from '../do-runner/index.js';
+import {
+  admitsDrainableExecution,
+  type ExecutionFenceStore,
+  isPathSafeId,
+} from '../do-runner/index.js';
 import type { ThreadTopology } from '../host-kit/index.js';
 import { nonnegativeSafeInteger } from '../numeric-config.js';
 
@@ -24,6 +28,14 @@ export interface NotificationDispatchTickOptions {
    * intentional no-op. Values above 100 are split into route-valid chunks.
    */
   limit?: number;
+  /**
+   * The deployment execution fence, read ONCE per pass. A drain still
+   * dispatches — the thread routes degrade a wake to a persist there, so the
+   * inbox drains without minting — while migration-locked and proof-only skip
+   * the pass entirely: a due row stays due, so the deployment that takes over
+   * dispatches it. Absent ⇒ unfenced.
+   */
+  executionFence?: ExecutionFenceStore;
 }
 
 export interface NotificationDispatchTickResult {
@@ -241,6 +253,27 @@ export function createNotificationDispatchTick(
   );
   return async () => {
     if (limit === 0) return { due: 0, delivered: 0, failed: 0 };
+    // The fence, before the due read and before any delivery. This runs on a
+    // maintenance alarm, so a fence that cannot be READ degrades closed by
+    // skipping the pass and logging: throwing would fail the duty, and
+    // proceeding would dispatch on a deployment whose state is unknown.
+    if (options.executionFence) {
+      let admitted: boolean;
+      try {
+        admitted = admitsDrainableExecution(
+          await options.executionFence.read(),
+        );
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            type: 'notification-dispatch-fence-error',
+            error: errorMessage(error),
+          }),
+        );
+        return { due: 0, delivered: 0, failed: 0 };
+      }
+      if (!admitted) return { due: 0, delivered: 0, failed: 0 };
+    }
     const now = options.now?.() ?? new Date();
     const due = await options.storage.listDueNotifications({
       now,

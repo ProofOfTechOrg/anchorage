@@ -51,6 +51,12 @@ import {
   RUN_PROVENANCE_CONTEXT_KEY,
   stripReservedExecutionContext,
 } from './execution-context.js';
+import {
+  admitsExistingRun,
+  admitsRunStart,
+  ExecutionFencedError,
+  type ExecutionFenceStore,
+} from './execution-fence.js';
 import { mastraRegistryEntries } from './mastra-registry.js';
 import { isPathSafeId } from './path-safe-id.js';
 import type { HostPubSub } from './pubsub.js';
@@ -739,6 +745,20 @@ export interface RunnerRuntimeOptions {
    * before this seam existed.
    */
   pubsub?: HostPubSub;
+  /**
+   * The deployment execution fence (execution-fence.ts), consulted on EVERY
+   * start and resume. THIS is the closure guarantee for runs: every mint in
+   * this package funnels through start() and every re-entry through resume(),
+   * so a check here cannot be routed around by a surface that forgot to gate
+   * itself — the route-level checks are the same refusal made earlier and
+   * cheaper, never the boundary.
+   *
+   * Absent ⇒ unfenced, byte-identical to before this seam existed. `init()`
+   * builds one automatically from a `{ DB }` source and REQUIRES an explicit
+   * `executionFence` (a store, or `'none'`) from a `{ storage }` one, so
+   * absence here is always something a host wrote down.
+   */
+  executionFence?: ExecutionFenceStore;
 }
 
 /** @inline */
@@ -779,6 +799,16 @@ export type StartRunOptions = {
   economicOperations?: readonly RunEconomicOperation[];
   /** Trusted schedule source; never accepted directly from a public request. */
   scheduleDispatch?: RunScheduleDispatch;
+  /**
+   * The start's idempotency key, for the execution fence's proof-only match
+   * and nothing else in this checkpoint (F3 wires the reservation that also
+   * consumes it). INTERNAL: it reaches the runtime from a trusted host seam,
+   * never from a request body and never through an open request-context key —
+   * a tenant able to name the proof key could start a run on a deployment that
+   * is supposed to be executing exactly one.
+   * @internal
+   */
+  idempotencyKey?: string;
 } & OptionalRunRequester;
 
 export type ResumeRunOptions = {
@@ -911,6 +941,7 @@ export class RunnerRuntime {
   // replays on ONE shared feed. Undefined ⇒ core defaults a fresh emitter per
   // run ⇒ byte-identical to before this seam existed.
   readonly #pubsub?: HostPubSub;
+  readonly #executionFence?: ExecutionFenceStore;
   #mastra?: Mastra;
 
   constructor(options: RunnerRuntimeOptions) {
@@ -918,6 +949,19 @@ export class RunnerRuntime {
     this.#logger = options.logger ?? false;
     this.#requestContextForRun = options.requestContextForRun;
     this.#pubsub = options.pubsub;
+    this.#executionFence = options.executionFence;
+  }
+
+  /**
+   * The deployment execution fence this runtime enforces, or undefined when
+   * the host built an unfenced runtime. Exposed so the surfaces ABOVE the
+   * runtime — the run object's routes, the thread DO's signal routes — gate on
+   * the same store rather than constructing a second one, and so
+   * DurableObjectRunner can assert that a runtime built against a bound
+   * database is never fence-less.
+   */
+  get executionFence(): ExecutionFenceStore | undefined {
+    return this.#executionFence;
   }
 
   /**
@@ -972,6 +1016,42 @@ export class RunnerRuntime {
     return [...this.#workflows.keys()];
   }
 
+  /**
+   * The fence check every mint passes. In proof-only the admitted start also
+   * BINDS the proof to its run id, and that write-back is conditional: between
+   * the read that admitted it and the write another start may have claimed the
+   * proof, or the operator may have moved the fence on. Zero rows changed
+   * therefore refuses the start — the deployment is no longer the one this
+   * start read.
+   */
+  async #assertStartFence(
+    runId: string,
+    idempotencyKey: string | undefined,
+  ): Promise<void> {
+    const fence = this.#executionFence;
+    if (!fence) return;
+    const reading = await fence.read();
+    if (!admitsRunStart(reading, idempotencyKey)) {
+      throw new ExecutionFencedError(reading.state, 'run start');
+    }
+    if (reading.state !== 'proof-only' || reading.proofKey === undefined) {
+      return;
+    }
+    if (!(await fence.recordProofRun(reading.proofKey, runId))) {
+      throw new ExecutionFencedError(reading.state, 'run start');
+    }
+  }
+
+  /** The fence check every re-entry passes — resume, and the deadline alarm. */
+  async #assertResumeFence(runId: string): Promise<void> {
+    const fence = this.#executionFence;
+    if (!fence) return;
+    const reading = await fence.read();
+    if (!admitsExistingRun(reading, runId)) {
+      throw new ExecutionFencedError(reading.state, 'run resume');
+    }
+  }
+
   async start(
     workflowId: string,
     options: StartRunOptions,
@@ -1019,6 +1099,11 @@ export class RunnerRuntime {
     ) {
       throw new InvalidRunRequestError('attemptToken is malformed');
     }
+    // The fence, BEFORE the run lock and before any storage work: a fenced
+    // deployment must not queue behind a live run's lock just to be refused,
+    // and must write nothing on the way to the refusal. One read, never
+    // memoized (execution-fence.ts).
+    await this.#assertStartFence(runId, options.idempotencyKey);
     return this.#withRunLock(workflowId, runId, async () => {
       // Supplied ids can collide with an existing run; starting it
       // again would re-execute already-executed steps.
@@ -1123,6 +1208,10 @@ export class RunnerRuntime {
     options: ResumeRunOptions = {},
   ): Promise<RunSummary> {
     const workflow = this.#getWorkflow(workflowId);
+    // A drain must not refuse resumes — the suspended runs it is draining are
+    // waiting for exactly these — so only migration-locked and proof-only
+    // block here, and proof-only admits its one nominated run.
+    await this.#assertResumeFence(runId);
     return this.#withRunLock(workflowId, runId, async () => {
       const state = await this.#workflowState(workflow, runId);
       if (!state) throw new UnknownRunError(workflowId, runId);
