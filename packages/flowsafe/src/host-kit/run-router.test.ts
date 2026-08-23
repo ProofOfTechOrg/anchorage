@@ -1076,7 +1076,7 @@ describe('createRunRouter — error mapping', () => {
 function keyedHarness(
   options: HarnessOptions & {
     live?: (workflowId: string, runId: string) => Promise<boolean>;
-    fence?: ExecutionFenceWiring;
+    executionFence?: ExecutionFenceWiring;
     now?: () => number;
   } = {},
 ) {
@@ -1097,7 +1097,7 @@ function keyedHarness(
     startIdempotency: {
       store,
       live: options.live ?? (async (_workflowId, runId) => inFlight.has(runId)),
-      fence: options.fence ?? 'none',
+      executionFence: options.executionFence ?? 'none',
     },
     start:
       options.start ??

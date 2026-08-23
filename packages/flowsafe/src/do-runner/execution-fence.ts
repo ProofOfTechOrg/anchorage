@@ -45,6 +45,7 @@ import {
   EXECUTION_FENCE_STATES,
   EXECUTION_FENCE_TABLE,
 } from '#deployment-identity-protocol';
+import { missingTableReadsEmpty } from './cause-chain.js';
 import { DoStatusError } from './do-status-error.js';
 import { isPathSafeId } from './path-safe-id.js';
 
@@ -511,56 +512,19 @@ function readingFromRow(row: ExecutionFenceRow): ExecutionFenceReading {
 }
 
 /**
- * How far down an error's `cause` chain the missing-table test looks. Bounded
- * because a chain can be cyclic or adversarially deep, and this runs on the
- * fence read that fronts every gated request.
- */
-const MAX_FENCE_ERROR_CAUSE_DEPTH = 8;
-
-/**
- * SQLite/D1's "no such table". Same message match, and the same reasoning, as
- * d1-storage's purge helpers: the structural database seam carries no error
- * codes, and a table that was never created is not a fault — for this store it
- * is a pre-0.20 database, which reads as `open`.
+ * SQLite/D1's "no such table", for THIS store's table: a table that was never
+ * created is not a fault here — it is a pre-0.20 database, which reads as
+ * `open`.
  *
- * The CAUSE chain is walked, not just the top message, because the seam is
- * structural: an adapter is free to wrap the driver's error in one of its own
- * ("D1 query failed") and carry the SQLite text on `cause`. Reading only the
- * top message there would classify a pre-0.20 database as unreadable instead of
- * open — a PERMANENT 503 on every gated path of a deployment that upgraded
- * correctly, which is the one failure this rule exists to prevent.
- *
- * Only the ROOT of that chain is matched, never a link part-way down. Those are
- * different claims: if the innermost fault IS the missing table then the
- * database is pre-0.20 and `open` is the truth however many wrappers sit on
- * top, but a missing-table link whose own cause is something else describes a
- * fault that merely MENTIONS this table on its way past — a failed migration,
- * an adapter retry that reports the last thing it saw — and concluding "there
- * is no fence" from that is the one answer that must never be wrong. So the
- * walk descends first and tests once.
- *
- * A chain that does not terminate within the bound (a cycle, or one deeper than
- * MAX_FENCE_ERROR_CAUSE_DEPTH) has no reachable root, so it degrades closed for
- * the same reason: no root was observed, and an unobserved root is not evidence
- * of an absent table.
+ * The rule itself (walk the cause chain, bounded and cycle-safe, and test the
+ * ROOT only) lives in cause-chain.ts, shared with the start-reservation store
+ * because both answer the same question and both are dangerous in the same
+ * direction. A chain with no reachable root degrades CLOSED there for the same
+ * reason it does here: no root was observed, and an unobserved root is not
+ * evidence of an absent table.
  */
 function isMissingFenceTable(error: unknown): boolean {
-  const seen = new Set<unknown>();
-  let current: unknown = error;
-  for (let depth = 0; depth < MAX_FENCE_ERROR_CAUSE_DEPTH; depth += 1) {
-    seen.add(current);
-    const cause = current instanceof Error ? current.cause : undefined;
-    if (cause !== undefined && cause !== null && !seen.has(cause)) {
-      current = cause;
-      continue;
-    }
-    const message =
-      current instanceof Error ? current.message : String(current);
-    return (
-      /no such table/i.test(message) && message.includes(EXECUTION_FENCE_TABLE)
-    );
-  }
-  return false;
+  return missingTableReadsEmpty(error, EXECUTION_FENCE_TABLE);
 }
 
 export interface ExecutionFenceStoreOptions {

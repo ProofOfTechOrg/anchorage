@@ -73,6 +73,7 @@ import {
   HubDurableObject,
   type RequestContextProvider,
   type RunnerRuntime,
+  startIdempotencyFor,
 } from '@proofoftech/flowsafe/do-runner';
 import {
   approvalStoreFactoryFor,
@@ -227,6 +228,10 @@ function defineWorkflows(env: Env): RunnerRuntime {
   return buildShowcaseRuntime({
     initInput: env,
     executionFence: new ExecutionFenceStore(env.DB),
+    // The same binding the composed Worker's run router reserves into, taken
+    // through the package's per-binding memo so the two are one store: the
+    // router reserves and claims, and THIS runtime is what settles.
+    startIdempotency: startIdempotencyFor(env.DB),
     // Grants are per run. The deployment tag is infrastructure-provided and
     // reaches Breakwater only as trusted audit correlation; connector rate and
     // idempotency keys are deployment-wide by physical isolation.

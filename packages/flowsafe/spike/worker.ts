@@ -123,6 +123,7 @@ import {
   assertExecutionFenceState,
   createD1Storage,
   createHostPubSub,
+  DeploymentInventory,
   DurableObjectRunner,
   doErrorResponse,
   type ExecutionFenceStore,
@@ -132,6 +133,7 @@ import {
   HubDurableObject,
   type InitResult,
   init,
+  isInventoryCategory,
   isPathSafeId,
   isSuspensionTimeoutResumeData,
   mintThreadId,
@@ -626,6 +628,19 @@ const SPIKE_ACTORS = new Map<string, ApprovalActor>([
   ['other-viewer', { id: 'vera', role: 'viewer' }],
 ]);
 
+// --- Idempotent-start execution counter (FI1/FI2) ---------------------------
+// The reservation's claim is not "one run id came back twice" — it is that the
+// paid first step of a keyed start EXECUTED ONCE. A repeated run id is only
+// evidence of that if nothing else could have run, which is an inference. This
+// workflow's first step writes a durable D1 row instead, so the spike can count
+// executions directly across a process death and across a concurrent burst.
+const COUNTED_WORKFLOW_ID = 'demo-idempotent';
+const EXECUTION_COUNT_TABLE = 'spike_execution_count';
+const EXECUTION_COUNT_DDL = `CREATE TABLE IF NOT EXISTS ${EXECUTION_COUNT_TABLE} (
+    id TEXT PRIMARY KEY,
+    executions INTEGER NOT NULL
+  )`;
+
 const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
   {
     id: 'demo-approval',
@@ -647,6 +662,13 @@ const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
     description:
       'one step that suspends with a per-suspension deadline, so the run resumes itself when the awaited signal never arrives',
     sampleInput: { topic: 'launch', deadlineMs: 10_000 },
+  },
+  {
+    id: COUNTED_WORKFLOW_ID,
+    title: 'Demo idempotent start',
+    description:
+      'demo-approval with a counting first step, so an idempotent start can be proved by EXECUTIONS rather than by run ids',
+    sampleInput: { topic: 'launch', counterId: 'probe' },
   },
 ];
 const scheduleTargetPolicy = createScheduleTargetPolicy({
@@ -774,6 +796,46 @@ function defineWorkflows(env: Env): RunnerRuntime {
     }),
   })
     .then(research)
+    .then(approval)
+    .then(publish)
+    .commit();
+
+  // FI1/FI2: demo-approval's shape with a COUNTING first step. The step is
+  // ordinary paid work as far as the runtime is concerned — it writes to D1
+  // before the run suspends — so a second execution of this key would show up
+  // as a second row increment whatever the run ids said.
+  const countedResearch = createStep({
+    id: 'counted-research',
+    inputSchema: z.object({ topic: z.string(), counterId: z.string() }),
+    outputSchema: z.object({ topic: z.string(), notes: z.string() }),
+    execute: async ({ inputData }) => {
+      // Lazy DDL rather than a provisioning step: this table belongs to the
+      // probe, not to the deployment, and creating it here keeps its one
+      // definition beside its one writer.
+      await env.DB.prepare(EXECUTION_COUNT_DDL).run();
+      await env.DB.prepare(
+        `INSERT INTO ${EXECUTION_COUNT_TABLE} (id, executions) VALUES (?, 1)
+           ON CONFLICT(id) DO UPDATE SET executions = executions + 1`,
+      )
+        .bind(inputData.counterId)
+        .run();
+      return {
+        topic: inputData.topic,
+        notes: `research notes for ${inputData.topic}`,
+      };
+    },
+  });
+
+  createWorkflow({
+    id: COUNTED_WORKFLOW_ID,
+    inputSchema: z.object({ topic: z.string(), counterId: z.string() }),
+    outputSchema: z.object({
+      topic: z.string(),
+      published: z.boolean(),
+      approvedBy: z.string().optional(),
+    }),
+  })
+    .then(countedResearch)
     .then(approval)
     .then(publish)
     .commit();
@@ -1274,6 +1336,11 @@ export class DemoThread extends ThreadDurableObject<Env> {
         // so this thread DO names it: the fence must live in the SAME database
         // as the state it fences.
         executionFence: executionFenceForEnv(env),
+        // Same reasoning, and the same binding: the agent topology reserves
+        // keyed starts into THIS store, so the runtime that sees an agent run
+        // reach terminal has to be the one that can mark them spent. Wiring
+        // 'none' here would reserve and claim normally and then never settle.
+        startIdempotency: startIdempotencyForEnv(env),
       },
     );
     this.#threadInit = threadInit;
@@ -2724,6 +2791,37 @@ async function handleSuspensionDeadlineProbe(
   return json({ status: response.status, armed: await response.json() });
 }
 
+// --- Idempotent-start execution count probe (FI1/FI2) ----------------------
+// Reads the counter `counted-research` writes. LOCAL-ONLY and unauthenticated,
+// like every other spike probe: it exposes nothing a run's own status does not,
+// and exists because no published surface reports how many times a step ran.
+async function handleExecutionCountProbe(
+  request: Request,
+  env: Env,
+): Promise<Response | null> {
+  const url = new URL(request.url);
+  if (request.method !== 'GET' || url.pathname !== '/idempotent/executions') {
+    return null;
+  }
+  const counterId = url.searchParams.get('counterId');
+  if (!isPathSafeId(counterId)) {
+    return json({ error: 'a path-safe counterId is required' }, 404);
+  }
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT executions FROM ${EXECUTION_COUNT_TABLE} WHERE id = ?`,
+    )
+      .bind(counterId)
+      .all<{ executions: number }>();
+    return json({ executions: results[0]?.executions ?? 0 });
+  } catch (error) {
+    // The table is created by the first counted step, so before any counted
+    // run has executed, ZERO executions is the truth rather than a fault.
+    if (!/no such table/i.test(String(error))) throw error;
+    return json({ executions: 0 });
+  }
+}
+
 // --- Execution fence control probe (F1) ------------------------------------
 // LOCAL-ONLY worker-level fence control channel, in the same shape the
 // published admin route serves (`GET`/`POST /admin/execution-fence`, CAS on
@@ -2762,6 +2860,46 @@ async function handleExecutionFenceProbe(
       ...(body.proofKey === undefined ? {} : { proofKey: body.proofKey }),
     });
     return json({ state: reading.state });
+  } catch (error) {
+    return doErrorResponse(error);
+  }
+}
+
+// --- Drain inventory probe (F2) --------------------------------------------
+// LOCAL-ONLY worker-level read of the deployment's outstanding work, in the
+// same shape the published `GET /admin/inventory` route serves (index with no
+// category, keyset page with one). Spike-local for the same reason the fence
+// probe is: this worker composes its routers by hand and mounts no
+// authenticated /admin surface.
+//
+// What the spike proves that unit tests cannot: that the inventory reads the
+// SAME D1 the runs, notifications, tasks, and reservations were really written
+// to by real workerd traffic, that its counts move as that work drains, and
+// that it stays answerable while the fence is refusing everything else.
+async function handleInventoryProbe(
+  request: Request,
+  env: Env,
+): Promise<Response | null> {
+  const url = new URL(request.url);
+  if (url.pathname !== '/admin/inventory') return null;
+  if (request.method !== 'GET') {
+    return json({ error: 'method not allowed' }, 405);
+  }
+  const inventory = new DeploymentInventory(env.DB as unknown as never);
+  try {
+    const category = url.searchParams.get('category');
+    if (category === null || category === '') return json(inventory.index());
+    if (!isInventoryCategory(category)) {
+      return json({ error: `unknown inventory category '${category}'` }, 400);
+    }
+    const cursor = url.searchParams.get('cursor');
+    const limit = url.searchParams.get('limit');
+    return json(
+      await inventory.read(category, {
+        ...(cursor === null ? {} : { cursor }),
+        ...(limit === null ? {} : { limit: Number(limit) }),
+      }),
+    );
   } catch (error) {
     return doErrorResponse(error);
   }
@@ -2813,6 +2951,12 @@ const handler: ExportedHandler<Env> = {
     const fenceProbe = await handleExecutionFenceProbe(routed, env);
     if (fenceProbe) return fenceProbe;
 
+    // The drain proof, beside the control that holds the drain open: an
+    // operator has to be able to READ what remains on a deployment that is
+    // refusing everything else.
+    const inventoryProbe = await handleInventoryProbe(routed, env);
+    if (inventoryProbe) return inventoryProbe;
+
     const agentProbeResponse = await handleLiveAgentRoute(routed, env, resolve);
     if (agentProbeResponse) return agentProbeResponse;
 
@@ -2845,6 +2989,11 @@ const handler: ExportedHandler<Env> = {
     // unauthenticated, ahead of the routers.
     const deadlineProbe = await handleSuspensionDeadlineProbe(routed, env);
     if (deadlineProbe) return deadlineProbe;
+
+    // Idempotent-start execution count (FI1/FI2) — local, unauthenticated,
+    // ahead of the routers.
+    const executionCountProbe = await handleExecutionCountProbe(routed, env);
+    if (executionCountProbe) return executionCountProbe;
 
     // Track E webhook ingress: the github webhook route TERMINATES on the Worker,
     // signature-authed (not bearer), route-absent when its secret is unset.
@@ -2898,7 +3047,7 @@ const handler: ExportedHandler<Env> = {
       startIdempotency: {
         store: startIdempotencyForEnv(env),
         live: runTopology.startLiveness,
-        fence: executionFenceForEnv(env),
+        executionFence: executionFenceForEnv(env),
       },
     })(routed);
     if (runResponse) return runResponse;

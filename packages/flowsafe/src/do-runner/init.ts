@@ -88,13 +88,9 @@ export interface InitOptions {
    * binding — the reservation table must live in the database the runs live in,
    * and init is the one place that holds both.
    *
-   * OPTIONAL rather than required, unlike `executionFence`, because absence
-   * here is not a policy a host can get wrong in silence: a runtime with no
-   * reservation store cannot settle reservations, and
-   * `DurableObjectRunner.build` REFUSES to serve from one whenever a DB binding
-   * is present. So the only runtimes that reach production without it are the
-   * ones with no database to reserve against, and the guard — not this option —
-   * is what makes that true.
+   * OPTIONAL on THIS branch only, where it is ignored. `StorageInitOptions`
+   * requires it, and widens it to include the opt-out — see there for why a
+   * `{ storage }` host must write the answer down.
    */
   startIdempotency?: StartIdempotencyWiring;
 }
@@ -128,13 +124,31 @@ function startIdempotencyForSource(
 }
 
 /**
- * InitOptions for a `{ storage }` source: the fence wiring is mandatory, and
- * widened to admit the opt-out. Written as an intersection rather than an
- * `extends`, because a subtype may not WIDEN an inherited property's type —
- * and the widening is the point: `'none'` exists only on this branch.
+ * InitOptions for a `{ storage }` source: the fence wiring AND the reservation
+ * wiring are mandatory, and both are widened to admit the opt-out. Written as
+ * an intersection rather than an `extends`, because a subtype may not WIDEN an
+ * inherited property's type — and the widening is the point: `'none'` exists
+ * only on this branch.
+ *
+ * `startIdempotency` is required HERE and optional on `InitOptions` because the
+ * two branches fail differently. A `{ DB }` host cannot get this wrong: init
+ * builds the store from the binding, and `DurableObjectRunner.build` refuses to
+ * serve a runtime that lacks one while a DB binding is present. A `{ storage }`
+ * host has no binding to derive one from, and its failure is SILENT and split:
+ * such a host can still wire a real store into its run router (the router takes
+ * its own), so keys reserve and claim normally — and then nothing ever settles
+ * them, because the runtime that sees every terminal transition was never given
+ * the store. The reservation stays `started` forever, and the next retry of
+ * that key is told UNRESOLVABLE instead of replaying a run that completed
+ * perfectly well. Making the host WRITE `'none'` turns that into a decision
+ * someone made; nothing about an omission could have said it.
  */
-export type StorageInitOptions = Omit<InitOptions, 'executionFence'> & {
+export type StorageInitOptions = Omit<
+  InitOptions,
+  'executionFence' | 'startIdempotency'
+> & {
   executionFence: ExecutionFenceWiring;
+  startIdempotency: StartIdempotencyWiring;
 };
 
 export interface InitResult {

@@ -54,6 +54,7 @@ function buildHarness() {
   const runtime = buildShowcaseRuntime({
     initInput: { storage: new InMemoryStore() },
     executionFence: 'none',
+    startIdempotency: 'none',
     grantProvider: async (workflowId, runId, leg) => ({
       ...(await grants(workflowId, runId, leg)),
       [AGENT_AUDIT_CONTEXT_KEY]: {

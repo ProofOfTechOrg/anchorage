@@ -128,7 +128,7 @@ function scope(
     principal: humanPrincipal({ id: 'operator', role: 'operator' }),
     init: init(
       { storage: new InMemoryStore() },
-      { pubsub, executionFence: 'none' },
+      { pubsub, executionFence: 'none', startIdempotency: 'none' },
     ),
   };
 }

@@ -23,30 +23,29 @@ import {
   type ApprovalActor,
   type ApprovalRole,
 } from './contract.js';
+import {
+  boundedText,
+  type ExecutionPrincipalKind,
+  isExecutionPrincipalId,
+  isExecutionPrincipalKind,
+  MAX_PURPOSE_LENGTH,
+} from './principal-identity.js';
 
 /**
- * Mirrors breakwater's `PrincipalKind` by value, for the same reason
- * contract.ts mirrors the request-context keys: flowsafe does not import
- * breakwater at runtime. The cross-package contract test pins the equality.
+ * The identity vocabulary lives on an import-free leaf (principal-identity.ts)
+ * so that modules which need only the kind list and the two predicates — the
+ * start-reservation store, which declares a class hierarchy at module-eval time
+ * — can take them without pulling this file's import graph behind them.
+ *
+ * Re-exported here rather than moved away, because THIS is the documented home
+ * of the execution principal and every existing importer names it.
  */
-export const EXECUTION_PRINCIPAL_KINDS = [
-  'human',
-  'service',
-  'agent',
-  'system',
-] as const;
-
-export type ExecutionPrincipalKind = (typeof EXECUTION_PRINCIPAL_KINDS)[number];
-
-/** Internal runtime guard for values crossing storage and request boundaries. */
-export function isExecutionPrincipalKind(
-  value: unknown,
-): value is ExecutionPrincipalKind {
-  return (
-    typeof value === 'string' &&
-    (EXECUTION_PRINCIPAL_KINDS as readonly string[]).includes(value)
-  );
-}
+export {
+  EXECUTION_PRINCIPAL_KINDS,
+  type ExecutionPrincipalKind,
+  isExecutionPrincipalId,
+  isExecutionPrincipalKind,
+} from './principal-identity.js';
 
 /** Automated kinds — everything that is not a logged-in person. */
 export const AUTOMATED_PRINCIPAL_KINDS: readonly ExecutionPrincipalKind[] = [
@@ -56,10 +55,6 @@ export const AUTOMATED_PRINCIPAL_KINDS: readonly ExecutionPrincipalKind[] = [
 ];
 
 export type AutomatedPrincipalKind = Exclude<ExecutionPrincipalKind, 'human'>;
-
-/** Upper bound on the free-text provenance fields, so audit rows stay bounded. */
-const MAX_PURPOSE_LENGTH = 200;
-const MAX_PRINCIPAL_ID_LENGTH = 200;
 
 /**
  * `purpose` is REQUIRED on every automated kind, not optional as the roadmap
@@ -250,35 +245,6 @@ export function canonicalAutomatedPrincipal(
   return principal !== undefined && principal.kind !== 'human'
     ? principal
     : undefined;
-}
-
-/**
- * Bounded, non-empty, and free of control characters.
- *
- * Not an injection barrier for the wire — the principal travels through
- * `JSON.stringify`, which escapes U+0000–U+001F. It matters because these
- * fields do not stop at the wire: `id` becomes `requestedBy`/`decidedBy` in D1
- * and the actor on every audit row, and `purpose` rides into the SIEM export.
- * The bounds keep an audit row bounded; the control-character refusal keeps
- * those strings clean at the boundary rather than downstream.
- */
-function boundedText(value: unknown, max: number): value is string {
-  if (typeof value !== 'string' || value.trim() === '' || value.length > max) {
-    return false;
-  }
-  for (const character of value) {
-    const code = character.charCodeAt(0);
-    if (code <= 0x1f || code === 0x7f) return false;
-  }
-  return true;
-}
-
-/**
- * Canonical execution-principal identifier rule shared by every request and
- * storage hydration boundary. Kept off the package barrel deliberately.
- */
-export function isExecutionPrincipalId(value: unknown): value is string {
-  return boundedText(value, MAX_PRINCIPAL_ID_LENGTH);
 }
 
 /**

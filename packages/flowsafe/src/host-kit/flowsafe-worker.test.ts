@@ -2152,3 +2152,124 @@ describe('createFlowsafeWorker execution-fence administration', () => {
     expect(response.status).toBe(405);
   });
 });
+
+describe('createFlowsafeWorker drain inventory', () => {
+  const ADMIN_SECRET = 'maintenance-admin-secret-0000000002';
+
+  function inventoryRequest(
+    query = '',
+    init: { method?: string; token?: string | null } = {},
+  ): Request {
+    const token = init.token === undefined ? ADMIN_SECRET : init.token;
+    return new Request(`http://host/admin/inventory${query}`, {
+      method: init.method ?? 'GET',
+      headers: token === null ? {} : { authorization: `Bearer ${token}` },
+    });
+  }
+
+  it('serves the index, then one category, behind the shared admin gate', async () => {
+    // #given — a deployment with nothing in it yet: every inventory table is
+    // created lazily by the first feature that writes it, so this is the state
+    // a freshly provisioned Worker is really in.
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+
+    // #when — no category names the index.
+    const index = await worker.fetch(inventoryRequest(), env, ctx);
+
+    // #then — the categories, split by class, plus the rule an empty answer
+    // means something under. The contract travels with the answer because an
+    // operator who reads a count without it will lock too early.
+    expect(index.status).toBe(200);
+    const body = (await index.json()) as {
+      categories: Array<{ category: string; class: string }>;
+      unenumerable: Array<{ name: string }>;
+      drainProof: { reachableFrom: string[] };
+    };
+    expect(body.categories.filter((c) => c.class === 'work')).toHaveLength(7);
+    expect(body.categories.filter((c) => c.class === 'standing')).toHaveLength(
+      2,
+    );
+    expect(body.unenumerable.map((entry) => entry.name)).toContain(
+      'run-owner-recovery-journal',
+    );
+    expect(body.drainProof.reachableFrom).toEqual(['draining']);
+
+    // #then — a category over a database with no tables answers EMPTY rather
+    // than faulting, and creates nothing to answer with.
+    const runs = await worker.fetch(
+      inventoryRequest('?category=runs'),
+      env,
+      ctx,
+    );
+    expect(runs.status).toBe(200);
+    expect(await runs.json()).toEqual({
+      category: 'runs',
+      class: 'work',
+      table: 'mastra_workflow_snapshot',
+      entries: [],
+    });
+  });
+
+  it('refuses an unauthenticated read, and 503s when the credential is unconfigured', async () => {
+    // #given — this read enumerates every outstanding run, approval, and
+    // reservation on the deployment. There is no capability relay behind it,
+    // so an absent secret closes the surface rather than opening it.
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+
+    // #then — unconfigured is 503, not 200.
+    expect((await worker.fetch(inventoryRequest(), env, ctx)).status).toBe(503);
+
+    // #then — configured but unpresented is 401, and a wrong token is too:
+    // neither learns anything about the deployment's state.
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+    expect(
+      (await worker.fetch(inventoryRequest('', { token: null }), env, ctx))
+        .status,
+    ).toBe(401);
+    expect(
+      (
+        await worker.fetch(
+          inventoryRequest('', { token: 'wrong-secret-0000000000000000000' }),
+          env,
+          ctx,
+        )
+      ).status,
+    ).toBe(401);
+  });
+
+  it('rejects an unknown category, a malformed limit, and a malformed cursor', async () => {
+    // #given — a sweep is only a proof if it really reaches the end. A request
+    // the route quietly "fixed" would restart the scan, and an operator
+    // watching for two consecutive empty sweeps would wait forever.
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+
+    for (const query of [
+      '?category=not-a-category',
+      '?category=runs&limit=abc',
+      '?category=runs&limit=0',
+      '?category=runs&cursor=not-json',
+      '?category=runs&cursor=%5B%22one-part-only%22%5D',
+    ]) {
+      const response = await worker.fetch(inventoryRequest(query), env, ctx);
+      expect(response.status, query).toBe(400);
+    }
+  });
+
+  it('405s a method the inventory does not serve', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+
+    const response = await worker.fetch(
+      inventoryRequest('', { method: 'POST' }),
+      env,
+      ctx,
+    );
+    expect(response.status).toBe(405);
+  });
+});

@@ -89,7 +89,10 @@ class TestThread extends ThreadDurableObject<TestEnv> {
   });
 
   protected build(): InitResult {
-    return init({ storage: new InMemoryStore() }, { executionFence: 'none' });
+    return init(
+      { storage: new InMemoryStore() },
+      { executionFence: 'none', startIdempotency: 'none' },
+    );
   }
 
   protected async route(

@@ -268,6 +268,7 @@ function buildHarness(): Harness {
   const { createWorkflow, createStep, runtime } = init(
     { storage: new InMemoryStore() },
     {
+      startIdempotency: 'none',
       requestContextForRun: approvalGrantProvider(store),
       executionFence: 'none',
     },

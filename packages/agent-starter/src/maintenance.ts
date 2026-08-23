@@ -65,7 +65,7 @@ export function starterMaintenanceTick(env: Env): () => Promise<unknown> {
     env.DEPLOYMENT_IDENTITY_SECRET,
     {
       startIdempotency: startIdempotency(env.DB),
-      executionFence: executionFence(env.DB),
+      executionFence: fence,
     },
   );
   const schedules = createScheduleTick({

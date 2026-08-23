@@ -78,7 +78,7 @@ async function seededD1(): Promise<MastraCompositeStore> {
   });
   const { createWorkflow, createStep, runtime } = init(
     { storage },
-    { executionFence: 'none' },
+    { startIdempotency: 'none', executionFence: 'none' },
   );
   const step = createStep({
     id: 'noop',

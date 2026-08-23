@@ -555,7 +555,7 @@ describe('init() fence wiring', () => {
   it("accepts an explicit 'none' for a { storage } source", () => {
     const { runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
 
     expect(runtime.executionFence).toBeUndefined();
@@ -565,7 +565,7 @@ describe('init() fence wiring', () => {
     const { fence } = fenceFixture();
     const { runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: fence },
+      { startIdempotency: 'none', executionFence: fence },
     );
 
     expect(runtime.executionFence).toBe(fence);
@@ -589,7 +589,7 @@ describe('init() fence wiring', () => {
 function fencedRuntime(fence: ExecutionFenceStore): RunnerRuntime {
   const { createWorkflow, createStep, runtime } = init(
     { storage: new InMemoryStore() },
-    { executionFence: fence },
+    { startIdempotency: 'none', executionFence: fence },
   );
   const gate = createStep({
     id: 'gate',
@@ -731,7 +731,7 @@ describe('RunnerRuntime enforcement', () => {
     await fence.seed('open');
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: fence },
+      { startIdempotency: 'none', executionFence: fence },
     );
     const drainMidRun = createStep({
       id: 'drain-mid-run',

@@ -36,6 +36,7 @@ import {
   type StartReservation,
   StartReservationOwnerMismatchError,
   StartReservationTargetMismatchError,
+  StartReservationUnreadableError,
 } from './start-idempotency.js';
 
 const OWNER = { kind: 'human', id: 'operator-1' } as const;
@@ -611,6 +612,176 @@ describe('beginIdempotentStart', () => {
     );
     expect(starts).toHaveLength(1);
   });
+
+  it('lets the CREATOR lose the claim to a later caller, and refuses the creator rather than starting it', async () => {
+    // #given the interleaving the two-signal `created` test cannot reach by
+    // racing: caller A wins the INSERT and caller B wins the CAS. Nothing about
+    // creating the row entitles A to start it, and if both ever believed they
+    // could, the key would have bought nothing.
+    const { store } = harness();
+    const live: IdempotentStartSurface<string> = {
+      persisted: async () => undefined,
+      // The winner IS executing — the realistic state of the world at the
+      // moment the loser asks.
+      live: async () => true,
+    };
+    const decisions: string[] = [];
+    let loserDecision: unknown;
+    const realClaim = store.claim.bind(store);
+    let interleaved = false;
+    store.claim = async (key: string, runId: string) => {
+      if (!interleaved) {
+        // B arrives in the window between A's insert and A's claim.
+        interleaved = true;
+        loserDecision = await beginIdempotentStart(
+          store,
+          workflowRequest('key-1', 'run-B'),
+          live,
+        );
+      }
+      return realClaim(key, runId);
+    };
+
+    // #when A (the creator) races its own claim against B's
+    const refusal = await beginIdempotentStart(
+      store,
+      workflowRequest('key-1', 'run-A'),
+      live,
+    ).catch((error: unknown) => error);
+    for (const decision of [loserDecision, refusal]) {
+      if (
+        decision !== null &&
+        typeof decision === 'object' &&
+        'kind' in decision
+      ) {
+        decisions.push(String((decision as { kind: string }).kind));
+      }
+    }
+
+    // #then exactly one caller was told to start, it was B, and the run it
+    // starts is the one A RESERVED — the reservation decides the run id, the
+    // claim only decides who executes it.
+    expect(decisions).toEqual(['start']);
+    expect(loserDecision).toMatchObject({
+      kind: 'start',
+      reservation: { runId: 'run-A' },
+    });
+    // And the creator is REFUSED, pointed at the run its own key already names.
+    expect(refusal).toBeInstanceOf(IdempotentStartPendingError);
+    expect((refusal as IdempotentStartPendingError).reason.runId).toBe('run-A');
+  });
+
+  it('re-claims the reserved run after a crash between reserve and claim, and stores no second id', async () => {
+    // #given a reservation whose creator died before claiming — nothing has
+    // executed, and the row is the only thing that knows which run this key
+    // means
+    const { store, sqlite } = harness();
+    await store.reserve(workflowRequest('key-1', 'run-1'));
+    let minted = 0;
+
+    // #when the retry arrives, mints its own candidate, and is resolved
+    const decision = await beginIdempotentStart(
+      store,
+      {
+        key: 'key-1',
+        owner: OWNER,
+        targetKind: 'workflow',
+        targetId: 'payout',
+        mintRunId: () => {
+          minted += 1;
+          return 'run-retry-candidate';
+        },
+      },
+      EMPTY_SURFACE,
+    );
+
+    // #then it starts the FIRST run, and the candidate it minted is discarded
+    // rather than stored: a second id in this table is a second run waiting to
+    // happen, whatever the decision said.
+    expect(decision).toMatchObject({
+      kind: 'start',
+      reservation: { runId: 'run-1' },
+    });
+    expect(minted).toBe(1);
+    expect(rows(sqlite)).toEqual([
+      expect.objectContaining({ key: 'key-1', run_id: 'run-1' }),
+    ]);
+  });
+
+  it('refuses a key belonging to another SURFACE’s principal, in both directions, and says nothing else', async () => {
+    // #given the collision a shared key namespace makes reachable: a public
+    // human actor on the run router and a stamped agent principal on the agent
+    // topology, deriving the same key from the same order id
+    const { store } = harness();
+    const humanOwner = { kind: 'human', id: 'opal' } as const;
+    const agentOwner = { kind: 'agent', id: 'writer-agent' } as const;
+    const agentRequest = (key: string) => ({
+      key,
+      owner: agentOwner,
+      targetKind: 'agent' as const,
+      targetId: 'writer',
+      threadId: 'thread-1',
+      mintRunId: () => 'agent-run',
+    });
+    const humanRequest = (key: string) => ({
+      key,
+      owner: humanOwner,
+      targetKind: 'workflow' as const,
+      targetId: 'payout',
+      mintRunId: () => 'workflow-run',
+    });
+
+    // #when each surface reserves first and the other follows
+    await store.reserve(humanRequest('key-human-first'));
+    const agentRefusal = await store
+      .reserve(agentRequest('key-human-first'))
+      .catch((error: unknown) => error);
+    await store.reserve(agentRequest('key-agent-first'));
+    const humanRefusal = await store
+      .reserve(humanRequest('key-agent-first'))
+      .catch((error: unknown) => error);
+
+    // #then both directions refuse with 403 and an EMPTY body — no target, no
+    // kind, no run. A key is guessable by construction, so this refusal is
+    // reachable by probing, and anything it named would be something the prober
+    // learned about a principal it has no claim on.
+    for (const refusal of [agentRefusal, humanRefusal]) {
+      expect(refusal).toBeInstanceOf(StartReservationOwnerMismatchError);
+      expect((refusal as StartReservationOwnerMismatchError).status).toBe(403);
+      expect((refusal as StartReservationOwnerMismatchError).reason).toEqual({
+        code: 'IDEMPOTENT_START_OWNER_MISMATCH',
+      });
+    }
+  });
+
+  it('refuses rather than starting when the reservation row cannot be read', async () => {
+    // #given a row this build cannot parse — here a corrupt `updated_at`, the
+    // column the purge horizon and `pendingSince` are both measured from
+    const { store, sqlite } = harness();
+    await store.reserve(workflowRequest('key-1', 'run-1'));
+    sqlite
+      .prepare(
+        `UPDATE ${START_IDEMPOTENCY_TABLE} SET updated_at = 'corrupt' WHERE key = ?`,
+      )
+      .run('key-1');
+
+    // #when the key is consulted again
+    const refusal = await beginIdempotentStart(
+      store,
+      workflowRequest('key-1', 'run-2'),
+      EMPTY_SURFACE,
+    ).catch((error: unknown) => error);
+
+    // #then 503, and never the absent answer. "There is no reservation" is the
+    // answer that STARTS A RUN, so it must be unreachable from a row that
+    // cannot be understood — a corrupt terminal `updated_at` would otherwise
+    // read as epoch 0 and make the row immediately reapable as well.
+    expect(refusal).toBeInstanceOf(StartReservationUnreadableError);
+    expect((refusal as StartReservationUnreadableError).status).toBe(503);
+    expect((refusal as StartReservationUnreadableError).reason).toEqual({
+      code: 'IDEMPOTENT_START_UNREADABLE',
+    });
+  });
 });
 
 describe('rollbackFencedStart', () => {
@@ -675,6 +846,97 @@ describe('rollbackFencedStart', () => {
     // #then still claimed: releasing here would hand the next retry a second
     // run after a start that may already have charged somebody.
     expect((await store.read('key-1'))?.state).toBe('started');
+  });
+
+  it('completes the whole round trip: claim, fence refusal, release, reopen, and ONE execution of the same run', async () => {
+    // #given a real fence and a real reservation over one database, and a host
+    // whose start executes paid work — the shape the round trip has to be
+    // proved in, because each half of it is only correct given the other.
+    const sqlite = openSqlite();
+    const binding = sqliteUnitDatabase(sqlite);
+    const store = new StartIdempotencyStore(
+      binding as StartIdempotencyDatabase,
+    );
+    const fence = new ExecutionFenceStore(binding as ExecutionFenceDatabase);
+    await fence.seed('open');
+    await fence.transition({ expected: 'open', next: 'migration-locked' });
+    let executions = 0;
+    const startRun = async (): Promise<void> => {
+      const reading = await fence.read();
+      if (reading.state !== 'open') {
+        throw new ExecutionFencedError(reading.state, 'run start');
+      }
+      executions += 1;
+    };
+    const attempt = async (candidate: string): Promise<StartReservation> => {
+      const decision = await beginIdempotentStart(
+        store,
+        workflowRequest('key-1', candidate),
+        EMPTY_SURFACE,
+      );
+      if (decision.kind !== 'start') throw new Error('expected a start');
+      const { key, runId } = decision.reservation;
+      try {
+        await startRun();
+      } catch (error) {
+        return rollbackFencedStart(store, key, runId, error);
+      }
+      return decision.reservation;
+    };
+
+    // #when the fenced attempt is refused, the operator reopens, and the client
+    // retries with the same key
+    const refused = await attempt('run-1').catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(ExecutionFencedError);
+    expect((await store.read('key-1'))?.state).toBe('reserved');
+    await fence.transition({ expected: 'migration-locked', next: 'open' });
+    const started = await attempt('run-ignored');
+
+    // #then the retry ran the SAME run the fenced attempt reserved, exactly
+    // once. A rollback that did not land would have left the key UNRESOLVABLE
+    // forever; a rollback that handed back a fresh run id would have made an
+    // operator's drain the cause of a second charge.
+    expect(started.runId).toBe('run-1');
+    expect(executions).toBe(1);
+    expect((await store.read('key-1'))?.state).toBe('started');
+  });
+
+  it('still re-throws the fence refusal when the release itself fails', async () => {
+    // #given a claimed reservation and a store whose release cannot be written
+    // — a storage incident arriving during a deployment that is already
+    // refusing to execute
+    const { store } = harness();
+    await store.reserve(workflowRequest('key-1', 'run-1'));
+    await store.claim('key-1', 'run-1');
+    store.release = async () => {
+      throw new Error('D1_ERROR: network');
+    };
+    const fenced = new ExecutionFencedError('migration-locked', 'run start');
+
+    // #when
+    const thrown = await rollbackFencedStart(
+      store,
+      'key-1',
+      'run-1',
+      fenced,
+    ).catch((error: unknown) => error);
+
+    // #then the caller sees the FENCE's refusal, not the storage error:
+    // swallowing it would leave the caller believing the deployment is broken
+    // rather than fenced, and the rollback's own failure is not something the
+    // caller can act on.
+    expect(thrown).toBe(fenced);
+    // The claim stayed taken, so the key is now UNRESOLVABLE rather than
+    // startable — recoverable by investigation, which is the direction this
+    // best-effort rollback deliberately fails in.
+    expect((await store.read('key-1'))?.state).toBe('started');
+    await expect(
+      beginIdempotentStart(
+        store,
+        workflowRequest('key-1', 'run-2'),
+        EMPTY_SURFACE,
+      ),
+    ).rejects.toBeInstanceOf(IdempotentStartUnresolvableError);
   });
 });
 

@@ -135,6 +135,15 @@ function isDuplicateColumn(error: unknown): boolean {
   return error instanceof Error && /duplicate column/i.test(error.message);
 }
 
+/**
+ * The single-row counter table this domain allocates insertion ordinals from.
+ *
+ * Named because the deployment table census has to account for every
+ * `flowsafe_`-prefixed table by name, and a table whose only spelling is inside
+ * a template literal is one the census can only match by restating it.
+ */
+export const NOTIFICATION_SEQUENCE_TABLE = 'flowsafe_notification_sequence';
+
 export class D1NotificationsStorage extends NotificationsStorage {
   readonly #db: SignalDatabase;
   readonly #table: string;
@@ -149,7 +158,7 @@ export class D1NotificationsStorage extends NotificationsStorage {
     const prefix = validateTablePrefix(tablePrefix) ?? '';
     this.#db = db;
     this.#table = `${prefix}mastra_notifications`;
-    this.#sequenceTable = `${prefix}flowsafe_notification_sequence`;
+    this.#sequenceTable = `${prefix}${NOTIFICATION_SEQUENCE_TABLE}`;
     this.#ordinalIndex = `idx_${this.#table}_insertion_ordinal`;
     this.#legacyReplaceTrigger = `trg_${this.#table}_preserve_insertion_ordinal`;
     this.#legacyInsertTrigger = `trg_${this.#table}_allocate_insertion_ordinal`;

@@ -5528,7 +5528,7 @@ describe('DurableObjectRunner and the deployment execution fence', () => {
     const env = makeProductionEnv();
     env.runtime = init(
       { storage: env.storage },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     ).runtime;
     const runner = new TestRunner(undefined, env);
 
@@ -5563,7 +5563,7 @@ describe('DurableObjectRunner and the deployment execution fence', () => {
     ) as unknown as typeof env.DB;
     env.runtime = init(
       { storage: env.storage },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     ).runtime;
     const runner = new TestRunner(undefined, env);
 

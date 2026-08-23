@@ -22,6 +22,7 @@ import type {
   ExecutionFenceWiring,
   InitSource,
   RequestContextProvider,
+  StartIdempotencyWiring,
 } from '@proofoftech/flowsafe/do-runner';
 import { z } from 'zod';
 
@@ -92,6 +93,15 @@ export interface ShowcaseDeps {
    * binding, and an in-memory test host passes `'none'`.
    */
   executionFence: ExecutionFenceWiring;
+  /**
+   * The deployment's start reservations for `initInput`. Required for the same
+   * reason the fence is: the shape of `initInput` is only known at runtime, so
+   * nothing here can tell whether init would build one. A D1-backed host passes
+   * a store over the SAME binding its run router reserves into — the runtime is
+   * what marks a reservation spent when its run ends — and an in-memory test
+   * host passes `'none'`.
+   */
+  startIdempotency: StartIdempotencyWiring;
   /**
    * The grant-minting seam, built by the host from the deployment-wide
    * approval store. The provider is consulted on every start and resume leg.

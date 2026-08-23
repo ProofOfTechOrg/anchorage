@@ -72,6 +72,7 @@ import {
   createComposedStorage,
   executionFence,
   schedulesStore,
+  startIdempotency,
   subscriptionStoreFactory,
 } from './storage.js';
 import { defineWorkflows } from './workflows.js';
@@ -226,6 +227,10 @@ export class StarterThread extends ThreadDurableObject<Env> {
         // this thread DO names it: the deployment execution fence must live in
         // the SAME database as the state it fences.
         executionFence: executionFence(env.DB),
+        // Same binding, same reasoning: the agent topology reserves keyed
+        // agent starts into this store, and this runtime is what settles them
+        // when the run it dispatched reaches terminal.
+        startIdempotency: startIdempotency(env.DB),
       },
     );
     this.#threadInit = threadInit;

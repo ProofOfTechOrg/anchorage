@@ -73,10 +73,12 @@
 // authority, and the whole rule is that there is exactly one.
 
 import {
+  EXECUTION_PRINCIPAL_KINDS,
   type ExecutionPrincipalKind,
   isExecutionPrincipalId,
   isExecutionPrincipalKind,
-} from '../approval-api/principal.js';
+} from '../approval-api/principal-identity.js';
+import { missingTableReadsEmpty } from './cause-chain.js';
 import { DoStatusError } from './do-status-error.js';
 import type { ExecutionFenceWiring } from './execution-fence.js';
 import { isExecutionFenceRefusal } from './execution-fence.js';
@@ -143,14 +145,31 @@ export interface StartReservation {
    */
   readonly threadId?: string;
   readonly state: StartReservationState;
-  /** Epoch ms; the key's own age, which the purge horizon is measured from. */
+  /**
+   * Epoch ms of the reserve that created this row. Provenance only: the purge
+   * horizon is measured from `updatedAt`, so that a key's validity runs from
+   * the moment it was SPENT rather than from the moment it was first used —
+   * a long run must not age its own reservation out while it is still running.
+   */
   readonly createdAt: number;
-  /** Epoch ms of the last state change — `pendingSince` on a live claim. */
+  /**
+   * Epoch ms of the last state change — `pendingSince` on a live claim, and the
+   * column the purge horizon is measured from once the row is terminal.
+   */
   readonly updatedAt: number;
 }
 
 export interface StartReservationRequest {
-  key: string;
+  /**
+   * `unknown` rather than `string`, the same posture (and for the same reason)
+   * as `ExecutionFenceTransition.proofKey`: every caller is a route holding a
+   * parsed JSON body, `assertKey` already validates this against
+   * PATH_SAFE_ID_PATTERN and throws on anything else, and typing it `string`
+   * only made callers write `body.idempotencyKey as string` — an assertion that
+   * is false exactly when the caller sent the wrong thing, so the one input
+   * this field exists to police would arrive pre-blessed at the type level.
+   */
+  key: unknown;
   owner: StartReservationOwner;
   targetKind: StartTargetKind;
   targetId: string;
@@ -389,9 +408,17 @@ export type StartIdempotencyWiring = StartIdempotencyStore | 'none';
 
 /**
  * Rows affected by a write, read from D1's `{ meta: { changes } }` envelope.
- * Restated here for the same reason execution-fence.ts restates it: this module
- * imports only leaves, and every surface that reserves must be able to import
- * it without dragging the D1 storage adapter into its bundle.
+ * Restated here for the same reason execution-fence.ts restates it: every
+ * surface that reserves must be able to import this module without dragging
+ * the D1 storage adapter (and @mastra/cloudflare-d1 with it) into its bundle.
+ *
+ * That bundle rule is why the imports at the top of this file are what they
+ * are. Four are import-free leaves (principal-identity, cause-chain,
+ * do-status-error, path-safe-id) and the fifth, execution-fence, imports only
+ * leaves and the shared provisioning protocol. Nothing on that graph can cycle
+ * back here, which matters more than usual: the six DoStatusError subclasses
+ * below are evaluated at module load, so an import edge that came back around
+ * would meet a class expression still in its temporal dead zone.
  */
 function changesOf(result: unknown): number {
   const changes = (result as { meta?: { changes?: number } } | undefined)?.meta
@@ -422,6 +449,18 @@ const STATE_CHECK = START_RESERVATION_STATES.map((state) => `'${state}'`).join(
   ', ',
 );
 const TARGET_CHECK = START_TARGET_KINDS.map((kind) => `'${kind}'`).join(', ');
+/**
+ * Built from the principal vocabulary rather than hand-written, so a kind added
+ * to `EXECUTION_PRINCIPAL_KINDS` cannot leave this constraint behind. The
+ * failure a stale literal would cause is not a compile error and not a rejected
+ * write on an existing deployment: `CREATE TABLE IF NOT EXISTS` is a no-op
+ * against a table that already exists, so the drift would show up only as an
+ * INSERT refused on whichever database happened to be created after the new
+ * kind shipped.
+ */
+const OWNER_KIND_CHECK = EXECUTION_PRINCIPAL_KINDS.map(
+  (kind) => `'${kind}'`,
+).join(', ');
 
 /**
  * The reservation schema.
@@ -434,7 +473,7 @@ const TARGET_CHECK = START_TARGET_KINDS.map((kind) => `'${kind}'`).join(', ');
  */
 export const START_IDEMPOTENCY_DDL = `CREATE TABLE IF NOT EXISTS ${START_IDEMPOTENCY_TABLE} (
     key TEXT PRIMARY KEY,
-    owner_kind TEXT NOT NULL CHECK (owner_kind IN ('human', 'service', 'agent', 'system')),
+    owner_kind TEXT NOT NULL CHECK (owner_kind IN (${OWNER_KIND_CHECK})),
     owner_id TEXT NOT NULL,
     target_kind TEXT NOT NULL CHECK (target_kind IN (${TARGET_CHECK})),
     target_id TEXT NOT NULL,
@@ -487,8 +526,8 @@ function isStartTargetKind(value: unknown): value is StartTargetKind {
   );
 }
 
-function epochMs(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+function isEpochMs(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
 }
 
 /**
@@ -499,6 +538,15 @@ function epochMs(value: unknown): number {
  * must never be reachable from a row this build cannot parse. The CHECK
  * constraints make this unreachable on a database this package created; it
  * exists for the one that was hand-edited.
+ *
+ * The TIMESTAMPS are in that strict set too, rather than coerced to 0 as an
+ * unparseable number once was. Neither column is decoration: `updated_at` is
+ * the horizon the purge measures from, so a corrupt one on a terminal row reads
+ * as epoch 0 and makes the reservation immediately reapable — which deletes a
+ * spent key early and turns the next retry of it into a fresh start. It is also
+ * `pendingSince` on a live claim, where 0 tells an operator a run has been
+ * starting since 1970. Refusing the row keeps both faults visible as the 503
+ * they are.
  */
 function reservationFromRow(row: StartReservationRow): StartReservation {
   const {
@@ -510,6 +558,8 @@ function reservationFromRow(row: StartReservationRow): StartReservation {
     run_id: runId,
     thread_id: threadId,
     state,
+    created_at: createdAt,
+    updated_at: updatedAt,
   } = row;
   if (
     typeof key !== 'string' ||
@@ -518,7 +568,9 @@ function reservationFromRow(row: StartReservationRow): StartReservation {
     !isStartTargetKind(targetKind) ||
     typeof targetId !== 'string' ||
     !isPathSafeId(runId) ||
-    !isStartReservationState(state)
+    !isStartReservationState(state) ||
+    !isEpochMs(createdAt) ||
+    !isEpochMs(updatedAt)
   ) {
     throw new StartReservationUnreadableError(
       typeof key === 'string' ? key : '(unknown)',
@@ -532,8 +584,8 @@ function reservationFromRow(row: StartReservationRow): StartReservation {
     runId,
     ...(isPathSafeId(threadId) ? { threadId } : {}),
     state,
-    createdAt: epochMs(row.created_at),
-    updatedAt: epochMs(row.updated_at),
+    createdAt,
+    updatedAt,
   };
 }
 
@@ -555,40 +607,24 @@ export class StartReservationUnreadableError extends DoStatusError {
 }
 
 /**
- * How far down an error's `cause` chain the missing-table test looks. Bounded
- * because a chain can be cyclic or adversarially deep — same rule, same bound,
- * as the fence's.
- */
-const MAX_RESERVATION_ERROR_CAUSE_DEPTH = 8;
-
-/**
- * SQLite/D1's "no such table", matched at the ROOT of the cause chain only.
+ * SQLite/D1's "no such table", for THIS store's table: the reservation table is
+ * created lazily by the first `reserve()`, so its absence means no key has ever
+ * been used here and there is nothing to find.
  *
- * The same discrimination the fence makes, for the same reason: a missing table
- * mentioned part-way down a chain describes a fault that merely PASSED this
- * table on its way out (a failed migration, an adapter reporting the last thing
- * it saw), and concluding "no reservations exist" from that would start a run.
- * If the innermost fault IS the missing table, the table genuinely does not
- * exist yet and there is nothing to find.
+ * The rule itself — bounded, cycle-safe, and matched at the ROOT of the cause
+ * chain only — lives in cause-chain.ts, shared with the fence store. Root-only
+ * is the load-bearing half: a missing-table link mentioned part-way down a
+ * chain describes a fault that merely PASSED this table on its way out (a
+ * failed migration, an adapter reporting the last thing it saw), and concluding
+ * "no reservations exist" from that would start a run.
+ *
+ * Exported so F2's drain inventory classifies the same failure the same way;
+ * it may equally call `missingTableReadsEmpty` directly with this module's
+ * `START_IDEMPOTENCY_TABLE`. Deliberately off the package barrel — it is an
+ * internal storage rule, not public API.
  */
-function isMissingReservationTable(error: unknown): boolean {
-  const seen = new Set<unknown>();
-  let current: unknown = error;
-  for (let depth = 0; depth < MAX_RESERVATION_ERROR_CAUSE_DEPTH; depth += 1) {
-    seen.add(current);
-    const cause = current instanceof Error ? current.cause : undefined;
-    if (cause !== undefined && cause !== null && !seen.has(cause)) {
-      current = cause;
-      continue;
-    }
-    const message =
-      current instanceof Error ? current.message : String(current);
-    return (
-      /no such table/i.test(message) &&
-      message.includes(START_IDEMPOTENCY_TABLE)
-    );
-  }
-  return false;
+export function isMissingReservationTable(error: unknown): boolean {
+  return missingTableReadsEmpty(error, START_IDEMPOTENCY_TABLE);
 }
 
 function assertKey(key: unknown): string {
@@ -1057,6 +1093,10 @@ async function rebindProofRun(
 ): Promise<void> {
   if (fence === undefined || fence === 'none') return;
   try {
+    // The reservation KEY is passed as the fence's PROOF KEY: proof-only
+    // nominates one idempotency key, and `admitsRunStart` admits the start
+    // carrying it — so the two identifiers are the same string by construction,
+    // and a rebind for any other key is the zero-row no-op described above.
     await fence.recordProofRun(reservation.key, reservation.runId);
   } catch (error) {
     console.error(
@@ -1120,6 +1160,33 @@ async function resolveClaimedReservation<TPersisted>(
  * fresh run after a start that may well have executed. Keeping the predicate
  * and the CAS in one function is what stops that widening from being a one-line
  * edit somebody makes in a hurry.
+ *
+ * THE CLASS INVARIANT THIS RELIES ON. Giving a claim back is only sound for a
+ * failure that provably executed NOTHING, and that is a property of the two
+ * fence refusal codes rather than of the JavaScript class carrying them:
+ *
+ *   EXECUTION_FENCED           is authored at a gate — the run object's start
+ *                              route, before any of its own reads or writes,
+ *                              and `RunnerRuntime.#assertStartFence`, before
+ *                              the run lock and before core mints anything.
+ *   EXECUTION_FENCE_UNREADABLE is authored by the fence READ that fronts those
+ *                              same gates, which is even earlier.
+ *
+ * Neither code is reachable from anywhere past the point of execution, so a
+ * refusal carrying one is pre-execution wherever it was observed.
+ *
+ * Which is why the predicate is `isExecutionFenceRefusal` — the widened one,
+ * which admits the wire rebuild — and NOT `instanceof ExecutionFencedError`.
+ * Both of this function's callers sit on the far side of a Durable Object
+ * boundary in every DO-backed host: the run object throws, `doErrorResponse`
+ * renders, and `doSummary` (or the agent topology's `errorFrom`) rebuilds a
+ * `RunRouteError` carrying the same status and the same structured reason but
+ * not the same class. An instanceof-only test would answer "not a fence
+ * refusal" for exactly the deployments this rollback exists to protect, and a
+ * drained-then-reopened deployment would find every key that was in flight
+ * permanently stuck at UNRESOLVABLE. In-process hosts (a `{ storage }` runtime
+ * wired straight into the router) do throw the class, so both shapes are live
+ * and one predicate has to cover them.
  *
  * The rollback itself is best-effort: it runs while the deployment is already
  * refusing to execute, so its own failure must not replace the fence's refusal

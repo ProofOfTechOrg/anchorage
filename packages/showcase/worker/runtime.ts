@@ -88,6 +88,7 @@ export function buildShowcaseRuntime(deps: ShowcaseDeps): RunnerRuntime {
     // the host's topology.
     requestContextForRun: deps.grantProvider,
     executionFence: deps.executionFence,
+    startIdempotency: deps.startIdempotency,
   });
 
   for (const workflowModule of SHOWCASE_MODULES) {

@@ -2469,6 +2469,60 @@ describe('purgeExpiredWorkflowRuns — start reservations', () => {
     expect(reservationRows(sqlite)).toHaveLength(1);
   });
 
+  it('sweeps orphans on the strict side of the horizon, and never one whose snapshot survives', async () => {
+    // #given the three rows the sweep's predicate has to separate, in ONE pass
+    // so they are judged by the same cutoff. With no `startIdempotencyTtlMs`
+    // the horizon is the run TTL, so the boundary is exactly NOW - 7 days and
+    // the comparison is `updated_at < cutoff` — strict, because a row AT the
+    // cutoff has not yet outlived it.
+    const sqlite = openSqlite();
+    createSnapshotTable(sqlite);
+    createReservationTable(sqlite);
+    const cutoff = NOW - 7 * DAY_MS;
+    seedReservation(sqlite, {
+      key: 'key-at-cutoff',
+      runId: 'run-gone-a',
+      state: 'terminal',
+      updatedAt: cutoff,
+    });
+    seedReservation(sqlite, {
+      key: 'key-past-cutoff',
+      runId: 'run-gone-b',
+      state: 'terminal',
+      updatedAt: cutoff - 1,
+    });
+    // Old enough to sweep on age alone, but its run is still readable — a
+    // suspended run, which run retention never reclaims.
+    seedRun(sqlite, {
+      runId: 'run-still-here',
+      status: 'suspended',
+      updatedAt: NOW - 90 * DAY_MS,
+    });
+    seedReservation(sqlite, {
+      key: 'key-with-snapshot',
+      runId: 'run-still-here',
+      state: 'terminal',
+      updatedAt: NOW - 90 * DAY_MS,
+    });
+
+    // #when
+    await purgeExpiredWorkflowRuns(sqliteUnitDatabase(sqlite) as never, {
+      ttlMs: 7 * DAY_MS,
+      startIdempotencyTable: START_IDEMPOTENCY_TABLE,
+      now: () => NOW,
+    });
+
+    // #then exactly the row PAST the horizon is gone. The at-cutoff row is the
+    // boundary this test exists for: a `<=` here would reap a key on the last
+    // instant it is still meant to answer ALREADY_SETTLED, and the retry that
+    // arrives in that instant would start a second run. The snapshot-backed row
+    // survives on `NOT EXISTS`, whatever its age, which is the HARD rule.
+    expect(reservationRows(sqlite).map((row) => row.key)).toEqual([
+      'key-at-cutoff',
+      'key-with-snapshot',
+    ]);
+  });
+
   it('still purges runs on a deployment where no key has ever been used', async () => {
     // #given the reservation table wired but never created — its DDL is lazy,
     // so a deployment on which nobody used a key has none. A batch naming a

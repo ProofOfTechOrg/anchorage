@@ -62,10 +62,19 @@ export function createD1Storage(
   });
 }
 
-// Mastra workflow terminals plus FlowSafe's lifecycle-owned terminals.
-// Deleting a live run (running/suspended/waiting/pending/paused) would kill a
-// pending approval, so only these are ever purged.
-const TERMINAL_STATUSES = [
+/**
+ * Mastra workflow terminals plus FlowSafe's lifecycle-owned terminals.
+ * Deleting a live run (running/suspended/waiting/pending/paused) would kill a
+ * pending approval, so only these are ever purged.
+ *
+ * Exported because retention and the drain inventory must agree on the word
+ * "terminal" to the letter. The purge deletes what this set matches; the
+ * inventory counts what it does NOT, and a run that is terminal to one and live
+ * to the other is either a row the purge reaps while the inventory still calls
+ * it work, or — worse — a run the inventory declares finished while it is still
+ * executing, which is exactly the reading a migration would act on.
+ */
+export const RUN_TERMINAL_STATUSES = [
   'success',
   'failed',
   'tripwire',
@@ -75,6 +84,31 @@ const TERMINAL_STATUSES = [
   'cancelled',
   'timed_out',
 ] as const;
+
+/**
+ * The SQL that decides one snapshot row is TERMINAL, with `?` for each entry of
+ * RUN_TERMINAL_STATUSES in order.
+ *
+ * A shared FRAGMENT rather than a shared list because the rule is not "the
+ * status is in the set": a run that reached 'cancelled' or 'timed_out' is
+ * terminal only once its lifecycle cleanup stamped `cleanupCompletedAt`, and
+ * before that it is still executing compensation. Two hand-written copies of
+ * that carve-out are two chances for one of them to answer "finished" for a run
+ * that is mid-cleanup — the retention purge would delete a live run's snapshot,
+ * and the drain inventory would report a deployment empty while it still runs
+ * work. The caller supplies the `json_valid` guard, because it decides which
+ * way an unclassifiable row should fail.
+ */
+export const RUN_TERMINAL_SNAPSHOT_SQL = `json_extract(snapshot, '$.status') IN (${RUN_TERMINAL_STATUSES.map(
+  () => '?',
+).join(', ')})
+             AND (
+               json_extract(snapshot, '$.status') NOT IN ('cancelled', 'timed_out')
+               OR json_extract(
+                 snapshot,
+                 '$.requestContext."flowsafe.runLifecycle".terminal.cleanupCompletedAt'
+               ) IS NOT NULL
+             )`;
 
 const DEADLINE_LIVE_STATUSES = [
   'running',
@@ -375,6 +409,20 @@ export const RUN_TTL_PURGE_TABLES: readonly string[] = [
 ];
 
 /**
+ * The resource-ownership registry's table, named here rather than imported from
+ * the store that creates it (approval-api/resource-ownership.ts).
+ *
+ * The layering forbids the import: do-runner may reach approval-api only
+ * through its declared leaves, and the ownership store is not one — it is built
+ * ON do-runner. So this file has always carried the name as a literal inside
+ * RUN_TTL_FLOWSAFE_PURGE_TABLES; giving it a name adds no second home, it names
+ * the one that was already here, and lets the drain inventory read the registry
+ * without a third copy. The census test crosses it against
+ * RESOURCE_OWNERSHIP_TABLE, which is the only place the two can be compared.
+ */
+export const RESOURCE_OWNER_TABLE = 'flowsafe_resource_owners';
+
+/**
  * The FLOWSAFE-owned tables this purge also deletes from when the caller wires
  * them, and the reason they are not in the list above.
  *
@@ -388,7 +436,7 @@ export const RUN_TTL_PURGE_TABLES: readonly string[] = [
  * anchor would make that guard assert an equality it cannot mean.
  */
 export const RUN_TTL_FLOWSAFE_PURGE_TABLES: readonly string[] = [
-  'flowsafe_resource_owners',
+  RESOURCE_OWNER_TABLE,
   START_IDEMPOTENCY_TABLE,
 ];
 
@@ -416,7 +464,6 @@ export async function purgeExpiredWorkflowRuns(
   // (persistWorkflowSnapshot serializes via toISOString), so lexicographic
   // < against an ISO cutoff is a correct timestamp comparison.
   const cutoff = new Date(now() - options.ttlMs).toISOString();
-  const placeholders = TERMINAL_STATUSES.map(() => '?').join(', ');
   // json_extract throws on malformed JSON and would abort the WHOLE delete —
   // one corrupt row must not stop every valid terminal row from being
   // reclaimed. The CASE guard (not `AND json_valid(...)`) is load-bearing:
@@ -427,14 +474,7 @@ export async function purgeExpiredWorkflowRuns(
   const eligible = `updatedAt < ?
          AND CASE WHEN json_valid(snapshot) THEN
            (
-             json_extract(snapshot, '$.status') IN (${placeholders})
-             AND (
-               json_extract(snapshot, '$.status') NOT IN ('cancelled', 'timed_out')
-               OR json_extract(
-                 snapshot,
-                 '$.requestContext."flowsafe.runLifecycle".terminal.cleanupCompletedAt'
-               ) IS NOT NULL
-             )
+             ${RUN_TERMINAL_SNAPSHOT_SQL}
            )
          ELSE 0 END`;
   const resourceOwnerTable = options.resourceOwnerTable;
@@ -482,6 +522,18 @@ export async function purgeExpiredWorkflowRuns(
    *     also HEALS the reconcile a crash between a run's terminal persist and
    *     `settleRun` would have lost, and re-stamps `updated_at` so the horizon
    *     is measured from a point at which the reservation is definitely spent.
+   *
+   *     `state <> 'terminal'` also settles `reserved` rows, not just `started`
+   *     ones. The ordinary lifecycle should not produce one here — a run only
+   *     persists a snapshot after its claim, so a row this statement can see is
+   *     normally `started` — and the point is that this statement does not
+   *     depend on that. It is selected by RUN, and every run it names has just
+   *     lost its snapshot in this same transaction, so whatever left the row
+   *     un-claimed (a released claim, a hand-edited row, a caller yet to be
+   *     written), the run it names is gone and the key cannot be worth starting
+   *     again. Settling too eagerly costs a retry a refusal it can resolve with
+   *     a fresh key; leaving a row readable as `reserved` after its run is
+   *     unreadable costs a second run of work that already completed.
    */
   /**
    * Whether the reservation table has been seen to exist this pass.
@@ -617,7 +669,7 @@ export async function purgeExpiredWorkflowRuns(
            WHERE ${eligible}
            LIMIT ?`,
         )
-        .bind(cutoff, ...TERMINAL_STATUSES, options.limit ?? 100)
+        .bind(cutoff, ...RUN_TERMINAL_STATUSES, options.limit ?? 100)
         .all<{ workflow_name: string; run_id: string }>());
     } catch (error) {
       if (!isMissingTable(error, `${prefix}mastra_workflow_snapshot`))
@@ -645,20 +697,26 @@ export async function purgeExpiredWorkflowRuns(
       }
       // Re-checking eligibility keys the delete to the row the SELECT saw;
       // terminal is absorbing, so this is belt-and-braces, not a race fix.
-      const deleteSnapshot = db
-        .prepare(
-          `DELETE FROM ${prefix}mastra_workflow_snapshot
-           WHERE workflow_name = ? AND run_id = ? AND ${eligible}`,
-        )
-        .bind(row.workflow_name, row.run_id, cutoff, ...TERMINAL_STATUSES);
+      //
+      // A FACTORY, not one prepared statement: D1 statements are single-use
+      // once run, and `runPurgeBatch` re-prepares its whole batch when the
+      // reservation table turns out not to exist. Written once so the batch and
+      // non-batch paths cannot drift onto different delete predicates.
+      const deleteSnapshot = (): SnapshotStatement =>
+        db
+          .prepare(
+            `DELETE FROM ${prefix}mastra_workflow_snapshot
+             WHERE workflow_name = ? AND run_id = ? AND ${eligible}`,
+          )
+          .bind(
+            row.workflow_name,
+            row.run_id,
+            cutoff,
+            ...RUN_TERMINAL_STATUSES,
+          );
       if (batch) {
         const [result] = await runPurgeBatch((withReservations) => [
-          db
-            .prepare(
-              `DELETE FROM ${prefix}mastra_workflow_snapshot
-           WHERE workflow_name = ? AND run_id = ? AND ${eligible}`,
-            )
-            .bind(row.workflow_name, row.run_id, cutoff, ...TERMINAL_STATUSES),
+          deleteSnapshot(),
           ...(resourceOwnerTable
             ? [
                 db
@@ -677,7 +735,7 @@ export async function purgeExpiredWorkflowRuns(
         ]);
         deleted += d1Changes(result);
       } else {
-        deleted += d1Changes(await deleteSnapshot.run());
+        deleted += d1Changes(await deleteSnapshot().run());
       }
     }
     await sweepOrphanedStartReservations();
@@ -712,7 +770,7 @@ export async function purgeExpiredWorkflowRuns(
            WHERE ${eligible}
            LIMIT ?`,
         )
-        .bind(cutoff, ...TERMINAL_STATUSES, limit)
+        .bind(cutoff, ...RUN_TERMINAL_STATUSES, limit)
         .all<{ rowid: number; run_id: string }>();
       if (selected.results.length === 0) {
         // No eligible run this pass, but reservations left behind by EARLIER
@@ -730,7 +788,7 @@ export async function purgeExpiredWorkflowRuns(
             `DELETE FROM ${prefix}mastra_workflow_snapshot
              WHERE rowid IN (${rowPlaceholders}) AND ${eligible}`,
           )
-          .bind(...rowIds, cutoff, ...TERMINAL_STATUSES),
+          .bind(...rowIds, cutoff, ...RUN_TERMINAL_STATUSES),
         ...(resourceOwnerTable
           ? [
               db
@@ -759,7 +817,7 @@ export async function purgeExpiredWorkflowRuns(
              LIMIT ?
            )`,
           )
-          .bind(cutoff, ...TERMINAL_STATUSES, options.limit ?? 1000)
+          .bind(cutoff, ...RUN_TERMINAL_STATUSES, options.limit ?? 1000)
           .run(),
       );
     }
@@ -1007,6 +1065,21 @@ const BACKGROUND_TASK_FAILED_STATUSES = [
   'cancelled',
   'timed_out',
 ] as const;
+
+/**
+ * Every background-task status this purge is willing to reap — the two TTL
+ * windows' sets together, and therefore the package's definition of a SETTLED
+ * task.
+ *
+ * The drain inventory reads it as the complement it needs: a task whose status
+ * is not here is still work, whether it is queued, running, or suspended
+ * awaiting a webhook. Deriving both from one list is what stops "terminal"
+ * meaning one thing to retention and another to a migration's emptiness proof.
+ */
+export const BACKGROUND_TASK_TERMINAL_STATUSES: readonly string[] = [
+  'completed',
+  ...BACKGROUND_TASK_FAILED_STATUSES,
+];
 
 /**
  * Background-task TTL cleanup: deletes terminal task

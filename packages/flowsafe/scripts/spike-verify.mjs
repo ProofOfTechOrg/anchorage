@@ -70,6 +70,9 @@ const AGENT_RUN_BODY = {
 // and still elapse inside the kill+restart window, so it adds no wall clock of
 // its own; hence 10s rather than the module's 1s floor. The SIGNAL deadline
 // only has to outlive its own immediate resume, which settles the entry.
+// Idempotent start (FI1/FI2): demo-approval's shape with a counting first step
+// (spike/worker.ts COUNTED_WORKFLOW_ID). MUST match the worker's id.
+const COUNTED_WORKFLOW_ID = 'demo-idempotent';
 const DEADLINE_WORKFLOW_ID = 'demo-deadline';
 const DEADLINE_STEP = 'wait-signal';
 // The reserved arming key, as it appears on the wire (do-runner exports it to
@@ -368,6 +371,36 @@ async function startWithKey(idempotencyKey, headers = AUTH.operator) {
   });
 }
 
+// The same keyed start against the COUNTING workflow, whose first step
+// increments a durable D1 row before the run suspends. `counterId` names the
+// row, so each probe counts only its own executions.
+async function startCountedWithKey(
+  idempotencyKey,
+  counterId,
+  headers = AUTH.operator,
+) {
+  return http('POST', '/runs', {
+    body: {
+      workflowId: COUNTED_WORKFLOW_ID,
+      inputData: { topic: 'launch', counterId },
+      idempotencyKey,
+    },
+    headers,
+  });
+}
+
+// How many times the counting step actually ran for this counter. THE
+// assertion FI1 and FI2 are really about: a repeated run id says two responses
+// named one run, while this says the paid work happened once.
+async function executionCount(counterId) {
+  const { status, body } = await http(
+    'GET',
+    `/idempotent/executions?counterId=${encodeURIComponent(counterId)}`,
+  );
+  assert(status === 200, `execution-count probe -> ${status}`, body);
+  return body.executions;
+}
+
 // Every fence refusal is 503 (operator-transient, retryable) carrying
 // reason.code EXECUTION_FENCED and the state that refused. Asserting the code
 // and the state — rather than the status alone — is what separates "the fence
@@ -380,6 +413,56 @@ function assertFenced(label, response, state) {
     `${label} must be refused 503 EXECUTION_FENCED in '${state}'`,
     response,
   );
+}
+
+// --- Drain inventory (F2) helpers ------------------------------------------
+
+const INVENTORY_ADMIN_PATH = '/admin/inventory';
+
+async function readInventoryIndex() {
+  const { status, body } = await http('GET', INVENTORY_ADMIN_PATH);
+  assert(status === 200, `GET ${INVENTORY_ADMIN_PATH} -> ${status}`, body);
+  return body;
+}
+
+// One category, PAGED TO EXHAUSTION through the inventory's own cursors — the
+// sweep an operator's drain proof is actually made of, not a single page that
+// could hide the rows behind it. `limit: 3` forces several continuations even
+// on the spike's small data, so the keyset is exercised rather than skipped.
+async function sweepInventoryCategory(category) {
+  const keys = [];
+  let first;
+  let cursor;
+  for (let pass = 0; pass < 200; pass += 1) {
+    const query = `${INVENTORY_ADMIN_PATH}?category=${encodeURIComponent(category)}&limit=3${
+      cursor === undefined ? '' : `&cursor=${encodeURIComponent(cursor)}`
+    }`;
+    const { status, body } = await http('GET', query);
+    assert(status === 200, `GET ${query} -> ${status}`, body);
+    first ??= body;
+    for (const entry of body.entries) keys.push(entry.key.join('/'));
+    if (body.cursor === undefined) {
+      return {
+        keys,
+        count: first.count,
+        totals: first.totals,
+        class: body.class,
+        table: body.table,
+      };
+    }
+    cursor = body.cursor;
+  }
+  throw new Error(`inventory paging did not terminate for ${category}`);
+}
+
+// Every WORK category, swept. The drain proof is defined over exactly these.
+async function sweepInventoryWork(index) {
+  const work = index.categories.filter((entry) => entry.class === 'work');
+  const swept = {};
+  for (const entry of work) {
+    swept[entry.category] = await sweepInventoryCategory(entry.category);
+  }
+  return swept;
 }
 
 async function startFencedRun(headers = AUTH.operator) {
@@ -2601,13 +2684,20 @@ async function main() {
 
   const idempotentRun = await step(
     'FI1 idempotent start: a retry after a workerd kill+restart returns the ' +
-      'SAME run, and starts no second one',
+      'SAME run, and the paid first step ran exactly ONCE',
     async () => {
-      const first = await startWithKey('spike-key-1');
+      const first = await startCountedWithKey('spike-key-1', 'fi1');
       assert(
         first.status === 200 && first.body.status === 'suspended',
         'the first keyed start must run normally',
         first,
+      );
+      // The start responded with the SUSPENDED summary, so the counting step
+      // has already run and its row is durable. Anything other than 1 here
+      // would mean the probe itself is not measuring what it claims to.
+      assert(
+        (await executionCount('fi1')) === 1,
+        'the first keyed start must execute the counting step exactly once',
       );
 
       // Process death between the response and the retry — the case a client
@@ -2619,22 +2709,29 @@ async function main() {
         join(tmpDir, 'idempotent-restart.log'),
       );
 
-      const retry = await startWithKey('spike-key-1');
+      const retry = await startCountedWithKey('spike-key-1', 'fi1');
       assert(
         retry.status === 200 && retry.body.runId === first.body.runId,
         'the retry must replay the first run, not start a second',
         { first: first.body, retry: retry.body },
       );
-      // Run ids are server-minted per start and a run id can only be started
-      // once (INV-1 + RunAlreadyExistsError), so one run id across two requests
-      // IS one execution. Nothing in the restarted process had ever seen this
-      // key: the only thing that carried it across process death is the D1 row.
+      // The claim this probe exists for, stated as EXECUTIONS rather than as
+      // run ids: the retry answered from the reservation and ran nothing.
+      // Nothing in the restarted process had ever seen this key — the only
+      // thing that carried it across process death is the D1 row.
+      const executions = await executionCount('fi1');
+      assert(
+        executions === 1,
+        'a retry after process death must execute the first step no second time',
+        { executions, first: first.body, retry: retry.body },
+      );
       return { runId: first.body.runId, approvalId: first.body.approval?.id };
     },
   );
 
   await step(
-    'FI2 concurrent same-key starts: two in-flight requests produce ONE run',
+    'FI2 concurrent same-key starts: two in-flight requests produce ONE run ' +
+      'and ONE execution',
     async () => {
       // The cross-isolate race a kill-and-retry harness cannot fake: neither
       // request has seen the other, and only the reservation's CAS is between
@@ -2642,13 +2739,22 @@ async function main() {
       // two same-key starts naming different threads are two different Durable
       // Objects with no shared lock at all.
       const [a, b] = await Promise.all([
-        startWithKey('spike-key-2'),
-        startWithKey('spike-key-2'),
+        startCountedWithKey('spike-key-2', 'fi2'),
+        startCountedWithKey('spike-key-2', 'fi2'),
       ]);
-      const runIds = new Set(
-        [a, b]
-          .filter((response) => response.status === 200)
-          .map((response) => response.body.runId),
+      const responses = [a, b];
+      const accepted = responses.filter((response) => response.status === 200);
+      const runIds = new Set(accepted.map((response) => response.body.runId));
+      // At least one caller must be ANSWERED, not merely refused consistently:
+      // a burst in which both requests were told to retry would satisfy every
+      // "no second run" assertion below while proving nothing about the start.
+      assert(
+        accepted.length >= 1,
+        'at least one concurrent same-key start must be answered with a run',
+        {
+          a: { status: a.status, body: a.body },
+          b: { status: b.status, body: b.body },
+        },
       );
       assert(
         runIds.size === 1,
@@ -2661,14 +2767,38 @@ async function main() {
       // The loser is allowed to replay (200), to be told the winner is still
       // working (503 IDEMPOTENT_START_PENDING), or — inside the window between
       // the winning claim and its dispatch — to be told UNRESOLVABLE (409).
-      // What it may never be is a second run.
-      for (const response of [a, b]) {
+      // What it may never be is a second run, and what it may never carry is a
+      // code outside the published taxonomy: a collapsed or generic refusal
+      // would read to a client as "retry", which is exactly the advice that
+      // charges twice.
+      const refusalCodes = new Map();
+      for (const response of responses) {
+        if (response.status === 200) continue;
+        const code = response.body?.reason?.code;
         assert(
-          [200, 409, 503].includes(response.status),
-          'a concurrent same-key start answered outside the taxonomy',
-          response,
+          code === 'IDEMPOTENT_START_PENDING' ||
+            code === 'IDEMPOTENT_START_UNRESOLVABLE',
+          'a concurrent same-key start was refused outside the taxonomy',
+          { status: response.status, body: response.body },
         );
+        refusalCodes.set(code, (refusalCodes.get(code) ?? 0) + 1);
       }
+      // One 200 carries the suspended summary, so the counting step has
+      // already run by the time both requests have settled — no polling, and
+      // no window in which a second execution could still be in flight.
+      const executions = await executionCount('fi2');
+      assert(
+        executions === 1,
+        'a concurrent same-key burst must execute the first step exactly once',
+        {
+          executions,
+          accepted: accepted.length,
+          refusals: Object.fromEntries(refusalCodes),
+        },
+      );
+      console.log(
+        `  answered: ${accepted.length}, refusals: ${JSON.stringify(Object.fromEntries(refusalCodes))}`,
+      );
     },
   );
 
@@ -2735,6 +2865,212 @@ async function main() {
         'the reopened deployment mints fresh runs again',
         afterReopen,
       );
+    },
+  );
+
+  // --- Drain inventory (F2): the migration proof, on real workerd -----------
+  // Unit tests can prove the queries are pure SELECTs against the real schemas.
+  // What they cannot prove is that those queries read the SAME D1 that real
+  // HTTP traffic on real workerd wrote its runs, approvals, reservations,
+  // notifications, and tasks into — and that the numbers MOVE as that work
+  // drains. An inventory that reported the right shape over the wrong database
+  // would pass every unit test and certify a deployment that still owed work.
+
+  await step(
+    'FV1 inventory index: every category, its class, the states no query can ' +
+      'see, and the rule an empty answer means something under',
+    async () => {
+      const index = await readInventoryIndex();
+      const work = index.categories
+        .filter((entry) => entry.class === 'work')
+        .map((entry) => entry.category);
+      const standing = index.categories
+        .filter((entry) => entry.class === 'standing')
+        .map((entry) => entry.category);
+      assert(
+        work.length === 7 && standing.length === 2,
+        'the index splits work from standing configuration',
+        { work, standing },
+      );
+      assert(
+        index.unenumerable.some(
+          (entry) => entry.name === 'run-owner-recovery-journal',
+        ),
+        'the Durable Object journal window is DECLARED, not silently omitted',
+        index.unenumerable,
+      );
+      assert(
+        Array.isArray(index.drainProof?.reachableFrom) &&
+          index.drainProof.reachableFrom.length === 1 &&
+          index.drainProof.reachableFrom[0] === 'draining',
+        "an empty work set only means something from 'draining'",
+        index.drainProof,
+      );
+    },
+  );
+
+  await step(
+    'FV2 drain proof: seeded work appears while draining, leaves as it is ' +
+      'finished, and reads empty across TWO consecutive sweeps before the lock',
+    async () => {
+      const index = await readInventoryIndex();
+
+      // A BASELINE, because this deployment has been running scenarios for the
+      // whole spike and legitimately still holds work from them. The proof
+      // below is over the seeded DELTA: these exact rows appear, and these
+      // exact rows are gone — which is the same claim an empty sweep makes,
+      // stated about rows whose lifecycle this step controls.
+      const before = await sweepInventoryWork(index);
+
+      // Seed: a suspended run with a pending approval, and a keyed start
+      // (a second suspended run PLUS a start reservation).
+      const drained = await startFencedRun();
+      const keyed = await startCountedWithKey('spike-inventory-key', 'inv');
+      assert(
+        keyed.status === 200 && keyed.body.status === 'suspended',
+        'the keyed seed run suspended',
+        keyed.body,
+      );
+
+      // Draining: the operator has stopped new work and is now proving what is
+      // left. Reads stay open in every state, which is the whole point.
+      await moveFence('open', 'draining');
+      const seeded = await sweepInventoryWork(index);
+
+      assert(
+        seeded.runs.keys.some((key) => key.endsWith(`/${drained.runId}`)) &&
+          seeded.runs.keys.some((key) => key.endsWith(`/${keyed.body.runId}`)),
+        'both seeded runs are reported as outstanding work',
+        seeded.runs,
+      );
+      assert(
+        seeded['approvals-waiting'].keys.includes(drained.approvalId),
+        'the pending approval is reported as outstanding work',
+        seeded['approvals-waiting'],
+      );
+      assert(
+        seeded['start-reservations'].keys.includes('spike-inventory-key'),
+        'the unsettled start reservation is reported as outstanding work',
+        seeded['start-reservations'],
+      );
+      assert(
+        seeded.runs.count >= before.runs.count + 2,
+        'the run count moved by exactly the work that was seeded',
+        { before: before.runs.count, seeded: seeded.runs.count },
+      );
+
+      // The categories the earlier scenarios populated are READ here too, over
+      // the same real D1: their sub-counts are what tell an operator a parked
+      // task from one awaiting a webhook, and a due notification from one
+      // scheduled for later.
+      assert(
+        typeof seeded['background-tasks'].count === 'number' &&
+          typeof seeded['background-tasks'].totals?.fenceSuspended === 'number',
+        'background tasks report a fence-parked sub-count',
+        seeded['background-tasks'],
+      );
+      assert(
+        typeof seeded['pending-notifications'].count === 'number' &&
+          typeof seeded['pending-notifications'].totals?.notDue === 'number',
+        'pending notifications separate what is due from what is not',
+        seeded['pending-notifications'],
+      );
+
+      // Drain: a draining deployment still finishes what it already has. Both
+      // seeded runs complete, and the reservation settles with its run.
+      const decided = await http(
+        'POST',
+        `/api/approvals/${drained.approvalId}/decide`,
+        { headers: AUTH.reviewer, body: { decision: 'approve' } },
+      );
+      assert(
+        decided.status === 200 &&
+          decided.body.resume?.summary?.status === 'success',
+        'the draining deployment resumed the seeded run to success',
+        decided,
+      );
+      const keyedApprovalId = keyed.body.approval?.id;
+      assert(
+        typeof keyedApprovalId === 'string',
+        'the keyed seed run filed an approval to drain',
+        keyed.body,
+      );
+      const keyedDecided = await http(
+        'POST',
+        `/api/approvals/${keyedApprovalId}/decide`,
+        { headers: AUTH.reviewer, body: { decision: 'approve' } },
+      );
+      assert(
+        keyedDecided.status === 200 &&
+          keyedDecided.body.resume?.summary?.status === 'success',
+        'the keyed seed run also resumed to success',
+        keyedDecided,
+      );
+
+      // The proof: the seeded rows are gone, and STILL gone on a second full
+      // sweep. One sweep is a lower bound — traffic is still completing work
+      // while it runs — so the contract asks for two.
+      const gone = (sweep) =>
+        !sweep.runs.keys.some((key) => key.endsWith(`/${drained.runId}`)) &&
+        !sweep.runs.keys.some((key) => key.endsWith(`/${keyed.body.runId}`)) &&
+        !sweep['approvals-waiting'].keys.includes(drained.approvalId) &&
+        !sweep['approvals-waiting'].keys.includes(keyedApprovalId) &&
+        !sweep['start-reservations'].keys.includes('spike-inventory-key');
+      const first = await sweepInventoryWork(index);
+      assert(gone(first), 'the first sweep no longer reports the seeded work', {
+        runs: first.runs.keys,
+        approvals: first['approvals-waiting'].keys,
+        reservations: first['start-reservations'].keys,
+      });
+      const second = await sweepInventoryWork(index);
+      assert(
+        gone(second),
+        'the second consecutive sweep agrees — the drain proof holds',
+        {
+          runs: second.runs.keys,
+          approvals: second['approvals-waiting'].keys,
+          reservations: second['start-reservations'].keys,
+        },
+      );
+
+      // Standing configuration is NOT drained: a schedule and a provider
+      // subscription survive the migration, and demanding they empty would make
+      // the proof unreachable rather than strict.
+      const schedules = await sweepInventoryCategory('schedules');
+      const subscriptions = await sweepInventoryCategory(
+        'signal-subscriptions',
+      );
+      assert(
+        schedules.class === 'standing' && schedules.keys.length >= 1,
+        'schedules are still reported while the drain proof passes',
+        schedules,
+      );
+      assert(
+        subscriptions.class === 'standing' && subscriptions.keys.length >= 1,
+        'provider subscriptions are still reported while the proof passes',
+        subscriptions,
+      );
+
+      // Lock: the proof held, so the deployment may stop executing. The
+      // inventory keeps answering — reads are ungated in every state, which is
+      // what lets an operator verify the lock they just took.
+      await moveFence('draining', 'migration-locked');
+      const locked = await sweepInventoryWork(index);
+      assert(
+        gone(locked),
+        'the inventory still answers under the lock, with the same verdict',
+        locked.runs.keys,
+      );
+      const refusedStart = await http('POST', '/runs', {
+        body: RUN_BODY,
+        headers: AUTH.operator,
+      });
+      assertFenced(
+        'a run start after the drain proof locked the deployment',
+        refusedStart,
+        'migration-locked',
+      );
+      await moveFence('migration-locked', 'open');
     },
   );
 
@@ -2818,9 +3154,20 @@ try {
       'Owner-bound idempotent start (F3): a keyed start retried after a ' +
       'workerd kill+restart replayed the SAME run rather than starting a ' +
       'second, two genuinely concurrent same-key starts resolved to ONE ' +
-      'run, and under proof-only exactly the start carrying the nominated ' +
+      'run — both proved by a durable D1 execution counter reading exactly 1, ' +
+      'with every concurrent refusal inside the published taxonomy — ' +
+      'and under proof-only exactly the start carrying the nominated ' +
       'key was admitted and bound the fence to its run while unkeyed and ' +
       'wrong-keyed starts were refused. ' +
+      'The drain inventory (F2): the index declared every category with its ' +
+      'class, the Durable Object journal window it cannot see, and the rule an ' +
+      'empty answer means something under; seeded runs, an approval, and a ' +
+      'start reservation appeared as outstanding work while draining, left as ' +
+      'each was finished, and read absent across TWO consecutive full sweeps ' +
+      'paged through the keyset — after which the deployment locked, still ' +
+      'answered the same inventory, and refused to mint, while its schedules ' +
+      'and provider subscriptions kept being reported as standing ' +
+      'configuration a migration carries rather than drains. ' +
       'Finally, a fresh Worker refused a D1 sentinel stamped for ' +
       'another deployment with 503 before authentication or routing.',
   );

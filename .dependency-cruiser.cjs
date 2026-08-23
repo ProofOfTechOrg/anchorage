@@ -1,7 +1,13 @@
 const FLOWSAFE_PUBLIC_ENTRY =
   '^packages/flowsafe/src/(?:index|host-kit/index|agent-runner/index|signals/client)\\.ts$';
+// `principal-identity` is the import-free half of `principal` (the kind list
+// and the two identity predicates). It is admitted here for the same reason the
+// others are, and is strictly leafier than any of them: it imports nothing at
+// all, so it cannot widen what do-runner reaches through approval-api.
 const ALLOWED_APPROVAL_API_LEAVES =
-  '^packages/flowsafe/src/approval-api/(?:principal|contract|types)\\.ts$';
+  '^packages/flowsafe/src/approval-api/(?:principal-identity|principal|contract|types)\\.ts$';
+// NOT extended with `principal-identity`: this is the exception list for the
+// one tolerated import cycle, and a module with no imports can never be in one.
 const KNOWN_APPROVAL_API_CYCLE =
   '^packages/flowsafe/src/approval-api/(?:principal|contract|types)\\.ts$';
 
@@ -44,7 +50,7 @@ module.exports = {
       name: 'do-runner-approval-api-leaves-only',
       severity: 'error',
       comment:
-        'do-runner may reach approval-api only through principal.ts, contract.ts, and their type-only types.ts leaf.',
+        'do-runner may reach approval-api only through principal.ts, its import-free principal-identity.ts half, contract.ts, and their type-only types.ts leaf.',
       from: {
         path: [
           '^packages/flowsafe/src/do-runner/index\\.ts$',

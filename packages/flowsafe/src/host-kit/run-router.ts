@@ -182,8 +182,13 @@ export type RunRouterStartIdempotency =
        * because it must be the fence over the SAME database the reservation
        * lives in — a second store over a different binding would silently
        * re-bind nothing. `'none'` is the honest answer for a host with no fence.
+       *
+       * Named `executionFence`, like every other fence-carrying option in the
+       * package, so the wiring census can see it: a leaf that spelled the field
+       * differently would be one the census could not name, and an uncensused
+       * fence field is exactly the kind that quietly becomes optional.
        */
-      fence: ExecutionFenceWiring;
+      executionFence: ExecutionFenceWiring;
     };
 
 export interface RunStartInput {
@@ -357,7 +362,10 @@ async function startIdempotently(
   const decision = await beginIdempotentStart<RunSummary>(
     store,
     {
-      key: rawKey as string,
+      // No cast: `StartReservationRequest.key` takes `unknown` and `assertKey`
+      // is what validates it, so the one field a caller can get wrong reaches
+      // the check as whatever the JSON parser actually produced.
+      key: rawKey,
       owner: {
         kind: context.principal.kind,
         id: context.principal.id,
@@ -372,7 +380,7 @@ async function startIdempotently(
       live: async (reservation: StartReservation) =>
         live ? live(workflowId, reservation.runId) : false,
     },
-    wiring === 'none' ? undefined : wiring.fence,
+    wiring === 'none' ? undefined : wiring.executionFence,
   );
   if (decision.kind === 'replay') {
     return { summary: decision.persisted, replayed: true };

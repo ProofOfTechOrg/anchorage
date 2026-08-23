@@ -54,7 +54,7 @@ function buildRuntime(storage: InMemoryStore): {
   const counters: Counters = { approvalResumes: 0, echoRuns: 0 };
   const { createWorkflow, createStep, runtime } = init(
     { storage },
-    { executionFence: 'none' },
+    { startIdempotency: 'none', executionFence: 'none' },
   );
 
   const research = createStep({
@@ -123,7 +123,7 @@ describe('RunnerRuntime host pubsub identity', () => {
     // #when — init() threads it (InitOptions.pubsub -> RunnerRuntimeOptions.pubsub)
     const { runtime } = init(
       { storage: new InMemoryStore() },
-      { pubsub, executionFence: 'none' },
+      { startIdempotency: 'none', pubsub, executionFence: 'none' },
     );
 
     // #then — the SAME instance is reachable, so Track A's createRun sites and
@@ -137,7 +137,7 @@ describe('RunnerRuntime host pubsub identity', () => {
     // #when — no pubsub passed
     const { runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
 
     // #then — undefined, the polling-fallback posture existing hosts keep
@@ -149,7 +149,7 @@ describe('RunnerRuntime', () => {
   it('passes initial workflow state through to core execution', async () => {
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     const stateSchema = z.object({ seed: z.string() });
     const inspect = createStep({
@@ -584,7 +584,7 @@ describe('RunnerRuntime', () => {
     // #given
     const { createWorkflow } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     createWorkflow({
       id: 'wf',
@@ -606,7 +606,7 @@ describe('RunnerRuntime', () => {
     // #given
     const { runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     runtime.registerAgent(runtimeAgent('writer'));
 
@@ -620,7 +620,7 @@ describe('RunnerRuntime', () => {
     // #given
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     const agents = [
       runtimeAgent('a'),
@@ -686,7 +686,7 @@ describe('RunnerRuntime', () => {
     const publish = vi.spyOn(pubsub, 'publish');
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { pubsub, executionFence: 'none' },
+      { startIdempotency: 'none', pubsub, executionFence: 'none' },
     );
     const agent = runtimeAgent('writer');
     runtime.registerAgent(agent);
@@ -729,7 +729,7 @@ describe('RunnerRuntime', () => {
     // #given
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     const noop = createStep({
       id: 'noop',
@@ -770,7 +770,7 @@ describe('RunnerRuntime', () => {
     // #given
     const { createWorkflow } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
 
     // #when / #then — a ':' or '/' in the id would make the DO name join
@@ -789,7 +789,7 @@ describe('RunnerRuntime', () => {
     // #given
     const { createWorkflow, runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
 
     // #when — unreserved-character id, including the '.' that only the bare
@@ -808,7 +808,7 @@ describe('RunnerRuntime', () => {
     // #given
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     const step = createStep({
       id: 'noop',
@@ -846,7 +846,7 @@ describe('RunnerRuntime.status projection', () => {
     const storage = new InMemoryStore();
     const { createWorkflow, createStep, runtime } = init(
       { storage },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     const gate = createStep({
       id: 'gate',
@@ -898,7 +898,7 @@ describe('RunnerRuntime.status projection', () => {
     const storage = new InMemoryStore();
     const { createWorkflow, createStep, runtime } = init(
       { storage },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     const echo = createStep({
       id: 'echo-once',
@@ -978,7 +978,7 @@ describe('RunnerRuntime.status projection', () => {
     // #given
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     const boom = createStep({
       id: 'boom',
@@ -1016,7 +1016,7 @@ describe('RunnerRuntime.status projection', () => {
     // '[object Object]', so a naive projection would lose the message.
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     const boom = createStep({
       id: 'boom-object',
@@ -1057,7 +1057,7 @@ describe('RunnerRuntime.status projection', () => {
     // #given — two parallel steps that both suspend in the same run
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     const makeGate = (id: string, reason: string) =>
       createStep({
@@ -1123,7 +1123,7 @@ describe('RunnerRuntime run lifecycle', () => {
     });
     const { createWorkflow, createStep, runtime } = init(
       { storage: options.storage ?? new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     const step = createStep({
       id: 'held',
@@ -1216,6 +1216,7 @@ describe('RunnerRuntime run lifecycle', () => {
       const { createWorkflow, createStep, runtime } = init(
         { storage },
         {
+          startIdempotency: 'none',
           executionFence: 'none',
           requestContextForRun: () => ({
             'flowsafe.runLifecycle': {
@@ -1911,7 +1912,7 @@ describe('RunnerRuntime run lifecycle', () => {
     const storage = new InMemoryStore();
     const { createWorkflow, createStep, runtime } = init(
       { storage },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     const step = createStep({
       id: 'finish',
@@ -2020,7 +2021,11 @@ describe('RunnerRuntime requestContextForRun', () => {
     const seen: Observation[] = [];
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { requestContextForRun: provider, executionFence: 'none' },
+      {
+        startIdempotency: 'none',
+        requestContextForRun: provider,
+        executionFence: 'none',
+      },
     );
     const first = createStep({
       id: 'first',
@@ -2067,6 +2072,7 @@ describe('RunnerRuntime requestContextForRun', () => {
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
       {
+        startIdempotency: 'none',
         requestContextForRun: () => ({ 'test.a': 'provider' }),
         executionFence: 'none',
       },
@@ -2232,7 +2238,7 @@ describe('RunnerRuntime requestContextForRun', () => {
     const seen: unknown[] = [];
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     const probe = createStep({
       id: 'probe',
@@ -2266,7 +2272,7 @@ describe('RunnerRuntime requestContextForRun', () => {
     const seen: Array<{ scope: unknown; isolation: unknown }> = [];
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     const probe = createStep({
       id: 'probe',
@@ -2307,6 +2313,7 @@ describe('RunnerRuntime requestContextForRun', () => {
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
       {
+        startIdempotency: 'none',
         executionFence: 'none',
         requestContextForRun: () => ({
           'breakwater.workflowScope': 'overridden',
@@ -2345,6 +2352,7 @@ describe('RunnerRuntime requestContextForRun', () => {
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
       {
+        startIdempotency: 'none',
         executionFence: 'none',
         requestContextForRun: () => ({
           stored: 'kept',
@@ -2460,6 +2468,7 @@ describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
     const { createWorkflow, createStep, runtime } = init(
       { storage },
       {
+        startIdempotency: 'none',
         executionFence: 'none',
         ...(onLeg
           ? {
@@ -2612,7 +2621,7 @@ describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
     // the relaunch-falsy e2e fixture) goes silently stale.
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     const schemaGate = createStep({
       id: 'schemaGate',
@@ -2690,7 +2699,7 @@ describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
     // resume (round 2), gateB stays at its first suspension.
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     let aRounds = 0;
     const gateA = createStep({
@@ -2760,6 +2769,7 @@ describe('RunnerRuntime resumeCount snapshot provenance (shared runId across wor
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
       {
+        startIdempotency: 'none',
         executionFence: 'none',
         ...(onLeg
           ? {
@@ -2878,7 +2888,7 @@ describe('RunnerRuntime resumeCount snapshot provenance (shared runId across wor
   function buildSharedDeepChain(): RunnerRuntime {
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     for (const id of ['wfA', 'wfB']) {
       const gate = createStep({
@@ -2941,6 +2951,7 @@ describe('RunnerRuntime snapshot provenance durability', () => {
     const { createWorkflow, createStep, runtime } = init(
       { storage },
       {
+        startIdempotency: 'none',
         executionFence: 'none',
         requestContextForRun: (_workflowId, _runId, leg) => {
           onLeg?.(leg);
@@ -2972,7 +2983,11 @@ describe('RunnerRuntime snapshot provenance durability', () => {
   ): RunnerRuntime {
     const { createWorkflow, createStep, runtime } = init(
       { storage },
-      { requestContextForRun, executionFence: 'none' },
+      {
+        startIdempotency: 'none',
+        requestContextForRun,
+        executionFence: 'none',
+      },
     );
     const gate = createStep({
       id: 'gate',
@@ -3276,7 +3291,7 @@ describe('per-suspension deadline contract', () => {
     const storage = new InMemoryStore();
     const { createWorkflow, createStep, runtime } = init(
       { storage },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     // Built as a value so the reserved key survives a suspendSchema that does
     // not declare it — which is exactly what the stripping test measures.
@@ -3474,7 +3489,7 @@ describe('per-suspension deadline contract', () => {
     // leaving an author to believe a deadline was accepted.
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     const approval = createStep({
       id: 'approval',
@@ -3558,7 +3573,7 @@ describe('per-suspension deadline contract', () => {
     // that arms and then silently disappears.
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { executionFence: 'none' },
+      { startIdempotency: 'none', executionFence: 'none' },
     );
     const gate = createStep({
       id: stepId,

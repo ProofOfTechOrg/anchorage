@@ -161,6 +161,7 @@ function buildHarness(
     const { createWorkflow, createStep, runtime } = init(
       { storage },
       {
+        startIdempotency: 'none',
         executionFence: 'none',
         requestContextForRun: async (id, runId, leg) => ({
           ...(await grantProvider(id, runId, leg)),
@@ -568,6 +569,7 @@ describe('agent gate grant round-trip (R-003, both shapes)', () => {
       init(
         { storage },
         {
+          startIdempotency: 'none',
           requestContextForRun: approvalGrantProvider(store),
           executionFence: 'none',
         },

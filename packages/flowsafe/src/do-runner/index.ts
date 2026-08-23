@@ -145,6 +145,38 @@ export type {
   StorageInitOptions,
 } from './init.js';
 export { init } from './init.js';
+// The drain inventory: the read-only surface an operator proves a deployment
+// empty with, and the table census that keeps that proof complete as new
+// tables arrive.
+export type {
+  DeploymentInventoryOptions,
+  DrainProofContract,
+  FlowsafeTableEntry,
+  InventoryCategory,
+  InventoryCategoryClass,
+  InventoryCategoryDescriptor,
+  InventoryDatabase,
+  InventoryEntry,
+  InventoryIndex,
+  InventoryPage,
+  InventoryReadOptions,
+  InventoryStatement,
+  InventoryTableAccounting,
+  UnenumerableState,
+} from './inventory.js';
+export {
+  DeploymentInventory,
+  FLOWSAFE_TABLES,
+  INVENTORY_CATEGORIES,
+  INVENTORY_CATEGORY_DESCRIPTORS,
+  INVENTORY_DEFAULT_LIMIT,
+  INVENTORY_DRAIN_PROOF,
+  INVENTORY_INDEX,
+  INVENTORY_MAX_LIMIT,
+  INVENTORY_UNENUMERABLE,
+  InvalidInventoryRequestError,
+  isInventoryCategory,
+} from './inventory.js';
 // Agent-memory id chokepoint: mint server-owned thread ids and validate trusted
 // host business keys used as resource ids (clients never supply either).
 export { mintThreadId, resourceIdFromKey } from './memory-id.js';

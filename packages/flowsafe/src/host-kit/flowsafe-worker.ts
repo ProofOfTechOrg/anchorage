@@ -51,11 +51,14 @@ import {
   assertExecutionFenceState,
   DEPLOYMENT_IDENTITY_HEADER,
   DeploymentIdentityError,
+  DeploymentInventory,
   DoStatusError,
   deploymentIdentityHeaders,
   ensureDeploymentIdentityBindings,
   executionFenceFor,
   executionFenceReadingPayload,
+  InvalidInventoryRequestError,
+  isInventoryCategory,
   purgeExpiredBackgroundTasks,
   purgeExpiredNotifications,
   purgeExpiredScheduleTriggers,
@@ -996,6 +999,112 @@ async function executionFenceAdminResponse<Env extends FlowsafeWorkerEnv>(
   }
 }
 
+const INVENTORY_ADMIN_PATH = '/admin/inventory';
+
+/**
+ * The deployment's drain-proof surface, behind the SAME gate the fence and the
+ * maintenance routes use — one trust boundary, one credential.
+ *
+ * WHAT IT IS FOR. An operator holds the fence in `draining` and needs to prove,
+ * with no side effects, that this deployment holds no executable or resumable
+ * work before locking it for a migration. Without such a proof the only
+ * available answer is a wait-and-hope, and a suspended run that survives it
+ * gets resumed by two deployments at once.
+ *
+ * HOW TO READ THE ANSWER — the contract the index response also states, in
+ * full, because this is the part a hurried operator skips:
+ *
+ *   Results are a LOWER BOUND while a drain is running. The keyset never skips
+ *   a row and rows only ever leave a `work` category, so a sweep can
+ *   under-report what remains, never over-report what has finished.
+ *
+ *   The proof is TWO consecutive full sweeps, at least one alarm cadence apart,
+ *   in which every `work` category comes back empty. One sweep cannot cover the
+ *   window in which a run object has journalled its recovery key but not yet
+ *   written its D1 owner row; two, spaced that far, can.
+ *
+ *   Empty is only meaningful from `draining`. Under `migration-locked`
+ *   background tasks park themselves as fence-suspended and resumes are
+ *   refused, so outstanding work stops being ATTEMPTED rather than finishing —
+ *   an inventory taken there measures the fence, not the deployment.
+ *
+ * `standing` categories (schedules, provider subscriptions) are reported for
+ * reconciliation and are never required to be empty: they are configuration a
+ * migration carries across.
+ *
+ * GET only. Every query underneath is a bare SELECT that never creates schema,
+ * so running this against a deployment about to be copied does not change what
+ * is being copied.
+ */
+async function inventoryAdminResponse<Env extends FlowsafeWorkerEnv>(
+  request: Request,
+  env: Env,
+  storageTablePrefix: string | undefined,
+): Promise<Response | null> {
+  const url = new URL(request.url);
+  if (url.pathname !== INVENTORY_ADMIN_PATH) return null;
+  if (request.method !== 'GET') {
+    return json({ error: 'method not allowed' }, 405);
+  }
+  const gate = await authorizeAdminCredential(request, env, {
+    surface: 'deployment inventory',
+    // Unconfigured is 503, never open: this read enumerates every outstanding
+    // run, approval, and reservation on the deployment. There is no capability
+    // relay behind it to delegate to, either.
+    delegateWhenUnconfigured: false,
+  });
+  if (!gate.authorized) return gate.response;
+  try {
+    const inventory = new DeploymentInventory(env.DB, {
+      ...(storageTablePrefix === undefined
+        ? {}
+        : { tablePrefix: storageTablePrefix }),
+    });
+    const category = url.searchParams.get('category');
+    if (category === null || category === '') {
+      return json(inventory.index());
+    }
+    if (!isInventoryCategory(category)) {
+      throw new InvalidInventoryRequestError(
+        `unknown inventory category '${category}'`,
+      );
+    }
+    const rawLimit = url.searchParams.get('limit');
+    // Parsed here rather than coerced inside the store: `Number('abc')` is NaN
+    // and `Number('')` is 0, and both would otherwise reach the clamp as a
+    // number that means something the caller never asked for.
+    if (rawLimit !== null && !/^[0-9]{1,4}$/.test(rawLimit)) {
+      throw new InvalidInventoryRequestError(
+        'inventory limit must be a positive integer',
+      );
+    }
+    const cursor = url.searchParams.get('cursor');
+    return json(
+      await inventory.read(category, {
+        ...(cursor === null ? {} : { cursor }),
+        ...(rawLimit === null ? {} : { limit: Number(rawLimit) }),
+      }),
+    );
+  } catch (error) {
+    if (error instanceof DoStatusError) {
+      return json(
+        {
+          error: error.message,
+          ...(error.reason === undefined ? {} : { reason: error.reason }),
+        },
+        error.status,
+      );
+    }
+    console.error(
+      JSON.stringify({
+        type: 'inventory-admin-error',
+        reason: error instanceof Error ? error.message : String(error),
+      }),
+    );
+    return json({ error: 'deployment inventory failed' }, 500);
+  }
+}
+
 export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
   config: FlowsafeWorkerConfig<Env>,
 ): FlowsafeWorker<Env> {
@@ -1383,6 +1492,16 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         const fenceAdmin = await executionFenceAdminResponse(request, env);
         if (fenceAdmin) return fenceAdmin;
 
+        // Beside the fence for the same reason: the drain proof is read WHILE
+        // the deployment is refusing tenant traffic, so it must not sit behind
+        // a router that a drain is trying to empty.
+        const inventoryAdmin = await inventoryAdminResponse(
+          request,
+          env,
+          storageTablePrefix,
+        );
+        if (inventoryAdmin) return inventoryAdmin;
+
         const waitUntil = (promise: Promise<unknown>): void =>
           ctx.waitUntil(promise);
         const topology = createDoRunTopology(
@@ -1505,7 +1624,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           startIdempotency: {
             store: startIdempotencyForEnv(env),
             live: topology.startLiveness,
-            fence: executionFenceForEnv(env),
+            executionFence: executionFenceForEnv(env),
           },
           beforeStart: beforeStart
             ? (context, workflowId, inputData) =>

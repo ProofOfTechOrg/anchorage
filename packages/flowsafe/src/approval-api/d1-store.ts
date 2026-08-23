@@ -19,6 +19,7 @@ import {
   stepKeyOf,
 } from './store.js';
 import {
+  APPROVALS_TABLE,
   type ApprovalListFilter,
   type ApprovalMetrics,
   type ApprovalRecord,
@@ -48,7 +49,10 @@ export interface ApprovalPreparedStatement {
   all<T = unknown>(): Promise<{ results: T[] }>;
 }
 
-const TABLE = 'flowsafe_approvals';
+// The name itself lives on the types leaf, which is the only approval-api file
+// the drain inventory is allowed to reach. This is the local shorthand every
+// query below was already written against.
+const TABLE = APPROVALS_TABLE;
 
 // The partial index preserves open-step uniqueness. Captured suspensions add a
 // second, all-status fingerprint index after the legacy nullable columns are
