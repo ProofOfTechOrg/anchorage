@@ -343,6 +343,17 @@ export interface FleetRecord {
   readonly databaseExportLocation?: string;
   readonly databaseExportSha256?: string;
   readonly databaseExportSize?: number;
+  /**
+   * The key of the last settlement this deployment completed.
+   *
+   * Persisted for one reason: the convergence entry is the steady-state path,
+   * so a fleet that reconciles on a schedule re-enters it forever. Without a
+   * durable marker every one of those converges would re-fire settlement on an
+   * unchanged deployment, and a host charging per settlement would charge per
+   * reconcile. Absent on any deployment that has not settled since this field
+   * existed, which reads as "settle once more", never as "already settled".
+   */
+  readonly settledSettlementKey?: string;
   readonly updatedAt: string;
 }
 
@@ -575,6 +586,122 @@ export interface SeedDeploymentIdentityOptions {
   readonly initialExecutionFenceState: InitialExecutionFenceState;
 }
 
+/**
+ * What the provider actually reported when a route could not be attested.
+ *
+ * Every field is optional because an attestation failure is defined by what is
+ * MISSING. A Worker splitting traffic across two versions has percentages but
+ * no single routed version; an unrouted hostname has neither; a routed script
+ * built without the fleet digest binding has everything except `specDigest`.
+ * The refusal carries whichever of those the provider did answer, so an
+ * operator reading the failure sees the drift rather than a bare "mismatch".
+ */
+export interface ObservedActiveRoute {
+  readonly trafficSplit?: readonly Readonly<{
+    artifactVersion: string;
+    percentage: number;
+  }>[];
+  readonly routedScriptName?: string;
+  readonly artifactVersion?: string;
+  readonly specDigest?: string;
+}
+
+/**
+ * Provider truth about which artifact is serving a deployment's hostname right
+ * now, and which fleet specification that artifact was built from.
+ *
+ * `physicalScriptName` is the script traffic ACTUALLY reaches, which is not
+ * necessarily the release the control plane expected — reporting the difference
+ * is the whole point. `observedAt` comes from the backend's injected clock, so
+ * a caller comparing two attestations is comparing one clock, not two.
+ */
+export interface ActiveRouteAttestation {
+  readonly specDigest: string;
+  readonly artifactVersion: string;
+  readonly physicalScriptName: string;
+  readonly source: 'workers-deployments' | 'dispatch-route';
+  readonly observedAt: string;
+}
+
+/** Which promote path settled, so a host can tell four arrivals apart. */
+export type FleetSettlementEntry =
+  | 'migration'
+  | 'platform-only'
+  | 'ready-convergence'
+  | 'rollback';
+
+export interface FleetSettlementContext {
+  readonly tenantTag: string;
+  readonly environment: string;
+  /** Proof of what is routed, read after the promotion converged. */
+  readonly attestation: ActiveRouteAttestation;
+  /**
+   * The release now serving traffic, and the only deployment identity
+   * `settle()` may depend on.
+   *
+   * That limit is forced, not stylistic: on the convergence entry the prior
+   * release has already been retired by the time any settlement point is
+   * reached, and the plain backend retains no prior release at all. A host that
+   * needed the outgoing release to compute what it settles would work on some
+   * entries and silently misbehave on others.
+   *
+   * On a backend that retains no release snapshots this is synthesized: its
+   * script name, specification digest, and artifact version are the
+   * attestation's, but `releaseSchemaVersion` and `application` are copied from
+   * the control-plane record — this deployment's belief about what it deployed,
+   * not something the provider confirmed.
+   */
+  readonly target: ExternalReleaseSnapshot;
+  /**
+   * Optional-normal, and its meaning is defined per entry: on 'migration',
+   * 'platform-only', and 'ready-convergence' it is the release this one
+   * replaced, where the deployment still retains it; on 'rollback' it is the
+   * release being ABANDONED, so a host reversing its own effects reverses the
+   * right one. Absent whenever no prior release is retained.
+   */
+  readonly prior?: ExternalReleaseSnapshot;
+  readonly entry: FleetSettlementEntry;
+  /**
+   * Identifies this settlement by what was settled — the deployment and the
+   * target release — not by when it happened. Every retry of the same
+   * settlement carries the same key, which is what makes at-least-once
+   * delivery safe to deduplicate on.
+   */
+  readonly settlementKey: string;
+  /**
+   * True when the deployment already recorded this exact key, which happens
+   * only in a re-fire window: settle succeeded, the state write that records it
+   * did not, and the retry is delivering the same settlement again. A host that
+   * deduplicates on `settlementKey` needs nothing from this field; one that
+   * logs or alerts can use it to say so.
+   */
+  readonly alreadySettled: boolean;
+}
+
+export interface FleetSettlementHost {
+  /**
+   * Called while the deployment lease is held, after the route attested and
+   * matched, and before the state write that records the settlement.
+   *
+   * AT-LEAST-ONCE and KEYED. A crash between this returning and that write
+   * replays it with the same `settlementKey`, so anything with an external
+   * effect — a charge, an entitlement, a notification — must be idempotent on
+   * that key. This package cannot make the callback and its own durable write
+   * atomic, so it guarantees the direction that fails safe: never settled
+   * without being attempted.
+   *
+   * BRIEF. It runs inside a lease renewed on a five-minute heartbeat against a
+   * fifteen-minute TTL; a callback that outlives the renewal window loses the
+   * lease and takes the whole promote path down with it. Enqueue slow work,
+   * do not perform it here.
+   *
+   * A throw propagates. The branch's durable state is left where a re-entry
+   * resumes it, and that re-entry re-attests and settles again under the same
+   * key.
+   */
+  settle(context: FleetSettlementContext): Promise<void>;
+}
+
 export interface ProvisioningBackend {
   readonly kind: ProvisioningBackendKind;
   readonly immutableExternalArtifacts?: true;
@@ -694,6 +821,28 @@ export interface ProvisioningBackend {
     maintenanceAdminSecret: string,
     expectedArtifactVersion: string | undefined,
   ): Promise<LiveDeployment | undefined>;
+  /**
+   * Provider truth about what is ROUTED, never desired state.
+   *
+   * `inspect()` answers a different question — "does the deployment the control
+   * plane WANTS exist and match?" — and deliberately pins a staged candidate
+   * that is receiving none of the traffic, so a converge can compare against it
+   * before promoting it. That makes it the wrong instrument for asking what is
+   * serving requests: a candidate uploaded and never promoted answers as though
+   * it were live. This method answers only the second question and never pins a
+   * candidate; the two views stay separate on purpose.
+   *
+   * Read-only and lease-free. Provider GET/HEAD requests bypass the external
+   * mutation fence, so a caller holding no deployment lease may attest, and a
+   * caller already inside one does not nest a second.
+   *
+   * Refuses rather than guessing: a Worker splitting traffic across versions,
+   * a hostname routed nowhere, or a routed artifact carrying no fleet
+   * specification digest all throw `ActiveRouteAttestationError` carrying what
+   * the provider did report. There is no highest-percentage fallback — an
+   * attestation is either unambiguous or it is a refusal.
+   */
+  attestActiveRoute(spec: DeploymentSpec): Promise<ActiveRouteAttestation>;
   removeTraffic(
     spec: DeploymentSpec,
     retainedReleases: readonly ExternalReleaseSnapshot[] | undefined,

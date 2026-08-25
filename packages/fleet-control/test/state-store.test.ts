@@ -16,6 +16,24 @@ import type { FleetRecord, PlatformPlaneResourceSet } from '../src/types.js';
 const MAINTENANCE_PUBLIC_KEY =
   '{"kty":"OKP","crv":"Ed25519","alg":"EdDSA","kid":"fleet-maintenance-v1","x":"Lhp1XFeTJJx8FLOCKpn4nkO-tWuZZxXX8ziw0LEvUZo"}';
 
+/**
+ * The columns the store adds to a table that already shipped. A fake that
+ * models only some of them reports a half-upgraded schema, which is the one
+ * shape the store is entitled to refuse.
+ */
+const UPGRADED_COLUMNS = [
+  'backend_switch_intent',
+  'settled_settlement_key',
+] as const;
+
+function nullableTextColumn(name: string): Readonly<Record<string, unknown>> {
+  return { name, type: 'TEXT', notnull: 0, pk: 0 };
+}
+
+function addedColumnName(sql: string): string | undefined {
+  return /ADD COLUMN (?<name>[a-z_]+) TEXT/u.exec(sql)?.groups?.name;
+}
+
 class MemoryD1 implements FleetStateDatabase {
   row: Readonly<Record<string, unknown>> | undefined;
   readonly claims = new Map<string, Readonly<Record<string, unknown>>>();
@@ -25,14 +43,7 @@ class MemoryD1 implements FleetStateDatabase {
     bindings: readonly unknown[] = [],
   ): Promise<readonly Readonly<Record<string, unknown>>[]> {
     if (sql.startsWith('PRAGMA table_info(anchorage_fleet_deployments)')) {
-      return [
-        {
-          name: 'backend_switch_intent',
-          type: 'TEXT',
-          notnull: 0,
-          pk: 0,
-        },
-      ];
+      return UPGRADED_COLUMNS.map((name) => nullableTextColumn(name));
     }
     if (sql.startsWith('SELECT *')) return this.row ? [this.row] : [];
     if (sql.startsWith('INSERT INTO anchorage_fleet_leases')) {
@@ -159,6 +170,7 @@ class MemoryD1 implements FleetStateDatabase {
         'database_export_location',
         'database_export_sha256',
         'database_export_size',
+        'settled_settlement_key',
         'updated_at',
       ];
       this.row = Object.fromEntries(
@@ -283,12 +295,9 @@ class MemoryD1 implements FleetStateDatabase {
 }
 
 class SchemaD1 implements FleetStateDatabase {
-  column: Readonly<Record<string, unknown>> | undefined = {
-    name: 'backend_switch_intent',
-    type: 'TEXT',
-    notnull: 0,
-    pk: 0,
-  };
+  readonly columns = new Map<string, Readonly<Record<string, unknown>>>(
+    UPGRADED_COLUMNS.map((name) => [name, nullableTextColumn(name)]),
+  );
   createAttempts = 0;
   alterAttempts = 0;
   failCreateOnce = false;
@@ -297,9 +306,7 @@ class SchemaD1 implements FleetStateDatabase {
   async query(
     sql: string,
   ): Promise<readonly Readonly<Record<string, unknown>>[]> {
-    if (sql.startsWith('PRAGMA table_info')) {
-      return this.column ? [this.column] : [];
-    }
+    if (sql.startsWith('PRAGMA table_info')) return [...this.columns.values()];
     return [];
   }
 
@@ -313,18 +320,14 @@ class SchemaD1 implements FleetStateDatabase {
         throw new Error('transient schema failure');
       }
     }
-    if (sql.startsWith('ALTER TABLE')) {
+    const added = addedColumnName(sql);
+    if (added) {
       this.alterAttempts += 1;
       if (this.failAlterOnce) {
         this.failAlterOnce = false;
         throw new Error('genuine migration failure');
       }
-      this.column = {
-        name: 'backend_switch_intent',
-        type: 'TEXT',
-        notnull: 0,
-        pk: 0,
-      };
+      this.columns.set(added, nullableTextColumn(added));
     }
   }
 
@@ -336,13 +339,15 @@ class SchemaD1 implements FleetStateDatabase {
 }
 
 class ConcurrentSchemaD1 extends SchemaD1 {
+  /** Every column an ALTER found already present — a real racer's signature. */
+  readonly duplicates: string[] = [];
   readonly #bothInspected: Promise<void>;
   #releaseInspections!: () => void;
   #coldInspections = 0;
 
   constructor() {
     super();
-    this.column = undefined;
+    this.columns.clear();
     this.#bothInspected = new Promise((resolve) => {
       this.#releaseInspections = resolve;
     });
@@ -361,12 +366,12 @@ class ConcurrentSchemaD1 extends SchemaD1 {
   }
 
   override async execute(sql: string): Promise<void> {
-    if (sql.startsWith('ALTER TABLE') && this.column !== undefined) {
+    const added = addedColumnName(sql);
+    if (added && this.columns.has(added)) {
       this.alterAttempts += 1;
+      this.duplicates.push(added);
       throw new Error('D1 migration failed', {
-        cause: new Error(
-          'duplicate column name: backend_switch_intent: SQLITE_ERROR',
-        ),
+        cause: new Error(`duplicate column name: ${added}: SQLITE_ERROR`),
       });
     }
     await super.execute(sql);
@@ -432,18 +437,22 @@ describe('D1FleetStateStore release state', () => {
         second.get('other', 'production'),
       ]),
     ).resolves.toEqual([undefined, undefined]);
-    expect(db.alterAttempts).toBe(2);
-    expect(db.column).toMatchObject({
-      name: 'backend_switch_intent',
-      type: 'TEXT',
-      notnull: 0,
-      pk: 0,
-    });
+    // #then the losing racer's duplicate-column error was swallowed, and every
+    // upgraded column ended well-formed rather than half-applied
+    expect(db.duplicates.length).toBeGreaterThan(0);
+    for (const name of UPGRADED_COLUMNS) {
+      expect(db.columns.get(name)).toMatchObject({
+        name,
+        type: 'TEXT',
+        notnull: 0,
+        pk: 0,
+      });
+    }
   });
 
   it('propagates a genuine migration failure and retries it later', async () => {
     const db = new SchemaD1();
-    db.column = undefined;
+    db.columns.clear();
     db.failAlterOnce = true;
     const store = new D1FleetStateStore(db, { accountId: 'account' });
 
@@ -451,7 +460,9 @@ describe('D1FleetStateStore release state', () => {
       /genuine migration failure/u,
     );
     await expect(store.get('acme', 'production')).resolves.toBeUndefined();
-    expect(db.alterAttempts).toBe(2);
+    // The failed column is retried, and every other upgraded column still runs.
+    expect(db.alterAttempts).toBe(UPGRADED_COLUMNS.length + 1);
+    expect([...db.columns.keys()].sort()).toEqual([...UPGRADED_COLUMNS].sort());
   });
 
   it('verifies current column shape and does not repeat migration work', async () => {
@@ -465,12 +476,12 @@ describe('D1FleetStateStore release state', () => {
     expect(current.alterAttempts).toBe(0);
 
     const incompatible = new SchemaD1();
-    incompatible.column = {
-      name: 'backend_switch_intent',
+    incompatible.columns.set('settled_settlement_key', {
+      name: 'settled_settlement_key',
       type: 'INTEGER',
       notnull: 1,
       pk: 0,
-    };
+    });
     await expect(
       new D1FleetStateStore(incompatible, { accountId: 'account' }).get(
         'acme',
@@ -848,6 +859,55 @@ describe('D1FleetStateStore release state', () => {
     );
     expect(db.row?.migration_intent).toBeTypeOf('string');
     expect(db.row?.backend_switch_intent).toBeTypeOf('string');
+  });
+
+  it('round-trips the settled settlement key and refuses a malformed one', async () => {
+    // #given a deployment that has completed a settlement
+    const db = new MemoryD1();
+    const store = new D1FleetStateStore(db, { accountId: 'account' });
+    const settledSettlementKey = '7'.repeat(64);
+    const record: FleetRecord = {
+      tenantTag: 'acme',
+      environment: 'production',
+      backend: 'plain-worker',
+      scriptName: 'acme-production',
+      databaseId: 'db-acme',
+      databaseName: 'acme-production',
+      schemaVersion: 1,
+      artifactVersion: 'artifact-v1',
+      desiredSpecDigest: 'a'.repeat(64),
+      durableObjectBindings: [],
+      routeHostname: 'acme.example.test',
+      phase: 'ready',
+      settledSettlementKey,
+      updatedAt: '2026-08-10T00:00:00.000Z',
+    };
+
+    // #when it is written and read back
+    await store.withDeploymentLease('acme', 'production', (lease) =>
+      lease.put(record),
+    );
+
+    // #then the key survives the row, in its own column rather than folded
+    // into a blob a later reader would have to guess at
+    await expect(store.get('acme', 'production')).resolves.toMatchObject(
+      record,
+    );
+    expect(db.row?.settled_settlement_key).toBe(settledSettlementKey);
+
+    // #and a row carrying something that is not a key is refused rather than
+    // read as "settled", which would silently suppress a real settlement
+    db.row = { ...db.row, settled_settlement_key: 'not-a-key' };
+    await expect(store.get('acme', 'production')).rejects.toThrow(
+      /invalid settled_settlement_key/,
+    );
+
+    // #and an absent key reads as "never settled", so a database written
+    // before this column existed settles once more rather than never
+    db.row = { ...db.row, settled_settlement_key: null };
+    const unsettled = await store.get('acme', 'production');
+    expect(unsettled).toBeDefined();
+    expect(unsettled).not.toHaveProperty('settledSettlementKey');
   });
 
   it('refuses to use a lease capability for a different deployment key', async () => {

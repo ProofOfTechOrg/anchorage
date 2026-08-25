@@ -3,6 +3,10 @@
 import { assertInitialExecutionFenceState } from '@proofoftech/flowsafe/deployment-identity-protocol';
 
 import {
+  type AttestConvergedActiveRouteOptions,
+  attestConvergedActiveRoute,
+} from './active-route.js';
+import {
   applicationBindingTopology,
   applicationR2Bindings,
   assertApplicationR2EmptyBeforeDecommission,
@@ -595,6 +599,11 @@ export interface ProvisionDeploymentOptions {
    */
   readonly initialExecutionFenceState: InitialExecutionFenceState;
   readonly finalizedStateProvider?: FinalizedOrdinaryStateProvider;
+  /**
+   * Tuning for the convergence wait the ready-commit attestation performs.
+   * The defaults suit every provider this package targets.
+   */
+  readonly routeAttestation?: AttestConvergedActiveRouteOptions;
   readonly clock?: () => number;
 }
 
@@ -1292,6 +1301,20 @@ async function provisionDeploymentUnderLease(
       if (!maintenance.armed) {
         throw new Error('maintenance is unarmed before ready commit');
       }
+      // The committed artifact version is the ROUTED one, not the one an
+      // inspection reported. Inspection deliberately pins the candidate it was
+      // asked about, so committing its answer would record a version this
+      // deployment merely uploaded as the version it serves.
+      const attestation = await attestConvergedActiveRoute(
+        backend,
+        spec,
+        {
+          specDigest: record.desiredSpecDigest,
+          artifactVersion:
+            record.pendingRelease?.artifactVersion ?? record.artifactVersion,
+        },
+        { clock, ...options.routeAttestation },
+      );
       const readyRecord = { ...record };
       if (readyRecord.pendingRelease) {
         readyRecord.activeRelease = readyRecord.pendingRelease;
@@ -1300,7 +1323,7 @@ async function provisionDeploymentUnderLease(
       record = {
         ...readyRecord,
         phase: 'ready',
-        artifactVersion: live.artifactVersion,
+        artifactVersion: attestation.artifactVersion,
         durableObjectTag: targetDurableObjectTag(spec),
         durableObjectBindings: live.durableObjectBindings,
         updatedAt: nowIso(clock),

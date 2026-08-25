@@ -11,11 +11,14 @@ import {
   mintAsymmetricMaintenanceCapability,
   verifyMaintenanceReceipt,
 } from '@proofoftech/flowsafe/host-kit';
+import { ActiveRouteAttestationError } from './active-route.js';
 import {
   applicationSecretNames,
   applicationSecretValues,
 } from './application-bindings.js';
+import { isSha256 } from './deployment-context.js';
 import { WorkerDeploymentError } from './deployment-error.js';
+import { parseHostRoutingTarget } from './host-routing.js';
 import { readMaintenanceHealth } from './maintenance-health.js';
 import {
   applyMigrationsWithLedger,
@@ -39,6 +42,7 @@ import {
 import { assertProviderBindingIdentitiesMatchInspection } from './provider-binding-inventory.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
+  ActiveRouteAttestation,
   D1Migration,
   DatabaseExport,
   DatabaseReference,
@@ -344,6 +348,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
   readonly #hostRoutingKvId: string;
   readonly #auditQueueName?: string;
   readonly #maintenanceRequestTimeoutMs: number;
+  readonly #clock: () => number;
   readonly #platformProfileFor?: (
     spec: DeploymentSpec,
   ) => ExternalPlatformProfile;
@@ -359,6 +364,8 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
     readonly hostRoutingKvId: string;
     readonly auditQueueName?: string;
     readonly maintenanceRequestTimeoutMs?: number;
+    /** Stamps `observedAt` on an attestation. Injected so it can be pinned. */
+    readonly clock?: () => number;
     readonly platformProfileFor?: (
       spec: DeploymentSpec,
     ) => ExternalPlatformProfile;
@@ -389,6 +396,7 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
         'maintenanceRequestTimeoutMs must be a positive integer that fits the one-minute capability lifetime',
       );
     }
+    this.#clock = options.clock ?? Date.now;
     this.#platformProfileFor = options.platformProfileFor;
     if (
       !options.namespacedState?.dispatchNamespace ||
@@ -1824,6 +1832,69 @@ export class WorkersForPlatformsBackend implements ProvisioningBackend {
       desiredSpecDigest: live.desiredSpecDigest,
       schemaVersion: live.schemaVersion,
       maintenance,
+    };
+  }
+
+  /**
+   * Attest the release the hostname actually dispatches to.
+   *
+   * The chain starts at the routing entry rather than at
+   * `releaseScriptName(spec)`, and that ordering is the point: an immutable
+   * release is only live because the host route names it, so asking the
+   * expected release whether it exists proves nothing about what is serving.
+   * When the route names a different release — a rollback that landed, a
+   * promotion that did not — the attestation reports THAT release, and the
+   * caller comparing it against its own expectation is what fails closed.
+   *
+   * Host routing is eventually consistent, so a caller attesting straight after
+   * a promotion should go through the shared convergence helper rather than
+   * treating one stale read as drift.
+   */
+  async attestActiveRoute(
+    spec: DeploymentSpec,
+  ): Promise<ActiveRouteAttestation> {
+    const serialized = await this.#client.getHostRouting(
+      this.#hostRoutingKvId,
+      spec.routeHostname,
+    );
+    if (serialized === undefined) {
+      throw new ActiveRouteAttestationError(
+        `host route '${spec.routeHostname}' dispatches to no release`,
+        {},
+      );
+    }
+    let routed: import('./host-routing.js').HostRoutingTarget;
+    try {
+      routed = await parseHostRoutingTarget(serialized);
+    } catch (cause) {
+      throw new ActiveRouteAttestationError(
+        `host route '${spec.routeHostname}' is not a readable dispatch target`,
+        {},
+        { cause },
+      );
+    }
+    const live = await this.#inspectDispatchWorker(routed.scriptName);
+    if (!live) {
+      throw new ActiveRouteAttestationError(
+        `host route '${spec.routeHostname}' dispatches to absent release '${routed.scriptName}'`,
+        { routedScriptName: routed.scriptName },
+      );
+    }
+    if (!isSha256(live.desiredSpecDigest)) {
+      throw new ActiveRouteAttestationError(
+        `routed release '${routed.scriptName}' carries no fleet specification digest`,
+        {
+          routedScriptName: routed.scriptName,
+          artifactVersion: live.artifactVersion,
+        },
+      );
+    }
+    return {
+      specDigest: live.desiredSpecDigest,
+      artifactVersion: live.artifactVersion,
+      physicalScriptName: routed.scriptName,
+      source: 'dispatch-route',
+      observedAt: new Date(this.#clock()).toISOString(),
     };
   }
 

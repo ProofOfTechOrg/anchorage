@@ -181,6 +181,7 @@ try {
   await writeFile(
     join(consumerDirectory, 'consumer.ts'),
     `import {
+  ActiveRouteAttestationError,
   CloudflareProvisioningClient,
   D1CloudflareApiRateCoordinator,
   ProcessLocalCloudflareApiRateCoordinator,
@@ -188,17 +189,26 @@ try {
   WorkersForPlatformsBackend,
   WorkersForPlatformsBackendSwitchProvider,
   WranglerLoopBackend,
+  attestConvergedActiveRoute,
+  attestFleetRecordActiveRoute,
   auditFleetDrift,
   decommissionDeployment,
   forceDecommissionDeployment,
   deploymentSpecDigest,
   deriveStateEgressCredential,
+  fleetSettlementKey,
   provisionDeployment,
   validateDeploymentSpec,
+  type ActiveRouteAttestation,
+  type ActiveRouteExpectation,
   type CloudflareApiRateCoordinator,
   type DeploymentEgressPolicy,
+  type FleetSettlementContext,
+  type FleetSettlementEntry,
+  type FleetSettlementHost,
   type FleetStateDatabase,
   type InitialExecutionFenceState,
+  type ObservedActiveRoute,
   type SeedDeploymentIdentityOptions,
   type WorkersForPlatformsApi,
 } from '@proofoftech/fleet-control';
@@ -228,7 +238,33 @@ const lockedAtBirth: InitialExecutionFenceState = 'migration-locked';
 const seedOptions: SeedDeploymentIdentityOptions = {
   initialExecutionFenceState: lockedAtBirth,
 };
+// A consumer implementing its own ProvisioningBackend has to name the
+// attestation it returns, and a host reading one has to name what it compares
+// against, so both the result and the expectation are part of the surface.
+declare const routeAttestation: ActiveRouteAttestation;
+const routeExpectation: ActiveRouteExpectation = {
+  specDigest: routeAttestation.specDigest,
+  artifactVersion: routeAttestation.artifactVersion,
+};
+// The refusal's payload, which is what a host logs when a route cannot be
+// attested; unusable without its type.
+declare const observedRoute: ObservedActiveRoute;
+// A settling host is written entirely against these types: the callback shape,
+// the context it receives, and the entry it must switch on to interpret
+// \`prior\`. A consumer that cannot name all three cannot implement one.
+const settlementHost: FleetSettlementHost = {
+  async settle(context: FleetSettlementContext): Promise<void> {
+    const entry: FleetSettlementEntry = context.entry;
+    void entry;
+    void context.settlementKey;
+    void context.alreadySettled;
+    void context.attestation.physicalScriptName;
+    void context.target.specDigest;
+    void context.prior?.physicalScriptName;
+  },
+};
 
+void ActiveRouteAttestationError;
 void CloudflareProvisioningClient;
 void D1CloudflareApiRateCoordinator;
 void ProcessLocalCloudflareApiRateCoordinator;
@@ -237,12 +273,15 @@ void WorkersForPlatformsBackend;
 void WorkersForPlatformsBackendSwitchProvider;
 void WranglerLoopBackend;
 void StateEgress;
+void attestConvergedActiveRoute;
+void attestFleetRecordActiveRoute;
 void auditFleetDrift;
 void createEgressProxyFetch;
 void decommissionDeployment;
 void forceDecommissionDeployment;
 void deploymentSpecDigest;
 void deriveStateEgressCredential;
+void fleetSettlementKey;
 void provisionDeployment;
 void validateDeploymentSpec;
 void dispatchEnv;
@@ -255,6 +294,10 @@ void coordinator;
 void initialExecutionFenceState;
 void lockedAtBirth;
 void seedOptions;
+void routeAttestation;
+void routeExpectation;
+void observedRoute;
+void settlementHost;
 `,
   );
   await writeFile(

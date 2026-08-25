@@ -11,6 +11,7 @@ import {
   verifyAsymmetricMaintenanceCapability,
 } from '@proofoftech/flowsafe/host-kit';
 import { describe, expect, it, vi } from 'vitest';
+import { ActiveRouteAttestationError } from '../src/active-route.js';
 import { WorkerDeploymentError } from '../src/deployment-error.js';
 import {
   canonicalDeploymentEgressPolicy,
@@ -899,6 +900,32 @@ class FakeApi implements WorkersForPlatformsApi {
   async getScriptInventory(_namespaceId: string, scriptName: string) {
     return this.scriptInventories.get(scriptName);
   }
+}
+
+/** Pinned so an attestation is comparable by value, clock included. */
+const ATTESTED_AT = '2026-08-11T00:00:00.000Z';
+
+function hostRoutingTarget(scriptName: string) {
+  return {
+    scriptName,
+    tenantTag: deployment.tenantTag,
+    environment: deployment.environment,
+    ...canonicalDeploymentEgressPolicy({
+      policyId: externalPlatformResourceGroupId(deployment),
+      tenantTag: deployment.tenantTag,
+      environment: deployment.environment,
+      allowedHosts: ['api.example.com'],
+    }),
+  };
+}
+
+function attestingBackend(client: FakeApi): WorkersForPlatformsBackend {
+  return new WorkersForPlatformsBackend({
+    namespacedState: NAMESPACED_STATE,
+    client,
+    hostRoutingKvId: 'host-routing',
+    clock: () => Date.parse(ATTESTED_AT),
+  });
 }
 
 function healthResponse(): Response {
@@ -3109,6 +3136,99 @@ describe('WorkersForPlatformsBackend', () => {
     await expect(
       backend.assertDatabaseDetached(deployment, record, database, fence),
     ).resolves.toBeUndefined();
+  });
+
+  it('attests the release the host route dispatches to, not the expected one', async () => {
+    // #given a route left pointing at a release the current spec would not
+    // produce, which is exactly what a landed rollback or a promotion that
+    // never finished looks like from outside
+    const api = new FakeApi();
+    const routedScriptName = 'acme-production-superseded';
+    const routedSpecDigest = 'e'.repeat(64);
+    api.routeOwner = hostRoutingTarget(routedScriptName);
+    api.releaseDigests.set(routedScriptName, routedSpecDigest);
+    api.releaseArtifactVersions.set(routedScriptName, 'etag-superseded');
+    const backend = attestingBackend(api);
+
+    // #when the attestation is read
+    const attestation = await backend.attestActiveRoute(deployment);
+
+    // #then it reports what is routed, and never the release the spec expects
+    expect(attestation).toEqual({
+      specDigest: routedSpecDigest,
+      artifactVersion: 'etag-superseded',
+      physicalScriptName: routedScriptName,
+      source: 'dispatch-route',
+      observedAt: ATTESTED_AT,
+    });
+    expect(attestation.physicalScriptName).not.toBe(
+      externalReleaseScriptName(deployment),
+    );
+    expect(api.inspectedScriptNames).toEqual([routedScriptName]);
+  });
+
+  it('refuses to attest a hostname that dispatches nowhere', async () => {
+    // #given no host routing entry at all
+    const api = new FakeApi();
+    api.routeOwner = undefined;
+    const backend = attestingBackend(api);
+
+    // #when the attestation is read
+    const failure = await backend
+      .attestActiveRoute(deployment)
+      .catch((error: unknown) => error);
+
+    // #then it refuses, and never falls back to the expected release
+    expect(failure).toBeInstanceOf(ActiveRouteAttestationError);
+    expect((failure as ActiveRouteAttestationError).message).toContain(
+      'dispatches to no release',
+    );
+    expect((failure as ActiveRouteAttestationError).observed).toEqual({});
+    expect(api.inspectedScriptNames).toEqual([]);
+  });
+
+  it('refuses to attest a route pointing at an absent release', async () => {
+    // #given a route naming a release the provider no longer holds
+    const api = new FakeApi();
+    api.routeOwner = hostRoutingTarget('acme-production-deleted');
+    api.exists = false;
+    const backend = attestingBackend(api);
+
+    // #when the attestation is read
+    const failure = await backend
+      .attestActiveRoute(deployment)
+      .catch((error: unknown) => error);
+
+    // #then the refusal names the release the route claimed
+    expect(failure).toBeInstanceOf(ActiveRouteAttestationError);
+    expect((failure as ActiveRouteAttestationError).observed).toEqual({
+      routedScriptName: 'acme-production-deleted',
+    });
+  });
+
+  it('refuses to attest a routed release carrying no specification digest', async () => {
+    // #given a routed release whose fleet digest binding is missing
+    const api = new FakeApi();
+    const routedScriptName = 'acme-production-undigested';
+    api.routeOwner = hostRoutingTarget(routedScriptName);
+    api.releaseDigests.set(routedScriptName, '');
+    api.releaseArtifactVersions.set(routedScriptName, 'etag-undigested');
+    const backend = attestingBackend(api);
+
+    // #when the attestation is read
+    const failure = await backend
+      .attestActiveRoute(deployment)
+      .catch((error: unknown) => error);
+
+    // #then it refuses rather than attesting an unidentifiable artifact
+    expect(failure).toBeInstanceOf(ActiveRouteAttestationError);
+    expect((failure as ActiveRouteAttestationError).message).toContain(
+      'no fleet specification digest',
+    );
+    expect((failure as ActiveRouteAttestationError).observed).toEqual({
+      routedScriptName,
+      artifactVersion: 'etag-undigested',
+    });
   });
 });
 function providerBindingIdentitiesForTest(inspection: {

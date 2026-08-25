@@ -2,6 +2,7 @@
 
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
+import { ActiveRouteAttestationError } from '../src/active-route.js';
 import { canonicalApplicationBindings } from '../src/application-bindings.js';
 import type {
   BridgeMutationPlan,
@@ -26,13 +27,18 @@ import {
 } from '../src/platform-resources.js';
 import { providerBindingIdentitiesForInspection } from '../src/provider-binding-inventory.js';
 import { provisionDeployment } from '../src/provision.js';
+import { fleetSettlementKey } from '../src/settlement.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
 import type {
+  ActiveRouteAttestation,
   DatabaseReference,
   DeploymentSpec,
   ExternalMutationFence,
+  ExternalReleaseSnapshot,
   FleetRecord,
   FleetResourceInventory,
+  FleetSettlementContext,
+  FleetSettlementHost,
   FleetStateLease,
   FleetStateStore,
   LiveDeployment,
@@ -145,6 +151,9 @@ function spec(item: FleetRecord, schemaVersion = 2): DeploymentSpec {
   };
 }
 
+/** Pinned so an attestation these fakes return is comparable by value. */
+const ATTESTED_AT = '2026-08-11T00:00:00.000Z';
+
 const healthy: MaintenanceHealth = {
   armed: true,
   nextAlarmAt: 11_000,
@@ -157,6 +166,10 @@ class FleetBackend implements ProvisioningBackend {
   readonly immutableExternalArtifacts?: true;
   readonly calls: string[] = [];
   readonly live = new Map<string, LiveDeployment | undefined>();
+  /** What the route names per tenant, written by promotion. */
+  readonly routed = new Map<string, ActiveRouteAttestation>();
+  /** Strands the route on something else, to drive a settlement mismatch. */
+  routeDrift: ActiveRouteAttestation | undefined;
   failTenant: string | undefined;
   inspectFailureTenant: string | undefined;
   maintenanceFailureTenant: string | undefined;
@@ -352,11 +365,27 @@ class FleetBackend implements ProvisioningBackend {
     return { artifactVersion: `v${deployment.schemaVersion}`, created: false };
   }
 
+  // Promotion is what makes a release routed, here as in the provider, so the
+  // attestation below reads what promotion published rather than a value the
+  // fake was handed separately.
   async promoteWorker(
     deployment: DeploymentSpec,
     _guard: PromotionGuard,
+    _outboundPolicy?: FleetRecord['outboundPolicy'],
+    _fence?: unknown,
+    expectedArtifactVersion?: string,
   ): Promise<void> {
     this.calls.push(`promote:${deployment.tenantTag}`);
+    this.routed.set(deployment.tenantTag, {
+      specDigest: deploymentSpecDigest(deployment),
+      artifactVersion:
+        expectedArtifactVersion ??
+        this.live.get(deployment.tenantTag)?.artifactVersion ??
+        `v${deployment.schemaVersion}`,
+      physicalScriptName: deployment.scriptName,
+      source: 'workers-deployments',
+      observedAt: ATTESTED_AT,
+    });
   }
 
   async ensureMaintenance(
@@ -380,6 +409,21 @@ class FleetBackend implements ProvisioningBackend {
     if (!inspected) return undefined;
     const { providerBindingIdentities: _inventory, ...live } = inspected;
     return completeLiveDeployment(live);
+  }
+
+  async attestActiveRoute(
+    deployment: DeploymentSpec,
+  ): Promise<ActiveRouteAttestation> {
+    this.calls.push(`attest:${deployment.tenantTag}`);
+    const attestation =
+      this.routeDrift ?? this.routed.get(deployment.tenantTag);
+    if (!attestation) {
+      throw new ActiveRouteAttestationError(
+        `no deployment serves '${deployment.routeHostname}'`,
+        {},
+      );
+    }
+    return attestation;
   }
 
   async revokeCredentials(): Promise<void> {
@@ -417,6 +461,8 @@ class FleetBackend implements ProvisioningBackend {
 class FleetStore implements FleetStateStore {
   readonly records = new Map<string, FleetRecord>();
   readonly leases = new Set<string>();
+  /** Every accepted write, so a test can place one relative to a callback. */
+  readonly puts: FleetRecord[] = [];
   failNextReadyPut = false;
   failNextMigratingSchemaPut = false;
   failNextPutWhen:
@@ -479,6 +525,7 @@ class FleetStore implements FleetStateStore {
       throw new Error('state write failed after route promotion');
     }
     this.records.set(value.tenantTag, value);
+    this.puts.push(value);
   }
 
   async delete(tenantTag: string, _environment?: string): Promise<void> {
@@ -502,6 +549,9 @@ class ImmutableFleetBackend extends FleetBackend {
   override readonly immutableExternalArtifacts = true as const;
   readonly releases = new Map<string, LiveDeployment>();
   routedScriptName: string | undefined;
+  /** Answers this attestation before the real route, N reads long. */
+  staleRoute: ActiveRouteAttestation | undefined;
+  staleRouteReads = 0;
   invalidateCandidate = false;
   failNextRetirement = false;
   readonly retiredScriptNames: string[] = [];
@@ -584,6 +634,41 @@ class ImmutableFleetBackend extends FleetBackend {
     }
     this.routedScriptName = physical;
     this.lastPromotedPolicyHosts = outboundPolicy?.policyHosts;
+  }
+
+  // Attests the release the ROUTE names, not the one the spec expects, so a
+  // test can put the two out of step and see the attestation say so.
+  override async attestActiveRoute(
+    deployment: DeploymentSpec,
+  ): Promise<ActiveRouteAttestation> {
+    this.calls.push(`attest:${deployment.tenantTag}`);
+    if (this.routeDrift) return this.routeDrift;
+    if (this.staleRouteReads > 0) {
+      this.staleRouteReads -= 1;
+      const stale = this.staleRoute;
+      if (stale) return stale;
+    }
+    const routed = this.routedScriptName;
+    if (routed === undefined) {
+      throw new ActiveRouteAttestationError(
+        `host route '${deployment.routeHostname}' dispatches to no release`,
+        {},
+      );
+    }
+    const release = this.releases.get(routed);
+    if (!release) {
+      throw new ActiveRouteAttestationError(
+        `host route '${deployment.routeHostname}' dispatches to absent release '${routed}'`,
+        { routedScriptName: routed },
+      );
+    }
+    return {
+      specDigest: release.desiredSpecDigest,
+      artifactVersion: release.artifactVersion,
+      physicalScriptName: routed,
+      source: 'dispatch-route',
+      observedAt: ATTESTED_AT,
+    };
   }
 
   async deleteRetainedRelease(
@@ -3098,6 +3183,7 @@ describe('fleet operations', () => {
       },
     });
 
+    const rollbackHost = new RecordingSettlementHost(store);
     const rollback = () =>
       rollbackExternalRelease({
         store,
@@ -3109,6 +3195,7 @@ describe('fleet operations', () => {
           maintenanceAdmin: 'maintenance-admin-secret-value-00001',
           application: { API_ONE: initialSecret },
         },
+        settlement: rollbackHost,
       });
     const persistedRollback = backend.releases.get(activePhysicalScriptName);
     if (!persistedRollback)
@@ -3125,7 +3212,27 @@ describe('fleet operations', () => {
     await expect(rollback()).rejects.toThrow(/state write failed/);
     expect(backend.routedScriptName).toBe(activePhysicalScriptName);
     expect((await store.get('acme', 'production'))?.phase).toBe('rolling-back');
+    // The settle-succeeded-then-crashed window: traffic moved back and the
+    // host was told, but the write recording it was lost.
+    expect(rollbackHost.settlements).toHaveLength(1);
+    expect(
+      (await store.get('acme', 'production'))?.settledSettlementKey,
+    ).toBeUndefined();
     const rolledBack = await rollback();
+    // #then the re-entry re-delivers the SAME settlement, and still names the
+    // abandoned release as `prior` rather than the one it replaced.
+    expect(rollbackHost.settlements).toHaveLength(2);
+    expect(rollbackHost.settlements[1]?.settlementKey).toBe(
+      rollbackHost.settlements[0]?.settlementKey,
+    );
+    expect(
+      rollbackHost.settlements.map((context) => context.alreadySettled),
+    ).toEqual([false, false]);
+    expect(
+      rollbackHost.settlements.map(
+        (context) => context.prior?.physicalScriptName,
+      ),
+    ).toEqual([targetPhysicalScriptName, targetPhysicalScriptName]);
     expect(backend.routedScriptName).toBe(activePhysicalScriptName);
     expect(backend.lastPromotedPolicyHosts).toEqual(['api.example.com']);
     expect(rolledBack).toMatchObject({
@@ -3143,6 +3250,20 @@ describe('fleet operations', () => {
         releaseSchemaVersion: 2,
       },
     });
+    // `prior` on a reversal is the release traffic just LEFT, not the one it
+    // replaced: a host undoing its own effects has to undo the right ones.
+    expect(rollbackHost.settlements.at(-1)).toMatchObject({
+      entry: 'rollback',
+      target: { physicalScriptName: activePhysicalScriptName },
+      prior: {
+        physicalScriptName: targetPhysicalScriptName,
+        specDigest: deploymentSpecDigest(targetSpec),
+      },
+    });
+    expect(rollbackHost.leaseHeld.at(-1)).toBe(true);
+    expect(rolledBack.settledSettlementKey).toBe(
+      rollbackHost.settlements.at(-1)?.settlementKey,
+    );
 
     const deployCallsBeforeConvergence = backend.calls.filter((call) =>
       call.startsWith('deploy:'),
@@ -3604,5 +3725,495 @@ describe('fleet operations', () => {
       expect.objectContaining({ tenantTag: 'acme', artifactVersion: 'v1' }),
       expect.objectContaining({ tenantTag: 'beta', artifactVersion: 'v1' }),
     ]);
+  });
+});
+
+class RecordingSettlementHost implements FleetSettlementHost {
+  readonly settlements: FleetSettlementContext[] = [];
+  readonly leaseHeld: boolean[] = [];
+  readonly writesBefore: number[] = [];
+  throwOnce: string | undefined;
+  readonly #store: FleetStore;
+
+  constructor(store: FleetStore) {
+    this.#store = store;
+  }
+
+  async settle(context: FleetSettlementContext): Promise<void> {
+    this.settlements.push(context);
+    this.leaseHeld.push(
+      this.#store.leases.has(`${context.tenantTag}:${context.environment}`),
+    );
+    this.writesBefore.push(this.#store.puts.length);
+    if (this.throwOnce) {
+      const message = this.throwOnce;
+      this.throwOnce = undefined;
+      throw new Error(message);
+    }
+  }
+}
+
+/** A ready immutable deployment already serving the release it desires. */
+function readyImmutableFleet(): {
+  backend: ImmutableFleetBackend;
+  current: FleetRecord;
+  targetSpec: DeploymentSpec;
+  activeRelease: ExternalReleaseSnapshot;
+} {
+  const base = record('acme');
+  const targetSpec = spec(base, 1);
+  const backend = new ImmutableFleetBackend();
+  const platformTarget = backend.describeExternalPlatformTarget(targetSpec);
+  const activeRelease: ExternalReleaseSnapshot = {
+    physicalScriptName: externalReleaseScriptName(targetSpec),
+    specDigest: deploymentSpecDigest(targetSpec),
+    artifactVersion: 'etag:active',
+    releaseSchemaVersion: 1,
+  };
+  const current: FleetRecord = {
+    ...base,
+    schemaVersion: 1,
+    desiredSpecDigest: activeRelease.specDigest,
+    artifactVersion: activeRelease.artifactVersion,
+    activeRelease,
+    durableObjectBindings: [],
+    platformTarget,
+    outboundPolicy: platformTarget.outboundPolicy,
+    platformResources: {
+      maintenanceCapabilityPublicKey: MAINTENANCE_PUBLIC_KEY,
+      stateWorker: {
+        scriptName: externalStateScriptName(targetSpec),
+        artifactVersion: 'state-v1',
+        artifactDigest: platformTarget.stateArtifactDigest,
+        durableObjectBindings: [],
+        namespaceIds: [],
+      },
+      egressProxy: {
+        scriptName: externalEgressProxyScriptName(targetSpec),
+        artifactVersion: 'egress-v1',
+        artifactDigest: platformTarget.egressArtifactDigest,
+        ...platformTarget.outboundPolicy,
+      },
+    },
+  };
+  backend.releases.set(activeRelease.physicalScriptName, {
+    ...liveFor(current),
+    scriptName: activeRelease.physicalScriptName,
+    durableObjectBindings: [],
+    schemaVersion: 1,
+  });
+  backend.routedScriptName = activeRelease.physicalScriptName;
+  return { backend, current, targetSpec, activeRelease };
+}
+
+/** A ready immutable deployment whose PLATFORM profile has moved on. */
+function platformOnlyChangeFleet(): {
+  backend: ImmutableFleetBackend;
+  current: FleetRecord;
+  targetSpec: DeploymentSpec;
+} {
+  const base = record('acme');
+  const targetSpec = spec(base, 1);
+  const backend = new ImmutableFleetBackend();
+  const initialTarget = {
+    ...backend.describeExternalPlatformTarget(targetSpec),
+    d1SchemaVersion: 2,
+    d1SchemaHistoryDigest: 'f'.repeat(64),
+  };
+  const activeRelease: ExternalReleaseSnapshot = {
+    physicalScriptName: externalReleaseScriptName(targetSpec),
+    specDigest: deploymentSpecDigest(targetSpec),
+    artifactVersion: 'etag:active',
+    releaseSchemaVersion: 1,
+  };
+  const current: FleetRecord = {
+    ...base,
+    schemaVersion: 2,
+    desiredSpecDigest: activeRelease.specDigest,
+    artifactVersion: activeRelease.artifactVersion,
+    activeRelease,
+    durableObjectBindings: [],
+    platformTarget: initialTarget,
+    outboundPolicy: initialTarget.outboundPolicy,
+    platformResources: {
+      maintenanceCapabilityPublicKey: MAINTENANCE_PUBLIC_KEY,
+      stateWorker: {
+        scriptName: externalStateScriptName(targetSpec),
+        artifactVersion: 'state-v1',
+        artifactDigest: initialTarget.stateArtifactDigest,
+        durableObjectBindings: [],
+        namespaceIds: [],
+      },
+      egressProxy: {
+        scriptName: externalEgressProxyScriptName(targetSpec),
+        artifactVersion: 'egress-v1',
+        artifactDigest: initialTarget.egressArtifactDigest,
+        ...initialTarget.outboundPolicy,
+      },
+    },
+  };
+  backend.releases.set(activeRelease.physicalScriptName, {
+    ...liveFor(current),
+    scriptName: activeRelease.physicalScriptName,
+    durableObjectBindings: [],
+    schemaVersion: activeRelease.releaseSchemaVersion,
+  });
+  backend.routedScriptName = activeRelease.physicalScriptName;
+  backend.platformStateDigest = 'd'.repeat(64);
+  backend.platformPolicyHosts = ['narrow.example.com'];
+  return { backend, current, targetSpec };
+}
+
+function platformOnlyMigrate(
+  store: FleetStore,
+  backend: ImmutableFleetBackend,
+  current: FleetRecord,
+  targetSpec: DeploymentSpec,
+  host: FleetSettlementHost,
+): Promise<readonly FleetRecord[]> {
+  return migrateFleet({
+    store,
+    records: [current],
+    canaryTenantTags: [],
+    backendFor: () => backend,
+    specFor: () => targetSpec,
+    secretsFor: () => ({
+      deploymentIdentity: 'deployment-identity-secret-value-0001',
+      maintenanceAdmin: 'maintenance-admin-secret-value-00001',
+    }),
+    settlementFor: () => host,
+  });
+}
+
+describe('lease-held settlement', () => {
+  it('settles a migration after attestation and before the settling write', async () => {
+    // #given a plain deployment with a newer specification to migrate to
+    const acme = record('acme');
+    const backend = new FleetBackend();
+    const store = new FleetStore();
+    await store.put(acme);
+    const target = spec(acme, 2);
+    const host = new RecordingSettlementHost(store);
+
+    // #when the fleet migrates with a settling host
+    const [migrated] = await migrateFleet({
+      store,
+      records: [acme],
+      canaryTenantTags: [],
+      backendFor: () => backend,
+      specFor: () => target,
+      secretsFor: () => ({
+        deploymentIdentity: 'deployment-identity-secret-value-0001',
+        maintenanceAdmin: 'maintenance-admin-secret-value-00001',
+      }),
+      settlementFor: () => host,
+    });
+
+    // #then it settled once, while the lease was held, after the route was
+    // attested and before the write that records the settlement
+    expect(host.settlements).toHaveLength(1);
+    expect(host.leaseHeld).toEqual([true]);
+    expect(backend.calls.indexOf('attest:acme')).toBeGreaterThan(
+      backend.calls.indexOf('promote:acme'),
+    );
+    expect(host.writesBefore[0]).toBe(store.puts.length - 1);
+
+    const settlementKey = fleetSettlementKey({
+      tenantTag: 'acme',
+      environment: 'production',
+      specDigest: deploymentSpecDigest(target),
+      artifactVersion: 'v2',
+    });
+    expect(host.settlements[0]).toMatchObject({
+      tenantTag: 'acme',
+      environment: 'production',
+      entry: 'migration',
+      settlementKey,
+      alreadySettled: false,
+      attestation: { artifactVersion: 'v2', source: 'workers-deployments' },
+      target: { specDigest: deploymentSpecDigest(target) },
+    });
+    expect(migrated?.settledSettlementKey).toBe(settlementKey);
+  });
+
+  it('attests without a settling host, and refuses a route serving something else', async () => {
+    // #given a converge whose route was left on a foreign release, and no host
+    const { backend, current, targetSpec } = readyImmutableFleet();
+    const store = new FleetStore();
+    await store.put(current);
+    backend.routeDrift = {
+      specDigest: 'f'.repeat(64),
+      artifactVersion: 'etag:stranger',
+      physicalScriptName: 'acme-production-stranger',
+      source: 'dispatch-route',
+      observedAt: '2026-08-11T00:00:00.000Z',
+    };
+
+    // #when the fleet converges
+    const converge = migrateFleet({
+      store,
+      records: [current],
+      canaryTenantTags: [],
+      backendFor: () => backend,
+      specFor: () => targetSpec,
+      secretsFor: () => ({
+        deploymentIdentity: 'deployment-identity-secret-value-0001',
+        maintenanceAdmin: 'maintenance-admin-secret-value-00001',
+      }),
+      routeAttestation: { convergenceBudgetMs: 1, initialRetryDelayMs: 1 },
+    });
+
+    // #then attestation ran anyway and failed the converge closed
+    await expect(converge).rejects.toThrow(/did not converge/);
+    expect(backend.calls).toContain('attest:acme');
+  });
+
+  it('attests every routine converge but settles only the first', async () => {
+    // #given a ready deployment already serving what it desires
+    const { backend, current, targetSpec, activeRelease } =
+      readyImmutableFleet();
+    const store = new FleetStore();
+    await store.put(current);
+    const host = new RecordingSettlementHost(store);
+    const converge = (record_: FleetRecord) =>
+      migrateFleet({
+        store,
+        records: [record_],
+        canaryTenantTags: [],
+        backendFor: () => backend,
+        specFor: () => targetSpec,
+        secretsFor: () => ({
+          deploymentIdentity: 'deployment-identity-secret-value-0001',
+          maintenanceAdmin: 'maintenance-admin-secret-value-00001',
+        }),
+        settlementFor: () => host,
+      });
+
+    // #when the same unchanged deployment is reconciled twice
+    const [first] = await converge(current);
+    if (!first) throw new Error('convergence returned no record');
+    const writesAfterFirst = store.puts.length;
+    const [second] = await converge(first);
+
+    // #then the first settled, the second attested and did neither settle nor
+    // write — a fleet on a reconcile schedule settles once, not forever
+    expect(host.settlements).toHaveLength(1);
+    expect(host.settlements[0]).toMatchObject({
+      entry: 'ready-convergence',
+      alreadySettled: false,
+      target: { artifactVersion: activeRelease.artifactVersion },
+    });
+    expect(first.settledSettlementKey).toBe(host.settlements[0]?.settlementKey);
+    expect(second?.settledSettlementKey).toBe(first.settledSettlementKey);
+    expect(store.puts.length).toBe(writesAfterFirst);
+    expect(backend.calls.filter((call) => call === 'attest:acme')).toHaveLength(
+      2,
+    );
+  });
+
+  it('waits out a route that has not converged before settling', async () => {
+    // #given host routing answering once with the release just replaced
+    const { backend, current, targetSpec } = readyImmutableFleet();
+    const store = new FleetStore();
+    await store.put(current);
+    backend.staleRoute = {
+      specDigest: 'c'.repeat(64),
+      artifactVersion: 'etag:prior',
+      physicalScriptName: 'acme-production-prior',
+      source: 'dispatch-route',
+      observedAt: '2026-08-11T00:00:00.000Z',
+    };
+    backend.staleRouteReads = 1;
+    const host = new RecordingSettlementHost(store);
+
+    // #when the fleet converges
+    const [converged] = await migrateFleet({
+      store,
+      records: [current],
+      canaryTenantTags: [],
+      backendFor: () => backend,
+      specFor: () => targetSpec,
+      secretsFor: () => ({
+        deploymentIdentity: 'deployment-identity-secret-value-0001',
+        maintenanceAdmin: 'maintenance-admin-secret-value-00001',
+      }),
+      settlementFor: () => host,
+      routeAttestation: { initialRetryDelayMs: 1, maxRetryDelayMs: 1 },
+    });
+
+    // #then the stale read was waited out rather than read as drift
+    expect(backend.calls.filter((call) => call === 'attest:acme')).toHaveLength(
+      2,
+    );
+    expect(host.settlements).toHaveLength(1);
+    expect(converged?.settledSettlementKey).toBe(
+      host.settlements[0]?.settlementKey,
+    );
+  });
+
+  it('leaves a platform-only migration resumable when settlement throws', async () => {
+    // #given a platform profile change on a ready immutable deployment
+    const { backend, current, targetSpec } = platformOnlyChangeFleet();
+    const store = new FleetStore();
+    await store.put(current);
+    const host = new RecordingSettlementHost(store);
+    host.throwOnce = 'settlement ledger is unavailable';
+    const migrate = () =>
+      platformOnlyMigrate(store, backend, current, targetSpec, host);
+
+    // #when settlement throws, then the migration is re-entered
+    await expect(migrate()).rejects.toThrow(/settlement ledger is unavailable/);
+    const stranded = await store.get('acme', 'production');
+    const [settled] = await migrate();
+
+    // #then the throw left the migration where a retry resumes it, and the
+    // retry delivered the same settlement rather than a new one
+    expect(stranded).toMatchObject({
+      phase: 'migrating',
+      migrationIntent: { platformOnly: true, subphase: 'route-published' },
+    });
+    expect(stranded?.settledSettlementKey).toBeUndefined();
+    expect(host.settlements).toHaveLength(2);
+    expect(host.settlements[1]?.settlementKey).toBe(
+      host.settlements[0]?.settlementKey,
+    );
+    expect(host.settlements.map((context) => context.entry)).toEqual([
+      'platform-only',
+      'platform-only',
+    ]);
+    expect(settled?.settledSettlementKey).toBe(
+      host.settlements[0]?.settlementKey,
+    );
+  });
+
+  it('re-fires a platform-only settlement whose settling write was lost', async () => {
+    // #given a platform-only migration whose settlement SUCCEEDS and whose
+    // settling write is then lost — the window a throw cannot reach
+    const { backend, current, targetSpec } = platformOnlyChangeFleet();
+    const store = new FleetStore();
+    await store.put(current);
+    const host = new RecordingSettlementHost(store);
+    const migrate = () =>
+      platformOnlyMigrate(store, backend, current, targetSpec, host);
+    store.failNextReadyPut = true;
+
+    // #when the settling write is lost, then the migration is re-entered
+    await expect(migrate()).rejects.toThrow(/state write failed/);
+    const stranded = await store.get('acme', 'production');
+    const [settled] = await migrate();
+
+    // #then the host was told twice under one key, both times as a first
+    // delivery, because nothing durable ever recorded the first one
+    expect(stranded?.settledSettlementKey).toBeUndefined();
+    expect(host.settlements).toHaveLength(2);
+    expect(host.settlements[1]?.settlementKey).toBe(
+      host.settlements[0]?.settlementKey,
+    );
+    expect(host.settlements.map((context) => context.alreadySettled)).toEqual([
+      false,
+      false,
+    ]);
+    expect(settled?.settledSettlementKey).toBe(
+      host.settlements[0]?.settlementKey,
+    );
+  });
+
+  it('re-fires a migration settlement whose settling write was lost', async () => {
+    // #given a migration whose settlement succeeds and whose migrated write
+    // is then lost
+    const acme = record('acme');
+    const backend = new FleetBackend();
+    const store = new FleetStore();
+    await store.put(acme);
+    const target = spec(acme, 2);
+    const host = new RecordingSettlementHost(store);
+    const migrate = () =>
+      migrateFleet({
+        store,
+        records: [acme],
+        canaryTenantTags: [],
+        backendFor: () => backend,
+        specFor: () => target,
+        secretsFor: () => ({
+          deploymentIdentity: 'deployment-identity-secret-value-0001',
+          maintenanceAdmin: 'maintenance-admin-secret-value-00001',
+        }),
+        settlementFor: () => host,
+      });
+    store.failNextReadyPut = true;
+
+    // #when the settling write is lost, then the migration is re-entered
+    await expect(migrate()).rejects.toThrow(/state write failed/);
+    const stranded = await store.get('acme', 'production');
+    const [migrated] = await migrate();
+
+    // #then the same settlement is delivered again rather than a new one, and
+    // the retry reaches the ready state the lost write was carrying
+    expect(stranded?.phase).toBe('migrating');
+    expect(stranded?.settledSettlementKey).toBeUndefined();
+    expect(host.settlements).toHaveLength(2);
+    expect(host.settlements[1]?.settlementKey).toBe(
+      host.settlements[0]?.settlementKey,
+    );
+    expect(host.settlements.map((context) => context.alreadySettled)).toEqual([
+      false,
+      false,
+    ]);
+    expect(migrated).toMatchObject({
+      phase: 'ready',
+      settledSettlementKey: host.settlements[0]?.settlementKey,
+    });
+  });
+
+  it('re-fires a convergence settlement whose settling write was lost', async () => {
+    // #given a ready deployment whose convergence settles and whose added
+    // settling write is then lost
+    const { backend, current, targetSpec } = readyImmutableFleet();
+    const store = new FleetStore();
+    await store.put(current);
+    const host = new RecordingSettlementHost(store);
+    const converge = (from: FleetRecord) =>
+      migrateFleet({
+        store,
+        records: [from],
+        canaryTenantTags: [],
+        backendFor: () => backend,
+        specFor: () => targetSpec,
+        secretsFor: () => ({
+          deploymentIdentity: 'deployment-identity-secret-value-0001',
+          maintenanceAdmin: 'maintenance-admin-secret-value-00001',
+        }),
+        settlementFor: () => host,
+      });
+    store.failNextPutWhen = (next) =>
+      next.settledSettlementKey
+        ? 'state write failed after settlement'
+        : undefined;
+
+    // #when the settling write is lost, then the deployment is reconciled
+    // twice more
+    await expect(converge(current)).rejects.toThrow(/after settlement/);
+    const stranded = await store.get('acme', 'production');
+    const [recovered] = await converge(current);
+    if (!recovered) throw new Error('convergence returned no record');
+    const writesAfterRecovery = store.puts.length;
+    await converge(recovered);
+
+    // #then the lost write meant the settlement re-fired under the same key,
+    // and once it was recorded the next reconcile settled nothing and wrote
+    // nothing at all
+    expect(stranded?.settledSettlementKey).toBeUndefined();
+    expect(host.settlements).toHaveLength(2);
+    expect(host.settlements[1]?.settlementKey).toBe(
+      host.settlements[0]?.settlementKey,
+    );
+    expect(host.settlements.map((context) => context.alreadySettled)).toEqual([
+      false,
+      false,
+    ]);
+    expect(recovered.settledSettlementKey).toBe(
+      host.settlements[0]?.settlementKey,
+    );
+    expect(store.puts.length).toBe(writesAfterRecovery);
   });
 });

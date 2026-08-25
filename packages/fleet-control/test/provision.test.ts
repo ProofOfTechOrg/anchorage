@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from 'vitest';
+import { ActiveRouteAttestationError } from '../src/active-route.js';
 import type {
   BridgeMutationPlan,
   BridgeSnapshot,
@@ -26,6 +27,7 @@ import {
 } from '../src/provision.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
 import type {
+  ActiveRouteAttestation,
   ApplicationR2BucketSnapshot,
   ApplicationR2Resource,
   DatabaseReference,
@@ -185,6 +187,9 @@ class CommitThenThrowStore extends MemoryStore {
   }
 }
 
+/** Pinned so an attestation these fakes return is comparable by value. */
+const ATTESTED_AT = '2026-08-11T00:00:00.000Z';
+
 const maintenance: MaintenanceHealth = {
   armed: true,
   nextAlarmAt: 2_000,
@@ -199,6 +204,8 @@ class FakeBackend implements ProvisioningBackend {
   failAt: string | undefined;
   cleanupFailAt: string | undefined;
   live: LiveDeployment | undefined;
+  /** Strands the route on something else; unset attests the live deployment. */
+  activeRoute: ActiveRouteAttestation | undefined;
   exportLocation = 'r2://fleet-exports/acme.sql';
   databaseExists = false;
   databaseId = 'database-id';
@@ -470,6 +477,31 @@ class FakeBackend implements ProvisioningBackend {
     if (!this.live) return undefined;
     const { providerBindingIdentities: _inventory, ...live } = this.live;
     return completeLiveDeployment(live);
+  }
+
+  async attestActiveRoute(
+    deployment: DeploymentSpec,
+  ): Promise<ActiveRouteAttestation> {
+    this.#event('attest');
+    const live = this.live;
+    const attestation =
+      this.activeRoute ??
+      (live
+        ? {
+            specDigest: live.desiredSpecDigest,
+            artifactVersion: live.artifactVersion,
+            physicalScriptName: live.scriptName,
+            source: 'workers-deployments' as const,
+            observedAt: ATTESTED_AT,
+          }
+        : undefined);
+    if (!attestation) {
+      throw new ActiveRouteAttestationError(
+        `nothing serves '${deployment.routeHostname}'`,
+        {},
+      );
+    }
+    return attestation;
   }
 
   async removeTraffic(
@@ -785,6 +817,9 @@ describe('fleet provisioning', () => {
       'inspect',
       'promote',
       'inspect',
+      // The ready commit records what is ROUTED, so the last provider read on
+      // the create path is the attestation, after the promotion, not before.
+      'attest',
     ]);
     expect(result.record).toMatchObject({
       phase: 'ready',
@@ -809,6 +844,55 @@ describe('fleet provisioning', () => {
       'ready',
     ]);
     expect(backend.seededFenceStates).toEqual(['open']);
+  });
+
+  it('commits the routed artifact version, and refuses when it is foreign', async () => {
+    // #given a first deploy whose route ends up serving a different artifact
+    const backend = new FakeBackend();
+    const store = new MemoryStore();
+    backend.activeRoute = {
+      specDigest: deploymentSpecDigest(spec()),
+      artifactVersion: 'artifact-someone-else-promoted',
+      physicalScriptName: 'acme-production',
+      source: 'workers-deployments',
+      observedAt: ATTESTED_AT,
+    };
+
+    // #when the deployment is provisioned
+    const provision = provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+      clock: () => 1_000,
+      routeAttestation: { convergenceBudgetMs: 1, initialRetryDelayMs: 1 },
+    });
+
+    // #then the ready commit refuses rather than recording a version this
+    // deployment uploaded as the version it serves, and leaves the deployment
+    // in the phase a retry resumes from
+    const failure = await provision.catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(ProvisioningError);
+    expect(String((failure as ProvisioningError).cause)).toMatch(
+      /did not converge/,
+    );
+    expect(store.record?.phase).toBe('publishing');
+
+    // #and once the route serves the deployed artifact, that is what commits
+    backend.activeRoute = undefined;
+    const settled = await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+      clock: () => 1_000,
+    });
+    expect(settled.record).toMatchObject({
+      phase: 'ready',
+      artifactVersion: 'artifact-v3',
+    });
   });
 
   it('provisions a migration target already locked, exactly once', async () => {

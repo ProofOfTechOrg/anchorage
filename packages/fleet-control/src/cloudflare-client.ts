@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import Cloudflare from 'cloudflare';
 import { toFile } from 'cloudflare/uploads';
 import PQueue from 'p-queue';
+import { ActiveRouteAttestationError } from './active-route.js';
 import { canonicalApplicationBindings } from './application-bindings.js';
 import type { CloudflareApiRateCoordinator } from './cloudflare-rate-coordinator.js';
 import {
@@ -126,15 +127,17 @@ export interface OrdinaryWorkerFootprint {
 const SCRIPT_INVENTORY_PREFIX = '__anchorage_script__:';
 const FLEET_SCRIPT_TAG = 'fleet:anchorage';
 
+type ProviderDeployment =
+  | Readonly<{
+      versions?: readonly Readonly<{
+        percentage?: unknown;
+        version_id?: unknown;
+      }>[];
+    }>
+  | undefined;
+
 function exactActiveVersionId(
-  deployment:
-    | Readonly<{
-        versions?: readonly Readonly<{
-          percentage?: unknown;
-          version_id?: unknown;
-        }>[];
-      }>
-    | undefined,
+  deployment: ProviderDeployment,
   context: string,
 ): string {
   if (!deployment || !Array.isArray(deployment.versions)) {
@@ -163,6 +166,52 @@ function exactActiveVersionId(
     );
   }
   return onlyVersion.version_id;
+}
+
+/**
+ * The traffic split as the provider reported it, for a refusal to carry. Only
+ * well-formed entries survive: a malformed one is exactly what
+ * `exactActiveVersionId` already refused over, and inventing a shape for it
+ * would put a fabricated percentage into an operator-facing error.
+ */
+function observedTrafficSplit(
+  deployment: ProviderDeployment,
+): readonly Readonly<{ artifactVersion: string; percentage: number }>[] {
+  return (deployment?.versions ?? []).flatMap((version) =>
+    typeof version.version_id === 'string' &&
+    typeof version.percentage === 'number' &&
+    Number.isFinite(version.percentage)
+      ? [
+          {
+            artifactVersion: version.version_id,
+            percentage: version.percentage,
+          },
+        ]
+      : [],
+  );
+}
+
+/**
+ * `exactActiveVersionId` with its refusal restated as an attestation refusal
+ * carrying the split. The rule is unchanged and deliberately not relaxed: one
+ * version at 100% or nothing, never the version with the largest share.
+ */
+function attestedActiveVersionId(
+  deployment: ProviderDeployment,
+  scriptName: string,
+): string {
+  try {
+    return exactActiveVersionId(deployment, `ordinary Worker '${scriptName}'`);
+  } catch (cause) {
+    throw new ActiveRouteAttestationError(
+      cause instanceof Error ? cause.message : String(cause),
+      {
+        routedScriptName: scriptName,
+        trafficSplit: observedTrafficSplit(deployment),
+      },
+      { cause },
+    );
+  }
 }
 
 function tagValue(tags: readonly string[], prefix: string): string | undefined {
@@ -2471,6 +2520,47 @@ export class CloudflareProvisioningClient {
         }
       }),
     );
+  }
+
+  async inspectActiveWorkerRoute(scriptName: string): Promise<
+    | Readonly<{
+        artifactVersion: string;
+        specDigest: string | undefined;
+      }>
+    | undefined
+  > {
+    return this.#schedule(async () => {
+      let deploymentList: Awaited<
+        ReturnType<CloudflareSdk['workers']['scripts']['deployments']['list']>
+      >;
+      try {
+        deploymentList = await this.#client.workers.scripts.deployments.list(
+          scriptName,
+          { account_id: this.#accountId },
+        );
+      } catch (error) {
+        if (isNotFound(error)) return undefined;
+        throw error;
+      }
+      const artifactVersion = attestedActiveVersionId(
+        deploymentList.deployments[0],
+        scriptName,
+      );
+      const version = await this.#client.workers.scripts.versions.get(
+        artifactVersion,
+        { account_id: this.#accountId, script_name: scriptName },
+      );
+      const specDigest = (version.resources.bindings ?? []).flatMap(
+        (binding) =>
+          binding.type === 'plain_text' && binding.name === 'FLEET_SPEC_DIGEST'
+            ? [binding.text]
+            : [],
+      )[0];
+      return {
+        artifactVersion,
+        specDigest: typeof specDigest === 'string' ? specDigest : undefined,
+      };
+    });
   }
 
   async inspectOrdinaryWorkerFootprint(
