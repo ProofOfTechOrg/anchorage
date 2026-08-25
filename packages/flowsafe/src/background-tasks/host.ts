@@ -16,10 +16,9 @@
 // starting workers first guarantees that the workflow event has a subscriber.
 // Its workflow step resolves the executor by tool name via the re-registered
 // static registry: the cross-process path core ships `registerStaticExecutor`
-// for this. The DO ALARM WAKES an evicted DO so
-// this happens without waiting for a request. No private method is ever called;
-// the seam is `registerStaticExecutor` + `startWorkers()` + `init(pubsub)`, all
-// public.
+// for this. The DO ALARM WAKES an evicted DO so this happens without waiting
+// for a request. No private method is ever called; the seam is
+// `registerStaticExecutor` + `startWorkers()` + `init(pubsub)`, all public.
 //
 // THE FENCE SPLITS THAT SEAM IN TWO. `registerStaticExecutor` claims
 // nothing and always runs; `startWorkers()` + `init(pubsub)` are what make this

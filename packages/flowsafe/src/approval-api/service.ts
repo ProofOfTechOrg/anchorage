@@ -1406,8 +1406,7 @@ export async function sweepSLA(
   // (createdAt, id); escalating a record only drops it from the pending/claimed
   // filter and never changes its cursor position. Every currently-open record
   // is visited exactly once — no skips, no repeats — and every breach as of
-  // `at` still
-  // escalates regardless of where it sits in FIFO order.
+  // `at` still escalates regardless of where it sits in FIFO order.
   let after: string | undefined;
   for (;;) {
     const page = await store.list({
