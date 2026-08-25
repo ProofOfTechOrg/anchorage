@@ -961,7 +961,7 @@ export class RunnerRuntime {
   readonly #terminalAbortIntents = new Map<string, RunTerminalStatus>();
   readonly #lifecycleLocks = new Map<string, Promise<unknown>>();
   // The host DO's pubsub identity (RunnerRuntimeOptions.pubsub), threaded into
-  // both createRun sites below (CI-M-002-002) so a configured host publishes and
+  // both createRun sites below so a configured host publishes and
   // replays on ONE shared feed. Undefined ⇒ core defaults a fresh emitter per
   // run ⇒ byte-identical to before this seam existed.
   readonly #pubsub?: HostPubSub;
@@ -1149,7 +1149,7 @@ export class RunnerRuntime {
     // (durable-object.ts readJson), and RegExp.test() coerces its argument to a
     // String — so a numeric runId like 123 would pass the pattern as "123" yet
     // mint a run keyed by the number 123, unreachable by the string "123" the
-    // URL path later carries. There is NO generation fallback (INV-1): a
+    // URL path later carries. There is NO generation fallback: a
     // missing/null runId is a client error, not a request for one.
     if (!isPathSafeId(options.runId)) {
       throw new InvalidRunRequestError(
@@ -1221,7 +1221,7 @@ export class RunnerRuntime {
         options.storedRequestContext,
         lifecycle,
       );
-      // Thread the host DO's pubsub identity into the run (CI-M-002-002). Core
+      // Thread the host DO's pubsub identity into the run. Core
       // accepts `createRun({ runId, pubsub })` at every one of its OWN call
       // sites (agent/durable index.js:5224/5541) and stamps it straight onto
       // `new Run({ ..., pubsub: options?.pubsub })`, defaulting a FRESH
@@ -1349,7 +1349,7 @@ export class RunnerRuntime {
             new RequestContext(Object.entries(preparationValues)),
           );
         }
-        // Same host pubsub identity as start() (CI-M-002-002) — see the note
+        // Same host pubsub identity as start() — see the note
         // there; undefined stays byte-identical to `createRun({ runId })`.
         run = await workflow.createRun({ runId, pubsub: this.#pubsub });
         await this.#withLifecycleLock(workflowId, runId, async () => {

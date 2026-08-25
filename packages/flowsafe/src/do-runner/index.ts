@@ -132,6 +132,8 @@ export {
   // OPEN_EXECUTION_FENCE is deliberately NOT exported: `readExecutionFence`
   // is the only supported way to resolve an absent fence, so no consumer can
   // hand-roll a ternary that gets the open case subtly wrong.
+  // EXECUTION_FENCE_SUSPEND_KEY is deliberately NOT exported here; it is
+  // published only from `./background-tasks`, whose host stamps and reads it.
   readExecutionFence,
 } from './execution-fence.js';
 export { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
@@ -226,7 +228,12 @@ export type {
 export { resolveScheduleStartOwner } from './schedule-source.js';
 // Owner-bound idempotent start (docs/do-runner-design.md): the reservation that
 // makes a retried start converge onto the run it already made instead of paying
-// for a second one, and the five-code taxonomy that says which of those it did.
+// for a second one. Its eight structured reasons are five decision refusals —
+// IDEMPOTENT_START_OWNER_MISMATCH (403), IDEMPOTENT_START_TARGET_MISMATCH
+// (409), IDEMPOTENT_START_PENDING (503), IDEMPOTENT_START_UNRESOLVABLE (409),
+// and IDEMPOTENT_START_ALREADY_SETTLED (409) — plus
+// IDEMPOTENT_START_UNSUPPORTED (503), INVALID_START_IDEMPOTENCY_REQUEST (400),
+// and IDEMPOTENT_START_UNREADABLE (503).
 //
 // START_IDEMPOTENCY_DDL and the two index statements are exported for the drain
 // inventory and for a host that owns its own migrations; the table NAME rides

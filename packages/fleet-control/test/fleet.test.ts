@@ -4102,8 +4102,12 @@ describe('lease-held settlement', () => {
     const stranded = await store.get('acme', 'production');
     const [settled] = await migrate();
 
-    // #then the host was told twice under one key, both times as a first
-    // delivery, because nothing durable ever recorded the first one
+    // #then the lost write left the migration re-enterable, and both deliveries
+    // carry alreadySettled: false because neither settling write was durable
+    expect(stranded).toMatchObject({
+      phase: 'migrating',
+      migrationIntent: { platformOnly: true, subphase: 'route-published' },
+    });
     expect(stranded?.settledSettlementKey).toBeUndefined();
     expect(host.settlements).toHaveLength(2);
     expect(host.settlements[1]?.settlementKey).toBe(

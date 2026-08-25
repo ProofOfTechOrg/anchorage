@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track B host wiring + the B-S2 recovery seam (R-002 pin: the PUBLIC async
+// Background-task host wiring + the recovery seam (the PUBLIC async
 // init(pubsub) fires recoverStaleTasks internally — no private method is
 // called). Execution-mode recovery is proven over the serialized, deployment-bound
 // D1 domains: workers subscribe before init publishes the recovered dispatch,
@@ -156,7 +156,7 @@ describe('BackgroundTaskHost — wiring', () => {
     ).not.toThrow();
   });
 
-  it('boot() re-registers the static executors (survives DO eviction, DL-015)', async () => {
+  it('boot() re-registers the static executors (survives DO eviction)', async () => {
     // #given
     const executed: unknown[] = [];
     const executor: ToolExecutor = {
@@ -227,8 +227,8 @@ describe('BackgroundTaskHost — wiring', () => {
     // #given — a task left 'running' WITH retry budget, so recovery re-queues it
     // (the maxRetries>0 branch, distinct from the maxRetries=0 -> failed branch).
     // globalConcurrency:0 makes checkConcurrency refuse the re-dispatch, freezing
-    // the task at the pending hand-off so the transition is observable WITHOUT the
-    // R-B2-blocked execution re-dispatching it straight back to running.
+    // the task at the pending hand-off so the transition is observable WITHOUT
+    // the executor re-dispatching the blocked task straight back to running.
     const storage = new InMemoryStore();
     const mastra = new Mastra({ storage });
     const store = await backgroundTasksStore(mastra);
@@ -660,7 +660,7 @@ describe('BackgroundTaskHost — execution lifecycle', () => {
   });
 });
 
-describe('BackgroundTaskHost — on D1 (R-B1: persistence + recovery seam, no body execution)', () => {
+describe('BackgroundTaskHost — D1 persistence and recovery without body execution', () => {
   let storage: MastraCompositeStore;
 
   beforeEach(async () => {
@@ -679,7 +679,7 @@ describe('BackgroundTaskHost — on D1 (R-B1: persistence + recovery seam, no bo
     // #when
     await host.boot();
 
-    // #then — the R-B1 limitation is loud, not a stray async throw at dispatch
+    // #then — the D1 execution limitation is loud, not a stray dispatch throw
     expect(warn).toHaveBeenCalledWith(
       expect.stringContaining('concurrent updates'),
     );
@@ -716,7 +716,7 @@ describe('BackgroundTaskHost — on D1 (R-B1: persistence + recovery seam, no bo
     // #when
     await store.createTask(baseTask({ id: 'persisted', status: 'suspended' }));
 
-    // #then — durable persistence works on D1 regardless of execution (R-B1)
+    // #then — durable persistence works on D1 regardless of execution
     const got = await store.getTask('persisted');
     expect(got?.id).toBe('persisted');
     expect(got?.status).toBe('suspended');

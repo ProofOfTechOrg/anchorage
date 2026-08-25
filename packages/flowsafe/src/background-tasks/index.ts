@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track B (M-003) — background tasks. Subpath-only (`@proofoftech/flowsafe/
-// background-tasks`), like agent-runner: host-side wiring a consumer opts into,
-// not part of the root barrel. The completedAt TTL cleanup lives in do-runner
-// (coupled there to the schema guard) and is
-// re-exported here for a single import surface.
+// Background tasks. Subpath-only (`@proofoftech/flowsafe/background-tasks`),
+// like agent-runner: host-side wiring a consumer opts into, not part of the
+// root barrel. The completedAt TTL cleanup lives in do-runner, coupled there to
+// the schema guard, and is re-exported here for a single import surface.
 
 export type {
   CreateBackgroundTaskD1DomainsOptions,

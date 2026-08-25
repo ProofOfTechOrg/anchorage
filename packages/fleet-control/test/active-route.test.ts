@@ -213,6 +213,9 @@ describe('attestConvergedActiveRoute', () => {
       artifactVersion: 'etag-prior',
       specDigest: PRIOR_DIGEST,
     });
+    expect((failure as ActiveRouteAttestationError).message).toContain(
+      "still routes artifact 'etag-prior' of 'acme-production-prior'",
+    );
     expect(scripted.reads).toHaveLength(10);
     expect(timeline.slept).toEqual([
       1_000, 2_000, 4_000, 8_000, 8_000, 8_000, 8_000, 8_000, 8_000,
@@ -242,11 +245,10 @@ describe('attestConvergedActiveRoute', () => {
 
   it('fails closed carrying the last refusal when none ever succeeds', async () => {
     // #given a hostname that never routes anywhere
+    const observed = { routedScriptName: 'acme-production-dispatch' };
     const unrouted = new ActiveRouteAttestationError(
       'dispatches to no release',
-      {
-        routedScriptName: undefined,
-      },
+      observed,
     );
     const { backend } = backendOf([unrouted]);
     const timeline = fakeTimeline();
@@ -264,9 +266,82 @@ describe('attestConvergedActiveRoute', () => {
     expect(
       (failure as ActiveRouteAttestationError).attestation,
     ).toBeUndefined();
+    expect((failure as ActiveRouteAttestationError).observed).toBe(observed);
     expect((failure as ActiveRouteAttestationError).cause).toBe(unrouted);
     expect((failure as ActiveRouteAttestationError).message).toContain(
-      'did not converge',
+      'dispatches to no release',
+    );
+    expect((failure as ActiveRouteAttestationError).message).not.toContain(
+      'still routes artifact',
+    );
+  });
+
+  it('reports the last different release after earlier refusals', async () => {
+    // #given initial reads that cannot attest, followed by a routed old release
+    const refusal = new ActiveRouteAttestationError(
+      'dispatches to no release',
+      {},
+    );
+    const stale = attestation({
+      specDigest: PRIOR_DIGEST,
+      artifactVersion: 'etag-prior',
+      physicalScriptName: 'acme-production-prior',
+    });
+    const { backend } = backendOf([refusal, refusal, stale]);
+
+    // #when the route never reaches the expected release within the budget
+    const failure = await attestConvergedActiveRoute(
+      backend,
+      spec,
+      { specDigest: TARGET_DIGEST, artifactVersion: 'etag-target' },
+      fakeTimeline(),
+    ).catch((error: unknown) => error);
+
+    // #then the final complete observation determines the message shape
+    expect(failure).toBeInstanceOf(ActiveRouteAttestationError);
+    expect((failure as ActiveRouteAttestationError).message).toContain(
+      "still routes artifact 'etag-prior' of 'acme-production-prior'",
+    );
+    expect((failure as ActiveRouteAttestationError).message).not.toContain(
+      'dispatches to no release',
+    );
+    expect((failure as ActiveRouteAttestationError).attestation).toBe(stale);
+  });
+
+  it('reports the last refusal after an earlier stale release', async () => {
+    // #given a stale release followed by a route that remains unavailable
+    const stale = attestation({
+      specDigest: PRIOR_DIGEST,
+      artifactVersion: 'etag-prior',
+      physicalScriptName: 'acme-production-prior',
+    });
+    const observed = { routedScriptName: 'acme-production-dispatch' };
+    const refusal = new ActiveRouteAttestationError(
+      'dispatches to no release',
+      observed,
+    );
+    const { backend } = backendOf([stale, refusal]);
+
+    // #when refusals occupy the rest of the convergence budget
+    const failure = await attestConvergedActiveRoute(
+      backend,
+      spec,
+      { specDigest: TARGET_DIGEST, artifactVersion: 'etag-target' },
+      fakeTimeline(),
+    ).catch((error: unknown) => error);
+
+    // #then the final refusal replaces the stale complete observation
+    expect(failure).toBeInstanceOf(ActiveRouteAttestationError);
+    expect((failure as ActiveRouteAttestationError).cause).toBe(refusal);
+    expect(
+      (failure as ActiveRouteAttestationError).attestation,
+    ).toBeUndefined();
+    expect((failure as ActiveRouteAttestationError).observed).toBe(observed);
+    expect((failure as ActiveRouteAttestationError).message).toContain(
+      'dispatches to no release',
+    );
+    expect((failure as ActiveRouteAttestationError).message).not.toContain(
+      'etag-prior',
     );
   });
 

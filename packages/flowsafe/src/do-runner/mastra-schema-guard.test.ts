@@ -8,10 +8,10 @@
 //    MASTRA_TABLES names. A dependency bump that adds or renames one must make
 //    its lifecycle decision explicit here.
 //
-//    The inventory is a STRUCTURE, not a name list (DL-003): each entry states
-//    whether the product adopts that table and how its rows expire. A
-//    @mastra/core bump changing the inventory must fail CI and reopen the
-//    persistence review, never silently ship.
+//    The inventory is a STRUCTURE, not a name list: each entry states whether
+//    the product adopts that table and how its rows expire. A @mastra/core bump
+//    changing the inventory must fail CI, reopen the persistence review, and
+//    never ship silently.
 //
 // 2. SCHEMA GUARD — retention jobs and app-owned indexes depend on Mastra's
 //    column names and encodings. A @mastra/core bump renaming any of them must
@@ -140,13 +140,22 @@ type StorageOwnership = 'deployment-wide' | 'unadopted';
 type RetentionStory =
   | { kind: 'run-ttl' }
   | { kind: 'thread-ttl' }
-  /** Track B: rows expire via purgeExpiredBackgroundTasks (completedAt TTL). */
+  /**
+   * Background-task rows expire via purgeExpiredBackgroundTasks (completedAt
+   * TTL).
+   */
   | { kind: 'background-task-ttl' }
-  /** Track C: agent-inbox rows expire via purgeExpiredNotifications (terminal + updatedAt TTL). */
+  /**
+   * Agent-inbox rows expire via purgeExpiredNotifications (terminal + updatedAt
+   * TTL).
+   */
   | { kind: 'notification-ttl' }
-  /** Track C: thread-state rows expire via purgeExpiredThreadState (updatedAt TTL). */
+  /** Thread-state rows expire via purgeExpiredThreadState (updatedAt TTL). */
   | { kind: 'thread-state-ttl' }
-  /** Track D: schedule-trigger history expires via purgeExpiredScheduleTriggers (actualFireAt TTL). */
+  /**
+   * Schedule-trigger history expires via purgeExpiredScheduleTriggers
+   * (actualFireAt TTL).
+   */
   | { kind: 'schedule-trigger-ttl' }
   /** Rows die with their parent's TTL rather than aging out on their own. */
   | { kind: 'cascade'; with: string }
@@ -166,7 +175,7 @@ describe('Mastra persistence guards (D1Store SQL over node:sqlite)', () => {
   // biconditional below can tie them: an unadopted table has nothing to expire
   // BECAUSE nothing writes it, so it carries exactly this, and the day a track
   // becomes deployment-wide the tie forces retention off this
-  // boilerplate in the SAME change (the DL-003 "all three legs together" bar).
+  // boilerplate in the SAME change (the "all three legs together" bar).
   const UNADOPTED_NO_RETENTION =
     'unadopted — no feature writes it, so there is nothing to expire yet';
 
@@ -222,7 +231,7 @@ describe('Mastra persistence guards (D1Store SQL over node:sqlite)', () => {
           'per-owner working memory: state the migration copies wholesale. It is never in flight, so there is nothing here for a drain to finish and no reading of it that could ever reach empty.',
       },
     },
-    // Track D tables. Sorted:
+    // Schedule tables. Sorted:
     // 'mastra_schedule_triggers' precedes 'mastra_schedules' under BINARY
     // collation ('_' 0x5F < 's' 0x73, the same order 'mastra_thread_state' <
     // 'mastra_threads' takes), and both precede 'mastra_scorers' ('sch' < 'sco').
@@ -281,7 +290,7 @@ describe('Mastra persistence guards (D1Store SQL over node:sqlite)', () => {
   ];
 
   it('createD1Storage creates exactly the declared deployment inventory', async () => {
-    // #given — the real storage adapter over sqlite, WITH the Track C signal
+    // #given — the real storage adapter over sqlite, WITH the signal
     // domains composed (createD1Storage takes them injected — signals/ imports
     // do-runner, so do-runner cannot import back). @mastra/cloudflare-d1 ships no
     // notifications/thread-state domain, so those two tables come from the
@@ -599,7 +608,7 @@ describe('Mastra persistence guards (D1Store SQL over node:sqlite)', () => {
     }
   });
 
-  it('the Track D schedule tables keep the columns their purge + tick ride on (metadata + nextFireAt/actualFireAt)', async () => {
+  it('the schedule tables keep the columns their purge + tick ride on (metadata + nextFireAt/actualFireAt)', async () => {
     // #given — flowsafe-owned tables (the adapter ships neither); compose the
     // schedules domain and init to create them.
     const sqlite = openSqlite();
@@ -692,8 +701,8 @@ describe('Mastra persistence guards (D1Store SQL over node:sqlite)', () => {
     expect(columns).toContain('workflow_name');
   });
 
-  it('mastra_background_tasks keeps the columns Track B purges ride on (run_id range + completedAt/status TTL)', async () => {
-    // #given — the real adapter creates the table eagerly (Track B adopted it)
+  it('mastra_background_tasks keeps the columns its purges ride on (run_id range + completedAt/status TTL)', async () => {
+    // #given — the real adapter creates the table eagerly
     const sqlite = openSqlite();
     const storage = createD1Storage({
       binding: sqliteUnitDatabase(sqlite) as never,
@@ -715,7 +724,7 @@ describe('Mastra persistence guards (D1Store SQL over node:sqlite)', () => {
     expect(columns).toContain('completedAt');
   });
 
-  it('the Track C signal tables keep the columns their purges ride on (thread_id range + status/updatedAt TTL)', async () => {
+  it('the signal tables keep the columns their purges ride on (thread_id range + status/updatedAt TTL)', async () => {
     // #given — these two tables are flowsafe-owned (the adapter ships neither),
     // so compose the domains and init to create them.
     const sqlite = openSqlite();

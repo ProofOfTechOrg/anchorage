@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // FlowsafeDurableAgent — drive Mastra's durable-agent loop through the ONE
-// RunnerRuntime chokepoint (DL-001/DL-010) so every agent leg inherits the
-// substrate's invariants: INV-1 server-minted runIds, per-leg
-// requestContextForRun grant derivation, snapshot provenance, RunSummary, and
-// retention purge — with no second execution path to audit.
+// RunnerRuntime chokepoint so every agent leg inherits the substrate's
+// invariants: server-minted runIds, per-leg requestContextForRun grant
+// derivation, snapshot provenance, RunSummary, and retention purge, with no
+// second execution path to audit.
 //
-// The mechanic (validated against @mastra/core 1.50.0 dist, spike S1 — every
-// offset in THIS section is 1.50.0-vintage and deliberately kept as the
-// provenance of the original validation; later sections carry their own stamp):
+// The mechanic was validated against @mastra/core 1.50.0 dist. Every offset in
+// THIS section is 1.50.0-vintage and deliberately kept as the provenance of the
+// original validation; later sections carry their own stamp:
 // DurableAgent compiles the agent loop to the default-engine workflow
 // 'durable-agentic-loop' (agent/durable index.js: AGENTIC_LOOP :62,
 // getWorkflow() :5936, agent-agnostic — the agent is resolved per run by the
@@ -30,20 +30,20 @@
 // #requestContextFor mints per leg — so approvalGrantProvider's
 // `breakwater.connectorGrants` grant reaches the connector write gate with
 // zero extra wiring, and a forged/self resume that mints no grant fails closed
-// there (the registry copy is read only for the fail-closed, over-require-safe
-// approval PRE-check, S5).
+// there. The registry copy is read only for the fail-closed, over-require-safe
+// approval pre-check.
 //
-// INV-1 at the boundary: stream()/generate()/prepare() are the THREE inherited
-// minting entry points — each takes an OPTIONAL runId and, when it is absent,
-// lets core mint an unowned crypto.randomUUID() upstream
+// Host-owned run ids at the boundary: stream()/generate()/prepare() are the
+// THREE inherited minting entry points. Each takes an OPTIONAL runId and, when
+// it is absent, lets core mint an unowned crypto.randomUUID() upstream
 // (prepareForDurableExecution, agent/durable index.js:589) that
 // PATH_SAFE_ID_PATTERN then accepts, slipping past executeWorkflow's guard AND
-// RunnerRuntime.start's (the exact fallback INV-1 forbids). All three are
-// overridden ONLY to REQUIRE a caller-minted runId before delegating to super —
-// and prepare() also REGISTERS the run under that id (index.js:5984), so an
-// unguarded prepare() strands an unowned run in the registry. streamUntilIdle()
-// needs no override: it drives agent.stream() (index.js:368), so the stream()
-// guard already covers it.
+// RunnerRuntime.start's exact fallback, which the host-owned run-id rule
+// forbids. All three are overridden ONLY to require a caller-minted runId
+// before delegating to super. prepare() also REGISTERS the run under that id
+// (index.js:5984), so an unguarded prepare() strands an unowned run in the
+// registry. streamUntilIdle() needs no override: it drives agent.stream()
+// (index.js:368), so the stream() guard already covers it.
 //
 // EVERY OTHER inherited entry point that can drive a run — or that hands back
 // runs the caller may not own — is BLOCKED, overridden to throw before it
@@ -206,8 +206,9 @@
 // member is harmless there, while an INSTANCE Mastra calls in-process must
 // throw.
 //
-// Blocking them keeps A-D2/P8 true by construction: resumeViaRuntime() is the
-// ONLY way a run resumes. ApprovalService.decide -> the host's ResumeRunFn ->
+// Blocking them keeps the single-resume and no-capability guarantees true by
+// construction: resumeViaRuntime() is the ONLY way a run resumes.
+// ApprovalService.decide -> the host's ResumeRunFn ->
 // createAgentApprovalResumer, which hands every 'durable-agentic-loop' record to
 // the thread topology's resume (-> resumeViaRuntime -> runtime.resume) and
 // refuses one carrying no agent-thread target rather than falling through to the
@@ -220,7 +221,7 @@
 //
 // Live-isolate scope: the loop resolves the tool's execute closure from the
 // in-process globalRunRegistry (populated by stream()). A DO holds one run in
-// one isolate (P1), so a resume decided before eviction finds it. A resume
+// one isolate, so a resume decided before eviction finds it. A resume
 // AFTER eviction must first rehydrate that registry without replaying
 // application input processors. resumeViaRuntime() rebuilds the registry with
 // complete runtime processor lists after invoking only reserved RBAC during
@@ -406,9 +407,9 @@ const THREAD_TOOL_APPROVAL_REASON =
  */
 export const BLOCKED_RUN_ENTRIES = {
   recover:
-    're-driving a persisted run bypasses run ownership (INV-1), per-leg grant minting and the fail-closed registry rehydration',
+    're-driving a persisted run bypasses run ownership, per-leg grant minting and the fail-closed registry rehydration',
   recoverActiveRuns:
-    'bulk re-driving persisted runs bypasses run ownership (INV-1) and per-leg grant minting',
+    'bulk re-driving persisted runs bypasses run ownership and per-leg grant minting',
   resume: RESUME_FAMILY_REASON,
   resumeStream: RESUME_FAMILY_REASON,
   resumeGenerate: RESUME_FAMILY_REASON,
@@ -422,7 +423,7 @@ export const BLOCKED_RUN_ENTRIES = {
     "core scopes the suspended-run listing by agentId plus the caller's own optional thread and resource ids, never by per-principal ownership, so it bypasses the host topology's run-ownership checks and returns run, thread and resource ids the caller does not own",
   deleteRunSnapshots:
     'durable-agent snapshot rows are retained until deployment-scoped retention purge removes them',
-  network: `${NETWORK_FAMILY_REASON}, and it mints an unowned run id when the caller omits one (INV-1)`,
+  network: `${NETWORK_FAMILY_REASON}, and it mints an unowned run id when the caller omits one`,
   resumeNetwork: NETWORK_FAMILY_REASON,
   approveNetworkToolCall: NETWORK_FAMILY_REASON,
   declineNetworkToolCall: NETWORK_FAMILY_REASON,
@@ -595,8 +596,8 @@ export class FlowsafeDurableAgent<
       id: options.id,
       name: options.name,
       cache: options.cache,
-      // Default the agent's own stream pubsub to the runtime's identity (DL-001:
-      // ONE feed per DO), so a host that configures only init()'s pubsub still
+      // Default the agent's own stream pubsub to the runtime's identity (ONE
+      // feed per DO), so a host that configures only init()'s pubsub still
       // gets observe()/emitError aligned with the run's events (the run is driven
       // through the runtime, which publishes on THAT identity). An explicit
       // pubsub wins; both-absent falls to core's per-agent default (poll-only,
@@ -629,7 +630,7 @@ export class FlowsafeDurableAgent<
   #assertCallerRunId(runId: unknown): asserts runId is string {
     if (!isPathSafeId(runId)) {
       throw new InvalidRunRequestError(
-        'a caller-minted runId is required and must be URL-path-safe (INV-1: the host owns run ids) — the durable-agent runner never generates one',
+        'a caller-minted runId is required and must be URL-path-safe (the host owns run ids) — the durable-agent runner never generates one',
       );
     }
   }

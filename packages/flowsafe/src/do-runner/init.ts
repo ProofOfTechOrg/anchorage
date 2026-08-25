@@ -245,9 +245,10 @@ export function init(
     requestContextForRun: options.requestContextForRun,
     // Threaded directly because every DO subclass
     // returns THIS runtime from build(), so a host that configures a pubsub
-    // reaches the runtime's createRun sites with no host change (Track A wires
-    // those). Handing it only to InitResult would strand it — build() returns a
-    // RunnerRuntime, not an InitResult, so the run-DO path would drop it.
+    // reaches the runtime's createRun sites with no host change (the durable
+    // agent wires those). Handing it only to InitResult would strand it:
+    // build() returns a RunnerRuntime, not an InitResult, so the run-DO path
+    // would drop it.
     pubsub: options.pubsub,
     // Same reasoning, and the reason the fence is a construction-time argument
     // rather than a per-call one: the runtime IS the closure guarantee, so it

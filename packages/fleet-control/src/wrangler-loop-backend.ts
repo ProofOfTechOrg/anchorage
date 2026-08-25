@@ -37,10 +37,11 @@ import type {
   ForceDecommissionStep,
   LiveDeployment,
   MaintenanceHealth,
+  PlainWorkerCustomDomain,
+  PlainWorkerRouteApi,
   PromotionGuard,
   ProvisioningBackend,
   SeedDeploymentIdentityOptions,
-  WorkerZoneRoute,
 } from './types.js';
 import { targetDurableObjectTag } from './validation.js';
 import type { CommandResult, CommandRunner } from './wrangler-runner.js';
@@ -60,113 +61,6 @@ interface DeploymentVersion {
 
 interface DeploymentStatus {
   readonly versions: readonly DeploymentVersion[];
-}
-
-export interface PlainWorkerCustomDomain {
-  readonly id: string;
-  readonly hostname: string;
-  readonly service: string;
-}
-
-export interface PlainWorkerRouteApi {
-  withMutationFence<T>(
-    fence: ExternalMutationFence,
-    operation: () => Promise<T>,
-  ): Promise<T>;
-  queryDatabase(
-    databaseId: string,
-    sql: string,
-    bindings?: readonly string[],
-  ): Promise<readonly Readonly<Record<string, unknown>>[]>;
-  batchDatabase(
-    databaseId: string,
-    statements: readonly {
-      readonly sql: string;
-      readonly bindings?: readonly string[];
-    }[],
-  ): Promise<void>;
-  getDatabase?(databaseId: string): Promise<DatabaseReference | undefined>;
-  deleteDatabase?(databaseId: string): Promise<void>;
-  listWorkerDatabaseAttachments(databaseId: string): Promise<
-    readonly Readonly<{
-      scriptName: string;
-      plane: 'ordinary' | 'dispatch';
-      dispatchNamespace?: string;
-    }>[]
-  >;
-  listWorkerR2Attachments?(bucketName: string): Promise<
-    readonly Readonly<{
-      scriptName: string;
-      plane: 'ordinary' | 'dispatch';
-      dispatchNamespace?: string;
-    }>[]
-  >;
-  getR2Bucket?(
-    bucketName: string,
-    jurisdiction: import('./types.js').R2Jurisdiction,
-  ): Promise<import('./types.js').ApplicationR2BucketSnapshot | undefined>;
-  createR2Bucket?(
-    resource: import('./types.js').ApplicationR2Binding,
-    fence: ExternalMutationFence,
-  ): Promise<void>;
-  assertR2BucketEmpty?(
-    resource: import('./types.js').ApplicationR2Binding,
-  ): Promise<void>;
-  deleteR2Bucket?(
-    resource: import('./types.js').ApplicationR2Binding,
-    fence: ExternalMutationFence,
-  ): Promise<void>;
-  /**
-   * The version currently taking all of an ordinary Worker's traffic, plus the
-   * fleet specification digest that version was built from.
-   *
-   * Narrower than the version read `inspect()` performs, deliberately: an
-   * attestation needs the routed version and one binding, and every provider
-   * call it makes is charged against the account-wide request window the rate
-   * coordinator fences. It also goes through the provider API rather than the
-   * wrangler CLI, which runs outside that coordinator entirely.
-   *
-   * Returns undefined when the script does not exist. Throws
-   * `ActiveRouteAttestationError` when it exists but no single version holds
-   * 100% of the traffic — that ambiguity is the refusal, not a tie to break.
-   */
-  inspectActiveWorkerRoute(scriptName: string): Promise<
-    | Readonly<{
-        artifactVersion: string;
-        specDigest: string | undefined;
-      }>
-    | undefined
-  >;
-  listCustomDomains(): Promise<readonly PlainWorkerCustomDomain[]>;
-  inspectOrdinaryWorkerFootprint(scriptName: string): Promise<{
-    readonly scriptPresent: boolean;
-    readonly workersDevEnabled?: boolean;
-    readonly previewUrlsEnabled?: boolean;
-    readonly customDomains: readonly PlainWorkerCustomDomain[];
-    readonly zoneRoutes: readonly WorkerZoneRoute[];
-  }>;
-  listDurableObjectNamespaces(scriptName: string): Promise<readonly string[]>;
-  listOrdinaryWorkerSecretNames(scriptName: string): Promise<readonly string[]>;
-  deleteControlSecrets(
-    scriptName: string,
-    secretNames: readonly string[],
-    fence: ExternalMutationFence,
-  ): Promise<void>;
-  attachCustomDomain(
-    target: {
-      readonly hostname: string;
-      readonly service: string;
-    },
-    fence: ExternalMutationFence,
-  ): Promise<void>;
-  detachCustomDomain(
-    domainId: string,
-    fence: ExternalMutationFence,
-  ): Promise<void>;
-  disableOrdinaryWorkerPublicAccess(
-    scriptName: string,
-    fence: ExternalMutationFence,
-  ): Promise<void>;
 }
 
 function parseJson(value: string, operation: string): unknown {

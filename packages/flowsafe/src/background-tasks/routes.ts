@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track B (M-003): the read-only HTTP surface over background tasks (DL-014).
+// The read-only HTTP surface over background tasks.
 // Core's `listTasks` / `getTask` / `stream` are not run-bound, so this router:
 //   - requires a path-safe `runId` or `threadId` filter on list and stream;
 //   - loads a task for `getTask` and 404s when missing;
@@ -7,7 +7,7 @@
 // Mutating the queue
 // (dispatch/cancel/resume) is NOT here: v1 keeps background dispatch server-side
 // (an agent's tool call), and a suspended non-gated task's resume, if ever
-// exposed, is a separate role-gated route that mints no capability (P8).
+// exposed, is a separate role-gated route that mints no capability.
 
 import type {
   BackgroundTaskManager,
@@ -154,7 +154,7 @@ export function createBackgroundTaskRoutes(
         return json({ error: 'not found' }, 404);
       }
       const result = await manager.listTasks(resolved.filter);
-      // Per-row parity with the stream guard (DL-014): re-check every returned
+      // Per-row parity with the stream guard: re-check every returned
       // row against the requested scope, so a future regression in core's
       // listTasks filter cannot leak a foreign or out-of-scope task. `total` is
       // recomputed from the surviving rows — never report a count that includes
@@ -190,7 +190,7 @@ function streamResponse(
     new TransformStream<Record<string, unknown>, Uint8Array>({
       transform(chunk, controller) {
         // Same per-row scope guard the list route applies — one predicate so the
-        // two surfaces never drift (DL-014, defense-in-depth over core's filter).
+        // two surfaces never drift (defense-in-depth over core's filter).
         const payload =
           typeof chunk.payload === 'object' &&
           chunk.payload !== null &&

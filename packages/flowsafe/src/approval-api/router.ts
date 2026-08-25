@@ -338,7 +338,7 @@ export function createApprovalRouter(
           }
           if (!isPathSafeId(runId)) {
             throw new InvalidApprovalInputError(
-              `runId '${runId}' is not path-safe — approvals bind to server-minted runs (INV-1)`,
+              `runId '${runId}' is not path-safe — approvals bind to server-minted runs`,
             );
           }
           // The optional public filing route may only attach a request to a

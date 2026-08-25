@@ -1002,8 +1002,10 @@ async function executionFenceAdminResponse<Env extends FlowsafeWorkerEnv>(
 const INVENTORY_ADMIN_PATH = '/admin/inventory';
 
 /**
- * The deployment's drain-proof surface, behind the SAME gate the fence and the
- * maintenance routes use — one trust boundary, one credential.
+ * The deployment's drain-proof surface uses the same credential helper as the
+ * fence and maintenance routes. Their absent-secret policies differ:
+ * maintenance routes may delegate to a fleet capability; fence and inventory
+ * routes never do.
  *
  * WHAT IT IS FOR. An operator holds the fence in `draining` and needs to prove,
  * with no side effects, that this deployment holds no executable or resumable
@@ -1014,19 +1016,23 @@ const INVENTORY_ADMIN_PATH = '/admin/inventory';
  * HOW TO READ THE ANSWER — the contract the index response also states, in
  * full, because this is the part a hurried operator skips:
  *
- *   Results are a LOWER BOUND while a drain is running. The keyset never skips
- *   a row and rows only ever leave a `work` category, so a sweep can
- *   under-report what remains, never over-report what has finished.
+ *   Each result is a point-in-time observation, not a snapshot. Rows can enter
+ *   or leave `work` categories while draining admits work. An empty result
+ *   cannot over-count work, and keyset pagination never skips a row that
+ *   existed before the sweep started.
  *
- *   The proof is TWO consecutive full sweeps, at least one alarm cadence apart,
- *   in which every `work` category comes back empty. One sweep cannot cover the
- *   window in which a run object has journalled its recovery key but not yet
- *   written its D1 owner row; two, spaced that far, can.
+ *   The proof is TWO consecutive full sweeps, at least one 60-second
+ *   RUN_OWNER_RECOVERY_DELAY_MS cadence apart, in which every `work` category
+ *   comes back empty. One sweep cannot cover the window in which a run object
+ *   has journalled its recovery key but not yet written its D1 owner row; two,
+ *   spaced that far, can.
  *
- *   Empty is only meaningful from `draining`. Under `migration-locked`
- *   background tasks park themselves as fence-suspended and resumes are
- *   refused, so outstanding work stops being ATTEMPTED rather than finishing —
- *   an inventory taken there measures the fence, not the deployment.
+ *   An empty sweep from `draining` contributes to the two-sweep proof. After
+ *   the transition to `migration-locked`, an empty post-lock re-sweep is
+ *   conclusive because the lock refuses new work. A non-empty one means work is
+ *   still outstanding, either because it entered after the proof or because
+ *   the lock parked it before it finished. Return to `draining` and repeat the
+ *   proof.
  *
  * `standing` categories (schedules, provider subscriptions) are reported for
  * reconciliation and are never required to be empty: they are configuration a
@@ -1277,7 +1283,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         recordFailure('thread-retention-purge', error);
       }
     }
-    // Background-task TTL cleanup (Track B, opt-in). Its OWN try/catch, like
+    // Background-task TTL cleanup (opt-in). Its OWN try/catch, like
     // every sibling duty: a wedged background-task purge must cost the
     // run-snapshot, approval, and thread purges nothing.
     let backgroundTasksPurged: PurgeExpiredBackgroundTasksResult | undefined;
@@ -1292,7 +1298,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         recordFailure('background-task-purge', error);
       }
     }
-    // Track C notification TTL (opt-in). Its OWN try/catch, like every sibling
+    // Notification TTL cleanup (opt-in). Its OWN try/catch, like every sibling
     // duty. optionalNumberVar (GATES the duty; unset/garbage => do not delete).
     let notificationsPurged: number | undefined;
     const notificationRetentionDays = optionalNumberVar(
@@ -1310,7 +1316,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         recordFailure('notification-purge', error);
       }
     }
-    // Track C thread-state TTL (opt-in). Same isolation + opt-in posture.
+    // Thread-state TTL cleanup (opt-in). Same isolation + opt-in posture.
     let threadStatePurged: number | undefined;
     const threadStateRetentionDays = optionalNumberVar(
       env.THREAD_STATE_RETENTION_DAYS,
@@ -1327,7 +1333,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         recordFailure('thread-state-purge', error);
       }
     }
-    // Track D schedule-trigger history TTL (opt-in). Same isolation + opt-in
+    // Schedule-trigger history TTL cleanup (opt-in). Same isolation + opt-in
     // posture. Only the fire HISTORY expires; schedule config rows are reaped
     // only at deployment teardown.
     let scheduleTriggersPurged: number | undefined;
@@ -1375,7 +1381,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       : { ok: false, error: failures.join('; ') };
   }
 
-  // Track D schedule tick — its OWN failure-isolated duty (own try/catch, own log
+  // Schedule tick — its OWN failure-isolated duty (own try/catch, own log
   // line). A wedged fire pass must cost the other duties nothing, and vice
   // versa (the same failure-isolation rationale).
   async function runScheduleTickDuty(
@@ -1511,7 +1517,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         const notify = config.notify?.(env);
         const selfDecision = parseSelfDecision(env);
         // Fetch-scope live fan-out sink: present iff a hub is bound (streaming is
-        // opt-in, DL-019). Each publish rides ctx.waitUntil (DL-020) and is
+        // opt-in). Each publish rides ctx.waitUntil and is
         // contained — a failed fan-out logs and never fails the mutation.
         const hub = env.HUB;
         let streamSink: ApprovalStreamSink | undefined;
@@ -1556,7 +1562,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           if (agentResponse) return agentResponse;
         }
 
-        // Optional stream stage (DL-015/DL-019): mounted only when BOTH the hub
+        // Optional stream stage: mounted only when BOTH the hub
         // binding and the ticket secret are present. Every route is under
         // /api/stream/, so it composes ahead of the approval router without
         // touching the /api/* run_worker_first entry.
@@ -1572,29 +1578,29 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           if (streamResponse) return streamResponse;
         }
 
-        // Optional Track C signal stage (P6): the host-built createSignalRouter,
-        // closed over THIS request's resolver. `/api/threads/*` — composes ahead
-        // of approvals/runs without overlap. Absent seam => unmounted.
+        // Optional signal stage: the host-built createSignalRouter closes over
+        // THIS request's resolver. `/api/threads/*` composes ahead of
+        // approvals/runs without overlap. Absent seam => unmounted.
         const signalRouter = config.buildSignalRouter?.(resolve, env);
         if (signalRouter) {
           const signalResponse = await signalRouter(request);
           if (signalResponse) return signalResponse;
         }
 
-        // Optional Track F goal stage (P6-lite, DL-018): the host-built
-        // createObjectiveRouter, closed over THIS request's resolver.
-        // `/api/threads/:threadId/goal` — composes after signals (non-overlapping)
-        // and ahead of approvals/runs. Absent seam ⇒ unmounted, byte-identical.
+        // Optional goal stage: the host-built createObjectiveRouter closes over
+        // THIS request's resolver. `/api/threads/:threadId/goal` composes after
+        // signals and ahead of approvals/runs. Absent seam => unmounted and
+        // byte-identical.
         const objectiveRouter = config.buildObjectiveRouter?.(resolve, env);
         if (objectiveRouter) {
           const objectiveResponse = await objectiveRouter(request);
           if (objectiveResponse) return objectiveResponse;
         }
 
-        // Optional Track D schedule CRUD stage (DL-013): the host-built
-        // createScheduleRouter, closed over THIS request's resolver. `/api/schedules/*`
-        // — composes after goals (non-overlapping), ahead of approvals/runs. Absent
-        // seam ⇒ unmounted, byte-identical.
+        // Optional schedule CRUD stage: the host-built createScheduleRouter
+        // closes over THIS request's resolver. `/api/schedules/*` composes
+        // after goals and ahead of approvals/runs. Absent seam => unmounted
+        // and byte-identical.
         const scheduleRouter = config.buildScheduleRouter?.(resolve, env);
         if (scheduleRouter) {
           const scheduleResponse = await scheduleRouter(request);
@@ -1634,8 +1640,8 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
             ? (context, workflowId, runId, body) =>
                 beforeResume(context, env, workflowId, runId, body)
             : undefined,
-          // D4 self-healing, waitUntil-detached — the shared wrapper owns the
-          // detach + reconcile-error logging.
+          // Self-healing approval reconciliation is waitUntil-detached; the
+          // shared wrapper owns the detach + reconcile-error logging.
           reconcileApprovals: reconcileApprovalsOnStatusDetached(
             config.systemPrincipalId,
             waitUntil,

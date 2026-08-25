@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-// The goal objective HTTP surface (createObjectiveRouter): the P6-lite gate ORDER
-// (401 -> ownership -> role -> size/body/field/cap -> audit -> persist), each
-// fail-closed, plus the set/get/update/clear round-trip (byte-identical to core's
-// Agent goal methods), the maxRuns host cap, and the GOAL_REQUEST_CONTEXT_KEY
-// no-collision reservation — over mock resolve + store seams.
+// The goal objective HTTP surface (createObjectiveRouter): bounded ingestion
+// gate order (401 -> ownership -> role -> size/body/field/cap -> audit ->
+// persist). Each fails closed. The suite also covers the set/get/update/clear
+// round-trip, byte-identical to core's Agent goal methods, the maxRuns host
+// cap, and the GOAL_REQUEST_CONTEXT_KEY no-collision reservation over mock
+// resolver and store seams.
 
 import { describe, expect, it, vi } from 'vitest';
 
@@ -127,7 +128,7 @@ interface GoalRecord {
   prompt?: string;
 }
 
-describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
+describe('createObjectiveRouter — bounded ingestion gate', () => {
   it.each([
     { maxRunsCap: 0 },
     { maxRunsCap: 1.5 },
@@ -398,7 +399,7 @@ describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
   });
 });
 
-describe('createObjectiveRouter — maxRuns host cap (DL-007)', () => {
+describe('createObjectiveRouter — maxRuns host cap', () => {
   it('rejects a maxRuns above the host cap and audits it (never clamps)', async () => {
     const { store, raw } = memoryStore();
     const events: ObjectiveAuditEvent[] = [];
@@ -613,7 +614,7 @@ describe('createObjectiveRouter — set / get / update / clear round-trip', () =
   });
 });
 
-describe('GOAL_REQUEST_CONTEXT_KEY reservation (DL-018 no-collision pin)', () => {
+describe('GOAL_REQUEST_CONTEXT_KEY reservation', () => {
   // The keys #requestContextFor mints on a leg: the workflow-scope + isolation-
   // scope base (runtime.ts) plus the grant/actor keys the provider merges over
   // them. ALL are the breakwater 'breakwater.*' namespace; the goal key is
@@ -632,11 +633,11 @@ describe('GOAL_REQUEST_CONTEXT_KEY reservation (DL-018 no-collision pin)', () =>
   });
 
   it('pins the mirrored value to the core dist declaration (drift guard)', () => {
-    // GOAL_REQUEST_CONTEXT_KEY is not exports-reachable (R-001), so the mirror
+    // GOAL_REQUEST_CONTEXT_KEY is not exports-reachable, so the mirror
     // cannot be compared via an import — read the pinned core's own .d.ts
     // declaration instead. A core bump that changes the value (or moves the
-    // file) fails HERE loudly, per the P9 re-anchor protocol. Builtins load via
-    // process.getBuiltinModule (the test-support/sqlite.ts idiom) and
+    // file) fails HERE loudly under the re-anchoring protocol. Builtins load
+    // via process.getBuiltinModule (the test-support/sqlite.ts idiom) and
     // import.meta.url is cast, so this workers-typed program never sees a
     // node: import it cannot type.
     const getBuiltin = (

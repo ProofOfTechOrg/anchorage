@@ -109,6 +109,45 @@ Terminate:
 
 A repeated request reads the terminal snapshot and returns the same summary. After ownership release, the public router delegates replay authorization to the owner object. The object accepts only a principal recorded by the original transition.
 
+### Fence execution during a deployment migration
+
+The execution fence controls one physical deployment, which is also one tenant boundary. It is never scoped to an actor or run. Each admission reads the current row without memoization, and storage failures fail closed.
+
+The four states apply this matrix:
+
+| Entry family | `open` | `draining` | `migration-locked` | `proof-only` |
+| --- | --- | --- | --- | --- |
+| New run start | Admit | Refuse | Refuse | Admit only when `idempotencyKey` matches `proofKey` |
+| Resume, approval decision, or delivery to an existing run | Admit | Admit | Refuse | Admit only for the bound `proofRunId` |
+| Schedule or objective authoring and due-fire claims | Admit | Refuse | Refuse | Refuse |
+| Background tasks: new enqueue | Admit | Admit | Refuse | Refuse |
+| Background tasks: dispatch or stale re-drive | Admit | Admit | Refuse | Refuse |
+| Notification dispatch, provider polling, and webhook ingress | Admit | Admit | Refuse | Refuse |
+
+Fence-parked task rows are still swept for resume under the lock and simply re-park. This churn is self-limiting, and no task body executes.
+
+Schedule pause and delete, objective clear, reads, termination, cancellation, and timeout remain available in every state because they remove work or observe state. During `draining`, signal wakes that would mint a run degrade to persistence, so the next deployment can deliver them. The fence never preempts compute already in flight. Drain first, prove the work inventory empty, and only then transition to `migration-locked`.
+
+A refused request returns `503` with `reason.code: 'EXECUTION_FENCED'` and the current state. `proof-only` admits only proof-bound operations: webhook and poll ingress cannot identify the target run and remain blocked. The package enforces state names, compare-and-set (CAS), and proof-key requirements, while the host owns transition policy.
+
+### Start a run idempotently
+
+An idempotent start stores a caller-supplied `idempotencyKey` before execution and binds it to one server-minted run ID. Callers never supply a run ID. `POST /runs` continues to return `400` when its body contains `runId`; the key is the request handle, not the run identity.
+
+The key is accepted by `POST /runs`, trusted `AgentThreadStartInput` calls, and the internal `streamUntilPersisted()` start. `RunRouterOptions`, `AgentThreadTopologyOptions`, and `StorageInitOptions` require `startIdempotency` wiring. Pass `'none'` only when the host has no reservation database; a keyed start on that host returns `IDEMPOTENT_START_UNSUPPORTED`.
+
+Retries use these outcomes:
+
+- A persisted snapshot returns the same run and state without executing again
+- A `reserved` row with no snapshot reclaims the same reserved run ID
+- A live `started` row with no snapshot returns `IDEMPOTENT_START_PENDING` and `pendingSince`
+- A non-live `started` row with no snapshot returns `IDEMPOTENT_START_UNRESOLVABLE`
+- A `terminal` row whose snapshot expired returns `IDEMPOTENT_START_ALREADY_SETTLED`
+
+`IDEMPOTENT_START_UNRESOLVABLE` is a point-in-time probe. A read can occur between the Worker-side claim and the run object learning that execution started, so re-probe before investigating or choosing a fresh key. Flowsafe never starts another run automatically. A replayed suspended start returns the persisted `RunSummary` without the start response's `approval` and `approvals` fields; read `GET /runs/:workflowId/:runId` to reconcile approval state.
+
+The reservation remains valid for its retention horizon. Once the terminal reservation is purged, the same key is fresh and can start another run. Keep the horizon at least as long as callers can retry.
+
 ## Durable state
 
 ### D1 snapshot
@@ -122,6 +161,12 @@ Mastra's `mastra_workflow_snapshot` row is authoritative for:
 - durable-agent message-list state where applicable.
 
 Flowsafe does not maintain a parallel custom workflow state object.
+
+### Execution fence and start reservations
+
+`flowsafe_execution_fence` stores the deployment's singleton fence state, optional proof key, and optional bound proof run. State transitions compare the caller's `expected` state before they write. A database created by Flowsafe 0.19 has no row or table, which reads as `open`; provisioning from 0.20 onward writes an explicit initial row.
+
+`flowsafe_start_idempotency` stores owner, target, server-minted run ID, reservation state, and timestamps. The claim from `reserved` to `started` is the cross-isolate serializer. Terminal run cleanup pairs snapshot and reservation retention so a spent key remains distinguishable from a fresh key until its configured horizon expires.
 
 ### Snapshot provenance
 
@@ -257,6 +302,26 @@ POST /runs/:workflowId/:runId/terminate-replay
 POST /runs/:workflowId/:runId/deadline
 ```
 
+The composed Worker also exposes these control-plane routes before tenant routers:
+
+```text
+GET  /admin/execution-fence
+POST /admin/execution-fence
+GET  /admin/inventory
+```
+
+All three require a bearer token matching `MAINTENANCE_ADMIN_SECRET`, which must differ from `DEPLOYMENT_IDENTITY_SECRET`. The deployment-identity gate still runs first. A mis-provisioned deployment therefore returns `503` before an operator can read or move its fence.
+
+`GET /admin/execution-fence` returns `{ state, proofKey?, proofRunId? }`. `POST /admin/execution-fence` accepts `{ expected, next, proofKey? }`; a stale expectation returns `409` with `reason.code: 'FENCE_CAS_CONFLICT'` and the current state.
+
+`GET /admin/inventory` returns an index or one keyset-paginated category selected with `?category&cursor&limit`. The work categories are `runs`, `approvals-waiting`, `schedule-deferred-dispatches`, `pending-notifications`, `background-tasks`, `resource-owners`, and `start-reservations`. The standing categories are `schedules` and `signal-subscriptions`; they are reported for reconciliation and never required to empty.
+
+`INVENTORY_DRAIN_PROOF` defines a proof as two consecutive full sweeps with every work category empty, at least 60 seconds apart, while the fence remains `draining`. Each reading is a point-in-time observation rather than a snapshot and can move in either direction because draining still admits work. Empty results cannot over-count, and keyset pagination never skips a row that existed before the sweep began.
+
+If a host needs a hard guarantee, it can re-sweep once after transitioning to `migration-locked`. An empty post-lock sweep is conclusive. A non-empty sweep means work is still outstanding: either it entered after the proof or the lock parked it before it finished. Return to `draining`, let it finish, and repeat the proof before locking again. An inventory read taken under `migration-locked` measures what the fence parked rather than what the deployment would otherwise be doing.
+
+`INVENTORY_UNENUMERABLE` declares two visibility gaps instead of hiding them. The run-owner recovery journal can remain outside D1 for one 60-second alarm cadence. Persisted idle signals have no enumerable consumption marker and deliberately survive the migration. `FLOWSAFE_TABLES` accounts for every Flowsafe-owned table, including justified exclusions, so a new table cannot silently escape the inventory census.
+
 The public Worker normally exposes its own authenticated route facade and forwards to these internal routes. A stream request requires a WebSocket upgrade and workerd's hibernatable socket API; otherwise it returns 426 and the client polls status.
 
 The raw resume surface carries no approval grant. A protected connector still requires a matching stored decision.
@@ -291,14 +356,27 @@ Runtime-derived base keys win over stored or client-provided context. `breakwate
 
 ## Error taxonomy
 
-The runtime distinguishes:
+The runner preserves stable statuses and structured refusal reasons across Durable Object and host-router boundaries:
 
-- unknown workflow;
-- unknown run;
-- duplicate run;
-- run not suspended;
-- client-fixable input, resume-data, or step errors;
-- internal execution or storage errors.
+| Error | HTTP status | `reason.code` | Meaning |
+| --- | --- | --- | --- |
+| `ExecutionFencedError` | `503` | `EXECUTION_FENCED` | The current state refuses this execution entry |
+| `ExecutionFenceUnreadableError` | `503` | `EXECUTION_FENCE_UNREADABLE` | Storage did not provide a trustworthy fence state |
+| `FenceTransitionConflictError` | `409` | `FENCE_CAS_CONFLICT` | The caller's expected state is stale |
+| `InvalidExecutionFenceRequestError` | `400` | `INVALID_EXECUTION_FENCE_REQUEST` | A transition body contains an invalid state or proof key |
+| `StartReservationOwnerMismatchError` | `403` | `IDEMPOTENT_START_OWNER_MISMATCH` | Another principal owns the key |
+| `StartReservationTargetMismatchError` | `409` | `IDEMPOTENT_START_TARGET_MISMATCH` | The caller's key names another workflow or agent |
+| `IdempotentStartPendingError` | `503` | `IDEMPOTENT_START_PENDING` | The keyed run is live but has no persisted summary yet |
+| `IdempotentStartUnresolvableError` | `409` | `IDEMPOTENT_START_UNRESOLVABLE` | No snapshot or live execution currently resolves the claimed run |
+| `IdempotentStartAlreadySettledError` | `409` | `IDEMPOTENT_START_ALREADY_SETTLED` | The run settled and its summary expired |
+| `StartIdempotencyUnsupportedError` | `503` | `IDEMPOTENT_START_UNSUPPORTED` | The host did not wire reservation storage |
+| `StartReservationUnreadableError` | `503` | `IDEMPOTENT_START_UNREADABLE` | The reservation store or row is unreadable |
+| `InvalidStartIdempotencyRequestError` | `400` | `INVALID_START_IDEMPOTENCY_REQUEST` | The key or reservation request is malformed |
+| `InvalidInventoryRequestError` | `400` | `INVALID_INVENTORY_REQUEST` | The category, cursor, or limit is invalid |
+
+`isStartReservationRefusal()` recognizes the five reservation decisions, unsupported wiring, and malformed input. It excludes `StartReservationUnreadableError`, which propagates as an operational storage failure.
+
+The runtime also distinguishes unknown workflows, unknown runs, duplicate runs, runs that are not suspended, client-fixable input or resume-data errors, and internal execution or storage failures.
 
 The Durable Object maps known errors to stable HTTP status codes through `doErrorResponse()`. Unknown failures return an internal error without copying arbitrary thrown data to an audit sink.
 

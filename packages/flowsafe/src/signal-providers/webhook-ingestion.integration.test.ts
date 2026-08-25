@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track E (M-007) E-S1 (SHOULD-FIX): one webhook through the FULL delivery chain
-// with NO LLM — createWebhookRouter (verify → row lookup) → real
-// createThreadTopology → real ThreadDurableObject (its principal assertion) → the
-// production Track C thread signal routes → a real Agent registered with a Mastra
-// whose D1 storage composes the notifications domain — and the notification LANDS
-// in mastra_notifications, visible on the notifications read path. The unit suites
-// each mock a seam; this wires the real seams so the ingestion boundary has one
-// end-to-end proof of the webhook→inbox landing.
+// One webhook through the FULL delivery chain with NO LLM: createWebhookRouter
+// (verify → row lookup) → the real topology → the thread object and its
+// principal assertion → production signal routes → a real Agent registered
+// with a Mastra whose D1 storage composes the notifications domain. The
+// notification LANDS in mastra_notifications, visible on the notifications
+// read path. The unit suites each mock a seam; this wires the real seams so the
+// ingestion boundary has one end-to-end proof of the webhook→inbox landing.
 import { Agent } from '@mastra/core/agent';
 import { Mastra } from '@mastra/core/mastra';
 import { MockMemory } from '@mastra/core/memory';
@@ -87,7 +86,7 @@ async function wireWebhookChain(
   const agent = mastra.getAgent('sig-agent');
   const notifications = new D1NotificationsStorage(d1);
 
-  // A thread DO hosting the production Track C signal routes over that agent.
+  // A thread DO hosting the production signal routes over that agent.
   class TestThread extends ThreadDurableObject<unknown> {
     readonly #threadName: string;
 

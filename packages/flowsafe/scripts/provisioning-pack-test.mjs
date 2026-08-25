@@ -231,10 +231,28 @@ writeFileSync(new URL('./install-script-ran', import.meta.url), 'unexpected');
     `import assert from 'node:assert/strict';
 import {
   DEPLOYMENT_IDENTITY_HEADER,
+  EXECUTION_FENCE_DDL,
+  EXECUTION_FENCE_ROW_ID,
+  EXECUTION_FENCE_STATES,
+  EXECUTION_FENCE_TABLE,
+  INITIAL_EXECUTION_FENCE_STATES,
   deploymentIdentityHeaders,
 } from '@proofoftech/flowsafe/deployment-identity-protocol';
 
 const secret = 'x'.repeat(32);
+assert.equal(typeof EXECUTION_FENCE_DDL, 'string');
+assert.equal(EXECUTION_FENCE_ROW_ID, 'deployment');
+assert.deepEqual(EXECUTION_FENCE_STATES, [
+  'open',
+  'draining',
+  'migration-locked',
+  'proof-only',
+]);
+assert.equal(EXECUTION_FENCE_TABLE, 'flowsafe_execution_fence');
+assert.deepEqual(INITIAL_EXECUTION_FENCE_STATES, [
+  'open',
+  'migration-locked',
+]);
 assert.deepEqual(
   deploymentIdentityHeaders(secret, {
     'content-type': 'application/json',
@@ -252,6 +270,7 @@ assert.deepEqual(
     `import {
   DEPLOYMENT_IDENTITY_HEADER,
   deploymentIdentityHeaders,
+  type InitialExecutionFenceState,
 } from '@proofoftech/flowsafe/deployment-identity-protocol';
 import {
   DEPLOYMENT_IDENTITY_HEADER as LEGACY_DEPLOYMENT_IDENTITY_HEADER,
@@ -264,9 +283,11 @@ const legacyHeaders: Record<string, string> =
   legacyDeploymentIdentityHeaders(secret);
 const header: typeof DEPLOYMENT_IDENTITY_HEADER =
   LEGACY_DEPLOYMENT_IDENTITY_HEADER;
+const initialFenceState: InitialExecutionFenceState = 'open';
 void headers;
 void legacyHeaders;
 void header;
+void initialFenceState;
 `,
   );
   writeFileSync(

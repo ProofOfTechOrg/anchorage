@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track C (M-004), CI-M-004-002 — the D1 NotificationsStorage domain over
-// TABLE_NOTIFICATIONS ('mastra_notifications'), mirroring core's abstract
-// NotificationsStorage + InMemoryNotificationsStorage reference (create / list /
-// listDue / get({threadId,id}) / update + findCoalescable coalescing). Composed
+// The D1 NotificationsStorage domain over TABLE_NOTIFICATIONS
+// ('mastra_notifications'), mirroring core's abstract NotificationsStorage and
+// InMemoryNotificationsStorage reference (create / list / listDue /
+// get({threadId,id}) / update + findCoalescable coalescing). Composed
 // into createD1Storage's store so `agent.sendNotificationSignal` persists here
 // (core resolves the domain via `mastra.getStorage().getStore('notifications')`).
 //
@@ -24,6 +24,7 @@ import {
   NotificationsStorage,
   type UpdateNotificationInput,
 } from '@mastra/core/notifications';
+import { DUE_NOTIFICATION_SQL } from '../do-runner/notification-predicate.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
 import {
   d1Changes,
@@ -526,10 +527,7 @@ export class D1NotificationsStorage extends NotificationsStorage {
   ): Promise<NotificationRecord[]> {
     await this.#ensureSchema();
     const now = input.now.toISOString();
-    const clauses = [
-      "status = 'pending'",
-      '((deliverAt IS NOT NULL AND deliverAt <= ?) OR (summaryAt IS NOT NULL AND summaryAt <= ?))',
-    ];
+    const clauses = [DUE_NOTIFICATION_SQL];
     const binds: unknown[] = [now, now];
     if (input.agentId !== undefined) {
       clauses.push('agentId = ?');

@@ -3008,8 +3008,8 @@ async function main() {
       );
 
       // The proof: the seeded rows are gone, and STILL gone on a second full
-      // sweep. One sweep is a lower bound — traffic is still completing work
-      // while it runs — so the contract asks for two.
+      // sweep. One sweep is a point-in-time reading: traffic can still create
+      // or complete work while it runs, so the contract asks for two.
       const gone = (sweep) =>
         !sweep.runs.keys.some((key) => key.endsWith(`/${drained.runId}`)) &&
         !sweep.runs.keys.some((key) => key.endsWith(`/${keyed.body.runId}`)) &&

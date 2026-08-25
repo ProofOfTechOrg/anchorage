@@ -136,6 +136,8 @@ export {
   type LiveDeployment,
   type MaintenanceHealth,
   type ObservedActiveRoute,
+  type PlainWorkerCustomDomain,
+  type PlainWorkerRouteApi,
   type PlatformPlaneLease,
   type PlatformPlaneResourceSet,
   type PlatformPlaneStateStore,
@@ -174,11 +176,7 @@ export {
   WorkersForPlatformsBackendSwitchProvider,
   type WorkersForPlatformsBackendSwitchProviderOptions,
 } from './workers-for-platforms-backend-switch-provider.js';
-export {
-  type PlainWorkerCustomDomain,
-  type PlainWorkerRouteApi,
-  WranglerLoopBackend,
-} from './wrangler-loop-backend.js';
+export { WranglerLoopBackend } from './wrangler-loop-backend.js';
 export {
   type CommandResult,
   type CommandRunner,

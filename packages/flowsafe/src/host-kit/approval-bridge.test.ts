@@ -2,8 +2,8 @@
 // Unit coverage for the host-kit approval bridge: the payload-shape edge cases
 // of requestedConnectors, the (suspendedAt, resumeCount) capture in
 // queueApprovalForSuspension, the multi-gate re-queue + fail-closed guard in
-// resumeRunWithRequeue (plus its D4 audit signal on a re-queue failure), and
-// the D4 self-healing reconcile (reconcileApprovalsForSummary). These are the
+// resumeRunWithRequeue (plus its audit signal on a re-queue failure), and the
+// self-healing reconcileApprovalsForSummary. These are the
 // pieces the showcase Worker and dev backend both depend on, so they get
 // direct tests independent of any workflow.
 
@@ -349,7 +349,7 @@ describe('requestedConnectors', () => {
     ['connectors as a non-array', { connectors: 'a' }, []],
     ['connectors with a non-string element', { connectors: ['a', 2] }, []],
     ['a valid connectors array', { connectors: ['a', 'b'] }, ['a', 'b']],
-    // Track A (R-003): an AGENT gate declares no connectors array — the tool the
+    // An AGENT gate declares no connectors array — the tool the
     // model called is derived from its (flat or nested) suspend shape.
     [
       'a FLAT agent gate',
@@ -804,7 +804,7 @@ describe('resumeRunWithRequeue', () => {
     expect(requeue[0]?.detail).not.toHaveProperty('principalKind');
   });
 
-  it('emits an audit event and reports resume.ok=false when the post-resume re-queue throws (D4)', async () => {
+  it('emits an audit event and reports resume.ok=false when the post-resume re-queue throws', async () => {
     // #given — deciding gate1 durably resumes to a re-suspended gate2, but
     // the store rejects gate2's filing (a transient D1 failure) — the base
     // resume has already landed by the time this fires
@@ -896,8 +896,8 @@ describe('reconcileApprovalsForSummary', () => {
   });
 
   it('files a fresh approval for a suspended step with no matching record at all', async () => {
-    // #given — a run reported suspended, nothing ever queued for it (the D4
-    // wedge: the original filing never landed)
+    // #given — a run reported suspended, nothing ever queued for it (the
+    // approval reconciliation wedge: the original filing never landed)
     const store = new InMemoryApprovalStore();
     const service = new ApprovalService({ store, executionFence: 'none' });
     const summary = suspendedSummary(

@@ -10,8 +10,7 @@
 // idFromName(HUB_INSTANCE_NAME); the alarm-owned path collects the publish into
 // pendingSends and awaits it) is proven in the final describe. It belongs to
 // host-approval-service.ts but is exercised here because that module's own test
-// file is outside this milestone's edit scope — the wiring it proves (M-006
-// CI-M-006-004/005, DL-020) still needs coverage.
+// file is outside that edit scope; the wiring it proves still needs coverage.
 
 import { describe, expect, it, vi } from 'vitest';
 

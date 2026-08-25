@@ -878,8 +878,8 @@ export class ApprovalService {
 
   async metrics(actor: ApprovalActor): Promise<ApprovalMetrics> {
     this.#authorize(actor, APPROVAL_ROLES, 'approval.read', 'approval');
-    // D3: computation moved into the store contract (SQL aggregate on D1,
-    // JS reduction on in-memory) instead of loading every record here.
+    // Compute in the store contract (SQL aggregate on D1, JS reduction on
+    // in-memory) instead of loading every record here.
     return this.#store.metrics(this.#now().getTime());
   }
 
@@ -1063,13 +1063,13 @@ export class ApprovalService {
     if (!isNonEmptyString(input.runId)) {
       throw new InvalidApprovalInputError('runId is required');
     }
-    // Cheap INV-1 belt at the only write path: an approval binds to a
+    // A cheap run-id check at the only write path: an approval binds to a
     // server-minted run, and every context a runId keys (D1 row, DO name,
     // URL path) requires the path-safe charset. A record filed under a
     // malformed runId would be an orphan no resume can ever reach.
     if (!isPathSafeId(input.runId)) {
       throw new InvalidApprovalInputError(
-        `runId '${input.runId}' is not path-safe — approvals bind to server-minted runs (INV-1)`,
+        `runId '${input.runId}' is not path-safe — approvals bind to server-minted runs`,
       );
     }
     if (!isNonEmptyString(input.title)) {
@@ -1402,11 +1402,11 @@ export async function sweepSLA(
   const at = now();
   const nowIso = at.toISOString();
   const escalated: ApprovalRecord[] = [];
-  // D3: page the deployment's open set with an explicit cursor. Keyset paging
-  // is on (createdAt, id);
-  // escalating a record only drops it from the pending/claimed filter and never
-  // changes its cursor position, so every currently-open record is visited
-  // exactly once — no skips, no repeats — and every breach as of `at` still
+  // Page the deployment's open set with an explicit cursor. Keyset paging is on
+  // (createdAt, id); escalating a record only drops it from the pending/claimed
+  // filter and never changes its cursor position. Every currently-open record
+  // is visited exactly once — no skips, no repeats — and every breach as of
+  // `at` still
   // escalates regardless of where it sits in FIFO order.
   let after: string | undefined;
   for (;;) {

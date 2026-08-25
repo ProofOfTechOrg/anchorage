@@ -126,10 +126,10 @@ describe('RunnerRuntime host pubsub identity', () => {
       { startIdempotency: 'none', pubsub, executionFence: 'none' },
     );
 
-    // #then — the SAME instance is reachable, so Track A's createRun sites and
-    // observe() replay share one feed. Delete the thread in init.ts and this
-    // fails: runtime.pubsub is undefined and the two createRun sites would each
-    // let core default a separate emitter — the DL-001 bug this seam prevents.
+    // #then — the SAME instance is reachable, so the agent's createRun
+    // sites and observe() replay share one feed. Delete the thread in init.ts
+    // and this fails: runtime.pubsub is undefined, so the two createRun sites
+    // each let core default a separate emitter — the bug this seam prevents.
     expect(runtime.pubsub).toBe(pubsub);
   });
 

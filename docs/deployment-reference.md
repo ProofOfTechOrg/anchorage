@@ -30,7 +30,11 @@ Do not perform a physical-isolation cutover as an in-place update of a pooled Wo
 | `MAINTENANCE` | Durable Object namespace | Fixed deployment singleton for deadline expiry, SLA sweep, retention purge, and optional schedule tick |
 | `MAINTENANCE_ADMIN_SECRET` | Secret | Control-plane credential for maintenance bootstrap and status; distinct from deployment identity |
 
-Provision the sentinel before application migrations or traffic. Install host-provided Wrangler `>=4.118 <5` in the application, run `npx flowsafe-provision --database <database> --tag <tag> --remote --config wrangler.jsonc`, then set distinct `DEPLOYMENT_IDENTITY_SECRET` and `MAINTENANCE_ADMIN_SECRET` values with `wrangler secret put`. Wrangler is not installed as a Flowsafe peer. The CLI is published with Flowsafe. It verifies the exact singleton schema, refuses to re-home an owned database, and refuses to adopt an unowned database that already contains application tables.
+Provision the sentinel before application migrations or traffic. Install host-provided Wrangler `>=4.118 <5` in the application, then run `npx flowsafe-provision --database <database> --tag <tag> --initial-fence-state <open|migration-locked> --remote --config wrangler.jsonc`. Set distinct `DEPLOYMENT_IDENTITY_SECRET` and `MAINTENANCE_ADMIN_SECRET` values with `wrangler secret put`. Wrangler is not installed as a Flowsafe peer. The CLI is published with Flowsafe. It verifies the exact singleton schema, refuses to re-home an owned database, and refuses to adopt an unowned database that already contains application tables.
+
+The initial fence state is required and has no default. Choose `open` for an ordinary deployment or `migration-locked` for a deployment that must remain inert until a migration completes. A database created before Flowsafe 0.20 can lack the fence table or row; runtime reads treat that absence as `open` for upgrade compatibility.
+
+Treat `migration-locked` at birth as a verified postcondition. After provisioning, authenticate `GET /admin/execution-fence` and fail the provisioning operation unless the response state is `migration-locked`. This check also makes version skew loud: an older control plane that seeds a 0.20 database without establishing the required state cannot pass the postcondition.
 
 The Worker compares `DEPLOYMENT_TENANT` with `flowsafe_deployment.tenant_tag`. Worker topologies stamp the internal credential on every Durable Object fetch, and the target compares it in constant time before reading storage. This additional caller check prevents an external or cross-script namespace binding from reaching another deployment's objects. Alarms validate the target environment and sentinel because they have no caller request.
 
@@ -90,11 +94,12 @@ Host routing belongs to the provisioning control plane. It must resolve a hostna
 | --- | --- | --- |
 | `DEPLOYMENT_TENANT` | None | Required provisioning tag. Protected routes return `503` unless it matches the D1 sentinel |
 | `DEPLOYMENT_IDENTITY_SECRET` | None | Required internal credential. Worker-to-Durable-Object requests fail before storage unless it matches |
-| `MAINTENANCE_ADMIN_SECRET` | None | Required control-plane credential. Maintenance admin routes return `503` when absent or malformed |
+| `MAINTENANCE_ADMIN_SECRET` | None | Shared-secret credential. Execution-fence and inventory routes always return `503` when it is absent or malformed. Ensure-maintenance and maintenance-status instead accept a relayed fleet capability when `FLEET_MAINTENANCE_CAPABILITIES=required` and the secret is absent |
 | `APPROVAL_ACTOR_TOKENS` | Empty | Static verifier map. Empty means every authenticated route returns 401 |
 | `APPROVAL_SLA_SECONDS` | `14400` | SLA assigned to new approval records |
 | `APPROVAL_ALLOW_SELF_DECISION` | Unset | Separation of duties enabled. Accepts `true` or a comma-separated role list |
 | `RUN_RETENTION_DAYS` | `30` | Age for terminal workflow snapshot purge; `0` means immediate eligibility |
+| `START_IDEMPOTENCY_RETENTION_DAYS` | `RUN_RETENTION_DAYS` | Age for terminal start-reservation purge; keep it at least as long as callers may retry a key |
 | `APPROVAL_RETENTION_DAYS` | `30` | Age for approved/rejected approval purge |
 | `THREAD_RETENTION_DAYS` | Unset | Idle thread and message purge. Unset keeps conversations |
 
@@ -135,6 +140,28 @@ GET  /api/stream/run/:workflowId/:runId
 ```
 
 The stream routes mount only when streaming is configured. The approval create route is off unless the host explicitly enables its capability-free form.
+
+### Control-plane routes
+
+The composed Worker mounts operational routes before tenant routers:
+
+```text
+GET  /admin/execution-fence
+POST /admin/execution-fence
+GET  /admin/inventory
+POST /admin/ensure-maintenance
+GET  /admin/maintenance-status
+```
+
+The execution-fence and inventory routes require `Authorization: Bearer <maintenance_admin_secret>`. `MAINTENANCE_ADMIN_SECRET` must contain 32 to 256 visible ASCII characters and must differ from `DEPLOYMENT_IDENTITY_SECRET`. If the secret is absent, both routes return `503`; they never delegate authentication to a fleet capability.
+
+The ensure-maintenance and maintenance-status routes use the same shared-secret rule when `MAINTENANCE_ADMIN_SECRET` is configured. When `FLEET_MAINTENANCE_CAPABILITIES=required` and that secret is absent, they instead relay the caller's Ed25519 fleet capability token for downstream verification. The Worker does not compare the relayed token with a shared secret, and caps the credential at 2,048 characters.
+
+The deployment-identity gate runs before every control-plane route, so a binding or sentinel mismatch still returns `503` before administration.
+
+`GET /admin/execution-fence` returns `{ state, proofKey?, proofRunId? }`. `POST /admin/execution-fence` accepts `{ expected, next, proofKey? }` and applies one CAS transition. A stale `expected` value returns `409` with `reason.code: 'FENCE_CAS_CONFLICT'` and the current state. The host owns transition policy; Flowsafe validates only the state vocabulary, CAS, and proof-key shape.
+
+`GET /admin/inventory` returns the category index. Add `?category=<category>&cursor=<cursor>&limit=<limit>` to page one category. Prove a drain only from `draining`: sweep every work category to empty twice, at least 60 seconds apart. Standing categories remain present by design, and persisted idle signals deliberately carry across the migration.
 
 ### Advanced routes
 
@@ -226,6 +253,8 @@ TTL retention, authorized domain deletion, and deployment decommissioning are se
 | Schedule triggers | Opt-in fire-history TTL |
 | Background tasks | Terminal-state TTL |
 | Provider subscriptions | No TTL; authorized deletion or deployment decommissioning |
+| `flowsafe_execution_fence` | Singleton deployment control row; no TTL. An absent pre-0.20 row reads as `open` |
+| `flowsafe_start_idempotency` | Terminal reservations remain for at least the run-summary horizon, then purge with run retention |
 | `flowsafe_resource_owners` | Run retention and schedule deletion release their claims. Thread and resource claims require explicit host teardown or deployment decommissioning |
 | R2 artifacts | Delete with the owning snapshot purge and deployment decommissioning |
 

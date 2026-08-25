@@ -201,14 +201,20 @@ try {
   validateDeploymentSpec,
   type ActiveRouteAttestation,
   type ActiveRouteExpectation,
+  type AttestConvergedActiveRouteOptions,
   type CloudflareApiRateCoordinator,
   type DeploymentEgressPolicy,
+  type DeploymentSpec,
+  type FleetRecord,
   type FleetSettlementContext,
   type FleetSettlementEntry,
   type FleetSettlementHost,
   type FleetStateDatabase,
   type InitialExecutionFenceState,
   type ObservedActiveRoute,
+  type PlainWorkerCustomDomain,
+  type PlainWorkerRouteApi,
+  type ProvisioningBackend,
   type SeedDeploymentIdentityOptions,
   type WorkersForPlatformsApi,
 } from '@proofoftech/fleet-control';
@@ -227,6 +233,10 @@ declare const database: FleetStateDatabase;
 declare const api: WorkersForPlatformsApi;
 declare const policy: DeploymentEgressPolicy;
 declare const coordinator: CloudflareApiRateCoordinator;
+declare const deploymentSpec: DeploymentSpec;
+declare const provisioningBackend: ProvisioningBackend;
+declare const fleetRecord: FleetRecord;
+declare const plainWorkerRouteApi: PlainWorkerRouteApi;
 // The provisioning-time fence state a control plane has to choose. Named here
 // because it is a REQUIRED provisionDeployment option: a consumer that cannot
 // import its type cannot type its own provisioning wrapper.
@@ -246,6 +256,27 @@ const routeExpectation: ActiveRouteExpectation = {
   specDigest: routeAttestation.specDigest,
   artifactVersion: routeAttestation.artifactVersion,
 };
+const routeAttestationOptions: AttestConvergedActiveRouteOptions = {
+  convergenceBudgetMs: 60_000,
+};
+const activeRouteRead: Promise<ActiveRouteAttestation> =
+  provisioningBackend.attestActiveRoute(deploymentSpec);
+type SettledSettlementKeyIsOptional = {} extends Pick<
+  FleetRecord,
+  'settledSettlementKey'
+>
+  ? true
+  : false;
+const settledSettlementKeyIsOptional: SettledSettlementKeyIsOptional = true;
+const settledSettlementKey: string | undefined =
+  fleetRecord.settledSettlementKey;
+const customDomain: PlainWorkerCustomDomain = {
+  id: 'domain-id',
+  hostname: 'acme.example.test',
+  service: 'acme-production',
+};
+const activePlainWorkerRoute =
+  plainWorkerRouteApi.inspectActiveWorkerRoute(customDomain.service);
 // The refusal's payload, which is what a host logs when a route cannot be
 // attested; unusable without its type.
 declare const observedRoute: ObservedActiveRoute;
@@ -291,11 +322,21 @@ void database;
 void api;
 void policy;
 void coordinator;
+void deploymentSpec;
+void provisioningBackend;
+void fleetRecord;
+void plainWorkerRouteApi;
 void initialExecutionFenceState;
 void lockedAtBirth;
 void seedOptions;
 void routeAttestation;
 void routeExpectation;
+void routeAttestationOptions;
+void activeRouteRead;
+void settledSettlementKeyIsOptional;
+void settledSettlementKey;
+void customDomain;
+void activePlainWorkerRoute;
 void observedRoute;
 void settlementHost;
 `,
@@ -304,10 +345,14 @@ void settlementHost;
     join(consumerDirectory, 'runtime.mjs'),
     `import assert from 'node:assert/strict';
 import {
+  ActiveRouteAttestationError,
   ProcessLocalCloudflareApiRateCoordinator,
   ProvisioningError,
   WorkersForPlatformsBackend,
+  attestConvergedActiveRoute,
+  attestFleetRecordActiveRoute,
   deploymentSpecDigest,
+  fleetSettlementKey,
 } from '@proofoftech/fleet-control';
 
 // Every export entry must load. The three Workers entries are default-export
@@ -327,6 +372,11 @@ assert.equal(typeof auditConsumer.default.queue, 'function');
 assert.equal(typeof deploymentSpecDigest, 'function');
 assert.equal(typeof ProcessLocalCloudflareApiRateCoordinator, 'function');
 assert.ok(new ProvisioningError('probe') instanceof Error);
+assert.equal(typeof ActiveRouteAttestationError, 'function');
+assert.ok(new ActiveRouteAttestationError('probe', {}) instanceof Error);
+assert.equal(typeof attestConvergedActiveRoute, 'function');
+assert.equal(typeof attestFleetRecordActiveRoute, 'function');
+assert.equal(typeof fleetSettlementKey, 'function');
 
 // The trusted-configuration constructor must fail closed. This is the barrier
 // that makes a published fleet-control inert without control-plane inputs, so

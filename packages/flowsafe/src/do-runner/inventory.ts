@@ -66,7 +66,11 @@ import {
   RUN_TERMINAL_STATUSES,
 } from './d1-storage.js';
 import { DoStatusError } from './do-status-error.js';
-import type { ExecutionFenceState } from './execution-fence.js';
+import {
+  EXECUTION_FENCE_SUSPEND_KEY,
+  type ExecutionFenceState,
+} from './execution-fence.js';
+import { DUE_NOTIFICATION_SQL } from './notification-predicate.js';
 import {
   START_IDEMPOTENCY_TABLE,
   START_RESERVATION_STATES,
@@ -79,11 +83,15 @@ import { validateTablePrefix } from './table-prefix.js';
  *
  * `mastra_schedules` and `mastra_schedule_triggers` are created by
  * `schedules/schedules-d1.ts`, and `mastra_notifications` by
- * `signals/notifications-d1.ts` — both of which are built ON do-runner, so the
- * import would close a cycle. The census test can see both sides at once, and
- * crosses every name below against the storage inventory the schema guard
- * pins, so a rename fails there rather than turning a category permanently
- * empty. `mastra_workflow_snapshot` and `mastra_background_tasks` come from the
+ * `signals/notifications-d1.ts` — both of which are built ON do-runner, so
+ * importing their storage modules would close a cycle and pull their runtime
+ * dependencies into the public `./do-runner` graph. The pending-notification
+ * predicate is therefore single-homed in the import-free
+ * `do-runner/notification-predicate.ts` leaf, which both readers can safely
+ * import. The census test can see both sides at once, and crosses every name
+ * below against the storage inventory the schema guard pins, so a rename fails
+ * there rather than turning a category permanently empty.
+ * `mastra_workflow_snapshot` and `mastra_background_tasks` come from the
  * @mastra/cloudflare-d1 adapter and are pinned the same way.
  */
 const SNAPSHOT_TABLE = 'mastra_workflow_snapshot';
@@ -98,20 +106,6 @@ const SCHEDULE_TRIGGERS_TABLE = 'mastra_schedule_triggers';
  * to the census rather than to this file.
  */
 const SIGNAL_SUBSCRIPTIONS_INVENTORY_TABLE = 'flowsafe_signal_subscriptions';
-
-/**
- * The suspend-payload key the background-task host stamps when the fence parks
- * a task instead of letting its body run.
- *
- * `background-tasks/host.ts` owns the string and publishes it as
- * EXECUTION_FENCE_SUSPEND_KEY; it cannot be imported here because that module
- * imports do-runner. Its own doc warns that a hard-coded copy would silently
- * stop matching after a rename, and what stops that is BEHAVIOURAL, not the
- * table census: inventory.test.ts seeds its parked-task fixture with the real
- * imported constant, so renaming it without renaming this copy leaves the
- * `fenceSuspended` assertion reading `false`.
- */
-const EXECUTION_FENCE_SUSPEND_PAYLOAD_KEY = 'flowsafe.executionFenced';
 
 /**
  * Whether a category must reach empty before a deployment may be locked.
@@ -216,15 +210,15 @@ export interface UnenumerableState {
 /** The rule an operator reads an empty inventory under. */
 export interface DrainProofContract {
   /**
-   * Why one empty sweep is not a proof: draining traffic is still completing
-   * work while the sweep runs.
+   * How to interpret point-in-time readings while draining still admits work.
+   * Rows can enter or leave, but an empty result cannot over-count work.
    */
-  readonly lowerBound: string;
+  readonly reading: string;
   /** What a proof actually is. */
   readonly proof: string;
   /** The fence states an empty `work` set is reachable from. */
   readonly reachableFrom: readonly ExecutionFenceState[];
-  /** Why it is not reachable from the others. */
+  /** How to interpret a post-lock re-sweep and a read taken under the lock. */
   readonly note: string;
 }
 
@@ -357,7 +351,7 @@ const MAX_CURSOR_LENGTH = 1_024;
  * Bound parameters D1 accepts in ONE statement. The retention purge caps its
  * own batch against the same limit (d1-storage.ts).
  */
-const D1_MAX_BOUND_PARAMETERS = 100;
+export const D1_MAX_BOUND_PARAMETERS = 100;
 
 /**
  * Bound parameters the run-owner lookup spends on anything OTHER than run ids.
@@ -367,14 +361,14 @@ const D1_MAX_BOUND_PARAMETERS = 100;
  * future predicate that binds a value would otherwise push the statement one
  * parameter over the limit with nothing to catch it.
  */
-const RUN_OWNER_FIXED_BINDINGS = 0;
+export const RUN_OWNER_FIXED_BINDINGS = 0;
 
 /**
  * Run ids per owner-lookup statement: the full parameter budget, less whatever
  * the statement spends on its own predicate. 100 - 0 = 100, so a maximum page
  * (INVENTORY_MAX_LIMIT = 200) costs exactly two statements.
  */
-const RUN_OWNER_LOOKUP_CHUNK =
+export const RUN_OWNER_LOOKUP_CHUNK =
   D1_MAX_BOUND_PARAMETERS - RUN_OWNER_FIXED_BINDINGS;
 
 /**
@@ -445,7 +439,7 @@ export const INVENTORY_UNENUMERABLE: readonly UnenumerableState[] = [
     because:
       'the journal lives in the run object own storage; D1 has no row for it yet, so no query over this database can observe it',
     bound:
-      'one alarm cadence: the object reconciles the journal on its next wake, after which the run appears under `runs` (or has finished). Two sweeps at least that far apart therefore cover the window.',
+      '60,000 ms (60 seconds), the RUN_OWNER_RECOVERY_DELAY_MS cadence in do-runner/durable-object.ts: the object reconciles the journal on its next wake, after which the run appears under `runs` (or has finished). Two sweeps at least that far apart therefore cover the window.',
   },
   {
     name: 'persisted-idle-signals',
@@ -467,12 +461,12 @@ export const INVENTORY_UNENUMERABLE: readonly UnenumerableState[] = [
  * measurement of a drain.
  */
 export const INVENTORY_DRAIN_PROOF: DrainProofContract = {
-  lowerBound:
-    'Every count is a LOWER BOUND while traffic is draining: rows are still being finished as the sweep runs. The keyset never skips a row and rows only ever leave a work category, so a sweep can under-report what remains but never over-report what has finished.',
+  reading:
+    'Every reading is a point-in-time observation, not a snapshot: rows can enter or leave work categories while draining admits work. Empty results cannot over-count, and keyset pagination never skips a row that existed before the sweep started.',
   proof:
-    'The proof is TWO consecutive full sweeps, at least one alarm cadence apart, in which every `work` category returns no entries. One sweep cannot cover the Durable Object journal window; two, spaced that far, can.',
+    'The proof is TWO consecutive full sweeps, at least 60,000 ms (60 seconds) apart — the RUN_OWNER_RECOVERY_DELAY_MS cadence in do-runner/durable-object.ts — in which every `work` category returns no entries. One sweep cannot cover the Durable Object journal window; two, spaced that far, can.',
   reachableFrom: ['draining'],
-  note: "Empty is only meaningful from 'draining'. Under 'migration-locked' background tasks park themselves as fence-suspended and resumes are refused outright, so the work does not finish — it stops being attempted, and an inventory taken there measures the fence rather than the deployment.",
+  note: "The two-sweep proof is taken from 'draining', where work can finish. A host that needs a hard guarantee can re-sweep once after transitioning to 'migration-locked': an empty post-lock sweep is conclusive; a non-empty one means work is still outstanding, either because it entered after the proof or because the lock parked it before it finished. Return to draining and repeat the proof. An inventory read taken under 'migration-locked' measures what the fence parked rather than what the deployment would otherwise be doing.",
 };
 
 /** Every category's descriptor, in index order. */
@@ -778,7 +772,7 @@ function keyOf(row: RawRow, keys: readonly string[]): readonly string[] {
  */
 function fenceParkedSql(): string {
   return `CASE WHEN json_valid(suspend_payload)
-              AND json_extract(suspend_payload, '$."${EXECUTION_FENCE_SUSPEND_PAYLOAD_KEY}"') IS NOT NULL
+              AND json_extract(suspend_payload, '$."${EXECUTION_FENCE_SUSPEND_KEY}"') IS NOT NULL
             THEN 1 ELSE 0 END`;
 }
 
@@ -1072,8 +1066,7 @@ export class DeploymentInventory {
         // it — so it stays out of the page and is reported as `notDue`
         // instead. That total also covers pending rows carrying NEITHER
         // timestamp, which no dispatch pass will ever select at all.
-        const due =
-          "status = 'pending' AND ((deliverAt IS NOT NULL AND deliverAt <= ?) OR (summaryAt IS NOT NULL AND summaryAt <= ?))";
+        const due = DUE_NOTIFICATION_SQL;
         return {
           key: ['thread_id', 'id'],
           detail: ['source', 'kind', 'priority', 'agentId', 'deliverAt'],

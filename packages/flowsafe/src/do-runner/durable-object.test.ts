@@ -67,7 +67,7 @@ interface TestEnv extends DeploymentIdentityEnv {
   storage: InMemoryStore;
   runtime?: RunnerRuntime;
   /**
-   * The deployment execution fence the built runtime is wired to (F1). Always
+   * The deployment execution fence the built runtime is wired to. Always
    * present on a production-shaped env — DurableObjectRunner refuses to serve
    * from a fence-less RunnerRuntime while a DB binding is bound — and shared
    * with the test so it can move the fence under a live object.
@@ -1434,7 +1434,7 @@ describe('DurableObjectRunner.fetch', () => {
     }
   });
 
-  it('400s a start without a runId — the DO never generates one (INV-1)', async () => {
+  it('400s a start without a runId — the DO never generates one', async () => {
     // #given — the runId is host-owned and minted by the run router. A DO-side
     // generation fallback would let any caller that skips the router create an
     // unowned run outside the request budget and audit boundary.
@@ -1450,7 +1450,7 @@ describe('DurableObjectRunner.fetch', () => {
     }
   });
 
-  it('refuses to act outside its own identity when id.name is present (INV-1)', async () => {
+  it('refuses to act outside its own identity when id.name is present', async () => {
     // #given — a runner whose DO identity names a DIFFERENT run than the
     // request. id.name is set by the trusted Worker via idFromName and is
     // unforgeable at this boundary, so a mismatch means someone routed
@@ -1973,8 +1973,8 @@ describe('DurableObjectRunner.fetch', () => {
 
   it('returns a 426 non-WS fallback on the stream route when the runtime has no hibernation API', async () => {
     // #given — a node runner (state undefined ⇒ no acceptWebSocket). The per-run
-    // WS stream is workerd-only; off workerd it must degrade, never 500. The WS
-    // runtime behavior itself is proven by the workerd spike (M-009).
+    // WS stream is workerd-only; off workerd it must degrade, never 500. The
+    // WebSocket runtime behavior itself is proven by the workerd spike.
     const runner = makeRunner();
 
     // #when — a websocket upgrade attempt on the stream route
@@ -1988,7 +1988,7 @@ describe('DurableObjectRunner.fetch', () => {
     expect(response.status).toBe(426);
   });
 
-  it('broadcasts the authoritative RunSummary to run-channel sockets after start and resume (DL-018)', async () => {
+  it('broadcasts the authoritative RunSummary to run-channel sockets after start and resume', async () => {
     // #given — a runner whose DO exposes a hibernatable-socket stub;
     // #broadcastRunSummary reads getWebSockets() and send()s each the frame.
     const sent: string[] = [];
@@ -5578,7 +5578,7 @@ describe('DurableObjectRunner and the deployment execution fence', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F3 — what the run object contributes to an idempotent start: it carries the
+// What the run object contributes to an idempotent start: it carries the
 // key on the internal channel, and it answers the liveness probe that separates
 // a run still working from a claim nobody is holding.
 // ---------------------------------------------------------------------------

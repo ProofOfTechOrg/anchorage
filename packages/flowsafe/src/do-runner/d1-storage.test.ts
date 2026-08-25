@@ -2205,7 +2205,7 @@ describe('purgeExpiredScheduleTriggers', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F3 — start-reservation retention.
+// Start-reservation retention.
 //
 // The reservation is what makes a spent idempotency key answerable, so its
 // retention has one hard rule and one soft one:

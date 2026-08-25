@@ -8,6 +8,7 @@ import {
   externalStateScriptName,
 } from '../src/platform-resources.js';
 import {
+  ADDED_NULLABLE_TEXT_COLUMNS,
   D1FleetStateStore,
   type FleetStateDatabase,
 } from '../src/state-store.js';
@@ -15,16 +16,6 @@ import type { FleetRecord, PlatformPlaneResourceSet } from '../src/types.js';
 
 const MAINTENANCE_PUBLIC_KEY =
   '{"kty":"OKP","crv":"Ed25519","alg":"EdDSA","kid":"fleet-maintenance-v1","x":"Lhp1XFeTJJx8FLOCKpn4nkO-tWuZZxXX8ziw0LEvUZo"}';
-
-/**
- * The columns the store adds to a table that already shipped. A fake that
- * models only some of them reports a half-upgraded schema, which is the one
- * shape the store is entitled to refuse.
- */
-const UPGRADED_COLUMNS = [
-  'backend_switch_intent',
-  'settled_settlement_key',
-] as const;
 
 function nullableTextColumn(name: string): Readonly<Record<string, unknown>> {
   return { name, type: 'TEXT', notnull: 0, pk: 0 };
@@ -43,7 +34,9 @@ class MemoryD1 implements FleetStateDatabase {
     bindings: readonly unknown[] = [],
   ): Promise<readonly Readonly<Record<string, unknown>>[]> {
     if (sql.startsWith('PRAGMA table_info(anchorage_fleet_deployments)')) {
-      return UPGRADED_COLUMNS.map((name) => nullableTextColumn(name));
+      return ADDED_NULLABLE_TEXT_COLUMNS.map((name) =>
+        nullableTextColumn(name),
+      );
     }
     if (sql.startsWith('SELECT *')) return this.row ? [this.row] : [];
     if (sql.startsWith('INSERT INTO anchorage_fleet_leases')) {
@@ -296,7 +289,7 @@ class MemoryD1 implements FleetStateDatabase {
 
 class SchemaD1 implements FleetStateDatabase {
   readonly columns = new Map<string, Readonly<Record<string, unknown>>>(
-    UPGRADED_COLUMNS.map((name) => [name, nullableTextColumn(name)]),
+    ADDED_NULLABLE_TEXT_COLUMNS.map((name) => [name, nullableTextColumn(name)]),
   );
   createAttempts = 0;
   alterAttempts = 0;
@@ -440,7 +433,7 @@ describe('D1FleetStateStore release state', () => {
     // #then the losing racer's duplicate-column error was swallowed, and every
     // upgraded column ended well-formed rather than half-applied
     expect(db.duplicates.length).toBeGreaterThan(0);
-    for (const name of UPGRADED_COLUMNS) {
+    for (const name of ADDED_NULLABLE_TEXT_COLUMNS) {
       expect(db.columns.get(name)).toMatchObject({
         name,
         type: 'TEXT',
@@ -461,8 +454,10 @@ describe('D1FleetStateStore release state', () => {
     );
     await expect(store.get('acme', 'production')).resolves.toBeUndefined();
     // The failed column is retried, and every other upgraded column still runs.
-    expect(db.alterAttempts).toBe(UPGRADED_COLUMNS.length + 1);
-    expect([...db.columns.keys()].sort()).toEqual([...UPGRADED_COLUMNS].sort());
+    expect(db.alterAttempts).toBe(ADDED_NULLABLE_TEXT_COLUMNS.length + 1);
+    expect([...db.columns.keys()].sort()).toEqual(
+      [...ADDED_NULLABLE_TEXT_COLUMNS].sort(),
+    );
   });
 
   it('verifies current column shape and does not repeat migration work', async () => {

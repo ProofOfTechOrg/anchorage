@@ -28,15 +28,15 @@ import {
 // share, and widening it to consumers would invite queries the store cannot
 // keep correct.
 import { APPROVALS_TABLE } from '../approval-api/types.js';
-// The REAL marker the background-task host stamps. The inventory restates it
-// (it may not import a module that imports do-runner), so this fixture is what
-// pins the copy: rename the constant without renaming the SQL and the
-// fenceSuspended assertion below fails.
+// The public marker the background-task host stamps. The inventory imports its
+// single home from do-runner, while this fixture imports the unchanged public
+// background-tasks surface.
 import { EXECUTION_FENCE_SUSPEND_KEY } from '../background-tasks/index.js';
 import { createScheduleStorageDomains } from '../schedules/storage.js';
 import { D1SubscriptionStoreFactory } from '../signal-providers/index.js';
 import { createSignalStorageDomains } from '../signals/storage.js';
 import { createD1Storage, RESOURCE_OWNER_TABLE } from './d1-storage.js';
+import { RUN_OWNER_RECOVERY_DELAY_MS } from './durable-object.js';
 import {
   DEPLOYMENT_IDENTITY_HEADER,
   DurableObjectRunner,
@@ -47,11 +47,16 @@ import {
 } from './index.js';
 import { init } from './init.js';
 import {
+  D1_MAX_BOUND_PARAMETERS,
   DeploymentInventory,
   INVENTORY_CATEGORY_DESCRIPTORS,
+  INVENTORY_DRAIN_PROOF,
+  INVENTORY_UNENUMERABLE,
   InvalidInventoryRequestError,
   type InventoryCategory,
   type InventoryDatabase,
+  RUN_OWNER_FIXED_BINDINGS,
+  RUN_OWNER_LOOKUP_CHUNK,
 } from './inventory.js';
 import {
   START_IDEMPOTENCY_TABLE,
@@ -402,7 +407,13 @@ describe('deployment drain inventory', () => {
     ]);
     // #then — and the rule an empty answer means something under.
     expect(index.drainProof.reachableFrom).toEqual(['draining']);
+    expect(index.drainProof.reading).toMatch(/point-in-time observation/);
     expect(index.drainProof.proof).toMatch(/TWO consecutive full sweeps/);
+    const recoveryCadence = `${RUN_OWNER_RECOVERY_DELAY_MS.toLocaleString(
+      'en-US',
+    )} ms`;
+    expect(INVENTORY_UNENUMERABLE[0]?.bound).toContain(recoveryCadence);
+    expect(INVENTORY_DRAIN_PROOF.proof).toContain(recoveryCadence);
   });
 
   it('reads each work category with the predicate its production writer settles on', async () => {
@@ -818,7 +829,7 @@ describe('deployment drain inventory', () => {
         )
         .run(runId);
     }
-    const { statements, bindings, db } = recordingDatabase(binding);
+    const { bindings, db } = recordingDatabase(binding);
 
     // #when — the largest page the route will serve.
     const page = await new DeploymentInventory(db, { now: () => NOW }).read(
@@ -838,13 +849,19 @@ describe('deployment drain inventory', () => {
     // binding per-row fails here too.
     expect(bindings.filter((entry) => entry.count > 100)).toEqual([]);
 
-    // #then — the lookup really was split rather than merely shortened: 200
-    // ids at 100 per statement is exactly two.
-    expect(
-      statements.filter(
-        (sql) => sql.includes(RESOURCE_OWNER_TABLE) && sql.includes('IN ('),
-      ),
-    ).toHaveLength(2);
+    // #then — each lookup uses the derived chunk, and that chunk stays
+    // equal to the D1 parameter cap less the statement's fixed bindings.
+    const ownerLookups = bindings.filter(
+      (entry) =>
+        entry.sql.includes(RESOURCE_OWNER_TABLE) && entry.sql.includes('IN ('),
+    );
+    expect(ownerLookups.map((entry) => entry.count)).toEqual([
+      RUN_OWNER_LOOKUP_CHUNK,
+      RUN_OWNER_LOOKUP_CHUNK,
+    ]);
+    expect(RUN_OWNER_LOOKUP_CHUNK).toBe(
+      D1_MAX_BOUND_PARAMETERS - RUN_OWNER_FIXED_BINDINGS,
+    );
   });
 
   it('OWNERSHIP-ORDERING PIN: an in-flight run with no snapshot is visible under resource-owners', async () => {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// Full-pipeline D3 proof: the real ApprovalApiClient → createApprovalRouter →
-// ApprovalService → InMemoryApprovalStore, driven with NO limit at >MAX scale.
+// Full-pipeline bounded-list proof: the real ApprovalApiClient →
+// createApprovalRouter → ApprovalService → in-memory store, run without a
+// limit at >MAX scale.
 // Lives in approval-ui (not approval-api) because the "client" under test is
 // approval-ui's ApprovalApiClient; approval-ui → approval-api is the allowed
 // import direction. DOM-free (no hook, no JSX), so it runs in the main test
@@ -41,7 +42,7 @@ function seedRecord(
 }
 
 describe('approval pipeline (client → router → service → store)', () => {
-  it('a bare reviewer-ordered list() past MAX_APPROVAL_LIST_LIMIT bounds the page yet still surfaces the freshest critical at the top (D3)', async () => {
+  it('a bare reviewer-ordered list() past MAX_APPROVAL_LIST_LIMIT bounds the page yet still surfaces the freshest critical at the top', async () => {
     // #given — a shared backend behind the router, seeded directly (fast) with
     // MAX normal requests plus one critical created LAST (newest createdAt, so
     // a FIFO-then-cap page would drop it at position MAX+1)
@@ -91,7 +92,7 @@ describe('approval pipeline (client → router → service → store)', () => {
       },
     });
 
-    // #when — no limit: exercises the D3 store-boundary default through the
+    // #when — no limit: exercises the store-boundary default through the
     // whole stack
     const page = await client.list({
       status: [...OPEN_STATUSES],

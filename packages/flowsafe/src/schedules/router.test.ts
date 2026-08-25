@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track D (M-006) — createScheduleRouter: the P6-lite gate order, the no-oracle
-// 404s, the count + fire-rate caps, the P4 reserved-key rejection, and the audit
+// createScheduleRouter: bounded ingestion gate order, no-oracle 404s, count and
+// fire-rate caps, reserved-context rejection, and audit
 // coverage (accept + every post-auth denial; benign GET + pre-auth NOT audited).
 
 import type {
@@ -564,7 +564,7 @@ describe('createScheduleRouter — create', () => {
     expect(res.status).toBe(400);
   });
 
-  it('400s + audits a reserved requestContext key (P4 barrier a)', async () => {
+  it('400s + audits a reserved requestContext key', async () => {
     const { call, events } = harness(ctx('acme', 'operator'));
     const res = await call('POST', '/api/schedules', {
       ...WORKFLOW_CREATE,
@@ -613,7 +613,7 @@ describe('createScheduleRouter — create', () => {
     );
   });
 
-  it('400s a cron that fires faster than the fire-rate floor (DL-007)', async () => {
+  it('400s a cron that fires faster than the fire-rate floor', async () => {
     // floor 2min; a per-minute cron (60s interval) is under it
     const { call, events } = harness(ctx('acme', 'operator'), {
       minFireIntervalMs: 120_000,
@@ -628,7 +628,7 @@ describe('createScheduleRouter — create', () => {
     );
   });
 
-  it('400s at the deployment COUNT cap (DL-007)', async () => {
+  it('400s at the deployment COUNT cap', async () => {
     const { call, events } = harness(ctx('acme', 'operator'), {
       maxSchedules: 1,
     });

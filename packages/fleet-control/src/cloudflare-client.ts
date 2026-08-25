@@ -32,6 +32,7 @@ import type {
   DeploymentSpec,
   ExternalMutationFence,
   FleetResourceInventory,
+  PlainWorkerRouteApi,
   PromotionGuard,
   ProviderBindingIdentity,
   ScriptInventoryTarget,
@@ -430,7 +431,7 @@ async function hashExport(
   return { sha256: hash.digest('hex'), size };
 }
 
-export class CloudflareProvisioningClient {
+export class CloudflareProvisioningClient implements PlainWorkerRouteApi {
   readonly #accountId: string;
   readonly #apiToken: string;
   readonly #dispatchNamespace: string;

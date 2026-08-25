@@ -873,9 +873,9 @@ describe('ApprovalService.sweepSLA', () => {
 
   it('escalates ALL breached requests across more than one page (>MAX)', async () => {
     // #given — more breached requests than a single page holds, so the sweep
-    // must cursor-page the (un-defaulted) system view instead of one SELECT;
-    // pre-D3 this bare list() was unbounded, post-D3 a naive single list would
-    // silently cap at MAX and leave the tail un-escalated
+    // must cursor-page the un-defaulted system view instead of one SELECT.
+    // Before the list gained its default bound it was unbounded; a naive single
+    // bounded list would silently cap at MAX and leave the tail un-escalated.
     const harness = makeHarness();
     const total = MAX_APPROVAL_LIST_LIMIT + 1;
     for (let index = 0; index < total; index += 1) {

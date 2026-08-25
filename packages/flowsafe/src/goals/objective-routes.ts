@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track F (M-005), CI-M-005-001 — the goal objective HTTP surface (DL-018).
+// The goal objective HTTP surface.
 //
 // A goal is a durable, thread-scoped OBJECTIVE record (@mastra/core's
 // GoalObjectiveRecord, stored in the mastra_thread_state domain under type
 // 'goal') that a Mastra agent's in-loop judge reads to decide whether to keep
 // working toward it. In the DURABLE path the goal step rebuilds RequestContext
 // from initData and reads the objective from D1 via resolveGoalStore ->
-// readObjective, NOT any in-process registry (DL-018). Verified against the
+// readObjective, NOT any in-process registry. Verified against the
 // on-disk @mastra/core 1.50.0 dist: resolveGoalStore(mastra) is
 // `mastra.getStorage().getStore('threadState')` and readObjective is
 // `getState({ threadId, type: 'goal' })`. So this surface writes the D1 domain
@@ -15,49 +15,49 @@
 // through core's OWN writeObjective/readObjective/clearObjective over the SAME
 // (threadId, 'goal') key, so the stored shape can never drift from the reader's.
 //
-// An objective is a STANDING INSTRUCTION injected into every future model turn,
-// so the write path is an ingestion trust boundary (P6-lite, DL-006). It uses
-// the same resource-first authorization rule as the signal router:
+// An objective is a STANDING INSTRUCTION injected into every future model
+// turn, so the write path is an ingestion trust boundary. It uses the same
+// resource-first authorization rule as the signal router:
 //
-//   1. resolve (authenticate and validate actor)         -> 401 / 403
-//   2. registry-backed thread ownership                   -> 404
-//   3. coarse role (RUN_START_ROLES) on MUTATIONS        -> 403 (reads stay coarse)
-//   4. size cap on the raw body, THEN JSON parse          -> 413 / 400
-//   5. body names NO client memory id (assertNoClientMemoryIds) -> 400
-//   6. field allowlist (objective/maxRuns/judge/prompt; status on update) -> 400
-//   7. maxRuns host cap (DL-007)                          -> 400
+//   1. resolve and validate the actor              -> 401 / 403
+//   2. verify registry-backed thread ownership     -> 404
+//   3. require RUN_START_ROLES for mutations       -> 403
+//   4. cap the raw body, then parse JSON           -> 413 / 400
+//   5. reject client-supplied memory ids           -> 400
+//   6. allow only objective fields                 -> 400
+//   7. enforce the host maxRuns cap                -> 400
 //   8. audit (goal.objective) + persist
 //
 // Every MUTATION (set/update/clear) is audited on ACCEPT and on EVERY post-auth
-// denial (role 403, malformed target 404, size/body/field/cap 400) — the Track C lesson.
-// A GET is audited only on a post-auth denial; a
+// denial (role 403, malformed target 404, size/body/field/cap 400), following
+// the signal-ingestion lesson. A GET is audited only on a post-auth denial; a
 // benign successful read is not a standing-instruction write and is not logged.
 // Pre-auth failures (401 / a resolver throw -> 403) are NOT audited: an
 // unauthenticated flood must never be able to write the log.
 //
-// maxRuns (DL-007): a requested maxRuns above the host cap is REJECTED (400),
+// maxRuns: a requested maxRuns above the host cap is REJECTED (400),
 // not silently clamped. A caller that asked for 200 evaluations and got 50 would
 // see mysterious early-stopping — exactly the "your value was quietly replaced"
 // footgun the run router 400s a client runId to avoid — so the boundary fails
 // loud instead. The stored record therefore never carries maxRuns above the cap
-// (default the core DEFAULT_GOAL_MAX_RUNS, 50). Track F itself starts NO runs:
+// (default the core DEFAULT_GOAL_MAX_RUNS, 50). This router starts NO runs:
 // the deployment run-start budget stays enforced at the existing run-start seam;
 // bounding maxRuns only bounds how many of those already-budgeted runs one goal
 // can drive.
 //
-// P8 (goals never mint capability): no route reads or writes requestContext and
+// Goals never mint capability: no route reads or writes requestContext and
 // none names a connector/grant/step. writeObjective is called WITHOUT a
 // requestContext, so the within-turn GOAL_REQUEST_CONTEXT_KEY surface is never
 // touched here — the objective payload is content only.
 //
 // Write serialization: update is a read-modify-write and clear an unconditional
 // delete, both at the Worker with NO per-thread serialization — deliberately
-// weaker than signals (whose sends ride the thread-DO lease), because DL-018
-// writes D1 directly. Core's own
-// Agent.updateObjectiveOptions has the identical non-atomic read-then-write, so
-// concurrent mutations are last-write-wins within the deployment; the maxRuns cap is
-// enforced on every write, so no interleaving can persist an over-cap value or
-// cross an authorization/capability line.
+// weaker than signals (whose sends ride the thread-DO lease), because this
+// router writes D1 directly. Core's own Agent.updateObjectiveOptions has the
+// identical non-atomic read-then-write, so concurrent mutations are
+// last-write-wins within the deployment. The maxRuns cap is enforced on every
+// write, so no interleaving can persist an over-cap value or cross an
+// authorization/capability line.
 
 import type { GoalObjectiveRecord } from '@mastra/core/storage';
 import {
@@ -190,8 +190,11 @@ export interface ObjectiveRouterOptions {
   /**
    * The deployment execution fence, or `'none'` for a router with no database
    * behind it. A standing objective is authored work — it is what the agent
-   * loop re-reads to decide it should run again — so SET, UPDATE, and CLEAR are
-   * refused past `open` while GET stays available in every state.
+   * loop re-reads to decide it should run again — so SET and UPDATE are
+   * refused past `open`. CLEAR stays available in every state because it
+   * removes a standing instruction rather than arming one (the same reason
+   * schedule pause and delete are exempt), and GET stays available in every
+   * state.
    *
    * REQUIRED: this router receives a store facade, not a database, so the host
    * is the only place the wiring can happen. See ExecutionFenceWiring.

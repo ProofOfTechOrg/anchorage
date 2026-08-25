@@ -710,7 +710,7 @@ export class D1ApprovalStore implements ApprovalStore {
     const values: unknown[] = [];
     appendListFilters(filter, where, values);
     const clause = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : '';
-    // D3: default a bare list() to the max, so a repeated poll can never fall
+    // Bound a bare list() to the maximum, so a repeated poll can never fall
     // back to an unbounded SELECT.
     const limit = clampApprovalLimit(filter.limit) ?? MAX_APPROVAL_LIST_LIMIT;
     const { results } = await this.#db

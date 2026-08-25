@@ -500,6 +500,19 @@ describe('execution fence admission predicates', () => {
 });
 
 describe('doErrorResponse', () => {
+  it('maps an invalid fence request to 400 with its reason code', async () => {
+    const error = new InvalidExecutionFenceRequestError('state is invalid');
+    const response = doErrorResponse(error);
+
+    expect(error.status).toBe(400);
+    expect(error.reason.code).toBe('INVALID_EXECUTION_FENCE_REQUEST');
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      error: 'state is invalid',
+      reason: { code: 'INVALID_EXECUTION_FENCE_REQUEST' },
+    });
+  });
+
   it('maps an ExecutionFencedError to 503 with its reason code', async () => {
     const response = doErrorResponse(
       new ExecutionFencedError('migration-locked', 'run start'),

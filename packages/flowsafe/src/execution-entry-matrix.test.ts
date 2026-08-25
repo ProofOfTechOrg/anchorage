@@ -988,38 +988,37 @@ const GATE_SITES: ReadonlyArray<{
  */
 const NOT_GATE_FILES = ['do-runner/execution-fence.ts', 'do-runner/index.ts'];
 
-/**
- * Every `admits*(` call in the package's source, as (file, predicate) pairs.
- *
- * `process.getBuiltinModule` rather than an import: this package's test
- * tsconfig is workers-typed and carries no `@types/node`, so a static `node:`
- * specifier does not type-check — the same idiom the schema guard uses to reach
- * `node:sqlite`.
- */
-function gateCallSites(): Array<{ file: string; predicate: PredicateName }> {
-  const fs = (
+type SourceFileSystem = {
+  existsSync(path: string | URL): boolean;
+  readdirSync(
+    path: string,
+    options: { withFileTypes: true },
+  ): Array<{ name: string; isDirectory: () => boolean }>;
+  readFileSync(path: string, encoding: string): string;
+};
+
+function sourceFileSystem(): SourceFileSystem {
+  return (
     globalThis as {
       process?: { getBuiltinModule?: (id: string) => unknown };
     }
-  ).process?.getBuiltinModule?.('node:fs') as {
-    readdirSync: (
-      path: string,
-      options: { withFileTypes: true },
-    ) => Array<{ name: string; isDirectory: () => boolean }>;
-    readFileSync: (path: string, encoding: string) => string;
-  };
-  // This module's OWN directory, never `process.cwd()`: the working directory
-  // is the package under a filtered run and the workspace root under the root
-  // `pnpm test`, so a cwd-relative path passes one and throws ENOENT on the
-  // other — and the root run is the one CI actually gates on.
-  // The cast is for the TYPE, not the value: this package's test tsconfig is
-  // workers-typed, and its ambient `ImportMeta` does not declare `url` — which
-  // every ESM runtime, vitest's included, provides.
+  ).process?.getBuiltinModule?.('node:fs') as SourceFileSystem;
+}
+
+type SourceFile = { readonly file: string; readonly source: string };
+
+function sourceRoot(): string {
+  // This module's OWN directory, never `process.cwd()`: filtered and root test
+  // runs use different working directories.
   const here = (import.meta as ImportMeta & { url: string }).url;
-  const root = new URL('.', here).pathname.replace(/\/$/, '');
-  const found: Array<{ file: string; predicate: PredicateName }> = [];
-  const pattern =
-    /\badmits(RunStart|ExistingRun|WorkAuthoring|DrainableExecution)\s*\(/g;
+  return new URL('.', here).pathname.replace(/\/$/, '');
+}
+
+function walkSourceFiles(
+  root: string,
+  visit: (sourceFile: SourceFile) => void,
+): void {
+  const fs = sourceFileSystem();
   const walk = (directory: string, prefix: string): void => {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       const absolute = `${directory}/${entry.name}`;
@@ -1028,21 +1027,237 @@ function gateCallSites(): Array<{ file: string; predicate: PredicateName }> {
         walk(absolute, relative);
         continue;
       }
-      if (!entry.name.endsWith('.ts') || entry.name.endsWith('.test.ts')) {
+      if (
+        !/\.(?:ts|tsx)$/.test(entry.name) ||
+        /\.(?:test|stories)\.(?:ts|tsx)$/.test(entry.name)
+      ) {
         continue;
       }
-      if (NOT_GATE_FILES.includes(relative)) continue;
-      const source = fs.readFileSync(absolute, 'utf8');
-      for (const match of source.matchAll(pattern)) {
-        found.push({
-          file: relative,
-          predicate: `admits${match[1] as string}` as PredicateName,
-        });
-      }
+      visit({ file: relative, source: fs.readFileSync(absolute, 'utf8') });
     }
   };
   walk(root, '');
+}
+
+/**
+ * Every `admits*(` call in the package's source, as (file, predicate) pairs.
+ *
+ * `process.getBuiltinModule` rather than an import: this package's test
+ * tsconfig is workers-typed and carries no `@types/node`, so a static `node:`
+ * specifier does not type-check. This is the schema guard's idiom for reaching
+ * `node:sqlite`.
+ */
+function gateCallSites(): Array<{ file: string; predicate: PredicateName }> {
+  const found: Array<{ file: string; predicate: PredicateName }> = [];
+  const pattern =
+    /\badmits(RunStart|ExistingRun|WorkAuthoring|DrainableExecution)\s*\(/g;
+  walkSourceFiles(sourceRoot(), ({ file, source }) => {
+    if (NOT_GATE_FILES.includes(file)) return;
+    for (const match of source.matchAll(pattern)) {
+      found.push({
+        file,
+        predicate: `admits${match[1] as string}` as PredicateName,
+      });
+    }
+  });
   return found;
+}
+
+type FenceErrorName = 'ExecutionFencedError' | 'ExecutionFenceUnreadableError';
+
+/**
+ * Every production site that AUTHORS a fence refusal or unreadable-store
+ * failure. Each row states why the error is constructed before execution can
+ * have an effect; the source scan below makes a new author fail until its
+ * boundary is reviewed and recorded here. The census is deliberately lexical:
+ * a constructor spelling in a comment or string fails loud and asks for review.
+ * Aliased class names and namespace imports are forbidden so lexical coverage
+ * cannot be bypassed without first changing this test.
+ */
+const FENCE_ERROR_AUTHORS: ReadonlyArray<{
+  file: string;
+  error: FenceErrorName;
+  anchor: string;
+  beforeExecutionEffect: string;
+}> = [
+  {
+    file: 'approval-api/service.ts',
+    error: 'ExecutionFencedError',
+    anchor: 'async #assertDecidable',
+    beforeExecutionEffect:
+      'The admission check runs before decide() mutates the approval or resumes its run.',
+  },
+  {
+    file: 'background-tasks/host.ts',
+    error: 'ExecutionFencedError',
+    anchor: '#gated(executor',
+    beforeExecutionEffect:
+      'The executor backstop refuses before calling a tool body when core supplies no suspension seam.',
+  },
+  {
+    file: 'background-tasks/host.ts',
+    error: 'ExecutionFencedError',
+    anchor: 'async enqueue(',
+    beforeExecutionEffect:
+      'The enqueue admission check runs before the manager creates a queued task row.',
+  },
+  {
+    file: 'do-runner/durable-object.ts',
+    error: 'ExecutionFencedError',
+    anchor: 'const startFence =',
+    beforeExecutionEffect:
+      'The start route refuses before source lookup, recovery journalling, owner reservation, or runtime start.',
+  },
+  {
+    file: 'do-runner/durable-object.ts',
+    error: 'ExecutionFencedError',
+    anchor: 'const resumeFence =',
+    beforeExecutionEffect:
+      'The resume route refuses before handing the existing run to runtime.resume().',
+  },
+  {
+    file: 'do-runner/execution-fence.ts',
+    error: 'ExecutionFencedError',
+    anchor: 'export function executionFencedResponse',
+    beforeExecutionEffect:
+      'The response helper only serializes an already-decided refusal and performs no execution effect.',
+  },
+  {
+    file: 'do-runner/execution-fence.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: 'function readingFromRow',
+    beforeExecutionEffect:
+      'Fence-row validation fails closed before any caller can admit execution.',
+  },
+  {
+    file: 'do-runner/execution-fence.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: 'async read(): Promise<ExecutionFenceReading>',
+    beforeExecutionEffect:
+      'A failed fence read becomes unreadable before an admission predicate can run.',
+  },
+  {
+    file: 'do-runner/execution-fence.ts',
+    error: 'ExecutionFenceUnreadableError',
+    anchor: 'async recordProofRun(',
+    beforeExecutionEffect:
+      'A failed proof-binding metadata write becomes unreadable before the runtime starts the run.',
+  },
+  {
+    file: 'do-runner/runtime.ts',
+    error: 'ExecutionFencedError',
+    anchor: 'if (!admitsRunStart(reading, idempotencyKey))',
+    beforeExecutionEffect:
+      'The start admission check refuses before proof binding and engine run creation.',
+  },
+  {
+    file: 'do-runner/runtime.ts',
+    error: 'ExecutionFencedError',
+    anchor: 'if (!(await fence.recordProofRun',
+    beforeExecutionEffect:
+      'A lost proof-binding compare-and-set refuses while engine run creation has not begun.',
+  },
+  {
+    file: 'do-runner/runtime.ts',
+    error: 'ExecutionFencedError',
+    anchor: 'async #assertResumeFence',
+    beforeExecutionEffect:
+      'The resume admission check refuses before the engine continues the existing run.',
+  },
+  {
+    file: 'signal-providers/host-do.ts',
+    error: 'ExecutionFencedError',
+    anchor: 'async poll(): Promise<PollResult>',
+    beforeExecutionEffect:
+      'The poll admission check refuses before any provider is polled or notification is delivered.',
+  },
+];
+
+function fenceErrorAuthorSites(): Array<{
+  file: string;
+  error: FenceErrorName;
+  line: number;
+}> {
+  const found: Array<{ file: string; error: FenceErrorName; line: number }> =
+    [];
+  const pattern =
+    /\bnew\s+(ExecutionFencedError|ExecutionFenceUnreadableError)\s*\(/g;
+  walkSourceFiles(sourceRoot(), ({ file, source }) => {
+    for (const match of source.matchAll(pattern)) {
+      found.push({
+        file,
+        error: match[1] as FenceErrorName,
+        line: source.slice(0, match.index).split('\n').length,
+      });
+    }
+  });
+  return found;
+}
+
+const FENCE_ERROR_CENSUS_PATTERNS = [
+  {
+    pattern:
+      /\b(?:ExecutionFencedError|ExecutionFenceUnreadableError)\s+as\s+\w+/g,
+    message:
+      'import the fence error classes under their own names so the census can see the site, or reword a comment that spells one of these class names followed by `as`',
+  },
+  {
+    pattern:
+      /\bnew\s+\w+\.(?:ExecutionFencedError|ExecutionFenceUnreadableError)\s*\(/g,
+    message:
+      'construct the fence error classes under their own imported names so the census can see the site',
+  },
+  {
+    pattern:
+      /\bextends\s+(?:\w+\.)*(?:ExecutionFencedError|ExecutionFenceUnreadableError)\b/g,
+    message:
+      'subclassing the fence error classes is not census-visible; author fence refusals with the two classes directly',
+  },
+] as const;
+
+function matchesFenceErrorCensusViolation(source: string): boolean {
+  return FENCE_ERROR_CENSUS_PATTERNS.some(({ pattern }) =>
+    new RegExp(pattern.source, pattern.flags).test(source),
+  );
+}
+
+function fenceErrorCensusViolations(): string[] {
+  const found: string[] = [];
+  walkSourceFiles(sourceRoot(), ({ file, source }) => {
+    for (const { pattern, message } of FENCE_ERROR_CENSUS_PATTERNS) {
+      for (const match of source.matchAll(pattern)) {
+        const line = source.slice(0, match.index).split('\n').length;
+        found.push(`${file}:${line}: ${message}: ${match[0]}`);
+      }
+    }
+  });
+  return found;
+}
+
+const ANCHOR_WINDOW_LINES = 30;
+const sourceLinesByFile = new Map<string, readonly string[]>();
+
+function anchorDistanceBeforeAuthor(
+  author: (typeof FENCE_ERROR_AUTHORS)[number],
+  site: ReturnType<typeof fenceErrorAuthorSites>[number],
+): number | undefined {
+  let lines = sourceLinesByFile.get(site.file);
+  if (!lines) {
+    lines = sourceFileSystem()
+      .readFileSync(`${sourceRoot()}/${site.file}`, 'utf8')
+      .split('\n');
+    sourceLinesByFile.set(site.file, lines);
+  }
+  for (
+    let index = site.line - 2;
+    index >= Math.max(0, site.line - (ANCHOR_WINDOW_LINES + 1));
+    index -= 1
+  ) {
+    if (lines[index]?.includes(author.anchor)) {
+      return site.line - (index + 1);
+    }
+  }
+  return undefined;
 }
 
 function siteKey(site: { file: string; predicate: string }): string {
@@ -1050,6 +1265,63 @@ function siteKey(site: { file: string; predicate: string }): string {
 }
 
 describe('execution-entry matrix', () => {
+  it('rejects aliases, qualified construction, and subclassing census escapes', () => {
+    const escapes = [
+      "import { ExecutionFencedError as HiddenFenceError } from './do-runner/index.js';",
+      'new fence.ExecutionFenceUnreadableError()',
+      'class HiddenFenceError extends ExecutionFencedError {}',
+      'class HiddenFenceError extends fence.ExecutionFencedError {}',
+    ];
+
+    expect(escapes.map(matchesFenceErrorCensusViolation)).toEqual([
+      true,
+      true,
+      true,
+      true,
+    ]);
+  });
+
+  it('accounts for every production fence-error author, with a recorded pre-execution justification', () => {
+    expect(
+      fenceErrorCensusViolations(),
+      'fence-error construction must stay visible to the lexical census',
+    ).toEqual([]);
+    const sites = fenceErrorAuthorSites();
+    expect(sites).toHaveLength(FENCE_ERROR_AUTHORS.length);
+    const anchored = new Map<
+      (typeof sites)[number],
+      (typeof FENCE_ERROR_AUTHORS)[number]
+    >();
+    for (const site of sites) {
+      const candidates = FENCE_ERROR_AUTHORS.flatMap((author) => {
+        if (author.file !== site.file || author.error !== site.error) return [];
+        const distance = anchorDistanceBeforeAuthor(author, site);
+        return distance === undefined ? [] : [{ author, distance }];
+      });
+      const nearest = Math.min(...candidates.map(({ distance }) => distance));
+      const authors = candidates.filter(({ distance }) => distance === nearest);
+      expect(
+        authors.map(({ author }) => author.anchor),
+        `${site.file}:${site.line} must have one declared anchor in the preceding ${ANCHOR_WINDOW_LINES} lines`,
+      ).toHaveLength(1);
+      const author = authors[0]?.author;
+      if (author) anchored.set(site, author);
+    }
+    for (const author of FENCE_ERROR_AUTHORS) {
+      const sitesForAnchor = sites.filter(
+        (site) => anchored.get(site) === author,
+      );
+      expect(
+        sitesForAnchor.map((site) => site.line),
+        `${author.file} :: ${author.error} :: ${author.anchor} must anchor one author site`,
+      ).toHaveLength(1);
+      expect(
+        author.beforeExecutionEffect.length,
+        `${author.file} :: ${author.error} :: ${author.anchor} needs a substantive pre-execution justification`,
+      ).toBeGreaterThan(40);
+    }
+  });
+
   it('accounts for every admission call site in the source, and for no site that is gone', () => {
     // #given — the drives below can only prove the gates somebody listed. This
     // is what catches the gate nobody listed: a new execution entry, or a check
@@ -1068,10 +1340,18 @@ describe('execution-entry matrix', () => {
     // #given — `drivenBy` is either a matrix entry above or a test file. A
     // typo in the first would silently turn a driven gate into a delegated one.
     const entryNames = new Set(ENTRIES.map((entry) => entry.name));
+    const fs = sourceFileSystem();
+    const here = (import.meta as ImportMeta & { url: string }).url;
 
     // #then
     for (const site of GATE_SITES) {
-      if (site.drivenBy.endsWith('.test.ts')) continue;
+      if (site.drivenBy.endsWith('.test.ts')) {
+        expect(
+          fs.existsSync(new URL(site.drivenBy, here)),
+          `${siteKey(site)} delegates to missing suite '${site.drivenBy}'`,
+        ).toBe(true);
+        continue;
+      }
       expect(
         entryNames,
         `${siteKey(site)} claims to be driven by '${site.drivenBy}', which is not a matrix entry`,

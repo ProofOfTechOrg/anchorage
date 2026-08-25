@@ -9,11 +9,13 @@ import type {
 } from './types.js';
 
 /**
- * The whole convergence budget stays well inside the fleet lease renewal
- * interval, so a promote path that attests while holding the lease cannot spend
- * its lease waiting on the provider. This schedule caps a single convergence at
- * ten attempts, and an attempt costs two provider reads — twenty reads at worst
- * against the shared 1,100-request window the rate coordinator fences.
+ * The default 60-second convergence budget stays well inside the default
+ * five-minute fleet lease renewal interval, so a promote path that attests
+ * while holding the lease cannot spend its lease waiting on the provider. The
+ * default schedule caps a single convergence at ten attempts. Each attempt
+ * spends two provider reads on the plain-Worker backend or three on Workers for
+ * Platforms — twenty to thirty reads at worst against the default shared
+ * 1,100-request-per-five-minute window the rate coordinator fences.
  */
 const DEFAULT_CONVERGENCE_BUDGET_MS = 60_000;
 const DEFAULT_INITIAL_RETRY_DELAY_MS = 1_000;
@@ -210,6 +212,8 @@ export async function attestConvergedActiveRoute(
       { attestation: lastAttestation },
     );
   }
+  // The ?? fallbacks are defensive: the loop always attempts once, so one of
+  // lastAttestation / lastRefusal is always set.
   throw new ActiveRouteAttestationError(
     `${unconverged}: ${lastRefusal?.message ?? 'no attestation was produced'}`,
     lastRefusal?.observed ?? {},
@@ -231,9 +235,10 @@ export async function attestConvergedActiveRoute(
  * rendering fleet state wants to show drift, not fail on it. Only a provider
  * that cannot be attested at all throws.
  *
- * NOT for per-request status rendering. Each call spends two provider reads
- * against a 1,100-request-per-five-minute account-wide budget shared by every
- * provisioning operation, so a status surface with any traffic at all must
+ * NOT for per-request status rendering. Each single-shot call spends two
+ * provider reads on the plain-Worker backend or three on Workers for Platforms,
+ * against a default 1,100-request-per-five-minute account-wide budget shared by
+ * every provisioning operation. A status surface with any traffic at all must
  * cache these results rather than attest per request.
  */
 export async function attestFleetRecordActiveRoute(input: {

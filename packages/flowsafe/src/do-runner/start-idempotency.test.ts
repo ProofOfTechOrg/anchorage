@@ -15,6 +15,7 @@ import {
   type SqliteDatabase,
   sqliteUnitDatabase,
 } from '../../test-support/sqlite.js';
+import { doErrorResponse } from './do-error-response.js';
 import type { ExecutionFenceDatabase } from './execution-fence.js';
 import {
   ExecutionFencedError,
@@ -27,6 +28,7 @@ import {
   type IdempotentStartSurface,
   IdempotentStartUnresolvableError,
   InvalidStartIdempotencyRequestError,
+  isStartReservationRefusal,
   requireStartIdempotency,
   rollbackFencedStart,
   START_IDEMPOTENCY_TABLE,
@@ -74,6 +76,58 @@ const EMPTY_SURFACE: IdempotentStartSurface<string> = {
   live: async () => false,
 };
 
+describe('start idempotency error taxonomy', () => {
+  it('publishes the invalid-request status and reason code', async () => {
+    const error = new InvalidStartIdempotencyRequestError('key is malformed');
+    const response = doErrorResponse(error);
+
+    expect(error.status).toBe(400);
+    expect(error.reason.code).toBe('INVALID_START_IDEMPOTENCY_REQUEST');
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      error: 'key is malformed',
+      reason: { code: 'INVALID_START_IDEMPOTENCY_REQUEST' },
+    });
+  });
+});
+
+describe('isStartReservationRefusal', () => {
+  it('recognizes every union member and excludes unreadable storage', () => {
+    const reservation: StartReservation = {
+      key: 'key-1',
+      owner: OWNER,
+      targetKind: 'workflow',
+      targetId: 'payout',
+      runId: 'run-1',
+      state: 'started',
+      createdAt: 1_000,
+      updatedAt: 2_000,
+    };
+    const refusals = [
+      new StartReservationOwnerMismatchError('key-1'),
+      new StartReservationTargetMismatchError('key-1', reservation),
+      new IdempotentStartPendingError(reservation),
+      new IdempotentStartUnresolvableError(reservation),
+      new IdempotentStartAlreadySettledError(reservation),
+      new StartIdempotencyUnsupportedError(),
+      new InvalidStartIdempotencyRequestError('key is malformed'),
+    ];
+
+    expect(refusals.map(isStartReservationRefusal)).toEqual([
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+    ]);
+    expect(
+      isStartReservationRefusal(new StartReservationUnreadableError('key-1')),
+    ).toBe(false);
+  });
+});
+
 describe('StartIdempotencyStore.reserve', () => {
   it('creates the reservation and reports the caller as its creator', async () => {
     // #given a key nobody has used
@@ -83,7 +137,7 @@ describe('StartIdempotencyStore.reserve', () => {
     const outcome = await store.reserve(workflowRequest('key-1', 'run-1'));
 
     // #then the caller owns the start, and the row records exactly what it
-    // minted — the store never generates a run id of its own (INV-1).
+    // minted — the store never generates a run id of its own.
     expect(outcome.created).toBe(true);
     expect(outcome.reservation).toMatchObject({
       key: 'key-1',
@@ -391,7 +445,7 @@ describe('StartIdempotencyStore against a missing table', () => {
     await store.reservationsForRuns(['run-1']);
 
     // #then no lazy DDL: a read path that emits CREATE TABLE is a write path
-    // wearing a read's name, and F2's drain inventory reads this table on every
+    // wearing a read's name, and the drain inventory reads this table on every
     // sweep of a deployment that is deliberately not executing.
     const tables = sqlite
       .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name = ?`)
@@ -964,7 +1018,7 @@ describe('requireStartIdempotency', () => {
 
 describe('reservationsForRuns', () => {
   it('returns every reservation naming the given runs', async () => {
-    // #given — the F2 inventory and the purge both ask this question
+    // #given — the drain inventory and the purge both ask this question
     const { store } = harness();
     await store.reserve(workflowRequest('key-1', 'run-1'));
     await store.reserve(workflowRequest('key-2', 'run-2'));

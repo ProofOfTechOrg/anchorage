@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track E (M-007), CI-M-007-003 — webhook ingress that terminates on the Worker,
-// plus the human-only subscribe/unsubscribe surface (DL-006/DL-017).
+// Webhook ingress that terminates on the Worker, plus the human-only
+// subscribe/unsubscribe surface.
 //
 // THE WEBHOOK GATE (its "auth" IS the signature, not a bearer token):
 //   1. path + method match (else null / 405)
@@ -9,7 +9,7 @@
 //   3. read the RAW bytes, size-capped (413)
 //   4. VERIFY the provider signature over the raw bytes — BEFORE any parse, any
 //      subscription lookup, any delivery. A forged signature is REJECTED (401)
-//      and audited (E-S2). No state is touched on the reject path.
+//      and audited. No state is touched on the reject path.
 //   5. parse JSON (400 on malformed)
 //   6. extract the external resource key(s) from the payload
 //   7. map key -> deployment subscription rows — the payload NEVER names a
@@ -25,8 +25,8 @@
 // writing one line per attempt. Build the router ONCE per isolate (it needs no
 // per-request resolver) so that window persists across requests.
 //
-// Subscribe/unsubscribe are WRITE-CLASS and stay human-only HTTP (RA-009): never
-// exposed as agent tools. They mint NO capability (P8) — a subscription row is
+// Subscribe/unsubscribe are WRITE-CLASS and stay human-only HTTP: never
+// exposed as agent tools. They mint NO capability — a subscription row is
 // addressing/config, not a grant.
 
 import type { SendNotificationSignalInput } from '@mastra/core/notifications';
@@ -539,7 +539,7 @@ export function createWebhookRouter(
   };
 }
 
-// --- Subscription CRUD (human-only HTTP; RA-009) --------------------------
+// --- Subscription CRUD (human-only HTTP) -------------------------------
 
 export interface SubscriptionRouterOptions {
   /** Authenticate and validate the actor; undefined means 401. */

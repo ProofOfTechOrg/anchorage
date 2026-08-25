@@ -1,37 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track D (M-006), CI-M-006-002 — createScheduleTick. WE OWN THE TICK (DL-012):
-// a Durable Object alarm drives listDueSchedules -> CAS
-// updateScheduleNextFire claim -> fire, bypassing core's pubsub worker loop
-// entirely (the P1 "one chokepoint, no second execution path" rule). Core's own
-// pubsub-driven schedule-worker loop is deliberately not adopted.
+// createScheduleTick. WE OWN THE TICK: a Durable Object alarm drives
+// listDueSchedules -> CAS updateScheduleNextFire claim -> fire, bypassing
+// core's pubsub worker loop entirely under the "one chokepoint, no second
+// execution path" rule. It does not adopt core's pubsub-driven schedule worker.
 //
 // TARGET KINDS:
 //  - WORKFLOW targets: mint a fresh path-safe runId and fire
 //    through the host's run-start seam (topology.start / RunnerRuntime.start),
-//    so the run inherits INV-1, the per-leg requestContext derivation, and the
-//    snapshot provenance. This is the fully-owned path.
+//    so the run inherits host-owned run ids, per-leg requestContext derivation,
+//    and snapshot provenance. This is the fully-owned path.
 //  - AGENT targets: `startAgent` routes the claimed target through the host's
 //    runtime-driven thread DO. Without that seam, the tick retains the audited
 //    `agent-target-unsupported` skip and never adopts core's worker.
 //
-// CAP (DL-007, P7): every unattended workflow start consults an INJECTABLE
-// run-cap seam (host-agnostic; the showcase's demo caps are one implementation).
-// A capped deployment yields an audited skip and the schedule stays healthy — the
-// CAS claim already advanced nextFireAt, so a capped fire is CONSUMED, not
-// retried hot (spike D-S4).
+// CAP: every unattended workflow start consults an INJECTABLE run-cap seam.
+// The showcase's demo caps are one implementation. A capped deployment yields
+// an audited skip and the schedule stays healthy: the CAS claim already
+// advanced nextFireAt, so the capped fire is consumed without a hot retry.
 //
-// STORED-CONTEXT BARRIER (b) (DL-004/R-004): a schedule's stored
-// WorkflowSchedule.requestContext is NEVER forwarded verbatim into a fired leg.
-// The tick STRIPS every reserved key (the whole `breakwater.` namespace + core's
-// goal key) before handing the remainder to the start seam. The reserved set IS
-// exactly the keys #requestContextFor derives (the two scope keys + the grant
-// key), so a stripped context shares NO key with the runtime-derived context —
-// there is normally nothing to collide. buildScheduledLegContext keeps the
-// R-004 order (stored FIRST, runtime-derived LAST) as defense-in-depth for a host
-// that applies the stored context, so a reserved key that ever slipped the strip
-// still LOSES to the runtime value. The DO target resolves this sanitized
-// context from the exact prepared trigger snapshot and RunnerRuntime merges it
-// below provider/runtime-derived values; it never trusts a forwarded body copy.
+// STORED-CONTEXT BARRIER: a schedule's stored WorkflowSchedule.requestContext
+// is NEVER forwarded verbatim into a fired leg. The tick STRIPS every reserved
+// key: the whole `breakwater.` namespace and core's goal key, before handing
+// the remainder to the start seam. The reserved set exactly matches
+// #requestContextFor's keys: two scope keys and the grant key. A stripped
+// context shares NO key with the runtime-derived context. There is normally
+// nothing to collide. buildScheduledLegContext keeps the stored context FIRST
+// and the runtime-derived context LAST. For a host applying stored context, a
+// reserved key that slips the strip still LOSES to the runtime value. The DO
+// target resolves this sanitized context from the exact prepared trigger
+// snapshot. RunnerRuntime merges it below provider/runtime-derived values. It
+// never trusts a forwarded body copy.
 
 import { ScheduleInputSchema } from '@mastra/core/schedules';
 import { computeNextFireAt } from '@mastra/core/workflows';
@@ -976,10 +974,10 @@ export function createScheduleTick(
     // claim even when a cap later consumes it without dispatch.
     const runId = mintPathSafeId('scheduleTick');
 
-    // 3. CAS claim — the single-claim gate (spike D-S1). The LOSER of two
+    // 3. CAS claim — the single-claim gate. The LOSER of two
     // concurrent ticks gets false here and dispatches nothing. This serializes
     // the claim only; downstream dispatch remains recoverable/at-least-once.
-    // The cap is consulted AFTER the claim (DL-007), so `runId` is minted before
+    // The cap is consulted AFTER the claim, so `runId` is minted before
     // we know whether the fire will actually dispatch: on a capped fire the row's
     // `lastRunId` records this CLAIM's id though no run started. The trigger row
     // is the authoritative record of what happened (outcome + its own runId,
@@ -1356,10 +1354,10 @@ export function createScheduleTick(
       return;
     }
 
-    // 5. Workflow target: consult the run cap (DL-007).
+    // 5. Workflow target: consult the run cap.
     const allowed = options.runCap ? await options.runCap() : true;
     if (!allowed) {
-      // Capped: the schedule stays healthy (already advanced), audited (D-S4).
+      // Capped: the schedule stays healthy (already advanced) and is audited.
       result.skipped += 1;
       await store.recordTrigger({
         ...claimTrigger,

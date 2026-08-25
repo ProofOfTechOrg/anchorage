@@ -52,8 +52,8 @@ import { isPathSafeId } from './path-safe-id.js';
 /**
  * Rows affected by a write, read from D1's `{ meta: { changes } }` envelope —
  * the same accessor d1-storage exports as `d1Changes`, restated here so this
- * module imports only leaves. Every surface that consults the fence imports
- * it, including ones that must not drag the D1 storage adapter (and
+ * module imports only leaf modules. Every surface that consults the fence
+ * imports it, including ones that must not drag the D1 storage adapter (and
  * @mastra/cloudflare-d1 with it) into their bundle.
  */
 function changesOf(result: unknown): number {
@@ -83,6 +83,22 @@ function changesOf(result: unknown): number {
  * store, the refusals, and the admission predicates.
  */
 export type ExecutionFenceState = (typeof EXECUTION_FENCE_STATES)[number];
+
+/**
+ * The suspend-payload key the executor backstop stamps on a task it parked
+ * because the deployment was fenced mid-dispatch. Namespaced so it cannot
+ * collide with a tool's own suspend payload, and read back by
+ * `BackgroundTaskHost.#resumeFenceSuspendedTasks` — which is what makes the
+ * parking reversible rather than a quieter kind of loss.
+ *
+ * PUBLISHED via `./background-tasks` because it is the only way a host can tell
+ * a fence-parked row from a tool-suspended one: `listTasks({ status:
+ * 'suspended' })` returns both, and the marker lives in the suspend payload
+ * where no filter can express it. The drain inventory imports this same
+ * definition directly, so a rename cannot silently leave a hard-coded census
+ * predicate behind.
+ */
+export const EXECUTION_FENCE_SUSPEND_KEY = 'flowsafe.executionFenced';
 
 /**
  * How a surface is wired to the fence: a store, or the typed opt-out.
@@ -404,10 +420,12 @@ export function assertExecutionFenceState(
 /** A malformed control-plane fence request — the caller's to fix. */
 export class InvalidExecutionFenceRequestError extends DoStatusError {
   readonly status = 400;
+  readonly reason: { readonly code: 'INVALID_EXECUTION_FENCE_REQUEST' };
 
   constructor(message: string) {
     super(message);
     this.name = 'InvalidExecutionFenceRequestError';
+    this.reason = { code: 'INVALID_EXECUTION_FENCE_REQUEST' };
   }
 }
 

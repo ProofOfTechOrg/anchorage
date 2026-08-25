@@ -47,15 +47,22 @@ export function fleetSettlementKey(input: {
  * Resolves the snapshot a settlement reports as its target.
  *
  * Two adjustments, both narrow. A planned release still carrying the `pending`
- * sentinel takes the attested version, because a key built from `pending` would
- * differ on every retry and defeat deduplication.
+ * sentinel takes the attested version. A key built from the constant `pending`
+ * would repeat across retries of that pass, but it would not match the key the
+ * same release produces once its provider version is known; a later converge
+ * would therefore settle that already-settled release again.
+ *
+ * The settlement key has four inputs. `tenantTag` and `environment` are
+ * control-plane identity from the record. With a persisted target snapshot,
+ * `specDigest` comes from that snapshot and `artifactVersion` does too, unless
+ * its `pending` sentinel is replaced by the attestation. Without a snapshot,
+ * both release fields come from the attestation.
  *
  * A deployment with no release snapshots at all — the plain backend keeps
  * none — gets one synthesized, and it is a MIXED record rather than a provider
- * reading. `physicalScriptName`, `specDigest`, and `artifactVersion` are the
- * attestation's, so the three fields the settlement key is built from are
- * provider truth. `releaseSchemaVersion` and `application` are copied from the
- * control-plane record, because no provider read reports them; they are what
+ * reading. `physicalScriptName`, `specDigest`, and `artifactVersion` are
+ * attested. `releaseSchemaVersion` and `application` are copied from the
+ * control-plane record because no provider read reports them; they are what
  * this deployment believes it deployed, and a host must not treat them as
  * attested.
  */

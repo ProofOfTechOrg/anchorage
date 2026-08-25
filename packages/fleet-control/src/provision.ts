@@ -5,6 +5,7 @@ import { assertInitialExecutionFenceState } from '@proofoftech/flowsafe/deployme
 import {
   type AttestConvergedActiveRouteOptions,
   attestConvergedActiveRoute,
+  PENDING_ARTIFACT_VERSION,
 } from './active-route.js';
 import {
   applicationBindingTopology,
@@ -85,7 +86,8 @@ function activeExternalRelease(
 ): import('./types.js').ExternalReleaseSnapshot | undefined {
   return (
     record.activeRelease ??
-    (record.backend === 'plain-worker' && record.artifactVersion !== 'pending'
+    (record.backend === 'plain-worker' &&
+    record.artifactVersion !== PENDING_ARTIFACT_VERSION
       ? {
           physicalScriptName: record.scriptName,
           specDigest: record.desiredSpecDigest,
@@ -168,7 +170,7 @@ function recordAt(
     databaseId: database.id,
     databaseName: database.name,
     schemaVersion: options.schemaVersion ?? 0,
-    artifactVersion: options.artifactVersion ?? 'pending',
+    artifactVersion: options.artifactVersion ?? PENDING_ARTIFACT_VERSION,
     desiredSpecDigest: deploymentSpecDigest(spec),
     durableObjectBindings: options.durableObjectBindings ?? [],
     applicationResources,
@@ -308,7 +310,7 @@ export function assertExternalReleaseArtifactVersion(
   release: import('./types.js').ExternalReleaseSnapshot,
   context: string,
 ): void {
-  if (release.artifactVersion === 'pending') return;
+  if (release.artifactVersion === PENDING_ARTIFACT_VERSION) return;
   if (
     !live ||
     live.scriptName !== release.physicalScriptName ||
@@ -1053,7 +1055,7 @@ async function provisionDeploymentUnderLease(
         secrets,
         record.platformResources,
         lease,
-        immutableExternal ? 'pending' : undefined,
+        immutableExternal ? PENDING_ARTIFACT_VERSION : undefined,
         record.applicationBindings,
       );
       workerCreated = deployed.created;
@@ -1132,7 +1134,8 @@ async function provisionDeploymentUnderLease(
           record.platformResources,
           lease,
           immutableExternal
-            ? (record.pendingRelease?.artifactVersion ?? 'pending')
+            ? (record.pendingRelease?.artifactVersion ??
+                PENDING_ARTIFACT_VERSION)
             : undefined,
           record.applicationBindings,
         );

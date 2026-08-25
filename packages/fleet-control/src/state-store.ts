@@ -155,12 +155,15 @@ const FLEET_ROW_COLUMNS = [
  * that silently failed to appear would not fail a write, it would drop the
  * value on every write.
  */
-const ADDED_NULLABLE_TEXT_COLUMNS = [
+export const ADDED_NULLABLE_TEXT_COLUMNS = [
   'backend_switch_intent',
   'settled_settlement_key',
 ] as const;
 
-function isDuplicateColumnError(error: unknown, column: string): boolean {
+function isDuplicateColumnError(
+  error: unknown,
+  column: (typeof ADDED_NULLABLE_TEXT_COLUMNS)[number],
+): boolean {
   const duplicate = new RegExp(`duplicate column name:\\s*${column}\\b`, 'iu');
   let current = error;
   const seen = new Set<Error>();

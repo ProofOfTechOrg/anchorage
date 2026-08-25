@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// The stream surface every streaming host mounts (DL-010, DL-015, DL-009),
-// mirroring createRunRouter's shape: plain fetch routing that returns `null` for
-// paths outside its ownership so the composer can compose it, and `Response` for
-// everything under `/api/stream/`. Because every route is namespaced under
-// `/api/stream/`, the hosts' existing `/api/*` run_worker_first entry already
-// routes them — no assets-block edit (DL-015).
+// The stream surface every streaming host mounts, mirroring createRunRouter's
+// shape: plain fetch routing returns `null` for paths outside its ownership so
+// the composer can compose it, and `Response` for everything under
+// `/api/stream/`. Because every route uses that namespace, the hosts' existing
+// `/api/*` run_worker_first entry routes them without an assets-block edit.
 //
 // The Worker is the SOLE ticket-verification authority. The ticket route
 // authenticates through the shared ActorResolver and mints a short-lived HMAC

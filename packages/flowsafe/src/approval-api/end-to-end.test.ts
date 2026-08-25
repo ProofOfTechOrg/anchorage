@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Cross-package proof of the Phase 3 loop. breakwater is a devDependency
+// Cross-package proof of the approval loop. breakwater is a devDependency
 // resolved FROM SOURCE (vitest alias + tsconfig.test paths), so `pnpm -r
 // test` never needs a built breakwater dist.
 //

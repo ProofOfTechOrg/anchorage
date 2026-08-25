@@ -1160,7 +1160,7 @@ describe('createFlowsafeWorker maintenance duties', () => {
     });
   });
 
-  // Track B: the background-task TTL cleanup as the purge alarm's opt-in duty.
+  // Background-task TTL cleanup as the purge alarm's opt-in duty.
   async function seedOldCompletedTask(env: FlowsafeWorkerEnv): Promise<void> {
     await env.DB.prepare(
       `CREATE TABLE mastra_background_tasks (
@@ -1185,7 +1185,7 @@ describe('createFlowsafeWorker maintenance duties', () => {
     // #when
     await worker.runMaintenanceDuty('purge', env);
 
-    // #then — the duty never ran, byte-identical to before Track B
+    // #then — the duty never ran when the feature was absent
     const lines = maintenanceLines(logs.lines());
     expect(lines[0]).not.toHaveProperty('backgroundTasksCompletedPurged');
     expect(logs.errors()).toEqual([]);
@@ -1660,7 +1660,7 @@ describe('createFlowsafeWorker storage table prefix', () => {
   });
 });
 
-describe('createFlowsafeWorker schedule tick duty (Track D)', () => {
+describe('createFlowsafeWorker schedule tick duty', () => {
   it('the tick duty runs only the schedule tick', async () => {
     // #given a worker with a tick interval + a scheduleTick builder
     const logs = capturedLogs();
@@ -2185,7 +2185,7 @@ describe('createFlowsafeWorker drain inventory', () => {
     const body = (await index.json()) as {
       categories: Array<{ category: string; class: string }>;
       unenumerable: Array<{ name: string }>;
-      drainProof: { reachableFrom: string[] };
+      drainProof: { reading: string; reachableFrom: string[] };
     };
     expect(body.categories.filter((c) => c.class === 'work')).toHaveLength(7);
     expect(body.categories.filter((c) => c.class === 'standing')).toHaveLength(
@@ -2195,6 +2195,7 @@ describe('createFlowsafeWorker drain inventory', () => {
       'run-owner-recovery-journal',
     );
     expect(body.drainProof.reachableFrom).toEqual(['draining']);
+    expect(body.drainProof.reading).toContain('point-in-time observation');
 
     // #then — a category over a database with no tables answers EMPTY rather
     // than faulting, and creates nothing to answer with.

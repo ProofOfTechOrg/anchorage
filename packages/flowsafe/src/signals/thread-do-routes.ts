@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track C (M-004) — the signal routes hosted ON the thread DO (CI-M-004-001,
-// DL-002). A thread's agent loop and every signal for that thread both address
-// `idFromName(threadId)`, so the platform serializes them onto ONE isolate — the
-// DO IS the serialization lease Mastra otherwise wants Redis for (DL-002). These
-// routes run AFTER ThreadDurableObject.fetch has already verified the deployment
-// identity and decoded the server-stamped principal, so `scope.threadId` and
-// `scope.principal` are trusted here; the P6 ingestion gate (allowlist / size
+// The signal routes hosted ON the thread DO. A thread's agent loop and every
+// signal both address `idFromName(threadId)`, so the platform serializes them
+// onto ONE isolate. The DO IS the serialization lease Mastra otherwise wants
+// Redis for. These routes run AFTER ThreadDurableObject.fetch verifies the
+// deployment identity and decodes the server-stamped principal. The scope's
+// threadId and principal are trusted here; the ingestion gate (allowlist / size
 // cap / rate cap / audit) is the Worker-side createSignalRouter's job, the same
 // split createRunRouter (Worker gate) → DurableObjectRunner (execution) uses.
 //
@@ -14,14 +13,15 @@
 // module-level `defaultAgentThreadPubSub`), so a send only drains into an active
 // loop when BOTH run in one isolate (the DO gives this) AND both use the SAME
 // pubsub. The agent resolves its pubsub from `agent.getPubSub()`, so these routes
-// stamp the DO's ONE identity (`scope.init.pubsub`, Track 0 / DL-001) onto the
-// agent before every call — the exact reason Track A threads that same identity
-// into createRun. Absent (host opted out) ⇒ core's module default, still one per
+// stamp the DO's ONE identity (`scope.init.pubsub`) onto the agent before every
+// call — the exact reason durable-agent execution threads that identity into
+// createRun. Absent (host opted out) ⇒ core's module default, still one per
 // isolate, so affinity holds either way; a wired pubsub additionally makes
 // observe()/replay align (pubsub.ts).
 //
 // core's `agentThreadStreamRuntime` is NOT on the package exports map, so these
-// routes drive the PUBLIC Agent methods only (never a deep dist import — R-001).
+// routes drive only the PUBLIC Agent methods, never a deep dist import across
+// the export boundary.
 
 import type {
   Agent,
@@ -2118,7 +2118,7 @@ async function handleSignal(
   if (!isContents(body.contents)) {
     return json({ error: 'contents (string) is required' }, 400);
   }
-  // Route-level tagName defense (C-S5): reject a non-XML-name tagName HERE with a
+  // Route-level tagName defense: reject a non-XML-name tagName HERE with a
   // 400, rather than letting core's signalToXmlMarkup throw at render time inside
   // the agent turn. Core still escapes contents/attribute values and re-validates
   // names; this is the ingest-time half the plan calls "route-level defense".

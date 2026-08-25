@@ -15,9 +15,9 @@
 // same key does not start a second run — it finds the first one and is told
 // what happened to it.
 //
-// THE TAXONOMY IS THE CONTRACT. Every refusal below is a distinct sentence
-// about what flowsafe KNOWS, because the caller's next action differs for each
-// and a collapsed code would make them all "retry":
+// THE TAXONOMY IS THE CONTRACT. Eight structured reason codes say what flowsafe
+// KNOWS, because the caller's next action differs for each and a collapsed code
+// would make them all "retry". Five are reservation-decision refusals:
 //
 //   IDEMPOTENT_START_OWNER_MISMATCH (403) this key is somebody else's. Keys are
 //                                   owner-scoped, so one tenant principal
@@ -50,6 +50,18 @@
 //                                   OUTLIVES the snapshot so this answer exists
 //                                   at all; the alternative is a purged run
 //                                   looking exactly like a fresh key.
+//
+// Three complete the public keyed-start taxonomy:
+//
+//   IDEMPOTENT_START_UNSUPPORTED (503) a keyed start reached a deployment whose
+//                                   host did not wire a reservation store.
+//   INVALID_START_IDEMPOTENCY_REQUEST (400) the keyed input was malformed.
+//   IDEMPOTENT_START_UNREADABLE (503) the reservation store could not be read
+//                                   or contained a row this build cannot parse.
+//
+// The seven-member `StartReservationRefusal` union recognized by
+// `isStartReservationRefusal` includes everything above except UNREADABLE,
+// which propagates separately as an integrity or availability failure.
 //
 // NO TIMER ANYWHERE. Two of those branches are separated by a LIVENESS PROBE,
 // never by elapsed time. A timer would have to guess a bound on legitimate
@@ -332,10 +344,12 @@ export class IdempotentStartAlreadySettledError extends DoStatusError {
 /** A malformed idempotency key or reservation request — the caller's to fix. */
 export class InvalidStartIdempotencyRequestError extends DoStatusError {
   readonly status = 400;
+  readonly reason: { readonly code: 'INVALID_START_IDEMPOTENCY_REQUEST' };
 
   constructor(message: string) {
     super(message);
     this.name = 'InvalidStartIdempotencyRequestError';
+    this.reason = { code: 'INVALID_START_IDEMPOTENCY_REQUEST' };
   }
 }
 
@@ -363,7 +377,7 @@ export class StartIdempotencyUnsupportedError extends DoStatusError {
   }
 }
 
-/** Every reservation-authored refusal — the family a surface catches as one. */
+/** Failures a start surface may reject while admitting or resolving a key. */
 export type StartReservationRefusal =
   | StartReservationOwnerMismatchError
   | StartReservationTargetMismatchError
@@ -373,6 +387,28 @@ export type StartReservationRefusal =
   | StartIdempotencyUnsupportedError
   | InvalidStartIdempotencyRequestError;
 
+/**
+ * Recognize the five reservation-decision refusals:
+ *
+ * - `IDEMPOTENT_START_OWNER_MISMATCH` (403)
+ * - `IDEMPOTENT_START_TARGET_MISMATCH` (409)
+ * - `IDEMPOTENT_START_PENDING` (503)
+ * - `IDEMPOTENT_START_UNRESOLVABLE` (409)
+ * - `IDEMPOTENT_START_ALREADY_SETTLED` (409)
+ *
+ * The guard also recognizes `IDEMPOTENT_START_UNSUPPORTED` keyed admission
+ * (503) and malformed reservation input (400,
+ * `INVALID_START_IDEMPOTENCY_REQUEST`).
+ *
+ * Unsupported wiring remains in this guard because the keyed request is
+ * intentionally refused at admission instead of being executed without its
+ * exactly-once guarantee. `StartReservationUnreadableError` is deliberately
+ * outside it: unreadable storage is an integrity or availability failure, not
+ * a reservation decision, and propagates through the shared `DoStatusError`
+ * renderer with `IDEMPOTENT_START_UNREADABLE` and its 503 status. A false
+ * answer never permits an unkeyed start: a `StartReservationUnreadableError`
+ * must still propagate as 503.
+ */
 export function isStartReservationRefusal(
   error: unknown,
 ): error is StartReservationRefusal {
@@ -416,9 +452,9 @@ export type StartIdempotencyWiring = StartIdempotencyStore | 'none';
  * are. Four are import-free leaves (principal-identity, cause-chain,
  * do-status-error, path-safe-id) and the fifth, execution-fence, imports only
  * leaves and the shared provisioning protocol. Nothing on that graph can cycle
- * back here, which matters more than usual: the six DoStatusError subclasses
- * below are evaluated at module load, so an import edge that came back around
- * would meet a class expression still in its temporal dead zone.
+ * back here, which matters more than usual: the eight DoStatusError subclasses
+ * in this module are evaluated at module load, so an import edge that came
+ * back around would meet a class expression still in its temporal dead zone.
  */
 function changesOf(result: unknown): number {
   const changes = (result as { meta?: { changes?: number } } | undefined)?.meta
@@ -618,12 +654,10 @@ export class StartReservationUnreadableError extends DoStatusError {
  * failed migration, an adapter reporting the last thing it saw), and concluding
  * "no reservations exist" from that would start a run.
  *
- * Exported so F2's drain inventory classifies the same failure the same way;
- * it may equally call `missingTableReadsEmpty` directly with this module's
- * `START_IDEMPOTENCY_TABLE`. Deliberately off the package barrel — it is an
- * internal storage rule, not public API.
+ * Kept local because every consumer is in this store; the drain inventory uses
+ * `missingTableReadsEmpty` directly with `START_IDEMPOTENCY_TABLE`.
  */
-export function isMissingReservationTable(error: unknown): boolean {
+function isMissingReservationTable(error: unknown): boolean {
   return missingTableReadsEmpty(error, START_IDEMPOTENCY_TABLE);
 }
 
@@ -1043,10 +1077,15 @@ export type IdempotentStartDecision<TPersisted> =
  *  5. `terminal` with nothing persisted is a completed run whose summary aged
  *     out. Spent, never re-run.
  *
- * Throws the taxonomy's refusals; a surface renders them through
- * `doErrorResponse` (or its router's equivalent) with no re-mapping, because
- * the code is the contract and a collapsed status hides which of five very
- * different things happened.
+ * Throws the applicable structured taxonomy errors; a surface renders them
+ * through `doErrorResponse` (or its router's equivalent) with no re-mapping.
+ * Across the public keyed-start surface the eight codes are the five decision
+ * refusals — IDEMPOTENT_START_OWNER_MISMATCH (403),
+ * IDEMPOTENT_START_TARGET_MISMATCH (409), IDEMPOTENT_START_PENDING
+ * (503), IDEMPOTENT_START_UNRESOLVABLE (409), and
+ * IDEMPOTENT_START_ALREADY_SETTLED (409) — plus IDEMPOTENT_START_UNSUPPORTED
+ * (503), INVALID_START_IDEMPOTENCY_REQUEST (400), and
+ * IDEMPOTENT_START_UNREADABLE (503).
  */
 export async function beginIdempotentStart<TPersisted>(
   store: StartIdempotencyStore,

@@ -13,7 +13,6 @@ import type {
   DeploymentSpec,
   ExternalPlatformResources,
 } from '../src/types.js';
-import type { PlainWorkerRouteApi } from '../src/wrangler-loop-backend.js';
 
 function deployment(overrides: Partial<DeploymentSpec> = {}): DeploymentSpec {
   return {
@@ -2898,15 +2897,6 @@ describe('CloudflareProvisioningClient', () => {
   });
 });
 
-/**
- * Returns the client AS the plain backend's route API, deliberately.
- *
- * That backend's only production wiring lives in an untyped conformance
- * script, so nothing else in the repository checks that this client still
- * satisfies `PlainWorkerRouteApi`. This annotation is that check: a required
- * member added to the interface and forgotten here fails the typecheck instead
- * of the next credentialed run.
- */
 function activeRouteClient(
   state: () => {
     readonly versions: readonly Readonly<{
@@ -2917,7 +2907,7 @@ function activeRouteClient(
     readonly scriptPresent: boolean;
     readonly onVersionRead: () => void;
   },
-): PlainWorkerRouteApi {
+) {
   return new CloudflareProvisioningClient({
     accountId: 'account',
     apiToken: 'token',

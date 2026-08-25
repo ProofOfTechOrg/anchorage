@@ -392,7 +392,7 @@ describe('createAgentThreadTopology', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F3 — owner-bound idempotent start, on the AGENT surface.
+// Owner-bound idempotent start, on the AGENT surface.
 //
 // The agent surface is where the reservation earns its keep. A workflow run has
 // one possible host (idFromName(workflowId:runId)); an agent run lives in a
@@ -483,7 +483,7 @@ function keyedHarness(options: { now?: () => number } = {}) {
   };
 }
 
-describe('createAgentThreadTopology — idempotent start (F3)', () => {
+describe('createAgentThreadTopology — idempotent start', () => {
   it('refuses a key when the topology wired no reservation store', async () => {
     // #given the typed opt-out
     const { topology } = harness();

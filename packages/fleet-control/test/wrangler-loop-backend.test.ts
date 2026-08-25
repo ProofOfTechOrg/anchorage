@@ -17,10 +17,10 @@ import type {
   ExternalMutationFence,
   ExternalReleaseSnapshot,
   FleetRecord,
+  PlainWorkerCustomDomain,
+  PlainWorkerRouteApi,
 } from '../src/types.js';
 import {
-  type PlainWorkerCustomDomain,
-  type PlainWorkerRouteApi,
   plainWorkerIngressModule,
   WranglerLoopBackend,
 } from '../src/wrangler-loop-backend.js';

@@ -3,7 +3,7 @@
 // (401 -> coarse RUN_START_ROLES -> per-workflow allowedRoles), the catalog, the
 // start/status/resume/terminate routes and their error mapping, the suspension bridge's
 // attribution (the starting actor becomes requestedBy, so they cannot decide
-// their own run), and the D4 reconcileApprovals self-healing hook on status
+// their own run), and the reconcileApprovals self-healing hook on status
 // reads.
 //
 // Driven with real InMemoryApprovalStore + ApprovalService (no mocks) and
@@ -91,15 +91,15 @@ interface HarnessOptions {
   resume?: RunRouterOptions['resume'];
   terminate?: NonNullable<RunRouterOptions['terminate']>;
   reconcileApprovals?: RunRouterOptions['reconcileApprovals'];
-  // F9: feeds the resolver's allowSelfDecision now (the run-router no longer
+  // Feed the resolver's allowSelfDecision now (the run-router no longer
   // owns a selfDecision knob), driving the catalog's canSelfDecide echo.
   selfDecision?: SelfDecisionPolicy;
   resourceOwner?: ReqActor;
   approvalCreateFailures?: number;
   /**
    * How this harness honours `idempotencyKey`. Defaults to the typed opt-out,
-   * which is what every pre-F3 case in this file wants: unkeyed starts are
-   * unaffected by the wiring, and a keyed start on an unwired host must refuse.
+   * which is what every earlier unkeyed-start case in this file wants: unkeyed
+   * starts are unaffected; keyed starts on an unwired host refuse.
    */
   startIdempotency?: RunRouterOptions['startIdempotency'];
 }
@@ -153,7 +153,7 @@ function makeHarness(options: HarnessOptions = {}) {
     buildService: () =>
       new ApprovalService({ store: requestStore, executionFence: 'none' }),
     newRunId: () => 'generated-run-id',
-    // F9: the SoD exemption policy now feeds the resolver, so the catalog echo
+    // The SoD exemption policy now feeds the resolver, so the catalog echo
     // reads context.canSelfDecide (the run-router no longer takes its own knob).
     allowSelfDecision: options.selfDecision,
   });
@@ -544,7 +544,7 @@ describe('createRunRouter — POST /runs', () => {
     ).toBe(404);
   });
 
-  it('400s a client-pinned runId and mints an opaque id itself (INV-1)', async () => {
+  it('400s a client-pinned runId and mints an opaque id itself', async () => {
     // #given — a client may never choose the addressing id
     const { handle, started } = makeHarness();
 
@@ -920,7 +920,7 @@ describe('createRunRouter — GET status and POST resume', () => {
   });
 });
 
-describe('createRunRouter — reconcileApprovals hook (D4 self-healing)', () => {
+describe('createRunRouter — reconcileApprovals self-healing hook', () => {
   it('invokes reconcileApprovals when a status read reports the run suspended', async () => {
     // #given
     const calls: Array<{ workflowId: string; runId: string }> = [];
@@ -1065,7 +1065,7 @@ describe('createRunRouter — error mapping', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F3 — owner-bound idempotent start, on the workflow surface.
+// Owner-bound idempotent start, on the workflow surface.
 //
 // Every case below is about a PAID first step: the assertions count
 // EXECUTIONS, not responses, because a router that answers correctly while
@@ -1135,7 +1135,7 @@ function keyedHarness(
   };
 }
 
-describe('createRunRouter — idempotent start (F3)', () => {
+describe('createRunRouter — idempotent start', () => {
   it('refuses a key on a host that wired no reservation store', async () => {
     // #given the typed opt-out — the default in this file
     const { handle } = makeHarness();
@@ -1171,7 +1171,7 @@ describe('createRunRouter — idempotent start (F3)', () => {
       }),
     );
 
-    // #then the pinned 400 is untouched by F3
+    // #then the pinned 400 is untouched by owner-bound idempotent start
     expect(response?.status).toBe(400);
     expect(await response?.json()).toEqual({
       error: 'runId is server-assigned',

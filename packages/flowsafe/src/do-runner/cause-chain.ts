@@ -12,11 +12,11 @@
 // of them to lose the depth bound, the cycle guard, or the root-only rule.
 //
 // This module imports NOTHING, so the modules that consult it can keep their
-// own "imports only leaves" property — the fence and the reservation store are
-// both imported by surfaces that must not drag the D1 storage adapter (and
+// own "imports only leaf modules" property. The fence and reservation store
+// are both imported by surfaces that must not drag the D1 storage adapter (and
 // @mastra/cloudflare-d1 with it) into their bundle.
 //
-// F2 (the drain inventory) reads the reservation table on every sweep and needs
+// The drain inventory reads the reservation table on every sweep and needs
 // the same classification: import `missingTableReadsEmpty` from HERE, not from
 // start-idempotency.ts, and pass the table it is reading.
 

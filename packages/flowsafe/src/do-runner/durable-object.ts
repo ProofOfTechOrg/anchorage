@@ -112,7 +112,7 @@ export interface DurableObjectRunLifecycleHooks {
 }
 
 const RUN_OWNER_RECOVERY_KEY = 'flowsafe:run-owner-recovery:v1';
-const RUN_OWNER_RECOVERY_DELAY_MS = 60_000;
+export const RUN_OWNER_RECOVERY_DELAY_MS = 60_000;
 const SUSPENSION_DEADLINE_RETRY_MS = 60_000;
 // How long a run's state may stay unreadable before the entries due under it
 // are given up on. A read that never succeeds is never charged, so without this
@@ -313,8 +313,8 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     return readExecutionFence(this.#ensureRuntime().executionFence);
   }
 
-  // INV-1 enforcement at the DO boundary: this instance was addressed as
-  // idFromName(`${workflowId}:${runId}`) by the trusted Worker, and id.name
+  // Enforce host-owned run ids at the DO boundary: this instance was addressed
+  // as idFromName(`${workflowId}:${runId}`) by the trusted Worker, and id.name
   // is unforgeable at this boundary. If a request asks the instance to act on
   // a DIFFERENT (workflowId, runId), someone routed around the name join —
   // acting on the request's ids would run outside this instance's identity
@@ -327,7 +327,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     if (name === undefined) return;
     if (name !== `${workflowId}:${runId}`) {
       throw new Error(
-        `DO identity mismatch: instance is '${name}' but the request names '${workflowId}:${runId}' — refusing (INV-1)`,
+        `DO identity mismatch: instance is '${name}' but the request names '${workflowId}:${runId}' — refusing`,
       );
     }
   }
@@ -1069,11 +1069,11 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     now: number,
   ): Promise<void> {
     const { workflowId, runId } = stored;
-    // INV-1 at the one boundary whose ids come from storage rather than from
-    // the trusted Worker: this wake is about to execute a workflow body, so it
-    // must be this object's own run (and its per-run serialization). Charged
-    // like any other duty failure, deliberately: it is the one charged failure
-    // that read nothing, and charging is what quiets a foreign record's entry
+    // Enforce host-owned run ids at the boundary whose ids come from storage,
+    // rather than from the trusted Worker. This wake is about to execute a
+    // workflow body, so it must be this object's own run and serialization.
+    // Charge it like any other duty failure: it is the one charged failure that
+    // read nothing, and charging is what quiets a foreign record's entry
     // (five wakes to a tombstone). It stays here rather than moving up with the
     // runtime because the nothing-due path below deliberately prefers `id.name`
     // over a foreign record, which asserting early would break.
@@ -1470,9 +1470,9 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         if (!body || typeof body.workflowId !== 'string') {
           return json({ error: 'workflowId is required' }, 400);
         }
-        // The DO never generates a runId (INV-1): the trusted Worker mints the
-        // id and addresses this instance with it. A start without one is a
-        // caller bug, not a request for generation.
+        // The DO never generates a runId: the trusted Worker mints the id and
+        // addresses this instance with it. A start without one is a caller bug,
+        // not a request for generation.
         if (typeof body.runId !== 'string') {
           return json(
             { error: 'runId is required (server-minted by the run router)' },
@@ -1631,7 +1631,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
             summary,
           );
           await this.#settleRunOwnerBestEffort(recovery, false, !reconciled);
-          // DL-018: the authoritative RunSummary is the run-progress frame; push it
+          // The authoritative RunSummary is the run-progress frame; push it
           // to any subscribed run-channel socket at this lifecycle boundary.
           this.#broadcastRunSummary(summary);
           return json(summary);
@@ -1718,7 +1718,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         );
       }
       // The trusted Worker already verified the run ticket and routed by
-      // ticket.runId to idFromName; re-bind to this instance's identity (INV-1)
+      // ticket.runId to idFromName; re-bind to this instance's identity
       // before accepting so a mis-routed upgrade is refused.
       this.#assertRunIdentity(workflowId, runId);
       const runtime = this.#ensureRuntime();
@@ -1727,7 +1727,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       const { 0: client, 1: server } = newWebSocketPair();
       state.acceptWebSocket(server);
       // On-connect snapshot: seed the new subscriber with the current
-      // authoritative summary (DL-018) so it need not wait for the next
+      // authoritative summary so it need not wait for the next
       // lifecycle transition. Nothing to send if the run is not yet queryable.
       safeSend(server, runFrame(snapshot));
       return new Response(null, {
@@ -1771,7 +1771,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           runId,
           summary,
         );
-        // DL-018: broadcast the post-resume authoritative summary.
+        // Broadcast the post-resume authoritative summary.
         this.#broadcastRunSummary(summary);
         return json(summary);
       });

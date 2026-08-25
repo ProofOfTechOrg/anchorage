@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // The thread-DO signal routes (createThreadSignalRoutes): the affinity stamp
 // (agent.__setPubSub(scope.init.pubsub)), the delivery-decision passthrough, the
-// idle run-cap consult (DL-007), and the resourceId gating — over a mock agent.
+// idle run-cap consult and resourceId gating — over a mock agent.
 
 import {
   type Agent,
@@ -1311,7 +1311,7 @@ describe('createThreadSignalRoutes', () => {
     });
   });
 
-  it('consults the run cap for an idle WAKE and degrades to persist when over cap (DL-007)', async () => {
+  it('consults the run cap for an idle WAKE and degrades to persist when over cap', async () => {
     const { agent, calls } = mockAgent();
     const routes = createThreadSignalRoutes({
       resolveAgent: () => agent,
@@ -3067,7 +3067,7 @@ describe('createThreadSignalRoutes', () => {
     await expect(responsePromise).resolves.toMatchObject({ status: 200 });
   });
 
-  it('400s a signal whose tagName is not a valid XML name (C-S5 route-level defense)', async () => {
+  it('400s a signal whose tagName is not a valid XML name', async () => {
     // #given
     const { agent, calls } = mockAgent();
     const routes = createThreadSignalRoutes({
@@ -3150,7 +3150,7 @@ describe('createThreadSignalRoutes', () => {
   });
 });
 
-describe('signalToXmlMarkup — C-S5 injection neutralization (core render pin)', () => {
+describe('signalToXmlMarkup — injection neutralization', () => {
   // The render path the thread routes feed is core's signalToXmlMarkup. These
   // pin that it ENTITY-ESCAPES hostile contents and attribute values, so a
   // prompt-injection payload cannot break out of the <signal> element or forge a

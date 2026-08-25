@@ -1,27 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track B (M-003): host a Mastra BackgroundTaskManager on a Durable Object, and
-// survive DO eviction BY CONSTRUCTION (DL-015).
+// Host a Mastra BackgroundTaskManager on a Durable Object and survive eviction
+// BY CONSTRUCTION.
 //
-// THE RECOVERY SEAM (spike B-S2, pinned against @mastra/core 1.50.0 dist —
-// validation finding R-002). `recoverStaleTasks()` and `handleResume` are
-// PRIVATE and `getStorage()` is async, so the alarm CANNOT call
-// `recoverStaleTasks()` directly. But it does not need to: the PUBLIC async
-// `manager.init(pubsub)` fires `recoverStaleTasks()` internally (manager.d.ts:21
-// -> chunk .init -> `await this.recoverStaleTasks()`), guarded by its own
-// initPromise so it runs once per manager INSTANCE. A DO evicted mid-task leaves
-// its task row 'running'/'pending' in D1; when the DO is next instantiated (a
-// FRESH manager), `boot()` re-registers the static tool executors, starts the
-// workflow workers, and only then calls `init(pubsub)`. Init's recovery resets a
+// THE RECOVERY SEAM, pinned against @mastra/core 1.50.0 dist.
+// `recoverStaleTasks()` and `handleResume` are PRIVATE, and `getStorage()` is
+// async, so the alarm CANNOT call `recoverStaleTasks()` directly. It does not
+// need to: the PUBLIC async `manager.init(pubsub)` fires `recoverStaleTasks()`
+// internally. Its manager.d.ts:21 -> chunk .init path awaits
+// `this.recoverStaleTasks()`, guarded by its own initPromise so it runs once
+// per manager INSTANCE. A DO evicted mid-task leaves its task row
+// 'running'/'pending' in D1. When the DO is next instantiated with a FRESH
+// manager, `boot()` re-registers the static tool executors, starts the workflow
+// workers, and only then calls `init(pubsub)`. Init's recovery resets a
 // stranded 'running' task (maxRetries > 0) to 'pending' and re-dispatches it;
-// starting workers first guarantees that the workflow event published by that
-// dispatch has a subscriber. Its workflow step resolves the executor by tool
-// name via the re-registered static registry (the cross-process path core ships
-// `registerStaticExecutor` for). The DO ALARM is what WAKES an evicted DO so
+// starting workers first guarantees that the workflow event has a subscriber.
+// Its workflow step resolves the executor by tool name via the re-registered
+// static registry: the cross-process path core ships `registerStaticExecutor`
+// for this. The DO ALARM WAKES an evicted DO so
 // this happens without waiting for a request. No private method is ever called;
 // the seam is `registerStaticExecutor` + `startWorkers()` + `init(pubsub)`, all
 // public.
 //
-// THE FENCE SPLITS THAT SEAM IN TWO (F1). `registerStaticExecutor` claims
+// THE FENCE SPLITS THAT SEAM IN TWO. `registerStaticExecutor` claims
 // nothing and always runs; `startWorkers()` + `init(pubsub)` are what make this
 // instance a dispatcher, and behind a closed deployment execution fence they
 // are held back entirely — init's recovery would otherwise fail every stranded
@@ -29,7 +29,7 @@
 // on every later boot (request or alarm), so reopening the fence is all it
 // takes to resume. See #ensureDispatching.
 //
-// v1 policy (DL-005/P8): connectors are foreground-only, so approval-carrying
+// v1 policy: connectors are foreground-only, so approval-carrying
 // tools never enter this suspend/resume topology. Background suspend/resume
 // stays available for NON-gated tools (e.g. a long research tool awaiting an
 // external webhook); such a task's resume mints no capability.
@@ -56,7 +56,7 @@ import {
   type ToolExecutor,
 } from '@mastra/core/background-tasks';
 import type { Mastra } from '@mastra/core/mastra';
-
+import { EXECUTION_FENCE_SUSPEND_KEY } from '../do-runner/execution-fence.js';
 import {
   admitsDrainableExecution,
   ExecutionFencedError,
@@ -75,6 +75,8 @@ import {
   type DurableObjectBackgroundTasksStorageD1,
   SERIALIZED_WORKFLOWS_D1,
 } from './d1-storage.js';
+
+export { EXECUTION_FENCE_SUSPEND_KEY } from '../do-runner/execution-fence.js';
 
 export interface BackgroundTaskHostOptions {
   /**
@@ -220,21 +222,6 @@ function validateManagerConfig(
     );
   }
 }
-
-/**
- * The suspend-payload key the executor backstop stamps on a task it parked
- * because the deployment was fenced mid-dispatch. Namespaced so it cannot
- * collide with a tool's own suspend payload, and read back by
- * #resumeFenceSuspendedTasks — which is what makes the parking reversible
- * rather than a quieter kind of loss.
- *
- * PUBLISHED (via `./index.js`) because it is the only way a host can tell a
- * fence-parked row from a tool-suspended one: `listTasks({ status:
- * 'suspended' })` returns both, and the marker lives in the suspend payload
- * where no filter can express it. A census that hard-coded the string would
- * silently stop matching the day this key is renamed.
- */
-export const EXECUTION_FENCE_SUSPEND_KEY = 'flowsafe.executionFenced';
 
 /**
  * Was this row parked by the backstop, rather than suspended by its own tool?

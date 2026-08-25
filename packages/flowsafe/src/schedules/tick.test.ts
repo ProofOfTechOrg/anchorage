@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track D (M-006) — createScheduleTick: the mint posture (INV-1), the run-cap
-// seam (D-S4), optional agent start, fail-closed fallback, in-process single-claim
-// (CAS), lost-claim classification, and the P4 stored-context barrier (b).
+// createScheduleTick: mint posture, run-cap seam, optional agent start,
+// fail-closed fallback, in-process single-claim CAS, lost-claim classification,
+// and the stored-context barrier.
 
 import type { Schedule, ScheduleTrigger } from '@mastra/core/storage';
 import { describe, expect, it, vi } from 'vitest';
@@ -331,7 +331,7 @@ describe('createScheduleStartSource', () => {
 });
 
 describe('createScheduleTick', () => {
-  it('fires a due workflow target through the start seam with a fresh INV-1 runId', async () => {
+  it('fires a due workflow target through the start seam with a fresh host-owned runId', async () => {
     // #given a due workflow schedule
     const store = new FakeStore();
     store.seed(
@@ -423,7 +423,7 @@ describe('createScheduleTick', () => {
     );
   });
 
-  it('strips reserved requestContext keys before handing the leg context to start (P4 barrier b)', async () => {
+  it('strips reserved requestContext keys before handing the leg context to start', async () => {
     // #given a due schedule whose STORED requestContext carries a reserved key
     // (a compromised/tampered row) plus a benign one
     const store = new FakeStore();
@@ -459,7 +459,7 @@ describe('createScheduleTick', () => {
     expect(passedContext).toEqual({ 'my.custom': 'kept' });
   });
 
-  it('SKIPS a capped deployment (audited) but leaves the schedule healthy — the CAS already advanced it (D-S4)', async () => {
+  it('SKIPS a capped deployment but leaves the schedule healthy after the CAS advances it', async () => {
     // #given a due workflow schedule and a run cap that DENIES
     const store = new FakeStore();
     store.seed(workflowSchedule());
@@ -1102,7 +1102,7 @@ describe('createScheduleTick', () => {
   });
 });
 
-describe('the P4 reserved-key barrier helpers', () => {
+describe('reserved-key barrier helpers', () => {
   it('isReservedScheduleContextKey covers the whole breakwater namespace + the goal key', () => {
     expect(isReservedScheduleContextKey('breakwater.connectorGrants')).toBe(
       true,
