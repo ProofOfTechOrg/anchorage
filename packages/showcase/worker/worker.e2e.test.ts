@@ -34,6 +34,8 @@ function buildHarness() {
   const grants = approvalGrantProvider(store);
   const runtime = buildShowcaseRuntime({
     initInput: { storage: new InMemoryStore() },
+    executionFence: 'none',
+    startIdempotency: 'none',
     grantProvider: async (workflowId, runId, leg) => ({
       ...(await grants(workflowId, runId, leg)),
       [AGENT_AUDIT_CONTEXT_KEY]: {
@@ -48,6 +50,9 @@ function buildHarness() {
   });
   const service = new ApprovalService({
     store,
+    // In-memory store, no database to fence against: the opt-out is written down
+    // rather than defaulted — see ExecutionFenceWiring.
+    executionFence: 'none',
     resumeRun: resumeViaRuntime(runtime),
   });
   return { runtime, service, audit };

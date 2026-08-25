@@ -51,6 +51,12 @@ import {
   RUN_PROVENANCE_CONTEXT_KEY,
   stripReservedExecutionContext,
 } from './execution-context.js';
+import {
+  admitsExistingRun,
+  admitsRunStart,
+  ExecutionFencedError,
+  type ExecutionFenceStore,
+} from './execution-fence.js';
 import { mastraRegistryEntries } from './mastra-registry.js';
 import { isPathSafeId } from './path-safe-id.js';
 import type { HostPubSub } from './pubsub.js';
@@ -68,6 +74,7 @@ import {
   type RunTerminalErrorEnvelope,
   type RunTerminalStatus,
 } from './run-lifecycle.js';
+import type { StartIdempotencyStore } from './start-idempotency.js';
 
 export class UnknownWorkflowError extends Error {
   constructor(workflowId: string) {
@@ -739,6 +746,39 @@ export interface RunnerRuntimeOptions {
    * before this seam existed.
    */
   pubsub?: HostPubSub;
+  /**
+   * The deployment execution fence (execution-fence.ts), consulted on EVERY
+   * start and resume. THIS is the closure guarantee for runs: every mint in
+   * this package funnels through start() and every re-entry through resume(),
+   * so a check here cannot be routed around by a surface that forgot to gate
+   * itself — the route-level checks are the same refusal made earlier and
+   * cheaper, never the boundary.
+   *
+   * Absent ⇒ unfenced, byte-identical to before this seam existed. `init()`
+   * builds one automatically from a `{ DB }` source and REQUIRES an explicit
+   * `executionFence` (a store, or `'none'`) from a `{ storage }` one, so
+   * absence here is always something a host wrote down.
+   */
+  executionFence?: ExecutionFenceStore;
+  /**
+   * The deployment's start reservations (start-idempotency.ts). The runtime
+   * neither creates nor claims one — the surfaces above it do — but it is the
+   * one layer that sees EVERY way a run reaches a terminal state, so it owns
+   * the terminal reconcile that marks a key spent.
+   *
+   * Homed here rather than at the routes for exactly that reason: a run can end
+   * by completing, by failing, by being cancelled and by timing out, on the
+   * workflow surface and the agent surface alike, and a reconcile attached to
+   * any one route would miss the rest. A reservation that never settles is not
+   * a correctness bug (replay still answers from the snapshot) but it never
+   * leaves the drain inventory and never becomes purgeable, so a deployment
+   * would eventually be unable to prove itself empty.
+   *
+   * Absent ⇒ no reconcile. `init()` builds one from a `{ DB }` source, and
+   * `DurableObjectRunner.build` refuses a runtime that has none while a DB is
+   * bound, so absence means a host with no database to reserve against.
+   */
+  startIdempotency?: StartIdempotencyStore;
 }
 
 /** @inline */
@@ -779,6 +819,20 @@ export type StartRunOptions = {
   economicOperations?: readonly RunEconomicOperation[];
   /** Trusted schedule source; never accepted directly from a public request. */
   scheduleDispatch?: RunScheduleDispatch;
+  /**
+   * The start's idempotency key. The runtime uses it for exactly one thing: the
+   * execution fence's proof-only state admits the start whose key matches its
+   * nominated proof key, and this is where that comparison happens. The
+   * exactly-once property the key also carries is enforced ABOVE the runtime,
+   * by the start reservation the surfaces take before calling in.
+   *
+   * INTERNAL: it reaches the runtime from a trusted host seam, never from a
+   * request body and never through an open request-context key — a tenant able
+   * to name the proof key could start a run on a deployment that is supposed to
+   * be executing exactly one.
+   * @internal
+   */
+  idempotencyKey?: string;
 } & OptionalRunRequester;
 
 export type ResumeRunOptions = {
@@ -907,10 +961,12 @@ export class RunnerRuntime {
   readonly #terminalAbortIntents = new Map<string, RunTerminalStatus>();
   readonly #lifecycleLocks = new Map<string, Promise<unknown>>();
   // The host DO's pubsub identity (RunnerRuntimeOptions.pubsub), threaded into
-  // both createRun sites below (CI-M-002-002) so a configured host publishes and
+  // both createRun sites below so a configured host publishes and
   // replays on ONE shared feed. Undefined ⇒ core defaults a fresh emitter per
   // run ⇒ byte-identical to before this seam existed.
   readonly #pubsub?: HostPubSub;
+  readonly #executionFence?: ExecutionFenceStore;
+  readonly #startIdempotency?: StartIdempotencyStore;
   #mastra?: Mastra;
 
   constructor(options: RunnerRuntimeOptions) {
@@ -918,6 +974,51 @@ export class RunnerRuntime {
     this.#logger = options.logger ?? false;
     this.#requestContextForRun = options.requestContextForRun;
     this.#pubsub = options.pubsub;
+    this.#executionFence = options.executionFence;
+    this.#startIdempotency = options.startIdempotency;
+  }
+
+  /**
+   * The deployment execution fence this runtime enforces, or undefined when
+   * the host built an unfenced runtime. Exposed so the surfaces ABOVE the
+   * runtime — the run object's routes, the thread DO's signal routes — gate on
+   * the same store rather than constructing a second one, and so
+   * DurableObjectRunner can assert that a runtime built against a bound
+   * database is never fence-less.
+   */
+  get executionFence(): ExecutionFenceStore | undefined {
+    return this.#executionFence;
+  }
+
+  /**
+   * The deployment's start reservations, or undefined for a host with no
+   * database to reserve against. Exposed for the same reason the fence is: the
+   * surfaces ABOVE this runtime reserve and claim against it, and two stores
+   * over two bindings would be two different tables answering the same key.
+   */
+  get startIdempotency(): StartIdempotencyStore | undefined {
+    return this.#startIdempotency;
+  }
+
+  /**
+   * Is this run EXECUTING in this isolate right now?
+   *
+   * The liveness half of the idempotent-start replay decision, answered from
+   * the same `#activeRuns` map the cancel path uses — the runtime's own record
+   * of runs it is currently driving. It is in-memory ON PURPOSE: liveness is a
+   * property of an isolate that is running code, and any durable proxy for it
+   * (a journal, a heartbeat, a timestamp) would keep saying "live" after the
+   * isolate that wrote it was evicted, which is precisely the case the probe
+   * exists to detect.
+   *
+   * A `false` here therefore means "not running HERE", which is authoritative
+   * only where the run has exactly one possible host — a run Durable Object
+   * addressed by `idFromName(workflowId:runId)`, or the thread object an agent
+   * run is bound to. Callers that probe across an object boundary must ask the
+   * object that owns the run, never their own runtime.
+   */
+  isRunActive(workflowId: string, runId: string): boolean {
+    return this.#activeRuns.has(this.#runKey(workflowId, runId));
   }
 
   /**
@@ -972,6 +1073,69 @@ export class RunnerRuntime {
     return [...this.#workflows.keys()];
   }
 
+  /**
+   * The fence check every mint passes. In proof-only the admitted start also
+   * BINDS the proof to its run id, and that write-back is conditional: between
+   * the read that admitted it and the write another start may have claimed the
+   * proof, or the operator may have moved the fence on. Zero rows changed
+   * therefore refuses the start — the deployment is no longer the one this
+   * start read.
+   */
+  async #assertStartFence(
+    runId: string,
+    idempotencyKey: string | undefined,
+  ): Promise<void> {
+    const fence = this.#executionFence;
+    if (!fence) return;
+    const reading = await fence.read();
+    if (!admitsRunStart(reading, idempotencyKey)) {
+      throw new ExecutionFencedError(reading.state, 'run start');
+    }
+    if (reading.state !== 'proof-only' || reading.proofKey === undefined) {
+      return;
+    }
+    if (!(await fence.recordProofRun(reading.proofKey, runId))) {
+      throw new ExecutionFencedError(reading.state, 'run start');
+    }
+  }
+
+  /**
+   * Mark this run's start reservation spent, if it has one.
+   *
+   * BEST EFFORT, and deliberately so: the run has already reached a terminal
+   * state and its snapshot is already persisted, so failing the caller here
+   * would turn a completed run into an error response — while the reconcile it
+   * failed to make costs only the LATER answer's precision (a purged run
+   * replays as UNRESOLVABLE rather than ALREADY_SETTLED, which refuses either
+   * way). The retention purge marks any reservation this missed, so a swallowed
+   * failure heals rather than accumulating.
+   */
+  async #settleStartReservation(runId: string): Promise<void> {
+    const store = this.#startIdempotency;
+    if (!store) return;
+    try {
+      await store.settleRun(runId);
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          type: 'start-reservation-settle-failed',
+          runId,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    }
+  }
+
+  /** The fence check every re-entry passes — resume, and the deadline alarm. */
+  async #assertResumeFence(runId: string): Promise<void> {
+    const fence = this.#executionFence;
+    if (!fence) return;
+    const reading = await fence.read();
+    if (!admitsExistingRun(reading, runId)) {
+      throw new ExecutionFencedError(reading.state, 'run resume');
+    }
+  }
+
   async start(
     workflowId: string,
     options: StartRunOptions,
@@ -985,7 +1149,7 @@ export class RunnerRuntime {
     // (durable-object.ts readJson), and RegExp.test() coerces its argument to a
     // String — so a numeric runId like 123 would pass the pattern as "123" yet
     // mint a run keyed by the number 123, unreachable by the string "123" the
-    // URL path later carries. There is NO generation fallback (INV-1): a
+    // URL path later carries. There is NO generation fallback: a
     // missing/null runId is a client error, not a request for one.
     if (!isPathSafeId(options.runId)) {
       throw new InvalidRunRequestError(
@@ -1019,6 +1183,11 @@ export class RunnerRuntime {
     ) {
       throw new InvalidRunRequestError('attemptToken is malformed');
     }
+    // The fence, BEFORE the run lock and before any storage work: a fenced
+    // deployment must not queue behind a live run's lock just to be refused,
+    // and must write nothing on the way to the refusal. One read, never
+    // memoized (execution-fence.ts).
+    await this.#assertStartFence(runId, options.idempotencyKey);
     return this.#withRunLock(workflowId, runId, async () => {
       // Supplied ids can collide with an existing run; starting it
       // again would re-execute already-executed steps.
@@ -1052,7 +1221,7 @@ export class RunnerRuntime {
         options.storedRequestContext,
         lifecycle,
       );
-      // Thread the host DO's pubsub identity into the run (CI-M-002-002). Core
+      // Thread the host DO's pubsub identity into the run. Core
       // accepts `createRun({ runId, pubsub })` at every one of its OWN call
       // sites (agent/durable index.js:5224/5541) and stamps it straight onto
       // `new Run({ ..., pubsub: options?.pubsub })`, defaulting a FRESH
@@ -1123,6 +1292,10 @@ export class RunnerRuntime {
     options: ResumeRunOptions = {},
   ): Promise<RunSummary> {
     const workflow = this.#getWorkflow(workflowId);
+    // A drain must not refuse resumes — the suspended runs it is draining are
+    // waiting for exactly these — so only migration-locked and proof-only
+    // block here, and proof-only admits its one nominated run.
+    await this.#assertResumeFence(runId);
     return this.#withRunLock(workflowId, runId, async () => {
       const state = await this.#workflowState(workflow, runId);
       if (!state) throw new UnknownRunError(workflowId, runId);
@@ -1176,7 +1349,7 @@ export class RunnerRuntime {
             new RequestContext(Object.entries(preparationValues)),
           );
         }
-        // Same host pubsub identity as start() (CI-M-002-002) — see the note
+        // Same host pubsub identity as start() — see the note
         // there; undefined stays byte-identical to `createRun({ runId })`.
         run = await workflow.createRun({ runId, pubsub: this.#pubsub });
         await this.#withLifecycleLock(workflowId, runId, async () => {
@@ -1451,6 +1624,10 @@ export class RunnerRuntime {
         ) {
           throw new UnknownRunError(workflowId, runId);
         }
+        // A re-entry onto an already-terminal run heals a reconcile that an
+        // earlier crash lost. The CAS is `state <> 'terminal'`, so this is a
+        // no-op for the reservations that settled the first time.
+        await this.#settleStartReservation(runId);
         return {
           summary: await this.#summaryAfterPersist(workflowId, runId),
           transitioned: false,
@@ -1573,6 +1750,11 @@ export class RunnerRuntime {
         now,
       );
       this.#terminalAbortIntents.delete(this.#runKey(workflowId, runId));
+      // Cancel and timeout are terminal too: a run killed by an operator or by
+      // its deadline spends its idempotency key exactly as a completed one does,
+      // and a key left unspent here would keep a dead run in the drain
+      // inventory forever.
+      await this.#settleStartReservation(runId);
       return {
         summary: await this.#summaryAfterPersist(workflowId, runId),
         transitioned: true,
@@ -2056,6 +2238,11 @@ export class RunnerRuntime {
         },
       });
     });
+    // The run is terminal and its snapshot now says so, so any idempotency key
+    // that named it is spent. AFTER the persist, never before: a reservation
+    // marked terminal ahead of a persist that then failed would answer a retry
+    // with ALREADY_SETTLED for a run whose settled state exists nowhere.
+    await this.#settleStartReservation(runId);
   }
 
   #getWorkflow(workflowId: string): AnyWorkflow {

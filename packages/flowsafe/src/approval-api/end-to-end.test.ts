@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Cross-package proof of the Phase 3 loop. breakwater is a devDependency
+// Cross-package proof of the approval loop. breakwater is a devDependency
 // resolved FROM SOURCE (vitest alias + tsconfig.test paths), so `pnpm -r
 // test` never needs a built breakwater dist.
 //
@@ -267,7 +267,11 @@ function buildHarness(): Harness {
 
   const { createWorkflow, createStep, runtime } = init(
     { storage: new InMemoryStore() },
-    { requestContextForRun: approvalGrantProvider(store) },
+    {
+      startIdempotency: 'none',
+      requestContextForRun: approvalGrantProvider(store),
+      executionFence: 'none',
+    },
   );
 
   const research = createStep({
@@ -451,6 +455,9 @@ function buildHarness(): Harness {
 
   const service = new ApprovalService({
     store,
+    // In-memory store, no database to fence against: the opt-out is written down
+    // rather than defaulted — see ExecutionFenceWiring.
+    executionFence: 'none',
     resumeRun: resumeViaRuntime(runtime),
   });
 
@@ -498,6 +505,7 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
   ) {
     const service = new ApprovalService({
       store,
+      executionFence: 'none',
       ...(options.resumeRun === undefined
         ? {}
         : { resumeRun: options.resumeRun }),
@@ -731,7 +739,7 @@ describe('fail closed: the HTTP create route cannot mint a run-scoped standing g
     // #given — a step-keyed record created by TRUSTED in-process code, bound to
     // the leg's exact suspension. The fix tightens the HTTP boundary only.
     const store = new InMemoryApprovalStore();
-    const service = new ApprovalService({ store });
+    const service = new ApprovalService({ store, executionFence: 'none' });
     const suspendedAt = Date.parse('2026-07-09T00:00:00.000Z');
     const { record } = await service.create(
       {

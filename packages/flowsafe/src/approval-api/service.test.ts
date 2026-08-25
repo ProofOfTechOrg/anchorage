@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, it, vi } from 'vitest';
 
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+import {
+  type ExecutionFenceDatabase,
+  ExecutionFencedError,
+  type ExecutionFenceState,
+  ExecutionFenceStore,
+} from '../do-runner/index.js';
+
 import type {
   ApprovalActor,
   ApprovalAuditEvent,
@@ -66,6 +74,9 @@ function makeHarness(options: Partial<ApprovalServiceOptions> = {}): Harness {
   let nowMs = T0;
   const service = new ApprovalService({
     store,
+    // In-memory store, no database to fence against: the opt-out is written down
+    // rather than defaulted — see ExecutionFenceWiring.
+    executionFence: 'none',
     audit: (event) => events.push(event),
     now: () => new Date(nowMs),
     ...options,
@@ -757,6 +768,7 @@ describe('ApprovalService.decide', () => {
     const events: ApprovalAuditEvent[] = [];
     const service = new ApprovalService({
       store,
+      executionFence: 'none',
       audit: (event) => events.push(event),
       now: harness.now,
     });
@@ -861,9 +873,9 @@ describe('ApprovalService.sweepSLA', () => {
 
   it('escalates ALL breached requests across more than one page (>MAX)', async () => {
     // #given — more breached requests than a single page holds, so the sweep
-    // must cursor-page the (un-defaulted) system view instead of one SELECT;
-    // pre-D3 this bare list() was unbounded, post-D3 a naive single list would
-    // silently cap at MAX and leave the tail un-escalated
+    // must cursor-page the un-defaulted system view instead of one SELECT.
+    // Before the list gained its default bound it was unbounded; a naive single
+    // bounded list would silently cap at MAX and leave the tail un-escalated.
     const harness = makeHarness();
     const total = MAX_APPROVAL_LIST_LIMIT + 1;
     for (let index = 0; index < total; index += 1) {
@@ -989,6 +1001,7 @@ describe('ApprovalService.sweepSLA', () => {
     await seedPending(harness, { slaSeconds: 60 });
     const bravoService = new ApprovalService({
       store: harness.backend.store(),
+      executionFence: 'none',
       now: harness.now,
     });
     await bravoService.create(
@@ -2465,5 +2478,116 @@ describe('ApprovalService audit isolation', () => {
 
     // #then — the action succeeded despite the sink
     expect(record.status).toBe('pending');
+  });
+});
+
+describe('ApprovalService.decide and the deployment execution fence', () => {
+  async function fenceAt(
+    state: ExecutionFenceState,
+  ): Promise<ExecutionFenceStore> {
+    const fence = new ExecutionFenceStore(
+      sqliteUnitDatabase(openSqlite()) as ExecutionFenceDatabase,
+    );
+    await fence.seed(state);
+    return fence;
+  }
+
+  it('still decides while draining', async () => {
+    // #given — a drain finishes outstanding work, and a decision is what an
+    // outstanding suspended run is waiting for.
+    const resumeRun = vi.fn(async () => undefined);
+    const harness = makeHarness({
+      resumeRun,
+      executionFence: await fenceAt('draining'),
+    });
+    const record = await seedPending(harness, { stepPath: ['approval'] });
+
+    // #then
+    const decided = await harness.service.decide(
+      record.id,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+    expect(decided.record.status).toBe('approved');
+    expect(resumeRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a decision under migration-locked WITHOUT committing it', async () => {
+    // #given — decide() commits and THEN resumes, so a gate any later would
+    // leave the approval durably decided on a deployment that can never act on
+    // it, and the deployment taking over would inherit a decision with no
+    // resume behind it.
+    const resumeRun = vi.fn(async () => undefined);
+    const harness = makeHarness({
+      resumeRun,
+      executionFence: await fenceAt('migration-locked'),
+    });
+    const record = await seedPending(harness, { stepPath: ['approval'] });
+
+    // #when / #then
+    const refusal = await harness.service
+      .decide(record.id, { decision: 'approve' }, REVIEWER)
+      .catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(ExecutionFencedError);
+    expect((refusal as ExecutionFencedError).reason).toEqual({
+      code: 'EXECUTION_FENCED',
+      state: 'migration-locked',
+    });
+    expect(resumeRun).not.toHaveBeenCalled();
+    // #and — the record is untouched, so the migration carries a pending
+    // approval rather than a decided-but-unresumed one.
+    await expect(harness.store.get(record.id)).resolves.toMatchObject({
+      status: 'pending',
+    });
+  });
+
+  it('keeps list and read open while locked', async () => {
+    const harness = makeHarness({
+      executionFence: await fenceAt('migration-locked'),
+    });
+    const record = await seedPending(harness);
+
+    await expect(
+      harness.service.get(record.id, REVIEWER),
+    ).resolves.toMatchObject({ id: record.id });
+    await expect(harness.service.list({}, REVIEWER)).resolves.toEqual([
+      expect.objectContaining({ id: record.id }),
+    ]);
+  });
+
+  it('decides only for the nominated proof run under proof-only', async () => {
+    // #given — a proof state bound to one run.
+    const fence = await fenceAt('migration-locked');
+    await fence.transition({
+      expected: 'migration-locked',
+      next: 'proof-only',
+      proofKey: 'proof-1',
+    });
+    expect(await fence.recordProofRun('proof-1', 'acme_run-proof')).toBe(true);
+    const resumeRun = vi.fn(async () => undefined);
+    const harness = makeHarness({ resumeRun, executionFence: fence });
+    const other = await seedPending(harness, {
+      runId: 'acme_run-other',
+      stepPath: ['approval'],
+    });
+    const proof = await seedPending(harness, {
+      runId: 'acme_run-proof',
+      stepPath: ['approval'],
+    });
+
+    // #then — an approval that gates a different run is refused...
+    await expect(
+      harness.service.decide(other.id, { decision: 'approve' }, REVIEWER),
+    ).rejects.toBeInstanceOf(ExecutionFencedError);
+
+    // #and — the proof run's gate is decided, which is what makes the proof
+    // able to reach a suspension and come back.
+    const decided = await harness.service.decide(
+      proof.id,
+      { decision: 'approve' },
+      REVIEWER,
+    );
+    expect(decided.record.status).toBe('approved');
+    expect(resumeRun).toHaveBeenCalledTimes(1);
   });
 });

@@ -581,7 +581,7 @@ const handler = {
         return new Response('not found', { status: 404 });
       }
       if (path === '/seed') {
-        await seedDeploymentIdentity(env.DB, 'spike');
+        await seedDeploymentIdentity(env.DB, 'spike', 'open');
         return Response.json({ ok: true });
       }
       const result =

@@ -29,6 +29,7 @@ import {
   trustAutomationPrincipal,
 } from '../approval-api/index.js';
 import { type AuditQueue, queueAuditSink } from '../audit-export/index.js';
+import type { ExecutionFenceWiring } from '../do-runner/execution-fence.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
 import {
   type ResumeRunFn,
@@ -173,6 +174,25 @@ export interface HostApprovalServiceOptions {
    * at fetch scope. Undefined means no live fan-out (a poll-only host).
    */
   stream?: ApprovalStreamSink;
+  /**
+   * The deployment execution fence (do-runner/execution-fence.ts), forwarded to
+   * ApprovalServiceOptions.executionFence, or `'none'` for a service with no
+   * database behind it.
+   *
+   * REQUIRED, and the `'none'` branch is genuinely dangerous rather than merely
+   * unusual: `'none'` makes decide() unfenced, and decide COMMITS the decision
+   * and only then resumes. A migration-locked deployment would durably record a
+   * decision — with its audit trail and its notification — whose resume then
+   * 503s, and the deployment taking over inherits a decided approval with
+   * nothing behind it. Write it only for a service that has no database to
+   * fence against at all.
+   *
+   * This function receives an ApprovalStore rather than a database, so it
+   * cannot build the store itself the way `init({ DB })` can — which is exactly
+   * why the option is required rather than optional: the host is the only place
+   * the wiring can happen, so the type has to make it name one.
+   */
+  executionFence: ExecutionFenceWiring;
 }
 
 /**
@@ -202,6 +222,12 @@ export function buildHostApprovalService(
     notify: options.notify,
     stream: options.stream,
     allowSelfDecision: options.allowSelfDecision,
+    // Forwarded as written, opt-out included: ApprovalService now requires the
+    // same wiring this composer does, so there is nothing left to resolve here
+    // — and resolving `'none'` to `undefined` on the way down would have
+    // erased, one layer above the gate, the distinction between a host that
+    // named the opt-out and one that never held a fence at all.
+    executionFence: options.executionFence,
     resumeRun: resumeRunWithRequeue(
       options.resumeRun,
       () => service,

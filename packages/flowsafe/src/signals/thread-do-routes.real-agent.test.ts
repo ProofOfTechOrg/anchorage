@@ -126,7 +126,10 @@ function scope(
   return {
     threadId,
     principal: humanPrincipal({ id: 'operator', role: 'operator' }),
-    init: init({ storage: new InMemoryStore() }, { pubsub }),
+    init: init(
+      { storage: new InMemoryStore() },
+      { pubsub, executionFence: 'none', startIdempotency: 'none' },
+    ),
   };
 }
 

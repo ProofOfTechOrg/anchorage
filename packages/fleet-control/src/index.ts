@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 export {
+  ActiveRouteAttestationError,
+  type ActiveRouteExpectation,
+  type AttestConvergedActiveRouteOptions,
+  attestConvergedActiveRoute,
+  attestFleetRecordActiveRoute,
+} from './active-route.js';
+export {
   applicationBindingTopology,
   applicationR2Bindings,
   applicationSecretNames,
@@ -82,6 +89,7 @@ export {
   provisionDeployment,
 } from './provision.js';
 export { generateDeploymentSecrets } from './secrets.js';
+export { fleetSettlementKey } from './settlement.js';
 export { deploymentSpecDigest } from './spec-digest.js';
 export {
   D1FleetStateStore,
@@ -89,6 +97,7 @@ export {
   type FleetStateDatabase,
 } from './state-store.js';
 export {
+  type ActiveRouteAttestation,
   type ApplicationBindingTopology,
   type ApplicationR2Binding,
   type ApplicationR2BucketSnapshot,
@@ -117,11 +126,18 @@ export {
   type FleetInventoryFinding,
   type FleetRecord,
   type FleetResourceInventory,
+  type FleetSettlementContext,
+  type FleetSettlementEntry,
+  type FleetSettlementHost,
   type FleetStateLease,
   type FleetStateStore,
   type ForceDecommissionStep,
+  type InitialExecutionFenceState,
   type LiveDeployment,
   type MaintenanceHealth,
+  type ObservedActiveRoute,
+  type PlainWorkerCustomDomain,
+  type PlainWorkerRouteApi,
   type PlatformPlaneLease,
   type PlatformPlaneResourceSet,
   type PlatformPlaneStateStore,
@@ -136,6 +152,7 @@ export {
   type ProvisioningResult,
   type R2Jurisdiction,
   type ScriptInventoryTarget,
+  type SeedDeploymentIdentityOptions,
   type TrustedWorkerArtifact,
   type WorkerModule,
   type WorkerZoneRoute,
@@ -159,11 +176,7 @@ export {
   WorkersForPlatformsBackendSwitchProvider,
   type WorkersForPlatformsBackendSwitchProviderOptions,
 } from './workers-for-platforms-backend-switch-provider.js';
-export {
-  type PlainWorkerCustomDomain,
-  type PlainWorkerRouteApi,
-  WranglerLoopBackend,
-} from './wrangler-loop-backend.js';
+export { WranglerLoopBackend } from './wrangler-loop-backend.js';
 export {
   type CommandResult,
   type CommandRunner,

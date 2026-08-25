@@ -1,45 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track D (M-006), CI-M-006-002 — createScheduleTick. WE OWN THE TICK (DL-012):
-// a Durable Object alarm drives listDueSchedules -> CAS
-// updateScheduleNextFire claim -> fire, bypassing core's pubsub worker loop
-// entirely (the P1 "one chokepoint, no second execution path" rule). Core's own
-// pubsub-driven schedule-worker loop is deliberately not adopted.
+// createScheduleTick. WE OWN THE TICK: a Durable Object alarm drives
+// listDueSchedules -> CAS updateScheduleNextFire claim -> fire, bypassing
+// core's pubsub worker loop entirely under the "one chokepoint, no second
+// execution path" rule. It does not adopt core's pubsub-driven schedule worker.
 //
 // TARGET KINDS:
 //  - WORKFLOW targets: mint a fresh path-safe runId and fire
 //    through the host's run-start seam (topology.start / RunnerRuntime.start),
-//    so the run inherits INV-1, the per-leg requestContext derivation, and the
-//    snapshot provenance. This is the fully-owned path.
+//    so the run inherits host-owned run ids, per-leg requestContext derivation,
+//    and snapshot provenance. This is the fully-owned path.
 //  - AGENT targets: `startAgent` routes the claimed target through the host's
 //    runtime-driven thread DO. Without that seam, the tick retains the audited
 //    `agent-target-unsupported` skip and never adopts core's worker.
 //
-// CAP (DL-007, P7): every unattended workflow start consults an INJECTABLE
-// run-cap seam (host-agnostic; the showcase's demo caps are one implementation).
-// A capped deployment yields an audited skip and the schedule stays healthy — the
-// CAS claim already advanced nextFireAt, so a capped fire is CONSUMED, not
-// retried hot (spike D-S4).
+// CAP: every unattended workflow start consults an INJECTABLE run-cap seam.
+// The showcase's demo caps are one implementation. A capped deployment yields
+// an audited skip and the schedule stays healthy: the CAS claim already
+// advanced nextFireAt, so the capped fire is consumed without a hot retry.
 //
-// STORED-CONTEXT BARRIER (b) (DL-004/R-004): a schedule's stored
-// WorkflowSchedule.requestContext is NEVER forwarded verbatim into a fired leg.
-// The tick STRIPS every reserved key (the whole `breakwater.` namespace + core's
-// goal key) before handing the remainder to the start seam. The reserved set IS
-// exactly the keys #requestContextFor derives (the two scope keys + the grant
-// key), so a stripped context shares NO key with the runtime-derived context —
-// there is normally nothing to collide. buildScheduledLegContext keeps the
-// R-004 order (stored FIRST, runtime-derived LAST) as defense-in-depth for a host
-// that applies the stored context, so a reserved key that ever slipped the strip
-// still LOSES to the runtime value. The DO target resolves this sanitized
-// context from the exact prepared trigger snapshot and RunnerRuntime merges it
-// below provider/runtime-derived values; it never trusts a forwarded body copy.
+// STORED-CONTEXT BARRIER: a schedule's stored WorkflowSchedule.requestContext
+// is NEVER forwarded verbatim into a fired leg. The tick STRIPS every reserved
+// key: the whole `breakwater.` namespace and core's goal key, before handing
+// the remainder to the start seam. The reserved set exactly matches
+// #requestContextFor's keys: two scope keys and the grant key. A stripped
+// context shares NO key with the runtime-derived context. There is normally
+// nothing to collide. buildScheduledLegContext keeps the stored context FIRST
+// and the runtime-derived context LAST. For a host applying stored context, a
+// reserved key that slips the strip still LOSES to the runtime value. The DO
+// target resolves this sanitized context from the exact prepared trigger
+// snapshot. RunnerRuntime merges it below provider/runtime-derived values. It
+// never trusts a forwarded body copy.
 
 import { ScheduleInputSchema } from '@mastra/core/schedules';
 import { computeNextFireAt } from '@mastra/core/workflows';
 import type { ResourceOwnershipStore } from '../approval-api/index.js';
 import {
+  admitsWorkAuthoring,
+  type ExecutionFenceWiring,
   isPathSafeId,
   isReservedExecutionContextKey,
   RESERVED_EXECUTION_CONTEXT_KEYS,
+  readExecutionFence,
   resolveScheduleStartOwner,
   stripReservedExecutionContext,
 } from '../do-runner/index.js';
@@ -314,6 +315,18 @@ export interface ScheduleTickOptions {
   runCap?: ScheduleTickRunCap;
   /** Every fire attempt is audited through this (accepted OR skipped/failed). Absent ⇒ no audit. */
   audit?: ScheduleTickAuditSink;
+  /**
+   * The deployment execution fence, read ONCE per pass and BEFORE any CAS
+   * claim, or `'none'` for a tick with no database behind it.
+   *
+   * REQUIRED, and this is the option the requirement exists for: a fenced pass
+   * must do nothing at all, because claiming a fire it will not run CONSUMES it
+   * — the claim advances `nextFireAt` — and the fenced runtime then refuses the
+   * start, so the fire is lost rather than deferred. A host that wires the
+   * runtime's fence but forgets this one gets exactly that, and nothing reports
+   * it. See ExecutionFenceWiring.
+   */
+  executionFence: ExecutionFenceWiring;
   /**
    * Max due schedules processed per tick pass. Must be a nonnegative safe
    * integer; zero is an intentional no-op. Default 100.
@@ -961,10 +974,10 @@ export function createScheduleTick(
     // claim even when a cap later consumes it without dispatch.
     const runId = mintPathSafeId('scheduleTick');
 
-    // 3. CAS claim — the single-claim gate (spike D-S1). The LOSER of two
+    // 3. CAS claim — the single-claim gate. The LOSER of two
     // concurrent ticks gets false here and dispatches nothing. This serializes
     // the claim only; downstream dispatch remains recoverable/at-least-once.
-    // The cap is consulted AFTER the claim (DL-007), so `runId` is minted before
+    // The cap is consulted AFTER the claim, so `runId` is minted before
     // we know whether the fire will actually dispatch: on a capped fire the row's
     // `lastRunId` records this CLAIM's id though no run started. The trigger row
     // is the authoritative record of what happened (outcome + its own runId,
@@ -1341,10 +1354,10 @@ export function createScheduleTick(
       return;
     }
 
-    // 5. Workflow target: consult the run cap (DL-007).
+    // 5. Workflow target: consult the run cap.
     const allowed = options.runCap ? await options.runCap() : true;
     if (!allowed) {
-      // Capped: the schedule stays healthy (already advanced), audited (D-S4).
+      // Capped: the schedule stays healthy (already advanced) and is audited.
       result.skipped += 1;
       await store.recordTrigger({
         ...claimTrigger,
@@ -1432,18 +1445,42 @@ export function createScheduleTick(
     }
   };
 
+  const idlePass = (): ScheduleTickResult => ({
+    due: 0,
+    fired: 0,
+    skipped: 0,
+    failed: 0,
+    deferred: 0,
+    reconciled: 0,
+    lost: 0,
+  });
+
   return async () => {
-    if (limit === 0) {
-      return {
-        due: 0,
-        fired: 0,
-        skipped: 0,
-        failed: 0,
-        deferred: 0,
-        reconciled: 0,
-        lost: 0,
-      };
+    if (limit === 0) return idlePass();
+    // ONE fence read per pass, before the due list and before any claim.
+    // Nothing at all runs on a fenced pass — not the deferred reconciliation
+    // either, since its agent-signal retry can dispatch. Every due fire stays
+    // due, so it fires when the fence reopens: neither lost nor duplicated.
+    //
+    // A fence that cannot be read skips the pass too. This is a cron/alarm
+    // path, so it degrades closed by DOING NOTHING and logging: throwing would
+    // fail the maintenance duty, and proceeding would claim fires on a
+    // deployment whose state is unknown.
+    let admitted: boolean;
+    try {
+      admitted = admitsWorkAuthoring(
+        await readExecutionFence(options.executionFence),
+      );
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          type: 'schedule-tick-fence-error',
+          reason: error instanceof Error ? error.message : String(error),
+        }),
+      );
+      return idlePass();
     }
+    if (!admitted) return idlePass();
     const at = now();
     const due = await store.listDueSchedules(at, limit);
     const result: ScheduleTickResult = {

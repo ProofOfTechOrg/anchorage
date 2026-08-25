@@ -24,7 +24,10 @@ class TestThread extends ThreadDurableObject {
     this.builds += 1;
     this.events?.push('build');
     if (this.buildError) throw this.buildError;
-    return init({ storage: new InMemoryStore() });
+    return init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
   }
 
   protected route(_request: Request, scope: ThreadScope): Promise<Response> {

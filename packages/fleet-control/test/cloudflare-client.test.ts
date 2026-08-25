@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it, vi } from 'vitest';
+import { ActiveRouteAttestationError } from '../src/active-route.js';
 import {
   CloudflareProvisioningClient,
   type DurableDatabaseExportStore,
@@ -2800,4 +2801,136 @@ describe('CloudflareProvisioningClient', () => {
     expect(mutations).toEqual(['attach', 'detach']);
     expect(fence.assertOwned).toHaveBeenCalledTimes(2);
   });
+
+  it('reduces an active route to one version at 100% or refuses', async () => {
+    // #given a Worker whose deployment traffic split is controlled per case
+    let versions: readonly Readonly<{
+      percentage: number;
+      version_id: string;
+    }>[] = [{ percentage: 100, version_id: 'version-live' }];
+    let bindings: readonly Readonly<Record<string, unknown>>[] = [
+      { type: 'plain_text', name: 'FLEET_SPEC_DIGEST', text: 'a'.repeat(64) },
+    ];
+    let scriptPresent = true;
+    let versionReads = 0;
+    const client = activeRouteClient(() => ({
+      versions,
+      bindings,
+      scriptPresent,
+      onVersionRead: () => {
+        versionReads += 1;
+      },
+    }));
+
+    // #when a single version holds all of the traffic
+    // #then it is attested with the digest its bindings carry
+    await expect(
+      client.inspectActiveWorkerRoute('acme-production'),
+    ).resolves.toEqual({
+      artifactVersion: 'version-live',
+      specDigest: 'a'.repeat(64),
+    });
+
+    // #when a candidate is staged into the deployment at 0%
+    versions = [
+      { percentage: 100, version_id: 'version-live' },
+      { percentage: 0, version_id: 'version-candidate' },
+    ];
+    const staged = await client
+      .inspectActiveWorkerRoute('acme-production')
+      .catch((error: unknown) => error);
+
+    // #then the deployment is refused rather than reduced by picking a winner,
+    // and the staged candidate is never what comes back
+    expect(staged).toBeInstanceOf(ActiveRouteAttestationError);
+    expect((staged as ActiveRouteAttestationError).message).toContain(
+      'exactly one current version receiving 100% of traffic',
+    );
+    expect((staged as ActiveRouteAttestationError).observed).toEqual({
+      routedScriptName: 'acme-production',
+      trafficSplit: [
+        { artifactVersion: 'version-live', percentage: 100 },
+        { artifactVersion: 'version-candidate', percentage: 0 },
+      ],
+    });
+
+    // #when traffic is genuinely split
+    versions = [
+      { percentage: 60, version_id: 'version-old' },
+      { percentage: 40, version_id: 'version-new' },
+    ];
+    const split = await client
+      .inspectActiveWorkerRoute('acme-production')
+      .catch((error: unknown) => error);
+
+    // #then the refusal carries the percentages, and the larger share is not
+    // promoted to "the routed version"
+    expect((split as ActiveRouteAttestationError).observed).toEqual({
+      routedScriptName: 'acme-production',
+      trafficSplit: [
+        { artifactVersion: 'version-old', percentage: 60 },
+        { artifactVersion: 'version-new', percentage: 40 },
+      ],
+    });
+
+    // #when the routed version carries no fleet digest binding
+    versions = [{ percentage: 100, version_id: 'version-live' }];
+    bindings = [{ type: 'plain_text', name: 'FLEET_ENVIRONMENT', text: 'p' }];
+
+    // #then the version is still reported, with the absence stated as absence
+    await expect(
+      client.inspectActiveWorkerRoute('acme-production'),
+    ).resolves.toEqual({
+      artifactVersion: 'version-live',
+      specDigest: undefined,
+    });
+
+    // #when the script does not exist
+    scriptPresent = false;
+    const reads = versionReads;
+
+    // #then there is nothing to attest and no version read is spent
+    await expect(
+      client.inspectActiveWorkerRoute('acme-production'),
+    ).resolves.toBeUndefined();
+    expect(versionReads).toBe(reads);
+  });
 });
+
+function activeRouteClient(
+  state: () => {
+    readonly versions: readonly Readonly<{
+      percentage: number;
+      version_id: string;
+    }>[];
+    readonly bindings: readonly Readonly<Record<string, unknown>>[];
+    readonly scriptPresent: boolean;
+    readonly onVersionRead: () => void;
+  },
+) {
+  return new CloudflareProvisioningClient({
+    accountId: 'account',
+    apiToken: 'token',
+    rateCoordinator: testRateCoordinator(),
+    dispatchNamespace: 'fleet',
+    fetch: async (input) => {
+      const url = new URL(
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+      );
+      const current = state();
+      if (url.pathname.endsWith('/workers/scripts/acme-production/deployments'))
+        return current.scriptPresent
+          ? envelope({ deployments: [{ versions: current.versions }] })
+          : new Response(null, { status: 404 });
+      if (url.pathname.includes('/workers/scripts/acme-production/versions/')) {
+        current.onVersionRead();
+        return envelope({ resources: { bindings: current.bindings } });
+      }
+      throw new Error(`unexpected Cloudflare request: ${url.href}`);
+    },
+  });
+}

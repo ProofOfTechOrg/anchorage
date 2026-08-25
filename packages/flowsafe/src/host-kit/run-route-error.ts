@@ -24,3 +24,29 @@ export class RunRouteError extends Error {
     this.reason = reason;
   }
 }
+
+/**
+ * The Durable Object's own structured refusal, if this error carries one.
+ *
+ * The taxonomy's rule is that a `reason` is a SCREAMING_SNAKE code the DO
+ * deliberately published (do-error-response.ts), and every router that fronts a
+ * DO must pass one through with its status intact. Without this, a router that
+ * collapses 5xx to a bare 500 — the shape agent-host/router.ts and
+ * stream-router.ts both had — turns "this deployment is fenced, retry after the
+ * migration" into "I am broken", and the caller cannot tell a retryable
+ * operational state from a code fault.
+ *
+ * Narrow on purpose: only a plain object with a string `code` qualifies, so an
+ * upstream body that happened to carry a `reason` field of some other shape
+ * cannot widen what a 5xx surfaces.
+ */
+export function runRouteReason(
+  error: RunRouteError,
+): { code: string } | undefined {
+  const { reason } = error;
+  if (typeof reason !== 'object' || reason === null || Array.isArray(reason)) {
+    return undefined;
+  }
+  const { code } = reason as { code?: unknown };
+  return typeof code === 'string' ? (reason as { code: string }) : undefined;
+}

@@ -181,6 +181,7 @@ try {
   await writeFile(
     join(consumerDirectory, 'consumer.ts'),
     `import {
+  ActiveRouteAttestationError,
   CloudflareProvisioningClient,
   D1CloudflareApiRateCoordinator,
   ProcessLocalCloudflareApiRateCoordinator,
@@ -188,16 +189,33 @@ try {
   WorkersForPlatformsBackend,
   WorkersForPlatformsBackendSwitchProvider,
   WranglerLoopBackend,
+  attestConvergedActiveRoute,
+  attestFleetRecordActiveRoute,
   auditFleetDrift,
   decommissionDeployment,
   forceDecommissionDeployment,
   deploymentSpecDigest,
   deriveStateEgressCredential,
+  fleetSettlementKey,
   provisionDeployment,
   validateDeploymentSpec,
+  type ActiveRouteAttestation,
+  type ActiveRouteExpectation,
+  type AttestConvergedActiveRouteOptions,
   type CloudflareApiRateCoordinator,
   type DeploymentEgressPolicy,
+  type DeploymentSpec,
+  type FleetRecord,
+  type FleetSettlementContext,
+  type FleetSettlementEntry,
+  type FleetSettlementHost,
   type FleetStateDatabase,
+  type InitialExecutionFenceState,
+  type ObservedActiveRoute,
+  type PlainWorkerCustomDomain,
+  type PlainWorkerRouteApi,
+  type ProvisioningBackend,
+  type SeedDeploymentIdentityOptions,
   type WorkersForPlatformsApi,
 } from '@proofoftech/fleet-control';
 import type { FleetDispatchEnv } from '@proofoftech/fleet-control/workers/dispatch';
@@ -215,7 +233,69 @@ declare const database: FleetStateDatabase;
 declare const api: WorkersForPlatformsApi;
 declare const policy: DeploymentEgressPolicy;
 declare const coordinator: CloudflareApiRateCoordinator;
+declare const deploymentSpec: DeploymentSpec;
+declare const provisioningBackend: ProvisioningBackend;
+declare const fleetRecord: FleetRecord;
+declare const plainWorkerRouteApi: PlainWorkerRouteApi;
+// The provisioning-time fence state a control plane has to choose. Named here
+// because it is a REQUIRED provisionDeployment option: a consumer that cannot
+// import its type cannot type its own provisioning wrapper.
+declare const initialExecutionFenceState: InitialExecutionFenceState;
+const lockedAtBirth: InitialExecutionFenceState = 'migration-locked';
+// The options object seedDeploymentIdentity takes. A consumer implementing its
+// own ProvisioningBackend has to name this type to declare that method, and it
+// is where future provisioning context lands without another positional.
+const seedOptions: SeedDeploymentIdentityOptions = {
+  initialExecutionFenceState: lockedAtBirth,
+};
+// A consumer implementing its own ProvisioningBackend has to name the
+// attestation it returns, and a host reading one has to name what it compares
+// against, so both the result and the expectation are part of the surface.
+declare const routeAttestation: ActiveRouteAttestation;
+const routeExpectation: ActiveRouteExpectation = {
+  specDigest: routeAttestation.specDigest,
+  artifactVersion: routeAttestation.artifactVersion,
+};
+const routeAttestationOptions: AttestConvergedActiveRouteOptions = {
+  convergenceBudgetMs: 60_000,
+};
+const activeRouteRead: Promise<ActiveRouteAttestation> =
+  provisioningBackend.attestActiveRoute(deploymentSpec);
+type SettledSettlementKeyIsOptional = {} extends Pick<
+  FleetRecord,
+  'settledSettlementKey'
+>
+  ? true
+  : false;
+const settledSettlementKeyIsOptional: SettledSettlementKeyIsOptional = true;
+const settledSettlementKey: string | undefined =
+  fleetRecord.settledSettlementKey;
+const customDomain: PlainWorkerCustomDomain = {
+  id: 'domain-id',
+  hostname: 'acme.example.test',
+  service: 'acme-production',
+};
+const activePlainWorkerRoute =
+  plainWorkerRouteApi.inspectActiveWorkerRoute(customDomain.service);
+// The refusal's payload, which is what a host logs when a route cannot be
+// attested; unusable without its type.
+declare const observedRoute: ObservedActiveRoute;
+// A settling host is written entirely against these types: the callback shape,
+// the context it receives, and the entry it must switch on to interpret
+// \`prior\`. A consumer that cannot name all three cannot implement one.
+const settlementHost: FleetSettlementHost = {
+  async settle(context: FleetSettlementContext): Promise<void> {
+    const entry: FleetSettlementEntry = context.entry;
+    void entry;
+    void context.settlementKey;
+    void context.alreadySettled;
+    void context.attestation.physicalScriptName;
+    void context.target.specDigest;
+    void context.prior?.physicalScriptName;
+  },
+};
 
+void ActiveRouteAttestationError;
 void CloudflareProvisioningClient;
 void D1CloudflareApiRateCoordinator;
 void ProcessLocalCloudflareApiRateCoordinator;
@@ -224,12 +304,15 @@ void WorkersForPlatformsBackend;
 void WorkersForPlatformsBackendSwitchProvider;
 void WranglerLoopBackend;
 void StateEgress;
+void attestConvergedActiveRoute;
+void attestFleetRecordActiveRoute;
 void auditFleetDrift;
 void createEgressProxyFetch;
 void decommissionDeployment;
 void forceDecommissionDeployment;
 void deploymentSpecDigest;
 void deriveStateEgressCredential;
+void fleetSettlementKey;
 void provisionDeployment;
 void validateDeploymentSpec;
 void dispatchEnv;
@@ -239,16 +322,37 @@ void database;
 void api;
 void policy;
 void coordinator;
+void deploymentSpec;
+void provisioningBackend;
+void fleetRecord;
+void plainWorkerRouteApi;
+void initialExecutionFenceState;
+void lockedAtBirth;
+void seedOptions;
+void routeAttestation;
+void routeExpectation;
+void routeAttestationOptions;
+void activeRouteRead;
+void settledSettlementKeyIsOptional;
+void settledSettlementKey;
+void customDomain;
+void activePlainWorkerRoute;
+void observedRoute;
+void settlementHost;
 `,
   );
   await writeFile(
     join(consumerDirectory, 'runtime.mjs'),
     `import assert from 'node:assert/strict';
 import {
+  ActiveRouteAttestationError,
   ProcessLocalCloudflareApiRateCoordinator,
   ProvisioningError,
   WorkersForPlatformsBackend,
+  attestConvergedActiveRoute,
+  attestFleetRecordActiveRoute,
   deploymentSpecDigest,
+  fleetSettlementKey,
 } from '@proofoftech/fleet-control';
 
 // Every export entry must load. The three Workers entries are default-export
@@ -268,6 +372,11 @@ assert.equal(typeof auditConsumer.default.queue, 'function');
 assert.equal(typeof deploymentSpecDigest, 'function');
 assert.equal(typeof ProcessLocalCloudflareApiRateCoordinator, 'function');
 assert.ok(new ProvisioningError('probe') instanceof Error);
+assert.equal(typeof ActiveRouteAttestationError, 'function');
+assert.ok(new ActiveRouteAttestationError('probe', {}) instanceof Error);
+assert.equal(typeof attestConvergedActiveRoute, 'function');
+assert.equal(typeof attestFleetRecordActiveRoute, 'function');
+assert.equal(typeof fleetSettlementKey, 'function');
 
 // The trusted-configuration constructor must fail closed. This is the barrier
 // that makes a published fleet-control inert without control-plane inputs, so

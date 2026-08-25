@@ -70,7 +70,9 @@ import { modelConfig, SYSTEM_PRINCIPAL_ID } from './config.js';
 import { starterRunnerLifecycleConfig } from './principal-context.js';
 import {
   createComposedStorage,
+  executionFence,
   schedulesStore,
+  startIdempotency,
   subscriptionStoreFactory,
 } from './storage.js';
 import { defineWorkflows } from './workflows.js';
@@ -152,6 +154,7 @@ export class StarterSignalProviderHost extends SignalProviderHost<Env> {
         env.DEPLOYMENT_IDENTITY_SECRET,
       ),
       providers: [github],
+      executionFence: executionFence(env.DB),
     };
   }
 }
@@ -193,6 +196,10 @@ export class StarterThread extends ThreadDurableObject<Env> {
       approvalService: () => {
         this.#approvalService ??= new ApprovalService({
           store: approvals,
+          // decide() COMMITS and only then resumes, so the fence belongs at
+          // the service: a decision recorded against a locked deployment
+          // would be durable with nothing behind it.
+          executionFence: executionFence(env.DB),
           ...(this.env.STREAM_TICKET_SECRET
             ? {
                 stream: (event) =>
@@ -216,6 +223,14 @@ export class StarterThread extends ThreadDurableObject<Env> {
         requestContextForRun: agentHost.requestContextForRun(
           approvalGrantProvider(approvals),
         ),
+        // The composed store hides the binding init would have fenced from, so
+        // this thread DO names it: the deployment execution fence must live in
+        // the SAME database as the state it fences.
+        executionFence: executionFence(env.DB),
+        // Same binding, same reasoning: the agent topology reserves keyed
+        // agent starts into this store, and this runtime is what settles them
+        // when the run it dispatched reaches terminal.
+        startIdempotency: startIdempotency(env.DB),
       },
     );
     this.#threadInit = threadInit;
@@ -400,6 +415,7 @@ export class StarterBackgroundTasks {
         },
       },
       execution: true,
+      executionFence: executionFence(this.env.DB),
       manager: {
         globalConcurrency: 10,
         perAgentConcurrency: 3,
@@ -445,7 +461,10 @@ export class StarterBackgroundTasks {
       const resources = approvalStoreFactoryFor(this.env.DB).resources();
       const host = await this.#ensureHost();
       const route = createBackgroundTaskRoutes({
-        manager: host.manager,
+        // The HOST, not its manager: the manager also carries enqueue and the
+        // executor registry, and a route must not be one property access
+        // away from putting an unfenced task body on this deployment.
+        manager: host,
         authorize: async (scope) => {
           const checks: Promise<boolean>[] = [];
           if (scope.runId !== undefined) {

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track C (M-004) integration (SHOULD-FIX): one signal ingested through the FULL
-// chain — createSignalRouter (the P6 gate) → real createThreadTopology → real
-// ThreadDurableObject (its stamped-principal assertion) → the production thread
-// signal routes → a runtime-driven reserve agent — with NO LLM. The unit suites
+// One signal ingested through the FULL chain: createSignalRouter's ingestion
+// gate → real createThreadTopology → real ThreadDurableObject (its
+// stamped-principal assertion) → the production thread signal routes → a
+// runtime-driven reserve agent, with NO LLM. The unit suites
 // each mock a seam; this one wires the real seams together so the ingestion
 // boundary has one end-to-end proof, including the idle-wake run cap consulted
 // both allowing and capping, plus a foreign path-safe thread refusal.
@@ -89,7 +89,10 @@ class TestThread extends ThreadDurableObject<TestEnv> {
   });
 
   protected build(): InitResult {
-    return init({ storage: new InMemoryStore() });
+    return init(
+      { storage: new InMemoryStore() },
+      { executionFence: 'none', startIdempotency: 'none' },
+    );
   }
 
   protected async route(

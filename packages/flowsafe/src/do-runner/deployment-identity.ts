@@ -24,6 +24,7 @@ import {
   DeploymentIdentityError,
   deploymentIdentityHeaders,
   type DeploymentIdentityProtocolExecutor,
+  type InitialExecutionFenceState,
   provisionDeploymentIdentityProtocol,
   readDeploymentIdentityProtocol,
 } from '#deployment-identity-protocol';
@@ -51,6 +52,13 @@ export {
   DEPLOYMENT_IDENTITY_HEADER,
   deploymentIdentityHeaders,
 };
+
+/**
+ * The execution-fence state a deployment is provisioned into — 'open' or
+ * 'migration-locked'. Named here so a host wiring `seedDeploymentIdentity`
+ * types the choice rather than passing a bare string.
+ */
+export type { InitialExecutionFenceState };
 
 /**
  * Minimal structural D1 surface the sentinel check uses — same posture as
@@ -84,7 +92,20 @@ function assertValidTag(tag: unknown, caller: string): asserts tag is string {
   assertValidDeploymentTag(tag, caller);
 }
 
-function isDatabaseBinding(db: unknown): db is DeploymentIdentityDatabase {
+/**
+ * Whether a binding is a D1 database rather than something else bound under the
+ * same name.
+ *
+ * Exported for this package's own modules and deliberately NOT re-exported from
+ * `./index.js` — the same posture `safeDecodeSegment` has. It is internal
+ * plumbing two files must agree on (durable-object.ts asks the same question of
+ * `env.DB` before it insists on a fence), not a contract a consumer should be
+ * able to pin; barrel-exporting it would inflate the semver surface of a
+ * predicate that exists to describe Cloudflare's binding shapes.
+ */
+export function isDatabaseBinding(
+  db: unknown,
+): db is DeploymentIdentityDatabase {
   if ((typeof db !== 'object' && typeof db !== 'function') || db === null) {
     return false;
   }
@@ -154,18 +175,26 @@ function deploymentIdentityProtocolExecutor(
 
 /**
  * Provisioning-time seeding: stamp the database with its owning deployment's
- * tag. Idempotent for the SAME tag (re-running provisioning is safe); throws
- * for a DIFFERENT tag — a database is never silently re-homed; deployment
- * decommissioning deletes it instead.
+ * tag, and write its initial execution-fence row. Idempotent for the SAME tag
+ * (re-running provisioning is safe); throws for a DIFFERENT tag — a database is
+ * never silently re-homed; deployment decommissioning deletes it instead.
+ *
+ * `initialExecutionFenceState` is REQUIRED and has no default: a host that
+ * means to bring a deployment up already locked for a migration must say so,
+ * and one that forgets must not silently get an executing deployment. The fence
+ * row is INSERT-if-absent, so re-seeding never reopens a fence an operator
+ * closed.
  */
 export async function seedDeploymentIdentity(
   db: DeploymentIdentityDatabase,
   tag: string,
+  initialExecutionFenceState: InitialExecutionFenceState,
 ): Promise<void> {
   databaseBinding(db, 'seedDeploymentIdentity');
   await provisionDeploymentIdentityProtocol(
     deploymentIdentityProtocolExecutor(db),
     tag,
+    { initialExecutionFenceState },
   );
 }
 

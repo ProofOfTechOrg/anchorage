@@ -22,10 +22,19 @@ import {
 import type { DurableObjectRunnerState, WebSocketLike } from './cf-types.js';
 import { newWebSocketPair, safeSend } from './cf-types.js';
 import {
+  isDatabaseBinding,
   verifyDurableObjectDeploymentIdentity,
   verifyDurableObjectDeploymentRequest,
 } from './deployment-identity.js';
 import { DoStatusError, doErrorResponse } from './do-error-response.js';
+import {
+  admitsExistingRun,
+  admitsRunStart,
+  ExecutionFencedError,
+  type ExecutionFenceReading,
+  isExecutionFenceRefusal,
+  readExecutionFence,
+} from './execution-fence.js';
 import { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
 import { isPathSafeId } from './path-safe-id.js';
 import {
@@ -33,7 +42,7 @@ import {
   RunAlreadyExistsError,
   type RunLifecycleCas,
   type RunLifecycleTransitionResult,
-  type RunnerRuntime,
+  RunnerRuntime,
   RunStateUnreadableError,
   type RunSummary,
   UnknownRunError,
@@ -103,7 +112,7 @@ export interface DurableObjectRunLifecycleHooks {
 }
 
 const RUN_OWNER_RECOVERY_KEY = 'flowsafe:run-owner-recovery:v1';
-const RUN_OWNER_RECOVERY_DELAY_MS = 60_000;
+export const RUN_OWNER_RECOVERY_DELAY_MS = 60_000;
 const SUSPENSION_DEADLINE_RETRY_MS = 60_000;
 // How long a run's state may stay unreadable before the entries due under it
 // are given up on. A read that never succeeds is never charged, so without this
@@ -151,6 +160,16 @@ interface StartBody {
   scheduleId?: unknown;
   dispatchId?: unknown;
   deadlineMs?: unknown;
+  /**
+   * The start's idempotency key, arriving on the INTERNAL Worker-to-DO channel
+   * only. Every request that reaches this route carries the deployment-identity
+   * header (a tenant request bearing one is refused before routing), so a key
+   * here is one the trusted run router reserved — which is what lets the
+   * proof-only fence match it. It is deliberately not an open request-context
+   * key and never a field of the public POST /runs body.
+   * @internal
+   */
+  idempotencyKey?: unknown;
 }
 
 interface ResumeBody {
@@ -170,6 +189,55 @@ class DurableObjectRunIdentityError extends DoStatusError {
   readonly status = 403;
 }
 
+/**
+ * Does this env carry a database to fence against?
+ *
+ * `isDatabaseBinding` is deployment-identity's, imported rather than restated:
+ * it is the SAME question about the SAME binding (an RPC binding — a service
+ * binding with a named entrypoint, a Durable Object stub — is a proxy that
+ * answers every property with a callable, so `fetch` is what separates that
+ * family from a D1Database). Two copies would be two places for that
+ * discrimination to be revised, and a deployment where they disagreed would
+ * pass the identity check and skip the fence assert, or the reverse.
+ */
+function hasDatabaseBinding(env: unknown): boolean {
+  return isDatabaseBinding((env as { DB?: unknown } | null | undefined)?.DB);
+}
+
+/**
+ * A run object bound to a real database must never serve from a fence-less
+ * runtime. `init()` makes that true for every host that hands it the binding —
+ * its `{ DB }` branch has no opt-out — so what is left for this assert is the
+ * host that builds a RunnerRuntime by hand inside `build()` and forgets: that
+ * deployment would then execute straight through a migration lock, silently,
+ * and the fence would look wired because every OTHER surface reports it.
+ *
+ * Scoped to runtimes THIS PACKAGE built. A test double cast to the type is not
+ * a RunnerRuntime and carries no fence by construction; asserting on it would
+ * indict every stub for a property it was never meant to have, and would say
+ * nothing about the production wiring this guard exists for.
+ */
+function assertFencedRuntime(runtime: RunnerRuntime, env: unknown): void {
+  if (!(runtime instanceof RunnerRuntime)) return;
+  if (!hasDatabaseBinding(env)) return;
+  if (runtime.executionFence === undefined) {
+    throw new Error(
+      'DurableObjectRunner: build() returned a runtime with no execution fence while this deployment carries a DB binding — wire it through init({ DB }) (which builds one) or pass an ExecutionFenceStore, so a migration-locked deployment cannot execute',
+    );
+  }
+  // The same guard, for the same failure. A hand-built runtime with no
+  // reservation store still EXECUTES idempotent starts — the router reserves
+  // and claims above it — but never marks their reservations spent, so every
+  // key this deployment ever honoured stays in the drain inventory and never
+  // becomes purgeable. That is invisible until the day someone tries to prove
+  // the deployment empty, which is the day it matters most.
+  if (runtime.startIdempotency === undefined) {
+    throw new Error(
+      'DurableObjectRunner: build() returned a runtime with no start-reservation store while this deployment carries a DB binding — wire it through init({ DB }) (which builds one), so an idempotent start can be marked settled when its run ends',
+    );
+  }
+}
+
 export abstract class DurableObjectRunner<TEnv = unknown> {
   protected readonly env: TEnv;
   /** Absent in Node tests; present under workerd for storage and the alarm. */
@@ -178,6 +246,16 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
   #operationTail = Promise.resolve();
   /** `step\0reason` of every suspension deadline this object has reported. */
   #reportedSuspensionRejections = new Set<string>();
+  /**
+   * `workflowId:runId` of every start this object is currently executing — the
+   * liveness half of the idempotent-start replay decision.
+   *
+   * A SET rather than a stored key, because liveness is not durable state: the
+   * question is "is code running for this run right now", and the honest answer
+   * after an eviction is no. Anything written to storage would survive the
+   * isolate that wrote it and keep saying yes.
+   */
+  readonly #startsInFlight = new Set<string>();
 
   constructor(state: DurableObjectRunnerState | undefined, env: TEnv) {
     this.state = state;
@@ -218,13 +296,25 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
 
   #ensureRuntime(): RunnerRuntime {
     if (!this.#runtime) {
-      this.#runtime = this.build(this.env);
+      const runtime = this.build(this.env);
+      assertFencedRuntime(runtime, this.env);
+      this.#runtime = runtime;
     }
     return this.#runtime;
   }
 
-  // INV-1 enforcement at the DO boundary: this instance was addressed as
-  // idFromName(`${workflowId}:${runId}`) by the trusted Worker, and id.name
+  /**
+   * This object's execution fence, or the open reading when the host built an
+   * unfenced runtime. Taken from the RUNTIME rather than constructed here, so
+   * the routes below and the start/resume backstop inside the runtime can
+   * never be gating two different databases.
+   */
+  async #readExecutionFence(): Promise<ExecutionFenceReading> {
+    return readExecutionFence(this.#ensureRuntime().executionFence);
+  }
+
+  // Enforce host-owned run ids at the DO boundary: this instance was addressed
+  // as idFromName(`${workflowId}:${runId}`) by the trusted Worker, and id.name
   // is unforgeable at this boundary. If a request asks the instance to act on
   // a DIFFERENT (workflowId, runId), someone routed around the name join —
   // acting on the request's ids would run outside this instance's identity
@@ -237,9 +327,51 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     if (name === undefined) return;
     if (name !== `${workflowId}:${runId}`) {
       throw new Error(
-        `DO identity mismatch: instance is '${name}' but the request names '${workflowId}:${runId}' — refusing (INV-1)`,
+        `DO identity mismatch: instance is '${name}' but the request names '${workflowId}:${runId}' — refusing`,
       );
     }
+  }
+
+  /**
+   * The same `workflowId:runId` join the DO name and the runtime's own run key
+   * use — composed here so the in-flight set cannot be keyed by runId alone,
+   * which would make two workflows' runs of the same id one another's liveness.
+   */
+  #inFlightKey(workflowId: string, runId: string): string {
+    return `${workflowId}:${runId}`;
+  }
+
+  /**
+   * Is a start for this run executing in THIS object right now?
+   *
+   * Two sources, ORed, because they cover different halves of the window: the
+   * route's own set covers from the recovery journal to the response (including
+   * the gap before core persists anything), and the runtime's `#activeRuns`
+   * covers a run driven through this isolate's runtime by any other path — an
+   * in-process host, a resume, an agent loop sharing the runtime. Neither alone
+   * is the whole window, and a false negative here is the expensive direction:
+   * it turns a live run into an UNRESOLVABLE refusal.
+   */
+  #isStartLive(workflowId: string, runId: string): boolean {
+    if (this.#startsInFlight.has(this.#inFlightKey(workflowId, runId))) {
+      return true;
+    }
+    return this.#ensureRuntime().isRunActive(workflowId, runId);
+  }
+
+  /**
+   * Validate an internal-channel idempotency key. Absent stays absent; anything
+   * present must be path-safe, because the same string is compared against the
+   * fence's proof key and stored as a reservation's primary key.
+   */
+  #startIdempotencyKey(value: unknown): string | undefined {
+    if (value === undefined || value === null) return undefined;
+    if (!isPathSafeId(value)) {
+      throw new InvalidRunRequestError(
+        'idempotencyKey must be a URL-path-safe identifier',
+      );
+    }
+    return value;
   }
 
   #requestedBy(value: unknown): string {
@@ -937,11 +1069,11 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
     now: number,
   ): Promise<void> {
     const { workflowId, runId } = stored;
-    // INV-1 at the one boundary whose ids come from storage rather than from
-    // the trusted Worker: this wake is about to execute a workflow body, so it
-    // must be this object's own run (and its per-run serialization). Charged
-    // like any other duty failure, deliberately: it is the one charged failure
-    // that read nothing, and charging is what quiets a foreign record's entry
+    // Enforce host-owned run ids at the boundary whose ids come from storage,
+    // rather than from the trusted Worker. This wake is about to execute a
+    // workflow body, so it must be this object's own run and serialization.
+    // Charge it like any other duty failure: it is the one charged failure that
+    // read nothing, and charging is what quiets a foreign record's entry
     // (five wakes to a tombstone). It stays here rather than moving up with the
     // runtime because the nothing-due path below deliberately prefers `id.name`
     // over a foreign record, which asserting early would break.
@@ -1156,6 +1288,28 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       await this.#resumeDueSuspensionDeadline(runtime, stored, entry, now);
       return true;
     } catch (error) {
+      // The deployment is fenced (or its fence could not be read). Classified
+      // with the same THREE outcomes as an unreadable read — uncharged,
+      // unconverged, watchdog cadence — because a wake refused by an
+      // operational control is no evidence about the entry it was working on.
+      // Charging it would spend the abandonment budget in about sixteen
+      // minutes of lock and tombstone a live deadline; converging would arm
+      // from a still-due entry no ledger backed off, which lands on the
+      // one-second floor and spins.
+      //
+      // What it deliberately does NOT do is stamp `unreadableSince`. That
+      // clock exists to bound a run whose state became PERMANENTLY unreadable,
+      // and abandons its entries after a day; a fence is a deliberate,
+      // operator-visible, bounded state, and answering a long migration by
+      // discarding every deadline due inside it would be the same fault the
+      // no-charge rule above exists to prevent, one order of magnitude later.
+      if (isExecutionFenceRefusal(error)) {
+        console.error(
+          'suspension deadline wake refused by the deployment execution fence',
+          error,
+        );
+        return false;
+      }
       // Classified FIRST, or every degraded wake would also log the generic
       // failure below. A read that did not succeed converges nothing and
       // charges nothing: it keeps the watchdog cadence until it heals, and the
@@ -1316,9 +1470,9 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         if (!body || typeof body.workflowId !== 'string') {
           return json({ error: 'workflowId is required' }, 400);
         }
-        // The DO never generates a runId (INV-1): the trusted Worker mints the
-        // id and addresses this instance with it. A start without one is a
-        // caller bug, not a request for generation.
+        // The DO never generates a runId: the trusted Worker mints the id and
+        // addresses this instance with it. A start without one is a caller bug,
+        // not a request for generation.
         if (typeof body.runId !== 'string') {
           return json(
             { error: 'runId is required (server-minted by the run router)' },
@@ -1333,6 +1487,30 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           );
         }
         this.#assertRunIdentity(workflowId, runId);
+        // The key rides the internal channel and nothing else. Validated here
+        // rather than trusted because this body is JSON: an unvalidated value
+        // would reach the fence's proof-only comparison and the runtime's
+        // reservation as whatever the parser produced.
+        const idempotencyKey = this.#startIdempotencyKey(body.idempotencyKey);
+        // The fence BEFORE any of this object's own reads or writes: the
+        // schedule-source lookup below, the recovery pass, the journal at
+        // #armRunOwnerRecovery, and the owner reservation all touch storage,
+        // and a deployment that is refusing to execute must not leave a run
+        // half-claimed on its way to saying no. The runtime's own check inside
+        // start() stays the backstop for every other caller.
+        //
+        // The KEY is what admits a proof-only start: in that state the fence
+        // nominates exactly one key, and a start carrying it is the proof run.
+        // This check reads the fence but does NOT bind the proof to the run —
+        // `recordProofRun` belongs to the runtime's own assert, which is the
+        // last gate before execution and the only one every caller passes.
+        // Binding here as well would let a start that this route later refused
+        // (an existing run, a schedule-source mismatch) consume the deployment's
+        // one proof slot.
+        const startFence = await this.#readExecutionFence();
+        if (!admitsRunStart(startFence, idempotencyKey)) {
+          throw new ExecutionFencedError(startFence.state, 'run start');
+        }
         const source = await this.#startSource(
           principal,
           workflowId,
@@ -1371,6 +1549,16 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           token: crypto.randomUUID(),
         };
         await this.#armRunOwnerRecovery(recovery);
+        // From here to the finally below, this object IS the run's execution:
+        // everything past the journal either persists a snapshot or leaves the
+        // recovery pass to settle it. That window is exactly what a replaying
+        // start's liveness probe is asking about, and it is tracked in memory
+        // on purpose — an evicted isolate loses the entry, which is the true
+        // answer for a run that is no longer executing anywhere. Registered
+        // BEFORE the reservation and the runtime's own #activeRuns entry so the
+        // gap between the claim and core's first persisted snapshot — the one
+        // window where nothing else can see the run — is covered too.
+        this.#startsInFlight.add(this.#inFlightKey(workflowId, runId));
         try {
           await this.#reserveRunOwner(runId, source.owner, recovery.token);
           let summary: RunSummary;
@@ -1389,6 +1577,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
               requestedBy: principal.id,
               requestedByKind: principal.kind,
               attemptToken: recovery.token,
+              ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
               ...(body.deadlineMs === undefined
                 ? {}
                 : { deadlineMs: body.deadlineMs as number }),
@@ -1442,7 +1631,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
             summary,
           );
           await this.#settleRunOwnerBestEffort(recovery, false, !reconciled);
-          // DL-018: the authoritative RunSummary is the run-progress frame; push it
+          // The authoritative RunSummary is the run-progress frame; push it
           // to any subscribed run-channel socket at this lifecycle boundary.
           this.#broadcastRunSummary(summary);
           return json(summary);
@@ -1454,8 +1643,28 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
             await this.#rearmRunOwnerRecovery();
           }
           throw error;
+        } finally {
+          // Whatever happened, this object is no longer starting the run. The
+          // delete must be unconditional: an entry left behind would answer
+          // every later probe "live" for the lifetime of the isolate, turning a
+          // crashed start's honest UNRESOLVABLE into an endless PENDING.
+          this.#startsInFlight.delete(this.#inFlightKey(workflowId, runId));
         }
       });
+    }
+    // The liveness probe, answered OUTSIDE #withOperationLock on purpose: the
+    // start it is asking about holds that lock for the whole first leg, so a
+    // probe that queued behind it would block for exactly as long as the run it
+    // was trying to describe — and time out reporting nothing.
+    if (
+      request.method === 'GET' &&
+      segments.length === 4 &&
+      action === 'start-liveness' &&
+      workflowId &&
+      runId
+    ) {
+      this.#assertRunIdentity(workflowId, runId);
+      return json({ live: this.#isStartLive(workflowId, runId) });
     }
     if (
       request.method === 'GET' &&
@@ -1509,7 +1718,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
         );
       }
       // The trusted Worker already verified the run ticket and routed by
-      // ticket.runId to idFromName; re-bind to this instance's identity (INV-1)
+      // ticket.runId to idFromName; re-bind to this instance's identity
       // before accepting so a mis-routed upgrade is refused.
       this.#assertRunIdentity(workflowId, runId);
       const runtime = this.#ensureRuntime();
@@ -1518,7 +1727,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       const { 0: client, 1: server } = newWebSocketPair();
       state.acceptWebSocket(server);
       // On-connect snapshot: seed the new subscriber with the current
-      // authoritative summary (DL-018) so it need not wait for the next
+      // authoritative summary so it need not wait for the next
       // lifecycle transition. Nothing to send if the run is not yet queryable.
       safeSend(server, runFrame(snapshot));
       return new Response(null, {
@@ -1540,6 +1749,14 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
       const resumeData = this.#resumeData(body.resumeData);
       return this.#withOperationLock(async () => {
         const runtime = this.#ensureRuntime();
+        // Refused here as well as inside resume(), so a fenced deployment
+        // answers before it takes the per-run lock. A drain still admits
+        // resumes — the suspended runs it is draining are waiting for exactly
+        // these — and proof-only admits its one nominated run.
+        const resumeFence = await this.#readExecutionFence();
+        if (!admitsExistingRun(resumeFence, runId)) {
+          throw new ExecutionFencedError(resumeFence.state, 'run resume');
+        }
         const summary = await runtime.resume(workflowId, runId, {
           step: body.step,
           resumeData,
@@ -1554,7 +1771,7 @@ export abstract class DurableObjectRunner<TEnv = unknown> {
           runId,
           summary,
         );
-        // DL-018: broadcast the post-resume authoritative summary.
+        // Broadcast the post-resume authoritative summary.
         this.#broadcastRunSummary(summary);
         return json(summary);
       });

@@ -10,6 +10,7 @@ import {
   provisionDeploymentIdentityProtocol,
   readDeploymentIdentityProtocol,
 } from '@proofoftech/flowsafe/deployment-identity-protocol';
+import { ActiveRouteAttestationError } from './active-route.js';
 import {
   applicationSecretValues,
   canonicalApplicationBindings,
@@ -22,6 +23,7 @@ import { applyMigrationsWithLedger } from './migration-ledger.js';
 import { assertSupportedProviderBindings } from './provider-binding-inventory.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
+  ActiveRouteAttestation,
   D1Migration,
   DatabaseExport,
   DatabaseReference,
@@ -35,9 +37,11 @@ import type {
   ForceDecommissionStep,
   LiveDeployment,
   MaintenanceHealth,
+  PlainWorkerCustomDomain,
+  PlainWorkerRouteApi,
   PromotionGuard,
   ProvisioningBackend,
-  WorkerZoneRoute,
+  SeedDeploymentIdentityOptions,
 } from './types.js';
 import { targetDurableObjectTag } from './validation.js';
 import type { CommandResult, CommandRunner } from './wrangler-runner.js';
@@ -57,92 +61,6 @@ interface DeploymentVersion {
 
 interface DeploymentStatus {
   readonly versions: readonly DeploymentVersion[];
-}
-
-export interface PlainWorkerCustomDomain {
-  readonly id: string;
-  readonly hostname: string;
-  readonly service: string;
-}
-
-export interface PlainWorkerRouteApi {
-  withMutationFence<T>(
-    fence: ExternalMutationFence,
-    operation: () => Promise<T>,
-  ): Promise<T>;
-  queryDatabase(
-    databaseId: string,
-    sql: string,
-    bindings?: readonly string[],
-  ): Promise<readonly Readonly<Record<string, unknown>>[]>;
-  batchDatabase(
-    databaseId: string,
-    statements: readonly {
-      readonly sql: string;
-      readonly bindings?: readonly string[];
-    }[],
-  ): Promise<void>;
-  getDatabase?(databaseId: string): Promise<DatabaseReference | undefined>;
-  deleteDatabase?(databaseId: string): Promise<void>;
-  listWorkerDatabaseAttachments(databaseId: string): Promise<
-    readonly Readonly<{
-      scriptName: string;
-      plane: 'ordinary' | 'dispatch';
-      dispatchNamespace?: string;
-    }>[]
-  >;
-  listWorkerR2Attachments?(bucketName: string): Promise<
-    readonly Readonly<{
-      scriptName: string;
-      plane: 'ordinary' | 'dispatch';
-      dispatchNamespace?: string;
-    }>[]
-  >;
-  getR2Bucket?(
-    bucketName: string,
-    jurisdiction: import('./types.js').R2Jurisdiction,
-  ): Promise<import('./types.js').ApplicationR2BucketSnapshot | undefined>;
-  createR2Bucket?(
-    resource: import('./types.js').ApplicationR2Binding,
-    fence: ExternalMutationFence,
-  ): Promise<void>;
-  assertR2BucketEmpty?(
-    resource: import('./types.js').ApplicationR2Binding,
-  ): Promise<void>;
-  deleteR2Bucket?(
-    resource: import('./types.js').ApplicationR2Binding,
-    fence: ExternalMutationFence,
-  ): Promise<void>;
-  listCustomDomains(): Promise<readonly PlainWorkerCustomDomain[]>;
-  inspectOrdinaryWorkerFootprint(scriptName: string): Promise<{
-    readonly scriptPresent: boolean;
-    readonly workersDevEnabled?: boolean;
-    readonly previewUrlsEnabled?: boolean;
-    readonly customDomains: readonly PlainWorkerCustomDomain[];
-    readonly zoneRoutes: readonly WorkerZoneRoute[];
-  }>;
-  listDurableObjectNamespaces(scriptName: string): Promise<readonly string[]>;
-  listOrdinaryWorkerSecretNames(scriptName: string): Promise<readonly string[]>;
-  deleteControlSecrets(
-    scriptName: string,
-    secretNames: readonly string[],
-    fence: ExternalMutationFence,
-  ): Promise<void>;
-  attachCustomDomain(
-    target: {
-      readonly hostname: string;
-      readonly service: string;
-    },
-    fence: ExternalMutationFence,
-  ): Promise<void>;
-  detachCustomDomain(
-    domainId: string,
-    fence: ExternalMutationFence,
-  ): Promise<void>;
-  disableOrdinaryWorkerPublicAccess(
-    scriptName: string,
-    fence: ExternalMutationFence,
-  ): Promise<void>;
 }
 
 function parseJson(value: string, operation: string): unknown {
@@ -309,6 +227,7 @@ export class WranglerLoopBackend implements ProvisioningBackend {
   readonly #exportDirectory: string;
   readonly #exportStore: DurableDatabaseExportStore;
   readonly #maintenanceRequestTimeoutMs: number;
+  readonly #clock: () => number;
 
   constructor(options: {
     readonly runner: CommandRunner;
@@ -317,6 +236,8 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     readonly exportStore: DurableDatabaseExportStore;
     readonly fetch?: typeof fetch;
     readonly maintenanceRequestTimeoutMs?: number;
+    /** Stamps `observedAt` on an attestation. Injected so it can be pinned. */
+    readonly clock?: () => number;
   }) {
     if (!options.exportDirectory)
       throw new Error('exportDirectory is required');
@@ -336,6 +257,7 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     this.#exportDirectory = resolve(options.exportDirectory);
     this.#exportStore = options.exportStore;
     this.#maintenanceRequestTimeoutMs = maintenanceRequestTimeoutMs;
+    this.#clock = options.clock ?? Date.now;
   }
 
   async #assertMutationFence(fence: ExternalMutationFence): Promise<void> {
@@ -459,12 +381,16 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     database: DatabaseReference,
     tenantTag: string,
     fence: ExternalMutationFence,
+    options: SeedDeploymentIdentityOptions,
   ): Promise<void> {
     await provisionDeploymentIdentityProtocol(
       (statement) =>
         this.#query(database, statement.sql, fence, statement.bindings),
       tenantTag,
-      { caller: 'WranglerLoopBackend.seedDeploymentIdentity' },
+      {
+        caller: 'WranglerLoopBackend.seedDeploymentIdentity',
+        initialExecutionFenceState: options.initialExecutionFenceState,
+      },
     );
   }
 
@@ -1794,6 +1720,59 @@ export class WranglerLoopBackend implements ProvisioningBackend {
       desiredSpecDigest,
       schemaVersion,
       maintenance,
+    };
+  }
+
+  /**
+   * Attest the version serving traffic, which for an ordinary Worker is the
+   * one the deployment object holds at 100%.
+   *
+   * `inspect()` cannot answer this. Given an expected artifact version it pins
+   * that candidate even while the candidate sits at 0%, because a converge has
+   * to compare a staged upload against the specification before promoting it.
+   * Reusing it here would report an unpromoted candidate as though it were
+   * live, which is the exact failure this method exists to make impossible.
+   *
+   * The read goes through the provider API rather than the wrangler CLI: the
+   * CLI is outside the shared rate coordinator, so a poll loop driven through
+   * it would spend account-wide provider quota that nothing is counting.
+   *
+   * `physicalScriptName` is the spec's script rather than a value read back
+   * from the custom domain, because the hostname-to-script binding is already
+   * enforced on the path that can change it: `promoteWorker` fails unless the
+   * custom domain attests this exact script after every promotion, and
+   * `#attestPromotionRoute` refuses a hostname owned by a Worker outside the
+   * promotion guard. Re-reading the domain here would spend a third provider
+   * call against the two-read budget this method documents and learn nothing
+   * those two checks have not already established.
+   */
+  async attestActiveRoute(
+    spec: DeploymentSpec,
+  ): Promise<ActiveRouteAttestation> {
+    const active = await this.#routeApi.inspectActiveWorkerRoute(
+      spec.scriptName,
+    );
+    if (!active) {
+      throw new ActiveRouteAttestationError(
+        `Worker '${spec.scriptName}' has no deployment serving traffic`,
+        {},
+      );
+    }
+    if (!active.specDigest || !isSha256(active.specDigest)) {
+      throw new ActiveRouteAttestationError(
+        `routed version '${active.artifactVersion}' of Worker '${spec.scriptName}' carries no fleet specification digest`,
+        {
+          routedScriptName: spec.scriptName,
+          artifactVersion: active.artifactVersion,
+        },
+      );
+    }
+    return {
+      specDigest: active.specDigest,
+      artifactVersion: active.artifactVersion,
+      physicalScriptName: spec.scriptName,
+      source: 'workers-deployments',
+      observedAt: new Date(this.#clock()).toISOString(),
     };
   }
 

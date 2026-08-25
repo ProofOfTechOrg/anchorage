@@ -1,23 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track D (M-006), CI-M-006-003 — createScheduleRouter, the authenticated facade
-// over the deployment schedules domain. Ids are
-// SERVER-MINTED `${prefix}${uuid}` (agent_/schedule_) — a client cannot name the
-// id, so it cannot collide with (or probe for) another schedule, the
-// INV-1 posture applied to schedule ids; core's slugified client-id path is
-// avoided (a slugify-drift + existence-oracle vector).
+// createScheduleRouter, the authenticated facade over the deployment schedules
+// domain. Ids are SERVER-MINTED `${prefix}${uuid}` (agent_/schedule_): a client
+// cannot name the id, so it cannot collide with or probe for another schedule.
+// The host-owned run-id posture applies to schedule ids; core's slugified
+// client-id path is avoided because it exposes slug drift and existence probes.
 //
-// The write path is an ingestion trust boundary (P6-lite, DL-006) — the same gate
-// order createSignalRouter / createObjectiveRouter enforce:
+// The write path is an ingestion trust boundary with the same gate order that
+// createSignalRouter and createObjectiveRouter enforce:
 //
-//   1. resolve (authenticate and validate actor)            -> 401 / 403
-//   2. existing-schedule ownership before role or storage    -> 404
-//   3. coarse role (RUN_START_ROLES) on MUTATIONS           -> 403 (reads stay coarse)
-//   4. size cap on the raw body, THEN JSON parse             -> 413 / 400
-//   5. field validation + deployment COUNT cap + fire-RATE cap (DL-007)
-//   6. P4 reserved requestContext-key rejection (DL-004)     -> 400
+//   1. resolve and validate the actor              -> 401 / 403
+//   2. verify existing-schedule ownership          -> 404
+//   3. require RUN_START_ROLES for mutations       -> 403
+//   4. cap the raw body, then parse JSON           -> 413 / 400
+//   5. validate fields, count cap, and rate cap    -> 400
+//   6. reject reserved request-context keys        -> 400
 //   7. audit (schedule.route) + persist
 //
-// P4 STORED-CONTEXT BARRIER (a) (DL-004): a stored WorkflowSchedule.requestContext
+// STORED-CONTEXT BARRIER: a stored WorkflowSchedule.requestContext
 // / agent ScheduleStreamOptions.requestContext replays into a future run, so it is
 // a stored-capability channel — the same class as the approval create-route leak.
 // Create/update REJECT any requestContext naming a reserved key (the whole
@@ -64,6 +63,13 @@ import {
   type ResourceOwner,
   RUN_START_ROLES,
 } from '../approval-api/index.js';
+import {
+  admitsWorkAuthoring,
+  type ExecutionFenceWiring,
+  executionFencedResponse,
+  isExecutionFenceRefusal,
+  readExecutionFence,
+} from '../do-runner/index.js';
 import {
   type BoundThreadTargetValidator,
   RunRouteError,
@@ -168,6 +174,20 @@ export interface ScheduleRouterOptions {
    * zero denies every non-empty body. Default 16384 (16 KiB).
    */
   maxContentBytes?: number;
+  /**
+   * The deployment execution fence, or `'none'` for a router with no database
+   * behind it. REQUIRED: a router receives a store facade and a resolver, not a
+   * database, so it cannot build one for itself the way `init({ DB })` can —
+   * which leaves the host as the only place the wiring can happen, and an
+   * option a host may omit is one a host will omit. See ExecutionFenceWiring
+   * for the split-brain this closes (an unfenced surface next to a fenced
+   * runtime consumes work it then cannot run).
+   *
+   * The gate itself is the runtime's refusal made earlier: an operator draining
+   * a deployment sees a schedule create refused at the API instead of accepted
+   * and then never fired.
+   */
+  executionFence: ExecutionFenceWiring;
   /** Route prefix. Default '/api/schedules'. */
   basePath?: string;
 }
@@ -330,7 +350,7 @@ function checkFireRate(
   if (!first.ok) return first.error;
   const second = nextFireOrReject(cron, timezone, first.value);
   if (!second.ok) return second.error;
-  // NOTE (DL-007 limitation): this samples only the NEXT two fires at request
+  // NOTE: this samples only the NEXT two fires at request
   // time. A non-uniform cron (e.g. a dense minute cluster + a long gap) can pass
   // when sampled during the gap yet still fire the dense cluster later; the
   // deployment COUNT cap and the tick's run-cap seam are the real aggregate
@@ -675,10 +695,21 @@ function buildCreateRow(
   };
 }
 
+/**
+ * The operations the execution fence blocks past `open`: every one of them
+ * ARMS a future fire. `pause` and `delete` are deliberately absent — they take
+ * work away, which is what a drain wants — and so are the three reads.
+ */
+const FENCE_GATED_SCHEDULE_OPERATIONS = new Set<ScheduleOperation>([
+  'create',
+  'update',
+  'resume',
+]);
+
 export function createScheduleRouter(
   options: ScheduleRouterOptions,
 ): ScheduleRouter {
-  const { resolve, store, targetPolicy } = options;
+  const { executionFence, resolve, store, targetPolicy } = options;
   const roles = options.roles ?? RUN_START_ROLES;
   const maxSchedules = nonnegativeSafeInteger(
     options.maxSchedules ?? 100,
@@ -776,6 +807,22 @@ export function createScheduleRouter(
       if (operation === 'create' && !roles.includes(context.actor.role)) {
         await audit('rejected', 'forbidden-role');
         return json({ error: 'forbidden' }, 403);
+      }
+
+      // The execution fence, after authentication so a refusal is auditable
+      // and tells an anonymous caller nothing about the deployment's state.
+      // Only the operations that ARM future fires are gated: pause and delete
+      // remove work, which is the direction a drain is going, and reads stay
+      // open in every state.
+      if (FENCE_GATED_SCHEDULE_OPERATIONS.has(operation)) {
+        const reading = await readExecutionFence(executionFence);
+        if (!admitsWorkAuthoring(reading)) {
+          await audit('rejected', 'execution-fenced');
+          return executionFencedResponse(
+            reading.state,
+            `schedule ${operation}`,
+          );
+        }
       }
 
       // LIST returns only schedules this principal may read. Reviewer/admin
@@ -985,6 +1032,17 @@ export function createScheduleRouter(
       await auditCommittedMutation();
       return json({ schedule: toView(updated) });
     } catch (error) {
+      // A fence that could not be READ is not evidence the deployment is open,
+      // so it degrades closed with its own retryable 503 rather than the
+      // generic 500 below — an operator must be able to tell a deployment
+      // that is being migrated from one that is broken.
+      if (isExecutionFenceRefusal(error)) {
+        await audit('rejected', 'execution-fence-unreadable');
+        return json(
+          { error: error.message, reason: error.reason },
+          error.status,
+        );
+      }
       if (error instanceof RunRouteError) {
         await audit(
           'rejected',

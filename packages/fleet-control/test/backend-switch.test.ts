@@ -1025,6 +1025,7 @@ describe('backend switch state machine', () => {
     } as unknown as ProvisioningBackend;
 
     const result = await provisionDeployment({
+      initialExecutionFenceState: 'open',
       backend,
       store,
       spec: targetSpec,

@@ -40,27 +40,39 @@ import { credentialsMatch } from '../do-runner/deployment-identity.js';
 import type { DurableObjectRunLifecycleHooks } from '../do-runner/durable-object.js';
 import type {
   DeploymentIdentityDatabase,
+  ExecutionFenceStore,
   PurgeExpiredBackgroundTasksResult,
   RunArtifactPurger,
   RunDeadlineCursor,
   SnapshotDatabase,
+  StartIdempotencyStore,
 } from '../do-runner/index.js';
 import {
+  assertExecutionFenceState,
   DEPLOYMENT_IDENTITY_HEADER,
   DeploymentIdentityError,
+  DeploymentInventory,
+  DoStatusError,
   deploymentIdentityHeaders,
   ensureDeploymentIdentityBindings,
+  executionFenceFor,
+  executionFenceReadingPayload,
+  InvalidInventoryRequestError,
+  isInventoryCategory,
   purgeExpiredBackgroundTasks,
   purgeExpiredNotifications,
   purgeExpiredScheduleTriggers,
   purgeExpiredThreadState,
   purgeExpiredThreads,
   purgeExpiredWorkflowRuns,
+  START_IDEMPOTENCY_TABLE,
+  startIdempotencyFor,
   sweepExpiredRunDeadlines,
   verifyDurableObjectDeploymentIdentity,
   verifyDurableObjectDeploymentRequest,
 } from '../do-runner/index.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
+import { readBoundedBody } from '../http-body.js';
 import { abandonApprovalsForRun, type ResumeRunFn } from './approval-bridge.js';
 import { bearerActorAuthenticator } from './bearer-auth.js';
 import {
@@ -221,6 +233,17 @@ export interface FlowsafeWorkerEnv {
   APPROVAL_ALLOW_SELF_DECISION?: string;
   /** Maintenance purges terminal run snapshots older than this (default 30 days). */
   RUN_RETENTION_DAYS?: string;
+  /**
+   * How long a spent idempotency key stays answerable after its run settled —
+   * the key-validity horizon (var; defaults to RUN_RETENTION_DAYS, and is
+   * floored at it).
+   *
+   * Set this ABOVE run retention when callers may retry a start later than this
+   * deployment keeps run summaries: until the horizon elapses such a retry is
+   * told ALREADY_SETTLED, and after it the same key reads as brand new and
+   * starts a second run.
+   */
+  START_IDEMPOTENCY_RETENTION_DAYS?: string;
   /** Maintenance purges DECIDED approval records older than this (default 30 days). */
   APPROVAL_RETENTION_DAYS?: string;
   /**
@@ -461,6 +484,16 @@ interface ConfiguredApprovalServiceOptions {
   notify?: ApprovalNotificationSink;
   allowSelfDecision: SelfDecisionPolicy;
   stream?: ApprovalStreamSink;
+  /**
+   * REQUIRED, unlike its optional counterpart on HostApprovalServiceOptions:
+   * this interface is internal to the composer, both of its call sites are in
+   * this file, and every service the composer builds sits on a database whose
+   * fence it can name. Making it required is what keeps a third call site from
+   * being added later that silently builds an unfenced service — which would
+   * let a decision commit durably on a migration-locked deployment and then
+   * fail to resume.
+   */
+  executionFence: ExecutionFenceStore;
 }
 
 function buildConfiguredApprovalService<Env extends FlowsafeWorkerEnv>(
@@ -485,6 +518,7 @@ function buildConfiguredApprovalService<Env extends FlowsafeWorkerEnv>(
     notify: options.notify,
     allowSelfDecision: options.allowSelfDecision,
     stream: options.stream,
+    executionFence: options.executionFence,
   });
 }
 
@@ -516,6 +550,7 @@ export function createFlowsafeRunnerLifecycle<Env extends FlowsafeWorkerEnv>(
     : undefined;
   const service = buildConfiguredApprovalService(config, env, topology, {
     store: approvalStoreFactoryFor(env.DB, storageTablePrefix).store(),
+    executionFence: executionFenceForEnv(env),
     waitUntil: options.waitUntil,
     notify: config.notify?.(env),
     allowSelfDecision,
@@ -659,6 +694,120 @@ function json(payload: unknown, status = 200): Response {
 const MAINTENANCE_ADMIN_SECRET_PATTERN = /^[\x21-\x7e]{32,256}$/;
 const FLEET_SPEC_DIGEST_PATTERN = /^[a-f0-9]{64}$/;
 
+/**
+ * What the shared admin gate decided. A union rather than `Response | null`
+ * because an authorized answer carries two things a caller needs: the
+ * credential the request presented, which the maintenance route forwards to its
+ * Durable Object on the delegating path below, and WHETHER this was that
+ * delegating path. Recovering the credential by re-reading the header would
+ * either re-duplicate the Bearer extraction this gate exists to own, or need an
+ * unreachable `undefined` branch to satisfy the types.
+ *
+ * `delegated` is reported rather than re-derived for the stronger reason: the
+ * rule that makes `MAINTENANCE_ADMIN_SECRET === undefined` mean "delegating" is
+ * enforced HERE — an absent secret refuses outright unless the caller asked to
+ * delegate — so a route re-testing the env var is restating a decision it
+ * cannot see, and would keep answering `true` if this gate's policy ever
+ * changed. One decision, reported once.
+ */
+type AdminCredentialDecision =
+  | {
+      readonly authorized: true;
+      readonly credential: string;
+      /**
+       * The credential is a downstream-verified capability token relayed by
+       * this Worker, not a match against MAINTENANCE_ADMIN_SECRET.
+       */
+      readonly delegated: boolean;
+    }
+  | { readonly authorized: false; readonly response: Response };
+
+/**
+ * The credential preamble EVERY /admin surface runs before it does anything.
+ *
+ * One function rather than a copy per route because this is the trust boundary
+ * itself (docs/security-threat-model.md, "The provisioning boundary"): it
+ * proves MAINTENANCE_ADMIN_SECRET is configured, proves it is DISTINCT from the
+ * deployment identity secret (sharing them would let a Worker-to-DO credential
+ * move the fence, and vice versa), and constant-time compares the request's
+ * Bearer token against it. A second copy is a second place for one of those
+ * three to be dropped in a hurry, and the inventory route lands here next.
+ *
+ * The surfaces differ in exactly ONE thing, which is why it is a parameter
+ * rather than a fork: what an ABSENT secret means. `/admin/execution-fence`
+ * always refuses — the fence is the control that stops a deployment executing,
+ * so an unauthenticated caller must never reach it. The maintenance routes
+ * delegate instead when the fleet requires capability tokens, because there the
+ * Durable Object verifies a signed capability and this Worker is only a relay;
+ * the longer credential cap applies to that path alone, since a capability
+ * token is not a shared secret.
+ */
+async function authorizeAdminCredential<Env extends FlowsafeWorkerEnv>(
+  request: Request,
+  env: Env,
+  options: {
+    /** Names the surface in the config-error log and the 503 body. */
+    readonly surface: string;
+    /**
+     * Whether an absent MAINTENANCE_ADMIN_SECRET delegates authentication
+     * downstream rather than refusing. The caller folds its own policy into
+     * this boolean so the gate stays about credentials only.
+     */
+    readonly delegateWhenUnconfigured: boolean;
+  },
+): Promise<AdminCredentialDecision> {
+  const { surface } = options;
+  const unavailable = (reason: string): AdminCredentialDecision => {
+    console.error(
+      JSON.stringify({
+        type: 'config-error',
+        var: 'MAINTENANCE_ADMIN_SECRET',
+        reason,
+      }),
+    );
+    return {
+      authorized: false,
+      response: json({ error: `${surface} unavailable` }, 503),
+    };
+  };
+  const unauthenticated = (): AdminCredentialDecision => ({
+    authorized: false,
+    response: json({ error: 'authentication required' }, 401),
+  });
+  const expected = env.MAINTENANCE_ADMIN_SECRET;
+  const delegating = expected === undefined && options.delegateWhenUnconfigured;
+  if (!delegating) {
+    if (
+      expected === undefined ||
+      !MAINTENANCE_ADMIN_SECRET_PATTERN.test(expected)
+    ) {
+      return unavailable(`${surface} is not configured`);
+    }
+    if (await credentialsMatch(expected, env.DEPLOYMENT_IDENTITY_SECRET)) {
+      return unavailable(
+        'maintenance and deployment identity credentials must differ',
+      );
+    }
+  }
+  const credential = bearerCredential(request);
+  const maximumCredentialLength = delegating ? 2_048 : 256;
+  if (!credential || credential.length > maximumCredentialLength) {
+    return unauthenticated();
+  }
+  if (
+    expected !== undefined &&
+    !(await credentialsMatch(credential, expected))
+  ) {
+    return unauthenticated();
+  }
+  return { authorized: true, credential, delegated: delegating };
+}
+
+/** The Bearer credential a request presents, if it presents a well-formed one. */
+function bearerCredential(request: Request): string | undefined {
+  return request.headers.get('authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];
+}
+
 async function maintenanceAdminResponse<Env extends FlowsafeWorkerEnv>(
   request: Request,
   env: Env,
@@ -675,56 +824,14 @@ async function maintenanceAdminResponse<Env extends FlowsafeWorkerEnv>(
   if (request.method !== expectedMethod) {
     return json({ error: 'method not allowed' }, 405);
   }
-  const expected = env.MAINTENANCE_ADMIN_SECRET;
-  if (
-    expected === undefined &&
-    env.FLEET_MAINTENANCE_CAPABILITIES !== 'required'
-  ) {
-    console.error(
-      JSON.stringify({
-        type: 'config-error',
-        var: 'MAINTENANCE_ADMIN_SECRET',
-        reason: 'maintenance administration is not configured',
-      }),
-    );
-    return json({ error: 'maintenance administration unavailable' }, 503);
-  }
-  if (
-    expected !== undefined &&
-    !MAINTENANCE_ADMIN_SECRET_PATTERN.test(expected)
-  ) {
-    console.error(
-      JSON.stringify({
-        type: 'config-error',
-        var: 'MAINTENANCE_ADMIN_SECRET',
-        reason: 'maintenance administration is not configured',
-      }),
-    );
-    return json({ error: 'maintenance administration unavailable' }, 503);
-  }
-  if (
-    expected !== undefined &&
-    (await credentialsMatch(expected, env.DEPLOYMENT_IDENTITY_SECRET))
-  ) {
-    console.error(
-      JSON.stringify({
-        type: 'config-error',
-        var: 'MAINTENANCE_ADMIN_SECRET',
-        reason: 'maintenance and deployment identity credentials must differ',
-      }),
-    );
-    return json({ error: 'maintenance administration unavailable' }, 503);
-  }
-  const actual = request.headers
-    .get('authorization')
-    ?.match(/^Bearer\s+(.+)$/i)?.[1];
-  const maximumCredentialLength = expected === undefined ? 2_048 : 256;
-  if (!actual || actual.length > maximumCredentialLength) {
-    return json({ error: 'authentication required' }, 401);
-  }
-  if (expected !== undefined && !(await credentialsMatch(actual, expected))) {
-    return json({ error: 'authentication required' }, 401);
-  }
+  const gate = await authorizeAdminCredential(request, env, {
+    surface: 'maintenance administration',
+    // An unconfigured secret is survivable HERE and only here: a fleet that
+    // requires capability tokens authenticates at the maintenance DO, which
+    // verifies a signed capability this Worker only relays.
+    delegateWhenUnconfigured: env.FLEET_MAINTENANCE_CAPABILITIES === 'required',
+  });
+  if (!gate.authorized) return gate.response;
   const deploymentSpecDigest = env.FLEET_SPEC_DIGEST;
   if (
     deploymentSpecDigest !== undefined &&
@@ -744,13 +851,19 @@ async function maintenanceAdminResponse<Env extends FlowsafeWorkerEnv>(
     `http://maintenance/${operation}`,
     {
       method: expectedMethod,
-      headers:
-        expected === undefined
-          ? { authorization: `Bearer ${actual}` }
-          : deploymentIdentityHeaders(env.DEPLOYMENT_IDENTITY_SECRET),
+      // The gate's own verdict, not a second reading of the env var it decided
+      // on: a delegated request carries a capability the maintenance DO
+      // verifies, so this Worker relays the credential unchanged; anything else
+      // was authenticated HERE and travels on the deployment identity.
+      headers: gate.delegated
+        ? { authorization: `Bearer ${gate.credential}` }
+        : deploymentIdentityHeaders(env.DEPLOYMENT_IDENTITY_SECRET),
     },
   );
-  if (expected === undefined) return response;
+  // Nothing to enrich on the delegated path: the digest check below belongs to
+  // the deployment this Worker authenticated for, and a relayed response is the
+  // maintenance DO's own answer.
+  if (gate.delegated) return response;
   if (!response.ok || deploymentSpecDigest === undefined) return response;
   const payload: unknown = await response.json();
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
@@ -760,6 +873,242 @@ async function maintenanceAdminResponse<Env extends FlowsafeWorkerEnv>(
     ...(payload as Record<string, unknown>),
     deploymentSpecDigest,
   });
+}
+
+/**
+ * This composer's env-shaped view of the ONE per-database fence memo
+ * (do-runner/execution-fence.ts). Every call site here holds an `env` rather
+ * than a binding, so the unwrapping happens once instead of at each of them;
+ * the identity guarantee — admin route, approval service, and runner runtime
+ * all on the same store for the same database — belongs to the shared memo.
+ */
+function executionFenceForEnv<Env extends FlowsafeWorkerEnv>(
+  env: Env,
+): ExecutionFenceStore {
+  return executionFenceFor(env.DB);
+}
+
+/**
+ * The same env-shaped view of the ONE per-database start-reservation memo
+ * (do-runner/start-idempotency.ts), for the same reason: the run router
+ * reserves here, and the runtime inside the run object settles there, and both
+ * must be the store built from THIS env's binding.
+ */
+function startIdempotencyForEnv<Env extends FlowsafeWorkerEnv>(
+  env: Env,
+): StartIdempotencyStore {
+  return startIdempotencyFor(env.DB);
+}
+
+const EXECUTION_FENCE_ADMIN_PATH = '/admin/execution-fence';
+const EXECUTION_FENCE_ADMIN_MAX_BODY_BYTES = 4_096;
+
+/**
+ * The deployment execution fence's control-plane surface, behind the SAME gate
+ * `maintenanceAdminResponse` uses (`authorizeAdminCredential`) — it is the same
+ * trust boundary (the provisioning TCB, docs/security-threat-model.md), and
+ * splitting the credential would only add a second secret an operator can get
+ * wrong.
+ *
+ * `GET` reports the state; `POST` moves it, compare-and-set on `expected`.
+ * Transition POLICY is the HOST's: this package enforces only the state
+ * vocabulary, the CAS, and the rule that entering 'proof-only' names a proof
+ * key. Which sequence of states a migration walks is the control plane's
+ * business, and hard-coding it here would freeze an operational procedure into
+ * a published package.
+ *
+ * Answers on a mis-provisioned deployment are NOT reachable: the identity gate
+ * 503s before this dispatch. Accepted — an operator whose bindings are wrong
+ * has a bigger problem than the fence, and relaxing the identity gate to serve
+ * this route would put an unverified database behind a control-plane write.
+ */
+async function executionFenceAdminResponse<Env extends FlowsafeWorkerEnv>(
+  request: Request,
+  env: Env,
+): Promise<Response | null> {
+  const url = new URL(request.url);
+  if (url.pathname !== EXECUTION_FENCE_ADMIN_PATH) return null;
+  if (request.method !== 'GET' && request.method !== 'POST') {
+    return json({ error: 'method not allowed' }, 405);
+  }
+  const gate = await authorizeAdminCredential(request, env, {
+    surface: 'execution fence administration',
+    // Unconfigured is 503, never open: the fence is the control that stops a
+    // deployment executing, so an unauthenticated caller must never move it.
+    // There is no capability-token relay behind this route to delegate to.
+    delegateWhenUnconfigured: false,
+  });
+  if (!gate.authorized) return gate.response;
+  const fence = executionFenceForEnv(env);
+  try {
+    if (request.method === 'GET') {
+      return json(executionFenceReadingPayload(await fence.read()));
+    }
+    const raw = await readBoundedBody(
+      request,
+      EXECUTION_FENCE_ADMIN_MAX_BODY_BYTES,
+      'execution fence body exceeds limit',
+    );
+    if (!raw.ok) {
+      return json(
+        { error: 'a JSON object body is required' },
+        raw.reason === 'payload-too-large' ? 413 : 400,
+      );
+    }
+    let parsed: unknown;
+    try {
+      parsed = raw.text === '' ? undefined : JSON.parse(raw.text);
+    } catch {
+      parsed = undefined;
+    }
+    if (
+      parsed === null ||
+      typeof parsed !== 'object' ||
+      Array.isArray(parsed)
+    ) {
+      return json({ error: 'a JSON object body is required' }, 400);
+    }
+    const body = parsed as {
+      expected?: unknown;
+      next?: unknown;
+      proofKey?: unknown;
+    };
+    const reading = await fence.transition({
+      expected: assertExecutionFenceState(body.expected, 'expected'),
+      next: assertExecutionFenceState(body.next, 'next'),
+      ...(body.proofKey === undefined ? {} : { proofKey: body.proofKey }),
+    });
+    return json({ state: reading.state });
+  } catch (error) {
+    if (error instanceof DoStatusError) {
+      return json(
+        {
+          error: error.message,
+          ...(error.reason === undefined ? {} : { reason: error.reason }),
+        },
+        error.status,
+      );
+    }
+    console.error(
+      JSON.stringify({
+        type: 'execution-fence-admin-error',
+        reason: error instanceof Error ? error.message : String(error),
+      }),
+    );
+    return json({ error: 'execution fence administration failed' }, 500);
+  }
+}
+
+const INVENTORY_ADMIN_PATH = '/admin/inventory';
+
+/**
+ * The deployment's drain-proof surface uses the same credential helper as the
+ * fence and maintenance routes. Their absent-secret policies differ:
+ * maintenance routes may delegate to a fleet capability; fence and inventory
+ * routes never do.
+ *
+ * WHAT IT IS FOR. An operator holds the fence in `draining` and needs to prove,
+ * with no side effects, that this deployment holds no executable or resumable
+ * work before locking it for a migration. Without such a proof the only
+ * available answer is a wait-and-hope, and a suspended run that survives it
+ * gets resumed by two deployments at once.
+ *
+ * HOW TO READ THE ANSWER — the contract the index response also states, in
+ * full, because this is the part a hurried operator skips:
+ *
+ *   Each result is a point-in-time observation, not a snapshot. Rows can enter
+ *   or leave `work` categories while draining admits work. An empty result
+ *   cannot over-count work, and keyset pagination never skips a row that
+ *   existed before the sweep started.
+ *
+ *   The proof is TWO consecutive full sweeps, at least one 60-second
+ *   RUN_OWNER_RECOVERY_DELAY_MS cadence apart, in which every `work` category
+ *   comes back empty. One sweep cannot cover the window in which a run object
+ *   has journalled its recovery key but not yet written its D1 owner row; two,
+ *   spaced that far, can.
+ *
+ *   An empty sweep from `draining` contributes to the two-sweep proof. After
+ *   the transition to `migration-locked`, an empty post-lock re-sweep is
+ *   conclusive because the lock refuses new work. A non-empty one means work is
+ *   still outstanding, either because it entered after the proof or because
+ *   the lock parked it before it finished. Return to `draining` and repeat the
+ *   proof.
+ *
+ * `standing` categories (schedules, provider subscriptions) are reported for
+ * reconciliation and are never required to be empty: they are configuration a
+ * migration carries across.
+ *
+ * GET only. Every query underneath is a bare SELECT that never creates schema,
+ * so running this against a deployment about to be copied does not change what
+ * is being copied.
+ */
+async function inventoryAdminResponse<Env extends FlowsafeWorkerEnv>(
+  request: Request,
+  env: Env,
+  storageTablePrefix: string | undefined,
+): Promise<Response | null> {
+  const url = new URL(request.url);
+  if (url.pathname !== INVENTORY_ADMIN_PATH) return null;
+  if (request.method !== 'GET') {
+    return json({ error: 'method not allowed' }, 405);
+  }
+  const gate = await authorizeAdminCredential(request, env, {
+    surface: 'deployment inventory',
+    // Unconfigured is 503, never open: this read enumerates every outstanding
+    // run, approval, and reservation on the deployment. There is no capability
+    // relay behind it to delegate to, either.
+    delegateWhenUnconfigured: false,
+  });
+  if (!gate.authorized) return gate.response;
+  try {
+    const inventory = new DeploymentInventory(env.DB, {
+      ...(storageTablePrefix === undefined
+        ? {}
+        : { tablePrefix: storageTablePrefix }),
+    });
+    const category = url.searchParams.get('category');
+    if (category === null || category === '') {
+      return json(inventory.index());
+    }
+    if (!isInventoryCategory(category)) {
+      throw new InvalidInventoryRequestError(
+        `unknown inventory category '${category}'`,
+      );
+    }
+    const rawLimit = url.searchParams.get('limit');
+    // Parsed here rather than coerced inside the store: `Number('abc')` is NaN
+    // and `Number('')` is 0, and both would otherwise reach the clamp as a
+    // number that means something the caller never asked for.
+    if (rawLimit !== null && !/^[0-9]{1,4}$/.test(rawLimit)) {
+      throw new InvalidInventoryRequestError(
+        'inventory limit must be a positive integer',
+      );
+    }
+    const cursor = url.searchParams.get('cursor');
+    return json(
+      await inventory.read(category, {
+        ...(cursor === null ? {} : { cursor }),
+        ...(rawLimit === null ? {} : { limit: Number(rawLimit) }),
+      }),
+    );
+  } catch (error) {
+    if (error instanceof DoStatusError) {
+      return json(
+        {
+          error: error.message,
+          ...(error.reason === undefined ? {} : { reason: error.reason }),
+        },
+        error.status,
+      );
+    }
+    console.error(
+      JSON.stringify({
+        type: 'inventory-admin-error',
+        reason: error instanceof Error ? error.message : String(error),
+      }),
+    );
+    return json({ error: 'deployment inventory failed' }, 500);
+  }
 }
 
 export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
@@ -785,6 +1134,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       buildService: (store) =>
         buildConfiguredApprovalService(config, env, topology, {
           store,
+          executionFence: executionFenceForEnv(env),
           waitUntil,
           notify,
           stream,
@@ -866,6 +1216,28 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         // cannot leave unbounded run-ownership tombstones or expose a live row
         // without its authorization record.
         resourceOwnerTable: RESOURCE_OWNERSHIP_TABLE,
+        // Start reservations join the same transaction, for the same reason:
+        // an idempotency key must never be reaped while the run it names is
+        // still readable, or the next retry of that key would start a second
+        // run beside the live one. The horizon defaults to run retention —
+        // START_IDEMPOTENCY_RETENTION_DAYS is what a host sets when its callers
+        // retry for longer than it keeps run summaries.
+        startIdempotencyTable: START_IDEMPOTENCY_TABLE,
+        ...(env.START_IDEMPOTENCY_RETENTION_DAYS === undefined
+          ? {}
+          : {
+              startIdempotencyTtlMs:
+                numberVar(
+                  env.START_IDEMPOTENCY_RETENTION_DAYS,
+                  30,
+                  'START_IDEMPOTENCY_RETENTION_DAYS',
+                  { allowZero: true },
+                ) *
+                24 *
+                60 *
+                60 *
+                1000,
+            }),
       });
     } catch (error) {
       recordFailure('retention-purge', error);
@@ -911,7 +1283,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         recordFailure('thread-retention-purge', error);
       }
     }
-    // Background-task TTL cleanup (Track B, opt-in). Its OWN try/catch, like
+    // Background-task TTL cleanup (opt-in). Its OWN try/catch, like
     // every sibling duty: a wedged background-task purge must cost the
     // run-snapshot, approval, and thread purges nothing.
     let backgroundTasksPurged: PurgeExpiredBackgroundTasksResult | undefined;
@@ -926,7 +1298,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         recordFailure('background-task-purge', error);
       }
     }
-    // Track C notification TTL (opt-in). Its OWN try/catch, like every sibling
+    // Notification TTL cleanup (opt-in). Its OWN try/catch, like every sibling
     // duty. optionalNumberVar (GATES the duty; unset/garbage => do not delete).
     let notificationsPurged: number | undefined;
     const notificationRetentionDays = optionalNumberVar(
@@ -944,7 +1316,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         recordFailure('notification-purge', error);
       }
     }
-    // Track C thread-state TTL (opt-in). Same isolation + opt-in posture.
+    // Thread-state TTL cleanup (opt-in). Same isolation + opt-in posture.
     let threadStatePurged: number | undefined;
     const threadStateRetentionDays = optionalNumberVar(
       env.THREAD_STATE_RETENTION_DAYS,
@@ -961,7 +1333,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         recordFailure('thread-state-purge', error);
       }
     }
-    // Track D schedule-trigger history TTL (opt-in). Same isolation + opt-in
+    // Schedule-trigger history TTL cleanup (opt-in). Same isolation + opt-in
     // posture. Only the fire HISTORY expires; schedule config rows are reaped
     // only at deployment teardown.
     let scheduleTriggersPurged: number | undefined;
@@ -1009,7 +1381,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
       : { ok: false, error: failures.join('; ') };
   }
 
-  // Track D schedule tick — its OWN failure-isolated duty (own try/catch, own log
+  // Schedule tick — its OWN failure-isolated duty (own try/catch, own log
   // line). A wedged fire pass must cost the other duties nothing, and vice
   // versa (the same failure-isolation rationale).
   async function runScheduleTickDuty(
@@ -1119,6 +1491,23 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         const maintenanceAdmin = await maintenanceAdminResponse(request, env);
         if (maintenanceAdmin) return maintenanceAdmin;
 
+        // The execution fence's control plane, beside the maintenance admin
+        // routes and ahead of every tenant router: it must answer while the
+        // deployment is refusing tenant traffic, which is the whole state it
+        // exists to report and clear.
+        const fenceAdmin = await executionFenceAdminResponse(request, env);
+        if (fenceAdmin) return fenceAdmin;
+
+        // Beside the fence for the same reason: the drain proof is read WHILE
+        // the deployment is refusing tenant traffic, so it must not sit behind
+        // a router that a drain is trying to empty.
+        const inventoryAdmin = await inventoryAdminResponse(
+          request,
+          env,
+          storageTablePrefix,
+        );
+        if (inventoryAdmin) return inventoryAdmin;
+
         const waitUntil = (promise: Promise<unknown>): void =>
           ctx.waitUntil(promise);
         const topology = createDoRunTopology(
@@ -1128,7 +1517,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
         const notify = config.notify?.(env);
         const selfDecision = parseSelfDecision(env);
         // Fetch-scope live fan-out sink: present iff a hub is bound (streaming is
-        // opt-in, DL-019). Each publish rides ctx.waitUntil (DL-020) and is
+        // opt-in). Each publish rides ctx.waitUntil and is
         // contained — a failed fan-out logs and never fails the mutation.
         const hub = env.HUB;
         let streamSink: ApprovalStreamSink | undefined;
@@ -1173,7 +1562,7 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           if (agentResponse) return agentResponse;
         }
 
-        // Optional stream stage (DL-015/DL-019): mounted only when BOTH the hub
+        // Optional stream stage: mounted only when BOTH the hub
         // binding and the ticket secret are present. Every route is under
         // /api/stream/, so it composes ahead of the approval router without
         // touching the /api/* run_worker_first entry.
@@ -1189,29 +1578,29 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           if (streamResponse) return streamResponse;
         }
 
-        // Optional Track C signal stage (P6): the host-built createSignalRouter,
-        // closed over THIS request's resolver. `/api/threads/*` — composes ahead
-        // of approvals/runs without overlap. Absent seam => unmounted.
+        // Optional signal stage: the host-built createSignalRouter closes over
+        // THIS request's resolver. `/api/threads/*` composes ahead of
+        // approvals/runs without overlap. Absent seam => unmounted.
         const signalRouter = config.buildSignalRouter?.(resolve, env);
         if (signalRouter) {
           const signalResponse = await signalRouter(request);
           if (signalResponse) return signalResponse;
         }
 
-        // Optional Track F goal stage (P6-lite, DL-018): the host-built
-        // createObjectiveRouter, closed over THIS request's resolver.
-        // `/api/threads/:threadId/goal` — composes after signals (non-overlapping)
-        // and ahead of approvals/runs. Absent seam ⇒ unmounted, byte-identical.
+        // Optional goal stage: the host-built createObjectiveRouter closes over
+        // THIS request's resolver. `/api/threads/:threadId/goal` composes after
+        // signals and ahead of approvals/runs. Absent seam => unmounted and
+        // byte-identical.
         const objectiveRouter = config.buildObjectiveRouter?.(resolve, env);
         if (objectiveRouter) {
           const objectiveResponse = await objectiveRouter(request);
           if (objectiveResponse) return objectiveResponse;
         }
 
-        // Optional Track D schedule CRUD stage (DL-013): the host-built
-        // createScheduleRouter, closed over THIS request's resolver. `/api/schedules/*`
-        // — composes after goals (non-overlapping), ahead of approvals/runs. Absent
-        // seam ⇒ unmounted, byte-identical.
+        // Optional schedule CRUD stage: the host-built createScheduleRouter
+        // closes over THIS request's resolver. `/api/schedules/*` composes
+        // after goals and ahead of approvals/runs. Absent seam => unmounted
+        // and byte-identical.
         const scheduleRouter = config.buildScheduleRouter?.(resolve, env);
         if (scheduleRouter) {
           const scheduleResponse = await scheduleRouter(request);
@@ -1233,6 +1622,16 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
           status: topology.status,
           resume: topology.resume,
           terminate: topology.terminate,
+          // Both halves come from this env's own bindings: the store from the
+          // per-database memo (so the runtime inside the run object settles the
+          // very rows this router reserved), and the probe from the same DO
+          // topology every other run operation travels through (so "is it
+          // live?" is asked of the one object that could be running it).
+          startIdempotency: {
+            store: startIdempotencyForEnv(env),
+            live: topology.startLiveness,
+            executionFence: executionFenceForEnv(env),
+          },
           beforeStart: beforeStart
             ? (context, workflowId, inputData) =>
                 beforeStart(context, env, workflowId, inputData)
@@ -1241,8 +1640,8 @@ export function createFlowsafeWorker<Env extends FlowsafeWorkerEnv>(
             ? (context, workflowId, runId, body) =>
                 beforeResume(context, env, workflowId, runId, body)
             : undefined,
-          // D4 self-healing, waitUntil-detached — the shared wrapper owns the
-          // detach + reconcile-error logging.
+          // Self-healing approval reconciliation is waitUntil-detached; the
+          // shared wrapper owns the detach + reconcile-error logging.
           reconcileApprovals: reconcileApprovalsOnStatusDetached(
             config.systemPrincipalId,
             waitUntil,

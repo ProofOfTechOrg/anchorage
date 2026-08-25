@@ -24,6 +24,7 @@ import {
 import {
   DurableObjectRunner,
   ensureDeploymentIdentityBindings,
+  executionFenceFor,
   init,
   isPathSafeId,
   type RunnerRuntime,
@@ -285,6 +286,10 @@ export class BenchmarkFlowsafeRunner extends DurableObjectRunner<Env> {
   protected runLifecycle(env: Env) {
     const service = new ApprovalService({
       store: approvalFactory(env.DB).store(),
+      // Deliberately unfenced: this service only abandons approvals for a
+      // terminated run, which is allowed in every fence state because it
+      // removes future work rather than starting any. It never decides.
+      executionFence: 'none',
     });
     return {
       abandonApprovals: (
@@ -415,6 +420,9 @@ function flowsafeService(env: Env): ApprovalService {
   return new ApprovalService({
     store: approvalFactory(env.DB).store(),
     resumeRun: topology.resumeRecord,
+    // This one DECIDES, and decide() commits before it resumes: same database,
+    // same fence as the runs it moves.
+    executionFence: executionFenceFor(env.DB as unknown as never),
   });
 }
 

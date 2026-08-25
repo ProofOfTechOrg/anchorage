@@ -19,6 +19,7 @@ import {
   stepKeyOf,
 } from './store.js';
 import {
+  APPROVALS_TABLE,
   type ApprovalListFilter,
   type ApprovalMetrics,
   type ApprovalRecord,
@@ -48,7 +49,10 @@ export interface ApprovalPreparedStatement {
   all<T = unknown>(): Promise<{ results: T[] }>;
 }
 
-const TABLE = 'flowsafe_approvals';
+// The name itself lives on the types leaf, which is the only approval-api file
+// the drain inventory is allowed to reach. This is the local shorthand every
+// query below was already written against.
+const TABLE = APPROVALS_TABLE;
 
 // The partial index preserves open-step uniqueness. Captured suspensions add a
 // second, all-status fingerprint index after the legacy nullable columns are
@@ -706,7 +710,7 @@ export class D1ApprovalStore implements ApprovalStore {
     const values: unknown[] = [];
     appendListFilters(filter, where, values);
     const clause = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : '';
-    // D3: default a bare list() to the max, so a repeated poll can never fall
+    // Bound a bare list() to the maximum, so a repeated poll can never fall
     // back to an unbounded SELECT.
     const limit = clampApprovalLimit(filter.limit) ?? MAX_APPROVAL_LIST_LIMIT;
     const { results } = await this.#db

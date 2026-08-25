@@ -51,11 +51,29 @@ test('every architecture rule has an executable positive control', () => {
 
 for (const [ruleName, fixture] of Object.entries(controls)) {
   test(`${ruleName} rejects its positive control`, () => {
-    const result = spawnSync(
-      process.execPath,
-      [cli, '--config', configPath, '--output-type', 'json', fixture],
-      { cwd: fileURLToPath(new URL('..', import.meta.url)), encoding: 'utf8' },
-    );
+    const args = [
+      cli,
+      '--config',
+      configPath,
+      '--output-type',
+      'json',
+      fixture,
+    ];
+    const result = spawnSync(process.execPath, args, {
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
+      encoding: 'utf8',
+    });
+    const command = [process.execPath, ...args].join(' ');
+    if (result.error) {
+      throw new Error(
+        `failed to spawn ${JSON.stringify(command)}: ${result.error.message}`,
+      );
+    }
+    if (result.stdout.trim() === '') {
+      throw new Error(
+        `${JSON.stringify(command)} produced no JSON output (status=${String(result.status)}, signal=${String(result.signal)}); stderr=${JSON.stringify(result.stderr.slice(0, 300))}`,
+      );
+    }
 
     assert.equal(result.signal, null, result.stderr);
     assert.equal(result.status, 0, result.stderr);

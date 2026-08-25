@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // The thread-DO signal routes (createThreadSignalRoutes): the affinity stamp
 // (agent.__setPubSub(scope.init.pubsub)), the delivery-decision passthrough, the
-// idle run-cap consult (DL-007), and the resourceId gating — over a mock agent.
+// idle run-cap consult and resourceId gating — over a mock agent.
 
 import {
   type Agent,
@@ -17,10 +17,14 @@ import {
   summarizeNotifications,
 } from '@mastra/core/notifications';
 import { describe, expect, it, vi } from 'vitest';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import { FLOWSAFE_PERSISTENCE_FORBIDDEN } from '../agent-runner/durable-agent-runner.js';
 import { RUNTIME_DRIVEN_AGENT } from '../agent-runner/index.js';
 import {
   DoStatusError,
+  type ExecutionFenceDatabase,
+  type ExecutionFenceState,
+  ExecutionFenceStore,
   RunStateUnreadableError,
   type ThreadScope,
 } from '../do-runner/index.js';
@@ -110,7 +114,10 @@ function mockAgent(
   return { agent, calls, pubsub: () => stampedPubsub };
 }
 
-function scopeWith(pubsub: unknown): ThreadScope {
+function scopeWith(
+  pubsub: unknown,
+  executionFence?: ExecutionFenceStore,
+): ThreadScope {
   return {
     threadId: 'acme_t1',
     actor: { id: 'operator', role: 'operator' },
@@ -120,7 +127,7 @@ function scopeWith(pubsub: unknown): ThreadScope {
       role: 'operator',
     },
     requestedBy: 'operator',
-    init: { pubsub },
+    init: { pubsub, executionFence },
   } as unknown as ThreadScope;
 }
 
@@ -1304,7 +1311,7 @@ describe('createThreadSignalRoutes', () => {
     });
   });
 
-  it('consults the run cap for an idle WAKE and degrades to persist when over cap (DL-007)', async () => {
+  it('consults the run cap for an idle WAKE and degrades to persist when over cap', async () => {
     const { agent, calls } = mockAgent();
     const routes = createThreadSignalRoutes({
       resolveAgent: () => agent,
@@ -3060,7 +3067,7 @@ describe('createThreadSignalRoutes', () => {
     await expect(responsePromise).resolves.toMatchObject({ status: 200 });
   });
 
-  it('400s a signal whose tagName is not a valid XML name (C-S5 route-level defense)', async () => {
+  it('400s a signal whose tagName is not a valid XML name', async () => {
     // #given
     const { agent, calls } = mockAgent();
     const routes = createThreadSignalRoutes({
@@ -3143,7 +3150,7 @@ describe('createThreadSignalRoutes', () => {
   });
 });
 
-describe('signalToXmlMarkup — C-S5 injection neutralization (core render pin)', () => {
+describe('signalToXmlMarkup — injection neutralization', () => {
   // The render path the thread routes feed is core's signalToXmlMarkup. These
   // pin that it ENTITY-ESCAPES hostile contents and attribute values, so a
   // prompt-injection payload cannot break out of the <signal> element or forge a
@@ -4087,5 +4094,169 @@ describe('createThreadSignalRoutes — signal content policy', () => {
     // #then — unchanged behavior: the host opted out
     expect(response?.status).toBe(200);
     expect(calls).toHaveLength(1);
+  });
+});
+
+describe('createThreadSignalRoutes and the deployment execution fence', () => {
+  async function fenceAt(
+    state: ExecutionFenceState,
+  ): Promise<ExecutionFenceStore> {
+    const fence = new ExecutionFenceStore(
+      sqliteUnitDatabase(openSqlite()) as ExecutionFenceDatabase,
+    );
+    await fence.seed(state);
+    return fence;
+  }
+
+  it('degrades an idle WAKE to a durable persist while draining', async () => {
+    // #given — a runtime-driven agent with a working start seam on a
+    // deployment that is draining. A drain must mint no new run, and a signal
+    // is the one input it cannot answer by refusing: the sender has nowhere to
+    // put it and the migration would lose it.
+    const { agent, calls } = mockAgent();
+    const startIdleRun = vi.fn(async ({ runId }: { runId: string }) => ({
+      runId,
+      signalId: 'started',
+    }));
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      startIdleRun,
+    });
+
+    // #when — an explicit wake request.
+    const res = await routes(
+      post('/signal/message', { contents: 'hi', ifIdle: 'wake' }),
+      scopeWith(undefined, await fenceAt('draining')),
+    );
+
+    // #then — persisted for post-migration wake: never lost, never minted, and
+    // the refusal is attributed so an operator can see WHY.
+    expect(res?.status).toBe(200);
+    expect((await res?.json()) as { wakeRefused?: string }).toMatchObject({
+      wakeRefused: 'execution-draining',
+    });
+    expect(startIdleRun).not.toHaveBeenCalled();
+    expect(calls[0]?.target.ifIdle).toEqual({ behavior: 'persist' });
+  });
+
+  it('still delivers into an ACTIVE run while draining', async () => {
+    // #given — the run a drain is waiting for.
+    const { agent } = mockAgent();
+    (
+      agent as unknown as { getActiveThreadRunId: () => string }
+    ).getActiveThreadRunId = () => 'active-run';
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+
+    // #then — delivery is what lets the drain finish, so it is admitted.
+    const res = await routes(
+      post('/signal', { contents: 'hi' }),
+      scopeWith(undefined, await fenceAt('draining')),
+    );
+    expect(res?.status).toBe(200);
+    expect(await res?.json()).toMatchObject({
+      decision: { action: 'deliver', runId: 'run-1' },
+    });
+  });
+
+  it('refuses every signal route under migration-locked, delivery and persist alike', async () => {
+    // #given
+    const { agent, calls } = mockAgent();
+    (
+      agent as unknown as { getActiveThreadRunId: () => string }
+    ).getActiveThreadRunId = () => 'active-run';
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+      startIdleRun: vi.fn(),
+    });
+    const scope = scopeWith(undefined, await fenceAt('migration-locked'));
+
+    // #when / #then — the persist lanes are refused too: their thread-state
+    // write is part of what the migration is copying.
+    for (const path of ['/signal', '/signal/message', '/signal/queue']) {
+      const res = await routes(post(path, { contents: 'hi' }), scope);
+      expect(res?.status).toBe(503);
+      expect(await res?.json()).toEqual({
+        error: expect.stringContaining("fenced ('migration-locked')"),
+        reason: { code: 'EXECUTION_FENCED', state: 'migration-locked' },
+      });
+    }
+    expect(calls).toEqual([]);
+  });
+
+  it('admits proof-only delivery to the nominated run and nothing else', async () => {
+    // #given — a proof state already bound to 'active-run'.
+    const fence = await fenceAt('migration-locked');
+    await fence.transition({
+      expected: 'migration-locked',
+      next: 'proof-only',
+      proofKey: 'proof-1',
+    });
+    expect(await fence.recordProofRun('proof-1', 'active-run')).toBe(true);
+    const { agent } = mockAgent();
+    (
+      agent as unknown as { getActiveThreadRunId: () => string }
+    ).getActiveThreadRunId = () => 'active-run';
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+
+    // #then — the proof run receives its signal...
+    const admitted = await routes(
+      post('/signal', { contents: 'hi' }),
+      scopeWith(undefined, fence),
+    );
+    expect(admitted?.status).toBe(200);
+
+    // #and — a thread whose active run is NOT the proof run does not.
+    (
+      agent as unknown as { getActiveThreadRunId: () => string }
+    ).getActiveThreadRunId = () => 'some-other-run';
+    const refused = await routes(
+      post('/signal', { contents: 'hi' }),
+      scopeWith(undefined, fence),
+    );
+    expect(refused?.status).toBe(503);
+    expect(await refused?.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCED', state: 'proof-only' },
+    });
+  });
+
+  it('answers 503 rather than 502 when the fence cannot be read', async () => {
+    // #given — a fence whose storage is down. Degrade closed, and keep the
+    // status distinguishable from "the model or a route is broken".
+    const { agent } = mockAgent();
+    const unreadable = new ExecutionFenceStore({
+      prepare: () => ({
+        bind: () => ({
+          bind: () => {
+            throw new Error('unreachable');
+          },
+          run: () => Promise.reject(new Error('D1_ERROR: network')),
+          all: () => Promise.reject(new Error('D1_ERROR: network')),
+        }),
+        run: () => Promise.reject(new Error('D1_ERROR: network')),
+        all: () => Promise.reject(new Error('D1_ERROR: network')),
+      }),
+    } as unknown as ExecutionFenceDatabase);
+    const routes = createThreadSignalRoutes({
+      resolveAgent: () => agent,
+      resolveResourceId: () => 'acme_res',
+    });
+
+    // #then
+    const res = await routes(
+      post('/signal', { contents: 'hi' }),
+      scopeWith(undefined, unreadable),
+    );
+    expect(res?.status).toBe(503);
+    expect(await res?.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
+    });
   });
 });

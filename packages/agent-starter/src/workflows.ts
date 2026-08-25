@@ -9,7 +9,11 @@ import {
 } from '@proofoftech/flowsafe/host-kit';
 import { z } from 'zod';
 
-import { createComposedStorage } from './storage.js';
+import {
+  createComposedStorage,
+  executionFence,
+  startIdempotency,
+} from './storage.js';
 
 export const WORKFLOWS: ReadonlyArray<WorkflowMeta> = [
   {
@@ -28,6 +32,16 @@ export function defineWorkflows(env: Env): RunnerRuntime {
       requestContextForRun: approvalGrantProvider(
         approvalStoreFactoryFor(env.DB).store(),
       ),
+      // The composed store hides the binding init would have fenced from, so
+      // the run object names it: the deployment execution fence must live in
+      // the SAME database as the state it fences.
+      executionFence: executionFence(env.DB),
+      // The same binding again, and not optional in practice: the run router
+      // reserves keyed starts into this store, and THIS runtime is the layer
+      // that sees a run reach terminal — so it is the only one that can mark
+      // the reservation spent. `DurableObjectRunner.build()` refuses to serve
+      // a database-backed runtime without it.
+      startIdempotency: startIdempotency(env.DB),
     },
   );
   const schema = z.object({ message: z.string().min(1).max(5_000) });

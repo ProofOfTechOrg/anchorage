@@ -38,6 +38,8 @@ import {
   type DurableObjectRunOwnershipStore,
   nextDutyAlarmAt,
 } from './durable-object.js';
+import type { ExecutionFenceDatabase } from './execution-fence.js';
+import { ExecutionFenceStore } from './execution-fence.js';
 import { EXECUTION_PRINCIPAL_HEADER } from './execution-principal-header.js';
 import { init } from './init.js';
 import {
@@ -46,6 +48,8 @@ import {
   type RunSummary,
 } from './runtime.js';
 import type { ScheduleSourceStore } from './schedule-source.js';
+import type { StartIdempotencyDatabase } from './start-idempotency.js';
+import { StartIdempotencyStore } from './start-idempotency.js';
 import {
   isSuspensionTimeoutResumeData,
   MAX_SUSPENSION_DEADLINE_ATTEMPTS,
@@ -62,6 +66,13 @@ import {
 interface TestEnv extends DeploymentIdentityEnv {
   storage: InMemoryStore;
   runtime?: RunnerRuntime;
+  /**
+   * The deployment execution fence the built runtime is wired to. Always
+   * present on a production-shaped env — DurableObjectRunner refuses to serve
+   * from a fence-less RunnerRuntime while a DB binding is bound — and shared
+   * with the test so it can move the fence under a live object.
+   */
+  fence?: ExecutionFenceStore;
   owners: DurableObjectRunOwnershipStore;
   schedules?: ScheduleSourceStore;
   lifecycle?: DurableObjectRunLifecycleHooks;
@@ -110,12 +121,17 @@ function makeProductionEnv(
         },
       }
     : registry;
+  const db = deploymentIdentityDatabase();
   return {
     storage,
     owners,
     DEPLOYMENT_TENANT: 'acme',
     DEPLOYMENT_IDENTITY_SECRET: TEST_DEPLOYMENT_IDENTITY_SECRET,
-    DB: deploymentIdentityDatabase(),
+    DB: db,
+    // The fence lives in the SAME database as the deployment sentinel, exactly
+    // as it does in production. Absent-table reads as 'open', so every test
+    // that does not move it is byte-identical to before the fence existed.
+    fence: new ExecutionFenceStore(db),
   };
 }
 
@@ -133,8 +149,40 @@ function statusStub(read: RunnerRuntime['status']) {
   return { status: vi.fn(read), authoritativeStatus: vi.fn(read) };
 }
 
-function gatedRuntime(storage: InMemoryStore): RunnerRuntime {
-  const { createWorkflow, createStep, runtime } = init({ storage });
+/**
+ * A fence over its own throwaway database, for the runtime builders that are
+ * handed a storage instance and no env. Every read finds no table and answers
+ * 'open', so these runners behave exactly as they did before the fence — what
+ * it buys is that they are FENCED runtimes, which is what DurableObjectRunner
+ * asserts of anything it serves from while a DB binding is bound.
+ */
+function newTestExecutionFence(): ExecutionFenceStore {
+  return new ExecutionFenceStore(
+    sqliteUnitDatabase(openSqlite()) as ExecutionFenceDatabase,
+  );
+}
+
+/**
+ * A start-reservation store over its own throwaway database, for the same
+ * reason as the fence above: DurableObjectRunner refuses to serve from a
+ * runtime that has none while a DB binding is bound, and every runner in this
+ * file carries one. No key is ever used against it, so the table is never even
+ * created and every runner behaves exactly as it did before reservations.
+ */
+function newTestStartIdempotency(): StartIdempotencyStore {
+  return new StartIdempotencyStore(
+    sqliteUnitDatabase(openSqlite()) as StartIdempotencyDatabase,
+  );
+}
+
+function gatedRuntime(
+  storage: InMemoryStore,
+  executionFence: ExecutionFenceStore = newTestExecutionFence(),
+): RunnerRuntime {
+  const { createWorkflow, createStep, runtime } = init(
+    { storage },
+    { executionFence, startIdempotency: newTestStartIdempotency() },
+  );
   const gate = createStep({
     id: 'gate',
     inputSchema: z.object({ topic: z.string() }),
@@ -171,7 +219,7 @@ class TestRunner extends DurableObjectRunner<TestEnv> {
 
   protected build(env: TestEnv): RunnerRuntime {
     if (env.runtime) return env.runtime;
-    return gatedRuntime(env.storage);
+    return gatedRuntime(env.storage, env.fence);
   }
 }
 
@@ -1102,7 +1150,9 @@ describe('DurableObjectRunner.fetch', () => {
 
     const approvalStore = new InMemoryApprovalStore();
     const filed = await reconcileApprovalsForSummary(
-      new ApprovalService({ store: approvalStore }),
+      // In-memory store, no database to fence against: the opt-out is written down
+      // rather than defaulted — see ExecutionFenceWiring.
+      new ApprovalService({ store: approvalStore, executionFence: 'none' }),
       'gated',
       summary,
       'approval-reconciler',
@@ -1384,7 +1434,7 @@ describe('DurableObjectRunner.fetch', () => {
     }
   });
 
-  it('400s a start without a runId — the DO never generates one (INV-1)', async () => {
+  it('400s a start without a runId — the DO never generates one', async () => {
     // #given — the runId is host-owned and minted by the run router. A DO-side
     // generation fallback would let any caller that skips the router create an
     // unowned run outside the request budget and audit boundary.
@@ -1400,7 +1450,7 @@ describe('DurableObjectRunner.fetch', () => {
     }
   });
 
-  it('refuses to act outside its own identity when id.name is present (INV-1)', async () => {
+  it('refuses to act outside its own identity when id.name is present', async () => {
     // #given — a runner whose DO identity names a DIFFERENT run than the
     // request. id.name is set by the trusted Worker via idFromName and is
     // unforgeable at this boundary, so a mismatch means someone routed
@@ -1458,9 +1508,13 @@ describe('DurableObjectRunner.fetch', () => {
       }
 
       protected build(env: TestEnv): RunnerRuntime {
-        const { createWorkflow, createStep, runtime } = init({
-          storage: env.storage,
-        });
+        const { createWorkflow, createStep, runtime } = init(
+          { storage: env.storage },
+          {
+            executionFence: env.fence ?? newTestExecutionFence(),
+            startIdempotency: newTestStartIdempotency(),
+          },
+        );
         const gate = createStep({
           id: 'gate',
           inputSchema: z.object({}),
@@ -1701,7 +1755,7 @@ describe('DurableObjectRunner.fetch', () => {
     let wedge = true;
     const env = makeProductionEnv(storage);
     env.runtime = new Proxy(runtime, {
-      get(target, property, receiver) {
+      get(target, property) {
         if (property === 'completeTerminalCleanup') {
           return async (
             ...args: Parameters<RunnerRuntime['completeTerminalCleanup']>
@@ -1713,7 +1767,11 @@ describe('DurableObjectRunner.fetch', () => {
             return complete(...args);
           };
         }
-        const value = Reflect.get(target, property, receiver) as unknown;
+        // Receiver is the TARGET, not the proxy: RunnerRuntime's accessors read
+        // private fields, and a private-field read against a proxy receiver
+        // throws. Every function is re-bound to the target below for the same
+        // reason, so this only makes the getters agree with the methods.
+        const value = Reflect.get(target, property, target) as unknown;
         return typeof value === 'function' ? value.bind(target) : value;
       },
     });
@@ -1915,8 +1973,8 @@ describe('DurableObjectRunner.fetch', () => {
 
   it('returns a 426 non-WS fallback on the stream route when the runtime has no hibernation API', async () => {
     // #given — a node runner (state undefined ⇒ no acceptWebSocket). The per-run
-    // WS stream is workerd-only; off workerd it must degrade, never 500. The WS
-    // runtime behavior itself is proven by the workerd spike (M-009).
+    // WS stream is workerd-only; off workerd it must degrade, never 500. The
+    // WebSocket runtime behavior itself is proven by the workerd spike.
     const runner = makeRunner();
 
     // #when — a websocket upgrade attempt on the stream route
@@ -1930,7 +1988,7 @@ describe('DurableObjectRunner.fetch', () => {
     expect(response.status).toBe(426);
   });
 
-  it('broadcasts the authoritative RunSummary to run-channel sockets after start and resume (DL-018)', async () => {
+  it('broadcasts the authoritative RunSummary to run-channel sockets after start and resume', async () => {
     // #given — a runner whose DO exposes a hibernatable-socket stub;
     // #broadcastRunSummary reads getWebSockets() and send()s each the frame.
     const sent: string[] = [];
@@ -2004,8 +2062,12 @@ type TimedStepExecute = ExecuteFunction<
 function timedRuntime(
   storage: InMemoryStore,
   onSettle?: () => void,
+  executionFence: ExecutionFenceStore = newTestExecutionFence(),
 ): RunnerRuntime {
-  const { createWorkflow, createStep, runtime } = init({ storage });
+  const { createWorkflow, createStep, runtime } = init(
+    { storage },
+    { executionFence, startIdempotency: newTestStartIdempotency() },
+  );
   const timedStep = (id: string, execute: TimedStepExecute) =>
     createStep({
       id,
@@ -2113,7 +2175,13 @@ function collidingRuntime(storage: InMemoryStore): {
   settled: () => string[];
 } {
   const settled: string[] = [];
-  const { createWorkflow, createStep, runtime } = init({ storage });
+  const { createWorkflow, createStep, runtime } = init(
+    { storage },
+    {
+      executionFence: newTestExecutionFence(),
+      startIdempotency: newTestStartIdempotency(),
+    },
+  );
   const suspending = (id: string, label: string) =>
     createStep({
       id,
@@ -2157,7 +2225,13 @@ function foreachRuntime(
   options?: { concurrency: number },
 ): { runtime: RunnerRuntime; timedOut: () => number[] } {
   const timedOut: number[] = [];
-  const { createWorkflow, createStep, runtime } = init({ storage });
+  const { createWorkflow, createStep, runtime } = init(
+    { storage },
+    {
+      executionFence: newTestExecutionFence(),
+      startIdempotency: newTestStartIdempotency(),
+    },
+  );
   const gate = createStep({
     id: 'gate',
     inputSchema: z.object({ item: z.number() }),
@@ -2193,7 +2267,7 @@ function foreachRuntime(
 
 function timedEnv(): TestEnv {
   const env = makeProductionEnv();
-  env.runtime = timedRuntime(env.storage);
+  env.runtime = timedRuntime(env.storage, undefined, env.fence);
   return env;
 }
 
@@ -5300,5 +5374,438 @@ describe('nextDutyAlarmAt', () => {
     // guarantee for an entry that is already due.
     expect(nextDutyAlarmAt(NOW - 5_000, undefined, NOW)).toBe(NOW + 1_000);
     expect(nextDutyAlarmAt(NOW - 5_000, NOW + 60_000, NOW)).toBe(NOW + 1_000);
+  });
+});
+
+describe('DurableObjectRunner and the deployment execution fence', () => {
+  it('refuses a fenced start before ANY of its own storage writes', async () => {
+    // #given — a locked deployment and a start that would otherwise journal a
+    // recovery record, arm an alarm, and reserve the run's owner.
+    const events: string[] = [];
+    const { state } = recoveryStorage(events);
+    const reserve = vi.fn(async () => true);
+    const env = makeProductionEnv(new InMemoryStore(), {
+      reserve,
+      settle: vi.fn(async () => undefined),
+    });
+    await env.fence?.seed('migration-locked');
+    const runner = new TestRunner(state, env);
+    events.length = 0;
+
+    // #when
+    const response = await runner.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'fenced-start',
+        inputData: { topic: 't' },
+      }),
+    );
+
+    // #then — the refusal carries the taxonomy's retryable status and code.
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({
+      error:
+        "deployment execution is fenced ('migration-locked'): run start is refused",
+      reason: { code: 'EXECUTION_FENCED', state: 'migration-locked' },
+    });
+
+    // #then — and NOTHING was written on the way to saying no: no owner
+    // reservation in D1, and no DO-storage mutation at all (the recovery
+    // journal, its alarm, or any delete). A deployment whose state is being
+    // copied must not leave a run half-claimed behind the copy.
+    expect(reserve).not.toHaveBeenCalled();
+    expect(
+      events.filter(
+        (event) =>
+          event.startsWith('put:') ||
+          event.startsWith('delete:') ||
+          event === 'setAlarm' ||
+          event === 'deleteAlarm',
+      ),
+    ).toEqual([]);
+  });
+
+  it('keeps reads open while locked', async () => {
+    // #given — a run started before the lock.
+    const env = timedEnv();
+    const { state } = recoveryStorage();
+    const runner = new TestRunner(state, env);
+    await startTimed(runner, 'fenced-read');
+    await env.fence?.seed('open');
+    await env.fence?.transition({
+      expected: 'open',
+      next: 'migration-locked',
+    });
+
+    // #when / #then — status still answers. An operator proving a deployment
+    // drained needs to read it, and a read moves nothing.
+    const response = await runner.fetch(
+      deploymentIdentityRequest('http://do/runs/timed/fenced-read'),
+    );
+    expect(response.status).toBe(200);
+    expect((await response.json()) as RunSummary).toMatchObject({
+      runId: 'fenced-read',
+      status: 'suspended',
+    });
+  });
+
+  it('leaves a due deadline uncharged and unconverged under a locked fence, then fires it after reopen', async () => {
+    // #given — a suspended run with a due deadline on a locked deployment.
+    const env = timedEnv();
+    const { state, values, alarms } = recoveryStorage();
+    const runner = new TestRunner(state, env);
+    await startTimed(runner, 'fenced-deadline');
+    elapseDeadlines(values);
+    const armed = storedEntry(values, 'gate');
+    await env.fence?.seed('open');
+    await env.fence?.transition({
+      expected: 'open',
+      next: 'migration-locked',
+    });
+    // Only the wakes below are under test; the start's own arm is not.
+    alarms.length = 0;
+    const logged: string[] = [];
+    const log = vi
+      .spyOn(console, 'error')
+      .mockImplementation((...args: unknown[]) => {
+        logged.push(String(args[0]));
+      });
+    const before = Date.now();
+
+    // #when — three wakes under the lock.
+    try {
+      for (let wake = 0; wake < 3; wake += 1) {
+        // #then — an alarm NEVER rethrows: workerd retries a thrown alarm up
+        // to six times, which would answer a deliberate operational state with
+        // a wake storm.
+        await expect(runner.alarm()).resolves.toBeUndefined();
+      }
+    } finally {
+      log.mockRestore();
+    }
+
+    // #then — every arm is the 60 s watchdog, never the floored re-arm a
+    // still-due entry would produce. The wake converged nothing, so it has no
+    // arm of its own to compute.
+    expect(alarms.filter((at) => at <= before)).toEqual([]);
+    for (const at of alarms) {
+      expect(at).toBeGreaterThanOrEqual(before + 60_000);
+    }
+    // #then — and the entry is untouched: not charged (five charged wakes
+    // would tombstone it in about sixteen minutes of lock), not tombstoned,
+    // and not stamped with the unreadable clock either — the read SUCCEEDED,
+    // the deployment simply refused, and that clock's day-long abandonment
+    // budget exists for a run whose state is permanently unreadable.
+    const entry = storedEntry(values, 'gate');
+    expect(entry).toEqual(armed);
+    expect(entry).not.toHaveProperty('attempts');
+    expect(entry).not.toHaveProperty('nextAttemptAt');
+    expect(entry).not.toHaveProperty('unreadableSince');
+    expect(
+      logged.filter((message) =>
+        message.includes('refused by the deployment execution fence'),
+      ),
+    ).toHaveLength(3);
+    expect(logged).not.toContain('suspension deadline wake failed');
+
+    // #when — the migration finishes and the operator reopens the fence.
+    await env.fence?.transition({ expected: 'migration-locked', next: 'open' });
+    await runner.alarm();
+
+    // #then — the deadline fires. Nothing was lost while the fence was closed.
+    const settled = await runner.fetch(
+      deploymentIdentityRequest('http://do/runs/timed/fenced-deadline'),
+    );
+    expect((await settled.json()) as RunSummary).toMatchObject({
+      status: 'success',
+      result: { settledBy: 'timeout' },
+    });
+  });
+
+  it('refuses to serve from a fence-less runtime while a database is bound', async () => {
+    // #given — a host that built a RunnerRuntime by hand inside build() and
+    // forgot the fence, on a deployment that HAS a database.
+    const env = makeProductionEnv();
+    env.runtime = init(
+      { storage: env.storage },
+      { startIdempotency: 'none', executionFence: 'none' },
+    ).runtime;
+    const runner = new TestRunner(undefined, env);
+
+    // #then — refused at the first request rather than silently executing
+    // straight through a migration lock. Every other surface would report the
+    // fence as wired, so nothing else would catch this. The MESSAGE is pinned
+    // too: a bare 500 could be any fault, and this test would still pass while
+    // the guard it exists for had stopped firing.
+    const response = await runner.fetch(
+      post('/runs', { workflowId: 'gated', runId: 'no-fence' }),
+    );
+    expect(response.status).toBe(500);
+    expect(await response.json()).toMatchObject({
+      error: expect.stringContaining(
+        'returned a runtime with no execution fence',
+      ),
+    });
+  });
+
+  it('serves from a fence-less runtime when DB is an RPC binding, not a database', async () => {
+    // #given — the OTHER direction of the same discrimination, and the one that
+    // fails loudly for every host if it is wrong. `DB` here is a service
+    // binding with a named entrypoint (fleet trusted state binds exactly this
+    // beside its D1), which is an RPC proxy: it answers EVERY property with a
+    // callable, so a bare `prepare` test says yes to it. There is no database
+    // to fence against, so a fence-less runtime is correct — insisting on a
+    // fence would refuse the first request every such Worker ever serves.
+    const env = makeProductionEnv();
+    env.DB = new Proxy(
+      {},
+      { get: () => () => undefined },
+    ) as unknown as typeof env.DB;
+    env.runtime = init(
+      { storage: env.storage },
+      { startIdempotency: 'none', executionFence: 'none' },
+    ).runtime;
+    const runner = new TestRunner(undefined, env);
+
+    // #then — past the guard. 404 is this bare runtime answering for a workflow
+    // it was never given; what matters is that it ANSWERED, where the D1-shaped
+    // binding above produced the guard's 500.
+    const response = await runner.fetch(
+      post('/runs', { workflowId: 'gated', runId: 'rpc-db' }),
+    );
+    expect(response.status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// What the run object contributes to an idempotent start: it carries the
+// key on the internal channel, and it answers the liveness probe that separates
+// a run still working from a claim nobody is holding.
+// ---------------------------------------------------------------------------
+
+describe('DurableObjectRunner — idempotent start plumbing', () => {
+  it('answers the liveness probe false for a run it is not executing', async () => {
+    // #given a run object with nothing in flight
+    const runner = makeRunner();
+
+    // #when
+    const response = await runner.fetch(
+      deploymentIdentityRequest('http://do/runs/gated/run-idle/start-liveness'),
+    );
+
+    // #then. `false` is the fail-closed direction here: it produces the
+    // refusal that asks a human to investigate, where a default of `true`
+    // would answer a permanently dead run with a permanently retryable 503.
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ live: false });
+  });
+
+  it('answers the liveness probe true WHILE the start is executing, without queuing behind it', async () => {
+    // #given a workflow whose first step blocks until the probe has answered.
+    // This is the whole point of the route: the start holds the operation lock
+    // for its entire first leg, so a probe that took that lock would block for
+    // exactly as long as the run it was trying to describe.
+    const storage = new InMemoryStore();
+    const { createWorkflow, createStep, runtime } = init(
+      { storage },
+      {
+        executionFence: newTestExecutionFence(),
+        startIdempotency: newTestStartIdempotency(),
+      },
+    );
+    let probed!: (value: unknown) => void;
+    const probeAnswered = new Promise((resolve) => {
+      probed = resolve;
+    });
+    let running!: (value: unknown) => void;
+    const stepRunning = new Promise((resolve) => {
+      running = resolve;
+    });
+    const blocking = createStep({
+      id: 'blocking',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+      execute: async () => {
+        running(undefined);
+        await probeAnswered;
+        return {};
+      },
+    });
+    createWorkflow({
+      id: 'gated',
+      inputSchema: z.object({}),
+      outputSchema: z.object({}),
+    })
+      .then(blocking)
+      .commit();
+    const env = { ...makeProductionEnv(storage), runtime };
+    const runner = new TestRunner(undefined, env);
+
+    // #when the start is in flight and a probe arrives
+    const started = runner.fetch(
+      post('/runs', { workflowId: 'gated', runId: 'run-live', inputData: {} }),
+    );
+    await stepRunning;
+    const probe = await runner.fetch(
+      deploymentIdentityRequest('http://do/runs/gated/run-live/start-liveness'),
+    );
+    probed(undefined);
+    await started;
+
+    // #then the probe answered — promptly, and truthfully
+    expect(await probe.json()).toEqual({ live: true });
+
+    // #and once the start is done, so is the liveness
+    const after = await runner.fetch(
+      deploymentIdentityRequest('http://do/runs/gated/run-live/start-liveness'),
+    );
+    expect(await after.json()).toEqual({ live: false });
+  });
+
+  it('refuses an idempotency key that is not path-safe', async () => {
+    // #given — the same string is compared against the fence's proof key and
+    // stored as a reservation's primary key, so an unvalidated one reaches both
+    const runner = makeRunner();
+
+    // #when
+    const response = await runner.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'run-bad-key',
+        inputData: { topic: 't' },
+        idempotencyKey: 'key/../escape',
+      }),
+    );
+
+    // #then
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: expect.stringContaining('idempotencyKey'),
+    });
+  });
+
+  it('admits exactly the proof-only start that carries the nominated key, end to end', async () => {
+    // #given a deployment fenced into proof-only, addressed through the route
+    // a trusted Worker actually uses
+    const storage = new InMemoryStore();
+    const env = makeProductionEnv(storage);
+    const fence = env.fence as ExecutionFenceStore;
+    await fence.seed('migration-locked');
+    await fence.transition({
+      expected: 'migration-locked',
+      next: 'proof-only',
+      proofKey: 'proof-key-1',
+    });
+    const runner = new TestRunner(undefined, env);
+
+    // #then a start with NO key is refused at the route, before this object
+    // writes anything of its own
+    const unkeyed = await runner.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'run-unkeyed',
+        inputData: { topic: 't' },
+      }),
+    );
+    expect(unkeyed.status).toBe(503);
+    expect(await unkeyed.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCED', state: 'proof-only' },
+    });
+
+    // #and a start carrying the WRONG key is refused the same way
+    const guessed = await runner.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'run-guessed',
+        inputData: { topic: 't' },
+        idempotencyKey: 'guessed-key',
+      }),
+    );
+    expect(guessed.status).toBe(503);
+
+    // #and the nominated start is admitted AND binds the proof run
+    const admitted = await runner.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'run-proof',
+        inputData: { topic: 't' },
+        idempotencyKey: 'proof-key-1',
+      }),
+    );
+    expect(admitted.status).toBe(200);
+    await expect(fence.read()).resolves.toEqual({
+      state: 'proof-only',
+      proofKey: 'proof-key-1',
+      proofRunId: 'run-proof',
+    });
+
+    // #and a SECOND start under the same key is refused: the proof is one run,
+    // and recordProofRun's CAS is what says so.
+    const second = await runner.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'run-proof-2',
+        inputData: { topic: 't' },
+        idempotencyKey: 'proof-key-1',
+      }),
+    );
+    expect(second.status).toBe(503);
+  });
+
+  it('refuses an admitted start whose fence MOVED before the write-back landed', async () => {
+    // #given a fence that reads proof-only and then, between the admitting
+    // read and the write-back, has been transitioned away — the 0-row case
+    // recordProofRun's CAS exists for
+    const storage = new InMemoryStore();
+    const env = makeProductionEnv(storage);
+    const fence = env.fence as ExecutionFenceStore;
+    await fence.seed('migration-locked');
+    await fence.transition({
+      expected: 'migration-locked',
+      next: 'proof-only',
+      proofKey: 'proof-key-1',
+    });
+    let moved = false;
+    const moving = new Proxy(fence, {
+      get(target, property, receiver) {
+        if (property === 'read') {
+          return async () => {
+            const reading = await target.read();
+            // The operator moves the fence ONCE, right after the read that
+            // admitted the start. Every later read sees the moved fence, which
+            // is exactly what an admitted-then-moved start observes.
+            if (!moved) {
+              moved = true;
+              await target.transition({
+                expected: 'proof-only',
+                next: 'migration-locked',
+              });
+            }
+            return reading;
+          };
+        }
+        const value = Reflect.get(target, property, receiver) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const runner = new TestRunner(undefined, {
+      ...env,
+      fence: moving as ExecutionFenceStore,
+    });
+
+    // #when
+    const response = await runner.fetch(
+      post('/runs', {
+        workflowId: 'gated',
+        runId: 'run-proof',
+        inputData: { topic: 't' },
+        idempotencyKey: 'proof-key-1',
+      }),
+    );
+
+    // #then refused, and nothing ran: the deployment is no longer the one this
+    // start read, so its admission is void.
+    expect(response.status).toBe(503);
+    await expect(fence.read()).resolves.toEqual({ state: 'migration-locked' });
   });
 });

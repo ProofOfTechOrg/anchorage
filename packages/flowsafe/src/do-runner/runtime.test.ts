@@ -52,7 +52,10 @@ function buildRuntime(storage: InMemoryStore): {
   counters: Counters;
 } {
   const counters: Counters = { approvalResumes: 0, echoRuns: 0 };
-  const { createWorkflow, createStep, runtime } = init({ storage });
+  const { createWorkflow, createStep, runtime } = init(
+    { storage },
+    { startIdempotency: 'none', executionFence: 'none' },
+  );
 
   const research = createStep({
     id: 'research',
@@ -118,18 +121,24 @@ describe('RunnerRuntime host pubsub identity', () => {
     const pubsub = createHostPubSub();
 
     // #when — init() threads it (InitOptions.pubsub -> RunnerRuntimeOptions.pubsub)
-    const { runtime } = init({ storage: new InMemoryStore() }, { pubsub });
+    const { runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', pubsub, executionFence: 'none' },
+    );
 
-    // #then — the SAME instance is reachable, so Track A's createRun sites and
-    // observe() replay share one feed. Delete the thread in init.ts and this
-    // fails: runtime.pubsub is undefined and the two createRun sites would each
-    // let core default a separate emitter — the DL-001 bug this seam prevents.
+    // #then — the SAME instance is reachable, so the agent's createRun
+    // sites and observe() replay share one feed. Delete the thread in init.ts
+    // and this fails: runtime.pubsub is undefined, so the two createRun sites
+    // each let core default a separate emitter — the bug this seam prevents.
     expect(runtime.pubsub).toBe(pubsub);
   });
 
   it('leaves runtime.pubsub undefined when the host configures none (byte-identical)', () => {
     // #when — no pubsub passed
-    const { runtime } = init({ storage: new InMemoryStore() });
+    const { runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
 
     // #then — undefined, the polling-fallback posture existing hosts keep
     expect(runtime.pubsub).toBeUndefined();
@@ -138,9 +147,10 @@ describe('RunnerRuntime host pubsub identity', () => {
 
 describe('RunnerRuntime', () => {
   it('passes initial workflow state through to core execution', async () => {
-    const { createWorkflow, createStep, runtime } = init({
-      storage: new InMemoryStore(),
-    });
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     const stateSchema = z.object({ seed: z.string() });
     const inspect = createStep({
       id: 'inspect-state',
@@ -572,7 +582,10 @@ describe('RunnerRuntime', () => {
 
   it('rejects duplicate workflow ids at registration', () => {
     // #given
-    const { createWorkflow } = init({ storage: new InMemoryStore() });
+    const { createWorkflow } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     createWorkflow({
       id: 'wf',
       inputSchema: z.object({}),
@@ -591,7 +604,10 @@ describe('RunnerRuntime', () => {
 
   it('rejects duplicate agent ids at registration', () => {
     // #given
-    const { runtime } = init({ storage: new InMemoryStore() });
+    const { runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     runtime.registerAgent(runtimeAgent('writer'));
 
     // #when / #then
@@ -602,9 +618,10 @@ describe('RunnerRuntime', () => {
 
   it('exposes every registered agent to workflow execution', async () => {
     // #given
-    const { createWorkflow, createStep, runtime } = init({
-      storage: new InMemoryStore(),
-    });
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     const agents = [
       runtimeAgent('a'),
       runtimeAgent('b'),
@@ -669,7 +686,7 @@ describe('RunnerRuntime', () => {
     const publish = vi.spyOn(pubsub, 'publish');
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { pubsub },
+      { startIdempotency: 'none', pubsub, executionFence: 'none' },
     );
     const agent = runtimeAgent('writer');
     runtime.registerAgent(agent);
@@ -710,9 +727,10 @@ describe('RunnerRuntime', () => {
     'constructor',
   ])("executes prototype-collision workflow id '%s'", async (workflowId) => {
     // #given
-    const { createWorkflow, createStep, runtime } = init({
-      storage: new InMemoryStore(),
-    });
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     const noop = createStep({
       id: 'noop',
       inputSchema: z.object({}),
@@ -750,7 +768,10 @@ describe('RunnerRuntime', () => {
     '',
   ])("rejects non-path-safe workflow id '%s' at registration", (id) => {
     // #given
-    const { createWorkflow } = init({ storage: new InMemoryStore() });
+    const { createWorkflow } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
 
     // #when / #then — a ':' or '/' in the id would make the DO name join
     // (`${workflowId}:${runId}`) and the /runs/:workflowId/:runId path
@@ -766,7 +787,10 @@ describe('RunnerRuntime', () => {
 
   it('accepts path-safe workflow ids at registration', () => {
     // #given
-    const { createWorkflow, runtime } = init({ storage: new InMemoryStore() });
+    const { createWorkflow, runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
 
     // #when — unreserved-character id, including the '.' that only the bare
     // dot-segments '.' and '..' are barred from
@@ -782,9 +806,10 @@ describe('RunnerRuntime', () => {
 
   it('rejects registration after the first run', async () => {
     // #given
-    const { createWorkflow, createStep, runtime } = init({
-      storage: new InMemoryStore(),
-    });
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     const step = createStep({
       id: 'noop',
       inputSchema: z.object({}),
@@ -819,7 +844,10 @@ const ISO_8601 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
 describe('RunnerRuntime.status projection', () => {
   it('persists a terminal status when a workflow retains only resume snapshots', async () => {
     const storage = new InMemoryStore();
-    const { createWorkflow, createStep, runtime } = init({ storage });
+    const { createWorkflow, createStep, runtime } = init(
+      { storage },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     const gate = createStep({
       id: 'gate',
       inputSchema: z.object({ value: z.string() }),
@@ -868,7 +896,10 @@ describe('RunnerRuntime.status projection', () => {
 
   it('persists a terminal start when the engine omits terminal snapshots', async () => {
     const storage = new InMemoryStore();
-    const { createWorkflow, createStep, runtime } = init({ storage });
+    const { createWorkflow, createStep, runtime } = init(
+      { storage },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     const echo = createStep({
       id: 'echo-once',
       inputSchema: z.object({ value: z.string() }),
@@ -945,9 +976,10 @@ describe('RunnerRuntime.status projection', () => {
 
   it('projects the failure message for a failed run', async () => {
     // #given
-    const { createWorkflow, createStep, runtime } = init({
-      storage: new InMemoryStore(),
-    });
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     const boom = createStep({
       id: 'boom',
       inputSchema: z.object({}),
@@ -982,9 +1014,10 @@ describe('RunnerRuntime.status projection', () => {
     // object, not an Error instance. This is the shape errorText() defends
     // against at an engine/persistence boundary; String() on it reads
     // '[object Object]', so a naive projection would lose the message.
-    const { createWorkflow, createStep, runtime } = init({
-      storage: new InMemoryStore(),
-    });
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     const boom = createStep({
       id: 'boom-object',
       inputSchema: z.object({}),
@@ -1022,9 +1055,10 @@ describe('RunnerRuntime.status projection', () => {
 
   it('projects every branch of a multi-step (parallel) suspension', async () => {
     // #given — two parallel steps that both suspend in the same run
-    const { createWorkflow, createStep, runtime } = init({
-      storage: new InMemoryStore(),
-    });
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     const makeGate = (id: string, reason: string) =>
       createStep({
         id,
@@ -1087,9 +1121,10 @@ describe('RunnerRuntime run lifecycle', () => {
     const held = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const { createWorkflow, createStep, runtime } = init({
-      storage: options.storage ?? new InMemoryStore(),
-    });
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: options.storage ?? new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     const step = createStep({
       id: 'held',
       inputSchema: z.object({}),
@@ -1181,6 +1216,8 @@ describe('RunnerRuntime run lifecycle', () => {
       const { createWorkflow, createStep, runtime } = init(
         { storage },
         {
+          startIdempotency: 'none',
+          executionFence: 'none',
           requestContextForRun: () => ({
             'flowsafe.runLifecycle': {
               version: 1,
@@ -1873,7 +1910,10 @@ describe('RunnerRuntime run lifecycle', () => {
 
   it('serializes terminal reconciliation with a concurrent cancellation preflight', async () => {
     const storage = new InMemoryStore();
-    const { createWorkflow, createStep, runtime } = init({ storage });
+    const { createWorkflow, createStep, runtime } = init(
+      { storage },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     const step = createStep({
       id: 'finish',
       inputSchema: z.object({}),
@@ -1981,7 +2021,11 @@ describe('RunnerRuntime requestContextForRun', () => {
     const seen: Observation[] = [];
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { requestContextForRun: provider },
+      {
+        startIdempotency: 'none',
+        requestContextForRun: provider,
+        executionFence: 'none',
+      },
     );
     const first = createStep({
       id: 'first',
@@ -2027,7 +2071,11 @@ describe('RunnerRuntime requestContextForRun', () => {
     const seen: Record<string, unknown> = {};
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      { requestContextForRun: () => ({ 'test.a': 'provider' }) },
+      {
+        startIdempotency: 'none',
+        requestContextForRun: () => ({ 'test.a': 'provider' }),
+        executionFence: 'none',
+      },
     );
     const inspect = createStep({
       id: 'inspect-scheduled-context',
@@ -2188,9 +2236,10 @@ describe('RunnerRuntime requestContextForRun', () => {
     // #given — NO requestContextForRun provider; a step that records the
     // runtime-minted scope (breakwater's crossWorkflowIsolation reads it)
     const seen: unknown[] = [];
-    const { createWorkflow, createStep, runtime } = init({
-      storage: new InMemoryStore(),
-    });
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     const probe = createStep({
       id: 'probe',
       inputSchema: z.object({}),
@@ -2221,9 +2270,10 @@ describe('RunnerRuntime requestContextForRun', () => {
   it('does not synthesize breakwater isolation scope from runId prefixes', async () => {
     // #given — a probe recording both server-minted keys
     const seen: Array<{ scope: unknown; isolation: unknown }> = [];
-    const { createWorkflow, createStep, runtime } = init({
-      storage: new InMemoryStore(),
-    });
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     const probe = createStep({
       id: 'probe',
       inputSchema: z.object({}),
@@ -2263,6 +2313,8 @@ describe('RunnerRuntime requestContextForRun', () => {
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
       {
+        startIdempotency: 'none',
+        executionFence: 'none',
         requestContextForRun: () => ({
           'breakwater.workflowScope': 'overridden',
         }),
@@ -2300,6 +2352,8 @@ describe('RunnerRuntime requestContextForRun', () => {
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
       {
+        startIdempotency: 'none',
+        executionFence: 'none',
         requestContextForRun: () => ({
           stored: 'kept',
           'breakwater.workflowScope': 'forged-workflow',
@@ -2413,14 +2467,22 @@ describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
     let rounds = 0;
     const { createWorkflow, createStep, runtime } = init(
       { storage },
-      onLeg
-        ? {
-            requestContextForRun: (_workflowId, _runId, leg) => {
-              onLeg(leg);
-              return undefined;
-            },
-          }
-        : undefined,
+      {
+        startIdempotency: 'none',
+        executionFence: 'none',
+        ...(onLeg
+          ? {
+              requestContextForRun: (
+                _workflowId: string,
+                _runId: string,
+                leg: RunLeg,
+              ) => {
+                onLeg(leg);
+                return undefined;
+              },
+            }
+          : {}),
+      },
     );
     const gate2x = createStep({
       id: 'gate2x',
@@ -2557,9 +2619,10 @@ describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
     // optional-schema / validateInputs-off steps. If a Mastra bump changes
     // this, the "schema-less fixture required" assumption (buildReSuspender,
     // the relaunch-falsy e2e fixture) goes silently stale.
-    const { createWorkflow, createStep, runtime } = init({
-      storage: new InMemoryStore(),
-    });
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     const schemaGate = createStep({
       id: 'schemaGate',
       inputSchema: z.object({}),
@@ -2634,9 +2697,10 @@ describe('RunnerRuntime resumeCount projection (re-suspension)', () => {
   it('marks only the resumed branch, leaving a co-suspended branch a first suspension', async () => {
     // #given — two parallel gates both suspend; gateA re-suspends on a payload
     // resume (round 2), gateB stays at its first suspension.
-    const { createWorkflow, createStep, runtime } = init({
-      storage: new InMemoryStore(),
-    });
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     let aRounds = 0;
     const gateA = createStep({
       id: 'gateA',
@@ -2704,14 +2768,22 @@ describe('RunnerRuntime resumeCount snapshot provenance (shared runId across wor
     let bRounds = 0;
     const { createWorkflow, createStep, runtime } = init(
       { storage: new InMemoryStore() },
-      onLeg
-        ? {
-            requestContextForRun: (workflowId, _runId, leg) => {
-              onLeg(workflowId, leg);
-              return undefined;
-            },
-          }
-        : undefined,
+      {
+        startIdempotency: 'none',
+        executionFence: 'none',
+        ...(onLeg
+          ? {
+              requestContextForRun: (
+                workflowId: string,
+                _runId: string,
+                leg: RunLeg,
+              ) => {
+                onLeg(workflowId, leg);
+                return undefined;
+              },
+            }
+          : {}),
+      },
     );
     const gateA = createStep({
       id: 'gate',
@@ -2814,9 +2886,10 @@ describe('RunnerRuntime resumeCount snapshot provenance (shared runId across wor
   // suspended at any depth and status() keeps projecting its accumulating
   // ordinal — the deep-chain (3+ suspension) case the pair-binding relies on.
   function buildSharedDeepChain(): RunnerRuntime {
-    const { createWorkflow, createStep, runtime } = init({
-      storage: new InMemoryStore(),
-    });
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     for (const id of ['wfA', 'wfB']) {
       const gate = createStep({
         id: 'gate',
@@ -2878,6 +2951,8 @@ describe('RunnerRuntime snapshot provenance durability', () => {
     const { createWorkflow, createStep, runtime } = init(
       { storage },
       {
+        startIdempotency: 'none',
+        executionFence: 'none',
         requestContextForRun: (_workflowId, _runId, leg) => {
           onLeg?.(leg);
           return providedContext;
@@ -2908,7 +2983,11 @@ describe('RunnerRuntime snapshot provenance durability', () => {
   ): RunnerRuntime {
     const { createWorkflow, createStep, runtime } = init(
       { storage },
-      { requestContextForRun },
+      {
+        startIdempotency: 'none',
+        requestContextForRun,
+        executionFence: 'none',
+      },
     );
     const gate = createStep({
       id: 'gate',
@@ -3210,7 +3289,10 @@ describe('per-suspension deadline contract', () => {
     start: () => Promise<RunSummary>;
   } {
     const storage = new InMemoryStore();
-    const { createWorkflow, createStep, runtime } = init({ storage });
+    const { createWorkflow, createStep, runtime } = init(
+      { storage },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     // Built as a value so the reserved key survives a suspendSchema that does
     // not declare it — which is exactly what the stripping test measures.
     const suspendPayload: Record<string, unknown> = {
@@ -3405,9 +3487,10 @@ describe('per-suspension deadline contract', () => {
     // payload and the fence by the TOP-LEVEL step, so there is no fence for
     // the step that actually suspended. v1 refuses it, loudly, rather than
     // leaving an author to believe a deadline was accepted.
-    const { createWorkflow, createStep, runtime } = init({
-      storage: new InMemoryStore(),
-    });
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     const approval = createStep({
       id: 'approval',
       inputSchema: z.object({}),
@@ -3488,9 +3571,10 @@ describe('per-suspension deadline contract', () => {
     // differently for a dotted id — ['a.b'] live, ['a','b'] rehydrated — and
     // an entry derived from one that the other cannot recognize is a deadline
     // that arms and then silently disappears.
-    const { createWorkflow, createStep, runtime } = init({
-      storage: new InMemoryStore(),
-    });
+    const { createWorkflow, createStep, runtime } = init(
+      { storage: new InMemoryStore() },
+      { startIdempotency: 'none', executionFence: 'none' },
+    );
     const gate = createStep({
       id: stepId,
       inputSchema: z.object({}),

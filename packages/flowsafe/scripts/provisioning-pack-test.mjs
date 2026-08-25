@@ -70,17 +70,33 @@ if (typeof sql !== 'string') {
 const statePath = process.env.FAKE_WRANGLER_STATE;
 const state = existsSync(statePath)
   ? JSON.parse(readFileSync(statePath, 'utf8'))
-  : { created: false, tag: undefined };
+  : { created: false, tag: undefined, fence: false, fenceState: undefined };
+const FENCE = 'flowsafe_execution_fence';
 const schema = \`CREATE TABLE flowsafe_deployment (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   tenant_tag TEXT NOT NULL,
   provisioned_at TEXT NOT NULL
 )\`;
 let results;
+// Fence statements are matched by their TARGET table and BEFORE the generic
+// arms: the ownership insert names the fence table inside its exclusion list,
+// so a substring test would route it to the wrong branch.
 if (sql.startsWith('SELECT name, sql')) {
-  results = state.created
-    ? [{ name: 'flowsafe_deployment', sql: schema }]
-    : [];
+  results = [
+    ...(state.created ? [{ name: 'flowsafe_deployment', sql: schema }] : []),
+    ...(state.fence ? [{ name: FENCE, sql: 'CREATE' }] : []),
+  ];
+} else if (sql.startsWith('CREATE TABLE IF NOT EXISTS ' + FENCE)) {
+  state.fence = true;
+  results = [];
+} else if (sql.startsWith('INSERT OR IGNORE INTO ' + FENCE)) {
+  if (!state.fence) {
+    process.stderr.write('fence row seeded before its table\\n');
+    process.exit(5);
+  }
+  state.fenceState =
+    state.fenceState ?? sql.match(/'deployment', '([^']+)'/)?.[1];
+  results = [];
 } else if (sql.startsWith('CREATE TABLE')) {
   state.created = true;
   results = [];
@@ -215,10 +231,28 @@ writeFileSync(new URL('./install-script-ran', import.meta.url), 'unexpected');
     `import assert from 'node:assert/strict';
 import {
   DEPLOYMENT_IDENTITY_HEADER,
+  EXECUTION_FENCE_DDL,
+  EXECUTION_FENCE_ROW_ID,
+  EXECUTION_FENCE_STATES,
+  EXECUTION_FENCE_TABLE,
+  INITIAL_EXECUTION_FENCE_STATES,
   deploymentIdentityHeaders,
 } from '@proofoftech/flowsafe/deployment-identity-protocol';
 
 const secret = 'x'.repeat(32);
+assert.equal(typeof EXECUTION_FENCE_DDL, 'string');
+assert.equal(EXECUTION_FENCE_ROW_ID, 'deployment');
+assert.deepEqual(EXECUTION_FENCE_STATES, [
+  'open',
+  'draining',
+  'migration-locked',
+  'proof-only',
+]);
+assert.equal(EXECUTION_FENCE_TABLE, 'flowsafe_execution_fence');
+assert.deepEqual(INITIAL_EXECUTION_FENCE_STATES, [
+  'open',
+  'migration-locked',
+]);
 assert.deepEqual(
   deploymentIdentityHeaders(secret, {
     'content-type': 'application/json',
@@ -236,6 +270,7 @@ assert.deepEqual(
     `import {
   DEPLOYMENT_IDENTITY_HEADER,
   deploymentIdentityHeaders,
+  type InitialExecutionFenceState,
 } from '@proofoftech/flowsafe/deployment-identity-protocol';
 import {
   DEPLOYMENT_IDENTITY_HEADER as LEGACY_DEPLOYMENT_IDENTITY_HEADER,
@@ -248,9 +283,11 @@ const legacyHeaders: Record<string, string> =
   legacyDeploymentIdentityHeaders(secret);
 const header: typeof DEPLOYMENT_IDENTITY_HEADER =
   LEGACY_DEPLOYMENT_IDENTITY_HEADER;
+const initialFenceState: InitialExecutionFenceState = 'open';
 void headers;
 void legacyHeaders;
 void header;
+void initialFenceState;
 `,
   );
   writeFileSync(
@@ -322,6 +359,19 @@ void header;
       'packed package is missing the deployment identity protocol implementation or declaration',
     );
   }
+  // The fence schema ships in the SAME root module the runtime store imports
+  // it from; if it were missing here, the packed store would fail to resolve
+  // its own DDL rather than silently create a different table.
+  if (
+    !protocolSource.includes('EXECUTION_FENCE_DDL') ||
+    !protocolSource.includes('assertInitialExecutionFenceState') ||
+    !protocolDeclaration.includes('InitialExecutionFenceState') ||
+    !protocolDeclaration.includes('EXECUTION_FENCE_DDL')
+  ) {
+    throw new Error(
+      'packed deployment identity protocol is missing the execution fence seeding contract',
+    );
+  }
   const runtimeIdentity = await import(
     pathToFileURL(
       join(packageRoot, 'dist', 'do-runner', 'deployment-identity.js'),
@@ -390,11 +440,48 @@ void header;
   const statePath = join(consumerRoot, 'wrangler-state.json');
   const logPath = join(consumerRoot, 'wrangler-invocations.ndjson');
   writeFileSync(logPath, '');
+  // The fence state has NO default, so an otherwise-complete invocation that
+  // omits it must fail rather than quietly provision an executing deployment.
+  const withoutFenceState = invokeProvision(consumerRoot, [
+    '--database',
+    'consumer-db',
+    '--tag',
+    'acme',
+    '--local',
+  ]);
+  if (
+    withoutFenceState.status !== 1 ||
+    !withoutFenceState.stderr.includes('--initial-fence-state')
+  ) {
+    throw new Error(
+      `packed provisioning CLI accepted a missing --initial-fence-state (status=${withoutFenceState.status})\n${withoutFenceState.stdout}\n${withoutFenceState.stderr}`,
+    );
+  }
+  const badFenceState = invokeProvision(consumerRoot, [
+    '--database',
+    'consumer-db',
+    '--tag',
+    'acme',
+    '--initial-fence-state',
+    'draining',
+    '--local',
+  ]);
+  if (
+    badFenceState.status !== 1 ||
+    !badFenceState.stderr.includes('must be one of open, migration-locked')
+  ) {
+    throw new Error(
+      `packed provisioning CLI accepted a non-birth fence state (status=${badFenceState.status})\n${badFenceState.stdout}\n${badFenceState.stderr}`,
+    );
+  }
+
   const validArgs = [
     '--database',
     'consumer-db',
     '--tag',
     'acme',
+    '--initial-fence-state',
+    'migration-locked',
     '--local',
     '--config',
     'wrangler.jsonc',
@@ -408,7 +495,7 @@ void header;
   if (
     valid.status !== 0 ||
     valid.stdout !==
-      "Deployment identity 'acme' verified in consumer-db (local).\n" ||
+      "Deployment identity 'acme' verified in consumer-db (local), initial execution fence state 'migration-locked'.\n" ||
     valid.stderr !== ''
   ) {
     throw new Error(
@@ -423,6 +510,36 @@ void header;
   if (invocations.length < 8) {
     throw new Error(
       `expected full provisioning query sequence, got ${invocations.length}`,
+    );
+  }
+  // The SQL follows `--command`; `--config`/`--persist-to` come after it, so
+  // the last argument is not the statement.
+  const executedSql = invocations.map(
+    (invocation) => invocation.args[invocation.args.indexOf('--command') + 1],
+  );
+  const fenceDdlAt = executedSql.findIndex((sql) =>
+    sql.startsWith('CREATE TABLE IF NOT EXISTS flowsafe_execution_fence'),
+  );
+  const fenceRowAt = executedSql.findIndex((sql) =>
+    sql.startsWith('INSERT OR IGNORE INTO flowsafe_execution_fence'),
+  );
+  const ownershipAt = executedSql.findIndex((sql) =>
+    sql.startsWith('INSERT OR IGNORE INTO flowsafe_deployment'),
+  );
+  if (
+    fenceDdlAt === -1 ||
+    fenceRowAt !== fenceDdlAt + 1 ||
+    ownershipAt === -1 ||
+    ownershipAt > fenceDdlAt
+  ) {
+    throw new Error(
+      `packed provisioning CLI did not seed the fence after proving ownership: ${JSON.stringify(executedSql)}`,
+    );
+  }
+  const seededState = JSON.parse(readFileSync(statePath, 'utf8')).fenceState;
+  if (seededState !== 'migration-locked') {
+    throw new Error(
+      `packed provisioning CLI seeded fence state '${seededState}', expected 'migration-locked'`,
     );
   }
   for (const invocation of invocations) {
@@ -456,6 +573,8 @@ void header;
     'consumer-db',
     '--tag',
     'acme',
+    '--initial-fence-state',
+    'open',
     '--preview',
     '--config',
     'wrangler.jsonc',
@@ -467,7 +586,7 @@ void header;
   if (
     preview.status !== 0 ||
     preview.stdout !==
-      "Deployment identity 'acme' verified in consumer-db (preview).\n" ||
+      "Deployment identity 'acme' verified in consumer-db (preview), initial execution fence state 'open'.\n" ||
     preview.stderr !== ''
   ) {
     throw new Error(

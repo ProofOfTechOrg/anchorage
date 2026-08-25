@@ -14,6 +14,7 @@ import {
 
 import type { D1DatabaseBinding } from './cf-types.js';
 import { isPathSafeId } from './path-safe-id.js';
+import { START_IDEMPOTENCY_TABLE } from './start-idempotency.js';
 import { validateTablePrefix } from './table-prefix.js';
 
 export interface D1StorageOptions {
@@ -61,10 +62,19 @@ export function createD1Storage(
   });
 }
 
-// Mastra workflow terminals plus FlowSafe's lifecycle-owned terminals.
-// Deleting a live run (running/suspended/waiting/pending/paused) would kill a
-// pending approval, so only these are ever purged.
-const TERMINAL_STATUSES = [
+/**
+ * Mastra workflow terminals plus FlowSafe's lifecycle-owned terminals.
+ * Deleting a live run (running/suspended/waiting/pending/paused) would kill a
+ * pending approval, so only these are ever purged.
+ *
+ * Exported because retention and the drain inventory must agree on the word
+ * "terminal" to the letter. The purge deletes what this set matches; the
+ * inventory counts what it does NOT, and a run that is terminal to one and live
+ * to the other is either a row the purge reaps while the inventory still calls
+ * it work, or — worse — a run the inventory declares finished while it is still
+ * executing, which is exactly the reading a migration would act on.
+ */
+export const RUN_TERMINAL_STATUSES = [
   'success',
   'failed',
   'tripwire',
@@ -74,6 +84,31 @@ const TERMINAL_STATUSES = [
   'cancelled',
   'timed_out',
 ] as const;
+
+/**
+ * The SQL that decides one snapshot row is TERMINAL, with `?` for each entry of
+ * RUN_TERMINAL_STATUSES in order.
+ *
+ * A shared FRAGMENT rather than a shared list because the rule is not "the
+ * status is in the set": a run that reached 'cancelled' or 'timed_out' is
+ * terminal only once its lifecycle cleanup stamped `cleanupCompletedAt`, and
+ * before that it is still executing compensation. Two hand-written copies of
+ * that carve-out are two chances for one of them to answer "finished" for a run
+ * that is mid-cleanup — the retention purge would delete a live run's snapshot,
+ * and the drain inventory would report a deployment empty while it still runs
+ * work. The caller supplies the `json_valid` guard, because it decides which
+ * way an unclassifiable row should fail.
+ */
+export const RUN_TERMINAL_SNAPSHOT_SQL = `json_extract(snapshot, '$.status') IN (${RUN_TERMINAL_STATUSES.map(
+  () => '?',
+).join(', ')})
+             AND (
+               json_extract(snapshot, '$.status') NOT IN ('cancelled', 'timed_out')
+               OR json_extract(
+                 snapshot,
+                 '$.requestContext."flowsafe.runLifecycle".terminal.cleanupCompletedAt'
+               ) IS NOT NULL
+             )`;
 
 const DEADLINE_LIVE_STATUSES = [
   'running',
@@ -311,6 +346,37 @@ export interface PurgeExpiredRunsOptions {
    */
   resourceOwnerTable?: string;
   /**
+   * The start-reservation table (`flowsafe_start_idempotency`). When supplied,
+   * this purge is also what keeps idempotency keys finite.
+   *
+   * Wired the same way `resourceOwnerTable` is — by name, from the composed
+   * Flowsafe Worker — for the same reason: this module owns the SQL of run
+   * retention, and a reservation must be reaped in the same transaction that
+   * removes the run it points at, never by a second sweep that could interleave
+   * with it.
+   */
+  startIdempotencyTable?: string;
+  /**
+   * How long a spent idempotency key stays answerable after its run settled —
+   * the KEY-VALIDITY HORIZON, and the only tuning decision this feature has.
+   *
+   * Until it elapses, a retry of a completed run is told ALREADY_SETTLED. After
+   * it, the reservation is gone and the same key reads as brand new, so a retry
+   * would START A SECOND RUN. That is the whole reason this exists as its own
+   * knob rather than riding `ttlMs`: a host whose callers retry for longer than
+   * its run retention (an overnight batch re-run, a queue with a multi-day
+   * redrive) needs keys to outlive summaries, and a host whose keys are minted
+   * per HTTP request does not.
+   *
+   * DEFAULTS TO `ttlMs`, and is floored at it: a reservation shorter-lived than
+   * the snapshot it guards would be deleted while its run is still readable,
+   * and the very next retry would mint a fresh run alongside the live one — the
+   * exact double-execution this feature exists to prevent. A caller asking for
+   * less gets `ttlMs`, silently, because there is no configuration in which the
+   * smaller number is what anybody meant.
+   */
+  startIdempotencyTtlMs?: number;
+  /**
    * Runs processed per call. Artifact-paired path: default 100 — the purge duty's
    * subrequest-budget guard, same batching as any batched reaper. Each
    * run costs ~2+N subrequests (R2 list, per-artifact deletes, its row's
@@ -327,14 +393,51 @@ export interface PurgeExpiredRunsOptions {
 }
 
 /**
- * The tables `purgeExpiredWorkflowRuns` deletes from under the run TTL — the
- * production anchor the schema guard cross-checks every `run-ttl` retention
- * declaration against. The guard reads THIS, not a literal copied into the
- * test, so a purge that changes what it targets and a guard that still
+ * The MASTRA-OWNED tables `purgeExpiredWorkflowRuns` deletes from under the run
+ * TTL — the production anchor the schema guard cross-checks every `run-ttl`
+ * retention declaration against. The guard reads THIS, not a literal copied
+ * into the test, so a purge that changes what it targets and a guard that still
  * blesses the old set cannot drift apart silently.
+ *
+ * Mastra-owned specifically: the purge ALSO deletes from flowsafe's own
+ * registries when a caller wires them, and those live in
+ * RUN_TTL_FLOWSAFE_PURGE_TABLES below rather than here — see its note for why
+ * the two sets are not one.
  */
 export const RUN_TTL_PURGE_TABLES: readonly string[] = [
   'mastra_workflow_snapshot',
+];
+
+/**
+ * The resource-ownership registry's table, named here rather than imported from
+ * the store that creates it (approval-api/resource-ownership.ts).
+ *
+ * The layering forbids the import: do-runner may reach approval-api only
+ * through its declared leaves, and the ownership store is not one — it is built
+ * ON do-runner. So this file has always carried the name as a literal inside
+ * RUN_TTL_FLOWSAFE_PURGE_TABLES; giving it a name adds no second home, it names
+ * the one that was already here, and lets the drain inventory read the registry
+ * without a third copy. The census test crosses it against
+ * RESOURCE_OWNERSHIP_TABLE, which is the only place the two can be compared.
+ */
+export const RESOURCE_OWNER_TABLE = 'flowsafe_resource_owners';
+
+/**
+ * The FLOWSAFE-owned tables this purge also deletes from when the caller wires
+ * them, and the reason they are not in the list above.
+ *
+ * `RUN_TTL_PURGE_TABLES` is cross-checked against the `mastra_%` inventory in
+ * mastra-schema-guard.test.ts — its job is to catch a @mastra/core bump that
+ * changes what run retention targets. These two are ours, they are optional
+ * (a lower-level caller without the registries omits both), and they are
+ * deleted on a DIFFERENT predicate: `flowsafe_resource_owners` when its run's
+ * last snapshot is gone, `flowsafe_start_idempotency` when its reservation is
+ * settled AND past the key-validity horizon. Folding them into the Mastra
+ * anchor would make that guard assert an equality it cannot mean.
+ */
+export const RUN_TTL_FLOWSAFE_PURGE_TABLES: readonly string[] = [
+  RESOURCE_OWNER_TABLE,
+  START_IDEMPOTENCY_TABLE,
 ];
 
 /**
@@ -342,7 +445,9 @@ export const RUN_TTL_PURGE_TABLES: readonly string[] = [
  * canceled/bailed/skipped and cleanup-complete cancelled/timed_out) whose
  * updatedAt is older than the TTL from
  * mastra_workflow_snapshot — and, when `artifactStore` is wired, each purged
- * run's R2 artifacts with its row. Live runs (running/suspended/waiting/
+ * run's R2 artifacts with its row, plus (when their tables are wired) the run's
+ * ownership row and its spent start reservation, each in the SAME transaction
+ * as the snapshot delete. Live runs (running/suspended/waiting/
  * pending/paused) are never touched — expiring a suspended run would kill a
  * pending approval. A missing snapshot table reads as zero purgeable runs
  * (Mastra creates it lazily with the first persisted run). TTL enforcement
@@ -359,7 +464,6 @@ export async function purgeExpiredWorkflowRuns(
   // (persistWorkflowSnapshot serializes via toISOString), so lexicographic
   // < against an ISO cutoff is a correct timestamp comparison.
   const cutoff = new Date(now() - options.ttlMs).toISOString();
-  const placeholders = TERMINAL_STATUSES.map(() => '?').join(', ');
   // json_extract throws on malformed JSON and would abort the WHOLE delete —
   // one corrupt row must not stop every valid terminal row from being
   // reclaimed. The CASE guard (not `AND json_valid(...)`) is load-bearing:
@@ -370,14 +474,7 @@ export async function purgeExpiredWorkflowRuns(
   const eligible = `updatedAt < ?
          AND CASE WHEN json_valid(snapshot) THEN
            (
-             json_extract(snapshot, '$.status') IN (${placeholders})
-             AND (
-               json_extract(snapshot, '$.status') NOT IN ('cancelled', 'timed_out')
-               OR json_extract(
-                 snapshot,
-                 '$.requestContext."flowsafe.runLifecycle".terminal.cleanupCompletedAt'
-               ) IS NOT NULL
-             )
+             ${RUN_TERMINAL_SNAPSHOT_SQL}
            )
          ELSE 0 END`;
   const resourceOwnerTable = options.resourceOwnerTable;
@@ -387,12 +484,173 @@ export async function purgeExpiredWorkflowRuns(
   ) {
     throw new Error('resourceOwnerTable must be a safe SQL identifier');
   }
-  const batch = resourceOwnerTable ? db.batch?.bind(db) : undefined;
-  if (resourceOwnerTable && !batch) {
+  const startIdempotencyTable = options.startIdempotencyTable;
+  if (
+    startIdempotencyTable !== undefined &&
+    !/^[A-Za-z_][A-Za-z0-9_]*$/.test(startIdempotencyTable)
+  ) {
+    throw new Error('startIdempotencyTable must be a safe SQL identifier');
+  }
+  // Floored at the run TTL, never below it — see startIdempotencyTtlMs. A
+  // reservation deleted while its run is still readable would let the next
+  // retry of that key start a SECOND run beside the live one.
+  const reservationCutoff =
+    now() -
+    Math.max(options.startIdempotencyTtlMs ?? options.ttlMs, options.ttlMs);
+  const batch =
+    resourceOwnerTable || startIdempotencyTable
+      ? db.batch?.bind(db)
+      : undefined;
+  if ((resourceOwnerTable || startIdempotencyTable) && !batch) {
     throw new Error(
       'purgeExpiredWorkflowRuns requires database.batch() for atomic owner cleanup',
     );
   }
+  /**
+   * The two reservation statements that ride a snapshot delete, in order.
+   *
+   * They run INSIDE the same `batch()` as the snapshot's own DELETE and AFTER
+   * it, which is what makes the pairing atomic: by the time these execute, the
+   * runs named here have no snapshot in this transaction, so neither statement
+   * can act on a reservation whose run is still readable.
+   *
+   *  1. DELETE the reservations already past the horizon. This is the pairing
+   *     the design asks for: a spent key and the run it named leave together.
+   *  2. MARK the rest terminal. A reservation still inside its horizon must
+   *     survive — that is what makes a late retry ALREADY_SETTLED rather than a
+   *     fresh start — but its run is gone, so it is settled by definition. This
+   *     also HEALS the reconcile a crash between a run's terminal persist and
+   *     `settleRun` would have lost, and re-stamps `updated_at` so the horizon
+   *     is measured from a point at which the reservation is definitely spent.
+   *
+   *     `state <> 'terminal'` also settles `reserved` rows, not just `started`
+   *     ones. The ordinary lifecycle should not produce one here — a run only
+   *     persists a snapshot after its claim, so a row this statement can see is
+   *     normally `started` — and the point is that this statement does not
+   *     depend on that. It is selected by RUN, and every run it names has just
+   *     lost its snapshot in this same transaction, so whatever left the row
+   *     un-claimed (a released claim, a hand-edited row, a caller yet to be
+   *     written), the run it names is gone and the key cannot be worth starting
+   *     again. Settling too eagerly costs a retry a refusal it can resolve with
+   *     a fresh key; leaving a row readable as `reserved` after its run is
+   *     unreadable costs a second run of work that already completed.
+   */
+  /**
+   * Whether the reservation table has been seen to exist this pass.
+   *
+   * It is created lazily by the first `reserve()`, so a deployment on which no
+   * idempotency key has ever been used has none — and a batch naming a missing
+   * table fails as ONE TRANSACTION, taking the snapshot delete down with it.
+   * That would turn "this host wired reservations and nobody has used one yet"
+   * into "run retention is silently unenforced", so the first such failure
+   * retries the batch WITHOUT the reservation statements and the pass carries
+   * on with the pairing disabled. Nothing is lost: a table that does not exist
+   * holds no reservation to reap.
+   */
+  let reservationsUnavailable = false;
+  const reservationStatements = (
+    runIds: readonly string[],
+  ): SnapshotStatement[] => {
+    if (
+      !startIdempotencyTable ||
+      reservationsUnavailable ||
+      runIds.length === 0
+    ) {
+      return [];
+    }
+    const placeholders = runIds.map(() => '?').join(', ');
+    return [
+      db
+        .prepare(
+          `DELETE FROM ${startIdempotencyTable}
+           WHERE run_id IN (${placeholders})
+             AND state = 'terminal' AND updated_at < ?`,
+        )
+        .bind(...runIds, reservationCutoff),
+      db
+        .prepare(
+          `UPDATE ${startIdempotencyTable}
+             SET state = 'terminal', updated_at = ?
+           WHERE run_id IN (${placeholders}) AND state <> 'terminal'`,
+        )
+        .bind(now(), ...runIds),
+    ];
+  };
+  /**
+   * Reap the reservations that OUTLIVED their snapshot.
+   *
+   * The paired statements above only ever see runs whose snapshot is expiring
+   * in THIS pass, and a reservation is meant to survive that moment — the whole
+   * point of a horizon longer than run retention is that a late retry still
+   * finds ALREADY_SETTLED after the summary is gone. Which means the pairing
+   * alone can never delete those rows: by the time they are old enough, their
+   * snapshot has been gone for passes and nothing re-visits them. This sweep is
+   * what keeps the table finite, and without it the reservation table would be
+   * the one piece of this deployment's state that only ever grows.
+   *
+   * `NOT EXISTS (snapshot)` is not an optimization — it is the safety predicate
+   * that makes this sweep structurally unable to delete a reservation whose run
+   * is still readable, whatever a caller configured the horizon to be. The
+   * LIMIT rides a rowid subselect for the same reason every other purge here
+   * does: plain `DELETE ... LIMIT` needs a SQLite compile-time option D1 does
+   * not guarantee.
+   */
+  /**
+   * Run a snapshot-delete batch, retrying once without the reservation
+   * statements if the reservation table turns out not to exist yet.
+   *
+   * `build(withReservations)` rather than a prepared array, because D1
+   * statements are single-use once run: a retry has to re-prepare.
+   */
+  const runPurgeBatch = async (
+    build: (withReservations: boolean) => SnapshotStatement[],
+  ): Promise<unknown[]> => {
+    if (!batch) throw new Error('purgeExpiredWorkflowRuns: batch unavailable');
+    try {
+      return await batch(build(true));
+    } catch (error) {
+      if (
+        startIdempotencyTable === undefined ||
+        reservationsUnavailable ||
+        !isMissingTable(error, startIdempotencyTable)
+      ) {
+        throw error;
+      }
+      reservationsUnavailable = true;
+      return batch(build(false));
+    }
+  };
+  const sweepOrphanedStartReservations = async (): Promise<void> => {
+    if (!startIdempotencyTable || reservationsUnavailable) return;
+    try {
+      await db
+        .prepare(
+          `DELETE FROM ${startIdempotencyTable}
+           WHERE rowid IN (
+             SELECT r.rowid FROM ${startIdempotencyTable} AS r
+             WHERE r.state = 'terminal' AND r.updated_at < ?
+               AND NOT EXISTS (
+                 SELECT 1 FROM ${prefix}mastra_workflow_snapshot AS s
+                 WHERE s.run_id = r.run_id
+               )
+             LIMIT ?
+           )`,
+        )
+        .bind(reservationCutoff, options.limit ?? 1000)
+        .run();
+    } catch (error) {
+      // Either table may legitimately not exist yet: the reservation table is
+      // created by the first reserve() and the snapshot table by the first run.
+      // Neither absence is a fault, and neither leaves anything to reap.
+      if (
+        isMissingTable(error, startIdempotencyTable) ||
+        isMissingTable(error, `${prefix}mastra_workflow_snapshot`)
+      ) {
+        return;
+      }
+      throw error;
+    }
+  };
 
   if (options.artifactStore) {
     // Artifact-paired path, run by run: artifacts BEFORE the row, because
@@ -411,7 +669,7 @@ export async function purgeExpiredWorkflowRuns(
            WHERE ${eligible}
            LIMIT ?`,
         )
-        .bind(cutoff, ...TERMINAL_STATUSES, options.limit ?? 100)
+        .bind(cutoff, ...RUN_TERMINAL_STATUSES, options.limit ?? 100)
         .all<{ workflow_name: string; run_id: string }>());
     } catch (error) {
       if (!isMissingTable(error, `${prefix}mastra_workflow_snapshot`))
@@ -439,31 +697,48 @@ export async function purgeExpiredWorkflowRuns(
       }
       // Re-checking eligibility keys the delete to the row the SELECT saw;
       // terminal is absorbing, so this is belt-and-braces, not a race fix.
-      const deleteSnapshot = db
-        .prepare(
-          `DELETE FROM ${prefix}mastra_workflow_snapshot
-           WHERE workflow_name = ? AND run_id = ? AND ${eligible}`,
-        )
-        .bind(row.workflow_name, row.run_id, cutoff, ...TERMINAL_STATUSES);
-      if (resourceOwnerTable && batch) {
-        const [result] = await batch([
-          deleteSnapshot,
-          db
-            .prepare(
-              `DELETE FROM ${resourceOwnerTable}
+      //
+      // A FACTORY, not one prepared statement: D1 statements are single-use
+      // once run, and `runPurgeBatch` re-prepares its whole batch when the
+      // reservation table turns out not to exist. Written once so the batch and
+      // non-batch paths cannot drift onto different delete predicates.
+      const deleteSnapshot = (): SnapshotStatement =>
+        db
+          .prepare(
+            `DELETE FROM ${prefix}mastra_workflow_snapshot
+             WHERE workflow_name = ? AND run_id = ? AND ${eligible}`,
+          )
+          .bind(
+            row.workflow_name,
+            row.run_id,
+            cutoff,
+            ...RUN_TERMINAL_STATUSES,
+          );
+      if (batch) {
+        const [result] = await runPurgeBatch((withReservations) => [
+          deleteSnapshot(),
+          ...(resourceOwnerTable
+            ? [
+                db
+                  .prepare(
+                    `DELETE FROM ${resourceOwnerTable}
                WHERE resource_kind = 'run' AND resource_id = ?
                  AND NOT EXISTS (
                    SELECT 1 FROM ${prefix}mastra_workflow_snapshot
                    WHERE run_id = ?
                  )`,
-            )
-            .bind(row.run_id, row.run_id),
+                  )
+                  .bind(row.run_id, row.run_id),
+              ]
+            : []),
+          ...(withReservations ? reservationStatements([row.run_id]) : []),
         ]);
         deleted += d1Changes(result);
       } else {
-        deleted += d1Changes(await deleteSnapshot.run());
+        deleted += d1Changes(await deleteSnapshot().run());
       }
     }
+    await sweepOrphanedStartReservations();
     if (failures.length > 0) {
       throw new Error(
         `purgeExpiredWorkflowRuns: artifact deletion failed for ${failures.length} of ${rows.length} eligible run(s), the rest were purged (${failures
@@ -481,8 +756,9 @@ export async function purgeExpiredWorkflowRuns(
   // limits and then fail the same way on EVERY firing — retention silently
   // unenforced, the exact wedge the one-duty-per-alarm split exists to avoid. The
   // shrinking eligible set is the cursor: a backlog drains across firings.
+  let deleted: number;
   try {
-    if (resourceOwnerTable && batch) {
+    if (batch) {
       // D1 accepts at most 100 bound parameters per statement. Keep the exact
       // rowid + owner-id transaction below under that limit even when a caller
       // requests a larger generic purge batch.
@@ -494,51 +770,64 @@ export async function purgeExpiredWorkflowRuns(
            WHERE ${eligible}
            LIMIT ?`,
         )
-        .bind(cutoff, ...TERMINAL_STATUSES, limit)
+        .bind(cutoff, ...RUN_TERMINAL_STATUSES, limit)
         .all<{ rowid: number; run_id: string }>();
-      if (selected.results.length === 0) return 0;
+      if (selected.results.length === 0) {
+        // No eligible run this pass, but reservations left behind by EARLIER
+        // passes still age out — so the orphan sweep runs before the return.
+        await sweepOrphanedStartReservations();
+        return 0;
+      }
       const rowIds = selected.results.map((row) => row.rowid);
       const runIds = [...new Set(selected.results.map((row) => row.run_id))];
       const rowPlaceholders = rowIds.map(() => '?').join(', ');
       const runPlaceholders = runIds.map(() => '?').join(', ');
-      const [result] = await batch([
+      const [result] = await runPurgeBatch((withReservations) => [
         db
           .prepare(
             `DELETE FROM ${prefix}mastra_workflow_snapshot
              WHERE rowid IN (${rowPlaceholders}) AND ${eligible}`,
           )
-          .bind(...rowIds, cutoff, ...TERMINAL_STATUSES),
-        db
-          .prepare(
-            `DELETE FROM ${resourceOwnerTable}
+          .bind(...rowIds, cutoff, ...RUN_TERMINAL_STATUSES),
+        ...(resourceOwnerTable
+          ? [
+              db
+                .prepare(
+                  `DELETE FROM ${resourceOwnerTable}
              WHERE resource_kind = 'run'
                AND resource_id IN (${runPlaceholders})
                AND resource_id NOT IN (
                  SELECT run_id FROM ${prefix}mastra_workflow_snapshot
                )`,
-          )
-          .bind(...runIds),
+                )
+                .bind(...runIds),
+            ]
+          : []),
+        ...(withReservations ? reservationStatements(runIds) : []),
       ]);
-      return d1Changes(result);
-    }
-    return d1Changes(
-      await db
-        .prepare(
-          `DELETE FROM ${prefix}mastra_workflow_snapshot
+      deleted = d1Changes(result);
+    } else {
+      deleted = d1Changes(
+        await db
+          .prepare(
+            `DELETE FROM ${prefix}mastra_workflow_snapshot
            WHERE rowid IN (
              SELECT rowid FROM ${prefix}mastra_workflow_snapshot
              WHERE ${eligible}
              LIMIT ?
            )`,
-        )
-        .bind(cutoff, ...TERMINAL_STATUSES, options.limit ?? 1000)
-        .run(),
-    );
+          )
+          .bind(cutoff, ...RUN_TERMINAL_STATUSES, options.limit ?? 1000)
+          .run(),
+      );
+    }
   } catch (error) {
     if (!isMissingTable(error, `${prefix}mastra_workflow_snapshot`))
       throw error;
     return 0;
   }
+  await sweepOrphanedStartReservations();
+  return deleted;
 }
 
 export interface PurgeExpiredThreadsOptions {
@@ -776,6 +1065,21 @@ const BACKGROUND_TASK_FAILED_STATUSES = [
   'cancelled',
   'timed_out',
 ] as const;
+
+/**
+ * Every background-task status this purge is willing to reap — the two TTL
+ * windows' sets together, and therefore the package's definition of a SETTLED
+ * task.
+ *
+ * The drain inventory reads it as the complement it needs: a task whose status
+ * is not here is still work, whether it is queued, running, or suspended
+ * awaiting a webhook. Deriving both from one list is what stops "terminal"
+ * meaning one thing to retention and another to a migration's emptiness proof.
+ */
+export const BACKGROUND_TASK_TERMINAL_STATUSES: readonly string[] = [
+  'completed',
+  ...BACKGROUND_TASK_FAILED_STATUSES,
+];
 
 /**
  * Background-task TTL cleanup: deletes terminal task

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track B (M-003): the read-only HTTP surface over background tasks (DL-014).
+// The read-only HTTP surface over background tasks.
 // Core's `listTasks` / `getTask` / `stream` are not run-bound, so this router:
 //   - requires a path-safe `runId` or `threadId` filter on list and stream;
 //   - loads a task for `getTask` and 404s when missing;
@@ -7,7 +7,7 @@
 // Mutating the queue
 // (dispatch/cancel/resume) is NOT here: v1 keeps background dispatch server-side
 // (an agent's tool call), and a suspended non-gated task's resume, if ever
-// exposed, is a separate role-gated route that mints no capability (P8).
+// exposed, is a separate role-gated route that mints no capability.
 
 import type {
   BackgroundTaskManager,
@@ -17,9 +17,27 @@ import type {
 import { isPathSafeId } from '../do-runner/index.js';
 import { safeDecodeSegment } from '../host-kit/route-path.js';
 
+/**
+ * The three reads this router makes, as a type of their own.
+ *
+ * Narrower than `BackgroundTaskManager` on purpose. The manager also carries
+ * `enqueue`, `registerStaticExecutor`, `registerTaskContext`, `resume`, and
+ * `restart` — each of which puts a task body on the deployment without passing
+ * the execution fence — so a route handler holding one is a single property
+ * access away from the thing the fence exists to stop. Typing the option as the
+ * reads instead lets `BackgroundTaskHost` hand over its own fence-preserving
+ * forwarding surface, while a plain manager still satisfies it structurally for
+ * a host that has no fence to preserve.
+ */
+export interface BackgroundTaskReads {
+  getTask: BackgroundTaskManager['getTask'];
+  listTasks: BackgroundTaskManager['listTasks'];
+  stream: BackgroundTaskManager['stream'];
+}
+
 export interface BackgroundTaskRoutesOptions {
-  /** The manager to read through — WRAPPED, never exposed over the wire. */
-  manager: BackgroundTaskManager;
+  /** The read surface to serve — WRAPPED, never exposed over the wire. */
+  manager: BackgroundTaskReads;
   /** Host-owned authorization for the run/thread scope of every returned row. */
   authorize(scope: { runId?: string; threadId?: string }): Promise<boolean>;
   /** Route prefix. Default '/background-tasks'. */
@@ -136,7 +154,7 @@ export function createBackgroundTaskRoutes(
         return json({ error: 'not found' }, 404);
       }
       const result = await manager.listTasks(resolved.filter);
-      // Per-row parity with the stream guard (DL-014): re-check every returned
+      // Per-row parity with the stream guard: re-check every returned
       // row against the requested scope, so a future regression in core's
       // listTasks filter cannot leak a foreign or out-of-scope task. `total` is
       // recomputed from the surviving rows — never report a count that includes
@@ -161,7 +179,7 @@ export function createBackgroundTaskRoutes(
  * disconnect closes the upstream subscription.
  */
 function streamResponse(
-  manager: BackgroundTaskManager,
+  manager: BackgroundTaskReads,
   scoped: { filter: TaskFilter; scopeValue: string },
   abortSignal: AbortSignal,
 ): Response {
@@ -172,7 +190,7 @@ function streamResponse(
     new TransformStream<Record<string, unknown>, Uint8Array>({
       transform(chunk, controller) {
         // Same per-row scope guard the list route applies — one predicate so the
-        // two surfaces never drift (DL-014, defense-in-depth over core's filter).
+        // two surfaces never drift (defense-in-depth over core's filter).
         const payload =
           typeof chunk.payload === 'object' &&
           chunk.payload !== null &&

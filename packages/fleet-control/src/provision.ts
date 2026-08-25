@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { assertInitialExecutionFenceState } from '@proofoftech/flowsafe/deployment-identity-protocol';
+
+import {
+  type AttestConvergedActiveRouteOptions,
+  attestConvergedActiveRoute,
+  PENDING_ARTIFACT_VERSION,
+} from './active-route.js';
 import {
   applicationBindingTopology,
   applicationR2Bindings,
@@ -44,6 +51,7 @@ import type {
   FleetRecord,
   FleetStateLease,
   FleetStateStore,
+  InitialExecutionFenceState,
   MaintenanceHealth,
   ProvisioningBackend,
   ProvisioningPhase,
@@ -78,7 +86,8 @@ function activeExternalRelease(
 ): import('./types.js').ExternalReleaseSnapshot | undefined {
   return (
     record.activeRelease ??
-    (record.backend === 'plain-worker' && record.artifactVersion !== 'pending'
+    (record.backend === 'plain-worker' &&
+    record.artifactVersion !== PENDING_ARTIFACT_VERSION
       ? {
           physicalScriptName: record.scriptName,
           specDigest: record.desiredSpecDigest,
@@ -161,7 +170,7 @@ function recordAt(
     databaseId: database.id,
     databaseName: database.name,
     schemaVersion: options.schemaVersion ?? 0,
-    artifactVersion: options.artifactVersion ?? 'pending',
+    artifactVersion: options.artifactVersion ?? PENDING_ARTIFACT_VERSION,
     desiredSpecDigest: deploymentSpecDigest(spec),
     durableObjectBindings: options.durableObjectBindings ?? [],
     applicationResources,
@@ -301,7 +310,7 @@ export function assertExternalReleaseArtifactVersion(
   release: import('./types.js').ExternalReleaseSnapshot,
   context: string,
 ): void {
-  if (release.artifactVersion === 'pending') return;
+  if (release.artifactVersion === PENDING_ARTIFACT_VERSION) return;
   if (
     !live ||
     live.scriptName !== release.physicalScriptName ||
@@ -573,13 +582,50 @@ export interface ProvisionDeploymentOptions {
   readonly store: FleetStateStore;
   readonly spec: DeploymentSpec;
   readonly secrets: DeploymentSecrets;
+  /**
+   * The execution-fence state this deployment is born in. REQUIRED; no default.
+   *
+   * It lives on the OPTIONS and deliberately not on `DeploymentSpec`. The spec
+   * is the digested canonical description of a deployment
+   * (`deploymentSpecDigest`), and every stored record, drift audit, and
+   * migration decision compares against that digest — adding a field to it
+   * would change the digest of every deployment already in the fleet and
+   * present as fleet-wide drift, scheduling migrations for artifacts nobody
+   * touched.
+   *
+   * It is also provisioning-time-only by nature: after the first pass the fence
+   * is live operational state an operator moves through
+   * `POST /admin/execution-fence`, so `migrateFleet`, `rollbackExternalRelease`
+   * and `decommissionDeployment` neither take it nor need it — re-seeding is
+   * INSERT-if-absent and can only ever repair a missing row.
+   */
+  readonly initialExecutionFenceState: InitialExecutionFenceState;
   readonly finalizedStateProvider?: FinalizedOrdinaryStateProvider;
+  /**
+   * Tuning for the convergence wait the ready-commit attestation performs.
+   * The defaults suit every provider this package targets.
+   */
+  readonly routeAttestation?: AttestConvergedActiveRouteOptions;
   readonly clock?: () => number;
 }
 
-export function provisionDeployment(
+// `async` so the entry validation below REJECTS rather than throwing
+// synchronously: every caller and every test treats this as a promise-returning
+// function, and a synchronous throw would escape an unguarded `.catch()`.
+export async function provisionDeployment(
   options: ProvisionDeploymentOptions,
 ): Promise<ProvisioningResult> {
+  // Validated HERE, before the lease and before a single provider call. The
+  // protocol validates it too, but only when the seeding statements are built —
+  // which is after `database-created`, so a garbage value would have created a
+  // Worker and a D1 database first and then failed, leaving a half-provisioned
+  // deployment for an operator to reconcile over a typo. Nothing about this
+  // value depends on anything the lease reads, so the cheapest place to refuse
+  // it is the entry.
+  assertInitialExecutionFenceState(
+    options.initialExecutionFenceState,
+    'provisionDeployment',
+  );
   return options.store.withDeploymentLease(
     options.spec.tenantTag,
     options.spec.environment,
@@ -841,7 +887,9 @@ async function provisionDeploymentUnderLease(
 
     if (record.phase === 'database-created') {
       await lease.assertOwned();
-      await backend.seedDeploymentIdentity(database, spec.tenantTag, lease);
+      await backend.seedDeploymentIdentity(database, spec.tenantTag, lease, {
+        initialExecutionFenceState: options.initialExecutionFenceState,
+      });
       databaseOwnershipProven = true;
       record = {
         ...record,
@@ -1007,7 +1055,7 @@ async function provisionDeploymentUnderLease(
         secrets,
         record.platformResources,
         lease,
-        immutableExternal ? 'pending' : undefined,
+        immutableExternal ? PENDING_ARTIFACT_VERSION : undefined,
         record.applicationBindings,
       );
       workerCreated = deployed.created;
@@ -1086,7 +1134,8 @@ async function provisionDeploymentUnderLease(
           record.platformResources,
           lease,
           immutableExternal
-            ? (record.pendingRelease?.artifactVersion ?? 'pending')
+            ? (record.pendingRelease?.artifactVersion ??
+                PENDING_ARTIFACT_VERSION)
             : undefined,
           record.applicationBindings,
         );
@@ -1255,6 +1304,20 @@ async function provisionDeploymentUnderLease(
       if (!maintenance.armed) {
         throw new Error('maintenance is unarmed before ready commit');
       }
+      // The committed artifact version is the ROUTED one, not the one an
+      // inspection reported. Inspection deliberately pins the candidate it was
+      // asked about, so committing its answer would record a version this
+      // deployment merely uploaded as the version it serves.
+      const attestation = await attestConvergedActiveRoute(
+        backend,
+        spec,
+        {
+          specDigest: record.desiredSpecDigest,
+          artifactVersion:
+            record.pendingRelease?.artifactVersion ?? record.artifactVersion,
+        },
+        { clock, ...options.routeAttestation },
+      );
       const readyRecord = { ...record };
       if (readyRecord.pendingRelease) {
         readyRecord.activeRelease = readyRecord.pendingRelease;
@@ -1263,7 +1326,7 @@ async function provisionDeploymentUnderLease(
       record = {
         ...readyRecord,
         phase: 'ready',
-        artifactVersion: live.artifactVersion,
+        artifactVersion: attestation.artifactVersion,
         durableObjectTag: targetDurableObjectTag(spec),
         durableObjectBindings: live.durableObjectBindings,
         updatedAt: nowIso(clock),
@@ -1424,10 +1487,17 @@ async function cleanupDeploymentArtifactsUnderLease(
       );
     }
     await lease.assertOwned();
+    // A freshness PROOF, not a provisioning: this database is stamped only so
+    // the read-back below can show it was empty, and it is deleted three lines
+    // later. The fence state is therefore hard-coded rather than taken from the
+    // caller — cleanup has no provisioning options to take it from — and it is
+    // 'migration-locked' because a database that survives a failed delete must
+    // never come back as one that executes.
     await backend.seedDeploymentIdentity(
       reservedDatabase,
       record.tenantTag,
       lease,
+      { initialExecutionFenceState: 'migration-locked' },
     );
     const seededOwner = await backend.readDeploymentIdentity(
       reservedDatabase,

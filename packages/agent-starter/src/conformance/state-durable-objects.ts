@@ -10,6 +10,7 @@ import {
   type DurableObjectRunLifecycleHooks,
   DurableObjectRunner,
   doErrorResponse,
+  executionFenceFor,
   verifyDurableObjectDeploymentRequest,
 } from '@proofoftech/flowsafe/do-runner';
 import {
@@ -206,6 +207,11 @@ export class ConformanceState {
         deploymentTag: this.#env.DEPLOYMENT_TENANT,
         resumeRun: (record, decision) =>
           this.#topology().resumeRecord(record, decision),
+        // The package's per-binding memo, so this artifact gates the SAME
+        // database as the runs it decides on: `decide()` commits before it
+        // resumes, and a conformance state script on a locked deployment must
+        // refuse rather than record a decision with nothing behind it.
+        executionFence: executionFenceFor(this.#env.DB),
       },
     );
   }

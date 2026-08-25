@@ -8,6 +8,12 @@
 // (grants.ts) derives requestContext grants from approved records at
 // start/resume. Nothing here ever reads capability data from client input.
 
+import {
+  admitsExistingRun,
+  ExecutionFencedError,
+  type ExecutionFenceWiring,
+  readExecutionFence,
+} from '../do-runner/execution-fence.js';
 import { isPathSafeId } from '../do-runner/path-safe-id.js';
 import type {
   ApprovalActor,
@@ -168,6 +174,24 @@ export interface ApprovalServiceOptions {
    * audited with `detail.selfDecision: true`.
    */
   allowSelfDecision?: SelfDecisionPolicy;
+  /**
+   * The deployment execution fence, consulted before a DECISION commits, or
+   * `'none'` for a service with no database to fence against.
+   *
+   * DECIDE is gated wherever resume is, because decide() COMMITS and THEN
+   * resumes (see #resume): a lock that only stopped the resume would leave the
+   * approval durably decided on a deployment that can never act on it, and the
+   * deployment taking over would inherit a decision with no resume behind it.
+   * Reads, claims, and delegation stay open in every state — they move no run.
+   *
+   * REQUIRED, and `'none'` has to be WRITTEN. This service is the last leaf of
+   * the wiring to admit an omission, and it is the leaf where an omission costs
+   * the most: an unfenced service looks identical to a fenced one until the day
+   * an operator locks the deployment, and then it records decisions the
+   * deployment can never act on. Naming the opt-out turns that into a decision
+   * someone made rather than one they missed. See ExecutionFenceWiring.
+   */
+  executionFence: ExecutionFenceWiring;
   /** Injectable clock (tests, deterministic SLA math). */
   now?: () => Date;
 }
@@ -195,6 +219,7 @@ export class ApprovalService {
     decision: ApprovalDecision,
   ) => Promise<unknown>;
   readonly #allowSelfDecision?: SelfDecisionPolicy;
+  readonly #executionFence: ExecutionFenceWiring;
   readonly #now: () => Date;
 
   constructor(options: ApprovalServiceOptions) {
@@ -205,6 +230,7 @@ export class ApprovalService {
     this.#defaultSlaSeconds = options.defaultSlaSeconds;
     this.#resumeRun = options.resumeRun;
     this.#allowSelfDecision = options.allowSelfDecision;
+    this.#executionFence = options.executionFence;
     this.#now = options.now ?? (() => new Date());
   }
 
@@ -424,6 +450,35 @@ export class ApprovalService {
     return updated;
   }
 
+  /**
+   * The execution fence, for the one approval operation that moves a run.
+   *
+   * Placed BEFORE the CAS commit, not around the resume: decide() writes the
+   * decision and then resumes, so a check any later would leave the approval
+   * durably decided with nothing behind it.
+   *
+   * `proof-only` costs one extra read, because the proof is a specific RUN and
+   * an approval id says nothing about which run it gates until the record is
+   * loaded. That read happens only in proof-only — an operational state that
+   * lasts minutes — so the steady-state cost stays exactly one fence read.
+   *
+   * The wiring is resolved through `readExecutionFence` rather than by testing
+   * the field here: a written `'none'` and a store both arrive at this one
+   * definition of what "no fence" does, so the opt-out cannot be a ternary this
+   * gate gets subtly wrong.
+   */
+  async #assertDecidable(id: string): Promise<void> {
+    const reading = await readExecutionFence(this.#executionFence);
+    if (reading.state === 'open' || reading.state === 'draining') return;
+    const runId =
+      reading.state === 'proof-only'
+        ? (await this.#store.get(id))?.runId
+        : undefined;
+    if (!admitsExistingRun(reading, runId)) {
+      throw new ExecutionFencedError(reading.state, 'approval decision');
+    }
+  }
+
   async decide(
     id: string,
     input: { decision: ApprovalDecision; comment?: string },
@@ -436,6 +491,7 @@ export class ApprovalService {
       `approval:${id}`,
     );
     this.#assertDecisionInput(input);
+    await this.#assertDecidable(id);
     // Role-scoped SoD: an exempt decider (allowSelfDecision: true, or a role
     // named in { roles }) skips the pre-read entirely; everyone else keeps
     // today's read-then-CAS self-request denial.
@@ -822,8 +878,8 @@ export class ApprovalService {
 
   async metrics(actor: ApprovalActor): Promise<ApprovalMetrics> {
     this.#authorize(actor, APPROVAL_ROLES, 'approval.read', 'approval');
-    // D3: computation moved into the store contract (SQL aggregate on D1,
-    // JS reduction on in-memory) instead of loading every record here.
+    // Compute in the store contract (SQL aggregate on D1, JS reduction on
+    // in-memory) instead of loading every record here.
     return this.#store.metrics(this.#now().getTime());
   }
 
@@ -1007,13 +1063,13 @@ export class ApprovalService {
     if (!isNonEmptyString(input.runId)) {
       throw new InvalidApprovalInputError('runId is required');
     }
-    // Cheap INV-1 belt at the only write path: an approval binds to a
+    // A cheap run-id check at the only write path: an approval binds to a
     // server-minted run, and every context a runId keys (D1 row, DO name,
     // URL path) requires the path-safe charset. A record filed under a
     // malformed runId would be an orphan no resume can ever reach.
     if (!isPathSafeId(input.runId)) {
       throw new InvalidApprovalInputError(
-        `runId '${input.runId}' is not path-safe — approvals bind to server-minted runs (INV-1)`,
+        `runId '${input.runId}' is not path-safe — approvals bind to server-minted runs`,
       );
     }
     if (!isNonEmptyString(input.title)) {
@@ -1346,12 +1402,11 @@ export async function sweepSLA(
   const at = now();
   const nowIso = at.toISOString();
   const escalated: ApprovalRecord[] = [];
-  // D3: page the deployment's open set with an explicit cursor. Keyset paging
-  // is on (createdAt, id);
-  // escalating a record only drops it from the pending/claimed filter and never
-  // changes its cursor position, so every currently-open record is visited
-  // exactly once — no skips, no repeats — and every breach as of `at` still
-  // escalates regardless of where it sits in FIFO order.
+  // Page the deployment's open set with an explicit cursor. Keyset paging is on
+  // (createdAt, id); escalating a record only drops it from the pending/claimed
+  // filter and never changes its cursor position. Every currently-open record
+  // is visited exactly once — no skips, no repeats — and every breach as of
+  // `at` still escalates regardless of where it sits in FIFO order.
   let after: string | undefined;
   for (;;) {
     const page = await store.list({

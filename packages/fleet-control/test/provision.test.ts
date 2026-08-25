@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from 'vitest';
+import { ActiveRouteAttestationError } from '../src/active-route.js';
 import type {
   BridgeMutationPlan,
   BridgeSnapshot,
@@ -26,20 +27,24 @@ import {
 } from '../src/provision.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
 import type {
+  ActiveRouteAttestation,
   ApplicationR2BucketSnapshot,
   ApplicationR2Resource,
   DatabaseReference,
   DeploymentSecrets,
   DeploymentSpec,
+  ExternalMutationFence,
   ExternalReleaseSnapshot,
   FleetRecord,
   FleetStateLease,
   FleetStateStore,
   ForceDecommissionStep,
+  InitialExecutionFenceState,
   LiveDeployment,
   MaintenanceHealth,
   ProvisioningBackend,
   ProvisioningBackendKind,
+  SeedDeploymentIdentityOptions,
 } from '../src/types.js';
 import { externalReleaseScriptName } from '../src/workers-for-platforms-backend.js';
 
@@ -182,6 +187,9 @@ class CommitThenThrowStore extends MemoryStore {
   }
 }
 
+/** Pinned so an attestation these fakes return is comparable by value. */
+const ATTESTED_AT = '2026-08-11T00:00:00.000Z';
+
 const maintenance: MaintenanceHealth = {
   armed: true,
   nextAlarmAt: 2_000,
@@ -196,11 +204,15 @@ class FakeBackend implements ProvisioningBackend {
   failAt: string | undefined;
   cleanupFailAt: string | undefined;
   live: LiveDeployment | undefined;
+  /** Strands the route on something else; unset attests the live deployment. */
+  activeRoute: ActiveRouteAttestation | undefined;
   exportLocation = 'r2://fleet-exports/acme.sql';
   databaseExists = false;
   databaseId = 'database-id';
   databaseName = 'acme-production';
   databaseOwner: string | undefined;
+  /** Every fence state provisioning asked for, in call order. */
+  readonly seededFenceStates: InitialExecutionFenceState[] = [];
   readonly databaseIdsRead: string[] = [];
   findDatabaseCalls = 0;
   retainedReleases: readonly ExternalReleaseSnapshot[] = [];
@@ -274,10 +286,17 @@ class FakeBackend implements ProvisioningBackend {
     return { id: 'database-id', name: 'acme-production', created: true };
   }
 
+  // The fence state is DECLARED here, not dropped: a fake that omits the
+  // options argument still satisfies the interface (TypeScript accepts a
+  // fewer-argument function in a more-argument slot), so a silently unthreaded
+  // fence state would leave every one of these tests green.
   async seedDeploymentIdentity(
     _database: DatabaseReference,
     tenantTag: string,
+    _fence: ExternalMutationFence,
+    options: SeedDeploymentIdentityOptions,
   ): Promise<void> {
+    this.seededFenceStates.push(options.initialExecutionFenceState);
     this.#event('identity');
     this.databaseOwner = tenantTag;
   }
@@ -458,6 +477,31 @@ class FakeBackend implements ProvisioningBackend {
     if (!this.live) return undefined;
     const { providerBindingIdentities: _inventory, ...live } = this.live;
     return completeLiveDeployment(live);
+  }
+
+  async attestActiveRoute(
+    deployment: DeploymentSpec,
+  ): Promise<ActiveRouteAttestation> {
+    this.#event('attest');
+    const live = this.live;
+    const attestation =
+      this.activeRoute ??
+      (live
+        ? {
+            specDigest: live.desiredSpecDigest,
+            artifactVersion: live.artifactVersion,
+            physicalScriptName: live.scriptName,
+            source: 'workers-deployments' as const,
+            observedAt: ATTESTED_AT,
+          }
+        : undefined);
+    if (!attestation) {
+      throw new ActiveRouteAttestationError(
+        `nothing serves '${deployment.routeHostname}'`,
+        {},
+      );
+    }
+    return attestation;
   }
 
   async removeTraffic(
@@ -722,6 +766,7 @@ describe('fleet provisioning', () => {
     const backend = new FakeBackend();
     const store = new MemoryStore();
     const initial = await provisionDeployment({
+      initialExecutionFenceState: 'open',
       backend,
       store,
       spec: spec(),
@@ -737,7 +782,13 @@ describe('fleet provisioning', () => {
     backend.events.length = 0;
 
     await expect(
-      provisionDeployment({ backend, store, spec: spec(), secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: spec(),
+        secrets,
+      }),
     ).rejects.toThrow(/active backend switch 'domain-detach-authorized'/);
     expect(backend.events).toEqual([]);
   });
@@ -746,6 +797,7 @@ describe('fleet provisioning', () => {
     const backend = new FakeBackend();
     const store = new MemoryStore();
     const result = await provisionDeployment({
+      initialExecutionFenceState: 'open',
       backend,
       store,
       spec: spec(),
@@ -765,6 +817,9 @@ describe('fleet provisioning', () => {
       'inspect',
       'promote',
       'inspect',
+      // The ready commit records what is ROUTED, so the last provider read on
+      // the create path is the attestation, after the promotion, not before.
+      'attest',
     ]);
     expect(result.record).toMatchObject({
       phase: 'ready',
@@ -788,6 +843,119 @@ describe('fleet provisioning', () => {
       'publishing',
       'ready',
     ]);
+    expect(backend.seededFenceStates).toEqual(['open']);
+  });
+
+  it('commits the routed artifact version, and refuses when it is foreign', async () => {
+    // #given a first deploy whose route ends up serving a different artifact
+    const backend = new FakeBackend();
+    const store = new MemoryStore();
+    backend.activeRoute = {
+      specDigest: deploymentSpecDigest(spec()),
+      artifactVersion: 'artifact-someone-else-promoted',
+      physicalScriptName: 'acme-production',
+      source: 'workers-deployments',
+      observedAt: ATTESTED_AT,
+    };
+
+    // #when the deployment is provisioned
+    const provision = provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+      clock: () => 1_000,
+      routeAttestation: { convergenceBudgetMs: 1, initialRetryDelayMs: 1 },
+    });
+
+    // #then the ready commit refuses rather than recording a version this
+    // deployment uploaded as the version it serves, and leaves the deployment
+    // in the phase a retry resumes from
+    const failure = await provision.catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(ProvisioningError);
+    expect(String((failure as ProvisioningError).cause)).toMatch(
+      /did not converge/,
+    );
+    expect(store.record?.phase).toBe('publishing');
+
+    // #and once the route serves the deployed artifact, that is what commits
+    backend.activeRoute = undefined;
+    const settled = await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+      clock: () => 1_000,
+    });
+    expect(settled.record).toMatchObject({
+      phase: 'ready',
+      artifactVersion: 'artifact-v3',
+    });
+  });
+
+  it('provisions a migration target already locked, exactly once', async () => {
+    // The capability the fence exists for: a deployment that will RECEIVE a
+    // migration comes up unable to execute, so nothing starts on it between
+    // provisioning and the operator's own reopen.
+    const backend = new FakeBackend();
+    const store = new MemoryStore();
+    const result = await provisionDeployment({
+      initialExecutionFenceState: 'migration-locked',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+      clock: () => 1_000,
+    });
+
+    expect(result.record.phase).toBe('ready');
+    expect(backend.seededFenceStates).toEqual(['migration-locked']);
+  });
+
+  it('rejects an illegal birth fence state before creating ANY resource', async () => {
+    // #given — the protocol validates this too, but only when the seeding
+    // statements are built, which is after `database-created`. Refusing at the
+    // entry is what keeps a typo from costing a Worker and a D1 database first
+    // and leaving a half-provisioned deployment behind. 'draining' and
+    // 'proof-only' are real fence states but not coherent BIRTH states: they
+    // are transitions out of something that already exists.
+    for (const illegal of ['draining', 'proof-only', 'open ', '', undefined]) {
+      const backend = new FakeBackend();
+      const store = new MemoryStore();
+      await expect(
+        provisionDeployment({
+          initialExecutionFenceState:
+            illegal as unknown as InitialExecutionFenceState,
+          backend,
+          store,
+          spec: spec(),
+          secrets,
+          clock: () => 1_000,
+        }),
+      ).rejects.toThrow(/initialExecutionFenceState must be one of/);
+      // #then — no lease taken, no provider call made, nothing persisted.
+      expect(store.leaseCalls).toBe(0);
+      expect(backend.events).toEqual([]);
+      expect(store.record).toBeUndefined();
+    }
+  });
+
+  it('carries the requested fence state on a failed provisioning pass', async () => {
+    const backend = new FakeBackend();
+    backend.failAt = 'migrations';
+    const store = new MemoryStore();
+    await expect(
+      provisionDeployment({
+        initialExecutionFenceState: 'migration-locked',
+        backend,
+        store,
+        spec: spec(),
+        secrets,
+      }),
+    ).rejects.toBeInstanceOf(ProvisioningError);
+    expect(backend.seededFenceStates).toEqual(['migration-locked']);
   });
 
   it('rejects incomplete or noncontiguous D1 migration history before creating resources', async () => {
@@ -810,6 +978,7 @@ describe('fleet provisioning', () => {
       const backend = new FakeBackend();
       await expect(
         provisionDeployment({
+          initialExecutionFenceState: 'open',
           backend,
           store: new MemoryStore(),
           spec: invalid,
@@ -827,7 +996,13 @@ describe('fleet provisioning', () => {
     const deployment = spec();
 
     await expect(
-      provisionDeployment({ backend, store, spec: deployment, secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: deployment,
+        secrets,
+      }),
     ).rejects.toBeInstanceOf(ProvisioningError);
     expect(store.record).toMatchObject({
       phase: 'database-create-authorized',
@@ -838,6 +1013,7 @@ describe('fleet provisioning', () => {
 
     await expect(
       provisionDeployment({
+        initialExecutionFenceState: 'open',
         backend,
         store,
         spec: {
@@ -852,7 +1028,13 @@ describe('fleet provisioning', () => {
 
     backend.failAt = undefined;
     await expect(
-      provisionDeployment({ backend, store, spec: deployment, secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: deployment,
+        secrets,
+      }),
     ).resolves.toMatchObject({ record: { phase: 'ready' } });
   });
 
@@ -871,7 +1053,13 @@ describe('fleet provisioning', () => {
     const store = new ConflictingDatabaseNameStore();
 
     await expect(
-      provisionDeployment({ backend, store, spec: spec(), secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: spec(),
+        secrets,
+      }),
     ).rejects.toThrow(/UNIQUE constraint failed.*database_name/);
     expect(backend.events).toEqual([]);
     expect(store.record).toBeUndefined();
@@ -886,7 +1074,13 @@ describe('fleet provisioning', () => {
       throw new Error('D1 lookup unavailable before create authorization');
     };
     await expect(
-      provisionDeployment({ backend, store, spec: deployment, secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: deployment,
+        secrets,
+      }),
     ).rejects.toBeInstanceOf(ProvisioningError);
     expect(store.record?.phase).toBe('database-reserved');
 
@@ -905,7 +1099,13 @@ describe('fleet provisioning', () => {
     const store = new MemoryStore();
     const deployment = spec();
     await expect(
-      provisionDeployment({ backend, store, spec: deployment, secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: deployment,
+        secrets,
+      }),
     ).rejects.toBeInstanceOf(ProvisioningError);
 
     backend.failAt = undefined;
@@ -916,6 +1116,10 @@ describe('fleet provisioning', () => {
       cleanupDeploymentArtifacts({ backend, store, spec: deployment }),
     ).resolves.toBeUndefined();
     expect(backend.events).toEqual(['identity', 'delete-database']);
+    // The freshness proof seeds the most restrictive fence it can: this
+    // database is about to be deleted, and one that survives a failed delete
+    // must never come back executing.
+    expect(backend.seededFenceStates).toEqual(['migration-locked']);
     expect(backend.databaseExists).toBe(false);
     expect(store.record).toBeUndefined();
   });
@@ -927,7 +1131,13 @@ describe('fleet provisioning', () => {
     const store = new MemoryStore();
     const deployment = spec();
     await expect(
-      provisionDeployment({ backend, store, spec: deployment, secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: deployment,
+        secrets,
+      }),
     ).rejects.toBeInstanceOf(ProvisioningError);
     expect(store.record?.phase).toBe('database-reserved');
     backend.events.length = 0;
@@ -944,7 +1154,13 @@ describe('fleet provisioning', () => {
     const store = new MemoryStore();
     const deployment = spec();
     await expect(
-      provisionDeployment({ backend, store, spec: deployment, secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: deployment,
+        secrets,
+      }),
     ).rejects.toBeInstanceOf(ProvisioningError);
     expect(store.record?.phase).toBe('database-create-authorized');
 
@@ -952,6 +1168,7 @@ describe('fleet provisioning', () => {
     backend.databaseOwner = 'other-tenant';
     backend.events.length = 0;
     const failure = await provisionDeployment({
+      initialExecutionFenceState: 'open',
       backend,
       store,
       spec: deployment,
@@ -977,7 +1194,13 @@ describe('fleet provisioning', () => {
     const store = new MemoryStore();
 
     await expect(
-      provisionDeployment({ backend, store, spec: spec(), secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: spec(),
+        secrets,
+      }),
     ).rejects.toBeInstanceOf(ProvisioningError);
 
     if (failure === 'identity') {
@@ -1000,7 +1223,13 @@ describe('fleet provisioning', () => {
     const deployment = spec();
 
     await expect(
-      provisionDeployment({ backend, store, spec: deployment, secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: deployment,
+        secrets,
+      }),
     ).rejects.toBeInstanceOf(ProvisioningError);
 
     expect(backend.activeRelease).toEqual({
@@ -1028,7 +1257,13 @@ describe('fleet provisioning', () => {
     });
 
     await expect(
-      provisionDeployment({ backend, store, spec: deployment, secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: deployment,
+        secrets,
+      }),
     ).rejects.toBeInstanceOf(ProvisioningError);
 
     expect(
@@ -1069,6 +1304,7 @@ describe('fleet provisioning', () => {
     });
 
     const failure = await provisionDeployment({
+      initialExecutionFenceState: 'open',
       backend,
       store,
       spec: deployment,
@@ -1132,6 +1368,7 @@ describe('fleet provisioning', () => {
     });
 
     const failure = await provisionDeployment({
+      initialExecutionFenceState: 'open',
       backend,
       store,
       spec: deployment,
@@ -1192,7 +1429,13 @@ describe('fleet provisioning', () => {
     });
 
     await expect(
-      provisionDeployment({ backend, store, spec: deployment, secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: deployment,
+        secrets,
+      }),
     ).rejects.toBeInstanceOf(ProvisioningError);
 
     expect(
@@ -1219,7 +1462,13 @@ describe('fleet provisioning', () => {
     });
 
     await expect(
-      provisionDeployment({ backend, store, spec: external, secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: external,
+        secrets,
+      }),
     ).rejects.toBeInstanceOf(ProvisioningError);
 
     expect(store.phases).toContain('platform-resources-deployed');
@@ -1249,7 +1498,13 @@ describe('fleet provisioning', () => {
     });
 
     await expect(
-      provisionDeployment({ backend, store, spec: external, secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: external,
+        secrets,
+      }),
     ).rejects.toBeInstanceOf(ProvisioningError);
 
     expect(backend.events).toEqual(
@@ -1270,6 +1525,7 @@ describe('fleet provisioning', () => {
     const backend = new FakeBackend('plain-worker');
     await expect(
       provisionDeployment({
+        initialExecutionFenceState: 'open',
         backend,
         store: new MemoryStore(),
         spec: spec({ authoredBy: 'external' }),
@@ -1283,6 +1539,7 @@ describe('fleet provisioning', () => {
     const backend = new FakeBackend('plain-worker');
     await expect(
       provisionDeployment({
+        initialExecutionFenceState: 'open',
         backend,
         store: new MemoryStore(),
         spec: spec({
@@ -1309,6 +1566,7 @@ describe('fleet provisioning', () => {
     });
     await expect(
       provisionDeployment({
+        initialExecutionFenceState: 'open',
         backend: new FakeBackend(),
         store: new MemoryStore(),
         spec: external,
@@ -1339,6 +1597,7 @@ describe('fleet provisioning', () => {
       const backend = new FakeBackend();
       await expect(
         provisionDeployment({
+          initialExecutionFenceState: 'open',
           backend,
           store: new MemoryStore(),
           spec: invalid,
@@ -1361,6 +1620,7 @@ describe('fleet provisioning', () => {
       ],
     });
     const first = await provisionDeployment({
+      initialExecutionFenceState: 'open',
       backend,
       store,
       spec: external,
@@ -1374,7 +1634,13 @@ describe('fleet provisioning', () => {
     backend.events.length = 0;
 
     await expect(
-      provisionDeployment({ backend, store, spec: external, secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: external,
+        secrets,
+      }),
     ).rejects.toThrow(/do not match the persisted platform target/);
     expect(backend.events).toEqual([]);
   });
@@ -1387,7 +1653,13 @@ describe('fleet provisioning', () => {
       egressProxyService: undefined,
       durableObjectMigrations: [],
     });
-    await provisionDeployment({ backend, store, spec: external, secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: external,
+      secrets,
+    });
     const current = store.record;
     if (
       !current?.platformResources ||
@@ -1475,6 +1747,7 @@ describe('fleet provisioning', () => {
 
     await expect(
       provisionDeployment({
+        initialExecutionFenceState: 'open',
         backend,
         store,
         spec: external,
@@ -1583,6 +1856,7 @@ describe('fleet provisioning', () => {
     backend.databaseOwner = activeSpec.tenantTag;
 
     const result = await provisionDeployment({
+      initialExecutionFenceState: 'open',
       backend,
       store,
       spec: activeSpec,
@@ -1596,7 +1870,13 @@ describe('fleet provisioning', () => {
   it('resumes decommissioning after export failure without repeating prior steps', async () => {
     const backend = new FakeBackend();
     const store = new MemoryStore();
-    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    });
     backend.events.length = 0;
     backend.failAt = 'export';
 
@@ -1636,7 +1916,13 @@ describe('fleet provisioning', () => {
         r2Buckets: [{ name: 'FILES' }],
       },
     });
-    await provisionDeployment({ backend, store, spec: deployment, secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: deployment,
+      secrets,
+    });
     backend.events.length = 0;
     backend.nonempty = true;
 
@@ -1666,7 +1952,13 @@ describe('fleet provisioning', () => {
         r2Buckets: [{ name: 'FILES' }],
       },
     });
-    await provisionDeployment({ backend, store, spec: deployment, secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: deployment,
+      secrets,
+    });
     backend.events.length = 0;
     backend.writeAfterTrafficRemovalOnce = true;
 
@@ -1698,7 +1990,13 @@ describe('fleet provisioning', () => {
         r2Buckets: [{ name: 'FILES' }],
       },
     });
-    await provisionDeployment({ backend, store, spec: deployment, secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: deployment,
+      secrets,
+    });
     backend.events.length = 0;
     backend.failRemoveTrafficResponseOnce = true;
 
@@ -1726,7 +2024,13 @@ describe('fleet provisioning', () => {
         r2Buckets: [{ name: 'FILES' }],
       },
     });
-    await provisionDeployment({ backend, store, spec: deployment, secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: deployment,
+      secrets,
+    });
     backend.events.length = 0;
     store.failAfterCommittedPhase = 'traffic-removed';
 
@@ -1756,7 +2060,13 @@ describe('fleet provisioning', () => {
     backend.failAt = 'promote';
 
     await expect(
-      provisionDeployment({ backend, store, spec: deployment, secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: deployment,
+        secrets,
+      }),
     ).rejects.toThrow(/publishing state is preserved/u);
     expect(store.record?.phase).toBe('publishing');
     expect(backend.live).toBeDefined();
@@ -1782,7 +2092,13 @@ describe('fleet provisioning', () => {
     const backend = new FakeBackend('plain-worker');
     const store = new MemoryStore();
     const deployment = spec();
-    await provisionDeployment({ backend, store, spec: deployment, secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: deployment,
+      secrets,
+    });
     if (!store.record) throw new Error('missing provisioned record');
     store.record = { ...store.record, phase: 'worker-deployed' };
     backend.events.length = 0;
@@ -1806,7 +2122,13 @@ describe('fleet provisioning', () => {
   it('never deletes the database when export fails', async () => {
     const backend = new FakeBackend();
     const store = new MemoryStore();
-    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    });
     backend.events.length = 0;
     backend.failAt = 'export';
     await expect(
@@ -1822,7 +2144,13 @@ describe('fleet provisioning', () => {
     const backend = new FakeBackend();
     const store = new MemoryStore();
     const deployment = spec();
-    await provisionDeployment({ backend, store, spec: deployment, secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: deployment,
+      secrets,
+    });
     if (!store.record) throw new Error('missing provisioned record');
     const activeRelease: ExternalReleaseSnapshot = {
       physicalScriptName: 'acme-active-release',
@@ -1871,6 +2199,7 @@ describe('fleet provisioning', () => {
       durableObjectMigrations: [],
     });
     await provisionDeployment({
+      initialExecutionFenceState: 'open',
       backend,
       store,
       spec: initialSpec,
@@ -1942,7 +2271,13 @@ describe('fleet provisioning', () => {
   it('recovers when final state persistence fails after D1 deletion', async () => {
     const backend = new FakeBackend();
     const store = new MemoryStore();
-    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    });
     store.failPutPhase = 'decommissioned';
 
     await expect(
@@ -1969,7 +2304,13 @@ describe('fleet provisioning', () => {
   it('rejects a persisted database ID that now has a different name', async () => {
     const backend = new FakeBackend();
     const store = new MemoryStore();
-    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    });
     backend.databaseName = 'unexpected-database-name';
     backend.events.length = 0;
 
@@ -1983,7 +2324,13 @@ describe('fleet provisioning', () => {
   it('rejects database cleanup when the persisted ID has another sentinel owner', async () => {
     const backend = new FakeBackend();
     const store = new MemoryStore();
-    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    });
     if (!store.record) throw new Error('missing test record');
     store.record = { ...store.record, phase: 'worker-deployed' };
     backend.databaseOwner = 'other-tenant';
@@ -1999,7 +2346,13 @@ describe('fleet provisioning', () => {
   it('converges cleanup when the persisted database ID is positively absent', async () => {
     const backend = new FakeBackend();
     const store = new MemoryStore();
-    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    });
     if (!store.record) throw new Error('missing test record');
     store.record = { ...store.record, phase: 'worker-deployed' };
     backend.databaseExists = false;
@@ -2015,7 +2368,13 @@ describe('fleet provisioning', () => {
   it('does not treat a persisted-ID lookup failure as database absence', async () => {
     const backend = new FakeBackend();
     const store = new MemoryStore();
-    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    });
     if (!store.record) throw new Error('missing test record');
     store.record = { ...store.record, phase: 'worker-deployed' };
     backend.getDatabase = async () => {
@@ -2037,6 +2396,7 @@ describe('fleet provisioning', () => {
     const store = new MemoryStore();
 
     const failure = await provisionDeployment({
+      initialExecutionFenceState: 'open',
       backend,
       store,
       spec: spec(),
@@ -2055,7 +2415,13 @@ describe('fleet provisioning', () => {
     const store = new MemoryStore();
 
     await expect(
-      provisionDeployment({ backend, store, spec: spec(), secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: spec(),
+        secrets,
+      }),
     ).rejects.toBeInstanceOf(ProvisioningError);
     expect(store.record?.phase).toBe('database-created');
 
@@ -2064,7 +2430,13 @@ describe('fleet provisioning', () => {
     backend.events.length = 0;
     backend.databaseIdsRead.length = 0;
     await expect(
-      provisionDeployment({ backend, store, spec: spec(), secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: spec(),
+        secrets,
+      }),
     ).resolves.toMatchObject({ record: { phase: 'ready' } });
     expect(backend.events).not.toContain('database');
     expect(backend.events).toContain('identity');
@@ -2074,7 +2446,13 @@ describe('fleet provisioning', () => {
   it('does not delete a database after an export without integrity evidence', async () => {
     const backend = new FakeBackend();
     const store = new MemoryStore();
-    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    });
     backend.events.length = 0;
     backend.exportDatabase = async () => ({
       databaseId: 'database-id',
@@ -2092,7 +2470,13 @@ describe('fleet provisioning', () => {
   it('rejects an export for a different database before persisting or deleting', async () => {
     const backend = new FakeBackend();
     const store = new MemoryStore();
-    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    });
     backend.events.length = 0;
     backend.exportDatabase = async () => ({
       databaseId: 'replacement-database-id',
@@ -2111,7 +2495,13 @@ describe('fleet provisioning', () => {
   it('force-decommissions a deployment without a specification and removes its ledger row', async () => {
     const backend = new FakeBackend('plain-worker');
     const store = new MemoryStore();
-    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    });
     backend.events.length = 0;
     const auditEvents: unknown[] = [];
 
@@ -2154,7 +2544,13 @@ describe('fleet provisioning', () => {
       throw new Error('D1 lookup unavailable before create authorization');
     };
     await expect(
-      provisionDeployment({ backend, store, spec: spec(), secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: spec(),
+        secrets,
+      }),
     ).rejects.toBeInstanceOf(ProvisioningError);
     expect(store.record?.phase).toBe('database-reserved');
     backend.events.length = 0;
@@ -2177,7 +2573,13 @@ describe('fleet provisioning', () => {
     const store = new MemoryStore();
     backend.failAt = 'database';
     await expect(
-      provisionDeployment({ backend, store, spec: spec(), secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: spec(),
+        secrets,
+      }),
     ).rejects.toBeInstanceOf(ProvisioningError);
     expect(store.record).toMatchObject({
       phase: 'database-create-authorized',
@@ -2221,6 +2623,7 @@ describe('fleet provisioning', () => {
 
     const terminalStore = new MemoryStore();
     await provisionDeployment({
+      initialExecutionFenceState: 'open',
       backend,
       store: terminalStore,
       spec: spec(),
@@ -2263,6 +2666,7 @@ describe('fleet provisioning', () => {
     const normalBackend = new FakeBackend();
     const normalStore = new MemoryStore();
     await provisionDeployment({
+      initialExecutionFenceState: 'open',
       backend: normalBackend,
       store: normalStore,
       spec: spec(),
@@ -2271,6 +2675,7 @@ describe('fleet provisioning', () => {
     const forceBackend = new FakeBackend('plain-worker');
     const forceStore = new MemoryStore();
     await provisionDeployment({
+      initialExecutionFenceState: 'open',
       backend: forceBackend,
       store: forceStore,
       spec: spec(),
@@ -2308,7 +2713,13 @@ describe('fleet provisioning', () => {
   it('re-enters a force decommission wedged after traffic removal', async () => {
     const backend = new FakeBackend('plain-worker');
     const store = new MemoryStore();
-    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    });
     backend.forceFailOnceAt = 'revoke-credentials';
 
     await expect(
@@ -2342,7 +2753,13 @@ describe('fleet provisioning', () => {
   it('converges after D1 deletion succeeds but the terminal state write fails', async () => {
     const backend = new FakeBackend('plain-worker');
     const store = new MemoryStore();
-    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    });
     store.failPutPhase = 'decommissioned';
 
     await expect(
@@ -2373,7 +2790,13 @@ describe('fleet provisioning', () => {
   it('serializes force decommission against concurrent provisioning', async () => {
     const backend = new FakeBackend('plain-worker');
     const store = new MemoryStore();
-    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    });
     let releaseStep: (() => void) | undefined;
     let stepStarted: (() => void) | undefined;
     const started = new Promise<void>((resolve) => {
@@ -2392,7 +2815,13 @@ describe('fleet provisioning', () => {
     });
     await started;
     await expect(
-      provisionDeployment({ backend, store, spec: spec(), secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: spec(),
+        secrets,
+      }),
     ).rejects.toThrow(/already being modified/);
     releaseStep?.();
     await expect(force).resolves.toBeUndefined();
@@ -2401,7 +2830,13 @@ describe('fleet provisioning', () => {
   it('silently removes a completed force teardown after audit delivery fails', async () => {
     const backend = new FakeBackend('plain-worker');
     const store = new MemoryStore();
-    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    });
     let auditAttempts = 0;
     const input = {
       backend,
@@ -2440,6 +2875,7 @@ describe('fleet provisioning', () => {
       });
 
     const first = provisionDeployment({
+      initialExecutionFenceState: 'open',
       backend,
       store,
       spec: spec(),
@@ -2447,7 +2883,13 @@ describe('fleet provisioning', () => {
     });
     await Promise.resolve();
     await expect(
-      provisionDeployment({ backend, store, spec: spec(), secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: spec(),
+        secrets,
+      }),
     ).rejects.toThrow(/already being modified/);
     releaseDatabase?.({
       id: 'database-id',
@@ -2463,7 +2905,13 @@ describe('fleet provisioning', () => {
     backend.cleanupFailAt = 'delete-worker';
     const store = new MemoryStore();
     await expect(
-      provisionDeployment({ backend, store, spec: spec(), secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: spec(),
+        secrets,
+      }),
     ).rejects.toBeInstanceOf(ProvisioningError);
     expect(store.record?.phase).toBe('worker-deployed');
 
@@ -2472,7 +2920,13 @@ describe('fleet provisioning', () => {
     backend.live = undefined;
     backend.events.length = 0;
     await expect(
-      provisionDeployment({ backend, store, spec: spec(), secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: spec(),
+        secrets,
+      }),
     ).resolves.toMatchObject({ record: { phase: 'ready' } });
     expect(backend.events.filter((event) => event === 'worker')).toHaveLength(
       1,
@@ -2486,7 +2940,13 @@ describe('fleet provisioning', () => {
     backend.cleanupFailAt = 'delete-worker';
     const store = new MemoryStore();
     await expect(
-      provisionDeployment({ backend, store, spec: spec(), secrets }),
+      provisionDeployment({
+        initialExecutionFenceState: 'open',
+        backend,
+        store,
+        spec: spec(),
+        secrets,
+      }),
     ).rejects.toBeInstanceOf(ProvisioningError);
     backend.failAt = undefined;
     backend.cleanupFailAt = undefined;
@@ -2494,6 +2954,7 @@ describe('fleet provisioning', () => {
 
     await expect(
       provisionDeployment({
+        initialExecutionFenceState: 'open',
         backend,
         store,
         spec: spec({
@@ -2510,7 +2971,13 @@ describe('fleet provisioning', () => {
   it('does not delete D1 when partial cleanup cannot remove the Worker', async () => {
     const backend = new FakeBackend();
     const store = new MemoryStore();
-    await provisionDeployment({ backend, store, spec: spec(), secrets });
+    await provisionDeployment({
+      initialExecutionFenceState: 'open',
+      backend,
+      store,
+      spec: spec(),
+      secrets,
+    });
     if (!store.record) throw new Error('missing test record');
     store.record = { ...store.record, phase: 'worker-deployed' };
     backend.cleanupFailAt = 'delete-worker';

@@ -141,6 +141,8 @@ Run termination keeps the same boundary. The Worker sends the trusted execution 
 
 External maintenance is a separate, narrower channel. The candidate may relay a fleet-private Ed25519 capability, but it cannot mint one or read `MAINTENANCE_ADMIN_SECRET`. The global dispatcher verifies the public signature and the bound operation, tenant, environment, physical script, specification digest, expiry, and nonce before it invokes customer code. The trusted maintenance object verifies the same capability against its static tenant and environment, rejects deployment-identity authorization for maintenance routes in this mode, consumes mutation nonces atomically, and signs the exact result with its per-state HMAC secret. Fleet control accepts only that signed result. Status verification is read-only, and maintenance mutation is bounded by a request timeout shorter than the active lease.
 
+The execution-fence and inventory admin routes use a stricter `MAINTENANCE_ADMIN_SECRET` boundary than the maintenance routes: they return `503` when the secret is absent and never delegate authentication to fleet capabilities. The fence can halt every execution entry in the deployment, so the host owns and audits transition policy. The deployment-identity gate still runs first; a mismatched binding or sentinel cannot use fence administration to reach an unverified database.
+
 A missing binding, invalid sentinel schema, missing or extra owner row, malformed tag, caller-credential mismatch, or tag mismatch fails closed. The Worker returns `503`; Durable Object initialization refuses the request.
 
 ### Opaque server-minted ids

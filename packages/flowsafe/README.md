@@ -291,15 +291,26 @@ npm install --save-dev "wrangler@>=4.118 <5"
 npx flowsafe-provision \
   --database <database> \
   --tag <tag> \
+  --initial-fence-state open \
   --remote \
   --config wrangler.jsonc
 ```
 
 Fleet control planes can import the same fail-closed sentinel implementation from `@proofoftech/flowsafe/deployment-identity-protocol` instead of duplicating its schema or race handling.
 
+### Fence and drain a deployment
+
+One Flowsafe deployment is one tenant, so the execution fence controls the complete deployment. `open` admits all work. `draining` refuses new run mints and future-work authoring while existing runs and deliveries finish. It still accepts new background-task enqueues and dispatches queued tasks because both are drainable work. Background-task enqueue, dispatch, and stale-task re-drive are refused in `migration-locked` and `proof-only`. Signal wakes that would mint a run persist instead. `migration-locked` refuses execution, and `proof-only` admits only the nominated start and its bound run. The fence never preempts compute already in flight.
+
+Provisioning requires `--initial-fence-state open` or `--initial-fence-state migration-locked`; it never chooses a default. A pre-0.20 database without a fence row reads as `open`. For locked-at-birth provisioning, read `GET /admin/execution-fence` afterward and fail unless it reports `migration-locked`.
+
+Use `GET /admin/inventory` while the fence remains `draining`. A drain is proven only after every work category is empty across two complete sweeps at least 60 seconds apart. Readings are point-in-time observations rather than snapshots and can move in either direction while draining admits work. Empty results cannot over-count, and keyset pagination never skips a row that existed before the sweep began. If you need a hard guarantee, re-sweep once after transitioning to `migration-locked`: an empty post-lock sweep is conclusive; a non-empty one means work is still outstanding, either because it entered after the proof or because the lock parked it before it finished. Return to `draining` and repeat the proof. An inventory read taken under `migration-locked` measures what the fence parked rather than what the deployment would otherwise be doing. Schedules and signal subscriptions are standing configuration and need not empty. Persisted idle signals are deliberately unenumerable and carry into the replacement deployment.
+
 ### Runtime ids are opaque
 
 The host mints opaque, path-safe run and thread ids. `RunnerRuntime.start()` requires a host-owned run id and has no generation fallback. The id scopes the snapshot, Durable Object, approval lookup, stream address, and artifact path, but it carries no customer identity.
+
+Callers that need exactly-once start behavior supply an `idempotencyKey`, never a run ID. The key is available on `POST /runs`, trusted agent-host starts, and `streamUntilPersisted()`. A retry returns the same persisted run. `IDEMPOTENT_START_PENDING` includes `pendingSince`; re-probe the point-in-time `IDEMPOTENT_START_UNRESOLVABLE` result before acting. A key remains valid until its reservation-retention horizon expires.
 
 ### Stores are deployment-wide
 
@@ -483,6 +494,10 @@ Complete wiring is in the [durable-agents guide](https://github.com/ProofOfTechO
 ## Deployment and operations
 
 The composed `createFlowsafeWorker()` owns the shared route and maintenance-duty pipeline. Hosts inject workflows, identity verification, topology-backed optional routers, budget wrappers, notification transport, an invocation-scoped artifact-store factory, the storage table prefix, schedule tick, and extra purge duties.
+
+Protect `GET` and `POST /admin/execution-fence` plus `GET /admin/inventory` with a distinct `MAINTENANCE_ADMIN_SECRET`. Fence transitions use CAS and return `409` with `FENCE_CAS_CONFLICT` when the expected state is stale. Fenced execution returns `503` with an `EXECUTION_FENCED` reason. The agent-host and stream routers preserve structured `503` and `409` refusals instead of collapsing them to a generic `500`.
+
+Every leaf option that accepts `ExecutionFenceWiring` requires an explicit store or `'none'`. Run-router, agent-thread-topology, and storage initialization also require explicit start-idempotency wiring. Use `'none'` only when no database exists. `BackgroundTaskHost` no longer exposes its manager; call `enqueue()`, `getTask()`, `listTasks()`, or `stream()` on the host and use `BackgroundTaskReads` for read-only route composition.
 
 `createFlowsafeMaintenanceDurableObject()` runs deadline expiry, approval service-level agreement (SLA) sweep, retention purge, and optional schedule fire as separate alarm invocations. Provider polling and background recovery use their own Durable Object alarms.
 

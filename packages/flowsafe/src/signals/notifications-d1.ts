@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track C (M-004), CI-M-004-002 — the D1 NotificationsStorage domain over
-// TABLE_NOTIFICATIONS ('mastra_notifications'), mirroring core's abstract
-// NotificationsStorage + InMemoryNotificationsStorage reference (create / list /
-// listDue / get({threadId,id}) / update + findCoalescable coalescing). Composed
+// The D1 NotificationsStorage domain over TABLE_NOTIFICATIONS
+// ('mastra_notifications'), mirroring core's abstract NotificationsStorage and
+// InMemoryNotificationsStorage reference (create / list / listDue /
+// get({threadId,id}) / update + findCoalescable coalescing). Composed
 // into createD1Storage's store so `agent.sendNotificationSignal` persists here
 // (core resolves the domain via `mastra.getStorage().getStore('notifications')`).
 //
@@ -24,6 +24,7 @@ import {
   NotificationsStorage,
   type UpdateNotificationInput,
 } from '@mastra/core/notifications';
+import { DUE_NOTIFICATION_SQL } from '../do-runner/notification-predicate.js';
 import { validateTablePrefix } from '../do-runner/table-prefix.js';
 import {
   d1Changes,
@@ -135,6 +136,15 @@ function isDuplicateColumn(error: unknown): boolean {
   return error instanceof Error && /duplicate column/i.test(error.message);
 }
 
+/**
+ * The single-row counter table this domain allocates insertion ordinals from.
+ *
+ * Named because the deployment table census has to account for every
+ * `flowsafe_`-prefixed table by name, and a table whose only spelling is inside
+ * a template literal is one the census can only match by restating it.
+ */
+export const NOTIFICATION_SEQUENCE_TABLE = 'flowsafe_notification_sequence';
+
 export class D1NotificationsStorage extends NotificationsStorage {
   readonly #db: SignalDatabase;
   readonly #table: string;
@@ -149,7 +159,7 @@ export class D1NotificationsStorage extends NotificationsStorage {
     const prefix = validateTablePrefix(tablePrefix) ?? '';
     this.#db = db;
     this.#table = `${prefix}mastra_notifications`;
-    this.#sequenceTable = `${prefix}flowsafe_notification_sequence`;
+    this.#sequenceTable = `${prefix}${NOTIFICATION_SEQUENCE_TABLE}`;
     this.#ordinalIndex = `idx_${this.#table}_insertion_ordinal`;
     this.#legacyReplaceTrigger = `trg_${this.#table}_preserve_insertion_ordinal`;
     this.#legacyInsertTrigger = `trg_${this.#table}_allocate_insertion_ordinal`;
@@ -517,10 +527,7 @@ export class D1NotificationsStorage extends NotificationsStorage {
   ): Promise<NotificationRecord[]> {
     await this.#ensureSchema();
     const now = input.now.toISOString();
-    const clauses = [
-      "status = 'pending'",
-      '((deliverAt IS NOT NULL AND deliverAt <= ?) OR (summaryAt IS NOT NULL AND summaryAt <= ?))',
-    ];
+    const clauses = [DUE_NOTIFICATION_SQL];
     const binds: unknown[] = [now, now];
     if (input.agentId !== undefined) {
       clauses.push('agentId = ?');

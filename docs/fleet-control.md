@@ -38,6 +38,7 @@ const result = await provisionDeployment({
   store,
   spec: deployment,
   secrets: generateDeploymentSecrets(),
+  initialExecutionFenceState: 'open',
 });
 
 if (!result.maintenance.armed) {
@@ -48,6 +49,8 @@ if (!result.maintenance.armed) {
 The function persists every completed phase and validates the immutable tenant, environment, logical script, database, and route mapping on retry. Database creation advances from `database-reserved` to an explicit create-authorized ownership phase before the provider mutation, so a same-name discovery cannot be silently adopted after a crash or race. `D1FleetStateStore` serializes each deployment lifecycle with a renewable database-time lease and fences state writes with its owner token. It commits the exact Worker, dispatch-script, and R2 claims with the fleet row in one D1 batch. The final statement fails the whole batch if the lease expired after an earlier claim statement. A lost batch response converges only after raw serialized row values, the complete owned claim set, desired-key occupants, and the live lease all match. Specification digests make a retry use the exact intended modules, bindings, limits, and migrations. A changed ready specification must go through `migrateFleet()`.
 
 Provisioning resumes from its last durable phase without repeating a committed step. Before `ready`, it compares the exact live tenant, environment, D1 binding, schema, specification digest, Durable Object bindings, plain-text variables, and secret names. Plain Worker, dispatch Worker, backend-switch, and control-plane inspection must consume every raw provider binding entry. An unknown type, malformed entry, duplicate name, binding absent from the structured inspection, or missing complete inventory fails closed even when the desired application groups are empty. Ordinary Worker secret names come from the authoritative secret-list API; if version resources also report them, the two inventories must agree. A failed first create revokes credentials and removes resources created by that attempt. If an upload may have succeeded, cleanup treats the Worker as present until deletion is positively confirmed; D1 is never deleted while a Worker or route may remain. Cleanup errors remain attached to `ProvisioningError.cleanupErrors`, and the durable phase remains available to retry or to `cleanupDeploymentArtifacts()`.
+
+`initialExecutionFenceState` is required and accepts `open` or `migration-locked`. It is a provisioning decision, not part of `DeploymentSpec`, so it does not alter the specification digest. `provisionDeployment()` is asynchronous from entry: invalid initial state and other validation failures reject its promise instead of throwing before a promise exists. The final ready record uses the artifact version from post-promotion route attestation rather than the candidate inspection.
 
 ## Define application bindings
 
@@ -98,6 +101,43 @@ The state-egress credential digest is immutable for an existing trusted state re
 External candidates cannot own Durable Object classes or migrations, and an external specification cannot choose a state script, dispatch namespace, outbound target, or physical R2 bucket name. The trusted control plane resolves every requested Durable Object binding to the deployment's stable state script and every R2 descriptor to the fleet-owned deployment resource. The state script owns FlowSafe runs, approvals, alarms, and Durable Object code while candidates remain independently replaceable. The state script receives the named `OUTBOUND_PROXY` service binding, its context-bound credential, the audit queue, and the maintenance secret. The candidate receives none of them. If audit export is enabled, its `AUDIT_PROXY` binding is a remote Durable Object binding to `FlowsafeFleetAuditProxy` in the exact state script. Fresh state scripts include the dispatch namespace in that binding; adopted ordinary bridge scripts omit it. Fleet state persists the exact state binding inventory and an append-only snapshot of every authoritative namespace ID. Drift and teardown use that snapshot rather than recomputing names. Every D1 migration introduced while a rollback release is retained must be explicitly marked rollback-compatible and use expand-only schema changes. Apply contract changes only after the rollback window closes.
 
 Supply a backend-owned `platformProfileFor(spec)` provider when the Workers for Platforms backend can receive external artifacts. The provider returns the trusted state artifact, platform state migration history, organization egress allowlist, and optional legacy bridge template. Fleet control validates and hashes that profile before upload. A profile or policy change requires `migrateFleet()`, even when the customer candidate bytes are unchanged. Customer modules are never reused in fresh trusted state. The stable state name derives from immutable deployment identity, not candidate contents, so release promotion and rollback do not replace platform state.
+
+### Attest the active route
+
+Active-route attestation proves which provider artifact receives traffic and which fleet specification digest that artifact carries. It starts from provider routing state, not the desired candidate returned by `inspect()`. Every package-owned promotion path attests after promotion: initial provision, every `migrateFleet()` branch, and `rollbackExternalRelease()` all fail closed when the route is absent, ambiguous, or mismatched. The two-version staging window is refused if observed, but the package's own promote paths never observe it because each attestation runs after promotion converges.
+
+An ordinary Worker attestation performs two provider reads per attempt: read the deployment traffic split, require exactly one version at 100 percent, then read that version's specification-digest binding. A deployment containing two versions is refused even when one has 100 percent and the other has 0 percent; Fleet control never selects a version by highest share. `physicalScriptName` equals `spec.scriptName` by construction because promotion already proves custom-domain ownership for that script.
+
+A Workers for Platforms attestation performs three provider reads per attempt: read the hostname mapping, resolve the routed physical script, then inspect that script and its digest. The shared convergence helper retries provider propagation for up to 60 seconds by default. Backend constructors accept `clock?` so `observedAt` uses the host's clock.
+
+Use `attestFleetRecordActiveRoute()` for a single host-side drift read. Cache its result and never invoke it for every status request: one record costs two provider reads on the plain backend or three on Workers for Platforms. Use `attestConvergedActiveRoute()` only around a promote path that must wait for provider convergence.
+
+### Settle a promotion under the lease
+
+Pass `settlementFor?` to `migrateFleet()` or `settlement?` to `rollbackExternalRelease()` to run a host callback after the route attests and matches, but before Fleet control writes the settling state. Each callback receives `FleetSettlementContext` with a stable `settlementKey`. Delivery is at least once: a crash after `settle()` succeeds but before the state write repeats the callback under the same key. The host must deduplicate every external effect on `settlementKey`.
+
+`alreadySettled` is an observational hint, not a deduplication guarantee. It can be false again after a successful callback whose following state write failed. `FleetRecord.settledSettlementKey` lets a later routine convergence skip a settlement whose key was durably recorded, while route attestation still runs.
+
+The package imposes no callback timeout. By default, the state store renews the lease every five minutes against a 15-minute lifetime for as long as `settle()` runs. A hung callback that keeps renewing therefore holds the deployment lease indefinitely. Keep the callback brief and enqueue slow work. If the process dies, the lease expires 15 minutes after its last successful renewal by default. A throw leaves the migration re-enterable; the next call re-attests and retries the same settlement key.
+
+The `entry` field distinguishes `migration`, `platform-only`, `ready-convergence`, and `rollback`. For the first three, `prior` is the replaced release when the backend still retains it. For `rollback`, `prior` is the abandoned active release. `prior` is optional-normal, and settlement logic may depend only on the target identity.
+
+Initial provisioning consults no settlement host. It returns to the caller after route attestation, and the host can settle after return with `attestFleetRecordActiveRoute()`.
+
+### Upgrade from 0.3
+
+The 0.4 public surface has these breaking requirements:
+
+- `ProvisioningBackend` implementations add required `attestActiveRoute()`
+- Public `PlainWorkerRouteApi` implementations add required `inspectActiveWorkerRoute()`
+- `ProvisioningBackend.seedDeploymentIdentity()` takes `{ initialExecutionFenceState }` as its fourth argument through `SeedDeploymentIdentityOptions`
+- `provisionDeployment()` requires `initialExecutionFenceState`, returns its validation failures asynchronously, accepts `routeAttestation?`, and records the routed artifact version
+- `migrateFleet()` accepts `settlementFor?` and `routeAttestation?`
+- `rollbackExternalRelease()` accepts `settlement?` and `routeAttestation?`
+- `WranglerLoopBackend` and `WorkersForPlatformsBackend` constructors accept `clock?`
+- `FleetRecord` adds `settledSettlementKey`; `D1FleetStateStore` adds the nullable text column automatically on first open
+
+Fleet control 0.4 depends on exactly one matching Flowsafe 0.20 runtime copy. Upgrade a direct Flowsafe 0.19 dependency at the same time to avoid a second nominal runtime copy.
 
 ## Switch a plain deployment to Workers for Platforms
 

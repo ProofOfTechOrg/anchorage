@@ -53,6 +53,8 @@ function buildHarness() {
   const grants = approvalGrantProvider(store);
   const runtime = buildShowcaseRuntime({
     initInput: { storage: new InMemoryStore() },
+    executionFence: 'none',
+    startIdempotency: 'none',
     grantProvider: async (workflowId, runId, leg) => ({
       ...(await grants(workflowId, runId, leg)),
       [AGENT_AUDIT_CONTEXT_KEY]: {
@@ -70,6 +72,9 @@ function buildHarness() {
   // product-launch flow); single-gate runs simply resume to success.
   const service: ApprovalService = new ApprovalService({
     store,
+    // In-memory store, no database to fence against: the opt-out is written down
+    // rather than defaulted — see ExecutionFenceWiring.
+    executionFence: 'none',
     resumeRun: resumeRunWithRequeue(
       resumeViaRuntime(runtime),
       () => service,
@@ -559,6 +564,7 @@ describe('showcase run routes', () => {
         buildService: (store) =>
           new ApprovalService({
             store,
+            executionFence: 'none',
             resumeRun: resumeRunWithRequeue(
               resumeViaRuntime(harness.runtime),
               () => harness.service,
@@ -567,6 +573,9 @@ describe('showcase run routes', () => {
           }),
       }),
       systemPrincipalId: SYSTEM,
+      // In-memory harness, no database to reserve against: the opt-out is
+      // written down rather than defaulted — see RunRouterStartIdempotency.
+      startIdempotency: 'none',
       start: async ({ workflowId, runId, inputData, principal }) => {
         const resources = harness.storeFactory.resources();
         const resourceOwner = principalOwner(principal);

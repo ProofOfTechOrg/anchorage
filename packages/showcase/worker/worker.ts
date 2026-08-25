@@ -69,9 +69,11 @@ import {
 import {
   type DurableObjectRunLifecycleHooks,
   DurableObjectRunner,
+  executionFenceFor,
   HubDurableObject,
   type RequestContextProvider,
   type RunnerRuntime,
+  startIdempotencyFor,
 } from '@proofoftech/flowsafe/do-runner';
 import {
   approvalStoreFactoryFor,
@@ -143,9 +145,9 @@ interface Env {
    * Secret (`wrangler secret put STREAM_TICKET_SECRET`): the dedicated HS256
    * key that signs short-lived WebSocket stream tickets. Present WITH the HUB
    * binding => the composer mounts live streaming (queue + run channels);
-   * absent => streaming stays unmounted and the SPA runs on polling only
-   * (graceful degradation, DL-019). A dedicated key so a stream ticket and a
-   * session JWT can never be confused under one signing secret.
+   * absent => streaming stays unmounted and the SPA runs on polling only. A
+   * dedicated key ensures a stream ticket and a session JWT can never be
+   * confused under one signing secret.
    */
   STREAM_TICKET_SECRET?: string;
   /** Default SLA seconds for new approvals (var; default 14400 = 4h). */
@@ -225,6 +227,11 @@ function grantProviderFor(env: Env): RequestContextProvider {
 function defineWorkflows(env: Env): RunnerRuntime {
   return buildShowcaseRuntime({
     initInput: env,
+    executionFence: executionFenceFor(env.DB),
+    // The same binding the composed Worker's run router reserves into, taken
+    // through the package's per-binding memo so the two are one store: the
+    // router reserves and claims, and THIS runtime is what settles.
+    startIdempotency: startIdempotencyFor(env.DB),
     // Grants are per run. The deployment tag is infrastructure-provided and
     // reaches Breakwater only as trusted audit correlation; connector rate and
     // idempotency keys are deployment-wide by physical isolation.

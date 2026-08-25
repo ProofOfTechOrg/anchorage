@@ -6,6 +6,13 @@ import {
   deploymentIdentityRequest,
   TEST_DEPLOYMENT_IDENTITY_SECRET,
 } from '../../test-support/deployment-identity.js';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+import {
+  type ExecutionFenceDatabase,
+  ExecutionFencedError,
+  type ExecutionFenceState,
+  ExecutionFenceStore,
+} from '../do-runner/index.js';
 import {
   createThreadTopology,
   type ThreadNamespaceLike,
@@ -100,6 +107,7 @@ interface TestEnv {
   topology: ThreadTopology;
   providers: readonly SignalProviderAdapter[];
   identityDatabase?: ReturnType<typeof deploymentIdentityDatabase>;
+  executionFence?: ExecutionFenceStore;
 }
 
 class TestHost extends SignalProviderHost<TestEnv> {
@@ -121,6 +129,10 @@ class TestHost extends SignalProviderHost<TestEnv> {
       store: env.factory.store(),
       topology: env.topology,
       providers: env.providers,
+      // 'none' where a case has no fence: the subscription store is backed by
+      // an in-memory factory, so there is no database to fence. The fence cases
+      // supply a real store.
+      executionFence: env.executionFence ?? 'none',
     };
   }
 }
@@ -722,5 +734,98 @@ describe('SignalProviderHost alarm + routes', () => {
       deploymentIdentityRequest('http://host/poll', { method: 'POST' }),
     );
     expect(res.status).toBe(403);
+  });
+});
+
+describe('SignalProviderHost and the deployment execution fence', () => {
+  async function fenceAt(
+    state_: ExecutionFenceState,
+  ): Promise<ExecutionFenceStore> {
+    const fence = new ExecutionFenceStore(
+      sqliteUnitDatabase(openSqlite()) as ExecutionFenceDatabase,
+    );
+    await fence.seed(state_);
+    return fence;
+  }
+
+  it('refuses the REQUEST poll path with 503 once locked', async () => {
+    // #given
+    const factory = new InMemorySubscriptionStoreFactory();
+    await seed(factory, 'acme', 'poller', 'acme_t1');
+    const addressed: string[] = [];
+    const host = new TestHost(state(SIGNAL_PROVIDER_HOST_INSTANCE_NAME), {
+      factory,
+      topology: stubTopology(addressed),
+      providers: [pollProvider('poller', 60_000)],
+      executionFence: await fenceAt('migration-locked'),
+    });
+
+    // #then — a poll adapter re-reports state it has not seen accepted, so a
+    // refused pass costs a redelivery rather than a lost notification.
+    await expect(host.poll()).rejects.toBeInstanceOf(ExecutionFencedError);
+    expect(addressed).toEqual([]);
+
+    // #and — over the fetch surface it is the taxonomy's 503.
+    const response = await host.fetch(
+      deploymentIdentityRequest('http://host/poll', { method: 'POST' }),
+    );
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCED', state: 'migration-locked' },
+    });
+  });
+
+  it('swallows the refusal on the ALARM path and keeps its re-arm', async () => {
+    // #given — workerd retries a thrown alarm() up to six times, which would
+    // answer a deliberate operational state with a wake storm.
+    const factory = new InMemorySubscriptionStoreFactory();
+    await seed(factory, 'acme', 'poller', 'acme_t1');
+    const alarms: number[] = [];
+    const storage = {
+      setAlarm: (at: number) => {
+        alarms.push(at);
+      },
+      deleteAlarm: () => undefined,
+      getAlarm: () => null,
+    };
+    const addressed: string[] = [];
+    const host = new TestHost(
+      state(SIGNAL_PROVIDER_HOST_INSTANCE_NAME, storage),
+      {
+        factory,
+        topology: stubTopology(addressed),
+        providers: [pollProvider('poller', 60_000)],
+        executionFence: await fenceAt('migration-locked'),
+      },
+    );
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    // #when / #then
+    try {
+      await expect(host.alarm()).resolves.toBeUndefined();
+    } finally {
+      log.mockRestore();
+    }
+    expect(addressed).toEqual([]);
+    // #and — the prearm stands, so the next wake polls again once reopened.
+    expect(alarms).toHaveLength(1);
+  });
+
+  it('keeps polling while draining', async () => {
+    const factory = new InMemorySubscriptionStoreFactory();
+    await seed(factory, 'acme', 'poller', 'acme_t1');
+    const addressed: string[] = [];
+    const host = new TestHost(state(SIGNAL_PROVIDER_HOST_INSTANCE_NAME), {
+      factory,
+      topology: stubTopology(addressed),
+      providers: [pollProvider('poller', 60_000)],
+      executionFence: await fenceAt('draining'),
+    });
+
+    await expect(host.poll()).resolves.toEqual({
+      providersPolled: 1,
+      delivered: 1,
+    });
+    expect(addressed).toEqual(['acme_t1']);
   });
 });

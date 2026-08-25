@@ -33,6 +33,16 @@ let githubOwnershipMemo:
     }
   | undefined;
 
+/**
+ * The host's audit sink: one structured line to Workers Logs. Shared by every
+ * router and by the maintenance tick so a deployment's audit trail is one
+ * stream, and it lives here rather than in the Worker entry because workerd
+ * rejects a non-handler export from an entry module.
+ */
+export function audit(event: unknown): void {
+  console.log(JSON.stringify(event));
+}
+
 export function buildVerifier(env: Env): TokenVerifier {
   const key = [
     env.AUTH_HMAC_SECRET ?? '',

@@ -1160,7 +1160,7 @@ describe('createFlowsafeWorker maintenance duties', () => {
     });
   });
 
-  // Track B: the background-task TTL cleanup as the purge alarm's opt-in duty.
+  // Background-task TTL cleanup as the purge alarm's opt-in duty.
   async function seedOldCompletedTask(env: FlowsafeWorkerEnv): Promise<void> {
     await env.DB.prepare(
       `CREATE TABLE mastra_background_tasks (
@@ -1185,7 +1185,7 @@ describe('createFlowsafeWorker maintenance duties', () => {
     // #when
     await worker.runMaintenanceDuty('purge', env);
 
-    // #then — the duty never ran, byte-identical to before Track B
+    // #then — the duty never ran when the feature was absent
     const lines = maintenanceLines(logs.lines());
     expect(lines[0]).not.toHaveProperty('backgroundTasksCompletedPurged');
     expect(logs.errors()).toEqual([]);
@@ -1660,7 +1660,7 @@ describe('createFlowsafeWorker storage table prefix', () => {
   });
 });
 
-describe('createFlowsafeWorker schedule tick duty (Track D)', () => {
+describe('createFlowsafeWorker schedule tick duty', () => {
   it('the tick duty runs only the schedule tick', async () => {
     // #given a worker with a tick interval + a scheduleTick builder
     const logs = capturedLogs();
@@ -1774,5 +1774,503 @@ describe('createFlowsafeWorker schedule tick duty (Track D)', () => {
     expect(logs.lines().some((l) => l.includes('"type":"maintenance"'))).toBe(
       true,
     );
+  });
+});
+
+describe('createFlowsafeWorker approval decisions under the execution fence', () => {
+  // The store's create() takes a complete record. Requested by someone OTHER
+  // than the decider, so separation of duties is never what refuses a decide
+  // in these tests. `stepPath` makes it suspension-bound, i.e. a record whose
+  // decision genuinely drives a resume.
+  function pendingRecord(runId: string): ApprovalRecord {
+    const now = new Date('2026-08-01T00:00:00.000Z').toISOString();
+    return {
+      id: `approval-${runId}`,
+      workflowId: 'demo-approval',
+      runId,
+      stepPath: ['approval'],
+      title: 'publish launch post',
+      connectors: [],
+      priority: 'normal',
+      status: 'pending',
+      requestedBy: 'opal',
+      requestedByKind: 'human',
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
+
+  it('refuses a decide with 503 and commits NOTHING while migration-locked', async () => {
+    // #given — a worker composed exactly as a published host composes it, and a
+    // pending approval requested by someone OTHER than the decider (so
+    // separation of duties is not what refuses this).
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    const store = approvalStoreFactoryFor(env.DB).store();
+    const { record } = await store.create(pendingRecord('acme_run-fenced'));
+
+    // #and — the control plane locks the deployment through its own route,
+    // rather than by reaching for a store this test built. What that pins is
+    // AGREEMENT over the one D1 binding: the route's write and the read
+    // decide() makes land on the same database, so a worker that fenced its
+    // approval path against some other fence would fail here. It does not pin
+    // store IDENTITY — two stores over one binding would agree too — and the
+    // WeakMap that makes them one instance is pinned separately below.
+    env.MAINTENANCE_ADMIN_SECRET = 'maintenance-admin-secret-0000000001';
+    const locked = await worker.fetch(
+      new Request('http://host/admin/execution-fence', {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${env.MAINTENANCE_ADMIN_SECRET}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ expected: 'open', next: 'migration-locked' }),
+      }),
+      env,
+      ctx,
+    );
+    expect(locked.status).toBe(200);
+
+    // #when
+    const response = await worker.fetch(
+      authed(`http://host/api/approvals/${record.id}/decide`, {
+        method: 'POST',
+        body: JSON.stringify({ decision: 'approve' }),
+      }),
+      env,
+      ctx,
+    );
+
+    // #then — the taxonomy's retryable refusal, not a 500 and not a silent
+    // success. This is the case that made #assertDecidable dead code: the
+    // composer built the service without a fence, so every published host
+    // decided straight through a migration lock.
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCED', state: 'migration-locked' },
+    });
+
+    // #then — and NOTHING committed. decide() writes the decision and only
+    // then resumes, so a gate any later than the pre-commit check would leave
+    // this record durably 'approved' with a resume that 503s behind it, and
+    // the deployment taking over would inherit a decision with nothing behind
+    // it.
+    const stored = await store.get(record.id);
+    expect(stored).toMatchObject({ status: 'pending' });
+    expect(stored).not.toHaveProperty('decidedBy');
+    expect(stored).not.toHaveProperty('decision');
+    expect(stored).not.toHaveProperty('decidedAt');
+    // The whole row is byte-identical to the one that was seeded: not even
+    // updatedAt moved, so no audit trail and no reviewer notification fired
+    // either — decide() never reached its transition.
+    expect(stored).toEqual(record);
+  });
+
+  it('lets the approval lifecycle observe the NEXT read after each admin move', async () => {
+    // #given — the store-sharing invariant, in the only form that is observable
+    // from outside: the admin route and the approval service must consult one
+    // fence, per request, in both directions. A service that cached its reading
+    // at composition time, or that was handed a different store, passes the
+    // lock-then-refuse case above and fails here — it would keep refusing after
+    // the operator reopened, stranding every decision on the deployment the
+    // migration just finished with.
+    const worker = makeWorker({
+      buildResumeRun: () => async () => successSummary('acme_run-reopened'),
+    });
+    const { env, ctx } = makeEnv();
+    const store = approvalStoreFactoryFor(env.DB).store();
+    const { record } = await store.create(pendingRecord('acme_run-reopened'));
+    env.MAINTENANCE_ADMIN_SECRET = 'maintenance-admin-secret-0000000001';
+    const move = (body: unknown) =>
+      worker.fetch(
+        new Request('http://host/admin/execution-fence', {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${env.MAINTENANCE_ADMIN_SECRET}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify(body),
+        }),
+        env,
+        ctx,
+      );
+    const decide = () =>
+      worker.fetch(
+        authed(`http://host/api/approvals/${record.id}/decide`, {
+          method: 'POST',
+          body: JSON.stringify({ decision: 'approve' }),
+        }),
+        env,
+        ctx,
+      );
+
+    // #when / #then — locked, and the very next decide sees it.
+    expect(
+      (await move({ expected: 'open', next: 'migration-locked' })).status,
+    ).toBe(200);
+    expect((await decide()).status).toBe(503);
+
+    // #when / #then — reopened, and the very next decide sees THAT.
+    expect(
+      (await move({ expected: 'migration-locked', next: 'open' })).status,
+    ).toBe(200);
+    expect((await decide()).status).toBe(200);
+    await expect(store.get(record.id)).resolves.toMatchObject({
+      status: 'approved',
+    });
+  });
+
+  it('still decides while draining', async () => {
+    // #given — a drain finishes outstanding work, and a suspended run is
+    // waiting for exactly this decision.
+    const worker = makeWorker({
+      buildResumeRun: () => async () => successSummary('acme_run-draining'),
+    });
+    const { env, ctx } = makeEnv();
+    const store = approvalStoreFactoryFor(env.DB).store();
+    const { record } = await store.create(pendingRecord('acme_run-draining'));
+    env.MAINTENANCE_ADMIN_SECRET = 'maintenance-admin-secret-0000000001';
+    await worker.fetch(
+      new Request('http://host/admin/execution-fence', {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${env.MAINTENANCE_ADMIN_SECRET}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ expected: 'open', next: 'draining' }),
+      }),
+      env,
+      ctx,
+    );
+
+    // #when / #then
+    const response = await worker.fetch(
+      authed(`http://host/api/approvals/${record.id}/decide`, {
+        method: 'POST',
+        body: JSON.stringify({ decision: 'approve' }),
+      }),
+      env,
+      ctx,
+    );
+    expect(response.status).toBe(200);
+    await expect(store.get(record.id)).resolves.toMatchObject({
+      status: 'approved',
+    });
+  });
+});
+
+describe('createFlowsafeWorker execution-fence administration', () => {
+  const ADMIN_SECRET = 'maintenance-admin-secret-0000000001';
+
+  function fenceRequest(init: {
+    method: 'GET' | 'POST';
+    body?: unknown;
+    token?: string | null;
+  }): Request {
+    const token = init.token === undefined ? ADMIN_SECRET : init.token;
+    return new Request('http://host/admin/execution-fence', {
+      method: init.method,
+      headers: {
+        ...(token === null ? {} : { authorization: `Bearer ${token}` }),
+        ...(init.body === undefined
+          ? {}
+          : { 'content-type': 'application/json' }),
+      },
+      ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
+    });
+  }
+
+  it('reads and moves the fence for an authenticated control plane', async () => {
+    // #given
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+
+    // #then — a 0.19-era database reads as open with no row at all.
+    const initial = await worker.fetch(
+      fenceRequest({ method: 'GET' }),
+      env,
+      ctx,
+    );
+    expect(initial.status).toBe(200);
+    expect(await initial.json()).toEqual({ state: 'open' });
+
+    // #when — the control plane drains, then locks.
+    const drained = await worker.fetch(
+      fenceRequest({
+        method: 'POST',
+        body: { expected: 'open', next: 'draining' },
+      }),
+      env,
+      ctx,
+    );
+    expect(drained.status).toBe(200);
+    expect(await drained.json()).toEqual({ state: 'draining' });
+
+    // #then — a STALE expectation is a 409 carrying the current state, so the
+    // loser of a control-plane race can re-plan without a second round trip.
+    const stale = await worker.fetch(
+      fenceRequest({
+        method: 'POST',
+        body: { expected: 'open', next: 'migration-locked' },
+      }),
+      env,
+      ctx,
+    );
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({
+      reason: { code: 'FENCE_CAS_CONFLICT', state: 'draining' },
+    });
+
+    // #then — entering proof-only names its key, and the read reports it.
+    await worker.fetch(
+      fenceRequest({
+        method: 'POST',
+        body: { expected: 'draining', next: 'migration-locked' },
+      }),
+      env,
+      ctx,
+    );
+    const proof = await worker.fetch(
+      fenceRequest({
+        method: 'POST',
+        body: {
+          expected: 'migration-locked',
+          next: 'proof-only',
+          proofKey: 'proof-1',
+        },
+      }),
+      env,
+      ctx,
+    );
+    expect(proof.status).toBe(200);
+    const observed = await worker.fetch(
+      fenceRequest({ method: 'GET' }),
+      env,
+      ctx,
+    );
+    expect(await observed.json()).toEqual({
+      state: 'proof-only',
+      proofKey: 'proof-1',
+    });
+  });
+
+  it('rejects an unknown state name as a client error', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+
+    const response = await worker.fetch(
+      fenceRequest({
+        method: 'POST',
+        body: { expected: 'open', next: 'quiesced' },
+      }),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(400);
+  });
+
+  it("refuses 'proof-only' with no proof key", async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+
+    const response = await worker.fetch(
+      fenceRequest({
+        method: 'POST',
+        body: { expected: 'open', next: 'proof-only' },
+      }),
+      env,
+      ctx,
+    );
+
+    expect(response.status).toBe(400);
+  });
+
+  it('401s a missing or wrong credential, and never leaks the state', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+
+    for (const token of [null, 'tok-ada']) {
+      const response = await worker.fetch(
+        fenceRequest({ method: 'GET', token }),
+        env,
+        ctx,
+      );
+      expect(response.status).toBe(401);
+      expect(await response.json()).toEqual({
+        error: 'authentication required',
+      });
+    }
+  });
+
+  it('503s when the control-plane credential is unconfigured', async () => {
+    // #given — the fence is the control that stops a deployment executing, so
+    // an unauthenticated caller must never be able to move it.
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    expect(env.MAINTENANCE_ADMIN_SECRET).toBeUndefined();
+
+    // #then
+    const response = await worker.fetch(
+      fenceRequest({ method: 'GET', token: null }),
+      env,
+      ctx,
+    );
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({
+      error: 'execution fence administration unavailable',
+    });
+  });
+
+  it('503s when the control-plane credential equals the deployment identity secret', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = env.DEPLOYMENT_IDENTITY_SECRET;
+
+    const response = await worker.fetch(
+      fenceRequest({ method: 'GET' }),
+      env,
+      ctx,
+    );
+    expect(response.status).toBe(503);
+  });
+
+  it('405s a method the fence surface does not serve', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+
+    const response = await worker.fetch(
+      new Request('http://host/admin/execution-fence', { method: 'DELETE' }),
+      env,
+      ctx,
+    );
+    expect(response.status).toBe(405);
+  });
+});
+
+describe('createFlowsafeWorker drain inventory', () => {
+  const ADMIN_SECRET = 'maintenance-admin-secret-0000000002';
+
+  function inventoryRequest(
+    query = '',
+    init: { method?: string; token?: string | null } = {},
+  ): Request {
+    const token = init.token === undefined ? ADMIN_SECRET : init.token;
+    return new Request(`http://host/admin/inventory${query}`, {
+      method: init.method ?? 'GET',
+      headers: token === null ? {} : { authorization: `Bearer ${token}` },
+    });
+  }
+
+  it('serves the index, then one category, behind the shared admin gate', async () => {
+    // #given — a deployment with nothing in it yet: every inventory table is
+    // created lazily by the first feature that writes it, so this is the state
+    // a freshly provisioned Worker is really in.
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+
+    // #when — no category names the index.
+    const index = await worker.fetch(inventoryRequest(), env, ctx);
+
+    // #then — the categories, split by class, plus the rule an empty answer
+    // means something under. The contract travels with the answer because an
+    // operator who reads a count without it will lock too early.
+    expect(index.status).toBe(200);
+    const body = (await index.json()) as {
+      categories: Array<{ category: string; class: string }>;
+      unenumerable: Array<{ name: string }>;
+      drainProof: { reading: string; reachableFrom: string[] };
+    };
+    expect(body.categories.filter((c) => c.class === 'work')).toHaveLength(7);
+    expect(body.categories.filter((c) => c.class === 'standing')).toHaveLength(
+      2,
+    );
+    expect(body.unenumerable.map((entry) => entry.name)).toContain(
+      'run-owner-recovery-journal',
+    );
+    expect(body.drainProof.reachableFrom).toEqual(['draining']);
+    expect(body.drainProof.reading).toContain('point-in-time observation');
+
+    // #then — a category over a database with no tables answers EMPTY rather
+    // than faulting, and creates nothing to answer with.
+    const runs = await worker.fetch(
+      inventoryRequest('?category=runs'),
+      env,
+      ctx,
+    );
+    expect(runs.status).toBe(200);
+    expect(await runs.json()).toEqual({
+      category: 'runs',
+      class: 'work',
+      table: 'mastra_workflow_snapshot',
+      entries: [],
+    });
+  });
+
+  it('refuses an unauthenticated read, and 503s when the credential is unconfigured', async () => {
+    // #given — this read enumerates every outstanding run, approval, and
+    // reservation on the deployment. There is no capability relay behind it,
+    // so an absent secret closes the surface rather than opening it.
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+
+    // #then — unconfigured is 503, not 200.
+    expect((await worker.fetch(inventoryRequest(), env, ctx)).status).toBe(503);
+
+    // #then — configured but unpresented is 401, and a wrong token is too:
+    // neither learns anything about the deployment's state.
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+    expect(
+      (await worker.fetch(inventoryRequest('', { token: null }), env, ctx))
+        .status,
+    ).toBe(401);
+    expect(
+      (
+        await worker.fetch(
+          inventoryRequest('', { token: 'wrong-secret-0000000000000000000' }),
+          env,
+          ctx,
+        )
+      ).status,
+    ).toBe(401);
+  });
+
+  it('rejects an unknown category, a malformed limit, and a malformed cursor', async () => {
+    // #given — a sweep is only a proof if it really reaches the end. A request
+    // the route quietly "fixed" would restart the scan, and an operator
+    // watching for two consecutive empty sweeps would wait forever.
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+
+    for (const query of [
+      '?category=not-a-category',
+      '?category=runs&limit=abc',
+      '?category=runs&limit=0',
+      '?category=runs&cursor=not-json',
+      '?category=runs&cursor=%5B%22one-part-only%22%5D',
+    ]) {
+      const response = await worker.fetch(inventoryRequest(query), env, ctx);
+      expect(response.status, query).toBe(400);
+    }
+  });
+
+  it('405s a method the inventory does not serve', async () => {
+    const worker = makeWorker();
+    const { env, ctx } = makeEnv();
+    env.MAINTENANCE_ADMIN_SECRET = ADMIN_SECRET;
+
+    const response = await worker.fetch(
+      inventoryRequest('', { method: 'POST' }),
+      env,
+      ctx,
+    );
+    expect(response.status).toBe(405);
   });
 });

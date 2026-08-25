@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track D (M-006) — createScheduleRouter: the P6-lite gate order, the no-oracle
-// 404s, the count + fire-rate caps, the P4 reserved-key rejection, and the audit
+// createScheduleRouter: bounded ingestion gate order, no-oracle 404s, count and
+// fire-rate caps, reserved-context rejection, and audit
 // coverage (accept + every post-auth denial; benign GET + pre-auth NOT audited).
 
 import type {
@@ -10,6 +10,8 @@ import type {
 } from '@mastra/core/storage';
 import { describe, expect, it, vi } from 'vitest';
 
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+
 import {
   type ActorContext,
   ActorResolutionError,
@@ -17,6 +19,10 @@ import {
   type ApprovalRole,
   type ResourceOwner,
 } from '../approval-api/index.js';
+import {
+  type ExecutionFenceDatabase,
+  ExecutionFenceStore,
+} from '../do-runner/index.js';
 import { RunRouteError } from '../host-kit/index.js';
 import {
   createScheduleRouter as createScheduleRouterImpl,
@@ -171,6 +177,7 @@ function harness(
     targetPolicy?: ScheduleTargetPolicy;
     audit?: ScheduleRouterOptions['audit'];
     validateThreadTarget?: ScheduleRouterOptions['validateThreadTarget'];
+    executionFence?: ScheduleRouterOptions['executionFence'];
   } = {},
 ): Harness {
   const store = new MemStore();
@@ -198,6 +205,9 @@ function harness(
     ...(overrides.validateThreadTarget !== undefined
       ? { validateThreadTarget: overrides.validateThreadTarget }
       : {}),
+    // 'none' is the honest wiring for MemStore — no database, nothing to fence.
+    // The fence cases below pass a real store.
+    executionFence: overrides.executionFence ?? 'none',
   });
   const call = async (method: string, path: string, body?: unknown) => {
     const res = await router(
@@ -230,6 +240,7 @@ describe('createScheduleRouter — gate order', () => {
     const router = createScheduleRouter({
       resolve: resolveAs(ctx('acme', 'operator')),
       store: new MemStore(),
+      executionFence: 'none',
     });
     expect(await router(new Request('http://host/api/other'))).toBeNull();
     // sanity: our own base IS handled
@@ -243,6 +254,7 @@ describe('createScheduleRouter — gate order', () => {
     const router = createScheduleRouter({
       resolve: resolveAs(ctx('acme', 'operator')),
       store: new MemStore(),
+      executionFence: 'none',
     });
     const res = await router(
       new Request('http://host/api/schedules/%', { method: 'GET' }),
@@ -552,7 +564,7 @@ describe('createScheduleRouter — create', () => {
     expect(res.status).toBe(400);
   });
 
-  it('400s + audits a reserved requestContext key (P4 barrier a)', async () => {
+  it('400s + audits a reserved requestContext key', async () => {
     const { call, events } = harness(ctx('acme', 'operator'));
     const res = await call('POST', '/api/schedules', {
       ...WORKFLOW_CREATE,
@@ -601,7 +613,7 @@ describe('createScheduleRouter — create', () => {
     );
   });
 
-  it('400s a cron that fires faster than the fire-rate floor (DL-007)', async () => {
+  it('400s a cron that fires faster than the fire-rate floor', async () => {
     // floor 2min; a per-minute cron (60s interval) is under it
     const { call, events } = harness(ctx('acme', 'operator'), {
       minFireIntervalMs: 120_000,
@@ -616,7 +628,7 @@ describe('createScheduleRouter — create', () => {
     );
   });
 
-  it('400s at the deployment COUNT cap (DL-007)', async () => {
+  it('400s at the deployment COUNT cap', async () => {
     const { call, events } = harness(ctx('acme', 'operator'), {
       maxSchedules: 1,
     });
@@ -655,6 +667,7 @@ describe('createScheduleRouter — resource-scoped reads', () => {
     const router = createScheduleRouter({
       resolve: resolveAs(ctx('xyz', 'operator', async () => false)),
       store,
+      executionFence: 'none',
     });
     const response = await router(
       new Request(`http://host/api/schedules/${id}`),
@@ -667,6 +680,7 @@ describe('createScheduleRouter — resource-scoped reads', () => {
     const router = createScheduleRouter({
       resolve: resolveAs(ctx('review', 'viewer', async () => true)),
       store,
+      executionFence: 'none',
     });
     const response = await router(
       new Request(`http://host/api/schedules/${id}`),
@@ -680,6 +694,7 @@ describe('createScheduleRouter — resource-scoped reads', () => {
       createScheduleRouter({
         resolve: resolveAs(context),
         store,
+        executionFence: 'none',
       });
     const ids: string[] = [];
     for (const actorLabel of ['acme', 'xyz']) {
@@ -970,6 +985,7 @@ describe('createScheduleRouter internal errors', () => {
     const router = createScheduleRouter({
       resolve: resolveAs(ctx('acme', 'operator')),
       store,
+      executionFence: 'none',
     });
 
     try {
@@ -981,5 +997,131 @@ describe('createScheduleRouter internal errors', () => {
     } finally {
       log.mockRestore();
     }
+  });
+});
+
+describe('createScheduleRouter and the deployment execution fence', () => {
+  it('will not compile without explicit fence wiring', () => {
+    // A TYPE-level pin on the forcing function, and the representative for the
+    // whole required-`executionFence` sweep: the compile error is what stops a
+    // host wiring the runtime's fence and forgetting a router's, which is the
+    // partially-fenced deployment the option exists to prevent.
+    //
+    // An unused suppression directive is itself an error in this package's
+    // tsconfig, so `tsc` exiting 0 is what proves the negative. (The directive
+    // below must be the only one in this comment block — a prose line that
+    // BEGINS with the directive text is parsed as one.)
+    const build = (): unknown =>
+      // @ts-expect-error a schedule router must state its fence wiring
+      createScheduleRouterImpl({
+        resolve: resolveAs(ctx('acme', 'operator')),
+        store: new MemStore(),
+        targetPolicy: TARGET_POLICY,
+        validateThreadTarget: async () => undefined,
+      });
+    expect(build).toBeTypeOf('function');
+  });
+
+  async function drainingFence(): Promise<ExecutionFenceStore> {
+    const fence = new ExecutionFenceStore(
+      sqliteUnitDatabase(openSqlite()) as ExecutionFenceDatabase,
+    );
+    await fence.seed('draining');
+    return fence;
+  }
+
+  function unreadableFence(): ExecutionFenceStore {
+    // Storage that faults on every query — NOT the "no such table" a pre-0.20
+    // database answers with, which legitimately reads as open.
+    return new ExecutionFenceStore({
+      prepare: () => ({
+        bind: () => ({
+          bind: () => {
+            throw new Error('unreachable');
+          },
+          run: () => Promise.reject(new Error('D1_ERROR: network')),
+          all: () => Promise.reject(new Error('D1_ERROR: network')),
+        }),
+        run: () => Promise.reject(new Error('D1_ERROR: network')),
+        all: () => Promise.reject(new Error('D1_ERROR: network')),
+      }),
+    } as unknown as ExecutionFenceDatabase);
+  }
+
+  it('degrades a mutation closed with 503 when the fence cannot be read', async () => {
+    // #given
+    const { store, call } = harness(ctx('acme', 'operator'), {
+      executionFence: unreadableFence(),
+    });
+
+    // #then — never the generic 500: an operator must be able to tell a
+    // deployment being migrated from a broken one, and the write did not land.
+    const res = await call('POST', '/api/schedules', WORKFLOW_CREATE);
+    expect(res.status).toBe(503);
+    expect(res.body.reason).toEqual({ code: 'EXECUTION_FENCE_UNREADABLE' });
+    expect(store.m.size).toBe(0);
+  });
+
+  it('refuses create, update, and resume once the deployment is draining', async () => {
+    // #given
+    const executionFence = await drainingFence();
+    const { store, events, call } = harness(ctx('acme', 'operator'), {
+      executionFence,
+    });
+    store.m.set('s1', {
+      id: 's1',
+      target: { type: 'workflow', workflowId: 'wf', inputData: {} },
+      cron: '*/5 * * * *',
+      status: 'paused',
+      nextFireAt: 0,
+      createdAt: 0,
+      updatedAt: 0,
+      metadata: {},
+    } as Schedule);
+
+    // #when / #then — every operation that ARMS a future fire is refused with
+    // the taxonomy's retryable status and code.
+    for (const [method, path, body] of [
+      ['POST', '/api/schedules', WORKFLOW_CREATE],
+      ['PATCH', '/api/schedules/s1', { cron: '*/10 * * * *' }],
+      ['POST', '/api/schedules/s1/resume', undefined],
+    ] as const) {
+      const res = await call(method, path, body);
+      expect(res.status).toBe(503);
+      expect(res.body.reason).toEqual({
+        code: 'EXECUTION_FENCED',
+        state: 'draining',
+      });
+    }
+    expect(store.m.size).toBe(1);
+    expect(
+      events.filter((event) => event.reason === 'execution-fenced'),
+    ).toHaveLength(3);
+  });
+
+  it('keeps pause, delete, and every read available while draining', async () => {
+    // #given — pause and delete TAKE WORK AWAY, which is the direction a drain
+    // is going, and a read moves nothing.
+    const executionFence = await drainingFence();
+    const { store, call } = harness(ctx('acme', 'operator'), {
+      executionFence,
+    });
+    store.m.set('s1', {
+      id: 's1',
+      target: { type: 'workflow', workflowId: 'wf', inputData: {} },
+      cron: '*/5 * * * *',
+      status: 'active',
+      nextFireAt: 0,
+      createdAt: 0,
+      updatedAt: 0,
+      metadata: {},
+    } as Schedule);
+
+    // #then
+    expect((await call('GET', '/api/schedules')).status).toBe(200);
+    expect((await call('GET', '/api/schedules/s1')).status).toBe(200);
+    expect((await call('POST', '/api/schedules/s1/pause')).status).toBe(200);
+    expect((await call('DELETE', '/api/schedules/s1')).status).toBe(200);
+    expect(store.m.size).toBe(0);
   });
 });

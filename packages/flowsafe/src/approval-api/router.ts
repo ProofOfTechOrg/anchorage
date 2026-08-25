@@ -15,6 +15,7 @@
 // records that carry grants are minted in-process from an observed suspension,
 // never from a request body.
 
+import { isExecutionFenceRefusal } from '../do-runner/execution-fence.js';
 import { isPathSafeId } from '../do-runner/path-safe-id.js';
 import { readBoundedBody } from '../http-body.js';
 import { ActorResolutionError, type ActorResolver } from './actor-context.js';
@@ -126,6 +127,13 @@ function json(payload: unknown, status = 200): Response {
 }
 
 function errorResponse(error: unknown): Response {
+  // The deployment execution fence refusing, or failing to answer. 503 with
+  // its reason code, never the generic 500 below: a decision refused because
+  // this deployment is being migrated is retryable, and a reviewer's client
+  // must be able to tell that from a broken queue.
+  if (isExecutionFenceRefusal(error)) {
+    return json({ error: error.message, reason: error.reason }, error.status);
+  }
   if (error instanceof ApprovalPayloadTooLargeError) {
     return json({ error: error.message }, 413);
   }
@@ -330,7 +338,7 @@ export function createApprovalRouter(
           }
           if (!isPathSafeId(runId)) {
             throw new InvalidApprovalInputError(
-              `runId '${runId}' is not path-safe — approvals bind to server-minted runs (INV-1)`,
+              `runId '${runId}' is not path-safe — approvals bind to server-minted runs`,
             );
           }
           // The optional public filing route may only attach a request to a

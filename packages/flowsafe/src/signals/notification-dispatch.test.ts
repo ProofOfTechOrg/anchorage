@@ -3,11 +3,35 @@
 import { InMemoryNotificationsStorage } from '@mastra/core/notifications';
 import { describe, expect, it, vi } from 'vitest';
 
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 import type { ActorContext } from '../approval-api/index.js';
+import {
+  type ExecutionFenceDatabase,
+  type ExecutionFenceState,
+  ExecutionFenceStore,
+} from '../do-runner/index.js';
 import type { ThreadTopology } from '../host-kit/index.js';
-import { createNotificationDispatchTick } from './notification-dispatch.js';
+import {
+  createNotificationDispatchTick as createNotificationDispatchTickImpl,
+  type NotificationDispatchTickOptions,
+} from './notification-dispatch.js';
 
 const NOW = new Date('2026-07-20T12:00:00.000Z');
+
+/**
+ * The tick under test with the fence defaulted to the honest wiring for these
+ * cases: the notifications storage is in-memory, so there is no database to
+ * fence. The fence cases at the bottom of this file pass a real store.
+ */
+function createNotificationDispatchTick(
+  options: Omit<NotificationDispatchTickOptions, 'executionFence'> &
+    Partial<Pick<NotificationDispatchTickOptions, 'executionFence'>>,
+) {
+  return createNotificationDispatchTickImpl({
+    ...options,
+    executionFence: options.executionFence ?? 'none',
+  });
+}
 
 function actorContext(groupId = 'deployment'): ActorContext {
   return {
@@ -658,5 +682,87 @@ describe('createNotificationDispatchTick', () => {
     });
     expect(list).not.toHaveBeenCalled();
     expect(send).not.toHaveBeenCalled();
+  });
+});
+
+describe('createNotificationDispatchTick and the deployment execution fence', () => {
+  async function fenceAt(
+    state: ExecutionFenceState,
+  ): Promise<ExecutionFenceStore> {
+    const fence = new ExecutionFenceStore(
+      sqliteUnitDatabase(openSqlite()) as ExecutionFenceDatabase,
+    );
+    await fence.seed(state);
+    return fence;
+  }
+
+  async function dueRow(): Promise<InMemoryNotificationsStorage> {
+    const storage = new InMemoryNotificationsStorage();
+    await storage.createNotification({
+      id: 'due-1',
+      threadId: 'acme_thread',
+      resourceId: 'acme_resource',
+      agentId: 'agent',
+      source: 'test',
+      kind: 'ready',
+      summary: 'due',
+      deliverAt: new Date(NOW.getTime() - 1),
+    });
+    return storage;
+  }
+
+  it('skips the whole pass once locked, leaving the row due', async () => {
+    // #given
+    const storage = await dueRow();
+    const send = vi.fn(
+      async () => new Response(JSON.stringify({ delivered: 1, failed: 0 })),
+    );
+    const executionFence = await fenceAt('migration-locked');
+    const tick = createNotificationDispatchTick({
+      storage,
+      topology: { send } as unknown as ThreadTopology,
+      resolveContext: actorContext,
+      now: () => NOW,
+      executionFence,
+    });
+
+    // #when / #then — no thread DO addressed, and the row is untouched: the
+    // deployment taking over dispatches it.
+    expect(await tick()).toEqual({ due: 0, delivered: 0, failed: 0 });
+    expect(send).not.toHaveBeenCalled();
+    const row = await storage.getNotification({
+      threadId: 'acme_thread',
+      id: 'due-1',
+    });
+    expect(row?.deliveryAttempts ?? 0).toBe(0);
+
+    // #when — reopened
+    await executionFence.transition({
+      expected: 'migration-locked',
+      next: 'open',
+    });
+
+    // #then — the same row dispatches, exactly once.
+    expect(await tick()).toEqual({ due: 1, delivered: 1, failed: 0 });
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps dispatching while draining', async () => {
+    // #given — the thread routes degrade a wake to a persist under a drain, so
+    // the inbox drains without minting.
+    const storage = await dueRow();
+    const send = vi.fn(
+      async () => new Response(JSON.stringify({ delivered: 1, failed: 0 })),
+    );
+    const tick = createNotificationDispatchTick({
+      storage,
+      topology: { send } as unknown as ThreadTopology,
+      resolveContext: actorContext,
+      now: () => NOW,
+      executionFence: await fenceAt('draining'),
+    });
+
+    // #then
+    expect(await tick()).toEqual({ due: 1, delivered: 1, failed: 0 });
   });
 });

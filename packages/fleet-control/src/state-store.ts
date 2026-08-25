@@ -144,39 +144,49 @@ const FLEET_ROW_COLUMNS = [
   'database_export_location',
   'database_export_sha256',
   'database_export_size',
+  'settled_settlement_key',
   'updated_at',
 ] as const;
 
-function isDuplicateBackendSwitchColumn(error: unknown): boolean {
+/**
+ * Nullable TEXT columns added to a table that already shipped, in the order
+ * they were added. Each is created by ALTER on an existing database and by the
+ * CREATE above on a new one, and each is asserted present afterwards: a column
+ * that silently failed to appear would not fail a write, it would drop the
+ * value on every write.
+ */
+export const ADDED_NULLABLE_TEXT_COLUMNS = [
+  'backend_switch_intent',
+  'settled_settlement_key',
+] as const;
+
+function isDuplicateColumnError(
+  error: unknown,
+  column: (typeof ADDED_NULLABLE_TEXT_COLUMNS)[number],
+): boolean {
+  const duplicate = new RegExp(`duplicate column name:\\s*${column}\\b`, 'iu');
   let current = error;
   const seen = new Set<Error>();
   while (current instanceof Error && !seen.has(current)) {
     seen.add(current);
-    if (
-      /duplicate column name:\s*backend_switch_intent\b/iu.test(current.message)
-    ) {
-      return true;
-    }
+    if (duplicate.test(current.message)) return true;
     current = current.cause;
   }
   return false;
 }
 
-function assertBackendSwitchColumn(
+function assertNullableTextColumn(
   columns: readonly Readonly<Record<string, unknown>>[],
+  name: string,
 ): void {
-  const column = columns.find(
-    (candidate) => candidate.name === 'backend_switch_intent',
-  );
+  const column = columns.find((candidate) => candidate.name === name);
   if (
     !column ||
     String(column.type).toUpperCase() !== 'TEXT' ||
     Number(column.notnull) !== 0 ||
     Number(column.pk) !== 0
   ) {
-    throw new Error(
-      'fleet state backend_switch_intent column is absent or incompatible',
-    );
+    throw new Error(`fleet state ${name} column is absent or incompatible`);
   }
 }
 
@@ -887,6 +897,15 @@ function toRecord(row: Readonly<Record<string, unknown>>): FleetRecord {
   ) {
     throw new Error('fleet state row has invalid database_export_size');
   }
+  const settledSettlementKey = row.settled_settlement_key;
+  if (
+    settledSettlementKey !== null &&
+    settledSettlementKey !== undefined &&
+    (typeof settledSettlementKey !== 'string' ||
+      !isSha256(settledSettlementKey))
+  ) {
+    throw new Error('fleet state row has invalid settled_settlement_key');
+  }
   const durableObjectBindings = JSON.parse(
     rowString(row, 'durable_object_bindings'),
   ) as unknown;
@@ -1117,6 +1136,9 @@ function toRecord(row: Readonly<Record<string, unknown>>): FleetRecord {
     ...(databaseExportSize !== null && databaseExportSize !== undefined
       ? { databaseExportSize: Number(databaseExportSize) }
       : {}),
+    ...(typeof settledSettlementKey === 'string' && settledSettlementKey
+      ? { settledSettlementKey }
+      : {}),
     updatedAt: rowString(row, 'updated_at'),
   };
 }
@@ -1196,6 +1218,7 @@ export class D1FleetStateStore
       database_export_location TEXT,
       database_export_sha256 TEXT,
       database_export_size INTEGER,
+      settled_settlement_key TEXT,
       updated_at TEXT NOT NULL,
       PRIMARY KEY (tenant_tag, environment),
       UNIQUE (backend, script_name),
@@ -1204,19 +1227,19 @@ export class D1FleetStateStore
       UNIQUE (route_hostname)
     )`);
     let fleetColumns = await this.#db.query(`PRAGMA table_info(${TABLE})`);
-    if (
-      !fleetColumns.some((column) => column.name === 'backend_switch_intent')
-    ) {
+    for (const name of ADDED_NULLABLE_TEXT_COLUMNS) {
+      if (fleetColumns.some((column) => column.name === name)) continue;
       try {
-        await this.#db.execute(
-          `ALTER TABLE ${TABLE} ADD COLUMN backend_switch_intent TEXT`,
-        );
+        await this.#db.execute(`ALTER TABLE ${TABLE} ADD COLUMN ${name} TEXT`);
       } catch (error) {
-        if (!isDuplicateBackendSwitchColumn(error)) throw error;
+        // A replica that added the same column between the read and the write.
+        if (!isDuplicateColumnError(error, name)) throw error;
       }
       fleetColumns = await this.#db.query(`PRAGMA table_info(${TABLE})`);
     }
-    assertBackendSwitchColumn(fleetColumns);
+    for (const name of ADDED_NULLABLE_TEXT_COLUMNS) {
+      assertNullableTextColumn(fleetColumns, name);
+    }
     await this.#db.execute(`UPDATE ${TABLE}
         SET backend_switch_intent = migration_intent,
             migration_intent = NULL
@@ -1777,6 +1800,7 @@ export class D1FleetStateStore
       record.databaseExportLocation ?? null,
       record.databaseExportSha256 ?? null,
       record.databaseExportSize ?? null,
+      record.settledSettlementKey ?? null,
       record.updatedAt,
     ] as const;
     const upsertSql = `INSERT INTO ${TABLE} (
@@ -1789,13 +1813,13 @@ export class D1FleetStateStore
         durable_object_bindings, application_resources, application_bindings,
         route_hostname, phase,
         database_export_location, database_export_sha256,
-        database_export_size, updated_at
+        database_export_size, settled_settlement_key, updated_at
       ) SELECT CASE WHEN EXISTS (
         SELECT 1 FROM ${LEASE_TABLE}
         WHERE tenant_tag = ? AND environment = ? AND owner_token = ?
           AND expires_at > ${DB_NOW_MS}
       ) THEN ? ELSE NULL END,
-      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       WHERE true
       ON CONFLICT (tenant_tag, environment) DO UPDATE SET
         backend = excluded.backend,
@@ -1828,6 +1852,7 @@ export class D1FleetStateStore
         database_export_location = excluded.database_export_location,
         database_export_sha256 = excluded.database_export_sha256,
         database_export_size = excluded.database_export_size,
+        settled_settlement_key = excluded.settled_settlement_key,
         updated_at = excluded.updated_at
       RETURNING tenant_tag, environment`;
     let results: readonly (readonly Readonly<Record<string, unknown>>[])[];

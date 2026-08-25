@@ -99,6 +99,16 @@ Workers Routes Write across every zone in the selected account. Fleet control
 discovers that complete account-filtered zone set and rejects partial token
 scope instead of accepting a configured zone list.
 
+### Attest and settle promoted releases
+
+Fleet Control attests provider routing after every package-owned promotion, including provision, every migration branch, and rollback. An ordinary Worker must have exactly one version at 100 percent; a second version at 0 percent still makes the deployment ambiguous and is refused. Workers for Platforms attestation begins with the hostname mapping and inspects the physical script it actually names. The package never chooses a routed version by highest share.
+
+Use `attestFleetRecordActiveRoute()` for host-side drift reads and cache its result. One call costs two provider reads for a plain Worker or three for Workers for Platforms. Use `attestConvergedActiveRoute()` around custom promote paths that must wait for provider propagation.
+
+`migrateFleet({ settlementFor, routeAttestation })` and `rollbackExternalRelease({ settlement, routeAttestation })` can run a host settlement callback under the deployment lease after attestation. Settlement is delivered at least once under a stable `settlementKey`; deduplicate every external effect by that key. The package applies no callback timeout and renews the lease while `settle()` runs, so enqueue slow work. `prior` identifies the replaced release for migration entries and the abandoned active release for rollback.
+
+Initial `provisionDeployment()` calls require `initialExecutionFenceState: 'open' | 'migration-locked'`, attest the routed release before committing `ready`, and consult no settlement host. Settle after it returns by calling `attestFleetRecordActiveRoute()`. Backend implementations must add `attestActiveRoute()`, and custom `PlainWorkerRouteApi` implementations must add `inspectActiveWorkerRoute()`. `seedDeploymentIdentity()` now takes `{ initialExecutionFenceState }` as its fourth argument.
+
 ## Import it only from a trusted control plane
 
 Account credentials, routing ownership, billing policy, and tenant lifecycle belong to the hosted control plane. Do not import this package into a data-plane Worker, and do not give a Worker that serves tenant requests a Cloudflare API token that reaches it.

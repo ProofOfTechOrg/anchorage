@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track A acceptance criteria #2 + #3, proven against the REAL runtime +
-// breakwater connector + grant provider + host-kit bridge (no LLM needed):
+// The durable-agent approval round trip, proven against the REAL runtime,
+// breakwater connector, grant provider, and host-kit bridge (no LLM needed):
 //
-//   - S1/S2: the ENGINE-LEG requestContext reaches the connector, so an approved
-//     agent gate mints the grant the write gate demands and the run completes;
-//     a FORGED resume that mints no grant fails closed at that same gate.
-//   - R-003: BOTH durable approval-suspend shapes (flat + nested) round-trip
+//   - The ENGINE-LEG requestContext reaches the connector, so an approved agent
+//     gate mints the grant the write gate demands and the run completes. A
+//     FORGED resume that mints no grant fails closed at that same gate.
+//   - BOTH durable approval-suspend shapes (flat + nested) round-trip
 //     through the grant-only path — the bridge derives connectors:[toolName]
 //     from the agent shape (not an explicit `connectors` array), and the
 //     decision resumes on the (suspendedAt, resumeCount) fingerprint.
 //
-// This is the composition S1 verified in dist made executable: the workflow
-// here MIMICS the durable-agentic-loop's tool-call gate (suspend with the agent
-// payload shape, then call a write-gated connector using the step-param
-// requestContext), which is exactly the mechanic the real loop uses
+// This makes the dist-verified composition executable: the workflow MIMICS the
+// durable-agentic-loop's tool-call gate by suspending with the agent payload
+// shape, then calling a write-gated connector with the step-param
+// requestContext. This is exactly the mechanic the real loop uses
 // (agent/durable index.js: params.requestContext -> toolOptions -> tool.execute).
 
 import { Agent } from '@mastra/core/agent';
@@ -161,6 +161,8 @@ function buildHarness(
     const { createWorkflow, createStep, runtime } = init(
       { storage },
       {
+        startIdempotency: 'none',
+        executionFence: 'none',
         requestContextForRun: async (id, runId, leg) => ({
           ...(await grantProvider(id, runId, leg)),
           ...(options.principalPermissions !== undefined
@@ -247,6 +249,9 @@ function buildHarness(
   const runtime = makeRuntime();
   const service = new ApprovalService({
     store,
+    // In-memory store, no database to fence against: the opt-out is written down
+    // rather than defaulted — see ExecutionFenceWiring.
+    executionFence: 'none',
     resumeRun: resumeViaRuntime(runtime),
   });
 
@@ -261,7 +266,7 @@ function buildHarness(
   };
 }
 
-describe('agent gate grant round-trip (R-003, both shapes)', () => {
+describe('agent gate grant round-trip (both suspension shapes)', () => {
   for (const shape of ['flat', 'nested'] as const) {
     it(`${shape} shape: an approved agent gate mints the grant and the connector runs`, async () => {
       // #given — a run suspended at the agent tool-call gate
@@ -273,8 +278,8 @@ describe('agent gate grant round-trip (R-003, both shapes)', () => {
       expect(started.status).toBe('suspended');
 
       // #when — the suspension is bridged to an approval record. The bridge must
-      // derive the connector to grant FROM the agent suspend shape (R-003),
-      // since the payload carries no explicit `connectors` array.
+      // derive the connector to grant FROM the agent suspend shape, since the
+      // payload carries no explicit `connectors` array.
       const [record] = await queueApprovalForSuspension(
         h.service,
         'agent-launch',
@@ -525,6 +530,7 @@ describe('agent gate grant round-trip (R-003, both shapes)', () => {
     const evicted = h.makeRuntime();
     const service = new ApprovalService({
       store: h.store,
+      executionFence: 'none',
       resumeRun: resumeViaRuntime(evicted),
     });
     const [record] = await queueApprovalForSuspension(
@@ -560,8 +566,14 @@ describe('agent gate grant round-trip (R-003, both shapes)', () => {
     const store = new InMemoryApprovalStore();
     const connectorAudit = new AuditLogger();
     const makeRuntime = () =>
-      init({ storage }, { requestContextForRun: approvalGrantProvider(store) })
-        .runtime;
+      init(
+        { storage },
+        {
+          startIdempotency: 'none',
+          requestContextForRun: approvalGrantProvider(store),
+          executionFence: 'none',
+        },
+      ).runtime;
     const modelCalls = vi.fn();
     let initialPublishes = 0;
     let rehydratedPublishes = 0;
@@ -647,6 +659,7 @@ describe('agent gate grant round-trip (R-003, both shapes)', () => {
     } as never);
     const service = new ApprovalService({
       store,
+      executionFence: 'none',
       resumeRun: (record, decision) =>
         reconstructed.resumeViaRuntime({
           runId: record.runId,

@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-// The goal objective HTTP surface (createObjectiveRouter): the P6-lite gate ORDER
-// (401 -> ownership -> role -> size/body/field/cap -> audit -> persist), each
-// fail-closed, plus the set/get/update/clear round-trip (byte-identical to core's
-// Agent goal methods), the maxRuns host cap, and the GOAL_REQUEST_CONTEXT_KEY
-// no-collision reservation — over mock resolve + store seams.
+// The goal objective HTTP surface (createObjectiveRouter): bounded ingestion
+// gate order (401 -> ownership -> role -> size/body/field/cap -> audit ->
+// persist). Each fails closed. The suite also covers the set/get/update/clear
+// round-trip, byte-identical to core's Agent goal methods, the maxRuns host
+// cap, and the GOAL_REQUEST_CONTEXT_KEY no-collision reservation over mock
+// resolver and store seams.
 
 import { describe, expect, it, vi } from 'vitest';
+
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
 
 import type { ActorContext, ApprovalActor } from '../approval-api/index.js';
 import {
@@ -15,6 +18,11 @@ import {
   BREAKWATER_ISOLATION_SCOPE_KEY,
   BREAKWATER_WORKFLOW_SCOPE_KEY,
 } from '../do-runner/breakwater-keys.js';
+import {
+  type ExecutionFenceDatabase,
+  type ExecutionFenceState,
+  ExecutionFenceStore,
+} from '../do-runner/index.js';
 import { RunRouteError } from '../host-kit/index.js';
 import {
   createObjectiveRouter as createObjectiveRouterImpl,
@@ -26,12 +34,24 @@ import {
 
 const OWNED_THREAD = 'acme_t1';
 
+/**
+ * The router under test with the two options every case would otherwise repeat
+ * defaulted. `executionFence: 'none'` is the honest wiring for the in-memory
+ * ObjectiveStore these cases use — there is no database to fence — and the
+ * fence cases below pass a real store, so nothing here weakens their gate.
+ */
 function createObjectiveRouter(
-  options: Omit<ObjectiveRouterOptions, 'validateThreadTarget'> &
-    Partial<Pick<ObjectiveRouterOptions, 'validateThreadTarget'>>,
+  options: Omit<
+    ObjectiveRouterOptions,
+    'validateThreadTarget' | 'executionFence'
+  > &
+    Partial<
+      Pick<ObjectiveRouterOptions, 'validateThreadTarget' | 'executionFence'>
+    >,
 ) {
   return createObjectiveRouterImpl({
     ...options,
+    executionFence: options.executionFence ?? 'none',
     validateThreadTarget:
       options.validateThreadTarget ?? (async () => undefined),
   });
@@ -108,7 +128,7 @@ interface GoalRecord {
   prompt?: string;
 }
 
-describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
+describe('createObjectiveRouter — bounded ingestion gate', () => {
   it.each([
     { maxRunsCap: 0 },
     { maxRunsCap: 1.5 },
@@ -379,7 +399,7 @@ describe('createObjectiveRouter — the P6-lite ingestion gate', () => {
   });
 });
 
-describe('createObjectiveRouter — maxRuns host cap (DL-007)', () => {
+describe('createObjectiveRouter — maxRuns host cap', () => {
   it('rejects a maxRuns above the host cap and audits it (never clamps)', async () => {
     const { store, raw } = memoryStore();
     const events: ObjectiveAuditEvent[] = [];
@@ -594,7 +614,7 @@ describe('createObjectiveRouter — set / get / update / clear round-trip', () =
   });
 });
 
-describe('GOAL_REQUEST_CONTEXT_KEY reservation (DL-018 no-collision pin)', () => {
+describe('GOAL_REQUEST_CONTEXT_KEY reservation', () => {
   // The keys #requestContextFor mints on a leg: the workflow-scope + isolation-
   // scope base (runtime.ts) plus the grant/actor keys the provider merges over
   // them. ALL are the breakwater 'breakwater.*' namespace; the goal key is
@@ -613,11 +633,11 @@ describe('GOAL_REQUEST_CONTEXT_KEY reservation (DL-018 no-collision pin)', () =>
   });
 
   it('pins the mirrored value to the core dist declaration (drift guard)', () => {
-    // GOAL_REQUEST_CONTEXT_KEY is not exports-reachable (R-001), so the mirror
+    // GOAL_REQUEST_CONTEXT_KEY is not exports-reachable, so the mirror
     // cannot be compared via an import — read the pinned core's own .d.ts
     // declaration instead. A core bump that changes the value (or moves the
-    // file) fails HERE loudly, per the P9 re-anchor protocol. Builtins load via
-    // process.getBuiltinModule (the test-support/sqlite.ts idiom) and
+    // file) fails HERE loudly under the re-anchoring protocol. Builtins load
+    // via process.getBuiltinModule (the test-support/sqlite.ts idiom) and
     // import.meta.url is cast, so this workers-typed program never sees a
     // node: import it cannot type.
     const getBuiltin = (
@@ -691,5 +711,139 @@ describe('createObjectiveRouter internal errors', () => {
     } finally {
       log.mockRestore();
     }
+  });
+});
+
+describe('createObjectiveRouter and the deployment execution fence', () => {
+  async function fenceAt(
+    state: ExecutionFenceState,
+  ): Promise<ExecutionFenceStore> {
+    const fence = new ExecutionFenceStore(
+      sqliteUnitDatabase(openSqlite()) as ExecutionFenceDatabase,
+    );
+    await fence.seed(state);
+    return fence;
+  }
+
+  function unreadableFence(): ExecutionFenceStore {
+    // Storage that faults on every query — NOT the "no such table" a pre-0.20
+    // database answers with, which legitimately reads as open.
+    return new ExecutionFenceStore({
+      prepare: () => ({
+        bind: () => ({
+          bind: () => {
+            throw new Error('unreachable');
+          },
+          run: () => Promise.reject(new Error('D1_ERROR: network')),
+          all: () => Promise.reject(new Error('D1_ERROR: network')),
+        }),
+        run: () => Promise.reject(new Error('D1_ERROR: network')),
+        all: () => Promise.reject(new Error('D1_ERROR: network')),
+      }),
+    } as unknown as ExecutionFenceDatabase);
+  }
+
+  it('degrades a mutation closed with 503 when the fence cannot be read', async () => {
+    // #given
+    const { store, raw } = memoryStore();
+    const router = createObjectiveRouter({
+      resolve: async () => actorContext('operator'),
+      store,
+      executionFence: unreadableFence(),
+    });
+
+    // #then
+    const res = await router(
+      req('PUT', OWNED_THREAD, { objective: 'ship it' }),
+    );
+    expect(res?.status).toBe(503);
+    expect(await res?.json()).toMatchObject({
+      reason: { code: 'EXECUTION_FENCE_UNREADABLE' },
+    });
+    expect(raw.size).toBe(0);
+  });
+
+  it('refuses every objective-ARMING mutation once draining, and writes nothing', async () => {
+    // #given — a standing objective is authored work: it is what the agent loop
+    // re-reads to decide it should run again.
+    const { store, raw } = memoryStore();
+    const events: ObjectiveAuditEvent[] = [];
+    const router = createObjectiveRouter({
+      resolve: async () => actorContext('operator'),
+      store,
+      audit: (event) => {
+        events.push(event);
+      },
+      executionFence: await fenceAt('draining'),
+    });
+
+    // #when / #then
+    for (const request of [
+      req('PUT', OWNED_THREAD, { objective: 'ship it' }),
+      req('PATCH', OWNED_THREAD, { status: 'paused' }),
+    ]) {
+      const res = await router(request);
+      expect(res?.status).toBe(503);
+      expect(await res?.json()).toMatchObject({
+        reason: { code: 'EXECUTION_FENCED', state: 'draining' },
+      });
+    }
+    expect(raw.size).toBe(0);
+    expect(
+      events.filter((event) => event.reason === 'execution-fenced'),
+    ).toHaveLength(2);
+  });
+
+  it('keeps CLEAR open in every state, because clearing removes future work', async () => {
+    // #given — an objective already authored, on a deployment locked down for a
+    // migration. `clear` is the exemption schedule pause/delete get: it takes
+    // standing work AWAY, which is the direction a drain is going, and refusing
+    // it would leave an operator unable to quiet an agent they are migrating.
+    const { store, raw } = memoryStore();
+    const events: ObjectiveAuditEvent[] = [];
+    const open = createObjectiveRouter({
+      resolve: async () => actorContext('operator'),
+      store,
+      executionFence: await fenceAt('open'),
+    });
+    expect(
+      (await open(req('PUT', OWNED_THREAD, { objective: 'ship it' })))?.status,
+    ).toBe(200);
+    expect(raw.size).toBe(1);
+
+    // #when — the same store behind a migration-locked fence.
+    const locked = createObjectiveRouter({
+      resolve: async () => actorContext('operator'),
+      store,
+      audit: (event) => {
+        events.push(event);
+      },
+      executionFence: await fenceAt('migration-locked'),
+    });
+    const res = await locked(req('DELETE', OWNED_THREAD));
+
+    // #then — accepted, committed, and audited as a committed mutation rather
+    // than a fenced refusal.
+    expect(res?.status).toBe(200);
+    expect(await res?.json()).toEqual({ ok: true });
+    expect(raw.size).toBe(0);
+    expect(
+      events.filter((event) => event.reason === 'execution-fenced'),
+    ).toHaveLength(0);
+  });
+
+  it('keeps the objective READ open while locked', async () => {
+    // #given — a read moves nothing, and an operator proving a drain needs it.
+    const { store } = memoryStore();
+    const router = createObjectiveRouter({
+      resolve: async () => actorContext('operator'),
+      store,
+      executionFence: await fenceAt('migration-locked'),
+    });
+
+    // #then
+    const res = await router(req('GET', OWNED_THREAD));
+    expect(res?.status).toBe(200);
+    expect(await res?.json()).toEqual({ objective: null });
   });
 });

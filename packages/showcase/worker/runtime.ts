@@ -87,6 +87,8 @@ export function buildShowcaseRuntime(deps: ShowcaseDeps): RunnerRuntime {
     // host-built (see ShowcaseDeps.grantProvider) so the store binding matches
     // the host's topology.
     requestContextForRun: deps.grantProvider,
+    executionFence: deps.executionFence,
+    startIdempotency: deps.startIdempotency,
   });
 
   for (const workflowModule of SHOWCASE_MODULES) {

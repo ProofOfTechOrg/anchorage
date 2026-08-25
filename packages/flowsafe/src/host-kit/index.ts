@@ -113,10 +113,14 @@ export {
 export type { WorkflowIdSource } from './registration.js';
 export { assertWorkflowsRegistered } from './registration.js';
 export { requireResourceAccess } from './resource-access.js';
-export { RunRouteError } from './run-route-error.js';
+export { RunRouteError, runRouteReason } from './run-route-error.js';
 export type {
   RunRouter,
   RunRouterOptions,
+  // The type of RunRouterOptions.startIdempotency, published because that
+  // option is required: a host has to be able to name the shape it is being
+  // asked to supply.
+  RunRouterStartIdempotency,
   RunStartInput,
 } from './run-router.js';
 export { createRunRouter } from './run-router.js';

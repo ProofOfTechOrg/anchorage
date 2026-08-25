@@ -29,7 +29,43 @@ export const DEPLOYMENT_SENTINEL_COLUMNS: readonly Readonly<{
   pk: number;
 }>[];
 
+/** The table the single deployment execution fence row lives in. */
+export const EXECUTION_FENCE_TABLE: 'flowsafe_execution_fence';
+/** The fence row's fixed primary key — one deployment, one database, one row. */
+export const EXECUTION_FENCE_ROW_ID: 'deployment';
+/** Every fence state, ordered from most to least permissive. */
+export const EXECUTION_FENCE_STATES: readonly [
+  'open',
+  'draining',
+  'migration-locked',
+  'proof-only',
+];
+/** The states a deployment may be BORN in. */
+export const INITIAL_EXECUTION_FENCE_STATES: readonly [
+  'open',
+  'migration-locked',
+];
+/**
+ * The fence table's schema. `do-runner/execution-fence.ts` issues this exact
+ * string, so the store and the provisioning protocol cannot create differently
+ * shaped tables.
+ */
+export const EXECUTION_FENCE_DDL: string;
+
+/** The fence state a deployment is provisioned into. Required; no default. */
+export type InitialExecutionFenceState =
+  (typeof INITIAL_EXECUTION_FENCE_STATES)[number];
+
 export class DeploymentIdentityError extends Error {}
+
+/**
+ * Validate the fence state a deployment is to be born in, throwing
+ * DeploymentIdentityError on anything else.
+ */
+export function assertInitialExecutionFenceState(
+  state: unknown,
+  caller: string,
+): InitialExecutionFenceState;
 
 export function assertDeploymentIdentitySecret(
   secret: unknown,
@@ -62,8 +98,16 @@ export function readDeploymentIdentityProtocol(
 export function provisionDeploymentIdentityProtocol(
   execute: DeploymentIdentityProtocolExecutor,
   tag: string,
-  options?: {
+  options: {
     caller?: string;
     provisionedAt?: string;
+    /** Injectable clock (epoch milliseconds) for the seeded rows. */
+    now?: () => number;
+    /**
+     * The fence state the deployment is born in. REQUIRED and without a
+     * default: a migration host that forgot to ask for 'migration-locked'
+     * would otherwise silently get an executing deployment.
+     */
+    initialExecutionFenceState: InitialExecutionFenceState;
   },
 ): Promise<void>;

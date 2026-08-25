@@ -204,12 +204,22 @@ import type {
 } from '@proofoftech/flowsafe/approval-api';
 import {
   sweepExpiredRunDeadlines,
+  type DeploymentInventory,
+  type DrainProofContract,
   type DurableObjectRunLifecycleHooks,
+  type ExecutionFenceState,
+  type ExecutionFenceWiring,
   type RunTerminalErrorEnvelope,
+  type StartIdempotencyWiring,
 } from '@proofoftech/flowsafe/do-runner';
 import {
   createFlowsafeRunnerLifecycle,
   createRunRouter,
+  type FlowsafeWorker,
+  type FlowsafeWorkerConfig,
+  type FlowsafeWorkerEnv,
+  type RunRouterOptions,
+  type RunRouterStartIdempotency,
 } from '@proofoftech/flowsafe/host-kit';
 import {
   createAgentCatalog,
@@ -221,6 +231,7 @@ import {
   type AgentAutomationRule,
   type AgentMeta,
   type AgentRunEnvelope,
+  type AgentThreadTopologyOptions,
   type AutomatedEntryAuthorizer,
   type AutomatedEntryRequest,
   type AutomationCheck,
@@ -228,6 +239,10 @@ import {
   type PrincipalPermissionResolution,
   type PrincipalPermissionResolver,
 } from '@proofoftech/flowsafe/agent-host';
+import type {
+  BackgroundTaskHost,
+  BackgroundTaskReads,
+} from '@proofoftech/flowsafe/background-tasks';
 
 const automation: AgentAutomationRule = {
   kind: 'system',
@@ -272,6 +287,21 @@ const terminalError: RunTerminalErrorEnvelope = {
   message: 'run was cancelled',
 };
 const lifecycleHooks = null as DurableObjectRunLifecycleHooks | null;
+const fenceState: ExecutionFenceState = 'open';
+const fenceWiring = null as ExecutionFenceWiring | null;
+const startWiring = null as StartIdempotencyWiring | null;
+const deploymentInventory = null as DeploymentInventory | null;
+const drainProofReading = null as DrainProofContract['reading'] | null;
+const routerOptions = null as RunRouterOptions | null;
+const routerStart = null as RunRouterStartIdempotency | null;
+const routerOptionStart = null as
+  | RunRouterOptions['startIdempotency']
+  | null;
+const workerConfig = null as FlowsafeWorkerConfig<FlowsafeWorkerEnv> | null;
+const worker = null as FlowsafeWorker<FlowsafeWorkerEnv> | null;
+const topologyOptions = null as AgentThreadTopologyOptions | null;
+const backgroundReads = null as BackgroundTaskReads | null;
+declare const bgHost: BackgroundTaskHost;
 void BREAKWATER_CONNECTOR_EXECUTION_KEY;
 void BREAKWATER_CONNECTOR_GRANTS_KEY;
 void connectorGrantsForLeg;
@@ -288,6 +318,22 @@ void envelope;
 void grant;
 void terminalError;
 void lifecycleHooks;
+void fenceState;
+void fenceWiring;
+void startWiring;
+void deploymentInventory;
+void drainProofReading;
+void routerOptions;
+void routerStart;
+void routerOptionStart;
+void workerConfig;
+void worker;
+void topologyOptions;
+void backgroundReads;
+void bgHost.enqueue;
+void bgHost.getTask;
+void bgHost.listTasks;
+void bgHost.stream;
 void sweepExpiredRunDeadlines;
 void createFlowsafeRunnerLifecycle;
 void createRunRouter;
@@ -314,18 +360,50 @@ void createRunRouter;
 import * as host from '@proofoftech/flowsafe/agent-host';
 import * as flowsafe from '@proofoftech/flowsafe';
 import * as approvals from '@proofoftech/flowsafe/approval-api';
-import {
-  createD1Storage,
-  sweepExpiredRunDeadlines,
-} from '@proofoftech/flowsafe/do-runner';
-import {
-  createFlowsafeRunnerLifecycle,
-  createRunRouter,
-} from '@proofoftech/flowsafe/host-kit';
-assert.equal(typeof createD1Storage, 'function');
-assert.equal(typeof sweepExpiredRunDeadlines, 'function');
-assert.equal(typeof createFlowsafeRunnerLifecycle, 'function');
-assert.equal(typeof createRunRouter, 'function');
+import * as backgroundTasks from '@proofoftech/flowsafe/background-tasks';
+import * as doRunner from '@proofoftech/flowsafe/do-runner';
+import * as hostKit from '@proofoftech/flowsafe/host-kit';
+for (const name of [
+  'createD1Storage',
+  'sweepExpiredRunDeadlines',
+  'ExecutionFenceStore',
+  'executionFenceFor',
+  'readExecutionFence',
+  'ExecutionFencedError',
+  'FenceTransitionConflictError',
+  'ExecutionFenceUnreadableError',
+  'admitsDrainableExecution',
+  'admitsExistingRun',
+  'admitsRunStart',
+  'admitsWorkAuthoring',
+  'StartIdempotencyStore',
+  'startIdempotencyFor',
+  'StartReservationOwnerMismatchError',
+  'StartReservationTargetMismatchError',
+  'IdempotentStartPendingError',
+  'IdempotentStartUnresolvableError',
+  'IdempotentStartAlreadySettledError',
+  'DeploymentInventory',
+]) {
+  assert.equal(typeof doRunner[name], 'function', name);
+}
+for (const name of [
+  'INVENTORY_CATEGORIES',
+  'FLOWSAFE_TABLES',
+  'INVENTORY_UNENUMERABLE',
+]) {
+  assert.equal(Array.isArray(doRunner[name]), true, name);
+}
+assert.equal(typeof doRunner.INVENTORY_DRAIN_PROOF, 'object');
+assert.equal(typeof doRunner.INVENTORY_DRAIN_PROOF.reading, 'string');
+assert.equal(Array.isArray(doRunner.INVENTORY_DRAIN_PROOF.reachableFrom), true);
+assert.equal(typeof hostKit.createFlowsafeRunnerLifecycle, 'function');
+assert.equal(typeof hostKit.createRunRouter, 'function');
+assert.equal(typeof hostKit.createFlowsafeWorker, 'function');
+assert.equal(
+  backgroundTasks.EXECUTION_FENCE_SUSPEND_KEY,
+  'flowsafe.executionFenced',
+);
 assert.equal(typeof host.createAgentCatalog, 'function');
 assert.equal(typeof host.createAgentRouter, 'function');
 assert.equal(typeof host.createAgentThreadTopology, 'function');

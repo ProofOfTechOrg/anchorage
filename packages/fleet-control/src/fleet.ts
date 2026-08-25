@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import type { AttestConvergedActiveRouteOptions } from './active-route.js';
 import {
   applicationBindingTopology,
   DEPLOYMENT_PLATFORM_VARIABLE_NAMES,
@@ -32,6 +33,7 @@ import {
   assertPlatformDurableObjectHistory,
   reconcilePersistedDatabase,
 } from './provision.js';
+import { settlePromotedRoute } from './settlement.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   DeploymentEgressPolicy,
@@ -44,6 +46,7 @@ import type {
   FleetInventoryFinding,
   FleetRecord,
   FleetResourceInventory,
+  FleetSettlementHost,
   FleetStateLease,
   FleetStateStore,
   LiveDeployment,
@@ -1357,6 +1360,30 @@ export async function migrateFleet(options: {
   readonly finalizedStateProviderFor?: (
     record: FleetRecord,
   ) => FinalizedOrdinaryStateProvider | undefined;
+  /**
+   * The host to hand each settled promotion to, per deployment.
+   *
+   * Optional, and its absence changes nothing about correctness: every promote
+   * path attests what it published whether or not a host is settling, because
+   * checking its own work is the package's obligation rather than a service it
+   * performs for a caller.
+   *
+   * `provisionDeployment` deliberately consults nothing like this. A first
+   * deploy returns synchronously to the caller that asked for it, so the host
+   * already knows the moment it went live and can settle after the call using
+   * `attestFleetRecordActiveRoute`; an in-lease settlement point there would
+   * add a callback into the critical section to tell a caller something it is
+   * about to be told anyway.
+   */
+  readonly settlementFor?: (
+    record: FleetRecord,
+  ) => FleetSettlementHost | undefined;
+  /**
+   * Tuning for the convergence wait each post-promote attestation performs.
+   * The defaults suit every provider this package targets; a caller overrides
+   * them to bound the wait differently or to drive it from an injected clock.
+   */
+  readonly routeAttestation?: AttestConvergedActiveRouteOptions;
   readonly clock?: () => number;
 }): Promise<readonly FleetRecord[]> {
   const canaryOrder = new Map(
@@ -1374,6 +1401,10 @@ export async function migrateFleet(options: {
       `${b.tenantTag}:${b.environment}`,
     );
   });
+  const attestationOptions: AttestConvergedActiveRouteOptions = {
+    clock: options.clock ?? Date.now,
+    ...options.routeAttestation,
+  };
   const updated: FleetRecord[] = [];
   for (const record of ordered) {
     const next = await options.store.withDeploymentLease(
@@ -1613,6 +1644,31 @@ export async function migrateFleet(options: {
             lease,
             activeArtifactVersion(stored),
           );
+          // The steady-state path: an unchanged deployment reconciled again.
+          // It re-promotes because a crash could have left the route behind,
+          // so it must re-attest — but it must not re-settle, or a fleet on a
+          // reconcile schedule would settle forever.
+          const convergence = await settlePromotedRoute({
+            backend,
+            spec,
+            record: stored,
+            entry: 'ready-convergence',
+            target: stored.activeRelease,
+            prior: stored.rollbackRelease,
+            expectedSpecDigest: targetDigest,
+            expectedArtifactVersion: activeArtifactVersion(stored),
+            settlementHost: options.settlementFor?.(stored),
+            attestation: attestationOptions,
+            skipWhenAlreadySettled: true,
+          });
+          if (convergence.settled) {
+            stored = {
+              ...stored,
+              settledSettlementKey: convergence.settlementKey,
+              updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
+            };
+            await lease.put(stored);
+          }
           return retireCommittedRelease(
             backend,
             spec,
@@ -1863,6 +1919,18 @@ export async function migrateFleet(options: {
             platformMigrationRelease,
             'platform-only settlement',
           );
+          const platformSettlement = await settlePromotedRoute({
+            backend,
+            spec,
+            record: migrationRecord,
+            entry: 'platform-only',
+            target: platformMigrationRelease,
+            prior: migrationRecord.rollbackRelease,
+            expectedSpecDigest: targetDigest,
+            expectedArtifactVersion: platformMigrationRelease.artifactVersion,
+            settlementHost: options.settlementFor?.(migrationRecord),
+            attestation: attestationOptions,
+          });
           const settled = { ...migrationRecord };
           delete settled.migrationIntent;
           const migrated: FleetRecord = {
@@ -1870,13 +1938,36 @@ export async function migrateFleet(options: {
             phase: 'ready',
             platformTarget: platformMigrationTarget,
             outboundPolicy: platformMigrationTarget.outboundPolicy,
+            ...(platformSettlement.settled
+              ? { settledSettlementKey: platformSettlement.settlementKey }
+              : {}),
             updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
           };
           await lease.put(migrated);
           return migrated;
         }
         await lease.assertOwned();
-        await backend.seedDeploymentIdentity(database, stored.tenantTag, lease);
+        // Re-stamping a database this deployment already owns: the ownership
+        // sentinel short-circuits, and the only thing that can still happen is
+        // the fence row being CREATED where none exists.
+        //
+        // 'open' is hard-coded, and migrateFleet takes no fence option, for one
+        // reason: the deployment being migrated is `ready` or `migrating` — it
+        // is EXECUTING right now. A pre-0.20 database has no fence row and
+        // therefore reads as open; materializing that row must record what the
+        // deployment already IS, not impose something new. Seeding
+        // 'migration-locked' here would silently stop a live deployment in the
+        // middle of its own migration. Closing a fence is an operator action
+        // through POST /admin/execution-fence, never a side effect of a
+        // schema pass.
+        await backend.seedDeploymentIdentity(
+          database,
+          stored.tenantTag,
+          lease,
+          {
+            initialExecutionFenceState: 'open',
+          },
+        );
         const pendingMigrations = spec.migrations.filter(
           (candidate) => candidate.version > migrationRecord.schemaVersion,
         );
@@ -2192,6 +2283,18 @@ export async function migrateFleet(options: {
             'promoted release has no exact persisted binding topology',
           );
         }
+        const migrationSettlement = await settlePromotedRoute({
+          backend,
+          spec,
+          record: migrationRecord,
+          entry: 'migration',
+          target: committedTargetRelease,
+          prior: rollbackRelease,
+          expectedSpecDigest: targetDigest,
+          expectedArtifactVersion: live.artifactVersion,
+          settlementHost: options.settlementFor?.(migrationRecord),
+          attestation: attestationOptions,
+        });
         const settled = { ...migrationRecord };
         delete settled.pendingRelease;
         delete settled.migrationPriorRelease;
@@ -2240,6 +2343,9 @@ export async function migrateFleet(options: {
               spec,
               migrationRecord.applicationResources ?? [],
             ),
+          ...(migrationSettlement.settled
+            ? { settledSettlementKey: migrationSettlement.settlementKey }
+            : {}),
           updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
         };
         await lease.put(migrated);
@@ -2265,6 +2371,13 @@ export async function rollbackExternalRelease(options: {
   readonly rollbackSpec: DeploymentSpec;
   readonly secrets: DeploymentSecrets;
   readonly finalizedStateProvider?: FinalizedOrdinaryStateProvider;
+  /**
+   * The host to hand the reversal to. Singular because a rollback names one
+   * deployment, where `migrateFleet` sweeps many.
+   */
+  readonly settlement?: FleetSettlementHost;
+  /** Tuning for the convergence wait the post-promote attestation performs. */
+  readonly routeAttestation?: AttestConvergedActiveRouteOptions;
   readonly clock?: () => number;
 }): Promise<FleetRecord> {
   const { store, backend, currentSpec, rollbackSpec, secrets } = options;
@@ -2534,6 +2647,24 @@ export async function rollbackExternalRelease(options: {
       );
       assertExternalReleaseArtifactVersion(live, target, 'rollback settlement');
       const nextRollback = stored.activeRelease;
+      // `prior` is the release being ABANDONED here, not the one replaced.
+      // A host reversing its own effects needs the snapshot traffic just left,
+      // and on this path that is the release that was active on entry.
+      const rollbackSettlement = await settlePromotedRoute({
+        backend,
+        spec: rollbackSpec,
+        record: intent,
+        entry: 'rollback',
+        target,
+        prior: nextRollback,
+        expectedSpecDigest: target.specDigest,
+        expectedArtifactVersion: target.artifactVersion,
+        settlementHost: options.settlement,
+        attestation: {
+          clock: options.clock ?? Date.now,
+          ...options.routeAttestation,
+        },
+      });
       const settled = { ...intent };
       delete settled.pendingRelease;
       const rolledBack: FleetRecord = {
@@ -2551,6 +2682,9 @@ export async function rollbackExternalRelease(options: {
             rollbackSpec,
             stored.applicationResources ?? [],
           ),
+        ...(rollbackSettlement.settled
+          ? { settledSettlementKey: rollbackSettlement.settlementKey }
+          : {}),
         updatedAt: new Date((options.clock ?? Date.now)()).toISOString(),
       };
       await lease.put(rolledBack);

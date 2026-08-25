@@ -174,6 +174,17 @@ export interface ThreadAgentStartInput {
   safeContext?: Record<string, unknown>;
   /** Trusted, JSON-safe model provider options from schedule dispatch only. */
   providerOptions?: Record<string, unknown>;
+  /**
+   * The idempotency key the thread topology already RESERVED for this run.
+   *
+   * Nothing at this layer reserves, claims, or replays on it: the reservation
+   * lives on the Worker side, where a retry that minted a fresh thread can
+   * still be redirected to the original one. It travels down here only so
+   * `RunnerRuntime.start` can compare it against the execution fence's
+   * nominated proof key.
+   * @internal
+   */
+  idempotencyKey?: string;
 }
 
 export interface BoundThreadAgent {
@@ -497,6 +508,20 @@ export function createThreadAgentHost(
   const withBindingLock = createFifoLock();
   const withDispatchLock = createFifoLock();
   const withRecoveryLock = createFifoLock();
+  /**
+   * Run ids this object is currently starting — the liveness half of the
+   * idempotent-start replay decision, and the reason a retried agent start can
+   * tell "the first one is still working" from "the first one died holding the
+   * claim" without a timer.
+   *
+   * In memory, never stored: liveness is a property of an isolate that is
+   * running code, so the honest answer after an eviction is `false`, and any
+   * durable proxy would keep saying `true` for a run nothing is executing.
+   * Scoped to this host instance, which `instanceScopeFor` already pins to one
+   * Durable Object — the same object an agent run is bound to for its whole
+   * life, so this object's answer is the only one there is.
+   */
+  const startsInFlight = new Set<string>();
 
   const instanceScopeFor = (scope: ThreadScope): AgentThreadInstanceScope => {
     if (stableScope) {
@@ -1513,6 +1538,10 @@ export function createThreadAgentHost(
           await writeAgentRunRecord(options.stateStorage(), ref.runId, stored);
           return recovery;
         });
+        // From here to the finally below, this object IS the run's execution.
+        // Registered BEFORE the stream so the window a replaying start asks
+        // about — the one before core has persisted anything — is covered too.
+        startsInFlight.add(ref.runId);
         try {
           const streamOptions = {
             runId: ref.runId,
@@ -1544,7 +1573,8 @@ export function createThreadAgentHost(
             scope.principal.id,
             scope.principal.kind,
             recovery.token,
-            ...(scheduleDispatch ? ([scheduleDispatch] as const) : []),
+            scheduleDispatch,
+            input.idempotencyKey,
           );
           const summary = await scope.init.runtime.status(
             DURABLE_AGENTIC_LOOP_WORKFLOW_ID,
@@ -1613,6 +1643,11 @@ export function createThreadAgentHost(
             }
           }
           throw error;
+        } finally {
+          // Unconditional: an entry left behind would answer every later probe
+          // "live" for the lifetime of the isolate, turning a crashed start's
+          // honest UNRESOLVABLE into an endless PENDING.
+          startsInFlight.delete(ref.runId);
         }
       });
     },
@@ -1648,6 +1683,25 @@ export function createThreadAgentHost(
         ? preflightUrl.pathname.slice(AGENT_HOST_ROUTE_PREFIX.length)
         : '';
       const preflightSegments = preflightSuffix.split('/').filter(Boolean);
+      // The liveness probe, answered BEFORE withDispatchLock on purpose: the
+      // start it is asking about holds that lock for its whole first leg, so a
+      // probe that queued behind it would block for exactly as long as the run
+      // it was trying to describe — and time out reporting nothing.
+      //
+      // It reads no storage and reveals only whether this object is currently
+      // executing a run id the caller already had to know. Authorization is the
+      // deployment-identity header every request to this object carries: the
+      // probe travels the internal Worker-to-DO channel, and the reservation on
+      // the far side already proved the caller owns the key that names this run.
+      if (
+        request.method === 'GET' &&
+        preflightSegments.length === 4 &&
+        preflightSegments[0] === 'runs' &&
+        preflightSegments[3] === 'start-liveness'
+      ) {
+        const runId = decode(preflightSegments[2]);
+        return json({ live: runId !== undefined && startsInFlight.has(runId) });
+      }
       if (
         request.method === 'POST' &&
         preflightSegments.length === 4 &&
@@ -1733,6 +1787,20 @@ export function createThreadAgentHost(
               threaded: body.threaded !== false,
               safeContext: safeContext(body.safeContext),
               providerOptions: providerOptions(body.providerOptions),
+              // Validated, not trusted: this body is JSON, and the same string
+              // reaches the execution fence's proof-only comparison.
+              ...(body.idempotencyKey === undefined
+                ? {}
+                : {
+                    idempotencyKey: isPathSafeId(body.idempotencyKey)
+                      ? body.idempotencyKey
+                      : (() => {
+                          throw new AgentHostRequestError(
+                            400,
+                            'idempotencyKey must be a URL-path-safe identifier',
+                          );
+                        })(),
+                  }),
               ...(body.scheduleId !== undefined
                 ? {
                     scheduleId: isPathSafeId(body.scheduleId)

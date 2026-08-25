@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
+import { ActiveRouteAttestationError } from '../src/active-route.js';
 import type { DurableDatabaseExportStore } from '../src/cloudflare-client.js';
 import { WorkerDeploymentError } from '../src/deployment-error.js';
 import { deploymentSpecDigest } from '../src/spec-digest.js';
@@ -16,10 +17,10 @@ import type {
   ExternalMutationFence,
   ExternalReleaseSnapshot,
   FleetRecord,
+  PlainWorkerCustomDomain,
+  PlainWorkerRouteApi,
 } from '../src/types.js';
 import {
-  type PlainWorkerCustomDomain,
-  type PlainWorkerRouteApi,
   plainWorkerIngressModule,
   WranglerLoopBackend,
 } from '../src/wrangler-loop-backend.js';
@@ -83,6 +84,9 @@ const activeRelease: ExternalReleaseSnapshot = {
   artifactVersion: 'version-owned',
   releaseSchemaVersion: deployment.schemaVersion,
 };
+
+/** Pinned so an attestation is comparable by value, clock included. */
+const ATTESTED_AT = '2026-08-11T00:00:00.000Z';
 
 const mutationFence: ExternalMutationFence = {
   mutationLeaseTtlMs: 15 * 60_000,
@@ -176,6 +180,18 @@ class FakeRouteApi implements PlainWorkerRouteApi {
     readonly pattern: string;
   }> = [];
   beforeListCustomDomains: (() => void) | undefined;
+  /** Every script name attestation asked about, in call order. */
+  readonly activeRouteReads: string[] = [];
+  /** The reduced active-route read; undefined models an absent script. */
+  activeRoute:
+    | Readonly<{ artifactVersion: string; specDigest: string | undefined }>
+    | undefined;
+  /**
+   * A refusal the provider read itself raises — an ambiguous traffic split.
+   * The rule producing it lives in the client and is proven there; what this
+   * models is the backend's obligation not to swallow or reshape it.
+   */
+  activeRouteFailure: Error | undefined;
   domains: PlainWorkerCustomDomain[];
 
   constructor(domains: readonly PlainWorkerCustomDomain[] = []) {
@@ -223,6 +239,18 @@ class FakeRouteApi implements PlainWorkerRouteApi {
   async deleteDatabase(databaseId: string): Promise<void> {
     this.calls.push({ operation: 'delete-database', databaseId });
     this.databasePresent = false;
+  }
+
+  async inspectActiveWorkerRoute(scriptName: string): Promise<
+    | Readonly<{
+        artifactVersion: string;
+        specDigest: string | undefined;
+      }>
+    | undefined
+  > {
+    this.activeRouteReads.push(scriptName);
+    if (this.activeRouteFailure) throw this.activeRouteFailure;
+    return this.activeRoute;
   }
 
   async listCustomDomains(): Promise<readonly PlainWorkerCustomDomain[]> {
@@ -349,6 +377,7 @@ function backend(
     readonly exportStore?: DurableDatabaseExportStore;
     readonly routeApi?: PlainWorkerRouteApi;
     readonly maintenanceRequestTimeoutMs?: number;
+    readonly clock?: () => number;
   } = {},
 ): WranglerLoopBackend {
   const exportStore: DurableDatabaseExportStore = options.exportStore ?? {
@@ -376,6 +405,7 @@ function backend(
     exportStore,
     fetch: options.fetch,
     maintenanceRequestTimeoutMs: options.maintenanceRequestTimeoutMs,
+    clock: options.clock,
   });
 }
 
@@ -1132,6 +1162,9 @@ export default {
         return [];
       },
       async deleteControlSecrets() {},
+      async inspectActiveWorkerRoute(): Promise<never> {
+        throw new Error('unused');
+      },
       async listCustomDomains() {
         reads += 1;
         return reads === 1
@@ -1792,15 +1825,22 @@ export default {
   provisioned_at TEXT NOT NULL
 )`;
     let sentinelExists = false;
+    let fenceExists = false;
     let owner: string | undefined;
+    let fenceBindings: readonly unknown[] | undefined;
     const runner = new FakeRunner();
     const routeApi = new FakeRouteApi();
     routeApi.queryHandler = async (sql, bindings) => {
       let results: readonly Readonly<Record<string, unknown>>[] = [];
       if (sql.includes("sqlite_schema WHERE type = 'table' ORDER BY name")) {
-        results = sentinelExists
-          ? [{ name: 'flowsafe_deployment', sql: sentinelDdl }]
-          : [];
+        results = [
+          ...(sentinelExists
+            ? [{ name: 'flowsafe_deployment', sql: sentinelDdl }]
+            : []),
+          ...(fenceExists
+            ? [{ name: 'flowsafe_execution_fence', sql: 'CREATE' }]
+            : []),
+        ];
       } else if (
         sql.includes('name = ?') &&
         bindings[0] === 'flowsafe_deployment'
@@ -1814,6 +1854,16 @@ export default {
         ];
       } else if (sql.startsWith('SELECT id, tenant_tag')) {
         results = owner ? [{ id: 1, tenant_tag: owner }] : [];
+      } else if (
+        // Matched on the TARGET table, ahead of the generic arms: the ownership
+        // insert names the fence table inside its exclusion list.
+        sql.startsWith('CREATE TABLE IF NOT EXISTS flowsafe_execution_fence')
+      ) {
+        fenceExists = true;
+      } else if (
+        sql.startsWith('INSERT OR IGNORE INTO flowsafe_execution_fence')
+      ) {
+        fenceBindings = bindings;
       } else if (sql.startsWith('CREATE TABLE')) {
         sentinelExists = true;
       } else if (sql.startsWith('INSERT OR IGNORE')) {
@@ -1826,7 +1876,9 @@ export default {
     await expect(
       subject.readDeploymentIdentity(database, mutationFence),
     ).resolves.toBeUndefined();
-    await subject.seedDeploymentIdentity(database, 'acme', mutationFence);
+    await subject.seedDeploymentIdentity(database, 'acme', mutationFence, {
+      initialExecutionFenceState: 'migration-locked',
+    });
     await expect(
       subject.readDeploymentIdentity(database, mutationFence),
     ).resolves.toBe('acme');
@@ -1837,6 +1889,16 @@ export default {
         (query) => query.databaseId === database.id,
       ),
     ).toBe(true);
+    // The fence rides the same fenced provider-native path, and every binding
+    // reaches it as a STRING — the plain-Worker adapter rejects anything else
+    // (restD1Bindings), which is why the seeded timestamp is bound as text and
+    // left to SQLite's INTEGER affinity.
+    expect(fenceExists).toBe(true);
+    expect(fenceBindings).toEqual([
+      'deployment',
+      'migration-locked',
+      expect.stringMatching(/^\d+$/),
+    ]);
   });
 
   it('forwards SQLite literals, identifiers, comments, and numbered parameters unchanged', async () => {
@@ -2839,6 +2901,9 @@ export default {
         return [];
       },
       async deleteControlSecrets() {},
+      async inspectActiveWorkerRoute(): Promise<never> {
+        throw new Error('unused');
+      },
       async listCustomDomains() {
         return [
           {
@@ -3055,5 +3120,109 @@ export default {
     await expect(deleteDeploymentWorker(backend(runner))).rejects.toThrow(
       'wrangler authentication failed',
     );
+  });
+
+  it('attests the routed version through the provider API, not the CLI', async () => {
+    // #given a Worker whose deployment reduces to one routed version
+    const routeApi = new FakeRouteApi();
+    routeApi.activeRoute = {
+      artifactVersion: 'version-routed',
+      specDigest: deploymentSpecDigest(deployment),
+    };
+    const runner = new FakeRunner(async () => {
+      throw new Error('attestation must not shell out to wrangler');
+    });
+    const subject = backend(runner, {
+      routeApi,
+      clock: () => Date.parse(ATTESTED_AT),
+    });
+
+    // #when the route is attested
+    const attestation = await subject.attestActiveRoute(deployment);
+
+    // #then the attestation names the routed version and cost no CLI call
+    expect(attestation).toEqual({
+      specDigest: deploymentSpecDigest(deployment),
+      artifactVersion: 'version-routed',
+      physicalScriptName: deployment.scriptName,
+      source: 'workers-deployments',
+      observedAt: ATTESTED_AT,
+    });
+    expect(routeApi.activeRouteReads).toEqual([deployment.scriptName]);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it('refuses to attest a Worker with no deployment serving traffic', async () => {
+    // #given a script the provider does not hold
+    const routeApi = new FakeRouteApi();
+    routeApi.activeRoute = undefined;
+    const subject = backend(new FakeRunner(), { routeApi });
+
+    // #when the route is attested
+    const failure = await subject
+      .attestActiveRoute(deployment)
+      .catch((error: unknown) => error);
+
+    // #then it refuses rather than reporting an absent deployment as routed
+    expect(failure).toBeInstanceOf(ActiveRouteAttestationError);
+    expect((failure as ActiveRouteAttestationError).message).toContain(
+      'no deployment serving traffic',
+    );
+    expect((failure as ActiveRouteAttestationError).observed).toEqual({});
+  });
+
+  it('refuses to attest a routed version carrying no specification digest', async () => {
+    // #given a routed version whose fleet digest binding is missing, then one
+    // whose binding holds something that is not a digest at all
+    const routeApi = new FakeRouteApi();
+    routeApi.activeRoute = {
+      artifactVersion: 'version-undigested',
+      specDigest: undefined,
+    };
+    const subject = backend(new FakeRunner(), { routeApi });
+    const attest = () =>
+      subject.attestActiveRoute(deployment).catch((error: unknown) => error);
+
+    // #when each is attested
+    const missing = await attest();
+    routeApi.activeRoute = {
+      artifactVersion: 'version-undigested',
+      specDigest: 'not-a-digest',
+    };
+    const malformed = await attest();
+
+    // #then both refuse with the version they could not identify
+    for (const failure of [missing, malformed]) {
+      expect(failure).toBeInstanceOf(ActiveRouteAttestationError);
+      expect((failure as ActiveRouteAttestationError).observed).toEqual({
+        routedScriptName: deployment.scriptName,
+        artifactVersion: 'version-undigested',
+      });
+    }
+  });
+
+  it('passes an ambiguous traffic split through as the provider raised it', async () => {
+    // #given the provider read refusing an unreduced deployment
+    const routeApi = new FakeRouteApi();
+    const split = new ActiveRouteAttestationError(
+      "ordinary Worker 'acme-production' must have exactly one current version receiving 100% of traffic",
+      {
+        routedScriptName: deployment.scriptName,
+        trafficSplit: [
+          { artifactVersion: 'version-live', percentage: 100 },
+          { artifactVersion: 'version-candidate', percentage: 0 },
+        ],
+      },
+    );
+    routeApi.activeRouteFailure = split;
+    const subject = backend(new FakeRunner(), { routeApi });
+
+    // #when the route is attested
+    const failure = await subject
+      .attestActiveRoute(deployment)
+      .catch((error: unknown) => error);
+
+    // #then the refusal reaches the caller intact, percentages included
+    expect(failure).toBe(split);
   });
 });

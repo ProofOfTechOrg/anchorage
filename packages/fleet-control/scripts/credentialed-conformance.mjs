@@ -1122,6 +1122,7 @@ async function assertSecretPreservingStateUpload(deployment, record) {
     attestationError = error;
   }
   const repaired = await provisionDeployment({
+    initialExecutionFenceState: 'open',
     backend,
     store: deployment.store,
     spec: deployment.currentSpec,
@@ -1269,6 +1270,7 @@ async function provePlainWorkerSecretVersionChurnTeardown() {
   let conformanceError;
   try {
     const provisioned = await provisionDeployment({
+      initialExecutionFenceState: 'open',
       backend: trackedBackend,
       store: deployment.store,
       spec,
@@ -1339,6 +1341,7 @@ async function provePlainWorkerSecretVersionChurnTeardown() {
 
 async function provisionV1(deployment) {
   deployment.v1Result = await provisionDeployment({
+    initialExecutionFenceState: 'open',
     backend,
     store: deployment.store,
     spec: deployment.initialSpec,
@@ -1399,10 +1402,15 @@ async function assertTenantIsolation() {
   let sentinelOwner;
   await withDeploymentMutationFence(deployments[0], async (fence) => {
     try {
+      // The fence state is irrelevant to what this probe asserts (the sentinel
+      // must refuse a re-stamp), but the protocol requires one; 'open' is the
+      // state this already-provisioned database is in, so a refusal that
+      // somehow did not happen could not also silently close its fence.
       await backend.seedDeploymentIdentity(
         firstDatabase,
         deployments[1].initialSpec.tenantTag,
         fence,
+        { initialExecutionFenceState: 'open' },
       );
     } catch (error) {
       mismatchRejected = /already belongs|refusing to re-stamp/.test(

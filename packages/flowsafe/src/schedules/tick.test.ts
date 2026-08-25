@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track D (M-006) — createScheduleTick: the mint posture (INV-1), the run-cap
-// seam (D-S4), optional agent start, fail-closed fallback, in-process single-claim
-// (CAS), lost-claim classification, and the P4 stored-context barrier (b).
+// createScheduleTick: mint posture, run-cap seam, optional agent start,
+// fail-closed fallback, in-process single-claim CAS, lost-claim classification,
+// and the stored-context barrier.
 
 import type { Schedule, ScheduleTrigger } from '@mastra/core/storage';
 import { describe, expect, it, vi } from 'vitest';
+import { openSqlite, sqliteUnitDatabase } from '../../test-support/sqlite.js';
+import {
+  type ExecutionFenceDatabase,
+  ExecutionFenceStore,
+} from '../do-runner/index.js';
 import type { ScheduleFireClaim } from './schedules-d1.js';
 import { createScheduleTargetPolicy } from './target-policy.js';
 import {
@@ -32,14 +37,25 @@ const TARGET_POLICY = createScheduleTargetPolicy({
   ],
 });
 
+/**
+ * The tick under test with the shared options defaulted.
+ * `executionFence: 'none'` is the honest wiring for the in-memory FakeStore —
+ * there is no database to fence — and the fence cases at the bottom of this
+ * file pass a real store, so nothing here weakens their gate.
+ */
 function createScheduleTick(
-  options: Omit<ScheduleTickOptions, 'targetPolicy' | 'status'> & {
+  options: Omit<
+    ScheduleTickOptions,
+    'targetPolicy' | 'status' | 'executionFence'
+  > & {
     status?: ScheduleTickOptions['status'];
+    executionFence?: ScheduleTickOptions['executionFence'];
   },
 ) {
   return createScheduleTickImpl({
     status: async () => undefined,
     ...options,
+    executionFence: options.executionFence ?? 'none',
     targetPolicy: TARGET_POLICY,
   });
 }
@@ -315,7 +331,7 @@ describe('createScheduleStartSource', () => {
 });
 
 describe('createScheduleTick', () => {
-  it('fires a due workflow target through the start seam with a fresh INV-1 runId', async () => {
+  it('fires a due workflow target through the start seam with a fresh host-owned runId', async () => {
     // #given a due workflow schedule
     const store = new FakeStore();
     store.seed(
@@ -372,6 +388,7 @@ describe('createScheduleTick', () => {
       start,
       status: async () => undefined,
       targetPolicy,
+      executionFence: 'none',
       now: () => NOW,
     })();
 
@@ -406,7 +423,7 @@ describe('createScheduleTick', () => {
     );
   });
 
-  it('strips reserved requestContext keys before handing the leg context to start (P4 barrier b)', async () => {
+  it('strips reserved requestContext keys before handing the leg context to start', async () => {
     // #given a due schedule whose STORED requestContext carries a reserved key
     // (a compromised/tampered row) plus a benign one
     const store = new FakeStore();
@@ -442,7 +459,7 @@ describe('createScheduleTick', () => {
     expect(passedContext).toEqual({ 'my.custom': 'kept' });
   });
 
-  it('SKIPS a capped deployment (audited) but leaves the schedule healthy — the CAS already advanced it (D-S4)', async () => {
+  it('SKIPS a capped deployment but leaves the schedule healthy after the CAS advances it', async () => {
     // #given a due workflow schedule and a run cap that DENIES
     const store = new FakeStore();
     store.seed(workflowSchedule());
@@ -1085,7 +1102,7 @@ describe('createScheduleTick', () => {
   });
 });
 
-describe('the P4 reserved-key barrier helpers', () => {
+describe('reserved-key barrier helpers', () => {
   it('isReservedScheduleContextKey covers the whole breakwater namespace + the goal key', () => {
     expect(isReservedScheduleContextKey('breakwater.connectorGrants')).toBe(
       true,
@@ -1151,5 +1168,110 @@ describe('the P4 reserved-key barrier helpers', () => {
       'breakwater.workflowScope': 'runtime',
       collide: 'runtime',
     });
+  });
+});
+
+describe('createScheduleTick and the deployment execution fence', () => {
+  function fence(): ExecutionFenceStore {
+    return new ExecutionFenceStore(
+      sqliteUnitDatabase(openSqlite()) as ExecutionFenceDatabase,
+    );
+  }
+
+  it.each([
+    'draining',
+    'migration-locked',
+  ] as const)('leaves a due schedule ROW untouched on a %s pass, then fires it exactly once after reopen', async (state) => {
+    // #given — a due schedule on a deployment the operator has just fenced.
+    const store = new FakeStore();
+    store.seed(workflowSchedule());
+    const before = { ...(store.schedules.get('schedule_a') as Schedule) };
+    const start = vi.fn(async ({ runId }: { runId: string }) => ({ runId }));
+    const executionFence = fence();
+    await executionFence.seed(state);
+    const tick = createScheduleTick({
+      store,
+      start,
+      executionFence,
+      now: () => NOW,
+    });
+
+    // #when
+    const fenced = await tick();
+
+    // #then — the pass did nothing at all. Claiming a fire it will not run
+    // would CONSUME it (the claim advances nextFireAt) and the fenced runtime
+    // would then refuse the start, so the fire would be LOST rather than
+    // deferred. An idle-looking RESULT is not evidence of that: the tally
+    // below is what the pass reported, and the row is what it did.
+    expect(fenced).toEqual({
+      due: 0,
+      fired: 0,
+      skipped: 0,
+      failed: 0,
+      deferred: 0,
+      reconciled: 0,
+      lost: 0,
+    });
+    expect(start).not.toHaveBeenCalled();
+    expect(store.triggers).toEqual([]);
+    // The whole row, not just nextFireAt: status, lastFireAt, and lastRunId
+    // are the other fields a claim writes, and a claim that advanced any of
+    // them has consumed the fire whatever the tally said.
+    expect(store.schedules.get('schedule_a')).toEqual(before);
+
+    // #when — the migration finishes and the operator reopens the fence.
+    await executionFence.transition({ expected: state, next: 'open' });
+    const reopened = await tick();
+
+    // #then — the SAME fire runs, exactly once: neither lost nor duplicated.
+    expect(reopened.due).toBe(1);
+    expect(reopened.fired).toBe(1);
+    expect(start).toHaveBeenCalledTimes(1);
+    // #and — only NOW is the fire consumed: the row advanced past this due
+    // time, so a third pass would not run it again.
+    expect(store.schedules.get('schedule_a')?.nextFireAt).toBeGreaterThan(NOW);
+  });
+
+  it('skips the pass rather than claiming when the fence cannot be read', async () => {
+    // #given — a fence whose storage is down. This runs on a maintenance
+    // alarm, so degrading closed means doing NOTHING, not throwing: a throw
+    // would fail the duty, and proceeding would claim fires on a deployment
+    // whose state is unknown.
+    const store = new FakeStore();
+    store.seed(workflowSchedule());
+    const start = vi.fn(async ({ runId }: { runId: string }) => ({ runId }));
+    const unreadable = new ExecutionFenceStore({
+      prepare: () => ({
+        bind: () => ({
+          bind: () => {
+            throw new Error('unreachable');
+          },
+          run: () => Promise.reject(new Error('D1_ERROR: network')),
+          all: () => Promise.reject(new Error('D1_ERROR: network')),
+        }),
+        run: () => Promise.reject(new Error('D1_ERROR: network')),
+        all: () => Promise.reject(new Error('D1_ERROR: network')),
+      }),
+    } as unknown as ExecutionFenceDatabase);
+    const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    // #when
+    let result: Awaited<ReturnType<ReturnType<typeof createScheduleTick>>>;
+    try {
+      result = await createScheduleTick({
+        store,
+        start,
+        executionFence: unreadable,
+        now: () => NOW,
+      })();
+    } finally {
+      log.mockRestore();
+    }
+
+    // #then
+    expect(result.due).toBe(0);
+    expect(start).not.toHaveBeenCalled();
+    expect(store.schedules.get('schedule_a')?.nextFireAt).toBe(NOW - 1000);
   });
 });

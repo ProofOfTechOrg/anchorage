@@ -57,6 +57,19 @@ export type ConnectorApprovalGrant =
     });
 
 /**
+ * The table the durable approval queue lives in.
+ *
+ * It sits on this leaf rather than beside the store that creates it because two
+ * layers now need the name and only one of them may import the store: the D1
+ * store builds its DDL and every query from it, and the deployment drain
+ * inventory (do-runner/inventory.ts) counts the records still awaiting a
+ * decision. do-runner may reach approval-api only through this file and its
+ * siblings, so a name declared in `d1-store.ts` would have had to be restated
+ * there — and a restated table name is one a rename silently leaves behind.
+ */
+export const APPROVALS_TABLE = 'flowsafe_approvals';
+
+/**
  * Statuses that still await a decision. 'escalated' stays decidable —
  * escalation raises visibility, it does not close the request.
  */
