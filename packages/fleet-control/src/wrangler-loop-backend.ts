@@ -1,11 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { createHash } from 'node:crypto';
-import { createReadStream } from 'node:fs';
-import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { Readable } from 'node:stream';
 import {
   provisionDeploymentIdentityProtocol,
   readDeploymentIdentityProtocol,
@@ -20,7 +14,7 @@ import { isSha256 } from './deployment-context.js';
 import { WorkerDeploymentError } from './deployment-error.js';
 import { maintenanceUrl, readMaintenanceHealth } from './maintenance-health.js';
 import { applyMigrationsWithLedger } from './migration-ledger.js';
-import { assertSupportedProviderBindings } from './provider-binding-inventory.js';
+import { assertSupportedPlainWorkerBindings } from './provider-binding-inventory.js';
 import { deploymentSpecDigest } from './spec-digest.js';
 import type {
   ActiveRouteAttestation,
@@ -38,16 +32,23 @@ import type {
   LiveDeployment,
   MaintenanceHealth,
   PlainWorkerCustomDomain,
+  PlainWorkerProvisioningApi,
   PlainWorkerRouteApi,
+  PlainWorkerUploadOutcome,
+  PlainWorkerVersionDetail,
+  PlainWorkerVersionSummary,
   PromotionGuard,
   ProvisioningBackend,
   SeedDeploymentIdentityOptions,
 } from './types.js';
 import { targetDurableObjectTag } from './validation.js';
-import type { CommandResult, CommandRunner } from './wrangler-runner.js';
+import { WranglerPlainWorkerProvisioningApi } from './wrangler-plain-worker-provisioning-api.js';
+import type { CommandRunner } from './wrangler-runner.js';
 
 const PLAIN_INGRESS_CONTRACT = 'guarded-object-v1';
 const PLAIN_INGRESS_MODULE = '__anchorage_guarded_entry__.js';
+const EXACT_DATABASE_DELETION_REQUIRED =
+  'plain Worker route API does not support exact-ID D1 database deletion';
 const JAVASCRIPT_CONTENT_TYPES = new Set([
   'application/javascript',
   'application/javascript+module',
@@ -63,36 +64,6 @@ interface DeploymentStatus {
   readonly versions: readonly DeploymentVersion[];
 }
 
-function parseJson(value: string, operation: string): unknown {
-  try {
-    return JSON.parse(value);
-  } catch (cause) {
-    throw new Error(`wrangler ${operation} returned invalid JSON`, { cause });
-  }
-}
-
-function asArray(value: unknown): readonly unknown[] {
-  if (Array.isArray(value)) return value;
-  if (value && typeof value === 'object' && 'result' in value) {
-    const result = (value as { result?: unknown }).result;
-    return Array.isArray(result) ? result : result ? [result] : [];
-  }
-  return [];
-}
-
-function field(value: unknown, name: string): unknown {
-  return value && typeof value === 'object'
-    ? (value as Record<string, unknown>)[name]
-    : undefined;
-}
-
-function isWranglerNotFound(error: unknown): boolean {
-  return (
-    error instanceof Error &&
-    /not found|10090|does not exist|has no deployments/i.test(error.message)
-  );
-}
-
 function restD1Bindings(
   bindings: readonly unknown[],
   operation: string,
@@ -101,17 +72,6 @@ function restD1Bindings(
     throw new Error(`${operation} D1 bindings must be strings`);
   }
   return bindings as readonly string[];
-}
-
-function versionId(value: unknown): string | undefined {
-  const id = field(value, 'id') ?? field(value, 'version_id');
-  return typeof id === 'string' ? id : undefined;
-}
-
-function versionTag(value: unknown): string | undefined {
-  const annotations = field(value, 'annotations');
-  const tag = field(annotations, 'workers/tag') ?? field(value, 'tag');
-  return typeof tag === 'string' ? tag : undefined;
 }
 
 export function plainWorkerIngressModule(spec: DeploymentSpec): Readonly<{
@@ -221,11 +181,8 @@ export default {
 
 export class WranglerLoopBackend implements ProvisioningBackend {
   readonly kind = 'plain-worker' as const;
-  readonly #runner: CommandRunner;
-  readonly #routeApi: PlainWorkerRouteApi;
+  readonly #api: PlainWorkerProvisioningApi;
   readonly #fetch: typeof fetch;
-  readonly #exportDirectory: string;
-  readonly #exportStore: DurableDatabaseExportStore;
   readonly #maintenanceRequestTimeoutMs: number;
   readonly #clock: () => number;
 
@@ -251,16 +208,18 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     ) {
       throw new Error('maintenance request timeout must be positive');
     }
-    this.#runner = options.runner;
-    this.#routeApi = options.routeApi;
+    this.#api = new WranglerPlainWorkerProvisioningApi({
+      runner: options.runner,
+      routeApi: options.routeApi,
+      exportDirectory: options.exportDirectory,
+      exportStore: options.exportStore,
+    });
     this.#fetch = options.fetch ?? fetch;
-    this.#exportDirectory = resolve(options.exportDirectory);
-    this.#exportStore = options.exportStore;
     this.#maintenanceRequestTimeoutMs = maintenanceRequestTimeoutMs;
     this.#clock = options.clock ?? Date.now;
   }
 
-  async #assertMutationFence(fence: ExternalMutationFence): Promise<void> {
+  #assertMutationDuration(fence: ExternalMutationFence): void {
     if (
       !Number.isSafeInteger(fence.mutationLeaseTtlMs) ||
       fence.mutationLeaseTtlMs < 1
@@ -268,41 +227,36 @@ export class WranglerLoopBackend implements ProvisioningBackend {
       throw new Error('external mutation fence lease TTL must be positive');
     }
     if (
-      !Number.isSafeInteger(this.#runner.maxDurationMs) ||
-      this.#runner.maxDurationMs < 1
+      !Number.isSafeInteger(this.#api.maxMutationDurationMs) ||
+      this.#api.maxMutationDurationMs < 1
     ) {
       throw new Error('Wrangler command maximum duration must be positive');
     }
-    if (this.#runner.maxDurationMs >= fence.mutationLeaseTtlMs) {
+    if (this.#api.maxMutationDurationMs >= fence.mutationLeaseTtlMs) {
       throw new Error(
         'Wrangler command maximum duration must be below the external mutation fence lease TTL',
       );
     }
-    await fence.assertOwned();
   }
 
-  async #runMutation(
-    fence: ExternalMutationFence,
-    arguments_: readonly string[],
-    options?: { readonly input?: string; readonly cwd?: string },
-  ): Promise<CommandResult> {
-    await this.#assertMutationFence(fence);
-    return this.#runner.run(arguments_, options);
+  async #assertMutationFence(fence: ExternalMutationFence): Promise<void> {
+    this.#assertMutationDuration(fence);
+    await fence.assertOwned();
   }
 
   async findDatabase(
     spec: DeploymentSpec,
   ): Promise<DatabaseReference | undefined> {
-    const listed = await this.#runner.run(['d1', 'list', '--json']);
-    const matches = asArray(parseJson(listed.stdout, 'd1 list')).filter(
-      (database) => field(database, 'name') === spec.databaseName,
+    const listed = await this.#api.listDatabases();
+    const matches = listed.filter(
+      (database) => database.name === spec.databaseName,
     );
     if (matches.length > 1) {
       throw new Error(`multiple D1 databases are named '${spec.databaseName}'`);
     }
     if (matches[0]) {
-      const id = field(matches[0], 'uuid');
-      if (typeof id !== 'string') throw new Error('D1 list result has no uuid');
+      const id = matches[0].databaseId;
+      if (!id) throw new Error('D1 list result has no uuid');
       return { id, name: spec.databaseName, created: false };
     }
     return undefined;
@@ -311,47 +265,28 @@ export class WranglerLoopBackend implements ProvisioningBackend {
   async getDatabase(
     databaseId: string,
   ): Promise<DatabaseReference | undefined> {
-    const getDatabase = this.#routeApi.getDatabase;
-    if (getDatabase) {
-      return getDatabase.call(this.#routeApi, databaseId);
-    }
-    let result: CommandResult;
-    try {
-      result = await this.#runner.run(['d1', 'info', databaseId, '--json']);
-    } catch (error) {
-      if (isWranglerNotFound(error)) return undefined;
-      throw error;
-    }
-    const parsed = parseJson(result.stdout, 'd1 info');
-    const body = field(parsed, 'result') ?? parsed;
-    const id = field(body, 'uuid');
-    const name = field(body, 'name');
-    if (id !== databaseId || typeof name !== 'string' || name.length === 0) {
-      throw new Error('D1 info result has an invalid uuid or name');
-    }
-    return { id: databaseId, name, created: false };
+    return this.#api.getDatabase(databaseId);
   }
 
   async ensureDatabase(
     spec: DeploymentSpec,
     fence: ExternalMutationFence,
   ): Promise<DatabaseReference> {
-    await this.#assertMutationFence(fence);
-    try {
-      await this.#runner.run(['d1', 'create', spec.databaseName]);
-    } catch (cause) {
+    this.#assertMutationDuration(fence);
+    const outcome = await this.#api.createDatabase(spec.databaseName, fence);
+    if (outcome.status === 'failed') {
       const recovered = await this.findDatabase(spec);
       if (recovered) {
         const owner = await this.readDeploymentIdentity(recovered, fence);
         if (owner !== undefined) {
           throw new Error(
             `refusing authorized database reconciliation for '${recovered.id}' owned by '${owner}'`,
-            { cause },
+            { cause: outcome.error },
           );
         }
         return { ...recovered, created: true };
       }
-      throw cause;
+      throw outcome.error;
     }
     const resolved = await this.findDatabase(spec);
     if (!resolved) {
@@ -368,8 +303,8 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     fence: ExternalMutationFence,
     bindings: readonly unknown[] = [],
   ): Promise<readonly Readonly<Record<string, unknown>>[]> {
-    return this.#routeApi.withMutationFence(fence, () =>
-      this.#routeApi.queryDatabase(
+    return this.#api.withMutationFence(fence, () =>
+      this.#api.queryDatabase(
         database.id,
         sql,
         restD1Bindings(bindings, 'plain Worker'),
@@ -412,8 +347,8 @@ export class WranglerLoopBackend implements ProvisioningBackend {
       {
         query: (sql, bindings) => this.#query(database, sql, fence, bindings),
         batch: (statements) =>
-          this.#routeApi.withMutationFence(fence, () =>
-            this.#routeApi.batchDatabase(
+          this.#api.withMutationFence(fence, () =>
+            this.#api.batchDatabase(
               database.id,
               statements.map((statement) => ({
                 sql: statement.sql,
@@ -432,10 +367,10 @@ export class WranglerLoopBackend implements ProvisioningBackend {
   async findApplicationR2Bucket(
     resource: import('./types.js').ApplicationR2Binding,
   ): Promise<import('./types.js').ApplicationR2BucketSnapshot | undefined> {
-    if (!this.#routeApi.getR2Bucket) {
+    if (!this.#api.getR2Bucket) {
       throw new Error('plain Worker route API does not support application R2');
     }
-    const found = await this.#routeApi.getR2Bucket(
+    const found = await this.#api.getR2Bucket(
       resource.bucketName,
       resource.jurisdiction,
     );
@@ -448,11 +383,11 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     resource: import('./types.js').ApplicationR2Binding,
     fence: ExternalMutationFence,
   ): Promise<import('./types.js').ApplicationR2BucketSnapshot> {
-    if (!this.#routeApi.createR2Bucket) {
+    if (!this.#api.createR2Bucket) {
       throw new Error('plain Worker route API does not support application R2');
     }
     try {
-      await this.#routeApi.createR2Bucket(resource, fence);
+      await this.#api.createR2Bucket(resource, fence);
     } catch (error) {
       const reconciled = await this.findApplicationR2Bucket(resource);
       if (reconciled) return reconciled;
@@ -480,10 +415,10 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     resource: import('./types.js').ApplicationR2Binding,
     _fence: ExternalMutationFence,
   ): Promise<void> {
-    if (!this.#routeApi.listWorkerR2Attachments) {
+    if (!this.#api.listWorkerR2Attachments) {
       throw new Error('plain Worker route API cannot scan R2 attachments');
     }
-    const attachments = await this.#routeApi.listWorkerR2Attachments(
+    const attachments = await this.#api.listWorkerR2Attachments(
       resource.bucketName,
     );
     if (attachments.length > 0) {
@@ -497,24 +432,24 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     resource: import('./types.js').ApplicationR2Binding,
     _fence: ExternalMutationFence,
   ): Promise<void> {
-    if (!this.#routeApi.assertR2BucketEmpty) {
+    if (!this.#api.assertR2BucketEmpty) {
       throw new Error('plain Worker route API cannot inspect R2 contents');
     }
-    await this.#routeApi.assertR2BucketEmpty(resource);
+    await this.#api.assertR2BucketEmpty(resource);
   }
 
   async deleteApplicationR2Bucket(
     resource: import('./types.js').ApplicationR2Binding,
     fence: ExternalMutationFence,
   ): Promise<void> {
-    if (!this.#routeApi.deleteR2Bucket) {
+    if (!this.#api.deleteR2Bucket) {
       throw new Error('plain Worker route API cannot delete application R2');
     }
     const current = await this.findApplicationR2Bucket(resource);
     if (!current || current.creationDate !== resource.creationDate) {
       throw new Error(`R2 bucket '${resource.bucketName}' ownership changed`);
     }
-    await this.#routeApi.deleteR2Bucket(resource, fence);
+    await this.#api.deleteR2Bucket(resource, fence);
     if (await this.findApplicationR2Bucket(resource)) {
       throw new Error(
         `R2 bucket '${resource.bucketName}' remains after delete`,
@@ -525,25 +460,15 @@ export class WranglerLoopBackend implements ProvisioningBackend {
   async #deploymentStatus(
     spec: DeploymentSpec,
   ): Promise<DeploymentStatus | undefined> {
-    let result: CommandResult;
-    try {
-      result = await this.#runner.run([
-        'deployments',
-        'status',
-        '--name',
-        spec.scriptName,
-        '--json',
-      ]);
-    } catch (error) {
-      if (isWranglerNotFound(error)) return undefined;
-      throw error;
-    }
-    const parsed = parseJson(result.stdout, 'deployments status');
-    const body = field(parsed, 'result') ?? parsed;
-    const versions = asArray(field(body, 'versions')).map((version) => {
-      const id = versionId(version);
-      const percentage = Number(field(version, 'percentage'));
-      if (!id || !Number.isFinite(percentage) || percentage < 0) {
+    const status = await this.#api.deploymentStatus(spec.scriptName);
+    if (!status) return undefined;
+    const versions = status.versions.map(({ versionId: id, percentage }) => {
+      if (
+        !id ||
+        percentage === undefined ||
+        !Number.isFinite(percentage) ||
+        percentage < 0
+      ) {
         throw new Error('wrangler deployment status has an invalid version');
       }
       return { id, percentage };
@@ -556,64 +481,39 @@ export class WranglerLoopBackend implements ProvisioningBackend {
 
   async #listVersions(
     spec: DeploymentSpec,
-  ): Promise<readonly unknown[] | undefined> {
-    try {
-      const listed = await this.#runner.run([
-        'versions',
-        'list',
-        '--name',
-        spec.scriptName,
-        '--json',
-      ]);
-      return asArray(parseJson(listed.stdout, 'versions list'));
-    } catch (error) {
-      if (isWranglerNotFound(error)) return undefined;
-      throw error;
-    }
+  ): Promise<readonly PlainWorkerVersionSummary[] | undefined> {
+    return this.#api.listVersions(spec.scriptName);
   }
 
-  async #viewVersion(spec: DeploymentSpec, id: string): Promise<unknown> {
-    const viewed = await this.#runner.run([
-      'versions',
-      'view',
-      id,
-      '--name',
-      spec.scriptName,
-      '--json',
-    ]);
-    return parseJson(viewed.stdout, 'versions view');
-  }
-
-  #plainTextBindings(version: unknown): ReadonlyMap<string, string> {
-    const resources = field(version, 'resources');
-    const bindings = asArray(field(resources, 'bindings'));
+  #plainTextBindings(
+    version: PlainWorkerVersionDetail,
+  ): ReadonlyMap<string, string> {
     return new Map(
-      bindings.flatMap((binding) => {
-        if (field(binding, 'type') !== 'plain_text') return [];
-        const name = field(binding, 'name');
-        const text = field(binding, 'text');
-        return typeof name === 'string' && typeof text === 'string'
-          ? [[name, text] as const]
-          : [];
-      }),
+      version.bindings.flatMap((binding) =>
+        binding.type === 'plain-text' &&
+        typeof binding.name === 'string' &&
+        typeof binding.value === 'string'
+          ? [[binding.name, binding.value] as const]
+          : [],
+      ),
     );
   }
 
   async #matchingCandidateIds(
     spec: DeploymentSpec,
-    versions?: readonly unknown[],
+    versions?: readonly PlainWorkerVersionSummary[],
   ): Promise<readonly string[]> {
     const digest = deploymentSpecDigest(spec);
     const listed = versions ?? (await this.#listVersions(spec));
     if (!listed) return [];
-    const tagged = listed.filter((version) => versionTag(version) === digest);
+    const tagged = listed.filter((version) => version.tag === digest);
     const matches: string[] = [];
     for (const candidate of tagged) {
-      const id = versionId(candidate);
+      const id = candidate.versionId;
       if (!id) {
         throw new Error('wrangler versions list result has no version id');
       }
-      const version = await this.#viewVersion(spec, id);
+      const version = await this.#api.viewVersion(spec.scriptName, id);
       const plainText = this.#plainTextBindings(version);
       if (plainText.get('FLEET_SPEC_DIGEST') !== digest) {
         throw new Error(
@@ -629,7 +529,7 @@ export class WranglerLoopBackend implements ProvisioningBackend {
 
   async #findCandidate(
     spec: DeploymentSpec,
-    versions?: readonly unknown[],
+    versions?: readonly PlainWorkerVersionSummary[],
   ): Promise<string | undefined> {
     const digest = deploymentSpecDigest(spec);
     const matches = await this.#matchingCandidateIds(spec, versions);
@@ -644,15 +544,18 @@ export class WranglerLoopBackend implements ProvisioningBackend {
   async #expectedCandidate(
     spec: DeploymentSpec,
     artifactVersion: string,
-    versions?: readonly unknown[],
+    versions?: readonly PlainWorkerVersionSummary[],
   ): Promise<string> {
     const listed = versions ?? (await this.#listVersions(spec));
-    if (!listed?.some((version) => versionId(version) === artifactVersion)) {
+    if (!listed?.some((version) => version.versionId === artifactVersion)) {
       throw new Error(
         `Worker '${spec.scriptName}' is missing persisted artifact version '${artifactVersion}'`,
       );
     }
-    const version = await this.#viewVersion(spec, artifactVersion);
+    const version = await this.#api.viewVersion(
+      spec.scriptName,
+      artifactVersion,
+    );
     const plainText = this.#plainTextBindings(version);
     if (
       plainText.get('FLEET_SPEC_DIGEST') !== deploymentSpecDigest(spec) ||
@@ -665,13 +568,12 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     return artifactVersion;
   }
 
-  #databaseIds(version: unknown): readonly string[] {
-    const resources = field(version, 'resources');
-    return asArray(field(resources, 'bindings')).flatMap((binding) => {
-      if (field(binding, 'type') !== 'd1') return [];
-      const id = field(binding, 'id') ?? field(binding, 'database_id');
-      return typeof id === 'string' ? [id] : [];
-    });
+  #databaseIds(version: PlainWorkerVersionDetail): readonly string[] {
+    return version.bindings.flatMap((binding) =>
+      binding.type === 'd1' && typeof binding.databaseId === 'string'
+        ? [binding.databaseId]
+        : [],
+    );
   }
 
   async #assertExistingWorkerIdentity(
@@ -685,7 +587,7 @@ export class WranglerLoopBackend implements ProvisioningBackend {
       );
     }
     for (const deployed of deployment.versions) {
-      const version = await this.#viewVersion(spec, deployed.id);
+      const version = await this.#api.viewVersion(spec.scriptName, deployed.id);
       const plainText = this.#plainTextBindings(version);
       const databaseIds = this.#databaseIds(version);
       const digest = plainText.get('FLEET_SPEC_DIGEST');
@@ -720,7 +622,7 @@ export class WranglerLoopBackend implements ProvisioningBackend {
       );
     }
     const [version, databaseId] = await Promise.all([
-      this.#viewVersion(spec, candidateId),
+      this.#api.viewVersion(spec.scriptName, candidateId),
       persistedDatabaseId
         ? Promise.resolve(persistedDatabaseId)
         : this.findDatabase(spec).then((database) => database?.id),
@@ -741,7 +643,10 @@ export class WranglerLoopBackend implements ProvisioningBackend {
       );
     }
     for (const deployed of status?.versions ?? []) {
-      const deployedVersion = await this.#viewVersion(spec, deployed.id);
+      const deployedVersion = await this.#api.viewVersion(
+        spec.scriptName,
+        deployed.id,
+      );
       const deployedPlainText = this.#plainTextBindings(deployedVersion);
       const deployedDatabaseIds = this.#databaseIds(deployedVersion);
       const deployedDigest = deployedPlainText.get('FLEET_SPEC_DIGEST');
@@ -793,7 +698,7 @@ export class WranglerLoopBackend implements ProvisioningBackend {
           `refusing to mutate Worker '${spec.scriptName}' with a current deployment outside its persisted artifact set`,
         );
       }
-      const version = await this.#viewVersion(spec, deployed.id);
+      const version = await this.#api.viewVersion(spec.scriptName, deployed.id);
       const plainText = this.#plainTextBindings(version);
       const databaseIds = this.#databaseIds(version);
       if (
@@ -833,8 +738,8 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     const [status, versions, footprint, namespaceIds] = await Promise.all([
       this.#deploymentStatus(spec),
       this.#listVersions(spec),
-      this.#routeApi.inspectOrdinaryWorkerFootprint(spec.scriptName),
-      this.#routeApi.listDurableObjectNamespaces(spec.scriptName),
+      this.#api.inspectOrdinaryWorkerFootprint(spec.scriptName),
+      this.#api.listDurableObjectNamespaces(spec.scriptName),
     ]);
     const listed = versions ?? [];
     if (!status && listed.length === 0) {
@@ -856,13 +761,12 @@ export class WranglerLoopBackend implements ProvisioningBackend {
       );
     }
     const validInventory = listed.map((version) => {
-      const id = versionId(version);
-      if (!id) {
+      if (!version.versionId) {
         throw new Error(
           `refusing to mutate Worker '${spec.scriptName}' with an invalid version inventory`,
         );
       }
-      return { id, tag: versionTag(version) };
+      return { id: version.versionId, tag: version.tag };
     });
     const listedIds = validInventory.map(({ id }) => id);
     if (new Set(listedIds).size !== listedIds.length) {
@@ -878,16 +782,30 @@ export class WranglerLoopBackend implements ProvisioningBackend {
       specDigest: deploymentSpecDigest(spec),
       releaseSchemaVersion: spec.schemaVersion,
     };
-    const viewedVersions = new Map<string, unknown>();
-    const view = async (id: string): Promise<unknown> => {
-      const cached = viewedVersions.get(id);
-      if (cached !== undefined) return cached;
-      const version = await this.#viewVersion(spec, id);
+    const viewedVersions = new Map<string, PlainWorkerVersionDetail>();
+    const remember = (
+      id: string,
+      version: PlainWorkerVersionDetail,
+    ): PlainWorkerVersionDetail => {
       viewedVersions.set(id, version);
       return version;
     };
+    const view = async (id: string): Promise<PlainWorkerVersionDetail> => {
+      const cached = viewedVersions.get(id);
+      if (cached !== undefined) return cached;
+      const version = await this.#api.viewVersion(spec.scriptName, id);
+      return remember(id, version);
+    };
+    const find = async (
+      id: string,
+    ): Promise<PlainWorkerVersionDetail | undefined> => {
+      const cached = viewedVersions.get(id);
+      if (cached !== undefined) return cached;
+      const version = await this.#api.findVersion(spec.scriptName, id);
+      return version ? remember(id, version) : undefined;
+    };
     const assertIdentity = (
-      version: unknown,
+      version: PlainWorkerVersionDetail,
       expectedReleases: readonly ReleaseIdentity[],
     ): void => {
       const plainText = this.#plainTextBindings(version);
@@ -914,13 +832,8 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     let anchorId: string | undefined;
     if (allowed.length > 0) {
       for (const release of allowed) {
-        let anchor: unknown;
-        try {
-          anchor = await view(release.artifactVersion);
-        } catch (error) {
-          if (isWranglerNotFound(error)) continue;
-          throw error;
-        }
+        const anchor = await find(release.artifactVersion);
+        if (!anchor) continue;
         assertIdentity(anchor, [release]);
         anchorId = release.artifactVersion;
         break;
@@ -969,8 +882,9 @@ export class WranglerLoopBackend implements ProvisioningBackend {
         `refusing to attest database detachment for mismatched fleet record '${record.tenantTag}:${record.environment}'`,
       );
     }
-    const databaseAttachments =
-      await this.#routeApi.listWorkerDatabaseAttachments(database.id);
+    const databaseAttachments = await this.#api.listWorkerDatabaseAttachments(
+      database.id,
+    );
     if (databaseAttachments.length > 0) {
       throw new Error(
         `database '${record.databaseId}' remains attached to ${databaseAttachments
@@ -985,9 +899,9 @@ export class WranglerLoopBackend implements ProvisioningBackend {
       await Promise.all([
         this.#deploymentStatus(spec),
         this.#listVersions(spec),
-        this.#routeApi.listCustomDomains(),
-        this.#routeApi.inspectOrdinaryWorkerFootprint(spec.scriptName),
-        this.#routeApi.listDurableObjectNamespaces(spec.scriptName),
+        this.#api.listCustomDomains(),
+        this.#api.inspectOrdinaryWorkerFootprint(spec.scriptName),
+        this.#api.listDurableObjectNamespaces(spec.scriptName),
       ]);
     const routeFootprint = domains.filter(
       (domain) =>
@@ -1038,9 +952,9 @@ export class WranglerLoopBackend implements ProvisioningBackend {
       ] = await Promise.all([
         this.#deploymentStatus(spec),
         this.#listVersions(spec),
-        this.#routeApi.listCustomDomains(),
-        this.#routeApi.inspectOrdinaryWorkerFootprint(spec.scriptName),
-        this.#routeApi.listDurableObjectNamespaces(spec.scriptName),
+        this.#api.listCustomDomains(),
+        this.#api.inspectOrdinaryWorkerFootprint(spec.scriptName),
+        this.#api.listDurableObjectNamespaces(spec.scriptName),
       ]);
       const reconciledRoute = reconciledDomains.some(
         (domain) =>
@@ -1075,7 +989,7 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     hostname: string,
   ): Promise<PlainWorkerCustomDomain | undefined> {
     const normalized = hostname.toLowerCase();
-    const matches = (await this.#routeApi.listCustomDomains()).filter(
+    const matches = (await this.#api.listCustomDomains()).filter(
       (domain) => domain.hostname.toLowerCase() === normalized,
     );
     if (matches.length > 1) {
@@ -1117,25 +1031,22 @@ export class WranglerLoopBackend implements ProvisioningBackend {
       );
     }
     if (current.versions.some((version) => version.id === candidateId)) return;
-    const versionSpecs = [
-      ...current.versions.map(
-        (version) => `${version.id}@${version.percentage}%`,
-      ),
-      `${candidateId}@0%`,
-    ];
-    try {
-      await this.#runMutation(fence, [
-        'versions',
-        'deploy',
-        ...versionSpecs,
-        '--name',
-        spec.scriptName,
-        '-y',
-      ]);
-    } catch (error) {
+    this.#assertMutationDuration(fence);
+    const outcome = await this.#api.createDeployment(
+      spec.scriptName,
+      [
+        ...current.versions.map((version) => ({
+          versionId: version.id,
+          percentage: version.percentage,
+        })),
+        { versionId: candidateId, percentage: 0 },
+      ],
+      fence,
+    );
+    if (outcome.status === 'failed') {
       const reconciled = await this.#deploymentStatus(spec);
       if (!reconciled?.versions.some((version) => version.id === candidateId)) {
-        throw error;
+        throw outcome.error;
       }
     }
   }
@@ -1175,191 +1086,188 @@ export class WranglerLoopBackend implements ProvisioningBackend {
         'Wrangler loop supports only local Durable Object bindings',
       );
     }
-    const directory = await mkdtemp(join(tmpdir(), 'anchorage-fleet-'));
-    try {
-      const deployment = await this.#deploymentStatus(spec);
-      const versions = await this.#listVersions(spec);
-      const workerExisted = deployment !== undefined || versions !== undefined;
-      const priorVersionIds = new Set(
-        (versions ?? []).map((version) => {
-          const id = versionId(version);
-          if (!id) {
-            throw new Error('wrangler versions list result has no version id');
-          }
-          return id;
-        }),
-      );
-      let candidateId = expectedArtifactVersion
-        ? await this.#expectedCandidate(spec, expectedArtifactVersion, versions)
-        : undefined;
-      const pendingDurableObjectMigration =
-        targetDurableObjectTag(spec) !== spec.previousDurableObjectTag;
-      if (deployment && pendingDurableObjectMigration) {
-        throw new Error(
-          `existing Worker '${spec.scriptName}' has a pending Durable Object lifecycle migration; plain-Worker updates require an immediate/manual migration boundary`,
-        );
-      }
-      if (deployment) {
-        await this.#assertExistingWorkerIdentity(spec, database.id, deployment);
-      }
-      if (
-        candidateId &&
-        deployment?.versions.some((version) => version.id === candidateId)
-      ) {
-        return { artifactVersion: candidateId, created: false };
-      }
-      for (const module of spec.modules) {
-        const modulePath = resolve(directory, module.name);
-        if (!modulePath.startsWith(`${directory}/`)) {
-          throw new Error(
-            `module '${module.name}' escapes the staging directory`,
-          );
+    const deployment = await this.#deploymentStatus(spec);
+    const versions = await this.#listVersions(spec);
+    const workerExisted = deployment !== undefined || versions !== undefined;
+    const priorVersionIds = new Set(
+      (versions ?? []).map((version) => {
+        if (!version.versionId) {
+          throw new Error('wrangler versions list result has no version id');
         }
-        await mkdir(resolve(modulePath, '..'), { recursive: true });
-        await writeFile(modulePath, module.content);
-      }
-      const ingressModule = plainWorkerIngressModule(spec);
-      await writeFile(
-        join(directory, ingressModule.name),
-        ingressModule.content,
+        return version.versionId;
+      }),
+    );
+    let candidateId = expectedArtifactVersion
+      ? await this.#expectedCandidate(spec, expectedArtifactVersion, versions)
+      : undefined;
+    const pendingDurableObjectMigration =
+      targetDurableObjectTag(spec) !== spec.previousDurableObjectTag;
+    if (deployment && pendingDurableObjectMigration) {
+      throw new Error(
+        `existing Worker '${spec.scriptName}' has a pending Durable Object lifecycle migration; plain-Worker updates require an immediate/manual migration boundary`,
       );
-      const configPath = join(directory, 'wrangler.candidate.json');
-      await writeFile(
-        configPath,
-        JSON.stringify({
-          name: spec.scriptName,
-          main: ingressModule.name,
-          workers_dev: true,
-          preview_urls: false,
-          compatibility_date: spec.compatibilityDate,
-          compatibility_flags: spec.compatibilityFlags,
-          vars: {
-            DEPLOYMENT_TENANT: spec.tenantTag,
-            FLEET_ENVIRONMENT: spec.environment,
-            FLEET_SCHEMA_VERSION: String(spec.schemaVersion),
-            FLEET_SPEC_DIGEST: deploymentSpecDigest(spec),
-            FLEET_INGRESS_CONTRACT: PLAIN_INGRESS_CONTRACT,
-            ...Object.fromEntries(
-              (
-                application?.vars ?? canonicalApplicationBindings(spec).vars
-              ).map(({ name, value }) => [name, value]),
-            ),
-          },
-          d1_databases: [
-            {
-              binding: 'DB',
-              database_name: database.name,
-              database_id: database.id,
-            },
-          ],
-          durable_objects: {
-            bindings: spec.durableObjectBindings.map((binding) => ({
+    }
+    if (deployment) {
+      await this.#assertExistingWorkerIdentity(spec, database.id, deployment);
+    }
+    if (
+      candidateId &&
+      deployment?.versions.some((version) => version.id === candidateId)
+    ) {
+      return { artifactVersion: candidateId, created: false };
+    }
+    const ingressModule = plainWorkerIngressModule(spec);
+    const digest = deploymentSpecDigest(spec);
+    const mode = deployment === undefined ? 'initial' : 'staged';
+    let uploadOutcome: PlainWorkerUploadOutcome | undefined;
+    if (!candidateId) {
+      this.#assertMutationDuration(fence);
+      uploadOutcome = await this.#api.uploadCandidate(
+        {
+          scriptName: spec.scriptName,
+          candidateTag: digest,
+          mainModule: ingressModule.name,
+          modules: [...spec.modules, ingressModule],
+          compatibilityDate: spec.compatibilityDate,
+          compatibilityFlags: spec.compatibilityFlags,
+          bindings: {
+            plainText: [
+              { name: 'DEPLOYMENT_TENANT', value: spec.tenantTag },
+              { name: 'FLEET_ENVIRONMENT', value: spec.environment },
+              {
+                name: 'FLEET_SCHEMA_VERSION',
+                value: String(spec.schemaVersion),
+              },
+              { name: 'FLEET_SPEC_DIGEST', value: digest },
+              {
+                name: 'FLEET_INGRESS_CONTRACT',
+                value: PLAIN_INGRESS_CONTRACT,
+              },
+              ...(application?.vars ?? canonicalApplicationBindings(spec).vars),
+            ],
+            secrets: [
+              {
+                name: 'DEPLOYMENT_IDENTITY_SECRET',
+                value: secrets.deploymentIdentity,
+              },
+              {
+                name: 'MAINTENANCE_ADMIN_SECRET',
+                value: secrets.maintenanceAdmin,
+              },
+              ...Object.entries(applicationSecretValues(spec, secrets)).map(
+                ([name, value]) => ({ name, value }),
+              ),
+            ],
+            d1: [
+              {
+                name: 'DB',
+                databaseName: database.name,
+                databaseId: database.id,
+              },
+            ],
+            durableObjects: spec.durableObjectBindings.map((binding) => ({
               name: binding.name,
-              class_name: binding.className,
+              className: binding.className,
+            })),
+            services: spec.egressProxyService
+              ? [
+                  {
+                    name: 'EGRESS_PROXY',
+                    service: spec.egressProxyService,
+                  },
+                ]
+              : [],
+            queueProducers: spec.queueProducer
+              ? [
+                  {
+                    name: spec.queueProducer.binding,
+                    queueName: spec.queueProducer.queueName,
+                  },
+                ]
+              : [],
+            r2Buckets: (application?.r2Buckets ?? []).map((binding) => ({
+              name: binding.name,
+              bucketName: binding.bucketName,
             })),
           },
-          services: spec.egressProxyService
-            ? [
-                {
-                  binding: 'EGRESS_PROXY',
-                  service: spec.egressProxyService,
-                },
-              ]
-            : undefined,
-          ...(deployment
-            ? {}
-            : {
-                migrations: spec.durableObjectMigrations.map((migration) => ({
-                  tag: migration.tag,
-                  new_sqlite_classes: migration.newSqliteClasses,
-                  new_classes: migration.newClasses,
-                  deleted_classes: migration.deletedClasses,
-                  renamed_classes: migration.renamedClasses,
-                })),
-              }),
-          queues: spec.queueProducer
+          limits: { cpuMs: spec.cpuLimitMs },
+          publicAccess: {
+            workersDevEnabled: true,
+            previewUrlsEnabled: false,
+          },
+          ...(mode === 'initial'
             ? {
-                producers: [
-                  {
-                    binding: spec.queueProducer.binding,
-                    queue: spec.queueProducer.queueName,
-                  },
-                ],
+                mode,
+                durableObjectMigrations: spec.durableObjectMigrations,
               }
-            : undefined,
-          r2_buckets: (application?.r2Buckets ?? []).map((binding) => ({
-            binding: binding.name,
-            bucket_name: binding.bucketName,
-          })),
-          limits: spec.cpuLimitMs ? { cpu_ms: spec.cpuLimitMs } : undefined,
-        }),
+            : { mode }),
+        },
+        fence,
       );
-      const secretsPath = join(directory, 'wrangler.secrets.json');
-      await writeFile(
-        secretsPath,
-        JSON.stringify({
-          DEPLOYMENT_IDENTITY_SECRET: secrets.deploymentIdentity,
-          MAINTENANCE_ADMIN_SECRET: secrets.maintenanceAdmin,
-          ...applicationSecretValues(spec, secrets),
-        }),
-        { mode: 0o600 },
-      );
-      const digest = deploymentSpecDigest(spec);
-      try {
-        if (!candidateId) {
-          const command = deployment ? ['versions', 'upload'] : ['deploy'];
-          let mutationError: unknown;
-          try {
-            await this.#runMutation(fence, [
-              ...command,
-              '--config',
-              configPath,
-              '--secrets-file',
-              secretsPath,
-              '--tag',
-              digest,
-            ]);
-          } catch (error) {
-            mutationError = error;
+    }
+    let settled:
+      | Readonly<{
+          ok: true;
+          result: Readonly<{ artifactVersion: string; created: boolean }>;
+        }>
+      | Readonly<{
+          ok: false;
+          error: Readonly<{
+            message: string;
+            cause: unknown;
+            createdByAttempt: boolean;
+            resourceState: 'absent' | 'present' | 'unknown';
+          }>;
+        }>;
+    try {
+      if (!candidateId) {
+        const operationCandidates = (
+          await this.#matchingCandidateIds(spec)
+        ).filter((id) => !priorVersionIds.has(id));
+        if (operationCandidates.length !== 1) {
+          if (uploadOutcome?.status === 'failed' && uploadOutcome.error) {
+            throw uploadOutcome.error;
           }
-          const operationCandidates = (
-            await this.#matchingCandidateIds(spec)
-          ).filter((id) => !priorVersionIds.has(id));
-          if (operationCandidates.length !== 1) {
-            if (mutationError) throw mutationError;
-            throw new Error(
-              `wrangler ${command.join(' ')} did not create exactly one new tagged Worker version`,
-            );
-          }
-          const operationCandidate = operationCandidates[0];
-          if (!operationCandidate) {
-            throw new Error('new Worker candidate has no artifact version');
-          }
-          candidateId = operationCandidate;
-        }
-        if (deployment) {
-          await this.#deployCandidateAtZero(spec, candidateId, fence);
-        } else {
-          const initial = await this.#deploymentStatus(spec);
-          const selected = initial?.versions.find(
-            (version) => version.id === candidateId,
+          // HEAD parity: a falsy rejection value carries no diagnostic.
+          throw new Error(
+            `${mode} Worker upload did not create exactly one new tagged Worker version`,
           );
-          if (selected?.percentage !== 100) {
-            throw new Error(
-              `initial Worker '${spec.scriptName}' did not deploy its tagged version at 100%`,
-            );
-          }
         }
-        return { artifactVersion: candidateId, created: !workerExisted };
-      } catch (cause) {
-        if (workerExisted) {
-          throw new WorkerDeploymentError({
+        const operationCandidate = operationCandidates[0];
+        if (!operationCandidate) {
+          throw new Error('new Worker candidate has no artifact version');
+        }
+        candidateId = operationCandidate;
+      }
+      if (deployment) {
+        await this.#deployCandidateAtZero(spec, candidateId, fence);
+      } else {
+        const initial = await this.#deploymentStatus(spec);
+        const selected = initial?.versions.find(
+          (version) => version.id === candidateId,
+        );
+        if (selected?.percentage !== 100) {
+          throw new Error(
+            `initial Worker '${spec.scriptName}' did not deploy its tagged version at 100%`,
+          );
+        }
+      }
+      settled = {
+        ok: true,
+        result: { artifactVersion: candidateId, created: !workerExisted },
+      };
+    } catch (cause) {
+      if (workerExisted) {
+        settled = {
+          ok: false,
+          error: {
             message: `failed to update existing Worker '${spec.scriptName}'`,
             cause,
             createdByAttempt: false,
             resourceState: 'present',
-          });
-        }
+          },
+        };
+      } else {
         const cleanupErrors: unknown[] = [];
         const cleanupRelease: ExternalReleaseSnapshot | undefined = candidateId
           ? {
@@ -1407,24 +1315,40 @@ export class WranglerLoopBackend implements ProvisioningBackend {
             cleanupErrors.push(cleanupError);
           }
         }
-        if (cleanupErrors.length > 0) {
-          throw new WorkerDeploymentError({
-            message: `failed to install credentials and clean up '${spec.scriptName}'`,
-            cause: new AggregateError([cause, ...cleanupErrors]),
-            createdByAttempt: true,
-            resourceState: 'unknown',
-          });
-        }
-        throw new WorkerDeploymentError({
-          message: `failed to install Worker '${spec.scriptName}'`,
-          cause,
-          createdByAttempt: true,
-          resourceState: 'absent',
-        });
+        settled = {
+          ok: false,
+          error:
+            cleanupErrors.length > 0
+              ? {
+                  message: `failed to install credentials and clean up '${spec.scriptName}'`,
+                  cause: new AggregateError([cause, ...cleanupErrors]),
+                  createdByAttempt: true,
+                  resourceState: 'unknown',
+                }
+              : {
+                  message: `failed to install Worker '${spec.scriptName}'`,
+                  cause,
+                  createdByAttempt: true,
+                  resourceState: 'absent',
+                },
+        };
       }
-    } finally {
-      await rm(directory, { recursive: true, force: true });
     }
+    if (!settled.ok) {
+      const record = settled.error;
+      const cause =
+        uploadOutcome?.cleanup.status === 'failed'
+          ? new AggregateError(
+              [record.cause, uploadOutcome.cleanup.error],
+              'Worker upload and adapter scratch cleanup both failed',
+            )
+          : record.cause;
+      throw new WorkerDeploymentError({ ...record, cause });
+    }
+    if (uploadOutcome?.cleanup.status === 'failed') {
+      throw uploadOutcome.cleanup.error;
+    }
+    return settled.result;
   }
 
   async promoteWorker(
@@ -1460,30 +1384,27 @@ export class WranglerLoopBackend implements ProvisioningBackend {
       current.versions[0]?.id === candidateId &&
       current.versions[0].percentage === 100;
     if (!promoted) {
-      try {
-        await this.#runMutation(fence, [
-          'versions',
-          'deploy',
-          `${candidateId}@100%`,
-          '--name',
-          spec.scriptName,
-          '-y',
-        ]);
-      } catch (error) {
+      this.#assertMutationDuration(fence);
+      const outcome = await this.#api.createDeployment(
+        spec.scriptName,
+        [{ versionId: candidateId, percentage: 100 }],
+        fence,
+      );
+      if (outcome.status === 'failed') {
         const reconciled = await this.#deploymentStatus(spec);
         if (
           reconciled?.versions.length !== 1 ||
           reconciled.versions[0]?.id !== candidateId ||
           reconciled.versions[0].percentage !== 100
         ) {
-          throw error;
+          throw outcome.error;
         }
       }
     }
     const beforeAttach = await this.#attestPromotionRoute(spec, guard);
     if (beforeAttach?.service !== spec.scriptName) {
       await this.#assertMutationFence(fence);
-      await this.#routeApi.attachCustomDomain(
+      await this.#api.attachCustomDomain(
         {
           hostname: spec.routeHostname,
           service: spec.scriptName,
@@ -1559,50 +1480,53 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     if (!artifactVersion) {
       throw new Error('wrangler deployment status has no active version');
     }
-    const version = await this.#viewVersion(spec, artifactVersion);
-    const resources = field(version, 'resources');
-    const bindings = asArray(field(resources, 'bindings'));
-    const databaseIds = bindings.flatMap((binding) => {
-      if (field(binding, 'type') !== 'd1') return [];
-      const id = field(binding, 'id') ?? field(binding, 'database_id');
-      return typeof id === 'string' ? [id] : [];
-    });
-    const durableObjectBindings = bindings.flatMap((binding) => {
-      if (field(binding, 'type') !== 'durable_object_namespace') return [];
-      const id = field(binding, 'namespace_id');
-      const name = field(binding, 'name');
-      const className = field(binding, 'class_name');
-      return typeof id === 'string' &&
-        typeof name === 'string' &&
-        typeof className === 'string'
-        ? [{ name, className, namespaceId: id }]
-        : [];
-    });
-    const serviceBindings = bindings.flatMap((binding) => {
-      if (field(binding, 'type') !== 'service') return [];
-      const name = field(binding, 'name');
-      const service = field(binding, 'service');
-      return typeof name === 'string' && typeof service === 'string'
-        ? [{ name, service }]
-        : [];
-    });
-    const queueProducerBindings = bindings.flatMap((binding) => {
-      if (field(binding, 'type') !== 'queue') return [];
-      const name = field(binding, 'name');
-      const queueName = field(binding, 'queue_name');
-      return typeof name === 'string' && typeof queueName === 'string'
-        ? [{ name, queueName }]
-        : [];
-    });
-    const r2BucketBindings = bindings
-      .flatMap((binding) => {
-        if (field(binding, 'type') !== 'r2_bucket') return [];
-        const name = field(binding, 'name');
-        const bucketName = field(binding, 'bucket_name');
-        return typeof name === 'string' && typeof bucketName === 'string'
-          ? [{ name, bucketName, jurisdiction: 'default' as const }]
-          : [];
-      })
+    const version = await this.#api.viewVersion(
+      spec.scriptName,
+      artifactVersion,
+    );
+    const databaseIds = this.#databaseIds(version);
+    const durableObjectBindings = version.bindings.flatMap((binding) =>
+      binding.type === 'durable-object' &&
+      typeof binding.namespaceId === 'string' &&
+      typeof binding.name === 'string' &&
+      typeof binding.className === 'string'
+        ? [
+            {
+              name: binding.name,
+              className: binding.className,
+              namespaceId: binding.namespaceId,
+            },
+          ]
+        : [],
+    );
+    const serviceBindings = version.bindings.flatMap((binding) =>
+      binding.type === 'service' &&
+      typeof binding.name === 'string' &&
+      typeof binding.service === 'string'
+        ? [{ name: binding.name, service: binding.service }]
+        : [],
+    );
+    const queueProducerBindings = version.bindings.flatMap((binding) =>
+      binding.type === 'queue-producer' &&
+      typeof binding.name === 'string' &&
+      typeof binding.queueName === 'string'
+        ? [{ name: binding.name, queueName: binding.queueName }]
+        : [],
+    );
+    const r2BucketBindings = version.bindings
+      .flatMap((binding) =>
+        binding.type === 'r2-bucket' &&
+        typeof binding.name === 'string' &&
+        typeof binding.bucketName === 'string'
+          ? [
+              {
+                name: binding.name,
+                bucketName: binding.bucketName,
+                jurisdiction: 'default' as const,
+              },
+            ]
+          : [],
+      )
       .sort((left, right) => left.name.localeCompare(right.name));
     const plainText = this.#plainTextBindings(version);
     const expectedServiceBindings = spec.egressProxyService
@@ -1645,20 +1569,11 @@ export class WranglerLoopBackend implements ProvisioningBackend {
         `script '${spec.scriptName}' has no valid schema version`,
       );
     }
-    const versionBindingIdentities = assertSupportedProviderBindings(
-      bindings,
-      new Set([
-        'd1',
-        'durable_object_namespace',
-        'service',
-        'queue',
-        'r2_bucket',
-        'plain_text',
-        'secret_text',
-      ]),
+    const versionBindingIdentities = assertSupportedPlainWorkerBindings(
+      version.bindings,
       `plain Worker '${spec.scriptName}'`,
     );
-    const secretNames = await this.#routeApi.listOrdinaryWorkerSecretNames(
+    const secretNames = await this.#api.listOrdinaryWorkerSecretNames(
       spec.scriptName,
     );
     const versionSecretNames = versionBindingIdentities
@@ -1749,9 +1664,7 @@ export class WranglerLoopBackend implements ProvisioningBackend {
   async attestActiveRoute(
     spec: DeploymentSpec,
   ): Promise<ActiveRouteAttestation> {
-    const active = await this.#routeApi.inspectActiveWorkerRoute(
-      spec.scriptName,
-    );
+    const active = await this.#api.inspectActiveWorkerRoute(spec.scriptName);
     if (!active) {
       throw new ActiveRouteAttestationError(
         `Worker '${spec.scriptName}' has no deployment serving traffic`,
@@ -1785,7 +1698,7 @@ export class WranglerLoopBackend implements ProvisioningBackend {
   ): Promise<void> {
     const secretNames = [
       ...new Set(
-        await this.#routeApi.listOrdinaryWorkerSecretNames(spec.scriptName),
+        await this.#api.listOrdinaryWorkerSecretNames(spec.scriptName),
       ),
     ].sort();
     if (secretNames.length === 0) {
@@ -1811,13 +1724,13 @@ export class WranglerLoopBackend implements ProvisioningBackend {
           `ordinary Worker '${spec.scriptName}' has secrets without an attestable Worker owner`,
         );
       }
-      await this.#routeApi.deleteControlSecrets(
+      await this.#api.deleteControlSecrets(
         spec.scriptName,
         [secretName],
         fence,
       );
     }
-    const remaining = await this.#routeApi.listOrdinaryWorkerSecretNames(
+    const remaining = await this.#api.listOrdinaryWorkerSecretNames(
       spec.scriptName,
     );
     if (remaining.length > 0) {
@@ -1838,24 +1751,24 @@ export class WranglerLoopBackend implements ProvisioningBackend {
       );
     }
     if (step === 'remove-traffic') {
-      const domains = await this.#routeApi.listCustomDomains();
+      const domains = await this.#api.listCustomDomains();
       for (const domain of domains.filter(
         ({ service }) => service === record.scriptName,
       )) {
-        await this.#routeApi.detachCustomDomain(domain.id, fence);
+        await this.#api.detachCustomDomain(domain.id, fence);
       }
-      const initial = await this.#routeApi.inspectOrdinaryWorkerFootprint(
+      const initial = await this.#api.inspectOrdinaryWorkerFootprint(
         record.scriptName,
       );
       if (initial.scriptPresent) {
-        await this.#routeApi.disableOrdinaryWorkerPublicAccess(
+        await this.#api.disableOrdinaryWorkerPublicAccess(
           record.scriptName,
           fence,
         );
       }
       const [footprint, remainingDomains] = await Promise.all([
-        this.#routeApi.inspectOrdinaryWorkerFootprint(record.scriptName),
-        this.#routeApi.listCustomDomains(),
+        this.#api.inspectOrdinaryWorkerFootprint(record.scriptName),
+        this.#api.listCustomDomains(),
       ]);
       if (
         footprint.customDomains.length > 0 ||
@@ -1873,17 +1786,17 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     if (step === 'revoke-credentials') {
       const secretNames = [
         ...new Set(
-          await this.#routeApi.listOrdinaryWorkerSecretNames(record.scriptName),
+          await this.#api.listOrdinaryWorkerSecretNames(record.scriptName),
         ),
       ].sort();
       for (const secretName of secretNames) {
-        await this.#routeApi.deleteControlSecrets(
+        await this.#api.deleteControlSecrets(
           record.scriptName,
           [secretName],
           fence,
         );
       }
-      const remaining = await this.#routeApi.listOrdinaryWorkerSecretNames(
+      const remaining = await this.#api.listOrdinaryWorkerSecretNames(
         record.scriptName,
       );
       if (remaining.length > 0) {
@@ -1896,18 +1809,11 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     if (step !== 'delete-database') {
       throw new Error(`unsupported force-decommission step '${step}'`);
     }
-    const getDatabase = this.#routeApi.getDatabase;
-    const deleteDatabase = this.#routeApi.deleteDatabase;
-    if (!getDatabase || !deleteDatabase) {
-      throw new Error(
-        'plain Worker route API does not support exact-ID D1 database deletion',
-      );
+    if (!this.#api.supportsExactDatabaseDeletion) {
+      throw new Error(EXACT_DATABASE_DELETION_REQUIRED);
     }
-    await this.#routeApi.withMutationFence(fence, async () => {
-      const database = await getDatabase.call(
-        this.#routeApi,
-        record.databaseId,
-      );
+    await this.#api.withMutationFence(fence, async () => {
+      const database = await this.#api.getDatabase(record.databaseId);
       if (!database) return;
       if (
         database.id !== record.databaseId ||
@@ -1917,8 +1823,8 @@ export class WranglerLoopBackend implements ProvisioningBackend {
           `persisted database '${record.databaseId}' resolved with unexpected identity '${database.id}:${database.name}' during force decommission`,
         );
       }
-      await deleteDatabase.call(this.#routeApi, database.id);
-      if (await getDatabase.call(this.#routeApi, record.databaseId)) {
+      await this.#api.deleteDatabaseFenced(database.id, fence);
+      if (await this.#api.getDatabase(record.databaseId)) {
         throw new Error(
           `database '${record.databaseId}' remains after force decommission`,
         );
@@ -1952,18 +1858,15 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     }
     if (route) {
       await this.#assertMutationFence(fence);
-      await this.#routeApi.detachCustomDomain(route.id, fence);
+      await this.#api.detachCustomDomain(route.id, fence);
     }
     if (worker) {
-      await this.#routeApi.disableOrdinaryWorkerPublicAccess(
-        spec.scriptName,
-        fence,
-      );
+      await this.#api.disableOrdinaryWorkerPublicAccess(spec.scriptName, fence);
     }
   }
 
   async assertTrafficRemoved(spec: DeploymentSpec): Promise<void> {
-    const footprint = await this.#routeApi.inspectOrdinaryWorkerFootprint(
+    const footprint = await this.#api.inspectOrdinaryWorkerFootprint(
       spec.scriptName,
     );
     if (
@@ -1986,8 +1889,8 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     fence: ExternalMutationFence,
   ): Promise<void> {
     const [initialFootprint, initialNamespaceIds] = await Promise.all([
-      this.#routeApi.inspectOrdinaryWorkerFootprint(spec.scriptName),
-      this.#routeApi.listDurableObjectNamespaces(spec.scriptName),
+      this.#api.inspectOrdinaryWorkerFootprint(spec.scriptName),
+      this.#api.listDurableObjectNamespaces(spec.scriptName),
     ]);
     await this.assertTrafficRemoved(spec);
     if (!initialFootprint.scriptPresent) {
@@ -2016,7 +1919,7 @@ export class WranglerLoopBackend implements ProvisioningBackend {
         `refusing to delete Worker '${spec.scriptName}' with an inconsistent script or zone-route footprint`,
       );
     }
-    const unexpectedDomains = (await this.#routeApi.listCustomDomains()).filter(
+    const unexpectedDomains = (await this.#api.listCustomDomains()).filter(
       (domain) =>
         domain.service === spec.scriptName &&
         domain.hostname.toLowerCase() !== spec.routeHostname.toLowerCase(),
@@ -2040,16 +1943,14 @@ export class WranglerLoopBackend implements ProvisioningBackend {
         `ordinary Worker '${spec.scriptName}' disappeared before deletion`,
       );
     }
-    try {
-      await this.#runMutation(fence, [
-        'delete',
-        '--name',
-        spec.scriptName,
-        '--force',
-      ]);
-    } catch (error) {
-      if (!isWranglerNotFound(error)) throw error;
-    }
+    this.#assertMutationDuration(fence);
+    const deletionOutcome = await this.#api.deleteWorkerScript(
+      spec.scriptName,
+      fence,
+    );
+    // Policy treats deleted and absent identically because the residual check follows;
+    // satisfies is a widening tripwire for future adapter outcomes.
+    deletionOutcome satisfies 'deleted' | 'absent';
     const [
       status,
       versions,
@@ -2061,13 +1962,13 @@ export class WranglerLoopBackend implements ProvisioningBackend {
       this.#deploymentStatus(spec),
       this.#listVersions(spec),
       this.#customDomain(spec.routeHostname),
-      this.#routeApi
+      this.#api
         .listCustomDomains()
         .then((domains) =>
           domains.filter((domain) => domain.service === spec.scriptName),
         ),
-      this.#routeApi.inspectOrdinaryWorkerFootprint(spec.scriptName),
-      this.#routeApi.listDurableObjectNamespaces(spec.scriptName),
+      this.#api.inspectOrdinaryWorkerFootprint(spec.scriptName),
+      this.#api.listDurableObjectNamespaces(spec.scriptName),
     ]);
     if (
       status ||
@@ -2089,74 +1990,26 @@ export class WranglerLoopBackend implements ProvisioningBackend {
     database: DatabaseReference,
     fence: ExternalMutationFence,
   ): Promise<DatabaseExport> {
-    await mkdir(this.#exportDirectory, { recursive: true });
-    const temporaryDirectory = await mkdtemp(
-      join(this.#exportDirectory, '.wrangler-export-'),
-    );
-    const fileName = `${database.name}-${Date.now()}.sql`;
-    const temporaryLocation = join(temporaryDirectory, fileName);
-    try {
-      await this.#runMutation(fence, [
-        'd1',
-        'export',
-        database.id,
-        '--remote',
-        '--skip-confirmation',
-        '--output',
-        temporaryLocation,
-      ]);
-      await chmod(temporaryLocation, 0o600);
-      const metadata = await stat(temporaryLocation);
-      if (!metadata.isFile() || metadata.size === 0) {
-        throw new Error('Wrangler database export is not a non-empty file');
-      }
-      const hash = createHash('sha256');
-      for await (const chunk of createReadStream(temporaryLocation)) {
-        hash.update(chunk);
-      }
-      const sha256 = hash.digest('hex');
-      const stored = await this.#exportStore.write({
-        databaseId: database.id,
-        fileName,
-        body: Readable.toWeb(
-          createReadStream(temporaryLocation),
-        ) as ReadableStream<Uint8Array>,
-        contentLength: metadata.size,
-      });
-      if (
-        !stored.location ||
-        stored.size !== metadata.size ||
-        stored.sha256 !== sha256
-      ) {
-        throw new Error(
-          'durable database export store returned mismatched committed integrity',
-        );
-      }
-      return {
-        databaseId: database.id,
-        location: stored.location,
-        sha256,
-        size: metadata.size,
-      };
-    } finally {
-      await rm(temporaryDirectory, { recursive: true, force: true });
-    }
+    this.#assertMutationDuration(fence);
+    const exported = await this.#api.exportDatabase(database, fence);
+    return {
+      databaseId: database.id,
+      location: exported.location,
+      sha256: exported.sha256,
+      size: exported.size,
+    };
   }
 
   async deleteDatabase(
     database: DatabaseReference,
     fence: ExternalMutationFence,
   ): Promise<void> {
-    const getDatabase = this.#routeApi.getDatabase;
-    const deleteDatabase = this.#routeApi.deleteDatabase;
-    if (!getDatabase || !deleteDatabase) {
-      throw new Error(
-        'plain Worker route API does not support exact-ID D1 database deletion',
-      );
+    if (!this.#api.supportsExactDatabaseDeletion) {
+      throw new Error(EXACT_DATABASE_DELETION_REQUIRED);
     }
-    await this.#routeApi.withMutationFence(fence, async () => {
-      await deleteDatabase.call(this.#routeApi, database.id);
-      if (await getDatabase.call(this.#routeApi, database.id)) {
+    await this.#api.withMutationFence(fence, async () => {
+      await this.#api.deleteDatabaseFenced(database.id, fence);
+      if (await this.#api.getDatabase(database.id)) {
         throw new Error(`database '${database.id}' remains after deletion`);
       }
     });

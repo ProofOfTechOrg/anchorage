@@ -518,6 +518,190 @@ export interface PlainWorkerCustomDomain {
   readonly service: string;
 }
 
+/** Provider facts for one D1 database inventory entry. */
+export interface PlainWorkerDatabaseInventoryEntry {
+  /** Provider database identifier, when present and well formed. */
+  readonly databaseId: string | undefined;
+  /** Provider database name, when present and well formed. */
+  readonly name: string | undefined;
+}
+
+/** Provider facts for one ordinary Worker version binding. */
+export type PlainWorkerVersionBinding =
+  | Readonly<{
+      type: 'd1';
+      name: string | undefined;
+      databaseId: string | undefined;
+    }>
+  | Readonly<{
+      type: 'durable-object';
+      name: string | undefined;
+      className: string | undefined;
+      namespaceId: string | undefined;
+    }>
+  | Readonly<{
+      type: 'service';
+      name: string | undefined;
+      service: string | undefined;
+    }>
+  | Readonly<{
+      type: 'queue-producer';
+      name: string | undefined;
+      queueName: string | undefined;
+    }>
+  | Readonly<{
+      type: 'r2-bucket';
+      name: string | undefined;
+      bucketName: string | undefined;
+    }>
+  | Readonly<{
+      type: 'plain-text';
+      name: string | undefined;
+      value: string | undefined;
+    }>
+  | Readonly<{
+      type: 'secret-text';
+      name: string | undefined;
+    }>
+  | Readonly<{
+      type: 'unsupported';
+      name: string | undefined;
+      /** The provider binding was not an object, so it has no raw type fact. */
+      issue: 'not-object';
+    }>
+  | Readonly<{
+      type: 'unsupported';
+      name: string | undefined;
+      /** Raw provider binding type, when the invalid wire value was a string. */
+      providerType: string | undefined;
+      issue: 'invalid-type';
+    }>
+  | Readonly<{
+      type: 'unsupported';
+      name: string | undefined;
+      /** Raw unsupported provider binding type. */
+      providerType: string;
+      issue: 'unsupported-type';
+    }>;
+
+/** Provider facts for one ordinary Worker version summary. */
+export interface PlainWorkerVersionSummary {
+  /** Provider version identifier, when present and well formed. */
+  readonly versionId: string | undefined;
+  /** Fleet tag attached to the version, when present and well formed. */
+  readonly tag: string | undefined;
+}
+
+/** Provider facts for one ordinary Worker version and its bindings. */
+export interface PlainWorkerVersionDetail extends PlainWorkerVersionSummary {
+  /** Provider bindings attached to the version. */
+  readonly bindings: readonly PlainWorkerVersionBinding[];
+}
+
+/** Provider facts for an ordinary Worker's deployment status. */
+export interface PlainWorkerDeploymentStatus {
+  /** Traffic assignments reported by the provider. */
+  readonly versions: readonly {
+    /** Provider version identifier, when present and well formed. */
+    readonly versionId: string | undefined;
+    /** Provider traffic percentage, when present. */
+    readonly percentage: number | undefined;
+  }[];
+}
+
+/** Result of a durable ordinary-Worker database export. */
+export interface PlainWorkerDatabaseExportResult {
+  /** Durable location returned by the export store. */
+  readonly location: string;
+  /** Committed export size in bytes. */
+  readonly size: number;
+  /** Lowercase hexadecimal SHA-256 digest of the complete export. */
+  readonly sha256: string;
+}
+
+/** Outcome of a provider mutation that may have been dispatched. */
+export type PlainWorkerMutationOutcome =
+  | Readonly<{ status: 'succeeded' }>
+  | Readonly<{ status: 'failed'; error: unknown }>;
+
+/**
+ * Adapter scratch-cleanup outcome. A failure is never thrown by the adapter
+ * after dispatch; the caller surfaces it after reconciliation. An adapter with
+ * no adapter-owned scratch always reports `succeeded`.
+ */
+export type PlainWorkerCleanupOutcome =
+  | Readonly<{ status: 'succeeded' }>
+  | Readonly<{ status: 'failed'; error: unknown }>;
+
+/** Upload outcome including the adapter scratch-cleanup outcome. */
+export type PlainWorkerUploadOutcome = PlainWorkerMutationOutcome &
+  Readonly<{ cleanup: PlainWorkerCleanupOutcome }>;
+
+/** Shared provider mechanics for an ordinary Worker candidate upload. */
+interface PlainWorkerUploadIntentBase {
+  /** Provider script name. */
+  readonly scriptName: string;
+  /** Fleet tag attached to the uploaded candidate. */
+  readonly candidateTag: string;
+  /** Main module path written into the generated configuration. */
+  readonly mainModule: string;
+  /** Worker modules written into the adapter-owned staging directory. */
+  readonly modules: readonly WorkerModule[];
+  /** Worker compatibility date. */
+  readonly compatibilityDate: string;
+  /** Worker compatibility flags, preserving provider-config omission. */
+  readonly compatibilityFlags: readonly string[] | undefined;
+  /** Worker bindings written into the generated configuration and secrets file. */
+  readonly bindings: {
+    readonly plainText: readonly {
+      readonly name: string;
+      readonly value: string;
+    }[];
+    readonly secrets: readonly {
+      readonly name: string;
+      readonly value: string;
+    }[];
+    readonly d1: readonly {
+      readonly name: string;
+      readonly databaseId: string;
+      readonly databaseName: string;
+    }[];
+    readonly durableObjects: readonly {
+      readonly name: string;
+      readonly className: string;
+    }[];
+    readonly services: readonly {
+      readonly name: string;
+      readonly service: string;
+    }[];
+    readonly queueProducers: readonly {
+      readonly name: string;
+      readonly queueName: string;
+    }[];
+    readonly r2Buckets: readonly {
+      readonly name: string;
+      readonly bucketName: string;
+    }[];
+  };
+  /** Worker resource limits written into the generated configuration. */
+  readonly limits: { readonly cpuMs: number | undefined };
+  /** Ordinary Worker public-access mechanics applied by this upload. */
+  readonly publicAccess: {
+    readonly workersDevEnabled: boolean;
+    readonly previewUrlsEnabled: boolean;
+  };
+}
+
+/** Intent for an initial deploy or staged ordinary Worker version upload. */
+export type PlainWorkerUploadIntent = PlainWorkerUploadIntentBase &
+  (
+    | Readonly<{
+        mode: 'initial';
+        durableObjectMigrations: readonly DurableObjectMigration[];
+      }>
+    | Readonly<{ mode: 'staged' }>
+  );
+
 export interface PlainWorkerRouteApi {
   withMutationFence<T>(
     fence: ExternalMutationFence,
@@ -615,6 +799,117 @@ export interface PlainWorkerRouteApi {
     scriptName: string,
     fence: ExternalMutationFence,
   ): Promise<void>;
+}
+
+/**
+ * Provider-neutral port whose methods return provider facts and perform
+ * provider mechanics. Absence policy, malformed-fact refusals, ordering,
+ * reconciliation, and compensation belong to the caller.
+ *
+ * A method whose result type cannot represent a malformed provider fact refuses
+ * it in the adapter (e.g. `getDatabase` (`DatabaseReference` has required string
+ * fields) and `exportDatabase` (`location` is required)); every other
+ * malformed-fact refusal belongs to the caller.
+ *
+ * A method declared here that accepts an `ExternalMutationFence`, other than
+ * `deleteDatabaseFenced`, asserts it immediately before every provider request
+ * it issues through the command runner or route API. `deleteDatabaseFenced`
+ * runs inside `withMutationFence` and relies on the route API's per-request
+ * assertion (HEAD parity, D10); whether the direct-API adapter additionally
+ * pre-asserts is a named conformance question for B2.
+ *
+ * A method that resolves a `PlainWorkerMutationOutcome` over a transport that
+ * asserts per request must ALSO assert explicitly before dispatch, so a lost
+ * lease rejects instead of resolving `failed` and triggering readback.
+ *
+ * `withMutationFence` is re-entrant with the same fence; a
+ * `PlainWorkerRouteApi.withMutationFence` implementation is not required to
+ * treat entry as an ownership assertion (assertion belongs to each mutating
+ * request). An implementation that also asserts on entry is tolerated — the
+ * adapter's re-entrancy short-circuit keeps the assertion count stable. Inherited
+ * `PlainWorkerRouteApi` members retain their own contract.
+ *
+ * `undefined` and `'absent'` mean provider absence only. Other failures reject
+ * with the provider error unmodified, and fence failures are never classified
+ * as absence. Methods without an absence-typed result do not classify absence.
+ *
+ * `createDatabase`, `uploadCandidate`, and `createDeployment` resolve a failed
+ * outcome only after a provider request was dispatched and failed or its result
+ * became unknown. They reject failures that provably predate dispatch, including
+ * fence assertion and local preparation failures. Other mutations reject on
+ * failure except for their documented absence result.
+ */
+export interface PlainWorkerProvisioningApi extends PlainWorkerRouteApi {
+  /** Maximum duration of any one provider mutation request after assertion. */
+  readonly maxMutationDurationMs: number;
+  /** Whether immutable-ID D1 reads and deletion are both available. */
+  readonly supportsExactDatabaseDeletion: boolean;
+  /** Lists all D1 database inventory facts visible to the adapter. */
+  listDatabases(): Promise<readonly PlainWorkerDatabaseInventoryEntry[]>;
+  /** Reads a D1 database, returning undefined only for provider absence. */
+  getDatabase(databaseId: string): Promise<DatabaseReference | undefined>;
+  /** Creates a D1 database and reports a dispatched mutation outcome. */
+  createDatabase(
+    name: string,
+    fence: ExternalMutationFence,
+  ): Promise<PlainWorkerMutationOutcome>;
+  /** Prevents the shared core from using the inherited unfenced deletion. */
+  readonly deleteDatabase?: never;
+  /** Deletes a D1 database by immutable ID through the fenced route API. */
+  deleteDatabaseFenced(
+    databaseId: string,
+    fence: ExternalMutationFence,
+  ): Promise<void>;
+  /** Reads deployment facts, returning undefined only for provider absence. */
+  deploymentStatus(
+    scriptName: string,
+  ): Promise<PlainWorkerDeploymentStatus | undefined>;
+  /**
+   * Lists the provider's Worker version inventory, or `undefined` for provider
+   * absence. Bounded pagination is an open contract question for the direct-API
+   * adapter.
+   */
+  listVersions(
+    scriptName: string,
+  ): Promise<readonly PlainWorkerVersionSummary[] | undefined>;
+  /** Strictly reads one version and never classifies provider absence. */
+  viewVersion(
+    scriptName: string,
+    versionId: string,
+  ): Promise<PlainWorkerVersionDetail>;
+  /** Reads one version, returning undefined only for provider absence. */
+  findVersion(
+    scriptName: string,
+    versionId: string,
+  ): Promise<PlainWorkerVersionDetail | undefined>;
+  /**
+   * Uploads a candidate and reports dispatch and cleanup outcomes separately.
+   * Scratch, if any, is adapter-owned and exists only for the duration of the
+   * call. If a pre-dispatch failure (fence assertion or local preparation) and
+   * scratch cleanup both occur, rejects with an `AggregateError` containing the
+   * pre-dispatch error followed by the cleanup error; neither failure is
+   * discarded.
+   */
+  uploadCandidate(
+    intent: PlainWorkerUploadIntent,
+    fence: ExternalMutationFence,
+  ): Promise<PlainWorkerUploadOutcome>;
+  /** Creates a deployment and reports a dispatched mutation outcome. */
+  createDeployment(
+    scriptName: string,
+    versions: readonly { versionId: string; percentage: number }[],
+    fence: ExternalMutationFence,
+  ): Promise<PlainWorkerMutationOutcome>;
+  /** Deletes a Worker script, returning absent only for provider absence. */
+  deleteWorkerScript(
+    scriptName: string,
+    fence: ExternalMutationFence,
+  ): Promise<'deleted' | 'absent'>;
+  /** Exports a D1 database into the durable store with independent integrity. */
+  exportDatabase(
+    database: { readonly id: string; readonly name: string },
+    fence: ExternalMutationFence,
+  ): Promise<PlainWorkerDatabaseExportResult>;
 }
 
 export interface FleetStateLease extends ExternalMutationFence {

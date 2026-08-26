@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import type { ProviderBindingIdentity } from './types.js';
+import type {
+  PlainWorkerVersionBinding,
+  ProviderBindingIdentity,
+} from './types.js';
 
 function bindingKey(binding: ProviderBindingIdentity): string {
   return `${binding.type}\u0000${binding.name}`;
@@ -122,6 +125,83 @@ export function assertSupportedProviderBindings(
     return valid ? [providerBindingIdentity(type, name)] : [];
   });
   return assertEveryProviderBindingConsumed(rawBindings, consumed, context);
+}
+
+export function plainWorkerBindingsToProviderShape(
+  bindings: readonly PlainWorkerVersionBinding[],
+): readonly unknown[] {
+  return bindings.map((binding) => {
+    switch (binding.type) {
+      case 'd1':
+        return {
+          type: 'd1',
+          name: binding.name,
+          id: binding.databaseId,
+        };
+      case 'durable-object':
+        return {
+          type: 'durable_object_namespace',
+          name: binding.name,
+          namespace_id: binding.namespaceId,
+          class_name: binding.className,
+        };
+      case 'service':
+        return {
+          type: 'service',
+          name: binding.name,
+          service: binding.service,
+        };
+      case 'queue-producer':
+        return {
+          type: 'queue',
+          name: binding.name,
+          queue_name: binding.queueName,
+        };
+      case 'r2-bucket':
+        return {
+          type: 'r2_bucket',
+          name: binding.name,
+          bucket_name: binding.bucketName,
+        };
+      case 'plain-text':
+        return {
+          type: 'plain_text',
+          name: binding.name,
+          text: binding.value,
+        };
+      case 'secret-text':
+        return { type: 'secret_text', name: binding.name };
+      case 'unsupported':
+        if (binding.issue === 'not-object') return undefined;
+        // For `invalid-type` the reconstructed type changes no message (either spelling
+        // fails the type check); for `unsupported-type` it preserves HEAD's `unsupported
+        // or malformed` refusal instead of an index-based `no valid type`. Carried as a
+        // provider fact for B1b/B2 diagnostics.
+        return { type: binding.providerType, name: binding.name };
+    }
+    // Exhaustiveness tripwire: a new normalized binding must define wire reconstruction.
+    binding satisfies never;
+    return undefined;
+  });
+}
+
+export function assertSupportedPlainWorkerBindings(
+  bindings: readonly PlainWorkerVersionBinding[],
+  context: string,
+): readonly ProviderBindingIdentity[] {
+  return assertSupportedProviderBindings(
+    plainWorkerBindingsToProviderShape(bindings),
+    new Set([
+      'd1',
+      'durable_object_namespace',
+      'service',
+      'queue',
+      'r2_bucket',
+      'plain_text',
+      'secret_text',
+    ]),
+    context,
+  );
 }
 
 export function assertProviderBindingIdentitiesMatchInspection(
